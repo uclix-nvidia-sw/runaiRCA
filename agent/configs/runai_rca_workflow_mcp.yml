@@ -1,0 +1,76 @@
+# NeMo Agent Toolkit workflow variant with MCP and LLM synthesis enabled.
+#
+# Use this when Prometheus/Loki MCP servers and NVIDIA NIM credentials are
+# available. The default runai_rca_workflow.yml remains MCP-free so local
+# development and CI can execute without external servers.
+
+general:
+  telemetry:
+    enabled: false
+
+llms:
+  nim_llm:
+    _type: nim
+    model_name: nvidia/nemotron-3-nano-30b-a3b
+    temperature: 0.0
+    chat_template_kwargs:
+      enable_thinking: false
+
+function_groups:
+  prometheus_mcp:
+    _type: mcp_client
+    server:
+      transport: streamable-http
+      url: http://localhost:9901/mcp
+  loki_mcp:
+    _type: mcp_client
+    server:
+      transport: streamable-http
+      url: http://localhost:9902/mcp
+
+functions:
+  runai_context:
+    _type: runai_context
+  kubernetes_context:
+    _type: kubernetes_context
+  postgres_context:
+    _type: postgres_context
+  prometheus_context:
+    _type: prometheus_context
+  loki_context:
+    _type: loki_context
+  evidence_parallel:
+    _type: parallel_executor
+    description: Parallel component evidence collection for Run:ai RCA.
+    tool_list: [runai_context, kubernetes_context, postgres_context, prometheus_context, loki_context]
+    detailed_logs: true
+    return_error_on_exception: true
+  synthesize_runai_rca:
+    _type: synthesize_runai_rca
+  deterministic_rca:
+    _type: sequential_executor
+    description: Deterministic RCA synthesis path.
+    tool_list: [evidence_parallel, synthesize_runai_rca]
+    return_error_on_exception: true
+  final_synthesis:
+    _type: react_agent
+    description: LLM synthesis agent with MCP-aware evidence tools.
+    tool_names:
+      - runai_context
+      - kubernetes_context
+      - postgres_context
+      - prometheus_context
+      - loki_context
+      - prometheus_mcp
+      - loki_mcp
+    llm_name: nim_llm
+    max_tool_calls: 8
+    system_prompt: >
+      You are a Run:ai root cause analysis agent inspired by KubeRCA. Keep the
+      response operational, evidence-backed, and explicit about missing data.
+
+workflow:
+  _type: sequential_executor
+  description: Run:ai RCA workflow with deterministic collection followed by LLM review.
+  tool_list: [deterministic_rca, final_synthesis]
+  return_error_on_exception: true

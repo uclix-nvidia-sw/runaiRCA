@@ -1,0 +1,76 @@
+nameOverride: ""
+fullnameOverride: ""
+
+global:
+  imageRegistry: ""
+
+secrets:
+  existingSecret: ""
+  databaseUrl: ""
+  postgresDsn: ""
+  runaiClientId: ""
+  runaiClientSecret: ""
+  nvidiaApiKey: ""
+
+backend:
+  replicaCount: 1
+  image:
+    repository: runai-rca-backend
+    tag: ""
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 8080
+  resources: {}
+
+agent:
+  replicaCount: 1
+  image:
+    repository: runai-rca-agent
+    tag: ""
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 8000
+  serviceAccount:
+    create: true
+    name: ""
+  rbac:
+    create: true
+  env:
+    language: en
+    logLevel: info
+    enableNatRuntime: false
+    natConfigFile: /app/configs/runai_rca_workflow.yml
+    runaiBaseUrl: ""
+    prometheusUrl: ""
+    lokiUrl: ""
+  resources: {}
+
+frontend:
+  replicaCount: 1
+  image:
+    repository: runai-rca-frontend
+    tag: ""
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 80
+  config:
+    apiBaseUrl: ""
+  resources: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: runai-rca.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

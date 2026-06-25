@@ -1,0 +1,36 @@
+# NeMo Agent Toolkit workflow for Run:AI RCA.
+#
+# Custom functions are registered by the `runai_rca` nat.components entrypoint in
+# app.nat_tools. The FastAPI service can delegate to this workflow with
+# ENABLE_NAT_RUNTIME=true; when NAT is disabled it uses the same collectors
+# directly as a deterministic fallback.
+
+general:
+  telemetry:
+    enabled: false
+
+functions:
+  runai_context:
+    _type: runai_context
+  kubernetes_context:
+    _type: kubernetes_context
+  postgres_context:
+    _type: postgres_context
+  prometheus_context:
+    _type: prometheus_context
+  loki_context:
+    _type: loki_context
+  evidence_parallel:
+    _type: parallel_executor
+    description: Parallel component evidence collection for Run:ai RCA.
+    tool_list: [runai_context, kubernetes_context, postgres_context, prometheus_context, loki_context]
+    detailed_logs: true
+    return_error_on_exception: true
+  synthesize_runai_rca:
+    _type: synthesize_runai_rca
+
+workflow:
+  _type: sequential_executor
+  description: Run:ai RCA workflow.
+  tool_list: [evidence_parallel, synthesize_runai_rca]
+  return_error_on_exception: true

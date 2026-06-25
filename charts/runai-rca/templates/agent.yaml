@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "runai-rca.agent.fullname" . }}
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+spec:
+  replicas: {{ .Values.agent.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "runai-rca.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: agent
+  template:
+    metadata:
+      labels:
+        {{- include "runai-rca.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: agent
+    spec:
+      serviceAccountName: {{ include "runai-rca.agent.serviceAccountName" . }}
+      containers:
+        - name: agent
+          image: {{ include "runai-rca.image" (dict "root" . "image" .Values.agent.image) | quote }}
+          imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.agent.service.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.agent.service.port | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.agent.env.logLevel | quote }}
+            - name: LANGUAGE
+              value: {{ .Values.agent.env.language | quote }}
+            - name: ENABLE_NAT_RUNTIME
+              value: {{ .Values.agent.env.enableNatRuntime | quote }}
+            - name: NAT_CONFIG_FILE
+              value: {{ .Values.agent.env.natConfigFile | quote }}
+            - name: RUNAI_BASE_URL
+              value: {{ .Values.agent.env.runaiBaseUrl | quote }}
+            - name: PROMETHEUS_URL
+              value: {{ .Values.agent.env.prometheusUrl | quote }}
+            - name: LOKI_URL
+              value: {{ .Values.agent.env.lokiUrl | quote }}
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "runai-rca.secretName" . }}
+                  key: POSTGRES_DSN
+                  optional: true
+            - name: RUNAI_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "runai-rca.secretName" . }}
+                  key: RUNAI_CLIENT_ID
+                  optional: true
+            - name: RUNAI_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "runai-rca.secretName" . }}
+                  key: RUNAI_CLIENT_SECRET
+                  optional: true
+            - name: NVIDIA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "runai-rca.secretName" . }}
+                  key: NVIDIA_API_KEY
+                  optional: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            {{- toYaml .Values.agent.resources | nindent 12 }}
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "runai-rca.agent.fullname" . }}
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+spec:
+  type: {{ .Values.agent.service.type | default "ClusterIP" }}
+  ports:
+    - name: http
+      port: {{ .Values.agent.service.port }}
+      targetPort: http
+  selector:
+    {{- include "runai-rca.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: agent

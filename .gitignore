@@ -1,0 +1,21 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# Go
+backend/runai-rca-backend
+
+# Node
+node_modules/
+dist/
+coverage/
+
+# Local env
+.env
+.env.*
+!.env.example
