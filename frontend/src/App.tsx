@@ -752,14 +752,18 @@ function App() {
   const load = useCallback(async () => {
     setError('');
     try {
-      const [incidentData, alertData, analysisRunData] = await Promise.all([
-        fetchIncidents(),
-        fetchAlerts(),
-        fetchAnalysisRuns(),
-      ]);
+      const [incidentData, alertData] = await Promise.all([fetchIncidents(), fetchAlerts()]);
       setIncidents(incidentData);
       setAlerts(alertData);
-      setAnalysisRuns(analysisRunData);
+      try {
+        setAnalysisRuns(await fetchAnalysisRuns());
+      } catch (err) {
+        setAnalysisRuns([]);
+        if (!ENABLE_MOCK_DATA) {
+          const message = err instanceof Error ? err.message : 'Failed to load analysis runs.';
+          setError(`Analysis runs are unavailable: ${message}`);
+        }
+      }
     } catch (err) {
       if (ENABLE_MOCK_DATA) {
         setIncidents([]);
