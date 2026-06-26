@@ -6,12 +6,12 @@ const configuredApiBase = normalizeApiBase(runtimeApiBase) ?? normalizeApiBase(i
 const API_BASE = configuredApiBase ?? fallbackApiBase;
 const FEEDBACK_ACTOR_KEY = 'runai-rca-feedback-actor';
 
-type FeedbackVote = 'up' | 'down' | 'none';
+export type FeedbackVote = 'up' | 'down' | 'none';
 
 async function read<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`);
   if (!response.ok) {
-    throw new Error(`Request failed: ${response.status}`);
+    throw new Error(await responseErrorMessage(response));
   }
   return response.json() as Promise<T>;
 }
@@ -27,7 +27,7 @@ async function mutate<T>(method: string, path: string, body?: unknown): Promise<
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!response.ok) {
-    throw new Error(`Request failed: ${response.status}`);
+    throw new Error(await responseErrorMessage(response));
   }
   return response.json() as Promise<T>;
 }
@@ -165,6 +165,21 @@ function targetPath(targetType: 'incident' | 'alert', id: string, action: string
 
 function feedbackActorQuery() {
   return `?feedback_author=${encodeURIComponent(feedbackActorID())}`;
+}
+
+async function responseErrorMessage(response: Response) {
+  const fallback = `Request failed: ${response.status}`;
+  const contentType = response.headers.get('content-type') || '';
+  try {
+    if (contentType.includes('application/json')) {
+      const body = await response.json() as { error?: string; message?: string; status?: string };
+      return body.error || body.message || body.status || fallback;
+    }
+    const body = (await response.text()).trim();
+    return body || fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 function feedbackActorID() {

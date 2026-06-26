@@ -62,6 +62,7 @@ import {
   submitFeedback,
   updateComment,
   type ChatRequest,
+  type FeedbackVote,
 } from './api';
 import nvidiaLogo from './assets/nvidia-logo.svg';
 import { AlertRecord, AnalysisRun, Artifact, FeedbackSummary, Incident, IncidentDetail, SimilarIncident } from './types';
@@ -83,6 +84,7 @@ type RealtimeEventPayload = {
 
 type EditorTab = 'write' | 'preview';
 type MainView = 'operations' | 'analysis' | 'evidence' | 'agents';
+type DashboardDataState = 'loading' | 'backend-down' | 'empty' | 'live';
 
 type EvidenceItem = {
   id: string;
@@ -120,6 +122,7 @@ type AnalysisRecord = {
   alertID?: string;
   title: string;
   target: string;
+  source: string;
   severity: string;
   alertStatus: string;
   analysisStatus: string;
@@ -675,6 +678,80 @@ function mockFeedback(targetType: 'incident' | 'alert', targetID: string): Feedb
   };
 }
 
+function normalizeFeedbackSummary(
+  feedback: FeedbackSummary | undefined,
+  targetType: 'incident' | 'alert',
+  targetID: string,
+): FeedbackSummary {
+  return {
+    target_type: feedback?.target_type || targetType,
+    target_id: feedback?.target_id || targetID,
+    positive: feedback?.positive ?? 0,
+    negative: feedback?.negative ?? 0,
+    my_vote: feedback?.my_vote,
+    comments: feedback?.comments ?? [],
+    learning_hints: feedback?.learning_hints,
+  };
+}
+
+function isMockTargetID(id: string) {
+  return id.startsWith('MOCK-');
+}
+
+function applyFeedbackVote(summary: FeedbackSummary, nextVote: FeedbackVote): FeedbackSummary {
+  const previousVote = summary.my_vote;
+  let positive = summary.positive;
+  let negative = summary.negative;
+  if (previousVote === 'up') positive = Math.max(0, positive - 1);
+  if (previousVote === 'down') negative = Math.max(0, negative - 1);
+  if (nextVote === 'up') positive += 1;
+  if (nextVote === 'down') negative += 1;
+  return {
+    ...summary,
+    positive,
+    negative,
+    my_vote: nextVote === 'none' ? undefined : nextVote,
+  };
+}
+
+function appendMockComment(summary: FeedbackSummary, body: string): FeedbackSummary {
+  const targetType = summary.target_type === 'alert' ? 'alert' : 'incident';
+  const comment = {
+    comment_id: `MOCK-CMT-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    target_type: targetType,
+    target_id: summary.target_id,
+    incident_id: targetType === 'incident' ? summary.target_id : undefined,
+    alert_id: targetType === 'alert' ? summary.target_id : undefined,
+    body,
+    author: 'operator',
+    created_at: new Date().toISOString(),
+  };
+  return {
+    ...summary,
+    comments: [comment, ...summary.comments],
+  };
+}
+
+function updateMockComment(summary: FeedbackSummary, commentID: string, body: string): FeedbackSummary {
+  return {
+    ...summary,
+    comments: summary.comments.map((item) =>
+      item.comment_id === commentID ? { ...item, body } : item,
+    ),
+  };
+}
+
+function removeMockComment(summary: FeedbackSummary, commentID: string): FeedbackSummary {
+  return {
+    ...summary,
+    comments: summary.comments.filter((item) => item.comment_id !== commentID),
+  };
+}
+
+function errorMessage(err: unknown, fallback: string) {
+  return err instanceof Error ? err.message : fallback;
+}
+
 function runtimeBool(runtimeKey: 'enableMockData', envKey: string, fallback: boolean) {
   const runtimeValue = window.__RUNAI_RCA_CONFIG__?.[runtimeKey];
   if (typeof runtimeValue === 'boolean') return runtimeValue;
@@ -783,40 +860,39 @@ function useEditorHistory(initialValue = '') {
   return { value, setValue: commit, reset, undo, redo };
 }
 
-function App() {
+function useDashboardData() {
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [alerts, setAlerts] = useState<AlertRecord[]>([]);
   const [analysisRuns, setAnalysisRuns] = useState<AnalysisRun[]>([]);
-  const [detail, setDetail] = useState<DetailState>(null);
-  const [activeView, setActiveView] = useState<MainView>('operations');
-  const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [dataState, setDataState] = useState<DashboardDataState>('loading');
+  const [realtimePayload, setRealtimePayload] = useState<RealtimeEventPayload>();
 
   const load = useCallback(async () => {
     setError('');
+    let nextAnalysisRuns: AnalysisRun[] = [];
     try {
       const [incidentData, alertData] = await Promise.all([fetchIncidents(), fetchAlerts()]);
       setIncidents(incidentData);
       setAlerts(alertData);
       try {
-        setAnalysisRuns(await fetchAnalysisRuns());
+        nextAnalysisRuns = await fetchAnalysisRuns();
+        setAnalysisRuns(nextAnalysisRuns);
       } catch (err) {
         setAnalysisRuns([]);
-        if (!ENABLE_MOCK_DATA) {
-          const message = err instanceof Error ? err.message : 'Failed to load analysis runs.';
-          setError(`Analysis runs are unavailable: ${message}`);
-        }
+        const message = err instanceof Error ? err.message : 'Failed to load analysis runs.';
+        setError(`Analysis runs are unavailable: ${message}`);
       }
+      const hasLiveRows = incidentData.length > 0 || alertData.length > 0 || nextAnalysisRuns.length > 0;
+      setDataState(hasLiveRows ? 'live' : 'empty');
     } catch (err) {
-      if (ENABLE_MOCK_DATA) {
-        setIncidents([]);
-        setAlerts([]);
-        setAnalysisRuns([]);
-        setError('');
-      } else {
-        setError(err instanceof Error ? err.message : 'Failed to load dashboard data.');
-      }
+      setIncidents([]);
+      setAlerts([]);
+      setAnalysisRuns([]);
+      setDataState('backend-down');
+      const message = err instanceof Error ? err.message : 'Failed to load dashboard data.';
+      setError(ENABLE_MOCK_DATA ? `Backend unavailable, showing mock data: ${message}` : message);
     } finally {
       setLoading(false);
     }
@@ -826,14 +902,78 @@ function App() {
     void load();
   }, [load]);
 
+  useEffect(() => {
+    let source: EventSource;
+    try {
+      source = eventSource();
+    } catch (err) {
+      if (!ENABLE_MOCK_DATA) {
+        const message = err instanceof Error ? err.message : 'Realtime updates are unavailable.';
+        setError(`Realtime updates are unavailable: ${message}`);
+      }
+      return undefined;
+    }
+    const handleRealtimeEvent = (event: Event) => {
+      const payload = parseRealtimeEvent(event);
+      setRealtimePayload(payload);
+      void load();
+    };
+    source.onmessage = handleRealtimeEvent;
+    source.addEventListener('alert.created', handleRealtimeEvent);
+    source.addEventListener('analysis.started', handleRealtimeEvent);
+    source.addEventListener('analysis.completed', handleRealtimeEvent);
+    source.addEventListener('incident.resolved', handleRealtimeEvent);
+    source.addEventListener('feedback.updated', handleRealtimeEvent);
+    return () => source.close();
+  }, [load]);
+
   const hasLiveData = incidents.length > 0 || alerts.length > 0 || analysisRuns.length > 0;
-  const showMockData = ENABLE_MOCK_DATA && !loading && !error && !hasLiveData;
+  const showMockData =
+    ENABLE_MOCK_DATA &&
+    !loading &&
+    !hasLiveData &&
+    (dataState === 'backend-down' || dataState === 'empty');
+
+  return {
+    incidents,
+    alerts,
+    analysisRuns,
+    loading,
+    error,
+    load,
+    hasLiveData,
+    showMockData,
+    realtimePayload,
+  };
+}
+
+function App() {
+  const {
+    incidents,
+    alerts,
+    analysisRuns,
+    loading,
+    error,
+    load,
+    hasLiveData,
+    showMockData,
+    realtimePayload,
+  } = useDashboardData();
+  const [detail, setDetail] = useState<DetailState>(null);
+  const [activeView, setActiveView] = useState<MainView>('operations');
+  const [query, setQuery] = useState('');
+  const [chatDocked, setChatDocked] = useState(false);
+  const detailVersionRef = useRef(0);
 
   useEffect(() => {
-    if (!loading && !error && hasLiveData && isMockDetail(detail)) {
+    detailVersionRef.current += 1;
+  }, [detail]);
+
+  useEffect(() => {
+    if (!loading && hasLiveData && isMockDetail(detail)) {
       setDetail(null);
     }
-  }, [detail, error, hasLiveData, loading]);
+  }, [detail, hasLiveData, loading]);
 
   const operationIncidents = showMockData ? [MOCK_INCIDENT] : incidents;
   const operationAlerts = showMockData ? [MOCK_ALERT] : alerts;
@@ -883,6 +1023,7 @@ function App() {
       [
         record.title,
         record.target,
+        record.source,
         record.severity,
         record.alertStatus,
         record.analysisStatus,
@@ -1019,57 +1160,48 @@ function App() {
   }, [showMockData]);
 
   const refreshDetail = useCallback(async () => {
-    if (!detail) return;
-    if (showMockData && detail.kind === 'incident') {
-      const mockDetail = mockIncidentDetail(detail.data.incident_id);
+    const currentDetail = detail;
+    const version = detailVersionRef.current;
+    if (!currentDetail) return;
+    if (showMockData && currentDetail.kind === 'incident') {
+      const mockDetail = mockIncidentDetail(currentDetail.data.incident_id);
       if (mockDetail) {
-        setDetail({ kind: 'incident', data: mockDetail });
+        if (detailVersionRef.current === version) {
+          setDetail({ kind: 'incident', data: mockDetail });
+        }
         return;
       }
     }
-    if (showMockData && detail.kind === 'alert') {
-      const mockAlert = mockAlertDetail(detail.data.alert_id);
+    if (showMockData && currentDetail.kind === 'alert') {
+      const mockAlert = mockAlertDetail(currentDetail.data.alert_id);
       if (mockAlert) {
-        setDetail({ kind: 'alert', data: mockAlert });
+        if (detailVersionRef.current === version) {
+          setDetail({ kind: 'alert', data: mockAlert });
+        }
         return;
       }
     }
-    if (detail.kind === 'incident') {
-      setDetail({ kind: 'incident', data: await fetchIncident(detail.data.incident_id) });
+    if (currentDetail.kind === 'incident') {
+      const nextDetail = await fetchIncident(currentDetail.data.incident_id);
+      if (detailVersionRef.current === version) {
+        setDetail({ kind: 'incident', data: nextDetail });
+      }
       return;
     }
-    setDetail({ kind: 'alert', data: await fetchAlert(detail.data.alert_id) });
+    const nextAlert = await fetchAlert(currentDetail.data.alert_id);
+    if (detailVersionRef.current === version) {
+      setDetail({ kind: 'alert', data: nextAlert });
+    }
   }, [detail, showMockData]);
 
   useEffect(() => {
-    let source: EventSource;
-    try {
-      source = eventSource();
-    } catch (err) {
-      if (!ENABLE_MOCK_DATA) {
-        const message = err instanceof Error ? err.message : 'Realtime updates are unavailable.';
-        setError(`Realtime updates are unavailable: ${message}`);
-      }
-      return undefined;
+    if (realtimeEventMatchesDetail(detail, realtimePayload)) {
+      void refreshDetail();
     }
-    const handleRealtimeEvent = (event: Event) => {
-      const payload = parseRealtimeEvent(event);
-      void load();
-      if (realtimeEventMatchesDetail(detail, payload)) {
-        void refreshDetail();
-      }
-    };
-    source.onmessage = handleRealtimeEvent;
-    source.addEventListener('alert.created', handleRealtimeEvent);
-    source.addEventListener('analysis.started', handleRealtimeEvent);
-    source.addEventListener('analysis.completed', handleRealtimeEvent);
-    source.addEventListener('incident.resolved', handleRealtimeEvent);
-    source.addEventListener('feedback.updated', handleRealtimeEvent);
-    return () => source.close();
-  }, [detail, load, refreshDetail]);
+  }, [detail, realtimePayload, refreshDetail]);
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${chatDocked ? 'chat-docked' : ''}`}>
       <aside className="sidebar">
         <button className="brand-mark" onClick={goHome} type="button" aria-label="Go to operations dashboard">
           <img className="brand-logo" src={nvidiaLogo} alt="NVIDIA" />
@@ -1176,7 +1308,7 @@ function App() {
       <UnifiedWorkspace
         detail={detail}
         onClose={() => setDetail(null)}
-        onRefresh={() => void refreshDetail()}
+        onRefresh={refreshDetail}
         onAnalyze={async (id) => {
           await analyzeIncident(id);
           await refreshDetail();
@@ -1193,6 +1325,8 @@ function App() {
         activeView={activeView}
         incidents={operationIncidents}
         alerts={operationAlerts}
+        onDockedChange={setChatDocked}
+        onAnalysisCreated={load}
       />
     </div>
   );
@@ -1230,7 +1364,7 @@ function OperationsView({
       <section className="content-grid">
         <div className="panel">
           <PanelHeader title="Incidents" count={filteredIncidents.length} />
-          <table>
+          <table className="operations-table incidents-table">
             <thead>
               <tr>
                 <th>Incident</th>
@@ -1260,7 +1394,7 @@ function OperationsView({
 
         <div className="panel">
           <PanelHeader title="Alerts" count={filteredAlerts.length} />
-          <table>
+          <table className="operations-table alerts-table">
             <thead>
               <tr>
                 <th>Alert</th>
@@ -1406,6 +1540,9 @@ function AnalysisDashboard({
                     <div className="section-title compact-title">
                       <ListChecks size={18} />
                       <span>{record.title}</span>
+                      <span className={`source-pill source-${analysisSourceClass(record.source)}`}>
+                        {sourceLabel(record.source)}
+                      </span>
                       {record.mock && <span className="sample-pill">Mock</span>}
                     </div>
                     <div className="meta-line">
@@ -1474,7 +1611,8 @@ function AnalysisDashboard({
             );
           })}
           {loading && <p className="empty">Loading analysis...</p>}
-          {!loading && recentRecords.length === 0 && <p className="empty">No matching analysis records.</p>}
+          {!loading && totalCount === 0 && <p className="empty">No analysis records yet.</p>}
+          {!loading && totalCount > 0 && recentRecords.length === 0 && <p className="empty">No matching analysis records.</p>}
         </div>
       </section>
     </>
@@ -1759,7 +1897,7 @@ function UnifiedWorkspace({
 }: {
   detail: DetailState;
   onClose: () => void;
-  onRefresh: () => void;
+  onRefresh: () => Promise<void>;
   onAnalyze: (id: string) => Promise<void>;
   onOpenIncident: (id: string) => Promise<void>;
   onResolve: (id: string) => Promise<void>;
@@ -1794,18 +1932,18 @@ function UnifiedWorkspace({
           </div>
         </div>
         <div className="workspace-actions">
-          <button className="ghost-button" onClick={onClose}><ArrowLeft size={16} /> Back</button>
-          <button className="ghost-button" onClick={onRefresh}><RefreshCw size={16} /> Refresh</button>
+          <button className="ghost-button" onClick={onClose} type="button"><ArrowLeft size={16} /> Back</button>
+          <button className="ghost-button" onClick={() => void onRefresh()} type="button"><RefreshCw size={16} /> Refresh</button>
           {incident && (
             <>
-              <button className="ghost-button" onClick={() => onAnalyze(incident.incident_id)}><Bot size={16} /> Analyze</button>
-              <button className="primary-button" onClick={() => onResolve(incident.incident_id)}><CheckCircle2 size={16} /> Resolve</button>
+              <button className="ghost-button" onClick={() => void onAnalyze(incident.incident_id)} type="button"><Bot size={16} /> Analyze</button>
+              <button className="primary-button" onClick={() => void onResolve(incident.incident_id)} type="button"><CheckCircle2 size={16} /> Resolve</button>
             </>
           )}
           {alert && (
             <>
-              <button className="ghost-button" onClick={() => onOpenIncident(alert.incident_id)}><Link size={16} /> Incident</button>
-              <button className="ghost-button" onClick={() => onAnalyze(alert.incident_id)}><Bot size={16} /> Analyze</button>
+              <button className="ghost-button" onClick={() => void onOpenIncident(alert.incident_id)} type="button"><Link size={16} /> Incident</button>
+              <button className="ghost-button" onClick={() => void onAnalyze(alert.incident_id)} type="button"><Bot size={16} /> Analyze</button>
             </>
           )}
         </div>
@@ -2177,9 +2315,13 @@ function FeedbackPanel({
   targetType: 'incident' | 'alert';
   targetID: string;
   feedback?: FeedbackSummary;
-  onSubmitted: () => void;
+  onSubmitted: () => Promise<void> | void;
 }) {
   const [selectedVote, setSelectedVote] = useState<'up' | 'down' | null>(null);
+  const [localSummary, setLocalSummary] = useState<FeedbackSummary>(() =>
+    normalizeFeedbackSummary(feedback, targetType, targetID),
+  );
+  const [feedbackError, setFeedbackError] = useState('');
   const draftEditor = useEditorHistory('');
   const comment = draftEditor.value;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -2192,34 +2334,47 @@ function FeedbackPanel({
   const [commentMenuID, setCommentMenuID] = useState('');
   const [commentActionID, setCommentActionID] = useState('');
   const [busy, setBusy] = useState(false);
-  const summary = feedback ?? {
-    target_type: targetType,
-    target_id: targetID,
-    positive: 0,
-    negative: 0,
-    comments: [],
-  };
+  const summary = localSummary;
+  const isMockTarget = isMockTargetID(targetID);
 
   useEffect(() => {
-    setSelectedVote(feedback?.my_vote ?? null);
-  }, [targetType, targetID, feedback?.my_vote]);
+    const nextSummary = normalizeFeedbackSummary(feedback, targetType, targetID);
+    setLocalSummary(nextSummary);
+    setSelectedVote(nextSummary.my_vote ?? null);
+    setFeedbackError('');
+  }, [targetType, targetID, feedback]);
 
   useEffect(() => {
     draftEditor.reset('');
     editingEditor.reset('');
     setEditingCommentID('');
     setCommentMenuID('');
+    setCommentActionID('');
     setTab('write');
     setEditingTab('write');
   }, [targetType, targetID]);
 
   const sendVote = async (vote: 'up' | 'down') => {
     setBusy(true);
+    setFeedbackError('');
     try {
       const nextVote = selectedVote === vote ? 'none' : vote;
-      const updated = await submitFeedback(targetType, targetID, nextVote);
+      if (isMockTarget) {
+        const updated = applyFeedbackVote(summary, nextVote);
+        setLocalSummary(updated);
+        setSelectedVote(updated.my_vote ?? null);
+        return;
+      }
+      const updated = normalizeFeedbackSummary(
+        await submitFeedback(targetType, targetID, nextVote),
+        targetType,
+        targetID,
+      );
+      setLocalSummary(updated);
       setSelectedVote(updated.my_vote ?? null);
-      onSubmitted();
+      await onSubmitted();
+    } catch (err) {
+      setFeedbackError(errorMessage(err, 'Failed to submit vote.'));
     } finally {
       setBusy(false);
     }
@@ -2228,11 +2383,25 @@ function FeedbackPanel({
   const sendComment = async () => {
     if (!comment.trim()) return;
     setBusy(true);
+    setFeedbackError('');
     try {
-      await addComment(targetType, targetID, comment);
+      if (isMockTarget) {
+        setLocalSummary((current) => appendMockComment(current, comment.trim()));
+        draftEditor.reset('');
+        setTab('write');
+        return;
+      }
+      const updated = normalizeFeedbackSummary(
+        await addComment(targetType, targetID, comment),
+        targetType,
+        targetID,
+      );
+      setLocalSummary(updated);
       draftEditor.reset('');
       setTab('write');
-      onSubmitted();
+      await onSubmitted();
+    } catch (err) {
+      setFeedbackError(errorMessage(err, 'Failed to add comment.'));
     } finally {
       setBusy(false);
     }
@@ -2241,12 +2410,27 @@ function FeedbackPanel({
   const saveEdit = async () => {
     if (!editingCommentID || !editBody.trim()) return;
     setBusy(true);
+    setFeedbackError('');
     try {
-      await updateComment(targetType, targetID, editingCommentID, editBody);
+      if (isMockTarget) {
+        setLocalSummary((current) => updateMockComment(current, editingCommentID, editBody.trim()));
+        setEditingCommentID('');
+        editingEditor.reset('');
+        setEditingTab('write');
+        return;
+      }
+      const updated = normalizeFeedbackSummary(
+        await updateComment(targetType, targetID, editingCommentID, editBody),
+        targetType,
+        targetID,
+      );
+      setLocalSummary(updated);
       setEditingCommentID('');
       editingEditor.reset('');
       setEditingTab('write');
-      onSubmitted();
+      await onSubmitted();
+    } catch (err) {
+      setFeedbackError(errorMessage(err, 'Failed to update comment.'));
     } finally {
       setBusy(false);
     }
@@ -2262,13 +2446,25 @@ function FeedbackPanel({
   const removeComment = async (commentID: string) => {
     if (!window.confirm('Delete this comment?')) return;
     setCommentActionID(commentID);
+    setFeedbackError('');
     try {
-      await deleteComment(targetType, targetID, commentID);
+      if (isMockTarget) {
+        setLocalSummary((current) => removeMockComment(current, commentID));
+      } else {
+        const updated = normalizeFeedbackSummary(
+          await deleteComment(targetType, targetID, commentID),
+          targetType,
+          targetID,
+        );
+        setLocalSummary(updated);
+        await onSubmitted();
+      }
       if (editingCommentID === commentID) {
         setEditingCommentID('');
         editingEditor.reset('');
       }
-      onSubmitted();
+    } catch (err) {
+      setFeedbackError(errorMessage(err, 'Failed to delete comment.'));
     } finally {
       setCommentActionID('');
       setCommentMenuID('');
@@ -2300,6 +2496,7 @@ function FeedbackPanel({
         </button>
         <strong>{summary.negative}</strong>
       </div>
+      {feedbackError && <p className="feedback-error">{feedbackError}</p>}
 
       {summary.comments.length > 0 && (
         <div className="comment-list">
@@ -2449,11 +2646,15 @@ function FloatingChat({
   activeView,
   incidents,
   alerts,
+  onDockedChange,
+  onAnalysisCreated,
 }: {
   detail: DetailState;
   activeView: MainView;
   incidents: Incident[];
   alerts: AlertRecord[];
+  onDockedChange: (docked: boolean) => void;
+  onAnalysisCreated: () => Promise<void> | void;
 }) {
   const [open, setOpen] = useState(false);
   const [docked, setDocked] = useState(false);
@@ -2483,6 +2684,10 @@ function FloatingChat({
     listRef.current.scrollTop = listRef.current.scrollHeight;
   }, [messages, open, sending]);
 
+  useEffect(() => {
+    onDockedChange(open && docked);
+  }, [docked, onDockedChange, open]);
+
   const send = async () => {
     const message = input.trim();
     if (!message || sending) return;
@@ -2508,7 +2713,13 @@ function FloatingChat({
     try {
       const response = await chat(payload);
       setConversationID(response.conversation_id || conversationID);
-      setMessages((previous) => [...previous, makeChatMessage('assistant', response.answer)]);
+      const answer = response.analysis_run
+        ? `${response.answer}\n\nAnalysis run ${response.analysis_run.run_id} was created and added to the Analysis Dashboard.`
+        : response.answer;
+      setMessages((previous) => [...previous, makeChatMessage('assistant', answer)]);
+      if (response.analysis_run) {
+        void Promise.resolve(onAnalysisCreated()).catch(() => undefined);
+      }
     } catch (error) {
       const text = error instanceof Error ? error.message : 'Chat request failed.';
       setMessages((previous) => [...previous, makeChatMessage('assistant', `Error: ${text}`)]);
@@ -2752,6 +2963,7 @@ function buildAnalysisRecords(alerts: AlertRecord[], analysisRuns: AnalysisRun[]
         alertID: alert.alert_id,
         title: alert.alarm_title || alert.labels.alertname || alert.alert_id,
         target: targetLine(alert.labels),
+        source: 'auto',
         severity: alert.severity,
         alertStatus: alert.status,
         analysisStatus,
@@ -2777,6 +2989,7 @@ function buildAnalysisRecords(alerts: AlertRecord[], analysisRuns: AnalysisRun[]
     alertID: run.alert_id || undefined,
     title: run.title || `${sourceLabel(run.source)} analysis`,
     target: `${run.target_type} / ${run.target_id}`,
+    source: normalizeAnalysisSource(run.source),
     severity: 'warning',
     alertStatus: run.status,
     analysisStatus: run.status === 'complete' || run.status === 'failed' ? run.status : 'analyzing',
@@ -2805,16 +3018,31 @@ function buildAnalysisRecords(alerts: AlertRecord[], analysisRuns: AnalysisRun[]
 }
 
 function sourceLabel(source: string) {
-  switch (source) {
+  switch (normalizeAnalysisSource(source)) {
+    case 'auto':
+      return 'Auto';
+    case 'manual':
+      return 'Manual';
     case 'comment':
-      return 'Comment reanalysis';
+      return 'Comment';
     case 'feedback':
-      return 'Feedback reanalysis';
+      return 'Feedback';
     case 'chat':
-      return 'Chat analysis';
+      return 'Chat';
     default:
       return 'RCA';
   }
+}
+
+function normalizeAnalysisSource(source: string) {
+  if (['auto', 'manual', 'comment', 'feedback', 'chat'].includes(source)) {
+    return source;
+  }
+  return 'manual';
+}
+
+function analysisSourceClass(source: string) {
+  return normalizeAnalysisSource(source);
 }
 
 function buildAnalysisAnalytics(
