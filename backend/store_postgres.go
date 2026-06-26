@@ -61,7 +61,12 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 	pgvectorReady := true
 	if _, err := s.db.ExecContext(ctx, `CREATE EXTENSION IF NOT EXISTS vector`); err != nil {
 		pgvectorReady = false
-		log.Printf("pgvector=unavailable, fallback=jsonb: CREATE EXTENSION vector failed: %v", err)
+		s.pgvectorDetail = classifyPGVectorError(err)
+		log.Printf(
+			"WARNING: pgvector disabled, using JSONB sparse-vector fallback for similar-incident search. "+
+				"Reason: %v. Remediation: %s",
+			err, s.pgvectorDetail,
+		)
 	}
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS incidents (
@@ -207,6 +212,28 @@ func (s *Store) ensureVectorColumn(ctx context.Context) {
 			log.Printf("pgvector column/index setup skipped: %v", err)
 			return
 		}
+	}
+}
+
+// classifyPGVectorError turns a failed `CREATE EXTENSION vector` into an
+// actionable remediation hint for operators, distinguishing the two common
+// causes on an existing/external Postgres: the extension binary is not installed
+// on the server, or the application database user lacks the privilege to create
+// it. The hint is logged at startup and surfaced in /healthz so the JSONB
+// fallback is never silent.
+func classifyPGVectorError(err error) string {
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "permission denied"), strings.Contains(msg, "must be superuser"):
+		return "the database user lacks privilege to create the extension; " +
+			"have a superuser run `CREATE EXTENSION vector;` in this database once (or grant the privilege)"
+	case strings.Contains(msg, "is not available"),
+		strings.Contains(msg, "could not open extension control file"),
+		strings.Contains(msg, "no such file"):
+		return "the pgvector extension is not installed on the Postgres server; " +
+			"install the pgvector package/image on the server, then `CREATE EXTENSION vector;`"
+	default:
+		return "verify pgvector is installed on the server and the app user may `CREATE EXTENSION vector;`"
 	}
 }
 
@@ -675,6 +702,7 @@ func (s *Store) persistMemoryLocked(memory *IncidentMemory) {
 			return
 		}
 		log.Printf("Failed to persist incident memory %s with pgvector, falling back to jsonb: %v", memory.IncidentID, err)
+	}
 	_, err := s.db.ExecContext(
 		context.Background(),
 		`INSERT INTO incident_embeddings (

@@ -68,6 +68,10 @@ func TestPostgresConnectFallsBackToJSONBWhenPGVectorUnavailable(t *testing.T) {
 		health["similarity_search"] != similaritySearchJSONB {
 		t.Fatalf("expected JSONB fallback health, got %+v", health)
 	}
+	detail, ok := health["pgvector_detail"].(string)
+	if !ok || !strings.Contains(detail, "not installed") {
+		t.Fatalf("expected actionable pgvector_detail remediation hint, got %+v", health["pgvector_detail"])
+	}
 
 	assertLoadedPostgresMemory(t, store)
 }
@@ -196,7 +200,7 @@ func (c *fakePostgresConn) ExecContext(_ context.Context, query string, _ []driv
 	c.state.mu.Unlock()
 
 	if c.state.failCreateVector && strings.Contains(query, "CREATE EXTENSION IF NOT EXISTS vector") {
-		return nil, errors.New("extension vector is not installed")
+		return nil, errors.New(`extension "vector" is not available`)
 	}
 	return driver.RowsAffected(1), nil
 }
