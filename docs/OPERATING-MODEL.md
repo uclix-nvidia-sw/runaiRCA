@@ -23,6 +23,11 @@ Run:AI RCA is read-only by default.
   `runai` and `runai-backend` by default.
 - Postgres Agent inspects RCA store connectivity, pgvector, embeddings,
   feedback, comments, and memory health.
+- Store/Postgres ownership includes verifying the target database exists, the
+  backend user can create/update RCA tables, and pgvector is installed plus
+  enabled with `CREATE EXTENSION vector;` when true pgvector readiness is
+  required. Without pgvector, the backend should remain healthy with JSONB
+  sparse-vector memory fallback.
 - Analysis Agent produces the KubeRCA-style dashboard RCA: root cause,
   confidence, impact, missing data, recommended manual actions, prevention, and
   evidence coverage.

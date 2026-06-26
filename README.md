@@ -257,8 +257,14 @@ Secret key names, set `secrets.keys.*` to match them.
 For an existing Postgres, set `secrets.databaseUrl` or provide a Secret through
 `secrets.existingSecret`. By default the chart reads `DATABASE_URL` and
 `POSTGRES_DSN`; if your existing Secret uses different key names, set
-`secrets.keys.databaseUrl` and `secrets.keys.postgresDsn`. For a bundled
-single-pod Postgres, enable:
+`secrets.keys.databaseUrl` and `secrets.keys.postgresDsn`. The existing database
+must already exist and the backend user needs table create/read/write
+privileges. pgvector is a database-server prerequisite: the extension binary
+must be installed on that Postgres server, and a DBA/admin may need to run
+`CREATE EXTENSION IF NOT EXISTS vector;` inside every database such as
+`runai_rca` before the backend starts.
+
+For a bundled single-pod Postgres, enable:
 
 ```bash
 helm install runai-rca charts/runai-rca \
@@ -273,7 +279,10 @@ instead, set `secrets.databaseExistingSecret`.
 Bundled Postgres usernames, passwords, and database names are URL-encoded when
 the chart generates `DATABASE_URL` / `POSTGRES_DSN`; externally supplied DSNs in
 `secrets.databaseUrl`, `secrets.postgresDsn`, or existing Secrets should already
-be valid Postgres URLs.
+be valid Postgres URLs. The default bundled image is `postgres:16-alpine`, so do
+not treat it as a pgvector image. If pgvector is unavailable, the backend logs
+`pgvector=unavailable, fallback=jsonb` and continues to serve similar-incident
+search from JSONB sparse vectors in `incident_embeddings.vector_json`.
 
 The Agent uses read-only cluster-wide RBAC by default so it can inspect target
 pods, Run:ai control-plane namespaces, and node context. To limit it to selected
@@ -358,10 +367,11 @@ When `DATABASE_URL` is configured, the backend creates and uses `incidents`,
 `alerts`, `incident_embeddings`, `rca_feedback`, `rca_comments`, and
 `analysis_runs`. Comments and chat requests that explicitly ask for analysis
 create separate analysis runs, so the Analysis Dashboard can track them without
-overwriting the original RCA. If the pgvector extension is not available, the
-backend still stores sparse text vectors in JSONB and serves similar-incident
-search. When `POSTGRES_DSN` is configured, the Postgres agent checks
-connectivity, active connections, long-running transactions, pgvector
+overwriting the original RCA. On startup it logs `pgvector=enabled` when
+`CREATE EXTENSION vector` succeeds. If the pgvector extension is not available,
+the backend still stores sparse text vectors in JSONB and serves
+similar-incident search. When `POSTGRES_DSN` is configured, the Postgres agent
+checks connectivity, active connections, long-running transactions, pgvector
 availability, and expected RCA table presence. If it is not configured, the
 agent marks Postgres evidence as unavailable without blocking the rest of the
 RCA.
