@@ -106,8 +106,8 @@ type AgentSummary = {
 
 type AnalysisRecord = {
   id: string;
-  incidentID: string;
-  alertID: string;
+  incidentID?: string;
+  alertID?: string;
   title: string;
   target: string;
   severity: string;
@@ -1309,73 +1309,83 @@ function AnalysisDashboard({
       <section className="panel view-panel">
         <PanelHeader title="Recent analyses" count={recentRecords.length} />
         <div className="analysis-list">
-          {recentRecords.map((record) => (
-            <article className="analysis-card" key={record.id}>
-              <div className="analysis-card-head">
-                <div>
-                  <div className="section-title compact-title">
-                    <ListChecks size={18} />
-                    <span>{record.title}</span>
-                    {record.mock && <span className="sample-pill">Mock</span>}
+          {recentRecords.map((record) => {
+            const alertID = record.alertID;
+            const incidentID = record.incidentID;
+            return (
+              <article className="analysis-card" key={record.id}>
+                <div className="analysis-card-head">
+                  <div>
+                    <div className="section-title compact-title">
+                      <ListChecks size={18} />
+                      <span>{record.title}</span>
+                      {record.mock && <span className="sample-pill">Mock</span>}
+                    </div>
+                    <div className="meta-line">
+                      <span>{record.alertID || record.id}</span>
+                      <span>{record.target}</span>
+                      <Severity value={record.severity} />
+                      <Status value={record.analysisStatus} />
+                    </div>
                   </div>
-                  <div className="meta-line">
-                    <span>{record.alertID}</span>
-                    <span>{record.target}</span>
-                    <Severity value={record.severity} />
-                    <Status value={record.analysisStatus} />
-                  </div>
+                  <strong className={`quality quality-${record.quality || 'pending'}`}>{record.quality || 'pending'}</strong>
                 </div>
-                <strong className={`quality quality-${record.quality || 'pending'}`}>{record.quality || 'pending'}</strong>
-              </div>
 
-              <p className="analysis-summary">
-                {record.summary || 'Analysis has not produced a summary yet.'}
-              </p>
+                <p className="analysis-summary">
+                  {record.summary || 'Analysis has not produced a summary yet.'}
+                </p>
 
-              <div className="coverage-strip">
-                {COMPONENT_AGENT_ORDER.map((agent) => (
-                  <span className={`coverage-pill coverage-${record.capabilities[agent] || 'pending'}`} key={agent}>
-                    {agentIcon(agent)}
-                    {agentLabel(agent)}
-                    <strong>{record.capabilities[agent] || 'pending'}</strong>
-                  </span>
-                ))}
-              </div>
-
-              <div className="analysis-grid">
-                <span>Artifacts <strong>{record.artifactCount}</strong></span>
-                <span>Similar <strong>{record.similarCount}</strong></span>
-                <span>Feedback <strong>{record.positiveFeedback}/{record.negativeFeedback}</strong></span>
-                <span>Comments <strong>{record.commentCount}</strong></span>
-              </div>
-
-              {(record.missingData.length > 0 || record.warnings.length > 0) && (
-                <div className="analysis-flags">
-                  {record.missingData.slice(0, 3).map((item) => (
-                    <span key={`missing-${record.id}-${item}`}>{item}</span>
-                  ))}
-                  {record.warnings.slice(0, 3).map((item) => (
-                    <span key={`warning-${record.id}-${item}`}>{item}</span>
+                <div className="coverage-strip">
+                  {COMPONENT_AGENT_ORDER.map((agent) => (
+                    <span className={`coverage-pill coverage-${record.capabilities[agent] || 'pending'}`} key={agent}>
+                      {agentIcon(agent)}
+                      {agentLabel(agent)}
+                      <strong>{record.capabilities[agent] || 'pending'}</strong>
+                    </span>
                   ))}
                 </div>
-              )}
 
-              <div className="analysis-actions">
-                <span>{formatTime(record.createdAt)}</span>
-                <div>
-                  <button className="ghost-button" onClick={() => void onOpenAlert(record.alertID)} type="button">
-                    <FileText size={16} /> Open report
-                  </button>
-                  <button className="ghost-button" onClick={() => void onOpenIncident(record.incidentID)} type="button">
-                    <ArrowLeft size={16} /> Incident
-                  </button>
-                  <button className="primary-button" onClick={() => void onAnalyze(record.incidentID)} type="button">
-                    <Bot size={16} /> Analyze
-                  </button>
+                <div className="analysis-grid">
+                  <span>Artifacts <strong>{record.artifactCount}</strong></span>
+                  <span>Similar <strong>{record.similarCount}</strong></span>
+                  <span>Feedback <strong>{record.positiveFeedback}/{record.negativeFeedback}</strong></span>
+                  <span>Comments <strong>{record.commentCount}</strong></span>
                 </div>
-              </div>
-            </article>
-          ))}
+
+                {(record.missingData.length > 0 || record.warnings.length > 0) && (
+                  <div className="analysis-flags">
+                    {record.missingData.slice(0, 3).map((item) => (
+                      <span key={`missing-${record.id}-${item}`}>{item}</span>
+                    ))}
+                    {record.warnings.slice(0, 3).map((item) => (
+                      <span key={`warning-${record.id}-${item}`}>{item}</span>
+                    ))}
+                  </div>
+                )}
+
+                <div className="analysis-actions">
+                  <span>{formatTime(record.createdAt)}</span>
+                  <div>
+                    {alertID && (
+                      <button className="ghost-button" onClick={() => void onOpenAlert(alertID)} type="button">
+                        <FileText size={16} /> Open report
+                      </button>
+                    )}
+                    {incidentID && (
+                      <button className="ghost-button" onClick={() => void onOpenIncident(incidentID)} type="button">
+                        <ArrowLeft size={16} /> Incident
+                      </button>
+                    )}
+                    {incidentID && (
+                      <button className="primary-button" onClick={() => void onAnalyze(incidentID)} type="button">
+                        <Bot size={16} /> Analyze
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </article>
+            );
+          })}
           {loading && <p className="empty">Loading analysis...</p>}
           {!loading && recentRecords.length === 0 && <p className="empty">No matching analysis records.</p>}
         </div>
@@ -2636,8 +2646,8 @@ function buildAnalysisRecords(alerts: AlertRecord[], analysisRuns: AnalysisRun[]
     })
   const runRecords = analysisRuns.map((run) => ({
     id: run.run_id,
-    incidentID: run.incident_id || '',
-    alertID: run.alert_id || '',
+    incidentID: run.incident_id || undefined,
+    alertID: run.alert_id || undefined,
     title: run.title || `${sourceLabel(run.source)} analysis`,
     target: `${run.target_type} / ${run.target_id}`,
     severity: 'warning',
