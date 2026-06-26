@@ -48,6 +48,18 @@ func TestAlertmanagerWebhookCreatesIncidentAndAlert(t *testing.T) {
 	}
 }
 
+func TestAgentRequestTimeoutConfig(t *testing.T) {
+	t.Setenv("AGENT_REQUEST_TIMEOUT_SECONDS", "7")
+	server := NewServer()
+
+	if server.agentRequestTimeout != 7*time.Second {
+		t.Fatalf("expected agent request timeout from env, got %s", server.agentRequestTimeout)
+	}
+	if server.client.Timeout != 7*time.Second {
+		t.Fatalf("expected http client timeout from env, got %s", server.client.Timeout)
+	}
+}
+
 func TestChatRouteProxiesContextualRCARequestToAgent(t *testing.T) {
 	server := NewServer()
 	agentReqCh := make(chan ChatRequest, 1)

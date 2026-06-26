@@ -1730,11 +1730,12 @@ func (h *Hub) Broadcast(event Event) {
 }
 
 type Server struct {
-	store    *Store
-	hub      *Hub
-	agentURL string
-	language string
-	client   *http.Client
+	store               *Store
+	hub                 *Hub
+	agentURL            string
+	language            string
+	agentRequestTimeout time.Duration
+	client              *http.Client
 }
 
 func main() {
@@ -1752,12 +1753,17 @@ func NewServer() *Server {
 		first(os.Getenv("DATABASE_URL"), os.Getenv("POSTGRES_DSN")),
 		time.Duration(getenvInt("DATABASE_CONNECT_TIMEOUT_SECONDS", 5))*time.Second,
 	)
+	agentRequestTimeout := time.Duration(getenvInt("AGENT_REQUEST_TIMEOUT_SECONDS", 180)) * time.Second
+	if agentRequestTimeout <= 0 {
+		agentRequestTimeout = 180 * time.Second
+	}
 	return &Server{
-		store:    store,
-		hub:      NewHub(),
-		agentURL: strings.TrimRight(getenv("AGENT_URL", "http://localhost:8000"), "/"),
-		language: getenv("LANGUAGE", "en"),
-		client:   &http.Client{Timeout: 20 * time.Second},
+		store:               store,
+		hub:                 NewHub(),
+		agentURL:            strings.TrimRight(getenv("AGENT_URL", "http://localhost:8000"), "/"),
+		language:            getenv("LANGUAGE", "en"),
+		agentRequestTimeout: agentRequestTimeout,
+		client:              &http.Client{Timeout: agentRequestTimeout},
 	}
 }
 
@@ -2324,7 +2330,7 @@ func (s *Server) requestChat(req ChatRequest) (ChatResponse, error) {
 	if err != nil {
 		return ChatResponse{}, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), s.agentRequestTimeout)
 	defer cancel()
 	httpReq, err := http.NewRequestWithContext(
 		ctx,

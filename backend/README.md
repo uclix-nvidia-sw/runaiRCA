@@ -37,6 +37,7 @@ go test ./...
 | --- | --- | --- |
 | `PORT` | `8080` | HTTP port |
 | `AGENT_URL` | `http://localhost:8000` | Agent API base URL |
+| `AGENT_REQUEST_TIMEOUT_SECONDS` | `180` | Timeout for Agent `/analyze` and `/chat` requests |
 | `DATABASE_URL` | empty | Postgres store DSN |
 | `POSTGRES_DSN` | empty | Fallback store DSN and Agent diagnostic DSN |
 | `DATABASE_CONNECT_TIMEOUT_SECONDS` | `5` | Startup timeout for Postgres connection and schema initialization |

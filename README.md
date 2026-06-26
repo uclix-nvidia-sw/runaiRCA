@@ -137,7 +137,9 @@ Core environment variables:
 
 | Variable | Purpose |
 | --- | --- |
+| `PORT` | Backend/Agent HTTP port; Helm maps this from the component service port |
 | `AGENT_URL` | Backend to Agent URL, default `http://localhost:8000` |
+| `AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for Agent `/analyze` and `/chat` requests, default `180` |
 | `LOG_LEVEL` | Agent log level, default `info` |
 | `LANGUAGE` | Backend/Agent response language, `en` or `ko` |
 | `KUBERNETES_API_URL` | In-cluster Kubernetes API URL, default `https://kubernetes.default.svc` |
@@ -257,7 +259,7 @@ Frequently tuned Helm values:
 | `{backend,agent,frontend,postgresql}.resources` | CPU/memory requests and limits for production scheduling |
 | `backend.env.agentUrl` | Override Backend-to-Agent URL when the Agent is external or remote |
 | `backend.env.language` / `agent.env.language` | Set RCA language to `en` or `ko` |
-| `backend.env.databaseConnectTimeoutSeconds` | Backend startup timeout for the Postgres store connection |
+| `backend.env.databaseConnectTimeoutSeconds` / `agentRequestTimeoutSeconds` | Backend startup DB timeout and Backend-to-Agent request timeout |
 | `secrets.keys.*` | Existing Secret key names for DB, Run:ai, and NVIDIA credentials |
 | `secrets.existingSecret` | Existing Secret for Run:ai/NVIDIA credentials and, by default, DB keys |
 | `secrets.databaseExistingSecret` | Existing Secret used only for `DATABASE_URL` / `POSTGRES_DSN` |

@@ -70,6 +70,7 @@ backend:
     agentUrl: ""
     language: en
     databaseConnectTimeoutSeconds: 5
+    agentRequestTimeoutSeconds: 180
   service:
     annotations: {}
     type: ClusterIP
