@@ -895,7 +895,7 @@ function useDashboardData() {
       setAnalysisRuns([]);
       setDataState('backend-down');
       const message = err instanceof Error ? err.message : 'Failed to load dashboard data.';
-      setError(ENABLE_MOCK_DATA ? `Backend unavailable, showing mock data: ${message}` : message);
+      setError(ENABLE_MOCK_DATA ? '' : message);
     } finally {
       setLoading(false);
     }
@@ -1369,16 +1369,23 @@ function OperationsView({
   onOpenIncident: (id: string) => Promise<void>;
   onOpenAlert: (id: string) => Promise<void>;
 }) {
+  let openCount = 0;
+  let resolvedCount = 0;
+  let analyzingIncidentCount = 0;
+  for (const i of incidents) {
+    if (i.status === 'resolved') resolvedCount++;
+    else openCount++;
+    if (i.is_analyzing) analyzingIncidentCount++;
+  }
+  const analyzingCount = alerts.filter((alert) => alert.is_analyzing).length + analyzingIncidentCount;
+
   return (
     <>
       <section className="metric-row">
-        <Metric label="Open incidents" value={incidents.filter((i) => i.status !== 'resolved').length} />
+        <Metric label="Open incidents" value={openCount} />
         <Metric label="Alerts" value={alerts.length} />
-        <Metric
-          label="Analyzing"
-          value={alerts.filter((alert) => alert.is_analyzing).length + incidents.filter((i) => i.is_analyzing).length}
-        />
-        <Metric label="Postgres agent" value="Ready" />
+        <Metric label="Analyzing" value={analyzingCount} />
+        <Metric label="Resolved incidents" value={resolvedCount} />
       </section>
 
       <section className="content-grid">
@@ -1575,7 +1582,7 @@ function AnalysisDashboard({
                     {COMPONENT_AGENT_ORDER.map((agent) => (
                       <span className={`coverage-pill coverage-${record.capabilities[agent] || 'pending'}`} key={agent}>
                         {agentIcon(agent)}
-                        {agentLabel(agent)}
+                        <span className="coverage-label">{agentLabel(agent)}</span>
                         <strong>{record.capabilities[agent] || 'pending'}</strong>
                       </span>
                     ))}
