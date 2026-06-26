@@ -153,6 +153,63 @@ func (s *Store) MarkAnalyzing(incidentID string, analyzing bool) {
 	}
 }
 
+// BeginAnalyzing flags the incident and alert as analyzing so the dashboard can
+// render an in-progress state for the whole lifecycle.
+func (s *Store) BeginAnalyzing(incidentID string, alertID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if incident := s.incidents[incidentID]; incident != nil {
+		incident.IsAnalyzing = true
+		s.persistIncidentLocked(incident)
+	}
+	if alert := s.alerts[alertID]; alert != nil {
+		alert.IsAnalyzing = true
+		s.persistAlertLocked(alert)
+	}
+}
+
+// ApplyFallbackAnalysisIfAbsent implements the overwrite policy for failed runs:
+// a successful RCA already attached to the alert is always preserved, and the
+// fallback RCA is only surfaced on the alert when there is nothing to keep. It
+// returns true when the fallback was written. The analyzing flags are cleared in
+// both cases. Fallback RCA is never written to incident memory.
+func (s *Store) ApplyFallbackAnalysisIfAbsent(alertID string, response AgentAnalysisResponse) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	alert := s.alerts[alertID]
+	if alert == nil {
+		return false
+	}
+	hasExistingRCA := strings.TrimSpace(alert.AnalysisSummary) != "" ||
+		strings.TrimSpace(alert.AnalysisDetail) != ""
+	if hasExistingRCA {
+		alert.IsAnalyzing = false
+		if incident := s.incidents[alert.IncidentID]; incident != nil {
+			incident.IsAnalyzing = false
+			s.persistIncidentLocked(incident)
+		}
+		s.persistAlertLocked(alert)
+		return false
+	}
+	alert.AnalysisSummary = response.AnalysisSummary
+	alert.AnalysisDetail = response.AnalysisDetail
+	if alert.AnalysisDetail == "" {
+		alert.AnalysisDetail = response.Analysis
+	}
+	alert.AnalysisQuality = first(response.AnalysisQuality, "low")
+	alert.Capabilities = response.Capabilities
+	alert.MissingData = response.MissingData
+	alert.Warnings = response.Warnings
+	alert.Artifacts = response.Artifacts
+	alert.IsAnalyzing = false
+	if incident := s.incidents[alert.IncidentID]; incident != nil {
+		incident.IsAnalyzing = false
+		s.persistIncidentLocked(incident)
+	}
+	s.persistAlertLocked(alert)
+	return true
+}
+
 func (s *Store) upsertMemoryLocked(incident *Incident, alert *AlertRecord) {
 	if strings.TrimSpace(alert.AnalysisSummary) == "" && strings.TrimSpace(alert.AnalysisDetail) == "" {
 		return

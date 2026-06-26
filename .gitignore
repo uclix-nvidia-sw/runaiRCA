@@ -9,6 +9,7 @@ __pycache__/
 
 # Go
 backend/runai-rca-backend
+backend/backend
 
 # Node
 node_modules/
