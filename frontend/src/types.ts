@@ -53,6 +53,27 @@ export type FeedbackSummary = {
   learning_hints?: FeedbackHint[];
 };
 
+export type AnalysisRun = {
+  run_id: string;
+  source: string;
+  status: string;
+  target_type: string;
+  target_id: string;
+  incident_id?: string;
+  alert_id?: string;
+  title: string;
+  prompt?: string;
+  analysis_summary: string;
+  analysis_detail: string;
+  analysis_quality: string;
+  capabilities: Record<string, string>;
+  missing_data: string[];
+  warnings: string[];
+  artifacts: Artifact[];
+  created_at: string;
+  updated_at: string;
+};
+
 export type Incident = {
   incident_id: string;
   correlation_key: string;

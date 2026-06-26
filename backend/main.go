@@ -110,6 +110,27 @@ type FeedbackSummary struct {
 	LearningHints []FeedbackHint  `json:"learning_hints,omitempty"`
 }
 
+type AnalysisRun struct {
+	RunID           string            `json:"run_id"`
+	Source          string            `json:"source"`
+	Status          string            `json:"status"`
+	TargetType      string            `json:"target_type"`
+	TargetID        string            `json:"target_id"`
+	IncidentID      string            `json:"incident_id,omitempty"`
+	AlertID         string            `json:"alert_id,omitempty"`
+	Title           string            `json:"title"`
+	Prompt          string            `json:"prompt,omitempty"`
+	AnalysisSummary string            `json:"analysis_summary"`
+	AnalysisDetail  string            `json:"analysis_detail"`
+	AnalysisQuality string            `json:"analysis_quality"`
+	Capabilities    map[string]string `json:"capabilities"`
+	MissingData     []string          `json:"missing_data"`
+	Warnings        []string          `json:"warnings"`
+	Artifacts       []Artifact        `json:"artifacts"`
+	CreatedAt       time.Time         `json:"created_at"`
+	UpdatedAt       time.Time         `json:"updated_at"`
+}
+
 type FeedbackRequest struct {
 	Vote     string `json:"vote"`
 	VoteType string `json:"vote_type,omitempty"`
@@ -236,11 +257,12 @@ type ChatRequest struct {
 }
 
 type ChatResponse struct {
-	Status         string `json:"status"`
-	Answer         string `json:"answer"`
-	Message        string `json:"message,omitempty"`
-	Response       string `json:"response,omitempty"`
-	ConversationID string `json:"conversation_id"`
+	Status         string       `json:"status"`
+	Answer         string       `json:"answer"`
+	Message        string       `json:"message,omitempty"`
+	Response       string       `json:"response,omitempty"`
+	ConversationID string       `json:"conversation_id"`
+	AnalysisRun    *AnalysisRun `json:"analysis_run,omitempty"`
 }
 
 type Event struct {
@@ -249,21 +271,23 @@ type Event struct {
 }
 
 type Store struct {
-	mu            sync.RWMutex
-	incidentSeq   atomic.Int64
-	alertSeq      atomic.Int64
-	feedbackSeq   atomic.Int64
-	commentSeq    atomic.Int64
-	incidents     map[string]*Incident
-	incidentByKey map[string]string
-	alerts        map[string]*AlertRecord
-	alertByFinger map[string]string
-	memories      map[string]*IncidentMemory
-	feedback      map[string]*FeedbackRecord
-	comments      map[string]*CommentRecord
-	db            *sql.DB
-	dbReady       bool
-	pgvectorReady bool
+	mu             sync.RWMutex
+	incidentSeq    atomic.Int64
+	alertSeq       atomic.Int64
+	feedbackSeq    atomic.Int64
+	commentSeq     atomic.Int64
+	analysisRunSeq atomic.Int64
+	incidents      map[string]*Incident
+	incidentByKey  map[string]string
+	alerts         map[string]*AlertRecord
+	alertByFinger  map[string]string
+	memories       map[string]*IncidentMemory
+	feedback       map[string]*FeedbackRecord
+	comments       map[string]*CommentRecord
+	analysisRuns   map[string]*AnalysisRun
+	db             *sql.DB
+	dbReady        bool
+	pgvectorReady  bool
 }
 
 func NewStore() *Store {
@@ -275,6 +299,7 @@ func NewStore() *Store {
 		memories:      make(map[string]*IncidentMemory),
 		feedback:      make(map[string]*FeedbackRecord),
 		comments:      make(map[string]*CommentRecord),
+		analysisRuns:  make(map[string]*AnalysisRun),
 	}
 }
 
@@ -402,9 +427,31 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			author TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`CREATE TABLE IF NOT EXISTS analysis_runs (
+			run_id TEXT PRIMARY KEY,
+			source TEXT NOT NULL,
+			status TEXT NOT NULL,
+			target_type TEXT NOT NULL,
+			target_id TEXT NOT NULL,
+			incident_id TEXT,
+			alert_id TEXT,
+			title TEXT NOT NULL,
+			prompt TEXT NOT NULL DEFAULT '',
+			analysis_summary TEXT NOT NULL DEFAULT '',
+			analysis_detail TEXT NOT NULL DEFAULT '',
+			analysis_quality TEXT NOT NULL DEFAULT '',
+			capabilities JSONB NOT NULL DEFAULT '{}'::jsonb,
+			missing_data JSONB NOT NULL DEFAULT '[]'::jsonb,
+			warnings JSONB NOT NULL DEFAULT '[]'::jsonb,
+			artifacts JSONB NOT NULL DEFAULT '[]'::jsonb,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_alerts_incident_id ON alerts (incident_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_feedback_target ON rca_feedback (target_type, target_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_comments_target ON rca_comments (target_type, target_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_created_at ON analysis_runs (created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_target ON analysis_runs (target_type, target_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_embeddings_created_at ON incident_embeddings (created_at DESC)`,
 	}
 	for _, statement := range statements {
@@ -426,6 +473,7 @@ func (s *Store) loadDatabaseState(ctx context.Context) {
 	s.loadMemories(ctx)
 	s.loadFeedback(ctx)
 	s.loadComments(ctx)
+	s.loadAnalysisRuns(ctx)
 }
 
 func (s *Store) loadIncidents(ctx context.Context) {
@@ -628,6 +676,56 @@ func (s *Store) loadComments(ctx context.Context) {
 	}
 }
 
+func (s *Store) loadAnalysisRuns(ctx context.Context) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT run_id, source, status, target_type, target_id, incident_id,
+		        alert_id, title, prompt, analysis_summary, analysis_detail,
+		        analysis_quality, capabilities, missing_data, warnings, artifacts,
+		        created_at, updated_at
+		   FROM analysis_runs`,
+	)
+	if err != nil {
+		log.Printf("Failed to load analysis runs: %v", err)
+		return
+	}
+	defer rows.Close()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for rows.Next() {
+		var run AnalysisRun
+		var capabilitiesRaw, missingRaw, warningsRaw, artifactsRaw []byte
+		if err := rows.Scan(
+			&run.RunID,
+			&run.Source,
+			&run.Status,
+			&run.TargetType,
+			&run.TargetID,
+			&run.IncidentID,
+			&run.AlertID,
+			&run.Title,
+			&run.Prompt,
+			&run.AnalysisSummary,
+			&run.AnalysisDetail,
+			&run.AnalysisQuality,
+			&capabilitiesRaw,
+			&missingRaw,
+			&warningsRaw,
+			&artifactsRaw,
+			&run.CreatedAt,
+			&run.UpdatedAt,
+		); err != nil {
+			log.Printf("Failed to scan analysis run: %v", err)
+			continue
+		}
+		_ = json.Unmarshal(capabilitiesRaw, &run.Capabilities)
+		_ = json.Unmarshal(missingRaw, &run.MissingData)
+		_ = json.Unmarshal(warningsRaw, &run.Warnings)
+		_ = json.Unmarshal(artifactsRaw, &run.Artifacts)
+		s.analysisRuns[run.RunID] = &run
+	}
+}
+
 func (s *Store) UpsertAlert(webhook AlertmanagerWebhook, alert Alert) (*Incident, *AlertRecord) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -713,6 +811,130 @@ func (s *Store) ListAlerts() []AlertRecord {
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].FiredAt.After(items[j].FiredAt) })
 	return items
+}
+
+func (s *Store) ListAnalysisRuns() []AnalysisRun {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	items := make([]AnalysisRun, 0, len(s.analysisRuns))
+	for _, run := range s.analysisRuns {
+		items = append(items, cloneAnalysisRun(run))
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].CreatedAt.After(items[j].CreatedAt) })
+	return items
+}
+
+func (s *Store) CreateAnalysisRun(
+	source string,
+	targetType string,
+	targetID string,
+	incidentID string,
+	alertID string,
+	title string,
+	prompt string,
+) AnalysisRun {
+	now := time.Now().UTC()
+	run := &AnalysisRun{
+		RunID:        nextID("ANL", s.analysisRunSeq.Add(1)),
+		Source:       first(source, "manual"),
+		Status:       "analyzing",
+		TargetType:   targetType,
+		TargetID:     targetID,
+		IncidentID:   incidentID,
+		AlertID:      alertID,
+		Title:        first(title, "RCA analysis request"),
+		Prompt:       strings.TrimSpace(prompt),
+		Capabilities: map[string]string{},
+		MissingData:  []string{},
+		Warnings:     []string{},
+		Artifacts:    []Artifact{},
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.analysisRuns[run.RunID] = run
+	s.persistAnalysisRunLocked(run)
+	return cloneAnalysisRun(run)
+}
+
+func (s *Store) CompleteAnalysisRun(runID string, response AgentAnalysisResponse) (AnalysisRun, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run := s.analysisRuns[runID]
+	if run == nil {
+		return AnalysisRun{}, false
+	}
+	run.Status = "complete"
+	run.AnalysisSummary = response.AnalysisSummary
+	run.AnalysisDetail = response.AnalysisDetail
+	if run.AnalysisDetail == "" {
+		run.AnalysisDetail = response.Analysis
+	}
+	run.AnalysisQuality = response.AnalysisQuality
+	run.Capabilities = response.Capabilities
+	run.MissingData = response.MissingData
+	run.Warnings = response.Warnings
+	run.Artifacts = response.Artifacts
+	run.UpdatedAt = time.Now().UTC()
+	s.persistAnalysisRunLocked(run)
+	return cloneAnalysisRun(run), true
+}
+
+func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (AnalysisRun, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run := s.analysisRuns[runID]
+	if run == nil {
+		return AnalysisRun{}, false
+	}
+	run.Status = "failed"
+	run.AnalysisSummary = response.AnalysisSummary
+	run.AnalysisDetail = response.AnalysisDetail
+	if run.AnalysisDetail == "" {
+		run.AnalysisDetail = response.Analysis
+	}
+	run.AnalysisQuality = first(response.AnalysisQuality, "low")
+	run.Capabilities = response.Capabilities
+	run.MissingData = response.MissingData
+	run.Warnings = response.Warnings
+	run.Artifacts = response.Artifacts
+	run.UpdatedAt = time.Now().UTC()
+	s.persistAnalysisRunLocked(run)
+	return cloneAnalysisRun(run), true
+}
+
+func (s *Store) AnalysisTarget(targetType string, targetID string) (Alert, string, string, string, string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	switch targetType {
+	case "alert":
+		alert := s.alerts[targetID]
+		if alert == nil {
+			return Alert{}, "", "", "", "", false
+		}
+		return alertFromRecord(*alert), alert.IncidentID, alert.AlertID, alert.ThreadTS, alert.AlarmTitle, true
+	case "incident":
+		incident := s.incidents[targetID]
+		if incident == nil {
+			return Alert{}, "", "", "", "", false
+		}
+		var selected *AlertRecord
+		for _, alert := range s.alerts {
+			if alert.IncidentID != targetID {
+				continue
+			}
+			if selected == nil || alert.FiredAt.After(selected.FiredAt) {
+				selected = alert
+			}
+		}
+		if selected == nil {
+			return Alert{}, "", "", "", "", false
+		}
+		return alertFromRecord(*selected), incident.IncidentID, selected.AlertID, selected.ThreadTS, incident.Title, true
+	default:
+		return Alert{}, "", "", "", "", false
+	}
 }
 
 func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
@@ -1417,6 +1639,61 @@ func (s *Store) persistCommentDeleteLocked(commentID string) {
 	}
 }
 
+func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) {
+	if s.db == nil || !s.dbReady || run == nil {
+		return
+	}
+	_, err := s.db.ExecContext(
+		context.Background(),
+		`INSERT INTO analysis_runs (
+			run_id, source, status, target_type, target_id, incident_id, alert_id,
+			title, prompt, analysis_summary, analysis_detail, analysis_quality,
+			capabilities, missing_data, warnings, artifacts, created_at, updated_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+			$15, $16, $17, $18
+		)
+		ON CONFLICT (run_id) DO UPDATE SET
+			source = EXCLUDED.source,
+			status = EXCLUDED.status,
+			target_type = EXCLUDED.target_type,
+			target_id = EXCLUDED.target_id,
+			incident_id = EXCLUDED.incident_id,
+			alert_id = EXCLUDED.alert_id,
+			title = EXCLUDED.title,
+			prompt = EXCLUDED.prompt,
+			analysis_summary = EXCLUDED.analysis_summary,
+			analysis_detail = EXCLUDED.analysis_detail,
+			analysis_quality = EXCLUDED.analysis_quality,
+			capabilities = EXCLUDED.capabilities,
+			missing_data = EXCLUDED.missing_data,
+			warnings = EXCLUDED.warnings,
+			artifacts = EXCLUDED.artifacts,
+			updated_at = EXCLUDED.updated_at`,
+		run.RunID,
+		run.Source,
+		run.Status,
+		run.TargetType,
+		run.TargetID,
+		run.IncidentID,
+		run.AlertID,
+		run.Title,
+		run.Prompt,
+		run.AnalysisSummary,
+		run.AnalysisDetail,
+		run.AnalysisQuality,
+		mustJSON(run.Capabilities),
+		mustJSON(run.MissingData),
+		mustJSON(run.Warnings),
+		mustJSON(run.Artifacts),
+		run.CreatedAt,
+		run.UpdatedAt,
+	)
+	if err != nil {
+		log.Printf("Failed to persist analysis run %s: %v", run.RunID, err)
+	}
+}
+
 type Hub struct {
 	mu      sync.Mutex
 	clients map[chan Event]struct{}
@@ -1518,6 +1795,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleAlertAction(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/embeddings/search":
 		s.handleEmbeddingSearch(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/analysis-runs":
+		writeJSON(w, http.StatusOK, envelope(s.store.ListAnalysisRuns()))
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/events":
 		s.handleEvents(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/chat":
@@ -1743,6 +2022,9 @@ func (s *Server) handleFeedback(
 		"target_type": targetType,
 		"target_id":   targetID,
 	}})
+	if strings.TrimSpace(req.Comment) != "" {
+		s.startAnalysisRun(targetType, targetID, "feedback", req.Comment)
+	}
 	writeJSON(w, http.StatusOK, envelope(summary))
 }
 
@@ -1770,6 +2052,7 @@ func (s *Server) handleComment(
 		"target_type": targetType,
 		"target_id":   targetID,
 	}})
+	s.startAnalysisRun(targetType, targetID, "comment", req.Body)
 	writeJSON(w, http.StatusOK, envelope(summary))
 }
 
@@ -1893,6 +2176,41 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req = s.enrichChatRequest(req)
+	if wantsAnalysisRun(req.Message) {
+		targetType, targetID := chatAnalysisTarget(req)
+		if targetType == "" || targetID == "" {
+			answer := ChatResponse{
+				Status:         "ok",
+				Answer:         "분석을 새로 만들 대상 incident나 alert를 먼저 지정해줘. 현재 RCA detail 화면에서 요청하거나, 채팅 컨텍스트에 Incident/Alert ID를 넣으면 Analysis Dashboard에 새 분석 아이템을 생성할게.",
+				ConversationID: req.ConversationID,
+			}
+			if answer.ConversationID == "" {
+				answer.ConversationID = fmt.Sprintf("chat-%d", time.Now().UnixNano())
+			}
+			answer.Message = answer.Answer
+			answer.Response = answer.Answer
+			writeJSON(w, http.StatusOK, answer)
+			return
+		}
+		run, ok := s.startAnalysisRun(targetType, targetID, "chat", req.Message)
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "analysis target not found"})
+			return
+		}
+		answer := ChatResponse{
+			Status:         "ok",
+			Answer:         fmt.Sprintf("새 분석 아이템 `%s`를 만들었고 에이전트 재분석을 시작했어. Analysis Dashboard에서 상태와 결과를 이어서 볼 수 있어.", run.RunID),
+			ConversationID: req.ConversationID,
+			AnalysisRun:    run,
+		}
+		if answer.ConversationID == "" {
+			answer.ConversationID = fmt.Sprintf("chat-%d", time.Now().UnixNano())
+		}
+		answer.Message = answer.Answer
+		answer.Response = answer.Answer
+		writeJSON(w, http.StatusAccepted, answer)
+		return
+	}
 	answer, err := s.requestChat(req)
 	if err != nil {
 		answer = fallbackChatResponse(req, err)
@@ -1952,6 +2270,53 @@ func (s *Server) enrichChatRequest(req ChatRequest) ChatRequest {
 	req.Context["rca_memory"] = s.store.SearchIncidentMemory(memoryQuery, 5)
 	req.Context["page"] = req.Page
 	return req
+}
+
+func wantsAnalysisRun(message string) bool {
+	lowered := strings.ToLower(strings.TrimSpace(message))
+	if lowered == "" {
+		return false
+	}
+	if strings.Contains(lowered, "re-analyze") ||
+		strings.Contains(lowered, "reanalyze") ||
+		strings.Contains(lowered, "run analysis") ||
+		strings.Contains(lowered, "start analysis") ||
+		strings.Contains(lowered, "create analysis") {
+		return true
+	}
+	if strings.Contains(lowered, "analyze") && strings.Contains(lowered, "rca") {
+		return true
+	}
+	if !strings.Contains(message, "분석") {
+		return false
+	}
+	for _, token := range []string{"해줘", "돌려", "진행", "요청", "다시", "새로", "시작", "만들"} {
+		if strings.Contains(message, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func chatAnalysisTarget(req ChatRequest) (string, string) {
+	if req.AlertID != "" {
+		return "alert", req.AlertID
+	}
+	if req.IncidentID != "" {
+		return "incident", req.IncidentID
+	}
+	targetType := stringFromContext(req.Context, "target_type")
+	switch targetType {
+	case "alert":
+		if id := stringFromContext(req.Context, "alert_id"); id != "" {
+			return "alert", id
+		}
+	case "incident":
+		if id := stringFromContext(req.Context, "incident_id"); id != "" {
+			return "incident", id
+		}
+	}
+	return "", ""
 }
 
 func (s *Server) requestChat(req ChatRequest) (ChatResponse, error) {
@@ -2154,6 +2519,113 @@ func (s *Server) requestAnalysis(alert Alert, incidentID, alertID, threadTS stri
 	s.hub.Broadcast(Event{Type: "analysis.completed", Data: map[string]any{"incident_id": incidentID, "alert_id": alertID}})
 }
 
+func (s *Server) startAnalysisRun(targetType string, targetID string, source string, prompt string) (*AnalysisRun, bool) {
+	alert, incidentID, alertID, threadTS, title, ok := s.store.AnalysisTarget(targetType, targetID)
+	if !ok {
+		return nil, false
+	}
+	run := s.store.CreateAnalysisRun(
+		source,
+		targetType,
+		targetID,
+		incidentID,
+		alertID,
+		fmt.Sprintf("%s: %s", sourceTitle(source), title),
+		prompt,
+	)
+	s.hub.Broadcast(Event{Type: "analysis.started", Data: map[string]any{
+		"run_id":      run.RunID,
+		"source":      run.Source,
+		"target_type": targetType,
+		"target_id":   targetID,
+		"incident_id": incidentID,
+		"alert_id":    alertID,
+	}})
+	go s.requestAnalysisRun(run.RunID, alert, incidentID, alertID, threadTS, source, prompt)
+	return &run, true
+}
+
+func (s *Server) requestAnalysisRun(
+	runID string,
+	alert Alert,
+	incidentID string,
+	alertID string,
+	threadTS string,
+	source string,
+	prompt string,
+) {
+	if alert.Annotations == nil {
+		alert.Annotations = map[string]string{}
+	}
+	alert.Annotations["analysis_run_id"] = runID
+	alert.Annotations["analysis_request_source"] = source
+	alert.Annotations["operator_prompt"] = prompt
+	req := AgentAnalysisRequest{
+		Alert:            alert,
+		ThreadTS:         threadTS,
+		IncidentID:       incidentID,
+		AnalysisType:     source,
+		Language:         s.language,
+		SimilarIncidents: s.store.SimilarIncidentsForAlert(alert, incidentID, 5),
+		FeedbackHints:    s.store.FeedbackHintsForAlert(alert, incidentID, 5),
+	}
+	payload, _ := json.Marshal(req)
+	httpReq, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		s.agentURL+"/analyze",
+		bytes.NewReader(payload),
+	)
+	if err != nil {
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := s.client.Do(httpReq)
+	if err != nil {
+		run, _ := s.store.FailAnalysisRun(runID, fallbackAnalysis(alert, err))
+		s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		run, _ := s.store.FailAnalysisRun(runID, fallbackAnalysis(alert, errors.New(string(body))))
+		s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
+		return
+	}
+	var analysis AgentAnalysisResponse
+	if err := json.Unmarshal(body, &analysis); err != nil {
+		run, _ := s.store.FailAnalysisRun(runID, fallbackAnalysis(alert, err))
+		s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
+		return
+	}
+	run, _ := s.store.CompleteAnalysisRun(runID, analysis)
+	s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
+}
+
+func (s *Server) broadcastAnalysisRunCompleted(run AnalysisRun, incidentID string, alertID string) {
+	s.hub.Broadcast(Event{Type: "analysis.completed", Data: map[string]any{
+		"run_id":      run.RunID,
+		"source":      run.Source,
+		"status":      run.Status,
+		"incident_id": incidentID,
+		"alert_id":    alertID,
+	}})
+}
+
+func sourceTitle(source string) string {
+	switch source {
+	case "comment":
+		return "Comment reanalysis"
+	case "feedback":
+		return "Feedback reanalysis"
+	case "chat":
+		return "Chat analysis"
+	default:
+		return "Analysis"
+	}
+}
+
 func fallbackAnalysis(alert Alert, err error) AgentAnalysisResponse {
 	name := alert.Labels["alertname"]
 	if name == "" {
@@ -2289,6 +2761,18 @@ func cloneFeedbackSummary(in FeedbackSummary) FeedbackSummary {
 	out := in
 	out.Comments = append([]CommentRecord{}, in.Comments...)
 	out.LearningHints = append([]FeedbackHint{}, in.LearningHints...)
+	return out
+}
+
+func cloneAnalysisRun(in *AnalysisRun) AnalysisRun {
+	if in == nil {
+		return AnalysisRun{}
+	}
+	out := *in
+	out.Capabilities = cloneMap(in.Capabilities)
+	out.MissingData = append([]string{}, in.MissingData...)
+	out.Warnings = append([]string{}, in.Warnings...)
+	out.Artifacts = append([]Artifact{}, in.Artifacts...)
 	return out
 }
 

@@ -1,8 +1,9 @@
-import { AlertRecord, Envelope, FeedbackSummary, Incident, IncidentDetail } from './types';
+import { AlertRecord, AnalysisRun, Envelope, FeedbackSummary, Incident, IncidentDetail } from './types';
 
 const runtimeApiBase = window.__RUNAI_RCA_CONFIG__?.apiBaseUrl;
 const fallbackApiBase = import.meta.env.DEV ? 'http://localhost:8080' : '';
-const API_BASE = (runtimeApiBase ?? import.meta.env.VITE_API_BASE_URL ?? fallbackApiBase).replace(/\/$/, '');
+const configuredApiBase = nonEmpty(runtimeApiBase) ?? nonEmpty(import.meta.env.VITE_API_BASE_URL);
+const API_BASE = (configuredApiBase ?? fallbackApiBase).replace(/\/$/, '');
 const FEEDBACK_ACTOR_KEY = 'runai-rca-feedback-actor';
 
 type FeedbackVote = 'up' | 'down' | 'none';
@@ -45,6 +46,10 @@ export async function fetchIncident(id: string): Promise<IncidentDetail> {
 
 export async function fetchAlerts(): Promise<AlertRecord[]> {
   return (await read<Envelope<AlertRecord[]>>('/api/v1/alerts')).data;
+}
+
+export async function fetchAnalysisRuns(): Promise<AnalysisRun[]> {
+  return (await read<Envelope<AnalysisRun[]>>('/api/v1/analysis-runs')).data;
 }
 
 export async function fetchAlert(id: string): Promise<AlertRecord> {
@@ -119,6 +124,7 @@ export type ChatResponse = {
   message?: string;
   response?: string;
   conversation_id: string;
+  analysis_run?: AnalysisRun;
 };
 
 export async function chat(payload: ChatRequest) {
@@ -127,6 +133,12 @@ export async function chat(payload: ChatRequest) {
 
 export function eventSource(): EventSource {
   return new EventSource(`${API_BASE}/api/v1/events`);
+}
+
+function nonEmpty(value: unknown) {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed === '' ? undefined : trimmed;
 }
 
 function targetPath(targetType: 'incident' | 'alert', id: string, action: string) {

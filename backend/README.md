@@ -4,8 +4,8 @@ Go API server for Run:AI RCA.
 
 The backend uses an in-memory store when no database is configured and upgrades
 to Postgres when `DATABASE_URL` or `POSTGRES_DSN` is present. The Postgres store
-persists incidents, alerts, similar-incident vectors, feedback votes, and
-markdown comments.
+persists incidents, alerts, similar-incident vectors, feedback votes, markdown
+comments, and independent analysis runs created from comments or chat requests.
 
 On startup it creates:
 
@@ -14,6 +14,7 @@ On startup it creates:
 - `incident_embeddings`
 - `rca_feedback`
 - `rca_comments`
+- `analysis_runs`
 
 The backend attempts to enable `pgvector`. If the extension is unavailable, it
 continues with JSONB sparse vectors so similar-incident search remains usable.
@@ -55,3 +56,4 @@ go test ./...
 | `POST` | `/api/v1/alerts/{id}/comments` | Add alert markdown comment |
 | `PUT` | `/api/v1/alerts/{id}/comments/{comment_id}` | Update alert comment |
 | `DELETE` | `/api/v1/alerts/{id}/comments/{comment_id}` | Delete alert comment |
+| `GET` | `/api/v1/analysis-runs` | List comment/chat-triggered analysis runs |

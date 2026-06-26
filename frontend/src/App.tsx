@@ -53,6 +53,7 @@ import {
   chat,
   deleteComment,
   eventSource,
+  fetchAnalysisRuns,
   fetchAlert,
   fetchAlerts,
   fetchIncident,
@@ -63,7 +64,7 @@ import {
   type ChatRequest,
 } from './api';
 import nvidiaLogo from './assets/nvidia-logo.svg';
-import { AlertRecord, Artifact, FeedbackSummary, Incident, IncidentDetail, SimilarIncident } from './types';
+import { AlertRecord, AnalysisRun, Artifact, FeedbackSummary, Incident, IncidentDetail, SimilarIncident } from './types';
 
 type DetailState =
   | { kind: 'incident'; data: IncidentDetail }
@@ -230,6 +231,27 @@ const MOCK_ALERT_ARTIFACT: Artifact = {
     reason: 'GPU quota exhausted',
   },
 };
+const MOCK_SIMILAR_INCIDENT: SimilarIncident = {
+  incident_id: 'MOCK-INC-000002',
+  alert_id: 'MOCK-ALR-000002',
+  title: 'Recurring gpu-a queue saturation',
+  severity: 'warning',
+  status: 'resolved',
+  similarity: 0.91,
+  analysis_summary: 'Prior gpu-a saturation was resolved by moving one trainer workload and increasing queue quota.',
+  analysis_detail:
+    '## Root Cause\n\nHistorical Run:AI queue saturation on `gpu-a` exhausted available GPU quota.\n\n## Recommended Actions\n\nMove lower-priority workloads or increase queue quota before retrying trainers.',
+  positive_feedback: 1,
+  negative_feedback: 0,
+  comment_count: 1,
+  labels: {
+    namespace: 'runai',
+    project: 'vision',
+    queue: 'gpu-a',
+    workload: 'batch-trainer',
+  },
+  created_at: '2026-06-25T09:30:00Z',
+};
 const MOCK_INCIDENT: Incident = {
   incident_id: 'MOCK-INC-000001',
   correlation_key: 'mock/runai/queue/gpu-a/trainer',
@@ -274,7 +296,7 @@ const MOCK_ALERT: AlertRecord = {
   missing_data: ['live cluster connection'],
   warnings: ['Mock data is shown because the Operations dashboard has no live incidents or alerts yet.'],
   artifacts: [MOCK_ALERT_ARTIFACT],
-  similar_incidents: [],
+  similar_incidents: [MOCK_SIMILAR_INCIDENT],
   feedback: {
     target_type: 'alert',
     target_id: 'MOCK-ALR-000001',
@@ -293,7 +315,7 @@ const MOCK_INCIDENT_DETAIL: IncidentDetail = {
   missing_data: MOCK_ALERT.missing_data,
   warnings: MOCK_ALERT.warnings,
   artifacts: MOCK_ALERT.artifacts,
-  similar_incidents: [],
+  similar_incidents: [MOCK_SIMILAR_INCIDENT],
   feedback: {
     target_type: 'incident',
     target_id: 'MOCK-INC-000001',
@@ -501,6 +523,56 @@ function makeMockIncident({
   };
 }
 
+function makeMockSimilarIncident({
+  id,
+  incidentID,
+  title,
+  severity,
+  firedAt,
+  labels,
+  summary,
+}: {
+  id: string;
+  incidentID: string;
+  title: string;
+  severity: string;
+  firedAt: string;
+  labels: Record<string, string>;
+  summary: string;
+}): SimilarIncident {
+  const queue = labels.queue || 'cluster';
+  const namespace = labels.namespace || 'runai';
+  return {
+    incident_id: `${incidentID}-MEMORY`,
+    alert_id: `${id}-MEMORY`,
+    title: `Prior ${queue} RCA memory`,
+    severity,
+    status: 'resolved',
+    similarity: queue === 'gpu-a' ? 0.88 : 0.82,
+    analysis_summary: `Historical RCA with matching ${namespace}/${queue} labels: ${summary}`,
+    analysis_detail:
+      '## Root Cause\n\nPrior RCA memory matched namespace, queue, workload, or symptom tokens.\n\n## Recommended Actions\n\nReuse the prior pattern only after validating current Run:AI, Kubernetes, Prometheus, Loki, and Postgres evidence.',
+    positive_feedback: 1,
+    negative_feedback: 0,
+    comment_count: 1,
+    labels,
+    created_at: firedAt,
+  };
+}
+
+function mergeSimilarIncidents(lists: Array<SimilarIncident[] | undefined>) {
+  const seen = new Set<string>();
+  const merged: SimilarIncident[] = [];
+  for (const items of lists) {
+    for (const item of items ?? []) {
+      if (seen.has(item.incident_id)) continue;
+      seen.add(item.incident_id);
+      merged.push(item);
+    }
+  }
+  return merged;
+}
+
 function makeMockAlert({
   id,
   incidentID,
@@ -516,6 +588,7 @@ function makeMockAlert({
   artifacts,
   missingData = [],
   warnings = [],
+  similarIncidents,
 }: {
   id: string;
   incidentID: string;
@@ -531,6 +604,7 @@ function makeMockAlert({
   artifacts: number;
   missingData?: string[];
   warnings?: string[];
+  similarIncidents?: SimilarIncident[];
 }): AlertRecord {
   return {
     alert_id: id,
@@ -573,7 +647,9 @@ function makeMockAlert({
       summary: `${agentLabel(COMPONENT_AGENT_ORDER[index % COMPONENT_AGENT_ORDER.length])} mock signal for ${title}.`,
       result: { incident_id: incidentID, alert_id: id, signal_index: index + 1 },
     })),
-    similar_incidents: [],
+    similar_incidents:
+      similarIncidents ??
+      [makeMockSimilarIncident({ id, incidentID, title, severity, firedAt, labels, summary })],
     feedback: mockFeedback('alert', id),
     is_analyzing: false,
   };
@@ -616,7 +692,7 @@ function mockIncidentDetail(id: string): IncidentDetail | null {
     missing_data: uniqueStrings(incidentAlerts.flatMap((alert) => alert.missing_data)),
     warnings: uniqueStrings(incidentAlerts.flatMap((alert) => alert.warnings)),
     artifacts: incidentAlerts.flatMap((alert) => alert.artifacts),
-    similar_incidents: [],
+    similar_incidents: mergeSimilarIncidents(incidentAlerts.map((alert) => alert.similar_incidents)),
     feedback: mockFeedback('incident', id),
     alerts: incidentAlerts,
   };
@@ -666,6 +742,7 @@ function useEditorHistory(initialValue = '') {
 function App() {
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [alerts, setAlerts] = useState<AlertRecord[]>([]);
+  const [analysisRuns, setAnalysisRuns] = useState<AnalysisRun[]>([]);
   const [detail, setDetail] = useState<DetailState>(null);
   const [activeView, setActiveView] = useState<MainView>('operations');
   const [query, setQuery] = useState('');
@@ -675,11 +752,23 @@ function App() {
   const load = useCallback(async () => {
     setError('');
     try {
-      const [incidentData, alertData] = await Promise.all([fetchIncidents(), fetchAlerts()]);
+      const [incidentData, alertData, analysisRunData] = await Promise.all([
+        fetchIncidents(),
+        fetchAlerts(),
+        fetchAnalysisRuns(),
+      ]);
       setIncidents(incidentData);
       setAlerts(alertData);
+      setAnalysisRuns(analysisRunData);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load dashboard data.');
+      if (ENABLE_MOCK_DATA) {
+        setIncidents([]);
+        setAlerts([]);
+        setAnalysisRuns([]);
+        setError('');
+      } else {
+        setError(err instanceof Error ? err.message : 'Failed to load dashboard data.');
+      }
     } finally {
       setLoading(false);
     }
@@ -704,6 +793,7 @@ function App() {
   const operationAlerts = showMockData ? [MOCK_ALERT] : alerts;
   const analysisIncidents = showMockData ? MOCK_ANALYTICS_INCIDENTS : incidents;
   const analysisAlerts = showMockData ? MOCK_ANALYTICS_ALERTS : alerts;
+  const dashboardAnalysisRuns = showMockData ? [] : analysisRuns;
 
   const filteredIncidents = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -735,7 +825,10 @@ function App() {
     );
   }, [operationAlerts, query]);
 
-  const analysisRecords = useMemo(() => buildAnalysisRecords(analysisAlerts), [analysisAlerts]);
+  const analysisRecords = useMemo(
+    () => buildAnalysisRecords(analysisAlerts, dashboardAnalysisRuns),
+    [analysisAlerts, dashboardAnalysisRuns],
+  );
 
   const filteredAnalysis = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -2497,8 +2590,8 @@ function truncateForChat(value: string, limit = 8000) {
   return `${value.slice(0, limit)}\n\n[context truncated]`;
 }
 
-function buildAnalysisRecords(alerts: AlertRecord[]): AnalysisRecord[] {
-  return alerts
+function buildAnalysisRecords(alerts: AlertRecord[], analysisRuns: AnalysisRun[] = []): AnalysisRecord[] {
+  const alertRecords = alerts
     .map((alert) => {
       const hasAnalysis = Boolean(alert.analysis_summary || alert.analysis_detail);
       const analysisStatus = alert.is_analyzing ? 'analyzing' : hasAnalysis ? 'complete' : 'pending';
@@ -2527,12 +2620,50 @@ function buildAnalysisRecords(alerts: AlertRecord[]): AnalysisRecord[] {
         mock: alert.alert_id === MOCK_ALERT.alert_id,
       };
     })
+  const runRecords = analysisRuns.map((run) => ({
+    id: run.run_id,
+    incidentID: run.incident_id || '',
+    alertID: run.alert_id || '',
+    title: run.title || `${sourceLabel(run.source)} analysis`,
+    target: `${run.target_type} / ${run.target_id}`,
+    severity: 'warning',
+    alertStatus: run.status,
+    analysisStatus: run.status === 'complete' || run.status === 'failed' ? run.status : 'analyzing',
+    quality: run.analysis_quality || (run.status === 'failed' ? 'low' : 'pending'),
+    summary: run.analysis_summary || run.prompt || 'Analysis request is waiting for agent results.',
+    detail: run.analysis_detail,
+    capabilities: run.capabilities || {},
+    missingData: run.missing_data || [],
+    warnings: run.warnings || [],
+    artifactCount: run.artifacts?.length || 0,
+    similarCount: 0,
+    positiveFeedback: 0,
+    negativeFeedback: 0,
+    commentCount: 0,
+    createdAt: run.created_at,
+    isAnalyzing: run.status === 'analyzing',
+    mock: false,
+  }));
+  return [...runRecords, ...alertRecords]
     .sort((left, right) => {
-      const statusWeight: Record<string, number> = { analyzing: 0, pending: 1, complete: 2 };
-      const delta = (statusWeight[left.analysisStatus] ?? 3) - (statusWeight[right.analysisStatus] ?? 3);
+      const statusWeight: Record<string, number> = { analyzing: 0, pending: 1, failed: 2, complete: 3 };
+      const delta = (statusWeight[left.analysisStatus] ?? 4) - (statusWeight[right.analysisStatus] ?? 4);
       if (delta !== 0) return delta;
       return right.createdAt.localeCompare(left.createdAt);
     });
+}
+
+function sourceLabel(source: string) {
+  switch (source) {
+    case 'comment':
+      return 'Comment reanalysis';
+    case 'feedback':
+      return 'Feedback reanalysis';
+    case 'chat':
+      return 'Chat analysis';
+    default:
+      return 'RCA';
+  }
 }
 
 function buildAnalysisAnalytics(

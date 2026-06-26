@@ -90,6 +90,7 @@ Backend:
 - `PUT /api/v1/alerts/{id}/comments/{comment_id}`
 - `DELETE /api/v1/alerts/{id}/comments/{comment_id}`
 - `POST /api/v1/embeddings/search`
+- `GET /api/v1/analysis-runs`
 - `GET /api/v1/events`
 - `POST /api/v1/chat`
 
@@ -257,6 +258,9 @@ Frequently tuned Helm values:
 | `agent.rbac.clusterWide` | Use a ClusterRole for Kubernetes evidence collection; default `true` |
 | `agent.rbac.namespaces` | Namespaces that receive Role/RoleBinding when `agent.rbac.clusterWide=false`; defaults to the release namespace |
 | `agent.env.kubernetesNamespaces` | Agent-side Kubernetes namespace allowlist; when empty and `clusterWide=false`, Helm derives it from `agent.rbac.namespaces` |
+| `agent.serviceAccount.annotations` | ServiceAccount annotations for workload identity integrations |
+| `{backend,frontend,postgresql}.automountServiceAccountToken` | Disable Kubernetes API token mounts for pods that do not need cluster API access; default `false` |
+| `agent.automountServiceAccountToken` | Agent Kubernetes API token mount; default `true` because direct Kubernetes collection uses the service account token |
 | `agent.env.runaiBaseUrl` / `agent.env.runaiTokenUrl` | Run:ai API and optional OAuth token endpoint |
 | `agent.env.runaiWorkloadsPath`, `runaiProjectsPath`, `runaiQueuesPath` | Run:ai API path overrides for different Run:ai versions |
 | `agent.env.runaiLogNamespaces` | Namespaces for Run:ai control-plane/backend logs, default `runai,runai-backend` |
@@ -292,19 +296,22 @@ helm upgrade --install runai-rca charts/runai-rca \
 
 Mock data is a frontend-only sample mode. It is enabled by default during Vite
 local development, disabled by default in Helm/static deployments, and is shown
-only after the Backend successfully returns empty incident and alert lists. API
-errors do not fall back to mock records. As soon as real incident or alert data
-is returned by the Backend, the UI uses the live values and does not mix mock
-records into Operations, Analysis, Evidence, or Agents.
+after the Backend returns empty incident and alert lists, or when the local dev
+Backend is unavailable. As soon as real incident or alert data is returned by
+the Backend, the UI uses the live values and does not mix mock records into
+Operations, Analysis, Evidence, or Agents.
 
 When `DATABASE_URL` is configured, the backend creates and uses `incidents`,
-`alerts`, `incident_embeddings`, `rca_feedback`, and `rca_comments`. If the
-pgvector extension is not available, the backend still stores sparse text
-vectors in JSONB and serves similar-incident search. When `POSTGRES_DSN` is
-configured, the Postgres agent checks connectivity, active connections,
-long-running transactions, pgvector availability, and expected RCA table
-presence. If it is not configured, the agent marks Postgres evidence as
-unavailable without blocking the rest of the RCA.
+`alerts`, `incident_embeddings`, `rca_feedback`, `rca_comments`, and
+`analysis_runs`. Comments and chat requests that explicitly ask for analysis
+create separate analysis runs, so the Analysis Dashboard can track them without
+overwriting the original RCA. If the pgvector extension is not available, the
+backend still stores sparse text vectors in JSONB and serves similar-incident
+search. When `POSTGRES_DSN` is configured, the Postgres agent checks
+connectivity, active connections, long-running transactions, pgvector
+availability, and expected RCA table presence. If it is not configured, the
+agent marks Postgres evidence as unavailable without blocking the rest of the
+RCA.
 
 Sensitive values are redacted before evidence is returned to the backend or
 passed into NeMo synthesis. The built-in redactor masks common secret keys,

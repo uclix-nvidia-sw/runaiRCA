@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAlertmanagerWebhookCreatesIncidentAndAlert(t *testing.T) {
@@ -119,6 +120,124 @@ func TestChatRouteProxiesContextualRCARequestToAgent(t *testing.T) {
 	}
 }
 
+func TestCommentCreatesAnalysisRun(t *testing.T) {
+	server := NewServer()
+	agentReqCh := make(chan AgentAnalysisRequest, 1)
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req AgentAnalysisRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode agent analysis request: %v", err)
+		}
+		agentReqCh <- req
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Comment-driven RCA refined the queue diagnosis.",
+			AnalysisDetail:  "## Root Cause\n\nOperator comment was included in reanalysis.",
+			AnalysisQuality: "high",
+			Capabilities:    map[string]string{"analysis": "ok", "runai": "ok"},
+		})
+	}))
+	defer agent.Close()
+	server.agentURL = agent.URL
+
+	incident, _ := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "comment-run"}, Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIQueueBlocked",
+			"severity":  "warning",
+			"queue":     "gpu-a",
+		},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-comment-run",
+	})
+	payload, _ := json.Marshal(CommentRequest{
+		Body:   "Please re-check runai-backend scheduler logs before finalizing.",
+		Author: "operator",
+	})
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/incidents/"+incident.IncidentID+"/comments",
+		bytes.NewReader(payload),
+	)
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected comment 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	agentReq := <-agentReqCh
+	if agentReq.AnalysisType != "comment" {
+		t.Fatalf("expected comment analysis type, got %+v", agentReq)
+	}
+	if !strings.Contains(agentReq.Alert.Annotations["operator_prompt"], "scheduler logs") {
+		t.Fatalf("operator comment was not sent to agent: %+v", agentReq.Alert.Annotations)
+	}
+	run := waitForAnalysisRun(t, server, "comment")
+	if run.Status != "complete" || !strings.Contains(run.AnalysisSummary, "Comment-driven") {
+		t.Fatalf("unexpected analysis run: %+v", run)
+	}
+}
+
+func TestChatAnalysisRequestCreatesAnalysisRun(t *testing.T) {
+	server := NewServer()
+	agentReqCh := make(chan AgentAnalysisRequest, 1)
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req AgentAnalysisRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode agent analysis request: %v", err)
+		}
+		agentReqCh <- req
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Chat-requested RCA completed.",
+			AnalysisDetail:  "## Root Cause\n\nChat requested a separate analysis item.",
+			AnalysisQuality: "medium",
+			Capabilities:    map[string]string{"analysis": "ok"},
+		})
+	}))
+	defer agent.Close()
+	server.agentURL = agent.URL
+
+	incident, _ := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "chat-run"}, Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIQueueBlocked",
+			"severity":  "warning",
+			"queue":     "gpu-a",
+		},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-chat-run",
+	})
+	payload, _ := json.Marshal(ChatRequest{
+		Message:    "이 RCA 분석 다시 돌려줘",
+		IncidentID: incident.IncidentID,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected chat 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var response ChatResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode chat response: %v", err)
+	}
+	if response.AnalysisRun == nil || response.AnalysisRun.Source != "chat" {
+		t.Fatalf("expected chat analysis run in response: %+v", response)
+	}
+	agentReq := <-agentReqCh
+	if agentReq.AnalysisType != "chat" {
+		t.Fatalf("expected chat analysis type, got %+v", agentReq)
+	}
+	run := waitForAnalysisRun(t, server, "chat")
+	if run.Status != "complete" || !strings.Contains(run.AnalysisSummary, "Chat-requested") {
+		t.Fatalf("unexpected analysis run: %+v", run)
+	}
+}
+
 func TestFeedbackAndSimilarIncidentMemory(t *testing.T) {
 	store := NewStore()
 	priorAlert := Alert{
@@ -198,6 +317,21 @@ func TestFeedbackAndSimilarIncidentMemory(t *testing.T) {
 	if len(search) == 0 || search[0].IncidentID != priorIncident.IncidentID {
 		t.Fatalf("expected embedding search to return prior incident, got %+v", search)
 	}
+}
+
+func waitForAnalysisRun(t *testing.T, server *Server, source string) AnalysisRun {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, run := range server.store.ListAnalysisRuns() {
+			if run.Source == source && run.Status != "analyzing" {
+				return run
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("analysis run with source %q did not complete: %+v", source, server.store.ListAnalysisRuns())
+	return AnalysisRun{}
 }
 
 func TestAlertListIncludesSimilarIncidentMemory(t *testing.T) {

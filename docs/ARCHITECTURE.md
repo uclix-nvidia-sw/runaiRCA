@@ -49,7 +49,7 @@ It owns:
 - Alertmanager webhook intake
 - Incident and alert correlation
 - Agent request lifecycle
-- Postgres persistence for incidents, alerts, embeddings, feedback, and comments
+- Postgres persistence for incidents, alerts, embeddings, feedback, comments, and analysis runs
 - KubeRCA-style `/api/v1/embeddings/search` similar-incident API
 - SSE event fanout
 - Chat proxy
@@ -79,6 +79,9 @@ The key interaction is the Unified RCA Workspace:
 4. Feedback counts and comments from similar incidents are converted into
    `feedback_hints`, so the Agent can reuse accepted RCA patterns and avoid
    repeating rejected ones.
+5. New operator comments and chat messages that explicitly ask for analysis
+   create `analysis_runs`. Each run is processed by the Agent independently and
+   appears as its own item in the Analysis Dashboard.
 
 ## Evidence Contract
 

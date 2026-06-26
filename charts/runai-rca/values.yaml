@@ -50,6 +50,7 @@ postgresql:
   podLabels: {}
   podSecurityContext: {}
   securityContext: {}
+  automountServiceAccountToken: false
   priorityClassName: ""
   topologySpreadConstraints: []
   readinessProbe: {}
@@ -77,6 +78,7 @@ backend:
   podLabels: {}
   podSecurityContext: {}
   securityContext: {}
+  automountServiceAccountToken: false
   priorityClassName: ""
   topologySpreadConstraints: []
   readinessProbe:
@@ -103,6 +105,7 @@ agent:
   serviceAccount:
     create: true
     name: ""
+    annotations: {}
   rbac:
     create: true
     clusterWide: true
@@ -143,6 +146,7 @@ agent:
   podLabels: {}
   podSecurityContext: {}
   securityContext: {}
+  automountServiceAccountToken: true
   priorityClassName: ""
   topologySpreadConstraints: []
   readinessProbe:
@@ -173,6 +177,7 @@ frontend:
   podLabels: {}
   podSecurityContext: {}
   securityContext: {}
+  automountServiceAccountToken: false
   priorityClassName: ""
   topologySpreadConstraints: []
   readinessProbe:
