@@ -133,7 +133,8 @@ func fallbackAnalysis(alert Alert, err error) AgentAnalysisResponse {
 		name = "Run:AI alert"
 	}
 	kind := agentErrorKind("unavailable")
-	if agentErr, ok := err.(*AgentError); ok && agentErr != nil {
+	var agentErr *AgentError
+	if errors.As(err, &agentErr) && agentErr != nil {
 		kind = agentErr.Kind
 	}
 	summary := fmt.Sprintf("%s accepted, but agent analysis failed (%s): %v", name, kind, err)
