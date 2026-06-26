@@ -110,8 +110,7 @@ button:not(:disabled):active,
 
 .brand-mark:hover,
 .brand-mark:focus,
-.brand-mark:active,
-.brand-mark:not(:disabled):active {
+.brand-mark:active {
   background: transparent;
   transform: none;
 }
