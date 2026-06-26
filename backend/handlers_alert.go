@@ -17,8 +17,7 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 		incident, record := s.store.UpsertAlert(webhook, alert)
 		created++
 		s.hub.Broadcast(alertCreatedEvent(incident, record))
-		s.hub.Broadcast(analysisStartedEvent("", "auto", "alert", record.AlertID, incident.IncidentID, record.AlertID))
-		go s.requestAnalysis(alert, incident.IncidentID, record.AlertID, record.ThreadTS, "auto")
+		s.startAnalysisRun("alert", record.AlertID, "auto", "")
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted", "alerts": created})
 }

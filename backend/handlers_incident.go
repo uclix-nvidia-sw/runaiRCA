@@ -68,13 +68,7 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 		}
 		s.store.MarkAnalyzing(id, true)
 		for _, alert := range detail.Alerts {
-			s.hub.Broadcast(analysisStartedEvent("", "manual", "alert", alert.AlertID, id, alert.AlertID))
-			go s.requestAnalysis(Alert{
-				Status:      alert.Status,
-				Labels:      alert.Labels,
-				Annotations: alert.Annotations,
-				Fingerprint: alert.Fingerprint,
-			}, id, alert.AlertID, alert.ThreadTS, "manual")
+			s.startAnalysisRun("alert", alert.AlertID, "manual", "")
 		}
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "analysis_requested"})
 	case "resolve":
