@@ -273,6 +273,7 @@ Frequently tuned Helm values:
 | `agent.env.maskingRegexListJson` | Cluster-specific secret masking regexes as a JSON array |
 | `frontend.config.apiBaseUrl` | Browser API base URL when not using the bundled nginx `/api` proxy; accepts absolute URLs, `/api`-style paths, or localhost host:port values |
 | `frontend.config.enableMockData` | Show sample dashboard records when no live incidents or alerts exist, or when the local dev backend is unavailable; default `false` in Helm |
+| `frontend.nginx.*` | Frontend nginx proxy timeout and body-size controls for REST, webhook, and SSE traffic; defaults keep event streams open for one hour |
 | `backend.extraEnv`, `agent.extraEnv`, `frontend.extraEnv` | Additional container env entries for deployment-specific settings |
 | `podAnnotations` / `podLabels` | Global pod metadata applied to Backend, Agent, Frontend, and bundled Postgres |
 | `{backend,agent,frontend,postgresql}.podAnnotations` / `.podLabels` | Component-specific pod metadata merged over global metadata |

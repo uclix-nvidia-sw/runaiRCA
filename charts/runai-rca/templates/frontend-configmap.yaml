@@ -17,6 +17,9 @@ data:
       server_name _;
       root /usr/share/nginx/html;
       index index.html;
+      {{- with .Values.frontend.nginx.clientMaxBodySize }}
+      client_max_body_size {{ . }};
+      {{- end }}
 
       location = /config.js {
         add_header Cache-Control "no-store";
@@ -25,6 +28,15 @@ data:
 
       location /api/ {
         proxy_http_version 1.1;
+        {{- with .Values.frontend.nginx.proxyConnectTimeout }}
+        proxy_connect_timeout {{ . }};
+        {{- end }}
+        {{- with .Values.frontend.nginx.proxyReadTimeout }}
+        proxy_read_timeout {{ . }};
+        {{- end }}
+        {{- with .Values.frontend.nginx.proxySendTimeout }}
+        proxy_send_timeout {{ . }};
+        {{- end }}
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
@@ -34,6 +46,15 @@ data:
 
       location /webhook/ {
         proxy_http_version 1.1;
+        {{- with .Values.frontend.nginx.proxyConnectTimeout }}
+        proxy_connect_timeout {{ . }};
+        {{- end }}
+        {{- with .Values.frontend.nginx.proxyReadTimeout }}
+        proxy_read_timeout {{ . }};
+        {{- end }}
+        {{- with .Values.frontend.nginx.proxySendTimeout }}
+        proxy_send_timeout {{ . }};
+        {{- end }}
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;

@@ -179,6 +179,11 @@ frontend:
   config:
     apiBaseUrl: ""
     enableMockData: false
+  nginx:
+    clientMaxBodySize: 10m
+    proxyConnectTimeout: 60s
+    proxyReadTimeout: 3600s
+    proxySendTimeout: 3600s
   podAnnotations: {}
   podLabels: {}
   podSecurityContext: {}
