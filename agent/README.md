@@ -22,6 +22,10 @@ Prometheus/Loki MCP servers and NVIDIA NIM credentials are available.
 By default it points at local MCP endpoints; set `PROMETHEUS_MCP_URL` and
 `LOKI_MCP_URL` to use remote MCP servers without editing the workflow file.
 
+`configs/runai_rca_workflow_litellm.yml` is the LiteLLM/OpenAI-compatible LLM
+variant. Set `LLM_BASE_URL`, `LLM_MODEL`, and `LLM_API_KEY`; the service writes a
+temporary 0600 workflow config with those values when `ENABLE_NAT_RUNTIME=true`.
+
 The Python service can run in deterministic fallback mode for local development
 and tests. Set `ENABLE_NAT_RUNTIME=true` to delegate analysis to the `nat` CLI.
 
@@ -80,4 +84,5 @@ uvicorn app.main:app --reload --port 8000
 pytest
 python -m compileall app
 nat validate --config_file configs/runai_rca_workflow.yml
+nat validate --config_file configs/runai_rca_workflow_litellm.yml
 ```

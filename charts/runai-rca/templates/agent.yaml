@@ -133,6 +133,12 @@ spec:
               value: {{ .Values.agent.env.builtinRedactionEnabled | quote }}
             - name: BUILTIN_REDACTION_HASH_MODE
               value: {{ .Values.agent.env.builtinRedactionHashMode | quote }}
+            - name: LLM_BASE_URL
+              value: {{ .Values.agent.env.llmBaseUrl | quote }}
+            - name: LLM_MODEL
+              value: {{ .Values.agent.env.llmModel | quote }}
+            - name: LLM_REQUEST_TIMEOUT_SECONDS
+              value: {{ .Values.agent.env.llmRequestTimeoutSeconds | quote }}
             - name: POSTGRES_DSN
               valueFrom:
                 secretKeyRef:
@@ -162,6 +168,12 @@ spec:
                 secretKeyRef:
                   name: {{ include "runai-rca.secretName" . }}
                   key: {{ .Values.secrets.keys.nvidiaApiKey | quote }}
+                  optional: true
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "runai-rca.secretName" . }}
+                  key: {{ .Values.secrets.keys.llmApiKey | quote }}
                   optional: true
             {{- with .Values.agent.extraEnv }}
             {{- toYaml . | nindent 12 }}

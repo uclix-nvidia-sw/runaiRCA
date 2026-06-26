@@ -176,6 +176,10 @@ Core environment variables:
 | `BUILTIN_REDACTION_ENABLED` | Enable built-in secret redaction, default `true` |
 | `BUILTIN_REDACTION_HASH_MODE` | Replace secrets with stable short hashes instead of `[MASKED]`, default `false` |
 | `NVIDIA_API_KEY` | NIM key for NeMo Agent Toolkit workflows |
+| `LLM_BASE_URL` | LiteLLM/OpenAI-compatible base URL for the LiteLLM NAT workflow |
+| `LLM_MODEL` | LiteLLM/OpenAI-compatible model name, for example `auto-router` |
+| `LLM_API_KEY` | LiteLLM/OpenAI-compatible API key secret |
+| `LLM_REQUEST_TIMEOUT_SECONDS` | LiteLLM request timeout used in the materialized NAT config, default `120` |
 | `ENABLE_NAT_RUNTIME` | Run RCA synthesis through the NeMo Agent Toolkit CLI instead of the deterministic in-process fallback, default `false` |
 | `NAT_CONFIG_FILE` | Optional NeMo workflow config path, default `configs/runai_rca_workflow.yml` |
 | `NAT_TIMEOUT_SECONDS` | NeMo Agent Toolkit CLI execution timeout |
@@ -189,6 +193,21 @@ NeMo Agent Toolkit workflows:
 - `agent/configs/runai_rca_workflow_mcp.yml` adds Prometheus/Loki MCP client
   groups and a NIM-backed Analysis Agent review path for environments where
   those services are available.
+- `agent/configs/runai_rca_workflow_litellm.yml` adds a LiteLLM/OpenAI-compatible
+  Analysis Agent review path. Set `ENABLE_NAT_RUNTIME=true`, point
+  `NAT_CONFIG_FILE` at that config, and provide `LLM_BASE_URL`, `LLM_MODEL`, and
+  `LLM_API_KEY` through env or Helm Secret values.
+
+Example Helm override for a LiteLLM/OpenAI-compatible endpoint:
+
+```bash
+helm upgrade --install runai-rca charts/runai-rca \
+  --set agent.env.enableNatRuntime=true \
+  --set agent.env.natConfigFile=/app/configs/runai_rca_workflow_litellm.yml \
+  --set-string agent.env.llmBaseUrl=https://litellm.example.com/v1 \
+  --set-string agent.env.llmModel=auto-router \
+  --set-string secrets.llmApiKey='<llm-api-key>'
+```
 
 ## Container and Helm Deployment
 
@@ -260,7 +279,7 @@ Frequently tuned Helm values:
 | `backend.env.agentUrl` | Override Backend-to-Agent URL when the Agent is external or remote |
 | `backend.env.language` / `agent.env.language` | Set RCA language to `en` or `ko` |
 | `backend.env.databaseConnectTimeoutSeconds` / `agentRequestTimeoutSeconds` | Backend startup DB timeout and Backend-to-Agent request timeout |
-| `secrets.keys.*` | Existing Secret key names for DB, Run:ai, and NVIDIA credentials |
+| `secrets.keys.*` | Existing Secret key names for DB, Run:ai, NVIDIA, and LLM credentials |
 | `secrets.existingSecret` | Existing Secret for Run:ai/NVIDIA credentials and, by default, DB keys |
 | `secrets.databaseExistingSecret` | Existing Secret used only for `DATABASE_URL` / `POSTGRES_DSN` |
 | `postgresql.enabled` / `postgresql.auth.*` | Install the bundled Postgres and set its generated DSN user, password, and database |
@@ -276,6 +295,7 @@ Frequently tuned Helm values:
 | `agent.env.prometheusUrl` | In-cluster Prometheus URL, for example `http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090` |
 | `agent.env.lokiUrl` | In-cluster Loki URL, for example `http://loki-gateway.monitoring.svc.cluster.local` |
 | `agent.env.prometheusMcpUrl` / `agent.env.lokiMcpUrl` | Remote MCP endpoints when using the MCP workflow |
+| `agent.env.llmBaseUrl` / `agent.env.llmModel` / `secrets.llmApiKey` | LiteLLM/OpenAI-compatible endpoint, model, and Secret-backed API key for `runai_rca_workflow_litellm.yml` |
 | `agent.env.*TimeoutSeconds` | Request/runtime timeouts for Kubernetes, Run:ai, Prometheus, Loki, Postgres, and NAT |
 | `agent.env.kubernetesListLimit` / `agent.env.lokiQueryLimit` | Evidence volume controls for Kubernetes list calls and Loki log query groups |
 | `agent.env.troubleshootingCasesFile` / `agent.env.agentSoulsFile` | Paths for injected troubleshooting memory and agent role contracts |

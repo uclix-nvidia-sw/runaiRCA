@@ -22,12 +22,14 @@ secrets:
     runaiClientSecret: RUNAI_CLIENT_SECRET
     runaiBearerToken: RUNAI_BEARER_TOKEN
     nvidiaApiKey: NVIDIA_API_KEY
+    llmApiKey: LLM_API_KEY
   databaseUrl: ""
   postgresDsn: ""
   runaiClientId: ""
   runaiClientSecret: ""
   runaiBearerToken: ""
   nvidiaApiKey: ""
+  llmApiKey: ""
 
 postgresql:
   enabled: false
@@ -146,6 +148,9 @@ agent:
     maskingRegexListJson: "[]"
     builtinRedactionEnabled: true
     builtinRedactionHashMode: false
+    llmBaseUrl: ""
+    llmModel: ""
+    llmRequestTimeoutSeconds: 120
   podAnnotations: {}
   podLabels: {}
   podSecurityContext: {}

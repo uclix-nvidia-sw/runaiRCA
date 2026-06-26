@@ -92,6 +92,10 @@ class Settings:
     masking_regex_list: tuple[str, ...]
     builtin_redaction_enabled: bool
     builtin_redaction_hash_mode: bool
+    llm_base_url: str
+    llm_model: str
+    llm_api_key: str
+    llm_request_timeout_seconds: int
     nat_config_file: str
     enable_nat_runtime: bool
     nat_timeout_seconds: int
@@ -148,6 +152,10 @@ def load_settings() -> Settings:
         masking_regex_list=_json_string_list_env("MASKING_REGEX_LIST_JSON"),
         builtin_redaction_enabled=_bool_env("BUILTIN_REDACTION_ENABLED", True),
         builtin_redaction_hash_mode=_bool_env("BUILTIN_REDACTION_HASH_MODE", False),
+        llm_base_url=os.getenv("LLM_BASE_URL", "").strip().rstrip("/"),
+        llm_model=os.getenv("LLM_MODEL", "").strip(),
+        llm_api_key=os.getenv("LLM_API_KEY", "").strip(),
+        llm_request_timeout_seconds=_int_env("LLM_REQUEST_TIMEOUT_SECONDS", 120),
         nat_config_file=os.getenv(
             "NAT_CONFIG_FILE", "configs/runai_rca_workflow.yml"
         ).strip(),

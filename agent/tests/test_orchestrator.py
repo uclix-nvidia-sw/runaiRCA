@@ -53,6 +53,10 @@ def make_settings() -> Settings:
         masking_regex_list=(),
         builtin_redaction_enabled=True,
         builtin_redaction_hash_mode=False,
+        llm_base_url="",
+        llm_model="",
+        llm_api_key="",
+        llm_request_timeout_seconds=120,
         nat_config_file="configs/runai_rca_workflow.yml",
         enable_nat_runtime=False,
         nat_timeout_seconds=1,
@@ -170,6 +174,39 @@ function_groups:
     assert "https://loki-mcp.example.com/mcp" in rendered
     assert "localhost:9901" not in rendered
     assert "localhost:9902" not in rendered
+
+
+def test_nat_runner_materializes_litellm_placeholders(tmp_path: Path) -> None:
+    config = tmp_path / "workflow_litellm.yml"
+    config.write_text(
+        """
+llms:
+  litellm_llm:
+    _type: litellm
+    model_name: __RUNAI_RCA_LLM_MODEL__
+    base_url: __RUNAI_RCA_LLM_BASE_URL__
+    api_key: __RUNAI_RCA_LLM_API_KEY__
+    request_timeout: __RUNAI_RCA_LLM_REQUEST_TIMEOUT_SECONDS__
+""".strip(),
+        encoding="utf-8",
+    )
+    settings = replace(
+        make_settings(),
+        nat_config_file=str(config),
+        llm_base_url="https://litellm.example.com/v1",
+        llm_model="auto-router",
+        llm_api_key="test-secret",
+        llm_request_timeout_seconds=45,
+    )
+
+    rendered_path = Path(NemoWorkflowRunner(settings)._materialize_config_file())
+    rendered = rendered_path.read_text(encoding="utf-8")
+
+    assert "https://litellm.example.com/v1" in rendered
+    assert "auto-router" in rendered
+    assert "test-secret" in rendered
+    assert "request_timeout: 45" in rendered
+    assert "__RUNAI_RCA_LLM" not in rendered
 
 
 def test_masker_redacts_sensitive_object_values() -> None:

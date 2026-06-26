@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -81,6 +82,12 @@ class NemoWorkflowRunner:
         replacements = {
             "http://localhost:9901/mcp": self._settings.prometheus_mcp_url,
             "http://localhost:9902/mcp": self._settings.loki_mcp_url,
+            "__RUNAI_RCA_LLM_BASE_URL__": self._settings.llm_base_url,
+            "__RUNAI_RCA_LLM_MODEL__": self._settings.llm_model,
+            "__RUNAI_RCA_LLM_API_KEY__": self._settings.llm_api_key,
+            "__RUNAI_RCA_LLM_REQUEST_TIMEOUT_SECONDS__": str(
+                self._settings.llm_request_timeout_seconds
+            ),
         }
         replacements = {old: new for old, new in replacements.items() if new}
         if not replacements:
@@ -100,6 +107,7 @@ class NemoWorkflowRunner:
 
         target = Path(tempfile.gettempdir()) / "runai-rca-nat-workflow.yml"
         target.write_text(rendered, encoding="utf-8")
+        os.chmod(target, 0o600)
         return str(target)
 
 
