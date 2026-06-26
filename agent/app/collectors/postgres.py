@@ -102,9 +102,7 @@ class PostgresCollector:
         long_tx_count = len(checks["long_transactions"])
         pgvector = checks["pgvector_extension"]
         rca_tables = checks["rca_tables"]
-        missing_tables = [
-            name for name, exists in rca_tables.items() if not exists and name in {"incidents", "alerts"}
-        ]
+        missing_tables = [name for name, exists in rca_tables.items() if not exists]
         status = "ok"
         warnings: list[str] = []
         if long_tx_count:
@@ -178,7 +176,13 @@ async def _collect_postgres_checks(conn: Any, target: AnalysisTarget) -> dict[st
     table_rows = await conn.fetch(
         """
         SELECT table_name, to_regclass('public.' || table_name)::text IS NOT NULL AS exists
-        FROM unnest(ARRAY['incidents', 'alerts', 'analysis_artifacts', 'incident_embeddings'])
+        FROM unnest(ARRAY[
+          'incidents',
+          'alerts',
+          'incident_embeddings',
+          'rca_feedback',
+          'rca_comments'
+        ])
           AS table_name
         """
     )

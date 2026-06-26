@@ -40,8 +40,34 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{ include "runai-rca.fullname" . }}-frontend
 {{- end -}}
 
+{{- define "runai-rca.postgresql.fullname" -}}
+{{ include "runai-rca.fullname" . }}-postgresql
+{{- end -}}
+
+{{- define "runai-rca.postgresql.secretName" -}}
+{{ include "runai-rca.postgresql.fullname" . }}
+{{- end -}}
+
 {{- define "runai-rca.secretName" -}}
 {{- default (printf "%s-secrets" (include "runai-rca.fullname" .)) .Values.secrets.existingSecret -}}
+{{- end -}}
+
+{{- define "runai-rca.databaseUrl" -}}
+{{- if .Values.secrets.databaseUrl -}}
+{{- .Values.secrets.databaseUrl -}}
+{{- else if .Values.postgresql.enabled -}}
+{{- printf "postgres://%s:%s@%s:%v/%s?sslmode=disable" .Values.postgresql.auth.username .Values.postgresql.auth.password (include "runai-rca.postgresql.fullname" .) .Values.postgresql.service.port .Values.postgresql.auth.database -}}
+{{- else -}}
+{{- "" -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "runai-rca.postgresDsn" -}}
+{{- if .Values.secrets.postgresDsn -}}
+{{- .Values.secrets.postgresDsn -}}
+{{- else -}}
+{{- include "runai-rca.databaseUrl" . -}}
+{{- end -}}
 {{- end -}}
 
 {{- define "runai-rca.agent.serviceAccountName" -}}

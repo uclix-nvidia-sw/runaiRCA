@@ -3,44 +3,55 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from nat.plugin_api import Builder
-from nat.plugin_api import FunctionBaseConfig
-from nat.plugin_api import FunctionInfo
-from nat.plugin_api import register_function
+from nat.plugin_api import Builder, FunctionBaseConfig, FunctionInfo, register_function
 
-from app.collectors.base import CollectorResult
-from app.collectors.base import resolve_target
+from app.collectors.base import CollectorResult, resolve_target
 from app.collectors.kubernetes import KubernetesCollector
 from app.collectors.loki import LokiCollector
 from app.collectors.postgres import PostgresCollector
 from app.collectors.prometheus import PrometheusCollector
 from app.collectors.runai import RunAICollector
 from app.config import load_settings
+from app.knowledge import load_troubleshooting_cases
+from app.masking import build_masker
+from app.prompts import agent_role_coverage_lines, load_agent_souls
 from app.schemas import AlertAnalysisRequest
 
 
 class RunAIContextConfig(FunctionBaseConfig, name="runai_context"):
-    """Collect Run:ai project, queue, workload, and scheduler context."""
+    """Collect Run:ai API workload, project, queue, quota; no CLI by default."""
 
 
 class KubernetesContextConfig(FunctionBaseConfig, name="kubernetes_context"):
-    """Collect Kubernetes pod, event, node, and controller context."""
+    """Collect workload and Run:ai control-plane pod/event/node evidence."""
 
 
 class PostgresContextConfig(FunctionBaseConfig, name="postgres_context"):
-    """Collect Postgres RCA store, pgvector, and transaction health context."""
+    """Collect RCA store, pgvector, feedback, comments, and persistence health context."""
 
 
 class PrometheusContextConfig(FunctionBaseConfig, name="prometheus_context"):
-    """Collect Prometheus metric context or prepare PromQL evidence queries."""
+    """Collect Prometheus GPU, scheduling, pod, restart, CPU, and memory metric evidence."""
 
 
 class LokiContextConfig(FunctionBaseConfig, name="loki_context"):
-    """Collect Loki log context or prepare LogQL evidence queries."""
+    """Collect workload logs plus runai/runai-backend control-plane and backend log evidence."""
+
+
+class TroubleshootingCasesConfig(FunctionBaseConfig, name="troubleshooting_cases"):
+    """Load known Run:ai troubleshooting cases and operator playbook hints."""
+
+
+class AnalysisMemoryConfig(FunctionBaseConfig, name="analysis_memory"):
+    """Load similar incidents and operator feedback hints from the analysis request."""
+
+
+class AnalysisAgentConfig(FunctionBaseConfig, name="analysis_agent"):
+    """Own final KubeRCA-style RCA analysis, evidence review, confidence, and operator actions."""
 
 
 class SynthesizeRunAIRCACfg(FunctionBaseConfig, name="synthesize_runai_rca"):
-    """Synthesize component evidence into a KubeRCA-style Run:ai RCA report."""
+    """Backward-compatible alias for the Analysis Agent RCA report function."""
 
 
 @register_function(config_type=RunAIContextConfig)
@@ -83,6 +94,47 @@ async def loki_context(_config: LokiContextConfig, _builder: Builder):
     yield FunctionInfo.from_fn(_collect, description=LokiContextConfig.__doc__ or "")
 
 
+@register_function(config_type=TroubleshootingCasesConfig)
+async def troubleshooting_cases(_config: TroubleshootingCasesConfig, _builder: Builder):
+    async def _load(_input_message: str) -> str:
+        settings = load_settings()
+        cases = load_troubleshooting_cases(settings.troubleshooting_cases_file)
+        return cases or "No troubleshooting cases file was loaded."
+
+    yield FunctionInfo.from_fn(_load, description=TroubleshootingCasesConfig.__doc__ or "")
+
+
+@register_function(config_type=AnalysisMemoryConfig)
+async def analysis_memory(_config: AnalysisMemoryConfig, _builder: Builder):
+    async def _load(input_message: str) -> str:
+        settings = load_settings()
+        masker = build_masker(
+            settings.masking_regex_list,
+            builtin_enabled=settings.builtin_redaction_enabled,
+            hash_mode=settings.builtin_redaction_hash_mode,
+        )
+        request = _parse_payload(input_message)
+        payload = {
+            "similar_incidents": [
+                item.model_dump(mode="json") for item in request.similar_incidents
+            ],
+            "feedback_hints": [
+                item.model_dump(mode="json") for item in request.feedback_hints
+            ],
+        }
+        return json.dumps(masker.mask_object(payload), indent=2, sort_keys=True)
+
+    yield FunctionInfo.from_fn(_load, description=AnalysisMemoryConfig.__doc__ or "")
+
+
+@register_function(config_type=AnalysisAgentConfig)
+async def analysis_agent(_config: AnalysisAgentConfig, _builder: Builder):
+    async def _analyze(evidence_text: str) -> str:
+        return _synthesize_report(evidence_text)
+
+    yield FunctionInfo.from_fn(_analyze, description=AnalysisAgentConfig.__doc__ or "")
+
+
 @register_function(config_type=SynthesizeRunAIRCACfg)
 async def synthesize_runai_rca(_config: SynthesizeRunAIRCACfg, _builder: Builder):
     async def _synthesize(evidence_text: str) -> str:
@@ -95,7 +147,14 @@ async def _run_collector(payload: str, collector: Any) -> str:
     request = _parse_payload(payload)
     target = resolve_target(request.alert.labels, request.alert.annotations)
     result = await collector.collect(target)
-    return json.dumps(_collector_result_to_dict(result), indent=2, sort_keys=True)
+    settings = load_settings()
+    masker = build_masker(
+        settings.masking_regex_list,
+        builtin_enabled=settings.builtin_redaction_enabled,
+        hash_mode=settings.builtin_redaction_hash_mode,
+    )
+    safe_result = masker.mask_object(_collector_result_to_dict(result))
+    return json.dumps(safe_result, indent=2, sort_keys=True)
 
 
 def _parse_payload(payload: str) -> AlertAnalysisRequest:
@@ -122,12 +181,34 @@ def _collector_result_to_dict(result: CollectorResult) -> dict[str, Any]:
 
 
 def _synthesize_report(evidence_text: str) -> str:
-    return "\n".join(
+    settings = load_settings()
+    masker = build_masker(
+        settings.masking_regex_list,
+        builtin_enabled=settings.builtin_redaction_enabled,
+        hash_mode=settings.builtin_redaction_hash_mode,
+    )
+    cases = load_troubleshooting_cases(settings.troubleshooting_cases_file)
+    agent_souls = load_agent_souls(settings.agent_souls_file)
+    role_guidance = (
+        "Agent role contracts were loaded."
+        if agent_souls
+        else "Fallback agent role contracts were used."
+    )
+    report = "\n".join(
         [
             "## Root Cause",
             "",
             "NeMo Agent Toolkit collected component evidence for the Run:ai incident. "
             "Review the per-agent findings below and confirm against the live cluster.",
+            "",
+            "## Agent Role Contract",
+            "",
+            *agent_role_coverage_lines(),
+            "",
+            "## Analysis Agent Verdict",
+            "",
+            "The Analysis Agent is responsible for the final RCA judgment, confidence, "
+            "impact framing, missing-data callouts, and operator-facing next actions.",
             "",
             "## Agent Evidence",
             "",
@@ -135,12 +216,25 @@ def _synthesize_report(evidence_text: str) -> str:
             evidence_text,
             "```",
             "",
+            "## Troubleshooting Playbook",
+            "",
+            cases or "- No local troubleshooting cases file was loaded.",
+            "",
+            "## Runtime Guidance",
+            "",
+            role_guidance,
+            "",
             "## Recommended Actions",
             "",
             "- Check Run:ai project and queue saturation for the affected workload.",
             "- Review Kubernetes pod status, events, and node conditions.",
-            "- Inspect Postgres RCA store health when incident persistence or similarity search is stale.",
-            "- Compare Prometheus GPU, scheduling, CPU, and memory metrics around the alert window.",
+            "- Inspect Run:ai control-plane and backend namespace logs for scheduler, "
+            "queue, quota, database, or reconciliation errors.",
+            "- Inspect Postgres RCA store health when incident persistence or "
+            "similarity search is stale.",
+            "- Compare Prometheus GPU, scheduling, CPU, and memory metrics around "
+            "the alert window.",
             "- Inspect Loki workload logs for scheduling, startup, image, or runtime failures.",
         ]
     )
+    return masker.mask_text(report)

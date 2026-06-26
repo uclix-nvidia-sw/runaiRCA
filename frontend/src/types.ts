@@ -9,6 +9,50 @@ export type Artifact = {
   summary?: string;
 };
 
+export type SimilarIncident = {
+  incident_id: string;
+  alert_id?: string;
+  title: string;
+  severity: string;
+  status: string;
+  similarity: number;
+  analysis_summary: string;
+  analysis_detail?: string;
+  positive_feedback: number;
+  negative_feedback: number;
+  comment_count: number;
+  labels?: Record<string, string>;
+  created_at: string;
+};
+
+export type FeedbackHint = {
+  source_id: string;
+  sentiment: string;
+  weight: number;
+  text: string;
+};
+
+export type CommentRecord = {
+  comment_id: string;
+  target_type: string;
+  target_id: string;
+  incident_id?: string;
+  alert_id?: string;
+  body: string;
+  author?: string;
+  created_at: string;
+};
+
+export type FeedbackSummary = {
+  target_type: string;
+  target_id: string;
+  positive: number;
+  negative: number;
+  my_vote?: 'up' | 'down';
+  comments: CommentRecord[];
+  learning_hints?: FeedbackHint[];
+};
+
 export type Incident = {
   incident_id: string;
   correlation_key: string;
@@ -40,6 +84,8 @@ export type AlertRecord = {
   missing_data: string[];
   warnings: string[];
   artifacts: Artifact[];
+  similar_incidents?: SimilarIncident[];
+  feedback: FeedbackSummary;
   is_analyzing: boolean;
 };
 
@@ -51,6 +97,8 @@ export type IncidentDetail = Incident & {
   missing_data: string[];
   warnings: string[];
   artifacts: Artifact[];
+  similar_incidents?: SimilarIncident[];
+  feedback: FeedbackSummary;
   alerts: AlertRecord[];
 };
 

@@ -1,8 +1,11 @@
-import { AlertRecord, Envelope, Incident, IncidentDetail } from './types';
+import { AlertRecord, Envelope, FeedbackSummary, Incident, IncidentDetail } from './types';
 
 const runtimeApiBase = window.__RUNAI_RCA_CONFIG__?.apiBaseUrl;
 const fallbackApiBase = import.meta.env.DEV ? 'http://localhost:8080' : '';
 const API_BASE = (runtimeApiBase ?? import.meta.env.VITE_API_BASE_URL ?? fallbackApiBase).replace(/\/$/, '');
+const FEEDBACK_ACTOR_KEY = 'runai-rca-feedback-actor';
+
+type FeedbackVote = 'up' | 'down' | 'none';
 
 async function read<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`);
@@ -13,8 +16,12 @@ async function read<T>(path: string): Promise<T> {
 }
 
 async function write<T>(path: string, body?: unknown): Promise<T> {
+  return mutate<T>('POST', path, body);
+}
+
+async function mutate<T>(method: string, path: string, body?: unknown): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
-    method: 'POST',
+    method,
     headers: { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
@@ -29,7 +36,11 @@ export async function fetchIncidents(): Promise<Incident[]> {
 }
 
 export async function fetchIncident(id: string): Promise<IncidentDetail> {
-  return (await read<Envelope<IncidentDetail>>(`/api/v1/incidents/${encodeURIComponent(id)}`)).data;
+  return (
+    await read<Envelope<IncidentDetail>>(
+      `/api/v1/incidents/${encodeURIComponent(id)}${feedbackActorQuery()}`,
+    )
+  ).data;
 }
 
 export async function fetchAlerts(): Promise<AlertRecord[]> {
@@ -37,7 +48,9 @@ export async function fetchAlerts(): Promise<AlertRecord[]> {
 }
 
 export async function fetchAlert(id: string): Promise<AlertRecord> {
-  return (await read<Envelope<AlertRecord>>(`/api/v1/alerts/${encodeURIComponent(id)}`)).data;
+  return (
+    await read<Envelope<AlertRecord>>(`/api/v1/alerts/${encodeURIComponent(id)}${feedbackActorQuery()}`)
+  ).data;
 }
 
 export async function analyzeIncident(id: string): Promise<void> {
@@ -48,13 +61,97 @@ export async function resolveIncident(id: string): Promise<void> {
   await write(`/api/v1/incidents/${encodeURIComponent(id)}/resolve`);
 }
 
-export async function chat(message: string, context: Record<string, unknown>) {
-  return write<{ status: string; answer: string; conversation_id: string }>('/api/v1/chat', {
-    message,
-    context,
-  });
+export async function submitFeedback(
+  targetType: 'incident' | 'alert',
+  id: string,
+  vote: FeedbackVote,
+): Promise<FeedbackSummary> {
+  const path = targetPath(targetType, id, 'vote');
+  return (await write<Envelope<FeedbackSummary>>(path, { vote_type: vote, author: feedbackActorID() })).data;
+}
+
+export async function addComment(
+  targetType: 'incident' | 'alert',
+  id: string,
+  body: string,
+): Promise<FeedbackSummary> {
+  const path = targetPath(targetType, id, 'comments');
+  return (await write<Envelope<FeedbackSummary>>(path, { body })).data;
+}
+
+export async function updateComment(
+  targetType: 'incident' | 'alert',
+  id: string,
+  commentID: string,
+  body: string,
+): Promise<FeedbackSummary> {
+  const path = `${targetPath(targetType, id, 'comments')}/${encodeURIComponent(commentID)}`;
+  return (await mutate<Envelope<FeedbackSummary>>('PUT', path, { body })).data;
+}
+
+export async function deleteComment(
+  targetType: 'incident' | 'alert',
+  id: string,
+  commentID: string,
+): Promise<FeedbackSummary> {
+  const path = `${targetPath(targetType, id, 'comments')}/${encodeURIComponent(commentID)}`;
+  return (await mutate<Envelope<FeedbackSummary>>('DELETE', path)).data;
+}
+
+export type ChatRequest = {
+  message: string;
+  conversation_id?: string;
+  language?: 'ko' | 'en';
+  page?: string;
+  auto?: boolean;
+  incident_id?: string;
+  alert_id?: string;
+  incident_title?: string;
+  incident_content?: string;
+  alert_title?: string;
+  alert_content?: string;
+  context?: Record<string, unknown>;
+};
+
+export type ChatResponse = {
+  status: string;
+  answer: string;
+  message?: string;
+  response?: string;
+  conversation_id: string;
+};
+
+export async function chat(payload: ChatRequest) {
+  return write<ChatResponse>('/api/v1/chat', payload);
 }
 
 export function eventSource(): EventSource {
   return new EventSource(`${API_BASE}/api/v1/events`);
+}
+
+function targetPath(targetType: 'incident' | 'alert', id: string, action: string) {
+  const collection = targetType === 'incident' ? 'incidents' : 'alerts';
+  return `/api/v1/${collection}/${encodeURIComponent(id)}/${action}`;
+}
+
+function feedbackActorQuery() {
+  return `?feedback_author=${encodeURIComponent(feedbackActorID())}`;
+}
+
+function feedbackActorID() {
+  try {
+    const existing = window.localStorage.getItem(FEEDBACK_ACTOR_KEY);
+    if (existing) {
+      return existing;
+    }
+    const random =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const actor = `browser-${random}`;
+    window.localStorage.setItem(FEEDBACK_ACTOR_KEY, actor);
+    return actor;
+  } catch {
+    return 'browser-anonymous';
+  }
 }

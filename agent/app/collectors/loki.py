@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.collectors.base import AnalysisTarget, CollectorResult, artifact
+from app.collectors.http_json import compact, get_json
 from app.config import Settings
 
 
@@ -32,34 +33,125 @@ class LokiCollector:
                 ],
             )
 
-        selector_parts = []
-        if target.namespace:
-            selector_parts.append(f'namespace="{target.namespace}"')
-        if target.pod:
-            selector_parts.append(f'pod="{target.pod}"')
-        selector = "{" + ",".join(selector_parts) + "}" if selector_parts else "{}"
-        summary = "Loki is configured; MVP collector prepared a workload log query."
+        selector = _selector_for(target)
+        error_query = f'{selector} |~ "(?i)(error|fail|oom|evict|crash|pending|unschedul|back-off)"'
+        queries = [("error_logs", error_query), ("recent_logs", selector)]
+        runai_selector = _namespace_regex_selector(self._settings.runai_log_namespaces)
+        if runai_selector:
+            runai_error_query = (
+                f'{runai_selector} |~ '
+                '"(?i)(error|fail|panic|exception|scheduler|quota|queue|database|reconcile)"'
+            )
+            queries.append(("runai_control_plane_errors", runai_error_query))
+        query_results = []
+        warnings: list[str] = []
+
+        for name, query in queries:
+            response = await get_json(
+                base_url=self._settings.loki_url,
+                path="/loki/api/v1/query_range",
+                timeout_seconds=self._settings.loki_timeout_seconds,
+                params={"query": query, "limit": 20, "direction": "BACKWARD"},
+            )
+            streams = _loki_streams(response.data)
+            line_count = sum(len(stream.get("values", [])) for stream in streams)
+            query_results.append(
+                {
+                    "name": name,
+                    "query": query,
+                    "url": response.url,
+                    "status_code": response.status_code,
+                    "status": _loki_status(response.data),
+                    "stream_count": len(streams),
+                    "line_count": line_count,
+                    "sample": compact(streams, limit=3),
+                    "error": response.error,
+                }
+            )
+            if response.error:
+                warnings.append(f"Loki query failed for {name}: {response.error}")
+
+        successful = [item for item in query_results if not item["error"]]
+        populated = [item for item in successful if item["line_count"]]
+        if populated:
+            status = "ok"
+            confidence = "high"
+            summary = (
+                "Loki direct queries completed with matching log lines "
+                f"for {len(populated)} of {len(query_results)} query group(s)."
+            )
+        elif successful:
+            status = "partial"
+            confidence = "medium"
+            summary = (
+                "Loki is reachable, but the workload log queries returned no lines. "
+                "Check label names and log retention."
+            )
+        else:
+            status = "unavailable"
+            confidence = "low"
+            summary = "Loki direct queries failed."
+
         result = {
             "loki_url": self._settings.loki_url,
-            "query": selector,
-            "note": "Query execution will be wired through native client or MCP server.",
+            "queries": query_results,
         }
         return CollectorResult(
             agent=self.name,
-            status="ok",
+            status=status,
             summary=summary,
-            confidence="medium",
+            confidence=confidence,
             details=result,
+            missing_data=[] if successful else ["loki.query"],
+            warnings=warnings,
             artifacts=[
                 artifact(
                     agent=self.name,
                     source="loki",
                     type="logql",
-                    status="ok",
-                    confidence="medium",
-                    query=selector,
+                    status=status,
+                    confidence=confidence,
+                    query="; ".join(item["query"] for item in query_results),
                     summary=summary,
                     result=result,
                 )
             ],
         )
+
+
+def _selector_for(target: AnalysisTarget) -> str:
+    selector_parts = []
+    if target.namespace:
+        selector_parts.append(f'namespace="{target.namespace}"')
+    if target.pod:
+        selector_parts.append(f'pod="{target.pod}"')
+    elif target.workload_name:
+        selector_parts.append(f'app=~".*{target.workload_name}.*"')
+    return "{" + ",".join(selector_parts) + "}" if selector_parts else "{}"
+
+
+def _namespace_regex_selector(namespaces: tuple[str, ...]) -> str:
+    escaped = [namespace.replace("\\", "\\\\").replace('"', '\\"') for namespace in namespaces]
+    if not escaped:
+        return ""
+    return '{namespace=~"' + "|".join(escaped) + '"}'
+
+
+def _loki_status(data: object) -> str:
+    if isinstance(data, dict):
+        value = data.get("status")
+        if isinstance(value, str):
+            return value
+    return "unknown"
+
+
+def _loki_streams(data: object) -> list[dict[str, object]]:
+    if not isinstance(data, dict):
+        return []
+    payload = data.get("data")
+    if not isinstance(payload, dict):
+        return []
+    result = payload.get("result")
+    if not isinstance(result, list):
+        return []
+    return [item for item in result if isinstance(item, dict)]

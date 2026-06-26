@@ -20,17 +20,28 @@ functions:
     _type: prometheus_context
   loki_context:
     _type: loki_context
+  troubleshooting_cases:
+    _type: troubleshooting_cases
+  analysis_memory:
+    _type: analysis_memory
   evidence_parallel:
     _type: parallel_executor
-    description: Parallel component evidence collection for Run:ai RCA.
-    tool_list: [runai_context, kubernetes_context, postgres_context, prometheus_context, loki_context]
+    description: Parallel read-only evidence collection for Run:ai RCA. RunAI owns API workload/project/queue context; Kubernetes owns workload and Run:ai control-plane pods/events/nodes; Prometheus owns queue/project GPU and pod metrics; Loki owns workload and runai/runai-backend logs; Postgres owns RCA memory health.
+    tool_list:
+      - runai_context
+      - kubernetes_context
+      - postgres_context
+      - prometheus_context
+      - loki_context
+      - troubleshooting_cases
+      - analysis_memory
     detailed_logs: true
     return_error_on_exception: true
-  synthesize_runai_rca:
-    _type: synthesize_runai_rca
+  analysis_agent:
+    _type: analysis_agent
 
 workflow:
   _type: sequential_executor
-  description: Run:ai RCA workflow.
-  tool_list: [evidence_parallel, synthesize_runai_rca]
+  description: Run:ai RCA workflow with component evidence collection followed by the Analysis Agent.
+  tool_list: [evidence_parallel, analysis_agent]
   return_error_on_exception: true

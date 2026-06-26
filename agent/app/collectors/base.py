@@ -56,7 +56,9 @@ def resolve_target(labels: dict[str, str], annotations: dict[str, str]) -> Analy
             "pod",
             "job_name",
         ),
-        workload_type=value_from(labels, annotations, "workload_type", "kind", "runai_workload_type"),
+        workload_type=value_from(
+            labels, annotations, "workload_type", "kind", "runai_workload_type"
+        ),
         runai_workload_id=value_from(labels, annotations, "runai_workload_id", "workload_id"),
         node=value_from(labels, annotations, "node", "node_name", "kubernetes_node"),
         pod=value_from(labels, annotations, "pod", "pod_name", "kubernetes_pod_name"),

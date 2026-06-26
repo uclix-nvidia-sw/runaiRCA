@@ -8,6 +8,8 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY app ./app
 COPY configs ./configs
+COPY knowledge ./knowledge
+COPY prompts ./prompts
 
 RUN pip install --no-cache-dir .
 

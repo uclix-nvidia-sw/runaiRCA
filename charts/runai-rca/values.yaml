@@ -10,7 +10,26 @@ secrets:
   postgresDsn: ""
   runaiClientId: ""
   runaiClientSecret: ""
+  runaiBearerToken: ""
   nvidiaApiKey: ""
+
+postgresql:
+  enabled: false
+  image:
+    repository: postgres
+    tag: "16-alpine"
+    pullPolicy: IfNotPresent
+  auth:
+    username: runai_rca
+    password: runai_rca
+    database: runai_rca
+  service:
+    port: 5432
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClass: ""
+  resources: {}
 
 backend:
   replicaCount: 1
@@ -40,11 +59,24 @@ agent:
   env:
     language: en
     logLevel: info
+    kubernetesTimeoutSeconds: 6
     enableNatRuntime: false
     natConfigFile: /app/configs/runai_rca_workflow.yml
     runaiBaseUrl: ""
-    prometheusUrl: ""
-    lokiUrl: ""
+    runaiTokenUrl: ""
+    runaiWorkloadsPath: /api/v1/workloads
+    runaiProjectsPath: /api/v1/projects
+    runaiQueuesPath: /api/v1/queues
+    runaiLogNamespaces: runai,runai-backend
+    prometheusUrl: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+    prometheusMcpUrl: ""
+    lokiUrl: http://loki-gateway.monitoring.svc.cluster.local
+    lokiMcpUrl: ""
+    troubleshootingCasesFile: knowledge/troubleshooting_cases.md
+    agentSoulsFile: prompts/agent_souls.md
+    maskingRegexListJson: "[]"
+    builtinRedactionEnabled: true
+    builtinRedactionHashMode: false
   resources: {}
 
 frontend:

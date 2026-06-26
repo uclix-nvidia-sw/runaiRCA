@@ -1,9 +1,10 @@
 # Architecture
 
 Run:AI RCA is organized around three runtime services: Backend, Agent, and
-Frontend. The MVP keeps state in the Backend memory store so the project can be
-run quickly; the API and data shapes are designed to move to PostgreSQL and
-pgvector without changing the UI contract.
+Frontend. The Backend can run with an in-memory fallback for local development,
+but production-style deployments should provide Postgres through
+`DATABASE_URL`. The API stores incidents, alerts, operator feedback, comments,
+and similar-incident vectors without changing the UI contract.
 
 ## Runtime Flow
 
@@ -20,7 +21,9 @@ pgvector without changing the UI contract.
 7. Agent synthesizes a single RCA plus an `artifacts` list that preserves each
    agent's query, summary, confidence, and status.
 8. Backend stores the analysis response and broadcasts SSE updates.
-9. Frontend renders the final RCA and the agent evidence trail on the same
+9. Backend writes analyzed incidents into `incident_embeddings` and includes
+   similar prior incidents plus feedback hints in future Agent requests.
+10. Frontend renders the final RCA and the agent evidence trail on the same
    Incident or Alert detail page.
 
 ## Services
@@ -37,14 +40,17 @@ Prometheus, Loki, or NIM credentials exist. When `ENABLE_NAT_RUNTIME=true`, the
 
 ### Backend
 
-The Backend is a Go HTTP API. The MVP uses the Go standard library to avoid
-external dependency bootstrapping while the product shape stabilizes.
+The Backend is a Go HTTP API. It uses Postgres when `DATABASE_URL` or
+`POSTGRES_DSN` is configured, and keeps the in-memory fallback for local smoke
+tests where no database is available.
 
 It owns:
 
 - Alertmanager webhook intake
 - Incident and alert correlation
 - Agent request lifecycle
+- Postgres persistence for incidents, alerts, embeddings, feedback, and comments
+- KubeRCA-style `/api/v1/embeddings/search` similar-incident API
 - SSE event fanout
 - Chat proxy
 - Unified API response shape for the frontend
@@ -57,8 +63,22 @@ not include a marketing-style landing page.
 The key interaction is the Unified RCA Workspace:
 
 - Summary and recommended action at the top
-- Impact, evidence, missing data, and prevention in the middle
+- Similar incidents, operator votes/comments, impact, missing data, and prevention in the middle
 - Agent Evidence Trail at the bottom of the same page
+
+## Feedback And Memory Loop
+
+1. When an analysis completes, the Backend creates or updates an
+   `incident_embeddings` row with the incident text, labels, and sparse text
+   vector.
+2. Operators can vote up/down and leave markdown comments on either an incident
+   or alert. These are stored in `rca_feedback` and `rca_comments`.
+3. New alerts are compared against prior incident vectors. The top matches are
+   attached to the detail response and sent to the Agent as
+   `similar_incidents`.
+4. Feedback counts and comments from similar incidents are converted into
+   `feedback_hints`, so the Agent can reuse accepted RCA patterns and avoid
+   repeating rejected ones.
 
 ## Evidence Contract
 

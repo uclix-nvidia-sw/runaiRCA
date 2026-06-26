@@ -22,12 +22,35 @@ class PreviousAnalysisContext(BaseModel):
     created_at: str | None = None
 
 
+class SimilarIncidentContext(BaseModel):
+    incident_id: str
+    alert_id: str | None = None
+    title: str = ""
+    severity: str = ""
+    status: str = ""
+    similarity: float = 0
+    analysis_summary: str = ""
+    analysis_detail: str | None = None
+    positive_feedback: int = 0
+    negative_feedback: int = 0
+    comment_count: int = 0
+
+
+class FeedbackHintContext(BaseModel):
+    source_id: str = ""
+    sentiment: str = ""
+    weight: float = 0
+    text: str = ""
+
+
 class AlertAnalysisRequest(BaseModel):
     alert: Alert
     thread_ts: str = ""
     incident_id: str | None = None
     analysis_type: str | None = None
     previous_analysis: PreviousAnalysisContext | None = None
+    similar_incidents: list[SimilarIncidentContext] = Field(default_factory=list)
+    feedback_hints: list[FeedbackHintContext] = Field(default_factory=list)
     language: str | None = None
 
 
@@ -88,6 +111,14 @@ class ChatRequest(BaseModel):
     message: str
     conversation_id: str | None = None
     language: str | None = None
+    page: str | None = None
+    auto: bool = False
+    incident_id: str | None = None
+    alert_id: str | None = None
+    incident_title: str | None = None
+    incident_content: str | None = None
+    alert_title: str | None = None
+    alert_content: str | None = None
     context: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
 
@@ -95,4 +126,6 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     status: str
     answer: str
+    message: str | None = None
+    response: str | None = None
     conversation_id: str
