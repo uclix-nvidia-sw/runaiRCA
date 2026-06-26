@@ -8,6 +8,8 @@ metadata:
     app.kubernetes.io/component: agent
 {{- end }}
 {{- if .Values.agent.rbac.create }}
+{{- $rbacNamespaces := default (list .Release.Namespace) .Values.agent.rbac.namespaces -}}
+{{- if .Values.agent.rbac.clusterWide }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -57,4 +59,56 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "runai-rca.agent.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+{{- else }}
+{{- range $namespace := $rbacNamespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "runai-rca.agent.fullname" $ }}
+  namespace: {{ $namespace | quote }}
+  labels:
+    {{- include "runai-rca.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: agent
+rules:
+  - apiGroups: [""]
+    resources:
+      - configmaps
+      - endpoints
+      - events
+      - persistentvolumeclaims
+      - pods
+      - services
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources:
+      - daemonsets
+      - deployments
+      - replicasets
+      - statefulsets
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources:
+      - cronjobs
+      - jobs
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "runai-rca.agent.fullname" $ }}
+  namespace: {{ $namespace | quote }}
+  labels:
+    {{- include "runai-rca.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "runai-rca.agent.fullname" $ }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "runai-rca.agent.serviceAccountName" $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}
 {{- end }}

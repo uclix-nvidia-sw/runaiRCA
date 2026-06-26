@@ -143,6 +143,8 @@ Core environment variables:
 | `KUBERNETES_CA_PATH` | Service account CA path for in-cluster Kubernetes collection |
 | `KUBERNETES_TIMEOUT_SECONDS` | Kubernetes API request timeout |
 | `KUBERNETES_LIST_LIMIT` | Kubernetes pod/event list page size for evidence collection, default `50` |
+| `KUBERNETES_NAMESPACES` | Optional comma-separated namespace allowlist for Kubernetes direct collection |
+| `KUBERNETES_CLUSTER_SCOPE_ENABLED` | Enables cluster-scoped Kubernetes calls such as node lookups; Helm follows `agent.rbac.clusterWide` |
 | `RUNAI_BASE_URL` | Run:ai control plane URL |
 | `RUNAI_BEARER_TOKEN` | Optional Run:ai bearer token secret |
 | `RUNAI_CLIENT_ID` | Run:ai application client ID |
@@ -219,6 +221,19 @@ helm install runai-rca charts/runai-rca \
   --set postgresql.auth.password=change-me
 ```
 
+The Agent uses read-only cluster-wide RBAC by default so it can inspect target
+pods, Run:ai control-plane namespaces, and node context. To limit it to selected
+namespaces, disable cluster-wide RBAC and list the namespaces that should be
+queryable:
+
+```bash
+helm upgrade --install runai-rca charts/runai-rca \
+  --set agent.rbac.clusterWide=false \
+  --set 'agent.rbac.namespaces[0]=runai' \
+  --set 'agent.rbac.namespaces[1]=runai-backend' \
+  --set 'agent.rbac.namespaces[2]=runai-vision'
+```
+
 Frequently tuned Helm values:
 
 | Value | Purpose |
@@ -228,6 +243,9 @@ Frequently tuned Helm values:
 | `backend.env.language` / `agent.env.language` | Set RCA language to `en` or `ko` |
 | `backend.env.databaseConnectTimeoutSeconds` | Backend startup timeout for the Postgres store connection |
 | `secrets.keys.*` | Existing Secret key names for DB, Run:ai, and NVIDIA credentials |
+| `agent.rbac.clusterWide` | Use a ClusterRole for Kubernetes evidence collection; default `true` |
+| `agent.rbac.namespaces` | Namespaces that receive Role/RoleBinding when `agent.rbac.clusterWide=false`; defaults to the release namespace |
+| `agent.env.kubernetesNamespaces` | Agent-side Kubernetes namespace allowlist; when empty and `clusterWide=false`, Helm derives it from `agent.rbac.namespaces` |
 | `agent.env.runaiBaseUrl` / `agent.env.runaiTokenUrl` | Run:ai API and optional OAuth token endpoint |
 | `agent.env.runaiWorkloadsPath`, `runaiProjectsPath`, `runaiQueuesPath` | Run:ai API path overrides for different Run:ai versions |
 | `agent.env.runaiLogNamespaces` | Namespaces for Run:ai control-plane/backend logs, default `runai,runai-backend` |

@@ -66,6 +66,8 @@ class Settings:
     kubernetes_ca_path: str
     kubernetes_timeout_seconds: int
     kubernetes_list_limit: int
+    kubernetes_namespaces: tuple[str, ...]
+    kubernetes_cluster_scope_enabled: bool
     runai_base_url: str
     runai_bearer_token: str
     runai_client_id: str
@@ -117,6 +119,8 @@ def load_settings() -> Settings:
         ).strip(),
         kubernetes_timeout_seconds=_int_env("KUBERNETES_TIMEOUT_SECONDS", 6),
         kubernetes_list_limit=max(1, _int_env("KUBERNETES_LIST_LIMIT", 50)),
+        kubernetes_namespaces=_csv_env("KUBERNETES_NAMESPACES", ()),
+        kubernetes_cluster_scope_enabled=_bool_env("KUBERNETES_CLUSTER_SCOPE_ENABLED", True),
         runai_base_url=os.getenv("RUNAI_BASE_URL", "").strip().rstrip("/"),
         runai_bearer_token=os.getenv("RUNAI_BEARER_TOKEN", "").strip(),
         runai_client_id=os.getenv("RUNAI_CLIENT_ID", "").strip(),

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
+
 from app.collectors.base import AnalysisTarget
-from app.collectors.kubernetes import _filter_kubernetes_data, _list_params
+from app.collectors.kubernetes import _collect_kubernetes_responses, _filter_kubernetes_data, _list_params
 from app.collectors.prometheus import _queries_for
 from app.config import load_settings
 from app.nat_tools import (
@@ -99,6 +104,42 @@ def test_kubernetes_list_params_include_configured_limit(monkeypatch) -> None:
         "fieldSelector": "involvedObject.name=trainer",
         "limit": "25",
     }
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_namespace_scope_limits_direct_queries(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def fake_get_json(
+        *,
+        base_url: str,
+        path: str,
+        timeout_seconds: int,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        verify: bool | str = True,
+    ) -> SimpleNamespace:
+        calls.append(path)
+        return SimpleNamespace(url=f"{base_url}{path}", status_code=200, error=None, data={"items": []})
+
+    monkeypatch.setattr("app.collectors.kubernetes.get_json", fake_get_json)
+    monkeypatch.setenv("KUBERNETES_NAMESPACES", "runai-vision,runai")
+    monkeypatch.setenv("KUBERNETES_CLUSTER_SCOPE_ENABLED", "false")
+    monkeypatch.setenv("RUNAI_LOG_NAMESPACES", "runai,runai-backend")
+    settings = load_settings()
+    target = replace(make_target(), node="worker-a")
+
+    await _collect_kubernetes_responses(
+        settings=settings,
+        target=target,
+        headers={"Authorization": "Bearer test"},
+        verify=True,
+    )
+
+    assert "/api/v1/nodes/worker-a" not in calls
+    assert "/api/v1/namespaces/runai-backend/pods" not in calls
+    assert "/api/v1/namespaces/runai-vision/pods" in calls
+    assert "/api/v1/namespaces/runai/pods" in calls
 
 
 def test_prometheus_queries_cover_queue_and_project_gpu_contract() -> None:

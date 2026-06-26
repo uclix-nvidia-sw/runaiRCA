@@ -4,6 +4,11 @@
 {{- $securityContext := default .Values.securityContext .Values.agent.securityContext -}}
 {{- $priorityClassName := default .Values.priorityClassName .Values.agent.priorityClassName -}}
 {{- $topologySpreadConstraints := default .Values.topologySpreadConstraints .Values.agent.topologySpreadConstraints -}}
+{{- $rbacNamespaces := default (list .Release.Namespace) .Values.agent.rbac.namespaces -}}
+{{- $kubernetesNamespaces := .Values.agent.env.kubernetesNamespaces -}}
+{{- if and (not .Values.agent.rbac.clusterWide) (not $kubernetesNamespaces) -}}
+{{- $kubernetesNamespaces = join "," $rbacNamespaces -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -74,6 +79,10 @@ spec:
               value: {{ .Values.agent.env.kubernetesTimeoutSeconds | quote }}
             - name: KUBERNETES_LIST_LIMIT
               value: {{ .Values.agent.env.kubernetesListLimit | quote }}
+            - name: KUBERNETES_NAMESPACES
+              value: {{ $kubernetesNamespaces | quote }}
+            - name: KUBERNETES_CLUSTER_SCOPE_ENABLED
+              value: {{ .Values.agent.rbac.clusterWide | quote }}
             - name: ENABLE_NAT_RUNTIME
               value: {{ .Values.agent.env.enableNatRuntime | quote }}
             - name: NAT_CONFIG_FILE

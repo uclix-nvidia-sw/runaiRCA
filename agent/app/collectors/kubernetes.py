@@ -20,6 +20,8 @@ class KubernetesCollector:
             missing.append("kubernetes.namespace")
         if not target.pod and not target.workload_name and not target.node:
             missing.append("kubernetes.target")
+        if target.namespace and not _namespace_allowed(self._settings, target.namespace):
+            missing.append("kubernetes.namespace_scope")
 
         token = _read_file(self._settings.kubernetes_token_path)
         if not token:
@@ -87,6 +89,8 @@ class KubernetesCollector:
 
         details = {
             "kubernetes_api_url": self._settings.kubernetes_api_url,
+            "kubernetes_namespaces": self._settings.kubernetes_namespaces,
+            "kubernetes_cluster_scope_enabled": self._settings.kubernetes_cluster_scope_enabled,
             "namespace": target.namespace,
             "pod": target.pod,
             "workload_name": target.workload_name,
@@ -132,7 +136,8 @@ async def _collect_kubernetes_responses(
 ) -> list[dict[str, object]]:
     requests: list[tuple[str, str, dict[str, str] | None]] = []
     namespace = quote(target.namespace, safe="")
-    if target.namespace and target.pod:
+    target_namespace_allowed = _namespace_allowed(settings, target.namespace)
+    if target.namespace and target_namespace_allowed and target.pod:
         pod = quote(target.pod, safe="")
         requests.append(("pod", f"/api/v1/namespaces/{namespace}/pods/{pod}", None))
         requests.append(
@@ -142,13 +147,15 @@ async def _collect_kubernetes_responses(
                 _list_params(settings, {"fieldSelector": f"involvedObject.name={target.pod}"}),
             )
         )
-    elif target.namespace:
+    elif target.namespace and target_namespace_allowed:
         requests.append(("namespace_pods", f"/api/v1/namespaces/{namespace}/pods", _list_params(settings)))
         requests.append(("namespace_events", f"/api/v1/namespaces/{namespace}/events", _list_params(settings)))
-    if target.node:
+    if target.node and settings.kubernetes_cluster_scope_enabled:
         node = quote(target.node, safe="")
         requests.append(("node", f"/api/v1/nodes/{node}", None))
     for runai_namespace in settings.runai_log_namespaces:
+        if not _namespace_allowed(settings, runai_namespace):
+            continue
         namespace_name = quote(runai_namespace, safe="")
         requests.append(
             (
@@ -186,6 +193,12 @@ async def _collect_kubernetes_responses(
             }
         )
     return responses
+
+
+def _namespace_allowed(settings: Settings, namespace: str) -> bool:
+    if not namespace or not settings.kubernetes_namespaces:
+        return True
+    return namespace in settings.kubernetes_namespaces
 
 
 def _list_params(

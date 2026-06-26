@@ -104,6 +104,8 @@ agent:
     name: ""
   rbac:
     create: true
+    clusterWide: true
+    namespaces: []
   env:
     language: en
     logLevel: info
@@ -112,6 +114,7 @@ agent:
     kubernetesCaPath: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
     kubernetesTimeoutSeconds: 6
     kubernetesListLimit: 50
+    kubernetesNamespaces: ""
     enableNatRuntime: false
     natConfigFile: /app/configs/runai_rca_workflow.yml
     natTimeoutSeconds: 180

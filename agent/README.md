@@ -36,6 +36,9 @@ The Loki collector also queries Run:ai control-plane/backend logs with
 `RUNAI_LOG_NAMESPACES`, defaulting to `runai,runai-backend`.
 Use `KUBERNETES_LIST_LIMIT` and `LOKI_QUERY_LIMIT` to cap evidence volume in
 large clusters.
+Use `KUBERNETES_NAMESPACES` to restrict direct Kubernetes API collection to a
+comma-separated namespace allowlist, and set `KUBERNETES_CLUSTER_SCOPE_ENABLED=false`
+when the service account has namespaced RBAC only.
 
 Known troubleshooting cases are loaded from `TROUBLESHOOTING_CASES_FILE`
 (`knowledge/troubleshooting_cases.md` by default) and injected into fallback and

@@ -27,6 +27,8 @@ def make_settings() -> Settings:
         kubernetes_ca_path="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
         kubernetes_timeout_seconds=1,
         kubernetes_list_limit=10,
+        kubernetes_namespaces=(),
+        kubernetes_cluster_scope_enabled=True,
         runai_base_url="",
         runai_bearer_token="",
         runai_client_id="",
