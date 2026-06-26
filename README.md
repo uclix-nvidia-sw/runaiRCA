@@ -138,6 +138,7 @@ Core environment variables:
 | Variable | Purpose |
 | --- | --- |
 | `AGENT_URL` | Backend to Agent URL, default `http://localhost:8000` |
+| `LOG_LEVEL` | Agent log level, default `info` |
 | `LANGUAGE` | Backend/Agent response language, `en` or `ko` |
 | `KUBERNETES_API_URL` | In-cluster Kubernetes API URL, default `https://kubernetes.default.svc` |
 | `KUBERNETES_TOKEN_PATH` | Service account token path for in-cluster Kubernetes collection |
@@ -173,6 +174,7 @@ Core environment variables:
 | `BUILTIN_REDACTION_ENABLED` | Enable built-in secret redaction, default `true` |
 | `BUILTIN_REDACTION_HASH_MODE` | Replace secrets with stable short hashes instead of `[MASKED]`, default `false` |
 | `NVIDIA_API_KEY` | NIM key for NeMo Agent Toolkit workflows |
+| `ENABLE_NAT_RUNTIME` | Run RCA synthesis through the NeMo Agent Toolkit CLI instead of the deterministic in-process fallback, default `false` |
 | `NAT_CONFIG_FILE` | Optional NeMo workflow config path, default `configs/runai_rca_workflow.yml` |
 | `NAT_TIMEOUT_SECONDS` | NeMo Agent Toolkit CLI execution timeout |
 | `VITE_ENABLE_MOCK_DATA` | Frontend local-dev sample data toggle; Helm uses `frontend.config.enableMockData` |
@@ -275,7 +277,7 @@ Frequently tuned Helm values:
 | `agent.env.*TimeoutSeconds` | Request/runtime timeouts for Kubernetes, Run:ai, Prometheus, Loki, Postgres, and NAT |
 | `agent.env.kubernetesListLimit` / `agent.env.lokiQueryLimit` | Evidence volume controls for Kubernetes list calls and Loki log query groups |
 | `agent.env.troubleshootingCasesFile` / `agent.env.agentSoulsFile` | Paths for injected troubleshooting memory and agent role contracts |
-| `agent.env.maskingRegexListJson` | Cluster-specific secret masking regexes as a JSON array |
+| `agent.env.maskingRegexListJson` / `builtinRedaction*` | Cluster-specific secret masking regexes plus built-in redaction enable/hash controls |
 | `frontend.config.apiBaseUrl` | Browser API base URL when not using the bundled nginx `/api` proxy; accepts absolute URLs, `/api`-style paths, or localhost host:port values |
 | `frontend.config.enableMockData` | Show sample dashboard records when no live incidents or alerts exist, or when the local dev backend is unavailable; default `false` in Helm |
 | `frontend.nginx.*` | Frontend nginx proxy timeout and body-size controls for REST, webhook, and SSE traffic; defaults keep event streams open for one hour |

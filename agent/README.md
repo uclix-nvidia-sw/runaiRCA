@@ -62,7 +62,10 @@ RCA history instead of behaving like a generic chatbot.
 
 Sensitive values are masked before agent evidence is returned or synthesized.
 Built-in redaction is enabled by default and can be extended with
-`MASKING_REGEX_LIST_JSON`, a JSON array of regex patterns.
+`MASKING_REGEX_LIST_JSON`, a JSON array of regex patterns. Set
+`BUILTIN_REDACTION_ENABLED=false` only for controlled debugging, and use
+`BUILTIN_REDACTION_HASH_MODE=true` when stable correlation of masked values is
+needed without exposing the original secret.
 
 ## Run
 
