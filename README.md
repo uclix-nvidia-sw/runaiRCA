@@ -225,6 +225,10 @@ If `secrets.existingSecret` is used for Run:ai/NVIDIA credentials while bundled
 Postgres is enabled, the chart creates a separate generated database Secret and
 points Backend/Agent DB variables at it. To use a dedicated existing DB Secret
 instead, set `secrets.databaseExistingSecret`.
+Bundled Postgres usernames, passwords, and database names are URL-encoded when
+the chart generates `DATABASE_URL` / `POSTGRES_DSN`; externally supplied DSNs in
+`secrets.databaseUrl`, `secrets.postgresDsn`, or existing Secrets should already
+be valid Postgres URLs.
 
 The Agent uses read-only cluster-wide RBAC by default so it can inspect target
 pods, Run:ai control-plane namespaces, and node context. To limit it to selected

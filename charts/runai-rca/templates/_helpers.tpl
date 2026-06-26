@@ -72,11 +72,15 @@ true
 {{- end -}}
 {{- end -}}
 
+{{- define "runai-rca.urlEncode" -}}
+{{- . | toString | urlquery | replace "+" "%20" -}}
+{{- end -}}
+
 {{- define "runai-rca.databaseUrl" -}}
 {{- if .Values.secrets.databaseUrl -}}
 {{- .Values.secrets.databaseUrl -}}
 {{- else if .Values.postgresql.enabled -}}
-{{- printf "postgres://%s:%s@%s:%v/%s?sslmode=disable" .Values.postgresql.auth.username .Values.postgresql.auth.password (include "runai-rca.postgresql.fullname" .) .Values.postgresql.service.port .Values.postgresql.auth.database -}}
+{{- printf "postgres://%s:%s@%s:%v/%s?sslmode=disable" (include "runai-rca.urlEncode" .Values.postgresql.auth.username) (include "runai-rca.urlEncode" .Values.postgresql.auth.password) (include "runai-rca.postgresql.fullname" .) .Values.postgresql.service.port (include "runai-rca.urlEncode" .Values.postgresql.auth.database) -}}
 {{- else -}}
 {{- "" -}}
 {{- end -}}
