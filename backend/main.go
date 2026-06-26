@@ -192,6 +192,7 @@ func main() {
 		Addr:    ":" + port,
 		Handler: server.routes(),
 		// No WriteTimeout: the /api/v1/events SSE stream is long-lived.
+		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
