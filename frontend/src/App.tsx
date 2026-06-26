@@ -116,6 +116,17 @@ type AgentSummary = {
   mock?: boolean;
 };
 
+type SynthesisSummary = {
+  id: string;
+  name: string;
+  status: string;
+  summary: string;
+  source: string;
+  lastRun: string;
+  runCount: number;
+  mock?: boolean;
+};
+
 type AnalysisRecord = {
   id: string;
   incidentID?: string;
@@ -180,13 +191,17 @@ type AnalysisAnalytics = {
 const ANALYSIS_AGENT_ID = 'analysis';
 const COMPONENT_AGENT_ORDER = ['runai', 'kubernetes', 'postgres', 'prometheus', 'loki'];
 const AGENT_ORDER = COMPONENT_AGENT_ORDER;
-const AGENT_REGISTRY_ORDER = [ANALYSIS_AGENT_ID, ...COMPONENT_AGENT_ORDER];
 const ANALYSIS_WINDOWS = [
   { label: '7d', days: 7 },
   { label: '14d', days: 14 },
   { label: '30d', days: 30 },
 ];
 const ENABLE_MOCK_DATA = runtimeBool('enableMockData', 'VITE_ENABLE_MOCK_DATA', import.meta.env.DEV);
+
+function isCollectorAgent(agent: string) {
+  return COMPONENT_AGENT_ORDER.includes(agent);
+}
+
 const MOCK_EVIDENCE_ITEM: EvidenceItem = {
   id: 'mock-evidence-runai-queue',
   title: 'Sample Run:AI queue snapshot',
@@ -207,26 +222,14 @@ const MOCK_EVIDENCE_ITEM: EvidenceItem = {
   createdAt: '2026-06-26T00:00:00Z',
   mock: true,
 };
-const MOCK_AGENT_SUMMARY: AgentSummary = {
-  id: 'mock-agent-runai',
-  agent: 'runai',
-  name: 'Run:AI Collector',
+const MOCK_SYNTHESIS_SUMMARY: SynthesisSummary = {
+  id: 'mock-synthesis-analysis',
+  name: 'RCA Synthesis',
   status: 'ok',
-  summary: 'Mock agent run: validates Run:AI workload state, queue pressure, and quota signals.',
-  source: 'mock.agent.runai',
-  lastRun: '2026-06-26T00:00:00Z',
-  evidenceCount: 1,
-  mock: true,
-};
-const MOCK_ANALYSIS_AGENT_SUMMARY: AgentSummary = {
-  id: 'mock-agent-analysis',
-  agent: ANALYSIS_AGENT_ID,
-  name: 'Analysis Agent',
-  status: 'ok',
-  summary: 'Mock analysis agent: combines component evidence into the RCA report and dashboard state.',
+  summary: 'Mock synthesis run: combines collector evidence into the RCA report and dashboard state.',
   source: 'mock.agent.analysis',
   lastRun: '2026-06-26T00:00:00Z',
-  evidenceCount: 1,
+  runCount: 1,
   mock: true,
 };
 const MOCK_ALERT_ARTIFACT: Artifact = {
@@ -1041,22 +1044,24 @@ function App() {
 
   const liveEvidenceItems = useMemo<EvidenceItem[]>(() => {
     return alerts.flatMap((alert) =>
-      alert.artifacts.map((artifact, index) => ({
-        id: `${alert.alert_id}-${artifact.agent}-${artifact.type}-${index}`,
-        title: artifact.summary || `${agentLabel(artifact.agent)} ${artifact.type}`,
-        agent: artifact.agent,
-        source: artifact.source,
-        type: artifact.type,
-        status: artifact.status || 'ok',
-        confidence: artifact.confidence || 'medium',
-        target: targetLine(alert.labels),
-        summary: artifact.summary || 'Evidence was collected without a summary.',
-        query: artifact.query,
-        result: artifact.result,
-        alertID: alert.alert_id,
-        incidentID: alert.incident_id,
-        createdAt: alert.fired_at,
-      })),
+      alert.artifacts
+        .filter((artifact) => isCollectorAgent(artifact.agent))
+        .map((artifact, index) => ({
+          id: `${alert.alert_id}-${artifact.agent}-${artifact.type}-${index}`,
+          title: artifact.summary || `${agentLabel(artifact.agent)} ${artifact.type}`,
+          agent: artifact.agent,
+          source: artifact.source,
+          type: artifact.type,
+          status: artifact.status || 'ok',
+          confidence: artifact.confidence || 'medium',
+          target: targetLine(alert.labels),
+          summary: artifact.summary || 'Evidence was collected without a summary.',
+          query: artifact.query,
+          result: artifact.result,
+          alertID: alert.alert_id,
+          incidentID: alert.incident_id,
+          createdAt: alert.fired_at,
+        })),
     );
   }, [alerts]);
 
@@ -1074,45 +1079,47 @@ function App() {
   }, [evidenceItems, query]);
 
   const agentSummaries = useMemo<AgentSummary[]>(() => {
-    if (liveEvidenceItems.length === 0 && showMockData) return [MOCK_ANALYSIS_AGENT_SUMMARY, MOCK_AGENT_SUMMARY];
-    return AGENT_REGISTRY_ORDER.map((agent) => {
-      if (agent === ANALYSIS_AGENT_ID) {
-        const latest = analysisRecords[0];
-        return {
-          id: `agent-${agent}`,
-          agent,
-          name: 'Analysis Agent',
-          status: analysisRecords.some((record) => record.isAnalyzing)
-            ? 'analyzing'
-            : analysisRecords.some((record) => record.detail || record.summary)
-              ? 'ok'
-              : 'pending',
-          summary:
-            analysisRecords.length > 0
-              ? `${analysisRecords.length} RCA analysis record(s) tracked across current alerts.`
-              : 'No RCA analysis records have been created yet.',
-          source: 'nemo.analysis_agent',
-          lastRun: latest?.createdAt || '-',
-          evidenceCount: analysisRecords.length,
-        };
-      }
-      const agentEvidence = liveEvidenceItems.filter((item) => item.agent === agent);
+    const evidenceSource = showMockData ? [MOCK_EVIDENCE_ITEM] : liveEvidenceItems;
+    return COMPONENT_AGENT_ORDER.map((agent) => {
+      const agentEvidence = evidenceSource.filter((item) => item.agent === agent);
       const latest = agentEvidence[0];
       return {
         id: `agent-${agent}`,
         agent,
-        name: `${agentLabel(agent)} Agent`,
+        name: `${agentLabel(agent)} Collector`,
         status: agentEvidence.length > 0 ? 'ok' : 'pending',
         summary:
           agentEvidence.length > 0
-            ? `${agentEvidence.length} evidence item(s) collected for recent RCA context.`
-            : 'No evidence has been collected by this agent yet.',
+            ? `${agentEvidence.length} collector evidence item(s) linked to recent RCA context.`
+            : 'No collector evidence has been collected by this agent yet.',
         source: latest?.source || `${agent}.collector`,
         lastRun: latest?.createdAt || '-',
         evidenceCount: agentEvidence.length,
+        mock: latest?.mock,
       };
     });
-  }, [analysisRecords, liveEvidenceItems, showMockData]);
+  }, [liveEvidenceItems, showMockData]);
+
+  const synthesisSummary = useMemo<SynthesisSummary>(() => {
+    if (showMockData) return MOCK_SYNTHESIS_SUMMARY;
+    const latest = analysisRecords[0];
+    return {
+      id: 'synthesis-analysis',
+      name: 'RCA Synthesis',
+      status: analysisRecords.some((record) => record.isAnalyzing)
+        ? 'analyzing'
+        : analysisRecords.some((record) => record.detail || record.summary)
+          ? 'ok'
+          : 'pending',
+      summary:
+        analysisRecords.length > 0
+          ? `${analysisRecords.length} RCA synthesis run(s) tracked across current incidents and alerts.`
+          : 'No RCA synthesis runs have been created yet.',
+      source: 'nemo.analysis_agent',
+      lastRun: latest?.createdAt || '-',
+      runCount: analysisRecords.length,
+    };
+  }, [analysisRecords, showMockData]);
 
   const filteredAgents = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -1124,6 +1131,17 @@ function App() {
         .includes(q),
     );
   }, [agentSummaries, query]);
+
+  const visibleSynthesis = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return synthesisSummary;
+    return [synthesisSummary.name, synthesisSummary.status, synthesisSummary.summary, synthesisSummary.source]
+      .join(' ')
+      .toLowerCase()
+      .includes(q)
+      ? synthesisSummary
+      : null;
+  }, [query, synthesisSummary]);
 
   const viewCopy = VIEW_COPY[activeView];
 
@@ -1300,6 +1318,8 @@ function App() {
         {activeView === 'agents' && (
           <AgentsRegistry
             agents={filteredAgents}
+            synthesis={visibleSynthesis}
+            synthesisRuns={synthesisSummary.runCount}
             totalCount={agentSummaries.length}
           />
         )}
@@ -1390,6 +1410,7 @@ function OperationsView({
             </tbody>
           </table>
           {loading && <p className="empty">Loading incidents...</p>}
+          {!loading && filteredIncidents.length === 0 && <p className="empty">No incidents match the current search.</p>}
         </div>
 
         <div className="panel">
@@ -1435,7 +1456,7 @@ function OperationsView({
               ))}
             </tbody>
           </table>
-          {!loading && filteredAlerts.length === 0 && <p className="empty">No alerts yet.</p>}
+          {!loading && filteredAlerts.length === 0 && <p className="empty">No alerts match the current search.</p>}
         </div>
       </section>
     </>
@@ -1500,23 +1521,119 @@ function AnalysisDashboard({
         <Metric label="Alerts / Incident" value={formatDecimal(analytics.summary.avgAlertsPerIncident)} />
       </section>
 
-      <section className="analysis-pipeline" aria-label="Analysis agent pipeline">
-        <PipelineStep agent={ANALYSIS_AGENT_ID} title="Analysis Agent" status={highQuality > 0 ? 'ok' : completed > 0 ? 'partial' : 'pending'} />
+      <section className="analysis-pipeline" aria-label="Collector and synthesis pipeline">
         {COMPONENT_AGENT_ORDER.map((agent) => (
           <PipelineStep
             key={agent}
             agent={agent}
-            title={`${agentLabel(agent)} Agent`}
+            title={`${agentLabel(agent)} Collector`}
             status={dominantCapability(records, agent)}
           />
         ))}
+        <PipelineStep
+          agent={ANALYSIS_AGENT_ID}
+          synthesis
+          title="Analysis Agent"
+          status={highQuality > 0 ? 'ok' : completed > 0 ? 'partial' : 'pending'}
+        />
       </section>
 
-      <section className="analysis-overview-grid">
-        <TrendLineChart points={analytics.series} />
-        <div className="analysis-side-stack">
-          <DistributionBars title="Incident severity" items={analytics.breakdown.incidentSeverity} />
-          <DistributionBars title="Analysis quality" items={analytics.breakdown.analysisQuality} />
+      <section className="analysis-focus-grid">
+        <section className="panel view-panel recent-analysis-panel">
+          <PanelHeader title="Recent analyses" count={recentRecords.length} />
+          <div className="analysis-list">
+            {recentRecords.map((record) => {
+              const alertID = record.alertID;
+              const incidentID = record.incidentID;
+              return (
+                <article className="analysis-card" key={record.id}>
+                  <div className="analysis-card-head">
+                    <div>
+                      <div className="section-title compact-title">
+                        <ListChecks size={18} />
+                        <span>{record.title}</span>
+                        <span className={`source-pill source-${analysisSourceClass(record.source)}`}>
+                          {sourceLabel(record.source)}
+                        </span>
+                        {record.mock && <span className="sample-pill">Mock</span>}
+                      </div>
+                      <div className="meta-line">
+                        <span>{record.alertID || record.id}</span>
+                        <span>{record.target}</span>
+                        <Severity value={record.severity} />
+                        <Status value={record.analysisStatus} />
+                      </div>
+                    </div>
+                    <strong className={`quality quality-${record.quality || 'pending'}`}>{record.quality || 'pending'}</strong>
+                  </div>
+
+                  <p className="analysis-summary">
+                    {record.summary || 'Analysis has not produced a summary yet.'}
+                  </p>
+
+                  <div className="coverage-strip">
+                    {COMPONENT_AGENT_ORDER.map((agent) => (
+                      <span className={`coverage-pill coverage-${record.capabilities[agent] || 'pending'}`} key={agent}>
+                        {agentIcon(agent)}
+                        {agentLabel(agent)}
+                        <strong>{record.capabilities[agent] || 'pending'}</strong>
+                      </span>
+                    ))}
+                  </div>
+
+                  <div className="analysis-grid">
+                    <span>Artifacts <strong>{record.artifactCount}</strong></span>
+                    <span>Similar <strong>{record.similarCount}</strong></span>
+                    <span>Feedback <strong>{record.positiveFeedback}/{record.negativeFeedback}</strong></span>
+                    <span>Comments <strong>{record.commentCount}</strong></span>
+                  </div>
+
+                  {(record.missingData.length > 0 || record.warnings.length > 0) && (
+                    <div className="analysis-flags">
+                      {record.missingData.slice(0, 3).map((item) => (
+                        <span key={`missing-${record.id}-${item}`}>{item}</span>
+                      ))}
+                      {record.warnings.slice(0, 3).map((item) => (
+                        <span key={`warning-${record.id}-${item}`}>{item}</span>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="analysis-actions">
+                    <span>{formatTime(record.createdAt)}</span>
+                    <div>
+                      {alertID && (
+                        <button className="ghost-button" onClick={() => void onOpenAlert(alertID)} type="button">
+                          <FileText size={16} /> Open report
+                        </button>
+                      )}
+                      {incidentID && (
+                        <button className="ghost-button" onClick={() => void onOpenIncident(incidentID)} type="button">
+                          <ArrowLeft size={16} /> Incident
+                        </button>
+                      )}
+                      {incidentID && (
+                        <button className="primary-button" onClick={() => void onAnalyze(incidentID)} type="button">
+                          <Bot size={16} /> Analyze
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </article>
+              );
+            })}
+            {loading && <p className="empty">Loading analysis...</p>}
+            {!loading && totalCount === 0 && <p className="empty">No analysis records have been created yet.</p>}
+            {!loading && totalCount > 0 && recentRecords.length === 0 && <p className="empty">No analyses match the selected time window or search.</p>}
+          </div>
+        </section>
+
+        <div className="analysis-focus-side">
+          <TrendLineChart points={analytics.series} />
+          <div className="analysis-side-stack">
+            <DistributionBars title="Incident severity" items={analytics.breakdown.incidentSeverity} />
+            <DistributionBars title="Analysis quality" items={analytics.breakdown.analysisQuality} />
+          </div>
         </div>
       </section>
 
@@ -1525,95 +1642,6 @@ function AnalysisDashboard({
         <TopDimensionList title="Top namespaces" items={analytics.breakdown.topNamespaces} />
         <TopDimensionList title="Top projects" items={analytics.breakdown.topProjects} />
         <AnalysisReadiness records={allRecords} />
-      </section>
-
-      <section className="panel view-panel">
-        <PanelHeader title="Recent analyses" count={recentRecords.length} />
-        <div className="analysis-list">
-          {recentRecords.map((record) => {
-            const alertID = record.alertID;
-            const incidentID = record.incidentID;
-            return (
-              <article className="analysis-card" key={record.id}>
-                <div className="analysis-card-head">
-                  <div>
-                    <div className="section-title compact-title">
-                      <ListChecks size={18} />
-                      <span>{record.title}</span>
-                      <span className={`source-pill source-${analysisSourceClass(record.source)}`}>
-                        {sourceLabel(record.source)}
-                      </span>
-                      {record.mock && <span className="sample-pill">Mock</span>}
-                    </div>
-                    <div className="meta-line">
-                      <span>{record.alertID || record.id}</span>
-                      <span>{record.target}</span>
-                      <Severity value={record.severity} />
-                      <Status value={record.analysisStatus} />
-                    </div>
-                  </div>
-                  <strong className={`quality quality-${record.quality || 'pending'}`}>{record.quality || 'pending'}</strong>
-                </div>
-
-                <p className="analysis-summary">
-                  {record.summary || 'Analysis has not produced a summary yet.'}
-                </p>
-
-                <div className="coverage-strip">
-                  {COMPONENT_AGENT_ORDER.map((agent) => (
-                    <span className={`coverage-pill coverage-${record.capabilities[agent] || 'pending'}`} key={agent}>
-                      {agentIcon(agent)}
-                      {agentLabel(agent)}
-                      <strong>{record.capabilities[agent] || 'pending'}</strong>
-                    </span>
-                  ))}
-                </div>
-
-                <div className="analysis-grid">
-                  <span>Artifacts <strong>{record.artifactCount}</strong></span>
-                  <span>Similar <strong>{record.similarCount}</strong></span>
-                  <span>Feedback <strong>{record.positiveFeedback}/{record.negativeFeedback}</strong></span>
-                  <span>Comments <strong>{record.commentCount}</strong></span>
-                </div>
-
-                {(record.missingData.length > 0 || record.warnings.length > 0) && (
-                  <div className="analysis-flags">
-                    {record.missingData.slice(0, 3).map((item) => (
-                      <span key={`missing-${record.id}-${item}`}>{item}</span>
-                    ))}
-                    {record.warnings.slice(0, 3).map((item) => (
-                      <span key={`warning-${record.id}-${item}`}>{item}</span>
-                    ))}
-                  </div>
-                )}
-
-                <div className="analysis-actions">
-                  <span>{formatTime(record.createdAt)}</span>
-                  <div>
-                    {alertID && (
-                      <button className="ghost-button" onClick={() => void onOpenAlert(alertID)} type="button">
-                        <FileText size={16} /> Open report
-                      </button>
-                    )}
-                    {incidentID && (
-                      <button className="ghost-button" onClick={() => void onOpenIncident(incidentID)} type="button">
-                        <ArrowLeft size={16} /> Incident
-                      </button>
-                    )}
-                    {incidentID && (
-                      <button className="primary-button" onClick={() => void onAnalyze(incidentID)} type="button">
-                        <Bot size={16} /> Analyze
-                      </button>
-                    )}
-                  </div>
-                </div>
-              </article>
-            );
-          })}
-          {loading && <p className="empty">Loading analysis...</p>}
-          {!loading && totalCount === 0 && <p className="empty">No analysis records yet.</p>}
-          {!loading && totalCount > 0 && recentRecords.length === 0 && <p className="empty">No matching analysis records.</p>}
-        </div>
       </section>
     </>
   );
@@ -1740,7 +1768,7 @@ function TopDimensionList({ title, items }: { title: string; items: Distribution
 function AnalysisReadiness({ records }: { records: AnalysisRecord[] }) {
   return (
     <section className="top-dimension-panel">
-      <div className="compact-panel-title">Agent readiness</div>
+      <div className="compact-panel-title">Collector readiness</div>
       <div className="readiness-list">
         {COMPONENT_AGENT_ORDER.map((agent) => {
           const status = dominantCapability(records, agent);
@@ -1759,9 +1787,19 @@ function AnalysisReadiness({ records }: { records: AnalysisRecord[] }) {
   );
 }
 
-function PipelineStep({ agent, title, status }: { agent: string; title: string; status: string }) {
+function PipelineStep({
+  agent,
+  title,
+  status,
+  synthesis = false,
+}: {
+  agent: string;
+  title: string;
+  status: string;
+  synthesis?: boolean;
+}) {
   return (
-    <article className="pipeline-step">
+    <article className={`pipeline-step ${synthesis ? 'synthesis-step' : ''}`}>
       {agentIcon(agent)}
       <div>
         <strong>{title}</strong>
@@ -1824,25 +1862,59 @@ function EvidenceInventory({
               </div>
             </article>
           ))}
-          {items.length === 0 && <p className="empty">No matching evidence.</p>}
+          {items.length === 0 && <p className="empty">No evidence items match the current search.</p>}
         </div>
       </section>
     </>
   );
 }
 
-function AgentsRegistry({ agents, totalCount }: { agents: AgentSummary[]; totalCount: number }) {
+function AgentsRegistry({
+  agents,
+  synthesis,
+  synthesisRuns,
+  totalCount,
+}: {
+  agents: AgentSummary[];
+  synthesis: SynthesisSummary | null;
+  synthesisRuns: number;
+  totalCount: number;
+}) {
   return (
     <>
       <section className="metric-row">
-        <Metric label="Agents" value={totalCount} />
-        <Metric label="Visible" value={agents.length} />
-        <Metric label="Ready" value={agents.filter((agent) => agent.status === 'ok').length} />
+        <Metric label="Collectors" value={totalCount} />
+        <Metric label="Collectors ready" value={agents.filter((agent) => agent.status === 'ok').length} />
         <Metric label="Evidence linked" value={agents.reduce((sum, agent) => sum + agent.evidenceCount, 0)} />
+        <Metric label="Synthesis runs" value={synthesisRuns} />
+      </section>
+
+      <section className="panel view-panel synthesis-panel">
+        <PanelHeader title="RCA Synthesis" count={synthesis ? 1 : 0} />
+        {synthesis ? (
+          <article className="synthesis-card">
+            <div className="synthesis-card-head">
+              <div className="section-title compact-title">
+                {agentIcon(ANALYSIS_AGENT_ID)}
+                <span>{synthesis.name}</span>
+                {synthesis.mock && <span className="sample-pill">Mock</span>}
+              </div>
+              <Status value={synthesis.status} />
+            </div>
+            <p>{synthesis.summary}</p>
+            <div className="synthesis-stats">
+              <span>Source <strong>{synthesis.source}</strong></span>
+              <span>Runs <strong>{synthesis.runCount}</strong></span>
+              <span>Latest <strong>{formatTime(synthesis.lastRun)}</strong></span>
+            </div>
+          </article>
+        ) : (
+          <p className="empty compact-empty">No synthesis run matches the current search.</p>
+        )}
       </section>
 
       <section className="panel view-panel">
-        <PanelHeader title="Agents" count={agents.length} />
+        <PanelHeader title="Collectors" count={agents.length} />
         <div className="agent-registry">
           {agents.map((agent) => (
             <article className="agent-card" key={agent.id}>
@@ -1862,7 +1934,7 @@ function AgentsRegistry({ agents, totalCount }: { agents: AgentSummary[]; totalC
               </div>
             </article>
           ))}
-          {agents.length === 0 && <p className="empty">No matching agents.</p>}
+          {agents.length === 0 && <p className="empty">No collectors match the current search.</p>}
         </div>
       </section>
     </>
@@ -1917,6 +1989,12 @@ function UnifiedWorkspace({
   const similarIncidents = incident?.similar_incidents ?? [];
   const feedback = incident?.feedback ?? alert?.feedback;
   const targetType = detail.kind;
+  const positiveFeedback = feedback?.positive ?? 0;
+  const negativeFeedback = feedback?.negative ?? 0;
+  const commentCount = feedback?.comments?.length ?? 0;
+  const scrollToFeedback = () => {
+    document.getElementById('operator-feedback')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
 
   return (
     <section className="workspace">
@@ -1925,7 +2003,7 @@ function UnifiedWorkspace({
           <p className="eyebrow">{detail.kind} detail</p>
           <h2>{title}</h2>
           <div className="meta-line">
-            <span>{id}</span>
+            <span className="entity-id">{id}</span>
             <span>{targetLine(labels)}</span>
             <Severity value={detail.data.severity} />
             <Status value={detail.data.status} analyzing={detail.data.is_analyzing} />
@@ -1952,7 +2030,15 @@ function UnifiedWorkspace({
       <div className="workspace-body">
         <section className="rca-summary">
           <h3>RCA Summary</h3>
-          <p>{summary || 'Analysis is pending. The Agent Evidence Trail will populate as collectors finish.'}</p>
+          <p>{summary || 'Analysis is pending. The Collector Evidence Trail will populate as collectors finish.'}</p>
+          <div className="rca-feedback-strip">
+            <span><ThumbsUp size={15} /> {positiveFeedback}</span>
+            <span><ThumbsDown size={15} /> {negativeFeedback}</span>
+            <span><MessageSquare size={15} /> {commentCount}</span>
+            <button className="ghost-button compact-button" onClick={scrollToFeedback} type="button">
+              <MessageSquare size={14} /> Feedback
+            </button>
+          </div>
         </section>
 
         {incident ? (
@@ -1971,7 +2057,7 @@ function UnifiedWorkspace({
         </section>
 
         <section className="agent-trail">
-          <div className="section-title"><Bot size={18} /> Agent Evidence Trail</div>
+          <div className="section-title"><Bot size={18} /> Collector Evidence Trail</div>
           <div className="agent-grid">
             {AGENT_ORDER.map((agent) => (
               <AgentEvidence
@@ -2472,7 +2558,7 @@ function FeedbackPanel({
   };
 
   return (
-    <section className="feedback-panel">
+    <section className="feedback-panel" id="operator-feedback">
       <div className="section-title"><MessageSquare size={18} /> Operator Feedback</div>
       <div className="feedback-votes">
         <button
@@ -2957,6 +3043,7 @@ function buildAnalysisRecords(alerts: AlertRecord[], analysisRuns: AnalysisRun[]
     .map((alert) => {
       const hasAnalysis = Boolean(alert.analysis_summary || alert.analysis_detail);
       const analysisStatus = alert.is_analyzing ? 'analyzing' : hasAnalysis ? 'complete' : 'pending';
+      const collectorArtifacts = alert.artifacts?.filter((artifact) => isCollectorAgent(artifact.agent)) ?? [];
       return {
         id: `analysis-${alert.alert_id}`,
         incidentID: alert.incident_id,
@@ -2973,7 +3060,7 @@ function buildAnalysisRecords(alerts: AlertRecord[], analysisRuns: AnalysisRun[]
         capabilities: alert.capabilities || {},
         missingData: alert.missing_data || [],
         warnings: alert.warnings || [],
-        artifactCount: alert.artifacts?.length || 0,
+        artifactCount: collectorArtifacts.length,
         similarCount: alert.similar_incidents?.length || 0,
         positiveFeedback: alert.feedback?.positive || 0,
         negativeFeedback: alert.feedback?.negative || 0,
@@ -2999,7 +3086,7 @@ function buildAnalysisRecords(alerts: AlertRecord[], analysisRuns: AnalysisRun[]
     capabilities: run.capabilities || {},
     missingData: run.missing_data || [],
     warnings: run.warnings || [],
-    artifactCount: run.artifacts?.length || 0,
+    artifactCount: run.artifacts?.filter((artifact) => isCollectorAgent(artifact.agent)).length || 0,
     similarCount: 0,
     positiveFeedback: 0,
     negativeFeedback: 0,
