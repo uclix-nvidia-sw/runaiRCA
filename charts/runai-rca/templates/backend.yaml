@@ -68,13 +68,13 @@ spec:
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "runai-rca.secretName" . }}
+                  name: {{ include "runai-rca.databaseSecretName" . }}
                   key: {{ .Values.secrets.keys.databaseUrl | quote }}
                   optional: true
             - name: POSTGRES_DSN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "runai-rca.secretName" . }}
+                  name: {{ include "runai-rca.databaseSecretName" . }}
                   key: {{ .Values.secrets.keys.postgresDsn | quote }}
                   optional: true
             {{- with .Values.backend.extraEnv }}

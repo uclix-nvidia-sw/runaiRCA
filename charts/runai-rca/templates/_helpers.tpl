@@ -52,6 +52,26 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- default (printf "%s-secrets" (include "runai-rca.fullname" .)) .Values.secrets.existingSecret -}}
 {{- end -}}
 
+{{- define "runai-rca.generatedDatabaseSecretName" -}}
+{{ include "runai-rca.fullname" . }}-database
+{{- end -}}
+
+{{- define "runai-rca.createDatabaseSecret" -}}
+{{- if and .Values.secrets.existingSecret (not .Values.secrets.databaseExistingSecret) (or .Values.postgresql.enabled .Values.secrets.databaseUrl .Values.secrets.postgresDsn) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{- define "runai-rca.databaseSecretName" -}}
+{{- if .Values.secrets.databaseExistingSecret -}}
+{{- .Values.secrets.databaseExistingSecret -}}
+{{- else if include "runai-rca.createDatabaseSecret" . -}}
+{{- include "runai-rca.generatedDatabaseSecretName" . -}}
+{{- else -}}
+{{- include "runai-rca.secretName" . -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "runai-rca.databaseUrl" -}}
 {{- if .Values.secrets.databaseUrl -}}
 {{- .Values.secrets.databaseUrl -}}

@@ -221,6 +221,11 @@ helm install runai-rca charts/runai-rca \
   --set postgresql.auth.password=change-me
 ```
 
+If `secrets.existingSecret` is used for Run:ai/NVIDIA credentials while bundled
+Postgres is enabled, the chart creates a separate generated database Secret and
+points Backend/Agent DB variables at it. To use a dedicated existing DB Secret
+instead, set `secrets.databaseExistingSecret`.
+
 The Agent uses read-only cluster-wide RBAC by default so it can inspect target
 pods, Run:ai control-plane namespaces, and node context. To limit it to selected
 namespaces, disable cluster-wide RBAC and list the namespaces that should be
@@ -243,6 +248,8 @@ Frequently tuned Helm values:
 | `backend.env.language` / `agent.env.language` | Set RCA language to `en` or `ko` |
 | `backend.env.databaseConnectTimeoutSeconds` | Backend startup timeout for the Postgres store connection |
 | `secrets.keys.*` | Existing Secret key names for DB, Run:ai, and NVIDIA credentials |
+| `secrets.existingSecret` | Existing Secret for Run:ai/NVIDIA credentials and, by default, DB keys |
+| `secrets.databaseExistingSecret` | Existing Secret used only for `DATABASE_URL` / `POSTGRES_DSN` |
 | `agent.rbac.clusterWide` | Use a ClusterRole for Kubernetes evidence collection; default `true` |
 | `agent.rbac.namespaces` | Namespaces that receive Role/RoleBinding when `agent.rbac.clusterWide=false`; defaults to the release namespace |
 | `agent.env.kubernetesNamespaces` | Agent-side Kubernetes namespace allowlist; when empty and `clusterWide=false`, Helm derives it from `agent.rbac.namespaces` |

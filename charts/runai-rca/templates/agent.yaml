@@ -132,7 +132,7 @@ spec:
             - name: POSTGRES_DSN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "runai-rca.secretName" . }}
+                  name: {{ include "runai-rca.databaseSecretName" . }}
                   key: {{ .Values.secrets.keys.postgresDsn | quote }}
                   optional: true
             - name: RUNAI_CLIENT_ID
