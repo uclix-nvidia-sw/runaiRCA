@@ -671,11 +671,10 @@ func (s *Store) persistMemoryLocked(memory *IncidentMemory) {
 			embeddingLiteral(denseEmbedding(memoryText(*memory))),
 			memory.CreatedAt,
 		)
-		if err != nil {
-			log.Printf("Failed to persist incident memory %s: %v", memory.IncidentID, err)
+		if err == nil {
+			return
 		}
-		return
-	}
+		log.Printf("Failed to persist incident memory %s with pgvector, falling back to jsonb: %v", memory.IncidentID, err)
 	_, err := s.db.ExecContext(
 		context.Background(),
 		`INSERT INTO incident_embeddings (
