@@ -33,9 +33,12 @@ secrets:
 
 postgresql:
   enabled: false
+  # pgvector/pgvector ships Postgres with the pgvector extension preinstalled, so
+  # the bundled database can serve real vector similarity search. It is a drop-in
+  # replacement for the official postgres image (same env vars, same data dir).
   image:
-    repository: postgres
-    tag: "16-alpine"
+    repository: pgvector/pgvector
+    tag: "pg16"
     pullPolicy: IfNotPresent
   auth:
     username: runai_rca

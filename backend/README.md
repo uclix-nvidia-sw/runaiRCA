@@ -74,18 +74,22 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO runai_rca;
 ```
 
-When pgvector is unavailable or the app user cannot create the extension, the
-backend still starts and keeps similar-incident memory in
-`incident_embeddings.vector_json` using JSONB sparse vectors. The current search
-implementation intentionally remains JSONB-backed because the backend stores
-sparse text-token vectors rather than fixed-dimension dense embeddings. A real
-pgvector column/index should be added when a dense embedding model and dimension
-are introduced.
+When pgvector is available, the backend adds a fixed-dimension
+`embedding vector(384)` column with an HNSW cosine index to
+`incident_embeddings` and runs free-text similar-incident search inside Postgres
+with the pgvector `<=>` cosine operator. Dense vectors are derived
+deterministically from incident text using signed feature hashing, so there is
+no embedding-model dependency. When pgvector is unavailable or the app user
+cannot create the extension, the backend still starts and keeps similar-incident
+memory in `incident_embeddings.vector_json` using JSONB sparse vectors, served
+with in-process cosine similarity.
 
-The Helm bundled Postgres default image is `postgres:16-alpine`; do not assume it
-contains pgvector. For external Postgres, Helm only provides `DATABASE_URL` /
+The Helm bundled Postgres default image is `pgvector/pgvector:pg16`, which ships
+the pgvector extension preinstalled, so the bundled database serves real vector
+search out of the box. For external Postgres, Helm only provides `DATABASE_URL` /
 `POSTGRES_DSN`; pgvector installation and extension creation remain the
-responsibility of the existing Postgres operator.
+responsibility of the existing Postgres operator (the backend attempts
+`CREATE EXTENSION IF NOT EXISTS vector` but may lack the privilege).
 
 ## RCA Memory APIs
 

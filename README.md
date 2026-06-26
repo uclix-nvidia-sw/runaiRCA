@@ -279,11 +279,13 @@ instead, set `secrets.databaseExistingSecret`.
 Bundled Postgres usernames, passwords, and database names are URL-encoded when
 the chart generates `DATABASE_URL` / `POSTGRES_DSN`; externally supplied DSNs in
 `secrets.databaseUrl`, `secrets.postgresDsn`, or existing Secrets should already
-be valid Postgres URLs. The default bundled image is `postgres:16-alpine`, so do
-not treat it as a pgvector image. When pgvector is available the backend adds an
+be valid Postgres URLs. The default bundled image is `pgvector/pgvector:pg16`,
+which ships the pgvector extension preinstalled, so the bundled database serves
+real vector search out of the box. When pgvector is available the backend adds an
 `embedding vector(384)` column with an HNSW cosine index and runs similar-incident
-search inside Postgres with the `<=>` cosine operator. If pgvector is unavailable,
-the backend logs `pgvector=unavailable, fallback=jsonb` and continues to serve
+search inside Postgres with the `<=>` cosine operator. If pgvector is unavailable
+(for example when pointing at an external Postgres without the extension), the
+backend logs `pgvector=unavailable, fallback=jsonb` and continues to serve
 similar-incident search from JSONB sparse vectors in
 `incident_embeddings.vector_json` using in-process cosine similarity.
 
