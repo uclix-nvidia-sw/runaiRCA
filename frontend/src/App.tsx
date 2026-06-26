@@ -1095,10 +1095,6 @@ function App() {
             loading={loading}
             onOpenIncident={openIncident}
             onOpenAlert={openAlert}
-            onAnalyze={async (id) => {
-              await analyzeIncident(id);
-              await load();
-            }}
           />
         )}
         {activeView === 'analysis' && (
@@ -1165,7 +1161,6 @@ function OperationsView({
   loading,
   onOpenIncident,
   onOpenAlert,
-  onAnalyze,
 }: {
   incidents: Incident[];
   alerts: AlertRecord[];
@@ -1174,7 +1169,6 @@ function OperationsView({
   loading: boolean;
   onOpenIncident: (id: string) => Promise<void>;
   onOpenAlert: (id: string) => Promise<void>;
-  onAnalyze: (id: string) => Promise<void>;
 }) {
   return (
     <>
@@ -1228,7 +1222,7 @@ function OperationsView({
                 <th>Run:AI target</th>
                 <th>Severity</th>
                 <th>Status</th>
-                <th>Actions</th>
+                <th>Incident</th>
               </tr>
             </thead>
             <tbody>
@@ -1255,16 +1249,6 @@ function OperationsView({
                         type="button"
                       >
                         <Link size={15} /> Incident
-                      </button>
-                      <button
-                        className="primary-button compact-button"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          void onAnalyze(alert.incident_id);
-                        }}
-                        type="button"
-                      >
-                        <Bot size={15} /> Analyze
                       </button>
                     </div>
                   </td>
