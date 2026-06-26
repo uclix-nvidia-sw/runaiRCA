@@ -160,6 +160,7 @@ func (s *Store) BeginAnalyzing(incidentID string, alertID string) {
 	defer s.mu.Unlock()
 	if incident := s.incidents[incidentID]; incident != nil {
 		incident.IsAnalyzing = true
+		s.persistIncidentLocked(incident)
 	}
 	if alert := s.alerts[alertID]; alert != nil {
 		alert.IsAnalyzing = true
