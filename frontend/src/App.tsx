@@ -698,6 +698,12 @@ function mockIncidentDetail(id: string): IncidentDetail | null {
   };
 }
 
+function isMockDetail(detail: DetailState) {
+  if (!detail) return false;
+  const id = detail.kind === 'incident' ? detail.data.incident_id : detail.data.alert_id;
+  return id.startsWith('MOCK-');
+}
+
 function useEditorHistory(initialValue = '') {
   const [value, setValue] = useState(initialValue);
   const historyRef = useRef<string[]>([initialValue]);
@@ -804,6 +810,13 @@ function App() {
 
   const hasLiveData = incidents.length > 0 || alerts.length > 0 || analysisRuns.length > 0;
   const showMockData = ENABLE_MOCK_DATA && !loading && !error && !hasLiveData;
+
+  useEffect(() => {
+    if (!loading && !error && hasLiveData && isMockDetail(detail)) {
+      setDetail(null);
+    }
+  }, [detail, error, hasLiveData, loading]);
+
   const operationIncidents = showMockData ? [MOCK_INCIDENT] : incidents;
   const operationAlerts = showMockData ? [MOCK_ALERT] : alerts;
   const analysisIncidents = showMockData ? MOCK_ANALYTICS_INCIDENTS : incidents;
