@@ -306,10 +306,10 @@ helm upgrade --install runai-rca charts/runai-rca \
 
 Mock data is a frontend-only sample mode. It is enabled by default during Vite
 local development, disabled by default in Helm/static deployments, and is shown
-after the Backend returns empty incident and alert lists, or when the local dev
-Backend is unavailable. As soon as real incident or alert data is returned by
-the Backend, the UI uses the live values and does not mix mock records into
-Operations, Analysis, Evidence, or Agents.
+after the Backend returns empty incident, alert, and analysis-run lists, or when
+the local dev Backend is unavailable. As soon as real incident, alert, or
+analysis-run data is returned by the Backend, the UI uses the live values and
+does not mix mock records into Operations, Analysis, Evidence, or Agents.
 
 When `DATABASE_URL` is configured, the backend creates and uses `incidents`,
 `alerts`, `incident_embeddings`, `rca_feedback`, `rca_comments`, and

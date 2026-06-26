@@ -802,7 +802,8 @@ function App() {
     return () => source.close();
   }, [load]);
 
-  const showMockData = ENABLE_MOCK_DATA && !loading && !error && incidents.length === 0 && alerts.length === 0;
+  const hasLiveData = incidents.length > 0 || alerts.length > 0 || analysisRuns.length > 0;
+  const showMockData = ENABLE_MOCK_DATA && !loading && !error && !hasLiveData;
   const operationIncidents = showMockData ? [MOCK_INCIDENT] : incidents;
   const operationAlerts = showMockData ? [MOCK_ALERT] : alerts;
   const analysisIncidents = showMockData ? MOCK_ANALYTICS_INCIDENTS : incidents;
