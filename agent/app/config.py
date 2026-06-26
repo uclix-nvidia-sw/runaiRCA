@@ -65,6 +65,7 @@ class Settings:
     kubernetes_token_path: str
     kubernetes_ca_path: str
     kubernetes_timeout_seconds: int
+    kubernetes_list_limit: int
     runai_base_url: str
     runai_bearer_token: str
     runai_client_id: str
@@ -79,6 +80,7 @@ class Settings:
     prometheus_mcp_url: str
     loki_url: str
     loki_timeout_seconds: int
+    loki_query_limit: int
     loki_mcp_url: str
     runai_log_namespaces: tuple[str, ...]
     postgres_dsn: str
@@ -114,6 +116,7 @@ def load_settings() -> Settings:
             "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
         ).strip(),
         kubernetes_timeout_seconds=_int_env("KUBERNETES_TIMEOUT_SECONDS", 6),
+        kubernetes_list_limit=max(1, _int_env("KUBERNETES_LIST_LIMIT", 50)),
         runai_base_url=os.getenv("RUNAI_BASE_URL", "").strip().rstrip("/"),
         runai_bearer_token=os.getenv("RUNAI_BEARER_TOKEN", "").strip(),
         runai_client_id=os.getenv("RUNAI_CLIENT_ID", "").strip(),
@@ -128,6 +131,7 @@ def load_settings() -> Settings:
         prometheus_mcp_url=os.getenv("PROMETHEUS_MCP_URL", "").strip().rstrip("/"),
         loki_url=os.getenv("LOKI_URL", "").strip().rstrip("/"),
         loki_timeout_seconds=_int_env("LOKI_TIMEOUT_SECONDS", 6),
+        loki_query_limit=max(1, _int_env("LOKI_QUERY_LIMIT", 20)),
         loki_mcp_url=os.getenv("LOKI_MCP_URL", "").strip().rstrip("/"),
         runai_log_namespaces=_csv_env("RUNAI_LOG_NAMESPACES", ("runai", "runai-backend")),
         postgres_dsn=os.getenv("POSTGRES_DSN", "").strip(),

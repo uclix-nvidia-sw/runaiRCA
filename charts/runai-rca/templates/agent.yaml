@@ -1,3 +1,9 @@
+{{- $podAnnotations := mergeOverwrite (deepCopy (default (dict) .Values.podAnnotations)) (default (dict) .Values.agent.podAnnotations) -}}
+{{- $podLabels := mergeOverwrite (deepCopy (default (dict) .Values.podLabels)) (default (dict) .Values.agent.podLabels) -}}
+{{- $podSecurityContext := default .Values.podSecurityContext .Values.agent.podSecurityContext -}}
+{{- $securityContext := default .Values.securityContext .Values.agent.securityContext -}}
+{{- $priorityClassName := default .Values.priorityClassName .Values.agent.priorityClassName -}}
+{{- $topologySpreadConstraints := default .Values.topologySpreadConstraints .Values.agent.topologySpreadConstraints -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,12 +22,38 @@ spec:
       labels:
         {{- include "runai-rca.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: agent
+        {{- with $podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with $podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
       serviceAccountName: {{ include "runai-rca.agent.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with $topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: agent
           image: {{ include "runai-rca.image" (dict "root" . "image" .Values.agent.image) | quote }}
           imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
+          {{- with $securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.agent.service.port }}
@@ -32,12 +64,22 @@ spec:
               value: {{ .Values.agent.env.logLevel | quote }}
             - name: LANGUAGE
               value: {{ .Values.agent.env.language | quote }}
+            - name: KUBERNETES_API_URL
+              value: {{ .Values.agent.env.kubernetesApiUrl | quote }}
+            - name: KUBERNETES_TOKEN_PATH
+              value: {{ .Values.agent.env.kubernetesTokenPath | quote }}
+            - name: KUBERNETES_CA_PATH
+              value: {{ .Values.agent.env.kubernetesCaPath | quote }}
             - name: KUBERNETES_TIMEOUT_SECONDS
               value: {{ .Values.agent.env.kubernetesTimeoutSeconds | quote }}
+            - name: KUBERNETES_LIST_LIMIT
+              value: {{ .Values.agent.env.kubernetesListLimit | quote }}
             - name: ENABLE_NAT_RUNTIME
               value: {{ .Values.agent.env.enableNatRuntime | quote }}
             - name: NAT_CONFIG_FILE
               value: {{ .Values.agent.env.natConfigFile | quote }}
+            - name: NAT_TIMEOUT_SECONDS
+              value: {{ .Values.agent.env.natTimeoutSeconds | quote }}
             - name: RUNAI_BASE_URL
               value: {{ .Values.agent.env.runaiBaseUrl | quote }}
             - name: RUNAI_TOKEN_URL
@@ -48,16 +90,26 @@ spec:
               value: {{ .Values.agent.env.runaiProjectsPath | quote }}
             - name: RUNAI_QUEUES_PATH
               value: {{ .Values.agent.env.runaiQueuesPath | quote }}
+            - name: RUNAI_TIMEOUT_SECONDS
+              value: {{ .Values.agent.env.runaiTimeoutSeconds | quote }}
             - name: RUNAI_LOG_NAMESPACES
               value: {{ .Values.agent.env.runaiLogNamespaces | quote }}
             - name: PROMETHEUS_URL
               value: {{ .Values.agent.env.prometheusUrl | quote }}
+            - name: PROMETHEUS_TIMEOUT_SECONDS
+              value: {{ .Values.agent.env.prometheusTimeoutSeconds | quote }}
             - name: PROMETHEUS_MCP_URL
               value: {{ .Values.agent.env.prometheusMcpUrl | quote }}
             - name: LOKI_URL
               value: {{ .Values.agent.env.lokiUrl | quote }}
+            - name: LOKI_TIMEOUT_SECONDS
+              value: {{ .Values.agent.env.lokiTimeoutSeconds | quote }}
+            - name: LOKI_QUERY_LIMIT
+              value: {{ .Values.agent.env.lokiQueryLimit | quote }}
             - name: LOKI_MCP_URL
               value: {{ .Values.agent.env.lokiMcpUrl | quote }}
+            - name: POSTGRES_TIMEOUT_SECONDS
+              value: {{ .Values.agent.env.postgresTimeoutSeconds | quote }}
             - name: TROUBLESHOOTING_CASES_FILE
               value: {{ .Values.agent.env.troubleshootingCasesFile | quote }}
             - name: AGENT_SOULS_FILE
@@ -72,48 +124,57 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "runai-rca.secretName" . }}
-                  key: POSTGRES_DSN
+                  key: {{ .Values.secrets.keys.postgresDsn | quote }}
                   optional: true
             - name: RUNAI_CLIENT_ID
               valueFrom:
                 secretKeyRef:
                   name: {{ include "runai-rca.secretName" . }}
-                  key: RUNAI_CLIENT_ID
+                  key: {{ .Values.secrets.keys.runaiClientId | quote }}
                   optional: true
             - name: RUNAI_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "runai-rca.secretName" . }}
-                  key: RUNAI_CLIENT_SECRET
+                  key: {{ .Values.secrets.keys.runaiClientSecret | quote }}
                   optional: true
             - name: RUNAI_BEARER_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "runai-rca.secretName" . }}
-                  key: RUNAI_BEARER_TOKEN
+                  key: {{ .Values.secrets.keys.runaiBearerToken | quote }}
                   optional: true
             - name: NVIDIA_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "runai-rca.secretName" . }}
-                  key: NVIDIA_API_KEY
+                  key: {{ .Values.secrets.keys.nvidiaApiKey | quote }}
                   optional: true
+            {{- with .Values.agent.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.agent.readinessProbe }}
           readinessProbe:
-            httpGet:
-              path: /healthz
-              port: http
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.agent.livenessProbe }}
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: http
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           resources:
             {{- toYaml .Values.agent.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
       nodeSelector:
-        {{- toYaml .Values.nodeSelector | nindent 8 }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
       affinity:
-        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
       tolerations:
-        {{- toYaml .Values.tolerations | nindent 8 }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -122,6 +183,10 @@ metadata:
   labels:
     {{- include "runai-rca.labels" . | nindent 4 }}
     app.kubernetes.io/component: agent
+  {{- with .Values.agent.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   type: {{ .Values.agent.service.type | default "ClusterIP" }}
   ports:

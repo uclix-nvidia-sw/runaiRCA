@@ -1,4 +1,13 @@
 {{- if .Values.postgresql.enabled }}
+{{- $podAnnotations := mergeOverwrite (deepCopy (default (dict) .Values.podAnnotations)) (default (dict) .Values.postgresql.podAnnotations) -}}
+{{- $podLabels := mergeOverwrite (deepCopy (default (dict) .Values.podLabels)) (default (dict) .Values.postgresql.podLabels) -}}
+{{- $podSecurityContext := default .Values.podSecurityContext .Values.postgresql.podSecurityContext -}}
+{{- $securityContext := default .Values.securityContext .Values.postgresql.securityContext -}}
+{{- $priorityClassName := default .Values.priorityClassName .Values.postgresql.priorityClassName -}}
+{{- $topologySpreadConstraints := default .Values.topologySpreadConstraints .Values.postgresql.topologySpreadConstraints -}}
+{{- $nodeSelector := default .Values.nodeSelector .Values.postgresql.nodeSelector -}}
+{{- $affinity := default .Values.affinity .Values.postgresql.affinity -}}
+{{- $tolerations := default .Values.tolerations .Values.postgresql.tolerations -}}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -19,6 +28,10 @@ metadata:
   labels:
     {{- include "runai-rca.labels" . | nindent 4 }}
     app.kubernetes.io/component: postgresql
+  {{- with .Values.postgresql.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   type: ClusterIP
   ports:
@@ -48,11 +61,37 @@ spec:
       labels:
         {{- include "runai-rca.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: postgresql
+        {{- with $podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with $podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with $topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: postgresql
-          image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+          image: {{ include "runai-rca.image" (dict "root" . "image" .Values.postgresql.image) | quote }}
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+          {{- with $securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - name: postgres
               containerPort: 5432
@@ -62,6 +101,10 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+          {{- with .Values.postgresql.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- else }}
           readinessProbe:
             exec:
               command:
@@ -70,12 +113,38 @@ spec:
                 - {{ .Values.postgresql.auth.username | quote }}
             initialDelaySeconds: 10
             periodSeconds: 10
+          {{- end }}
+          {{- with .Values.postgresql.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- else }}
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - {{ .Values.postgresql.auth.username | quote }}
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          {{- end }}
           resources:
             {{- toYaml .Values.postgresql.resources | nindent 12 }}
       {{- if not .Values.postgresql.persistence.enabled }}
       volumes:
         - name: data
           emptyDir: {}
+      {{- end }}
+      {{- with $nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
       {{- end }}
   {{- if .Values.postgresql.persistence.enabled }}
   volumeClaimTemplates:

@@ -172,6 +172,7 @@ const ANALYSIS_WINDOWS = [
   { label: '14d', days: 14 },
   { label: '30d', days: 30 },
 ];
+const ENABLE_MOCK_DATA = runtimeBool('enableMockData', 'VITE_ENABLE_MOCK_DATA', import.meta.env.DEV);
 const MOCK_EVIDENCE_ITEM: EvidenceItem = {
   id: 'mock-evidence-runai-queue',
   title: 'Sample Run:AI queue snapshot',
@@ -588,6 +589,14 @@ function mockFeedback(targetType: 'incident' | 'alert', targetID: string): Feedb
   };
 }
 
+function runtimeBool(runtimeKey: 'enableMockData', envKey: string, fallback: boolean) {
+  const runtimeValue = window.__RUNAI_RCA_CONFIG__?.[runtimeKey];
+  if (typeof runtimeValue === 'boolean') return runtimeValue;
+  const envValue = import.meta.env[envKey];
+  if (envValue === undefined) return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(String(envValue).trim().toLowerCase());
+}
+
 function mockAlertDetail(id: string) {
   return MOCK_ANALYTICS_ALERTS.find((alert) => alert.alert_id === id) ?? null;
 }
@@ -690,10 +699,11 @@ function App() {
     return () => source.close();
   }, [load]);
 
-  const operationIncidents = incidents.length > 0 ? incidents : [MOCK_INCIDENT];
-  const operationAlerts = alerts.length > 0 ? alerts : [MOCK_ALERT];
-  const analysisIncidents = incidents.length > 0 ? incidents : MOCK_ANALYTICS_INCIDENTS;
-  const analysisAlerts = alerts.length > 0 ? alerts : MOCK_ANALYTICS_ALERTS;
+  const showMockData = ENABLE_MOCK_DATA && !loading && !error && incidents.length === 0 && alerts.length === 0;
+  const operationIncidents = showMockData ? [MOCK_INCIDENT] : incidents;
+  const operationAlerts = showMockData ? [MOCK_ALERT] : alerts;
+  const analysisIncidents = showMockData ? MOCK_ANALYTICS_INCIDENTS : incidents;
+  const analysisAlerts = showMockData ? MOCK_ANALYTICS_ALERTS : alerts;
 
   const filteredIncidents = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -770,7 +780,7 @@ function App() {
     );
   }, [alerts]);
 
-  const evidenceItems = liveEvidenceItems.length > 0 ? liveEvidenceItems : [MOCK_EVIDENCE_ITEM];
+  const evidenceItems = liveEvidenceItems.length > 0 ? liveEvidenceItems : showMockData ? [MOCK_EVIDENCE_ITEM] : [];
 
   const filteredEvidence = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -784,7 +794,7 @@ function App() {
   }, [evidenceItems, query]);
 
   const agentSummaries = useMemo<AgentSummary[]>(() => {
-    if (liveEvidenceItems.length === 0) return [MOCK_ANALYSIS_AGENT_SUMMARY, MOCK_AGENT_SUMMARY];
+    if (liveEvidenceItems.length === 0 && showMockData) return [MOCK_ANALYSIS_AGENT_SUMMARY, MOCK_AGENT_SUMMARY];
     return AGENT_REGISTRY_ORDER.map((agent) => {
       if (agent === ANALYSIS_AGENT_ID) {
         const latest = analysisRecords[0];
@@ -822,7 +832,7 @@ function App() {
         evidenceCount: agentEvidence.length,
       };
     });
-  }, [analysisRecords, liveEvidenceItems]);
+  }, [analysisRecords, liveEvidenceItems, showMockData]);
 
   const filteredAgents = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -838,33 +848,37 @@ function App() {
   const viewCopy = VIEW_COPY[activeView];
 
   const openIncident = async (id: string) => {
-    const mockDetail = mockIncidentDetail(id);
-    if (mockDetail) {
-      setDetail({ kind: 'incident', data: mockDetail });
-      return;
+    if (showMockData) {
+      const mockDetail = mockIncidentDetail(id);
+      if (mockDetail) {
+        setDetail({ kind: 'incident', data: mockDetail });
+        return;
+      }
     }
     setDetail({ kind: 'incident', data: await fetchIncident(id) });
   };
 
   const openAlert = async (id: string) => {
-    const mockAlert = mockAlertDetail(id);
-    if (mockAlert) {
-      setDetail({ kind: 'alert', data: mockAlert });
-      return;
+    if (showMockData) {
+      const mockAlert = mockAlertDetail(id);
+      if (mockAlert) {
+        setDetail({ kind: 'alert', data: mockAlert });
+        return;
+      }
     }
     setDetail({ kind: 'alert', data: await fetchAlert(id) });
   };
 
   const refreshDetail = async () => {
     if (!detail) return;
-    if (detail.kind === 'incident') {
+    if (showMockData && detail.kind === 'incident') {
       const mockDetail = mockIncidentDetail(detail.data.incident_id);
       if (mockDetail) {
         setDetail({ kind: 'incident', data: mockDetail });
         return;
       }
     }
-    if (detail.kind === 'alert') {
+    if (showMockData && detail.kind === 'alert') {
       const mockAlert = mockAlertDetail(detail.data.alert_id);
       if (mockAlert) {
         setDetail({ kind: 'alert', data: mockAlert });

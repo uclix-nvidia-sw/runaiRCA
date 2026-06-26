@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -277,17 +278,20 @@ func NewStore() *Store {
 	}
 }
 
-func (s *Store) ConnectDatabase(databaseURL string) {
+func (s *Store) ConnectDatabase(databaseURL string, connectTimeout time.Duration) {
 	databaseURL = strings.TrimSpace(databaseURL)
 	if databaseURL == "" {
 		return
+	}
+	if connectTimeout <= 0 {
+		connectTimeout = 5 * time.Second
 	}
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
 		log.Printf("Postgres store disabled: open failed: %v", err)
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
@@ -703,7 +707,9 @@ func (s *Store) ListAlerts() []AlertRecord {
 	defer s.mu.RUnlock()
 	items := make([]AlertRecord, 0, len(s.alerts))
 	for _, alert := range s.alerts {
-		items = append(items, *cloneAlert(alert))
+		copied := cloneAlert(alert)
+		copied.SimilarIncidents = s.similarIncidentsLocked(alertFromRecord(*copied), alert.IncidentID, 5)
+		items = append(items, *copied)
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].FiredAt.After(items[j].FiredAt) })
 	return items
@@ -1465,7 +1471,10 @@ func main() {
 
 func NewServer() *Server {
 	store := NewStore()
-	store.ConnectDatabase(first(os.Getenv("DATABASE_URL"), os.Getenv("POSTGRES_DSN")))
+	store.ConnectDatabase(
+		first(os.Getenv("DATABASE_URL"), os.Getenv("POSTGRES_DSN")),
+		time.Duration(getenvInt("DATABASE_CONNECT_TIMEOUT_SECONDS", 5))*time.Second,
+	)
 	return &Server{
 		store:    store,
 		hub:      NewHub(),
@@ -2461,4 +2470,16 @@ func getenv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func getenvInt(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }

@@ -51,7 +51,11 @@ class LokiCollector:
                 base_url=self._settings.loki_url,
                 path="/loki/api/v1/query_range",
                 timeout_seconds=self._settings.loki_timeout_seconds,
-                params={"query": query, "limit": 20, "direction": "BACKWARD"},
+                params={
+                    "query": query,
+                    "limit": str(self._settings.loki_query_limit),
+                    "direction": "BACKWARD",
+                },
             )
             streams = _loki_streams(response.data)
             line_count = sum(len(stream.get("values", [])) for stream in streams)

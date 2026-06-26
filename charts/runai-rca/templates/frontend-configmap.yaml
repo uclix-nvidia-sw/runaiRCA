@@ -8,7 +8,8 @@ metadata:
 data:
   config.js: |
     window.__RUNAI_RCA_CONFIG__ = {
-      apiBaseUrl: {{ .Values.frontend.config.apiBaseUrl | quote }}
+      apiBaseUrl: {{ .Values.frontend.config.apiBaseUrl | quote }},
+      enableMockData: {{ .Values.frontend.config.enableMockData | default false }}
     };
   default.conf: |
     server {

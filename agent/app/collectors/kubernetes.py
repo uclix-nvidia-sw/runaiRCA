@@ -139,12 +139,12 @@ async def _collect_kubernetes_responses(
             (
                 "pod_events",
                 f"/api/v1/namespaces/{namespace}/events",
-                {"fieldSelector": f"involvedObject.name={target.pod}"},
+                _list_params(settings, {"fieldSelector": f"involvedObject.name={target.pod}"}),
             )
         )
     elif target.namespace:
-        requests.append(("namespace_pods", f"/api/v1/namespaces/{namespace}/pods", None))
-        requests.append(("namespace_events", f"/api/v1/namespaces/{namespace}/events", None))
+        requests.append(("namespace_pods", f"/api/v1/namespaces/{namespace}/pods", _list_params(settings)))
+        requests.append(("namespace_events", f"/api/v1/namespaces/{namespace}/events", _list_params(settings)))
     if target.node:
         node = quote(target.node, safe="")
         requests.append(("node", f"/api/v1/nodes/{node}", None))
@@ -154,14 +154,14 @@ async def _collect_kubernetes_responses(
             (
                 f"runai_control_plane_pods:{runai_namespace}",
                 f"/api/v1/namespaces/{namespace_name}/pods",
-                None,
+                _list_params(settings),
             )
         )
         requests.append(
             (
                 f"runai_control_plane_events:{runai_namespace}",
                 f"/api/v1/namespaces/{namespace_name}/events",
-                None,
+                _list_params(settings),
             )
         )
 
@@ -186,6 +186,16 @@ async def _collect_kubernetes_responses(
             }
         )
     return responses
+
+
+def _list_params(
+    settings: Settings,
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    params = {"limit": str(settings.kubernetes_list_limit)}
+    if extra:
+        params.update(extra)
+    return params
 
 
 def _read_file(path: str) -> str:

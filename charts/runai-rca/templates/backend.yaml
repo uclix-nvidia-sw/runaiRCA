@@ -1,3 +1,9 @@
+{{- $podAnnotations := mergeOverwrite (deepCopy (default (dict) .Values.podAnnotations)) (default (dict) .Values.backend.podAnnotations) -}}
+{{- $podLabels := mergeOverwrite (deepCopy (default (dict) .Values.podLabels)) (default (dict) .Values.backend.podLabels) -}}
+{{- $podSecurityContext := default .Values.podSecurityContext .Values.backend.podSecurityContext -}}
+{{- $securityContext := default .Values.securityContext .Values.backend.securityContext -}}
+{{- $priorityClassName := default .Values.priorityClassName .Values.backend.priorityClassName -}}
+{{- $topologySpreadConstraints := default .Values.topologySpreadConstraints .Values.backend.topologySpreadConstraints -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,11 +22,37 @@ spec:
       labels:
         {{- include "runai-rca.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: backend
+        {{- with $podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with $podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with $topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: backend
           image: {{ include "runai-rca.image" (dict "root" . "image" .Values.backend.image) | quote }}
           imagePullPolicy: {{ .Values.backend.image.pullPolicy }}
+          {{- with $securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.backend.service.port }}
@@ -28,35 +60,48 @@ spec:
             - name: PORT
               value: {{ .Values.backend.service.port | quote }}
             - name: AGENT_URL
-              value: http://{{ include "runai-rca.agent.fullname" . }}:{{ .Values.agent.service.port }}
+              value: {{ default (printf "http://%s:%v" (include "runai-rca.agent.fullname" .) .Values.agent.service.port) .Values.backend.env.agentUrl | quote }}
+            - name: LANGUAGE
+              value: {{ .Values.backend.env.language | quote }}
+            - name: DATABASE_CONNECT_TIMEOUT_SECONDS
+              value: {{ .Values.backend.env.databaseConnectTimeoutSeconds | quote }}
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ include "runai-rca.secretName" . }}
-                  key: DATABASE_URL
+                  key: {{ .Values.secrets.keys.databaseUrl | quote }}
                   optional: true
             - name: POSTGRES_DSN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "runai-rca.secretName" . }}
-                  key: POSTGRES_DSN
+                  key: {{ .Values.secrets.keys.postgresDsn | quote }}
                   optional: true
+            {{- with .Values.backend.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.backend.readinessProbe }}
           readinessProbe:
-            httpGet:
-              path: /healthz
-              port: http
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.backend.livenessProbe }}
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: http
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           resources:
             {{- toYaml .Values.backend.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
       nodeSelector:
-        {{- toYaml .Values.nodeSelector | nindent 8 }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
       affinity:
-        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
       tolerations:
-        {{- toYaml .Values.tolerations | nindent 8 }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -65,6 +110,10 @@ metadata:
   labels:
     {{- include "runai-rca.labels" . | nindent 4 }}
     app.kubernetes.io/component: backend
+  {{- with .Values.backend.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   type: {{ .Values.backend.service.type }}
   ports:

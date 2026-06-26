@@ -23,3 +23,10 @@ npm run dev
 
 Set `VITE_API_BASE_URL=http://localhost:8080` when the backend is on a different
 origin.
+
+Mock dashboard samples are enabled by default only in Vite development mode.
+Override with `VITE_ENABLE_MOCK_DATA=false` or the runtime
+`window.__RUNAI_RCA_CONFIG__.enableMockData` value. In Helm/static deployments,
+mock samples default to disabled and are shown only after the backend
+successfully returns empty live incident and alert lists. API failures do not
+fall back to mock records.

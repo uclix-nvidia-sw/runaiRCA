@@ -137,8 +137,12 @@ Core environment variables:
 | Variable | Purpose |
 | --- | --- |
 | `AGENT_URL` | Backend to Agent URL, default `http://localhost:8000` |
+| `LANGUAGE` | Backend/Agent response language, `en` or `ko` |
 | `KUBERNETES_API_URL` | In-cluster Kubernetes API URL, default `https://kubernetes.default.svc` |
+| `KUBERNETES_TOKEN_PATH` | Service account token path for in-cluster Kubernetes collection |
+| `KUBERNETES_CA_PATH` | Service account CA path for in-cluster Kubernetes collection |
 | `KUBERNETES_TIMEOUT_SECONDS` | Kubernetes API request timeout |
+| `KUBERNETES_LIST_LIMIT` | Kubernetes pod/event list page size for evidence collection, default `50` |
 | `RUNAI_BASE_URL` | Run:ai control plane URL |
 | `RUNAI_BEARER_TOKEN` | Optional Run:ai bearer token secret |
 | `RUNAI_CLIENT_ID` | Run:ai application client ID |
@@ -147,13 +151,19 @@ Core environment variables:
 | `RUNAI_WORKLOADS_PATH` | Run:ai workloads API path, default `/api/v1/workloads` |
 | `RUNAI_PROJECTS_PATH` | Run:ai projects API path, default `/api/v1/projects` |
 | `RUNAI_QUEUES_PATH` | Run:ai queues API path, default `/api/v1/queues` |
+| `RUNAI_TIMEOUT_SECONDS` | Run:ai API request timeout |
 | `RUNAI_LOG_NAMESPACES` | Comma-separated Run:ai control-plane log namespaces, default `runai,runai-backend` |
 | `PROMETHEUS_URL` | Prometheus base URL |
+| `PROMETHEUS_TIMEOUT_SECONDS` | Prometheus query timeout |
 | `PROMETHEUS_MCP_URL` | Optional remote Prometheus MCP URL for the MCP workflow |
 | `LOKI_URL` | Loki base URL |
+| `LOKI_TIMEOUT_SECONDS` | Loki query timeout |
+| `LOKI_QUERY_LIMIT` | Maximum log lines requested per Loki query group, default `20` |
 | `LOKI_MCP_URL` | Optional remote Loki MCP URL for the MCP workflow |
 | `DATABASE_URL` | Backend Postgres store DSN for incidents, alerts, embeddings, feedback, and comments |
+| `DATABASE_CONNECT_TIMEOUT_SECONDS` | Backend Postgres startup connection timeout, default `5` |
 | `POSTGRES_DSN` | Agent Postgres diagnostic DSN; defaults to `DATABASE_URL` in Helm |
+| `POSTGRES_TIMEOUT_SECONDS` | Agent Postgres diagnostic query timeout |
 | `TROUBLESHOOTING_CASES_FILE` | Local known-cases/playbook markdown path |
 | `AGENT_SOULS_FILE` | Agent role-contract prompt path, default `prompts/agent_souls.md` |
 | `MASKING_REGEX_LIST_JSON` | Optional JSON array of custom redaction regexes |
@@ -161,6 +171,8 @@ Core environment variables:
 | `BUILTIN_REDACTION_HASH_MODE` | Replace secrets with stable short hashes instead of `[MASKED]`, default `false` |
 | `NVIDIA_API_KEY` | NIM key for NeMo Agent Toolkit workflows |
 | `NAT_CONFIG_FILE` | Optional NeMo workflow config path, default `configs/runai_rca_workflow.yml` |
+| `NAT_TIMEOUT_SECONDS` | NeMo Agent Toolkit CLI execution timeout |
+| `VITE_ENABLE_MOCK_DATA` | Frontend local-dev sample data toggle; Helm uses `frontend.config.enableMockData` |
 
 NeMo Agent Toolkit workflows:
 
@@ -195,8 +207,10 @@ helm install runai-rca charts/runai-rca \
   --set secrets.existingSecret=runai-rca-secrets
 ```
 
-For an existing Postgres, set `secrets.databaseUrl` or provide
-`DATABASE_URL`/`POSTGRES_DSN` from `secrets.existingSecret`. For a bundled
+For an existing Postgres, set `secrets.databaseUrl` or provide a Secret through
+`secrets.existingSecret`. By default the chart reads `DATABASE_URL` and
+`POSTGRES_DSN`; if your existing Secret uses different key names, set
+`secrets.keys.databaseUrl` and `secrets.keys.postgresDsn`. For a bundled
 single-pod Postgres, enable:
 
 ```bash
@@ -204,6 +218,55 @@ helm install runai-rca charts/runai-rca \
   --set postgresql.enabled=true \
   --set postgresql.auth.password=change-me
 ```
+
+Frequently tuned Helm values:
+
+| Value | Purpose |
+| --- | --- |
+| `global.imageRegistry` / `imagePullSecrets` | Private registry prefix and pull secrets applied to all runtime images |
+| `backend.env.agentUrl` | Override Backend-to-Agent URL when the Agent is external or remote |
+| `backend.env.language` / `agent.env.language` | Set RCA language to `en` or `ko` |
+| `backend.env.databaseConnectTimeoutSeconds` | Backend startup timeout for the Postgres store connection |
+| `secrets.keys.*` | Existing Secret key names for DB, Run:ai, and NVIDIA credentials |
+| `agent.env.runaiBaseUrl` / `agent.env.runaiTokenUrl` | Run:ai API and optional OAuth token endpoint |
+| `agent.env.runaiWorkloadsPath`, `runaiProjectsPath`, `runaiQueuesPath` | Run:ai API path overrides for different Run:ai versions |
+| `agent.env.runaiLogNamespaces` | Namespaces for Run:ai control-plane/backend logs, default `runai,runai-backend` |
+| `agent.env.prometheusUrl` | In-cluster Prometheus URL, for example `http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090` |
+| `agent.env.lokiUrl` | In-cluster Loki URL, for example `http://loki-gateway.monitoring.svc.cluster.local` |
+| `agent.env.prometheusMcpUrl` / `agent.env.lokiMcpUrl` | Remote MCP endpoints when using the MCP workflow |
+| `agent.env.*TimeoutSeconds` | Request/runtime timeouts for Kubernetes, Run:ai, Prometheus, Loki, Postgres, and NAT |
+| `agent.env.kubernetesListLimit` / `agent.env.lokiQueryLimit` | Evidence volume controls for Kubernetes list calls and Loki log query groups |
+| `agent.env.troubleshootingCasesFile` / `agent.env.agentSoulsFile` | Paths for injected troubleshooting memory and agent role contracts |
+| `agent.env.maskingRegexListJson` | Cluster-specific secret masking regexes as a JSON array |
+| `frontend.config.apiBaseUrl` | Browser API base URL when not using the bundled nginx `/api` proxy |
+| `frontend.config.enableMockData` | Show sample dashboard records only when no live incidents or alerts exist; default `false` in Helm |
+| `backend.extraEnv`, `agent.extraEnv`, `frontend.extraEnv` | Additional container env entries for deployment-specific settings |
+| `podAnnotations` / `podLabels` | Global pod metadata applied to Backend, Agent, Frontend, and bundled Postgres |
+| `{backend,agent,frontend,postgresql}.podAnnotations` / `.podLabels` | Component-specific pod metadata merged over global metadata |
+| `podSecurityContext` / `securityContext` | Global pod and container security contexts |
+| `{backend,agent,frontend,postgresql}.podSecurityContext` / `.securityContext` | Component-specific pod and container security contexts |
+| `priorityClassName` / `topologySpreadConstraints` | Global scheduling policy for all pods |
+| `{backend,agent,frontend,postgresql}.priorityClassName` / `.topologySpreadConstraints` | Component-specific scheduling policy overrides |
+| `{backend,agent,frontend,postgresql}.service.annotations` | Service annotations for cloud/load-balancer or mesh integrations |
+| `{backend,agent,frontend}.readinessProbe` / `.livenessProbe` | HTTP probe overrides for each service |
+| `postgresql.readinessProbe` / `postgresql.livenessProbe` | Bundled Postgres probe overrides; empty values use a `pg_isready` default based on `postgresql.auth.username` |
+| `postgresql.persistence.*` | PVC enablement, storage class, and size for bundled Postgres |
+| `postgresql.nodeSelector` / `.affinity` / `.tolerations` | Bundled Postgres scheduling overrides; fall back to the global scheduling values |
+
+For annotation keys that contain dots or slashes, prefer a small values file. If
+you use `--set`, escape dots and use `--set-string`, for example:
+
+```bash
+helm upgrade --install runai-rca charts/runai-rca \
+  --set-string 'backend.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-type=nlb'
+```
+
+Mock data is a frontend-only sample mode. It is enabled by default during Vite
+local development, disabled by default in Helm/static deployments, and is shown
+only after the Backend successfully returns empty incident and alert lists. API
+errors do not fall back to mock records. As soon as real incident or alert data
+is returned by the Backend, the UI uses the live values and does not mix mock
+records into Operations, Analysis, Evidence, or Agents.
 
 When `DATABASE_URL` is configured, the backend creates and uses `incidents`,
 `alerts`, `incident_embeddings`, `rca_feedback`, and `rca_comments`. If the

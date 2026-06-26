@@ -38,6 +38,7 @@ go test ./...
 | `AGENT_URL` | `http://localhost:8000` | Agent API base URL |
 | `DATABASE_URL` | empty | Postgres store DSN |
 | `POSTGRES_DSN` | empty | Fallback store DSN and Agent diagnostic DSN |
+| `DATABASE_CONNECT_TIMEOUT_SECONDS` | `5` | Startup timeout for Postgres connection and schema initialization |
 
 ## RCA Memory APIs
 

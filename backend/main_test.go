@@ -200,6 +200,75 @@ func TestFeedbackAndSimilarIncidentMemory(t *testing.T) {
 	}
 }
 
+func TestAlertListIncludesSimilarIncidentMemory(t *testing.T) {
+	server := NewServer()
+	priorIncident, priorRecord := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "list-prior"}, Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIWorkloadPending",
+			"severity":  "warning",
+			"cluster":   "lab",
+			"project":   "vision",
+			"queue":     "gpu-a",
+			"namespace": "runai-vision",
+			"workload":  "trainer",
+		},
+		Annotations: map[string]string{"summary": "Workload pending because GPU quota is exhausted"},
+		Fingerprint: "fp-list-prior",
+	})
+	server.store.ApplyAnalysis(priorRecord.AlertID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Run:AI queue gpu-a was saturated and quota blocked scheduling.",
+		AnalysisDetail:  "## Root Cause\n\nGPU quota was exhausted in queue gpu-a.",
+		AnalysisQuality: "high",
+		Capabilities:    map[string]string{"runai": "ok"},
+	})
+	_, currentRecord := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "list-current"}, Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIWorkloadPending",
+			"severity":  "warning",
+			"cluster":   "lab",
+			"project":   "vision",
+			"queue":     "gpu-a",
+			"namespace": "runai-vision",
+			"workload":  "trainer-v2",
+		},
+		Annotations: map[string]string{"summary": "Workload pending while waiting for GPU quota"},
+		Fingerprint: "fp-list-current",
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/alerts", nil)
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Data []AlertRecord `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode alert list response: %v", err)
+	}
+	foundCurrent := false
+	for _, alert := range response.Data {
+		if alert.AlertID != currentRecord.AlertID {
+			continue
+		}
+		foundCurrent = true
+		if len(alert.SimilarIncidents) == 0 {
+			t.Fatalf("expected similar incidents in alert list response")
+		}
+		if alert.SimilarIncidents[0].IncidentID != priorIncident.IncidentID {
+			t.Fatalf("expected prior incident first, got %+v", alert.SimilarIncidents[0])
+		}
+	}
+	if !foundCurrent {
+		t.Fatalf("current alert missing from list response")
+	}
+}
+
 func TestFeedbackVoteToggleCancelsSameActorVote(t *testing.T) {
 	store := NewStore()
 	incident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "toggle"}, Alert{

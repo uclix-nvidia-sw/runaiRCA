@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from app.collectors.base import AnalysisTarget
-from app.collectors.kubernetes import _filter_kubernetes_data
+from app.collectors.kubernetes import _filter_kubernetes_data, _list_params
 from app.collectors.prometheus import _queries_for
+from app.config import load_settings
 from app.nat_tools import (
     AnalysisAgentConfig,
     KubernetesContextConfig,
@@ -87,6 +88,17 @@ def test_runai_control_plane_pod_scan_is_not_filtered_by_workload_name() -> None
     assert result["namespace"] == "runai-backend"
     names = {item["name"] for item in result["items"]}
     assert names == {"runai-backend-0", "scheduler-0"}
+
+
+def test_kubernetes_list_params_include_configured_limit(monkeypatch) -> None:
+    monkeypatch.setenv("KUBERNETES_LIST_LIMIT", "25")
+    settings = load_settings()
+
+    assert _list_params(settings) == {"limit": "25"}
+    assert _list_params(settings, {"fieldSelector": "involvedObject.name=trainer"}) == {
+        "fieldSelector": "involvedObject.name=trainer",
+        "limit": "25",
+    }
 
 
 def test_prometheus_queries_cover_queue_and_project_gpu_contract() -> None:

@@ -4,8 +4,23 @@ fullnameOverride: ""
 global:
   imageRegistry: ""
 
+imagePullSecrets: []
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+priorityClassName: ""
+topologySpreadConstraints: []
+
 secrets:
   existingSecret: ""
+  keys:
+    databaseUrl: DATABASE_URL
+    postgresDsn: POSTGRES_DSN
+    runaiClientId: RUNAI_CLIENT_ID
+    runaiClientSecret: RUNAI_CLIENT_SECRET
+    runaiBearerToken: RUNAI_BEARER_TOKEN
+    nvidiaApiKey: NVIDIA_API_KEY
   databaseUrl: ""
   postgresDsn: ""
   runaiClientId: ""
@@ -24,11 +39,23 @@ postgresql:
     password: runai_rca
     database: runai_rca
   service:
+    annotations: {}
     port: 5432
   persistence:
     enabled: true
     size: 20Gi
     storageClass: ""
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext: {}
+  securityContext: {}
+  priorityClassName: ""
+  topologySpreadConstraints: []
+  readinessProbe: {}
+  livenessProbe: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
   resources: {}
 
 backend:
@@ -37,9 +64,29 @@ backend:
     repository: runai-rca-backend
     tag: ""
     pullPolicy: IfNotPresent
+  env:
+    agentUrl: ""
+    language: en
+    databaseConnectTimeoutSeconds: 5
   service:
+    annotations: {}
     type: ClusterIP
     port: 8080
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext: {}
+  securityContext: {}
+  priorityClassName: ""
+  topologySpreadConstraints: []
+  readinessProbe:
+    httpGet:
+      path: /healthz
+      port: http
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: http
+  extraEnv: []
   resources: {}
 
 agent:
@@ -49,6 +96,7 @@ agent:
     tag: ""
     pullPolicy: IfNotPresent
   service:
+    annotations: {}
     type: ClusterIP
     port: 8000
   serviceAccount:
@@ -59,24 +107,49 @@ agent:
   env:
     language: en
     logLevel: info
+    kubernetesApiUrl: https://kubernetes.default.svc
+    kubernetesTokenPath: /var/run/secrets/kubernetes.io/serviceaccount/token
+    kubernetesCaPath: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
     kubernetesTimeoutSeconds: 6
+    kubernetesListLimit: 50
     enableNatRuntime: false
     natConfigFile: /app/configs/runai_rca_workflow.yml
+    natTimeoutSeconds: 180
     runaiBaseUrl: ""
     runaiTokenUrl: ""
     runaiWorkloadsPath: /api/v1/workloads
     runaiProjectsPath: /api/v1/projects
     runaiQueuesPath: /api/v1/queues
+    runaiTimeoutSeconds: 8
     runaiLogNamespaces: runai,runai-backend
     prometheusUrl: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
+    prometheusTimeoutSeconds: 6
     prometheusMcpUrl: ""
     lokiUrl: http://loki-gateway.monitoring.svc.cluster.local
+    lokiTimeoutSeconds: 6
+    lokiQueryLimit: 20
     lokiMcpUrl: ""
+    postgresTimeoutSeconds: 6
     troubleshootingCasesFile: knowledge/troubleshooting_cases.md
     agentSoulsFile: prompts/agent_souls.md
     maskingRegexListJson: "[]"
     builtinRedactionEnabled: true
     builtinRedactionHashMode: false
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext: {}
+  securityContext: {}
+  priorityClassName: ""
+  topologySpreadConstraints: []
+  readinessProbe:
+    httpGet:
+      path: /healthz
+      port: http
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: http
+  extraEnv: []
   resources: {}
 
 frontend:
@@ -86,10 +159,27 @@ frontend:
     tag: ""
     pullPolicy: IfNotPresent
   service:
+    annotations: {}
     type: ClusterIP
     port: 80
   config:
     apiBaseUrl: ""
+    enableMockData: false
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext: {}
+  securityContext: {}
+  priorityClassName: ""
+  topologySpreadConstraints: []
+  readinessProbe:
+    httpGet:
+      path: /
+      port: http
+  livenessProbe:
+    httpGet:
+      path: /
+      port: http
+  extraEnv: []
   resources: {}
 
 ingress:
