@@ -54,29 +54,34 @@ class NemoWorkflowRunner:
         if not self.enabled():
             return None
 
-        config_file = self._materialize_config_file()
-        proc = await asyncio.create_subprocess_exec(
-            "nat",
-            "run",
-            "--config_file",
-            config_file,
-            "--input",
-            json.dumps(self._masker.mask_object(payload), sort_keys=True),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        config_file = self._settings.nat_config_file
         try:
-            stdout, _ = await asyncio.wait_for(
-                proc.communicate(), timeout=self._settings.nat_timeout_seconds
+            config_file = self._materialize_config_file()
+            proc = await asyncio.create_subprocess_exec(
+                "nat",
+                "run",
+                "--config_file",
+                config_file,
+                "--input",
+                json.dumps(self._masker.mask_object(payload), sort_keys=True),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
-        except TimeoutError:
-            proc.kill()
-            return None
-        if proc.returncode != 0:
-            return None
-        text = stdout.decode("utf-8", errors="replace").strip()
-        result = _extract_nat_result(text)
-        return self._masker.mask_text(result) if result else None
+            try:
+                stdout, _ = await asyncio.wait_for(
+                    proc.communicate(), timeout=self._settings.nat_timeout_seconds
+                )
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return None
+            if proc.returncode != 0:
+                return None
+            text = stdout.decode("utf-8", errors="replace").strip()
+            result = _extract_nat_result(text)
+            return self._masker.mask_text(result) if result else None
+        finally:
+            self._cleanup_materialized_config(config_file)
 
     def _materialize_config_file(self) -> str:
         replacements = {
@@ -104,11 +109,25 @@ class NemoWorkflowRunner:
             rendered = rendered.replace(old, new)
         if rendered == text:
             return self._settings.nat_config_file
+        if "__RUNAI_RCA_LLM" in rendered:
+            return self._settings.nat_config_file
 
-        target = Path(tempfile.gettempdir()) / "runai-rca-nat-workflow.yml"
-        target.write_text(rendered, encoding="utf-8")
+        fd, target_name = tempfile.mkstemp(
+            prefix="runai-rca-nat-workflow-", suffix=".yml"
+        )
+        target = Path(target_name)
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(rendered)
         os.chmod(target, 0o600)
-        return str(target)
+        return target_name
+
+    def _cleanup_materialized_config(self, config_file: str) -> None:
+        if config_file == self._settings.nat_config_file:
+            return
+        try:
+            Path(config_file).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 class AnalysisOrchestrator:

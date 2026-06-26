@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import stat
 from dataclasses import replace
 from pathlib import Path
 
@@ -207,6 +208,35 @@ llms:
     assert "test-secret" in rendered
     assert "request_timeout: 45" in rendered
     assert "__RUNAI_RCA_LLM" not in rendered
+    assert stat.S_IMODE(rendered_path.stat().st_mode) == 0o600
+
+    NemoWorkflowRunner(settings)._cleanup_materialized_config(str(rendered_path))
+
+    assert not rendered_path.exists()
+
+
+def test_nat_runner_skips_partial_litellm_materialization(tmp_path: Path) -> None:
+    config = tmp_path / "workflow_litellm.yml"
+    config.write_text(
+        """
+llms:
+  litellm_llm:
+    _type: litellm
+    model_name: __RUNAI_RCA_LLM_MODEL__
+    base_url: __RUNAI_RCA_LLM_BASE_URL__
+    api_key: __RUNAI_RCA_LLM_API_KEY__
+    request_timeout: __RUNAI_RCA_LLM_REQUEST_TIMEOUT_SECONDS__
+""".strip(),
+        encoding="utf-8",
+    )
+    settings = replace(
+        make_settings(),
+        nat_config_file=str(config),
+        llm_api_key="test-secret",
+        llm_request_timeout_seconds=45,
+    )
+
+    assert NemoWorkflowRunner(settings)._materialize_config_file() == str(config)
 
 
 def test_masker_redacts_sensitive_object_values() -> None:
