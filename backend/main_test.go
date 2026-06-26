@@ -331,6 +331,52 @@ func TestFeedbackAndSimilarIncidentMemory(t *testing.T) {
 	}
 }
 
+func TestReapStaleAnalyzingRunsMarksFailed(t *testing.T) {
+	store := NewStore()
+	incident, record := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "reap"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-reap",
+	})
+	// Simulate a run left "analyzing" by a previous process (no goroutine ran).
+	stale := store.CreateAnalysisRun("auto", "alert", record.AlertID, incident.IncidentID, record.AlertID, "t", "")
+	done := store.CreateAnalysisRun("manual", "alert", record.AlertID, incident.IncidentID, record.AlertID, "t", "")
+	store.CompleteAnalysisRun(done.RunID, AgentAnalysisResponse{Status: "ok", AnalysisSummary: "done"})
+
+	reaped := store.ReapStaleAnalyzingRuns()
+	if reaped != 1 {
+		t.Fatalf("expected exactly 1 stale run reaped, got %d", reaped)
+	}
+
+	var staleAfter, doneAfter AnalysisRun
+	for _, run := range store.ListAnalysisRuns() {
+		switch run.RunID {
+		case stale.RunID:
+			staleAfter = run
+		case done.RunID:
+			doneAfter = run
+		}
+	}
+	if staleAfter.Status != "failed" {
+		t.Fatalf("stale run should be failed, got %q", staleAfter.Status)
+	}
+	if len(staleAfter.Warnings) == 0 || staleAfter.Capabilities["agent"] != "interrupted" {
+		t.Fatalf("stale run missing interruption warning/capability: %+v", staleAfter)
+	}
+	if doneAfter.Status != "complete" {
+		t.Fatalf("completed run must be untouched, got %q", doneAfter.Status)
+	}
+
+	alert, _ := store.AlertDetail(record.AlertID)
+	if alert.IsAnalyzing {
+		t.Fatalf("alert is_analyzing flag should be cleared after reap")
+	}
+	if detail, ok := store.IncidentDetail(incident.IncidentID); !ok || detail.IsAnalyzing {
+		t.Fatalf("incident is_analyzing flag should be cleared after reap")
+	}
+}
+
 func waitForAnalysisRun(t *testing.T, server *Server, source string) AnalysisRun {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

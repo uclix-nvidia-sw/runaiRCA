@@ -1,17 +1,17 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -103,27 +103,6 @@ type FeedbackSummary struct {
 	LearningHints []FeedbackHint  `json:"learning_hints,omitempty"`
 }
 
-type AnalysisRun struct {
-	RunID           string            `json:"run_id"`
-	Source          string            `json:"source"`
-	Status          string            `json:"status"`
-	TargetType      string            `json:"target_type"`
-	TargetID        string            `json:"target_id"`
-	IncidentID      string            `json:"incident_id,omitempty"`
-	AlertID         string            `json:"alert_id,omitempty"`
-	Title           string            `json:"title"`
-	Prompt          string            `json:"prompt,omitempty"`
-	AnalysisSummary string            `json:"analysis_summary"`
-	AnalysisDetail  string            `json:"analysis_detail"`
-	AnalysisQuality string            `json:"analysis_quality"`
-	Capabilities    map[string]string `json:"capabilities"`
-	MissingData     []string          `json:"missing_data"`
-	Warnings        []string          `json:"warnings"`
-	Artifacts       []Artifact        `json:"artifacts"`
-	CreatedAt       time.Time         `json:"created_at"`
-	UpdatedAt       time.Time         `json:"updated_at"`
-}
-
 type FeedbackRequest struct {
 	Vote     string `json:"vote"`
 	VoteType string `json:"vote_type,omitempty"`
@@ -196,55 +175,6 @@ type IncidentDetail struct {
 	Alerts           []AlertRecord     `json:"alerts"`
 }
 
-type AgentAnalysisRequest struct {
-	Alert            Alert             `json:"alert"`
-	ThreadTS         string            `json:"thread_ts"`
-	IncidentID       string            `json:"incident_id,omitempty"`
-	AnalysisType     string            `json:"analysis_type,omitempty"`
-	Language         string            `json:"language,omitempty"`
-	SimilarIncidents []SimilarIncident `json:"similar_incidents,omitempty"`
-	FeedbackHints    []FeedbackHint    `json:"feedback_hints,omitempty"`
-}
-
-type AgentAnalysisResponse struct {
-	Status          string            `json:"status"`
-	ThreadTS        string            `json:"thread_ts"`
-	Analysis        string            `json:"analysis"`
-	AnalysisSummary string            `json:"analysis_summary"`
-	AnalysisDetail  string            `json:"analysis_detail"`
-	AnalysisType    string            `json:"analysis_type"`
-	AnalysisQuality string            `json:"analysis_quality"`
-	MissingData     []string          `json:"missing_data"`
-	Warnings        []string          `json:"warnings"`
-	Capabilities    map[string]string `json:"capabilities"`
-	Context         map[string]any    `json:"context"`
-	Artifacts       []Artifact        `json:"artifacts"`
-}
-
-type ChatRequest struct {
-	Message         string         `json:"message"`
-	ConversationID  string         `json:"conversation_id,omitempty"`
-	Language        string         `json:"language,omitempty"`
-	Page            string         `json:"page,omitempty"`
-	Auto            bool           `json:"auto,omitempty"`
-	IncidentID      string         `json:"incident_id,omitempty"`
-	AlertID         string         `json:"alert_id,omitempty"`
-	IncidentTitle   string         `json:"incident_title,omitempty"`
-	IncidentContent string         `json:"incident_content,omitempty"`
-	AlertTitle      string         `json:"alert_title,omitempty"`
-	AlertContent    string         `json:"alert_content,omitempty"`
-	Context         map[string]any `json:"context,omitempty"`
-}
-
-type ChatResponse struct {
-	Status         string       `json:"status"`
-	Answer         string       `json:"answer"`
-	Message        string       `json:"message,omitempty"`
-	Response       string       `json:"response,omitempty"`
-	ConversationID string       `json:"conversation_id"`
-	AnalysisRun    *AnalysisRun `json:"analysis_run,omitempty"`
-}
-
 type Server struct {
 	store               *Store
 	hub                 *Hub
@@ -257,9 +187,32 @@ type Server struct {
 func main() {
 	port := getenv("PORT", "8080")
 	server := NewServer()
-	log.Printf("Run:AI RCA backend listening on :%s", port)
-	if err := http.ListenAndServe(":"+port, server.routes()); err != nil {
-		log.Fatal(err)
+
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: server.routes(),
+		// No WriteTimeout: the /api/v1/events SSE stream is long-lived.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		log.Printf("Run:AI RCA backend listening on :%s", port)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	stop()
+	log.Printf("shutdown signal received, draining connections")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("graceful shutdown failed: %v", err)
 	}
 }
 
@@ -269,6 +222,9 @@ func NewServer() *Server {
 		first(os.Getenv("DATABASE_URL"), os.Getenv("POSTGRES_DSN")),
 		time.Duration(getenvInt("DATABASE_CONNECT_TIMEOUT_SECONDS", 5))*time.Second,
 	)
+	if reaped := store.ReapStaleAnalyzingRuns(); reaped > 0 {
+		log.Printf("reaped %d stale analyzing run(s) left by a previous process", reaped)
+	}
 	agentRequestTimeout := time.Duration(getenvInt("AGENT_REQUEST_TIMEOUT_SECONDS", 180)) * time.Second
 	if agentRequestTimeout <= 0 {
 		agentRequestTimeout = 180 * time.Second
@@ -328,473 +284,6 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleChat(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "not found")
-	}
-}
-
-func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
-	var req ChatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	req.Message = strings.TrimSpace(req.Message)
-	if req.Message == "" {
-		writeError(w, http.StatusBadRequest, "message is required")
-		return
-	}
-	req = s.enrichChatRequest(req)
-	if wantsAnalysisRun(req.Message) {
-		targetType, targetID := chatAnalysisTarget(req)
-		if targetType == "" || targetID == "" {
-			answer := ChatResponse{
-				Status:         "ok",
-				Answer:         "분석을 새로 만들 대상 incident나 alert를 먼저 지정해줘. 현재 RCA detail 화면에서 요청하거나, 채팅 컨텍스트에 Incident/Alert ID를 넣으면 Analysis Dashboard에 새 분석 아이템을 생성할게.",
-				ConversationID: req.ConversationID,
-			}
-			if answer.ConversationID == "" {
-				answer.ConversationID = fmt.Sprintf("chat-%d", time.Now().UnixNano())
-			}
-			answer.Message = answer.Answer
-			answer.Response = answer.Answer
-			writeJSON(w, http.StatusOK, answer)
-			return
-		}
-		run, ok := s.startAnalysisRun(targetType, targetID, "chat", req.Message)
-		if !ok {
-			writeError(w, http.StatusNotFound, "analysis target not found")
-			return
-		}
-		answer := ChatResponse{
-			Status:         "ok",
-			Answer:         fmt.Sprintf("새 분석 아이템 `%s`를 만들었고 에이전트 재분석을 시작했어. Analysis Dashboard에서 상태와 결과를 이어서 볼 수 있어.", run.RunID),
-			ConversationID: req.ConversationID,
-			AnalysisRun:    run,
-		}
-		if answer.ConversationID == "" {
-			answer.ConversationID = fmt.Sprintf("chat-%d", time.Now().UnixNano())
-		}
-		answer.Message = answer.Answer
-		answer.Response = answer.Answer
-		writeJSON(w, http.StatusAccepted, answer)
-		return
-	}
-	answer, err := s.requestChat(req)
-	if err != nil {
-		answer = fallbackChatResponse(req, err)
-	}
-	if answer.ConversationID == "" {
-		answer.ConversationID = req.ConversationID
-	}
-	if answer.ConversationID == "" {
-		answer.ConversationID = fmt.Sprintf("chat-%d", time.Now().UnixNano())
-	}
-	if answer.Message == "" {
-		answer.Message = answer.Answer
-	}
-	if answer.Response == "" {
-		answer.Response = answer.Answer
-	}
-	writeJSON(w, http.StatusOK, answer)
-}
-
-func (s *Server) enrichChatRequest(req ChatRequest) ChatRequest {
-	if req.Context == nil {
-		req.Context = map[string]any{}
-	}
-	req.IncidentID = strings.TrimSpace(first(req.IncidentID, stringFromContext(req.Context, "incident_id")))
-	req.AlertID = strings.TrimSpace(first(req.AlertID, stringFromContext(req.Context, "alert_id")))
-
-	if req.AlertID != "" {
-		if alert, ok := s.store.AlertDetail(req.AlertID); ok {
-			if req.IncidentID == "" {
-				req.IncidentID = alert.IncidentID
-			}
-			if req.AlertTitle == "" {
-				req.AlertTitle = alert.AlarmTitle
-			}
-			if req.AlertContent == "" {
-				req.AlertContent = alertChatContent(alert)
-			}
-			req.Context["alert"] = alertChatContext(alert)
-		}
-	}
-	if req.IncidentID != "" {
-		if detail, ok := s.store.IncidentDetail(req.IncidentID); ok {
-			if req.IncidentTitle == "" {
-				req.IncidentTitle = detail.Title
-			}
-			if req.IncidentContent == "" {
-				req.IncidentContent = incidentChatContent(detail)
-			}
-			req.Context["incident"] = incidentChatContext(detail)
-		}
-	}
-
-	memoryQuery := strings.Join(
-		[]string{req.Message, req.IncidentTitle, req.AlertTitle, req.IncidentContent, req.AlertContent},
-		"\n",
-	)
-	req.Context["rca_memory"] = s.store.SearchIncidentMemory(memoryQuery, 5)
-	req.Context["page"] = req.Page
-	return req
-}
-
-func wantsAnalysisRun(message string) bool {
-	lowered := strings.ToLower(strings.TrimSpace(message))
-	if lowered == "" {
-		return false
-	}
-	if strings.Contains(lowered, "re-analyze") ||
-		strings.Contains(lowered, "reanalyze") ||
-		strings.Contains(lowered, "run analysis") ||
-		strings.Contains(lowered, "start analysis") ||
-		strings.Contains(lowered, "create analysis") {
-		return true
-	}
-	if strings.Contains(lowered, "analyze") && strings.Contains(lowered, "rca") {
-		return true
-	}
-	if !strings.Contains(message, "분석") {
-		return false
-	}
-	for _, token := range []string{"해줘", "돌려", "진행", "요청", "다시", "새로", "시작", "만들"} {
-		if strings.Contains(message, token) {
-			return true
-		}
-	}
-	return false
-}
-
-func chatAnalysisTarget(req ChatRequest) (string, string) {
-	if req.AlertID != "" {
-		return "alert", req.AlertID
-	}
-	if req.IncidentID != "" {
-		return "incident", req.IncidentID
-	}
-	targetType := stringFromContext(req.Context, "target_type")
-	switch targetType {
-	case "alert":
-		if id := stringFromContext(req.Context, "alert_id"); id != "" {
-			return "alert", id
-		}
-	case "incident":
-		if id := stringFromContext(req.Context, "incident_id"); id != "" {
-			return "incident", id
-		}
-	}
-	return "", ""
-}
-
-func (s *Server) requestChat(req ChatRequest) (ChatResponse, error) {
-	payload, err := json.Marshal(req)
-	if err != nil {
-		return ChatResponse{}, err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), s.agentRequestTimeout)
-	defer cancel()
-	httpReq, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodPost,
-		s.agentURL+"/chat",
-		bytes.NewReader(payload),
-	)
-	if err != nil {
-		return ChatResponse{}, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := s.client.Do(httpReq)
-	if err != nil {
-		return ChatResponse{}, err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 {
-		return ChatResponse{}, errors.New(string(body))
-	}
-	var answer ChatResponse
-	if err := json.Unmarshal(body, &answer); err != nil {
-		return ChatResponse{}, err
-	}
-	return answer, nil
-}
-
-func fallbackChatResponse(req ChatRequest, err error) ChatResponse {
-	entity := first(req.IncidentID, req.AlertID, "current RCA workspace")
-	content := first(req.AlertContent, req.IncidentContent, "No RCA content is attached yet.")
-	answer := fmt.Sprintf(
-		"Agent chat is unavailable for %s: %v\n\nCurrent RCA context:\n%s",
-		entity,
-		err,
-		excerpt(content, 1200),
-	)
-	return ChatResponse{
-		Status:         "ok",
-		Answer:         answer,
-		Message:        answer,
-		Response:       answer,
-		ConversationID: req.ConversationID,
-	}
-}
-
-func incidentChatContent(detail *IncidentDetail) string {
-	if detail == nil {
-		return ""
-	}
-	alerts := make([]string, 0, len(detail.Alerts))
-	for _, alert := range detail.Alerts {
-		alerts = append(alerts, fmt.Sprintf(
-			"%s %s %s %s",
-			alert.AlertID,
-			alert.AlarmTitle,
-			alert.Severity,
-			alert.Status,
-		))
-	}
-	return strings.Join([]string{
-		"Title: " + detail.Title,
-		"Incident ID: " + detail.IncidentID,
-		"Status: " + detail.Status,
-		"Severity: " + detail.Severity,
-		"Analysis summary: " + detail.AnalysisSummary,
-		"Analysis detail: " + excerpt(detail.AnalysisDetail, 4000),
-		"Missing data: " + strings.Join(detail.MissingData, ", "),
-		"Warnings: " + strings.Join(detail.Warnings, ", "),
-		"Alerts: " + strings.Join(alerts, " | "),
-	}, "\n")
-}
-
-func alertChatContent(alert *AlertRecord) string {
-	if alert == nil {
-		return ""
-	}
-	labels, _ := json.Marshal(alert.Labels)
-	annotations, _ := json.Marshal(alert.Annotations)
-	return strings.Join([]string{
-		"Title: " + alert.AlarmTitle,
-		"Alert ID: " + alert.AlertID,
-		"Incident ID: " + alert.IncidentID,
-		"Status: " + alert.Status,
-		"Severity: " + alert.Severity,
-		"Labels: " + string(labels),
-		"Annotations: " + string(annotations),
-		"Analysis summary: " + alert.AnalysisSummary,
-		"Analysis detail: " + excerpt(alert.AnalysisDetail, 4000),
-		"Missing data: " + strings.Join(alert.MissingData, ", "),
-		"Warnings: " + strings.Join(alert.Warnings, ", "),
-	}, "\n")
-}
-
-func incidentChatContext(detail *IncidentDetail) map[string]any {
-	if detail == nil {
-		return map[string]any{}
-	}
-	return map[string]any{
-		"incident_id":       detail.IncidentID,
-		"title":             detail.Title,
-		"severity":          detail.Severity,
-		"status":            detail.Status,
-		"analysis_summary":  detail.AnalysisSummary,
-		"analysis_quality":  detail.AnalysisQuality,
-		"capabilities":      detail.Capabilities,
-		"missing_data":      detail.MissingData,
-		"warnings":          detail.Warnings,
-		"similar_incidents": detail.SimilarIncidents,
-		"feedback":          detail.Feedback,
-		"alerts":            detail.Alerts,
-	}
-}
-
-func alertChatContext(alert *AlertRecord) map[string]any {
-	if alert == nil {
-		return map[string]any{}
-	}
-	return map[string]any{
-		"alert_id":          alert.AlertID,
-		"incident_id":       alert.IncidentID,
-		"title":             alert.AlarmTitle,
-		"severity":          alert.Severity,
-		"status":            alert.Status,
-		"labels":            alert.Labels,
-		"annotations":       alert.Annotations,
-		"analysis_summary":  alert.AnalysisSummary,
-		"analysis_quality":  alert.AnalysisQuality,
-		"capabilities":      alert.Capabilities,
-		"missing_data":      alert.MissingData,
-		"warnings":          alert.Warnings,
-		"similar_incidents": alert.SimilarIncidents,
-		"feedback":          alert.Feedback,
-		"artifacts":         alert.Artifacts,
-	}
-}
-
-func stringFromContext(context map[string]any, key string) string {
-	value, ok := context[key]
-	if !ok || value == nil {
-		return ""
-	}
-	switch typed := value.(type) {
-	case string:
-		return typed
-	case fmt.Stringer:
-		return typed.String()
-	default:
-		return fmt.Sprint(typed)
-	}
-}
-
-func (s *Server) requestAnalysis(alert Alert, incidentID, alertID, threadTS string, source string) {
-	req := AgentAnalysisRequest{
-		Alert:            alert,
-		ThreadTS:         threadTS,
-		IncidentID:       incidentID,
-		AnalysisType:     status(alert.Status),
-		Language:         s.language,
-		SimilarIncidents: s.store.SimilarIncidentsForAlert(alert, incidentID, 5),
-		FeedbackHints:    s.store.FeedbackHintsForAlert(alert, incidentID, 5),
-	}
-	payload, _ := json.Marshal(req)
-	httpReq, err := http.NewRequestWithContext(
-		context.Background(),
-		http.MethodPost,
-		s.agentURL+"/analyze",
-		bytes.NewReader(payload),
-	)
-	if err != nil {
-		return
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := s.client.Do(httpReq)
-	if err != nil {
-		s.store.ApplyAnalysis(alertID, fallbackAnalysis(alert, err))
-		s.hub.Broadcast(analysisCompletedEvent("", source, "complete", incidentID, alertID))
-		return
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 {
-		s.store.ApplyAnalysis(alertID, fallbackAnalysis(alert, errors.New(string(body))))
-		s.hub.Broadcast(analysisCompletedEvent("", source, "complete", incidentID, alertID))
-		return
-	}
-	var analysis AgentAnalysisResponse
-	if err := json.Unmarshal(body, &analysis); err != nil {
-		s.store.ApplyAnalysis(alertID, fallbackAnalysis(alert, err))
-	} else {
-		s.store.ApplyAnalysis(alertID, analysis)
-	}
-	s.hub.Broadcast(analysisCompletedEvent("", source, "complete", incidentID, alertID))
-}
-
-func (s *Server) startAnalysisRun(targetType string, targetID string, source string, prompt string) (*AnalysisRun, bool) {
-	alert, incidentID, alertID, threadTS, title, ok := s.store.AnalysisTarget(targetType, targetID)
-	if !ok {
-		return nil, false
-	}
-	run := s.store.CreateAnalysisRun(
-		source,
-		targetType,
-		targetID,
-		incidentID,
-		alertID,
-		fmt.Sprintf("%s: %s", sourceTitle(source), title),
-		prompt,
-	)
-	s.hub.Broadcast(analysisStartedEvent(run.RunID, run.Source, targetType, targetID, incidentID, alertID))
-	go s.requestAnalysisRun(run.RunID, alert, incidentID, alertID, threadTS, source, prompt)
-	return &run, true
-}
-
-func (s *Server) requestAnalysisRun(
-	runID string,
-	alert Alert,
-	incidentID string,
-	alertID string,
-	threadTS string,
-	source string,
-	prompt string,
-) {
-	if alert.Annotations == nil {
-		alert.Annotations = map[string]string{}
-	}
-	alert.Annotations["analysis_run_id"] = runID
-	alert.Annotations["analysis_request_source"] = source
-	alert.Annotations["operator_prompt"] = prompt
-	req := AgentAnalysisRequest{
-		Alert:            alert,
-		ThreadTS:         threadTS,
-		IncidentID:       incidentID,
-		AnalysisType:     source,
-		Language:         s.language,
-		SimilarIncidents: s.store.SimilarIncidentsForAlert(alert, incidentID, 5),
-		FeedbackHints:    s.store.FeedbackHintsForAlert(alert, incidentID, 5),
-	}
-	payload, _ := json.Marshal(req)
-	httpReq, err := http.NewRequestWithContext(
-		context.Background(),
-		http.MethodPost,
-		s.agentURL+"/analyze",
-		bytes.NewReader(payload),
-	)
-	if err != nil {
-		return
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := s.client.Do(httpReq)
-	if err != nil {
-		run, _ := s.store.FailAnalysisRun(runID, fallbackAnalysis(alert, err))
-		s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
-		return
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 {
-		run, _ := s.store.FailAnalysisRun(runID, fallbackAnalysis(alert, errors.New(string(body))))
-		s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
-		return
-	}
-	var analysis AgentAnalysisResponse
-	if err := json.Unmarshal(body, &analysis); err != nil {
-		run, _ := s.store.FailAnalysisRun(runID, fallbackAnalysis(alert, err))
-		s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
-		return
-	}
-	run, _ := s.store.CompleteAnalysisRun(runID, analysis)
-	s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
-}
-
-func (s *Server) broadcastAnalysisRunCompleted(run AnalysisRun, incidentID string, alertID string) {
-	s.hub.Broadcast(analysisCompletedEvent(run.RunID, run.Source, run.Status, incidentID, alertID))
-}
-
-func sourceTitle(source string) string {
-	switch source {
-	case "comment":
-		return "Comment reanalysis"
-	case "feedback":
-		return "Feedback reanalysis"
-	case "chat":
-		return "Chat analysis"
-	default:
-		return "Analysis"
-	}
-}
-
-func fallbackAnalysis(alert Alert, err error) AgentAnalysisResponse {
-	name := alert.Labels["alertname"]
-	if name == "" {
-		name = "Run:AI alert"
-	}
-	summary := fmt.Sprintf("%s accepted, but agent analysis is unavailable: %v", name, err)
-	return AgentAnalysisResponse{
-		Status:          "ok",
-		Analysis:        "## Root Cause\n\nAgent analysis is unavailable.\n\n## Recommended Actions\n\nCheck Agent service health and configured integrations.",
-		AnalysisSummary: summary,
-		AnalysisDetail:  "## Root Cause\n\nAgent analysis is unavailable.\n\n## Recommended Actions\n\nCheck Agent service health and configured integrations.",
-		AnalysisQuality: "low",
-		Capabilities:    map[string]string{"agent": "unavailable"},
-		MissingData:     []string{"agent.response"},
-		Warnings:        []string{err.Error()},
 	}
 }
 

@@ -267,6 +267,47 @@ func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (A
 	return cloneAnalysisRun(run), true
 }
 
+// ReapStaleAnalyzingRuns enforces the lifecycle invariant across process
+// restarts. A run persisted as "analyzing" by a previous process (a pod that was
+// killed mid-analysis by a rollout, OOM, or a shutdown that exceeded the drain
+// window) has no goroutine to finish it, so on startup it is marked failed with a
+// warning. Any stale is_analyzing flags on alerts/incidents are also cleared,
+// since nothing is actually running yet. It returns the number of runs reaped
+// and is a no-op for the in-memory store with no persisted state.
+func (s *Store) ReapStaleAnalyzingRuns() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reaped := 0
+	for _, run := range s.analysisRuns {
+		if run == nil || run.Status != "analyzing" {
+			continue
+		}
+		run.Status = "failed"
+		run.AnalysisQuality = first(run.AnalysisQuality, "low")
+		if run.Capabilities == nil {
+			run.Capabilities = map[string]string{}
+		}
+		run.Capabilities["agent"] = "interrupted"
+		run.Warnings = append(run.Warnings, "analysis was interrupted by a backend restart and marked failed")
+		run.UpdatedAt = time.Now().UTC()
+		s.persistAnalysisRunLocked(run)
+		reaped++
+	}
+	for _, alert := range s.alerts {
+		if alert != nil && alert.IsAnalyzing {
+			alert.IsAnalyzing = false
+			s.persistAlertLocked(alert)
+		}
+	}
+	for _, incident := range s.incidents {
+		if incident != nil && incident.IsAnalyzing {
+			incident.IsAnalyzing = false
+			s.persistIncidentLocked(incident)
+		}
+	}
+	return reaped
+}
+
 func (s *Store) AnalysisTarget(targetType string, targetID string) (Alert, string, string, string, string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
