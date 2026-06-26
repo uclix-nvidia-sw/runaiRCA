@@ -2,8 +2,8 @@ import { AlertRecord, AnalysisRun, Envelope, FeedbackSummary, Incident, Incident
 
 const runtimeApiBase = window.__RUNAI_RCA_CONFIG__?.apiBaseUrl;
 const fallbackApiBase = import.meta.env.DEV ? 'http://localhost:8080' : '';
-const configuredApiBase = nonEmpty(runtimeApiBase) ?? nonEmpty(import.meta.env.VITE_API_BASE_URL);
-const API_BASE = (configuredApiBase ?? fallbackApiBase).replace(/\/$/, '');
+const configuredApiBase = normalizeApiBase(runtimeApiBase) ?? normalizeApiBase(import.meta.env.VITE_API_BASE_URL);
+const API_BASE = configuredApiBase ?? fallbackApiBase;
 const FEEDBACK_ACTOR_KEY = 'runai-rca-feedback-actor';
 
 type FeedbackVote = 'up' | 'down' | 'none';
@@ -139,6 +139,23 @@ function nonEmpty(value: unknown) {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
   return trimmed === '' ? undefined : trimmed;
+}
+
+function normalizeApiBase(value: unknown) {
+  const trimmed = nonEmpty(value);
+  if (!trimmed) return undefined;
+  const withoutTrailingSlash = trimmed.replace(/\/$/, '');
+  if (withoutTrailingSlash.startsWith('/')) return withoutTrailingSlash;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(withoutTrailingSlash)) return withoutTrailingSlash;
+  if (
+    withoutTrailingSlash.startsWith('localhost') ||
+    withoutTrailingSlash.startsWith('127.') ||
+    withoutTrailingSlash.startsWith('[') ||
+    withoutTrailingSlash.includes('.')
+  ) {
+    return `http://${withoutTrailingSlash}`;
+  }
+  return `/${withoutTrailingSlash.replace(/^\/+/, '')}`;
 }
 
 function targetPath(targetType: 'incident' | 'alert', id: string, action: string) {

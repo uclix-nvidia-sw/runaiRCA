@@ -779,9 +779,19 @@ function App() {
   }, [load]);
 
   useEffect(() => {
-    const source = eventSource();
+    let source: EventSource;
+    try {
+      source = eventSource();
+    } catch (err) {
+      if (!ENABLE_MOCK_DATA) {
+        const message = err instanceof Error ? err.message : 'Realtime updates are unavailable.';
+        setError(`Realtime updates are unavailable: ${message}`);
+      }
+      return undefined;
+    }
     source.onmessage = () => void load();
     source.addEventListener('alert.created', () => void load());
+    source.addEventListener('analysis.started', () => void load());
     source.addEventListener('analysis.completed', () => void load());
     source.addEventListener('incident.resolved', () => void load());
     source.addEventListener('feedback.updated', () => void load());

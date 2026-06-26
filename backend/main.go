@@ -328,7 +328,7 @@ func (s *Store) ConnectDatabase(databaseURL string, connectTimeout time.Duration
 	s.pgvectorReady = s.ensurePostgresSchema(ctx)
 	s.loadDatabaseState(ctx)
 	log.Printf(
-		"Postgres store enabled for incidents, embeddings, feedback, and comments; pgvector=%t",
+		"Postgres store enabled for incidents, embeddings, feedback, comments, and analysis runs; pgvector=%t",
 		s.pgvectorReady,
 	)
 }

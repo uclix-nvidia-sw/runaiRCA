@@ -163,7 +163,7 @@ Core environment variables:
 | `LOKI_TIMEOUT_SECONDS` | Loki query timeout |
 | `LOKI_QUERY_LIMIT` | Maximum log lines requested per Loki query group, default `20` |
 | `LOKI_MCP_URL` | Optional remote Loki MCP URL for the MCP workflow |
-| `DATABASE_URL` | Backend Postgres store DSN for incidents, alerts, embeddings, feedback, and comments |
+| `DATABASE_URL` | Backend Postgres store DSN for incidents, alerts, embeddings, feedback, comments, and analysis runs |
 | `DATABASE_CONNECT_TIMEOUT_SECONDS` | Backend Postgres startup connection timeout, default `5` |
 | `POSTGRES_DSN` | Agent Postgres diagnostic DSN; defaults to `DATABASE_URL` in Helm |
 | `POSTGRES_TIMEOUT_SECONDS` | Agent Postgres diagnostic query timeout |
@@ -271,8 +271,8 @@ Frequently tuned Helm values:
 | `agent.env.kubernetesListLimit` / `agent.env.lokiQueryLimit` | Evidence volume controls for Kubernetes list calls and Loki log query groups |
 | `agent.env.troubleshootingCasesFile` / `agent.env.agentSoulsFile` | Paths for injected troubleshooting memory and agent role contracts |
 | `agent.env.maskingRegexListJson` | Cluster-specific secret masking regexes as a JSON array |
-| `frontend.config.apiBaseUrl` | Browser API base URL when not using the bundled nginx `/api` proxy |
-| `frontend.config.enableMockData` | Show sample dashboard records only when no live incidents or alerts exist; default `false` in Helm |
+| `frontend.config.apiBaseUrl` | Browser API base URL when not using the bundled nginx `/api` proxy; accepts absolute URLs, `/api`-style paths, or localhost host:port values |
+| `frontend.config.enableMockData` | Show sample dashboard records when no live incidents or alerts exist, or when the local dev backend is unavailable; default `false` in Helm |
 | `backend.extraEnv`, `agent.extraEnv`, `frontend.extraEnv` | Additional container env entries for deployment-specific settings |
 | `podAnnotations` / `podLabels` | Global pod metadata applied to Backend, Agent, Frontend, and bundled Postgres |
 | `{backend,agent,frontend,postgresql}.podAnnotations` / `.podLabels` | Component-specific pod metadata merged over global metadata |
