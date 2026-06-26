@@ -968,6 +968,16 @@ function App() {
 
   const viewCopy = VIEW_COPY[activeView];
 
+  const goHome = () => {
+    setDetail(null);
+    setActiveView('operations');
+  };
+
+  const switchView = (view: MainView) => {
+    setDetail(null);
+    setActiveView(view);
+  };
+
   const openIncident = async (id: string) => {
     if (showMockData) {
       const mockDetail = mockIncidentDetail(id);
@@ -1016,7 +1026,9 @@ function App() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <img className="brand-logo" src={nvidiaLogo} alt="NVIDIA" />
+        <button className="brand-mark" onClick={goHome} type="button" aria-label="Go to operations dashboard">
+          <img className="brand-logo" src={nvidiaLogo} alt="NVIDIA" />
+        </button>
         <div>
           <p className="eyebrow">NVIDIA Run:ai</p>
           <h1>Run:AI RCA</h1>
@@ -1024,28 +1036,28 @@ function App() {
         <nav>
           <button
             className={`nav-item ${activeView === 'operations' ? 'active' : ''}`}
-            onClick={() => setActiveView('operations')}
+            onClick={() => switchView('operations')}
             type="button"
           >
             <Activity size={18} /> Operations
           </button>
           <button
             className={`nav-item ${activeView === 'analysis' ? 'active' : ''}`}
-            onClick={() => setActiveView('analysis')}
+            onClick={() => switchView('analysis')}
             type="button"
           >
             <ListChecks size={18} /> Analysis
           </button>
           <button
             className={`nav-item ${activeView === 'evidence' ? 'active' : ''}`}
-            onClick={() => setActiveView('evidence')}
+            onClick={() => switchView('evidence')}
             type="button"
           >
             <Database size={18} /> Evidence
           </button>
           <button
             className={`nav-item ${activeView === 'agents' ? 'active' : ''}`}
-            onClick={() => setActiveView('agents')}
+            onClick={() => switchView('agents')}
             type="button"
           >
             <Bot size={18} /> Agents
@@ -1083,6 +1095,10 @@ function App() {
             loading={loading}
             onOpenIncident={openIncident}
             onOpenAlert={openAlert}
+            onAnalyze={async (id) => {
+              await analyzeIncident(id);
+              await load();
+            }}
           />
         )}
         {activeView === 'analysis' && (
@@ -1124,6 +1140,7 @@ function App() {
           await analyzeIncident(id);
           await refreshDetail();
         }}
+        onOpenIncident={openIncident}
         onResolve={async (id) => {
           await resolveIncident(id);
           await refreshDetail();
@@ -1148,6 +1165,7 @@ function OperationsView({
   loading,
   onOpenIncident,
   onOpenAlert,
+  onAnalyze,
 }: {
   incidents: Incident[];
   alerts: AlertRecord[];
@@ -1156,6 +1174,7 @@ function OperationsView({
   loading: boolean;
   onOpenIncident: (id: string) => Promise<void>;
   onOpenAlert: (id: string) => Promise<void>;
+  onAnalyze: (id: string) => Promise<void>;
 }) {
   return (
     <>
@@ -1209,6 +1228,7 @@ function OperationsView({
                 <th>Run:AI target</th>
                 <th>Severity</th>
                 <th>Status</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -1224,6 +1244,30 @@ function OperationsView({
                   </td>
                   <td><Severity value={alert.severity} /></td>
                   <td><Status value={alert.status} analyzing={alert.is_analyzing} /></td>
+                  <td>
+                    <div className="table-actions">
+                      <button
+                        className="ghost-button compact-button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void onOpenIncident(alert.incident_id);
+                        }}
+                        type="button"
+                      >
+                        <Link size={15} /> Incident
+                      </button>
+                      <button
+                        className="primary-button compact-button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void onAnalyze(alert.incident_id);
+                        }}
+                        type="button"
+                      >
+                        <Bot size={15} /> Analyze
+                      </button>
+                    </div>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -1681,12 +1725,14 @@ function UnifiedWorkspace({
   onClose,
   onRefresh,
   onAnalyze,
+  onOpenIncident,
   onResolve,
 }: {
   detail: DetailState;
   onClose: () => void;
   onRefresh: () => void;
   onAnalyze: (id: string) => Promise<void>;
+  onOpenIncident: (id: string) => Promise<void>;
   onResolve: (id: string) => Promise<void>;
 }) {
   if (!detail) return null;
@@ -1701,7 +1747,7 @@ function UnifiedWorkspace({
   const warnings = incident?.warnings ?? alert?.warnings ?? [];
   const analysis = incident?.analysis_detail ?? alert?.analysis_detail;
   const summary = incident?.analysis_summary ?? alert?.analysis_summary;
-  const similarIncidents = incident?.similar_incidents ?? alert?.similar_incidents ?? [];
+  const similarIncidents = incident?.similar_incidents ?? [];
   const feedback = incident?.feedback ?? alert?.feedback;
   const targetType = detail.kind;
 
@@ -1727,6 +1773,12 @@ function UnifiedWorkspace({
               <button className="primary-button" onClick={() => onResolve(incident.incident_id)}><CheckCircle2 size={16} /> Resolve</button>
             </>
           )}
+          {alert && (
+            <>
+              <button className="ghost-button" onClick={() => onOpenIncident(alert.incident_id)}><Link size={16} /> Incident</button>
+              <button className="ghost-button" onClick={() => onAnalyze(alert.incident_id)}><Bot size={16} /> Analyze</button>
+            </>
+          )}
         </div>
       </div>
 
@@ -1736,7 +1788,11 @@ function UnifiedWorkspace({
           <p>{summary || 'Analysis is pending. The Agent Evidence Trail will populate as collectors finish.'}</p>
         </section>
 
-        <SimilarIncidentsPanel items={similarIncidents} />
+        {incident ? (
+          <SimilarIncidentsPanel items={similarIncidents} />
+        ) : (
+          alert && <RelatedIncidentPanel alert={alert} onOpenIncident={onOpenIncident} />
+        )}
 
         <section className="rca-report">
           <div className="section-title"><FileText size={18} /> Report</div>
@@ -1785,6 +1841,34 @@ function UnifiedWorkspace({
           onSubmitted={onRefresh}
         />
       </div>
+    </section>
+  );
+}
+
+function RelatedIncidentPanel({
+  alert,
+  onOpenIncident,
+}: {
+  alert: AlertRecord;
+  onOpenIncident: (id: string) => Promise<void>;
+}) {
+  return (
+    <section className="related-panel">
+      <div className="section-title"><Link size={18} /> Related Incident</div>
+      <article className="related-incident-card">
+        <div>
+          <strong>{alert.incident_id}</strong>
+          <div className="meta-line">
+            <span>{targetLine(alert.labels)}</span>
+            <Severity value={alert.severity} />
+            <Status value={alert.status} analyzing={alert.is_analyzing} />
+          </div>
+          <p>{alert.analysis_summary || 'This alert is grouped into the incident RCA workspace.'}</p>
+        </div>
+        <button className="ghost-button" onClick={() => void onOpenIncident(alert.incident_id)} type="button">
+          <ArrowLeft size={16} /> Open incident dashboard
+        </button>
+      </article>
     </section>
   );
 }

@@ -233,6 +233,27 @@ helm install runai-rca charts/runai-rca \
   --set secrets.existingSecret=runai-rca-secrets
 ```
 
+Create the Kubernetes Secret referenced by `secrets.existingSecret` before
+installing the chart. Use the same namespace as the Helm release, keep `.env`
+for local development only, and omit keys that your deployment does not use:
+
+```bash
+kubectl create namespace runai-rca
+kubectl create secret generic runai-rca-secrets \
+  --namespace runai-rca \
+  --from-literal=RUNAI_CLIENT_ID='<runai-client-id>' \
+  --from-literal=RUNAI_CLIENT_SECRET='<runai-client-secret>' \
+  --from-literal=RUNAI_BEARER_TOKEN='<optional-runai-token>' \
+  --from-literal=NVIDIA_API_KEY='<nim-api-key>' \
+  --from-literal=LLM_API_KEY='<llm-api-key>' \
+  --from-literal=DATABASE_URL='postgres://user:password@postgres.example.com:5432/runai_rca?sslmode=require' \
+  --from-literal=POSTGRES_DSN='postgres://user:password@postgres.example.com:5432/runai_rca?sslmode=require'
+```
+
+Install into that namespace with `--namespace runai-rca --create-namespace`, or
+replace the namespace above with your release namespace. If you use different
+Secret key names, set `secrets.keys.*` to match them.
+
 For an existing Postgres, set `secrets.databaseUrl` or provide a Secret through
 `secrets.existingSecret`. By default the chart reads `DATABASE_URL` and
 `POSTGRES_DSN`; if your existing Secret uses different key names, set
@@ -280,7 +301,7 @@ Frequently tuned Helm values:
 | `backend.env.language` / `agent.env.language` | Set RCA language to `en` or `ko` |
 | `backend.env.databaseConnectTimeoutSeconds` / `agentRequestTimeoutSeconds` | Backend startup DB timeout and Backend-to-Agent request timeout |
 | `secrets.keys.*` | Existing Secret key names for DB, Run:ai, NVIDIA, and LLM credentials |
-| `secrets.existingSecret` | Existing Secret for Run:ai/NVIDIA credentials and, by default, DB keys |
+| `secrets.existingSecret` | Existing Secret for Run:ai/NVIDIA/LLM credentials and, by default, DB keys |
 | `secrets.databaseExistingSecret` | Existing Secret used only for `DATABASE_URL` / `POSTGRES_DSN` |
 | `postgresql.enabled` / `postgresql.auth.*` | Install the bundled Postgres and set its generated DSN user, password, and database |
 | `agent.rbac.clusterWide` | Use a ClusterRole for Kubernetes evidence collection; default `true` |

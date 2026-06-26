@@ -45,6 +45,7 @@ button:disabled {
 button,
 .nav-item,
 tbody tr td,
+	.brand-mark,
 	.agent-toggle,
 	.analysis-card,
 	.vote-button,
@@ -61,6 +62,7 @@ tbody tr td,
 
 button:not(:disabled):active,
 .nav-item:active,
+	.brand-mark:active,
 	.agent-toggle:active,
 	.analysis-card:active,
 	.editor-tool:active,
@@ -89,11 +91,24 @@ button:not(:disabled):active,
   padding: 1.5rem;
 }
 
+.brand-mark {
+  display: block;
+  width: max-content;
+  border: 0;
+  border-radius: 0.45rem;
+  background: transparent;
+  padding: 0.25rem;
+  margin: -0.25rem 0 1rem -0.25rem;
+}
+
+.brand-mark:hover {
+  background: var(--surface-soft);
+}
+
 .brand-logo {
   display: block;
   width: 9rem;
   height: auto;
-  margin-bottom: 1.25rem;
 }
 
 .eyebrow {
@@ -386,9 +401,21 @@ td span {
   color: #ffffff;
 }
 
+.compact-button {
+  min-height: 2rem;
+  padding: 0 0.55rem;
+  font-size: 0.78rem;
+}
+
 .ghost-button:hover,
 .icon-button:hover {
   background: var(--surface-soft);
+}
+
+.table-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
 }
 
 .error-banner {
@@ -844,7 +871,7 @@ td span {
 .workspace {
   position: fixed;
   top: 1rem;
-  left: 1rem;
+  left: 18rem;
   right: 1rem;
   bottom: 1rem;
   width: auto;
@@ -858,7 +885,7 @@ td span {
 .workspace::before {
   content: "";
   position: fixed;
-  inset: 0;
+  inset: 0 0 0 17rem;
   z-index: -1;
   background: #ffffff;
 }
@@ -909,6 +936,7 @@ td span {
 .agent-trail,
 .diagnostics,
 .similar-panel,
+.related-panel,
 .feedback-panel {
   border-top: 1px solid var(--line);
   padding-top: 1rem;
@@ -1149,8 +1177,25 @@ td span {
 }
 
 .similar-item p,
+.related-incident-card p,
 .comment-item p {
   margin-bottom: 0.35rem;
+}
+
+.related-incident-card {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--nvidia);
+  border-radius: 0.5rem;
+  background: #fafbf8;
+  padding: 0.85rem;
+}
+
+.related-incident-card > div {
+  min-width: 0;
 }
 
 .feedback-votes {
@@ -1654,7 +1699,10 @@ td span {
 
   .brand-logo {
     width: 7.5rem;
-    margin-bottom: 0;
+  }
+
+  .brand-mark {
+    margin: -0.25rem 0 -0.25rem -0.25rem;
   }
 
   .content-grid,
@@ -1701,5 +1749,13 @@ td span {
     inset: 0;
     width: 100vw;
     border-radius: 0;
+  }
+
+  .workspace::before {
+    inset: 0;
+  }
+
+  .related-incident-card {
+    flex-direction: column;
   }
 }
