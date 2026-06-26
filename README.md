@@ -37,7 +37,7 @@ flowchart TD
   AM[Alertmanager] -->|webhook| BE[Backend API]
   FE[Frontend] <-->|REST + SSE| BE
   BE -->|/analyze / chat| AG[Agent API]
-  BE <-->|incidents alerts feedback embeddings| DB[(PostgreSQL + JSONB vectors)]
+  BE <-->|incidents alerts feedback embeddings| DB[(PostgreSQL + pgvector / JSONB fallback)]
 
   subgraph "NeMo Agent Toolkit workflow"
     ORCH[Parallel evidence orchestration]
@@ -279,10 +279,15 @@ instead, set `secrets.databaseExistingSecret`.
 Bundled Postgres usernames, passwords, and database names are URL-encoded when
 the chart generates `DATABASE_URL` / `POSTGRES_DSN`; externally supplied DSNs in
 `secrets.databaseUrl`, `secrets.postgresDsn`, or existing Secrets should already
-be valid Postgres URLs. The default bundled image is `postgres:16-alpine`, so do
-not treat it as a pgvector image. If pgvector is unavailable, the backend logs
-`pgvector=unavailable, fallback=jsonb` and continues to serve similar-incident
-search from JSONB sparse vectors in `incident_embeddings.vector_json`.
+be valid Postgres URLs. The default bundled image is `pgvector/pgvector:pg16`,
+which ships the pgvector extension preinstalled, so the bundled database serves
+real vector search out of the box. When pgvector is available the backend adds an
+`embedding vector(384)` column with an HNSW cosine index and runs similar-incident
+search inside Postgres with the `<=>` cosine operator. If pgvector is unavailable
+(for example when pointing at an external Postgres without the extension), the
+backend logs `pgvector=unavailable, fallback=jsonb` and continues to serve
+similar-incident search from JSONB sparse vectors in
+`incident_embeddings.vector_json` using in-process cosine similarity.
 
 The Agent uses read-only cluster-wide RBAC by default so it can inspect target
 pods, Run:ai control-plane namespaces, and node context. To limit it to selected
@@ -368,12 +373,17 @@ When `DATABASE_URL` is configured, the backend creates and uses `incidents`,
 `analysis_runs`. Comments and chat requests that explicitly ask for analysis
 create separate analysis runs, so the Analysis Dashboard can track them without
 overwriting the original RCA. On startup it logs `pgvector=enabled` when
-`CREATE EXTENSION vector` succeeds. If the pgvector extension is not available,
-the backend still stores sparse text vectors in JSONB and serves
-similar-incident search. When `POSTGRES_DSN` is configured, the Postgres agent
-checks connectivity, active connections, long-running transactions, pgvector
-availability, and expected RCA table presence. If it is not configured, the
-agent marks Postgres evidence as unavailable without blocking the rest of the
+`CREATE EXTENSION vector` succeeds, then adds a dense `embedding vector(384)`
+column and an HNSW cosine index to `incident_embeddings`. Dense vectors are
+derived deterministically from incident text with signed feature hashing (no
+embedding model dependency, so the backend stays self-contained next to the
+agent), and free-text memory search runs in Postgres via the pgvector `<=>`
+cosine operator. If the pgvector extension is not available, the backend still
+stores sparse text vectors in JSONB and serves similar-incident search with
+in-process cosine similarity. When `POSTGRES_DSN` is configured, the Postgres
+agent checks connectivity, active connections, long-running transactions,
+pgvector availability, and expected RCA table presence. If it is not configured,
+the agent marks Postgres evidence as unavailable without blocking the rest of the
 RCA.
 
 Sensitive values are redacted before evidence is returned to the backend or

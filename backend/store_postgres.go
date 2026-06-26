@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
+	"math"
 	"strings"
 	"time"
 
@@ -180,7 +182,32 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			return pgvectorReady
 		}
 	}
+	if pgvectorReady {
+		s.ensureVectorColumn(ctx)
+	}
 	return pgvectorReady
+}
+
+// ensureVectorColumn adds the dense pgvector column and a cosine index used by
+// similarity search. It runs only when the extension is available and is
+// deliberately non-fatal: if the column or index cannot be created (e.g. an
+// older pgvector without HNSW), the backend keeps the JSONB sparse vectors and
+// in-process cosine fallback rather than failing startup.
+func (s *Store) ensureVectorColumn(ctx context.Context) {
+	statements := []string{
+		fmt.Sprintf(
+			`ALTER TABLE incident_embeddings ADD COLUMN IF NOT EXISTS embedding vector(%d)`,
+			embeddingDim,
+		),
+		`CREATE INDEX IF NOT EXISTS idx_embeddings_vector
+			ON incident_embeddings USING hnsw (embedding vector_cosine_ops)`,
+	}
+	for _, statement := range statements {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			log.Printf("pgvector column/index setup skipped: %v", err)
+			return
+		}
+	}
 }
 
 func (s *Store) loadDatabaseState(ctx context.Context) {
@@ -326,6 +353,80 @@ func (s *Store) loadMemories(ctx context.Context) {
 		}
 		s.memories[memory.IncidentID] = &memory
 	}
+}
+
+// dbSearchMemory runs the free-text similarity search inside Postgres using the
+// pgvector cosine distance operator (`<=>`) against the dense `embedding`
+// column, then enriches each hit with feedback metadata held in memory. It
+// returns (results, true) when pgvector served the query, or (nil, false) to
+// signal the caller to fall back to the in-process sparse-vector search (when
+// the extension is unavailable or the query errors).
+func (s *Store) dbSearchMemory(query string, limit int) ([]SimilarIncident, bool) {
+	if s.db == nil || !s.dbReady || !s.pgvectorReady {
+		return nil, false
+	}
+	literal := embeddingLiteral(denseEmbedding(query))
+	rows, err := s.db.QueryContext(
+		context.Background(),
+		`SELECT incident_id, alert_id, title, severity, status, analysis_summary,
+		        analysis_detail, labels, created_at, (embedding <=> $1::vector) AS distance
+		   FROM incident_embeddings
+		  WHERE embedding IS NOT NULL
+		  ORDER BY embedding <=> $1::vector
+		  LIMIT $2`,
+		literal, limit,
+	)
+	if err != nil {
+		log.Printf("pgvector similarity search failed, falling back to jsonb: %v", err)
+		return nil, false
+	}
+	defer rows.Close()
+	results := make([]SimilarIncident, 0, limit)
+	for rows.Next() {
+		var item SimilarIncident
+		var detail string
+		var labelsRaw []byte
+		var distance float64
+		if err := rows.Scan(
+			&item.IncidentID,
+			&item.AlertID,
+			&item.Title,
+			&item.Severity,
+			&item.Status,
+			&item.AnalysisSummary,
+			&detail,
+			&labelsRaw,
+			&item.CreatedAt,
+			&distance,
+		); err != nil {
+			log.Printf("Failed to scan pgvector search row: %v", err)
+			return nil, false
+		}
+		similarity := 1 - distance
+		if similarity <= 0.05 {
+			continue
+		}
+		_ = json.Unmarshal(labelsRaw, &item.Labels)
+		if item.Labels == nil {
+			item.Labels = map[string]string{}
+		}
+		item.Similarity = math.Round(similarity*1000) / 1000
+		item.AnalysisDetail = excerpt(detail, 900)
+		results = append(results, item)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("pgvector similarity search iteration failed: %v", err)
+		return nil, false
+	}
+	s.mu.RLock()
+	for i := range results {
+		summary := s.feedbackSummaryLocked("incident", results[i].IncidentID)
+		results[i].PositiveFeedback = summary.Positive
+		results[i].NegativeFeedback = summary.Negative
+		results[i].CommentCount = len(summary.Comments)
+	}
+	s.mu.RUnlock()
+	return results, true
 }
 
 func (s *Store) loadFeedback(ctx context.Context) {
@@ -540,6 +641,40 @@ func (s *Store) persistMemoryLocked(memory *IncidentMemory) {
 	if s.db == nil || !s.dbReady || memory == nil {
 		return
 	}
+	if s.pgvectorReady {
+		_, err := s.db.ExecContext(
+			context.Background(),
+			`INSERT INTO incident_embeddings (
+				incident_id, alert_id, title, severity, status, analysis_summary,
+				analysis_detail, labels, vector_json, embedding, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::vector, $11, now())
+			ON CONFLICT (incident_id) DO UPDATE SET
+				alert_id = EXCLUDED.alert_id,
+				title = EXCLUDED.title,
+				severity = EXCLUDED.severity,
+				status = EXCLUDED.status,
+				analysis_summary = EXCLUDED.analysis_summary,
+				analysis_detail = EXCLUDED.analysis_detail,
+				labels = EXCLUDED.labels,
+				vector_json = EXCLUDED.vector_json,
+				embedding = EXCLUDED.embedding,
+				updated_at = now()`,
+			memory.IncidentID,
+			memory.AlertID,
+			memory.Title,
+			memory.Severity,
+			memory.Status,
+			memory.AnalysisSummary,
+			memory.AnalysisDetail,
+			mustJSON(memory.Labels),
+			mustJSON(memory.Vector),
+			embeddingLiteral(denseEmbedding(memoryText(*memory))),
+			memory.CreatedAt,
+		)
+		if err == nil {
+			return
+		}
+		log.Printf("Failed to persist incident memory %s with pgvector, falling back to jsonb: %v", memory.IncidentID, err)
 	_, err := s.db.ExecContext(
 		context.Background(),
 		`INSERT INTO incident_embeddings (
