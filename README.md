@@ -248,13 +248,18 @@ Frequently tuned Helm values:
 
 | Value | Purpose |
 | --- | --- |
+| `nameOverride` / `fullnameOverride` | Override generated Kubernetes resource names when matching existing naming conventions |
 | `global.imageRegistry` / `imagePullSecrets` | Private registry prefix and pull secrets applied to all runtime images |
+| `{backend,agent,frontend,postgresql}.image.*` | Per-component image repository, tag, and pull policy; empty tags default to the chart app version |
+| `{backend,agent,frontend}.replicaCount` | Scale stateless runtime components; keep the bundled Postgres at one replica |
+| `{backend,agent,frontend,postgresql}.resources` | CPU/memory requests and limits for production scheduling |
 | `backend.env.agentUrl` | Override Backend-to-Agent URL when the Agent is external or remote |
 | `backend.env.language` / `agent.env.language` | Set RCA language to `en` or `ko` |
 | `backend.env.databaseConnectTimeoutSeconds` | Backend startup timeout for the Postgres store connection |
 | `secrets.keys.*` | Existing Secret key names for DB, Run:ai, and NVIDIA credentials |
 | `secrets.existingSecret` | Existing Secret for Run:ai/NVIDIA credentials and, by default, DB keys |
 | `secrets.databaseExistingSecret` | Existing Secret used only for `DATABASE_URL` / `POSTGRES_DSN` |
+| `postgresql.enabled` / `postgresql.auth.*` | Install the bundled Postgres and set its generated DSN user, password, and database |
 | `agent.rbac.clusterWide` | Use a ClusterRole for Kubernetes evidence collection; default `true` |
 | `agent.rbac.namespaces` | Namespaces that receive Role/RoleBinding when `agent.rbac.clusterWide=false`; defaults to the release namespace |
 | `agent.env.kubernetesNamespaces` | Agent-side Kubernetes namespace allowlist; when empty and `clusterWide=false`, Helm derives it from `agent.rbac.namespaces` |
@@ -282,7 +287,9 @@ Frequently tuned Helm values:
 | `priorityClassName` / `topologySpreadConstraints` / `nodeSelector` / `affinity` / `tolerations` | Global scheduling policy for all pods |
 | `{backend,agent,frontend,postgresql}.priorityClassName` / `.topologySpreadConstraints` | Component-specific priority and spread scheduling overrides |
 | `{backend,agent,frontend,postgresql}.nodeSelector` / `.affinity` / `.tolerations` | Component-specific node placement overrides; fall back to the global scheduling values |
+| `{backend,agent,frontend}.service.type` / `.port` | Service exposure type and port for each runtime component |
 | `{backend,agent,frontend,postgresql}.service.annotations` | Service annotations for cloud/load-balancer or mesh integrations |
+| `ingress.*` | Optional Ingress host, path, class, annotations, and TLS settings for the frontend service |
 | `{backend,agent,frontend}.readinessProbe` / `.livenessProbe` | HTTP probe overrides for each service |
 | `postgresql.readinessProbe` / `postgresql.livenessProbe` | Bundled Postgres probe overrides; empty values use a `pg_isready` default based on `postgresql.auth.username` |
 | `postgresql.persistence.*` | PVC enablement, storage class, and size for bundled Postgres |
