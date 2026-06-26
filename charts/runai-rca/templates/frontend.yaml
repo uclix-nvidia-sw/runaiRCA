@@ -4,6 +4,9 @@
 {{- $securityContext := default .Values.securityContext .Values.frontend.securityContext -}}
 {{- $priorityClassName := default .Values.priorityClassName .Values.frontend.priorityClassName -}}
 {{- $topologySpreadConstraints := default .Values.topologySpreadConstraints .Values.frontend.topologySpreadConstraints -}}
+{{- $nodeSelector := default .Values.nodeSelector .Values.frontend.nodeSelector -}}
+{{- $affinity := default .Values.affinity .Values.frontend.affinity -}}
+{{- $tolerations := default .Values.tolerations .Values.frontend.tolerations -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -82,15 +85,15 @@ spec:
         - name: frontend-config
           configMap:
             name: {{ include "runai-rca.frontend.fullname" . }}
-      {{- with .Values.nodeSelector }}
+      {{- with $nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- with $affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.tolerations }}
+      {{- with $tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}

@@ -4,6 +4,9 @@
 {{- $securityContext := default .Values.securityContext .Values.backend.securityContext -}}
 {{- $priorityClassName := default .Values.priorityClassName .Values.backend.priorityClassName -}}
 {{- $topologySpreadConstraints := default .Values.topologySpreadConstraints .Values.backend.topologySpreadConstraints -}}
+{{- $nodeSelector := default .Values.nodeSelector .Values.backend.nodeSelector -}}
+{{- $affinity := default .Values.affinity .Values.backend.affinity -}}
+{{- $tolerations := default .Values.tolerations .Values.backend.tolerations -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -91,15 +94,15 @@ spec:
           {{- end }}
           resources:
             {{- toYaml .Values.backend.resources | nindent 12 }}
-      {{- with .Values.nodeSelector }}
+      {{- with $nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- with $affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.tolerations }}
+      {{- with $tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}

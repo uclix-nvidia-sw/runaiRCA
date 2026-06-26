@@ -278,13 +278,13 @@ Frequently tuned Helm values:
 | `{backend,agent,frontend,postgresql}.podAnnotations` / `.podLabels` | Component-specific pod metadata merged over global metadata |
 | `podSecurityContext` / `securityContext` | Global pod and container security contexts |
 | `{backend,agent,frontend,postgresql}.podSecurityContext` / `.securityContext` | Component-specific pod and container security contexts |
-| `priorityClassName` / `topologySpreadConstraints` | Global scheduling policy for all pods |
-| `{backend,agent,frontend,postgresql}.priorityClassName` / `.topologySpreadConstraints` | Component-specific scheduling policy overrides |
+| `priorityClassName` / `topologySpreadConstraints` / `nodeSelector` / `affinity` / `tolerations` | Global scheduling policy for all pods |
+| `{backend,agent,frontend,postgresql}.priorityClassName` / `.topologySpreadConstraints` | Component-specific priority and spread scheduling overrides |
+| `{backend,agent,frontend,postgresql}.nodeSelector` / `.affinity` / `.tolerations` | Component-specific node placement overrides; fall back to the global scheduling values |
 | `{backend,agent,frontend,postgresql}.service.annotations` | Service annotations for cloud/load-balancer or mesh integrations |
 | `{backend,agent,frontend}.readinessProbe` / `.livenessProbe` | HTTP probe overrides for each service |
 | `postgresql.readinessProbe` / `postgresql.livenessProbe` | Bundled Postgres probe overrides; empty values use a `pg_isready` default based on `postgresql.auth.username` |
 | `postgresql.persistence.*` | PVC enablement, storage class, and size for bundled Postgres |
-| `postgresql.nodeSelector` / `.affinity` / `.tolerations` | Bundled Postgres scheduling overrides; fall back to the global scheduling values |
 
 For annotation keys that contain dots or slashes, prefer a small values file. If
 you use `--set`, escape dots and use `--set-string`, for example:

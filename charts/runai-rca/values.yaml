@@ -81,6 +81,9 @@ backend:
   automountServiceAccountToken: false
   priorityClassName: ""
   topologySpreadConstraints: []
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
   readinessProbe:
     httpGet:
       path: /healthz
@@ -149,6 +152,9 @@ agent:
   automountServiceAccountToken: true
   priorityClassName: ""
   topologySpreadConstraints: []
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
   readinessProbe:
     httpGet:
       path: /healthz
@@ -180,6 +186,9 @@ frontend:
   automountServiceAccountToken: false
   priorityClassName: ""
   topologySpreadConstraints: []
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
   readinessProbe:
     httpGet:
       path: /

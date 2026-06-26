@@ -4,6 +4,9 @@
 {{- $securityContext := default .Values.securityContext .Values.agent.securityContext -}}
 {{- $priorityClassName := default .Values.priorityClassName .Values.agent.priorityClassName -}}
 {{- $topologySpreadConstraints := default .Values.topologySpreadConstraints .Values.agent.topologySpreadConstraints -}}
+{{- $nodeSelector := default .Values.nodeSelector .Values.agent.nodeSelector -}}
+{{- $affinity := default .Values.affinity .Values.agent.affinity -}}
+{{- $tolerations := default .Values.tolerations .Values.agent.tolerations -}}
 {{- $rbacNamespaces := default (list .Release.Namespace) .Values.agent.rbac.namespaces -}}
 {{- $kubernetesNamespaces := .Values.agent.env.kubernetesNamespaces -}}
 {{- if and (not .Values.agent.rbac.clusterWide) (not $kubernetesNamespaces) -}}
@@ -173,15 +176,15 @@ spec:
           {{- end }}
           resources:
             {{- toYaml .Values.agent.resources | nindent 12 }}
-      {{- with .Values.nodeSelector }}
+      {{- with $nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- with $affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.tolerations }}
+      {{- with $tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
