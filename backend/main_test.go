@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -328,6 +329,33 @@ func TestFeedbackAndSimilarIncidentMemory(t *testing.T) {
 	search := store.SearchIncidentMemory("gpu quota saturated scheduling", 5)
 	if len(search) == 0 || search[0].IncidentID != priorIncident.IncidentID {
 		t.Fatalf("expected embedding search to return prior incident, got %+v", search)
+	}
+}
+
+func TestDenseEmbeddingIsDeterministicAndNormalized(t *testing.T) {
+	text := "Run:AI GPU quota saturated scheduling blocked"
+	a := denseEmbedding(text)
+	b := denseEmbedding(text)
+	if len(a) != embeddingDim {
+		t.Fatalf("expected embedding dimension %d, got %d", embeddingDim, len(a))
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			t.Fatalf("embedding is not deterministic at index %d: %v vs %v", i, a[i], b[i])
+		}
+	}
+	var norm float64
+	for _, v := range a {
+		norm += float64(v) * float64(v)
+	}
+	if math.Abs(norm-1) > 1e-5 {
+		t.Fatalf("embedding should be L2-normalized, got norm^2=%v", norm)
+	}
+	if literal := embeddingLiteral(a); literal[0] != '[' || literal[len(literal)-1] != ']' {
+		t.Fatalf("embedding literal must be bracketed for pgvector, got %q", literal)
+	}
+	if empty := denseEmbedding(""); len(empty) != embeddingDim {
+		t.Fatalf("empty text should still yield a zero vector of the right dim, got %d", len(empty))
 	}
 }
 

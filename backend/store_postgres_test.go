@@ -34,6 +34,13 @@ func TestPostgresConnectReportsPGVectorEnabledAndLoadsState(t *testing.T) {
 		!state.executed("CREATE TABLE IF NOT EXISTS incident_embeddings") {
 		t.Fatalf("expected pgvector extension and embeddings schema statements, got %+v", state.execs)
 	}
+	if !state.executed("ADD COLUMN IF NOT EXISTS embedding vector(") ||
+		!state.executed("USING hnsw (embedding vector_cosine_ops)") {
+		t.Fatalf("expected pgvector column and cosine index DDL, got %+v", state.execs)
+	}
+	if health := store.databaseHealth(); health["similarity_search"] != similaritySearchPGVector {
+		t.Fatalf("expected pgvector cosine search path, got %+v", health)
+	}
 
 	assertLoadedPostgresMemory(t, store)
 }
@@ -205,6 +212,18 @@ func (c *fakePostgresConn) QueryContext(_ context.Context, query string, _ []dri
 func (s *fakePostgresState) rowsFor(query string) driver.Rows {
 	lowered := strings.ToLower(query)
 	switch {
+	case strings.Contains(lowered, "<=>"):
+		return &fakeRows{
+			columns: []string{
+				"incident_id", "alert_id", "title", "severity", "status",
+				"analysis_summary", "analysis_detail", "labels", "created_at", "distance",
+			},
+			values: [][]driver.Value{{
+				"INC-db", "ALR-db", "Prior GPU quota saturation", "warning", "firing",
+				"Run:AI queue gpu-a was saturated.", "GPU quota blocked scheduling.",
+				s.labelsJSON, s.now, float64(0.1),
+			}},
+		}
 	case strings.Contains(lowered, "from incidents"):
 		return &fakeRows{
 			columns: []string{"incident_id", "correlation_key", "title", "severity", "status", "fired_at", "resolved_at", "alert_count"},

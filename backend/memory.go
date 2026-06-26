@@ -2,11 +2,20 @@ package main
 
 import (
 	"fmt"
+	"hash/fnv"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// embeddingDim is the fixed dimensionality of the dense vectors stored in the
+// pgvector `embedding` column. The backend has no embedding model dependency
+// (it must run offline next to the NeMo agent), so dense vectors are produced
+// deterministically from text with the feature-hashing trick. Changing this
+// value invalidates previously persisted vectors of a different dimension.
+const embeddingDim = 384
 
 type IncidentMemory struct {
 	IncidentID      string
@@ -77,6 +86,9 @@ func (s *Store) SearchIncidentMemory(query string, limit int) []SimilarIncident 
 	}
 	if limit > 20 {
 		limit = 20
+	}
+	if results, ok := s.dbSearchMemory(query, limit); ok {
+		return results
 	}
 	queryVector := textVector(query)
 	s.mu.RLock()
@@ -326,6 +338,57 @@ func textVector(text string) map[string]float64 {
 		vector[token]++
 	}
 	return vector
+}
+
+// denseEmbedding maps free text to a fixed-dimension dense vector using signed
+// feature hashing (Weinberger et al.). Each token is hashed to a dimension and a
+// sign, so token counts accumulate into a dense vector whose inner products are
+// unbiased estimates of the sparse bag-of-words inner products. The result is
+// L2-normalized so pgvector cosine distance (`<=>`) is a meaningful similarity.
+// It is deterministic and requires no model, keeping the backend self-contained.
+func denseEmbedding(text string) []float32 {
+	vector := make([]float32, embeddingDim)
+	for _, token := range tokenize(text) {
+		h := fnv.New64a()
+		_, _ = h.Write([]byte(token))
+		sum := h.Sum64()
+		idx := sum % embeddingDim
+		if sum&(1<<63) != 0 {
+			vector[idx]--
+		} else {
+			vector[idx]++
+		}
+	}
+	var norm float64
+	for _, v := range vector {
+		norm += float64(v) * float64(v)
+	}
+	if norm == 0 {
+		return vector
+	}
+	inv := float32(1 / math.Sqrt(norm))
+	for i := range vector {
+		vector[i] *= inv
+	}
+	return vector
+}
+
+// embeddingLiteral renders a dense vector in the textual form pgvector accepts
+// for a `vector` value, e.g. "[0.1,0.2,...]".
+func embeddingLiteral(vector []float32) string {
+	if len(vector) == 0 {
+		return "[]"
+	}
+	var b strings.Builder
+	b.WriteByte('[')
+	for i, v := range vector {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(strconv.FormatFloat(float64(v), 'f', 6, 32))
+	}
+	b.WriteByte(']')
+	return b.String()
 }
 
 func tokenize(text string) []string {

@@ -15,6 +15,7 @@ const (
 	pgvectorStatusEnabled     = "enabled"
 	pgvectorStatusUnavailable = "unavailable"
 	vectorFallbackJSONB       = "jsonb"
+	similaritySearchPGVector  = "pgvector_cosine"
 	similaritySearchJSONB     = "jsonb_sparse_vectors"
 	similaritySearchMemory    = "in_memory_sparse_vectors"
 )
@@ -81,6 +82,9 @@ func (s *Store) databaseHealth() map[string]any {
 	}
 	if s.dbReady {
 		health["similarity_search"] = similaritySearchJSONB
+	}
+	if s.pgvectorReady {
+		health["similarity_search"] = similaritySearchPGVector
 	}
 	if s.dbReady && !s.pgvectorReady {
 		health["fallback"] = vectorFallbackJSONB
