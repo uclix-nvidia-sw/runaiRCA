@@ -38,6 +38,7 @@ type Store struct {
 	db             *sql.DB
 	dbReady        bool
 	pgvectorReady  bool
+	pgvectorDetail string
 }
 
 func NewStore() *Store {
@@ -88,6 +89,9 @@ func (s *Store) databaseHealth() map[string]any {
 	}
 	if s.dbReady && !s.pgvectorReady {
 		health["fallback"] = vectorFallbackJSONB
+		if s.pgvectorDetail != "" {
+			health["pgvector_detail"] = s.pgvectorDetail
+		}
 	}
 	return health
 }
