@@ -895,7 +895,7 @@ function useDashboardData() {
       setAnalysisRuns([]);
       setDataState('backend-down');
       const message = err instanceof Error ? err.message : 'Failed to load dashboard data.';
-      setError(ENABLE_MOCK_DATA ? `Backend unavailable, showing mock data: ${message}` : message);
+      setError(ENABLE_MOCK_DATA ? '' : message);
     } finally {
       setLoading(false);
     }
@@ -1378,7 +1378,7 @@ function OperationsView({
           label="Analyzing"
           value={alerts.filter((alert) => alert.is_analyzing).length + incidents.filter((i) => i.is_analyzing).length}
         />
-        <Metric label="Postgres agent" value="Ready" />
+        <Metric label="Resolved incidents" value={incidents.filter((i) => i.status === 'resolved').length} />
       </section>
 
       <section className="content-grid">
@@ -1575,7 +1575,7 @@ function AnalysisDashboard({
                     {COMPONENT_AGENT_ORDER.map((agent) => (
                       <span className={`coverage-pill coverage-${record.capabilities[agent] || 'pending'}`} key={agent}>
                         {agentIcon(agent)}
-                        {agentLabel(agent)}
+                        <span className="coverage-label">{agentLabel(agent)}</span>
                         <strong>{record.capabilities[agent] || 'pending'}</strong>
                       </span>
                     ))}

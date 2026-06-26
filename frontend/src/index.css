@@ -16,6 +16,14 @@
   --pressed-soft: #eef2e8;
   --danger: #dc2626;
   --warning: #b7791f;
+  --space-1: 0.375rem;
+  --space-2: 0.625rem;
+  --space-3: 0.875rem;
+  --space-4: 1.25rem;
+  --space-5: 1.75rem;
+  --space-6: 2.25rem;
+  --radius: 0.55rem;
+  line-height: 1.55;
 }
 
 * {
@@ -26,6 +34,7 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+  line-height: 1.55;
 }
 
 button,
@@ -45,7 +54,6 @@ button:disabled {
 button,
 .nav-item,
 tbody tr td,
-	.brand-mark,
 	.agent-toggle,
 	.analysis-card,
 	.vote-button,
@@ -62,7 +70,6 @@ tbody tr td,
 
 button:not(:disabled):active,
 .nav-item:active,
-	.brand-mark:active,
 	.agent-toggle:active,
 	.analysis-card:active,
 	.editor-tool:active,
@@ -101,8 +108,12 @@ button:not(:disabled):active,
   margin: -0.25rem 0 1rem -0.25rem;
 }
 
-.brand-mark:hover {
-  background: var(--surface-soft);
+.brand-mark:hover,
+.brand-mark:focus,
+.brand-mark:active,
+.brand-mark:not(:disabled):active {
+  background: transparent;
+  transform: none;
 }
 
 .brand-logo {
@@ -112,11 +123,11 @@ button:not(:disabled):active,
 }
 
 .eyebrow {
-  margin: 0 0 0.25rem;
+  margin: 0 0 0.35rem;
   color: var(--nvidia-dark);
   font-size: 0.72rem;
-  font-weight: 800;
-  letter-spacing: 0;
+  font-weight: 750;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
 }
 
@@ -160,7 +171,7 @@ h2 {
 }
 
 .main {
-  padding: 1.25rem;
+  padding: 1.5rem;
   min-width: 0;
 }
 
@@ -169,7 +180,7 @@ h2 {
   grid-template-columns: minmax(14rem, 1fr) minmax(18rem, 32rem) auto;
   gap: 1rem;
   align-items: center;
-  margin-bottom: 1rem;
+  margin-bottom: 1.25rem;
 }
 
 .search-box {
@@ -192,8 +203,8 @@ h2 {
 .metric-row {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 0.75rem;
-  margin-bottom: 1rem;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
 }
 
 .metric {
@@ -201,7 +212,7 @@ h2 {
   border: 1px solid var(--line);
   border-left: 4px solid var(--nvidia);
   border-radius: 0.5rem;
-  padding: 0.95rem;
+  padding: 1.1rem 1.15rem;
 }
 
 .metric span {
@@ -219,7 +230,7 @@ h2 {
 .content-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
-  gap: 1rem;
+  gap: 1.25rem;
   align-items: start;
 }
 
@@ -244,7 +255,7 @@ h2 {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 0.9rem 1rem;
+  padding: 1rem 1.15rem;
   border-bottom: 1px solid var(--line);
 }
 
@@ -260,23 +271,24 @@ h2 {
 table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 0.9rem;
+  font-size: 0.92rem;
 }
 
 th {
   text-align: left;
   color: var(--muted);
-  font-size: 0.73rem;
+  font-size: 0.76rem;
+  font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0;
+  letter-spacing: 0.04em;
   background: #fafbf8;
   border-bottom: 1px solid var(--line);
-  padding: 0.7rem 0.85rem;
+  padding: 0.75rem 1rem;
 }
 
 td {
   border-bottom: 1px solid var(--line);
-  padding: 0.8rem 0.85rem;
+  padding: 0.9rem 1rem;
   vertical-align: top;
 }
 
@@ -344,8 +356,8 @@ tbody tr:active td {
 td span {
   display: block;
   color: var(--muted);
-  font-size: 0.78rem;
-  margin-top: 0.15rem;
+  font-size: 0.8rem;
+  margin-top: 0.2rem;
 }
 
 .severity,
@@ -357,6 +369,7 @@ td span {
   border-radius: 999px;
   font-size: 0.75rem;
   font-weight: 800;
+  white-space: nowrap;
   border: 1px solid var(--line);
   text-transform: capitalize;
 }
@@ -526,11 +539,11 @@ td span {
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 0.45rem;
+  gap: 0.5rem;
   background: #ffffff;
   border: 1px solid var(--line);
   border-radius: 0.5rem;
-  padding: 0.55rem 0.6rem;
+  padding: 0.65rem 0.75rem;
   min-height: 3rem;
 }
 
@@ -685,16 +698,16 @@ td span {
 .analysis-insight-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 1rem;
-  margin-bottom: 1rem;
+  gap: 1.15rem;
+  margin-bottom: 1.25rem;
 }
 
 .distribution-list,
 .top-dimension-list,
 .readiness-list {
   display: grid;
-  gap: 0.65rem;
-  padding: 0.85rem;
+  gap: 0.8rem;
+  padding: 1rem;
 }
 
 .distribution-row,
@@ -718,8 +731,8 @@ td span {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: #344054;
-  font-size: 0.82rem;
-  font-weight: 750;
+  font-size: 0.84rem;
+  font-weight: 650;
 }
 
 .distribution-row > div,
@@ -770,8 +783,8 @@ td span {
 
 .analysis-list {
   display: grid;
-  gap: 0.7rem;
-  padding: 0.8rem;
+  gap: 0.85rem;
+  padding: 1rem;
 }
 
 .recent-analysis-panel .analysis-list {
@@ -783,7 +796,7 @@ td span {
   border: 1px solid var(--line);
   border-radius: 0.5rem;
   background: #ffffff;
-  padding: 0.8rem;
+  padding: 1rem;
 }
 
 .analysis-card:hover {
@@ -853,32 +866,42 @@ td span {
 .coverage-strip {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr));
-  gap: 0.4rem;
-  margin-bottom: 0.65rem;
+  gap: 0.55rem;
+  margin-bottom: 0.85rem;
 }
 
 .coverage-pill {
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 0.35rem;
+  gap: 0.4rem;
   border: 1px solid var(--line);
   border-radius: 0.45rem;
   background: #f8fafc;
-  padding: 0.45rem 0.5rem;
+  padding: 0.5rem 0.6rem;
   color: #344054;
   font-size: 0.78rem;
-  font-weight: 700;
+  font-weight: 650;
 }
 
 .coverage-pill svg {
   flex: 0 0 auto;
 }
 
+.coverage-label {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .coverage-pill strong {
+  flex: 0 0 auto;
   margin-left: auto;
   color: var(--muted);
   font-size: 0.72rem;
+  white-space: nowrap;
   text-transform: capitalize;
 }
 
@@ -900,8 +923,8 @@ td span {
 .analysis-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 0.45rem;
-  margin-bottom: 0.65rem;
+  gap: 0.6rem;
+  margin-bottom: 0.85rem;
 }
 
 .analysis-grid span {
@@ -911,10 +934,10 @@ td span {
   border: 1px solid var(--line);
   border-radius: 0.45rem;
   background: #fafafa;
-  padding: 0.5rem 0.6rem;
+  padding: 0.6rem 0.7rem;
   color: var(--muted);
-  font-size: 0.78rem;
-  font-weight: 700;
+  font-size: 0.8rem;
+  font-weight: 650;
 }
 
 .analysis-grid strong {
@@ -986,7 +1009,7 @@ td span {
   justify-content: space-between;
   align-items: flex-start;
   gap: 0.75rem;
-  padding: 0.55rem 0.85rem;
+  padding: 0.85rem 1.1rem;
   border-bottom: 1px solid var(--line);
   background: #ffffff;
 }
@@ -1054,7 +1077,7 @@ td span {
 
 .workspace-body {
   overflow: auto;
-  padding: 0.9rem;
+  padding: 1.15rem;
   background: #ffffff;
 }
 
@@ -1110,7 +1133,7 @@ td span {
   gap: 0.5rem;
   color: #1f2937;
   font-weight: 850;
-  margin-bottom: 0.75rem;
+  margin-bottom: 0.9rem;
 }
 
 .rca-report h2,
@@ -1202,8 +1225,8 @@ td span {
 .evidence-list,
 .agent-registry {
   display: grid;
-  gap: 0.85rem;
-  padding: 1rem;
+  gap: 1rem;
+  padding: 1.15rem;
 }
 
 .evidence-card,
@@ -1211,7 +1234,7 @@ td span {
   border: 1px solid var(--line);
   border-radius: 0.5rem;
   background: #ffffff;
-  padding: 0.9rem;
+  padding: 1.1rem;
 }
 
 .evidence-card-head,
@@ -1919,6 +1942,17 @@ td span {
 
 .chat-compose .primary-button {
   min-height: 2.5rem;
+}
+
+@media (max-width: 1400px) {
+  .analysis-insight-grid,
+  .analysis-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .analysis-pipeline {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
 }
 
 @media (min-width: 1101px) {
