@@ -87,7 +87,7 @@ func (s *Store) SearchIncidentMemory(query string, limit int) []SimilarIncident 
 	if limit > 20 {
 		limit = 20
 	}
-	if results, ok := s.dbSearchMemory(query, limit); ok {
+	if results, ok := s.dbSearchMemory(query, limit); ok && len(results) > 0 {
 		return results
 	}
 	queryVector := textVector(query)
