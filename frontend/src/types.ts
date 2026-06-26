@@ -105,7 +105,7 @@ export type AlertRecord = {
   missing_data: string[];
   warnings: string[];
   artifacts: Artifact[];
-  similar_incidents?: SimilarIncident[];
+  similar_incidents: SimilarIncident[];
   feedback: FeedbackSummary;
   is_analyzing: boolean;
 };
@@ -118,7 +118,7 @@ export type IncidentDetail = Incident & {
   missing_data: string[];
   warnings: string[];
   artifacts: Artifact[];
-  similar_incidents?: SimilarIncident[];
+  similar_incidents: SimilarIncident[];
   feedback: FeedbackSummary;
   alerts: AlertRecord[];
 };

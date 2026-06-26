@@ -71,6 +71,16 @@ type DetailState =
   | { kind: 'alert'; data: AlertRecord }
   | null;
 
+type RealtimeEventPayload = {
+  type?: string;
+  data?: {
+    target_type?: 'incident' | 'alert';
+    target_id?: string;
+    incident_id?: string;
+    alert_id?: string;
+  };
+};
+
 type EditorTab = 'write' | 'preview';
 type MainView = 'operations' | 'analysis' | 'evidence' | 'agents';
 
@@ -704,6 +714,34 @@ function isMockDetail(detail: DetailState) {
   return id.startsWith('MOCK-');
 }
 
+function parseRealtimeEvent(event: Event): RealtimeEventPayload | undefined {
+  if (!(event instanceof MessageEvent) || typeof event.data !== 'string') return undefined;
+  try {
+    return JSON.parse(event.data) as RealtimeEventPayload;
+  } catch {
+    return undefined;
+  }
+}
+
+function realtimeEventMatchesDetail(detail: DetailState, payload: RealtimeEventPayload | undefined) {
+  if (!detail || !payload?.data) return false;
+  const data = payload.data;
+  if (detail.kind === 'incident') {
+    const incidentID = detail.data.incident_id;
+    return (
+      data.incident_id === incidentID ||
+      (data.target_type === 'incident' && data.target_id === incidentID) ||
+      detail.data.alerts.some((alert) => data.alert_id === alert.alert_id || (data.target_type === 'alert' && data.target_id === alert.alert_id))
+    );
+  }
+  const alertID = detail.data.alert_id;
+  return (
+    data.alert_id === alertID ||
+    (data.target_type === 'alert' && data.target_id === alertID) ||
+    (data.target_type === 'incident' && data.target_id === detail.data.incident_id)
+  );
+}
+
 function useEditorHistory(initialValue = '') {
   const [value, setValue] = useState(initialValue);
   const historyRef = useRef<string[]>([initialValue]);
@@ -786,26 +824,6 @@ function App() {
 
   useEffect(() => {
     void load();
-  }, [load]);
-
-  useEffect(() => {
-    let source: EventSource;
-    try {
-      source = eventSource();
-    } catch (err) {
-      if (!ENABLE_MOCK_DATA) {
-        const message = err instanceof Error ? err.message : 'Realtime updates are unavailable.';
-        setError(`Realtime updates are unavailable: ${message}`);
-      }
-      return undefined;
-    }
-    source.onmessage = () => void load();
-    source.addEventListener('alert.created', () => void load());
-    source.addEventListener('analysis.started', () => void load());
-    source.addEventListener('analysis.completed', () => void load());
-    source.addEventListener('incident.resolved', () => void load());
-    source.addEventListener('feedback.updated', () => void load());
-    return () => source.close();
   }, [load]);
 
   const hasLiveData = incidents.length > 0 || alerts.length > 0 || analysisRuns.length > 0;
@@ -978,7 +996,7 @@ function App() {
     setActiveView(view);
   };
 
-  const openIncident = async (id: string) => {
+  const openIncident = useCallback(async (id: string) => {
     if (showMockData) {
       const mockDetail = mockIncidentDetail(id);
       if (mockDetail) {
@@ -987,9 +1005,9 @@ function App() {
       }
     }
     setDetail({ kind: 'incident', data: await fetchIncident(id) });
-  };
+  }, [showMockData]);
 
-  const openAlert = async (id: string) => {
+  const openAlert = useCallback(async (id: string) => {
     if (showMockData) {
       const mockAlert = mockAlertDetail(id);
       if (mockAlert) {
@@ -998,9 +1016,9 @@ function App() {
       }
     }
     setDetail({ kind: 'alert', data: await fetchAlert(id) });
-  };
+  }, [showMockData]);
 
-  const refreshDetail = async () => {
+  const refreshDetail = useCallback(async () => {
     if (!detail) return;
     if (showMockData && detail.kind === 'incident') {
       const mockDetail = mockIncidentDetail(detail.data.incident_id);
@@ -1021,7 +1039,34 @@ function App() {
       return;
     }
     setDetail({ kind: 'alert', data: await fetchAlert(detail.data.alert_id) });
-  };
+  }, [detail, showMockData]);
+
+  useEffect(() => {
+    let source: EventSource;
+    try {
+      source = eventSource();
+    } catch (err) {
+      if (!ENABLE_MOCK_DATA) {
+        const message = err instanceof Error ? err.message : 'Realtime updates are unavailable.';
+        setError(`Realtime updates are unavailable: ${message}`);
+      }
+      return undefined;
+    }
+    const handleRealtimeEvent = (event: Event) => {
+      const payload = parseRealtimeEvent(event);
+      void load();
+      if (realtimeEventMatchesDetail(detail, payload)) {
+        void refreshDetail();
+      }
+    };
+    source.onmessage = handleRealtimeEvent;
+    source.addEventListener('alert.created', handleRealtimeEvent);
+    source.addEventListener('analysis.started', handleRealtimeEvent);
+    source.addEventListener('analysis.completed', handleRealtimeEvent);
+    source.addEventListener('incident.resolved', handleRealtimeEvent);
+    source.addEventListener('feedback.updated', handleRealtimeEvent);
+    return () => source.close();
+  }, [detail, load, refreshDetail]);
 
   return (
     <div className="app-shell">

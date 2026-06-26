@@ -197,7 +197,7 @@ type AlertRecord struct {
 	MissingData      []string          `json:"missing_data"`
 	Warnings         []string          `json:"warnings"`
 	Artifacts        []Artifact        `json:"artifacts"`
-	SimilarIncidents []SimilarIncident `json:"similar_incidents,omitempty"`
+	SimilarIncidents []SimilarIncident `json:"similar_incidents"`
 	Feedback         FeedbackSummary   `json:"feedback"`
 	IsAnalyzing      bool              `json:"is_analyzing"`
 }
@@ -211,7 +211,7 @@ type IncidentDetail struct {
 	MissingData      []string          `json:"missing_data"`
 	Warnings         []string          `json:"warnings"`
 	Artifacts        []Artifact        `json:"artifacts"`
-	SimilarIncidents []SimilarIncident `json:"similar_incidents,omitempty"`
+	SimilarIncidents []SimilarIncident `json:"similar_incidents"`
 	Feedback         FeedbackSummary   `json:"feedback"`
 	Alerts           []AlertRecord     `json:"alerts"`
 }
@@ -263,11 +263,6 @@ type ChatResponse struct {
 	Response       string       `json:"response,omitempty"`
 	ConversationID string       `json:"conversation_id"`
 	AnalysisRun    *AnalysisRun `json:"analysis_run,omitempty"`
-}
-
-type Event struct {
-	Type string         `json:"type"`
-	Data map[string]any `json:"data"`
 }
 
 type Store struct {
@@ -807,6 +802,7 @@ func (s *Store) ListAlerts() []AlertRecord {
 	for _, alert := range s.alerts {
 		copied := cloneAlert(alert)
 		copied.SimilarIncidents = s.similarIncidentsLocked(alertFromRecord(*copied), alert.IncidentID, 5)
+		copied.Feedback = s.feedbackSummaryLocked("alert", alert.AlertID)
 		items = append(items, *copied)
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].FiredAt.After(items[j].FiredAt) })
@@ -946,11 +942,18 @@ func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 	}
 	detail := &IncidentDetail{Incident: *cloneIncident(incident)}
 	detail.Capabilities = map[string]string{}
+	detail.MissingData = []string{}
+	detail.Warnings = []string{}
+	detail.Artifacts = []Artifact{}
+	detail.SimilarIncidents = []SimilarIncident{}
+	detail.Alerts = []AlertRecord{}
 	for _, alert := range s.alerts {
 		if alert.IncidentID != id {
 			continue
 		}
 		copied := cloneAlert(alert)
+		copied.Feedback = s.feedbackSummaryLocked("alert", alert.AlertID)
+		copied.SimilarIncidents = s.similarIncidentsLocked(alertFromRecord(*copied), alert.IncidentID, 5)
 		detail.Alerts = append(detail.Alerts, *copied)
 		if detail.AnalysisSummary == "" && copied.AnalysisSummary != "" {
 			detail.AnalysisSummary = copied.AnalysisSummary
@@ -1418,6 +1421,12 @@ func (s *Store) targetIDsLocked(targetType string, targetID string) (string, str
 	}
 }
 
+func (s *Store) TargetIDs(targetType string, targetID string) (string, string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.targetIDsLocked(targetType, targetID)
+}
+
 func (s *Store) persistIncidentLocked(incident *Incident) {
 	if s.db == nil || !s.dbReady || incident == nil {
 		return
@@ -1694,41 +1703,6 @@ func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) {
 	}
 }
 
-type Hub struct {
-	mu      sync.Mutex
-	clients map[chan Event]struct{}
-}
-
-func NewHub() *Hub {
-	return &Hub{clients: make(map[chan Event]struct{})}
-}
-
-func (h *Hub) Subscribe() chan Event {
-	ch := make(chan Event, 16)
-	h.mu.Lock()
-	h.clients[ch] = struct{}{}
-	h.mu.Unlock()
-	return ch
-}
-
-func (h *Hub) Unsubscribe(ch chan Event) {
-	h.mu.Lock()
-	delete(h.clients, ch)
-	close(ch)
-	h.mu.Unlock()
-}
-
-func (h *Hub) Broadcast(event Event) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for ch := range h.clients {
-		select {
-		case ch <- event:
-		default:
-		}
-	}
-}
-
 type Server struct {
 	store               *Store
 	hub                 *Hub
@@ -1782,7 +1756,13 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/ping":
 		_, _ = w.Write([]byte("pong"))
 	case r.Method == http.MethodGet && r.URL.Path == "/healthz":
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status": "ok",
+			"database": map[string]bool{
+				"postgres": s.store.dbReady,
+				"pgvector": s.store.pgvectorReady,
+			},
+		})
 	case r.Method == http.MethodPost && r.URL.Path == "/webhook/alertmanager":
 		s.handleAlertmanager(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/incidents":
@@ -1808,377 +1788,19 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/chat":
 		s.handleChat(w, r)
 	default:
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
-	}
-}
-
-func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
-	var webhook AlertmanagerWebhook
-	if err := json.NewDecoder(r.Body).Decode(&webhook); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	created := 0
-	for _, alert := range webhook.Alerts {
-		incident, record := s.store.UpsertAlert(webhook, alert)
-		created++
-		s.hub.Broadcast(Event{Type: "alert.created", Data: map[string]any{
-			"incident_id": incident.IncidentID,
-			"alert_id":    record.AlertID,
-		}})
-		go s.requestAnalysis(alert, incident.IncidentID, record.AlertID, record.ThreadTS)
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted", "alerts": created})
-}
-
-func (s *Server) handleIncident(w http.ResponseWriter, r *http.Request) {
-	rest := pathPart(r.URL.Path, "/api/v1/incidents/")
-	parts := strings.Split(strings.Trim(rest, "/"), "/")
-	id := ""
-	if len(parts) > 0 {
-		id = parts[0]
-	}
-	if id == "" {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "incident id required"})
-		return
-	}
-	if len(parts) == 2 && parts[1] == "feedback" {
-		if _, ok := s.store.IncidentDetail(id); !ok {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "incident not found"})
-			return
-		}
-		s.store.mu.RLock()
-		summary := s.store.feedbackSummaryForActorLocked("incident", id, r.URL.Query().Get("feedback_author"))
-		s.store.mu.RUnlock()
-		writeJSON(w, http.StatusOK, envelope(summary))
-		return
-	}
-	if len(parts) > 1 {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown incident action"})
-		return
-	}
-	if detail, ok := s.store.IncidentDetail(id); ok {
-		if actor := r.URL.Query().Get("feedback_author"); actor != "" {
-			s.store.mu.RLock()
-			detail.Feedback = s.store.feedbackSummaryForActorLocked("incident", id, actor)
-			for i := range detail.Alerts {
-				detail.Alerts[i].Feedback = s.store.feedbackSummaryForActorLocked("alert", detail.Alerts[i].AlertID, actor)
-			}
-			s.store.mu.RUnlock()
-		}
-		writeJSON(w, http.StatusOK, envelope(detail))
-		return
-	}
-	writeJSON(w, http.StatusNotFound, map[string]string{"error": "incident not found"})
-}
-
-func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
-	rest := pathPart(r.URL.Path, "/api/v1/incidents/")
-	parts := strings.Split(strings.Trim(rest, "/"), "/")
-	if len(parts) < 2 {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown incident action"})
-		return
-	}
-	id, action := parts[0], parts[1]
-	switch action {
-	case "analyze":
-		if len(parts) != 2 || r.Method != http.MethodPost {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown incident action"})
-			return
-		}
-		detail, ok := s.store.IncidentDetail(id)
-		if !ok {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "incident not found"})
-			return
-		}
-		s.store.MarkAnalyzing(id, true)
-		for _, alert := range detail.Alerts {
-			go s.requestAnalysis(Alert{
-				Status:      alert.Status,
-				Labels:      alert.Labels,
-				Annotations: alert.Annotations,
-				Fingerprint: alert.Fingerprint,
-			}, id, alert.AlertID, alert.ThreadTS)
-		}
-		writeJSON(w, http.StatusAccepted, map[string]string{"status": "analysis_requested"})
-	case "resolve":
-		if len(parts) != 2 || r.Method != http.MethodPost {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown incident action"})
-			return
-		}
-		now := time.Now().UTC()
-		s.store.mu.Lock()
-		if incident := s.store.incidents[id]; incident != nil {
-			incident.Status = "resolved"
-			incident.ResolvedAt = &now
-			s.store.persistIncidentLocked(incident)
-			if memory := s.store.memories[id]; memory != nil {
-				memory.Status = "resolved"
-				s.store.persistMemoryLocked(memory)
-			}
-		}
-		s.store.mu.Unlock()
-		s.hub.Broadcast(Event{Type: "incident.resolved", Data: map[string]any{"incident_id": id}})
-		writeJSON(w, http.StatusOK, map[string]string{"status": "resolved"})
-	case "feedback":
-		if len(parts) != 2 || r.Method != http.MethodPost {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown incident action"})
-			return
-		}
-		s.handleFeedback(w, r, "incident", id)
-	case "vote":
-		if len(parts) != 2 || r.Method != http.MethodPost {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown incident action"})
-			return
-		}
-		s.handleFeedback(w, r, "incident", id)
-	case "comments":
-		s.handleCommentAction(w, r, "incident", id, parts)
-	default:
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown incident action"})
-	}
-}
-
-func (s *Server) handleAlert(w http.ResponseWriter, r *http.Request) {
-	rest := pathPart(r.URL.Path, "/api/v1/alerts/")
-	parts := strings.Split(strings.Trim(rest, "/"), "/")
-	id := ""
-	if len(parts) > 0 {
-		id = parts[0]
-	}
-	if len(parts) == 2 && parts[1] == "feedback" {
-		if _, ok := s.store.AlertDetail(id); !ok {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "alert not found"})
-			return
-		}
-		s.store.mu.RLock()
-		summary := s.store.feedbackSummaryForActorLocked("alert", id, r.URL.Query().Get("feedback_author"))
-		s.store.mu.RUnlock()
-		writeJSON(w, http.StatusOK, envelope(summary))
-		return
-	}
-	if len(parts) > 1 {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown alert action"})
-		return
-	}
-	if alert, ok := s.store.AlertDetail(id); ok {
-		if actor := r.URL.Query().Get("feedback_author"); actor != "" {
-			s.store.mu.RLock()
-			alert.Feedback = s.store.feedbackSummaryForActorLocked("alert", id, actor)
-			s.store.mu.RUnlock()
-		}
-		writeJSON(w, http.StatusOK, envelope(alert))
-		return
-	}
-	writeJSON(w, http.StatusNotFound, map[string]string{"error": "alert not found"})
-}
-
-func (s *Server) handleAlertAction(w http.ResponseWriter, r *http.Request) {
-	rest := pathPart(r.URL.Path, "/api/v1/alerts/")
-	parts := strings.Split(strings.Trim(rest, "/"), "/")
-	if len(parts) < 2 {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown alert action"})
-		return
-	}
-	id, action := parts[0], parts[1]
-	switch action {
-	case "feedback":
-		if len(parts) != 2 || r.Method != http.MethodPost {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown alert action"})
-			return
-		}
-		s.handleFeedback(w, r, "alert", id)
-	case "vote":
-		if len(parts) != 2 || r.Method != http.MethodPost {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown alert action"})
-			return
-		}
-		s.handleFeedback(w, r, "alert", id)
-	case "comments":
-		s.handleCommentAction(w, r, "alert", id, parts)
-	default:
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown alert action"})
-	}
-}
-
-func (s *Server) handleFeedback(
-	w http.ResponseWriter,
-	r *http.Request,
-	targetType string,
-	targetID string,
-) {
-	var req FeedbackRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	if strings.TrimSpace(req.Author) == "" {
-		req.Author = r.URL.Query().Get("feedback_author")
-	}
-	summary, ok, err := s.store.AddFeedback(targetType, targetID, req)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "target not found"})
-		return
-	}
-	s.hub.Broadcast(Event{Type: "feedback.updated", Data: map[string]any{
-		"target_type": targetType,
-		"target_id":   targetID,
-	}})
-	if strings.TrimSpace(req.Comment) != "" {
-		s.startAnalysisRun(targetType, targetID, "feedback", req.Comment)
-	}
-	writeJSON(w, http.StatusOK, envelope(summary))
-}
-
-func (s *Server) handleComment(
-	w http.ResponseWriter,
-	r *http.Request,
-	targetType string,
-	targetID string,
-) {
-	var req CommentRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	summary, ok, err := s.store.AddComment(targetType, targetID, req)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "target not found"})
-		return
-	}
-	s.hub.Broadcast(Event{Type: "feedback.updated", Data: map[string]any{
-		"target_type": targetType,
-		"target_id":   targetID,
-	}})
-	s.startAnalysisRun(targetType, targetID, "comment", req.Body)
-	writeJSON(w, http.StatusOK, envelope(summary))
-}
-
-func (s *Server) handleCommentAction(
-	w http.ResponseWriter,
-	r *http.Request,
-	targetType string,
-	targetID string,
-	parts []string,
-) {
-	switch {
-	case len(parts) == 2 && r.Method == http.MethodPost:
-		s.handleComment(w, r, targetType, targetID)
-	case len(parts) == 3 && r.Method == http.MethodPut:
-		s.handleCommentUpdate(w, r, targetType, targetID, parts[2])
-	case len(parts) == 3 && r.Method == http.MethodDelete:
-		s.handleCommentDelete(w, r, targetType, targetID, parts[2])
-	default:
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown comment action"})
-	}
-}
-
-func (s *Server) handleCommentUpdate(
-	w http.ResponseWriter,
-	r *http.Request,
-	targetType string,
-	targetID string,
-	commentID string,
-) {
-	var req CommentRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	summary, ok, err := s.store.UpdateComment(targetType, targetID, commentID, req)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "comment not found"})
-		return
-	}
-	s.hub.Broadcast(Event{Type: "feedback.updated", Data: map[string]any{
-		"target_type": targetType,
-		"target_id":   targetID,
-	}})
-	writeJSON(w, http.StatusOK, envelope(summary))
-}
-
-func (s *Server) handleCommentDelete(
-	w http.ResponseWriter,
-	r *http.Request,
-	targetType string,
-	targetID string,
-	commentID string,
-) {
-	summary, ok := s.store.DeleteComment(targetType, targetID, commentID)
-	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "comment not found"})
-		return
-	}
-	s.hub.Broadcast(Event{Type: "feedback.updated", Data: map[string]any{
-		"target_type": targetType,
-		"target_id":   targetID,
-	}})
-	writeJSON(w, http.StatusOK, envelope(summary))
-}
-
-func (s *Server) handleEmbeddingSearch(w http.ResponseWriter, r *http.Request) {
-	var req EmbeddingSearchRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	query := strings.TrimSpace(req.Query)
-	if query == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "query is required"})
-		return
-	}
-	results := s.store.SearchIncidentMemory(query, req.Limit)
-	writeJSON(w, http.StatusOK, envelope(EmbeddingSearchResponse{
-		Model:   "local-term-frequency",
-		Results: results,
-	}))
-}
-
-func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "streaming unsupported"})
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	ch := s.hub.Subscribe()
-	defer s.hub.Unsubscribe(ch)
-	writeSSE(w, Event{Type: "connected", Data: map[string]any{"status": "ok"}})
-	flusher.Flush()
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case event := <-ch:
-			writeSSE(w, event)
-			flusher.Flush()
-		}
+		writeError(w, http.StatusNotFound, "not found")
 	}
 }
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var req ChatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	req.Message = strings.TrimSpace(req.Message)
 	if req.Message == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "message is required"})
+		writeError(w, http.StatusBadRequest, "message is required")
 		return
 	}
 	req = s.enrichChatRequest(req)
@@ -2200,7 +1822,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		run, ok := s.startAnalysisRun(targetType, targetID, "chat", req.Message)
 		if !ok {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "analysis target not found"})
+			writeError(w, http.StatusNotFound, "analysis target not found")
 			return
 		}
 		answer := ChatResponse{
@@ -2482,7 +2104,7 @@ func stringFromContext(context map[string]any, key string) string {
 	}
 }
 
-func (s *Server) requestAnalysis(alert Alert, incidentID, alertID, threadTS string) {
+func (s *Server) requestAnalysis(alert Alert, incidentID, alertID, threadTS string, source string) {
 	req := AgentAnalysisRequest{
 		Alert:            alert,
 		ThreadTS:         threadTS,
@@ -2506,14 +2128,14 @@ func (s *Server) requestAnalysis(alert Alert, incidentID, alertID, threadTS stri
 	resp, err := s.client.Do(httpReq)
 	if err != nil {
 		s.store.ApplyAnalysis(alertID, fallbackAnalysis(alert, err))
-		s.hub.Broadcast(Event{Type: "analysis.completed", Data: map[string]any{"incident_id": incidentID, "alert_id": alertID}})
+		s.hub.Broadcast(analysisCompletedEvent("", source, "complete", incidentID, alertID))
 		return
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
 		s.store.ApplyAnalysis(alertID, fallbackAnalysis(alert, errors.New(string(body))))
-		s.hub.Broadcast(Event{Type: "analysis.completed", Data: map[string]any{"incident_id": incidentID, "alert_id": alertID}})
+		s.hub.Broadcast(analysisCompletedEvent("", source, "complete", incidentID, alertID))
 		return
 	}
 	var analysis AgentAnalysisResponse
@@ -2522,7 +2144,7 @@ func (s *Server) requestAnalysis(alert Alert, incidentID, alertID, threadTS stri
 	} else {
 		s.store.ApplyAnalysis(alertID, analysis)
 	}
-	s.hub.Broadcast(Event{Type: "analysis.completed", Data: map[string]any{"incident_id": incidentID, "alert_id": alertID}})
+	s.hub.Broadcast(analysisCompletedEvent("", source, "complete", incidentID, alertID))
 }
 
 func (s *Server) startAnalysisRun(targetType string, targetID string, source string, prompt string) (*AnalysisRun, bool) {
@@ -2539,14 +2161,7 @@ func (s *Server) startAnalysisRun(targetType string, targetID string, source str
 		fmt.Sprintf("%s: %s", sourceTitle(source), title),
 		prompt,
 	)
-	s.hub.Broadcast(Event{Type: "analysis.started", Data: map[string]any{
-		"run_id":      run.RunID,
-		"source":      run.Source,
-		"target_type": targetType,
-		"target_id":   targetID,
-		"incident_id": incidentID,
-		"alert_id":    alertID,
-	}})
+	s.hub.Broadcast(analysisStartedEvent(run.RunID, run.Source, targetType, targetID, incidentID, alertID))
 	go s.requestAnalysisRun(run.RunID, alert, incidentID, alertID, threadTS, source, prompt)
 	return &run, true
 }
@@ -2610,13 +2225,7 @@ func (s *Server) requestAnalysisRun(
 }
 
 func (s *Server) broadcastAnalysisRunCompleted(run AnalysisRun, incidentID string, alertID string) {
-	s.hub.Broadcast(Event{Type: "analysis.completed", Data: map[string]any{
-		"run_id":      run.RunID,
-		"source":      run.Source,
-		"status":      run.Status,
-		"incident_id": incidentID,
-		"alert_id":    alertID,
-	}})
+	s.hub.Broadcast(analysisCompletedEvent(run.RunID, run.Source, run.Status, incidentID, alertID))
 }
 
 func sourceTitle(source string) string {
@@ -2746,15 +2355,32 @@ func cloneAlert(in *AlertRecord) *AlertRecord {
 	out.Labels = cloneMap(in.Labels)
 	out.Annotations = cloneMap(in.Annotations)
 	out.Capabilities = cloneMap(in.Capabilities)
-	out.MissingData = append([]string{}, in.MissingData...)
-	out.Warnings = append([]string{}, in.Warnings...)
-	out.Artifacts = append([]Artifact{}, in.Artifacts...)
+	out.MissingData = cloneStrings(in.MissingData)
+	out.Warnings = cloneStrings(in.Warnings)
+	out.Artifacts = cloneArtifacts(in.Artifacts)
 	out.SimilarIncidents = cloneSimilar(in.SimilarIncidents)
 	out.Feedback = cloneFeedbackSummary(in.Feedback)
 	return &out
 }
 
+func cloneStrings(in []string) []string {
+	if in == nil {
+		return []string{}
+	}
+	return append([]string{}, in...)
+}
+
+func cloneArtifacts(in []Artifact) []Artifact {
+	if in == nil {
+		return []Artifact{}
+	}
+	return append([]Artifact{}, in...)
+}
+
 func cloneSimilar(in []SimilarIncident) []SimilarIncident {
+	if in == nil {
+		return []SimilarIncident{}
+	}
 	out := make([]SimilarIncident, len(in))
 	for i, item := range in {
 		out[i] = item
@@ -2765,8 +2391,14 @@ func cloneSimilar(in []SimilarIncident) []SimilarIncident {
 
 func cloneFeedbackSummary(in FeedbackSummary) FeedbackSummary {
 	out := in
-	out.Comments = append([]CommentRecord{}, in.Comments...)
-	out.LearningHints = append([]FeedbackHint{}, in.LearningHints...)
+	if out.Comments == nil {
+		out.Comments = []CommentRecord{}
+	} else {
+		out.Comments = append([]CommentRecord{}, in.Comments...)
+	}
+	if out.LearningHints != nil {
+		out.LearningHints = append([]FeedbackHint{}, in.LearningHints...)
+	}
 	return out
 }
 
@@ -2776,9 +2408,9 @@ func cloneAnalysisRun(in *AnalysisRun) AnalysisRun {
 	}
 	out := *in
 	out.Capabilities = cloneMap(in.Capabilities)
-	out.MissingData = append([]string{}, in.MissingData...)
-	out.Warnings = append([]string{}, in.Warnings...)
-	out.Artifacts = append([]Artifact{}, in.Artifacts...)
+	out.MissingData = cloneStrings(in.MissingData)
+	out.Warnings = cloneStrings(in.Warnings)
+	out.Artifacts = cloneArtifacts(in.Artifacts)
 	return out
 }
 
@@ -2941,9 +2573,8 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-func writeSSE(w io.Writer, event Event) {
-	payload, _ := json.Marshal(event)
-	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, payload)
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
 }
 
 func cors(next http.Handler) http.Handler {

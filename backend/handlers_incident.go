@@ -1,0 +1,120 @@
+package main
+
+import (
+	"net/http"
+	"strings"
+	"time"
+)
+
+func (s *Server) handleIncident(w http.ResponseWriter, r *http.Request) {
+	rest := pathPart(r.URL.Path, "/api/v1/incidents/")
+	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	id := ""
+	if len(parts) > 0 {
+		id = parts[0]
+	}
+	if id == "" {
+		writeError(w, http.StatusNotFound, "incident id required")
+		return
+	}
+	if len(parts) == 2 && parts[1] == "feedback" {
+		if _, ok := s.store.IncidentDetail(id); !ok {
+			writeError(w, http.StatusNotFound, "incident not found")
+			return
+		}
+		s.store.mu.RLock()
+		summary := s.store.feedbackSummaryForActorLocked("incident", id, r.URL.Query().Get("feedback_author"))
+		s.store.mu.RUnlock()
+		writeJSON(w, http.StatusOK, envelope(summary))
+		return
+	}
+	if len(parts) > 1 {
+		writeError(w, http.StatusNotFound, "unknown incident action")
+		return
+	}
+	if detail, ok := s.store.IncidentDetail(id); ok {
+		if actor := r.URL.Query().Get("feedback_author"); actor != "" {
+			s.store.mu.RLock()
+			detail.Feedback = s.store.feedbackSummaryForActorLocked("incident", id, actor)
+			for i := range detail.Alerts {
+				detail.Alerts[i].Feedback = s.store.feedbackSummaryForActorLocked("alert", detail.Alerts[i].AlertID, actor)
+			}
+			s.store.mu.RUnlock()
+		}
+		writeJSON(w, http.StatusOK, envelope(detail))
+		return
+	}
+	writeError(w, http.StatusNotFound, "incident not found")
+}
+
+func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
+	rest := pathPart(r.URL.Path, "/api/v1/incidents/")
+	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	if len(parts) < 2 {
+		writeError(w, http.StatusNotFound, "unknown incident action")
+		return
+	}
+	id, action := parts[0], parts[1]
+	switch action {
+	case "analyze":
+		if len(parts) != 2 || r.Method != http.MethodPost {
+			writeError(w, http.StatusNotFound, "unknown incident action")
+			return
+		}
+		detail, ok := s.store.IncidentDetail(id)
+		if !ok {
+			writeError(w, http.StatusNotFound, "incident not found")
+			return
+		}
+		s.store.MarkAnalyzing(id, true)
+		for _, alert := range detail.Alerts {
+			s.hub.Broadcast(analysisStartedEvent("", "manual", "alert", alert.AlertID, id, alert.AlertID))
+			go s.requestAnalysis(Alert{
+				Status:      alert.Status,
+				Labels:      alert.Labels,
+				Annotations: alert.Annotations,
+				Fingerprint: alert.Fingerprint,
+			}, id, alert.AlertID, alert.ThreadTS, "manual")
+		}
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "analysis_requested"})
+	case "resolve":
+		if len(parts) != 2 || r.Method != http.MethodPost {
+			writeError(w, http.StatusNotFound, "unknown incident action")
+			return
+		}
+		now := time.Now().UTC()
+		s.store.mu.Lock()
+		incident := s.store.incidents[id]
+		if incident == nil {
+			s.store.mu.Unlock()
+			writeError(w, http.StatusNotFound, "incident not found")
+			return
+		}
+		incident.Status = "resolved"
+		incident.ResolvedAt = &now
+		s.store.persistIncidentLocked(incident)
+		if memory := s.store.memories[id]; memory != nil {
+			memory.Status = "resolved"
+			s.store.persistMemoryLocked(memory)
+		}
+		s.store.mu.Unlock()
+		s.hub.Broadcast(incidentResolvedEvent(id, now))
+		writeJSON(w, http.StatusOK, map[string]string{"status": "resolved"})
+	case "feedback":
+		if len(parts) != 2 || r.Method != http.MethodPost {
+			writeError(w, http.StatusNotFound, "unknown incident action")
+			return
+		}
+		s.handleFeedback(w, r, "incident", id)
+	case "vote":
+		if len(parts) != 2 || r.Method != http.MethodPost {
+			writeError(w, http.StatusNotFound, "unknown incident action")
+			return
+		}
+		s.handleFeedback(w, r, "incident", id)
+	case "comments":
+		s.handleCommentAction(w, r, "incident", id, parts)
+	default:
+		writeError(w, http.StatusNotFound, "unknown incident action")
+	}
+}
