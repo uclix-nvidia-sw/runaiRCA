@@ -211,6 +211,36 @@ helm upgrade --install runai-rca charts/runai-rca \
 
 ## Container and Helm Deployment
 
+The repository includes a GitHub Actions workflow that builds the three runtime
+images and publishes them to GitHub Container Registry (GHCR), so operators do
+not need to build images locally for every deployment:
+
+- `ghcr.io/<owner>/runai-rca-backend`
+- `ghcr.io/<owner>/runai-rca-agent`
+- `ghcr.io/<owner>/runai-rca-frontend`
+
+The workflow runs on branch pushes, version tags such as `v0.1.0`, pull
+requests, and manual dispatch. Pull requests build the images without pushing.
+Branch pushes publish branch and `sha-...` tags, the default branch also
+publishes `latest`, and version tags publish semver tags such as `0.1.0`.
+
+Deploy the published GHCR images with Helm by pointing the global registry at
+the GitHub owner or organization namespace and choosing a shared tag:
+
+```bash
+helm upgrade --install runai-rca charts/runai-rca \
+  --set global.imageRegistry=ghcr.io/<owner> \
+  --set backend.image.tag=latest \
+  --set agent.image.tag=latest \
+  --set frontend.image.tag=latest
+```
+
+For a release tag like `v0.1.0`, use `--set backend.image.tag=0.1.0` and the
+same tag for `agent` and `frontend`. If component image tags are left empty, the
+chart defaults them to `appVersion` from `charts/runai-rca/Chart.yaml`.
+
+Local image builds are still available for development.
+
 Each runtime has its own image:
 
 ```bash
@@ -385,6 +415,12 @@ agent checks connectivity, active connections, long-running transactions,
 pgvector availability, and expected RCA table presence. If it is not configured,
 the agent marks Postgres evidence as unavailable without blocking the rest of the
 RCA.
+
+No separate migration command is required for these RCA tables on a fresh
+database: backend startup uses idempotent `CREATE TABLE IF NOT EXISTS`,
+`CREATE INDEX IF NOT EXISTS`, and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+statements. External Postgres still needs the database/user to exist and the
+user to have schema/table create and read/write privileges.
 
 Sensitive values are redacted before evidence is returned to the backend or
 passed into NeMo synthesis. The built-in redactor masks common secret keys,

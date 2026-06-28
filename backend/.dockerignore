@@ -1,0 +1,9 @@
+.git
+.gitignore
+.dockerignore
+Dockerfile
+*.log
+.DS_Store
+.vscode
+.idea
+coverage

@@ -1,0 +1,15 @@
+.git
+.gitignore
+.dockerignore
+Dockerfile
+*.log
+.DS_Store
+.pytest_cache
+.venv
+__pycache__
+*.pyc
+.mypy_cache
+.ruff_cache
+.vscode
+.idea
+coverage

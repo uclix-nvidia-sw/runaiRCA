@@ -181,7 +181,8 @@ async def _collect_postgres_checks(conn: Any, target: AnalysisTarget) -> dict[st
           'alerts',
           'incident_embeddings',
           'rca_feedback',
-          'rca_comments'
+          'rca_comments',
+          'analysis_runs'
         ])
           AS table_name
         """
