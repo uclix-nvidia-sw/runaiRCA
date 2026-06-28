@@ -219,10 +219,10 @@ not need to build images locally for every deployment:
 - `ghcr.io/<owner>/runai-rca-agent`
 - `ghcr.io/<owner>/runai-rca-frontend`
 
-The workflow runs on branch pushes, version tags such as `v0.1.0`, pull
+The workflow runs on `main` pushes, version tags such as `v0.1.0`, pull
 requests, and manual dispatch. Pull requests build the images without pushing.
-Branch pushes publish branch and `sha-...` tags, the default branch also
-publishes `latest`, and version tags publish semver tags such as `0.1.0`.
+`main` pushes publish the `main` and `sha-...` tags plus the chart `appVersion`
+(for example `0.1.0`), and version tags publish semver tags such as `0.1.0`.
 
 Deploy the published GHCR images with Helm by pointing the global registry at
 the GitHub owner or organization namespace and choosing a shared tag:
@@ -230,14 +230,24 @@ the GitHub owner or organization namespace and choosing a shared tag:
 ```bash
 helm upgrade --install runai-rca charts/runai-rca \
   --set global.imageRegistry=ghcr.io/<owner> \
-  --set backend.image.tag=latest \
-  --set agent.image.tag=latest \
-  --set frontend.image.tag=latest
+  --set backend.image.tag=0.1.0 \
+  --set agent.image.tag=0.1.0 \
+  --set frontend.image.tag=0.1.0
 ```
 
 For a release tag like `v0.1.0`, use `--set backend.image.tag=0.1.0` and the
 same tag for `agent` and `frontend`. If component image tags are left empty, the
 chart defaults them to `appVersion` from `charts/runai-rca/Chart.yaml`.
+
+The Helm chart itself is also packaged and published to GHCR as an OCI artifact
+on `main` pushes and version tags. Pull the chart directly instead of cloning the
+repository:
+
+```bash
+helm upgrade --install runai-rca oci://ghcr.io/<owner>/charts/runai-rca \
+  --version 0.1.1 \
+  --set global.imageRegistry=ghcr.io/<owner>
+```
 
 Local image builds are still available for development.
 

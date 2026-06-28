@@ -3,7 +3,7 @@ name: Container Images
 on:
   push:
     branches:
-      - "**"
+      - main
     tags:
       - "v*.*.*"
   pull_request:
@@ -45,6 +45,13 @@ jobs:
         shell: bash
         run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
+      - name: Read chart app version
+        id: version
+        shell: bash
+        run: |
+          version=$(grep '^appVersion:' charts/runai-rca/Chart.yaml | head -1 | sed -E 's/^appVersion:[[:space:]]*"?([^"]+)"?/\1/')
+          echo "appVersion=${version}" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -67,7 +74,7 @@ jobs:
             type=sha,prefix=sha-
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.version.outputs.appVersion }},enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=${{ matrix.image }}
             org.opencontainers.image.description=Run:AI RCA ${{ matrix.component }} service
