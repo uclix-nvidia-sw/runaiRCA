@@ -49,8 +49,13 @@ jobs:
         id: version
         shell: bash
         run: |
-          version=$(grep '^appVersion:' charts/runai-rca/Chart.yaml | head -1 | sed -E 's/^appVersion:[[:space:]]*"?([^"]+)"?/\1/')
-          echo "appVersion=${version}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          version=$(awk -F: '/^appVersion:/{v=$2; sub(/#.*/,"",v); gsub(/"/,"",v); gsub(/^[ \t]+|[ \t\r]+$/,"",v); print v; exit}' charts/runai-rca/Chart.yaml)
+          if [[ -z "$version" ]]; then
+            echo "ERROR: appVersion not found in charts/runai-rca/Chart.yaml" >&2
+            exit 1
+          fi
+          echo "appVersion=$version" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
