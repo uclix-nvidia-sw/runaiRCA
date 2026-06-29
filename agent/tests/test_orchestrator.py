@@ -3,9 +3,13 @@ from __future__ import annotations
 import stat
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from app.collectors.base import AnalysisTarget
+from app.collectors.loki import LokiCollector, _loki_headers
+from app.collectors.runai import _runai_headers
 from app.config import Settings
 from app.masking import build_masker
 from app.schemas import (
@@ -43,6 +47,10 @@ def make_settings() -> Settings:
         prometheus_timeout_seconds=1,
         prometheus_mcp_url="",
         loki_url="",
+        loki_bearer_token="",
+        loki_basic_username="",
+        loki_basic_password="",
+        loki_tenant_id="",
         loki_timeout_seconds=1,
         loki_query_limit=10,
         loki_mcp_url="",
@@ -62,6 +70,81 @@ def make_settings() -> Settings:
         enable_nat_runtime=False,
         nat_timeout_seconds=1,
     )
+
+
+def make_target() -> AnalysisTarget:
+    return AnalysisTarget(
+        cluster="",
+        project="vision",
+        queue="gpu-a",
+        namespace="runai-vision",
+        workload_name="trainer",
+        workload_type="",
+        runai_workload_id="",
+        node="",
+        pod="trainer-0",
+        severity="warning",
+        alert_name="RunAIWorkloadPending",
+    )
+
+
+def test_loki_headers_prefer_bearer_and_include_tenant() -> None:
+    settings = replace(
+        make_settings(),
+        loki_bearer_token="loki-token",
+        loki_basic_username="basic-user",
+        loki_basic_password="basic-password",
+        loki_tenant_id="tenant-a",
+    )
+
+    headers, warnings = _loki_headers(settings)
+
+    assert headers["Authorization"] == "Bearer loki-token"
+    assert headers["X-Scope-OrgID"] == "tenant-a"
+    assert warnings == []
+
+
+def test_loki_headers_support_basic_auth() -> None:
+    settings = replace(
+        make_settings(),
+        loki_basic_username="basic-user",
+        loki_basic_password="basic-password",
+    )
+
+    headers, warnings = _loki_headers(settings)
+
+    assert headers["Authorization"].startswith("Basic ")
+    assert warnings == []
+
+
+@pytest.mark.asyncio
+async def test_loki_401_marks_auth_missing(monkeypatch) -> None:
+    async def fake_get_json(**kwargs) -> SimpleNamespace:
+        return SimpleNamespace(
+            url=f"{kwargs['base_url']}{kwargs['path']}",
+            status_code=401,
+            error="HTTP 401",
+            data={"body": "unauthorized"},
+        )
+
+    monkeypatch.setattr("app.collectors.loki.get_json", fake_get_json)
+    collector = LokiCollector(replace(make_settings(), loki_url="http://loki.example"))
+
+    result = await collector.collect(make_target())
+
+    assert result.status == "unavailable"
+    assert "loki.auth" in result.missing_data
+    assert any("HTTP 401" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_runai_headers_warn_when_auth_header_is_missing() -> None:
+    headers, warnings = await _runai_headers(
+        replace(make_settings(), runai_base_url="https://runai.example")
+    )
+
+    assert "Authorization" not in headers
+    assert any("no Authorization header" in warning for warning in warnings)
 
 
 @pytest.mark.asyncio

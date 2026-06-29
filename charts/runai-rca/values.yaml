@@ -21,6 +21,10 @@ secrets:
     runaiClientId: RUNAI_CLIENT_ID
     runaiClientSecret: RUNAI_CLIENT_SECRET
     runaiBearerToken: RUNAI_BEARER_TOKEN
+    lokiBearerToken: LOKI_BEARER_TOKEN
+    lokiBasicUsername: LOKI_BASIC_USERNAME
+    lokiBasicPassword: LOKI_BASIC_PASSWORD
+    lokiTenantId: LOKI_TENANT_ID
     nvidiaApiKey: NVIDIA_API_KEY
     llmApiKey: LLM_API_KEY
   databaseUrl: ""
@@ -28,6 +32,10 @@ secrets:
   runaiClientId: ""
   runaiClientSecret: ""
   runaiBearerToken: ""
+  lokiBearerToken: ""
+  lokiBasicUsername: ""
+  lokiBasicPassword: ""
+  lokiTenantId: ""
   nvidiaApiKey: ""
   llmApiKey: ""
 

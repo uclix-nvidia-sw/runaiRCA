@@ -12,14 +12,23 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	created := 0
+	accepted := 0
+	ignored := 0
 	for _, alert := range webhook.Alerts {
+		if ignoredAlert(alert) {
+			ignored++
+			continue
+		}
 		incident, record := s.store.UpsertAlert(webhook, alert)
-		created++
+		accepted++
 		s.hub.Broadcast(alertCreatedEvent(incident, record))
 		s.startAnalysisRun("alert", record.AlertID, "auto", "")
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted", "alerts": created})
+	writeJSON(
+		w,
+		http.StatusAccepted,
+		map[string]any{"status": "accepted", "alerts": accepted, "accepted": accepted, "ignored": ignored},
+	)
 }
 
 func (s *Server) handleAlert(w http.ResponseWriter, r *http.Request) {

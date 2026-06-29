@@ -49,6 +49,99 @@ func TestAlertmanagerWebhookCreatesIncidentAndAlert(t *testing.T) {
 	}
 }
 
+func TestAlertmanagerWebhookIgnoresInfoAlerts(t *testing.T) {
+	server := NewServer()
+	body := AlertmanagerWebhook{
+		GroupKey: "runai-info",
+		Alerts: []Alert{
+			{
+				Status: "firing",
+				Labels: map[string]string{
+					"alertname": "RunAIInfoOnly",
+					"severity":  "info",
+					"namespace": "runai",
+				},
+				Annotations: map[string]string{"summary": "Informational only"},
+				Fingerprint: "fp-info",
+			},
+		},
+	}
+	payload, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", rec.Code)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["alerts"].(float64) != 0 || response["ignored"].(float64) != 1 {
+		t.Fatalf("unexpected webhook counts: %+v", response)
+	}
+	if len(server.store.ListIncidents()) != 0 || len(server.store.ListAlerts()) != 0 {
+		t.Fatalf("info alert should not create incident or alert")
+	}
+	if len(server.store.ListAnalysisRuns()) != 0 {
+		t.Fatalf("info alert should not create analysis runs")
+	}
+}
+
+func TestAlertmanagerWebhookReportsAcceptedAndIgnoredCounts(t *testing.T) {
+	server := NewServer()
+	body := AlertmanagerWebhook{
+		GroupKey: "runai-mixed",
+		Alerts: []Alert{
+			{
+				Status: "firing",
+				Labels: map[string]string{
+					"alertname": "RunAIInfoOnly",
+					"severity":  "information",
+					"namespace": "runai",
+				},
+				Annotations: map[string]string{"summary": "Informational only"},
+				Fingerprint: "fp-mixed-info",
+			},
+			{
+				Status: "firing",
+				Labels: map[string]string{
+					"alertname": "RunAIWorkloadPending",
+					"severity":  "warning",
+					"namespace": "runai",
+					"workload":  "trainer",
+				},
+				Annotations: map[string]string{"summary": "Workload pending"},
+				Fingerprint: "fp-mixed-warning",
+			},
+		},
+	}
+	payload, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", rec.Code)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["alerts"].(float64) != 1 || response["accepted"].(float64) != 1 || response["ignored"].(float64) != 1 {
+		t.Fatalf("unexpected webhook counts: %+v", response)
+	}
+	if len(server.store.ListIncidents()) != 1 || len(server.store.ListAlerts()) != 1 {
+		t.Fatalf("expected only warning alert to be stored")
+	}
+	if len(server.store.ListAnalysisRuns()) != 1 {
+		t.Fatalf("expected one auto analysis run")
+	}
+}
+
 func TestAgentRequestTimeoutConfig(t *testing.T) {
 	t.Setenv("AGENT_REQUEST_TIMEOUT_SECONDS", "7")
 	server := NewServer()

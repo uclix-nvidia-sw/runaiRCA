@@ -28,6 +28,11 @@ Backend:
 - `GET /api/v1/events`
 - `POST /api/v1/chat`
 
+`POST /webhook/alertmanager` returns HTTP 202 with `status`, `alerts`,
+`accepted`, and `ignored` counts. Alerts with severity `info` or `information`
+are counted as ignored and do not create incidents, alerts, SSE events, or
+analysis runs.
+
 Agent:
 
 - `POST /analyze`

@@ -81,6 +81,10 @@ class Settings:
     prometheus_timeout_seconds: int
     prometheus_mcp_url: str
     loki_url: str
+    loki_bearer_token: str
+    loki_basic_username: str
+    loki_basic_password: str
+    loki_tenant_id: str
     loki_timeout_seconds: int
     loki_query_limit: int
     loki_mcp_url: str
@@ -138,6 +142,10 @@ def load_settings() -> Settings:
         prometheus_timeout_seconds=_int_env("PROMETHEUS_TIMEOUT_SECONDS", 6),
         prometheus_mcp_url=os.getenv("PROMETHEUS_MCP_URL", "").strip().rstrip("/"),
         loki_url=os.getenv("LOKI_URL", "").strip().rstrip("/"),
+        loki_bearer_token=os.getenv("LOKI_BEARER_TOKEN", "").strip(),
+        loki_basic_username=os.getenv("LOKI_BASIC_USERNAME", "").strip(),
+        loki_basic_password=os.getenv("LOKI_BASIC_PASSWORD", "").strip(),
+        loki_tenant_id=os.getenv("LOKI_TENANT_ID", "").strip(),
         loki_timeout_seconds=_int_env("LOKI_TIMEOUT_SECONDS", 6),
         loki_query_limit=max(1, _int_env("LOKI_QUERY_LIMIT", 20)),
         loki_mcp_url=os.getenv("LOKI_MCP_URL", "").strip().rstrip("/"),
