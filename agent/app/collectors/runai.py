@@ -3,7 +3,7 @@ from __future__ import annotations
 from urllib.parse import quote
 
 from app.collectors.base import AnalysisTarget, CollectorResult, artifact
-from app.collectors.http_json import compact, get_json, post_form_json
+from app.collectors.http_json import compact, get_json, post_json
 from app.config import Settings
 
 
@@ -146,21 +146,22 @@ async def _runai_headers(settings: Settings, *, prefer_oauth: bool = False) -> t
     warnings: list[str] = []
     token = "" if prefer_oauth else settings.runai_bearer_token
     if not token and settings.runai_token_url and settings.runai_client_id:
-        response = await post_form_json(
+        response = await post_json(
             url=settings.runai_token_url,
             timeout_seconds=settings.runai_timeout_seconds,
-            data={
-                "grant_type": "client_credentials",
-                "client_id": settings.runai_client_id,
-                "client_secret": settings.runai_client_secret,
+            json_body={
+                "grantType": "client_credentials",
+                "clientId": settings.runai_client_id,
+                "clientSecret": settings.runai_client_secret,
             },
+            headers={"Content-Type": "application/json"},
         )
         if response.ok and isinstance(response.data, dict):
-            value = response.data.get("access_token")
-            if isinstance(value, str):
+            value = response.data.get("accessToken") or response.data.get("access_token")
+            if isinstance(value, str) and value:
                 token = value
             else:
-                warnings.append("Run:ai token response did not include an access_token.")
+                warnings.append("Run:ai token response did not include an access token.")
         elif response.error:
             warnings.append(f"Run:ai token request failed: {response.error}")
     elif settings.runai_client_id and settings.runai_client_secret and not settings.runai_token_url:

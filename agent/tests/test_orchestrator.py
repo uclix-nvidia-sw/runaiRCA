@@ -148,6 +148,34 @@ async def test_runai_headers_warn_when_auth_header_is_missing() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runai_token_uses_json_client_credentials(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        captured["url"] = url
+        captured["json_body"] = json_body
+        return SimpleNamespace(ok=True, error=None, data={"accessToken": "tok-123"})
+
+    monkeypatch.setattr("app.collectors.runai.post_json", fake_post_json)
+    settings = replace(
+        make_settings(),
+        runai_base_url="https://runai.example",
+        runai_token_url="https://runai.example/api/v1/token",
+        runai_client_id="cid",
+        runai_client_secret="secret",
+    )
+    headers, warnings = await _runai_headers(settings)
+
+    assert headers["Authorization"] == "Bearer tok-123"
+    assert captured["json_body"] == {
+        "grantType": "client_credentials",
+        "clientId": "cid",
+        "clientSecret": "secret",
+    }
+    assert warnings == []
+
+
+@pytest.mark.asyncio
 async def test_analyze_returns_unified_artifacts() -> None:
     orchestrator = AnalysisOrchestrator(make_settings())
     response = await orchestrator.analyze(
