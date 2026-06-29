@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"time"
 )
 
 // AgentAnalysisRequest is the payload the backend sends to the agent /analyze endpoint.
@@ -98,8 +99,8 @@ func classifyDoError(ctx context.Context, err error) *AgentError {
 
 // callAnalyze posts an analysis request to the agent and returns a structured
 // response or a typed *AgentError describing the failure.
-func (s *Server) callAnalyze(req AgentAnalysisRequest) (AgentAnalysisResponse, error) {
-	body, err := s.postAgent("/analyze", req)
+func (s *Server) callAnalyze(req AgentAnalysisRequest, timeout time.Duration) (AgentAnalysisResponse, error) {
+	body, err := s.postAgent("/analyze", req, timeout)
 	if err != nil {
 		return AgentAnalysisResponse{}, err
 	}
@@ -113,7 +114,7 @@ func (s *Server) callAnalyze(req AgentAnalysisRequest) (AgentAnalysisResponse, e
 // callChat posts a chat request to the agent and returns a structured response
 // or a typed *AgentError describing the failure.
 func (s *Server) callChat(req ChatRequest) (ChatResponse, error) {
-	body, err := s.postAgent("/chat", req)
+	body, err := s.postAgent("/chat", req, s.agentRequestTimeout)
 	if err != nil {
 		return ChatResponse{}, err
 	}
@@ -127,12 +128,15 @@ func (s *Server) callChat(req ChatRequest) (ChatResponse, error) {
 // postAgent performs a JSON POST against the agent and returns the raw body or a
 // typed *AgentError. JSON decoding of the body is left to the caller so the
 // invalid-JSON case can be classified per endpoint.
-func (s *Server) postAgent(path string, payload any) ([]byte, error) {
+func (s *Server) postAgent(path string, payload any, timeout time.Duration) ([]byte, error) {
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return nil, &AgentError{Kind: agentErrEncode, Err: err}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), s.agentRequestTimeout)
+	ctx, cancel := context.WithCancel(context.Background())
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), timeout)
+	}
 	defer cancel()
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, s.agentURL+path, bytes.NewReader(encoded))
 	if err != nil {

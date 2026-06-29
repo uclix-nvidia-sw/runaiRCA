@@ -126,15 +126,16 @@ type EmbeddingSearchResponse struct {
 }
 
 type Incident struct {
-	IncidentID     string     `json:"incident_id"`
-	CorrelationKey string     `json:"correlation_key"`
-	Title          string     `json:"title"`
-	Severity       string     `json:"severity"`
-	Status         string     `json:"status"`
-	FiredAt        time.Time  `json:"fired_at"`
-	ResolvedAt     *time.Time `json:"resolved_at"`
-	AlertCount     int        `json:"alert_count"`
-	IsAnalyzing    bool       `json:"is_analyzing"`
+	IncidentID       string     `json:"incident_id"`
+	CorrelationKey   string     `json:"correlation_key"`
+	Title            string     `json:"title"`
+	Severity         string     `json:"severity"`
+	Status           string     `json:"status"`
+	FiredAt          time.Time  `json:"fired_at"`
+	ResolvedAt       *time.Time `json:"resolved_at"`
+	AlertCount       int        `json:"alert_count"`
+	IsAnalyzing      bool       `json:"is_analyzing"`
+	LatestActivityAt time.Time  `json:"-"`
 }
 
 type AlertRecord struct {
@@ -176,13 +177,19 @@ type IncidentDetail struct {
 }
 
 type Server struct {
-	store               *Store
-	hub                 *Hub
-	agentURL            string
-	language            string
-	agentRequestTimeout time.Duration
-	client              *http.Client
+	store                      *Store
+	hub                        *Hub
+	agentURL                   string
+	language                   string
+	agentRequestTimeout        time.Duration
+	manualAgentRequestTimeout  time.Duration
+	client                     *http.Client
 }
+
+const (
+	similarIncidentLimit = 3
+	flappingGroupWindow  = 30 * time.Minute
+)
 
 func main() {
 	port := getenv("PORT", "8080")
@@ -230,13 +237,18 @@ func NewServer() *Server {
 	if agentRequestTimeout <= 0 {
 		agentRequestTimeout = 180 * time.Second
 	}
+	manualAgentRequestTimeout := time.Duration(getenvInt("MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS", 900)) * time.Second
+	if manualAgentRequestTimeout <= 0 {
+		manualAgentRequestTimeout = 900 * time.Second
+	}
 	return &Server{
-		store:               store,
-		hub:                 NewHub(),
-		agentURL:            strings.TrimRight(getenv("AGENT_URL", "http://localhost:8000"), "/"),
-		language:            getenv("LANGUAGE", "en"),
-		agentRequestTimeout: agentRequestTimeout,
-		client:              &http.Client{Timeout: agentRequestTimeout},
+		store:                     store,
+		hub:                       NewHub(),
+		agentURL:                  strings.TrimRight(getenv("AGENT_URL", "http://localhost:8000"), "/"),
+		language:                  getenv("LANGUAGE", "en"),
+		agentRequestTimeout:       agentRequestTimeout,
+		manualAgentRequestTimeout: manualAgentRequestTimeout,
+		client:                    &http.Client{},
 	}
 }
 
@@ -291,22 +303,17 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 func correlationKey(webhook AlertmanagerWebhook, alert Alert) string {
 	labels := alert.Labels
 	cluster := first(labels["cluster"], labels["runai_cluster"], labels["runai.io/cluster"])
-	project := first(labels["project"], labels["runai_project"], labels["runai.io/project"])
-	queue := first(labels["queue"], labels["runai_queue"], labels["runai.io/queue"])
 	namespace := first(labels["namespace"], labels["kubernetes_namespace"])
-	workload := first(labels["workload"], labels["workload_name"], labels["runai_workload_name"], labels["pod"])
-	node := first(labels["node"], labels["node_name"])
-	if cluster != "" && project != "" && queue != "" && namespace != "" && workload != "" {
-		return strings.Join([]string{"workload", cluster, project, queue, namespace, workload}, ":")
-	}
-	if cluster != "" && node != "" {
-		return strings.Join([]string{"node", cluster, node}, ":")
-	}
-	if webhook.GroupKey != "" {
-		return "group:" + webhook.GroupKey
+	pod := first(labels["pod"], labels["pod_name"], labels["kubernetes_pod_name"])
+	alertName := first(labels["alertname"], labels["alert_name"])
+	if cluster != "" && namespace != "" && pod != "" && alertName != "" {"
+		return strings.Join([]string{"flap", cluster, namespace, pod, alertName}, ":")
 	}
 	if alert.Fingerprint != "" {
 		return "fingerprint:" + alert.Fingerprint
+	}
+	if webhook.GroupKey != "" {
+		return "group:" + webhook.GroupKey
 	}
 	return fmt.Sprintf("adhoc:%d", time.Now().UnixNano())
 }

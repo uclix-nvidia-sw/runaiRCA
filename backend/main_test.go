@@ -149,8 +149,8 @@ func TestAgentRequestTimeoutConfig(t *testing.T) {
 	if server.agentRequestTimeout != 7*time.Second {
 		t.Fatalf("expected agent request timeout from env, got %s", server.agentRequestTimeout)
 	}
-	if server.client.Timeout != 7*time.Second {
-		t.Fatalf("expected http client timeout from env, got %s", server.client.Timeout)
+	if server.client.Timeout != 0 {
+		t.Fatalf("expected http client to rely on per-request contexts, got %s", server.client.Timeout)
 	}
 }
 
@@ -288,6 +288,79 @@ func TestCommentCreatesAnalysisRun(t *testing.T) {
 	run := waitForAnalysisRun(t, server, "comment")
 	if run.Status != "complete" || !strings.Contains(run.AnalysisSummary, "Comment-driven") {
 		t.Fatalf("unexpected analysis run: %+v", run)
+	}
+}
+
+func TestCommentUpdateCreatesAnalysisRun(t *testing.T) {
+	server := NewServer()
+	agentReqCh := make(chan AgentAnalysisRequest, 2)
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req AgentAnalysisRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode agent analysis request: %v", err)
+		}
+		agentReqCh <- req
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Comment update RCA refined the diagnosis.",
+			AnalysisDetail:  "## Root Cause\n\nUpdated operator comment was included.",
+			AnalysisQuality: "high",
+			Capabilities:    map[string]string{"analysis": "ok"},
+		})
+	}))
+	defer agent.Close()
+	server.agentURL = agent.URL
+
+	incident, _ := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "comment-update-run"}, Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIQueueBlocked",
+			"severity":  "warning",
+			"queue":     "gpu-a",
+		},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-comment-update-run",
+	})
+	createPayload, _ := json.Marshal(CommentRequest{Body: "Initial comment.", Author: "operator"})
+	createRec := httptest.NewRecorder()
+	server.routes().ServeHTTP(createRec, httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/incidents/"+incident.IncidentID+"/comments",
+		bytes.NewReader(createPayload),
+	))
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("expected comment create 200, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+	var createResponse struct {
+		Data FeedbackSummary `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &createResponse); err != nil {
+		t.Fatalf("decode comment create response: %v", err)
+	}
+	if len(createResponse.Data.Comments) != 1 {
+		t.Fatalf("expected created comment, got %+v", createResponse.Data)
+	}
+	<-agentReqCh
+
+	updatePayload, _ := json.Marshal(CommentRequest{
+		Body:   "Use scheduler logs instead of quota as the primary cause.",
+		Author: "operator",
+	})
+	updateRec := httptest.NewRecorder()
+	server.routes().ServeHTTP(updateRec, httptest.NewRequest(
+		http.MethodPut,
+		"/api/v1/incidents/"+incident.IncidentID+"/comments/"+createResponse.Data.Comments[0].CommentID,
+		bytes.NewReader(updatePayload),
+	))
+	if updateRec.Code != http.StatusOK {
+		t.Fatalf("expected comment update 200, got %d: %s", updateRec.Code, updateRec.Body.String())
+	}
+	agentReq := <-agentReqCh
+	if agentReq.AnalysisType != "comment" {
+		t.Fatalf("expected comment analysis type, got %+v", agentReq)
+	}
+	if !strings.Contains(agentReq.Alert.Annotations["operator_prompt"], "scheduler logs") {
+		t.Fatalf("updated operator comment was not sent to agent: %+v", agentReq.Alert.Annotations)
 	}
 }
 
@@ -484,6 +557,131 @@ func TestFeedbackAndSimilarIncidentMemory(t *testing.T) {
 	search := store.SearchIncidentMemory("gpu quota saturated scheduling", 5)
 	if len(search) == 0 || search[0].IncidentID != priorIncident.IncidentID {
 		t.Fatalf("expected embedding search to return prior incident, got %+v", search)
+	}
+}
+
+func TestSimilarIncidentsLimitAndLatestTieBreak(t *testing.T) {
+	store := NewStore()
+	alert := Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIWorkloadPending",
+			"severity":  "warning",
+			"cluster":   "lab",
+			"namespace": "runai",
+			"pod":       "trainer-0",
+		},
+		Annotations: map[string]string{"summary": "GPU quota exhausted for trainer"},
+		Fingerprint: "fp-current-similar-limit",
+	}
+	queryVector := textVector(alertSearchText(alert))
+	base := time.Date(2026, 6, 26, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 4; i++ {
+		id := "INC-similar-000" + string(rune('1'+i))
+		store.memories[id] = &IncidentMemory{
+			IncidentID:      id,
+			AlertID:         "ALR-similar-000" + string(rune('1'+i)),
+			Title:           "RunAI workload pending",
+			Severity:        "warning",
+			Status:          "resolved",
+			AnalysisSummary: "GPU quota exhausted for trainer",
+			AnalysisDetail:  "Quota was expanded and the pod recovered.",
+			Labels:          cloneMap(alert.Labels),
+			CreatedAt:       base.Add(time.Duration(i) * time.Minute),
+			Vector:          queryVector,
+		}
+	}
+
+	similar := store.SimilarIncidentsForAlert(alert, "INC-current", 5)
+	if len(similar) != similarIncidentLimit {
+		t.Fatalf("expected %d similar incidents, got %d: %+v", similarIncidentLimit, len(similar), similar)
+	}
+	for i, want := range []string{"INC-similar-0004", "INC-similar-0003", "INC-similar-0002"} {
+		if similar[i].IncidentID != want {
+			t.Fatalf("expected latest tie-break result %s at %d, got %+v", want, i, similar)
+		}
+	}
+}
+
+func TestFlappingAlertGroupingUsesNamespacePodAndWindow(t *testing.T) {
+	store := NewStore()
+	base := time.Date(2026, 6, 26, 9, 0, 0, 0, time.UTC)
+	makeAlert := func(namespace, pod, fingerprint string, at time.Time) Alert {
+		return Alert{
+			Status: "firing",
+			Labels: map[string]string{
+				"alertname": "PodCrashLooping",
+				"severity":  "warning",
+				"cluster":   "lab",
+				"namespace": namespace,
+				"pod":       pod,
+			},
+			Annotations: map[string]string{"summary": "Pod is repeatedly failing"},
+			Fingerprint: fingerprint,
+			StartsAt:    at.Format(time.RFC3339),
+		}
+	}
+
+	firstIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-0", "fp-flap-1", base))
+	sameTargetIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-0", "fp-flap-2", base.Add(10*time.Minute)))
+	if sameTargetIncident.IncidentID != firstIncident.IncidentID {
+		t.Fatalf("same namespace/pod alert inside window should group: %s != %s", sameTargetIncident.IncidentID, firstIncident.IncidentID)
+	}
+
+	differentNamespaceIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-b", "trainer-0", "fp-flap-3", base.Add(11*time.Minute)))
+	if differentNamespaceIncident.IncidentID == firstIncident.IncidentID {
+		t.Fatalf("alerts from different namespaces must not group")
+	}
+	differentPodIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-1", "fp-flap-4", base.Add(12*time.Minute)))
+	if differentPodIncident.IncidentID == firstIncident.IncidentID {
+		t.Fatalf("alerts from different pods must not group")
+	}
+	outsideWindowIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-0", "fp-flap-5", base.Add(45*time.Minute)))
+	if outsideWindowIncident.IncidentID == firstIncident.IncidentID {
+		t.Fatalf("same namespace/pod alert outside flapping window should start a new incident")
+	}
+}
+
+func TestResolveEndpointTogglesResolvedStatus(t *testing.T) {
+	server := NewServer()
+	incident, _ := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "resolve-toggle"}, Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIWorkloadPending",
+			"severity":  "warning",
+			"namespace": "runai",
+			"pod":       "trainer-0",
+		},
+		Annotations: map[string]string{"summary": "Workload pending"},
+		Fingerprint: "fp-resolve-toggle",
+	})
+	path := "/api/v1/incidents/" + incident.IncidentID + "/resolve"
+
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected first resolve 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	detail, ok := server.store.IncidentDetail(incident.IncidentID)
+	if !ok || detail.Status != "resolved" || detail.ResolvedAt == nil {
+		t.Fatalf("expected incident to be resolved, got ok=%t detail=%+v", ok, detail)
+	}
+
+	rec = httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected second resolve 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	detail, ok = server.store.IncidentDetail(incident.IncidentID)
+	if !ok || detail.Status != "firing" || detail.ResolvedAt != nil {
+		t.Fatalf("expected second resolve click to reopen incident, got ok=%t detail=%+v", ok, detail)
+	}
+	var response map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["status"] != "firing" {
+		t.Fatalf("expected response status firing, got %+v", response)
 	}
 }
 

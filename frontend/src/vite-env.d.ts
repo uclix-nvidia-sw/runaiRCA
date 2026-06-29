@@ -3,6 +3,5 @@
 interface Window {
   __RUNAI_RCA_CONFIG__?: {
     apiBaseUrl?: string;
-    enableMockData?: boolean;
   };
 }

@@ -54,7 +54,6 @@ import {
   submitFeedback,
   updateComment,
   type ChatRequest,
-  type FeedbackVote,
 } from './api';
 import nvidiaLogo from './assets/nvidia-logo.svg';
 import { AlertRecord, AnalysisRun, Artifact, FeedbackSummary, Incident, IncidentDetail, SimilarIncident } from './types';
@@ -77,8 +76,7 @@ type RealtimeEventPayload = {
 };
 
 type EditorTab = 'write' | 'preview';
-type MainView = 'operations' | 'analysis' | 'evidence' | 'agents';
-type DashboardDataState = 'loading' | 'backend-down' | 'empty' | 'live';
+type MainView = 'incidents' | 'alerts' | 'analysis' | 'agents';
 type DetailKind = 'incident' | 'alert';
 
 type RouteState = {
@@ -102,7 +100,6 @@ type EvidenceItem = {
   alertID?: string;
   incidentID?: string;
   createdAt: string;
-  mock?: boolean;
 };
 
 type AgentSummary = {
@@ -114,7 +111,6 @@ type AgentSummary = {
   source: string;
   lastRun: string;
   evidenceCount: number;
-  mock?: boolean;
 };
 
 type SynthesisSummary = {
@@ -125,7 +121,6 @@ type SynthesisSummary = {
   source: string;
   lastRun: string;
   runCount: number;
-  mock?: boolean;
 };
 
 type AnalysisRecord = {
@@ -151,7 +146,6 @@ type AnalysisRecord = {
   commentCount: number;
   createdAt: string;
   isAnalyzing: boolean;
-  mock?: boolean;
 };
 
 type TrendPoint = {
@@ -197,309 +191,25 @@ const ANALYSIS_WINDOWS = [
   { label: '14d', days: 14 },
   { label: '30d', days: 30 },
 ];
-const ENABLE_MOCK_DATA = runtimeBool('enableMockData', 'VITE_ENABLE_MOCK_DATA', import.meta.env.DEV);
-
 function isCollectorAgent(agent: string) {
   return COMPONENT_AGENT_ORDER.includes(agent);
 }
 
-const MOCK_EVIDENCE_ITEM: EvidenceItem = {
-  id: 'mock-evidence-runai-queue',
-  title: 'Sample Run:AI queue snapshot',
-  agent: 'runai',
-  source: 'mock.runai.queue',
-  type: 'queue-snapshot',
-  status: 'ok',
-  confidence: 'high',
-  target: 'vision / gpu-a / trainer',
-  summary: 'Mock evidence: workload trainer is pending because gpu-a quota is exhausted.',
-  query: 'GET /api/v1/workloads?project=vision&queue=gpu-a&name=trainer',
-  result: {
-    queue: 'gpu-a',
-    requested_gpus: 4,
-    allocated_gpus: 0,
-    reason: 'GPU quota exhausted',
-  },
-  createdAt: '2026-06-26T00:00:00Z',
-  mock: true,
-};
-const MOCK_SYNTHESIS_SUMMARY: SynthesisSummary = {
-  id: 'mock-synthesis-analysis',
-  name: 'RCA Synthesis',
-  status: 'ok',
-  summary: 'Mock synthesis run: combines collector evidence into the RCA report and dashboard state.',
-  source: 'mock.agent.analysis',
-  lastRun: '2026-06-26T00:00:00Z',
-  runCount: 1,
-  mock: true,
-};
-const MOCK_ALERT_ARTIFACT: Artifact = {
-  agent: 'runai',
-  source: 'mock.runai.queue',
-  type: 'queue-snapshot',
-  status: 'ok',
-  confidence: 'high',
-  query: 'GET /api/v1/workloads?project=vision&queue=gpu-a&name=trainer',
-  summary: 'Mock evidence: workload trainer is pending because gpu-a quota is exhausted.',
-  result: {
-    queue: 'gpu-a',
-    requested_gpus: 4,
-    allocated_gpus: 0,
-    reason: 'GPU quota exhausted',
-  },
-};
-const MOCK_SIMILAR_INCIDENT: SimilarIncident = {
-  incident_id: 'MOCK-INC-000002',
-  alert_id: 'MOCK-ALR-000002',
-  title: 'Recurring gpu-a queue saturation',
-  severity: 'warning',
-  status: 'resolved',
-  similarity: 0.91,
-  analysis_summary: 'Prior gpu-a saturation was resolved by moving one trainer workload and increasing queue quota.',
-  analysis_detail:
-    '## Root Cause\n\nHistorical Run:AI queue saturation on `gpu-a` exhausted available GPU quota.\n\n## Recommended Actions\n\nMove lower-priority workloads or increase queue quota before retrying trainers.',
-  positive_feedback: 1,
-  negative_feedback: 0,
-  comment_count: 1,
-  labels: {
-    namespace: 'runai',
-    project: 'vision',
-    queue: 'gpu-a',
-    workload: 'batch-trainer',
-  },
-  created_at: '2026-06-25T09:30:00Z',
-};
-const MOCK_INCIDENT: Incident = {
-  incident_id: 'MOCK-INC-000001',
-  correlation_key: 'mock/runai/queue/gpu-a/trainer',
-  title: 'Mock GPU workload pending on Run:AI queue',
-  severity: 'warning',
-  status: 'firing',
-  fired_at: '2026-06-26T00:00:00Z',
-  resolved_at: null,
-  alert_count: 1,
-  is_analyzing: false,
-};
-const MOCK_ALERT: AlertRecord = {
-  alert_id: 'MOCK-ALR-000001',
-  incident_id: MOCK_INCIDENT.incident_id,
-  alarm_title: 'Mock Run:AI workload pending',
-  severity: 'warning',
-  status: 'firing',
-  fired_at: MOCK_INCIDENT.fired_at,
-  resolved_at: null,
-  fingerprint: 'mock-runai-workload-pending',
-  thread_ts: 'mock-thread',
-  labels: {
-    namespace: 'runai',
-    project: 'vision',
-    queue: 'gpu-a',
-    workload: 'trainer',
-  },
-  annotations: {
-    summary: 'Mock workload is pending while waiting for GPU quota.',
-  },
-  analysis_summary: 'Mock RCA: gpu-a quota is exhausted, so the workload cannot be scheduled.',
-  analysis_detail:
-    '## Root Cause\n\nMock Run:AI queue `gpu-a` has no available GPU quota for workload `trainer`.\n\n## Recommended Actions\n\nIncrease queue quota or move the workload to a queue with available GPUs.',
-  analysis_quality: 'mock',
-  capabilities: {
-    runai: 'ok',
-    kubernetes: 'pending',
-    postgres: 'ok',
-    prometheus: 'pending',
-    loki: 'pending',
-  },
-  missing_data: ['live cluster connection'],
-  warnings: ['Mock data is shown because the Operations dashboard has no live incidents or alerts yet.'],
-  artifacts: [MOCK_ALERT_ARTIFACT],
-  similar_incidents: [MOCK_SIMILAR_INCIDENT],
-  feedback: {
-    target_type: 'alert',
-    target_id: 'MOCK-ALR-000001',
-    positive: 0,
-    negative: 0,
-    comments: [],
-  },
-  is_analyzing: false,
-};
-const MOCK_INCIDENT_DETAIL: IncidentDetail = {
-  ...MOCK_INCIDENT,
-  analysis_summary: MOCK_ALERT.analysis_summary,
-  analysis_detail: MOCK_ALERT.analysis_detail,
-  analysis_quality: MOCK_ALERT.analysis_quality,
-  capabilities: MOCK_ALERT.capabilities,
-  missing_data: MOCK_ALERT.missing_data,
-  warnings: MOCK_ALERT.warnings,
-  artifacts: MOCK_ALERT.artifacts,
-  similar_incidents: [MOCK_SIMILAR_INCIDENT],
-  feedback: {
-    target_type: 'incident',
-    target_id: 'MOCK-INC-000001',
-    positive: 0,
-    negative: 0,
-    comments: [],
-  },
-  alerts: [MOCK_ALERT],
-};
-const MOCK_ANALYTICS_INCIDENTS: Incident[] = [
-  MOCK_INCIDENT,
-  makeMockIncident({
-    id: 'MOCK-INC-000002',
-    correlationKey: 'mock/runai/queue/gpu-a/batch-trainer',
-    title: 'Recurring gpu-a queue saturation',
-    severity: 'warning',
-    status: 'resolved',
-    firedAt: '2026-06-25T09:30:00Z',
-    resolvedAt: '2026-06-25T10:05:00Z',
-    alertCount: 2,
-  }),
-  makeMockIncident({
-    id: 'MOCK-INC-000003',
-    correlationKey: 'mock/runai-backend/scheduler/reconcile-lag',
-    title: 'Run:AI scheduler reconciliation lag',
-    severity: 'critical',
-    status: 'resolved',
-    firedAt: '2026-06-24T03:20:00Z',
-    resolvedAt: '2026-06-24T04:08:00Z',
-    alertCount: 3,
-  }),
-  makeMockIncident({
-    id: 'MOCK-INC-000004',
-    correlationKey: 'mock/runai/queue/gpu-b/eval-worker',
-    title: 'GPU node capacity pressure delayed pods',
-    severity: 'warning',
-    status: 'resolved',
-    firedAt: '2026-06-22T13:10:00Z',
-    resolvedAt: '2026-06-22T14:00:00Z',
-    alertCount: 1,
-  }),
-  makeMockIncident({
-    id: 'MOCK-INC-000005',
-    correlationKey: 'mock/runai/project/cv/image-pull',
-    title: 'Image pull delay during CV workload startup',
-    severity: 'info',
-    status: 'resolved',
-    firedAt: '2026-06-20T18:00:00Z',
-    resolvedAt: '2026-06-20T18:18:00Z',
-    alertCount: 1,
-  }),
-  makeMockIncident({
-    id: 'MOCK-INC-000006',
-    correlationKey: 'mock/postgres/rca-memory/write-latency',
-    title: 'RCA memory write latency increased',
-    severity: 'warning',
-    status: 'resolved',
-    firedAt: '2026-06-18T01:40:00Z',
-    resolvedAt: '2026-06-18T02:21:00Z',
-    alertCount: 1,
-  }),
-];
-const MOCK_ANALYTICS_ALERTS: AlertRecord[] = [
-  MOCK_ALERT,
-  makeMockAlert({
-    id: 'MOCK-ALR-000002',
-    incidentID: 'MOCK-INC-000002',
-    title: 'Mock Run:AI queue gpu-a saturation',
-    severity: 'warning',
-    status: 'resolved',
-    firedAt: '2026-06-25T09:30:00Z',
-    resolvedAt: '2026-06-25T10:05:00Z',
-    labels: { namespace: 'runai', project: 'vision', queue: 'gpu-a', workload: 'batch-trainer' },
-    quality: 'high',
-    summary: 'Queue gpu-a requested GPUs exceeded allocatable quota for two training workloads.',
-    capabilities: { runai: 'ok', kubernetes: 'ok', postgres: 'ok', prometheus: 'ok', loki: 'partial' },
-    artifacts: 4,
-  }),
-  makeMockAlert({
-    id: 'MOCK-ALR-000003',
-    incidentID: 'MOCK-INC-000003',
-    title: 'Mock Run:AI backend scheduler lag',
-    severity: 'critical',
-    status: 'resolved',
-    firedAt: '2026-06-24T03:20:00Z',
-    resolvedAt: '2026-06-24T04:08:00Z',
-    labels: { namespace: 'runai-backend', project: 'platform', queue: 'gpu-platform', workload: 'scheduler' },
-    quality: 'high',
-    summary: 'Scheduler reconciliation lag aligned with runai-backend warning logs and pending workload growth.',
-    capabilities: { runai: 'partial', kubernetes: 'ok', postgres: 'ok', prometheus: 'ok', loki: 'ok' },
-    artifacts: 5,
-    warnings: ['scheduler log window was sampled'],
-  }),
-  makeMockAlert({
-    id: 'MOCK-ALR-000004',
-    incidentID: 'MOCK-INC-000003',
-    title: 'Mock pending workload burst',
-    severity: 'warning',
-    status: 'resolved',
-    firedAt: '2026-06-24T03:36:00Z',
-    resolvedAt: '2026-06-24T04:08:00Z',
-    labels: { namespace: 'runai', project: 'platform', queue: 'gpu-platform', workload: 'inference-burst' },
-    quality: 'medium',
-    summary: 'Pending workloads increased while scheduler reconciliation was delayed.',
-    capabilities: { runai: 'ok', kubernetes: 'ok', postgres: 'ok', prometheus: 'partial', loki: 'ok' },
-    artifacts: 3,
-  }),
-  makeMockAlert({
-    id: 'MOCK-ALR-000005',
-    incidentID: 'MOCK-INC-000004',
-    title: 'Mock GPU node allocatable pressure',
-    severity: 'warning',
-    status: 'resolved',
-    firedAt: '2026-06-22T13:10:00Z',
-    resolvedAt: '2026-06-22T14:00:00Z',
-    labels: { namespace: 'runai', project: 'research', queue: 'gpu-b', workload: 'eval-worker' },
-    quality: 'medium',
-    summary: 'GPU node allocatable capacity was lower than queued pod requests during the alert window.',
-    capabilities: { runai: 'ok', kubernetes: 'ok', postgres: 'ok', prometheus: 'partial', loki: 'pending' },
-    artifacts: 3,
-    missingData: ['loki.workload_logs'],
-  }),
-  makeMockAlert({
-    id: 'MOCK-ALR-000006',
-    incidentID: 'MOCK-INC-000005',
-    title: 'Mock image pull delay',
-    severity: 'info',
-    status: 'resolved',
-    firedAt: '2026-06-20T18:00:00Z',
-    resolvedAt: '2026-06-20T18:18:00Z',
-    labels: { namespace: 'runai-cv', project: 'cv', queue: 'gpu-c', workload: 'preprocess' },
-    quality: 'medium',
-    summary: 'Image pull latency caused a short startup delay before the workload recovered.',
-    capabilities: { runai: 'ok', kubernetes: 'ok', postgres: 'ok', prometheus: 'pending', loki: 'ok' },
-    artifacts: 2,
-  }),
-  makeMockAlert({
-    id: 'MOCK-ALR-000007',
-    incidentID: 'MOCK-INC-000006',
-    title: 'Mock RCA memory write latency',
-    severity: 'warning',
-    status: 'resolved',
-    firedAt: '2026-06-18T01:40:00Z',
-    resolvedAt: '2026-06-18T02:21:00Z',
-    labels: { namespace: 'runai-rca', project: 'ops', queue: 'control-plane', workload: 'backend' },
-    quality: 'low',
-    summary: 'Postgres write latency affected RCA memory persistence but did not block alert analysis.',
-    capabilities: { runai: 'pending', kubernetes: 'ok', postgres: 'partial', prometheus: 'ok', loki: 'partial' },
-    artifacts: 3,
-    missingData: ['postgres.pg_stat_statements'],
-  }),
-];
 const VIEW_COPY: Record<MainView, { eyebrow: string; title: string; placeholder: string }> = {
-  operations: {
+  incidents: {
     eyebrow: 'Incident cockpit',
-    title: 'GPU workload RCA workspace',
-    placeholder: 'Search project, queue, workload, status',
+    title: 'Incident',
+    placeholder: 'Search incident, severity, status',
+  },
+  alerts: {
+    eyebrow: 'Alert stream',
+    title: 'Alerts',
+    placeholder: 'Search alert, project, queue, namespace',
   },
   analysis: {
     eyebrow: 'Analysis dashboard',
     title: 'RCA analysis lifecycle',
     placeholder: 'Search RCA, quality, missing data, agent',
-  },
-  evidence: {
-    eyebrow: 'Evidence inventory',
-    title: 'Collected RCA evidence',
-    placeholder: 'Search evidence, agent, source, target',
   },
   agents: {
     eyebrow: 'Agent registry',
@@ -510,29 +220,31 @@ const VIEW_COPY: Record<MainView, { eyebrow: string; title: string; placeholder:
 
 function routeFromHash(hash: string): RouteState {
   const normalized = hash.replace(/^#\/?/, '').replace(/^\/+/, '');
-  if (!normalized) return { view: 'operations' };
+  if (!normalized) return { view: 'incidents' };
   const [first, second, ...rest] = normalized.split('/');
-  if (isMainView(first) && (second === 'incidents' || second === 'incident' || second === 'alerts' || second === 'alert')) {
+  const view = first === 'operations' ? 'incidents' : first;
+  const collection = second === 'incident' ? 'incidents' : second === 'alert' ? 'alerts' : second;
+  if ((isMainView(view) || first === 'operations') && (collection === 'incidents' || collection === 'alerts')) {
     const id = rest.length > 0 ? decodeRoutePart(rest.join('/')) : '';
-    if ((second === 'incidents' || second === 'incident') && id) {
-      return { view: first, detailKind: 'incident', detailID: id };
+    if (collection === 'incidents' && id) {
+      return { view: isMainView(view) ? view : 'incidents', detailKind: 'incident', detailID: id };
     }
-    if ((second === 'alerts' || second === 'alert') && id) {
-      return { view: first, detailKind: 'alert', detailID: id };
+    if (collection === 'alerts' && id) {
+      return { view: isMainView(view) ? view : 'alerts', detailKind: 'alert', detailID: id };
     }
   }
-  const rawKind = first;
+  const rawKind = view;
   const id = second ? decodeRoutePart([second, ...rest].join('/')) : '';
   if ((rawKind === 'incidents' || rawKind === 'incident') && id) {
-    return { view: 'operations', detailKind: 'incident', detailID: id };
+    return { view: 'incidents', detailKind: 'incident', detailID: id };
   }
   if ((rawKind === 'alerts' || rawKind === 'alert') && id) {
-    return { view: 'operations', detailKind: 'alert', detailID: id };
+    return { view: 'alerts', detailKind: 'alert', detailID: id };
   }
   if (isMainView(rawKind)) {
     return { view: rawKind };
   }
-  return { view: 'operations' };
+  return { view: 'incidents' };
 }
 
 function decodeRoutePart(value: string) {
@@ -544,7 +256,7 @@ function decodeRoutePart(value: string) {
 }
 
 function isMainView(value: string): value is MainView {
-  return value === 'analysis' || value === 'evidence' || value === 'agents' || value === 'operations';
+  return value === 'incidents' || value === 'alerts' || value === 'analysis' || value === 'agents';
 }
 
 function hashForView(view: MainView) {
@@ -554,180 +266,6 @@ function hashForView(view: MainView) {
 function hashForDetail(kind: DetailKind, id: string, view: MainView) {
   const collection = kind === 'incident' ? 'incidents' : 'alerts';
   return `#/${view}/${collection}/${encodeURIComponent(id)}`;
-}
-
-function makeMockIncident({
-  id,
-  correlationKey,
-  title,
-  severity,
-  status,
-  firedAt,
-  resolvedAt,
-  alertCount,
-}: {
-  id: string;
-  correlationKey: string;
-  title: string;
-  severity: string;
-  status: string;
-  firedAt: string;
-  resolvedAt: string | null;
-  alertCount: number;
-}): Incident {
-  return {
-    incident_id: id,
-    correlation_key: correlationKey,
-    title,
-    severity,
-    status,
-    fired_at: firedAt,
-    resolved_at: resolvedAt,
-    alert_count: alertCount,
-    is_analyzing: false,
-  };
-}
-
-function makeMockSimilarIncident({
-  id,
-  incidentID,
-  title,
-  severity,
-  firedAt,
-  labels,
-  summary,
-}: {
-  id: string;
-  incidentID: string;
-  title: string;
-  severity: string;
-  firedAt: string;
-  labels: Record<string, string>;
-  summary: string;
-}): SimilarIncident {
-  const queue = labels.queue || 'cluster';
-  const namespace = labels.namespace || 'runai';
-  return {
-    incident_id: `${incidentID}-MEMORY`,
-    alert_id: `${id}-MEMORY`,
-    title: `Prior ${queue} RCA memory`,
-    severity,
-    status: 'resolved',
-    similarity: queue === 'gpu-a' ? 0.88 : 0.82,
-    analysis_summary: `Historical RCA with matching ${namespace}/${queue} labels: ${summary}`,
-    analysis_detail:
-      '## Root Cause\n\nPrior RCA memory matched namespace, queue, workload, or symptom tokens.\n\n## Recommended Actions\n\nReuse the prior pattern only after validating current Run:AI, Kubernetes, Prometheus, Loki, and Postgres evidence.',
-    positive_feedback: 1,
-    negative_feedback: 0,
-    comment_count: 1,
-    labels,
-    created_at: firedAt,
-  };
-}
-
-function mergeSimilarIncidents(lists: Array<SimilarIncident[] | undefined>) {
-  const seen = new Set<string>();
-  const merged: SimilarIncident[] = [];
-  for (const items of lists) {
-    for (const item of items ?? []) {
-      if (seen.has(item.incident_id)) continue;
-      seen.add(item.incident_id);
-      merged.push(item);
-    }
-  }
-  return merged;
-}
-
-function makeMockAlert({
-  id,
-  incidentID,
-  title,
-  severity,
-  status,
-  firedAt,
-  resolvedAt,
-  labels,
-  quality,
-  summary,
-  capabilities,
-  artifacts,
-  missingData = [],
-  warnings = [],
-  similarIncidents,
-}: {
-  id: string;
-  incidentID: string;
-  title: string;
-  severity: string;
-  status: string;
-  firedAt: string;
-  resolvedAt: string | null;
-  labels: Record<string, string>;
-  quality: string;
-  summary: string;
-  capabilities: Record<string, string>;
-  artifacts: number;
-  missingData?: string[];
-  warnings?: string[];
-  similarIncidents?: SimilarIncident[];
-}): AlertRecord {
-  return {
-    alert_id: id,
-    incident_id: incidentID,
-    alarm_title: title,
-    severity,
-    status,
-    fired_at: firedAt,
-    resolved_at: resolvedAt,
-    fingerprint: id.toLowerCase(),
-    thread_ts: `mock-${id.toLowerCase()}`,
-    labels,
-    annotations: {
-      summary,
-    },
-    analysis_summary: summary,
-    analysis_detail: [
-      '## Root Cause',
-      '',
-      summary,
-      '',
-      '## Evidence',
-      '',
-      '- Mock evidence follows the same shape as live Run:AI RCA collector artifacts.',
-      '',
-      '## Recommended Actions',
-      '',
-      '- Confirm queue, pod, metric, log, and persistence evidence before taking action.',
-    ].join('\n'),
-    analysis_quality: quality,
-    capabilities,
-    missing_data: missingData,
-    warnings,
-    artifacts: Array.from({ length: artifacts }).map((_, index) => ({
-      agent: COMPONENT_AGENT_ORDER[index % COMPONENT_AGENT_ORDER.length],
-      source: `mock.${COMPONENT_AGENT_ORDER[index % COMPONENT_AGENT_ORDER.length]}`,
-      type: 'analysis-signal',
-      status: index === 0 ? 'ok' : 'partial',
-      confidence: index <= 1 ? 'high' : 'medium',
-      summary: `${agentLabel(COMPONENT_AGENT_ORDER[index % COMPONENT_AGENT_ORDER.length])} mock signal for ${title}.`,
-      result: { incident_id: incidentID, alert_id: id, signal_index: index + 1 },
-    })),
-    similar_incidents:
-      similarIncidents ??
-      [makeMockSimilarIncident({ id, incidentID, title, severity, firedAt, labels, summary })],
-    feedback: mockFeedback('alert', id),
-    is_analyzing: false,
-  };
-}
-
-function mockFeedback(targetType: 'incident' | 'alert', targetID: string): FeedbackSummary {
-  return {
-    target_type: targetType,
-    target_id: targetID,
-    positive: 0,
-    negative: 0,
-    comments: [],
-  };
 }
 
 function normalizeFeedbackSummary(
@@ -743,60 +281,6 @@ function normalizeFeedbackSummary(
     my_vote: feedback?.my_vote,
     comments: feedback?.comments ?? [],
     learning_hints: feedback?.learning_hints,
-  };
-}
-
-function isMockTargetID(id: string) {
-  return id.startsWith('MOCK-');
-}
-
-function applyFeedbackVote(summary: FeedbackSummary, nextVote: FeedbackVote): FeedbackSummary {
-  const previousVote = summary.my_vote;
-  let positive = summary.positive;
-  let negative = summary.negative;
-  if (previousVote === 'up') positive = Math.max(0, positive - 1);
-  if (previousVote === 'down') negative = Math.max(0, negative - 1);
-  if (nextVote === 'up') positive += 1;
-  if (nextVote === 'down') negative += 1;
-  return {
-    ...summary,
-    positive,
-    negative,
-    my_vote: nextVote === 'none' ? undefined : nextVote,
-  };
-}
-
-function appendMockComment(summary: FeedbackSummary, body: string): FeedbackSummary {
-  const targetType = summary.target_type === 'alert' ? 'alert' : 'incident';
-  const comment = {
-    comment_id: `MOCK-CMT-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-    target_type: targetType,
-    target_id: summary.target_id,
-    incident_id: targetType === 'incident' ? summary.target_id : undefined,
-    alert_id: targetType === 'alert' ? summary.target_id : undefined,
-    body,
-    author: 'operator',
-    created_at: new Date().toISOString(),
-  };
-  return {
-    ...summary,
-    comments: [comment, ...summary.comments],
-  };
-}
-
-function updateMockComment(summary: FeedbackSummary, commentID: string, body: string): FeedbackSummary {
-  return {
-    ...summary,
-    comments: summary.comments.map((item) =>
-      item.comment_id === commentID ? { ...item, body } : item,
-    ),
-  };
-}
-
-function removeMockComment(summary: FeedbackSummary, commentID: string): FeedbackSummary {
-  return {
-    ...summary,
-    comments: summary.comments.filter((item) => item.comment_id !== commentID),
   };
 }
 
@@ -826,45 +310,6 @@ async function copyToClipboard(value: string) {
   textarea.select();
   document.execCommand('copy');
   document.body.removeChild(textarea);
-}
-
-function runtimeBool(runtimeKey: 'enableMockData', envKey: string, fallback: boolean) {
-  const runtimeValue = window.__RUNAI_RCA_CONFIG__?.[runtimeKey];
-  if (typeof runtimeValue === 'boolean') return runtimeValue;
-  const envValue = import.meta.env[envKey];
-  if (envValue === undefined) return fallback;
-  return ['1', 'true', 'yes', 'on'].includes(String(envValue).trim().toLowerCase());
-}
-
-function mockAlertDetail(id: string) {
-  return MOCK_ANALYTICS_ALERTS.find((alert) => alert.alert_id === id) ?? null;
-}
-
-function mockIncidentDetail(id: string): IncidentDetail | null {
-  if (id === MOCK_INCIDENT.incident_id) return MOCK_INCIDENT_DETAIL;
-  const incident = MOCK_ANALYTICS_INCIDENTS.find((item) => item.incident_id === id);
-  if (!incident) return null;
-  const incidentAlerts = MOCK_ANALYTICS_ALERTS.filter((alert) => alert.incident_id === id);
-  const firstAlert = incidentAlerts[0];
-  return {
-    ...incident,
-    analysis_summary: firstAlert?.analysis_summary ?? '',
-    analysis_detail: incidentAlerts.map((alert) => alert.analysis_detail).filter(Boolean).join('\n\n---\n\n'),
-    analysis_quality: firstAlert?.analysis_quality ?? 'pending',
-    capabilities: mergeCapabilities(incidentAlerts.map((alert) => alert.capabilities)),
-    missing_data: uniqueStrings(incidentAlerts.flatMap((alert) => alert.missing_data)),
-    warnings: uniqueStrings(incidentAlerts.flatMap((alert) => alert.warnings)),
-    artifacts: incidentAlerts.flatMap((alert) => alert.artifacts),
-    similar_incidents: mergeSimilarIncidents(incidentAlerts.map((alert) => alert.similar_incidents)),
-    feedback: mockFeedback('incident', id),
-    alerts: incidentAlerts,
-  };
-}
-
-function isMockDetail(detail: DetailState) {
-  if (!detail) return false;
-  const id = detail.kind === 'incident' ? detail.data.incident_id : detail.data.alert_id;
-  return id.startsWith('MOCK-');
 }
 
 function parseRealtimeEvent(event: Event): RealtimeEventPayload | undefined {
@@ -942,10 +387,10 @@ function useDashboardData() {
   const [analysisRuns, setAnalysisRuns] = useState<AnalysisRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [dataState, setDataState] = useState<DashboardDataState>('loading');
   const [realtimePayload, setRealtimePayload] = useState<RealtimeEventPayload>();
 
   const load = useCallback(async () => {
+    setLoading(true);
     setError('');
     let nextAnalysisRuns: AnalysisRun[] = [];
     try {
@@ -958,17 +403,14 @@ function useDashboardData() {
       } catch (err) {
         setAnalysisRuns([]);
         const message = err instanceof Error ? err.message : 'Failed to load analysis runs.';
-        setError(`Analysis runs are unavailable: ${message}`);
+          setError(`Analysis runs are unavailable: ${message}`);
       }
-      const hasLiveRows = incidentData.length > 0 || alertData.length > 0 || nextAnalysisRuns.length > 0;
-      setDataState(hasLiveRows ? 'live' : 'empty');
     } catch (err) {
       setIncidents([]);
       setAlerts([]);
       setAnalysisRuns([]);
-      setDataState('backend-down');
       const message = err instanceof Error ? err.message : 'Failed to load dashboard data.';
-      setError(ENABLE_MOCK_DATA ? '' : message);
+      setError(message);
     } finally {
       setLoading(false);
     }
@@ -983,10 +425,8 @@ function useDashboardData() {
     try {
       source = eventSource();
     } catch (err) {
-      if (!ENABLE_MOCK_DATA) {
-        const message = err instanceof Error ? err.message : 'Realtime updates are unavailable.';
-        setError(`Realtime updates are unavailable: ${message}`);
-      }
+      const message = err instanceof Error ? err.message : 'Realtime updates are unavailable.';
+      setError(`Realtime updates are unavailable: ${message}`);
       return undefined;
     }
     const handleRealtimeEvent = (event: Event) => {
@@ -1003,13 +443,6 @@ function useDashboardData() {
     return () => source.close();
   }, [load]);
 
-  const hasLiveData = incidents.length > 0 || alerts.length > 0 || analysisRuns.length > 0;
-  const showMockData =
-    ENABLE_MOCK_DATA &&
-    !loading &&
-    !hasLiveData &&
-    (dataState === 'backend-down' || dataState === 'empty');
-
   return {
     incidents,
     alerts,
@@ -1017,8 +450,6 @@ function useDashboardData() {
     loading,
     error,
     load,
-    hasLiveData,
-    showMockData,
     realtimePayload,
   };
 }
@@ -1031,8 +462,6 @@ function App() {
     loading,
     error,
     load,
-    hasLiveData,
-    showMockData,
     realtimePayload,
   } = useDashboardData();
   const [detail, setDetail] = useState<DetailState>(null);
@@ -1046,33 +475,27 @@ function App() {
     detailVersionRef.current += 1;
   }, [detail]);
 
-  useEffect(() => {
-    if (!loading && hasLiveData && isMockDetail(detail)) {
-      setDetail(null);
-    }
-  }, [detail, hasLiveData, loading]);
-
-  const operationIncidents = showMockData ? [MOCK_INCIDENT] : incidents;
-  const operationAlerts = showMockData ? [MOCK_ALERT] : alerts;
-  const analysisIncidents = showMockData ? MOCK_ANALYTICS_INCIDENTS : incidents;
-  const analysisAlerts = showMockData ? MOCK_ANALYTICS_ALERTS : alerts;
-  const dashboardAnalysisRuns = showMockData ? [] : analysisRuns;
+  const dashboardIncidents = incidents;
+  const dashboardAlerts = alerts;
+  const analysisIncidents = incidents;
+  const analysisAlerts = alerts;
+  const dashboardAnalysisRuns = analysisRuns;
 
   const filteredIncidents = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return operationIncidents;
-    return operationIncidents.filter((incident) =>
+    if (!q) return dashboardIncidents;
+    return dashboardIncidents.filter((incident) =>
       [incident.title, incident.severity, incident.status, incident.correlation_key]
         .join(' ')
         .toLowerCase()
         .includes(q),
     );
-  }, [operationIncidents, query]);
+  }, [dashboardIncidents, query]);
 
   const filteredAlerts = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return operationAlerts;
-    return operationAlerts.filter((alert) =>
+    if (!q) return dashboardAlerts;
+    return dashboardAlerts.filter((alert) =>
       [
         alert.alarm_title,
         alert.severity,
@@ -1086,7 +509,7 @@ function App() {
         .toLowerCase()
         .includes(q),
     );
-  }, [operationAlerts, query]);
+  }, [dashboardAlerts, query]);
 
   const analysisRecords = useMemo(
     () => buildAnalysisRecords(analysisAlerts, dashboardAnalysisRuns),
@@ -1139,43 +562,27 @@ function App() {
     );
   }, [alerts]);
 
-  const evidenceItems = liveEvidenceItems.length > 0 ? liveEvidenceItems : showMockData ? [MOCK_EVIDENCE_ITEM] : [];
-
-  const filteredEvidence = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return evidenceItems;
-    return evidenceItems.filter((item) =>
-      [item.title, item.agent, item.source, item.type, item.status, item.confidence, item.target, item.summary]
-        .join(' ')
-        .toLowerCase()
-        .includes(q),
-    );
-  }, [evidenceItems, query]);
-
   const agentSummaries = useMemo<AgentSummary[]>(() => {
-    const evidenceSource = showMockData ? [MOCK_EVIDENCE_ITEM] : liveEvidenceItems;
     return COMPONENT_AGENT_ORDER.map((agent) => {
-      const agentEvidence = evidenceSource.filter((item) => item.agent === agent);
-      const latest = agentEvidence[0];
+      const agentEvidence = latestEvidenceForAgent(liveEvidenceItems, agent);
+      const signal = latestAgentSignal(analysisRecords, agentEvidence, agent);
       return {
         id: `agent-${agent}`,
         agent,
         name: `${agentLabel(agent)} Collector`,
-        status: agentEvidence.length > 0 ? 'ok' : 'pending',
+        status: signal.status,
         summary:
           agentEvidence.length > 0
             ? `${agentEvidence.length} collector evidence item(s) linked to recent RCA context.`
             : 'No collector evidence has been collected by this agent yet.',
-        source: latest?.source || `${agent}.collector`,
-        lastRun: latest?.createdAt || '-',
+        source: signal.source,
+        lastRun: signal.lastRun,
         evidenceCount: agentEvidence.length,
-        mock: latest?.mock,
       };
     });
-  }, [liveEvidenceItems, showMockData]);
+  }, [analysisRecords, liveEvidenceItems]);
 
   const synthesisSummary = useMemo<SynthesisSummary>(() => {
-    if (showMockData) return MOCK_SYNTHESIS_SUMMARY;
     const latest = analysisRecords[0];
     return {
       id: 'synthesis-analysis',
@@ -1193,7 +600,7 @@ function App() {
       lastRun: latest?.createdAt || '-',
       runCount: analysisRecords.length,
     };
-  }, [analysisRecords, showMockData]);
+  }, [analysisRecords]);
 
   const filteredAgents = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -1227,29 +634,11 @@ function App() {
     }
     try {
       if (route.detailKind === 'incident') {
-        if (showMockData) {
-          const mockDetail = mockIncidentDetail(route.detailID);
-          if (mockDetail) {
-            if (routeLoadVersionRef.current === version) {
-              setDetail({ kind: 'incident', data: mockDetail });
-            }
-            return;
-          }
-        }
         const nextDetail = await fetchIncident(route.detailID);
         if (routeLoadVersionRef.current === version) {
           setDetail({ kind: 'incident', data: nextDetail });
         }
         return;
-      }
-      if (showMockData) {
-        const mockAlert = mockAlertDetail(route.detailID);
-        if (mockAlert) {
-          if (routeLoadVersionRef.current === version) {
-            setDetail({ kind: 'alert', data: mockAlert });
-          }
-          return;
-        }
       }
       const nextAlert = await fetchAlert(route.detailID);
       if (routeLoadVersionRef.current === version) {
@@ -1260,11 +649,11 @@ function App() {
         setDetail(null);
       }
     }
-  }, [showMockData]);
+  }, []);
 
   useEffect(() => {
     if (!window.location.hash) {
-      window.history.replaceState(null, '', hashForView('operations'));
+      window.history.replaceState(null, '', hashForView('incidents'));
     }
     const handleHashChange = () => {
       void loadRoute(routeFromHash(window.location.hash));
@@ -1284,42 +673,27 @@ function App() {
 
   const viewCopy = VIEW_COPY[activeView];
 
-  const goHome = () => navigateToHash(hashForView('operations'));
+  const goHome = () => navigateToHash(hashForView('incidents'));
 
-  const switchView = (view: MainView) => navigateToHash(hashForView(view));
+  const switchView = (view: MainView) => {
+    navigateToHash(hashForView(view));
+    void load();
+  };
 
   const closeDetail = () => navigateToHash(hashForView(activeView));
 
   const openIncident = useCallback(async (id: string) => {
-    navigateToHash(hashForDetail('incident', id, activeView));
-  }, [activeView, navigateToHash]);
+    navigateToHash(hashForDetail('incident', id, 'incidents'));
+  }, [navigateToHash]);
 
   const openAlert = useCallback(async (id: string) => {
-    navigateToHash(hashForDetail('alert', id, activeView));
-  }, [activeView, navigateToHash]);
+    navigateToHash(hashForDetail('alert', id, 'alerts'));
+  }, [navigateToHash]);
 
   const refreshDetail = useCallback(async () => {
     const currentDetail = detail;
     const version = detailVersionRef.current;
     if (!currentDetail) return;
-    if (showMockData && currentDetail.kind === 'incident') {
-      const mockDetail = mockIncidentDetail(currentDetail.data.incident_id);
-      if (mockDetail) {
-        if (detailVersionRef.current === version) {
-          setDetail({ kind: 'incident', data: mockDetail });
-        }
-        return;
-      }
-    }
-    if (showMockData && currentDetail.kind === 'alert') {
-      const mockAlert = mockAlertDetail(currentDetail.data.alert_id);
-      if (mockAlert) {
-        if (detailVersionRef.current === version) {
-          setDetail({ kind: 'alert', data: mockAlert });
-        }
-        return;
-      }
-    }
     if (currentDetail.kind === 'incident') {
       const nextDetail = await fetchIncident(currentDetail.data.incident_id);
       if (detailVersionRef.current === version) {
@@ -1331,7 +705,12 @@ function App() {
     if (detailVersionRef.current === version) {
       setDetail({ kind: 'alert', data: nextAlert });
     }
-  }, [detail, showMockData]);
+  }, [detail]);
+
+  const refreshCurrentView = useCallback(async () => {
+    await load();
+    await refreshDetail();
+  }, [load, refreshDetail]);
 
   useEffect(() => {
     if (realtimeEventMatchesDetail(detail, realtimePayload)) {
@@ -1342,7 +721,7 @@ function App() {
   return (
     <div className={`app-shell ${chatDocked ? 'chat-docked' : ''}`}>
       <aside className="sidebar">
-        <button className="brand-mark" onClick={goHome} type="button" aria-label="Go to operations dashboard">
+        <button className="brand-mark" onClick={goHome} type="button" aria-label="Go to incidents dashboard">
           <img className="brand-logo" src={nvidiaLogo} alt="NVIDIA" />
         </button>
         <div>
@@ -1351,11 +730,18 @@ function App() {
         </div>
         <nav>
           <button
-            className={`nav-item ${activeView === 'operations' ? 'active' : ''}`}
-            onClick={() => switchView('operations')}
+            className={`nav-item ${activeView === 'incidents' ? 'active' : ''}`}
+            onClick={() => switchView('incidents')}
             type="button"
           >
-            <Activity size={18} /> Operations
+            <Activity size={18} /> Incident
+          </button>
+          <button
+            className={`nav-item ${activeView === 'alerts' ? 'active' : ''}`}
+            onClick={() => switchView('alerts')}
+            type="button"
+          >
+            <AlertTriangle size={18} /> Alerts
           </button>
           <button
             className={`nav-item ${activeView === 'analysis' ? 'active' : ''}`}
@@ -1363,13 +749,6 @@ function App() {
             type="button"
           >
             <ListChecks size={18} /> Analysis
-          </button>
-          <button
-            className={`nav-item ${activeView === 'evidence' ? 'active' : ''}`}
-            onClick={() => switchView('evidence')}
-            type="button"
-          >
-            <Database size={18} /> Evidence
           </button>
           <button
             className={`nav-item ${activeView === 'agents' ? 'active' : ''}`}
@@ -1395,22 +774,28 @@ function App() {
               placeholder={viewCopy.placeholder}
             />
           </div>
-          <button className="icon-button" onClick={() => void load()} aria-label="Refresh">
+          <button className="icon-button" onClick={() => void refreshCurrentView()} aria-label="Refresh">
             <RefreshCw size={18} />
           </button>
         </header>
 
         {error && <div className="error-banner">{error}</div>}
 
-        {activeView === 'operations' && (
-          <OperationsView
-            incidents={operationIncidents}
-            alerts={operationAlerts}
+        {activeView === 'incidents' && (
+          <IncidentsDashboard
+            incidents={dashboardIncidents}
             filteredIncidents={filteredIncidents}
-            filteredAlerts={filteredAlerts}
             loading={loading}
             onOpenIncident={openIncident}
+          />
+        )}
+        {activeView === 'alerts' && (
+          <AlertsDashboard
+            alerts={dashboardAlerts}
+            filteredAlerts={filteredAlerts}
+            loading={loading}
             onOpenAlert={openAlert}
+            onOpenIncident={openIncident}
           />
         )}
         {activeView === 'analysis' && (
@@ -1423,17 +808,10 @@ function App() {
             loading={loading}
             onAnalyze={async (id) => {
               await analyzeIncident(id);
-              await load();
+              await refreshCurrentView();
             }}
             onOpenAlert={openAlert}
             onOpenIncident={openIncident}
-          />
-        )}
-        {activeView === 'evidence' && (
-          <EvidenceInventory
-            items={filteredEvidence}
-            totalCount={evidenceItems.length}
-            onOpenAlert={openAlert}
           />
         )}
         {activeView === 'agents' && (
@@ -1452,20 +830,19 @@ function App() {
         onRefresh={refreshDetail}
         onAnalyze={async (id) => {
           await analyzeIncident(id);
-          await refreshDetail();
+          await refreshCurrentView();
         }}
         onOpenIncident={openIncident}
         onResolve={async (id) => {
           await resolveIncident(id);
-          await refreshDetail();
-          await load();
+          await refreshCurrentView();
         }}
       />
       <FloatingChat
         detail={detail}
         activeView={activeView}
-        incidents={operationIncidents}
-        alerts={operationAlerts}
+        incidents={dashboardIncidents}
+        alerts={dashboardAlerts}
         onDockedChange={setChatDocked}
         onAnalysisCreated={load}
       />
@@ -1473,22 +850,16 @@ function App() {
   );
 }
 
-function OperationsView({
+function IncidentsDashboard({
   incidents,
-  alerts,
   filteredIncidents,
-  filteredAlerts,
   loading,
   onOpenIncident,
-  onOpenAlert,
 }: {
   incidents: Incident[];
-  alerts: AlertRecord[];
   filteredIncidents: Incident[];
-  filteredAlerts: AlertRecord[];
   loading: boolean;
   onOpenIncident: (id: string) => Promise<void>;
-  onOpenAlert: (id: string) => Promise<void>;
 }) {
   let openCount = 0;
   let resolvedCount = 0;
@@ -1498,19 +869,18 @@ function OperationsView({
     else openCount++;
     if (i.is_analyzing) analyzingIncidentCount++;
   }
-  const analyzingCount = alerts.filter((alert) => alert.is_analyzing).length + analyzingIncidentCount;
 
   return (
     <>
       <section className="metric-row">
         <Metric label="Open incidents" value={openCount} />
-        <Metric label="Alerts" value={alerts.length} />
-        <Metric label="Analyzing" value={analyzingCount} />
+        <Metric label="Total incidents" value={incidents.length} />
+        <Metric label="Analyzing" value={analyzingIncidentCount} />
         <Metric label="Resolved incidents" value={resolvedCount} />
       </section>
 
-      <section className="content-grid">
-        <div className="panel">
+      <section className="content-grid single-dashboard-grid">
+        <div className="panel full-width-panel">
           <PanelHeader title="Incidents" count={filteredIncidents.length} />
           <table className="operations-table incidents-table">
             <thead>
@@ -1540,8 +910,39 @@ function OperationsView({
           {loading && <p className="empty">Loading incidents...</p>}
           {!loading && filteredIncidents.length === 0 && <p className="empty">No incidents match the current search.</p>}
         </div>
+      </section>
+    </>
+  );
+}
 
-        <div className="panel">
+function AlertsDashboard({
+  alerts,
+  filteredAlerts,
+  loading,
+  onOpenAlert,
+  onOpenIncident,
+}: {
+  alerts: AlertRecord[];
+  filteredAlerts: AlertRecord[];
+  loading: boolean;
+  onOpenAlert: (id: string) => Promise<void>;
+  onOpenIncident: (id: string) => Promise<void>;
+}) {
+  const firingCount = alerts.filter((alert) => alert.status !== 'resolved').length;
+  const resolvedCount = alerts.filter((alert) => alert.status === 'resolved').length;
+  const analyzingCount = alerts.filter((alert) => alert.is_analyzing).length;
+
+  return (
+    <>
+      <section className="metric-row">
+        <Metric label="Firing alerts" value={firingCount} />
+        <Metric label="Total alerts" value={alerts.length} />
+        <Metric label="Analyzing" value={analyzingCount} />
+        <Metric label="Resolved alerts" value={resolvedCount} />
+      </section>
+
+      <section className="content-grid single-dashboard-grid">
+        <div className="panel full-width-panel">
           <PanelHeader title="Alerts" count={filteredAlerts.length} />
           <table className="operations-table alerts-table">
             <thead>
@@ -1584,6 +985,7 @@ function OperationsView({
               ))}
             </tbody>
           </table>
+          {loading && <p className="empty">Loading alerts...</p>}
           {!loading && filteredAlerts.length === 0 && <p className="empty">No alerts match the current search.</p>}
         </div>
       </section>
@@ -1622,7 +1024,7 @@ function AnalysisDashboard({
     [analytics.anchorDate, records, windowDays],
   );
   const completed = allRecords.filter((record) => record.analysisStatus === 'complete').length;
-  const highQuality = allRecords.filter((record) => ['high', 'mock'].includes(record.quality)).length;
+  const highQuality = allRecords.filter((record) => record.quality === 'high').length;
 
   return (
     <>
@@ -1655,7 +1057,7 @@ function AnalysisDashboard({
             key={agent}
             agent={agent}
             title={`${agentLabel(agent)} Collector`}
-            status={dominantCapability(records, agent)}
+            status={dominantCapability(allRecords, agent)}
           />
         ))}
         <PipelineStep
@@ -1683,7 +1085,6 @@ function AnalysisDashboard({
                         <span className={`source-pill source-${analysisSourceClass(record.source)}`}>
                           {sourceLabel(record.source)}
                         </span>
-                        {record.mock && <span className="sample-pill">Mock</span>}
                       </div>
                       <div className="meta-line">
                         <span>{record.alertID || record.id}</span>
@@ -1696,7 +1097,10 @@ function AnalysisDashboard({
                   </div>
 
                   <p className="analysis-summary">
-                    {record.summary || 'Analysis has not produced a summary yet.'}
+                    {record.summary ||
+                      (record.isAnalyzing
+                        ? 'Analysis is running. Waiting for new RCA output.'
+                        : 'Analysis has not produced a summary yet.')}
                   </p>
 
                   <div className="coverage-strip">
@@ -1886,136 +1290,6 @@ function PipelineStep({
   );
 }
 
-function EvidenceInventory({
-  items,
-  totalCount,
-  onOpenAlert,
-}: {
-  items: EvidenceItem[];
-  totalCount: number;
-  onOpenAlert: (id: string) => Promise<void>;
-}) {
-  const mockCount = items.filter((item) => item.mock).length;
-  const groupedItems = useMemo(() => {
-    const known = COMPONENT_AGENT_ORDER.map((agent) => ({
-      agent,
-      items: items.filter((item) => item.agent === agent),
-    })).filter((group) => group.items.length > 0);
-    const knownAgents = new Set(COMPONENT_AGENT_ORDER);
-    const customAgents = uniqueStrings(items.map((item) => item.agent).filter((agent) => !knownAgents.has(agent)));
-    return [
-      ...known,
-      ...customAgents.map((agent) => ({
-        agent,
-        items: items.filter((item) => item.agent === agent),
-      })),
-    ];
-  }, [items]);
-  return (
-    <>
-      <section className="metric-row">
-        <Metric label="Evidence items" value={totalCount} />
-        <Metric label="Visible" value={items.length} />
-        <Metric label="Mock samples" value={mockCount} />
-        <Metric label="High confidence" value={items.filter((item) => item.confidence === 'high').length} />
-      </section>
-
-      <section className="panel view-panel">
-        <PanelHeader title="Evidence" count={items.length} />
-        <div className="evidence-list">
-          {groupedItems.map((group) => (
-            <EvidenceAgentGroup
-              agent={group.agent}
-              items={group.items}
-              key={group.agent}
-              onOpenAlert={onOpenAlert}
-            />
-          ))}
-          {items.length === 0 && <p className="empty">No evidence items match the current search.</p>}
-        </div>
-      </section>
-    </>
-  );
-}
-
-function EvidenceAgentGroup({
-  agent,
-  items,
-  onOpenAlert,
-}: {
-  agent: string;
-  items: EvidenceItem[];
-  onOpenAlert: (id: string) => Promise<void>;
-}) {
-  const [open, setOpen] = useState(true);
-  useEffect(() => {
-    if (items.length > 0) setOpen(true);
-  }, [items.length]);
-  return (
-    <section className="evidence-agent-group">
-      <button className="agent-toggle evidence-group-toggle" onClick={() => setOpen((value) => !value)} type="button">
-        <span>{agentIcon(agent)}</span>
-        <strong>{agentLabel(agent)}</strong>
-        <span className="artifact-count">{items.length}</span>
-        <ChevronDown size={16} />
-      </button>
-      {open && (
-        <div className="evidence-agent-content">
-          {items.map((item) => (
-            <EvidenceArtifactCard item={item} key={item.id} onOpenAlert={onOpenAlert} />
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function EvidenceArtifactCard({
-  item,
-  onOpenAlert,
-}: {
-  item: EvidenceItem;
-  onOpenAlert: (id: string) => Promise<void>;
-}) {
-  const [open, setOpen] = useState(true);
-  const resultText = item.result !== undefined ? formatArtifactValue(item.result) : '';
-  return (
-    <article className="evidence-card">
-      <button className="artifact-toggle" onClick={() => setOpen((value) => !value)} type="button">
-        <div>
-          <div className="section-title compact-title">
-            {agentIcon(item.agent)}
-            <span>{item.title}</span>
-            {item.mock && <span className="sample-pill">Mock</span>}
-          </div>
-          <div className="meta-line">
-            <span>{item.source}</span>
-            <span>{item.target}</span>
-            <Status value={item.status} />
-          </div>
-        </div>
-        <strong className="confidence">{item.confidence}</strong>
-        <ChevronDown size={16} />
-      </button>
-      {open && (
-        <div className="artifact-body">
-          <p>{item.summary}</p>
-          {item.query && <CopyableBlock title="Query" value={item.query} kind="code" />}
-          {item.result !== undefined && <CopyableBlock title="Result JSON" value={resultText} kind="pre" />}
-          <div className="card-actions">
-            <span>{formatTime(item.createdAt)}</span>
-            {item.alertID && (
-              <button className="ghost-button" onClick={() => void onOpenAlert(item.alertID!)} type="button">
-                Open alert
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-    </article>
-  );
-}
-
 function AgentsRegistry({
   agents,
   synthesis,
@@ -2044,7 +1318,6 @@ function AgentsRegistry({
               <div className="section-title compact-title">
                 {agentIcon(ANALYSIS_AGENT_ID)}
                 <span>{synthesis.name}</span>
-                {synthesis.mock && <span className="sample-pill">Mock</span>}
               </div>
               <Status value={synthesis.status} />
             </div>
@@ -2069,7 +1342,6 @@ function AgentsRegistry({
                 <div className="section-title compact-title">
                   {agentIcon(agent.agent)}
                   <span>{agent.name}</span>
-                  {agent.mock && <span className="sample-pill">Mock</span>}
                 </div>
                 <Status value={agent.status} />
               </div>
@@ -2187,6 +1459,7 @@ function UnifiedWorkspace({
   const warnings = incident?.warnings ?? alert?.warnings ?? [];
   const analysis = incident?.analysis_detail ?? alert?.analysis_detail;
   const summary = incident?.analysis_summary ?? alert?.analysis_summary;
+  const isAnalyzing = Boolean(detail.data.is_analyzing);
   const similarIncidents = incident?.similar_incidents ?? [];
   const feedback = incident?.feedback ?? alert?.feedback;
   const targetType = detail.kind;
@@ -2216,7 +1489,9 @@ function UnifiedWorkspace({
           {incident && (
             <>
               <button className="ghost-button" onClick={() => void onAnalyze(incident.incident_id)} type="button"><Bot size={16} /> Analyze</button>
-              <button className="primary-button" onClick={() => void onResolve(incident.incident_id)} type="button"><CheckCircle2 size={16} /> Resolve</button>
+              <button className="primary-button" onClick={() => void onResolve(incident.incident_id)} type="button">
+                <CheckCircle2 size={16} /> {incident.status === 'resolved' ? 'Reopen' : 'Resolve'}
+              </button>
             </>
           )}
           {alert && (
@@ -2231,7 +1506,12 @@ function UnifiedWorkspace({
       <div className="workspace-body">
         <section className="rca-summary">
           <h3>RCA Summary</h3>
-          <p>{summary || 'Analysis is pending. The Collector Evidence Trail will populate as collectors finish.'}</p>
+          <p>
+            {summary ||
+              (isAnalyzing
+                ? 'Analysis is running. New RCA content will appear when the agent finishes.'
+                : 'Analysis is pending. The Collector Evidence Trail will populate as collectors finish.')}
+          </p>
           <div className="rca-feedback-strip">
             <span><ThumbsUp size={15} /> {positiveFeedback}</span>
             <span><ThumbsDown size={15} /> {negativeFeedback}</span>
@@ -2253,7 +1533,7 @@ function UnifiedWorkspace({
           {analysis ? (
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{analysis}</ReactMarkdown>
           ) : (
-            <p className="empty">No RCA report yet.</p>
+            <p className="empty">{isAnalyzing ? 'Generating a fresh RCA report...' : 'No RCA report yet.'}</p>
           )}
         </section>
 
@@ -2328,14 +1608,24 @@ function RelatedIncidentPanel({
 }
 
 function SimilarIncidentsPanel({ items }: { items: SimilarIncident[] }) {
+  const visibleItems = useMemo(
+    () =>
+      [...items]
+        .sort((left, right) => {
+          if (right.similarity !== left.similarity) return right.similarity - left.similarity;
+          return right.created_at.localeCompare(left.created_at);
+        })
+        .slice(0, 3),
+    [items],
+  );
   return (
     <section className="similar-panel">
       <div className="section-title"><Search size={18} /> Similar Incidents</div>
-      {items.length === 0 ? (
+      {visibleItems.length === 0 ? (
         <p className="empty">No similar incident memory yet.</p>
       ) : (
         <div className="similar-list">
-          {items.map((item) => (
+          {visibleItems.map((item) => (
             <article className="similar-item" key={item.incident_id}>
               <div className="similar-head">
                 <strong>{item.title || item.incident_id}</strong>
@@ -2622,7 +1912,6 @@ function FeedbackPanel({
   const [commentActionID, setCommentActionID] = useState('');
   const [busy, setBusy] = useState(false);
   const summary = localSummary;
-  const isMockTarget = isMockTargetID(targetID);
 
   useEffect(() => {
     const nextSummary = normalizeFeedbackSummary(feedback, targetType, targetID);
@@ -2646,12 +1935,6 @@ function FeedbackPanel({
     setFeedbackError('');
     try {
       const nextVote = selectedVote === vote ? 'none' : vote;
-      if (isMockTarget) {
-        const updated = applyFeedbackVote(summary, nextVote);
-        setLocalSummary(updated);
-        setSelectedVote(updated.my_vote ?? null);
-        return;
-      }
       const updated = normalizeFeedbackSummary(
         await submitFeedback(targetType, targetID, nextVote),
         targetType,
@@ -2672,12 +1955,6 @@ function FeedbackPanel({
     setBusy(true);
     setFeedbackError('');
     try {
-      if (isMockTarget) {
-        setLocalSummary((current) => appendMockComment(current, comment.trim()));
-        draftEditor.reset('');
-        setTab('write');
-        return;
-      }
       const updated = normalizeFeedbackSummary(
         await addComment(targetType, targetID, comment),
         targetType,
@@ -2699,13 +1976,6 @@ function FeedbackPanel({
     setBusy(true);
     setFeedbackError('');
     try {
-      if (isMockTarget) {
-        setLocalSummary((current) => updateMockComment(current, editingCommentID, editBody.trim()));
-        setEditingCommentID('');
-        editingEditor.reset('');
-        setEditingTab('write');
-        return;
-      }
       const updated = normalizeFeedbackSummary(
         await updateComment(targetType, targetID, editingCommentID, editBody),
         targetType,
@@ -2735,17 +2005,13 @@ function FeedbackPanel({
     setCommentActionID(commentID);
     setFeedbackError('');
     try {
-      if (isMockTarget) {
-        setLocalSummary((current) => removeMockComment(current, commentID));
-      } else {
-        const updated = normalizeFeedbackSummary(
-          await deleteComment(targetType, targetID, commentID),
-          targetType,
-          targetID,
-        );
-        setLocalSummary(updated);
-        await onSubmitted();
-      }
+      const updated = normalizeFeedbackSummary(
+        await deleteComment(targetType, targetID, commentID),
+        targetType,
+        targetID,
+      );
+      setLocalSummary(updated);
+      await onSubmitted();
       if (editingCommentID === commentID) {
         setEditingCommentID('');
         editingEditor.reset('');
@@ -3290,7 +2556,6 @@ function buildAnalysisRecords(alerts: AlertRecord[], analysisRuns: AnalysisRun[]
         commentCount: alert.feedback?.comments?.length || 0,
         createdAt: alert.fired_at,
         isAnalyzing: alert.is_analyzing,
-        mock: alert.alert_id === MOCK_ALERT.alert_id,
       };
     })
   const runRecords = analysisRuns.map((run) => ({
@@ -3316,7 +2581,6 @@ function buildAnalysisRecords(alerts: AlertRecord[], analysisRuns: AnalysisRun[]
     commentCount: 0,
     createdAt: run.created_at,
     isAnalyzing: run.status === 'analyzing',
-    mock: false,
   }));
   return [...runRecords, ...alertRecords]
     .sort((left, right) => {
@@ -3456,16 +2720,85 @@ function countBy<T>(items: T[], getKey: (item: T) => string): DistributionItem[]
     });
 }
 
-function mergeCapabilities(items: Record<string, string>[]) {
-  const merged: Record<string, string> = {};
-  COMPONENT_AGENT_ORDER.forEach((agent) => {
-    const statuses = items.map((item) => item[agent]).filter(Boolean);
-    if (statuses.includes('ok')) merged[agent] = 'ok';
-    else if (statuses.includes('partial')) merged[agent] = 'partial';
-    else if (statuses.includes('unavailable')) merged[agent] = 'unavailable';
-    else if (statuses.includes('pending')) merged[agent] = 'pending';
-  });
-  return merged;
+function latestEvidenceForAgent(items: EvidenceItem[], agent: string) {
+  return items
+    .filter((item) => item.agent === agent)
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+}
+
+function latestAgentSignal(records: AnalysisRecord[], evidenceItems: EvidenceItem[], agent: string) {
+  const capability = latestCapabilitySignal(records, agent);
+  const evidence = evidenceItems[0];
+  if (capability && (!evidence || capability.createdAt.localeCompare(evidence.createdAt) >= 0)) {
+    return {
+      status: capability.status,
+      source: `${agent}.collector`,
+      lastRun: capability.createdAt || '-',
+    };
+  }
+  if (evidence) {
+    return {
+      status: normalizeAgentStatus(evidence.status) || 'pending',
+      source: evidence.source || `${agent}.collector`,
+      lastRun: evidence.createdAt || '-',
+    };
+  }
+  return {
+    status: 'pending',
+    source: `${agent}.collector`,
+    lastRun: '-',
+  };
+}
+
+function latestCapabilitySignal(records: AnalysisRecord[], agent: string) {
+  const signals = records
+    .map((record) => ({
+      status: normalizeAgentStatus(record.capabilities[agent]),
+      createdAt: record.createdAt,
+    }))
+    .filter((item) => item.status)
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  if (signals.length === 0) return null;
+  const latestAt = signals[0].createdAt;
+  return {
+    status: worstAgentStatus(signals.filter((item) => item.createdAt === latestAt).map((item) => item.status)),
+    createdAt: latestAt,
+  };
+}
+
+function normalizeAgentStatus(value?: string) {
+  const status = (value || '').trim().toLowerCase();
+  if (!status) return '';
+  if (['ok', 'complete', 'completed', 'success', 'ready'].includes(status)) return 'ok';
+  if (['failed', 'failure', 'error', 'unavailable', 'down'].includes(status)) return 'unavailable';
+  if (['partial', 'degraded', 'warning'].includes(status)) return 'partial';
+  if (['running', 'analyzing', 'in_progress'].includes(status)) return 'analyzing';
+  if (status === 'pending') return 'pending';
+  return status;
+}
+
+function worstAgentStatus(statuses: string[]) {
+  return statuses
+    .map((status) => normalizeAgentStatus(status))
+    .filter(Boolean)
+    .sort((left, right) => agentStatusRank(right) - agentStatusRank(left))[0] || 'pending';
+}
+
+function agentStatusRank(status: string) {
+  switch (normalizeAgentStatus(status)) {
+    case 'unavailable':
+      return 4;
+    case 'partial':
+      return 3;
+    case 'analyzing':
+      return 2;
+    case 'pending':
+      return 1;
+    case 'ok':
+      return 0;
+    default:
+      return 1;
+  }
 }
 
 function uniqueStrings(items: string[]) {
@@ -3560,12 +2893,7 @@ function formatDecimal(value: number) {
 }
 
 function dominantCapability(records: AnalysisRecord[], agent: string) {
-  const statuses = records.map((record) => record.capabilities[agent]).filter(Boolean);
-  if (statuses.includes('ok')) return 'ok';
-  if (statuses.includes('partial')) return 'partial';
-  if (statuses.includes('unavailable')) return 'unavailable';
-  if (statuses.includes('pending')) return 'pending';
-  return records.length > 0 ? 'pending' : 'pending';
+  return latestCapabilitySignal(records, agent)?.status || 'pending';
 }
 
 function Severity({ value }: { value: string }) {
@@ -3573,7 +2901,8 @@ function Severity({ value }: { value: string }) {
 }
 
 function Status({ value, analyzing = false }: { value: string; analyzing?: boolean }) {
-  return <span className={`status status-${value || 'pending'}`}>{analyzing ? 'analyzing' : value}</span>;
+  const displayValue = analyzing ? 'analyzing' : (value || 'pending');
+  return <span className={`status status-${displayValue}`}>{displayValue}</span>;
 }
 
 function targetLine(labels: Record<string, string>) {

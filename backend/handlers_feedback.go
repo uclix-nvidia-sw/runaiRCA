@@ -105,6 +105,7 @@ func (s *Server) handleCommentUpdate(
 	}
 	incidentID, alertID, _ := s.store.TargetIDs(targetType, targetID)
 	s.hub.Broadcast(feedbackUpdatedEvent(summary, incidentID, alertID))
+	s.startAnalysisRun(targetType, targetID, "comment", req.Body)
 	writeJSON(w, http.StatusOK, envelope(summary))
 }
 

@@ -108,14 +108,70 @@ func TestAnalysisRunTimeoutFailsRun(t *testing.T) {
 	server.agentRequestTimeout = 30 * time.Millisecond
 	_, record := seedAlert(t, server, "fp-timeout")
 
-	server.startAnalysisRun("alert", record.AlertID, "manual", "")
+	server.startAnalysisRun("alert", record.AlertID, "auto", "")
 
-	run := waitForRunStatus(t, server, "manual", "failed")
+	run := waitForRunStatus(t, server, "auto", "failed")
 	if len(run.Warnings) == 0 || run.Capabilities["agent"] != string(agentErrTimeout) {
 		t.Fatalf("expected timeout-classified failure, got %+v", run)
 	}
 	if hit.Load() == 0 {
 		t.Fatalf("agent was never called")
+	}
+}
+
+func TestManualAnalysisClearsRCAAndSkipsAgentTimeout(t *testing.T) {
+	agentReqCh := make(chan AgentAnalysisRequest, 1)
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		var req AgentAnalysisRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode agent analysis request: %v", err)
+		}
+		agentReqCh <- req
+		time.Sleep(80 * time.Millisecond)
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Fresh manual RCA completed.",
+			AnalysisDetail:  "## Root Cause\n\nManual reanalysis finished.",
+			AnalysisQuality: "high",
+			Capabilities:    map[string]string{"analysis": "ok"},
+		})
+	})
+	server.agentRequestTimeout = 20 * time.Millisecond
+	incident, record := seedAlert(t, server, "fp-manual-no-timeout")
+	server.store.ApplyAnalysis(record.AlertID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Old RCA should disappear.",
+		AnalysisDetail:  "## Root Cause\n\nOld analysis.",
+		AnalysisQuality: "medium",
+		Capabilities:    map[string]string{"analysis": "old"},
+	})
+	if _, ok, err := server.store.AddComment("incident", incident.IncidentID, CommentRequest{
+		Body:   "Re-check queue quota before finalizing.",
+		Author: "operator",
+	}); !ok || err != nil {
+		t.Fatalf("incident comment failed: ok=%t err=%v", ok, err)
+	}
+	if _, ok, err := server.store.AddComment("alert", record.AlertID, CommentRequest{
+		Body:   "Inspect scheduler logs for the pending workload.",
+		Author: "operator",
+	}); !ok || err != nil {
+		t.Fatalf("alert comment failed: ok=%t err=%v", ok, err)
+	}
+
+	server.startAnalysisRun("alert", record.AlertID, "manual", "")
+
+	alert, _ := server.store.AlertDetail(record.AlertID)
+	if alert.AnalysisSummary != "" || alert.AnalysisDetail != "" || !alert.IsAnalyzing {
+		t.Fatalf("manual analysis did not clear visible RCA: %+v", alert)
+	}
+	agentReq := <-agentReqCh
+	prompt := agentReq.Alert.Annotations["operator_prompt"]
+	if !strings.Contains(prompt, "queue quota") || !strings.Contains(prompt, "scheduler logs") {
+		t.Fatalf("operator comments were not attached to manual analysis: %q", prompt)
+	}
+	run := waitForRunStatus(t, server, "manual", "complete")
+	if !strings.Contains(run.AnalysisSummary, "Fresh manual") {
+		t.Fatalf("manual run did not complete without timeout: %+v", run)
 	}
 }
 

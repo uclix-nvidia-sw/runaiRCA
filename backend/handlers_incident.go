@@ -77,6 +77,8 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		now := time.Now().UTC()
+		nextStatus := "resolved"
+		var resolvedAt *time.Time
 		s.store.mu.Lock()
 		incident := s.store.incidents[id]
 		if incident == nil {
@@ -84,16 +86,23 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "incident not found")
 			return
 		}
-		incident.Status = "resolved"
-		incident.ResolvedAt = &now
+		if incident.Status == "resolved" {
+			nextStatus = "firing"
+			incident.Status = nextStatus
+			incident.ResolvedAt = nil
+		} else {
+			incident.Status = nextStatus
+			incident.ResolvedAt = &now
+			resolvedAt = &now
+		}
 		s.store.persistIncidentLocked(incident)
 		if memory := s.store.memories[id]; memory != nil {
-			memory.Status = "resolved"
+			memory.Status = nextStatus
 			s.store.persistMemoryLocked(memory)
 		}
 		s.store.mu.Unlock()
-		s.hub.Broadcast(incidentResolvedEvent(id, now))
-		writeJSON(w, http.StatusOK, map[string]string{"status": "resolved"})
+		s.hub.Broadcast(incidentResolvedEvent(id, nextStatus, resolvedAt))
+		writeJSON(w, http.StatusOK, map[string]string{"status": nextStatus})
 	case "feedback":
 		if len(parts) != 2 || r.Method != http.MethodPost {
 			writeError(w, http.StatusNotFound, "unknown incident action")

@@ -230,6 +230,14 @@ h2 {
   align-items: start;
 }
 
+.single-dashboard-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.full-width-panel {
+  width: 100%;
+}
+
 .view-panel {
   overflow: visible;
 }
@@ -419,12 +427,6 @@ td span {
   color: #854d0e;
   background: #fefce8;
   border-color: #fde68a;
-}
-
-.status-mock {
-  color: #365314;
-  background: #f7fee7;
-  border-color: #bef264;
 }
 
 .icon-button,
@@ -849,8 +851,7 @@ td span {
   text-transform: capitalize;
 }
 
-.quality-high,
-.quality-mock {
+.quality-high {
   color: #166534;
   background: #f0fdf4;
   border-color: #bbf7d0;

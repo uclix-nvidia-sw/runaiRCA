@@ -371,6 +371,16 @@ def _detail_from(
     ]
     for result in results:
         lines.append(f"- **{result.agent}** [{result.status}]: {result.summary}")
+    operator_prompt = annotations.get("operator_prompt")
+    if operator_prompt:
+        lines.extend(
+            [
+                "",
+                "## Operator Guidance",
+                "",
+                operator_prompt,
+            ]
+        )
     lines.extend(
         [
             "",
@@ -434,7 +444,7 @@ def _similar_incident_lines(request: AlertAnalysisRequest) -> list[str]:
     lines = ["", "## Similar Incidents", ""]
     if not request.similar_incidents:
         return [*lines, "- No similar incident memory was provided."]
-    for item in request.similar_incidents[:5]:
+    for item in request.similar_incidents[:3]:
         feedback = (
             f"{item.positive_feedback} up / {item.negative_feedback} down / "
             f"{item.comment_count} comments"

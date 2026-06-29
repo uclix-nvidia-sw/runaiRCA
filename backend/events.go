@@ -113,10 +113,10 @@ func feedbackUpdatedEvent(summary FeedbackSummary, incidentID string, alertID st
 	}}
 }
 
-func incidentResolvedEvent(incidentID string, resolvedAt time.Time) Event {
+func incidentResolvedEvent(incidentID string, status string, resolvedAt *time.Time) Event {
 	return Event{Type: eventIncidentResolved, Data: map[string]any{
 		"incident_id": incidentID,
-		"status":      "resolved",
+		"status":      status,
 		"resolved_at": resolvedAt,
 	}}
 }
