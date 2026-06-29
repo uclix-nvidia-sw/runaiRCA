@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+
 from app.collectors.base import AnalysisTarget, CollectorResult, artifact
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
@@ -44,7 +46,7 @@ class LokiCollector:
             )
             queries.append(("runai_control_plane_errors", runai_error_query))
         query_results = []
-        warnings: list[str] = []
+        headers, warnings = _loki_headers(self._settings)
 
         for name, query in queries:
             response = await get_json(
@@ -56,6 +58,7 @@ class LokiCollector:
                     "limit": str(self._settings.loki_query_limit),
                     "direction": "BACKWARD",
                 },
+                headers=headers,
             )
             streams = _loki_streams(response.data)
             line_count = sum(len(stream.get("values", [])) for stream in streams)
@@ -74,9 +77,19 @@ class LokiCollector:
             )
             if response.error:
                 warnings.append(f"Loki query failed for {name}: {response.error}")
+                if response.status_code == 401:
+                    if _loki_auth_configured(self._settings):
+                        warnings.append(
+                            "Loki authentication was configured but rejected with HTTP 401."
+                        )
+                    else:
+                        warnings.append(
+                            "Loki returned HTTP 401 and no Loki authentication credentials are configured."
+                        )
 
         successful = [item for item in query_results if not item["error"]]
         populated = [item for item in successful if item["line_count"]]
+        auth_failed = any(item["status_code"] == 401 for item in query_results)
         if populated:
             status = "ok"
             confidence = "high"
@@ -100,13 +113,16 @@ class LokiCollector:
             "loki_url": self._settings.loki_url,
             "queries": query_results,
         }
+        missing_data = [] if successful else ["loki.query"]
+        if auth_failed:
+            missing_data.append("loki.auth")
         return CollectorResult(
             agent=self.name,
             status=status,
             summary=summary,
             confidence=confidence,
             details=result,
-            missing_data=[] if successful else ["loki.query"],
+            missing_data=missing_data,
             warnings=warnings,
             artifacts=[
                 artifact(
@@ -121,6 +137,38 @@ class LokiCollector:
                 )
             ],
         )
+
+
+def _loki_headers(settings: Settings) -> tuple[dict[str, str], list[str]]:
+    headers = {"Accept": "application/json"}
+    warnings: list[str] = []
+    if settings.loki_tenant_id:
+        headers["X-Scope-OrgID"] = settings.loki_tenant_id
+    if settings.loki_bearer_token:
+        headers["Authorization"] = _bearer_header_value(settings.loki_bearer_token)
+    elif settings.loki_basic_username or settings.loki_basic_password:
+        if settings.loki_basic_username and settings.loki_basic_password:
+            raw = f"{settings.loki_basic_username}:{settings.loki_basic_password}".encode()
+            headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
+        else:
+            warnings.append(
+                "LOKI_BASIC_USERNAME and LOKI_BASIC_PASSWORD must both be set for Loki basic auth."
+            )
+    return headers, warnings
+
+
+def _bearer_header_value(token: str) -> str:
+    if token.lower().startswith("bearer "):
+        return token
+    return f"Bearer {token}"
+
+
+def _loki_auth_configured(settings: Settings) -> bool:
+    return bool(
+        settings.loki_bearer_token
+        or (settings.loki_basic_username and settings.loki_basic_password)
+        or settings.loki_tenant_id
+    )
 
 
 def _selector_for(target: AnalysisTarget) -> str:

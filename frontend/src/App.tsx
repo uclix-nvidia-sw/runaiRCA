@@ -7,6 +7,7 @@ import {
   CheckCircle2,
   ChevronDown,
   Code2,
+  Clipboard,
   Database,
   Eraser,
   FileText,
@@ -85,6 +86,13 @@ type RealtimeEventPayload = {
 type EditorTab = 'write' | 'preview';
 type MainView = 'operations' | 'analysis' | 'evidence' | 'agents';
 type DashboardDataState = 'loading' | 'backend-down' | 'empty' | 'live';
+type DetailKind = 'incident' | 'alert';
+
+type RouteState = {
+  view: MainView;
+  detailKind?: DetailKind;
+  detailID?: string;
+};
 
 type EvidenceItem = {
   id: string;
@@ -507,6 +515,54 @@ const VIEW_COPY: Record<MainView, { eyebrow: string; title: string; placeholder:
   },
 };
 
+function routeFromHash(hash: string): RouteState {
+  const normalized = hash.replace(/^#\/?/, '').replace(/^\/+/, '');
+  if (!normalized) return { view: 'operations' };
+  const [first, second, ...rest] = normalized.split('/');
+  if (isMainView(first) && (second === 'incidents' || second === 'incident' || second === 'alerts' || second === 'alert')) {
+    const id = rest.length > 0 ? decodeRoutePart(rest.join('/')) : '';
+    if ((second === 'incidents' || second === 'incident') && id) {
+      return { view: first, detailKind: 'incident', detailID: id };
+    }
+    if ((second === 'alerts' || second === 'alert') && id) {
+      return { view: first, detailKind: 'alert', detailID: id };
+    }
+  }
+  const rawKind = first;
+  const id = second ? decodeRoutePart([second, ...rest].join('/')) : '';
+  if ((rawKind === 'incidents' || rawKind === 'incident') && id) {
+    return { view: 'operations', detailKind: 'incident', detailID: id };
+  }
+  if ((rawKind === 'alerts' || rawKind === 'alert') && id) {
+    return { view: 'operations', detailKind: 'alert', detailID: id };
+  }
+  if (isMainView(rawKind)) {
+    return { view: rawKind };
+  }
+  return { view: 'operations' };
+}
+
+function decodeRoutePart(value: string) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function isMainView(value: string): value is MainView {
+  return value === 'analysis' || value === 'evidence' || value === 'agents' || value === 'operations';
+}
+
+function hashForView(view: MainView) {
+  return `#/${view}`;
+}
+
+function hashForDetail(kind: DetailKind, id: string, view: MainView) {
+  const collection = kind === 'incident' ? 'incidents' : 'alerts';
+  return `#/${view}/${collection}/${encodeURIComponent(id)}`;
+}
+
 function makeMockIncident({
   id,
   correlationKey,
@@ -755,6 +811,30 @@ function errorMessage(err: unknown, fallback: string) {
   return err instanceof Error ? err.message : fallback;
 }
 
+function formatArtifactValue(value: unknown) {
+  return typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+}
+
+async function copyToClipboard(value: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // Fall back for local/dev browser contexts where clipboard permission is denied.
+    }
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = value;
+  textarea.setAttribute('readonly', 'true');
+  textarea.style.position = 'fixed';
+  textarea.style.left = '-9999px';
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand('copy');
+  document.body.removeChild(textarea);
+}
+
 function runtimeBool(runtimeKey: 'enableMockData', envKey: string, fallback: boolean) {
   const runtimeValue = window.__RUNAI_RCA_CONFIG__?.[runtimeKey];
   if (typeof runtimeValue === 'boolean') return runtimeValue;
@@ -963,10 +1043,11 @@ function App() {
     realtimePayload,
   } = useDashboardData();
   const [detail, setDetail] = useState<DetailState>(null);
-  const [activeView, setActiveView] = useState<MainView>('operations');
+  const [activeView, setActiveView] = useState<MainView>(() => routeFromHash(window.location.hash).view);
   const [query, setQuery] = useState('');
   const [chatDocked, setChatDocked] = useState(false);
   const detailVersionRef = useRef(0);
+  const routeLoadVersionRef = useRef(0);
 
   useEffect(() => {
     detailVersionRef.current += 1;
@@ -1143,39 +1224,86 @@ function App() {
       : null;
   }, [query, synthesisSummary]);
 
+  const loadRoute = useCallback(async (route: RouteState) => {
+    const version = routeLoadVersionRef.current + 1;
+    routeLoadVersionRef.current = version;
+    setActiveView(route.view);
+    if (!route.detailKind || !route.detailID) {
+      setDetail(null);
+      return;
+    }
+    try {
+      if (route.detailKind === 'incident') {
+        if (showMockData) {
+          const mockDetail = mockIncidentDetail(route.detailID);
+          if (mockDetail) {
+            if (routeLoadVersionRef.current === version) {
+              setDetail({ kind: 'incident', data: mockDetail });
+            }
+            return;
+          }
+        }
+        const nextDetail = await fetchIncident(route.detailID);
+        if (routeLoadVersionRef.current === version) {
+          setDetail({ kind: 'incident', data: nextDetail });
+        }
+        return;
+      }
+      if (showMockData) {
+        const mockAlert = mockAlertDetail(route.detailID);
+        if (mockAlert) {
+          if (routeLoadVersionRef.current === version) {
+            setDetail({ kind: 'alert', data: mockAlert });
+          }
+          return;
+        }
+      }
+      const nextAlert = await fetchAlert(route.detailID);
+      if (routeLoadVersionRef.current === version) {
+        setDetail({ kind: 'alert', data: nextAlert });
+      }
+    } catch {
+      if (routeLoadVersionRef.current === version) {
+        setDetail(null);
+      }
+    }
+  }, [showMockData]);
+
+  useEffect(() => {
+    if (!window.location.hash) {
+      window.history.replaceState(null, '', hashForView('operations'));
+    }
+    const handleHashChange = () => {
+      void loadRoute(routeFromHash(window.location.hash));
+    };
+    handleHashChange();
+    window.addEventListener('hashchange', handleHashChange);
+    return () => window.removeEventListener('hashchange', handleHashChange);
+  }, [loadRoute]);
+
+  const navigateToHash = useCallback((hash: string) => {
+    if (window.location.hash === hash) {
+      void loadRoute(routeFromHash(hash));
+      return;
+    }
+    window.location.hash = hash;
+  }, [loadRoute]);
+
   const viewCopy = VIEW_COPY[activeView];
 
-  const goHome = () => {
-    setDetail(null);
-    setActiveView('operations');
-  };
+  const goHome = () => navigateToHash(hashForView('operations'));
 
-  const switchView = (view: MainView) => {
-    setDetail(null);
-    setActiveView(view);
-  };
+  const switchView = (view: MainView) => navigateToHash(hashForView(view));
+
+  const closeDetail = () => navigateToHash(hashForView(activeView));
 
   const openIncident = useCallback(async (id: string) => {
-    if (showMockData) {
-      const mockDetail = mockIncidentDetail(id);
-      if (mockDetail) {
-        setDetail({ kind: 'incident', data: mockDetail });
-        return;
-      }
-    }
-    setDetail({ kind: 'incident', data: await fetchIncident(id) });
-  }, [showMockData]);
+    navigateToHash(hashForDetail('incident', id, activeView));
+  }, [activeView, navigateToHash]);
 
   const openAlert = useCallback(async (id: string) => {
-    if (showMockData) {
-      const mockAlert = mockAlertDetail(id);
-      if (mockAlert) {
-        setDetail({ kind: 'alert', data: mockAlert });
-        return;
-      }
-    }
-    setDetail({ kind: 'alert', data: await fetchAlert(id) });
-  }, [showMockData]);
+    navigateToHash(hashForDetail('alert', id, activeView));
+  }, [activeView, navigateToHash]);
 
   const refreshDetail = useCallback(async () => {
     const currentDetail = detail;
@@ -1327,7 +1455,7 @@ function App() {
 
       <UnifiedWorkspace
         detail={detail}
-        onClose={() => setDetail(null)}
+        onClose={closeDetail}
         onRefresh={refreshDetail}
         onAnalyze={async (id) => {
           await analyzeIncident(id);
@@ -1826,6 +1954,21 @@ function EvidenceInventory({
   onOpenAlert: (id: string) => Promise<void>;
 }) {
   const mockCount = items.filter((item) => item.mock).length;
+  const groupedItems = useMemo(() => {
+    const known = COMPONENT_AGENT_ORDER.map((agent) => ({
+      agent,
+      items: items.filter((item) => item.agent === agent),
+    })).filter((group) => group.items.length > 0);
+    const knownAgents = new Set(COMPONENT_AGENT_ORDER);
+    const customAgents = uniqueStrings(items.map((item) => item.agent).filter((agent) => !knownAgents.has(agent)));
+    return [
+      ...known,
+      ...customAgents.map((agent) => ({
+        agent,
+        items: items.filter((item) => item.agent === agent),
+      })),
+    ];
+  }, [items]);
   return (
     <>
       <section className="metric-row">
@@ -1838,41 +1981,96 @@ function EvidenceInventory({
       <section className="panel view-panel">
         <PanelHeader title="Evidence" count={items.length} />
         <div className="evidence-list">
-          {items.map((item) => (
-            <article className="evidence-card" key={item.id}>
-              <div className="evidence-card-head">
-                <div>
-                  <div className="section-title compact-title">
-                    {agentIcon(item.agent)}
-                    <span>{item.title}</span>
-                    {item.mock && <span className="sample-pill">Mock</span>}
-                  </div>
-                  <div className="meta-line">
-                    <span>{agentLabel(item.agent)}</span>
-                    <span>{item.source}</span>
-                    <span>{item.target}</span>
-                    <Status value={item.status} />
-                  </div>
-                </div>
-                <strong className="confidence">{item.confidence}</strong>
-              </div>
-              <p>{item.summary}</p>
-              {item.query && <code>{item.query}</code>}
-              {item.result !== undefined && <pre>{JSON.stringify(item.result, null, 2)}</pre>}
-              <div className="card-actions">
-                <span>{formatTime(item.createdAt)}</span>
-                {item.alertID && (
-                  <button className="ghost-button" onClick={() => void onOpenAlert(item.alertID!)} type="button">
-                    Open alert
-                  </button>
-                )}
-              </div>
-            </article>
+          {groupedItems.map((group) => (
+            <EvidenceAgentGroup
+              agent={group.agent}
+              items={group.items}
+              key={group.agent}
+              onOpenAlert={onOpenAlert}
+            />
           ))}
           {items.length === 0 && <p className="empty">No evidence items match the current search.</p>}
         </div>
       </section>
     </>
+  );
+}
+
+function EvidenceAgentGroup({
+  agent,
+  items,
+  onOpenAlert,
+}: {
+  agent: string;
+  items: EvidenceItem[];
+  onOpenAlert: (id: string) => Promise<void>;
+}) {
+  const [open, setOpen] = useState(true);
+  useEffect(() => {
+    if (items.length > 0) setOpen(true);
+  }, [items.length]);
+  return (
+    <section className="evidence-agent-group">
+      <button className="agent-toggle evidence-group-toggle" onClick={() => setOpen((value) => !value)} type="button">
+        <span>{agentIcon(agent)}</span>
+        <strong>{agentLabel(agent)}</strong>
+        <span className="artifact-count">{items.length}</span>
+        <ChevronDown size={16} />
+      </button>
+      {open && (
+        <div className="evidence-agent-content">
+          {items.map((item) => (
+            <EvidenceArtifactCard item={item} key={item.id} onOpenAlert={onOpenAlert} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function EvidenceArtifactCard({
+  item,
+  onOpenAlert,
+}: {
+  item: EvidenceItem;
+  onOpenAlert: (id: string) => Promise<void>;
+}) {
+  const [open, setOpen] = useState(true);
+  const resultText = item.result !== undefined ? formatArtifactValue(item.result) : '';
+  return (
+    <article className="evidence-card">
+      <button className="artifact-toggle" onClick={() => setOpen((value) => !value)} type="button">
+        <div>
+          <div className="section-title compact-title">
+            {agentIcon(item.agent)}
+            <span>{item.title}</span>
+            {item.mock && <span className="sample-pill">Mock</span>}
+          </div>
+          <div className="meta-line">
+            <span>{item.source}</span>
+            <span>{item.target}</span>
+            <Status value={item.status} />
+          </div>
+        </div>
+        <strong className="confidence">{item.confidence}</strong>
+        <ChevronDown size={16} />
+      </button>
+      {open && (
+        <div className="artifact-body">
+          <p>{item.summary}</p>
+          {item.query && <CopyableBlock title="Query" value={item.query} kind="code" />}
+          {item.result !== undefined && <CopyableBlock title="Result JSON" value={resultText} kind="pre" />}
+          <div className="card-actions">
+            <span>{formatTime(item.createdAt)}</span>
+            {item.alertID && (
+              <button className="ghost-button" onClick={() => void onOpenAlert(item.alertID!)} type="button">
+                Open alert
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </article>
   );
 }
 
@@ -1962,6 +2160,45 @@ function PanelHeader({ title, count }: { title: string; count: number }) {
     <div className="panel-header">
       <h3>{title}</h3>
       <span>{count}</span>
+    </div>
+  );
+}
+
+function CopyButton({ value, label = 'Copy' }: { value: string; label?: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      className="copy-button"
+      onClick={async () => {
+        await copyToClipboard(value);
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1200);
+      }}
+      type="button"
+      title={label}
+      aria-label={label}
+    >
+      {copied ? <CheckCircle2 size={14} /> : <Clipboard size={14} />}
+    </button>
+  );
+}
+
+function CopyableBlock({
+  title,
+  value,
+  kind,
+}: {
+  title: string;
+  value: string;
+  kind: 'code' | 'pre';
+}) {
+  return (
+    <div className="copyable-block">
+      <div className="copyable-head">{title}</div>
+      <div className="copyable-frame">
+        <CopyButton value={value} label={`Copy ${title}`} />
+        {kind === 'code' ? <code>{value}</code> : <pre>{value}</pre>}
+      </div>
     </div>
   );
 }
@@ -2685,11 +2922,16 @@ function FeedbackPanel({
 }
 
 function AgentEvidence({ agent, status, artifacts }: { agent: string; status: string; artifacts: Artifact[] }) {
-  const [open, setOpen] = useState(agent === 'runai' || agent === 'postgres');
+  const [open, setOpen] = useState(status !== 'pending' || artifacts.length > 0);
+  useEffect(() => {
+    if (status !== 'pending' || artifacts.length > 0) {
+      setOpen(true);
+    }
+  }, [artifacts.length, status]);
   const icon = agentIcon(agent);
   return (
     <article className="agent-evidence">
-      <button className="agent-toggle" onClick={() => setOpen((value) => !value)}>
+      <button className="agent-toggle" onClick={() => setOpen((value) => !value)} type="button">
         <span>{icon}</span>
         <strong>{agentLabel(agent)}</strong>
         <Status value={status} />
@@ -2701,22 +2943,39 @@ function AgentEvidence({ agent, status, artifacts }: { agent: string; status: st
             <p className="empty">No evidence yet.</p>
           ) : (
             artifacts.map((artifact, index) => (
-              <div className="artifact" key={`${artifact.agent}-${artifact.type}-${index}`}>
-                <div className="artifact-head">
-                  <strong>{artifact.type}</strong>
-                  <span>{artifact.confidence}</span>
-                </div>
-                <p>{artifact.summary}</p>
-                {artifact.query && <code>{artifact.query}</code>}
-                {artifact.result !== undefined && (
-                  <pre>{JSON.stringify(artifact.result, null, 2)}</pre>
-                )}
-              </div>
+              <ArtifactResult
+                artifact={artifact}
+                defaultOpen
+                key={`${artifact.agent}-${artifact.type}-${index}`}
+              />
             ))
           )}
         </div>
       )}
     </article>
+  );
+}
+
+function ArtifactResult({ artifact, defaultOpen = true }: { artifact: Artifact; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen);
+  const resultText = artifact.result !== undefined ? formatArtifactValue(artifact.result) : '';
+  return (
+    <div className="artifact">
+      <button className="artifact-toggle compact-artifact-toggle" onClick={() => setOpen((value) => !value)} type="button">
+        <div className="artifact-head">
+          <strong>{artifact.type}</strong>
+          <span>{artifact.confidence}</span>
+        </div>
+        <ChevronDown size={16} />
+      </button>
+      {open && (
+        <div className="artifact-body">
+          <p>{artifact.summary}</p>
+          {artifact.query && <CopyableBlock title="Query" value={artifact.query} kind="code" />}
+          {artifact.result !== undefined && <CopyableBlock title="Result JSON" value={resultText} kind="pre" />}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -3146,8 +3405,12 @@ function buildAnalysisAnalytics(
   windowDays: number,
 ): AnalysisAnalytics {
   const anchorDate = startOfUtcDay(new Date());
-  const windowedIncidents = incidents.filter((incident) => isWithinWindow(incident.fired_at, windowDays, anchorDate));
-  const windowedAlerts = alerts.filter((alert) => isWithinWindow(alert.fired_at, windowDays, anchorDate));
+  const windowedIncidents = incidents.filter((incident) =>
+    isActiveWithinWindow(incident.fired_at, incident.resolved_at ?? '', incident.status, windowDays, anchorDate),
+  );
+  const windowedAlerts = alerts.filter((alert) =>
+    isActiveWithinWindow(alert.fired_at, alert.resolved_at ?? '', alert.status, windowDays, anchorDate),
+  );
   const windowedRecords = records.filter((record) => isWithinWindow(record.createdAt, windowDays, anchorDate));
   const resolvedDurations = windowedIncidents
     .map((incident) => durationMinutes(incident.fired_at, incident.resolved_at ?? ''))
@@ -3194,14 +3457,19 @@ function buildDailySeries(
       alerts: 0,
     };
   });
-  const byDate = new Map(points.map((point) => [point.date, point]));
   incidents.forEach((incident) => {
-    const point = byDate.get(dateKey(parseDate(incident.fired_at) ?? anchorDate));
-    if (point) point.incidents += 1;
+    points.forEach((point) => {
+      if (isActiveOnDay(incident.fired_at, incident.resolved_at ?? '', incident.status, parseDate(point.date) ?? anchorDate)) {
+        point.incidents += 1;
+      }
+    });
   });
   alerts.forEach((alert) => {
-    const point = byDate.get(dateKey(parseDate(alert.fired_at) ?? anchorDate));
-    if (point) point.alerts += 1;
+    points.forEach((point) => {
+      if (isActiveOnDay(alert.fired_at, alert.resolved_at ?? '', alert.status, parseDate(point.date) ?? anchorDate)) {
+        point.alerts += 1;
+      }
+    });
   });
   return points;
 }
@@ -3242,6 +3510,37 @@ function isWithinWindow(value: string, windowDays: number, anchorDate: Date) {
   const start = addUtcDays(anchorDate, -windowDays + 1);
   const day = startOfUtcDay(parsed);
   return day >= start && day <= anchorDate;
+}
+
+function isActiveWithinWindow(
+  startedAt: string,
+  resolvedAt: string,
+  status: string,
+  windowDays: number,
+  anchorDate: Date,
+) {
+  const started = parseDate(startedAt);
+  if (!started) return false;
+  const windowStart = addUtcDays(anchorDate, -windowDays + 1);
+  const windowEnd = addUtcDays(anchorDate, 1);
+  const ended = activeEndDate(startedAt, resolvedAt, status);
+  return started < windowEnd && (!ended || ended >= windowStart);
+}
+
+function isActiveOnDay(startedAt: string, resolvedAt: string, status: string, day: Date) {
+  const started = parseDate(startedAt);
+  if (!started) return false;
+  const dayStart = startOfUtcDay(day);
+  const dayEnd = addUtcDays(dayStart, 1);
+  const ended = activeEndDate(startedAt, resolvedAt, status);
+  return started < dayEnd && (!ended || ended >= dayStart);
+}
+
+function activeEndDate(startedAt: string, resolvedAt: string, status: string) {
+  const resolved = parseDate(resolvedAt);
+  if (resolved) return resolved;
+  if (status === 'resolved') return parseDate(startedAt);
+  return null;
 }
 
 function durationMinutes(start: string, end: string) {

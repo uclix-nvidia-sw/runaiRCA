@@ -319,6 +319,15 @@ func severity(alert Alert) string {
 	return first(alert.Labels["severity"], "warning")
 }
 
+func ignoredAlert(alert Alert) bool {
+	switch strings.ToLower(severity(alert)) {
+	case "info", "information":
+		return true
+	default:
+		return false
+	}
+}
+
 func status(value string) string {
 	if value == "resolved" {
 		return "resolved"

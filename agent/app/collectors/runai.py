@@ -33,6 +33,7 @@ class RunAICollector:
             headers, auth_warnings = await _runai_headers(self._settings)
             query_results = await _collect_runai_responses(self._settings, target, headers)
             successful = [item for item in query_results if not item.get("error")]
+            auth_failed = any(item.get("status_code") == 401 for item in query_results)
             if successful and not missing:
                 summary = (
                     "Run:ai API direct queries completed for workload, project, "
@@ -52,6 +53,8 @@ class RunAICollector:
                 status = "unavailable"
                 confidence = "low"
                 missing.append("runai.query")
+            if auth_failed and "runai.auth" not in missing:
+                missing.append("runai.auth")
 
             details = {
                 "cluster": target.cluster,
@@ -68,6 +71,8 @@ class RunAICollector:
                 for item in query_results
                 if item.get("error")
             ]
+            if auth_failed:
+                warnings.append("Run:ai API rejected the request with HTTP 401.")
             return CollectorResult(
                 agent=self.name,
                 status=status,
@@ -143,6 +148,8 @@ async def _runai_headers(settings: Settings) -> tuple[dict[str, str], list[str]]
             value = response.data.get("access_token")
             if isinstance(value, str):
                 token = value
+            else:
+                warnings.append("Run:ai token response did not include an access_token.")
         elif response.error:
             warnings.append(f"Run:ai token request failed: {response.error}")
     elif settings.runai_client_id and settings.runai_client_secret and not settings.runai_token_url:
@@ -153,8 +160,20 @@ async def _runai_headers(settings: Settings) -> tuple[dict[str, str], list[str]]
 
     headers = {"Accept": "application/json"}
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        headers["Authorization"] = _bearer_header_value(token)
+    elif settings.runai_base_url:
+        warnings.append(
+            "Run:ai API URL is configured, but no Authorization header could be built. "
+            "Set RUNAI_BEARER_TOKEN or configure RUNAI_TOKEN_URL with RUNAI_CLIENT_ID "
+            "and RUNAI_CLIENT_SECRET."
+        )
     return headers, warnings
+
+
+def _bearer_header_value(token: str) -> str:
+    if token.lower().startswith("bearer "):
+        return token
+    return f"Bearer {token}"
 
 
 async def _collect_runai_responses(

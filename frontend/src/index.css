@@ -48,6 +48,8 @@ button,
 .nav-item,
 tbody tr td,
 	.agent-toggle,
+	.artifact-toggle,
+	.copy-button,
 	.analysis-card,
 	.vote-button,
 .editor-tool,
@@ -64,6 +66,8 @@ tbody tr td,
 button:not(:disabled):active,
 .nav-item:active,
 	.agent-toggle:active,
+	.artifact-toggle:active,
+	.copy-button:active,
 	.analysis-card:active,
 	.editor-tool:active,
 .comment-menu-button:active,
@@ -1150,7 +1154,7 @@ td span {
   background: #111827;
   color: #d9f99d;
   border-radius: 0.35rem;
-  padding: 0.55rem;
+  padding: 0.55rem 2.75rem 0.55rem 0.55rem;
   overflow-x: auto;
   font-size: 0.78rem;
   font-weight: 500;
@@ -1186,6 +1190,22 @@ td span {
   padding: 0.75rem;
 }
 
+.artifact-toggle {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 0.65rem;
+  text-align: left;
+}
+
+.compact-artifact-toggle {
+  grid-template-columns: 1fr auto;
+}
+
 .artifact {
   border: 1px solid var(--line);
   border-radius: 0.45rem;
@@ -1197,11 +1217,16 @@ td span {
   display: flex;
   justify-content: space-between;
   gap: 1rem;
+  min-width: 0;
 }
 
 .artifact-head span {
   color: var(--nvidia-dark);
   font-weight: 800;
+}
+
+.artifact-body {
+  margin-top: 0.65rem;
 }
 
 .artifact pre {
@@ -1221,6 +1246,32 @@ td span {
   padding: 1.15rem;
 }
 
+.evidence-agent-group {
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  overflow: hidden;
+  background: #ffffff;
+}
+
+.evidence-agent-content {
+  display: grid;
+  gap: 0.8rem;
+  padding: 0.9rem;
+}
+
+.evidence-group-toggle {
+  border-bottom: 1px solid var(--line);
+}
+
+.artifact-count {
+  border-radius: 999px;
+  background: #eef2e8;
+  color: var(--nvidia-dark);
+  padding: 0.08rem 0.5rem;
+  font-size: 0.78rem;
+  font-weight: 850;
+}
+
 .evidence-card,
 .agent-card {
   border: 1px solid var(--line);
@@ -1238,6 +1289,44 @@ td span {
   align-items: flex-start;
   justify-content: space-between;
   gap: 0.75rem;
+}
+
+.copyable-block {
+  margin-bottom: 0.7rem;
+}
+
+.copyable-head {
+  margin-bottom: 0.35rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 850;
+}
+
+.copyable-frame {
+  position: relative;
+}
+
+.copy-button {
+  border: 1px solid transparent;
+  border-radius: 0.35rem;
+  background: transparent;
+  color: #94a3b8;
+  position: absolute;
+  top: 0.45rem;
+  right: 0.45rem;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.85rem;
+  height: 1.85rem;
+  padding: 0;
+}
+
+.copy-button:hover {
+  border-color: rgba(118, 185, 0, 0.28);
+  background: rgba(217, 249, 157, 0.16);
+  color: var(--nvidia-dark);
 }
 
 .evidence-card p,
@@ -1280,7 +1369,7 @@ td span {
   border-radius: 0.35rem;
   background: #111827;
   color: #d9f99d;
-  padding: 0.55rem;
+  padding: 0.55rem 2.75rem 0.55rem 0.55rem;
   overflow-x: auto;
   margin-bottom: 0.65rem;
 }
@@ -1291,7 +1380,7 @@ td span {
   border: 1px solid var(--line);
   border-radius: 0.35rem;
   background: #f8fafc;
-  padding: 0.65rem;
+  padding: 0.65rem 2.75rem 0.65rem 0.65rem;
   font-size: 0.78rem;
 }
 
