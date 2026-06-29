@@ -120,8 +120,10 @@ func ensureDatabaseExists(driverName, databaseURL string, connectTimeout time.Du
 	if _, err := conn.ExecContext(ctx, stmt); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr != nil && pgErr.Code == "42P04" {
-			log.Printf("auto-create database %q skipped: already created by another instance", dbName)
-			return true
+			if err := conn.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)`, dbName).Scan(&exists); err == nil && exists {
+				log.Printf("auto-create database %q skipped: database already exists", dbName)
+				return true
+			}
 		}
 		log.Printf("auto-create database %q failed: %v", dbName, err)
 		return false
