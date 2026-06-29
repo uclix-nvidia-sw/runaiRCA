@@ -29,6 +29,8 @@ jobs:
   chart:
     name: Lint and publish chart
     runs-on: ubuntu-latest
+    # Main pushes are published after version-bump.yml updates Chart.yaml.
+    if: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
