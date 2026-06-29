@@ -3,7 +3,7 @@ name: Container Images
 on:
   push:
     branches:
-      - "**"
+      - main
     tags:
       - "v*.*.*"
   pull_request:
@@ -45,6 +45,18 @@ jobs:
         shell: bash
         run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
+      - name: Read chart app version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(awk -F: '/^appVersion:/{v=$2; sub(/#.*/,"",v); gsub(/"/,"",v); gsub(/^[ \t]+|[ \t\r]+$/,"",v); print v; exit}' charts/runai-rca/Chart.yaml)
+          if [[ -z "$version" ]]; then
+            echo "ERROR: appVersion not found in charts/runai-rca/Chart.yaml" >&2
+            exit 1
+          fi
+          echo "appVersion=$version" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -67,7 +79,7 @@ jobs:
             type=sha,prefix=sha-
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.version.outputs.appVersion }},enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=${{ matrix.image }}
             org.opencontainers.image.description=Run:AI RCA ${{ matrix.component }} service
@@ -77,7 +89,7 @@ jobs:
         with:
           context: ./${{ matrix.context }}
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.component }}
