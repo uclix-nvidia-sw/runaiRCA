@@ -137,4 +137,10 @@ EXISTS`; no migration step is needed. pgvector is used when available, otherwise
 the backend falls back to JSONB cosine search. Sensitive values are redacted
 before evidence leaves a collector; add patterns via `MASKING_REGEX_LIST_JSON`.
 
-See `docs/ARCHITECTURE.md` for the implementation contract.
+## Documentation
+
+- `docs/CONFIGURATION.md` — full env var and Helm value reference
+- `docs/DEPLOYMENT.md` — detailed deployment, RBAC, and DB notes
+- `docs/API.md` — backend and agent endpoints
+- `docs/ARCHITECTURE.md` — implementation contract
+- `docs/OPERATING-MODEL.md` — operating model
