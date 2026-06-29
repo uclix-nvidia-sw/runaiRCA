@@ -167,7 +167,6 @@ def _loki_auth_configured(settings: Settings) -> bool:
     return bool(
         settings.loki_bearer_token
         or (settings.loki_basic_username and settings.loki_basic_password)
-        or settings.loki_tenant_id
     )
 
 
