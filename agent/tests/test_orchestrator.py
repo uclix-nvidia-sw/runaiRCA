@@ -269,6 +269,52 @@ async def test_chat_without_detail_reports_runtime_state() -> None:
     assert "No specific incident or alert RCA content is attached yet" not in response.answer
 
 
+@pytest.mark.anyio
+async def test_chat_uses_llm_when_configured(monkeypatch) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.example.com/v1",
+        llm_model="rca-router",
+        llm_api_key="secret",
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        captured["url"] = url
+        captured["json_body"] = json_body
+        return SimpleNamespace(
+            ok=True,
+            data={"choices": [{"message": {"content": "Live LLM reply about the pending workload."}}]},
+        )
+
+    monkeypatch.setattr("app.services.orchestrator.post_json", fake_post_json)
+    orchestrator = AnalysisOrchestrator(settings)
+    response = await orchestrator.chat(ChatRequest(message="왜 워크로드가 멈췄어?", page="operations"))
+
+    assert response.answer == "Live LLM reply about the pending workload."
+    assert captured["url"] == "https://llm.example.com/v1/chat/completions"
+    assert captured["json_body"]["model"] == "rca-router"
+
+
+@pytest.mark.anyio
+async def test_chat_falls_back_when_llm_unavailable(monkeypatch) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.example.com/v1",
+        llm_model="rca-router",
+        llm_api_key="secret",
+    )
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        return SimpleNamespace(ok=False, data=None)
+
+    monkeypatch.setattr("app.services.orchestrator.post_json", fake_post_json)
+    orchestrator = AnalysisOrchestrator(settings)
+    response = await orchestrator.chat(ChatRequest(message="status?", page="operations"))
+
+    assert "## RCA Chat" in response.answer
+
+
 def test_extract_nat_result_strips_console_wrapper() -> None:
     output = (
         "\x1b[32mWorkflow Result:\n## Root Cause\n\nBody\n"

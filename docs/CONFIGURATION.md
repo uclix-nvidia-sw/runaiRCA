@@ -50,9 +50,9 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `BUILTIN_REDACTION_ENABLED` | Enable built-in secret redaction, default `true` |
 | `BUILTIN_REDACTION_HASH_MODE` | Replace secrets with stable short hashes instead of `[MASKED]`, default `false` |
 | `NVIDIA_API_KEY` | NIM key for NeMo Agent Toolkit workflows |
-| `LLM_BASE_URL` | LiteLLM/OpenAI-compatible base URL for the LiteLLM NAT workflow |
-| `LLM_MODEL` | LiteLLM/OpenAI-compatible model name, for example `auto-router` |
-| `LLM_API_KEY` | LiteLLM/OpenAI-compatible API key secret |
+| `LLM_BASE_URL` | OpenAI-compatible base URL for the LiteLLM NAT workflow and the operator chat copilot |
+| `LLM_MODEL` | OpenAI-compatible model name, for example `auto-router` |
+| `LLM_API_KEY` | OpenAI-compatible API key secret; enables conversational chat answers when all three LLM vars are set |
 | `LLM_REQUEST_TIMEOUT_SECONDS` | LiteLLM request timeout used in the materialized NAT config, default `120` |
 | `ENABLE_NAT_RUNTIME` | Run RCA synthesis through the NeMo Agent Toolkit CLI instead of the deterministic in-process fallback, default `false` |
 | `NAT_CONFIG_FILE` | Optional NeMo workflow config path, default `configs/runai_rca_workflow.yml` |
