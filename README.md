@@ -297,11 +297,15 @@ Secret key names, set `secrets.keys.*` to match them.
 For an existing Postgres, set `secrets.databaseUrl` or provide a Secret through
 `secrets.existingSecret`. By default the chart reads `DATABASE_URL` and
 `POSTGRES_DSN`; if your existing Secret uses different key names, set
-`secrets.keys.databaseUrl` and `secrets.keys.postgresDsn`. The existing database
-must already exist and the backend user needs table create/read/write
-privileges. pgvector is a database-server prerequisite: the extension binary
-must be installed on that Postgres server, and a DBA/admin may need to run
-`CREATE EXTENSION IF NOT EXISTS vector;` inside every database such as
+`secrets.keys.databaseUrl` and `secrets.keys.postgresDsn`. The backend
+auto-creates the target database on first start if it is missing — it connects to
+the server's `postgres` maintenance database, issues a single
+`CREATE DATABASE <name>` only when absent, and never touches other databases. The
+the connecting user therefore needs the `CREATEDB` privilege (or an admin can
+pre-create the database). The backend user also needs privileges to create/update tables
+(and to run `CREATE EXTENSION` if pgvector should be enabled). pgvector is a database-server prerequisite: the
+extension binary must be installed on that Postgres server, and a DBA/admin may
+need to run `CREATE EXTENSION IF NOT EXISTS vector;` inside every database such as
 `runai_rca` before the backend starts.
 
 For a bundled single-pod Postgres, enable:
