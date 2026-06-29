@@ -3406,28 +3406,39 @@ function buildDailySeries(
   windowDays: number,
   anchorDate: Date,
 ): TrendPoint[] {
-  const points = Array.from({ length: windowDays }).map((_, index) => {
+  // Precompute day boundaries once to avoid repeated date construction in the inner loop
+  const days = Array.from({ length: windowDays }).map((_, index) => {
     const date = addUtcDays(anchorDate, index - windowDays + 1);
-    return {
-      date: dateKey(date),
-      incidents: 0,
-      alerts: 0,
-    };
+    const dayStart = startOfUtcDay(date);
+    const dayEnd = addUtcDays(dayStart, 1);
+    return { date: dateKey(date), dayStart, dayEnd };
   });
+
+  const points: TrendPoint[] = days.map(({ date }) => ({ date, incidents: 0, alerts: 0 }));
+
+  // Parse each record's timestamps once (outside the inner loop) then do pure date comparisons
   incidents.forEach((incident) => {
-    points.forEach((point) => {
-      if (isActiveOnDay(incident.fired_at, incident.resolved_at ?? '', incident.status, parseDate(point.date) ?? anchorDate)) {
-        point.incidents += 1;
+    const started = parseDate(incident.fired_at);
+    if (!started) return;
+    const ended = activeEndDate(incident.fired_at, incident.resolved_at ?? '', incident.status);
+    days.forEach(({ dayStart, dayEnd }, i) => {
+      if (started < dayEnd && (!ended || ended >= dayStart)) {
+        points[i].incidents += 1;
       }
     });
   });
+
   alerts.forEach((alert) => {
-    points.forEach((point) => {
-      if (isActiveOnDay(alert.fired_at, alert.resolved_at ?? '', alert.status, parseDate(point.date) ?? anchorDate)) {
-        point.alerts += 1;
+    const started = parseDate(alert.fired_at);
+    if (!started) return;
+    const ended = activeEndDate(alert.fired_at, alert.resolved_at ?? '', alert.status);
+    days.forEach(({ dayStart, dayEnd }, i) => {
+      if (started < dayEnd && (!ended || ended >= dayStart)) {
+        points[i].alerts += 1;
       }
     });
   });
+
   return points;
 }
 
