@@ -41,6 +41,9 @@ func (s *Server) startAnalysisRun(targetType string, targetID string, source str
 	if !ok {
 		return nil, false
 	}
+	if source == "manual" && strings.TrimSpace(prompt) == "" {
+		prompt = s.store.OperatorPromptForTarget(targetType, targetID)
+	}
 	run := s.store.CreateAnalysisRun(
 		source,
 		targetType,
@@ -50,7 +53,11 @@ func (s *Server) startAnalysisRun(targetType string, targetID string, source str
 		fmt.Sprintf("%s: %s", sourceTitle(source), title),
 		prompt,
 	)
-	s.store.BeginAnalyzing(incidentID, alertID)
+	if source == "manual" {
+		s.store.BeginManualAnalysis(incidentID, alertID)
+	} else {
+		s.store.BeginAnalyzing(incidentID, alertID)
+	}
 	s.hub.Broadcast(analysisStartedEvent(run.RunID, run.Source, targetType, targetID, incidentID, alertID))
 	go s.requestAnalysisRun(run.RunID, alert, incidentID, alertID, threadTS, source, prompt)
 	return &run, true
@@ -85,11 +92,11 @@ func (s *Server) requestAnalysisRun(
 		IncidentID:       incidentID,
 		AnalysisType:     first(source, status(alert.Status)),
 		Language:         s.language,
-		SimilarIncidents: s.store.SimilarIncidentsForAlert(alert, incidentID, 5),
-		FeedbackHints:    s.store.FeedbackHintsForAlert(alert, incidentID, 5),
+		SimilarIncidents: s.store.SimilarIncidentsForAlert(alert, incidentID, similarIncidentLimit),
+		FeedbackHints:    s.store.FeedbackHintsForAlert(alert, incidentID, similarIncidentLimit),
 	}
 
-	analysis, err := s.callAnalyze(req)
+	analysis, err := s.callAnalyze(req, s.analysisRequestTimeout(source))
 	if err != nil {
 		fallback := fallbackAnalysis(alert, err)
 		run, _ := s.store.FailAnalysisRun(runID, fallback)
@@ -100,6 +107,13 @@ func (s *Server) requestAnalysisRun(
 	run, _ := s.store.CompleteAnalysisRun(runID, analysis)
 	s.store.ApplyAnalysis(alertID, analysis)
 	s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
+}
+
+func (s *Server) analysisRequestTimeout(source string) time.Duration {
+	if source == "manual" {
+		return 0
+	}
+	return s.agentRequestTimeout
 }
 
 func (s *Server) broadcastAnalysisRunCompleted(run AnalysisRun, incidentID string, alertID string) {

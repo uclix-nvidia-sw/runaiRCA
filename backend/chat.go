@@ -159,8 +159,8 @@ func (s *Server) enrichChatRequest(req ChatRequest) ChatRequest {
 	}
 
 	if contextAlert != nil {
-		req.Context["similar_incidents"] = s.store.SimilarIncidentsForAlert(*contextAlert, contextIncidentID, 5)
-		req.Context["feedback_hints"] = s.store.FeedbackHintsForAlert(*contextAlert, contextIncidentID, 5)
+		req.Context["similar_incidents"] = s.store.SimilarIncidentsForAlert(*contextAlert, contextIncidentID, similarIncidentLimit)
+		req.Context["feedback_hints"] = s.store.FeedbackHintsForAlert(*contextAlert, contextIncidentID, similarIncidentLimit)
 	}
 
 	memoryQuery := strings.Join(

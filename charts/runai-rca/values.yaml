@@ -195,7 +195,6 @@ frontend:
     port: 80
   config:
     apiBaseUrl: ""
-    enableMockData: false
   nginx:
     clientMaxBodySize: 10m
     proxyConnectTimeout: 60s

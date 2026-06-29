@@ -184,6 +184,11 @@ type Server struct {
 	client              *http.Client
 }
 
+const (
+	similarIncidentLimit = 3
+	flappingGroupWindow  = 30 * time.Minute
+)
+
 func main() {
 	port := getenv("PORT", "8080")
 	server := NewServer()
@@ -236,7 +241,7 @@ func NewServer() *Server {
 		agentURL:            strings.TrimRight(getenv("AGENT_URL", "http://localhost:8000"), "/"),
 		language:            getenv("LANGUAGE", "en"),
 		agentRequestTimeout: agentRequestTimeout,
-		client:              &http.Client{Timeout: agentRequestTimeout},
+		client:              &http.Client{},
 	}
 }
 
@@ -291,22 +296,17 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 func correlationKey(webhook AlertmanagerWebhook, alert Alert) string {
 	labels := alert.Labels
 	cluster := first(labels["cluster"], labels["runai_cluster"], labels["runai.io/cluster"])
-	project := first(labels["project"], labels["runai_project"], labels["runai.io/project"])
-	queue := first(labels["queue"], labels["runai_queue"], labels["runai.io/queue"])
 	namespace := first(labels["namespace"], labels["kubernetes_namespace"])
-	workload := first(labels["workload"], labels["workload_name"], labels["runai_workload_name"], labels["pod"])
-	node := first(labels["node"], labels["node_name"])
-	if cluster != "" && project != "" && queue != "" && namespace != "" && workload != "" {
-		return strings.Join([]string{"workload", cluster, project, queue, namespace, workload}, ":")
-	}
-	if cluster != "" && node != "" {
-		return strings.Join([]string{"node", cluster, node}, ":")
-	}
-	if webhook.GroupKey != "" {
-		return "group:" + webhook.GroupKey
+	pod := first(labels["pod"], labels["pod_name"], labels["kubernetes_pod_name"])
+	alertName := first(labels["alertname"], labels["alert_name"])
+	if namespace != "" && pod != "" && alertName != "" {
+		return strings.Join([]string{"flap", cluster, namespace, pod, alertName}, ":")
 	}
 	if alert.Fingerprint != "" {
 		return "fingerprint:" + alert.Fingerprint
+	}
+	if webhook.GroupKey != "" {
+		return "group:" + webhook.GroupKey
 	}
 	return fmt.Sprintf("adhoc:%d", time.Now().UnixNano())
 }

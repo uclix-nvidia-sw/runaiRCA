@@ -33,13 +33,13 @@ type IncidentMemory struct {
 func (s *Store) SimilarIncidentsForAlert(alert Alert, incidentID string, limit int) []SimilarIncident {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.similarIncidentsLocked(alert, incidentID, limit)
+	return s.similarIncidentsLocked(alert, incidentID, capSimilarIncidentLimit(limit))
 }
 
 func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int) []FeedbackHint {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	similar := s.similarIncidentsLocked(alert, incidentID, limit)
+	similar := s.similarIncidentsLocked(alert, incidentID, capSimilarIncidentLimit(limit))
 	hints := make([]FeedbackHint, 0, limit)
 	for _, item := range similar {
 		if item.PositiveFeedback > 0 {
@@ -74,6 +74,13 @@ func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int)
 		}
 	}
 	return hints
+}
+
+func capSimilarIncidentLimit(limit int) int {
+	if limit <= 0 || limit > similarIncidentLimit {
+		return similarIncidentLimit
+	}
+	return limit
 }
 
 func (s *Store) SearchIncidentMemory(query string, limit int) []SimilarIncident {
@@ -180,6 +187,28 @@ func (s *Store) BeginAnalyzing(incidentID string, alertID string) {
 	}
 }
 
+// BeginManualAnalysis clears the visible RCA before a dashboard-triggered
+// reanalysis so operators can see a fresh run is in progress.
+func (s *Store) BeginManualAnalysis(incidentID string, alertID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if incident := s.incidents[incidentID]; incident != nil {
+		incident.IsAnalyzing = true
+		s.persistIncidentLocked(incident)
+	}
+	if alert := s.alerts[alertID]; alert != nil {
+		alert.AnalysisSummary = ""
+		alert.AnalysisDetail = ""
+		alert.AnalysisQuality = ""
+		alert.Capabilities = map[string]string{}
+		alert.MissingData = []string{}
+		alert.Warnings = []string{}
+		alert.Artifacts = []Artifact{}
+		alert.IsAnalyzing = true
+		s.persistAlertLocked(alert)
+	}
+}
+
 // ApplyFallbackAnalysisIfAbsent implements the overwrite policy for failed runs:
 // a successful RCA already attached to the alert is always preserved, and the
 // fallback RCA is only surfaced on the alert when there is nothing to keep. It
@@ -247,9 +276,7 @@ func (s *Store) similarIncidentsLocked(
 	currentIncidentID string,
 	limit int,
 ) []SimilarIncident {
-	if limit <= 0 {
-		limit = 5
-	}
+	limit = capSimilarIncidentLimit(limit)
 	queryVector := textVector(alertSearchText(alert))
 	results := make([]SimilarIncident, 0, len(s.memories))
 	for _, memory := range s.memories {

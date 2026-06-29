@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -107,8 +108,28 @@ func (s *Store) UpsertAlert(webhook AlertmanagerWebhook, alert Alert) (*Incident
 		alert.Annotations = map[string]string{}
 	}
 	key := correlationKey(webhook, alert)
-	incidentID := s.incidentByKey[key]
 	now := time.Now().UTC()
+	alertFiredAt := firstTime(alert.StartsAt, now)
+	alertID := ""
+	if alert.Fingerprint != "" {
+		alertID = s.alertByFinger[alert.Fingerprint]
+	}
+	incidentID := ""
+	if alertID != "" {
+		if existing := s.alerts[alertID]; existing != nil {
+			if s.shouldReuseIncidentForAlertLocked(key, s.incidents[existing.IncidentID], alertFiredAt) {
+				incidentID = existing.IncidentID
+			} else {
+				alertID = ""
+			}
+		}
+	}
+	if incidentID == "" {
+		incidentID = s.incidentByKey[key]
+		if incidentID != "" && !s.shouldReuseIncidentForAlertLocked(key, s.incidents[incidentID], alertFiredAt) {
+			incidentID = ""
+		}
+	}
 	if incidentID == "" {
 		incidentID = nextID("INC", s.incidentSeq.Add(1))
 		s.incidentByKey[key] = incidentID
@@ -118,7 +139,7 @@ func (s *Store) UpsertAlert(webhook AlertmanagerWebhook, alert Alert) (*Incident
 			Title:          incidentTitle(alert),
 			Severity:       severity(alert),
 			Status:         "firing",
-			FiredAt:        firstTime(alert.StartsAt, now),
+			FiredAt:        alertFiredAt,
 		}
 	}
 	incident := s.incidents[incidentID]
@@ -128,12 +149,16 @@ func (s *Store) UpsertAlert(webhook AlertmanagerWebhook, alert Alert) (*Incident
 		t := firstTime(alert.EndsAt, now)
 		incident.ResolvedAt = &t
 		incident.Status = "resolved"
+	} else if alert.Status != "resolved" && incident.Status == "resolved" {
+		incident.Status = "firing"
+		incident.ResolvedAt = nil
 	}
 
-	alertID := s.alertByFinger[alert.Fingerprint]
 	if alertID == "" {
 		alertID = nextID("ALR", s.alertSeq.Add(1))
-		s.alertByFinger[alert.Fingerprint] = alertID
+		if alert.Fingerprint != "" {
+			s.alertByFinger[alert.Fingerprint] = alertID
+		}
 	}
 	record := s.alerts[alertID]
 	if record == nil {
@@ -144,7 +169,7 @@ func (s *Store) UpsertAlert(webhook AlertmanagerWebhook, alert Alert) (*Incident
 	record.AlarmTitle = incidentTitle(alert)
 	record.Severity = severity(alert)
 	record.Status = status(alert.Status)
-	record.FiredAt = firstTime(alert.StartsAt, now)
+	record.FiredAt = alertFiredAt
 	record.Fingerprint = alert.Fingerprint
 	record.ThreadTS = "thread-" + alertID
 	record.Labels = cloneMap(alert.Labels)
@@ -153,10 +178,41 @@ func (s *Store) UpsertAlert(webhook AlertmanagerWebhook, alert Alert) (*Incident
 	if alert.Status == "resolved" {
 		t := firstTime(alert.EndsAt, now)
 		record.ResolvedAt = &t
+	} else {
+		record.ResolvedAt = nil
 	}
 	s.persistIncidentLocked(incident)
 	s.persistAlertLocked(record)
 	return cloneIncident(incident), cloneAlert(record)
+}
+
+func (s *Store) shouldReuseIncidentForAlertLocked(key string, incident *Incident, firedAt time.Time) bool {
+	if incident == nil {
+		return false
+	}
+	if !strings.HasPrefix(key, "flap:") {
+		return true
+	}
+	latest := incident.FiredAt
+	if incident.ResolvedAt != nil && incident.ResolvedAt.After(latest) {
+		latest = *incident.ResolvedAt
+	}
+	for _, alert := range s.alerts {
+		if alert == nil || alert.IncidentID != incident.IncidentID {
+			continue
+		}
+		if alert.FiredAt.After(latest) {
+			latest = alert.FiredAt
+		}
+		if alert.ResolvedAt != nil && alert.ResolvedAt.After(latest) {
+			latest = *alert.ResolvedAt
+		}
+	}
+	delta := firedAt.Sub(latest)
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= flappingGroupWindow
 }
 
 func (s *Store) ListIncidents() []Incident {
@@ -176,7 +232,7 @@ func (s *Store) ListAlerts() []AlertRecord {
 	items := make([]AlertRecord, 0, len(s.alerts))
 	for _, alert := range s.alerts {
 		copied := cloneAlert(alert)
-		copied.SimilarIncidents = s.similarIncidentsLocked(alertFromRecord(*copied), alert.IncidentID, 5)
+		copied.SimilarIncidents = s.similarIncidentsLocked(alertFromRecord(*copied), alert.IncidentID, similarIncidentLimit)
 		copied.Feedback = s.feedbackSummaryLocked("alert", alert.AlertID)
 		items = append(items, *copied)
 	}
@@ -369,7 +425,7 @@ func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 		}
 		copied := cloneAlert(alert)
 		copied.Feedback = s.feedbackSummaryLocked("alert", alert.AlertID)
-		copied.SimilarIncidents = s.similarIncidentsLocked(alertFromRecord(*copied), alert.IncidentID, 5)
+		copied.SimilarIncidents = s.similarIncidentsLocked(alertFromRecord(*copied), alert.IncidentID, similarIncidentLimit)
 		detail.Alerts = append(detail.Alerts, *copied)
 		if detail.AnalysisSummary == "" && copied.AnalysisSummary != "" {
 			detail.AnalysisSummary = copied.AnalysisSummary
@@ -389,7 +445,7 @@ func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 		detail.SimilarIncidents = s.similarIncidentsLocked(
 			alertFromRecord(detail.Alerts[0]),
 			id,
-			5,
+			similarIncidentLimit,
 		)
 	}
 	return detail, true
@@ -404,7 +460,7 @@ func (s *Store) AlertDetail(id string) (*AlertRecord, bool) {
 	}
 	copied := cloneAlert(alert)
 	copied.Feedback = s.feedbackSummaryLocked("alert", id)
-	copied.SimilarIncidents = s.similarIncidentsLocked(alertFromRecord(*copied), alert.IncidentID, 5)
+	copied.SimilarIncidents = s.similarIncidentsLocked(alertFromRecord(*copied), alert.IncidentID, similarIncidentLimit)
 	return copied, true
 }
 
@@ -520,6 +576,39 @@ func (s *Store) UpdateComment(
 	}
 	s.persistCommentUpdateLocked(comment)
 	return s.feedbackSummaryLocked(targetType, targetID), true, nil
+}
+
+func (s *Store) OperatorPromptForTarget(targetType string, targetID string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	incidentID, alertID, ok := s.targetIDsLocked(targetType, targetID)
+	if !ok {
+		return ""
+	}
+	lines := []string{"Operator feedback comments to consider during this reanalysis:"}
+	lines = appendCommentPromptLines(lines, "incident", incidentID, s.commentsForTargetLocked("incident", incidentID))
+	if alertID != "" {
+		lines = appendCommentPromptLines(lines, "alert", alertID, s.commentsForTargetLocked("alert", alertID))
+	}
+	if len(lines) == 1 {
+		return ""
+	}
+	return strings.Join(lines, "\n")
+}
+
+func appendCommentPromptLines(lines []string, targetType string, targetID string, comments []CommentRecord) []string {
+	if targetID == "" || len(comments) == 0 {
+		return lines
+	}
+	for _, comment := range comments {
+		body := strings.TrimSpace(comment.Body)
+		if body == "" {
+			continue
+		}
+		author := first(strings.TrimSpace(comment.Author), "operator")
+		lines = append(lines, fmt.Sprintf("- %s %s by %s: %s", targetType, targetID, author, body))
+	}
+	return lines
 }
 
 func (s *Store) DeleteComment(
