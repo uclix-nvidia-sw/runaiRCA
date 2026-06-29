@@ -42,7 +42,9 @@ func (s *Store) connectDatabaseWithDriver(driverName string, databaseURL string,
 				log.Printf("Postgres store disabled: reopen failed: %v", err)
 				return
 			}
-			err = db.PingContext(ctx)
+			retryCtx, retryCancel := context.WithTimeout(context.Background(), connectTimeout)
+			err = db.PingContext(retryCtx)
+			retryCancel()
 		}
 		if err != nil {
 			_ = db.Close()
@@ -52,7 +54,9 @@ func (s *Store) connectDatabaseWithDriver(driverName string, databaseURL string,
 	}
 	s.db = db
 	s.dbReady = true
-	s.pgvectorReady = s.ensurePostgresSchema(ctx)
+	schemaCtx, schemaCancel := context.WithTimeout(context.Background(), connectTimeout)
+	defer schemaCancel()
+	s.pgvectorReady = s.ensurePostgresSchema(schemaCtx)
 	if !s.dbReady {
 		_ = db.Close()
 		s.db = nil
@@ -60,7 +64,7 @@ func (s *Store) connectDatabaseWithDriver(driverName string, databaseURL string,
 		log.Printf("Postgres store disabled: schema initialization failed")
 		return
 	}
-	s.loadDatabaseState(ctx)
+	s.loadDatabaseState(schemaCtx)
 	log.Printf(
 		"Postgres store enabled for incidents, embeddings, feedback, comments, and analysis runs; %s",
 		s.pgvectorLogState(),
@@ -79,6 +83,7 @@ func isMissingDatabaseError(err error) bool {
 		return pgErr.Code == "3D000"
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "does not exist")
+}
 
 // ensureDatabaseExists connects to the server's maintenance database and creates
 // the target database only when it is missing. Existing databases on the same
