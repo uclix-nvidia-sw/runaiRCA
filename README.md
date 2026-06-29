@@ -1,33 +1,21 @@
 # Run:AI RCA
 
 Run:AI RCA is a KubeRCA-inspired incident analysis cockpit for NVIDIA Run:ai
-environments. It keeps the operator workflow that made KubeRCA useful:
-Alertmanager intake, incident and alert dashboards, structured RCA reports,
-Slack-friendly summaries, realtime updates, chat, and reusable incident memory.
-
-The key difference is the analysis engine. Instead of a single agent, Run:AI RCA
-uses a component-oriented multi-agent design with NVIDIA NeMo Agent Toolkit as
-the orchestration backbone.
-
-## Product Direction
-
-- White-first operations UI with NVIDIA green accents.
-- One unified Incident or Alert page. Operators should see the final RCA and
-  every agent's evidence trail in the same place.
-- Read-only RCA by default. The system explains root cause and next actions but
-  does not remediate automatically.
-- Graceful degradation. If Run:ai API, Prometheus, Loki, or Kubernetes access is
-  missing, the RCA still returns a useful partial report and clearly marks
-  missing data.
+environments: Alertmanager intake, incident/alert dashboards, structured RCA
+reports, realtime updates, chat, and reusable incident memory. Instead of a
+single agent, it uses a component-oriented multi-agent design with the NVIDIA
+NeMo Agent Toolkit as the orchestration backbone. RCA is read-only by default
+and degrades gracefully when Run:ai, Prometheus, Loki, or Kubernetes access is
+missing.
 
 ## Repository Layout
 
 ```text
-agent/          FastAPI analysis service and NeMo Agent Toolkit workflow config
-backend/        Go API server for Alertmanager intake, incidents, alerts, SSE
-frontend/       React dashboard with NVIDIA-inspired white theme
-charts/         Helm chart for Kubernetes deployment
-docs/           Architecture, UI direction, and operation notes
+agent/      FastAPI analysis service and NeMo Agent Toolkit workflow config
+backend/    Go API server for Alertmanager intake, incidents, alerts, SSE
+frontend/   React dashboard
+charts/     Helm chart for Kubernetes deployment
+docs/       Architecture and operation notes
 ```
 
 ## Architecture
@@ -47,413 +35,112 @@ flowchart TD
     PA[Prometheus agent]
     LA[Loki agent]
     AA[Analysis agent]
-    CA[Chat agent]
   end
 
   AG --> ORCH
-  ORCH --> RA
-  ORCH --> KA
-  ORCH --> DBA
-  ORCH --> PA
-  ORCH --> LA
-  RA --> AA
-  KA --> AA
-  DBA --> AA
-  PA --> AA
-  LA --> AA
+  ORCH --> RA & KA & DBA & PA & LA
+  RA & KA & DBA & PA & LA --> AA
   AA -->|dashboard RCA| FE
-  DB --> CA
-  AG --> CA
 ```
-
-## MVP Interfaces
-
-Backend:
-
-- `POST /webhook/alertmanager`
-- `GET /api/v1/incidents`
-- `GET /api/v1/incidents/{id}`
-- `POST /api/v1/incidents/{id}/analyze`
-- `POST /api/v1/incidents/{id}/resolve`
-- `GET /api/v1/incidents/{id}/feedback`
-- `POST /api/v1/incidents/{id}/feedback`
-- `POST /api/v1/incidents/{id}/vote`
-- `POST /api/v1/incidents/{id}/comments`
-- `PUT /api/v1/incidents/{id}/comments/{comment_id}`
-- `DELETE /api/v1/incidents/{id}/comments/{comment_id}`
-- `GET /api/v1/alerts`
-- `GET /api/v1/alerts/{id}`
-- `GET /api/v1/alerts/{id}/feedback`
-- `POST /api/v1/alerts/{id}/feedback`
-- `POST /api/v1/alerts/{id}/vote`
-- `POST /api/v1/alerts/{id}/comments`
-- `PUT /api/v1/alerts/{id}/comments/{comment_id}`
-- `DELETE /api/v1/alerts/{id}/comments/{comment_id}`
-- `POST /api/v1/embeddings/search`
-- `GET /api/v1/analysis-runs`
-- `GET /api/v1/events`
-- `POST /api/v1/chat`
-
-Agent:
-
-- `POST /analyze`
-- `POST /summarize-incident`
-- `POST /chat` context-aware RCA chat grounded in current incidents, alerts, evidence, feedback, and similar RCA memory
-- `GET /healthz`
 
 ## Local Development
 
-Agent:
-
 ```bash
-cd agent
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-uvicorn app.main:app --reload --port 8000
-```
+# Agent
+cd agent && python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]" && uvicorn app.main:app --reload --port 8000
 
-Backend:
+# Backend
+cd backend && go test ./... && go run .
 
-```bash
-cd backend
-go test ./...
-go run .
-```
-
-Frontend:
-
-```bash
-cd frontend
-npm install
-npm run dev
+# Frontend
+cd frontend && npm install && npm run dev
 ```
 
 The frontend expects the backend at `http://localhost:8080` by default.
 
-## Configuration
+## Deployment
 
-Core environment variables:
+Container images and the Helm chart are published to GHCR on `main` pushes and
+version tags (`v*.*.*`). Pull requests build/lint only. Images are tagged with
+the chart `appVersion` plus `sha-...`; the chart is published as an OCI
+artifact.
 
-| Variable | Purpose |
-| --- | --- |
-| `PORT` | Backend/Agent HTTP port; Helm maps this from the component service port |
-| `AGENT_URL` | Backend to Agent URL, default `http://localhost:8000` |
-| `AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for Agent `/analyze` and `/chat` requests, default `180` |
-| `LOG_LEVEL` | Agent log level, default `info` |
-| `LANGUAGE` | Backend/Agent response language, `en` or `ko` |
-| `KUBERNETES_API_URL` | In-cluster Kubernetes API URL, default `https://kubernetes.default.svc` |
-| `KUBERNETES_TOKEN_PATH` | Service account token path for in-cluster Kubernetes collection |
-| `KUBERNETES_CA_PATH` | Service account CA path for in-cluster Kubernetes collection |
-| `KUBERNETES_TIMEOUT_SECONDS` | Kubernetes API request timeout |
-| `KUBERNETES_LIST_LIMIT` | Kubernetes pod/event list page size for evidence collection, default `50` |
-| `KUBERNETES_NAMESPACES` | Optional comma-separated namespace allowlist for Kubernetes direct collection |
-| `KUBERNETES_CLUSTER_SCOPE_ENABLED` | Enables cluster-scoped Kubernetes calls such as node lookups; Helm follows `agent.rbac.clusterWide` |
-| `RUNAI_BASE_URL` | Run:ai control plane URL |
-| `RUNAI_BEARER_TOKEN` | Optional Run:ai bearer token secret |
-| `RUNAI_CLIENT_ID` | Run:ai application client ID |
-| `RUNAI_CLIENT_SECRET` | Run:ai application client secret |
-| `RUNAI_TOKEN_URL` | Optional OAuth token URL for Run:ai client credentials |
-| `RUNAI_WORKLOADS_PATH` | Run:ai workloads API path, default `/api/v1/workloads` |
-| `RUNAI_PROJECTS_PATH` | Run:ai projects API path, default `/api/v1/projects` |
-| `RUNAI_QUEUES_PATH` | Run:ai queues API path, default `/api/v1/queues` |
-| `RUNAI_TIMEOUT_SECONDS` | Run:ai API request timeout |
-| `RUNAI_LOG_NAMESPACES` | Comma-separated Run:ai control-plane log namespaces, default `runai,runai-backend` |
-| `PROMETHEUS_URL` | Prometheus base URL |
-| `PROMETHEUS_TIMEOUT_SECONDS` | Prometheus query timeout |
-| `PROMETHEUS_MCP_URL` | Optional remote Prometheus MCP URL for the MCP workflow |
-| `LOKI_URL` | Loki base URL |
-| `LOKI_TIMEOUT_SECONDS` | Loki query timeout |
-| `LOKI_QUERY_LIMIT` | Maximum log lines requested per Loki query group, default `20` |
-| `LOKI_MCP_URL` | Optional remote Loki MCP URL for the MCP workflow |
-| `DATABASE_URL` | Backend Postgres store DSN for incidents, alerts, embeddings, feedback, comments, and analysis runs |
-| `DATABASE_CONNECT_TIMEOUT_SECONDS` | Backend Postgres startup connection timeout, default `5` |
-| `POSTGRES_DSN` | Agent Postgres diagnostic DSN; defaults to `DATABASE_URL` in Helm |
-| `POSTGRES_TIMEOUT_SECONDS` | Agent Postgres diagnostic query timeout |
-| `TROUBLESHOOTING_CASES_FILE` | Local known-cases/playbook markdown path |
-| `AGENT_SOULS_FILE` | Agent role-contract prompt path, default `prompts/agent_souls.md` |
-| `MASKING_REGEX_LIST_JSON` | Optional JSON array of custom redaction regexes |
-| `BUILTIN_REDACTION_ENABLED` | Enable built-in secret redaction, default `true` |
-| `BUILTIN_REDACTION_HASH_MODE` | Replace secrets with stable short hashes instead of `[MASKED]`, default `false` |
-| `NVIDIA_API_KEY` | NIM key for NeMo Agent Toolkit workflows |
-| `LLM_BASE_URL` | LiteLLM/OpenAI-compatible base URL for the LiteLLM NAT workflow |
-| `LLM_MODEL` | LiteLLM/OpenAI-compatible model name, for example `auto-router` |
-| `LLM_API_KEY` | LiteLLM/OpenAI-compatible API key secret |
-| `LLM_REQUEST_TIMEOUT_SECONDS` | LiteLLM request timeout used in the materialized NAT config, default `120` |
-| `ENABLE_NAT_RUNTIME` | Run RCA synthesis through the NeMo Agent Toolkit CLI instead of the deterministic in-process fallback, default `false` |
-| `NAT_CONFIG_FILE` | Optional NeMo workflow config path, default `configs/runai_rca_workflow.yml` |
-| `NAT_TIMEOUT_SECONDS` | NeMo Agent Toolkit CLI execution timeout |
-| `VITE_ENABLE_MOCK_DATA` | Frontend local-dev sample data toggle; Helm uses `frontend.config.enableMockData` |
+- `ghcr.io/<owner>/runai-rca-backend`, `-agent`, `-frontend`
+- `ghcr.io/<owner>/charts/runai-rca`
 
-NeMo Agent Toolkit workflows:
+### 1. Secret
 
-- `agent/configs/runai_rca_workflow.yml` runs the component collectors through
-  NAT `parallel_executor` and the `analysis_agent` RCA step. It does not require
-  external MCP servers.
-- `agent/configs/runai_rca_workflow_mcp.yml` adds Prometheus/Loki MCP client
-  groups and a NIM-backed Analysis Agent review path for environments where
-  those services are available.
-- `agent/configs/runai_rca_workflow_litellm.yml` adds a LiteLLM/OpenAI-compatible
-  Analysis Agent review path. Set `ENABLE_NAT_RUNTIME=true`, point
-  `NAT_CONFIG_FILE` at that config, and provide `LLM_BASE_URL`, `LLM_MODEL`, and
-  `LLM_API_KEY` through env or Helm Secret values.
-
-Example Helm override for a LiteLLM/OpenAI-compatible endpoint:
-
-```bash
-helm upgrade --install runai-rca charts/runai-rca \
-  --set agent.env.enableNatRuntime=true \
-  --set agent.env.natConfigFile=/app/configs/runai_rca_workflow_litellm.yml \
-  --set-string agent.env.llmBaseUrl=https://litellm.example.com/v1 \
-  --set-string agent.env.llmModel=auto-router \
-  --set-string secrets.llmApiKey='<llm-api-key>'
-```
-
-## Container and Helm Deployment
-
-The repository includes a GitHub Actions workflow that builds the three runtime
-images and publishes them to GitHub Container Registry (GHCR), so operators do
-not need to build images locally for every deployment:
-
-- `ghcr.io/<owner>/runai-rca-backend`
-- `ghcr.io/<owner>/runai-rca-agent`
-- `ghcr.io/<owner>/runai-rca-frontend`
-
-The workflow runs on `main` pushes, version tags such as `v0.1.0`, pull
-requests, and manual dispatch. Pull requests build the images without pushing.
-`main` pushes publish the `main` and `sha-...` tags plus the chart `appVersion`
-(for example `0.1.0`), and version tags publish semver tags such as `0.1.0`.
-
-Deploy the published GHCR images with Helm by pointing the global registry at
-the GitHub owner or organization namespace and choosing a shared tag:
-
-```bash
-helm upgrade --install runai-rca charts/runai-rca \
-  --set global.imageRegistry=ghcr.io/<owner> \
-  --set backend.image.tag=0.1.0 \
-  --set agent.image.tag=0.1.0 \
-  --set frontend.image.tag=0.1.0
-```
-
-For a release tag like `v0.1.0`, use `--set backend.image.tag=0.1.0` and the
-same tag for `agent` and `frontend`. If component image tags are left empty, the
-chart defaults them to `appVersion` from `charts/runai-rca/Chart.yaml`.
-
-The Helm chart itself is also packaged and published to GHCR as an OCI artifact
-on `main` pushes and version tags. Pull the chart directly instead of cloning the
-repository:
-
-```bash
-helm upgrade --install runai-rca oci://ghcr.io/<owner>/charts/runai-rca \
-  --version 0.1.1 \
-  --set global.imageRegistry=ghcr.io/<owner>
-```
-
-Local image builds are still available for development.
-
-Each runtime has its own image:
-
-```bash
-docker build -t runai-rca-agent:0.1.0 agent
-docker build -t runai-rca-backend:0.1.0 backend
-docker build -t runai-rca-frontend:0.1.0 frontend
-```
-
-The Helm chart deploys the frontend, backend, agent service, read-only
-Kubernetes RBAC for evidence collection, and the secret/config boundaries for
-Run:ai, Prometheus, Loki, Postgres, and NeMo Agent Toolkit.
-
-```bash
-helm template runai-rca charts/runai-rca
-helm install runai-rca charts/runai-rca \
-  --set agent.env.runaiBaseUrl=https://runai.example.com \
-  --set agent.env.prometheusUrl=http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090 \
-  --set agent.env.lokiUrl=http://loki-gateway.monitoring.svc.cluster.local \
-  --set-string agent.env.runaiLogNamespaces='runai\,runai-backend' \
-  --set secrets.existingSecret=runai-rca-secrets
-```
-
-Create the Kubernetes Secret referenced by `secrets.existingSecret` before
-installing the chart. Use the same namespace as the Helm release, keep `.env`
-for local development only, and omit keys that your deployment does not use:
+The backend auto-creates the target database if it is missing (needs `CREATEDB`,
+or pre-create it). Existing databases are never modified.
 
 ```bash
 kubectl create namespace runai-rca
-kubectl create secret generic runai-rca-secrets \
-  --namespace runai-rca \
-  --from-literal=RUNAI_CLIENT_ID='<runai-client-id>' \
-  --from-literal=RUNAI_CLIENT_SECRET='<runai-client-secret>' \
-  --from-literal=RUNAI_BEARER_TOKEN='<optional-runai-token>' \
-  --from-literal=NVIDIA_API_KEY='<nim-api-key>' \
-  --from-literal=LLM_API_KEY='<llm-api-key>' \
-  --from-literal=DATABASE_URL='postgres://user:password@postgres.example.com:5432/runai_rca?sslmode=require' \
-  --from-literal=POSTGRES_DSN='postgres://user:password@postgres.example.com:5432/runai_rca?sslmode=require'
+kubectl create secret generic runai-rca-secrets -n runai-rca \
+  --from-literal=DATABASE_URL='postgres://user:pw@pg-host:5432/runai_rca?sslmode=require' \
+  --from-literal=POSTGRES_DSN='postgres://user:pw@pg-host:5432/runai_rca?sslmode=require' \
+  --from-literal=RUNAI_CLIENT_ID='<id>' \
+  --from-literal=RUNAI_CLIENT_SECRET='<secret>'
 ```
 
-Install into that namespace with `--namespace runai-rca --create-namespace`, or
-replace the namespace above with your release namespace. If you use different
-Secret key names, set `secrets.keys.*` to match them.
-
-For an existing Postgres, set `secrets.databaseUrl` or provide a Secret through
-`secrets.existingSecret`. By default the chart reads `DATABASE_URL` and
-`POSTGRES_DSN`; if your existing Secret uses different key names, set
-`secrets.keys.databaseUrl` and `secrets.keys.postgresDsn`. The backend
-auto-creates the target database on first start if it is missing — it connects to
-the server's `postgres` maintenance database, issues a single
-`CREATE DATABASE <name>` only when absent, and never touches other databases. The
-the connecting user therefore needs the `CREATEDB` privilege (or an admin can
-pre-create the database). The backend user also needs privileges to create/update tables
-(and to run `CREATE EXTENSION` if pgvector should be enabled). pgvector is a database-server prerequisite: the
-extension binary must be installed on that Postgres server, and a DBA/admin may
-need to run `CREATE EXTENSION IF NOT EXISTS vector;` inside every database such as
-`runai_rca` before the backend starts.
-
-For a bundled single-pod Postgres, enable:
+### 2. Install
 
 ```bash
-helm install runai-rca charts/runai-rca \
-  --set postgresql.enabled=true \
-  --set postgresql.auth.password=change-me
+helm upgrade --install runai-rca oci://ghcr.io/<owner>/charts/runai-rca \
+  --version <chart-version> -n runai-rca \
+  --set global.imageRegistry=ghcr.io/<owner> \
+  --set secrets.existingSecret=runai-rca-secrets \
+  --set agent.env.runaiBaseUrl=https://runai.example.com \
+  --set agent.env.runaiTokenUrl=https://runai.example.com/auth/token \
+  --set agent.env.prometheusUrl=http://prometheus.monitoring.svc:9090 \
+  --set agent.env.lokiUrl=http://loki-gateway.monitoring.svc
 ```
 
-If `secrets.existingSecret` is used for Run:ai/NVIDIA credentials while bundled
-Postgres is enabled, the chart creates a separate generated database Secret and
-points Backend/Agent DB variables at it. To use a dedicated existing DB Secret
-instead, set `secrets.databaseExistingSecret`.
-Bundled Postgres usernames, passwords, and database names are URL-encoded when
-the chart generates `DATABASE_URL` / `POSTGRES_DSN`; externally supplied DSNs in
-`secrets.databaseUrl`, `secrets.postgresDsn`, or existing Secrets should already
-be valid Postgres URLs. The default bundled image is `pgvector/pgvector:pg16`,
-which ships the pgvector extension preinstalled, so the bundled database serves
-real vector search out of the box. When pgvector is available the backend adds an
-`embedding vector(384)` column with an HNSW cosine index and runs similar-incident
-search inside Postgres with the `<=>` cosine operator. If pgvector is unavailable
-(for example when pointing at an external Postgres without the extension), the
-backend logs `pgvector=unavailable, fallback=jsonb` and continues to serve
-similar-incident search from JSONB sparse vectors in
-`incident_embeddings.vector_json` using in-process cosine similarity.
+Bundled single-pod Postgres instead of an external DB: `--set postgresql.enabled=true`.
 
-The Agent uses read-only cluster-wide RBAC by default so it can inspect target
-pods, Run:ai control-plane namespaces, and node context. To limit it to selected
-namespaces, disable cluster-wide RBAC and list the namespaces that should be
-queryable:
+### LLM synthesis (optional)
+
+RCA synthesis runs deterministically in-process unless the NeMo runtime is
+enabled. To synthesize through an OpenAI-compatible endpoint (e.g. LiteLLM):
 
 ```bash
-helm upgrade --install runai-rca charts/runai-rca \
-  --set agent.rbac.clusterWide=false \
-  --set 'agent.rbac.namespaces[0]=runai' \
-  --set 'agent.rbac.namespaces[1]=runai-backend' \
-  --set 'agent.rbac.namespaces[2]=runai-vision'
+  --set agent.env.enableNatRuntime=true \
+  --set agent.env.natConfigFile=/app/configs/runai_rca_workflow_litellm.yml \
+  --set agent.env.llmBaseUrl=https://llm.example.com/v1 \
+  --set agent.env.llmModel=<model> \
+  --set secrets.llmApiKey='<llm-api-key>'
 ```
 
-Frequently tuned Helm values:
+Workflow configs: `runai_rca_workflow.yml` (default, no external LLM),
+`_litellm.yml` (OpenAI-compatible), `_mcp.yml` (Prometheus/Loki MCP + NIM).
 
-| Value | Purpose |
+## Configuration
+
+Key values (full secret keys: `DATABASE_URL`, `POSTGRES_DSN`, `RUNAI_CLIENT_ID`,
+`RUNAI_CLIENT_SECRET`, `RUNAI_BEARER_TOKEN`, `NVIDIA_API_KEY`, `LLM_API_KEY`):
+
+| Helm value | Purpose |
 | --- | --- |
-| `nameOverride` / `fullnameOverride` | Override generated Kubernetes resource names when matching existing naming conventions |
-| `global.imageRegistry` / `imagePullSecrets` | Private registry prefix and pull secrets applied to all runtime images |
-| `{backend,agent,frontend,postgresql}.image.*` | Per-component image repository, tag, and pull policy; empty tags default to the chart app version |
-| `{backend,agent,frontend}.replicaCount` | Scale stateless runtime components; keep the bundled Postgres at one replica |
-| `{backend,agent,frontend,postgresql}.resources` | CPU/memory requests and limits for production scheduling |
-| `backend.env.agentUrl` | Override Backend-to-Agent URL when the Agent is external or remote |
-| `backend.env.language` / `agent.env.language` | Set RCA language to `en` or `ko` |
-| `backend.env.databaseConnectTimeoutSeconds` / `agentRequestTimeoutSeconds` | Backend startup DB timeout and Backend-to-Agent request timeout |
-| `secrets.keys.*` | Existing Secret key names for DB, Run:ai, NVIDIA, and LLM credentials |
-| `secrets.existingSecret` | Existing Secret for Run:ai/NVIDIA/LLM credentials and, by default, DB keys |
-| `secrets.databaseExistingSecret` | Existing Secret used only for `DATABASE_URL` / `POSTGRES_DSN` |
-| `postgresql.enabled` / `postgresql.auth.*` | Install the bundled Postgres and set its generated DSN user, password, and database |
-| `agent.rbac.clusterWide` | Use a ClusterRole for Kubernetes evidence collection; default `true` |
-| `agent.rbac.namespaces` | Namespaces that receive Role/RoleBinding when `agent.rbac.clusterWide=false`; defaults to the release namespace |
-| `agent.env.kubernetesNamespaces` | Agent-side Kubernetes namespace allowlist; when empty and `clusterWide=false`, Helm derives it from `agent.rbac.namespaces` |
-| `agent.serviceAccount.annotations` | ServiceAccount annotations for workload identity integrations |
-| `{backend,frontend,postgresql}.automountServiceAccountToken` | Disable Kubernetes API token mounts for pods that do not need cluster API access; default `false` |
-| `agent.automountServiceAccountToken` | Agent Kubernetes API token mount; default `true` because direct Kubernetes collection uses the service account token |
-| `agent.env.runaiBaseUrl` / `agent.env.runaiTokenUrl` | Run:ai API and optional OAuth token endpoint |
-| `agent.env.runaiWorkloadsPath`, `runaiProjectsPath`, `runaiQueuesPath` | Run:ai API path overrides for different Run:ai versions |
-| `agent.env.runaiLogNamespaces` | Namespaces for Run:ai control-plane/backend logs, default `runai,runai-backend` |
-| `agent.env.prometheusUrl` | In-cluster Prometheus URL, for example `http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090` |
-| `agent.env.lokiUrl` | In-cluster Loki URL, for example `http://loki-gateway.monitoring.svc.cluster.local` |
-| `agent.env.prometheusMcpUrl` / `agent.env.lokiMcpUrl` | Remote MCP endpoints when using the MCP workflow |
-| `agent.env.llmBaseUrl` / `agent.env.llmModel` / `secrets.llmApiKey` | LiteLLM/OpenAI-compatible endpoint, model, and Secret-backed API key for `runai_rca_workflow_litellm.yml` |
-| `agent.env.*TimeoutSeconds` | Request/runtime timeouts for Kubernetes, Run:ai, Prometheus, Loki, Postgres, and NAT |
-| `agent.env.kubernetesListLimit` / `agent.env.lokiQueryLimit` | Evidence volume controls for Kubernetes list calls and Loki log query groups |
-| `agent.env.troubleshootingCasesFile` / `agent.env.agentSoulsFile` | Paths for injected troubleshooting memory and agent role contracts |
-| `agent.env.maskingRegexListJson` / `builtinRedaction*` | Cluster-specific secret masking regexes plus built-in redaction enable/hash controls |
-| `frontend.config.apiBaseUrl` | Browser API base URL when not using the bundled nginx `/api` proxy; accepts absolute URLs, `/api`-style paths, or localhost host:port values |
-| `frontend.config.enableMockData` | Show sample dashboard records when no live incidents or alerts exist, or when the local dev backend is unavailable; default `false` in Helm |
-| `frontend.nginx.*` | Frontend nginx proxy timeout and body-size controls for REST, webhook, and SSE traffic; defaults keep event streams open for one hour |
-| `backend.extraEnv`, `agent.extraEnv`, `frontend.extraEnv` | Additional container env entries for deployment-specific settings |
-| `podAnnotations` / `podLabels` | Global pod metadata applied to Backend, Agent, Frontend, and bundled Postgres |
-| `{backend,agent,frontend,postgresql}.podAnnotations` / `.podLabels` | Component-specific pod metadata merged over global metadata |
-| `podSecurityContext` / `securityContext` | Global pod and container security contexts |
-| `{backend,agent,frontend,postgresql}.podSecurityContext` / `.securityContext` | Component-specific pod and container security contexts |
-| `priorityClassName` / `topologySpreadConstraints` / `nodeSelector` / `affinity` / `tolerations` | Global scheduling policy for all pods |
-| `{backend,agent,frontend,postgresql}.priorityClassName` / `.topologySpreadConstraints` | Component-specific priority and spread scheduling overrides |
-| `{backend,agent,frontend,postgresql}.nodeSelector` / `.affinity` / `.tolerations` | Component-specific node placement overrides; fall back to the global scheduling values |
-| `{backend,agent,frontend}.service.type` / `.port` | Service exposure type and port for each runtime component |
-| `{backend,agent,frontend,postgresql}.service.annotations` | Service annotations for cloud/load-balancer or mesh integrations |
-| `ingress.*` | Optional Ingress host, path, class, annotations, and TLS settings for the frontend service |
-| `{backend,agent,frontend}.readinessProbe` / `.livenessProbe` | HTTP probe overrides for each service |
-| `postgresql.readinessProbe` / `postgresql.livenessProbe` | Bundled Postgres probe overrides; empty values use a `pg_isready` default based on `postgresql.auth.username` |
-| `postgresql.persistence.*` | PVC enablement, storage class, and size for bundled Postgres |
+| `global.imageRegistry` / `imagePullSecrets` | Registry prefix and pull secrets for all images |
+| `secrets.existingSecret` | Existing Secret with DB/Run:ai/NVIDIA/LLM credentials |
+| `agent.env.runaiBaseUrl` / `runaiTokenUrl` | Run:ai API URL and OAuth token URL (token URL required for client_id/secret) |
+| `agent.env.prometheusUrl` / `lokiUrl` | In-cluster Prometheus / Loki URLs |
+| `agent.env.enableNatRuntime` / `natConfigFile` | Enable NeMo synthesis and select workflow config |
+| `agent.env.llmBaseUrl` / `llmModel` | OpenAI-compatible endpoint and model |
+| `agent.rbac.clusterWide` / `namespaces` | Read-only RBAC scope for evidence collection |
+| `postgresql.enabled` / `auth.*` | Use bundled Postgres and its user/password/database |
+| `ingress.*` | Frontend host, TLS, class, annotations |
+| `{backend,agent,frontend}.image.tag` | Override image tags (default: chart appVersion) |
 
-For annotation keys that contain dots or slashes, prefer a small values file. If
-you use `--set`, escape dots and use `--set-string`, for example:
+RCA tables are created automatically with idempotent `CREATE TABLE IF NOT
+EXISTS`; no migration step is needed. pgvector is used when available, otherwise
+the backend falls back to JSONB cosine search. Sensitive values are redacted
+before evidence leaves a collector; add patterns via `MASKING_REGEX_LIST_JSON`.
 
-```bash
-helm upgrade --install runai-rca charts/runai-rca \
-  --set-string 'backend.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-type=nlb'
-```
+## Documentation
 
-Mock data is a frontend-only sample mode. It is enabled by default during Vite
-local development, disabled by default in Helm/static deployments, and is shown
-after the Backend returns empty incident, alert, and analysis-run lists, or when
-the local dev Backend is unavailable. As soon as real incident, alert, or
-analysis-run data is returned by the Backend, the UI uses the live values and
-does not mix mock records into Operations, Analysis, Evidence, or Agents.
-
-When `DATABASE_URL` is configured, the backend creates and uses `incidents`,
-`alerts`, `incident_embeddings`, `rca_feedback`, `rca_comments`, and
-`analysis_runs`. Comments and chat requests that explicitly ask for analysis
-create separate analysis runs, so the Analysis Dashboard can track them without
-overwriting the original RCA. On startup it logs `pgvector=enabled` when
-`CREATE EXTENSION vector` succeeds, then adds a dense `embedding vector(384)`
-column and an HNSW cosine index to `incident_embeddings`. Dense vectors are
-derived deterministically from incident text with signed feature hashing (no
-embedding model dependency, so the backend stays self-contained next to the
-agent), and free-text memory search runs in Postgres via the pgvector `<=>`
-cosine operator. If the pgvector extension is not available, the backend still
-stores sparse text vectors in JSONB and serves similar-incident search with
-in-process cosine similarity. When `POSTGRES_DSN` is configured, the Postgres
-agent checks connectivity, active connections, long-running transactions,
-pgvector availability, and expected RCA table presence. If it is not configured,
-the agent marks Postgres evidence as unavailable without blocking the rest of the
-RCA.
-
-No separate migration command is required for these RCA tables on a fresh
-database: backend startup uses idempotent `CREATE TABLE IF NOT EXISTS`,
-`CREATE INDEX IF NOT EXISTS`, and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
-statements. External Postgres still needs the database/user to exist and the
-user to have schema/table create and read/write privileges.
-
-Sensitive values are redacted before evidence is returned to the backend or
-passed into NeMo synthesis. The built-in redactor masks common secret keys,
-Authorization headers, JWT-like values, token query parameters, Postgres URL
-passwords, long base64 blobs, Kubernetes env values, command flags, sensitive
-annotation keys, and embedded annotation secrets. Add cluster-specific patterns
-with `MASKING_REGEX_LIST_JSON` when needed.
-
-## KubeRCA Lineage
-
-This project intentionally preserves the KubeRCA feel:
-
-- Incident and alert are first-class workflow objects.
-- The Analysis Dashboard tracks RCA lifecycle, quality, missing evidence,
-  similar incidents, feedback, and per-agent coverage.
-- RCA output is structured, reviewable, and annotated by operators.
-- Similar incidents, votes, and markdown comments are part of the RCA loop.
-- Agent evidence is not hidden in logs. It is part of the incident record.
-- The UI is dense and operational, not a marketing landing page.
-
-See `docs/ARCHITECTURE.md` and `docs/UI-DIRECTION.md` for the implementation
-contract.
+- `docs/CONFIGURATION.md` — full env var and Helm value reference
+- `docs/DEPLOYMENT.md` — detailed deployment, RBAC, and DB notes
+- `docs/API.md` — backend and agent endpoints
+- `docs/ARCHITECTURE.md` — implementation contract
+- `docs/OPERATING-MODEL.md` — operating model
