@@ -24,6 +24,7 @@ secrets:
     lokiBearerToken: LOKI_BEARER_TOKEN
     lokiBasicUsername: LOKI_BASIC_USERNAME
     lokiBasicPassword: LOKI_BASIC_PASSWORD
+    lokiTenantId: LOKI_TENANT_ID
     nvidiaApiKey: NVIDIA_API_KEY
     llmApiKey: LLM_API_KEY
   databaseUrl: ""
@@ -34,6 +35,7 @@ secrets:
   lokiBearerToken: ""
   lokiBasicUsername: ""
   lokiBasicPassword: ""
+  lokiTenantId: ""
   nvidiaApiKey: ""
   llmApiKey: ""
 
@@ -148,7 +150,6 @@ agent:
     prometheusTimeoutSeconds: 6
     prometheusMcpUrl: ""
     lokiUrl: http://loki-gateway.monitoring.svc.cluster.local
-    lokiTenantId: ""
     lokiTimeoutSeconds: 6
     lokiQueryLimit: 20
     lokiMcpUrl: ""

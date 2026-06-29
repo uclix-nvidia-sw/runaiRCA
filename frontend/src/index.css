@@ -662,6 +662,16 @@ td span {
   font-weight: 700;
 }
 
+.trend-chart-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: #98a2b3;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
 .trend-bars {
   height: 3.5rem;
   display: grid;

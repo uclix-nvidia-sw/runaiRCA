@@ -115,8 +115,6 @@ spec:
               value: {{ .Values.agent.env.prometheusMcpUrl | quote }}
             - name: LOKI_URL
               value: {{ .Values.agent.env.lokiUrl | quote }}
-            - name: LOKI_TENANT_ID
-              value: {{ .Values.agent.env.lokiTenantId | quote }}
             - name: LOKI_TIMEOUT_SECONDS
               value: {{ .Values.agent.env.lokiTimeoutSeconds | quote }}
             - name: LOKI_QUERY_LIMIT
@@ -182,6 +180,12 @@ spec:
                 secretKeyRef:
                   name: {{ include "runai-rca.secretName" . }}
                   key: {{ .Values.secrets.keys.lokiBasicPassword | quote }}
+                  optional: true
+            - name: LOKI_TENANT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "runai-rca.secretName" . }}
+                  key: {{ .Values.secrets.keys.lokiTenantId | quote }}
                   optional: true
             - name: NVIDIA_API_KEY
               valueFrom:
