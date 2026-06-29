@@ -94,8 +94,8 @@ func ensureDatabaseExists(driverName, databaseURL string, connectTimeout time.Du
 	if err != nil {
 		return false
 	}
-	dbName := strings.TrimPrefix(u.Path, "/")
-	if dbName == "" {
+	dbName, err := url.PathUnescape(strings.Trim(u.Path, "/"))
+	if err != nil || dbName == "" {
 		return false
 	}
 	admin := *u
