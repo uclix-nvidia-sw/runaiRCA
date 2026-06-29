@@ -14,6 +14,7 @@ from uuid import uuid4
 from pydantic import BaseModel
 
 from app.collectors.base import CollectorResult, resolve_target
+from app.collectors.http_json import post_json
 from app.collectors.kubernetes import KubernetesCollector
 from app.collectors.loki import LokiCollector
 from app.collectors.postgres import PostgresCollector
@@ -229,11 +230,14 @@ class AnalysisOrchestrator:
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
         context = dict(request.context or {})
+        llm_configured = bool(
+            self._settings.llm_base_url and self._settings.llm_model and self._settings.llm_api_key
+        )
         context["agent_service"] = {
             "nemo_runtime": "enabled" if self._nat.enabled() else "fallback",
-            "chat_mode": "deterministic_context",
-            "chat_llm_runtime": "not_directly_used",
-            "llm_configured": bool(self._settings.llm_base_url and self._settings.llm_model),
+            "chat_mode": "llm" if llm_configured else "deterministic_context",
+            "chat_llm_runtime": "active" if llm_configured else "not_directly_used",
+            "llm_configured": llm_configured,
             "nat_config_file": self._settings.nat_config_file,
             "runai_configured": bool(self._settings.runai_base_url),
             "prometheus_configured": bool(self._settings.prometheus_url),
@@ -248,7 +252,12 @@ class AnalysisOrchestrator:
             or request.page
             or "current RCA workspace"
         )
-        answer = _chat_answer_from_context(request, context, str(entity), self._masker)
+        grounding = _chat_answer_from_context(request, context, str(entity), self._masker)
+        answer = grounding
+        if llm_configured:
+            llm_answer = await self._llm_chat_answer(request, grounding)
+            if llm_answer:
+                answer = self._masker.mask_text(llm_answer)
         response = ChatResponse(
             status="ok",
             answer=answer,
@@ -257,6 +266,41 @@ class AnalysisOrchestrator:
             conversation_id=request.conversation_id or f"chat-{uuid4().hex[:10]}",
         )
         return _mask_model(response, ChatResponse, self._masker)
+
+    async def _llm_chat_answer(self, request: ChatRequest, grounding: str) -> str | None:
+        question = (request.message or "").strip()
+        if not question:
+            return None
+        system = (
+            "You are the RCA copilot for an NVIDIA Run:AI GPU platform. Answer the operator's "
+            "question conversationally and concisely using only the grounded context provided. "
+            "If the context lacks the answer, say so and suggest the next diagnostic step. "
+            "Reply in the operator's language."
+        )
+        payload = {
+            "model": self._settings.llm_model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": f"Grounded context:\n{grounding}\n\nQuestion: {question}"},
+            ],
+            "temperature": 0.2,
+        }
+        response = await post_json(
+            url=f"{self._settings.llm_base_url}/chat/completions",
+            timeout_seconds=self._settings.llm_request_timeout_seconds,
+            json_body=payload,
+            headers={"Authorization": f"Bearer {self._settings.llm_api_key}"},
+        )
+        if not response.ok or not isinstance(response.data, dict):
+            return None
+        choices = response.data.get("choices")
+        if isinstance(choices, list) and choices:
+            message = choices[0].get("message") if isinstance(choices[0], dict) else None
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+        return None
 
 
 def _quality_from(results: list[CollectorResult]) -> str:

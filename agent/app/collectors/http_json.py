@@ -92,6 +92,41 @@ async def post_form_json(
     )
 
 
+async def post_json(
+    *,
+    url: str,
+    timeout_seconds: int,
+    json_body: dict[str, Any],
+    headers: dict[str, str] | None = None,
+    verify: bool | str = True,
+) -> JsonResponse:
+    try:
+        import httpx
+    except ImportError:
+        return JsonResponse(url=url, status_code=0, error="python.httpx is not installed")
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds, verify=verify) as client:
+            response = await client.post(url, json=json_body, headers=headers)
+    except Exception as exc:  # noqa: BLE001 - collectors report diagnostics, not failures.
+        return JsonResponse(url=url, status_code=0, error=f"{exc.__class__.__name__}: {exc}")
+
+    try:
+        payload: Any = response.json()
+    except ValueError:
+        payload = {"body": response.text[:1000]}
+
+    error = None
+    if response.status_code >= 400:
+        error = f"HTTP {response.status_code}"
+    return JsonResponse(
+        url=str(response.url),
+        status_code=response.status_code,
+        data=payload,
+        error=error,
+    )
+
+
 def compact(value: Any, *, limit: int = 5) -> Any:
     if isinstance(value, dict):
         return {key: compact(child, limit=limit) for key, child in value.items()}
