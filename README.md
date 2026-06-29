@@ -114,6 +114,27 @@ enabled. To synthesize through an OpenAI-compatible endpoint (e.g. LiteLLM):
 Workflow configs: `runai_rca_workflow.yml` (default, no external LLM),
 `_litellm.yml` (OpenAI-compatible), `_mcp.yml` (Prometheus/Loki MCP + NIM).
 
+### Runtime checks
+
+Automatic RCA starts only after Alertmanager posts to Backend
+`/webhook/alertmanager`; a Slack notification alone does not prove that the RCA
+webhook receiver was routed. Check live intake and analysis state with:
+
+```bash
+curl -s http://<frontend-or-backend-url>/api/v1/alerts
+curl -s http://<frontend-or-backend-url>/api/v1/analysis-runs
+```
+
+Agent `/healthz` means the Agent API process is alive. Collector cards in the UI
+turn `ok` only after an RCA run stores collector `artifacts`; pod `Running` or
+health `200` is not enough by itself. Chat is context-grounded from the active
+incident/alert RCA content. In the current implementation it does not call the
+LLM path directly; `ENABLE_NAT_RUNTIME=true` affects `/analyze` synthesis, while
+`/chat` returns a deterministic context answer. When no detail RCA is attached,
+Backend supplies dashboard and analysis-run state so Chat can report current
+alerts, latest run status, agent timeout/failure warnings, and configured
+runtime mode.
+
 ## Configuration
 
 Key values (full secret keys: `DATABASE_URL`, `POSTGRES_DSN`, `RUNAI_CLIENT_ID`,

@@ -228,7 +228,18 @@ class AnalysisOrchestrator:
         return _mask_model(response, IncidentSummaryResponse, self._masker)
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
-        context = request.context or {}
+        context = dict(request.context or {})
+        context["agent_service"] = {
+            "nemo_runtime": "enabled" if self._nat.enabled() else "fallback",
+            "chat_mode": "deterministic_context",
+            "chat_llm_runtime": "not_directly_used",
+            "llm_configured": bool(self._settings.llm_base_url and self._settings.llm_model),
+            "nat_config_file": self._settings.nat_config_file,
+            "runai_configured": bool(self._settings.runai_base_url),
+            "prometheus_configured": bool(self._settings.prometheus_url),
+            "loki_configured": bool(self._settings.loki_url),
+            "postgres_configured": bool(self._settings.postgres_dsn),
+        }
         entity = (
             request.incident_id
             or request.alert_id
@@ -415,6 +426,7 @@ def _chat_answer_from_context(
     similar = context.get("similar_incidents")
     missing = _context_list(context, "missing_data")
     warnings = _context_list(context, "warnings")
+    runtime_lines = _runtime_snapshot_lines(context)
 
     lines = [
         "## RCA Chat",
@@ -433,15 +445,30 @@ def _chat_answer_from_context(
             ]
         )
     else:
-        lines.extend(
-            [
-                "## Grounded Answer",
-                "",
-                "No specific incident or alert RCA content is attached yet. "
-                "Ask from an incident or alert detail page for a more grounded answer.",
-                "",
-            ]
-        )
+        if runtime_lines:
+            lines.extend(
+                [
+                    "## Grounded Answer",
+                    "",
+                    "No incident or alert detail RCA text was attached, so I am answering from "
+                    "the current Backend and Agent runtime state supplied with this chat request.",
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "## Grounded Answer",
+                    "",
+                    "No incident, alert, analysis-run, or agent runtime state was attached to "
+                    "this chat request. I cannot determine whether the agent is healthy, timed "
+                    "out, or waiting for Alertmanager intake from this payload alone.",
+                    "",
+                ]
+            )
+
+    if runtime_lines:
+        lines.extend(["## Current Agent State", "", *runtime_lines, ""])
 
     memory_lines = _memory_lines(memory or similar)
     if memory_lines:
@@ -459,6 +486,111 @@ def _chat_answer_from_context(
         ]
     )
     return "\n".join(lines)
+
+
+def _runtime_snapshot_lines(context: dict[str, object]) -> list[str]:
+    lines: list[str] = []
+    dashboard = _dict_context(context.get("dashboard_state"))
+    if dashboard:
+        alert_count = dashboard.get("alert_count", 0)
+        firing_alert_count = dashboard.get("firing_alert_count", 0)
+        run_count = dashboard.get("analysis_run_count", 0)
+        statuses = dashboard.get("analysis_statuses")
+        lines.append(
+            "- Backend dashboard state: "
+            f"{alert_count} alert(s), {firing_alert_count} active/firing alert(s), "
+            f"{run_count} analysis run(s)."
+        )
+        if isinstance(statuses, dict) and statuses:
+            rendered = ", ".join(f"{key}={value}" for key, value in sorted(statuses.items()))
+            lines.append(f"- Analysis run status counts: {rendered}.")
+        latest_alert = _dict_context(dashboard.get("latest_alert"))
+        if latest_alert:
+            lines.append(
+                "- Latest alert: "
+                f"{latest_alert.get('alert_id', 'unknown')} "
+                f"({latest_alert.get('status', 'unknown')}, "
+                f"{latest_alert.get('severity', 'unknown')}): "
+                f"{latest_alert.get('title', 'untitled')}."
+            )
+            alert_warnings = _string_list(latest_alert.get("warnings"))
+            if alert_warnings:
+                lines.append(f"- Latest alert warnings: {_compact_inline(alert_warnings, 2)}.")
+        latest_run = _dict_context(dashboard.get("latest_run"))
+        if latest_run:
+            lines.append(
+                "- Latest analysis run: "
+                f"{latest_run.get('run_id', 'unknown')} is "
+                f"{latest_run.get('status', 'unknown')} "
+                f"for {latest_run.get('target_type', 'target')} "
+                f"{latest_run.get('target_id', 'unknown')}."
+            )
+            capabilities = _dict_context(latest_run.get("capabilities"))
+            agent_status = capabilities.get("agent") if capabilities else None
+            if agent_status:
+                lines.append(f"- Latest backend-to-agent call status: {agent_status}.")
+            run_warnings = _string_list(latest_run.get("warnings"))
+            if run_warnings:
+                lines.append(f"- Latest run warnings: {_compact_inline(run_warnings, 3)}.")
+            missing = _string_list(latest_run.get("missing_data"))
+            if missing:
+                lines.append(f"- Latest run missing data: {_compact_inline(missing, 3)}.")
+
+    backend_runtime = _dict_context(context.get("agent_runtime"))
+    if backend_runtime:
+        timeout = backend_runtime.get("agent_request_timeout_seconds")
+        chat_mode = backend_runtime.get("chat_mode")
+        if timeout or chat_mode:
+            lines.append(
+                "- Backend agent client: "
+                f"timeout={timeout or 'unknown'}s, chat_mode={chat_mode or 'unknown'}."
+            )
+        database = _dict_context(backend_runtime.get("database"))
+        if database:
+            lines.append(
+                "- Backend database state: "
+                f"postgres={database.get('postgres')}, "
+                f"pgvector_status={database.get('pgvector_status')}, "
+                f"similarity_search={database.get('similarity_search')}."
+            )
+
+    agent_service = _dict_context(context.get("agent_service"))
+    if agent_service:
+        lines.append(
+            "- Agent service runtime: "
+            f"nemo_runtime={agent_service.get('nemo_runtime')}, "
+            f"chat_mode={agent_service.get('chat_mode')}, "
+            f"llm_configured={agent_service.get('llm_configured')}."
+        )
+        integrations = []
+        for key in [
+            "runai_configured",
+            "prometheus_configured",
+            "loki_configured",
+            "postgres_configured",
+        ]:
+            integrations.append(f"{key.replace('_configured', '')}={agent_service.get(key)}")
+        lines.append("- Agent integration config: " + ", ".join(integrations) + ".")
+
+    return lines
+
+
+def _dict_context(value: object) -> dict[str, object]:
+    return value if isinstance(value, dict) else {}
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item).strip()]
+
+
+def _compact_inline(items: list[str], limit: int) -> str:
+    selected = items[:limit]
+    rendered = "; ".join(_compact_text(item, 220) for item in selected)
+    if len(items) > limit:
+        rendered += f"; +{len(items) - limit} more"
+    return rendered
 
 
 def _focused_chat_response(question: str, content: str) -> str:

@@ -48,11 +48,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	req = s.enrichChatRequest(req)
 	if wantsAnalysisRun(req.Message) {
-		targetType, targetID := chatAnalysisTarget(req)
+		targetType, targetID, inferred := s.chatAnalysisTarget(req)
 		if targetType == "" || targetID == "" {
 			answer := ChatResponse{
 				Status:         "ok",
-				Answer:         "분석을 새로 만들 대상 incident나 alert를 먼저 지정해줘. 현재 RCA detail 화면에서 요청하거나, 채팅 컨텍스트에 Incident/Alert ID를 넣으면 Analysis Dashboard에 새 분석 아이템을 생성할게.",
+				Answer:         noAnalysisTargetAnswer(req),
 				ConversationID: req.ConversationID,
 			}
 			finalizeChatResponse(&answer, req)
@@ -66,7 +66,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		answer := ChatResponse{
 			Status:         "ok",
-			Answer:         fmt.Sprintf("새 분석 아이템 `%s`를 만들었고 에이전트 재분석을 시작했어. Analysis Dashboard에서 상태와 결과를 이어서 볼 수 있어.", run.RunID),
+			Answer:         analysisStartedAnswer(run, inferred),
 			ConversationID: req.ConversationID,
 			AnalysisRun:    run,
 		}
@@ -111,6 +111,8 @@ func (s *Server) enrichChatRequest(req ChatRequest) ChatRequest {
 	}
 	req.IncidentID = strings.TrimSpace(first(req.IncidentID, stringFromContext(req.Context, "incident_id")))
 	req.AlertID = strings.TrimSpace(first(req.AlertID, stringFromContext(req.Context, "alert_id")))
+	req.Context["dashboard_state"] = s.dashboardChatState()
+	req.Context["agent_runtime"] = s.agentRuntimeContext()
 
 	var contextAlert *Alert
 	var contextIncidentID string
@@ -170,6 +172,129 @@ func (s *Server) enrichChatRequest(req ChatRequest) ChatRequest {
 	return req
 }
 
+func (s *Server) dashboardChatState() map[string]any {
+	incidents := s.store.ListIncidents()
+	alerts := s.store.ListAlerts()
+	runs := s.store.ListAnalysisRuns()
+	state := map[string]any{
+		"incident_count":      len(incidents),
+		"alert_count":         len(alerts),
+		"analysis_run_count":  len(runs),
+		"open_incident_count": countIncidentsByStatus(incidents, "resolved", false),
+		"firing_alert_count":  countAlertsByStatus(alerts, "resolved", false),
+		"analysis_statuses":   analysisStatusCounts(runs),
+		"recent_alerts":       recentAlertSummaries(alerts, 5),
+		"recent_runs":         recentRunSummaries(runs, 5),
+	}
+	if len(alerts) > 0 {
+		state["latest_alert"] = alertSummary(alerts[0])
+	}
+	if len(runs) > 0 {
+		state["latest_run"] = runSummary(runs[0])
+	}
+	return state
+}
+
+func (s *Server) agentRuntimeContext() map[string]any {
+	return map[string]any{
+		"agent_url":                       s.agentURL,
+		"agent_request_timeout_seconds":   int(s.agentRequestTimeout.Seconds()),
+		"database":                        s.store.databaseHealth(),
+		"chat_mode":                       "deterministic_context",
+		"chat_llm_runtime":                "not_directly_used",
+		"analysis_runtime_failure_source": "analysis_runs.capabilities.agent and warnings",
+	}
+}
+
+func countIncidentsByStatus(incidents []Incident, status string, equal bool) int {
+	count := 0
+	for _, incident := range incidents {
+		matched := incident.Status == status
+		if matched == equal {
+			count++
+		}
+	}
+	return count
+}
+
+func countAlertsByStatus(alerts []AlertRecord, status string, equal bool) int {
+	count := 0
+	for _, alert := range alerts {
+		matched := alert.Status == status
+		if matched == equal {
+			count++
+		}
+	}
+	return count
+}
+
+func analysisStatusCounts(runs []AnalysisRun) map[string]int {
+	counts := map[string]int{}
+	for _, run := range runs {
+		counts[first(run.Status, "unknown")]++
+	}
+	return counts
+}
+
+func recentAlertSummaries(alerts []AlertRecord, limit int) []map[string]any {
+	if limit > len(alerts) {
+		limit = len(alerts)
+	}
+	items := make([]map[string]any, 0, limit)
+	for _, alert := range alerts[:limit] {
+		items = append(items, alertSummary(alert))
+	}
+	return items
+}
+
+func recentRunSummaries(runs []AnalysisRun, limit int) []map[string]any {
+	if limit > len(runs) {
+		limit = len(runs)
+	}
+	items := make([]map[string]any, 0, limit)
+	for _, run := range runs[:limit] {
+		items = append(items, runSummary(run))
+	}
+	return items
+}
+
+func alertSummary(alert AlertRecord) map[string]any {
+	return map[string]any{
+		"alert_id":         alert.AlertID,
+		"incident_id":      alert.IncidentID,
+		"title":            alert.AlarmTitle,
+		"severity":         alert.Severity,
+		"status":           alert.Status,
+		"fired_at":         alert.FiredAt,
+		"is_analyzing":     alert.IsAnalyzing,
+		"analysis_quality": alert.AnalysisQuality,
+		"capabilities":     alert.Capabilities,
+		"missing_data":     alert.MissingData,
+		"warnings":         alert.Warnings,
+		"artifact_count":   len(alert.Artifacts),
+	}
+}
+
+func runSummary(run AnalysisRun) map[string]any {
+	return map[string]any{
+		"run_id":           run.RunID,
+		"source":           run.Source,
+		"status":           run.Status,
+		"target_type":      run.TargetType,
+		"target_id":        run.TargetID,
+		"incident_id":      run.IncidentID,
+		"alert_id":         run.AlertID,
+		"title":            run.Title,
+		"analysis_quality": run.AnalysisQuality,
+		"capabilities":     run.Capabilities,
+		"missing_data":     run.MissingData,
+		"warnings":         run.Warnings,
+		"artifact_count":   len(run.Artifacts),
+		"created_at":       run.CreatedAt,
+		"updated_at":       run.UpdatedAt,
+	}
+}
+
 func wantsAnalysisRun(message string) bool {
 	lowered := strings.ToLower(strings.TrimSpace(message))
 	if lowered == "" {
@@ -196,25 +321,80 @@ func wantsAnalysisRun(message string) bool {
 	return false
 }
 
-func chatAnalysisTarget(req ChatRequest) (string, string) {
+func (s *Server) chatAnalysisTarget(req ChatRequest) (string, string, bool) {
 	if req.AlertID != "" {
-		return "alert", req.AlertID
+		return "alert", req.AlertID, false
 	}
 	if req.IncidentID != "" {
-		return "incident", req.IncidentID
+		return "incident", req.IncidentID, false
 	}
 	targetType := stringFromContext(req.Context, "target_type")
 	switch targetType {
 	case "alert":
 		if id := stringFromContext(req.Context, "alert_id"); id != "" {
-			return "alert", id
+			return "alert", id, false
 		}
 	case "incident":
 		if id := stringFromContext(req.Context, "incident_id"); id != "" {
-			return "incident", id
+			return "incident", id, false
 		}
 	}
-	return "", ""
+	if alertID := s.latestAlertTarget(); alertID != "" {
+		return "alert", alertID, true
+	}
+	return "", "", false
+}
+
+func (s *Server) latestAlertTarget() string {
+	alerts := s.store.ListAlerts()
+	for _, alert := range alerts {
+		if alert.Status != "resolved" {
+			return alert.AlertID
+		}
+	}
+	if len(alerts) > 0 {
+		return alerts[0].AlertID
+	}
+	return ""
+}
+
+func analysisStartedAnswer(run *AnalysisRun, inferred bool) string {
+	target := fmt.Sprintf("%s `%s`", run.TargetType, run.TargetID)
+	if inferred {
+		target = fmt.Sprintf("latest available %s `%s`", run.TargetType, run.TargetID)
+	}
+	return fmt.Sprintf(
+		"새 분석 아이템 `%s`를 만들었고 %s 대상으로 에이전트 재분석을 시작했어. "+
+			"Agent 연결 실패, timeout, non-2xx 같은 문제는 이 run이 곧 `failed`로 바뀌면서 warnings/capabilities에 기록돼. "+
+			"Analysis Dashboard에서 상태와 결과를 이어서 볼 수 있어.",
+		run.RunID,
+		target,
+	)
+}
+
+func noAnalysisTargetAnswer(req ChatRequest) string {
+	state, _ := req.Context["dashboard_state"].(map[string]any)
+	alertCount := anyInt(state["alert_count"])
+	runCount := anyInt(state["analysis_run_count"])
+	return fmt.Sprintf(
+		"분석 요청은 인식했지만 분석할 alert/incident가 아직 없어. 현재 Backend가 보는 alert는 %d개, analysis run은 %d개야. "+
+			"Alertmanager webhook이 `/webhook/alertmanager`로 들어왔는지 먼저 확인해줘. alert가 들어오면 같은 요청에서 최신 alert를 자동으로 골라 분석을 시작할게.",
+		alertCount,
+		runCount,
+	)
+}
+
+func anyInt(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	default:
+		return 0
+	}
 }
 
 func fallbackChatResponse(req ChatRequest, err error) ChatResponse {

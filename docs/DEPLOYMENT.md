@@ -64,6 +64,74 @@ helm install runai-rca charts/runai-rca \
   --set secrets.existingSecret=runai-rca-secrets
 ```
 
+## Alertmanager Webhook Routing
+
+The Backend creates incidents and starts automatic RCA only when Alertmanager
+sends `POST /webhook/alertmanager`. If the same alert reaches Slack but does
+not appear in Run:AI RCA, Alertmanager is usually routing to the Slack receiver
+but not to the RCA webhook receiver.
+
+Use the Backend service directly from inside the cluster:
+
+```text
+http://<release-name>-runai-rca-backend.<namespace>.svc.cluster.local:8080/webhook/alertmanager
+```
+
+If Alertmanager must call through the frontend ingress, the bundled nginx config
+also proxies `/webhook/` to the Backend:
+
+```text
+https://<frontend-host>/webhook/alertmanager
+```
+
+A simple combined receiver sends the same routed alert to Slack and RCA:
+
+```yaml
+route:
+  receiver: slack-and-rca
+
+receivers:
+  - name: slack-and-rca
+    slack_configs:
+      - api_url: <slack-webhook-url>
+        channel: <channel>
+    webhook_configs:
+      - url: http://<release-name>-runai-rca-backend.<namespace>.svc.cluster.local:8080/webhook/alertmanager
+        send_resolved: true
+```
+
+When keeping separate receivers, make sure the Slack route does not stop
+matching before RCA. One common pattern is `continue: true` on the Slack route:
+
+```yaml
+route:
+  routes:
+    - matchers:
+        - alertname=~".*"
+      receiver: slack
+      continue: true
+    - matchers:
+        - alertname=~".*"
+      receiver: runai-rca
+
+receivers:
+  - name: runai-rca
+    webhook_configs:
+      - url: http://<release-name>-runai-rca-backend.<namespace>.svc.cluster.local:8080/webhook/alertmanager
+        send_resolved: true
+```
+
+After a route change, verify both network reachability from the Alertmanager pod
+and Backend intake:
+
+```bash
+kubectl exec -n <alertmanager-namespace> <alertmanager-pod> -- \
+  wget -S -O- http://<release-name>-runai-rca-backend.<namespace>.svc.cluster.local:8080/healthz
+
+curl -s http://<frontend-or-backend-url>/api/v1/alerts
+curl -s http://<frontend-or-backend-url>/api/v1/analysis-runs
+```
+
 Create the Kubernetes Secret referenced by `secrets.existingSecret` before
 installing the chart. Use the same namespace as the Helm release, keep `.env`
 for local development only, and omit keys that your deployment does not use:

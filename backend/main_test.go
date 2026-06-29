@@ -131,6 +131,12 @@ func TestChatRouteProxiesContextualRCARequestToAgent(t *testing.T) {
 	if _, ok := agentReq.Context["rca_memory"]; !ok {
 		t.Fatalf("expected RCA memory context, got %+v", agentReq.Context)
 	}
+	if _, ok := agentReq.Context["dashboard_state"]; !ok {
+		t.Fatalf("expected dashboard state context, got %+v", agentReq.Context)
+	}
+	if _, ok := agentReq.Context["agent_runtime"]; !ok {
+		t.Fatalf("expected agent runtime context, got %+v", agentReq.Context)
+	}
 }
 
 func TestCommentCreatesAnalysisRun(t *testing.T) {
@@ -247,6 +253,62 @@ func TestChatAnalysisRequestCreatesAnalysisRun(t *testing.T) {
 	}
 	run := waitForAnalysisRun(t, server, "chat")
 	if run.Status != "complete" || !strings.Contains(run.AnalysisSummary, "Chat-requested") {
+		t.Fatalf("unexpected analysis run: %+v", run)
+	}
+}
+
+func TestChatAnalysisRequestWithoutTargetUsesLatestAlert(t *testing.T) {
+	server := NewServer()
+	agentReqCh := make(chan AgentAnalysisRequest, 1)
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req AgentAnalysisRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode agent analysis request: %v", err)
+		}
+		agentReqCh <- req
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Latest alert RCA completed.",
+			AnalysisDetail:  "## Root Cause\n\nChat selected the latest alert.",
+			AnalysisQuality: "medium",
+			Capabilities:    map[string]string{"analysis": "ok"},
+		})
+	}))
+	defer agent.Close()
+	server.agentURL = agent.URL
+
+	_, record := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "chat-latest"}, Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIWorkloadPending",
+			"severity":  "warning",
+			"queue":     "gpu-a",
+		},
+		Annotations: map[string]string{"summary": "Workload pending"},
+		Fingerprint: "fp-chat-latest",
+	})
+	payload, _ := json.Marshal(ChatRequest{Message: "지금 알람 분석해줘"})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected chat 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var response ChatResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode chat response: %v", err)
+	}
+	if response.AnalysisRun == nil || response.AnalysisRun.TargetType != "alert" || response.AnalysisRun.TargetID != record.AlertID {
+		t.Fatalf("expected latest alert analysis run, got %+v", response)
+	}
+	agentReq := <-agentReqCh
+	if agentReq.IncidentID != record.IncidentID || agentReq.Alert.Fingerprint != "fp-chat-latest" {
+		t.Fatalf("expected latest alert sent to agent, got %+v", agentReq)
+	}
+	run := waitForAnalysisRun(t, server, "chat")
+	if run.Status != "complete" || !strings.Contains(run.AnalysisSummary, "Latest alert") {
 		t.Fatalf("unexpected analysis run: %+v", run)
 	}
 }

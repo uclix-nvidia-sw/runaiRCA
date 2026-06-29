@@ -137,6 +137,55 @@ async def test_analyze_includes_similar_incidents_and_feedback_hints() -> None:
     assert "Operators confirmed quota saturation" in response.analysis_detail
 
 
+@pytest.mark.asyncio
+async def test_chat_without_detail_reports_runtime_state() -> None:
+    orchestrator = AnalysisOrchestrator(make_settings())
+    response = await orchestrator.chat(
+        ChatRequest(
+            message="야 알람 왔잖아",
+            page="evidence_dashboard",
+            context={
+                "dashboard_state": {
+                    "alert_count": 1,
+                    "firing_alert_count": 1,
+                    "analysis_run_count": 1,
+                    "analysis_statuses": {"failed": 1},
+                    "latest_alert": {
+                        "alert_id": "ALR-000001",
+                        "status": "firing",
+                        "severity": "warning",
+                        "title": "RunAIWorkloadPending",
+                    },
+                    "latest_run": {
+                        "run_id": "ANL-000001",
+                        "status": "failed",
+                        "target_type": "alert",
+                        "target_id": "ALR-000001",
+                        "capabilities": {"agent": "timeout"},
+                        "warnings": ["agent request timed out"],
+                        "missing_data": ["agent.response"],
+                    },
+                },
+                "agent_runtime": {
+                    "agent_request_timeout_seconds": 180,
+                    "chat_mode": "deterministic_context",
+                    "database": {
+                        "postgres": True,
+                        "pgvector_status": "enabled",
+                        "similarity_search": "pgvector_cosine",
+                    },
+                },
+            },
+        )
+    )
+
+    assert "## Current Agent State" in response.answer
+    assert "ALR-000001" in response.answer
+    assert "ANL-000001 is failed" in response.answer
+    assert "timeout" in response.answer
+    assert "No specific incident or alert RCA content is attached yet" not in response.answer
+
+
 def test_extract_nat_result_strips_console_wrapper() -> None:
     output = (
         "\x1b[32mWorkflow Result:\n## Root Cause\n\nBody\n"
