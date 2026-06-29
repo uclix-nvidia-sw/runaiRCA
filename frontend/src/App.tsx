@@ -2901,7 +2901,8 @@ function Severity({ value }: { value: string }) {
 }
 
 function Status({ value, analyzing = false }: { value: string; analyzing?: boolean }) {
-  return <span className={`status status-${value || 'pending'}`}>{analyzing ? 'analyzing' : value}</span>;
+  const displayValue = analyzing ? 'analyzing' : (value || 'pending');
+  return <span className={`status status-${displayValue}`}>{displayValue}</span>;
 }
 
 function targetLine(labels: Record<string, string>) {
