@@ -421,6 +421,18 @@ func (s *Store) loadAlerts(ctx context.Context) {
 			s.alertByFinger[alert.Fingerprint] = alert.AlertID
 		}
 	}
+	for _, alert := range s.alerts {
+		incident := s.incidents[alert.IncidentID]
+		if incident == nil {
+			continue
+		}
+		if alert.FiredAt.After(incident.LatestActivityAt) {
+			incident.LatestActivityAt = alert.FiredAt
+		}
+		if alert.ResolvedAt != nil && alert.ResolvedAt.After(incident.LatestActivityAt) {
+			incident.LatestActivityAt = *alert.ResolvedAt
+		}
+	}
 }
 
 func (s *Store) loadMemories(ctx context.Context) {

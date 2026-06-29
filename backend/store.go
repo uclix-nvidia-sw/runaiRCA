@@ -181,6 +181,13 @@ func (s *Store) UpsertAlert(webhook AlertmanagerWebhook, alert Alert) (*Incident
 	} else {
 		record.ResolvedAt = nil
 	}
+	activityAt := record.FiredAt
+	if record.ResolvedAt != nil && record.ResolvedAt.After(activityAt) {
+		activityAt = *record.ResolvedAt
+	}
+	if activityAt.After(incident.LatestActivityAt) {
+		incident.LatestActivityAt = activityAt
+	}
 	s.persistIncidentLocked(incident)
 	s.persistAlertLocked(record)
 	return cloneIncident(incident), cloneAlert(record)
@@ -193,21 +200,7 @@ func (s *Store) shouldReuseIncidentForAlertLocked(key string, incident *Incident
 	if !strings.HasPrefix(key, "flap:") {
 		return true
 	}
-	latest := incident.FiredAt
-	if incident.ResolvedAt != nil && incident.ResolvedAt.After(latest) {
-		latest = *incident.ResolvedAt
-	}
-	for _, alert := range s.alerts {
-		if alert == nil || alert.IncidentID != incident.IncidentID {
-			continue
-		}
-		if alert.FiredAt.After(latest) {
-			latest = alert.FiredAt
-		}
-		if alert.ResolvedAt != nil && alert.ResolvedAt.After(latest) {
-			latest = *alert.ResolvedAt
-		}
-	}
+	latest := incident.LatestActivityAt
 	delta := firedAt.Sub(latest)
 	if delta < 0 {
 		delta = -delta

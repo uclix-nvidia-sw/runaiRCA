@@ -126,15 +126,16 @@ type EmbeddingSearchResponse struct {
 }
 
 type Incident struct {
-	IncidentID     string     `json:"incident_id"`
-	CorrelationKey string     `json:"correlation_key"`
-	Title          string     `json:"title"`
-	Severity       string     `json:"severity"`
-	Status         string     `json:"status"`
-	FiredAt        time.Time  `json:"fired_at"`
-	ResolvedAt     *time.Time `json:"resolved_at"`
-	AlertCount     int        `json:"alert_count"`
-	IsAnalyzing    bool       `json:"is_analyzing"`
+	IncidentID       string     `json:"incident_id"`
+	CorrelationKey   string     `json:"correlation_key"`
+	Title            string     `json:"title"`
+	Severity         string     `json:"severity"`
+	Status           string     `json:"status"`
+	FiredAt          time.Time  `json:"fired_at"`
+	ResolvedAt       *time.Time `json:"resolved_at"`
+	AlertCount       int        `json:"alert_count"`
+	IsAnalyzing      bool       `json:"is_analyzing"`
+	LatestActivityAt time.Time  `json:"-"`
 }
 
 type AlertRecord struct {
