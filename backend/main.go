@@ -177,12 +177,13 @@ type IncidentDetail struct {
 }
 
 type Server struct {
-	store               *Store
-	hub                 *Hub
-	agentURL            string
-	language            string
-	agentRequestTimeout time.Duration
-	client              *http.Client
+	store                      *Store
+	hub                        *Hub
+	agentURL                   string
+	language                   string
+	agentRequestTimeout        time.Duration
+	manualAgentRequestTimeout  time.Duration
+	client                     *http.Client
 }
 
 const (
@@ -236,13 +237,18 @@ func NewServer() *Server {
 	if agentRequestTimeout <= 0 {
 		agentRequestTimeout = 180 * time.Second
 	}
+	manualAgentRequestTimeout := time.Duration(getenvInt("MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS", 900)) * time.Second
+	if manualAgentRequestTimeout <= 0 {
+		manualAgentRequestTimeout = 900 * time.Second
+	}
 	return &Server{
-		store:               store,
-		hub:                 NewHub(),
-		agentURL:            strings.TrimRight(getenv("AGENT_URL", "http://localhost:8000"), "/"),
-		language:            getenv("LANGUAGE", "en"),
-		agentRequestTimeout: agentRequestTimeout,
-		client:              &http.Client{},
+		store:                     store,
+		hub:                       NewHub(),
+		agentURL:                  strings.TrimRight(getenv("AGENT_URL", "http://localhost:8000"), "/"),
+		language:                  getenv("LANGUAGE", "en"),
+		agentRequestTimeout:       agentRequestTimeout,
+		manualAgentRequestTimeout: manualAgentRequestTimeout,
+		client:                    &http.Client{},
 	}
 }
 

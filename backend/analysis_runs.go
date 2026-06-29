@@ -111,7 +111,7 @@ func (s *Server) requestAnalysisRun(
 
 func (s *Server) analysisRequestTimeout(source string) time.Duration {
 	if source == "manual" {
-		return 0
+		return s.manualAgentRequestTimeout
 	}
 	return s.agentRequestTimeout
 }
