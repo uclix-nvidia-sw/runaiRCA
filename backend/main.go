@@ -306,7 +306,7 @@ func correlationKey(webhook AlertmanagerWebhook, alert Alert) string {
 	namespace := first(labels["namespace"], labels["kubernetes_namespace"])
 	pod := first(labels["pod"], labels["pod_name"], labels["kubernetes_pod_name"])
 	alertName := first(labels["alertname"], labels["alert_name"])
-	if cluster != "" && namespace != "" && pod != "" && alertName != "" {"
+	if cluster != "" && namespace != "" && pod != "" && alertName != "" {
 		return strings.Join([]string{"flap", cluster, namespace, pod, alertName}, ":")
 	}
 	if alert.Fingerprint != "" {
