@@ -2108,14 +2108,29 @@ function PanelHeader({ title, count }: { title: string; count: number }) {
 
 function CopyButton({ value, label = 'Copy' }: { value: string; label?: string }) {
   const [copied, setCopied] = useState(false);
+  const timeoutRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timeoutRef.current !== null) {
+        window.clearTimeout(timeoutRef.current);
+      }
+    };
+  }, []);
+
+  const handleClick = useCallback(async () => {
+    await copyToClipboard(value);
+    setCopied(true);
+    if (timeoutRef.current !== null) {
+      window.clearTimeout(timeoutRef.current);
+    }
+    timeoutRef.current = window.setTimeout(() => setCopied(false), 1200);
+  }, [value]);
+
   return (
     <button
       className="copy-button"
-      onClick={async () => {
-        await copyToClipboard(value);
-        setCopied(true);
-        window.setTimeout(() => setCopied(false), 1200);
-      }}
+      onClick={handleClick}
       type="button"
       title={label}
       aria-label={label}
