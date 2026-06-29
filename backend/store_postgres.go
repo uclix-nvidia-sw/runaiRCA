@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net/url"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -33,9 +35,19 @@ func (s *Store) connectDatabaseWithDriver(driverName string, databaseURL string,
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
-		_ = db.Close()
-		log.Printf("Postgres store disabled: ping failed: %v", err)
-		return
+		if isMissingDatabaseError(err) && ensureDatabaseExists(driverName, databaseURL, connectTimeout) {
+			_ = db.Close()
+			if db, err = sql.Open(driverName, databaseURL); err != nil {
+				log.Printf("Postgres store disabled: reopen failed: %v", err)
+				return
+			}
+			err = db.PingContext(ctx)
+		}
+		if err != nil {
+			_ = db.Close()
+			log.Printf("Postgres store disabled: ping failed: %v", err)
+			return
+		}
 	}
 	s.db = db
 	s.dbReady = true
@@ -52,6 +64,66 @@ func (s *Store) connectDatabaseWithDriver(driverName string, databaseURL string,
 		"Postgres store enabled for incidents, embeddings, feedback, comments, and analysis runs; %s",
 		s.pgvectorLogState(),
 	)
+}
+
+// isMissingDatabaseError reports whether err is Postgres SQLSTATE 3D000
+// (invalid_catalog_name), which is returned when the target database does not
+// yet exist on an otherwise reachable server.
+func isMissingDatabaseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if pgErr, ok := err.(*pgconn.PgError); ok {
+		return pgErr.Code == "3D000"
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "does not exist")
+}
+
+// ensureDatabaseExists connects to the server's maintenance database and creates
+// the target database only when it is missing. Existing databases on the same
+// server are never modified; the only DDL issued is CREATE DATABASE for the
+// requested name. Returns true when the database exists or was created.
+func ensureDatabaseExists(driverName, databaseURL string, connectTimeout time.Duration) bool {
+	u, err := url.Parse(databaseURL)
+	if err != nil {
+		return false
+	}
+	dbName := strings.TrimPrefix(u.Path, "/")
+	if dbName == "" {
+		return false
+	}
+	admin := *u
+	admin.Path = "/postgres"
+	conn, err := sql.Open(driverName, admin.String())
+	if err != nil {
+		log.Printf("auto-create database: connect to maintenance db failed: %v", err)
+		return false
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	defer cancel()
+	var exists bool
+	if err := conn.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)`, dbName).Scan(&exists); err != nil {
+		log.Printf("auto-create database: existence check failed: %v", err)
+		return false
+	}
+	if exists {
+		return true
+	}
+	stmt := fmt.Sprintf(`CREATE DATABASE %s`, quoteIdentifier(dbName))
+	if _, err := conn.ExecContext(ctx, stmt); err != nil {
+		log.Printf("auto-create database %q failed: %v", dbName, err)
+		return false
+	}
+	log.Printf("auto-created database %q on existing Postgres server", dbName)
+	return true
+}
+
+// quoteIdentifier safely double-quotes a Postgres identifier, escaping embedded
+// double quotes so the database name cannot break out of the CREATE DATABASE
+// statement.
+func quoteIdentifier(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
 func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
