@@ -74,11 +74,11 @@ func isMissingDatabaseError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if pgErr, ok := err.(*pgconn.PgError); ok {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr != nil {
 		return pgErr.Code == "3D000"
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "does not exist")
-}
 
 // ensureDatabaseExists connects to the server's maintenance database and creates
 // the target database only when it is missing. Existing databases on the same
