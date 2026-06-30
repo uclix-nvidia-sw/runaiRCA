@@ -3,7 +3,7 @@ from __future__ import annotations
 from urllib.parse import quote
 
 from app.collectors.base import AnalysisTarget, CollectorResult, artifact
-from app.collectors.http_json import compact, get_json, post_json
+from app.collectors.http_json import compact, get_json, post_form_json, post_json
 from app.config import Settings
 
 
@@ -31,6 +31,43 @@ class RunAICollector:
             confidence = "low"
         else:
             headers, auth_warnings = await _runai_headers(self._settings)
+            if not headers.get("Authorization"):
+                if "runai.auth" not in missing:
+                    missing.append("runai.auth")
+                if "runai.query" not in missing:
+                    missing.append("runai.query")
+                summary = "Run:ai API authentication is unavailable; direct queries were skipped."
+                details = {
+                    "cluster": target.cluster,
+                    "project": target.project,
+                    "queue": target.queue,
+                    "workload_name": target.workload_name,
+                    "workload_type": target.workload_type,
+                    "runai_workload_id": target.runai_workload_id,
+                    "runai_base_url": self._settings.runai_base_url,
+                    "queries": [],
+                }
+                return CollectorResult(
+                    agent=self.name,
+                    status="unavailable",
+                    summary=summary,
+                    confidence="low",
+                    details=details,
+                    missing_data=missing,
+                    warnings=auth_warnings,
+                    artifacts=[
+                        artifact(
+                            agent=self.name,
+                            source="runai",
+                            type="workload_context",
+                            status="unavailable",
+                            confidence="low",
+                            query="Run:ai API query skipped because no Authorization header was available.",
+                            summary=summary,
+                            result=details,
+                        )
+                    ],
+                )
             query_results = await _collect_runai_responses(self._settings, target, headers)
             auth_failed = any(item.get("status_code") == 401 for item in query_results)
             if auth_failed and _can_refresh_runai_token(self._settings):
@@ -142,32 +179,23 @@ def _can_refresh_runai_token(settings: Settings) -> bool:
     return bool(settings.runai_token_url and settings.runai_client_id and settings.runai_client_secret)
 
 
-async def _runai_headers(settings: Settings, *, prefer_oauth: bool = False) -> tuple[dict[str, str], list[str]]:
+async def _runai_headers(
+    settings: Settings, *, prefer_oauth: bool = False
+) -> tuple[dict[str, str], list[str]]:
     warnings: list[str] = []
     token = "" if prefer_oauth else settings.runai_bearer_token
-    if not token and settings.runai_token_url and settings.runai_client_id:
-        response = await post_json(
-            url=settings.runai_token_url,
-            timeout_seconds=settings.runai_timeout_seconds,
-            json_body={
-                "grantType": "client_credentials",
-                "clientId": settings.runai_client_id,
-                "clientSecret": settings.runai_client_secret,
-            },
-            headers={"Content-Type": "application/json"},
-        )
-        if response.ok and isinstance(response.data, dict):
-            value = response.data.get("accessToken") or response.data.get("access_token")
-            if isinstance(value, str) and value:
-                token = value
-            else:
-                warnings.append("Run:ai token response did not include an access token.")
-        elif response.error:
-            warnings.append(f"Run:ai token request failed: {response.error}")
-    elif settings.runai_client_id and settings.runai_client_secret and not settings.runai_token_url:
+    if (
+        not token
+        and settings.runai_client_id
+        and settings.runai_client_secret
+        and (settings.runai_token_url or settings.runai_base_url)
+    ):
+        token = await _request_runai_token(settings, warnings)
+    elif settings.runai_client_id or settings.runai_client_secret:
         warnings.append(
-            "RUNAI_CLIENT_ID and RUNAI_CLIENT_SECRET are configured, "
-            "but RUNAI_TOKEN_URL is not set."
+            "Run:ai client credential configuration is incomplete. "
+            "Set both RUNAI_CLIENT_ID and RUNAI_CLIENT_SECRET; RUNAI_TOKEN_URL is optional "
+            "when RUNAI_BASE_URL can infer a token endpoint."
         )
 
     headers = {"Accept": "application/json"}
@@ -180,6 +208,78 @@ async def _runai_headers(settings: Settings, *, prefer_oauth: bool = False) -> t
             "and RUNAI_CLIENT_SECRET."
         )
     return headers, warnings
+
+
+async def _request_runai_token(settings: Settings, warnings: list[str]) -> str:
+    attempts: list[str] = []
+    for url in _runai_token_urls(settings):
+        json_response = await post_json(
+            url=url,
+            timeout_seconds=settings.runai_timeout_seconds,
+            json_body={
+                "grantType": "client_credentials",
+                "clientId": settings.runai_client_id,
+                "clientSecret": settings.runai_client_secret,
+            },
+            headers={"Content-Type": "application/json"},
+        )
+        token = _token_from_response(json_response.data)
+        if json_response.ok and token:
+            return token
+        attempts.append(f"{url} json={json_response.error or 'missing access token'}")
+
+        form_response = await post_form_json(
+            url=url,
+            timeout_seconds=settings.runai_timeout_seconds,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": settings.runai_client_id,
+                "client_secret": settings.runai_client_secret,
+            },
+        )
+        token = _token_from_response(form_response.data)
+        if form_response.ok and token:
+            return token
+        attempts.append(f"{url} form={form_response.error or 'missing access token'}")
+
+    if attempts:
+        warnings.append("Run:ai token request failed: " + "; ".join(attempts[:4]))
+    else:
+        warnings.append(
+            "RUNAI_CLIENT_ID and RUNAI_CLIENT_SECRET are configured, "
+            "but neither RUNAI_TOKEN_URL nor RUNAI_BASE_URL can produce a token URL."
+        )
+    return ""
+
+
+def _runai_token_urls(settings: Settings) -> list[str]:
+    urls: list[str] = []
+    if settings.runai_token_url:
+        urls.append(settings.runai_token_url)
+    base_url = settings.runai_base_url.rstrip("/")
+    if base_url:
+        urls.extend(
+            [
+                f"{base_url}/auth/realms/runai/protocol/openid-connect/token",
+                f"{base_url}/api/v1/token",
+                f"{base_url}/api/v1/auth/token",
+            ]
+        )
+    deduped: list[str] = []
+    for url in urls:
+        if url and url not in deduped:
+            deduped.append(url)
+    return deduped
+
+
+def _token_from_response(data: object) -> str:
+    if not isinstance(data, dict):
+        return ""
+    for key in ("accessToken", "access_token", "token", "id_token"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
 def _bearer_header_value(token: str) -> str:

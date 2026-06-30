@@ -59,7 +59,7 @@ helm template runai-rca charts/runai-rca
 helm install runai-rca charts/runai-rca \
   --set agent.env.runaiBaseUrl=https://runai.example.com \
   --set agent.env.prometheusUrl=http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090 \
-  --set agent.env.lokiUrl=http://loki-gateway.monitoring.svc.cluster.local \
+  --set agent.env.lokiUrl=http://loki-query-frontend.monitoring.svc.cluster.local:3100 \
   --set-string agent.env.runaiLogNamespaces='runai\,runai-backend' \
   --set secrets.existingSecret=runai-rca-secrets
 ```
@@ -143,9 +143,6 @@ kubectl create secret generic runai-rca-secrets \
   --from-literal=RUNAI_CLIENT_ID='<runai-client-id>' \
   --from-literal=RUNAI_CLIENT_SECRET='<runai-client-secret>' \
   --from-literal=RUNAI_BEARER_TOKEN='<optional-runai-token>' \
-  --from-literal=LOKI_BEARER_TOKEN='<optional-loki-token>' \
-  --from-literal=LOKI_BASIC_USERNAME='<optional-loki-user>' \
-  --from-literal=LOKI_BASIC_PASSWORD='<optional-loki-password>' \
   --from-literal=NVIDIA_API_KEY='<nim-api-key>' \
   --from-literal=LLM_API_KEY='<llm-api-key>' \
   --from-literal=DATABASE_URL='postgres://user:password@postgres.example.com:5432/runai_rca?sslmode=require' \

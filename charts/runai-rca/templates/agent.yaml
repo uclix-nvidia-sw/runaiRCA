@@ -163,30 +163,6 @@ spec:
                   name: {{ include "runai-rca.secretName" . }}
                   key: {{ .Values.secrets.keys.runaiBearerToken | quote }}
                   optional: true
-            - name: LOKI_BEARER_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "runai-rca.secretName" . }}
-                  key: {{ .Values.secrets.keys.lokiBearerToken | quote }}
-                  optional: true
-            - name: LOKI_BASIC_USERNAME
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "runai-rca.secretName" . }}
-                  key: {{ .Values.secrets.keys.lokiBasicUsername | quote }}
-                  optional: true
-            - name: LOKI_BASIC_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "runai-rca.secretName" . }}
-                  key: {{ .Values.secrets.keys.lokiBasicPassword | quote }}
-                  optional: true
-            - name: LOKI_TENANT_ID
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "runai-rca.secretName" . }}
-                  key: {{ .Values.secrets.keys.lokiTenantId | quote }}
-                  optional: true
             - name: NVIDIA_API_KEY
               valueFrom:
                 secretKeyRef:

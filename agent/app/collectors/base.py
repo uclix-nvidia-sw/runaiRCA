@@ -41,12 +41,23 @@ def value_from(labels: dict[str, str], annotations: dict[str, str], *keys: str) 
     return ""
 
 
+def project_from_namespace(namespace: str) -> str:
+    prefix = "runai-"
+    return namespace[len(prefix) :] if namespace.startswith(prefix) else ""
+
+
+def normalize_project_name(value: str) -> str:
+    return project_from_namespace(value) or value
+
+
 def resolve_target(labels: dict[str, str], annotations: dict[str, str]) -> AnalysisTarget:
+    namespace = value_from(labels, annotations, "namespace", "kubernetes_namespace")
+    project = value_from(labels, annotations, "project", "runai_project", "runai.io/project")
     return AnalysisTarget(
         cluster=value_from(labels, annotations, "cluster", "runai_cluster", "runai.io/cluster"),
-        project=value_from(labels, annotations, "project", "runai_project", "runai.io/project"),
+        project=normalize_project_name(project) if project else project_from_namespace(namespace),
         queue=value_from(labels, annotations, "queue", "runai_queue", "runai.io/queue"),
-        namespace=value_from(labels, annotations, "namespace", "kubernetes_namespace"),
+        namespace=namespace,
         workload_name=value_from(
             labels,
             annotations,

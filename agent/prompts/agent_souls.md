@@ -134,7 +134,7 @@ Role: own the KubeRCA-style incident and alert analysis shown in the Analysis Da
 Owns:
 
 - Merging component evidence into root cause, impact, confidence, missing data,
-  recommended manual actions, and prevention sections.
+  recommended remediation actions, and prevention sections.
 - Separating live evidence from similar-incident memory and operator feedback.
 - Marking analysis as incomplete when required Run:ai, Kubernetes, Prometheus,
   Loki, or Postgres evidence is unavailable.
