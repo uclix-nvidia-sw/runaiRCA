@@ -183,23 +183,25 @@ func registerFakePostgresDriver(state *fakePostgresState) string {
 }
 
 type fakePostgresState struct {
-	mu                sync.Mutex
-	failCreateVector  bool
-	failAnalysisRuns  bool
-	execs             []string
-	queries           []string
-	now               time.Time
-	labelsJSON        []byte
-	annotationsJSON   []byte
-	capabilitiesJSON  []byte
-	missingDataJSON   []byte
-	warningsJSON      []byte
-	artifactsJSON     []byte
-	memoryVectorJSON  []byte
-	emptyObjectJSON   []byte
-	emptyArrayJSON    []byte
-	execsNoDeadline   int
-	queriesNoDeadline int
+	mu                       sync.Mutex
+	failCreateVector         bool
+	failAnalysisRuns         bool
+	failAnalysisRunExecAfter int
+	analysisRunExecs         int
+	execs                    []string
+	queries                  []string
+	now                      time.Time
+	labelsJSON               []byte
+	annotationsJSON          []byte
+	capabilitiesJSON         []byte
+	missingDataJSON          []byte
+	warningsJSON             []byte
+	artifactsJSON            []byte
+	memoryVectorJSON         []byte
+	emptyObjectJSON          []byte
+	emptyArrayJSON           []byte
+	execsNoDeadline          int
+	queriesNoDeadline        int
 }
 
 func newFakePostgresState(failCreateVector bool) *fakePostgresState {
@@ -264,17 +266,23 @@ func (c *fakePostgresConn) Ping(context.Context) error {
 }
 
 func (c *fakePostgresConn) ExecContext(ctx context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+	failAnalysisRun := false
 	c.state.mu.Lock()
 	if _, ok := ctx.Deadline(); !ok {
 		c.state.execsNoDeadline++
 	}
 	c.state.execs = append(c.state.execs, query)
+	if strings.Contains(query, "INSERT INTO analysis_runs") {
+		c.state.analysisRunExecs++
+		failAnalysisRun = c.state.failAnalysisRuns ||
+			(c.state.failAnalysisRunExecAfter > 0 && c.state.analysisRunExecs > c.state.failAnalysisRunExecAfter)
+	}
 	c.state.mu.Unlock()
 
 	if c.state.failCreateVector && strings.Contains(query, "CREATE EXTENSION IF NOT EXISTS vector") {
 		return nil, errors.New(`extension "vector" is not available`)
 	}
-	if c.state.failAnalysisRuns && strings.Contains(query, "INSERT INTO analysis_runs") {
+	if failAnalysisRun {
 		return nil, errors.New("analysis run write failed")
 	}
 	return driver.RowsAffected(1), nil

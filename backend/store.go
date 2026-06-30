@@ -550,6 +550,7 @@ func (s *Store) CompleteAnalysisRun(runID string, response AgentAnalysisResponse
 	if run == nil {
 		return AnalysisRun{}, false
 	}
+	before := cloneAnalysisRun(run)
 	run.Status = "complete"
 	run.AnalysisSummary = response.AnalysisSummary
 	run.AnalysisDetail = response.AnalysisDetail
@@ -562,7 +563,10 @@ func (s *Store) CompleteAnalysisRun(runID string, response AgentAnalysisResponse
 	run.Warnings = response.Warnings
 	run.Artifacts = response.Artifacts
 	run.UpdatedAt = time.Now().UTC()
-	s.persistAnalysisRunLocked(run)
+	if !s.persistAnalysisRunLocked(run) {
+		*run = before
+		return cloneAnalysisRun(run), false
+	}
 	return cloneAnalysisRun(run), true
 }
 
@@ -573,6 +577,7 @@ func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (A
 	if run == nil {
 		return AnalysisRun{}, false
 	}
+	before := cloneAnalysisRun(run)
 	run.Status = "failed"
 	run.AnalysisSummary = response.AnalysisSummary
 	run.AnalysisDetail = response.AnalysisDetail
@@ -585,7 +590,10 @@ func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (A
 	run.Warnings = response.Warnings
 	run.Artifacts = response.Artifacts
 	run.UpdatedAt = time.Now().UTC()
-	s.persistAnalysisRunLocked(run)
+	if !s.persistAnalysisRunLocked(run) {
+		*run = before
+		return cloneAnalysisRun(run), false
+	}
 	return cloneAnalysisRun(run), true
 }
 

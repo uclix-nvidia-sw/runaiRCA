@@ -261,6 +261,71 @@ func TestAnalysisRunPersistFailureSkipsAgentCall(t *testing.T) {
 	}
 }
 
+func TestAnalysisRunUpdatePersistFailureSkipsAlertRCA(t *testing.T) {
+	state := newFakePostgresState(false)
+	state.failAnalysisRunExecAfter = 1
+	store := NewStore()
+	store.connectDatabaseWithDriver(registerFakePostgresDriver(state), "fake://runai_rca", time.Second)
+	defer store.db.Close()
+	var hit atomic.Int32
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit.Add(1)
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Should not be applied.",
+			AnalysisDetail:  "Agent result could not be persisted to the run row.",
+			AnalysisQuality: "high",
+		})
+	}))
+	defer agent.Close()
+	server := &Server{
+		store:                     store,
+		hub:                       NewHub(),
+		agentURL:                  agent.URL,
+		agentRequestTimeout:       time.Second,
+		manualAgentRequestTimeout: time.Second,
+		client:                    &http.Client{},
+	}
+	incident, record := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "update-persist-failure"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-update-persist-failure",
+	})
+
+	run, ok := server.startAnalysisRun("incident", incident.IncidentID, "auto", "")
+	if !ok {
+		t.Fatalf("expected initial analysis run persist to succeed")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		state.mu.Lock()
+		execs := state.analysisRunExecs
+		state.mu.Unlock()
+		if execs >= 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	state.mu.Lock()
+	execs := state.analysisRunExecs
+	state.mu.Unlock()
+	if execs < 2 {
+		t.Fatalf("analysis run update persist was not attempted, execs=%d", execs)
+	}
+	if hit.Load() != 1 {
+		t.Fatalf("expected exactly one agent call, got %d", hit.Load())
+	}
+	alert, _ := store.AlertDetail(record.AlertID)
+	if alert.AnalysisSummary != "" || alert.AnalysisDetail != "" || !alert.IsAnalyzing {
+		t.Fatalf("alert RCA should not apply when run update persist fails: %+v", alert)
+	}
+	after := waitForRunIDStatus(t, server, run.RunID, "analyzing")
+	if after.AnalysisSummary != "" {
+		t.Fatalf("run should be restored to analyzing without result text: %+v", after)
+	}
+}
+
 func TestManualAnalysisClearsRCAAndSkipsAgentTimeout(t *testing.T) {
 	agentReqCh := make(chan AgentAnalysisRequest, 1)
 	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {

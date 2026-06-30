@@ -103,12 +103,18 @@ func (s *Server) requestAnalysisRun(
 	analysis, err := s.callAnalyze(req, s.analysisRequestTimeout(source))
 	if err != nil {
 		fallback := fallbackAnalysis(alert, err)
-		run, _ := s.store.FailAnalysisRun(runID, fallback)
+		run, ok := s.store.FailAnalysisRun(runID, fallback)
+		if !ok {
+			return
+		}
 		s.store.ApplyFallbackAnalysisIfAbsentForRun(runID, alertID, fallback)
 		s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
 		return
 	}
-	run, _ := s.store.CompleteAnalysisRun(runID, analysis)
+	run, ok := s.store.CompleteAnalysisRun(runID, analysis)
+	if !ok {
+		return
+	}
 	s.store.ApplyAnalysisForRun(runID, alertID, analysis)
 	s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
 }
