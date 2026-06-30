@@ -24,6 +24,9 @@ const (
 	maxOperatorPromptCommentsPerTarget = 10
 	maxOperatorPromptCommentBodyBytes  = 200
 	maxOperatorPromptAuthorBytes       = 80
+
+	maxStoredCommentBodyBytes = 8000
+	maxFeedbackAuthorBytes    = 120
 )
 
 type Store struct {
@@ -769,6 +772,13 @@ func (s *Store) AddFeedback(
 	rawVote := strings.TrimSpace(first(req.Vote, req.VoteType))
 	vote := normalizeVote(rawVote)
 	actor := feedbackActor(req.Author)
+	comment := strings.TrimSpace(req.Comment)
+	if err := validateStoredText("author", actor, maxFeedbackAuthorBytes); err != nil {
+		return FeedbackSummary{}, false, err
+	}
+	if err := validateStoredText("comment", req.Comment, maxStoredCommentBodyBytes); err != nil {
+		return FeedbackSummary{}, false, err
+	}
 	if strings.EqualFold(rawVote, "none") {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -795,7 +805,7 @@ func (s *Store) AddFeedback(
 		IncidentID: incidentID,
 		AlertID:    alertID,
 		Vote:       vote,
-		Comment:    strings.TrimSpace(req.Comment),
+		Comment:    comment,
 		Author:     actor,
 		CreatedAt:  time.Now().UTC(),
 	}
@@ -827,6 +837,13 @@ func (s *Store) AddComment(
 	if body == "" {
 		return FeedbackSummary{}, false, errors.New("comment body is required")
 	}
+	author := strings.TrimSpace(req.Author)
+	if err := validateStoredText("comment body", req.Body, maxStoredCommentBodyBytes); err != nil {
+		return FeedbackSummary{}, false, err
+	}
+	if err := validateStoredText("author", author, maxFeedbackAuthorBytes); err != nil {
+		return FeedbackSummary{}, false, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incidentID, alertID, ok := s.targetIDsLocked(targetType, targetID)
@@ -840,7 +857,7 @@ func (s *Store) AddComment(
 		IncidentID: incidentID,
 		AlertID:    alertID,
 		Body:       body,
-		Author:     strings.TrimSpace(req.Author),
+		Author:     author,
 		CreatedAt:  time.Now().UTC(),
 	}
 	s.comments[comment.CommentID] = comment
@@ -858,6 +875,13 @@ func (s *Store) UpdateComment(
 	if body == "" {
 		return FeedbackSummary{}, false, errors.New("comment body is required")
 	}
+	author := strings.TrimSpace(req.Author)
+	if err := validateStoredText("comment body", req.Body, maxStoredCommentBodyBytes); err != nil {
+		return FeedbackSummary{}, false, err
+	}
+	if err := validateStoredText("author", author, maxFeedbackAuthorBytes); err != nil {
+		return FeedbackSummary{}, false, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, _, ok := s.targetIDsLocked(targetType, targetID); !ok {
@@ -868,11 +892,18 @@ func (s *Store) UpdateComment(
 		return FeedbackSummary{}, false, nil
 	}
 	comment.Body = body
-	if author := strings.TrimSpace(req.Author); author != "" {
+	if author != "" {
 		comment.Author = author
 	}
 	s.persistCommentUpdateLocked(comment)
 	return s.feedbackSummaryLocked(targetType, targetID), true, nil
+}
+
+func validateStoredText(field string, value string, maxBytes int) error {
+	if len(value) > maxBytes {
+		return fmt.Errorf("%s must be %d bytes or less", field, maxBytes)
+	}
+	return nil
 }
 
 func (s *Store) OperatorPromptForTarget(targetType string, targetID string) string {

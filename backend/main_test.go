@@ -1322,6 +1322,32 @@ func TestFeedbackVoteToggleCancelsSameActorVote(t *testing.T) {
 	}
 }
 
+func TestFeedbackRejectsOversizedCommentFields(t *testing.T) {
+	store := NewStore()
+	incident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "feedback-bounds"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-feedback-bounds",
+	})
+
+	tooLongComment := strings.Repeat("x", maxStoredCommentBodyBytes+1)
+	tooLongAuthor := strings.Repeat("a", maxFeedbackAuthorBytes+1)
+
+	if _, _, err := store.AddComment("incident", incident.IncidentID, CommentRequest{Body: tooLongComment}); err == nil {
+		t.Fatalf("expected oversized comment body to be rejected")
+	}
+	if _, _, err := store.AddComment("incident", incident.IncidentID, CommentRequest{Body: "Check scheduler logs.", Author: tooLongAuthor}); err == nil {
+		t.Fatalf("expected oversized comment author to be rejected")
+	}
+	if _, _, err := store.AddFeedback("incident", incident.IncidentID, FeedbackRequest{Vote: "up", Comment: tooLongComment}); err == nil {
+		t.Fatalf("expected oversized feedback comment to be rejected")
+	}
+	if _, _, err := store.AddFeedback("incident", incident.IncidentID, FeedbackRequest{Vote: "up", Author: tooLongAuthor}); err == nil {
+		t.Fatalf("expected oversized feedback author to be rejected")
+	}
+}
+
 func TestFeedbackRoutesReturnSummary(t *testing.T) {
 	server := NewServer()
 	incident, _ := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "route"}, Alert{
