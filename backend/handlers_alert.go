@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
 
 func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
@@ -19,7 +20,8 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 	accepted := 0
 	ignored := 0
 	autoAnalyses := 0
-	autoIncidentIDs := map[string]struct{}{}
+	autoAlertIDs := map[string]struct{}{}
+	autoAlertOrder := []string{}
 	for _, alert := range webhook.Alerts {
 		if ignoredAlert(alert) {
 			ignored++
@@ -31,13 +33,25 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 		if result.Changed {
 			s.hub.Broadcast(alertCreatedEvent(incident, record))
 		}
-		if result.NewIncident {
-			autoIncidentIDs[incident.IncidentID] = struct{}{}
+		if status(alert.Status) != "resolved" {
+			if _, queued := autoAlertIDs[record.AlertID]; !queued {
+				autoAlertIDs[record.AlertID] = struct{}{}
+				autoAlertOrder = append(autoAlertOrder, record.AlertID)
+			}
 		}
 	}
-	for incidentID := range autoIncidentIDs {
-		if _, ok := s.startAnalysisRun("incident", incidentID, "auto", ""); ok {
+	for _, alertID := range autoAlertOrder {
+		if autoAnalyses >= maxAutoAnalyzeFanout {
+			break
+		}
+		reserved, release := s.reserveAutoAnalysisSlot()
+		if !reserved {
+			break
+		}
+		if _, ok := s.startAnalysisRun("alert", alertID, "auto", ""); ok {
 			autoAnalyses++
+		} else {
+			release()
 		}
 	}
 	writeJSON(
@@ -51,6 +65,35 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 			"auto_analyses": autoAnalyses,
 		},
 	)
+}
+
+func (s *Server) reserveAutoAnalysisSlot() (bool, func()) {
+	now := time.Now().UTC()
+	cutoff := now.Add(-autoAnalyzeWindow)
+	s.autoAnalyzeMu.Lock()
+	defer s.autoAnalyzeMu.Unlock()
+	kept := s.autoAnalyzeStarts[:0]
+	for _, startedAt := range s.autoAnalyzeStarts {
+		if startedAt.After(cutoff) {
+			kept = append(kept, startedAt)
+		}
+	}
+	s.autoAnalyzeStarts = kept
+	if len(s.autoAnalyzeStarts) >= maxAutoAnalyzeFanout {
+		return false, func() {}
+	}
+	s.autoAnalyzeStarts = append(s.autoAnalyzeStarts, now)
+	release := func() {
+		s.autoAnalyzeMu.Lock()
+		defer s.autoAnalyzeMu.Unlock()
+		for i, t := range s.autoAnalyzeStarts {
+			if t == now {
+				s.autoAnalyzeStarts = append(s.autoAnalyzeStarts[:i], s.autoAnalyzeStarts[i+1:]...)
+				break
+			}
+		}
+	}
+	return true, release
 }
 
 func (s *Server) handleAlert(w http.ResponseWriter, r *http.Request) {

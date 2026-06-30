@@ -5,6 +5,7 @@ const fallbackApiBase = import.meta.env.DEV ? 'http://localhost:8080' : '';
 const configuredApiBase = normalizeApiBase(runtimeApiBase) ?? normalizeApiBase(import.meta.env.VITE_API_BASE_URL);
 const API_BASE = configuredApiBase ?? fallbackApiBase;
 const FEEDBACK_ACTOR_KEY = 'runai-rca-feedback-actor';
+const MAX_ERROR_BODY_BYTES = 4096;
 
 export type FeedbackVote = 'up' | 'down' | 'none';
 export type PageRequest = { limit: number; offset: number };
@@ -198,15 +199,55 @@ async function responseErrorMessage(response: Response) {
   const fallback = `Request failed: ${response.status}`;
   const contentType = response.headers.get('content-type') || '';
   try {
+    const { text, truncated } = await readLimitedResponseText(response, MAX_ERROR_BODY_BYTES);
+    const bodyText = text.trim();
+    if (!bodyText) return fallback;
     if (contentType.includes('application/json')) {
-      const body = await response.json() as { error?: string; message?: string; status?: string };
-      return body.error || body.message || body.status || fallback;
+      if (truncated) return `${fallback}: response body exceeded ${MAX_ERROR_BODY_BYTES} bytes`;
+      const body = JSON.parse(bodyText) as { error?: unknown; message?: unknown; status?: unknown };
+      return stringField(body.error) || stringField(body.message) || stringField(body.status) || fallback;
     }
-    const body = (await response.text()).trim();
-    return body || fallback;
+    return truncated ? `${bodyText}...` : bodyText;
   } catch {
     return fallback;
   }
+}
+
+async function readLimitedResponseText(response: Response, limit: number) {
+  if (!response.body) {
+    const text = await response.text();
+    return { text: text.slice(0, limit), truncated: text.length > limit };
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let truncated = false;
+  let bytesRead = 0;
+  try {
+    while (bytesRead < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const remaining = limit - bytesRead;
+      if (value.byteLength > remaining) {
+        text += decoder.decode(value.slice(0, remaining), { stream: true });
+        truncated = true;
+        await reader.cancel();
+        break;
+      }
+      bytesRead += value.byteLength;
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
+
+  return { text, truncated };
+}
+
+function stringField(value: unknown) {
+  return typeof value === 'string' && value.trim() ? value : undefined;
 }
 
 function feedbackActorID() {

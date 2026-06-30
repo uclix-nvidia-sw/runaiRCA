@@ -203,7 +203,7 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 		`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS occurrence_count INTEGER NOT NULL DEFAULT 1`,
 		`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS occurrence_pods JSONB NOT NULL DEFAULT '[]'::jsonb`,
 		`CREATE TABLE IF NOT EXISTS incident_embeddings (
-			incident_id TEXT PRIMARY KEY,
+			incident_id TEXT NOT NULL,
 			alert_id TEXT NOT NULL,
 			title TEXT NOT NULL,
 			severity TEXT NOT NULL,
@@ -215,6 +215,8 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`ALTER TABLE incident_embeddings DROP CONSTRAINT IF EXISTS incident_embeddings_pkey`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_incident_embeddings_incident_alert ON incident_embeddings (incident_id, alert_id)`,
 		`DO $$
 		BEGIN
 			IF to_regclass('public.incident_memories') IS NOT NULL THEN
@@ -229,7 +231,7 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 						analysis_summary, analysis_detail, labels, vector_json,
 						created_at, updated_at
 					FROM incident_memories
-					ON CONFLICT (incident_id) DO NOTHING
+					ON CONFLICT DO NOTHING
 				';
 			END IF;
 		END $$`,
@@ -279,6 +281,25 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 		`CREATE INDEX IF NOT EXISTS idx_comments_target ON rca_comments (target_type, target_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_created_at ON analysis_runs (created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_target ON analysis_runs (target_type, target_id)`,
+		`UPDATE analysis_runs
+			SET status = 'failed',
+				analysis_quality = COALESCE(NULLIF(analysis_quality, ''), 'low'),
+				capabilities = capabilities || '{"agent":"deduplicated"}'::jsonb,
+				warnings = warnings || '["duplicate analyzing run was closed before enforcing alert uniqueness"]'::jsonb,
+				updated_at = now()
+			WHERE run_id IN (
+				SELECT run_id
+				FROM (
+					SELECT run_id, row_number() OVER (
+						PARTITION BY alert_id
+						ORDER BY updated_at DESC, created_at DESC, run_id DESC
+					) AS rn
+					FROM analysis_runs
+					WHERE status = 'analyzing' AND alert_id IS NOT NULL AND alert_id <> ''
+				) ranked
+				WHERE rn > 1
+			)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_analysis_runs_one_analyzing_alert ON analysis_runs (alert_id) WHERE status = 'analyzing' AND alert_id IS NOT NULL AND alert_id <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_embeddings_created_at ON incident_embeddings (created_at DESC)`,
 	}
 	for _, statement := range statements {
@@ -443,11 +464,8 @@ func (s *Store) loadAlerts(ctx context.Context) {
 		if alert.Fingerprint != "" {
 			s.alertByFinger[alert.Fingerprint] = alert.AlertID
 		}
-		alertSource := alertFromRecord(alert)
-		key := correlationKey(AlertmanagerWebhook{}, alertSource)
-		storageKey := alertStorageKey(AlertmanagerWebhook{}, alertSource, key)
-		if storageKey != "" {
-			s.alertByGroup[storageKey] = alert.AlertID
+		if incident := s.incidents[alert.IncidentID]; incident != nil && incident.CorrelationKey != "" {
+			s.alertByGroup["correlation:"+incident.CorrelationKey] = alert.AlertID
 		}
 	}
 	for _, alert := range s.alerts {
@@ -504,7 +522,7 @@ func (s *Store) loadMemories(ctx context.Context) {
 		if memory.Vector == nil {
 			memory.Vector = textVector(memoryText(memory))
 		}
-		s.memories[memory.IncidentID] = &memory
+		s.memories[first(memory.AlertID, memory.IncidentID)] = &memory
 	}
 }
 
@@ -519,6 +537,7 @@ func (s *Store) dbSearchMemory(query string, limit int) ([]SimilarIncident, bool
 		return nil, false
 	}
 	literal := embeddingLiteral(denseEmbedding(query))
+	queryLimit := limit * 3
 	ctx, cancel := postgresOperationContext()
 	defer cancel()
 	rows, err := s.db.QueryContext(
@@ -529,7 +548,7 @@ func (s *Store) dbSearchMemory(query string, limit int) ([]SimilarIncident, bool
 		  WHERE embedding IS NOT NULL
 		  ORDER BY embedding <=> $1::vector
 		  LIMIT $2`,
-		literal, limit,
+		literal, queryLimit,
 	)
 	if err != nil {
 		log.Printf("pgvector similarity search failed, falling back to jsonb: %v", err)
@@ -581,7 +600,7 @@ func (s *Store) dbSearchMemory(query string, limit int) ([]SimilarIncident, bool
 		results[i].CommentCount = len(summary.Comments)
 	}
 	s.mu.RUnlock()
-	return results, true
+	return dedupeSimilarByIncident(results, limit), true
 }
 
 func (s *Store) loadFeedback(ctx context.Context) {
@@ -701,9 +720,9 @@ func (s *Store) loadAnalysisRuns(ctx context.Context) {
 	}
 }
 
-func (s *Store) persistIncidentLocked(incident *Incident) {
+func (s *Store) persistIncidentLocked(incident *Incident) bool {
 	if s.db == nil || !s.dbReady || incident == nil {
-		return
+		return true
 	}
 	_, err := s.execPostgres(
 		`INSERT INTO incidents (
@@ -730,12 +749,14 @@ func (s *Store) persistIncidentLocked(incident *Incident) {
 	)
 	if err != nil {
 		log.Printf("Failed to persist incident %s: %v", incident.IncidentID, err)
+		return false
 	}
+	return true
 }
 
-func (s *Store) persistAlertLocked(alert *AlertRecord) {
+func (s *Store) persistAlertLocked(alert *AlertRecord) bool {
 	if s.db == nil || !s.dbReady || alert == nil {
-		return
+		return true
 	}
 	_, err := s.execPostgres(
 		`INSERT INTO alerts (
@@ -791,7 +812,9 @@ func (s *Store) persistAlertLocked(alert *AlertRecord) {
 	)
 	if err != nil {
 		log.Printf("Failed to persist alert %s: %v", alert.AlertID, err)
+		return false
 	}
+	return true
 }
 
 func (s *Store) persistMemoryLocked(memory *IncidentMemory) {
@@ -804,7 +827,7 @@ func (s *Store) persistMemoryLocked(memory *IncidentMemory) {
 				incident_id, alert_id, title, severity, status, analysis_summary,
 				analysis_detail, labels, vector_json, embedding, created_at, updated_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::vector, $11, now())
-			ON CONFLICT (incident_id) DO UPDATE SET
+			ON CONFLICT (incident_id, alert_id) DO UPDATE SET
 				alert_id = EXCLUDED.alert_id,
 				title = EXCLUDED.title,
 				severity = EXCLUDED.severity,
@@ -837,7 +860,7 @@ func (s *Store) persistMemoryLocked(memory *IncidentMemory) {
 			incident_id, alert_id, title, severity, status, analysis_summary,
 			analysis_detail, labels, vector_json, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
-		ON CONFLICT (incident_id) DO UPDATE SET
+		ON CONFLICT (incident_id, alert_id) DO UPDATE SET
 			alert_id = EXCLUDED.alert_id,
 			title = EXCLUDED.title,
 			severity = EXCLUDED.severity,
@@ -953,9 +976,9 @@ func (s *Store) persistCommentDeleteLocked(commentID string) {
 	}
 }
 
-func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) {
+func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) bool {
 	if s.db == nil || !s.dbReady || run == nil {
-		return
+		return true
 	}
 	_, err := s.execPostgres(
 		`INSERT INTO analysis_runs (
@@ -1004,5 +1027,7 @@ func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) {
 	)
 	if err != nil {
 		log.Printf("Failed to persist analysis run %s: %v", run.RunID, err)
+		return false
 	}
+	return true
 }

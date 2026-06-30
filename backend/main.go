@@ -16,8 +16,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 type AlertmanagerWebhook struct {
@@ -191,6 +193,9 @@ type Server struct {
 	agentRequestTimeout       time.Duration
 	manualAgentRequestTimeout time.Duration
 	client                    *http.Client
+	agentSlots                chan struct{}
+	autoAnalyzeMu             sync.Mutex
+	autoAnalyzeStarts         []time.Time
 }
 
 const (
@@ -198,8 +203,12 @@ const (
 	flappingGroupWindow    = 30 * time.Minute
 	maxListLimit           = 200
 	maxJSONBodyBytes       = 1 << 20
+	maxEmbeddingQueryBytes = 4000
 	maxWebhookAlerts       = 500
+	maxAutoAnalyzeFanout   = 25
 	maxManualAnalyzeFanout = 25
+	maxConcurrentAgentRuns = maxManualAnalyzeFanout
+	autoAnalyzeWindow      = time.Minute
 )
 
 func main() {
@@ -237,13 +246,6 @@ func main() {
 
 func NewServer() *Server {
 	store := NewStore()
-	store.ConnectDatabase(
-		first(os.Getenv("DATABASE_URL"), os.Getenv("POSTGRES_DSN")),
-		time.Duration(getenvInt("DATABASE_CONNECT_TIMEOUT_SECONDS", 5))*time.Second,
-	)
-	if reaped := store.ReapStaleAnalyzingRuns(); reaped > 0 {
-		log.Printf("reaped %d stale analyzing run(s) left by a previous process", reaped)
-	}
 	agentRequestTimeout := time.Duration(getenvInt("AGENT_REQUEST_TIMEOUT_SECONDS", 180)) * time.Second
 	if agentRequestTimeout <= 0 {
 		agentRequestTimeout = 180 * time.Second
@@ -251,6 +253,13 @@ func NewServer() *Server {
 	manualAgentRequestTimeout := time.Duration(getenvInt("MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS", 900)) * time.Second
 	if manualAgentRequestTimeout <= 0 {
 		manualAgentRequestTimeout = 900 * time.Second
+	}
+	store.ConnectDatabase(
+		first(os.Getenv("DATABASE_URL"), os.Getenv("POSTGRES_DSN")),
+		time.Duration(getenvInt("DATABASE_CONNECT_TIMEOUT_SECONDS", 5))*time.Second,
+	)
+	if reaped := store.ReapStaleAnalyzingRuns(agentRequestTimeout, manualAgentRequestTimeout); reaped > 0 {
+		log.Printf("reaped %d stale analyzing run(s) left by a previous process", reaped)
 	}
 	return &Server{
 		store:                     store,
@@ -260,6 +269,7 @@ func NewServer() *Server {
 		agentRequestTimeout:       agentRequestTimeout,
 		manualAgentRequestTimeout: manualAgentRequestTimeout,
 		client:                    &http.Client{},
+		agentSlots:                make(chan struct{}, maxConcurrentAgentRuns),
 	}
 }
 
@@ -547,7 +557,11 @@ func keyPart(value string) string {
 }
 
 func severity(alert Alert) string {
-	return first(alert.Labels["severity"], "warning")
+	value := strings.ToLower(first(alert.Labels["severity"], "warning"))
+	if value == "information" {
+		return "info"
+	}
+	return value
 }
 
 func ignoredAlert(alert Alert) bool {
@@ -560,7 +574,7 @@ func ignoredAlert(alert Alert) bool {
 }
 
 func status(value string) string {
-	if value == "resolved" {
+	if strings.EqualFold(strings.TrimSpace(value), "resolved") {
 		return "resolved"
 	}
 	return "firing"
@@ -726,10 +740,17 @@ func nextID(prefix string, seq int64) string {
 
 func excerpt(value string, limit int) string {
 	value = strings.TrimSpace(value)
+	if limit <= 0 {
+		return ""
+	}
 	if len(value) <= limit {
 		return value
 	}
-	return strings.TrimSpace(value[:limit]) + "..."
+	end := limit
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return strings.TrimSpace(value[:end]) + "..."
 }
 
 func mustJSON(value any) []byte {
@@ -762,15 +783,22 @@ type paginationInfo struct {
 
 func paginatedEnvelope(data any, page paginationRequest, total int) map[string]any {
 	payload := envelope(data)
+	offset := page.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
 	limit := page.Limit
 	if limit <= 0 {
-		limit = total
+		limit = total - offset
 	}
 	payload["pagination"] = paginationInfo{
 		Total:   total,
 		Limit:   limit,
-		Offset:  page.Offset,
-		HasMore: page.Offset+limit < total,
+		Offset:  offset,
+		HasMore: offset+limit < total,
 	}
 	return payload
 }

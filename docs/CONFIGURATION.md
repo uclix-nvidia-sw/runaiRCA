@@ -55,7 +55,6 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `ENABLE_NAT_RUNTIME` | Run RCA synthesis through the NeMo Agent Toolkit CLI instead of the deterministic in-process fallback, default `false` |
 | `NAT_CONFIG_FILE` | Optional NeMo workflow config path, default `configs/runai_rca_workflow.yml` |
 | `NAT_TIMEOUT_SECONDS` | NeMo Agent Toolkit CLI execution timeout |
-| `VITE_ENABLE_MOCK_DATA` | Frontend local-dev sample data toggle; Helm uses `frontend.config.enableMockData` |
 
 The Helm chart does not expose Loki credential values because the default
 deployment is expected to query Loki through the in-cluster read/query service.
@@ -122,8 +121,7 @@ Frequently tuned Helm values:
 | `agent.env.kubernetesListLimit` / `agent.env.lokiQueryLimit` | Evidence volume controls for Kubernetes list calls and Loki log query groups |
 | `agent.env.troubleshootingCasesFile` / `agent.env.agentSoulsFile` | Paths for injected troubleshooting memory and agent role contracts |
 | `agent.env.maskingRegexListJson` / `builtinRedaction*` | Cluster-specific secret masking regexes plus built-in redaction enable/hash controls |
-| `frontend.config.apiBaseUrl` | Browser API base URL when not using the bundled nginx `/api` proxy; accepts absolute URLs, `/api`-style paths, or localhost host:port values |
-| `frontend.config.enableMockData` | Show sample dashboard records when no live incidents or alerts exist, or when the local dev backend is unavailable; default `false` in Helm |
+| `frontend.config.apiBaseUrl` | Browser API origin when not using the bundled nginx `/api` proxy; leave empty for the default proxy, or use an absolute URL / localhost host:port for an external backend |
 | `frontend.nginx.*` | Frontend nginx proxy timeout and body-size controls for REST, webhook, and SSE traffic; defaults keep event streams open for one hour |
 | `backend.extraEnv`, `agent.extraEnv`, `frontend.extraEnv` | Additional container env entries for deployment-specific settings |
 | `podAnnotations` / `podLabels` | Global pod metadata applied to Backend, Agent, Frontend, and bundled Postgres |
@@ -150,13 +148,6 @@ you use `--set`, escape dots and use `--set-string`, for example:
 helm upgrade --install runai-rca charts/runai-rca \
   --set-string 'backend.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-type=nlb'
 ```
-
-Mock data is a frontend-only sample mode. It is enabled by default during Vite
-local development, disabled by default in Helm/static deployments, and is shown
-after the Backend returns empty incident, alert, and analysis-run lists, or when
-the local dev Backend is unavailable. As soon as real incident, alert, or
-analysis-run data is returned by the Backend, the UI uses the live values and
-does not mix mock records into Operations, Analysis, Evidence, or Agents.
 
 When `DATABASE_URL` is configured, the backend creates and uses `incidents`,
 `alerts`, `incident_embeddings`, `rca_feedback`, `rca_comments`, and

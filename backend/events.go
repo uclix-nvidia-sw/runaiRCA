@@ -89,13 +89,13 @@ func analysisStartedEvent(runID, source, targetType, targetID, incidentID, alert
 	}}
 }
 
-func analysisCompletedEvent(runID, source, status, incidentID, alertID string) Event {
+func analysisCompletedEvent(runID, source, status, targetType, targetID, incidentID, alertID string) Event {
 	return Event{Type: eventAnalysisCompleted, Data: map[string]any{
 		"run_id":      runID,
 		"source":      first(source, "auto"),
 		"status":      first(status, "complete"),
-		"target_type": "alert",
-		"target_id":   alertID,
+		"target_type": targetType,
+		"target_id":   targetID,
 		"incident_id": incidentID,
 		"alert_id":    alertID,
 	}}

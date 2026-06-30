@@ -15,7 +15,10 @@ import (
 // (it must run offline next to the NeMo agent), so dense vectors are produced
 // deterministically from text with the feature-hashing trick. Changing this
 // value invalidates previously persisted vectors of a different dimension.
-const embeddingDim = 384
+const (
+	embeddingDim             = 384
+	maxFeedbackHintTextBytes = 800
+)
 
 type IncidentMemory struct {
 	IncidentID      string
@@ -39,26 +42,38 @@ func (s *Store) SimilarIncidentsForAlert(alert Alert, incidentID string, limit i
 func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int) []FeedbackHint {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	similar := s.similarIncidentsLocked(alert, incidentID, capSimilarIncidentLimit(limit))
+	limit = capSimilarIncidentLimit(limit)
+	similar := s.similarIncidentsLocked(alert, incidentID, limit)
 	hints := make([]FeedbackHint, 0, limit)
+	seenComments := map[string]struct{}{}
 	for _, item := range similar {
 		if item.PositiveFeedback > 0 {
 			hints = append(hints, FeedbackHint{
 				SourceID:  item.IncidentID,
 				Sentiment: "positive",
 				Weight:    item.Similarity,
-				Text:      fmt.Sprintf("Operators found this prior RCA useful: %s", item.AnalysisSummary),
+				Text:      excerpt(fmt.Sprintf("Operators found this prior RCA useful: %s", item.AnalysisSummary), maxFeedbackHintTextBytes),
 			})
+			if len(hints) >= limit {
+				return hints
+			}
 		}
 		if item.NegativeFeedback > 0 {
 			hints = append(hints, FeedbackHint{
 				SourceID:  item.IncidentID,
 				Sentiment: "negative",
 				Weight:    item.Similarity,
-				Text:      fmt.Sprintf("Operators pushed back on this prior RCA: %s", item.AnalysisSummary),
+				Text:      excerpt(fmt.Sprintf("Operators pushed back on this prior RCA: %s", item.AnalysisSummary), maxFeedbackHintTextBytes),
 			})
+			if len(hints) >= limit {
+				return hints
+			}
 		}
 		for _, comment := range s.commentsForTargetLocked("incident", item.IncidentID) {
+			if _, ok := seenComments[comment.CommentID]; ok {
+				continue
+			}
+			seenComments[comment.CommentID] = struct{}{}
 			if len(hints) >= limit {
 				return hints
 			}
@@ -66,8 +81,11 @@ func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int)
 				SourceID:  item.IncidentID,
 				Sentiment: "comment",
 				Weight:    item.Similarity,
-				Text:      comment.Body,
+				Text:      excerpt(comment.Body, maxFeedbackHintTextBytes),
 			})
+			if len(hints) >= limit {
+				return hints
+			}
 		}
 		if len(hints) >= limit {
 			return hints
@@ -132,10 +150,7 @@ func (s *Store) SearchIncidentMemory(query string, limit int) []SimilarIncident 
 		}
 		return results[i].Similarity > results[j].Similarity
 	})
-	if len(results) > limit {
-		return results[:limit]
-	}
-	return results
+	return dedupeSimilarByIncident(results, limit)
 }
 
 func (s *Store) ApplyAnalysis(alertID string, response AgentAnalysisResponse) {
@@ -159,7 +174,33 @@ func (s *Store) ApplyAnalysisForRun(runID string, alertID string, response Agent
 	if alert == nil || !s.isLatestAnalysisRunForAlertLocked(runID, alertID) {
 		return false
 	}
-	s.applyAnalysisLocked(alert, response)
+	before := cloneAlert(alert)
+	alert.AnalysisSummary = response.AnalysisSummary
+	alert.AnalysisDetail = response.AnalysisDetail
+	if alert.AnalysisDetail == "" {
+		alert.AnalysisDetail = response.Analysis
+	}
+	alert.AnalysisQuality = response.AnalysisQuality
+	alert.Capabilities = response.Capabilities
+	alert.MissingData = response.MissingData
+	alert.Warnings = response.Warnings
+	alert.Artifacts = response.Artifacts
+	alert.IsAnalyzing = false
+	if !s.persistAlertLocked(alert) {
+		*alert = *before
+		alert.IsAnalyzing = false
+		if incident := s.incidents[alert.IncidentID]; incident != nil {
+			s.refreshIncidentAnalyzingLocked(incident.IncidentID)
+			s.persistIncidentLocked(incident)
+		}
+		s.persistAlertLocked(alert)
+		return false
+	}
+	if incident := s.incidents[alert.IncidentID]; incident != nil {
+		s.refreshIncidentAnalyzingLocked(incident.IncidentID)
+		s.upsertMemoryLocked(incident, alert)
+		s.persistIncidentLocked(incident)
+	}
 	return true
 }
 
@@ -206,8 +247,8 @@ func (s *Store) BeginAnalyzing(incidentID string, alertID string) {
 	}
 }
 
-// BeginManualAnalysis clears the visible RCA before a dashboard-triggered
-// reanalysis so operators can see a fresh run is in progress.
+// BeginManualAnalysis marks a dashboard-triggered reanalysis in progress while
+// keeping the last good RCA visible until a fresh result replaces it.
 func (s *Store) BeginManualAnalysis(incidentID string, alertID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -216,13 +257,6 @@ func (s *Store) BeginManualAnalysis(incidentID string, alertID string) {
 		s.persistIncidentLocked(incident)
 	}
 	if alert := s.alerts[alertID]; alert != nil {
-		alert.AnalysisSummary = ""
-		alert.AnalysisDetail = ""
-		alert.AnalysisQuality = ""
-		alert.Capabilities = map[string]string{}
-		alert.MissingData = []string{}
-		alert.Warnings = []string{}
-		alert.Artifacts = []Artifact{}
 		alert.IsAnalyzing = true
 		s.persistAlertLocked(alert)
 	}
@@ -337,7 +371,7 @@ func (s *Store) upsertMemoryLocked(incident *Incident, alert *AlertRecord) {
 		CreatedAt:       time.Now().UTC(),
 	}
 	memory.Vector = textVector(memoryText(*memory))
-	s.memories[memory.IncidentID] = memory
+	s.memories[first(memory.AlertID, memory.IncidentID)] = memory
 	s.persistMemoryLocked(memory)
 }
 
@@ -384,10 +418,23 @@ func (s *Store) similarIncidentsLocked(
 		}
 		return results[i].Similarity > results[j].Similarity
 	})
-	if len(results) > limit {
-		return results[:limit]
+	return dedupeSimilarByIncident(results, limit)
+}
+
+func dedupeSimilarByIncident(results []SimilarIncident, limit int) []SimilarIncident {
+	deduped := results[:0]
+	seen := map[string]struct{}{}
+	for _, result := range results {
+		if _, ok := seen[result.IncidentID]; ok {
+			continue
+		}
+		seen[result.IncidentID] = struct{}{}
+		deduped = append(deduped, result)
+		if len(deduped) >= limit {
+			break
+		}
 	}
-	return results
+	return deduped
 }
 
 func alertSearchText(alert Alert) string {

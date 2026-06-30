@@ -8,8 +8,8 @@ import (
 )
 
 // AnalysisRun is a single lifecycle record for an analysis request. Automatic
-// webhook analysis is incident-scoped and idempotent; explicit operator
-// requests still create their own runs so manual follow-up remains auditable.
+// webhook analysis is alert-scoped and idempotent; explicit operator requests
+// still create their own runs so manual follow-up remains auditable.
 type AnalysisRun struct {
 	RunID           string            `json:"run_id"`
 	Source          string            `json:"source"`
@@ -39,6 +39,9 @@ func (s *Server) startAnalysisRun(targetType string, targetID string, source str
 	if !ok {
 		return nil, false
 	}
+	if source == "auto" && status(alert.Status) == "resolved" {
+		return nil, false
+	}
 	if source == "manual" && strings.TrimSpace(prompt) == "" {
 		prompt = s.store.OperatorPromptForTarget(targetType, targetID)
 	}
@@ -52,6 +55,9 @@ func (s *Server) startAnalysisRun(targetType string, targetID string, source str
 		prompt,
 	)
 	if !created {
+		if run.RunID == "" {
+			return nil, false
+		}
 		return &run, false
 	}
 	if source == "manual" {
@@ -87,30 +93,107 @@ func (s *Server) requestAnalysisRun(
 		alert.Annotations["operator_prompt"] = prompt
 	}
 
+	releaseAgentSlot, ok := s.acquireAgentSlot(s.analysisRequestTimeout(source))
+	if !ok {
+		fallback := fallbackAnalysis(alert, &AgentError{Kind: agentErrBusy, Err: errors.New("too many analysis requests are already running")})
+		run, ok := s.store.FailAnalysisRun(runID, fallback)
+		if !ok {
+			return
+		}
+		s.store.ApplyFallbackAnalysisIfAbsentForRun(runID, alertID, fallback)
+		s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
+		return
+	}
+	defer releaseAgentSlot()
+
 	occurrencePods, occurrenceCount := s.store.OccurrenceSummaryForTarget(incidentID, alertID)
 	req := AgentAnalysisRequest{
-		Alert:            alert,
+		Alert:            compactAgentAlert(alert),
 		ThreadTS:         threadTS,
 		IncidentID:       incidentID,
 		AnalysisType:     first(source, status(alert.Status)),
 		Language:         s.language,
 		OccurrenceCount:  occurrenceCount,
 		OccurrencePods:   occurrencePods,
-		SimilarIncidents: s.store.SimilarIncidentsForAlert(alert, incidentID, similarIncidentLimit),
+		SimilarIncidents: compactAgentSimilarIncidents(s.store.SimilarIncidentsForAlert(alert, incidentID, similarIncidentLimit)),
 		FeedbackHints:    s.store.FeedbackHintsForAlert(alert, incidentID, similarIncidentLimit),
 	}
 
 	analysis, err := s.callAnalyze(req, s.analysisRequestTimeout(source))
 	if err != nil {
 		fallback := fallbackAnalysis(alert, err)
-		run, _ := s.store.FailAnalysisRun(runID, fallback)
+		run, ok := s.store.FailAnalysisRun(runID, fallback)
+		if !ok {
+			return
+		}
 		s.store.ApplyFallbackAnalysisIfAbsentForRun(runID, alertID, fallback)
 		s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
 		return
 	}
-	run, _ := s.store.CompleteAnalysisRun(runID, analysis)
-	s.store.ApplyAnalysisForRun(runID, alertID, analysis)
+	run, ok := s.store.CompleteAnalysisRun(runID, analysis)
+	if !ok {
+		return
+	}
+	if !s.store.ApplyAnalysisForRun(runID, alertID, analysis) {
+		if failedRun, ok := s.store.FailAnalysisRun(runID, analysisPersistenceFailure(alert)); ok {
+			run = failedRun
+		}
+		s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
+		return
+	}
 	s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
+}
+
+const maxAgentMapValueBytes = 4000
+
+func compactAgentAlert(alert Alert) Alert {
+	alert.Labels = compactAgentStringMap(alert.Labels)
+	alert.Annotations = compactAgentStringMap(alert.Annotations)
+	return alert
+}
+
+func compactAgentStringMap(in map[string]string) map[string]string {
+	out := cloneMap(in)
+	for key, value := range out {
+		out[key] = excerpt(value, maxAgentMapValueBytes)
+	}
+	return out
+}
+
+func compactAgentSimilarIncidents(items []SimilarIncident) []SimilarIncident {
+	out := make([]SimilarIncident, 0, len(items))
+	for _, item := range items {
+		item.Title = excerpt(item.Title, 120)
+		item.AnalysisSummary = excerpt(item.AnalysisSummary, 800)
+		item.AnalysisDetail = ""
+		item.Labels = nil
+		out = append(out, item)
+	}
+	return out
+}
+
+func analysisPersistenceFailure(alert Alert) AgentAnalysisResponse {
+	name := first(alert.Labels["alertname"], "Run:AI alert")
+	summary := fmt.Sprintf("%s analysis completed, but alert RCA could not be persisted", name)
+	detail := strings.Join([]string{
+		"## Root Cause",
+		"",
+		"Agent analysis completed, but the backend could not persist the RCA to the alert row.",
+		"",
+		"## Recommended Actions",
+		"",
+		"Check Postgres health and retry the analysis.",
+	}, "\n")
+	return AgentAnalysisResponse{
+		Status:          "error",
+		Analysis:        detail,
+		AnalysisSummary: summary,
+		AnalysisDetail:  detail,
+		AnalysisQuality: "low",
+		Capabilities:    map[string]string{"database": "alert_persist_failed"},
+		MissingData:     []string{"alerts.persistence"},
+		Warnings:        []string{"alert RCA persistence failed"},
+	}
 }
 
 func (s *Server) analysisRequestTimeout(source string) time.Duration {
@@ -120,9 +203,23 @@ func (s *Server) analysisRequestTimeout(source string) time.Duration {
 	return s.agentRequestTimeout
 }
 
+func (s *Server) acquireAgentSlot(timeout time.Duration) (func(), bool) {
+	if s.agentSlots == nil {
+		return func() {}, true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case s.agentSlots <- struct{}{}:
+		return func() { <-s.agentSlots }, true
+	case <-timer.C:
+		return nil, false
+	}
+}
+
 func (s *Server) broadcastAnalysisRunCompleted(run AnalysisRun, incidentID string, alertID string) {
 	status := first(run.Status, "complete")
-	s.hub.Broadcast(analysisCompletedEvent(run.RunID, run.Source, status, incidentID, alertID))
+	s.hub.Broadcast(analysisCompletedEvent(run.RunID, run.Source, status, run.TargetType, run.TargetID, incidentID, alertID))
 }
 
 func sourceTitle(source string) string {

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestAlertmanagerWebhookCreatesIncidentAndAlert(t *testing.T) {
@@ -114,8 +115,8 @@ func TestAlertmanagerWebhookGroupsDiskPressureStormIntoOneAutoAnalysis(t *testin
 	if len(groupedAlerts) != 1 || groupedAlerts[0].OccurrenceCount != 3 {
 		t.Fatalf("expected one grouped alert row with three occurrences, got %+v", groupedAlerts)
 	}
-	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 || runs[0].TargetType != "incident" {
-		t.Fatalf("expected one incident-level analysis run, got %+v", runs)
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 || runs[0].TargetType != "alert" || runs[0].AlertID != groupedAlerts[0].AlertID {
+		t.Fatalf("expected one grouped-alert analysis run, got %+v", runs)
 	}
 }
 
@@ -301,6 +302,47 @@ func TestListAlertsSupportsPagination(t *testing.T) {
 	}
 }
 
+func TestListAlertsPaginationClampsOffsetBeyondTotal(t *testing.T) {
+	server := NewServer()
+	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
+	for i, workload := range []string{"scheduler", "queue-controller"} {
+		server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "page-clamp-" + strconv.Itoa(i)}, Alert{
+			Status: "firing",
+			Labels: map[string]string{
+				"alertname": "RunAIQueueBlocked",
+				"severity":  "warning",
+				"namespace": "monitoring",
+				"pod":       workload + "-" + strconv.Itoa(i),
+			},
+			Annotations: map[string]string{"summary": "Run:AI queue blocked"},
+			StartsAt:    base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
+			Fingerprint: "fp-page-clamp-" + strconv.Itoa(i),
+		})
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/alerts?limit=1&offset=99", nil)
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var response struct {
+		Status     string         `json:"status"`
+		Data       []AlertRecord  `json:"data"`
+		Pagination paginationInfo `json:"pagination"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Data) != 0 {
+		t.Fatalf("expected empty page past the end, got %d item(s)", len(response.Data))
+	}
+	if response.Pagination.Total != 2 || response.Pagination.Limit != 1 || response.Pagination.Offset != 2 || response.Pagination.HasMore {
+		t.Fatalf("unexpected pagination: %+v", response.Pagination)
+	}
+}
+
 func TestDashboardSnapshotCountsAllRowsButBoundsRecentItems(t *testing.T) {
 	store := NewStore()
 	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
@@ -391,6 +433,70 @@ func TestLatestAlertIDPrefersNewestFiringAlert(t *testing.T) {
 	store.mu.Unlock()
 	if got := store.LatestAlertID(); got != resolved.AlertID {
 		t.Fatalf("expected newest resolved alert when no firing alert remains, got %s", got)
+	}
+}
+
+func TestIncidentAnalysisTargetPrefersFiringAlert(t *testing.T) {
+	store := NewStore()
+	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
+	incident, firing := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "analysis-target-firing"}, Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIQueueBlocked",
+			"severity":  "warning",
+		},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-analysis-target-firing",
+		StartsAt:    base.Format(time.RFC3339),
+	})
+	resolvedAt := base.Add(time.Hour)
+	store.mu.Lock()
+	store.alerts["ALR-analysis-target-resolved"] = &AlertRecord{
+		AlertID:     "ALR-analysis-target-resolved",
+		IncidentID:  incident.IncidentID,
+		AlarmTitle:  "Recovered alert",
+		Severity:    "warning",
+		Status:      "resolved",
+		FiredAt:     resolvedAt,
+		ResolvedAt:  &resolvedAt,
+		Fingerprint: "fp-analysis-target-resolved",
+		ThreadTS:    "thread-resolved",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue recovered"},
+	}
+	store.mu.Unlock()
+
+	alert, _, alertID, _, _, ok := store.AnalysisTarget("incident", incident.IncidentID)
+	if !ok || alertID != firing.AlertID || status(alert.Status) != "firing" {
+		t.Fatalf("expected firing alert target, got ok=%t alertID=%s alert=%+v", ok, alertID, alert)
+	}
+}
+
+func TestIncidentSeverityNormalizesCaseBeforeRanking(t *testing.T) {
+	store := NewStore()
+	webhook := AlertmanagerWebhook{GroupKey: "severity-case"}
+	incident, _ := store.UpsertAlert(webhook, Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIQueueBlocked",
+			"severity":  "Critical",
+		},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+	})
+	if incident.Severity != "critical" {
+		t.Fatalf("expected severity to be canonicalized, got %q", incident.Severity)
+	}
+
+	incident, _ = store.UpsertAlert(webhook, Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIQueueBlocked",
+			"severity":  "warning",
+		},
+		Annotations: map[string]string{"summary": "Queue still blocked"},
+	})
+	if incident.Severity != "critical" {
+		t.Fatalf("warning alert should not downgrade critical incident, got %q", incident.Severity)
 	}
 }
 
@@ -487,6 +593,104 @@ func TestAlertmanagerWebhookReportsAcceptedAndIgnoredCounts(t *testing.T) {
 	}
 }
 
+func TestAlertmanagerWebhookSkipsAutoAnalysisForResolvedOnlyIncident(t *testing.T) {
+	server := NewServer()
+	payload, _ := json.Marshal(AlertmanagerWebhook{
+		GroupKey: "resolved-only",
+		Alerts: []Alert{{
+			Status:      "Resolved",
+			Labels:      map[string]string{"alertname": "RunAIWorkloadPending", "severity": "warning"},
+			Annotations: map[string]string{"summary": "Workload recovered"},
+			Fingerprint: "fp-resolved-only",
+		}},
+	})
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload)))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 0 {
+		t.Fatalf("resolved-only webhook should not start auto analysis, got %+v", runs)
+	}
+	alerts := server.store.ListAlerts()
+	if len(alerts) != 1 || alerts[0].Status != "resolved" {
+		t.Fatalf("resolved status should be canonicalized, got %+v", alerts)
+	}
+}
+
+func TestAlertmanagerWebhookSkipsAutoAnalysisWhenAlertResolvesInSamePayload(t *testing.T) {
+	server := NewServer()
+	payload, _ := json.Marshal(AlertmanagerWebhook{
+		GroupKey: "firing-then-resolved",
+		Alerts: []Alert{
+			{
+				Status:      "firing",
+				Labels:      map[string]string{"alertname": "RunAIWorkloadPending", "severity": "warning"},
+				Annotations: map[string]string{"summary": "Workload pending"},
+				Fingerprint: "fp-firing-then-resolved",
+			},
+			{
+				Status:      "resolved",
+				Labels:      map[string]string{"alertname": "RunAIWorkloadPending", "severity": "warning"},
+				Annotations: map[string]string{"summary": "Workload recovered"},
+				Fingerprint: "fp-firing-then-resolved",
+			},
+		},
+	})
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload)))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["auto_analyses"].(float64) != 0 {
+		t.Fatalf("resolved final state should not start auto analysis, got %+v", response)
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 0 {
+		t.Fatalf("resolved final state should not create analysis runs, got %+v", runs)
+	}
+	alerts := server.store.ListAlerts()
+	if len(alerts) != 1 || alerts[0].Status != "resolved" {
+		t.Fatalf("expected final alert status resolved, got %+v", alerts)
+	}
+}
+
+func TestAlertmanagerWebhookAnalyzesNewIncidentWhenFiringFollowsResolved(t *testing.T) {
+	server := NewServer()
+	payload, _ := json.Marshal(AlertmanagerWebhook{
+		GroupKey: "resolved-then-firing",
+		Alerts: []Alert{
+			{
+				Status:      "resolved",
+				Labels:      map[string]string{"alertname": "RunAIWorkloadPending", "severity": "warning"},
+				Annotations: map[string]string{"summary": "Workload recovered"},
+			},
+			{
+				Status:      "firing",
+				Labels:      map[string]string{"alertname": "RunAIWorkloadPending", "severity": "warning"},
+				Annotations: map[string]string{"summary": "Workload pending again"},
+			},
+		},
+	})
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload)))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 {
+		t.Fatalf("firing alert on new incident should start one auto analysis, got %+v", runs)
+	}
+}
+
 func TestAlertmanagerWebhookRejectsTooManyAlerts(t *testing.T) {
 	server := NewServer()
 	alerts := make([]Alert, maxWebhookAlerts+1)
@@ -534,6 +738,29 @@ func TestChatRejectsOversizedBody(t *testing.T) {
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected 413, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestChatRejectsOversizedMessage(t *testing.T) {
+	server := NewServer()
+	payload, _ := json.Marshal(ChatRequest{Message: strings.Repeat("x", maxChatMessageBytes+1)})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestExcerptDoesNotSplitUTF8(t *testing.T) {
+	got := excerpt("한글 alert", 4)
+	if !utf8.ValidString(got) {
+		t.Fatalf("excerpt returned invalid UTF-8: %q", got)
+	}
+	if got != "한..." {
+		t.Fatalf("excerpt should stop at rune boundary, got %q", got)
 	}
 }
 
@@ -612,6 +839,186 @@ func TestChatRouteProxiesContextualRCARequestToAgent(t *testing.T) {
 	}
 	if _, ok := agentReq.Context["agent_runtime"]; !ok {
 		t.Fatalf("expected agent runtime context, got %+v", agentReq.Context)
+	}
+}
+
+func TestIncidentChatContextSummarizesAlerts(t *testing.T) {
+	alerts := []AlertRecord{{
+		AlertID:         "ALR-chat-context",
+		AlarmTitle:      "RunAIQueueBlocked",
+		Severity:        "warning",
+		Status:          "firing",
+		AnalysisSummary: "large RCA summary",
+		AnalysisDetail:  strings.Repeat("detail ", 100),
+		Labels:          map[string]string{"queue": "gpu-a"},
+	}}
+	for i := 0; i < dashboardChatRecentLimit+2; i++ {
+		alerts = append(alerts, AlertRecord{
+			AlertID:    "ALR-chat-extra-" + strconv.Itoa(i),
+			AlarmTitle: strings.Repeat("extra-title-", 20),
+			Severity:   "warning",
+			Status:     "firing",
+		})
+	}
+	context := incidentChatContext(&IncidentDetail{
+		Incident: Incident{
+			IncidentID: "INC-chat-context",
+			Title:      "Queue blocked",
+			Severity:   "warning",
+			Status:     "firing",
+		},
+		Feedback: FeedbackSummary{
+			Positive: 1,
+			Comments: []CommentRecord{{
+				Body: strings.Repeat("operator comment ", 100),
+			}},
+		},
+		SimilarIncidents: []SimilarIncident{{
+			IncidentID:      "INC-prior-chat",
+			AlertID:         "ALR-prior-chat",
+			Title:           strings.Repeat("prior-title-", 20),
+			Similarity:      0.91,
+			AnalysisSummary: strings.Repeat("summary ", 200),
+			AnalysisDetail:  strings.Repeat("detail ", 500),
+		}},
+		Alerts: alerts,
+	})
+
+	contextAlerts, ok := context["alerts"].([]map[string]any)
+	if !ok || len(contextAlerts) != dashboardChatRecentLimit {
+		t.Fatalf("expected summarized alert context, got %+v", context["alerts"])
+	}
+	if contextAlerts[0]["alert_id"] != "ALR-chat-context" || contextAlerts[0]["title"] != "RunAIQueueBlocked" {
+		t.Fatalf("alert summary lost identity fields: %+v", contextAlerts[0])
+	}
+	if _, ok := contextAlerts[0]["analysis_detail"]; ok {
+		t.Fatalf("chat context should not include full alert RCA detail: %+v", contextAlerts[0])
+	}
+	if _, ok := contextAlerts[0]["labels"]; ok {
+		t.Fatalf("chat context should not include full alert labels: %+v", contextAlerts[0])
+	}
+	if context["omitted_alerts"] != 3 {
+		t.Fatalf("expected omitted alert count, got %+v", context["omitted_alerts"])
+	}
+	if title, _ := contextAlerts[1]["title"].(string); len(title) > 123 || !strings.HasSuffix(title, "...") {
+		t.Fatalf("alert titles should be capped, got %q", title)
+	}
+	feedback, ok := context["feedback"].(map[string]any)
+	if !ok || feedback["comment_count"] != 1 {
+		t.Fatalf("expected summarized feedback context, got %+v", context["feedback"])
+	}
+	if _, ok := feedback["comments"]; ok {
+		t.Fatalf("chat context should not include full feedback comments: %+v", feedback)
+	}
+	similar, ok := context["similar_incidents"].([]map[string]any)
+	if !ok || len(similar) != 1 {
+		t.Fatalf("expected compact similar incident context, got %+v", context["similar_incidents"])
+	}
+	if _, ok := similar[0]["analysis_detail"]; ok {
+		t.Fatalf("chat context should not include similar incident detail: %+v", similar[0])
+	}
+	if title, _ := similar[0]["title"].(string); len(title) > 123 || !strings.HasSuffix(title, "...") {
+		t.Fatalf("similar incident title should be capped, got %q", title)
+	}
+	if summary, _ := similar[0]["analysis_summary"].(string); len(summary) > 803 || !strings.HasSuffix(summary, "...") {
+		t.Fatalf("similar incident summary should be capped, got len=%d", len(summary))
+	}
+}
+
+func TestChatContextDropsClientSuppliedPayload(t *testing.T) {
+	server := NewServer()
+	incident, alert := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "chat-context-trim"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-chat-context-trim",
+	})
+
+	req := server.enrichChatRequest(ChatRequest{
+		Message:         "compare RCA",
+		ConversationID:  strings.Repeat("conversation-", 40),
+		Language:        strings.Repeat("language-", 40),
+		Page:            strings.Repeat("page-", 80),
+		IncidentContent: strings.Repeat("client supplied RCA ", 400),
+		Context: map[string]any{
+			"incident_id":      incident.IncidentID,
+			"dashboard_state":  map[string]any{"fake": true},
+			"untrusted_blob":   strings.Repeat("x", 4096),
+			"similar_incident": strings.Repeat("y", 4096),
+		},
+	})
+
+	if req.IncidentID != incident.IncidentID {
+		t.Fatalf("incident id from context should still be honored, got %q", req.IncidentID)
+	}
+	if strings.Contains(req.IncidentContent, "client supplied RCA") {
+		t.Fatalf("client-supplied incident content should be replaced with server context")
+	}
+	if len(req.ConversationID) > maxChatMetadataBytes+len("...") ||
+		len(req.Language) > maxChatMetadataBytes+len("...") ||
+		len(req.Page) > maxChatMetadataBytes+len("...") {
+		t.Fatalf("chat metadata should be capped, got conversation=%d language=%d page=%d", len(req.ConversationID), len(req.Language), len(req.Page))
+	}
+	if req.Context["page"] != req.Page {
+		t.Fatalf("context page should use capped page metadata")
+	}
+	missing := server.enrichChatRequest(ChatRequest{
+		Message:         "compare RCA",
+		IncidentID:      "INC-missing",
+		IncidentTitle:   "client title",
+		IncidentContent: strings.Repeat("client supplied RCA ", 400),
+		AlertTitle:      "client alert",
+		AlertContent:    strings.Repeat("client alert RCA ", 400),
+	})
+	if missing.IncidentTitle != "" || missing.IncidentContent != "" || missing.AlertTitle != "" || missing.AlertContent != "" {
+		t.Fatalf("client-supplied content should be dropped for missing targets: %+v", missing)
+	}
+	mismatched := server.enrichChatRequest(ChatRequest{
+		Message:    "compare RCA",
+		IncidentID: "INC-wrong",
+		AlertID:    alert.AlertID,
+	})
+	if mismatched.IncidentID != incident.IncidentID {
+		t.Fatalf("alert context should correct mismatched incident id, got %q", mismatched.IncidentID)
+	}
+	alertContext, ok := mismatched.Context["alert"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected sanitized alert context, got %+v", mismatched.Context["alert"])
+	}
+	if _, ok := alertContext["labels"]; ok {
+		t.Fatalf("alert context should not include full labels: %+v", alertContext)
+	}
+	if _, ok := alertContext["annotations"]; ok {
+		t.Fatalf("alert context should not include full annotations: %+v", alertContext)
+	}
+	if _, ok := alertContext["artifacts"]; ok {
+		t.Fatalf("alert context should not include full artifacts: %+v", alertContext)
+	}
+	if _, ok := req.Context["untrusted_blob"]; ok {
+		t.Fatalf("client-supplied context leaked to agent payload: %+v", req.Context)
+	}
+	if _, ok := req.Context["similar_incident"]; ok {
+		t.Fatalf("client-supplied similar context leaked to agent payload: %+v", req.Context)
+	}
+	targetType, targetID, inferred := server.chatAnalysisTarget(req)
+	if targetType != "incident" || targetID != incident.IncidentID || inferred {
+		t.Fatalf("chat target should use sanitized incident id, got type=%q id=%q inferred=%t", targetType, targetID, inferred)
+	}
+	invalidAlert := server.enrichChatRequest(ChatRequest{
+		Message:    "compare RCA",
+		IncidentID: incident.IncidentID,
+		AlertID:    "ALR-missing",
+	})
+	if invalidAlert.AlertID != "" || invalidAlert.IncidentID != incident.IncidentID {
+		t.Fatalf("invalid alert id should fall back to incident target, got alert=%q incident=%q", invalidAlert.AlertID, invalidAlert.IncidentID)
+	}
+	targetType, targetID, inferred = server.chatAnalysisTarget(invalidAlert)
+	if targetType != "incident" || targetID != incident.IncidentID || inferred {
+		t.Fatalf("invalid alert should not block valid incident target, got type=%q id=%q inferred=%t", targetType, targetID, inferred)
+	}
+	state, ok := req.Context["dashboard_state"].(map[string]any)
+	if !ok || state["fake"] != nil {
+		t.Fatalf("dashboard_state should be server-generated, got %+v", req.Context["dashboard_state"])
 	}
 }
 
@@ -724,6 +1131,7 @@ func TestCommentUpdateCreatesAnalysisRun(t *testing.T) {
 		t.Fatalf("expected created comment, got %+v", createResponse.Data)
 	}
 	<-agentReqCh
+	waitForAnalysisRun(t, server, "comment")
 
 	updatePayload, _ := json.Marshal(CommentRequest{
 		Body:   "Use scheduler logs instead of quota as the primary cause.",
@@ -803,6 +1211,21 @@ func TestChatAnalysisRequestCreatesAnalysisRun(t *testing.T) {
 	run := waitForAnalysisRun(t, server, "chat")
 	if run.Status != "complete" || !strings.Contains(run.AnalysisSummary, "Chat-requested") {
 		t.Fatalf("unexpected analysis run: %+v", run)
+	}
+}
+
+func TestWantsAnalysisRunDoesNotTreatReplayAsReanalysis(t *testing.T) {
+	if wantsAnalysisRun("분석 결과 다시 보여줘") {
+		t.Fatalf("replaying an analysis result should not start a new agent run")
+	}
+	for _, message := range []string{
+		"이 RCA 분석 다시 돌려줘",
+		"지금 알람 분석해줘",
+		"분석 새로 시작해줘",
+	} {
+		if !wantsAnalysisRun(message) {
+			t.Fatalf("expected analysis request for %q", message)
+		}
 	}
 }
 
@@ -943,6 +1366,54 @@ func TestFeedbackAndSimilarIncidentMemory(t *testing.T) {
 	}
 }
 
+func TestIncidentMemoryKeepsMultipleAlertAnalyses(t *testing.T) {
+	store := NewStore()
+	incident, first := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "multi-memory"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning", "queue": "gpu-a"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-memory-first",
+	})
+	secondID := "ALR-memory-second"
+	store.mu.Lock()
+	store.alerts[secondID] = &AlertRecord{
+		AlertID:     secondID,
+		IncidentID:  incident.IncidentID,
+		AlarmTitle:  "Quota alert",
+		Severity:    "critical",
+		Status:      "firing",
+		FiredAt:     first.FiredAt.Add(time.Minute),
+		Fingerprint: "fp-memory-second",
+		ThreadTS:    "thread-" + secondID,
+		Labels:      map[string]string{"alertname": "RunAIQuotaBlocked", "severity": "critical", "queue": "gpu-a"},
+		Annotations: map[string]string{"summary": "Quota blocked"},
+	}
+	store.mu.Unlock()
+
+	store.ApplyAnalysis(first.AlertID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Queue saturation RCA.",
+		AnalysisDetail:  "Queue workers are waiting.",
+	})
+	store.ApplyAnalysis(secondID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Quota exhaustion RCA.",
+		AnalysisDetail:  "GPU quota is exhausted.",
+	})
+
+	if len(store.memories) != 2 {
+		t.Fatalf("expected two alert memories, got %+v", store.memories)
+	}
+	firstMemory := store.memories[first.AlertID]
+	if firstMemory == nil || firstMemory.AnalysisSummary != "Queue saturation RCA." {
+		t.Fatalf("first alert memory was overwritten: %+v", firstMemory)
+	}
+	secondMemory := store.memories[secondID]
+	if secondMemory == nil || secondMemory.AnalysisSummary != "Quota exhaustion RCA." {
+		t.Fatalf("second alert memory missing: %+v", secondMemory)
+	}
+}
+
 func TestSimilarIncidentsLimitAndLatestTieBreak(t *testing.T) {
 	store := NewStore()
 	alert := Alert{
@@ -983,6 +1454,239 @@ func TestSimilarIncidentsLimitAndLatestTieBreak(t *testing.T) {
 		if similar[i].IncidentID != want {
 			t.Fatalf("expected latest tie-break result %s at %d, got %+v", want, i, similar)
 		}
+	}
+}
+
+func TestSimilarIncidentsDedupesAlertMemoriesByIncident(t *testing.T) {
+	store := NewStore()
+	alert := Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIWorkloadPending",
+			"severity":  "warning",
+			"cluster":   "lab",
+			"namespace": "runai",
+			"pod":       "trainer-0",
+		},
+		Annotations: map[string]string{"summary": "GPU quota exhausted for trainer"},
+	}
+	base := time.Date(2026, 6, 26, 9, 0, 0, 0, time.UTC)
+	for _, item := range []struct {
+		alertID string
+		at      time.Time
+	}{
+		{"ALR-prior-old", base},
+		{"ALR-prior-new", base.Add(time.Minute)},
+	} {
+		store.memories[item.alertID] = &IncidentMemory{
+			IncidentID:      "INC-prior-shared",
+			AlertID:         item.alertID,
+			Title:           "RunAI workload pending",
+			Severity:        "warning",
+			Status:          "resolved",
+			AnalysisSummary: "GPU quota exhausted for trainer",
+			AnalysisDetail:  "Quota was expanded.",
+			Labels:          cloneMap(alert.Labels),
+			CreatedAt:       item.at,
+			Vector:          textVector(alertSearchText(alert)),
+		}
+	}
+
+	similar := store.SimilarIncidentsForAlert(alert, "INC-current", 5)
+	if len(similar) != 1 {
+		t.Fatalf("expected one similar incident per prior incident, got %+v", similar)
+	}
+	if similar[0].AlertID != "ALR-prior-new" {
+		t.Fatalf("expected latest tied alert memory to represent incident, got %+v", similar[0])
+	}
+	search := store.SearchIncidentMemory("GPU quota exhausted for trainer", 5)
+	if len(search) != 1 || search[0].IncidentID != "INC-prior-shared" {
+		t.Fatalf("expected search memory to dedupe by incident, got %+v", search)
+	}
+}
+
+func TestFeedbackHintsCapsInvalidLimit(t *testing.T) {
+	store := NewStore()
+	alert := Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIWorkloadPending",
+			"severity":  "warning",
+			"namespace": "runai",
+			"pod":       "trainer-0",
+		},
+		Annotations: map[string]string{"summary": "GPU quota exhausted for trainer"},
+	}
+	store.memories["INC-prior-hint"] = &IncidentMemory{
+		IncidentID:      "INC-prior-hint",
+		AlertID:         "ALR-prior-hint",
+		Title:           "RunAI workload pending",
+		Severity:        "warning",
+		Status:          "resolved",
+		AnalysisSummary: "GPU quota exhausted for trainer",
+		AnalysisDetail:  "Quota was expanded.",
+		Labels:          cloneMap(alert.Labels),
+		CreatedAt:       time.Now().UTC(),
+		Vector:          textVector(alertSearchText(alert)),
+	}
+	store.comments["CMT-prior-hint"] = &CommentRecord{
+		CommentID:  "CMT-prior-hint",
+		TargetType: "incident",
+		TargetID:   "INC-prior-hint",
+		IncidentID: "INC-prior-hint",
+		Body:       "operator note",
+		CreatedAt:  time.Now().UTC(),
+	}
+
+	hints := store.FeedbackHintsForAlert(alert, "INC-current", -1)
+	if len(hints) == 0 || hints[0].Text != "operator note" {
+		t.Fatalf("expected invalid limit to fall back to default hint cap, got %+v", hints)
+	}
+}
+
+func TestFeedbackHintsHonorsLimitAcrossVoteHints(t *testing.T) {
+	store := NewStore()
+	alert := Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIWorkloadPending",
+			"severity":  "warning",
+			"namespace": "runai",
+			"pod":       "trainer-0",
+		},
+		Annotations: map[string]string{"summary": "GPU quota exhausted for trainer"},
+	}
+	store.memories["ALR-prior-limit"] = &IncidentMemory{
+		IncidentID:      "INC-prior-limit",
+		AlertID:         "ALR-prior-limit",
+		Title:           "RunAI workload pending",
+		Severity:        "warning",
+		Status:          "resolved",
+		AnalysisSummary: "GPU quota exhausted for trainer",
+		AnalysisDetail:  "Quota was expanded.",
+		Labels:          cloneMap(alert.Labels),
+		CreatedAt:       time.Now().UTC(),
+		Vector:          textVector(alertSearchText(alert)),
+	}
+	store.feedback["FDB-prior-up"] = &FeedbackRecord{
+		FeedbackID: "FDB-prior-up",
+		TargetType: "incident",
+		TargetID:   "INC-prior-limit",
+		Vote:       "up",
+		Author:     "operator-a",
+		CreatedAt:  time.Now().UTC(),
+	}
+	store.feedback["FDB-prior-down"] = &FeedbackRecord{
+		FeedbackID: "FDB-prior-down",
+		TargetType: "incident",
+		TargetID:   "INC-prior-limit",
+		Vote:       "down",
+		Author:     "operator-b",
+		CreatedAt:  time.Now().UTC(),
+	}
+
+	hints := store.FeedbackHintsForAlert(alert, "INC-current", 1)
+	if len(hints) != 1 {
+		t.Fatalf("expected feedback hints to honor limit, got %+v", hints)
+	}
+}
+
+func TestFeedbackHintsCapHintText(t *testing.T) {
+	store := NewStore()
+	alert := Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIWorkloadPending",
+			"severity":  "warning",
+			"namespace": "runai",
+			"pod":       "trainer-0",
+		},
+		Annotations: map[string]string{"summary": "GPU quota exhausted for trainer"},
+	}
+	store.memories["ALR-prior-long-hint"] = &IncidentMemory{
+		IncidentID:      "INC-prior-long-hint",
+		AlertID:         "ALR-prior-long-hint",
+		Title:           "RunAI workload pending",
+		Severity:        "warning",
+		Status:          "resolved",
+		AnalysisSummary: strings.Repeat("quota summary ", 200),
+		AnalysisDetail:  "Quota was expanded.",
+		Labels:          cloneMap(alert.Labels),
+		CreatedAt:       time.Now().UTC(),
+		Vector:          textVector(alertSearchText(alert)),
+	}
+	store.feedback["FDB-prior-long-hint"] = &FeedbackRecord{
+		FeedbackID: "FDB-prior-long-hint",
+		TargetType: "incident",
+		TargetID:   "INC-prior-long-hint",
+		Vote:       "up",
+		Author:     "operator-a",
+		CreatedAt:  time.Now().UTC(),
+	}
+	store.comments["CMT-prior-long-hint"] = &CommentRecord{
+		CommentID:  "CMT-prior-long-hint",
+		TargetType: "incident",
+		TargetID:   "INC-prior-long-hint",
+		IncidentID: "INC-prior-long-hint",
+		Body:       strings.Repeat("operator comment ", 200),
+		CreatedAt:  time.Now().UTC(),
+	}
+
+	hints := store.FeedbackHintsForAlert(alert, "INC-current", 5)
+	if len(hints) < 2 {
+		t.Fatalf("expected vote and comment hints, got %+v", hints)
+	}
+	for _, hint := range hints {
+		if len(hint.Text) > maxFeedbackHintTextBytes+len("...") || !strings.HasSuffix(hint.Text, "...") {
+			t.Fatalf("feedback hint text should be capped, got len=%d text=%q", len(hint.Text), hint.Text)
+		}
+	}
+}
+
+func TestFeedbackHintsDedupesIncidentCommentsAcrossAlertMemories(t *testing.T) {
+	store := NewStore()
+	alert := Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIWorkloadPending",
+			"severity":  "warning",
+			"namespace": "runai",
+			"pod":       "trainer-0",
+		},
+		Annotations: map[string]string{"summary": "GPU quota exhausted for trainer"},
+	}
+	for _, alertID := range []string{"ALR-prior-a", "ALR-prior-b"} {
+		store.memories[alertID] = &IncidentMemory{
+			IncidentID:      "INC-prior-duplicate-comments",
+			AlertID:         alertID,
+			Title:           "RunAI workload pending",
+			Severity:        "warning",
+			Status:          "resolved",
+			AnalysisSummary: "GPU quota exhausted for trainer",
+			AnalysisDetail:  "Quota was expanded.",
+			Labels:          cloneMap(alert.Labels),
+			CreatedAt:       time.Now().UTC(),
+			Vector:          textVector(alertSearchText(alert)),
+		}
+	}
+	store.comments["CMT-duplicate-hint"] = &CommentRecord{
+		CommentID:  "CMT-duplicate-hint",
+		TargetType: "incident",
+		TargetID:   "INC-prior-duplicate-comments",
+		IncidentID: "INC-prior-duplicate-comments",
+		Body:       "same incident note",
+		CreatedAt:  time.Now().UTC(),
+	}
+
+	hints := store.FeedbackHintsForAlert(alert, "INC-current", 5)
+	commentHints := 0
+	for _, hint := range hints {
+		if hint.Sentiment == "comment" && hint.Text == "same incident note" {
+			commentHints++
+		}
+	}
+	if commentHints != 1 {
+		t.Fatalf("expected one deduped comment hint, got %d in %+v", commentHints, hints)
 	}
 }
 
@@ -1029,7 +1733,7 @@ func TestFlappingAlertGroupingUsesNamespaceWorkloadAndWindow(t *testing.T) {
 
 func TestResolveEndpointTogglesResolvedStatus(t *testing.T) {
 	server := NewServer()
-	incident, _ := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "resolve-toggle"}, Alert{
+	incident, record := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "resolve-toggle"}, Alert{
 		Status: "firing",
 		Labels: map[string]string{
 			"alertname": "RunAIWorkloadPending",
@@ -1039,6 +1743,11 @@ func TestResolveEndpointTogglesResolvedStatus(t *testing.T) {
 		},
 		Annotations: map[string]string{"summary": "Workload pending"},
 		Fingerprint: "fp-resolve-toggle",
+	})
+	server.store.ApplyAnalysis(record.AlertID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Pending workload RCA.",
+		AnalysisDetail:  "Quota blocked scheduling.",
 	})
 	path := "/api/v1/incidents/" + incident.IncidentID + "/resolve"
 
@@ -1051,6 +1760,9 @@ func TestResolveEndpointTogglesResolvedStatus(t *testing.T) {
 	if !ok || detail.Status != "resolved" || detail.ResolvedAt == nil {
 		t.Fatalf("expected incident to be resolved, got ok=%t detail=%+v", ok, detail)
 	}
+	if memory := server.store.memories[record.AlertID]; memory == nil || memory.Status != "resolved" {
+		t.Fatalf("expected alert memory to resolve with incident, got %+v", memory)
+	}
 
 	rec = httptest.NewRecorder()
 	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, nil))
@@ -1061,12 +1773,107 @@ func TestResolveEndpointTogglesResolvedStatus(t *testing.T) {
 	if !ok || detail.Status != "firing" || detail.ResolvedAt != nil {
 		t.Fatalf("expected second resolve click to reopen incident, got ok=%t detail=%+v", ok, detail)
 	}
+	if memory := server.store.memories[record.AlertID]; memory == nil || memory.Status != "firing" {
+		t.Fatalf("expected alert memory to reopen with incident, got %+v", memory)
+	}
 	var response map[string]string
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
 	if response["status"] != "firing" {
 		t.Fatalf("expected response status firing, got %+v", response)
+	}
+}
+
+func TestIncidentDetailAggregatesAlertAnalyses(t *testing.T) {
+	store := NewStore()
+	incident, first := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "aggregate-rca"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-aggregate-first",
+	})
+	secondID := "ALR-aggregate-second"
+	store.mu.Lock()
+	store.alerts[secondID] = &AlertRecord{
+		AlertID:     secondID,
+		IncidentID:  incident.IncidentID,
+		AlarmTitle:  "Quota alert",
+		Severity:    "critical",
+		Status:      "firing",
+		FiredAt:     first.FiredAt.Add(time.Minute),
+		Fingerprint: "fp-aggregate-second",
+		ThreadTS:    "thread-" + secondID,
+		Labels:      map[string]string{"alertname": "RunAIQuotaBlocked", "severity": "critical"},
+		Annotations: map[string]string{"summary": "Quota blocked"},
+	}
+	store.mu.Unlock()
+	store.ApplyAnalysis(first.AlertID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Queue saturation RCA.",
+		AnalysisDetail:  "Queue workers are waiting.",
+		AnalysisQuality: "medium",
+		MissingData:     []string{"loki.logs"},
+		Warnings:        []string{"partial logs"},
+		Artifacts:       []Artifact{{Agent: "runai", Source: "workloads", Type: "api", Status: "ok", Confidence: "high"}},
+	})
+	store.ApplyAnalysis(secondID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Quota exhaustion RCA.",
+		AnalysisDetail:  "GPU quota is exhausted.",
+		AnalysisQuality: "high",
+		MissingData:     []string{"loki.logs"},
+		Warnings:        []string{"partial logs"},
+		Artifacts:       []Artifact{{Agent: "runai", Source: "workloads", Type: "api", Status: "ok", Confidence: "high"}},
+	})
+
+	detail, ok := store.IncidentDetail(incident.IncidentID)
+	if !ok {
+		t.Fatalf("incident detail missing")
+	}
+	if !strings.Contains(detail.AnalysisSummary, "Queue saturation RCA.") ||
+		!strings.Contains(detail.AnalysisSummary, "Quota exhaustion RCA.") {
+		t.Fatalf("incident summary should aggregate alert RCA summaries, got %q", detail.AnalysisSummary)
+	}
+	if !strings.Contains(detail.AnalysisDetail, "Queue workers are waiting.") ||
+		!strings.Contains(detail.AnalysisDetail, "GPU quota is exhausted.") {
+		t.Fatalf("incident detail should aggregate alert RCA details, got %q", detail.AnalysisDetail)
+	}
+	if len(detail.MissingData) != 1 || len(detail.Warnings) != 1 || len(detail.Artifacts) != 1 {
+		t.Fatalf("incident RCA metadata should be deduplicated, got missing=%v warnings=%v artifacts=%v", detail.MissingData, detail.Warnings, detail.Artifacts)
+	}
+}
+
+func TestIncidentDetailCapsAggregateAnalysisTextOnly(t *testing.T) {
+	store := NewStore()
+	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "aggregate-cap"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-aggregate-cap",
+	})
+	longSummary := strings.Repeat("s", maxIncidentAggregateSummaryBytes+100)
+	longDetail := strings.Repeat("d", maxIncidentAggregateDetailBytes+100)
+	store.ApplyAnalysis(alert.AlertID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: longSummary,
+		AnalysisDetail:  longDetail,
+	})
+
+	detail, ok := store.IncidentDetail(incident.IncidentID)
+	if !ok {
+		t.Fatalf("incident detail missing")
+	}
+	if len(detail.AnalysisSummary) > maxIncidentAggregateSummaryBytes+len("...") ||
+		!strings.HasSuffix(detail.AnalysisSummary, "...") {
+		t.Fatalf("incident summary aggregate was not capped, len=%d", len(detail.AnalysisSummary))
+	}
+	if len(detail.AnalysisDetail) > maxIncidentAggregateDetailBytes+len("...") ||
+		!strings.HasSuffix(detail.AnalysisDetail, "...") {
+		t.Fatalf("incident detail aggregate was not capped, len=%d", len(detail.AnalysisDetail))
+	}
+	if len(detail.Alerts) != 1 || detail.Alerts[0].AnalysisSummary != longSummary || detail.Alerts[0].AnalysisDetail != longDetail {
+		t.Fatalf("alert-level RCA should remain complete in incident detail")
 	}
 }
 
@@ -1106,11 +1913,11 @@ func TestReapStaleAnalyzingRunsMarksFailed(t *testing.T) {
 		Fingerprint: "fp-reap",
 	})
 	// Simulate a run left "analyzing" by a previous process (no goroutine ran).
-	stale := store.CreateAnalysisRun("auto", "alert", record.AlertID, incident.IncidentID, record.AlertID, "t", "")
 	done := store.CreateAnalysisRun("manual", "alert", record.AlertID, incident.IncidentID, record.AlertID, "t", "")
 	store.CompleteAnalysisRun(done.RunID, AgentAnalysisResponse{Status: "ok", AnalysisSummary: "done"})
+	stale := store.CreateAnalysisRun("auto", "alert", record.AlertID, incident.IncidentID, record.AlertID, "t", "")
 
-	reaped := store.ReapStaleAnalyzingRuns()
+	reaped := store.ReapStaleAnalyzingRuns(0, 0)
 	if reaped != 1 {
 		t.Fatalf("expected exactly 1 stale run reaped, got %d", reaped)
 	}
@@ -1140,6 +1947,79 @@ func TestReapStaleAnalyzingRunsMarksFailed(t *testing.T) {
 	}
 	if detail, ok := store.IncidentDetail(incident.IncidentID); !ok || detail.IsAnalyzing {
 		t.Fatalf("incident is_analyzing flag should be cleared after reap")
+	}
+}
+
+func TestReapStaleAnalyzingRunsKeepsFreshRun(t *testing.T) {
+	store := NewStore()
+	incident, record := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "fresh-reap"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-fresh-reap",
+	})
+	run := store.CreateAnalysisRun("manual", "alert", record.AlertID, incident.IncidentID, record.AlertID, "t", "")
+	store.BeginAnalyzing(incident.IncidentID, record.AlertID)
+
+	reaped := store.ReapStaleAnalyzingRuns(time.Hour, time.Hour)
+	if reaped != 0 {
+		t.Fatalf("fresh run should not be reaped, got %d", reaped)
+	}
+	found := false
+	for _, current := range store.ListAnalysisRuns() {
+		if current.RunID == run.RunID && current.Status != "analyzing" {
+			t.Fatalf("fresh run should stay analyzing, got %q", current.Status)
+		}
+		found = found || current.RunID == run.RunID
+	}
+	if !found {
+		t.Fatalf("fresh run disappeared")
+	}
+	if alert, _ := store.AlertDetail(record.AlertID); !alert.IsAnalyzing {
+		t.Fatalf("fresh alert should stay analyzing")
+	}
+	if detail, ok := store.IncidentDetail(incident.IncidentID); !ok || !detail.IsAnalyzing {
+		t.Fatalf("fresh incident should stay analyzing")
+	}
+}
+
+func TestReapStaleAnalyzingRunsUsesManualTimeoutOnlyForManualRuns(t *testing.T) {
+	store := NewStore()
+	incident, autoAlert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "auto-reap"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIAutoBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Auto queue blocked"},
+		Fingerprint: "fp-auto-reap",
+	})
+	manualIncident, manualAlert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "manual-reap"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIManualBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Manual queue blocked"},
+		Fingerprint: "fp-manual-reap",
+	})
+	autoRun := store.CreateAnalysisRun("auto", "alert", autoAlert.AlertID, incident.IncidentID, autoAlert.AlertID, "auto", "")
+	manualRun := store.CreateAnalysisRun("manual", "alert", manualAlert.AlertID, manualIncident.IncidentID, manualAlert.AlertID, "manual", "")
+
+	store.mu.Lock()
+	store.analysisRuns[autoRun.RunID].UpdatedAt = time.Now().UTC().Add(-5 * time.Minute)
+	store.analysisRuns[manualRun.RunID].UpdatedAt = time.Now().UTC().Add(-5 * time.Minute)
+	store.mu.Unlock()
+
+	reaped := store.ReapStaleAnalyzingRuns(3*time.Minute, 15*time.Minute)
+	if reaped != 1 {
+		t.Fatalf("expected only stale auto run to be reaped, got %d", reaped)
+	}
+	for _, run := range store.ListAnalysisRuns() {
+		switch run.RunID {
+		case autoRun.RunID:
+			if run.Status != "failed" {
+				t.Fatalf("auto run should be reaped with default timeout, got %q", run.Status)
+			}
+		case manualRun.RunID:
+			if run.Status != "analyzing" {
+				t.Fatalf("manual run should use manual timeout, got %q", run.Status)
+			}
+		}
 	}
 }
 
@@ -1281,6 +2161,32 @@ func TestFeedbackVoteToggleCancelsSameActorVote(t *testing.T) {
 	}
 }
 
+func TestFeedbackRejectsOversizedCommentFields(t *testing.T) {
+	store := NewStore()
+	incident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "feedback-bounds"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-feedback-bounds",
+	})
+
+	tooLongComment := strings.Repeat("x", maxStoredCommentBodyBytes+1)
+	tooLongAuthor := strings.Repeat("a", maxFeedbackAuthorBytes+1)
+
+	if _, _, err := store.AddComment("incident", incident.IncidentID, CommentRequest{Body: tooLongComment}); err == nil {
+		t.Fatalf("expected oversized comment body to be rejected")
+	}
+	if _, _, err := store.AddComment("incident", incident.IncidentID, CommentRequest{Body: "Check scheduler logs.", Author: tooLongAuthor}); err == nil {
+		t.Fatalf("expected oversized comment author to be rejected")
+	}
+	if _, _, err := store.AddFeedback("incident", incident.IncidentID, FeedbackRequest{Vote: "up", Comment: tooLongComment}); err == nil {
+		t.Fatalf("expected oversized feedback comment to be rejected")
+	}
+	if _, _, err := store.AddFeedback("incident", incident.IncidentID, FeedbackRequest{Vote: "up", Author: tooLongAuthor}); err == nil {
+		t.Fatalf("expected oversized feedback author to be rejected")
+	}
+}
+
 func TestFeedbackRoutesReturnSummary(t *testing.T) {
 	server := NewServer()
 	incident, _ := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "route"}, Alert{
@@ -1368,5 +2274,20 @@ func TestFeedbackRoutesReturnSummary(t *testing.T) {
 
 	if searchRec.Code != http.StatusOK {
 		t.Fatalf("expected embedding search 200, got %d: %s", searchRec.Code, searchRec.Body.String())
+	}
+}
+
+func TestEmbeddingSearchRejectsOversizedQuery(t *testing.T) {
+	server := NewServer()
+	body, _ := json.Marshal(EmbeddingSearchRequest{Query: strings.Repeat("q", maxEmbeddingQueryBytes+1)})
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(
+		rec,
+		httptest.NewRequest(http.MethodPost, "/api/v1/embeddings/search", bytes.NewReader(body)),
+	)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected oversized query 400, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

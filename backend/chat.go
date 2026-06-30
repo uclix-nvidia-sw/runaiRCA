@@ -35,7 +35,11 @@ type ChatResponse struct {
 	AnalysisRun    *AnalysisRun `json:"analysis_run,omitempty"`
 }
 
-const dashboardChatRecentLimit = 5
+const (
+	dashboardChatRecentLimit = 5
+	maxChatMessageBytes      = 8000
+	maxChatMetadataBytes     = 256
+)
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var req ChatRequest
@@ -46,6 +50,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	req.Message = strings.TrimSpace(req.Message)
 	if req.Message == "" {
 		writeError(w, http.StatusBadRequest, "message is required")
+		return
+	}
+	if len(req.Message) > maxChatMessageBytes {
+		writeError(w, http.StatusBadRequest, "message is too long")
 		return
 	}
 	req = s.enrichChatRequest(req)
@@ -63,6 +71,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		run, ok := s.startAnalysisRun(targetType, targetID, "chat", req.Message)
 		if !ok {
+			if run != nil && run.Status == "analyzing" {
+				answer := ChatResponse{
+					Status:         "ok",
+					Answer:         analysisAlreadyRunningAnswer(run, inferred),
+					ConversationID: req.ConversationID,
+					AnalysisRun:    run,
+				}
+				finalizeChatResponse(&answer, req)
+				writeJSON(w, http.StatusAccepted, answer)
+				return
+			}
 			writeError(w, http.StatusNotFound, "analysis target not found")
 			return
 		}
@@ -108,11 +127,20 @@ func finalizeChatResponse(answer *ChatResponse, req ChatRequest) {
 // similar-incident memory, and the feedback hints so the agent always sees the
 // full operator context.
 func (s *Server) enrichChatRequest(req ChatRequest) ChatRequest {
-	if req.Context == nil {
-		req.Context = map[string]any{}
+	incomingContext := req.Context
+	if incomingContext == nil {
+		incomingContext = map[string]any{}
 	}
-	req.IncidentID = strings.TrimSpace(first(req.IncidentID, stringFromContext(req.Context, "incident_id")))
-	req.AlertID = strings.TrimSpace(first(req.AlertID, stringFromContext(req.Context, "alert_id")))
+	req.IncidentID = strings.TrimSpace(first(req.IncidentID, stringFromContext(incomingContext, "incident_id")))
+	req.AlertID = strings.TrimSpace(first(req.AlertID, stringFromContext(incomingContext, "alert_id")))
+	req.ConversationID = excerpt(req.ConversationID, maxChatMetadataBytes)
+	req.Language = excerpt(req.Language, maxChatMetadataBytes)
+	req.Page = excerpt(req.Page, maxChatMetadataBytes)
+	req.IncidentTitle = ""
+	req.IncidentContent = ""
+	req.AlertTitle = ""
+	req.AlertContent = ""
+	req.Context = map[string]any{}
 	req.Context["dashboard_state"] = s.dashboardChatState()
 	req.Context["agent_runtime"] = s.agentRuntimeContext()
 
@@ -121,29 +149,21 @@ func (s *Server) enrichChatRequest(req ChatRequest) ChatRequest {
 
 	if req.AlertID != "" {
 		if alert, ok := s.store.AlertDetail(req.AlertID); ok {
-			if req.IncidentID == "" {
-				req.IncidentID = alert.IncidentID
-			}
-			if req.AlertTitle == "" {
-				req.AlertTitle = alert.AlarmTitle
-			}
-			if req.AlertContent == "" {
-				req.AlertContent = alertChatContent(alert)
-			}
+			req.IncidentID = alert.IncidentID
+			req.AlertTitle = alert.AlarmTitle
+			req.AlertContent = alertChatContent(alert)
 			req.Context["alert"] = alertChatContext(alert)
 			resolved := alertFromRecord(*alert)
 			contextAlert = &resolved
 			contextIncidentID = alert.IncidentID
+		} else {
+			req.AlertID = ""
 		}
 	}
 	if req.IncidentID != "" {
 		if detail, ok := s.store.IncidentDetail(req.IncidentID); ok {
-			if req.IncidentTitle == "" {
-				req.IncidentTitle = detail.Title
-			}
-			if req.IncidentContent == "" {
-				req.IncidentContent = incidentChatContent(detail)
-			}
+			req.IncidentTitle = detail.Title
+			req.IncidentContent = incidentChatContent(detail)
 			req.Context["incident"] = incidentChatContext(detail)
 			if contextIncidentID == "" {
 				contextIncidentID = detail.IncidentID
@@ -161,7 +181,7 @@ func (s *Server) enrichChatRequest(req ChatRequest) ChatRequest {
 	}
 
 	if contextAlert != nil {
-		req.Context["similar_incidents"] = s.store.SimilarIncidentsForAlert(*contextAlert, contextIncidentID, similarIncidentLimit)
+		req.Context["similar_incidents"] = compactSimilarIncidentContext(s.store.SimilarIncidentsForAlert(*contextAlert, contextIncidentID, similarIncidentLimit))
 		req.Context["feedback_hints"] = s.store.FeedbackHintsForAlert(*contextAlert, contextIncidentID, similarIncidentLimit)
 	}
 
@@ -169,7 +189,7 @@ func (s *Server) enrichChatRequest(req ChatRequest) ChatRequest {
 		[]string{req.Message, req.IncidentTitle, req.AlertTitle, req.IncidentContent, req.AlertContent},
 		"\n",
 	)
-	req.Context["rca_memory"] = s.store.SearchIncidentMemory(memoryQuery, 5)
+	req.Context["rca_memory"] = compactSimilarIncidentContext(s.store.SearchIncidentMemory(memoryQuery, 5))
 	req.Context["page"] = req.Page
 	return req
 }
@@ -232,7 +252,7 @@ func alertSummary(alert AlertRecord) map[string]any {
 	return map[string]any{
 		"alert_id":         alert.AlertID,
 		"incident_id":      alert.IncidentID,
-		"title":            alert.AlarmTitle,
+		"title":            excerpt(alert.AlarmTitle, 120),
 		"severity":         alert.Severity,
 		"status":           alert.Status,
 		"fired_at":         alert.FiredAt,
@@ -254,7 +274,7 @@ func runSummary(run AnalysisRun) map[string]any {
 		"target_id":        run.TargetID,
 		"incident_id":      run.IncidentID,
 		"alert_id":         run.AlertID,
-		"title":            run.Title,
+		"title":            excerpt(run.Title, 120),
 		"analysis_quality": run.AnalysisQuality,
 		"capabilities":     run.Capabilities,
 		"missing_data":     run.MissingData,
@@ -283,7 +303,7 @@ func wantsAnalysisRun(message string) bool {
 	if !strings.Contains(message, "분석") {
 		return false
 	}
-	for _, token := range []string{"해줘", "돌려", "진행", "요청", "다시", "새로", "시작", "만들"} {
+	for _, token := range []string{"해줘", "돌려", "진행", "요청", "새로", "시작", "만들"} {
 		if strings.Contains(message, token) {
 			return true
 		}
@@ -297,17 +317,6 @@ func (s *Server) chatAnalysisTarget(req ChatRequest) (string, string, bool) {
 	}
 	if req.IncidentID != "" {
 		return "incident", req.IncidentID, false
-	}
-	targetType := stringFromContext(req.Context, "target_type")
-	switch targetType {
-	case "alert":
-		if id := stringFromContext(req.Context, "alert_id"); id != "" {
-			return "alert", id, false
-		}
-	case "incident":
-		if id := stringFromContext(req.Context, "incident_id"); id != "" {
-			return "incident", id, false
-		}
 	}
 	if alertID := s.latestAlertTarget(); alertID != "" {
 		return "alert", alertID, true
@@ -331,6 +340,14 @@ func analysisStartedAnswer(run *AnalysisRun, inferred bool) string {
 		run.RunID,
 		target,
 	)
+}
+
+func analysisAlreadyRunningAnswer(run *AnalysisRun, inferred bool) string {
+	target := fmt.Sprintf("%s `%s`", run.TargetType, run.TargetID)
+	if inferred {
+		target = fmt.Sprintf("latest available %s `%s`", run.TargetType, run.TargetID)
+	}
+	return fmt.Sprintf("이미 분석 run `%s`가 %s 대상으로 진행 중이야. 새 Agent 요청은 보내지 않았고, Analysis Dashboard에서 이어서 보면 돼.", run.RunID, target)
 }
 
 func noAnalysisTargetAnswer(req ChatRequest) string {
@@ -380,18 +397,21 @@ func incidentChatContent(detail *IncidentDetail) string {
 	if detail == nil {
 		return ""
 	}
-	alerts := make([]string, 0, len(detail.Alerts))
-	for _, alert := range detail.Alerts {
+	alerts := make([]string, 0, min(len(detail.Alerts), dashboardChatRecentLimit))
+	for _, alert := range detail.Alerts[:min(len(detail.Alerts), dashboardChatRecentLimit)] {
 		alerts = append(alerts, fmt.Sprintf(
 			"%s %s %s %s",
 			alert.AlertID,
-			alert.AlarmTitle,
+			excerpt(alert.AlarmTitle, 120),
 			alert.Severity,
 			alert.Status,
 		))
 	}
+	if omitted := len(detail.Alerts) - len(alerts); omitted > 0 {
+		alerts = append(alerts, fmt.Sprintf("+%d more alerts", omitted))
+	}
 	return strings.Join([]string{
-		"Title: " + detail.Title,
+		"Title: " + excerpt(detail.Title, 120),
 		"Incident ID: " + detail.IncidentID,
 		"Status: " + detail.Status,
 		"Severity: " + detail.Severity,
@@ -410,13 +430,13 @@ func alertChatContent(alert *AlertRecord) string {
 	labels, _ := json.Marshal(alert.Labels)
 	annotations, _ := json.Marshal(alert.Annotations)
 	return strings.Join([]string{
-		"Title: " + alert.AlarmTitle,
+		"Title: " + excerpt(alert.AlarmTitle, 120),
 		"Alert ID: " + alert.AlertID,
 		"Incident ID: " + alert.IncidentID,
 		"Status: " + alert.Status,
 		"Severity: " + alert.Severity,
-		"Labels: " + string(labels),
-		"Annotations: " + string(annotations),
+		"Labels: " + excerpt(string(labels), 1200),
+		"Annotations: " + excerpt(string(annotations), 1200),
 		"Analysis summary: " + alert.AnalysisSummary,
 		"Analysis detail: " + excerpt(alert.AnalysisDetail, 4000),
 		"Missing data: " + strings.Join(alert.MissingData, ", "),
@@ -428,9 +448,18 @@ func incidentChatContext(detail *IncidentDetail) map[string]any {
 	if detail == nil {
 		return map[string]any{}
 	}
+	alerts := make([]map[string]any, 0, min(len(detail.Alerts), dashboardChatRecentLimit))
+	for _, alert := range detail.Alerts[:min(len(detail.Alerts), dashboardChatRecentLimit)] {
+		alerts = append(alerts, map[string]any{
+			"alert_id": alert.AlertID,
+			"title":    excerpt(alert.AlarmTitle, 120),
+			"severity": alert.Severity,
+			"status":   alert.Status,
+		})
+	}
 	return map[string]any{
 		"incident_id":       detail.IncidentID,
-		"title":             detail.Title,
+		"title":             excerpt(detail.Title, 120),
 		"severity":          detail.Severity,
 		"status":            detail.Status,
 		"analysis_summary":  detail.AnalysisSummary,
@@ -438,9 +467,10 @@ func incidentChatContext(detail *IncidentDetail) map[string]any {
 		"capabilities":      detail.Capabilities,
 		"missing_data":      detail.MissingData,
 		"warnings":          detail.Warnings,
-		"similar_incidents": detail.SimilarIncidents,
-		"feedback":          detail.Feedback,
-		"alerts":            detail.Alerts,
+		"similar_incidents": compactSimilarIncidentContext(detail.SimilarIncidents),
+		"feedback":          feedbackChatContext(detail.Feedback),
+		"alerts":            alerts,
+		"omitted_alerts":    max(0, len(detail.Alerts)-len(alerts)),
 	}
 }
 
@@ -451,19 +481,46 @@ func alertChatContext(alert *AlertRecord) map[string]any {
 	return map[string]any{
 		"alert_id":          alert.AlertID,
 		"incident_id":       alert.IncidentID,
-		"title":             alert.AlarmTitle,
+		"title":             excerpt(alert.AlarmTitle, 120),
 		"severity":          alert.Severity,
 		"status":            alert.Status,
-		"labels":            alert.Labels,
-		"annotations":       alert.Annotations,
 		"analysis_summary":  alert.AnalysisSummary,
 		"analysis_quality":  alert.AnalysisQuality,
 		"capabilities":      alert.Capabilities,
 		"missing_data":      alert.MissingData,
 		"warnings":          alert.Warnings,
-		"similar_incidents": alert.SimilarIncidents,
-		"feedback":          alert.Feedback,
-		"artifacts":         alert.Artifacts,
+		"similar_incidents": compactSimilarIncidentContext(alert.SimilarIncidents),
+		"feedback":          feedbackChatContext(alert.Feedback),
+		"artifact_count":    len(alert.Artifacts),
+	}
+}
+
+func compactSimilarIncidentContext(items []SimilarIncident) []map[string]any {
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		out = append(out, map[string]any{
+			"incident_id":       item.IncidentID,
+			"alert_id":          item.AlertID,
+			"title":             excerpt(item.Title, 120),
+			"severity":          item.Severity,
+			"status":            item.Status,
+			"similarity":        item.Similarity,
+			"analysis_summary":  excerpt(item.AnalysisSummary, 800),
+			"positive_feedback": item.PositiveFeedback,
+			"negative_feedback": item.NegativeFeedback,
+			"comment_count":     item.CommentCount,
+			"created_at":        item.CreatedAt,
+		})
+	}
+	return out
+}
+
+func feedbackChatContext(feedback FeedbackSummary) map[string]any {
+	return map[string]any{
+		"positive":      feedback.Positive,
+		"negative":      feedback.Negative,
+		"my_vote":       feedback.MyVote,
+		"comment_count": len(feedback.Comments),
 	}
 }
 

@@ -19,6 +19,17 @@ const (
 	similaritySearchPGVector  = "pgvector_cosine"
 	similaritySearchJSONB     = "jsonb_sparse_vectors"
 	similaritySearchMemory    = "in_memory_sparse_vectors"
+
+	maxOperatorPromptBytes             = 8000
+	maxOperatorPromptCommentsPerTarget = 10
+	maxOperatorPromptCommentBodyBytes  = 200
+	maxOperatorPromptAuthorBytes       = 80
+
+	maxIncidentAggregateSummaryBytes = 8000
+	maxIncidentAggregateDetailBytes  = 32000
+
+	maxStoredCommentBodyBytes = 8000
+	maxFeedbackAuthorBytes    = 120
 )
 
 type Store struct {
@@ -161,6 +172,7 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	key := correlationKey(webhook, alert)
 	fingerprint := alertIdentity(alert)
 	storageKey := alertStorageKey(webhook, alert, key)
+	alertStatus := status(alert.Status)
 	now := time.Now().UTC()
 	alertFiredAt := firstTime(alert.StartsAt, now)
 	alertID := ""
@@ -206,11 +218,11 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	}
 	incident := s.incidents[incidentID]
 	incident.Severity = maxSeverity(incident.Severity, severity(alert))
-	if alert.Status == "resolved" && incident.ResolvedAt == nil {
+	if alertStatus == "resolved" && incident.ResolvedAt == nil {
 		t := firstTime(alert.EndsAt, now)
 		incident.ResolvedAt = &t
 		incident.Status = "resolved"
-	} else if alert.Status != "resolved" && incident.Status == "resolved" {
+	} else if alertStatus != "resolved" && incident.Status == "resolved" {
 		incident.Status = "firing"
 		incident.ResolvedAt = nil
 	}
@@ -259,13 +271,13 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	record.OccurrencePods = appendOccurrencePod(record.OccurrencePods, podName(alert))
 	record.AlarmTitle = groupedIncidentTitle(alert, record.OccurrenceCount)
 	record.Severity = severity(alert)
-	record.Status = status(alert.Status)
+	record.Status = alertStatus
 	record.FiredAt = alertFiredAt
 	record.Fingerprint = fingerprint
 	record.ThreadTS = "thread-" + alertID
 	record.Labels = cloneMap(alert.Labels)
 	record.Annotations = cloneMap(alert.Annotations)
-	if alert.Status == "resolved" {
+	if alertStatus == "resolved" {
 		t := firstTime(alert.EndsAt, now)
 		record.ResolvedAt = &t
 	} else {
@@ -507,30 +519,54 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if existing := s.analyzingAnalysisRunLocked(targetType, targetID, alertID); existing != nil {
+		return cloneAnalysisRun(existing), false
+	}
 	if source == "auto" {
-		if existing := s.latestAutoAnalysisRunLocked(incidentID); existing != nil {
+		if existing := s.latestAutoAnalysisRunLocked(alertID); existing != nil {
 			return cloneAnalysisRun(existing), false
 		}
 	}
 	s.analysisRuns[run.RunID] = run
-	s.persistAnalysisRunLocked(run)
+	if !s.persistAnalysisRunLocked(run) {
+		delete(s.analysisRuns, run.RunID)
+		return AnalysisRun{}, false
+	}
 	return cloneAnalysisRun(run), true
 }
 
-func (s *Store) ExistingAutoAnalysisRun(incidentID string) (AnalysisRun, bool) {
+func (s *Store) analyzingAnalysisRunLocked(targetType string, targetID string, alertID string) *AnalysisRun {
+	var selected *AnalysisRun
+	for _, run := range s.analysisRuns {
+		if run == nil || run.Status != "analyzing" {
+			continue
+		}
+		sameTarget := run.TargetType == targetType && run.TargetID == targetID
+		sameAlert := alertID != "" && run.AlertID == alertID
+		if !sameTarget && !sameAlert {
+			continue
+		}
+		if selected == nil || run.CreatedAt.After(selected.CreatedAt) {
+			selected = run
+		}
+	}
+	return selected
+}
+
+func (s *Store) ExistingAutoAnalysisRun(alertID string) (AnalysisRun, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	selected := s.latestAutoAnalysisRunLocked(incidentID)
+	selected := s.latestAutoAnalysisRunLocked(alertID)
 	if selected == nil {
 		return AnalysisRun{}, false
 	}
 	return cloneAnalysisRun(selected), true
 }
 
-func (s *Store) latestAutoAnalysisRunLocked(incidentID string) *AnalysisRun {
+func (s *Store) latestAutoAnalysisRunLocked(alertID string) *AnalysisRun {
 	var selected *AnalysisRun
 	for _, run := range s.analysisRuns {
-		if run == nil || run.Source != "auto" || run.IncidentID != incidentID {
+		if run == nil || run.Source != "auto" || run.AlertID != alertID {
 			continue
 		}
 		if selected == nil || run.CreatedAt.After(selected.CreatedAt) {
@@ -547,6 +583,7 @@ func (s *Store) CompleteAnalysisRun(runID string, response AgentAnalysisResponse
 	if run == nil {
 		return AnalysisRun{}, false
 	}
+	before := cloneAnalysisRun(run)
 	run.Status = "complete"
 	run.AnalysisSummary = response.AnalysisSummary
 	run.AnalysisDetail = response.AnalysisDetail
@@ -559,7 +596,10 @@ func (s *Store) CompleteAnalysisRun(runID string, response AgentAnalysisResponse
 	run.Warnings = response.Warnings
 	run.Artifacts = response.Artifacts
 	run.UpdatedAt = time.Now().UTC()
-	s.persistAnalysisRunLocked(run)
+	if !s.persistAnalysisRunLocked(run) {
+		*run = before
+		return cloneAnalysisRun(run), false
+	}
 	return cloneAnalysisRun(run), true
 }
 
@@ -570,6 +610,7 @@ func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (A
 	if run == nil {
 		return AnalysisRun{}, false
 	}
+	before := cloneAnalysisRun(run)
 	run.Status = "failed"
 	run.AnalysisSummary = response.AnalysisSummary
 	run.AnalysisDetail = response.AnalysisDetail
@@ -582,25 +623,35 @@ func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (A
 	run.Warnings = response.Warnings
 	run.Artifacts = response.Artifacts
 	run.UpdatedAt = time.Now().UTC()
-	s.persistAnalysisRunLocked(run)
+	if !s.persistAnalysisRunLocked(run) {
+		*run = before
+		return cloneAnalysisRun(run), false
+	}
 	return cloneAnalysisRun(run), true
 }
 
 // ReapStaleAnalyzingRuns enforces the lifecycle invariant across process
-// restarts. A run persisted as "analyzing" by a previous process (a pod that was
-// killed mid-analysis by a rollout, OOM, or a shutdown that exceeded the drain
-// window) has no goroutine to finish it, so on startup it is marked failed with a
-// warning. Any stale is_analyzing flags on alerts/incidents are also cleared,
-// since nothing is actually running yet. It returns the number of runs reaped
-// and is a no-op for the in-memory store with no persisted state.
-func (s *Store) ReapStaleAnalyzingRuns() int {
+// restarts. A run persisted as "analyzing" past its source timeout has no
+// goroutine to finish it, so on startup it is marked failed with a warning. Any
+// stale is_analyzing flags on alerts/incidents are also cleared when no
+// analyzing run remains for them. It returns the number of runs reaped.
+func (s *Store) ReapStaleAnalyzingRuns(staleAfter time.Duration, manualStaleAfter time.Duration) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now().UTC()
 	reaped := 0
 	for _, run := range s.analysisRuns {
 		if run == nil || run.Status != "analyzing" {
 			continue
 		}
+		runStaleAfter := staleAfter
+		if run.Source == "manual" {
+			runStaleAfter = manualStaleAfter
+		}
+		if runStaleAfter > 0 && run.UpdatedAt.After(now.Add(-runStaleAfter)) {
+			continue
+		}
+		before := cloneAnalysisRun(run)
 		run.Status = "failed"
 		run.AnalysisQuality = first(run.AnalysisQuality, "low")
 		if run.Capabilities == nil {
@@ -608,18 +659,34 @@ func (s *Store) ReapStaleAnalyzingRuns() int {
 		}
 		run.Capabilities["agent"] = "interrupted"
 		run.Warnings = append(run.Warnings, "analysis was interrupted by a backend restart and marked failed")
-		run.UpdatedAt = time.Now().UTC()
-		s.persistAnalysisRunLocked(run)
+		run.UpdatedAt = now
+		if !s.persistAnalysisRunLocked(run) {
+			*run = before
+			continue
+		}
 		reaped++
 	}
+	activeAlerts := map[string]bool{}
+	activeIncidents := map[string]bool{}
+	for _, run := range s.analysisRuns {
+		if run == nil || run.Status != "analyzing" {
+			continue
+		}
+		if run.AlertID != "" {
+			activeAlerts[run.AlertID] = true
+		}
+		if run.IncidentID != "" {
+			activeIncidents[run.IncidentID] = true
+		}
+	}
 	for _, alert := range s.alerts {
-		if alert != nil && alert.IsAnalyzing {
+		if alert != nil && alert.IsAnalyzing && !activeAlerts[alert.AlertID] {
 			alert.IsAnalyzing = false
 			s.persistAlertLocked(alert)
 		}
 	}
 	for _, incident := range s.incidents {
-		if incident != nil && incident.IsAnalyzing {
+		if incident != nil && incident.IsAnalyzing && !activeIncidents[incident.IncidentID] {
 			incident.IsAnalyzing = false
 			s.persistIncidentLocked(incident)
 		}
@@ -643,6 +710,7 @@ func (s *Store) AnalysisTarget(targetType string, targetID string) (Alert, strin
 			return Alert{}, "", "", "", "", false
 		}
 		var selected *AlertRecord
+		var selectedFiring *AlertRecord
 		for _, alert := range s.alerts {
 			if alert.IncidentID != targetID {
 				continue
@@ -650,6 +718,12 @@ func (s *Store) AnalysisTarget(targetType string, targetID string) (Alert, strin
 			if selected == nil || alert.FiredAt.After(selected.FiredAt) {
 				selected = alert
 			}
+			if alert.Status != "resolved" && (selectedFiring == nil || alert.FiredAt.After(selectedFiring.FiredAt)) {
+				selectedFiring = alert
+			}
+		}
+		if selectedFiring != nil {
+			selected = selectedFiring
 		}
 		if selected == nil {
 			return Alert{}, "", "", "", "", false
@@ -728,19 +802,61 @@ func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 		copied.Feedback = s.feedbackSummaryLocked("alert", alert.AlertID)
 		copied.SimilarIncidents = s.similarIncidentsLocked(alertFromRecord(*copied), alert.IncidentID, similarIncidentLimit)
 		detail.Alerts = append(detail.Alerts, *copied)
-		if detail.AnalysisSummary == "" && copied.AnalysisSummary != "" {
-			detail.AnalysisSummary = copied.AnalysisSummary
-			detail.AnalysisDetail = copied.AnalysisDetail
-			detail.AnalysisQuality = copied.AnalysisQuality
-			detail.Capabilities = cloneMap(copied.Capabilities)
-			detail.MissingData = append([]string{}, copied.MissingData...)
-			detail.Warnings = append([]string{}, copied.Warnings...)
-			detail.Artifacts = append([]Artifact{}, copied.Artifacts...)
-		}
 	}
 	sort.Slice(detail.Alerts, func(i, j int) bool {
 		return detail.Alerts[i].FiredAt.After(detail.Alerts[j].FiredAt)
 	})
+	summaryLines := []string{}
+	detailSections := []string{}
+	seenMissingData := map[string]struct{}{}
+	seenWarnings := map[string]struct{}{}
+	seenArtifacts := map[string]struct{}{}
+	for _, alert := range detail.Alerts {
+		if strings.TrimSpace(alert.AnalysisSummary) == "" && strings.TrimSpace(alert.AnalysisDetail) == "" {
+			continue
+		}
+		title := first(alert.AlarmTitle, alert.AlertID)
+		if strings.TrimSpace(alert.AnalysisSummary) != "" {
+			summaryLines = append(summaryLines, fmt.Sprintf("- %s: %s", title, alert.AnalysisSummary))
+		}
+		if strings.TrimSpace(alert.AnalysisDetail) != "" {
+			detailSections = append(detailSections, fmt.Sprintf("## %s\n\n%s", title, alert.AnalysisDetail))
+		}
+		if detail.AnalysisQuality == "" {
+			detail.AnalysisQuality = alert.AnalysisQuality
+		}
+		for key, value := range alert.Capabilities {
+			detail.Capabilities[key] = value
+		}
+		for _, item := range alert.MissingData {
+			if _, ok := seenMissingData[item]; ok {
+				continue
+			}
+			seenMissingData[item] = struct{}{}
+			detail.MissingData = append(detail.MissingData, item)
+		}
+		for _, item := range alert.Warnings {
+			if _, ok := seenWarnings[item]; ok {
+				continue
+			}
+			seenWarnings[item] = struct{}{}
+			detail.Warnings = append(detail.Warnings, item)
+		}
+		for _, artifact := range alert.Artifacts {
+			key := string(mustJSON(artifact))
+			if _, ok := seenArtifacts[key]; ok {
+				continue
+			}
+			seenArtifacts[key] = struct{}{}
+			detail.Artifacts = append(detail.Artifacts, artifact)
+		}
+	}
+	if len(summaryLines) > 0 {
+		detail.AnalysisSummary = excerpt(strings.Join(summaryLines, "\n"), maxIncidentAggregateSummaryBytes)
+	}
+	if len(detailSections) > 0 {
+		detail.AnalysisDetail = excerpt(strings.Join(detailSections, "\n\n"), maxIncidentAggregateDetailBytes)
+	}
 	detail.Feedback = s.feedbackSummaryLocked("incident", id)
 	if len(detail.Alerts) > 0 {
 		detail.SimilarIncidents = s.similarIncidentsLocked(
@@ -773,6 +889,13 @@ func (s *Store) AddFeedback(
 	rawVote := strings.TrimSpace(first(req.Vote, req.VoteType))
 	vote := normalizeVote(rawVote)
 	actor := feedbackActor(req.Author)
+	comment := strings.TrimSpace(req.Comment)
+	if err := validateStoredText("author", actor, maxFeedbackAuthorBytes); err != nil {
+		return FeedbackSummary{}, false, err
+	}
+	if err := validateStoredText("comment", comment, maxStoredCommentBodyBytes); err != nil {
+		return FeedbackSummary{}, false, err
+	}
 	if strings.EqualFold(rawVote, "none") {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -799,7 +922,7 @@ func (s *Store) AddFeedback(
 		IncidentID: incidentID,
 		AlertID:    alertID,
 		Vote:       vote,
-		Comment:    strings.TrimSpace(req.Comment),
+		Comment:    comment,
 		Author:     actor,
 		CreatedAt:  time.Now().UTC(),
 	}
@@ -831,6 +954,13 @@ func (s *Store) AddComment(
 	if body == "" {
 		return FeedbackSummary{}, false, errors.New("comment body is required")
 	}
+	author := strings.TrimSpace(req.Author)
+	if err := validateStoredText("comment body", body, maxStoredCommentBodyBytes); err != nil {
+		return FeedbackSummary{}, false, err
+	}
+	if err := validateStoredText("author", author, maxFeedbackAuthorBytes); err != nil {
+		return FeedbackSummary{}, false, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incidentID, alertID, ok := s.targetIDsLocked(targetType, targetID)
@@ -844,7 +974,7 @@ func (s *Store) AddComment(
 		IncidentID: incidentID,
 		AlertID:    alertID,
 		Body:       body,
-		Author:     strings.TrimSpace(req.Author),
+		Author:     author,
 		CreatedAt:  time.Now().UTC(),
 	}
 	s.comments[comment.CommentID] = comment
@@ -862,6 +992,13 @@ func (s *Store) UpdateComment(
 	if body == "" {
 		return FeedbackSummary{}, false, errors.New("comment body is required")
 	}
+	author := strings.TrimSpace(req.Author)
+	if err := validateStoredText("comment body", body, maxStoredCommentBodyBytes); err != nil {
+		return FeedbackSummary{}, false, err
+	}
+	if err := validateStoredText("author", author, maxFeedbackAuthorBytes); err != nil {
+		return FeedbackSummary{}, false, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, _, ok := s.targetIDsLocked(targetType, targetID); !ok {
@@ -872,11 +1009,18 @@ func (s *Store) UpdateComment(
 		return FeedbackSummary{}, false, nil
 	}
 	comment.Body = body
-	if author := strings.TrimSpace(req.Author); author != "" {
+	if author != "" {
 		comment.Author = author
 	}
 	s.persistCommentUpdateLocked(comment)
 	return s.feedbackSummaryLocked(targetType, targetID), true, nil
+}
+
+func validateStoredText(field string, value string, maxBytes int) error {
+	if len(value) > maxBytes {
+		return fmt.Errorf("%s must be %d bytes or less", field, maxBytes)
+	}
+	return nil
 }
 
 func (s *Store) OperatorPromptForTarget(targetType string, targetID string) string {
@@ -894,20 +1038,25 @@ func (s *Store) OperatorPromptForTarget(targetType string, targetID string) stri
 	if len(lines) == 1 {
 		return ""
 	}
-	return strings.Join(lines, "\n")
+	return excerpt(strings.Join(lines, "\n"), maxOperatorPromptBytes)
 }
 
 func appendCommentPromptLines(lines []string, targetType string, targetID string, comments []CommentRecord) []string {
 	if targetID == "" || len(comments) == 0 {
 		return lines
 	}
+	if len(comments) > maxOperatorPromptCommentsPerTarget {
+		omitted := len(comments) - maxOperatorPromptCommentsPerTarget
+		lines = append(lines, fmt.Sprintf("- %d older %s comment(s) omitted from this analysis prompt.", omitted, targetType))
+		comments = comments[omitted:]
+	}
 	for _, comment := range comments {
 		body := strings.TrimSpace(comment.Body)
 		if body == "" {
 			continue
 		}
-		author := first(strings.TrimSpace(comment.Author), "operator")
-		lines = append(lines, fmt.Sprintf("- %s %s by %s: %s", targetType, targetID, author, body))
+		author := excerpt(first(strings.TrimSpace(comment.Author), "operator"), maxOperatorPromptAuthorBytes)
+		lines = append(lines, fmt.Sprintf("- %s %s by %s: %s", targetType, targetID, author, excerpt(body, maxOperatorPromptCommentBodyBytes)))
 	}
 	return lines
 }

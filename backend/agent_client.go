@@ -46,15 +46,20 @@ type AgentAnalysisResponse struct {
 type agentErrorKind string
 
 const (
-	agentErrEncode      agentErrorKind = "encode"
-	agentErrTimeout     agentErrorKind = "timeout"
-	agentErrNetwork     agentErrorKind = "network"
-	agentErrStatus      agentErrorKind = "non_2xx"
-	agentErrInvalidJSON agentErrorKind = "invalid_json"
-	agentErrBodyTooBig  agentErrorKind = "response_too_large"
+	agentErrEncode        agentErrorKind = "encode"
+	agentErrTimeout       agentErrorKind = "timeout"
+	agentErrNetwork       agentErrorKind = "network"
+	agentErrStatus        agentErrorKind = "non_2xx"
+	agentErrInvalidJSON   agentErrorKind = "invalid_json"
+	agentErrRequestTooBig agentErrorKind = "request_too_large"
+	agentErrBodyTooBig    agentErrorKind = "response_too_large"
+	agentErrBusy          agentErrorKind = "busy"
 )
 
-const maxAgentResponseBodyBytes int64 = 2 << 20
+const (
+	maxAgentRequestBodyBytes  int64 = 256 << 10
+	maxAgentResponseBodyBytes int64 = 2 << 20
+)
 
 // AgentError is a typed error describing an agent call failure.
 type AgentError struct {
@@ -76,8 +81,12 @@ func (e *AgentError) Error() string {
 		return fmt.Sprintf("agent returned status %d: %v", e.Status, e.Err)
 	case agentErrInvalidJSON:
 		return fmt.Sprintf("agent returned invalid JSON: %v", e.Err)
+	case agentErrRequestTooBig:
+		return fmt.Sprintf("agent request exceeded limit: %v", e.Err)
 	case agentErrBodyTooBig:
 		return fmt.Sprintf("agent response exceeded limit: %v", e.Err)
+	case agentErrBusy:
+		return fmt.Sprintf("agent concurrency limit reached: %v", e.Err)
 	case agentErrEncode:
 		return fmt.Sprintf("failed to build agent request: %v", e.Err)
 	default:
@@ -139,6 +148,12 @@ func (s *Server) postAgent(path string, payload any, timeout time.Duration) ([]b
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return nil, &AgentError{Kind: agentErrEncode, Err: err}
+	}
+	if int64(len(encoded)) > maxAgentRequestBodyBytes {
+		return nil, &AgentError{
+			Kind: agentErrRequestTooBig,
+			Err:  fmt.Errorf("body exceeded %d bytes", maxAgentRequestBodyBytes),
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	if timeout > 0 {
