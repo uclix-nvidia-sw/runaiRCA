@@ -595,6 +595,56 @@ func TestAnalyzingRunRejectsDuplicateManualRun(t *testing.T) {
 	}
 }
 
+func TestIncidentRunDedupesRepresentativeAlertRun(t *testing.T) {
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	released := false
+	release := func() {
+		if !released {
+			close(releaseFirst)
+			released = true
+		}
+	}
+	defer release()
+	var hit atomic.Int32
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		if hit.Add(1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Incident RCA complete.",
+			AnalysisDetail:  "## Root Cause\n\nRepresentative alert was analyzed once.",
+			AnalysisQuality: "medium",
+		})
+	})
+	incident, _ := seedAlert(t, server, "fp-incident-alert-dedupe")
+
+	incidentRun, ok := server.startAnalysisRun("incident", incident.IncidentID, "manual", "incident analysis")
+	if !ok {
+		t.Fatalf("expected incident run to start")
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("incident analysis did not reach agent")
+	}
+	alertRun, ok := server.startAnalysisRun("alert", incidentRun.AlertID, "manual", "alert analysis")
+	if ok {
+		t.Fatalf("representative alert run should not start while incident run is analyzing")
+	}
+	if alertRun == nil || alertRun.RunID != incidentRun.RunID {
+		t.Fatalf("duplicate alert request should return the in-flight incident run, got %+v want %s", alertRun, incidentRun.RunID)
+	}
+
+	release()
+	waitForRunIDStatus(t, server, incidentRun.RunID, "complete")
+	if hit.Load() != 1 {
+		t.Fatalf("expected exactly one agent call, got %d", hit.Load())
+	}
+}
+
 func TestAnalysisRunHugeAgentResponseFailsRun(t *testing.T) {
 	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(strings.Repeat("x", int(maxAgentResponseBodyBytes)+1)))
