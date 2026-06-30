@@ -741,6 +741,19 @@ func TestChatRejectsOversizedBody(t *testing.T) {
 	}
 }
 
+func TestChatRejectsOversizedMessage(t *testing.T) {
+	server := NewServer()
+	payload, _ := json.Marshal(ChatRequest{Message: strings.Repeat("x", maxChatMessageBytes+1)})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestExcerptDoesNotSplitUTF8(t *testing.T) {
 	got := excerpt("한글 alert", 4)
 	if !utf8.ValidString(got) {
@@ -830,6 +843,23 @@ func TestChatRouteProxiesContextualRCARequestToAgent(t *testing.T) {
 }
 
 func TestIncidentChatContextSummarizesAlerts(t *testing.T) {
+	alerts := []AlertRecord{{
+		AlertID:         "ALR-chat-context",
+		AlarmTitle:      "RunAIQueueBlocked",
+		Severity:        "warning",
+		Status:          "firing",
+		AnalysisSummary: "large RCA summary",
+		AnalysisDetail:  strings.Repeat("detail ", 100),
+		Labels:          map[string]string{"queue": "gpu-a"},
+	}}
+	for i := 0; i < dashboardChatRecentLimit+2; i++ {
+		alerts = append(alerts, AlertRecord{
+			AlertID:    "ALR-chat-extra-" + strconv.Itoa(i),
+			AlarmTitle: strings.Repeat("extra-title-", 20),
+			Severity:   "warning",
+			Status:     "firing",
+		})
+	}
 	context := incidentChatContext(&IncidentDetail{
 		Incident: Incident{
 			IncidentID: "INC-chat-context",
@@ -837,29 +867,158 @@ func TestIncidentChatContextSummarizesAlerts(t *testing.T) {
 			Severity:   "warning",
 			Status:     "firing",
 		},
-		Alerts: []AlertRecord{{
-			AlertID:         "ALR-chat-context",
-			AlarmTitle:      "RunAIQueueBlocked",
-			Severity:        "warning",
-			Status:          "firing",
-			AnalysisSummary: "large RCA summary",
-			AnalysisDetail:  strings.Repeat("detail ", 100),
-			Labels:          map[string]string{"queue": "gpu-a"},
+		Feedback: FeedbackSummary{
+			Positive: 1,
+			Comments: []CommentRecord{{
+				Body: strings.Repeat("operator comment ", 100),
+			}},
+		},
+		SimilarIncidents: []SimilarIncident{{
+			IncidentID:      "INC-prior-chat",
+			AlertID:         "ALR-prior-chat",
+			Title:           strings.Repeat("prior-title-", 20),
+			Similarity:      0.91,
+			AnalysisSummary: strings.Repeat("summary ", 200),
+			AnalysisDetail:  strings.Repeat("detail ", 500),
 		}},
+		Alerts: alerts,
 	})
 
-	alerts, ok := context["alerts"].([]map[string]any)
-	if !ok || len(alerts) != 1 {
+	contextAlerts, ok := context["alerts"].([]map[string]any)
+	if !ok || len(contextAlerts) != dashboardChatRecentLimit {
 		t.Fatalf("expected summarized alert context, got %+v", context["alerts"])
 	}
-	if alerts[0]["alert_id"] != "ALR-chat-context" || alerts[0]["title"] != "RunAIQueueBlocked" {
-		t.Fatalf("alert summary lost identity fields: %+v", alerts[0])
+	if contextAlerts[0]["alert_id"] != "ALR-chat-context" || contextAlerts[0]["title"] != "RunAIQueueBlocked" {
+		t.Fatalf("alert summary lost identity fields: %+v", contextAlerts[0])
 	}
-	if _, ok := alerts[0]["analysis_detail"]; ok {
-		t.Fatalf("chat context should not include full alert RCA detail: %+v", alerts[0])
+	if _, ok := contextAlerts[0]["analysis_detail"]; ok {
+		t.Fatalf("chat context should not include full alert RCA detail: %+v", contextAlerts[0])
 	}
-	if _, ok := alerts[0]["labels"]; ok {
-		t.Fatalf("chat context should not include full alert labels: %+v", alerts[0])
+	if _, ok := contextAlerts[0]["labels"]; ok {
+		t.Fatalf("chat context should not include full alert labels: %+v", contextAlerts[0])
+	}
+	if context["omitted_alerts"] != 3 {
+		t.Fatalf("expected omitted alert count, got %+v", context["omitted_alerts"])
+	}
+	if title, _ := contextAlerts[1]["title"].(string); len(title) > 123 || !strings.HasSuffix(title, "...") {
+		t.Fatalf("alert titles should be capped, got %q", title)
+	}
+	feedback, ok := context["feedback"].(map[string]any)
+	if !ok || feedback["comment_count"] != 1 {
+		t.Fatalf("expected summarized feedback context, got %+v", context["feedback"])
+	}
+	if _, ok := feedback["comments"]; ok {
+		t.Fatalf("chat context should not include full feedback comments: %+v", feedback)
+	}
+	similar, ok := context["similar_incidents"].([]map[string]any)
+	if !ok || len(similar) != 1 {
+		t.Fatalf("expected compact similar incident context, got %+v", context["similar_incidents"])
+	}
+	if _, ok := similar[0]["analysis_detail"]; ok {
+		t.Fatalf("chat context should not include similar incident detail: %+v", similar[0])
+	}
+	if title, _ := similar[0]["title"].(string); len(title) > 123 || !strings.HasSuffix(title, "...") {
+		t.Fatalf("similar incident title should be capped, got %q", title)
+	}
+	if summary, _ := similar[0]["analysis_summary"].(string); len(summary) > 803 || !strings.HasSuffix(summary, "...") {
+		t.Fatalf("similar incident summary should be capped, got len=%d", len(summary))
+	}
+}
+
+func TestChatContextDropsClientSuppliedPayload(t *testing.T) {
+	server := NewServer()
+	incident, alert := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "chat-context-trim"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-chat-context-trim",
+	})
+
+	req := server.enrichChatRequest(ChatRequest{
+		Message:         "compare RCA",
+		ConversationID:  strings.Repeat("conversation-", 40),
+		Language:        strings.Repeat("language-", 40),
+		Page:            strings.Repeat("page-", 80),
+		IncidentContent: strings.Repeat("client supplied RCA ", 400),
+		Context: map[string]any{
+			"incident_id":      incident.IncidentID,
+			"dashboard_state":  map[string]any{"fake": true},
+			"untrusted_blob":   strings.Repeat("x", 4096),
+			"similar_incident": strings.Repeat("y", 4096),
+		},
+	})
+
+	if req.IncidentID != incident.IncidentID {
+		t.Fatalf("incident id from context should still be honored, got %q", req.IncidentID)
+	}
+	if strings.Contains(req.IncidentContent, "client supplied RCA") {
+		t.Fatalf("client-supplied incident content should be replaced with server context")
+	}
+	if len(req.ConversationID) > maxChatMetadataBytes+len("...") ||
+		len(req.Language) > maxChatMetadataBytes+len("...") ||
+		len(req.Page) > maxChatMetadataBytes+len("...") {
+		t.Fatalf("chat metadata should be capped, got conversation=%d language=%d page=%d", len(req.ConversationID), len(req.Language), len(req.Page))
+	}
+	if req.Context["page"] != req.Page {
+		t.Fatalf("context page should use capped page metadata")
+	}
+	missing := server.enrichChatRequest(ChatRequest{
+		Message:         "compare RCA",
+		IncidentID:      "INC-missing",
+		IncidentTitle:   "client title",
+		IncidentContent: strings.Repeat("client supplied RCA ", 400),
+		AlertTitle:      "client alert",
+		AlertContent:    strings.Repeat("client alert RCA ", 400),
+	})
+	if missing.IncidentTitle != "" || missing.IncidentContent != "" || missing.AlertTitle != "" || missing.AlertContent != "" {
+		t.Fatalf("client-supplied content should be dropped for missing targets: %+v", missing)
+	}
+	mismatched := server.enrichChatRequest(ChatRequest{
+		Message:    "compare RCA",
+		IncidentID: "INC-wrong",
+		AlertID:    alert.AlertID,
+	})
+	if mismatched.IncidentID != incident.IncidentID {
+		t.Fatalf("alert context should correct mismatched incident id, got %q", mismatched.IncidentID)
+	}
+	alertContext, ok := mismatched.Context["alert"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected sanitized alert context, got %+v", mismatched.Context["alert"])
+	}
+	if _, ok := alertContext["labels"]; ok {
+		t.Fatalf("alert context should not include full labels: %+v", alertContext)
+	}
+	if _, ok := alertContext["annotations"]; ok {
+		t.Fatalf("alert context should not include full annotations: %+v", alertContext)
+	}
+	if _, ok := alertContext["artifacts"]; ok {
+		t.Fatalf("alert context should not include full artifacts: %+v", alertContext)
+	}
+	if _, ok := req.Context["untrusted_blob"]; ok {
+		t.Fatalf("client-supplied context leaked to agent payload: %+v", req.Context)
+	}
+	if _, ok := req.Context["similar_incident"]; ok {
+		t.Fatalf("client-supplied similar context leaked to agent payload: %+v", req.Context)
+	}
+	targetType, targetID, inferred := server.chatAnalysisTarget(req)
+	if targetType != "incident" || targetID != incident.IncidentID || inferred {
+		t.Fatalf("chat target should use sanitized incident id, got type=%q id=%q inferred=%t", targetType, targetID, inferred)
+	}
+	invalidAlert := server.enrichChatRequest(ChatRequest{
+		Message:    "compare RCA",
+		IncidentID: incident.IncidentID,
+		AlertID:    "ALR-missing",
+	})
+	if invalidAlert.AlertID != "" || invalidAlert.IncidentID != incident.IncidentID {
+		t.Fatalf("invalid alert id should fall back to incident target, got alert=%q incident=%q", invalidAlert.AlertID, invalidAlert.IncidentID)
+	}
+	targetType, targetID, inferred = server.chatAnalysisTarget(invalidAlert)
+	if targetType != "incident" || targetID != incident.IncidentID || inferred {
+		t.Fatalf("invalid alert should not block valid incident target, got type=%q id=%q inferred=%t", targetType, targetID, inferred)
+	}
+	state, ok := req.Context["dashboard_state"].(map[string]any)
+	if !ok || state["fake"] != nil {
+		t.Fatalf("dashboard_state should be server-generated, got %+v", req.Context["dashboard_state"])
 	}
 }
 
@@ -1052,6 +1211,21 @@ func TestChatAnalysisRequestCreatesAnalysisRun(t *testing.T) {
 	run := waitForAnalysisRun(t, server, "chat")
 	if run.Status != "complete" || !strings.Contains(run.AnalysisSummary, "Chat-requested") {
 		t.Fatalf("unexpected analysis run: %+v", run)
+	}
+}
+
+func TestWantsAnalysisRunDoesNotTreatReplayAsReanalysis(t *testing.T) {
+	if wantsAnalysisRun("분석 결과 다시 보여줘") {
+		t.Fatalf("replaying an analysis result should not start a new agent run")
+	}
+	for _, message := range []string{
+		"이 RCA 분석 다시 돌려줘",
+		"지금 알람 분석해줘",
+		"분석 새로 시작해줘",
+	} {
+		if !wantsAnalysisRun(message) {
+			t.Fatalf("expected analysis request for %q", message)
+		}
 	}
 }
 
@@ -1414,6 +1588,58 @@ func TestFeedbackHintsHonorsLimitAcrossVoteHints(t *testing.T) {
 	hints := store.FeedbackHintsForAlert(alert, "INC-current", 1)
 	if len(hints) != 1 {
 		t.Fatalf("expected feedback hints to honor limit, got %+v", hints)
+	}
+}
+
+func TestFeedbackHintsCapHintText(t *testing.T) {
+	store := NewStore()
+	alert := Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIWorkloadPending",
+			"severity":  "warning",
+			"namespace": "runai",
+			"pod":       "trainer-0",
+		},
+		Annotations: map[string]string{"summary": "GPU quota exhausted for trainer"},
+	}
+	store.memories["ALR-prior-long-hint"] = &IncidentMemory{
+		IncidentID:      "INC-prior-long-hint",
+		AlertID:         "ALR-prior-long-hint",
+		Title:           "RunAI workload pending",
+		Severity:        "warning",
+		Status:          "resolved",
+		AnalysisSummary: strings.Repeat("quota summary ", 200),
+		AnalysisDetail:  "Quota was expanded.",
+		Labels:          cloneMap(alert.Labels),
+		CreatedAt:       time.Now().UTC(),
+		Vector:          textVector(alertSearchText(alert)),
+	}
+	store.feedback["FDB-prior-long-hint"] = &FeedbackRecord{
+		FeedbackID: "FDB-prior-long-hint",
+		TargetType: "incident",
+		TargetID:   "INC-prior-long-hint",
+		Vote:       "up",
+		Author:     "operator-a",
+		CreatedAt:  time.Now().UTC(),
+	}
+	store.comments["CMT-prior-long-hint"] = &CommentRecord{
+		CommentID:  "CMT-prior-long-hint",
+		TargetType: "incident",
+		TargetID:   "INC-prior-long-hint",
+		IncidentID: "INC-prior-long-hint",
+		Body:       strings.Repeat("operator comment ", 200),
+		CreatedAt:  time.Now().UTC(),
+	}
+
+	hints := store.FeedbackHintsForAlert(alert, "INC-current", 5)
+	if len(hints) < 2 {
+		t.Fatalf("expected vote and comment hints, got %+v", hints)
+	}
+	for _, hint := range hints {
+		if len(hint.Text) > maxFeedbackHintTextBytes+len("...") || !strings.HasSuffix(hint.Text, "...") {
+			t.Fatalf("feedback hint text should be capped, got len=%d text=%q", len(hint.Text), hint.Text)
+		}
 	}
 }
 

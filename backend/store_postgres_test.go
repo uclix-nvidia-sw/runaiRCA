@@ -201,6 +201,8 @@ type fakePostgresState struct {
 	failAnalysisRuns         bool
 	failAnalysisRunExecAfter int
 	analysisRunExecs         int
+	failAlertExecAfter       int
+	alertExecs               int
 	execs                    []string
 	queries                  []string
 	now                      time.Time
@@ -308,6 +310,11 @@ func (c *fakePostgresConn) ExecContext(ctx context.Context, query string, _ []dr
 		failAnalysisRun = c.state.failAnalysisRuns ||
 			(c.state.failAnalysisRunExecAfter > 0 && c.state.analysisRunExecs > c.state.failAnalysisRunExecAfter)
 	}
+	failAlert := false
+	if strings.Contains(query, "INSERT INTO alerts") {
+		c.state.alertExecs++
+		failAlert = c.state.failAlertExecAfter > 0 && c.state.alertExecs > c.state.failAlertExecAfter
+	}
 	c.state.mu.Unlock()
 
 	if c.state.failCreateVector && strings.Contains(query, "CREATE EXTENSION IF NOT EXISTS vector") {
@@ -315,6 +322,9 @@ func (c *fakePostgresConn) ExecContext(ctx context.Context, query string, _ []dr
 	}
 	if failAnalysisRun {
 		return nil, errors.New("analysis run write failed")
+	}
+	if failAlert {
+		return nil, errors.New("alert write failed")
 	}
 	return driver.RowsAffected(1), nil
 }

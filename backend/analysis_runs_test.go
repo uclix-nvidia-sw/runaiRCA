@@ -114,6 +114,92 @@ func TestAnalysisRunSuccessAppliesRCA(t *testing.T) {
 	}
 }
 
+func TestAnalysisRunCompactsSimilarIncidentsForAgent(t *testing.T) {
+	agentReqCh := make(chan AgentAnalysisRequest, 1)
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		var req AgentAnalysisRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode agent analysis request: %v", err)
+		}
+		agentReqCh <- req
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{Status: "ok", AnalysisSummary: "done"})
+	})
+	priorIncident, priorRecord := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "compact-prior"}, Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIQueueBlocked",
+			"severity":  "warning",
+			"queue":     "gpu-a",
+			"large":     strings.Repeat("label", 200),
+		},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-compact-prior",
+	})
+	server.store.ApplyAnalysis(priorRecord.AlertID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: strings.Repeat("summary ", 200),
+		AnalysisDetail:  strings.Repeat("detail ", 500),
+	})
+	_, record := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "compact-current"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning", "queue": "gpu-a"},
+		Annotations: map[string]string{"summary": "Queue blocked again"},
+		Fingerprint: "fp-compact-current",
+	})
+
+	server.startAnalysisRun("alert", record.AlertID, "manual", "")
+
+	agentReq := <-agentReqCh
+	if len(agentReq.SimilarIncidents) != 1 || agentReq.SimilarIncidents[0].IncidentID != priorIncident.IncidentID {
+		t.Fatalf("expected compact prior incident, got %+v", agentReq.SimilarIncidents)
+	}
+	similar := agentReq.SimilarIncidents[0]
+	if similar.AnalysisDetail != "" || similar.Labels != nil {
+		t.Fatalf("similar incident detail/labels should not be sent to agent: %+v", similar)
+	}
+	if len(similar.AnalysisSummary) > 803 || !strings.HasSuffix(similar.AnalysisSummary, "...") {
+		t.Fatalf("similar incident summary should be capped, got len=%d", len(similar.AnalysisSummary))
+	}
+}
+
+func TestAnalysisRunCompactsAlertMapValuesForAgent(t *testing.T) {
+	agentReqCh := make(chan AgentAnalysisRequest, 1)
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		var req AgentAnalysisRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode agent analysis request: %v", err)
+		}
+		agentReqCh <- req
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{Status: "ok", AnalysisSummary: "done"})
+	})
+	_, record := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "compact-alert-map"}, Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIQueueBlocked",
+			"severity":  "warning",
+			"large":     strings.Repeat("label", maxAgentMapValueBytes+200),
+		},
+		Annotations: map[string]string{"summary": strings.Repeat("summary", maxAgentMapValueBytes+200)},
+		Fingerprint: "fp-compact-alert-map",
+	})
+
+	server.startAnalysisRun("alert", record.AlertID, "manual", "")
+
+	agentReq := <-agentReqCh
+	if len(agentReq.Alert.Labels["large"]) > maxAgentMapValueBytes+len("...") ||
+		!strings.HasSuffix(agentReq.Alert.Labels["large"], "...") {
+		t.Fatalf("large label should be capped, got len=%d", len(agentReq.Alert.Labels["large"]))
+	}
+	if len(agentReq.Alert.Annotations["summary"]) > maxAgentMapValueBytes+len("...") ||
+		!strings.HasSuffix(agentReq.Alert.Annotations["summary"], "...") {
+		t.Fatalf("large annotation should be capped, got len=%d", len(agentReq.Alert.Annotations["summary"]))
+	}
+	stored, _ := server.store.AlertDetail(record.AlertID)
+	if len(stored.Annotations["summary"]) <= maxAgentMapValueBytes+len("...") {
+		t.Fatalf("stored alert annotation should not be compacted")
+	}
+}
+
 func TestAnalysisRunTimeoutFailsRun(t *testing.T) {
 	var hit atomic.Int32
 	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
@@ -223,6 +309,154 @@ func TestWebhookAutoAnalysisFanoutCapsRunsAndAgentCallsTogether(t *testing.T) {
 	}
 }
 
+func TestWebhookAutoAnalysisCapsAcrossPayloads(t *testing.T) {
+	var hit atomic.Int32
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		hit.Add(1)
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Auto RCA complete.",
+			AnalysisDetail:  "## Root Cause\n\nGlobal auto cap.",
+			AnalysisQuality: "medium",
+		})
+	})
+	makeAlerts := func(prefix string, count int) []Alert {
+		alerts := make([]Alert, count)
+		for i := range alerts {
+			alerts[i] = Alert{
+				Status: "firing",
+				Labels: map[string]string{
+					"alertname": "RunAIWorkloadPending",
+					"severity":  "warning",
+					"namespace": fmt.Sprintf("%s-%02d", prefix, i),
+					"workload":  fmt.Sprintf("trainer-%02d", i),
+				},
+				Annotations: map[string]string{"summary": "Workload pending"},
+				Fingerprint: fmt.Sprintf("fp-%s-%02d", prefix, i),
+			}
+		}
+		return alerts
+	}
+	firstPayload, _ := json.Marshal(AlertmanagerWebhook{GroupKey: "auto-global-cap-1", Alerts: makeAlerts("global-a", maxAutoAnalyzeFanout)})
+	firstRec := httptest.NewRecorder()
+	server.routes().ServeHTTP(firstRec, httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(firstPayload)))
+	if firstRec.Code != http.StatusAccepted {
+		t.Fatalf("expected first webhook 202, got %d: %s", firstRec.Code, firstRec.Body.String())
+	}
+	secondPayload, _ := json.Marshal(AlertmanagerWebhook{GroupKey: "auto-global-cap-2", Alerts: makeAlerts("global-b", 3)})
+	secondRec := httptest.NewRecorder()
+	server.routes().ServeHTTP(secondRec, httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(secondPayload)))
+	if secondRec.Code != http.StatusAccepted {
+		t.Fatalf("expected second webhook 202, got %d: %s", secondRec.Code, secondRec.Body.String())
+	}
+	var secondResponse map[string]any
+	if err := json.Unmarshal(secondRec.Body.Bytes(), &secondResponse); err != nil {
+		t.Fatalf("decode second response: %v", err)
+	}
+	if secondResponse["auto_analyses"].(float64) != 0 {
+		t.Fatalf("second webhook should be globally capped, got %+v", secondResponse)
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != maxAutoAnalyzeFanout {
+		t.Fatalf("global cap should keep run count bounded, got %d", len(runs))
+	}
+}
+
+func TestAnalysisRunLimitsConcurrentAgentCalls(t *testing.T) {
+	var hit atomic.Int32
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		current := inFlight.Add(1)
+		for {
+			seen := maxInFlight.Load()
+			if current <= seen || maxInFlight.CompareAndSwap(seen, current) {
+				break
+			}
+		}
+		hit.Add(1)
+		started <- struct{}{}
+		<-release
+		inFlight.Add(-1)
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "ok",
+			AnalysisQuality: "high",
+		})
+	})
+	server.agentSlots = make(chan struct{}, 1)
+	_, first := seedAlert(t, server, "agent-limit-a")
+	_, second := seedAlert(t, server, "agent-limit-b")
+
+	if _, ok := server.startAnalysisRun("alert", first.AlertID, "auto", ""); !ok {
+		t.Fatal("expected first run to start")
+	}
+	if _, ok := server.startAnalysisRun("alert", second.AlertID, "auto", ""); !ok {
+		t.Fatal("expected second run to queue")
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first agent call did not start")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := hit.Load(); got != 1 {
+		t.Fatalf("expected only one agent call before release, got %d", got)
+	}
+	close(release)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		completed := 0
+		for _, run := range server.store.ListAnalysisRuns() {
+			if run.Status == "complete" {
+				completed++
+			}
+		}
+		if completed == 2 {
+			if got := maxInFlight.Load(); got != 1 {
+				t.Fatalf("expected max in-flight agent calls to be 1, got %d", got)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("runs did not complete: %+v", server.store.ListAnalysisRuns())
+}
+
+func TestAnalysisRunFailsWhenAgentSlotUnavailable(t *testing.T) {
+	var hit atomic.Int32
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		hit.Add(1)
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "should not run",
+			AnalysisQuality: "high",
+		})
+	})
+	server.agentSlots = make(chan struct{}, 1)
+	server.agentSlots <- struct{}{}
+	server.agentRequestTimeout = 10 * time.Millisecond
+	_, record := seedAlert(t, server, "agent-limit-timeout")
+
+	run, ok := server.startAnalysisRun("alert", record.AlertID, "auto", "")
+	if !ok {
+		t.Fatal("expected run to start before waiting for an agent slot")
+	}
+	failed := waitForRunIDStatus(t, server, run.RunID, "failed")
+	if failed.Capabilities["agent"] != string(agentErrBusy) {
+		t.Fatalf("expected busy failure, got %+v", failed.Capabilities)
+	}
+	if got := hit.Load(); got != 0 {
+		t.Fatalf("agent was called despite unavailable slot: %d", got)
+	}
+	alert, _ := server.store.AlertDetail(record.AlertID)
+	if alert.IsAnalyzing {
+		t.Fatal("alert remained analyzing after slot timeout")
+	}
+}
+
 func TestAnalysisRunPersistFailureSkipsAgentCall(t *testing.T) {
 	state := newFakePostgresState(false)
 	state.failAnalysisRuns = true
@@ -325,6 +559,73 @@ func TestAnalysisRunUpdatePersistFailureSkipsAlertRCA(t *testing.T) {
 	after := waitForRunIDStatus(t, server, run.RunID, "analyzing")
 	if after.AnalysisSummary != "" {
 		t.Fatalf("run should be restored to analyzing without result text: %+v", after)
+	}
+}
+
+func TestAlertRCAPersistFailureFailsRun(t *testing.T) {
+	state := newFakePostgresState(false)
+	store := NewStore()
+	store.connectDatabaseWithDriver(registerFakePostgresDriver(state), "fake://runai_rca", time.Second)
+	defer store.db.Close()
+	_, record := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "alert-persist-failure"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-alert-persist-failure",
+	})
+	state.failAlertExecAfter = 2
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "RCA should not look successful.",
+			AnalysisDetail:  "## Root Cause\n\nPersist fails.",
+			AnalysisQuality: "high",
+		})
+	}))
+	defer agent.Close()
+	server := &Server{
+		store:                     store,
+		hub:                       NewHub(),
+		agentURL:                  agent.URL,
+		agentRequestTimeout:       time.Second,
+		manualAgentRequestTimeout: time.Second,
+		client:                    &http.Client{},
+	}
+
+	server.startAnalysisRun("alert", record.AlertID, "manual", "")
+
+	run := waitForRunStatus(t, server, "manual", "failed")
+	if run.Capabilities["database"] != "alert_persist_failed" {
+		t.Fatalf("expected database persistence failure on run, got %+v", run)
+	}
+	alert, _ := store.AlertDetail(record.AlertID)
+	if alert.AnalysisSummary != "" || alert.AnalysisDetail != "" || alert.IsAnalyzing {
+		t.Fatalf("failed alert RCA persist should not leave visible RCA/analyzing state: %+v", alert)
+	}
+}
+
+func TestReapPersistFailureKeepsRunAnalyzing(t *testing.T) {
+	state := newFakePostgresState(false)
+	store := NewStore()
+	store.connectDatabaseWithDriver(registerFakePostgresDriver(state), "fake://runai_rca", time.Second)
+	defer store.db.Close()
+	incident, record := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "reap-persist-failure"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-reap-persist-failure",
+	})
+	run := store.CreateAnalysisRun("auto", "alert", record.AlertID, incident.IncidentID, record.AlertID, "stale", "")
+	state.failAnalysisRunExecAfter = 1
+
+	reaped := store.ReapStaleAnalyzingRuns(0, 0)
+
+	if reaped != 0 {
+		t.Fatalf("failed reap persist should not count as reaped, got %d", reaped)
+	}
+	after := store.ListAnalysisRuns()[0]
+	if after.RunID != run.RunID || after.Status != "analyzing" || after.Capabilities["agent"] == "interrupted" {
+		t.Fatalf("failed reap persist should keep run analyzing, got %+v", after)
 	}
 }
 
@@ -691,6 +992,40 @@ func TestAnalysisRunHugeAgentResponseFailsRun(t *testing.T) {
 	}
 }
 
+func TestAnalysisRunHugeAgentRequestFailsBeforeCall(t *testing.T) {
+	var hit atomic.Int32
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		hit.Add(1)
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{Status: "ok"})
+	})
+	annotations := map[string]string{"summary": "Queue blocked"}
+	for i := 0; i < 2*int(maxAgentRequestBodyBytes)/maxAgentMapValueBytes; i++ {
+		annotations[fmt.Sprintf("extra_%03d", i)] = strings.Repeat("x", maxAgentMapValueBytes+200)
+	}
+	incident, record := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "huge-agent-request"}, Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIQueueBlocked",
+			"severity":  "warning",
+		},
+		Annotations: annotations,
+		Fingerprint: "fp-huge-agent-request",
+	})
+	if incident == nil || record == nil {
+		t.Fatalf("seed huge request alert failed")
+	}
+
+	server.startAnalysisRun("alert", record.AlertID, "manual", "")
+
+	run := waitForRunStatus(t, server, "manual", "failed")
+	if run.Capabilities["agent"] != string(agentErrRequestTooBig) {
+		t.Fatalf("expected request_too_large failure, got %+v", run)
+	}
+	if hit.Load() != 0 {
+		t.Fatalf("oversized request should not call agent, got %d calls", hit.Load())
+	}
+}
+
 func TestDashboardAnalyzeCreatesAnalysisRun(t *testing.T) {
 	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
@@ -850,8 +1185,17 @@ func TestDashboardAnalyzeStartsRemainingAlertsWhileOneIsAnalyzing(t *testing.T) 
 	}
 }
 
-func TestDashboardAnalyzeLargeIncidentRejectsAgentFanout(t *testing.T) {
-	server := NewServer()
+func TestDashboardAnalyzeLargeIncidentStartsCappedRuns(t *testing.T) {
+	var hit atomic.Int32
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		hit.Add(1)
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Large incident RCA complete.",
+			AnalysisDetail:  "## Root Cause\n\nCapped large incident analysis.",
+			AnalysisQuality: "medium",
+		})
+	})
 	incident, _ := seedAlert(t, server, "fp-dashboard-large")
 	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
 	extraAlerts := 28
@@ -877,11 +1221,27 @@ func TestDashboardAnalyzeLargeIncidentRejectsAgentFanout(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, nil))
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("expected large analyze 409, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected large analyze 202, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if runs := server.store.ListAnalysisRuns(); len(runs) != 0 {
-		t.Fatalf("large incident should not fan out new runs, got %+v", runs)
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["status"] != "analysis_requested" ||
+		response["analysis_runs"].(float64) != float64(maxManualAnalyzeFanout) ||
+		response["analysis_limit"].(float64) != float64(maxManualAnalyzeFanout) {
+		t.Fatalf("expected capped large incident analysis, got %+v", response)
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != maxManualAnalyzeFanout {
+		t.Fatalf("large incident should start capped runs, got %+v", runs)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && hit.Load() < int32(maxManualAnalyzeFanout) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if hit.Load() != int32(maxManualAnalyzeFanout) {
+		t.Fatalf("agent calls should be capped, got %d", hit.Load())
 	}
 }
 

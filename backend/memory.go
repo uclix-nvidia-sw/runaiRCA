@@ -15,7 +15,10 @@ import (
 // (it must run offline next to the NeMo agent), so dense vectors are produced
 // deterministically from text with the feature-hashing trick. Changing this
 // value invalidates previously persisted vectors of a different dimension.
-const embeddingDim = 384
+const (
+	embeddingDim             = 384
+	maxFeedbackHintTextBytes = 800
+)
 
 type IncidentMemory struct {
 	IncidentID      string
@@ -49,7 +52,7 @@ func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int)
 				SourceID:  item.IncidentID,
 				Sentiment: "positive",
 				Weight:    item.Similarity,
-				Text:      fmt.Sprintf("Operators found this prior RCA useful: %s", item.AnalysisSummary),
+				Text:      excerpt(fmt.Sprintf("Operators found this prior RCA useful: %s", item.AnalysisSummary), maxFeedbackHintTextBytes),
 			})
 			if len(hints) >= limit {
 				return hints
@@ -60,7 +63,7 @@ func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int)
 				SourceID:  item.IncidentID,
 				Sentiment: "negative",
 				Weight:    item.Similarity,
-				Text:      fmt.Sprintf("Operators pushed back on this prior RCA: %s", item.AnalysisSummary),
+				Text:      excerpt(fmt.Sprintf("Operators pushed back on this prior RCA: %s", item.AnalysisSummary), maxFeedbackHintTextBytes),
 			})
 			if len(hints) >= limit {
 				return hints
@@ -78,7 +81,7 @@ func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int)
 				SourceID:  item.IncidentID,
 				Sentiment: "comment",
 				Weight:    item.Similarity,
-				Text:      comment.Body,
+				Text:      excerpt(comment.Body, maxFeedbackHintTextBytes),
 			})
 			if len(hints) >= limit {
 				return hints
@@ -171,7 +174,33 @@ func (s *Store) ApplyAnalysisForRun(runID string, alertID string, response Agent
 	if alert == nil || !s.isLatestAnalysisRunForAlertLocked(runID, alertID) {
 		return false
 	}
-	s.applyAnalysisLocked(alert, response)
+	before := cloneAlert(alert)
+	alert.AnalysisSummary = response.AnalysisSummary
+	alert.AnalysisDetail = response.AnalysisDetail
+	if alert.AnalysisDetail == "" {
+		alert.AnalysisDetail = response.Analysis
+	}
+	alert.AnalysisQuality = response.AnalysisQuality
+	alert.Capabilities = response.Capabilities
+	alert.MissingData = response.MissingData
+	alert.Warnings = response.Warnings
+	alert.Artifacts = response.Artifacts
+	alert.IsAnalyzing = false
+	if !s.persistAlertLocked(alert) {
+		*alert = *before
+		alert.IsAnalyzing = false
+		if incident := s.incidents[alert.IncidentID]; incident != nil {
+			s.refreshIncidentAnalyzingLocked(incident.IncidentID)
+			s.persistIncidentLocked(incident)
+		}
+		s.persistAlertLocked(alert)
+		return false
+	}
+	if incident := s.incidents[alert.IncidentID]; incident != nil {
+		s.refreshIncidentAnalyzingLocked(incident.IncidentID)
+		s.upsertMemoryLocked(incident, alert)
+		s.persistIncidentLocked(incident)
+	}
 	return true
 }
 

@@ -642,6 +642,7 @@ func (s *Store) ReapStaleAnalyzingRuns(staleAfter time.Duration, manualStaleAfte
 		if runStaleAfter > 0 && run.UpdatedAt.After(now.Add(-runStaleAfter)) {
 			continue
 		}
+		before := cloneAnalysisRun(run)
 		run.Status = "failed"
 		run.AnalysisQuality = first(run.AnalysisQuality, "low")
 		if run.Capabilities == nil {
@@ -650,7 +651,10 @@ func (s *Store) ReapStaleAnalyzingRuns(staleAfter time.Duration, manualStaleAfte
 		run.Capabilities["agent"] = "interrupted"
 		run.Warnings = append(run.Warnings, "analysis was interrupted by a backend restart and marked failed")
 		run.UpdatedAt = now
-		s.persistAnalysisRunLocked(run)
+		if !s.persistAnalysisRunLocked(run) {
+			*run = before
+			continue
+		}
 		reaped++
 	}
 	activeAlerts := map[string]bool{}

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
 
 func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
@@ -43,6 +44,9 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 		if autoAnalyses >= maxAutoAnalyzeFanout {
 			break
 		}
+		if !s.reserveAutoAnalysisSlot() {
+			break
+		}
 		if _, ok := s.startAnalysisRun("alert", alertID, "auto", ""); ok {
 			autoAnalyses++
 		}
@@ -58,6 +62,25 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 			"auto_analyses": autoAnalyses,
 		},
 	)
+}
+
+func (s *Server) reserveAutoAnalysisSlot() bool {
+	now := time.Now().UTC()
+	cutoff := now.Add(-autoAnalyzeWindow)
+	s.autoAnalyzeMu.Lock()
+	defer s.autoAnalyzeMu.Unlock()
+	kept := s.autoAnalyzeStarts[:0]
+	for _, startedAt := range s.autoAnalyzeStarts {
+		if startedAt.After(cutoff) {
+			kept = append(kept, startedAt)
+		}
+	}
+	s.autoAnalyzeStarts = kept
+	if len(s.autoAnalyzeStarts) >= maxAutoAnalyzeFanout {
+		return false
+	}
+	s.autoAnalyzeStarts = append(s.autoAnalyzeStarts, now)
+	return true
 }
 
 func (s *Server) handleAlert(w http.ResponseWriter, r *http.Request) {

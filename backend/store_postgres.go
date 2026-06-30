@@ -720,9 +720,9 @@ func (s *Store) loadAnalysisRuns(ctx context.Context) {
 	}
 }
 
-func (s *Store) persistIncidentLocked(incident *Incident) {
+func (s *Store) persistIncidentLocked(incident *Incident) bool {
 	if s.db == nil || !s.dbReady || incident == nil {
-		return
+		return true
 	}
 	_, err := s.execPostgres(
 		`INSERT INTO incidents (
@@ -749,12 +749,14 @@ func (s *Store) persistIncidentLocked(incident *Incident) {
 	)
 	if err != nil {
 		log.Printf("Failed to persist incident %s: %v", incident.IncidentID, err)
+		return false
 	}
+	return true
 }
 
-func (s *Store) persistAlertLocked(alert *AlertRecord) {
+func (s *Store) persistAlertLocked(alert *AlertRecord) bool {
 	if s.db == nil || !s.dbReady || alert == nil {
-		return
+		return true
 	}
 	_, err := s.execPostgres(
 		`INSERT INTO alerts (
@@ -810,7 +812,9 @@ func (s *Store) persistAlertLocked(alert *AlertRecord) {
 	)
 	if err != nil {
 		log.Printf("Failed to persist alert %s: %v", alert.AlertID, err)
+		return false
 	}
+	return true
 }
 
 func (s *Store) persistMemoryLocked(memory *IncidentMemory) {

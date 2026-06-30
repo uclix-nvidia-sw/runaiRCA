@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -192,6 +193,9 @@ type Server struct {
 	agentRequestTimeout       time.Duration
 	manualAgentRequestTimeout time.Duration
 	client                    *http.Client
+	agentSlots                chan struct{}
+	autoAnalyzeMu             sync.Mutex
+	autoAnalyzeStarts         []time.Time
 }
 
 const (
@@ -203,6 +207,8 @@ const (
 	maxWebhookAlerts       = 500
 	maxAutoAnalyzeFanout   = 25
 	maxManualAnalyzeFanout = 25
+	maxConcurrentAgentRuns = maxManualAnalyzeFanout
+	autoAnalyzeWindow      = time.Minute
 )
 
 func main() {
@@ -263,6 +269,7 @@ func NewServer() *Server {
 		agentRequestTimeout:       agentRequestTimeout,
 		manualAgentRequestTimeout: manualAgentRequestTimeout,
 		client:                    &http.Client{},
+		agentSlots:                make(chan struct{}, maxConcurrentAgentRuns),
 	}
 }
 

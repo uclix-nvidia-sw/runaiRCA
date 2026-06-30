@@ -70,13 +70,12 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "incident has no alerts to analyze")
 			return
 		}
-		if len(detail.Alerts) > maxManualAnalyzeFanout {
-			writeError(w, http.StatusConflict, "incident has too many alerts to analyze at once")
-			return
-		}
 		started := 0
 		alreadyRunning := false
 		for _, alert := range detail.Alerts {
+			if started >= maxManualAnalyzeFanout {
+				break
+			}
 			run, ok := s.startAnalysisRun("alert", alert.AlertID, "manual", "")
 			if ok {
 				started++
@@ -95,10 +94,11 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusAccepted, map[string]any{
-			"status":        "analysis_requested",
-			"mode":          "alerts",
-			"analysis_runs": started,
-			"alert_count":   len(detail.Alerts),
+			"status":         "analysis_requested",
+			"mode":           "alerts",
+			"analysis_runs":  started,
+			"alert_count":    len(detail.Alerts),
+			"analysis_limit": maxManualAnalyzeFanout,
 		})
 	case "resolve":
 		if len(parts) != 2 || r.Method != http.MethodPost {
