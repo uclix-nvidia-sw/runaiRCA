@@ -884,7 +884,7 @@ func (s *Store) AddFeedback(
 	if err := validateStoredText("author", actor, maxFeedbackAuthorBytes); err != nil {
 		return FeedbackSummary{}, false, err
 	}
-	if err := validateStoredText("comment", req.Comment, maxStoredCommentBodyBytes); err != nil {
+	if err := validateStoredText("comment", comment, maxStoredCommentBodyBytes); err != nil {
 		return FeedbackSummary{}, false, err
 	}
 	if strings.EqualFold(rawVote, "none") {
