@@ -264,9 +264,14 @@ class AnalysisOrchestrator:
         grounding = _chat_answer_from_context(request, context, str(entity), self._masker)
         answer = grounding
         if llm_configured:
-            llm_answer = await self._llm_chat_answer(request, grounding)
-            if llm_answer:
-                answer = self._masker.mask_text(llm_answer)
+            try:
+                llm_answer = await self._llm_chat_answer(request, grounding)
+            except Exception as exc:
+                warning = self._masker.mask_text(_unexpected_runtime_warning("llm", exc))
+                answer = _append_chat_warning(grounding, warning)
+            else:
+                if llm_answer:
+                    answer = self._masker.mask_text(llm_answer)
         response = ChatResponse(
             status="ok",
             answer=answer,
@@ -350,6 +355,12 @@ def _collector_name(collector: object) -> str:
 
 def _unexpected_runtime_warning(component: str, exc: Exception) -> str:
     return f"{component} failed unexpectedly: {type(exc).__name__}: {exc}"
+
+
+def _append_chat_warning(answer: str, warning: str) -> str:
+    if "## Warnings" in answer:
+        return f"{answer}\n- {warning}"
+    return "\n".join([answer, "", "## Warnings", "", f"- {warning}"])
 
 
 def _build_settings_masker(settings: Settings) -> Masker:

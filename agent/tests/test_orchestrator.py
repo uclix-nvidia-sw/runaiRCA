@@ -512,6 +512,29 @@ async def test_chat_falls_back_when_llm_unavailable(monkeypatch) -> None:
     assert "## RCA Chat" in response.answer
 
 
+@pytest.mark.anyio
+async def test_chat_falls_back_when_llm_call_raises(monkeypatch) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.example.com/v1",
+        llm_model="rca-router",
+        llm_api_key="secret",
+    )
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        raise RuntimeError("LLM transport exploded")
+
+    monkeypatch.setattr("app.services.orchestrator.post_json", fake_post_json)
+    orchestrator = AnalysisOrchestrator(settings)
+    response = await orchestrator.chat(ChatRequest(message="status?", page="operations"))
+
+    assert response.status == "ok"
+    assert "## RCA Chat" in response.answer
+    assert "## Warnings" in response.answer
+    assert "llm failed unexpectedly" in response.answer
+    assert "LLM transport exploded" in response.answer
+
+
 def test_extract_nat_result_strips_console_wrapper() -> None:
     output = (
         "\x1b[32mWorkflow Result:\n## Root Cause\n\nBody\n"
