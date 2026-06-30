@@ -773,6 +773,9 @@ func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 	})
 	summaryLines := []string{}
 	detailSections := []string{}
+	seenMissingData := map[string]struct{}{}
+	seenWarnings := map[string]struct{}{}
+	seenArtifacts := map[string]struct{}{}
 	for _, alert := range detail.Alerts {
 		if strings.TrimSpace(alert.AnalysisSummary) == "" && strings.TrimSpace(alert.AnalysisDetail) == "" {
 			continue
@@ -790,9 +793,28 @@ func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 		for key, value := range alert.Capabilities {
 			detail.Capabilities[key] = value
 		}
-		detail.MissingData = append(detail.MissingData, alert.MissingData...)
-		detail.Warnings = append(detail.Warnings, alert.Warnings...)
-		detail.Artifacts = append(detail.Artifacts, alert.Artifacts...)
+		for _, item := range alert.MissingData {
+			if _, ok := seenMissingData[item]; ok {
+				continue
+			}
+			seenMissingData[item] = struct{}{}
+			detail.MissingData = append(detail.MissingData, item)
+		}
+		for _, item := range alert.Warnings {
+			if _, ok := seenWarnings[item]; ok {
+				continue
+			}
+			seenWarnings[item] = struct{}{}
+			detail.Warnings = append(detail.Warnings, item)
+		}
+		for _, artifact := range alert.Artifacts {
+			key := string(mustJSON(artifact))
+			if _, ok := seenArtifacts[key]; ok {
+				continue
+			}
+			seenArtifacts[key] = struct{}{}
+			detail.Artifacts = append(detail.Artifacts, artifact)
+		}
 	}
 	if len(summaryLines) > 0 {
 		detail.AnalysisSummary = strings.Join(summaryLines, "\n")

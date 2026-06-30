@@ -1341,12 +1341,18 @@ func TestIncidentDetailAggregatesAlertAnalyses(t *testing.T) {
 		AnalysisSummary: "Queue saturation RCA.",
 		AnalysisDetail:  "Queue workers are waiting.",
 		AnalysisQuality: "medium",
+		MissingData:     []string{"loki.logs"},
+		Warnings:        []string{"partial logs"},
+		Artifacts:       []Artifact{{Agent: "runai", Source: "workloads", Type: "api", Status: "ok", Confidence: "high"}},
 	})
 	store.ApplyAnalysis(secondID, AgentAnalysisResponse{
 		Status:          "ok",
 		AnalysisSummary: "Quota exhaustion RCA.",
 		AnalysisDetail:  "GPU quota is exhausted.",
 		AnalysisQuality: "high",
+		MissingData:     []string{"loki.logs"},
+		Warnings:        []string{"partial logs"},
+		Artifacts:       []Artifact{{Agent: "runai", Source: "workloads", Type: "api", Status: "ok", Confidence: "high"}},
 	})
 
 	detail, ok := store.IncidentDetail(incident.IncidentID)
@@ -1360,6 +1366,9 @@ func TestIncidentDetailAggregatesAlertAnalyses(t *testing.T) {
 	if !strings.Contains(detail.AnalysisDetail, "Queue workers are waiting.") ||
 		!strings.Contains(detail.AnalysisDetail, "GPU quota is exhausted.") {
 		t.Fatalf("incident detail should aggregate alert RCA details, got %q", detail.AnalysisDetail)
+	}
+	if len(detail.MissingData) != 1 || len(detail.Warnings) != 1 || len(detail.Artifacts) != 1 {
+		t.Fatalf("incident RCA metadata should be deduplicated, got missing=%v warnings=%v artifacts=%v", detail.MissingData, detail.Warnings, detail.Artifacts)
 	}
 }
 
