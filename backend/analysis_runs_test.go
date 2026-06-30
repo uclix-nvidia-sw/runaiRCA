@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -413,6 +414,123 @@ func TestDashboardAnalyzeCreatesAnalysisRun(t *testing.T) {
 	}
 	if !strings.Contains(run.Title, "Dashboard analysis") {
 		t.Fatalf("expected dashboard source title, got %q", run.Title)
+	}
+}
+
+func TestDashboardAnalyzeSkipsDuplicateWhenIncidentAlreadyAnalyzing(t *testing.T) {
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var hit atomic.Int32
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		hit.Add(1)
+		close(firstStarted)
+		<-releaseFirst
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Manual RCA complete.",
+			AnalysisDetail:  "## Root Cause\n\nManual analysis finished.",
+			AnalysisQuality: "medium",
+		})
+	})
+	incident, _ := seedAlert(t, server, "fp-dashboard-duplicate")
+	path := "/api/v1/incidents/" + incident.IncidentID + "/analyze"
+
+	firstRec := httptest.NewRecorder()
+	server.routes().ServeHTTP(firstRec, httptest.NewRequest(http.MethodPost, path, nil))
+	if firstRec.Code != http.StatusAccepted {
+		t.Fatalf("expected first analyze 202, got %d: %s", firstRec.Code, firstRec.Body.String())
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("first analysis did not reach agent")
+	}
+
+	secondRec := httptest.NewRecorder()
+	server.routes().ServeHTTP(secondRec, httptest.NewRequest(http.MethodPost, path, nil))
+	if secondRec.Code != http.StatusAccepted {
+		t.Fatalf("expected duplicate analyze 202, got %d: %s", secondRec.Code, secondRec.Body.String())
+	}
+	var duplicateResponse map[string]any
+	if err := json.Unmarshal(secondRec.Body.Bytes(), &duplicateResponse); err != nil {
+		t.Fatalf("decode duplicate response: %v", err)
+	}
+	if duplicateResponse["status"] != "analysis_already_running" {
+		t.Fatalf("expected already running response, got %+v", duplicateResponse)
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 {
+		t.Fatalf("duplicate analyze should not create another run, got %+v", runs)
+	}
+	close(releaseFirst)
+	waitForRunStatus(t, server, "manual", "complete")
+	if hit.Load() != 1 {
+		t.Fatalf("expected exactly one agent call, got %d", hit.Load())
+	}
+}
+
+func TestDashboardAnalyzeLargeIncidentUsesSingleIncidentRun(t *testing.T) {
+	agentReqCh := make(chan AgentAnalysisRequest, 1)
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		var req AgentAnalysisRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode agent request: %v", err)
+		}
+		agentReqCh <- req
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Large incident RCA complete.",
+			AnalysisDetail:  "## Root Cause\n\nIncident-scope analysis avoided fan-out.",
+			AnalysisQuality: "medium",
+		})
+	})
+	incident, _ := seedAlert(t, server, "fp-dashboard-large")
+	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
+	server.store.mu.Lock()
+	for i := 1; i <= maxManualAnalyzeFanout+3; i++ {
+		alertID := fmt.Sprintf("ALR-large-%03d", i)
+		server.store.alerts[alertID] = &AlertRecord{
+			AlertID:     alertID,
+			IncidentID:  incident.IncidentID,
+			AlarmTitle:  fmt.Sprintf("Large incident alert %03d", i),
+			Severity:    "warning",
+			Status:      "firing",
+			FiredAt:     base.Add(time.Duration(i) * time.Minute),
+			Fingerprint: fmt.Sprintf("fp-dashboard-large-%03d", i),
+			ThreadTS:    "thread-" + alertID,
+			Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+			Annotations: map[string]string{"summary": "Queue blocked"},
+		}
+	}
+	server.store.incidents[incident.IncidentID].AlertCount = maxManualAnalyzeFanout + 4
+	server.store.mu.Unlock()
+	path := "/api/v1/incidents/" + incident.IncidentID + "/analyze"
+
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, nil))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected large analyze 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["mode"] != "incident" || response["analysis_runs"].(float64) != 1 {
+		t.Fatalf("expected single incident run response, got %+v", response)
+	}
+	agentReq := <-agentReqCh
+	if agentReq.IncidentID != incident.IncidentID {
+		t.Fatalf("incident id was not forwarded: %+v", agentReq)
+	}
+	run := waitForRunStatus(t, server, "manual", "complete")
+	if run.TargetType != "incident" || run.TargetID != incident.IncidentID {
+		t.Fatalf("expected incident-scope run, got %+v", run)
+	}
+	alert, _ := server.store.AlertDetail(run.AlertID)
+	if alert.IsAnalyzing {
+		t.Fatalf("representative alert should be complete, got %+v", alert)
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 {
+		t.Fatalf("large incident should create one run, got %+v", runs)
 	}
 }
 

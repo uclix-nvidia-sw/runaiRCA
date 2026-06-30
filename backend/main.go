@@ -194,11 +194,12 @@ type Server struct {
 }
 
 const (
-	similarIncidentLimit = 3
-	flappingGroupWindow  = 30 * time.Minute
-	maxListLimit         = 200
-	maxJSONBodyBytes     = 1 << 20
-	maxWebhookAlerts     = 500
+	similarIncidentLimit   = 3
+	flappingGroupWindow    = 30 * time.Minute
+	maxListLimit           = 200
+	maxJSONBodyBytes       = 1 << 20
+	maxWebhookAlerts       = 500
+	maxManualAnalyzeFanout = 25
 )
 
 func main() {
