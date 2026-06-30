@@ -281,6 +281,7 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 		`CREATE INDEX IF NOT EXISTS idx_comments_target ON rca_comments (target_type, target_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_created_at ON analysis_runs (created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_target ON analysis_runs (target_type, target_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_analysis_runs_one_analyzing_alert ON analysis_runs (alert_id) WHERE status = 'analyzing' AND alert_id IS NOT NULL AND alert_id <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_embeddings_created_at ON incident_embeddings (created_at DESC)`,
 	}
 	for _, statement := range statements {

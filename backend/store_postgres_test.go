@@ -37,6 +37,9 @@ func TestPostgresConnectReportsPGVectorEnabledAndLoadsState(t *testing.T) {
 	if !state.executed("idx_incident_embeddings_incident_alert") {
 		t.Fatalf("expected alert-scoped incident embedding uniqueness DDL, got %+v", state.execs)
 	}
+	if !state.executed("idx_analysis_runs_one_analyzing_alert") {
+		t.Fatalf("expected alert-scoped analyzing run uniqueness DDL, got %+v", state.execs)
+	}
 	if !state.executed("ADD COLUMN IF NOT EXISTS embedding vector(") ||
 		!state.executed("USING hnsw (embedding vector_cosine_ops)") {
 		t.Fatalf("expected pgvector column and cosine index DDL, got %+v", state.execs)
