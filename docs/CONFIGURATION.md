@@ -121,7 +121,7 @@ Frequently tuned Helm values:
 | `agent.env.kubernetesListLimit` / `agent.env.lokiQueryLimit` | Evidence volume controls for Kubernetes list calls and Loki log query groups |
 | `agent.env.troubleshootingCasesFile` / `agent.env.agentSoulsFile` | Paths for injected troubleshooting memory and agent role contracts |
 | `agent.env.maskingRegexListJson` / `builtinRedaction*` | Cluster-specific secret masking regexes plus built-in redaction enable/hash controls |
-| `frontend.config.apiBaseUrl` | Browser API base URL when not using the bundled nginx `/api` proxy; accepts absolute URLs, `/api`-style paths, or localhost host:port values |
+| `frontend.config.apiBaseUrl` | Browser API origin when not using the bundled nginx `/api` proxy; leave empty for the default proxy, or use an absolute URL / localhost host:port for an external backend |
 | `frontend.nginx.*` | Frontend nginx proxy timeout and body-size controls for REST, webhook, and SSE traffic; defaults keep event streams open for one hour |
 | `backend.extraEnv`, `agent.extraEnv`, `frontend.extraEnv` | Additional container env entries for deployment-specific settings |
 | `podAnnotations` / `podLabels` | Global pod metadata applied to Backend, Agent, Frontend, and bundled Postgres |
