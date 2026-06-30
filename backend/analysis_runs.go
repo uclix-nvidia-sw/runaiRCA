@@ -122,7 +122,7 @@ func (s *Server) analysisRequestTimeout(source string) time.Duration {
 
 func (s *Server) broadcastAnalysisRunCompleted(run AnalysisRun, incidentID string, alertID string) {
 	status := first(run.Status, "complete")
-	s.hub.Broadcast(analysisCompletedEvent(run.RunID, run.Source, status, incidentID, alertID))
+	s.hub.Broadcast(analysisCompletedEvent(run.RunID, run.Source, status, run.TargetType, run.TargetID, incidentID, alertID))
 }
 
 func sourceTitle(source string) string {

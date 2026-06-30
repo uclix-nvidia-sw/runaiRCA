@@ -360,15 +360,22 @@ func TestFailedRunBroadcastsCompletedEvent(t *testing.T) {
 	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
-	_, record := seedAlert(t, server, "fp-sse")
+	incident, record := seedAlert(t, server, "fp-sse")
 	ch := server.hub.Subscribe()
 	defer server.hub.Unsubscribe(ch)
 
 	server.startAnalysisRun("alert", record.AlertID, "manual", "")
 
 	event := waitForCompletedEvent(t, ch, "failed")
-	if event.Data["alert_id"] != record.AlertID {
+	if event.Data["target_type"] != "alert" || event.Data["target_id"] != record.AlertID || event.Data["alert_id"] != record.AlertID {
 		t.Fatalf("completed event missing alert id: %+v", event.Data)
+	}
+
+	server.startAnalysisRun("incident", incident.IncidentID, "manual", "")
+
+	event = waitForCompletedEvent(t, ch, "failed")
+	if event.Data["target_type"] != "incident" || event.Data["target_id"] != incident.IncidentID || event.Data["incident_id"] != incident.IncidentID {
+		t.Fatalf("completed event missing incident target: %+v", event.Data)
 	}
 }
 
