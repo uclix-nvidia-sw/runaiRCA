@@ -829,6 +829,40 @@ func TestChatRouteProxiesContextualRCARequestToAgent(t *testing.T) {
 	}
 }
 
+func TestIncidentChatContextSummarizesAlerts(t *testing.T) {
+	context := incidentChatContext(&IncidentDetail{
+		Incident: Incident{
+			IncidentID: "INC-chat-context",
+			Title:      "Queue blocked",
+			Severity:   "warning",
+			Status:     "firing",
+		},
+		Alerts: []AlertRecord{{
+			AlertID:         "ALR-chat-context",
+			AlarmTitle:      "RunAIQueueBlocked",
+			Severity:        "warning",
+			Status:          "firing",
+			AnalysisSummary: "large RCA summary",
+			AnalysisDetail:  strings.Repeat("detail ", 100),
+			Labels:          map[string]string{"queue": "gpu-a"},
+		}},
+	})
+
+	alerts, ok := context["alerts"].([]map[string]any)
+	if !ok || len(alerts) != 1 {
+		t.Fatalf("expected summarized alert context, got %+v", context["alerts"])
+	}
+	if alerts[0]["alert_id"] != "ALR-chat-context" || alerts[0]["title"] != "RunAIQueueBlocked" {
+		t.Fatalf("alert summary lost identity fields: %+v", alerts[0])
+	}
+	if _, ok := alerts[0]["analysis_detail"]; ok {
+		t.Fatalf("chat context should not include full alert RCA detail: %+v", alerts[0])
+	}
+	if _, ok := alerts[0]["labels"]; ok {
+		t.Fatalf("chat context should not include full alert labels: %+v", alerts[0])
+	}
+}
+
 func TestCommentCreatesAnalysisRun(t *testing.T) {
 	server := NewServer()
 	agentReqCh := make(chan AgentAnalysisRequest, 1)

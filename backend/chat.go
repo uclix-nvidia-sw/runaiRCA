@@ -447,6 +447,15 @@ func incidentChatContext(detail *IncidentDetail) map[string]any {
 	if detail == nil {
 		return map[string]any{}
 	}
+	alerts := make([]map[string]any, 0, len(detail.Alerts))
+	for _, alert := range detail.Alerts {
+		alerts = append(alerts, map[string]any{
+			"alert_id": alert.AlertID,
+			"title":    alert.AlarmTitle,
+			"severity": alert.Severity,
+			"status":   alert.Status,
+		})
+	}
 	return map[string]any{
 		"incident_id":       detail.IncidentID,
 		"title":             detail.Title,
@@ -459,7 +468,7 @@ func incidentChatContext(detail *IncidentDetail) map[string]any {
 		"warnings":          detail.Warnings,
 		"similar_incidents": detail.SimilarIncidents,
 		"feedback":          detail.Feedback,
-		"alerts":            detail.Alerts,
+		"alerts":            alerts,
 	}
 }
 
