@@ -133,7 +133,9 @@ def _relate(
     if not va or not vb:
         return
     match = f'$a isa {ta}, has {ka} "{esc(va)}"; $b isa {tb}, has {kb} "{esc(vb)}";'
-    tx.query(f"match {match} insert ({role_a}: $a, {role_b}: $b) isa {rel};").resolve()
+    tx.query(
+        f"match {match} not {{ ({role_a}: $a, {role_b}: $b) isa {rel}; }} insert ({role_a}: $a, {role_b}: $b) isa {rel};"
+    ).resolve()
 
 
 def _write_incident(tx: Any, inc: OntologyIncident) -> None:
