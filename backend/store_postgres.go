@@ -16,6 +16,8 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
+const postgresOperationTimeout = 5 * time.Second
+
 func (s *Store) ConnectDatabase(databaseURL string, connectTimeout time.Duration) {
 	s.connectDatabaseWithDriver("pgx", databaseURL, connectTimeout)
 }
@@ -137,6 +139,16 @@ func ensureDatabaseExists(driverName, databaseURL string, connectTimeout time.Du
 // statement.
 func quoteIdentifier(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+func postgresOperationContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), postgresOperationTimeout)
+}
+
+func (s *Store) execPostgres(query string, args ...any) (sql.Result, error) {
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	return s.db.ExecContext(ctx, query, args...)
 }
 
 func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
@@ -507,8 +519,10 @@ func (s *Store) dbSearchMemory(query string, limit int) ([]SimilarIncident, bool
 		return nil, false
 	}
 	literal := embeddingLiteral(denseEmbedding(query))
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
 	rows, err := s.db.QueryContext(
-		context.Background(),
+		ctx,
 		`SELECT incident_id, alert_id, title, severity, status, analysis_summary,
 		        analysis_detail, labels, created_at, (embedding <=> $1::vector) AS distance
 		   FROM incident_embeddings
@@ -691,8 +705,7 @@ func (s *Store) persistIncidentLocked(incident *Incident) {
 	if s.db == nil || !s.dbReady || incident == nil {
 		return
 	}
-	_, err := s.db.ExecContext(
-		context.Background(),
+	_, err := s.execPostgres(
 		`INSERT INTO incidents (
 			incident_id, correlation_key, title, severity, status, fired_at,
 			resolved_at, alert_count, updated_at
@@ -724,8 +737,7 @@ func (s *Store) persistAlertLocked(alert *AlertRecord) {
 	if s.db == nil || !s.dbReady || alert == nil {
 		return
 	}
-	_, err := s.db.ExecContext(
-		context.Background(),
+	_, err := s.execPostgres(
 		`INSERT INTO alerts (
 			alert_id, incident_id, alarm_title, severity, status, fired_at,
 			resolved_at, fingerprint, occurrence_count, occurrence_pods, thread_ts, labels, annotations,
@@ -787,8 +799,7 @@ func (s *Store) persistMemoryLocked(memory *IncidentMemory) {
 		return
 	}
 	if s.pgvectorReady {
-		_, err := s.db.ExecContext(
-			context.Background(),
+		_, err := s.execPostgres(
 			`INSERT INTO incident_embeddings (
 				incident_id, alert_id, title, severity, status, analysis_summary,
 				analysis_detail, labels, vector_json, embedding, created_at, updated_at
@@ -821,8 +832,7 @@ func (s *Store) persistMemoryLocked(memory *IncidentMemory) {
 		}
 		log.Printf("Failed to persist incident memory %s with pgvector, falling back to jsonb: %v", memory.IncidentID, err)
 	}
-	_, err := s.db.ExecContext(
-		context.Background(),
+	_, err := s.execPostgres(
 		`INSERT INTO incident_embeddings (
 			incident_id, alert_id, title, severity, status, analysis_summary,
 			analysis_detail, labels, vector_json, created_at, updated_at
@@ -857,8 +867,7 @@ func (s *Store) persistFeedbackLocked(record *FeedbackRecord) {
 	if s.db == nil || !s.dbReady || record == nil {
 		return
 	}
-	_, err := s.db.ExecContext(
-		context.Background(),
+	_, err := s.execPostgres(
 		`INSERT INTO rca_feedback (
 			feedback_id, target_type, target_id, incident_id, alert_id, vote,
 			comment, author, created_at
@@ -883,8 +892,7 @@ func (s *Store) persistFeedbackDeleteForActorLocked(targetType string, targetID 
 	if s.db == nil || !s.dbReady {
 		return
 	}
-	if _, err := s.db.ExecContext(
-		context.Background(),
+	if _, err := s.execPostgres(
 		`DELETE FROM rca_feedback
 		  WHERE target_type = $1 AND target_id = $2 AND author = $3`,
 		targetType,
@@ -899,8 +907,7 @@ func (s *Store) persistCommentLocked(record *CommentRecord) {
 	if s.db == nil || !s.dbReady || record == nil {
 		return
 	}
-	_, err := s.db.ExecContext(
-		context.Background(),
+	_, err := s.execPostgres(
 		`INSERT INTO rca_comments (
 			comment_id, target_type, target_id, incident_id, alert_id, body,
 			author, created_at
@@ -924,8 +931,7 @@ func (s *Store) persistCommentUpdateLocked(record *CommentRecord) {
 	if s.db == nil || !s.dbReady || record == nil {
 		return
 	}
-	_, err := s.db.ExecContext(
-		context.Background(),
+	_, err := s.execPostgres(
 		`UPDATE rca_comments
 		    SET body = $1, author = $2
 		  WHERE comment_id = $3`,
@@ -942,7 +948,7 @@ func (s *Store) persistCommentDeleteLocked(commentID string) {
 	if s.db == nil || !s.dbReady || commentID == "" {
 		return
 	}
-	if _, err := s.db.ExecContext(context.Background(), `DELETE FROM rca_comments WHERE comment_id = $1`, commentID); err != nil {
+	if _, err := s.execPostgres(`DELETE FROM rca_comments WHERE comment_id = $1`, commentID); err != nil {
 		log.Printf("Failed to delete comment %s: %v", commentID, err)
 	}
 }
@@ -951,8 +957,7 @@ func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) {
 	if s.db == nil || !s.dbReady || run == nil {
 		return
 	}
-	_, err := s.db.ExecContext(
-		context.Background(),
+	_, err := s.execPostgres(
 		`INSERT INTO analysis_runs (
 			run_id, source, status, target_type, target_id, incident_id, alert_id,
 			title, prompt, analysis_summary, analysis_detail, analysis_quality,

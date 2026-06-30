@@ -89,6 +89,44 @@ func TestInMemoryStoreHealthReportsNoPostgres(t *testing.T) {
 	}
 }
 
+func TestPostgresRuntimeOperationsUseDeadlines(t *testing.T) {
+	state := newFakePostgresState(false)
+	store := NewStore()
+
+	store.connectDatabaseWithDriver(registerFakePostgresDriver(state), "fake://runai_rca", time.Second)
+	defer store.db.Close()
+	if execs, queries := state.deadlineMisses(); execs != 0 || queries != 0 {
+		t.Fatalf("startup database calls should all carry deadlines, got execs=%d queries=%d", execs, queries)
+	}
+
+	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "deadline"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-deadline",
+	})
+	store.ApplyAnalysis(alert.AlertID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Queue gpu-a saturated.",
+		AnalysisDetail:  "Quota was exhausted.",
+		AnalysisQuality: "high",
+	})
+	_, _, _ = store.AddFeedback("incident", incident.IncidentID, FeedbackRequest{Vote: "up", Author: "operator"})
+	summary, _, _ := store.AddComment("incident", incident.IncidentID, CommentRequest{Body: "Check scheduler logs.", Author: "operator"})
+	if len(summary.Comments) == 0 {
+		t.Fatalf("expected comment to be created")
+	}
+	_, _, _ = store.UpdateComment("incident", incident.IncidentID, summary.Comments[0].CommentID, CommentRequest{Body: "Updated scheduler note."})
+	store.DeleteComment("incident", incident.IncidentID, summary.Comments[0].CommentID)
+	run := store.CreateAnalysisRun("manual", "alert", alert.AlertID, incident.IncidentID, alert.AlertID, "deadline run", "")
+	store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{Status: "ok", AnalysisSummary: "done"})
+	store.SearchIncidentMemory("gpu quota scheduling", 5)
+
+	if execs, queries := state.deadlineMisses(); execs != 0 || queries != 0 {
+		t.Fatalf("runtime database calls should all carry deadlines, got execs=%d queries=%d", execs, queries)
+	}
+}
+
 func assertLoadedPostgresMemory(t *testing.T, store *Store) {
 	t.Helper()
 
@@ -123,20 +161,22 @@ func registerFakePostgresDriver(state *fakePostgresState) string {
 }
 
 type fakePostgresState struct {
-	mu               sync.Mutex
-	failCreateVector bool
-	execs            []string
-	queries          []string
-	now              time.Time
-	labelsJSON       []byte
-	annotationsJSON  []byte
-	capabilitiesJSON []byte
-	missingDataJSON  []byte
-	warningsJSON     []byte
-	artifactsJSON    []byte
-	memoryVectorJSON []byte
-	emptyObjectJSON  []byte
-	emptyArrayJSON   []byte
+	mu                sync.Mutex
+	failCreateVector  bool
+	execs             []string
+	queries           []string
+	now               time.Time
+	labelsJSON        []byte
+	annotationsJSON   []byte
+	capabilitiesJSON  []byte
+	missingDataJSON   []byte
+	warningsJSON      []byte
+	artifactsJSON     []byte
+	memoryVectorJSON  []byte
+	emptyObjectJSON   []byte
+	emptyArrayJSON    []byte
+	execsNoDeadline   int
+	queriesNoDeadline int
 }
 
 func newFakePostgresState(failCreateVector bool) *fakePostgresState {
@@ -164,6 +204,12 @@ func (s *fakePostgresState) executed(fragment string) bool {
 		}
 	}
 	return false
+}
+
+func (s *fakePostgresState) deadlineMisses() (int, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.execsNoDeadline, s.queriesNoDeadline
 }
 
 type fakePostgresDriver struct {
@@ -194,8 +240,11 @@ func (c *fakePostgresConn) Ping(context.Context) error {
 	return nil
 }
 
-func (c *fakePostgresConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+func (c *fakePostgresConn) ExecContext(ctx context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
 	c.state.mu.Lock()
+	if _, ok := ctx.Deadline(); !ok {
+		c.state.execsNoDeadline++
+	}
 	c.state.execs = append(c.state.execs, query)
 	c.state.mu.Unlock()
 
@@ -205,8 +254,11 @@ func (c *fakePostgresConn) ExecContext(_ context.Context, query string, _ []driv
 	return driver.RowsAffected(1), nil
 }
 
-func (c *fakePostgresConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+func (c *fakePostgresConn) QueryContext(ctx context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
 	c.state.mu.Lock()
+	if _, ok := ctx.Deadline(); !ok {
+		c.state.queriesNoDeadline++
+	}
 	c.state.queries = append(c.state.queries, query)
 	c.state.mu.Unlock()
 
