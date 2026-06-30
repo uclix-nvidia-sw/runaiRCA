@@ -168,6 +168,59 @@ func TestAutoAnalysisRunIsIncidentScopedAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestWebhookAutoAnalysisFanoutCapsRunsAndAgentCallsTogether(t *testing.T) {
+	var hit atomic.Int32
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		hit.Add(1)
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Auto RCA complete.",
+			AnalysisDetail:  "## Root Cause\n\nBounded auto fanout.",
+			AnalysisQuality: "medium",
+		})
+	})
+	alerts := make([]Alert, maxAutoAnalyzeFanout+3)
+	for i := range alerts {
+		alerts[i] = Alert{
+			Status: "firing",
+			Labels: map[string]string{
+				"alertname": "RunAIWorkloadPending",
+				"severity":  "warning",
+				"namespace": fmt.Sprintf("runai-%02d", i),
+				"workload":  fmt.Sprintf("trainer-%02d", i),
+			},
+			Annotations: map[string]string{"summary": "Workload pending"},
+			Fingerprint: fmt.Sprintf("fp-auto-fanout-%02d", i),
+		}
+	}
+	payload, _ := json.Marshal(AlertmanagerWebhook{GroupKey: "auto-fanout-cap", Alerts: alerts})
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload)))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected webhook 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode webhook response: %v", err)
+	}
+	if response["auto_analyses"].(float64) != float64(maxAutoAnalyzeFanout) {
+		t.Fatalf("expected capped auto analyses, got %+v", response)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && hit.Load() < int32(maxAutoAnalyzeFanout) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := int(hit.Load()); got != maxAutoAnalyzeFanout {
+		t.Fatalf("agent calls must match capped DB runs, got calls=%d", got)
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != maxAutoAnalyzeFanout {
+		t.Fatalf("analysis run rows must match capped agent calls, got %d", len(runs))
+	}
+}
+
 func TestManualAnalysisClearsRCAAndSkipsAgentTimeout(t *testing.T) {
 	agentReqCh := make(chan AgentAnalysisRequest, 1)
 	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {

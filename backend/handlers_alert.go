@@ -21,6 +21,7 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 	autoAnalyses := 0
 	newIncidentIDs := map[string]struct{}{}
 	autoIncidentIDs := map[string]struct{}{}
+	autoIncidentOrder := []string{}
 	for _, alert := range webhook.Alerts {
 		if ignoredAlert(alert) {
 			ignored++
@@ -36,10 +37,16 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 			newIncidentIDs[incident.IncidentID] = struct{}{}
 		}
 		if _, ok := newIncidentIDs[incident.IncidentID]; ok && status(alert.Status) != "resolved" {
-			autoIncidentIDs[incident.IncidentID] = struct{}{}
+			if _, queued := autoIncidentIDs[incident.IncidentID]; !queued {
+				autoIncidentIDs[incident.IncidentID] = struct{}{}
+				autoIncidentOrder = append(autoIncidentOrder, incident.IncidentID)
+			}
 		}
 	}
-	for incidentID := range autoIncidentIDs {
+	for _, incidentID := range autoIncidentOrder {
+		if autoAnalyses >= maxAutoAnalyzeFanout {
+			break
+		}
 		if _, ok := s.startAnalysisRun("incident", incidentID, "auto", ""); ok {
 			autoAnalyses++
 		}

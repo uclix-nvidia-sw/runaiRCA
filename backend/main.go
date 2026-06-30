@@ -200,6 +200,7 @@ const (
 	maxJSONBodyBytes       = 1 << 20
 	maxEmbeddingQueryBytes = 4000
 	maxWebhookAlerts       = 500
+	maxAutoAnalyzeFanout   = 25
 	maxManualAnalyzeFanout = 25
 )
 
