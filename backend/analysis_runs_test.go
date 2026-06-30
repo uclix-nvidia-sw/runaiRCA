@@ -745,6 +745,83 @@ func TestDashboardAnalyzeSkipsDuplicateWhenIncidentAlreadyAnalyzing(t *testing.T
 	}
 }
 
+func TestDashboardAnalyzeStartsRemainingAlertsWhileOneIsAnalyzing(t *testing.T) {
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	released := false
+	release := func() {
+		if !released {
+			close(releaseFirst)
+			released = true
+		}
+	}
+	defer release()
+	var hit atomic.Int32
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		if hit.Add(1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Manual RCA complete.",
+			AnalysisDetail:  "## Root Cause\n\nManual analysis finished.",
+			AnalysisQuality: "medium",
+		})
+	})
+	incident, first := seedAlert(t, server, "fp-dashboard-partial")
+	secondID := "ALR-dashboard-partial-second"
+	server.store.mu.Lock()
+	server.store.alerts[secondID] = &AlertRecord{
+		AlertID:     secondID,
+		IncidentID:  incident.IncidentID,
+		AlarmTitle:  "Second alert",
+		Severity:    "warning",
+		Status:      "firing",
+		FiredAt:     first.FiredAt.Add(time.Minute),
+		Fingerprint: "fp-dashboard-partial-second",
+		ThreadTS:    "thread-" + secondID,
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Second alert blocked"},
+	}
+	server.store.mu.Unlock()
+
+	firstRun, ok := server.startAnalysisRun("alert", first.AlertID, "manual", "first alert")
+	if !ok {
+		t.Fatalf("expected first alert run to start")
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("first analysis did not reach agent")
+	}
+
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/incidents/"+incident.IncidentID+"/analyze", nil))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected partial incident analyze 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["status"] != "analysis_requested" || response["analysis_runs"].(float64) != 1 {
+		t.Fatalf("expected one remaining alert run to start, got %+v", response)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && hit.Load() < 2 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if hit.Load() != 2 {
+		t.Fatalf("expected second alert to reach agent, got %d calls", hit.Load())
+	}
+	release()
+	waitForRunIDStatus(t, server, firstRun.RunID, "complete")
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 2 {
+		t.Fatalf("expected exactly two alert runs, got %+v", runs)
+	}
+}
+
 func TestDashboardAnalyzeLargeIncidentRejectsAgentFanout(t *testing.T) {
 	server := NewServer()
 	incident, _ := seedAlert(t, server, "fp-dashboard-large")

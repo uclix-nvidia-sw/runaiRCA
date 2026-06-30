@@ -66,12 +66,6 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "incident not found")
 			return
 		}
-		if detail.IsAnalyzing {
-			writeJSON(w, http.StatusAccepted, map[string]any{
-				"status": "analysis_already_running",
-			})
-			return
-		}
 		if len(detail.Alerts) == 0 {
 			writeError(w, http.StatusConflict, "incident has no alerts to analyze")
 			return
