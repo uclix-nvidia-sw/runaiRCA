@@ -239,6 +239,8 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	record := s.alerts[alertID]
 	newAlert := record == nil
 	previousStatus := ""
+	previousSeverity := ""
+	previousFiredAt := time.Time{}
 	var previousResolvedAt *time.Time
 	previousOccurrenceCount := 0
 	if record == nil {
@@ -246,6 +248,8 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 		s.alerts[alertID] = record
 	} else {
 		previousStatus = record.Status
+		previousSeverity = record.Severity
+		previousFiredAt = record.FiredAt
 		previousResolvedAt = record.ResolvedAt
 		previousOccurrenceCount = record.OccurrenceCount
 	}
@@ -286,7 +290,12 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	if activityAt.After(incident.LatestActivityAt) {
 		incident.LatestActivityAt = activityAt
 	}
-	changed := newAlert || previousStatus != record.Status || previousOccurrenceCount != record.OccurrenceCount || !sameTimePtr(previousResolvedAt, record.ResolvedAt)
+	changed := newAlert ||
+		previousStatus != record.Status ||
+		previousSeverity != record.Severity ||
+		!previousFiredAt.Equal(record.FiredAt) ||
+		previousOccurrenceCount != record.OccurrenceCount ||
+		!sameTimePtr(previousResolvedAt, record.ResolvedAt)
 	s.persistIncidentLocked(incident)
 	s.persistAlertLocked(record)
 	return AlertUpsertResult{
@@ -884,7 +893,7 @@ func (s *Store) AddFeedback(
 	if err := validateStoredText("author", actor, maxFeedbackAuthorBytes); err != nil {
 		return FeedbackSummary{}, false, err
 	}
-	if err := validateStoredText("comment", req.Comment, maxStoredCommentBodyBytes); err != nil {
+	if err := validateStoredText("comment", comment, maxStoredCommentBodyBytes); err != nil {
 		return FeedbackSummary{}, false, err
 	}
 	if strings.EqualFold(rawVote, "none") {
@@ -946,7 +955,7 @@ func (s *Store) AddComment(
 		return FeedbackSummary{}, false, errors.New("comment body is required")
 	}
 	author := strings.TrimSpace(req.Author)
-	if err := validateStoredText("comment body", req.Body, maxStoredCommentBodyBytes); err != nil {
+	if err := validateStoredText("comment body", body, maxStoredCommentBodyBytes); err != nil {
 		return FeedbackSummary{}, false, err
 	}
 	if err := validateStoredText("author", author, maxFeedbackAuthorBytes); err != nil {
@@ -984,7 +993,7 @@ func (s *Store) UpdateComment(
 		return FeedbackSummary{}, false, errors.New("comment body is required")
 	}
 	author := strings.TrimSpace(req.Author)
-	if err := validateStoredText("comment body", req.Body, maxStoredCommentBodyBytes); err != nil {
+	if err := validateStoredText("comment body", body, maxStoredCommentBodyBytes); err != nil {
 		return FeedbackSummary{}, false, err
 	}
 	if err := validateStoredText("author", author, maxFeedbackAuthorBytes); err != nil {

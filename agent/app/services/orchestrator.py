@@ -20,6 +20,7 @@ from app.collectors.loki import LokiCollector
 from app.collectors.postgres import PostgresCollector
 from app.collectors.prometheus import PrometheusCollector
 from app.collectors.runai import RunAICollector
+from app.collectors.typedb import TypeDBCollector
 from app.config import Settings
 from app.knowledge import load_troubleshooting_cases
 from app.masking import Masker, build_masker
@@ -32,6 +33,7 @@ from app.schemas import (
     IncidentSummaryRequest,
     IncidentSummaryResponse,
 )
+from app.services.root_cause_ranking import RankedCause, rank_root_cause_candidates
 
 TModel = TypeVar("TModel", bound=BaseModel)
 
@@ -142,6 +144,7 @@ class AnalysisOrchestrator:
             PostgresCollector(settings),
             PrometheusCollector(settings),
             LokiCollector(settings),
+            TypeDBCollector(settings),
         ]
 
     async def analyze(self, request: AlertAnalysisRequest) -> AlertAnalysisResponse:
@@ -167,11 +170,14 @@ class AnalysisOrchestrator:
         warnings = sorted(
             {item for result in results for item in result.warnings} | set(nat_warnings)
         )
+        root_cause_candidates = rank_root_cause_candidates(
+            target, results, occurrence_count=request.occurrence_count
+        )
         quality = _quality_from(results)
-        summary = _summary_from(request, results)
+        summary = _summary_from(request, results, root_cause_candidates)
         playbook = load_troubleshooting_cases(self._settings.troubleshooting_cases_file)
         detail = nat_text if nat_text else _detail_from(
-            request, results, missing, playbook, agent_souls
+            request, results, missing, playbook, agent_souls, root_cause_candidates
         )
 
         response = AlertAnalysisResponse(
@@ -198,6 +204,12 @@ class AnalysisOrchestrator:
                 ],
                 "agent_souls_file": self._settings.agent_souls_file,
                 "agent_souls_applied": bool(agent_souls),
+                "root_cause_candidates": [
+                    candidate.as_dict() for candidate in root_cause_candidates
+                ],
+                "top_root_cause": (
+                    root_cause_candidates[0].as_dict() if root_cause_candidates else None
+                ),
             },
             artifacts=artifacts,
         )
@@ -388,8 +400,12 @@ def _extract_nat_result(output: str) -> str | None:
     return result.strip() or None
 
 
-def _summary_from(request: AlertAnalysisRequest, results: list[CollectorResult]) -> str:
-    root_cause = _root_cause_statement(request)
+def _summary_from(
+    request: AlertAnalysisRequest,
+    results: list[CollectorResult],
+    root_cause_candidates: list[RankedCause],
+) -> str:
+    root_cause = _ranked_root_cause_statement(root_cause_candidates, request)
     unavailable = [result.agent for result in results if result.status == "unavailable"]
     if unavailable:
         return _short_sentence(
@@ -405,10 +421,11 @@ def _detail_from(
     missing: list[str],
     troubleshooting_cases: str = "",
     agent_souls: str = "",
+    root_cause_candidates: list[RankedCause] | None = None,
 ) -> str:
     labels = request.alert.labels
     annotations = request.alert.annotations
-    root_cause = _root_cause_statement(request)
+    root_cause = _ranked_root_cause_statement(root_cause_candidates or [], request)
     lines = [
         "## Root Cause",
         "",
@@ -431,6 +448,8 @@ def _detail_from(
     highlight_lines = _evidence_highlight_lines(results)
     if highlight_lines:
         lines.extend(["", "## Evidence Highlights", "", *highlight_lines])
+    if root_cause_candidates:
+        lines.extend(_root_cause_candidate_lines(root_cause_candidates))
     operator_prompt = annotations.get("operator_prompt")
     if operator_prompt:
         lines.extend(
@@ -502,6 +521,50 @@ def _root_cause_statement(request: AlertAnalysisRequest) -> str:
         or "The alert fired before the agent could identify a precise root cause."
     )
     return _short_sentence(text, limit=320)
+
+
+def _ranked_root_cause_statement(
+    candidates: list[RankedCause], request: AlertAnalysisRequest
+) -> str:
+    if not candidates:
+        return _root_cause_statement(request)
+    top = candidates[0]
+    if top.family == "insufficient_evidence":
+        return _short_sentence(
+            "The collected evidence is insufficient to name a specific root-cause "
+            f"family with confidence. Alert context: {_root_cause_statement(request)}",
+            limit=320,
+        )
+    rationale = top.rationale[0] if top.rationale else _root_cause_statement(request)
+    return _short_sentence(
+        f"Most likely root-cause family: {_family_label(top.family)} "
+        f"({top.confidence} confidence). {rationale}.",
+        limit=320,
+    )
+
+
+def _root_cause_candidate_lines(candidates: list[RankedCause]) -> list[str]:
+    lines = ["", "## Root Cause Candidates", ""]
+    for candidate in candidates[:3]:
+        agents = ", ".join(candidate.evidence_agents) or "no corroborating agent"
+        lines.append(
+            f"- **{_family_label(candidate.family)}** "
+            f"({candidate.confidence}, score {candidate.score:.2f}; evidence: {agents})"
+        )
+        for rationale in candidate.rationale[:3]:
+            lines.append(f"  - {rationale}")
+    return lines
+
+
+def _family_label(family: str) -> str:
+    labels = {
+        "node_kubelet_pressure": "node kubelet pressure",
+        "scheduling_quota_exhaustion": "scheduling quota exhaustion",
+        "control_plane_error": "Run:ai control-plane error",
+        "workload_startup_image_failure": "workload startup/image failure",
+        "insufficient_evidence": "insufficient evidence",
+    }
+    return labels.get(family, family.replace("_", " "))
 
 
 def _short_sentence(value: str, *, limit: int) -> str:

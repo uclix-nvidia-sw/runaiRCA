@@ -65,6 +65,41 @@ postgresql:
   affinity: {}
   resources: {}
 
+typedb:
+  # TypeDB 3.x knowledge-graph store for the RCA ontology. Community Edition is
+  # single-node (StatefulSet replica 1); HA/clustering is the paid Enterprise tier.
+  # No official Helm chart/operator exists, so this template is self-managed.
+  enabled: false
+  image:
+    repository: typedb/typedb
+    tag: "3.11.5"
+    pullPolicy: IfNotPresent
+  auth:
+    # CE default credentials; override for anything beyond a local PoC.
+    username: admin
+    password: password
+    database: runai_rca
+  service:
+    annotations: {}
+    port: 1729
+    httpPort: 8000
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: ""
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext: {}
+  securityContext: {}
+  automountServiceAccountToken: false
+  priorityClassName: ""
+  topologySpreadConstraints: []
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  readinessProbe: {}
+  resources: {}
+
 backend:
   replicaCount: 1
   image:
@@ -147,6 +182,7 @@ agent:
     lokiQueryLimit: 20
     lokiMcpUrl: ""
     postgresTimeoutSeconds: 6
+    typedbTimeoutSeconds: 6
     troubleshootingCasesFile: knowledge/troubleshooting_cases.md
     agentSoulsFile: prompts/agent_souls.md
     maskingRegexListJson: "[]"

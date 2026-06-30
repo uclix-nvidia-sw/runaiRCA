@@ -2002,7 +2002,11 @@ function DiagnosticGroup({
   items: string[];
   tone: 'missing' | 'warning';
 }) {
-  const [open, setOpen] = useState(items.length <= 3);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    setOpen(items.length <= 3);
+  }, [title, items.length]);
   const visibleItems = open ? items : items.slice(0, 3);
   const hiddenCount = Math.max(0, items.length - visibleItems.length);
 

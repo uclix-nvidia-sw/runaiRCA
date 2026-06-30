@@ -69,6 +69,13 @@ def make_settings() -> Settings:
         nat_config_file="configs/runai_rca_workflow.yml",
         enable_nat_runtime=False,
         nat_timeout_seconds=1,
+        typedb_address="",
+        typedb_database="runai_rca",
+        typedb_username="admin",
+        typedb_password="password",
+        typedb_tls_enabled=False,
+        typedb_timeout_seconds=1,
+        enable_typedb=False,
     )
 
 
@@ -289,8 +296,10 @@ async def test_analyze_returns_unified_artifacts() -> None:
         "postgres",
         "prometheus",
         "loki",
+        "typedb",
     }
     assert response.capabilities["runai"] in {"partial", "ok"}
+    assert response.capabilities["typedb"] == "unavailable"
 
 
 @pytest.mark.asyncio
