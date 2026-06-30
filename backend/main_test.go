@@ -435,6 +435,34 @@ func TestLatestAlertIDPrefersNewestFiringAlert(t *testing.T) {
 	}
 }
 
+func TestIncidentSeverityNormalizesCaseBeforeRanking(t *testing.T) {
+	store := NewStore()
+	webhook := AlertmanagerWebhook{GroupKey: "severity-case"}
+	incident, _ := store.UpsertAlert(webhook, Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIQueueBlocked",
+			"severity":  "Critical",
+		},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+	})
+	if incident.Severity != "critical" {
+		t.Fatalf("expected severity to be canonicalized, got %q", incident.Severity)
+	}
+
+	incident, _ = store.UpsertAlert(webhook, Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIQueueBlocked",
+			"severity":  "warning",
+		},
+		Annotations: map[string]string{"summary": "Queue still blocked"},
+	})
+	if incident.Severity != "critical" {
+		t.Fatalf("warning alert should not downgrade critical incident, got %q", incident.Severity)
+	}
+}
+
 func TestAlertmanagerWebhookIgnoresInfoAlerts(t *testing.T) {
 	server := NewServer()
 	body := AlertmanagerWebhook{

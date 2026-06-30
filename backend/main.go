@@ -548,7 +548,11 @@ func keyPart(value string) string {
 }
 
 func severity(alert Alert) string {
-	return first(alert.Labels["severity"], "warning")
+	value := strings.ToLower(first(alert.Labels["severity"], "warning"))
+	if value == "information" {
+		return "info"
+	}
+	return value
 }
 
 func ignoredAlert(alert Alert) bool {
