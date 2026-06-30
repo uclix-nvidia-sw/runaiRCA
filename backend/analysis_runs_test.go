@@ -328,7 +328,7 @@ func TestAnalysisRunUpdatePersistFailureSkipsAlertRCA(t *testing.T) {
 	}
 }
 
-func TestManualAnalysisClearsRCAAndSkipsAgentTimeout(t *testing.T) {
+func TestManualAnalysisKeepsRCAAndSkipsAgentTimeout(t *testing.T) {
 	agentReqCh := make(chan AgentAnalysisRequest, 1)
 	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
 		var req AgentAnalysisRequest
@@ -370,8 +370,8 @@ func TestManualAnalysisClearsRCAAndSkipsAgentTimeout(t *testing.T) {
 	server.startAnalysisRun("alert", record.AlertID, "manual", "")
 
 	alert, _ := server.store.AlertDetail(record.AlertID)
-	if alert.AnalysisSummary != "" || alert.AnalysisDetail != "" || !alert.IsAnalyzing {
-		t.Fatalf("manual analysis did not clear visible RCA: %+v", alert)
+	if !strings.Contains(alert.AnalysisSummary, "Old RCA") || !alert.IsAnalyzing {
+		t.Fatalf("manual analysis should keep the last RCA visible while analyzing: %+v", alert)
 	}
 	agentReq := <-agentReqCh
 	prompt := agentReq.Alert.Annotations["operator_prompt"]
@@ -381,6 +381,32 @@ func TestManualAnalysisClearsRCAAndSkipsAgentTimeout(t *testing.T) {
 	run := waitForRunStatus(t, server, "manual", "complete")
 	if !strings.Contains(run.AnalysisSummary, "Fresh manual") {
 		t.Fatalf("manual run did not complete without timeout: %+v", run)
+	}
+}
+
+func TestFailedManualRunPreservesExistingSuccessfulRCA(t *testing.T) {
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("upstream down"))
+	})
+	_, record := seedAlert(t, server, "fp-manual-preserve")
+	server.store.ApplyAnalysis(record.AlertID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Trusted manual RCA: quota saturation.",
+		AnalysisDetail:  "## Root Cause\n\nQuota exhausted.",
+		AnalysisQuality: "high",
+		Capabilities:    map[string]string{"runai": "ok"},
+	})
+
+	server.startAnalysisRun("alert", record.AlertID, "manual", "")
+	waitForRunStatus(t, server, "manual", "failed")
+
+	alert, _ := server.store.AlertDetail(record.AlertID)
+	if !strings.Contains(alert.AnalysisSummary, "Trusted manual RCA") {
+		t.Fatalf("failed manual run overwrote a successful RCA: %+v", alert.AnalysisSummary)
+	}
+	if alert.AnalysisQuality != "high" || alert.IsAnalyzing {
+		t.Fatalf("alert state corrupted by failed manual run: quality=%s analyzing=%t", alert.AnalysisQuality, alert.IsAnalyzing)
 	}
 }
 

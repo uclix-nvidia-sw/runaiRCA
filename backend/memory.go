@@ -207,8 +207,8 @@ func (s *Store) BeginAnalyzing(incidentID string, alertID string) {
 	}
 }
 
-// BeginManualAnalysis clears the visible RCA before a dashboard-triggered
-// reanalysis so operators can see a fresh run is in progress.
+// BeginManualAnalysis marks a dashboard-triggered reanalysis in progress while
+// keeping the last good RCA visible until a fresh result replaces it.
 func (s *Store) BeginManualAnalysis(incidentID string, alertID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -217,13 +217,6 @@ func (s *Store) BeginManualAnalysis(incidentID string, alertID string) {
 		s.persistIncidentLocked(incident)
 	}
 	if alert := s.alerts[alertID]; alert != nil {
-		alert.AnalysisSummary = ""
-		alert.AnalysisDetail = ""
-		alert.AnalysisQuality = ""
-		alert.Capabilities = map[string]string{}
-		alert.MissingData = []string{}
-		alert.Warnings = []string{}
-		alert.Artifacts = []Artifact{}
 		alert.IsAnalyzing = true
 		s.persistAlertLocked(alert)
 	}
