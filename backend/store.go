@@ -622,21 +622,24 @@ func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (A
 }
 
 // ReapStaleAnalyzingRuns enforces the lifecycle invariant across process
-// restarts. A run persisted as "analyzing" past staleAfter has no goroutine to
-// finish it, so on startup it is marked failed with a warning. Any stale
-// is_analyzing flags on alerts/incidents are also cleared when no analyzing run
-// remains for them. It returns the number of runs reaped.
-func (s *Store) ReapStaleAnalyzingRuns(staleAfter time.Duration) int {
+// restarts. A run persisted as "analyzing" past its source timeout has no
+// goroutine to finish it, so on startup it is marked failed with a warning. Any
+// stale is_analyzing flags on alerts/incidents are also cleared when no
+// analyzing run remains for them. It returns the number of runs reaped.
+func (s *Store) ReapStaleAnalyzingRuns(staleAfter time.Duration, manualStaleAfter time.Duration) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
-	cutoff := now.Add(-staleAfter)
 	reaped := 0
 	for _, run := range s.analysisRuns {
 		if run == nil || run.Status != "analyzing" {
 			continue
 		}
-		if staleAfter > 0 && run.UpdatedAt.After(cutoff) {
+		runStaleAfter := staleAfter
+		if run.Source == "manual" {
+			runStaleAfter = manualStaleAfter
+		}
+		if runStaleAfter > 0 && run.UpdatedAt.After(now.Add(-runStaleAfter)) {
 			continue
 		}
 		run.Status = "failed"

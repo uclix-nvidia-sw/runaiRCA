@@ -1691,7 +1691,7 @@ func TestReapStaleAnalyzingRunsMarksFailed(t *testing.T) {
 	store.CompleteAnalysisRun(done.RunID, AgentAnalysisResponse{Status: "ok", AnalysisSummary: "done"})
 	stale := store.CreateAnalysisRun("auto", "alert", record.AlertID, incident.IncidentID, record.AlertID, "t", "")
 
-	reaped := store.ReapStaleAnalyzingRuns(0)
+	reaped := store.ReapStaleAnalyzingRuns(0, 0)
 	if reaped != 1 {
 		t.Fatalf("expected exactly 1 stale run reaped, got %d", reaped)
 	}
@@ -1735,7 +1735,7 @@ func TestReapStaleAnalyzingRunsKeepsFreshRun(t *testing.T) {
 	run := store.CreateAnalysisRun("manual", "alert", record.AlertID, incident.IncidentID, record.AlertID, "t", "")
 	store.BeginAnalyzing(incident.IncidentID, record.AlertID)
 
-	reaped := store.ReapStaleAnalyzingRuns(time.Hour)
+	reaped := store.ReapStaleAnalyzingRuns(time.Hour, time.Hour)
 	if reaped != 0 {
 		t.Fatalf("fresh run should not be reaped, got %d", reaped)
 	}
@@ -1754,6 +1754,46 @@ func TestReapStaleAnalyzingRunsKeepsFreshRun(t *testing.T) {
 	}
 	if detail, ok := store.IncidentDetail(incident.IncidentID); !ok || !detail.IsAnalyzing {
 		t.Fatalf("fresh incident should stay analyzing")
+	}
+}
+
+func TestReapStaleAnalyzingRunsUsesManualTimeoutOnlyForManualRuns(t *testing.T) {
+	store := NewStore()
+	incident, autoAlert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "auto-reap"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIAutoBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Auto queue blocked"},
+		Fingerprint: "fp-auto-reap",
+	})
+	manualIncident, manualAlert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "manual-reap"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIManualBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Manual queue blocked"},
+		Fingerprint: "fp-manual-reap",
+	})
+	autoRun := store.CreateAnalysisRun("auto", "alert", autoAlert.AlertID, incident.IncidentID, autoAlert.AlertID, "auto", "")
+	manualRun := store.CreateAnalysisRun("manual", "alert", manualAlert.AlertID, manualIncident.IncidentID, manualAlert.AlertID, "manual", "")
+
+	store.mu.Lock()
+	store.analysisRuns[autoRun.RunID].UpdatedAt = time.Now().UTC().Add(-5 * time.Minute)
+	store.analysisRuns[manualRun.RunID].UpdatedAt = time.Now().UTC().Add(-5 * time.Minute)
+	store.mu.Unlock()
+
+	reaped := store.ReapStaleAnalyzingRuns(3*time.Minute, 15*time.Minute)
+	if reaped != 1 {
+		t.Fatalf("expected only stale auto run to be reaped, got %d", reaped)
+	}
+	for _, run := range store.ListAnalysisRuns() {
+		switch run.RunID {
+		case autoRun.RunID:
+			if run.Status != "failed" {
+				t.Fatalf("auto run should be reaped with default timeout, got %q", run.Status)
+			}
+		case manualRun.RunID:
+			if run.Status != "analyzing" {
+				t.Fatalf("manual run should use manual timeout, got %q", run.Status)
+			}
+		}
 	}
 }
 

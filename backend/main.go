@@ -252,7 +252,7 @@ func NewServer() *Server {
 		first(os.Getenv("DATABASE_URL"), os.Getenv("POSTGRES_DSN")),
 		time.Duration(getenvInt("DATABASE_CONNECT_TIMEOUT_SECONDS", 5))*time.Second,
 	)
-	if reaped := store.ReapStaleAnalyzingRuns(max(agentRequestTimeout, manualAgentRequestTimeout)); reaped > 0 {
+	if reaped := store.ReapStaleAnalyzingRuns(agentRequestTimeout, manualAgentRequestTimeout); reaped > 0 {
 		log.Printf("reaped %d stale analyzing run(s) left by a previous process", reaped)
 	}
 	return &Server{
