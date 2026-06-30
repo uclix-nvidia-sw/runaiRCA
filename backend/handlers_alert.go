@@ -19,6 +19,7 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 	accepted := 0
 	ignored := 0
 	autoAnalyses := 0
+	newIncidentIDs := map[string]struct{}{}
 	autoIncidentIDs := map[string]struct{}{}
 	for _, alert := range webhook.Alerts {
 		if ignoredAlert(alert) {
@@ -32,6 +33,9 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 			s.hub.Broadcast(alertCreatedEvent(incident, record))
 		}
 		if result.NewIncident {
+			newIncidentIDs[incident.IncidentID] = struct{}{}
+		}
+		if _, ok := newIncidentIDs[incident.IncidentID]; ok && status(alert.Status) != "resolved" {
 			autoIncidentIDs[incident.IncidentID] = struct{}{}
 		}
 	}

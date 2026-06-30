@@ -169,6 +169,7 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	key := correlationKey(webhook, alert)
 	fingerprint := alertIdentity(alert)
 	storageKey := alertStorageKey(webhook, alert, key)
+	alertStatus := status(alert.Status)
 	now := time.Now().UTC()
 	alertFiredAt := firstTime(alert.StartsAt, now)
 	alertID := ""
@@ -214,11 +215,11 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	}
 	incident := s.incidents[incidentID]
 	incident.Severity = maxSeverity(incident.Severity, severity(alert))
-	if alert.Status == "resolved" && incident.ResolvedAt == nil {
+	if alertStatus == "resolved" && incident.ResolvedAt == nil {
 		t := firstTime(alert.EndsAt, now)
 		incident.ResolvedAt = &t
 		incident.Status = "resolved"
-	} else if alert.Status != "resolved" && incident.Status == "resolved" {
+	} else if alertStatus != "resolved" && incident.Status == "resolved" {
 		incident.Status = "firing"
 		incident.ResolvedAt = nil
 	}
@@ -263,13 +264,13 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	record.OccurrencePods = appendOccurrencePod(record.OccurrencePods, podName(alert))
 	record.AlarmTitle = groupedIncidentTitle(alert, record.OccurrenceCount)
 	record.Severity = severity(alert)
-	record.Status = status(alert.Status)
+	record.Status = alertStatus
 	record.FiredAt = alertFiredAt
 	record.Fingerprint = fingerprint
 	record.ThreadTS = "thread-" + alertID
 	record.Labels = cloneMap(alert.Labels)
 	record.Annotations = cloneMap(alert.Annotations)
-	if alert.Status == "resolved" {
+	if alertStatus == "resolved" {
 		t := firstTime(alert.EndsAt, now)
 		record.ResolvedAt = &t
 	} else {

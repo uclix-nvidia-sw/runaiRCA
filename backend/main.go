@@ -565,7 +565,7 @@ func ignoredAlert(alert Alert) bool {
 }
 
 func status(value string) string {
-	if value == "resolved" {
+	if strings.EqualFold(strings.TrimSpace(value), "resolved") {
 		return "resolved"
 	}
 	return "firing"

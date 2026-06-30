@@ -556,6 +556,62 @@ func TestAlertmanagerWebhookReportsAcceptedAndIgnoredCounts(t *testing.T) {
 	}
 }
 
+func TestAlertmanagerWebhookSkipsAutoAnalysisForResolvedOnlyIncident(t *testing.T) {
+	server := NewServer()
+	payload, _ := json.Marshal(AlertmanagerWebhook{
+		GroupKey: "resolved-only",
+		Alerts: []Alert{{
+			Status:      "Resolved",
+			Labels:      map[string]string{"alertname": "RunAIWorkloadPending", "severity": "warning"},
+			Annotations: map[string]string{"summary": "Workload recovered"},
+			Fingerprint: "fp-resolved-only",
+		}},
+	})
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload)))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 0 {
+		t.Fatalf("resolved-only webhook should not start auto analysis, got %+v", runs)
+	}
+	alerts := server.store.ListAlerts()
+	if len(alerts) != 1 || alerts[0].Status != "resolved" {
+		t.Fatalf("resolved status should be canonicalized, got %+v", alerts)
+	}
+}
+
+func TestAlertmanagerWebhookAnalyzesNewIncidentWhenFiringFollowsResolved(t *testing.T) {
+	server := NewServer()
+	payload, _ := json.Marshal(AlertmanagerWebhook{
+		GroupKey: "resolved-then-firing",
+		Alerts: []Alert{
+			{
+				Status:      "resolved",
+				Labels:      map[string]string{"alertname": "RunAIWorkloadPending", "severity": "warning"},
+				Annotations: map[string]string{"summary": "Workload recovered"},
+			},
+			{
+				Status:      "firing",
+				Labels:      map[string]string{"alertname": "RunAIWorkloadPending", "severity": "warning"},
+				Annotations: map[string]string{"summary": "Workload pending again"},
+			},
+		},
+	})
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload)))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 {
+		t.Fatalf("firing alert on new incident should start one auto analysis, got %+v", runs)
+	}
+}
+
 func TestAlertmanagerWebhookRejectsTooManyAlerts(t *testing.T) {
 	server := NewServer()
 	alerts := make([]Alert, maxWebhookAlerts+1)
