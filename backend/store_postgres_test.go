@@ -46,6 +46,9 @@ func TestPostgresConnectReportsPGVectorEnabledAndLoadsState(t *testing.T) {
 	}
 
 	assertLoadedPostgresMemory(t, store)
+	if got := state.recordedPGVectorSearchLimit(); got != 15 {
+		t.Fatalf("expected pgvector search to overfetch before dedupe, got limit %d", got)
+	}
 }
 
 func TestPostgresConnectFallsBackToJSONBWhenPGVectorUnavailable(t *testing.T) {
@@ -170,7 +173,6 @@ func assertLoadedPostgresMemory(t *testing.T, store *Store) {
 	if search[0].IncidentID != "INC-db" || search[0].PositiveFeedback != 1 || search[0].CommentCount != 1 {
 		t.Fatalf("expected feedback metadata on search result, got %+v", search[0])
 	}
-
 	runs := store.ListAnalysisRuns()
 	if len(runs) != 1 || runs[0].RunID != "ANL-db" || runs[0].Status != "complete" {
 		t.Fatalf("expected analysis run to reload, got %+v", runs)
@@ -205,6 +207,7 @@ type fakePostgresState struct {
 	emptyArrayJSON           []byte
 	execsNoDeadline          int
 	queriesNoDeadline        int
+	pgvectorSearchLimit      int64
 }
 
 func newFakePostgresState(failCreateVector bool) *fakePostgresState {
@@ -238,6 +241,12 @@ func (s *fakePostgresState) deadlineMisses() (int, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.execsNoDeadline, s.queriesNoDeadline
+}
+
+func (s *fakePostgresState) recordedPGVectorSearchLimit() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pgvectorSearchLimit
 }
 
 type fakePostgresDriver struct {
@@ -291,12 +300,20 @@ func (c *fakePostgresConn) ExecContext(ctx context.Context, query string, _ []dr
 	return driver.RowsAffected(1), nil
 }
 
-func (c *fakePostgresConn) QueryContext(ctx context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+func (c *fakePostgresConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	c.state.mu.Lock()
 	if _, ok := ctx.Deadline(); !ok {
 		c.state.queriesNoDeadline++
 	}
 	c.state.queries = append(c.state.queries, query)
+	if strings.Contains(query, "<=>") && len(args) >= 2 {
+		switch value := args[1].Value.(type) {
+		case int64:
+			c.state.pgvectorSearchLimit = value
+		case int:
+			c.state.pgvectorSearchLimit = int64(value)
+		}
+	}
 	c.state.mu.Unlock()
 
 	return c.state.rowsFor(query), nil

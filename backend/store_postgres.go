@@ -518,6 +518,7 @@ func (s *Store) dbSearchMemory(query string, limit int) ([]SimilarIncident, bool
 		return nil, false
 	}
 	literal := embeddingLiteral(denseEmbedding(query))
+	queryLimit := limit * 3
 	ctx, cancel := postgresOperationContext()
 	defer cancel()
 	rows, err := s.db.QueryContext(
@@ -528,7 +529,7 @@ func (s *Store) dbSearchMemory(query string, limit int) ([]SimilarIncident, bool
 		  WHERE embedding IS NOT NULL
 		  ORDER BY embedding <=> $1::vector
 		  LIMIT $2`,
-		literal, limit,
+		literal, queryLimit,
 	)
 	if err != nil {
 		log.Printf("pgvector similarity search failed, falling back to jsonb: %v", err)
