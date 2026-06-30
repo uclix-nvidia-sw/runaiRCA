@@ -281,6 +281,24 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 		`CREATE INDEX IF NOT EXISTS idx_comments_target ON rca_comments (target_type, target_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_created_at ON analysis_runs (created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_target ON analysis_runs (target_type, target_id)`,
+		`UPDATE analysis_runs
+			SET status = 'failed',
+				analysis_quality = COALESCE(NULLIF(analysis_quality, ''), 'low'),
+				capabilities = capabilities || '{"agent":"deduplicated"}'::jsonb,
+				warnings = warnings || '["duplicate analyzing run was closed before enforcing alert uniqueness"]'::jsonb,
+				updated_at = now()
+			WHERE run_id IN (
+				SELECT run_id
+				FROM (
+					SELECT run_id, row_number() OVER (
+						PARTITION BY alert_id
+						ORDER BY updated_at DESC, created_at DESC, run_id DESC
+					) AS rn
+					FROM analysis_runs
+					WHERE status = 'analyzing' AND alert_id IS NOT NULL AND alert_id <> ''
+				) ranked
+				WHERE rn > 1
+			)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_analysis_runs_one_analyzing_alert ON analysis_runs (alert_id) WHERE status = 'analyzing' AND alert_id IS NOT NULL AND alert_id <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_embeddings_created_at ON incident_embeddings (created_at DESC)`,
 	}

@@ -40,6 +40,11 @@ func TestPostgresConnectReportsPGVectorEnabledAndLoadsState(t *testing.T) {
 	if !state.executed("idx_analysis_runs_one_analyzing_alert") {
 		t.Fatalf("expected alert-scoped analyzing run uniqueness DDL, got %+v", state.execs)
 	}
+	cleanupIndex := state.execIndex("duplicate analyzing run was closed before enforcing alert uniqueness")
+	uniqueIndex := state.execIndex("idx_analysis_runs_one_analyzing_alert")
+	if cleanupIndex < 0 || uniqueIndex < 0 || cleanupIndex > uniqueIndex {
+		t.Fatalf("expected duplicate analyzing cleanup before unique index, cleanup=%d unique=%d", cleanupIndex, uniqueIndex)
+	}
 	if !state.executed("ADD COLUMN IF NOT EXISTS embedding vector(") ||
 		!state.executed("USING hnsw (embedding vector_cosine_ops)") {
 		t.Fatalf("expected pgvector column and cosine index DDL, got %+v", state.execs)
@@ -238,6 +243,17 @@ func (s *fakePostgresState) executed(fragment string) bool {
 		}
 	}
 	return false
+}
+
+func (s *fakePostgresState) execIndex(fragment string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, statement := range s.execs {
+		if strings.Contains(statement, fragment) {
+			return i
+		}
+	}
+	return -1
 }
 
 func (s *fakePostgresState) deadlineMisses() (int, int) {
