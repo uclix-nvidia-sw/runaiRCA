@@ -150,16 +150,23 @@ class AnalysisOrchestrator:
         nat_payload["mode"] = "alert_analysis"
         agent_souls = load_agent_souls(self._settings.agent_souls_file)
         nat_payload["agent_souls"] = agent_souls
-        nat_text = await self._nat.run(nat_payload)
+        nat_text = None
+        nat_warnings: list[str] = []
+        try:
+            nat_text = await self._nat.run(nat_payload)
+        except Exception as exc:
+            nat_warnings.append(_unexpected_runtime_warning("nemo", exc))
 
         results = await asyncio.gather(
-            *(collector.collect(target) for collector in self._collectors)
+            *(_collect_safely(collector, target) for collector in self._collectors)
         )
 
         capabilities = {result.agent: result.status for result in results}
         artifacts = [artifact for result in results for artifact in result.artifacts]
         missing = sorted({item for result in results for item in result.missing_data})
-        warnings = sorted({item for result in results for item in result.warnings})
+        warnings = sorted(
+            {item for result in results for item in result.warnings} | set(nat_warnings)
+        )
         quality = _quality_from(results)
         summary = _summary_from(request, results)
         playbook = load_troubleshooting_cases(self._settings.troubleshooting_cases_file)
@@ -283,7 +290,10 @@ class AnalysisOrchestrator:
             "model": self._settings.llm_model,
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": f"Grounded context:\n{grounding}\n\nQuestion: {question}"},
+                {
+                    "role": "user",
+                    "content": f"Grounded context:\n{grounding}\n\nQuestion: {question}",
+                },
             ],
             "temperature": 0.2,
         }
@@ -312,6 +322,34 @@ def _quality_from(results: list[CollectorResult]) -> str:
     if counts["ok"] >= 1 or counts["partial"] >= 2:
         return "medium"
     return "low"
+
+
+async def _collect_safely(collector: object, target: object) -> CollectorResult:
+    try:
+        return await collector.collect(target)  # type: ignore[attr-defined]
+    except Exception as exc:
+        agent = _collector_name(collector)
+        return CollectorResult(
+            agent=agent,
+            status="unavailable",
+            summary=f"{agent} collector failed unexpectedly before returning evidence.",
+            confidence="low",
+            details={"error": f"{type(exc).__name__}: {exc}"},
+            missing_data=[f"{agent}.collector_exception"],
+            warnings=[_unexpected_runtime_warning(agent, exc)],
+        )
+
+
+def _collector_name(collector: object) -> str:
+    name = collector.__class__.__name__
+    if name.endswith("Collector"):
+        name = name[: -len("Collector")]
+    normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+    return normalized.replace("_a_i", "ai") or "collector"
+
+
+def _unexpected_runtime_warning(component: str, exc: Exception) -> str:
+    return f"{component} failed unexpectedly: {type(exc).__name__}: {exc}"
 
 
 def _build_settings_masker(settings: Settings) -> Masker:
@@ -543,7 +581,8 @@ def _recommended_action_lines(missing: list[str]) -> list[str]:
     lines = [
         "- Treat the Kubernetes and Prometheus evidence above as the current "
         "source of truth for this RCA.",
-        "- Apply the remediation implied by the confirmed scheduling, pod, node, or metric evidence.",
+        "- Apply the remediation implied by the confirmed scheduling, pod, node, "
+        "or metric evidence.",
     ]
     if "runai.auth" in missing or "runai.query" in missing:
         lines.append(

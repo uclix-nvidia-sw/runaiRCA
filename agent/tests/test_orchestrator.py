@@ -358,6 +358,60 @@ async def test_analyze_lists_grouped_pods() -> None:
 
 
 @pytest.mark.asyncio
+async def test_analyze_isolates_collector_exceptions() -> None:
+    class ExplodingCollector:
+        async def collect(self, target):
+            raise RuntimeError("collector boom")
+
+    orchestrator = AnalysisOrchestrator(make_settings())
+    orchestrator._collectors = [ExplodingCollector()]
+
+    response = await orchestrator.analyze(
+        AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={"alertname": "RunAICollectorCrash", "namespace": "runai"},
+                annotations={"summary": "Collector crashed during RCA."},
+                fingerprint="fp-collector-crash",
+            )
+        )
+    )
+
+    assert response.status == "ok"
+    assert response.analysis_quality == "low"
+    assert response.capabilities["exploding"] == "unavailable"
+    assert "exploding.collector_exception" in response.missing_data
+    assert any("collector boom" in warning for warning in response.warnings)
+    assert "**exploding** [unavailable]" in response.analysis_detail
+
+
+@pytest.mark.asyncio
+async def test_analyze_falls_back_when_nat_runtime_raises(monkeypatch) -> None:
+    settings = replace(make_settings(), enable_nat_runtime=True)
+    orchestrator = AnalysisOrchestrator(settings)
+
+    async def broken_nat_run(payload):
+        raise RuntimeError("nat executable missing")
+
+    monkeypatch.setattr(orchestrator._nat, "run", broken_nat_run)
+
+    response = await orchestrator.analyze(
+        AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={"alertname": "RunAINatFailure", "namespace": "runai"},
+                annotations={"summary": "NAT failed but fallback should continue."},
+                fingerprint="fp-nat-failure",
+            )
+        )
+    )
+
+    assert response.status == "ok"
+    assert "NAT failed but fallback should continue" in response.analysis_detail
+    assert any("nemo failed unexpectedly" in warning for warning in response.warnings)
+
+
+@pytest.mark.asyncio
 async def test_chat_without_detail_reports_runtime_state() -> None:
     orchestrator = AnalysisOrchestrator(make_settings())
     response = await orchestrator.chat(
@@ -421,12 +475,18 @@ async def test_chat_uses_llm_when_configured(monkeypatch) -> None:
         captured["json_body"] = json_body
         return SimpleNamespace(
             ok=True,
-            data={"choices": [{"message": {"content": "Live LLM reply about the pending workload."}}]},
+            data={
+                "choices": [
+                    {"message": {"content": "Live LLM reply about the pending workload."}}
+                ]
+            },
         )
 
     monkeypatch.setattr("app.services.orchestrator.post_json", fake_post_json)
     orchestrator = AnalysisOrchestrator(settings)
-    response = await orchestrator.chat(ChatRequest(message="왜 워크로드가 멈췄어?", page="operations"))
+    response = await orchestrator.chat(
+        ChatRequest(message="왜 워크로드가 멈췄어?", page="operations")
+    )
 
     assert response.answer == "Live LLM reply about the pending workload."
     assert captured["url"] == "https://llm.example.com/v1/chat/completions"

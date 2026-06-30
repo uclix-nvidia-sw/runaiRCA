@@ -62,7 +62,10 @@ class RunAICollector:
                             type="workload_context",
                             status="unavailable",
                             confidence="low",
-                            query="Run:ai API query skipped because no Authorization header was available.",
+                            query=(
+                                "Run:ai API query skipped because no Authorization header "
+                                "was available."
+                            ),
                             summary=summary,
                             result=details,
                         )
@@ -71,11 +74,17 @@ class RunAICollector:
             query_results = await _collect_runai_responses(self._settings, target, headers)
             auth_failed = any(item.get("status_code") == 401 for item in query_results)
             if auth_failed and _can_refresh_runai_token(self._settings):
-                retry_headers, retry_warnings = await _runai_headers(self._settings, prefer_oauth=True)
+                retry_headers, retry_warnings = await _runai_headers(
+                    self._settings, prefer_oauth=True
+                )
                 if retry_headers.get("Authorization"):
-                    auth_warnings.append("Run:ai returned HTTP 401; refreshed OAuth token and retried once.")
+                    auth_warnings.append(
+                        "Run:ai returned HTTP 401; refreshed OAuth token and retried once."
+                    )
                     auth_warnings.extend(retry_warnings)
-                    query_results = await _collect_runai_responses(self._settings, target, retry_headers)
+                    query_results = await _collect_runai_responses(
+                        self._settings, target, retry_headers
+                    )
                     auth_failed = any(item.get("status_code") == 401 for item in query_results)
             successful = [item for item in query_results if not item.get("error")]
             if successful and not missing:
@@ -176,7 +185,11 @@ class RunAICollector:
 
 
 def _can_refresh_runai_token(settings: Settings) -> bool:
-    return bool(settings.runai_token_url and settings.runai_client_id and settings.runai_client_secret)
+    return bool(
+        settings.runai_token_url
+        and settings.runai_client_id
+        and settings.runai_client_secret
+    )
 
 
 async def _runai_headers(
