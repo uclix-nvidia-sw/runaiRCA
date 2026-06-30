@@ -76,6 +76,7 @@ backend:
     language: en
     databaseConnectTimeoutSeconds: 5
     agentRequestTimeoutSeconds: 180
+    manualAgentRequestTimeoutSeconds: 900
   service:
     annotations: {}
     type: ClusterIP
