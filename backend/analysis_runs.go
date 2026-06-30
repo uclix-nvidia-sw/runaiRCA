@@ -39,6 +39,9 @@ func (s *Server) startAnalysisRun(targetType string, targetID string, source str
 	if !ok {
 		return nil, false
 	}
+	if source == "auto" && status(alert.Status) == "resolved" {
+		return nil, false
+	}
 	if source == "manual" && strings.TrimSpace(prompt) == "" {
 		prompt = s.store.OperatorPromptForTarget(targetType, targetID)
 	}

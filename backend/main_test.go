@@ -435,6 +435,42 @@ func TestLatestAlertIDPrefersNewestFiringAlert(t *testing.T) {
 	}
 }
 
+func TestIncidentAnalysisTargetPrefersFiringAlert(t *testing.T) {
+	store := NewStore()
+	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
+	incident, firing := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "analysis-target-firing"}, Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIQueueBlocked",
+			"severity":  "warning",
+		},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-analysis-target-firing",
+		StartsAt:    base.Format(time.RFC3339),
+	})
+	resolvedAt := base.Add(time.Hour)
+	store.mu.Lock()
+	store.alerts["ALR-analysis-target-resolved"] = &AlertRecord{
+		AlertID:     "ALR-analysis-target-resolved",
+		IncidentID:  incident.IncidentID,
+		AlarmTitle:  "Recovered alert",
+		Severity:    "warning",
+		Status:      "resolved",
+		FiredAt:     resolvedAt,
+		ResolvedAt:  &resolvedAt,
+		Fingerprint: "fp-analysis-target-resolved",
+		ThreadTS:    "thread-resolved",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue recovered"},
+	}
+	store.mu.Unlock()
+
+	alert, _, alertID, _, _, ok := store.AnalysisTarget("incident", incident.IncidentID)
+	if !ok || alertID != firing.AlertID || status(alert.Status) != "firing" {
+		t.Fatalf("expected firing alert target, got ok=%t alertID=%s alert=%+v", ok, alertID, alert)
+	}
+}
+
 func TestIncidentSeverityNormalizesCaseBeforeRanking(t *testing.T) {
 	store := NewStore()
 	webhook := AlertmanagerWebhook{GroupKey: "severity-case"}
@@ -580,6 +616,48 @@ func TestAlertmanagerWebhookSkipsAutoAnalysisForResolvedOnlyIncident(t *testing.
 	alerts := server.store.ListAlerts()
 	if len(alerts) != 1 || alerts[0].Status != "resolved" {
 		t.Fatalf("resolved status should be canonicalized, got %+v", alerts)
+	}
+}
+
+func TestAlertmanagerWebhookSkipsAutoAnalysisWhenAlertResolvesInSamePayload(t *testing.T) {
+	server := NewServer()
+	payload, _ := json.Marshal(AlertmanagerWebhook{
+		GroupKey: "firing-then-resolved",
+		Alerts: []Alert{
+			{
+				Status:      "firing",
+				Labels:      map[string]string{"alertname": "RunAIWorkloadPending", "severity": "warning"},
+				Annotations: map[string]string{"summary": "Workload pending"},
+				Fingerprint: "fp-firing-then-resolved",
+			},
+			{
+				Status:      "resolved",
+				Labels:      map[string]string{"alertname": "RunAIWorkloadPending", "severity": "warning"},
+				Annotations: map[string]string{"summary": "Workload recovered"},
+				Fingerprint: "fp-firing-then-resolved",
+			},
+		},
+	})
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload)))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["auto_analyses"].(float64) != 0 {
+		t.Fatalf("resolved final state should not start auto analysis, got %+v", response)
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 0 {
+		t.Fatalf("resolved final state should not create analysis runs, got %+v", runs)
+	}
+	alerts := server.store.ListAlerts()
+	if len(alerts) != 1 || alerts[0].Status != "resolved" {
+		t.Fatalf("expected final alert status resolved, got %+v", alerts)
 	}
 }
 

@@ -670,6 +670,7 @@ func (s *Store) AnalysisTarget(targetType string, targetID string) (Alert, strin
 			return Alert{}, "", "", "", "", false
 		}
 		var selected *AlertRecord
+		var selectedFiring *AlertRecord
 		for _, alert := range s.alerts {
 			if alert.IncidentID != targetID {
 				continue
@@ -677,6 +678,12 @@ func (s *Store) AnalysisTarget(targetType string, targetID string) (Alert, strin
 			if selected == nil || alert.FiredAt.After(selected.FiredAt) {
 				selected = alert
 			}
+			if alert.Status != "resolved" && (selectedFiring == nil || alert.FiredAt.After(selectedFiring.FiredAt)) {
+				selectedFiring = alert
+			}
+		}
+		if selectedFiring != nil {
+			selected = selectedFiring
 		}
 		if selected == nil {
 			return Alert{}, "", "", "", "", false
