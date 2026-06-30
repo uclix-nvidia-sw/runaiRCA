@@ -19,6 +19,11 @@ const (
 	similaritySearchPGVector  = "pgvector_cosine"
 	similaritySearchJSONB     = "jsonb_sparse_vectors"
 	similaritySearchMemory    = "in_memory_sparse_vectors"
+
+	maxOperatorPromptBytes             = 8000
+	maxOperatorPromptCommentsPerTarget = 10
+	maxOperatorPromptCommentBodyBytes  = 200
+	maxOperatorPromptAuthorBytes       = 80
 )
 
 type Store struct {
@@ -885,20 +890,25 @@ func (s *Store) OperatorPromptForTarget(targetType string, targetID string) stri
 	if len(lines) == 1 {
 		return ""
 	}
-	return strings.Join(lines, "\n")
+	return excerpt(strings.Join(lines, "\n"), maxOperatorPromptBytes)
 }
 
 func appendCommentPromptLines(lines []string, targetType string, targetID string, comments []CommentRecord) []string {
 	if targetID == "" || len(comments) == 0 {
 		return lines
 	}
+	if len(comments) > maxOperatorPromptCommentsPerTarget {
+		omitted := len(comments) - maxOperatorPromptCommentsPerTarget
+		lines = append(lines, fmt.Sprintf("- %d older %s comment(s) omitted from this analysis prompt.", omitted, targetType))
+		comments = comments[omitted:]
+	}
 	for _, comment := range comments {
 		body := strings.TrimSpace(comment.Body)
 		if body == "" {
 			continue
 		}
-		author := first(strings.TrimSpace(comment.Author), "operator")
-		lines = append(lines, fmt.Sprintf("- %s %s by %s: %s", targetType, targetID, author, body))
+		author := excerpt(first(strings.TrimSpace(comment.Author), "operator"), maxOperatorPromptAuthorBytes)
+		lines = append(lines, fmt.Sprintf("- %s %s by %s: %s", targetType, targetID, author, excerpt(body, maxOperatorPromptCommentBodyBytes)))
 	}
 	return lines
 }

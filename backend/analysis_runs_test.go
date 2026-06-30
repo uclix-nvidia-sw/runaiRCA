@@ -224,6 +224,60 @@ func TestManualAnalysisClearsRCAAndSkipsAgentTimeout(t *testing.T) {
 	}
 }
 
+func TestOperatorPromptForTargetBoundsCommentSnapshot(t *testing.T) {
+	server := NewServer()
+	incident, record := seedAlert(t, server, "fp-comment-bounds")
+	longAuthor := strings.Repeat("a", maxOperatorPromptAuthorBytes+20)
+
+	addComment := func(targetType, targetID, body, author string) {
+		t.Helper()
+		if _, ok, err := server.store.AddComment(targetType, targetID, CommentRequest{
+			Body:   body,
+			Author: author,
+		}); !ok || err != nil {
+			t.Fatalf("add %s comment failed: ok=%t err=%v", targetType, ok, err)
+		}
+		time.Sleep(time.Microsecond)
+	}
+
+	for i := 0; i < maxOperatorPromptCommentsPerTarget+3; i++ {
+		addComment(
+			"incident",
+			incident.IncidentID,
+			fmt.Sprintf("incident-comment-%02d %s", i, strings.Repeat("i", maxOperatorPromptCommentBodyBytes+50)),
+			"operator",
+		)
+	}
+	for i := 0; i < maxOperatorPromptCommentsPerTarget; i++ {
+		addComment(
+			"alert",
+			record.AlertID,
+			fmt.Sprintf("alert-comment-%02d %s", i, strings.Repeat("z", maxOperatorPromptCommentBodyBytes+50)),
+			longAuthor,
+		)
+	}
+
+	prompt := server.store.OperatorPromptForTarget("alert", record.AlertID)
+	if len(prompt) > maxOperatorPromptBytes+len("...") {
+		t.Fatalf("operator prompt exceeded cap: got %d bytes", len(prompt))
+	}
+	if !strings.Contains(prompt, "3 older incident comment(s) omitted") {
+		t.Fatalf("operator prompt did not record omitted incident comments: %q", prompt)
+	}
+	if strings.Contains(prompt, "incident-comment-00") {
+		t.Fatalf("operator prompt kept oldest incident comment: %q", prompt)
+	}
+	if !strings.Contains(prompt, "incident-comment-12") || !strings.Contains(prompt, "alert-comment-09") {
+		t.Fatalf("operator prompt lost latest comments: %q", prompt)
+	}
+	if !strings.Contains(prompt, strings.Repeat("a", maxOperatorPromptAuthorBytes)+"...") {
+		t.Fatalf("operator prompt did not trim long author: %q", prompt)
+	}
+	if strings.Contains(prompt, strings.Repeat("z", maxOperatorPromptCommentBodyBytes+1)) {
+		t.Fatalf("operator prompt did not trim long comment body: %q", prompt)
+	}
+}
+
 func TestAnalysisRunNon2xxFailsRun(t *testing.T) {
 	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
