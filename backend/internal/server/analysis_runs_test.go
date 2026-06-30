@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"bytes"
@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/brilly-bohyun/runai-rca/backend/internal/server/testsupport"
 )
 
 // analysisAgentStub spins up a fake agent /analyze endpoint with configurable
@@ -458,10 +460,10 @@ func TestAnalysisRunFailsWhenAgentSlotUnavailable(t *testing.T) {
 }
 
 func TestAnalysisRunPersistFailureSkipsAgentCall(t *testing.T) {
-	state := newFakePostgresState(false)
-	state.failAnalysisRuns = true
+	state := testsupport.NewPostgresState(false)
+	state.SetFailAnalysisRuns(true)
 	store := NewStore()
-	store.connectDatabaseWithDriver(registerFakePostgresDriver(state), "fake://runai_rca", time.Second)
+	store.connectDatabaseWithDriver(testsupport.RegisterPostgresDriver(state), "fake://runai_rca", time.Second)
 	defer store.db.Close()
 	beforeRuns := len(store.ListAnalysisRuns())
 	var hit atomic.Int32
@@ -498,10 +500,10 @@ func TestAnalysisRunPersistFailureSkipsAgentCall(t *testing.T) {
 }
 
 func TestAnalysisRunUpdatePersistFailureSkipsAlertRCA(t *testing.T) {
-	state := newFakePostgresState(false)
-	state.failAnalysisRunExecAfter = 1
+	state := testsupport.NewPostgresState(false)
+	state.SetFailAnalysisRunExecAfter(1)
 	store := NewStore()
-	store.connectDatabaseWithDriver(registerFakePostgresDriver(state), "fake://runai_rca", time.Second)
+	store.connectDatabaseWithDriver(testsupport.RegisterPostgresDriver(state), "fake://runai_rca", time.Second)
 	defer store.db.Close()
 	var hit atomic.Int32
 	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -535,17 +537,13 @@ func TestAnalysisRunUpdatePersistFailureSkipsAlertRCA(t *testing.T) {
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		state.mu.Lock()
-		execs := state.analysisRunExecs
-		state.mu.Unlock()
+		execs := state.AnalysisRunExecs()
 		if execs >= 2 {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	state.mu.Lock()
-	execs := state.analysisRunExecs
-	state.mu.Unlock()
+	execs := state.AnalysisRunExecs()
 	if execs < 2 {
 		t.Fatalf("analysis run update persist was not attempted, execs=%d", execs)
 	}
@@ -563,9 +561,9 @@ func TestAnalysisRunUpdatePersistFailureSkipsAlertRCA(t *testing.T) {
 }
 
 func TestAlertRCAPersistFailureFailsRun(t *testing.T) {
-	state := newFakePostgresState(false)
+	state := testsupport.NewPostgresState(false)
 	store := NewStore()
-	store.connectDatabaseWithDriver(registerFakePostgresDriver(state), "fake://runai_rca", time.Second)
+	store.connectDatabaseWithDriver(testsupport.RegisterPostgresDriver(state), "fake://runai_rca", time.Second)
 	defer store.db.Close()
 	_, record := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "alert-persist-failure"}, Alert{
 		Status:      "firing",
@@ -573,7 +571,7 @@ func TestAlertRCAPersistFailureFailsRun(t *testing.T) {
 		Annotations: map[string]string{"summary": "Queue blocked"},
 		Fingerprint: "fp-alert-persist-failure",
 	})
-	state.failAlertExecAfter = 2
+	state.SetFailAlertExecAfter(2)
 	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
 			Status:          "ok",
@@ -605,9 +603,9 @@ func TestAlertRCAPersistFailureFailsRun(t *testing.T) {
 }
 
 func TestReapPersistFailureKeepsRunAnalyzing(t *testing.T) {
-	state := newFakePostgresState(false)
+	state := testsupport.NewPostgresState(false)
 	store := NewStore()
-	store.connectDatabaseWithDriver(registerFakePostgresDriver(state), "fake://runai_rca", time.Second)
+	store.connectDatabaseWithDriver(testsupport.RegisterPostgresDriver(state), "fake://runai_rca", time.Second)
 	defer store.db.Close()
 	incident, record := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "reap-persist-failure"}, Alert{
 		Status:      "firing",
@@ -616,7 +614,7 @@ func TestReapPersistFailureKeepsRunAnalyzing(t *testing.T) {
 		Fingerprint: "fp-reap-persist-failure",
 	})
 	run := store.CreateAnalysisRun("auto", "alert", record.AlertID, incident.IncidentID, record.AlertID, "stale", "")
-	state.failAnalysisRunExecAfter = 1
+	state.SetFailAnalysisRunExecAfter(1)
 
 	reaped := store.ReapStaleAnalyzingRuns(0, 0)
 
