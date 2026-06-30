@@ -1027,6 +1027,45 @@ func TestSimilarIncidentsLimitAndLatestTieBreak(t *testing.T) {
 	}
 }
 
+func TestFeedbackHintsCapsInvalidLimit(t *testing.T) {
+	store := NewStore()
+	alert := Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIWorkloadPending",
+			"severity":  "warning",
+			"namespace": "runai",
+			"pod":       "trainer-0",
+		},
+		Annotations: map[string]string{"summary": "GPU quota exhausted for trainer"},
+	}
+	store.memories["INC-prior-hint"] = &IncidentMemory{
+		IncidentID:      "INC-prior-hint",
+		AlertID:         "ALR-prior-hint",
+		Title:           "RunAI workload pending",
+		Severity:        "warning",
+		Status:          "resolved",
+		AnalysisSummary: "GPU quota exhausted for trainer",
+		AnalysisDetail:  "Quota was expanded.",
+		Labels:          cloneMap(alert.Labels),
+		CreatedAt:       time.Now().UTC(),
+		Vector:          textVector(alertSearchText(alert)),
+	}
+	store.comments["CMT-prior-hint"] = &CommentRecord{
+		CommentID:  "CMT-prior-hint",
+		TargetType: "incident",
+		TargetID:   "INC-prior-hint",
+		IncidentID: "INC-prior-hint",
+		Body:       "operator note",
+		CreatedAt:  time.Now().UTC(),
+	}
+
+	hints := store.FeedbackHintsForAlert(alert, "INC-current", -1)
+	if len(hints) == 0 || hints[0].Text != "operator note" {
+		t.Fatalf("expected invalid limit to fall back to default hint cap, got %+v", hints)
+	}
+}
+
 func TestFlappingAlertGroupingUsesNamespaceWorkloadAndWindow(t *testing.T) {
 	store := NewStore()
 	base := time.Date(2026, 6, 26, 9, 0, 0, 0, time.UTC)

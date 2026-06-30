@@ -39,7 +39,8 @@ func (s *Store) SimilarIncidentsForAlert(alert Alert, incidentID string, limit i
 func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int) []FeedbackHint {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	similar := s.similarIncidentsLocked(alert, incidentID, capSimilarIncidentLimit(limit))
+	limit = capSimilarIncidentLimit(limit)
+	similar := s.similarIncidentsLocked(alert, incidentID, limit)
 	hints := make([]FeedbackHint, 0, limit)
 	for _, item := range similar {
 		if item.PositiveFeedback > 0 {
