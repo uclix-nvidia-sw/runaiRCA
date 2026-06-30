@@ -622,18 +622,21 @@ func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (A
 }
 
 // ReapStaleAnalyzingRuns enforces the lifecycle invariant across process
-// restarts. A run persisted as "analyzing" by a previous process (a pod that was
-// killed mid-analysis by a rollout, OOM, or a shutdown that exceeded the drain
-// window) has no goroutine to finish it, so on startup it is marked failed with a
-// warning. Any stale is_analyzing flags on alerts/incidents are also cleared,
-// since nothing is actually running yet. It returns the number of runs reaped
-// and is a no-op for the in-memory store with no persisted state.
-func (s *Store) ReapStaleAnalyzingRuns() int {
+// restarts. A run persisted as "analyzing" past staleAfter has no goroutine to
+// finish it, so on startup it is marked failed with a warning. Any stale
+// is_analyzing flags on alerts/incidents are also cleared when no analyzing run
+// remains for them. It returns the number of runs reaped.
+func (s *Store) ReapStaleAnalyzingRuns(staleAfter time.Duration) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	cutoff := now.Add(-staleAfter)
 	reaped := 0
 	for _, run := range s.analysisRuns {
 		if run == nil || run.Status != "analyzing" {
+			continue
+		}
+		if staleAfter > 0 && run.UpdatedAt.After(cutoff) {
 			continue
 		}
 		run.Status = "failed"
@@ -643,18 +646,31 @@ func (s *Store) ReapStaleAnalyzingRuns() int {
 		}
 		run.Capabilities["agent"] = "interrupted"
 		run.Warnings = append(run.Warnings, "analysis was interrupted by a backend restart and marked failed")
-		run.UpdatedAt = time.Now().UTC()
+		run.UpdatedAt = now
 		s.persistAnalysisRunLocked(run)
 		reaped++
 	}
+	activeAlerts := map[string]bool{}
+	activeIncidents := map[string]bool{}
+	for _, run := range s.analysisRuns {
+		if run == nil || run.Status != "analyzing" {
+			continue
+		}
+		if run.AlertID != "" {
+			activeAlerts[run.AlertID] = true
+		}
+		if run.IncidentID != "" {
+			activeIncidents[run.IncidentID] = true
+		}
+	}
 	for _, alert := range s.alerts {
-		if alert != nil && alert.IsAnalyzing {
+		if alert != nil && alert.IsAnalyzing && !activeAlerts[alert.AlertID] {
 			alert.IsAnalyzing = false
 			s.persistAlertLocked(alert)
 		}
 	}
 	for _, incident := range s.incidents {
-		if incident != nil && incident.IsAnalyzing {
+		if incident != nil && incident.IsAnalyzing && !activeIncidents[incident.IncidentID] {
 			incident.IsAnalyzing = false
 			s.persistIncidentLocked(incident)
 		}

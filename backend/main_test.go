@@ -1691,7 +1691,7 @@ func TestReapStaleAnalyzingRunsMarksFailed(t *testing.T) {
 	store.CompleteAnalysisRun(done.RunID, AgentAnalysisResponse{Status: "ok", AnalysisSummary: "done"})
 	stale := store.CreateAnalysisRun("auto", "alert", record.AlertID, incident.IncidentID, record.AlertID, "t", "")
 
-	reaped := store.ReapStaleAnalyzingRuns()
+	reaped := store.ReapStaleAnalyzingRuns(0)
 	if reaped != 1 {
 		t.Fatalf("expected exactly 1 stale run reaped, got %d", reaped)
 	}
@@ -1721,6 +1721,39 @@ func TestReapStaleAnalyzingRunsMarksFailed(t *testing.T) {
 	}
 	if detail, ok := store.IncidentDetail(incident.IncidentID); !ok || detail.IsAnalyzing {
 		t.Fatalf("incident is_analyzing flag should be cleared after reap")
+	}
+}
+
+func TestReapStaleAnalyzingRunsKeepsFreshRun(t *testing.T) {
+	store := NewStore()
+	incident, record := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "fresh-reap"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-fresh-reap",
+	})
+	run := store.CreateAnalysisRun("manual", "alert", record.AlertID, incident.IncidentID, record.AlertID, "t", "")
+	store.BeginAnalyzing(incident.IncidentID, record.AlertID)
+
+	reaped := store.ReapStaleAnalyzingRuns(time.Hour)
+	if reaped != 0 {
+		t.Fatalf("fresh run should not be reaped, got %d", reaped)
+	}
+	found := false
+	for _, current := range store.ListAnalysisRuns() {
+		if current.RunID == run.RunID && current.Status != "analyzing" {
+			t.Fatalf("fresh run should stay analyzing, got %q", current.Status)
+		}
+		found = found || current.RunID == run.RunID
+	}
+	if !found {
+		t.Fatalf("fresh run disappeared")
+	}
+	if alert, _ := store.AlertDetail(record.AlertID); !alert.IsAnalyzing {
+		t.Fatalf("fresh alert should stay analyzing")
+	}
+	if detail, ok := store.IncidentDetail(incident.IncidentID); !ok || !detail.IsAnalyzing {
+		t.Fatalf("fresh incident should stay analyzing")
 	}
 }
 
