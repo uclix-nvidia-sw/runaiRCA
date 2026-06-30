@@ -114,8 +114,8 @@ func TestAlertmanagerWebhookGroupsDiskPressureStormIntoOneAutoAnalysis(t *testin
 	if len(groupedAlerts) != 1 || groupedAlerts[0].OccurrenceCount != 3 {
 		t.Fatalf("expected one grouped alert row with three occurrences, got %+v", groupedAlerts)
 	}
-	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 || runs[0].TargetType != "incident" {
-		t.Fatalf("expected one incident-level analysis run, got %+v", runs)
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 || runs[0].TargetType != "alert" || runs[0].AlertID != groupedAlerts[0].AlertID {
+		t.Fatalf("expected one grouped-alert analysis run, got %+v", runs)
 	}
 }
 

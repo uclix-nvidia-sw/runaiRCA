@@ -135,7 +135,7 @@ func TestAnalysisRunTimeoutFailsRun(t *testing.T) {
 	}
 }
 
-func TestAutoAnalysisRunIsIncidentScopedAndIdempotent(t *testing.T) {
+func TestAutoAnalysisRunIsAlertScopedAndIdempotent(t *testing.T) {
 	var hit atomic.Int32
 	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
 		hit.Add(1)
@@ -146,13 +146,13 @@ func TestAutoAnalysisRunIsIncidentScopedAndIdempotent(t *testing.T) {
 			AnalysisQuality: "medium",
 		})
 	})
-	incident, _ := seedAlert(t, server, "fp-auto-idempotent")
+	_, record := seedAlert(t, server, "fp-auto-idempotent")
 
-	first, ok := server.startAnalysisRun("incident", incident.IncidentID, "auto", "")
+	first, ok := server.startAnalysisRun("alert", record.AlertID, "auto", "")
 	if !ok {
 		t.Fatalf("expected first auto run to start")
 	}
-	second, ok := server.startAnalysisRun("incident", incident.IncidentID, "auto", "")
+	second, ok := server.startAnalysisRun("alert", record.AlertID, "auto", "")
 	if ok {
 		t.Fatalf("expected second auto run to reuse existing run")
 	}
@@ -165,6 +165,8 @@ func TestAutoAnalysisRunIsIncidentScopedAndIdempotent(t *testing.T) {
 	}
 	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 {
 		t.Fatalf("expected one auto analysis run, got %+v", runs)
+	} else if runs[0].TargetType != "alert" || runs[0].TargetID != record.AlertID {
+		t.Fatalf("expected alert-scoped auto run, got %+v", runs[0])
 	}
 }
 
@@ -242,14 +244,14 @@ func TestAnalysisRunPersistFailureSkipsAgentCall(t *testing.T) {
 		manualAgentRequestTimeout: time.Second,
 		client:                    &http.Client{},
 	}
-	incident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "persist-failure"}, Alert{
+	_, record := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "persist-failure"}, Alert{
 		Status:      "firing",
 		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
 		Annotations: map[string]string{"summary": "Queue blocked"},
 		Fingerprint: "fp-persist-failure",
 	})
 
-	if _, ok := server.startAnalysisRun("incident", incident.IncidentID, "auto", ""); ok {
+	if _, ok := server.startAnalysisRun("alert", record.AlertID, "auto", ""); ok {
 		t.Fatalf("analysis run should not start when its DB row cannot be persisted")
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -286,14 +288,14 @@ func TestAnalysisRunUpdatePersistFailureSkipsAlertRCA(t *testing.T) {
 		manualAgentRequestTimeout: time.Second,
 		client:                    &http.Client{},
 	}
-	incident, record := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "update-persist-failure"}, Alert{
+	_, record := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "update-persist-failure"}, Alert{
 		Status:      "firing",
 		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
 		Annotations: map[string]string{"summary": "Queue blocked"},
 		Fingerprint: "fp-update-persist-failure",
 	})
 
-	run, ok := server.startAnalysisRun("incident", incident.IncidentID, "auto", "")
+	run, ok := server.startAnalysisRun("alert", record.AlertID, "auto", "")
 	if !ok {
 		t.Fatalf("expected initial analysis run persist to succeed")
 	}
