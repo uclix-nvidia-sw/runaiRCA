@@ -51,6 +51,9 @@ func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int)
 				Weight:    item.Similarity,
 				Text:      fmt.Sprintf("Operators found this prior RCA useful: %s", item.AnalysisSummary),
 			})
+			if len(hints) >= limit {
+				return hints
+			}
 		}
 		if item.NegativeFeedback > 0 {
 			hints = append(hints, FeedbackHint{
@@ -59,6 +62,9 @@ func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int)
 				Weight:    item.Similarity,
 				Text:      fmt.Sprintf("Operators pushed back on this prior RCA: %s", item.AnalysisSummary),
 			})
+			if len(hints) >= limit {
+				return hints
+			}
 		}
 		for _, comment := range s.commentsForTargetLocked("incident", item.IncidentID) {
 			if _, ok := seenComments[comment.CommentID]; ok {
@@ -74,6 +80,9 @@ func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int)
 				Weight:    item.Similarity,
 				Text:      comment.Body,
 			})
+			if len(hints) >= limit {
+				return hints
+			}
 		}
 		if len(hints) >= limit {
 			return hints

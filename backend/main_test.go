@@ -1332,6 +1332,53 @@ func TestFeedbackHintsCapsInvalidLimit(t *testing.T) {
 	}
 }
 
+func TestFeedbackHintsHonorsLimitAcrossVoteHints(t *testing.T) {
+	store := NewStore()
+	alert := Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIWorkloadPending",
+			"severity":  "warning",
+			"namespace": "runai",
+			"pod":       "trainer-0",
+		},
+		Annotations: map[string]string{"summary": "GPU quota exhausted for trainer"},
+	}
+	store.memories["ALR-prior-limit"] = &IncidentMemory{
+		IncidentID:      "INC-prior-limit",
+		AlertID:         "ALR-prior-limit",
+		Title:           "RunAI workload pending",
+		Severity:        "warning",
+		Status:          "resolved",
+		AnalysisSummary: "GPU quota exhausted for trainer",
+		AnalysisDetail:  "Quota was expanded.",
+		Labels:          cloneMap(alert.Labels),
+		CreatedAt:       time.Now().UTC(),
+		Vector:          textVector(alertSearchText(alert)),
+	}
+	store.feedback["FDB-prior-up"] = &FeedbackRecord{
+		FeedbackID: "FDB-prior-up",
+		TargetType: "incident",
+		TargetID:   "INC-prior-limit",
+		Vote:       "up",
+		Author:     "operator-a",
+		CreatedAt:  time.Now().UTC(),
+	}
+	store.feedback["FDB-prior-down"] = &FeedbackRecord{
+		FeedbackID: "FDB-prior-down",
+		TargetType: "incident",
+		TargetID:   "INC-prior-limit",
+		Vote:       "down",
+		Author:     "operator-b",
+		CreatedAt:  time.Now().UTC(),
+	}
+
+	hints := store.FeedbackHintsForAlert(alert, "INC-current", 1)
+	if len(hints) != 1 {
+		t.Fatalf("expected feedback hints to honor limit, got %+v", hints)
+	}
+}
+
 func TestFeedbackHintsDedupesIncidentCommentsAcrossAlertMemories(t *testing.T) {
 	store := NewStore()
 	alert := Alert{
