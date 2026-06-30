@@ -1288,6 +1288,53 @@ func TestFeedbackHintsCapsInvalidLimit(t *testing.T) {
 	}
 }
 
+func TestFeedbackHintsDedupesIncidentCommentsAcrossAlertMemories(t *testing.T) {
+	store := NewStore()
+	alert := Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIWorkloadPending",
+			"severity":  "warning",
+			"namespace": "runai",
+			"pod":       "trainer-0",
+		},
+		Annotations: map[string]string{"summary": "GPU quota exhausted for trainer"},
+	}
+	for _, alertID := range []string{"ALR-prior-a", "ALR-prior-b"} {
+		store.memories[alertID] = &IncidentMemory{
+			IncidentID:      "INC-prior-duplicate-comments",
+			AlertID:         alertID,
+			Title:           "RunAI workload pending",
+			Severity:        "warning",
+			Status:          "resolved",
+			AnalysisSummary: "GPU quota exhausted for trainer",
+			AnalysisDetail:  "Quota was expanded.",
+			Labels:          cloneMap(alert.Labels),
+			CreatedAt:       time.Now().UTC(),
+			Vector:          textVector(alertSearchText(alert)),
+		}
+	}
+	store.comments["CMT-duplicate-hint"] = &CommentRecord{
+		CommentID:  "CMT-duplicate-hint",
+		TargetType: "incident",
+		TargetID:   "INC-prior-duplicate-comments",
+		IncidentID: "INC-prior-duplicate-comments",
+		Body:       "same incident note",
+		CreatedAt:  time.Now().UTC(),
+	}
+
+	hints := store.FeedbackHintsForAlert(alert, "INC-current", 5)
+	commentHints := 0
+	for _, hint := range hints {
+		if hint.Sentiment == "comment" && hint.Text == "same incident note" {
+			commentHints++
+		}
+	}
+	if commentHints != 1 {
+		t.Fatalf("expected one deduped comment hint, got %d in %+v", commentHints, hints)
+	}
+}
+
 func TestFlappingAlertGroupingUsesNamespaceWorkloadAndWindow(t *testing.T) {
 	store := NewStore()
 	base := time.Date(2026, 6, 26, 9, 0, 0, 0, time.UTC)

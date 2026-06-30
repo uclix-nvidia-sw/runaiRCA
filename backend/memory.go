@@ -42,6 +42,7 @@ func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int)
 	limit = capSimilarIncidentLimit(limit)
 	similar := s.similarIncidentsLocked(alert, incidentID, limit)
 	hints := make([]FeedbackHint, 0, limit)
+	seenComments := map[string]struct{}{}
 	for _, item := range similar {
 		if item.PositiveFeedback > 0 {
 			hints = append(hints, FeedbackHint{
@@ -60,6 +61,10 @@ func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int)
 			})
 		}
 		for _, comment := range s.commentsForTargetLocked("incident", item.IncidentID) {
+			if _, ok := seenComments[comment.CommentID]; ok {
+				continue
+			}
+			seenComments[comment.CommentID] = struct{}{}
 			if len(hints) >= limit {
 				return hints
 			}
