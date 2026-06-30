@@ -443,11 +443,8 @@ func (s *Store) loadAlerts(ctx context.Context) {
 		if alert.Fingerprint != "" {
 			s.alertByFinger[alert.Fingerprint] = alert.AlertID
 		}
-		alertSource := alertFromRecord(alert)
-		key := correlationKey(AlertmanagerWebhook{}, alertSource)
-		storageKey := alertStorageKey(AlertmanagerWebhook{}, alertSource, key)
-		if storageKey != "" {
-			s.alertByGroup[storageKey] = alert.AlertID
+		if incident := s.incidents[alert.IncidentID]; incident != nil && incident.CorrelationKey != "" {
+			s.alertByGroup["correlation:"+incident.CorrelationKey] = alert.AlertID
 		}
 	}
 	for _, alert := range s.alerts {

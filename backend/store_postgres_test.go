@@ -76,6 +76,28 @@ func TestPostgresConnectFallsBackToJSONBWhenPGVectorUnavailable(t *testing.T) {
 	assertLoadedPostgresMemory(t, store)
 }
 
+func TestPostgresLoadRestoresGroupAlertIndex(t *testing.T) {
+	state := newFakePostgresState(false)
+	state.labelsJSON = []byte(`{"alertname":"RunAIQueueBlocked","severity":"warning"}`)
+	store := NewStore()
+
+	store.connectDatabaseWithDriver(registerFakePostgresDriver(state), "fake://runai_rca", time.Second)
+	defer store.db.Close()
+
+	_, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "db"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue still blocked"},
+	})
+
+	if alert.AlertID != "ALR-db" {
+		t.Fatalf("expected group-key alert to reuse loaded row, got %s", alert.AlertID)
+	}
+	if alerts := store.ListAlerts(); len(alerts) != 1 {
+		t.Fatalf("expected one alert after reload upsert, got %+v", alerts)
+	}
+}
+
 func TestInMemoryStoreHealthReportsNoPostgres(t *testing.T) {
 	health := NewStore().databaseHealth()
 	if health["postgres"] != false ||
