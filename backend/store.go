@@ -236,6 +236,8 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 		s.alerts[alertID] = record
 	} else {
 		previousStatus = record.Status
+		previousSeverity = record.Severity
+		previousFiredAt = record.FiredAt
 		previousResolvedAt = record.ResolvedAt
 		previousOccurrenceCount = record.OccurrenceCount
 	}
