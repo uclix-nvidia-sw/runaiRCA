@@ -203,7 +203,7 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 		`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS occurrence_count INTEGER NOT NULL DEFAULT 1`,
 		`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS occurrence_pods JSONB NOT NULL DEFAULT '[]'::jsonb`,
 		`CREATE TABLE IF NOT EXISTS incident_embeddings (
-			incident_id TEXT PRIMARY KEY,
+			incident_id TEXT NOT NULL,
 			alert_id TEXT NOT NULL,
 			title TEXT NOT NULL,
 			severity TEXT NOT NULL,
@@ -215,6 +215,8 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`ALTER TABLE incident_embeddings DROP CONSTRAINT IF EXISTS incident_embeddings_pkey`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_incident_embeddings_incident_alert ON incident_embeddings (incident_id, alert_id)`,
 		`DO $$
 		BEGIN
 			IF to_regclass('public.incident_memories') IS NOT NULL THEN
@@ -229,7 +231,7 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 						analysis_summary, analysis_detail, labels, vector_json,
 						created_at, updated_at
 					FROM incident_memories
-					ON CONFLICT (incident_id) DO NOTHING
+					ON CONFLICT DO NOTHING
 				';
 			END IF;
 		END $$`,
@@ -501,7 +503,7 @@ func (s *Store) loadMemories(ctx context.Context) {
 		if memory.Vector == nil {
 			memory.Vector = textVector(memoryText(memory))
 		}
-		s.memories[memory.IncidentID] = &memory
+		s.memories[first(memory.AlertID, memory.IncidentID)] = &memory
 	}
 }
 
@@ -801,7 +803,7 @@ func (s *Store) persistMemoryLocked(memory *IncidentMemory) {
 				incident_id, alert_id, title, severity, status, analysis_summary,
 				analysis_detail, labels, vector_json, embedding, created_at, updated_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::vector, $11, now())
-			ON CONFLICT (incident_id) DO UPDATE SET
+			ON CONFLICT (incident_id, alert_id) DO UPDATE SET
 				alert_id = EXCLUDED.alert_id,
 				title = EXCLUDED.title,
 				severity = EXCLUDED.severity,
@@ -834,7 +836,7 @@ func (s *Store) persistMemoryLocked(memory *IncidentMemory) {
 			incident_id, alert_id, title, severity, status, analysis_summary,
 			analysis_detail, labels, vector_json, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
-		ON CONFLICT (incident_id) DO UPDATE SET
+		ON CONFLICT (incident_id, alert_id) DO UPDATE SET
 			alert_id = EXCLUDED.alert_id,
 			title = EXCLUDED.title,
 			severity = EXCLUDED.severity,

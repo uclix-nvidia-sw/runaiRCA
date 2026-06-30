@@ -8,8 +8,8 @@ import (
 )
 
 // AnalysisRun is a single lifecycle record for an analysis request. Automatic
-// webhook analysis is incident-scoped and idempotent; explicit operator
-// requests still create their own runs so manual follow-up remains auditable.
+// webhook analysis is alert-scoped and idempotent; explicit operator requests
+// still create their own runs so manual follow-up remains auditable.
 type AnalysisRun struct {
 	RunID           string            `json:"run_id"`
 	Source          string            `json:"source"`

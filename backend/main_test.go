@@ -1158,6 +1158,54 @@ func TestFeedbackAndSimilarIncidentMemory(t *testing.T) {
 	}
 }
 
+func TestIncidentMemoryKeepsMultipleAlertAnalyses(t *testing.T) {
+	store := NewStore()
+	incident, first := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "multi-memory"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning", "queue": "gpu-a"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-memory-first",
+	})
+	secondID := "ALR-memory-second"
+	store.mu.Lock()
+	store.alerts[secondID] = &AlertRecord{
+		AlertID:     secondID,
+		IncidentID:  incident.IncidentID,
+		AlarmTitle:  "Quota alert",
+		Severity:    "critical",
+		Status:      "firing",
+		FiredAt:     first.FiredAt.Add(time.Minute),
+		Fingerprint: "fp-memory-second",
+		ThreadTS:    "thread-" + secondID,
+		Labels:      map[string]string{"alertname": "RunAIQuotaBlocked", "severity": "critical", "queue": "gpu-a"},
+		Annotations: map[string]string{"summary": "Quota blocked"},
+	}
+	store.mu.Unlock()
+
+	store.ApplyAnalysis(first.AlertID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Queue saturation RCA.",
+		AnalysisDetail:  "Queue workers are waiting.",
+	})
+	store.ApplyAnalysis(secondID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Quota exhaustion RCA.",
+		AnalysisDetail:  "GPU quota is exhausted.",
+	})
+
+	if len(store.memories) != 2 {
+		t.Fatalf("expected two alert memories, got %+v", store.memories)
+	}
+	firstMemory := store.memories[first.AlertID]
+	if firstMemory == nil || firstMemory.AnalysisSummary != "Queue saturation RCA." {
+		t.Fatalf("first alert memory was overwritten: %+v", firstMemory)
+	}
+	secondMemory := store.memories[secondID]
+	if secondMemory == nil || secondMemory.AnalysisSummary != "Quota exhaustion RCA." {
+		t.Fatalf("second alert memory missing: %+v", secondMemory)
+	}
+}
+
 func TestSimilarIncidentsLimitAndLatestTieBreak(t *testing.T) {
 	store := NewStore()
 	alert := Alert{

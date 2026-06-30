@@ -331,7 +331,7 @@ func (s *Store) upsertMemoryLocked(incident *Incident, alert *AlertRecord) {
 		CreatedAt:       time.Now().UTC(),
 	}
 	memory.Vector = textVector(memoryText(*memory))
-	s.memories[memory.IncidentID] = memory
+	s.memories[first(memory.AlertID, memory.IncidentID)] = memory
 	s.persistMemoryLocked(memory)
 }
 
