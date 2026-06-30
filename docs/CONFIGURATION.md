@@ -33,10 +33,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `PROMETHEUS_URL` | Prometheus base URL |
 | `PROMETHEUS_TIMEOUT_SECONDS` | Prometheus query timeout |
 | `PROMETHEUS_MCP_URL` | Optional remote Prometheus MCP URL for the MCP workflow |
-| `LOKI_URL` | Loki base URL |
-| `LOKI_BEARER_TOKEN` | Optional Loki bearer token secret |
-| `LOKI_BASIC_USERNAME` / `LOKI_BASIC_PASSWORD` | Optional Loki basic auth credentials |
-| `LOKI_TENANT_ID` | Optional Loki tenant header value sent as `X-Scope-OrgID` |
+| `LOKI_URL` | Loki base URL. In Helm this should normally point to the direct read/query service, for example `http://loki-read.monitoring.svc.cluster.local:3100`, not an authenticated gateway. |
 | `LOKI_TIMEOUT_SECONDS` | Loki query timeout |
 | `LOKI_QUERY_LIMIT` | Maximum log lines requested per Loki query group, default `20` |
 | `LOKI_MCP_URL` | Optional remote Loki MCP URL for the MCP workflow |
@@ -58,6 +55,12 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `NAT_CONFIG_FILE` | Optional NeMo workflow config path, default `configs/runai_rca_workflow.yml` |
 | `NAT_TIMEOUT_SECONDS` | NeMo Agent Toolkit CLI execution timeout |
 | `VITE_ENABLE_MOCK_DATA` | Frontend local-dev sample data toggle; Helm uses `frontend.config.enableMockData` |
+
+The Helm chart does not expose Loki credential values because the default
+deployment is expected to query Loki through the in-cluster read/query service.
+If a deployment must call an authenticated external Loki endpoint, inject
+`LOKI_BEARER_TOKEN`, `LOKI_BASIC_USERNAME` / `LOKI_BASIC_PASSWORD`, or
+`LOKI_TENANT_ID` explicitly with `agent.extraEnv`.
 
 NeMo Agent Toolkit workflows:
 
@@ -111,8 +114,7 @@ Frequently tuned Helm values:
 | `agent.env.runaiWorkloadsPath`, `runaiProjectsPath`, `runaiQueuesPath` | Run:ai API path overrides for different Run:ai versions |
 | `agent.env.runaiLogNamespaces` | Namespaces for Run:ai control-plane/backend logs, default `runai,runai-backend` |
 | `agent.env.prometheusUrl` | In-cluster Prometheus URL, for example `http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090` |
-| `agent.env.lokiUrl` / `agent.env.lokiTenantId` | In-cluster Loki URL and optional `X-Scope-OrgID` tenant header, for example `http://loki-gateway.monitoring.svc.cluster.local` |
-| `secrets.lokiBearerToken` / `secrets.lokiBasicUsername` / `secrets.lokiBasicPassword` | Optional Loki auth credentials; bearer auth takes precedence over basic auth |
+| `agent.env.lokiUrl` | In-cluster Loki query URL, for example `http://loki-read.monitoring.svc.cluster.local:3100`. The chart intentionally avoids the authenticated `loki-gateway` path by default. |
 | `agent.env.prometheusMcpUrl` / `agent.env.lokiMcpUrl` | Remote MCP endpoints when using the MCP workflow |
 | `agent.env.llmBaseUrl` / `agent.env.llmModel` / `secrets.llmApiKey` | LiteLLM/OpenAI-compatible endpoint, model, and Secret-backed API key for `runai_rca_workflow_litellm.yml` |
 | `agent.env.*TimeoutSeconds` | Request/runtime timeouts for Kubernetes, Run:ai, Prometheus, Loki, Postgres, and NAT |

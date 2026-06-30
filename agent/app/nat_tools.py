@@ -199,7 +199,7 @@ def _synthesize_report(evidence_text: str) -> str:
             "## Root Cause",
             "",
             "NeMo Agent Toolkit collected component evidence for the Run:ai incident. "
-            "Review the per-agent findings below and confirm against the live cluster.",
+            "Use the per-agent findings below as the current RCA evidence set.",
             "",
             "## Agent Role Contract",
             "",
@@ -208,7 +208,7 @@ def _synthesize_report(evidence_text: str) -> str:
             "## Analysis Agent Verdict",
             "",
             "The Analysis Agent is responsible for the final RCA judgment, confidence, "
-            "impact framing, missing-data callouts, and operator-facing next actions.",
+            "impact framing, missing-data callouts, and evidence-backed next actions.",
             "",
             "## Agent Evidence",
             "",
@@ -226,15 +226,11 @@ def _synthesize_report(evidence_text: str) -> str:
             "",
             "## Recommended Actions",
             "",
-            "- Check Run:ai project and queue saturation for the affected workload.",
-            "- Review Kubernetes pod status, events, and node conditions.",
-            "- Inspect Run:ai control-plane and backend namespace logs for scheduler, "
-            "queue, quota, database, or reconciliation errors.",
-            "- Inspect Postgres RCA store health when incident persistence or "
-            "similarity search is stale.",
-            "- Compare Prometheus GPU, scheduling, CPU, and memory metrics around "
-            "the alert window.",
-            "- Inspect Loki workload logs for scheduling, startup, image, or runtime failures.",
+            "- Use collected Run:ai project, queue, and workload evidence when present.",
+            "- Use collected Kubernetes pod, event, and node evidence when present.",
+            "- Use collected Prometheus GPU, scheduling, CPU, and memory metrics when present.",
+            "- Restore missing Run:ai, Loki, or Postgres integrations so the agent can "
+            "attach those sources on the next analysis run.",
         ]
     )
     return masker.mask_text(report)

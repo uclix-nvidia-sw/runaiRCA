@@ -34,8 +34,10 @@ When deployed in the same Kubernetes cluster as Run:ai, Prometheus, and Loki,
 the collectors query cluster-local service URLs directly. The Helm chart defaults
 Prometheus to
 `http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090`
-and Loki to `http://loki-gateway.monitoring.svc.cluster.local`; override those
-values when the cluster service names differ.
+and Loki to
+`http://loki-read.monitoring.svc.cluster.local:3100`; override those
+values when the cluster service names differ. The default uses the direct Loki
+query service and avoids gateway-level Basic Auth.
 
 The Loki collector also queries Run:ai control-plane/backend logs with
 `RUNAI_LOG_NAMESPACES`, defaulting to `runai,runai-backend`.

@@ -7,9 +7,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.collectors.base import AnalysisTarget
+from app.collectors.base import AnalysisTarget, resolve_target
 from app.collectors.loki import LokiCollector, _loki_headers
-from app.collectors.runai import _runai_headers
+from app.collectors.runai import RunAICollector, _runai_headers
 from app.config import Settings
 from app.masking import build_masker
 from app.schemas import (
@@ -86,6 +86,16 @@ def make_target() -> AnalysisTarget:
         severity="warning",
         alert_name="RunAIWorkloadPending",
     )
+
+
+def test_resolve_target_derives_project_from_runai_namespace() -> None:
+    target = resolve_target(
+        {"namespace": "runai-vision", "pod": "trainer-0"},
+        {},
+    )
+
+    assert target.project == "vision"
+    assert target.namespace == "runai-vision"
 
 
 def test_loki_headers_prefer_bearer_and_include_tenant() -> None:
@@ -176,6 +186,55 @@ async def test_runai_token_uses_json_client_credentials(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_runai_token_falls_back_to_form_candidate_url(monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        calls.append(("json", url))
+        return SimpleNamespace(ok=False, error="HTTP 404", data={"body": "not found"})
+
+    async def fake_post_form_json(*, url, timeout_seconds, data, headers=None, verify=True):
+        calls.append(("form", url))
+        if url.endswith("/auth/realms/runai/protocol/openid-connect/token"):
+            return SimpleNamespace(ok=True, error=None, data={"access_token": "form-token"})
+        return SimpleNamespace(ok=False, error="HTTP 404", data={"body": "not found"})
+
+    monkeypatch.setattr("app.collectors.runai.post_json", fake_post_json)
+    monkeypatch.setattr("app.collectors.runai.post_form_json", fake_post_form_json)
+    settings = replace(
+        make_settings(),
+        runai_base_url="https://runai.example",
+        runai_token_url="https://runai.example/wrong-token-url",
+        runai_client_id="cid",
+        runai_client_secret="secret",
+    )
+
+    headers, warnings = await _runai_headers(settings)
+
+    assert headers["Authorization"] == "Bearer form-token"
+    assert warnings == []
+    assert (
+        "form",
+        "https://runai.example/auth/realms/runai/protocol/openid-connect/token",
+    ) in calls
+
+
+@pytest.mark.asyncio
+async def test_runai_collector_skips_queries_without_auth(monkeypatch) -> None:
+    async def fake_get_json(**kwargs) -> SimpleNamespace:
+        raise AssertionError("Run:ai API should not be queried without Authorization")
+
+    monkeypatch.setattr("app.collectors.runai.get_json", fake_get_json)
+    collector = RunAICollector(replace(make_settings(), runai_base_url="https://runai.example"))
+
+    result = await collector.collect(make_target())
+
+    assert result.status == "unavailable"
+    assert "runai.auth" in result.missing_data
+    assert result.details["queries"] == []
+
+
+@pytest.mark.asyncio
 async def test_analyze_returns_unified_artifacts() -> None:
     orchestrator = AnalysisOrchestrator(make_settings())
     response = await orchestrator.analyze(
@@ -198,8 +257,11 @@ async def test_analyze_returns_unified_artifacts() -> None:
 
     assert response.status == "ok"
     assert response.analysis_summary
+    assert "analysis completed" not in response.analysis_summary
     assert response.context["agent_souls_applied"] is True
     assert "## Agent Role Coverage" in response.analysis_detail
+    assert "requires operator review" not in response.analysis_detail
+    assert "Inspect Loki logs" not in response.analysis_detail
     assert {artifact.agent for artifact in response.artifacts} == {
         "runai",
         "kubernetes",

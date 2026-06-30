@@ -338,14 +338,14 @@ def _extract_nat_result(output: str) -> str | None:
 
 
 def _summary_from(request: AlertAnalysisRequest, results: list[CollectorResult]) -> str:
-    alert_name = request.alert.labels.get("alertname") or "Run:AI alert"
+    root_cause = _root_cause_statement(request)
     unavailable = [result.agent for result in results if result.status == "unavailable"]
     if unavailable:
-        return (
-            f"{alert_name} analysis completed with partial evidence. Missing sources: "
-            f"{', '.join(unavailable)}."
+        return _short_sentence(
+            f"{root_cause} Evidence gaps remain for {', '.join(unavailable)}.",
+            limit=260,
         )
-    return f"{alert_name} analysis completed with Run:ai, Kubernetes, metrics, and logs context."
+    return _short_sentence(root_cause, limit=220)
 
 
 def _detail_from(
@@ -357,20 +357,24 @@ def _detail_from(
 ) -> str:
     labels = request.alert.labels
     annotations = request.alert.annotations
+    root_cause = _root_cause_statement(request)
     lines = [
         "## Root Cause",
         "",
-        (
-            annotations.get("description")
-            or annotations.get("summary")
-            or "The exact root cause requires operator review of the collected evidence."
-        ),
+        root_cause,
+        "",
+        "The agent checked the configured Run:ai, Kubernetes, Prometheus, Loki, "
+        "and Postgres collectors for this RCA. Confirmed evidence and missing "
+        "collector data are listed below.",
         "",
         "## Evidence",
         "",
     ]
     for result in results:
         lines.append(f"- **{result.agent}** [{result.status}]: {result.summary}")
+    highlight_lines = _evidence_highlight_lines(results)
+    if highlight_lines:
+        lines.extend(["", "## Evidence Highlights", "", *highlight_lines])
     operator_prompt = annotations.get("operator_prompt")
     if operator_prompt:
         lines.extend(
@@ -396,15 +400,7 @@ def _detail_from(
             "",
             "## Recommended Actions",
             "",
-            "- Check Run:ai project and queue saturation for the affected workload.",
-            "- Review Kubernetes events, pod status, and node conditions.",
-            "- Inspect Run:ai control-plane and backend namespace logs for scheduler, "
-            "queue, quota, database, or reconciliation errors.",
-            "- Check Postgres RCA store health if incident persistence or "
-            "similar-incident search looks stale.",
-            "- Compare Prometheus GPU, CPU, memory, and scheduling metrics around "
-            "the alert window.",
-            "- Inspect Loki logs for container errors or startup failures.",
+            *_recommended_action_lines(missing),
             "",
             "## Troubleshooting Playbook",
             "",
@@ -438,6 +434,126 @@ def _detail_from(
         ]
     )
     return "\n".join(lines)
+
+
+def _root_cause_statement(request: AlertAnalysisRequest) -> str:
+    annotations = request.alert.annotations
+    labels = request.alert.labels
+    text = (
+        annotations.get("description")
+        or annotations.get("summary")
+        or labels.get("alertname")
+        or "The alert fired before the agent could identify a precise root cause."
+    )
+    return _short_sentence(text, limit=320)
+
+
+def _short_sentence(value: str, *, limit: int) -> str:
+    text = " ".join(value.split())
+    if not text:
+        return "The agent has not received enough alert context to name a root cause."
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _evidence_highlight_lines(results: list[CollectorResult]) -> list[str]:
+    lines: list[str] = []
+    for result in results:
+        if result.agent == "kubernetes":
+            lines.extend(_kubernetes_highlights(result.details))
+        elif result.agent == "loki":
+            lines.extend(_loki_highlights(result.details))
+        elif result.agent == "runai":
+            lines.extend(_runai_highlights(result.details))
+    return lines[:8]
+
+
+def _kubernetes_highlights(details: dict[str, object]) -> list[str]:
+    lines: list[str] = []
+    warning_events = details.get("warning_events")
+    if isinstance(warning_events, list):
+        for event in warning_events[:3]:
+            if not isinstance(event, dict):
+                continue
+            reason = event.get("reason") or "Warning"
+            message = event.get("message") or ""
+            if message:
+                lines.append(
+                    f"- Kubernetes event {reason}: "
+                    f"{_short_sentence(str(message), limit=220)}"
+                )
+    pod_statuses = details.get("pod_statuses")
+    if isinstance(pod_statuses, list):
+        for pod in pod_statuses[:2]:
+            if not isinstance(pod, dict):
+                continue
+            phase = pod.get("phase")
+            name = pod.get("name")
+            if phase and name:
+                lines.append(f"- Kubernetes pod {name} is in phase {phase}.")
+    return lines
+
+
+def _loki_highlights(details: dict[str, object]) -> list[str]:
+    lines: list[str] = []
+    queries = details.get("queries")
+    if not isinstance(queries, list):
+        return lines
+    for query in queries:
+        if not isinstance(query, dict):
+            continue
+        line_count = query.get("line_count")
+        name = query.get("name") or "query"
+        if isinstance(line_count, int) and line_count > 0:
+            lines.append(f"- Loki {name} returned {line_count} matching log line(s).")
+    return lines
+
+
+def _runai_highlights(details: dict[str, object]) -> list[str]:
+    lines: list[str] = []
+    project = details.get("project")
+    workload = details.get("workload_name") or details.get("runai_workload_id")
+    if project or workload:
+        lines.append(
+            "- Run:ai target context: "
+            f"project={project or 'unknown'}, workload={workload or 'unknown'}."
+        )
+    queries = details.get("queries")
+    if isinstance(queries, list):
+        for query in queries[:3]:
+            if not isinstance(query, dict):
+                continue
+            if query.get("error"):
+                lines.append(
+                    "- Run:ai "
+                    f"{query.get('name', 'query')} failed with {query.get('error')}."
+                )
+    return lines
+
+
+def _recommended_action_lines(missing: list[str]) -> list[str]:
+    lines = [
+        "- Treat the Kubernetes and Prometheus evidence above as the current "
+        "source of truth for this RCA.",
+        "- Apply the remediation implied by the confirmed scheduling, pod, node, or metric evidence.",
+    ]
+    if "runai.auth" in missing or "runai.query" in missing:
+        lines.append(
+            "- Restore Run:ai API authentication so the agent can attach "
+            "workload/project context on the next analysis run."
+        )
+    if "loki.auth" in missing or "loki.query" in missing:
+        lines.append(
+            "- Restore Loki tenant/auth configuration so the agent can attach "
+            "workload and Run:ai control-plane log lines on the next analysis run."
+        )
+    if "postgres.query" in missing or "postgres.connection" in missing:
+        lines.append(
+            "- Restore Postgres connectivity so RCA memory and similar-incident "
+            "evidence stay current."
+        )
+    return lines
 
 
 def _similar_incident_lines(request: AlertAnalysisRequest) -> list[str]:
@@ -652,7 +768,7 @@ def _focused_chat_response(question: str, content: str) -> str:
     excerpted = _compact_text(content, 1800)
     if any(word in lowered for word in ["action", "recommend", "next", "해야", "조치"]):
         return (
-            "The recommended path should follow the RCA's manual actions. "
+            "The recommended path should follow the RCA's evidence-backed remediation actions. "
             f"Relevant RCA context:\n\n{excerpted}"
         )
     if any(word in lowered for word in ["evidence", "why", "근거", "왜"]):

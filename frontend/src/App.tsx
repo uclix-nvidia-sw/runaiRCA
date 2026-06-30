@@ -183,6 +183,18 @@ type AnalysisAnalytics = {
   };
 };
 
+type QueryDisplayItem = {
+  id: string;
+  name: string;
+  queryText: string;
+  queryLabel: string;
+  status: string;
+  statusCode?: number;
+  error?: string;
+  facts: string[];
+  preview?: unknown;
+};
+
 const ANALYSIS_AGENT_ID = 'analysis';
 const COMPONENT_AGENT_ORDER = ['runai', 'kubernetes', 'postgres', 'prometheus', 'loki'];
 const AGENT_ORDER = COMPONENT_AGENT_ORDER;
@@ -290,6 +302,106 @@ function errorMessage(err: unknown, fallback: string) {
 
 function formatArtifactValue(value: unknown) {
   return typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+}
+
+function compactArtifactValue(value: unknown, depth = 3): unknown {
+  if (depth <= 0) {
+    if (Array.isArray(value)) return `[${value.length} item(s)]`;
+    if (isPlainObject(value)) return '{...}';
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const trimmed = value.slice(0, 4).map((item) => compactArtifactValue(item, depth - 1));
+    if (value.length > 4) {
+      trimmed.push({ truncated: value.length - 4 });
+    }
+    return trimmed;
+  }
+  if (!isPlainObject(value)) return value;
+
+  const priorityKeys = [
+    'name',
+    'namespace',
+    'path',
+    'query',
+    'status',
+    'status_code',
+    'error',
+    'reason',
+    'message',
+    'phase',
+    'nodeName',
+    'ready',
+    'restartCount',
+    'line_count',
+    'stream_count',
+    'items',
+    'conditions',
+    'containerStatuses',
+    'data',
+    'sample',
+  ];
+  const keys = Object.keys(value);
+  const selected = [
+    ...priorityKeys.filter((key) => key in value),
+    ...keys.filter((key) => !priorityKeys.includes(key)),
+  ].slice(0, 9);
+
+  const compacted: Record<string, unknown> = {};
+  for (const key of selected) {
+    compacted[key] = compactArtifactValue(value[key], depth - 1);
+  }
+  if (keys.length > selected.length) {
+    compacted.truncated_keys = keys.length - selected.length;
+  }
+  return compacted;
+}
+
+function queryDisplayItems(result: unknown): QueryDisplayItem[] {
+  if (!isPlainObject(result) || !Array.isArray(result.queries)) return [];
+  return result.queries
+    .filter(isPlainObject)
+    .map((query, index) => {
+      const name = stringValue(query.name) || `query_${index + 1}`;
+      const statusCode = numberValue(query.status_code);
+      const error = stringValue(query.error);
+      const status = error ? 'failed' : stringValue(query.status) || (statusCode ? String(statusCode) : 'ok');
+      const queryText = stringValue(query.query) || stringValue(query.path) || stringValue(query.url) || '';
+      const previewSource = query.sample !== undefined ? query.sample : query.data;
+      const facts = [
+        statusCode ? `HTTP ${statusCode}` : '',
+        numberValue(query.stream_count) !== undefined ? `${numberValue(query.stream_count)} stream(s)` : '',
+        numberValue(query.line_count) !== undefined ? `${numberValue(query.line_count)} line(s)` : '',
+        error ? error : '',
+      ].filter(Boolean);
+      return {
+        id: `${name}-${index}`,
+        name: humanizeKey(name),
+        queryText,
+        queryLabel: query.query ? 'Query' : query.path ? 'Path' : 'URL',
+        status,
+        statusCode,
+        error,
+        facts,
+        preview: previewSource === undefined ? undefined : compactArtifactValue(previewSource),
+      };
+    });
+}
+
+function stringValue(value: unknown) {
+  return typeof value === 'string' ? value : '';
+}
+
+function numberValue(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function humanizeKey(value: string) {
+  return value.replace(/[_:]/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 async function copyToClipboard(value: string) {
@@ -468,6 +580,7 @@ function App() {
   const [activeView, setActiveView] = useState<MainView>(() => routeFromHash(window.location.hash).view);
   const [query, setQuery] = useState('');
   const [chatDocked, setChatDocked] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const detailVersionRef = useRef(0);
   const routeLoadVersionRef = useRef(0);
 
@@ -501,6 +614,7 @@ function App() {
         alert.severity,
         alert.status,
         alert.labels.project,
+        projectNameFromLabels(alert.labels),
         alert.labels.queue,
         alert.labels.workload,
         alert.labels.namespace,
@@ -677,7 +791,6 @@ function App() {
 
   const switchView = (view: MainView) => {
     navigateToHash(hashForView(view));
-    void load();
   };
 
   const closeDetail = () => navigateToHash(hashForView(activeView));
@@ -708,9 +821,14 @@ function App() {
   }, [detail]);
 
   const refreshCurrentView = useCallback(async () => {
-    await load();
-    await refreshDetail();
-  }, [load, refreshDetail]);
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      await Promise.all([load(), refreshDetail()]);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [load, refreshDetail, refreshing]);
 
   useEffect(() => {
     if (realtimeEventMatchesDetail(detail, realtimePayload)) {
@@ -774,10 +892,22 @@ function App() {
               placeholder={viewCopy.placeholder}
             />
           </div>
-          <button className="icon-button" onClick={() => void refreshCurrentView()} aria-label="Refresh">
+          <button
+            className={`icon-button ${refreshing ? 'is-spinning' : ''}`}
+            disabled={refreshing}
+            onClick={() => void refreshCurrentView()}
+            aria-label="Refresh"
+          >
             <RefreshCw size={18} />
           </button>
         </header>
+
+        {(loading || refreshing) && (
+          <div className="loading-strip" role="status" aria-live="polite">
+            <span />
+            <strong>{refreshing ? 'Refreshing data...' : 'Loading dashboard...'}</strong>
+          </div>
+        )}
 
         {error && <div className="error-banner">{error}</div>}
 
@@ -1015,6 +1145,7 @@ function AnalysisDashboard({
   onOpenIncident: (id: string) => Promise<void>;
 }) {
   const [windowDays, setWindowDays] = useState(14);
+  const [pendingAnalyzeID, setPendingAnalyzeID] = useState('');
   const analytics = useMemo(
     () => buildAnalysisAnalytics(allRecords, incidents, alerts, windowDays),
     [allRecords, alerts, incidents, windowDays],
@@ -1025,6 +1156,15 @@ function AnalysisDashboard({
   );
   const completed = allRecords.filter((record) => record.analysisStatus === 'complete').length;
   const highQuality = allRecords.filter((record) => record.quality === 'high').length;
+  const runAnalyze = async (incidentID: string) => {
+    if (pendingAnalyzeID) return;
+    setPendingAnalyzeID(incidentID);
+    try {
+      await onAnalyze(incidentID);
+    } finally {
+      setPendingAnalyzeID('');
+    }
+  };
 
   return (
     <>
@@ -1145,8 +1285,13 @@ function AnalysisDashboard({
                         </button>
                       )}
                       {incidentID && (
-                        <button className="primary-button" onClick={() => void onAnalyze(incidentID)} type="button">
-                          <Bot size={16} /> Analyze
+                        <button
+                          className={`primary-button ${pendingAnalyzeID === incidentID ? 'is-busy' : ''}`}
+                          disabled={Boolean(pendingAnalyzeID)}
+                          onClick={() => void runAnalyze(incidentID)}
+                          type="button"
+                        >
+                          <Bot size={16} /> {pendingAnalyzeID === incidentID ? 'Analyzing...' : 'Analyze'}
                         </button>
                       )}
                     </div>
@@ -1447,6 +1592,17 @@ function UnifiedWorkspace({
   onOpenIncident: (id: string) => Promise<void>;
   onResolve: (id: string) => Promise<void>;
 }) {
+  const [busyAction, setBusyAction] = useState('');
+  const runWorkspaceAction = useCallback(async (action: string, work: () => Promise<void>) => {
+    if (busyAction) return;
+    setBusyAction(action);
+    try {
+      await work();
+    } finally {
+      setBusyAction('');
+    }
+  }, [busyAction]);
+
   if (!detail) return null;
   const incident = detail.kind === 'incident' ? detail.data : null;
   const alert = detail.kind === 'alert' ? detail.data : null;
@@ -1485,23 +1641,62 @@ function UnifiedWorkspace({
         </div>
         <div className="workspace-actions">
           <button className="ghost-button" onClick={onClose} type="button"><ArrowLeft size={16} /> Back</button>
-          <button className="ghost-button" onClick={() => void onRefresh()} type="button"><RefreshCw size={16} /> Refresh</button>
+          <button
+            className={`ghost-button ${busyAction === 'refresh' ? 'is-busy is-spinning' : ''}`}
+            disabled={Boolean(busyAction)}
+            onClick={() => void runWorkspaceAction('refresh', onRefresh)}
+            type="button"
+          >
+            <RefreshCw size={16} /> {busyAction === 'refresh' ? 'Refreshing...' : 'Refresh'}
+          </button>
           {incident && (
             <>
-              <button className="ghost-button" onClick={() => void onAnalyze(incident.incident_id)} type="button"><Bot size={16} /> Analyze</button>
-              <button className="primary-button" onClick={() => void onResolve(incident.incident_id)} type="button">
-                <CheckCircle2 size={16} /> {incident.status === 'resolved' ? 'Reopen' : 'Resolve'}
+              <button
+                className={`ghost-button ${busyAction === 'analyze' ? 'is-busy' : ''}`}
+                disabled={Boolean(busyAction)}
+                onClick={() => void runWorkspaceAction('analyze', () => onAnalyze(incident.incident_id))}
+                type="button"
+              >
+                <Bot size={16} /> {busyAction === 'analyze' ? 'Analyzing...' : 'Analyze'}
+              </button>
+              <button
+                className={`primary-button ${busyAction === 'resolve' ? 'is-busy' : ''}`}
+                disabled={Boolean(busyAction)}
+                onClick={() => void runWorkspaceAction('resolve', () => onResolve(incident.incident_id))}
+                type="button"
+              >
+                <CheckCircle2 size={16} /> {busyAction === 'resolve' ? 'Updating...' : incident.status === 'resolved' ? 'Reopen' : 'Resolve'}
               </button>
             </>
           )}
           {alert && (
             <>
-              <button className="ghost-button" onClick={() => void onOpenIncident(alert.incident_id)} type="button"><Link size={16} /> Incident</button>
-              <button className="ghost-button" onClick={() => void onAnalyze(alert.incident_id)} type="button"><Bot size={16} /> Analyze</button>
+              <button
+                className={`ghost-button ${busyAction === 'open-incident' ? 'is-busy' : ''}`}
+                disabled={Boolean(busyAction)}
+                onClick={() => void runWorkspaceAction('open-incident', () => onOpenIncident(alert.incident_id))}
+                type="button"
+              >
+                <Link size={16} /> Incident
+              </button>
+              <button
+                className={`ghost-button ${busyAction === 'analyze' ? 'is-busy' : ''}`}
+                disabled={Boolean(busyAction)}
+                onClick={() => void runWorkspaceAction('analyze', () => onAnalyze(alert.incident_id))}
+                type="button"
+              >
+                <Bot size={16} /> {busyAction === 'analyze' ? 'Analyzing...' : 'Analyze'}
+              </button>
             </>
           )}
         </div>
       </div>
+
+      {busyAction && (
+        <div className="workspace-progress" role="status" aria-live="polite">
+          <span />
+        </div>
+      )}
 
       <div className="workspace-body">
         <section className="rca-summary">
@@ -2181,7 +2376,8 @@ function AgentEvidence({ agent, status, artifacts }: { agent: string; status: st
 
 function ArtifactResult({ artifact, defaultOpen = true }: { artifact: Artifact; defaultOpen?: boolean }) {
   const [open, setOpen] = useState(defaultOpen);
-  const resultText = artifact.result !== undefined ? formatArtifactValue(artifact.result) : '';
+  const queryItems = queryDisplayItems(artifact.result);
+  const resultText = artifact.result !== undefined ? formatArtifactValue(compactArtifactValue(artifact.result)) : '';
   return (
     <div className="artifact">
       <button className="artifact-toggle compact-artifact-toggle" onClick={() => setOpen((value) => !value)} type="button">
@@ -2194,10 +2390,42 @@ function ArtifactResult({ artifact, defaultOpen = true }: { artifact: Artifact; 
       {open && (
         <div className="artifact-body">
           <p>{artifact.summary}</p>
-          {artifact.query && <CopyableBlock title="Query" value={artifact.query} kind="code" />}
-          {artifact.result !== undefined && <CopyableBlock title="Result JSON" value={resultText} kind="pre" />}
+          {queryItems.length > 0 ? (
+            <QueryResultList items={queryItems} />
+          ) : (
+            <>
+              {artifact.query && <CopyableBlock title="Query" value={artifact.query} kind="code" />}
+              {artifact.result !== undefined && <CopyableBlock title="Result summary" value={resultText} kind="pre" />}
+            </>
+          )}
         </div>
       )}
+    </div>
+  );
+}
+
+function QueryResultList({ items }: { items: QueryDisplayItem[] }) {
+  return (
+    <div className="query-result-list">
+      {items.map((item) => (
+        <article className="query-result-card" key={item.id}>
+          <div className="query-result-head">
+            <strong>{item.name}</strong>
+            <span className={item.error ? 'query-status query-status-error' : 'query-status'}>{item.status}</span>
+          </div>
+          {item.facts.length > 0 && (
+            <div className="query-facts">
+              {item.facts.slice(0, 4).map((fact) => (
+                <span key={`${item.id}-${fact}`}>{fact}</span>
+              ))}
+            </div>
+          )}
+          {item.queryText && <CopyableBlock title={item.queryLabel} value={item.queryText} kind="code" />}
+          {item.preview !== undefined && (
+            <CopyableBlock title="Relevant result" value={formatArtifactValue(item.preview)} kind="pre" />
+          )}
+        </article>
+      ))}
     </div>
   );
 }
@@ -2659,7 +2887,7 @@ function buildAnalysisAnalytics(
       analysisQuality: countBy(windowedRecords, (record) => record.quality || 'pending'),
       topNamespaces: countBy(windowedAlerts, (alert) => alert.labels.namespace || 'unknown').slice(0, 5),
       topQueues: countBy(windowedAlerts, (alert) => alert.labels.queue || alert.labels.runai_queue || 'unknown').slice(0, 5),
-      topProjects: countBy(windowedAlerts, (alert) => alert.labels.project || alert.labels.runai_project || 'unknown').slice(0, 5),
+      topProjects: countBy(windowedAlerts, (alert) => projectNameFromLabels(alert.labels) || 'unknown').slice(0, 5),
     },
   };
 }
@@ -2906,10 +3134,23 @@ function Status({ value, analyzing = false }: { value: string; analyzing?: boole
 }
 
 function targetLine(labels: Record<string, string>) {
-  const project = labels.project || labels.runai_project || 'project unknown';
-  const queue = labels.queue || labels.runai_queue || 'queue unknown';
+  const project = projectNameFromLabels(labels) || 'project unknown';
   const workload = labels.workload || labels.workload_name || labels.pod || 'workload unknown';
-  return `${project} / ${queue} / ${workload}`;
+  return `${project} / ${workload}`;
+}
+
+function projectNameFromLabels(labels: Record<string, string>) {
+  const explicit = labels.project || labels.runai_project || labels['runai.io/project'];
+  if (explicit) return stripRunaiNamespacePrefix(explicit);
+  return projectNameFromNamespace(labels.namespace || labels.kubernetes_namespace || '');
+}
+
+function projectNameFromNamespace(namespace: string) {
+  return namespace.startsWith('runai-') ? namespace.slice('runai-'.length) : '';
+}
+
+function stripRunaiNamespacePrefix(value: string) {
+  return value.startsWith('runai-') ? value.slice('runai-'.length) : value;
 }
 
 function formatTime(value: string) {
