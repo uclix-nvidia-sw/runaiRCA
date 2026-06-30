@@ -227,6 +227,8 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	record := s.alerts[alertID]
 	newAlert := record == nil
 	previousStatus := ""
+	previousSeverity := ""
+	previousFiredAt := time.Time{}
 	var previousResolvedAt *time.Time
 	previousOccurrenceCount := 0
 	if record == nil {
