@@ -18,6 +18,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 type AlertmanagerWebhook struct {
@@ -732,10 +733,17 @@ func nextID(prefix string, seq int64) string {
 
 func excerpt(value string, limit int) string {
 	value = strings.TrimSpace(value)
+	if limit <= 0 {
+		return ""
+	}
 	if len(value) <= limit {
 		return value
 	}
-	return strings.TrimSpace(value[:limit]) + "..."
+	end := limit
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return strings.TrimSpace(value[:end]) + "..."
 }
 
 func mustJSON(value any) []byte {

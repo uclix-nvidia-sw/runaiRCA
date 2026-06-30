@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestAlertmanagerWebhookCreatesIncidentAndAlert(t *testing.T) {
@@ -737,6 +738,16 @@ func TestChatRejectsOversizedBody(t *testing.T) {
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected 413, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestExcerptDoesNotSplitUTF8(t *testing.T) {
+	got := excerpt("한글 alert", 4)
+	if !utf8.ValidString(got) {
+		t.Fatalf("excerpt returned invalid UTF-8: %q", got)
+	}
+	if got != "한..." {
+		t.Fatalf("excerpt should stop at rune boundary, got %q", got)
 	}
 }
 
