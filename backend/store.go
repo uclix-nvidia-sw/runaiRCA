@@ -513,7 +513,10 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 		}
 	}
 	s.analysisRuns[run.RunID] = run
-	s.persistAnalysisRunLocked(run)
+	if !s.persistAnalysisRunLocked(run) {
+		delete(s.analysisRuns, run.RunID)
+		return AnalysisRun{}, false
+	}
 	return cloneAnalysisRun(run), true
 }
 

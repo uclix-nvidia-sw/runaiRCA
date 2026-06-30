@@ -221,6 +221,46 @@ func TestWebhookAutoAnalysisFanoutCapsRunsAndAgentCallsTogether(t *testing.T) {
 	}
 }
 
+func TestAnalysisRunPersistFailureSkipsAgentCall(t *testing.T) {
+	state := newFakePostgresState(false)
+	state.failAnalysisRuns = true
+	store := NewStore()
+	store.connectDatabaseWithDriver(registerFakePostgresDriver(state), "fake://runai_rca", time.Second)
+	defer store.db.Close()
+	beforeRuns := len(store.ListAnalysisRuns())
+	var hit atomic.Int32
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit.Add(1)
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{Status: "ok"})
+	}))
+	defer agent.Close()
+	server := &Server{
+		store:                     store,
+		hub:                       NewHub(),
+		agentURL:                  agent.URL,
+		agentRequestTimeout:       time.Second,
+		manualAgentRequestTimeout: time.Second,
+		client:                    &http.Client{},
+	}
+	incident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "persist-failure"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-persist-failure",
+	})
+
+	if _, ok := server.startAnalysisRun("incident", incident.IncidentID, "auto", ""); ok {
+		t.Fatalf("analysis run should not start when its DB row cannot be persisted")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if hit.Load() != 0 {
+		t.Fatalf("agent was called despite analysis run persist failure")
+	}
+	if runs := store.ListAnalysisRuns(); len(runs) != beforeRuns {
+		t.Fatalf("failed analysis run persist should not leave an in-memory run, before=%d after=%d", beforeRuns, len(runs))
+	}
+}
+
 func TestManualAnalysisClearsRCAAndSkipsAgentTimeout(t *testing.T) {
 	agentReqCh := make(chan AgentAnalysisRequest, 1)
 	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {

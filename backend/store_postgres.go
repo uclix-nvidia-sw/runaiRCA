@@ -950,9 +950,9 @@ func (s *Store) persistCommentDeleteLocked(commentID string) {
 	}
 }
 
-func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) {
+func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) bool {
 	if s.db == nil || !s.dbReady || run == nil {
-		return
+		return true
 	}
 	_, err := s.execPostgres(
 		`INSERT INTO analysis_runs (
@@ -1001,5 +1001,7 @@ func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) {
 	)
 	if err != nil {
 		log.Printf("Failed to persist analysis run %s: %v", run.RunID, err)
+		return false
 	}
+	return true
 }

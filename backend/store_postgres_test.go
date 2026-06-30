@@ -185,6 +185,7 @@ func registerFakePostgresDriver(state *fakePostgresState) string {
 type fakePostgresState struct {
 	mu                sync.Mutex
 	failCreateVector  bool
+	failAnalysisRuns  bool
 	execs             []string
 	queries           []string
 	now               time.Time
@@ -272,6 +273,9 @@ func (c *fakePostgresConn) ExecContext(ctx context.Context, query string, _ []dr
 
 	if c.state.failCreateVector && strings.Contains(query, "CREATE EXTENSION IF NOT EXISTS vector") {
 		return nil, errors.New(`extension "vector" is not available`)
+	}
+	if c.state.failAnalysisRuns && strings.Contains(query, "INSERT INTO analysis_runs") {
+		return nil, errors.New("analysis run write failed")
 	}
 	return driver.RowsAffected(1), nil
 }
