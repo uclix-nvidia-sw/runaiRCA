@@ -1331,7 +1331,7 @@ func TestFlappingAlertGroupingUsesNamespaceWorkloadAndWindow(t *testing.T) {
 
 func TestResolveEndpointTogglesResolvedStatus(t *testing.T) {
 	server := NewServer()
-	incident, _ := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "resolve-toggle"}, Alert{
+	incident, record := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "resolve-toggle"}, Alert{
 		Status: "firing",
 		Labels: map[string]string{
 			"alertname": "RunAIWorkloadPending",
@@ -1341,6 +1341,11 @@ func TestResolveEndpointTogglesResolvedStatus(t *testing.T) {
 		},
 		Annotations: map[string]string{"summary": "Workload pending"},
 		Fingerprint: "fp-resolve-toggle",
+	})
+	server.store.ApplyAnalysis(record.AlertID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Pending workload RCA.",
+		AnalysisDetail:  "Quota blocked scheduling.",
 	})
 	path := "/api/v1/incidents/" + incident.IncidentID + "/resolve"
 
@@ -1353,6 +1358,9 @@ func TestResolveEndpointTogglesResolvedStatus(t *testing.T) {
 	if !ok || detail.Status != "resolved" || detail.ResolvedAt == nil {
 		t.Fatalf("expected incident to be resolved, got ok=%t detail=%+v", ok, detail)
 	}
+	if memory := server.store.memories[record.AlertID]; memory == nil || memory.Status != "resolved" {
+		t.Fatalf("expected alert memory to resolve with incident, got %+v", memory)
+	}
 
 	rec = httptest.NewRecorder()
 	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, nil))
@@ -1362,6 +1370,9 @@ func TestResolveEndpointTogglesResolvedStatus(t *testing.T) {
 	detail, ok = server.store.IncidentDetail(incident.IncidentID)
 	if !ok || detail.Status != "firing" || detail.ResolvedAt != nil {
 		t.Fatalf("expected second resolve click to reopen incident, got ok=%t detail=%+v", ok, detail)
+	}
+	if memory := server.store.memories[record.AlertID]; memory == nil || memory.Status != "firing" {
+		t.Fatalf("expected alert memory to reopen with incident, got %+v", memory)
 	}
 	var response map[string]string
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {

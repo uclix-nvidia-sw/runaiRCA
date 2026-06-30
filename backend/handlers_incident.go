@@ -125,7 +125,10 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			resolvedAt = &now
 		}
 		s.store.persistIncidentLocked(incident)
-		if memory := s.store.memories[id]; memory != nil {
+		for _, memory := range s.store.memories {
+			if memory == nil || memory.IncidentID != id {
+				continue
+			}
 			memory.Status = nextStatus
 			s.store.persistMemoryLocked(memory)
 		}
