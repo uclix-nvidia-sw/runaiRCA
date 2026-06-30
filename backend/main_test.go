@@ -1372,6 +1372,39 @@ func TestIncidentDetailAggregatesAlertAnalyses(t *testing.T) {
 	}
 }
 
+func TestIncidentDetailCapsAggregateAnalysisTextOnly(t *testing.T) {
+	store := NewStore()
+	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "aggregate-cap"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-aggregate-cap",
+	})
+	longSummary := strings.Repeat("s", maxIncidentAggregateSummaryBytes+100)
+	longDetail := strings.Repeat("d", maxIncidentAggregateDetailBytes+100)
+	store.ApplyAnalysis(alert.AlertID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: longSummary,
+		AnalysisDetail:  longDetail,
+	})
+
+	detail, ok := store.IncidentDetail(incident.IncidentID)
+	if !ok {
+		t.Fatalf("incident detail missing")
+	}
+	if len(detail.AnalysisSummary) > maxIncidentAggregateSummaryBytes+len("...") ||
+		!strings.HasSuffix(detail.AnalysisSummary, "...") {
+		t.Fatalf("incident summary aggregate was not capped, len=%d", len(detail.AnalysisSummary))
+	}
+	if len(detail.AnalysisDetail) > maxIncidentAggregateDetailBytes+len("...") ||
+		!strings.HasSuffix(detail.AnalysisDetail, "...") {
+		t.Fatalf("incident detail aggregate was not capped, len=%d", len(detail.AnalysisDetail))
+	}
+	if len(detail.Alerts) != 1 || detail.Alerts[0].AnalysisSummary != longSummary || detail.Alerts[0].AnalysisDetail != longDetail {
+		t.Fatalf("alert-level RCA should remain complete in incident detail")
+	}
+}
+
 func TestDenseEmbeddingIsDeterministicAndNormalized(t *testing.T) {
 	text := "Run:AI GPU quota saturated scheduling blocked"
 	a := denseEmbedding(text)

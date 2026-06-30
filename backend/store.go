@@ -25,6 +25,9 @@ const (
 	maxOperatorPromptCommentBodyBytes  = 200
 	maxOperatorPromptAuthorBytes       = 80
 
+	maxIncidentAggregateSummaryBytes = 8000
+	maxIncidentAggregateDetailBytes  = 32000
+
 	maxStoredCommentBodyBytes = 8000
 	maxFeedbackAuthorBytes    = 120
 )
@@ -817,10 +820,10 @@ func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 		}
 	}
 	if len(summaryLines) > 0 {
-		detail.AnalysisSummary = strings.Join(summaryLines, "\n")
+		detail.AnalysisSummary = excerpt(strings.Join(summaryLines, "\n"), maxIncidentAggregateSummaryBytes)
 	}
 	if len(detailSections) > 0 {
-		detail.AnalysisDetail = strings.Join(detailSections, "\n\n")
+		detail.AnalysisDetail = excerpt(strings.Join(detailSections, "\n\n"), maxIncidentAggregateDetailBytes)
 	}
 	detail.Feedback = s.feedbackSummaryLocked("incident", id)
 	if len(detail.Alerts) > 0 {
