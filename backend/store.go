@@ -52,6 +52,17 @@ type AlertUpsertResult struct {
 	Changed        bool
 }
 
+type DashboardSnapshot struct {
+	IncidentCount     int
+	OpenIncidentCount int
+	AlertCount        int
+	FiringAlertCount  int
+	AnalysisRunCount  int
+	AnalysisStatuses  map[string]int
+	RecentAlerts      []AlertRecord
+	RecentRuns        []AnalysisRun
+}
+
 func NewStore() *Store {
 	return &Store{
 		incidents:     make(map[string]*Incident),
@@ -355,6 +366,93 @@ func (s *Store) ListAnalysisRunsPage(limit, offset int) ([]AnalysisRun, int) {
 		items = append(items, cloneAnalysisRun(run))
 	}
 	return items, len(ordered)
+}
+
+func (s *Store) DashboardSnapshot(recentLimit int) DashboardSnapshot {
+	if recentLimit < 0 {
+		recentLimit = 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	snapshot := DashboardSnapshot{
+		AnalysisStatuses: map[string]int{},
+		RecentAlerts:     []AlertRecord{},
+		RecentRuns:       []AnalysisRun{},
+	}
+	alerts := make([]*AlertRecord, 0, len(s.alerts))
+	runs := make([]*AnalysisRun, 0, len(s.analysisRuns))
+	for _, incident := range s.incidents {
+		if incident == nil {
+			continue
+		}
+		snapshot.IncidentCount++
+		if incident.Status != "resolved" {
+			snapshot.OpenIncidentCount++
+		}
+	}
+	for _, alert := range s.alerts {
+		if alert == nil {
+			continue
+		}
+		snapshot.AlertCount++
+		if alert.Status != "resolved" {
+			snapshot.FiringAlertCount++
+		}
+		if recentLimit > 0 {
+			alerts = append(alerts, alert)
+		}
+	}
+	for _, run := range s.analysisRuns {
+		if run == nil {
+			continue
+		}
+		snapshot.AnalysisRunCount++
+		snapshot.AnalysisStatuses[first(run.Status, "unknown")]++
+		if recentLimit > 0 {
+			runs = append(runs, run)
+		}
+	}
+	sort.Slice(alerts, func(i, j int) bool { return alerts[i].FiredAt.After(alerts[j].FiredAt) })
+	sort.Slice(runs, func(i, j int) bool { return runs[i].CreatedAt.After(runs[j].CreatedAt) })
+	if len(alerts) > recentLimit {
+		alerts = alerts[:recentLimit]
+	}
+	if len(runs) > recentLimit {
+		runs = runs[:recentLimit]
+	}
+	for _, alert := range alerts {
+		snapshot.RecentAlerts = append(snapshot.RecentAlerts, *cloneAlert(alert))
+	}
+	for _, run := range runs {
+		snapshot.RecentRuns = append(snapshot.RecentRuns, cloneAnalysisRun(run))
+	}
+	return snapshot
+}
+
+func (s *Store) LatestAlertID() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var latest *AlertRecord
+	var latestFiring *AlertRecord
+	for _, alert := range s.alerts {
+		if alert == nil {
+			continue
+		}
+		if latest == nil || alert.FiredAt.After(latest.FiredAt) {
+			latest = alert
+		}
+		if alert.Status != "resolved" && (latestFiring == nil || alert.FiredAt.After(latestFiring.FiredAt)) {
+			latestFiring = alert
+		}
+	}
+	if latestFiring != nil {
+		return latestFiring.AlertID
+	}
+	if latest != nil {
+		return latest.AlertID
+	}
+	return ""
 }
 
 func (s *Store) CreateAnalysisRun(

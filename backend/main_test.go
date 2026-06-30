@@ -301,6 +301,99 @@ func TestListAlertsSupportsPagination(t *testing.T) {
 	}
 }
 
+func TestDashboardSnapshotCountsAllRowsButBoundsRecentItems(t *testing.T) {
+	store := NewStore()
+	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
+	alertIDs := []string{}
+	incidentIDs := []string{}
+	for i := 0; i < 8; i++ {
+		status := "firing"
+		if i%3 == 0 {
+			status = "resolved"
+		}
+		incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "snapshot-" + strconv.Itoa(i)}, Alert{
+			Status: status,
+			Labels: map[string]string{
+				"alertname": "RunAIQueueBlocked",
+				"severity":  "warning",
+				"namespace": "runai",
+				"workload":  "trainer_" + strconv.Itoa(i),
+			},
+			Annotations: map[string]string{"summary": "Queue blocked"},
+			Fingerprint: "fp-snapshot-" + strconv.Itoa(i),
+			StartsAt:    base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
+			EndsAt:      base.Add(time.Duration(i+1) * time.Minute).Format(time.RFC3339),
+		})
+		alertIDs = append(alertIDs, alert.AlertID)
+		incidentIDs = append(incidentIDs, incident.IncidentID)
+	}
+	complete := store.CreateAnalysisRun("manual", "alert", alertIDs[0], incidentIDs[0], alertIDs[0], "complete", "")
+	store.CompleteAnalysisRun(complete.RunID, AgentAnalysisResponse{Status: "ok", AnalysisSummary: "done"})
+	failed := store.CreateAnalysisRun("comment", "alert", alertIDs[1], incidentIDs[1], alertIDs[1], "failed", "")
+	store.FailAnalysisRun(failed.RunID, AgentAnalysisResponse{Status: "error", AnalysisSummary: "failed"})
+	store.CreateAnalysisRun("chat", "alert", alertIDs[2], incidentIDs[2], alertIDs[2], "running", "")
+
+	snapshot := store.DashboardSnapshot(3)
+
+	if snapshot.IncidentCount != 8 || snapshot.AlertCount != 8 || snapshot.AnalysisRunCount != 3 {
+		t.Fatalf("snapshot counts should include all rows, got %+v", snapshot)
+	}
+	if snapshot.FiringAlertCount != 5 || snapshot.OpenIncidentCount != 5 {
+		t.Fatalf("snapshot status counts are wrong: %+v", snapshot)
+	}
+	if len(snapshot.RecentAlerts) != 3 || len(snapshot.RecentRuns) != 3 {
+		t.Fatalf("snapshot recent rows should be capped at 3, got alerts=%d runs=%d", len(snapshot.RecentAlerts), len(snapshot.RecentRuns))
+	}
+	if snapshot.RecentAlerts[0].Fingerprint != "fp-snapshot-7" {
+		t.Fatalf("expected latest alert first, got %+v", snapshot.RecentAlerts[0])
+	}
+	if snapshot.AnalysisStatuses["complete"] != 1 ||
+		snapshot.AnalysisStatuses["failed"] != 1 ||
+		snapshot.AnalysisStatuses["analyzing"] != 1 {
+		t.Fatalf("unexpected analysis status counts: %+v", snapshot.AnalysisStatuses)
+	}
+}
+
+func TestLatestAlertIDPrefersNewestFiringAlert(t *testing.T) {
+	store := NewStore()
+	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
+	_, firing := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "latest-firing"}, Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIQueueBlocked",
+			"severity":  "warning",
+			"namespace": "runai",
+			"workload":  "trainer-firing",
+		},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-latest-firing",
+		StartsAt:    base.Format(time.RFC3339),
+	})
+	_, resolved := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "latest-resolved"}, Alert{
+		Status: "resolved",
+		Labels: map[string]string{
+			"alertname": "RunAIQueueBlocked",
+			"severity":  "warning",
+			"namespace": "runai",
+			"workload":  "trainer-resolved",
+		},
+		Annotations: map[string]string{"summary": "Queue recovered"},
+		Fingerprint: "fp-latest-resolved",
+		StartsAt:    base.Add(time.Hour).Format(time.RFC3339),
+		EndsAt:      base.Add(time.Hour).Format(time.RFC3339),
+	})
+
+	if got := store.LatestAlertID(); got != firing.AlertID {
+		t.Fatalf("expected latest firing alert to win over newer resolved alert, got %s", got)
+	}
+	store.mu.Lock()
+	store.alerts[firing.AlertID].Status = "resolved"
+	store.mu.Unlock()
+	if got := store.LatestAlertID(); got != resolved.AlertID {
+		t.Fatalf("expected newest resolved alert when no firing alert remains, got %s", got)
+	}
+}
+
 func TestAlertmanagerWebhookIgnoresInfoAlerts(t *testing.T) {
 	server := NewServer()
 	body := AlertmanagerWebhook{

@@ -239,13 +239,13 @@ func (s *fakePostgresState) rowsFor(query string) driver.Rows {
 		return &fakeRows{
 			columns: []string{
 				"alert_id", "incident_id", "alarm_title", "severity", "status", "fired_at",
-				"resolved_at", "fingerprint", "occurrence_count", "thread_ts", "labels", "annotations",
-				"analysis_summary", "analysis_detail", "analysis_quality", "capabilities",
+				"resolved_at", "fingerprint", "occurrence_count", "occurrence_pods", "thread_ts",
+				"labels", "annotations", "analysis_summary", "analysis_detail", "analysis_quality", "capabilities",
 				"missing_data", "warnings", "artifacts",
 			},
 			values: [][]driver.Value{{
 				"ALR-db", "INC-db", "RunAIWorkloadPending", "warning", "firing", s.now,
-				nil, "fp-db", int64(1), "thread-db", s.labelsJSON, s.annotationsJSON,
+				nil, "fp-db", int64(1), s.emptyArrayJSON, "thread-db", s.labelsJSON, s.annotationsJSON,
 				"Run:AI queue gpu-a was saturated.", "GPU quota blocked scheduling.", "high", s.capabilitiesJSON,
 				s.missingDataJSON, s.warningsJSON, s.artifactsJSON,
 			}},
