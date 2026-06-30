@@ -191,7 +191,7 @@ async def _runai_headers(
         and (settings.runai_token_url or settings.runai_base_url)
     ):
         token = await _request_runai_token(settings, warnings)
-    elif settings.runai_client_id or settings.runai_client_secret:
+    elif not token and (settings.runai_client_id or settings.runai_client_secret):
         warnings.append(
             "Run:ai client credential configuration is incomplete. "
             "Set both RUNAI_CLIENT_ID and RUNAI_CLIENT_SECRET; RUNAI_TOKEN_URL is optional "
