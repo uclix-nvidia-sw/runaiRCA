@@ -48,6 +48,8 @@ class AlertAnalysisRequest(BaseModel):
     thread_ts: str = ""
     incident_id: str | None = None
     analysis_type: str | None = None
+    occurrence_count: int = 0
+    occurrence_pods: list[str] = Field(default_factory=list)
     previous_analysis: PreviousAnalysisContext | None = None
     similar_incidents: list[SimilarIncidentContext] = Field(default_factory=list)
     feedback_hints: list[FeedbackHintContext] = Field(default_factory=list)

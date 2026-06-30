@@ -71,6 +71,8 @@ spec:
               value: {{ .Values.backend.env.databaseConnectTimeoutSeconds | quote }}
             - name: AGENT_REQUEST_TIMEOUT_SECONDS
               value: {{ .Values.backend.env.agentRequestTimeoutSeconds | quote }}
+            - name: MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS
+              value: {{ .Values.backend.env.manualAgentRequestTimeoutSeconds | quote }}
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

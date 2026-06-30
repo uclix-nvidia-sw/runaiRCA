@@ -139,6 +139,18 @@ spec:
               value: {{ .Values.agent.env.llmModel | quote }}
             - name: LLM_REQUEST_TIMEOUT_SECONDS
               value: {{ .Values.agent.env.llmRequestTimeoutSeconds | quote }}
+            - name: ENABLE_TYPEDB
+              value: {{ .Values.typedb.enabled | quote }}
+            - name: TYPEDB_ADDRESS
+              value: {{ include "runai-rca.typedb.address" . | quote }}
+            - name: TYPEDB_DATABASE
+              value: {{ .Values.typedb.auth.database | quote }}
+            - name: TYPEDB_USERNAME
+              value: {{ .Values.typedb.auth.username | quote }}
+            - name: TYPEDB_PASSWORD
+              value: {{ .Values.typedb.auth.password | quote }}
+            - name: TYPEDB_TIMEOUT_SECONDS
+              value: {{ .Values.agent.env.typedbTimeoutSeconds | quote }}
             - name: POSTGRES_DSN
               valueFrom:
                 secretKeyRef:

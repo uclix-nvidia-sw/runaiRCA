@@ -11,6 +11,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `PORT` | Backend/Agent HTTP port; Helm maps this from the component service port |
 | `AGENT_URL` | Backend to Agent URL, default `http://localhost:8000` |
 | `AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for Agent `/analyze` and `/chat` requests, default `180` |
+| `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for operator-triggered Agent `/analyze` requests, default `900` |
 | `LOG_LEVEL` | Agent log level, default `info` |
 | `LANGUAGE` | Backend/Agent response language, `en` or `ko` |
 | `KUBERNETES_API_URL` | In-cluster Kubernetes API URL, default `https://kubernetes.default.svc` |
@@ -99,7 +100,7 @@ Frequently tuned Helm values:
 | `{backend,agent,frontend,postgresql}.resources` | CPU/memory requests and limits for production scheduling |
 | `backend.env.agentUrl` | Override Backend-to-Agent URL when the Agent is external or remote |
 | `backend.env.language` / `agent.env.language` | Set RCA language to `en` or `ko` |
-| `backend.env.databaseConnectTimeoutSeconds` / `agentRequestTimeoutSeconds` | Backend startup DB timeout and Backend-to-Agent request timeout |
+| `backend.env.databaseConnectTimeoutSeconds` / `agentRequestTimeoutSeconds` / `manualAgentRequestTimeoutSeconds` | Backend startup DB timeout, automatic/chat Agent timeout, and operator-triggered analysis timeout |
 | `secrets.keys.*` | Existing Secret key names for DB, Run:ai, NVIDIA, and LLM credentials |
 | `secrets.existingSecret` | Existing Secret for Run:ai/NVIDIA/LLM credentials and, by default, DB keys |
 | `secrets.databaseExistingSecret` | Existing Secret used only for `DATABASE_URL` / `POSTGRES_DSN` |

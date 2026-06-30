@@ -2,13 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -147,6 +152,8 @@ type AlertRecord struct {
 	FiredAt          time.Time         `json:"fired_at"`
 	ResolvedAt       *time.Time        `json:"resolved_at"`
 	Fingerprint      string            `json:"fingerprint"`
+	OccurrenceCount  int               `json:"occurrence_count"`
+	OccurrencePods   []string          `json:"occurrence_pods"`
 	ThreadTS         string            `json:"thread_ts"`
 	Labels           map[string]string `json:"labels"`
 	Annotations      map[string]string `json:"annotations"`
@@ -177,18 +184,22 @@ type IncidentDetail struct {
 }
 
 type Server struct {
-	store                      *Store
-	hub                        *Hub
-	agentURL                   string
-	language                   string
-	agentRequestTimeout        time.Duration
-	manualAgentRequestTimeout  time.Duration
-	client                     *http.Client
+	store                     *Store
+	hub                       *Hub
+	agentURL                  string
+	language                  string
+	agentRequestTimeout       time.Duration
+	manualAgentRequestTimeout time.Duration
+	client                    *http.Client
 }
 
 const (
-	similarIncidentLimit = 3
-	flappingGroupWindow  = 30 * time.Minute
+	similarIncidentLimit   = 3
+	flappingGroupWindow    = 30 * time.Minute
+	maxListLimit           = 200
+	maxJSONBodyBytes       = 1 << 20
+	maxWebhookAlerts       = 500
+	maxManualAnalyzeFanout = 25
 )
 
 func main() {
@@ -274,14 +285,14 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && r.URL.Path == "/webhook/alertmanager":
 		s.handleAlertmanager(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/incidents":
-		writeJSON(w, http.StatusOK, envelope(s.store.ListIncidents()))
+		s.handleIncidentList(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/incidents/"):
 		s.handleIncident(w, r)
 	case (r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete) &&
 		strings.HasPrefix(r.URL.Path, "/api/v1/incidents/"):
 		s.handleIncidentAction(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/alerts":
-		writeJSON(w, http.StatusOK, envelope(s.store.ListAlerts()))
+		s.handleAlertList(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/alerts/"):
 		s.handleAlert(w, r)
 	case (r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete) &&
@@ -290,7 +301,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/embeddings/search":
 		s.handleEmbeddingSearch(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/analysis-runs":
-		writeJSON(w, http.StatusOK, envelope(s.store.ListAnalysisRuns()))
+		s.handleAnalysisRunList(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/events":
 		s.handleEvents(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/chat":
@@ -300,14 +311,59 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleIncidentList(w http.ResponseWriter, r *http.Request) {
+	page, err := paginationFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	items, total := s.store.ListIncidentsPage(page.Limit, page.Offset)
+	writeJSON(w, http.StatusOK, paginatedEnvelope(items, page, total))
+}
+
+func (s *Server) handleAlertList(w http.ResponseWriter, r *http.Request) {
+	page, err := paginationFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	items, total := s.store.ListAlertsPage(page.Limit, page.Offset)
+	writeJSON(w, http.StatusOK, paginatedEnvelope(items, page, total))
+}
+
+func (s *Server) handleAnalysisRunList(w http.ResponseWriter, r *http.Request) {
+	page, err := paginationFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	items, total := s.store.ListAnalysisRunsPage(page.Limit, page.Offset)
+	writeJSON(w, http.StatusOK, paginatedEnvelope(items, page, total))
+}
+
 func correlationKey(webhook AlertmanagerWebhook, alert Alert) string {
 	labels := alert.Labels
 	cluster := first(labels["cluster"], labels["runai_cluster"], labels["runai.io/cluster"])
+	if group, ok := diskPressureGroup(alert); ok {
+		return strings.Join([]string{
+			"flap",
+			"node-pressure",
+			keyPart(first(cluster, "cluster-unknown")),
+			keyPart(first(group.Node, "node-unknown")),
+			keyPart(group.Reason),
+		}, ":")
+	}
 	namespace := first(labels["namespace"], labels["kubernetes_namespace"])
-	pod := first(labels["pod"], labels["pod_name"], labels["kubernetes_pod_name"])
+	workload := workloadIdentity(alert)
 	alertName := first(labels["alertname"], labels["alert_name"])
-	if cluster != "" && namespace != "" && pod != "" && alertName != "" {
-		return strings.Join([]string{"flap", cluster, namespace, pod, alertName}, ":")
+	if namespace != "" && workload != "" && alertName != "" {
+		return strings.Join([]string{
+			"flap",
+			keyPart(first(cluster, "cluster-unknown")),
+			keyPart(namespace),
+			keyPart(workload),
+			keyPart(alertName),
+		}, ":")
 	}
 	if alert.Fingerprint != "" {
 		return "fingerprint:" + alert.Fingerprint
@@ -318,8 +374,176 @@ func correlationKey(webhook AlertmanagerWebhook, alert Alert) string {
 	return fmt.Sprintf("adhoc:%d", time.Now().UnixNano())
 }
 
+type diskPressureGroupInfo struct {
+	Node   string
+	Reason string
+}
+
+func diskPressureGroup(alert Alert) (diskPressureGroupInfo, bool) {
+	labels := alert.Labels
+	annotations := alert.Annotations
+	text := strings.ToLower(strings.Join([]string{
+		labels["alertname"],
+		labels["alert_name"],
+		labels["reason"],
+		labels["condition"],
+		annotations["summary"],
+		annotations["description"],
+		annotations["message"],
+	}, " "))
+
+	reason := ""
+	switch {
+	case strings.Contains(text, "diskpressure"), strings.Contains(text, "disk pressure"):
+		reason = "disk-pressure"
+	case strings.Contains(text, "evicted"), strings.Contains(text, "evict"):
+		reason = "evicted"
+	default:
+		return diskPressureGroupInfo{}, false
+	}
+
+	node := first(
+		labels["node"],
+		labels["node_name"],
+		labels["nodename"],
+		labels["kubernetes_node"],
+		labels["instance"],
+	)
+	return diskPressureGroupInfo{Node: node, Reason: reason}, true
+}
+
+func groupedIncidentTitle(alert Alert, alertCount int) string {
+	group, ok := diskPressureGroup(alert)
+	if !ok {
+		return incidentTitle(alert)
+	}
+	node := first(group.Node, "unknown node")
+	if alertCount > 1 {
+		return fmt.Sprintf("Node %s %s affected %d alert(s)", node, strings.ReplaceAll(group.Reason, "-", " "), alertCount)
+	}
+	return fmt.Sprintf("Node %s %s", node, strings.ReplaceAll(group.Reason, "-", " "))
+}
+
 func incidentTitle(alert Alert) string {
 	return first(alert.Annotations["summary"], alert.Labels["alertname"], "Run:AI incident")
+}
+
+// workloadIdentity returns a stable identifier for the workload behind an alert.
+// Controllers recreate pods under new, randomized names (a Deployment rollout, a
+// StatefulSet restart, a CrashLoop churn), so keying flapping correlation on the
+// raw pod name makes every occurrence look unique and floods the store. Explicit
+// workload/owner labels win when present; otherwise the pod name is normalized to
+// its workload prefix.
+func workloadIdentity(alert Alert) string {
+	labels := alert.Labels
+	if w := first(
+		labels["workload"],
+		labels["workload_name"],
+		labels["runai_job_name"],
+		labels["deployment"],
+		labels["statefulset"],
+		labels["daemonset"],
+		labels["job_name"],
+		labels["created_by_name"],
+		labels["owner_name"],
+	); w != "" {
+		return normalizePodName(w)
+	}
+	pod := first(labels["pod"], labels["pod_name"], labels["kubernetes_pod_name"])
+	return normalizePodName(pod)
+}
+
+var (
+	podRandomSuffixRe   = regexp.MustCompile(`-[a-z0-9]{5}$`)
+	podReplicaSetHashRe = regexp.MustCompile(`-[a-z0-9]{8,10}$`)
+	podOrdinalSuffixRe  = regexp.MustCompile(`-\d+$`)
+)
+
+// normalizePodName strips the controller-generated suffixes from a pod name so
+// pods of the same workload collapse to one identity:
+//   - Deployment:  <name>-<replicaset-hash>-<random5>
+//   - DaemonSet:   <name>-<random5>
+//   - StatefulSet: <name>-<ordinal>
+func normalizePodName(pod string) string {
+	pod = strings.TrimSpace(pod)
+	if pod == "" {
+		return ""
+	}
+	if podRandomSuffixRe.MatchString(pod) {
+		stripped := podRandomSuffixRe.ReplaceAllString(pod, "")
+		if podReplicaSetHashRe.MatchString(stripped) {
+			return podReplicaSetHashRe.ReplaceAllString(stripped, "")
+		}
+		return stripped
+	}
+	if podOrdinalSuffixRe.MatchString(pod) {
+		return podOrdinalSuffixRe.ReplaceAllString(pod, "")
+	}
+	return pod
+}
+
+// maxOccurrencePods bounds the distinct concrete pod names retained on a grouped
+// alert row. The OccurrenceCount still reflects the true total; only the forensic
+// name list is capped so a perpetually flapping workload cannot bloat the row.
+const maxOccurrencePods = 25
+
+// podName extracts the concrete pod name behind an alert occurrence.
+func podName(alert Alert) string {
+	return first(alert.Labels["pod"], alert.Labels["pod_name"], alert.Labels["kubernetes_pod_name"])
+}
+
+// appendOccurrencePod records the concrete pod behind one occurrence, keeping the
+// most-recent distinct names (most recent last) within the cap.
+func appendOccurrencePod(pods []string, pod string) []string {
+	pod = strings.TrimSpace(pod)
+	if pod == "" {
+		return pods
+	}
+	out := make([]string, 0, len(pods)+1)
+	for _, existing := range pods {
+		if existing != pod {
+			out = append(out, existing)
+		}
+	}
+	out = append(out, pod)
+	if len(out) > maxOccurrencePods {
+		out = out[len(out)-maxOccurrencePods:]
+	}
+	return out
+}
+
+func alertIdentity(alert Alert) string {
+	if fingerprint := strings.TrimSpace(alert.Fingerprint); fingerprint != "" {
+		return fingerprint
+	}
+	labels := make([]string, 0, len(alert.Labels))
+	for key, value := range alert.Labels {
+		labels = append(labels, key+"="+value)
+	}
+	sort.Strings(labels)
+	raw := strings.Join([]string{
+		alert.StartsAt,
+		alert.GeneratorURL,
+		strings.Join(labels, "\x1f"),
+	}, "\x00")
+	sum := sha1.Sum([]byte(raw))
+	return "synthetic:" + hex.EncodeToString(sum[:])
+}
+
+func alertStorageKey(webhook AlertmanagerWebhook, alert Alert, correlation string) string {
+	if key := strings.TrimSpace(correlation); key != "" {
+		return "correlation:" + key
+	}
+	return "identity:" + alertIdentity(alert)
+}
+
+func keyPart(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return "unknown"
+	}
+	replacer := strings.NewReplacer(" ", "-", "\t", "-", "\n", "-", ":", "-", "/", "-")
+	return replacer.Replace(value)
 }
 
 func severity(alert Alert) string {
@@ -399,6 +623,7 @@ func cloneAlert(in *AlertRecord) *AlertRecord {
 	out := *in
 	out.Labels = cloneMap(in.Labels)
 	out.Annotations = cloneMap(in.Annotations)
+	out.OccurrencePods = cloneStrings(in.OccurrencePods)
 	out.Capabilities = cloneMap(in.Capabilities)
 	out.MissingData = cloneStrings(in.MissingData)
 	out.Warnings = cloneStrings(in.Warnings)
@@ -521,6 +746,90 @@ func pathPart(path, prefix string) string {
 
 func envelope(data any) map[string]any {
 	return map[string]any{"status": "ok", "data": data}
+}
+
+type paginationRequest struct {
+	Limit  int
+	Offset int
+}
+
+type paginationInfo struct {
+	Total   int  `json:"total"`
+	Limit   int  `json:"limit"`
+	Offset  int  `json:"offset"`
+	HasMore bool `json:"has_more"`
+}
+
+func paginatedEnvelope(data any, page paginationRequest, total int) map[string]any {
+	payload := envelope(data)
+	limit := page.Limit
+	if limit <= 0 {
+		limit = total
+	}
+	payload["pagination"] = paginationInfo{
+		Total:   total,
+		Limit:   limit,
+		Offset:  page.Offset,
+		HasMore: page.Offset+limit < total,
+	}
+	return payload
+}
+
+func paginationFromRequest(r *http.Request) (paginationRequest, error) {
+	query := r.URL.Query()
+	limit, err := nonNegativeQueryInt(query.Get("limit"), 0)
+	if err != nil {
+		return paginationRequest{}, fmt.Errorf("invalid limit")
+	}
+	offset, err := nonNegativeQueryInt(query.Get("offset"), 0)
+	if err != nil {
+		return paginationRequest{}, fmt.Errorf("invalid offset")
+	}
+	if limit > maxListLimit {
+		limit = maxListLimit
+	}
+	return paginationRequest{Limit: limit, Offset: offset}, nil
+}
+
+func nonNegativeQueryInt(raw string, fallback int) (int, error) {
+	if strings.TrimSpace(raw) == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, err
+	}
+	if value < 0 {
+		return 0, fmt.Errorf("value must be non-negative")
+	}
+	return value, nil
+}
+
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) (int, error) {
+	body := r.Body
+	if maxBytes > 0 {
+		body = http.MaxBytesReader(w, r.Body, maxBytes)
+	}
+	decoder := json.NewDecoder(body)
+	if err := decoder.Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return http.StatusRequestEntityTooLarge, fmt.Errorf("request body too large (max %d bytes)", maxErr.Limit)
+		}
+		return http.StatusBadRequest, err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				return http.StatusRequestEntityTooLarge, fmt.Errorf("request body too large (max %d bytes)", maxErr.Limit)
+			}
+			return http.StatusBadRequest, err
+		}
+		return http.StatusBadRequest, fmt.Errorf("request body must contain a single JSON value")
+	}
+	return http.StatusOK, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

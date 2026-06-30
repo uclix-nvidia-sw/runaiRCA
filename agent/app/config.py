@@ -103,6 +103,13 @@ class Settings:
     nat_config_file: str
     enable_nat_runtime: bool
     nat_timeout_seconds: int
+    typedb_address: str
+    typedb_database: str
+    typedb_username: str
+    typedb_password: str
+    typedb_tls_enabled: bool
+    typedb_timeout_seconds: int
+    enable_typedb: bool
 
 
 def load_settings() -> Settings:
@@ -169,4 +176,11 @@ def load_settings() -> Settings:
         ).strip(),
         enable_nat_runtime=_bool_env("ENABLE_NAT_RUNTIME", False),
         nat_timeout_seconds=_int_env("NAT_TIMEOUT_SECONDS", 180),
+        typedb_address=os.getenv("TYPEDB_ADDRESS", "").strip(),
+        typedb_database=os.getenv("TYPEDB_DATABASE", "runai_rca").strip(),
+        typedb_username=os.getenv("TYPEDB_USERNAME", "admin").strip(),
+        typedb_password=os.getenv("TYPEDB_PASSWORD", "password").strip(),
+        typedb_tls_enabled=_bool_env("TYPEDB_TLS_ENABLED", False),
+        typedb_timeout_seconds=_int_env("TYPEDB_TIMEOUT_SECONDS", 6),
+        enable_typedb=_bool_env("ENABLE_TYPEDB", False),
     )

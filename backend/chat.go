@@ -35,10 +35,12 @@ type ChatResponse struct {
 	AnalysisRun    *AnalysisRun `json:"analysis_run,omitempty"`
 }
 
+const dashboardChatRecentLimit = 5
+
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var req ChatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if status, err := decodeJSONBody(w, r, &req, maxJSONBodyBytes); err != nil {
+		writeError(w, status, err.Error())
 		return
 	}
 	req.Message = strings.TrimSpace(req.Message)
@@ -173,24 +175,22 @@ func (s *Server) enrichChatRequest(req ChatRequest) ChatRequest {
 }
 
 func (s *Server) dashboardChatState() map[string]any {
-	incidents := s.store.ListIncidents()
-	alerts := s.store.ListAlerts()
-	runs := s.store.ListAnalysisRuns()
+	snapshot := s.store.DashboardSnapshot(dashboardChatRecentLimit)
 	state := map[string]any{
-		"incident_count":      len(incidents),
-		"alert_count":         len(alerts),
-		"analysis_run_count":  len(runs),
-		"open_incident_count": countIncidentsByStatus(incidents, "resolved", false),
-		"firing_alert_count":  countAlertsByStatus(alerts, "resolved", false),
-		"analysis_statuses":   analysisStatusCounts(runs),
-		"recent_alerts":       recentAlertSummaries(alerts, 5),
-		"recent_runs":         recentRunSummaries(runs, 5),
+		"incident_count":      snapshot.IncidentCount,
+		"alert_count":         snapshot.AlertCount,
+		"analysis_run_count":  snapshot.AnalysisRunCount,
+		"open_incident_count": snapshot.OpenIncidentCount,
+		"firing_alert_count":  snapshot.FiringAlertCount,
+		"analysis_statuses":   snapshot.AnalysisStatuses,
+		"recent_alerts":       recentAlertSummaries(snapshot.RecentAlerts, dashboardChatRecentLimit),
+		"recent_runs":         recentRunSummaries(snapshot.RecentRuns, dashboardChatRecentLimit),
 	}
-	if len(alerts) > 0 {
-		state["latest_alert"] = alertSummary(alerts[0])
+	if len(snapshot.RecentAlerts) > 0 {
+		state["latest_alert"] = alertSummary(snapshot.RecentAlerts[0])
 	}
-	if len(runs) > 0 {
-		state["latest_run"] = runSummary(runs[0])
+	if len(snapshot.RecentRuns) > 0 {
+		state["latest_run"] = runSummary(snapshot.RecentRuns[0])
 	}
 	return state
 }
@@ -204,36 +204,6 @@ func (s *Server) agentRuntimeContext() map[string]any {
 		"chat_llm_runtime":                "not_directly_used",
 		"analysis_runtime_failure_source": "analysis_runs.capabilities.agent and warnings",
 	}
-}
-
-func countIncidentsByStatus(incidents []Incident, status string, equal bool) int {
-	count := 0
-	for _, incident := range incidents {
-		matched := incident.Status == status
-		if matched == equal {
-			count++
-		}
-	}
-	return count
-}
-
-func countAlertsByStatus(alerts []AlertRecord, status string, equal bool) int {
-	count := 0
-	for _, alert := range alerts {
-		matched := alert.Status == status
-		if matched == equal {
-			count++
-		}
-	}
-	return count
-}
-
-func analysisStatusCounts(runs []AnalysisRun) map[string]int {
-	counts := map[string]int{}
-	for _, run := range runs {
-		counts[first(run.Status, "unknown")]++
-	}
-	return counts
 }
 
 func recentAlertSummaries(alerts []AlertRecord, limit int) []map[string]any {
@@ -346,16 +316,7 @@ func (s *Server) chatAnalysisTarget(req ChatRequest) (string, string, bool) {
 }
 
 func (s *Server) latestAlertTarget() string {
-	alerts := s.store.ListAlerts()
-	for _, alert := range alerts {
-		if alert.Status != "resolved" {
-			return alert.AlertID
-		}
-	}
-	if len(alerts) > 0 {
-		return alerts[0].AlertID
-	}
-	return ""
+	return s.store.LatestAlertID()
 }
 
 func analysisStartedAnswer(run *AnalysisRun, inferred bool) string {

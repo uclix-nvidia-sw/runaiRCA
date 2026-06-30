@@ -95,6 +95,8 @@ export type AlertRecord = {
   fired_at: string;
   resolved_at?: string | null;
   fingerprint: string;
+  occurrence_count: number;
+  occurrence_pods?: string[];
   thread_ts: string;
   labels: Record<string, string>;
   annotations: Record<string, string>;
@@ -126,4 +128,12 @@ export type IncidentDetail = Incident & {
 export type Envelope<T> = {
   status: string;
   data: T;
+  pagination?: PageInfo;
+};
+
+export type PageInfo = {
+  total: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
 };

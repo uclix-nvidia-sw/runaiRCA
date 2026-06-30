@@ -1,33 +1,55 @@
 package main
 
 import (
-	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 )
 
 func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 	var webhook AlertmanagerWebhook
-	if err := json.NewDecoder(r.Body).Decode(&webhook); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if status, err := decodeJSONBody(w, r, &webhook, maxJSONBodyBytes); err != nil {
+		writeError(w, status, err.Error())
+		return
+	}
+	if len(webhook.Alerts) > maxWebhookAlerts {
+		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("too many alerts in webhook (max %d)", maxWebhookAlerts))
 		return
 	}
 	accepted := 0
 	ignored := 0
+	autoAnalyses := 0
+	autoIncidentIDs := map[string]struct{}{}
 	for _, alert := range webhook.Alerts {
 		if ignoredAlert(alert) {
 			ignored++
 			continue
 		}
-		incident, record := s.store.UpsertAlert(webhook, alert)
+		result := s.store.UpsertAlertResult(webhook, alert)
+		incident, record := result.Incident, result.Alert
 		accepted++
-		s.hub.Broadcast(alertCreatedEvent(incident, record))
-		s.startAnalysisRun("alert", record.AlertID, "auto", "")
+		if result.Changed {
+			s.hub.Broadcast(alertCreatedEvent(incident, record))
+		}
+		if result.NewIncident {
+			autoIncidentIDs[incident.IncidentID] = struct{}{}
+		}
+	}
+	for incidentID := range autoIncidentIDs {
+		if _, ok := s.startAnalysisRun("incident", incidentID, "auto", ""); ok {
+			autoAnalyses++
+		}
 	}
 	writeJSON(
 		w,
 		http.StatusAccepted,
-		map[string]any{"status": "accepted", "alerts": accepted, "accepted": accepted, "ignored": ignored},
+		map[string]any{
+			"status":        "accepted",
+			"alerts":        accepted,
+			"accepted":      accepted,
+			"ignored":       ignored,
+			"auto_analyses": autoAnalyses,
+		},
 	)
 }
 

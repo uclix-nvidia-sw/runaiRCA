@@ -66,11 +66,45 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "incident not found")
 			return
 		}
-		s.store.MarkAnalyzing(id, true)
-		for _, alert := range detail.Alerts {
-			s.startAnalysisRun("alert", alert.AlertID, "manual", "")
+		if detail.IsAnalyzing {
+			writeJSON(w, http.StatusAccepted, map[string]any{
+				"status": "analysis_already_running",
+			})
+			return
 		}
-		writeJSON(w, http.StatusAccepted, map[string]string{"status": "analysis_requested"})
+		if len(detail.Alerts) == 0 {
+			writeError(w, http.StatusConflict, "incident has no alerts to analyze")
+			return
+		}
+		if len(detail.Alerts) > maxManualAnalyzeFanout {
+			if _, ok := s.startAnalysisRun("incident", id, "manual", ""); !ok {
+				writeError(w, http.StatusNotFound, "analysis target not found")
+				return
+			}
+			writeJSON(w, http.StatusAccepted, map[string]any{
+				"status":        "analysis_requested",
+				"mode":          "incident",
+				"analysis_runs": 1,
+				"alert_count":   len(detail.Alerts),
+			})
+			return
+		}
+		started := 0
+		for _, alert := range detail.Alerts {
+			if _, ok := s.startAnalysisRun("alert", alert.AlertID, "manual", ""); ok {
+				started++
+			}
+		}
+		if started == 0 {
+			writeError(w, http.StatusConflict, "incident has no analyzable alerts")
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"status":        "analysis_requested",
+			"mode":          "alerts",
+			"analysis_runs": started,
+			"alert_count":   len(detail.Alerts),
+		})
 	case "resolve":
 		if len(parts) != 2 || r.Method != http.MethodPost {
 			writeError(w, http.StatusNotFound, "unknown incident action")

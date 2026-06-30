@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"net/http"
 	"strings"
 )
@@ -13,8 +12,8 @@ func (s *Server) handleFeedback(
 	targetID string,
 ) {
 	var req FeedbackRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if status, err := decodeJSONBody(w, r, &req, maxJSONBodyBytes); err != nil {
+		writeError(w, status, err.Error())
 		return
 	}
 	if strings.TrimSpace(req.Author) == "" {
@@ -44,8 +43,8 @@ func (s *Server) handleComment(
 	targetID string,
 ) {
 	var req CommentRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if status, err := decodeJSONBody(w, r, &req, maxJSONBodyBytes); err != nil {
+		writeError(w, status, err.Error())
 		return
 	}
 	summary, ok, err := s.store.AddComment(targetType, targetID, req)
@@ -90,8 +89,8 @@ func (s *Server) handleCommentUpdate(
 	commentID string,
 ) {
 	var req CommentRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if status, err := decodeJSONBody(w, r, &req, maxJSONBodyBytes); err != nil {
+		writeError(w, status, err.Error())
 		return
 	}
 	summary, ok, err := s.store.UpdateComment(targetType, targetID, commentID, req)
@@ -128,8 +127,8 @@ func (s *Server) handleCommentDelete(
 
 func (s *Server) handleEmbeddingSearch(w http.ResponseWriter, r *http.Request) {
 	var req EmbeddingSearchRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if status, err := decodeJSONBody(w, r, &req, maxJSONBodyBytes); err != nil {
+		writeError(w, status, err.Error())
 		return
 	}
 	query := strings.TrimSpace(req.Query)

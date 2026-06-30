@@ -6,6 +6,8 @@ import {
   Bot,
   CheckCircle2,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Code2,
   Clipboard,
   Database,
@@ -56,9 +58,10 @@ import {
   type ChatRequest,
 } from './api';
 import nvidiaLogo from './assets/nvidia-logo.svg';
-import { AlertRecord, AnalysisRun, Artifact, FeedbackSummary, Incident, IncidentDetail, SimilarIncident } from './types';
+import { AlertRecord, AnalysisRun, Artifact, FeedbackSummary, Incident, IncidentDetail, PageInfo, SimilarIncident } from './types';
 
 const TrendChartCanvas = lazy(() => import('./TrendChartCanvas'));
+const DASHBOARD_PAGE_SIZE = 50;
 
 type DetailState =
   | { kind: 'incident'; data: IncidentDetail }
@@ -301,7 +304,30 @@ function errorMessage(err: unknown, fallback: string) {
 }
 
 function formatArtifactValue(value: unknown) {
-  return typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  return typeof value === 'string' ? value : safeJSONStringify(value, 2);
+}
+
+function safeJSONStringify(value: unknown, space?: number) {
+  const seen = new WeakSet<object>();
+  try {
+    const serialized = JSON.stringify(
+      value,
+      (_key, item) => {
+        if (typeof item !== 'object' || item === null) {
+          return item;
+        }
+        if (seen.has(item)) {
+          return '[Circular]';
+        }
+        seen.add(item);
+        return item;
+      },
+      space,
+    );
+    return serialized ?? String(value);
+  } catch (err) {
+    return `[Unserializable: ${errorMessage(err, 'unknown value')}]`;
+  }
 }
 
 function compactArtifactValue(value: unknown, depth = 3): unknown {
@@ -493,40 +519,79 @@ function useEditorHistory(initialValue = '') {
   return { value, setValue: commit, reset, undo, redo };
 }
 
-function useDashboardData() {
+type DashboardPageIndexes = {
+  incidents: number;
+  alerts: number;
+  analysis: number;
+};
+
+function pageRequest(pageIndex: number) {
+  return {
+    limit: DASHBOARD_PAGE_SIZE,
+    offset: Math.max(0, pageIndex) * DASHBOARD_PAGE_SIZE,
+  };
+}
+
+function emptyPage(pageIndex = 0): PageInfo {
+  return {
+    total: 0,
+    limit: DASHBOARD_PAGE_SIZE,
+    offset: Math.max(0, pageIndex) * DASHBOARD_PAGE_SIZE,
+    has_more: false,
+  };
+}
+
+function useDashboardData(pageIndexes: DashboardPageIndexes) {
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [alerts, setAlerts] = useState<AlertRecord[]>([]);
   const [analysisRuns, setAnalysisRuns] = useState<AnalysisRun[]>([]);
+  const [incidentPage, setIncidentPage] = useState<PageInfo>(() => emptyPage());
+  const [alertPage, setAlertPage] = useState<PageInfo>(() => emptyPage());
+  const [analysisPage, setAnalysisPage] = useState<PageInfo>(() => emptyPage());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [realtimePayload, setRealtimePayload] = useState<RealtimeEventPayload>();
+  const realtimeRefreshTimerRef = useRef<number | null>(null);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (options: { silent?: boolean } = {}) => {
+    if (!options.silent) {
+      setLoading(true);
+    }
     setError('');
-    let nextAnalysisRuns: AnalysisRun[] = [];
     try {
-      const [incidentData, alertData] = await Promise.all([fetchIncidents(), fetchAlerts()]);
-      setIncidents(incidentData);
-      setAlerts(alertData);
+      const [incidentData, alertData] = await Promise.all([
+        fetchIncidents(pageRequest(pageIndexes.incidents)),
+        fetchAlerts(pageRequest(pageIndexes.alerts)),
+      ]);
+      setIncidents(incidentData.items);
+      setIncidentPage(incidentData.page);
+      setAlerts(alertData.items);
+      setAlertPage(alertData.page);
       try {
-        nextAnalysisRuns = await fetchAnalysisRuns();
-        setAnalysisRuns(nextAnalysisRuns);
+        const nextAnalysisRuns = await fetchAnalysisRuns(pageRequest(pageIndexes.analysis));
+        setAnalysisRuns(nextAnalysisRuns.items);
+        setAnalysisPage(nextAnalysisRuns.page);
       } catch (err) {
         setAnalysisRuns([]);
+        setAnalysisPage(emptyPage(pageIndexes.analysis));
         const message = err instanceof Error ? err.message : 'Failed to load analysis runs.';
-          setError(`Analysis runs are unavailable: ${message}`);
+        setError(`Analysis runs are unavailable: ${message}`);
       }
     } catch (err) {
       setIncidents([]);
       setAlerts([]);
       setAnalysisRuns([]);
+      setIncidentPage(emptyPage(pageIndexes.incidents));
+      setAlertPage(emptyPage(pageIndexes.alerts));
+      setAnalysisPage(emptyPage(pageIndexes.analysis));
       const message = err instanceof Error ? err.message : 'Failed to load dashboard data.';
       setError(message);
     } finally {
-      setLoading(false);
+      if (!options.silent) {
+        setLoading(false);
+      }
     }
-  }, []);
+  }, [pageIndexes.alerts, pageIndexes.analysis, pageIndexes.incidents]);
 
   useEffect(() => {
     void load();
@@ -544,7 +609,13 @@ function useDashboardData() {
     const handleRealtimeEvent = (event: Event) => {
       const payload = parseRealtimeEvent(event);
       setRealtimePayload(payload);
-      void load();
+      if (realtimeRefreshTimerRef.current !== null) {
+        window.clearTimeout(realtimeRefreshTimerRef.current);
+      }
+      realtimeRefreshTimerRef.current = window.setTimeout(() => {
+        realtimeRefreshTimerRef.current = null;
+        void load({ silent: true });
+      }, 750);
     };
     source.onmessage = handleRealtimeEvent;
     source.addEventListener('alert.created', handleRealtimeEvent);
@@ -552,13 +623,21 @@ function useDashboardData() {
     source.addEventListener('analysis.completed', handleRealtimeEvent);
     source.addEventListener('incident.resolved', handleRealtimeEvent);
     source.addEventListener('feedback.updated', handleRealtimeEvent);
-    return () => source.close();
+    return () => {
+      source.close();
+      if (realtimeRefreshTimerRef.current !== null) {
+        window.clearTimeout(realtimeRefreshTimerRef.current);
+      }
+    };
   }, [load]);
 
   return {
     incidents,
     alerts,
     analysisRuns,
+    incidentPage,
+    alertPage,
+    analysisPage,
     loading,
     error,
     load,
@@ -567,15 +646,25 @@ function useDashboardData() {
 }
 
 function App() {
+  const [incidentPageIndex, setIncidentPageIndex] = useState(0);
+  const [alertPageIndex, setAlertPageIndex] = useState(0);
+  const [analysisPageIndex, setAnalysisPageIndex] = useState(0);
   const {
     incidents,
     alerts,
     analysisRuns,
+    incidentPage,
+    alertPage,
+    analysisPage,
     loading,
     error,
     load,
     realtimePayload,
-  } = useDashboardData();
+  } = useDashboardData({
+    incidents: incidentPageIndex,
+    alerts: alertPageIndex,
+    analysis: analysisPageIndex,
+  });
   const [detail, setDetail] = useState<DetailState>(null);
   const [activeView, setActiveView] = useState<MainView>(() => routeFromHash(window.location.hash).view);
   const [query, setQuery] = useState('');
@@ -583,6 +672,12 @@ function App() {
   const [refreshing, setRefreshing] = useState(false);
   const detailVersionRef = useRef(0);
   const routeLoadVersionRef = useRef(0);
+
+  useEffect(() => {
+    setIncidentPageIndex(0);
+    setAlertPageIndex(0);
+    setAnalysisPageIndex(0);
+  }, [query]);
 
   useEffect(() => {
     detailVersionRef.current += 1;
@@ -824,7 +919,7 @@ function App() {
     if (refreshing) return;
     setRefreshing(true);
     try {
-      await Promise.all([load(), refreshDetail()]);
+      await Promise.all([load({ silent: true }), refreshDetail()]);
     } finally {
       setRefreshing(false);
     }
@@ -915,17 +1010,21 @@ function App() {
           <IncidentsDashboard
             incidents={dashboardIncidents}
             filteredIncidents={filteredIncidents}
+            page={incidentPage}
             loading={loading}
             onOpenIncident={openIncident}
+            onPageChange={setIncidentPageIndex}
           />
         )}
         {activeView === 'alerts' && (
           <AlertsDashboard
             alerts={dashboardAlerts}
             filteredAlerts={filteredAlerts}
+            page={alertPage}
             loading={loading}
             onOpenAlert={openAlert}
             onOpenIncident={openIncident}
+            onPageChange={setAlertPageIndex}
           />
         )}
         {activeView === 'analysis' && (
@@ -934,7 +1033,8 @@ function App() {
             allRecords={analysisRecords}
             incidents={analysisIncidents}
             alerts={analysisAlerts}
-            totalCount={analysisRecords.length}
+            page={analysisPage}
+            totalCount={analysisPage.total}
             loading={loading}
             onAnalyze={async (id) => {
               await analyzeIncident(id);
@@ -942,6 +1042,7 @@ function App() {
             }}
             onOpenAlert={openAlert}
             onOpenIncident={openIncident}
+            onPageChange={setAnalysisPageIndex}
           />
         )}
         {activeView === 'agents' && (
@@ -983,13 +1084,17 @@ function App() {
 function IncidentsDashboard({
   incidents,
   filteredIncidents,
+  page,
   loading,
   onOpenIncident,
+  onPageChange,
 }: {
   incidents: Incident[];
   filteredIncidents: Incident[];
+  page: PageInfo;
   loading: boolean;
   onOpenIncident: (id: string) => Promise<void>;
+  onPageChange: (page: number) => void;
 }) {
   let openCount = 0;
   let resolvedCount = 0;
@@ -1004,14 +1109,14 @@ function IncidentsDashboard({
     <>
       <section className="metric-row">
         <Metric label="Open incidents" value={openCount} />
-        <Metric label="Total incidents" value={incidents.length} />
+        <Metric label="Total incidents" value={page.total} />
         <Metric label="Analyzing" value={analyzingIncidentCount} />
         <Metric label="Resolved incidents" value={resolvedCount} />
       </section>
 
       <section className="content-grid single-dashboard-grid">
         <div className="panel full-width-panel">
-          <PanelHeader title="Incidents" count={filteredIncidents.length} />
+          <PanelHeader title="Incidents" count={page.total === filteredIncidents.length ? filteredIncidents.length : `${filteredIncidents.length} / ${page.total}`} />
           <table className="operations-table incidents-table">
             <thead>
               <tr>
@@ -1039,6 +1144,7 @@ function IncidentsDashboard({
           </table>
           {loading && <p className="empty">Loading incidents...</p>}
           {!loading && filteredIncidents.length === 0 && <p className="empty">No incidents match the current search.</p>}
+          <PaginationControls page={page} disabled={loading} onPageChange={onPageChange} />
         </div>
       </section>
     </>
@@ -1048,37 +1154,42 @@ function IncidentsDashboard({
 function AlertsDashboard({
   alerts,
   filteredAlerts,
+  page,
   loading,
   onOpenAlert,
   onOpenIncident,
+  onPageChange,
 }: {
   alerts: AlertRecord[];
   filteredAlerts: AlertRecord[];
+  page: PageInfo;
   loading: boolean;
   onOpenAlert: (id: string) => Promise<void>;
   onOpenIncident: (id: string) => Promise<void>;
+  onPageChange: (page: number) => void;
 }) {
-  const firingCount = alerts.filter((alert) => alert.status !== 'resolved').length;
-  const resolvedCount = alerts.filter((alert) => alert.status === 'resolved').length;
   const analyzingCount = alerts.filter((alert) => alert.is_analyzing).length;
+  const totalOccurrences = sumAlertOccurrences(alerts);
+  const firingOccurrences = sumAlertOccurrences(alerts.filter((alert) => alert.status !== 'resolved'));
+  const resolvedOccurrences = sumAlertOccurrences(alerts.filter((alert) => alert.status === 'resolved'));
 
   return (
     <>
       <section className="metric-row">
-        <Metric label="Firing alerts" value={firingCount} />
-        <Metric label="Total alerts" value={alerts.length} />
+        <Metric label="Firing occurrences" value={firingOccurrences} />
+        <Metric label="Alert groups" value={page.total} />
         <Metric label="Analyzing" value={analyzingCount} />
-        <Metric label="Resolved alerts" value={resolvedCount} />
+        <Metric label="Resolved occurrences" value={resolvedOccurrences} />
       </section>
 
       <section className="content-grid single-dashboard-grid">
         <div className="panel full-width-panel">
-          <PanelHeader title="Alerts" count={filteredAlerts.length} />
+          <PanelHeader title="Alerts" count={page.total === filteredAlerts.length ? filteredAlerts.length : `${filteredAlerts.length} / ${page.total}`} />
           <table className="operations-table alerts-table">
             <thead>
               <tr>
                 <th>Alert</th>
-                <th>Run:AI target</th>
+                <th>Target</th>
                 <th>Severity</th>
                 <th>Status</th>
                 <th>Incident</th>
@@ -1089,7 +1200,10 @@ function AlertsDashboard({
                 <tr key={alert.alert_id} onClick={() => void onOpenAlert(alert.alert_id)}>
                   <td>
                     <strong>{alert.alarm_title}</strong>
-                    <span>{alert.alert_id}</span>
+                    <span className="table-subline">
+                      {alert.alert_id}
+                      <span className="occurrence-pill">{formatOccurrenceCount(alert)}</span>
+                    </span>
                   </td>
                   <td>
                     <strong>{targetLine(alert.labels)}</strong>
@@ -1117,6 +1231,12 @@ function AlertsDashboard({
           </table>
           {loading && <p className="empty">Loading alerts...</p>}
           {!loading && filteredAlerts.length === 0 && <p className="empty">No alerts match the current search.</p>}
+          {!loading && filteredAlerts.length > 0 && totalOccurrences > filteredAlerts.length && (
+            <p className="table-note">
+              Showing {filteredAlerts.length} alert group(s) covering {sumAlertOccurrences(filteredAlerts)} occurrence(s).
+            </p>
+          )}
+          <PaginationControls page={page} disabled={loading} onPageChange={onPageChange} />
         </div>
       </section>
     </>
@@ -1128,21 +1248,25 @@ function AnalysisDashboard({
   allRecords,
   incidents,
   alerts,
+  page,
   totalCount,
   loading,
   onAnalyze,
   onOpenAlert,
   onOpenIncident,
+  onPageChange,
 }: {
   records: AnalysisRecord[];
   allRecords: AnalysisRecord[];
   incidents: Incident[];
   alerts: AlertRecord[];
+  page: PageInfo;
   totalCount: number;
   loading: boolean;
   onAnalyze: (id: string) => Promise<void>;
   onOpenAlert: (id: string) => Promise<void>;
   onOpenIncident: (id: string) => Promise<void>;
+  onPageChange: (page: number) => void;
 }) {
   const [windowDays, setWindowDays] = useState(14);
   const [pendingAnalyzeID, setPendingAnalyzeID] = useState('');
@@ -1210,7 +1334,7 @@ function AnalysisDashboard({
 
       <section className="analysis-focus-grid">
         <section className="panel view-panel recent-analysis-panel">
-          <PanelHeader title="Recent analyses" count={recentRecords.length} />
+          <PanelHeader title="Recent analyses" count={page.total === recentRecords.length ? recentRecords.length : `${recentRecords.length} / ${page.total}`} />
           <div className="analysis-list">
             {recentRecords.map((record) => {
               const alertID = record.alertID;
@@ -1303,6 +1427,7 @@ function AnalysisDashboard({
             {!loading && totalCount === 0 && <p className="empty">No analysis records have been created yet.</p>}
             {!loading && totalCount > 0 && recentRecords.length === 0 && <p className="empty">No analyses match the selected time window or search.</p>}
           </div>
+          <PaginationControls page={page} disabled={loading} onPageChange={onPageChange} />
         </section>
 
         <div className="analysis-focus-side">
@@ -1514,11 +1639,59 @@ function Metric({ label, value }: { label: string; value: string | number }) {
   );
 }
 
-function PanelHeader({ title, count }: { title: string; count: number }) {
+function PanelHeader({ title, count }: { title: string; count: number | string }) {
   return (
     <div className="panel-header">
       <h3>{title}</h3>
       <span>{count}</span>
+    </div>
+  );
+}
+
+function PaginationControls({
+  page,
+  disabled,
+  onPageChange,
+}: {
+  page: PageInfo;
+  disabled?: boolean;
+  onPageChange: (page: number) => void;
+}) {
+  const limit = Math.max(1, page.limit || DASHBOARD_PAGE_SIZE);
+  const currentPage = Math.floor(page.offset / limit);
+  const totalPages = Math.max(1, Math.ceil(page.total / limit));
+  const start = page.total === 0 ? 0 : page.offset + 1;
+  const end = Math.min(page.offset + limit, page.total);
+  const canGoPrevious = currentPage > 0;
+  const canGoNext = page.has_more && currentPage < totalPages - 1;
+
+  if (page.total <= limit && currentPage === 0) {
+    return null;
+  }
+
+  return (
+    <div className="pagination-bar">
+      <span>{start}-{end} / {page.total}</span>
+      <div>
+        <button
+          className="icon-button compact-icon-button"
+          disabled={disabled || !canGoPrevious}
+          onClick={() => onPageChange(currentPage - 1)}
+          type="button"
+          aria-label="Previous page"
+        >
+          <ChevronLeft size={16} />
+        </button>
+        <button
+          className="icon-button compact-icon-button"
+          disabled={disabled || !canGoNext}
+          onClick={() => onPageChange(currentPage + 1)}
+          type="button"
+          aria-label="Next page"
+        >
+          <ChevronRight size={16} />
+        </button>
+      </div>
     </div>
   );
 }
@@ -1609,6 +1782,9 @@ function UnifiedWorkspace({
   const title = incident?.title ?? alert?.alarm_title ?? '';
   const id = incident?.incident_id ?? alert?.alert_id ?? '';
   const labels = incident?.alerts[0]?.labels ?? alert?.labels ?? {};
+  const affectedPods = incident
+    ? Array.from(new Set(incident.alerts.flatMap((item) => item.occurrence_pods ?? []))).filter(Boolean)
+    : (alert?.occurrence_pods ?? []).filter(Boolean);
   const artifacts = incident?.artifacts ?? alert?.artifacts ?? [];
   const capabilities = incident?.capabilities ?? alert?.capabilities ?? {};
   const missingData = incident?.missing_data ?? alert?.missing_data ?? [];
@@ -1638,6 +1814,7 @@ function UnifiedWorkspace({
             <Severity value={detail.data.severity} />
             <Status value={detail.data.status} analyzing={detail.data.is_analyzing} />
           </div>
+          <AffectedPods pods={affectedPods} />
         </div>
         <div className="workspace-actions">
           <button className="ghost-button" onClick={onClose} type="button"><ArrowLeft size={16} /> Back</button>
@@ -1747,20 +1924,7 @@ function UnifiedWorkspace({
         </section>
 
         {(missingData.length > 0 || warnings.length > 0) && (
-          <section className="diagnostics">
-            {missingData.length > 0 && (
-              <div>
-                <h3>Missing Data</h3>
-                <ul>{missingData.map((item) => <li key={item}>{item}</li>)}</ul>
-              </div>
-            )}
-            {warnings.length > 0 && (
-              <div>
-                <h3>Warnings</h3>
-                <ul>{warnings.map((item) => <li key={item}>{item}</li>)}</ul>
-              </div>
-            )}
-          </section>
+          <DiagnosticsPanel missingData={missingData} warnings={warnings} />
         )}
 
         <FeedbackPanel
@@ -1771,6 +1935,23 @@ function UnifiedWorkspace({
         />
       </div>
     </section>
+  );
+}
+
+function AffectedPods({ pods }: { pods: string[] }) {
+  if (!pods.length) return null;
+  const shown = pods.slice(0, 12);
+  const remaining = pods.length - shown.length;
+  return (
+    <div className="affected-pods">
+      <span className="affected-pods-label">Affected pods · {pods.length}</span>
+      <div className="affected-pods-list">
+        {shown.map((pod) => (
+          <code key={pod} className="pod-chip" title={pod}>{pod}</code>
+        ))}
+        {remaining > 0 && <span className="pod-chip pod-chip-more">+{remaining} more</span>}
+      </div>
+    </div>
   );
 }
 
@@ -1789,6 +1970,7 @@ function RelatedIncidentPanel({
           <strong>{alert.incident_id}</strong>
           <div className="meta-line">
             <span>{targetLine(alert.labels)}</span>
+            <span>{formatOccurrenceCount(alert)}</span>
             <Severity value={alert.severity} />
             <Status value={alert.status} analyzing={alert.is_analyzing} />
           </div>
@@ -1799,6 +1981,53 @@ function RelatedIncidentPanel({
         </button>
       </article>
     </section>
+  );
+}
+
+function DiagnosticsPanel({ missingData, warnings }: { missingData: string[]; warnings: string[] }) {
+  return (
+    <section className="diagnostics">
+      {missingData.length > 0 && <DiagnosticGroup title="Missing Data" items={missingData} tone="missing" />}
+      {warnings.length > 0 && <DiagnosticGroup title="Warnings" items={warnings} tone="warning" />}
+    </section>
+  );
+}
+
+function DiagnosticGroup({
+  title,
+  items,
+  tone,
+}: {
+  title: string;
+  items: string[];
+  tone: 'missing' | 'warning';
+}) {
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    setOpen(items.length <= 3);
+  }, [title, items.length]);
+  const visibleItems = open ? items : items.slice(0, 3);
+  const hiddenCount = Math.max(0, items.length - visibleItems.length);
+
+  return (
+    <div className={`diagnostic-group diagnostic-${tone}`}>
+      <button className="diagnostic-toggle" onClick={() => setOpen((value) => !value)} type="button">
+        <span>{title}</span>
+        <strong>{items.length}</strong>
+        <ChevronDown size={16} />
+      </button>
+      <ul>
+        {visibleItems.map((item, index) => (
+          <li key={`${title}-${index}-${item}`}>{item}</li>
+        ))}
+      </ul>
+      {hiddenCount > 0 && (
+        <button className="ghost-button compact-button diagnostic-more" onClick={() => setOpen(true)} type="button">
+          <ChevronDown size={14} /> Show {hiddenCount} more
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -2363,7 +2592,7 @@ function AgentEvidence({ agent, status, artifacts }: { agent: string; status: st
             artifacts.map((artifact, index) => (
               <ArtifactResult
                 artifact={artifact}
-                defaultOpen
+                defaultOpen={defaultArtifactOpen(artifact, index, artifacts.length)}
                 key={`${artifact.agent}-${artifact.type}-${index}`}
               />
             ))
@@ -2372,6 +2601,12 @@ function AgentEvidence({ agent, status, artifacts }: { agent: string; status: st
       )}
     </article>
   );
+}
+
+function defaultArtifactOpen(artifact: Artifact, index: number, total: number) {
+  if (normalizeAgentStatus(artifact.status) === 'unavailable') return false;
+  if (total > 2) return index === 0;
+  return true;
 }
 
 function ArtifactResult({ artifact, defaultOpen = true }: { artifact: Artifact; defaultOpen?: boolean }) {
@@ -2408,25 +2643,40 @@ function QueryResultList({ items }: { items: QueryDisplayItem[] }) {
   return (
     <div className="query-result-list">
       {items.map((item) => (
-        <article className="query-result-card" key={item.id}>
-          <div className="query-result-head">
-            <strong>{item.name}</strong>
-            <span className={item.error ? 'query-status query-status-error' : 'query-status'}>{item.status}</span>
-          </div>
-          {item.facts.length > 0 && (
-            <div className="query-facts">
-              {item.facts.slice(0, 4).map((fact) => (
-                <span key={`${item.id}-${fact}`}>{fact}</span>
-              ))}
-            </div>
-          )}
-          {item.queryText && <CopyableBlock title={item.queryLabel} value={item.queryText} kind="code" />}
-          {item.preview !== undefined && (
-            <CopyableBlock title="Relevant result" value={formatArtifactValue(item.preview)} kind="pre" />
-          )}
-        </article>
+        <QueryResultCard item={item} key={item.id} />
       ))}
     </div>
+  );
+}
+
+function QueryResultCard({ item }: { item: QueryDisplayItem }) {
+  const previewText = item.preview === undefined ? '' : formatArtifactValue(item.preview);
+  const [open, setOpen] = useState(!item.error && previewText.length > 0 && previewText.length < 700);
+  return (
+    <article className="query-result-card">
+      <button className="query-result-toggle" onClick={() => setOpen((value) => !value)} type="button">
+        <div className="query-result-head">
+          <strong>{item.name}</strong>
+          <span className={item.error ? 'query-status query-status-error' : 'query-status'}>{item.status}</span>
+        </div>
+        <ChevronDown size={16} />
+      </button>
+      {item.facts.length > 0 && (
+        <div className="query-facts compact-query-facts">
+          {item.facts.slice(0, open ? 4 : 2).map((fact) => (
+            <span key={`${item.id}-${fact}`}>{fact}</span>
+          ))}
+        </div>
+      )}
+      {open && (
+        <>
+          {item.queryText && <CopyableBlock title={item.queryLabel} value={item.queryText} kind="code" />}
+          {item.preview !== undefined && (
+            <CopyableBlock title="Relevant result" value={previewText} kind="pre" />
+          )}
+        </>
+      )}
+    </article>
   );
 }
 
@@ -2702,14 +2952,16 @@ function buildChatContext(
       target_type: 'dashboard',
       active_view: activeView,
       incident_count: incidents.length,
-      alert_count: alerts.length,
+      alert_group_count: alerts.length,
+      alert_count: sumAlertOccurrences(alerts),
       open_incidents: incidents.filter((incident) => incident.status !== 'resolved').length,
-      firing_alerts: alerts.filter((alert) => alert.status !== 'resolved').length,
+      firing_alerts: sumAlertOccurrences(alerts.filter((alert) => alert.status !== 'resolved')),
       sample_incidents: incidents.slice(0, 5),
       sample_alerts: alerts.slice(0, 5).map((alert) => ({
         alert_id: alert.alert_id,
         incident_id: alert.incident_id,
         title: alert.alarm_title,
+        occurrence_count: alertOccurrenceCount(alert),
         severity: alert.severity,
         status: alert.status,
       })),
@@ -2740,8 +2992,9 @@ function alertChatContent(alert: AlertRecord) {
       `Title: ${alert.alarm_title}`,
       `Status: ${alert.status}`,
       `Severity: ${alert.severity}`,
-      `Labels: ${JSON.stringify(alert.labels)}`,
-      `Annotations: ${JSON.stringify(alert.annotations)}`,
+      `Occurrences: ${alertOccurrenceCount(alert)}`,
+      `Labels: ${safeJSONStringify(alert.labels)}`,
+      `Annotations: ${safeJSONStringify(alert.annotations)}`,
       `Summary: ${alert.analysis_summary}`,
       alert.analysis_detail,
       `Missing data: ${alert.missing_data.join(', ') || 'none'}`,
@@ -2847,6 +3100,23 @@ function analysisSourceClass(source: string) {
   return normalizeAnalysisSource(source);
 }
 
+function alertOccurrenceCount(alert: AlertRecord) {
+  const count = Number(alert.occurrence_count);
+  if (!Number.isFinite(count) || count < 1) {
+    return 1;
+  }
+  return Math.round(count);
+}
+
+function sumAlertOccurrences(alerts: AlertRecord[]) {
+  return alerts.reduce((total, alert) => total + alertOccurrenceCount(alert), 0);
+}
+
+function formatOccurrenceCount(alert: AlertRecord) {
+  const count = alertOccurrenceCount(alert);
+  return `${count} occurrence${count === 1 ? '' : 's'}`;
+}
+
 function buildAnalysisAnalytics(
   records: AnalysisRecord[],
   incidents: Incident[],
@@ -2864,7 +3134,7 @@ function buildAnalysisAnalytics(
   const resolvedDurations = windowedIncidents
     .map((incident) => durationMinutes(incident.fired_at, incident.resolved_at ?? ''))
     .filter((value) => value > 0);
-  const totalAlerts = windowedAlerts.length;
+  const totalAlerts = sumAlertOccurrences(windowedAlerts);
   const totalIncidents = windowedIncidents.length;
 
   return {
@@ -2874,8 +3144,8 @@ function buildAnalysisAnalytics(
       firingIncidents: windowedIncidents.filter((incident) => incident.status !== 'resolved').length,
       resolvedIncidents: windowedIncidents.filter((incident) => incident.status === 'resolved').length,
       totalAlerts,
-      firingAlerts: windowedAlerts.filter((alert) => alert.status !== 'resolved').length,
-      resolvedAlerts: windowedAlerts.filter((alert) => alert.status === 'resolved').length,
+      firingAlerts: sumAlertOccurrences(windowedAlerts.filter((alert) => alert.status !== 'resolved')),
+      resolvedAlerts: sumAlertOccurrences(windowedAlerts.filter((alert) => alert.status === 'resolved')),
       avgMttrMinutes: average(resolvedDurations),
       avgAlertsPerIncident: totalIncidents === 0 ? 0 : totalAlerts / totalIncidents,
       needsEvidence: windowedRecords.filter((record) => record.missingData.length > 0 || record.warnings.length > 0).length,
@@ -2883,11 +3153,11 @@ function buildAnalysisAnalytics(
     series: buildDailySeries(windowedIncidents, windowedAlerts, windowDays, anchorDate),
     breakdown: {
       incidentSeverity: countBy(windowedIncidents, (incident) => incident.severity || 'unknown'),
-      alertSeverity: countBy(windowedAlerts, (alert) => alert.severity || 'unknown'),
+      alertSeverity: countAlertOccurrencesBy(windowedAlerts, (alert) => alert.severity || 'unknown'),
       analysisQuality: countBy(windowedRecords, (record) => record.quality || 'pending'),
-      topNamespaces: countBy(windowedAlerts, (alert) => alert.labels.namespace || 'unknown').slice(0, 5),
-      topQueues: countBy(windowedAlerts, (alert) => alert.labels.queue || alert.labels.runai_queue || 'unknown').slice(0, 5),
-      topProjects: countBy(windowedAlerts, (alert) => projectNameFromLabels(alert.labels) || 'unknown').slice(0, 5),
+      topNamespaces: countAlertOccurrencesBy(windowedAlerts, (alert) => alert.labels.namespace || 'unknown').slice(0, 5),
+      topQueues: countAlertOccurrencesBy(windowedAlerts, (alert) => alert.labels.queue || alert.labels.runai_queue || 'unknown').slice(0, 5),
+      topProjects: countAlertOccurrencesBy(windowedAlerts, (alert) => projectNameFromLabels(alert.labels) || 'unknown').slice(0, 5),
     },
   };
 }
@@ -2926,7 +3196,7 @@ function buildDailySeries(
     const ended = activeEndDate(alert.fired_at, alert.resolved_at ?? '', alert.status);
     days.forEach(({ dayStart, dayEnd }, i) => {
       if (started < dayEnd && (!ended || ended >= dayStart)) {
-        points[i].alerts += 1;
+        points[i].alerts += alertOccurrenceCount(alert);
       }
     });
   });
@@ -2939,6 +3209,20 @@ function countBy<T>(items: T[], getKey: (item: T) => string): DistributionItem[]
   items.forEach((item) => {
     const key = getKey(item) || 'unknown';
     counts.set(key, (counts.get(key) ?? 0) + 1);
+  });
+  return [...counts.entries()]
+    .map(([key, count]) => ({ key, count }))
+    .sort((left, right) => {
+      if (right.count !== left.count) return right.count - left.count;
+      return left.key.localeCompare(right.key);
+    });
+}
+
+function countAlertOccurrencesBy(alerts: AlertRecord[], getKey: (alert: AlertRecord) => string): DistributionItem[] {
+  const counts = new Map<string, number>();
+  alerts.forEach((alert) => {
+    const key = getKey(alert) || 'unknown';
+    counts.set(key, (counts.get(key) ?? 0) + alertOccurrenceCount(alert));
   });
   return [...counts.entries()]
     .map(([key, count]) => ({ key, count }))
@@ -3134,8 +3418,15 @@ function Status({ value, analyzing = false }: { value: string; analyzing?: boole
 }
 
 function targetLine(labels: Record<string, string>) {
-  const project = projectNameFromLabels(labels) || 'project unknown';
+  const project = projectNameFromLabels(labels);
+  const namespace = labels.namespace || labels.kubernetes_namespace || '';
   const workload = labels.workload || labels.workload_name || labels.pod || 'workload unknown';
+  if (!project && namespace) {
+    return `Namespace ${namespace} / ${workload}`;
+  }
+  if (!project) {
+    return workload;
+  }
   return `${project} / ${workload}`;
 }
 

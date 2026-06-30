@@ -69,6 +69,13 @@ def make_settings() -> Settings:
         nat_config_file="configs/runai_rca_workflow.yml",
         enable_nat_runtime=False,
         nat_timeout_seconds=1,
+        typedb_address="",
+        typedb_database="runai_rca",
+        typedb_username="admin",
+        typedb_password="password",
+        typedb_tls_enabled=False,
+        typedb_timeout_seconds=1,
+        enable_typedb=False,
     )
 
 
@@ -145,6 +152,27 @@ async def test_loki_401_marks_auth_missing(monkeypatch) -> None:
     assert result.status == "unavailable"
     assert "loki.auth" in result.missing_data
     assert any("HTTP 401" in warning for warning in result.warnings)
+    assert any("Evicted" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_loki_401_from_gateway_points_to_direct_read_service(monkeypatch) -> None:
+    async def fake_get_json(**kwargs) -> SimpleNamespace:
+        return SimpleNamespace(
+            url=f"{kwargs['base_url']}{kwargs['path']}",
+            status_code=401,
+            error="HTTP 401",
+            data={"body": "unauthorized"},
+        )
+
+    monkeypatch.setattr("app.collectors.loki.get_json", fake_get_json)
+    collector = LokiCollector(replace(make_settings(), loki_url="http://loki-gateway.monitoring.svc"))
+
+    result = await collector.collect(make_target())
+
+    assert "loki.auth" in result.missing_data
+    assert any("gateway Basic Auth" in warning for warning in result.warnings)
+    assert any("direct loki-read service" in warning for warning in result.warnings)
 
 
 @pytest.mark.asyncio
@@ -268,8 +296,10 @@ async def test_analyze_returns_unified_artifacts() -> None:
         "postgres",
         "prometheus",
         "loki",
+        "typedb",
     }
     assert response.capabilities["runai"] in {"partial", "ok"}
+    assert response.capabilities["typedb"] == "unavailable"
 
 
 @pytest.mark.asyncio
@@ -308,6 +338,86 @@ async def test_analyze_includes_similar_incidents_and_feedback_hints() -> None:
     assert response.context["feedback_hints"][0]["source_id"] == "INC-000001"
     assert "## Similar Incidents" in response.analysis_detail
     assert "Operators confirmed quota saturation" in response.analysis_detail
+
+
+@pytest.mark.asyncio
+async def test_analyze_lists_grouped_pods() -> None:
+    orchestrator = AnalysisOrchestrator(make_settings())
+    response = await orchestrator.analyze(
+        AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={"alertname": "KubePodCrashLooping", "namespace": "monitoring"},
+                annotations={"summary": "Loki read pod is crash looping."},
+                fingerprint="fp-flap",
+            ),
+            occurrence_count=4,
+            occurrence_pods=[
+                "loki-read-7d9f8c6b5-x2k4p",
+                "loki-read-7d9f8c6b5-a1b2c",
+            ],
+        )
+    )
+
+    assert "## Affected Pods" in response.analysis_detail
+    assert "loki-read-7d9f8c6b5-x2k4p" in response.analysis_detail
+    assert "grouped from 4 occurrence" in response.analysis_detail
+    assert response.context["occurrence_count"] == 4
+    assert "loki-read-7d9f8c6b5-a1b2c" in response.context["occurrence_pods"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_isolates_collector_exceptions() -> None:
+    class ExplodingCollector:
+        async def collect(self, target):
+            raise RuntimeError("collector boom")
+
+    orchestrator = AnalysisOrchestrator(make_settings())
+    orchestrator._collectors = [ExplodingCollector()]
+
+    response = await orchestrator.analyze(
+        AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={"alertname": "RunAICollectorCrash", "namespace": "runai"},
+                annotations={"summary": "Collector crashed during RCA."},
+                fingerprint="fp-collector-crash",
+            )
+        )
+    )
+
+    assert response.status == "ok"
+    assert response.analysis_quality == "low"
+    assert response.capabilities["exploding"] == "unavailable"
+    assert "exploding.collector_exception" in response.missing_data
+    assert any("collector boom" in warning for warning in response.warnings)
+    assert "**exploding** [unavailable]" in response.analysis_detail
+
+
+@pytest.mark.asyncio
+async def test_analyze_falls_back_when_nat_runtime_raises(monkeypatch) -> None:
+    settings = replace(make_settings(), enable_nat_runtime=True)
+    orchestrator = AnalysisOrchestrator(settings)
+
+    async def broken_nat_run(payload):
+        raise RuntimeError("nat executable missing")
+
+    monkeypatch.setattr(orchestrator._nat, "run", broken_nat_run)
+
+    response = await orchestrator.analyze(
+        AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={"alertname": "RunAINatFailure", "namespace": "runai"},
+                annotations={"summary": "NAT failed but fallback should continue."},
+                fingerprint="fp-nat-failure",
+            )
+        )
+    )
+
+    assert response.status == "ok"
+    assert "NAT failed but fallback should continue" in response.analysis_detail
+    assert any("nemo failed unexpectedly" in warning for warning in response.warnings)
 
 
 @pytest.mark.asyncio
@@ -374,12 +484,18 @@ async def test_chat_uses_llm_when_configured(monkeypatch) -> None:
         captured["json_body"] = json_body
         return SimpleNamespace(
             ok=True,
-            data={"choices": [{"message": {"content": "Live LLM reply about the pending workload."}}]},
+            data={
+                "choices": [
+                    {"message": {"content": "Live LLM reply about the pending workload."}}
+                ]
+            },
         )
 
     monkeypatch.setattr("app.services.orchestrator.post_json", fake_post_json)
     orchestrator = AnalysisOrchestrator(settings)
-    response = await orchestrator.chat(ChatRequest(message="왜 워크로드가 멈췄어?", page="operations"))
+    response = await orchestrator.chat(
+        ChatRequest(message="왜 워크로드가 멈췄어?", page="operations")
+    )
 
     assert response.answer == "Live LLM reply about the pending workload."
     assert captured["url"] == "https://llm.example.com/v1/chat/completions"
@@ -403,6 +519,29 @@ async def test_chat_falls_back_when_llm_unavailable(monkeypatch) -> None:
     response = await orchestrator.chat(ChatRequest(message="status?", page="operations"))
 
     assert "## RCA Chat" in response.answer
+
+
+@pytest.mark.anyio
+async def test_chat_falls_back_when_llm_call_raises(monkeypatch) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.example.com/v1",
+        llm_model="rca-router",
+        llm_api_key="secret",
+    )
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        raise RuntimeError("LLM transport exploded")
+
+    monkeypatch.setattr("app.services.orchestrator.post_json", fake_post_json)
+    orchestrator = AnalysisOrchestrator(settings)
+    response = await orchestrator.chat(ChatRequest(message="status?", page="operations"))
+
+    assert response.status == "ok"
+    assert "## RCA Chat" in response.answer
+    assert "## Warnings" in response.answer
+    assert "llm failed unexpectedly" in response.answer
+    assert "LLM transport exploded" in response.answer
 
 
 def test_extract_nat_result_strips_console_wrapper() -> None:

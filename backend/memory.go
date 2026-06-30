@@ -145,6 +145,25 @@ func (s *Store) ApplyAnalysis(alertID string, response AgentAnalysisResponse) {
 	if alert == nil {
 		return
 	}
+	s.applyAnalysisLocked(alert, response)
+}
+
+// ApplyAnalysisForRun applies a completed RCA only when this run is still the
+// newest analysis run for the alert. Slow older runs may finish after a fresher
+// operator-triggered run; those stale results remain auditable in analysis_runs
+// but must not overwrite the visible RCA.
+func (s *Store) ApplyAnalysisForRun(runID string, alertID string, response AgentAnalysisResponse) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	alert := s.alerts[alertID]
+	if alert == nil || !s.isLatestAnalysisRunForAlertLocked(runID, alertID) {
+		return false
+	}
+	s.applyAnalysisLocked(alert, response)
+	return true
+}
+
+func (s *Store) applyAnalysisLocked(alert *AlertRecord, response AgentAnalysisResponse) {
 	alert.AnalysisSummary = response.AnalysisSummary
 	alert.AnalysisDetail = response.AnalysisDetail
 	if alert.AnalysisDetail == "" {
@@ -157,7 +176,7 @@ func (s *Store) ApplyAnalysis(alertID string, response AgentAnalysisResponse) {
 	alert.Artifacts = response.Artifacts
 	alert.IsAnalyzing = false
 	if incident := s.incidents[alert.IncidentID]; incident != nil {
-		incident.IsAnalyzing = false
+		s.refreshIncidentAnalyzingLocked(incident.IncidentID)
 		s.upsertMemoryLocked(incident, alert)
 		s.persistIncidentLocked(incident)
 	}
@@ -221,12 +240,29 @@ func (s *Store) ApplyFallbackAnalysisIfAbsent(alertID string, response AgentAnal
 	if alert == nil {
 		return false
 	}
+	return s.applyFallbackAnalysisIfAbsentLocked(alert, response)
+}
+
+// ApplyFallbackAnalysisIfAbsentForRun is the guarded version used by async run
+// completion. It prevents an older failed run from clearing the analyzing state
+// or surfacing fallback text after a newer run has already started.
+func (s *Store) ApplyFallbackAnalysisIfAbsentForRun(runID string, alertID string, response AgentAnalysisResponse) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	alert := s.alerts[alertID]
+	if alert == nil || !s.isLatestAnalysisRunForAlertLocked(runID, alertID) {
+		return false
+	}
+	return s.applyFallbackAnalysisIfAbsentLocked(alert, response)
+}
+
+func (s *Store) applyFallbackAnalysisIfAbsentLocked(alert *AlertRecord, response AgentAnalysisResponse) bool {
 	hasExistingRCA := strings.TrimSpace(alert.AnalysisSummary) != "" ||
 		strings.TrimSpace(alert.AnalysisDetail) != ""
 	if hasExistingRCA {
 		alert.IsAnalyzing = false
 		if incident := s.incidents[alert.IncidentID]; incident != nil {
-			incident.IsAnalyzing = false
+			s.refreshIncidentAnalyzingLocked(incident.IncidentID)
 			s.persistIncidentLocked(incident)
 		}
 		s.persistAlertLocked(alert)
@@ -244,11 +280,45 @@ func (s *Store) ApplyFallbackAnalysisIfAbsent(alertID string, response AgentAnal
 	alert.Artifacts = response.Artifacts
 	alert.IsAnalyzing = false
 	if incident := s.incidents[alert.IncidentID]; incident != nil {
-		incident.IsAnalyzing = false
+		s.refreshIncidentAnalyzingLocked(incident.IncidentID)
 		s.persistIncidentLocked(incident)
 	}
 	s.persistAlertLocked(alert)
 	return true
+}
+
+func (s *Store) isLatestAnalysisRunForAlertLocked(runID string, alertID string) bool {
+	if runID == "" || alertID == "" {
+		return true
+	}
+	current := s.analysisRuns[runID]
+	if current == nil {
+		return false
+	}
+	for _, other := range s.analysisRuns {
+		if other == nil || other.RunID == current.RunID || other.AlertID != alertID {
+			continue
+		}
+		if other.CreatedAt.After(current.CreatedAt) ||
+			(other.CreatedAt.Equal(current.CreatedAt) && other.RunID > current.RunID) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Store) refreshIncidentAnalyzingLocked(incidentID string) {
+	incident := s.incidents[incidentID]
+	if incident == nil {
+		return
+	}
+	incident.IsAnalyzing = false
+	for _, alert := range s.alerts {
+		if alert != nil && alert.IncidentID == incidentID && alert.IsAnalyzing {
+			incident.IsAnalyzing = true
+			return
+		}
+	}
 }
 
 func (s *Store) upsertMemoryLocked(incident *Incident, alert *AlertRecord) {

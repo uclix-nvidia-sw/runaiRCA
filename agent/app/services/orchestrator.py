@@ -20,6 +20,7 @@ from app.collectors.loki import LokiCollector
 from app.collectors.postgres import PostgresCollector
 from app.collectors.prometheus import PrometheusCollector
 from app.collectors.runai import RunAICollector
+from app.collectors.typedb import TypeDBCollector
 from app.config import Settings
 from app.knowledge import load_troubleshooting_cases
 from app.masking import Masker, build_masker
@@ -32,6 +33,7 @@ from app.schemas import (
     IncidentSummaryRequest,
     IncidentSummaryResponse,
 )
+from app.services.root_cause_ranking import RankedCause, rank_root_cause_candidates
 
 TModel = TypeVar("TModel", bound=BaseModel)
 
@@ -142,6 +144,7 @@ class AnalysisOrchestrator:
             PostgresCollector(settings),
             PrometheusCollector(settings),
             LokiCollector(settings),
+            TypeDBCollector(settings),
         ]
 
     async def analyze(self, request: AlertAnalysisRequest) -> AlertAnalysisResponse:
@@ -150,21 +153,31 @@ class AnalysisOrchestrator:
         nat_payload["mode"] = "alert_analysis"
         agent_souls = load_agent_souls(self._settings.agent_souls_file)
         nat_payload["agent_souls"] = agent_souls
-        nat_text = await self._nat.run(nat_payload)
+        nat_text = None
+        nat_warnings: list[str] = []
+        try:
+            nat_text = await self._nat.run(nat_payload)
+        except Exception as exc:
+            nat_warnings.append(_unexpected_runtime_warning("nemo", exc))
 
         results = await asyncio.gather(
-            *(collector.collect(target) for collector in self._collectors)
+            *(_collect_safely(collector, target) for collector in self._collectors)
         )
 
         capabilities = {result.agent: result.status for result in results}
         artifacts = [artifact for result in results for artifact in result.artifacts]
         missing = sorted({item for result in results for item in result.missing_data})
-        warnings = sorted({item for result in results for item in result.warnings})
+        warnings = sorted(
+            {item for result in results for item in result.warnings} | set(nat_warnings)
+        )
+        root_cause_candidates = rank_root_cause_candidates(
+            target, results, occurrence_count=request.occurrence_count
+        )
         quality = _quality_from(results)
-        summary = _summary_from(request, results)
+        summary = _summary_from(request, results, root_cause_candidates)
         playbook = load_troubleshooting_cases(self._settings.troubleshooting_cases_file)
         detail = nat_text if nat_text else _detail_from(
-            request, results, missing, playbook, agent_souls
+            request, results, missing, playbook, agent_souls, root_cause_candidates
         )
 
         response = AlertAnalysisResponse(
@@ -181,6 +194,8 @@ class AnalysisOrchestrator:
             context={
                 "target": target.__dict__,
                 "nemo_runtime": "enabled" if self._nat.enabled() else "fallback",
+                "occurrence_count": request.occurrence_count,
+                "occurrence_pods": request.occurrence_pods,
                 "similar_incidents": [
                     item.model_dump(mode="json") for item in request.similar_incidents
                 ],
@@ -189,6 +204,12 @@ class AnalysisOrchestrator:
                 ],
                 "agent_souls_file": self._settings.agent_souls_file,
                 "agent_souls_applied": bool(agent_souls),
+                "root_cause_candidates": [
+                    candidate.as_dict() for candidate in root_cause_candidates
+                ],
+                "top_root_cause": (
+                    root_cause_candidates[0].as_dict() if root_cause_candidates else None
+                ),
             },
             artifacts=artifacts,
         )
@@ -255,9 +276,14 @@ class AnalysisOrchestrator:
         grounding = _chat_answer_from_context(request, context, str(entity), self._masker)
         answer = grounding
         if llm_configured:
-            llm_answer = await self._llm_chat_answer(request, grounding)
-            if llm_answer:
-                answer = self._masker.mask_text(llm_answer)
+            try:
+                llm_answer = await self._llm_chat_answer(request, grounding)
+            except Exception as exc:
+                warning = self._masker.mask_text(_unexpected_runtime_warning("llm", exc))
+                answer = _append_chat_warning(grounding, warning)
+            else:
+                if llm_answer:
+                    answer = self._masker.mask_text(llm_answer)
         response = ChatResponse(
             status="ok",
             answer=answer,
@@ -281,7 +307,10 @@ class AnalysisOrchestrator:
             "model": self._settings.llm_model,
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": f"Grounded context:\n{grounding}\n\nQuestion: {question}"},
+                {
+                    "role": "user",
+                    "content": f"Grounded context:\n{grounding}\n\nQuestion: {question}",
+                },
             ],
             "temperature": 0.2,
         }
@@ -312,6 +341,40 @@ def _quality_from(results: list[CollectorResult]) -> str:
     return "low"
 
 
+async def _collect_safely(collector: object, target: object) -> CollectorResult:
+    try:
+        return await collector.collect(target)  # type: ignore[attr-defined]
+    except Exception as exc:
+        agent = _collector_name(collector)
+        return CollectorResult(
+            agent=agent,
+            status="unavailable",
+            summary=f"{agent} collector failed unexpectedly before returning evidence.",
+            confidence="low",
+            details={"error": f"{type(exc).__name__}: {exc}"},
+            missing_data=[f"{agent}.collector_exception"],
+            warnings=[_unexpected_runtime_warning(agent, exc)],
+        )
+
+
+def _collector_name(collector: object) -> str:
+    name = collector.__class__.__name__
+    if name.endswith("Collector"):
+        name = name[: -len("Collector")]
+    normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+    return normalized.replace("_a_i", "ai") or "collector"
+
+
+def _unexpected_runtime_warning(component: str, exc: Exception) -> str:
+    return f"{component} failed unexpectedly: {type(exc).__name__}: {exc}"
+
+
+def _append_chat_warning(answer: str, warning: str) -> str:
+    if "## Warnings" in answer:
+        return f"{answer}\n- {warning}"
+    return "\n".join([answer, "", "## Warnings", "", f"- {warning}"])
+
+
 def _build_settings_masker(settings: Settings) -> Masker:
     return build_masker(
         settings.masking_regex_list,
@@ -337,8 +400,12 @@ def _extract_nat_result(output: str) -> str | None:
     return result.strip() or None
 
 
-def _summary_from(request: AlertAnalysisRequest, results: list[CollectorResult]) -> str:
-    root_cause = _root_cause_statement(request)
+def _summary_from(
+    request: AlertAnalysisRequest,
+    results: list[CollectorResult],
+    root_cause_candidates: list[RankedCause],
+) -> str:
+    root_cause = _ranked_root_cause_statement(root_cause_candidates, request)
     unavailable = [result.agent for result in results if result.status == "unavailable"]
     if unavailable:
         return _short_sentence(
@@ -354,10 +421,11 @@ def _detail_from(
     missing: list[str],
     troubleshooting_cases: str = "",
     agent_souls: str = "",
+    root_cause_candidates: list[RankedCause] | None = None,
 ) -> str:
     labels = request.alert.labels
     annotations = request.alert.annotations
-    root_cause = _root_cause_statement(request)
+    root_cause = _ranked_root_cause_statement(root_cause_candidates or [], request)
     lines = [
         "## Root Cause",
         "",
@@ -366,15 +434,22 @@ def _detail_from(
         "The agent checked the configured Run:ai, Kubernetes, Prometheus, Loki, "
         "and Postgres collectors for this RCA. Confirmed evidence and missing "
         "collector data are listed below.",
-        "",
-        "## Evidence",
-        "",
     ]
+    lines.extend(_affected_pods_lines(request))
+    lines.extend(
+        [
+            "",
+            "## Evidence",
+            "",
+        ]
+    )
     for result in results:
         lines.append(f"- **{result.agent}** [{result.status}]: {result.summary}")
     highlight_lines = _evidence_highlight_lines(results)
     if highlight_lines:
         lines.extend(["", "## Evidence Highlights", "", *highlight_lines])
+    if root_cause_candidates:
+        lines.extend(_root_cause_candidate_lines(root_cause_candidates))
     operator_prompt = annotations.get("operator_prompt")
     if operator_prompt:
         lines.extend(
@@ -446,6 +521,50 @@ def _root_cause_statement(request: AlertAnalysisRequest) -> str:
         or "The alert fired before the agent could identify a precise root cause."
     )
     return _short_sentence(text, limit=320)
+
+
+def _ranked_root_cause_statement(
+    candidates: list[RankedCause], request: AlertAnalysisRequest
+) -> str:
+    if not candidates:
+        return _root_cause_statement(request)
+    top = candidates[0]
+    if top.family == "insufficient_evidence":
+        return _short_sentence(
+            "The collected evidence is insufficient to name a specific root-cause "
+            f"family with confidence. Alert context: {_root_cause_statement(request)}",
+            limit=320,
+        )
+    rationale = top.rationale[0] if top.rationale else _root_cause_statement(request)
+    return _short_sentence(
+        f"Most likely root-cause family: {_family_label(top.family)} "
+        f"({top.confidence} confidence). {rationale}.",
+        limit=320,
+    )
+
+
+def _root_cause_candidate_lines(candidates: list[RankedCause]) -> list[str]:
+    lines = ["", "## Root Cause Candidates", ""]
+    for candidate in candidates[:3]:
+        agents = ", ".join(candidate.evidence_agents) or "no corroborating agent"
+        lines.append(
+            f"- **{_family_label(candidate.family)}** "
+            f"({candidate.confidence}, score {candidate.score:.2f}; evidence: {agents})"
+        )
+        for rationale in candidate.rationale[:3]:
+            lines.append(f"  - {rationale}")
+    return lines
+
+
+def _family_label(family: str) -> str:
+    labels = {
+        "node_kubelet_pressure": "node kubelet pressure",
+        "scheduling_quota_exhaustion": "scheduling quota exhaustion",
+        "control_plane_error": "Run:ai control-plane error",
+        "workload_startup_image_failure": "workload startup/image failure",
+        "insufficient_evidence": "insufficient evidence",
+    }
+    return labels.get(family, family.replace("_", " "))
 
 
 def _short_sentence(value: str, *, limit: int) -> str:
@@ -536,7 +655,8 @@ def _recommended_action_lines(missing: list[str]) -> list[str]:
     lines = [
         "- Treat the Kubernetes and Prometheus evidence above as the current "
         "source of truth for this RCA.",
-        "- Apply the remediation implied by the confirmed scheduling, pod, node, or metric evidence.",
+        "- Apply the remediation implied by the confirmed scheduling, pod, node, "
+        "or metric evidence.",
     ]
     if "runai.auth" in missing or "runai.query" in missing:
         lines.append(
@@ -545,14 +665,37 @@ def _recommended_action_lines(missing: list[str]) -> list[str]:
         )
     if "loki.auth" in missing or "loki.query" in missing:
         lines.append(
-            "- Restore Loki tenant/auth configuration so the agent can attach "
-            "workload and Run:ai control-plane log lines on the next analysis run."
+            "- Fix Loki reachability for the next analysis run: prefer the direct "
+            "loki-read service, and only add tenant/auth settings when the endpoint "
+            "explicitly requires them."
         )
     if "postgres.query" in missing or "postgres.connection" in missing:
         lines.append(
             "- Restore Postgres connectivity so RCA memory and similar-incident "
             "evidence stay current."
         )
+    return lines
+
+
+def _affected_pods_lines(request: AlertAnalysisRequest) -> list[str]:
+    pods = [pod.strip() for pod in request.occurrence_pods if pod and pod.strip()]
+    count = request.occurrence_count
+    if not pods and count <= 1:
+        return []
+    lines = ["", "## Affected Pods", ""]
+    if count > 1:
+        lines.append(
+            f"- This alert was grouped from {count} occurrence(s) of the same workload; "
+            "the controller keeps recreating pods under new names, so treat the names "
+            "below as one cycling workload rather than separate failures."
+        )
+    if pods:
+        shown = pods[:20]
+        lines.extend(f"- `{pod}`" for pod in shown)
+        if len(pods) > len(shown):
+            lines.append(f"- … and {len(pods) - len(shown)} more pod(s)")
+    else:
+        lines.append("- Individual pod names were not present on the alert labels.")
     return lines
 
 

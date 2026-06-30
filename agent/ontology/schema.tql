@@ -1,0 +1,175 @@
+# Run:AI RCA ontology — TypeDB 3.x (TypeQL).
+#
+# The durable, store-independent model behind the RCA knowledge graph: typed
+# entities + relations + a root_cause taxonomy (5 families as sub-types).
+# Apply with:  python -m ontology.load_schema   (see agent/ontology/load_schema.py)
+#
+# ponytail: GPU capacity/demand are attributes on node/queue/project, not a
+# first-class `gpu` entity. Promote to an entity only if per-GPU facts are needed.
+
+define
+
+# --- attributes -------------------------------------------------------------
+attribute name, value string;
+attribute incident_id, value string;
+attribute alert_id, value string;
+attribute run_id, value string;
+attribute correlation_key, value string;
+attribute title, value string;
+attribute severity, value string;
+attribute status, value string;
+attribute alert_name, value string;
+attribute fingerprint, value string;
+attribute occurrence_count, value integer;
+attribute reason, value string;
+attribute condition_type, value string;
+attribute workload_type, value string;
+attribute workload_id, value string;
+attribute gpu_allocated, value double;
+attribute gpu_requested, value double;
+attribute source, value string;
+attribute summary, value string;
+attribute confidence, value string;
+attribute blast_radius, value string;
+attribute subtype, value string;
+attribute statement, value string;
+attribute created_at, value datetime;
+
+# --- entities ---------------------------------------------------------------
+entity cluster,
+    owns name @key,
+    plays scopes:scope;
+
+entity node,
+    owns name @key,
+    owns condition_type,
+    owns gpu_allocated,
+    plays runs_on:host,
+    plays scopes:member;
+
+entity namespace,
+    owns name @key,
+    plays contains:space;
+
+entity project,
+    owns name @key,
+    owns gpu_allocated,
+    owns gpu_requested,
+    plays in_project:project,
+    plays scopes:member;
+
+entity queue,
+    owns name @key,
+    owns gpu_allocated,
+    owns gpu_requested,
+    plays submitted_to:queue;
+
+entity workload,
+    owns name,
+    owns workload_type,
+    owns workload_id,
+    plays belongs_to:owner,
+    plays in_project:member,
+    plays submitted_to:job,
+    plays contains:occupant;
+
+entity pod,
+    owns name,
+    owns status,
+    plays runs_on:guest,
+    plays belongs_to:member,
+    plays contains:occupant;
+
+entity control_plane_component,
+    owns name,
+    plays emits:emitter,
+    plays contains:occupant;
+
+entity alert,
+    owns alert_id @key,
+    owns alert_name,
+    owns fingerprint,
+    owns severity,
+    owns status,
+    owns occurrence_count,
+    owns reason,
+    plays grouped_into:member;
+
+entity incident,
+    owns incident_id @key,
+    owns correlation_key,
+    owns title,
+    owns severity,
+    owns status,
+    owns created_at,
+    plays grouped_into:incident,
+    plays has_symptom:incident,
+    plays has_cause:incident,
+    plays analyzed_by:incident,
+    plays similar_to:this,
+    plays similar_to:other;
+
+entity analysis_run,
+    owns run_id @key,
+    owns source,
+    owns status,
+    owns confidence,
+    plays analyzed_by:run;
+
+entity symptom,
+    owns name,
+    owns reason,
+    owns condition_type,
+    plays has_symptom:symptom,
+    plays indicates:symptom,
+    plays supported_by:claim,
+    plays emits:signal;
+
+entity root_cause,
+    owns subtype,
+    owns confidence,
+    owns blast_radius,
+    owns statement,
+    plays has_cause:cause,
+    plays indicates:cause,
+    plays fixed_by:cause,
+    plays supported_by:claim;
+
+# root-cause taxonomy — all 5 families (see knowledge/troubleshooting_cases.md)
+entity node_kubelet_pressure sub root_cause;
+entity scheduling_quota_exhaustion sub root_cause;
+entity control_plane_error sub root_cause;
+entity workload_startup_image_failure sub root_cause;
+entity insufficient_evidence sub root_cause;
+
+entity action,
+    owns statement,
+    plays fixed_by:remedy;
+
+entity evidence,
+    owns source,
+    owns summary,
+    owns confidence,
+    plays supported_by:proof,
+    plays emits:signal;
+
+entity runbook,
+    owns name,
+    owns summary;
+
+# --- relations --------------------------------------------------------------
+relation scopes, relates scope, relates member;           # cluster scopes node/project
+relation runs_on, relates host, relates guest;            # node runs_on pod
+relation belongs_to, relates owner, relates member;       # workload belongs_to pod
+relation in_project, relates project, relates member;     # project <- workload
+relation submitted_to, relates queue, relates job;        # workload submitted_to queue
+relation contains, relates space, relates occupant;       # namespace contains pod/workload/component
+relation grouped_into, relates incident, relates member;  # incident <- alert
+relation has_symptom, relates incident, relates symptom;
+relation indicates, relates symptom, relates cause;       # symptom indicates root_cause
+relation has_cause, relates incident, relates cause;
+relation fixed_by, relates cause, relates remedy;         # root_cause fixed_by action
+relation supported_by, relates claim, relates proof;      # (symptom|root_cause) <- evidence
+relation analyzed_by, relates incident, relates run;
+relation similar_to, relates this, relates other;
+relation emits, relates emitter, relates signal;          # component emits evidence/symptom

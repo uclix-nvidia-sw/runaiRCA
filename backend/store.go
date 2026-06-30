@@ -32,6 +32,7 @@ type Store struct {
 	incidentByKey  map[string]string
 	alerts         map[string]*AlertRecord
 	alertByFinger  map[string]string
+	alertByGroup   map[string]string
 	memories       map[string]*IncidentMemory
 	feedback       map[string]*FeedbackRecord
 	comments       map[string]*CommentRecord
@@ -42,12 +43,33 @@ type Store struct {
 	pgvectorDetail string
 }
 
+type AlertUpsertResult struct {
+	Incident       *Incident
+	Alert          *AlertRecord
+	CorrelationKey string
+	NewIncident    bool
+	NewAlert       bool
+	Changed        bool
+}
+
+type DashboardSnapshot struct {
+	IncidentCount     int
+	OpenIncidentCount int
+	AlertCount        int
+	FiringAlertCount  int
+	AnalysisRunCount  int
+	AnalysisStatuses  map[string]int
+	RecentAlerts      []AlertRecord
+	RecentRuns        []AnalysisRun
+}
+
 func NewStore() *Store {
 	return &Store{
 		incidents:     make(map[string]*Incident),
 		incidentByKey: make(map[string]string),
 		alerts:        make(map[string]*AlertRecord),
 		alertByFinger: make(map[string]string),
+		alertByGroup:  make(map[string]string),
 		memories:      make(map[string]*IncidentMemory),
 		feedback:      make(map[string]*FeedbackRecord),
 		comments:      make(map[string]*CommentRecord),
@@ -75,6 +97,30 @@ func (s *Store) pgvectorLogState() string {
 	return "pgvector=disabled"
 }
 
+func pageRange(total, limit, offset int) (int, int) {
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	if limit <= 0 {
+		return offset, total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	return offset, end
+}
+
+func sameTimePtr(left, right *time.Time) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.Equal(*right)
+}
+
 func (s *Store) databaseHealth() map[string]any {
 	health := map[string]any{
 		"postgres":          s.dbReady,
@@ -98,6 +144,11 @@ func (s *Store) databaseHealth() map[string]any {
 }
 
 func (s *Store) UpsertAlert(webhook AlertmanagerWebhook, alert Alert) (*Incident, *AlertRecord) {
+	result := s.UpsertAlertResult(webhook, alert)
+	return result.Incident, result.Alert
+}
+
+func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) AlertUpsertResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -108,11 +159,20 @@ func (s *Store) UpsertAlert(webhook AlertmanagerWebhook, alert Alert) (*Incident
 		alert.Annotations = map[string]string{}
 	}
 	key := correlationKey(webhook, alert)
+	fingerprint := alertIdentity(alert)
+	storageKey := alertStorageKey(webhook, alert, key)
 	now := time.Now().UTC()
 	alertFiredAt := firstTime(alert.StartsAt, now)
 	alertID := ""
-	if alert.Fingerprint != "" {
-		alertID = s.alertByFinger[alert.Fingerprint]
+	if storageKey != "" {
+		alertID = s.alertByGroup[storageKey]
+	}
+	existingIDForFingerprint := ""
+	if fingerprint != "" {
+		existingIDForFingerprint = s.alertByFinger[fingerprint]
+	}
+	if alertID == "" && existingIDForFingerprint != "" {
+		alertID = existingIDForFingerprint
 	}
 	incidentID := ""
 	if alertID != "" {
@@ -130,20 +190,21 @@ func (s *Store) UpsertAlert(webhook AlertmanagerWebhook, alert Alert) (*Incident
 			incidentID = ""
 		}
 	}
+	newIncident := false
 	if incidentID == "" {
 		incidentID = nextID("INC", s.incidentSeq.Add(1))
 		s.incidentByKey[key] = incidentID
+		newIncident = true
 		s.incidents[incidentID] = &Incident{
 			IncidentID:     incidentID,
 			CorrelationKey: key,
-			Title:          incidentTitle(alert),
+			Title:          groupedIncidentTitle(alert, 1),
 			Severity:       severity(alert),
 			Status:         "firing",
 			FiredAt:        alertFiredAt,
 		}
 	}
 	incident := s.incidents[incidentID]
-	incident.AlertCount++
 	incident.Severity = maxSeverity(incident.Severity, severity(alert))
 	if alert.Status == "resolved" && incident.ResolvedAt == nil {
 		t := firstTime(alert.EndsAt, now)
@@ -156,25 +217,54 @@ func (s *Store) UpsertAlert(webhook AlertmanagerWebhook, alert Alert) (*Incident
 
 	if alertID == "" {
 		alertID = nextID("ALR", s.alertSeq.Add(1))
-		if alert.Fingerprint != "" {
-			s.alertByFinger[alert.Fingerprint] = alertID
-		}
+	}
+	if storageKey != "" {
+		s.alertByGroup[storageKey] = alertID
+	}
+	if fingerprint != "" {
+		s.alertByFinger[fingerprint] = alertID
 	}
 	record := s.alerts[alertID]
+	newAlert := record == nil
+	previousStatus := ""
+	previousSeverity := ""
+	previousFiredAt := time.Time{}
+	var previousResolvedAt *time.Time
+	previousOccurrenceCount := 0
 	if record == nil {
 		record = &AlertRecord{AlertID: alertID}
 		s.alerts[alertID] = record
+	} else {
+		previousStatus = record.Status
+		previousSeverity = record.Severity
+		previousFiredAt = record.FiredAt
+		previousResolvedAt = record.ResolvedAt
+		previousOccurrenceCount = record.OccurrenceCount
 	}
+	newOccurrence := newAlert || existingIDForFingerprint == "" || existingIDForFingerprint != alertID
+	if newOccurrence {
+		incident.AlertCount++
+	}
+	incident.Title = groupedIncidentTitle(alert, incident.AlertCount)
 	record.IncidentID = incidentID
-	record.AlarmTitle = incidentTitle(alert)
+	if record.OccurrenceCount <= 0 {
+		record.OccurrenceCount = 0
+	}
+	if newOccurrence {
+		record.OccurrenceCount++
+	}
+	if record.OccurrenceCount <= 0 {
+		record.OccurrenceCount = 1
+	}
+	record.OccurrencePods = appendOccurrencePod(record.OccurrencePods, podName(alert))
+	record.AlarmTitle = groupedIncidentTitle(alert, record.OccurrenceCount)
 	record.Severity = severity(alert)
 	record.Status = status(alert.Status)
 	record.FiredAt = alertFiredAt
-	record.Fingerprint = alert.Fingerprint
+	record.Fingerprint = fingerprint
 	record.ThreadTS = "thread-" + alertID
 	record.Labels = cloneMap(alert.Labels)
 	record.Annotations = cloneMap(alert.Annotations)
-	record.IsAnalyzing = true
 	if alert.Status == "resolved" {
 		t := firstTime(alert.EndsAt, now)
 		record.ResolvedAt = &t
@@ -188,9 +278,22 @@ func (s *Store) UpsertAlert(webhook AlertmanagerWebhook, alert Alert) (*Incident
 	if activityAt.After(incident.LatestActivityAt) {
 		incident.LatestActivityAt = activityAt
 	}
+	changed := newAlert ||
+		previousStatus != record.Status ||
+		previousSeverity != record.Severity ||
+		!previousFiredAt.Equal(record.FiredAt) ||
+		previousOccurrenceCount != record.OccurrenceCount ||
+		!sameTimePtr(previousResolvedAt, record.ResolvedAt)
 	s.persistIncidentLocked(incident)
 	s.persistAlertLocked(record)
-	return cloneIncident(incident), cloneAlert(record)
+	return AlertUpsertResult{
+		Incident:       cloneIncident(incident),
+		Alert:          cloneAlert(record),
+		CorrelationKey: key,
+		NewIncident:    newIncident,
+		NewAlert:       newAlert,
+		Changed:        changed,
+	}
 }
 
 func (s *Store) shouldReuseIncidentForAlertLocked(key string, incident *Incident, firedAt time.Time) bool {
@@ -209,39 +312,156 @@ func (s *Store) shouldReuseIncidentForAlertLocked(key string, incident *Incident
 }
 
 func (s *Store) ListIncidents() []Incident {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	items := make([]Incident, 0, len(s.incidents))
-	for _, incident := range s.incidents {
-		items = append(items, *cloneIncident(incident))
-	}
-	sort.Slice(items, func(i, j int) bool { return items[i].FiredAt.After(items[j].FiredAt) })
+	items, _ := s.ListIncidentsPage(0, 0)
 	return items
 }
 
-func (s *Store) ListAlerts() []AlertRecord {
+func (s *Store) ListIncidentsPage(limit, offset int) ([]Incident, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	items := make([]AlertRecord, 0, len(s.alerts))
+	ordered := make([]*Incident, 0, len(s.incidents))
+	for _, incident := range s.incidents {
+		ordered = append(ordered, incident)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].FiredAt.After(ordered[j].FiredAt) })
+	start, end := pageRange(len(ordered), limit, offset)
+	items := make([]Incident, 0, end-start)
+	for _, incident := range ordered[start:end] {
+		items = append(items, *cloneIncident(incident))
+	}
+	return items, len(ordered)
+}
+
+func (s *Store) ListAlerts() []AlertRecord {
+	items, _ := s.ListAlertsPage(0, 0)
+	return items
+}
+
+func (s *Store) ListAlertsPage(limit, offset int) ([]AlertRecord, int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ordered := make([]*AlertRecord, 0, len(s.alerts))
 	for _, alert := range s.alerts {
+		ordered = append(ordered, alert)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].FiredAt.After(ordered[j].FiredAt) })
+	start, end := pageRange(len(ordered), limit, offset)
+	items := make([]AlertRecord, 0, end-start)
+	for _, alert := range ordered[start:end] {
 		copied := cloneAlert(alert)
 		copied.SimilarIncidents = s.similarIncidentsLocked(alertFromRecord(*copied), alert.IncidentID, similarIncidentLimit)
 		copied.Feedback = s.feedbackSummaryLocked("alert", alert.AlertID)
 		items = append(items, *copied)
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].FiredAt.After(items[j].FiredAt) })
-	return items
+	return items, len(ordered)
 }
 
 func (s *Store) ListAnalysisRuns() []AnalysisRun {
+	items, _ := s.ListAnalysisRunsPage(0, 0)
+	return items
+}
+
+func (s *Store) ListAnalysisRunsPage(limit, offset int) ([]AnalysisRun, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	items := make([]AnalysisRun, 0, len(s.analysisRuns))
+	ordered := make([]*AnalysisRun, 0, len(s.analysisRuns))
 	for _, run := range s.analysisRuns {
+		ordered = append(ordered, run)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].CreatedAt.After(ordered[j].CreatedAt) })
+	start, end := pageRange(len(ordered), limit, offset)
+	items := make([]AnalysisRun, 0, end-start)
+	for _, run := range ordered[start:end] {
 		items = append(items, cloneAnalysisRun(run))
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].CreatedAt.After(items[j].CreatedAt) })
-	return items
+	return items, len(ordered)
+}
+
+func (s *Store) DashboardSnapshot(recentLimit int) DashboardSnapshot {
+	if recentLimit < 0 {
+		recentLimit = 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	snapshot := DashboardSnapshot{
+		AnalysisStatuses: map[string]int{},
+		RecentAlerts:     []AlertRecord{},
+		RecentRuns:       []AnalysisRun{},
+	}
+	alerts := make([]*AlertRecord, 0, len(s.alerts))
+	runs := make([]*AnalysisRun, 0, len(s.analysisRuns))
+	for _, incident := range s.incidents {
+		if incident == nil {
+			continue
+		}
+		snapshot.IncidentCount++
+		if incident.Status != "resolved" {
+			snapshot.OpenIncidentCount++
+		}
+	}
+	for _, alert := range s.alerts {
+		if alert == nil {
+			continue
+		}
+		snapshot.AlertCount++
+		if alert.Status != "resolved" {
+			snapshot.FiringAlertCount++
+		}
+		if recentLimit > 0 {
+			alerts = append(alerts, alert)
+		}
+	}
+	for _, run := range s.analysisRuns {
+		if run == nil {
+			continue
+		}
+		snapshot.AnalysisRunCount++
+		snapshot.AnalysisStatuses[first(run.Status, "unknown")]++
+		if recentLimit > 0 {
+			runs = append(runs, run)
+		}
+	}
+	sort.Slice(alerts, func(i, j int) bool { return alerts[i].FiredAt.After(alerts[j].FiredAt) })
+	sort.Slice(runs, func(i, j int) bool { return runs[i].CreatedAt.After(runs[j].CreatedAt) })
+	if len(alerts) > recentLimit {
+		alerts = alerts[:recentLimit]
+	}
+	if len(runs) > recentLimit {
+		runs = runs[:recentLimit]
+	}
+	for _, alert := range alerts {
+		snapshot.RecentAlerts = append(snapshot.RecentAlerts, *cloneAlert(alert))
+	}
+	for _, run := range runs {
+		snapshot.RecentRuns = append(snapshot.RecentRuns, cloneAnalysisRun(run))
+	}
+	return snapshot
+}
+
+func (s *Store) LatestAlertID() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var latest *AlertRecord
+	var latestFiring *AlertRecord
+	for _, alert := range s.alerts {
+		if alert == nil {
+			continue
+		}
+		if latest == nil || alert.FiredAt.After(latest.FiredAt) {
+			latest = alert
+		}
+		if alert.Status != "resolved" && (latestFiring == nil || alert.FiredAt.After(latestFiring.FiredAt)) {
+			latestFiring = alert
+		}
+	}
+	if latestFiring != nil {
+		return latestFiring.AlertID
+	}
+	if latest != nil {
+		return latest.AlertID
+	}
+	return ""
 }
 
 func (s *Store) CreateAnalysisRun(
@@ -253,10 +473,24 @@ func (s *Store) CreateAnalysisRun(
 	title string,
 	prompt string,
 ) AnalysisRun {
+	run, _ := s.CreateAnalysisRunIfAllowed(source, targetType, targetID, incidentID, alertID, title, prompt)
+	return run
+}
+
+func (s *Store) CreateAnalysisRunIfAllowed(
+	source string,
+	targetType string,
+	targetID string,
+	incidentID string,
+	alertID string,
+	title string,
+	prompt string,
+) (AnalysisRun, bool) {
+	source = first(source, "manual")
 	now := time.Now().UTC()
 	run := &AnalysisRun{
 		RunID:        nextID("ANL", s.analysisRunSeq.Add(1)),
-		Source:       first(source, "manual"),
+		Source:       source,
 		Status:       "analyzing",
 		TargetType:   targetType,
 		TargetID:     targetID,
@@ -273,9 +507,37 @@ func (s *Store) CreateAnalysisRun(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if source == "auto" {
+		if existing := s.latestAutoAnalysisRunLocked(incidentID); existing != nil {
+			return cloneAnalysisRun(existing), false
+		}
+	}
 	s.analysisRuns[run.RunID] = run
 	s.persistAnalysisRunLocked(run)
-	return cloneAnalysisRun(run)
+	return cloneAnalysisRun(run), true
+}
+
+func (s *Store) ExistingAutoAnalysisRun(incidentID string) (AnalysisRun, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	selected := s.latestAutoAnalysisRunLocked(incidentID)
+	if selected == nil {
+		return AnalysisRun{}, false
+	}
+	return cloneAnalysisRun(selected), true
+}
+
+func (s *Store) latestAutoAnalysisRunLocked(incidentID string) *AnalysisRun {
+	var selected *AnalysisRun
+	for _, run := range s.analysisRuns {
+		if run == nil || run.Source != "auto" || run.IncidentID != incidentID {
+			continue
+		}
+		if selected == nil || run.CreatedAt.After(selected.CreatedAt) {
+			selected = run
+		}
+	}
+	return selected
 }
 
 func (s *Store) CompleteAnalysisRun(runID string, response AgentAnalysisResponse) (AnalysisRun, bool) {
@@ -396,6 +658,52 @@ func (s *Store) AnalysisTarget(targetType string, targetID string) (Alert, strin
 	default:
 		return Alert{}, "", "", "", "", false
 	}
+}
+
+// OccurrenceSummaryForTarget returns the distinct concrete pod names and the
+// total occurrence count behind an analysis target, aggregated across the grouped
+// alert rows. It lets the agent reason about which pods cycled even though the
+// flapping was collapsed into one row to protect the store.
+func (s *Store) OccurrenceSummaryForTarget(incidentID string, alertID string) ([]string, int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	pods := []string{}
+	seen := map[string]struct{}{}
+	count := 0
+	add := func(record *AlertRecord) {
+		if record == nil {
+			return
+		}
+		count += record.OccurrenceCount
+		for _, pod := range record.OccurrencePods {
+			if pod == "" {
+				continue
+			}
+			if _, ok := seen[pod]; ok {
+				continue
+			}
+			seen[pod] = struct{}{}
+			pods = append(pods, pod)
+		}
+	}
+	if incidentID != "" {
+		records := make([]*AlertRecord, 0)
+		for _, record := range s.alerts {
+			if record != nil && record.IncidentID == incidentID {
+				records = append(records, record)
+			}
+		}
+		sort.Slice(records, func(i, j int) bool { return records[i].FiredAt.After(records[j].FiredAt) })
+		for _, record := range records {
+			add(record)
+		}
+	} else if alertID != "" {
+		add(s.alerts[alertID])
+	}
+	if len(pods) > maxOccurrencePods {
+		pods = pods[:maxOccurrencePods]
+	}
+	return pods, count
 }
 
 func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {

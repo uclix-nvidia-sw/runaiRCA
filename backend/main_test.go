@@ -6,6 +6,9 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -46,6 +49,348 @@ func TestAlertmanagerWebhookCreatesIncidentAndAlert(t *testing.T) {
 	}
 	if len(server.store.ListAlerts()) != 1 {
 		t.Fatalf("expected one alert")
+	}
+}
+
+func TestAlertmanagerWebhookGroupsDiskPressureStormIntoOneAutoAnalysis(t *testing.T) {
+	server := NewServer()
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Node disk pressure is evicting Loki read pods.",
+			AnalysisDetail:  "Disk pressure eviction storm was grouped into one RCA.",
+			AnalysisQuality: "medium",
+			Capabilities:    map[string]string{"kubernetes": "ok"},
+		})
+	}))
+	defer agent.Close()
+	server.agentURL = agent.URL
+
+	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
+	alerts := make([]Alert, 0, 3)
+	for i, pod := range []string{"loki-read-a", "loki-read-b", "loki-read-c"} {
+		alerts = append(alerts, Alert{
+			Status: "firing",
+			Labels: map[string]string{
+				"alertname": "KubePodEvicted",
+				"severity":  "warning",
+				"cluster":   "lab",
+				"namespace": "monitoring",
+				"pod":       pod,
+				"node":      "k8s-lb-02",
+				"reason":    "Evicted",
+			},
+			Annotations: map[string]string{
+				"summary":     "Pod was evicted",
+				"description": "The node had disk pressure.",
+			},
+			Fingerprint: "fp-disk-pressure-" + strconv.Itoa(i),
+			StartsAt:    base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
+		})
+	}
+	payload, _ := json.Marshal(AlertmanagerWebhook{GroupKey: "disk-pressure-storm", Alerts: alerts})
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload)))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["accepted"].(float64) != 3 || response["auto_analyses"].(float64) != 1 {
+		t.Fatalf("unexpected webhook response: %+v", response)
+	}
+	incidents := server.store.ListIncidents()
+	if len(incidents) != 1 || incidents[0].AlertCount != 3 {
+		t.Fatalf("expected one grouped incident with three alerts, got %+v", incidents)
+	}
+	if !strings.Contains(strings.ToLower(incidents[0].Title), "disk pressure") {
+		t.Fatalf("expected disk pressure grouped title, got %q", incidents[0].Title)
+	}
+	groupedAlerts := server.store.ListAlerts()
+	if len(groupedAlerts) != 1 || groupedAlerts[0].OccurrenceCount != 3 {
+		t.Fatalf("expected one grouped alert row with three occurrences, got %+v", groupedAlerts)
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 || runs[0].TargetType != "incident" {
+		t.Fatalf("expected one incident-level analysis run, got %+v", runs)
+	}
+}
+
+func TestAlertmanagerWebhookDoesNotCreateAnalysisForRepeatedAlert(t *testing.T) {
+	server := NewServer()
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Repeated alert was deduplicated.",
+			AnalysisDetail:  "Only the first webhook created an automatic RCA run.",
+			AnalysisQuality: "medium",
+		})
+	}))
+	defer agent.Close()
+	server.agentURL = agent.URL
+
+	alert := Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "KubePodEvicted",
+			"severity":  "warning",
+			"namespace": "monitoring",
+			"pod":       "loki-read-a",
+			"node":      "k8s-lb-02",
+			"reason":    "Evicted",
+		},
+		Annotations: map[string]string{"summary": "Pod was evicted"},
+		StartsAt:    "2026-06-30T10:00:00Z",
+	}
+	payload, _ := json.Marshal(AlertmanagerWebhook{GroupKey: "repeat-no-fingerprint", Alerts: []Alert{alert}})
+
+	server.routes().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload)))
+	server.routes().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload)))
+
+	incidents := server.store.ListIncidents()
+	if len(incidents) != 1 || incidents[0].AlertCount != 1 {
+		t.Fatalf("expected repeated alert to upsert, got incidents=%+v", incidents)
+	}
+	alerts := server.store.ListAlerts()
+	if len(alerts) != 1 || alerts[0].OccurrenceCount != 1 {
+		t.Fatalf("expected one synthetic alert identity without counting resends, got %+v", alerts)
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 {
+		t.Fatalf("expected one auto analysis run for repeated webhook, got %+v", runs)
+	}
+}
+
+func TestAlertmanagerWebhookGroupsPodSuffixFlappingIntoOneAutoAnalysis(t *testing.T) {
+	server := NewServer()
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Loki read pods are crash-looping under one workload.",
+			AnalysisDetail:  "Pod-suffix flapping was grouped into one RCA.",
+			AnalysisQuality: "medium",
+		})
+	}))
+	defer agent.Close()
+	server.agentURL = agent.URL
+
+	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
+	// Same workload (loki-read), but the controller keeps recreating the pod under a
+	// new randomized name. Each occurrence carries its own fingerprint, exactly the
+	// Loki flapping shape that flooded the store.
+	pods := []string{
+		"loki-read-7d9f8c6b5-x2k4p",
+		"loki-read-7d9f8c6b5-a1b2c",
+		"loki-read-7d9f8c6b5-z9y8x",
+		"loki-read-7d9f8c6b5-q7w8e",
+	}
+	alerts := make([]Alert, 0, len(pods))
+	for i, pod := range pods {
+		alerts = append(alerts, Alert{
+			Status: "firing",
+			Labels: map[string]string{
+				"alertname": "KubePodCrashLooping",
+				"severity":  "warning",
+				"cluster":   "lab",
+				"namespace": "monitoring",
+				"pod":       pod,
+			},
+			Annotations: map[string]string{"summary": "Loki read pod is crash looping"},
+			Fingerprint: "fp-loki-flap-" + strconv.Itoa(i),
+			StartsAt:    base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
+		})
+	}
+	payload, _ := json.Marshal(AlertmanagerWebhook{GroupKey: "loki-crashloop", Alerts: alerts})
+
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload)))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	incidents := server.store.ListIncidents()
+	if len(incidents) != 1 || incidents[0].AlertCount != len(pods) {
+		t.Fatalf("expected one grouped incident covering every pod, got %+v", incidents)
+	}
+	groupedAlerts := server.store.ListAlerts()
+	if len(groupedAlerts) != 1 || groupedAlerts[0].OccurrenceCount != len(pods) {
+		t.Fatalf("expected one grouped alert row with %d occurrences, got %+v", len(pods), groupedAlerts)
+	}
+	// The row is grouped by workload, but every concrete pod name stays on record.
+	gotPods := append([]string{}, groupedAlerts[0].OccurrencePods...)
+	sort.Strings(gotPods)
+	wantPods := append([]string{}, pods...)
+	sort.Strings(wantPods)
+	if !reflect.DeepEqual(gotPods, wantPods) {
+		t.Fatalf("expected occurrence pods %v, got %v", wantPods, gotPods)
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 {
+		t.Fatalf("expected one auto analysis run for the grouped workload, got %d", len(runs))
+	}
+
+	// A second webhook of the same flapping workload must not create new rows.
+	rec = httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload)))
+	if got := len(server.store.ListAlerts()); got != 1 {
+		t.Fatalf("expected resend to stay on one alert row, got %d", got)
+	}
+	if got := len(server.store.ListAnalysisRuns()); got != 1 {
+		t.Fatalf("expected resend to not add analysis runs, got %d", got)
+	}
+}
+
+func TestNormalizePodName(t *testing.T) {
+	cases := map[string]string{
+		"loki-read-7d9f8c6b5-x2k4p": "loki-read",    // Deployment: hash + random suffix
+		"loki-read-x2k4p":           "loki-read",    // DaemonSet: random suffix only
+		"trainer-0":                 "trainer",      // StatefulSet ordinal
+		"trainer-12":                "trainer",      // StatefulSet ordinal (multi-digit)
+		"gpu-operator":              "gpu-operator", // already a bare workload name
+		"":                          "",             // empty stays empty
+	}
+	for pod, want := range cases {
+		if got := normalizePodName(pod); got != want {
+			t.Fatalf("normalizePodName(%q) = %q, want %q", pod, got, want)
+		}
+	}
+}
+
+func TestListAlertsSupportsPagination(t *testing.T) {
+	server := NewServer()
+	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
+	// Distinct workloads so each upserts its own alert row (grouping collapses
+	// same-workload pods into one occurrence-counted row, which is tested elsewhere).
+	workloads := []string{"queue-controller", "gpu-feeder", "scheduler"}
+	for i, workload := range workloads {
+		server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "page-test-" + strconv.Itoa(i)}, Alert{
+			Status: "firing",
+			Labels: map[string]string{
+				"alertname": "RunAIQueueBlocked",
+				"severity":  "warning",
+				"namespace": "monitoring",
+				"pod":       workload + "-" + strconv.Itoa(i),
+			},
+			Annotations: map[string]string{"summary": "Run:AI queue blocked"},
+			StartsAt:    base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
+			Fingerprint: "fp-page-" + strconv.Itoa(i),
+		})
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/alerts?limit=1&offset=1", nil)
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var response struct {
+		Status     string         `json:"status"`
+		Data       []AlertRecord  `json:"data"`
+		Pagination paginationInfo `json:"pagination"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Data) != 1 {
+		t.Fatalf("expected one alert page item, got %d", len(response.Data))
+	}
+	if response.Pagination.Total != 3 || response.Pagination.Limit != 1 || response.Pagination.Offset != 1 || !response.Pagination.HasMore {
+		t.Fatalf("unexpected pagination: %+v", response.Pagination)
+	}
+}
+
+func TestDashboardSnapshotCountsAllRowsButBoundsRecentItems(t *testing.T) {
+	store := NewStore()
+	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
+	alertIDs := []string{}
+	incidentIDs := []string{}
+	for i := 0; i < 8; i++ {
+		status := "firing"
+		if i%3 == 0 {
+			status = "resolved"
+		}
+		incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "snapshot-" + strconv.Itoa(i)}, Alert{
+			Status: status,
+			Labels: map[string]string{
+				"alertname": "RunAIQueueBlocked",
+				"severity":  "warning",
+				"namespace": "runai",
+				"workload":  "trainer_" + strconv.Itoa(i),
+			},
+			Annotations: map[string]string{"summary": "Queue blocked"},
+			Fingerprint: "fp-snapshot-" + strconv.Itoa(i),
+			StartsAt:    base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
+			EndsAt:      base.Add(time.Duration(i+1) * time.Minute).Format(time.RFC3339),
+		})
+		alertIDs = append(alertIDs, alert.AlertID)
+		incidentIDs = append(incidentIDs, incident.IncidentID)
+	}
+	complete := store.CreateAnalysisRun("manual", "alert", alertIDs[0], incidentIDs[0], alertIDs[0], "complete", "")
+	store.CompleteAnalysisRun(complete.RunID, AgentAnalysisResponse{Status: "ok", AnalysisSummary: "done"})
+	failed := store.CreateAnalysisRun("comment", "alert", alertIDs[1], incidentIDs[1], alertIDs[1], "failed", "")
+	store.FailAnalysisRun(failed.RunID, AgentAnalysisResponse{Status: "error", AnalysisSummary: "failed"})
+	store.CreateAnalysisRun("chat", "alert", alertIDs[2], incidentIDs[2], alertIDs[2], "running", "")
+
+	snapshot := store.DashboardSnapshot(3)
+
+	if snapshot.IncidentCount != 8 || snapshot.AlertCount != 8 || snapshot.AnalysisRunCount != 3 {
+		t.Fatalf("snapshot counts should include all rows, got %+v", snapshot)
+	}
+	if snapshot.FiringAlertCount != 5 || snapshot.OpenIncidentCount != 5 {
+		t.Fatalf("snapshot status counts are wrong: %+v", snapshot)
+	}
+	if len(snapshot.RecentAlerts) != 3 || len(snapshot.RecentRuns) != 3 {
+		t.Fatalf("snapshot recent rows should be capped at 3, got alerts=%d runs=%d", len(snapshot.RecentAlerts), len(snapshot.RecentRuns))
+	}
+	if snapshot.RecentAlerts[0].Fingerprint != "fp-snapshot-7" {
+		t.Fatalf("expected latest alert first, got %+v", snapshot.RecentAlerts[0])
+	}
+	if snapshot.AnalysisStatuses["complete"] != 1 ||
+		snapshot.AnalysisStatuses["failed"] != 1 ||
+		snapshot.AnalysisStatuses["analyzing"] != 1 {
+		t.Fatalf("unexpected analysis status counts: %+v", snapshot.AnalysisStatuses)
+	}
+}
+
+func TestLatestAlertIDPrefersNewestFiringAlert(t *testing.T) {
+	store := NewStore()
+	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
+	_, firing := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "latest-firing"}, Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIQueueBlocked",
+			"severity":  "warning",
+			"namespace": "runai",
+			"workload":  "trainer-firing",
+		},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-latest-firing",
+		StartsAt:    base.Format(time.RFC3339),
+	})
+	_, resolved := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "latest-resolved"}, Alert{
+		Status: "resolved",
+		Labels: map[string]string{
+			"alertname": "RunAIQueueBlocked",
+			"severity":  "warning",
+			"namespace": "runai",
+			"workload":  "trainer-resolved",
+		},
+		Annotations: map[string]string{"summary": "Queue recovered"},
+		Fingerprint: "fp-latest-resolved",
+		StartsAt:    base.Add(time.Hour).Format(time.RFC3339),
+		EndsAt:      base.Add(time.Hour).Format(time.RFC3339),
+	})
+
+	if got := store.LatestAlertID(); got != firing.AlertID {
+		t.Fatalf("expected latest firing alert to win over newer resolved alert, got %s", got)
+	}
+	store.mu.Lock()
+	store.alerts[firing.AlertID].Status = "resolved"
+	store.mu.Unlock()
+	if got := store.LatestAlertID(); got != resolved.AlertID {
+		t.Fatalf("expected newest resolved alert when no firing alert remains, got %s", got)
 	}
 }
 
@@ -142,6 +487,31 @@ func TestAlertmanagerWebhookReportsAcceptedAndIgnoredCounts(t *testing.T) {
 	}
 }
 
+func TestAlertmanagerWebhookRejectsTooManyAlerts(t *testing.T) {
+	server := NewServer()
+	alerts := make([]Alert, maxWebhookAlerts+1)
+	for i := range alerts {
+		alerts[i] = Alert{
+			Status:      "firing",
+			Labels:      map[string]string{"alertname": "RunAIWorkloadPending", "severity": "warning"},
+			Annotations: map[string]string{"summary": "Workload pending"},
+			Fingerprint: "fp-too-many-" + strconv.Itoa(i),
+		}
+	}
+	payload, _ := json.Marshal(AlertmanagerWebhook{GroupKey: "too-many", Alerts: alerts})
+	req := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(server.store.ListIncidents()) != 0 || len(server.store.ListAnalysisRuns()) != 0 {
+		t.Fatalf("rejected webhook should not mutate store")
+	}
+}
+
 func TestAgentRequestTimeoutConfig(t *testing.T) {
 	t.Setenv("AGENT_REQUEST_TIMEOUT_SECONDS", "7")
 	server := NewServer()
@@ -151,6 +521,19 @@ func TestAgentRequestTimeoutConfig(t *testing.T) {
 	}
 	if server.client.Timeout != 0 {
 		t.Fatalf("expected http client to rely on per-request contexts, got %s", server.client.Timeout)
+	}
+}
+
+func TestChatRejectsOversizedBody(t *testing.T) {
+	server := NewServer()
+	payload := []byte(`{"message":"` + strings.Repeat("x", int(maxJSONBodyBytes)+1) + `"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -603,7 +986,7 @@ func TestSimilarIncidentsLimitAndLatestTieBreak(t *testing.T) {
 	}
 }
 
-func TestFlappingAlertGroupingUsesNamespacePodAndWindow(t *testing.T) {
+func TestFlappingAlertGroupingUsesNamespaceWorkloadAndWindow(t *testing.T) {
 	store := NewStore()
 	base := time.Date(2026, 6, 26, 9, 0, 0, 0, time.UTC)
 	makeAlert := func(namespace, pod, fingerprint string, at time.Time) Alert {
@@ -622,23 +1005,25 @@ func TestFlappingAlertGroupingUsesNamespacePodAndWindow(t *testing.T) {
 		}
 	}
 
-	firstIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-0", "fp-flap-1", base))
-	sameTargetIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-0", "fp-flap-2", base.Add(10*time.Minute)))
-	if sameTargetIncident.IncidentID != firstIncident.IncidentID {
-		t.Fatalf("same namespace/pod alert inside window should group: %s != %s", sameTargetIncident.IncidentID, firstIncident.IncidentID)
+	firstIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-7d9f8c6b5-aaaa1", "fp-flap-1", base))
+	// Same workload, fresh controller-generated pod name inside the window: this is
+	// the Loki/CrashLoop flapping shape, and it must collapse onto one incident.
+	rotatedPodIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-7d9f8c6b5-bbbb2", "fp-flap-2", base.Add(10*time.Minute)))
+	if rotatedPodIncident.IncidentID != firstIncident.IncidentID {
+		t.Fatalf("same-workload alert with a rotated pod suffix inside window should group: %s != %s", rotatedPodIncident.IncidentID, firstIncident.IncidentID)
 	}
 
-	differentNamespaceIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-b", "trainer-0", "fp-flap-3", base.Add(11*time.Minute)))
+	differentNamespaceIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-b", "trainer-7d9f8c6b5-cccc3", "fp-flap-3", base.Add(11*time.Minute)))
 	if differentNamespaceIncident.IncidentID == firstIncident.IncidentID {
 		t.Fatalf("alerts from different namespaces must not group")
 	}
-	differentPodIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-1", "fp-flap-4", base.Add(12*time.Minute)))
-	if differentPodIncident.IncidentID == firstIncident.IncidentID {
-		t.Fatalf("alerts from different pods must not group")
+	differentWorkloadIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "inference-5c8f9d7a4-dddd4", "fp-flap-4", base.Add(12*time.Minute)))
+	if differentWorkloadIncident.IncidentID == firstIncident.IncidentID {
+		t.Fatalf("alerts from different workloads must not group")
 	}
-	outsideWindowIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-0", "fp-flap-5", base.Add(45*time.Minute)))
+	outsideWindowIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-7d9f8c6b5-eeee5", "fp-flap-5", base.Add(45*time.Minute)))
 	if outsideWindowIncident.IncidentID == firstIncident.IncidentID {
-		t.Fatalf("same namespace/pod alert outside flapping window should start a new incident")
+		t.Fatalf("same-workload alert outside flapping window should start a new incident")
 	}
 }
 

@@ -148,8 +148,16 @@ async def _collect_kubernetes_responses(
             )
         )
     elif target.namespace and target_namespace_allowed:
-        requests.append(("namespace_pods", f"/api/v1/namespaces/{namespace}/pods", _list_params(settings)))
-        requests.append(("namespace_events", f"/api/v1/namespaces/{namespace}/events", _list_params(settings)))
+        requests.append(
+            ("namespace_pods", f"/api/v1/namespaces/{namespace}/pods", _list_params(settings))
+        )
+        requests.append(
+            (
+                "namespace_events",
+                f"/api/v1/namespaces/{namespace}/events",
+                _list_params(settings),
+            )
+        )
     if target.node and settings.kubernetes_cluster_scope_enabled:
         node = quote(target.node, safe="")
         requests.append(("node", f"/api/v1/nodes/{node}", None))

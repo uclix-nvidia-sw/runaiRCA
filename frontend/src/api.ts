@@ -1,4 +1,4 @@
-import { AlertRecord, AnalysisRun, Envelope, FeedbackSummary, Incident, IncidentDetail } from './types';
+import { AlertRecord, AnalysisRun, Envelope, FeedbackSummary, Incident, IncidentDetail, PageInfo } from './types';
 
 const runtimeApiBase = window.__RUNAI_RCA_CONFIG__?.apiBaseUrl;
 const fallbackApiBase = import.meta.env.DEV ? 'http://localhost:8080' : '';
@@ -7,6 +7,8 @@ const API_BASE = configuredApiBase ?? fallbackApiBase;
 const FEEDBACK_ACTOR_KEY = 'runai-rca-feedback-actor';
 
 export type FeedbackVote = 'up' | 'down' | 'none';
+export type PageRequest = { limit: number; offset: number };
+export type PageResult<T> = { items: T[]; page: PageInfo };
 
 async function read<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`);
@@ -32,8 +34,9 @@ async function mutate<T>(method: string, path: string, body?: unknown): Promise<
   return response.json() as Promise<T>;
 }
 
-export async function fetchIncidents(): Promise<Incident[]> {
-  return (await read<Envelope<Incident[]>>('/api/v1/incidents')).data;
+export async function fetchIncidents(page?: PageRequest): Promise<PageResult<Incident>> {
+  const response = await read<Envelope<Incident[]>>(`/api/v1/incidents${pageQuery(page)}`);
+  return pageResult(response, page);
 }
 
 export async function fetchIncident(id: string): Promise<IncidentDetail> {
@@ -44,12 +47,14 @@ export async function fetchIncident(id: string): Promise<IncidentDetail> {
   ).data;
 }
 
-export async function fetchAlerts(): Promise<AlertRecord[]> {
-  return (await read<Envelope<AlertRecord[]>>('/api/v1/alerts')).data;
+export async function fetchAlerts(page?: PageRequest): Promise<PageResult<AlertRecord>> {
+  const response = await read<Envelope<AlertRecord[]>>(`/api/v1/alerts${pageQuery(page)}`);
+  return pageResult(response, page);
 }
 
-export async function fetchAnalysisRuns(): Promise<AnalysisRun[]> {
-  return (await read<Envelope<AnalysisRun[]>>('/api/v1/analysis-runs')).data;
+export async function fetchAnalysisRuns(page?: PageRequest): Promise<PageResult<AnalysisRun>> {
+  const response = await read<Envelope<AnalysisRun[]>>(`/api/v1/analysis-runs${pageQuery(page)}`);
+  return pageResult(response, page);
 }
 
 export async function fetchAlert(id: string): Promise<AlertRecord> {
@@ -161,6 +166,28 @@ function normalizeApiBase(value: unknown) {
 function targetPath(targetType: 'incident' | 'alert', id: string, action: string) {
   const collection = targetType === 'incident' ? 'incidents' : 'alerts';
   return `/api/v1/${collection}/${encodeURIComponent(id)}/${action}`;
+}
+
+function pageQuery(page?: PageRequest) {
+  if (!page) return '';
+  const params = new URLSearchParams();
+  params.set('limit', String(page.limit));
+  params.set('offset', String(page.offset));
+  return `?${params.toString()}`;
+}
+
+function pageResult<T>(response: Envelope<T[]>, requested?: PageRequest): PageResult<T> {
+  const fallbackLimit = requested?.limit ?? response.data.length;
+  const fallbackOffset = requested?.offset ?? 0;
+  return {
+    items: response.data,
+    page: response.pagination ?? {
+      total: response.data.length,
+      limit: fallbackLimit,
+      offset: fallbackOffset,
+      has_more: fallbackOffset + fallbackLimit < response.data.length,
+    },
+  };
 }
 
 function feedbackActorQuery() {

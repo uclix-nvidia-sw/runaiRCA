@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -49,6 +50,21 @@ func waitForRunStatus(t *testing.T, server *Server, source string, status string
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("run source=%q status=%q not reached: %+v", source, status, server.store.ListAnalysisRuns())
+	return AnalysisRun{}
+}
+
+func waitForRunIDStatus(t *testing.T, server *Server, runID string, status string) AnalysisRun {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, run := range server.store.ListAnalysisRuns() {
+			if run.RunID == runID && run.Status == status {
+				return run
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("run %q status=%q not reached: %+v", runID, status, server.store.ListAnalysisRuns())
 	return AnalysisRun{}
 }
 
@@ -116,6 +132,39 @@ func TestAnalysisRunTimeoutFailsRun(t *testing.T) {
 	}
 	if hit.Load() == 0 {
 		t.Fatalf("agent was never called")
+	}
+}
+
+func TestAutoAnalysisRunIsIncidentScopedAndIdempotent(t *testing.T) {
+	var hit atomic.Int32
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		hit.Add(1)
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Auto RCA complete.",
+			AnalysisDetail:  "## Root Cause\n\nSingle automatic run.",
+			AnalysisQuality: "medium",
+		})
+	})
+	incident, _ := seedAlert(t, server, "fp-auto-idempotent")
+
+	first, ok := server.startAnalysisRun("incident", incident.IncidentID, "auto", "")
+	if !ok {
+		t.Fatalf("expected first auto run to start")
+	}
+	second, ok := server.startAnalysisRun("incident", incident.IncidentID, "auto", "")
+	if ok {
+		t.Fatalf("expected second auto run to reuse existing run")
+	}
+	if first.RunID != second.RunID {
+		t.Fatalf("expected duplicate auto request to return existing run, got first=%s second=%s", first.RunID, second.RunID)
+	}
+	waitForRunStatus(t, server, "auto", "complete")
+	if hit.Load() != 1 {
+		t.Fatalf("expected one agent call, got %d", hit.Load())
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 {
+		t.Fatalf("expected one auto analysis run, got %+v", runs)
 	}
 }
 
@@ -269,6 +318,74 @@ func TestFailedRunBroadcastsCompletedEvent(t *testing.T) {
 	}
 }
 
+func TestNewerAnalysisRunWinsOverSlowerOlderRun(t *testing.T) {
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var hit atomic.Int32
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		call := hit.Add(1)
+		if call == 1 {
+			close(firstStarted)
+			<-releaseFirst
+			_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+				Status:          "ok",
+				AnalysisSummary: "Stale first RCA.",
+				AnalysisDetail:  "## Root Cause\n\nOlder result finished late.",
+				AnalysisQuality: "low",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Fresh second RCA.",
+			AnalysisDetail:  "## Root Cause\n\nNewer result should stay visible.",
+			AnalysisQuality: "high",
+		})
+	})
+	_, record := seedAlert(t, server, "fp-newer-wins")
+
+	firstRun, ok := server.startAnalysisRun("alert", record.AlertID, "manual", "first analysis")
+	if !ok {
+		t.Fatalf("expected first run to start")
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("first agent request did not start")
+	}
+	secondRun, ok := server.startAnalysisRun("alert", record.AlertID, "manual", "second analysis")
+	if !ok {
+		t.Fatalf("expected second run to start")
+	}
+
+	waitForRunIDStatus(t, server, secondRun.RunID, "complete")
+	close(releaseFirst)
+	waitForRunIDStatus(t, server, firstRun.RunID, "complete")
+
+	alert, _ := server.store.AlertDetail(record.AlertID)
+	if alert.AnalysisSummary != "Fresh second RCA." || alert.AnalysisQuality != "high" {
+		t.Fatalf("late stale run overwrote newer RCA: %+v", alert)
+	}
+}
+
+func TestAnalysisRunHugeAgentResponseFailsRun(t *testing.T) {
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(strings.Repeat("x", int(maxAgentResponseBodyBytes)+1)))
+	})
+	_, record := seedAlert(t, server, "fp-huge-agent-response")
+
+	server.startAnalysisRun("alert", record.AlertID, "manual", "")
+
+	run := waitForRunStatus(t, server, "manual", "failed")
+	if run.Capabilities["agent"] != string(agentErrBodyTooBig) {
+		t.Fatalf("expected response_too_large failure, got %+v", run)
+	}
+	alert, _ := server.store.AlertDetail(record.AlertID)
+	if alert.IsAnalyzing || alert.AnalysisQuality != "low" {
+		t.Fatalf("huge response should clear analyzing with low-quality fallback, got %+v", alert)
+	}
+}
+
 func TestDashboardAnalyzeCreatesAnalysisRun(t *testing.T) {
 	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
@@ -297,6 +414,123 @@ func TestDashboardAnalyzeCreatesAnalysisRun(t *testing.T) {
 	}
 	if !strings.Contains(run.Title, "Dashboard analysis") {
 		t.Fatalf("expected dashboard source title, got %q", run.Title)
+	}
+}
+
+func TestDashboardAnalyzeSkipsDuplicateWhenIncidentAlreadyAnalyzing(t *testing.T) {
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var hit atomic.Int32
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		hit.Add(1)
+		close(firstStarted)
+		<-releaseFirst
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Manual RCA complete.",
+			AnalysisDetail:  "## Root Cause\n\nManual analysis finished.",
+			AnalysisQuality: "medium",
+		})
+	})
+	incident, _ := seedAlert(t, server, "fp-dashboard-duplicate")
+	path := "/api/v1/incidents/" + incident.IncidentID + "/analyze"
+
+	firstRec := httptest.NewRecorder()
+	server.routes().ServeHTTP(firstRec, httptest.NewRequest(http.MethodPost, path, nil))
+	if firstRec.Code != http.StatusAccepted {
+		t.Fatalf("expected first analyze 202, got %d: %s", firstRec.Code, firstRec.Body.String())
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("first analysis did not reach agent")
+	}
+
+	secondRec := httptest.NewRecorder()
+	server.routes().ServeHTTP(secondRec, httptest.NewRequest(http.MethodPost, path, nil))
+	if secondRec.Code != http.StatusAccepted {
+		t.Fatalf("expected duplicate analyze 202, got %d: %s", secondRec.Code, secondRec.Body.String())
+	}
+	var duplicateResponse map[string]any
+	if err := json.Unmarshal(secondRec.Body.Bytes(), &duplicateResponse); err != nil {
+		t.Fatalf("decode duplicate response: %v", err)
+	}
+	if duplicateResponse["status"] != "analysis_already_running" {
+		t.Fatalf("expected already running response, got %+v", duplicateResponse)
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 {
+		t.Fatalf("duplicate analyze should not create another run, got %+v", runs)
+	}
+	close(releaseFirst)
+	waitForRunStatus(t, server, "manual", "complete")
+	if hit.Load() != 1 {
+		t.Fatalf("expected exactly one agent call, got %d", hit.Load())
+	}
+}
+
+func TestDashboardAnalyzeLargeIncidentUsesSingleIncidentRun(t *testing.T) {
+	agentReqCh := make(chan AgentAnalysisRequest, 1)
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		var req AgentAnalysisRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode agent request: %v", err)
+		}
+		agentReqCh <- req
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Large incident RCA complete.",
+			AnalysisDetail:  "## Root Cause\n\nIncident-scope analysis avoided fan-out.",
+			AnalysisQuality: "medium",
+		})
+	})
+	incident, _ := seedAlert(t, server, "fp-dashboard-large")
+	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
+	server.store.mu.Lock()
+	for i := 1; i <= maxManualAnalyzeFanout+3; i++ {
+		alertID := fmt.Sprintf("ALR-large-%03d", i)
+		server.store.alerts[alertID] = &AlertRecord{
+			AlertID:     alertID,
+			IncidentID:  incident.IncidentID,
+			AlarmTitle:  fmt.Sprintf("Large incident alert %03d", i),
+			Severity:    "warning",
+			Status:      "firing",
+			FiredAt:     base.Add(time.Duration(i) * time.Minute),
+			Fingerprint: fmt.Sprintf("fp-dashboard-large-%03d", i),
+			ThreadTS:    "thread-" + alertID,
+			Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+			Annotations: map[string]string{"summary": "Queue blocked"},
+		}
+	}
+	server.store.incidents[incident.IncidentID].AlertCount = maxManualAnalyzeFanout + 4
+	server.store.mu.Unlock()
+	path := "/api/v1/incidents/" + incident.IncidentID + "/analyze"
+
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, nil))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected large analyze 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["mode"] != "incident" || response["analysis_runs"].(float64) != 1 {
+		t.Fatalf("expected single incident run response, got %+v", response)
+	}
+	agentReq := <-agentReqCh
+	if agentReq.IncidentID != incident.IncidentID {
+		t.Fatalf("incident id was not forwarded: %+v", agentReq)
+	}
+	run := waitForRunStatus(t, server, "manual", "complete")
+	if run.TargetType != "incident" || run.TargetID != incident.IncidentID {
+		t.Fatalf("expected incident-scope run, got %+v", run)
+	}
+	alert, _ := server.store.AlertDetail(run.AlertID)
+	if alert.IsAnalyzing {
+		t.Fatalf("representative alert should be complete, got %+v", alert)
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 {
+		t.Fatalf("large incident should create one run, got %+v", runs)
 	}
 }
 

@@ -6,7 +6,11 @@ from types import SimpleNamespace
 import pytest
 
 from app.collectors.base import AnalysisTarget
-from app.collectors.kubernetes import _collect_kubernetes_responses, _filter_kubernetes_data, _list_params
+from app.collectors.kubernetes import (
+    _collect_kubernetes_responses,
+    _filter_kubernetes_data,
+    _list_params,
+)
 from app.collectors.prometheus import _queries_for
 from app.config import load_settings
 from app.nat_tools import (
@@ -120,7 +124,12 @@ async def test_kubernetes_namespace_scope_limits_direct_queries(monkeypatch) -> 
         verify: bool | str = True,
     ) -> SimpleNamespace:
         calls.append(path)
-        return SimpleNamespace(url=f"{base_url}{path}", status_code=200, error=None, data={"items": []})
+        return SimpleNamespace(
+            url=f"{base_url}{path}",
+            status_code=200,
+            error=None,
+            data={"items": []},
+        )
 
     monkeypatch.setattr("app.collectors.kubernetes.get_json", fake_get_json)
     monkeypatch.setenv("KUBERNETES_NAMESPACES", "runai-vision,runai")
