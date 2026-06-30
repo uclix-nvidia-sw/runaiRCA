@@ -34,14 +34,27 @@ flowchart TD
     DBA[Postgres agent]
     PA[Prometheus agent]
     LA[Loki agent]
+    TG["TypeDB agent / knowledge graph"]
+    RANK["Root-cause ranking: 5 families, R1-R6"]
     AA[Analysis agent]
   end
 
   AG --> ORCH
-  ORCH --> RA & KA & DBA & PA & LA
-  RA & KA & DBA & PA & LA --> AA
-  AA -->|dashboard RCA| FE
+  ORCH --> RA & KA & DBA & PA & LA & TG
+  RA & KA & DBA & PA & LA & TG --> RANK
+  RANK --> AA
+  AA -->|dashboard RCA + ranked causes| FE
+
+  TG <-->|"TypeQL: blast radius, history"| KG[("TypeDB knowledge graph")]
+  DB -.->|review-gated ingestion| KG
 ```
+
+The **TypeDB agent** queries an ontology knowledge graph for relational facts the
+other collectors can't express (node blast radius, incident history); a
+deterministic **root-cause ranking** step then scores the five failure families
+(rules R1–R6) and passes ranked candidates to the Analysis agent. The graph is
+populated by review-gated ingestion from the Postgres incident store. TypeDB is
+optional (`typedb.enabled`, default off).
 
 ## Local Development
 
