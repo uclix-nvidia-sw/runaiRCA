@@ -1325,6 +1325,10 @@ func TestSimilarIncidentsDedupesAlertMemoriesByIncident(t *testing.T) {
 	if similar[0].AlertID != "ALR-prior-new" {
 		t.Fatalf("expected latest tied alert memory to represent incident, got %+v", similar[0])
 	}
+	search := store.SearchIncidentMemory("GPU quota exhausted for trainer", 5)
+	if len(search) != 1 || search[0].IncidentID != "INC-prior-shared" {
+		t.Fatalf("expected search memory to dedupe by incident, got %+v", search)
+	}
 }
 
 func TestFeedbackHintsCapsInvalidLimit(t *testing.T) {

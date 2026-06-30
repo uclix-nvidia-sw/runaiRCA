@@ -147,10 +147,7 @@ func (s *Store) SearchIncidentMemory(query string, limit int) []SimilarIncident 
 		}
 		return results[i].Similarity > results[j].Similarity
 	})
-	if len(results) > limit {
-		return results[:limit]
-	}
-	return results
+	return dedupeSimilarByIncident(results, limit)
 }
 
 func (s *Store) ApplyAnalysis(alertID string, response AgentAnalysisResponse) {
@@ -392,6 +389,10 @@ func (s *Store) similarIncidentsLocked(
 		}
 		return results[i].Similarity > results[j].Similarity
 	})
+	return dedupeSimilarByIncident(results, limit)
+}
+
+func dedupeSimilarByIncident(results []SimilarIncident, limit int) []SimilarIncident {
 	deduped := results[:0]
 	seen := map[string]struct{}{}
 	for _, result := range results {

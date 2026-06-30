@@ -580,7 +580,7 @@ func (s *Store) dbSearchMemory(query string, limit int) ([]SimilarIncident, bool
 		results[i].CommentCount = len(summary.Comments)
 	}
 	s.mu.RUnlock()
-	return results, true
+	return dedupeSimilarByIncident(results, limit), true
 }
 
 func (s *Store) loadFeedback(ctx context.Context) {
