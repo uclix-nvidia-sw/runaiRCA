@@ -278,7 +278,12 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	if activityAt.After(incident.LatestActivityAt) {
 		incident.LatestActivityAt = activityAt
 	}
-	changed := newAlert || previousStatus != record.Status || previousOccurrenceCount != record.OccurrenceCount || !sameTimePtr(previousResolvedAt, record.ResolvedAt)
+	changed := newAlert ||
+		previousStatus != record.Status ||
+		previousSeverity != record.Severity ||
+		!previousFiredAt.Equal(record.FiredAt) ||
+		previousOccurrenceCount != record.OccurrenceCount ||
+		!sameTimePtr(previousResolvedAt, record.ResolvedAt)
 	s.persistIncidentLocked(incident)
 	s.persistAlertLocked(record)
 	return AlertUpsertResult{
