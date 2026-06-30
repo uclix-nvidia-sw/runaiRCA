@@ -304,7 +304,30 @@ function errorMessage(err: unknown, fallback: string) {
 }
 
 function formatArtifactValue(value: unknown) {
-  return typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  return typeof value === 'string' ? value : safeJSONStringify(value, 2);
+}
+
+function safeJSONStringify(value: unknown, space?: number) {
+  const seen = new WeakSet<object>();
+  try {
+    const serialized = JSON.stringify(
+      value,
+      (_key, item) => {
+        if (typeof item !== 'object' || item === null) {
+          return item;
+        }
+        if (seen.has(item)) {
+          return '[Circular]';
+        }
+        seen.add(item);
+        return item;
+      },
+      space,
+    );
+    return serialized ?? String(value);
+  } catch (err) {
+    return `[Unserializable: ${errorMessage(err, 'unknown value')}]`;
+  }
 }
 
 function compactArtifactValue(value: unknown, depth = 3): unknown {
@@ -2966,8 +2989,8 @@ function alertChatContent(alert: AlertRecord) {
       `Status: ${alert.status}`,
       `Severity: ${alert.severity}`,
       `Occurrences: ${alertOccurrenceCount(alert)}`,
-      `Labels: ${JSON.stringify(alert.labels)}`,
-      `Annotations: ${JSON.stringify(alert.annotations)}`,
+      `Labels: ${safeJSONStringify(alert.labels)}`,
+      `Annotations: ${safeJSONStringify(alert.annotations)}`,
       `Summary: ${alert.analysis_summary}`,
       alert.analysis_detail,
       `Missing data: ${alert.missing_data.join(', ') || 'none'}`,
