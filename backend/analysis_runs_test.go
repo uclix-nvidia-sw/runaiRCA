@@ -686,7 +686,7 @@ func TestDashboardAnalyzeCreatesAnalysisRun(t *testing.T) {
 	}
 
 	run := waitForRunStatus(t, server, "manual", "complete")
-	if run.TargetType != "incident" || run.TargetID != incident.IncidentID {
+	if run.TargetType != "alert" || run.IncidentID != incident.IncidentID {
 		t.Fatalf("dashboard run missing target linkage: %+v", run)
 	}
 	if !strings.Contains(run.Title, "Dashboard analysis") {
@@ -745,21 +745,8 @@ func TestDashboardAnalyzeSkipsDuplicateWhenIncidentAlreadyAnalyzing(t *testing.T
 	}
 }
 
-func TestDashboardAnalyzeLargeIncidentUsesSingleIncidentRun(t *testing.T) {
-	agentReqCh := make(chan AgentAnalysisRequest, 1)
-	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
-		var req AgentAnalysisRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("decode agent request: %v", err)
-		}
-		agentReqCh <- req
-		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
-			Status:          "ok",
-			AnalysisSummary: "Large incident RCA complete.",
-			AnalysisDetail:  "## Root Cause\n\nIncident-scope analysis avoided fan-out.",
-			AnalysisQuality: "medium",
-		})
-	})
+func TestDashboardAnalyzeLargeIncidentRejectsAgentFanout(t *testing.T) {
+	server := NewServer()
 	incident, _ := seedAlert(t, server, "fp-dashboard-large")
 	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
 	extraAlerts := 28
@@ -785,30 +772,11 @@ func TestDashboardAnalyzeLargeIncidentUsesSingleIncidentRun(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, nil))
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("expected large analyze 202, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected large analyze 409, got %d: %s", rec.Code, rec.Body.String())
 	}
-	var response map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if response["mode"] != "incident" || response["analysis_runs"].(float64) != 1 {
-		t.Fatalf("expected single incident run response, got %+v", response)
-	}
-	agentReq := <-agentReqCh
-	if agentReq.IncidentID != incident.IncidentID {
-		t.Fatalf("incident id was not forwarded: %+v", agentReq)
-	}
-	run := waitForRunStatus(t, server, "manual", "complete")
-	if run.TargetType != "incident" || run.TargetID != incident.IncidentID {
-		t.Fatalf("expected incident-scope run, got %+v", run)
-	}
-	alert, _ := server.store.AlertDetail(run.AlertID)
-	if alert.IsAnalyzing {
-		t.Fatalf("representative alert should be complete, got %+v", alert)
-	}
-	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 {
-		t.Fatalf("large incident should create one run, got %+v", runs)
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 0 {
+		t.Fatalf("large incident should not fan out new runs, got %+v", runs)
 	}
 }
 

@@ -767,19 +767,39 @@ func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 		copied.Feedback = s.feedbackSummaryLocked("alert", alert.AlertID)
 		copied.SimilarIncidents = s.similarIncidentsLocked(alertFromRecord(*copied), alert.IncidentID, similarIncidentLimit)
 		detail.Alerts = append(detail.Alerts, *copied)
-		if detail.AnalysisSummary == "" && copied.AnalysisSummary != "" {
-			detail.AnalysisSummary = copied.AnalysisSummary
-			detail.AnalysisDetail = copied.AnalysisDetail
-			detail.AnalysisQuality = copied.AnalysisQuality
-			detail.Capabilities = cloneMap(copied.Capabilities)
-			detail.MissingData = append([]string{}, copied.MissingData...)
-			detail.Warnings = append([]string{}, copied.Warnings...)
-			detail.Artifacts = append([]Artifact{}, copied.Artifacts...)
-		}
 	}
 	sort.Slice(detail.Alerts, func(i, j int) bool {
 		return detail.Alerts[i].FiredAt.After(detail.Alerts[j].FiredAt)
 	})
+	summaryLines := []string{}
+	detailSections := []string{}
+	for _, alert := range detail.Alerts {
+		if strings.TrimSpace(alert.AnalysisSummary) == "" && strings.TrimSpace(alert.AnalysisDetail) == "" {
+			continue
+		}
+		title := first(alert.AlarmTitle, alert.AlertID)
+		if strings.TrimSpace(alert.AnalysisSummary) != "" {
+			summaryLines = append(summaryLines, fmt.Sprintf("- %s: %s", title, alert.AnalysisSummary))
+		}
+		if strings.TrimSpace(alert.AnalysisDetail) != "" {
+			detailSections = append(detailSections, fmt.Sprintf("## %s\n\n%s", title, alert.AnalysisDetail))
+		}
+		if detail.AnalysisQuality == "" {
+			detail.AnalysisQuality = alert.AnalysisQuality
+		}
+		for key, value := range alert.Capabilities {
+			detail.Capabilities[key] = value
+		}
+		detail.MissingData = append(detail.MissingData, alert.MissingData...)
+		detail.Warnings = append(detail.Warnings, alert.Warnings...)
+		detail.Artifacts = append(detail.Artifacts, alert.Artifacts...)
+	}
+	if len(summaryLines) > 0 {
+		detail.AnalysisSummary = strings.Join(summaryLines, "\n")
+	}
+	if len(detailSections) > 0 {
+		detail.AnalysisDetail = strings.Join(detailSections, "\n\n")
+	}
 	detail.Feedback = s.feedbackSummaryLocked("incident", id)
 	if len(detail.Alerts) > 0 {
 		detail.SimilarIncidents = s.similarIncidentsLocked(

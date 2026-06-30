@@ -1313,6 +1313,56 @@ func TestResolveEndpointTogglesResolvedStatus(t *testing.T) {
 	}
 }
 
+func TestIncidentDetailAggregatesAlertAnalyses(t *testing.T) {
+	store := NewStore()
+	incident, first := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "aggregate-rca"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-aggregate-first",
+	})
+	secondID := "ALR-aggregate-second"
+	store.mu.Lock()
+	store.alerts[secondID] = &AlertRecord{
+		AlertID:     secondID,
+		IncidentID:  incident.IncidentID,
+		AlarmTitle:  "Quota alert",
+		Severity:    "critical",
+		Status:      "firing",
+		FiredAt:     first.FiredAt.Add(time.Minute),
+		Fingerprint: "fp-aggregate-second",
+		ThreadTS:    "thread-" + secondID,
+		Labels:      map[string]string{"alertname": "RunAIQuotaBlocked", "severity": "critical"},
+		Annotations: map[string]string{"summary": "Quota blocked"},
+	}
+	store.mu.Unlock()
+	store.ApplyAnalysis(first.AlertID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Queue saturation RCA.",
+		AnalysisDetail:  "Queue workers are waiting.",
+		AnalysisQuality: "medium",
+	})
+	store.ApplyAnalysis(secondID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Quota exhaustion RCA.",
+		AnalysisDetail:  "GPU quota is exhausted.",
+		AnalysisQuality: "high",
+	})
+
+	detail, ok := store.IncidentDetail(incident.IncidentID)
+	if !ok {
+		t.Fatalf("incident detail missing")
+	}
+	if !strings.Contains(detail.AnalysisSummary, "Queue saturation RCA.") ||
+		!strings.Contains(detail.AnalysisSummary, "Quota exhaustion RCA.") {
+		t.Fatalf("incident summary should aggregate alert RCA summaries, got %q", detail.AnalysisSummary)
+	}
+	if !strings.Contains(detail.AnalysisDetail, "Queue workers are waiting.") ||
+		!strings.Contains(detail.AnalysisDetail, "GPU quota is exhausted.") {
+		t.Fatalf("incident detail should aggregate alert RCA details, got %q", detail.AnalysisDetail)
+	}
+}
+
 func TestDenseEmbeddingIsDeterministicAndNormalized(t *testing.T) {
 	text := "Run:AI GPU quota saturated scheduling blocked"
 	a := denseEmbedding(text)
