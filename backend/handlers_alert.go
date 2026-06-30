@@ -44,11 +44,14 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 		if autoAnalyses >= maxAutoAnalyzeFanout {
 			break
 		}
-		if !s.reserveAutoAnalysisSlot() {
+		reserved, release := s.reserveAutoAnalysisSlot()
+		if !reserved {
 			break
 		}
 		if _, ok := s.startAnalysisRun("alert", alertID, "auto", ""); ok {
 			autoAnalyses++
+		} else {
+			release()
 		}
 	}
 	writeJSON(
@@ -64,7 +67,7 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
-func (s *Server) reserveAutoAnalysisSlot() bool {
+func (s *Server) reserveAutoAnalysisSlot() (bool, func()) {
 	now := time.Now().UTC()
 	cutoff := now.Add(-autoAnalyzeWindow)
 	s.autoAnalyzeMu.Lock()
@@ -77,10 +80,20 @@ func (s *Server) reserveAutoAnalysisSlot() bool {
 	}
 	s.autoAnalyzeStarts = kept
 	if len(s.autoAnalyzeStarts) >= maxAutoAnalyzeFanout {
-		return false
+		return false, func() {}
 	}
 	s.autoAnalyzeStarts = append(s.autoAnalyzeStarts, now)
-	return true
+	release := func() {
+		s.autoAnalyzeMu.Lock()
+		defer s.autoAnalyzeMu.Unlock()
+		for i, t := range s.autoAnalyzeStarts {
+			if t == now {
+				s.autoAnalyzeStarts = append(s.autoAnalyzeStarts[:i], s.autoAnalyzeStarts[i+1:]...)
+				break
+			}
+		}
+	}
+	return true, release
 }
 
 func (s *Server) handleAlert(w http.ResponseWriter, r *http.Request) {
