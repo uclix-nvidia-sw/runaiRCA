@@ -507,6 +507,9 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if existing := s.analyzingAnalysisRunLocked(targetType, targetID); existing != nil {
+		return cloneAnalysisRun(existing), false
+	}
 	if source == "auto" {
 		if existing := s.latestAutoAnalysisRunLocked(incidentID); existing != nil {
 			return cloneAnalysisRun(existing), false
@@ -518,6 +521,19 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 		return AnalysisRun{}, false
 	}
 	return cloneAnalysisRun(run), true
+}
+
+func (s *Store) analyzingAnalysisRunLocked(targetType string, targetID string) *AnalysisRun {
+	var selected *AnalysisRun
+	for _, run := range s.analysisRuns {
+		if run == nil || run.Status != "analyzing" || run.TargetType != targetType || run.TargetID != targetID {
+			continue
+		}
+		if selected == nil || run.CreatedAt.After(selected.CreatedAt) {
+			selected = run
+		}
+	}
+	return selected
 }
 
 func (s *Store) ExistingAutoAnalysisRun(incidentID string) (AnalysisRun, bool) {

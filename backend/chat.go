@@ -63,6 +63,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		run, ok := s.startAnalysisRun(targetType, targetID, "chat", req.Message)
 		if !ok {
+			if run != nil && run.Status == "analyzing" {
+				answer := ChatResponse{
+					Status:         "ok",
+					Answer:         analysisAlreadyRunningAnswer(run, inferred),
+					ConversationID: req.ConversationID,
+					AnalysisRun:    run,
+				}
+				finalizeChatResponse(&answer, req)
+				writeJSON(w, http.StatusAccepted, answer)
+				return
+			}
 			writeError(w, http.StatusNotFound, "analysis target not found")
 			return
 		}
@@ -331,6 +342,14 @@ func analysisStartedAnswer(run *AnalysisRun, inferred bool) string {
 		run.RunID,
 		target,
 	)
+}
+
+func analysisAlreadyRunningAnswer(run *AnalysisRun, inferred bool) string {
+	target := fmt.Sprintf("%s `%s`", run.TargetType, run.TargetID)
+	if inferred {
+		target = fmt.Sprintf("latest available %s `%s`", run.TargetType, run.TargetID)
+	}
+	return fmt.Sprintf("이미 분석 run `%s`가 %s 대상으로 진행 중이야. 새 Agent 요청은 보내지 않았고, Analysis Dashboard에서 이어서 보면 돼.", run.RunID, target)
 }
 
 func noAnalysisTargetAnswer(req ChatRequest) string {

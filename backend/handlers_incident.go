@@ -77,7 +77,14 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(detail.Alerts) > maxManualAnalyzeFanout {
-			if _, ok := s.startAnalysisRun("incident", id, "manual", ""); !ok {
+			run, ok := s.startAnalysisRun("incident", id, "manual", "")
+			if !ok {
+				if run != nil && run.Status == "analyzing" {
+					writeJSON(w, http.StatusAccepted, map[string]any{
+						"status": "analysis_already_running",
+					})
+					return
+				}
 				writeError(w, http.StatusNotFound, "analysis target not found")
 				return
 			}
@@ -90,12 +97,22 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		started := 0
+		alreadyRunning := false
 		for _, alert := range detail.Alerts {
-			if _, ok := s.startAnalysisRun("alert", alert.AlertID, "manual", ""); ok {
+			run, ok := s.startAnalysisRun("alert", alert.AlertID, "manual", "")
+			if ok {
 				started++
+			} else if run != nil && run.Status == "analyzing" {
+				alreadyRunning = true
 			}
 		}
 		if started == 0 {
+			if alreadyRunning {
+				writeJSON(w, http.StatusAccepted, map[string]any{
+					"status": "analysis_already_running",
+				})
+				return
+			}
 			writeError(w, http.StatusConflict, "incident has no analyzable alerts")
 			return
 		}

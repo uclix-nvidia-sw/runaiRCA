@@ -537,31 +537,32 @@ func TestFailedRunBroadcastsCompletedEvent(t *testing.T) {
 	}
 }
 
-func TestNewerAnalysisRunWinsOverSlowerOlderRun(t *testing.T) {
+func TestAnalyzingRunRejectsDuplicateManualRun(t *testing.T) {
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
+	released := false
+	release := func() {
+		if !released {
+			close(releaseFirst)
+			released = true
+		}
+	}
+	defer release()
 	var hit atomic.Int32
 	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
 		call := hit.Add(1)
 		if call == 1 {
 			close(firstStarted)
 			<-releaseFirst
-			_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
-				Status:          "ok",
-				AnalysisSummary: "Stale first RCA.",
-				AnalysisDetail:  "## Root Cause\n\nOlder result finished late.",
-				AnalysisQuality: "low",
-			})
-			return
 		}
 		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
 			Status:          "ok",
-			AnalysisSummary: "Fresh second RCA.",
-			AnalysisDetail:  "## Root Cause\n\nNewer result should stay visible.",
-			AnalysisQuality: "high",
+			AnalysisSummary: "Manual RCA complete.",
+			AnalysisDetail:  "## Root Cause\n\nOnly one agent call should run.",
+			AnalysisQuality: "medium",
 		})
 	})
-	_, record := seedAlert(t, server, "fp-newer-wins")
+	_, record := seedAlert(t, server, "fp-manual-dedupe")
 
 	firstRun, ok := server.startAnalysisRun("alert", record.AlertID, "manual", "first analysis")
 	if !ok {
@@ -573,17 +574,24 @@ func TestNewerAnalysisRunWinsOverSlowerOlderRun(t *testing.T) {
 		t.Fatalf("first agent request did not start")
 	}
 	secondRun, ok := server.startAnalysisRun("alert", record.AlertID, "manual", "second analysis")
-	if !ok {
-		t.Fatalf("expected second run to start")
+	if ok {
+		t.Fatalf("duplicate manual run should not start")
 	}
-
-	waitForRunIDStatus(t, server, secondRun.RunID, "complete")
-	close(releaseFirst)
+	if secondRun == nil || secondRun.RunID != firstRun.RunID {
+		t.Fatalf("duplicate manual run should return the in-flight run, got %+v want %s", secondRun, firstRun.RunID)
+	}
+	release()
 	waitForRunIDStatus(t, server, firstRun.RunID, "complete")
 
 	alert, _ := server.store.AlertDetail(record.AlertID)
-	if alert.AnalysisSummary != "Fresh second RCA." || alert.AnalysisQuality != "high" {
-		t.Fatalf("late stale run overwrote newer RCA: %+v", alert)
+	if alert.AnalysisSummary != "Manual RCA complete." || alert.AnalysisQuality != "medium" {
+		t.Fatalf("first run result was not applied: %+v", alert)
+	}
+	if hit.Load() != 1 {
+		t.Fatalf("expected exactly one agent call, got %d", hit.Load())
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 {
+		t.Fatalf("duplicate manual request should not create another run, got %+v", runs)
 	}
 }
 

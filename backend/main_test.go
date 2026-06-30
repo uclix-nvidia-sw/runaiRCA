@@ -849,6 +849,7 @@ func TestCommentUpdateCreatesAnalysisRun(t *testing.T) {
 		t.Fatalf("expected created comment, got %+v", createResponse.Data)
 	}
 	<-agentReqCh
+	waitForAnalysisRun(t, server, "comment")
 
 	updatePayload, _ := json.Marshal(CommentRequest{
 		Body:   "Use scheduler logs instead of quota as the primary cause.",
@@ -1270,9 +1271,9 @@ func TestReapStaleAnalyzingRunsMarksFailed(t *testing.T) {
 		Fingerprint: "fp-reap",
 	})
 	// Simulate a run left "analyzing" by a previous process (no goroutine ran).
-	stale := store.CreateAnalysisRun("auto", "alert", record.AlertID, incident.IncidentID, record.AlertID, "t", "")
 	done := store.CreateAnalysisRun("manual", "alert", record.AlertID, incident.IncidentID, record.AlertID, "t", "")
 	store.CompleteAnalysisRun(done.RunID, AgentAnalysisResponse{Status: "ok", AnalysisSummary: "done"})
+	stale := store.CreateAnalysisRun("auto", "alert", record.AlertID, incident.IncidentID, record.AlertID, "t", "")
 
 	reaped := store.ReapStaleAnalyzingRuns()
 	if reaped != 1 {
