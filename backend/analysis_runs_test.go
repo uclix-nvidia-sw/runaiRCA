@@ -251,7 +251,7 @@ func TestAnalysisRunPersistFailureSkipsAgentCall(t *testing.T) {
 		Fingerprint: "fp-persist-failure",
 	})
 
-	if _, ok := server.startAnalysisRun("alert", record.AlertID, "auto", ""); ok {
+	if run, ok := server.startAnalysisRun("alert", record.AlertID, "auto", ""); ok || run != nil {
 		t.Fatalf("analysis run should not start when its DB row cannot be persisted")
 	}
 	time.Sleep(50 * time.Millisecond)

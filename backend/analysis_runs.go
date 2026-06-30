@@ -55,6 +55,9 @@ func (s *Server) startAnalysisRun(targetType string, targetID string, source str
 		prompt,
 	)
 	if !created {
+		if run.RunID == "" {
+			return nil, false
+		}
 		return &run, false
 	}
 	if source == "manual" {
