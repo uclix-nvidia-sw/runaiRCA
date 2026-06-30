@@ -212,8 +212,9 @@ func (c *fakePostgresConn) QueryContext(ctx context.Context, query string, args 
 }
 
 func (s *PostgresState) rowsFor(query string) driver.Rows {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	lowered := strings.ToLower(query)
-	switch {
 	case strings.Contains(lowered, "<=>"):
 		return &fakeRows{
 			columns: []string{
