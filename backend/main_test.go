@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -46,6 +47,158 @@ func TestAlertmanagerWebhookCreatesIncidentAndAlert(t *testing.T) {
 	}
 	if len(server.store.ListAlerts()) != 1 {
 		t.Fatalf("expected one alert")
+	}
+}
+
+func TestAlertmanagerWebhookGroupsDiskPressureStormIntoOneAutoAnalysis(t *testing.T) {
+	server := NewServer()
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Node disk pressure is evicting Loki read pods.",
+			AnalysisDetail:  "Disk pressure eviction storm was grouped into one RCA.",
+			AnalysisQuality: "medium",
+			Capabilities:    map[string]string{"kubernetes": "ok"},
+		})
+	}))
+	defer agent.Close()
+	server.agentURL = agent.URL
+
+	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
+	alerts := make([]Alert, 0, 3)
+	for i, pod := range []string{"loki-read-a", "loki-read-b", "loki-read-c"} {
+		alerts = append(alerts, Alert{
+			Status: "firing",
+			Labels: map[string]string{
+				"alertname": "KubePodEvicted",
+				"severity":  "warning",
+				"cluster":   "lab",
+				"namespace": "monitoring",
+				"pod":       pod,
+				"node":      "k8s-lb-02",
+				"reason":    "Evicted",
+			},
+			Annotations: map[string]string{
+				"summary":     "Pod was evicted",
+				"description": "The node had disk pressure.",
+			},
+			Fingerprint: "fp-disk-pressure-" + strconv.Itoa(i),
+			StartsAt:    base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
+		})
+	}
+	payload, _ := json.Marshal(AlertmanagerWebhook{GroupKey: "disk-pressure-storm", Alerts: alerts})
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload)))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["accepted"].(float64) != 3 || response["auto_analyses"].(float64) != 1 {
+		t.Fatalf("unexpected webhook response: %+v", response)
+	}
+	incidents := server.store.ListIncidents()
+	if len(incidents) != 1 || incidents[0].AlertCount != 3 {
+		t.Fatalf("expected one grouped incident with three alerts, got %+v", incidents)
+	}
+	if !strings.Contains(strings.ToLower(incidents[0].Title), "disk pressure") {
+		t.Fatalf("expected disk pressure grouped title, got %q", incidents[0].Title)
+	}
+	groupedAlerts := server.store.ListAlerts()
+	if len(groupedAlerts) != 1 || groupedAlerts[0].OccurrenceCount != 3 {
+		t.Fatalf("expected one grouped alert row with three occurrences, got %+v", groupedAlerts)
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 || runs[0].TargetType != "incident" {
+		t.Fatalf("expected one incident-level analysis run, got %+v", runs)
+	}
+}
+
+func TestAlertmanagerWebhookDoesNotCreateAnalysisForRepeatedAlert(t *testing.T) {
+	server := NewServer()
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Repeated alert was deduplicated.",
+			AnalysisDetail:  "Only the first webhook created an automatic RCA run.",
+			AnalysisQuality: "medium",
+		})
+	}))
+	defer agent.Close()
+	server.agentURL = agent.URL
+
+	alert := Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "KubePodEvicted",
+			"severity":  "warning",
+			"namespace": "monitoring",
+			"pod":       "loki-read-a",
+			"node":      "k8s-lb-02",
+			"reason":    "Evicted",
+		},
+		Annotations: map[string]string{"summary": "Pod was evicted"},
+		StartsAt:    "2026-06-30T10:00:00Z",
+	}
+	payload, _ := json.Marshal(AlertmanagerWebhook{GroupKey: "repeat-no-fingerprint", Alerts: []Alert{alert}})
+
+	server.routes().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload)))
+	server.routes().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload)))
+
+	incidents := server.store.ListIncidents()
+	if len(incidents) != 1 || incidents[0].AlertCount != 1 {
+		t.Fatalf("expected repeated alert to upsert, got incidents=%+v", incidents)
+	}
+	alerts := server.store.ListAlerts()
+	if len(alerts) != 1 || alerts[0].OccurrenceCount != 1 {
+		t.Fatalf("expected one synthetic alert identity without counting resends, got %+v", alerts)
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 {
+		t.Fatalf("expected one auto analysis run for repeated webhook, got %+v", runs)
+	}
+}
+
+func TestListAlertsSupportsPagination(t *testing.T) {
+	server := NewServer()
+	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < 3; i++ {
+		server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "page-test-" + strconv.Itoa(i)}, Alert{
+			Status: "firing",
+			Labels: map[string]string{
+				"alertname": "RunAIQueueBlocked",
+				"severity":  "warning",
+				"namespace": "monitoring",
+				"pod":       "queue-controller-" + strconv.Itoa(i),
+			},
+			Annotations: map[string]string{"summary": "Run:AI queue blocked"},
+			StartsAt:    base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
+			Fingerprint: "fp-page-" + strconv.Itoa(i),
+		})
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/alerts?limit=1&offset=1", nil)
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var response struct {
+		Status     string         `json:"status"`
+		Data       []AlertRecord  `json:"data"`
+		Pagination paginationInfo `json:"pagination"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Data) != 1 {
+		t.Fatalf("expected one alert page item, got %d", len(response.Data))
+	}
+	if response.Pagination.Total != 3 || response.Pagination.Limit != 1 || response.Pagination.Offset != 1 || !response.Pagination.HasMore {
+		t.Fatalf("unexpected pagination: %+v", response.Pagination)
 	}
 }
 

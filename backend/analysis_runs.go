@@ -7,10 +7,9 @@ import (
 	"time"
 )
 
-// AnalysisRun is a single lifecycle record for an analysis request. Every
-// trigger (webhook auto-analysis, dashboard analyze, comment/feedback
-// reanalysis, chat-requested analysis) creates exactly one AnalysisRun that
-// always terminates in "complete" or "failed".
+// AnalysisRun is a single lifecycle record for an analysis request. Automatic
+// webhook analysis is incident-scoped and idempotent; explicit operator
+// requests still create their own runs so manual follow-up remains auditable.
 type AnalysisRun struct {
 	RunID           string            `json:"run_id"`
 	Source          string            `json:"source"`
@@ -32,10 +31,9 @@ type AnalysisRun struct {
 	UpdatedAt       time.Time         `json:"updated_at"`
 }
 
-// startAnalysisRun resolves the analysis target, creates a fresh analyzing run,
-// marks the target as analyzing, emits the started SSE event, and kicks off the
-// agent call asynchronously. It is the single entry point for every analysis
-// trigger so each one shows up as its own analysis_runs item.
+// startAnalysisRun resolves the analysis target, creates an analyzing run when
+// allowed, marks the target as analyzing, emits the started SSE event, and
+// kicks off the agent call asynchronously.
 func (s *Server) startAnalysisRun(targetType string, targetID string, source string, prompt string) (*AnalysisRun, bool) {
 	alert, incidentID, alertID, threadTS, title, ok := s.store.AnalysisTarget(targetType, targetID)
 	if !ok {
@@ -44,7 +42,7 @@ func (s *Server) startAnalysisRun(targetType string, targetID string, source str
 	if source == "manual" && strings.TrimSpace(prompt) == "" {
 		prompt = s.store.OperatorPromptForTarget(targetType, targetID)
 	}
-	run := s.store.CreateAnalysisRun(
+	run, created := s.store.CreateAnalysisRunIfAllowed(
 		source,
 		targetType,
 		targetID,
@@ -53,6 +51,9 @@ func (s *Server) startAnalysisRun(targetType string, targetID string, source str
 		fmt.Sprintf("%s: %s", sourceTitle(source), title),
 		prompt,
 	)
+	if !created {
+		return &run, false
+	}
 	if source == "manual" {
 		s.store.BeginManualAnalysis(incidentID, alertID)
 	} else {

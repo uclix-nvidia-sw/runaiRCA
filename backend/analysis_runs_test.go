@@ -119,6 +119,39 @@ func TestAnalysisRunTimeoutFailsRun(t *testing.T) {
 	}
 }
 
+func TestAutoAnalysisRunIsIncidentScopedAndIdempotent(t *testing.T) {
+	var hit atomic.Int32
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		hit.Add(1)
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Auto RCA complete.",
+			AnalysisDetail:  "## Root Cause\n\nSingle automatic run.",
+			AnalysisQuality: "medium",
+		})
+	})
+	incident, _ := seedAlert(t, server, "fp-auto-idempotent")
+
+	first, ok := server.startAnalysisRun("incident", incident.IncidentID, "auto", "")
+	if !ok {
+		t.Fatalf("expected first auto run to start")
+	}
+	second, ok := server.startAnalysisRun("incident", incident.IncidentID, "auto", "")
+	if ok {
+		t.Fatalf("expected second auto run to reuse existing run")
+	}
+	if first.RunID != second.RunID {
+		t.Fatalf("expected duplicate auto request to return existing run, got first=%s second=%s", first.RunID, second.RunID)
+	}
+	waitForRunStatus(t, server, "auto", "complete")
+	if hit.Load() != 1 {
+		t.Fatalf("expected one agent call, got %d", hit.Load())
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 {
+		t.Fatalf("expected one auto analysis run, got %+v", runs)
+	}
+}
+
 func TestManualAnalysisClearsRCAAndSkipsAgentTimeout(t *testing.T) {
 	agentReqCh := make(chan AgentAnalysisRequest, 1)
 	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {

@@ -545,8 +545,9 @@ def _recommended_action_lines(missing: list[str]) -> list[str]:
         )
     if "loki.auth" in missing or "loki.query" in missing:
         lines.append(
-            "- Restore Loki tenant/auth configuration so the agent can attach "
-            "workload and Run:ai control-plane log lines on the next analysis run."
+            "- Fix Loki reachability for the next analysis run: prefer the direct "
+            "loki-read service, and only add tenant/auth settings when the endpoint "
+            "explicitly requires them."
         )
     if "postgres.query" in missing or "postgres.connection" in missing:
         lines.append(

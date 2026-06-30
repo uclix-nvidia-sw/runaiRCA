@@ -145,6 +145,27 @@ async def test_loki_401_marks_auth_missing(monkeypatch) -> None:
     assert result.status == "unavailable"
     assert "loki.auth" in result.missing_data
     assert any("HTTP 401" in warning for warning in result.warnings)
+    assert any("Evicted" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_loki_401_from_gateway_points_to_direct_read_service(monkeypatch) -> None:
+    async def fake_get_json(**kwargs) -> SimpleNamespace:
+        return SimpleNamespace(
+            url=f"{kwargs['base_url']}{kwargs['path']}",
+            status_code=401,
+            error="HTTP 401",
+            data={"body": "unauthorized"},
+        )
+
+    monkeypatch.setattr("app.collectors.loki.get_json", fake_get_json)
+    collector = LokiCollector(replace(make_settings(), loki_url="http://loki-gateway.monitoring.svc"))
+
+    result = await collector.collect(make_target())
+
+    assert "loki.auth" in result.missing_data
+    assert any("gateway Basic Auth" in warning for warning in result.warnings)
+    assert any("direct loki-read service" in warning for warning in result.warnings)
 
 
 @pytest.mark.asyncio

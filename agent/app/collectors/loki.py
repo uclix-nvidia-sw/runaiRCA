@@ -78,14 +78,7 @@ class LokiCollector:
             if response.error:
                 warnings.append(f"Loki query failed for {name}: {response.error}")
                 if response.status_code == 401:
-                    if _loki_auth_configured(self._settings):
-                        warnings.append(
-                            "Loki authentication was configured but rejected with HTTP 401."
-                        )
-                    else:
-                        warnings.append(
-                            "Loki returned HTTP 401 and no Loki authentication credentials are configured."
-                        )
+                    warnings.append(_loki_unauthorized_warning(self._settings))
 
         successful = [item for item in query_results if not item["error"]]
         populated = [item for item in successful if item["line_count"]]
@@ -167,6 +160,22 @@ def _loki_auth_configured(settings: Settings) -> bool:
     return bool(
         settings.loki_bearer_token
         or (settings.loki_basic_username and settings.loki_basic_password)
+    )
+
+
+def _loki_unauthorized_warning(settings: Settings) -> str:
+    if _loki_auth_configured(settings):
+        return "Loki authentication was configured but the endpoint rejected it with HTTP 401."
+    endpoint = settings.loki_url.lower()
+    if "loki-gateway" in endpoint:
+        return (
+            "Loki returned HTTP 401 from loki-gateway. That is gateway Basic Auth, "
+            "not a loki-read eviction symptom; set LOKI_URL to the direct loki-read service."
+        )
+    return (
+        "Loki returned HTTP 401 from the configured endpoint. Evicted loki-read pods "
+        "typically cause timeouts, 5xx responses, or no endpoints rather than HTTP 401; "
+        "check whether LOKI_URL still points at an authenticated proxy or tenant-enforced endpoint."
     )
 
 
