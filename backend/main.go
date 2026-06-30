@@ -198,6 +198,7 @@ const (
 	flappingGroupWindow    = 30 * time.Minute
 	maxListLimit           = 200
 	maxJSONBodyBytes       = 1 << 20
+	maxEmbeddingQueryBytes = 4000
 	maxWebhookAlerts       = 500
 	maxManualAnalyzeFanout = 25
 )

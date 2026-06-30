@@ -1437,3 +1437,18 @@ func TestFeedbackRoutesReturnSummary(t *testing.T) {
 		t.Fatalf("expected embedding search 200, got %d: %s", searchRec.Code, searchRec.Body.String())
 	}
 }
+
+func TestEmbeddingSearchRejectsOversizedQuery(t *testing.T) {
+	server := NewServer()
+	body, _ := json.Marshal(EmbeddingSearchRequest{Query: strings.Repeat("q", maxEmbeddingQueryBytes+1)})
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(
+		rec,
+		httptest.NewRequest(http.MethodPost, "/api/v1/embeddings/search", bytes.NewReader(body)),
+	)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected oversized query 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
