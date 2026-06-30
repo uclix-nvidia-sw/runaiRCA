@@ -1,0 +1,136 @@
+{{- if .Values.typedb.enabled }}
+{{- $podAnnotations := mergeOverwrite (deepCopy (default (dict) .Values.podAnnotations)) (default (dict) .Values.typedb.podAnnotations) -}}
+{{- $podLabels := mergeOverwrite (deepCopy (default (dict) .Values.podLabels)) (default (dict) .Values.typedb.podLabels) -}}
+{{- $podSecurityContext := default .Values.podSecurityContext .Values.typedb.podSecurityContext -}}
+{{- $securityContext := default .Values.securityContext .Values.typedb.securityContext -}}
+{{- $priorityClassName := default .Values.priorityClassName .Values.typedb.priorityClassName -}}
+{{- $topologySpreadConstraints := default .Values.topologySpreadConstraints .Values.typedb.topologySpreadConstraints -}}
+{{- $nodeSelector := default .Values.nodeSelector .Values.typedb.nodeSelector -}}
+{{- $affinity := default .Values.affinity .Values.typedb.affinity -}}
+{{- $tolerations := default .Values.tolerations .Values.typedb.tolerations -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "runai-rca.typedb.fullname" . }}
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: typedb
+  {{- with .Values.typedb.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: grpc
+      port: {{ .Values.typedb.service.port }}
+      targetPort: grpc
+    - name: http
+      port: {{ .Values.typedb.service.httpPort }}
+      targetPort: http
+  selector:
+    {{- include "runai-rca.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: typedb
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "runai-rca.typedb.fullname" . }}
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: typedb
+spec:
+  serviceName: {{ include "runai-rca.typedb.fullname" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "runai-rca.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: typedb
+  template:
+    metadata:
+      labels:
+        {{- include "runai-rca.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: typedb
+        {{- with $podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with $podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: {{ .Values.typedb.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with $topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: typedb
+          image: {{ include "runai-rca.image" (dict "root" . "image" .Values.typedb.image) | quote }}
+          imagePullPolicy: {{ .Values.typedb.image.pullPolicy }}
+          {{- with $securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: grpc
+              containerPort: 1729
+            - name: http
+              containerPort: 8000
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/typedb/data
+          {{- with .Values.typedb.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- else }}
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          {{- end }}
+          resources:
+            {{- toYaml .Values.typedb.resources | nindent 12 }}
+      {{- if not .Values.typedb.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+      {{- with $nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.typedb.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.typedb.persistence.storageClass }}
+        storageClassName: {{ .Values.typedb.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.typedb.persistence.size | quote }}
+  {{- end }}
+{{- end }}

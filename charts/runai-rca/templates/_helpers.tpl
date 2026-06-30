@@ -48,6 +48,18 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{ include "runai-rca.postgresql.fullname" . }}
 {{- end -}}
 
+{{- define "runai-rca.typedb.fullname" -}}
+{{ include "runai-rca.fullname" . }}-typedb
+{{- end -}}
+
+{{- define "runai-rca.typedb.address" -}}
+{{- if .Values.typedb.enabled -}}
+{{- printf "%s:%v" (include "runai-rca.typedb.fullname" .) .Values.typedb.service.port -}}
+{{- else -}}
+{{- "" -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "runai-rca.secretName" -}}
 {{- default (printf "%s-secrets" (include "runai-rca.fullname" .)) .Values.secrets.existingSecret -}}
 {{- end -}}
