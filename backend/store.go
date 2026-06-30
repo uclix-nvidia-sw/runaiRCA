@@ -946,7 +946,7 @@ func (s *Store) AddComment(
 		return FeedbackSummary{}, false, errors.New("comment body is required")
 	}
 	author := strings.TrimSpace(req.Author)
-	if err := validateStoredText("comment body", req.Body, maxStoredCommentBodyBytes); err != nil {
+	if err := validateStoredText("comment body", body, maxStoredCommentBodyBytes); err != nil {
 		return FeedbackSummary{}, false, err
 	}
 	if err := validateStoredText("author", author, maxFeedbackAuthorBytes); err != nil {
