@@ -762,15 +762,22 @@ type paginationInfo struct {
 
 func paginatedEnvelope(data any, page paginationRequest, total int) map[string]any {
 	payload := envelope(data)
+	offset := page.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
 	limit := page.Limit
 	if limit <= 0 {
-		limit = total
+		limit = total - offset
 	}
 	payload["pagination"] = paginationInfo{
 		Total:   total,
 		Limit:   limit,
-		Offset:  page.Offset,
-		HasMore: page.Offset+limit < total,
+		Offset:  offset,
+		HasMore: offset+limit < total,
 	}
 	return payload
 }

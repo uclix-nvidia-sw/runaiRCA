@@ -301,6 +301,47 @@ func TestListAlertsSupportsPagination(t *testing.T) {
 	}
 }
 
+func TestListAlertsPaginationClampsOffsetBeyondTotal(t *testing.T) {
+	server := NewServer()
+	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
+	for i, workload := range []string{"scheduler", "queue-controller"} {
+		server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "page-clamp-" + strconv.Itoa(i)}, Alert{
+			Status: "firing",
+			Labels: map[string]string{
+				"alertname": "RunAIQueueBlocked",
+				"severity":  "warning",
+				"namespace": "monitoring",
+				"pod":       workload + "-" + strconv.Itoa(i),
+			},
+			Annotations: map[string]string{"summary": "Run:AI queue blocked"},
+			StartsAt:    base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
+			Fingerprint: "fp-page-clamp-" + strconv.Itoa(i),
+		})
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/alerts?limit=1&offset=99", nil)
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var response struct {
+		Status     string         `json:"status"`
+		Data       []AlertRecord  `json:"data"`
+		Pagination paginationInfo `json:"pagination"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Data) != 0 {
+		t.Fatalf("expected empty page past the end, got %d item(s)", len(response.Data))
+	}
+	if response.Pagination.Total != 2 || response.Pagination.Limit != 1 || response.Pagination.Offset != 2 || response.Pagination.HasMore {
+		t.Fatalf("unexpected pagination: %+v", response.Pagination)
+	}
+}
+
 func TestDashboardSnapshotCountsAllRowsButBoundsRecentItems(t *testing.T) {
 	store := NewStore()
 	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
