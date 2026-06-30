@@ -37,8 +37,8 @@ type ChatResponse struct {
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var req ChatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if status, err := decodeJSONBody(w, r, &req, maxJSONBodyBytes); err != nil {
+		writeError(w, status, err.Error())
 		return
 	}
 	req.Message = strings.TrimSpace(req.Message)

@@ -175,6 +175,7 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			resolved_at TIMESTAMPTZ,
 			fingerprint TEXT NOT NULL,
 			occurrence_count INTEGER NOT NULL DEFAULT 1,
+			occurrence_pods JSONB NOT NULL DEFAULT '[]'::jsonb,
 			thread_ts TEXT NOT NULL,
 			labels JSONB NOT NULL DEFAULT '{}'::jsonb,
 			annotations JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -188,6 +189,7 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS occurrence_count INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS occurrence_pods JSONB NOT NULL DEFAULT '[]'::jsonb`,
 		`CREATE TABLE IF NOT EXISTS incident_embeddings (
 			incident_id TEXT PRIMARY KEY,
 			alert_id TEXT NOT NULL,
@@ -374,7 +376,7 @@ func (s *Store) loadAlerts(ctx context.Context) {
 	rows, err := s.db.QueryContext(
 		ctx,
 		`SELECT alert_id, incident_id, alarm_title, severity, status, fired_at,
-		        resolved_at, fingerprint, occurrence_count, thread_ts, labels, annotations,
+		        resolved_at, fingerprint, occurrence_count, occurrence_pods, thread_ts, labels, annotations,
 		        analysis_summary, analysis_detail, analysis_quality, capabilities,
 		        missing_data, warnings, artifacts
 		   FROM alerts`,
@@ -389,6 +391,7 @@ func (s *Store) loadAlerts(ctx context.Context) {
 	for rows.Next() {
 		var alert AlertRecord
 		var labelsRaw, annotationsRaw, capabilitiesRaw, missingRaw, warningsRaw, artifactsRaw []byte
+		var occurrencePodsRaw []byte
 		if err := rows.Scan(
 			&alert.AlertID,
 			&alert.IncidentID,
@@ -399,6 +402,7 @@ func (s *Store) loadAlerts(ctx context.Context) {
 			&alert.ResolvedAt,
 			&alert.Fingerprint,
 			&alert.OccurrenceCount,
+			&occurrencePodsRaw,
 			&alert.ThreadTS,
 			&labelsRaw,
 			&annotationsRaw,
@@ -415,6 +419,7 @@ func (s *Store) loadAlerts(ctx context.Context) {
 		}
 		_ = json.Unmarshal(labelsRaw, &alert.Labels)
 		_ = json.Unmarshal(annotationsRaw, &alert.Annotations)
+		_ = json.Unmarshal(occurrencePodsRaw, &alert.OccurrencePods)
 		_ = json.Unmarshal(capabilitiesRaw, &alert.Capabilities)
 		_ = json.Unmarshal(missingRaw, &alert.MissingData)
 		_ = json.Unmarshal(warningsRaw, &alert.Warnings)
@@ -723,12 +728,12 @@ func (s *Store) persistAlertLocked(alert *AlertRecord) {
 		context.Background(),
 		`INSERT INTO alerts (
 			alert_id, incident_id, alarm_title, severity, status, fired_at,
-			resolved_at, fingerprint, occurrence_count, thread_ts, labels, annotations,
+			resolved_at, fingerprint, occurrence_count, occurrence_pods, thread_ts, labels, annotations,
 			analysis_summary, analysis_detail, analysis_quality, capabilities,
 			missing_data, warnings, artifacts, updated_at
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-			$15, $16, $17, $18, $19, now()
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+			$16, $17, $18, $19, $20, now()
 		)
 		ON CONFLICT (alert_id) DO UPDATE SET
 			incident_id = EXCLUDED.incident_id,
@@ -739,6 +744,7 @@ func (s *Store) persistAlertLocked(alert *AlertRecord) {
 			resolved_at = EXCLUDED.resolved_at,
 			fingerprint = EXCLUDED.fingerprint,
 			occurrence_count = EXCLUDED.occurrence_count,
+			occurrence_pods = EXCLUDED.occurrence_pods,
 			thread_ts = EXCLUDED.thread_ts,
 			labels = EXCLUDED.labels,
 			annotations = EXCLUDED.annotations,
@@ -759,6 +765,7 @@ func (s *Store) persistAlertLocked(alert *AlertRecord) {
 		alert.ResolvedAt,
 		alert.Fingerprint,
 		alert.OccurrenceCount,
+		mustJSON(alert.OccurrencePods),
 		alert.ThreadTS,
 		mustJSON(alert.Labels),
 		mustJSON(alert.Annotations),

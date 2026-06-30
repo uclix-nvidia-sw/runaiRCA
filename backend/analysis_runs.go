@@ -87,12 +87,15 @@ func (s *Server) requestAnalysisRun(
 		alert.Annotations["operator_prompt"] = prompt
 	}
 
+	occurrencePods, occurrenceCount := s.store.OccurrenceSummaryForTarget(incidentID, alertID)
 	req := AgentAnalysisRequest{
 		Alert:            alert,
 		ThreadTS:         threadTS,
 		IncidentID:       incidentID,
 		AnalysisType:     first(source, status(alert.Status)),
 		Language:         s.language,
+		OccurrenceCount:  occurrenceCount,
+		OccurrencePods:   occurrencePods,
 		SimilarIncidents: s.store.SimilarIncidentsForAlert(alert, incidentID, similarIncidentLimit),
 		FeedbackHints:    s.store.FeedbackHintsForAlert(alert, incidentID, similarIncidentLimit),
 	}
@@ -101,12 +104,12 @@ func (s *Server) requestAnalysisRun(
 	if err != nil {
 		fallback := fallbackAnalysis(alert, err)
 		run, _ := s.store.FailAnalysisRun(runID, fallback)
-		s.store.ApplyFallbackAnalysisIfAbsent(alertID, fallback)
+		s.store.ApplyFallbackAnalysisIfAbsentForRun(runID, alertID, fallback)
 		s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
 		return
 	}
 	run, _ := s.store.CompleteAnalysisRun(runID, analysis)
-	s.store.ApplyAnalysis(alertID, analysis)
+	s.store.ApplyAnalysisForRun(runID, alertID, analysis)
 	s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
 }
 

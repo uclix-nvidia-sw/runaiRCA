@@ -181,6 +181,8 @@ class AnalysisOrchestrator:
             context={
                 "target": target.__dict__,
                 "nemo_runtime": "enabled" if self._nat.enabled() else "fallback",
+                "occurrence_count": request.occurrence_count,
+                "occurrence_pods": request.occurrence_pods,
                 "similar_incidents": [
                     item.model_dump(mode="json") for item in request.similar_incidents
                 ],
@@ -366,10 +368,15 @@ def _detail_from(
         "The agent checked the configured Run:ai, Kubernetes, Prometheus, Loki, "
         "and Postgres collectors for this RCA. Confirmed evidence and missing "
         "collector data are listed below.",
-        "",
-        "## Evidence",
-        "",
     ]
+    lines.extend(_affected_pods_lines(request))
+    lines.extend(
+        [
+            "",
+            "## Evidence",
+            "",
+        ]
+    )
     for result in results:
         lines.append(f"- **{result.agent}** [{result.status}]: {result.summary}")
     highlight_lines = _evidence_highlight_lines(results)
@@ -554,6 +561,28 @@ def _recommended_action_lines(missing: list[str]) -> list[str]:
             "- Restore Postgres connectivity so RCA memory and similar-incident "
             "evidence stay current."
         )
+    return lines
+
+
+def _affected_pods_lines(request: AlertAnalysisRequest) -> list[str]:
+    pods = [pod.strip() for pod in request.occurrence_pods if pod and pod.strip()]
+    count = request.occurrence_count
+    if not pods and count <= 1:
+        return []
+    lines = ["", "## Affected Pods", ""]
+    if count > 1:
+        lines.append(
+            f"- This alert was grouped from {count} occurrence(s) of the same workload; "
+            "the controller keeps recreating pods under new names, so treat the names "
+            "below as one cycling workload rather than separate failures."
+        )
+    if pods:
+        shown = pods[:20]
+        lines.extend(f"- `{pod}`" for pod in shown)
+        if len(pods) > len(shown):
+            lines.append(f"- … and {len(pods) - len(shown)} more pod(s)")
+    else:
+        lines.append("- Individual pod names were not present on the alert labels.")
     return lines
 
 

@@ -1,15 +1,19 @@
 package main
 
 import (
-	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 )
 
 func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 	var webhook AlertmanagerWebhook
-	if err := json.NewDecoder(r.Body).Decode(&webhook); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if status, err := decodeJSONBody(w, r, &webhook, maxJSONBodyBytes); err != nil {
+		writeError(w, status, err.Error())
+		return
+	}
+	if len(webhook.Alerts) > maxWebhookAlerts {
+		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("too many alerts in webhook (max %d)", maxWebhookAlerts))
 		return
 	}
 	accepted := 0

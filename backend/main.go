@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -151,6 +153,7 @@ type AlertRecord struct {
 	ResolvedAt       *time.Time        `json:"resolved_at"`
 	Fingerprint      string            `json:"fingerprint"`
 	OccurrenceCount  int               `json:"occurrence_count"`
+	OccurrencePods   []string          `json:"occurrence_pods"`
 	ThreadTS         string            `json:"thread_ts"`
 	Labels           map[string]string `json:"labels"`
 	Annotations      map[string]string `json:"annotations"`
@@ -194,6 +197,8 @@ const (
 	similarIncidentLimit = 3
 	flappingGroupWindow  = 30 * time.Minute
 	maxListLimit         = 200
+	maxJSONBodyBytes     = 1 << 20
+	maxWebhookAlerts     = 500
 )
 
 func main() {
@@ -348,10 +353,16 @@ func correlationKey(webhook AlertmanagerWebhook, alert Alert) string {
 		}, ":")
 	}
 	namespace := first(labels["namespace"], labels["kubernetes_namespace"])
-	pod := first(labels["pod"], labels["pod_name"], labels["kubernetes_pod_name"])
+	workload := workloadIdentity(alert)
 	alertName := first(labels["alertname"], labels["alert_name"])
-	if cluster != "" && namespace != "" && pod != "" && alertName != "" {
-		return strings.Join([]string{"flap", cluster, namespace, pod, alertName}, ":")
+	if namespace != "" && workload != "" && alertName != "" {
+		return strings.Join([]string{
+			"flap",
+			keyPart(first(cluster, "cluster-unknown")),
+			keyPart(namespace),
+			keyPart(workload),
+			keyPart(alertName),
+		}, ":")
 	}
 	if alert.Fingerprint != "" {
 		return "fingerprint:" + alert.Fingerprint
@@ -414,6 +425,90 @@ func groupedIncidentTitle(alert Alert, alertCount int) string {
 
 func incidentTitle(alert Alert) string {
 	return first(alert.Annotations["summary"], alert.Labels["alertname"], "Run:AI incident")
+}
+
+// workloadIdentity returns a stable identifier for the workload behind an alert.
+// Controllers recreate pods under new, randomized names (a Deployment rollout, a
+// StatefulSet restart, a CrashLoop churn), so keying flapping correlation on the
+// raw pod name makes every occurrence look unique and floods the store. Explicit
+// workload/owner labels win when present; otherwise the pod name is normalized to
+// its workload prefix.
+func workloadIdentity(alert Alert) string {
+	labels := alert.Labels
+	if w := first(
+		labels["workload"],
+		labels["workload_name"],
+		labels["runai_job_name"],
+		labels["deployment"],
+		labels["statefulset"],
+		labels["daemonset"],
+		labels["job_name"],
+		labels["created_by_name"],
+		labels["owner_name"],
+	); w != "" {
+		return normalizePodName(w)
+	}
+	pod := first(labels["pod"], labels["pod_name"], labels["kubernetes_pod_name"])
+	return normalizePodName(pod)
+}
+
+var (
+	podRandomSuffixRe   = regexp.MustCompile(`-[a-z0-9]{5}$`)
+	podReplicaSetHashRe = regexp.MustCompile(`-[a-z0-9]{8,10}$`)
+	podOrdinalSuffixRe  = regexp.MustCompile(`-\d+$`)
+)
+
+// normalizePodName strips the controller-generated suffixes from a pod name so
+// pods of the same workload collapse to one identity:
+//   - Deployment:  <name>-<replicaset-hash>-<random5>
+//   - DaemonSet:   <name>-<random5>
+//   - StatefulSet: <name>-<ordinal>
+func normalizePodName(pod string) string {
+	pod = strings.TrimSpace(pod)
+	if pod == "" {
+		return ""
+	}
+	if podRandomSuffixRe.MatchString(pod) {
+		stripped := podRandomSuffixRe.ReplaceAllString(pod, "")
+		if podReplicaSetHashRe.MatchString(stripped) {
+			return podReplicaSetHashRe.ReplaceAllString(stripped, "")
+		}
+		return stripped
+	}
+	if podOrdinalSuffixRe.MatchString(pod) {
+		return podOrdinalSuffixRe.ReplaceAllString(pod, "")
+	}
+	return pod
+}
+
+// maxOccurrencePods bounds the distinct concrete pod names retained on a grouped
+// alert row. The OccurrenceCount still reflects the true total; only the forensic
+// name list is capped so a perpetually flapping workload cannot bloat the row.
+const maxOccurrencePods = 25
+
+// podName extracts the concrete pod name behind an alert occurrence.
+func podName(alert Alert) string {
+	return first(alert.Labels["pod"], alert.Labels["pod_name"], alert.Labels["kubernetes_pod_name"])
+}
+
+// appendOccurrencePod records the concrete pod behind one occurrence, keeping the
+// most-recent distinct names (most recent last) within the cap.
+func appendOccurrencePod(pods []string, pod string) []string {
+	pod = strings.TrimSpace(pod)
+	if pod == "" {
+		return pods
+	}
+	out := make([]string, 0, len(pods)+1)
+	for _, existing := range pods {
+		if existing != pod {
+			out = append(out, existing)
+		}
+	}
+	out = append(out, pod)
+	if len(out) > maxOccurrencePods {
+		out = out[len(out)-maxOccurrencePods:]
+	}
+	return out
 }
 
 func alertIdentity(alert Alert) string {
@@ -527,6 +622,7 @@ func cloneAlert(in *AlertRecord) *AlertRecord {
 	out := *in
 	out.Labels = cloneMap(in.Labels)
 	out.Annotations = cloneMap(in.Annotations)
+	out.OccurrencePods = cloneStrings(in.OccurrencePods)
 	out.Capabilities = cloneMap(in.Capabilities)
 	out.MissingData = cloneStrings(in.MissingData)
 	out.Warnings = cloneStrings(in.Warnings)
@@ -706,6 +802,33 @@ func nonNegativeQueryInt(raw string, fallback int) (int, error) {
 		return 0, fmt.Errorf("value must be non-negative")
 	}
 	return value, nil
+}
+
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) (int, error) {
+	body := r.Body
+	if maxBytes > 0 {
+		body = http.MaxBytesReader(w, r.Body, maxBytes)
+	}
+	decoder := json.NewDecoder(body)
+	if err := decoder.Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return http.StatusRequestEntityTooLarge, fmt.Errorf("request body too large (max %d bytes)", maxErr.Limit)
+		}
+		return http.StatusBadRequest, err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				return http.StatusRequestEntityTooLarge, fmt.Errorf("request body too large (max %d bytes)", maxErr.Limit)
+			}
+			return http.StatusBadRequest, err
+		}
+		return http.StatusBadRequest, fmt.Errorf("request body must contain a single JSON value")
+	}
+	return http.StatusOK, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

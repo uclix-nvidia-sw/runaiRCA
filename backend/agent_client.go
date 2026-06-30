@@ -19,6 +19,8 @@ type AgentAnalysisRequest struct {
 	IncidentID       string            `json:"incident_id,omitempty"`
 	AnalysisType     string            `json:"analysis_type,omitempty"`
 	Language         string            `json:"language,omitempty"`
+	OccurrenceCount  int               `json:"occurrence_count,omitempty"`
+	OccurrencePods   []string          `json:"occurrence_pods,omitempty"`
 	SimilarIncidents []SimilarIncident `json:"similar_incidents,omitempty"`
 	FeedbackHints    []FeedbackHint    `json:"feedback_hints,omitempty"`
 }
@@ -49,7 +51,10 @@ const (
 	agentErrNetwork     agentErrorKind = "network"
 	agentErrStatus      agentErrorKind = "non_2xx"
 	agentErrInvalidJSON agentErrorKind = "invalid_json"
+	agentErrBodyTooBig  agentErrorKind = "response_too_large"
 )
+
+const maxAgentResponseBodyBytes int64 = 2 << 20
 
 // AgentError is a typed error describing an agent call failure.
 type AgentError struct {
@@ -71,6 +76,8 @@ func (e *AgentError) Error() string {
 		return fmt.Sprintf("agent returned status %d: %v", e.Status, e.Err)
 	case agentErrInvalidJSON:
 		return fmt.Sprintf("agent returned invalid JSON: %v", e.Err)
+	case agentErrBodyTooBig:
+		return fmt.Sprintf("agent response exceeded limit: %v", e.Err)
 	case agentErrEncode:
 		return fmt.Sprintf("failed to build agent request: %v", e.Err)
 	default:
@@ -148,9 +155,12 @@ func (s *Server) postAgent(path string, payload any, timeout time.Duration) ([]b
 		return nil, classifyDoError(ctx, err)
 	}
 	defer resp.Body.Close()
-	body, readErr := io.ReadAll(resp.Body)
+	body, truncated, readErr := readLimitedBody(resp.Body, maxAgentResponseBodyBytes)
 	if resp.StatusCode >= 300 {
 		detail := excerpt(string(body), 500)
+		if truncated {
+			detail = first(detail, "response body") + fmt.Sprintf(" (truncated at %d bytes)", maxAgentResponseBodyBytes)
+		}
 		if detail == "" && readErr != nil {
 			detail = readErr.Error()
 		}
@@ -159,5 +169,23 @@ func (s *Server) postAgent(path string, payload any, timeout time.Duration) ([]b
 	if readErr != nil {
 		return nil, classifyDoError(ctx, readErr)
 	}
+	if truncated {
+		return nil, &AgentError{
+			Kind: agentErrBodyTooBig,
+			Err:  fmt.Errorf("body exceeded %d bytes", maxAgentResponseBodyBytes),
+		}
+	}
 	return body, nil
+}
+
+func readLimitedBody(body io.Reader, limit int64) ([]byte, bool, error) {
+	if limit <= 0 {
+		data, err := io.ReadAll(body)
+		return data, false, err
+	}
+	data, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if int64(len(data)) <= limit {
+		return data, false, err
+	}
+	return data[:limit], true, err
 }

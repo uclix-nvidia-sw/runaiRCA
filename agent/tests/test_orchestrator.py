@@ -332,6 +332,32 @@ async def test_analyze_includes_similar_incidents_and_feedback_hints() -> None:
 
 
 @pytest.mark.asyncio
+async def test_analyze_lists_grouped_pods() -> None:
+    orchestrator = AnalysisOrchestrator(make_settings())
+    response = await orchestrator.analyze(
+        AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={"alertname": "KubePodCrashLooping", "namespace": "monitoring"},
+                annotations={"summary": "Loki read pod is crash looping."},
+                fingerprint="fp-flap",
+            ),
+            occurrence_count=4,
+            occurrence_pods=[
+                "loki-read-7d9f8c6b5-x2k4p",
+                "loki-read-7d9f8c6b5-a1b2c",
+            ],
+        )
+    )
+
+    assert "## Affected Pods" in response.analysis_detail
+    assert "loki-read-7d9f8c6b5-x2k4p" in response.analysis_detail
+    assert "grouped from 4 occurrence" in response.analysis_detail
+    assert response.context["occurrence_count"] == 4
+    assert "loki-read-7d9f8c6b5-a1b2c" in response.context["occurrence_pods"]
+
+
+@pytest.mark.asyncio
 async def test_chat_without_detail_reports_runtime_state() -> None:
     orchestrator = AnalysisOrchestrator(make_settings())
     response = await orchestrator.chat(

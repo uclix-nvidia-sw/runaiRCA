@@ -241,6 +241,7 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	if record.OccurrenceCount <= 0 {
 		record.OccurrenceCount = 1
 	}
+	record.OccurrencePods = appendOccurrencePod(record.OccurrencePods, podName(alert))
 	record.AlarmTitle = groupedIncidentTitle(alert, record.OccurrenceCount)
 	record.Severity = severity(alert)
 	record.Status = status(alert.Status)
@@ -550,6 +551,52 @@ func (s *Store) AnalysisTarget(targetType string, targetID string) (Alert, strin
 	default:
 		return Alert{}, "", "", "", "", false
 	}
+}
+
+// OccurrenceSummaryForTarget returns the distinct concrete pod names and the
+// total occurrence count behind an analysis target, aggregated across the grouped
+// alert rows. It lets the agent reason about which pods cycled even though the
+// flapping was collapsed into one row to protect the store.
+func (s *Store) OccurrenceSummaryForTarget(incidentID string, alertID string) ([]string, int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	pods := []string{}
+	seen := map[string]struct{}{}
+	count := 0
+	add := func(record *AlertRecord) {
+		if record == nil {
+			return
+		}
+		count += record.OccurrenceCount
+		for _, pod := range record.OccurrencePods {
+			if pod == "" {
+				continue
+			}
+			if _, ok := seen[pod]; ok {
+				continue
+			}
+			seen[pod] = struct{}{}
+			pods = append(pods, pod)
+		}
+	}
+	if incidentID != "" {
+		records := make([]*AlertRecord, 0)
+		for _, record := range s.alerts {
+			if record != nil && record.IncidentID == incidentID {
+				records = append(records, record)
+			}
+		}
+		sort.Slice(records, func(i, j int) bool { return records[i].FiredAt.After(records[j].FiredAt) })
+		for _, record := range records {
+			add(record)
+		}
+	} else if alertID != "" {
+		add(s.alerts[alertID])
+	}
+	if len(pods) > maxOccurrencePods {
+		pods = pods[:maxOccurrencePods]
+	}
+	return pods, count
 }
 
 func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {

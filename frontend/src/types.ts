@@ -96,6 +96,7 @@ export type AlertRecord = {
   resolved_at?: string | null;
   fingerprint: string;
   occurrence_count: number;
+  occurrence_pods?: string[];
   thread_ts: string;
   labels: Record<string, string>;
   annotations: Record<string, string>;

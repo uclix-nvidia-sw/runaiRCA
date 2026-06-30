@@ -1759,6 +1759,9 @@ function UnifiedWorkspace({
   const title = incident?.title ?? alert?.alarm_title ?? '';
   const id = incident?.incident_id ?? alert?.alert_id ?? '';
   const labels = incident?.alerts[0]?.labels ?? alert?.labels ?? {};
+  const affectedPods = incident
+    ? Array.from(new Set(incident.alerts.flatMap((item) => item.occurrence_pods ?? []))).filter(Boolean)
+    : (alert?.occurrence_pods ?? []).filter(Boolean);
   const artifacts = incident?.artifacts ?? alert?.artifacts ?? [];
   const capabilities = incident?.capabilities ?? alert?.capabilities ?? {};
   const missingData = incident?.missing_data ?? alert?.missing_data ?? [];
@@ -1788,6 +1791,7 @@ function UnifiedWorkspace({
             <Severity value={detail.data.severity} />
             <Status value={detail.data.status} analyzing={detail.data.is_analyzing} />
           </div>
+          <AffectedPods pods={affectedPods} />
         </div>
         <div className="workspace-actions">
           <button className="ghost-button" onClick={onClose} type="button"><ArrowLeft size={16} /> Back</button>
@@ -1908,6 +1912,23 @@ function UnifiedWorkspace({
         />
       </div>
     </section>
+  );
+}
+
+function AffectedPods({ pods }: { pods: string[] }) {
+  if (!pods.length) return null;
+  const shown = pods.slice(0, 12);
+  const remaining = pods.length - shown.length;
+  return (
+    <div className="affected-pods">
+      <span className="affected-pods-label">Affected pods · {pods.length}</span>
+      <div className="affected-pods-list">
+        {shown.map((pod) => (
+          <code key={pod} className="pod-chip" title={pod}>{pod}</code>
+        ))}
+        {remaining > 0 && <span className="pod-chip pod-chip-more">+{remaining} more</span>}
+      </div>
+    </div>
   );
 }
 

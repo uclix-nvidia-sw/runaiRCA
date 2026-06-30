@@ -6,6 +6,8 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -161,17 +163,114 @@ func TestAlertmanagerWebhookDoesNotCreateAnalysisForRepeatedAlert(t *testing.T) 
 	}
 }
 
+func TestAlertmanagerWebhookGroupsPodSuffixFlappingIntoOneAutoAnalysis(t *testing.T) {
+	server := NewServer()
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Loki read pods are crash-looping under one workload.",
+			AnalysisDetail:  "Pod-suffix flapping was grouped into one RCA.",
+			AnalysisQuality: "medium",
+		})
+	}))
+	defer agent.Close()
+	server.agentURL = agent.URL
+
+	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
+	// Same workload (loki-read), but the controller keeps recreating the pod under a
+	// new randomized name. Each occurrence carries its own fingerprint, exactly the
+	// Loki flapping shape that flooded the store.
+	pods := []string{
+		"loki-read-7d9f8c6b5-x2k4p",
+		"loki-read-7d9f8c6b5-a1b2c",
+		"loki-read-7d9f8c6b5-z9y8x",
+		"loki-read-7d9f8c6b5-q7w8e",
+	}
+	alerts := make([]Alert, 0, len(pods))
+	for i, pod := range pods {
+		alerts = append(alerts, Alert{
+			Status: "firing",
+			Labels: map[string]string{
+				"alertname": "KubePodCrashLooping",
+				"severity":  "warning",
+				"cluster":   "lab",
+				"namespace": "monitoring",
+				"pod":       pod,
+			},
+			Annotations: map[string]string{"summary": "Loki read pod is crash looping"},
+			Fingerprint: "fp-loki-flap-" + strconv.Itoa(i),
+			StartsAt:    base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
+		})
+	}
+	payload, _ := json.Marshal(AlertmanagerWebhook{GroupKey: "loki-crashloop", Alerts: alerts})
+
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload)))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	incidents := server.store.ListIncidents()
+	if len(incidents) != 1 || incidents[0].AlertCount != len(pods) {
+		t.Fatalf("expected one grouped incident covering every pod, got %+v", incidents)
+	}
+	groupedAlerts := server.store.ListAlerts()
+	if len(groupedAlerts) != 1 || groupedAlerts[0].OccurrenceCount != len(pods) {
+		t.Fatalf("expected one grouped alert row with %d occurrences, got %+v", len(pods), groupedAlerts)
+	}
+	// The row is grouped by workload, but every concrete pod name stays on record.
+	gotPods := append([]string{}, groupedAlerts[0].OccurrencePods...)
+	sort.Strings(gotPods)
+	wantPods := append([]string{}, pods...)
+	sort.Strings(wantPods)
+	if !reflect.DeepEqual(gotPods, wantPods) {
+		t.Fatalf("expected occurrence pods %v, got %v", wantPods, gotPods)
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 {
+		t.Fatalf("expected one auto analysis run for the grouped workload, got %d", len(runs))
+	}
+
+	// A second webhook of the same flapping workload must not create new rows.
+	rec = httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload)))
+	if got := len(server.store.ListAlerts()); got != 1 {
+		t.Fatalf("expected resend to stay on one alert row, got %d", got)
+	}
+	if got := len(server.store.ListAnalysisRuns()); got != 1 {
+		t.Fatalf("expected resend to not add analysis runs, got %d", got)
+	}
+}
+
+func TestNormalizePodName(t *testing.T) {
+	cases := map[string]string{
+		"loki-read-7d9f8c6b5-x2k4p": "loki-read",    // Deployment: hash + random suffix
+		"loki-read-x2k4p":           "loki-read",    // DaemonSet: random suffix only
+		"trainer-0":                 "trainer",      // StatefulSet ordinal
+		"trainer-12":                "trainer",      // StatefulSet ordinal (multi-digit)
+		"gpu-operator":              "gpu-operator", // already a bare workload name
+		"":                          "",             // empty stays empty
+	}
+	for pod, want := range cases {
+		if got := normalizePodName(pod); got != want {
+			t.Fatalf("normalizePodName(%q) = %q, want %q", pod, got, want)
+		}
+	}
+}
+
 func TestListAlertsSupportsPagination(t *testing.T) {
 	server := NewServer()
 	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
-	for i := 0; i < 3; i++ {
+	// Distinct workloads so each upserts its own alert row (grouping collapses
+	// same-workload pods into one occurrence-counted row, which is tested elsewhere).
+	workloads := []string{"queue-controller", "gpu-feeder", "scheduler"}
+	for i, workload := range workloads {
 		server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "page-test-" + strconv.Itoa(i)}, Alert{
 			Status: "firing",
 			Labels: map[string]string{
 				"alertname": "RunAIQueueBlocked",
 				"severity":  "warning",
 				"namespace": "monitoring",
-				"pod":       "queue-controller-" + strconv.Itoa(i),
+				"pod":       workload + "-" + strconv.Itoa(i),
 			},
 			Annotations: map[string]string{"summary": "Run:AI queue blocked"},
 			StartsAt:    base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
@@ -295,6 +394,31 @@ func TestAlertmanagerWebhookReportsAcceptedAndIgnoredCounts(t *testing.T) {
 	}
 }
 
+func TestAlertmanagerWebhookRejectsTooManyAlerts(t *testing.T) {
+	server := NewServer()
+	alerts := make([]Alert, maxWebhookAlerts+1)
+	for i := range alerts {
+		alerts[i] = Alert{
+			Status:      "firing",
+			Labels:      map[string]string{"alertname": "RunAIWorkloadPending", "severity": "warning"},
+			Annotations: map[string]string{"summary": "Workload pending"},
+			Fingerprint: "fp-too-many-" + strconv.Itoa(i),
+		}
+	}
+	payload, _ := json.Marshal(AlertmanagerWebhook{GroupKey: "too-many", Alerts: alerts})
+	req := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(server.store.ListIncidents()) != 0 || len(server.store.ListAnalysisRuns()) != 0 {
+		t.Fatalf("rejected webhook should not mutate store")
+	}
+}
+
 func TestAgentRequestTimeoutConfig(t *testing.T) {
 	t.Setenv("AGENT_REQUEST_TIMEOUT_SECONDS", "7")
 	server := NewServer()
@@ -304,6 +428,19 @@ func TestAgentRequestTimeoutConfig(t *testing.T) {
 	}
 	if server.client.Timeout != 0 {
 		t.Fatalf("expected http client to rely on per-request contexts, got %s", server.client.Timeout)
+	}
+}
+
+func TestChatRejectsOversizedBody(t *testing.T) {
+	server := NewServer()
+	payload := []byte(`{"message":"` + strings.Repeat("x", int(maxJSONBodyBytes)+1) + `"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -756,7 +893,7 @@ func TestSimilarIncidentsLimitAndLatestTieBreak(t *testing.T) {
 	}
 }
 
-func TestFlappingAlertGroupingUsesNamespacePodAndWindow(t *testing.T) {
+func TestFlappingAlertGroupingUsesNamespaceWorkloadAndWindow(t *testing.T) {
 	store := NewStore()
 	base := time.Date(2026, 6, 26, 9, 0, 0, 0, time.UTC)
 	makeAlert := func(namespace, pod, fingerprint string, at time.Time) Alert {
@@ -775,23 +912,25 @@ func TestFlappingAlertGroupingUsesNamespacePodAndWindow(t *testing.T) {
 		}
 	}
 
-	firstIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-0", "fp-flap-1", base))
-	sameTargetIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-0", "fp-flap-2", base.Add(10*time.Minute)))
-	if sameTargetIncident.IncidentID != firstIncident.IncidentID {
-		t.Fatalf("same namespace/pod alert inside window should group: %s != %s", sameTargetIncident.IncidentID, firstIncident.IncidentID)
+	firstIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-7d9f8c6b5-aaaa1", "fp-flap-1", base))
+	// Same workload, fresh controller-generated pod name inside the window: this is
+	// the Loki/CrashLoop flapping shape, and it must collapse onto one incident.
+	rotatedPodIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-7d9f8c6b5-bbbb2", "fp-flap-2", base.Add(10*time.Minute)))
+	if rotatedPodIncident.IncidentID != firstIncident.IncidentID {
+		t.Fatalf("same-workload alert with a rotated pod suffix inside window should group: %s != %s", rotatedPodIncident.IncidentID, firstIncident.IncidentID)
 	}
 
-	differentNamespaceIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-b", "trainer-0", "fp-flap-3", base.Add(11*time.Minute)))
+	differentNamespaceIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-b", "trainer-7d9f8c6b5-cccc3", "fp-flap-3", base.Add(11*time.Minute)))
 	if differentNamespaceIncident.IncidentID == firstIncident.IncidentID {
 		t.Fatalf("alerts from different namespaces must not group")
 	}
-	differentPodIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-1", "fp-flap-4", base.Add(12*time.Minute)))
-	if differentPodIncident.IncidentID == firstIncident.IncidentID {
-		t.Fatalf("alerts from different pods must not group")
+	differentWorkloadIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "inference-5c8f9d7a4-dddd4", "fp-flap-4", base.Add(12*time.Minute)))
+	if differentWorkloadIncident.IncidentID == firstIncident.IncidentID {
+		t.Fatalf("alerts from different workloads must not group")
 	}
-	outsideWindowIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-0", "fp-flap-5", base.Add(45*time.Minute)))
+	outsideWindowIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-7d9f8c6b5-eeee5", "fp-flap-5", base.Add(45*time.Minute)))
 	if outsideWindowIncident.IncidentID == firstIncident.IncidentID {
-		t.Fatalf("same namespace/pod alert outside flapping window should start a new incident")
+		t.Fatalf("same-workload alert outside flapping window should start a new incident")
 	}
 }
 

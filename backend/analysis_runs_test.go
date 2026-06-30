@@ -52,6 +52,21 @@ func waitForRunStatus(t *testing.T, server *Server, source string, status string
 	return AnalysisRun{}
 }
 
+func waitForRunIDStatus(t *testing.T, server *Server, runID string, status string) AnalysisRun {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, run := range server.store.ListAnalysisRuns() {
+			if run.RunID == runID && run.Status == status {
+				return run
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("run %q status=%q not reached: %+v", runID, status, server.store.ListAnalysisRuns())
+	return AnalysisRun{}
+}
+
 func waitForCompletedEvent(t *testing.T, ch <-chan Event, wantStatus string) Event {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
@@ -299,6 +314,74 @@ func TestFailedRunBroadcastsCompletedEvent(t *testing.T) {
 	event := waitForCompletedEvent(t, ch, "failed")
 	if event.Data["alert_id"] != record.AlertID {
 		t.Fatalf("completed event missing alert id: %+v", event.Data)
+	}
+}
+
+func TestNewerAnalysisRunWinsOverSlowerOlderRun(t *testing.T) {
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var hit atomic.Int32
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		call := hit.Add(1)
+		if call == 1 {
+			close(firstStarted)
+			<-releaseFirst
+			_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+				Status:          "ok",
+				AnalysisSummary: "Stale first RCA.",
+				AnalysisDetail:  "## Root Cause\n\nOlder result finished late.",
+				AnalysisQuality: "low",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Fresh second RCA.",
+			AnalysisDetail:  "## Root Cause\n\nNewer result should stay visible.",
+			AnalysisQuality: "high",
+		})
+	})
+	_, record := seedAlert(t, server, "fp-newer-wins")
+
+	firstRun, ok := server.startAnalysisRun("alert", record.AlertID, "manual", "first analysis")
+	if !ok {
+		t.Fatalf("expected first run to start")
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("first agent request did not start")
+	}
+	secondRun, ok := server.startAnalysisRun("alert", record.AlertID, "manual", "second analysis")
+	if !ok {
+		t.Fatalf("expected second run to start")
+	}
+
+	waitForRunIDStatus(t, server, secondRun.RunID, "complete")
+	close(releaseFirst)
+	waitForRunIDStatus(t, server, firstRun.RunID, "complete")
+
+	alert, _ := server.store.AlertDetail(record.AlertID)
+	if alert.AnalysisSummary != "Fresh second RCA." || alert.AnalysisQuality != "high" {
+		t.Fatalf("late stale run overwrote newer RCA: %+v", alert)
+	}
+}
+
+func TestAnalysisRunHugeAgentResponseFailsRun(t *testing.T) {
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(strings.Repeat("x", int(maxAgentResponseBodyBytes)+1)))
+	})
+	_, record := seedAlert(t, server, "fp-huge-agent-response")
+
+	server.startAnalysisRun("alert", record.AlertID, "manual", "")
+
+	run := waitForRunStatus(t, server, "manual", "failed")
+	if run.Capabilities["agent"] != string(agentErrBodyTooBig) {
+		t.Fatalf("expected response_too_large failure, got %+v", run)
+	}
+	alert, _ := server.store.AlertDetail(record.AlertID)
+	if alert.IsAnalyzing || alert.AnalysisQuality != "low" {
+		t.Fatalf("huge response should clear analyzing with low-quality fallback, got %+v", alert)
 	}
 }
 
