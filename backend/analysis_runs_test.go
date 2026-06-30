@@ -686,7 +686,7 @@ func TestDashboardAnalyzeCreatesAnalysisRun(t *testing.T) {
 	}
 
 	run := waitForRunStatus(t, server, "manual", "complete")
-	if run.TargetType != "alert" || run.IncidentID != incident.IncidentID {
+	if run.TargetType != "incident" || run.TargetID != incident.IncidentID {
 		t.Fatalf("dashboard run missing target linkage: %+v", run)
 	}
 	if !strings.Contains(run.Title, "Dashboard analysis") {
@@ -762,8 +762,9 @@ func TestDashboardAnalyzeLargeIncidentUsesSingleIncidentRun(t *testing.T) {
 	})
 	incident, _ := seedAlert(t, server, "fp-dashboard-large")
 	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
+	extraAlerts := 28
 	server.store.mu.Lock()
-	for i := 1; i <= maxManualAnalyzeFanout+3; i++ {
+	for i := 1; i <= extraAlerts; i++ {
 		alertID := fmt.Sprintf("ALR-large-%03d", i)
 		server.store.alerts[alertID] = &AlertRecord{
 			AlertID:     alertID,
@@ -778,7 +779,7 @@ func TestDashboardAnalyzeLargeIncidentUsesSingleIncidentRun(t *testing.T) {
 			Annotations: map[string]string{"summary": "Queue blocked"},
 		}
 	}
-	server.store.incidents[incident.IncidentID].AlertCount = maxManualAnalyzeFanout + 4
+	server.store.incidents[incident.IncidentID].AlertCount = extraAlerts + 1
 	server.store.mu.Unlock()
 	path := "/api/v1/incidents/" + incident.IncidentID + "/analyze"
 

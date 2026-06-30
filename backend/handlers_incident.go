@@ -76,50 +76,21 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "incident has no alerts to analyze")
 			return
 		}
-		if len(detail.Alerts) > maxManualAnalyzeFanout {
-			run, ok := s.startAnalysisRun("incident", id, "manual", "")
-			if !ok {
-				if run != nil && run.Status == "analyzing" {
-					writeJSON(w, http.StatusAccepted, map[string]any{
-						"status": "analysis_already_running",
-					})
-					return
-				}
-				writeError(w, http.StatusNotFound, "analysis target not found")
-				return
-			}
-			writeJSON(w, http.StatusAccepted, map[string]any{
-				"status":        "analysis_requested",
-				"mode":          "incident",
-				"analysis_runs": 1,
-				"alert_count":   len(detail.Alerts),
-			})
-			return
-		}
-		started := 0
-		alreadyRunning := false
-		for _, alert := range detail.Alerts {
-			run, ok := s.startAnalysisRun("alert", alert.AlertID, "manual", "")
-			if ok {
-				started++
-			} else if run != nil && run.Status == "analyzing" {
-				alreadyRunning = true
-			}
-		}
-		if started == 0 {
-			if alreadyRunning {
+		run, ok := s.startAnalysisRun("incident", id, "manual", "")
+		if !ok {
+			if run != nil && run.Status == "analyzing" {
 				writeJSON(w, http.StatusAccepted, map[string]any{
 					"status": "analysis_already_running",
 				})
 				return
 			}
-			writeError(w, http.StatusConflict, "incident has no analyzable alerts")
+			writeError(w, http.StatusNotFound, "analysis target not found")
 			return
 		}
 		writeJSON(w, http.StatusAccepted, map[string]any{
 			"status":        "analysis_requested",
-			"mode":          "alerts",
-			"analysis_runs": started,
+			"mode":          "incident",
+			"analysis_runs": 1,
 			"alert_count":   len(detail.Alerts),
 		})
 	case "resolve":
