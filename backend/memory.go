@@ -383,10 +383,19 @@ func (s *Store) similarIncidentsLocked(
 		}
 		return results[i].Similarity > results[j].Similarity
 	})
-	if len(results) > limit {
-		return results[:limit]
+	deduped := results[:0]
+	seen := map[string]struct{}{}
+	for _, result := range results {
+		if _, ok := seen[result.IncidentID]; ok {
+			continue
+		}
+		seen[result.IncidentID] = struct{}{}
+		deduped = append(deduped, result)
+		if len(deduped) >= limit {
+			break
+		}
 	}
-	return results
+	return deduped
 }
 
 func alertSearchText(alert Alert) string {

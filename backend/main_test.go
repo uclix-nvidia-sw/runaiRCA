@@ -1249,6 +1249,50 @@ func TestSimilarIncidentsLimitAndLatestTieBreak(t *testing.T) {
 	}
 }
 
+func TestSimilarIncidentsDedupesAlertMemoriesByIncident(t *testing.T) {
+	store := NewStore()
+	alert := Alert{
+		Status: "firing",
+		Labels: map[string]string{
+			"alertname": "RunAIWorkloadPending",
+			"severity":  "warning",
+			"cluster":   "lab",
+			"namespace": "runai",
+			"pod":       "trainer-0",
+		},
+		Annotations: map[string]string{"summary": "GPU quota exhausted for trainer"},
+	}
+	base := time.Date(2026, 6, 26, 9, 0, 0, 0, time.UTC)
+	for _, item := range []struct {
+		alertID string
+		at      time.Time
+	}{
+		{"ALR-prior-old", base},
+		{"ALR-prior-new", base.Add(time.Minute)},
+	} {
+		store.memories[item.alertID] = &IncidentMemory{
+			IncidentID:      "INC-prior-shared",
+			AlertID:         item.alertID,
+			Title:           "RunAI workload pending",
+			Severity:        "warning",
+			Status:          "resolved",
+			AnalysisSummary: "GPU quota exhausted for trainer",
+			AnalysisDetail:  "Quota was expanded.",
+			Labels:          cloneMap(alert.Labels),
+			CreatedAt:       item.at,
+			Vector:          textVector(alertSearchText(alert)),
+		}
+	}
+
+	similar := store.SimilarIncidentsForAlert(alert, "INC-current", 5)
+	if len(similar) != 1 {
+		t.Fatalf("expected one similar incident per prior incident, got %+v", similar)
+	}
+	if similar[0].AlertID != "ALR-prior-new" {
+		t.Fatalf("expected latest tied alert memory to represent incident, got %+v", similar[0])
+	}
+}
+
 func TestFeedbackHintsCapsInvalidLimit(t *testing.T) {
 	store := NewStore()
 	alert := Alert{
