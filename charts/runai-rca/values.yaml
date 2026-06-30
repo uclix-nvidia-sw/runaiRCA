@@ -141,7 +141,7 @@ agent:
     prometheusUrl: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
     prometheusTimeoutSeconds: 6
     prometheusMcpUrl: ""
-    lokiUrl: http://loki-query-frontend.monitoring.svc.cluster.local:3100
+    lokiUrl: http://loki-read.monitoring.svc.cluster.local:3100
     lokiTimeoutSeconds: 6
     lokiQueryLimit: 20
     lokiMcpUrl: ""

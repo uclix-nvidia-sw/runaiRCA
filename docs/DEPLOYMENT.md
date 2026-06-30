@@ -59,7 +59,7 @@ helm template runai-rca charts/runai-rca
 helm install runai-rca charts/runai-rca \
   --set agent.env.runaiBaseUrl=https://runai.example.com \
   --set agent.env.prometheusUrl=http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090 \
-  --set agent.env.lokiUrl=http://loki-query-frontend.monitoring.svc.cluster.local:3100 \
+  --set agent.env.lokiUrl=http://loki-read.monitoring.svc.cluster.local:3100 \
   --set-string agent.env.runaiLogNamespaces='runai\,runai-backend' \
   --set secrets.existingSecret=runai-rca-secrets
 ```

@@ -35,7 +35,7 @@ the collectors query cluster-local service URLs directly. The Helm chart default
 Prometheus to
 `http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090`
 and Loki to
-`http://loki-query-frontend.monitoring.svc.cluster.local:3100`; override those
+`http://loki-read.monitoring.svc.cluster.local:3100`; override those
 values when the cluster service names differ. The default uses the direct Loki
 query service and avoids gateway-level Basic Auth.
 

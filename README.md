@@ -93,7 +93,7 @@ helm upgrade --install runai-rca oci://ghcr.io/<owner>/charts/runai-rca \
   --set agent.env.runaiBaseUrl=https://runai.example.com \
   --set agent.env.runaiTokenUrl=https://runai.example.com/auth/token \
   --set agent.env.prometheusUrl=http://prometheus.monitoring.svc:9090 \
-  --set agent.env.lokiUrl=http://loki-query-frontend.monitoring.svc.cluster.local:3100
+  --set agent.env.lokiUrl=http://loki-read.monitoring.svc.cluster.local:3100
 ```
 
 Bundled single-pod Postgres instead of an external DB: `--set postgresql.enabled=true`.
@@ -145,7 +145,7 @@ Key values (full secret keys: `DATABASE_URL`, `POSTGRES_DSN`, `RUNAI_CLIENT_ID`,
 | `global.imageRegistry` / `imagePullSecrets` | Registry prefix and pull secrets for all images |
 | `secrets.existingSecret` | Existing Secret with DB/Run:ai/NVIDIA/LLM credentials |
 | `agent.env.runaiBaseUrl` / `runaiTokenUrl` | Run:ai API URL and OAuth token URL (token URL required for client_id/secret) |
-| `agent.env.prometheusUrl` / `lokiUrl` | In-cluster Prometheus / Loki URLs. Loki defaults to the direct query-frontend service, not the authenticated gateway. |
+| `agent.env.prometheusUrl` / `lokiUrl` | In-cluster Prometheus / Loki URLs. Loki defaults to the direct read service, not the authenticated gateway. |
 | `agent.env.enableNatRuntime` / `natConfigFile` | Enable NeMo synthesis and select workflow config |
 | `agent.env.llmBaseUrl` / `llmModel` | OpenAI-compatible endpoint and model |
 | `agent.rbac.clusterWide` / `namespaces` | Read-only RBAC scope for evidence collection |

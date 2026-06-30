@@ -33,7 +33,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `PROMETHEUS_URL` | Prometheus base URL |
 | `PROMETHEUS_TIMEOUT_SECONDS` | Prometheus query timeout |
 | `PROMETHEUS_MCP_URL` | Optional remote Prometheus MCP URL for the MCP workflow |
-| `LOKI_URL` | Loki base URL. In Helm this should normally point to the direct query service, for example `http://loki-query-frontend.monitoring.svc.cluster.local:3100`, not an authenticated gateway. |
+| `LOKI_URL` | Loki base URL. In Helm this should normally point to the direct read/query service, for example `http://loki-read.monitoring.svc.cluster.local:3100`, not an authenticated gateway. |
 | `LOKI_TIMEOUT_SECONDS` | Loki query timeout |
 | `LOKI_QUERY_LIMIT` | Maximum log lines requested per Loki query group, default `20` |
 | `LOKI_MCP_URL` | Optional remote Loki MCP URL for the MCP workflow |
@@ -114,7 +114,7 @@ Frequently tuned Helm values:
 | `agent.env.runaiWorkloadsPath`, `runaiProjectsPath`, `runaiQueuesPath` | Run:ai API path overrides for different Run:ai versions |
 | `agent.env.runaiLogNamespaces` | Namespaces for Run:ai control-plane/backend logs, default `runai,runai-backend` |
 | `agent.env.prometheusUrl` | In-cluster Prometheus URL, for example `http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090` |
-| `agent.env.lokiUrl` | In-cluster Loki query URL, for example `http://loki-query-frontend.monitoring.svc.cluster.local:3100`. The chart intentionally avoids the authenticated `loki-gateway` path by default. |
+| `agent.env.lokiUrl` | In-cluster Loki query URL, for example `http://loki-read.monitoring.svc.cluster.local:3100`. The chart intentionally avoids the authenticated `loki-gateway` path by default. |
 | `agent.env.prometheusMcpUrl` / `agent.env.lokiMcpUrl` | Remote MCP endpoints when using the MCP workflow |
 | `agent.env.llmBaseUrl` / `agent.env.llmModel` / `secrets.llmApiKey` | LiteLLM/OpenAI-compatible endpoint, model, and Secret-backed API key for `runai_rca_workflow_litellm.yml` |
 | `agent.env.*TimeoutSeconds` | Request/runtime timeouts for Kubernetes, Run:ai, Prometheus, Loki, Postgres, and NAT |
