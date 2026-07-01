@@ -145,7 +145,7 @@ def _replace_attr(
     # quoted=False for non-string attributes (e.g. integer occurrence_count).
     tx.query(
         f'match $x isa {etype}, has {key_attr} "{esc(key_value)}", has {attr} $old; '
-        f"delete $x has $old;"
+        f"delete has $old of $x;"  # TypeDB 3.x: `delete has <attr> of <owner>` (2.x was `delete $x has $old`)
     ).resolve()
     value = f'"{esc(str(new_value))}"' if quoted else str(new_value)
     tx.query(
