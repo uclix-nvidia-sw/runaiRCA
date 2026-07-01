@@ -113,7 +113,8 @@ async def _fetch(limit: int, resolved_grace_hours: int = 0) -> list[dict[str, An
 
     settings = load_settings()
     if not settings.postgres_dsn:
-        raise SystemExit("POSTGRES_DSN is not set.")
+        print("POSTGRES_DSN not set; skipping ingest.")
+        return []
     conn = await asyncpg.connect(settings.postgres_dsn)
     try:
         if resolved_grace_hours > 0:
