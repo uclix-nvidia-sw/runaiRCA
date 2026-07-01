@@ -526,7 +526,7 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 		if existing := s.latestAutoAnalysisRunLocked(alertID); existing != nil {
 			return cloneAnalysisRun(existing), false
 		}
-	} else if existing := s.latestReusableAnalysisRunLocked(targetType, targetID, alertID); existing != nil {
+	} else if existing := s.latestReusableAnalysisRunLocked(targetType, targetID); existing != nil {
 		// Re-analysis updates the existing run in place instead of appending a
 		// new row, so an incident keeps a single evolving RCA run.
 		existing.Status = "analyzing"
@@ -589,17 +589,16 @@ func (s *Store) latestAutoAnalysisRunLocked(alertID string) *AnalysisRun {
 }
 
 // latestReusableAnalysisRunLocked returns the most recent non-analyzing run for
-// the target so a re-analysis can update it in place instead of creating a new
-// row (one evolving RCA run per incident/alert).
-func (s *Store) latestReusableAnalysisRunLocked(targetType string, targetID string, alertID string) *AnalysisRun {
+// the exact target so a re-analysis updates it in place instead of creating a
+// new row. Matched by target_type+target_id only: an alert-scoped run and an
+// incident-scoped run for the same alert are distinct and must stay separate.
+func (s *Store) latestReusableAnalysisRunLocked(targetType string, targetID string) *AnalysisRun {
 	var selected *AnalysisRun
 	for _, run := range s.analysisRuns {
 		if run == nil || run.Status == "analyzing" {
 			continue
 		}
-		sameTarget := run.TargetType == targetType && run.TargetID == targetID
-		sameAlert := alertID != "" && run.AlertID == alertID
-		if !sameTarget && !sameAlert {
+		if run.TargetType != targetType || run.TargetID != targetID {
 			continue
 		}
 		if selected == nil || run.UpdatedAt.After(selected.UpdatedAt) {
