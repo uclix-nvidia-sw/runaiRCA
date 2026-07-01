@@ -136,18 +136,21 @@ def _ensure(tx: Any, etype: str, key_attr: str, value: str) -> None:
 
 
 def _replace_attr(
-    tx: Any, etype: str, key_attr: str, key_value: str, attr: str, new_value: str
+    tx: Any, etype: str, key_attr: str, key_value: str, attr: str, new_value: Any, quoted: bool = True
 ) -> None:
     # Remove any existing value of `attr`, then set the new one. Replace (not
     # add-if-missing) so a re-projected incident whose RCA/status changed after a
-    # re-open+re-analysis updates in place instead of accumulating stale values.
+    # re-open+re-analysis updates in place instead of accumulating stale values —
+    # required, since owns defaults to @card(0..1) so a second value fails commit.
+    # quoted=False for non-string attributes (e.g. integer occurrence_count).
     tx.query(
         f'match $x isa {etype}, has {key_attr} "{esc(key_value)}", has {attr} $old; '
         f"delete $x has $old;"
     ).resolve()
+    value = f'"{esc(str(new_value))}"' if quoted else str(new_value)
     tx.query(
         f'match $x isa {etype}, has {key_attr} "{esc(key_value)}"; '
-        f'insert $x has {attr} "{esc(new_value)}";'
+        f"insert $x has {attr} {value};"
     ).resolve()
 
 
@@ -195,15 +198,21 @@ def _write_incident(tx: Any, inc: OntologyIncident) -> None:
     ):
         _replace_attr(tx, "incident", "incident_id", inc.incident_id, attr, value)
 
-    # alert attributes + grouped_into(incident, alert)
+    # alert attributes + grouped_into(incident, alert). Replace-in-place (like the
+    # incident attrs above) so re-projecting the same alert with a changed value
+    # updates instead of adding a 2nd value that fails commit (@card(0..1)).
     if inc.alert_id:
-        tx.query(
-            f'match $a isa alert, has alert_id "{esc(inc.alert_id)}"; '
-            f'insert $a has alert_name "{esc(inc.alert_name)}", '
-            f'has severity "{esc(inc.severity)}", has status "{esc(inc.status)}", '
-            f'has fingerprint "{esc(inc.fingerprint)}", '
-            f"has occurrence_count {max(inc.occurrence_count, 0)};"
-        ).resolve()
+        for attr, value in (
+            ("alert_name", inc.alert_name),
+            ("severity", inc.severity),
+            ("status", inc.status),
+            ("fingerprint", inc.fingerprint),
+        ):
+            _replace_attr(tx, "alert", "alert_id", inc.alert_id, attr, value)
+        _replace_attr(
+            tx, "alert", "alert_id", inc.alert_id,
+            "occurrence_count", max(inc.occurrence_count, 0), quoted=False,
+        )
         _relate(
             tx,
             ("incident", "incident_id", inc.incident_id),

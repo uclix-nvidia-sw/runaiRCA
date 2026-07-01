@@ -123,7 +123,10 @@ entity symptom,
     owns name,
     owns reason,
     owns condition_type,
-    owns keyword,
+    # A symptom matches on many keywords. TypeDB 3.x defaults ownership to
+    # @card(0..1), so this MUST be explicit or multi-keyword insert fails at
+    # commit ([CNT5] @card(0..1) violated).
+    owns keyword @card(0..),
     plays has_symptom:symptom,
     plays indicates:symptom,
     plays resolved_by:symptom,
