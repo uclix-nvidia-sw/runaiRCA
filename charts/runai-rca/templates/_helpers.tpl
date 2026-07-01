@@ -118,7 +118,13 @@ true
 {{- $root := .root -}}
 {{- $image := .image -}}
 {{- $tag := default $root.Chart.AppVersion $image.tag -}}
-{{- if $root.Values.global.imageRegistry -}}
+{{- /* Only prefix global.imageRegistry onto short repos (our own images, e.g. */ -}}
+{{- /* runai-rca-agent). A repo already carrying a registry host — first path */ -}}
+{{- /* segment contains "." or ":" — is fully qualified (e.g. docker.io/typedb/typedb) */ -}}
+{{- /* and must NOT be clobbered, or third-party images 403 against our private org. */ -}}
+{{- $firstSegment := $image.repository | toString | splitList "/" | first -}}
+{{- $qualified := or (contains "." $firstSegment) (contains ":" $firstSegment) (eq $firstSegment "localhost") -}}
+{{- if and $root.Values.global.imageRegistry (not $qualified) -}}
 {{- printf "%s/%s:%s" $root.Values.global.imageRegistry $image.repository $tag -}}
 {{- else -}}
 {{- printf "%s:%s" $image.repository $tag -}}

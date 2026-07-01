@@ -37,7 +37,9 @@ postgresql:
   # the bundled database can serve real vector similarity search. It is a drop-in
   # replacement for the official postgres image (same env vars, same data dir).
   image:
-    repository: pgvector/pgvector
+    # Fully qualified so global.imageRegistry does NOT rewrite this third-party
+    # image to a private org (see typedb.image comment).
+    repository: docker.io/pgvector/pgvector
     tag: "pg16"
     pullPolicy: IfNotPresent
   auth:
@@ -82,7 +84,10 @@ typedb:
     limit: 200
     requireReview: false        # true = only operator-reviewed incidents
   image:
-    repository: typedb/typedb
+    # Fully qualified (docker.io/...) so global.imageRegistry does NOT rewrite it
+    # to a private org. Air-gapped? Point this at your mirror, e.g.
+    # my-registry.internal/typedb/typedb (also fully qualified → not re-prefixed).
+    repository: docker.io/typedb/typedb
     tag: "3.11.5"
     pullPolicy: IfNotPresent
   auth:

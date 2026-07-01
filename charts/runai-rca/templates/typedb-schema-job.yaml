@@ -1,8 +1,10 @@
 {{- if and .Values.typedb.enabled .Values.typedb.loadSchema }}
 # Post-install/upgrade hook that loads ontology/schema.tql into TypeDB once the
 # server is reachable, so the knowledge graph is queryable on a fresh install.
-# Uses the agent image (which ships ontology/ + typedb-driver) and retries via
-# restartPolicy: OnFailure until TypeDB accepts connections.
+# Uses the agent image (which ships ontology/ + typedb-driver). An initContainer
+# gates the load on TypeDB accepting connections (K8s has no Job dependsOn), so
+# the main container runs once cleanly instead of crash-looping while the
+# StatefulSet pod starts. restartPolicy: OnFailure remains a safety net.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -28,6 +30,32 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      initContainers:
+        - name: wait-for-typedb
+          image: {{ include "runai-rca.image" (dict "root" . "image" .Values.agent.image) | quote }}
+          imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
+          command:
+            - python
+            - -c
+            - |
+              import os, socket, time
+              host, _, port = os.environ["TYPEDB_ADDRESS"].rpartition(":")
+              port = int(port)
+              deadline = time.time() + 600
+              while time.time() < deadline:
+                  try:
+                      socket.create_connection((host, port), timeout=3).close()
+                  except OSError:
+                      print("waiting for typedb at %s:%d ..." % (host, port), flush=True)
+                      time.sleep(3)
+                      continue
+                  print("typedb reachable at %s:%d" % (host, port), flush=True)
+                  break
+              else:
+                  raise SystemExit("timed out waiting for typedb at %s:%d" % (host, port))
+          env:
+            - name: TYPEDB_ADDRESS
+              value: {{ include "runai-rca.typedb.address" . | quote }}
       containers:
         - name: load-schema
           image: {{ include "runai-rca.image" (dict "root" . "image" .Values.agent.image) | quote }}
