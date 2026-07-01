@@ -529,10 +529,19 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 	} else if existing := s.latestReusableAnalysisRunLocked(targetType, targetID); existing != nil {
 		// Re-analysis updates the existing run in place instead of appending a
 		// new row, so an incident keeps a single evolving RCA run.
+		// Clear previous result fields so stale content is not surfaced while
+		// the new analysis is in progress.
 		existing.Status = "analyzing"
 		existing.Source = source
 		existing.Title = run.Title
 		existing.Prompt = run.Prompt
+		existing.AnalysisSummary = ""
+		existing.AnalysisDetail = ""
+		existing.AnalysisQuality = ""
+		existing.Capabilities = map[string]string{}
+		existing.MissingData = []string{}
+		existing.Warnings = []string{}
+		existing.Artifacts = []Artifact{}
 		existing.UpdatedAt = now
 		if !s.persistAnalysisRunLocked(existing) {
 			return AnalysisRun{}, false
