@@ -1,8 +1,8 @@
 """Load curated failure-mode knowledge (knowledge/failure_modes.yaml) into TypeDB.
 
 Populates the ontology's knowledge layer:
-    symptom  -indicates->  root_cause(family)  -fixed_by->  action
-i.e. the team-curated "this symptom -> this cause -> fixed by this action"
+    symptom  -indicates->  root_cause(family); symptom  -resolved_by->  action
+i.e. the team-curated "this symptom -> this cause -> resolved by this action"
 knowledge the synthesis step consults for remediation.
 
     ENABLE_TYPEDB=true TYPEDB_ADDRESS=localhost:1729 \
