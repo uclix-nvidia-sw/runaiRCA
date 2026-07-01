@@ -2,6 +2,13 @@
 
 Go API server for Run:AI RCA.
 
+## Layout
+
+- `main.go` starts the process.
+- `internal/server/` contains the HTTP handlers, store, agent client, memory,
+  events, and package-level tests.
+- `internal/server/testsupport/` contains shared test doubles.
+
 The backend uses an in-memory store when no database is configured and upgrades
 to Postgres when `DATABASE_URL` or `POSTGRES_DSN` is present. The Postgres store
 persists incidents, alerts, similar-incident vectors, feedback votes, markdown
