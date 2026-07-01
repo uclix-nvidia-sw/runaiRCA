@@ -17,15 +17,16 @@ and similar-incident vectors without changing the UI contract.
 4. Backend creates or updates the incident and alert records.
 5. Backend asynchronously calls Agent `POST /analyze`.
 6. Agent runs component evidence collectors in parallel:
-   Run:ai, Kubernetes, Postgres, Prometheus, Loki, and (optionally) TypeDB.
-7. A deterministic root-cause ranking step scores the five failure families
+   Run:ai, Kubernetes, Postgres, Prometheus, Loki.
+7. The analysis/synthesis step consults the optional TypeDB ontology knowledge
+   base once (node blast radius and prior same-alert incidents), and a
+   deterministic root-cause ranking scores the five failure families
    (node/kubelet pressure, scheduling/quota exhaustion, control-plane error,
-   workload/image startup failure, insufficient evidence) from the collected
-   evidence using rules R1-R6, and never names a cause without a corroborating
-   source.
-8. Agent synthesizes a single RCA plus an `artifacts` list that preserves each
-   agent's query, summary, confidence, and status, and surfaces the ranked
-   candidates in the response context.
+   workload/image startup failure, insufficient evidence) using rules R1-R6,
+   never naming a cause without a corroborating source.
+8. Agent synthesizes a single RCA — grounded in the collected evidence, the
+   ranked candidates, and the knowledge-base facts — plus an `artifacts` list
+   that preserves each agent's query, summary, confidence, and status.
 9. Backend stores the analysis response and broadcasts SSE updates.
 10. Backend writes analyzed incidents into `incident_embeddings` and includes
    similar prior incidents plus feedback hints in future Agent requests.
@@ -91,8 +92,10 @@ The key interaction is the Unified RCA Workspace:
 
 ## Ontology Knowledge Graph
 
-An optional TypeDB knowledge graph (`typedb.enabled`, default off) adds
-relational reasoning that pgvector similarity and label overlap cannot express.
+An optional TypeDB knowledge graph (`typedb.enabled`, default off) gives the
+final analysis/synthesis step relational reasoning that pgvector similarity and
+label overlap cannot express. It is a knowledge resource consulted once at
+synthesis time — not a parallel evidence collector.
 
 - **Schema** (`agent/ontology/schema.tql`): typed entities (cluster, node, GPU,
   pod, workload, project, queue, namespace, alert, incident, symptom, root
@@ -103,10 +106,11 @@ relational reasoning that pgvector similarity and label overlap cannot express.
   projection of the existing `incidents`/`alerts` Postgres rows into the graph.
   Only incidents an operator has reviewed (an up-vote or a comment) are
   committed, so the graph is not poisoned by unverified auto-analysis.
-- **Collector** (`agent/app/collectors/typedb.py`): queries the graph for facts
-  the flat collectors miss — node blast radius (how many workloads share the
-  alerting node) and incident history — and returns them as artifacts. It
-  degrades to `unavailable`/`partial` when disabled or unreachable.
+- **Enrichment** (`agent/app/services/kg_enrichment.py`): the analysis/synthesis
+  step queries the graph once for facts the flat collectors miss — node blast
+  radius (how many workloads share the alerting node) and prior incidents that
+  fired the same alert, with their stored RCA. Degrades to an empty context when
+  TypeDB is disabled or unreachable; never raises into the analysis path.
 - **Ranking** (`agent/app/services/root_cause_ranking.py`): scores the five
   failure families for the current incident (rules R1-R6). This ranks *causes*,
   not similarity — pgvector still owns "which past incidents are similar".
@@ -128,8 +132,7 @@ Agent responses contain both the synthesized RCA and source-level artifacts.
     "kubernetes": "partial",
     "postgres": "ok",
     "prometheus": "unavailable",
-    "loki": "ok",
-    "typedb": "ok"
+    "loki": "ok"
   },
   "artifacts": [
     {

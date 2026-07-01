@@ -10,6 +10,7 @@ COPY app ./app
 COPY configs ./configs
 COPY knowledge ./knowledge
 COPY prompts ./prompts
+COPY ontology ./ontology
 
 RUN pip install --no-cache-dir .
 

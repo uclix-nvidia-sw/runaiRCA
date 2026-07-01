@@ -33,6 +33,7 @@ class OntologyIncident(BaseModel):
     incident_id: str
     alert_id: str = ""
     correlation_key: str = ""
+    analysis_summary: str = ""
     title: str = ""
     severity: str = "warning"
     status: str = "firing"

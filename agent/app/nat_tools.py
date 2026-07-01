@@ -11,7 +11,6 @@ from app.collectors.loki import LokiCollector
 from app.collectors.postgres import PostgresCollector
 from app.collectors.prometheus import PrometheusCollector
 from app.collectors.runai import RunAICollector
-from app.collectors.typedb import TypeDBCollector
 from app.config import load_settings
 from app.knowledge import load_troubleshooting_cases
 from app.masking import build_masker
@@ -37,10 +36,6 @@ class PrometheusContextConfig(FunctionBaseConfig, name="prometheus_context"):
 
 class LokiContextConfig(FunctionBaseConfig, name="loki_context"):
     """Collect workload logs plus runai/runai-backend control-plane and backend log evidence."""
-
-
-class TypeDBContextConfig(FunctionBaseConfig, name="typedb_context"):
-    """Collect Run:ai knowledge-graph evidence: node blast radius and incident history."""
 
 
 class TroubleshootingCasesConfig(FunctionBaseConfig, name="troubleshooting_cases"):
@@ -97,14 +92,6 @@ async def loki_context(_config: LokiContextConfig, _builder: Builder):
         return await _run_collector(input_message, LokiCollector(load_settings()))
 
     yield FunctionInfo.from_fn(_collect, description=LokiContextConfig.__doc__ or "")
-
-
-@register_function(config_type=TypeDBContextConfig)
-async def typedb_context(_config: TypeDBContextConfig, _builder: Builder):
-    async def _collect(input_message: str) -> str:
-        return await _run_collector(input_message, TypeDBCollector(load_settings()))
-
-    yield FunctionInfo.from_fn(_collect, description=TypeDBContextConfig.__doc__ or "")
 
 
 @register_function(config_type=TroubleshootingCasesConfig)

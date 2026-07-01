@@ -526,6 +526,27 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 		if existing := s.latestAutoAnalysisRunLocked(alertID); existing != nil {
 			return cloneAnalysisRun(existing), false
 		}
+	} else if existing := s.latestReusableAnalysisRunLocked(targetType, targetID); existing != nil {
+		// Re-analysis updates the existing run in place instead of appending a
+		// new row, so an incident keeps a single evolving RCA run.
+		// Clear previous result fields so stale content is not surfaced while
+		// the new analysis is in progress.
+		existing.Status = "analyzing"
+		existing.Source = source
+		existing.Title = run.Title
+		existing.Prompt = run.Prompt
+		existing.AnalysisSummary = ""
+		existing.AnalysisDetail = ""
+		existing.AnalysisQuality = ""
+		existing.Capabilities = map[string]string{}
+		existing.MissingData = []string{}
+		existing.Warnings = []string{}
+		existing.Artifacts = []Artifact{}
+		existing.UpdatedAt = now
+		if !s.persistAnalysisRunLocked(existing) {
+			return AnalysisRun{}, false
+		}
+		return cloneAnalysisRun(existing), true
 	}
 	s.analysisRuns[run.RunID] = run
 	if !s.persistAnalysisRunLocked(run) {
@@ -570,6 +591,26 @@ func (s *Store) latestAutoAnalysisRunLocked(alertID string) *AnalysisRun {
 			continue
 		}
 		if selected == nil || run.CreatedAt.After(selected.CreatedAt) {
+			selected = run
+		}
+	}
+	return selected
+}
+
+// latestReusableAnalysisRunLocked returns the most recent non-analyzing run for
+// the exact target so a re-analysis updates it in place instead of creating a
+// new row. Matched by target_type+target_id only: an alert-scoped run and an
+// incident-scoped run for the same alert are distinct and must stay separate.
+func (s *Store) latestReusableAnalysisRunLocked(targetType string, targetID string) *AnalysisRun {
+	var selected *AnalysisRun
+	for _, run := range s.analysisRuns {
+		if run == nil || run.Status == "analyzing" {
+			continue
+		}
+		if run.TargetType != targetType || run.TargetID != targetID {
+			continue
+		}
+		if selected == nil || run.UpdatedAt.After(selected.UpdatedAt) {
 			selected = run
 		}
 	}

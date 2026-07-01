@@ -296,10 +296,8 @@ async def test_analyze_returns_unified_artifacts() -> None:
         "postgres",
         "prometheus",
         "loki",
-        "typedb",
     }
     assert response.capabilities["runai"] in {"partial", "ok"}
-    assert response.capabilities["typedb"] == "unavailable"
 
 
 @pytest.mark.asyncio

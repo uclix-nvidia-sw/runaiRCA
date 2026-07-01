@@ -15,6 +15,7 @@ attribute incident_id, value string;
 attribute alert_id, value string;
 attribute run_id, value string;
 attribute correlation_key, value string;
+attribute analysis_summary, value string;
 attribute title, value string;
 attribute severity, value string;
 attribute status, value string;
@@ -23,6 +24,7 @@ attribute fingerprint, value string;
 attribute occurrence_count, value integer;
 attribute reason, value string;
 attribute condition_type, value string;
+attribute keyword, value string;
 attribute workload_type, value string;
 attribute workload_id, value string;
 attribute gpu_allocated, value double;
@@ -98,6 +100,7 @@ entity alert,
 entity incident,
     owns incident_id @key,
     owns correlation_key,
+    owns analysis_summary,
     owns title,
     owns severity,
     owns status,
@@ -120,8 +123,10 @@ entity symptom,
     owns name,
     owns reason,
     owns condition_type,
+    owns keyword,
     plays has_symptom:symptom,
     plays indicates:symptom,
+    plays resolved_by:symptom,
     plays supported_by:claim,
     plays emits:signal;
 
@@ -144,7 +149,8 @@ entity insufficient_evidence sub root_cause;
 
 entity action,
     owns statement,
-    plays fixed_by:remedy;
+    plays fixed_by:remedy,
+    plays resolved_by:remedy;
 
 entity evidence,
     owns source,
@@ -168,7 +174,8 @@ relation grouped_into, relates incident, relates member;  # incident <- alert
 relation has_symptom, relates incident, relates symptom;
 relation indicates, relates symptom, relates cause;       # symptom indicates root_cause
 relation has_cause, relates incident, relates cause;
-relation fixed_by, relates cause, relates remedy;         # root_cause fixed_by action
+relation fixed_by, relates cause, relates remedy;         # root_cause fixed_by action (family-level)
+relation resolved_by, relates symptom, relates remedy;    # symptom resolved_by action (precise)
 relation supported_by, relates claim, relates proof;      # (symptom|root_cause) <- evidence
 relation analyzed_by, relates incident, relates run;
 relation similar_to, relates this, relates other;
