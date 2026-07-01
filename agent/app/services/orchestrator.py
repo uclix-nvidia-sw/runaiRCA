@@ -20,7 +20,6 @@ from app.collectors.loki import LokiCollector
 from app.collectors.postgres import PostgresCollector
 from app.collectors.prometheus import PrometheusCollector
 from app.collectors.runai import RunAICollector
-from app.collectors.typedb import TypeDBCollector
 from app.config import Settings
 from app.knowledge import load_troubleshooting_cases
 from app.masking import Masker, build_masker
@@ -33,6 +32,7 @@ from app.schemas import (
     IncidentSummaryRequest,
     IncidentSummaryResponse,
 )
+from app.services.kg_enrichment import enrich
 from app.services.root_cause_ranking import RankedCause, rank_root_cause_candidates
 
 TModel = TypeVar("TModel", bound=BaseModel)
@@ -144,13 +144,16 @@ class AnalysisOrchestrator:
             PostgresCollector(settings),
             PrometheusCollector(settings),
             LokiCollector(settings),
-            TypeDBCollector(settings),
         ]
 
     async def analyze(self, request: AlertAnalysisRequest) -> AlertAnalysisResponse:
         target = resolve_target(request.alert.labels, request.alert.annotations)
+        # Knowledge graph is consulted once here, at synthesis time, as a
+        # knowledge resource for the final RCA — not as a parallel collector.
+        kg_context = await enrich(self._settings, target)
         nat_payload = request.model_dump(mode="json")
         nat_payload["mode"] = "alert_analysis"
+        nat_payload["kg_context"] = kg_context.as_dict()
         agent_souls = load_agent_souls(self._settings.agent_souls_file)
         nat_payload["agent_souls"] = agent_souls
         nat_text = None
@@ -171,13 +174,22 @@ class AnalysisOrchestrator:
             {item for result in results for item in result.warnings} | set(nat_warnings)
         )
         root_cause_candidates = rank_root_cause_candidates(
-            target, results, occurrence_count=request.occurrence_count
+            target,
+            results,
+            occurrence_count=request.occurrence_count,
+            kg_blast_radius=kg_context.blast_radius_workloads,
         )
         quality = _quality_from(results)
         summary = _summary_from(request, results, root_cause_candidates)
         playbook = load_troubleshooting_cases(self._settings.troubleshooting_cases_file)
         detail = nat_text if nat_text else _detail_from(
-            request, results, missing, playbook, agent_souls, root_cause_candidates
+            request,
+            results,
+            missing,
+            playbook,
+            agent_souls,
+            root_cause_candidates,
+            kg_context.as_dict(),
         )
 
         response = AlertAnalysisResponse(
@@ -210,6 +222,7 @@ class AnalysisOrchestrator:
                 "top_root_cause": (
                     root_cause_candidates[0].as_dict() if root_cause_candidates else None
                 ),
+                "knowledge_base": kg_context.as_dict(),
             },
             artifacts=artifacts,
         )
@@ -422,6 +435,7 @@ def _detail_from(
     troubleshooting_cases: str = "",
     agent_souls: str = "",
     root_cause_candidates: list[RankedCause] | None = None,
+    kg_context: dict | None = None,
 ) -> str:
     labels = request.alert.labels
     annotations = request.alert.annotations
@@ -450,6 +464,9 @@ def _detail_from(
         lines.extend(["", "## Evidence Highlights", "", *highlight_lines])
     if root_cause_candidates:
         lines.extend(_root_cause_candidate_lines(root_cause_candidates))
+    lines.extend(
+        _knowledge_base_lines(kg_context, root_cause_candidates, _observed_text(results))
+    )
     operator_prompt = annotations.get("operator_prompt")
     if operator_prompt:
         lines.extend(
@@ -541,6 +558,77 @@ def _ranked_root_cause_statement(
         f"({top.confidence} confidence). {rationale}.",
         limit=320,
     )
+
+
+def _observed_text(results: list[CollectorResult]) -> str:
+    parts: list[str] = []
+    for result in results:
+        if result.summary:
+            parts.append(result.summary)
+        parts.extend(art.summary for art in result.artifacts if art.summary)
+    return " ".join(parts).lower()
+
+
+def _knowledge_base_lines(
+    kg_context: dict | None,
+    candidates: list[RankedCause] | None = None,
+    observed_text: str = "",
+) -> list[str]:
+    if not kg_context or not kg_context.get("enabled"):
+        return []
+    if not kg_context.get("available"):
+        return [
+            "",
+            "## Knowledge Base (Ontology)",
+            "",
+            "- TypeDB knowledge graph was unreachable; relational KG context was skipped.",
+        ]
+    body: list[str] = []
+    blast = kg_context.get("blast_radius_workloads") or 0
+    if blast:
+        body.append(
+            f"- Blast radius: {blast} workload(s) share the alerting node, so the impact "
+            "is node-wide rather than a single workload."
+        )
+    prior = kg_context.get("prior_incidents") or []
+    if prior:
+        body.append(f"- This alert recurred in {len(prior)} prior incident(s):")
+        for item in prior[:5]:
+            summary = item.get("analysis_summary") or "(no stored RCA summary)"
+            body.append(f"  - {item.get('incident_id')}: {summary}")
+    body.extend(_kb_remediation_lines(kg_context, candidates, observed_text))
+    if not body:
+        body.append("- No related knowledge-graph facts were found for this entity yet.")
+    return ["", "## Knowledge Base (Ontology)", "", *body]
+
+
+def _kb_remediation_lines(
+    kg_context: dict, candidates: list[RankedCause] | None, observed_text: str
+) -> list[str]:
+    knowledge = kg_context.get("knowledge") or {}
+    if not candidates or not knowledge:
+        return []
+    top_family = candidates[0].family
+    symptoms = knowledge.get(top_family) or []
+    if not symptoms:
+        return []
+    text = observed_text.lower()
+    # Precise: the first symptom whose keyword appears in the observed evidence.
+    for symptom in symptoms:
+        if any(str(kw).lower() in text for kw in symptom.get("keywords", [])):
+            actions = symptom.get("actions", [])
+            if actions:
+                header = (
+                    f"- Known fixes for **{symptom.get('symptom')}** "
+                    f"({top_family}, from the knowledge base):"
+                )
+                return [header, *[f"  - {a}" for a in actions[:5]]]
+    # Fallback: no specific symptom matched -> the family's actions.
+    fallback = sorted({a for symptom in symptoms for a in symptom.get("actions", [])})
+    if not fallback:
+        return []
+    header = f"- Known fixes for **{top_family}** (from the knowledge base):"
+    return [header, *[f"  - {a}" for a in fallback[:5]]]
 
 
 def _root_cause_candidate_lines(candidates: list[RankedCause]) -> list[str]:

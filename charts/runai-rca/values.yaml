@@ -69,7 +69,18 @@ typedb:
   # TypeDB 3.x knowledge-graph store for the RCA ontology. Community Edition is
   # single-node (StatefulSet replica 1); HA/clustering is the paid Enterprise tier.
   # No official Helm chart/operator exists, so this template is self-managed.
-  enabled: false
+  # Installed together with the chart by default; set enabled=false to opt out.
+  enabled: true
+  # Auto-load the ontology schema (ontology/schema.tql) into TypeDB via a
+  # post-install/upgrade Helm hook Job so the graph is queryable immediately.
+  loadSchema: true
+  # Periodically project resolved incidents into the KG (the "facts" layer).
+  ingest:
+    enabled: true
+    schedule: "17 */3 * * *"    # every 3 hours
+    resolvedGraceHours: 6       # only incidents resolved >= N hours ago
+    limit: 200
+    requireReview: false        # true = only operator-reviewed incidents
   image:
     repository: typedb/typedb
     tag: "3.11.5"

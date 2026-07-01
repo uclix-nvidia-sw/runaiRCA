@@ -96,11 +96,16 @@ def rank_root_cause_candidates(
     results: list[CollectorResult],
     occurrence_count: int = 0,
     top_n: int = 3,
+    kg_blast_radius: int = 0,
 ) -> list[RankedCause]:
     top_n = max(1, top_n)
     text_by_agent = {r.agent: _result_text(r) for r in results}
     status_by_agent = {r.agent: r.status for r in results}
     blast, blast_agents = _kg_blast_radius(results)
+    # Blast radius now comes from synthesis-time KG enrichment, not a collector.
+    if kg_blast_radius > blast:
+        blast = kg_blast_radius
+        blast_agents = blast_agents | {"knowledge-graph"}
 
     scores = {fam: _Score() for fam in FAMILIES}
     for fam, (canonical, agents, keywords) in _FAMILY_RULES.items():

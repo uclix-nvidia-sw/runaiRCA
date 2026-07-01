@@ -2,7 +2,7 @@
 
 The official `typedb-driver` is synchronous/promise-based — there is no asyncio.
 Callers in the async service MUST run these methods via `asyncio.to_thread(...)`
-so they never block the event loop (see app/collectors/typedb.py).
+so they never block the event loop (see app/services/kg_enrichment.py).
 
 `typedb` is imported lazily inside methods so the module imports even when the
 driver isn't installed (the collector reports that as `unavailable`).

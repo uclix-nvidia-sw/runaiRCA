@@ -1,0 +1,70 @@
+# Curated Run:AI / Kubernetes failure-mode knowledge.
+#
+#   family  = coarse root-cause category (must match root_cause_ranking.py + schema.tql).
+#   symptom = a specific observable signal, identified by `keywords`, with its OWN
+#             precise remediation `actions`.
+#
+# The synthesis matches the incident's evidence against a symptom's keywords and
+# shows THAT symptom's actions (precise), falling back to the family's actions
+# when nothing specific matches. The team maintains this file; load with:
+#
+#   ENABLE_TYPEDB=true TYPEDB_ADDRESS=localhost:1729 python -m ontology.load_knowledge
+
+- family: workload_startup_image_failure
+  symptoms:
+    - name: ImagePullBackOff
+      keywords: [imagepullbackoff, errimagepull, "manifest unknown"]
+      actions:
+        - "Check the image tag/digest and the registry credentials (ImagePullSecret)."
+        - "Confirm the image exists and the node can reach the registry."
+    - name: CrashLoopBackOff
+      keywords: [crashloopbackoff, "back-off restarting"]
+      actions:
+        - "Read the container logs for the crash cause; compare with the last working revision."
+        - "Check the entrypoint/command and the required config/env/secrets."
+    - name: OOMKilled
+      keywords: [oomkilled, "out of memory"]
+      actions:
+        - "Raise the memory limit if the usage is legitimate, otherwise fix the leak."
+        - "Check whether the spike is at startup vs steady state."
+    - name: CreateContainerError
+      keywords: [createcontainererror, failedmount, "permission denied"]
+      actions:
+        - "Check mounted secrets/PVCs and the securityContext (fsGroup/runAsUser)."
+
+- family: scheduling_quota_exhaustion
+  symptoms:
+    - name: Unschedulable GPU
+      keywords: [failedscheduling, unschedulable, "insufficient nvidia.com/gpu"]
+      actions:
+        - "Confirm the queue/project GPU quota against the requested GPU count."
+        - "Check higher-priority workloads consuming the allocation (preemption)."
+    - name: Quota Or Request Changed
+      keywords: [preempt, quota]
+      actions:
+        - "Review whether the queue/project quota or the workload's GPU request changed recently."
+
+- family: node_kubelet_pressure
+  symptoms:
+    - name: Node Disk Pressure
+      keywords: [diskpressure, evicted]
+      actions:
+        - "Cordon/drain the node if multiple unrelated workloads are affected."
+        - "Inspect kubelet disk usage and image/log growth on the node."
+    - name: Node Memory Pressure
+      keywords: [memorypressure]
+      actions:
+        - "Cordon the node; find the memory hog among the node's pods."
+    - name: Node PID Pressure
+      keywords: [pidpressure]
+      actions:
+        - "Check for a process/thread leak on the node."
+
+- family: control_plane_error
+  symptoms:
+    - name: Scheduler Or Reconcile Error
+      keywords: [scheduler, reconcile, admission, "database error", authorization]
+      actions:
+        - "Inspect runai/runai-backend logs around the alert window for scheduler/quota/db errors."
+        - "Check whether several workloads in the same queue/project changed state together."
+        - "Escalate to Run:ai platform owners for repeated control-plane errors."

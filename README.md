@@ -34,27 +34,26 @@ flowchart TD
     DBA[Postgres agent]
     PA[Prometheus agent]
     LA[Loki agent]
-    TG["TypeDB agent / knowledge graph"]
-    RANK["Root-cause ranking: 5 families, R1-R6"]
-    AA[Analysis agent]
+    AA[Analysis / synthesis agent]
   end
 
   AG --> ORCH
-  ORCH --> RA & KA & DBA & PA & LA & TG
-  RA & KA & DBA & PA & LA & TG --> RANK
-  RANK --> AA
+  ORCH --> RA & KA & DBA & PA & LA
+  RA & KA & DBA & PA & LA --> AA
+  AA <-->|"consults: blast radius, prior incidents"| KG[("TypeDB ontology knowledge base")]
   AA -->|dashboard RCA + ranked causes| FE
 
-  TG <-->|"TypeQL: blast radius, history"| KG[("TypeDB knowledge graph")]
   DB -.->|review-gated ingestion| KG
 ```
 
-The **TypeDB agent** queries an ontology knowledge graph for relational facts the
-other collectors can't express (node blast radius, incident history); a
-deterministic **root-cause ranking** step then scores the five failure families
-(rules R1–R6) and passes ranked candidates to the Analysis agent. The graph is
-populated by review-gated ingestion from the Postgres incident store. TypeDB is
-optional (`typedb.enabled`, default off).
+The **Analysis/synthesis agent** — the step that aggregates every collector into a
+single RCA — consults the optional **TypeDB ontology knowledge base** once at
+synthesis time (`typedb.enabled`, default off) for relational facts pgvector
+can't express: node blast radius and prior incidents that fired the same alert
+(with their past RCA). The deterministic root-cause ranking (five families, rules
+R1–R6) runs as a tool of this same step. The knowledge base is a *resource the
+final agent reads*, not a separate parallel collector; it is populated by
+review-gated ingestion from the Postgres incident store.
 
 ## Local Development
 

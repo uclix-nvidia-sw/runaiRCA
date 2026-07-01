@@ -35,16 +35,25 @@ _SELECT_INCIDENTS = """
 SELECT i.incident_id, i.correlation_key, i.title, i.severity, i.status,
        i.fired_at::text AS fired_at,
        a.alert_id, a.fingerprint, a.occurrence_count, a.occurrence_pods,
-       a.labels, a.annotations,
+       a.labels, a.annotations, a.analysis_summary,
        (EXISTS (SELECT 1 FROM rca_feedback f
                  WHERE f.target_id IN (i.incident_id, a.alert_id) AND f.vote = 'up')
         OR EXISTS (SELECT 1 FROM rca_comments c
                     WHERE c.target_id IN (i.incident_id, a.alert_id))) AS reviewed
 FROM incidents i
 JOIN alerts a ON a.incident_id = i.incident_id
+{where}
 ORDER BY i.fired_at DESC
 LIMIT $1
 """
+
+# Only incidents resolved at least N hours ago (grace window lets late feedback /
+# re-analysis settle before the KG learns). Re-fired incidents have status back to
+# 'firing', so they are excluded automatically.
+_RESOLVED_GRACE_WHERE = (
+    "WHERE i.status = 'resolved' AND i.resolved_at IS NOT NULL "
+    "AND i.resolved_at < now() - make_interval(hours => $2::int)"
+)
 
 
 def _json(value: Any) -> dict[str, Any]:
@@ -79,6 +88,7 @@ def _to_incident(row: dict[str, Any]) -> OntologyIncident:
         incident_id=str(row["incident_id"]),
         alert_id=str(row.get("alert_id") or ""),
         correlation_key=str(row.get("correlation_key") or ""),
+        analysis_summary=str(row.get("analysis_summary") or ""),
         title=str(row.get("title") or ""),
         severity=str(row.get("severity") or "warning"),
         status=str(row.get("status") or "firing"),
@@ -98,7 +108,7 @@ def _to_incident(row: dict[str, Any]) -> OntologyIncident:
     )
 
 
-async def _fetch(limit: int) -> list[dict[str, Any]]:
+async def _fetch(limit: int, resolved_grace_hours: int = 0) -> list[dict[str, Any]]:
     import asyncpg
 
     settings = load_settings()
@@ -106,7 +116,11 @@ async def _fetch(limit: int) -> list[dict[str, Any]]:
         raise SystemExit("POSTGRES_DSN is not set.")
     conn = await asyncpg.connect(settings.postgres_dsn)
     try:
-        rows = await conn.fetch(_SELECT_INCIDENTS, limit)
+        if resolved_grace_hours > 0:
+            sql = _SELECT_INCIDENTS.format(where=_RESOLVED_GRACE_WHERE)
+            rows = await conn.fetch(sql, limit, resolved_grace_hours)
+        else:
+            rows = await conn.fetch(_SELECT_INCIDENTS.format(where=""), limit)
     finally:
         await conn.close()
     return [dict(r) for r in rows]
@@ -118,6 +132,22 @@ def _ensure(tx: Any, etype: str, key_attr: str, value: str) -> None:
     q = f'match $x isa {etype}, has {key_attr} "{esc(value)}"; select $x;'
     if not list(tx.query(q).resolve().as_concept_rows()):
         tx.query(f'insert $x isa {etype}, has {key_attr} "{esc(value)}";').resolve()
+
+
+def _replace_attr(
+    tx: Any, etype: str, key_attr: str, key_value: str, attr: str, new_value: str
+) -> None:
+    # Remove any existing value of `attr`, then set the new one. Replace (not
+    # add-if-missing) so a re-projected incident whose RCA/status changed after a
+    # re-open+re-analysis updates in place instead of accumulating stale values.
+    tx.query(
+        f'match $x isa {etype}, has {key_attr} "{esc(key_value)}", has {attr} $old; '
+        f"delete $x has $old;"
+    ).resolve()
+    tx.query(
+        f'match $x isa {etype}, has {key_attr} "{esc(key_value)}"; '
+        f'insert $x has {attr} "{esc(new_value)}";'
+    ).resolve()
 
 
 def _relate(
@@ -133,9 +163,8 @@ def _relate(
     if not va or not vb:
         return
     match = f'$a isa {ta}, has {ka} "{esc(va)}"; $b isa {tb}, has {kb} "{esc(vb)}";'
-    tx.query(
-        f"match {match} not {{ ({role_a}: $a, {role_b}: $b) isa {rel}; }} insert ({role_a}: $a, {role_b}: $b) isa {rel};"
-    ).resolve()
+    relation = f"({role_a}: $a, {role_b}: $b) isa {rel}"
+    tx.query(f"match {match} not {{ {relation}; }} insert {relation};").resolve()
 
 
 def _write_incident(tx: Any, inc: OntologyIncident) -> None:
@@ -149,12 +178,15 @@ def _write_incident(tx: Any, inc: OntologyIncident) -> None:
     _ensure(tx, "incident", "incident_id", inc.incident_id)
     _ensure(tx, "alert", "alert_id", inc.alert_id)
 
-    # incident attributes
-    tx.query(
-        f'match $i isa incident, has incident_id "{esc(inc.incident_id)}"; '
-        f'insert $i has title "{esc(inc.title)}", has severity "{esc(inc.severity)}", '
-        f'has status "{esc(inc.status)}", has correlation_key "{esc(inc.correlation_key)}";'
-    ).resolve()
+    # incident attributes (replace-in-place so re-projection updates, not duplicates)
+    for attr, value in (
+        ("title", inc.title),
+        ("severity", inc.severity),
+        ("status", inc.status),
+        ("correlation_key", inc.correlation_key),
+        ("analysis_summary", inc.analysis_summary),
+    ):
+        _replace_attr(tx, "incident", "incident_id", inc.incident_id, attr, value)
 
     # alert attributes + grouped_into(incident, alert)
     if inc.alert_id:
@@ -218,9 +250,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Ingest backend incidents into TypeDB.")
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--all", action="store_true", help="ingest unreviewed incidents too")
+    parser.add_argument(
+        "--resolved-grace-hours",
+        type=int,
+        default=0,
+        help="only ingest incidents resolved at least N hours ago (0 = no gate)",
+    )
     args = parser.parse_args()
 
-    rows = asyncio.run(_fetch(args.limit))
+    rows = asyncio.run(_fetch(args.limit, args.resolved_grace_hours))
     incidents = [_to_incident(r) for r in rows]
     selected = [i for i in incidents if args.all or i.reviewed]
     skipped = len(incidents) - len(selected)

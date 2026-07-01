@@ -1,0 +1,52 @@
+{{- if and .Values.typedb.enabled .Values.typedb.loadSchema }}
+# Post-install/upgrade hook that loads ontology/schema.tql into TypeDB once the
+# server is reachable, so the knowledge graph is queryable on a fresh install.
+# Uses the agent image (which ships ontology/ + typedb-driver) and retries via
+# restartPolicy: OnFailure until TypeDB accepts connections.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "runai-rca.typedb.fullname" . }}-load-schema
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: typedb-load-schema
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 30
+  template:
+    metadata:
+      labels:
+        {{- include "runai-rca.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: typedb-load-schema
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: load-schema
+          image: {{ include "runai-rca.image" (dict "root" . "image" .Values.agent.image) | quote }}
+          imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - python -m ontology.load_schema && python -m ontology.load_knowledge
+          env:
+            - name: ENABLE_TYPEDB
+              value: "true"
+            - name: TYPEDB_ADDRESS
+              value: {{ include "runai-rca.typedb.address" . | quote }}
+            - name: TYPEDB_DATABASE
+              value: {{ .Values.typedb.auth.database | quote }}
+            - name: TYPEDB_USERNAME
+              value: {{ .Values.typedb.auth.username | quote }}
+            - name: TYPEDB_PASSWORD
+              value: {{ .Values.typedb.auth.password | quote }}
+            - name: TYPEDB_TIMEOUT_SECONDS
+              value: {{ .Values.agent.env.typedbTimeoutSeconds | quote }}
+{{- end }}
