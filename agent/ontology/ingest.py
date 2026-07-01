@@ -159,13 +159,19 @@ def _relate(
     role_a: str,
     role_b: str,
 ) -> None:
-    """match-and-insert a binary relation; skips when either end is missing."""
+    """match-and-insert a binary relation; skips when either end is missing.
+
+    Existence-check then insert (like _ensure) rather than inline `not { ... }`
+    negation: TypeDB 3.11 rejects that negation form ([TQL03] "expected pattern").
+    """
     (ta, ka, va), (tb, kb, vb) = a, b
     if not va or not vb:
         return
     match = f'$a isa {ta}, has {ka} "{esc(va)}"; $b isa {tb}, has {kb} "{esc(vb)}";'
     relation = f"({role_a}: $a, {role_b}: $b) isa {rel}"
-    tx.query(f"match {match} not {{ {relation}; }} insert {relation};").resolve()
+    if list(tx.query(f"match {match} {relation}; select $a;").resolve().as_concept_rows()):
+        return
+    tx.query(f"match {match} insert {relation};").resolve()
 
 
 def _write_incident(tx: Any, inc: OntologyIncident) -> None:

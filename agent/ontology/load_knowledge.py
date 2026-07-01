@@ -8,9 +8,13 @@ knowledge the synthesis step consults for remediation.
     ENABLE_TYPEDB=true TYPEDB_ADDRESS=localhost:1729 \
         python -m ontology.load_knowledge
 
-Idempotent (match-or-insert), so re-running after editing the YAML is safe.
-ponytail: first run needs live validation against TypeDB — TypeQL 3.x is not
-exercised by the unit tests.
+Idempotent via a read-then-insert check (_exists), so re-running after editing
+the YAML is safe. Read-your-writes within the single WRITE txn makes the checks
+see earlier inserts in the same run.
+ponytail: uses _exists() rather than inline `not { ... }` negation — TypeDB 3.11
+rejects that negation form here ([TQL03] "expected pattern"). Only syntax proven
+in app/services/kg_enrichment.py is used. First run needs live TypeDB validation;
+TypeQL 3.x is not exercised by the unit tests.
 """
 
 from __future__ import annotations
@@ -51,9 +55,10 @@ def _ensure_symptom(tx: Any, name: str, keywords: list[str]) -> None:
     if not _exists(tx, f'$x isa symptom, has name "{esc(name)}";'):
         tx.query(f'insert $x isa symptom, has name "{esc(name)}";').resolve()
     for kw in keywords:
+        if _exists(tx, f'$x isa symptom, has name "{esc(name)}", has keyword "{esc(kw)}";'):
+            continue
         tx.query(
             f'match $s isa symptom, has name "{esc(name)}"; '
-            f'not {{ $s has keyword "{esc(kw)}"; }} '
             f'insert $s has keyword "{esc(kw)}";'
         ).resolve()
 
@@ -64,18 +69,29 @@ def _ensure_action(tx: Any, statement: str) -> None:
 
 
 def _relate_indicates(tx: Any, symptom_name: str, family: str) -> None:
+    if _exists(
+        tx,
+        f'$x isa symptom, has name "{esc(symptom_name)}"; $rc isa {family}; '
+        f"(symptom: $x, cause: $rc) isa indicates;",
+    ):
+        return
     tx.query(
         f'match $s isa symptom, has name "{esc(symptom_name)}"; $rc isa {family}; '
-        f"not {{ (symptom: $s, cause: $rc) isa indicates; }} "
         f"insert (symptom: $s, cause: $rc) isa indicates;"
     ).resolve()
 
 
 def _relate_resolved_by(tx: Any, symptom_name: str, statement: str) -> None:
+    if _exists(
+        tx,
+        f'$x isa symptom, has name "{esc(symptom_name)}"; '
+        f'$a isa action, has statement "{esc(statement)}"; '
+        f"(symptom: $x, remedy: $a) isa resolved_by;",
+    ):
+        return
     tx.query(
         f'match $s isa symptom, has name "{esc(symptom_name)}"; '
         f'$a isa action, has statement "{esc(statement)}"; '
-        f"not {{ (symptom: $s, remedy: $a) isa resolved_by; }} "
         f"insert (symptom: $s, remedy: $a) isa resolved_by;"
     ).resolve()
 
