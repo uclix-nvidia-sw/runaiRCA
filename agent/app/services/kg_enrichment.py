@@ -50,6 +50,8 @@ select $iid, $sum;
 _FN_FIXES_FOR_FAMILY = 'match let $x in fixes_for_family("{family}"); select $x;'
 _FN_FIXES_FOR_XID = "match let $x in fixes_for_xid({code}); select $x;"
 _FN_XIDS_FOR_GPU_MODEL = 'match let $x in xids_for_gpu_model("{model}"); select $x;'
+# Reverse leads_to: the root fault(s) that escalate INTO an observed XID.
+_FN_ROOT_XIDS_FOR = "match let $x in root_xids_for({code}); select $x;"
 
 # Curated failure-mode knowledge (knowledge layer), loaded by
 # ontology/load_knowledge.py: family -> symptom(keywords) -> action. The synthesis
@@ -138,16 +140,19 @@ class GraphRemediation:
     family_fixes: list[str] = field(default_factory=list)
     xid_fixes: dict[int, list[str]] = field(default_factory=dict)
     model_xids: dict[str, list[int]] = field(default_factory=dict)
+    # observed XID -> root XID(s) that escalate into it (leads_to chain, one hop back)
+    root_xids: dict[int, list[int]] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
     def is_empty(self) -> bool:
-        return not (self.family_fixes or self.xid_fixes or self.model_xids)
+        return not (self.family_fixes or self.xid_fixes or self.model_xids or self.root_xids)
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "family_fixes": self.family_fixes,
             "xid_fixes": {str(k): v for k, v in self.xid_fixes.items()},
             "model_xids": {k: v for k, v in self.model_xids.items()},
+            "root_xids": {str(k): v for k, v in self.root_xids.items()},
             "warnings": self.warnings,
         }
 
@@ -203,11 +208,29 @@ def _query_remediation(
         if family:
             rows = run(_FN_FIXES_FOR_FAMILY.format(family=escape_typeql(family)))
             out.family_fixes = _statements(rows)
-        for code in dict.fromkeys(xid_codes):  # de-dupe, preserve order
-            rows = run(_FN_FIXES_FOR_XID.format(code=int(code)))
-            fixes = _statements(rows)
+        for raw_code in dict.fromkeys(xid_codes):  # de-dupe, preserve order
+            code = int(raw_code)
+            fixes = _statements(run(_FN_FIXES_FOR_XID.format(code=code)))
             if fixes:
-                out.xid_fixes[int(code)] = fixes
+                out.xid_fixes[code] = fixes
+            # Drill to the root of the leads_to causal chain: which fault(s)
+            # escalate INTO this observed XID. Surfacing the root (and its fix) is
+            # the ontology's precision win — fix the origin, not the downstream
+            # symptom. root_xids_for is newer than the validated functions, so a
+            # query error here must NOT wipe the fixes above: isolate it.
+            try:
+                root_rows = run(_FN_ROOT_XIDS_FOR.format(code=code))
+            except Exception:  # noqa: BLE001 - best-effort drill-down, never fatal
+                root_rows = []
+            root_codes = {int(v) for v in _values(root_rows) if _is_int(v)}
+            roots = [r for r in sorted(root_codes) if r != code]
+            if roots:
+                out.root_xids[code] = roots
+                for root in roots:
+                    if root not in out.xid_fixes:
+                        rfixes = _statements(run(_FN_FIXES_FOR_XID.format(code=root)))
+                        if rfixes:
+                            out.xid_fixes[root] = rfixes
         if gpu_model:
             rows = run(_FN_XIDS_FOR_GPU_MODEL.format(model=escape_typeql(gpu_model)))
             xids = sorted({int(v) for v in _values(rows) if _is_int(v)})

@@ -81,3 +81,23 @@ Recommended actions:
 - Drain or isolate the node if multiple workloads are affected.
 - Check GPU device plugin and kubelet logs outside this app if node evidence is
   strong.
+
+## Run:ai Operational Notes (config & expected behavior)
+
+Signature-matched known issues (version regressions, observability quirks,
+expected behaviors) live in `runai_known_issues.yaml` and surface automatically.
+These are operator FAQ items with no single error signature to key on:
+
+Node Pool structure:
+- Every Kubernetes node joins the Default node pool, so Master/Ingress/Mgmt nodes
+  appear there too; split by node Label into e.g. default(cpu) + training pools
+  (~10 min once nodes and labels are chosen).
+- A node belongs to exactly one node pool. Node Pool Label Value takes a single
+  value (no comma-separated multi-value).
+- Quota flows Department -> Project: set per-node-pool GPU quota on the Department,
+  then split it across Projects. One node pool can be shared by multiple
+  Departments/Projects via their quotas.
+
+Distributed Training restart/backoff (see the known-issue entry for detail):
+- Only the Worker backoffLimit is used; restart count is Master+Worker summed;
+  restartPolicy Always behaves like OnFailure (completions=1 Job).
