@@ -72,16 +72,54 @@ jobs:
           PY
 
       - name: Commit bumped version
+        id: commit
         shell: bash
+        env:
+          NEW_VERSION: ${{ steps.bump.outputs.version }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "$CHART_PATH/Chart.yaml"
-          git commit -m "chore(release): bump runai-rca chart to v${{ steps.bump.outputs.version }} [skip version bump]"
-          git push
+          git commit -m "chore(release): bump runai-rca chart to v${NEW_VERSION} [skip version bump]"
+
+          read_remote_version() {
+            git show "origin/main:$CHART_PATH/Chart.yaml" 2>/dev/null \
+              | awk -F: '/^version:/{v=$2; gsub(/"/,"",v); gsub(/^[ \t]+|[ \t\r]+$/,"",v); print v; exit}'
+          }
+
+          # Concurrent merges can trigger two bump runs; retry with rebase and
+          # skip if another run already published the same (or newer) version.
+          for attempt in 1 2 3 4 5; do
+            if git push origin HEAD:main; then
+              echo "pushed=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "Push rejected (attempt $attempt); reconciling with origin/main..."
+            git fetch origin main
+
+            remote_version="$(read_remote_version)"
+            if [[ "$remote_version" == "$NEW_VERSION" ]]; then
+              echo "origin/main already at v${NEW_VERSION}; another run won the race. Skipping."
+              echo "pushed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [[ -n "$remote_version" ]] \
+              && [[ "$(printf '%s\n%s\n' "$NEW_VERSION" "$remote_version" | sort -V | tail -1)" == "$remote_version" ]]; then
+              echo "origin/main already ahead at v${remote_version}; nothing to publish. Skipping."
+              echo "pushed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            git rebase origin/main
+          done
+
+          echo "ERROR: failed to push bumped version after multiple attempts" >&2
+          exit 1
 
       - name: Dispatch artifact publish workflows
+        if: ${{ steps.commit.outputs.pushed == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
