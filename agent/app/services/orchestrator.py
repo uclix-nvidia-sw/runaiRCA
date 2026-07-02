@@ -392,7 +392,9 @@ class AnalysisOrchestrator:
         graph_fixes = await graph_remediation(
             self._settings,
             family=top_family if top_family != "insufficient_evidence" else "",
-            xid_codes=_xid_codes_from_results(results),
+            # The alert's own text often carries the XID (NVRM Xid alerts) even when
+            # every collector came back empty — it must feed the drill-down too.
+            xid_codes=_xid_codes_from_results(results, _alert_text(request)),
             gpu_model=_gpu_model_from(target, results),
         )
         warnings = sorted(set(warnings) | set(graph_fixes.warnings))
@@ -414,7 +416,7 @@ class AnalysisOrchestrator:
         # Adversarial precision: LLM-verify signature/keyword matches (known issues,
         # failure-mode symptoms, GPU XIDs) and drop ones the evidence doesn't support.
         # Best-effort + LLM-gated: with no LLM nothing is suppressed.
-        observed = _observed_text(results)
+        observed = _observed_text(results, request)
         try:
             from app.services.self_check import verify_known_issues, verify_matches
         except ImportError:
@@ -1058,7 +1060,7 @@ def _detail_from(
     lines.append(_ranked_root_cause_statement(root_cause_candidates or [], request))
     # Ground the coarse family in the most specific signature match when one exists:
     # a recognised known issue (with its affected/fixed version) is far more precise.
-    lines.extend(_known_issue_cause_lines(known_issues, _observed_text(results), language))
+    lines.extend(_known_issue_cause_lines(known_issues, _observed_text(results, request), language))
     supporting = _supporting_evidence(results)
     if supporting:
         lines.append("")
@@ -1073,7 +1075,7 @@ def _detail_from(
         plan,
         graph_fixes,
         root_cause_candidates,
-        _observed_text(results),
+        _observed_text(results, request),
         failure_modes or {},
         missing,
         request,
@@ -1097,7 +1099,7 @@ def _detail_from(
         lines.append(f"- **{result.agent}**: {_best_evidence_line(result)}")
     lines.extend(_investigation_plan_lines(plan))
     lines.extend(
-        _knowledge_base_lines(kg_context, root_cause_candidates, _observed_text(results))
+        _knowledge_base_lines(kg_context, root_cause_candidates, _observed_text(results, request))
     )
     operator_prompt = annotations.get("operator_prompt")
     if operator_prompt:
@@ -1111,7 +1113,7 @@ def _detail_from(
     lines.extend(
         _playbook_lines(
             root_cause_candidates,
-            _observed_text(results),
+            _observed_text(results, request),
             failure_modes or {},
             troubleshooting_cases,
         )
@@ -1358,8 +1360,25 @@ _FAMILY_EXPLANATION = {
 }
 
 
-def _observed_text(results: list[CollectorResult]) -> str:
+def _alert_text(request: AlertAnalysisRequest) -> str:
+    """The alert's own labels+annotations text — it often carries the signature
+    (e.g. 'XID 79 ... GPU has fallen off the bus') even when every collector
+    comes back empty."""
+    alert = request.alert
+    parts = [str(v) for v in (alert.labels or {}).values()]
+    parts.extend(str(v) for v in (alert.annotations or {}).values())
+    return " ".join(parts)
+
+
+def _observed_text(
+    results: list[CollectorResult], request: AlertAnalysisRequest | None = None
+) -> str:
     parts: list[str] = []
+    if request is not None:
+        # The alert message itself is evidence: signature matching (symptoms, known
+        # issues, XIDs) must see it, or an alert whose collectors all came back
+        # empty matches NOTHING even though its own text names the fault.
+        parts.append(_alert_text(request))
     for result in results:
         if result.summary:
             parts.append(result.summary)
@@ -1749,13 +1768,20 @@ _XID_PATTERN = re.compile(
 )
 
 
-def _xid_codes_from_results(results: list[CollectorResult]) -> list[int]:
-    """Distinct NVIDIA Xid codes found in loki/system/kubernetes evidence."""
+def _xid_codes_from_results(
+    results: list[CollectorResult], alert_text: str = ""
+) -> list[int]:
+    """Distinct NVIDIA Xid codes in the alert's own text + loki/system/kubernetes
+    evidence. The alert text matters: an NVRM Xid alert names its code even when
+    every collector comes back empty."""
+    texts = [alert_text] if alert_text else []
+    texts.extend(
+        _stringify_result(result)
+        for result in results
+        if result.agent in ("loki", "system", "kubernetes")
+    )
     codes: list[int] = []
-    for result in results:
-        if result.agent not in ("loki", "system", "kubernetes"):
-            continue
-        text = _stringify_result(result)
+    for text in texts:
         for match in _XID_PATTERN.finditer(text):
             code = int(match.group(1))
             if code not in codes:
