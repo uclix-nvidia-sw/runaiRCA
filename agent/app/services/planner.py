@@ -100,6 +100,20 @@ def _ordered_hypotheses(target: AnalysisTarget) -> list[dict[str, str]]:
     ]
 
 
+def _node_first_hypotheses(
+    hypotheses: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Promote node/system-level families for a namespace-less (node) alert.
+
+    node_kubelet_pressure is the node-level failure family in the ranked set
+    (GPU/hardware faults surface here via the system agent's kernel/XID lines).
+    """
+    node_family = "node_kubelet_pressure"
+    reason = "namespace-less alert — investigate node/system level first"
+    promoted = [{"family": node_family, "reason": reason}]
+    return promoted + [h for h in hypotheses if h["family"] != node_family]
+
+
 def _best_similar(similar_incidents: list) -> object | None:
     best = None
     best_sim = _SIMILARITY_FLOOR
@@ -139,7 +153,13 @@ async def plan_investigation(
                 namespaces.append(ns)
 
     hypotheses = _ordered_hypotheses(target)
-    # If this is a documented Run:ai built-in alert, we already know its meaning,
+    # Namespace-less alert (no namespace, project, or queue): there is no workload
+    # scope to dig into, so lead with node/system-level causes. The workload/loki/
+    # runai agents will have nothing to match; the system agent (node syslog/
+    # journalctl/dmesg) + kubernetes node conditions carry the investigation.
+    node_focused = not target.namespace and not target.project and not target.queue
+    if node_focused:
+        hypotheses = _node_first_hypotheses(hypotheses)
     # family, and fix — lead with that family and carry the definition on the plan.
     matched_alert = match_runai_alert(
         load_runai_alerts(settings.runai_alerts_file), target.alert_name
@@ -188,6 +208,15 @@ async def plan_investigation(
             f"breadth-first: {sweep}. Rank the failure family from what the collectors "
             "actually find rather than assuming a cause."
         )
+
+    if node_focused:
+        node_note = (
+            "No namespace/project/queue on this alert, so the workload, Loki, and Run:ai "
+            "agents will likely report '증거를 찾기 어렵습니다.'. Focus the investigation on "
+            "node/system level: the system agent (node syslog/journalctl/dmesg) and "
+            "Kubernetes node conditions are the primary evidence sources. "
+        )
+        narrative = node_note + narrative
 
     if matched_alert:
         narrative = (
@@ -251,6 +280,8 @@ async def _llm_refine(
         "incident. Keys: focus (str), hypotheses (list of {family, reason}), strategy "
         "('targeted' or 'breadth_first'), narrative (str)."
     )
+    if getattr(settings, "language", "en") == "ko":
+        system += " Write the focus, reason, and narrative values in Korean."
     user = (
         f"Alert: {target.alert_name}\n"
         f"Namespace: {target.namespace}  Node: {target.node}  "

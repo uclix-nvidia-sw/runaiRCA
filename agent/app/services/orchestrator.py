@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
-from app.collectors.base import CollectorResult, resolve_target
+from app.collectors.base import AnalysisTarget, CollectorResult, resolve_target
 from app.collectors.http_json import post_json
 from app.collectors.kubernetes import KubernetesCollector
 from app.collectors.loki import LokiCollector
@@ -23,6 +23,7 @@ from app.collectors.runai import RunAICollector
 from app.collectors.system import SystemCollector
 from app.config import Settings
 from app.knowledge import load_failure_modes, load_troubleshooting_cases
+from app.llm import complete, llm_configured
 from app.masking import Masker, build_masker
 from app.plan import InvestigationPlan
 from app.prompts import agent_role_coverage_lines, load_agent_souls
@@ -34,7 +35,7 @@ from app.schemas import (
     IncidentSummaryRequest,
     IncidentSummaryResponse,
 )
-from app.services.kg_enrichment import enrich
+from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
 from app.services.planner import plan_investigation
 from app.services.root_cause_ranking import RankedCause, rank_root_cause_candidates
 
@@ -177,8 +178,15 @@ class AnalysisOrchestrator:
         except Exception as exc:
             nat_warnings.append(_unexpected_runtime_warning("nemo", exc))
 
+        # Synthesis MUST see EVERY collector's result. Await the full gather over ALL
+        # collectors here, before any ranking/synthesis, and never synthesize from a
+        # subset — an early/partial synthesis would produce a confident-but-wrong RCA.
         results = await asyncio.gather(
             *(_collect_safely(collector, target, plan) for collector in self._collectors)
+        )
+        assert len(results) == len(self._collectors), (
+            "synthesis must wait for all collectors: "
+            f"{len(results)} results for {len(self._collectors)} collectors"
         )
 
         capabilities = {result.agent: result.status for result in results}
@@ -195,6 +203,19 @@ class AnalysisOrchestrator:
             occurrence_count=request.occurrence_count,
             kg_blast_radius=kg_context.blast_radius_workloads,
         )
+        # Graph-derived remediation from the validated TypeDB reasoning functions,
+        # keyed to the ranked top family + any Xid codes / GPU model in the evidence.
+        # Best-effort: an empty result when TypeDB is off/unreachable.
+        top_family = (
+            root_cause_candidates[0].family if root_cause_candidates else ""
+        )
+        graph_fixes = await graph_remediation(
+            self._settings,
+            family=top_family if top_family != "insufficient_evidence" else "",
+            xid_codes=_xid_codes_from_results(results),
+            gpu_model=_gpu_model_from(target, results),
+        )
+        warnings = sorted(set(warnings) | set(graph_fixes.warnings))
         quality = _quality_from(results)
         summary = _summary_from(request, results, root_cause_candidates)
         failure_modes = load_failure_modes(self._settings.failure_modes_file)
@@ -211,7 +232,25 @@ class AnalysisOrchestrator:
             root_cause_candidates,
             kg_context.as_dict(),
             plan,
+            graph_fixes,
         )
+        # Korean LLM synthesis (preferred when language == "ko" and LLM configured):
+        # rewrite summary + detail grounded STRICTLY in the evidence just gathered.
+        # Falls back to the deterministic English report on any failure.
+        if not nat_text and getattr(self._settings, "language", "en") == "ko" \
+                and llm_configured(self._settings):
+            synth = await _synthesize_korean(
+                self._settings,
+                request=request,
+                results=results,
+                plan=plan,
+                root_cause_candidates=root_cause_candidates,
+                kg_context=kg_context.as_dict(),
+                graph_fixes=graph_fixes,
+                fallback_detail=detail,
+            )
+            if synth:
+                summary, detail = synth
 
         response = AlertAnalysisResponse(
             status="ok",
@@ -367,6 +406,114 @@ class AnalysisOrchestrator:
         return None
 
 
+async def _synthesize_korean(
+    settings: Settings,
+    *,
+    request: AlertAnalysisRequest,
+    results: list[CollectorResult],
+    plan: InvestigationPlan,
+    root_cause_candidates: list[RankedCause],
+    kg_context: dict,
+    graph_fixes: GraphRemediation,
+    fallback_detail: str,
+) -> tuple[str, str] | None:
+    """LLM synthesis of the RCA report in Korean, grounded STRICTLY in the evidence.
+
+    Returns (analysis_summary, analysis_detail) in Korean, or None on any failure so
+    the caller keeps the deterministic English report. Never raises into analyze().
+    """
+    from app.collectors.http_json import compact
+
+    evidence = {
+        "alert": {
+            "name": request.alert.labels.get("alertname"),
+            "labels": request.alert.labels,
+            "annotations": request.alert.annotations,
+        },
+        "plan": plan.as_dict(),
+        "ranked_root_cause_candidates": [c.as_dict() for c in root_cause_candidates],
+        "collector_findings": [
+            {
+                "agent": r.agent,
+                "status": r.status,
+                "confidence": r.confidence,
+                "summary": r.summary,
+            }
+            for r in results
+        ],
+        "knowledge_graph": {
+            "blast_radius_workloads": kg_context.get("blast_radius_workloads"),
+            "prior_incidents": kg_context.get("prior_incidents"),
+            "knowledge": kg_context.get("knowledge"),
+        },
+        "graph_remediation": graph_fixes.as_dict(),
+        "matched_alert": plan.matched_alert,
+        "similar_incidents": [
+            {
+                "incident_id": i.incident_id,
+                "similarity": i.similarity,
+                "analysis_summary": i.analysis_summary or i.title,
+            }
+            for i in request.similar_incidents
+            if (i.similarity or 0) >= _SIMILARITY_FLOOR
+        ],
+    }
+    system = (
+        "당신은 NVIDIA Run:ai GPU 플랫폼을 담당하는 시니어 SRE입니다. 제공된 증거(수집기별 "
+        "발견 사항, 조사 계획, 순위가 매겨진 원인 후보, 지식 그래프/함수 기반 조치, 매칭된 "
+        "내장 알림, 유사 인시던트)에만 근거하여 한국어로 RCA 보고서를 작성하세요.\n"
+        "규칙:\n"
+        "- 반드시 한국어로 작성합니다.\n"
+        "- 증거에 없는 사실을 절대 만들어내지 마세요.\n"
+        "- 특정 수집기가 아무것도 찾지 못했으면 해당 항목에 '증거를 찾기 어렵습니다.'라고 "
+        "명시하세요.\n"
+        "- 기존 섹션 구조를 유지하세요: ## Root Cause, ## Affected Pods, ## Evidence, "
+        "## Investigation Plan, ## Recommended Actions (필요 시 ## Knowledge Base 등).\n"
+        '- 반드시 JSON 객체 하나로만 응답하세요: {"summary": <한국어 한 문장>, '
+        '"detail": <한국어 마크다운 본문>}'
+    )
+    user = "증거(JSON):\n" + json.dumps(
+        compact(evidence, limit=8), ensure_ascii=False, default=str
+    )
+    try:
+        data = await _complete_synthesis_json(settings, system=system, user=user)
+    except Exception:  # noqa: BLE001 - synthesis is best-effort; keep deterministic report
+        return None
+    if not data:
+        return None
+    summary = data.get("summary")
+    detail = data.get("detail")
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    if not isinstance(detail, str) or not detail.strip():
+        detail = fallback_detail
+    return _short_sentence(summary, limit=280), detail.strip()
+
+
+async def _complete_synthesis_json(
+    settings: Settings, *, system: str, user: str
+) -> dict | None:
+    text = await complete(
+        settings,
+        system=system + "\n\nJSON 객체 하나로만, 프롬프트나 코드펜스 없이 응답하세요.",
+        user=user,
+        temperature=0.2,
+    )
+    if not text:
+        return None
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[-1] if "\n" in cleaned else cleaned
+        cleaned = cleaned.removeprefix("json").strip()
+        if cleaned.endswith("```"):
+            cleaned = cleaned[: cleaned.rfind("```")].strip()
+    try:
+        parsed = json.loads(cleaned)
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _quality_from(results: list[CollectorResult]) -> str:
     counts = Counter(result.status for result in results)
     if counts["ok"] >= 3:
@@ -457,6 +604,7 @@ def _detail_from(
     root_cause_candidates: list[RankedCause] | None = None,
     kg_context: dict | None = None,
     plan: InvestigationPlan | None = None,
+    graph_fixes: GraphRemediation | None = None,
 ) -> str:
     labels = request.alert.labels
     annotations = request.alert.annotations
@@ -511,6 +659,7 @@ def _detail_from(
             "## Recommended Actions",
             "",
             *_recommended_action_lines(missing, request),
+            *_graph_remediation_lines(graph_fixes),
             "",
             "## Troubleshooting Playbook",
             "",
@@ -869,6 +1018,62 @@ def _recommended_action_lines(
             "- Restore Postgres connectivity so RCA memory and similar-incident "
             "evidence stay current."
         )
+    return lines
+
+
+# Xid codes appear as "Xid 79", "Xid: 79", or "NVRM: Xid (PCI:0000:3b:00): 79" —
+# skip the optional parenthesized PCI address before the code so we don't capture it.
+_XID_PATTERN = re.compile(
+    r"\bxid\s*(?:\([^)]*\))?\s*[:=]?\s*(\d{1,4})", re.IGNORECASE
+)
+
+
+def _xid_codes_from_results(results: list[CollectorResult]) -> list[int]:
+    """Distinct NVIDIA Xid codes found in loki/system/kubernetes evidence."""
+    codes: list[int] = []
+    for result in results:
+        if result.agent not in ("loki", "system", "kubernetes"):
+            continue
+        text = _stringify_result(result)
+        for match in _XID_PATTERN.finditer(text):
+            code = int(match.group(1))
+            if code not in codes:
+                codes.append(code)
+    return codes
+
+
+def _gpu_model_from(target: AnalysisTarget, results: list[CollectorResult]) -> str:
+    """GPU model, when a collector resolved one into its details (e.g. gpu_model)."""
+    for result in results:
+        for key in ("gpu_model", "gpu_type", "gpu_product"):
+            value = result.details.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _stringify_result(result: CollectorResult) -> str:
+    parts = [result.summary or ""]
+    if result.details:
+        try:
+            parts.append(json.dumps(result.details, default=str))
+        except (TypeError, ValueError):
+            parts.append(str(result.details))
+    return " ".join(parts)
+
+
+def _graph_remediation_lines(graph_fixes: GraphRemediation | None) -> list[str]:
+    if graph_fixes is None or graph_fixes.is_empty():
+        return []
+    lines = ["- Knowledge-graph derived remediation:"]
+    for statement in graph_fixes.family_fixes[:5]:
+        lines.append(f"  - {statement}")
+    for code, fixes in graph_fixes.xid_fixes.items():
+        lines.append(f"  - NVIDIA Xid {code}:")
+        lines.extend(f"    - {statement}" for statement in fixes[:5])
+    for model, xids in graph_fixes.model_xids.items():
+        rendered = ", ".join(str(x) for x in xids)
+        lines.append(f"  - Known Xid codes for {model}: {rendered}.")
     return lines
 
 

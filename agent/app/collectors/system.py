@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 
-from app.collectors.base import AnalysisTarget, CollectorResult, artifact
+from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import complete, llm_configured
@@ -42,7 +42,10 @@ class SystemCollector:
 
     async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:
         if not self._settings.enable_system_agent or not self._settings.system_agent_url:
-            summary = "System agent is not configured; node/kernel evidence was skipped."
+            summary = (
+                f"{NO_EVIDENCE} System agent is not configured; node/kernel evidence "
+                "was skipped."
+            )
             return CollectorResult(
                 agent=self.name,
                 status="unavailable",
@@ -64,7 +67,10 @@ class SystemCollector:
 
         node = (getattr(plan, "node", "") or target.node or "").strip()
         if not node:
-            summary = "No node is associated with this alert; node/kernel evidence was skipped."
+            summary = (
+                f"{NO_EVIDENCE} No node is associated with this alert; node/kernel "
+                "evidence was skipped."
+            )
             return CollectorResult(
                 agent=self.name,
                 status="unavailable",
@@ -123,16 +129,17 @@ class SystemCollector:
                 + "."
             )
         elif successful:
+            # Clean node is a POSITIVE finding (status ok) — NOT a "no evidence" case.
             status = "ok"
             confidence = "medium"
             deterministic = (
-                f"Node {node}: system agent reachable, no kernel/GPU/hardware error "
-                "signatures in recent dmesg/journal/syslog."
+                f"Node {node}: system agent reachable, no kernel/GPU/hardware "
+                "error signatures in recent dmesg/journal/syslog."
             )
         else:
             status = "unavailable"
             confidence = "low"
-            deterministic = f"Node {node}: system agent unreachable on all sources."
+            deterministic = f"{NO_EVIDENCE} Node {node}: system agent unreachable on all sources."
 
         summary = deterministic
         if with_errors and llm_configured(self._settings):
@@ -176,6 +183,8 @@ async def _llm_insight(settings: Settings, node: str, error_lines: list[str]) ->
         "hardware/kernel root cause (e.g. GPU XID fault, OOM kill, disk I/O failure). "
         "No preamble, no list."
     )
+    if getattr(settings, "language", "en") == "ko":
+        system += " 한국어로 답하세요."
     user = f"Node {node} recent kernel/host error lines:\n" + "\n".join(error_lines[:20])
     return await complete(settings, system=system, user=user, max_tokens=120)
 

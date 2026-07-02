@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.collectors.base import AnalysisTarget, CollectorResult, artifact
+from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.collectors.http_json import compact, get_json
 from app.collectors.loki import _llm_insight
 from app.config import Settings
@@ -14,7 +14,7 @@ class PrometheusCollector:
 
     async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:
         if not self._settings.prometheus_url:
-            summary = "Prometheus is not configured; metric evidence was skipped."
+            summary = f"{NO_EVIDENCE} Prometheus is not configured; metric evidence was skipped."
             return CollectorResult(
                 agent=self.name,
                 status="unavailable",
@@ -79,13 +79,13 @@ class PrometheusCollector:
             status = "partial"
             confidence = "medium"
             summary = (
-                "Prometheus is reachable, but the workload metric queries returned no series. "
-                "Check metric labels and scrape configuration."
+                f"{NO_EVIDENCE} Prometheus is reachable, but the workload metric queries "
+                "returned no series. Check metric labels and scrape configuration."
             )
         else:
             status = "unavailable"
             confidence = "low"
-            summary = "Prometheus direct queries failed."
+            summary = f"{NO_EVIDENCE} Prometheus direct queries failed."
 
         insight = await _llm_insight(
             self._settings, "Prometheus metrics", summary, query_results

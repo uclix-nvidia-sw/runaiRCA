@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 
-from app.collectors.base import AnalysisTarget, CollectorResult, artifact
+from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import complete, llm_configured
@@ -17,7 +17,7 @@ class LokiCollector:
 
     async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:
         if not self._settings.loki_url:
-            summary = "Loki is not configured; log evidence was skipped."
+            summary = f"{NO_EVIDENCE} Loki is not configured; log evidence was skipped."
             return CollectorResult(
                 agent=self.name,
                 status="unavailable",
@@ -111,13 +111,13 @@ class LokiCollector:
             status = "partial"
             confidence = "medium"
             summary = (
-                "Loki is reachable, but the workload log queries returned no lines. "
-                "Check label names and log retention."
+                f"{NO_EVIDENCE} Loki is reachable, but the workload log queries returned "
+                "no lines. Check label names and log retention."
             )
         else:
             status = "unavailable"
             confidence = "low"
-            summary = "Loki direct queries failed."
+            summary = f"{NO_EVIDENCE} Loki direct queries failed."
 
         insight = await _llm_insight(self._settings, "Loki logs", summary, query_results)
         if insight:
@@ -166,13 +166,16 @@ async def _llm_insight(
         blob = json.dumps(evidence, default=str)[:3000]
     except (TypeError, ValueError):
         blob = str(evidence)[:3000]
+    system = (
+        "You are a senior SRE. Read one collector's raw evidence and state the single "
+        "most useful finding in ONE plain sentence. If nothing notable, say so briefly. "
+        "No preamble, no markdown."
+    )
+    if getattr(settings, "language", "en") == "ko":
+        system += " 한국어로 답하세요. 증거가 없으면 '증거를 찾기 어렵습니다.'라고만 답하세요."
     text = await complete(
         settings,
-        system=(
-            "You are a senior SRE. Read one collector's raw evidence and state the single "
-            "most useful finding in ONE plain sentence. If nothing notable, say so briefly. "
-            "No preamble, no markdown."
-        ),
+        system=system,
         user=f"Source: {source}\nDeterministic summary: {deterministic}\nRaw evidence:\n{blob}",
         max_tokens=120,
     )

@@ -5,6 +5,12 @@ from typing import Any
 
 from app.schemas import AlertAnalysisArtifact
 
+# Honest gap marker: every collector uses this (optionally + a short reason) when
+# it has no matching evidence — unconfigured, reachable-but-empty, or scoped out.
+# The synthesis surfaces it verbatim so an operator sees where evidence is missing
+# rather than a confident-but-empty summary. Korean per settings.language == "ko".
+NO_EVIDENCE = "증거를 찾기 어렵습니다."
+
 
 @dataclass(frozen=True)
 class AnalysisTarget:

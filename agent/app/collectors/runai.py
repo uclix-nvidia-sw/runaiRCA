@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from urllib.parse import quote
 
-from app.collectors.base import AnalysisTarget, CollectorResult, artifact
+from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.collectors.http_json import compact, get_json, post_form_json, post_json
 from app.collectors.loki import _llm_insight
 from app.config import Settings
@@ -25,8 +25,8 @@ class RunAICollector:
 
         if not self._settings.runai_base_url:
             summary = (
-                "Run:ai API is not configured. Using alert labels and annotations "
-                "as scheduling context."
+                f"{NO_EVIDENCE} Run:ai API is not configured. Using alert labels and "
+                "annotations as scheduling context."
             )
             status = "partial" if len(missing) < 3 else "unavailable"
             confidence = "low"
@@ -37,7 +37,10 @@ class RunAICollector:
                     missing.append("runai.auth")
                 if "runai.query" not in missing:
                     missing.append("runai.query")
-                summary = "Run:ai API authentication is unavailable; direct queries were skipped."
+                summary = (
+                    f"{NO_EVIDENCE} Run:ai API authentication is unavailable; direct "
+                    "queries were skipped."
+                )
                 details = {
                     "cluster": target.cluster,
                     "project": target.project,
@@ -103,7 +106,7 @@ class RunAICollector:
                 status = "partial"
                 confidence = "medium"
             else:
-                summary = "Run:ai API direct queries failed."
+                summary = f"{NO_EVIDENCE} Run:ai API direct queries failed."
                 status = "unavailable"
                 confidence = "low"
                 missing.append("runai.query")

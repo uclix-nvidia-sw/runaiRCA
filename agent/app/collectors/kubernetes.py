@@ -4,7 +4,7 @@ import shlex
 from pathlib import Path
 from urllib.parse import quote
 
-from app.collectors.base import AnalysisTarget, CollectorResult, artifact
+from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import complete, llm_configured
@@ -58,7 +58,7 @@ class KubernetesCollector:
 
         token = _read_file(self._settings.kubernetes_token_path)
         if not token:
-            summary = "Kubernetes service account token is not available."
+            summary = f"{NO_EVIDENCE} Kubernetes service account token is not available."
             return CollectorResult(
                 agent=self.name,
                 status="unavailable",
@@ -141,7 +141,7 @@ class KubernetesCollector:
         else:
             status = "unavailable"
             confidence = "low"
-            summary = "Kubernetes API direct queries failed."
+            summary = f"{NO_EVIDENCE} Kubernetes API direct queries failed."
 
         insight = await _senior_insight(
             self._settings,
@@ -506,12 +506,15 @@ async def _senior_insight(
         },
         limit=8,
     )
+    system = (
+        "You are a senior Kubernetes SRE. From this read-only pod inspection, give ONE "
+        "short sentence naming the most likely root-cause direction. No preamble."
+    )
+    if getattr(settings, "language", "en") == "ko":
+        system += " 한국어로 답하세요."
     insight = await complete(
         settings,
-        system=(
-            "You are a senior Kubernetes SRE. From this read-only pod inspection, give ONE "
-            "short sentence naming the most likely root-cause direction. No preamble."
-        ),
+        system=system,
         user=str(user),
         max_tokens=80,
     )
