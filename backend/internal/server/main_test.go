@@ -1879,8 +1879,8 @@ func TestIncidentDetailCapsAggregateAnalysisTextOnly(t *testing.T) {
 
 func TestDenseEmbeddingIsDeterministicAndNormalized(t *testing.T) {
 	text := "Run:AI GPU quota saturated scheduling blocked"
-	a := denseEmbedding(text)
-	b := denseEmbedding(text)
+	a := denseEmbedding(text, embeddingDim)
+	b := denseEmbedding(text, embeddingDim)
 	if len(a) != embeddingDim {
 		t.Fatalf("expected embedding dimension %d, got %d", embeddingDim, len(a))
 	}
@@ -1899,8 +1899,62 @@ func TestDenseEmbeddingIsDeterministicAndNormalized(t *testing.T) {
 	if literal := embeddingLiteral(a); literal[0] != '[' || literal[len(literal)-1] != ']' {
 		t.Fatalf("embedding literal must be bracketed for pgvector, got %q", literal)
 	}
-	if empty := denseEmbedding(""); len(empty) != embeddingDim {
+	if empty := denseEmbedding("", embeddingDim); len(empty) != embeddingDim {
 		t.Fatalf("empty text should still yield a zero vector of the right dim, got %d", len(empty))
+	}
+}
+
+func TestEmbedderRemotePath(t *testing.T) {
+	const dim = 4
+	var gotModel, gotInput string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/embeddings" {
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+		var req struct {
+			Model string `json:"model"`
+			Input string `json:"input"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		gotModel, gotInput = req.Model, req.Input
+		writeJSON(w, http.StatusOK, map[string]any{
+			"data": []map[string]any{{"embedding": []float32{3, 0, 4, 0}}},
+		})
+	}))
+	defer srv.Close()
+
+	e := &embedder{endpoint: srv.URL, model: "test-model", dim: dim, client: srv.Client()}
+	vec := e.embed("장애 원인 분석")
+	if len(vec) != dim {
+		t.Fatalf("expected dim %d, got %d", dim, len(vec))
+	}
+	if gotModel != "test-model" || gotInput != "장애 원인 분석" {
+		t.Fatalf("endpoint got model=%q input=%q", gotModel, gotInput)
+	}
+	// {3,0,4,0} normalized -> {0.6,0,0.8,0}.
+	if math.Abs(float64(vec[0])-0.6) > 1e-5 || math.Abs(float64(vec[2])-0.8) > 1e-5 {
+		t.Fatalf("remote vector not L2-normalized: %v", vec)
+	}
+}
+
+func TestEmbedderFallsBackToHash(t *testing.T) {
+	// No endpoint -> deterministic hash embedding, matching denseEmbedding.
+	offline := &embedder{dim: embeddingDim}
+	got := offline.embed("hello world")
+	want := denseEmbedding("hello world", embeddingDim)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("offline embedder should equal hash embedding")
+	}
+
+	// Endpoint configured but failing (server returns 500) -> still falls back,
+	// so an incident write/search is never blocked by embedding unavailability.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	failing := &embedder{endpoint: srv.URL, model: "m", dim: embeddingDim, client: srv.Client()}
+	if fb := failing.embed("hello world"); !reflect.DeepEqual(fb, want) {
+		t.Fatalf("failed endpoint should fall back to hash embedding of the stored dim")
 	}
 }
 
