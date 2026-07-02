@@ -73,6 +73,16 @@ spec:
               value: {{ .Values.backend.env.agentRequestTimeoutSeconds | quote }}
             - name: MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS
               value: {{ .Values.backend.env.manualAgentRequestTimeoutSeconds | quote }}
+            - name: MAX_AUTO_ANALYZE_FANOUT
+              value: {{ .Values.backend.env.maxAutoAnalyzeFanout | quote }}
+            - name: MAX_CONCURRENT_AGENT_RUNS
+              value: {{ .Values.backend.env.maxConcurrentAgentRuns | quote }}
+            - name: ANALYSIS_BACKFILL_INTERVAL_SECONDS
+              value: {{ .Values.backend.env.analysisBackfillIntervalSeconds | quote }}
+            - name: ANALYSIS_BACKFILL_BATCH
+              value: {{ .Values.backend.env.analysisBackfillBatch | quote }}
+            - name: ANALYSIS_BACKFILL_RETRY_COOLDOWN_SECONDS
+              value: {{ .Values.backend.env.analysisBackfillRetryCooldownSeconds | quote }}
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

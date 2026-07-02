@@ -735,6 +735,55 @@ func (s *Store) ReapStaleAnalyzingRuns(staleAfter time.Duration, manualStaleAfte
 	return reaped
 }
 
+// AlertIDsNeedingAnalysis returns up to `limit` non-resolved, non-analyzing alerts
+// that have no completed analysis run: alerts that never got a run (dropped by the
+// fan-out / rate caps) and alerts whose latest run failed longer ago than
+// retryCooldown. Completed and in-flight alerts are skipped, so backfill never
+// re-runs a good RCA and does not hammer a just-failed one.
+func (s *Store) AlertIDsNeedingAnalysis(limit int, retryCooldown time.Duration, now time.Time) []string {
+	if limit <= 0 {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	type runInfo struct {
+		status  string
+		updated time.Time
+	}
+	latest := map[string]runInfo{}
+	for _, run := range s.analysisRuns {
+		if run == nil || run.AlertID == "" {
+			continue
+		}
+		if cur, ok := latest[run.AlertID]; !ok || run.UpdatedAt.After(cur.updated) {
+			latest[run.AlertID] = runInfo{status: run.Status, updated: run.UpdatedAt}
+		}
+	}
+	out := make([]string, 0, limit)
+	for _, alert := range s.alerts {
+		if alert == nil || alert.IsAnalyzing {
+			continue
+		}
+		if status(alert.Status) == "resolved" {
+			continue
+		}
+		if info, ok := latest[alert.AlertID]; ok {
+			if info.status == "complete" || info.status == "analyzing" {
+				continue
+			}
+			// A recently failed run is left to cool down before we retry it.
+			if retryCooldown > 0 && info.updated.After(now.Add(-retryCooldown)) {
+				continue
+			}
+		}
+		out = append(out, alert.AlertID)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
 func (s *Store) AnalysisTarget(targetType string, targetID string) (Alert, string, string, string, string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

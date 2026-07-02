@@ -128,6 +128,17 @@ backend:
     databaseConnectTimeoutSeconds: 5
     agentRequestTimeoutSeconds: 180
     manualAgentRequestTimeoutSeconds: 900
+    # Max analyses started per webhook and per 1-minute window. Raise if bursts of
+    # alerts get dropped without a report; ultimately bounded by the agent's capacity.
+    maxAutoAnalyzeFanout: 50
+    # Max analyses running against the agent concurrently.
+    maxConcurrentAgentRuns: 50
+    # Backfill: periodically re-drive alerts left without a completed RCA (dropped by
+    # the caps, or a prior failed run). Pauses while the agent is unhealthy.
+    # intervalSeconds: 0 disables it.
+    analysisBackfillIntervalSeconds: 300
+    analysisBackfillBatch: 10
+    analysisBackfillRetryCooldownSeconds: 900
   service:
     annotations: {}
     type: ClusterIP

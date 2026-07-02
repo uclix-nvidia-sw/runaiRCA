@@ -1,8 +1,11 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -144,6 +147,65 @@ func (s *Server) requestAnalysisRun(
 	s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
 }
 
+// runBackfill periodically re-drives alerts that never produced a completed RCA:
+// alerts dropped by the per-webhook fan-out / rate caps (no run was ever created)
+// and alerts whose only run failed (retried after a cooldown). It pauses the whole
+// cycle when the agent is unhealthy, so a pod-down / outage is never hammered.
+// Interval <= 0 disables the loop entirely.
+func (s *Server) runBackfill(ctx context.Context) {
+	if s.backfillInterval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(s.backfillInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.backfillOnce()
+		}
+	}
+}
+
+func (s *Server) backfillOnce() int {
+	if !s.agentHealthy() {
+		return 0 // agent down / outage — do not queue more work onto it
+	}
+	batch := s.backfillBatch
+	if batch <= 0 {
+		batch = 10
+	}
+	ids := s.store.AlertIDsNeedingAnalysis(batch, s.backfillRetryCooldown, time.Now().UTC())
+	started := 0
+	for _, id := range ids {
+		if _, ok := s.startAnalysisRun("alert", id, "backfill", ""); ok {
+			started++
+		}
+	}
+	if started > 0 {
+		log.Printf("backfill started %d analysis run(s) for alerts without a completed RCA", started)
+	}
+	return started
+}
+
+// agentHealthy is the circuit breaker for backfill: a fast GET on the agent's
+// /healthz. A failure (pod down, network) means "outage" — skip this cycle.
+func (s *Server) agentHealthy() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.agentURL+"/healthz", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
+}
+
 const maxAgentMapValueBytes = 4000
 
 func compactAgentAlert(alert Alert) Alert {
@@ -232,6 +294,8 @@ func sourceTitle(source string) string {
 		return "Comment reanalysis"
 	case "feedback":
 		return "Feedback reanalysis"
+	case "backfill":
+		return "Backfill analysis"
 	case "chat":
 		return "Chat analysis"
 	default:

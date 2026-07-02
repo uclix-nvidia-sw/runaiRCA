@@ -196,6 +196,10 @@ type Server struct {
 	agentSlots                chan struct{}
 	autoAnalyzeMu             sync.Mutex
 	autoAnalyzeStarts         []time.Time
+	autoAnalyzeFanout         int
+	backfillInterval          time.Duration
+	backfillBatch             int
+	backfillRetryCooldown     time.Duration
 }
 
 const (
@@ -205,11 +209,21 @@ const (
 	maxJSONBodyBytes       = 1 << 20
 	maxEmbeddingQueryBytes = 4000
 	maxWebhookAlerts       = 500
-	maxAutoAnalyzeFanout   = 25
-	maxManualAnalyzeFanout = 25
+	// Default caps; overridable via MAX_AUTO_ANALYZE_FANOUT / MAX_CONCURRENT_AGENT_RUNS.
+	maxAutoAnalyzeFanout   = 50
+	maxManualAnalyzeFanout = 50
 	maxConcurrentAgentRuns = maxManualAnalyzeFanout
 	autoAnalyzeWindow      = time.Minute
 )
+
+// autoFanoutLimit is the effective per-webhook / per-window auto-analysis cap.
+// Falls back to the const default when unset (e.g. tests that build Server literals).
+func (s *Server) autoFanoutLimit() int {
+	if s.autoAnalyzeFanout > 0 {
+		return s.autoAnalyzeFanout
+	}
+	return maxAutoAnalyzeFanout
+}
 
 func Run() {
 	port := getenv("PORT", "8080")
@@ -226,6 +240,8 @@ func Run() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	go server.runBackfill(ctx)
 
 	go func() {
 		log.Printf("Run:AI RCA backend listening on :%s", port)
@@ -261,6 +277,18 @@ func NewServer() *Server {
 	if reaped := store.ReapStaleAnalyzingRuns(agentRequestTimeout, manualAgentRequestTimeout); reaped > 0 {
 		log.Printf("reaped %d stale analyzing run(s) left by a previous process", reaped)
 	}
+	concurrency := getenvInt("MAX_CONCURRENT_AGENT_RUNS", maxConcurrentAgentRuns)
+	if concurrency <= 0 {
+		concurrency = maxConcurrentAgentRuns
+	}
+	autoFanout := getenvInt("MAX_AUTO_ANALYZE_FANOUT", maxAutoAnalyzeFanout)
+	if autoFanout <= 0 {
+		autoFanout = maxAutoAnalyzeFanout
+	}
+	backfillBatch := getenvInt("ANALYSIS_BACKFILL_BATCH", 10)
+	if backfillBatch <= 0 {
+		backfillBatch = 10
+	}
 	return &Server{
 		store:                     store,
 		hub:                       NewHub(),
@@ -269,7 +297,13 @@ func NewServer() *Server {
 		agentRequestTimeout:       agentRequestTimeout,
 		manualAgentRequestTimeout: manualAgentRequestTimeout,
 		client:                    &http.Client{},
-		agentSlots:                make(chan struct{}, maxConcurrentAgentRuns),
+		agentSlots:                make(chan struct{}, concurrency),
+		autoAnalyzeFanout:         autoFanout,
+		// Backfill re-drives alerts left without a completed RCA (dropped by the
+		// caps, or a prior failed run). Interval 0 disables it.
+		backfillInterval:      time.Duration(getenvInt("ANALYSIS_BACKFILL_INTERVAL_SECONDS", 300)) * time.Second,
+		backfillBatch:         backfillBatch,
+		backfillRetryCooldown: time.Duration(getenvInt("ANALYSIS_BACKFILL_RETRY_COOLDOWN_SECONDS", 900)) * time.Second,
 	}
 }
 

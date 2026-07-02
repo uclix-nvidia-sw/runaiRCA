@@ -1196,7 +1196,7 @@ func TestDashboardAnalyzeLargeIncidentStartsCappedRuns(t *testing.T) {
 	})
 	incident, _ := seedAlert(t, server, "fp-dashboard-large")
 	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
-	extraAlerts := 28
+	extraAlerts := maxManualAnalyzeFanout + 3
 	server.store.mu.Lock()
 	for i := 1; i <= extraAlerts; i++ {
 		alertID := fmt.Sprintf("ALR-large-%03d", i)
@@ -1241,6 +1241,79 @@ func TestDashboardAnalyzeLargeIncidentStartsCappedRuns(t *testing.T) {
 	if hit.Load() != int32(maxManualAnalyzeFanout) {
 		t.Fatalf("agent calls should be capped, got %d", hit.Load())
 	}
+}
+
+func TestAlertIDsNeedingAnalysis(t *testing.T) {
+	store := NewStore()
+	now := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+	addAlert := func(id, status string, analyzing bool) {
+		store.alerts[id] = &AlertRecord{AlertID: id, Status: status, IsAnalyzing: analyzing}
+	}
+	addRun := func(alertID, runStatus string, updated time.Time) {
+		rid := "run-" + alertID
+		store.analysisRuns[rid] = &AnalysisRun{RunID: rid, AlertID: alertID, Status: runStatus, UpdatedAt: updated}
+	}
+	addAlert("never", "firing", false) // no run -> include
+	addAlert("done", "firing", false)
+	addRun("done", "complete", now) // completed -> exclude
+	addAlert("failedold", "firing", false)
+	addRun("failedold", "failed", now.Add(-time.Hour)) // failed, cooled -> include
+	addAlert("failednew", "firing", false)
+	addRun("failednew", "failed", now.Add(-time.Minute)) // failed, hot -> exclude
+	addAlert("resolved", "resolved", false)              // resolved -> exclude
+	addAlert("inflight", "firing", true)                 // analyzing -> exclude
+
+	got := store.AlertIDsNeedingAnalysis(10, 15*time.Minute, now)
+	set := map[string]bool{}
+	for _, id := range got {
+		set[id] = true
+	}
+	for _, want := range []string{"never", "failedold"} {
+		if !set[want] {
+			t.Fatalf("expected %q in candidates, got %v", want, got)
+		}
+	}
+	for _, bad := range []string{"done", "failednew", "resolved", "inflight"} {
+		if set[bad] {
+			t.Fatalf("%q must be excluded, got %v", bad, got)
+		}
+	}
+}
+
+func TestBackfillPausesWhenAgentUnhealthy(t *testing.T) {
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable) // /healthz and everything else -> down
+	})
+	seedAlert(t, server, "fp-backfill-agent-down")
+	if started := server.backfillOnce(); started != 0 {
+		t.Fatalf("backfill must pause when the agent is unhealthy, started %d", started)
+	}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 0 {
+		t.Fatalf("no runs should be created while the agent is down, got %d", len(runs))
+	}
+}
+
+func TestBackfillStartsRunForMissingAlert(t *testing.T) {
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Backfilled RCA.",
+			AnalysisDetail:  "## Root Cause\n\nBackfill.",
+			AnalysisQuality: "medium",
+		})
+	})
+	_, record := seedAlert(t, server, "fp-backfill-missing")
+	if started := server.backfillOnce(); started < 1 {
+		t.Fatalf("backfill should start a run for the un-analyzed alert, started %d", started)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if alert, ok := server.store.AlertDetail(record.AlertID); ok && alert.AnalysisSummary != "" {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("backfill run never applied an RCA to the alert")
 }
 
 func TestChatContextAttachesMemoryAndFeedbackHints(t *testing.T) {

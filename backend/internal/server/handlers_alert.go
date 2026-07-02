@@ -41,7 +41,7 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for _, alertID := range autoAlertOrder {
-		if autoAnalyses >= maxAutoAnalyzeFanout {
+		if autoAnalyses >= s.autoFanoutLimit() {
 			break
 		}
 		reserved, release := s.reserveAutoAnalysisSlot()
@@ -79,7 +79,7 @@ func (s *Server) reserveAutoAnalysisSlot() (bool, func()) {
 		}
 	}
 	s.autoAnalyzeStarts = kept
-	if len(s.autoAnalyzeStarts) >= maxAutoAnalyzeFanout {
+	if len(s.autoAnalyzeStarts) >= s.autoFanoutLimit() {
 		return false, func() {}
 	}
 	s.autoAnalyzeStarts = append(s.autoAnalyzeStarts, now)
