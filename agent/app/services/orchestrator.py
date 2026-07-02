@@ -21,7 +21,7 @@ from app.collectors.postgres import PostgresCollector
 from app.collectors.prometheus import PrometheusCollector
 from app.collectors.runai import RunAICollector
 from app.config import Settings
-from app.knowledge import load_troubleshooting_cases
+from app.knowledge import load_failure_modes, load_troubleshooting_cases
 from app.masking import Masker, build_masker
 from app.prompts import agent_role_coverage_lines, load_agent_souls
 from app.schemas import (
@@ -171,7 +171,9 @@ class AnalysisOrchestrator:
         artifacts = [artifact for result in results for artifact in result.artifacts]
         missing = sorted({item for result in results for item in result.missing_data})
         warnings = sorted(
-            {item for result in results for item in result.warnings} | set(nat_warnings)
+            {item for result in results for item in result.warnings}
+            | set(nat_warnings)
+            | set(kg_context.warnings)
         )
         root_cause_candidates = rank_root_cause_candidates(
             target,
@@ -181,12 +183,16 @@ class AnalysisOrchestrator:
         )
         quality = _quality_from(results)
         summary = _summary_from(request, results, root_cause_candidates)
-        playbook = load_troubleshooting_cases(self._settings.troubleshooting_cases_file)
+        failure_modes = load_failure_modes(self._settings.failure_modes_file)
+        playbook_fallback = load_troubleshooting_cases(
+            self._settings.troubleshooting_cases_file
+        )
         detail = nat_text if nat_text else _detail_from(
             request,
             results,
             missing,
-            playbook,
+            failure_modes,
+            playbook_fallback,
             agent_souls,
             root_cause_candidates,
             kg_context.as_dict(),
@@ -418,20 +424,16 @@ def _summary_from(
     results: list[CollectorResult],
     root_cause_candidates: list[RankedCause],
 ) -> str:
-    root_cause = _ranked_root_cause_statement(root_cause_candidates, request)
-    unavailable = [result.agent for result in results if result.status == "unavailable"]
-    if unavailable:
-        return _short_sentence(
-            f"{root_cause} Evidence gaps remain for {', '.join(unavailable)}.",
-            limit=260,
-        )
-    return _short_sentence(root_cause, limit=220)
+    return _short_sentence(
+        _ranked_root_cause_statement(root_cause_candidates, request), limit=280
+    )
 
 
 def _detail_from(
     request: AlertAnalysisRequest,
     results: list[CollectorResult],
     missing: list[str],
+    failure_modes: dict[str, list[dict]] | None = None,
     troubleshooting_cases: str = "",
     agent_souls: str = "",
     root_cause_candidates: list[RankedCause] | None = None,
@@ -458,12 +460,10 @@ def _detail_from(
         ]
     )
     for result in results:
-        lines.append(f"- **{result.agent}** [{result.status}]: {result.summary}")
+        lines.append(f"- **{result.agent}**: {result.summary}")
     highlight_lines = _evidence_highlight_lines(results)
     if highlight_lines:
         lines.extend(["", "## Evidence Highlights", "", *highlight_lines])
-    if root_cause_candidates:
-        lines.extend(_root_cause_candidate_lines(root_cause_candidates))
     lines.extend(
         _knowledge_base_lines(kg_context, root_cause_candidates, _observed_text(results))
     )
@@ -498,23 +498,16 @@ def _detail_from(
             "",
         ]
     )
-    if troubleshooting_cases:
-        lines.append(troubleshooting_cases)
-    else:
-        lines.append("- No local troubleshooting cases file was loaded.")
+    lines.extend(
+        _playbook_lines(
+            root_cause_candidates,
+            _observed_text(results),
+            failure_modes or {},
+            troubleshooting_cases,
+        )
+    )
     lines.extend(_similar_incident_lines(request))
     lines.extend(_feedback_hint_lines(request))
-    lines.extend(
-        [
-            "",
-            "## Missing Data",
-            "",
-        ]
-    )
-    if missing:
-        lines.extend(f"- {item}" for item in missing)
-    else:
-        lines.append("- No required evidence source was marked missing by the MVP collectors.")
     lines.extend(
         [
             "",
@@ -543,21 +536,46 @@ def _root_cause_statement(request: AlertAnalysisRequest) -> str:
 def _ranked_root_cause_statement(
     candidates: list[RankedCause], request: AlertAnalysisRequest
 ) -> str:
+    subject = _as_sentence(_root_cause_statement(request))
     if not candidates:
-        return _root_cause_statement(request)
+        return subject
     top = candidates[0]
     if top.family == "insufficient_evidence":
         return _short_sentence(
-            "The collected evidence is insufficient to name a specific root-cause "
-            f"family with confidence. Alert context: {_root_cause_statement(request)}",
+            f"{subject} There is not yet enough evidence to point at a specific cause; "
+            "the collected signals are inconclusive.",
             limit=320,
         )
-    rationale = top.rationale[0] if top.rationale else _root_cause_statement(request)
-    return _short_sentence(
-        f"Most likely root-cause family: {_family_label(top.family)} "
-        f"({top.confidence} confidence). {rationale}.",
-        limit=320,
-    )
+    explanation = _FAMILY_EXPLANATION.get(top.family) or _family_label(top.family)
+    return _short_sentence(f"{subject} Likely cause: {explanation}.", limit=320)
+
+
+def _as_sentence(text: str) -> str:
+    text = " ".join((text or "").split())
+    if text and text[-1] not in ".!?":
+        text += "."
+    return text
+
+
+# Plain-language cause per family for operator-facing summaries — no scores,
+# confidence words, or keyword-match jargon.
+_FAMILY_EXPLANATION = {
+    "node_kubelet_pressure": (
+        "the node hosting this workload is under resource pressure (disk, memory, or "
+        "PID), which can evict or restart its pods"
+    ),
+    "scheduling_quota_exhaustion": (
+        "the workload cannot be scheduled — GPU quota or queue capacity looks exhausted"
+    ),
+    "control_plane_error": (
+        "the Run:ai control plane (scheduler or backend) is reporting errors that "
+        "affect this workload"
+    ),
+    "workload_startup_image_failure": (
+        "the workload itself is failing to start — an image pull, crash loop, or a "
+        "startup/configuration error"
+    ),
+}
 
 
 def _observed_text(results: list[CollectorResult]) -> str:
@@ -577,12 +595,9 @@ def _knowledge_base_lines(
     if not kg_context or not kg_context.get("enabled"):
         return []
     if not kg_context.get("available"):
-        return [
-            "",
-            "## Knowledge Base (Ontology)",
-            "",
-            "- TypeDB knowledge graph was unreachable; relational KG context was skipped.",
-        ]
+        # Optional enrichment; when it is not available we simply omit the section
+        # rather than surfacing infra jargon. The reason is carried in `warnings`.
+        return []
     body: list[str] = []
     blast = kg_context.get("blast_radius_workloads") or 0
     if blast:
@@ -631,16 +646,35 @@ def _kb_remediation_lines(
     return [header, *[f"  - {a}" for a in fallback[:5]]]
 
 
-def _root_cause_candidate_lines(candidates: list[RankedCause]) -> list[str]:
-    lines = ["", "## Root Cause Candidates", ""]
-    for candidate in candidates[:3]:
-        agents = ", ".join(candidate.evidence_agents) or "no corroborating agent"
-        lines.append(
-            f"- **{_family_label(candidate.family)}** "
-            f"({candidate.confidence}, score {candidate.score:.2f}; evidence: {agents})"
-        )
-        for rationale in candidate.rationale[:3]:
-            lines.append(f"  - {rationale}")
+def _playbook_lines(
+    candidates: list[RankedCause] | None,
+    observed_text: str,
+    failure_modes: dict[str, list[dict]],
+    fallback_cases: str,
+) -> list[str]:
+    """Root-cause-relevant remediation, keyed to the top-ranked family.
+
+    Shows the curated fixes for the identified family (precise when a symptom
+    keyword matches the observed evidence, otherwise the family checklist). Only
+    when no family is confidently ranked does it fall back to the full case library.
+    """
+    top_family = candidates[0].family if candidates else ""
+    symptoms = failure_modes.get(top_family) if top_family else None
+    if not symptoms:
+        if fallback_cases:
+            return [fallback_cases]
+        return ["- No troubleshooting guidance is available for this cause yet."]
+    text = (observed_text or "").lower()
+    lines = [f"Guidance for the most likely cause: **{_family_label(top_family)}**.", ""]
+    matched = False
+    for symptom in symptoms:
+        if any(kw in text for kw in symptom.get("keywords", [])):
+            matched = True
+            lines.append(f"- **{symptom.get('symptom')}**")
+            lines.extend(f"  - {action}" for action in symptom.get("actions", [])[:5])
+    if not matched:
+        actions = sorted({a for s in symptoms for a in s.get("actions", [])})
+        lines.extend(f"- {action}" for action in actions[:6])
     return lines
 
 

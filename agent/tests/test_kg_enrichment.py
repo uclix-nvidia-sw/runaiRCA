@@ -44,9 +44,10 @@ def test_knowledge_base_section_empty_when_disabled() -> None:
     assert _knowledge_base_lines(None) == []
 
 
-def test_knowledge_base_section_notes_unreachable() -> None:
-    text = "\n".join(_knowledge_base_lines({"enabled": True, "available": False}))
-    assert "unreachable" in text
+def test_knowledge_base_section_omitted_when_unavailable() -> None:
+    # Optional enrichment: when enabled but unreachable, no operator-facing section
+    # is rendered (the reason is carried in the response warnings instead).
+    assert _knowledge_base_lines({"enabled": True, "available": False}) == []
 
 
 _KNOWLEDGE = {

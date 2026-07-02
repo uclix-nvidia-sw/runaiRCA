@@ -58,6 +58,7 @@ def make_settings() -> Settings:
         postgres_dsn="",
         postgres_timeout_seconds=1,
         troubleshooting_cases_file="knowledge/troubleshooting_cases.md",
+        failure_modes_file="knowledge/failure_modes.yaml",
         agent_souls_file="prompts/agent_souls.md",
         masking_regex_list=(),
         builtin_redaction_enabled=True,
@@ -389,7 +390,7 @@ async def test_analyze_isolates_collector_exceptions() -> None:
     assert response.capabilities["exploding"] == "unavailable"
     assert "exploding.collector_exception" in response.missing_data
     assert any("collector boom" in warning for warning in response.warnings)
-    assert "**exploding** [unavailable]" in response.analysis_detail
+    assert "**exploding**:" in response.analysis_detail
 
 
 @pytest.mark.asyncio

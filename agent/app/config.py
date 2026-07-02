@@ -92,6 +92,7 @@ class Settings:
     postgres_dsn: str
     postgres_timeout_seconds: int
     troubleshooting_cases_file: str
+    failure_modes_file: str
     agent_souls_file: str
     masking_regex_list: tuple[str, ...]
     builtin_redaction_enabled: bool
@@ -162,6 +163,10 @@ def load_settings() -> Settings:
         troubleshooting_cases_file=os.getenv(
             "TROUBLESHOOTING_CASES_FILE",
             "knowledge/troubleshooting_cases.md",
+        ).strip(),
+        failure_modes_file=os.getenv(
+            "FAILURE_MODES_FILE",
+            "knowledge/failure_modes.yaml",
         ).strip(),
         agent_souls_file=os.getenv("AGENT_SOULS_FILE", "prompts/agent_souls.md").strip(),
         masking_regex_list=_json_string_list_env("MASKING_REGEX_LIST_JSON"),
