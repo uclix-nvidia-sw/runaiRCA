@@ -83,6 +83,8 @@ def make_settings() -> Settings:
         typedb_tls_enabled=False,
         typedb_timeout_seconds=1,
         enable_typedb=False,
+        enable_investigation_loop=False,
+        max_investigation_steps=4,
     )
 
 
@@ -304,8 +306,15 @@ async def test_analyze_returns_unified_artifacts() -> None:
         "prometheus",
         "loki",
         "system",
+        "change",
     }
     assert response.capabilities["runai"] in {"partial", "ok"}
+    # Self-check must never leave a dangling empty section: if the header is
+    # present, a non-empty caveat body must follow it.
+    detail = response.analysis_detail
+    if "## Self-Check" in detail:
+        body = detail.split("## Self-Check", 1)[1]
+        assert body.strip(), "empty ## Self-Check section appended"
 
 
 @pytest.mark.asyncio

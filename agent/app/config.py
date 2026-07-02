@@ -117,6 +117,8 @@ class Settings:
     typedb_tls_enabled: bool
     typedb_timeout_seconds: int
     enable_typedb: bool
+    enable_investigation_loop: bool
+    max_investigation_steps: int
 
 
 def load_settings() -> Settings:
@@ -206,4 +208,6 @@ def load_settings() -> Settings:
         typedb_tls_enabled=_bool_env("TYPEDB_TLS_ENABLED", False),
         typedb_timeout_seconds=_int_env("TYPEDB_TIMEOUT_SECONDS", 6),
         enable_typedb=_bool_env("ENABLE_TYPEDB", False),
+        enable_investigation_loop=_bool_env("ENABLE_INVESTIGATION_LOOP", False),
+        max_investigation_steps=max(1, _int_env("MAX_INVESTIGATION_STEPS", 4)),
     )

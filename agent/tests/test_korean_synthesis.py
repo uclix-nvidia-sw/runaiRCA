@@ -149,7 +149,7 @@ async def test_analyze_synthesis_sees_every_collector() -> None:
         )
     )
     assert set(response.capabilities) == {
-        "runai", "kubernetes", "postgres", "prometheus", "loki", "system"
+        "runai", "kubernetes", "postgres", "prometheus", "loki", "system", "change"
     }
 
 

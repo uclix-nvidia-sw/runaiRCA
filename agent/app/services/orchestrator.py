@@ -150,6 +150,13 @@ class AnalysisOrchestrator:
             LokiCollector(settings),
             SystemCollector(settings),
         ]
+        # Optional change/timeline capability agent — probe-able tool once it exists.
+        try:
+            from app.collectors.change import ChangeCollector
+        except ImportError:
+            pass
+        else:
+            self._collectors.append(ChangeCollector(settings))
 
     async def analyze(self, request: AlertAnalysisRequest) -> AlertAnalysisResponse:
         target = resolve_target(request.alert.labels, request.alert.annotations)
@@ -181,9 +188,25 @@ class AnalysisOrchestrator:
         # Synthesis MUST see EVERY collector's result. Await the full gather over ALL
         # collectors here, before any ranking/synthesis, and never synthesize from a
         # subset — an early/partial synthesis would produce a confident-but-wrong RCA.
-        results = await asyncio.gather(
-            *(_collect_safely(collector, target, plan) for collector in self._collectors)
-        )
+        # LLM-gated senior-SRE loop when enabled; otherwise the one-shot gather. Both
+        # return one CollectorResult per collector (investigate runs any it skipped).
+        if llm_configured(self._settings) and self._settings.enable_investigation_loop:
+            from app.services.investigator import investigate
+
+            results = await investigate(
+                self._settings,
+                target,
+                self._collectors,
+                plan,
+                kg_context.as_dict(),
+                self._settings.max_investigation_steps,
+            )
+        else:
+            results = list(
+                await asyncio.gather(
+                    *(_collect_safely(collector, target, plan) for collector in self._collectors)
+                )
+            )
         assert len(results) == len(self._collectors), (
             "synthesis must wait for all collectors: "
             f"{len(results)} results for {len(self._collectors)} collectors"
@@ -197,12 +220,38 @@ class AnalysisOrchestrator:
             | set(nat_warnings)
             | set(kg_context.warnings)
         )
+        # Optional feedback-derived priors from operator hints — nudge ranking.
+        priors = None
+        try:
+            from app.services.feedback_priors import derive_priors
+        except ImportError:
+            pass
+        else:
+            priors = derive_priors(request.feedback_hints)
         root_cause_candidates = rank_root_cause_candidates(
             target,
             results,
             occurrence_count=request.occurrence_count,
             kg_blast_radius=kg_context.blast_radius_workloads,
+            priors=priors,
         )
+        # Optional self-check: refute the top cause, apply its calibrated confidence
+        # to the top candidate, and keep the caveat text for the report.
+        self_check_caveat = ""
+        try:
+            from app.services.self_check import refute_top_cause
+        except ImportError:
+            pass
+        else:
+            if root_cause_candidates:
+                check = await refute_top_cause(
+                    self._settings, root_cause_candidates[0], results
+                )
+                if isinstance(check, dict):
+                    calibrated = check.get("confidence")
+                    if calibrated in ("low", "medium", "high"):
+                        root_cause_candidates[0].confidence = calibrated
+                    self_check_caveat = str(check.get("caveat") or "").strip()
         # Graph-derived remediation from the validated TypeDB reasoning functions,
         # keyed to the ranked top family + any Xid codes / GPU model in the evidence.
         # Best-effort: an empty result when TypeDB is off/unreachable.
@@ -216,6 +265,14 @@ class AnalysisOrchestrator:
             gpu_model=_gpu_model_from(target, results),
         )
         warnings = sorted(set(warnings) | set(graph_fixes.warnings))
+        # Optional change/timeline capability — added to the synthesis context.
+        timeline = None
+        try:
+            from app.services.timeline import build_timeline
+        except ImportError:
+            pass
+        else:
+            timeline = build_timeline(results)
         quality = _quality_from(results)
         summary = _summary_from(request, results, root_cause_candidates)
         failure_modes = load_failure_modes(self._settings.failure_modes_file)
@@ -252,6 +309,10 @@ class AnalysisOrchestrator:
             if synth:
                 summary, detail = synth
 
+        # Self-check caveat (optional hook) appended verbatim to the final report.
+        if self_check_caveat:
+            detail = f"{detail}\n\n## Self-Check\n\n{self_check_caveat}"
+
         response = AlertAnalysisResponse(
             status="ok",
             thread_ts=request.thread_ts,
@@ -284,6 +345,7 @@ class AnalysisOrchestrator:
                 ),
                 "knowledge_base": kg_context.as_dict(),
                 "plan": plan.as_dict(),
+                **({"timeline": timeline} if timeline else {}),
             },
             artifacts=artifacts,
         )
