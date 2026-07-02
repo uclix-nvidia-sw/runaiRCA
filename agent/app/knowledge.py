@@ -107,3 +107,82 @@ def load_failure_modes(path: str) -> dict[str, list[dict[str, Any]]]:
                 }
             )
     return knowledge
+
+
+def load_runai_known_issues(path: str) -> list[dict[str, Any]]:
+    """Parse runai_known_issues.yaml into a list of known-issue entries.
+
+    Each entry: {issue, family, keywords[], reason, affected_version,
+    fixed_version, actions[]}. Recognised by their signature keywords appearing in
+    the collected evidence — ranking-independent, like the built-in alert catalog
+    is recognised by name, and needing no TypeDB.
+    """
+    if not path:
+        return []
+    try:
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or []
+    except (OSError, yaml.YAMLError):
+        return []
+    out: list[dict[str, Any]] = []
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("issue") or "").strip()
+        keywords = [str(k).lower() for k in (entry.get("keywords") or []) if str(k).strip()]
+        if not name or not keywords:
+            continue
+        out.append(
+            {
+                "issue": name,
+                "family": str(entry.get("family") or ""),
+                "keywords": keywords,
+                "reason": str(entry.get("reason") or ""),
+                "affected_version": str(entry.get("affected_version") or ""),
+                "fixed_version": str(entry.get("fixed_version") or ""),
+                "actions": [str(a) for a in (entry.get("actions") or [])],
+            }
+        )
+    return out
+
+
+def match_runai_known_issues(
+    catalog: list[dict[str, Any]], observed_text: str
+) -> list[dict[str, Any]]:
+    """Known-issue entries whose signature keyword appears in the evidence text.
+
+    Substring match on the lowercased evidence, ranking-independent. Returns every
+    match — one incident can hit more than one known issue.
+    """
+    text = (observed_text or "").lower()
+    if not text or not catalog:
+        return []
+    return [entry for entry in catalog if any(kw in text for kw in entry["keywords"])]
+
+
+def match_failure_mode_symptoms(
+    failure_modes: dict[str, list[dict[str, Any]]],
+    observed_text: str,
+    top_family: str = "",
+) -> list[tuple[str, dict[str, Any]]]:
+    """Every curated symptom, across ALL families, whose keyword hits the evidence.
+
+    The ontology entry point is the fine-grained signature match — NOT the coarse
+    family ranking. Matches are ordered top-ranked-family first (the ranker is a
+    soft prior for ordering, no longer a gate), so a precise fix from any family
+    still surfaces, including families the ranker cannot even nominate (e.g.
+    gpu_hardware_error, which is not one of the four ranked families). Works on any
+    {family: [{symptom, keywords[], actions[]}]} map — the curated failure modes or
+    the TypeDB knowledge layer.
+    """
+    text = (observed_text or "").lower()
+    if not text or not failure_modes:
+        return []
+    matched: list[tuple[str, dict[str, Any]]] = []
+    for family, symptoms in failure_modes.items():
+        for symptom in symptoms or []:
+            if any(str(kw).lower() in text for kw in symptom.get("keywords", [])):
+                matched.append((family, symptom))
+    # Stable sort: top-ranked family's matches first, otherwise file/query order
+    # (which lists the more specific symptom before the generic one).
+    matched.sort(key=lambda fs: fs[0] != top_family)
+    return matched

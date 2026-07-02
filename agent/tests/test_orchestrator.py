@@ -60,6 +60,7 @@ def make_settings() -> Settings:
         troubleshooting_cases_file="knowledge/troubleshooting_cases.md",
         failure_modes_file="knowledge/failure_modes.yaml",
         runai_alerts_file="knowledge/runai_alerts_catalog.yaml",
+        runai_known_issues_file="knowledge/runai_known_issues.yaml",
         enable_system_agent=False,
         system_agent_url="",
         system_agent_token="",
@@ -86,6 +87,8 @@ def make_settings() -> Settings:
         enable_typedb=False,
         enable_investigation_loop=False,
         max_investigation_steps=4,
+        max_reanalysis_steps=2,
+        analysis_deadline_seconds=300,
     )
 
 

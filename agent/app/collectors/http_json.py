@@ -36,7 +36,9 @@ async def get_json(
 
     url = _join_url(base_url, path)
     try:
-        async with httpx.AsyncClient(timeout=timeout_seconds, verify=verify) as client:
+        async with httpx.AsyncClient(
+            timeout=_client_timeout(timeout_seconds), verify=verify
+        ) as client:
             response = await client.get(url, params=params, headers=headers)
     except Exception as exc:  # noqa: BLE001 - collectors report diagnostics, not failures.
         return JsonResponse(url=url, status_code=0, error=f"{exc.__class__.__name__}: {exc}")
@@ -71,7 +73,9 @@ async def post_form_json(
         return JsonResponse(url=url, status_code=0, error="python.httpx is not installed")
 
     try:
-        async with httpx.AsyncClient(timeout=timeout_seconds, verify=verify) as client:
+        async with httpx.AsyncClient(
+            timeout=_client_timeout(timeout_seconds), verify=verify
+        ) as client:
             response = await client.post(url, data=data, headers=headers)
     except Exception as exc:  # noqa: BLE001 - collectors report diagnostics, not failures.
         return JsonResponse(url=url, status_code=0, error=f"{exc.__class__.__name__}: {exc}")
@@ -106,7 +110,9 @@ async def post_json(
         return JsonResponse(url=url, status_code=0, error="python.httpx is not installed")
 
     try:
-        async with httpx.AsyncClient(timeout=timeout_seconds, verify=verify) as client:
+        async with httpx.AsyncClient(
+            timeout=_client_timeout(timeout_seconds), verify=verify
+        ) as client:
             response = await client.post(url, json=json_body, headers=headers)
     except Exception as exc:  # noqa: BLE001 - collectors report diagnostics, not failures.
         return JsonResponse(url=url, status_code=0, error=f"{exc.__class__.__name__}: {exc}")
@@ -136,6 +142,15 @@ def compact(value: Any, *, limit: int = 5) -> Any:
             trimmed.append({"truncated": len(value) - limit})
         return trimmed
     return value
+
+
+def _client_timeout(timeout_seconds: int) -> float | None:
+    """<=0 means 'no timeout' (unlimited) — let the caller wait as long as it needs.
+
+    Used so an LLM/agent request configured with timeout 0 is never cut off mid-
+    thought; a positive value keeps the usual bound (e.g. for data collectors).
+    """
+    return timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
 
 
 def _join_url(base_url: str, path: str) -> str:
