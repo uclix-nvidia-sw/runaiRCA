@@ -179,11 +179,12 @@ def load_settings() -> Settings:
             "knowledge/runai_alerts_catalog.yaml",
         ).strip(),
         # System agent (node infra: syslog/journalctl/dmesg via the per-node DaemonSet).
-        enable_system_agent=_bool_env("ENABLE_SYSTEM_AGENT", False),
+        # On by default; degrades to "unavailable" when SYSTEM_AGENT_URL isn't set.
+        enable_system_agent=_bool_env("ENABLE_SYSTEM_AGENT", True),
         system_agent_url=os.getenv("SYSTEM_AGENT_URL", "").strip().rstrip("/"),
         system_agent_timeout_seconds=_int_env("SYSTEM_AGENT_TIMEOUT_SECONDS", 6),
         # Read-only pod exec for the Kubernetes agent (view container state/logs; no mutations).
-        enable_pod_exec=_bool_env("ENABLE_POD_EXEC", False),
+        enable_pod_exec=_bool_env("ENABLE_POD_EXEC", True),
         pod_exec_timeout_seconds=_int_env("POD_EXEC_TIMEOUT_SECONDS", 10),
         agent_souls_file=os.getenv("AGENT_SOULS_FILE", "prompts/agent_souls.md").strip(),
         masking_regex_list=_json_string_list_env("MASKING_REGEX_LIST_JSON"),
