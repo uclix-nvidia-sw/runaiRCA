@@ -128,8 +128,11 @@ backend:
     agentUrl: ""
     language: ko
     databaseConnectTimeoutSeconds: 5
-    agentRequestTimeoutSeconds: 180
-    manualAgentRequestTimeoutSeconds: 900
+    # MUST exceed the agent's analysisDeadlineSeconds (1200): the agent works up to
+    # that budget and then returns a graceful degraded report — if the backend hangs
+    # up first, the report is lost and the alert gets a useless fallback instead.
+    agentRequestTimeoutSeconds: 1260
+    manualAgentRequestTimeoutSeconds: 1260
     # Max analyses started per webhook and per 1-minute window. Raise if bursts of
     # alerts get dropped without a report; ultimately bounded by the agent's capacity.
     maxAutoAnalyzeFanout: 50

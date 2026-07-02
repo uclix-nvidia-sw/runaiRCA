@@ -262,13 +262,16 @@ func Run() {
 
 func NewServer() *Server {
 	store := NewStore()
-	agentRequestTimeout := time.Duration(getenvInt("AGENT_REQUEST_TIMEOUT_SECONDS", 180)) * time.Second
+	// Defaults must exceed the agent's ANALYSIS_DEADLINE_SECONDS (1200): the agent
+	// works up to that budget then returns a graceful degraded report — hanging up
+	// earlier loses the report and leaves the alert with a useless fallback.
+	agentRequestTimeout := time.Duration(getenvInt("AGENT_REQUEST_TIMEOUT_SECONDS", 1260)) * time.Second
 	if agentRequestTimeout <= 0 {
-		agentRequestTimeout = 180 * time.Second
+		agentRequestTimeout = 1260 * time.Second
 	}
-	manualAgentRequestTimeout := time.Duration(getenvInt("MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS", 900)) * time.Second
+	manualAgentRequestTimeout := time.Duration(getenvInt("MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS", 1260)) * time.Second
 	if manualAgentRequestTimeout <= 0 {
-		manualAgentRequestTimeout = 900 * time.Second
+		manualAgentRequestTimeout = 1260 * time.Second
 	}
 	store.ConnectDatabase(
 		first(os.Getenv("DATABASE_URL"), os.Getenv("POSTGRES_DSN")),
