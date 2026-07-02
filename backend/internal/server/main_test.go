@@ -2345,3 +2345,68 @@ func TestEmbeddingSearchRejectsOversizedQuery(t *testing.T) {
 		t.Fatalf("expected oversized query 400, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestChatAnalysisRequestWithoutAnyAlertCreatesAdHocIncident(t *testing.T) {
+	// The operator asks about something Alertmanager never caught: no explicit
+	// target, no reference to existing alerts. The chat must create an ad-hoc
+	// incident (visible in the incident list) and analyze IT — not silently
+	// hijack an unrelated latest alert, and not dead-end.
+	server := NewServer()
+	agentReqCh := make(chan AgentAnalysisRequest, 1)
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req AgentAnalysisRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode agent analysis request: %v", err)
+		}
+		agentReqCh <- req
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Ad-hoc RCA completed.",
+			AnalysisDetail:  "## Root Cause\n\nAd-hoc analysis.",
+			AnalysisQuality: "medium",
+			Capabilities:    map[string]string{"analysis": "ok"},
+		})
+	}))
+	defer agent.Close()
+	server.agentURL = agent.URL
+
+	// An unrelated alert exists — it must NOT be hijacked.
+	_, unrelated := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "unrelated"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "SomethingElse", "severity": "warning"},
+		Fingerprint: "fp-unrelated",
+	})
+
+	message := "dgx02 노드 GPU가 이상한 것 같아. 분석해줘"
+	payload, _ := json.Marshal(ChatRequest{Message: message})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected chat 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var response ChatResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode chat response: %v", err)
+	}
+	if response.AnalysisRun == nil || response.AnalysisRun.TargetType != "alert" {
+		t.Fatalf("expected an analysis run on an alert target, got %+v", response)
+	}
+	if response.AnalysisRun.TargetID == unrelated.AlertID {
+		t.Fatalf("ad-hoc request must not hijack the unrelated latest alert")
+	}
+	agentReq := <-agentReqCh
+	if agentReq.Alert.Labels["alertname"] != "OperatorRequestedAnalysis" {
+		t.Fatalf("expected the ad-hoc alert sent to the agent, got %+v", agentReq.Alert.Labels)
+	}
+	// The chat message must steer the analysis as operator guidance.
+	if agentReq.Alert.Annotations["operator_prompt"] != message {
+		t.Fatalf("expected the chat message as operator_prompt, got %q",
+			agentReq.Alert.Annotations["operator_prompt"])
+	}
+	run := waitForAnalysisRun(t, server, "chat")
+	if run.Status != "complete" {
+		t.Fatalf("unexpected analysis run: %+v", run)
+	}
+}

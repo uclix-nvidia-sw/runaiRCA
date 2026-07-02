@@ -1907,10 +1907,14 @@ function UnifiedWorkspace({
 
         <section className="rca-report">
           <div className="section-title"><FileText size={18} /> Report</div>
-          {analysis ? (
+          {isAnalyzing ? (
+            // While a run is in flight the previous report is stale — showing it
+            // confused operators into reading the old RCA as the new result.
+            <p className="empty">Analyzing… a new RCA report is being generated. The previous report will be replaced when it completes.</p>
+          ) : analysis ? (
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{analysis}</ReactMarkdown>
           ) : (
-            <p className="empty">{isAnalyzing ? 'Generating a fresh RCA report...' : 'No RCA report yet.'}</p>
+            <p className="empty">No RCA report yet.</p>
           )}
         </section>
 

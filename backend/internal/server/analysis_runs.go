@@ -138,7 +138,14 @@ func (s *Server) requestAnalysisRun(
 		return
 	}
 	if !s.store.ApplyAnalysisForRun(runID, alertID, analysis) {
-		if failedRun, ok := s.store.FailAnalysisRun(runID, analysisPersistenceFailure(alert)); ok {
+		// Distinguish "a newer run superseded this one" (normal when an operator
+		// re-triggers Analyze mid-run) from a real Postgres persistence failure —
+		// the persistence message told operators to check Postgres for a non-problem.
+		failure := analysisPersistenceFailure(alert)
+		if s.store.IsSupersededAnalysisRun(runID, alertID) {
+			failure = analysisSupersededResult(alert)
+		}
+		if failedRun, ok := s.store.FailAnalysisRun(runID, failure); ok {
 			run = failedRun
 		}
 		s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
@@ -164,6 +171,28 @@ func (s *Server) runBackfill(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.backfillOnce()
+		}
+	}
+}
+
+// runStaleRunReaper periodically re-runs the startup reaper. The startup pass
+// alone leaves a hole: a run orphaned by a backend restart (its goroutine died
+// with the old process) that is still YOUNGER than its request timeout survives
+// the startup reap — and nothing ever reaped it again, so its alert/incident
+// stayed "analyzing" forever. Reaping is safe on a live system: only runs older
+// than their own request timeout are touched, and by then the HTTP call driving
+// them has necessarily given up.
+func (s *Server) runStaleRunReaper(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if reaped := s.store.ReapStaleAnalyzingRuns(s.agentRequestTimeout, s.manualAgentRequestTimeout); reaped > 0 {
+				log.Printf("reaped %d stale analyzing run(s)", reaped)
+			}
 		}
 	}
 }
@@ -232,6 +261,29 @@ func compactAgentSimilarIncidents(items []SimilarIncident) []SimilarIncident {
 		out = append(out, item)
 	}
 	return out
+}
+
+func analysisSupersededResult(alert Alert) AgentAnalysisResponse {
+	name := first(alert.Labels["alertname"], "Run:AI alert")
+	summary := fmt.Sprintf("%s analysis was superseded by a newer run", name)
+	detail := strings.Join([]string{
+		"## Root Cause",
+		"",
+		"A newer analysis run was started for this alert before this one finished, so this result was not applied.",
+		"",
+		"## Recommended Actions",
+		"",
+		"No action needed — see the newest analysis run for the current RCA.",
+	}, "\n")
+	return AgentAnalysisResponse{
+		Status:          "superseded",
+		Analysis:        detail,
+		AnalysisSummary: summary,
+		AnalysisDetail:  detail,
+		AnalysisQuality: "low",
+		Capabilities:    map[string]string{"analysis": "superseded_by_newer_run"},
+		Warnings:        []string{"analysis superseded by a newer run for this alert"},
+	}
 }
 
 func analysisPersistenceFailure(alert Alert) AgentAnalysisResponse {

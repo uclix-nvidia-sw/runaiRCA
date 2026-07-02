@@ -59,15 +59,26 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	req = s.enrichChatRequest(req)
 	if wantsAnalysisRun(req.Message) {
 		targetType, targetID, inferred := s.chatAnalysisTarget(req)
+		adHoc := false
 		if targetType == "" || targetID == "" {
-			answer := ChatResponse{
-				Status:         "ok",
-				Answer:         noAnalysisTargetAnswer(req),
-				ConversationID: req.ConversationID,
-			}
-			finalizeChatResponse(&answer, req)
-			writeJSON(w, http.StatusOK, answer)
-			return
+			// Alertmanager never caught this problem, but the operator still wants
+			// an analysis (e.g. "dgx02 노드가 이상해, 분석해줘" with no matching
+			// alert). Create an ad-hoc incident from the request so the pipeline
+			// has a real target and the work shows up in the incident list; the
+			// chat message travels as the operator guidance steering the analysis.
+			fp := fmt.Sprintf("chat-adhoc-%d", time.Now().UnixNano())
+			_, record := s.store.UpsertAlert(AlertmanagerWebhook{GroupKey: fp}, Alert{
+				Status: "firing",
+				Labels: map[string]string{
+					"alertname": "OperatorRequestedAnalysis",
+					"severity":  "info",
+					"source":    "chat",
+				},
+				Annotations: map[string]string{"summary": excerpt(req.Message, 160)},
+				Fingerprint: fp,
+			})
+			targetType, targetID = "alert", record.AlertID
+			adHoc = true
 		}
 		run, ok := s.startAnalysisRun(targetType, targetID, "chat", req.Message)
 		if !ok {
@@ -85,9 +96,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "analysis target not found")
 			return
 		}
+		startedAnswer := analysisStartedAnswer(run, inferred)
+		if adHoc {
+			startedAnswer = adHocAnalysisStartedAnswer(run)
+		}
 		answer := ChatResponse{
 			Status:         "ok",
-			Answer:         analysisStartedAnswer(run, inferred),
+			Answer:         startedAnswer,
 			ConversationID: req.ConversationID,
 			AnalysisRun:    run,
 		}
@@ -318,10 +333,29 @@ func (s *Server) chatAnalysisTarget(req ChatRequest) (string, string, bool) {
 	if req.IncidentID != "" {
 		return "incident", req.IncidentID, false
 	}
-	if alertID := s.latestAlertTarget(); alertID != "" {
-		return "alert", alertID, true
+	// Only guess "the latest alert" when the message actually refers to existing
+	// alerts ("지금 알람 분석해줘"). An ad-hoc question about something Alertmanager
+	// never caught must NOT silently hijack an unrelated alert — the caller creates
+	// a fresh ad-hoc incident for it instead.
+	if referencesExistingAlerts(req.Message) {
+		if alertID := s.latestAlertTarget(); alertID != "" {
+			return "alert", alertID, true
+		}
 	}
 	return "", "", false
+}
+
+func referencesExistingAlerts(message string) bool {
+	lowered := strings.ToLower(message)
+	for _, token := range []string{
+		"알람", "알림", "경보", "인시던트", "지금", "최근", "현재",
+		"alert", "incident", "latest", "current",
+	} {
+		if strings.Contains(lowered, token) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) latestAlertTarget() string {
@@ -342,24 +376,21 @@ func analysisStartedAnswer(run *AnalysisRun, inferred bool) string {
 	)
 }
 
+func adHocAnalysisStartedAnswer(run *AnalysisRun) string {
+	return fmt.Sprintf(
+		"이 요청과 맞는 Alertmanager 알림이 없어서 새 인시던트 `%s`를 만들고 분석 run `%s`를 시작했어. "+
+			"요청 내용은 분석 지침(operator guidance)으로 에이전트에 전달돼. Incident 목록에서 진행 상황을 볼 수 있어.",
+		run.IncidentID,
+		run.RunID,
+	)
+}
+
 func analysisAlreadyRunningAnswer(run *AnalysisRun, inferred bool) string {
 	target := fmt.Sprintf("%s `%s`", run.TargetType, run.TargetID)
 	if inferred {
 		target = fmt.Sprintf("latest available %s `%s`", run.TargetType, run.TargetID)
 	}
 	return fmt.Sprintf("이미 분석 run `%s`가 %s 대상으로 진행 중이야. 새 Agent 요청은 보내지 않았고, Analysis Dashboard에서 이어서 보면 돼.", run.RunID, target)
-}
-
-func noAnalysisTargetAnswer(req ChatRequest) string {
-	state, _ := req.Context["dashboard_state"].(map[string]any)
-	alertCount := anyInt(state["alert_count"])
-	runCount := anyInt(state["analysis_run_count"])
-	return fmt.Sprintf(
-		"분석 요청은 인식했지만 분석할 alert/incident가 아직 없어. 현재 Backend가 보는 alert는 %d개, analysis run은 %d개야. "+
-			"Alertmanager webhook이 `/webhook/alertmanager`로 들어왔는지 먼저 확인해줘. alert가 들어오면 같은 요청에서 최신 alert를 자동으로 골라 분석을 시작할게.",
-		alertCount,
-		runCount,
-	)
 }
 
 func anyInt(value any) int {

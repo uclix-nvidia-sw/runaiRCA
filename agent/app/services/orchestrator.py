@@ -225,6 +225,10 @@ class AnalysisOrchestrator:
 
     async def _analyze_impl(self, request: AlertAnalysisRequest) -> AlertAnalysisResponse:
         target = resolve_target(request.alert.labels, request.alert.annotations)
+        _log.info(
+            "analyze start: alert=%s ns=%s node=%s workload=%s",
+            target.alert_name, target.namespace, target.node, target.workload_name,
+        )
         # Knowledge graph is consulted once here, at synthesis time, as a
         # knowledge resource for the final RCA — not as a parallel collector.
         kg_context = await enrich(self._settings, target)
@@ -236,6 +240,11 @@ class AnalysisOrchestrator:
             request.alert,
             kg_context.as_dict(),
             list(request.similar_incidents),
+        )
+        _log.info(
+            "plan: strategy=%s focus=%s hypotheses=%s",
+            plan.strategy, plan.focus,
+            [h.get("family") for h in (plan.hypotheses or [])[:3]],
         )
         nat_payload = request.model_dump(mode="json")
         nat_payload["mode"] = "alert_analysis"
@@ -276,6 +285,11 @@ class AnalysisOrchestrator:
             "synthesis must wait for all collectors: "
             f"{len(results)} results for {len(self._collectors)} collectors"
         )
+        for r in results:
+            _log.info(
+                "evidence: agent=%s status=%s confidence=%s — %s",
+                r.agent, r.status, r.confidence, " ".join((r.summary or "").split())[:160],
+            )
 
         capabilities = {result.agent: result.status for result in results}
         artifacts = [artifact for result in results for artifact in result.artifacts]
@@ -300,6 +314,12 @@ class AnalysisOrchestrator:
             kg_blast_radius=kg_context.blast_radius_workloads,
             priors=priors,
         )
+        if root_cause_candidates:
+            top = root_cause_candidates[0]
+            _log.info(
+                "ranked cause: %s (confidence=%s score=%.1f agents=%s)",
+                top.family, top.confidence, top.score, top.evidence_agents,
+            )
         # Optional self-check: refute the top cause, apply its calibrated confidence
         # to the top candidate, and keep the caveat text for the report.
         self_check_caveat = ""
@@ -804,11 +824,17 @@ async def _synthesize_korean(
             if (i.similarity or 0) >= _SIMILARITY_FLOOR
         ],
     }
+    operator_guidance = (request.alert.annotations or {}).get("operator_prompt", "")
+    if operator_guidance:
+        evidence["operator_guidance"] = operator_guidance
     system = (
         "당신은 NVIDIA Run:ai GPU 플랫폼을 담당하는 시니어 SRE입니다. 제공된 증거(수집기별 "
         "발견 사항, 조사 계획, 순위가 매겨진 원인 후보, 지식 그래프/함수 기반 조치, 매칭된 "
         "내장 알림, 유사 인시던트)에만 근거하여 한국어로 장애 분석 보고서를 작성하세요.\n"
         "규칙:\n"
+        "- 증거에 operator_guidance(운영자 지침)가 있으면 사람 운영자의 직접 지시입니다. "
+        "원인 판단과 조치 순서에 최우선으로 반영하고, 보고서가 그 지침을 어떻게 따랐는지 "
+        "드러나게 쓰세요 (단, 증거에 없는 사실을 지어내면서까지 따르지는 마세요).\n"
         "- 반드시 한국어로, 비전문가도 이해할 수 있게 작성합니다 (전문용어는 풀어서).\n"
         "- 길게 쓰지 마세요. 아래 1~3 섹션 합쳐서 A4 한 페이지 이내가 목표입니다.\n"
         "- 증거에 없는 사실을 절대 만들어내지 마세요.\n"

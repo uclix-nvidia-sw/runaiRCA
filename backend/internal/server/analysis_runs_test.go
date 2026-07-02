@@ -1372,3 +1372,52 @@ func TestChatContextAttachesMemoryAndFeedbackHints(t *testing.T) {
 		t.Fatalf("feedback_hints missing from chat context: %+v", agentReq.Context)
 	}
 }
+
+func TestReusedManualRunBecomesLatestSoItsResultApplies(t *testing.T) {
+	// Production bug: manual re-analysis reuses its old run row IN PLACE, and the
+	// "latest run" guard compares CreatedAt — so once ANY later run row existed for
+	// the same alert (e.g. a comment reanalysis), every reused manual run finished
+	// only to be rejected as stale ("alert RCA persistence failed"), forever.
+	store := NewStore()
+	incident, record := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "fp-reuse"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "ReuseLatest"},
+		Fingerprint: "fp-reuse",
+	})
+	alertID := record.AlertID
+	incidentID := incident.IncidentID
+
+	// 1) A manual alert-targeted run completes.
+	runA, created := store.CreateAnalysisRunIfAllowed(
+		"manual", "alert", alertID, incidentID, alertID, "manual", "")
+	if !created {
+		t.Fatalf("first manual run should be created")
+	}
+	store.CompleteAnalysisRun(runA.RunID, AgentAnalysisResponse{AnalysisSummary: "old", AnalysisDetail: "old"})
+
+	// 2) A later run row for the SAME alert but a different target (comment
+	//    reanalysis on the incident) is created and completes — newer CreatedAt.
+	runB, created := store.CreateAnalysisRunIfAllowed(
+		"comment", "incident", incidentID, incidentID, alertID, "comment", "")
+	if !created {
+		t.Fatalf("comment run should be created as its own row")
+	}
+	store.CompleteAnalysisRun(runB.RunID, AgentAnalysisResponse{AnalysisSummary: "b", AnalysisDetail: "b"})
+
+	// 3) The operator clicks Analyze on the alert again: the manual row is reused.
+	reused, created := store.CreateAnalysisRunIfAllowed(
+		"manual", "alert", alertID, incidentID, alertID, "manual again", "")
+	if !created {
+		t.Fatalf("re-analysis should reuse and restart the manual run")
+	}
+	if reused.RunID != runA.RunID {
+		t.Fatalf("expected in-place reuse of %s, got %s", runA.RunID, reused.RunID)
+	}
+
+	// 4) Its completed RCA must APPLY — it is the newest analysis.
+	fresh := AgentAnalysisResponse{AnalysisSummary: "fresh", AnalysisDetail: "fresh"}
+	store.CompleteAnalysisRun(reused.RunID, fresh)
+	if !store.ApplyAnalysisForRun(reused.RunID, alertID, fresh) {
+		t.Fatalf("reused run result must apply as the newest analysis, not be rejected as stale")
+	}
+}
