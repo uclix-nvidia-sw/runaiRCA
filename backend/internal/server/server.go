@@ -242,6 +242,7 @@ func Run() {
 	defer stop()
 
 	go server.runBackfill(ctx)
+	go server.runStaleRunReaper(ctx)
 
 	go func() {
 		log.Printf("Run:AI RCA backend listening on :%s", port)

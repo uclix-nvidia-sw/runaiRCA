@@ -175,6 +175,28 @@ func (s *Server) runBackfill(ctx context.Context) {
 	}
 }
 
+// runStaleRunReaper periodically re-runs the startup reaper. The startup pass
+// alone leaves a hole: a run orphaned by a backend restart (its goroutine died
+// with the old process) that is still YOUNGER than its request timeout survives
+// the startup reap — and nothing ever reaped it again, so its alert/incident
+// stayed "analyzing" forever. Reaping is safe on a live system: only runs older
+// than their own request timeout are touched, and by then the HTTP call driving
+// them has necessarily given up.
+func (s *Server) runStaleRunReaper(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if reaped := s.store.ReapStaleAnalyzingRuns(s.agentRequestTimeout, s.manualAgentRequestTimeout); reaped > 0 {
+				log.Printf("reaped %d stale analyzing run(s)", reaped)
+			}
+		}
+	}
+}
+
 func (s *Server) backfillOnce() int {
 	if !s.agentHealthy() {
 		return 0 // agent down / outage — do not queue more work onto it
