@@ -4,6 +4,7 @@ Populates the ontology's GPU-hardware-fault layer:
     xid_error  -applies_to->  gpu_model
     xid_error  -indicates->   gpu_hardware_error(root_cause family)
     xid_error  -resolved_by->  action   (the immediate/investigatory buckets)
+    xid_error  -leads_to->    xid_error (causal escalation, from `leads_to` in the YAML)
 
 so an NVIDIA XID becomes a first-class RCA candidate alongside the curated
 failure modes. Run:
@@ -118,6 +119,21 @@ def _relate_resolved_by(tx: Any, code: int, statement: str) -> None:
     ).resolve()
 
 
+def _relate_leads_to(tx: Any, cause: int, effect: int) -> None:
+    if _exists(
+        tx,
+        f"$x isa xid_error, has xid_code {cause}; "
+        f"$e isa xid_error, has xid_code {effect}; "
+        f"(cause_fault: $x, effect_fault: $e) isa leads_to;",
+    ):
+        return
+    tx.query(
+        f"match $x isa xid_error, has xid_code {cause}; "
+        f"$e isa xid_error, has xid_code {effect}; "
+        f"insert (cause_fault: $x, effect_fault: $e) isa leads_to;"
+    ).resolve()
+
+
 def main() -> int:
     settings = load_settings()
     if not settings.enable_typedb:
@@ -134,8 +150,10 @@ def main() -> int:
         print("typedb-driver is not installed. `pip install typedb-driver`.", file=sys.stderr)
         return 2
 
-    n_xids = n_models = n_actions = 0
+    n_xids = n_models = n_actions = n_leads = 0
     seen_models: set[str] = set()
+    catalog_codes = {int(e["code"]) for e in xids if e.get("code") is not None}
+    leads_pairs: list[tuple[int, int]] = []
     with open_driver(settings) as driver:
         with driver.transaction(settings.typedb_database, TransactionType.WRITE) as tx:
             _ensure_family(tx)
@@ -174,9 +192,21 @@ def main() -> int:
                     _ensure_action(tx, statement)
                     _relate_resolved_by(tx, code, statement)
                     n_actions += 1
+                for effect in entry.get("leads_to", []) or []:
+                    effect = int(effect)
+                    # Effect XIDs may appear later in the file — relate in a
+                    # second pass once every xid_error entity exists.
+                    if effect != code and effect in catalog_codes:
+                        leads_pairs.append((code, effect))
+            for cause, effect in leads_pairs:
+                _relate_leads_to(tx, cause, effect)
+                n_leads += 1
             tx.commit()
 
-    print(f"loaded XID catalog: {n_xids} xids, {n_models} gpu models, {n_actions} action links")
+    print(
+        f"loaded XID catalog: {n_xids} xids, {n_models} gpu models, "
+        f"{n_actions} action links, {n_leads} leads_to edges"
+    )
     return 0
 
 

@@ -3,6 +3,11 @@
 # severity is derived from the immediate-action bucket:
 #   RESET_GPU/RESTART_BM/RESTART_VM/CONTACT_SUPPORT/XID_154/WORKFLOW_* => fatal, else non-fatal.
 # Degenerate self-referential resolution rows (class == action text) are dropped.
+# leads_to: XID codes this fault escalates to (causal edges), parsed from the
+#   sheet1 "Xid 154 linkage" column (non-empty => escalates to XID 154) and the
+#   sheet2 "Xid 144-150 Decode" Local/Remote causal text ("Will lead to Xid 48",
+#   "AppCrash (Xid 45)", ...). Deduped; self-references dropped.
+# linkage_note: raw "Xid 154 linkage" cell text (driver version the linkage landed in).
 
 xids:
   - code: 8
@@ -133,6 +138,8 @@ xids:
     immediate_action: "WORKFLOW_XID_48"
     investigatory_action: "WORKFLOW_XID_48"
     trigger: "This event is logged when the GPU detects that an uncorrectable error occurs on the GPU. This is also reported back to the user application. A GPU reset or node reboot is needed to clear this error. The tool nvidia-smi can provide a summary of ECC errors. If the ECC error is reported for SRAM (excludes \"framebuffer\"), check for SRAM DBE thresholds and follow RMA flow if exceeded - (nvidia-smi <sram_threshold_exceeded> or NSM Msg Type 0x3, Cmd Code 0x7D, bit 0). If flag is set, run field diag."
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 54
     mnemonic: "SILENT_RUNNING_PWR_REDUCED_CLOCKING"
     description: "Auxiliary power is not connected to the GPU board"
@@ -157,6 +164,8 @@ xids:
     immediate_action: "RESET_GPU"
     investigatory_action: "CONTACT_SUPPORT"
     trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 63
     mnemonic: "INFOROM_DRAM_RETIREMENT_EVENT"
     description: "GPU memory remapping event"
@@ -165,6 +174,8 @@ xids:
     immediate_action: "IGNORE"
     investigatory_action: "IGNORE"
     trigger: "These events are logged when the GPU handles ECC memory errors on the GPU. On GPUs that support row remapping, starting with NVIDIA® Ampere archtecture GPUs, these events provide details on row remapper activity. For more information row remapper Xids, refer to https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/index.html#row-remapping. On earlier GPUs that support dynamic page retirement, these events provide details on dynamic page retirement activity. For more information on dynamic page retirement Xids, refer to https://docs.nvidia.com/deploy/dynamic-page-retirement/index.html."
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 64
     mnemonic: "INFOROM_DRAM_RETIREMENT_FAILURE"
     description: "GPU memory remapping failure"
@@ -173,6 +184,8 @@ xids:
     immediate_action: "RESET_GPU"
     investigatory_action: "CONTACT_SUPPORT"
     trigger: "These events are logged when the GPU handles ECC memory errors on the GPU. On GPUs that support row remapping, starting with NVIDIA® Ampere archtecture GPUs, these events provide details on row remapper activity. For more information row remapper Xids, refer to https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/index.html#row-remapping. On earlier GPUs that support dynamic page retirement, these events provide details on dynamic page retirement activity. For more information on dynamic page retirement Xids, refer to https://docs.nvidia.com/deploy/dynamic-page-retirement/index.html."
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 66
     mnemonic: "ROBUST_CHANNEL_FECS_ERR_REG_ACCESS_VIOLATION"
     description: "Illegal access by driver"
@@ -237,6 +250,8 @@ xids:
     immediate_action: "WORKFLOW_NVLINK_ERR"
     investigatory_action: "CONTACT_SUPPORT"
     trigger: "This event is logged when the GPU detects that a problem with a connection from the GPU to another GPU or NVSwitch over NVLink. A GPU reset or node reboot is needed to clear this error. This event may indicate a hardware failure with the link itself, or may indicate a problem with the device at the remote end of the link. For example, if a GPU fails, another GPU connected to it over NVLink may report an Xid 74 simply because the link went down as a result. The nvidia-smi nvlink command can provide additional details on NVLink errors, and connection information on the links. If this error is seen repeatedly and GPU reset or node reboot fails to clear the condition, contact your hardware vendor for support."
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 75
     mnemonic: "ROBUST_CHANNEL_CE6_ERROR"
     description: "CE6: Unknown Error"
@@ -277,6 +292,8 @@ xids:
     immediate_action: "RESTART_BM"
     investigatory_action: "CONTACT_SUPPORT"
     trigger: "This event is logged when the GPU driver attempts to access the GPU over its PCI Express connection and finds that the GPU is not accessible. This event is often caused by hardware failures on the PCI Express link causing the GPU to be inaccessible due to the link being brought down. Reviewing system event logs and kernel PCI event logs may provide additional indications of the source of the link failures. This event may also be cause by failing GPU hardware or other driver issues."
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 80
     mnemonic: "PBDMA_PUSHBUFFER_CRC_MISMATCH"
     description: "Corrupted data sent to GPU"
@@ -365,6 +382,8 @@ xids:
     immediate_action: "RESTART_APP"
     investigatory_action: "IGNORE (sympathetic)"
     trigger: "These events (94/95) are logged when GPU drivers handle errors in GPUs that support error containment, starting with NVIDIA A100 GPUs. For Xid 94, these errors are contained to one application, and the application that encountered this error must be restarted. All other applications running at the time of the Xid are unaffected. It is recommended to reset the GPU when convenient. Applications can continue to be run until the reset can be performed. One possible cause of containment errors is the handling of ECC memory errors. Review the NVIDIA GPU Memory Error Management manual: https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/index.html#row-remapping for coverage of ECC-triggered containment errors. Xid 45 will be seen in relation to this error."
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 95
     mnemonic: "ROBUST_CHANNEL_UNCONTAINED_ERROR"
     description: "Uncontained memory error"
@@ -373,6 +392,8 @@ xids:
     immediate_action: "RESET_GPU"
     investigatory_action: "IGNORE (sympathetic)"
     trigger: "These events (94/95) are logged when GPU drivers handle errors in GPUs that support error containment, starting with NVIDIA® A100 GPUs. For Xid 95, these errors affect multiple applications, and the affected GPU must be reset before applications can restart. Refer https://docs.nvidia.com/deploy/gpu-debug-guidelines/index.html for GPU Reset capabilities & limitations One possible cause of containment errors is the handling of ECC memory errors. Review the NVIDIA GPU Memory Error Management manual: https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/index.html#row-remapping for coverage of ECC-triggered containment errors. Xid 45 will be seen in relation to this error."
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 96
     mnemonic: "ROBUST_CHANNEL_NVDEC5_ERROR"
     description: "NVDEC5 Error"
@@ -477,6 +498,8 @@ xids:
     immediate_action: "RESET_GPU"
     investigatory_action: "CONTACT_SUPPORT"
     trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R570"
   - code: 110
     mnemonic: "SEC_FAULT_ERROR"
     description: "Security Fault Error"
@@ -485,6 +508,8 @@ xids:
     immediate_action: "RESET_GPU"
     investigatory_action: "INVESTIGATE_SW"
     trigger: "This event should be uncommon unless there is a hardware failure. To recover, revert any recent system hardware modifications and cold reset the system. If this fails to correct the issue, contact your hardware vendor for assistance."
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 119
     mnemonic: "GSP_RPC_TIMEOUT"
     description: "GSP RPC Timeout"
@@ -501,6 +526,8 @@ xids:
     immediate_action: "RESET_GPU"
     investigatory_action: "INVESTIGATE_SW"
     trigger: "These events (119/120) may be logged when an error occurs in code running on the GSP core of the GPU and/or a timeout occurs while waiting for the GSP core of the GPU to respond to an RPC message. A GPU reset or node power cycle may be needed if the error persists. If this problem reoccurs after a power cycle, follow the NVIDIA GPU Debug Guidelines document for additional debugging steps."
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 121
     mnemonic: "C2C_ERROR"
     description: "C2C Error"
@@ -597,6 +624,8 @@ xids:
     immediate_action: "RESET_GPU"
     investigatory_action: "INVESTIGATE_LINK_SI"
     trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 137
     mnemonic: "NVLINK_PRIV_ERR"
     description: "NVLink Privilege Error"
@@ -645,6 +674,8 @@ xids:
     immediate_action: "RESET_GPU"
     investigatory_action: "CONTACT_SUPPORT"
     trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.9; GPU driver R575"
   - code: 144
     mnemonic: "NVLINK_SAW_ERROR"
     description: "NVLINK: SAW Error"
@@ -653,6 +684,8 @@ xids:
     immediate_action: "WORKFLOW_NVLINK5_ERR"
     investigatory_action: "WORKFLOW_NVLINK5_ERR"
     trigger: ""
+    leads_to: [45, 48, 94, 95, 154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 145
     mnemonic: "NVLINK_RLW_ERROR"
     description: "NVLINK: RLW Error"
@@ -661,6 +694,8 @@ xids:
     immediate_action: "WORKFLOW_NVLINK5_ERR"
     investigatory_action: "WORKFLOW_NVLINK5_ERR"
     trigger: ""
+    leads_to: [45, 48, 154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 146
     mnemonic: "NVLINK_TLW_ERROR"
     description: "NVLINK: TLW Error"
@@ -669,6 +704,8 @@ xids:
     immediate_action: "WORKFLOW_NVLINK5_ERR"
     investigatory_action: "WORKFLOW_NVLINK5_ERR"
     trigger: ""
+    leads_to: [48, 94, 95, 154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 147
     mnemonic: "NVLINK_TREX_ERROR"
     description: "NVLINK: TREX Error"
@@ -677,6 +714,8 @@ xids:
     immediate_action: "WORKFLOW_NVLINK5_ERR"
     investigatory_action: "WORKFLOW_NVLINK5_ERR"
     trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 148
     mnemonic: "NVLINK_NVLPW_CTRL_ERROR"
     description: "NVLINK: NVLPW_CTRL Error"
@@ -685,6 +724,8 @@ xids:
     immediate_action: "WORKFLOW_NVLINK5_ERR"
     investigatory_action: "WORKFLOW_NVLINK5_ERR"
     trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 149
     mnemonic: "NVLINK_NETIR_ERROR"
     description: "NVLINK: NETIR Error"
@@ -693,6 +734,8 @@ xids:
     immediate_action: "WORKFLOW_NVLINK5_ERR"
     investigatory_action: "WORKFLOW_NVLINK5_ERR"
     trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 150
     mnemonic: "NVLINK_MSE_ERROR"
     description: "NVLINK: MSE Error"
@@ -701,6 +744,8 @@ xids:
     immediate_action: "WORKFLOW_NVLINK5_ERR"
     investigatory_action: "WORKFLOW_NVLINK5_ERR"
     trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 151
     mnemonic: "ROBUST_CHANNEL_KEY_ROTATION_ERROR"
     description: "Key rotation Error"
@@ -741,6 +786,8 @@ xids:
     immediate_action: "RESET_GPU"
     investigatory_action: "INVESTIGATE_SW_USER"
     trigger: "Link down events which are flagged as “intentional” (including transitions to SLEEP) will trigger this Xid"
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 156
     mnemonic: "RESOURCE_RETIREMENT_EVENT"
     description: "Resource Retirement Event"
@@ -749,6 +796,8 @@ xids:
     immediate_action: "RESET_GPU"
     investigatory_action: "IGNORE"
     trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
   - code: 157
     mnemonic: "RESOURCE_RETIREMENT_FAILURE"
     description: "Resource Retirement Failure"
@@ -765,6 +814,8 @@ xids:
     immediate_action: "RESET_GPU"
     investigatory_action: "CONTACT_SUPPORT"
     trigger: ""
+    leads_to: [154]
+    linkage_note: "yes; support with Xid introduction"
   - code: 159
     mnemonic: "ROBUST_CHANNEL_CHI_NON_DATA_ERROR"
     description: "CHI Non-Data Error"
@@ -773,6 +824,8 @@ xids:
     immediate_action: "CHECK_UVM"
     investigatory_action: "SYMPATHETIC_REPORT_SOLO"
     trigger: "May be seen on any C2C link-connected GPU."
+    leads_to: [154]
+    linkage_note: "yes; support with Xid introduction"
   - code: 160
     mnemonic: "CHANNEL_RETIREMENT_EVENT"
     description: "Channel Retirement Event"
@@ -781,6 +834,8 @@ xids:
     immediate_action: "IGNORE"
     investigatory_action: "INVESTIGATE_SW"
     trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.9; GPU driver R575"
   - code: 161
     mnemonic: "CHANNEL_RETIREMENT_FAILURE"
     description: "Channel Retirement Failure"
@@ -789,6 +844,8 @@ xids:
     immediate_action: "IGNORE"
     investigatory_action: "INVESTIGATE_SW"
     trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.9; GPU driver R575"
   - code: 162
     mnemonic: "PSHC_REENGAGED"
     description: "Power Smoothing HW Circuitry capability reengaged"

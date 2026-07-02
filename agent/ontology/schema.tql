@@ -203,13 +203,20 @@ entity xid_error,
     owns severity,
     plays applies_to:fault,
     plays indicates:symptom,      # xid_error indicates gpu_hardware_error
-    plays resolved_by:symptom;    # xid_error resolved_by action
+    plays resolved_by:symptom,    # xid_error resolved_by action
+    plays leads_to:cause_fault,   # this XID escalates to another XID...
+    plays leads_to:effect_fault;  # ...and can itself be an escalation target
 
 entity gpu_model,
     owns name @key,
     plays applies_to:model;
 
 relation applies_to, relates fault, relates model;  # xid_error applies_to gpu_model
+
+# Causal chain between XIDs: cause_fault escalates to / results in effect_fault
+# (e.g. NVLink faults 144-146 lead to Xid 48/45/94/95; many faults report via 154).
+# Edges come from xid_catalog.yaml `leads_to`, loaded by ontology/load_xids.py.
+relation leads_to, relates cause_fault, relates effect_fault;
 
 # --- inference (TypeDB 3.x) --------------------------------------------------
 # NOTE: TypeDB 3.0 REMOVED the 2.x `rule <name>: when { } then { };` reasoning

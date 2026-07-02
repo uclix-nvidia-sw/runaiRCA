@@ -10,6 +10,6 @@ from pathlib import Path
 def test_functions_tql_defines_the_expected_functions() -> None:
     text = Path("ontology/functions.tql").read_text(encoding="utf-8")
     assert "define" in text
-    for name in ("fixes_for_xid", "xids_for_gpu_model", "fixes_for_family"):
+    for name in ("fixes_for_xid", "xids_for_gpu_model", "fixes_for_family", "root_xids_for"):
         assert f"fun {name}(" in text
         assert "return {" in text

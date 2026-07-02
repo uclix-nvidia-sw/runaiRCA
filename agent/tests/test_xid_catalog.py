@@ -57,6 +57,28 @@ def test_known_gpu_failure_xids_present() -> None:
     assert {"A100", "H100"} <= set(x79["gpu_models"])
 
 
+def test_leads_to_causal_edges() -> None:
+    by_code = {x["code"]: x for x in _load()["xids"]}
+
+    for code, x in by_code.items():
+        edges = x.get("leads_to")
+        if edges is None:
+            continue
+        assert isinstance(edges, list) and edges
+        assert all(isinstance(e, int) for e in edges)
+        assert code not in edges, f"XID {code} leads_to itself"
+        assert len(edges) == len(set(edges)), f"XID {code} leads_to has duplicates"
+
+    # sheet1 "Xid 154 linkage": these faults escalate to XID 154.
+    for code in (48, 79, 95, 144):
+        assert 154 in by_code[code]["leads_to"], f"XID {code} must lead to 154"
+    # sheet2 "Xid 144-150 Decode": NVLink faults lead to ECC/app-crash XIDs.
+    assert {45, 48, 94, 95} <= set(by_code[144]["leads_to"])
+    assert 48 in by_code[146]["leads_to"]
+    # linkage_note carries the raw sheet1 text.
+    assert "driver" in by_code[48]["linkage_note"].lower()
+
+
 def test_resolution_buckets_resolve_action_text() -> None:
     data = _load()
     buckets = data["resolution_buckets"]

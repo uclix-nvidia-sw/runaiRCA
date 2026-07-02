@@ -40,3 +40,13 @@ fun fixes_for_family($fam: string) -> { statement }:
     (symptom: $sy, remedy: $a) isa resolved_by;
     $a has statement $s;
   return { $s };
+
+# Root-cause XIDs for an observed XID: which faults lead_to (escalate into) the
+# given code, one hop back along the leads_to causal chain. When the evidence
+# shows Xid 45 or 154, this answers "the likely ROOT faults are these".
+fun root_xids_for($code: integer) -> { xid_code }:
+  match
+    $e isa xid_error, has xid_code $c; $c == $code;
+    (cause_fault: $r, effect_fault: $e) isa leads_to;
+    $r has xid_code $root;
+  return { $root };
