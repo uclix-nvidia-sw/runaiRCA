@@ -42,6 +42,7 @@ def make_settings() -> Settings:
         runai_workloads_path="/api/v1/workloads",
         runai_projects_path="/api/v1/projects",
         runai_queues_path="/api/v1/queues",
+        runai_version_path="/api/v1/version",
         runai_timeout_seconds=1,
         prometheus_url="",
         prometheus_timeout_seconds=1,
