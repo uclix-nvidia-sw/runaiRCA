@@ -40,3 +40,19 @@ def test_malformed_verdict_is_safe(monkeypatch) -> None:
 
     monkeypatch.setattr(self_check, "complete_json", _fake)
     assert asyncio.run(self_check.verify_known_issues(_llm_settings(), _ISSUES, [])) == set()
+
+
+def test_verify_matches_generic_symptom_and_xid(monkeypatch) -> None:
+    # The verification is generic: failure-mode symptoms and GPU XIDs are verified
+    # the same way as known issues.
+    async def _fake(*_a, **_k):
+        return {"refuted": ["OOMKilled", "XID 45"]}
+
+    monkeypatch.setattr(self_check, "complete_json", _fake)
+    candidates = [
+        {"name": "OOMKilled", "detail": "workload_startup — raise the memory limit"},
+        {"name": "XID 45", "detail": "reset the GPU"},
+        {"name": "ImagePullBackOff", "detail": "check the registry"},  # kept
+    ]
+    out = asyncio.run(self_check.verify_matches(_llm_settings(), candidates, [], subject="match"))
+    assert out == {"OOMKilled", "XID 45"}

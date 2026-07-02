@@ -391,18 +391,49 @@ class AnalysisOrchestrator:
         # Version-aware precision: drop known issues already fixed in the cluster's
         # running Run:ai version so we don't attribute a symptom to a patched bug.
         known_issues = _suppress_fixed_known_issues(known_issues, _runai_version_from(results))
-        # Adversarial precision: keyword-matched known issues are LLM-verified; drop
-        # any the evidence does not actually support (best-effort, LLM-gated).
-        matched_ki = match_runai_known_issues(known_issues, _observed_text(results))
-        if matched_ki:
-            try:
-                from app.services.self_check import verify_known_issues
-            except ImportError:
-                pass
-            else:
-                refuted = await verify_known_issues(self._settings, matched_ki, results)
+        # Adversarial precision: LLM-verify signature/keyword matches (known issues,
+        # failure-mode symptoms, GPU XIDs) and drop ones the evidence doesn't support.
+        # Best-effort + LLM-gated: with no LLM nothing is suppressed.
+        observed = _observed_text(results)
+        try:
+            from app.services.self_check import verify_known_issues, verify_matches
+        except ImportError:
+            pass
+        else:
+            ki_matches = match_runai_known_issues(known_issues, observed)
+            if ki_matches:
+                refuted = await verify_known_issues(self._settings, ki_matches, results)
                 if refuted:
                     known_issues = [k for k in known_issues if k.get("issue") not in refuted]
+
+            ev_candidates = [
+                {
+                    "name": sym.get("symptom", ""),
+                    "detail": f"{fam} — {'; '.join(sym.get('actions', [])[:1])}",
+                }
+                for fam, sym in match_failure_mode_symptoms(failure_modes, observed)
+            ]
+            ev_candidates += [
+                {"name": f"XID {code}", "detail": "; ".join(graph_fixes.xid_fixes[code][:1])}
+                for code in graph_fixes.xid_fixes
+            ]
+            if ev_candidates:
+                refuted = await verify_matches(
+                    self._settings, ev_candidates, results, subject="matched symptom or GPU XID"
+                )
+                if refuted:
+                    failure_modes = {
+                        fam: [s for s in syms if s.get("symptom") not in refuted]
+                        for fam, syms in failure_modes.items()
+                    }
+                    for label in refuted:
+                        if label.startswith("XID "):
+                            try:
+                                code = int(label[4:])
+                            except ValueError:
+                                continue
+                            graph_fixes.xid_fixes.pop(code, None)
+                            graph_fixes.root_xids.pop(code, None)
         playbook_fallback = load_troubleshooting_cases(
             self._settings.troubleshooting_cases_file
         )
