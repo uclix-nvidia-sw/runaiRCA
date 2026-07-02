@@ -3442,9 +3442,24 @@ function stripRunaiNamespacePrefix(value: string) {
   return value.startsWith('runai-') ? value.slice('runai-'.length) : value;
 }
 
+// All backend timestamps are UTC (RFC3339 with Z). Render them in Korea Standard
+// Time (Asia/Seoul, UTC+9, no DST) — every date/time in the UI flows through here.
+const KST_FORMAT = new Intl.DateTimeFormat('sv-SE', {
+  timeZone: 'Asia/Seoul',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+});
+
 function formatTime(value: string) {
   if (!value) return '-';
-  return value.replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return `${KST_FORMAT.format(date).replace(',', '')} KST`;
 }
 
 function agentLabel(agent: string) {
