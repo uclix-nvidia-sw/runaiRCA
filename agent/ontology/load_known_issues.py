@@ -88,8 +88,8 @@ def _ensure_action(tx: Any, statement: str) -> None:
 def _relate_indicates(tx: Any, name: str, family: str) -> None:
     if _exists(
         tx,
-        f'$s isa symptom, has name "{esc(name)}"; $rc isa {family}; '
-        f"(symptom: $s, cause: $rc) isa indicates;",
+        f'$x isa symptom, has name "{esc(name)}"; $rc isa {family}; '
+        f"(symptom: $x, cause: $rc) isa indicates;",
     ):
         return
     tx.query(
@@ -101,9 +101,9 @@ def _relate_indicates(tx: Any, name: str, family: str) -> None:
 def _relate_resolved_by(tx: Any, name: str, statement: str) -> None:
     if _exists(
         tx,
-        f'$s isa symptom, has name "{esc(name)}"; '
+        f'$x isa symptom, has name "{esc(name)}"; '
         f'$a isa action, has statement "{esc(statement)}"; '
-        f"(symptom: $s, remedy: $a) isa resolved_by;",
+        f"(symptom: $x, remedy: $a) isa resolved_by;",
     ):
         return
     tx.query(
