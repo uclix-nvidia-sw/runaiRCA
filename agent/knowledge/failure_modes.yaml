@@ -39,36 +39,6 @@
         - "The node cannot reach the registry over the network. Check proxy/firewall rules and DNS from a node."
         - "Check that the registry service itself is up and responding."
         - "Try pulling the image manually from an affected node (e.g. `crictl pull <image>`) to confirm."
-    - name: Pod DNS Resolution Failure
-      keywords: [nxdomain, "temporary failure in name resolution", "no such host", "server misbehaving"]
-      actions:
-        - "In-cluster DNS is failing. Check the CoreDNS pods are Running: `kubectl -n kube-system get pods -l k8s-app=kube-dns`."
-        - "Test resolution from inside a pod (`nslookup kubernetes.default`) to tell pod-level from cluster-level failure."
-        - "Check the pod's dnsPolicy/dnsConfig and any NetworkPolicy blocking UDP/TCP port 53."
-    - name: CoreDNS Unhealthy
-      keywords: [coredns]
-      actions:
-        - "Inspect the CoreDNS pod logs and restarts in kube-system; a crash-looping CoreDNS breaks name resolution for the whole cluster."
-        - "Check whether the CoreDNS ConfigMap (Corefile) changed recently and roll it back if so."
-        - "Verify the upstream nameservers CoreDNS forwards to are reachable from the nodes."
-    - name: Pod Sandbox / CNI Failure
-      keywords: ["failed to create pod sandbox", "cni plugin", "network plugin", "failed to setup network for sandbox"]
-      actions:
-        - "The container network (CNI) failed while creating the pod. Check the CNI daemonset pod (calico/cilium/flannel) on that node."
-        - "Check whether the node ran out of pod IP addresses (IP pool exhaustion)."
-        - "If sandbox errors persist on one node, restart the container runtime and kubelet there, or cordon the node."
-    - name: Volume Attach/Mount Failure
-      keywords: [failedattachvolume, "unable to attach or mount volumes", "timed out waiting for the volume", "multi-attach error"]
-      actions:
-        - "Check the PVC is Bound and the CSI driver pods on the node are healthy."
-        - "A Multi-Attach error means the volume is still attached to another node — delete the old pod or wait for detach before the new one can start."
-        - "Check the storage backend (NFS/Ceph/cloud disk) health and connectivity from the node."
-    - name: PVC Pending / StorageClass Missing
-      keywords: ["unbound immediate persistentvolumeclaims", "no persistent volumes available", storageclass, provisioningfailed]
-      actions:
-        - "Run `kubectl describe pvc <name>` — the events say why provisioning failed."
-        - "Confirm the requested StorageClass exists and its provisioner is running."
-        - "Check the storage backend has free capacity for the requested size."
     - name: ImagePullBackOff
       keywords: [imagepullbackoff, errimagepull, "manifest unknown"]
       actions:
@@ -140,12 +110,6 @@
         - "A filesystem on the node is full. Run `df -h` on the node to find which one."
         - "Clean unused container images and old logs (e.g. `crictl rmi --prune`)."
         - "Find pods writing large files to emptyDir/local disk and cap them with ephemeral-storage limits."
-    - name: Node Filesystem Read-Only
-      keywords: ["read-only file system"]
-      actions:
-        - "The node's disk remounted itself read-only, which usually means a disk or storage-layer error. Check `dmesg` on the node for I/O errors."
-        - "Drain the node, then repair (fsck) or replace the disk before uncordoning."
-        - "On cloud nodes, check whether the underlying disk was detached or is being throttled."
     - name: Node Not Ready / Network Unavailable
       keywords: [nodenotready, "node is not ready", "network is unavailable", "container runtime network not ready"]
       actions:
@@ -197,12 +161,104 @@
         - "Check the dcgm-exporter pod logs on the node; a broken exporter breaks GPU metrics/alerts even when the GPU is fine."
         - "Run a DCGM health check on the node (`dcgmi diag -r 2`) to test the GPU hardware itself."
         - "Correlate with any Xid errors in the node's kernel log to separate monitoring issues from real hardware faults."
+- family: network_fabric_error
+  symptoms:
     - name: NCCL NVLS Cuda Failure
       keywords: ["transport/nvls.cc", "nccl warn cuda failure", nvls]
       actions:
         - "NCCL fails to initialize NVLS (multicast) with 'Cuda failure invalid argument' and stays broken until the node reboots. Immediate workaround: set NCCL_NVLS_ENABLE=0 to run without NVLS (loses NVLS AllReduce acceleration)."
         - "Recover the NVSwitch/NVLink coherent state: stop CUDA apps and the Fabric Manager service, run `nvidia-smi -r` to reset the GPUs, then restart Fabric Manager (per the Fabric Manager User Guide)."
         - "If it recurs, collect fabric/FM logs before rebooting and check GPU/NVSwitch fabric-state consistency (see NCCL issues #1562, #1672)."
+    - name: NCCL Communication Failure
+      keywords: ["nccl warn", "nccl error", "unhandled system error", "nccl timeout", "watchdog caught collective operation timeout"]
+      actions:
+        - "A collective (AllReduce/broadcast) failed or timed out between ranks. Check whether ONE rank/pod died first (its failure cascades to every other rank as an NCCL timeout) — find the first failing pod, not the loudest."
+        - "Validate inter-node connectivity on the compute fabric (IB/RoCE): `ibstat`, `ib_write_bw` between the involved nodes."
+        - "Reproduce with `nccl-tests` (all_reduce_perf) across the same nodes to separate fabric problems from application problems."
+    - name: InfiniBand / RDMA Link Error
+      keywords: [infiniband, mlx5, "rdma", "link downed", "port down", "link flap"]
+      actions:
+        - "Check the IB port state on the node (`ibstat`, `ibdev2netdev`) and the switch port counters for symbol/link errors."
+        - "Reseat or replace the cable/transceiver if one link flaps repeatedly; check the subnet manager (opensm/UFM) logs."
+        - "Multi-node training on the affected node will stall or crash with NCCL timeouts — cordon the node until the link is stable."
+    - name: Fabric Manager Unhealthy
+      keywords: ["fabric manager", nvswitch, "nv-fabricmanager"]
+      actions:
+        - "NVSwitch systems need a healthy Fabric Manager for GPU-to-GPU traffic. Check `systemctl status nvidia-fabricmanager` and its log on the node."
+        - "Restart order matters: stop CUDA apps -> restart Fabric Manager -> (if needed) `nvidia-smi -r` -> restart apps."
+
+- family: cluster_network_error
+  symptoms:
+    - name: Pod DNS Resolution Failure
+      keywords: [nxdomain, "temporary failure in name resolution", "no such host", "server misbehaving"]
+      actions:
+        - "In-cluster DNS is failing. Check the CoreDNS pods are Running: `kubectl -n kube-system get pods -l k8s-app=kube-dns`."
+        - "Test resolution from inside a pod (`nslookup kubernetes.default`) to tell pod-level from cluster-level failure."
+        - "Check the pod's dnsPolicy/dnsConfig and any NetworkPolicy blocking UDP/TCP port 53."
+    - name: CoreDNS Unhealthy
+      keywords: [coredns]
+      actions:
+        - "Inspect the CoreDNS pod logs and restarts in kube-system; a crash-looping CoreDNS breaks name resolution for the whole cluster."
+        - "Check whether the CoreDNS ConfigMap (Corefile) changed recently and roll it back if so."
+        - "Verify the upstream nameservers CoreDNS forwards to are reachable from the nodes."
+    - name: Pod Sandbox / CNI Failure
+      keywords: ["failed to create pod sandbox", "cni plugin", "network plugin", "failed to setup network for sandbox"]
+      actions:
+        - "The container network (CNI) failed while creating the pod. Check the CNI daemonset pod (calico/cilium/flannel) on that node."
+        - "Check whether the node ran out of pod IP addresses (IP pool exhaustion)."
+        - "If sandbox errors persist on one node, restart the container runtime and kubelet there, or cordon the node."
+    - name: CNI Agent Unhealthy
+      keywords: [calico, cilium, felix, "bird: bgp"]
+      actions:
+        - "The CNI agent (calico/cilium) on the node is unhealthy — pod networking on that node degrades or new pods fail to start. Check the agent pod's logs and restarts."
+        - "For calico, check BGP peer state (`calicoctl node status`); for cilium, `cilium status` on the node."
+
+- family: storage_io_error
+  symptoms:
+    - name: Volume Attach/Mount Failure
+      keywords: [failedattachvolume, "unable to attach or mount volumes", "timed out waiting for the volume", "multi-attach error"]
+      actions:
+        - "Check the PVC is Bound and the CSI driver pods on the node are healthy."
+        - "A Multi-Attach error means the volume is still attached to another node — delete the old pod or wait for detach before the new one can start."
+        - "Check the storage backend (NFS/Ceph/cloud disk) health and connectivity from the node."
+    - name: PVC Pending / StorageClass Missing
+      keywords: ["unbound immediate persistentvolumeclaims", "no persistent volumes available", storageclass, provisioningfailed]
+      actions:
+        - "Run `kubectl describe pvc <name>` — the events say why provisioning failed."
+        - "Confirm the requested StorageClass exists and its provisioner is running."
+        - "Check the storage backend has free capacity for the requested size."
+    - name: Node Filesystem Read-Only
+      keywords: ["read-only file system"]
+      actions:
+        - "The node's disk remounted itself read-only, which usually means a disk or storage-layer error. Check `dmesg` on the node for I/O errors."
+        - "Drain the node, then repair (fsck) or replace the disk before uncordoning."
+        - "On cloud nodes, check whether the underlying disk was detached or is being throttled."
+    - name: NFS Unresponsive / Stale Handle
+      keywords: ["nfs: server", "stale file handle", "nfs timeout"]
+      actions:
+        - "The NFS backend is not answering or handed out stale handles — training jobs reading datasets/checkpoints will hang, not crash. Check the NFS server load and network path from the node."
+        - "Identify every node mounting the same export (blast radius) before restarting anything."
+        - "After the server recovers, pods with hung mounts may need a restart to drop the stale handles."
+    - name: Ceph Backend Degraded
+      keywords: [ceph, "slow ops", "osd down", "pg degraded"]
+      actions:
+        - "Check `ceph -s` on the storage cluster: OSD down / degraded PGs / slow ops explain cluster-wide slow or failing volumes."
+        - "RBD/CephFS volumes will stall pod IO cluster-wide — prioritize the storage cluster recovery over per-pod debugging."
+
+- family: workload_runtime_error
+  symptoms:
+    - name: CUDA Out Of Memory
+      keywords: ["cuda out of memory", "torch.cuda.outofmemoryerror", "cuda oom"]
+      actions:
+        - "The APPLICATION ran out of GPU memory (this is not the container OOMKilled case). Reduce batch size / sequence length, or enable activation checkpointing / gradient accumulation."
+        - "Check whether another process shares the same GPU (`nvidia-smi` memory per PID) — fractional-GPU or leaked processes shrink the usable VRAM."
+        - "If it appears after many steps, look for a GPU-memory leak (tensors kept on device, growing cache) rather than a sizing problem."
+    - name: Application Crash / Traceback
+      keywords: ["traceback (most recent call last)", "unhandled exception", "segmentation fault", "core dumped"]
+      actions:
+        - "The workload's own code crashed while running. Read the last traceback in the pod logs — the RCA is in the application, not the platform."
+        - "Compare with the last successful run: what changed (image, code, data, config)?"
+        - "In distributed training, the FIRST crashing rank is the cause; every other rank then fails with communication timeouts."
 
 - family: control_plane_error
   symptoms:

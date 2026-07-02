@@ -1439,6 +1439,23 @@ _FAMILY_EXPLANATION = {
         "the GPU itself reported a fault (NVIDIA XID) — a hardware/driver/fabric "
         "problem on the node, not a scheduling or workload issue"
     ),
+    "network_fabric_error": (
+        "the GPU interconnect / multi-node communication layer is failing "
+        "(NCCL, NVLink/NVSwitch, InfiniBand/RDMA) — distributed training breaks "
+        "even though each GPU looks healthy"
+    ),
+    "cluster_network_error": (
+        "cluster networking is failing (CNI, CoreDNS, pod networking) — pods can't "
+        "resolve names or get network connectivity"
+    ),
+    "storage_io_error": (
+        "the storage layer is failing (CSI/PVC, NFS, Ceph, disk IO) — volumes "
+        "won't mount or IO hangs, independent of the workload itself"
+    ),
+    "workload_runtime_error": (
+        "the workload's own code failed while running (application crash, CUDA "
+        "out-of-memory) — an application-level fault, not a platform problem"
+    ),
 }
 
 
@@ -1564,6 +1581,10 @@ def _family_label(family: str) -> str:
         "platform_version_bug": "Run:ai version bug",
         "observability_accuracy": "metrics/observability accuracy",
         "expected_known_behavior": "expected/known behavior",
+        "network_fabric_error": "GPU interconnect/fabric error (NCCL/IB/NVLink)",
+        "cluster_network_error": "cluster networking error (CNI/DNS)",
+        "storage_io_error": "storage/IO error (CSI/NFS/Ceph)",
+        "workload_runtime_error": "workload runtime error (application fault)",
         "insufficient_evidence": "insufficient evidence",
     }
     return labels.get(family, family.replace("_", " "))
