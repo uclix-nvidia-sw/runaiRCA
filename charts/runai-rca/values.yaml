@@ -334,7 +334,9 @@ systemAgent:
   # only if you need a known token (e.g. to curl the endpoint yourself).
   authToken: ""
   image:
-    repository: python
+    # Fully qualified (docker.io/...) so global.imageRegistry does NOT rewrite this
+    # public base image into a private org (where it 403s). See runai-rca.image helper.
+    repository: docker.io/library/python
     tag: "3.12-slim"
     pullPolicy: IfNotPresent
   port: 9095
