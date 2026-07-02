@@ -198,7 +198,7 @@ agent:
     kubernetesApiUrl: https://kubernetes.default.svc
     kubernetesTokenPath: /var/run/secrets/kubernetes.io/serviceaccount/token
     kubernetesCaPath: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-    kubernetesTimeoutSeconds: 6
+    kubernetesTimeoutSeconds: 120
     kubernetesListLimit: 50
     kubernetesNamespaces: ""
     # Allow the Kubernetes agent to run read-only diagnostic commands (nvidia-smi,
@@ -206,29 +206,37 @@ agent:
     enablePodExec: true
     enableNatRuntime: false
     natConfigFile: /app/configs/runai_rca_workflow.yml
-    natTimeoutSeconds: 180
+    natTimeoutSeconds: 300
     # Human-like iterative investigation: the orchestrator plans, probes the most
     # relevant agent, observes, and re-plans (bounded by maxInvestigationSteps)
     # instead of gathering everything once. Only active when an LLM is configured
     # (no-op otherwise); each step is an extra LLM call, so it costs more per RCA.
     enableInvestigationLoop: true
-    maxInvestigationSteps: 4
+    maxInvestigationSteps: 12
+    # Re-analysis (after a refuted top cause) gets its own investigation budget.
+    maxReanalysisSteps: 6
+    # Overall hard cap per analysis: generous per-step time, but the whole run always
+    # finishes within this budget (default 20 min). 0 = no overall cap.
+    analysisDeadlineSeconds: 1200
     runaiBaseUrl: ""
     runaiTokenUrl: ""
     runaiWorkloadsPath: /api/v1/workloads
     runaiProjectsPath: /api/v1/projects
     runaiQueuesPath: /api/v1/queues
-    runaiTimeoutSeconds: 8
+    # Run:ai control-plane version endpoint — enables version-aware suppression of
+    # known issues already fixed on this cluster. Best-effort; set to your API's path.
+    runaiVersionPath: /api/v1/version
+    runaiTimeoutSeconds: 120
     runaiLogNamespaces: runai,runai-backend
     prometheusUrl: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
-    prometheusTimeoutSeconds: 6
+    prometheusTimeoutSeconds: 120
     prometheusMcpUrl: ""
     lokiUrl: http://loki-read.monitoring.svc.cluster.local:3100
-    lokiTimeoutSeconds: 6
+    lokiTimeoutSeconds: 120
     lokiQueryLimit: 20
     lokiMcpUrl: ""
-    postgresTimeoutSeconds: 6
-    typedbTimeoutSeconds: 6
+    postgresTimeoutSeconds: 60
+    typedbTimeoutSeconds: 60
     troubleshootingCasesFile: knowledge/troubleshooting_cases.md
     agentSoulsFile: prompts/agent_souls.md
     maskingRegexListJson: "[]"
@@ -236,7 +244,7 @@ agent:
     builtinRedactionHashMode: false
     llmBaseUrl: ""
     llmModel: ""
-    llmRequestTimeoutSeconds: 120
+    llmRequestTimeoutSeconds: 300
   podAnnotations: {}
   podLabels: {}
   podSecurityContext: {}
