@@ -315,6 +315,17 @@ async def test_analyze_returns_unified_artifacts() -> None:
     if "## Self-Check" in detail:
         body = detail.split("## Self-Check", 1)[1]
         assert body.strip(), "empty ## Self-Check section appended"
+    # The report must read as a document: Problem -> Root Cause -> Recommended
+    # Actions -> Appendix, in that order (Word-export skeleton).
+    order = [
+        detail.find("# Incident Analysis Report"),
+        detail.find("## 1. Problem"),
+        detail.find("## 2. Root Cause"),
+        detail.find("## 3. Recommended Actions"),
+        detail.find("## 4. Appendix"),
+    ]
+    assert all(idx >= 0 for idx in order), f"missing report section: {order}"
+    assert order == sorted(order), f"report sections out of order: {order}"
 
 
 @pytest.mark.asyncio
@@ -424,7 +435,7 @@ async def test_analyze_weaves_similar_incident_fix_into_actions() -> None:
         )
     )
 
-    recommended = response.analysis_detail.split("## Recommended Actions", 1)[1]
+    recommended = response.analysis_detail.split("## 3. Recommended Actions", 1)[1]
     actions_block = recommended.split("##", 1)[0]
     assert "INC-HIGH" in actions_block
     assert "Raised queue gpu-a quota" in actions_block

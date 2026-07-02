@@ -178,15 +178,17 @@ class SystemCollector:
 
 async def _llm_insight(settings: Settings, node: str, error_lines: list[str]) -> str | None:
     system = (
-        "You are a senior infrastructure engineer triaging a Kubernetes GPU node. "
-        "Given raw kernel/host log lines, reply with ONE sentence naming the most likely "
-        "hardware/kernel root cause (e.g. GPU XID fault, OOM kill, disk I/O failure). "
-        "No preamble, no list."
+        "You are a senior infrastructure engineer triaging a Kubernetes GPU node, "
+        "reporting to a colleague. Given raw kernel/host log lines, write ONE (max two) "
+        "sentence shaped: what you OBSERVED (the exact error, e.g. GPU XID fault, OOM "
+        "kill, disk I/O failure — with timestamps/counts when the lines carry them) -> "
+        "what it MEANS -> WHEN it started. Grounded ONLY in the given lines; never "
+        "invent. No preamble, no list."
     )
     if getattr(settings, "language", "en") == "ko":
-        system += " 한국어로 답하세요."
+        system += " 한국어로 답하세요 (관찰한 것 → 의미 → 시작 시점)."
     user = f"Node {node} recent kernel/host error lines:\n" + "\n".join(error_lines[:20])
-    return await complete(settings, system=system, user=user, max_tokens=120)
+    return await complete(settings, system=system, user=user, max_tokens=160)
 
 
 def _base_url_for_node(url_template: str, node: str) -> str:

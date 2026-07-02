@@ -507,16 +507,19 @@ async def _senior_insight(
         limit=8,
     )
     system = (
-        "You are a senior Kubernetes SRE. From this read-only pod inspection, give ONE "
-        "short sentence naming the most likely root-cause direction. No preamble."
+        "You are a senior Kubernetes SRE reporting a finding to a colleague. From this "
+        "read-only pod inspection, write ONE (max two) sentence shaped: what you "
+        "OBSERVED (restarts/events/log lines, with timestamps or counts when present) "
+        "-> what it MEANS -> WHEN it started. Grounded ONLY in the given data; never "
+        "invent. No preamble."
     )
     if getattr(settings, "language", "en") == "ko":
-        system += " 한국어로 답하세요."
+        system += " 한국어로 답하세요 (관찰한 것 → 의미 → 시작 시점)."
     insight = await complete(
         settings,
         system=system,
         user=str(user),
-        max_tokens=80,
+        max_tokens=160,
     )
     return insight or ""
 

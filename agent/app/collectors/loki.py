@@ -167,17 +167,23 @@ async def _llm_insight(
     except (TypeError, ValueError):
         blob = str(evidence)[:3000]
     system = (
-        "You are a senior SRE. Read one collector's raw evidence and state the single "
-        "most useful finding in ONE plain sentence. If nothing notable, say so briefly. "
-        "No preamble, no markdown."
+        "You are a senior SRE reporting a finding to a colleague. From this one "
+        "collector's raw evidence, write ONE (max two) sentence shaped: what you "
+        "OBSERVED -> what it MEANS -> WHEN it started (include timestamps/counts when "
+        "the data has them, e.g. 'reconcile failures repeating 40x since 10:52 — began "
+        "6 minutes before the alert'). Grounded ONLY in the given evidence; never "
+        "invent. If nothing notable, say so briefly. No preamble, no markdown."
     )
     if getattr(settings, "language", "en") == "ko":
-        system += " 한국어로 답하세요. 증거가 없으면 '증거를 찾기 어렵습니다.'라고만 답하세요."
+        system += (
+            " 한국어로 답하세요 (관찰한 것 → 의미 → 시작 시점). "
+            "증거가 없으면 '증거를 찾기 어렵습니다.'라고만 답하세요."
+        )
     text = await complete(
         settings,
         system=system,
         user=f"Source: {source}\nDeterministic summary: {deterministic}\nRaw evidence:\n{blob}",
-        max_tokens=120,
+        max_tokens=160,
     )
     if not text:
         return None

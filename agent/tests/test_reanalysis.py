@@ -206,6 +206,7 @@ async def test_insufficient_evidence_adds_korean_questions_without_llm() -> None
     assert top["family"] == "insufficient_evidence"
     assert "## 추가 확인 요청" in response.analysis_detail
     section = response.analysis_detail.split("## 추가 확인 요청", 1)[1]
+    section = section.split("\n## ", 1)[0]
     questions = [line for line in section.splitlines() if line.startswith("- ")]
     assert 2 <= len(questions) <= 4
     assert any("확인해 주세요" in q for q in questions)

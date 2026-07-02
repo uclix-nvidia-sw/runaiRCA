@@ -302,14 +302,16 @@ async def _senior_insight(settings: Settings, changes: list[dict]) -> str:
     if not llm_configured(settings):
         return ""
     system = (
-        "You are a senior SRE. Given the recently-changed resources around an alert, "
-        "reply with ONE short sentence on whether a change likely triggered the alert. "
-        "No preamble."
+        "You are a senior SRE asking the first question of any incident: what changed? "
+        "Given the recently-changed resources around an alert, write ONE (max two) "
+        "sentence shaped: what CHANGED (which resource, with the change time when "
+        "present) -> whether that change likely TRIGGERED the alert. Grounded ONLY in "
+        "the given changes; never invent. No preamble."
     )
     if getattr(settings, "language", "en") == "ko":
-        system += " 한국어로 답하세요."
+        system += " 한국어로 답하세요 (무엇이 언제 바뀌었고 → 알림을 유발했을 가능성)."
     user = str(compact([c.get("summary") for c in changes[:15]], limit=15))
-    return await complete(settings, system=system, user=user, max_tokens=80) or ""
+    return await complete(settings, system=system, user=user, max_tokens=160) or ""
 
 
 def _first_namespace(plan) -> str:  # noqa: ANN001

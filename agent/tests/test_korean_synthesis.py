@@ -226,7 +226,7 @@ async def test_korean_synthesis_falls_back_on_bad_json(monkeypatch) -> None:
         )
     )
     # Bad synthesis -> deterministic English report stands.
-    assert "## Root Cause" in response.analysis_detail
+    assert "## 2. 원인" in response.analysis_detail
     assert "## Agent Role Coverage" in response.analysis_detail
 
 
@@ -260,7 +260,7 @@ async def test_english_language_keeps_deterministic_report(monkeypatch) -> None:
             )
         )
     )
-    assert "## Root Cause" in response.analysis_detail
+    assert "## 2. Root Cause" in response.analysis_detail
     assert "## Agent Role Coverage" in response.analysis_detail
     # The Korean synthesis system prompt is Korean; it must never be sent for en.
     assert not any("한국어" in body for body in seen), "Korean synthesis must not run for en"
