@@ -31,6 +31,7 @@ import {
   Search,
   Send,
   Server,
+  Cpu,
   Settings2,
   ThumbsDown,
   ThumbsUp,
@@ -199,7 +200,7 @@ type QueryDisplayItem = {
 };
 
 const ANALYSIS_AGENT_ID = 'analysis';
-const COMPONENT_AGENT_ORDER = ['runai', 'kubernetes', 'postgres', 'prometheus', 'loki'];
+const COMPONENT_AGENT_ORDER = ['runai', 'kubernetes', 'postgres', 'prometheus', 'loki', 'system'];
 const AGENT_ORDER = COMPONENT_AGENT_ORDER;
 const ANALYSIS_WINDOWS = [
   { label: '7d', days: 7 },
@@ -3454,6 +3455,7 @@ function agentLabel(agent: string) {
     postgres: 'Postgres',
     prometheus: 'Prometheus',
     loki: 'Loki',
+    system: 'System',
   };
   return labels[agent] || agent;
 }
@@ -3465,6 +3467,7 @@ function agentIcon(agent: string) {
   if (agent === 'postgres') return <Database size={18} />;
   if (agent === 'prometheus') return <LineChart size={18} />;
   if (agent === 'loki') return <FileText size={18} />;
+  if (agent === 'system') return <Cpu size={18} />;
   return <AlertTriangle size={18} />;
 }
 

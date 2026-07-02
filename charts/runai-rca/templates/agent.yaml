@@ -151,6 +151,16 @@ spec:
               value: {{ .Values.typedb.auth.password | quote }}
             - name: TYPEDB_TIMEOUT_SECONDS
               value: {{ .Values.agent.env.typedbTimeoutSeconds | quote }}
+            - name: ENABLE_POD_EXEC
+              value: {{ .Values.agent.env.enablePodExec | quote }}
+            {{- if .Values.systemAgent.enabled }}
+            - name: ENABLE_SYSTEM_AGENT
+              value: "true"
+            # The system collector substitutes {node} per alert; the DaemonSet serves
+            # node logs on this port (hostNetwork), so the node name resolves directly.
+            - name: SYSTEM_AGENT_URL
+              value: "http://{node}:{{ .Values.systemAgent.port }}"
+            {{- end }}
             - name: POSTGRES_DSN
               valueFrom:
                 secretKeyRef:

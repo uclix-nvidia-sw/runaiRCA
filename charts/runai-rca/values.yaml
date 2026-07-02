@@ -191,6 +191,9 @@ agent:
     kubernetesTimeoutSeconds: 6
     kubernetesListLimit: 50
     kubernetesNamespaces: ""
+    # Allow the Kubernetes agent to run read-only diagnostic commands (nvidia-smi,
+    # etc.) via the pod exec subresource. Requires pods/exec RBAC (agent-rbac.yaml).
+    enablePodExec: false
     enableNatRuntime: false
     natConfigFile: /app/configs/runai_rca_workflow.yml
     natTimeoutSeconds: 180
@@ -291,3 +294,21 @@ ingress:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# Privileged DaemonSet exposing a read-only node log endpoint (dmesg/journal/syslog)
+# so the RCA agent can see host/kernel/GPU-driver events (NVIDIA XID, OOM, MCE, ...).
+# Disabled by default: it runs privileged with hostNetwork/hostPID on every node.
+# The agent reaches each node via http://{node}:port — set the agent's SYSTEM_AGENT_URL
+# to "http://{node}:9095" and ENABLE_SYSTEM_AGENT=true. Any base python image with
+# nsenter/journalctl works (e.g. a distro image with python3); it only runs stdlib code.
+systemAgent:
+  enabled: false
+  image:
+    repository: python
+    tag: "3.12-slim"
+    pullPolicy: IfNotPresent
+  port: 9095
+  nodeSelector: {}
+  tolerations:
+    - operator: Exists
+  resources: {}
