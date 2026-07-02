@@ -138,7 +138,14 @@ func (s *Server) requestAnalysisRun(
 		return
 	}
 	if !s.store.ApplyAnalysisForRun(runID, alertID, analysis) {
-		if failedRun, ok := s.store.FailAnalysisRun(runID, analysisPersistenceFailure(alert)); ok {
+		// Distinguish "a newer run superseded this one" (normal when an operator
+		// re-triggers Analyze mid-run) from a real Postgres persistence failure —
+		// the persistence message told operators to check Postgres for a non-problem.
+		failure := analysisPersistenceFailure(alert)
+		if s.store.IsSupersededAnalysisRun(runID, alertID) {
+			failure = analysisSupersededResult(alert)
+		}
+		if failedRun, ok := s.store.FailAnalysisRun(runID, failure); ok {
 			run = failedRun
 		}
 		s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
@@ -232,6 +239,29 @@ func compactAgentSimilarIncidents(items []SimilarIncident) []SimilarIncident {
 		out = append(out, item)
 	}
 	return out
+}
+
+func analysisSupersededResult(alert Alert) AgentAnalysisResponse {
+	name := first(alert.Labels["alertname"], "Run:AI alert")
+	summary := fmt.Sprintf("%s analysis was superseded by a newer run", name)
+	detail := strings.Join([]string{
+		"## Root Cause",
+		"",
+		"A newer analysis run was started for this alert before this one finished, so this result was not applied.",
+		"",
+		"## Recommended Actions",
+		"",
+		"No action needed — see the newest analysis run for the current RCA.",
+	}, "\n")
+	return AgentAnalysisResponse{
+		Status:          "superseded",
+		Analysis:        detail,
+		AnalysisSummary: summary,
+		AnalysisDetail:  detail,
+		AnalysisQuality: "low",
+		Capabilities:    map[string]string{"analysis": "superseded_by_newer_run"},
+		Warnings:        []string{"analysis superseded by a newer run for this alert"},
+	}
 }
 
 func analysisPersistenceFailure(alert Alert) AgentAnalysisResponse {

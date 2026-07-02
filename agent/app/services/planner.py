@@ -314,9 +314,15 @@ async def plan_investigation(
         matched_alert=matched_alert,
     )
 
+    # Operator guidance (the prompt an operator attached to this Analyze request /
+    # their feedback) is a human directive — the LLM refine must honor it.
+    guidance = str((getattr(alert, "annotations", None) or {}).get("operator_prompt") or "")
+
     if llm_configured(settings):
         try:
-            refined = await _llm_refine(settings, target, plan, kg_context, similar_incidents)
+            refined = await _llm_refine(
+                settings, target, plan, kg_context, similar_incidents, guidance
+            )
             if refined:
                 plan = refined
         except Exception:  # noqa: BLE001 - planning is best-effort; keep deterministic plan
@@ -331,6 +337,7 @@ async def _llm_refine(
     plan: InvestigationPlan,
     kg_context: dict,
     similar_incidents: list,
+    guidance: str = "",
 ) -> InvestigationPlan | None:
     kg_summary = "none"
     if kg_context.get("available"):
@@ -357,12 +364,16 @@ async def _llm_refine(
         "control plane itself) — investigate Kubernetes and node/system evidence "
         "broadly; 'workload' = a user workload running inside Run:ai — focus on the "
         "Run:ai scheduler and the workload's scheduling/quota/startup; 'infra' = "
-        "node/system level first."
+        "node/system level first. "
+        "If operator guidance is present it is a direct instruction from the human "
+        "operator — honor it when ordering hypotheses and writing the narrative "
+        "(e.g. if it says this is a GPU problem, lead with the GPU/hardware path)."
     )
     if getattr(settings, "language", "en") == "ko":
         system += " Write the focus, reason, and narrative values in Korean."
     user = (
         f"Alert: {target.alert_name}\n"
+        f"Operator guidance: {guidance or '(none)'}\n"
         f"Namespace: {target.namespace} (scope: {_namespace_scope(target, settings)})  "
         f"Node: {target.node}  "
         f"Workload: {target.workload_name}  Pod: {target.pod}  "

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import FastAPI
 
 from app.config import load_settings
@@ -12,6 +14,23 @@ from app.schemas import (
     IncidentSummaryResponse,
 )
 from app.services.orchestrator import AnalysisOrchestrator
+
+
+class _HealthzFilter(logging.Filter):
+    """Drop kubelet probe noise (/healthz, /ping) from the uvicorn access log.
+
+    The probes are liveness/readiness checks from the node, not AI/agent traffic —
+    they drowned out the useful investigation logs. The endpoints themselves stay."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return "/healthz" not in msg and "/ping" not in msg
+
+
+logging.getLogger("uvicorn.access").addFilter(_HealthzFilter())
+# The RCA investigation narrates plan/collect/synthesis at INFO so the pod log
+# shows what the agents are doing instead of probe noise.
+logging.basicConfig(level=logging.INFO)
 
 settings = load_settings()
 orchestrator = AnalysisOrchestrator(settings)

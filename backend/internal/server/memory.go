@@ -284,6 +284,15 @@ func (s *Store) ApplyAnalysis(alertID string, response AgentAnalysisResponse) {
 	s.applyAnalysisLocked(alert, response)
 }
 
+// IsSupersededAnalysisRun reports whether a fresher analysis run has been started
+// for the alert since runID — i.e. this run's result is stale and will not be
+// applied. Lets callers distinguish "superseded" from a real persistence failure.
+func (s *Store) IsSupersededAnalysisRun(runID string, alertID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.alerts[alertID] != nil && !s.isLatestAnalysisRunForAlertLocked(runID, alertID)
+}
+
 // ApplyAnalysisForRun applies a completed RCA only when this run is still the
 // newest analysis run for the alert. Slow older runs may finish after a fresher
 // operator-triggered run; those stale results remain auditable in analysis_runs
