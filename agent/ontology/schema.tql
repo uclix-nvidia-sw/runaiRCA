@@ -211,31 +211,17 @@ entity gpu_model,
 
 relation applies_to, relates fault, relates model;  # xid_error applies_to gpu_model
 
-# --- inference rules (TypeDB 3.x) -------------------------------------------
-# needs live TypeDB validation — rule/read syntax is NOT exercised by unit tests.
-# Conservative: only constructs proven in the existing schema/loaders. No `not {}`
-# negation (TypeDB 3.11 rejects that form here).
-
-# (a) A fatal xid_error indicates the gpu_hardware_error root cause (escalation
-#     path: those carry RESET_GPU / RESTART_BM / CONTACT_SUPPORT actions).
-rule fatal_xid_indicates_gpu_hardware_error:
-    when {
-        $x isa xid_error, has severity "fatal";
-        $rc isa gpu_hardware_error;
-    } then {
-        (symptom: $x, cause: $rc) isa indicates;
-    };
-
-# (b) An xid_error that applies_to a GPU model is a relevant gpu_hardware_error
-#     candidate for that model — derive the indicates edge so a query scoped to
-#     the alerting GPU model surfaces the applicable XIDs as hardware-fault
-#     candidates (not just the fatal ones from rule (a)).
-rule model_xid_indicates_gpu_hardware_error:
-    when {
-        $x isa xid_error;
-        $g isa gpu_model;
-        (fault: $x, model: $g) isa applies_to;
-        $rc isa gpu_hardware_error;
-    } then {
-        (symptom: $x, cause: $rc) isa indicates;
-    };
+# --- inference (TypeDB 3.x) --------------------------------------------------
+# NOTE: TypeDB 3.0 REMOVED the 2.x `rule <name>: when { } then { };` reasoning
+# construct (it is replaced by `define fun` functions). A 2.x-style rule in this
+# `define` would make the WHOLE schema fail to load on 3.11 — so there is none.
+#
+# The inference those rules would have derived is instead MATERIALIZED at load
+# time by ontology/load_xids.py: it inserts an explicit `indicates` edge from
+# every xid_error to the gpu_hardware_error root cause, plus `applies_to`
+# (gpu_model) and `resolved_by` (action) edges. Severity + the resolved_by
+# actions carry the fatal/escalation nuance (RESET_GPU / CONTACT_SUPPORT vs
+# IGNORE), so no rule is needed to make XIDs first-class RCA candidates.
+#
+# If declarative, query-time reasoning is wanted later, add `define fun`
+# functions here — that is the 3.x equivalent and needs live TypeDB validation.
