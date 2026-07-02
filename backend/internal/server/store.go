@@ -544,6 +544,12 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 		existing.MissingData = []string{}
 		existing.Warnings = []string{}
 		existing.Artifacts = []Artifact{}
+		// This IS a new analysis occupying the old row, so it must also become the
+		// NEWEST run: isLatestAnalysisRunForAlert compares CreatedAt, and with the
+		// old timestamp any run created later (e.g. a comment reanalysis) stayed
+		// permanently newer — every re-analysis of this alert then completed only
+		// to be rejected as stale ("alert RCA persistence failed"), forever.
+		existing.CreatedAt = now
 		existing.UpdatedAt = now
 		if !s.persistAnalysisRunLocked(existing) {
 			return AnalysisRun{}, false
