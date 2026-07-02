@@ -1,5 +1,8 @@
 # Deployment Guide
 
+> **Lens:** How to use — take it from published images to a running deployment.
+> **In this doc:** container/Helm publishing · install paths · Alertmanager webhook routing · Postgres & pgvector setup · read-only RBAC.
+
 ## Container and Helm Deployment
 
 The repository includes a GitHub Actions workflow that builds the three runtime
@@ -160,7 +163,7 @@ For an existing Postgres, set `secrets.databaseUrl` or provide a Secret through
 auto-creates the target database on first start if it is missing — it connects to
 the server's `postgres` maintenance database, issues a single
 `CREATE DATABASE <name>` only when absent, and never touches other databases. The
-the connecting user therefore needs the `CREATEDB` privilege (or an admin can
+connecting user therefore needs the `CREATEDB` privilege (or an admin can
 pre-create the database). The backend user also needs privileges to create/update tables
 (and to run `CREATE EXTENSION` if pgvector should be enabled). pgvector is a database-server prerequisite: the
 extension binary must be installed on that Postgres server, and a DBA/admin may

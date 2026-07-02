@@ -1,5 +1,8 @@
 # UI Direction
 
+> **Lens:** How it's built (UI) — the design contract for the operator console.
+> **In this doc:** visual system · page model · interaction notes.
+
 Run:AI RCA should feel like KubeRCA evolved for NVIDIA Run:ai operators.
 
 ## Visual System

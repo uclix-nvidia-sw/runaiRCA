@@ -1,5 +1,8 @@
 # API Reference
 
+> **Lens:** Reference — the HTTP surface.
+> **In this doc:** Backend endpoints · Agent endpoints · webhook accept/ignore semantics.
+
 ## Endpoints
 
 Backend:

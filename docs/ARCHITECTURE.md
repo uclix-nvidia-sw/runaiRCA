@@ -1,5 +1,8 @@
 # Architecture
 
+> **Lens:** How it's built — the contract from Alertmanager webhook to a stored RCA.
+> **In this doc:** runtime flow · the three services · feedback/memory loop · ontology knowledge graph · evidence contract.
+
 Run:AI RCA is organized around three runtime services: Backend, Agent, and
 Frontend. The Backend can run with an in-memory fallback for local development,
 but production-style deployments should provide Postgres through

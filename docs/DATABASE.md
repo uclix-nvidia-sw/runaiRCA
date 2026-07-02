@@ -1,6 +1,9 @@
 # Data Stores
 
-Run:AI RCA uses two stores with distinct roles. See `ARCHITECTURE.md` for the
+> **Lens:** How it's built (data) — the two stores and what each owns.
+> **In this doc:** PostgreSQL tables · TypeDB ontology · ingestion paths · connection config.
+
+Run:AI RCA uses two stores with distinct roles. See [Architecture](ARCHITECTURE.md) for the
 runtime flow; this document is the data-structure reference.
 
 | Store | Role | Owner | Required? |
