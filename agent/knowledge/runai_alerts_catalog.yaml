@@ -1,0 +1,121 @@
+# Run:ai self-hosted built-in alerts — captured from
+# https://run-ai-docs.nvidia.com/self-hosted/infrastructure-setup/procedures/system-monitoring#built-in-alerts
+# Staged here (scratchpad) to fold into the ontology during integration, next to the
+# XID catalog. Maps built-in alert_name -> category -> root-cause family -> remediation,
+# so when one of these alerts fires the RCA already knows what it means + what to do.
+
+- alert: NVIDIA Run:ai Agent Cluster Info Push Rate Low
+  severity: critical
+  category: control_plane
+  family: control_plane_error
+  trigger: The cluster-sync pod in the runai namespace may not be functioning; cluster info may not sync to the control plane.
+  actions:
+    - "Check pod status: kubectl get pod -n runai (cluster-sync)."
+    - "Review the deployment details and pod logs."
+    - "Verify network connectivity between cluster and control plane."
+
+- alert: NVIDIA Run:ai Agent Pull Rate Low
+  severity: critical
+  category: control_plane
+  family: control_plane_error
+  trigger: The runai-agent pod may be overloaded/slow or not functioning; control-plane info may not sync to the cluster.
+  actions:
+    - "Check runai-agent pod status: kubectl get pod -n runai; review logs."
+    - "Verify control-plane connectivity."
+    - "If load is the cause, adjust the alert threshold (agentPullPushRateMinForAlert)."
+
+- alert: NVIDIA Run:ai Container Memory Usage Critical
+  severity: critical
+  category: resource
+  family: control_plane_error
+  trigger: A Run:ai container is using more than 90% of its memory limit; may OOM and crash.
+  actions:
+    - "Raise the container memory limit/request."
+    - "Investigate the memory growth; contact NVIDIA if it persists."
+
+- alert: NVIDIA Run:ai Container Memory Usage Warning
+  severity: warning
+  category: resource
+  family: control_plane_error
+  trigger: A Run:ai container is using more than 80% of its memory limit.
+  actions:
+    - "Raise the container memory limit/request before it OOMs."
+
+- alert: NVIDIA Run:ai Container Restarting
+  severity: warning
+  category: resource
+  family: control_plane_error
+  trigger: A Run:ai container restarted more than twice in the last 10 minutes; availability may be affected.
+  actions:
+    - "Find the pod: kubectl get pods -n runai; review its logs."
+    - "Verify the container has sufficient resources."
+
+- alert: NVIDIA Run:ai CPU Usage Warning
+  severity: warning
+  category: resource
+  family: control_plane_error
+  trigger: A Run:ai container is using more than 80% of its CPU limit; may slow Run:ai features.
+  actions:
+    - "Add CPU resources to the container."
+
+- alert: NVIDIA Run:ai Critical Problem
+  severity: critical
+  category: aggregate
+  family: control_plane_error
+  trigger: One of the critical Run:ai alerts is currently active (aggregate alert).
+  actions:
+    - "Check Prometheus for the active critical alert and address that root cause."
+
+- alert: Unknown State Alert for a Node
+  severity: critical
+  category: cluster_infra
+  family: node_kubelet_pressure
+  trigger: A Kubernetes node is in Unknown state; health/readiness cannot be determined; may interrupt GPU scheduling.
+  actions:
+    - "kubectl describe node <node> to inspect conditions."
+    - "Verify kubelet / API-server connectivity for the node."
+    - "Inspect node system logs (syslog/journal/dmesg) for GPU or node-level errors."
+
+- alert: Low Memory Node Alert
+  severity: critical   # >90% usage; warning at >80%
+  category: cluster_infra
+  family: node_kubelet_pressure
+  trigger: A node has insufficient memory for current/upcoming workloads; GPU workloads may fail to schedule or crash.
+  actions:
+    - "kubectl top node to assess memory usage; identify memory-intensive pods."
+    - "Resize the node or optimize memory usage in the offending pods."
+
+- alert: NVIDIA Run:ai DaemonSet Rollout Stuck / DaemonSet Unavailable on Nodes
+  severity: critical
+  category: cluster_infra
+  family: control_plane_error
+  trigger: Zero available pods for the runai daemonset on a relevant node; no fractional-GPU workload support.
+  actions:
+    - "kubectl get daemonset -n runai-backend; describe the problematic daemonset."
+    - "Check node resource constraints and nodeSelector/affinity mismatches."
+
+- alert: NVIDIA Run:ai Deployment Insufficient Replicas / No Available Replicas
+  severity: critical
+  category: cluster_infra
+  family: control_plane_error
+  trigger: A Run:ai deployment has one or more unavailable pods; scale/deploy issues.
+  actions:
+    - "Check the deployment/replicaset status; describe them; review logs."
+    - "Check for resource constraints or nodeSelector mismatches."
+
+- alert: NVIDIA Run:ai Project Controller Reconcile Failure
+  severity: critical
+  category: control_plane
+  family: control_plane_error
+  trigger: The project controller had errors reconciling projects; some projects may not be Ready.
+  actions:
+    - "kubectl logs deployment/project-controller -n runai; find the failing project."
+    - "kubectl get project <name> -o yaml and read the status section."
+
+- alert: NVIDIA Run:ai StatefulSet Insufficient Replicas / No Available Replicas
+  severity: critical
+  category: cluster_infra
+  family: control_plane_error
+  trigger: A Run:ai statefulset has no available pods; metrics database may be unavailable.
+  actions:
+    - "kubectl get statefulset -n runai-backend; describe it; review events."

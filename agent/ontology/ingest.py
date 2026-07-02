@@ -136,16 +136,23 @@ def _ensure(tx: Any, etype: str, key_attr: str, value: str) -> None:
 
 
 def _replace_attr(
-    tx: Any, etype: str, key_attr: str, key_value: str, attr: str, new_value: Any, quoted: bool = True
+    tx: Any,
+    etype: str,
+    key_attr: str,
+    key_value: str,
+    attr: str,
+    new_value: Any,
+    quoted: bool = True,
 ) -> None:
     # Remove any existing value of `attr`, then set the new one. Replace (not
     # add-if-missing) so a re-projected incident whose RCA/status changed after a
     # re-open+re-analysis updates in place instead of accumulating stale values —
     # required, since owns defaults to @card(0..1) so a second value fails commit.
     # quoted=False for non-string attributes (e.g. integer occurrence_count).
+    # TypeDB 3.x delete syntax: `delete has <attr> of <owner>` (2.x was `delete $x has $old`).
     tx.query(
         f'match $x isa {etype}, has {key_attr} "{esc(key_value)}", has {attr} $old; '
-        f"delete has $old of $x;"  # TypeDB 3.x: `delete has <attr> of <owner>` (2.x was `delete $x has $old`)
+        f"delete has $old of $x;"
     ).resolve()
     value = f'"{esc(str(new_value))}"' if quoted else str(new_value)
     tx.query(

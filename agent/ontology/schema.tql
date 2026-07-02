@@ -36,6 +36,10 @@ attribute blast_radius, value string;
 attribute subtype, value string;
 attribute statement, value string;
 attribute created_at, value datetime;
+# --- XID GPU-error catalog attributes ---
+attribute xid_code, value integer;
+attribute mnemonic, value string;
+attribute description, value string;
 
 # --- entities ---------------------------------------------------------------
 entity cluster,
@@ -149,6 +153,8 @@ entity scheduling_quota_exhaustion sub root_cause;
 entity control_plane_error sub root_cause;
 entity workload_startup_image_failure sub root_cause;
 entity insufficient_evidence sub root_cause;
+# 6th family: NVIDIA XID GPU hardware faults (see knowledge/xid_catalog.yaml).
+entity gpu_hardware_error sub root_cause;
 
 entity action,
     owns statement,
@@ -183,3 +189,53 @@ relation supported_by, relates claim, relates proof;      # (symptom|root_cause)
 relation analyzed_by, relates incident, relates run;
 relation similar_to, relates this, relates other;
 relation emits, relates emitter, relates signal;          # component emits evidence/symptom
+
+# --- XID GPU-error catalog ---------------------------------------------------
+# A first-class GPU-hardware-fault RCA path. An xid_error is a catalog entry
+# (one NVIDIA XID code); it applies_to the GPU models it can occur on, indicates
+# the gpu_hardware_error root_cause family, and is resolved_by action(s). We
+# reuse the existing `indicates`/`resolved_by`/`action` machinery so the
+# knowledge layer stays uniform — xid_error slots in wherever a symptom does.
+entity xid_error,
+    owns xid_code @key,
+    owns mnemonic,
+    owns description,
+    owns severity,
+    plays applies_to:fault,
+    plays indicates:symptom,      # xid_error indicates gpu_hardware_error
+    plays resolved_by:symptom;    # xid_error resolved_by action
+
+entity gpu_model,
+    owns name @key,
+    plays applies_to:model;
+
+relation applies_to, relates fault, relates model;  # xid_error applies_to gpu_model
+
+# --- inference rules (TypeDB 3.x) -------------------------------------------
+# needs live TypeDB validation — rule/read syntax is NOT exercised by unit tests.
+# Conservative: only constructs proven in the existing schema/loaders. No `not {}`
+# negation (TypeDB 3.11 rejects that form here).
+
+# (a) A fatal xid_error indicates the gpu_hardware_error root cause (escalation
+#     path: those carry RESET_GPU / RESTART_BM / CONTACT_SUPPORT actions).
+rule fatal_xid_indicates_gpu_hardware_error:
+    when {
+        $x isa xid_error, has severity "fatal";
+        $rc isa gpu_hardware_error;
+    } then {
+        (symptom: $x, cause: $rc) isa indicates;
+    };
+
+# (b) An xid_error that applies_to a GPU model is a relevant gpu_hardware_error
+#     candidate for that model — derive the indicates edge so a query scoped to
+#     the alerting GPU model surfaces the applicable XIDs as hardware-fault
+#     candidates (not just the fatal ones from rule (a)).
+rule model_xid_indicates_gpu_hardware_error:
+    when {
+        $x isa xid_error;
+        $g isa gpu_model;
+        (fault: $x, model: $g) isa applies_to;
+        $rc isa gpu_hardware_error;
+    } then {
+        (symptom: $x, cause: $rc) isa indicates;
+    };
