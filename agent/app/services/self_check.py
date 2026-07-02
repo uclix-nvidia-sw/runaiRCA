@@ -174,3 +174,72 @@ async def _llm_refute(
         f"Gathered evidence:\n{evidence}"
     )
     return await complete_json(settings, system=system, user=user, temperature=0.1)
+
+
+async def verify_matches(
+    settings: Settings,
+    candidates: list[dict],
+    results: list[CollectorResult],
+    *,
+    subject: str = "candidate finding",
+) -> set[str]:
+    """Names of signature/keyword-matched candidates the evidence does NOT support.
+
+    A skeptical LLM pass over matches (known issues, failure-mode symptoms, GPU XIDs):
+    keyword/signature hits can be superficial, so it flags the ones the gathered
+    evidence doesn't actually back — the caller suppresses those. LLM-gated and
+    conservative: with no LLM configured, or on any failure/uncertainty, returns an
+    empty set so the match stands by default. Never raises into analyze().
+
+    Each candidate is {"name": str, "detail": str}; returned names are a subset of the
+    candidate names (hallucinated names are dropped).
+    """
+    try:
+        names = {str(c.get("name") or "").strip() for c in candidates}
+        names.discard("")
+        if not names or not llm_configured(settings):
+            return set()
+        verdict = await _llm_verify_matches(settings, candidates, results, subject)
+        refuted = (verdict or {}).get("refuted")
+        if not isinstance(refuted, list):
+            return set()
+        return {str(n).strip() for n in refuted if str(n).strip() in names}
+    except Exception:  # noqa: BLE001 - best-effort; never break analyze()
+        return set()
+
+
+async def verify_known_issues(
+    settings: Settings, issues: list[dict], results: list[CollectorResult]
+) -> set[str]:
+    """Suppress keyword-matched known issues the evidence doesn't support (see verify_matches)."""
+    candidates = [
+        {"name": str(i.get("issue") or "").strip(), "detail": str(i.get("reason") or "")}
+        for i in issues
+    ]
+    return await verify_matches(settings, candidates, results, subject="known Run:ai issue")
+
+
+async def _llm_verify_matches(
+    settings: Settings,
+    candidates: list[dict],
+    results: list[CollectorResult],
+    subject: str,
+) -> dict | None:
+    evidence = "\n".join(
+        f"- {r.agent} [{r.status}]: {(r.summary or '').strip() or NO_EVIDENCE}" for r in results
+    )
+    cand = "\n".join(
+        f"- {str(c.get('name') or '').strip()}: "
+        f"{' '.join(str(c.get('detail') or '').split())}"
+        for c in candidates
+    )
+    system = (
+        f"You are a skeptical senior SRE. Each {subject} below matched this alert's "
+        "evidence by keyword or signature. Matches can be superficial, so decide which "
+        "the gathered evidence does NOT actually support. Use ONLY the evidence; do not "
+        "invent any. Be conservative: refute a match only when the evidence clearly does "
+        'not fit — when unsure, keep it. Respond with a JSON object: {"refuted": [exact '
+        'names that are NOT supported by the evidence]}.'
+    )
+    user = f"Candidates:\n{cand}\n\nGathered evidence:\n{evidence}"
+    return await complete_json(settings, system=system, user=user, temperature=0.1)

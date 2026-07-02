@@ -76,6 +76,7 @@ class Settings:
     runai_workloads_path: str
     runai_projects_path: str
     runai_queues_path: str
+    runai_version_path: str
     runai_timeout_seconds: int
     prometheus_url: str
     prometheus_timeout_seconds: int
@@ -94,6 +95,7 @@ class Settings:
     troubleshooting_cases_file: str
     failure_modes_file: str
     runai_alerts_file: str
+    runai_known_issues_file: str
     enable_system_agent: bool
     system_agent_url: str
     system_agent_token: str
@@ -120,6 +122,8 @@ class Settings:
     enable_typedb: bool
     enable_investigation_loop: bool
     max_investigation_steps: int
+    max_reanalysis_steps: int
+    analysis_deadline_seconds: int
 
 
 def load_settings() -> Settings:
@@ -142,7 +146,10 @@ def load_settings() -> Settings:
             "KUBERNETES_CA_PATH",
             "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
         ).strip(),
-        kubernetes_timeout_seconds=_int_env("KUBERNETES_TIMEOUT_SECONDS", 6),
+        # Collector ceilings are generous so agents gather DEEP evidence (thin
+        # evidence came from cutting them off early); the overall analysis deadline
+        # is the real bound. A single slow collector still fails gracefully.
+        kubernetes_timeout_seconds=_int_env("KUBERNETES_TIMEOUT_SECONDS", 120),
         kubernetes_list_limit=max(1, _int_env("KUBERNETES_LIST_LIMIT", 50)),
         kubernetes_namespaces=_csv_env("KUBERNETES_NAMESPACES", ()),
         kubernetes_cluster_scope_enabled=_bool_env("KUBERNETES_CLUSTER_SCOPE_ENABLED", True),
@@ -154,21 +161,24 @@ def load_settings() -> Settings:
         runai_workloads_path=os.getenv("RUNAI_WORKLOADS_PATH", "/api/v1/workloads").strip(),
         runai_projects_path=os.getenv("RUNAI_PROJECTS_PATH", "/api/v1/projects").strip(),
         runai_queues_path=os.getenv("RUNAI_QUEUES_PATH", "/api/v1/queues").strip(),
-        runai_timeout_seconds=_int_env("RUNAI_TIMEOUT_SECONDS", 8),
+        # Run:ai control-plane version endpoint — enables version-aware suppression of
+        # already-fixed known issues. Best-effort; override per your Run:ai API.
+        runai_version_path=os.getenv("RUNAI_VERSION_PATH", "/api/v1/version").strip(),
+        runai_timeout_seconds=_int_env("RUNAI_TIMEOUT_SECONDS", 120),
         prometheus_url=os.getenv("PROMETHEUS_URL", "").strip().rstrip("/"),
-        prometheus_timeout_seconds=_int_env("PROMETHEUS_TIMEOUT_SECONDS", 6),
+        prometheus_timeout_seconds=_int_env("PROMETHEUS_TIMEOUT_SECONDS", 120),
         prometheus_mcp_url=os.getenv("PROMETHEUS_MCP_URL", "").strip().rstrip("/"),
         loki_url=os.getenv("LOKI_URL", "").strip().rstrip("/"),
         loki_bearer_token=os.getenv("LOKI_BEARER_TOKEN", "").strip(),
         loki_basic_username=os.getenv("LOKI_BASIC_USERNAME", "").strip(),
         loki_basic_password=os.getenv("LOKI_BASIC_PASSWORD", "").strip(),
         loki_tenant_id=os.getenv("LOKI_TENANT_ID", "").strip(),
-        loki_timeout_seconds=_int_env("LOKI_TIMEOUT_SECONDS", 6),
+        loki_timeout_seconds=_int_env("LOKI_TIMEOUT_SECONDS", 120),
         loki_query_limit=max(1, _int_env("LOKI_QUERY_LIMIT", 20)),
         loki_mcp_url=os.getenv("LOKI_MCP_URL", "").strip().rstrip("/"),
         runai_log_namespaces=_csv_env("RUNAI_LOG_NAMESPACES", ("runai", "runai-backend")),
         postgres_dsn=os.getenv("POSTGRES_DSN", "").strip(),
-        postgres_timeout_seconds=_int_env("POSTGRES_TIMEOUT_SECONDS", 6),
+        postgres_timeout_seconds=_int_env("POSTGRES_TIMEOUT_SECONDS", 60),
         troubleshooting_cases_file=os.getenv(
             "TROUBLESHOOTING_CASES_FILE",
             "knowledge/troubleshooting_cases.md",
@@ -181,15 +191,19 @@ def load_settings() -> Settings:
             "RUNAI_ALERTS_FILE",
             "knowledge/runai_alerts_catalog.yaml",
         ).strip(),
+        runai_known_issues_file=os.getenv(
+            "RUNAI_KNOWN_ISSUES_FILE",
+            "knowledge/runai_known_issues.yaml",
+        ).strip(),
         # System agent (node infra: syslog/journalctl/dmesg via the per-node DaemonSet).
         # On by default; degrades to "unavailable" when SYSTEM_AGENT_URL isn't set.
         enable_system_agent=_bool_env("ENABLE_SYSTEM_AGENT", True),
         system_agent_url=os.getenv("SYSTEM_AGENT_URL", "").strip().rstrip("/"),
         system_agent_token=os.getenv("SYSTEM_AGENT_TOKEN", "").strip(),
-        system_agent_timeout_seconds=_int_env("SYSTEM_AGENT_TIMEOUT_SECONDS", 6),
+        system_agent_timeout_seconds=_int_env("SYSTEM_AGENT_TIMEOUT_SECONDS", 120),
         # Read-only pod exec for the Kubernetes agent (view container state/logs; no mutations).
         enable_pod_exec=_bool_env("ENABLE_POD_EXEC", True),
-        pod_exec_timeout_seconds=_int_env("POD_EXEC_TIMEOUT_SECONDS", 10),
+        pod_exec_timeout_seconds=_int_env("POD_EXEC_TIMEOUT_SECONDS", 120),
         agent_souls_file=os.getenv("AGENT_SOULS_FILE", "prompts/agent_souls.md").strip(),
         masking_regex_list=_json_string_list_env("MASKING_REGEX_LIST_JSON"),
         builtin_redaction_enabled=_bool_env("BUILTIN_REDACTION_ENABLED", True),
@@ -197,19 +211,31 @@ def load_settings() -> Settings:
         llm_base_url=os.getenv("LLM_BASE_URL", "").strip().rstrip("/"),
         llm_model=os.getenv("LLM_MODEL", "").strip(),
         llm_api_key=os.getenv("LLM_API_KEY", "").strip(),
-        llm_request_timeout_seconds=_int_env("LLM_REQUEST_TIMEOUT_SECONDS", 120),
+        # Generous per-call ceiling so a reasoning agent is never cut off mid-thought;
+        # the overall analysis deadline below is the real bound. (0 = unlimited.)
+        llm_request_timeout_seconds=_int_env("LLM_REQUEST_TIMEOUT_SECONDS", 300),
         nat_config_file=os.getenv(
             "NAT_CONFIG_FILE", "configs/runai_rca_workflow.yml"
         ).strip(),
         enable_nat_runtime=_bool_env("ENABLE_NAT_RUNTIME", False),
-        nat_timeout_seconds=_int_env("NAT_TIMEOUT_SECONDS", 180),
+        # Bounded below the overall deadline so the workflow subprocess is killed
+        # cleanly if it overruns. (0 = unlimited.)
+        nat_timeout_seconds=_int_env("NAT_TIMEOUT_SECONDS", 300),
         typedb_address=os.getenv("TYPEDB_ADDRESS", "").strip(),
         typedb_database=os.getenv("TYPEDB_DATABASE", "runai_rca").strip(),
         typedb_username=os.getenv("TYPEDB_USERNAME", "admin").strip(),
         typedb_password=os.getenv("TYPEDB_PASSWORD", "password").strip(),
         typedb_tls_enabled=_bool_env("TYPEDB_TLS_ENABLED", False),
-        typedb_timeout_seconds=_int_env("TYPEDB_TIMEOUT_SECONDS", 6),
+        typedb_timeout_seconds=_int_env("TYPEDB_TIMEOUT_SECONDS", 60),
         enable_typedb=_bool_env("ENABLE_TYPEDB", False),
         enable_investigation_loop=_bool_env("ENABLE_INVESTIGATION_LOOP", False),
-        max_investigation_steps=max(1, _int_env("MAX_INVESTIGATION_STEPS", 4)),
+        # Generous by default: give the investigation loop room to keep digging
+        # (more "opportunity to think"), not just more time per step.
+        max_investigation_steps=max(1, _int_env("MAX_INVESTIGATION_STEPS", 12)),
+        # Re-analysis (after the first top cause is refuted) gets a generous
+        # investigation budget of its own — accuracy over speed.
+        max_reanalysis_steps=max(1, _int_env("MAX_REANALYSIS_STEPS", 6)),
+        # Overall hard cap on one analysis: agents get generous per-step time above,
+        # but the whole run always finishes within this budget. (0 = no overall cap.)
+        analysis_deadline_seconds=max(0, _int_env("ANALYSIS_DEADLINE_SECONDS", 1200)),
     )

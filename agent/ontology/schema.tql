@@ -40,6 +40,9 @@ attribute created_at, value datetime;
 attribute xid_code, value integer;
 attribute mnemonic, value string;
 attribute description, value string;
+# --- Run:ai known-issues catalog attributes (version-linked issues) ---
+attribute affected_version, value string;
+attribute fixed_version, value string;
 
 # --- entities ---------------------------------------------------------------
 entity cluster,
@@ -131,6 +134,11 @@ entity symptom,
     # @card(0..1), so this MUST be explicit or multi-keyword insert fails at
     # commit ([CNT5] @card(0..1) violated).
     owns keyword @card(0..),
+    # Version-linked known issues (knowledge/runai_known_issues.yaml). Optional:
+    # most symptoms carry no version. @card(0..1) is the 3.x default, stated for
+    # clarity alongside the multi-valued keyword above.
+    owns affected_version @card(0..1),
+    owns fixed_version @card(0..1),
     plays has_symptom:symptom,
     plays indicates:symptom,
     plays resolved_by:symptom,
@@ -147,14 +155,21 @@ entity root_cause,
     plays fixed_by:cause,
     plays supported_by:claim;
 
-# root-cause taxonomy — all 5 families (see knowledge/troubleshooting_cases.md)
+# root-cause taxonomy — families as sub-types (see knowledge/troubleshooting_cases.md)
 entity node_kubelet_pressure sub root_cause;
 entity scheduling_quota_exhaustion sub root_cause;
 entity control_plane_error sub root_cause;
 entity workload_startup_image_failure sub root_cause;
 entity insufficient_evidence sub root_cause;
-# 6th family: NVIDIA XID GPU hardware faults (see knowledge/xid_catalog.yaml).
+# NVIDIA XID GPU hardware faults (see knowledge/xid_catalog.yaml).
 entity gpu_hardware_error sub root_cause;
+# Run:ai known-issue families (see knowledge/runai_known_issues.yaml):
+#   platform_version_bug   = regression fixed by upgrading Run:ai to a fixed version
+#   observability_accuracy = metrics/dashboard wrong while the cluster itself is fine
+#   expected_known_behavior = by-design behavior or product limitation, NOT a fault
+entity platform_version_bug sub root_cause;
+entity observability_accuracy sub root_cause;
+entity expected_known_behavior sub root_cause;
 
 entity action,
     owns statement,

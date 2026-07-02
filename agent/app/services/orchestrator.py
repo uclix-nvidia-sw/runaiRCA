@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import subprocess
@@ -23,7 +24,13 @@ from app.collectors.prometheus import PrometheusCollector
 from app.collectors.runai import RunAICollector
 from app.collectors.system import SystemCollector
 from app.config import Settings
-from app.knowledge import load_failure_modes, load_troubleshooting_cases
+from app.knowledge import (
+    load_failure_modes,
+    load_runai_known_issues,
+    load_troubleshooting_cases,
+    match_failure_mode_symptoms,
+    match_runai_known_issues,
+)
 from app.llm import complete, complete_json, llm_configured
 from app.masking import Masker, build_masker
 from app.plan import InvestigationPlan
@@ -39,6 +46,8 @@ from app.schemas import (
 from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
 from app.services.planner import plan_investigation
 from app.services.root_cause_ranking import RankedCause, rank_root_cause_candidates
+
+_log = logging.getLogger(__name__)
 
 TModel = TypeVar("TModel", bound=BaseModel)
 
@@ -75,10 +84,14 @@ class NemoWorkflowRunner:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
+            nat_timeout = self._settings.nat_timeout_seconds
             try:
-                stdout, _ = await asyncio.wait_for(
-                    proc.communicate(), timeout=self._settings.nat_timeout_seconds
-                )
+                if nat_timeout and nat_timeout > 0:
+                    stdout, _ = await asyncio.wait_for(
+                        proc.communicate(), timeout=nat_timeout
+                    )
+                else:  # 0 = no timeout: let the agent workflow run to completion
+                    stdout, _ = await proc.communicate()
             except TimeoutError:
                 proc.kill()
                 await proc.wait()
@@ -98,8 +111,10 @@ class NemoWorkflowRunner:
             "__RUNAI_RCA_LLM_BASE_URL__": self._settings.llm_base_url,
             "__RUNAI_RCA_LLM_MODEL__": self._settings.llm_model,
             "__RUNAI_RCA_LLM_API_KEY__": self._settings.llm_api_key,
+            # NAT's litellm config wants a positive number; our "unlimited" (0)
+            # becomes a very large timeout so the sub-agent isn't cut off either.
             "__RUNAI_RCA_LLM_REQUEST_TIMEOUT_SECONDS__": str(
-                self._settings.llm_request_timeout_seconds
+                self._settings.llm_request_timeout_seconds or 86400
             ),
         }
         replacements = {old: new for old, new in replacements.items() if new}
@@ -160,6 +175,55 @@ class AnalysisOrchestrator:
             self._collectors.append(ChangeCollector(settings))
 
     async def analyze(self, request: AlertAnalysisRequest) -> AlertAnalysisResponse:
+        """Run one analysis under an overall hard deadline.
+
+        Per-step ceilings (collectors, LLM, NAT) are generous so agents gather deep
+        evidence and think; this wrapper guarantees the whole run still finishes
+        within `analysis_deadline_seconds` (default 20 min / 1200s), returning a
+        graceful degraded report if it overruns rather than hanging."""
+        deadline = self._settings.analysis_deadline_seconds
+        if not deadline or deadline <= 0:
+            return await self._analyze_impl(request)
+        try:
+            return await asyncio.wait_for(self._analyze_impl(request), timeout=deadline)
+        except TimeoutError:  # asyncio.TimeoutError is this builtin on 3.11+
+            _log.warning("analysis exceeded the %ss deadline; returning degraded report", deadline)
+            return self._deadline_response(request, deadline)
+
+    def _deadline_response(
+        self, request: AlertAnalysisRequest, deadline: int
+    ) -> AlertAnalysisResponse:
+        target = resolve_target(request.alert.labels, request.alert.annotations)
+        ko = self._settings.language == "ko"
+        summary = (
+            f"분석이 {deadline}초 제한을 초과하여 중단되었습니다."
+            if ko
+            else f"Analysis was stopped after exceeding the {deadline}s deadline."
+        )
+        detail = (
+            f"{summary} 증거 수집/추론이 예상보다 오래 걸렸습니다 — 재시도하거나 "
+            "대상(네임스페이스/워크로드)을 좁혀 다시 실행해 주세요."
+            if ko
+            else f"{summary} Evidence gathering/reasoning took longer than expected — "
+            "retry, or narrow the target (namespace/workload) and run again."
+        )
+        response = AlertAnalysisResponse(
+            status="ok",
+            thread_ts=request.thread_ts,
+            analysis=detail,
+            analysis_summary=summary,
+            analysis_detail=detail,
+            analysis_type=request.analysis_type or request.alert.status or "firing",
+            analysis_quality="degraded",
+            missing_data=[],
+            warnings=[f"analysis exceeded the {deadline}s deadline and was stopped"],
+            capabilities={},
+            context={"target": target.__dict__, "deadline_seconds": deadline},
+            artifacts=[],
+        )
+        return _mask_model(response, AlertAnalysisResponse, self._masker)
+
+    async def _analyze_impl(self, request: AlertAnalysisRequest) -> AlertAnalysisResponse:
         target = resolve_target(request.alert.labels, request.alert.annotations)
         # Knowledge graph is consulted once here, at synthesis time, as a
         # knowledge resource for the final RCA — not as a parallel collector.
@@ -323,6 +387,53 @@ class AnalysisOrchestrator:
         quality = _quality_from(results)
         summary = _summary_from(request, results, root_cause_candidates)
         failure_modes = load_failure_modes(self._settings.failure_modes_file)
+        known_issues = load_runai_known_issues(self._settings.runai_known_issues_file)
+        # Version-aware precision: drop known issues already fixed in the cluster's
+        # running Run:ai version so we don't attribute a symptom to a patched bug.
+        known_issues = _suppress_fixed_known_issues(known_issues, _runai_version_from(results))
+        # Adversarial precision: LLM-verify signature/keyword matches (known issues,
+        # failure-mode symptoms, GPU XIDs) and drop ones the evidence doesn't support.
+        # Best-effort + LLM-gated: with no LLM nothing is suppressed.
+        observed = _observed_text(results)
+        try:
+            from app.services.self_check import verify_known_issues, verify_matches
+        except ImportError:
+            pass
+        else:
+            ki_matches = match_runai_known_issues(known_issues, observed)
+            if ki_matches:
+                refuted = await verify_known_issues(self._settings, ki_matches, results)
+                if refuted:
+                    known_issues = [k for k in known_issues if k.get("issue") not in refuted]
+
+            ev_candidates = [
+                {
+                    "name": sym.get("symptom", ""),
+                    "detail": f"{fam} — {'; '.join(sym.get('actions', [])[:1])}",
+                }
+                for fam, sym in match_failure_mode_symptoms(failure_modes, observed)
+            ]
+            ev_candidates += [
+                {"name": f"XID {code}", "detail": "; ".join(graph_fixes.xid_fixes[code][:1])}
+                for code in graph_fixes.xid_fixes
+            ]
+            if ev_candidates:
+                refuted = await verify_matches(
+                    self._settings, ev_candidates, results, subject="matched symptom or GPU XID"
+                )
+                if refuted:
+                    failure_modes = {
+                        fam: [s for s in syms if s.get("symptom") not in refuted]
+                        for fam, syms in failure_modes.items()
+                    }
+                    for label in refuted:
+                        if label.startswith("XID "):
+                            try:
+                                code = int(label[4:])
+                            except ValueError:
+                                continue
+                            graph_fixes.xid_fixes.pop(code, None)
+                            graph_fixes.root_xids.pop(code, None)
         playbook_fallback = load_troubleshooting_cases(
             self._settings.troubleshooting_cases_file
         )
@@ -338,6 +449,7 @@ class AnalysisOrchestrator:
             plan,
             graph_fixes,
             language=getattr(self._settings, "language", "en"),
+            known_issues=known_issues,
         )
         # Korean LLM synthesis (preferred when language == "ko" and LLM configured):
         # rewrite summary + detail grounded STRICTLY in the evidence just gathered.
@@ -558,7 +670,7 @@ class AnalysisOrchestrator:
                 self._collectors,
                 replan,
                 kg_dict,
-                min(2, self._settings.max_investigation_steps),
+                min(self._settings.max_reanalysis_steps, self._settings.max_investigation_steps),
             )
             merged = {result.agent: result for result in results}
             for result in fresh:
@@ -879,6 +991,7 @@ def _detail_from(
     plan: InvestigationPlan | None = None,
     graph_fixes: GraphRemediation | None = None,
     language: str = "en",
+    known_issues: list[dict] | None = None,
 ) -> str:
     """Problem -> Root Cause -> Recommended Actions, then everything else in an
     appendix. Sections 1-3 are the ~1-page report an operator (or a Word export)
@@ -917,6 +1030,9 @@ def _detail_from(
     # --- 2. Root Cause --------------------------------------------------------
     lines.extend(["", h["cause"], ""])
     lines.append(_ranked_root_cause_statement(root_cause_candidates or [], request))
+    # Ground the coarse family in the most specific signature match when one exists:
+    # a recognised known issue (with its affected/fixed version) is far more precise.
+    lines.extend(_known_issue_cause_lines(known_issues, _observed_text(results), language))
     supporting = _supporting_evidence(results)
     if supporting:
         lines.append("")
@@ -935,6 +1051,7 @@ def _detail_from(
         failure_modes or {},
         missing,
         request,
+        known_issues or [],
     )
     if numbered:
         lines.extend(numbered)
@@ -1019,13 +1136,93 @@ def _supporting_evidence(results: list[CollectorResult]) -> list[tuple[str, str]
 
 
 def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> str:
-    """One line naming the XID causal picture when the graph produced one."""
+    """One line naming the XID causal picture when the graph produced one.
+
+    When the ontology's leads_to chain resolves a ROOT fault for an observed XID
+    (e.g. NVLink Xid 74 -> app-crash Xid 45), name the chain so the operator fixes
+    the origin, not the downstream symptom — the drill-down precision win."""
     if graph_fixes is None or not graph_fixes.xid_fixes:
         return ""
     codes = ", ".join(str(code) for code in sorted(graph_fixes.xid_fixes))
+    roots = getattr(graph_fixes, "root_xids", None) or {}
+    chain = "; ".join(
+        dict.fromkeys(
+            f"XID {root} → XID {observed}"
+            for observed, root_list in sorted(roots.items())
+            for root in root_list
+        )
+    )
     if language == "ko":
+        if chain:
+            return (
+                f"- 관련 GPU 오류(XID): {codes} — 인과 사슬(뿌리→관측): {chain}. "
+                "뿌리 XID를 먼저 조치하세요."
+            )
         return f"- 관련 GPU 오류(XID): {codes} — 세부 조치는 아래 권장 조치를 참고."
+    if chain:
+        return (
+            f"- Related GPU errors (XID): {codes} — causal chain (root → observed): "
+            f"{chain}. Fix the root XID first."
+        )
     return f"- Related GPU errors (XID): {codes} — see the recommended actions below."
+
+
+def _runai_version_from(results: list[CollectorResult]) -> str:
+    """The running Run:ai control-plane version, if the runai collector resolved one."""
+    for result in results:
+        if result.agent == "runai":
+            value = result.details.get("runai_version")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _version_tuple(text: str) -> tuple[int, ...]:
+    return tuple(int(n) for n in re.findall(r"\d+", text or "")[:4])
+
+
+def _known_issue_fixed_in_running(issue: dict, running_version: str) -> bool:
+    """True when the cluster's Run:ai version is at/after the issue's fixed version:
+    the bug is already patched here, so surfacing it would be a false positive."""
+    fixed = _version_tuple(str(issue.get("fixed_version") or ""))
+    running = _version_tuple(running_version)
+    return bool(fixed and running and running >= fixed)
+
+
+def _suppress_fixed_known_issues(known_issues: list[dict], running_version: str) -> list[dict]:
+    """Drop known issues already fixed in the running Run:ai version (precision:
+    don't attribute a symptom to a bug the cluster is already patched against)."""
+    if not running_version:
+        return known_issues
+    return [k for k in known_issues if not _known_issue_fixed_in_running(k, running_version)]
+
+
+def _known_issue_cause_lines(
+    known_issues: list[dict] | None, observed_text: str, language: str
+) -> list[str]:
+    """Ground the root cause in a recognised known issue — more precise than the
+    coarse family. Names the issue and its affected/fixed Run:ai version. Returns
+    the grounded line(s), or [] when no known-issue signature matches the evidence."""
+    matches = match_runai_known_issues(known_issues or [], observed_text)
+    out: list[str] = []
+    for issue in matches[:2]:  # the strongest signature hits only
+        name = str(issue.get("issue") or "").strip()
+        reason = " ".join(str(issue.get("reason") or "").split())
+        affected = str(issue.get("affected_version") or "").strip()
+        fixed = str(issue.get("fixed_version") or "").strip()
+        ver = ""
+        if affected or fixed:
+            head = affected or "?"
+            if language == "ko":
+                ver = f" (영향 버전: {head}" + (f", 수정: {fixed}" if fixed else "") + ")"
+            else:
+                ver = f" (affected {head}" + (f", fixed in {fixed}" if fixed else "") + ")"
+        label = "알려진 이슈로 인식" if language == "ko" else "Recognised known issue"
+        line = f"- {label}: **{name}**{ver}"
+        if reason:
+            line += f" — {reason}"
+        out.append(line)
+    return out
 
 
 def _numbered_actions(
@@ -1036,21 +1233,32 @@ def _numbered_actions(
     failure_modes: dict[str, list[dict]],
     missing: list[str],
     request: AlertAnalysisRequest,
+    known_issues: list[dict] | None = None,
 ) -> list[str]:
     """One deduped, numbered priority list — documented-alert fixes first, then
-    graph-derived and curated family fixes, then infra-restore steps."""
+    recognised known-issue fixes, then graph-derived and curated family fixes,
+    then infra-restore steps."""
     ordered: list[str] = []
     if plan is not None and plan.matched_alert:
         ordered.extend(str(a) for a in plan.matched_alert.get("actions", []))
+    # Known operator cases recognised by their signature keywords in the evidence
+    # (ranking-independent): version-regression / observability / expected-behavior
+    # fixes surface even when the coarse family ranking points elsewhere.
+    for issue in match_runai_known_issues(known_issues or [], observed_text):
+        ordered.extend(str(a) for a in issue.get("actions", []))
     if graph_fixes is not None:
         ordered.extend(graph_fixes.family_fixes)
-        for code in sorted(graph_fixes.xid_fixes):
-            ordered.extend(f"(XID {code}) {fix}" for fix in graph_fixes.xid_fixes[code])
+        root_codes = {r for roots in graph_fixes.root_xids.values() for r in roots}
+        # Fix the ROOT of the causal chain before its downstream symptoms.
+        for code in sorted(graph_fixes.xid_fixes, key=lambda c: (c not in root_codes, c)):
+            label = "root XID" if code in root_codes else "XID"
+            ordered.extend(f"({label} {code}) {fix}" for fix in graph_fixes.xid_fixes[code])
+    # Curated failure-mode fixes: entry point is the fine-grained signature match
+    # across ALL families (ranker orders, doesn't gate) — so a precise fix surfaces
+    # even from a family the ranker mis-scored or can't nominate (gpu_hardware_error).
     top_family = candidates[0].family if candidates else ""
-    text = (observed_text or "").lower()
-    for symptom in failure_modes.get(top_family, []) or []:
-        if any(kw in text for kw in symptom.get("keywords", [])):
-            ordered.extend(str(a) for a in symptom.get("actions", []))
+    for _family, symptom in match_failure_mode_symptoms(failure_modes, observed_text, top_family):
+        ordered.extend(str(a) for a in symptom.get("actions", []))
     ordered.extend(
         line.removeprefix("- ") for line in _recommended_action_lines(missing, request)
     )
@@ -1167,25 +1375,20 @@ def _kb_remediation_lines(
     kg_context: dict, candidates: list[RankedCause] | None, observed_text: str
 ) -> list[str]:
     knowledge = kg_context.get("knowledge") or {}
-    if not candidates or not knowledge:
+    if not knowledge:
         return []
-    top_family = candidates[0].family
-    if top_family == "insufficient_evidence":
-        return ["- No closely-matching prior knowledge for this evidence yet."]
-    symptoms = knowledge.get(top_family) or []
-    if not symptoms:
-        return ["- No closely-matching prior knowledge for this evidence yet."]
-    text = observed_text.lower()
-    # Precise: the first symptom whose keyword appears in the observed evidence.
-    for symptom in symptoms:
-        if any(str(kw).lower() in text for kw in symptom.get("keywords", [])):
-            actions = symptom.get("actions", [])
-            if actions:
-                header = (
-                    f"- Matched symptom **{symptom.get('symptom')}** "
-                    f"({_family_label(top_family)}); known fixes from the knowledge base:"
-                )
-                return [header, *[f"  - {a}" for a in actions[:5]]]
+    # Entry point = the fine-grained signature match across ALL families, not the
+    # coarse ranked family (which can be wrong, or can't even nominate the right one
+    # such as gpu_hardware_error). The ranker only orders the matches.
+    top_family = candidates[0].family if candidates else ""
+    for family, symptom in match_failure_mode_symptoms(knowledge, observed_text, top_family):
+        actions = symptom.get("actions", [])
+        if actions:
+            header = (
+                f"- Matched symptom **{symptom.get('symptom')}** "
+                f"({_family_label(family)}); known fixes from the knowledge base:"
+            )
+            return [header, *[f"  - {a}" for a in actions[:5]]]
     # No symptom keyword matched the observed evidence: don't dump a generic family
     # checklist as if it were a match — say so plainly.
     return ["- No closely-matching prior knowledge for this evidence yet."]
@@ -1197,30 +1400,31 @@ def _playbook_lines(
     failure_modes: dict[str, list[dict]],
     fallback_cases: str,
 ) -> list[str]:
-    """Root-cause-relevant remediation, keyed to the top-ranked family.
+    """Root-cause-relevant remediation.
 
-    Shows the curated fixes for the identified family (precise when a symptom
-    keyword matches the observed evidence, otherwise the family checklist). Only
-    when no family is confidently ranked does it fall back to the full case library.
+    Precise first: every curated symptom whose keyword matches the evidence, across
+    ALL families (the fine-grained signature is the entry point, not the coarse
+    ranked family). Only when nothing matches does it fall back to the ranked
+    family's general checklist, then the full case library.
     """
     top_family = candidates[0].family if candidates else ""
-    symptoms = failure_modes.get(top_family) if top_family else None
-    if not symptoms:
-        if fallback_cases:
-            return [fallback_cases]
-        return ["- No troubleshooting guidance is available for this cause yet."]
-    text = (observed_text or "").lower()
-    lines = [f"Guidance for the most likely cause: **{_family_label(top_family)}**.", ""]
-    matched = False
-    for symptom in symptoms:
-        if any(kw in text for kw in symptom.get("keywords", [])):
-            matched = True
-            lines.append(f"- **{symptom.get('symptom')}**")
+    matches = match_failure_mode_symptoms(failure_modes, observed_text, top_family)
+    if matches:
+        lines: list[str] = []
+        for family, symptom in matches:
+            lines.append(f"- **{symptom.get('symptom')}** ({_family_label(family)})")
             lines.extend(f"  - {action}" for action in symptom.get("actions", [])[:5])
-    if not matched:
+        return lines
+    # No precise signature matched: fall back to the ranked family's general
+    # checklist (the coarse ranking's legitimate role), else the full case library.
+    symptoms = failure_modes.get(top_family) if top_family else None
+    if symptoms:
         actions = sorted({a for s in symptoms for a in s.get("actions", [])})
-        lines.extend(f"- {action}" for action in actions[:6])
-    return lines
+        header = f"Guidance for the most likely cause: **{_family_label(top_family)}**."
+        return [header, "", *[f"- {action}" for action in actions[:6]]]
+    if fallback_cases:
+        return [fallback_cases]
+    return ["- No troubleshooting guidance is available for this cause yet."]
 
 
 def _family_label(family: str) -> str:
@@ -1229,6 +1433,10 @@ def _family_label(family: str) -> str:
         "scheduling_quota_exhaustion": "scheduling quota exhaustion",
         "control_plane_error": "Run:ai control-plane error",
         "workload_startup_image_failure": "workload startup/image failure",
+        "gpu_hardware_error": "GPU hardware error",
+        "platform_version_bug": "Run:ai version bug",
+        "observability_accuracy": "metrics/observability accuracy",
+        "expected_known_behavior": "expected/known behavior",
         "insufficient_evidence": "insufficient evidence",
     }
     return labels.get(family, family.replace("_", " "))

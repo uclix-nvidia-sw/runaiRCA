@@ -152,6 +152,11 @@
         - "Check kubelet and the container runtime on the node: `systemctl status kubelet containerd`."
         - "'Network not ready' means the CNI never initialized on the node — check the CNI daemonset pod there."
         - "If the node is unreachable, cordon it and investigate via console/BMC; workloads will be rescheduled elsewhere."
+    - name: Node File Descriptor Exhaustion
+      keywords: [nodefiledescriptorlimit, "file descriptor", "too many open files"]
+      actions:
+        - "The node hit its kernel file-descriptor limit (often the 65535 default), which breaks kubelet<->device-plugin sockets and flaps GPU health/readiness. Raise fs.file-max (e.g. 524288) in /etc/sysctl.conf and apply with `sysctl -p` — no pod restart needed."
+        - "Roll the sysctl change out to every node (e.g. `pdsh` from the proxy/deploy host) so the limit survives reboot."
 
 - family: gpu_hardware_error
   symptoms:
@@ -192,6 +197,12 @@
         - "Check the dcgm-exporter pod logs on the node; a broken exporter breaks GPU metrics/alerts even when the GPU is fine."
         - "Run a DCGM health check on the node (`dcgmi diag -r 2`) to test the GPU hardware itself."
         - "Correlate with any Xid errors in the node's kernel log to separate monitoring issues from real hardware faults."
+    - name: NCCL NVLS Cuda Failure
+      keywords: ["transport/nvls.cc", "nccl warn cuda failure", nvls]
+      actions:
+        - "NCCL fails to initialize NVLS (multicast) with 'Cuda failure invalid argument' and stays broken until the node reboots. Immediate workaround: set NCCL_NVLS_ENABLE=0 to run without NVLS (loses NVLS AllReduce acceleration)."
+        - "Recover the NVSwitch/NVLink coherent state: stop CUDA apps and the Fabric Manager service, run `nvidia-smi -r` to reset the GPUs, then restart Fabric Manager (per the Fabric Manager User Guide)."
+        - "If it recurs, collect fabric/FM logs before rebooting and check GPU/NVSwitch fabric-state consistency (see NCCL issues #1562, #1672)."
 
 - family: control_plane_error
   symptoms:

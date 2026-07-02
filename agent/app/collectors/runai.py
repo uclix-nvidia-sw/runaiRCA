@@ -1,11 +1,57 @@
 from __future__ import annotations
 
+import re
+from typing import Any
 from urllib.parse import quote
 
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.collectors.http_json import compact, get_json, post_form_json, post_json
 from app.collectors.loki import _llm_insight
 from app.config import Settings
+
+_VERSION_RE = re.compile(r"\d+\.\d+(?:\.\d+)?")
+
+
+def _extract_version(data: Any) -> str:
+    """Find a semver-ish version string in an arbitrary Run:ai version payload.
+
+    Prefers dict keys that look like a version field, then falls back to any nested
+    string that matches N.N(.N). Returns '' when nothing looks like a version."""
+    if isinstance(data, str):
+        match = _VERSION_RE.search(data)
+        return match.group(0) if match else ""
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if "version" in str(key).lower():
+                found = _extract_version(value)
+                if found:
+                    return found
+        for value in data.values():
+            found = _extract_version(value)
+            if found:
+                return found
+    if isinstance(data, list):
+        for item in data:
+            found = _extract_version(item)
+            if found:
+                return found
+    return ""
+
+
+async def _fetch_runai_version(settings: Settings, headers: dict[str, str]) -> str:
+    """Best-effort Run:ai control-plane version, '' when unavailable.
+
+    The path is configurable (RUNAI_VERSION_PATH) and this never fails the collector
+    — an unknown version simply means no version-aware known-issue suppression."""
+    if not settings.runai_base_url or not settings.runai_version_path:
+        return ""
+    resp = await get_json(
+        base_url=settings.runai_base_url,
+        path=settings.runai_version_path,
+        timeout_seconds=settings.runai_timeout_seconds,
+        headers=headers,
+    )
+    return _extract_version(resp.data) if resp.ok else ""
 
 
 class RunAICollector:
@@ -113,6 +159,7 @@ class RunAICollector:
             if auth_failed and "runai.auth" not in missing:
                 missing.append("runai.auth")
 
+            runai_version = await _fetch_runai_version(self._settings, headers)
             details = {
                 "cluster": target.cluster,
                 "project": target.project,
@@ -121,6 +168,7 @@ class RunAICollector:
                 "workload_type": target.workload_type,
                 "runai_workload_id": target.runai_workload_id,
                 "runai_base_url": self._settings.runai_base_url,
+                "runai_version": runai_version,
                 "queries": query_results,
             }
             warnings = auth_warnings + [
