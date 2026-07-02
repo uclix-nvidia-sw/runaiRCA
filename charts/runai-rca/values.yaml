@@ -23,6 +23,7 @@ secrets:
     runaiBearerToken: RUNAI_BEARER_TOKEN
     nvidiaApiKey: NVIDIA_API_KEY
     llmApiKey: LLM_API_KEY
+    embeddingApiKey: EMBEDDING_API_KEY
   databaseUrl: ""
   postgresDsn: ""
   runaiClientId: ""
@@ -30,6 +31,7 @@ secrets:
   runaiBearerToken: ""
   nvidiaApiKey: ""
   llmApiKey: ""
+  embeddingApiKey: ""
 
 postgresql:
   enabled: false
@@ -124,7 +126,7 @@ backend:
     pullPolicy: IfNotPresent
   env:
     agentUrl: ""
-    language: en
+    language: ko
     databaseConnectTimeoutSeconds: 5
     agentRequestTimeoutSeconds: 180
     manualAgentRequestTimeoutSeconds: 900
@@ -139,6 +141,14 @@ backend:
     analysisBackfillIntervalSeconds: 300
     analysisBackfillBatch: 10
     analysisBackfillRetryCooldownSeconds: 900
+    # Semantic embedding for similar-incident search. Empty embeddingUrl => offline
+    # hash fallback (default, language-agnostic but lexical). Point at an
+    # OpenAI-compatible /embeddings endpoint for real multilingual (incl. Korean)
+    # similarity. embeddingDim MUST match the model; changing it requires
+    # re-embedding existing rows (mixed-dim vectors can't be compared).
+    embeddingUrl: ""
+    embeddingModel: ""
+    embeddingDim: 384
   service:
     annotations: {}
     type: ClusterIP
@@ -183,7 +193,7 @@ agent:
     clusterWide: true
     namespaces: []
   env:
-    language: en
+    language: ko
     logLevel: info
     kubernetesApiUrl: https://kubernetes.default.svc
     kubernetesTokenPath: /var/run/secrets/kubernetes.io/serviceaccount/token

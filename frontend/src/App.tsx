@@ -3363,18 +3363,25 @@ function parseDate(value: string) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
+// ponytail: buckets align to Asia/Seoul (KST, fixed UTC+9) calendar days, not UTC.
+// KST has no DST, so a constant +9h offset is exact — no Intl zone math needed here.
+const KST_OFFSET_MS = 9 * 60 * 60 * 1000;
+
+// Real UTC instant of the KST midnight that contains `date`. Shift into KST, floor to
+// the calendar day there, then shift back so the result stays a comparable real instant.
 function startOfUtcDay(date: Date) {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const shifted = new Date(date.getTime() + KST_OFFSET_MS);
+  const kstMidnight = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate());
+  return new Date(kstMidnight - KST_OFFSET_MS);
 }
 
 function addUtcDays(date: Date, days: number) {
-  const next = new Date(date);
-  next.setUTCDate(next.getUTCDate() + days);
-  return next;
+  return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
 }
 
+// Label for a KST-day-start instant: its calendar date in Asia/Seoul (YYYY-MM-DD).
 function dateKey(date: Date) {
-  return date.toISOString().slice(0, 10);
+  return new Date(date.getTime() + KST_OFFSET_MS).toISOString().slice(0, 10);
 }
 
 function dateRangeLabel(points: TrendPoint[]) {
