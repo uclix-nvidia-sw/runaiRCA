@@ -6,12 +6,69 @@
 #
 # The synthesis matches the incident's evidence against a symptom's keywords and
 # shows THAT symptom's actions (precise), falling back to the family's actions
-# when nothing specific matches. The team maintains this file; load with:
+# when nothing specific matches. Keywords are lowercase substrings that must
+# actually appear in k8s event/log text; within a family, list the more specific
+# symptom BEFORE the more generic one (first keyword match wins). The team
+# maintains this file; load with:
 #
 #   ENABLE_TYPEDB=true TYPEDB_ADDRESS=localhost:1729 python -m ontology.load_knowledge
 
 - family: workload_startup_image_failure
   symptoms:
+    - name: Registry Pull Rate Limit
+      keywords: [toomanyrequests, "pull rate limit", "rate limit exceeded"]
+      actions:
+        - "The registry rejected the pull because the anonymous pull limit was hit (common with Docker Hub). Add an ImagePullSecret with a logged-in account to raise the limit."
+        - "Mirror frequently-used images to an internal registry so nodes stop pulling from the internet."
+        - "Retry after the rate-limit window resets if this is a one-off burst (e.g. many nodes pulling at once)."
+    - name: Registry TLS Certificate Error
+      keywords: [x509, "certificate signed by unknown authority", "certificate has expired", "tls handshake timeout"]
+      actions:
+        - "The node does not trust the registry's TLS certificate. Add the registry's CA certificate to the container runtime's trust store on every node."
+        - "If the registry certificate expired, renew it on the registry side."
+        - "Check for a corporate proxy/firewall intercepting TLS between the nodes and the registry."
+    - name: Registry Auth Failure
+      keywords: ["pull access denied", "authentication required", "repository does not exist or may require"]
+      actions:
+        - "Check that the ImagePullSecret exists in the workload's namespace and is referenced by the pod/serviceaccount."
+        - "Verify the credentials still work: try `docker login` / `crane auth login` with the same user."
+        - "Confirm the account has read permission on that specific repository (private repos deny pulls silently)."
+    - name: Registry Unreachable
+      keywords: ["i/o timeout", "connection refused", "no route to host"]
+      actions:
+        - "The node cannot reach the registry over the network. Check proxy/firewall rules and DNS from a node."
+        - "Check that the registry service itself is up and responding."
+        - "Try pulling the image manually from an affected node (e.g. `crictl pull <image>`) to confirm."
+    - name: Pod DNS Resolution Failure
+      keywords: [nxdomain, "temporary failure in name resolution", "no such host", "server misbehaving"]
+      actions:
+        - "In-cluster DNS is failing. Check the CoreDNS pods are Running: `kubectl -n kube-system get pods -l k8s-app=kube-dns`."
+        - "Test resolution from inside a pod (`nslookup kubernetes.default`) to tell pod-level from cluster-level failure."
+        - "Check the pod's dnsPolicy/dnsConfig and any NetworkPolicy blocking UDP/TCP port 53."
+    - name: CoreDNS Unhealthy
+      keywords: [coredns]
+      actions:
+        - "Inspect the CoreDNS pod logs and restarts in kube-system; a crash-looping CoreDNS breaks name resolution for the whole cluster."
+        - "Check whether the CoreDNS ConfigMap (Corefile) changed recently and roll it back if so."
+        - "Verify the upstream nameservers CoreDNS forwards to are reachable from the nodes."
+    - name: Pod Sandbox / CNI Failure
+      keywords: ["failed to create pod sandbox", "cni plugin", "network plugin", "failed to setup network for sandbox"]
+      actions:
+        - "The container network (CNI) failed while creating the pod. Check the CNI daemonset pod (calico/cilium/flannel) on that node."
+        - "Check whether the node ran out of pod IP addresses (IP pool exhaustion)."
+        - "If sandbox errors persist on one node, restart the container runtime and kubelet there, or cordon the node."
+    - name: Volume Attach/Mount Failure
+      keywords: [failedattachvolume, "unable to attach or mount volumes", "timed out waiting for the volume", "multi-attach error"]
+      actions:
+        - "Check the PVC is Bound and the CSI driver pods on the node are healthy."
+        - "A Multi-Attach error means the volume is still attached to another node — delete the old pod or wait for detach before the new one can start."
+        - "Check the storage backend (NFS/Ceph/cloud disk) health and connectivity from the node."
+    - name: PVC Pending / StorageClass Missing
+      keywords: ["unbound immediate persistentvolumeclaims", "no persistent volumes available", storageclass, provisioningfailed]
+      actions:
+        - "Run `kubectl describe pvc <name>` — the events say why provisioning failed."
+        - "Confirm the requested StorageClass exists and its provisioner is running."
+        - "Check the storage backend has free capacity for the requested size."
     - name: ImagePullBackOff
       keywords: [imagepullbackoff, errimagepull, "manifest unknown"]
       actions:
@@ -39,6 +96,18 @@
       actions:
         - "Confirm the queue/project GPU quota against the requested GPU count."
         - "Check higher-priority workloads consuming the allocation (preemption)."
+    - name: Preempted By Higher Priority
+      keywords: ["preempted by higher priority", "preemption victim", preemptor]
+      actions:
+        - "This is expected Run:ai behavior: a higher-priority workload took the resources. Check which workload preempted this one and its project's priority."
+        - "If this workload must not be preempted, run it within-quota (guaranteed) instead of over-quota, or raise its project's deserved quota."
+        - "Consider marking critical training jobs as non-preemptible if the scheduler policy allows it."
+    - name: Over-Quota Contention
+      keywords: ["over-quota", "over quota", overquota]
+      actions:
+        - "The workload is using over-quota (spare) GPUs, which can be reclaimed at any moment — this is normal Run:ai elasticity, not a fault."
+        - "Adjust the project's over-quota weight if it should get a larger share of spare capacity."
+        - "Move the workload to a within-quota request if it needs stable, non-reclaimable GPUs."
     - name: Quota Or Request Changed
       keywords: [preempt, quota]
       actions:
@@ -59,6 +128,70 @@
       keywords: [pidpressure]
       actions:
         - "Check for a process/thread leak on the node."
+    - name: DNS Nameserver Limits Exceeded
+      keywords: [dnsconfigforming, "nameserver limits were exceeded", "nameserver limits exceeded"]
+      actions:
+        - "The node's /etc/resolv.conf has more than the 3 nameservers Kubernetes supports; the extras are silently dropped. Remove the extra nameserver entries on the node."
+        - "Check what writes the node's resolv.conf (DHCP, NetworkManager, systemd-resolved) and fix it at the source so the entries don't come back."
+        - "Verify the file kubelet actually uses (its --resolv-conf flag) — that is the one that must have at most 3 nameservers."
+    - name: No Space Left On Device
+      keywords: ["no space left on device", imagegcfailed, "ephemeral-storage"]
+      actions:
+        - "A filesystem on the node is full. Run `df -h` on the node to find which one."
+        - "Clean unused container images and old logs (e.g. `crictl rmi --prune`)."
+        - "Find pods writing large files to emptyDir/local disk and cap them with ephemeral-storage limits."
+    - name: Node Filesystem Read-Only
+      keywords: ["read-only file system"]
+      actions:
+        - "The node's disk remounted itself read-only, which usually means a disk or storage-layer error. Check `dmesg` on the node for I/O errors."
+        - "Drain the node, then repair (fsck) or replace the disk before uncordoning."
+        - "On cloud nodes, check whether the underlying disk was detached or is being throttled."
+    - name: Node Not Ready / Network Unavailable
+      keywords: [nodenotready, "node is not ready", "network is unavailable", "container runtime network not ready"]
+      actions:
+        - "Check kubelet and the container runtime on the node: `systemctl status kubelet containerd`."
+        - "'Network not ready' means the CNI never initialized on the node — check the CNI daemonset pod there."
+        - "If the node is unreachable, cordon it and investigate via console/BMC; workloads will be rescheduled elsewhere."
+
+- family: gpu_hardware_error
+  symptoms:
+    - name: NVML Driver/Library Version Mismatch
+      keywords: ["driver/library version mismatch", "failed to initialize nvml", "could not load nvml library"]
+      actions:
+        - "The NVIDIA driver on the node was updated without a reboot, so the loaded kernel module and the userspace library disagree. Drain and reboot the node (or reload the nvidia kernel modules)."
+        - "Pin matching versions of the NVIDIA driver and container toolkit so upgrades stay in sync."
+        - "Always drain GPU nodes before driver upgrades to avoid this on running workloads."
+    - name: NVIDIA Device Plugin Not Registering
+      keywords: [nvidia-device-plugin, "no devices found", "nvidia.com/gpu: 0"]
+      actions:
+        - "The node advertises 0 GPUs to Kubernetes. Check the nvidia-device-plugin daemonset pod on that node is Running and its logs are clean."
+        - "Run `nvidia-smi` on the node — if it fails, the driver is the problem, not the plugin."
+        - "Confirm the container runtime is configured with the NVIDIA runtime (nvidia-container-toolkit) on that node."
+        - "Restart the device-plugin pod after fixing the driver/runtime so the GPU count is re-advertised."
+    - name: GPU Fallen Off The Bus
+      keywords: ["fallen off the bus", "gpu is lost"]
+      actions:
+        - "The GPU disappeared from the PCIe bus — a serious hardware, power, or cooling event. Drain the node and reboot it."
+        - "Check power delivery, cooling, and PCIe riser/seating on that server."
+        - "If the same GPU falls off the bus repeatedly, replace it (RMA)."
+    - name: ECC Page Retirement
+      keywords: ["retired pages", "pending page retirement", "uncorrectable ecc", "ecc error"]
+      actions:
+        - "The GPU is retiring bad memory pages. 'Pending' retirements only take effect after a GPU reset — drain the node and reset the GPU (or reboot)."
+        - "Check the counts with `nvidia-smi -q -d PAGE_RETIREMENT` on the node."
+        - "A growing number of retired pages means the GPU memory is degrading — plan a replacement."
+    - name: GPU Thermal Throttle
+      keywords: ["thermal slowdown", "thermal throttle", "hw slowdown"]
+      actions:
+        - "The GPU is slowing itself down to avoid overheating — jobs run slower but don't crash. Check GPU temperatures with `nvidia-smi -q -d TEMPERATURE`."
+        - "Check server airflow, fans, and datacenter/rack inlet temperature."
+        - "If cooling can't be fixed quickly, lower the GPU power limit (`nvidia-smi -pl`) as a stopgap."
+    - name: DCGM Error
+      keywords: [dcgm]
+      actions:
+        - "Check the dcgm-exporter pod logs on the node; a broken exporter breaks GPU metrics/alerts even when the GPU is fine."
+        - "Run a DCGM health check on the node (`dcgmi diag -r 2`) to test the GPU hardware itself."
+        - "Correlate with any Xid errors in the node's kernel log to separate monitoring issues from real hardware faults."
 
 - family: control_plane_error
   symptoms:
