@@ -62,6 +62,7 @@ def make_settings() -> Settings:
         runai_alerts_file="knowledge/runai_alerts_catalog.yaml",
         enable_system_agent=False,
         system_agent_url="",
+        system_agent_token="",
         system_agent_timeout_seconds=6,
         enable_pod_exec=False,
         pod_exec_timeout_seconds=10,

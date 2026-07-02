@@ -313,12 +313,18 @@ affinity: {}
 
 # Privileged DaemonSet exposing a read-only node log endpoint (dmesg/journal/syslog)
 # so the RCA agent can see host/kernel/GPU-driver events (NVIDIA XID, OOM, MCE, ...).
-# Disabled by default: it runs privileged with hostNetwork/hostPID on every node.
+# Enabled by default (enabled: true below) — note it runs privileged with
+# hostNetwork/hostPID on every node; set enabled: false to opt out of node logs.
 # The agent reaches each node via http://{node}:port — set the agent's SYSTEM_AGENT_URL
-# to "http://{node}:9095" and ENABLE_SYSTEM_AGENT=true. Any base python image with
-# nsenter/journalctl works (e.g. a distro image with python3); it only runs stdlib code.
+# to "http://{node}:9095" and ENABLE_SYSTEM_AGENT=true. The server runs dmesg/journalctl
+# via `nsenter -t 1` into the host, so only the container needs `nsenter` (present in
+# python:3.12-slim's util-linux); journalctl/dmesg resolve to the node's own binaries.
 systemAgent:
   enabled: true
+  # Bearer token the agent must present to read node logs. Leave empty to have Helm
+  # auto-generate one and keep it stable across upgrades (recommended). Set a value
+  # only if you need a known token (e.g. to curl the endpoint yourself).
+  authToken: ""
   image:
     repository: python
     tag: "3.12-slim"

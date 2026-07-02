@@ -91,6 +91,8 @@ class SystemCollector:
             )
 
         base_url = _base_url_for_node(self._settings.system_agent_url, node)
+        token = self._settings.system_agent_token
+        headers = {"Authorization": f"Bearer {token}"} if token else None
         source_results = []
         warnings: list[str] = []
         for source in _SOURCES:
@@ -99,6 +101,7 @@ class SystemCollector:
                 path="/logs",
                 timeout_seconds=self._settings.system_agent_timeout_seconds,
                 params={"source": source, "lines": "500"},
+                headers=headers,
             )
             lines = _lines(response.data)
             matches = [line for line in lines if _ERROR_PATTERNS.search(line)]

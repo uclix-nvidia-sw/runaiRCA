@@ -1,5 +1,28 @@
 {{- if .Values.systemAgent.enabled }}
 {{- $name := printf "%s-system-agent" (include "runai-rca.fullname" .) -}}
+{{- $tokenSecretName := printf "%s-token" $name -}}
+{{- /* Shared bearer token gating the node-log endpoint. Auto-generated and kept
+       stable across upgrades via lookup; override with systemAgent.authToken. */ -}}
+{{- $token := .Values.systemAgent.authToken -}}
+{{- if not $token -}}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $tokenSecretName -}}
+{{- if and $existing $existing.data (index $existing.data "token") -}}
+{{- $token = index $existing.data "token" | b64dec -}}
+{{- else -}}
+{{- $token = randAlphaNum 32 -}}
+{{- end -}}
+{{- end -}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $tokenSecretName }}
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: system-agent
+type: Opaque
+stringData:
+  token: {{ $token | quote }}
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -18,6 +41,8 @@ data:
 
     PORT = int(os.environ.get("PORT", "9095"))
     MAX_LINES = 2000
+    # Shared bearer token; when set, /logs requires "Authorization: Bearer <token>".
+    TOKEN = os.environ.get("SYSTEM_AGENT_TOKEN", "")
     # nsenter into PID 1 (host) so dmesg/journalctl read the node, not the container.
     NSENTER = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"]
     SOURCES = {
@@ -56,6 +81,8 @@ data:
             u = urlparse(self.path)
             if u.path == "/healthz":
                 self.send_response(200); self.end_headers(); self.wfile.write(b"ok"); return
+            if TOKEN and self.headers.get("Authorization", "") != "Bearer " + TOKEN:
+                self.send_response(401); self.end_headers(); return
             if u.path != "/logs":
                 self.send_response(404); self.end_headers(); return
             q = parse_qs(u.query)
@@ -121,6 +148,11 @@ spec:
           env:
             - name: PORT
               value: {{ .Values.systemAgent.port | quote }}
+            - name: SYSTEM_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $tokenSecretName }}
+                  key: token
           volumeMounts:
             - name: server
               mountPath: /opt/system-agent

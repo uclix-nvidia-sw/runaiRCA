@@ -110,6 +110,16 @@ def test_extract_actions_truncates_and_handles_missing_section() -> None:
     assert len(ingest._extract_actions(long)[0]) == ingest._ACTION_MAXLEN
 
 
+def test_extract_actions_matches_numbered_and_korean_headings() -> None:
+    # The live report now emits numbered/Korean headings — both must still parse.
+    assert ingest._extract_actions("## 3. Recommended Actions\n- do the thing") == [
+        "do the thing"
+    ]
+    assert ingest._extract_actions("## 3. 권장 조치 (Recommended Actions)\n- 조치하기") == [
+        "조치하기"
+    ]
+
+
 # --- row eligibility -------------------------------------------------------------
 
 

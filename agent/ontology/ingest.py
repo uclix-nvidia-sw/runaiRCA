@@ -312,14 +312,17 @@ def _derive_family(text: str) -> str:
 
 
 def _extract_actions(detail: str) -> list[str]:
-    """Bullet lines from the '## Recommended Actions' section only (conservative:
-    that header survives both the deterministic and the Korean LLM report)."""
+    """Bullet lines from the Recommended-Actions section only.
+
+    The heading appears as '## Recommended Actions', numbered
+    '## 3. Recommended Actions', or Korean '## 3. 권장 조치 (Recommended Actions)'
+    depending on language/report shape — match the phrase, not an exact prefix."""
     actions: list[str] = []
     in_section = False
     for line in (detail or "").splitlines():
         stripped = line.strip()
         if stripped.startswith("## "):
-            in_section = stripped.lower().startswith("## recommended actions")
+            in_section = "recommended actions" in stripped.lower() or "권장 조치" in stripped
             continue
         if in_section and stripped.startswith("- "):
             text = stripped[2:].strip().strip("*").strip()

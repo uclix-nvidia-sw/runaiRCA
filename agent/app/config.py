@@ -96,6 +96,7 @@ class Settings:
     runai_alerts_file: str
     enable_system_agent: bool
     system_agent_url: str
+    system_agent_token: str
     system_agent_timeout_seconds: int
     enable_pod_exec: bool
     pod_exec_timeout_seconds: int
@@ -184,6 +185,7 @@ def load_settings() -> Settings:
         # On by default; degrades to "unavailable" when SYSTEM_AGENT_URL isn't set.
         enable_system_agent=_bool_env("ENABLE_SYSTEM_AGENT", True),
         system_agent_url=os.getenv("SYSTEM_AGENT_URL", "").strip().rstrip("/"),
+        system_agent_token=os.getenv("SYSTEM_AGENT_TOKEN", "").strip(),
         system_agent_timeout_seconds=_int_env("SYSTEM_AGENT_TIMEOUT_SECONDS", 6),
         # Read-only pod exec for the Kubernetes agent (view container state/logs; no mutations).
         enable_pod_exec=_bool_env("ENABLE_POD_EXEC", True),

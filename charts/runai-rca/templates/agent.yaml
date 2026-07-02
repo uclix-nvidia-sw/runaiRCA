@@ -164,6 +164,11 @@ spec:
             # node logs on this port (hostNetwork), so the node name resolves directly.
             - name: SYSTEM_AGENT_URL
               value: "http://{node}:{{ .Values.systemAgent.port }}"
+            - name: SYSTEM_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ printf "%s-system-agent-token" (include "runai-rca.fullname" .) }}
+                  key: token
             {{- end }}
             - name: POSTGRES_DSN
               valueFrom:

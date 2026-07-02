@@ -27,6 +27,7 @@ def _target(node: str = "gpu-node-1") -> AnalysisTarget:
 class _Settings:
     enable_system_agent = True
     system_agent_url = "http://{node}:9095"
+    system_agent_token = ""
     system_agent_timeout_seconds = 6
     # llm_configured() reads these; unset -> deterministic path.
     llm_base_url = ""
