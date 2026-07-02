@@ -324,7 +324,7 @@ func (s *Store) ensureVectorColumn(ctx context.Context) {
 	statements := []string{
 		fmt.Sprintf(
 			`ALTER TABLE incident_embeddings ADD COLUMN IF NOT EXISTS embedding vector(%d)`,
-			embeddingDim,
+			s.embeddingDim(),
 		),
 		`CREATE INDEX IF NOT EXISTS idx_embeddings_vector
 			ON incident_embeddings USING hnsw (embedding vector_cosine_ops)`,
@@ -536,7 +536,7 @@ func (s *Store) dbSearchMemory(query string, limit int) ([]SimilarIncident, bool
 	if s.db == nil || !s.dbReady || !s.pgvectorReady {
 		return nil, false
 	}
-	literal := embeddingLiteral(denseEmbedding(query))
+	literal := embeddingLiteral(s.embed(query))
 	queryLimit := limit * 3
 	ctx, cancel := postgresOperationContext()
 	defer cancel()
@@ -847,7 +847,7 @@ func (s *Store) persistMemoryLocked(memory *IncidentMemory) {
 			memory.AnalysisDetail,
 			mustJSON(memory.Labels),
 			mustJSON(memory.Vector),
-			embeddingLiteral(denseEmbedding(memoryText(*memory))),
+			embeddingLiteral(s.embed(memoryText(*memory))),
 			memory.CreatedAt,
 		)
 		if err == nil {

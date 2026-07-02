@@ -40,6 +40,8 @@ def agent_role_coverage_lines() -> list[str]:
         "- **loki**: workload logs plus `runai` and `runai-backend` control-plane/backend logs.",
         "- **postgres**: RCA store, pgvector, embeddings, feedback, comments, "
         "and persistence health.",
+        "- **system**: node infrastructure below Kubernetes — syslog, journalctl, and "
+        "dmesg (kernel, GPU driver / NVIDIA XID, OOM, hardware) via the per-node agent.",
     ]
 
 

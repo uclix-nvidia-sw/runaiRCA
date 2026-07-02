@@ -23,6 +23,7 @@ secrets:
     runaiBearerToken: RUNAI_BEARER_TOKEN
     nvidiaApiKey: NVIDIA_API_KEY
     llmApiKey: LLM_API_KEY
+    embeddingApiKey: EMBEDDING_API_KEY
   databaseUrl: ""
   postgresDsn: ""
   runaiClientId: ""
@@ -30,6 +31,7 @@ secrets:
   runaiBearerToken: ""
   nvidiaApiKey: ""
   llmApiKey: ""
+  embeddingApiKey: ""
 
 postgresql:
   enabled: false
@@ -124,7 +126,7 @@ backend:
     pullPolicy: IfNotPresent
   env:
     agentUrl: ""
-    language: en
+    language: ko
     databaseConnectTimeoutSeconds: 5
     agentRequestTimeoutSeconds: 180
     manualAgentRequestTimeoutSeconds: 900
@@ -139,6 +141,14 @@ backend:
     analysisBackfillIntervalSeconds: 300
     analysisBackfillBatch: 10
     analysisBackfillRetryCooldownSeconds: 900
+    # Semantic embedding for similar-incident search. Empty embeddingUrl => offline
+    # hash fallback (default, language-agnostic but lexical). Point at an
+    # OpenAI-compatible /embeddings endpoint for real multilingual (incl. Korean)
+    # similarity. embeddingDim MUST match the model; changing it requires
+    # re-embedding existing rows (mixed-dim vectors can't be compared).
+    embeddingUrl: ""
+    embeddingModel: ""
+    embeddingDim: 384
   service:
     annotations: {}
     type: ClusterIP
@@ -183,7 +193,7 @@ agent:
     clusterWide: true
     namespaces: []
   env:
-    language: en
+    language: ko
     logLevel: info
     kubernetesApiUrl: https://kubernetes.default.svc
     kubernetesTokenPath: /var/run/secrets/kubernetes.io/serviceaccount/token
@@ -191,9 +201,18 @@ agent:
     kubernetesTimeoutSeconds: 6
     kubernetesListLimit: 50
     kubernetesNamespaces: ""
+    # Allow the Kubernetes agent to run read-only diagnostic commands (nvidia-smi,
+    # etc.) via the pod exec subresource. Requires pods/exec RBAC (agent-rbac.yaml).
+    enablePodExec: true
     enableNatRuntime: false
     natConfigFile: /app/configs/runai_rca_workflow.yml
     natTimeoutSeconds: 180
+    # Human-like iterative investigation: the orchestrator plans, probes the most
+    # relevant agent, observes, and re-plans (bounded by maxInvestigationSteps)
+    # instead of gathering everything once. Only active when an LLM is configured
+    # (no-op otherwise); each step is an extra LLM call, so it costs more per RCA.
+    enableInvestigationLoop: true
+    maxInvestigationSteps: 4
     runaiBaseUrl: ""
     runaiTokenUrl: ""
     runaiWorkloadsPath: /api/v1/workloads
@@ -291,3 +310,27 @@ ingress:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# Privileged DaemonSet exposing a read-only node log endpoint (dmesg/journal/syslog)
+# so the RCA agent can see host/kernel/GPU-driver events (NVIDIA XID, OOM, MCE, ...).
+# Enabled by default (enabled: true below) — note it runs privileged with
+# hostNetwork/hostPID on every node; set enabled: false to opt out of node logs.
+# The agent reaches each node via http://{node}:port — set the agent's SYSTEM_AGENT_URL
+# to "http://{node}:9095" and ENABLE_SYSTEM_AGENT=true. The server runs dmesg/journalctl
+# via `nsenter -t 1` into the host, so only the container needs `nsenter` (present in
+# python:3.12-slim's util-linux); journalctl/dmesg resolve to the node's own binaries.
+systemAgent:
+  enabled: true
+  # Bearer token the agent must present to read node logs. Leave empty to have Helm
+  # auto-generate one and keep it stable across upgrades (recommended). Set a value
+  # only if you need a known token (e.g. to curl the endpoint yourself).
+  authToken: ""
+  image:
+    repository: python
+    tag: "3.12-slim"
+    pullPolicy: IfNotPresent
+  port: 9095
+  nodeSelector: {}
+  tolerations:
+    - operator: Exists
+  resources: {}

@@ -7,22 +7,26 @@ import re
 import subprocess
 import tempfile
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from typing import TypeVar
 from uuid import uuid4
 
 from pydantic import BaseModel
 
-from app.collectors.base import CollectorResult, resolve_target
+from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, resolve_target
 from app.collectors.http_json import post_json
 from app.collectors.kubernetes import KubernetesCollector
 from app.collectors.loki import LokiCollector
 from app.collectors.postgres import PostgresCollector
 from app.collectors.prometheus import PrometheusCollector
 from app.collectors.runai import RunAICollector
+from app.collectors.system import SystemCollector
 from app.config import Settings
 from app.knowledge import load_failure_modes, load_troubleshooting_cases
+from app.llm import complete, complete_json, llm_configured
 from app.masking import Masker, build_masker
+from app.plan import InvestigationPlan
 from app.prompts import agent_role_coverage_lines, load_agent_souls
 from app.schemas import (
     AlertAnalysisRequest,
@@ -32,7 +36,8 @@ from app.schemas import (
     IncidentSummaryRequest,
     IncidentSummaryResponse,
 )
-from app.services.kg_enrichment import enrich
+from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
+from app.services.planner import plan_investigation
 from app.services.root_cause_ranking import RankedCause, rank_root_cause_candidates
 
 TModel = TypeVar("TModel", bound=BaseModel)
@@ -144,16 +149,34 @@ class AnalysisOrchestrator:
             PostgresCollector(settings),
             PrometheusCollector(settings),
             LokiCollector(settings),
+            SystemCollector(settings),
         ]
+        # Optional change/timeline capability agent — probe-able tool once it exists.
+        try:
+            from app.collectors.change import ChangeCollector
+        except ImportError:
+            pass
+        else:
+            self._collectors.append(ChangeCollector(settings))
 
     async def analyze(self, request: AlertAnalysisRequest) -> AlertAnalysisResponse:
         target = resolve_target(request.alert.labels, request.alert.annotations)
         # Knowledge graph is consulted once here, at synthesis time, as a
         # knowledge resource for the final RCA — not as a parallel collector.
         kg_context = await enrich(self._settings, target)
+        # Plan first (senior-SRE "think before you dig"): scope every collector to
+        # what THIS alert needs instead of always scraping the control plane.
+        plan = await plan_investigation(
+            self._settings,
+            target,
+            request.alert,
+            kg_context.as_dict(),
+            list(request.similar_incidents),
+        )
         nat_payload = request.model_dump(mode="json")
         nat_payload["mode"] = "alert_analysis"
         nat_payload["kg_context"] = kg_context.as_dict()
+        nat_payload["plan"] = plan.as_dict()
         agent_souls = load_agent_souls(self._settings.agent_souls_file)
         nat_payload["agent_souls"] = agent_souls
         nat_text = None
@@ -163,8 +186,31 @@ class AnalysisOrchestrator:
         except Exception as exc:
             nat_warnings.append(_unexpected_runtime_warning("nemo", exc))
 
-        results = await asyncio.gather(
-            *(_collect_safely(collector, target) for collector in self._collectors)
+        # Synthesis MUST see EVERY collector's result. Await the full gather over ALL
+        # collectors here, before any ranking/synthesis, and never synthesize from a
+        # subset — an early/partial synthesis would produce a confident-but-wrong RCA.
+        # LLM-gated senior-SRE loop when enabled; otherwise the one-shot gather. Both
+        # return one CollectorResult per collector (investigate runs any it skipped).
+        if llm_configured(self._settings) and self._settings.enable_investigation_loop:
+            from app.services.investigator import investigate
+
+            results = await investigate(
+                self._settings,
+                target,
+                self._collectors,
+                plan,
+                kg_context.as_dict(),
+                self._settings.max_investigation_steps,
+            )
+        else:
+            results = list(
+                await asyncio.gather(
+                    *(_collect_safely(collector, target, plan) for collector in self._collectors)
+                )
+            )
+        assert len(results) == len(self._collectors), (
+            "synthesis must wait for all collectors: "
+            f"{len(results)} results for {len(self._collectors)} collectors"
         )
 
         capabilities = {result.agent: result.status for result in results}
@@ -175,12 +221,105 @@ class AnalysisOrchestrator:
             | set(nat_warnings)
             | set(kg_context.warnings)
         )
+        # Optional feedback-derived priors from operator hints — nudge ranking.
+        priors = None
+        try:
+            from app.services.feedback_priors import derive_priors
+        except ImportError:
+            pass
+        else:
+            priors = derive_priors(request.feedback_hints)
         root_cause_candidates = rank_root_cause_candidates(
             target,
             results,
             occurrence_count=request.occurrence_count,
             kg_blast_radius=kg_context.blast_radius_workloads,
+            priors=priors,
         )
+        # Optional self-check: refute the top cause, apply its calibrated confidence
+        # to the top candidate, and keep the caveat text for the report.
+        self_check_caveat = ""
+        self_check_refuted = False
+        self_check_next = ""
+        try:
+            from app.services.self_check import refute_top_cause
+        except ImportError:
+            pass
+        else:
+            if root_cause_candidates:
+                check = await refute_top_cause(
+                    self._settings, root_cause_candidates[0], results
+                )
+                if isinstance(check, dict):
+                    calibrated = check.get("confidence")
+                    if calibrated in ("low", "medium", "high"):
+                        root_cause_candidates[0].confidence = calibrated
+                    self_check_caveat = str(check.get("caveat") or "").strip()
+                    self_check_refuted = bool(check.get("refuted"))
+                    self_check_next = str(check.get("next_check") or "").strip()
+        # RE-ANALYSIS ON REFUTATION (LLM-gated): when the self-check refuted the top
+        # cause, do EXACTLY ONE bounded re-analysis pass leading with the next-best
+        # hypothesis. Hard guard: this block runs once and never re-enters analyze().
+        reanalysis_note = ""
+        if (
+            self_check_refuted
+            and root_cause_candidates
+            and llm_configured(self._settings)
+            and self._settings.enable_investigation_loop
+        ):
+            outcome = await self._reanalyze_once(
+                target=target,
+                plan=plan,
+                kg_context=kg_context,
+                results=results,
+                request=request,
+                priors=priors,
+                refuted_family=root_cause_candidates[0].family,
+                prior_candidates=root_cause_candidates,
+            )
+            if outcome is not None:
+                (
+                    results,
+                    root_cause_candidates,
+                    self_check_caveat,
+                    reanalysis_note,
+                    self_check_refuted,
+                    self_check_next,
+                ) = outcome
+                # Re-derive the evidence aggregates from the merged results.
+                capabilities = {result.agent: result.status for result in results}
+                artifacts = [
+                    artifact for result in results for artifact in result.artifacts
+                ]
+                missing = sorted(
+                    {item for result in results for item in result.missing_data}
+                )
+                warnings = sorted(
+                    {item for result in results for item in result.warnings}
+                    | set(nat_warnings)
+                    | set(kg_context.warnings)
+                )
+        # Graph-derived remediation from the validated TypeDB reasoning functions,
+        # keyed to the ranked top family + any Xid codes / GPU model in the evidence.
+        # Best-effort: an empty result when TypeDB is off/unreachable.
+        top_family = (
+            root_cause_candidates[0].family if root_cause_candidates else ""
+        )
+        graph_fixes = await graph_remediation(
+            self._settings,
+            family=top_family if top_family != "insufficient_evidence" else "",
+            xid_codes=_xid_codes_from_results(results),
+            gpu_model=_gpu_model_from(target, results),
+        )
+        warnings = sorted(set(warnings) | set(graph_fixes.warnings))
+        # Optional change/timeline capability — added to the synthesis context.
+        timeline = None
+        try:
+            from app.services.timeline import build_timeline
+        except ImportError:
+            pass
+        else:
+            timeline = build_timeline(results)
         quality = _quality_from(results)
         summary = _summary_from(request, results, root_cause_candidates)
         failure_modes = load_failure_modes(self._settings.failure_modes_file)
@@ -196,7 +335,53 @@ class AnalysisOrchestrator:
             agent_souls,
             root_cause_candidates,
             kg_context.as_dict(),
+            plan,
+            graph_fixes,
+            language=getattr(self._settings, "language", "en"),
         )
+        # Korean LLM synthesis (preferred when language == "ko" and LLM configured):
+        # rewrite summary + detail grounded STRICTLY in the evidence just gathered.
+        # Falls back to the deterministic English report on any failure.
+        if not nat_text and getattr(self._settings, "language", "en") == "ko" \
+                and llm_configured(self._settings):
+            synth = await _synthesize_korean(
+                self._settings,
+                request=request,
+                results=results,
+                plan=plan,
+                root_cause_candidates=root_cause_candidates,
+                kg_context=kg_context.as_dict(),
+                graph_fixes=graph_fixes,
+                fallback_detail=detail,
+            )
+            if synth:
+                summary, detail = synth
+
+        # Self-check caveat (optional hook) + re-analysis note — inserted BEFORE the
+        # appendix so the document reads problem -> cause -> actions -> checks -> appendix.
+        self_check_lines = [text for text in (self_check_caveat, reanalysis_note) if text]
+        if self_check_lines:
+            detail = _insert_before_appendix(
+                detail, "## Self-Check\n\n" + "\n\n".join(self_check_lines)
+            )
+
+        # Operator questions: when the RCA could not settle (insufficient evidence,
+        # or still refuted after re-analysis), honestly ask for the missing inputs.
+        if top_family in ("", "insufficient_evidence") or self_check_refuted:
+            try:
+                questions = await _operator_questions(
+                    self._settings, missing, plan, target, self_check_next
+                )
+            except Exception:  # noqa: BLE001 - questions are best-effort
+                questions = []
+            if questions:
+                header = (
+                    "## 추가 확인 요청"
+                    if getattr(self._settings, "language", "en") == "ko"
+                    else "## Questions for the Operator"
+                )
+                body = "\n".join(f"- {question}" for question in questions)
+                detail = _insert_before_appendix(detail, f"{header}\n\n{body}")
 
         response = AlertAnalysisResponse(
             status="ok",
@@ -229,6 +414,8 @@ class AnalysisOrchestrator:
                     root_cause_candidates[0].as_dict() if root_cause_candidates else None
                 ),
                 "knowledge_base": kg_context.as_dict(),
+                "plan": plan.as_dict(),
+                **({"timeline": timeline} if timeline else {}),
             },
             artifacts=artifacts,
         )
@@ -312,6 +499,108 @@ class AnalysisOrchestrator:
         )
         return _mask_model(response, ChatResponse, self._masker)
 
+    async def _reanalyze_once(
+        self,
+        *,
+        target: AnalysisTarget,
+        plan: InvestigationPlan,
+        kg_context: object,
+        results: list[CollectorResult],
+        request: AlertAnalysisRequest,
+        priors: dict[str, float] | None,
+        refuted_family: str,
+        prior_candidates: list[RankedCause],
+    ) -> tuple[list[CollectorResult], list[RankedCause], str, str, bool, str] | None:
+        """EXACTLY ONE bounded re-analysis pass after the self-check refuted the top cause.
+
+        Leads with the next-best hypothesis, re-runs a small investigation, merges the
+        fresh evidence by agent name, re-ranks, and refutes the new top ONCE. Returns
+        (results, candidates, caveat, note, refuted, next_check), or None on ANY
+        failure so the caller keeps the pre-re-analysis result. Never re-enters.
+        """
+        try:
+            from app.services.investigator import investigate
+            from app.services.self_check import refute_top_cause
+
+            kg_dict = kg_context.as_dict()  # type: ignore[attr-defined]
+            kg_blast = getattr(kg_context, "blast_radius_workloads", 0)
+            # Next-best hypothesis: candidates[1] when usable, else re-rank and take
+            # the best family that is neither the refuted one nor the fallback gate.
+            next_cause = None
+            pool = list(prior_candidates[1:]) or rank_root_cause_candidates(
+                target,
+                results,
+                occurrence_count=request.occurrence_count,
+                top_n=5,
+                kg_blast_radius=kg_blast,
+                priors=priors,
+            )
+            for candidate in pool:
+                if candidate.family not in (refuted_family, "insufficient_evidence"):
+                    next_cause = candidate
+                    break
+            if next_cause is None:
+                return None
+
+            lead = {
+                "family": next_cause.family,
+                "reason": "re-analysis after the first conclusion was refuted",
+            }
+            rest = [
+                h
+                for h in (plan.hypotheses or [])
+                if isinstance(h, dict) and h.get("family") != next_cause.family
+            ]
+            replan = replace(plan, hypotheses=[lead, *rest])
+            fresh = await investigate(
+                self._settings,
+                target,
+                self._collectors,
+                replan,
+                kg_dict,
+                min(2, self._settings.max_investigation_steps),
+            )
+            merged = {result.agent: result for result in results}
+            for result in fresh:
+                merged[result.agent] = result
+            merged_results = list(merged.values())
+
+            candidates = rank_root_cause_candidates(
+                target,
+                merged_results,
+                occurrence_count=request.occurrence_count,
+                kg_blast_radius=kg_blast,
+                priors=priors,
+            )
+            caveat = ""
+            refuted = False
+            next_check = ""
+            if candidates:
+                check = await refute_top_cause(
+                    self._settings, candidates[0], merged_results
+                )
+                if isinstance(check, dict):
+                    calibrated = check.get("confidence")
+                    if calibrated in ("low", "medium", "high"):
+                        candidates[0].confidence = calibrated
+                    caveat = str(check.get("caveat") or "").strip()
+                    refuted = bool(check.get("refuted"))
+                    next_check = str(check.get("next_check") or "").strip()
+            new_family = candidates[0].family if candidates else "insufficient_evidence"
+            if getattr(self._settings, "language", "en") == "ko":
+                note = (
+                    f"1차 결론({refuted_family})이 반증되어 재분석을 수행했습니다 → "
+                    f"재분석 결론: {new_family}"
+                )
+            else:
+                note = (
+                    f"The initial conclusion ({refuted_family}) was refuted, so one "
+                    f"re-analysis pass was performed → revised conclusion: {new_family}."
+                )
+            return merged_results, candidates, caveat, note, refuted, next_check
+        except Exception:  # noqa: BLE001 - re-analysis is best-effort; keep 1st result
+            return None
+
     async def _llm_chat_answer(self, request: ChatRequest, grounding: str) -> str | None:
         question = (request.message or "").strip()
         if not question:
@@ -351,6 +640,122 @@ class AnalysisOrchestrator:
         return None
 
 
+async def _synthesize_korean(
+    settings: Settings,
+    *,
+    request: AlertAnalysisRequest,
+    results: list[CollectorResult],
+    plan: InvestigationPlan,
+    root_cause_candidates: list[RankedCause],
+    kg_context: dict,
+    graph_fixes: GraphRemediation,
+    fallback_detail: str,
+) -> tuple[str, str] | None:
+    """LLM synthesis of the RCA report in Korean, grounded STRICTLY in the evidence.
+
+    Returns (analysis_summary, analysis_detail) in Korean, or None on any failure so
+    the caller keeps the deterministic English report. Never raises into analyze().
+    """
+    from app.collectors.http_json import compact
+
+    evidence = {
+        "alert": {
+            "name": request.alert.labels.get("alertname"),
+            "labels": request.alert.labels,
+            "annotations": request.alert.annotations,
+        },
+        "plan": plan.as_dict(),
+        "ranked_root_cause_candidates": [c.as_dict() for c in root_cause_candidates],
+        "collector_findings": [
+            {
+                "agent": r.agent,
+                "status": r.status,
+                "confidence": r.confidence,
+                "summary": r.summary,
+            }
+            for r in results
+        ],
+        "knowledge_graph": {
+            "blast_radius_workloads": kg_context.get("blast_radius_workloads"),
+            "prior_incidents": kg_context.get("prior_incidents"),
+            "knowledge": kg_context.get("knowledge"),
+        },
+        "graph_remediation": graph_fixes.as_dict(),
+        "matched_alert": plan.matched_alert,
+        "similar_incidents": [
+            {
+                "incident_id": i.incident_id,
+                "similarity": i.similarity,
+                "analysis_summary": i.analysis_summary or i.title,
+            }
+            for i in request.similar_incidents
+            if (i.similarity or 0) >= _SIMILARITY_FLOOR
+        ],
+    }
+    system = (
+        "당신은 NVIDIA Run:ai GPU 플랫폼을 담당하는 시니어 SRE입니다. 제공된 증거(수집기별 "
+        "발견 사항, 조사 계획, 순위가 매겨진 원인 후보, 지식 그래프/함수 기반 조치, 매칭된 "
+        "내장 알림, 유사 인시던트)에만 근거하여 한국어로 장애 분석 보고서를 작성하세요.\n"
+        "규칙:\n"
+        "- 반드시 한국어로, 비전문가도 이해할 수 있게 작성합니다 (전문용어는 풀어서).\n"
+        "- 길게 쓰지 마세요. 아래 1~3 섹션 합쳐서 A4 한 페이지 이내가 목표입니다.\n"
+        "- 증거에 없는 사실을 절대 만들어내지 마세요.\n"
+        "- 특정 수집기가 아무것도 찾지 못했으면 '증거를 찾기 어렵습니다.'라고 명시하세요.\n"
+        "- 반드시 이 문서 구조를 따르세요 (Word 제출용이므로 헤딩/번호목록만 사용, 표·HTML 금지):\n"
+        "  # 장애 분석 보고서 — {알림명}\n"
+        "  발생/심각도/대상 메타 한 줄\n"
+        "  ## 1. 문제 (Problem) — 무엇이/어디서/언제부터/어떤 영향, 3~4문장.\n"
+        "  ## 2. 원인 (Root Cause) — 결론 한 문장 먼저, 그다음 뒷받침 근거 2~4개(수집기별 "
+        "핵심 발견: 관찰한 것과 시작 시점), XID 인과 사슬이 있으면 명시 "
+        "(예: 'XID 74(NVLink) → XID 45 앱 크래시 — 뿌리는 NVLink').\n"
+        "  ## 3. 권장 조치 (Recommended Actions) — 번호 목록, 즉시/후속/예방 순서, "
+        "구체적 명령·확인 포함, 중복 금지.\n"
+        "  ## 4. 부록 (Appendix) — 수집기별 증거 한 줄씩, 조사 계획 요약.\n"
+        '- 반드시 JSON 객체 하나로만 응답하세요: {"summary": <한국어 한 문장: 문제+원인 요약>, '
+        '"detail": <위 구조의 한국어 마크다운 본문>}'
+    )
+    user = "증거(JSON):\n" + json.dumps(
+        compact(evidence, limit=8), ensure_ascii=False, default=str
+    )
+    try:
+        data = await _complete_synthesis_json(settings, system=system, user=user)
+    except Exception:  # noqa: BLE001 - synthesis is best-effort; keep deterministic report
+        return None
+    if not data:
+        return None
+    summary = data.get("summary")
+    detail = data.get("detail")
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    if not isinstance(detail, str) or not detail.strip():
+        detail = fallback_detail
+    return _short_sentence(summary, limit=280), detail.strip()
+
+
+async def _complete_synthesis_json(
+    settings: Settings, *, system: str, user: str
+) -> dict | None:
+    text = await complete(
+        settings,
+        system=system + "\n\nJSON 객체 하나로만, 프롬프트나 코드펜스 없이 응답하세요.",
+        user=user,
+        temperature=0.2,
+    )
+    if not text:
+        return None
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[-1] if "\n" in cleaned else cleaned
+        cleaned = cleaned.removeprefix("json").strip()
+        if cleaned.endswith("```"):
+            cleaned = cleaned[: cleaned.rfind("```")].strip()
+    try:
+        parsed = json.loads(cleaned)
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _quality_from(results: list[CollectorResult]) -> str:
     counts = Counter(result.status for result in results)
     if counts["ok"] >= 3:
@@ -360,9 +765,11 @@ def _quality_from(results: list[CollectorResult]) -> str:
     return "low"
 
 
-async def _collect_safely(collector: object, target: object) -> CollectorResult:
+async def _collect_safely(
+    collector: object, target: object, plan: object = None
+) -> CollectorResult:
     try:
-        return await collector.collect(target)  # type: ignore[attr-defined]
+        return await collector.collect(target, plan)  # type: ignore[attr-defined]
     except Exception as exc:
         agent = _collector_name(collector)
         return CollectorResult(
@@ -429,6 +836,37 @@ def _summary_from(
     )
 
 
+# Section headings for the report document (Word-export-clean markdown).
+_HEADINGS = {
+    "en": {
+        "title": "# Incident Analysis Report",
+        "problem": "## 1. Problem",
+        "cause": "## 2. Root Cause",
+        "actions": "## 3. Recommended Actions",
+        "appendix": "## 4. Appendix",
+        "fired": "Fired",
+        "severity": "Severity",
+        "target": "Target",
+        "what": "What",
+        "where": "Where",
+        "impact": "Impact",
+    },
+    "ko": {
+        "title": "# 장애 분석 보고서",
+        "problem": "## 1. 문제 (Problem)",
+        "cause": "## 2. 원인 (Root Cause)",
+        "actions": "## 3. 권장 조치 (Recommended Actions)",
+        "appendix": "## 4. 부록 (Appendix)",
+        "fired": "발생",
+        "severity": "심각도",
+        "target": "대상",
+        "what": "증상",
+        "where": "위치",
+        "impact": "영향",
+    },
+}
+
+
 def _detail_from(
     request: AlertAnalysisRequest,
     results: list[CollectorResult],
@@ -438,66 +876,95 @@ def _detail_from(
     agent_souls: str = "",
     root_cause_candidates: list[RankedCause] | None = None,
     kg_context: dict | None = None,
+    plan: InvestigationPlan | None = None,
+    graph_fixes: GraphRemediation | None = None,
+    language: str = "en",
 ) -> str:
+    """Problem -> Root Cause -> Recommended Actions, then everything else in an
+    appendix. Sections 1-3 are the ~1-page report an operator (or a Word export)
+    actually reads; the appendix keeps the full evidence trail."""
+    h = _HEADINGS.get(language, _HEADINGS["en"])
     labels = request.alert.labels
     annotations = request.alert.annotations
-    root_cause = _ranked_root_cause_statement(root_cause_candidates or [], request)
-    lines = [
-        "## Root Cause",
-        "",
-        root_cause,
-        "",
-        "The agent checked the configured Run:ai, Kubernetes, Prometheus, Loki, "
-        "and Postgres collectors for this RCA. Confirmed evidence and missing "
-        "collector data are listed below.",
-    ]
-    lines.extend(_affected_pods_lines(request))
-    lines.extend(
-        [
-            "",
-            "## Evidence",
-            "",
-        ]
+    alert_name = labels.get("alertname") or request.alert.labels.get("alert_name") or "alert"
+    target = resolve_target(labels, annotations)
+
+    # --- header -------------------------------------------------------------
+    meta = [f"{h['severity']}: {target.severity}"]
+    if request.alert.startsAt:
+        meta.insert(0, f"{h['fired']}: {request.alert.startsAt}")
+    where = " / ".join(
+        part for part in (target.namespace, target.workload_name or target.pod, target.node)
+        if part
     )
+    if where:
+        meta.append(f"{h['target']}: {where}")
+    lines = [f"{h['title']} — {alert_name}", "", " · ".join(meta), ""]
+
+    # --- 1. Problem -----------------------------------------------------------
+    lines.extend([h["problem"], ""])
+    lines.append(f"- {h['what']}: {_root_cause_statement(request)}")
+    if where:
+        lines.append(f"- {h['where']}: {where}")
+    if request.occurrence_count > 1:
+        impact = (
+            f"같은 워크로드에서 {request.occurrence_count}회 반복 발생"
+            if language == "ko"
+            else f"recurred {request.occurrence_count} times on the same workload"
+        )
+        lines.append(f"- {h['impact']}: {impact}")
+
+    # --- 2. Root Cause --------------------------------------------------------
+    lines.extend(["", h["cause"], ""])
+    lines.append(_ranked_root_cause_statement(root_cause_candidates or [], request))
+    supporting = _supporting_evidence(results)
+    if supporting:
+        lines.append("")
+        lines.extend(f"- **{agent}**: {finding}" for agent, finding in supporting)
+    causal = _causal_chain_line(graph_fixes, language)
+    if causal:
+        lines.extend(["", causal])
+
+    # --- 3. Recommended Actions ------------------------------------------------
+    lines.extend(["", h["actions"], ""])
+    numbered = _numbered_actions(
+        plan,
+        graph_fixes,
+        root_cause_candidates,
+        _observed_text(results),
+        failure_modes or {},
+        missing,
+        request,
+    )
+    if numbered:
+        lines.extend(numbered)
+    else:
+        # Never a dangling empty section — say honestly why there are no actions.
+        lines.append(
+            "증거가 부족하여 구체적인 조치를 제시하기 어렵습니다. "
+            "아래 확인 요청을 먼저 진행해 주세요."
+            if language == "ko"
+            else "Not enough evidence for concrete actions yet — please address the "
+            "questions below first."
+        )
+
+    # --- 4. Appendix (full evidence trail; children demoted to ###) -----------
+    lines.extend(["", h["appendix"], "", "### Evidence", ""])
     for result in results:
-        lines.append(f"- **{result.agent}**: {result.summary}")
-    highlight_lines = _evidence_highlight_lines(results)
-    if highlight_lines:
-        lines.extend(["", "## Evidence Highlights", "", *highlight_lines])
+        lines.append(f"- **{result.agent}**: {_best_evidence_line(result)}")
+    lines.extend(_investigation_plan_lines(plan))
     lines.extend(
         _knowledge_base_lines(kg_context, root_cause_candidates, _observed_text(results))
     )
     operator_prompt = annotations.get("operator_prompt")
     if operator_prompt:
-        lines.extend(
-            [
-                "",
-                "## Operator Guidance",
-                "",
-                operator_prompt,
-            ]
-        )
-    lines.extend(
-        [
-            "",
-            "## Agent Role Coverage",
-            "",
-        ]
-    )
+        lines.extend(["", "### Operator Guidance", "", operator_prompt])
+    lines.extend(["", "### Agent Role Coverage", ""])
     lines.extend(agent_role_coverage_lines())
     if not agent_souls:
         lines.append("- Agent role contract file was not loaded; fallback guidance was used.")
-    lines.extend(
-        [
-            "",
-            "## Recommended Actions",
-            "",
-            *_recommended_action_lines(missing),
-            "",
-            "## Troubleshooting Playbook",
-            "",
-        ]
-    )
+    lines.extend(_affected_pods_lines(request))
+    lines.extend(["", "### Troubleshooting Playbook", ""])
     lines.extend(
         _playbook_lines(
             root_cause_candidates,
@@ -511,7 +978,7 @@ def _detail_from(
     lines.extend(
         [
             "",
-            "## Alert Labels",
+            "### Alert Labels",
             "",
             "```json",
             json.dumps(labels, indent=2, sort_keys=True),
@@ -519,6 +986,85 @@ def _detail_from(
         ]
     )
     return "\n".join(lines)
+
+
+def _insert_before_appendix(detail: str, block: str) -> str:
+    """Insert a section before the appendix so it reads as part of the report body.
+
+    Falls back to appending at the end when no appendix heading exists (e.g. an
+    LLM-synthesized or NAT-produced detail with a different shape).
+    """
+    for heading in ("\n## 4. 부록", "\n## 4. Appendix"):
+        idx = detail.find(heading)
+        if idx >= 0:
+            return f"{detail[:idx]}\n{block}\n{detail[idx:]}"
+    return f"{detail}\n\n{block}"
+
+
+def _supporting_evidence(results: list[CollectorResult]) -> list[tuple[str, str]]:
+    """Up to 4 (agent, finding) pairs with a REAL finding — no no-evidence lines."""
+    picked: list[tuple[str, str]] = []
+    for result in results:
+        if result.status not in ("ok", "partial"):
+            continue
+        if (result.summary or "").startswith(NO_EVIDENCE):
+            continue
+        line = _best_evidence_line(result)
+        if line.startswith(NO_EVIDENCE):
+            continue
+        picked.append((result.agent, line))
+        if len(picked) >= 4:
+            break
+    return picked
+
+
+def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> str:
+    """One line naming the XID causal picture when the graph produced one."""
+    if graph_fixes is None or not graph_fixes.xid_fixes:
+        return ""
+    codes = ", ".join(str(code) for code in sorted(graph_fixes.xid_fixes))
+    if language == "ko":
+        return f"- 관련 GPU 오류(XID): {codes} — 세부 조치는 아래 권장 조치를 참고."
+    return f"- Related GPU errors (XID): {codes} — see the recommended actions below."
+
+
+def _numbered_actions(
+    plan: InvestigationPlan | None,
+    graph_fixes: GraphRemediation | None,
+    candidates: list[RankedCause] | None,
+    observed_text: str,
+    failure_modes: dict[str, list[dict]],
+    missing: list[str],
+    request: AlertAnalysisRequest,
+) -> list[str]:
+    """One deduped, numbered priority list — documented-alert fixes first, then
+    graph-derived and curated family fixes, then infra-restore steps."""
+    ordered: list[str] = []
+    if plan is not None and plan.matched_alert:
+        ordered.extend(str(a) for a in plan.matched_alert.get("actions", []))
+    if graph_fixes is not None:
+        ordered.extend(graph_fixes.family_fixes)
+        for code in sorted(graph_fixes.xid_fixes):
+            ordered.extend(f"(XID {code}) {fix}" for fix in graph_fixes.xid_fixes[code])
+    top_family = candidates[0].family if candidates else ""
+    text = (observed_text or "").lower()
+    for symptom in failure_modes.get(top_family, []) or []:
+        if any(kw in text for kw in symptom.get("keywords", [])):
+            ordered.extend(str(a) for a in symptom.get("actions", []))
+    ordered.extend(
+        line.removeprefix("- ") for line in _recommended_action_lines(missing, request)
+    )
+    seen: set[str] = set()
+    numbered: list[str] = []
+    for action in ordered:
+        action = " ".join(action.split())
+        if not action or action in seen:
+            continue
+        seen.add(action)
+        numbered.append(f"{len(numbered) + 1}. {action}")
+        if len(numbered) >= 8:
+            break
+    return numbered
 
 
 def _root_cause_statement(request: AlertAnalysisRequest) -> str:
@@ -614,7 +1160,7 @@ def _knowledge_base_lines(
     body.extend(_kb_remediation_lines(kg_context, candidates, observed_text))
     if not body:
         body.append("- No related knowledge-graph facts were found for this entity yet.")
-    return ["", "## Knowledge Base (Ontology)", "", *body]
+    return ["", "### Knowledge Base (Ontology)", "", *body]
 
 
 def _kb_remediation_lines(
@@ -624,9 +1170,11 @@ def _kb_remediation_lines(
     if not candidates or not knowledge:
         return []
     top_family = candidates[0].family
+    if top_family == "insufficient_evidence":
+        return ["- No closely-matching prior knowledge for this evidence yet."]
     symptoms = knowledge.get(top_family) or []
     if not symptoms:
-        return []
+        return ["- No closely-matching prior knowledge for this evidence yet."]
     text = observed_text.lower()
     # Precise: the first symptom whose keyword appears in the observed evidence.
     for symptom in symptoms:
@@ -634,16 +1182,13 @@ def _kb_remediation_lines(
             actions = symptom.get("actions", [])
             if actions:
                 header = (
-                    f"- Known fixes for **{symptom.get('symptom')}** "
-                    f"({top_family}, from the knowledge base):"
+                    f"- Matched symptom **{symptom.get('symptom')}** "
+                    f"({_family_label(top_family)}); known fixes from the knowledge base:"
                 )
                 return [header, *[f"  - {a}" for a in actions[:5]]]
-    # Fallback: no specific symptom matched -> the family's actions.
-    fallback = sorted({a for symptom in symptoms for a in symptom.get("actions", [])})
-    if not fallback:
-        return []
-    header = f"- Known fixes for **{top_family}** (from the knowledge base):"
-    return [header, *[f"  - {a}" for a in fallback[:5]]]
+    # No symptom keyword matched the observed evidence: don't dump a generic family
+    # checklist as if it were a match — say so plainly.
+    return ["- No closely-matching prior knowledge for this evidence yet."]
 
 
 def _playbook_lines(
@@ -698,16 +1243,57 @@ def _short_sentence(value: str, *, limit: int) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
-def _evidence_highlight_lines(results: list[CollectorResult]) -> list[str]:
-    lines: list[str] = []
-    for result in results:
-        if result.agent == "kubernetes":
-            lines.extend(_kubernetes_highlights(result.details))
-        elif result.agent == "loki":
-            lines.extend(_loki_highlights(result.details))
-        elif result.agent == "runai":
-            lines.extend(_runai_highlights(result.details))
-    return lines[:8]
+def _investigation_plan_lines(plan: InvestigationPlan | None) -> list[str]:
+    if plan is None:
+        return []
+    matched = []
+    if plan.used_similarity:
+        matched.append("a similar past incident")
+    if plan.used_ontology:
+        matched.append("knowledge-graph facts")
+    matched_text = (
+        "matched " + " and ".join(matched)
+        if matched
+        else "nothing prior matched — reasoning from live evidence"
+    )
+    lines = [
+        "",
+        "### Investigation Plan",
+        "",
+        f"- Focus: {plan.focus}",
+        f"- Strategy: {plan.strategy} ({matched_text}).",
+    ]
+    if plan.check_control_plane:
+        lines.append("- Run:ai control plane is in scope for this alert.")
+    else:
+        lines.append("- Run:ai control plane was ruled out of scope for this alert.")
+    if plan.narrative:
+        lines.append(f"- Approach: {plan.narrative}")
+    alert = plan.matched_alert
+    if alert:
+        lines.append(
+            f"- Documented Run:ai alert **{alert.get('alert')}** "
+            f"({alert.get('severity', 'n/a')}) — {alert.get('trigger', '')}"
+        )
+        for step in alert.get("actions", [])[:5]:
+            lines.append(f"  - {step}")
+    return lines
+
+
+def _best_evidence_line(result: CollectorResult) -> str:
+    """The single most useful finding for this agent, not a status blurb."""
+    if result.agent == "kubernetes":
+        picked = _kubernetes_highlights(result.details)
+    elif result.agent == "loki":
+        picked = _loki_highlights(result.details)
+    elif result.agent == "runai":
+        picked = _runai_highlights(result.details)
+    else:
+        picked = []
+    if picked:
+        # highlight lines start with "- "; strip the marker for inline use.
+        return picked[0].lstrip("- ").strip()
+    return result.summary
 
 
 def _kubernetes_highlights(details: dict[str, object]) -> list[str]:
@@ -773,13 +1359,24 @@ def _runai_highlights(details: dict[str, object]) -> list[str]:
     return lines
 
 
-def _recommended_action_lines(missing: list[str]) -> list[str]:
-    lines = [
-        "- Treat the Kubernetes and Prometheus evidence above as the current "
-        "source of truth for this RCA.",
-        "- Apply the remediation implied by the confirmed scheduling, pod, node, "
-        "or metric evidence.",
-    ]
+_SIMILARITY_FLOOR = 0.80
+
+
+def _recommended_action_lines(
+    missing: list[str], request: AlertAnalysisRequest | None = None
+) -> list[str]:
+    # Concrete actions only — no generic "trust the evidence" filler.
+    lines: list[str] = []
+    # Weave the proven RCA/fix from a high-similarity past incident into the actions.
+    top = _top_similar_incident(request) if request else None
+    if top is not None:
+        proven = (top.analysis_summary or top.title or "").strip()
+        if proven:
+            lines.append(
+                f"- Similar past incident {top.incident_id} (similarity "
+                f"{top.similarity:.2f}) was resolved by: {proven} — verify this fix "
+                "applies here before repeating it."
+            )
     if "runai.auth" in missing or "runai.query" in missing:
         lines.append(
             "- Restore Run:ai API authentication so the agent can attach "
@@ -799,12 +1396,180 @@ def _recommended_action_lines(missing: list[str]) -> list[str]:
     return lines
 
 
+async def _operator_questions(
+    settings: Settings,
+    missing: list[str],
+    plan: InvestigationPlan | None,
+    target: AnalysisTarget,
+    next_check: str,
+) -> list[str]:
+    """2-4 concrete follow-up questions when the RCA could not settle.
+
+    Derived deterministically from missing_data + the plan; the LLM only sharpens
+    the wording when configured (deterministic list is the fallback).
+    """
+    ko = getattr(settings, "language", "en") == "ko"
+
+    def has(prefix: str) -> bool:
+        return any(item.startswith(prefix) for item in missing)
+
+    questions: list[str] = []
+    if next_check:
+        questions.append(next_check)
+    if has("loki."):
+        questions.append(
+            "Loki 주소(LOKI_URL)가 설정되어 있고 에이전트에서 접근 가능한지 확인해 주세요."
+            if ko
+            else "Is the Loki URL configured and reachable from the agent?"
+        )
+    if has("runai."):
+        questions.append(
+            "Run:ai API 인증 정보(토큰 또는 클라이언트 ID/시크릿)가 유효한지 확인해 주세요."
+            if ko
+            else "Are the Run:ai API credentials (token or client id/secret) still valid?"
+        )
+    if has("prometheus."):
+        questions.append(
+            "Prometheus 주소(PROMETHEUS_URL)가 설정되어 있는지 확인해 주세요."
+            if ko
+            else "Is the Prometheus URL configured for the agent?"
+        )
+    if has("postgres."):
+        questions.append(
+            "Postgres 연결 정보(DSN)가 설정되어 있는지 확인해 주세요."
+            if ko
+            else "Is the Postgres DSN configured so RCA memory can be consulted?"
+        )
+    if has("kubernetes."):
+        questions.append(
+            "에이전트의 Kubernetes 서비스 계정 토큰이 유효한지 확인해 주세요."
+            if ko
+            else "Is the agent's Kubernetes service-account token valid?"
+        )
+    namespaces = list(plan.namespaces) if plan else []
+    if has("system_agent.") or not (target.namespace or namespaces):
+        questions.append(
+            "이 알림이 발생한 노드에 접근(시스템 에이전트 등)이 가능한지 확인해 주세요."
+            if ko
+            else "Is the node this alert fired on accessible (system agent or SSH)?"
+        )
+    if len(questions) < 2:
+        questions.append(
+            "알림 발생 시각 전후에 배포나 설정 변경이 있었는지 확인해 주세요."
+            if ko
+            else "Were there any deployments or config changes around the alert time?"
+        )
+    questions = questions[:4]
+
+    if llm_configured(settings):
+        try:
+            sharpened = await _sharpen_operator_questions(settings, questions, missing, plan)
+        except Exception:  # noqa: BLE001 - sharpening is best-effort
+            sharpened = None
+        if sharpened:
+            return sharpened
+    return questions
+
+
+async def _sharpen_operator_questions(
+    settings: Settings,
+    questions: list[str],
+    missing: list[str],
+    plan: InvestigationPlan | None,
+) -> list[str] | None:
+    """LLM-sharpened operator questions; None keeps the deterministic list."""
+    ko = getattr(settings, "language", "en") == "ko"
+    system = (
+        "You review operator-facing follow-up questions for an RCA that could not "
+        "settle on a root cause. Rewrite the draft questions to be sharper and more "
+        "specific to the missing data and investigation plan. Do not invent facts, "
+        "do not add generic filler. "
+        + ("반드시 한국어로 작성하세요. " if ko else "Write in English. ")
+        + 'Respond with ONLY JSON: {"questions": [str, ...]} containing 2 to 4 questions.'
+    )
+    user = json.dumps(
+        {
+            "draft_questions": questions,
+            "missing_data": missing,
+            "plan": plan.as_dict() if plan else {},
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+    data = await complete_json(settings, system=system, user=user, temperature=0.2)
+    if not isinstance(data, dict):
+        return None
+    raw = data.get("questions")
+    if not isinstance(raw, list):
+        return None
+    cleaned = [str(item).strip() for item in raw if str(item).strip()]
+    if 2 <= len(cleaned) <= 4:
+        return cleaned
+    return None
+
+
+# Xid codes appear as "Xid 79", "Xid: 79", or "NVRM: Xid (PCI:0000:3b:00): 79" —
+# skip the optional parenthesized PCI address before the code so we don't capture it.
+_XID_PATTERN = re.compile(
+    r"\bxid\s*(?:\([^)]*\))?\s*[:=]?\s*(\d{1,4})", re.IGNORECASE
+)
+
+
+def _xid_codes_from_results(results: list[CollectorResult]) -> list[int]:
+    """Distinct NVIDIA Xid codes found in loki/system/kubernetes evidence."""
+    codes: list[int] = []
+    for result in results:
+        if result.agent not in ("loki", "system", "kubernetes"):
+            continue
+        text = _stringify_result(result)
+        for match in _XID_PATTERN.finditer(text):
+            code = int(match.group(1))
+            if code not in codes:
+                codes.append(code)
+    return codes
+
+
+def _gpu_model_from(target: AnalysisTarget, results: list[CollectorResult]) -> str:
+    """GPU model, when a collector resolved one into its details (e.g. gpu_model)."""
+    for result in results:
+        for key in ("gpu_model", "gpu_type", "gpu_product"):
+            value = result.details.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _stringify_result(result: CollectorResult) -> str:
+    parts = [result.summary or ""]
+    if result.details:
+        try:
+            parts.append(json.dumps(result.details, default=str))
+        except (TypeError, ValueError):
+            parts.append(str(result.details))
+    return " ".join(parts)
+
+
+def _graph_remediation_lines(graph_fixes: GraphRemediation | None) -> list[str]:
+    if graph_fixes is None or graph_fixes.is_empty():
+        return []
+    lines = ["- Knowledge-graph derived remediation:"]
+    for statement in graph_fixes.family_fixes[:5]:
+        lines.append(f"  - {statement}")
+    for code, fixes in graph_fixes.xid_fixes.items():
+        lines.append(f"  - NVIDIA Xid {code}:")
+        lines.extend(f"    - {statement}" for statement in fixes[:5])
+    for model, xids in graph_fixes.model_xids.items():
+        rendered = ", ".join(str(x) for x in xids)
+        lines.append(f"  - Known Xid codes for {model}: {rendered}.")
+    return lines
+
+
 def _affected_pods_lines(request: AlertAnalysisRequest) -> list[str]:
     pods = [pod.strip() for pod in request.occurrence_pods if pod and pod.strip()]
     count = request.occurrence_count
     if not pods and count <= 1:
         return []
-    lines = ["", "## Affected Pods", ""]
+    lines = ["", "### Affected Pods", ""]
     if count > 1:
         lines.append(
             f"- This alert was grouped from {count} occurrence(s) of the same workload; "
@@ -821,11 +1586,29 @@ def _affected_pods_lines(request: AlertAnalysisRequest) -> list[str]:
     return lines
 
 
+def _top_similar_incident(request: AlertAnalysisRequest):
+    """Highest-similarity incident at/above the 0.80 trust floor, else None."""
+    qualified = [
+        item
+        for item in request.similar_incidents
+        if (item.similarity or 0) >= _SIMILARITY_FLOOR
+    ]
+    if not qualified:
+        return None
+    return max(qualified, key=lambda item: item.similarity or 0)
+
+
 def _similar_incident_lines(request: AlertAnalysisRequest) -> list[str]:
-    lines = ["", "## Similar Incidents", ""]
-    if not request.similar_incidents:
-        return [*lines, "- No similar incident memory was provided."]
-    for item in request.similar_incidents[:3]:
+    lines = ["", "### Similar Incidents", ""]
+    # Only surface vector hits we actually trust; a 0.70 "match" is noise.
+    qualified = sorted(
+        (i for i in request.similar_incidents if (i.similarity or 0) >= _SIMILARITY_FLOOR),
+        key=lambda i: i.similarity or 0,
+        reverse=True,
+    )
+    if not qualified:
+        return [*lines, "- No similar past incident found."]
+    for item in qualified[:3]:
         feedback = (
             f"{item.positive_feedback} up / {item.negative_feedback} down / "
             f"{item.comment_count} comments"
@@ -838,7 +1621,7 @@ def _similar_incident_lines(request: AlertAnalysisRequest) -> list[str]:
 
 
 def _feedback_hint_lines(request: AlertAnalysisRequest) -> list[str]:
-    lines = ["", "## Feedback Learning Hints", ""]
+    lines = ["", "### Feedback Learning Hints", ""]
     if not request.feedback_hints:
         return [*lines, "- No operator feedback hints were provided."]
     for hint in request.feedback_hints[:5]:

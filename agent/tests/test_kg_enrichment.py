@@ -72,14 +72,16 @@ def test_kb_matches_symptom_keyword_for_precise_fix() -> None:
     text = "\n".join(
         _knowledge_base_lines(kg, candidates, "node condition DiskPressure=True; pods evicted")
     )
-    assert "Known fixes for **Node Disk Pressure**" in text
+    assert "Matched symptom **Node Disk Pressure**" in text
     assert "Cordon or drain the node" in text
     assert "memory hog" not in text  # the non-matching symptom's action is not shown
 
 
-def test_kb_falls_back_to_family_when_no_symptom_matches() -> None:
+def test_kb_says_no_match_when_no_symptom_keyword_matches() -> None:
+    # Report fix #5: when no symptom keyword matches the observed evidence, do NOT
+    # dump a generic family checklist as if it were a real match — say so plainly.
     kg = KGContext(enabled=True, available=True, knowledge=_KNOWLEDGE).as_dict()
     candidates = [RankedCause(family="node_kubelet_pressure", confidence="medium", score=3.0)]
     text = "\n".join(_knowledge_base_lines(kg, candidates, "some unrelated evidence text"))
-    assert "Known fixes for **node_kubelet_pressure**" in text
-    assert "Cordon or drain the node" in text  # union fallback still surfaces actions
+    assert "No closely-matching prior knowledge" in text
+    assert "Cordon or drain the node" not in text

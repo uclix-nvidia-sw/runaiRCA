@@ -1,0 +1,968 @@
+# NVIDIA XID GPU-error catalog — generated from the Xid-Catalog xlsx (one-time parse).
+# Data file consumed by ontology/load_xids.py and app RCA. 'Unused' XIDs are dropped.
+# severity is derived from the immediate-action bucket:
+#   RESET_GPU/RESTART_BM/RESTART_VM/CONTACT_SUPPORT/XID_154/WORKFLOW_* => fatal, else non-fatal.
+# Degenerate self-referential resolution rows (class == action text) are dropped.
+# leads_to: XID codes this fault escalates to (causal edges), parsed from the
+#   sheet1 "Xid 154 linkage" column (non-empty => escalates to XID 154) and the
+#   sheet2 "Xid 144-150 Decode" Local/Remote causal text ("Will lead to Xid 48",
+#   "AppCrash (Xid 45)", ...). Deduped; self-references dropped.
+# linkage_note: raw "Xid 154 linkage" cell text (driver version the linkage landed in).
+
+xids:
+  - code: 8
+    mnemonic: "ROBUST_CHANNEL_FIFO_ERROR_IDLE_TIMEOUT"
+    description: "GPU stopped processing"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 11
+    mnemonic: "ROBUST_CHANNEL_GR_ERROR_MISSING_HW"
+    description: "Invalid or corrupted push buffer stream"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CHECK_APP/CUDA"
+    trigger: ""
+  - code: 13
+    mnemonic: "ROBUST_CHANNEL_GR_EXCEPTION / ROBUST_CHANNEL_GR_ERROR_SW_NOTIFY"
+    description: "Graphics Engine Exception"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "WORKFLOW_XID_13"
+    trigger: "This event is logged for general user application faults. Typically this is an out-of-bounds error where the user has walked past the end of an array, but could also be an illegal instruction, illegal register, or other case. In rare cases, it’s possible for a hardware failure or system software bugs to materialize as XID 13. When this event is logged, NVIDIA recommends the following: 1. Run the application in cuda-gdb or the Compute Sanitizer memcheck tool , or 2. Run the application with CUDA_DEVICE_WAITS_ON_EXCEPTION=1 and then attach later with cuda-gdb, or 3. File a bug if the previous two come back inconclusive to eliminate potential NVIDIA driver or hardware bug. NOTE: The Compute Sanitizer memcheck tool instruments the running application and reports which line of code performed the illegal read."
+  - code: 25
+    mnemonic: "ROBUST_CHANNEL_GR_ILLEGAL_NOTIFY"
+    description: "Invalid or illegal push buffer stream"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CHECK_APP/CUDA"
+    trigger: ""
+  - code: 31
+    mnemonic: "ROBUST_CHANNEL_FIFO_ERROR_MMU_ERR_FLT"
+    description: "GPU memory page fault"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "WORKFLOW_XID_31"
+    trigger: "This event is logged when a fault is reported by the MMU, such as when an illegal address access is made by an applicable unit on the chip. Typically these are application-level bugs, but can also be driver bugs or hardware bugs. When this event is logged, NVIDIA recommends the following: 1. Run the application in cuda-gdb or the Compute Sanitizer memcheck tool, or 2. Run the application with CUDA_DEVICE_WAITS_ON_EXCEPTION=1 and then attach later with cuda-gdb, or 3. File a bug if the previous two come back inconclusive to eliminate potential NVIDIA driver or hardware bug. NOTE: The Compute Sanitizer memcheck tool instruments the running application and reports which line of code performed the illegal read."
+  - code: 32
+    mnemonic: "ROBUST_CHANNEL_PBDMA_ERROR"
+    description: "Invalid or corrupted push buffer stream"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CHECK_APP/CUDA"
+    trigger: "This event is logged when a fault is reported by the DMA controller which manages the communication stream between the NVIDIA driver and the GPU over the PCI-E bus. These failures primarily involve quality issues on PCI, and are generally not caused by user application actions."
+  - code: 37
+    mnemonic: "ROBUST_CHANNEL_FECS_ERR_UNIMP_FIRMWARE_METHOD"
+    description: "Driver firmware error"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "IGNORE"
+    investigatory_action: "CHECK_APP/CUDA"
+    trigger: ""
+  - code: 38
+    mnemonic: "ROBUST_CHANNEL_FECS_ERR_WATCHDOG_TIMEOUT"
+    description: "Driver firmware error"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "IGNORE"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 39
+    mnemonic: "ROBUST_CHANNEL_CE0_ERROR"
+    description: "Copy Engine Exception"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 40
+    mnemonic: "ROBUST_CHANNEL_CE1_ERROR"
+    description: "Copy Engine Exception"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 41
+    mnemonic: "ROBUST_CHANNEL_CE2_ERROR"
+    description: "Copy Engine Exception"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 43
+    mnemonic: "ROBUST_CHANNEL_RESETCHANNEL_VERIF_ERROR"
+    description: "GPU stopped processing"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "IGNORE"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: "This event is logged when a user application hits a software induced fault and must terminate. The GPU remains in a healthy state. In most cases, this is not indicative of a driver bug but rather a user application error."
+  - code: 44
+    mnemonic: "ROBUST_CHANNEL_GR_FAULT_DURING_CTXSW"
+    description: "Graphics Engine fault during context switch"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "IGNORE"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 45
+    mnemonic: "ROBUST_CHANNEL_PREEMPTIVE_REMOVAL"
+    description: "Preemptive cleanup, due to previous errors -- Most likely to see when running multiple cuda applications and hitting a DBE"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "WORKFLOW_XID_45"
+    investigatory_action: "Solo: RESTART_FM Not Solo: IGNORE (follow other Xid)"
+    trigger: "This event is logged when the user application aborts and the kernel driver tears down the GPU application running on the GPU. Control-C, GPU resets, sigkill are all examples where the application is aborted and this event is created. In many cases, this is not indicative of a bug but rather a user or system action."
+  - code: 46
+    mnemonic: "ROBUST_CHANNEL_GPU_TIMEOUT_ERROR"
+    description: "GPU stopped processing"
+    severity: "fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESET_GPU"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 48
+    mnemonic: "ROBUST_CHANNEL_GPU_ECC_DBE"
+    description: "Double Bit ECC Error"
+    severity: "fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "WORKFLOW_XID_48"
+    investigatory_action: "WORKFLOW_XID_48"
+    trigger: "This event is logged when the GPU detects that an uncorrectable error occurs on the GPU. This is also reported back to the user application. A GPU reset or node reboot is needed to clear this error. The tool nvidia-smi can provide a summary of ECC errors. If the ECC error is reported for SRAM (excludes \"framebuffer\"), check for SRAM DBE thresholds and follow RMA flow if exceeded - (nvidia-smi <sram_threshold_exceeded> or NSM Msg Type 0x3, Cmd Code 0x7D, bit 0). If flag is set, run field diag."
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 54
+    mnemonic: "SILENT_RUNNING_PWR_REDUCED_CLOCKING"
+    description: "Auxiliary power is not connected to the GPU board"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100]
+    immediate_action: "CHECK_MECHANICALS"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 60
+    mnemonic: "ROBUST_CHANNEL_SEC2_ERROR"
+    description: "Video processor exception"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "INVESTIGATE_SW"
+    trigger: ""
+  - code: 62
+    mnemonic: "PMU_HALT_ERROR"
+    description: "Internal micro-controller halt (newer drivers)"
+    severity: "fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESET_GPU"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 63
+    mnemonic: "INFOROM_DRAM_RETIREMENT_EVENT"
+    description: "GPU memory remapping event"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "IGNORE"
+    investigatory_action: "IGNORE"
+    trigger: "These events are logged when the GPU handles ECC memory errors on the GPU. On GPUs that support row remapping, starting with NVIDIA® Ampere archtecture GPUs, these events provide details on row remapper activity. For more information row remapper Xids, refer to https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/index.html#row-remapping. On earlier GPUs that support dynamic page retirement, these events provide details on dynamic page retirement activity. For more information on dynamic page retirement Xids, refer to https://docs.nvidia.com/deploy/dynamic-page-retirement/index.html."
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 64
+    mnemonic: "INFOROM_DRAM_RETIREMENT_FAILURE"
+    description: "GPU memory remapping failure"
+    severity: "fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESET_GPU"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: "These events are logged when the GPU handles ECC memory errors on the GPU. On GPUs that support row remapping, starting with NVIDIA® Ampere archtecture GPUs, these events provide details on row remapper activity. For more information row remapper Xids, refer to https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/index.html#row-remapping. On earlier GPUs that support dynamic page retirement, these events provide details on dynamic page retirement activity. For more information on dynamic page retirement Xids, refer to https://docs.nvidia.com/deploy/dynamic-page-retirement/index.html."
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 66
+    mnemonic: "ROBUST_CHANNEL_FECS_ERR_REG_ACCESS_VIOLATION"
+    description: "Illegal access by driver"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "IGNORE"
+    investigatory_action: "INVESTIGATE_SW"
+    trigger: ""
+  - code: 67
+    mnemonic: "ROBUST_CHANNEL_FECS_ERR_VERIF_VIOLATION"
+    description: "Illegal access by driver"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "IGNORE"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 68
+    mnemonic: "ROBUST_CHANNEL_NVDEC0_ERROR"
+    description: "NVDEC0 Exception"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 69
+    mnemonic: "ROBUST_CHANNEL_GR_CLASS_ERROR"
+    description: "Graphics Engine class error"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CHECK_APP/CUDA"
+    trigger: ""
+  - code: 70
+    mnemonic: "ROBUST_CHANNEL_CE3_ERROR"
+    description: "CE3: Unknown Error"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 71
+    mnemonic: "ROBUST_CHANNEL_CE4_ERROR"
+    description: "CE4: Unknown Error"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 72
+    mnemonic: "ROBUST_CHANNEL_CE5_ERROR"
+    description: "CE5: Unknown Error"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 74
+    mnemonic: "NVLINK_ERROR"
+    description: "NVLINK Error"
+    severity: "fatal"
+    gpu_models: [A100, H100]
+    immediate_action: "WORKFLOW_NVLINK_ERR"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: "This event is logged when the GPU detects that a problem with a connection from the GPU to another GPU or NVSwitch over NVLink. A GPU reset or node reboot is needed to clear this error. This event may indicate a hardware failure with the link itself, or may indicate a problem with the device at the remote end of the link. For example, if a GPU fails, another GPU connected to it over NVLink may report an Xid 74 simply because the link went down as a result. The nvidia-smi nvlink command can provide additional details on NVLink errors, and connection information on the links. If this error is seen repeatedly and GPU reset or node reboot fails to clear the condition, contact your hardware vendor for support."
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 75
+    mnemonic: "ROBUST_CHANNEL_CE6_ERROR"
+    description: "CE6: Unknown Error"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 76
+    mnemonic: "ROBUST_CHANNEL_CE7_ERROR"
+    description: "CE7: Unknown Error"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 77
+    mnemonic: "ROBUST_CHANNEL_CE8_ERROR"
+    description: "CE8: Unknown Error"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 78
+    mnemonic: "VGPU_START_ERROR"
+    description: "vGPU Start Error"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "UPDATE_SWFW"
+    investigatory_action: "UPDATE_SWFW"
+    trigger: ""
+  - code: 79
+    mnemonic: "ROBUST_CHANNEL_GPU_HAS_FALLEN_OFF_THE_BUS"
+    description: "GPU has fallen off the bus"
+    severity: "fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_BM"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: "This event is logged when the GPU driver attempts to access the GPU over its PCI Express connection and finds that the GPU is not accessible. This event is often caused by hardware failures on the PCI Express link causing the GPU to be inaccessible due to the link being brought down. Reviewing system event logs and kernel PCI event logs may provide additional indications of the source of the link failures. This event may also be cause by failing GPU hardware or other driver issues."
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 80
+    mnemonic: "PBDMA_PUSHBUFFER_CRC_MISMATCH"
+    description: "Corrupted data sent to GPU"
+    severity: "non-fatal"
+    gpu_models: [A100, H100]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CHECK_APP/CUDA"
+    trigger: ""
+  - code: 82
+    mnemonic: "ROBUST_CHANNEL_NVJPG0_ERROR"
+    description: "NVJPG0 Error"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 83
+    mnemonic: "ROBUST_CHANNEL_NVDEC1_ERROR"
+    description: "NVDEC1 Error"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 84
+    mnemonic: "ROBUST_CHANNEL_NVDEC2_ERROR"
+    description: "NVDEC2 Error"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 85
+    mnemonic: "ROBUST_CHANNEL_CE9_ERROR"
+    description: "CE9: Unknown Error"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 86
+    mnemonic: "ROBUST_CHANNEL_OFA0_ERROR"
+    description: "OFA Exception"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 88
+    mnemonic: "ROBUST_CHANNEL_NVDEC3_ERROR"
+    description: "NVDEC3 Error"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 89
+    mnemonic: "ROBUST_CHANNEL_NVDEC4_ERROR"
+    description: "NVDEC4 Error"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 92
+    mnemonic: "EXCESSIVE_SBE_INTERRUPTS"
+    description: "High single-bit ECC error rate"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "IGNORE"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 93
+    mnemonic: "INFOROM_ERASE_LIMIT_EXCEEDED"
+    description: "Non-fatal violation of provisioned InfoROM wear limit"
+    severity: "non-fatal"
+    gpu_models: [A100]
+    immediate_action: "IGNORE"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: "This event is logged when the GPU driver fails to update the InfoROM due to violation of the provisioned InfoROM wear limit that was set for the GPU using NVFlash using nvflash --=elsessionstart. In most cases this is not indicative of a driver or flash failure, but rather the intentional use of the InfoROM wear protection feature as set by NVFlash. Recovery steps: The GPU can be recovered from Xid 93 by clearing InfoROM erase limit using ./nvflash –-elsessionclear. If clearing the limit using nvflash doesn’t help, report the issue to NVIDIA."
+  - code: 94
+    mnemonic: "ROBUST_CHANNEL_CONTAINED_ERROR"
+    description: "Contained memory error"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "IGNORE (sympathetic)"
+    trigger: "These events (94/95) are logged when GPU drivers handle errors in GPUs that support error containment, starting with NVIDIA A100 GPUs. For Xid 94, these errors are contained to one application, and the application that encountered this error must be restarted. All other applications running at the time of the Xid are unaffected. It is recommended to reset the GPU when convenient. Applications can continue to be run until the reset can be performed. One possible cause of containment errors is the handling of ECC memory errors. Review the NVIDIA GPU Memory Error Management manual: https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/index.html#row-remapping for coverage of ECC-triggered containment errors. Xid 45 will be seen in relation to this error."
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 95
+    mnemonic: "ROBUST_CHANNEL_UNCONTAINED_ERROR"
+    description: "Uncontained memory error"
+    severity: "fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESET_GPU"
+    investigatory_action: "IGNORE (sympathetic)"
+    trigger: "These events (94/95) are logged when GPU drivers handle errors in GPUs that support error containment, starting with NVIDIA® A100 GPUs. For Xid 95, these errors affect multiple applications, and the affected GPU must be reset before applications can restart. Refer https://docs.nvidia.com/deploy/gpu-debug-guidelines/index.html for GPU Reset capabilities & limitations One possible cause of containment errors is the handling of ECC memory errors. Review the NVIDIA GPU Memory Error Management manual: https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/index.html#row-remapping for coverage of ECC-triggered containment errors. Xid 45 will be seen in relation to this error."
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 96
+    mnemonic: "ROBUST_CHANNEL_NVDEC5_ERROR"
+    description: "NVDEC5 Error"
+    severity: "non-fatal"
+    gpu_models: [H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 97
+    mnemonic: "ROBUST_CHANNEL_NVDEC6_ERROR"
+    description: "NVDEC6 Error"
+    severity: "non-fatal"
+    gpu_models: [H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 98
+    mnemonic: "ROBUST_CHANNEL_NVDEC7_ERROR"
+    description: "NVDEC7 Error"
+    severity: "non-fatal"
+    gpu_models: [H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 99
+    mnemonic: "ROBUST_CHANNEL_NVJPG1_ERROR"
+    description: "NVJPG1 Error"
+    severity: "non-fatal"
+    gpu_models: [H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 100
+    mnemonic: "ROBUST_CHANNEL_NVJPG2_ERROR"
+    description: "NVJPG2 Error"
+    severity: "non-fatal"
+    gpu_models: [H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 101
+    mnemonic: "ROBUST_CHANNEL_NVJPG3_ERROR"
+    description: "NVJPG3 Error"
+    severity: "non-fatal"
+    gpu_models: [H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 102
+    mnemonic: "ROBUST_CHANNEL_NVJPG4_ERROR"
+    description: "NVJPG4 Error"
+    severity: "non-fatal"
+    gpu_models: [H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 103
+    mnemonic: "ROBUST_CHANNEL_NVJPG5_ERROR"
+    description: "NVJPG5 Error"
+    severity: "non-fatal"
+    gpu_models: [H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 104
+    mnemonic: "ROBUST_CHANNEL_NVJPG6_ERROR"
+    description: "NVJPG6 Error"
+    severity: "non-fatal"
+    gpu_models: [H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 105
+    mnemonic: "ROBUST_CHANNEL_NVJPG7_ERROR"
+    description: "NVJPG7 Error"
+    severity: "non-fatal"
+    gpu_models: [H100, B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 106
+    mnemonic: "SMBPBI_TEST_MESSAGE"
+    description: "SMBPBI Test Message"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "IGNORE"
+    investigatory_action: "IGNORE"
+    trigger: ""
+  - code: 107
+    mnemonic: "SMBPBI_TEST_MESSAGE_SILENT"
+    description: "SMBPBI Test Message Silent"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "IGNORE"
+    investigatory_action: "IGNORE"
+    trigger: ""
+  - code: 109
+    mnemonic: "ROBUST_CHANNEL_CTXSW_TIMEOUT_ERROR"
+    description: "Context Switch Timeout Error"
+    severity: "fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESET_GPU"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R570"
+  - code: 110
+    mnemonic: "SEC_FAULT_ERROR"
+    description: "Security Fault Error"
+    severity: "fatal"
+    gpu_models: [H100, B100, GB200]
+    immediate_action: "RESET_GPU"
+    investigatory_action: "INVESTIGATE_SW"
+    trigger: "This event should be uncommon unless there is a hardware failure. To recover, revert any recent system hardware modifications and cold reset the system. If this fails to correct the issue, contact your hardware vendor for assistance."
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 119
+    mnemonic: "GSP_RPC_TIMEOUT"
+    description: "GSP RPC Timeout"
+    severity: "fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESET_GPU"
+    investigatory_action: "INVESTIGATE_SW"
+    trigger: "These events (119/120) may be logged when an error occurs in code running on the GSP core of the GPU and/or a timeout occurs while waiting for the GSP core of the GPU to respond to an RPC message. A GPU reset or node power cycle may be needed if the error persists. If this problem reoccurs after a power cycle, follow the NVIDIA GPU Debug Guidelines document for additional debugging steps."
+  - code: 120
+    mnemonic: "GSP_ERROR"
+    description: "GSP Error"
+    severity: "fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESET_GPU"
+    investigatory_action: "INVESTIGATE_SW"
+    trigger: "These events (119/120) may be logged when an error occurs in code running on the GSP core of the GPU and/or a timeout occurs while waiting for the GSP core of the GPU to respond to an RPC message. A GPU reset or node power cycle may be needed if the error persists. If this problem reoccurs after a power cycle, follow the NVIDIA GPU Debug Guidelines document for additional debugging steps."
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 121
+    mnemonic: "C2C_ERROR"
+    description: "C2C Error"
+    severity: "non-fatal"
+    gpu_models: [GB200]
+    immediate_action: "IGNORE"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: "This event may occur when the GPU driver has observed corrected errors on the C2C NVLink connection to a Grace CPU. These errors are corrected by the system and have no operational impact. Resetting the GPU at an available service window will allow the GPU to retrain the link. NOTE: repeat errors may be reported; VBIOS 97.00.90.00.00 may provide some relief from that condition"
+  - code: 126
+    mnemonic: "ROBUST_CHANNEL_CE10_ERROR"
+    description: "CE10: Unknown Error"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 127
+    mnemonic: "ROBUST_CHANNEL_CE11_ERROR"
+    description: "CE11: Unknown Error"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 128
+    mnemonic: "ROBUST_CHANNEL_CE12_ERROR"
+    description: "CE12: Unknown Error"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 129
+    mnemonic: "ROBUST_CHANNEL_CE13_ERROR"
+    description: "CE13: Unknown Error"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 130
+    mnemonic: "ROBUST_CHANNEL_CE14_ERROR"
+    description: "CE14: Unknown Error"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 131
+    mnemonic: "ROBUST_CHANNEL_CE15_ERROR"
+    description: "CE15: Unknown Error"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 132
+    mnemonic: "ROBUST_CHANNEL_CE16_ERROR"
+    description: "CE16: Unknown Error"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 133
+    mnemonic: "ROBUST_CHANNEL_CE17_ERROR"
+    description: "CE17: Unknown Error"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 134
+    mnemonic: "ROBUST_CHANNEL_CE18_ERROR"
+    description: "CE18: Unknown Error"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 135
+    mnemonic: "ROBUST_CHANNEL_CE19_ERROR"
+    description: "CE19: Unknown Error"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 136
+    mnemonic: "ALI_TRAINING_FAIL"
+    description: "Link Training Failed"
+    severity: "fatal"
+    gpu_models: [H100]
+    immediate_action: "RESET_GPU"
+    investigatory_action: "INVESTIGATE_LINK_SI"
+    trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 137
+    mnemonic: "NVLINK_PRIV_ERR"
+    description: "NVLink Privilege Error"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "IGNORE"
+    investigatory_action: "XID_137_FLOW"
+    trigger: "This event is logged when a fault is reported by the remote MMU, such as when an illegal NVLink peer-to-peer access is made by an applicable unit on the chip. Typically these are application-level bugs, but can also be driver bugs or hardware bugs. When this event is logged, NVIDIA recommends the following: #. Run the application in cuda-gdb or the Compute Sanitizer memcheck tool , or #. Run the application with CUDA_DEVICE_WAITS_ON_EXCEPTION=1 and then attach later with cuda-gdb, or #. File a bug if the previous two come back inconclusive to eliminate potential NVIDIA driver or hardware bug."
+  - code: 139
+    mnemonic: "ROBUST_CHANNEL_OFA1_ERROR"
+    description: "OFA1 Error"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "RESTART_APP"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 140
+    mnemonic: "UNRECOVERABLE_ECC_ERROR_ESCAPE"
+    description: "ECC Unrecovered Error"
+    severity: "fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESET_GPU"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: "This event may occur when the GPU driver has observed uncorrectable errors in GPU memory, in such a way as to interrupt the GPU driver’s ability to mark the pages for dynamic page offlining or row remapping. Reset the GPU, and if the problem persists, contact your hardware vendor for support."
+  - code: 141
+    mnemonic: "ROBUST_CHANNEL_FAST_PATH_ERROR"
+    description: "CUDA Fast Path Error"
+    severity: "non-fatal"
+    gpu_models: [H100, B100, GB200]
+    immediate_action: "IGNORE"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 142
+    mnemonic: "ROBUST_CHANNEL_NVENC3_ERROR"
+    description: "NVENC3 Error"
+    severity: "fatal"
+    gpu_models: [GB200]
+    immediate_action: "CONTACT_SUPPORT"
+    investigatory_action: ""
+    trigger: ""
+  - code: 143
+    mnemonic: "GPU_INIT_ERROR"
+    description: "GPU Initialization Error"
+    severity: "fatal"
+    gpu_models: [H100, B100, GB200]
+    immediate_action: "RESET_GPU"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.9; GPU driver R575"
+  - code: 144
+    mnemonic: "NVLINK_SAW_ERROR"
+    description: "NVLINK: SAW Error"
+    severity: "fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "WORKFLOW_NVLINK5_ERR"
+    investigatory_action: "WORKFLOW_NVLINK5_ERR"
+    trigger: ""
+    leads_to: [45, 48, 94, 95, 154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 145
+    mnemonic: "NVLINK_RLW_ERROR"
+    description: "NVLINK: RLW Error"
+    severity: "fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "WORKFLOW_NVLINK5_ERR"
+    investigatory_action: "WORKFLOW_NVLINK5_ERR"
+    trigger: ""
+    leads_to: [45, 48, 154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 146
+    mnemonic: "NVLINK_TLW_ERROR"
+    description: "NVLINK: TLW Error"
+    severity: "fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "WORKFLOW_NVLINK5_ERR"
+    investigatory_action: "WORKFLOW_NVLINK5_ERR"
+    trigger: ""
+    leads_to: [48, 94, 95, 154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 147
+    mnemonic: "NVLINK_TREX_ERROR"
+    description: "NVLINK: TREX Error"
+    severity: "fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "WORKFLOW_NVLINK5_ERR"
+    investigatory_action: "WORKFLOW_NVLINK5_ERR"
+    trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 148
+    mnemonic: "NVLINK_NVLPW_CTRL_ERROR"
+    description: "NVLINK: NVLPW_CTRL Error"
+    severity: "fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "WORKFLOW_NVLINK5_ERR"
+    investigatory_action: "WORKFLOW_NVLINK5_ERR"
+    trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 149
+    mnemonic: "NVLINK_NETIR_ERROR"
+    description: "NVLINK: NETIR Error"
+    severity: "fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "WORKFLOW_NVLINK5_ERR"
+    investigatory_action: "WORKFLOW_NVLINK5_ERR"
+    trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 150
+    mnemonic: "NVLINK_MSE_ERROR"
+    description: "NVLINK: MSE Error"
+    severity: "fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "WORKFLOW_NVLINK5_ERR"
+    investigatory_action: "WORKFLOW_NVLINK5_ERR"
+    trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 151
+    mnemonic: "ROBUST_CHANNEL_KEY_ROTATION_ERROR"
+    description: "Key rotation Error"
+    severity: "fatal"
+    gpu_models: [H100, B100, GB200]
+    immediate_action: "RESTART_VM"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 152
+    mnemonic: "ROBUST_CHANNEL_DLA_SMMU_ERROR"
+    description: "DLA SMMU Error"
+    severity: "non-fatal"
+    gpu_models: []
+    immediate_action: "IGNORE"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 153
+    mnemonic: "ROBUST_CHANNEL_DLA_TIMEOUT"
+    description: "DLA timeout Error"
+    severity: "non-fatal"
+    gpu_models: []
+    immediate_action: "IGNORE"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+  - code: 154
+    mnemonic: "GPU_RECOVERY_ACTION_CHANGED"
+    description: "GPU Recovery Action Changed"
+    severity: "fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "XID_154"
+    investigatory_action: "N/A Informational only regarding another Xid"
+    trigger: "\"Xid 154 will be seen in conjunction with other Xids and summarizes the recovery action required for other Xids. The string will be similar to \"\"Xid 154 GPU recovery action changed from 0x0 (None) to 0x2 (Node Reboot Required)\"\" where the expected values of the text are: \"\"None\"\", \"\"Drain P2P\"\", \"\"Drain and Reset\"\", \"\"GPU Reset Required\"\", \"\"Node Reboot Required\"\". \""
+  - code: 155
+    mnemonic: "NVLINK_SW_DEFINED_ERROR"
+    description: "NVLINK: SW Defined Error"
+    severity: "fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "RESET_GPU"
+    investigatory_action: "INVESTIGATE_SW_USER"
+    trigger: "Link down events which are flagged as “intentional” (including transitions to SLEEP) will trigger this Xid"
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 156
+    mnemonic: "RESOURCE_RETIREMENT_EVENT"
+    description: "Resource Retirement Event"
+    severity: "fatal"
+    gpu_models: [H100, B100, GB200]
+    immediate_action: "RESET_GPU"
+    investigatory_action: "IGNORE"
+    trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.7; GPU driver R565"
+  - code: 157
+    mnemonic: "RESOURCE_RETIREMENT_FAILURE"
+    description: "Resource Retirement Failure"
+    severity: "non-fatal"
+    gpu_models: [H100, B100, GB200]
+    immediate_action: "IGNORE"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: "No possible repairs are possible due to lack of resources. You may still run workloads or Apps, but may experience the same Xid again."
+  - code: 158
+    mnemonic: "GPU_FATAL_TIMEOUT"
+    description: "GPU Fatal Timeout"
+    severity: "fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: "RESET_GPU"
+    investigatory_action: "CONTACT_SUPPORT"
+    trigger: ""
+    leads_to: [154]
+    linkage_note: "yes; support with Xid introduction"
+  - code: 159
+    mnemonic: "ROBUST_CHANNEL_CHI_NON_DATA_ERROR"
+    description: "CHI Non-Data Error"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "CHECK_UVM"
+    investigatory_action: "SYMPATHETIC_REPORT_SOLO"
+    trigger: "May be seen on any C2C link-connected GPU."
+    leads_to: [154]
+    linkage_note: "yes; support with Xid introduction"
+  - code: 160
+    mnemonic: "CHANNEL_RETIREMENT_EVENT"
+    description: "Channel Retirement Event"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "IGNORE"
+    investigatory_action: "INVESTIGATE_SW"
+    trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.9; GPU driver R575"
+  - code: 161
+    mnemonic: "CHANNEL_RETIREMENT_FAILURE"
+    description: "Channel Retirement Failure"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: "IGNORE"
+    investigatory_action: "INVESTIGATE_SW"
+    trigger: ""
+    leads_to: [154]
+    linkage_note: "CUDA 12.9; GPU driver R575"
+  - code: 162
+    mnemonic: "PSHC_REENGAGED"
+    description: "Power Smoothing HW Circuitry capability reengaged"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: ""
+    investigatory_action: ""
+    trigger: ""
+  - code: 163
+    mnemonic: "PSHC_DISENGAGED"
+    description: "Power Smoothing HW Circuitry capability disengaged"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: ""
+    investigatory_action: ""
+    trigger: "No GPU reset required. If power smoothing functionality is desired, the customer needs to resolve the thermal events. If disabled due to timeout, reload the driver or reset the GPU."
+  - code: 164
+    mnemonic: "PSHC_LOW_LIFETIME"
+    description: "Power Smoothing HW Circuitry low lifetime reached"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: ""
+    investigatory_action: ""
+    trigger: "Monitor power swings and expect to replace GPUs if power smoothing is desired. Power smoothing functionality will be disabled soon. Investigate if power swings are acceptable, and if not, take action."
+  - code: 165
+    mnemonic: "PSHC_ZERO_LIFETIME"
+    description: "Power Smoothing HW Circuitry lifetime exhausted"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: ""
+    investigatory_action: ""
+    trigger: "Replace GPUs if power swings are not acceptable, and power smoothing is desired. Power smoothing will be disabled by the driver and power swings will occur. Analyze datacenter infrastructure to ensure ability to absorb power swings."
+  - code: 166
+    mnemonic: "NVLINK_SECURE_CRYPTO_ERR"
+    description: "CC traffic seen prior to link properly being configured for encrypted traffic"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: ""
+    investigatory_action: ""
+    trigger: "Applicable to CC (confidential computing) mode only."
+  - code: 167
+    mnemonic: "PCIE_FATAL_TIMEOUT"
+    description: "PCIE_FATAL_TIMEOUT"
+    severity: "non-fatal"
+    gpu_models: [H100, B100, GB200]
+    immediate_action: ""
+    investigatory_action: ""
+    trigger: ""
+  - code: 168
+    mnemonic: "REDUCED_GPU_MEMORY_CAPACITY"
+    description: "Errors found in WPR (write protected region)"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: ""
+    investigatory_action: ""
+    trigger: "Should only be seen when ECC is disabled. Either ECC should be enabled (to enable row-remapping) or boot re-attempted with shifted WPR."
+  - code: 169
+    mnemonic: "SEC2_HALT_ERROR"
+    description: "Internal micro-controller halt"
+    severity: "non-fatal"
+    gpu_models: [H100, B100, GB200]
+    immediate_action: ""
+    investigatory_action: ""
+    trigger: ""
+  - code: 170
+    mnemonic: "NVLINK_SECURE_OTHER"
+    description: "Interrupt seen in CC mode"
+    severity: "non-fatal"
+    gpu_models: [B100, GB200]
+    immediate_action: ""
+    investigatory_action: ""
+    trigger: "Applicable to CC (confidential computing) mode only."
+  - code: 171
+    mnemonic: "UNCORRECTABLE_DRAM_ERROR"
+    description: "Additional to Xid 48 providing more details on particulars of fault to differentiate DRAM/SRAM"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: ""
+    investigatory_action: ""
+    trigger: ""
+  - code: 172
+    mnemonic: "UNCORRECTABLE_SRAM_ERROR"
+    description: "Additional to Xid 48 providing more details on particulars of fault to differentiate DRAM/SRAM"
+    severity: "non-fatal"
+    gpu_models: [A100, H100, B100, GB200]
+    immediate_action: ""
+    investigatory_action: ""
+    trigger: ""
+
+resolution_buckets:
+  "CONTACT_SUPPORT": "Please contact your support organization for further investigation."
+  "RESTART_APP": "The application should be restarted RESET_GPU or RESTART_BM is not deemed necessary."
+  "IGNORE": "No Action required"
+  "WORKFLOW_XID_45": "Solo: RESTART_FM Not Solo: IGNORE (follow guidance in other Xid)"
+  "RESET_GPU": "Refer to https://docs.nvidia.com/deploy/gpu-debug-guidelines/index.html for GPU Reset capabilities & limitations RESTART_BM is not deemed necessary."
+  "WORKFLOW_XID_48": "Data Center Recovery Action Solo: RESET_GPU w/ 63 or 64: DRAIN_AND_RESET Investagatory Action Solo: RUN_FIELDDIAG Not Solo: String in error would tell us what unit was impacted. FB: follow Xid63/64 guidance All other SRAM: check SRAM Error Threshold flag (nvidia-smi <sram_threshold_exceeded> or NSM Msg Type 0x3, Cmd Code 0x7D, bit 0. If set RUN_FIELDDIAG"
+  "CHECK_MECHANICALS": "Check to ensure that device seating and all applicable connections to it are secure."
+  "WORKFLOW_NVLINK_ERR": "Extract the hex strings from the Xid error message. Note that there should be seven fields in the Xid. Unused fields would expect to be 0x0 rather than a full DWORD of 0’s. The first, third, fourth and fifth registers are valid for Hopper-based products. Evaluate the populate(d) registers. If bits other than those specifically outlined below are seen, please report a bug. First register: Bit 0, 23, 30: Can be safely ignored. Bits 1, 20: These are generally sympathetic or secondary errors. If seen with other bits set or other Xid/SXid, please follow the resolution for those. If seen solo, please report a bug. Bits 4 or 5: Likely HW issue with ECC/Parity --> If seen more than 2 times on the same link, report a bug. Bits 8, 9, 12, 16, 17, 24, 28: Could possibly be a HW issue: Check link mechanical connections and re-seat if a field resolution is required. Run diags if issue persists. If the issue persist, and diagnostics has passed please report a bug. Bits 21 or 22: Marginal channel SI issue. If other errors accompany this Xid, follow the resolution for those first. Otherwise, check link mechanical connections. Run Field Diags and report a bug. Bits 27, 29: If seen repeatedly, please report a bug. Third register: Bits 0, 1, 2, 6: Likely HW issue with ECC/Parity --> If seen more than 2 times on the same link, report a bug. Bit 13: Not expected to be seen in production. If seen, please report a bug. Bits 16, 19: If seen repeatedly, please run Field Diags and report a bug Bits 17, 18: If seen repeatedly, please report a bug. Fourth register: Bits 16, 17: These are generally sympathetic or secondary errors. If seen with other bits set or other Xid/SXid, please follow the resolution for those. If seen solo, please report a bug. Bit 18: These are generally sympathetic or secondary errors, though a reset of the fabric is required. If seen with other bits set or other Xid/SXid, please follow the resolution for those. If seen solo, please report a bug. Fifth register: Bits 18, 19, 21, 22, 24, 25, 27, 28: Likely HW issue with ECC/Parity --> If seen more than 2 times on the same link, report a bug. Bits 20, 23, 26, 29: These errors represent a threshold of ECC errors being exceeded. There was no uncorrectable error at this time. Continue operation. If desired, Field Diags can be run to check for link integrity."
+  "UPDATE_SWFW": "Update Firmware and Software to latest versions XID 78: basic issues will keep vGPU functionality from being able to operate; must resolve to progress 1. Guest driver version is incompatible with the host driver * In this case error string should be “Guest driver is incompatible with host driver\" 2. This vGPU type is not compatible with the guest OS type/GPU type. For example, user is trying to use a compute profile on an old Maxwell GPU on windows guest. * In this case error string should be \"vGPU type is not supported\""
+  "RESTART_BM": "Restart bare metal, system should be restarted"
+  "WORKFLOW_NVLINK5_ERR": "Please see the \"XID 144-150 Decode\" (was \"Customer Doc 144-150\")tab for further guidance in evaluating these Xids. These errors need decoding of XID message as follows to determine the resolution action: Format of the XID error message: Xid (PCI:0000:BB:DF): <Xid Number> <sub component> <fatal vs nonfatal> <Crosscontain> <injected> <link> (<intrInfo> <errorStatus> <errorDebugData[0]> <errorDebugData[1]> <errorDebugData[2]> <errorDebugData[3]> <errorDebugData[4]>) From the above message, <intrInfo>, <errorStatus> must be decoded and evaluated using \"XID 144-150 Decode\" to derive the final resolution."
+  "RESTART_VM": "VM owning the affected GPU must be restarted RESET_GPU or RESTART_BM is not deemed necessary."
+  "XID_154": "Follow XID 154 reported guidance"
+  "CHECK_UVM": "If UVM/vGPU is being utilized, RESET_GPU; otherwise IGNORE"
+  "CHECK_APP/CUDA": "Issue likely caused by an application passing bad data or utilizing incorrect methods in communications with GPU. Some errors will contain PID that can be used to identify source of the problem. If determined to be a driver issue then REPORT_ISSUE"
+  "WORKFLOW_XID_13": "Repeat TPC and GPC, diff SMs: RUN_DCGMEUD (possible HW issue); if pass RUN_FIELDDIAGS Repeat TPC and GPC, single SM: RUN_DCGMEUD (possible HW issue); if pass RUN_FIELDDIAGS Solo, no burst: CHECK_APP/CUDA Not Repeat TPC and GPC: CHECK_APP/CUDA Non-prod environment: CHECK_APP/CUDA If known good APP and Solo: REPORT_ISSUE"
+  "WORKFLOW_XID_31": "Multiple runs needed to establish pattern Repeat MMU faults to same GPU (via PCI-ID): RUN_DCGMEUD (possible HW issue); if pass RUN_FIELDDIAGS Repeat MMU faults to diff GPU (via PCI-ID): CHECK_APP/CUDA Solo, no burst: CHECK_APP/CUDA If known good APP: REPORT_ISSUE"
+  "INVESTIGATE_SW": "There is a problem with either user or NVIDIA software that needs to be investigated further. In many cases the user software may be making calls to illegal areas, poorly structured commands or other issues. This may also be a problem with NVIDIA software in which case an issue should be reported. In many cases there may be a PID that could be tracked back to the offending, originating entity."
+  "IGNORE (sympathetic)": "This is a sympathetic error that is expected to be seen with other conditions. Resolution for the other errors should be undertaken first. If this error was seen independently or all other resolutions aren't suffficient then REPORT_ISSUE."
+  "XID_137_FLOW": "This event is logged when a fault is reported by the remote MMU, such as when an illegal NVLink peer-to-peer access is made by an applicable unit on the chip. Typically these are application-level bugs. When this event is logged, NVIDIA recommends the following: • Run the application in cuda-gdb or cuda-memcheck • Note: The cuda-memcheck tool instruments the running application and reports which line of code performed the illegal read. or • Run the application with CUDA_DEVICE_WAITS_ON_EXCEPTION=1 and then attach later with cuda-gdb File a bug if the previous two come back inconclusive to eliminate other possible causes."
+  "INVESTIGATE_LINK_SI": "Refer to GB200 Resiliency Service Flow for appropriate Access or Trunk link telemetry and investigation methods."
+  "N/A Informational only regarding another Xid": "Other issues need to be addressed. This Xid in informational only and is always expected to be seen with another Xid requiring a recovery action."
+  "INVESTIGATE_SW_USER": "Investigate SW or user initiated if unexpected"
+  "SYMPATHETIC_REPORT_SOLO": "This is a sympathetic error that is expected to be seen with other conditions. Resolution for the other errors should be undertaken first. If this error was seen independently or all other resolutions aren't suffficient then REPORT_ISSUE."
+  "XID_154_EVAL": "If an XID 154 is seen along with this error, take that action. If no XID 154 present, RESTART_APP"
+  "CHECK_NVLINK_FAILURE_FLOW": "Check telemetry to see if the any link went down in the partition within that last 30 seconds. If so, this Xid can be ignored as it was likely a by-product of the other conditions which should be investigated. If no link down indication is present, REPORT_ISSUE."
+  "INVESTIGATE_SW_USER_LINK_SI": "Investigate software or user intervention if not expected; additionally, follow INVESTGATE_LINK_SI if needed"
+  "INVESTIGATE_PEER_DEVICE": "A peer device experience the issue as decoded in the Xid144-150 table (Xid 149 in particular). Based upon the note column: Received_TS1: will be seen when peer link down reason is unknown Peer_side_down_to_sleep_state: investigate peer software and users if unexpected Peer_side_down_to_disable_state: investigate peer software and users if unexpected Peer_side_down_to_disable_and_port_lock: investigate peer software and users if unexpected Peer_side_down_due_to_thermal_event: check switch cooling Peer_side_down_due_to_force_event: investigate peer software and users if unexpected Peer_side_down_due_to_reset_event: investigate peer software and users if unexpected"
+  "INVESTIGATE_HOST": "Check other logs as this is likely a secondary indicator of some action or fault (may be OOB)."
+  "INVESTIGATE_LINK_SI_AND_CABLES": "A more general fault that could be cable, temperature, transceiver or seating condition. Refer to GB200 Resiliency Service Flow for appropriate Access or Trunk link telemetry and investigation methods."

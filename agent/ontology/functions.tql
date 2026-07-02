@@ -1,0 +1,52 @@
+# Run:AI RCA ontology — TypeDB 3.x reasoning FUNCTIONS.
+#
+# TypeDB 3.0 replaced 2.x `rule ... when {} then {}` reasoning with FUNCTIONS
+# (`define fun`): query-time derivation, invoked explicitly from a match with
+# `let $x in fn(...)`. These give the knowledge graph real reasoning power
+# (what the earlier PoC deferred as "complex").
+#
+# Loaded AFTER the schema by ontology/load_functions.py — as a SEPARATE define so
+# a function issue on a future TypeDB patch can never break the core schema/data
+# load. VALIDATED against TypeDB CE 3.11.5 (HTTP /v1/query) on 2026-07-02:
+#   fixes_for_xid(79)                    -> "Reset the GPU / contact support."
+#   xids_for_gpu_model("H100")           -> 79
+#   fixes_for_family("gpu_hardware_error") -> "Reset the GPU / contact support."
+
+define
+
+# Remediation statements for a specific NVIDIA XID code (xid_error -> resolved_by -> action).
+fun fixes_for_xid($code: integer) -> { statement }:
+  match
+    $x isa xid_error, has xid_code $c; $c == $code;
+    (symptom: $x, remedy: $a) isa resolved_by;
+    $a has statement $s;
+  return { $s };
+
+# XID codes that can occur on a given GPU model (xid_error -> applies_to -> gpu_model).
+fun xids_for_gpu_model($model: string) -> { xid_code }:
+  match
+    $x isa xid_error; $g isa gpu_model, has name $n; $n == $model;
+    (fault: $x, model: $g) isa applies_to;
+    $x has xid_code $code;
+  return { $code };
+
+# Remediation statements for a root-cause family (root_cause[subtype] <- indicates <-
+# symptom -> resolved_by -> action). Works for any family: the curated failure modes,
+# the Run:ai built-in alerts, and the XID GPU faults all attach here.
+fun fixes_for_family($fam: string) -> { statement }:
+  match
+    $rc isa root_cause, has subtype $sub; $sub == $fam;
+    (symptom: $sy, cause: $rc) isa indicates;
+    (symptom: $sy, remedy: $a) isa resolved_by;
+    $a has statement $s;
+  return { $s };
+
+# Root-cause XIDs for an observed XID: which faults lead_to (escalate into) the
+# given code, one hop back along the leads_to causal chain. When the evidence
+# shows Xid 45 or 154, this answers "the likely ROOT faults are these".
+fun root_xids_for($code: integer) -> { xid_code }:
+  match
+    $e isa xid_error, has xid_code $c; $c == $code;
+    (cause_fault: $r, effect_fault: $e) isa leads_to;
+    $r has xid_code $root;
+  return { $root };

@@ -31,6 +31,7 @@ import {
   Search,
   Send,
   Server,
+  Cpu,
   Settings2,
   ThumbsDown,
   ThumbsUp,
@@ -199,7 +200,7 @@ type QueryDisplayItem = {
 };
 
 const ANALYSIS_AGENT_ID = 'analysis';
-const COMPONENT_AGENT_ORDER = ['runai', 'kubernetes', 'postgres', 'prometheus', 'loki'];
+const COMPONENT_AGENT_ORDER = ['runai', 'kubernetes', 'postgres', 'prometheus', 'loki', 'system'];
 const AGENT_ORDER = COMPONENT_AGENT_ORDER;
 const ANALYSIS_WINDOWS = [
   { label: '7d', days: 7 },
@@ -3362,18 +3363,25 @@ function parseDate(value: string) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
+// ponytail: buckets align to Asia/Seoul (KST, fixed UTC+9) calendar days, not UTC.
+// KST has no DST, so a constant +9h offset is exact — no Intl zone math needed here.
+const KST_OFFSET_MS = 9 * 60 * 60 * 1000;
+
+// Real UTC instant of the KST midnight that contains `date`. Shift into KST, floor to
+// the calendar day there, then shift back so the result stays a comparable real instant.
 function startOfUtcDay(date: Date) {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const shifted = new Date(date.getTime() + KST_OFFSET_MS);
+  const kstMidnight = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate());
+  return new Date(kstMidnight - KST_OFFSET_MS);
 }
 
 function addUtcDays(date: Date, days: number) {
-  const next = new Date(date);
-  next.setUTCDate(next.getUTCDate() + days);
-  return next;
+  return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
 }
 
+// Label for a KST-day-start instant: its calendar date in Asia/Seoul (YYYY-MM-DD).
 function dateKey(date: Date) {
-  return date.toISOString().slice(0, 10);
+  return new Date(date.getTime() + KST_OFFSET_MS).toISOString().slice(0, 10);
 }
 
 function dateRangeLabel(points: TrendPoint[]) {
@@ -3441,9 +3449,24 @@ function stripRunaiNamespacePrefix(value: string) {
   return value.startsWith('runai-') ? value.slice('runai-'.length) : value;
 }
 
+// All backend timestamps are UTC (RFC3339 with Z). Render them in Korea Standard
+// Time (Asia/Seoul, UTC+9, no DST) — every date/time in the UI flows through here.
+const KST_FORMAT = new Intl.DateTimeFormat('sv-SE', {
+  timeZone: 'Asia/Seoul',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+});
+
 function formatTime(value: string) {
   if (!value) return '-';
-  return value.replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return `${KST_FORMAT.format(date).replace(',', '')} KST`;
 }
 
 function agentLabel(agent: string) {
@@ -3454,6 +3477,7 @@ function agentLabel(agent: string) {
     postgres: 'Postgres',
     prometheus: 'Prometheus',
     loki: 'Loki',
+    system: 'System',
   };
   return labels[agent] || agent;
 }
@@ -3465,6 +3489,7 @@ function agentIcon(agent: string) {
   if (agent === 'postgres') return <Database size={18} />;
   if (agent === 'prometheus') return <LineChart size={18} />;
   if (agent === 'loki') return <FileText size={18} />;
+  if (agent === 'system') return <Cpu size={18} />;
   return <AlertTriangle size={18} />;
 }
 

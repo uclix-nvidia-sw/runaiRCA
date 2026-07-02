@@ -30,12 +30,25 @@ from app.collectors.base import resolve_target
 from app.config import load_settings
 from app.ontology.typedb_client import escape_typeql as esc
 from ontology.incident import OntologyIncident
+from ontology.load_knowledge import (
+    _ensure_action,
+    _ensure_cause,
+    _ensure_symptom,
+    _relate_indicates,
+    _relate_resolved_by,
+)
 
 _SELECT_INCIDENTS = """
 SELECT i.incident_id, i.correlation_key, i.title, i.severity, i.status,
        i.fired_at::text AS fired_at,
        a.alert_id, a.fingerprint, a.occurrence_count, a.occurrence_pods,
-       a.labels, a.annotations, a.analysis_summary,
+       a.labels, a.annotations, a.analysis_summary, a.analysis_detail,
+       (SELECT count(*) FROM rca_feedback f
+         WHERE f.target_id IN (i.incident_id, a.alert_id)
+           AND f.vote = 'up') AS positive_feedback,
+       (SELECT count(*) FROM rca_feedback f
+         WHERE f.target_id IN (i.incident_id, a.alert_id)
+           AND f.vote = 'down') AS negative_feedback,
        (EXISTS (SELECT 1 FROM rca_feedback f
                  WHERE f.target_id IN (i.incident_id, a.alert_id) AND f.vote = 'up')
         OR EXISTS (SELECT 1 FROM rca_comments c
@@ -136,16 +149,23 @@ def _ensure(tx: Any, etype: str, key_attr: str, value: str) -> None:
 
 
 def _replace_attr(
-    tx: Any, etype: str, key_attr: str, key_value: str, attr: str, new_value: Any, quoted: bool = True
+    tx: Any,
+    etype: str,
+    key_attr: str,
+    key_value: str,
+    attr: str,
+    new_value: Any,
+    quoted: bool = True,
 ) -> None:
     # Remove any existing value of `attr`, then set the new one. Replace (not
     # add-if-missing) so a re-projected incident whose RCA/status changed after a
     # re-open+re-analysis updates in place instead of accumulating stale values —
     # required, since owns defaults to @card(0..1) so a second value fails commit.
     # quoted=False for non-string attributes (e.g. integer occurrence_count).
+    # TypeDB 3.x delete syntax: `delete has <attr> of <owner>` (2.x was `delete $x has $old`).
     tx.query(
         f'match $x isa {etype}, has {key_attr} "{esc(key_value)}", has {attr} $old; '
-        f"delete has $old of $x;"  # TypeDB 3.x: `delete has <attr> of <owner>` (2.x was `delete $x has $old`)
+        f"delete has $old of $x;"
     ).resolve()
     value = f'"{esc(str(new_value))}"' if quoted else str(new_value)
     tx.query(
@@ -241,6 +261,136 @@ def _write_incident(tx: Any, inc: OntologyIncident) -> None:
                 "contains", "space", "occupant")
 
 
+# --- knowledge promotion (--promote-knowledge) --------------------------------
+# Promote operator-CONFIRMED RCAs into the knowledge layer the synthesis step
+# consults: symptom "confirmed:{alert_name}" -indicates-> family root_cause,
+# -resolved_by-> action(s) from the stored report. The backend does NOT persist
+# the agent's ranked_root_cause_candidates (the response `context` dict is
+# dropped by the Go store), so the top family is recovered from the stored
+# analysis text instead — a printed family label is decisive, otherwise >= 2
+# distinct keyword hits with a unique best family. Ambiguity -> skip.
+
+# family -> (decisive label markers, weak keywords). Labels mirror
+# orchestrator._family_label / _FAMILY_EXPLANATION output; keywords mirror
+# root_cause_ranking._FAMILY_RULES. insufficient_evidence is never promoted.
+_FAMILY_MARKERS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "node_kubelet_pressure": (
+        ("node_kubelet_pressure", "node kubelet pressure", "node hosting this workload is under"),
+        ("diskpressure", "memorypressure", "pidpressure", "kubelet", "evict"),
+    ),
+    "scheduling_quota_exhaustion": (
+        ("scheduling_quota_exhaustion", "scheduling quota exhaustion", "queue capacity looks"),
+        ("failedscheduling", "unschedulable", "quota", "preempt", "insufficient gpu"),
+    ),
+    "control_plane_error": (
+        ("control_plane_error", "run:ai control-plane error"),
+        ("control plane", "control-plane", "admission", "reconcile", "runai-backend"),
+    ),
+    "workload_startup_image_failure": (
+        ("workload_startup_image_failure", "workload startup/image failure"),
+        ("imagepullbackoff", "errimagepull", "crashloopbackoff", "oomkilled", "back-off"),
+    ),
+}
+
+_ACTION_CAP = 3
+_ACTION_MAXLEN = 200
+
+
+def _derive_family(text: str) -> str:
+    """Best-effort family from stored analysis text; "" when ambiguous."""
+    t = (text or "").lower()
+    if not t:
+        return ""
+    for family, (labels, _) in _FAMILY_MARKERS.items():
+        if any(label in t for label in labels):
+            return family
+    scores = {fam: sum(1 for kw in kws if kw in t) for fam, (_, kws) in _FAMILY_MARKERS.items()}
+    top = max(scores.values())
+    if top < 2 or sum(1 for s in scores.values() if s == top) > 1:
+        return ""
+    return max(scores, key=lambda fam: scores[fam])
+
+
+def _extract_actions(detail: str) -> list[str]:
+    """Bullet lines from the Recommended-Actions section only.
+
+    The heading appears as '## Recommended Actions', numbered
+    '## 3. Recommended Actions', or Korean '## 3. 권장 조치 (Recommended Actions)'
+    depending on language/report shape — match the phrase, not an exact prefix."""
+    actions: list[str] = []
+    in_section = False
+    for line in (detail or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            in_section = "recommended actions" in stripped.lower() or "권장 조치" in stripped
+            continue
+        if in_section and stripped.startswith("- "):
+            text = stripped[2:].strip().strip("*").strip()
+            if text:
+                actions.append(text[:_ACTION_MAXLEN])
+        if len(actions) >= _ACTION_CAP:
+            break
+    return actions
+
+
+def _promotion_from_row(row: dict[str, Any]) -> tuple[str, str, list[str]] | None:
+    """(alert_name, family, actions) when the row is promotable, else None.
+
+    Promotable = resolved + net-positive operator feedback (rca_feedback votes)
+    + a recoverable root-cause family + a real alertname label.
+    """
+    if str(row.get("status") or "") != "resolved":
+        return None
+    if int(row.get("positive_feedback") or 0) <= int(row.get("negative_feedback") or 0):
+        return None
+    target = resolve_target(_json(row.get("labels")), _json(row.get("annotations")))
+    alert_name = (target.alert_name or "").strip()
+    if not alert_name or alert_name == "RunAIAlert":  # resolve_target's fallback, not a real name
+        return None
+    summary = str(row.get("analysis_summary") or "")
+    detail = str(row.get("analysis_detail") or "")
+    family = _derive_family(f"{summary}\n{detail}")
+    if not family:
+        return None
+    return alert_name, family, _extract_actions(detail)
+
+
+def _promote_one(tx: Any, alert_name: str, family: str, actions: list[str]) -> None:
+    """Idempotent knowledge insert (reuses load_knowledge's _exists helpers)."""
+    name = f"confirmed:{alert_name}"
+    _ensure_cause(tx, family)
+    _ensure_symptom(tx, name, [alert_name.strip().lower()])
+    _relate_indicates(tx, name, family)
+    for statement in actions[:_ACTION_CAP]:
+        _ensure_action(tx, statement)
+        _relate_resolved_by(tx, name, statement)
+
+
+def _promote(rows: list[dict[str, Any]]) -> tuple[int, int]:
+    from typedb.driver import TransactionType
+
+    from app.ontology.typedb_client import open_driver
+
+    records = [rec for rec in (_promotion_from_row(row) for row in rows) if rec]
+    if not records:
+        print("promotion: no eligible incidents")
+        return 0, 0
+    settings = load_settings()
+    promoted = failed = 0
+    with open_driver(settings) as driver:
+        for alert_name, family, actions in records:
+            try:
+                with driver.transaction(settings.typedb_database, TransactionType.WRITE) as tx:
+                    _promote_one(tx, alert_name, family, actions)
+                    tx.commit()
+                promoted += 1
+            except Exception as exc:  # noqa: BLE001 - report and continue the batch
+                failed += 1
+                print(f"  ! promote {alert_name}: {type(exc).__name__}: {exc}", file=sys.stderr)
+    print(f"promotion: {promoted} promoted, {failed} failed")
+    return promoted, failed
+
+
 def _write(incidents: list[OntologyIncident]) -> tuple[int, int]:
     from typedb.driver import TransactionType
 
@@ -272,6 +422,12 @@ def main() -> int:
         default=0,
         help="only ingest incidents resolved at least N hours ago (0 = no gate)",
     )
+    parser.add_argument(
+        "--promote-knowledge",
+        action="store_true",
+        help="also promote operator-confirmed RCAs (resolved + net-positive feedback) "
+        "into the knowledge layer (symptom -> root_cause -> action); default off",
+    )
     args = parser.parse_args()
 
     rows = asyncio.run(_fetch(args.limit, args.resolved_grace_hours))
@@ -282,10 +438,12 @@ def main() -> int:
         f"fetched {len(incidents)} incident(s); "
         f"ingesting {len(selected)}, skipping {skipped} unreviewed"
     )
-    if not selected:
-        return 0
-    written, failed = _write(selected)
-    print(f"done: {written} written, {failed} failed")
+    written = failed = 0
+    if selected:
+        written, failed = _write(selected)
+        print(f"done: {written} written, {failed} failed")
+    if args.promote_knowledge and rows:
+        _promote(rows)
     return 1 if failed and not written else 0
 
 

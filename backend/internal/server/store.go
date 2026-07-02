@@ -52,6 +52,7 @@ type Store struct {
 	dbReady        bool
 	pgvectorReady  bool
 	pgvectorDetail string
+	embedder       *embedder
 }
 
 type AlertUpsertResult struct {
@@ -85,6 +86,7 @@ func NewStore() *Store {
 		feedback:      make(map[string]*FeedbackRecord),
 		comments:      make(map[string]*CommentRecord),
 		analysisRuns:  make(map[string]*AnalysisRun),
+		embedder:      newEmbedder(),
 	}
 }
 

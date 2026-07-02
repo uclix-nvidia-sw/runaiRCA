@@ -93,6 +93,10 @@ spec:
               value: {{ .Values.agent.env.natConfigFile | quote }}
             - name: NAT_TIMEOUT_SECONDS
               value: {{ .Values.agent.env.natTimeoutSeconds | quote }}
+            - name: ENABLE_INVESTIGATION_LOOP
+              value: {{ .Values.agent.env.enableInvestigationLoop | quote }}
+            - name: MAX_INVESTIGATION_STEPS
+              value: {{ .Values.agent.env.maxInvestigationSteps | quote }}
             - name: RUNAI_BASE_URL
               value: {{ .Values.agent.env.runaiBaseUrl | quote }}
             - name: RUNAI_TOKEN_URL
@@ -151,6 +155,21 @@ spec:
               value: {{ .Values.typedb.auth.password | quote }}
             - name: TYPEDB_TIMEOUT_SECONDS
               value: {{ .Values.agent.env.typedbTimeoutSeconds | quote }}
+            - name: ENABLE_POD_EXEC
+              value: {{ .Values.agent.env.enablePodExec | quote }}
+            {{- if .Values.systemAgent.enabled }}
+            - name: ENABLE_SYSTEM_AGENT
+              value: "true"
+            # The system collector substitutes {node} per alert; the DaemonSet serves
+            # node logs on this port (hostNetwork), so the node name resolves directly.
+            - name: SYSTEM_AGENT_URL
+              value: "http://{node}:{{ .Values.systemAgent.port }}"
+            - name: SYSTEM_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ printf "%s-system-agent-token" (include "runai-rca.fullname" .) }}
+                  key: token
+            {{- end }}
             - name: POSTGRES_DSN
               valueFrom:
                 secretKeyRef:

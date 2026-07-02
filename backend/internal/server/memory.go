@@ -1,24 +1,145 @@
 package server
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"log"
 	"math"
+	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// embeddingDim is the fixed dimensionality of the dense vectors stored in the
-// pgvector `embedding` column. The backend has no embedding model dependency
-// (it must run offline next to the NeMo agent), so dense vectors are produced
-// deterministically from text with the feature-hashing trick. Changing this
-// value invalidates previously persisted vectors of a different dimension.
+// embeddingDim is the default dimensionality of the dense vectors stored in the
+// pgvector `embedding` column. The backend has no embedding model dependency by
+// default (it must run offline next to the NeMo agent), so dense vectors are
+// produced deterministically from text with the feature-hashing trick. When a
+// real embedding model is configured (EMBEDDING_URL), its dimension is read
+// from EMBEDDING_DIM instead. Changing this value invalidates previously
+// persisted vectors of a different dimension — mixed-dim vectors can't be
+// compared, so switching embedding modes requires re-embedding existing rows.
 const (
 	embeddingDim             = 384
 	maxFeedbackHintTextBytes = 800
 )
+
+// embedder produces dense vectors for similarity search. When endpoint is set
+// (EMBEDDING_URL), it calls an OpenAI-compatible {endpoint}/embeddings API and
+// uses the returned multilingual vector; otherwise (or on any failure) it falls
+// back to the deterministic feature-hashing denseEmbedding so the backend keeps
+// working fully offline. dim is the stored pgvector column dimension and must
+// match the model's output when the endpoint is set.
+type embedder struct {
+	endpoint string
+	model    string
+	apiKey   string
+	dim      int
+	client   *http.Client
+}
+
+// newEmbedder reads embedding config from the environment. With no EMBEDDING_URL
+// it returns a hash-only embedder (default, offline). Kept out of NewServer so
+// the Store owns the config that its embed() calls depend on.
+func newEmbedder() *embedder {
+	dim := getenvInt("EMBEDDING_DIM", embeddingDim)
+	if dim <= 0 {
+		dim = embeddingDim
+	}
+	endpoint := strings.TrimRight(strings.TrimSpace(os.Getenv("EMBEDDING_URL")), "/")
+	if endpoint == "" {
+		// ponytail: hash fallback ignores EMBEDDING_DIM to keep the historically
+		// fixed offline dim; only a real model needs a matching custom dim.
+		dim = embeddingDim
+	}
+	return &embedder{
+		endpoint: endpoint,
+		model:    strings.TrimSpace(os.Getenv("EMBEDDING_MODEL")),
+		apiKey:   strings.TrimSpace(os.Getenv("EMBEDDING_API_KEY")),
+		dim:      dim,
+		client:   &http.Client{Timeout: 15 * time.Second},
+	}
+}
+
+// embed produces the stored dense vector for text via the store's embedder,
+// tolerating a nil embedder (e.g. Store literals in tests) by using the hash.
+func (s *Store) embed(text string) []float32 {
+	if s.embedder == nil {
+		return denseEmbedding(text, embeddingDim)
+	}
+	return s.embedder.embed(text)
+}
+
+// embeddingDim is the pgvector column dimension the store persists and queries.
+func (s *Store) embeddingDim() int {
+	if s.embedder == nil {
+		return embeddingDim
+	}
+	return s.embedder.dim
+}
+
+// embed returns an L2-normalized dense vector of length e.dim. It calls the
+// configured OpenAI-compatible endpoint when set, and falls back to the
+// hash embedding on any error so an incident write/search is never blocked.
+func (e *embedder) embed(text string) []float32 {
+	if e == nil || e.endpoint == "" {
+		return denseEmbedding(text, embeddingDim)
+	}
+	vector, err := e.remoteEmbed(text)
+	if err != nil {
+		log.Printf("embedding endpoint failed, falling back to hash embedding: %v", err)
+		return denseEmbedding(text, e.dim)
+	}
+	return normalize(vector)
+}
+
+// remoteEmbed POSTs to {endpoint}/embeddings and returns the raw model vector.
+// The response follows the OpenAI embeddings schema: {"data":[{"embedding":[...]}]}.
+func (e *embedder) remoteEmbed(text string) ([]float32, error) {
+	body, err := json.Marshal(map[string]any{"model": e.model, "input": text})
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint+"/embeddings", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if e.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+e.apiKey)
+	}
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("embeddings endpoint status %d", resp.StatusCode)
+	}
+	var parsed struct {
+		Data []struct {
+			Embedding []float32 `json:"embedding"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, err
+	}
+	if len(parsed.Data) == 0 || len(parsed.Data[0].Embedding) == 0 {
+		return nil, fmt.Errorf("embeddings endpoint returned no vector")
+	}
+	got := parsed.Data[0].Embedding
+	if len(got) != e.dim {
+		return nil, fmt.Errorf("embedding dim mismatch: got %d, EMBEDDING_DIM=%d", len(got), e.dim)
+	}
+	return got, nil
+}
 
 type IncidentMemory struct {
 	IncidentID      string
@@ -484,25 +605,35 @@ func textVector(text string) map[string]float64 {
 	return vector
 }
 
-// denseEmbedding maps free text to a fixed-dimension dense vector using signed
+// denseEmbedding maps free text to a dim-dimensional dense vector using signed
 // feature hashing (Weinberger et al.). Each token is hashed to a dimension and a
 // sign, so token counts accumulate into a dense vector whose inner products are
 // unbiased estimates of the sparse bag-of-words inner products. The result is
 // L2-normalized so pgvector cosine distance (`<=>`) is a meaningful similarity.
 // It is deterministic and requires no model, keeping the backend self-contained.
-func denseEmbedding(text string) []float32 {
-	vector := make([]float32, embeddingDim)
+func denseEmbedding(text string, dim int) []float32 {
+	if dim <= 0 {
+		dim = embeddingDim
+	}
+	vector := make([]float32, dim)
 	for _, token := range tokenize(text) {
 		h := fnv.New64a()
 		_, _ = h.Write([]byte(token))
 		sum := h.Sum64()
-		idx := sum % embeddingDim
+		idx := sum % uint64(dim)
 		if sum&(1<<63) != 0 {
 			vector[idx]--
 		} else {
 			vector[idx]++
 		}
 	}
+	return normalize(vector)
+}
+
+// normalize L2-normalizes a dense vector in place and returns it, so cosine
+// distance stays valid regardless of the embedding source. A zero vector is
+// returned unchanged.
+func normalize(vector []float32) []float32 {
 	var norm float64
 	for _, v := range vector {
 		norm += float64(v) * float64(v)

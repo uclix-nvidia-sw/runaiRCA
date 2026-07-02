@@ -59,6 +59,13 @@ def make_settings() -> Settings:
         postgres_timeout_seconds=1,
         troubleshooting_cases_file="knowledge/troubleshooting_cases.md",
         failure_modes_file="knowledge/failure_modes.yaml",
+        runai_alerts_file="knowledge/runai_alerts_catalog.yaml",
+        enable_system_agent=False,
+        system_agent_url="",
+        system_agent_token="",
+        system_agent_timeout_seconds=6,
+        enable_pod_exec=False,
+        pod_exec_timeout_seconds=10,
         agent_souls_file="prompts/agent_souls.md",
         masking_regex_list=(),
         builtin_redaction_enabled=True,
@@ -77,6 +84,8 @@ def make_settings() -> Settings:
         typedb_tls_enabled=False,
         typedb_timeout_seconds=1,
         enable_typedb=False,
+        enable_investigation_loop=False,
+        max_investigation_steps=4,
     )
 
 
@@ -297,8 +306,27 @@ async def test_analyze_returns_unified_artifacts() -> None:
         "postgres",
         "prometheus",
         "loki",
+        "system",
+        "change",
     }
     assert response.capabilities["runai"] in {"partial", "ok"}
+    # Self-check must never leave a dangling empty section: if the header is
+    # present, a non-empty caveat body must follow it.
+    detail = response.analysis_detail
+    if "## Self-Check" in detail:
+        body = detail.split("## Self-Check", 1)[1]
+        assert body.strip(), "empty ## Self-Check section appended"
+    # The report must read as a document: Problem -> Root Cause -> Recommended
+    # Actions -> Appendix, in that order (Word-export skeleton).
+    order = [
+        detail.find("# Incident Analysis Report"),
+        detail.find("## 1. Problem"),
+        detail.find("## 2. Root Cause"),
+        detail.find("## 3. Recommended Actions"),
+        detail.find("## 4. Appendix"),
+    ]
+    assert all(idx >= 0 for idx in order), f"missing report section: {order}"
+    assert order == sorted(order), f"report sections out of order: {order}"
 
 
 @pytest.mark.asyncio
@@ -340,6 +368,81 @@ async def test_analyze_includes_similar_incidents_and_feedback_hints() -> None:
 
 
 @pytest.mark.asyncio
+async def test_analyze_includes_investigation_plan_section() -> None:
+    orchestrator = AnalysisOrchestrator(make_settings())
+    response = await orchestrator.analyze(
+        AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={"alertname": "NodeDiskPressure", "namespace": "monitoring"},
+                annotations={"summary": "Node under disk pressure."},
+                fingerprint="fp-plan",
+            )
+        )
+    )
+
+    assert "## Investigation Plan" in response.analysis_detail
+    plan = response.context["plan"]
+    # non-runai namespace, no keywords, no match -> control plane out of scope
+    assert plan["check_control_plane"] is False
+    assert plan["strategy"] == "breadth_first"
+
+
+@pytest.mark.asyncio
+async def test_analyze_excludes_low_similarity_incidents() -> None:
+    orchestrator = AnalysisOrchestrator(make_settings())
+    response = await orchestrator.analyze(
+        AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={"alertname": "NodeDiskPressure", "namespace": "monitoring"},
+                annotations={"summary": "Node under disk pressure."},
+                fingerprint="fp-lowsim",
+            ),
+            similar_incidents=[
+                SimilarIncidentContext(
+                    incident_id="INC-LOW",
+                    title="Weak match",
+                    similarity=0.70,
+                    analysis_summary="Not really related.",
+                )
+            ],
+        )
+    )
+
+    assert "No similar past incident found." in response.analysis_detail
+    assert "INC-LOW" not in response.analysis_detail
+
+
+@pytest.mark.asyncio
+async def test_analyze_weaves_similar_incident_fix_into_actions() -> None:
+    orchestrator = AnalysisOrchestrator(make_settings())
+    response = await orchestrator.analyze(
+        AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={"alertname": "RunAIWorkloadPending", "namespace": "runai-vision"},
+                annotations={"summary": "Pending workload waiting for GPU quota."},
+                fingerprint="fp-weave",
+            ),
+            similar_incidents=[
+                SimilarIncidentContext(
+                    incident_id="INC-HIGH",
+                    title="Prior quota saturation",
+                    similarity=0.88,
+                    analysis_summary="Raised queue gpu-a quota to clear the backlog.",
+                )
+            ],
+        )
+    )
+
+    recommended = response.analysis_detail.split("## 3. Recommended Actions", 1)[1]
+    actions_block = recommended.split("##", 1)[0]
+    assert "INC-HIGH" in actions_block
+    assert "Raised queue gpu-a quota" in actions_block
+
+
+@pytest.mark.asyncio
 async def test_analyze_lists_grouped_pods() -> None:
     orchestrator = AnalysisOrchestrator(make_settings())
     response = await orchestrator.analyze(
@@ -368,7 +471,7 @@ async def test_analyze_lists_grouped_pods() -> None:
 @pytest.mark.asyncio
 async def test_analyze_isolates_collector_exceptions() -> None:
     class ExplodingCollector:
-        async def collect(self, target):
+        async def collect(self, target, plan=None):
             raise RuntimeError("collector boom")
 
     orchestrator = AnalysisOrchestrator(make_settings())

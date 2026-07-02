@@ -36,6 +36,10 @@ attribute blast_radius, value string;
 attribute subtype, value string;
 attribute statement, value string;
 attribute created_at, value datetime;
+# --- XID GPU-error catalog attributes ---
+attribute xid_code, value integer;
+attribute mnemonic, value string;
+attribute description, value string;
 
 # --- entities ---------------------------------------------------------------
 entity cluster,
@@ -149,6 +153,8 @@ entity scheduling_quota_exhaustion sub root_cause;
 entity control_plane_error sub root_cause;
 entity workload_startup_image_failure sub root_cause;
 entity insufficient_evidence sub root_cause;
+# 6th family: NVIDIA XID GPU hardware faults (see knowledge/xid_catalog.yaml).
+entity gpu_hardware_error sub root_cause;
 
 entity action,
     owns statement,
@@ -183,3 +189,46 @@ relation supported_by, relates claim, relates proof;      # (symptom|root_cause)
 relation analyzed_by, relates incident, relates run;
 relation similar_to, relates this, relates other;
 relation emits, relates emitter, relates signal;          # component emits evidence/symptom
+
+# --- XID GPU-error catalog ---------------------------------------------------
+# A first-class GPU-hardware-fault RCA path. An xid_error is a catalog entry
+# (one NVIDIA XID code); it applies_to the GPU models it can occur on, indicates
+# the gpu_hardware_error root_cause family, and is resolved_by action(s). We
+# reuse the existing `indicates`/`resolved_by`/`action` machinery so the
+# knowledge layer stays uniform — xid_error slots in wherever a symptom does.
+entity xid_error,
+    owns xid_code @key,
+    owns mnemonic,
+    owns description,
+    owns severity,
+    plays applies_to:fault,
+    plays indicates:symptom,      # xid_error indicates gpu_hardware_error
+    plays resolved_by:symptom,    # xid_error resolved_by action
+    plays leads_to:cause_fault,   # this XID escalates to another XID...
+    plays leads_to:effect_fault;  # ...and can itself be an escalation target
+
+entity gpu_model,
+    owns name @key,
+    plays applies_to:model;
+
+relation applies_to, relates fault, relates model;  # xid_error applies_to gpu_model
+
+# Causal chain between XIDs: cause_fault escalates to / results in effect_fault
+# (e.g. NVLink faults 144-146 lead to Xid 48/45/94/95; many faults report via 154).
+# Edges come from xid_catalog.yaml `leads_to`, loaded by ontology/load_xids.py.
+relation leads_to, relates cause_fault, relates effect_fault;
+
+# --- inference (TypeDB 3.x) --------------------------------------------------
+# NOTE: TypeDB 3.0 REMOVED the 2.x `rule <name>: when { } then { };` reasoning
+# construct (it is replaced by `define fun` functions). A 2.x-style rule in this
+# `define` would make the WHOLE schema fail to load on 3.11 — so there is none.
+#
+# The inference those rules would have derived is instead MATERIALIZED at load
+# time by ontology/load_xids.py: it inserts an explicit `indicates` edge from
+# every xid_error to the gpu_hardware_error root cause, plus `applies_to`
+# (gpu_model) and `resolved_by` (action) edges. Severity + the resolved_by
+# actions carry the fatal/escalation nuance (RESET_GPU / CONTACT_SUPPORT vs
+# IGNORE), so no rule is needed to make XIDs first-class RCA candidates.
+#
+# If declarative, query-time reasoning is wanted later, add `define fun`
+# functions here — that is the 3.x equivalent and needs live TypeDB validation.

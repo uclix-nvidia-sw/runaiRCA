@@ -1,0 +1,192 @@
+{{- if .Values.systemAgent.enabled }}
+{{- $name := printf "%s-system-agent" (include "runai-rca.fullname" .) -}}
+{{- $tokenSecretName := printf "%s-token" $name -}}
+{{- /* Shared bearer token gating the node-log endpoint. Auto-generated and kept
+       stable across upgrades via lookup; override with systemAgent.authToken. */ -}}
+{{- $token := .Values.systemAgent.authToken -}}
+{{- if not $token -}}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $tokenSecretName -}}
+{{- if and $existing $existing.data (index $existing.data "token") -}}
+{{- $token = index $existing.data "token" | b64dec -}}
+{{- else -}}
+{{- $token = randAlphaNum 32 -}}
+{{- end -}}
+{{- end -}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $tokenSecretName }}
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: system-agent
+type: Opaque
+stringData:
+  token: {{ $token | quote }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: system-agent
+data:
+  # Tiny read-only log endpoint. stdlib only, no deps.
+  # GET /logs?source=dmesg|journal|syslog&lines=N&grep=REGEX -> {"lines": [...]}
+  # ponytail: stdlib http.server is enough for a per-node read endpoint; no framework.
+  server.py: |
+    import os, re, subprocess
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    PORT = int(os.environ.get("PORT", "9095"))
+    MAX_LINES = 2000
+    # Shared bearer token; when set, /logs requires "Authorization: Bearer <token>".
+    TOKEN = os.environ.get("SYSTEM_AGENT_TOKEN", "")
+    # nsenter into PID 1 (host) so dmesg/journalctl read the node, not the container.
+    NSENTER = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"]
+    SOURCES = {
+        "dmesg": NSENTER + ["dmesg", "-T"],
+        "journal": NSENTER + ["journalctl", "-k", "--no-pager", "-n"],
+        # syslog/kern.log are bind-mounted read-only at /host/var/log.
+        "syslog": None,
+    }
+
+    def read_syslog(lines):
+        out = []
+        for path in ("/host/var/log/syslog", "/host/var/log/kern.log", "/host/var/log/messages"):
+            if os.path.exists(path):
+                with open(path, errors="replace") as fh:
+                    out = fh.read().splitlines()
+                break
+        return out[-lines:]
+
+    def collect(source, lines):
+        if source == "syslog":
+            return read_syslog(lines)
+        cmd = SOURCES[source]
+        if source == "journal":
+            cmd = cmd + [str(lines)]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        except Exception as exc:
+            return ["system-agent error: %s" % exc]
+        return res.stdout.splitlines()[-lines:]
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            u = urlparse(self.path)
+            if u.path == "/healthz":
+                self.send_response(200); self.end_headers(); self.wfile.write(b"ok"); return
+            if TOKEN and self.headers.get("Authorization", "") != "Bearer " + TOKEN:
+                self.send_response(401); self.end_headers(); return
+            if u.path != "/logs":
+                self.send_response(404); self.end_headers(); return
+            q = parse_qs(u.query)
+            source = (q.get("source", ["dmesg"])[0]).lower()
+            if source not in SOURCES:
+                self.send_response(400); self.end_headers(); return
+            try:
+                lines = min(int(q.get("lines", ["500"])[0]), MAX_LINES)
+            except ValueError:
+                lines = 500
+            data = collect(source, lines)
+            grep = q.get("grep", [""])[0]
+            if grep:
+                rx = re.compile(grep, re.IGNORECASE)
+                data = [ln for ln in data if rx.search(ln)]
+            import json
+            body = json.dumps({"source": source, "lines": data}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+    if __name__ == "__main__":
+        ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: system-agent
+spec:
+  selector:
+    matchLabels:
+      {{- include "runai-rca.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: system-agent
+  template:
+    metadata:
+      labels:
+        {{- include "runai-rca.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: system-agent
+    spec:
+      serviceAccountName: {{ $name }}
+      # hostNetwork so the agent reaches each node at http://<node-ip>:<port>.
+      hostNetwork: true
+      hostPID: true
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: system-agent
+          image: {{ include "runai-rca.image" (dict "root" . "image" .Values.systemAgent.image) | quote }}
+          imagePullPolicy: {{ .Values.systemAgent.image.pullPolicy }}
+          command: ["python3", "/opt/system-agent/server.py"]
+          securityContext:
+            privileged: true
+          ports:
+            - name: http
+              containerPort: {{ .Values.systemAgent.port }}
+              hostPort: {{ .Values.systemAgent.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.systemAgent.port | quote }}
+            - name: SYSTEM_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $tokenSecretName }}
+                  key: token
+          volumeMounts:
+            - name: server
+              mountPath: /opt/system-agent
+              readOnly: true
+            - name: host-var-log
+              mountPath: /host/var/log
+              readOnly: true
+            - name: host-journal
+              mountPath: /run/log/journal
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            {{- toYaml .Values.systemAgent.resources | nindent 12 }}
+      volumes:
+        - name: server
+          configMap:
+            name: {{ $name }}
+        - name: host-var-log
+          hostPath:
+            path: /var/log
+            type: Directory
+        - name: host-journal
+          hostPath:
+            path: /run/log/journal
+            type: DirectoryOrCreate
+      {{- with .Values.systemAgent.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.systemAgent.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

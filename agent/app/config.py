@@ -93,6 +93,13 @@ class Settings:
     postgres_timeout_seconds: int
     troubleshooting_cases_file: str
     failure_modes_file: str
+    runai_alerts_file: str
+    enable_system_agent: bool
+    system_agent_url: str
+    system_agent_token: str
+    system_agent_timeout_seconds: int
+    enable_pod_exec: bool
+    pod_exec_timeout_seconds: int
     agent_souls_file: str
     masking_regex_list: tuple[str, ...]
     builtin_redaction_enabled: bool
@@ -111,6 +118,8 @@ class Settings:
     typedb_tls_enabled: bool
     typedb_timeout_seconds: int
     enable_typedb: bool
+    enable_investigation_loop: bool
+    max_investigation_steps: int
 
 
 def load_settings() -> Settings:
@@ -168,6 +177,19 @@ def load_settings() -> Settings:
             "FAILURE_MODES_FILE",
             "knowledge/failure_modes.yaml",
         ).strip(),
+        runai_alerts_file=os.getenv(
+            "RUNAI_ALERTS_FILE",
+            "knowledge/runai_alerts_catalog.yaml",
+        ).strip(),
+        # System agent (node infra: syslog/journalctl/dmesg via the per-node DaemonSet).
+        # On by default; degrades to "unavailable" when SYSTEM_AGENT_URL isn't set.
+        enable_system_agent=_bool_env("ENABLE_SYSTEM_AGENT", True),
+        system_agent_url=os.getenv("SYSTEM_AGENT_URL", "").strip().rstrip("/"),
+        system_agent_token=os.getenv("SYSTEM_AGENT_TOKEN", "").strip(),
+        system_agent_timeout_seconds=_int_env("SYSTEM_AGENT_TIMEOUT_SECONDS", 6),
+        # Read-only pod exec for the Kubernetes agent (view container state/logs; no mutations).
+        enable_pod_exec=_bool_env("ENABLE_POD_EXEC", True),
+        pod_exec_timeout_seconds=_int_env("POD_EXEC_TIMEOUT_SECONDS", 10),
         agent_souls_file=os.getenv("AGENT_SOULS_FILE", "prompts/agent_souls.md").strip(),
         masking_regex_list=_json_string_list_env("MASKING_REGEX_LIST_JSON"),
         builtin_redaction_enabled=_bool_env("BUILTIN_REDACTION_ENABLED", True),
@@ -188,4 +210,6 @@ def load_settings() -> Settings:
         typedb_tls_enabled=_bool_env("TYPEDB_TLS_ENABLED", False),
         typedb_timeout_seconds=_int_env("TYPEDB_TIMEOUT_SECONDS", 6),
         enable_typedb=_bool_env("ENABLE_TYPEDB", False),
+        enable_investigation_loop=_bool_env("ENABLE_INVESTIGATION_LOOP", False),
+        max_investigation_steps=max(1, _int_env("MAX_INVESTIGATION_STEPS", 4)),
     )

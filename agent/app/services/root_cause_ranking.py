@@ -100,6 +100,7 @@ def rank_root_cause_candidates(
     occurrence_count: int = 0,
     top_n: int = 3,
     kg_blast_radius: int = 0,
+    priors: dict[str, float] | None = None,
 ) -> list[RankedCause]:
     top_n = max(1, top_n)
     text_by_agent = {r.agent: _result_text(r) for r in results}
@@ -127,6 +128,15 @@ def rank_root_cause_candidates(
             s.rationale.append(f"{agent} evidence matched {', '.join(hits[:3])}")
 
     _apply_bonuses(scores, blast, blast_agents, occurrence_count)
+
+    # Optional feedback-derived priors nudge a family that already has a signal
+    # (multiplier on its score). Priors never create a candidate from nothing.
+    if priors:
+        for fam, s in scores.items():
+            factor = priors.get(fam)
+            if factor is not None and s.points > 0:
+                s.points *= factor
+                s.rationale.append(f"feedback prior adjusted score x{factor:.2f}")
 
     ranked = [
         RankedCause(

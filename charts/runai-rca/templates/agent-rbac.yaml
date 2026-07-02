@@ -35,6 +35,19 @@ rules:
       - pods
       - services
     verbs: ["get", "list", "watch"]
+  # Read-only container log inspection (pods/log subresource).
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  {{- if .Values.agent.env.enablePodExec }}
+  # pods/exec is read-only-by-policy: the agent only runs an allowlisted set of
+  # non-mutating diagnostic commands (nvidia-smi, cat /proc/driver/nvidia/version,
+  # env, ...). Enforced in code (exec_command_allowed); RBAC cannot scope by argv.
+  # Gated on enablePodExec so turning the feature off also drops the permission.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  {{- end }}
   - apiGroups: ["apps"]
     resources:
       - daemonsets
@@ -84,6 +97,19 @@ rules:
       - pods
       - services
     verbs: ["get", "list", "watch"]
+  # Read-only container log inspection (pods/log subresource).
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  {{- if $.Values.agent.env.enablePodExec }}
+  # pods/exec is read-only-by-policy: the agent only runs an allowlisted set of
+  # non-mutating diagnostic commands (nvidia-smi, cat /proc/driver/nvidia/version,
+  # env, ...). Enforced in code (exec_command_allowed); RBAC cannot scope by argv.
+  # Gated on enablePodExec so turning the feature off also drops the permission.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  {{- end }}
   - apiGroups: ["apps"]
     resources:
       - daemonsets

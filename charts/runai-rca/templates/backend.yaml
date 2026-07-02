@@ -83,6 +83,18 @@ spec:
               value: {{ .Values.backend.env.analysisBackfillBatch | quote }}
             - name: ANALYSIS_BACKFILL_RETRY_COOLDOWN_SECONDS
               value: {{ .Values.backend.env.analysisBackfillRetryCooldownSeconds | quote }}
+            - name: EMBEDDING_URL
+              value: {{ .Values.backend.env.embeddingUrl | quote }}
+            - name: EMBEDDING_MODEL
+              value: {{ .Values.backend.env.embeddingModel | quote }}
+            - name: EMBEDDING_DIM
+              value: {{ .Values.backend.env.embeddingDim | quote }}
+            - name: EMBEDDING_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "runai-rca.secretName" . }}
+                  key: {{ .Values.secrets.keys.embeddingApiKey | quote }}
+                  optional: true
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

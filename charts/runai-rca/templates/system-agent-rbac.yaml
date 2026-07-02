@@ -1,0 +1,9 @@
+{{- if .Values.systemAgent.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "runai-rca.fullname" . }}-system-agent
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: system-agent
+{{- end }}

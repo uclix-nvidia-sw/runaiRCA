@@ -38,6 +38,7 @@ FAMILIES = {
     "scheduling_quota_exhaustion",
     "control_plane_error",
     "workload_startup_image_failure",
+    "gpu_hardware_error",
     "insufficient_evidence",
 }
 

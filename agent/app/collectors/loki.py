@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import base64
+import json
 
-from app.collectors.base import AnalysisTarget, CollectorResult, artifact
+from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
+from app.llm import complete, llm_configured
 
 
 class LokiCollector:
@@ -13,9 +15,9 @@ class LokiCollector:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    async def collect(self, target: AnalysisTarget) -> CollectorResult:
+    async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:
         if not self._settings.loki_url:
-            summary = "Loki is not configured; log evidence was skipped."
+            summary = f"{NO_EVIDENCE} Loki is not configured; log evidence was skipped."
             return CollectorResult(
                 agent=self.name,
                 status="unavailable",
@@ -35,10 +37,17 @@ class LokiCollector:
                 ],
             )
 
-        selector = _selector_for(target)
+        selector = _selector_for(target, plan)
         error_query = f'{selector} |~ "(?i)(error|fail|oom|evict|crash|pending|unschedul|back-off)"'
         queries = [("error_logs", error_query), ("recent_logs", selector)]
-        runai_selector = _namespace_regex_selector(self._settings.runai_log_namespaces)
+        # Control-plane sweep only when the plan says this alert implicates Run:ai —
+        # otherwise every alert scraped runai/runai-backend and skewed ranking.
+        control_plane_in_scope = plan.check_control_plane if plan is not None else True
+        runai_selector = (
+            _namespace_regex_selector(self._settings.runai_log_namespaces)
+            if control_plane_in_scope
+            else ""
+        )
         if runai_selector:
             # Require an error-indicating term to co-occur with the control-plane
             # subsystem (or an outright panic/fatal). The previous broad
@@ -102,14 +111,17 @@ class LokiCollector:
             status = "partial"
             confidence = "medium"
             summary = (
-                "Loki is reachable, but the workload log queries returned no lines. "
-                "Check label names and log retention."
+                f"{NO_EVIDENCE} Loki is reachable, but the workload log queries returned "
+                "no lines. Check label names and log retention."
             )
         else:
             status = "unavailable"
             confidence = "low"
-            summary = "Loki direct queries failed."
+            summary = f"{NO_EVIDENCE} Loki direct queries failed."
 
+        insight = await _llm_insight(self._settings, "Loki logs", summary, query_results)
+        if insight:
+            summary = insight
         result = {
             "loki_url": self._settings.loki_url,
             "queries": query_results,
@@ -138,6 +150,44 @@ class LokiCollector:
                 )
             ],
         )
+
+
+async def _llm_insight(
+    settings: Settings, source: str, deterministic: str, evidence: object
+) -> str | None:
+    """Distill raw collector evidence into ONE senior-SRE insight line.
+
+    Returns None when no LLM is configured or the call fails, so callers keep
+    their deterministic summary.
+    """
+    if not llm_configured(settings):
+        return None
+    try:
+        blob = json.dumps(evidence, default=str)[:3000]
+    except (TypeError, ValueError):
+        blob = str(evidence)[:3000]
+    system = (
+        "You are a senior SRE reporting a finding to a colleague. From this one "
+        "collector's raw evidence, write ONE (max two) sentence shaped: what you "
+        "OBSERVED -> what it MEANS -> WHEN it started (include timestamps/counts when "
+        "the data has them, e.g. 'reconcile failures repeating 40x since 10:52 — began "
+        "6 minutes before the alert'). Grounded ONLY in the given evidence; never "
+        "invent. If nothing notable, say so briefly. No preamble, no markdown."
+    )
+    if getattr(settings, "language", "en") == "ko":
+        system += (
+            " 한국어로 답하세요 (관찰한 것 → 의미 → 시작 시점). "
+            "증거가 없으면 '증거를 찾기 어렵습니다.'라고만 답하세요."
+        )
+    text = await complete(
+        settings,
+        system=system,
+        user=f"Source: {source}\nDeterministic summary: {deterministic}\nRaw evidence:\n{blob}",
+        max_tokens=160,
+    )
+    if not text:
+        return None
+    return " ".join(text.split())[:400]
 
 
 def _loki_headers(settings: Settings) -> tuple[dict[str, str], list[str]]:
@@ -187,14 +237,23 @@ def _loki_unauthorized_warning(settings: Settings) -> str:
     )
 
 
-def _selector_for(target: AnalysisTarget) -> str:
+def _selector_for(target: AnalysisTarget, plan=None) -> str:
+    namespace = target.namespace
+    pod = target.pod
+    workload = target.workload_name
+    if plan is not None:
+        # Plan scopes the query; fall back to target values it does not override.
+        if plan.namespaces:
+            namespace = plan.namespaces[0]
+        pod = plan.pod or pod
+        workload = plan.workload or workload
     selector_parts = []
-    if target.namespace:
-        selector_parts.append(f'namespace="{target.namespace}"')
-    if target.pod:
-        selector_parts.append(f'pod="{target.pod}"')
-    elif target.workload_name:
-        selector_parts.append(f'app=~".*{target.workload_name}.*"')
+    if namespace:
+        selector_parts.append(f'namespace="{namespace}"')
+    if pod:
+        selector_parts.append(f'pod="{pod}"')
+    elif workload:
+        selector_parts.append(f'app=~".*{workload}.*"')
     return "{" + ",".join(selector_parts) + "}" if selector_parts else "{}"
 
 

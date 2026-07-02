@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from app.collectors.base import AnalysisTarget, CollectorResult, artifact
+from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
+from app.collectors.loki import _llm_insight
 from app.config import Settings
 
 
@@ -13,11 +14,11 @@ class PostgresCollector:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    async def collect(self, target: AnalysisTarget) -> CollectorResult:
+    async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:
         if not self._settings.postgres_dsn:
             summary = (
-                "Postgres DSN is not configured; database health, incident-store, "
-                "and pgvector evidence were skipped."
+                f"{NO_EVIDENCE} Postgres DSN is not configured; database health, "
+                "incident-store, and pgvector evidence were skipped."
             )
             return CollectorResult(
                 agent=self.name,
@@ -42,7 +43,10 @@ class PostgresCollector:
         try:
             import asyncpg
         except ImportError:
-            summary = "asyncpg is not installed, so Postgres diagnostics could not run."
+            summary = (
+                f"{NO_EVIDENCE} asyncpg is not installed, so Postgres diagnostics "
+                "could not run."
+            )
             return CollectorResult(
                 agent=self.name,
                 status="unavailable",
@@ -69,7 +73,7 @@ class PostgresCollector:
                 timeout=timeout + 1,
             )
         except Exception as exc:  # noqa: BLE001 - collector reports diagnostics, not failures.
-            summary = f"Postgres connection failed: {exc.__class__.__name__}."
+            summary = f"{NO_EVIDENCE} Postgres connection failed: {exc.__class__.__name__}."
             return CollectorResult(
                 agent=self.name,
                 status="partial",
@@ -117,6 +121,9 @@ class PostgresCollector:
             f"{checks['active_connections']} active connection(s), "
             f"pgvector={'installed' if pgvector else 'missing'}."
         )
+        insight = await _llm_insight(self._settings, "Postgres diagnostics", summary, checks)
+        if insight:
+            summary = insight
         return CollectorResult(
             agent=self.name,
             status=status,
