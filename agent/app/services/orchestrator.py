@@ -7,6 +7,7 @@ import re
 import subprocess
 import tempfile
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from typing import TypeVar
 from uuid import uuid4
@@ -23,7 +24,7 @@ from app.collectors.runai import RunAICollector
 from app.collectors.system import SystemCollector
 from app.config import Settings
 from app.knowledge import load_failure_modes, load_troubleshooting_cases
-from app.llm import complete, llm_configured
+from app.llm import complete, complete_json, llm_configured
 from app.masking import Masker, build_masker
 from app.plan import InvestigationPlan
 from app.prompts import agent_role_coverage_lines, load_agent_souls
@@ -238,6 +239,8 @@ class AnalysisOrchestrator:
         # Optional self-check: refute the top cause, apply its calibrated confidence
         # to the top candidate, and keep the caveat text for the report.
         self_check_caveat = ""
+        self_check_refuted = False
+        self_check_next = ""
         try:
             from app.services.self_check import refute_top_cause
         except ImportError:
@@ -252,6 +255,50 @@ class AnalysisOrchestrator:
                     if calibrated in ("low", "medium", "high"):
                         root_cause_candidates[0].confidence = calibrated
                     self_check_caveat = str(check.get("caveat") or "").strip()
+                    self_check_refuted = bool(check.get("refuted"))
+                    self_check_next = str(check.get("next_check") or "").strip()
+        # RE-ANALYSIS ON REFUTATION (LLM-gated): when the self-check refuted the top
+        # cause, do EXACTLY ONE bounded re-analysis pass leading with the next-best
+        # hypothesis. Hard guard: this block runs once and never re-enters analyze().
+        reanalysis_note = ""
+        if (
+            self_check_refuted
+            and root_cause_candidates
+            and llm_configured(self._settings)
+            and self._settings.enable_investigation_loop
+        ):
+            outcome = await self._reanalyze_once(
+                target=target,
+                plan=plan,
+                kg_context=kg_context,
+                results=results,
+                request=request,
+                priors=priors,
+                refuted_family=root_cause_candidates[0].family,
+                prior_candidates=root_cause_candidates,
+            )
+            if outcome is not None:
+                (
+                    results,
+                    root_cause_candidates,
+                    self_check_caveat,
+                    reanalysis_note,
+                    self_check_refuted,
+                    self_check_next,
+                ) = outcome
+                # Re-derive the evidence aggregates from the merged results.
+                capabilities = {result.agent: result.status for result in results}
+                artifacts = [
+                    artifact for result in results for artifact in result.artifacts
+                ]
+                missing = sorted(
+                    {item for result in results for item in result.missing_data}
+                )
+                warnings = sorted(
+                    {item for result in results for item in result.warnings}
+                    | set(nat_warnings)
+                    | set(kg_context.warnings)
+                )
         # Graph-derived remediation from the validated TypeDB reasoning functions,
         # keyed to the ranked top family + any Xid codes / GPU model in the evidence.
         # Best-effort: an empty result when TypeDB is off/unreachable.
@@ -309,9 +356,28 @@ class AnalysisOrchestrator:
             if synth:
                 summary, detail = synth
 
-        # Self-check caveat (optional hook) appended verbatim to the final report.
-        if self_check_caveat:
-            detail = f"{detail}\n\n## Self-Check\n\n{self_check_caveat}"
+        # Self-check caveat (optional hook) + re-analysis note appended verbatim.
+        self_check_lines = [text for text in (self_check_caveat, reanalysis_note) if text]
+        if self_check_lines:
+            detail = f"{detail}\n\n## Self-Check\n\n" + "\n\n".join(self_check_lines)
+
+        # Operator questions: when the RCA could not settle (insufficient evidence,
+        # or still refuted after re-analysis), honestly ask for the missing inputs.
+        if top_family in ("", "insufficient_evidence") or self_check_refuted:
+            try:
+                questions = await _operator_questions(
+                    self._settings, missing, plan, target, self_check_next
+                )
+            except Exception:  # noqa: BLE001 - questions are best-effort
+                questions = []
+            if questions:
+                header = (
+                    "## 추가 확인 요청"
+                    if getattr(self._settings, "language", "en") == "ko"
+                    else "## Questions for the Operator"
+                )
+                body = "\n".join(f"- {question}" for question in questions)
+                detail = f"{detail}\n\n{header}\n\n{body}"
 
         response = AlertAnalysisResponse(
             status="ok",
@@ -428,6 +494,108 @@ class AnalysisOrchestrator:
             conversation_id=request.conversation_id or f"chat-{uuid4().hex[:10]}",
         )
         return _mask_model(response, ChatResponse, self._masker)
+
+    async def _reanalyze_once(
+        self,
+        *,
+        target: AnalysisTarget,
+        plan: InvestigationPlan,
+        kg_context: object,
+        results: list[CollectorResult],
+        request: AlertAnalysisRequest,
+        priors: dict[str, float] | None,
+        refuted_family: str,
+        prior_candidates: list[RankedCause],
+    ) -> tuple[list[CollectorResult], list[RankedCause], str, str, bool, str] | None:
+        """EXACTLY ONE bounded re-analysis pass after the self-check refuted the top cause.
+
+        Leads with the next-best hypothesis, re-runs a small investigation, merges the
+        fresh evidence by agent name, re-ranks, and refutes the new top ONCE. Returns
+        (results, candidates, caveat, note, refuted, next_check), or None on ANY
+        failure so the caller keeps the pre-re-analysis result. Never re-enters.
+        """
+        try:
+            from app.services.investigator import investigate
+            from app.services.self_check import refute_top_cause
+
+            kg_dict = kg_context.as_dict()  # type: ignore[attr-defined]
+            kg_blast = getattr(kg_context, "blast_radius_workloads", 0)
+            # Next-best hypothesis: candidates[1] when usable, else re-rank and take
+            # the best family that is neither the refuted one nor the fallback gate.
+            next_cause = None
+            pool = list(prior_candidates[1:]) or rank_root_cause_candidates(
+                target,
+                results,
+                occurrence_count=request.occurrence_count,
+                top_n=5,
+                kg_blast_radius=kg_blast,
+                priors=priors,
+            )
+            for candidate in pool:
+                if candidate.family not in (refuted_family, "insufficient_evidence"):
+                    next_cause = candidate
+                    break
+            if next_cause is None:
+                return None
+
+            lead = {
+                "family": next_cause.family,
+                "reason": "re-analysis after the first conclusion was refuted",
+            }
+            rest = [
+                h
+                for h in (plan.hypotheses or [])
+                if isinstance(h, dict) and h.get("family") != next_cause.family
+            ]
+            replan = replace(plan, hypotheses=[lead, *rest])
+            fresh = await investigate(
+                self._settings,
+                target,
+                self._collectors,
+                replan,
+                kg_dict,
+                min(2, self._settings.max_investigation_steps),
+            )
+            merged = {result.agent: result for result in results}
+            for result in fresh:
+                merged[result.agent] = result
+            merged_results = list(merged.values())
+
+            candidates = rank_root_cause_candidates(
+                target,
+                merged_results,
+                occurrence_count=request.occurrence_count,
+                kg_blast_radius=kg_blast,
+                priors=priors,
+            )
+            caveat = ""
+            refuted = False
+            next_check = ""
+            if candidates:
+                check = await refute_top_cause(
+                    self._settings, candidates[0], merged_results
+                )
+                if isinstance(check, dict):
+                    calibrated = check.get("confidence")
+                    if calibrated in ("low", "medium", "high"):
+                        candidates[0].confidence = calibrated
+                    caveat = str(check.get("caveat") or "").strip()
+                    refuted = bool(check.get("refuted"))
+                    next_check = str(check.get("next_check") or "").strip()
+            new_family = candidates[0].family if candidates else "insufficient_evidence"
+            if getattr(self._settings, "language", "en") == "ko":
+                note = (
+                    f"1차 결론({refuted_family})이 반증되어 재분석을 수행했습니다 → "
+                    f"재분석 결론: {new_family}"
+                )
+            else:
+                note = (
+                    f"The initial conclusion ({refuted_family}) was refuted, so one "
+                    f"re-analysis pass was performed → revised conclusion: {new_family}."
+                )
+            return merged_results, candidates, caveat, note, refuted, next_check
+        except Exception:  # noqa: BLE001 - re-analysis is best-effort; keep 1st result
+            return None
 
     async def _llm_chat_answer(self, request: ChatRequest, grounding: str) -> str | None:
         question = (request.message or "").strip()
@@ -1081,6 +1249,118 @@ def _recommended_action_lines(
             "evidence stay current."
         )
     return lines
+
+
+async def _operator_questions(
+    settings: Settings,
+    missing: list[str],
+    plan: InvestigationPlan | None,
+    target: AnalysisTarget,
+    next_check: str,
+) -> list[str]:
+    """2-4 concrete follow-up questions when the RCA could not settle.
+
+    Derived deterministically from missing_data + the plan; the LLM only sharpens
+    the wording when configured (deterministic list is the fallback).
+    """
+    ko = getattr(settings, "language", "en") == "ko"
+
+    def has(prefix: str) -> bool:
+        return any(item.startswith(prefix) for item in missing)
+
+    questions: list[str] = []
+    if next_check:
+        questions.append(next_check)
+    if has("loki."):
+        questions.append(
+            "Loki 주소(LOKI_URL)가 설정되어 있고 에이전트에서 접근 가능한지 확인해 주세요."
+            if ko
+            else "Is the Loki URL configured and reachable from the agent?"
+        )
+    if has("runai."):
+        questions.append(
+            "Run:ai API 인증 정보(토큰 또는 클라이언트 ID/시크릿)가 유효한지 확인해 주세요."
+            if ko
+            else "Are the Run:ai API credentials (token or client id/secret) still valid?"
+        )
+    if has("prometheus."):
+        questions.append(
+            "Prometheus 주소(PROMETHEUS_URL)가 설정되어 있는지 확인해 주세요."
+            if ko
+            else "Is the Prometheus URL configured for the agent?"
+        )
+    if has("postgres."):
+        questions.append(
+            "Postgres 연결 정보(DSN)가 설정되어 있는지 확인해 주세요."
+            if ko
+            else "Is the Postgres DSN configured so RCA memory can be consulted?"
+        )
+    if has("kubernetes."):
+        questions.append(
+            "에이전트의 Kubernetes 서비스 계정 토큰이 유효한지 확인해 주세요."
+            if ko
+            else "Is the agent's Kubernetes service-account token valid?"
+        )
+    namespaces = list(plan.namespaces) if plan else []
+    if has("system_agent.") or not (target.namespace or namespaces):
+        questions.append(
+            "이 알림이 발생한 노드에 접근(시스템 에이전트 등)이 가능한지 확인해 주세요."
+            if ko
+            else "Is the node this alert fired on accessible (system agent or SSH)?"
+        )
+    if len(questions) < 2:
+        questions.append(
+            "알림 발생 시각 전후에 배포나 설정 변경이 있었는지 확인해 주세요."
+            if ko
+            else "Were there any deployments or config changes around the alert time?"
+        )
+    questions = questions[:4]
+
+    if llm_configured(settings):
+        try:
+            sharpened = await _sharpen_operator_questions(settings, questions, missing, plan)
+        except Exception:  # noqa: BLE001 - sharpening is best-effort
+            sharpened = None
+        if sharpened:
+            return sharpened
+    return questions
+
+
+async def _sharpen_operator_questions(
+    settings: Settings,
+    questions: list[str],
+    missing: list[str],
+    plan: InvestigationPlan | None,
+) -> list[str] | None:
+    """LLM-sharpened operator questions; None keeps the deterministic list."""
+    ko = getattr(settings, "language", "en") == "ko"
+    system = (
+        "You review operator-facing follow-up questions for an RCA that could not "
+        "settle on a root cause. Rewrite the draft questions to be sharper and more "
+        "specific to the missing data and investigation plan. Do not invent facts, "
+        "do not add generic filler. "
+        + ("반드시 한국어로 작성하세요. " if ko else "Write in English. ")
+        + 'Respond with ONLY JSON: {"questions": [str, ...]} containing 2 to 4 questions.'
+    )
+    user = json.dumps(
+        {
+            "draft_questions": questions,
+            "missing_data": missing,
+            "plan": plan.as_dict() if plan else {},
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+    data = await complete_json(settings, system=system, user=user, temperature=0.2)
+    if not isinstance(data, dict):
+        return None
+    raw = data.get("questions")
+    if not isinstance(raw, list):
+        return None
+    cleaned = [str(item).strip() for item in raw if str(item).strip()]
+    if 2 <= len(cleaned) <= 4:
+        return cleaned
+    return None
 
 
 # Xid codes appear as "Xid 79", "Xid: 79", or "NVRM: Xid (PCI:0000:3b:00): 79" —

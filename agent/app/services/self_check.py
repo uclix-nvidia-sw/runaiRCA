@@ -13,7 +13,7 @@ confidence drops one level with a generic caveat. Otherwise confidence is kept.
 Never raises into analyze(): any failure returns a safe default that preserves
 the ranked confidence with no caveat.
 
-Return value is a `dict` (confidence/caveat/refuted) so callers can inspect it;
+Return value is a `dict` (confidence/caveat/refuted/next_check) so callers can inspect it;
 its str() is the caveat text so the orchestrator can append it to the report
 verbatim.
 """
@@ -35,8 +35,12 @@ class _Result(dict):
         return str(self.get("caveat") or "")
 
 
-def _default(confidence: str, caveat: str = "", refuted: bool = False) -> _Result:
-    return _Result(confidence=confidence, caveat=caveat, refuted=refuted)
+def _default(
+    confidence: str, caveat: str = "", refuted: bool = False, next_check: str = ""
+) -> _Result:
+    return _Result(
+        confidence=confidence, caveat=caveat, refuted=refuted, next_check=next_check
+    )
 
 
 def _downgrade(confidence: str) -> str:
@@ -86,6 +90,7 @@ async def refute_top_cause(
                     _downgrade(confidence),
                     _caveat_missing_evidence(family, settings),
                     refuted=False,
+                    next_check=_next_check_missing_evidence(family, settings),
                 )
             return _default(confidence)
 
@@ -93,18 +98,23 @@ async def refute_top_cause(
         if not verdict:
             # LLM failed/empty: fall back to the deterministic gate.
             if not has_evidence:
-                return _default(_downgrade(confidence), _caveat_missing_evidence(family, settings))
+                return _default(
+                    _downgrade(confidence),
+                    _caveat_missing_evidence(family, settings),
+                    next_check=_next_check_missing_evidence(family, settings),
+                )
             return _default(confidence)
 
         supported = bool(verdict.get("supported", True))
         caveat = str(verdict.get("caveat") or "").strip()
+        next_check = str(verdict.get("next_check") or "").strip()
         new_conf = confidence if supported else _downgrade(confidence)
         # Also honour an explicit weaker confidence from the model, never a stronger one.
         model_conf = str(verdict.get("confidence") or "").strip().lower()
         if model_conf in _CONF_ORDER:
             if _CONF_ORDER.index(model_conf) < _CONF_ORDER.index(new_conf):
                 new_conf = model_conf
-        return _default(new_conf, caveat, refuted=not supported)
+        return _default(new_conf, caveat, refuted=not supported, next_check=next_check)
     except Exception:  # noqa: BLE001 - self-check is best-effort; never break analyze()
         return _default(getattr(top_candidate, "confidence", "low"))
 
@@ -121,6 +131,14 @@ def _caveat_missing_evidence(family: str, settings: Settings) -> str:
         "no usable evidence, so confidence was lowered one level. Verify that source directly "
         "before acting."
     )
+
+
+def _next_check_missing_evidence(family: str, settings: Settings) -> str:
+    """The single settling check for the deterministic missing-evidence gate."""
+    canonical = _FAMILY_RULES.get(family, ("the canonical source",))[0]
+    if getattr(settings, "language", "en") == "ko":
+        return f"핵심 근거 수집기({canonical})에서 이 원인의 증거를 직접 확인해 주세요."
+    return f"Check the canonical evidence source ({canonical}) directly for this cause."
 
 
 async def _llm_refute(
@@ -141,10 +159,12 @@ async def _llm_refute(
         "it actually present, does a competing cause fit the evidence better, and what "
         "single check would settle it. Do not invent evidence. Be conservative: if the "
         "evidence does not clearly support the cause, mark it unsupported.\n"
-        f"Write the caveat in {caveat_lang}. Respond with a JSON object: "
-        '{"supported": bool, "confidence": "low|medium|high", "caveat": str}. '
+        f"Write the caveat and next_check in {caveat_lang}. Respond with a JSON object: "
+        '{"supported": bool, "confidence": "low|medium|high", "caveat": str, '
+        '"next_check": str}. '
         "The caveat is one or two sentences naming the strongest doubt and the single "
-        "check that would settle it."
+        "check that would settle it; next_check is that single settling check phrased "
+        "as one concrete instruction to the operator."
     )
     user = (
         f"Proposed root cause family: {top.family}\n"
