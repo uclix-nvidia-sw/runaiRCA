@@ -207,6 +207,12 @@ agent:
     enableNatRuntime: false
     natConfigFile: /app/configs/runai_rca_workflow.yml
     natTimeoutSeconds: 180
+    # Human-like iterative investigation: the orchestrator plans, probes the most
+    # relevant agent, observes, and re-plans (bounded by maxInvestigationSteps)
+    # instead of gathering everything once. Only active when an LLM is configured
+    # (no-op otherwise); each step is an extra LLM call, so it costs more per RCA.
+    enableInvestigationLoop: true
+    maxInvestigationSteps: 4
     runaiBaseUrl: ""
     runaiTokenUrl: ""
     runaiWorkloadsPath: /api/v1/workloads

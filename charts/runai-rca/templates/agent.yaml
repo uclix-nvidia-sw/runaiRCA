@@ -93,6 +93,10 @@ spec:
               value: {{ .Values.agent.env.natConfigFile | quote }}
             - name: NAT_TIMEOUT_SECONDS
               value: {{ .Values.agent.env.natTimeoutSeconds | quote }}
+            - name: ENABLE_INVESTIGATION_LOOP
+              value: {{ .Values.agent.env.enableInvestigationLoop | quote }}
+            - name: MAX_INVESTIGATION_STEPS
+              value: {{ .Values.agent.env.maxInvestigationSteps | quote }}
             - name: RUNAI_BASE_URL
               value: {{ .Values.agent.env.runaiBaseUrl | quote }}
             - name: RUNAI_TOKEN_URL
