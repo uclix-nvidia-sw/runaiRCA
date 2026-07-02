@@ -313,7 +313,7 @@ affinity: {}
 
 # Privileged DaemonSet exposing a read-only node log endpoint (dmesg/journal/syslog)
 # so the RCA agent can see host/kernel/GPU-driver events (NVIDIA XID, OOM, MCE, ...).
-# Disabled by default: it runs privileged with hostNetwork/hostPID on every node.
+# Enabled by default: it runs privileged with hostNetwork/hostPID on every node.
 # The agent reaches each node via http://{node}:port — set the agent's SYSTEM_AGENT_URL
 # to "http://{node}:9095" and ENABLE_SYSTEM_AGENT=true. Any base python image with
 # nsenter/journalctl works (e.g. a distro image with python3); it only runs stdlib code.
