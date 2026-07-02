@@ -7,7 +7,13 @@ from __future__ import annotations
 
 from app.knowledge import load_failure_modes, match_failure_mode_symptoms
 from app.schemas import Alert, AlertAnalysisRequest
-from app.services.orchestrator import _alert_text, _observed_text, _xid_codes_from_results
+from app.services.orchestrator import (
+    _alert_text,
+    _observed_text,
+    _promote_xid_cause,
+    _xid_codes_from_results,
+)
+from app.services.root_cause_ranking import RankedCause
 
 
 def _xid_request() -> AlertAnalysisRequest:
@@ -39,3 +45,22 @@ def test_symptom_matches_from_alert_text_alone() -> None:
 
 def test_observed_text_without_request_unchanged() -> None:
     assert _observed_text([]) == ""
+
+
+def test_xid_promotes_gpu_hardware_over_keyword_noise() -> None:
+    # Production complaint: XID alerts kept getting headlined node_kubelet_pressure
+    # because the k8s node-conditions text ("DiskPressure ... kubelet") feeds that
+    # family's keywords even when every condition is False. An XID is dispositive:
+    # gpu_hardware_error must lead the candidates.
+    ranked = [
+        RankedCause(family="node_kubelet_pressure", confidence="medium", score=3.0),
+        RankedCause(family="control_plane_error", confidence="low", score=1.0),
+    ]
+    promoted = _promote_xid_cause(ranked, [79])
+    assert promoted[0].family == "gpu_hardware_error"
+    assert promoted[0].confidence == "high"
+    assert "79" in promoted[0].rationale[0]
+    # keyword families remain as downstream context, in order
+    assert [c.family for c in promoted[1:]] == ["node_kubelet_pressure", "control_plane_error"]
+    # no XID -> untouched
+    assert _promote_xid_cause(ranked, [])[0].family == "node_kubelet_pressure"

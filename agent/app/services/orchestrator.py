@@ -314,6 +314,13 @@ class AnalysisOrchestrator:
             kg_blast_radius=kg_context.blast_radius_workloads,
             priors=priors,
         )
+        # Deterministic override: an NVIDIA XID names the cause category outright —
+        # GPU hardware. The keyword ranker only ranks the four generic families, so
+        # a GPU fault alert used to get headlined by keyword noise (chronically
+        # node_kubelet_pressure via the k8s node-conditions text, where words like
+        # "DiskPressure"/"kubelet" appear even when every condition is False).
+        xid_codes = _xid_codes_from_results(results, _alert_text(request))
+        root_cause_candidates = _promote_xid_cause(root_cause_candidates, xid_codes)
         if root_cause_candidates:
             top = root_cause_candidates[0]
             _log.info(
@@ -392,9 +399,9 @@ class AnalysisOrchestrator:
         graph_fixes = await graph_remediation(
             self._settings,
             family=top_family if top_family != "insufficient_evidence" else "",
-            # The alert's own text often carries the XID (NVRM Xid alerts) even when
-            # every collector came back empty — it must feed the drill-down too.
-            xid_codes=_xid_codes_from_results(results, _alert_text(request)),
+            # xid_codes already includes the alert's own text (NVRM Xid alerts name
+            # their code even when every collector comes back empty).
+            xid_codes=xid_codes,
             gpu_model=_gpu_model_from(target, results),
         )
         warnings = sorted(set(warnings) | set(graph_fixes.warnings))
@@ -1195,6 +1202,27 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
     return f"- Related GPU errors (XID): {codes} — see the recommended actions below."
 
 
+def _promote_xid_cause(
+    candidates: list[RankedCause], xid_codes: list[int]
+) -> list[RankedCause]:
+    """Lead with gpu_hardware_error when an NVIDIA XID is present.
+
+    An XID in the alert/evidence is dispositive for the cause CATEGORY (the GPU
+    driver itself reported the fault); the generic keyword families then describe
+    downstream effects at best. Deterministic — no LLM, no score fight."""
+    if not xid_codes:
+        return candidates
+    codes = ", ".join(str(code) for code in xid_codes)
+    gpu = RankedCause(
+        family="gpu_hardware_error",
+        confidence="high",
+        score=10.0,
+        rationale=[f"NVIDIA XID {codes} present in the alert/evidence"],
+        evidence_agents=["alert"],
+    )
+    return [gpu] + [c for c in candidates if c.family != "gpu_hardware_error"]
+
+
 def _runai_version_from(results: list[CollectorResult]) -> str:
     """The running Run:ai control-plane version, if the runai collector resolved one."""
     for result in results:
@@ -1356,6 +1384,10 @@ _FAMILY_EXPLANATION = {
     "workload_startup_image_failure": (
         "the workload itself is failing to start — an image pull, crash loop, or a "
         "startup/configuration error"
+    ),
+    "gpu_hardware_error": (
+        "the GPU itself reported a fault (NVIDIA XID) — a hardware/driver/fabric "
+        "problem on the node, not a scheduling or workload issue"
     ),
 }
 
