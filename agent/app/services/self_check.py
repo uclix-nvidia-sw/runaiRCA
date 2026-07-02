@@ -174,3 +174,57 @@ async def _llm_refute(
         f"Gathered evidence:\n{evidence}"
     )
     return await complete_json(settings, system=system, user=user, temperature=0.1)
+
+
+async def verify_known_issues(
+    settings: Settings,
+    issues: list[dict],
+    results: list[CollectorResult],
+) -> set[str]:
+    """Names of keyword-matched known issues the evidence does NOT actually support.
+
+    Signature keyword hits can be superficial, so a skeptical LLM pass checks each
+    matched known issue against the evidence and flags the ones that don't really
+    fit — those get suppressed by the caller. LLM-gated and conservative: with no
+    LLM configured, or on any failure/uncertainty, returns an empty set so the
+    keyword match stands by default. Never raises into analyze().
+    """
+    try:
+        names = {str(i.get("issue") or "").strip() for i in issues}
+        names.discard("")
+        if not names or not llm_configured(settings):
+            return set()
+        verdict = await _llm_verify_known_issues(settings, issues, results)
+        refuted = (verdict or {}).get("refuted")
+        if not isinstance(refuted, list):
+            return set()
+        # Only honour names that were actually candidates (guard against hallucinated names).
+        return {str(n).strip() for n in refuted if str(n).strip() in names}
+    except Exception:  # noqa: BLE001 - best-effort; never break analyze()
+        return set()
+
+
+async def _llm_verify_known_issues(
+    settings: Settings,
+    issues: list[dict],
+    results: list[CollectorResult],
+) -> dict | None:
+    evidence = "\n".join(
+        f"- {r.agent} [{r.status}]: {(r.summary or '').strip() or NO_EVIDENCE}" for r in results
+    )
+    candidates = "\n".join(
+        f"- {str(i.get('issue') or '').strip()}: "
+        f"{' '.join(str(i.get('reason') or '').split())}"
+        for i in issues
+    )
+    system = (
+        "You are a skeptical senior SRE. Each candidate below is a KNOWN Run:ai issue "
+        "that matched this alert's evidence by keyword. Keyword matches can be "
+        "superficial, so decide which candidates the gathered evidence does NOT "
+        "actually support. Use ONLY the evidence; do not invent any. Be conservative: "
+        "refute a candidate only when the evidence clearly does not fit — when unsure, "
+        'keep it. Respond with a JSON object: {"refuted": [exact issue names that are '
+        'NOT supported by the evidence]}.'
+    )
+    user = f"Candidate known issues:\n{candidates}\n\nGathered evidence:\n{evidence}"
+    return await complete_json(settings, system=system, user=user, temperature=0.1)

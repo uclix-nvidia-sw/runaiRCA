@@ -391,6 +391,18 @@ class AnalysisOrchestrator:
         # Version-aware precision: drop known issues already fixed in the cluster's
         # running Run:ai version so we don't attribute a symptom to a patched bug.
         known_issues = _suppress_fixed_known_issues(known_issues, _runai_version_from(results))
+        # Adversarial precision: keyword-matched known issues are LLM-verified; drop
+        # any the evidence does not actually support (best-effort, LLM-gated).
+        matched_ki = match_runai_known_issues(known_issues, _observed_text(results))
+        if matched_ki:
+            try:
+                from app.services.self_check import verify_known_issues
+            except ImportError:
+                pass
+            else:
+                refuted = await verify_known_issues(self._settings, matched_ki, results)
+                if refuted:
+                    known_issues = [k for k in known_issues if k.get("issue") not in refuted]
         playbook_fallback = load_troubleshooting_cases(
             self._settings.troubleshooting_cases_file
         )
