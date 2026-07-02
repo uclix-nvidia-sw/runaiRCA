@@ -111,6 +111,43 @@ async def test_hypotheses_ordered_and_present() -> None:
 
 
 @pytest.mark.asyncio
+async def test_platform_namespace_investigates_broadly() -> None:
+    # runai / runai-backend = the Run:ai platform itself -> control plane leads and the
+    # investigation is broad (k8s + node/system), not workload-scoped.
+    settings = make_settings()
+    target = _target(alert_name="SomeAlert", namespace="runai-backend")
+    plan = await plan_investigation(settings, target, None, {}, [])
+
+    assert plan.hypotheses[0]["family"] == "control_plane_error"
+    assert plan.check_control_plane is True
+    assert "broadly" in plan.narrative.lower()
+
+
+@pytest.mark.asyncio
+async def test_user_workload_namespace_focuses_scheduler() -> None:
+    # runai-test1 = a user workload running INSIDE the platform -> scheduler focus,
+    # while still reading the scheduler/control-plane logs.
+    settings = make_settings()
+    target = _target(alert_name="SomeAlert", namespace="runai-test1")
+    plan = await plan_investigation(settings, target, None, {}, [])
+
+    assert plan.hypotheses[0]["family"] == "scheduling_quota_exhaustion"
+    assert plan.check_control_plane is True
+
+
+def test_namespace_scope_classifies() -> None:
+    from app.services.planner import _namespace_scope
+
+    settings = make_settings()
+    assert _namespace_scope(_target(namespace="runai"), settings) == "platform"
+    assert _namespace_scope(_target(namespace="runai-backend"), settings) == "platform"
+    assert _namespace_scope(_target(namespace="runai-test1"), settings) == "workload"
+    assert _namespace_scope(_target(namespace="team-a", queue="gpu-a"), settings) == "workload"
+    assert _namespace_scope(_target(namespace="monitoring"), settings) == "infra"
+    assert _namespace_scope(_target(namespace=""), settings) == "infra"
+
+
+@pytest.mark.asyncio
 async def test_llm_refinement_kept_on_success(monkeypatch) -> None:
     settings = replace(
         make_settings(),

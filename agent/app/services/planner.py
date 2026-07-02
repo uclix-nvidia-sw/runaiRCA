@@ -83,6 +83,61 @@ def _implicates_control_plane(target: AnalysisTarget) -> bool:
     return any(kw in haystack for kw in _CONTROL_PLANE_KEYWORDS)
 
 
+def _is_platform_namespace(namespace: str, settings: Settings) -> bool:
+    """A Run:ai *platform* namespace — the control plane itself (runai / runai-backend).
+
+    These are the configured log namespaces; a problem here is a problem operating the
+    Run:ai platform, distinct from a user workload that merely runs inside it."""
+    ns = (namespace or "").strip().lower()
+    return bool(ns) and ns in {n.strip().lower() for n in settings.runai_log_namespaces}
+
+
+def _namespace_scope(target: AnalysisTarget, settings: Settings) -> str:
+    """Where the alert lives — decides the investigation emphasis:
+
+    - "platform": a Run:ai platform namespace (runai/runai-backend). The platform
+      itself is unhealthy, so investigate Kubernetes AND node/system evidence broadly.
+    - "workload": a user workload running inside Run:ai (a runai-* project namespace,
+      or any namespace carrying a Run:ai project/queue). Focus on the Run:ai scheduler
+      and the workload's scheduling/quota/startup.
+    - "infra": node-level / namespace-less / non-Run:ai — node & system first.
+    """
+    if _is_platform_namespace(target.namespace, settings):
+        return "platform"
+    if _is_runai_namespace(target.namespace) or target.project or target.queue:
+        return "workload"
+    return "infra"
+
+
+# scope -> (families to lead the hypotheses with, the reason tag)
+_SCOPE_LEAD: dict[str, tuple[tuple[str, ...], str]] = {
+    "platform": (
+        ("control_plane_error", "node_kubelet_pressure"),
+        "Run:ai platform namespace — the control plane itself; investigate Kubernetes "
+        "and node/system evidence broadly, not just the workload",
+    ),
+    "workload": (
+        ("scheduling_quota_exhaustion", "workload_startup_image_failure"),
+        "user workload inside the Run:ai platform — focus on the Run:ai scheduler and "
+        "the workload's scheduling/quota/startup",
+    ),
+}
+
+
+def _promote_families(
+    hypotheses: list[dict[str, str]], lead_families: tuple[str, ...], reason: str
+) -> list[dict[str, str]]:
+    """Move lead_families to the front (in order), tagging their reason."""
+    lead_set = set(lead_families)
+    lead = [
+        {"family": fam, "reason": reason}
+        for fam in lead_families
+        if any(h["family"] == fam for h in hypotheses)
+    ]
+    rest = [h for h in hypotheses if h["family"] not in lead_set]
+    return lead + rest
+
+
 def _ordered_hypotheses(target: AnalysisTarget) -> list[dict[str, str]]:
     haystack = " ".join(
         [target.alert_name or "", target.workload_name or "", target.workload_type or ""]
@@ -153,6 +208,13 @@ async def plan_investigation(
                 namespaces.append(ns)
 
     hypotheses = _ordered_hypotheses(target)
+    # Namespace decides the emphasis: a Run:ai platform namespace (runai/runai-backend)
+    # means the control plane itself is unhealthy -> lead control-plane + node/system
+    # broadly; a user workload namespace inside Run:ai -> lead the scheduler/scheduling.
+    scope = _namespace_scope(target, settings)
+    if scope in _SCOPE_LEAD:
+        lead_families, scope_reason = _SCOPE_LEAD[scope]
+        hypotheses = _promote_families(hypotheses, lead_families, scope_reason)
     # Namespace-less alert (no namespace, project, or queue): there is no workload
     # scope to dig into, so lead with node/system-level causes. The workload/loki/
     # runai agents will have nothing to match; the system agent (node syslog/
@@ -209,6 +271,18 @@ async def plan_investigation(
             "actually find rather than assuming a cause."
         )
 
+    if scope == "platform":
+        narrative = (
+            "This alert is in a Run:ai platform namespace (the control plane itself). "
+            "Investigate broadly — Kubernetes events/pods AND node/system evidence, not "
+            "just the workload. " + narrative
+        )
+    elif scope == "workload":
+        narrative = (
+            "This alert is a user workload inside the Run:ai platform. Focus on the "
+            "Run:ai scheduler and the workload's scheduling/quota/startup, and read the "
+            "scheduler/control-plane logs. " + narrative
+        )
     if node_focused:
         node_note = (
             "No namespace/project/queue on this alert, so the workload, Loki, and Run:ai "
@@ -278,13 +352,19 @@ async def _llm_refine(
         "incidents, refine the investigation plan. Be honest: if nothing matches, keep "
         "strategy breadth_first and describe HOW to approach. Do not force-fit a prior "
         "incident. Keys: focus (str), hypotheses (list of {family, reason}), strategy "
-        "('targeted' or 'breadth_first'), narrative (str)."
+        "('targeted' or 'breadth_first'), narrative (str). "
+        "Respect the investigation scope: 'platform' = a Run:ai platform namespace (the "
+        "control plane itself) — investigate Kubernetes and node/system evidence "
+        "broadly; 'workload' = a user workload running inside Run:ai — focus on the "
+        "Run:ai scheduler and the workload's scheduling/quota/startup; 'infra' = "
+        "node/system level first."
     )
     if getattr(settings, "language", "en") == "ko":
         system += " Write the focus, reason, and narrative values in Korean."
     user = (
         f"Alert: {target.alert_name}\n"
-        f"Namespace: {target.namespace}  Node: {target.node}  "
+        f"Namespace: {target.namespace} (scope: {_namespace_scope(target, settings)})  "
+        f"Node: {target.node}  "
         f"Workload: {target.workload_name}  Pod: {target.pod}  "
         f"Project: {target.project}  Queue: {target.queue}\n"
         f"Knowledge graph: {kg_summary}\n"
