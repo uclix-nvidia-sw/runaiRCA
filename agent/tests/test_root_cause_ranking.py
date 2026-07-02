@@ -56,6 +56,30 @@ def test_r4_startup_failure_when_control_plane_quiet() -> None:
     assert ranked[0].family == "workload_startup_image_failure"
 
 
+def test_r3_control_plane_error_wins_on_backend_reconcile_error() -> None:
+    results = [
+        _r(
+            "loki",
+            summary="runai-backend reconcile error: admission webhook denied; authorization failed",
+        ),
+        _r("kubernetes", summary="workload events sparse"),
+    ]
+    ranked = rank_root_cause_candidates(_target(alert_name="RunAIWorkloadPending"), results)
+    assert ranked[0].family == "control_plane_error"
+
+
+def test_scheduler_pod_name_does_not_elevate_control_plane() -> None:
+    # Regression: a node-exporter-style alert whose Loki stream labels merely
+    # mention the runai-scheduler pod name must NOT rank as a control-plane error.
+    # Previously the bare "scheduler" keyword matched the pod label and won.
+    results = [
+        _r("kubernetes", summary="pod prometheus-node-exporter Running; NodeNotReady briefly"),
+        _r("loki", summary='logs from pod="runai-scheduler-0" nominal; no errors'),
+    ]
+    ranked = rank_root_cause_candidates(_target(alert_name="NodeExporterDown"), results)
+    assert ranked[0].family != "control_plane_error"
+
+
 def test_r6_insufficient_evidence_when_nothing_corroborates() -> None:
     results = [
         _r("kubernetes", status="unavailable", summary="kubernetes API not configured"),

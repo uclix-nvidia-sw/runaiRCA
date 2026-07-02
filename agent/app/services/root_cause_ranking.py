@@ -47,7 +47,10 @@ _FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
     "control_plane_error": (
         "loki",
         ("loki", "kubernetes"),
-        ("scheduler", "reconcile", "admission", "runai-backend",
+        # NOTE: no bare "scheduler" — it matches the `runai-scheduler` pod name in
+        # every Run:ai log stream label, which falsely elevated this family for
+        # unrelated alerts. Keep phrases that only appear in real control-plane errors.
+        ("reconcile", "admission", "runai-backend",
          "control plane", "control-plane", "authorization", "database error"),
     ),
     "workload_startup_image_failure": (

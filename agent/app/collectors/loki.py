@@ -40,9 +40,17 @@ class LokiCollector:
         queries = [("error_logs", error_query), ("recent_logs", selector)]
         runai_selector = _namespace_regex_selector(self._settings.runai_log_namespaces)
         if runai_selector:
+            # Require an error-indicating term to co-occur with the control-plane
+            # subsystem (or an outright panic/fatal). The previous broad
+            # `error|fail|...|scheduler|queue|database` alternation matched almost
+            # every control-plane log line, so this query returned rows for every
+            # alert regardless of target and always steered ranking to
+            # control_plane_error. Keep it specific to real failures.
             runai_error_query = (
                 f'{runai_selector} |~ '
-                '"(?i)(error|fail|panic|exception|scheduler|quota|queue|database|reconcile)"'
+                '"(?i)(reconcile.*(error|fail)|admission.*(error|denied|reject)|'
+                'scheduler.*(error|fail|panic)|authorization.*(error|denied)|'
+                'database.*(error|fail|timeout)|panic|fatal)"'
             )
             queries.append(("runai_control_plane_errors", runai_error_query))
         query_results = []
