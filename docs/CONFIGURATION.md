@@ -1,5 +1,8 @@
 # Configuration Reference
 
+> **Lens:** What's configurable — every setting; the README covers the common path.
+> **In this doc:** environment variables · Helm values · behavior notes (pgvector, redaction).
+
 All settings available for Run:AI RCA. README covers the common path; this is the full reference.
 
 ## Environment Variables

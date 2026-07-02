@@ -172,8 +172,13 @@ before evidence leaves a collector; add patterns via `MASKING_REGEX_LIST_JSON`.
 
 ## Documentation
 
-- `docs/CONFIGURATION.md` — full env var and Helm value reference
-- `docs/DEPLOYMENT.md` — detailed deployment, RBAC, and DB notes
-- `docs/API.md` — backend and agent endpoints
-- `docs/ARCHITECTURE.md` — implementation contract
-- `docs/OPERATING-MODEL.md` — operating model
+Full table of contents (GitBook-ready): [`SUMMARY.md`](SUMMARY.md).
+
+- [Getting Started](docs/GETTING-STARTED.md) — run locally and get your first RCA
+- [Architecture](docs/ARCHITECTURE.md) — implementation contract
+- [Operating Model](docs/OPERATING-MODEL.md) — operating model
+- [Data Stores](docs/DATABASE.md) — PostgreSQL + TypeDB ontology
+- [UI Direction](docs/UI-DIRECTION.md) — UI/UX direction
+- [Deployment](docs/DEPLOYMENT.md) — detailed deployment, RBAC, and DB notes
+- [API Reference](docs/API.md) — backend and agent endpoints
+- [Configuration Reference](docs/CONFIGURATION.md) — full env var and Helm value reference

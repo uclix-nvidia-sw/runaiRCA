@@ -1,5 +1,8 @@
 # Operating Model
 
+> **Lens:** How it behaves — what the system does, and the lines it won't cross.
+> **In this doc:** supported signals · intake/analysis triggers · runtime status semantics · agent role contracts · RCA boundaries · degraded mode.
+
 Run:AI RCA is read-only by default.
 
 ## Supported Signals
