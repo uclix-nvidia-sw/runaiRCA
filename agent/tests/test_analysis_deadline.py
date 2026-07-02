@@ -1,4 +1,4 @@
-"""Overall 5-minute analysis deadline: agents get generous per-step time, but one
+"""Overall analysis deadline: agents get generous per-step time, but one
 analysis always finishes within analysis_deadline_seconds (graceful degrade)."""
 
 from __future__ import annotations
