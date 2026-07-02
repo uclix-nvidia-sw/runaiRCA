@@ -13,6 +13,8 @@ shows up in /analyze timings.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from app.config import Settings
@@ -51,18 +53,31 @@ class TypeDBClient:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    def fetch_rows(self, typeql: str) -> list[dict[str, Any]]:
+    @contextmanager
+    def open_reader(self) -> Iterator[Callable[[str], list[dict[str, Any]]]]:
+        """One driver + one READ transaction, reused for many queries.
+
+        A fresh gRPC connection per query (the old `fetch_rows`-per-call pattern)
+        triples the chance a transient connect blip fails the whole enrichment; a
+        single connection for all of a synthesis run's KG queries shrinks that
+        surface. Yields a `run(typeql) -> rows` callable.
+        """
         from typedb.driver import TransactionType  # lazy: optional dependency
 
-        rows: list[dict[str, Any]] = []
         with open_driver(self._settings) as driver:
             with driver.transaction(
                 self._settings.typedb_database, TransactionType.READ
             ) as tx:
-                answer = tx.query(typeql).resolve()
-                for row in answer.as_concept_rows():
-                    rows.append(_row_to_dict(row))
-        return rows
+
+                def run(typeql: str) -> list[dict[str, Any]]:
+                    answer = tx.query(typeql).resolve()
+                    return [_row_to_dict(row) for row in answer.as_concept_rows()]
+
+                yield run
+
+    def fetch_rows(self, typeql: str) -> list[dict[str, Any]]:
+        with self.open_reader() as run:
+            return run(typeql)
 
 
 def _row_to_dict(row: Any) -> dict[str, Any]:

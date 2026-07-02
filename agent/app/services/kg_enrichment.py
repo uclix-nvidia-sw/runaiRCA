@@ -17,12 +17,15 @@ confirmed cause->action edges are a later enrichment (needs richer ingestion).
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 from app.collectors.base import AnalysisTarget
 from app.config import Settings
 from app.ontology.typedb_client import TypeDBClient, escape_typeql
+
+_log = logging.getLogger(__name__)
 
 _BLAST_QUERY = """
 match
@@ -98,10 +101,17 @@ async def enrich(settings: Settings, target: AnalysisTarget) -> KGContext:
             timeout=settings.typedb_timeout_seconds + 1,
         )
     except Exception as exc:  # noqa: BLE001 - enrichment is best-effort, never fatal
+        # Full traceback to pod logs, and the actual message (not just the class
+        # name) into warnings, so "unreachable" can be diagnosed: connection
+        # refused vs auth vs a [TQLxx] query-syntax error look identical otherwise.
+        _log.warning("TypeDB knowledge-graph enrichment failed", exc_info=True)
+        detail = " ".join(str(exc).split())[:200] or exc.__class__.__name__
         return KGContext(
             enabled=True,
             available=False,
-            warnings=[f"TypeDB knowledge-graph query failed: {exc.__class__.__name__}."],
+            warnings=[
+                f"TypeDB knowledge-graph query failed ({exc.__class__.__name__}): {detail}"
+            ],
         )
 
     return KGContext(
@@ -115,25 +125,31 @@ async def enrich(settings: Settings, target: AnalysisTarget) -> KGContext:
 
 
 def _query_kg(client: TypeDBClient, target: AnalysisTarget) -> dict[str, Any]:
-    workloads: list[str] = []
-    if target.node:
-        rows = client.fetch_rows(_BLAST_QUERY.format(node=escape_typeql(target.node)))
-        workloads = sorted({str(r.get("wn")) for r in rows if r.get("wn")})
+    # One connection for all three synthesis queries: a transient connect blip on
+    # any single fresh connection would fail the whole enrichment, so opening once
+    # (instead of per query) shrinks that failure surface ~3x.
+    with client.open_reader() as run:
+        workloads: list[str] = []
+        if target.node:
+            rows = run(_BLAST_QUERY.format(node=escape_typeql(target.node)))
+            workloads = sorted({str(r.get("wn")) for r in rows if r.get("wn")})
 
-    prior: list[dict[str, str]] = []
-    if target.alert_name:
-        rows = client.fetch_rows(_PRIOR_QUERY.format(alert=escape_typeql(target.alert_name)))
-        seen: set[str] = set()
-        for r in rows:
-            iid = str(r.get("iid") or "")
-            if iid and iid not in seen:
-                seen.add(iid)
-                prior.append(
-                    {"incident_id": iid, "analysis_summary": str(r.get("sum") or "")}
-                )
+        prior: list[dict[str, str]] = []
+        if target.alert_name:
+            rows = run(_PRIOR_QUERY.format(alert=escape_typeql(target.alert_name)))
+            seen: set[str] = set()
+            for r in rows:
+                iid = str(r.get("iid") or "")
+                if iid and iid not in seen:
+                    seen.add(iid)
+                    prior.append(
+                        {"incident_id": iid, "analysis_summary": str(r.get("sum") or "")}
+                    )
+
+        knowledge_rows = run(_KNOWLEDGE_QUERY)
 
     grouped: dict[tuple[str, str], dict[str, set[str]]] = {}
-    for r in client.fetch_rows(_KNOWLEDGE_QUERY):
+    for r in knowledge_rows:
         fam = str(r.get("fam") or "")
         sname = str(r.get("sn") or "")
         if not fam or not sname:
