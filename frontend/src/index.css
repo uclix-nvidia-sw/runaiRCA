@@ -1239,6 +1239,11 @@ td span.occurrence-pill {
   font-size: 0.84rem;
 }
 
+.meta-time {
+  margin-top: 0.2rem;
+  gap: 1rem;
+}
+
 .entity-id {
   display: inline-flex;
   align-items: center;

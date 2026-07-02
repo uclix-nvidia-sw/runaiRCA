@@ -1372,7 +1372,7 @@ function AnalysisDashboard({
                       <span className={`coverage-pill coverage-${record.capabilities[agent] || 'pending'}`} key={agent}>
                         {agentIcon(agent)}
                         <span className="coverage-label">{agentLabel(agent)}</span>
-                        <strong>{record.capabilities[agent] || 'pending'}</strong>
+                        <strong>{statusLabel(record.capabilities[agent] || 'pending')}</strong>
                       </span>
                     ))}
                   </div>
@@ -1814,6 +1814,10 @@ function UnifiedWorkspace({
             <Severity value={detail.data.severity} />
             <Status value={detail.data.status} analyzing={detail.data.is_analyzing} />
           </div>
+          <div className="meta-line meta-time">
+            <span>Fired: {formatTime(detail.data.fired_at)}</span>
+            <span>Resolved: {detail.data.resolved_at ? formatTime(detail.data.resolved_at) : '—'}</span>
+          </div>
           <AffectedPods pods={affectedPods} />
         </div>
         <div className="workspace-actions">
@@ -2003,10 +2007,6 @@ function DiagnosticGroup({
   tone: 'missing' | 'warning';
 }) {
   const [open, setOpen] = useState(false);
-
-  useEffect(() => {
-    setOpen(items.length <= 3);
-  }, [title, items.length]);
   const visibleItems = open ? items : items.slice(0, 3);
   const hiddenCount = Math.max(0, items.length - visibleItems.length);
 
@@ -2569,12 +2569,7 @@ function FeedbackPanel({
 }
 
 function AgentEvidence({ agent, status, artifacts }: { agent: string; status: string; artifacts: Artifact[] }) {
-  const [open, setOpen] = useState(status !== 'pending' || artifacts.length > 0);
-  useEffect(() => {
-    if (status !== 'pending' || artifacts.length > 0) {
-      setOpen(true);
-    }
-  }, [artifacts.length, status]);
+  const [open, setOpen] = useState(false);
   const icon = agentIcon(agent);
   return (
     <article className="agent-evidence">
@@ -2592,7 +2587,6 @@ function AgentEvidence({ agent, status, artifacts }: { agent: string; status: st
             artifacts.map((artifact, index) => (
               <ArtifactResult
                 artifact={artifact}
-                defaultOpen={defaultArtifactOpen(artifact, index, artifacts.length)}
                 key={`${artifact.agent}-${artifact.type}-${index}`}
               />
             ))
@@ -2603,14 +2597,8 @@ function AgentEvidence({ agent, status, artifacts }: { agent: string; status: st
   );
 }
 
-function defaultArtifactOpen(artifact: Artifact, index: number, total: number) {
-  if (normalizeAgentStatus(artifact.status) === 'unavailable') return false;
-  if (total > 2) return index === 0;
-  return true;
-}
-
-function ArtifactResult({ artifact, defaultOpen = true }: { artifact: Artifact; defaultOpen?: boolean }) {
-  const [open, setOpen] = useState(defaultOpen);
+function ArtifactResult({ artifact }: { artifact: Artifact }) {
+  const [open, setOpen] = useState(false);
   const queryItems = queryDisplayItems(artifact.result);
   const resultText = artifact.result !== undefined ? formatArtifactValue(compactArtifactValue(artifact.result)) : '';
   return (
@@ -2651,7 +2639,7 @@ function QueryResultList({ items }: { items: QueryDisplayItem[] }) {
 
 function QueryResultCard({ item }: { item: QueryDisplayItem }) {
   const previewText = item.preview === undefined ? '' : formatArtifactValue(item.preview);
-  const [open, setOpen] = useState(!item.error && previewText.length > 0 && previewText.length < 700);
+  const [open, setOpen] = useState(false);
   return (
     <article className="query-result-card">
       <button className="query-result-toggle" onClick={() => setOpen((value) => !value)} type="button">
@@ -3412,9 +3400,18 @@ function Severity({ value }: { value: string }) {
   return <span className={`severity severity-${value || 'warning'}`}>{value || 'warning'}</span>;
 }
 
+// ponytail: "ok"/"partial" are internal collector states — noise to operators.
+// Blank them so only actionable status (firing/resolved/unavailable/analyzing…) shows.
+function statusLabel(value: string) {
+  const displayValue = value || 'pending';
+  return displayValue === 'ok' || displayValue === 'partial' ? '' : displayValue;
+}
+
 function Status({ value, analyzing = false }: { value: string; analyzing?: boolean }) {
   const displayValue = analyzing ? 'analyzing' : (value || 'pending');
-  return <span className={`status status-${displayValue}`}>{displayValue}</span>;
+  const label = statusLabel(displayValue);
+  if (!label) return null;
+  return <span className={`status status-${displayValue}`}>{label}</span>;
 }
 
 function targetLine(labels: Record<string, string>) {
@@ -3422,7 +3419,7 @@ function targetLine(labels: Record<string, string>) {
   const namespace = labels.namespace || labels.kubernetes_namespace || '';
   const workload = labels.workload || labels.workload_name || labels.pod || 'workload unknown';
   if (!project && namespace) {
-    return `Namespace ${namespace} / ${workload}`;
+    return `${namespace} / ${workload}`;
   }
   if (!project) {
     return workload;
