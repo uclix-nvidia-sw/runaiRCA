@@ -97,6 +97,10 @@ spec:
               value: {{ .Values.agent.env.enableInvestigationLoop | quote }}
             - name: MAX_INVESTIGATION_STEPS
               value: {{ .Values.agent.env.maxInvestigationSteps | quote }}
+            - name: MAX_REANALYSIS_STEPS
+              value: {{ .Values.agent.env.maxReanalysisSteps | quote }}
+            - name: ANALYSIS_DEADLINE_SECONDS
+              value: {{ .Values.agent.env.analysisDeadlineSeconds | quote }}
             - name: RUNAI_BASE_URL
               value: {{ .Values.agent.env.runaiBaseUrl | quote }}
             - name: RUNAI_TOKEN_URL
@@ -107,6 +111,8 @@ spec:
               value: {{ .Values.agent.env.runaiProjectsPath | quote }}
             - name: RUNAI_QUEUES_PATH
               value: {{ .Values.agent.env.runaiQueuesPath | quote }}
+            - name: RUNAI_VERSION_PATH
+              value: {{ .Values.agent.env.runaiVersionPath | quote }}
             - name: RUNAI_TIMEOUT_SECONDS
               value: {{ .Values.agent.env.runaiTimeoutSeconds | quote }}
             - name: RUNAI_LOG_NAMESPACES
