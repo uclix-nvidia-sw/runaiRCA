@@ -4,6 +4,7 @@ import asyncio
 from typing import Any
 
 from app.collectors.base import AnalysisTarget, CollectorResult, artifact
+from app.collectors.loki import _llm_insight
 from app.config import Settings
 
 
@@ -13,7 +14,7 @@ class PostgresCollector:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    async def collect(self, target: AnalysisTarget) -> CollectorResult:
+    async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:
         if not self._settings.postgres_dsn:
             summary = (
                 "Postgres DSN is not configured; database health, incident-store, "
@@ -117,6 +118,9 @@ class PostgresCollector:
             f"{checks['active_connections']} active connection(s), "
             f"pgvector={'installed' if pgvector else 'missing'}."
         )
+        insight = await _llm_insight(self._settings, "Postgres diagnostics", summary, checks)
+        if insight:
+            summary = insight
         return CollectorResult(
             agent=self.name,
             status=status,

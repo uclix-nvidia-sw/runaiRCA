@@ -4,6 +4,7 @@ from urllib.parse import quote
 
 from app.collectors.base import AnalysisTarget, CollectorResult, artifact
 from app.collectors.http_json import compact, get_json, post_form_json, post_json
+from app.collectors.loki import _llm_insight
 from app.config import Settings
 
 
@@ -13,7 +14,7 @@ class RunAICollector:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    async def collect(self, target: AnalysisTarget) -> CollectorResult:
+    async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:
         missing: list[str] = []
         if not target.project:
             missing.append("runai.project")
@@ -126,6 +127,11 @@ class RunAICollector:
             ]
             if auth_failed:
                 warnings.append("Run:ai API rejected the request with HTTP 401.")
+            insight = await _llm_insight(
+                self._settings, "Run:ai API", summary, query_results
+            )
+            if insight:
+                summary = insight
             return CollectorResult(
                 agent=self.name,
                 status=status,

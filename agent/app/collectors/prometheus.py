@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.collectors.base import AnalysisTarget, CollectorResult, artifact
 from app.collectors.http_json import compact, get_json
+from app.collectors.loki import _llm_insight
 from app.config import Settings
 
 
@@ -11,7 +12,7 @@ class PrometheusCollector:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    async def collect(self, target: AnalysisTarget) -> CollectorResult:
+    async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:
         if not self._settings.prometheus_url:
             summary = "Prometheus is not configured; metric evidence was skipped."
             return CollectorResult(
@@ -34,7 +35,7 @@ class PrometheusCollector:
                 ],
             )
 
-        queries = _queries_for(target)
+        queries = _queries_for(target, plan)
         query_results = []
         warnings: list[str] = []
 
@@ -86,6 +87,11 @@ class PrometheusCollector:
             confidence = "low"
             summary = "Prometheus direct queries failed."
 
+        insight = await _llm_insight(
+            self._settings, "Prometheus metrics", summary, query_results
+        )
+        if insight:
+            summary = insight
         result = {
             "prometheus_url": self._settings.prometheus_url,
             "queries": query_results,
@@ -119,12 +125,18 @@ class PrometheusCollector:
         )
 
 
-def _queries_for(target: AnalysisTarget) -> list[tuple[str, str]]:
+def _queries_for(target: AnalysisTarget, plan=None) -> list[tuple[str, str]]:
+    namespace = target.namespace
+    pod = target.pod
+    if plan is not None:
+        if plan.namespaces:
+            namespace = plan.namespaces[0]
+        pod = plan.pod or pod
     selectors = []
-    if target.namespace:
-        selectors.append(f'namespace="{target.namespace}"')
-    if target.pod:
-        selectors.append(f'pod="{target.pod}"')
+    if namespace:
+        selectors.append(f'namespace="{namespace}"')
+    if pod:
+        selectors.append(f'pod="{pod}"')
     pod_selector = ",".join(selectors)
 
     queries: list[tuple[str, str]] = [("prometheus_up", "up")]
@@ -139,8 +151,8 @@ def _queries_for(target: AnalysisTarget) -> list[tuple[str, str]]:
                 ),
             ]
         )
-    elif target.namespace:
-        namespace_selector = f'namespace="{target.namespace}"'
+    elif namespace:
+        namespace_selector = f'namespace="{namespace}"'
         queries.extend(
             [
                 (

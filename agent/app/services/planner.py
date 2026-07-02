@@ -1,0 +1,299 @@
+"""Investigation planner — the orchestrator's "think first" step.
+
+Builds an InvestigationPlan from the alert (labels/target), the knowledge-graph
+context, and any vector-similar incidents BEFORE any collector runs. The plan
+scopes each collector to what this specific alert needs, so agents stop always
+scraping the Run:ai control plane (the #1 accuracy complaint).
+
+Deterministic core (always runs); an optional LLM pass refines focus/hypotheses/
+strategy/narrative when configured. On ANY LLM failure the deterministic plan
+stands — this module never raises into analyze.
+
+ponytail: keyword/label heuristics over the target, not a model, for the core.
+The LLM only refines what the deterministic pass already produced.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from app.collectors.base import AnalysisTarget
+from app.config import Settings
+from app.knowledge import load_runai_alerts, match_runai_alert
+from app.llm import complete_json, llm_configured
+from app.plan import InvestigationPlan
+
+_log = logging.getLogger(__name__)
+
+# A similar incident is only trustworthy above this cosine similarity.
+_SIMILARITY_FLOOR = 0.80
+
+# Keywords in the alert name / labels that genuinely implicate the Run:ai
+# control plane (scheduler/quota/admission/reconcile), independent of namespace.
+_CONTROL_PLANE_KEYWORDS = (
+    "scheduler",
+    "quota",
+    "admission",
+    "reconcile",
+    "queue",
+    "runai-backend",
+)
+
+# Alert-name / evidence keywords -> failure family, for ordering hypotheses.
+_FAMILY_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "node_kubelet_pressure",
+        ("diskpressure", "memorypressure", "pidpressure", "kubelet", "node", "evict"),
+    ),
+    (
+        "scheduling_quota_exhaustion",
+        ("pending", "unschedul", "quota", "queue", "gpu", "preempt", "schedul"),
+    ),
+    (
+        "control_plane_error",
+        ("reconcile", "admission", "runai-backend", "control", "authorization"),
+    ),
+    (
+        "workload_startup_image_failure",
+        ("imagepull", "crashloop", "oom", "createcontainer", "startup", "image"),
+    ),
+)
+
+_FAMILY_REASON = {
+    "node_kubelet_pressure": "alert points at node/kubelet resource pressure",
+    "scheduling_quota_exhaustion": "alert points at scheduling or GPU-quota exhaustion",
+    "control_plane_error": "alert implicates the Run:ai control plane",
+    "workload_startup_image_failure": "alert points at a workload-local startup/image fault",
+}
+
+
+def _is_runai_namespace(namespace: str) -> bool:
+    ns = (namespace or "").lower()
+    return ns.startswith("runai")
+
+
+def _implicates_control_plane(target: AnalysisTarget) -> bool:
+    if _is_runai_namespace(target.namespace):
+        return True
+    if target.project or target.queue:
+        return True
+    haystack = " ".join(
+        [target.alert_name or "", target.workload_type or ""]
+    ).lower()
+    return any(kw in haystack for kw in _CONTROL_PLANE_KEYWORDS)
+
+
+def _ordered_hypotheses(target: AnalysisTarget) -> list[dict[str, str]]:
+    haystack = " ".join(
+        [target.alert_name or "", target.workload_name or "", target.workload_type or ""]
+    ).lower()
+    scored: list[tuple[int, str]] = []
+    for family, keywords in _FAMILY_HINTS:
+        hits = sum(1 for kw in keywords if kw in haystack)
+        scored.append((hits, family))
+    # Highest keyword-hit families first; keep declaration order as the tiebreak
+    # (enumerate index) so a 0-0 tie stays deterministic.
+    scored_indexed = [(hits, -i, fam) for i, (hits, fam) in enumerate(scored)]
+    scored_indexed.sort(reverse=True)
+    return [
+        {"family": fam, "reason": _FAMILY_REASON[fam]} for _, _, fam in scored_indexed
+    ]
+
+
+def _best_similar(similar_incidents: list) -> object | None:
+    best = None
+    best_sim = _SIMILARITY_FLOOR
+    for item in similar_incidents or []:
+        sim = getattr(item, "similarity", 0) or 0
+        if sim >= best_sim:
+            best_sim = sim
+            best = item
+    return best
+
+
+def _ontology_match(kg_context, hypotheses: list[dict[str, str]]) -> bool:
+    if not kg_context or not kg_context.get("available"):
+        return False
+    if kg_context.get("prior_incidents"):
+        return True
+    knowledge = kg_context.get("knowledge") or {}
+    top_family = hypotheses[0]["family"] if hypotheses else ""
+    return bool(top_family and knowledge.get(top_family))
+
+
+async def plan_investigation(
+    settings: Settings,
+    target: AnalysisTarget,
+    alert,
+    kg_context: dict | None,
+    similar_incidents: list | None,
+) -> InvestigationPlan:
+    kg_context = kg_context or {}
+    similar_incidents = similar_incidents or []
+
+    namespaces = [target.namespace] if target.namespace else []
+    check_control_plane = _implicates_control_plane(target)
+    if check_control_plane:
+        for ns in settings.runai_log_namespaces:
+            if ns and ns not in namespaces:
+                namespaces.append(ns)
+
+    hypotheses = _ordered_hypotheses(target)
+    # If this is a documented Run:ai built-in alert, we already know its meaning,
+    # family, and fix — lead with that family and carry the definition on the plan.
+    matched_alert = match_runai_alert(
+        load_runai_alerts(settings.runai_alerts_file), target.alert_name
+    )
+    if matched_alert and matched_alert.get("family"):
+        fam = matched_alert["family"]
+        reason = f"documented Run:ai built-in alert: {matched_alert.get('trigger', '')}".strip()
+        hypotheses = [{"family": fam, "reason": reason}] + [
+            h for h in hypotheses if h["family"] != fam
+        ]
+    best_similar = _best_similar(similar_incidents)
+    used_similarity = best_similar is not None
+    used_ontology = _ontology_match(kg_context, hypotheses)
+
+    if used_similarity or used_ontology:
+        strategy = "targeted"
+    else:
+        strategy = "breadth_first"
+
+    top_family = hypotheses[0]["family"] if hypotheses else "insufficient_evidence"
+    focus = (
+        f"{target.alert_name or 'alert'} on "
+        f"{target.workload_name or target.pod or target.namespace or 'the cluster'} "
+        f"— most likely {top_family.replace('_', ' ')}"
+    )
+
+    if strategy == "targeted":
+        matched: list[str] = []
+        if used_similarity:
+            matched.append(
+                f"vector match {getattr(best_similar, 'incident_id', '?')} "
+                f"(similarity {getattr(best_similar, 'similarity', 0):.2f})"
+            )
+        if used_ontology:
+            matched.append("ontology facts for this alert")
+        narrative = (
+            "Targeted investigation: " + " and ".join(matched) + ". "
+            "Confirm the prior cause against live evidence before acting."
+        )
+    else:
+        sweep = "Kubernetes events/pods and Prometheus metrics for the target"
+        if check_control_plane:
+            sweep += ", plus Run:ai control-plane logs"
+        narrative = (
+            "No prior incident or ontology fact cleared the confidence bar, so sweep "
+            f"breadth-first: {sweep}. Rank the failure family from what the collectors "
+            "actually find rather than assuming a cause."
+        )
+
+    if matched_alert:
+        narrative = (
+            f"Documented Run:ai alert '{matched_alert.get('alert')}' "
+            f"({matched_alert.get('severity', 'n/a')}): {matched_alert.get('trigger', '')} "
+            + narrative
+        )
+
+    plan = InvestigationPlan(
+        focus=focus,
+        namespaces=namespaces,
+        node=target.node or "",
+        workload=target.workload_name or "",
+        pod=target.pod or "",
+        check_control_plane=check_control_plane,
+        hypotheses=hypotheses,
+        strategy=strategy,
+        used_similarity=used_similarity,
+        used_ontology=used_ontology,
+        narrative=narrative,
+        matched_alert=matched_alert,
+    )
+
+    if llm_configured(settings):
+        try:
+            refined = await _llm_refine(settings, target, plan, kg_context, similar_incidents)
+            if refined:
+                plan = refined
+        except Exception:  # noqa: BLE001 - planning is best-effort; keep deterministic plan
+            _log.warning("LLM plan refinement failed; using deterministic plan", exc_info=True)
+
+    return plan
+
+
+async def _llm_refine(
+    settings: Settings,
+    target: AnalysisTarget,
+    plan: InvestigationPlan,
+    kg_context: dict,
+    similar_incidents: list,
+) -> InvestigationPlan | None:
+    kg_summary = "none"
+    if kg_context.get("available"):
+        prior = kg_context.get("prior_incidents") or []
+        kg_summary = (
+            f"blast_radius={kg_context.get('blast_radius_workloads', 0)} workloads; "
+            f"{len(prior)} prior incident(s) for this alert; "
+            f"knowledge families={sorted((kg_context.get('knowledge') or {}).keys())}"
+        )
+    sim_lines = [
+        f"- {getattr(i, 'incident_id', '?')} sim={getattr(i, 'similarity', 0):.2f}: "
+        f"{getattr(i, 'analysis_summary', '') or getattr(i, 'title', '')}"
+        for i in similar_incidents[:5]
+    ] or ["- none"]
+
+    system = (
+        "You are a senior SRE planning a root-cause investigation for an NVIDIA Run:ai "
+        "GPU platform. Given the alert, knowledge-graph summary, and similar past "
+        "incidents, refine the investigation plan. Be honest: if nothing matches, keep "
+        "strategy breadth_first and describe HOW to approach. Do not force-fit a prior "
+        "incident. Keys: focus (str), hypotheses (list of {family, reason}), strategy "
+        "('targeted' or 'breadth_first'), narrative (str)."
+    )
+    user = (
+        f"Alert: {target.alert_name}\n"
+        f"Namespace: {target.namespace}  Node: {target.node}  "
+        f"Workload: {target.workload_name}  Pod: {target.pod}  "
+        f"Project: {target.project}  Queue: {target.queue}\n"
+        f"Knowledge graph: {kg_summary}\n"
+        f"Similar incidents (only >=0.80 are trustworthy):\n" + "\n".join(sim_lines) + "\n\n"
+        f"Current deterministic plan:\n"
+        f"focus={plan.focus}\nstrategy={plan.strategy}\n"
+        f"hypotheses={plan.hypotheses}\nnarrative={plan.narrative}\n"
+    )
+    data = await complete_json(settings, system=system, user=user)
+    if not data:
+        return None
+
+    focus = data.get("focus")
+    strategy = data.get("strategy")
+    narrative = data.get("narrative")
+    hypotheses = _coerce_hypotheses(data.get("hypotheses"))
+
+    return InvestigationPlan(
+        focus=focus if isinstance(focus, str) and focus.strip() else plan.focus,
+        namespaces=plan.namespaces,
+        node=plan.node,
+        workload=plan.workload,
+        pod=plan.pod,
+        check_control_plane=plan.check_control_plane,
+        hypotheses=hypotheses or plan.hypotheses,
+        strategy=strategy if strategy in ("targeted", "breadth_first") else plan.strategy,
+        used_similarity=plan.used_similarity,
+        used_ontology=plan.used_ontology,
+        narrative=narrative if isinstance(narrative, str) and narrative.strip() else plan.narrative,
+        matched_alert=plan.matched_alert,
+    )
+
+
+def _coerce_hypotheses(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in value:
+        if isinstance(item, dict) and item.get("family"):
+            out.append(
+                {"family": str(item["family"]), "reason": str(item.get("reason", ""))}
+            )
+    return out

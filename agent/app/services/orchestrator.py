@@ -20,9 +20,11 @@ from app.collectors.loki import LokiCollector
 from app.collectors.postgres import PostgresCollector
 from app.collectors.prometheus import PrometheusCollector
 from app.collectors.runai import RunAICollector
+from app.collectors.system import SystemCollector
 from app.config import Settings
 from app.knowledge import load_failure_modes, load_troubleshooting_cases
 from app.masking import Masker, build_masker
+from app.plan import InvestigationPlan
 from app.prompts import agent_role_coverage_lines, load_agent_souls
 from app.schemas import (
     AlertAnalysisRequest,
@@ -33,6 +35,7 @@ from app.schemas import (
     IncidentSummaryResponse,
 )
 from app.services.kg_enrichment import enrich
+from app.services.planner import plan_investigation
 from app.services.root_cause_ranking import RankedCause, rank_root_cause_candidates
 
 TModel = TypeVar("TModel", bound=BaseModel)
@@ -144,6 +147,7 @@ class AnalysisOrchestrator:
             PostgresCollector(settings),
             PrometheusCollector(settings),
             LokiCollector(settings),
+            SystemCollector(settings),
         ]
 
     async def analyze(self, request: AlertAnalysisRequest) -> AlertAnalysisResponse:
@@ -151,9 +155,19 @@ class AnalysisOrchestrator:
         # Knowledge graph is consulted once here, at synthesis time, as a
         # knowledge resource for the final RCA — not as a parallel collector.
         kg_context = await enrich(self._settings, target)
+        # Plan first (senior-SRE "think before you dig"): scope every collector to
+        # what THIS alert needs instead of always scraping the control plane.
+        plan = await plan_investigation(
+            self._settings,
+            target,
+            request.alert,
+            kg_context.as_dict(),
+            list(request.similar_incidents),
+        )
         nat_payload = request.model_dump(mode="json")
         nat_payload["mode"] = "alert_analysis"
         nat_payload["kg_context"] = kg_context.as_dict()
+        nat_payload["plan"] = plan.as_dict()
         agent_souls = load_agent_souls(self._settings.agent_souls_file)
         nat_payload["agent_souls"] = agent_souls
         nat_text = None
@@ -164,7 +178,7 @@ class AnalysisOrchestrator:
             nat_warnings.append(_unexpected_runtime_warning("nemo", exc))
 
         results = await asyncio.gather(
-            *(_collect_safely(collector, target) for collector in self._collectors)
+            *(_collect_safely(collector, target, plan) for collector in self._collectors)
         )
 
         capabilities = {result.agent: result.status for result in results}
@@ -196,6 +210,7 @@ class AnalysisOrchestrator:
             agent_souls,
             root_cause_candidates,
             kg_context.as_dict(),
+            plan,
         )
 
         response = AlertAnalysisResponse(
@@ -229,6 +244,7 @@ class AnalysisOrchestrator:
                     root_cause_candidates[0].as_dict() if root_cause_candidates else None
                 ),
                 "knowledge_base": kg_context.as_dict(),
+                "plan": plan.as_dict(),
             },
             artifacts=artifacts,
         )
@@ -360,9 +376,11 @@ def _quality_from(results: list[CollectorResult]) -> str:
     return "low"
 
 
-async def _collect_safely(collector: object, target: object) -> CollectorResult:
+async def _collect_safely(
+    collector: object, target: object, plan: object = None
+) -> CollectorResult:
     try:
-        return await collector.collect(target)  # type: ignore[attr-defined]
+        return await collector.collect(target, plan)  # type: ignore[attr-defined]
     except Exception as exc:
         agent = _collector_name(collector)
         return CollectorResult(
@@ -438,6 +456,7 @@ def _detail_from(
     agent_souls: str = "",
     root_cause_candidates: list[RankedCause] | None = None,
     kg_context: dict | None = None,
+    plan: InvestigationPlan | None = None,
 ) -> str:
     labels = request.alert.labels
     annotations = request.alert.annotations
@@ -451,6 +470,7 @@ def _detail_from(
         "and Postgres collectors for this RCA. Confirmed evidence and missing "
         "collector data are listed below.",
     ]
+    lines.extend(_investigation_plan_lines(plan))
     lines.extend(_affected_pods_lines(request))
     lines.extend(
         [
@@ -459,11 +479,9 @@ def _detail_from(
             "",
         ]
     )
+    # One best line per agent — the single most useful finding, not status prose.
     for result in results:
-        lines.append(f"- **{result.agent}**: {result.summary}")
-    highlight_lines = _evidence_highlight_lines(results)
-    if highlight_lines:
-        lines.extend(["", "## Evidence Highlights", "", *highlight_lines])
+        lines.append(f"- **{result.agent}**: {_best_evidence_line(result)}")
     lines.extend(
         _knowledge_base_lines(kg_context, root_cause_candidates, _observed_text(results))
     )
@@ -492,7 +510,7 @@ def _detail_from(
             "",
             "## Recommended Actions",
             "",
-            *_recommended_action_lines(missing),
+            *_recommended_action_lines(missing, request),
             "",
             "## Troubleshooting Playbook",
             "",
@@ -624,9 +642,11 @@ def _kb_remediation_lines(
     if not candidates or not knowledge:
         return []
     top_family = candidates[0].family
+    if top_family == "insufficient_evidence":
+        return ["- No closely-matching prior knowledge for this evidence yet."]
     symptoms = knowledge.get(top_family) or []
     if not symptoms:
-        return []
+        return ["- No closely-matching prior knowledge for this evidence yet."]
     text = observed_text.lower()
     # Precise: the first symptom whose keyword appears in the observed evidence.
     for symptom in symptoms:
@@ -634,16 +654,13 @@ def _kb_remediation_lines(
             actions = symptom.get("actions", [])
             if actions:
                 header = (
-                    f"- Known fixes for **{symptom.get('symptom')}** "
-                    f"({top_family}, from the knowledge base):"
+                    f"- Matched symptom **{symptom.get('symptom')}** "
+                    f"({_family_label(top_family)}); known fixes from the knowledge base:"
                 )
                 return [header, *[f"  - {a}" for a in actions[:5]]]
-    # Fallback: no specific symptom matched -> the family's actions.
-    fallback = sorted({a for symptom in symptoms for a in symptom.get("actions", [])})
-    if not fallback:
-        return []
-    header = f"- Known fixes for **{top_family}** (from the knowledge base):"
-    return [header, *[f"  - {a}" for a in fallback[:5]]]
+    # No symptom keyword matched the observed evidence: don't dump a generic family
+    # checklist as if it were a match — say so plainly.
+    return ["- No closely-matching prior knowledge for this evidence yet."]
 
 
 def _playbook_lines(
@@ -698,16 +715,57 @@ def _short_sentence(value: str, *, limit: int) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
-def _evidence_highlight_lines(results: list[CollectorResult]) -> list[str]:
-    lines: list[str] = []
-    for result in results:
-        if result.agent == "kubernetes":
-            lines.extend(_kubernetes_highlights(result.details))
-        elif result.agent == "loki":
-            lines.extend(_loki_highlights(result.details))
-        elif result.agent == "runai":
-            lines.extend(_runai_highlights(result.details))
-    return lines[:8]
+def _investigation_plan_lines(plan: InvestigationPlan | None) -> list[str]:
+    if plan is None:
+        return []
+    matched = []
+    if plan.used_similarity:
+        matched.append("a similar past incident")
+    if plan.used_ontology:
+        matched.append("knowledge-graph facts")
+    matched_text = (
+        "matched " + " and ".join(matched)
+        if matched
+        else "nothing prior matched — reasoning from live evidence"
+    )
+    lines = [
+        "",
+        "## Investigation Plan",
+        "",
+        f"- Focus: {plan.focus}",
+        f"- Strategy: {plan.strategy} ({matched_text}).",
+    ]
+    if plan.check_control_plane:
+        lines.append("- Run:ai control plane is in scope for this alert.")
+    else:
+        lines.append("- Run:ai control plane was ruled out of scope for this alert.")
+    if plan.narrative:
+        lines.append(f"- Approach: {plan.narrative}")
+    alert = plan.matched_alert
+    if alert:
+        lines.append(
+            f"- Documented Run:ai alert **{alert.get('alert')}** "
+            f"({alert.get('severity', 'n/a')}) — {alert.get('trigger', '')}"
+        )
+        for step in alert.get("actions", [])[:5]:
+            lines.append(f"  - {step}")
+    return lines
+
+
+def _best_evidence_line(result: CollectorResult) -> str:
+    """The single most useful finding for this agent, not a status blurb."""
+    if result.agent == "kubernetes":
+        picked = _kubernetes_highlights(result.details)
+    elif result.agent == "loki":
+        picked = _loki_highlights(result.details)
+    elif result.agent == "runai":
+        picked = _runai_highlights(result.details)
+    else:
+        picked = []
+    if picked:
+        # highlight lines start with "- "; strip the marker for inline use.
+        return picked[0].lstrip("- ").strip()
+    return result.summary
 
 
 def _kubernetes_highlights(details: dict[str, object]) -> list[str]:
@@ -773,13 +831,28 @@ def _runai_highlights(details: dict[str, object]) -> list[str]:
     return lines
 
 
-def _recommended_action_lines(missing: list[str]) -> list[str]:
+_SIMILARITY_FLOOR = 0.80
+
+
+def _recommended_action_lines(
+    missing: list[str], request: AlertAnalysisRequest | None = None
+) -> list[str]:
     lines = [
         "- Treat the Kubernetes and Prometheus evidence above as the current "
         "source of truth for this RCA.",
         "- Apply the remediation implied by the confirmed scheduling, pod, node, "
         "or metric evidence.",
     ]
+    # Weave the proven RCA/fix from a high-similarity past incident into the actions.
+    top = _top_similar_incident(request) if request else None
+    if top is not None:
+        proven = (top.analysis_summary or top.title or "").strip()
+        if proven:
+            lines.append(
+                f"- Similar past incident {top.incident_id} (similarity "
+                f"{top.similarity:.2f}) was resolved by: {proven} — verify this fix "
+                "applies here before repeating it."
+            )
     if "runai.auth" in missing or "runai.query" in missing:
         lines.append(
             "- Restore Run:ai API authentication so the agent can attach "
@@ -821,11 +894,29 @@ def _affected_pods_lines(request: AlertAnalysisRequest) -> list[str]:
     return lines
 
 
+def _top_similar_incident(request: AlertAnalysisRequest):
+    """Highest-similarity incident at/above the 0.80 trust floor, else None."""
+    qualified = [
+        item
+        for item in request.similar_incidents
+        if (item.similarity or 0) >= _SIMILARITY_FLOOR
+    ]
+    if not qualified:
+        return None
+    return max(qualified, key=lambda item: item.similarity or 0)
+
+
 def _similar_incident_lines(request: AlertAnalysisRequest) -> list[str]:
     lines = ["", "## Similar Incidents", ""]
-    if not request.similar_incidents:
-        return [*lines, "- No similar incident memory was provided."]
-    for item in request.similar_incidents[:3]:
+    # Only surface vector hits we actually trust; a 0.70 "match" is noise.
+    qualified = sorted(
+        (i for i in request.similar_incidents if (i.similarity or 0) >= _SIMILARITY_FLOOR),
+        key=lambda i: i.similarity or 0,
+        reverse=True,
+    )
+    if not qualified:
+        return [*lines, "- No similar past incident found."]
+    for item in qualified[:3]:
         feedback = (
             f"{item.positive_feedback} up / {item.negative_feedback} down / "
             f"{item.comment_count} comments"
