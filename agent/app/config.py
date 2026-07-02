@@ -76,6 +76,7 @@ class Settings:
     runai_workloads_path: str
     runai_projects_path: str
     runai_queues_path: str
+    runai_version_path: str
     runai_timeout_seconds: int
     prometheus_url: str
     prometheus_timeout_seconds: int
@@ -160,6 +161,9 @@ def load_settings() -> Settings:
         runai_workloads_path=os.getenv("RUNAI_WORKLOADS_PATH", "/api/v1/workloads").strip(),
         runai_projects_path=os.getenv("RUNAI_PROJECTS_PATH", "/api/v1/projects").strip(),
         runai_queues_path=os.getenv("RUNAI_QUEUES_PATH", "/api/v1/queues").strip(),
+        # Run:ai control-plane version endpoint — enables version-aware suppression of
+        # already-fixed known issues. Best-effort; override per your Run:ai API.
+        runai_version_path=os.getenv("RUNAI_VERSION_PATH", "/api/v1/version").strip(),
         runai_timeout_seconds=_int_env("RUNAI_TIMEOUT_SECONDS", 120),
         prometheus_url=os.getenv("PROMETHEUS_URL", "").strip().rstrip("/"),
         prometheus_timeout_seconds=_int_env("PROMETHEUS_TIMEOUT_SECONDS", 120),

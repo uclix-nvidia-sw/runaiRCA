@@ -388,6 +388,9 @@ class AnalysisOrchestrator:
         summary = _summary_from(request, results, root_cause_candidates)
         failure_modes = load_failure_modes(self._settings.failure_modes_file)
         known_issues = load_runai_known_issues(self._settings.runai_known_issues_file)
+        # Version-aware precision: drop known issues already fixed in the cluster's
+        # running Run:ai version so we don't attribute a symptom to a patched bug.
+        known_issues = _suppress_fixed_known_issues(known_issues, _runai_version_from(results))
         playbook_fallback = load_troubleshooting_cases(
             self._settings.troubleshooting_cases_file
         )
@@ -1119,6 +1122,36 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
             f"{chain}. Fix the root XID first."
         )
     return f"- Related GPU errors (XID): {codes} — see the recommended actions below."
+
+
+def _runai_version_from(results: list[CollectorResult]) -> str:
+    """The running Run:ai control-plane version, if the runai collector resolved one."""
+    for result in results:
+        if result.agent == "runai":
+            value = result.details.get("runai_version")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _version_tuple(text: str) -> tuple[int, ...]:
+    return tuple(int(n) for n in re.findall(r"\d+", text or "")[:4])
+
+
+def _known_issue_fixed_in_running(issue: dict, running_version: str) -> bool:
+    """True when the cluster's Run:ai version is at/after the issue's fixed version:
+    the bug is already patched here, so surfacing it would be a false positive."""
+    fixed = _version_tuple(str(issue.get("fixed_version") or ""))
+    running = _version_tuple(running_version)
+    return bool(fixed and running and running >= fixed)
+
+
+def _suppress_fixed_known_issues(known_issues: list[dict], running_version: str) -> list[dict]:
+    """Drop known issues already fixed in the running Run:ai version (precision:
+    don't attribute a symptom to a bug the cluster is already patched against)."""
+    if not running_version:
+        return known_issues
+    return [k for k in known_issues if not _known_issue_fixed_in_running(k, running_version)]
 
 
 def _known_issue_cause_lines(
