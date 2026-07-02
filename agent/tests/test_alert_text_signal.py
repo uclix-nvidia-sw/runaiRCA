@@ -64,3 +64,25 @@ def test_xid_promotes_gpu_hardware_over_keyword_noise() -> None:
     assert [c.family for c in promoted[1:]] == ["node_kubelet_pressure", "control_plane_error"]
     # no XID -> untouched
     assert _promote_xid_cause(ranked, [])[0].family == "node_kubelet_pressure"
+
+
+def test_signature_promotion_beats_ranker_and_respects_precedence() -> None:
+    from app.services.orchestrator import _promote_signature_cause
+
+    ranked = [RankedCause(family="node_kubelet_pressure", confidence="medium", score=3.0)]
+    # known-issue signature beats the ranker
+    ki = [{"issue": "Scheduler Reclaim Panic On Large GPU Job", "family": "platform_version_bug"}]
+    out = _promote_signature_cause(ranked, [], ki, [])
+    assert out[0].family == "platform_version_bug"
+    # curated symptom beats the ranker when no known issue matched
+    sym = [("gpu_hardware_error", {"symptom": "GPU Fallen Off The Bus"})]
+    out = _promote_signature_cause(ranked, [], [], sym)
+    assert out[0].family == "gpu_hardware_error"
+    # XID outranks both
+    out = _promote_signature_cause(ranked, [79], ki, sym)
+    assert out[0].family == "gpu_hardware_error" and out[0].confidence == "high"
+    # signature agreeing with the ranker keeps the richer ranked entry
+    agree = [("node_kubelet_pressure", {"symptom": "Node Disk Pressure"})]
+    assert _promote_signature_cause(ranked, [], [], agree)[0] is ranked[0]
+    # nothing matched -> ranker stands
+    assert _promote_signature_cause(ranked, [], [], [])[0].family == "node_kubelet_pressure"

@@ -314,13 +314,25 @@ class AnalysisOrchestrator:
             kg_blast_radius=kg_context.blast_radius_workloads,
             priors=priors,
         )
-        # Deterministic override: an NVIDIA XID names the cause category outright —
-        # GPU hardware. The keyword ranker only ranks the four generic families, so
-        # a GPU fault alert used to get headlined by keyword noise (chronically
-        # node_kubelet_pressure via the k8s node-conditions text, where words like
-        # "DiskPressure"/"kubelet" appear even when every condition is False).
+        # Signature-first headline: the keyword ranker only decides when NOTHING
+        # specific matched. A specific signature — an NVIDIA XID (dispositive), a
+        # known-issue signature, or a curated symptom keyword — names the cause
+        # family directly; the ranker chronically mis-headlined these (e.g.
+        # node_kubelet_pressure winning on "DiskPressure"/"kubelet" words present in
+        # the k8s node-conditions text even when every condition is False).
+        observed = _observed_text(results, request)
         xid_codes = _xid_codes_from_results(results, _alert_text(request))
-        root_cause_candidates = _promote_xid_cause(root_cause_candidates, xid_codes)
+        failure_modes = load_failure_modes(self._settings.failure_modes_file)
+        known_issues = load_runai_known_issues(self._settings.runai_known_issues_file)
+        # Version-aware precision: drop known issues already fixed in the cluster's
+        # running Run:ai version so we don't attribute a symptom to a patched bug.
+        known_issues = _suppress_fixed_known_issues(known_issues, _runai_version_from(results))
+        root_cause_candidates = _promote_signature_cause(
+            root_cause_candidates,
+            xid_codes,
+            match_runai_known_issues(known_issues, observed),
+            match_failure_mode_symptoms(failure_modes, observed),
+        )
         if root_cause_candidates:
             top = root_cause_candidates[0]
             _log.info(
@@ -415,15 +427,10 @@ class AnalysisOrchestrator:
             timeline = build_timeline(results)
         quality = _quality_from(results)
         summary = _summary_from(request, results, root_cause_candidates)
-        failure_modes = load_failure_modes(self._settings.failure_modes_file)
-        known_issues = load_runai_known_issues(self._settings.runai_known_issues_file)
-        # Version-aware precision: drop known issues already fixed in the cluster's
-        # running Run:ai version so we don't attribute a symptom to a patched bug.
-        known_issues = _suppress_fixed_known_issues(known_issues, _runai_version_from(results))
         # Adversarial precision: LLM-verify signature/keyword matches (known issues,
         # failure-mode symptoms, GPU XIDs) and drop ones the evidence doesn't support.
-        # Best-effort + LLM-gated: with no LLM nothing is suppressed.
-        observed = _observed_text(results, request)
+        # Best-effort + LLM-gated: with no LLM nothing is suppressed. (failure_modes /
+        # known_issues / observed were computed before ranking promotion above.)
         try:
             from app.services.self_check import verify_known_issues, verify_matches
         except ImportError:
@@ -1200,6 +1207,49 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
             f"{chain}. Fix the root XID first."
         )
     return f"- Related GPU errors (XID): {codes} — see the recommended actions below."
+
+
+def _promote_signature_cause(
+    candidates: list[RankedCause],
+    xid_codes: list[int],
+    known_issue_matches: list[dict],
+    symptom_matches: list[tuple[str, dict]],
+) -> list[RankedCause]:
+    """A specific signature names the headline family; the keyword ranker is only
+    the no-signal fallback. Precedence: NVIDIA XID (dispositive) > known-issue
+    signature > curated symptom keyword > ranker. When the signature agrees with
+    the ranker's top family the richer ranked entry is kept as-is."""
+    if xid_codes:
+        return _promote_xid_cause(candidates, xid_codes)
+    top_family = candidates[0].family if candidates else ""
+    for entry in known_issue_matches:
+        family = str(entry.get("family") or "")
+        if not family:
+            continue
+        if family == top_family:
+            return candidates
+        lead = RankedCause(
+            family=family,
+            confidence="medium",
+            score=8.0,
+            rationale=[f"matched known-issue signature: {entry.get('issue')}"],
+            evidence_agents=["signature"],
+        )
+        return [lead] + [c for c in candidates if c.family != family]
+    for family, symptom in symptom_matches:
+        if not family:
+            continue
+        if family == top_family:
+            return candidates
+        lead = RankedCause(
+            family=family,
+            confidence="medium",
+            score=7.0,
+            rationale=[f"matched curated symptom: {symptom.get('symptom')}"],
+            evidence_agents=["signature"],
+        )
+        return [lead] + [c for c in candidates if c.family != family]
+    return candidates
 
 
 def _promote_xid_cause(

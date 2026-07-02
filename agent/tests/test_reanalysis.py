@@ -41,6 +41,22 @@ def _request() -> AlertAnalysisRequest:
     )
 
 
+def _signatureless_request() -> AlertAnalysisRequest:
+    """An alert matching NO curated signature — the true no-signal path.
+
+    The signature-first headline names the family straight from the alert text
+    (NodeDiskPressure -> node_kubelet_pressure), so insufficient-evidence tests
+    need an alert whose name/summary hit no symptom/known-issue/XID keyword."""
+    return AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "MysteriousBlip", "namespace": "runai-vision"},
+            annotations={"summary": "Something odd happened."},
+            fingerprint="fp-reanalysis-nosig",
+        )
+    )
+
+
 def _stub_llm_http(monkeypatch) -> None:
     # Any raw LLM HTTP call (planner refinement, synthesis, sharpening) fails fast.
     async def fake_post_json(*args, **kwargs):
@@ -200,7 +216,7 @@ async def test_insufficient_evidence_adds_korean_questions_without_llm() -> None
     # No LLM, all collectors unconfigured -> insufficient_evidence + Korean questions.
     settings = replace(make_settings(), language="ko")
     orchestrator = AnalysisOrchestrator(settings)
-    response = await orchestrator.analyze(_request())
+    response = await orchestrator.analyze(_signatureless_request())
 
     top = response.context["root_cause_candidates"][0]
     assert top["family"] == "insufficient_evidence"
@@ -225,7 +241,7 @@ async def test_no_llm_keeps_behavior_no_reanalysis(monkeypatch) -> None:
     monkeypatch.setattr("app.services.investigator.investigate", fake_investigate)
     settings = replace(make_settings(), enable_investigation_loop=True)
     orchestrator = AnalysisOrchestrator(settings)
-    response = await orchestrator.analyze(_request())
+    response = await orchestrator.analyze(_signatureless_request())
 
     assert investigate_calls == []
     assert "재분석" not in response.analysis_detail
