@@ -876,3 +876,51 @@ def test_pod_describe_line_carries_limits_restarts_oomkilled() -> None:
     assert _pod_describe_line({"name": "p", "phase": "Running"}) == (
         "- Kubernetes pod p is in phase Running."
     )
+
+
+@pytest.mark.asyncio
+async def test_loki_correlates_control_plane_logs_to_dying_workload(monkeypatch) -> None:
+    # When a workload alert implicates the control plane, Loki must also query the
+    # runai/runai-backend namespaces for lines that NAME this workload — that's where
+    # "scheduler evicted/preempted workload X" lives, beyond the error-pattern query.
+    from types import SimpleNamespace
+
+    seen_queries: list[str] = []
+
+    async def fake_get_json(**kwargs) -> SimpleNamespace:
+        seen_queries.append(kwargs["params"]["query"])
+        return SimpleNamespace(
+            url="http://loki/x", status_code=200, error=None,
+            data={"status": "success", "data": {"result": []}},
+        )
+
+    monkeypatch.setattr("app.collectors.loki.get_json", fake_get_json)
+    collector = LokiCollector(replace(make_settings(), loki_url="http://loki.example"))
+    plan = SimpleNamespace(
+        namespaces=["runai-vision"], pod="", workload="trainer", check_control_plane=True
+    )
+    await collector.collect(make_target(), plan)
+
+    joined = "\n".join(seen_queries)
+    # the control-plane namespaces are queried for the workload identifier
+    assert any("trainer" in q and "runai" in q for q in seen_queries), joined
+    # and the generic control-plane-error sweep still runs
+    assert any("reconcile" in q for q in seen_queries), joined
+
+
+def test_correlation_term_skips_too_short_identifiers() -> None:
+    from app.collectors.base import AnalysisTarget
+    from app.collectors.loki import _control_plane_correlation_term
+
+    def tgt(**k):
+        base = dict(cluster="", project="", queue="", namespace="", workload_name="",
+                    workload_type="", runai_workload_id="", node="", pod="",
+                    severity="warning", alert_name="A")
+        base.update(k)
+        return AnalysisTarget(**base)
+
+    assert _control_plane_correlation_term(tgt(workload_name="trainer")) == "trainer"
+    # regex metachars are escaped so the identifier can't break the LogQL query
+    assert _control_plane_correlation_term(tgt(workload_name="job.v2")) == r"job\.v2"
+    # too short → skipped (would match unrelated lines)
+    assert _control_plane_correlation_term(tgt(workload_name="a", project="x")) == ""
