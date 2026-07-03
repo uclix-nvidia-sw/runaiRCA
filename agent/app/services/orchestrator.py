@@ -1672,11 +1672,56 @@ def _kubernetes_highlights(details: dict[str, object]) -> list[str]:
         for pod in pod_statuses[:2]:
             if not isinstance(pod, dict):
                 continue
-            phase = pod.get("phase")
-            name = pod.get("name")
-            if phase and name:
-                lines.append(f"- Kubernetes pod {name} is in phase {phase}.")
+            if pod.get("phase") and pod.get("name"):
+                lines.append(_pod_describe_line(pod))
     return lines
+
+
+def _pod_describe_line(pod: dict[str, object]) -> str:
+    """`kubectl describe`-grade one-liner: phase + per-container limits, restarts,
+    and last termination. "phase Running" alone told the operator nothing on a
+    memory-limit alert — the limit and any OOMKilled restarts are the evidence."""
+    base = f"- Kubernetes pod {pod.get('name')} is in phase {pod.get('phase')}"
+    resources = pod.get("resources") if isinstance(pod.get("resources"), dict) else {}
+    statuses = pod.get("containerStatuses")
+    parts: list[str] = []
+    for st in (statuses if isinstance(statuses, list) else [])[:2]:
+        if not isinstance(st, dict) or not st.get("name"):
+            continue
+        cname = str(st["name"])
+        facts: list[str] = []
+        res = resources.get(cname) if isinstance(resources.get(cname), dict) else {}
+        limits = res.get("limits") if isinstance(res.get("limits"), dict) else {}
+        requests = res.get("requests") if isinstance(res.get("requests"), dict) else {}
+        if limits.get("memory"):
+            mem = f"mem limit {limits['memory']}"
+            if requests.get("memory"):
+                mem += f" (request {requests['memory']})"
+            facts.append(mem)
+        if limits.get("cpu"):
+            facts.append(f"cpu limit {limits['cpu']}")
+        restarts = st.get("restartCount")
+        if isinstance(restarts, int) and restarts > 0:
+            facts.append(f"{restarts} restart(s)")
+        state = st.get("state") if isinstance(st.get("state"), dict) else {}
+        waiting = state.get("waiting") if isinstance(state.get("waiting"), dict) else {}
+        if waiting.get("reason"):
+            facts.append(f"waiting: {waiting['reason']}")
+        last_state = st.get("lastState") if isinstance(st.get("lastState"), dict) else {}
+        term = last_state.get("terminated")
+        term = term if isinstance(term, dict) else {}
+        if term.get("reason") or term.get("exitCode") is not None:
+            last = f"last {term.get('reason') or 'terminated'}"
+            if term.get("exitCode") is not None:
+                last += f" (exit {term['exitCode']})"
+            if term.get("finishedAt"):
+                last += f" at {term['finishedAt']}"
+            facts.append(last)
+        if facts:
+            parts.append(f"{cname}: " + ", ".join(facts))
+    if parts:
+        base += " — " + "; ".join(parts)
+    return base + "."
 
 
 def _loki_highlights(details: dict[str, object]) -> list[str]:

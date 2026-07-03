@@ -697,6 +697,12 @@ def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
     status = pod.get("status") if isinstance(pod.get("status"), dict) else {}
     spec = pod.get("spec") if isinstance(pod.get("spec"), dict) else {}
     containers = status.get("containerStatuses", [])
+    # Per-container limits/requests — the `kubectl describe` fact an operator
+    # reaches for first on a memory/CPU-limit alert.
+    resources: dict[str, object] = {}
+    for container in spec.get("containers", []) if isinstance(spec.get("containers"), list) else []:
+        if isinstance(container, dict) and isinstance(container.get("name"), str):
+            resources[container["name"]] = container.get("resources") or {}
     return {
         "name": metadata.get("name"),
         "namespace": metadata.get("namespace"),
@@ -705,6 +711,7 @@ def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
         "podIP": status.get("podIP"),
         "conditions": status.get("conditions", []),
         "containerStatuses": compact(containers, limit=5),
+        "resources": resources,
     }
 
 
