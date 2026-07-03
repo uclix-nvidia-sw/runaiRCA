@@ -78,6 +78,23 @@
         - "The workload is using over-quota (spare) GPUs, which can be reclaimed at any moment — this is normal Run:ai elasticity, not a fault."
         - "Adjust the project's over-quota weight if it should get a larger share of spare capacity."
         - "Move the workload to a within-quota request if it needs stable, non-reclaimable GPUs."
+    # Run:ai runs its OWN scheduler (runai-scheduler-default in the runai namespace),
+    # separate from the Kubernetes scheduler. A workload that "suddenly died" or pends
+    # is often decided HERE, not by kube-scheduler, so its logs are the primary source.
+    # Concepts: gang/pod-groups, deserved vs over-quota, fairshare, priority, reclaim.
+    # Ref: run-ai-docs.nvidia.com/self-hosted/platform-management/runai-scheduler/scheduling/concepts-and-principles
+    - name: Reclaimed To Rebalance Fairshare
+      keywords: [reclaim, reclaimed, reclaiming, fairshare, "fair share"]
+      actions:
+        - "The Run:ai scheduler reclaimed this workload's OVER-QUOTA GPUs to return them to a project that deserves them (deserved quota) or to rebalance fairshare across projects/departments. This inter-project reclaim is distinct from priority preemption and is expected Run:ai elasticity, not a fault. Read the Run:ai scheduler logs: `kubectl logs -n runai deploy/runai-scheduler-default` and grep the workload/project name for the reclaim decision."
+        - "To keep GPUs stable, run the workload WITHIN the project's deserved (guaranteed, non-reclaimable) quota instead of over-quota."
+        - "If reclaim happens too often, rebalance the project/department deserved quota or over-quota weights."
+    - name: Gang Or Pod-Group Not Scheduling
+      keywords: ["pod group", pod-group, podgroup, "gang schedul", podgroupunschedulable]
+      actions:
+        - "Run:ai gang-schedules by pod-group: a multi-pod workload is either FULLY scheduled or FULLY pending, so a single unplaceable pod keeps the whole group Pending. Read the runai-scheduler-default logs plus the pod-group-controller / pod-grouper pods in the runai namespace for why the group could not gang."
+        - "Verify the SUM of the group's pod requests fits one node pool's free + reclaimable capacity, and that topology/affinity/GPU-fraction constraints are not fragmenting placement."
+        - "For distributed (leader/worker) workloads, confirm all sub-groups can be placed together."
     - name: Quota Or Request Changed
       keywords: [preempt, quota]
       actions:

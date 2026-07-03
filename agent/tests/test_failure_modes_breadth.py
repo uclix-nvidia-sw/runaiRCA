@@ -74,3 +74,22 @@ def test_layer_families_have_signatures() -> None:
         symptoms = modes.get(family) or []
         assert len(symptoms) >= 2, f"{family} needs at least 2 symptoms"
         assert all(s["keywords"] and s["actions"] for s in symptoms)
+
+
+def test_runai_scheduler_reclaim_and_gang_surface_with_scheduler_pod_pointer() -> None:
+    # Run:ai's own scheduler (separate from kube-scheduler): a reclaimed or gang-stuck
+    # workload must match a symptom whose action points at runai-scheduler-default.
+    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+
+    modes = load_failure_modes("knowledge/failure_modes.yaml")
+
+    reclaim = match_failure_mode_symptoms(
+        modes, "runai-scheduler reclaimed over-quota gpus from project vision", ""
+    )
+    assert any(s.get("symptom") == "Reclaimed To Rebalance Fairshare" for _, s in reclaim)
+    assert any("runai-scheduler-default" in a for _, s in reclaim for a in s.get("actions", []))
+
+    gang = match_failure_mode_symptoms(
+        modes, "pod group is unschedulable: not enough resources to gang the group", ""
+    )
+    assert any(s.get("symptom") == "Gang Or Pod-Group Not Scheduling" for _, s in gang)

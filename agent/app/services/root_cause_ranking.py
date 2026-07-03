@@ -42,6 +42,7 @@ _FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
         "prometheus",
         ("prometheus", "kubernetes", "runai"),
         ("failedscheduling", "unschedulable", "insufficient", "preempt",
+         "reclaim", "pod group", "podgroup", "gang", "fairshare",
          "saturat", "requested gpus", "quota", "pending"),
     ),
     "control_plane_error": (
