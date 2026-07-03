@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.collectors.http_json import compact, get_json
 from app.collectors.loki import _llm_insight
@@ -35,7 +37,12 @@ class PrometheusCollector:
                 ],
             )
 
-        queries = _queries_for(target, plan)
+        control_plane_namespaces = (
+            self._settings.runai_log_namespaces
+            if plan is not None and getattr(plan, "check_control_plane", False)
+            else ()
+        )
+        queries = _queries_for(target, plan, control_plane_namespaces)
         query_results = []
         warnings: list[str] = []
 
@@ -125,7 +132,9 @@ class PrometheusCollector:
         )
 
 
-def _queries_for(target: AnalysisTarget, plan=None) -> list[tuple[str, str]]:
+def _queries_for(
+    target: AnalysisTarget, plan=None, control_plane_namespaces: tuple[str, ...] = ()
+) -> list[tuple[str, str]]:
     namespace = target.namespace
     pod = target.pod
     if plan is not None:
@@ -188,6 +197,24 @@ def _queries_for(target: AnalysisTarget, plan=None) -> list[tuple[str, str]]:
                 (
                     "runai_project_requested_gpus",
                     f'runai_project_requested_gpus{{project="{target.project}"}}',
+                ),
+            ]
+        )
+    # Control-plane health: when the alert implicates Run:ai, check whether the
+    # scheduler/backend pods themselves are crashlooping or stuck Pending — a dying
+    # workload's cause is often an unhealthy control plane, not the workload.
+    ns_re = "|".join(re.escape(ns) for ns in control_plane_namespaces if ns)
+    if ns_re:
+        cp = f'namespace=~"{ns_re}"'
+        queries.extend(
+            [
+                (
+                    "runai_control_plane_restarts",
+                    f"kube_pod_container_status_restarts_total{{{cp}}}",
+                ),
+                (
+                    "runai_control_plane_pending",
+                    f'kube_pod_status_phase{{{cp},phase="Pending"}}',
                 ),
             ]
         )

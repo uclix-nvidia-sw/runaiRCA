@@ -924,3 +924,23 @@ def test_correlation_term_skips_too_short_identifiers() -> None:
     assert _control_plane_correlation_term(tgt(workload_name="job.v2")) == r"job\.v2"
     # too short → skipped (would match unrelated lines)
     assert _control_plane_correlation_term(tgt(workload_name="a", project="x")) == ""
+
+
+def test_prometheus_widens_to_control_plane_health_when_implicated() -> None:
+    # When a workload alert implicates the control plane, Prometheus must also probe
+    # whether the scheduler/backend pods are crashlooping / stuck Pending — that's a
+    # common real cause of a dead workload.
+    from types import SimpleNamespace
+
+    from app.collectors.prometheus import _queries_for
+
+    plan = SimpleNamespace(namespaces=["runai-vision"], pod="trainer-0", check_control_plane=True)
+    names = dict(_queries_for(make_target(), plan, ("runai", "runai-backend")))
+    assert "runai_control_plane_restarts" in names
+    assert "runai_control_plane_pending" in names
+    q = names["runai_control_plane_restarts"]
+    assert "namespace=~" in q and "runai" in q and "backend" in q
+
+    # Not implicated → no control-plane widening (empty namespaces).
+    names2 = dict(_queries_for(make_target(), plan, ()))
+    assert not any(k.startswith("runai_control_plane_") for k in names2)
