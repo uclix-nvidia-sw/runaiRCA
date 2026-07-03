@@ -1131,6 +1131,7 @@ def _detail_from(
             _observed_text(results, request),
             failure_modes or {},
             troubleshooting_cases,
+            known_issues or [],
         )
     )
     lines.extend(_similar_incident_lines(request))
@@ -1544,21 +1545,30 @@ def _playbook_lines(
     observed_text: str,
     failure_modes: dict[str, list[dict]],
     fallback_cases: str,
+    known_issues: list[dict] | None = None,
 ) -> list[str]:
-    """Root-cause-relevant remediation.
+    """Root-cause-relevant remediation, most specific first.
 
-    Precise first: every curated symptom whose keyword matches the evidence, across
-    ALL families (the fine-grained signature is the entry point, not the coarse
-    ranked family). Only when nothing matches does it fall back to the ranked
-    family's general checklist, then the full case library.
+    Precision order: matched known issues (real operator cases), then every
+    curated symptom whose keyword matches the evidence — across ALL families (the
+    fine-grained signature is the entry point, not the coarse ranked family).
+    Only when nothing matches does it fall back to the ranked family's general
+    checklist, then the full case library.
     """
+    lines: list[str] = []
+    for issue in match_runai_known_issues(known_issues or [], observed_text)[:2]:
+        lines.append(f"- **{issue.get('issue')}** (known issue)")
+        reason = " ".join(str(issue.get("reason") or "").split())
+        if reason:
+            lines.append(f"  - {reason}")
+        lines.extend(f"  - {action}" for action in issue.get("actions", [])[:4])
     top_family = candidates[0].family if candidates else ""
-    matches = match_failure_mode_symptoms(failure_modes, observed_text, top_family)
-    if matches:
-        lines: list[str] = []
-        for family, symptom in matches:
-            lines.append(f"- **{symptom.get('symptom')}** ({_family_label(family)})")
-            lines.extend(f"  - {action}" for action in symptom.get("actions", [])[:5])
+    for family, symptom in match_failure_mode_symptoms(
+        failure_modes, observed_text, top_family
+    ):
+        lines.append(f"- **{symptom.get('symptom')}** ({_family_label(family)})")
+        lines.extend(f"  - {action}" for action in symptom.get("actions", [])[:5])
+    if lines:
         return lines
     # No precise signature matched: fall back to the ranked family's general
     # checklist (the coarse ranking's legitimate role), else the full case library.
