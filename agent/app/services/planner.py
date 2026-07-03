@@ -412,6 +412,11 @@ async def _llm_refine(
         "strategy breadth_first and describe HOW to approach. Do not force-fit a prior "
         "incident. Keys: focus (str), hypotheses (list of {family, reason}), strategy "
         "('targeted' or 'breadth_first'), narrative (str). "
+        "You may WIDEN the search when your re-reasoning calls for it — you can never "
+        "narrow it below what the deterministic router already chose. Optional key "
+        "check_control_plane (bool): set true to ALSO read Run:ai control-plane "
+        "logs/pods (runai, runai-backend) when your leading hypothesis points at the "
+        "platform / scheduler / backend. "
         "Respect the investigation scope: 'platform' = a Run:ai platform namespace (the "
         "control plane itself) — investigate Kubernetes and node/system evidence "
         "broadly; 'workload' = a user workload running inside Run:ai — focus on the "
@@ -445,13 +450,26 @@ async def _llm_refine(
     narrative = data.get("narrative")
     hypotheses = _coerce_hypotheses(data.get("hypotheses"))
 
+    # Scope may only WIDEN, never narrow: when the LLM re-reasons the cause toward the
+    # platform, it can turn control-plane reading ON, but it cannot switch off evidence
+    # the deterministic router already required. This keeps "what's the cause" and
+    # "where to look" moving together while the deterministic floor stays intact.
+    check_control_plane = plan.check_control_plane or data.get("check_control_plane") is True
+    namespaces = list(plan.namespaces)
+    if check_control_plane and not plan.check_control_plane:
+        # Newly widened by the LLM — mirror the deterministic control-plane sweep so the
+        # control-plane namespaces are actually read (collectors also gate on the flag).
+        for ns in settings.runai_log_namespaces:
+            if ns and ns not in namespaces:
+                namespaces.append(ns)
+
     return InvestigationPlan(
         focus=focus if isinstance(focus, str) and focus.strip() else plan.focus,
-        namespaces=plan.namespaces,
+        namespaces=namespaces,
         node=plan.node,
         workload=plan.workload,
         pod=plan.pod,
-        check_control_plane=plan.check_control_plane,
+        check_control_plane=check_control_plane,
         hypotheses=hypotheses or plan.hypotheses,
         strategy=strategy if strategy in ("targeted", "breadth_first") else plan.strategy,
         used_similarity=plan.used_similarity,

@@ -265,3 +265,38 @@ async def test_memory_alert_is_workload_runtime_not_control_plane() -> None:
     )
     plan = await plan_investigation(settings, target, None, {}, [])
     assert plan.hypotheses[0]["family"] == "workload_runtime_error"
+
+
+@pytest.mark.asyncio
+async def test_llm_can_widen_scope_to_control_plane(monkeypatch) -> None:
+    # LLM re-reasons the cause toward the platform → it may turn control-plane
+    # reading ON, and the runai control-plane namespaces get added.
+    settings = replace(make_settings(), llm_base_url="x", llm_model="m", llm_api_key="k")
+
+    async def fake(settings, *, system, user, temperature=0.1):
+        return {"strategy": "targeted", "check_control_plane": True,
+                "hypotheses": [{"family": "control_plane_error", "reason": "platform"}]}
+
+    monkeypatch.setattr("app.services.planner.complete_json", fake)
+    # monitoring ns → deterministic check_control_plane is False
+    target = _target(alert_name="SomeAlert", namespace="monitoring")
+    plan = await plan_investigation(settings, target, None, {}, [])
+    assert plan.check_control_plane is True
+    for ns in settings.runai_log_namespaces:
+        assert ns in plan.namespaces
+
+
+@pytest.mark.asyncio
+async def test_llm_cannot_narrow_control_plane_below_floor(monkeypatch) -> None:
+    # Deterministic router required control-plane (runai-backend ns). The LLM saying
+    # false must NOT switch it off — scope only widens, never narrows.
+    settings = replace(make_settings(), llm_base_url="x", llm_model="m", llm_api_key="k")
+
+    async def fake(settings, *, system, user, temperature=0.1):
+        return {"strategy": "breadth_first", "check_control_plane": False,
+                "hypotheses": [{"family": "node_kubelet_pressure", "reason": "x"}]}
+
+    monkeypatch.setattr("app.services.planner.complete_json", fake)
+    target = _target(alert_name="SomeAlert", namespace="runai-backend")
+    plan = await plan_investigation(settings, target, None, {}, [])
+    assert plan.check_control_plane is True  # deterministic floor held
