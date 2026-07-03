@@ -48,3 +48,29 @@ def test_specific_symptom_ordered_before_generic() -> None:
     symptoms = load_failure_modes(YAML)["scheduling_quota_exhaustion"]
     idx = {kw: i for i, s in enumerate(symptoms) for kw in s["keywords"]}
     assert idx["preempted by higher priority"] < idx["preempt"]
+
+
+def test_every_family_exists_in_schema() -> None:
+    # Family sync guardrail: a family used anywhere (YAML/loaders) but missing from
+    # schema.tql fails the schema Job on deploy — catch it offline.
+    import re
+    from pathlib import Path
+
+    schema = Path("ontology/schema.tql").read_text(encoding="utf-8")
+    schema_families = set(re.findall(r"entity (\w+) sub root_cause", schema))
+    assert FAMILIES <= schema_families, FAMILIES - schema_families
+
+
+def test_layer_families_have_signatures() -> None:
+    # The widened entry points must actually carry keywords (signatures), or the
+    # new families are dead weight.
+    modes = load_failure_modes(YAML)
+    for family in (
+        "network_fabric_error",
+        "cluster_network_error",
+        "storage_io_error",
+        "workload_runtime_error",
+    ):
+        symptoms = modes.get(family) or []
+        assert len(symptoms) >= 2, f"{family} needs at least 2 symptoms"
+        assert all(s["keywords"] and s["actions"] for s in symptoms)

@@ -193,3 +193,44 @@ async def test_llm_failure_falls_back_to_deterministic(monkeypatch) -> None:
 
     assert plan.strategy == "breadth_first"
     assert plan.focus  # deterministic focus preserved
+
+
+@pytest.mark.asyncio
+async def test_static_knowledge_alone_is_not_an_ontology_match() -> None:
+    # Curated knowledge EXISTS for every family after loading — its mere presence
+    # made every plan claim "targeted (matched knowledge-graph facts)". Without an
+    # alert-specific fact the plan must stay honest breadth_first.
+    settings = make_settings()
+    target = _target(alert_name="MysteriousBlip", namespace="monitoring")
+    kg = {
+        "available": True,
+        "prior_incidents": [],
+        "knowledge": {
+            "node_kubelet_pressure": [
+                {"symptom": "Node Disk Pressure", "keywords": ["diskpressure"], "actions": ["x"]}
+            ]
+        },
+    }
+    plan = await plan_investigation(settings, target, None, kg, [])
+    assert plan.used_ontology is False
+    assert plan.strategy == "breadth_first"
+
+
+@pytest.mark.asyncio
+async def test_knowledge_keyword_matching_alert_text_is_targeted() -> None:
+    # A knowledge symptom whose keyword appears in the alert's own text IS an
+    # alert-specific ontology fact -> targeted.
+    settings = make_settings()
+    target = _target(alert_name="NodeDiskPressure", namespace="monitoring")
+    kg = {
+        "available": True,
+        "prior_incidents": [],
+        "knowledge": {
+            "node_kubelet_pressure": [
+                {"symptom": "Node Disk Pressure", "keywords": ["diskpressure"], "actions": ["x"]}
+            ]
+        },
+    }
+    plan = await plan_investigation(settings, target, None, kg, [])
+    assert plan.used_ontology is True
+    assert plan.strategy == "targeted"

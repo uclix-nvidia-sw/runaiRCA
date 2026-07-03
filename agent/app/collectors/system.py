@@ -12,6 +12,8 @@ Degrades gracefully exactly like loki.py: unconfigured -> status='unavailable'.
 from __future__ import annotations
 
 import re
+from pathlib import Path
+from urllib.parse import quote
 
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.collectors.http_json import compact, get_json
@@ -90,11 +92,25 @@ class SystemCollector:
                 ],
             )
 
-        base_url = _base_url_for_node(self._settings.system_agent_url, node)
+        # Pod DNS usually cannot resolve bare node hostnames (http://dgx01:9095 ->
+        # "Name or service not known"), so resolve the node's InternalIP from the
+        # Kubernetes API and address the hostNetwork DaemonSet by IP. Falls back to
+        # the node name when the lookup fails (e.g. no RBAC for nodes/get).
+        address = node
+        warnings: list[str] = []
+        if "{node}" in self._settings.system_agent_url:
+            internal_ip = await _node_internal_ip(self._settings, node)
+            if internal_ip:
+                address = internal_ip
+            else:
+                warnings.append(
+                    f"Could not resolve InternalIP for node {node}; using the node "
+                    "name, which may not resolve from pod DNS."
+                )
+        base_url = _base_url_for_node(self._settings.system_agent_url, address)
         token = self._settings.system_agent_token
         headers = {"Authorization": f"Bearer {token}"} if token else None
         source_results = []
-        warnings: list[str] = []
         for source in _SOURCES:
             response = await get_json(
                 base_url=base_url,
@@ -152,6 +168,7 @@ class SystemCollector:
 
         result = {
             "node": node,
+            "node_address": address,
             "base_url": base_url,
             "sources": source_results,
         }
@@ -192,6 +209,39 @@ async def _llm_insight(settings: Settings, node: str, error_lines: list[str]) ->
         system += " 한국어로 답하세요 (관찰한 것 → 의미 → 시작 시점)."
     user = f"Node {node} recent kernel/host error lines:\n" + "\n".join(error_lines[:20])
     return await complete(settings, system=system, user=user, max_tokens=160)
+
+
+async def _node_internal_ip(settings: Settings, node: str) -> str:
+    """The node's InternalIP from the Kubernetes API, '' when unavailable."""
+    try:
+        from app.collectors.kubernetes import _read_file
+
+        token = _read_file(settings.kubernetes_token_path)
+        if not token:
+            return ""
+        verify: bool | str = (
+            settings.kubernetes_ca_path
+            if Path(settings.kubernetes_ca_path).exists()
+            else True
+        )
+        response = await get_json(
+            base_url=settings.kubernetes_api_url,
+            path=f"/api/v1/nodes/{quote(node)}",
+            timeout_seconds=settings.kubernetes_timeout_seconds,
+            headers={"Authorization": f"Bearer {token}"},
+            verify=verify,
+        )
+        if not response.ok or not isinstance(response.data, dict):
+            return ""
+        addresses = (response.data.get("status") or {}).get("addresses") or []
+        for item in addresses:
+            if isinstance(item, dict) and item.get("type") == "InternalIP":
+                value = str(item.get("address") or "").strip()
+                if value:
+                    return value
+    except Exception:  # noqa: BLE001 - lookup is best-effort; caller falls back
+        return ""
+    return ""
 
 
 def _base_url_for_node(url_template: str, node: str) -> str:

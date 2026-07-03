@@ -40,6 +40,115 @@ def exec_command_allowed(argv: list[str]) -> bool:
     return tuple(argv) in _EXEC_ALLOWLIST
 
 
+# "kubectl for the agent": read-only ad-hoc queries the investigation loop can run.
+# kubectl is just a CLI over this same API, so nothing is lost by going direct —
+# what was missing was FREEFORM querying beyond the collector's fixed set. Kind
+# allowlist + GET/LIST-only by construction (secrets deliberately absent); RBAC
+# (agent-rbac.yaml) is the second fence.
+_READ_KINDS: dict[str, tuple[str, bool]] = {
+    # kind -> (API prefix, namespaced)
+    "pods": ("/api/v1", True),
+    "events": ("/api/v1", True),
+    "nodes": ("/api/v1", False),
+    "namespaces": ("/api/v1", False),
+    "services": ("/api/v1", True),
+    "endpoints": ("/api/v1", True),
+    "persistentvolumeclaims": ("/api/v1", True),
+    "persistentvolumes": ("/api/v1", False),
+    "configmaps": ("/api/v1", True),
+    "resourcequotas": ("/api/v1", True),
+    "deployments": ("/apis/apps/v1", True),
+    "replicasets": ("/apis/apps/v1", True),
+    "statefulsets": ("/apis/apps/v1", True),
+    "daemonsets": ("/apis/apps/v1", True),
+    "jobs": ("/apis/batch/v1", True),
+    "cronjobs": ("/apis/batch/v1", True),
+    "storageclasses": ("/apis/storage.k8s.io/v1", False),
+}
+_KIND_ALIASES = {
+    "po": "pods", "pod": "pods",
+    "no": "nodes", "node": "nodes",
+    "event": "events",
+    "ns": "namespaces", "namespace": "namespaces",
+    "svc": "services", "service": "services",
+    "ep": "endpoints", "endpoint": "endpoints",
+    "pvc": "persistentvolumeclaims", "persistentvolumeclaim": "persistentvolumeclaims",
+    "pv": "persistentvolumes", "persistentvolume": "persistentvolumes",
+    "cm": "configmaps", "configmap": "configmaps",
+    "quota": "resourcequotas", "resourcequota": "resourcequotas",
+    "deploy": "deployments", "deployment": "deployments",
+    "rs": "replicasets", "replicaset": "replicasets",
+    "sts": "statefulsets", "statefulset": "statefulsets",
+    "ds": "daemonsets", "daemonset": "daemonsets",
+    "job": "jobs", "cronjob": "cronjobs",
+    "sc": "storageclasses", "storageclass": "storageclasses",
+}
+
+
+def resolve_read_kind(kind: str) -> str | None:
+    """Canonical allowlisted kind for a kubectl-style name/alias, None if refused."""
+    normalized = (kind or "").strip().lower()
+    if normalized in _READ_KINDS:
+        return normalized
+    return _KIND_ALIASES.get(normalized)
+
+
+async def k8s_read(
+    settings: Settings,
+    kind: str,
+    namespace: str = "",
+    name: str = "",
+    label_selector: str = "",
+) -> dict:
+    """One read-only GET/LIST against the Kubernetes API, kubectl-style.
+
+    Never raises; returns {kind, namespace, name, url, status_code, error, data}
+    so the investigation loop can treat any failure as an observation."""
+    resolved = resolve_read_kind(kind)
+    if not resolved:
+        return {
+            "kind": kind,
+            "error": "kind is not in the read-only allowlist",
+            "allowed_kinds": sorted(_READ_KINDS),
+        }
+    token = _read_file(settings.kubernetes_token_path)
+    if not token:
+        return {"kind": resolved, "error": "kubernetes service account token unavailable"}
+    prefix, namespaced = _READ_KINDS[resolved]
+    parts = [prefix.rstrip("/")]
+    if namespaced and namespace:
+        parts += ["namespaces", quote(namespace)]
+    parts.append(resolved)
+    if name:
+        parts.append(quote(name))
+    path = "/".join(parts)
+    params: dict[str, str] = {}
+    if not name:
+        params["limit"] = str(settings.kubernetes_list_limit)
+        if label_selector:
+            params["labelSelector"] = label_selector
+    verify: bool | str = (
+        settings.kubernetes_ca_path if Path(settings.kubernetes_ca_path).exists() else True
+    )
+    response = await get_json(
+        base_url=settings.kubernetes_api_url,
+        path=path,
+        timeout_seconds=settings.kubernetes_timeout_seconds,
+        params=params or None,
+        headers={"Authorization": f"Bearer {token}"},
+        verify=verify,
+    )
+    return {
+        "kind": resolved,
+        "namespace": namespace,
+        "name": name,
+        "url": response.url,
+        "status_code": response.status_code,
+        "error": response.error,
+        "data": compact(response.data, limit=8),
+    }
+
+
 class KubernetesCollector:
     name = "kubernetes"
 
@@ -588,6 +697,12 @@ def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
     status = pod.get("status") if isinstance(pod.get("status"), dict) else {}
     spec = pod.get("spec") if isinstance(pod.get("spec"), dict) else {}
     containers = status.get("containerStatuses", [])
+    # Per-container limits/requests — the `kubectl describe` fact an operator
+    # reaches for first on a memory/CPU-limit alert.
+    resources: dict[str, object] = {}
+    for container in spec.get("containers", []) if isinstance(spec.get("containers"), list) else []:
+        if isinstance(container, dict) and isinstance(container.get("name"), str):
+            resources[container["name"]] = container.get("resources") or {}
     return {
         "name": metadata.get("name"),
         "namespace": metadata.get("namespace"),
@@ -596,6 +711,7 @@ def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
         "podIP": status.get("podIP"),
         "conditions": status.get("conditions", []),
         "containerStatuses": compact(containers, limit=5),
+        "resources": resources,
     }
 
 

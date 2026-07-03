@@ -18,10 +18,15 @@ import json
 import re
 from dataclasses import replace
 
-from app.collectors.base import CollectorResult
+from app.collectors.base import CollectorResult, artifact
+from app.collectors.kubernetes import _READ_KINDS, k8s_read
 from app.config import Settings
 from app.llm import complete_json
 from app.plan import InvestigationPlan
+
+# Ad-hoc kubectl-style reads per step are capped so a chatty LLM can't turn one
+# investigation into an API-server sweep.
+_MAX_QUERIES_PER_STEP = 4
 
 # What each collector is good for — fed to the LLM so it picks the right probe.
 _COLLECTOR_HINTS = {
@@ -107,44 +112,67 @@ async def investigate(
             collector, target, _scoped_plan(plan, scope)
         )
 
+    adhoc: list[dict] = []
     try:
+        ran_queries_last_step = False
         for _ in range(max(1, max_steps)):
-            if all_names <= set(evidence):
-                break  # every collector already probed
+            if all_names <= set(evidence) and not ran_queries_last_step:
+                break  # every collector probed and no ad-hoc drill-down pending
             decision = await complete_json(
                 settings,
                 system=(
                     "You are a senior SRE investigating a Run:ai GPU-platform alert. "
                     "Given the plan, hypotheses, evidence so far, and the available "
                     "collectors, decide the next diagnostic step. Probe the collectors "
-                    "most likely to confirm or refute a hypothesis; conclude once the "
-                    "evidence is sufficient. Respond with ONLY JSON: "
+                    "most likely to confirm or refute a hypothesis; you can ALSO run "
+                    "kubectl-style READ-ONLY Kubernetes queries (get/list of an "
+                    "allowlisted kind, see adhoc_query_kinds) to drill into anything "
+                    "the collectors don't cover — e.g. check a PVC, a deployment, a "
+                    "storageclass. Conclude once the evidence is sufficient. Respond "
+                    "with ONLY JSON: "
                     '{"action":"probe"|"conclude","reason":str,'
                     '"probes":[{"collector":str,'
-                    '"scope":{"namespace"?,"pod"?,"node"?,"workload"?}}]}'
+                    '"scope":{"namespace"?,"pod"?,"node"?,"workload"?}}],'
+                    '"queries":[{"kind":str,"namespace"?,"name"?,"label_selector"?}]}'
                 ),
-                user=_build_user_prompt(plan, kg_context, evidence, by_name),
+                user=_build_user_prompt(plan, kg_context, evidence, by_name, adhoc),
             )
             if not isinstance(decision, dict):
                 break  # unusable response -> fall through to full gather
             if decision.get("action") == "conclude":
                 break
             probes = decision.get("probes")
-            if not isinstance(probes, list) or not probes:
-                break
+            queries = decision.get("queries")
             fresh = [
                 p
-                for p in probes
+                for p in (probes if isinstance(probes, list) else [])
                 if isinstance(p, dict) and p.get("collector") in all_names
             ]
-            if not fresh:
+            wanted = [
+                q
+                for q in (queries if isinstance(queries, list) else [])
+                if isinstance(q, dict) and str(q.get("kind") or "").strip()
+            ][:_MAX_QUERIES_PER_STEP]
+            if not fresh and not wanted:
                 break
-            await asyncio.gather(
-                *(
-                    run_probe(p["collector"], p.get("scope") or {})
-                    for p in fresh
+            if fresh:
+                await asyncio.gather(
+                    *(
+                        run_probe(p["collector"], p.get("scope") or {})
+                        for p in fresh
+                    )
                 )
-            )
+            for q in wanted:
+                adhoc.append(
+                    await k8s_read(
+                        settings,
+                        str(q.get("kind")),
+                        namespace=str(q.get("namespace") or ""),
+                        name=str(q.get("name") or ""),
+                        label_selector=str(q.get("label_selector") or ""),
+                    )
+                )
+            ran_queries_last_step = bool(wanted)
     except Exception:  # noqa: BLE001 - never raise into analyze; keep whatever we have
         pass
 
@@ -160,6 +188,35 @@ async def investigate(
         except Exception:  # noqa: BLE001 - last-resort guard
             pass
 
+    # Ad-hoc reads are evidence too: attach them to the kubernetes result so the
+    # report's evidence trail (and signature matching) sees what was drilled into.
+    kubernetes_result = evidence.get("kubernetes")
+    if adhoc and kubernetes_result is not None:
+        for item in adhoc:
+            error = item.get("error")
+            kubernetes_result.artifacts.append(
+                artifact(
+                    agent="kubernetes",
+                    source="kubernetes",
+                    type="adhoc_query",
+                    status="unavailable" if error else "ok",
+                    confidence="medium",
+                    query=(
+                        f"get {item.get('kind')}"
+                        f" ns={item.get('namespace') or '-'} name={item.get('name') or '-'}"
+                    ),
+                    summary=(
+                        str(error)
+                        if error
+                        else (
+                            f"ad-hoc read of {item.get('kind')} returned "
+                            f"HTTP {item.get('status_code')}"
+                        )
+                    ),
+                    result=item,
+                )
+            )
+
     return list(evidence.values())
 
 
@@ -168,6 +225,7 @@ def _build_user_prompt(
     kg_context: dict,
     evidence: dict[str, CollectorResult],
     by_name: dict,
+    adhoc: list[dict] | None = None,
 ) -> str:
     payload = {
         "plan": plan.as_dict() if plan else {},
@@ -181,5 +239,11 @@ def _build_user_prompt(
         },
         "evidence_so_far": _evidence_summary(evidence),
         "not_yet_probed": [name for name in by_name if name not in evidence],
+        "adhoc_query_kinds": sorted(_READ_KINDS),
+        # The last few ad-hoc reads, trimmed — enough for the LLM to chain
+        # "PVC is Pending -> check the storageclass" style drill-downs.
+        "adhoc_results": [
+            json.dumps(item, default=str)[:600] for item in (adhoc or [])[-6:]
+        ],
     }
     return json.dumps(payload, default=str)[:8000]

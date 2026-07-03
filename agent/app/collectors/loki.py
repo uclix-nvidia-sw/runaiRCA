@@ -88,6 +88,10 @@ class LokiCollector:
                     "status": _loki_status(response.data),
                     "stream_count": len(streams),
                     "line_count": line_count,
+                    # The ACTUAL log lines, newest first — the evidence an operator
+                    # judges the RCA by. compact() alone collapsed the nested Loki
+                    # values into "[2 item(s)]", leaving the trail unreadable.
+                    "sample_lines": _sample_lines(streams),
                     "sample": compact(streams, limit=3),
                     "error": response.error,
                 }
@@ -282,3 +286,23 @@ def _loki_streams(data: object) -> list[dict[str, object]]:
     if not isinstance(result, list):
         return []
     return [item for item in result if isinstance(item, dict)]
+
+
+def _sample_lines(streams: list[dict[str, object]], limit: int = 8) -> list[str]:
+    """Readable log lines from Loki streams (values are [timestamp, line] pairs).
+
+    Queries run direction=BACKWARD, so the first values are the newest — keep
+    that order and cap line length so the artifact stays skimmable."""
+    lines: list[str] = []
+    for stream in streams:
+        values = stream.get("values")
+        if not isinstance(values, list):
+            continue
+        for pair in values:
+            if isinstance(pair, list) and len(pair) >= 2:
+                text = " ".join(str(pair[1]).split())
+                if text:
+                    lines.append(text[:240])
+            if len(lines) >= limit:
+                return lines
+    return lines

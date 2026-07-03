@@ -77,3 +77,24 @@ def test_numbered_actions_surfaces_known_issue_regardless_of_ranked_family() -> 
     )
     joined = " ".join(actions)
     assert "2.23" in joined and "upgrade" in joined.lower()
+
+
+def test_playbook_leads_with_known_issue_not_full_dump() -> None:
+    # A known-issue-headlined incident (e.g. workloads-manager cache growth) has no
+    # failure_modes symptoms for its family — the playbook used to dump the entire
+    # troubleshooting_cases.md. It must list the matched known issue precisely.
+    from app.services.orchestrator import _playbook_lines
+    from app.services.root_cause_ranking import RankedCause
+
+    catalog = load_runai_known_issues(CATALOG)
+    lines = _playbook_lines(
+        [RankedCause(family="expected_known_behavior", confidence="medium", score=8.0)],
+        "pod runai-backend-workloads-manager-xyz memory usage 91%",
+        {},  # no failure-mode symptoms match
+        "FULL CASE LIBRARY DUMP",
+        catalog,
+    )
+    joined = "\n".join(lines)
+    assert "Workloads Manager Memory Grows To Cache Cap" in joined
+    assert "known issue" in joined
+    assert "FULL CASE LIBRARY DUMP" not in joined

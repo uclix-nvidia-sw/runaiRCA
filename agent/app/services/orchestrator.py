@@ -34,7 +34,7 @@ from app.knowledge import (
 from app.llm import complete, complete_json, llm_configured
 from app.masking import Masker, build_masker
 from app.plan import InvestigationPlan
-from app.prompts import agent_role_coverage_lines, load_agent_souls
+from app.prompts import load_agent_souls
 from app.schemas import (
     AlertAnalysisRequest,
     AlertAnalysisResponse,
@@ -314,6 +314,25 @@ class AnalysisOrchestrator:
             kg_blast_radius=kg_context.blast_radius_workloads,
             priors=priors,
         )
+        # Signature-first headline: the keyword ranker only decides when NOTHING
+        # specific matched. A specific signature — an NVIDIA XID (dispositive), a
+        # known-issue signature, or a curated symptom keyword — names the cause
+        # family directly; the ranker chronically mis-headlined these (e.g.
+        # node_kubelet_pressure winning on "DiskPressure"/"kubelet" words present in
+        # the k8s node-conditions text even when every condition is False).
+        observed = _observed_text(results, request)
+        xid_codes = _xid_codes_from_results(results, _alert_text(request))
+        failure_modes = load_failure_modes(self._settings.failure_modes_file)
+        known_issues = load_runai_known_issues(self._settings.runai_known_issues_file)
+        # Version-aware precision: drop known issues already fixed in the cluster's
+        # running Run:ai version so we don't attribute a symptom to a patched bug.
+        known_issues = _suppress_fixed_known_issues(known_issues, _runai_version_from(results))
+        root_cause_candidates = _promote_signature_cause(
+            root_cause_candidates,
+            xid_codes,
+            match_runai_known_issues(known_issues, observed),
+            match_failure_mode_symptoms(failure_modes, observed),
+        )
         if root_cause_candidates:
             top = root_cause_candidates[0]
             _log.info(
@@ -392,7 +411,9 @@ class AnalysisOrchestrator:
         graph_fixes = await graph_remediation(
             self._settings,
             family=top_family if top_family != "insufficient_evidence" else "",
-            xid_codes=_xid_codes_from_results(results),
+            # xid_codes already includes the alert's own text (NVRM Xid alerts name
+            # their code even when every collector comes back empty).
+            xid_codes=xid_codes,
             gpu_model=_gpu_model_from(target, results),
         )
         warnings = sorted(set(warnings) | set(graph_fixes.warnings))
@@ -406,15 +427,10 @@ class AnalysisOrchestrator:
             timeline = build_timeline(results)
         quality = _quality_from(results)
         summary = _summary_from(request, results, root_cause_candidates)
-        failure_modes = load_failure_modes(self._settings.failure_modes_file)
-        known_issues = load_runai_known_issues(self._settings.runai_known_issues_file)
-        # Version-aware precision: drop known issues already fixed in the cluster's
-        # running Run:ai version so we don't attribute a symptom to a patched bug.
-        known_issues = _suppress_fixed_known_issues(known_issues, _runai_version_from(results))
         # Adversarial precision: LLM-verify signature/keyword matches (known issues,
         # failure-mode symptoms, GPU XIDs) and drop ones the evidence doesn't support.
-        # Best-effort + LLM-gated: with no LLM nothing is suppressed.
-        observed = _observed_text(results)
+        # Best-effort + LLM-gated: with no LLM nothing is suppressed. (failure_modes /
+        # known_issues / observed were computed before ranking promotion above.)
         try:
             from app.services.self_check import verify_known_issues, verify_matches
         except ImportError:
@@ -1058,7 +1074,7 @@ def _detail_from(
     lines.append(_ranked_root_cause_statement(root_cause_candidates or [], request))
     # Ground the coarse family in the most specific signature match when one exists:
     # a recognised known issue (with its affected/fixed version) is far more precise.
-    lines.extend(_known_issue_cause_lines(known_issues, _observed_text(results), language))
+    lines.extend(_known_issue_cause_lines(known_issues, _observed_text(results, request), language))
     supporting = _supporting_evidence(results)
     if supporting:
         lines.append("")
@@ -1073,7 +1089,7 @@ def _detail_from(
         plan,
         graph_fixes,
         root_cause_candidates,
-        _observed_text(results),
+        _observed_text(results, request),
         failure_modes or {},
         missing,
         request,
@@ -1097,13 +1113,14 @@ def _detail_from(
         lines.append(f"- **{result.agent}**: {_best_evidence_line(result)}")
     lines.extend(_investigation_plan_lines(plan))
     lines.extend(
-        _knowledge_base_lines(kg_context, root_cause_candidates, _observed_text(results))
+        _knowledge_base_lines(kg_context, root_cause_candidates, _observed_text(results, request))
     )
     operator_prompt = annotations.get("operator_prompt")
     if operator_prompt:
         lines.extend(["", "### Operator Guidance", "", operator_prompt])
-    lines.extend(["", "### Agent Role Coverage", ""])
-    lines.extend(agent_role_coverage_lines())
+    # ponytail: no "Agent Role Coverage" section — it was the same static
+    # collector-catalog text in every report, telling the operator nothing about
+    # THIS incident. (Kept in prompts.py for the NAT workflow's system prompt.)
     if not agent_souls:
         lines.append("- Agent role contract file was not loaded; fallback guidance was used.")
     lines.extend(_affected_pods_lines(request))
@@ -1111,9 +1128,10 @@ def _detail_from(
     lines.extend(
         _playbook_lines(
             root_cause_candidates,
-            _observed_text(results),
+            _observed_text(results, request),
             failure_modes or {},
             troubleshooting_cases,
+            known_issues or [],
         )
     )
     lines.extend(_similar_incident_lines(request))
@@ -1191,6 +1209,70 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
             f"{chain}. Fix the root XID first."
         )
     return f"- Related GPU errors (XID): {codes} — see the recommended actions below."
+
+
+def _promote_signature_cause(
+    candidates: list[RankedCause],
+    xid_codes: list[int],
+    known_issue_matches: list[dict],
+    symptom_matches: list[tuple[str, dict]],
+) -> list[RankedCause]:
+    """A specific signature names the headline family; the keyword ranker is only
+    the no-signal fallback. Precedence: NVIDIA XID (dispositive) > known-issue
+    signature > curated symptom keyword > ranker. When the signature agrees with
+    the ranker's top family the richer ranked entry is kept as-is."""
+    if xid_codes:
+        return _promote_xid_cause(candidates, xid_codes)
+    top_family = candidates[0].family if candidates else ""
+    for entry in known_issue_matches:
+        family = str(entry.get("family") or "")
+        if not family:
+            continue
+        if family == top_family:
+            return candidates
+        lead = RankedCause(
+            family=family,
+            confidence="medium",
+            score=8.0,
+            rationale=[f"matched known-issue signature: {entry.get('issue')}"],
+            evidence_agents=["signature"],
+        )
+        return [lead] + [c for c in candidates if c.family != family]
+    for family, symptom in symptom_matches:
+        if not family:
+            continue
+        if family == top_family:
+            return candidates
+        lead = RankedCause(
+            family=family,
+            confidence="medium",
+            score=7.0,
+            rationale=[f"matched curated symptom: {symptom.get('symptom')}"],
+            evidence_agents=["signature"],
+        )
+        return [lead] + [c for c in candidates if c.family != family]
+    return candidates
+
+
+def _promote_xid_cause(
+    candidates: list[RankedCause], xid_codes: list[int]
+) -> list[RankedCause]:
+    """Lead with gpu_hardware_error when an NVIDIA XID is present.
+
+    An XID in the alert/evidence is dispositive for the cause CATEGORY (the GPU
+    driver itself reported the fault); the generic keyword families then describe
+    downstream effects at best. Deterministic — no LLM, no score fight."""
+    if not xid_codes:
+        return candidates
+    codes = ", ".join(str(code) for code in xid_codes)
+    gpu = RankedCause(
+        family="gpu_hardware_error",
+        confidence="high",
+        score=10.0,
+        rationale=[f"NVIDIA XID {codes} present in the alert/evidence"],
+        evidence_agents=["alert"],
+    )
+    return [gpu] + [c for c in candidates if c.family != "gpu_hardware_error"]
 
 
 def _runai_version_from(results: list[CollectorResult]) -> str:
@@ -1355,11 +1437,49 @@ _FAMILY_EXPLANATION = {
         "the workload itself is failing to start — an image pull, crash loop, or a "
         "startup/configuration error"
     ),
+    "gpu_hardware_error": (
+        "the GPU itself reported a fault (NVIDIA XID) — a hardware/driver/fabric "
+        "problem on the node, not a scheduling or workload issue"
+    ),
+    "network_fabric_error": (
+        "the GPU interconnect / multi-node communication layer is failing "
+        "(NCCL, NVLink/NVSwitch, InfiniBand/RDMA) — distributed training breaks "
+        "even though each GPU looks healthy"
+    ),
+    "cluster_network_error": (
+        "cluster networking is failing (CNI, CoreDNS, pod networking) — pods can't "
+        "resolve names or get network connectivity"
+    ),
+    "storage_io_error": (
+        "the storage layer is failing (CSI/PVC, NFS, Ceph, disk IO) — volumes "
+        "won't mount or IO hangs, independent of the workload itself"
+    ),
+    "workload_runtime_error": (
+        "the workload's own code failed while running (application crash, CUDA "
+        "out-of-memory) — an application-level fault, not a platform problem"
+    ),
 }
 
 
-def _observed_text(results: list[CollectorResult]) -> str:
+def _alert_text(request: AlertAnalysisRequest) -> str:
+    """The alert's own labels+annotations text — it often carries the signature
+    (e.g. 'XID 79 ... GPU has fallen off the bus') even when every collector
+    comes back empty."""
+    alert = request.alert
+    parts = [str(v) for v in (alert.labels or {}).values()]
+    parts.extend(str(v) for v in (alert.annotations or {}).values())
+    return " ".join(parts)
+
+
+def _observed_text(
+    results: list[CollectorResult], request: AlertAnalysisRequest | None = None
+) -> str:
     parts: list[str] = []
+    if request is not None:
+        # The alert message itself is evidence: signature matching (symptoms, known
+        # issues, XIDs) must see it, or an alert whose collectors all came back
+        # empty matches NOTHING even though its own text names the fault.
+        parts.append(_alert_text(request))
     for result in results:
         if result.summary:
             parts.append(result.summary)
@@ -1425,21 +1545,30 @@ def _playbook_lines(
     observed_text: str,
     failure_modes: dict[str, list[dict]],
     fallback_cases: str,
+    known_issues: list[dict] | None = None,
 ) -> list[str]:
-    """Root-cause-relevant remediation.
+    """Root-cause-relevant remediation, most specific first.
 
-    Precise first: every curated symptom whose keyword matches the evidence, across
-    ALL families (the fine-grained signature is the entry point, not the coarse
-    ranked family). Only when nothing matches does it fall back to the ranked
-    family's general checklist, then the full case library.
+    Precision order: matched known issues (real operator cases), then every
+    curated symptom whose keyword matches the evidence — across ALL families (the
+    fine-grained signature is the entry point, not the coarse ranked family).
+    Only when nothing matches does it fall back to the ranked family's general
+    checklist, then the full case library.
     """
+    lines: list[str] = []
+    for issue in match_runai_known_issues(known_issues or [], observed_text)[:2]:
+        lines.append(f"- **{issue.get('issue')}** (known issue)")
+        reason = " ".join(str(issue.get("reason") or "").split())
+        if reason:
+            lines.append(f"  - {reason}")
+        lines.extend(f"  - {action}" for action in issue.get("actions", [])[:4])
     top_family = candidates[0].family if candidates else ""
-    matches = match_failure_mode_symptoms(failure_modes, observed_text, top_family)
-    if matches:
-        lines: list[str] = []
-        for family, symptom in matches:
-            lines.append(f"- **{symptom.get('symptom')}** ({_family_label(family)})")
-            lines.extend(f"  - {action}" for action in symptom.get("actions", [])[:5])
+    for family, symptom in match_failure_mode_symptoms(
+        failure_modes, observed_text, top_family
+    ):
+        lines.append(f"- **{symptom.get('symptom')}** ({_family_label(family)})")
+        lines.extend(f"  - {action}" for action in symptom.get("actions", [])[:5])
+    if lines:
         return lines
     # No precise signature matched: fall back to the ranked family's general
     # checklist (the coarse ranking's legitimate role), else the full case library.
@@ -1463,6 +1592,10 @@ def _family_label(family: str) -> str:
         "platform_version_bug": "Run:ai version bug",
         "observability_accuracy": "metrics/observability accuracy",
         "expected_known_behavior": "expected/known behavior",
+        "network_fabric_error": "GPU interconnect/fabric error (NCCL/IB/NVLink)",
+        "cluster_network_error": "cluster networking error (CNI/DNS)",
+        "storage_io_error": "storage/IO error (CSI/NFS/Ceph)",
+        "workload_runtime_error": "workload runtime error (application fault)",
         "insufficient_evidence": "insufficient evidence",
     }
     return labels.get(family, family.replace("_", " "))
@@ -1549,11 +1682,56 @@ def _kubernetes_highlights(details: dict[str, object]) -> list[str]:
         for pod in pod_statuses[:2]:
             if not isinstance(pod, dict):
                 continue
-            phase = pod.get("phase")
-            name = pod.get("name")
-            if phase and name:
-                lines.append(f"- Kubernetes pod {name} is in phase {phase}.")
+            if pod.get("phase") and pod.get("name"):
+                lines.append(_pod_describe_line(pod))
     return lines
+
+
+def _pod_describe_line(pod: dict[str, object]) -> str:
+    """`kubectl describe`-grade one-liner: phase + per-container limits, restarts,
+    and last termination. "phase Running" alone told the operator nothing on a
+    memory-limit alert — the limit and any OOMKilled restarts are the evidence."""
+    base = f"- Kubernetes pod {pod.get('name')} is in phase {pod.get('phase')}"
+    resources = pod.get("resources") if isinstance(pod.get("resources"), dict) else {}
+    statuses = pod.get("containerStatuses")
+    parts: list[str] = []
+    for st in (statuses if isinstance(statuses, list) else [])[:2]:
+        if not isinstance(st, dict) or not st.get("name"):
+            continue
+        cname = str(st["name"])
+        facts: list[str] = []
+        res = resources.get(cname) if isinstance(resources.get(cname), dict) else {}
+        limits = res.get("limits") if isinstance(res.get("limits"), dict) else {}
+        requests = res.get("requests") if isinstance(res.get("requests"), dict) else {}
+        if limits.get("memory"):
+            mem = f"mem limit {limits['memory']}"
+            if requests.get("memory"):
+                mem += f" (request {requests['memory']})"
+            facts.append(mem)
+        if limits.get("cpu"):
+            facts.append(f"cpu limit {limits['cpu']}")
+        restarts = st.get("restartCount")
+        if isinstance(restarts, int) and restarts > 0:
+            facts.append(f"{restarts} restart(s)")
+        state = st.get("state") if isinstance(st.get("state"), dict) else {}
+        waiting = state.get("waiting") if isinstance(state.get("waiting"), dict) else {}
+        if waiting.get("reason"):
+            facts.append(f"waiting: {waiting['reason']}")
+        last_state = st.get("lastState") if isinstance(st.get("lastState"), dict) else {}
+        term = last_state.get("terminated")
+        term = term if isinstance(term, dict) else {}
+        if term.get("reason") or term.get("exitCode") is not None:
+            last = f"last {term.get('reason') or 'terminated'}"
+            if term.get("exitCode") is not None:
+                last += f" (exit {term['exitCode']})"
+            if term.get("finishedAt"):
+                last += f" at {term['finishedAt']}"
+            facts.append(last)
+        if facts:
+            parts.append(f"{cname}: " + ", ".join(facts))
+    if parts:
+        base += " — " + "; ".join(parts)
+    return base + "."
 
 
 def _loki_highlights(details: dict[str, object]) -> list[str]:
@@ -1749,13 +1927,20 @@ _XID_PATTERN = re.compile(
 )
 
 
-def _xid_codes_from_results(results: list[CollectorResult]) -> list[int]:
-    """Distinct NVIDIA Xid codes found in loki/system/kubernetes evidence."""
+def _xid_codes_from_results(
+    results: list[CollectorResult], alert_text: str = ""
+) -> list[int]:
+    """Distinct NVIDIA Xid codes in the alert's own text + loki/system/kubernetes
+    evidence. The alert text matters: an NVRM Xid alert names its code even when
+    every collector comes back empty."""
+    texts = [alert_text] if alert_text else []
+    texts.extend(
+        _stringify_result(result)
+        for result in results
+        if result.agent in ("loki", "system", "kubernetes")
+    )
     codes: list[int] = []
-    for result in results:
-        if result.agent not in ("loki", "system", "kubernetes"):
-            continue
-        text = _stringify_result(result)
+    for text in texts:
         for match in _XID_PATTERN.finditer(text):
             code = int(match.group(1))
             if code not in codes:

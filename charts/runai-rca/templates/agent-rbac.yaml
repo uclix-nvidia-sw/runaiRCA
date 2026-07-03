@@ -33,8 +33,13 @@ rules:
       - persistentvolumeclaims
       - persistentvolumes
       - pods
+      - resourcequotas
       - services
     verbs: ["get", "list", "watch"]
+  # Ad-hoc read-only queries from the investigation loop (k8s_read kind allowlist).
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list"]
   # Read-only container log inspection (pods/log subresource).
   - apiGroups: [""]
     resources: ["pods/log"]
@@ -95,6 +100,7 @@ rules:
       - events
       - persistentvolumeclaims
       - pods
+      - resourcequotas
       - services
     verbs: ["get", "list", "watch"]
   # Read-only container log inspection (pods/log subresource).
