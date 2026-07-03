@@ -66,6 +66,15 @@
       actions:
         - "Confirm the queue/project GPU quota against the requested GPU count."
         - "Check higher-priority workloads consuming the allocation (preemption)."
+    # ALWAYS disambiguate which scheduler before diagnosing a scheduling failure:
+    # Run:ai has its OWN scheduler; the Kubernetes default-scheduler is a different
+    # component that does not understand GPU quota / pod-groups.
+    - name: Which Scheduler — Run:ai Or kube-scheduler
+      keywords: [default-scheduler, kube-scheduler, schedulername, runai-scheduler]
+      actions:
+        - "Disambiguate WHICH scheduler failed by the FailedScheduling event's source and the pod's spec.schedulerName. Run:ai GPU workloads MUST be scheduled by the Run:ai scheduler (schedulerName: runai-scheduler); the Kubernetes default-scheduler does not understand GPU quota or pod-groups."
+        - "Source 'runai-scheduler' (runai-scheduler-default, runai namespace) → a Run:ai placement/quota/preempt/reclaim decision; read `kubectl logs -n runai deploy/runai-scheduler-default`."
+        - "Source 'default-scheduler' on a GPU workload → the pod is BYPASSING Run:ai (wrong/missing schedulerName) and will never get Run:ai GPU scheduling — fix the submission/schedulerName. On a non-GPU/system pod, default-scheduler is expected."
     - name: Preempted By Higher Priority
       keywords: ["preempted by higher priority", "preemption victim", preemptor]
       actions:
@@ -300,8 +309,11 @@
 
 - family: control_plane_error
   symptoms:
+    # No bare "scheduler" — it matches the runai-scheduler pod name in every log
+    # stream and falsely elevates control-plane for plain scheduling/kube-scheduler
+    # events. Keep phrases that only appear when the control-plane service errors.
     - name: Scheduler Or Reconcile Error
-      keywords: [scheduler, reconcile, admission, "database error", authorization]
+      keywords: ["scheduler panic", "scheduler error", reconcile, admission, "database error", authorization]
       actions:
         - "Inspect runai/runai-backend logs around the alert window for scheduler/quota/db errors."
         - "Check whether several workloads in the same queue/project changed state together."

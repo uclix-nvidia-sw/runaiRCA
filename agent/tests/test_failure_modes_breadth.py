@@ -152,3 +152,30 @@ def test_deck_four_tracks_stay_separate_no_cross_matching() -> None:
         for text in texts:
             fams = {f for f, _ in match_failure_mode_symptoms(modes, text, "")}
             assert fams == {expected}, f"{text!r} bled into {fams - {expected}}"
+
+
+def test_scheduler_disambiguation_runai_vs_kube() -> None:
+    # A scheduler failure must be attributed to the RIGHT scheduler, and a plain
+    # kube default-scheduler event must NOT elevate the Run:ai control plane.
+    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+
+    modes = load_failure_modes("knowledge/failure_modes.yaml")
+
+    def fams(text):
+        return {f for f, _ in match_failure_mode_symptoms(modes, text, "")}
+
+    # kube default-scheduler event → scheduling track only, NOT control_plane
+    kube = match_failure_mode_symptoms(
+        modes, "default-scheduler failedscheduling insufficient cpu", ""
+    )
+    assert {f for f, _ in kube} == {"scheduling_quota_exhaustion"}
+    assert any(s["symptom"].startswith("Which Scheduler") for _, s in kube)
+
+    # runai-scheduler placement failure → scheduling track only, NOT control_plane
+    assert fams("runai-scheduler-default cannot place pod group") == {"scheduling_quota_exhaustion"}
+
+    # the disambiguation action names both schedulers + how to tell them apart
+    which = next(s for _, s in kube if s["symptom"].startswith("Which Scheduler"))
+    joined = " ".join(which["actions"]).lower()
+    assert "schedulername" in joined
+    assert "runai-scheduler-default" in joined and "default-scheduler" in joined
