@@ -180,14 +180,37 @@ def _best_similar(similar_incidents: list) -> object | None:
     return best
 
 
-def _ontology_match(kg_context, hypotheses: list[dict[str, str]]) -> bool:
+def _ontology_match(kg_context, alert_text: str) -> bool:
+    """True only when the ontology has facts about THIS alert.
+
+    That means a prior incident for the same alert, or a knowledge symptom whose
+    keyword actually appears in the alert's own text. Mere EXISTENCE of static
+    curated knowledge for the top family made every plan claim
+    "targeted (matched knowledge-graph facts)" — a hollow claim that had nothing
+    to do with the alert being investigated."""
     if not kg_context or not kg_context.get("available"):
         return False
     if kg_context.get("prior_incidents"):
         return True
-    knowledge = kg_context.get("knowledge") or {}
-    top_family = hypotheses[0]["family"] if hypotheses else ""
-    return bool(top_family and knowledge.get(top_family))
+    text = (alert_text or "").lower()
+    if not text:
+        return False
+    for symptoms in (kg_context.get("knowledge") or {}).values():
+        for symptom in symptoms or []:
+            if any(
+                str(kw).lower() in text for kw in (symptom.get("keywords") or [])
+            ):
+                return True
+    return False
+
+
+def _alert_haystack(target: AnalysisTarget, alert) -> str:
+    parts = [target.alert_name or "", target.workload_name or ""]
+    labels = getattr(alert, "labels", None) or {}
+    annotations = getattr(alert, "annotations", None) or {}
+    parts.extend(str(v) for v in labels.values())
+    parts.extend(str(v) for v in annotations.values())
+    return " ".join(parts)
 
 
 async def plan_investigation(
@@ -234,7 +257,7 @@ async def plan_investigation(
         ]
     best_similar = _best_similar(similar_incidents)
     used_similarity = best_similar is not None
-    used_ontology = _ontology_match(kg_context, hypotheses)
+    used_ontology = _ontology_match(kg_context, _alert_haystack(target, alert))
 
     if used_similarity or used_ontology:
         strategy = "targeted"
