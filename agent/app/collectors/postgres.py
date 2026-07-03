@@ -116,8 +116,11 @@ class PostgresCollector:
             status = "partial"
             warnings.append(f"Missing RCA table(s): {', '.join(missing_tables)}.")
 
+        # This collector checks the RCA STORE itself (can we persist reports, is
+        # similarity search available), NOT the incident's root cause — say so, so a
+        # GPU/XID report doesn't read as if the database were a suspect.
         summary = (
-            "Postgres diagnostics completed: connectivity ok, "
+            "RCA store self-check (not an incident cause): connectivity ok, "
             f"{checks['active_connections']} active connection(s), "
             f"pgvector={'installed' if pgvector else 'missing'}."
         )

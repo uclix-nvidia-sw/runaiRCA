@@ -80,6 +80,20 @@ def _scoped_plan(plan: InvestigationPlan | None, scope: dict) -> InvestigationPl
     )
 
 
+def _adhoc_query_repr(item: dict) -> str:
+    """kubectl-style repr of an ad-hoc read, showing only the params that were set
+    (and the label selector) so two reads that differ only by selector look
+    different — the old 'ns=- name=-' form hid what actually varied."""
+    parts = [f"get {item.get('kind')}"]
+    if item.get("namespace"):
+        parts.append(f"-n {item['namespace']}")
+    if item.get("name"):
+        parts.append(str(item["name"]))
+    if item.get("label_selector"):
+        parts.append(f"-l {item['label_selector']}")
+    return " ".join(parts)
+
+
 def _evidence_summary(evidence: dict[str, CollectorResult]) -> list[dict]:
     return [
         {
@@ -201,10 +215,7 @@ async def investigate(
                     type="adhoc_query",
                     status="unavailable" if error else "ok",
                     confidence="medium",
-                    query=(
-                        f"get {item.get('kind')}"
-                        f" ns={item.get('namespace') or '-'} name={item.get('name') or '-'}"
-                    ),
+                    query=_adhoc_query_repr(item),
                     summary=(
                         str(error)
                         if error

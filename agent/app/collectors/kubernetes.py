@@ -142,6 +142,7 @@ async def k8s_read(
         "kind": resolved,
         "namespace": namespace,
         "name": name,
+        "label_selector": label_selector,
         "url": response.url,
         "status_code": response.status_code,
         "error": response.error,

@@ -944,3 +944,46 @@ def test_prometheus_widens_to_control_plane_health_when_implicated() -> None:
     # Not implicated → no control-plane widening (empty namespaces).
     names2 = dict(_queries_for(make_target(), plan, ()))
     assert not any(k.startswith("runai_control_plane_") for k in names2)
+
+
+@pytest.mark.asyncio
+async def test_loki_skips_empty_selector_no_400(monkeypatch) -> None:
+    # Loki rejects `{}`; when the target has no namespace/pod/workload the collector
+    # must NOT issue an empty-selector query, and must say why.
+    from types import SimpleNamespace
+
+    issued: list[str] = []
+
+    async def fake_get_json(**kwargs) -> SimpleNamespace:
+        issued.append(kwargs["params"]["query"])
+        return SimpleNamespace(
+            url="http://loki/x", status_code=200, error=None,
+            data={"status": "success", "data": {"result": []}},
+        )
+
+    monkeypatch.setattr("app.collectors.loki.get_json", fake_get_json)
+    collector = LokiCollector(replace(make_settings(), loki_url="http://loki.example"))
+    bare = AnalysisTarget(
+        cluster="", project="", queue="", namespace="", workload_name="",
+        workload_type="", runai_workload_id="", node="", pod="",
+        severity="critical", alert_name="X",
+    )
+    # no plan → control_plane defaults in-scope, but the {} target queries must be skipped
+    result = await collector.collect(bare, SimpleNamespace(
+        namespaces=[], pod="", workload="", check_control_plane=False))
+    assert all(q != "{}" and not q.startswith("{} ") for q in issued), issued
+    assert any("empty {} selector" in w for w in result.warnings)
+
+
+def test_adhoc_query_repr_shows_selector_and_only_set_params() -> None:
+    from app.services.investigator import _adhoc_query_repr
+
+    assert _adhoc_query_repr(
+        {"kind": "pods", "namespace": "runai", "name": "", "label_selector": "app=x"}
+    ) == "get pods -n runai -l app=x"
+    # two reads differing only by selector must render differently
+    a = _adhoc_query_repr({"kind": "pods", "namespace": "runai", "label_selector": "a=1"})
+    b = _adhoc_query_repr({"kind": "pods", "namespace": "runai", "label_selector": "b=2"})
+    assert a != b
+    # cluster-scoped read with just a name
+    assert _adhoc_query_repr({"kind": "nodes", "name": "dgx01"}) == "get nodes dgx01"

@@ -1927,6 +1927,7 @@ function UnifiedWorkspace({
                 agent={agent}
                 status={capabilities[agent] || 'pending'}
                 artifacts={artifacts.filter((artifact) => artifact.agent === agent)}
+                reasons={agentReasons(agent, missingData, warnings)}
               />
             ))}
           </div>
@@ -2573,9 +2574,36 @@ function FeedbackPanel({
   );
 }
 
-function AgentEvidence({ agent, status, artifacts }: { agent: string; status: string; artifacts: Artifact[] }) {
+// Surface WHY a collector is unavailable: match the aggregate missing-data keys and
+// warnings back to this agent (keys are prefixed by source, e.g. "system_agent.url",
+// "loki.auth", "runai.queue") so an Unavailable card explains itself.
+function agentReasons(agent: string, missingData: string[], warnings: string[]): string[] {
+  const needles = agent === 'system' ? ['system_agent', 'system'] : [agent];
+  const hit = (s: string) => needles.some((n) => s.toLowerCase().includes(n));
+  const friendly: Record<string, string> = {
+    'system_agent.url': 'System agent is not configured (no URL) — node/kernel evidence was skipped.',
+    'system_agent.node': 'No node is associated with this alert — node/kernel evidence was skipped.',
+    'loki.auth': 'Loki authentication failed.',
+  };
+  const fromMissing = missingData.filter(hit).map((k) => friendly[k] || `missing: ${k}`);
+  const fromWarnings = warnings.filter(hit);
+  return Array.from(new Set([...fromMissing, ...fromWarnings]));
+}
+
+function AgentEvidence({
+  agent,
+  status,
+  artifacts,
+  reasons = [],
+}: {
+  agent: string;
+  status: string;
+  artifacts: Artifact[];
+  reasons?: string[];
+}) {
   const [open, setOpen] = useState(false);
   const icon = agentIcon(agent);
+  const emptyText = reasons.length > 0 ? reasons.join(' ') : 'No evidence yet.';
   return (
     <article className="agent-evidence">
       <button className="agent-toggle" onClick={() => setOpen((value) => !value)} type="button">
@@ -2587,7 +2615,7 @@ function AgentEvidence({ agent, status, artifacts }: { agent: string; status: st
       {open && (
         <div className="agent-content">
           {artifacts.length === 0 ? (
-            <p className="empty">No evidence yet.</p>
+            <p className="empty">{emptyText}</p>
           ) : (
             artifacts.map((artifact, index) => (
               <ArtifactResult

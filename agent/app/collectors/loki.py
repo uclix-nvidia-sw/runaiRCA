@@ -39,8 +39,21 @@ class LokiCollector:
             )
 
         selector = _selector_for(target, plan)
-        error_query = f'{selector} |~ "(?i)(error|fail|oom|evict|crash|pending|unschedul|back-off)"'
-        queries = [("error_logs", error_query), ("recent_logs", selector)]
+        skipped_target_scope = ""
+        # Loki rejects an empty stream selector `{}` with HTTP 400. When the alert has
+        # no namespace/pod/workload to scope by, skip the target log queries (the
+        # control-plane sweep below still runs on its own valid selector).
+        if selector == "{}":
+            queries = []
+            skipped_target_scope = (
+                "no namespace/pod/workload on this alert, so the target log queries "
+                "were skipped (Loki forbids an empty {} selector)."
+            )
+        else:
+            error_query = (
+                f'{selector} |~ "(?i)(error|fail|oom|evict|crash|pending|unschedul|back-off)"'
+            )
+            queries = [("error_logs", error_query), ("recent_logs", selector)]
         # Control-plane sweep only when the plan says this alert implicates Run:ai —
         # otherwise every alert scraped runai/runai-backend and skewed ranking.
         control_plane_in_scope = plan.check_control_plane if plan is not None else True
@@ -79,6 +92,8 @@ class LokiCollector:
                 )
         query_results = []
         headers, warnings = _loki_headers(self._settings)
+        if skipped_target_scope:
+            warnings.append(skipped_target_scope)
 
         for name, query in queries:
             response = await get_json(
