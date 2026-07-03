@@ -138,7 +138,13 @@ def _promote_families(
     return lead + rest
 
 
-def _ordered_hypotheses(target: AnalysisTarget) -> list[dict[str, str]]:
+def _ordered_hypotheses(target: AnalysisTarget) -> tuple[list[dict[str, str]], bool]:
+    """Ranked families + whether ANY family actually matched a keyword.
+
+    The bool matters: on a 0-0-0-0 tie the declaration-order tiebreak would make
+    node_kubelet_pressure the "top" hypothesis for an alert that gave no signal at
+    all (e.g. PrometheusMissingRuleEvaluations). The caller uses the flag to avoid
+    fabricating a confident "most likely X" out of the tiebreak."""
     haystack = " ".join(
         [target.alert_name or "", target.workload_name or "", target.workload_type or ""]
     ).lower()
@@ -150,9 +156,10 @@ def _ordered_hypotheses(target: AnalysisTarget) -> list[dict[str, str]]:
     # (enumerate index) so a 0-0 tie stays deterministic.
     scored_indexed = [(hits, -i, fam) for i, (hits, fam) in enumerate(scored)]
     scored_indexed.sort(reverse=True)
-    return [
+    hypotheses = [
         {"family": fam, "reason": _FAMILY_REASON[fam]} for _, _, fam in scored_indexed
     ]
+    return hypotheses, any(hits for hits, _ in scored)
 
 
 def _node_first_hypotheses(
@@ -230,7 +237,7 @@ async def plan_investigation(
             if ns and ns not in namespaces:
                 namespaces.append(ns)
 
-    hypotheses = _ordered_hypotheses(target)
+    hypotheses, keyword_signal = _ordered_hypotheses(target)
     # Namespace decides the emphasis: a Run:ai platform namespace (runai/runai-backend)
     # means the control plane itself is unhealthy -> lead control-plane + node/system
     # broadly; a user workload namespace inside Run:ai -> lead the scheduler/scheduling.
@@ -264,12 +271,34 @@ async def plan_investigation(
     else:
         strategy = "breadth_first"
 
-    top_family = hypotheses[0]["family"] if hypotheses else "insufficient_evidence"
-    focus = (
-        f"{target.alert_name or 'alert'} on "
-        f"{target.workload_name or target.pod or target.namespace or 'the cluster'} "
-        f"— most likely {top_family.replace('_', ' ')}"
+    # Did anything actually EARN the leading hypothesis, or is it just the
+    # declaration-order tiebreak? A namespace scope, a documented alert, a
+    # node-level alert, or a keyword hit all count as real signal.
+    leader_earned = (
+        keyword_signal
+        or bool(matched_alert)
+        or scope in _SCOPE_LEAD
+        or node_focused
     )
+    where = target.workload_name or target.pod or target.namespace or "the cluster"
+    if not leader_earned:
+        # No signal at all: don't let node_kubelet_pressure masquerade as the
+        # top cause. Rank from live collector evidence instead of the tiebreak.
+        hypotheses = [
+            {
+                "family": "insufficient_evidence",
+                "reason": "no alert/namespace/keyword signal — rank from collector evidence",
+            }
+        ] + hypotheses
+        focus = (
+            f"{target.alert_name or 'alert'} on {where} "
+            "— no strong family signal; breadth-first"
+        )
+    else:
+        focus = (
+            f"{target.alert_name or 'alert'} on {where} "
+            f"— most likely {hypotheses[0]['family'].replace('_', ' ')}"
+        )
 
     if strategy == "targeted":
         matched: list[str] = []

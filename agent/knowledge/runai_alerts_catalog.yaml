@@ -27,7 +27,10 @@
 - alert: NVIDIA Run:ai Container Memory Usage Critical
   severity: critical
   category: resource
-  family: control_plane_error
+  # A container saturating its OWN memory limit is workload/runtime resource
+  # saturation (OOM risk), not a control-plane error. Fires for any Run:ai
+  # container, so the coarse family must not assume the scheduler/backend.
+  family: workload_runtime_error
   trigger: A Run:ai container is using more than 90% of its memory limit; may OOM and crash.
   actions:
     - "Raise the container memory limit/request."
@@ -36,7 +39,7 @@
 - alert: NVIDIA Run:ai Container Memory Usage Warning
   severity: warning
   category: resource
-  family: control_plane_error
+  family: workload_runtime_error
   trigger: A Run:ai container is using more than 80% of its memory limit.
   actions:
     - "Raise the container memory limit/request before it OOMs."

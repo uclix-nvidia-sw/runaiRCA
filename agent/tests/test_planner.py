@@ -234,3 +234,34 @@ async def test_knowledge_keyword_matching_alert_text_is_targeted() -> None:
     plan = await plan_investigation(settings, target, None, kg, [])
     assert plan.used_ontology is True
     assert plan.strategy == "targeted"
+
+
+@pytest.mark.asyncio
+async def test_no_signal_alert_does_not_default_to_node_pressure() -> None:
+    # PrometheusMissingRuleEvaluations matches no family keyword. The old tiebreak
+    # made node_kubelet_pressure the confident "most likely" leader. It must now be
+    # honest: insufficient_evidence, breadth-first, no fabricated family.
+    settings = make_settings()
+    target = _target(
+        alert_name="PrometheusMissingRuleEvaluations",
+        namespace="monitoring",
+        pod="prometheus-prometheus-kube-prometheus-prometheus-0",
+    )
+    plan = await plan_investigation(settings, target, None, {}, [])
+    assert plan.hypotheses[0]["family"] == "insufficient_evidence"
+    assert "most likely" not in plan.focus
+    assert "node kubelet pressure" not in plan.focus
+
+
+@pytest.mark.asyncio
+async def test_memory_alert_is_workload_runtime_not_control_plane() -> None:
+    # A container over its own memory limit is workload runtime saturation, not a
+    # control-plane error (the catalog family was wrong).
+    settings = make_settings()
+    target = _target(
+        alert_name="RunaiContainerMemoryUsageCritical",
+        namespace="runai-backend",
+        workload_name="runai-backend-workloads-manager-7b5c45cd7d-89km6",
+    )
+    plan = await plan_investigation(settings, target, None, {}, [])
+    assert plan.hypotheses[0]["family"] == "workload_runtime_error"
