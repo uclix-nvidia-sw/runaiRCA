@@ -118,3 +118,37 @@ def test_nvidia_common_issues_deck_knowledge_surfaces() -> None:
     # Every new-family action carries a concrete pod/dashboard pointer, not just prose.
     metrics = match_failure_mode_symptoms(modes, "thanos-query cannot reach thanos-receive", "")
     assert any("runai-backend" in a for _, s in metrics for a in s.get("actions", []))
+
+
+def test_deck_four_tracks_stay_separate_no_cross_matching() -> None:
+    # The NVIDIA deck's 4 flows (auth, workloads, metrics, cluster-disconnected) are
+    # INDEPENDENT diagnostic tracks. A single-track evidence line must match ONLY its
+    # own family — no bleeding auth guidance into a metrics incident, etc.
+    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+
+    modes = load_failure_modes("knowledge/failure_modes.yaml")
+    tracks = {
+        "platform_auth_error": [
+            "user failed to authenticate, email_verified missing",
+            "saml assertionconsumerservice mismatch, attributestatement missing email",
+            "oidc discovery url wrong, client secret invalid",
+        ],
+        "scheduling_quota_exhaustion": [
+            "workload pending, node pool insufficient cpu",
+            "node defragmentation, gpus free but not on a single node",
+            "workload suspended due to idleness rule",
+        ],
+        "observability_accuracy": [
+            "no metrics, thanos-receive storage full",
+            "gpu number 0, dcgm_fi_dev_fb_used missing on some nodes",
+            "metrics-exporter target down",
+        ],
+        "control_plane_error": [
+            "cluster disconnected, traefik token used before issued",
+            "missing prerequisites, runai-toolkit crash",
+        ],
+    }
+    for expected, texts in tracks.items():
+        for text in texts:
+            fams = {f for f, _ in match_failure_mode_symptoms(modes, text, "")}
+            assert fams == {expected}, f"{text!r} bled into {fams - {expected}}"
