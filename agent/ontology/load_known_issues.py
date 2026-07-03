@@ -45,6 +45,7 @@ FAMILIES = {
     "platform_version_bug",
     "observability_accuracy",
     "expected_known_behavior",
+    "platform_auth_error",
     "insufficient_evidence",
 }
 

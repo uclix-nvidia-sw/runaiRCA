@@ -1458,6 +1458,15 @@ _FAMILY_EXPLANATION = {
         "the workload's own code failed while running (application crash, CUDA "
         "out-of-memory) — an application-level fault, not a platform problem"
     ),
+    "observability_accuracy": (
+        "the metrics/observability pipeline is degraded (Prometheus, Thanos, DCGM, "
+        "metrics-exporter) — dashboards are wrong or empty, not the workload itself"
+    ),
+    "platform_auth_error": (
+        "login/permissions/SSO is failing (JWT attributes, SAML/OIDC config, "
+        "Access Rules) or a UI/API call returned 401/403/503/500 — an auth or "
+        "control-plane service issue, not a workload fault"
+    ),
 }
 
 
@@ -1596,6 +1605,7 @@ def _family_label(family: str) -> str:
         "cluster_network_error": "cluster networking error (CNI/DNS)",
         "storage_io_error": "storage/IO error (CSI/NFS/Ceph)",
         "workload_runtime_error": "workload runtime error (application fault)",
+        "platform_auth_error": "authentication/SSO error (login/permissions/SAML/OIDC)",
         "insufficient_evidence": "insufficient evidence",
     }
     return labels.get(family, family.replace("_", " "))

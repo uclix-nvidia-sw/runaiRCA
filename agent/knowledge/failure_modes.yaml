@@ -95,6 +95,22 @@
         - "Run:ai gang-schedules by pod-group: a multi-pod workload is either FULLY scheduled or FULLY pending, so a single unplaceable pod keeps the whole group Pending. Read the runai-scheduler-default logs plus the pod-group-controller / pod-grouper pods in the runai namespace for why the group could not gang."
         - "Verify the SUM of the group's pod requests fits one node pool's free + reclaimable capacity, and that topology/affinity/GPU-fraction constraints are not fragmenting placement."
         - "For distributed (leader/worker) workloads, confirm all sub-groups can be placed together."
+    - name: Pending — Node Pool Out Of Resources
+      keywords: ["insufficient cpu", "insufficient memory", "node pool", "not enough resources"]
+      actions:
+        - "Each node pool is a SEPARATE scheduling domain — check free GPU/CPU/CPU-memory in the workload's node pool, not the whole cluster. The scheduling event says how many resources are missing on how many nodes."
+        - "For non-GPU shortfalls, read the pod YAML (`kubectl -n <project-ns> get po <pod> -o yaml`) for the requested cpu/memory/other resources."
+        - "Confirm the requested PVC is Bound: `kubectl -n <project-ns> get pvc <name>` — an unbound volume keeps the pod Pending."
+    - name: Node Defragmentation
+      keywords: [defragment, defragmentation, "single node"]
+      actions:
+        - "GPUs are free in the node pool but not enough on ONE node — e.g. a 4-GPU workload can't fit a pool with 8 free GPUs spread as 4×(2/8). Check the Overview dashboard 'Free nodes by node pool' and the Nodes page ordered by 'Allocated GPU' for a node with enough contiguous GPUs."
+        - "Multi-node workloads tend to allocate whole nodes' GPUs, so they suffer most from fragmentation — look for partially-full nodes (e.g. 4/8) blocking placement."
+    - name: Suspended By Scheduling Rules Or Eviction
+      keywords: [suspended, idleness, "runtime rule", "scheduling rule", eviction, evicted]
+      actions:
+        - "A workload flipped to Suspended is usually hit by a project Scheduling Rule (idleness limit or total-runtime limit, per workload type) OR was evicted. The scheduling event carries the reason."
+        - "For eviction, compare the evicted workload's requested/deserved resources against the workload that took them (higher priority, or a deserved-quota reclaim)."
     - name: Quota Or Request Changed
       keywords: [preempt, quota]
       actions:
@@ -285,3 +301,73 @@
         - "Inspect runai/runai-backend logs around the alert window for scheduler/quota/db errors."
         - "Check whether several workloads in the same queue/project changed state together."
         - "Escalate to Run:ai platform owners for repeated control-plane errors."
+    - name: Cluster-Sync Out Of Sync Or OOM
+      keywords: [cluster-sync, "out of sync", "status out of sync"]
+      actions:
+        - "A workload's status looking wrong in the UI but fine in the cluster usually means cluster-sync is out of sync. Compare the cluster truth (`kubectl get <workloadkind> <name> -o yaml`) and grep the cluster-sync logs for the workload name."
+        - "Frequent cluster-sync restarts / OOM kills leave status stale — raise cluster-sync resources via runaiconfig."
+    - name: Illegal Workload Crashing Controllers
+      keywords: ["workload-controller", "illegal workload"]
+      actions:
+        - "An illegal/legacy workload (old-version, or a raw-YAML submission) can crash workload-controller and cluster-sync. The offending workload is usually named in the logs right before the crash — find it and delete it."
+    - name: Cluster Disconnected
+      keywords: [disconnected, traefik, "token used before issued", "token expired", "clock sync"]
+      actions:
+        - "'Disconnected' means cluster-sync could not push updates to the control plane. Check cluster-sync for OOM / periodic crashes and read its logs for the specific error."
+        - "Rule out network errors to the backend; check the runai-backend-traefik pod for token errors."
+        - "Clock skew between cluster and backend causes 'token used before issued' / 'token expired' — sync NTP on both sides."
+    - name: Missing Prerequisites Or Service Issues
+      keywords: ["missing prerequisites", runai-toolkit, "required operators", "service issues"]
+      actions:
+        - "Missing prerequisites: confirm the required operators run and their namespaces are the defaults (prometheus→monitoring, gpu-operator→gpu-operator); check the runai-operator logs."
+        - "Service issues: a pod in a runai namespace isn't Running — the UI info sign names the affected service. Effects are per-service (e.g. project-controller → only project CRUD; gpu-operator → can't submit GPU workloads). Control-plane CRUD still works while the agent pod is healthy."
+        - "runai-toolkit is a daemonset on every node; if it crashes due to a node issue, cordon that node."
+
+- family: observability_accuracy
+  symptoms:
+    - name: No Metrics — Thanos Down
+      keywords: [thanos-query, thanos-receive, thanos, "no metrics"]
+      actions:
+        - "Metrics are written to Thanos (runai-backend). Check thanos-query and thanos-receive are Running (`kubectl -n runai-backend get po | grep thanos`), then describe/logs for errors — receive storage full/inaccessible, query can't reach receive, or OOM (exit code in `describe`)."
+        - "Confirm the Thanos PVC is Bound: `kubectl -n runai-backend get pvc`."
+    - name: No Metrics — Prometheus Down
+      keywords: ["prometheus-runai-0", "remote write", "prometheus disk full"]
+      actions:
+        - "Check the runai Prometheus (`kubectl -n runai get po prometheus-runai-0`, then its logs). Look for ACUTE errors — disk full, repeated remote-write failures (some errors are benign)."
+        - "Port-forward Prometheus and check the runai targets' status; verify the target pod is up and its node has no network issues."
+    - name: Partial GPU Metrics — DCGM
+      keywords: [dcgm, dcgm-exporter, "dcgm_fi_dev", "gpu number"]
+      actions:
+        - "GPU count 0 / incorrect: port-forward Prometheus and check DCGM_FI_DEV_FB_FREE / _FB_USED / _GPU_UTIL. If none show, check the gpu-operator configuration; if only some nodes are missing, check the dcgm-exporter instance on those nodes."
+    - name: Partial Run:ai Metrics — Metrics Exporter
+      keywords: [metrics-exporter, "metrics exporter"]
+      actions:
+        - "Missing Project/Workload metrics: check the metrics-exporter pod in the runai namespace (get/describe). Port-forward Prometheus and check its metrics-exporter target — if down, colocate Prometheus and metrics-exporter on the same node; add memory if it was OOM-killed."
+    - name: Metrics Slowness
+      keywords: ["metrics slow", "dashboard slow", "thanos slow"]
+      actions:
+        - "Give thanos-receive and thanos-query more CPU/memory via the helm chart (e.g. thanos.receive 6G/1cpu, thanos.query 2G/1cpu)."
+        - "Ensure Thanos runs on fast storage; if storage is slow, move thanos-receive off the slow node (cordon + delete the pod to reschedule)."
+
+- family: platform_auth_error
+  symptoms:
+    - name: Login 401 — Missing Token Attributes
+      keywords: ["failed to authenticate", email_verified, "http 401", "401 error"]
+      actions:
+        - "Get the user's token and verify it carries the required attributes (email, email_verified). For a LOCAL user with missing attributes, contact Run:ai support; for an SSO user, follow the SAML/OIDC troubleshooting."
+    - name: Permissions 403 / Partial Project Visibility
+      keywords: ["doesn't have permission", "can't see all projects", "access rules", "http 403"]
+      actions:
+        - "403 or partial project visibility means wrong user attributes/permissions. Verify the Access Rules page, decide which attribute is expected (email or SSO group), and check that attribute in the JWT token. If the token's attributes are wrong, fix the SAML/OIDC response from the IdP."
+    - name: SAML Misconfiguration
+      keywords: [saml, assertion, "entity id", assertionconsumerservice, attributestatement]
+      actions:
+        - "SAML passes identity via an XML assertion. Capture the 'saml' network call (browser devtools → Network), decode+inflate the request, and confirm <saml:Issuer>=Entity ID and AssertionConsumerServiceURL=Redirect URI. On the response, decode and check <saml:AttributeStatement> — the email attribute is mandatory and every attribute must match the Run:ai settings."
+    - name: OIDC Misconfiguration
+      keywords: [oidc, "discovery url", "client secret", "client id", claims, openid]
+      actions:
+        - "OIDC issues a JWT with user claims. Verify the Discovery URL, Client ID/Secret, and scopes (openid, email). Simulate the code exchange at openidconnect.net (temporarily add its callback as a valid redirect URI in the IdP) and confirm the ID token carries the mandatory (email) and optional claims correctly."
+    - name: UI / API Error Codes
+      keywords: ["http 503", "http 500", "service isn't responsive", "failed api call"]
+      actions:
+        - "Read UI failures from the browser Network page (failed API calls) and Console page. 401=auth (token attributes), 403=permissions, 503=service unresponsive (check the relevant micro-service pod, e.g. the org-unit/project pod for an org-unit API call), 500=internal error (check the related pod logs)."

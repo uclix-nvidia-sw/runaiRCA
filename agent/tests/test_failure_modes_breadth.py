@@ -93,3 +93,28 @@ def test_runai_scheduler_reclaim_and_gang_surface_with_scheduler_pod_pointer() -
         modes, "pod group is unschedulable: not enough resources to gang the group", ""
     )
     assert any(s.get("symptom") == "Gang Or Pod-Group Not Scheduling" for _, s in gang)
+
+
+def test_nvidia_common_issues_deck_knowledge_surfaces() -> None:
+    # Signatures from the official NVIDIA "Common Troubleshooting" deck must each
+    # match a symptom in the RIGHT family.
+    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+
+    modes = load_failure_modes("knowledge/failure_modes.yaml")
+
+    def fam_for(text):
+        hits = match_failure_mode_symptoms(modes, text, "")
+        return {f for f, _ in hits}
+
+    assert "scheduling_quota_exhaustion" in fam_for("node defragmentation blocks the 4-gpu pod")
+    assert "scheduling_quota_exhaustion" in fam_for("workload suspended due to idleness rule")
+    assert "control_plane_error" in fam_for("cluster-sync is out of sync with the workload status")
+    assert "control_plane_error" in fam_for("cluster disconnected: token used before issued")
+    assert "observability_accuracy" in fam_for("no metrics: thanos-receive storage full")
+    assert "observability_accuracy" in fam_for("gpu number is 0, dcgm_fi_dev_fb_used missing")
+    assert "platform_auth_error" in fam_for("user failed to authenticate, email_verified missing")
+    assert "platform_auth_error" in fam_for("saml assertionconsumerservice mismatch")
+
+    # Every new-family action carries a concrete pod/dashboard pointer, not just prose.
+    metrics = match_failure_mode_symptoms(modes, "thanos-query cannot reach thanos-receive", "")
+    assert any("runai-backend" in a for _, s in metrics for a in s.get("actions", []))

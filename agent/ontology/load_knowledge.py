@@ -43,6 +43,8 @@ FAMILIES = {
     "cluster_network_error",
     "storage_io_error",
     "workload_runtime_error",
+    "observability_accuracy",
+    "platform_auth_error",
     "insufficient_evidence",
 }
 

@@ -176,6 +176,7 @@ entity network_fabric_error sub root_cause;    # NCCL/NVLink/IB/RDMA/Fabric Mana
 entity cluster_network_error sub root_cause;   # CNI/CoreDNS/pod networking
 entity storage_io_error sub root_cause;        # CSI/PVC/NFS/Ceph/disk-IO layer
 entity workload_runtime_error sub root_cause;  # running-phase app faults (vs startup)
+entity platform_auth_error sub root_cause;     # login/permissions/SAML/OIDC/JWT, UI-API 401/403/503/500
 
 entity action,
     owns statement,
