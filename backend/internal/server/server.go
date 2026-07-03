@@ -203,8 +203,12 @@ type Server struct {
 }
 
 const (
-	similarIncidentLimit   = 3
-	flappingGroupWindow    = 30 * time.Minute
+	similarIncidentLimit = 3
+	// Cross-incident feedback/comments are only imported as learning hints above
+	// this similarity — matches the agent planner's "trustworthy" bar. Below it,
+	// another incident's comments are noise, not guidance.
+	minFeedbackHintSimilarity = 0.80
+	flappingGroupWindow       = 30 * time.Minute
 	maxListLimit           = 200
 	maxJSONBodyBytes       = 1 << 20
 	maxEmbeddingQueryBytes = 4000

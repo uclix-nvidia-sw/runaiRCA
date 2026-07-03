@@ -168,6 +168,13 @@ func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int)
 	hints := make([]FeedbackHint, 0, limit)
 	seenComments := map[string]struct{}{}
 	for _, item := range similar {
+		// Only import another incident's feedback/comments when it is GENUINELY
+		// similar. similarIncidentsLocked returns the top-N with no floor, so with
+		// the lexical (jsonb) fallback an unrelated incident's comments leaked into
+		// every analysis as "learning hints" and polluted the report.
+		if item.Similarity < minFeedbackHintSimilarity {
+			continue
+		}
 		if item.PositiveFeedback > 0 {
 			hints = append(hints, FeedbackHint{
 				SourceID:  item.IncidentID,

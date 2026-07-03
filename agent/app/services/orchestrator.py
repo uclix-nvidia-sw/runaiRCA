@@ -34,7 +34,7 @@ from app.knowledge import (
 from app.llm import complete, complete_json, llm_configured
 from app.masking import Masker, build_masker
 from app.plan import InvestigationPlan
-from app.prompts import agent_role_coverage_lines, load_agent_souls
+from app.prompts import load_agent_souls
 from app.schemas import (
     AlertAnalysisRequest,
     AlertAnalysisResponse,
@@ -1118,8 +1118,9 @@ def _detail_from(
     operator_prompt = annotations.get("operator_prompt")
     if operator_prompt:
         lines.extend(["", "### Operator Guidance", "", operator_prompt])
-    lines.extend(["", "### Agent Role Coverage", ""])
-    lines.extend(agent_role_coverage_lines())
+    # ponytail: no "Agent Role Coverage" section — it was the same static
+    # collector-catalog text in every report, telling the operator nothing about
+    # THIS incident. (Kept in prompts.py for the NAT workflow's system prompt.)
     if not agent_souls:
         lines.append("- Agent role contract file was not loaded; fallback guidance was used.")
     lines.extend(_affected_pods_lines(request))

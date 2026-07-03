@@ -301,7 +301,7 @@ async def test_analyze_returns_unified_artifacts() -> None:
     assert response.analysis_summary
     assert "analysis completed" not in response.analysis_summary
     assert response.context["agent_souls_applied"] is True
-    assert "## Agent Role Coverage" in response.analysis_detail
+    assert "Agent Role Coverage" not in response.analysis_detail  # static boilerplate removed
     assert "requires operator review" not in response.analysis_detail
     assert "Inspect Loki logs" not in response.analysis_detail
     assert {artifact.agent for artifact in response.artifacts} == {
