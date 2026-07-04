@@ -85,6 +85,11 @@ typedb:
     resolvedGraceHours: 6       # only incidents resolved >= N hours ago
     limit: 200
     requireReview: false        # true = only operator-reviewed incidents
+    # Close the learning loop: also promote operator-CONFIRMED RCAs (resolved with
+    # net-positive feedback) into reusable knowledge (confirmed:<alert> -> family),
+    # so the next similar alert matches what operators already validated. This is
+    # what makes the agent get smarter over time from real feedback.
+    promoteKnowledge: true
   image:
     # Fully qualified (docker.io/...) so global.imageRegistry does NOT rewrite it
     # to a private org. Air-gapped? Point this at your mirror, e.g.
