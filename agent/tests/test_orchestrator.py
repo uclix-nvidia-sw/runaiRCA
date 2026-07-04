@@ -44,6 +44,7 @@ def make_settings() -> Settings:
         runai_queues_path="/api/v1/queues",
         runai_version_path="/api/v1/version",
         runai_timeout_seconds=1,
+        runai_mcp_url="",
         prometheus_url="",
         prometheus_timeout_seconds=1,
         prometheus_mcp_url="",
@@ -987,3 +988,60 @@ def test_adhoc_query_repr_shows_selector_and_only_set_params() -> None:
     assert a != b
     # cluster-scoped read with just a name
     assert _adhoc_query_repr({"kind": "nodes", "name": "dgx01"}) == "get nodes dgx01"
+
+
+@pytest.mark.asyncio
+async def test_runai_collector_uses_mcp_results_when_configured(monkeypatch) -> None:
+    # With RUNAI_MCP_URL set, the collector gathers via the MCP and does NOT curl.
+    from app.collectors import runai as runai_mod
+
+    async def fake_mcp(settings, target):
+        return [
+            {"name": "workloads", "query": "MCP", "status_code": 200, "error": None,
+             "data": {"workloads": [{"name": "trainer"}]}},
+            {"name": "version", "query": "MCP", "status_code": 200, "error": None,
+             "data": {"version": "2.23.60"}},
+        ]
+
+    async def boom(*a, **k):  # the direct-HTTP path must not run
+        raise AssertionError("must not fall back to curl when MCP returned results")
+
+    monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", fake_mcp)
+    monkeypatch.setattr(runai_mod, "_collect_runai_responses", boom)
+    settings = replace(
+        make_settings(), runai_base_url="https://runai.example", runai_mcp_url="http://localhost:8809/mcp"
+    )
+    result = await RunAICollector(settings).collect(make_target())
+    assert result.details["runai_version"] == "2.23.60"
+    assert any("runai-mcp server" in w for w in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_runai_collector_falls_back_to_curl_when_mcp_unavailable(monkeypatch) -> None:
+    from app.collectors import runai as runai_mod
+
+    async def mcp_none(settings, target):
+        return None  # MCP not configured / failed -> signal fallback
+
+    called = {"curl": False}
+
+    async def fake_curl(settings, target, headers):
+        called["curl"] = True
+        return [
+            {"name": "workloads", "query": "GET", "status_code": 200, "error": None, "data": {}}
+        ]
+
+    async def fake_headers(settings, prefer_oauth=False):
+        return ({"Authorization": "Bearer x"}, [])
+
+    monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", mcp_none)
+    monkeypatch.setattr(runai_mod, "_collect_runai_responses", fake_curl)
+    monkeypatch.setattr(runai_mod, "_runai_headers", fake_headers)
+    monkeypatch.setattr(runai_mod, "_fetch_runai_version", lambda *a, **k: _async_empty())
+    settings = replace(make_settings(), runai_base_url="https://runai.example", runai_mcp_url="")
+    await RunAICollector(settings).collect(make_target())
+    assert called["curl"] is True
+
+
+async def _async_empty():
+    return ""
