@@ -179,3 +179,32 @@ def test_scheduler_disambiguation_runai_vs_kube() -> None:
     joined = " ".join(which["actions"]).lower()
     assert "schedulername" in joined
     assert "runai-scheduler-default" in joined and "default-scheduler" in joined
+
+
+def test_k8s_research_signatures_map_to_right_family_single_track() -> None:
+    # Signatures ingested from the learnk8s flowchart + k8s docs + CNCF research must
+    # each match exactly ONE family (no cross-track bleed).
+    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+
+    modes = load_failure_modes("knowledge/failure_modes.yaml")
+
+    def only(text):
+        return {f for f, _ in match_failure_mode_symptoms(modes, text, "")}
+
+    assert only("createcontainerconfigerror: couldn't find key api_key in secret") == {
+        "workload_startup_image_failure"
+    }
+    assert only("0/5 nodes are available: 3 untolerated taint, 2 didn't match node selector") == {
+        "scheduling_quota_exhaustion"
+    }
+    assert only("service myapp has no endpoints available") == {"cluster_network_error"}
+    assert only("pleg is not healthy: pleg was last active 5m ago") == {"node_kubelet_pressure"}
+    assert only("etcdserver: request timed out, no leader") == {"control_plane_error"}
+    assert only("volume node affinity conflict") == {"storage_io_error"}
+    assert only("error from server (forbidden): cannot list resource pods") == {
+        "platform_auth_error"
+    }
+    # cert text stays with the registry (workload) track; control-plane cert uses
+    # kubeadm-specific phrasing so the two don't collide
+    assert "control_plane_error" not in only("certificate has expired")
+    assert only("kubeadm certs check-expiration shows apiserver expired") == {"control_plane_error"}
