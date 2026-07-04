@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // embeddingDim is the default dimensionality of the dense vectors stored in the
@@ -683,16 +684,47 @@ func embeddingLiteral(vector []float32) string {
 }
 
 func tokenize(text string) []string {
+	// Split on any non-letter/non-number rune, keeping ALL Unicode letters — the
+	// old a-z/0-9-only predicate dropped Hangul/CJK entirely, so Korean reports
+	// were compared on a handful of ASCII scraps (IP octets, "dns", "io") and even
+	// near-identical incidents scored ~50%. unicode.IsLetter keeps Korean eojeols.
 	fields := strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
-		return !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9')
+		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
 	})
 	tokens := make([]string, 0, len(fields))
 	for _, field := range fields {
-		if len([]rune(field)) >= 2 {
-			tokens = append(tokens, field)
-		}
+		tokens = append(tokens, wordTokens(field)...)
 	}
 	return tokens
+}
+
+// wordTokens yields tokens for one whitespace-delimited field. Space-delimited
+// scripts (Latin, Korean eojeols) pass through as one token; scripts written
+// without spaces (Han/Hiragana/Katakana) are emitted as character bigrams so a
+// run still contributes overlapping features instead of one giant unique token.
+// ponytail: bigrams are a cheap CJK-segmentation stand-in; swap for a real
+// tokenizer only if non-Korean CJK similarity matters.
+func wordTokens(field string) []string {
+	runes := []rune(field)
+	if len(runes) < 2 {
+		return nil
+	}
+	hanCount := 0
+	for _, r := range runes {
+		if unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) || unicode.Is(unicode.Katakana, r) {
+			hanCount++
+		}
+	}
+	// Korean (Hangul) has spaces between words, so keep the eojeol whole; only the
+	// space-less CJK scripts need bigram splitting.
+	if hanCount < 2 {
+		return []string{field}
+	}
+	out := make([]string, 0, len(runes)-1)
+	for i := 0; i+1 < len(runes); i++ {
+		out = append(out, string(runes[i:i+2]))
+	}
+	return out
 }
 
 func cosineSimilarity(a, b map[string]float64) float64 {

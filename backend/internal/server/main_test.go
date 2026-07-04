@@ -2447,3 +2447,33 @@ func TestFlappingWindowGroupsRecurrenceWithinConfiguredWindow(t *testing.T) {
 		t.Fatalf("recurrence beyond window should start a new incident")
 	}
 }
+
+func TestTokenizeKeepsKoreanAndSimilarityIsHighForNearDuplicates(t *testing.T) {
+	// The old tokenizer dropped all Hangul, so near-identical Korean reports scored
+	// ~50%. Korean eojeols must now survive and drive a high similarity.
+	toks := tokenize("노드 192.168.20.172에서 메이저 페이지 폴트 지속 발생 메모리 압박")
+	has := func(w string) bool {
+		for _, tk := range toks {
+			if tk == w {
+				return true
+			}
+		}
+		return false
+	}
+	if !has("노드") || !has("메모리") || !has("페이지") {
+		t.Fatalf("Korean tokens dropped: %v", toks)
+	}
+
+	a := textVector("노드 192.168.20.172에서 초당 500회 이상 메이저 페이지 폴트 지속 발생 — 노드 메모리 압박(스왑/디스크 I/O 증가)이 주원인으로 판단됩니다")
+	b := textVector("노드 192.168.20.172에서 초당 520회 메이저 페이지 폴트 지속 발생 — 노드 메모리/디스크 압박이 주원인으로 판단됩니다")
+	sim := cosineSimilarity(a, b)
+	if sim < 0.8 {
+		t.Fatalf("near-identical Korean reports should score high, got %.2f", sim)
+	}
+
+	// A clearly different incident must NOT score high (no false grouping).
+	c := textVector("GPU XID 79 발생 — GPU가 PCIe 버스에서 떨어져 하드웨어 결함으로 판단됩니다")
+	if s := cosineSimilarity(a, c); s > 0.5 {
+		t.Fatalf("unrelated incident scored too high: %.2f", s)
+	}
+}
