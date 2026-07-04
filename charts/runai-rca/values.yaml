@@ -138,6 +138,11 @@ backend:
     maxAutoAnalyzeFanout: 50
     # Max analyses running against the agent concurrently.
     maxConcurrentAgentRuns: 50
+    # How long (minutes) an alert signature can be QUIET before a recurrence is
+    # treated as a NEW incident instead of another occurrence of the flapping one.
+    # 30 was too tight — alerts that recur every few hours each spawned a fresh row.
+    # Raise to cover your alerts' recurrence gap (e.g. 360 for a 6h cadence).
+    flappingGroupWindowMinutes: 120
     # Backfill: periodically re-drive alerts left without a completed RCA (dropped by
     # the caps, or a prior failed run). Pauses while the agent is unhealthy.
     # intervalSeconds: 0 disables it.
