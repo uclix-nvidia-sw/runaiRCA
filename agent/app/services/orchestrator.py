@@ -291,9 +291,13 @@ class AnalysisOrchestrator:
         # iterative even when litellm is down (the ReAct loop is skipped then).
         try:
             from app.collectors.kubernetes import k8s_followup
+            from app.collectors.prometheus import prometheus_followup
 
             k8s_result = next((r for r in results if r.agent == "kubernetes"), None)
+            prom_result = next((r for r in results if r.agent == "prometheus"), None)
             await k8s_followup(self._settings, k8s_result, target)
+            # Cross-collector: k8s findings (OOM/restart/Pending) -> derived PromQL.
+            await prometheus_followup(self._settings, prom_result, k8s_result, target)
         except Exception:  # noqa: BLE001 - follow-up is best-effort, never fail analysis
             pass
         for r in results:

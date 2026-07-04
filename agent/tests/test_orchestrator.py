@@ -1045,3 +1045,57 @@ async def test_runai_collector_falls_back_to_curl_when_mcp_unavailable(monkeypat
 
 async def _async_empty():
     return ""
+
+
+@pytest.mark.asyncio
+async def test_prometheus_followup_derives_promql_from_k8s_oom(monkeypatch) -> None:
+    # Cross-collector flowchart: an OOMKilled + restart found by kubernetes drives
+    # derived PromQL (memory/limit ratio, growth shape, restart rate) on prometheus.
+    from app.collectors import prometheus as prom_mod
+    from app.collectors.base import CollectorResult
+
+    fired: list[str] = []
+
+    async def fake_prom_query(settings, name, promql):
+        fired.append(name)
+        return {"name": name, "query": promql, "status_code": 200, "error": None, "data": {}}
+
+    monkeypatch.setattr(prom_mod, "prom_query", fake_prom_query)
+    k8s = CollectorResult(
+        agent="kubernetes", status="ok", summary="k8s", confidence="medium",
+        details={
+            "pod_statuses": [{"name": "trainer-0", "phase": "Running"}],
+            "container_diagnostics": [
+                {"name": "app", "restartCount": 3,
+                 "lastTerminated": {"reason": "OOMKilled", "exitCode": 137}}
+            ],
+        },
+    )
+    prom = CollectorResult(agent="prometheus", status="ok", summary="p", confidence="medium")
+    target = replace(make_target(), namespace="team-a", pod="trainer-0")
+    await prom_mod.prometheus_followup(make_settings(), prom, k8s, target)
+
+    assert "oom_working_set_vs_limit" in fired
+    assert "oom_growth_shape" in fired
+    assert "active_restart_rate" in fired
+    assert any(a.type == "followup_query" for a in prom.artifacts)
+
+
+@pytest.mark.asyncio
+async def test_prometheus_followup_noop_when_healthy(monkeypatch) -> None:
+    from app.collectors import prometheus as prom_mod
+    from app.collectors.base import CollectorResult
+
+    async def boom(*a, **k):  # pragma: no cover
+        raise AssertionError("no prometheus follow-up for a healthy pod")
+
+    monkeypatch.setattr(prom_mod, "prom_query", boom)
+    k8s = CollectorResult(
+        agent="kubernetes", status="ok", summary="k8s", confidence="medium",
+        details={"pod_statuses": [{"phase": "Running"}], "container_diagnostics": []},
+    )
+    prom = CollectorResult(agent="prometheus", status="ok", summary="p", confidence="medium")
+    out = await prom_mod.prometheus_followup(
+        make_settings(), prom, k8s, replace(make_target(), namespace="team-a", pod="p")
+    )
+    assert out == []
