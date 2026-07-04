@@ -15,7 +15,7 @@ def test_load_runai_alerts_shape() -> None:
     assert catalog  # non-empty
     matched = match_runai_alert(catalog, "NVIDIA Run:ai Project Controller Reconcile Failure")
     assert matched is not None
-    assert matched["family"] == "control_plane_error"
+    assert matched["family"] == "runai_control_plane_error"
     assert matched["actions"]
 
 
@@ -24,7 +24,7 @@ def test_match_camelcase_alertname() -> None:
     catalog = load_runai_alerts(CATALOG)
     matched = match_runai_alert(catalog, "RunaiProjectControllerReconcileFailure")
     assert matched is not None
-    assert matched["family"] == "control_plane_error"
+    assert matched["family"] == "runai_control_plane_error"
 
 
 def test_no_false_match_for_unknown_alert() -> None:

@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 FAMILIES = (
     "node_kubelet_pressure",
     "scheduling_quota_exhaustion",
-    "control_plane_error",
+    "runai_control_plane_error",
     "workload_startup_image_failure",
     "insufficient_evidence",
 )

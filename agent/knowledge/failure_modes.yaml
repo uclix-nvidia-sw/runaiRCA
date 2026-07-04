@@ -426,13 +426,13 @@
         - "Compare with the last successful run: what changed (image, code, data, config)?"
         - "In distributed training, the FIRST crashing rank is the cause; every other rank then fails with communication timeouts."
 
-- family: control_plane_error
+- family: runai_control_plane_error
   symptoms:
     # No bare "scheduler" — it matches the runai-scheduler pod name in every log
     # stream and falsely elevates control-plane for plain scheduling/kube-scheduler
     # events. Keep phrases that only appear when the control-plane service errors.
     - name: Scheduler Or Reconcile Error
-      keywords: ["scheduler panic", "scheduler error", reconcile, admission, "database error", authorization]
+      keywords: ["scheduler panic", "scheduler error", reconcile, "database error", authorization]
       actions:
         - "Inspect runai/runai-backend logs around the alert window for scheduler/quota/db errors."
         - "Check whether several workloads in the same queue/project changed state together."
@@ -459,36 +459,6 @@
         - "Service issues: a pod in a runai namespace isn't Running — the UI info sign names the affected service. Effects are per-service (e.g. project-controller → only project CRUD; gpu-operator → can't submit GPU workloads). Control-plane CRUD still works while the agent pod is healthy."
         - "runai-toolkit is a daemonset on every node; if it crashes due to a node issue, cordon that node."
     # --- added from k8s troubleshooting research (learnk8s flowchart, k8s docs, CNCF) ---
-    - name: kube-apiserver Unreachable From kubectl
-      keywords: ["the connection to the server", "couldn't get current server api group list", "unable to connect to the server", ":6443"]
-      actions:
-        - "kubectl cannot reach the kube-apiserver. From a control-plane node check the static pod: `crictl ps | grep kube-apiserver`, then `crictl logs <apiserver-container>` (or `journalctl -u kubelet` for the static-pod restart loop)."
-        - "Verify the kubeconfig points at the live endpoint/port (`kubectl config view --minify`) and the API VIP/load-balancer is healthy (`curl -k https://<vip>:6443/healthz`) before blaming the server itself."
-        - "If the apiserver pod won't start, check its backing store — the apiserver fails to come up when etcd is unreachable or its data is lost (see the etcd symptom)."
-    - name: etcd Quorum Lost / Request Timed Out
-      keywords: ["etcdserver: request timed out", "etcdserver: no leader", "etcdserver: leader changed", "failed to send out heartbeat on time", "waiting for readindex response took too long"]
-      actions:
-        - "etcd is the apiserver's backing store — with no leader/quorum every write fails and operators crash-loop. Check member health from a control-plane node: `etcdctl endpoint health --cluster` and `etcdctl endpoint status --cluster -w table`; a 3-node cluster needs 2 up."
-        - "Read the etcd static-pod logs (`crictl logs <etcd-container>`) for 'etcdserver: leader changed' / 'request timed out'; 'failed to send out heartbeat' / 'waiting for readindex response took too long' point at slow disk or CPU starvation — check `iostat -x 1`, give etcd dedicated SSD/NVMe."
-        - "Restore quorum BEFORE touching workloads — bring the down member's node back, don't delete etcd data while degraded; verify apiserver-etcd-client cert validity (`kubeadm certs check-expiration`) if etcd rejects the apiserver."
-    - name: Control-Plane / kubelet Certificate Expired
-      keywords: ["kubeadm certs check-expiration", "unable to load server certificate"]
-      actions:
-        - "A control-plane client/serving cert expired (or 'is not yet valid' = a node clock is BEHIND), so apiserver/controller-manager/scheduler/kubelet reject each other's TLS. On a control-plane node run `kubeadm certs check-expiration` to see which cert is past EXPIRES."
-        - "Renew with `kubeadm certs renew all`, then restart the control-plane static pods (move manifests out/in of /etc/kubernetes/manifests, or `crictl rm` them) so they reload; refresh the admin kubeconfig with `kubeadm init phase kubeconfig admin`."
-        - "For 'is not yet valid' fix the NODE CLOCK not the cert (`timedatectl`, `chronyc makestep`); distinguish an expired cert (renew) from a wrong CA ('signed by unknown authority', needs the correct CA in kubeconfig)."
-    - name: Admission Webhook Timeout / Unreachable
-      keywords: ["failed calling webhook", "admission webhook", "denied the request"]
-      actions:
-        - "An admission webhook the apiserver must call is unreachable, slow, or has a bad cert, so creates/updates are blocked cluster-wide. Match the failing webhook name from the error: `kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations`."
-        - "Check the webhook's backing service has endpoints and its pods are up: `kubectl -n <ns> get endpoints <webhook-svc>` (empty = pod down) and `kubectl -n <ns> get pods`; a NetworkPolicy can block the apiserver->webhook path."
-        - "If non-critical, unblock with `kubectl patch <validating|mutating>webhookconfiguration <name> --type=json -p '[{\"op\":\"replace\",\"path\":\"/webhooks/0/failurePolicy\",\"value\":\"Ignore\"}]'` or delete the config. For the x509 error, the webhook's caBundle no longer matches its serving cert — regenerate/patch the caBundle."
-    - name: Control-Plane Component Lost Leader Lease
-      keywords: ["leaderelection lost", "failed to renew lease", "stopped leading"]
-      actions:
-        - "The kube-controller-manager or kube-scheduler lost its leader lease and stopped reconciling (pods stay Pending, endpoints stop updating). See which lease flapped: `kubectl -n kube-system get lease kube-controller-manager kube-scheduler -o wide` (holderIdentity + renewTime)."
-        - "Read the static-pod logs on the control-plane node: `kubectl -n kube-system logs -l component=kube-controller-manager --tail=100` (and `-l component=kube-scheduler`), or `/var/log/kube-controller-manager.log`."
-        - "Flapping leader election is almost always apiserver/etcd latency underneath — if all components flap together, fix the apiserver/etcd path first (see those symptoms). Once the apiserver is reachable the lease moves to a healthy replica on its own."
 
 - family: observability_accuracy
   symptoms:
@@ -553,3 +523,39 @@
         - "The apiserver returned 401 — the credential (token or client cert) is missing, malformed, expired, or untrusted (distinct from 403 RBAC). Check which context/credential kubectl uses: `kubectl config current-context` and `kubectl config view --minify`; for an expired client cert, `kubeadm certs check-expiration` or `openssl x509 -noout -enddate -in <client.crt>`."
         - "For a rotated cluster, copy the fresh `/etc/kubernetes/admin.conf` from a control-plane node into `~/.kube/config`; for a ServiceAccount token, confirm the token secret still exists and is mounted."
         - "If ONLY this client is Unauthorized while others work, the problem is local credentials; if EVERY client is Unauthorized, suspect the apiserver's authn config (rotated signing key / OIDC issuer): `kubectl -n kube-system logs -l component=kube-apiserver | grep -i unauthorized`."
+
+- family: k8s_control_plane_error
+  # The Kubernetes cluster's OWN control plane (apiserver/etcd/kube-scheduler/
+  # controller-manager/kubelet certs/admission webhooks) — distinct from the Run:ai
+  # platform control plane (runai-scheduler / runai-backend / cluster-sync).
+  symptoms:
+    - name: kube-apiserver Unreachable From kubectl
+      keywords: ["the connection to the server", "couldn't get current server api group list", "unable to connect to the server", ":6443"]
+      actions:
+        - "kubectl cannot reach the kube-apiserver. From a control-plane node check the static pod: `crictl ps | grep kube-apiserver`, then `crictl logs <apiserver-container>` (or `journalctl -u kubelet` for the static-pod restart loop)."
+        - "Verify the kubeconfig points at the live endpoint/port (`kubectl config view --minify`) and the API VIP/load-balancer is healthy (`curl -k https://<vip>:6443/healthz`) before blaming the server itself."
+        - "If the apiserver pod won't start, check its backing store — the apiserver fails to come up when etcd is unreachable or its data is lost (see the etcd symptom)."
+    - name: etcd Quorum Lost / Request Timed Out
+      keywords: ["etcdserver: request timed out", "etcdserver: no leader", "etcdserver: leader changed", "failed to send out heartbeat on time", "waiting for readindex response took too long"]
+      actions:
+        - "etcd is the apiserver's backing store — with no leader/quorum every write fails and operators crash-loop. Check member health from a control-plane node: `etcdctl endpoint health --cluster` and `etcdctl endpoint status --cluster -w table`; a 3-node cluster needs 2 up."
+        - "Read the etcd static-pod logs (`crictl logs <etcd-container>`) for 'etcdserver: leader changed' / 'request timed out'; 'failed to send out heartbeat' / 'waiting for readindex response took too long' point at slow disk or CPU starvation — check `iostat -x 1`, give etcd dedicated SSD/NVMe."
+        - "Restore quorum BEFORE touching workloads — bring the down member's node back, don't delete etcd data while degraded; verify apiserver-etcd-client cert validity (`kubeadm certs check-expiration`) if etcd rejects the apiserver."
+    - name: Control-Plane / kubelet Certificate Expired
+      keywords: ["kubeadm certs check-expiration", "unable to load server certificate"]
+      actions:
+        - "A control-plane client/serving cert expired (or 'is not yet valid' = a node clock is BEHIND), so apiserver/controller-manager/scheduler/kubelet reject each other's TLS. On a control-plane node run `kubeadm certs check-expiration` to see which cert is past EXPIRES."
+        - "Renew with `kubeadm certs renew all`, then restart the control-plane static pods (move manifests out/in of /etc/kubernetes/manifests, or `crictl rm` them) so they reload; refresh the admin kubeconfig with `kubeadm init phase kubeconfig admin`."
+        - "For 'is not yet valid' fix the NODE CLOCK not the cert (`timedatectl`, `chronyc makestep`); distinguish an expired cert (renew) from a wrong CA ('signed by unknown authority', needs the correct CA in kubeconfig)."
+    - name: Admission Webhook Timeout / Unreachable
+      keywords: ["failed calling webhook", "admission webhook", "denied the request"]
+      actions:
+        - "An admission webhook the apiserver must call is unreachable, slow, or has a bad cert, so creates/updates are blocked cluster-wide. Match the failing webhook name from the error: `kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations`."
+        - "Check the webhook's backing service has endpoints and its pods are up: `kubectl -n <ns> get endpoints <webhook-svc>` (empty = pod down) and `kubectl -n <ns> get pods`; a NetworkPolicy can block the apiserver->webhook path."
+        - "If non-critical, unblock with `kubectl patch <validating|mutating>webhookconfiguration <name> --type=json -p '[{\"op\":\"replace\",\"path\":\"/webhooks/0/failurePolicy\",\"value\":\"Ignore\"}]'` or delete the config. For the x509 error, the webhook's caBundle no longer matches its serving cert — regenerate/patch the caBundle."
+    - name: Control-Plane Component Lost Leader Lease
+      keywords: ["leaderelection lost", "failed to renew lease", "stopped leading"]
+      actions:
+        - "The kube-controller-manager or kube-scheduler lost its leader lease and stopped reconciling (pods stay Pending, endpoints stop updating). See which lease flapped: `kubectl -n kube-system get lease kube-controller-manager kube-scheduler -o wide` (holderIdentity + renewTime)."
+        - "Read the static-pod logs on the control-plane node: `kubectl -n kube-system logs -l component=kube-controller-manager --tail=100` (and `-l component=kube-scheduler`), or `/var/log/kube-controller-manager.log`."
+        - "Flapping leader election is almost always apiserver/etcd latency underneath — if all components flap together, fix the apiserver/etcd path first (see those symptoms). Once the apiserver is reachable the lease moves to a healthy replica on its own."

@@ -25,7 +25,8 @@ from app.collectors.base import AnalysisTarget, CollectorResult
 FAMILIES = (
     "node_kubelet_pressure",
     "scheduling_quota_exhaustion",
-    "control_plane_error",
+    "runai_control_plane_error",
+    "k8s_control_plane_error",
     "workload_startup_image_failure",
 )
 INSUFFICIENT = "insufficient_evidence"
@@ -45,14 +46,25 @@ _FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
          "reclaim", "pod group", "podgroup", "gang", "fairshare",
          "saturat", "requested gpus", "quota", "pending"),
     ),
-    "control_plane_error": (
+    "runai_control_plane_error": (
         "loki",
         ("loki", "kubernetes"),
-        # NOTE: no bare "scheduler" — it matches the `runai-scheduler` pod name in
-        # every Run:ai log stream label, which falsely elevated this family for
-        # unrelated alerts. Keep phrases that only appear in real control-plane errors.
-        ("reconcile", "admission", "runai-backend",
-         "control plane", "control-plane", "authorization", "database error"),
+        # Run:ai PLATFORM control plane only. No bare "scheduler" (matches the
+        # runai-scheduler pod name in every stream) and no bare "control plane"/
+        # "control-plane" — those coarse tokens over-routed unrelated alerts here.
+        # Keep Run:ai-subsystem-specific phrases so a k8s apiserver/etcd fault lands
+        # in k8s_control_plane_error, not here.
+        ("reconcile", "runai-backend", "cluster-sync",
+         "authorization", "database error"),
+    ),
+    "k8s_control_plane_error": (
+        "kubernetes",
+        ("kubernetes", "loki"),
+        # The Kubernetes cluster's OWN control plane — apiserver/etcd/kube-scheduler/
+        # controller-manager/kubelet certs/admission webhooks. Distinct subsystem
+        # from the Run:ai platform control plane above.
+        ("apiserver", "kube-apiserver", "etcd", "etcdserver", "kube-controller-manager",
+         "kubeadm", "leaderelection", "failed calling webhook", "admission webhook"),
     ),
     "workload_startup_image_failure": (
         "kubernetes",
@@ -168,7 +180,7 @@ def _apply_bonuses(
     node = scores["node_kubelet_pressure"]
     startup = scores["workload_startup_image_failure"]
     quota = scores["scheduling_quota_exhaustion"]
-    control = scores["control_plane_error"]
+    control = scores["runai_control_plane_error"]
 
     # R1: node pressure with blast radius across >=2 workloads on the node.
     if node.points > 0 and blast >= 2:

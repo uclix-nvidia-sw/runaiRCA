@@ -24,7 +24,7 @@ _FAMILY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "scheduling", "unschedulable", "quota", "preempt", "pending",
         "insufficient gpu", "gpu quota", "capacity", "saturat",
     ),
-    "control_plane_error": (
+    "runai_control_plane_error": (
         "control plane", "control-plane", "reconcile", "admission",
         "runai-backend", "backend", "authorization", "database",
     ),

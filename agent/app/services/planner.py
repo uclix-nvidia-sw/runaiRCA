@@ -50,8 +50,12 @@ _FAMILY_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("pending", "unschedul", "quota", "queue", "gpu", "preempt", "schedul"),
     ),
     (
-        "control_plane_error",
-        ("reconcile", "admission", "runai-backend", "control", "authorization"),
+        "runai_control_plane_error",
+        ("reconcile", "runai-backend", "cluster-sync", "authorization"),
+    ),
+    (
+        "k8s_control_plane_error",
+        ("apiserver", "etcd", "kubeadm", "leaderelection", "webhook", "kube-controller"),
     ),
     (
         "workload_startup_image_failure",
@@ -62,7 +66,8 @@ _FAMILY_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
 _FAMILY_REASON = {
     "node_kubelet_pressure": "alert points at node/kubelet resource pressure",
     "scheduling_quota_exhaustion": "alert points at scheduling or GPU-quota exhaustion",
-    "control_plane_error": "alert implicates the Run:ai control plane",
+    "runai_control_plane_error": "alert implicates the Run:ai platform control plane",
+    "k8s_control_plane_error": "alert implicates the Kubernetes cluster control plane",
     "workload_startup_image_failure": "alert points at a workload-local startup/image fault",
 }
 
@@ -112,7 +117,7 @@ def _namespace_scope(target: AnalysisTarget, settings: Settings) -> str:
 # scope -> (families to lead the hypotheses with, the reason tag)
 _SCOPE_LEAD: dict[str, tuple[tuple[str, ...], str]] = {
     "platform": (
-        ("control_plane_error", "node_kubelet_pressure"),
+        ("runai_control_plane_error", "node_kubelet_pressure"),
         "Run:ai platform namespace — the control plane itself; investigate Kubernetes "
         "and node/system evidence broadly, not just the workload",
     ),

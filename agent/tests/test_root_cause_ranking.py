@@ -65,7 +65,7 @@ def test_r3_control_plane_error_wins_on_backend_reconcile_error() -> None:
         _r("kubernetes", summary="workload events sparse"),
     ]
     ranked = rank_root_cause_candidates(_target(alert_name="RunAIWorkloadPending"), results)
-    assert ranked[0].family == "control_plane_error"
+    assert ranked[0].family == "runai_control_plane_error"
 
 
 def test_scheduler_pod_name_does_not_elevate_control_plane() -> None:
@@ -77,7 +77,7 @@ def test_scheduler_pod_name_does_not_elevate_control_plane() -> None:
         _r("loki", summary='logs from pod="runai-scheduler-0" nominal; no errors'),
     ]
     ranked = rank_root_cause_candidates(_target(alert_name="NodeExporterDown"), results)
-    assert ranked[0].family != "control_plane_error"
+    assert ranked[0].family != "runai_control_plane_error"
 
 
 def test_r6_insufficient_evidence_when_nothing_corroborates() -> None:

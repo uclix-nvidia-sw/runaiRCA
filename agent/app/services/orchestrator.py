@@ -1444,9 +1444,15 @@ _FAMILY_EXPLANATION = {
     "scheduling_quota_exhaustion": (
         "the workload cannot be scheduled — GPU quota or queue capacity looks exhausted"
     ),
-    "control_plane_error": (
-        "the Run:ai control plane (scheduler or backend) is reporting errors that "
-        "affect this workload"
+    "runai_control_plane_error": (
+        "the Run:ai PLATFORM control plane (runai-scheduler, runai-backend, "
+        "cluster-sync) is reporting errors that affect this workload — not the "
+        "Kubernetes control plane"
+    ),
+    "k8s_control_plane_error": (
+        "the KUBERNETES cluster's own control plane is unhealthy (kube-apiserver, "
+        "etcd, kube-scheduler/controller-manager, kubelet certs, admission webhooks) "
+        "— a cluster-level fault beneath Run:ai"
     ),
     "workload_startup_image_failure": (
         "the workload itself is failing to start — an image pull, crash loop, or a "
@@ -1610,7 +1616,8 @@ def _family_label(family: str) -> str:
     labels = {
         "node_kubelet_pressure": "node kubelet pressure",
         "scheduling_quota_exhaustion": "scheduling quota exhaustion",
-        "control_plane_error": "Run:ai control-plane error",
+        "runai_control_plane_error": "Run:ai control-plane error (scheduler/backend/cluster-sync)",
+        "k8s_control_plane_error": "Kubernetes control-plane error (apiserver/etcd/scheduler)",
         "workload_startup_image_failure": "workload startup/image failure",
         "gpu_hardware_error": "GPU hardware error",
         "platform_version_bug": "Run:ai version bug",

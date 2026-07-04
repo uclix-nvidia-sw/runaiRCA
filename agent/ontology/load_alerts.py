@@ -33,7 +33,7 @@ ALERTS_FILE = Path(os.getenv("RUNAI_ALERTS_FILE", "knowledge/runai_alerts_catalo
 FAMILIES = {
     "node_kubelet_pressure",
     "scheduling_quota_exhaustion",
-    "control_plane_error",
+    "runai_control_plane_error",
     "workload_startup_image_failure",
     "gpu_hardware_error",
 }

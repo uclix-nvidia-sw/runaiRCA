@@ -108,8 +108,10 @@ def test_nvidia_common_issues_deck_knowledge_surfaces() -> None:
 
     assert "scheduling_quota_exhaustion" in fam_for("node defragmentation blocks the 4-gpu pod")
     assert "scheduling_quota_exhaustion" in fam_for("workload suspended due to idleness rule")
-    assert "control_plane_error" in fam_for("cluster-sync is out of sync with the workload status")
-    assert "control_plane_error" in fam_for("cluster disconnected: token used before issued")
+    assert "runai_control_plane_error" in fam_for(
+        "cluster-sync is out of sync with the workload status"
+    )
+    assert "runai_control_plane_error" in fam_for("cluster disconnected: token used before issued")
     assert "observability_accuracy" in fam_for("no metrics: thanos-receive storage full")
     assert "observability_accuracy" in fam_for("gpu number is 0, dcgm_fi_dev_fb_used missing")
     assert "platform_auth_error" in fam_for("user failed to authenticate, email_verified missing")
@@ -143,7 +145,7 @@ def test_deck_four_tracks_stay_separate_no_cross_matching() -> None:
             "gpu number 0, dcgm_fi_dev_fb_used missing on some nodes",
             "metrics-exporter target down",
         ],
-        "control_plane_error": [
+        "runai_control_plane_error": [
             "cluster disconnected, traefik token used before issued",
             "missing prerequisites, runai-toolkit crash",
         ],
@@ -199,12 +201,17 @@ def test_k8s_research_signatures_map_to_right_family_single_track() -> None:
     }
     assert only("service myapp has no endpoints available") == {"cluster_network_error"}
     assert only("pleg is not healthy: pleg was last active 5m ago") == {"node_kubelet_pressure"}
-    assert only("etcdserver: request timed out, no leader") == {"control_plane_error"}
+    # k8s cluster control plane (distinct from the Run:ai platform control plane)
+    assert only("etcdserver: request timed out, no leader") == {"k8s_control_plane_error"}
     assert only("volume node affinity conflict") == {"storage_io_error"}
     assert only("error from server (forbidden): cannot list resource pods") == {
         "platform_auth_error"
     }
-    # cert text stays with the registry (workload) track; control-plane cert uses
+    # cert text stays with the registry (workload) track; k8s control-plane cert uses
     # kubeadm-specific phrasing so the two don't collide
-    assert "control_plane_error" not in only("certificate has expired")
-    assert only("kubeadm certs check-expiration shows apiserver expired") == {"control_plane_error"}
+    assert "k8s_control_plane_error" not in only("certificate has expired")
+    assert only("kubeadm certs check-expiration shows apiserver expired") == {
+        "k8s_control_plane_error"
+    }
+    # the Run:ai platform control plane is a SEPARATE family from the k8s one
+    assert only("runai cluster-sync is out of sync") == {"runai_control_plane_error"}

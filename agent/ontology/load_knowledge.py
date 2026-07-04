@@ -36,7 +36,8 @@ KNOWLEDGE_FILE = Path(os.getenv("FAILURE_MODES_FILE", "knowledge/failure_modes.y
 FAMILIES = {
     "node_kubelet_pressure",
     "scheduling_quota_exhaustion",
-    "control_plane_error",
+    "runai_control_plane_error",
+    "k8s_control_plane_error",
     "workload_startup_image_failure",
     "gpu_hardware_error",
     "network_fabric_error",

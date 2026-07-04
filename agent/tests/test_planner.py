@@ -118,7 +118,7 @@ async def test_platform_namespace_investigates_broadly() -> None:
     target = _target(alert_name="SomeAlert", namespace="runai-backend")
     plan = await plan_investigation(settings, target, None, {}, [])
 
-    assert plan.hypotheses[0]["family"] == "control_plane_error"
+    assert plan.hypotheses[0]["family"] == "runai_control_plane_error"
     assert plan.check_control_plane is True
     assert "broadly" in plan.narrative.lower()
 
@@ -160,7 +160,7 @@ async def test_llm_refinement_kept_on_success(monkeypatch) -> None:
         return {
             "focus": "refined focus",
             "strategy": "targeted",
-            "hypotheses": [{"family": "control_plane_error", "reason": "llm says so"}],
+            "hypotheses": [{"family": "runai_control_plane_error", "reason": "llm says so"}],
             "narrative": "refined narrative",
         }
 
@@ -170,7 +170,7 @@ async def test_llm_refinement_kept_on_success(monkeypatch) -> None:
 
     assert plan.focus == "refined focus"
     assert plan.strategy == "targeted"
-    assert plan.hypotheses[0]["family"] == "control_plane_error"
+    assert plan.hypotheses[0]["family"] == "runai_control_plane_error"
     # deterministic scope decisions are NOT overridden by the LLM
     assert plan.check_control_plane is False
 
@@ -275,7 +275,7 @@ async def test_llm_can_widen_scope_to_control_plane(monkeypatch) -> None:
 
     async def fake(settings, *, system, user, temperature=0.1):
         return {"strategy": "targeted", "check_control_plane": True,
-                "hypotheses": [{"family": "control_plane_error", "reason": "platform"}]}
+                "hypotheses": [{"family": "runai_control_plane_error", "reason": "platform"}]}
 
     monkeypatch.setattr("app.services.planner.complete_json", fake)
     # monitoring ns → deterministic check_control_plane is False

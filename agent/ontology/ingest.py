@@ -282,8 +282,8 @@ _FAMILY_MARKERS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ("scheduling_quota_exhaustion", "scheduling quota exhaustion", "queue capacity looks"),
         ("failedscheduling", "unschedulable", "quota", "preempt", "insufficient gpu"),
     ),
-    "control_plane_error": (
-        ("control_plane_error", "run:ai control-plane error"),
+    "runai_control_plane_error": (
+        ("runai_control_plane_error", "run:ai control-plane error"),
         ("control plane", "control-plane", "admission", "reconcile", "runai-backend"),
     ),
     "workload_startup_image_failure": (

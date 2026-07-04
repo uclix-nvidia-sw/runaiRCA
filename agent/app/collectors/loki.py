@@ -68,7 +68,7 @@ class LokiCollector:
             # `error|fail|...|scheduler|queue|database` alternation matched almost
             # every control-plane log line, so this query returned rows for every
             # alert regardless of target and always steered ranking to
-            # control_plane_error. Keep it specific to real failures.
+            # runai_control_plane_error. Keep it specific to real failures.
             runai_error_query = (
                 f'{runai_selector} |~ '
                 '"(?i)(reconcile.*(error|fail)|admission.*(error|denied|reject)|'
@@ -81,7 +81,7 @@ class LokiCollector:
             # ("evicted", "preempted", "over quota for project X", "unschedulable").
             # Correlate the control-plane namespaces to THIS workload so those lines
             # surface — targeted by identifier, so it doesn't re-introduce the broad
-            # scrape that skewed every alert to control_plane_error.
+            # scrape that skewed every alert to runai_control_plane_error.
             correlation = _control_plane_correlation_term(target, plan)
             if correlation:
                 queries.append(

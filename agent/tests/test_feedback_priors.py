@@ -10,7 +10,7 @@ def _hint(sentiment: str = "", text: str = "", weight: float = 1.0) -> FeedbackH
 
 def test_downvote_mentioning_control_plane_downweights_family():
     priors = derive_priors([_hint("down", "the control plane was fine, not the cause")])
-    assert priors["control_plane_error"] < 1.0
+    assert priors["runai_control_plane_error"] < 1.0
 
 
 def test_upvote_upweights_family():
@@ -41,13 +41,13 @@ def test_malformed_hints_ignored():
     ]
     priors = derive_priors(hints)
     # only the third hint is usable; its bad weight defaults to 1.0
-    assert priors["control_plane_error"] < 1.0
+    assert priors["runai_control_plane_error"] < 1.0
 
 
 def test_accumulated_feedback_clamped():
     hints = [_hint("down", "control plane", weight=10.0) for _ in range(20)]
     priors = derive_priors(hints)
-    assert priors["control_plane_error"] >= 0.5  # clamp floor holds
+    assert priors["runai_control_plane_error"] >= 0.5  # clamp floor holds
 
 
 def test_dict_hints_supported():

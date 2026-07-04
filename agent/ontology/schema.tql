@@ -158,7 +158,8 @@ entity root_cause,
 # root-cause taxonomy — families as sub-types (see knowledge/troubleshooting_cases.md)
 entity node_kubelet_pressure sub root_cause;
 entity scheduling_quota_exhaustion sub root_cause;
-entity control_plane_error sub root_cause;
+entity runai_control_plane_error sub root_cause;  # Run:ai platform: runai-scheduler, runai-backend, cluster-sync
+entity k8s_control_plane_error sub root_cause;     # Kubernetes cluster: apiserver, etcd, kube-scheduler, kubelet certs, webhooks
 entity workload_startup_image_failure sub root_cause;
 entity insufficient_evidence sub root_cause;
 # NVIDIA XID GPU hardware faults (see knowledge/xid_catalog.yaml).
