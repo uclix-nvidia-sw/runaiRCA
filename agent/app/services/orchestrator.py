@@ -285,6 +285,17 @@ class AnalysisOrchestrator:
             "synthesis must wait for all collectors: "
             f"{len(results)} results for {len(self._collectors)} collectors"
         )
+        # Deterministic flowchart-driven follow-up: keep pulling k8s evidence based on
+        # what was found (Pending -> events/quota/pvc -> storageclass; CrashLoop/
+        # ImagePull -> events). Runs with OR without the LLM loop, so collection stays
+        # iterative even when litellm is down (the ReAct loop is skipped then).
+        try:
+            from app.collectors.kubernetes import k8s_followup
+
+            k8s_result = next((r for r in results if r.agent == "kubernetes"), None)
+            await k8s_followup(self._settings, k8s_result, target)
+        except Exception:  # noqa: BLE001 - follow-up is best-effort, never fail analysis
+            pass
         for r in results:
             _log.info(
                 "evidence: agent=%s status=%s confidence=%s — %s",
