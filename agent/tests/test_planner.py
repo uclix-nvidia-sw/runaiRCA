@@ -105,9 +105,9 @@ async def test_hypotheses_ordered_and_present() -> None:
     plan = await plan_investigation(settings, target, None, {}, [])
 
     families = [h["family"] for h in plan.hypotheses]
-    assert "scheduling_quota_exhaustion" in families
+    assert "runai_scheduling_quota" in families
     # pending/quota/queue signals should rank scheduling first
-    assert families[0] == "scheduling_quota_exhaustion"
+    assert families[0] == "runai_scheduling_quota"
 
 
 @pytest.mark.asyncio
@@ -131,7 +131,7 @@ async def test_user_workload_namespace_focuses_scheduler() -> None:
     target = _target(alert_name="SomeAlert", namespace="runai-test1")
     plan = await plan_investigation(settings, target, None, {}, [])
 
-    assert plan.hypotheses[0]["family"] == "scheduling_quota_exhaustion"
+    assert plan.hypotheses[0]["family"] == "runai_scheduling_quota"
     assert plan.check_control_plane is True
 
 

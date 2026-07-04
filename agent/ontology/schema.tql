@@ -157,10 +157,12 @@ entity root_cause,
 
 # root-cause taxonomy — families as sub-types (see knowledge/troubleshooting_cases.md)
 entity node_kubelet_pressure sub root_cause;
-entity scheduling_quota_exhaustion sub root_cause;
+entity runai_scheduling_quota sub root_cause;
+entity k8s_scheduling_error sub root_cause;       # kube-scheduler predicates: taint/affinity/topology/resourcequota
 entity runai_control_plane_error sub root_cause;  # Run:ai platform: runai-scheduler, runai-backend, cluster-sync
 entity k8s_control_plane_error sub root_cause;     # Kubernetes cluster: apiserver, etcd, kube-scheduler, kubelet certs, webhooks
-entity workload_startup_image_failure sub root_cause;
+entity workload_startup_error sub root_cause;
+entity image_pull_error sub root_cause;         # image/registry: pull, tag, auth, TLS, 5xx
 entity insufficient_evidence sub root_cause;
 # NVIDIA XID GPU hardware faults (see knowledge/xid_catalog.yaml).
 entity gpu_hardware_error sub root_cause;
@@ -175,7 +177,8 @@ entity expected_known_behavior sub root_cause;
 # span more layers than the original four generic families could name.
 entity network_fabric_error sub root_cause;    # NCCL/NVLink/IB/RDMA/Fabric Manager
 entity cluster_network_error sub root_cause;   # CNI/CoreDNS/pod networking
-entity storage_io_error sub root_cause;        # CSI/PVC/NFS/Ceph/disk-IO layer
+entity k8s_storage_error sub root_cause;        # CSI/PVC/NFS/Ceph/disk-IO layer
+entity storage_backend_error sub root_cause;   # backend storage health: NFS, Ceph, node filesystem
 entity workload_runtime_error sub root_cause;  # running-phase app faults (vs startup)
 entity platform_auth_error sub root_cause;     # login/permissions/SAML/OIDC/JWT, UI-API 401/403/503/500
 

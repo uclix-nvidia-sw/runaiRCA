@@ -24,10 +24,12 @@ from app.collectors.base import AnalysisTarget, CollectorResult
 # Families, ordered; insufficient_evidence is the explicit fallback (R6), not scored.
 FAMILIES = (
     "node_kubelet_pressure",
-    "scheduling_quota_exhaustion",
+    "runai_scheduling_quota",
+    "k8s_scheduling_error",
     "runai_control_plane_error",
     "k8s_control_plane_error",
-    "workload_startup_image_failure",
+    "workload_startup_error",
+    "image_pull_error",
 )
 INSUFFICIENT = "insufficient_evidence"
 
@@ -39,12 +41,22 @@ _FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
         ("diskpressure", "memorypressure", "pidpressure", "node pressure",
          "evict", "kubelet", "device plugin", "node condition"),
     ),
-    "scheduling_quota_exhaustion": (
+    "runai_scheduling_quota": (
         "prometheus",
         ("prometheus", "kubernetes", "runai"),
-        ("failedscheduling", "unschedulable", "insufficient", "preempt",
-         "reclaim", "pod group", "podgroup", "gang", "fairshare",
-         "saturat", "requested gpus", "quota", "pending"),
+        # Run:ai scheduler's OWN decisions: reclaim/preempt/over-quota/fairshare/
+        # gang. NOT the kube-scheduler predicates (those are k8s_scheduling_error).
+        ("preempt", "reclaim", "pod group", "podgroup", "gang", "fairshare",
+         "over-quota", "over quota", "requested gpus", "quota", "idleness"),
+    ),
+    "k8s_scheduling_error": (
+        "kubernetes",
+        ("kubernetes", "prometheus"),
+        # kube-scheduler predicate failures — placement the DEFAULT scheduler can't
+        # satisfy (taint/affinity/selector/topology/ResourceQuota admission).
+        ("failedscheduling", "unschedulable", "untolerated taint",
+         "node affinity/selector", "topology spread", "anti-affinity",
+         "exceeded quota", "default-scheduler", "0/"),
     ),
     "runai_control_plane_error": (
         "loki",
@@ -66,12 +78,22 @@ _FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
         ("apiserver", "kube-apiserver", "etcd", "etcdserver", "kube-controller-manager",
          "kubeadm", "leaderelection", "failed calling webhook", "admission webhook"),
     ),
-    "workload_startup_image_failure": (
+    "workload_startup_error": (
         "kubernetes",
         ("kubernetes", "loki"),
-        ("imagepullbackoff", "errimagepull", "crashloopbackoff", "oomkilled",
-         "failedmount", "createcontainer", "back-off", "importerror",
-         "permission denied", "registry"),
+        # The container's OWN startup/config/crash (NOT the image pull — that's
+        # image_pull_error): crashloop, OOM, config/mount/entrypoint, probe.
+        ("crashloopbackoff", "oomkilled", "failedmount", "createcontainer",
+         "back-off restarting", "startup probe", "runcontainererror",
+         "importerror", "permission denied"),
+    ),
+    "image_pull_error": (
+        "kubernetes",
+        ("kubernetes", "loki"),
+        # Getting the IMAGE onto the node: pull backoff, bad tag/manifest, registry
+        # auth/TLS/rate-limit/5xx. A registry problem, not the workload's code.
+        ("imagepullbackoff", "errimagepull", "errimageneverpull", "manifest for",
+         "toomanyrequests", "pull access denied", "no such host", "registry"),
     ),
 }
 
@@ -178,8 +200,8 @@ def _apply_bonuses(
     occurrence_count: int,
 ) -> None:
     node = scores["node_kubelet_pressure"]
-    startup = scores["workload_startup_image_failure"]
-    quota = scores["scheduling_quota_exhaustion"]
+    startup = scores["workload_startup_error"]
+    quota = scores["runai_scheduling_quota"]
     control = scores["runai_control_plane_error"]
 
     # R1: node pressure with blast radius across >=2 workloads on the node.

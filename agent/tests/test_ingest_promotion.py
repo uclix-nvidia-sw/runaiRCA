@@ -76,13 +76,13 @@ def test_derive_family_label_is_decisive() -> None:
         "node_kubelet_pressure"
     )
     assert ingest._derive_family("cause **workload startup/image failure** seen") == (
-        "workload_startup_image_failure"
+        "workload_startup_error"
     )
 
 
 def test_derive_family_keywords_need_two_hits_and_unique_winner() -> None:
     assert ingest._derive_family("pod ImagePullBackOff then CrashLoopBackOff") == (
-        "workload_startup_image_failure"
+        "workload_startup_error"
     )
     # one weak hit only -> ambiguous
     assert ingest._derive_family("pod was oomkilled") == ""

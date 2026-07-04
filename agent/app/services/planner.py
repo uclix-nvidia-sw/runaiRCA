@@ -46,8 +46,12 @@ _FAMILY_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("diskpressure", "memorypressure", "pidpressure", "kubelet", "node", "evict"),
     ),
     (
-        "scheduling_quota_exhaustion",
-        ("pending", "unschedul", "quota", "queue", "gpu", "preempt", "schedul"),
+        "runai_scheduling_quota",
+        ("quota", "queue", "preempt", "reclaim", "fairshare", "gang", "over-quota"),
+    ),
+    (
+        "k8s_scheduling_error",
+        ("failedscheduling", "unschedul", "taint", "affinity", "topology"),
     ),
     (
         "runai_control_plane_error",
@@ -58,17 +62,23 @@ _FAMILY_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("apiserver", "etcd", "kubeadm", "leaderelection", "webhook", "kube-controller"),
     ),
     (
-        "workload_startup_image_failure",
-        ("imagepull", "crashloop", "oom", "createcontainer", "startup", "image"),
+        "workload_startup_error",
+        ("crashloop", "oom", "createcontainer", "startup probe", "runcontainer"),
+    ),
+    (
+        "image_pull_error",
+        ("imagepull", "errimagepull", "image", "registry", "manifest"),
     ),
 )
 
 _FAMILY_REASON = {
     "node_kubelet_pressure": "alert points at node/kubelet resource pressure",
-    "scheduling_quota_exhaustion": "alert points at scheduling or GPU-quota exhaustion",
+    "runai_scheduling_quota": "alert points at Run:ai scheduling / GPU quota (preempt/reclaim)",
+    "k8s_scheduling_error": "alert points at kube-scheduler placement (taint/affinity/quota)",
     "runai_control_plane_error": "alert implicates the Run:ai platform control plane",
     "k8s_control_plane_error": "alert implicates the Kubernetes cluster control plane",
-    "workload_startup_image_failure": "alert points at a workload-local startup/image fault",
+    "workload_startup_error": "alert points at a workload-local startup/config/crash fault",
+    "image_pull_error": "alert points at an image pull / registry failure",
 }
 
 
@@ -122,7 +132,7 @@ _SCOPE_LEAD: dict[str, tuple[tuple[str, ...], str]] = {
         "and node/system evidence broadly, not just the workload",
     ),
     "workload": (
-        ("scheduling_quota_exhaustion", "workload_startup_image_failure"),
+        ("runai_scheduling_quota", "workload_startup_error"),
         "user workload inside the Run:ai platform — focus on the Run:ai scheduler and "
         "the workload's scheduling/quota/startup",
     ),

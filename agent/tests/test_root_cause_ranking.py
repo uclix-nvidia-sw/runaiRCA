@@ -44,16 +44,27 @@ def test_r2_quota_exhaustion_wins() -> None:
         _r("loki", summary="logs nominal"),
     ]
     ranked = rank_root_cause_candidates(_target(), results)
-    assert ranked[0].family == "scheduling_quota_exhaustion"
+    assert ranked[0].family == "runai_scheduling_quota"
 
 
 def test_r4_startup_failure_when_control_plane_quiet() -> None:
+    # a pure container-startup crash (no image-pull signal) ranks workload_startup_error
     results = [
-        _r("kubernetes", summary="container waiting ImagePullBackOff; pod CrashLoopBackOff"),
-        _r("loki", summary="workload log ErrImagePull from registry"),
+        _r("kubernetes", summary="pod CrashLoopBackOff; back-off restarting failed container"),
+        _r("loki", summary="workload log: oomkilled at startup, exit 137"),
     ]
     ranked = rank_root_cause_candidates(_target(), results)
-    assert ranked[0].family == "workload_startup_image_failure"
+    assert ranked[0].family == "workload_startup_error"
+
+
+def test_image_pull_ranks_separately_from_startup() -> None:
+    # the split: an image-pull failure is image_pull_error, not workload_startup_error
+    results = [
+        _r("kubernetes", summary="container waiting ImagePullBackOff; ErrImagePull"),
+        _r("loki", summary="pull access denied from registry, manifest for tag not found"),
+    ]
+    ranked = rank_root_cause_candidates(_target(), results)
+    assert ranked[0].family == "image_pull_error"
 
 
 def test_r3_control_plane_error_wins_on_backend_reconcile_error() -> None:

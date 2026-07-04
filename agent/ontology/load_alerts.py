@@ -32,9 +32,9 @@ ALERTS_FILE = Path(os.getenv("RUNAI_ALERTS_FILE", "knowledge/runai_alerts_catalo
 # Must match the root_cause subtypes in schema.tql.
 FAMILIES = {
     "node_kubelet_pressure",
-    "scheduling_quota_exhaustion",
+    "runai_scheduling_quota",
     "runai_control_plane_error",
-    "workload_startup_image_failure",
+    "workload_startup_error",
     "gpu_hardware_error",
 }
 
