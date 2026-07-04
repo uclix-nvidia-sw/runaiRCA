@@ -140,9 +140,11 @@ backend:
     maxConcurrentAgentRuns: 50
     # How long (minutes) an alert signature can be QUIET before a recurrence is
     # treated as a NEW incident instead of another occurrence of the flapping one.
-    # 30 was too tight — alerts that recur every few hours each spawned a fresh row.
-    # Raise to cover your alerts' recurrence gap (e.g. 360 for a 6h cadence).
-    flappingGroupWindowMinutes: 120
+    # 30 was too tight — a real recurring alert here (node-exporter memory page
+    # faults) fired every ~2h with quiet gaps up to 6h, so each firing spawned a
+    # fresh incident. 360 (6h) covers that observed cadence; lower it if you'd
+    # rather keep distinct episodes separate, raise it for longer-cycle alerts.
+    flappingGroupWindowMinutes: 360
     # Backfill: periodically re-drive alerts left without a completed RCA (dropped by
     # the caps, or a prior failed run). Pauses while the agent is unhealthy.
     # intervalSeconds: 0 disables it.
