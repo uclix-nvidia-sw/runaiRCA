@@ -189,6 +189,22 @@ backend:
   extraEnv: []
   resources: {}
 
+# Optional Run:ai MCP sidecar. When enabled, the agent gathers Run:ai evidence
+# through the runai-mcp server (426 APIs, spec-aware) instead of the fixed curls.
+# runai-mcp is stdio-only, so this runs it behind mcp-proxy (streamable HTTP) as a
+# sidecar in the agent pod; build the image from ./runai-mcp/Dockerfile. Auth reuses
+# the runai-rca secret's runaiClientId/runaiClientSecret. Off by default.
+runaiMcp:
+  enabled: false
+  image:
+    repository: ""          # e.g. your-registry/runai-mcp  (build ./runai-mcp/Dockerfile)
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  port: 8809
+  # Override if your mcp-proxy version needs different flags/endpoint.
+  command: []
+  resources: {}
+
 agent:
   replicaCount: 1
   image:
