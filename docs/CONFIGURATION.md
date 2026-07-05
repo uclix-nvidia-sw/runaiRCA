@@ -13,8 +13,8 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | --- | --- |
 | `PORT` | Backend/Agent HTTP port; Helm maps this from the component service port |
 | `AGENT_URL` | Backend to Agent URL, default `http://localhost:8000` |
-| `AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for Agent `/analyze` and `/chat` requests, default `180` |
-| `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for operator-triggered Agent `/analyze` requests, default `900` |
+| `AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for Agent `/analyze` and `/chat` requests, default `1560` (must exceed the agent's `ANALYSIS_DEADLINE_SECONDS`) |
+| `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for operator-triggered Agent `/analyze` requests, default `1560` |
 | `LOG_LEVEL` | Agent log level, default `info` |
 | `LANGUAGE` | Backend/Agent response language, `en` or `ko` |
 | `KUBERNETES_API_URL` | In-cluster Kubernetes API URL, default `https://kubernetes.default.svc` |
@@ -54,10 +54,16 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `LLM_BASE_URL` | OpenAI-compatible base URL for the LiteLLM NAT workflow and the operator chat copilot |
 | `LLM_MODEL` | OpenAI-compatible model name, for example `auto-router` |
 | `LLM_API_KEY` | OpenAI-compatible API key secret; enables conversational chat answers when all three LLM vars are set |
-| `LLM_REQUEST_TIMEOUT_SECONDS` | LiteLLM request timeout used in the materialized NAT config, default `120` |
+| `LLM_REQUEST_TIMEOUT_SECONDS` | LLM request timeout per call (chat, reasoning, and the materialized NAT config), default `300`, `0` = unlimited |
 | `ENABLE_NAT_RUNTIME` | Run RCA synthesis through the NeMo Agent Toolkit CLI instead of the deterministic in-process fallback, default `false` |
 | `NAT_CONFIG_FILE` | Optional NeMo workflow config path, default `configs/runai_rca_workflow.yml` |
 | `NAT_TIMEOUT_SECONDS` | NeMo Agent Toolkit CLI execution timeout |
+| `ENABLE_INVESTIGATION_LOOP` | Central LLM investigation loop: plan → probe the most relevant agents → observe → re-plan, default `false` (Helm sets `true`) |
+| `MAX_INVESTIGATION_STEPS` | Max central investigation steps per analysis, default `12` |
+| `MAX_REANALYSIS_STEPS` | Investigation budget for the one re-analysis pass after a refuted top cause, default `6` |
+| `ENABLE_AGENT_DRILLDOWN` | Per-collector autonomous drill-down: each evidence agent (kubernetes/prometheus/loki/runai) runs its own bounded LLM loop with only its domain's read-only tools, default `false` (Helm sets `true`) |
+| `DRILLDOWN_MAX_STEPS` | Max drill-down steps per evidence agent, default `4` |
+| `ANALYSIS_DEADLINE_SECONDS` | Overall hard cap per analysis (graceful degraded report on overrun), default `1500` (25 min), `0` = no cap. Keep the backend `AGENT_REQUEST_TIMEOUT_SECONDS` above this. |
 
 The Helm chart does not expose Loki credential values because the default
 deployment is expected to query Loki through the in-cluster read/query service.

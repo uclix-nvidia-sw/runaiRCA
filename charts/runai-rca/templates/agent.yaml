@@ -99,6 +99,10 @@ spec:
               value: {{ .Values.agent.env.maxInvestigationSteps | quote }}
             - name: MAX_REANALYSIS_STEPS
               value: {{ .Values.agent.env.maxReanalysisSteps | quote }}
+            - name: ENABLE_AGENT_DRILLDOWN
+              value: {{ .Values.agent.env.enableAgentDrilldown | quote }}
+            - name: DRILLDOWN_MAX_STEPS
+              value: {{ .Values.agent.env.drilldownMaxSteps | quote }}
             - name: ANALYSIS_DEADLINE_SECONDS
               value: {{ .Values.agent.env.analysisDeadlineSeconds | quote }}
             - name: RUNAI_BASE_URL

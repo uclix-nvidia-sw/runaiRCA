@@ -179,7 +179,7 @@ class AnalysisOrchestrator:
 
         Per-step ceilings (collectors, LLM, NAT) are generous so agents gather deep
         evidence and think; this wrapper guarantees the whole run still finishes
-        within `analysis_deadline_seconds` (default 20 min / 1200s), returning a
+        within `analysis_deadline_seconds` (default 25 min / 1500s), returning a
         graceful degraded report if it overruns rather than hanging."""
         deadline = self._settings.analysis_deadline_seconds
         if not deadline or deadline <= 0:
@@ -299,6 +299,15 @@ class AnalysisOrchestrator:
             # Cross-collector: k8s findings (OOM/restart/Pending) -> derived PromQL.
             await prometheus_followup(self._settings, prom_result, k8s_result, target)
         except Exception:  # noqa: BLE001 - follow-up is best-effort, never fail analysis
+            pass
+        # Per-collector autonomous drill-down (LLM-gated): each domain agent runs a
+        # bounded LLM loop with ONLY its domain's read-only tools to deepen its own
+        # evidence (services/drilldown.py). Best-effort, never fails analysis.
+        try:
+            from app.services.drilldown import run_drilldowns
+
+            await run_drilldowns(self._settings, results, target, plan)
+        except Exception:  # noqa: BLE001 - drill-down is best-effort
             pass
         for r in results:
             _log.info(

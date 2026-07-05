@@ -90,6 +90,8 @@ def make_settings() -> Settings:
         enable_investigation_loop=False,
         max_investigation_steps=4,
         max_reanalysis_steps=2,
+        enable_agent_drilldown=False,
+        drilldown_max_steps=4,
         analysis_deadline_seconds=300,
     )
 

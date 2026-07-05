@@ -133,11 +133,11 @@ backend:
     agentUrl: ""
     language: ko
     databaseConnectTimeoutSeconds: 5
-    # MUST exceed the agent's analysisDeadlineSeconds (1200): the agent works up to
+    # MUST exceed the agent's analysisDeadlineSeconds (1500): the agent works up to
     # that budget and then returns a graceful degraded report — if the backend hangs
     # up first, the report is lost and the alert gets a useless fallback instead.
-    agentRequestTimeoutSeconds: 1260
-    manualAgentRequestTimeoutSeconds: 1260
+    agentRequestTimeoutSeconds: 1560
+    manualAgentRequestTimeoutSeconds: 1560
     # Max analyses started per webhook and per 1-minute window. Raise if bursts of
     # alerts get dropped without a report; ultimately bounded by the agent's capacity.
     maxAutoAnalyzeFanout: 50
@@ -248,9 +248,15 @@ agent:
     maxInvestigationSteps: 12
     # Re-analysis (after a refuted top cause) gets its own investigation budget.
     maxReanalysisSteps: 6
+    # Per-collector autonomous drill-down: each evidence agent (kubernetes /
+    # prometheus / loki / runai) runs its own bounded LLM loop with ONLY its
+    # domain's read-only tools to deepen its own evidence. Only active when an
+    # LLM is configured; each step is extra LLM calls (accuracy over latency).
+    enableAgentDrilldown: true
+    drilldownMaxSteps: 4
     # Overall hard cap per analysis: generous per-step time, but the whole run always
-    # finishes within this budget (default 20 min). 0 = no overall cap.
-    analysisDeadlineSeconds: 1200
+    # finishes within this budget (default 25 min). 0 = no overall cap.
+    analysisDeadlineSeconds: 1500
     runaiBaseUrl: ""
     runaiTokenUrl: ""
     runaiWorkloadsPath: /api/v1/workloads

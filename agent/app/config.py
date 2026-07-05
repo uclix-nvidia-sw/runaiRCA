@@ -124,6 +124,8 @@ class Settings:
     enable_investigation_loop: bool
     max_investigation_steps: int
     max_reanalysis_steps: int
+    enable_agent_drilldown: bool
+    drilldown_max_steps: int
     analysis_deadline_seconds: int
 
 
@@ -237,7 +239,14 @@ def load_settings() -> Settings:
         # Re-analysis (after the first top cause is refuted) gets a generous
         # investigation budget of its own — accuracy over speed.
         max_reanalysis_steps=max(1, _int_env("MAX_REANALYSIS_STEPS", 6)),
+        # Per-collector autonomous drill-down: each evidence agent gets its own LLM
+        # loop with ONLY its domain's read-only tools (see services/drilldown.py).
+        # LLM-gated and best-effort like the investigation loop.
+        enable_agent_drilldown=_bool_env("ENABLE_AGENT_DRILLDOWN", False),
+        drilldown_max_steps=max(1, _int_env("DRILLDOWN_MAX_STEPS", 4)),
         # Overall hard cap on one analysis: agents get generous per-step time above,
         # but the whole run always finishes within this budget. (0 = no overall cap.)
-        analysis_deadline_seconds=max(0, _int_env("ANALYSIS_DEADLINE_SECONDS", 1200)),
+        # Owner priority is accuracy over latency; the backend's
+        # AGENT_REQUEST_TIMEOUT_SECONDS must stay above this (deadline + 60s).
+        analysis_deadline_seconds=max(0, _int_env("ANALYSIS_DEADLINE_SECONDS", 1500)),
     )
