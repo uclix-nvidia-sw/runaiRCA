@@ -17,7 +17,7 @@ from app.collectors.base import CollectorResult
 from app.collectors.http_json import JsonResponse
 from app.plan import InvestigationPlan
 from app.services import investigator
-from tests.test_orchestrator import make_settings
+from tests.test_orchestrator import make_settings, make_target
 
 
 def test_resolve_read_kind_aliases_and_refusals() -> None:
@@ -118,3 +118,46 @@ async def test_investigator_runs_queries_and_attaches_artifacts(monkeypatch) -> 
     assert "pvc" in (ok.query or "")
     refused = next(a for a in adhoc if a.status == "unavailable")
     assert "allowlist" in refused.summary
+
+
+def test_flowchart_followup_pending_pod_pulls_events_quota_pvc(monkeypatch) -> None:
+    # Deterministic flowchart: a Pending pod must trigger follow-up reads of
+    # events -> resourcequotas -> persistentvolumeclaims (independent of the LLM).
+    reads: list[str] = []
+
+    async def fake_k8s_read(settings, kind, namespace="", name="", label_selector=""):
+        reads.append(kind)
+        data = {"items": []}
+        if kind == "persistentvolumeclaims":
+            data = {"items": [{"status": {"phase": "Pending"}}]}  # unbound -> chains to SC
+        return {"kind": k8s.resolve_read_kind(kind), "namespace": namespace,
+                "status_code": 200, "error": None, "data": data}
+
+    monkeypatch.setattr(k8s, "k8s_read", fake_k8s_read)
+    result = CollectorResult(
+        agent="kubernetes", status="ok", summary="k8s", confidence="medium",
+        details={"pod_statuses": [{"name": "p", "phase": "Pending"}]},
+    )
+    target = replace(make_target(), namespace="team-a")
+    asyncio.run(k8s.k8s_followup(make_settings(), result, target))
+
+    assert "events" in reads and "resourcequotas" in reads
+    assert "persistentvolumeclaims" in reads
+    # chained: an unbound PVC pulls the storageclass provisioner next
+    assert "storageclasses" in reads
+    # each read is attached as a followup_query artifact
+    assert any(a.type == "followup_query" for a in result.artifacts)
+
+
+def test_flowchart_followup_noop_when_healthy(monkeypatch) -> None:
+    async def boom(*a, **k):  # pragma: no cover - must not be called
+        raise AssertionError("no follow-up expected for a healthy Running pod")
+
+    monkeypatch.setattr(k8s, "k8s_read", boom)
+    result = CollectorResult(
+        agent="kubernetes", status="ok", summary="ok", confidence="medium",
+        details={"pod_statuses": [{"name": "p", "phase": "Running"}], "container_diagnostics": []},
+    )
+    target = replace(make_target(), namespace="team-a")
+    out = asyncio.run(k8s.k8s_followup(make_settings(), result, target))
+    assert out == []

@@ -24,9 +24,12 @@ from app.collectors.base import AnalysisTarget, CollectorResult
 # Families, ordered; insufficient_evidence is the explicit fallback (R6), not scored.
 FAMILIES = (
     "node_kubelet_pressure",
-    "scheduling_quota_exhaustion",
-    "control_plane_error",
-    "workload_startup_image_failure",
+    "runai_scheduling_quota",
+    "k8s_scheduling_error",
+    "runai_control_plane_error",
+    "k8s_control_plane_error",
+    "workload_startup_error",
+    "image_pull_error",
 )
 INSUFFICIENT = "insufficient_evidence"
 
@@ -38,27 +41,59 @@ _FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
         ("diskpressure", "memorypressure", "pidpressure", "node pressure",
          "evict", "kubelet", "device plugin", "node condition"),
     ),
-    "scheduling_quota_exhaustion": (
+    "runai_scheduling_quota": (
         "prometheus",
         ("prometheus", "kubernetes", "runai"),
-        ("failedscheduling", "unschedulable", "insufficient", "preempt",
-         "saturat", "requested gpus", "quota", "pending"),
+        # Run:ai scheduler's OWN decisions: reclaim/preempt/over-quota/fairshare/
+        # gang. NOT the kube-scheduler predicates (those are k8s_scheduling_error).
+        ("preempt", "reclaim", "pod group", "podgroup", "gang", "fairshare",
+         "over-quota", "over quota", "requested gpus", "quota", "idleness"),
     ),
-    "control_plane_error": (
+    "k8s_scheduling_error": (
+        "kubernetes",
+        ("kubernetes", "prometheus"),
+        # kube-scheduler predicate failures — placement the DEFAULT scheduler can't
+        # satisfy (taint/affinity/selector/topology/ResourceQuota admission).
+        ("failedscheduling", "unschedulable", "untolerated taint",
+         "node affinity/selector", "topology spread", "anti-affinity",
+         "exceeded quota", "default-scheduler", "0/"),
+    ),
+    "runai_control_plane_error": (
         "loki",
         ("loki", "kubernetes"),
-        # NOTE: no bare "scheduler" — it matches the `runai-scheduler` pod name in
-        # every Run:ai log stream label, which falsely elevated this family for
-        # unrelated alerts. Keep phrases that only appear in real control-plane errors.
-        ("reconcile", "admission", "runai-backend",
-         "control plane", "control-plane", "authorization", "database error"),
+        # Run:ai PLATFORM control plane only. No bare "scheduler" (matches the
+        # runai-scheduler pod name in every stream) and no bare "control plane"/
+        # "control-plane" — those coarse tokens over-routed unrelated alerts here.
+        # Keep Run:ai-subsystem-specific phrases so a k8s apiserver/etcd fault lands
+        # in k8s_control_plane_error, not here.
+        ("reconcile", "runai-backend", "cluster-sync",
+         "authorization", "database error"),
     ),
-    "workload_startup_image_failure": (
+    "k8s_control_plane_error": (
         "kubernetes",
         ("kubernetes", "loki"),
-        ("imagepullbackoff", "errimagepull", "crashloopbackoff", "oomkilled",
-         "failedmount", "createcontainer", "back-off", "importerror",
-         "permission denied", "registry"),
+        # The Kubernetes cluster's OWN control plane — apiserver/etcd/kube-scheduler/
+        # controller-manager/kubelet certs/admission webhooks. Distinct subsystem
+        # from the Run:ai platform control plane above.
+        ("apiserver", "kube-apiserver", "etcd", "etcdserver", "kube-controller-manager",
+         "kubeadm", "leaderelection", "failed calling webhook", "admission webhook"),
+    ),
+    "workload_startup_error": (
+        "kubernetes",
+        ("kubernetes", "loki"),
+        # The container's OWN startup/config/crash (NOT the image pull — that's
+        # image_pull_error): crashloop, OOM, config/mount/entrypoint, probe.
+        ("crashloopbackoff", "oomkilled", "failedmount", "createcontainer",
+         "back-off restarting", "startup probe", "runcontainererror",
+         "importerror", "permission denied"),
+    ),
+    "image_pull_error": (
+        "kubernetes",
+        ("kubernetes", "loki"),
+        # Getting the IMAGE onto the node: pull backoff, bad tag/manifest, registry
+        # auth/TLS/rate-limit/5xx. A registry problem, not the workload's code.
+        ("imagepullbackoff", "errimagepull", "errimageneverpull", "manifest for",
+         "toomanyrequests", "pull access denied", "no such host", "registry"),
     ),
 }
 
@@ -165,9 +200,9 @@ def _apply_bonuses(
     occurrence_count: int,
 ) -> None:
     node = scores["node_kubelet_pressure"]
-    startup = scores["workload_startup_image_failure"]
-    quota = scores["scheduling_quota_exhaustion"]
-    control = scores["control_plane_error"]
+    startup = scores["workload_startup_error"]
+    quota = scores["runai_scheduling_quota"]
+    control = scores["runai_control_plane_error"]
 
     # R1: node pressure with blast radius across >=2 workloads on the node.
     if node.points > 0 and blast >= 2:

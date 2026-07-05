@@ -113,6 +113,8 @@ spec:
               value: {{ .Values.agent.env.runaiQueuesPath | quote }}
             - name: RUNAI_VERSION_PATH
               value: {{ .Values.agent.env.runaiVersionPath | quote }}
+            - name: RUNAI_MCP_URL
+              value: {{ if .Values.runaiMcp.enabled }}{{ printf "http://localhost:%v/mcp" .Values.runaiMcp.port | quote }}{{ else }}""{{ end }}
             - name: RUNAI_TIMEOUT_SECONDS
               value: {{ .Values.agent.env.runaiTimeoutSeconds | quote }}
             - name: RUNAI_LOG_NAMESPACES
@@ -225,6 +227,43 @@ spec:
           {{- end }}
           resources:
             {{- toYaml .Values.agent.resources | nindent 12 }}
+        {{- if .Values.runaiMcp.enabled }}
+        # Run:ai MCP sidecar: runs the stdio runai-mcp server behind mcp-proxy so the
+        # agent reaches it over http://localhost:{{ .Values.runaiMcp.port }}/mcp.
+        - name: runai-mcp
+          image: {{ printf "%s:%s" .Values.runaiMcp.image.repository .Values.runaiMcp.image.tag | quote }}
+          imagePullPolicy: {{ .Values.runaiMcp.image.pullPolicy }}
+          {{- with $securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.runaiMcp.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: mcp
+              containerPort: {{ .Values.runaiMcp.port }}
+          env:
+            - name: RUNAI_API_BASE_URL
+              value: {{ .Values.agent.env.runaiBaseUrl | quote }}
+            - name: RUNAI_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "runai-rca.secretName" . }}
+                  key: {{ .Values.secrets.keys.runaiClientId | quote }}
+                  optional: true
+            - name: RUNAI_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "runai-rca.secretName" . }}
+                  key: {{ .Values.secrets.keys.runaiClientSecret | quote }}
+                  optional: true
+          {{- with .Values.runaiMcp.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
       {{- with $nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

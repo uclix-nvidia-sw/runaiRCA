@@ -86,12 +86,12 @@ def _install_stubs(
         if call == 0:
             summaries = {
                 "kubernetes": "Node condition DiskPressure=True; kubelet evicting pods",
-                "prometheus": "pending pods observed",
+                "prometheus": "requested gpus exceed allocated gpus",
             }
         else:
             summaries = {
                 "kubernetes": "no further node findings",
-                "prometheus": "unschedulable: insufficient gpu quota; pods pending, preempt",
+                "prometheus": "runai reclaimed over-quota gpus; gang pod group preempt",
             }
         return [
             CollectorResult(
@@ -139,16 +139,16 @@ async def test_refuted_top_cause_triggers_exactly_one_reanalysis(monkeypatch) ->
     assert investigate_calls[1] == 2  # min(2, max_investigation_steps=4)
     assert len(refute_calls) == 2
     assert refute_calls[0] == "node_kubelet_pressure"
-    assert refute_calls[1] == "scheduling_quota_exhaustion"
+    assert refute_calls[1] == "runai_scheduling_quota"
     # The report shows it thought again.
     assert "## Self-Check" in response.analysis_detail
     assert (
         "The initial conclusion (node_kubelet_pressure) was refuted" in response.analysis_detail
     )
-    assert "revised conclusion: scheduling_quota_exhaustion" in response.analysis_detail
+    assert "revised conclusion: runai_scheduling_quota" in response.analysis_detail
     # The merged re-analysis evidence drives the final ranking.
     top = response.context["root_cause_candidates"][0]
-    assert top["family"] == "scheduling_quota_exhaustion"
+    assert top["family"] == "runai_scheduling_quota"
     # Not refuted anymore -> no operator questions section.
     assert "## Questions for the Operator" not in response.analysis_detail
 

@@ -20,15 +20,15 @@ _FAMILY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "node pressure", "kubelet", "disk pressure", "diskpressure",
         "memory pressure", "memorypressure", "eviction", "evict", "node",
     ),
-    "scheduling_quota_exhaustion": (
+    "runai_scheduling_quota": (
         "scheduling", "unschedulable", "quota", "preempt", "pending",
         "insufficient gpu", "gpu quota", "capacity", "saturat",
     ),
-    "control_plane_error": (
+    "runai_control_plane_error": (
         "control plane", "control-plane", "reconcile", "admission",
         "runai-backend", "backend", "authorization", "database",
     ),
-    "workload_startup_image_failure": (
+    "workload_startup_error": (
         "image pull", "imagepull", "crashloop", "oomkill", "startup",
         "container", "registry", "image", "mount",
     ),

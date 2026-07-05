@@ -77,6 +77,8 @@ spec:
               value: {{ .Values.backend.env.maxAutoAnalyzeFanout | quote }}
             - name: MAX_CONCURRENT_AGENT_RUNS
               value: {{ .Values.backend.env.maxConcurrentAgentRuns | quote }}
+            - name: FLAPPING_GROUP_WINDOW_MINUTES
+              value: {{ .Values.backend.env.flappingGroupWindowMinutes | quote }}
             - name: ANALYSIS_BACKFILL_INTERVAL_SECONDS
               value: {{ .Values.backend.env.analysisBackfillIntervalSeconds | quote }}
             - name: ANALYSIS_BACKFILL_BATCH

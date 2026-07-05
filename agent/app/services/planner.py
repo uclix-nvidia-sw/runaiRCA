@@ -46,24 +46,39 @@ _FAMILY_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("diskpressure", "memorypressure", "pidpressure", "kubelet", "node", "evict"),
     ),
     (
-        "scheduling_quota_exhaustion",
-        ("pending", "unschedul", "quota", "queue", "gpu", "preempt", "schedul"),
+        "runai_scheduling_quota",
+        ("quota", "queue", "preempt", "reclaim", "fairshare", "gang", "over-quota"),
     ),
     (
-        "control_plane_error",
-        ("reconcile", "admission", "runai-backend", "control", "authorization"),
+        "k8s_scheduling_error",
+        ("failedscheduling", "unschedul", "taint", "affinity", "topology"),
     ),
     (
-        "workload_startup_image_failure",
-        ("imagepull", "crashloop", "oom", "createcontainer", "startup", "image"),
+        "runai_control_plane_error",
+        ("reconcile", "runai-backend", "cluster-sync", "authorization"),
+    ),
+    (
+        "k8s_control_plane_error",
+        ("apiserver", "etcd", "kubeadm", "leaderelection", "webhook", "kube-controller"),
+    ),
+    (
+        "workload_startup_error",
+        ("crashloop", "oom", "createcontainer", "startup probe", "runcontainer"),
+    ),
+    (
+        "image_pull_error",
+        ("imagepull", "errimagepull", "image", "registry", "manifest"),
     ),
 )
 
 _FAMILY_REASON = {
     "node_kubelet_pressure": "alert points at node/kubelet resource pressure",
-    "scheduling_quota_exhaustion": "alert points at scheduling or GPU-quota exhaustion",
-    "control_plane_error": "alert implicates the Run:ai control plane",
-    "workload_startup_image_failure": "alert points at a workload-local startup/image fault",
+    "runai_scheduling_quota": "alert points at Run:ai scheduling / GPU quota (preempt/reclaim)",
+    "k8s_scheduling_error": "alert points at kube-scheduler placement (taint/affinity/quota)",
+    "runai_control_plane_error": "alert implicates the Run:ai platform control plane",
+    "k8s_control_plane_error": "alert implicates the Kubernetes cluster control plane",
+    "workload_startup_error": "alert points at a workload-local startup/config/crash fault",
+    "image_pull_error": "alert points at an image pull / registry failure",
 }
 
 
@@ -112,12 +127,12 @@ def _namespace_scope(target: AnalysisTarget, settings: Settings) -> str:
 # scope -> (families to lead the hypotheses with, the reason tag)
 _SCOPE_LEAD: dict[str, tuple[tuple[str, ...], str]] = {
     "platform": (
-        ("control_plane_error", "node_kubelet_pressure"),
+        ("runai_control_plane_error", "node_kubelet_pressure"),
         "Run:ai platform namespace — the control plane itself; investigate Kubernetes "
         "and node/system evidence broadly, not just the workload",
     ),
     "workload": (
-        ("scheduling_quota_exhaustion", "workload_startup_image_failure"),
+        ("runai_scheduling_quota", "workload_startup_error"),
         "user workload inside the Run:ai platform — focus on the Run:ai scheduler and "
         "the workload's scheduling/quota/startup",
     ),
@@ -138,7 +153,13 @@ def _promote_families(
     return lead + rest
 
 
-def _ordered_hypotheses(target: AnalysisTarget) -> list[dict[str, str]]:
+def _ordered_hypotheses(target: AnalysisTarget) -> tuple[list[dict[str, str]], bool]:
+    """Ranked families + whether ANY family actually matched a keyword.
+
+    The bool matters: on a 0-0-0-0 tie the declaration-order tiebreak would make
+    node_kubelet_pressure the "top" hypothesis for an alert that gave no signal at
+    all (e.g. PrometheusMissingRuleEvaluations). The caller uses the flag to avoid
+    fabricating a confident "most likely X" out of the tiebreak."""
     haystack = " ".join(
         [target.alert_name or "", target.workload_name or "", target.workload_type or ""]
     ).lower()
@@ -150,9 +171,10 @@ def _ordered_hypotheses(target: AnalysisTarget) -> list[dict[str, str]]:
     # (enumerate index) so a 0-0 tie stays deterministic.
     scored_indexed = [(hits, -i, fam) for i, (hits, fam) in enumerate(scored)]
     scored_indexed.sort(reverse=True)
-    return [
+    hypotheses = [
         {"family": fam, "reason": _FAMILY_REASON[fam]} for _, _, fam in scored_indexed
     ]
+    return hypotheses, any(hits for hits, _ in scored)
 
 
 def _node_first_hypotheses(
@@ -230,7 +252,7 @@ async def plan_investigation(
             if ns and ns not in namespaces:
                 namespaces.append(ns)
 
-    hypotheses = _ordered_hypotheses(target)
+    hypotheses, keyword_signal = _ordered_hypotheses(target)
     # Namespace decides the emphasis: a Run:ai platform namespace (runai/runai-backend)
     # means the control plane itself is unhealthy -> lead control-plane + node/system
     # broadly; a user workload namespace inside Run:ai -> lead the scheduler/scheduling.
@@ -264,12 +286,34 @@ async def plan_investigation(
     else:
         strategy = "breadth_first"
 
-    top_family = hypotheses[0]["family"] if hypotheses else "insufficient_evidence"
-    focus = (
-        f"{target.alert_name or 'alert'} on "
-        f"{target.workload_name or target.pod or target.namespace or 'the cluster'} "
-        f"— most likely {top_family.replace('_', ' ')}"
+    # Did anything actually EARN the leading hypothesis, or is it just the
+    # declaration-order tiebreak? A namespace scope, a documented alert, a
+    # node-level alert, or a keyword hit all count as real signal.
+    leader_earned = (
+        keyword_signal
+        or bool(matched_alert)
+        or scope in _SCOPE_LEAD
+        or node_focused
     )
+    where = target.workload_name or target.pod or target.namespace or "the cluster"
+    if not leader_earned:
+        # No signal at all: don't let node_kubelet_pressure masquerade as the
+        # top cause. Rank from live collector evidence instead of the tiebreak.
+        hypotheses = [
+            {
+                "family": "insufficient_evidence",
+                "reason": "no alert/namespace/keyword signal — rank from collector evidence",
+            }
+        ] + hypotheses
+        focus = (
+            f"{target.alert_name or 'alert'} on {where} "
+            "— no strong family signal; breadth-first"
+        )
+    else:
+        focus = (
+            f"{target.alert_name or 'alert'} on {where} "
+            f"— most likely {hypotheses[0]['family'].replace('_', ' ')}"
+        )
 
     if strategy == "targeted":
         matched: list[str] = []
@@ -383,6 +427,11 @@ async def _llm_refine(
         "strategy breadth_first and describe HOW to approach. Do not force-fit a prior "
         "incident. Keys: focus (str), hypotheses (list of {family, reason}), strategy "
         "('targeted' or 'breadth_first'), narrative (str). "
+        "You may WIDEN the search when your re-reasoning calls for it — you can never "
+        "narrow it below what the deterministic router already chose. Optional key "
+        "check_control_plane (bool): set true to ALSO read Run:ai control-plane "
+        "logs/pods (runai, runai-backend) when your leading hypothesis points at the "
+        "platform / scheduler / backend. "
         "Respect the investigation scope: 'platform' = a Run:ai platform namespace (the "
         "control plane itself) — investigate Kubernetes and node/system evidence "
         "broadly; 'workload' = a user workload running inside Run:ai — focus on the "
@@ -416,13 +465,26 @@ async def _llm_refine(
     narrative = data.get("narrative")
     hypotheses = _coerce_hypotheses(data.get("hypotheses"))
 
+    # Scope may only WIDEN, never narrow: when the LLM re-reasons the cause toward the
+    # platform, it can turn control-plane reading ON, but it cannot switch off evidence
+    # the deterministic router already required. This keeps "what's the cause" and
+    # "where to look" moving together while the deterministic floor stays intact.
+    check_control_plane = plan.check_control_plane or data.get("check_control_plane") is True
+    namespaces = list(plan.namespaces)
+    if check_control_plane and not plan.check_control_plane:
+        # Newly widened by the LLM — mirror the deterministic control-plane sweep so the
+        # control-plane namespaces are actually read (collectors also gate on the flag).
+        for ns in settings.runai_log_namespaces:
+            if ns and ns not in namespaces:
+                namespaces.append(ns)
+
     return InvestigationPlan(
         focus=focus if isinstance(focus, str) and focus.strip() else plan.focus,
-        namespaces=plan.namespaces,
+        namespaces=namespaces,
         node=plan.node,
         workload=plan.workload,
         pod=plan.pod,
-        check_control_plane=plan.check_control_plane,
+        check_control_plane=check_control_plane,
         hypotheses=hypotheses or plan.hypotheses,
         strategy=strategy if strategy in ("targeted", "breadth_first") else plan.strategy,
         used_similarity=plan.used_similarity,

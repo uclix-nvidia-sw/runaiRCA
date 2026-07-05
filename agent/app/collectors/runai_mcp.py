@@ -1,0 +1,103 @@
+"""Optional Run:ai evidence gathering via the runai-mcp server.
+
+When RUNAI_MCP_URL is set, the Run:ai collector pulls its context through the
+runai-mcp server's `call_runai_api` tool (426 Run:ai APIs, spec-aware, auto-authed
+in the sidecar) instead of the fixed curl endpoints. ANY failure — the mcp package
+not installed, the sidecar unreachable, a tool error, an unparseable result —
+returns None so the caller falls back to the direct-HTTP collector. The MCP path is
+strictly additive and never breaks analysis.
+
+The runai-mcp server is stdio-only; deploy it as a sidecar behind a stdio->HTTP
+bridge (e.g. mcp-proxy) and point RUNAI_MCP_URL at the bridge's streamable-HTTP
+endpoint (http://localhost:<port>/mcp).
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from app.collectors.base import AnalysisTarget
+from app.config import Settings
+
+
+async def gather_runai_via_mcp(
+    settings: Settings, target: AnalysisTarget
+) -> list[dict[str, Any]] | None:
+    """Return query_results (same shape as the direct collector) via the MCP, or
+    None to signal the caller to fall back to direct HTTP."""
+    if not settings.runai_mcp_url:
+        return None
+    try:
+        return await _gather(settings, target)
+    except Exception:  # noqa: BLE001 - MCP is best-effort; never break the collector
+        return None
+
+
+async def _gather(settings: Settings, target: AnalysisTarget) -> list[dict[str, Any]] | None:
+    # Lazy import so the agent runs without the `mcp` package until the sidecar ships.
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    plan = [
+        ("workloads", "GET", settings.runai_workloads_path, _workload_params(target)),
+        ("projects", "GET", settings.runai_projects_path, None),
+        ("queues", "GET", settings.runai_queues_path, None),
+        ("version", "GET", settings.runai_version_path, None),
+    ]
+    out: list[dict[str, Any]] = []
+    async with streamablehttp_client(settings.runai_mcp_url) as (read, write, *_rest):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            for name, method, path, params in plan:
+                if not path:
+                    continue
+                out.append(await _call_api(session, name, method, path, params))
+    return out or None
+
+
+async def _call_api(
+    session: Any, name: str, method: str, path: str, params: dict | None
+) -> dict[str, Any]:
+    args: dict[str, Any] = {"method": method, "path": path}
+    if params:
+        args["query"] = params
+    query = f"MCP call_runai_api {method} {path}"
+    try:
+        result = await session.call_tool("call_runai_api", args)
+        if getattr(result, "isError", False):
+            return {"name": name, "query": query, "status_code": None,
+                    "error": _tool_text(result)[:300] or "tool error", "data": None}
+        return {"name": name, "query": query, "status_code": 200, "error": None,
+                "data": _tool_json(result)}
+    except Exception as exc:  # noqa: BLE001 - per-query failure is an observation
+        return {"name": name, "query": query, "status_code": None,
+                "error": f"{exc.__class__.__name__}: {exc}", "data": None}
+
+
+def _tool_text(result: Any) -> str:
+    parts = []
+    for block in getattr(result, "content", None) or []:
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _tool_json(result: Any) -> Any:
+    blob = _tool_text(result).strip()
+    if not blob:
+        return {}
+    try:
+        return json.loads(blob)
+    except (ValueError, TypeError):
+        return {"raw": blob[:2000]}
+
+
+def _workload_params(target: AnalysisTarget) -> dict[str, str] | None:
+    params: dict[str, str] = {}
+    if target.workload_name:
+        params["name"] = target.workload_name
+    if target.project:
+        params["projectName"] = target.project
+    return params or None

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.collectors.http_json import compact, get_json
 from app.collectors.loki import _llm_insight
@@ -35,7 +37,12 @@ class PrometheusCollector:
                 ],
             )
 
-        queries = _queries_for(target, plan)
+        control_plane_namespaces = (
+            self._settings.runai_log_namespaces
+            if plan is not None and getattr(plan, "check_control_plane", False)
+            else ()
+        )
+        queries = _queries_for(target, plan, control_plane_namespaces)
         query_results = []
         warnings: list[str] = []
 
@@ -125,7 +132,9 @@ class PrometheusCollector:
         )
 
 
-def _queries_for(target: AnalysisTarget, plan=None) -> list[tuple[str, str]]:
+def _queries_for(
+    target: AnalysisTarget, plan=None, control_plane_namespaces: tuple[str, ...] = ()
+) -> list[tuple[str, str]]:
     namespace = target.namespace
     pod = target.pod
     if plan is not None:
@@ -191,6 +200,24 @@ def _queries_for(target: AnalysisTarget, plan=None) -> list[tuple[str, str]]:
                 ),
             ]
         )
+    # Control-plane health: when the alert implicates Run:ai, check whether the
+    # scheduler/backend pods themselves are crashlooping or stuck Pending — a dying
+    # workload's cause is often an unhealthy control plane, not the workload.
+    ns_re = "|".join(re.escape(ns) for ns in control_plane_namespaces if ns)
+    if ns_re:
+        cp = f'namespace=~"{ns_re}"'
+        queries.extend(
+            [
+                (
+                    "runai_control_plane_restarts",
+                    f"kube_pod_container_status_restarts_total{{{cp}}}",
+                ),
+                (
+                    "runai_control_plane_pending",
+                    f'kube_pod_status_phase{{{cp},phase="Pending"}}',
+                ),
+            ]
+        )
     return queries
 
 
@@ -210,3 +237,97 @@ def _prometheus_result(data: object) -> list[object]:
         return []
     result = payload.get("result")
     return result if isinstance(result, list) else []
+
+
+# --- Cross-collector deterministic follow-up -----------------------------------
+# The k8s->prometheus branches of the unified debug flowchart, as code: given what
+# the kubernetes collector found, derive the PromQL a human runs next. Runs with or
+# without the LLM. Read-only.
+async def prom_query(settings: Settings, name: str, promql: str) -> dict:
+    """One ad-hoc PromQL instant query; never raises."""
+    if not settings.prometheus_url:
+        return {"name": name, "query": promql, "error": "prometheus not configured", "data": None}
+    resp = await get_json(
+        base_url=settings.prometheus_url, path="/api/v1/query",
+        timeout_seconds=settings.prometheus_timeout_seconds, params={"query": promql},
+    )
+    return {
+        "name": name, "query": promql, "status_code": resp.status_code,
+        "error": resp.error, "data": compact(resp.data, limit=8),
+    }
+
+
+def _prom_followup_queries(details: dict, target: AnalysisTarget) -> list[tuple[str, str]]:
+    ns, pod, node = (target.namespace or ""), (target.pod or ""), (target.node or "")
+    if not isinstance(details, dict):
+        return []
+    diags = details.get("container_diagnostics") or []
+    statuses = details.get("pod_statuses") or []
+    oom = any(
+        isinstance(d, dict) and isinstance(d.get("lastTerminated"), dict)
+        and "oomkilled" in str(d["lastTerminated"].get("reason", "")).lower()
+        for d in diags
+    )
+    restarts = any(
+        isinstance(d, dict) and isinstance(d.get("restartCount"), int) and d["restartCount"] > 0
+        for d in diags
+    )
+    pending = any(
+        isinstance(p, dict) and str(p.get("phase", "")).lower() == "pending" for p in statuses
+    )
+    out: list[tuple[str, str]] = []
+    if oom and ns and pod:
+        # ratio ~1 => own-limit OOM (raise limit / fix leak); <<1 => node pressure.
+        out.append((
+            "oom_working_set_vs_limit",
+            f'max_over_time(container_memory_working_set_bytes{{namespace="{ns}",pod="{pod}",'
+            f'container!="",container!="POD"}}[30m]) / on(namespace,pod,container) '
+            f'kube_pod_container_resource_limits{{namespace="{ns}",pod="{pod}",resource="memory"}}',
+        ))
+        out.append((
+            "oom_growth_shape",
+            f'deriv(container_memory_working_set_bytes{{namespace="{ns}",pod="{pod}",'
+            f'container!="",container!="POD"}}[30m])',
+        ))
+    if restarts and ns and pod:
+        out.append((
+            "active_restart_rate",
+            f'increase(kube_pod_container_status_restarts_total{{namespace="{ns}",pod="{pod}"}}[15m])',
+        ))
+    if pending and node:
+        out.append((
+            "node_memory_headroom",
+            f'node_memory_MemAvailable_bytes{{instance=~"{node}.*"}} / '
+            f'node_memory_MemTotal_bytes{{instance=~"{node}.*"}}',
+        ))
+    return out
+
+
+async def prometheus_followup(
+    settings: Settings,
+    prometheus_result: CollectorResult | None,
+    kubernetes_result: CollectorResult | None,
+    target: AnalysisTarget,
+    max_reads: int = 6,
+) -> list[dict]:
+    """Fire k8s->prometheus follow-up queries and attach them as followup_query
+    artifacts on the prometheus result. Best-effort, read-only, bounded."""
+    if prometheus_result is None or getattr(prometheus_result, "agent", "") != "prometheus":
+        return []
+    details = getattr(kubernetes_result, "details", {}) or {}
+    queries = _prom_followup_queries(details, target)[:max_reads]
+    results: list[dict] = []
+    for name, promql in queries:
+        results.append(await prom_query(settings, name, promql))
+    for res in results:
+        err = res.get("error")
+        prometheus_result.artifacts.append(
+            artifact(
+                agent="prometheus", source="prometheus", type="followup_query",
+                status="unavailable" if err else "ok", confidence="medium",
+                query=res.get("query"),
+                summary=(str(err) if err else f"flowchart follow-up: {res.get('name')}"),
+                result=res,
+            )
+        )
+    return results

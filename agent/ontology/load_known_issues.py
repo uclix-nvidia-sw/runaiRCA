@@ -34,17 +34,22 @@ KNOWN_ISSUES_FILE = Path(
 # Must match the root_cause subtypes in schema.tql.
 FAMILIES = {
     "node_kubelet_pressure",
-    "scheduling_quota_exhaustion",
-    "control_plane_error",
-    "workload_startup_image_failure",
+    "runai_scheduling_quota",
+    "k8s_scheduling_error",
+    "runai_control_plane_error",
+    "k8s_control_plane_error",
+    "workload_startup_error",
+    "image_pull_error",
     "gpu_hardware_error",
     "network_fabric_error",
     "cluster_network_error",
-    "storage_io_error",
+    "k8s_storage_error",
+    "storage_backend_error",
     "workload_runtime_error",
     "platform_version_bug",
     "observability_accuracy",
     "expected_known_behavior",
+    "platform_auth_error",
     "insufficient_evidence",
 }
 

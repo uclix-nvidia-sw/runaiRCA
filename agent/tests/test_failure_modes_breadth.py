@@ -34,18 +34,18 @@ def test_spot_checks() -> None:
     gpu_kws = {kw for s in modes["gpu_hardware_error"] for kw in s["keywords"]}
     assert "driver/library version mismatch" in gpu_kws
     assert "fallen off the bus" in gpu_kws
-    # Registry rate limit is a distinct, more specific symptom than ImagePullBackOff.
-    wl_kws = {kw for s in modes["workload_startup_image_failure"] for kw in s["keywords"]}
-    assert "toomanyrequests" in wl_kws
-    # Original symptoms are intact.
-    assert "imagepullbackoff" in wl_kws
-    assert any(s["symptom"] == "Unschedulable GPU" for s in modes["scheduling_quota_exhaustion"])
+    # Image pull / registry is its own family, split from the container's startup faults.
+    img_kws = {kw for s in modes["image_pull_error"] for kw in s["keywords"]}
+    assert "toomanyrequests" in img_kws
+    assert "imagepullbackoff" in img_kws
+    # kube-scheduler predicate failures live in k8s_scheduling_error.
+    assert any(s["symptom"] == "Unschedulable GPU" for s in modes["k8s_scheduling_error"])
 
 
 def test_specific_symptom_ordered_before_generic() -> None:
     """First keyword match wins in _kb_remediation_lines, so 'preempted by higher
     priority' must appear before the generic 'preempt' symptom."""
-    symptoms = load_failure_modes(YAML)["scheduling_quota_exhaustion"]
+    symptoms = load_failure_modes(YAML)["runai_scheduling_quota"]
     idx = {kw: i for i, s in enumerate(symptoms) for kw in s["keywords"]}
     assert idx["preempted by higher priority"] < idx["preempt"]
 
@@ -68,9 +68,192 @@ def test_layer_families_have_signatures() -> None:
     for family in (
         "network_fabric_error",
         "cluster_network_error",
-        "storage_io_error",
+        "k8s_storage_error",
         "workload_runtime_error",
     ):
         symptoms = modes.get(family) or []
         assert len(symptoms) >= 2, f"{family} needs at least 2 symptoms"
         assert all(s["keywords"] and s["actions"] for s in symptoms)
+
+
+def test_runai_scheduler_reclaim_and_gang_surface_with_scheduler_pod_pointer() -> None:
+    # Run:ai's own scheduler (separate from kube-scheduler): a reclaimed or gang-stuck
+    # workload must match a symptom whose action points at runai-scheduler-default.
+    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+
+    modes = load_failure_modes("knowledge/failure_modes.yaml")
+
+    reclaim = match_failure_mode_symptoms(
+        modes, "runai-scheduler reclaimed over-quota gpus from project vision", ""
+    )
+    assert any(s.get("symptom") == "Reclaimed To Rebalance Fairshare" for _, s in reclaim)
+    assert any("runai-scheduler-default" in a for _, s in reclaim for a in s.get("actions", []))
+
+    gang = match_failure_mode_symptoms(
+        modes, "pod group is unschedulable: not enough resources to gang the group", ""
+    )
+    assert any(s.get("symptom") == "Gang Or Pod-Group Not Scheduling" for _, s in gang)
+
+
+def test_nvidia_common_issues_deck_knowledge_surfaces() -> None:
+    # Signatures from the official NVIDIA "Common Troubleshooting" deck must each
+    # match a symptom in the RIGHT family.
+    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+
+    modes = load_failure_modes("knowledge/failure_modes.yaml")
+
+    def fam_for(text):
+        hits = match_failure_mode_symptoms(modes, text, "")
+        return {f for f, _ in hits}
+
+    assert "runai_scheduling_quota" in fam_for("node defragmentation blocks the 4-gpu pod")
+    assert "runai_scheduling_quota" in fam_for("workload suspended due to idleness rule")
+    assert "runai_control_plane_error" in fam_for(
+        "cluster-sync is out of sync with the workload status"
+    )
+    assert "runai_control_plane_error" in fam_for("cluster disconnected: token used before issued")
+    assert "observability_accuracy" in fam_for("no metrics: thanos-receive storage full")
+    assert "observability_accuracy" in fam_for("gpu number is 0, dcgm_fi_dev_fb_used missing")
+    assert "platform_auth_error" in fam_for("user failed to authenticate, email_verified missing")
+    assert "platform_auth_error" in fam_for("saml assertionconsumerservice mismatch")
+
+    # Every new-family action carries a concrete pod/dashboard pointer, not just prose.
+    metrics = match_failure_mode_symptoms(modes, "thanos-query cannot reach thanos-receive", "")
+    assert any("runai-backend" in a for _, s in metrics for a in s.get("actions", []))
+
+
+def test_deck_four_tracks_stay_separate_no_cross_matching() -> None:
+    # The NVIDIA deck's 4 flows (auth, workloads, metrics, cluster-disconnected) are
+    # INDEPENDENT diagnostic tracks. A single-track evidence line must match ONLY its
+    # own family — no bleeding auth guidance into a metrics incident, etc.
+    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+
+    modes = load_failure_modes("knowledge/failure_modes.yaml")
+    tracks = {
+        "platform_auth_error": [
+            "user failed to authenticate, email_verified missing",
+            "saml assertionconsumerservice mismatch, attributestatement missing email",
+            "oidc discovery url wrong, client secret invalid",
+        ],
+        "runai_scheduling_quota": [
+            "runai reclaimed over-quota gpus to rebalance fairshare",
+            "node defragmentation, gpus free but not on a single node",
+            "workload suspended due to idleness rule",
+        ],
+        "observability_accuracy": [
+            "no metrics, thanos-receive storage full",
+            "gpu number 0, dcgm_fi_dev_fb_used missing on some nodes",
+            "metrics-exporter target down",
+        ],
+        "runai_control_plane_error": [
+            "cluster disconnected, traefik token used before issued",
+            "missing prerequisites, runai-toolkit crash",
+        ],
+    }
+    for expected, texts in tracks.items():
+        for text in texts:
+            fams = {f for f, _ in match_failure_mode_symptoms(modes, text, "")}
+            assert fams == {expected}, f"{text!r} bled into {fams - {expected}}"
+
+
+def test_scheduler_disambiguation_runai_vs_kube() -> None:
+    # A scheduler failure must be attributed to the RIGHT scheduler, and a plain
+    # kube default-scheduler event must NOT elevate the Run:ai control plane.
+    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+
+    modes = load_failure_modes("knowledge/failure_modes.yaml")
+
+    def fams(text):
+        return {f for f, _ in match_failure_mode_symptoms(modes, text, "")}
+
+    # kube default-scheduler event → scheduling track only, NOT control_plane
+    kube = match_failure_mode_symptoms(
+        modes, "default-scheduler failedscheduling insufficient cpu", ""
+    )
+    assert {f for f, _ in kube} == {"k8s_scheduling_error"}
+    assert any(s["symptom"].startswith("Which Scheduler") for _, s in kube)
+
+    # runai-scheduler placement failure → the Run:ai scheduling family
+    assert fams("runai-scheduler-default cannot place pod group") == {"runai_scheduling_quota"}
+
+    # the disambiguation action names both schedulers + how to tell them apart
+    which = next(s for _, s in kube if s["symptom"].startswith("Which Scheduler"))
+    joined = " ".join(which["actions"]).lower()
+    assert "schedulername" in joined
+    assert "runai-scheduler-default" in joined and "default-scheduler" in joined
+
+
+def test_k8s_research_signatures_map_to_right_family_single_track() -> None:
+    # Signatures ingested from the learnk8s flowchart + k8s docs + CNCF research must
+    # each match exactly ONE family (no cross-track bleed).
+    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+
+    modes = load_failure_modes("knowledge/failure_modes.yaml")
+
+    def only(text):
+        return {f for f, _ in match_failure_mode_symptoms(modes, text, "")}
+
+    assert only("createcontainerconfigerror: couldn't find key api_key in secret") == {
+        "workload_startup_error"
+    }
+    assert only("0/5 nodes are available: 3 untolerated taint, 2 didn't match node selector") == {
+        "k8s_scheduling_error"
+    }
+    assert only("service myapp has no endpoints available") == {"cluster_network_error"}
+    assert only("pleg is not healthy: pleg was last active 5m ago") == {"node_kubelet_pressure"}
+    # k8s cluster control plane (distinct from the Run:ai platform control plane)
+    assert only("etcdserver: request timed out, no leader") == {"k8s_control_plane_error"}
+    assert only("volume node affinity conflict") == {"k8s_storage_error"}
+    assert only("error from server (forbidden): cannot list resource pods") == {
+        "platform_auth_error"
+    }
+    # cert text stays with the registry (workload) track; k8s control-plane cert uses
+    # kubeadm-specific phrasing so the two don't collide
+    assert "k8s_control_plane_error" not in only("certificate has expired")
+    assert only("kubeadm certs check-expiration shows apiserver expired") == {
+        "k8s_control_plane_error"
+    }
+    # the Run:ai platform control plane is a SEPARATE family from the k8s one
+    assert only("runai cluster-sync is out of sync") == {"runai_control_plane_error"}
+
+
+def test_subsystem_splits_stay_separate() -> None:
+    # The coarse families were split by subsystem (k8s vs Run:ai scheduler, image
+    # vs startup, k8s-storage vs backend-storage). Each representative signature must
+    # match exactly ONE family — no bleed back across the split.
+    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+
+    modes = load_failure_modes("knowledge/failure_modes.yaml")
+    expect = {
+        "k8s_scheduling_error": [
+            "default-scheduler failedscheduling 0/5 nodes untolerated taint",
+            "exceeded quota: pods forbidden",
+        ],
+        "runai_scheduling_quota": [
+            "runai reclaimed over-quota gpus fairshare",
+            "gang pod group not scheduling",
+            "preempted by higher priority",
+        ],
+        "image_pull_error": [
+            "imagepullbackoff errimagepull",
+            "toomanyrequests pull rate limit",
+            "manifest for tag not found",
+        ],
+        "workload_startup_error": [
+            "crashloopbackoff back-off restarting failed container",
+            "createcontainerconfigerror couldn't find key",
+        ],
+        "k8s_storage_error": [
+            "unbound immediate persistentvolumeclaims storageclass",
+            "volume node affinity conflict",
+        ],
+        "storage_backend_error": [
+            "nfs: server not responding stale file handle",
+            "ceph slow ops osd down",
+            "read-only file system",
+        ],
+    }
+    for family, texts in expect.items():
+        for text in texts:
+            fams = {f for f, _ in match_failure_mode_symptoms(modes, text, "")}
+            assert fams == {family}, f"{text!r} -> {fams}, expected {{{family}}}"

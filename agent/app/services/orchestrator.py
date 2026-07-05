@@ -285,6 +285,21 @@ class AnalysisOrchestrator:
             "synthesis must wait for all collectors: "
             f"{len(results)} results for {len(self._collectors)} collectors"
         )
+        # Deterministic flowchart-driven follow-up: keep pulling k8s evidence based on
+        # what was found (Pending -> events/quota/pvc -> storageclass; CrashLoop/
+        # ImagePull -> events). Runs with OR without the LLM loop, so collection stays
+        # iterative even when litellm is down (the ReAct loop is skipped then).
+        try:
+            from app.collectors.kubernetes import k8s_followup
+            from app.collectors.prometheus import prometheus_followup
+
+            k8s_result = next((r for r in results if r.agent == "kubernetes"), None)
+            prom_result = next((r for r in results if r.agent == "prometheus"), None)
+            await k8s_followup(self._settings, k8s_result, target)
+            # Cross-collector: k8s findings (OOM/restart/Pending) -> derived PromQL.
+            await prometheus_followup(self._settings, prom_result, k8s_result, target)
+        except Exception:  # noqa: BLE001 - follow-up is best-effort, never fail analysis
+            pass
         for r in results:
             _log.info(
                 "evidence: agent=%s status=%s confidence=%s — %s",
@@ -1426,16 +1441,35 @@ _FAMILY_EXPLANATION = {
         "the node hosting this workload is under resource pressure (disk, memory, or "
         "PID), which can evict or restart its pods"
     ),
-    "scheduling_quota_exhaustion": (
-        "the workload cannot be scheduled — GPU quota or queue capacity looks exhausted"
+    "runai_scheduling_quota": (
+        "the Run:ai SCHEDULER held/evicted this workload — GPU quota, fairshare "
+        "reclaim, preemption, gang/pod-group, or queue capacity (its own decision, "
+        "not the Kubernetes scheduler)"
     ),
-    "control_plane_error": (
-        "the Run:ai control plane (scheduler or backend) is reporting errors that "
-        "affect this workload"
+    "k8s_scheduling_error": (
+        "the KUBERNETES scheduler could not place the pod — a predicate failed "
+        "(taint/toleration, node affinity/selector, topology spread, or a namespace "
+        "ResourceQuota), independent of Run:ai quota"
     ),
-    "workload_startup_image_failure": (
-        "the workload itself is failing to start — an image pull, crash loop, or a "
-        "startup/configuration error"
+    "runai_control_plane_error": (
+        "the Run:ai PLATFORM control plane (runai-scheduler, runai-backend, "
+        "cluster-sync) is reporting errors that affect this workload — not the "
+        "Kubernetes control plane"
+    ),
+    "k8s_control_plane_error": (
+        "the KUBERNETES cluster's own control plane is unhealthy (kube-apiserver, "
+        "etcd, kube-scheduler/controller-manager, kubelet certs, admission webhooks) "
+        "— a cluster-level fault beneath Run:ai"
+    ),
+    "workload_startup_error": (
+        "the container itself fails to start once the image is present — a crash "
+        "loop, OOM at start, bad entrypoint, missing config/secret, or a failing "
+        "startup probe (the workload's own fault, not the image pull)"
+    ),
+    "image_pull_error": (
+        "the node cannot PULL the container image — image-pull backoff, a bad tag/"
+        "manifest, private-registry auth, a registry TLS/rate-limit/5xx problem "
+        "(a registry/image issue, not the workload's code)"
     ),
     "gpu_hardware_error": (
         "the GPU itself reported a fault (NVIDIA XID) — a hardware/driver/fabric "
@@ -1450,13 +1484,28 @@ _FAMILY_EXPLANATION = {
         "cluster networking is failing (CNI, CoreDNS, pod networking) — pods can't "
         "resolve names or get network connectivity"
     ),
-    "storage_io_error": (
-        "the storage layer is failing (CSI/PVC, NFS, Ceph, disk IO) — volumes "
-        "won't mount or IO hangs, independent of the workload itself"
+    "k8s_storage_error": (
+        "the Kubernetes storage layer is failing (CSI driver, PVC binding, "
+        "StorageClass, volume attach/mount, node-affinity) — the volume can't be "
+        "provisioned or mounted"
+    ),
+    "storage_backend_error": (
+        "the backing storage system is degraded (NFS server unresponsive, Ceph "
+        "cluster unhealthy, node filesystem read-only) — IO hangs or fails beneath "
+        "the CSI layer"
     ),
     "workload_runtime_error": (
         "the workload's own code failed while running (application crash, CUDA "
         "out-of-memory) — an application-level fault, not a platform problem"
+    ),
+    "observability_accuracy": (
+        "the metrics/observability pipeline is degraded (Prometheus, Thanos, DCGM, "
+        "metrics-exporter) — dashboards are wrong or empty, not the workload itself"
+    ),
+    "platform_auth_error": (
+        "login/permissions/SSO is failing (JWT attributes, SAML/OIDC config, "
+        "Access Rules) or a UI/API call returned 401/403/503/500 — an auth or "
+        "control-plane service issue, not a workload fault"
     ),
 }
 
@@ -1585,17 +1634,22 @@ def _playbook_lines(
 def _family_label(family: str) -> str:
     labels = {
         "node_kubelet_pressure": "node kubelet pressure",
-        "scheduling_quota_exhaustion": "scheduling quota exhaustion",
-        "control_plane_error": "Run:ai control-plane error",
-        "workload_startup_image_failure": "workload startup/image failure",
+        "runai_scheduling_quota": "Run:ai scheduling / GPU quota (preempt/reclaim/gang)",
+        "k8s_scheduling_error": "Kubernetes scheduling error (taint/affinity/topology/quota)",
+        "runai_control_plane_error": "Run:ai control-plane error (scheduler/backend/cluster-sync)",
+        "k8s_control_plane_error": "Kubernetes control-plane error (apiserver/etcd/scheduler)",
+        "workload_startup_error": "workload startup/config/crash",
+        "image_pull_error": "image pull / registry failure",
         "gpu_hardware_error": "GPU hardware error",
         "platform_version_bug": "Run:ai version bug",
         "observability_accuracy": "metrics/observability accuracy",
         "expected_known_behavior": "expected/known behavior",
         "network_fabric_error": "GPU interconnect/fabric error (NCCL/IB/NVLink)",
         "cluster_network_error": "cluster networking error (CNI/DNS)",
-        "storage_io_error": "storage/IO error (CSI/NFS/Ceph)",
+        "k8s_storage_error": "Kubernetes storage error (CSI/PVC/StorageClass)",
+        "storage_backend_error": "backend storage error (NFS/Ceph/read-only fs)",
         "workload_runtime_error": "workload runtime error (application fault)",
+        "platform_auth_error": "authentication/SSO error (login/permissions/SAML/OIDC)",
         "insufficient_evidence": "insufficient evidence",
     }
     return labels.get(family, family.replace("_", " "))

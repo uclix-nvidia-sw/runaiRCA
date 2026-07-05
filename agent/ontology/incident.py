@@ -14,9 +14,9 @@ from pydantic import BaseModel, Field
 # app/services/root_cause_ranking.py.
 FAMILIES = (
     "node_kubelet_pressure",
-    "scheduling_quota_exhaustion",
-    "control_plane_error",
-    "workload_startup_image_failure",
+    "runai_scheduling_quota",
+    "runai_control_plane_error",
+    "workload_startup_error",
     "insufficient_evidence",
 )
 

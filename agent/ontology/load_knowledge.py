@@ -35,14 +35,20 @@ KNOWLEDGE_FILE = Path(os.getenv("FAILURE_MODES_FILE", "knowledge/failure_modes.y
 # Must match schema.tql sub-types and app/services/root_cause_ranking.py.
 FAMILIES = {
     "node_kubelet_pressure",
-    "scheduling_quota_exhaustion",
-    "control_plane_error",
-    "workload_startup_image_failure",
+    "runai_scheduling_quota",
+    "k8s_scheduling_error",
+    "runai_control_plane_error",
+    "k8s_control_plane_error",
+    "workload_startup_error",
+    "image_pull_error",
     "gpu_hardware_error",
     "network_fabric_error",
     "cluster_network_error",
-    "storage_io_error",
+    "k8s_storage_error",
+    "storage_backend_error",
     "workload_runtime_error",
+    "observability_accuracy",
+    "platform_auth_error",
     "insufficient_evidence",
 }
 

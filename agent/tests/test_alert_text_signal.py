@@ -54,14 +54,17 @@ def test_xid_promotes_gpu_hardware_over_keyword_noise() -> None:
     # gpu_hardware_error must lead the candidates.
     ranked = [
         RankedCause(family="node_kubelet_pressure", confidence="medium", score=3.0),
-        RankedCause(family="control_plane_error", confidence="low", score=1.0),
+        RankedCause(family="runai_control_plane_error", confidence="low", score=1.0),
     ]
     promoted = _promote_xid_cause(ranked, [79])
     assert promoted[0].family == "gpu_hardware_error"
     assert promoted[0].confidence == "high"
     assert "79" in promoted[0].rationale[0]
     # keyword families remain as downstream context, in order
-    assert [c.family for c in promoted[1:]] == ["node_kubelet_pressure", "control_plane_error"]
+    assert [c.family for c in promoted[1:]] == [
+        "node_kubelet_pressure",
+        "runai_control_plane_error",
+    ]
     # no XID -> untouched
     assert _promote_xid_cause(ranked, [])[0].family == "node_kubelet_pressure"
 

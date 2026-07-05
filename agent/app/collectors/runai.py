@@ -7,9 +7,18 @@ from urllib.parse import quote
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.collectors.http_json import compact, get_json, post_form_json, post_json
 from app.collectors.loki import _llm_insight
+from app.collectors.runai_mcp import gather_runai_via_mcp
 from app.config import Settings
 
 _VERSION_RE = re.compile(r"\d+\.\d+(?:\.\d+)?")
+
+
+def _version_from_results(query_results: list[dict[str, Any]]) -> str:
+    """Pull the Run:ai version out of the MCP 'version' query result, if present."""
+    for item in query_results or []:
+        if item.get("name") == "version" and not item.get("error"):
+            return _extract_version(item.get("data"))
+    return ""
 
 
 def _extract_version(data: Any) -> str:
@@ -78,7 +87,7 @@ class RunAICollector:
             confidence = "low"
         else:
             headers, auth_warnings = await _runai_headers(self._settings)
-            if not headers.get("Authorization"):
+            if not headers.get("Authorization") and not self._settings.runai_mcp_url:
                 if "runai.auth" not in missing:
                     missing.append("runai.auth")
                 if "runai.query" not in missing:
@@ -121,9 +130,16 @@ class RunAICollector:
                         )
                     ],
                 )
-            query_results = await _collect_runai_responses(self._settings, target, headers)
+            # Prefer the runai-mcp server when configured (richer, spec-aware,
+            # auto-authed in the sidecar); fall back to direct HTTP on any MCP issue.
+            query_results = await gather_runai_via_mcp(self._settings, target)
+            used_mcp = query_results is not None
+            if not used_mcp:
+                query_results = await _collect_runai_responses(self._settings, target, headers)
+            if used_mcp:
+                auth_warnings.append("Run:ai queries gathered via the runai-mcp server.")
             auth_failed = any(item.get("status_code") == 401 for item in query_results)
-            if auth_failed and _can_refresh_runai_token(self._settings):
+            if auth_failed and not used_mcp and _can_refresh_runai_token(self._settings):
                 retry_headers, retry_warnings = await _runai_headers(
                     self._settings, prefer_oauth=True
                 )
@@ -159,7 +175,11 @@ class RunAICollector:
             if auth_failed and "runai.auth" not in missing:
                 missing.append("runai.auth")
 
-            runai_version = await _fetch_runai_version(self._settings, headers)
+            # Version comes from the MCP "version" query when MCP was used, else a
+            # direct best-effort fetch (empty headers just yield "").
+            runai_version = _version_from_results(query_results) if used_mcp else ""
+            if not runai_version:
+                runai_version = await _fetch_runai_version(self._settings, headers)
             details = {
                 "cluster": target.cluster,
                 "project": target.project,
@@ -198,7 +218,10 @@ class RunAICollector:
                         type="workload_context",
                         status=status,
                         confidence=confidence,
-                        query="; ".join(item["path"] for item in query_results),
+                        query="; ".join(
+                            str(item.get("path") or item.get("query") or "")
+                            for item in query_results
+                        ),
                         summary=summary,
                         result=details,
                     )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.collectors.http_json import compact, get_json
@@ -38,8 +39,21 @@ class LokiCollector:
             )
 
         selector = _selector_for(target, plan)
-        error_query = f'{selector} |~ "(?i)(error|fail|oom|evict|crash|pending|unschedul|back-off)"'
-        queries = [("error_logs", error_query), ("recent_logs", selector)]
+        skipped_target_scope = ""
+        # Loki rejects an empty stream selector `{}` with HTTP 400. When the alert has
+        # no namespace/pod/workload to scope by, skip the target log queries (the
+        # control-plane sweep below still runs on its own valid selector).
+        if selector == "{}":
+            queries = []
+            skipped_target_scope = (
+                "no namespace/pod/workload on this alert, so the target log queries "
+                "were skipped (Loki forbids an empty {} selector)."
+            )
+        else:
+            error_query = (
+                f'{selector} |~ "(?i)(error|fail|oom|evict|crash|pending|unschedul|back-off)"'
+            )
+            queries = [("error_logs", error_query), ("recent_logs", selector)]
         # Control-plane sweep only when the plan says this alert implicates Run:ai —
         # otherwise every alert scraped runai/runai-backend and skewed ranking.
         control_plane_in_scope = plan.check_control_plane if plan is not None else True
@@ -54,7 +68,7 @@ class LokiCollector:
             # `error|fail|...|scheduler|queue|database` alternation matched almost
             # every control-plane log line, so this query returned rows for every
             # alert regardless of target and always steered ranking to
-            # control_plane_error. Keep it specific to real failures.
+            # runai_control_plane_error. Keep it specific to real failures.
             runai_error_query = (
                 f'{runai_selector} |~ '
                 '"(?i)(reconcile.*(error|fail)|admission.*(error|denied|reject)|'
@@ -62,8 +76,24 @@ class LokiCollector:
                 'database.*(error|fail|timeout)|panic|fatal)"'
             )
             queries.append(("runai_control_plane_errors", runai_error_query))
+            # A dying workload's real cause often sits in scheduler/backend logs that
+            # NAME the workload but don't match the generic error regex above
+            # ("evicted", "preempted", "over quota for project X", "unschedulable").
+            # Correlate the control-plane namespaces to THIS workload so those lines
+            # surface — targeted by identifier, so it doesn't re-introduce the broad
+            # scrape that skewed every alert to runai_control_plane_error.
+            correlation = _control_plane_correlation_term(target, plan)
+            if correlation:
+                queries.append(
+                    (
+                        "runai_control_plane_for_workload",
+                        f'{runai_selector} |~ "(?i)({correlation})"',
+                    )
+                )
         query_results = []
         headers, warnings = _loki_headers(self._settings)
+        if skipped_target_scope:
+            warnings.append(skipped_target_scope)
 
         for name, query in queries:
             response = await get_json(
@@ -259,6 +289,20 @@ def _selector_for(target: AnalysisTarget, plan=None) -> str:
     elif workload:
         selector_parts.append(f'app=~".*{workload}.*"')
     return "{" + ",".join(selector_parts) + "}" if selector_parts else "{}"
+
+
+def _control_plane_correlation_term(target: AnalysisTarget, plan=None) -> str:
+    """Regex alternation of the identifiers the control plane logs THIS workload by
+    (workload name, then project). Empty when nothing specific enough to correlate —
+    a too-short term would match unrelated control-plane lines."""
+    workload = (getattr(plan, "workload", "") or target.workload_name or "").strip()
+    project = (target.project or "").strip()
+    terms: list[str] = []
+    for value in (workload, project):
+        escaped = re.escape(value)
+        if len(value) >= 3 and escaped not in terms:
+            terms.append(escaped)
+    return "|".join(terms)
 
 
 def _namespace_regex_selector(namespaces: tuple[str, ...]) -> str:

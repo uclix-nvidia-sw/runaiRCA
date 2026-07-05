@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shlex
 from pathlib import Path
 from urllib.parse import quote
@@ -142,6 +143,7 @@ async def k8s_read(
         "kind": resolved,
         "namespace": namespace,
         "name": name,
+        "label_selector": label_selector,
         "url": response.url,
         "status_code": response.status_code,
         "error": response.error,
@@ -807,3 +809,104 @@ def _runai_control_plane_warning_events(
         if isinstance(data, dict) and isinstance(data.get("items"), list):
             events[namespace] = [item for item in data["items"] if isinstance(item, dict)]
     return events
+
+
+# --- Deterministic flowchart-driven follow-up ---------------------------------
+# The learnk8s debug flowchart as CODE: given what the collector found, keep
+# pulling the evidence a human would next check. Runs with OR without the LLM
+# investigation loop, so evidence collection stays iterative even when the LLM
+# (litellm) is unavailable — which is exactly when the ReAct loop is skipped.
+_FOLLOWUP_WAITING = {
+    "crashloopbackoff", "imagepullbackoff", "errimagepull", "errimageneverpull",
+    "createcontainerconfigerror", "createcontainererror", "runcontainererror",
+    "containercannotrun",
+}
+
+
+def _followup_queries(
+    details: dict, prior: list[dict], namespace: str
+) -> list[dict[str, str]]:
+    if not namespace or not isinstance(details, dict):
+        return []
+    queries: list[dict[str, str]] = []
+    statuses = details.get("pod_statuses") or []
+    pending = any(
+        isinstance(p, dict) and str(p.get("phase", "")).lower() == "pending"
+        for p in statuses
+    )
+    waiting = False
+    for d in details.get("container_diagnostics") or []:
+        state = d.get("state") if isinstance(d, dict) else None
+        if isinstance(state, dict) and str(state.get("phase")) == "waiting" and (
+            str(state.get("reason", "")).lower() in _FOLLOWUP_WAITING
+        ):
+            waiting = True
+    if pending:
+        # "Why is my pod Pending?" branch: scheduling event -> quota -> PVC.
+        queries += [
+            {"kind": "events", "namespace": namespace},
+            {"kind": "resourcequotas", "namespace": namespace},
+            {"kind": "persistentvolumeclaims", "namespace": namespace},
+        ]
+    if waiting:
+        # CrashLoop / ImagePull / CreateContainerConfigError -> read the Events tail.
+        queries.append({"kind": "events", "namespace": namespace})
+    # Chained step: a Pending/unbound PVC -> check the StorageClass provisioner.
+    for res in prior:
+        if res.get("kind") == "persistentvolumeclaims":
+            blob = json.dumps(res.get("data") or {}).lower()
+            if any(t in blob for t in ("pending", "unbound", "waitforfirstconsumer")):
+                queries.append({"kind": "storageclasses"})
+    return queries
+
+
+def _followup_key(q: dict) -> tuple:
+    return (q["kind"], q.get("namespace", ""), q.get("name", ""), q.get("label_selector", ""))
+
+
+async def k8s_followup(
+    settings: Settings,
+    kubernetes_result: CollectorResult | None,
+    target: AnalysisTarget,
+    max_rounds: int = 3,
+    max_reads: int = 8,
+) -> list[dict]:
+    """Iteratively pull follow-up k8s evidence per the debug flowchart and attach
+    each read as a `followup_query` artifact on the kubernetes result. Best-effort,
+    read-only, and bounded (rounds x reads); returns the raw read results."""
+    if kubernetes_result is None or getattr(kubernetes_result, "agent", "") != "kubernetes":
+        return []
+    details = getattr(kubernetes_result, "details", {}) or {}
+    namespace = getattr(target, "namespace", "") or ""
+    done: set = set()
+    results: list[dict] = []
+    for _ in range(max(1, max_rounds)):
+        wanted = _followup_queries(details, results, namespace)
+        fresh = [q for q in wanted if _followup_key(q) not in done]
+        if not fresh or len(results) >= max_reads:
+            break
+        for q in fresh[: max_reads - len(results)]:
+            done.add(_followup_key(q))
+            results.append(
+                await k8s_read(
+                    settings, q["kind"],
+                    namespace=q.get("namespace", ""), name=q.get("name", ""),
+                    label_selector=q.get("label_selector", ""),
+                )
+            )
+    for res in results:
+        err = res.get("error")
+        loc = f" -n {res['namespace']}" if res.get("namespace") else ""
+        kubernetes_result.artifacts.append(
+            artifact(
+                agent="kubernetes", source="kubernetes", type="followup_query",
+                status="unavailable" if err else "ok", confidence="medium",
+                query=f"get {res.get('kind')}{loc}",
+                summary=(
+                    str(err) if err
+                    else f"flowchart follow-up: {res.get('kind')} → HTTP {res.get('status_code')}"
+                ),
+                result=res,
+            )
+        )
+    return results

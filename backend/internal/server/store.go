@@ -53,6 +53,7 @@ type Store struct {
 	pgvectorReady  bool
 	pgvectorDetail string
 	embedder       *embedder
+	flappingWindow time.Duration
 }
 
 type AlertUpsertResult struct {
@@ -87,6 +88,11 @@ func NewStore() *Store {
 		comments:      make(map[string]*CommentRecord),
 		analysisRuns:  make(map[string]*AnalysisRun),
 		embedder:      newEmbedder(),
+		// How long an alert signature can be quiet before a recurrence is treated as
+		// a NEW incident rather than another occurrence of the flapping one. 30 min
+		// was too tight — real alerts recur over hours, so each firing spawned its
+		// own row. Default 2h; tune per environment.
+		flappingWindow: time.Duration(getenvInt("FLAPPING_GROUP_WINDOW_MINUTES", 120)) * time.Minute,
 	}
 }
 
@@ -322,7 +328,11 @@ func (s *Store) shouldReuseIncidentForAlertLocked(key string, incident *Incident
 	if delta < 0 {
 		delta = -delta
 	}
-	return delta <= flappingGroupWindow
+	window := s.flappingWindow
+	if window <= 0 {
+		window = flappingGroupWindow
+	}
+	return delta <= window
 }
 
 func (s *Store) ListIncidents() []Incident {

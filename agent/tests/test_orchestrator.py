@@ -44,6 +44,7 @@ def make_settings() -> Settings:
         runai_queues_path="/api/v1/queues",
         runai_version_path="/api/v1/version",
         runai_timeout_seconds=1,
+        runai_mcp_url="",
         prometheus_url="",
         prometheus_timeout_seconds=1,
         prometheus_mcp_url="",
@@ -876,3 +877,225 @@ def test_pod_describe_line_carries_limits_restarts_oomkilled() -> None:
     assert _pod_describe_line({"name": "p", "phase": "Running"}) == (
         "- Kubernetes pod p is in phase Running."
     )
+
+
+@pytest.mark.asyncio
+async def test_loki_correlates_control_plane_logs_to_dying_workload(monkeypatch) -> None:
+    # When a workload alert implicates the control plane, Loki must also query the
+    # runai/runai-backend namespaces for lines that NAME this workload — that's where
+    # "scheduler evicted/preempted workload X" lives, beyond the error-pattern query.
+    from types import SimpleNamespace
+
+    seen_queries: list[str] = []
+
+    async def fake_get_json(**kwargs) -> SimpleNamespace:
+        seen_queries.append(kwargs["params"]["query"])
+        return SimpleNamespace(
+            url="http://loki/x", status_code=200, error=None,
+            data={"status": "success", "data": {"result": []}},
+        )
+
+    monkeypatch.setattr("app.collectors.loki.get_json", fake_get_json)
+    collector = LokiCollector(replace(make_settings(), loki_url="http://loki.example"))
+    plan = SimpleNamespace(
+        namespaces=["runai-vision"], pod="", workload="trainer", check_control_plane=True
+    )
+    await collector.collect(make_target(), plan)
+
+    joined = "\n".join(seen_queries)
+    # the control-plane namespaces are queried for the workload identifier
+    assert any("trainer" in q and "runai" in q for q in seen_queries), joined
+    # and the generic control-plane-error sweep still runs
+    assert any("reconcile" in q for q in seen_queries), joined
+
+
+def test_correlation_term_skips_too_short_identifiers() -> None:
+    from app.collectors.base import AnalysisTarget
+    from app.collectors.loki import _control_plane_correlation_term
+
+    def tgt(**k):
+        base = dict(cluster="", project="", queue="", namespace="", workload_name="",
+                    workload_type="", runai_workload_id="", node="", pod="",
+                    severity="warning", alert_name="A")
+        base.update(k)
+        return AnalysisTarget(**base)
+
+    assert _control_plane_correlation_term(tgt(workload_name="trainer")) == "trainer"
+    # regex metachars are escaped so the identifier can't break the LogQL query
+    assert _control_plane_correlation_term(tgt(workload_name="job.v2")) == r"job\.v2"
+    # too short → skipped (would match unrelated lines)
+    assert _control_plane_correlation_term(tgt(workload_name="a", project="x")) == ""
+
+
+def test_prometheus_widens_to_control_plane_health_when_implicated() -> None:
+    # When a workload alert implicates the control plane, Prometheus must also probe
+    # whether the scheduler/backend pods are crashlooping / stuck Pending — that's a
+    # common real cause of a dead workload.
+    from types import SimpleNamespace
+
+    from app.collectors.prometheus import _queries_for
+
+    plan = SimpleNamespace(namespaces=["runai-vision"], pod="trainer-0", check_control_plane=True)
+    names = dict(_queries_for(make_target(), plan, ("runai", "runai-backend")))
+    assert "runai_control_plane_restarts" in names
+    assert "runai_control_plane_pending" in names
+    q = names["runai_control_plane_restarts"]
+    assert "namespace=~" in q and "runai" in q and "backend" in q
+
+    # Not implicated → no control-plane widening (empty namespaces).
+    names2 = dict(_queries_for(make_target(), plan, ()))
+    assert not any(k.startswith("runai_control_plane_") for k in names2)
+
+
+@pytest.mark.asyncio
+async def test_loki_skips_empty_selector_no_400(monkeypatch) -> None:
+    # Loki rejects `{}`; when the target has no namespace/pod/workload the collector
+    # must NOT issue an empty-selector query, and must say why.
+    from types import SimpleNamespace
+
+    issued: list[str] = []
+
+    async def fake_get_json(**kwargs) -> SimpleNamespace:
+        issued.append(kwargs["params"]["query"])
+        return SimpleNamespace(
+            url="http://loki/x", status_code=200, error=None,
+            data={"status": "success", "data": {"result": []}},
+        )
+
+    monkeypatch.setattr("app.collectors.loki.get_json", fake_get_json)
+    collector = LokiCollector(replace(make_settings(), loki_url="http://loki.example"))
+    bare = AnalysisTarget(
+        cluster="", project="", queue="", namespace="", workload_name="",
+        workload_type="", runai_workload_id="", node="", pod="",
+        severity="critical", alert_name="X",
+    )
+    # no plan → control_plane defaults in-scope, but the {} target queries must be skipped
+    result = await collector.collect(bare, SimpleNamespace(
+        namespaces=[], pod="", workload="", check_control_plane=False))
+    assert all(q != "{}" and not q.startswith("{} ") for q in issued), issued
+    assert any("empty {} selector" in w for w in result.warnings)
+
+
+def test_adhoc_query_repr_shows_selector_and_only_set_params() -> None:
+    from app.services.investigator import _adhoc_query_repr
+
+    assert _adhoc_query_repr(
+        {"kind": "pods", "namespace": "runai", "name": "", "label_selector": "app=x"}
+    ) == "get pods -n runai -l app=x"
+    # two reads differing only by selector must render differently
+    a = _adhoc_query_repr({"kind": "pods", "namespace": "runai", "label_selector": "a=1"})
+    b = _adhoc_query_repr({"kind": "pods", "namespace": "runai", "label_selector": "b=2"})
+    assert a != b
+    # cluster-scoped read with just a name
+    assert _adhoc_query_repr({"kind": "nodes", "name": "dgx01"}) == "get nodes dgx01"
+
+
+@pytest.mark.asyncio
+async def test_runai_collector_uses_mcp_results_when_configured(monkeypatch) -> None:
+    # With RUNAI_MCP_URL set, the collector gathers via the MCP and does NOT curl.
+    from app.collectors import runai as runai_mod
+
+    async def fake_mcp(settings, target):
+        return [
+            {"name": "workloads", "query": "MCP", "status_code": 200, "error": None,
+             "data": {"workloads": [{"name": "trainer"}]}},
+            {"name": "version", "query": "MCP", "status_code": 200, "error": None,
+             "data": {"version": "2.23.60"}},
+        ]
+
+    async def boom(*a, **k):  # the direct-HTTP path must not run
+        raise AssertionError("must not fall back to curl when MCP returned results")
+
+    monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", fake_mcp)
+    monkeypatch.setattr(runai_mod, "_collect_runai_responses", boom)
+    settings = replace(
+        make_settings(), runai_base_url="https://runai.example", runai_mcp_url="http://localhost:8809/mcp"
+    )
+    result = await RunAICollector(settings).collect(make_target())
+    assert result.details["runai_version"] == "2.23.60"
+    assert any("runai-mcp server" in w for w in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_runai_collector_falls_back_to_curl_when_mcp_unavailable(monkeypatch) -> None:
+    from app.collectors import runai as runai_mod
+
+    async def mcp_none(settings, target):
+        return None  # MCP not configured / failed -> signal fallback
+
+    called = {"curl": False}
+
+    async def fake_curl(settings, target, headers):
+        called["curl"] = True
+        return [
+            {"name": "workloads", "query": "GET", "status_code": 200, "error": None, "data": {}}
+        ]
+
+    async def fake_headers(settings, prefer_oauth=False):
+        return ({"Authorization": "Bearer x"}, [])
+
+    monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", mcp_none)
+    monkeypatch.setattr(runai_mod, "_collect_runai_responses", fake_curl)
+    monkeypatch.setattr(runai_mod, "_runai_headers", fake_headers)
+    monkeypatch.setattr(runai_mod, "_fetch_runai_version", lambda *a, **k: _async_empty())
+    settings = replace(make_settings(), runai_base_url="https://runai.example", runai_mcp_url="")
+    await RunAICollector(settings).collect(make_target())
+    assert called["curl"] is True
+
+
+async def _async_empty():
+    return ""
+
+
+@pytest.mark.asyncio
+async def test_prometheus_followup_derives_promql_from_k8s_oom(monkeypatch) -> None:
+    # Cross-collector flowchart: an OOMKilled + restart found by kubernetes drives
+    # derived PromQL (memory/limit ratio, growth shape, restart rate) on prometheus.
+    from app.collectors import prometheus as prom_mod
+    from app.collectors.base import CollectorResult
+
+    fired: list[str] = []
+
+    async def fake_prom_query(settings, name, promql):
+        fired.append(name)
+        return {"name": name, "query": promql, "status_code": 200, "error": None, "data": {}}
+
+    monkeypatch.setattr(prom_mod, "prom_query", fake_prom_query)
+    k8s = CollectorResult(
+        agent="kubernetes", status="ok", summary="k8s", confidence="medium",
+        details={
+            "pod_statuses": [{"name": "trainer-0", "phase": "Running"}],
+            "container_diagnostics": [
+                {"name": "app", "restartCount": 3,
+                 "lastTerminated": {"reason": "OOMKilled", "exitCode": 137}}
+            ],
+        },
+    )
+    prom = CollectorResult(agent="prometheus", status="ok", summary="p", confidence="medium")
+    target = replace(make_target(), namespace="team-a", pod="trainer-0")
+    await prom_mod.prometheus_followup(make_settings(), prom, k8s, target)
+
+    assert "oom_working_set_vs_limit" in fired
+    assert "oom_growth_shape" in fired
+    assert "active_restart_rate" in fired
+    assert any(a.type == "followup_query" for a in prom.artifacts)
+
+
+@pytest.mark.asyncio
+async def test_prometheus_followup_noop_when_healthy(monkeypatch) -> None:
+    from app.collectors import prometheus as prom_mod
+    from app.collectors.base import CollectorResult
+
+    async def boom(*a, **k):  # pragma: no cover
+        raise AssertionError("no prometheus follow-up for a healthy pod")
+
+    monkeypatch.setattr(prom_mod, "prom_query", boom)
+    k8s = CollectorResult(
+        agent="kubernetes", status="ok", summary="k8s", confidence="medium",
+        details={"pod_statuses": [{"phase": "Running"}], "container_diagnostics": []},
+    )
+    prom = CollectorResult(agent="prometheus", status="ok", summary="p", confidence="medium")
+    out = await prom_mod.prometheus_followup(
+        make_settings(), prom, k8s, replace(make_target(), namespace="team-a", pod="p")
+    )
+    assert out == []

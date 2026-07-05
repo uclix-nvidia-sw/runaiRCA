@@ -13,37 +13,8 @@
 #
 #   ENABLE_TYPEDB=true TYPEDB_ADDRESS=localhost:1729 python -m ontology.load_knowledge
 
-- family: workload_startup_image_failure
+- family: workload_startup_error
   symptoms:
-    - name: Registry Pull Rate Limit
-      keywords: [toomanyrequests, "pull rate limit", "rate limit exceeded"]
-      actions:
-        - "The registry rejected the pull because the anonymous pull limit was hit (common with Docker Hub). Add an ImagePullSecret with a logged-in account to raise the limit."
-        - "Mirror frequently-used images to an internal registry so nodes stop pulling from the internet."
-        - "Retry after the rate-limit window resets if this is a one-off burst (e.g. many nodes pulling at once)."
-    - name: Registry TLS Certificate Error
-      keywords: [x509, "certificate signed by unknown authority", "certificate has expired", "tls handshake timeout"]
-      actions:
-        - "The node does not trust the registry's TLS certificate. Add the registry's CA certificate to the container runtime's trust store on every node."
-        - "If the registry certificate expired, renew it on the registry side."
-        - "Check for a corporate proxy/firewall intercepting TLS between the nodes and the registry."
-    - name: Registry Auth Failure
-      keywords: ["pull access denied", "authentication required", "repository does not exist or may require"]
-      actions:
-        - "Check that the ImagePullSecret exists in the workload's namespace and is referenced by the pod/serviceaccount."
-        - "Verify the credentials still work: try `docker login` / `crane auth login` with the same user."
-        - "Confirm the account has read permission on that specific repository (private repos deny pulls silently)."
-    - name: Registry Unreachable
-      keywords: ["i/o timeout", "connection refused", "no route to host"]
-      actions:
-        - "The node cannot reach the registry over the network. Check proxy/firewall rules and DNS from a node."
-        - "Check that the registry service itself is up and responding."
-        - "Try pulling the image manually from an affected node (e.g. `crictl pull <image>`) to confirm."
-    - name: ImagePullBackOff
-      keywords: [imagepullbackoff, errimagepull, "manifest unknown"]
-      actions:
-        - "Check the image tag/digest and the registry credentials (ImagePullSecret)."
-        - "Confirm the image exists and the node can reach the registry."
     - name: CrashLoopBackOff
       keywords: [crashloopbackoff, "back-off restarting"]
       actions:
@@ -58,14 +29,28 @@
       keywords: [createcontainererror, failedmount, "permission denied"]
       actions:
         - "Check mounted secrets/PVCs and the securityContext (fsGroup/runAsUser)."
-
-- family: scheduling_quota_exhaustion
-  symptoms:
-    - name: Unschedulable GPU
-      keywords: [failedscheduling, unschedulable, "insufficient nvidia.com/gpu"]
+    # --- added from k8s troubleshooting research (learnk8s flowchart, k8s docs, CNCF) ---
+    - name: CreateContainerConfigError — Missing ConfigMap/Secret Key
+      keywords: [createcontainerconfigerror, "couldn't find key", "is not present with pull policy of never", errimageneverpull]
       actions:
-        - "Confirm the queue/project GPU quota against the requested GPU count."
-        - "Check higher-priority workloads consuming the allocation (preemption)."
+        - "Distinct from CreateContainerError (mount/securityContext): here the container config can't be BUILT because a referenced ConfigMap/Secret or one of its keys is missing (the pod stays stuck, it does NOT crash-loop). Read the exact object/key from `kubectl -n <ns> describe pod <p>` Events tail (e.g. 'couldn't find key API_KEY in Secret ns/app-secrets')."
+        - "Confirm the object exists in the SAME namespace and the key is present: `kubectl -n <ns> get configmap,secret` and `kubectl -n <ns> get secret <name> -o yaml` — cross-namespace references never resolve. Fix the secretKeyRef/configMapKeyRef name+key in the pod spec, then let the pod recreate."
+        - "For ErrImageNeverPull / 'is not present with pull policy of Never' (airgap): imagePullPolicy is Never but the image was never loaded on THIS node — check `crictl images | grep <image>` on the scheduled node and pre-load it, or switch to IfNotPresent."
+    - name: Bad Entrypoint / Executable Not Found (RunContainerError)
+      keywords: [runcontainererror, containercannotrun, "executable file not found", "no such file or directory"]
+      actions:
+        - "The container was created but its process could not start: 'executable file not found in $PATH' / Reason ContainerCannotRun / RunContainerError (exit 127 = not found, 126 = not executable). The command/entrypoint is wrong for this image and fails on every start. Run `kubectl describe pod <pod>` and read the Events message."
+        - "Compare the pod's command/args against what the image ships: `kubectl get pod <pod> -o jsonpath='{.spec.containers[*].command}'`; confirm the binary path exists and is +x inside the image."
+        - "For 'not executable', fix the file mode / interpreter (missing shebang, wrong-arch binary); for 'not found', fix the path or install the missing binary in the image."
+    - name: Startup Probe Failing (Never Becomes Ready)
+      keywords: ["startup probe failed"]
+      actions:
+        - "A startupProbe keeps failing, so kubelet never hands off to the liveness/readiness probes and eventually restarts the container before it finishes booting (Warning Unhealthy: Startup probe failed). The app needs longer to start than failureThreshold*periodSeconds allows. Confirm via `kubectl describe pod <pod>` Events."
+        - "Raise the startupProbe failureThreshold/periodSeconds to cover the real cold-start time (model download, DB migration, cache warm) so slow-but-healthy boots survive."
+        - "If the probe endpoint is wrong (path/port), fix it — the app may already be healthy on a different port; confirm with `kubectl logs <pod>`."
+
+- family: runai_scheduling_quota
+  symptoms:
     - name: Preempted By Higher Priority
       keywords: ["preempted by higher priority", "preemption victim", preemptor]
       actions:
@@ -78,15 +63,46 @@
         - "The workload is using over-quota (spare) GPUs, which can be reclaimed at any moment — this is normal Run:ai elasticity, not a fault."
         - "Adjust the project's over-quota weight if it should get a larger share of spare capacity."
         - "Move the workload to a within-quota request if it needs stable, non-reclaimable GPUs."
+    # Run:ai runs its OWN scheduler (runai-scheduler-default in the runai namespace),
+    # separate from the Kubernetes scheduler. A workload that "suddenly died" or pends
+    # is often decided HERE, not by kube-scheduler, so its logs are the primary source.
+    # Concepts: gang/pod-groups, deserved vs over-quota, fairshare, priority, reclaim.
+    # Ref: run-ai-docs.nvidia.com/self-hosted/platform-management/runai-scheduler/scheduling/concepts-and-principles
+    - name: Reclaimed To Rebalance Fairshare
+      keywords: [reclaim, reclaimed, reclaiming, fairshare, "fair share"]
+      actions:
+        - "The Run:ai scheduler reclaimed this workload's OVER-QUOTA GPUs to return them to a project that deserves them (deserved quota) or to rebalance fairshare across projects/departments. This inter-project reclaim is distinct from priority preemption and is expected Run:ai elasticity, not a fault. Read the Run:ai scheduler logs: `kubectl logs -n runai deploy/runai-scheduler-default` and grep the workload/project name for the reclaim decision."
+        - "To keep GPUs stable, run the workload WITHIN the project's deserved (guaranteed, non-reclaimable) quota instead of over-quota."
+        - "If reclaim happens too often, rebalance the project/department deserved quota or over-quota weights."
+    - name: Gang Or Pod-Group Not Scheduling
+      keywords: ["pod group", pod-group, podgroup, "gang schedul", podgroupunschedulable]
+      actions:
+        - "Run:ai gang-schedules by pod-group: a multi-pod workload is either FULLY scheduled or FULLY pending, so a single unplaceable pod keeps the whole group Pending. Read the runai-scheduler-default logs plus the pod-group-controller / pod-grouper pods in the runai namespace for why the group could not gang."
+        - "Verify the SUM of the group's pod requests fits one node pool's free + reclaimable capacity, and that topology/affinity/GPU-fraction constraints are not fragmenting placement."
+        - "For distributed (leader/worker) workloads, confirm all sub-groups can be placed together."
+    - name: Node Defragmentation
+      keywords: [defragment, defragmentation, "single node"]
+      actions:
+        - "GPUs are free in the node pool but not enough on ONE node — e.g. a 4-GPU workload can't fit a pool with 8 free GPUs spread as 4×(2/8). Check the Overview dashboard 'Free nodes by node pool' and the Nodes page ordered by 'Allocated GPU' for a node with enough contiguous GPUs."
+        - "Multi-node workloads tend to allocate whole nodes' GPUs, so they suffer most from fragmentation — look for partially-full nodes (e.g. 4/8) blocking placement."
+    # No bare "evicted" here — that collides with kubelet node-pressure eviction
+    # (a different track). Run:ai scheduler eviction is identified by suspended /
+    # scheduling-rule, and by the reclaim/preempt symptoms above.
+    - name: Suspended By Scheduling Rules Or Eviction
+      keywords: [suspended, idleness, "runtime rule", "scheduling rule"]
+      actions:
+        - "A workload flipped to Suspended is usually hit by a project Scheduling Rule (idleness limit or total-runtime limit, per workload type) OR was evicted. The scheduling event carries the reason."
+        - "For eviction, compare the evicted workload's requested/deserved resources against the workload that took them (higher priority, or a deserved-quota reclaim)."
     - name: Quota Or Request Changed
-      keywords: [preempt, quota]
+      keywords: [preempt, "project quota", "queue quota", "gpu quota"]
       actions:
         - "Review whether the queue/project quota or the workload's GPU request changed recently."
+    # --- added from k8s troubleshooting research (learnk8s flowchart, k8s docs, CNCF) ---
 
 - family: node_kubelet_pressure
   symptoms:
     - name: Node Disk Pressure
-      keywords: [diskpressure, evicted]
+      keywords: [diskpressure, "low on resource"]
       actions:
         - "Cordon/drain the node if multiple unrelated workloads are affected."
         - "Inspect kubelet disk usage and image/log growth on the node."
@@ -121,6 +137,25 @@
       actions:
         - "The node hit its kernel file-descriptor limit (often the 65535 default), which breaks kubelet<->device-plugin sockets and flaps GPU health/readiness. Raise fs.file-max (e.g. 524288) in /etc/sysctl.conf and apply with `sysctl -p` — no pod restart needed."
         - "Roll the sysctl change out to every node (e.g. `pdsh` from the proxy/deploy host) so the limit survives reboot."
+    # --- added from k8s troubleshooting research (learnk8s flowchart, k8s docs, CNCF) ---
+    - name: PLEG Not Healthy / Container Runtime Down
+      keywords: ["pleg is not healthy", "container runtime is down", "unable to determine runtime api version", "failed to get sandbox runtime"]
+      actions:
+        - "For 'PLEG is not healthy' the kubelet's Pod Lifecycle Event Generator relist didn't finish within 3 min so the node flips NotReady — usually a slow/overloaded (but alive) container runtime. On the node `journalctl -u kubelet | grep -i pleg`, check CPU saturation, boot-disk I/O throttling, and pod count `kubectl get pods -A --field-selector spec.nodeName=<node> | wc -l`."
+        - "For 'container runtime is down' / 'unable to determine runtime API version' the kubelet can't reach the CRI socket so no pods start — check the daemon (`systemctl status containerd`) and socket (`ls -l /run/containerd/containerd.sock`); this is the runtime DAEMON down, distinct from a CNI 'container runtime network not ready'."
+        - "Cordon the node (`kubectl cordon <node>`), then restart the runtime and kubelet (`systemctl restart containerd && systemctl restart kubelet`); read `journalctl -u containerd` for a panic/OOM if it crash-loops."
+    - name: Node Heartbeat / Lease Update Lost (Node Unknown)
+      keywords: ["kubelet stopped posting node status", nodestatusunknown, "failed to update node lease", node.kubernetes.io/unreachable]
+      actions:
+        - "Node conditions flipped to Unknown / NotReady because the kubelet stopped renewing its Lease or posting NodeStatus (kubelet crashed, node hung, network partition, or a stale API-server connection). On the node `systemctl status kubelet` and `journalctl -u kubelet | grep -iE 'node lease|node status|closed network'`; from a healthy node confirm with `kubectl describe node <node>` (Reason=NodeStatusUnknown)."
+        - "Kubernetes auto-applies `node.kubernetes.io/unreachable:NoExecute` and evicts pods after ~5 min; if the kubelet is posting to a dead socket ('use of closed network connection'), `systemctl restart kubelet` re-establishes it and the node returns Ready."
+        - "Rule out the runtime under it (`systemctl status containerd`) and node clock/certs — an expired kubelet client-cert also stops heartbeats (`journalctl -u kubelet` shows the TLS rejection); check the API server / LB in front of the node is reachable."
+    - name: Node Inode Exhaustion (DiskPressure by inodesFree)
+      keywords: [nodefs.inodesfree, imagefs.inodesfree, "free inodes on filesystem", "clock skew detected"]
+      actions:
+        - "DiskPressure fired on INODES not bytes — the disk can look half-empty in `df -h` yet be full. Confirm with `df -i` on the node to find the filesystem at ~100% IUSE; the usual cause is millions of tiny files (unrotated logs, cache/emptyDir churn). Find it: `find /var/lib/kubelet /var/log/pods -xdev -type f | head`, then clean/rotate and set ephemeral-storage limits."
+        - "If imagefs.inodesFree is the signal, prune stale container layers: `crictl rmi --prune`."
+        - "For 'clock skew detected' the node's clock drifted enough that kubelet TLS to the apiserver fails validation — check `timedatectl` / `chronyc tracking` (offset should be sub-second), fix the NTP source (`systemctl status chronyd`, `chronyc makestep`), then restart kubelet so it renews its cert."
 
 - family: gpu_hardware_error
   symptoms:
@@ -155,11 +190,13 @@
         - "The GPU is slowing itself down to avoid overheating — jobs run slower but don't crash. Check GPU temperatures with `nvidia-smi -q -d TEMPERATURE`."
         - "Check server airflow, fans, and datacenter/rack inlet temperature."
         - "If cooling can't be fixed quickly, lower the GPU power limit (`nvidia-smi -pl`) as a stopgap."
+    # Fault/diagnostic context only — bare "dcgm" collided with the metrics track's
+    # DCGM exporter symptom (observability_accuracy) and the DCGM_FI_DEV_* metric names.
     - name: DCGM Error
-      keywords: [dcgm]
+      keywords: ["dcgm error", "dcgm health", dcgmi]
       actions:
-        - "Check the dcgm-exporter pod logs on the node; a broken exporter breaks GPU metrics/alerts even when the GPU is fine."
         - "Run a DCGM health check on the node (`dcgmi diag -r 2`) to test the GPU hardware itself."
+        - "Check the dcgm-exporter pod logs on the node for the reported GPU fault (a broken exporter, by contrast, is a metrics issue, not a hardware fault)."
         - "Correlate with any Xid errors in the node's kernel log to separate monitoring issues from real hardware faults."
 - family: network_fabric_error
   symptoms:
@@ -212,8 +249,39 @@
       actions:
         - "The CNI agent (calico/cilium) on the node is unhealthy — pod networking on that node degrades or new pods fail to start. Check the agent pod's logs and restarts."
         - "For calico, check BGP peer state (`calicoctl node status`); for cilium, `cilium status` on the node."
+    # --- added from k8s troubleshooting research (learnk8s flowchart, k8s docs, CNCF) ---
+    - name: Service Has No Endpoints (Selector/Port/Readiness Mismatch)
+      keywords: ["no endpoints available", "0 endpoints", "endpoints: <none>", "has no endpoints"]
+      actions:
+        - "The Service resolves but routes to zero backends (503 / SYN_SENT hang). Confirm: `kubectl -n <ns> get endpoints <svc>` (or `kubectl -n <ns> get endpointslice -l kubernetes.io/service-name=<svc>`) shows <none>."
+        - "Compare the Service selector against pod labels: `kubectl -n <ns> get svc <svc> -o jsonpath='{.spec.selector}'` vs `kubectl -n <ns> get pods --show-labels` — align the selector with the Deployment's `spec.template.metadata.labels` (not the Deployment's own labels). A label refactor / Helm upgrade is the usual cause."
+        - "If labels match, the backing pods are just not Ready (only Ready pods become endpoints) or `targetPort` doesn't match a real `containerPort` — `kubectl -n <ns> describe pod <p>` for readiness and confirm the port the app actually listens on with `kubectl -n <ns> exec <pod> -- ss -ltnp`."
+    - name: Ingress No Backends / 502 / 503 / Not Adopted
+      keywords: ["default backend - 404", "service does not have any active endpoint", "502 bad gateway", "503 service temporarily unavailable", "upstream connect error"]
+      actions:
+        - "For default-backend 404 / 'Service does not have any active endpoint' the rule's Service has no ready endpoints — `kubectl -n <ns> describe ingress <ing>`, then `kubectl -n <ns> get endpoints <backend-svc>`; confirm the backend service.name/port EXISTS in the SAME namespace as the Ingress."
+        - "For 502/503/'upstream connect error' the controller is up but can't reach the upstream OR no controller adopted the Ingress — check `kubectl -n <ns> get ingress <ing> -o jsonpath='{.spec.ingressClassName}'` matches an existing IngressClass (else ADDRESS stays empty), and confirm a controller is Running: `kubectl -n <ingress-ns> get pods -l app.kubernetes.io/name=ingress-nginx`."
+        - "Read the controller for the exact host/path reason: `kubectl -n <ingress-ns> logs -l app.kubernetes.io/name=ingress-nginx` and verify the upstream pod actually listens on the target port."
+    - name: kube-proxy Not Programming Service Rules
+      keywords: [kube-proxy, "failed to execute iptables-restore", "another app is currently holding the xtables lock", "failed to add ipvs service", "failed to sync iptables rules"]
+      actions:
+        - "ClusterIPs stop routing on a node because kube-proxy can't program iptables/IPVS rules while pods look healthy (reachable-from-some-nodes-but-not-others points here, not DNS). Read the node's kube-proxy logs: `kubectl logs -n kube-system -l k8s-app=kube-proxy --field-selector spec.nodeName=<node>`."
+        - "'another app is currently holding the xtables lock' means firewalld / a HostNetwork pod / another iptables writer holds /run/xtables.lock — ensure /run/xtables.lock is mounted into kube-proxy and stop competing writers. For IPVS 'failed to add ipvs service', confirm the ip_vs modules are loaded (`lsmod | grep ip_vs`)."
+        - "On the node verify the rules exist: `iptables-save | grep <clusterIP>` (iptables) or `ipvsadm -Ln | grep <clusterIP>` (IPVS); if empty or kube-proxy is crash-looping there, delete its DaemonSet pod on that node to restart it."
+    - name: Conntrack Table Full / IP Pool Exhaustion
+      keywords: ["nf_conntrack: table full", "table full, dropping packet", nf_conntrack_max, "failed to allocate address", "no ip addresses available", "exhausted the ip address range"]
+      actions:
+        - "For 'nf_conntrack: table full, dropping packet' the node's connection-tracking table is full so new connections (Service DNAT, cross-node pod traffic) are silently dropped — intermittent timeouts under load. Confirm on the node: `dmesg | grep nf_conntrack` and `cat /proc/sys/net/netfilter/nf_conntrack_count` vs `..._max`; raise `net.netfilter.nf_conntrack_max` via sysctl and find the connection-churn source."
+        - "For CNI IPAM 'failed to allocate address' / 'no IP addresses available' new pods stick in ContainerCreating with no IP — check IPAM state (Calico `calicoctl ipam show --show-blocks`, node CIDR `kubectl get node <node> -o jsonpath='{.spec.podCIDR}'`); the per-node pod CIDR/pool is exhausted."
+        - "Free IPs by removing leaked/terminating pods, or restart the CNI agent pod on the affected node to reconcile stale allocations; expand the IP pool only if the density is legitimate."
+    - name: NetworkPolicy / MTU / CoreDNS-Forward Timeout
+      keywords: [networkpolicy, "connect: connection timed out", "needs to be fragmented but df set", servfail, plugin/errors]
+      actions:
+        - "For 'connect: connection timed out' (NOT connection refused) between two up pods, suspect a default-deny/misconfigured NetworkPolicy: `kubectl get networkpolicy -n <ns>` and `kubectl describe networkpolicy <p> -n <ns>`; match ingress/egress selectors+ports against the client pod's labels, and ensure a default-deny egress still allows UDP/TCP 53 to kube-system (else all DNS breaks)."
+        - "For large payloads / TLS handshakes hanging while small requests work ('needs to be fragmented but DF set'), it's an overlay MTU mismatch — test `ping -M do -s 1450 <peer-pod-ip>` from a pod, compare `kubectl exec <pod> -- ip link show eth0` MTU against the CNI's expected value (VXLAN 1450 / IPIP 1480), and fix the MTU in the CNI config."
+        - "For CoreDNS SERVFAIL / 'plugin/errors' (upstream forward failing, distinct from in-cluster NXDOMAIN) read `kubectl logs -n kube-system -l k8s-app=kube-dns` and confirm the Corefile 'forward' upstreams are reachable on 53 from a CoreDNS node."
 
-- family: storage_io_error
+- family: k8s_storage_error
   symptoms:
     - name: Volume Attach/Mount Failure
       keywords: [failedattachvolume, "unable to attach or mount volumes", "timed out waiting for the volume", "multi-attach error"]
@@ -227,6 +295,178 @@
         - "Run `kubectl describe pvc <name>` — the events say why provisioning failed."
         - "Confirm the requested StorageClass exists and its provisioner is running."
         - "Check the storage backend has free capacity for the requested size."
+    - name: Volume Node Affinity Conflict (Zonal Disk)
+      keywords: ["volume node affinity conflict", "had volume node affinity conflict"]
+      actions:
+        - "A FailedScheduling event line 'node(s) had volume node affinity conflict' means the bound PV is pinned to a topology (zone/node) via its nodeAffinity and no schedulable node matches — a storage-topology block, not a plain resource shortage (common with zonal EBS/PD in a different AZ than free nodes)."
+        - "Read the PV's constraint: `kubectl get pv $(kubectl get pvc <pvc> -n <ns> -o jsonpath='{.spec.volumeName}') -o jsonpath='{.spec.nodeAffinity}'`, then compare to node labels `kubectl get nodes -L topology.kubernetes.io/zone`."
+        - "Fix by ensuring schedulable capacity in the volume's zone, or recreate the PVC with a `volumeBindingMode: WaitForFirstConsumer` StorageClass so the volume provisions in the zone where the pod actually lands."
+    - name: CSI Mount RPC Timeout / Driver Not Registered
+      keywords: ["mountvolume.setup failed for volume", "rpc error: code = deadlineexceeded", "not found in the list of registered csi drivers", "mountvolume.mountdevice failed for volume"]
+      actions:
+        - "For 'MountVolume.SetUp failed ... rpc error: code = DeadlineExceeded' the CSI node driver's NodeStage/NodePublish RPC didn't return in time — read the CSI node DaemonSet pod on that node `kubectl -n <csi-ns> logs <csi-node-pod> -c csi-driver` for lock contention/queue depth, and confirm the controller can reach the storage/cloud API."
+        - "For 'driver name X.csi.k8s.io not found in the list of registered CSI drivers' the node plugin isn't registered — check the CSI node DaemonSet is Running on that node (`kubectl -n <csi-ns> get pod -o wide | grep <node>`), the CSIDriver object exists (`kubectl get csidriver`), and the registration socket is under /var/lib/kubelet/plugins_registry."
+        - "For 'MountVolume.MountDevice failed ... mount failed: exit status 32' (wrong fs type/bad superblock) the block device won't mount — on the node run `blkid <dev>` and `dmesg | tail`; a corrupt or mismatched filesystem needs fsck/xfs_repair (never on a volume attached elsewhere) or a corrected StorageClass fsType."
+    - name: Volume Expansion Failed / Orphaned Pod Volume Dir
+      keywords: [volumeresizefailed, externalexpanding, "orphaned pod", "error not a directory occurred when trying to remove the volumes dir"]
+      actions:
+        - "For 'VolumeResizeFailed' / 'ExternalExpanding' on `kubectl describe pvc <name>` a PVC size increase stalled — read the external-resizer sidecar `kubectl -n <csi-ns> logs <csi-controller-pod> -c csi-resizer`, confirm the StorageClass has `allowVolumeExpansion: true`; if controller-side grew but the fs didn't, restart the pod so kubelet re-runs NodeExpandVolume."
+        - "For kubelet spamming 'orphaned pod <uid> found, but error not a directory occurred when trying to remove the volumes dir' (in `journalctl -u kubelet`) a stale CSI vol_data.json survived a hard reboot/ungraceful deletion — on the node remove the leftover /var/lib/kubelet/pods/<uid> dir after confirming detach, then restart kubelet."
+        - "Recurring orphan errors across many nodes point at ungraceful node shutdowns — verify graceful-shutdown handling so kubelet unmounts volumes before the node stops."
+
+- family: workload_runtime_error
+  symptoms:
+    - name: CUDA Out Of Memory
+      keywords: ["cuda out of memory", "torch.cuda.outofmemoryerror", "cuda oom"]
+      actions:
+        - "The APPLICATION ran out of GPU memory (this is not the container OOMKilled case). Reduce batch size / sequence length, or enable activation checkpointing / gradient accumulation."
+        - "Check whether another process shares the same GPU (`nvidia-smi` memory per PID) — fractional-GPU or leaked processes shrink the usable VRAM."
+        - "If it appears after many steps, look for a GPU-memory leak (tensors kept on device, growing cache) rather than a sizing problem."
+    - name: Application Crash / Traceback
+      keywords: ["traceback (most recent call last)", "unhandled exception", "segmentation fault", "core dumped"]
+      actions:
+        - "The workload's own code crashed while running. Read the last traceback in the pod logs — the RCA is in the application, not the platform."
+        - "Compare with the last successful run: what changed (image, code, data, config)?"
+        - "In distributed training, the FIRST crashing rank is the cause; every other rank then fails with communication timeouts."
+
+- family: runai_control_plane_error
+  symptoms:
+    # No bare "scheduler" — it matches the runai-scheduler pod name in every log
+    # stream and falsely elevates control-plane for plain scheduling/kube-scheduler
+    # events. Keep phrases that only appear when the control-plane service errors.
+    - name: Scheduler Or Reconcile Error
+      keywords: ["scheduler panic", "scheduler error", reconcile, "database error", authorization]
+      actions:
+        - "Inspect runai/runai-backend logs around the alert window for scheduler/quota/db errors."
+        - "Check whether several workloads in the same queue/project changed state together."
+        - "Escalate to Run:ai platform owners for repeated control-plane errors."
+    - name: Cluster-Sync Out Of Sync Or OOM
+      keywords: [cluster-sync, "out of sync", "status out of sync"]
+      actions:
+        - "A workload's status looking wrong in the UI but fine in the cluster usually means cluster-sync is out of sync. Compare the cluster truth (`kubectl get <workloadkind> <name> -o yaml`) and grep the cluster-sync logs for the workload name."
+        - "Frequent cluster-sync restarts / OOM kills leave status stale — raise cluster-sync resources via runaiconfig."
+    - name: Illegal Workload Crashing Controllers
+      keywords: ["workload-controller", "illegal workload"]
+      actions:
+        - "An illegal/legacy workload (old-version, or a raw-YAML submission) can crash workload-controller and cluster-sync. The offending workload is usually named in the logs right before the crash — find it and delete it."
+    - name: Cluster Disconnected
+      keywords: [disconnected, traefik, "token used before issued", "token expired", "clock sync"]
+      actions:
+        - "'Disconnected' means cluster-sync could not push updates to the control plane. Check cluster-sync for OOM / periodic crashes and read its logs for the specific error."
+        - "Rule out network errors to the backend; check the runai-backend-traefik pod for token errors."
+        - "Clock skew between cluster and backend causes 'token used before issued' / 'token expired' — sync NTP on both sides."
+    - name: Missing Prerequisites Or Service Issues
+      keywords: ["missing prerequisites", runai-toolkit, "required operators", "service issues"]
+      actions:
+        - "Missing prerequisites: confirm the required operators run and their namespaces are the defaults (prometheus→monitoring, gpu-operator→gpu-operator); check the runai-operator logs."
+        - "Service issues: a pod in a runai namespace isn't Running — the UI info sign names the affected service. Effects are per-service (e.g. project-controller → only project CRUD; gpu-operator → can't submit GPU workloads). Control-plane CRUD still works while the agent pod is healthy."
+        - "runai-toolkit is a daemonset on every node; if it crashes due to a node issue, cordon that node."
+    # --- added from k8s troubleshooting research (learnk8s flowchart, k8s docs, CNCF) ---
+
+- family: observability_accuracy
+  symptoms:
+    - name: No Metrics — Thanos Down
+      keywords: [thanos-query, thanos-receive, thanos, "no metrics"]
+      actions:
+        - "Metrics are written to Thanos (runai-backend). Check thanos-query and thanos-receive are Running (`kubectl -n runai-backend get po | grep thanos`), then describe/logs for errors — receive storage full/inaccessible, query can't reach receive, or OOM (exit code in `describe`)."
+        - "Confirm the Thanos PVC is Bound: `kubectl -n runai-backend get pvc`."
+    - name: No Metrics — Prometheus Down
+      keywords: ["prometheus-runai-0", "remote write", "prometheus disk full"]
+      actions:
+        - "Check the runai Prometheus (`kubectl -n runai get po prometheus-runai-0`, then its logs). Look for ACUTE errors — disk full, repeated remote-write failures (some errors are benign)."
+        - "Port-forward Prometheus and check the runai targets' status; verify the target pod is up and its node has no network issues."
+    # Keyed on the exporter/metric names (metrics track), NOT bare "dcgm" — that
+    # collides with gpu_hardware_error where DCGM reports an actual GPU fault.
+    - name: Partial GPU Metrics — DCGM
+      keywords: [dcgm-exporter, "dcgm_fi_dev", "gpu number", "gpu nodes are 0"]
+      actions:
+        - "GPU count 0 / incorrect: port-forward Prometheus and check DCGM_FI_DEV_FB_FREE / _FB_USED / _GPU_UTIL. If none show, check the gpu-operator configuration; if only some nodes are missing, check the dcgm-exporter instance on those nodes."
+    - name: Partial Run:ai Metrics — Metrics Exporter
+      keywords: [metrics-exporter, "metrics exporter"]
+      actions:
+        - "Missing Project/Workload metrics: check the metrics-exporter pod in the runai namespace (get/describe). Port-forward Prometheus and check its metrics-exporter target — if down, colocate Prometheus and metrics-exporter on the same node; add memory if it was OOM-killed."
+    - name: Metrics Slowness
+      keywords: ["metrics slow", "dashboard slow", "thanos slow"]
+      actions:
+        - "Give thanos-receive and thanos-query more CPU/memory via the helm chart (e.g. thanos.receive 6G/1cpu, thanos.query 2G/1cpu)."
+        - "Ensure Thanos runs on fast storage; if storage is slow, move thanos-receive off the slow node (cordon + delete the pod to reschedule)."
+
+- family: platform_auth_error
+  symptoms:
+    - name: Login 401 — Missing Token Attributes
+      keywords: ["failed to authenticate", email_verified, "http 401", "401 error"]
+      actions:
+        - "Get the user's token and verify it carries the required attributes (email, email_verified). For a LOCAL user with missing attributes, contact Run:ai support; for an SSO user, follow the SAML/OIDC troubleshooting."
+    - name: Permissions 403 / Partial Project Visibility
+      keywords: ["doesn't have permission", "can't see all projects", "access rules", "http 403"]
+      actions:
+        - "403 or partial project visibility means wrong user attributes/permissions. Verify the Access Rules page, decide which attribute is expected (email or SSO group), and check that attribute in the JWT token. If the token's attributes are wrong, fix the SAML/OIDC response from the IdP."
+    - name: SAML Misconfiguration
+      keywords: [saml, assertion, "entity id", assertionconsumerservice, attributestatement]
+      actions:
+        - "SAML passes identity via an XML assertion. Capture the 'saml' network call (browser devtools → Network), decode+inflate the request, and confirm <saml:Issuer>=Entity ID and AssertionConsumerServiceURL=Redirect URI. On the response, decode and check <saml:AttributeStatement> — the email attribute is mandatory and every attribute must match the Run:ai settings."
+    - name: OIDC Misconfiguration
+      keywords: [oidc, "discovery url", "client secret", "client id", "id token claims", openid]
+      actions:
+        - "OIDC issues a JWT with user claims. Verify the Discovery URL, Client ID/Secret, and scopes (openid, email). Simulate the code exchange at openidconnect.net (temporarily add its callback as a valid redirect URI in the IdP) and confirm the ID token carries the mandatory (email) and optional claims correctly."
+    - name: UI / API Error Codes
+      keywords: ["http 503", "http 500", "service isn't responsive", "failed api call"]
+      actions:
+        - "Read UI failures from the browser Network page (failed API calls) and Console page. 401=auth (token attributes), 403=permissions, 503=service unresponsive (check the relevant micro-service pod, e.g. the org-unit/project pod for an org-unit API call), 500=internal error (check the related pod logs)."
+    # --- added from k8s troubleshooting research (learnk8s flowchart, k8s docs, CNCF) ---
+    - name: kubectl RBAC Forbidden (403)
+      keywords: ["error from server (forbidden)", "is forbidden: user", "cannot list resource", "cannot create resource"]
+      actions:
+        - "The apiserver authenticated the identity but RBAC denies the verb/resource named in the message (distinct from 401, where the credential itself is rejected). Reproduce the exact check: `kubectl auth can-i <verb> <resource> -n <ns> --as=<user-or-serviceaccount>` (e.g. `--as=system:serviceaccount:runai:<sa>`)."
+        - "List what the identity actually has: `kubectl auth can-i --list --as=<identity> -n <ns>`, then bind the missing Role/ClusterRole with a RoleBinding/ClusterRoleBinding in the right namespace."
+        - "For a Run:ai component ServiceAccount, confirm its RoleBinding still points at the right SA after an upgrade/reinstall (`kubectl -n runai get rolebindings -o wide`) — a renamed SA silently drops the binding and breaks only that controller's reconcile."
+    - name: kubectl Unauthorized (401) — Bad/Expired Credentials
+      keywords: ["you must be logged in to the server (unauthorized)", "the server has asked for the client to provide credentials", "error from server (unauthorized)", "invalid bearer token"]
+      actions:
+        - "The apiserver returned 401 — the credential (token or client cert) is missing, malformed, expired, or untrusted (distinct from 403 RBAC). Check which context/credential kubectl uses: `kubectl config current-context` and `kubectl config view --minify`; for an expired client cert, `kubeadm certs check-expiration` or `openssl x509 -noout -enddate -in <client.crt>`."
+        - "For a rotated cluster, copy the fresh `/etc/kubernetes/admin.conf` from a control-plane node into `~/.kube/config`; for a ServiceAccount token, confirm the token secret still exists and is mounted."
+        - "If ONLY this client is Unauthorized while others work, the problem is local credentials; if EVERY client is Unauthorized, suspect the apiserver's authn config (rotated signing key / OIDC issuer): `kubectl -n kube-system logs -l component=kube-apiserver | grep -i unauthorized`."
+
+- family: k8s_control_plane_error
+  # The Kubernetes cluster's OWN control plane (apiserver/etcd/kube-scheduler/
+  # controller-manager/kubelet certs/admission webhooks) — distinct from the Run:ai
+  # platform control plane (runai-scheduler / runai-backend / cluster-sync).
+  symptoms:
+    - name: kube-apiserver Unreachable From kubectl
+      keywords: ["the connection to the server", "couldn't get current server api group list", "unable to connect to the server", ":6443"]
+      actions:
+        - "kubectl cannot reach the kube-apiserver. From a control-plane node check the static pod: `crictl ps | grep kube-apiserver`, then `crictl logs <apiserver-container>` (or `journalctl -u kubelet` for the static-pod restart loop)."
+        - "Verify the kubeconfig points at the live endpoint/port (`kubectl config view --minify`) and the API VIP/load-balancer is healthy (`curl -k https://<vip>:6443/healthz`) before blaming the server itself."
+        - "If the apiserver pod won't start, check its backing store — the apiserver fails to come up when etcd is unreachable or its data is lost (see the etcd symptom)."
+    - name: etcd Quorum Lost / Request Timed Out
+      keywords: ["etcdserver: request timed out", "etcdserver: no leader", "etcdserver: leader changed", "failed to send out heartbeat on time", "waiting for readindex response took too long"]
+      actions:
+        - "etcd is the apiserver's backing store — with no leader/quorum every write fails and operators crash-loop. Check member health from a control-plane node: `etcdctl endpoint health --cluster` and `etcdctl endpoint status --cluster -w table`; a 3-node cluster needs 2 up."
+        - "Read the etcd static-pod logs (`crictl logs <etcd-container>`) for 'etcdserver: leader changed' / 'request timed out'; 'failed to send out heartbeat' / 'waiting for readindex response took too long' point at slow disk or CPU starvation — check `iostat -x 1`, give etcd dedicated SSD/NVMe."
+        - "Restore quorum BEFORE touching workloads — bring the down member's node back, don't delete etcd data while degraded; verify apiserver-etcd-client cert validity (`kubeadm certs check-expiration`) if etcd rejects the apiserver."
+    - name: Control-Plane / kubelet Certificate Expired
+      keywords: ["kubeadm certs check-expiration", "unable to load server certificate"]
+      actions:
+        - "A control-plane client/serving cert expired (or 'is not yet valid' = a node clock is BEHIND), so apiserver/controller-manager/scheduler/kubelet reject each other's TLS. On a control-plane node run `kubeadm certs check-expiration` to see which cert is past EXPIRES."
+        - "Renew with `kubeadm certs renew all`, then restart the control-plane static pods (move manifests out/in of /etc/kubernetes/manifests, or `crictl rm` them) so they reload; refresh the admin kubeconfig with `kubeadm init phase kubeconfig admin`."
+        - "For 'is not yet valid' fix the NODE CLOCK not the cert (`timedatectl`, `chronyc makestep`); distinguish an expired cert (renew) from a wrong CA ('signed by unknown authority', needs the correct CA in kubeconfig)."
+    - name: Admission Webhook Timeout / Unreachable
+      keywords: ["failed calling webhook", "admission webhook", "denied the request"]
+      actions:
+        - "An admission webhook the apiserver must call is unreachable, slow, or has a bad cert, so creates/updates are blocked cluster-wide. Match the failing webhook name from the error: `kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations`."
+        - "Check the webhook's backing service has endpoints and its pods are up: `kubectl -n <ns> get endpoints <webhook-svc>` (empty = pod down) and `kubectl -n <ns> get pods`; a NetworkPolicy can block the apiserver->webhook path."
+        - "If non-critical, unblock with `kubectl patch <validating|mutating>webhookconfiguration <name> --type=json -p '[{\"op\":\"replace\",\"path\":\"/webhooks/0/failurePolicy\",\"value\":\"Ignore\"}]'` or delete the config. For the x509 error, the webhook's caBundle no longer matches its serving cert — regenerate/patch the caBundle."
+    - name: Control-Plane Component Lost Leader Lease
+      keywords: ["leaderelection lost", "failed to renew lease", "stopped leading"]
+      actions:
+        - "The kube-controller-manager or kube-scheduler lost its leader lease and stopped reconciling (pods stay Pending, endpoints stop updating). See which lease flapped: `kubectl -n kube-system get lease kube-controller-manager kube-scheduler -o wide` (holderIdentity + renewTime)."
+        - "Read the static-pod logs on the control-plane node: `kubectl -n kube-system logs -l component=kube-controller-manager --tail=100` (and `-l component=kube-scheduler`), or `/var/log/kube-controller-manager.log`."
+        - "Flapping leader election is almost always apiserver/etcd latency underneath — if all components flap together, fix the apiserver/etcd path first (see those symptoms). Once the apiserver is reachable the lease moves to a healthy replica on its own."
+
+- family: storage_backend_error
+  # Backend storage health (NFS server, Ceph cluster, node filesystem) —
+  # distinct from the k8s CSI/PVC provisioning layer above.
+  symptoms:
     - name: Node Filesystem Read-Only
       keywords: ["read-only file system"]
       actions:
@@ -244,27 +484,94 @@
       actions:
         - "Check `ceph -s` on the storage cluster: OSD down / degraded PGs / slow ops explain cluster-wide slow or failing volumes."
         - "RBD/CephFS volumes will stall pod IO cluster-wide — prioritize the storage cluster recovery over per-pod debugging."
+    # --- added from k8s troubleshooting research (learnk8s flowchart, k8s docs, CNCF) ---
 
-- family: workload_runtime_error
+- family: image_pull_error
+  # Image PULL / registry problems (rate limit, bad tag, auth, TLS, 5xx) —
+  # distinct from the container's own startup/config/crash faults above.
   symptoms:
-    - name: CUDA Out Of Memory
-      keywords: ["cuda out of memory", "torch.cuda.outofmemoryerror", "cuda oom"]
+    - name: Registry Pull Rate Limit
+      keywords: [toomanyrequests, "pull rate limit", "rate limit exceeded"]
       actions:
-        - "The APPLICATION ran out of GPU memory (this is not the container OOMKilled case). Reduce batch size / sequence length, or enable activation checkpointing / gradient accumulation."
-        - "Check whether another process shares the same GPU (`nvidia-smi` memory per PID) — fractional-GPU or leaked processes shrink the usable VRAM."
-        - "If it appears after many steps, look for a GPU-memory leak (tensors kept on device, growing cache) rather than a sizing problem."
-    - name: Application Crash / Traceback
-      keywords: ["traceback (most recent call last)", "unhandled exception", "segmentation fault", "core dumped"]
+        - "The registry rejected the pull because the anonymous pull limit was hit (common with Docker Hub). Add an ImagePullSecret with a logged-in account to raise the limit."
+        - "Mirror frequently-used images to an internal registry so nodes stop pulling from the internet."
+        - "Retry after the rate-limit window resets if this is a one-off burst (e.g. many nodes pulling at once)."
+    - name: Registry TLS Certificate Error
+      keywords: [x509, "certificate signed by unknown authority", "certificate has expired", "tls handshake timeout"]
       actions:
-        - "The workload's own code crashed while running. Read the last traceback in the pod logs — the RCA is in the application, not the platform."
-        - "Compare with the last successful run: what changed (image, code, data, config)?"
-        - "In distributed training, the FIRST crashing rank is the cause; every other rank then fails with communication timeouts."
+        - "The node does not trust the registry's TLS certificate. Add the registry's CA certificate to the container runtime's trust store on every node."
+        - "If the registry certificate expired, renew it on the registry side."
+        - "Check for a corporate proxy/firewall intercepting TLS between the nodes and the registry."
+    - name: Registry Auth Failure
+      keywords: ["pull access denied", "authentication required", "repository does not exist or may require"]
+      actions:
+        - "Check that the ImagePullSecret exists in the workload's namespace and is referenced by the pod/serviceaccount."
+        - "Verify the credentials still work: try `docker login` / `crane auth login` with the same user."
+        - "Confirm the account has read permission on that specific repository (private repos deny pulls silently)."
+    - name: Registry Unreachable
+      keywords: ["i/o timeout", "connection refused", "no route to host"]
+      actions:
+        - "The node cannot reach the registry over the network. Check proxy/firewall rules and DNS from a node."
+        - "Check that the registry service itself is up and responding."
+        - "Try pulling the image manually from an affected node (e.g. `crictl pull <image>`) to confirm."
+    - name: ImagePullBackOff
+      keywords: [imagepullbackoff, errimagepull, "manifest unknown"]
+      actions:
+        - "Check the image tag/digest and the registry credentials (ImagePullSecret)."
+        - "Confirm the image exists and the node can reach the registry."
+    - name: Bad Image Tag — Manifest For Tag Not Found
+      keywords: ["manifest for", "not found: manifest", "no matching manifest for linux/"]
+      actions:
+        - "The image NAME resolves but the TAG does not exist ('manifest for myrepo/app:v2 not found: manifest unknown') — a typo'd or never-pushed tag, distinct from a private-repo auth denial. Read the exact tag: `kubectl describe pod <pod>` Events tail."
+        - "List the tags that actually exist: `crane ls <repo>` or `skopeo list-tags docker://<repo>`, then fix `spec.containers[].image`; pin an immutable digest (`<repo>@sha256:...`) so a deleted/re-pushed tag can't reintroduce it."
+        - "For 'no matching manifest for linux/arm64...' the tag is valid but has no layer for this node's CPU arch — inspect platforms with `docker buildx imagetools inspect <image:tag>`, then publish a multi-arch image or pin the pod to matching nodes with a `kubernetes.io/arch` nodeSelector."
+    - name: Registry Server 5xx / DNS Lookup Failure On Pull
+      keywords: ["received unexpected http status: 5", "unexpected status: 503", "dial tcp: lookup", "server gave http response to https client"]
+      actions:
+        - "For 'received unexpected HTTP status: 5xx': the registry is reachable and auth passed but returned 500/503 serving the manifest/blob — the registry itself is unhealthy/overloaded. A shared-registry 5xx fails EVERY node's pull, so expect broad correlated ImagePull failures; retry `crictl pull <image>` on a node once it recovers, else escalate to the registry owner."
+        - "For 'dial tcp: lookup <registry> ... no such host': the NODE can't resolve the registry hostname (distinct from in-cluster pod DNS). Test node-level resolution on the scheduled node: `nslookup <registry-host>` / `getent hosts <registry-host>` (uses the node's /etc/resolv.conf, not CoreDNS); fix the node's upstream DNS or airgap hosts entry."
+        - "For 'server gave HTTP response to HTTPS client': the registry is HTTP-only but the runtime tried HTTPS — add it as insecure in `/etc/containerd/certs.d/<registry>/hosts.toml` and restart containerd on every node, or (preferred) put a real TLS cert on the registry."
 
-- family: control_plane_error
+- family: k8s_scheduling_error
+  # Kubernetes kube-scheduler predicate failures (taint/affinity/selector/
+  # topology-spread/ResourceQuota) — distinct from the Run:ai scheduler's own
+  # placement/quota/preempt/reclaim decisions above.
   symptoms:
-    - name: Scheduler Or Reconcile Error
-      keywords: [scheduler, reconcile, admission, "database error", authorization]
+    - name: Unschedulable GPU
+      keywords: [failedscheduling, unschedulable, "insufficient nvidia.com/gpu"]
       actions:
-        - "Inspect runai/runai-backend logs around the alert window for scheduler/quota/db errors."
-        - "Check whether several workloads in the same queue/project changed state together."
-        - "Escalate to Run:ai platform owners for repeated control-plane errors."
+        - "Confirm the queue/project GPU quota against the requested GPU count."
+        - "Check higher-priority workloads consuming the allocation (preemption)."
+    # ALWAYS disambiguate which scheduler before diagnosing a scheduling failure:
+    # Run:ai has its OWN scheduler; the Kubernetes default-scheduler is a different
+    # component that does not understand GPU quota / pod-groups.
+    - name: Which Scheduler — Run:ai Or kube-scheduler
+      keywords: [default-scheduler, kube-scheduler, schedulername]
+      actions:
+        - "Disambiguate WHICH scheduler failed by the FailedScheduling event's source and the pod's spec.schedulerName. Run:ai GPU workloads MUST be scheduled by the Run:ai scheduler (schedulerName: runai-scheduler); the Kubernetes default-scheduler does not understand GPU quota or pod-groups."
+        - "Source 'runai-scheduler' (runai-scheduler-default, runai namespace) → a Run:ai placement/quota/preempt/reclaim decision; read `kubectl logs -n runai deploy/runai-scheduler-default`."
+        - "Source 'default-scheduler' on a GPU workload → the pod is BYPASSING Run:ai (wrong/missing schedulerName) and will never get Run:ai GPU scheduling — fix the submission/schedulerName. On a non-GPU/system pod, default-scheduler is expected."
+    - name: No Node Fits — Taint / Affinity / Selector Unmatched
+      keywords: ["untolerated taint", "didn't match pod's node affinity/selector", "didn't match node selector", "didn't have free ports for the requested pod ports", "too many pods"]
+      actions:
+        - "The kube-scheduler found nodes but none satisfy the pod's placement constraints (this is a default-scheduler predicate failure, NOT a Run:ai quota decision). Read the '0/N nodes are available: ...' breakdown in `kubectl describe pod <p>` FailedScheduling Events — the biggest bucket is the primary reason."
+        - "For 'untolerated taint', add a matching toleration or remove the taint (`kubectl taint nodes <node> <key>-`) — but a built-in `node.kubernetes.io/not-ready|unreachable` taint means fix the NODE, not add a toleration. For affinity/selector, diff the pod's nodeSelector/nodeAffinity (`kubectl get pod <p> -o jsonpath='{.spec.nodeSelector}'`) against `kubectl get nodes --show-labels` — a typo'd label key pends forever."
+        - "For 'didn't have free ports for the requested pod ports', a hostPort is already bound on every node — remove the hostPort or reduce replicas below node count. For 'too many pods', every node hit its kubelet --max-pods cap (check `kubectl get node <node> -o jsonpath='{.status.allocatable.pods}'`) — add nodes or raise the cap."
+    - name: Pod Topology Spread / Anti-Affinity Unsatisfiable
+      keywords: ["didn't match pod topology spread constraints", "didn't match pod anti-affinity rules", "didn't satisfy existing pods anti-affinity rules", "didn't match pod affinity rules"]
+      actions:
+        - "A topologySpreadConstraints (whenUnsatisfiable: DoNotSchedule) or inter-pod (anti-)affinity rule can't be met given where matching pods run. Read the rule: `kubectl get pod <p> -n <ns> -o jsonpath='{.spec.topologySpreadConstraints}{.spec.affinity}'`."
+        - "Check how many schedulable domains carry the topologyKey label (`kubectl get nodes -L <topologyKey>`) — anti-affinity/spread needs at least as many labelled domains as replicas; too few domains or missing labels makes it impossible."
+        - "Relax it (raise maxSkew, set whenUnsatisfiable: ScheduleAnyway, or switch required→preferredDuringScheduling), widen the topologyKey, or add capacity in the under-filled domain."
+    - name: Namespace ResourceQuota Rejection At Admission
+      keywords: ["exceeded quota:", "forbidden: exceeded quota", "must specify limits.cpu", "must specify requests.memory"]
+      actions:
+        - "A plain Kubernetes ResourceQuota admission rejection (the pod is NEVER created), distinct from Run:ai project/GPU quota AND from the scheduler failing to place a created pod. It surfaces on the OWNER, not a pod: `kubectl describe replicaset <rs> -n <ns>` shows FailedCreate from replicaset-controller."
+        - "Read exactly what overflowed: `kubectl -n <ns> get resourcequota` then `kubectl -n <ns> describe resourcequota <name>` — compare Used vs Hard for the named resource. Either raise Hard or lower the workload's requests/limits so the sum fits."
+        - "If the message is 'must specify limits.cpu/requests.memory', the namespace quota requires every pod to declare requests/limits — add them to the pod spec or define a LimitRange with defaults."
+    - name: Pending — Node Pool Out Of Resources
+      keywords: ["insufficient cpu", "insufficient memory", "node pool", "not enough resources"]
+      actions:
+        - "Each node pool is a SEPARATE scheduling domain — check free GPU/CPU/CPU-memory in the workload's node pool, not the whole cluster. The scheduling event says how many resources are missing on how many nodes."
+        - "For non-GPU shortfalls, read the pod YAML (`kubectl -n <project-ns> get po <pod> -o yaml`) for the requested cpu/memory/other resources."
+        - "Confirm the requested PVC is Bound: `kubectl -n <project-ns> get pvc <name>` — an unbound volume keeps the pod Pending."

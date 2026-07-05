@@ -1691,6 +1691,7 @@ func TestFeedbackHintsDedupesIncidentCommentsAcrossAlertMemories(t *testing.T) {
 }
 
 func TestFlappingAlertGroupingUsesNamespaceWorkloadAndWindow(t *testing.T) {
+	t.Setenv("FLAPPING_GROUP_WINDOW_MINUTES", "30") // pin the window this test asserts against
 	store := NewStore()
 	base := time.Date(2026, 6, 26, 9, 0, 0, 0, time.UTC)
 	makeAlert := func(namespace, pod, fingerprint string, at time.Time) Alert {
@@ -2408,5 +2409,71 @@ func TestChatAnalysisRequestWithoutAnyAlertCreatesAdHocIncident(t *testing.T) {
 	run := waitForAnalysisRun(t, server, "chat")
 	if run.Status != "complete" {
 		t.Fatalf("unexpected analysis run: %+v", run)
+	}
+}
+
+func TestFlappingWindowGroupsRecurrenceWithinConfiguredWindow(t *testing.T) {
+	t.Setenv("FLAPPING_GROUP_WINDOW_MINUTES", "180") // 3h
+	store := NewStore()
+	if store.flappingWindow != 180*time.Minute {
+		t.Fatalf("flappingWindow = %v, want 180m", store.flappingWindow)
+	}
+	mk := func(ts time.Time) (AlertmanagerWebhook, Alert) {
+		a := Alert{
+			Status:      "firing",
+			Labels:      map[string]string{"alertname": "MemPageFaults", "namespace": "monitoring", "pod": "prometheus-prometheus-node-exporter-qxhvl"},
+			Annotations: map[string]string{},
+			Fingerprint: "fp-mempagefaults",
+			StartsAt:    ts.Format(time.RFC3339),
+		}
+		return AlertmanagerWebhook{}, a
+	}
+	base := time.Now().UTC().Add(-10 * time.Hour)
+	wh, a := mk(base)
+	r1 := store.UpsertAlertResult(wh, a)
+	// recurrence 2h later → within 3h window → SAME incident, occurrence grows
+	wh, a = mk(base.Add(2 * time.Hour))
+	r2 := store.UpsertAlertResult(wh, a)
+	if r2.Incident.IncidentID != r1.Incident.IncidentID {
+		t.Fatalf("2h recurrence should reuse incident: got %s vs %s", r2.Incident.IncidentID, r1.Incident.IncidentID)
+	}
+	if r2.NewAlert {
+		t.Fatalf("2h recurrence should not create a new alert row")
+	}
+	// recurrence 5h after the last → beyond 3h window → NEW incident
+	wh, a = mk(base.Add(7 * time.Hour))
+	r3 := store.UpsertAlertResult(wh, a)
+	if r3.Incident.IncidentID == r1.Incident.IncidentID {
+		t.Fatalf("recurrence beyond window should start a new incident")
+	}
+}
+
+func TestTokenizeKeepsKoreanAndSimilarityIsHighForNearDuplicates(t *testing.T) {
+	// The old tokenizer dropped all Hangul, so near-identical Korean reports scored
+	// ~50%. Korean eojeols must now survive and drive a high similarity.
+	toks := tokenize("노드 192.168.20.172에서 메이저 페이지 폴트 지속 발생 메모리 압박")
+	has := func(w string) bool {
+		for _, tk := range toks {
+			if tk == w {
+				return true
+			}
+		}
+		return false
+	}
+	if !has("노드") || !has("메모리") || !has("페이지") {
+		t.Fatalf("Korean tokens dropped: %v", toks)
+	}
+
+	a := textVector("노드 192.168.20.172에서 초당 500회 이상 메이저 페이지 폴트 지속 발생 — 노드 메모리 압박(스왑/디스크 I/O 증가)이 주원인으로 판단됩니다")
+	b := textVector("노드 192.168.20.172에서 초당 520회 메이저 페이지 폴트 지속 발생 — 노드 메모리/디스크 압박이 주원인으로 판단됩니다")
+	sim := cosineSimilarity(a, b)
+	if sim < 0.8 {
+		t.Fatalf("near-identical Korean reports should score high, got %.2f", sim)
+	}
+
+	// A clearly different incident must NOT score high (no false grouping).
+	c := textVector("GPU XID 79 발생 — GPU가 PCIe 버스에서 떨어져 하드웨어 결함으로 판단됩니다")
+	if s := cosineSimilarity(a, c); s > 0.5 {
+		t.Fatalf("unrelated incident scored too high: %.2f", s)
 	}
 }

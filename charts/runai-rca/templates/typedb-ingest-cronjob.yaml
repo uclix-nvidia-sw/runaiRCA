@@ -1,6 +1,8 @@
 {{- if and .Values.typedb.enabled .Values.typedb.ingest.enabled }}
 {{- /* requireReview=false -> pass --all (ingest resolved incidents regardless of review) */ -}}
 {{- $allFlag := ternary "" "--all " .Values.typedb.ingest.requireReview }}
+{{- /* promoteKnowledge -> also learn confirmed RCAs into reusable knowledge (closes the loop) */ -}}
+{{- $promoteFlag := ternary "--promote-knowledge " "" .Values.typedb.ingest.promoteKnowledge }}
 # Periodic projection of resolved incidents (resolved >= resolvedGraceHours ago)
 # into the TypeDB knowledge graph. The grace window lets late feedback / re-analysis
 # settle; re-fired incidents flip back to 'firing' and are excluded automatically.
@@ -38,7 +40,7 @@ spec:
               imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
               command: ["sh", "-c"]
               args:
-                - "python -m ontology.ingest {{ $allFlag }}--resolved-grace-hours {{ .Values.typedb.ingest.resolvedGraceHours }} --limit {{ .Values.typedb.ingest.limit }}"
+                - "python -m ontology.ingest {{ $allFlag }}{{ $promoteFlag }}--resolved-grace-hours {{ .Values.typedb.ingest.resolvedGraceHours }} --limit {{ .Values.typedb.ingest.limit }}"
               env:
                 - name: ENABLE_TYPEDB
                   value: "true"

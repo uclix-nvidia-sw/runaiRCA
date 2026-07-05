@@ -278,16 +278,16 @@ _FAMILY_MARKERS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ("node_kubelet_pressure", "node kubelet pressure", "node hosting this workload is under"),
         ("diskpressure", "memorypressure", "pidpressure", "kubelet", "evict"),
     ),
-    "scheduling_quota_exhaustion": (
-        ("scheduling_quota_exhaustion", "scheduling quota exhaustion", "queue capacity looks"),
+    "runai_scheduling_quota": (
+        ("runai_scheduling_quota", "scheduling quota exhaustion", "queue capacity looks"),
         ("failedscheduling", "unschedulable", "quota", "preempt", "insufficient gpu"),
     ),
-    "control_plane_error": (
-        ("control_plane_error", "run:ai control-plane error"),
+    "runai_control_plane_error": (
+        ("runai_control_plane_error", "run:ai control-plane error"),
         ("control plane", "control-plane", "admission", "reconcile", "runai-backend"),
     ),
-    "workload_startup_image_failure": (
-        ("workload_startup_image_failure", "workload startup/image failure"),
+    "workload_startup_error": (
+        ("workload_startup_error", "workload startup/image failure"),
         ("imagepullbackoff", "errimagepull", "crashloopbackoff", "oomkilled", "back-off"),
     ),
 }

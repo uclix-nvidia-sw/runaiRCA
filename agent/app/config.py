@@ -78,6 +78,7 @@ class Settings:
     runai_queues_path: str
     runai_version_path: str
     runai_timeout_seconds: int
+    runai_mcp_url: str
     prometheus_url: str
     prometheus_timeout_seconds: int
     prometheus_mcp_url: str
@@ -165,6 +166,7 @@ def load_settings() -> Settings:
         # already-fixed known issues. Best-effort; override per your Run:ai API.
         runai_version_path=os.getenv("RUNAI_VERSION_PATH", "/api/v1/version").strip(),
         runai_timeout_seconds=_int_env("RUNAI_TIMEOUT_SECONDS", 120),
+        runai_mcp_url=os.getenv("RUNAI_MCP_URL", "").strip().rstrip("/"),
         prometheus_url=os.getenv("PROMETHEUS_URL", "").strip().rstrip("/"),
         prometheus_timeout_seconds=_int_env("PROMETHEUS_TIMEOUT_SECONDS", 120),
         prometheus_mcp_url=os.getenv("PROMETHEUS_MCP_URL", "").strip().rstrip("/"),

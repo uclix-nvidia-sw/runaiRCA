@@ -79,7 +79,7 @@ async def test_namespaced_alert_is_not_node_forced() -> None:
     target = _target(alert_name="RunAIWorkloadPending", namespace="team-a", queue="gpu-a")
     plan = await plan_investigation(settings, target, None, {}, [])
     # scheduling signal still leads for a namespaced/queue alert
-    assert plan.hypotheses[0]["family"] == "scheduling_quota_exhaustion"
+    assert plan.hypotheses[0]["family"] == "runai_scheduling_quota"
 
 
 # --- graph remediation (validated reasoning functions) ------------------------

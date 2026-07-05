@@ -105,9 +105,9 @@ async def test_hypotheses_ordered_and_present() -> None:
     plan = await plan_investigation(settings, target, None, {}, [])
 
     families = [h["family"] for h in plan.hypotheses]
-    assert "scheduling_quota_exhaustion" in families
+    assert "runai_scheduling_quota" in families
     # pending/quota/queue signals should rank scheduling first
-    assert families[0] == "scheduling_quota_exhaustion"
+    assert families[0] == "runai_scheduling_quota"
 
 
 @pytest.mark.asyncio
@@ -118,7 +118,7 @@ async def test_platform_namespace_investigates_broadly() -> None:
     target = _target(alert_name="SomeAlert", namespace="runai-backend")
     plan = await plan_investigation(settings, target, None, {}, [])
 
-    assert plan.hypotheses[0]["family"] == "control_plane_error"
+    assert plan.hypotheses[0]["family"] == "runai_control_plane_error"
     assert plan.check_control_plane is True
     assert "broadly" in plan.narrative.lower()
 
@@ -131,7 +131,7 @@ async def test_user_workload_namespace_focuses_scheduler() -> None:
     target = _target(alert_name="SomeAlert", namespace="runai-test1")
     plan = await plan_investigation(settings, target, None, {}, [])
 
-    assert plan.hypotheses[0]["family"] == "scheduling_quota_exhaustion"
+    assert plan.hypotheses[0]["family"] == "runai_scheduling_quota"
     assert plan.check_control_plane is True
 
 
@@ -160,7 +160,7 @@ async def test_llm_refinement_kept_on_success(monkeypatch) -> None:
         return {
             "focus": "refined focus",
             "strategy": "targeted",
-            "hypotheses": [{"family": "control_plane_error", "reason": "llm says so"}],
+            "hypotheses": [{"family": "runai_control_plane_error", "reason": "llm says so"}],
             "narrative": "refined narrative",
         }
 
@@ -170,7 +170,7 @@ async def test_llm_refinement_kept_on_success(monkeypatch) -> None:
 
     assert plan.focus == "refined focus"
     assert plan.strategy == "targeted"
-    assert plan.hypotheses[0]["family"] == "control_plane_error"
+    assert plan.hypotheses[0]["family"] == "runai_control_plane_error"
     # deterministic scope decisions are NOT overridden by the LLM
     assert plan.check_control_plane is False
 
@@ -234,3 +234,69 @@ async def test_knowledge_keyword_matching_alert_text_is_targeted() -> None:
     plan = await plan_investigation(settings, target, None, kg, [])
     assert plan.used_ontology is True
     assert plan.strategy == "targeted"
+
+
+@pytest.mark.asyncio
+async def test_no_signal_alert_does_not_default_to_node_pressure() -> None:
+    # PrometheusMissingRuleEvaluations matches no family keyword. The old tiebreak
+    # made node_kubelet_pressure the confident "most likely" leader. It must now be
+    # honest: insufficient_evidence, breadth-first, no fabricated family.
+    settings = make_settings()
+    target = _target(
+        alert_name="PrometheusMissingRuleEvaluations",
+        namespace="monitoring",
+        pod="prometheus-prometheus-kube-prometheus-prometheus-0",
+    )
+    plan = await plan_investigation(settings, target, None, {}, [])
+    assert plan.hypotheses[0]["family"] == "insufficient_evidence"
+    assert "most likely" not in plan.focus
+    assert "node kubelet pressure" not in plan.focus
+
+
+@pytest.mark.asyncio
+async def test_memory_alert_is_workload_runtime_not_control_plane() -> None:
+    # A container over its own memory limit is workload runtime saturation, not a
+    # control-plane error (the catalog family was wrong).
+    settings = make_settings()
+    target = _target(
+        alert_name="RunaiContainerMemoryUsageCritical",
+        namespace="runai-backend",
+        workload_name="runai-backend-workloads-manager-7b5c45cd7d-89km6",
+    )
+    plan = await plan_investigation(settings, target, None, {}, [])
+    assert plan.hypotheses[0]["family"] == "workload_runtime_error"
+
+
+@pytest.mark.asyncio
+async def test_llm_can_widen_scope_to_control_plane(monkeypatch) -> None:
+    # LLM re-reasons the cause toward the platform → it may turn control-plane
+    # reading ON, and the runai control-plane namespaces get added.
+    settings = replace(make_settings(), llm_base_url="x", llm_model="m", llm_api_key="k")
+
+    async def fake(settings, *, system, user, temperature=0.1):
+        return {"strategy": "targeted", "check_control_plane": True,
+                "hypotheses": [{"family": "runai_control_plane_error", "reason": "platform"}]}
+
+    monkeypatch.setattr("app.services.planner.complete_json", fake)
+    # monitoring ns → deterministic check_control_plane is False
+    target = _target(alert_name="SomeAlert", namespace="monitoring")
+    plan = await plan_investigation(settings, target, None, {}, [])
+    assert plan.check_control_plane is True
+    for ns in settings.runai_log_namespaces:
+        assert ns in plan.namespaces
+
+
+@pytest.mark.asyncio
+async def test_llm_cannot_narrow_control_plane_below_floor(monkeypatch) -> None:
+    # Deterministic router required control-plane (runai-backend ns). The LLM saying
+    # false must NOT switch it off — scope only widens, never narrows.
+    settings = replace(make_settings(), llm_base_url="x", llm_model="m", llm_api_key="k")
+
+    async def fake(settings, *, system, user, temperature=0.1):
+        return {"strategy": "breadth_first", "check_control_plane": False,
+                "hypotheses": [{"family": "node_kubelet_pressure", "reason": "x"}]}
+
+    monkeypatch.setattr("app.services.planner.complete_json", fake)
+    target = _target(alert_name="SomeAlert", namespace="runai-backend")
+    plan = await plan_investigation(settings, target, None, {}, [])
+    assert plan.check_control_plane is True  # deterministic floor held

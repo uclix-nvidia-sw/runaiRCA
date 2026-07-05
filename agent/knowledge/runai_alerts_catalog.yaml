@@ -7,7 +7,7 @@
 - alert: NVIDIA Run:ai Agent Cluster Info Push Rate Low
   severity: critical
   category: control_plane
-  family: control_plane_error
+  family: runai_control_plane_error
   trigger: The cluster-sync pod in the runai namespace may not be functioning; cluster info may not sync to the control plane.
   actions:
     - "Check pod status: kubectl get pod -n runai (cluster-sync)."
@@ -17,7 +17,7 @@
 - alert: NVIDIA Run:ai Agent Pull Rate Low
   severity: critical
   category: control_plane
-  family: control_plane_error
+  family: runai_control_plane_error
   trigger: The runai-agent pod may be overloaded/slow or not functioning; control-plane info may not sync to the cluster.
   actions:
     - "Check runai-agent pod status: kubectl get pod -n runai; review logs."
@@ -27,7 +27,10 @@
 - alert: NVIDIA Run:ai Container Memory Usage Critical
   severity: critical
   category: resource
-  family: control_plane_error
+  # A container saturating its OWN memory limit is workload/runtime resource
+  # saturation (OOM risk), not a control-plane error. Fires for any Run:ai
+  # container, so the coarse family must not assume the scheduler/backend.
+  family: workload_runtime_error
   trigger: A Run:ai container is using more than 90% of its memory limit; may OOM and crash.
   actions:
     - "Raise the container memory limit/request."
@@ -36,7 +39,7 @@
 - alert: NVIDIA Run:ai Container Memory Usage Warning
   severity: warning
   category: resource
-  family: control_plane_error
+  family: workload_runtime_error
   trigger: A Run:ai container is using more than 80% of its memory limit.
   actions:
     - "Raise the container memory limit/request before it OOMs."
@@ -44,7 +47,7 @@
 - alert: NVIDIA Run:ai Container Restarting
   severity: warning
   category: resource
-  family: control_plane_error
+  family: runai_control_plane_error
   trigger: A Run:ai container restarted more than twice in the last 10 minutes; availability may be affected.
   actions:
     - "Find the pod: kubectl get pods -n runai; review its logs."
@@ -53,7 +56,7 @@
 - alert: NVIDIA Run:ai CPU Usage Warning
   severity: warning
   category: resource
-  family: control_plane_error
+  family: runai_control_plane_error
   trigger: A Run:ai container is using more than 80% of its CPU limit; may slow Run:ai features.
   actions:
     - "Add CPU resources to the container."
@@ -61,7 +64,7 @@
 - alert: NVIDIA Run:ai Critical Problem
   severity: critical
   category: aggregate
-  family: control_plane_error
+  family: runai_control_plane_error
   trigger: One of the critical Run:ai alerts is currently active (aggregate alert).
   actions:
     - "Check Prometheus for the active critical alert and address that root cause."
@@ -88,7 +91,7 @@
 - alert: NVIDIA Run:ai DaemonSet Rollout Stuck / DaemonSet Unavailable on Nodes
   severity: critical
   category: cluster_infra
-  family: control_plane_error
+  family: runai_control_plane_error
   trigger: Zero available pods for the runai daemonset on a relevant node; no fractional-GPU workload support.
   actions:
     - "kubectl get daemonset -n runai-backend; describe the problematic daemonset."
@@ -97,7 +100,7 @@
 - alert: NVIDIA Run:ai Deployment Insufficient Replicas / No Available Replicas
   severity: critical
   category: cluster_infra
-  family: control_plane_error
+  family: runai_control_plane_error
   trigger: A Run:ai deployment has one or more unavailable pods; scale/deploy issues.
   actions:
     - "Check the deployment/replicaset status; describe them; review logs."
@@ -106,7 +109,7 @@
 - alert: NVIDIA Run:ai Project Controller Reconcile Failure
   severity: critical
   category: control_plane
-  family: control_plane_error
+  family: runai_control_plane_error
   trigger: The project controller had errors reconciling projects; some projects may not be Ready.
   actions:
     - "kubectl logs deployment/project-controller -n runai; find the failing project."
@@ -115,7 +118,7 @@
 - alert: NVIDIA Run:ai StatefulSet Insufficient Replicas / No Available Replicas
   severity: critical
   category: cluster_infra
-  family: control_plane_error
+  family: runai_control_plane_error
   trigger: A Run:ai statefulset has no available pods; metrics database may be unavailable.
   actions:
     - "kubectl get statefulset -n runai-backend; describe it; review events."
