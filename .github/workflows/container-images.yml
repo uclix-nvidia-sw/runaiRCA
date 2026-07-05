@@ -47,6 +47,9 @@ jobs:
           - component: frontend
             context: frontend
             image: runai-rca-frontend
+          - component: runai-mcp
+            context: runai-mcp
+            image: runai-rca-mcp
 
     steps:
       - name: Checkout
