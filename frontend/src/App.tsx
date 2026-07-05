@@ -62,7 +62,7 @@ import nvidiaLogo from './assets/nvidia-logo.svg';
 import { AlertRecord, AnalysisRun, Artifact, FeedbackSummary, Incident, IncidentDetail, PageInfo, SimilarIncident } from './types';
 
 const TrendChartCanvas = lazy(() => import('./TrendChartCanvas'));
-const DASHBOARD_PAGE_SIZE = 50;
+const DASHBOARD_PAGE_SIZE = 15;
 
 type DetailState =
   | { kind: 'incident'; data: IncidentDetail }
