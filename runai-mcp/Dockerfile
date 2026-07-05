@@ -13,6 +13,9 @@ ARG RUNAI_MCP_REF=main
 FROM node:20-slim AS build
 ARG RUNAI_MCP_REPO
 ARG RUNAI_MCP_REF
+# Upstream runai-mcp pins typescript@^6 in devDeps while ts-jest requires
+# typescript <6, so a strict install fails on ERESOLVE. Relax peer resolution.
+ENV npm_config_legacy_peer_deps=true
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
