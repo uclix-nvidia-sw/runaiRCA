@@ -1591,6 +1591,21 @@ td span.occurrence-pill {
   position: relative;
 }
 
+/* Problem signals inside rendered evidence (artifact.highlights + built-in
+   patterns) — red so the operator's eye lands on the finding first. */
+.evidence-mark {
+  background: transparent;
+  color: var(--danger);
+  font-weight: 700;
+}
+
+pre .evidence-mark,
+code .evidence-mark {
+  background: rgba(220, 38, 38, 0.08);
+  border-radius: 0.2rem;
+  padding: 0 0.1rem;
+}
+
 .copy-button {
   border: 1px solid transparent;
   border-radius: 0.35rem;

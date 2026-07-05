@@ -45,6 +45,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `DATABASE_CONNECT_TIMEOUT_SECONDS` | Backend Postgres startup connection timeout, default `5` |
 | `POSTGRES_DSN` | Agent Postgres diagnostic DSN; defaults to `DATABASE_URL` in Helm |
 | `POSTGRES_TIMEOUT_SECONDS` | Agent Postgres diagnostic query timeout |
+| `RUNAI_DB_DSN` | Optional read-only DSN for the Run:ai control-plane Postgres. When set, the postgres agent's drill-down can `SELECT` platform data (workloads, audit, clusters, ...) during troubleshooting; single-statement SELECT in a READ ONLY transaction. Provision a read-only DB role. |
 | `TROUBLESHOOTING_CASES_FILE` | Local known-cases/playbook markdown path |
 | `AGENT_SOULS_FILE` | Agent role-contract prompt path, default `prompts/agent_souls.md` |
 | `MASKING_REGEX_LIST_JSON` | Optional JSON array of custom redaction regexes |

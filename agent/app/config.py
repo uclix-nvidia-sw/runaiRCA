@@ -93,6 +93,7 @@ class Settings:
     runai_log_namespaces: tuple[str, ...]
     postgres_dsn: str
     postgres_timeout_seconds: int
+    runai_db_dsn: str
     troubleshooting_cases_file: str
     failure_modes_file: str
     runai_alerts_file: str
@@ -183,6 +184,13 @@ def load_settings() -> Settings:
         runai_log_namespaces=_csv_env("RUNAI_LOG_NAMESPACES", ("runai", "runai-backend")),
         postgres_dsn=os.getenv("POSTGRES_DSN", "").strip(),
         postgres_timeout_seconds=_int_env("POSTGRES_TIMEOUT_SECONDS", 60),
+        # Optional DSN for the Run:ai control-plane Postgres (the platform's own
+        # DB: workloads/clusters/audit/... schemas). When set, the postgres
+        # agent's drill-down can SELECT related platform data during
+        # troubleshooting instead of only health-checking the RCA store. Use a
+        # read-only DB role; the tool additionally enforces single-statement
+        # SELECT inside a READ ONLY transaction.
+        runai_db_dsn=os.getenv("RUNAI_DB_DSN", "").strip(),
         troubleshooting_cases_file=os.getenv(
             "TROUBLESHOOTING_CASES_FILE",
             "knowledge/troubleshooting_cases.md",
@@ -218,9 +226,7 @@ def load_settings() -> Settings:
         # Generous per-call ceiling so a reasoning agent is never cut off mid-thought;
         # the overall analysis deadline below is the real bound. (0 = unlimited.)
         llm_request_timeout_seconds=_int_env("LLM_REQUEST_TIMEOUT_SECONDS", 300),
-        nat_config_file=os.getenv(
-            "NAT_CONFIG_FILE", "configs/runai_rca_workflow.yml"
-        ).strip(),
+        nat_config_file=os.getenv("NAT_CONFIG_FILE", "configs/runai_rca_workflow.yml").strip(),
         enable_nat_runtime=_bool_env("ENABLE_NAT_RUNTIME", False),
         # Bounded below the overall deadline so the workflow subprocess is killed
         # cleanly if it overruns. (0 = unlimited.)

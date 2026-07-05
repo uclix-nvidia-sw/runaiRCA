@@ -58,6 +58,7 @@ def make_settings() -> Settings:
         loki_mcp_url="",
         runai_log_namespaces=("runai", "runai-backend"),
         postgres_dsn="",
+        runai_db_dsn="",
         postgres_timeout_seconds=1,
         troubleshooting_cases_file="knowledge/troubleshooting_cases.md",
         failure_modes_file="knowledge/failure_modes.yaml",
@@ -978,18 +979,22 @@ async def test_loki_skips_empty_selector_no_400(monkeypatch) -> None:
     assert any("empty {} selector" in w for w in result.warnings)
 
 
-def test_adhoc_query_repr_shows_selector_and_only_set_params() -> None:
+def test_adhoc_query_repr_is_the_real_kubectl_command() -> None:
+    # Operators asked for the actual query shape, exactly as they would type it.
     from app.services.investigator import _adhoc_query_repr
 
     assert _adhoc_query_repr(
         {"kind": "pods", "namespace": "runai", "name": "", "label_selector": "app=x"}
-    ) == "get pods -n runai -l app=x"
+    ) == "kubectl get pods -n runai -l app=x"
     # two reads differing only by selector must render differently
     a = _adhoc_query_repr({"kind": "pods", "namespace": "runai", "label_selector": "a=1"})
     b = _adhoc_query_repr({"kind": "pods", "namespace": "runai", "label_selector": "b=2"})
     assert a != b
-    # cluster-scoped read with just a name
-    assert _adhoc_query_repr({"kind": "nodes", "name": "dgx01"}) == "get nodes dgx01"
+    # cluster-scoped read with just a name; aliases resolve to the canonical kind
+    assert _adhoc_query_repr({"kind": "nodes", "name": "dgx01"}) == "kubectl get nodes dgx01"
+    assert _adhoc_query_repr(
+        {"kind": "po", "namespace": "monitoring", "name": "node-exporter-1"}
+    ) == "kubectl get pods node-exporter-1 -n monitoring"
 
 
 @pytest.mark.asyncio

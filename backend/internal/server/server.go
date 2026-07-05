@@ -52,6 +52,10 @@ type Artifact struct {
 	Query      string `json:"query,omitempty"`
 	Result     any    `json:"result,omitempty"`
 	Summary    string `json:"summary,omitempty"`
+	// Human-facing card title (e.g. "파드 조회"); the UI falls back to Type.
+	Title string `json:"title,omitempty"`
+	// Problem signals the agent extracted from Result; the UI marks them in red.
+	Highlights []string `json:"highlights,omitempty"`
 }
 
 type SimilarIncident struct {

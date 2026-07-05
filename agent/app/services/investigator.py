@@ -18,8 +18,8 @@ import json
 import re
 from dataclasses import replace
 
-from app.collectors.base import CollectorResult, artifact
-from app.collectors.kubernetes import _READ_KINDS, k8s_read
+from app.collectors.base import CollectorResult, artifact, salient_markers
+from app.collectors.kubernetes import _READ_KINDS, k8s_read, kind_lookup_title, kubectl_repr
 from app.config import Settings
 from app.llm import complete_json
 from app.plan import InvestigationPlan
@@ -47,9 +47,7 @@ def _collector_name(collector: object) -> str:
     return normalized.replace("_a_i", "ai") or "collector"
 
 
-async def _collect_safely(
-    collector: object, target: object, plan: object
-) -> CollectorResult:
+async def _collect_safely(collector: object, target: object, plan: object) -> CollectorResult:
     # Mirror the orchestrator: a collector must never raise into the loop.
     try:
         return await collector.collect(target, plan)  # type: ignore[attr-defined]
@@ -75,23 +73,20 @@ def _scoped_plan(plan: InvestigationPlan | None, scope: dict) -> InvestigationPl
         namespaces=[namespace] if isinstance(namespace, str) and namespace else base.namespaces,
         node=scope.get("node") if isinstance(scope.get("node"), str) else base.node,
         pod=scope.get("pod") if isinstance(scope.get("pod"), str) else base.pod,
-        workload=scope.get("workload") if isinstance(scope.get("workload"), str)
-        else base.workload,
+        workload=scope.get("workload") if isinstance(scope.get("workload"), str) else base.workload,
     )
 
 
 def _adhoc_query_repr(item: dict) -> str:
-    """kubectl-style repr of an ad-hoc read, showing only the params that were set
-    (and the label selector) so two reads that differ only by selector look
-    different — the old 'ns=- name=-' form hid what actually varied."""
-    parts = [f"get {item.get('kind')}"]
-    if item.get("namespace"):
-        parts.append(f"-n {item['namespace']}")
-    if item.get("name"):
-        parts.append(str(item["name"]))
-    if item.get("label_selector"):
-        parts.append(f"-l {item['label_selector']}")
-    return " ".join(parts)
+    """The ad-hoc read as the real kubectl command an operator would have typed
+    ("kubectl get pods -n runai -l app=x") — operators asked for the actual
+    query, not an internal 'ns=... name=...' param dump."""
+    return kubectl_repr(
+        str(item.get("kind") or ""),
+        namespace=str(item.get("namespace") or ""),
+        name=str(item.get("name") or ""),
+        label_selector=str(item.get("label_selector") or ""),
+    )
 
 
 def _evidence_summary(evidence: dict[str, CollectorResult]) -> list[dict]:
@@ -122,9 +117,7 @@ async def investigate(
         collector = by_name.get(name)
         if collector is None:
             return
-        evidence[name] = await _collect_safely(
-            collector, target, _scoped_plan(plan, scope)
-        )
+        evidence[name] = await _collect_safely(collector, target, _scoped_plan(plan, scope))
 
     adhoc: list[dict] = []
     try:
@@ -171,10 +164,7 @@ async def investigate(
                 break
             if fresh:
                 await asyncio.gather(
-                    *(
-                        run_probe(p["collector"], p.get("scope") or {})
-                        for p in fresh
-                    )
+                    *(run_probe(p["collector"], p.get("scope") or {}) for p in fresh)
                 )
             for q in wanted:
                 adhoc.append(
@@ -206,8 +196,22 @@ async def investigate(
     # report's evidence trail (and signature matching) sees what was drilled into.
     kubernetes_result = evidence.get("kubernetes")
     if adhoc and kubernetes_result is not None:
+        language = getattr(settings, "language", "en")
         for item in adhoc:
             error = item.get("error")
+            # Finding-first summary: name the problem signals in the data, not
+            # the transport ("HTTP 200" tells the operator nothing).
+            markers = [] if error else salient_markers(item.get("data"))
+            if error:
+                summary = str(error)
+            elif markers:
+                summary = ("주요 신호: " if language == "ko" else "signals: ") + ", ".join(markers)
+            else:
+                summary = (
+                    "특이 신호 없음 (HTTP {code})"
+                    if language == "ko"
+                    else "no problem signals (HTTP {code})"
+                ).format(code=item.get("status_code"))
             kubernetes_result.artifacts.append(
                 artifact(
                     agent="kubernetes",
@@ -216,14 +220,9 @@ async def investigate(
                     status="unavailable" if error else "ok",
                     confidence="medium",
                     query=_adhoc_query_repr(item),
-                    summary=(
-                        str(error)
-                        if error
-                        else (
-                            f"ad-hoc read of {item.get('kind')} returned "
-                            f"HTTP {item.get('status_code')}"
-                        )
-                    ),
+                    title=kind_lookup_title(str(item.get("kind") or ""), language),
+                    highlights=markers or None,
+                    summary=summary,
                     result=item,
                 )
             )
@@ -245,16 +244,12 @@ def _build_user_prompt(
             "blast_radius_workloads": kg_context.get("blast_radius_workloads"),
             "prior_incidents": kg_context.get("prior_incidents"),
         },
-        "available_collectors": {
-            name: _COLLECTOR_HINTS.get(name, "") for name in by_name
-        },
+        "available_collectors": {name: _COLLECTOR_HINTS.get(name, "") for name in by_name},
         "evidence_so_far": _evidence_summary(evidence),
         "not_yet_probed": [name for name in by_name if name not in evidence],
         "adhoc_query_kinds": sorted(_READ_KINDS),
         # The last few ad-hoc reads, trimmed — enough for the LLM to chain
         # "PVC is Pending -> check the storageclass" style drill-downs.
-        "adhoc_results": [
-            json.dumps(item, default=str)[:600] for item in (adhoc or [])[-6:]
-        ],
+        "adhoc_results": [json.dumps(item, default=str)[:600] for item in (adhoc or [])[-6:]],
     }
     return json.dumps(payload, default=str)[:8000]

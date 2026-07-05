@@ -18,6 +18,10 @@ secrets:
   keys:
     databaseUrl: DATABASE_URL
     postgresDsn: POSTGRES_DSN
+    # Optional read-only DSN for the Run:ai control-plane Postgres: enables the
+    # postgres agent's drill-down to SELECT platform data (workloads, audit,
+    # clusters, ...) during troubleshooting. Provision a read-only DB role.
+    runaiDbDsn: RUNAI_DB_DSN
     runaiClientId: RUNAI_CLIENT_ID
     runaiClientSecret: RUNAI_CLIENT_SECRET
     runaiBearerToken: RUNAI_BEARER_TOKEN
@@ -26,6 +30,7 @@ secrets:
     embeddingApiKey: EMBEDDING_API_KEY
   databaseUrl: ""
   postgresDsn: ""
+  runaiDbDsn: ""
   runaiClientId: ""
   runaiClientSecret: ""
   runaiBearerToken: ""

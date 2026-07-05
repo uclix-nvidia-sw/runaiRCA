@@ -222,3 +222,115 @@ async def test_never_raises_even_if_llm_layer_explodes(monkeypatch) -> None:
     result = _k8s_result()
     await run_drilldowns(drill_settings(), [result], _target(), None)
     assert result.artifacts == []
+
+
+def test_salient_markers_scan_only_string_leaves() -> None:
+    from app.collectors.base import salient_markers
+
+    data = {
+        "error": None,  # a key named error must NOT count as a signal
+        "status": {"phase": "Running", "reason": "CrashLoopBackOff"},
+        "events": ["Back-off restarting failed container", "NVRM: Xid 79 detected"],
+        "count": 3,
+    }
+    markers = salient_markers(data)
+    assert "CrashLoopBackOff" in markers
+    assert any("Xid" in m for m in markers)
+    assert salient_markers({"status": {"phase": "Running"}, "error": None}) == []
+
+
+def test_k8s_tool_reports_kubectl_command_title_and_highlights(monkeypatch) -> None:
+    decisions = iter(
+        [
+            {
+                "action": "query",
+                "queries": [
+                    {
+                        "tool": "k8s_read",
+                        "args": {"kind": "pods", "namespace": "runai", "name": "t-0"},
+                    }
+                ],
+            },
+            {"action": "done"},
+        ]
+    )
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1):
+        return next(decisions)
+
+    async def fake_k8s_read(settings, kind, *, namespace="", name="", label_selector=""):
+        return {
+            "kind": "pods",
+            "status_code": 200,
+            "error": None,
+            "data": {"status": {"reason": "OOMKilled"}},
+        }
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
+    result = _k8s_result()
+    settings = replace(drill_settings(), language="ko")
+    asyncio.run(run_drilldowns(settings, [result], _target(), None))
+    art = result.artifacts[0]
+    assert art.query == "kubectl get pods t-0 -n runai"
+    assert art.title == "파드 조회"
+    assert art.highlights == ["OOMKilled"]
+    assert "주요 신호" in (art.summary or "") and "OOMKilled" in (art.summary or "")
+
+
+def test_sql_validate_select_is_fail_closed() -> None:
+    from app.services.drilldown import _validate_select
+
+    ok, sql = _validate_select("SELECT id, status FROM workloads WHERE name = 'x';")
+    assert ok is None and sql.endswith("name = 'x'")
+    assert _validate_select("")[0]
+    assert _validate_select("DELETE FROM workloads")[0]
+    assert _validate_select("SELECT 1; DROP TABLE workloads")[0]
+    assert _validate_select("WITH x AS (SELECT 1) INSERT INTO y SELECT * FROM x")[0]
+    assert _validate_select("EXPLAIN SELECT 1")[0]  # not SELECT/WITH-leading
+    # column names containing forbidden words as substrings are fine
+    assert _validate_select("SELECT created_at, updated_at FROM audit")[0] is None
+
+
+def test_sql_tool_targets_runai_db_and_appends_limit(monkeypatch) -> None:
+    captured: dict = {}
+
+    async def fake_run_select(dsn, sql, timeout):
+        captured["dsn"] = dsn
+        captured["sql"] = sql
+        return [{"id": 1}]
+
+    monkeypatch.setattr(drilldown, "_run_select", fake_run_select)
+    decisions = iter(
+        [
+            {
+                "action": "query",
+                "queries": [{"tool": "sql_select", "args": {"query": "SELECT id FROM workloads"}}],
+            },
+            {"action": "done"},
+        ]
+    )
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1):
+        return next(decisions)
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    settings = drill_settings(runai_db_dsn="postgres://ro@runai-db/runai")
+    result = CollectorResult(agent="postgres", status="ok", summary="db health ok")
+    asyncio.run(run_drilldowns(settings, [result], _target(), None))
+    assert captured["dsn"] == "postgres://ro@runai-db/runai"
+    assert captured["sql"] == "SELECT id FROM workloads LIMIT 50"
+    assert result.artifacts[0].query == "SELECT id FROM workloads LIMIT 50"
+
+
+def test_postgres_agent_has_no_sql_tool_without_any_dsn(monkeypatch) -> None:
+    calls = [0]
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1):
+        calls[0] += 1
+        return {"action": "done"}
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    result = CollectorResult(agent="postgres", status="ok", summary="db")
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
+    assert calls[0] == 0  # make_settings has no postgres_dsn / runai_db_dsn

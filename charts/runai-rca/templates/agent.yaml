@@ -188,6 +188,15 @@ spec:
                   name: {{ include "runai-rca.databaseSecretName" . }}
                   key: {{ .Values.secrets.keys.postgresDsn | quote }}
                   optional: true
+            # Optional read-only DSN for the Run:ai control-plane Postgres — lets
+            # the postgres agent's drill-down SELECT platform data (workloads,
+            # audit, clusters, ...) during troubleshooting. Use a read-only role.
+            - name: RUNAI_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "runai-rca.databaseSecretName" . }}
+                  key: {{ .Values.secrets.keys.runaiDbDsn | quote }}
+                  optional: true
             - name: RUNAI_CLIENT_ID
               valueFrom:
                 secretKeyRef:

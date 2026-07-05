@@ -11,8 +11,16 @@ the verify pass, synthesis) consumes them with zero changes.
 Best-effort like the central investigation loop: flag off (ENABLE_AGENT_DRILLDOWN),
 no LLM, or ANY failure -> the base evidence stands. Read-only by construction:
 the k8s tool is the allowlisted `k8s_read`, Run:ai calls are locked to GET under
-/api/, and PromQL/LogQL only hit query endpoints. Untrusted log/event text feeds
-these loops, so the PROMPT_INJECTION_GUARD in app.llm rides on every decision.
+/api/, PromQL/LogQL only hit query endpoints, and SQL is a single SELECT inside
+a READ ONLY transaction (RUNAI_DB_DSN lets the postgres agent query the Run:ai
+control-plane DB itself, not just health-check the RCA store). Untrusted
+log/event text feeds these loops, so the PROMPT_INJECTION_GUARD in app.llm rides
+on every decision.
+
+Operator-facing output: every follow-up lands as an artifact with a human title
+("파드 조회"), the REAL query an operator would run (kubectl / PromQL / LogQL /
+SQL), a finding-first summary, and `highlights` (base.salient_markers) the UI
+marks in red.
 """
 
 from __future__ import annotations
@@ -20,11 +28,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any
 
-from app.collectors.base import AnalysisTarget, CollectorResult, artifact
+from app.collectors.base import AnalysisTarget, CollectorResult, artifact, salient_markers
 from app.collectors.http_json import get_json
-from app.collectors.kubernetes import _READ_KINDS, k8s_read
+from app.collectors.kubernetes import _READ_KINDS, k8s_read, kind_lookup_title, kubectl_repr
 from app.collectors.loki import _loki_headers, _loki_streams, _sample_lines
 from app.collectors.prometheus import prom_query
 from app.collectors.runai_mcp import _tool_json, _tool_text
@@ -94,6 +103,15 @@ async def _drill_one(
                         "outcome": json.dumps(outcome, default=str)[:_RESULT_CHARS],
                     }
                 )
+                # Finding-first: surface the problem signals in the data and hand
+                # them to the UI as highlights; the raw result stays attached.
+                markers = salient_markers(outcome.get("result"))
+                summary = str(outcome.get("summary") or outcome.get("error") or name)
+                if markers:
+                    label = (
+                        "주요 신호" if getattr(settings, "language", "en") == "ko" else "signals"
+                    )
+                    summary = f"{summary} — {label}: {', '.join(markers)}"
                 result.artifacts.append(
                     artifact(
                         agent=result.agent,
@@ -102,7 +120,9 @@ async def _drill_one(
                         status="unavailable" if outcome.get("error") else "ok",
                         confidence="medium",
                         query=str(outcome.get("query") or name),
-                        summary=str(outcome.get("summary") or outcome.get("error") or name),
+                        title=outcome.get("title"),
+                        highlights=markers or None,
+                        summary=summary,
                         result=outcome.get("result"),
                     )
                 )
@@ -130,9 +150,12 @@ def _system_prompt(agent: str, tools: dict[str, dict[str, Any]]) -> str:
         f"You are the {agent} evidence agent for a Run:ai GPU-platform RCA, autonomously "
         "drilling deeper into YOUR domain only. Look at your evidence so far and decide "
         "whether one more round of READ-ONLY follow-up queries would materially confirm or "
-        "refute the investigation's hypotheses. Prefer narrowing: one pod, one namespace, "
-        "one resource, a tighter filter. Conclude (action=done) as soon as the evidence is "
-        "sufficient — never query for completeness.\n"
+        "refute the investigation's hypotheses. Fetch data RELATED to the incident — the "
+        "workload's controller, its project/queue, the Run:ai control-plane component "
+        "involved, correlated namespaces and time windows — never your own datasource's "
+        "health (the base collector already covered that). Prefer narrowing: one pod, one "
+        "namespace, one resource, a tighter filter. Conclude (action=done) as soon as the "
+        "evidence is sufficient — never query for completeness.\n"
         f"Tools available to you (your only tools; there are no others):\n{tool_lines}\n"
         'Respond with ONLY JSON: {"action":"query"|"done","reason":str,'
         '"queries":[{"tool":str,"args":{...}}]} with at most '
@@ -222,25 +245,46 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
                 "call": _tool_runai_get,
             },
         }
+    sql_dsn = settings.runai_db_dsn or settings.postgres_dsn
+    if sql_dsn:
+        db_desc = (
+            "the Run:ai CONTROL-PLANE database (platform schemas: workloads, clusters, "
+            "audit, authorization, org units, ...)"
+            if settings.runai_db_dsn
+            else "the RCA store database (incidents, alerts, analysis runs, feedback)"
+        )
+        registry["postgres"] = {
+            "sql_select": {
+                "description": (
+                    f"One read-only SQL SELECT against {db_desc}. Discover tables first "
+                    "via information_schema.tables / information_schema.columns, then "
+                    "query the relevant rows. Single statement, SELECT/WITH only, runs "
+                    "in a READ ONLY transaction, auto 'LIMIT 50'. args: query (SQL)"
+                ),
+                "call": _tool_sql_select,
+            }
+        }
     return registry
 
 
+def _title(settings: Settings, ko: str, en: str) -> str:
+    return ko if getattr(settings, "language", "en") == "ko" else en
+
+
 async def _tool_k8s_read(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
+    kind = str(args.get("kind") or "")
+    namespace = str(args.get("namespace") or "")
+    name = str(args.get("name") or "")
+    label_selector = str(args.get("label_selector") or "")
     item = await k8s_read(
-        settings,
-        str(args.get("kind") or ""),
-        namespace=str(args.get("namespace") or ""),
-        name=str(args.get("name") or ""),
-        label_selector=str(args.get("label_selector") or ""),
+        settings, kind, namespace=namespace, name=name, label_selector=label_selector
     )
     error = item.get("error")
     return {
-        "query": f"k8s_read {args.get('kind')} ns={args.get('namespace') or '-'}",
-        "summary": (
-            str(error)
-            if error
-            else f"read {item.get('kind')} returned HTTP {item.get('status_code')}"
-        ),
+        # The real command an operator would have typed, not a param dump.
+        "query": kubectl_repr(kind, namespace=namespace, name=name, label_selector=label_selector),
+        "title": kind_lookup_title(kind, getattr(settings, "language", "en")),
+        "summary": (str(error) if error else f"HTTP {item.get('status_code')}"),
         "error": error,
         "result": item,
     }
@@ -248,13 +292,20 @@ async def _tool_k8s_read(settings: Settings, target: AnalysisTarget, args: dict)
 
 async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
     promql = " ".join(str(args.get("query") or "").split())[:600]
+    title = _title(settings, "메트릭 조회 (PromQL)", "Metric query (PromQL)")
     if not promql:
-        return {"query": "", "summary": "empty PromQL query", "error": "empty PromQL query"}
+        return {
+            "query": "",
+            "title": title,
+            "summary": "empty PromQL query",
+            "error": "empty PromQL query",
+        }
     item = await prom_query(settings, "drilldown", promql)
     error = item.get("error")
     return {
         "query": promql,
-        "summary": str(error) if error else f"promql returned HTTP {item.get('status_code')}",
+        "title": title,
+        "summary": str(error) if error else f"HTTP {item.get('status_code')}",
         "error": error,
         "result": item,
     }
@@ -262,8 +313,14 @@ async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -
 
 async def _tool_logql(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
     logql = " ".join(str(args.get("query") or "").split())[:600]
+    title = _title(settings, "로그 조회 (LogQL)", "Log query (LogQL)")
     if not logql:
-        return {"query": "", "summary": "empty LogQL query", "error": "empty LogQL query"}
+        return {
+            "query": "",
+            "title": title,
+            "summary": "empty LogQL query",
+            "error": "empty LogQL query",
+        }
     headers, _warnings = _loki_headers(settings)
     response = await get_json(
         base_url=settings.loki_url,
@@ -278,13 +335,72 @@ async def _tool_logql(settings: Settings, target: AnalysisTarget, args: dict) ->
     )
     if response.error or not response.ok:
         error = response.error or f"HTTP {response.status_code}"
-        return {"query": logql, "summary": error, "error": error}
+        return {"query": logql, "title": title, "summary": error, "error": error}
     lines = _sample_lines(_loki_streams(response.data), limit=10)
     return {
         "query": logql,
+        "title": title,
         "summary": f"{len(lines)} sample log line(s)" if lines else "no matching log lines",
         "error": None,
         "result": {"lines": lines},
+    }
+
+
+# --- read-only SQL (postgres agent) ----------------------------------------
+
+_SQL_FORBIDDEN = re.compile(
+    r"\b(insert|update|delete|drop|alter|create|grant|revoke|truncate|copy|vacuum|"
+    r"call|do|execute|set|listen|notify|lock|reindex|refresh|prepare|deallocate|merge)\b",
+    re.IGNORECASE,
+)
+
+
+def _validate_select(sql: str) -> tuple[str | None, str]:
+    """(error, normalized_sql). Fail-closed: single statement, SELECT/WITH only."""
+    text = " ".join((sql or "").split()).strip().rstrip(";").strip()
+    if not text:
+        return "empty SQL query", text
+    if ";" in text:
+        return "a single SQL statement is required", text
+    if not re.match(r"(?i)^(select|with)\b", text):
+        return "only SELECT/WITH queries are allowed", text
+    match = _SQL_FORBIDDEN.search(text)
+    if match:
+        return f"forbidden SQL keyword: {match.group(0)}", text
+    return None, text
+
+
+async def _run_select(dsn: str, sql: str, timeout: int) -> list[dict]:
+    # Lazy import mirrors the postgres collector; READ ONLY transaction is the
+    # second fence behind the syntactic guard (and a read-only DB role, ideally).
+    import asyncpg
+
+    from app.collectors.postgres import _record_to_dict
+
+    conn = await asyncio.wait_for(asyncpg.connect(dsn, timeout=timeout), timeout=timeout + 1)
+    try:
+        async with conn.transaction(readonly=True):
+            rows = await asyncio.wait_for(conn.fetch(sql), timeout=timeout)
+        return [_record_to_dict(row) for row in rows[:50]]
+    finally:
+        await conn.close()
+
+
+async def _tool_sql_select(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
+    title = _title(settings, "DB 조회 (SQL)", "Database query (SQL)")
+    error, sql = _validate_select(str(args.get("query") or ""))
+    if error:
+        return {"query": sql, "title": title, "summary": error, "error": error}
+    if not re.search(r"(?i)\blimit\s+\d", sql):
+        sql = f"{sql} LIMIT 50"
+    dsn = settings.runai_db_dsn or settings.postgres_dsn
+    rows = await _run_select(dsn, sql, settings.postgres_timeout_seconds)
+    return {
+        "query": sql,
+        "title": title,
+        "summary": f"{len(rows)} row(s)",
+        "error": None,
+        "result": {"rows": rows},
     }
 
 
@@ -302,14 +418,26 @@ async def _mcp_call(settings: Settings, tool: str, arguments: dict) -> Any:
 
 async def _tool_runai_search(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
     query = " ".join(str(args.get("query") or "").split())[:200]
+    title = _title(settings, "Run:ai API 검색", "Run:ai API spec search")
     if not query:
-        return {"query": "", "summary": "empty search query", "error": "empty search query"}
+        return {
+            "query": "",
+            "title": title,
+            "summary": "empty search query",
+            "error": "empty search query",
+        }
     result = await _mcp_call(settings, "search_runai_api_spec", {"query": query})
     text = _tool_text(result)[:_RESULT_CHARS]
     if getattr(result, "isError", False):
-        return {"query": query, "summary": text or "tool error", "error": text or "tool error"}
+        return {
+            "query": query,
+            "title": title,
+            "summary": text or "tool error",
+            "error": text or "tool error",
+        }
     return {
-        "query": f"runai_api_search {query}",
+        "query": f"search_runai_api_spec {query!r}",
+        "title": title,
         "summary": "spec search ok",
         "error": None,
         "result": text,
@@ -318,23 +446,28 @@ async def _tool_runai_search(settings: Settings, target: AnalysisTarget, args: d
 
 async def _tool_runai_get(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
     path = str(args.get("path") or "").strip()
+    title = _title(settings, "Run:ai API 조회 (GET)", "Run:ai API call (GET)")
     # GET-only under /api/ regardless of what the LLM asks for — the drill-down
     # must never mutate Run:ai state or reach non-API routes.
     if not path.startswith("/api/"):
         error = "only GET requests under /api/ are allowed"
-        return {"query": path, "summary": error, "error": error}
+        return {"query": path, "title": title, "summary": error, "error": error}
     raw_params = args.get("query") if isinstance(args.get("query"), dict) else {}
     params = {str(k)[:60]: str(v)[:120] for k, v in list(raw_params.items())[:8] if str(k).strip()}
     arguments: dict[str, Any] = {"method": "GET", "path": path[:300]}
     if params:
         arguments["query"] = params
     result = await _mcp_call(settings, "call_runai_api", arguments)
-    query = f"GET {path}"
+    # The real request an operator could replay with curl.
+    query = f"GET {path}" + (
+        "?" + "&".join(f"{k}={v}" for k, v in params.items()) if params else ""
+    )
     if getattr(result, "isError", False):
         error = _tool_text(result)[:300] or "tool error"
-        return {"query": query, "summary": error, "error": error}
+        return {"query": query, "title": title, "summary": error, "error": error}
     return {
         "query": query,
+        "title": title,
         "summary": f"GET {path} ok",
         "error": None,
         "result": _tool_json(result),
