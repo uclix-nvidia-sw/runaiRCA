@@ -5,6 +5,8 @@ from typing import Any
 
 import yaml
 
+from app.bm25 import BM25Index
+
 
 def load_troubleshooting_cases(path: str, *, max_chars: int = 12000) -> str:
     if not path:
@@ -146,23 +148,37 @@ def load_runai_known_issues(path: str) -> list[dict[str, Any]]:
 
 
 def match_runai_known_issues(
-    catalog: list[dict[str, Any]], observed_text: str
+    catalog: list[dict[str, Any]], observed_text: str, *, fuzzy_query: str = ""
 ) -> list[dict[str, Any]]:
     """Known-issue entries whose signature keyword appears in the evidence text.
 
     Substring match on the lowercased evidence, ranking-independent. Returns every
-    match — one incident can hit more than one known issue.
+    match — one incident can hit more than one known issue. When NO curated keyword
+    hits and ``fuzzy_query`` is given (the ALERT's own text — never collector
+    summaries, whose status boilerplate would false-match), a conservative
+    BM25+synonym pass (app.bm25) recovers vocabulary drift; those entries are
+    tagged ``matched_via: "bm25"`` and, like every match, still face the LLM
+    verify pass downstream.
     """
     text = (observed_text or "").lower()
     if not text or not catalog:
         return []
-    return [entry for entry in catalog if any(kw in text for kw in entry["keywords"])]
+    hits = [entry for entry in catalog if any(kw in text for kw in entry["keywords"])]
+    if hits or not fuzzy_query:
+        return hits
+    # ponytail: index rebuilt per call — corpus is ~a dozen entries, <1ms; cache if profiled.
+    index = BM25Index([(e, f"{e['issue']} {' '.join(e['keywords'])}") for e in catalog])
+    return [
+        {**entry, "matched_via": "bm25"} for entry, _score in index.search(fuzzy_query, top_k=2)
+    ]
 
 
 def match_failure_mode_symptoms(
     failure_modes: dict[str, list[dict[str, Any]]],
     observed_text: str,
     top_family: str = "",
+    *,
+    fuzzy_query: str = "",
 ) -> list[tuple[str, dict[str, Any]]]:
     """Every curated symptom, across ALL families, whose keyword hits the evidence.
 
@@ -182,6 +198,25 @@ def match_failure_mode_symptoms(
         for symptom in symptoms or []:
             if any(str(kw).lower() in text for kw in symptom.get("keywords", [])):
                 matched.append((family, symptom))
+    if not matched and fuzzy_query:
+        # Recall fallback, same contract as the known-issue matcher: BM25+synonyms
+        # over the curated names+keywords, only when substring found nothing, only
+        # against the alert's own text (fuzzy_query — collector summaries carry the
+        # pipeline's status boilerplate, which BM25 would false-match), and tagged
+        # so downstream (and the verify pass) can tell fuzzy from exact.
+        docs = [
+            (
+                (family, symptom),
+                f"{symptom.get('symptom') or ''} "
+                + " ".join(str(kw) for kw in symptom.get("keywords") or []),
+            )
+            for family, symptoms in failure_modes.items()
+            for symptom in symptoms or []
+        ]
+        matched = [
+            (family, {**symptom, "matched_via": "bm25"})
+            for (family, symptom), _score in BM25Index(docs).search(fuzzy_query, top_k=3)
+        ]
     # Stable sort: top-ranked family's matches first, otherwise file/query order
     # (which lists the more specific symptom before the generic one).
     matched.sort(key=lambda fs: fs[0] != top_family)

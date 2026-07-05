@@ -31,7 +31,7 @@ from app.knowledge import (
     match_failure_mode_symptoms,
     match_runai_known_issues,
 )
-from app.llm import complete, complete_json, llm_configured
+from app.llm import PROMPT_INJECTION_GUARD, complete, complete_json, llm_configured
 from app.masking import Masker, build_masker
 from app.plan import InvestigationPlan
 from app.prompts import load_agent_souls
@@ -342,6 +342,14 @@ class AnalysisOrchestrator:
         # Version-aware precision: drop known issues already fixed in the cluster's
         # running Run:ai version so we don't attribute a symptom to a patched bug.
         known_issues = _suppress_fixed_known_issues(known_issues, _runai_version_from(results))
+        # Fuzzy recall (BM25+synonyms, app.bm25) queries the alert's OWN text only:
+        # collector summaries would feed pipeline boilerplate to the matcher. And it
+        # informs, never headlines: promotion below stays exact-signature-only (a
+        # statistical hit is not "a specific signature that names the cause family"
+        # — e.g. NodeDiskPressure's disk+pressure tokens must not promote a
+        # database-disk known issue), while the playbook/actions/verify surfaces
+        # use fuzzy matches as candidates the LLM verify pass can still refute.
+        alert_fuzzy = _alert_text(request)
         root_cause_candidates = _promote_signature_cause(
             root_cause_candidates,
             xid_codes,
@@ -451,7 +459,7 @@ class AnalysisOrchestrator:
         except ImportError:
             pass
         else:
-            ki_matches = match_runai_known_issues(known_issues, observed)
+            ki_matches = match_runai_known_issues(known_issues, observed, fuzzy_query=alert_fuzzy)
             if ki_matches:
                 refuted = await verify_known_issues(self._settings, ki_matches, results)
                 if refuted:
@@ -462,7 +470,9 @@ class AnalysisOrchestrator:
                     "name": sym.get("symptom", ""),
                     "detail": f"{fam} — {'; '.join(sym.get('actions', [])[:1])}",
                 }
-                for fam, sym in match_failure_mode_symptoms(failure_modes, observed)
+                for fam, sym in match_failure_mode_symptoms(
+                    failure_modes, observed, fuzzy_query=alert_fuzzy
+                )
             ]
             ev_candidates += [
                 {"name": f"XID {code}", "detail": "; ".join(graph_fixes.xid_fixes[code][:1])}
@@ -773,6 +783,7 @@ class AnalysisOrchestrator:
             "question conversationally and concisely using only the grounded context provided. "
             "If the context lacks the answer, say so and suggest the next diagnostic step. "
             "Reply in the operator's language."
+            f"\n\n{PROMPT_INJECTION_GUARD}"  # this path posts directly, bypassing app.llm.complete
         )
         payload = {
             "model": self._settings.llm_model,
@@ -1089,7 +1100,11 @@ def _detail_from(
     lines.append(_ranked_root_cause_statement(root_cause_candidates or [], request))
     # Ground the coarse family in the most specific signature match when one exists:
     # a recognised known issue (with its affected/fixed version) is far more precise.
-    lines.extend(_known_issue_cause_lines(known_issues, _observed_text(results, request), language))
+    lines.extend(
+        _known_issue_cause_lines(
+            known_issues, _observed_text(results, request), language, _alert_text(request)
+        )
+    )
     supporting = _supporting_evidence(results)
     if supporting:
         lines.append("")
@@ -1128,7 +1143,12 @@ def _detail_from(
         lines.append(f"- **{result.agent}**: {_best_evidence_line(result)}")
     lines.extend(_investigation_plan_lines(plan))
     lines.extend(
-        _knowledge_base_lines(kg_context, root_cause_candidates, _observed_text(results, request))
+        _knowledge_base_lines(
+            kg_context,
+            root_cause_candidates,
+            _observed_text(results, request),
+            _alert_text(request),
+        )
     )
     operator_prompt = annotations.get("operator_prompt")
     if operator_prompt:
@@ -1147,6 +1167,7 @@ def _detail_from(
             failure_modes or {},
             troubleshooting_cases,
             known_issues or [],
+            _alert_text(request),
         )
     )
     lines.extend(_similar_incident_lines(request))
@@ -1321,12 +1342,15 @@ def _suppress_fixed_known_issues(known_issues: list[dict], running_version: str)
 
 
 def _known_issue_cause_lines(
-    known_issues: list[dict] | None, observed_text: str, language: str
+    known_issues: list[dict] | None,
+    observed_text: str,
+    language: str,
+    fuzzy_query: str = "",
 ) -> list[str]:
     """Ground the root cause in a recognised known issue — more precise than the
     coarse family. Names the issue and its affected/fixed Run:ai version. Returns
     the grounded line(s), or [] when no known-issue signature matches the evidence."""
-    matches = match_runai_known_issues(known_issues or [], observed_text)
+    matches = match_runai_known_issues(known_issues or [], observed_text, fuzzy_query=fuzzy_query)
     out: list[str] = []
     for issue in matches[:2]:  # the strongest signature hits only
         name = str(issue.get("issue") or "").strip()
@@ -1362,12 +1386,13 @@ def _numbered_actions(
     recognised known-issue fixes, then graph-derived and curated family fixes,
     then infra-restore steps."""
     ordered: list[str] = []
+    fuzzy = _alert_text(request)
     if plan is not None and plan.matched_alert:
         ordered.extend(str(a) for a in plan.matched_alert.get("actions", []))
     # Known operator cases recognised by their signature keywords in the evidence
     # (ranking-independent): version-regression / observability / expected-behavior
     # fixes surface even when the coarse family ranking points elsewhere.
-    for issue in match_runai_known_issues(known_issues or [], observed_text):
+    for issue in match_runai_known_issues(known_issues or [], observed_text, fuzzy_query=fuzzy):
         ordered.extend(str(a) for a in issue.get("actions", []))
     if graph_fixes is not None:
         ordered.extend(graph_fixes.family_fixes)
@@ -1380,7 +1405,9 @@ def _numbered_actions(
     # across ALL families (ranker orders, doesn't gate) — so a precise fix surfaces
     # even from a family the ranker mis-scored or can't nominate (gpu_hardware_error).
     top_family = candidates[0].family if candidates else ""
-    for _family, symptom in match_failure_mode_symptoms(failure_modes, observed_text, top_family):
+    for _family, symptom in match_failure_mode_symptoms(
+        failure_modes, observed_text, top_family, fuzzy_query=fuzzy
+    ):
         ordered.extend(str(a) for a in symptom.get("actions", []))
     ordered.extend(
         line.removeprefix("- ") for line in _recommended_action_lines(missing, request)
@@ -1540,6 +1567,7 @@ def _knowledge_base_lines(
     kg_context: dict | None,
     candidates: list[RankedCause] | None = None,
     observed_text: str = "",
+    fuzzy_query: str = "",
 ) -> list[str]:
     if not kg_context or not kg_context.get("enabled"):
         return []
@@ -1560,14 +1588,17 @@ def _knowledge_base_lines(
         for item in prior[:5]:
             summary = item.get("analysis_summary") or "(no stored RCA summary)"
             body.append(f"  - {item.get('incident_id')}: {summary}")
-    body.extend(_kb_remediation_lines(kg_context, candidates, observed_text))
+    body.extend(_kb_remediation_lines(kg_context, candidates, observed_text, fuzzy_query))
     if not body:
         body.append("- No related knowledge-graph facts were found for this entity yet.")
     return ["", "### Knowledge Base (Ontology)", "", *body]
 
 
 def _kb_remediation_lines(
-    kg_context: dict, candidates: list[RankedCause] | None, observed_text: str
+    kg_context: dict,
+    candidates: list[RankedCause] | None,
+    observed_text: str,
+    fuzzy_query: str = "",
 ) -> list[str]:
     knowledge = kg_context.get("knowledge") or {}
     if not knowledge:
@@ -1576,7 +1607,9 @@ def _kb_remediation_lines(
     # coarse ranked family (which can be wrong, or can't even nominate the right one
     # such as gpu_hardware_error). The ranker only orders the matches.
     top_family = candidates[0].family if candidates else ""
-    for family, symptom in match_failure_mode_symptoms(knowledge, observed_text, top_family):
+    for family, symptom in match_failure_mode_symptoms(
+        knowledge, observed_text, top_family, fuzzy_query=fuzzy_query
+    ):
         actions = symptom.get("actions", [])
         if actions:
             header = (
@@ -1595,6 +1628,7 @@ def _playbook_lines(
     failure_modes: dict[str, list[dict]],
     fallback_cases: str,
     known_issues: list[dict] | None = None,
+    fuzzy_query: str = "",
 ) -> list[str]:
     """Root-cause-relevant remediation, most specific first.
 
@@ -1605,7 +1639,9 @@ def _playbook_lines(
     checklist, then the full case library.
     """
     lines: list[str] = []
-    for issue in match_runai_known_issues(known_issues or [], observed_text)[:2]:
+    for issue in match_runai_known_issues(
+        known_issues or [], observed_text, fuzzy_query=fuzzy_query
+    )[:2]:
         lines.append(f"- **{issue.get('issue')}** (known issue)")
         reason = " ".join(str(issue.get("reason") or "").split())
         if reason:
@@ -1613,7 +1649,7 @@ def _playbook_lines(
         lines.extend(f"  - {action}" for action in issue.get("actions", [])[:4])
     top_family = candidates[0].family if candidates else ""
     for family, symptom in match_failure_mode_symptoms(
-        failure_modes, observed_text, top_family
+        failure_modes, observed_text, top_family, fuzzy_query=fuzzy_query
     ):
         lines.append(f"- **{symptom.get('symptom')}** ({_family_label(family)})")
         lines.extend(f"  - {action}" for action in symptom.get("actions", [])[:5])
