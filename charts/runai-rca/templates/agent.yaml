@@ -231,7 +231,7 @@ spec:
         # Run:ai MCP sidecar: runs the stdio runai-mcp server behind mcp-proxy so the
         # agent reaches it over http://localhost:{{ .Values.runaiMcp.port }}/mcp.
         - name: runai-mcp
-          image: {{ printf "%s:%s" .Values.runaiMcp.image.repository .Values.runaiMcp.image.tag | quote }}
+          image: {{ include "runai-rca.image" (dict "root" . "image" .Values.runaiMcp.image) | quote }}
           imagePullPolicy: {{ .Values.runaiMcp.image.pullPolicy }}
           {{- with $securityContext }}
           securityContext:
