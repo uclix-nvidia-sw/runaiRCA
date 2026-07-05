@@ -247,12 +247,20 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
         }
     sql_dsn = settings.runai_db_dsn or settings.postgres_dsn
     if sql_dsn:
-        db_desc = (
-            "the Run:ai CONTROL-PLANE database (platform schemas: workloads, clusters, "
-            "audit, authorization, org units, ...)"
-            if settings.runai_db_dsn
-            else "the RCA store database (incidents, alerts, analysis runs, feedback)"
-        )
+        if settings.runai_db_dsn:
+            db_desc = (
+                "the Run:ai CONTROL-PLANE database (platform schemas: workloads, "
+                "clusters, audit, authorization, org units, ...)"
+            )
+            # Schema ownership from the curated architecture topology, so the
+            # loop knows WHERE to look without a discovery round-trip.
+            schemas = _schema_ownership(settings)
+            if schemas:
+                db_desc += ". Schema ownership: " + "; ".join(
+                    f"{schema} = {owner}" for schema, owner in schemas
+                )
+        else:
+            db_desc = "the RCA store database (incidents, alerts, analysis runs, feedback)"
         registry["postgres"] = {
             "sql_select": {
                 "description": (
@@ -265,6 +273,18 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
             }
         }
     return registry
+
+
+def _schema_ownership(settings: Settings) -> list[tuple[str, str]]:
+    """(schema, owning component) pairs from the curated architecture topology."""
+    from app.knowledge import load_architecture
+
+    components = load_architecture(getattr(settings, "architecture_file", ""))
+    return sorted(
+        (entry["owns_schema"], name)
+        for name, entry in components.items()
+        if entry.get("owns_schema")
+    )
 
 
 def _title(settings: Settings, ko: str, en: str) -> str:

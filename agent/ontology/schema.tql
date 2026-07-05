@@ -40,6 +40,12 @@ attribute created_at, value datetime;
 attribute xid_code, value integer;
 attribute mnemonic, value string;
 attribute description, value string;
+# --- platform-architecture attributes (control_plane_component) ---
+attribute layer, value string;           # cluster | control_plane | external
+attribute k8s_namespace, value string;
+attribute failure_effect, value string;
+attribute owns_schema, value string;     # control-plane Postgres schema this service owns
+attribute check_command, value string;   # ready-to-run operator check
 # --- Run:ai known-issues catalog attributes (version-linked issues) ---
 attribute affected_version, value string;
 attribute fixed_version, value string;
@@ -89,10 +95,23 @@ entity pod,
     plays belongs_to:member,
     plays contains:occupant;
 
+# Run:ai platform components (BOTH the cluster side and the runai-backend
+# control plane; `layer` disambiguates). Mirrored from
+# knowledge/runai_architecture.yaml by ontology/load_architecture.py: purpose
+# (description), failure effect, dependency edges, control-plane DB schema
+# ownership, and ready-to-run checks.
 entity control_plane_component,
     owns name,
+    owns layer,
+    owns k8s_namespace,
+    owns description,
+    owns failure_effect,
+    owns owns_schema,
+    owns check_command,
     plays emits:emitter,
-    plays contains:occupant;
+    plays contains:occupant,
+    plays depends_on:dependent,
+    plays depends_on:dependency;
 
 entity alert,
     owns alert_id @key,
@@ -215,6 +234,7 @@ relation supported_by, relates claim, relates proof;      # (symptom|root_cause)
 relation analyzed_by, relates incident, relates run;
 relation similar_to, relates this, relates other;
 relation emits, relates emitter, relates signal;          # component emits evidence/symptom
+relation depends_on, relates dependent, relates dependency;  # component needs component (check order)
 
 # --- XID GPU-error catalog ---------------------------------------------------
 # A first-class GPU-hardware-fault RCA path. An xid_error is a catalog entry

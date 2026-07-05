@@ -79,6 +79,87 @@ def match_runai_alert(catalog: dict[str, dict[str, Any]], alert_name: str) -> di
     return hits[0] if len(hits) == 1 else None
 
 
+def load_architecture(path: str) -> dict[str, dict[str, Any]]:
+    """Parse runai_architecture.yaml into {component_name: entry}.
+
+    The platform topology layer (curated from the Run:ai architecture diagrams,
+    names calibrated against a live cluster): per-component purpose, failure
+    effect, dependency edges, control-plane DB schema ownership, and ready-to-run
+    checks. Consumed by the playbook (check paths for `component:`-tagged
+    symptoms) and the postgres drill-down (schema ownership hints)."""
+    if not path:
+        return {}
+    try:
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or []
+    except (OSError, yaml.YAMLError):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("component") or "").strip()
+        if not name:
+            continue
+        out[name] = {
+            "component": name,
+            "layer": str(entry.get("layer") or ""),
+            "namespace": str(entry.get("namespace") or ""),
+            "kind": str(entry.get("kind") or ""),
+            "purpose": str(entry.get("purpose") or ""),
+            "failure_effect": str(entry.get("failure_effect") or ""),
+            "owns_schema": str(entry.get("owns_schema") or ""),
+            "depends_on": [str(d) for d in (entry.get("depends_on") or [])],
+            "checks": [str(c) for c in (entry.get("checks") or [])],
+            "saas_only": bool(entry.get("saas_only")),
+        }
+    return out
+
+
+def dependency_path(
+    components: dict[str, dict[str, Any]], name: str, *, max_depth: int = 4
+) -> list[str]:
+    """BFS over depends_on from `name` — the order to check when `name` is
+    implicated ("X is broken" -> also check what X needs). SaaS-only and unknown
+    dependencies are skipped; the small static graph makes this a few hops."""
+    start = components.get(name)
+    if start is None:
+        return []
+    path, seen = [name], {name}
+    frontier = list(start.get("depends_on") or [])
+    for _ in range(max_depth):
+        if not frontier:
+            break
+        next_frontier: list[str] = []
+        for dep in frontier:
+            if dep in seen:
+                continue
+            seen.add(dep)
+            entry = components.get(dep)
+            if entry is None or entry.get("saas_only"):
+                continue
+            path.append(dep)
+            next_frontier.extend(entry.get("depends_on") or [])
+        frontier = next_frontier
+    return path
+
+
+def component_check_lines(components: dict[str, dict[str, Any]], name: str) -> list[str]:
+    """Playbook sub-lines for an implicated platform component: what it does,
+    the dependency check order, and its ready-to-run checks."""
+    entry = components.get(name)
+    if not entry:
+        return []
+    lines: list[str] = []
+    effect = entry.get("failure_effect") or entry.get("purpose")
+    if effect:
+        lines.append(f"  - Component `{name}`: {effect}")
+    chain = dependency_path(components, name)
+    if len(chain) > 1:
+        lines.append("  - Check order: " + " → ".join(chain))
+    lines.extend(f"  - `{check}`" for check in (entry.get("checks") or [])[:3])
+    return lines
+
+
 def load_failure_modes(path: str) -> dict[str, list[dict[str, Any]]]:
     """Parse failure_modes.yaml into {family: [{symptom, keywords[], actions[]}]}.
 
@@ -106,6 +187,9 @@ def load_failure_modes(path: str) -> dict[str, list[dict[str, Any]]]:
                     "symptom": symptom.get("name") or "",
                     "keywords": [str(k).lower() for k in symptom.get("keywords") or []],
                     "actions": list(symptom.get("actions") or []),
+                    # Optional link into runai_architecture.yaml: which platform
+                    # component this symptom implicates (drives check paths).
+                    "component": str(symptom.get("component") or ""),
                 }
             )
     return knowledge

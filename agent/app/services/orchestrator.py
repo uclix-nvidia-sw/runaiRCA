@@ -25,6 +25,8 @@ from app.collectors.runai import RunAICollector
 from app.collectors.system import SystemCollector
 from app.config import Settings
 from app.knowledge import (
+    component_check_lines,
+    load_architecture,
     load_failure_modes,
     load_runai_known_issues,
     load_troubleshooting_cases,
@@ -520,6 +522,7 @@ class AnalysisOrchestrator:
             graph_fixes,
             language=getattr(self._settings, "language", "en"),
             known_issues=known_issues,
+            components=load_architecture(self._settings.architecture_file),
         )
         # Korean LLM synthesis (preferred when language == "ko" and LLM configured):
         # rewrite summary + detail grounded STRICTLY in the evidence just gathered.
@@ -1069,6 +1072,7 @@ def _detail_from(
     graph_fixes: GraphRemediation | None = None,
     language: str = "en",
     known_issues: list[dict] | None = None,
+    components: dict[str, dict] | None = None,
 ) -> str:
     """Problem -> Root Cause -> Recommended Actions, then everything else in an
     appendix. Sections 1-3 are the ~1-page report an operator (or a Word export)
@@ -1177,6 +1181,7 @@ def _detail_from(
             troubleshooting_cases,
             known_issues or [],
             _alert_text(request),
+            components,
         )
     )
     lines.extend(_similar_incident_lines(request))
@@ -1638,6 +1643,7 @@ def _playbook_lines(
     fallback_cases: str,
     known_issues: list[dict] | None = None,
     fuzzy_query: str = "",
+    components: dict[str, dict] | None = None,
 ) -> list[str]:
     """Root-cause-relevant remediation, most specific first.
 
@@ -1662,6 +1668,12 @@ def _playbook_lines(
     ):
         lines.append(f"- **{symptom.get('symptom')}** ({_family_label(family)})")
         lines.extend(f"  - {action}" for action in symptom.get("actions", [])[:5])
+        # Architecture layer: the implicated platform component's failure effect,
+        # dependency check order, and ready-to-run checks (runai_architecture.yaml).
+        if symptom.get("component"):
+            lines.extend(
+                component_check_lines(components or {}, str(symptom["component"]))
+            )
     if lines:
         return lines
     # No precise signature matched: fall back to the ranked family's general

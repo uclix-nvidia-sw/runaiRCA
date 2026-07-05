@@ -95,6 +95,7 @@ class Settings:
     postgres_timeout_seconds: int
     runai_db_dsn: str
     troubleshooting_cases_file: str
+    architecture_file: str
     failure_modes_file: str
     runai_alerts_file: str
     runai_known_issues_file: str
@@ -194,6 +195,12 @@ def load_settings() -> Settings:
         troubleshooting_cases_file=os.getenv(
             "TROUBLESHOOTING_CASES_FILE",
             "knowledge/troubleshooting_cases.md",
+        ).strip(),
+        # Run:ai platform topology (components, depends_on, DB schema ownership)
+        # — powers playbook check paths and the postgres drill-down schema hints.
+        architecture_file=os.getenv(
+            "ARCHITECTURE_FILE",
+            "knowledge/runai_architecture.yaml",
         ).strip(),
         failure_modes_file=os.getenv(
             "FAILURE_MODES_FILE",

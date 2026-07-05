@@ -59,6 +59,7 @@ def make_settings() -> Settings:
         runai_log_namespaces=("runai", "runai-backend"),
         postgres_dsn="",
         runai_db_dsn="",
+        architecture_file="knowledge/runai_architecture.yaml",
         postgres_timeout_seconds=1,
         troubleshooting_cases_file="knowledge/troubleshooting_cases.md",
         failure_modes_file="knowledge/failure_modes.yaml",
