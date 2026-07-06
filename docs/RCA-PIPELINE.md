@@ -15,20 +15,21 @@ produces a report.
 
 ```mermaid
 flowchart TD
-  REQ["/analyze (alert + similar_incidents + feedback_hints)"] --> PLAN
-  PLAN[1 · Planner<br/>scope + hypotheses] --> COLL
-  subgraph COLL["2 · Parallel evidence collectors (7)"]
-    RA[runai] & KA[kubernetes] & PA[prometheus] & LA[loki] & DBA[postgres] & SA[system] & CA[change]
+  REQ([/analyze request]) --> PLAN
+  PLAN[1 · Planner] --> COLL
+  subgraph COLL["2 · Parallel evidence collectors"]
+    direction LR
+    RA([runai]) ~~~ KA([kubernetes]) ~~~ PA([prometheus]) ~~~ LA([loki]) ~~~ DBA([postgres]) ~~~ SA([system]) ~~~ CA([change])
   end
-  COLL --> FOLL[3 · Deterministic follow-up<br/>k8s flowchart → derived PromQL]
-  FOLL --> DRILL[4 · Per-collector autonomous drill-down<br/>each agent, own-domain tools only]
-  DRILL --> SIG[5 · Signature match + BM25 recall + ranking]
-  SIG --> CHK[6 · Self-check → re-analysis once → verify matches]
-  CHK --> KG[7 · Ontology enrichment<br/>blast radius · prior incidents · family/XID fixes]
-  KG --> SYN[8 · Synthesis: Problem → Cause → Actions → Appendix]
-  SYN --> RESP[RCA + ranked causes + evidence trail]
-  INV[Central investigation loop<br/>LLM routes probes + ad-hoc k8s reads] -.wraps 2–4.- COLL
-  ORCH([Orchestrator]) <-->|enrich / graph_remediation| TDB[(TypeDB ontology)]
+  COLL --> FOLL[3 · Deterministic follow-up]
+  FOLL --> DRILL[4 · Per-collector drill-down]
+  DRILL --> SIG[5 · Signature match + BM25 + ranking]
+  SIG --> CHK[6 · Self-check + re-analysis]
+  CHK --> KG[7 · Ontology enrichment]
+  KG --> SYN[8 · Synthesis]
+  SYN --> RESP([RCA + evidence trail])
+  INV[Central investigation loop] -.->|wraps 2-4| COLL
+  ORCH([Orchestrator]) <-->|"enrich / graph_remediation"| TDB[(TypeDB ontology)]
 ```
 
 The whole run is wrapped in `asyncio.wait_for(analyze, ANALYSIS_DEADLINE_SECONDS)`
