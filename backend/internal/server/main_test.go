@@ -2772,3 +2772,52 @@ func TestRecurrenceStatsAndIncidentSimilarRecentCount(t *testing.T) {
 		t.Fatalf("expected one recent similar incident, got ok=%t detail=%+v", ok, detail)
 	}
 }
+
+func TestRecurrenceStatsCacheExpiresAndInvalidates(t *testing.T) {
+	store := NewStore()
+	now := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
+
+	if stats := store.RecurrenceStats(7, now); stats.Total != 0 {
+		t.Fatalf("expected empty baseline stats, got %+v", stats)
+	}
+	store.UpsertAlert(AlertmanagerWebhook{GroupKey: "cache-first"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning", "queue": "gpu-a"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-cache-first",
+		StartsAt:    now.Format(time.RFC3339),
+	})
+	if stats := store.RecurrenceStats(7, now); stats.Total != 1 {
+		t.Fatalf("expected normal write to invalidate recurrence cache, got %+v", stats)
+	}
+
+	store.mu.Lock()
+	store.incidents["INC-cache-direct"] = &Incident{
+		IncidentID:       "INC-cache-direct",
+		CorrelationKey:   "cache-direct",
+		Title:            "Directly inserted cache probe",
+		Severity:         "warning",
+		Status:           "firing",
+		FiredAt:          now.Add(30 * time.Second),
+		LatestActivityAt: now.Add(30 * time.Second),
+	}
+	store.alerts["ALR-cache-direct"] = &AlertRecord{
+		AlertID:     "ALR-cache-direct",
+		IncidentID:  "INC-cache-direct",
+		AlarmTitle:  "Directly inserted cache probe",
+		Severity:    "warning",
+		Status:      "firing",
+		FiredAt:     now.Add(30 * time.Second),
+		Fingerprint: "fp-cache-direct",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning", "queue": "gpu-b"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+	}
+	store.mu.Unlock()
+
+	if stats := store.RecurrenceStats(7, now.Add(30*time.Second)); stats.Total != 1 {
+		t.Fatalf("expected cached stats inside TTL, got %+v", stats)
+	}
+	if stats := store.RecurrenceStats(7, now.Add(61*time.Second)); stats.Total != 2 {
+		t.Fatalf("expected recurrence cache to expire, got %+v", stats)
+	}
+}

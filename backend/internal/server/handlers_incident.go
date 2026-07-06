@@ -139,6 +139,7 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 		resolvedAt := incident.ResolvedAt
 		userApprovedAt := incident.UserApprovedAt
 		s.store.persistIncidentLocked(incident)
+		s.store.invalidateRecurrenceStatsLocked()
 		s.store.mu.Unlock()
 		s.hub.Broadcast(incidentResolvedEvent(id, status, resolvedAt, userApprovedAt))
 		writeJSON(w, http.StatusOK, map[string]any{"status": status, "user_approved_at": userApprovedAt})

@@ -34,30 +34,43 @@ const (
 	incidentViewActive   = "active"
 	incidentViewArchived = "archived"
 	incidentViewTrash    = "trash"
+
+	recurrenceStatsCacheTTL = time.Minute
 )
 
+type recurrenceStatsCacheKey struct {
+	days int
+	asOf time.Time
+}
+
+type recurrenceStatsCacheEntry struct {
+	expiresAt time.Time
+	stats     RecurrenceStats
+}
+
 type Store struct {
-	mu             sync.RWMutex
-	incidentSeq    atomic.Int64
-	alertSeq       atomic.Int64
-	feedbackSeq    atomic.Int64
-	commentSeq     atomic.Int64
-	analysisRunSeq atomic.Int64
-	incidents      map[string]*Incident
-	incidentByKey  map[string]string
-	alerts         map[string]*AlertRecord
-	alertByFinger  map[string]string
-	alertByGroup   map[string]string
-	memories       map[string]*IncidentMemory
-	feedback       map[string]*FeedbackRecord
-	comments       map[string]*CommentRecord
-	analysisRuns   map[string]*AnalysisRun
-	db             *sql.DB
-	dbReady        bool
-	pgvectorReady  bool
-	pgvectorDetail string
-	embedder       *embedder
-	flappingWindow time.Duration
+	mu                   sync.RWMutex
+	incidentSeq          atomic.Int64
+	alertSeq             atomic.Int64
+	feedbackSeq          atomic.Int64
+	commentSeq           atomic.Int64
+	analysisRunSeq       atomic.Int64
+	incidents            map[string]*Incident
+	incidentByKey        map[string]string
+	alerts               map[string]*AlertRecord
+	alertByFinger        map[string]string
+	alertByGroup         map[string]string
+	memories             map[string]*IncidentMemory
+	feedback             map[string]*FeedbackRecord
+	comments             map[string]*CommentRecord
+	analysisRuns         map[string]*AnalysisRun
+	recurrenceStatsCache map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry
+	db                   *sql.DB
+	dbReady              bool
+	pgvectorReady        bool
+	pgvectorDetail       string
+	embedder             *embedder
+	flappingWindow       time.Duration
 }
 
 type AlertUpsertResult struct {
@@ -91,7 +104,10 @@ func NewStore() *Store {
 		feedback:      make(map[string]*FeedbackRecord),
 		comments:      make(map[string]*CommentRecord),
 		analysisRuns:  make(map[string]*AnalysisRun),
-		embedder:      newEmbedder(),
+		recurrenceStatsCache: make(
+			map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry,
+		),
+		embedder: newEmbedder(),
 		// How long an alert signature can be quiet before a recurrence is treated as
 		// a NEW incident rather than another occurrence of the flapping one. 30 min
 		// was too tight — real alerts recur over hours, so each firing spawned its
@@ -407,6 +423,7 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 		!sameTimePtr(previousResolvedAt, record.ResolvedAt)
 	s.persistIncidentLocked(incident)
 	s.persistAlertLocked(record)
+	s.invalidateRecurrenceStatsLocked()
 	return AlertUpsertResult{
 		Incident:       cloneIncident(incident),
 		Alert:          cloneAlert(record),
@@ -536,6 +553,7 @@ func (s *Store) ArchiveIncident(id string, archived bool) (*Incident, bool) {
 	if !s.persistIncidentLocked(incident) {
 		return nil, false
 	}
+	s.invalidateRecurrenceStatsLocked()
 	return cloneIncident(incident), true
 }
 
@@ -554,6 +572,7 @@ func (s *Store) SoftDeleteIncident(id string) (*Incident, bool) {
 	if !s.persistIncidentLocked(incident) {
 		return nil, false
 	}
+	s.invalidateRecurrenceStatsLocked()
 	return cloneIncident(incident), true
 }
 
@@ -570,6 +589,7 @@ func (s *Store) RestoreIncident(id string) (*Incident, bool) {
 	if !s.persistIncidentLocked(incident) {
 		return nil, false
 	}
+	s.invalidateRecurrenceStatsLocked()
 	return cloneIncident(incident), true
 }
 
@@ -658,6 +678,7 @@ func (s *Store) HardDeleteIncident(id string) bool {
 			delete(s.analysisRuns, key)
 		}
 	}
+	s.invalidateRecurrenceStatsLocked()
 	return true
 }
 
@@ -806,9 +827,13 @@ func (s *Store) RecurrenceStats(days int, now time.Time) RecurrenceStats {
 		byDate[date] = len(stats.Daily) - 1
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	// ponytail: O(recent incidents * memories); replace with indexed vector queries if this dashboard gets large.
+	cacheKey := recurrenceStatsCacheKey{days: days, asOf: now.Truncate(time.Minute)}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if entry, ok := s.recurrenceStatsCache[cacheKey]; ok && now.Before(entry.expiresAt) {
+		return cloneRecurrenceStats(entry.stats)
+	}
+	// ponytail: O(recent incidents * memories), cached for the dashboard's polling cadence.
 	for _, incident := range s.incidents {
 		if incident == nil || incidentDeleted(incident) || incident.FiredAt.Before(since) || incident.FiredAt.After(now) {
 			continue
@@ -835,6 +860,21 @@ func (s *Store) RecurrenceStats(days int, now time.Time) RecurrenceStats {
 	for i := range stats.Daily {
 		stats.Daily[i].Rate = recurrenceRate(stats.Daily[i].Recurred, stats.Daily[i].Total)
 	}
+	s.recurrenceStatsCache[cacheKey] = recurrenceStatsCacheEntry{
+		expiresAt: now.Add(recurrenceStatsCacheTTL),
+		stats:     cloneRecurrenceStats(stats),
+	}
+	return cloneRecurrenceStats(stats)
+}
+
+func (s *Store) invalidateRecurrenceStatsLocked() {
+	if len(s.recurrenceStatsCache) > 0 {
+		s.recurrenceStatsCache = make(map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry)
+	}
+}
+
+func cloneRecurrenceStats(stats RecurrenceStats) RecurrenceStats {
+	stats.Daily = append([]RecurrenceDay(nil), stats.Daily...)
 	return stats
 }
 

@@ -141,6 +141,36 @@ func TestPostgresLoadSkipsDeletedIncidentIndexes(t *testing.T) {
 	}
 }
 
+func TestPostgresHardDeleteUsesSingleTransaction(t *testing.T) {
+	state := testsupport.NewPostgresState(false)
+	store := NewStore()
+
+	store.connectDatabaseWithDriver(testsupport.RegisterPostgresDriver(state), "fake://runai_rca", time.Second)
+	defer store.db.Close()
+	beforeBegins, beforeCommits, beforeRollbacks := state.TxCounts()
+
+	if !store.HardDeleteIncident("INC-db") {
+		t.Fatalf("expected hard delete to succeed")
+	}
+	afterBegins, afterCommits, afterRollbacks := state.TxCounts()
+	if afterBegins != beforeBegins+1 || afterCommits != beforeCommits+1 || afterRollbacks != beforeRollbacks {
+		t.Fatalf("expected one committed hard-delete transaction, before=%d/%d/%d after=%d/%d/%d",
+			beforeBegins, beforeCommits, beforeRollbacks, afterBegins, afterCommits, afterRollbacks)
+	}
+	for _, fragment := range []string{
+		"DELETE FROM analysis_runs",
+		"DELETE FROM rca_comments",
+		"DELETE FROM rca_feedback",
+		"DELETE FROM incident_embeddings",
+		"DELETE FROM alerts",
+		"DELETE FROM incidents",
+	} {
+		if !state.Executed(fragment) {
+			t.Fatalf("expected hard delete statement %q, got %+v", fragment, state.Execs())
+		}
+	}
+}
+
 func TestInMemoryStoreHealthReportsNoPostgres(t *testing.T) {
 	health := NewStore().databaseHealth()
 	if health["postgres"] != false ||

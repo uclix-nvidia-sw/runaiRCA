@@ -43,6 +43,9 @@ type PostgresState struct {
 	emptyArrayJSON           []byte
 	execsNoDeadline          int
 	queriesNoDeadline        int
+	txBegins                 int
+	txCommits                int
+	txRollbacks              int
 	pgvectorSearchLimit      int64
 	incidentDeletedAt        any
 }
@@ -133,6 +136,12 @@ func (s *PostgresState) DeadlineMisses() (int, int) {
 	return s.execsNoDeadline, s.queriesNoDeadline
 }
 
+func (s *PostgresState) TxCounts() (int, int, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.txBegins, s.txCommits, s.txRollbacks
+}
+
 func (s *PostgresState) RecordedPGVectorSearchLimit() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -159,8 +168,22 @@ func (c *fakePostgresConn) Close() error {
 	return nil
 }
 
+func (c *fakePostgresConn) CheckNamedValue(*driver.NamedValue) error {
+	return nil
+}
+
 func (c *fakePostgresConn) Begin() (driver.Tx, error) {
-	return nil, errors.New("transactions are not implemented")
+	return c.BeginTx(context.Background(), driver.TxOptions{})
+}
+
+func (c *fakePostgresConn) BeginTx(ctx context.Context, _ driver.TxOptions) (driver.Tx, error) {
+	c.state.mu.Lock()
+	if _, ok := ctx.Deadline(); !ok {
+		c.state.execsNoDeadline++
+	}
+	c.state.txBegins++
+	c.state.mu.Unlock()
+	return &fakePostgresTx{state: c.state}, nil
 }
 
 func (c *fakePostgresConn) Ping(context.Context) error {
@@ -216,6 +239,24 @@ func (c *fakePostgresConn) QueryContext(ctx context.Context, query string, args 
 	c.state.mu.Unlock()
 
 	return c.state.rowsFor(query), nil
+}
+
+type fakePostgresTx struct {
+	state *PostgresState
+}
+
+func (tx *fakePostgresTx) Commit() error {
+	tx.state.mu.Lock()
+	defer tx.state.mu.Unlock()
+	tx.state.txCommits++
+	return nil
+}
+
+func (tx *fakePostgresTx) Rollback() error {
+	tx.state.mu.Lock()
+	defer tx.state.mu.Unlock()
+	tx.state.txRollbacks++
+	return nil
 }
 
 func (s *PostgresState) rowsFor(query string) driver.Rows {

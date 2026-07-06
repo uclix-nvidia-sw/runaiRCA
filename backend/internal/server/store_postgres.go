@@ -795,6 +795,19 @@ func (s *Store) persistHardDeleteIncidentLocked(incidentID string, alertIDs []st
 	if s.db == nil || !s.dbReady || incidentID == "" {
 		return true
 	}
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("Failed to start hard delete transaction for incident %s: %v", incidentID, err)
+		return false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
 	for _, query := range []string{
 		`DELETE FROM analysis_runs WHERE incident_id = $1 OR alert_id = ANY($2)`,
 		`DELETE FROM rca_comments WHERE incident_id = $1 OR target_id = $1 OR alert_id = ANY($2) OR target_id = ANY($2)`,
@@ -803,11 +816,16 @@ func (s *Store) persistHardDeleteIncidentLocked(incidentID string, alertIDs []st
 		`DELETE FROM alerts WHERE incident_id = $1`,
 		`DELETE FROM incidents WHERE incident_id = $1`,
 	} {
-		if _, err := s.execPostgres(query, incidentID, alertIDs); err != nil {
+		if _, err := tx.ExecContext(ctx, query, incidentID, alertIDs); err != nil {
 			log.Printf("Failed to hard delete incident %s: %v", incidentID, err)
 			return false
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit hard delete incident %s: %v", incidentID, err)
+		return false
+	}
+	committed = true
 	return true
 }
 

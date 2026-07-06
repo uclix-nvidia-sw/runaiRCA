@@ -338,6 +338,7 @@ func (s *Store) ApplyAnalysisForRun(runID string, alertID string, response Agent
 		s.refreshIncidentAnalyzingLocked(incident.IncidentID)
 		s.persistIncidentLocked(incident)
 	}
+	s.invalidateRecurrenceStatsLocked()
 	return true
 }
 
@@ -358,6 +359,7 @@ func (s *Store) applyAnalysisLocked(alert *AlertRecord, response AgentAnalysisRe
 		s.persistIncidentLocked(incident)
 	}
 	s.persistAlertLocked(alert)
+	s.invalidateRecurrenceStatsLocked()
 }
 
 func (s *Store) MarkAnalyzing(incidentID string, analyzing bool) {
@@ -436,6 +438,7 @@ func (s *Store) applyFallbackAnalysisIfAbsentLocked(alert *AlertRecord, response
 			s.persistIncidentLocked(incident)
 		}
 		s.persistAlertLocked(alert)
+		s.invalidateRecurrenceStatsLocked()
 		return false
 	}
 	alert.AnalysisSummary = response.AnalysisSummary
@@ -454,6 +457,7 @@ func (s *Store) applyFallbackAnalysisIfAbsentLocked(alert *AlertRecord, response
 		s.persistIncidentLocked(incident)
 	}
 	s.persistAlertLocked(alert)
+	s.invalidateRecurrenceStatsLocked()
 	return true
 }
 
@@ -512,6 +516,7 @@ func (s *Store) upsertMemoryLocked(incident *Incident, alert *AlertRecord) {
 	memory.Vector = textVector(memoryText(*memory))
 	s.memories[first(memory.AlertID, memory.IncidentID)] = memory
 	s.persistMemoryLocked(memory)
+	s.invalidateRecurrenceStatsLocked()
 }
 
 func (s *Store) upsertApprovedIncidentMemoriesLocked(incident *Incident) {
