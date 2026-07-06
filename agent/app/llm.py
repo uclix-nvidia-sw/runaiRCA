@@ -18,7 +18,7 @@ from app.collectors.http_json import post_json
 from app.config import Settings
 
 _log = logging.getLogger(__name__)
-_usage: ContextVar[dict[str, int] | None] = ContextVar("llm_usage", default=None)
+_usage: ContextVar[dict[str, Any] | None] = ContextVar("llm_usage", default=None)
 _RETRY_STATUSES = {0, 429, 500, 502, 503, 504}
 
 
@@ -26,8 +26,16 @@ def llm_configured(settings: Settings) -> bool:
     return bool(settings.llm_base_url and settings.llm_model and settings.llm_api_key)
 
 
-def begin_usage_tracking() -> dict[str, int]:
-    usage = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+def begin_usage_tracking() -> dict[str, Any]:
+    usage = {
+        "calls": 0,
+        "calls_without_usage": 0,
+        "failed_calls": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "by_model": {},
+    }
     _usage.set(usage)
     return usage
 
@@ -83,7 +91,11 @@ async def complete(
         if response.ok or response.status_code not in _RETRY_STATUSES or attempt == 2:
             break
         await asyncio.sleep((0.25 * (2**attempt)) + random.uniform(0, 0.1))
-    if not response.ok or not isinstance(response.data, dict):
+    if not response.ok:
+        _record_failed_call(settings.llm_model)
+        return None
+    if not isinstance(response.data, dict):
+        _record_failed_call(settings.llm_model)
         return None
     _record_usage(settings.llm_model, response.data)
     choices = response.data.get("choices")
@@ -97,20 +109,56 @@ async def complete(
 
 
 def _record_usage(model: str, data: dict[str, Any]) -> None:
-    raw = data.get("usage")
-    if not isinstance(raw, dict):
-        return
     current = _usage.get()
     if current is None:
         return
-    per_call = {"model": model}
+    bucket = _usage_bucket(current, model)
     current["calls"] += 1
+    bucket["calls"] += 1
+
+    raw = data.get("usage")
+    if not isinstance(raw, dict):
+        current["calls_without_usage"] += 1
+        bucket["calls_without_usage"] += 1
+        _log.info("llm usage", extra={"llm_usage": {"model": model, "calls_without_usage": 1}})
+        return
+
+    per_call: dict[str, Any] = {"model": model}
     for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
         value = raw.get(key)
         if isinstance(value, int | float):
             current[key] += int(value)
+            bucket[key] += int(value)
             per_call[key] = int(value)
     _log.info("llm usage", extra={"llm_usage": per_call})
+
+
+def _record_failed_call(model: str) -> None:
+    current = _usage.get()
+    if current is None:
+        return
+    bucket = _usage_bucket(current, model)
+    current["failed_calls"] += 1
+    bucket["failed_calls"] += 1
+
+
+def _usage_bucket(current: dict[str, Any], model: str) -> dict[str, int]:
+    by_model = current.setdefault("by_model", {})
+    if not isinstance(by_model, dict):
+        by_model = {}
+        current["by_model"] = by_model
+    bucket = by_model.setdefault(
+        model,
+        {
+            "calls": 0,
+            "calls_without_usage": 0,
+            "failed_calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+    )
+    return bucket
 
 
 async def complete_json(

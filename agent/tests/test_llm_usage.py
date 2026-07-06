@@ -58,7 +58,114 @@ async def test_llm_usage_is_injected_by_analyze(monkeypatch) -> None:
 
     assert response.context["llm_usage"] == {
         "calls": 1,
+        "calls_without_usage": 0,
+        "failed_calls": 0,
         "prompt_tokens": 3,
         "completion_tokens": 5,
         "total_tokens": 8,
+        "by_model": {
+            "m": {
+                "calls": 1,
+                "calls_without_usage": 0,
+                "failed_calls": 0,
+                "prompt_tokens": 3,
+                "completion_tokens": 5,
+                "total_tokens": 8,
+            },
+        },
     }
+
+
+@pytest.mark.asyncio
+async def test_llm_usage_counts_missing_usage(monkeypatch) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.local",
+        llm_model="m",
+        llm_api_key="k",
+        analysis_deadline_seconds=0,
+    )
+
+    async def fake_post_json(**_kwargs):
+        return JsonResponse(
+            url="u",
+            status_code=200,
+            data={"choices": [{"message": {"content": "done"}}]},
+        )
+
+    async def fake_impl(request: AlertAnalysisRequest) -> AlertAnalysisResponse:
+        await complete(settings, system="s", user="u")
+        return AlertAnalysisResponse(
+            status="ok",
+            thread_ts=request.thread_ts,
+            analysis="a",
+            analysis_summary="s",
+            analysis_detail="d",
+            analysis_type="firing",
+            analysis_quality="high",
+            missing_data=[],
+            warnings=[],
+            capabilities={},
+            context={},
+            artifacts=[],
+        )
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    orch = AnalysisOrchestrator(settings)
+    orch._analyze_impl = fake_impl  # type: ignore[assignment]
+
+    response = await orch.analyze(
+        AlertAnalysisRequest(alert=Alert(labels={"alertname": "x"}, annotations={}))
+    )
+
+    assert response.context["llm_usage"]["calls"] == 1
+    assert response.context["llm_usage"]["calls_without_usage"] == 1
+    assert response.context["llm_usage"]["by_model"]["m"]["calls_without_usage"] == 1
+
+
+@pytest.mark.asyncio
+async def test_llm_usage_counts_exhausted_retry(monkeypatch) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.local",
+        llm_model="m",
+        llm_api_key="k",
+        analysis_deadline_seconds=0,
+    )
+
+    async def fake_post_json(**_kwargs):
+        return JsonResponse(url="u", status_code=500, error="HTTP 500")
+
+    async def fake_sleep(_seconds: float) -> None:
+        return None
+
+    async def fake_impl(request: AlertAnalysisRequest) -> AlertAnalysisResponse:
+        await complete(settings, system="s", user="u")
+        return AlertAnalysisResponse(
+            status="ok",
+            thread_ts=request.thread_ts,
+            analysis="a",
+            analysis_summary="s",
+            analysis_detail="d",
+            analysis_type="firing",
+            analysis_quality="high",
+            missing_data=[],
+            warnings=[],
+            capabilities={},
+            context={},
+            artifacts=[],
+        )
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    monkeypatch.setattr("app.llm.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("app.llm.random.uniform", lambda *_args: 0)
+    orch = AnalysisOrchestrator(settings)
+    orch._analyze_impl = fake_impl  # type: ignore[assignment]
+
+    response = await orch.analyze(
+        AlertAnalysisRequest(alert=Alert(labels={"alertname": "x"}, annotations={}))
+    )
+
+    assert response.context["llm_usage"]["calls"] == 0
+    assert response.context["llm_usage"]["failed_calls"] == 1
+    assert response.context["llm_usage"]["by_model"]["m"]["failed_calls"] == 1
