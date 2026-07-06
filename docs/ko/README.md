@@ -20,24 +20,30 @@ docs/       Architecture and operation notes
 flowchart TD
   AM[Alertmanager] -->|webhook| BE[Backend API]
   FE[Frontend] <-->|REST + SSE| BE
-  BE <-->|"persist + pgvector search: incidents · alerts · embeddings · feedback"| DB[(PostgreSQL + pgvector / JSONB fallback)]
-  BE -->|"summary + dashboard link on analysis complete (Slack)"| SLACK[Slack]
+  BE <-->|"persist · pgvector"| DB[(PostgreSQL + pgvector)]
+  BE -->|"summary + link"| SLACK([Slack])
   BE -->|"/analyze · /chat"| ORCH
 
   subgraph AG["Agent — analysis orchestrator"]
-    ORCH[Orchestrator]
-    PLAN[Planner: scope + hypotheses]
-    COLL["7 parallel collectors:<br/>runai · kubernetes · prometheus<br/>loki · postgres · system · change"]
-    INV["Central investigation loop<br/>+ per-collector autonomous drill-down"]
-    SYN["Signature match · BM25 recall<br/>ranking · self-check · synthesis"]
-    ORCH --> PLAN --> COLL --> INV --> SYN
+    ORCH[Orchestrator] --> PLAN[Planner]
+    PLAN --> COLL
+    subgraph COLL["Parallel evidence collectors"]
+      direction LR
+      RA([runai]) ~~~ KA([kubernetes]) ~~~ PA([prometheus]) ~~~ LA([loki]) ~~~ DBA([postgres]) ~~~ SA([system]) ~~~ CA([change])
+    end
+    COLL --> INV[Investigation loop]
+    INV --> DRILL[Per-collector drill-down]
+    DRILL --> SIG[Signature match + BM25]
+    SIG --> RANK[Ranking]
+    RANK --> CHK[Self-check + re-analysis]
+    CHK --> SYN[Synthesis]
   end
 
-  DB -.->|"similar incidents + feedback hints (retrieved by backend)"| ORCH
-  ORCH <-->|"blast radius · prior incidents · family/XID fixes"| KG[("TypeDB ontology")]
-  COLL -->|Run:ai API| MCP[runai-mcp sidecar]
-  SYN -->|"RCA + ranked causes + evidence trail"| BE
-  DB -.->|review-gated ingest| KG
+  DB -.->|"similar incidents (via backend)"| ORCH
+  ORCH <-->|"blast radius · prior incidents · fixes"| KG[(TypeDB ontology)]
+  COLL -->|"Run:ai API"| MCP([runai-mcp sidecar])
+  SYN -->|"RCA + evidence"| BE
+  DB -.->|"review-gated ingest"| KG
 ```
 
 **오케스트레이터**는 전체 파이프라인을 실행합니다. 플래너가 작업 범위를 정하고, 7개의 수집기가 병렬로 증거를 수집하며, 중앙 조사 루프와 수집기별 드릴다운이 이를 심화한 뒤, 시그니처 매칭, 랭킹, 회의적인 자기 점검, 그리고 종합을 거쳐 근거가 확실한 하나의 RCA를 산출합니다. 오케스트레이터는 pgvector가 표현할 수 없는 관계형 사실 — 노드 blast radius(영향 범위), 동일 알림에 대한 과거 인시던트, 그래프에서 도출된 family/XID 조치 — 를 위해 선택적 **TypeDB 온톨로지**(`typedb.enabled`, Helm에서 기본 활성화)를 참조하며, 이는 Postgres 저장소로부터 리뷰 기반 수집(review-gated ingestion)으로 채워집니다. **pgvector** 유사도는 백엔드가 소유하며, 백엔드는 각 분석 요청에 유사 인시던트와 피드백 힌트를 전달합니다. 전체 설명: [RCA Pipeline](RCA-PIPELINE.md) ·

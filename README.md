@@ -26,24 +26,30 @@ docs/       Architecture and operation notes
 flowchart TD
   AM[Alertmanager] -->|webhook| BE[Backend API]
   FE[Frontend] <-->|REST + SSE| BE
-  BE <-->|"persist + pgvector search: incidents · alerts · embeddings · feedback"| DB[(PostgreSQL + pgvector / JSONB fallback)]
-  BE -->|"summary + dashboard link on analysis complete (Slack)"| SLACK[Slack]
+  BE <-->|"persist · pgvector"| DB[(PostgreSQL + pgvector)]
+  BE -->|"summary + link"| SLACK([Slack])
   BE -->|"/analyze · /chat"| ORCH
 
   subgraph AG["Agent — analysis orchestrator"]
-    ORCH[Orchestrator]
-    PLAN[Planner: scope + hypotheses]
-    COLL["7 parallel collectors:<br/>runai · kubernetes · prometheus<br/>loki · postgres · system · change"]
-    INV["Central investigation loop<br/>+ per-collector autonomous drill-down"]
-    SYN["Signature match · BM25 recall<br/>ranking · self-check · synthesis"]
-    ORCH --> PLAN --> COLL --> INV --> SYN
+    ORCH[Orchestrator] --> PLAN[Planner]
+    PLAN --> COLL
+    subgraph COLL["Parallel evidence collectors"]
+      direction LR
+      RA([runai]) ~~~ KA([kubernetes]) ~~~ PA([prometheus]) ~~~ LA([loki]) ~~~ DBA([postgres]) ~~~ SA([system]) ~~~ CA([change])
+    end
+    COLL --> INV[Investigation loop]
+    INV --> DRILL[Per-collector drill-down]
+    DRILL --> SIG[Signature match + BM25]
+    SIG --> RANK[Ranking]
+    RANK --> CHK[Self-check + re-analysis]
+    CHK --> SYN[Synthesis]
   end
 
-  DB -.->|"similar incidents + feedback hints (retrieved by backend)"| ORCH
-  ORCH <-->|"blast radius · prior incidents · family/XID fixes"| KG[("TypeDB ontology")]
-  COLL -->|Run:ai API| MCP[runai-mcp sidecar]
-  SYN -->|"RCA + ranked causes + evidence trail"| BE
-  DB -.->|review-gated ingest| KG
+  DB -.->|"similar incidents (via backend)"| ORCH
+  ORCH <-->|"blast radius · prior incidents · fixes"| KG[(TypeDB ontology)]
+  COLL -->|"Run:ai API"| MCP([runai-mcp sidecar])
+  SYN -->|"RCA + evidence"| BE
+  DB -.->|"review-gated ingest"| KG
 ```
 
 The **orchestrator** runs the whole pipeline: a planner scopes the work, seven
