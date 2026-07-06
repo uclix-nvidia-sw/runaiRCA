@@ -35,7 +35,9 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `RUNAI_WORKLOADS_PATH` | Run:ai workloads API path, default `/api/v1/workloads` |
 | `RUNAI_PROJECTS_PATH` | Run:ai projects API path, default `/api/v1/projects` |
 | `RUNAI_QUEUES_PATH` | Run:ai queues API path, default `/api/v1/queues` |
-| `RUNAI_TIMEOUT_SECONDS` | Run:ai API request timeout |
+| `RUNAI_VERSION_PATH` | Run:ai control-plane version API path, default `/api/v1/version` — enables version-aware suppression of already-fixed known issues |
+| `RUNAI_TIMEOUT_SECONDS` | Run:ai API request timeout, default `120` |
+| `RUNAI_MCP_URL` | Optional runai-mcp sidecar URL (stdio→HTTP bridge, e.g. `http://localhost:8809/mcp`). When set, the runai collector + drill-down reach the 426 Run:ai APIs spec-aware; any failure falls back to the fixed-endpoint collector |
 | `RUNAI_LOG_NAMESPACES` | Comma-separated Run:ai control-plane log namespaces, default `runai,runai-backend` |
 | `PROMETHEUS_URL` | Prometheus base URL |
 | `PROMETHEUS_TIMEOUT_SECONDS` | Prometheus query timeout |
@@ -44,6 +46,12 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `LOKI_TIMEOUT_SECONDS` | Loki query timeout |
 | `LOKI_QUERY_LIMIT` | Maximum log lines requested per Loki query group, default `20` |
 | `LOKI_MCP_URL` | Optional remote Loki MCP URL for the MCP workflow |
+| `ENABLE_SYSTEM_AGENT` | Enable the node-infra System collector (dmesg/journalctl/syslog via a per-node DaemonSet), default `true`; degrades to `unavailable` when `SYSTEM_AGENT_URL` is unset |
+| `SYSTEM_AGENT_URL` | Per-node System-agent DaemonSet endpoint (`GET /logs?source=dmesg\|journal\|syslog`) |
+| `SYSTEM_AGENT_TOKEN` | Optional bearer token for the System-agent endpoint |
+| `SYSTEM_AGENT_TIMEOUT_SECONDS` | System-agent request timeout, default `120` |
+| `ENABLE_POD_EXEC` | Allow the Kubernetes collector read-only pod-exec (allowlisted commands: `nvidia-smi`, …), default `true` |
+| `POD_EXEC_TIMEOUT_SECONDS` | Pod-exec timeout, default `120` |
 | `DATABASE_URL` | Backend Postgres store DSN for incidents, alerts, embeddings, feedback, comments, and analysis runs |
 | `DATABASE_CONNECT_TIMEOUT_SECONDS` | Backend Postgres startup connection timeout, default `5` |
 | `POSTGRES_DSN` | Agent Postgres diagnostic DSN; defaults to `DATABASE_URL` in Helm |
@@ -69,6 +77,22 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `ENABLE_AGENT_DRILLDOWN` | Per-collector autonomous drill-down: each evidence agent (kubernetes/prometheus/loki/runai) runs its own bounded LLM loop with only its domain's read-only tools, default `false` (Helm sets `true`) |
 | `DRILLDOWN_MAX_STEPS` | Max drill-down steps per evidence agent, default `4` |
 | `ANALYSIS_DEADLINE_SECONDS` | Overall hard cap per analysis (graceful degraded report on overrun), default `1500` (25 min), `0` = no cap. Keep the backend `AGENT_REQUEST_TIMEOUT_SECONDS` above this. |
+| `MAX_AUTO_ANALYZE_FANOUT` | Backend: max analyses started per webhook, default `50` |
+| `MAX_CONCURRENT_AGENT_RUNS` | Backend: max analyses running against the Agent concurrently, default `50` |
+| `FLAPPING_GROUP_WINDOW_MINUTES` | Backend: quiet window before a recurring alert becomes a NEW incident vs another occurrence, code default `120` (Helm sets `360`) |
+| `ANALYSIS_BACKFILL_INTERVAL_SECONDS` | Backend: how often to re-drive alerts left without a completed RCA, default `300` (`0` disables) |
+| `ANALYSIS_BACKFILL_BATCH` | Backend: alerts re-driven per backfill tick, default `10` |
+| `ANALYSIS_BACKFILL_RETRY_COOLDOWN_SECONDS` | Backend: cooldown before retrying a failed alert, default `900` |
+| `EMBEDDING_URL` | Backend: OpenAI-compatible `/embeddings` endpoint for similar-incident search. Empty = offline feature-hash fallback (default, lexical) |
+| `EMBEDDING_MODEL` | Backend: embedding model name (with `EMBEDDING_URL`) |
+| `EMBEDDING_DIM` | Backend: embedding vector dimension, default `384`. Must match the model; changing it requires re-embedding existing rows |
+| `EMBEDDING_API_KEY` | Backend: API key for the embedding endpoint (secret key `embeddingApiKey`) |
+| `ENABLE_TYPEDB` | Master switch for the TypeDB ontology, default `false` (Helm sets it from `typedb.enabled`, default on). Connection vars below — full detail in [Data Stores](DATABASE.md) |
+| `TYPEDB_ADDRESS` | TypeDB server address, default `localhost:1729`; in-cluster `<release>-typedb:1729` |
+| `TYPEDB_DATABASE` | TypeDB database name, default `runai_rca` |
+| `TYPEDB_USERNAME` / `TYPEDB_PASSWORD` | TypeDB credentials, default `admin` / `password` (CE defaults — override beyond PoC) |
+| `TYPEDB_TLS_ENABLED` | Use TLS for the TypeDB connection, default `false` |
+| `TYPEDB_TIMEOUT_SECONDS` | TypeDB query timeout, default `60` |
 
 The Helm chart does not expose Loki credential values because the default
 deployment is expected to query Loki through the in-cluster read/query service.

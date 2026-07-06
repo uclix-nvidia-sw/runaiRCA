@@ -149,8 +149,15 @@ kubectl create secret generic runai-rca-secrets \
   --from-literal=NVIDIA_API_KEY='<nim-api-key>' \
   --from-literal=LLM_API_KEY='<llm-api-key>' \
   --from-literal=DATABASE_URL='postgres://user:password@postgres.example.com:5432/runai_rca?sslmode=require' \
-  --from-literal=POSTGRES_DSN='postgres://user:password@postgres.example.com:5432/runai_rca?sslmode=require'
+  --from-literal=POSTGRES_DSN='postgres://user:password@postgres.example.com:5432/runai_rca?sslmode=require' \
+  --from-literal=RUNAI_DB_DSN='<optional: read-only DSN for the Run:ai control-plane Postgres, enables the postgres drill-down>' \
+  --from-literal=SLACK_BOT_TOKEN='<optional: xoxb- bot token, chat:write>' \
+  --from-literal=SLACK_CHANNEL_ID='<optional: channel for incident-analysis summaries>'
 ```
+
+`RUNAI_DB_DSN` and the two `SLACK_*` keys are optional — omit them to disable the
+platform-DB drill-down and Slack notifications respectively. Slack also needs
+`backend.env.dashboardUrl` set for the "Open Incident" link.
 
 Install into that namespace with `--namespace runai-rca --create-namespace`, or
 replace the namespace above with your release namespace. If you use different

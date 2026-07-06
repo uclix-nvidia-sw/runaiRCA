@@ -53,12 +53,23 @@ workflow before falling back. It is not a chat-specific LLM readiness signal.
 - Loki Agent inspects workload logs plus Run:ai control-plane/backend logs from
   `runai` and `runai-backend` by default.
 - Postgres Agent inspects RCA store connectivity, pgvector, embeddings,
-  feedback, comments, and memory health.
+  feedback, comments, and memory health. With `RUNAI_DB_DSN` set it can also
+  read the Run:ai control-plane database (workloads/audit/… schemas) during
+  drill-down.
 - Store/Postgres ownership includes verifying the target database exists, the
   backend user can create/update RCA tables, and pgvector is installed plus
   enabled with `CREATE EXTENSION vector;` when true pgvector readiness is
   required. Without pgvector, the backend should remain healthy with JSONB
   sparse-vector memory fallback.
+- System Agent inspects node infrastructure below Kubernetes — dmesg/journalctl/
+  syslog for kernel, GPU driver / NVIDIA XID, OOM, and hardware errors — via a
+  per-node DaemonSet.
+- Change Agent answers "what changed?" around the alert window: recently-bumped
+  controllers, new/deleting pods, node-condition transitions, and recent events.
+
+Each evidence agent can additionally run its own bounded, read-only drill-down
+loop (`ENABLE_AGENT_DRILLDOWN`) scoped to its own domain's tools. The
+orchestration flow that ties these together is the [RCA Pipeline](RCA-PIPELINE.md).
 - Analysis Agent produces the KubeRCA-style dashboard RCA: root cause,
   confidence, impact, missing data, recommended manual actions, prevention, and
   evidence coverage.
