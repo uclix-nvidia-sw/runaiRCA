@@ -31,18 +31,13 @@ flowchart TD
   BE -->|"/analyze · /chat"| ORCH
 
   subgraph AG["Agent — analysis orchestrator"]
-    ORCH[Orchestrator] --> PLAN[Planner]
-    PLAN --> COLL
+    ORCH[Orchestrator] --> PLAN[Planner] --> COLL
     subgraph COLL["Parallel evidence collectors"]
       direction LR
       RA([runai]) ~~~ KA([kubernetes]) ~~~ PA([prometheus]) ~~~ LA([loki]) ~~~ DBA([postgres]) ~~~ SA([system]) ~~~ CA([change])
     end
-    COLL --> INV[Investigation loop]
-    INV --> DRILL[Per-collector drill-down]
-    DRILL --> SIG[Signature match + BM25]
-    SIG --> RANK[Ranking]
-    RANK --> CHK[Self-check + re-analysis]
-    CHK --> SYN[Synthesis]
+    COLL --> INV["Investigate + drill-down"]
+    INV --> SYN["Rank · self-check · synthesize"]
   end
 
   DB -.->|"similar incidents (via backend)"| ORCH
