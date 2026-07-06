@@ -8,9 +8,10 @@ live incident facts the ingest cronjob writes.
     ENABLE_TYPEDB=true TYPEDB_ADDRESS=localhost:1729 \
         python -m ontology.load_architecture
 
-Idempotent via read-then-insert (_exists) like the other loaders; re-running
-after editing the YAML is safe. Same TypeDB 3.11 syntax constraints as
-load_knowledge.py: no inline negation, `$x`-bound _exists matches only.
+Idempotent via replace semantics: single-valued attrs are delete-then-insert
+(a changed YAML value would otherwise violate the @card(0..1) default), and
+check_command mirrors the YAML list exactly. Same TypeDB 3.11 syntax
+constraints as load_knowledge.py: no inline negation, `delete has $a of $x`.
 """
 
 from __future__ import annotations
@@ -42,6 +43,9 @@ def _ensure_component(tx: Any, entry: dict[str, Any]) -> None:
         "failure_effect": entry.get("failure_effect"),
         "owns_schema": entry.get("owns_schema"),
     }
+    # Replace (not add-if-missing): these attrs are @card(0..1), so when the
+    # YAML text changes, inserting alongside the old value fails the commit —
+    # same pattern as ingest._replace_attr.
     for attr, value in single_valued.items():
         text = str(value or "").strip()
         if not text:
@@ -52,18 +56,22 @@ def _ensure_component(tx: Any, entry: dict[str, Any]) -> None:
         ):
             continue
         tx.query(
+            f'match $c isa control_plane_component, has name "{esc(name)}", has {attr} $old; '
+            f"delete has $old of $c;"
+        ).resolve()
+        tx.query(
             f'match $c isa control_plane_component, has name "{esc(name)}"; '
             f'insert $c has {attr} "{esc(text)}";'
         ).resolve()
+    # check_command is multi-valued (@card(0..)): mirror the YAML list exactly
+    # so checks dropped from the YAML don't linger as stale operator hints.
+    tx.query(
+        f'match $c isa control_plane_component, has name "{esc(name)}", has check_command $old; '
+        f"delete has $old of $c;"
+    ).resolve()
     for check in entry.get("checks") or []:
         text = str(check).strip()
         if not text:
-            continue
-        if _exists(
-            tx,
-            f'$x isa control_plane_component, has name "{esc(name)}", '
-            f'has check_command "{esc(text)}";',
-        ):
             continue
         tx.query(
             f'match $c isa control_plane_component, has name "{esc(name)}"; '

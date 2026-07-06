@@ -107,7 +107,9 @@ entity control_plane_component,
     owns description,
     owns failure_effect,
     owns owns_schema,
-    owns check_command,
+    # A component ships several ready-to-run checks; without the explicit card
+    # the 3.x default @card(0..1) makes any 2-check component uncommittable.
+    owns check_command @card(0..),
     plays emits:emitter,
     plays contains:occupant,
     plays depends_on:dependent,
