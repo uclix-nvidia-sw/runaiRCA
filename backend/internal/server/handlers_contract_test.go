@@ -32,6 +32,7 @@ func TestIncidentAndAlertDetailContracts(t *testing.T) {
 		AnalysisQuality: "high",
 		Capabilities:    map[string]string{"runai": "ok"},
 	})
+	approveIncidentForTest(t, server.store, priorIncident.IncidentID)
 	_, ok, err := server.store.AddFeedback("incident", priorIncident.IncidentID, FeedbackRequest{
 		Vote:   "up",
 		Author: "operator",
@@ -184,6 +185,63 @@ func TestAlertFeedbackCommentAndSearchEndpoints(t *testing.T) {
 	)
 	if searchRec.Code != http.StatusOK {
 		t.Fatalf("expected search 200, got %d: %s", searchRec.Code, searchRec.Body.String())
+	}
+}
+
+func TestIncidentLifecycleActionContractsAndEvents(t *testing.T) {
+	server := NewServer()
+	incident, _ := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "action-contract"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-action-contract",
+	})
+	events := server.hub.Subscribe()
+	defer server.hub.Unsubscribe(events)
+
+	post := func(path string) Event {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected %s 200, got %d: %s", path, rec.Code, rec.Body.String())
+		}
+		select {
+		case event := <-events:
+			if event.Type != eventIncidentUpdated {
+				t.Fatalf("expected incident.updated, got %+v", event)
+			}
+			return event
+		case <-time.After(time.Second):
+			t.Fatalf("missing incident.updated event for %s", path)
+			return Event{}
+		}
+	}
+
+	if event := post("/api/v1/incidents/" + incident.IncidentID + "/archive"); event.Data["action"] != "archive" {
+		t.Fatalf("unexpected archive event: %+v", event)
+	}
+	if event := post("/api/v1/incidents/" + incident.IncidentID + "/unarchive"); event.Data["action"] != "unarchive" {
+		t.Fatalf("unexpected unarchive event: %+v", event)
+	}
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/incidents/"+incident.IncidentID, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected soft delete 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if event := <-events; event.Type != eventIncidentUpdated || event.Data["action"] != "delete" {
+		t.Fatalf("unexpected delete event: %+v", event)
+	}
+	if event := post("/api/v1/incidents/" + incident.IncidentID + "/restore"); event.Data["action"] != "restore" {
+		t.Fatalf("unexpected restore event: %+v", event)
+	}
+	rec = httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/incidents/"+incident.IncidentID+"?permanent=true", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected permanent delete 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if event := <-events; event.Type != eventIncidentUpdated || event.Data["action"] != "delete_permanent" {
+		t.Fatalf("unexpected permanent delete event: %+v", event)
 	}
 }
 

@@ -174,6 +174,7 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			status TEXT NOT NULL,
 			fired_at TIMESTAMPTZ NOT NULL,
 			resolved_at TIMESTAMPTZ,
+			user_approved_at TIMESTAMPTZ,
 			alert_count INTEGER NOT NULL DEFAULT 0,
 			analysis_seq INTEGER NOT NULL DEFAULT 0,
 			slack_thread_ts TEXT NOT NULL DEFAULT '',
@@ -181,6 +182,9 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 		)`,
 		`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS analysis_seq INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS slack_thread_ts TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS user_approved_at TIMESTAMPTZ`,
+		`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ`,
+		`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`,
 		`CREATE TABLE IF NOT EXISTS alerts (
 			alert_id TEXT PRIMARY KEY,
 			incident_id TEXT NOT NULL,
@@ -277,9 +281,11 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			missing_data JSONB NOT NULL DEFAULT '[]'::jsonb,
 			warnings JSONB NOT NULL DEFAULT '[]'::jsonb,
 			artifacts JSONB NOT NULL DEFAULT '[]'::jsonb,
+			metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb`,
 		`CREATE INDEX IF NOT EXISTS idx_alerts_incident_id ON alerts (incident_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_feedback_target ON rca_feedback (target_type, target_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_comments_target ON rca_comments (target_type, target_id)`,
@@ -379,7 +385,7 @@ func (s *Store) loadIncidents(ctx context.Context) {
 	rows, err := s.db.QueryContext(
 		ctx,
 		`SELECT incident_id, correlation_key, title, severity, status, fired_at,
-		        resolved_at, alert_count, analysis_seq, slack_thread_ts
+		        resolved_at, user_approved_at, archived_at, deleted_at, alert_count, analysis_seq, slack_thread_ts
 		   FROM incidents`,
 	)
 	if err != nil {
@@ -399,6 +405,9 @@ func (s *Store) loadIncidents(ctx context.Context) {
 			&incident.Status,
 			&incident.FiredAt,
 			&incident.ResolvedAt,
+			&incident.UserApprovedAt,
+			&incident.ArchivedAt,
+			&incident.DeletedAt,
 			&incident.AlertCount,
 			&incident.AnalysisSeq,
 			&incident.SlackThreadTS,
@@ -407,7 +416,9 @@ func (s *Store) loadIncidents(ctx context.Context) {
 			continue
 		}
 		s.incidents[incident.IncidentID] = &incident
-		s.incidentByKey[incident.CorrelationKey] = incident.IncidentID
+		if incident.DeletedAt == nil {
+			s.incidentByKey[incident.CorrelationKey] = incident.IncidentID
+		}
 	}
 }
 
@@ -467,6 +478,9 @@ func (s *Store) loadAlerts(ctx context.Context) {
 			alert.OccurrenceCount = 1
 		}
 		s.alerts[alert.AlertID] = &alert
+		if incidentDeleted(s.incidents[alert.IncidentID]) {
+			continue
+		}
 		if alert.Fingerprint != "" {
 			s.alertByFinger[alert.Fingerprint] = alert.AlertID
 		}
@@ -598,15 +612,20 @@ func (s *Store) dbSearchMemory(query string, limit int) ([]SimilarIncident, bool
 		log.Printf("pgvector similarity search iteration failed: %v", err)
 		return nil, false
 	}
+	filtered := results[:0]
 	s.mu.RLock()
-	for i := range results {
-		summary := s.feedbackSummaryLocked("incident", results[i].IncidentID)
-		results[i].PositiveFeedback = summary.Positive
-		results[i].NegativeFeedback = summary.Negative
-		results[i].CommentCount = len(summary.Comments)
+	for _, result := range results {
+		if !incidentUserApproved(s.incidents[result.IncidentID]) || incidentDeleted(s.incidents[result.IncidentID]) {
+			continue
+		}
+		summary := s.feedbackSummaryLocked("incident", result.IncidentID)
+		result.PositiveFeedback = summary.Positive
+		result.NegativeFeedback = summary.Negative
+		result.CommentCount = len(summary.Comments)
+		filtered = append(filtered, result)
 	}
 	s.mu.RUnlock()
-	return dedupeSimilarByIncident(results, limit), true
+	return dedupeSimilarByIncident(filtered, limit), true
 }
 
 func (s *Store) loadFeedback(ctx context.Context) {
@@ -681,7 +700,7 @@ func (s *Store) loadAnalysisRuns(ctx context.Context) {
 		ctx,
 		`SELECT run_id, source, status, target_type, target_id, incident_id,
 		        alert_id, title, prompt, analysis_summary, analysis_detail,
-		        analysis_quality, capabilities, missing_data, warnings, artifacts,
+		        analysis_quality, capabilities, missing_data, warnings, artifacts, metadata,
 		        created_at, updated_at
 		   FROM analysis_runs`,
 	)
@@ -694,7 +713,7 @@ func (s *Store) loadAnalysisRuns(ctx context.Context) {
 	defer s.mu.Unlock()
 	for rows.Next() {
 		var run AnalysisRun
-		var capabilitiesRaw, missingRaw, warningsRaw, artifactsRaw []byte
+		var capabilitiesRaw, missingRaw, warningsRaw, artifactsRaw, metadataRaw []byte
 		if err := rows.Scan(
 			&run.RunID,
 			&run.Source,
@@ -712,6 +731,7 @@ func (s *Store) loadAnalysisRuns(ctx context.Context) {
 			&missingRaw,
 			&warningsRaw,
 			&artifactsRaw,
+			&metadataRaw,
 			&run.CreatedAt,
 			&run.UpdatedAt,
 		); err != nil {
@@ -722,6 +742,7 @@ func (s *Store) loadAnalysisRuns(ctx context.Context) {
 		_ = json.Unmarshal(missingRaw, &run.MissingData)
 		_ = json.Unmarshal(warningsRaw, &run.Warnings)
 		_ = json.Unmarshal(artifactsRaw, &run.Artifacts)
+		_ = json.Unmarshal(metadataRaw, &run.Metadata)
 		s.analysisRuns[run.RunID] = &run
 	}
 }
@@ -733,8 +754,8 @@ func (s *Store) persistIncidentLocked(incident *Incident) bool {
 	_, err := s.execPostgres(
 		`INSERT INTO incidents (
 			incident_id, correlation_key, title, severity, status, fired_at,
-			resolved_at, alert_count, analysis_seq, slack_thread_ts, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+			resolved_at, user_approved_at, archived_at, deleted_at, alert_count, analysis_seq, slack_thread_ts, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
 		ON CONFLICT (incident_id) DO UPDATE SET
 			correlation_key = EXCLUDED.correlation_key,
 			title = EXCLUDED.title,
@@ -742,6 +763,9 @@ func (s *Store) persistIncidentLocked(incident *Incident) bool {
 			status = EXCLUDED.status,
 			fired_at = EXCLUDED.fired_at,
 			resolved_at = EXCLUDED.resolved_at,
+			user_approved_at = EXCLUDED.user_approved_at,
+			archived_at = EXCLUDED.archived_at,
+			deleted_at = EXCLUDED.deleted_at,
 			alert_count = EXCLUDED.alert_count,
 			analysis_seq = EXCLUDED.analysis_seq,
 			slack_thread_ts = EXCLUDED.slack_thread_ts,
@@ -753,6 +777,9 @@ func (s *Store) persistIncidentLocked(incident *Incident) bool {
 		incident.Status,
 		incident.FiredAt,
 		incident.ResolvedAt,
+		incident.UserApprovedAt,
+		incident.ArchivedAt,
+		incident.DeletedAt,
 		incident.AlertCount,
 		incident.AnalysisSeq,
 		incident.SlackThreadTS,
@@ -760,6 +787,26 @@ func (s *Store) persistIncidentLocked(incident *Incident) bool {
 	if err != nil {
 		log.Printf("Failed to persist incident %s: %v", incident.IncidentID, err)
 		return false
+	}
+	return true
+}
+
+func (s *Store) persistHardDeleteIncidentLocked(incidentID string, alertIDs []string) bool {
+	if s.db == nil || !s.dbReady || incidentID == "" {
+		return true
+	}
+	for _, query := range []string{
+		`DELETE FROM analysis_runs WHERE incident_id = $1 OR alert_id = ANY($2)`,
+		`DELETE FROM rca_comments WHERE incident_id = $1 OR target_id = $1 OR alert_id = ANY($2) OR target_id = ANY($2)`,
+		`DELETE FROM rca_feedback WHERE incident_id = $1 OR target_id = $1 OR alert_id = ANY($2) OR target_id = ANY($2)`,
+		`DELETE FROM incident_embeddings WHERE incident_id = $1 OR alert_id = ANY($2)`,
+		`DELETE FROM alerts WHERE incident_id = $1`,
+		`DELETE FROM incidents WHERE incident_id = $1`,
+	} {
+		if _, err := s.execPostgres(query, incidentID, alertIDs); err != nil {
+			log.Printf("Failed to hard delete incident %s: %v", incidentID, err)
+			return false
+		}
 	}
 	return true
 }
@@ -994,10 +1041,10 @@ func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) bool {
 		`INSERT INTO analysis_runs (
 			run_id, source, status, target_type, target_id, incident_id, alert_id,
 			title, prompt, analysis_summary, analysis_detail, analysis_quality,
-			capabilities, missing_data, warnings, artifacts, created_at, updated_at
+			capabilities, missing_data, warnings, artifacts, metadata, created_at, updated_at
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-			$15, $16, $17, $18
+			$15, $16, $17, $18, $19
 		)
 		ON CONFLICT (run_id) DO UPDATE SET
 			source = EXCLUDED.source,
@@ -1015,6 +1062,7 @@ func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) bool {
 			missing_data = EXCLUDED.missing_data,
 			warnings = EXCLUDED.warnings,
 			artifacts = EXCLUDED.artifacts,
+			metadata = EXCLUDED.metadata,
 			updated_at = EXCLUDED.updated_at`,
 		run.RunID,
 		run.Source,
@@ -1032,6 +1080,7 @@ func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) bool {
 		mustJSON(run.MissingData),
 		mustJSON(run.Warnings),
 		mustJSON(run.Artifacts),
+		mustJSON(firstAnyMap(run.Metadata)),
 		run.CreatedAt,
 		run.UpdatedAt,
 	)

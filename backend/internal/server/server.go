@@ -137,20 +137,23 @@ type EmbeddingSearchResponse struct {
 }
 
 type Incident struct {
-	IncidentID       string     `json:"incident_id"`
-	CorrelationKey   string     `json:"correlation_key"`
-	Title            string     `json:"title"`
-	Severity         string     `json:"severity"`
-	Status           string     `json:"status"`
-	FiredAt          time.Time  `json:"fired_at"`
-	ResolvedAt       *time.Time `json:"resolved_at"`
-	AlertCount       int        `json:"alert_count"`
-	IsAnalyzing      bool       `json:"is_analyzing"`
+	IncidentID     string     `json:"incident_id"`
+	CorrelationKey string     `json:"correlation_key"`
+	Title          string     `json:"title"`
+	Severity       string     `json:"severity"`
+	Status         string     `json:"status"`
+	FiredAt        time.Time  `json:"fired_at"`
+	ResolvedAt     *time.Time `json:"resolved_at"`
+	UserApprovedAt *time.Time `json:"user_approved_at,omitempty"`
+	ArchivedAt     *time.Time `json:"archived_at,omitempty"`
+	DeletedAt      *time.Time `json:"deleted_at,omitempty"`
+	AlertCount     int        `json:"alert_count"`
+	IsAnalyzing    bool       `json:"is_analyzing"`
 	// AnalysisSeq counts Slack-notified analyses (1 = Initial Analysis). Runs
 	// are updated in place on re-analysis, so rows can't be counted instead.
-	AnalysisSeq      int        `json:"analysis_seq"`
-	SlackThreadTS    string     `json:"-"`
-	LatestActivityAt time.Time  `json:"-"`
+	AnalysisSeq      int       `json:"analysis_seq"`
+	SlackThreadTS    string    `json:"-"`
+	LatestActivityAt time.Time `json:"-"`
 }
 
 type AlertRecord struct {
@@ -181,16 +184,33 @@ type AlertRecord struct {
 
 type IncidentDetail struct {
 	Incident
-	AnalysisSummary  string            `json:"analysis_summary"`
-	AnalysisDetail   string            `json:"analysis_detail"`
-	AnalysisQuality  string            `json:"analysis_quality"`
-	Capabilities     map[string]string `json:"capabilities"`
-	MissingData      []string          `json:"missing_data"`
-	Warnings         []string          `json:"warnings"`
-	Artifacts        []Artifact        `json:"artifacts"`
-	SimilarIncidents []SimilarIncident `json:"similar_incidents"`
-	Feedback         FeedbackSummary   `json:"feedback"`
-	Alerts           []AlertRecord     `json:"alerts"`
+	AnalysisSummary    string            `json:"analysis_summary"`
+	AnalysisDetail     string            `json:"analysis_detail"`
+	AnalysisQuality    string            `json:"analysis_quality"`
+	Capabilities       map[string]string `json:"capabilities"`
+	MissingData        []string          `json:"missing_data"`
+	Warnings           []string          `json:"warnings"`
+	Artifacts          []Artifact        `json:"artifacts"`
+	SimilarIncidents   []SimilarIncident `json:"similar_incidents"`
+	SimilarRecentCount int               `json:"similar_recent_count"`
+	TokenUsage         map[string]any    `json:"token_usage,omitempty"`
+	Feedback           FeedbackSummary   `json:"feedback"`
+	Alerts             []AlertRecord     `json:"alerts"`
+}
+
+type RecurrenceDay struct {
+	Date     string  `json:"date"`
+	Total    int     `json:"total"`
+	Recurred int     `json:"recurred"`
+	Rate     float64 `json:"rate"`
+}
+
+type RecurrenceStats struct {
+	Days     int             `json:"days"`
+	Rate     float64         `json:"rate"`
+	Total    int             `json:"total"`
+	Recurred int             `json:"recurred"`
+	Daily    []RecurrenceDay `json:"daily"`
 }
 
 type Server struct {
@@ -208,6 +228,7 @@ type Server struct {
 	backfillInterval          time.Duration
 	backfillBatch             int
 	backfillRetryCooldown     time.Duration
+	trashRetention            time.Duration
 	slack                     *SlackNotifier
 }
 
@@ -218,15 +239,16 @@ const (
 	// another incident's comments are noise, not guidance.
 	minFeedbackHintSimilarity = 0.80
 	flappingGroupWindow       = 30 * time.Minute
-	maxListLimit           = 200
-	maxJSONBodyBytes       = 1 << 20
-	maxEmbeddingQueryBytes = 4000
-	maxWebhookAlerts       = 500
+	maxListLimit              = 200
+	maxJSONBodyBytes          = 1 << 20
+	maxEmbeddingQueryBytes    = 4000
+	maxWebhookAlerts          = 500
 	// Default caps; overridable via MAX_AUTO_ANALYZE_FANOUT / MAX_CONCURRENT_AGENT_RUNS.
-	maxAutoAnalyzeFanout   = 50
-	maxManualAnalyzeFanout = 50
-	maxConcurrentAgentRuns = maxManualAnalyzeFanout
-	autoAnalyzeWindow      = time.Minute
+	maxAutoAnalyzeFanout      = 50
+	maxManualAnalyzeFanout    = 50
+	maxConcurrentAgentRuns    = maxManualAnalyzeFanout
+	autoAnalyzeWindow         = time.Minute
+	defaultTrashRetentionDays = 30
 )
 
 // autoFanoutLimit is the effective per-webhook / per-window auto-analysis cap.
@@ -256,6 +278,7 @@ func Run() {
 
 	go server.runBackfill(ctx)
 	go server.runStaleRunReaper(ctx)
+	go server.runTrashPurge(ctx)
 	go server.runSlackSocketMode(ctx)
 
 	go func() {
@@ -307,6 +330,10 @@ func NewServer() *Server {
 	if backfillBatch <= 0 {
 		backfillBatch = 10
 	}
+	trashRetentionDays := getenvInt("TRASH_RETENTION_DAYS", defaultTrashRetentionDays)
+	if trashRetentionDays < 0 {
+		trashRetentionDays = defaultTrashRetentionDays
+	}
 	return &Server{
 		store:                     store,
 		hub:                       NewHub(),
@@ -322,6 +349,7 @@ func NewServer() *Server {
 		backfillInterval:      time.Duration(getenvInt("ANALYSIS_BACKFILL_INTERVAL_SECONDS", 300)) * time.Second,
 		backfillBatch:         backfillBatch,
 		backfillRetryCooldown: time.Duration(getenvInt("ANALYSIS_BACKFILL_RETRY_COOLDOWN_SECONDS", 900)) * time.Second,
+		trashRetention:        time.Duration(trashRetentionDays) * 24 * time.Hour,
 		slack:                 NewSlackNotifierFromEnv(),
 	}
 }
@@ -365,6 +393,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleEmbeddingSearch(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/analysis-runs":
 		s.handleAnalysisRunList(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/stats/recurrence":
+		s.handleRecurrenceStats(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/events":
 		s.handleEvents(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/chat":
@@ -380,7 +410,29 @@ func (s *Server) handleIncidentList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	items, total := s.store.ListIncidentsPage(page.Limit, page.Offset)
+	view := first(r.URL.Query().Get("view"), incidentViewActive)
+	if !validIncidentView(view) {
+		writeError(w, http.StatusBadRequest, "invalid incident view")
+		return
+	}
+	filter := IncidentListFilter{
+		Status:        strings.TrimSpace(r.URL.Query().Get("status")),
+		Severity:      strings.TrimSpace(r.URL.Query().Get("severity")),
+		FinalDecision: strings.TrimSpace(r.URL.Query().Get("final_decision")),
+	}
+	if !validIncidentStatusFilter(filter.Status) {
+		writeError(w, http.StatusBadRequest, "invalid incident status filter")
+		return
+	}
+	if !validIncidentSeverityFilter(filter.Severity) {
+		writeError(w, http.StatusBadRequest, "invalid incident severity filter")
+		return
+	}
+	if !validIncidentFinalDecisionFilter(filter.FinalDecision) {
+		writeError(w, http.StatusBadRequest, "invalid incident final decision filter")
+		return
+	}
+	items, total := s.store.ListIncidentsPageFiltered(page.Limit, page.Offset, view, filter)
 	writeJSON(w, http.StatusOK, paginatedEnvelope(items, page, total))
 }
 
@@ -390,7 +442,19 @@ func (s *Server) handleAlertList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	items, total := s.store.ListAlertsPage(page.Limit, page.Offset)
+	filter := AlertListFilter{
+		Status:   strings.TrimSpace(r.URL.Query().Get("status")),
+		Severity: strings.TrimSpace(r.URL.Query().Get("severity")),
+	}
+	if !validIncidentStatusFilter(filter.Status) {
+		writeError(w, http.StatusBadRequest, "invalid alert status filter")
+		return
+	}
+	if !validIncidentSeverityFilter(filter.Severity) {
+		writeError(w, http.StatusBadRequest, "invalid alert severity filter")
+		return
+	}
+	items, total := s.store.ListAlertsPageFiltered(page.Limit, page.Offset, filter)
 	writeJSON(w, http.StatusOK, paginatedEnvelope(items, page, total))
 }
 
@@ -402,6 +466,25 @@ func (s *Server) handleAnalysisRunList(w http.ResponseWriter, r *http.Request) {
 	}
 	items, total := s.store.ListAnalysisRunsPage(page.Limit, page.Offset)
 	writeJSON(w, http.StatusOK, paginatedEnvelope(items, page, total))
+}
+
+func (s *Server) handleRecurrenceStats(w http.ResponseWriter, r *http.Request) {
+	days := 7
+	if raw := strings.TrimSpace(r.URL.Query().Get("days")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid days")
+			return
+		}
+		days = parsed
+	}
+	if days < 1 {
+		days = 1
+	}
+	if days > 90 {
+		days = 90
+	}
+	writeJSON(w, http.StatusOK, envelope(s.store.RecurrenceStats(days, time.Now().UTC())))
 }
 
 func correlationKey(webhook AlertmanagerWebhook, alert Alert) string {
@@ -675,6 +758,28 @@ func cloneMap(in map[string]string) map[string]string {
 	return out
 }
 
+func cloneAnyMap(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		if child, ok := v.(map[string]any); ok {
+			out[k] = cloneAnyMap(child)
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func firstAnyMap(in map[string]any) map[string]any {
+	if in == nil {
+		return map[string]any{}
+	}
+	return in
+}
+
 func cloneIncident(in *Incident) *Incident {
 	if in == nil {
 		return nil
@@ -748,6 +853,7 @@ func cloneAnalysisRun(in *AnalysisRun) AnalysisRun {
 	out.MissingData = cloneStrings(in.MissingData)
 	out.Warnings = cloneStrings(in.Warnings)
 	out.Artifacts = cloneArtifacts(in.Artifacts)
+	out.Metadata = cloneAnyMap(in.Metadata)
 	return out
 }
 

@@ -33,7 +33,7 @@ from app.knowledge import (
     match_failure_mode_symptoms,
     match_runai_known_issues,
 )
-from app.llm import PROMPT_INJECTION_GUARD, complete, complete_json, llm_configured
+from app.llm import PROMPT_INJECTION_GUARD, begin_usage_tracking, complete, complete_json, llm_configured
 from app.masking import Masker, build_masker
 from app.plan import InvestigationPlan
 from app.prompts import load_agent_souls
@@ -179,14 +179,20 @@ class AnalysisOrchestrator:
         evidence and think; this wrapper guarantees the whole run still finishes
         within `analysis_deadline_seconds` (default 25 min / 1500s), returning a
         graceful degraded report if it overruns rather than hanging."""
+        usage = begin_usage_tracking()
         deadline = self._settings.analysis_deadline_seconds
         if not deadline or deadline <= 0:
-            return await self._analyze_impl(request)
+            response = await self._analyze_impl(request)
+            if isinstance(getattr(response, "context", None), dict):
+                response.context["llm_usage"] = dict(usage)
+            return response
         try:
-            return await asyncio.wait_for(self._analyze_impl(request), timeout=deadline)
+            response = await asyncio.wait_for(self._analyze_impl(request), timeout=deadline)
         except TimeoutError:  # asyncio.TimeoutError is this builtin on 3.11+
             _log.warning("analysis exceeded the %ss deadline; returning degraded report", deadline)
-            return self._deadline_response(request, deadline)
+            response = self._deadline_response(request, deadline)
+        response.context["llm_usage"] = dict(usage)
+        return response
 
     def _deadline_response(
         self, request: AlertAnalysisRequest, deadline: int

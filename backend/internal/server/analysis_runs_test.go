@@ -116,6 +116,39 @@ func TestAnalysisRunSuccessAppliesRCA(t *testing.T) {
 	}
 }
 
+func TestAnalysisRunStoresLLMUsageMetadataAndClearsOnReanalysis(t *testing.T) {
+	store := NewStore()
+	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "usage"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-usage",
+	})
+	run := store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Manual", "")
+	completed, ok := store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "done",
+		Context: map[string]any{
+			"llm_usage": map[string]any{"prompt_tokens": float64(3), "completion_tokens": float64(5), "total_tokens": float64(8)},
+		},
+	})
+	if !ok {
+		t.Fatalf("complete failed")
+	}
+	usage, ok := completed.Metadata["llm_usage"].(map[string]any)
+	if !ok || usage["total_tokens"] != float64(8) {
+		t.Fatalf("usage metadata missing: %+v", completed.Metadata)
+	}
+	detail, ok := store.IncidentDetail(incident.IncidentID)
+	if !ok || detail.TokenUsage["total_tokens"] != float64(8) {
+		t.Fatalf("incident detail missing token usage: ok=%t detail=%+v", ok, detail)
+	}
+
+	reused, created := store.CreateAnalysisRunIfAllowed("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Again", "")
+	if !created || reused.RunID != run.RunID || reused.Metadata != nil {
+		t.Fatalf("reanalysis should reuse row and clear metadata, created=%t run=%+v", created, reused)
+	}
+}
+
 func TestAnalysisRunCompactsSimilarIncidentsForAgent(t *testing.T) {
 	agentReqCh := make(chan AgentAnalysisRequest, 1)
 	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
@@ -142,6 +175,7 @@ func TestAnalysisRunCompactsSimilarIncidentsForAgent(t *testing.T) {
 		AnalysisSummary: strings.Repeat("summary ", 200),
 		AnalysisDetail:  strings.Repeat("detail ", 500),
 	})
+	approveIncidentForTest(t, server.store, priorIncident.IncidentID)
 	_, record := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "compact-current"}, Alert{
 		Status:      "firing",
 		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning", "queue": "gpu-a"},
@@ -1338,6 +1372,7 @@ func TestChatContextAttachesMemoryAndFeedbackHints(t *testing.T) {
 		AnalysisQuality: "high",
 		Capabilities:    map[string]string{"runai": "ok"},
 	})
+	approveIncidentForTest(t, server.store, priorIncident.IncidentID)
 	_, _, _ = server.store.AddFeedback("incident", priorIncident.IncidentID, FeedbackRequest{
 		Vote:    "up",
 		Comment: "Matched the quota saturation incident.",

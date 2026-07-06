@@ -15,6 +15,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `AGENT_URL` | Backend to Agent URL, default `http://localhost:8000` |
 | `AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for Agent `/analyze` and `/chat` requests, default `1560` (must exceed the agent's `ANALYSIS_DEADLINE_SECONDS`) |
 | `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for operator-triggered Agent `/analyze` requests, default `1560` |
+| `TRASH_RETENTION_DAYS` | Backend soft-delete retention before trash incidents are purged, default `30` |
 | `SLACK_BOT_TOKEN` | Backend Slack bot token (`xoxb-`, `chat:write` scope, bot invited to the channel). Set together with `SLACK_CHANNEL_ID` to enable incident-analysis notifications. A bot token — not an incoming webhook — is required because `chat.postMessage` returns the `ts` used to thread re-analyses. Chart secret key `slackBotToken` |
 | `SLACK_CHANNEL_ID` | Channel the backend posts incident-analysis summaries into. Chart secret key `slackChannelId` |
 | `SLACK_APP_TOKEN` | Optional app-level token (`xapp-`, `connections:write` scope). Enables the in-message Re-analyze button: clicks arrive over Socket Mode (outbound WebSocket), so no public endpoint is needed. Requires Socket Mode + Interactivity toggled on in the Slack app settings. Chart secret key `slackAppToken` |
@@ -190,8 +191,10 @@ helm upgrade --install runai-rca charts/runai-rca \
 
 When `DATABASE_URL` is configured, the backend creates and uses `incidents`,
 `alerts`, `incident_embeddings`, `rca_feedback`, `rca_comments`, and
-`analysis_runs`. Comments and chat requests that explicitly ask for analysis
-create separate analysis runs, so the Analysis Dashboard can track them without
+`analysis_runs`. Incidents include `user_approved_at`, `archived_at`, and
+`deleted_at` lifecycle columns; analysis runs include `metadata` JSONB for
+fields such as `llm_usage`. Comments and chat requests that explicitly ask for analysis create
+separate analysis runs, so the Analysis Dashboard can track them without
 overwriting the original RCA. On startup it logs `pgvector=enabled` when
 `CREATE EXTENSION vector` succeeds, then adds a dense `embedding vector(384)`
 column and an HNSW cosine index to `incident_embeddings`. Dense vectors are
@@ -205,6 +208,12 @@ agent checks connectivity, active connections, long-running transactions,
 pgvector availability, and expected RCA table presence. If it is not configured,
 the agent marks Postgres evidence as unavailable without blocking the rest of the
 RCA.
+
+Soft-deleted incidents remain queryable through the trash view until
+`TRASH_RETENTION_DAYS` elapses. During that period they are excluded from active
+incident matching, alert backfill, chat fallback, dashboard alert lists, and
+similar-incident memory search. The purge loop runs once on startup and then
+hourly.
 
 No separate migration command is required for these RCA tables on a fresh
 database: backend startup uses idempotent `CREATE TABLE IF NOT EXISTS`,

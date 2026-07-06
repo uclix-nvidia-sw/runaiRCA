@@ -44,6 +44,7 @@ type PostgresState struct {
 	execsNoDeadline          int
 	queriesNoDeadline        int
 	pgvectorSearchLimit      int64
+	incidentDeletedAt        any
 }
 
 func NewPostgresState(failCreateVector bool) *PostgresState {
@@ -84,6 +85,12 @@ func (s *PostgresState) SetLabelsJSON(value []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.labelsJSON = append([]byte(nil), value...)
+}
+
+func (s *PostgresState) SetIncidentDeletedAt(value time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.incidentDeletedAt = value
 }
 
 func (s *PostgresState) AnalysisRunExecs() int {
@@ -223,16 +230,16 @@ func (s *PostgresState) rowsFor(query string) driver.Rows {
 				"analysis_summary", "analysis_detail", "labels", "created_at", "distance",
 			},
 			values: [][]driver.Value{{
-				"INC-db", "ALR-db", "Prior GPU quota saturation", "warning", "firing",
+				"INC-db", "ALR-db", "Prior GPU quota saturation", "warning", "resolved",
 				"Run:AI queue gpu-a was saturated.", "GPU quota blocked scheduling.",
 				s.labelsJSON, s.now, float64(0.1),
 			}},
 		}
 	case strings.Contains(lowered, "from incidents"):
 		return &fakeRows{
-			columns: []string{"incident_id", "correlation_key", "title", "severity", "status", "fired_at", "resolved_at", "alert_count", "analysis_seq", "slack_thread_ts"},
+			columns: []string{"incident_id", "correlation_key", "title", "severity", "status", "fired_at", "resolved_at", "user_approved_at", "archived_at", "deleted_at", "alert_count", "analysis_seq", "slack_thread_ts"},
 			values: [][]driver.Value{{
-				"INC-db", "group:db", "Prior GPU quota saturation", "warning", "firing", s.now, nil, int64(1), int64(0), "",
+				"INC-db", "group:db", "Prior GPU quota saturation", "warning", "firing", s.now, nil, s.now, nil, s.incidentDeletedAt, int64(1), int64(0), "",
 			}},
 		}
 	case strings.Contains(lowered, "from alerts"):
@@ -257,7 +264,7 @@ func (s *PostgresState) rowsFor(query string) driver.Rows {
 				"analysis_detail", "labels", "vector_json", "created_at",
 			},
 			values: [][]driver.Value{{
-				"INC-db", "ALR-db", "Prior GPU quota saturation", "warning", "firing",
+				"INC-db", "ALR-db", "Prior GPU quota saturation", "warning", "resolved",
 				"Run:AI queue gpu-a was saturated.", "GPU quota blocked scheduling.",
 				s.labelsJSON, s.memoryVectorJSON, s.now,
 			}},
@@ -282,13 +289,13 @@ func (s *PostgresState) rowsFor(query string) driver.Rows {
 				"run_id", "source", "status", "target_type", "target_id", "incident_id",
 				"alert_id", "title", "prompt", "analysis_summary", "analysis_detail",
 				"analysis_quality", "capabilities", "missing_data", "warnings", "artifacts",
-				"created_at", "updated_at",
+				"metadata", "created_at", "updated_at",
 			},
 			values: [][]driver.Value{{
 				"ANL-db", "comment", "complete", "incident", "INC-db", "INC-db",
 				"", "Comment reanalysis", "check scheduler logs", "Reanalysis completed.",
 				"Scheduler logs confirmed quota saturation.", "high", s.capabilitiesJSON,
-				s.emptyArrayJSON, s.emptyArrayJSON, s.emptyArrayJSON, s.now, s.now,
+				s.emptyArrayJSON, s.emptyArrayJSON, s.emptyArrayJSON, s.emptyObjectJSON, s.now, s.now,
 			}},
 		}
 	default:

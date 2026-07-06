@@ -53,6 +53,90 @@ func TestAlertmanagerWebhookCreatesIncidentAndAlert(t *testing.T) {
 	}
 }
 
+func TestListIncidentsPageFiltered(t *testing.T) {
+	store := NewStore()
+	mkAlert := func(name, status, severity string) Alert {
+		return Alert{
+			Status: status,
+			Labels: map[string]string{
+				"alertname": name,
+				"severity":  severity,
+				"cluster":   "lab",
+				"namespace": "runai-vision",
+				"workload":  name,
+			},
+			Annotations: map[string]string{"summary": name},
+			Fingerprint: "fp-" + name,
+		}
+	}
+	approvedAt := time.Date(2026, 7, 6, 10, 0, 0, 0, time.UTC)
+	approved, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "filter-approved"}, mkAlert("approved", "resolved", "critical"))
+	pending, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "filter-pending"}, mkAlert("pending", "firing", "warning"))
+	analyzing, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "filter-analyzing"}, mkAlert("analyzing", "firing", "critical"))
+	store.mu.Lock()
+	store.incidents[approved.IncidentID].UserApprovedAt = &approvedAt
+	store.incidents[analyzing.IncidentID].IsAnalyzing = true
+	store.mu.Unlock()
+
+	items, total := store.ListIncidentsPageFiltered(0, 0, incidentViewActive, IncidentListFilter{
+		Status:        "resolved",
+		Severity:      "critical",
+		FinalDecision: "approved",
+	})
+	if total != 1 || len(items) != 1 || items[0].IncidentID != approved.IncidentID {
+		t.Fatalf("expected only approved resolved critical incident, total=%d items=%+v", total, items)
+	}
+
+	items, total = store.ListIncidentsPageFiltered(0, 0, incidentViewActive, IncidentListFilter{Status: "analyzing"})
+	if total != 1 || len(items) != 1 || items[0].IncidentID != analyzing.IncidentID {
+		t.Fatalf("expected only analyzing incident, total=%d items=%+v", total, items)
+	}
+
+	items, total = store.ListIncidentsPageFiltered(0, 0, incidentViewActive, IncidentListFilter{FinalDecision: "pending"})
+	if total != 2 || len(items) != 2 || items[0].IncidentID == approved.IncidentID || items[1].IncidentID == approved.IncidentID {
+		t.Fatalf("expected pending final decision incidents (%s, %s), total=%d items=%+v", pending.IncidentID, analyzing.IncidentID, total, items)
+	}
+}
+
+func TestListAlertsPageFiltered(t *testing.T) {
+	store := NewStore()
+	mkAlert := func(name, status, severity string) Alert {
+		return Alert{
+			Status: status,
+			Labels: map[string]string{
+				"alertname": name,
+				"severity":  severity,
+				"cluster":   "lab",
+				"namespace": "runai-vision",
+				"workload":  name,
+			},
+			Annotations: map[string]string{"summary": name},
+			Fingerprint: "fp-alert-" + name,
+		}
+	}
+	_, critical := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "alert-filter-critical"}, mkAlert("critical", "firing", "critical"))
+	_, resolved := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "alert-filter-resolved"}, mkAlert("resolved", "resolved", "warning"))
+	_, analyzing := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "alert-filter-analyzing"}, mkAlert("analyzing", "firing", "warning"))
+	store.mu.Lock()
+	store.alerts[analyzing.AlertID].IsAnalyzing = true
+	store.mu.Unlock()
+
+	items, total := store.ListAlertsPageFiltered(0, 0, AlertListFilter{Severity: "critical"})
+	if total != 1 || len(items) != 1 || items[0].AlertID != critical.AlertID {
+		t.Fatalf("expected only critical alert, total=%d items=%+v", total, items)
+	}
+
+	items, total = store.ListAlertsPageFiltered(0, 0, AlertListFilter{Status: "resolved"})
+	if total != 1 || len(items) != 1 || items[0].AlertID != resolved.AlertID {
+		t.Fatalf("expected only resolved alert, total=%d items=%+v", total, items)
+	}
+
+	items, total = store.ListAlertsPageFiltered(0, 0, AlertListFilter{Status: "analyzing"})
+	if total != 1 || len(items) != 1 || items[0].AlertID != analyzing.AlertID {
+		t.Fatalf("expected only analyzing alert, total=%d items=%+v", total, items)
+	}
+}
+
 func TestAlertmanagerWebhookGroupsDiskPressureStormIntoOneAutoAnalysis(t *testing.T) {
 	server := NewServer()
 	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1309,6 +1393,10 @@ func TestFeedbackAndSimilarIncidentMemory(t *testing.T) {
 		AnalysisQuality: "high",
 		Capabilities:    map[string]string{"runai": "ok"},
 	})
+	if len(store.SearchIncidentMemory("gpu quota saturated scheduling", 5)) != 0 {
+		t.Fatalf("unresolved incident RCA must not be loaded into memory")
+	}
+	approveIncidentForTest(t, store, priorIncident.IncidentID)
 	summary, ok, err := store.AddFeedback("incident", priorIncident.IncidentID, FeedbackRequest{
 		Vote:    "up",
 		Comment: "Matched the quota saturation incident we saw last week.",
@@ -1401,6 +1489,10 @@ func TestIncidentMemoryKeepsMultipleAlertAnalyses(t *testing.T) {
 		AnalysisDetail:  "GPU quota is exhausted.",
 	})
 
+	if len(store.memories) != 0 {
+		t.Fatalf("unresolved analysis should not create memory, got %+v", store.memories)
+	}
+	approveIncidentForTest(t, store, incident.IncidentID)
 	if len(store.memories) != 2 {
 		t.Fatalf("expected two alert memories, got %+v", store.memories)
 	}
@@ -1432,6 +1524,7 @@ func TestSimilarIncidentsLimitAndLatestTieBreak(t *testing.T) {
 	base := time.Date(2026, 6, 26, 9, 0, 0, 0, time.UTC)
 	for i := 0; i < 4; i++ {
 		id := "INC-similar-000" + string(rune('1'+i))
+		seedApprovedMemoryIncidentForTest(store, id, base.Add(time.Duration(i)*time.Minute))
 		store.memories[id] = &IncidentMemory{
 			IncidentID:      id,
 			AlertID:         "ALR-similar-000" + string(rune('1'+i)),
@@ -1478,6 +1571,7 @@ func TestSimilarIncidentsDedupesAlertMemoriesByIncident(t *testing.T) {
 		{"ALR-prior-old", base},
 		{"ALR-prior-new", base.Add(time.Minute)},
 	} {
+		seedApprovedMemoryIncidentForTest(store, "INC-prior-shared", item.at)
 		store.memories[item.alertID] = &IncidentMemory{
 			IncidentID:      "INC-prior-shared",
 			AlertID:         item.alertID,
@@ -1529,6 +1623,7 @@ func TestFeedbackHintsCapsInvalidLimit(t *testing.T) {
 		CreatedAt:       time.Now().UTC(),
 		Vector:          textVector(alertSearchText(alert)),
 	}
+	seedApprovedMemoryIncidentForTest(store, "INC-prior-hint", time.Now().UTC())
 	store.comments["CMT-prior-hint"] = &CommentRecord{
 		CommentID:  "CMT-prior-hint",
 		TargetType: "incident",
@@ -1568,6 +1663,7 @@ func TestFeedbackHintsHonorsLimitAcrossVoteHints(t *testing.T) {
 		CreatedAt:       time.Now().UTC(),
 		Vector:          textVector(alertSearchText(alert)),
 	}
+	seedApprovedMemoryIncidentForTest(store, "INC-prior-limit", time.Now().UTC())
 	store.feedback["FDB-prior-up"] = &FeedbackRecord{
 		FeedbackID: "FDB-prior-up",
 		TargetType: "incident",
@@ -1615,6 +1711,7 @@ func TestFeedbackHintsCapHintText(t *testing.T) {
 		CreatedAt:       time.Now().UTC(),
 		Vector:          textVector(alertSearchText(alert)),
 	}
+	seedApprovedMemoryIncidentForTest(store, "INC-prior-long-hint", time.Now().UTC())
 	store.feedback["FDB-prior-long-hint"] = &FeedbackRecord{
 		FeedbackID: "FDB-prior-long-hint",
 		TargetType: "incident",
@@ -1656,6 +1753,7 @@ func TestFeedbackHintsDedupesIncidentCommentsAcrossAlertMemories(t *testing.T) {
 		Annotations: map[string]string{"summary": "GPU quota exhausted for trainer"},
 	}
 	for _, alertID := range []string{"ALR-prior-a", "ALR-prior-b"} {
+		seedApprovedMemoryIncidentForTest(store, "INC-prior-duplicate-comments", time.Now().UTC())
 		store.memories[alertID] = &IncidentMemory{
 			IncidentID:      "INC-prior-duplicate-comments",
 			AlertID:         alertID,
@@ -1732,7 +1830,7 @@ func TestFlappingAlertGroupingUsesNamespaceWorkloadAndWindow(t *testing.T) {
 	}
 }
 
-func TestResolveEndpointTogglesResolvedStatus(t *testing.T) {
+func TestResolveEndpointTogglesUserApproval(t *testing.T) {
 	server := NewServer()
 	incident, record := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "resolve-toggle"}, Alert{
 		Status: "firing",
@@ -1750,6 +1848,9 @@ func TestResolveEndpointTogglesResolvedStatus(t *testing.T) {
 		AnalysisSummary: "Pending workload RCA.",
 		AnalysisDetail:  "Quota blocked scheduling.",
 	})
+	if len(server.store.memories) != 0 {
+		t.Fatalf("analysis should not load memory before manual resolve, got %+v", server.store.memories)
+	}
 	path := "/api/v1/incidents/" + incident.IncidentID + "/resolve"
 
 	rec := httptest.NewRecorder()
@@ -1758,11 +1859,11 @@ func TestResolveEndpointTogglesResolvedStatus(t *testing.T) {
 		t.Fatalf("expected first resolve 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 	detail, ok := server.store.IncidentDetail(incident.IncidentID)
-	if !ok || detail.Status != "resolved" || detail.ResolvedAt == nil {
-		t.Fatalf("expected incident to be resolved, got ok=%t detail=%+v", ok, detail)
+	if !ok || detail.Status != "firing" || detail.ResolvedAt != nil || detail.UserApprovedAt == nil {
+		t.Fatalf("expected incident status to stay firing and user approval to be set, got ok=%t detail=%+v", ok, detail)
 	}
-	if memory := server.store.memories[record.AlertID]; memory == nil || memory.Status != "resolved" {
-		t.Fatalf("expected alert memory to resolve with incident, got %+v", memory)
+	if memory := server.store.memories[record.AlertID]; memory == nil || memory.Status != "firing" {
+		t.Fatalf("expected alert memory to load after user approval, got %+v", memory)
 	}
 
 	rec = httptest.NewRecorder()
@@ -1771,17 +1872,20 @@ func TestResolveEndpointTogglesResolvedStatus(t *testing.T) {
 		t.Fatalf("expected second resolve 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 	detail, ok = server.store.IncidentDetail(incident.IncidentID)
-	if !ok || detail.Status != "firing" || detail.ResolvedAt != nil {
-		t.Fatalf("expected second resolve click to reopen incident, got ok=%t detail=%+v", ok, detail)
+	if !ok || detail.Status != "firing" || detail.ResolvedAt != nil || detail.UserApprovedAt != nil {
+		t.Fatalf("expected second resolve click to clear user approval only, got ok=%t detail=%+v", ok, detail)
 	}
-	if memory := server.store.memories[record.AlertID]; memory == nil || memory.Status != "firing" {
-		t.Fatalf("expected alert memory to reopen with incident, got %+v", memory)
+	if memory := server.store.memories[record.AlertID]; memory == nil {
+		t.Fatalf("expected memory row to remain for future reapproval, got %+v", memory)
 	}
-	var response map[string]string
+	if search := server.store.SearchIncidentMemory("quota blocked scheduling", 5); len(search) != 0 {
+		t.Fatalf("reopened incident memory should not be searchable, got %+v", search)
+	}
+	var response map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if response["status"] != "firing" {
+	if response["status"] != "firing" || response["user_approved_at"] != nil {
 		t.Fatalf("expected response status firing, got %+v", response)
 	}
 }
@@ -2093,6 +2197,35 @@ func waitForAnalysisRun(t *testing.T, server *Server, source string) AnalysisRun
 	return AnalysisRun{}
 }
 
+func approveIncidentForTest(t *testing.T, store *Store, incidentID string) {
+	t.Helper()
+	now := time.Now().UTC()
+	store.mu.Lock()
+	incident := store.incidents[incidentID]
+	if incident == nil {
+		store.mu.Unlock()
+		t.Fatalf("incident %s missing", incidentID)
+	}
+	incident.UserApprovedAt = &now
+	store.upsertApprovedIncidentMemoriesLocked(incident)
+	store.mu.Unlock()
+}
+
+func seedApprovedMemoryIncidentForTest(store *Store, incidentID string, at time.Time) {
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	store.incidents[incidentID] = &Incident{
+		IncidentID:     incidentID,
+		CorrelationKey: incidentID,
+		Title:          incidentID,
+		Severity:       "warning",
+		Status:         "resolved",
+		FiredAt:        at,
+		UserApprovedAt: &at,
+	}
+}
+
 func TestAlertListIncludesSimilarIncidentMemory(t *testing.T) {
 	server := NewServer()
 	priorIncident, priorRecord := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "list-prior"}, Alert{
@@ -2116,6 +2249,7 @@ func TestAlertListIncludesSimilarIncidentMemory(t *testing.T) {
 		AnalysisQuality: "high",
 		Capabilities:    map[string]string{"runai": "ok"},
 	})
+	approveIncidentForTest(t, server.store, priorIncident.IncidentID)
 	_, currentRecord := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "list-current"}, Alert{
 		Status: "firing",
 		Labels: map[string]string{
@@ -2475,5 +2609,166 @@ func TestTokenizeKeepsKoreanAndSimilarityIsHighForNearDuplicates(t *testing.T) {
 	c := textVector("GPU XID 79 발생 — GPU가 PCIe 버스에서 떨어져 하드웨어 결함으로 판단됩니다")
 	if s := cosineSimilarity(a, c); s > 0.5 {
 		t.Fatalf("unrelated incident scored too high: %.2f", s)
+	}
+}
+
+func TestIncidentLifecycleViewsAndDeletedGuards(t *testing.T) {
+	store := NewStore()
+	webhook := AlertmanagerWebhook{GroupKey: "lifecycle"}
+	alert := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning", "namespace": "runai", "workload": "trainer"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-lifecycle",
+		StartsAt:    "2026-07-01T10:00:00Z",
+	}
+	incident, record := store.UpsertAlert(webhook, alert)
+	store.ApplyAnalysis(record.AlertID, AgentAnalysisResponse{AnalysisSummary: "Queue blocked by quota."})
+
+	if _, ok := store.ArchiveIncident(incident.IncidentID, true); !ok {
+		t.Fatalf("archive failed")
+	}
+	if active, total := store.ListIncidentsPage(0, 0); total != 0 || len(active) != 0 {
+		t.Fatalf("archived incident should leave active view, got total=%d items=%+v", total, active)
+	}
+	if archived, total := store.ListIncidentsPage(0, 0, incidentViewArchived); total != 1 || archived[0].ArchivedAt == nil {
+		t.Fatalf("archived view missing incident, total=%d items=%+v", total, archived)
+	}
+
+	next := alert
+	next.Fingerprint = "fp-lifecycle-new"
+	result := store.UpsertAlertResult(webhook, next)
+	if result.Incident.ArchivedAt != nil {
+		t.Fatalf("new alert should unarchive incident: %+v", result.Incident)
+	}
+
+	if _, ok := store.SoftDeleteIncident(incident.IncidentID); !ok {
+		t.Fatalf("soft delete failed")
+	}
+	if active, total := store.ListIncidentsPage(0, 0); total != 0 || len(active) != 0 {
+		t.Fatalf("deleted incident should leave active view, got total=%d items=%+v", total, active)
+	}
+	if trash, total := store.ListIncidentsPage(0, 0, incidentViewTrash); total != 1 || trash[0].DeletedAt == nil {
+		t.Fatalf("trash view missing incident, total=%d items=%+v", total, trash)
+	}
+	if alerts, total := store.ListAlertsPage(0, 0); total != 0 || len(alerts) != 0 {
+		t.Fatalf("deleted incident alerts should be hidden, total=%d items=%+v", total, alerts)
+	}
+	if got := store.DashboardSnapshot(5); got.IncidentCount != 0 || got.AlertCount != 0 {
+		t.Fatalf("dashboard should exclude deleted incidents: %+v", got)
+	}
+	if got := store.LatestAlertID(); got != "" {
+		t.Fatalf("latest alert should exclude deleted incident alert, got %s", got)
+	}
+	if ids := store.AlertIDsNeedingAnalysis(10, 0, time.Now().UTC()); len(ids) != 0 {
+		t.Fatalf("backfill should exclude deleted incident alerts: %+v", ids)
+	}
+	if _, _, _, _, _, ok := store.AnalysisTarget("incident", incident.IncidentID); ok {
+		t.Fatalf("deleted incident should not be analyzable")
+	}
+	if results := store.SearchIncidentMemory("quota blocked", 5); len(results) != 0 {
+		t.Fatalf("memory search should exclude deleted incidents: %+v", results)
+	}
+
+	recreated := store.UpsertAlertResult(webhook, alert)
+	if !recreated.NewIncident || recreated.Incident.IncidentID == incident.IncidentID {
+		t.Fatalf("same fingerprint after soft delete should create a new incident: %+v", recreated)
+	}
+	if _, ok := store.RestoreIncident(incident.IncidentID); !ok {
+		t.Fatalf("restore failed")
+	}
+	reused := store.UpsertAlertResult(webhook, alert)
+	if reused.Incident.IncidentID != recreated.Incident.IncidentID {
+		t.Fatalf("restore should not steal occupied indexes, got %+v want %s", reused.Incident, recreated.Incident.IncidentID)
+	}
+}
+
+func TestIncidentHardDeleteAndTrashPurge(t *testing.T) {
+	store := NewStore()
+	oldIncident, oldAlert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "purge-old"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning", "queue": "gpu-a"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-purge-old",
+	})
+	store.ApplyAnalysis(oldAlert.AlertID, AgentAnalysisResponse{AnalysisSummary: "Old queue block."})
+	if _, _, err := store.AddFeedback("incident", oldIncident.IncidentID, FeedbackRequest{Vote: "up", Comment: "useful"}); err != nil {
+		t.Fatalf("feedback seed failed: %v", err)
+	}
+	if _, _, err := store.AddComment("incident", oldIncident.IncidentID, CommentRequest{Body: "operator note"}); err != nil {
+		t.Fatalf("comment seed failed: %v", err)
+	}
+	store.CreateAnalysisRun("manual", "incident", oldIncident.IncidentID, oldIncident.IncidentID, oldAlert.AlertID, "Manual", "")
+
+	keepIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "purge-keep"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning", "queue": "gpu-b"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-purge-keep",
+	})
+	store.SoftDeleteIncident(oldIncident.IncidentID)
+	store.SoftDeleteIncident(keepIncident.IncidentID)
+	now := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
+	store.mu.Lock()
+	oldDeleted := now.AddDate(0, 0, -31)
+	keepDeleted := now.AddDate(0, 0, -1)
+	store.incidents[oldIncident.IncidentID].DeletedAt = &oldDeleted
+	store.incidents[keepIncident.IncidentID].DeletedAt = &keepDeleted
+	store.mu.Unlock()
+
+	if purged := store.PurgeExpiredTrash(30*24*time.Hour, now); purged != 1 {
+		t.Fatalf("expected one expired trash purge, got %d", purged)
+	}
+	if _, ok := store.incidents[oldIncident.IncidentID]; ok {
+		t.Fatalf("expired incident was not hard deleted")
+	}
+	if _, ok := store.alerts[oldAlert.AlertID]; ok {
+		t.Fatalf("hard delete should remove alerts")
+	}
+	if len(store.memories) != 0 || len(store.feedback) != 0 || len(store.comments) != 0 || len(store.analysisRuns) != 0 {
+		t.Fatalf("hard delete should cascade, memories=%d feedback=%d comments=%d runs=%d", len(store.memories), len(store.feedback), len(store.comments), len(store.analysisRuns))
+	}
+	if _, ok := store.incidents[keepIncident.IncidentID]; !ok {
+		t.Fatalf("recent trash should be retained")
+	}
+}
+
+func TestRecurrenceStatsAndIncidentSimilarRecentCount(t *testing.T) {
+	store := NewStore()
+	now := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
+	prior, priorAlert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "recurrence-prior"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning", "queue": "gpu-a", "namespace": "runai"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-recur-prior",
+		StartsAt:    now.AddDate(0, 0, -2).Format(time.RFC3339),
+	})
+	store.ApplyAnalysis(priorAlert.AlertID, AgentAnalysisResponse{AnalysisSummary: "Queue gpu-a quota saturated."})
+	approveIncidentForTest(t, store, prior.IncidentID)
+	current, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "recurrence-current"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning", "queue": "gpu-a", "namespace": "runai"},
+		Annotations: map[string]string{"summary": "Queue blocked again"},
+		Fingerprint: "fp-recur-current",
+		StartsAt:    now.AddDate(0, 0, -1).Format(time.RFC3339),
+	})
+	deleted, deletedAlert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "recurrence-deleted"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning", "queue": "gpu-a", "namespace": "runai"},
+		Annotations: map[string]string{"summary": "Deleted recurrence"},
+		Fingerprint: "fp-recur-deleted",
+		StartsAt:    now.Format(time.RFC3339),
+	})
+	store.ApplyAnalysis(deletedAlert.AlertID, AgentAnalysisResponse{AnalysisSummary: "Deleted queue block."})
+	approveIncidentForTest(t, store, deleted.IncidentID)
+	store.SoftDeleteIncident(deleted.IncidentID)
+
+	stats := store.RecurrenceStats(7, now)
+	if stats.Total != 2 || stats.Recurred != 1 || stats.Rate != 0.5 {
+		t.Fatalf("unexpected recurrence stats: %+v prior=%s", stats, prior.IncidentID)
+	}
+	detail, ok := store.IncidentDetail(current.IncidentID)
+	if !ok || detail.SimilarRecentCount != 1 {
+		t.Fatalf("expected one recent similar incident, got ok=%t detail=%+v", ok, detail)
 	}
 }

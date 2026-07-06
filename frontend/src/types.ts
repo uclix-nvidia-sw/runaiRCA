@@ -74,6 +74,7 @@ export type AnalysisRun = {
   missing_data: string[];
   warnings: string[];
   artifacts: Artifact[];
+  metadata?: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 };
@@ -86,6 +87,9 @@ export type Incident = {
   status: string;
   fired_at: string;
   resolved_at?: string | null;
+  user_approved_at?: string | null;
+  archived_at?: string | null;
+  deleted_at?: string | null;
   alert_count: number;
   is_analyzing: boolean;
 };
@@ -125,8 +129,25 @@ export type IncidentDetail = Incident & {
   warnings: string[];
   artifacts: Artifact[];
   similar_incidents: SimilarIncident[];
+  similar_recent_count: number;
+  token_usage?: Record<string, unknown>;
   feedback: FeedbackSummary;
   alerts: AlertRecord[];
+};
+
+export type RecurrenceDay = {
+  date: string;
+  total: number;
+  recurred: number;
+  rate: number;
+};
+
+export type RecurrenceStats = {
+  days: number;
+  rate: number;
+  total: number;
+  recurred: number;
+  daily: RecurrenceDay[];
 };
 
 export type Envelope<T> = {

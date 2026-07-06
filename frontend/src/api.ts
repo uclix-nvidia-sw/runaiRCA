@@ -1,4 +1,4 @@
-import { AlertRecord, AnalysisRun, Envelope, FeedbackSummary, Incident, IncidentDetail, PageInfo } from './types';
+import { AlertRecord, AnalysisRun, Envelope, FeedbackSummary, Incident, IncidentDetail, PageInfo, RecurrenceStats } from './types';
 
 const runtimeApiBase = window.__RUNAI_RCA_CONFIG__?.apiBaseUrl;
 const fallbackApiBase = import.meta.env.DEV ? 'http://localhost:8080' : '';
@@ -10,6 +10,16 @@ const MAX_ERROR_BODY_BYTES = 4096;
 export type FeedbackVote = 'up' | 'down' | 'none';
 export type PageRequest = { limit: number; offset: number };
 export type PageResult<T> = { items: T[]; page: PageInfo };
+export type IncidentView = 'active' | 'archived' | 'trash';
+export type IncidentFilters = {
+  status?: string;
+  severity?: string;
+  finalDecision?: string;
+};
+export type AlertFilters = {
+  status?: string;
+  severity?: string;
+};
 
 async function read<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`);
@@ -35,8 +45,15 @@ async function mutate<T>(method: string, path: string, body?: unknown): Promise<
   return response.json() as Promise<T>;
 }
 
-export async function fetchIncidents(page?: PageRequest): Promise<PageResult<Incident>> {
-  const response = await read<Envelope<Incident[]>>(`/api/v1/incidents${pageQuery(page)}`);
+export async function fetchIncidents(page?: PageRequest, view: IncidentView = 'active', filters: IncidentFilters = {}): Promise<PageResult<Incident>> {
+  const response = await read<Envelope<Incident[]>>(
+    `/api/v1/incidents${pageQuery(page, {
+      view,
+      status: filters.status,
+      severity: filters.severity,
+      final_decision: filters.finalDecision,
+    })}`,
+  );
   return pageResult(response, page);
 }
 
@@ -48,8 +65,13 @@ export async function fetchIncident(id: string): Promise<IncidentDetail> {
   ).data;
 }
 
-export async function fetchAlerts(page?: PageRequest): Promise<PageResult<AlertRecord>> {
-  const response = await read<Envelope<AlertRecord[]>>(`/api/v1/alerts${pageQuery(page)}`);
+export async function fetchAlerts(page?: PageRequest, filters: AlertFilters = {}): Promise<PageResult<AlertRecord>> {
+  const response = await read<Envelope<AlertRecord[]>>(
+    `/api/v1/alerts${pageQuery(page, {
+      status: filters.status,
+      severity: filters.severity,
+    })}`,
+  );
   return pageResult(response, page);
 }
 
@@ -70,6 +92,27 @@ export async function analyzeIncident(id: string): Promise<void> {
 
 export async function resolveIncident(id: string): Promise<void> {
   await write(`/api/v1/incidents/${encodeURIComponent(id)}/resolve`);
+}
+
+export async function archiveIncident(id: string): Promise<void> {
+  await write(`/api/v1/incidents/${encodeURIComponent(id)}/archive`);
+}
+
+export async function unarchiveIncident(id: string): Promise<void> {
+  await write(`/api/v1/incidents/${encodeURIComponent(id)}/unarchive`);
+}
+
+export async function restoreIncident(id: string): Promise<void> {
+  await write(`/api/v1/incidents/${encodeURIComponent(id)}/restore`);
+}
+
+export async function deleteIncident(id: string, permanent = false): Promise<void> {
+  const suffix = permanent ? '?permanent=true' : '';
+  await mutate('DELETE', `/api/v1/incidents/${encodeURIComponent(id)}${suffix}`);
+}
+
+export async function fetchRecurrenceStats(days = 7): Promise<RecurrenceStats> {
+  return (await read<Envelope<RecurrenceStats>>(`/api/v1/stats/recurrence?days=${encodeURIComponent(String(days))}`)).data;
 }
 
 export async function submitFeedback(
@@ -169,12 +212,18 @@ function targetPath(targetType: 'incident' | 'alert', id: string, action: string
   return `/api/v1/${collection}/${encodeURIComponent(id)}/${action}`;
 }
 
-function pageQuery(page?: PageRequest) {
-  if (!page) return '';
+function pageQuery(page?: PageRequest, extra?: Record<string, string | undefined>) {
   const params = new URLSearchParams();
-  params.set('limit', String(page.limit));
-  params.set('offset', String(page.offset));
-  return `?${params.toString()}`;
+  if (page) {
+    params.set('limit', String(page.limit));
+    params.set('offset', String(page.offset));
+  }
+  for (const [key, value] of Object.entries(extra ?? {})) {
+    if (!value) continue;
+    params.set(key, value);
+  }
+  const query = params.toString();
+  return query ? `?${query}` : '';
 }
 
 function pageResult<T>(response: Envelope<T[]>, requested?: PageRequest): PageResult<T> {

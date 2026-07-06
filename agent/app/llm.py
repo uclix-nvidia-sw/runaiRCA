@@ -7,15 +7,29 @@ configured, or the call fails, the callers fall back to deterministic behaviour.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import random
+from contextvars import ContextVar
 from typing import Any
 
 from app.collectors.http_json import post_json
 from app.config import Settings
 
+_log = logging.getLogger(__name__)
+_usage: ContextVar[dict[str, int] | None] = ContextVar("llm_usage", default=None)
+_RETRY_STATUSES = {0, 429, 500, 502, 503, 504}
+
 
 def llm_configured(settings: Settings) -> bool:
     return bool(settings.llm_base_url and settings.llm_model and settings.llm_api_key)
+
+
+def begin_usage_tracking() -> dict[str, int]:
+    usage = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    _usage.set(usage)
+    return usage
 
 
 # Appended to EVERY system prompt sent through this module (and manually to the
@@ -58,14 +72,20 @@ async def complete(
     }
     if max_tokens:
         payload["max_tokens"] = max_tokens
-    response = await post_json(
-        url=f"{settings.llm_base_url}/chat/completions",
-        timeout_seconds=settings.llm_request_timeout_seconds,
-        json_body=payload,
-        headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-    )
+    response = None
+    for attempt in range(3):
+        response = await post_json(
+            url=f"{settings.llm_base_url}/chat/completions",
+            timeout_seconds=settings.llm_request_timeout_seconds,
+            json_body=payload,
+            headers={"Authorization": f"Bearer {settings.llm_api_key}"},
+        )
+        if response.ok or response.status_code not in _RETRY_STATUSES or attempt == 2:
+            break
+        await asyncio.sleep((0.25 * (2**attempt)) + random.uniform(0, 0.1))
     if not response.ok or not isinstance(response.data, dict):
         return None
+    _record_usage(settings.llm_model, response.data)
     choices = response.data.get("choices")
     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
         message = choices[0].get("message")
@@ -74,6 +94,23 @@ async def complete(
             if isinstance(content, str) and content.strip():
                 return content.strip()
     return None
+
+
+def _record_usage(model: str, data: dict[str, Any]) -> None:
+    raw = data.get("usage")
+    if not isinstance(raw, dict):
+        return
+    current = _usage.get()
+    if current is None:
+        return
+    per_call = {"model": model}
+    current["calls"] += 1
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = raw.get(key)
+        if isinstance(value, int | float):
+            current[key] += int(value)
+            per_call[key] = int(value)
+    _log.info("llm usage", extra={"llm_usage": per_call})
 
 
 async def complete_json(

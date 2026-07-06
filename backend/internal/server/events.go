@@ -16,6 +16,7 @@ const (
 	eventAnalysisCompleted = "analysis.completed"
 	eventFeedbackUpdated   = "feedback.updated"
 	eventIncidentResolved  = "incident.resolved"
+	eventIncidentUpdated   = "incident.updated"
 )
 
 type Event struct {
@@ -113,11 +114,22 @@ func feedbackUpdatedEvent(summary FeedbackSummary, incidentID string, alertID st
 	}}
 }
 
-func incidentResolvedEvent(incidentID string, status string, resolvedAt *time.Time) Event {
+func incidentResolvedEvent(incidentID string, status string, resolvedAt *time.Time, userApprovedAt *time.Time) Event {
 	return Event{Type: eventIncidentResolved, Data: map[string]any{
+		"incident_id":      incidentID,
+		"status":           status,
+		"resolved_at":      resolvedAt,
+		"user_approved_at": userApprovedAt,
+	}}
+}
+
+func incidentUpdatedEvent(incidentID string, action string, status string, archivedAt *time.Time, deletedAt *time.Time) Event {
+	return Event{Type: eventIncidentUpdated, Data: map[string]any{
 		"incident_id": incidentID,
+		"action":      action,
 		"status":      status,
-		"resolved_at": resolvedAt,
+		"archived_at": archivedAt,
+		"deleted_at":  deletedAt,
 	}}
 }
 

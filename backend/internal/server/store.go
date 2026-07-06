@@ -30,6 +30,10 @@ const (
 
 	maxStoredCommentBodyBytes = 8000
 	maxFeedbackAuthorBytes    = 120
+
+	incidentViewActive   = "active"
+	incidentViewArchived = "archived"
+	incidentViewTrash    = "trash"
 )
 
 type Store struct {
@@ -140,6 +144,99 @@ func sameTimePtr(left, right *time.Time) bool {
 	return left.Equal(*right)
 }
 
+func validIncidentView(view string) bool {
+	return view == incidentViewActive || view == incidentViewArchived || view == incidentViewTrash
+}
+
+type IncidentListFilter struct {
+	Status        string
+	Severity      string
+	FinalDecision string
+}
+
+type AlertListFilter struct {
+	Status   string
+	Severity string
+}
+
+func validIncidentStatusFilter(status string) bool {
+	return status == "" || status == "firing" || status == "resolved" || status == "analyzing"
+}
+
+func validIncidentSeverityFilter(severity string) bool {
+	return severity == "" || severity == "critical" || severity == "warning" || severity == "info"
+}
+
+func validIncidentFinalDecisionFilter(decision string) bool {
+	return decision == "" || decision == "approved" || decision == "pending"
+}
+
+func incidentInView(incident *Incident, view string) bool {
+	if incident == nil {
+		return false
+	}
+	switch view {
+	case incidentViewArchived:
+		return incident.DeletedAt == nil && incident.ArchivedAt != nil
+	case incidentViewTrash:
+		return incident.DeletedAt != nil
+	default:
+		return incident.DeletedAt == nil && incident.ArchivedAt == nil
+	}
+}
+
+func incidentMatchesListFilter(incident *Incident, filter IncidentListFilter) bool {
+	if incident == nil {
+		return false
+	}
+	if filter.Status != "" {
+		if filter.Status == "analyzing" {
+			if !incident.IsAnalyzing {
+				return false
+			}
+		} else if incident.Status != filter.Status {
+			return false
+		}
+	}
+	if filter.Severity != "" && incident.Severity != filter.Severity {
+		return false
+	}
+	if filter.FinalDecision == "approved" && incident.UserApprovedAt == nil {
+		return false
+	}
+	if filter.FinalDecision == "pending" && incident.UserApprovedAt != nil {
+		return false
+	}
+	return true
+}
+
+func alertMatchesListFilter(alert *AlertRecord, filter AlertListFilter) bool {
+	if alert == nil {
+		return false
+	}
+	if filter.Status != "" {
+		if filter.Status == "analyzing" {
+			if !alert.IsAnalyzing {
+				return false
+			}
+		} else if alert.Status != filter.Status {
+			return false
+		}
+	}
+	if filter.Severity != "" && alert.Severity != filter.Severity {
+		return false
+	}
+	return true
+}
+
+func incidentDeleted(incident *Incident) bool {
+	return incident != nil && incident.DeletedAt != nil
+}
+
+func incidentUserApproved(incident *Incident) bool {
+	return incident != nil && incident.UserApprovedAt != nil
+}
+
 func (s *Store) databaseHealth() map[string]any {
 	health := map[string]any{
 		"postgres":          s.dbReady,
@@ -225,6 +322,9 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 		}
 	}
 	incident := s.incidents[incidentID]
+	if incident.ArchivedAt != nil {
+		incident.ArchivedAt = nil
+	}
 	incident.Severity = maxSeverity(incident.Severity, severity(alert))
 	if alertStatus == "resolved" && incident.ResolvedAt == nil {
 		t := firstTime(alert.EndsAt, now)
@@ -233,6 +333,7 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	} else if alertStatus != "resolved" && incident.Status == "resolved" {
 		incident.Status = "firing"
 		incident.ResolvedAt = nil
+		incident.UserApprovedAt = nil
 	}
 
 	if alertID == "" {
@@ -317,7 +418,7 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 }
 
 func (s *Store) shouldReuseIncidentForAlertLocked(key string, incident *Incident, firedAt time.Time) bool {
-	if incident == nil {
+	if incident == nil || incidentDeleted(incident) {
 		return false
 	}
 	if !strings.HasPrefix(key, "flap:") {
@@ -336,15 +437,26 @@ func (s *Store) shouldReuseIncidentForAlertLocked(key string, incident *Incident
 }
 
 func (s *Store) ListIncidents() []Incident {
-	items, _ := s.ListIncidentsPage(0, 0)
+	items, _ := s.ListIncidentsPage(0, 0, incidentViewActive)
 	return items
 }
 
-func (s *Store) ListIncidentsPage(limit, offset int) ([]Incident, int) {
+func (s *Store) ListIncidentsPage(limit, offset int, views ...string) ([]Incident, int) {
+	view := incidentViewActive
+	if len(views) > 0 && views[0] != "" {
+		view = views[0]
+	}
+	return s.ListIncidentsPageFiltered(limit, offset, view, IncidentListFilter{})
+}
+
+func (s *Store) ListIncidentsPageFiltered(limit, offset int, view string, filter IncidentListFilter) ([]Incident, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	ordered := make([]*Incident, 0, len(s.incidents))
 	for _, incident := range s.incidents {
+		if !incidentInView(incident, view) || !incidentMatchesListFilter(incident, filter) {
+			continue
+		}
 		ordered = append(ordered, incident)
 	}
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].FiredAt.After(ordered[j].FiredAt) })
@@ -362,10 +474,17 @@ func (s *Store) ListAlerts() []AlertRecord {
 }
 
 func (s *Store) ListAlertsPage(limit, offset int) ([]AlertRecord, int) {
+	return s.ListAlertsPageFiltered(limit, offset, AlertListFilter{})
+}
+
+func (s *Store) ListAlertsPageFiltered(limit, offset int, filter AlertListFilter) ([]AlertRecord, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	ordered := make([]*AlertRecord, 0, len(s.alerts))
 	for _, alert := range s.alerts {
+		if alert == nil || incidentDeleted(s.incidents[alert.IncidentID]) || !alertMatchesListFilter(alert, filter) {
+			continue
+		}
 		ordered = append(ordered, alert)
 	}
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].FiredAt.After(ordered[j].FiredAt) })
@@ -401,6 +520,214 @@ func (s *Store) ListAnalysisRunsPage(limit, offset int) ([]AnalysisRun, int) {
 	return items, len(ordered)
 }
 
+func (s *Store) ArchiveIncident(id string, archived bool) (*Incident, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	incident := s.incidents[id]
+	if incidentDeleted(incident) {
+		return nil, false
+	}
+	if archived {
+		now := time.Now().UTC()
+		incident.ArchivedAt = &now
+	} else {
+		incident.ArchivedAt = nil
+	}
+	if !s.persistIncidentLocked(incident) {
+		return nil, false
+	}
+	return cloneIncident(incident), true
+}
+
+func (s *Store) SoftDeleteIncident(id string) (*Incident, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	incident := s.incidents[id]
+	if incident == nil {
+		return nil, false
+	}
+	if incident.DeletedAt == nil {
+		now := time.Now().UTC()
+		incident.DeletedAt = &now
+	}
+	s.removeIncidentIndexesLocked(id)
+	if !s.persistIncidentLocked(incident) {
+		return nil, false
+	}
+	return cloneIncident(incident), true
+}
+
+func (s *Store) RestoreIncident(id string) (*Incident, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	incident := s.incidents[id]
+	if incident == nil {
+		return nil, false
+	}
+	incident.DeletedAt = nil
+	incident.ArchivedAt = nil
+	s.registerIncidentIndexesLocked(incident)
+	if !s.persistIncidentLocked(incident) {
+		return nil, false
+	}
+	return cloneIncident(incident), true
+}
+
+func (s *Store) HardDeleteIncident(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	incident := s.incidents[id]
+	if incident == nil {
+		return false
+	}
+	alertIDs := map[string]struct{}{}
+	for alertID, alert := range s.alerts {
+		if alert != nil && alert.IncidentID == id {
+			alertIDs[alertID] = struct{}{}
+		}
+	}
+	alertList := make([]string, 0, len(alertIDs))
+	for alertID := range alertIDs {
+		alertList = append(alertList, alertID)
+	}
+	if !s.persistHardDeleteIncidentLocked(id, alertList) {
+		return false
+	}
+	s.removeIncidentIndexesLocked(id)
+	delete(s.incidents, id)
+	for alertID := range alertIDs {
+		delete(s.alerts, alertID)
+	}
+	for key, memory := range s.memories {
+		if memory == nil {
+			continue
+		}
+		if memory.IncidentID == id {
+			delete(s.memories, key)
+			continue
+		}
+		if _, ok := alertIDs[memory.AlertID]; ok {
+			delete(s.memories, key)
+		}
+	}
+	for key, record := range s.feedback {
+		if record == nil {
+			continue
+		}
+		if record.IncidentID == id || (record.TargetType == "incident" && record.TargetID == id) {
+			delete(s.feedback, key)
+			continue
+		}
+		if _, ok := alertIDs[record.AlertID]; ok {
+			delete(s.feedback, key)
+			continue
+		}
+		if record.TargetType == "alert" {
+			if _, ok := alertIDs[record.TargetID]; ok {
+				delete(s.feedback, key)
+			}
+		}
+	}
+	for key, record := range s.comments {
+		if record == nil {
+			continue
+		}
+		if record.IncidentID == id || (record.TargetType == "incident" && record.TargetID == id) {
+			delete(s.comments, key)
+			continue
+		}
+		if _, ok := alertIDs[record.AlertID]; ok {
+			delete(s.comments, key)
+			continue
+		}
+		if record.TargetType == "alert" {
+			if _, ok := alertIDs[record.TargetID]; ok {
+				delete(s.comments, key)
+			}
+		}
+	}
+	for key, run := range s.analysisRuns {
+		if run == nil {
+			continue
+		}
+		if run.IncidentID == id {
+			delete(s.analysisRuns, key)
+			continue
+		}
+		if _, ok := alertIDs[run.AlertID]; ok {
+			delete(s.analysisRuns, key)
+		}
+	}
+	return true
+}
+
+func (s *Store) PurgeExpiredTrash(retention time.Duration, now time.Time) int {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	cutoff := now.Add(-retention)
+	ids := []string{}
+	s.mu.RLock()
+	for id, incident := range s.incidents {
+		if incident == nil || incident.DeletedAt == nil {
+			continue
+		}
+		if !incident.DeletedAt.After(cutoff) {
+			ids = append(ids, id)
+		}
+	}
+	s.mu.RUnlock()
+	purged := 0
+	for _, id := range ids {
+		if s.HardDeleteIncident(id) {
+			purged++
+		}
+	}
+	return purged
+}
+
+func (s *Store) removeIncidentIndexesLocked(incidentID string) {
+	incident := s.incidents[incidentID]
+	if incident != nil && s.incidentByKey[incident.CorrelationKey] == incidentID {
+		delete(s.incidentByKey, incident.CorrelationKey)
+	}
+	for _, alert := range s.alerts {
+		if alert == nil || alert.IncidentID != incidentID {
+			continue
+		}
+		if s.alertByFinger[alert.Fingerprint] == alert.AlertID {
+			delete(s.alertByFinger, alert.Fingerprint)
+		}
+		if incident != nil {
+			key := "correlation:" + incident.CorrelationKey
+			if s.alertByGroup[key] == alert.AlertID {
+				delete(s.alertByGroup, key)
+			}
+		}
+	}
+}
+
+func (s *Store) registerIncidentIndexesLocked(incident *Incident) {
+	if incident == nil || incident.DeletedAt != nil {
+		return
+	}
+	if incident.CorrelationKey != "" && s.incidentByKey[incident.CorrelationKey] == "" {
+		s.incidentByKey[incident.CorrelationKey] = incident.IncidentID
+	}
+	for _, alert := range s.alerts {
+		if alert == nil || alert.IncidentID != incident.IncidentID {
+			continue
+		}
+		if alert.Fingerprint != "" && s.alertByFinger[alert.Fingerprint] == "" {
+			s.alertByFinger[alert.Fingerprint] = alert.AlertID
+		}
+		key := "correlation:" + incident.CorrelationKey
+		if incident.CorrelationKey != "" && s.alertByGroup[key] == "" {
+			s.alertByGroup[key] = alert.AlertID
+		}
+	}
+}
+
 func (s *Store) DashboardSnapshot(recentLimit int) DashboardSnapshot {
 	if recentLimit < 0 {
 		recentLimit = 0
@@ -416,7 +743,7 @@ func (s *Store) DashboardSnapshot(recentLimit int) DashboardSnapshot {
 	alerts := make([]*AlertRecord, 0, len(s.alerts))
 	runs := make([]*AnalysisRun, 0, len(s.analysisRuns))
 	for _, incident := range s.incidents {
-		if incident == nil {
+		if incidentDeleted(incident) {
 			continue
 		}
 		snapshot.IncidentCount++
@@ -425,7 +752,7 @@ func (s *Store) DashboardSnapshot(recentLimit int) DashboardSnapshot {
 		}
 	}
 	for _, alert := range s.alerts {
-		if alert == nil {
+		if alert == nil || incidentDeleted(s.incidents[alert.IncidentID]) {
 			continue
 		}
 		snapshot.AlertCount++
@@ -463,13 +790,137 @@ func (s *Store) DashboardSnapshot(recentLimit int) DashboardSnapshot {
 	return snapshot
 }
 
+func (s *Store) RecurrenceStats(days int, now time.Time) RecurrenceStats {
+	if days <= 0 {
+		days = 7
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	since := now.AddDate(0, 0, -days)
+	stats := RecurrenceStats{Days: days, Daily: make([]RecurrenceDay, 0, days)}
+	byDate := map[string]int{}
+	for i := days - 1; i >= 0; i-- {
+		date := now.AddDate(0, 0, -i).Format("2006-01-02")
+		stats.Daily = append(stats.Daily, RecurrenceDay{Date: date})
+		byDate[date] = len(stats.Daily) - 1
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	// ponytail: O(recent incidents * memories); replace with indexed vector queries if this dashboard gets large.
+	for _, incident := range s.incidents {
+		if incident == nil || incidentDeleted(incident) || incident.FiredAt.Before(since) || incident.FiredAt.After(now) {
+			continue
+		}
+		alert := s.latestAlertForIncidentLocked(incident.IncidentID)
+		if alert == nil {
+			continue
+		}
+		stats.Total++
+		day, ok := byDate[incident.FiredAt.Format("2006-01-02")]
+		if ok {
+			stats.Daily[day].Total++
+		}
+		before := incident.FiredAt
+		if s.similarRecentCountLocked(alertFromRecord(*alert), incident.IncidentID, incident.FiredAt.AddDate(0, 0, -days), &before) == 0 {
+			continue
+		}
+		stats.Recurred++
+		if ok {
+			stats.Daily[day].Recurred++
+		}
+	}
+	stats.Rate = recurrenceRate(stats.Recurred, stats.Total)
+	for i := range stats.Daily {
+		stats.Daily[i].Rate = recurrenceRate(stats.Daily[i].Recurred, stats.Daily[i].Total)
+	}
+	return stats
+}
+
+func recurrenceRate(recurred int, total int) float64 {
+	if total <= 0 {
+		return 0
+	}
+	return float64(recurred) / float64(total)
+}
+
+func metadataFromAgentContext(context map[string]any) map[string]any {
+	if context == nil {
+		return nil
+	}
+	usage, ok := context["llm_usage"]
+	if !ok {
+		return nil
+	}
+	if usageMap, ok := usage.(map[string]any); ok {
+		return map[string]any{"llm_usage": cloneAnyMap(usageMap)}
+	}
+	return map[string]any{"llm_usage": usage}
+}
+
+func (s *Store) latestTokenUsageLocked(incidentID string) map[string]any {
+	alertIDs := map[string]struct{}{}
+	for _, alert := range s.alerts {
+		if alert != nil && alert.IncidentID == incidentID {
+			alertIDs[alert.AlertID] = struct{}{}
+		}
+	}
+	var selected *AnalysisRun
+	for _, run := range s.analysisRuns {
+		if run == nil || len(run.Metadata) == 0 {
+			continue
+		}
+		matches := run.IncidentID == incidentID
+		if !matches {
+			_, matches = alertIDs[run.AlertID]
+		}
+		if !matches {
+			continue
+		}
+		if _, ok := run.Metadata["llm_usage"]; !ok {
+			continue
+		}
+		if selected == nil || run.UpdatedAt.After(selected.UpdatedAt) {
+			selected = run
+		}
+	}
+	if selected == nil {
+		return nil
+	}
+	if usage, ok := selected.Metadata["llm_usage"].(map[string]any); ok {
+		return cloneAnyMap(usage)
+	}
+	return map[string]any{"value": selected.Metadata["llm_usage"]}
+}
+
+func (s *Store) latestAlertForIncidentLocked(incidentID string) *AlertRecord {
+	var selected *AlertRecord
+	var selectedFiring *AlertRecord
+	for _, alert := range s.alerts {
+		if alert == nil || alert.IncidentID != incidentID {
+			continue
+		}
+		if selected == nil || alert.FiredAt.After(selected.FiredAt) {
+			selected = alert
+		}
+		if alert.Status != "resolved" && (selectedFiring == nil || alert.FiredAt.After(selectedFiring.FiredAt)) {
+			selectedFiring = alert
+		}
+	}
+	if selectedFiring != nil {
+		return selectedFiring
+	}
+	return selected
+}
+
 func (s *Store) LatestAlertID() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var latest *AlertRecord
 	var latestFiring *AlertRecord
 	for _, alert := range s.alerts {
-		if alert == nil {
+		if alert == nil || incidentDeleted(s.incidents[alert.IncidentID]) {
 			continue
 		}
 		if latest == nil || alert.FiredAt.After(latest.FiredAt) {
@@ -554,6 +1005,7 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 		existing.MissingData = []string{}
 		existing.Warnings = []string{}
 		existing.Artifacts = []Artifact{}
+		existing.Metadata = nil
 		// This IS a new analysis occupying the old row, so it must also become the
 		// NEWEST run: isLatestAnalysisRunForAlert compares CreatedAt, and with the
 		// old timestamp any run created later (e.g. a comment reanalysis) stayed
@@ -654,6 +1106,7 @@ func (s *Store) CompleteAnalysisRun(runID string, response AgentAnalysisResponse
 	run.MissingData = response.MissingData
 	run.Warnings = response.Warnings
 	run.Artifacts = response.Artifacts
+	run.Metadata = metadataFromAgentContext(response.Context)
 	run.UpdatedAt = time.Now().UTC()
 	if !s.persistAnalysisRunLocked(run) {
 		*run = before
@@ -681,6 +1134,7 @@ func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (A
 	run.MissingData = response.MissingData
 	run.Warnings = response.Warnings
 	run.Artifacts = response.Artifacts
+	run.Metadata = metadataFromAgentContext(response.Context)
 	run.UpdatedAt = time.Now().UTC()
 	if !s.persistAnalysisRunLocked(run) {
 		*run = before
@@ -782,6 +1236,9 @@ func (s *Store) AlertIDsNeedingAnalysis(limit int, retryCooldown time.Duration, 
 		if alert == nil || alert.IsAnalyzing {
 			continue
 		}
+		if incidentDeleted(s.incidents[alert.IncidentID]) {
+			continue
+		}
 		if status(alert.Status) == "resolved" {
 			continue
 		}
@@ -808,13 +1265,13 @@ func (s *Store) AnalysisTarget(targetType string, targetID string) (Alert, strin
 	switch targetType {
 	case "alert":
 		alert := s.alerts[targetID]
-		if alert == nil {
+		if alert == nil || incidentDeleted(s.incidents[alert.IncidentID]) {
 			return Alert{}, "", "", "", "", false
 		}
 		return alertFromRecord(*alert), alert.IncidentID, alert.AlertID, alert.ThreadTS, alert.AlarmTitle, true
 	case "incident":
 		incident := s.incidents[targetID]
-		if incident == nil {
+		if incident == nil || incidentDeleted(incident) {
 			return Alert{}, "", "", "", "", false
 		}
 		var selected *AlertRecord
@@ -894,7 +1351,7 @@ func (s *Store) BumpIncidentAnalysisSeq(id string) (int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[id]
-	if incident == nil {
+	if incident == nil || incidentDeleted(incident) {
 		return 0, false
 	}
 	incident.AnalysisSeq++
@@ -909,7 +1366,7 @@ func (s *Store) SetIncidentSlackThread(id string, ts string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[id]
-	if incident == nil {
+	if incident == nil || incidentDeleted(incident) {
 		return
 	}
 	incident.SlackThreadTS = ts
@@ -1000,7 +1457,9 @@ func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 			id,
 			similarIncidentLimit,
 		)
+		detail.SimilarRecentCount = s.similarRecentCountLocked(alertFromRecord(detail.Alerts[0]), id, time.Now().UTC().AddDate(0, 0, -7), nil)
 	}
+	detail.TokenUsage = s.latestTokenUsageLocked(id)
 	return detail, true
 }
 
@@ -1008,7 +1467,7 @@ func (s *Store) AlertDetail(id string) (*AlertRecord, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	alert := s.alerts[id]
-	if alert == nil {
+	if alert == nil || incidentDeleted(s.incidents[alert.IncidentID]) {
 		return nil, false
 	}
 	copied := cloneAlert(alert)

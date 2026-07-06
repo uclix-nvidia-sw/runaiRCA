@@ -30,6 +30,7 @@ type AnalysisRun struct {
 	MissingData     []string          `json:"missing_data"`
 	Warnings        []string          `json:"warnings"`
 	Artifacts       []Artifact        `json:"artifacts"`
+	Metadata        map[string]any    `json:"metadata,omitempty"`
 	CreatedAt       time.Time         `json:"created_at"`
 	UpdatedAt       time.Time         `json:"updated_at"`
 }
@@ -194,6 +195,25 @@ func (s *Server) runStaleRunReaper(ctx context.Context) {
 			if reaped := s.store.ReapStaleAnalyzingRuns(s.agentRequestTimeout, s.manualAgentRequestTimeout); reaped > 0 {
 				log.Printf("reaped %d stale analyzing run(s)", reaped)
 			}
+		}
+	}
+}
+
+func (s *Server) runTrashPurge(ctx context.Context) {
+	purge := func() {
+		if purged := s.store.PurgeExpiredTrash(s.trashRetention, time.Now().UTC()); purged > 0 {
+			log.Printf("purged %d expired trash incident(s)", purged)
+		}
+	}
+	purge()
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			purge()
 		}
 	}
 }

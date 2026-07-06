@@ -8,7 +8,7 @@
 # Build:  docker build -t <registry>/runai-mcp:latest ./runai-mcp
 # Pin RUNAI_MCP_REF to a commit/tag for reproducible builds.
 ARG RUNAI_MCP_REPO=https://github.com/sejongjeong/runai-mcp.git
-ARG RUNAI_MCP_REF=main
+ARG RUNAI_MCP_REF=527b14087c35edf3467f5028fcc3793475976855
 
 FROM node:20-slim AS build
 ARG RUNAI_MCP_REPO

@@ -1,6 +1,7 @@
 import {
   Activity,
   AlertTriangle,
+  Archive,
   ArrowLeft,
   Bold,
   Bot,
@@ -11,6 +12,7 @@ import {
   Code2,
   Clipboard,
   Database,
+  Download,
   Eraser,
   FileText,
   Heading3,
@@ -27,6 +29,7 @@ import {
   Pencil,
   Redo2,
   RefreshCw,
+  RotateCcw,
   Save,
   Search,
   Send,
@@ -39,13 +42,15 @@ import {
   Undo2,
   X,
 } from 'lucide-react';
-import { type KeyboardEvent, type RefObject, Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type KeyboardEvent, type MouseEvent, type RefObject, Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
   analyzeIncident,
   addComment,
+  archiveIncident,
   chat,
+  deleteIncident,
   deleteComment,
   eventSource,
   fetchAnalysisRuns,
@@ -53,13 +58,20 @@ import {
   fetchAlerts,
   fetchIncident,
   fetchIncidents,
+  fetchRecurrenceStats,
   resolveIncident,
+  restoreIncident,
   submitFeedback,
+  unarchiveIncident,
   updateComment,
+  type AlertFilters as AlertQueryFilters,
   type ChatRequest,
+  type IncidentFilters as IncidentQueryFilters,
+  type IncidentView,
 } from './api';
 import nvidiaLogo from './assets/nvidia-logo.svg';
-import { AlertRecord, AnalysisRun, Artifact, FeedbackSummary, Incident, IncidentDetail, PageInfo, SimilarIncident } from './types';
+import { exportIncidentDocx } from './exportDocx';
+import { AlertRecord, AnalysisRun, Artifact, FeedbackSummary, Incident, IncidentDetail, PageInfo, RecurrenceStats, SimilarIncident } from './types';
 
 const TrendChartCanvas = lazy(() => import('./TrendChartCanvas'));
 const DASHBOARD_PAGE_SIZE = 15;
@@ -80,8 +92,23 @@ type RealtimeEventPayload = {
 };
 
 type EditorTab = 'write' | 'preview';
-type MainView = 'incidents' | 'alerts' | 'analysis' | 'agents';
+type MainView = 'incidents' | 'archived' | 'trash' | 'alerts' | 'analysis';
 type DetailKind = 'incident' | 'alert';
+type IncidentStatusFilter = 'all' | 'firing' | 'resolved' | 'analyzing';
+type IncidentSeverityFilter = 'all' | 'critical' | 'warning' | 'info';
+type IncidentDecisionFilter = 'all' | 'approved' | 'pending';
+type AlertStatusFilter = 'all' | 'firing' | 'resolved' | 'analyzing';
+
+type IncidentFilterState = {
+  status: IncidentStatusFilter;
+  severity: IncidentSeverityFilter;
+  finalDecision: IncidentDecisionFilter;
+};
+
+type AlertFilterState = {
+  status: AlertStatusFilter;
+  severity: IncidentSeverityFilter;
+};
 
 type RouteState = {
   view: MainView;
@@ -187,6 +214,14 @@ type AnalysisAnalytics = {
   };
 };
 
+type RecurringIncidentRow = {
+  id: string;
+  title: string;
+  meta: string;
+  score: number;
+  delta: number;
+};
+
 type QueryDisplayItem = {
   id: string;
   name: string;
@@ -207,6 +242,38 @@ const ANALYSIS_WINDOWS = [
   { label: '14d', days: 14 },
   { label: '30d', days: 30 },
 ];
+const DEFAULT_INCIDENT_FILTERS: IncidentFilterState = {
+  status: 'all',
+  severity: 'all',
+  finalDecision: 'all',
+};
+const DEFAULT_ALERT_FILTERS: AlertFilterState = {
+  status: 'all',
+  severity: 'all',
+};
+const INCIDENT_STATUS_OPTIONS: Array<{ label: string; value: IncidentStatusFilter }> = [
+  { label: 'All statuses', value: 'all' },
+  { label: 'Firing', value: 'firing' },
+  { label: 'Resolved', value: 'resolved' },
+  { label: 'Analyzing', value: 'analyzing' },
+];
+const INCIDENT_SEVERITY_OPTIONS: Array<{ label: string; value: IncidentSeverityFilter }> = [
+  { label: 'All severities', value: 'all' },
+  { label: 'Critical', value: 'critical' },
+  { label: 'Warning', value: 'warning' },
+  { label: 'Info', value: 'info' },
+];
+const INCIDENT_DECISION_OPTIONS: Array<{ label: string; value: IncidentDecisionFilter }> = [
+  { label: 'All decisions', value: 'all' },
+  { label: 'Approved', value: 'approved' },
+  { label: 'Pending', value: 'pending' },
+];
+const ALERT_STATUS_OPTIONS: Array<{ label: string; value: AlertStatusFilter }> = [
+  { label: 'All statuses', value: 'all' },
+  { label: 'Firing', value: 'firing' },
+  { label: 'Resolved', value: 'resolved' },
+  { label: 'Analyzing', value: 'analyzing' },
+];
 function isCollectorAgent(agent: string) {
   return COMPONENT_AGENT_ORDER.includes(agent);
 }
@@ -217,6 +284,16 @@ const VIEW_COPY: Record<MainView, { eyebrow: string; title: string; placeholder:
     title: 'Incident',
     placeholder: 'Search incident, severity, status',
   },
+  archived: {
+    eyebrow: 'Incident archive',
+    title: 'Archived incidents',
+    placeholder: 'Search archived incident, severity, status',
+  },
+  trash: {
+    eyebrow: 'Incident trash',
+    title: 'Trash',
+    placeholder: 'Search deleted incident, severity, status',
+  },
   alerts: {
     eyebrow: 'Alert stream',
     title: 'Alerts',
@@ -226,11 +303,6 @@ const VIEW_COPY: Record<MainView, { eyebrow: string; title: string; placeholder:
     eyebrow: 'Analysis dashboard',
     title: 'RCA analysis lifecycle',
     placeholder: 'Search RCA, quality, missing data, agent',
-  },
-  agents: {
-    eyebrow: 'Agent registry',
-    title: 'Collector and reasoning agents',
-    placeholder: 'Search agent, source, status',
   },
 };
 
@@ -272,7 +344,7 @@ function decodeRoutePart(value: string) {
 }
 
 function isMainView(value: string): value is MainView {
-  return value === 'incidents' || value === 'alerts' || value === 'analysis' || value === 'agents';
+  return value === 'incidents' || value === 'archived' || value === 'trash' || value === 'alerts' || value === 'analysis';
 }
 
 function hashForView(view: MainView) {
@@ -580,6 +652,53 @@ function pageRequest(pageIndex: number) {
   };
 }
 
+function incidentViewForMainView(view: MainView): IncidentView {
+  if (view === 'archived') return 'archived';
+  if (view === 'trash') return 'trash';
+  return 'active';
+}
+
+function incidentFiltersForAPI(filters: IncidentFilterState): IncidentQueryFilters {
+  return {
+    status: filters.status === 'all' ? undefined : filters.status,
+    severity: filters.severity === 'all' ? undefined : filters.severity,
+    finalDecision: filters.finalDecision === 'all' ? undefined : filters.finalDecision,
+  };
+}
+
+function alertFiltersForAPI(filters: AlertFilterState): AlertQueryFilters {
+  return {
+    status: filters.status === 'all' ? undefined : filters.status,
+    severity: filters.severity === 'all' ? undefined : filters.severity,
+  };
+}
+
+function matchesIncidentFilters(incident: Incident, filters: IncidentFilterState) {
+  if (filters.status !== 'all') {
+    if (filters.status === 'analyzing') {
+      if (!incident.is_analyzing) return false;
+    } else if (incident.status !== filters.status) {
+      return false;
+    }
+  }
+  if (filters.severity !== 'all' && incident.severity !== filters.severity) return false;
+  if (filters.finalDecision === 'approved' && !incident.user_approved_at) return false;
+  if (filters.finalDecision === 'pending' && incident.user_approved_at) return false;
+  return true;
+}
+
+function matchesAlertFilters(alert: AlertRecord, filters: AlertFilterState) {
+  if (filters.status !== 'all') {
+    if (filters.status === 'analyzing') {
+      if (!alert.is_analyzing) return false;
+    } else if (alert.status !== filters.status) {
+      return false;
+    }
+  }
+  if (filters.severity !== 'all' && alert.severity !== filters.severity) return false;
+  return true;
+}
+
 function emptyPage(pageIndex = 0): PageInfo {
   return {
     total: 0,
@@ -589,7 +708,12 @@ function emptyPage(pageIndex = 0): PageInfo {
   };
 }
 
-function useDashboardData(pageIndexes: DashboardPageIndexes) {
+function useDashboardData(
+  pageIndexes: DashboardPageIndexes,
+  incidentView: IncidentView,
+  incidentFilters: IncidentQueryFilters,
+  alertFilters: AlertQueryFilters,
+) {
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [alerts, setAlerts] = useState<AlertRecord[]>([]);
   const [analysisRuns, setAnalysisRuns] = useState<AnalysisRun[]>([]);
@@ -608,8 +732,8 @@ function useDashboardData(pageIndexes: DashboardPageIndexes) {
     setError('');
     try {
       const [incidentData, alertData] = await Promise.all([
-        fetchIncidents(pageRequest(pageIndexes.incidents)),
-        fetchAlerts(pageRequest(pageIndexes.alerts)),
+        fetchIncidents(pageRequest(pageIndexes.incidents), incidentView, incidentFilters),
+        fetchAlerts(pageRequest(pageIndexes.alerts), alertFilters),
       ]);
       setIncidents(incidentData.items);
       setIncidentPage(incidentData.page);
@@ -639,7 +763,7 @@ function useDashboardData(pageIndexes: DashboardPageIndexes) {
         setLoading(false);
       }
     }
-  }, [pageIndexes.alerts, pageIndexes.analysis, pageIndexes.incidents]);
+  }, [alertFilters, incidentFilters, incidentView, pageIndexes.alerts, pageIndexes.analysis, pageIndexes.incidents]);
 
   useEffect(() => {
     void load();
@@ -670,6 +794,7 @@ function useDashboardData(pageIndexes: DashboardPageIndexes) {
     source.addEventListener('analysis.started', handleRealtimeEvent);
     source.addEventListener('analysis.completed', handleRealtimeEvent);
     source.addEventListener('incident.resolved', handleRealtimeEvent);
+    source.addEventListener('incident.updated', handleRealtimeEvent);
     source.addEventListener('feedback.updated', handleRealtimeEvent);
     return () => {
       source.close();
@@ -694,9 +819,14 @@ function useDashboardData(pageIndexes: DashboardPageIndexes) {
 }
 
 function App() {
+  const [activeView, setActiveView] = useState<MainView>(() => routeFromHash(window.location.hash).view);
   const [incidentPageIndex, setIncidentPageIndex] = useState(0);
   const [alertPageIndex, setAlertPageIndex] = useState(0);
   const [analysisPageIndex, setAnalysisPageIndex] = useState(0);
+  const [incidentFilters, setIncidentFilters] = useState<IncidentFilterState>(DEFAULT_INCIDENT_FILTERS);
+  const [alertFilters, setAlertFilters] = useState<AlertFilterState>(DEFAULT_ALERT_FILTERS);
+  const incidentQueryFilters = useMemo(() => incidentFiltersForAPI(incidentFilters), [incidentFilters]);
+  const alertQueryFilters = useMemo(() => alertFiltersForAPI(alertFilters), [alertFilters]);
   const {
     incidents,
     alerts,
@@ -712,9 +842,8 @@ function App() {
     incidents: incidentPageIndex,
     alerts: alertPageIndex,
     analysis: analysisPageIndex,
-  });
+  }, incidentViewForMainView(activeView), incidentQueryFilters, alertQueryFilters);
   const [detail, setDetail] = useState<DetailState>(null);
-  const [activeView, setActiveView] = useState<MainView>(() => routeFromHash(window.location.hash).view);
   const [query, setQuery] = useState('');
   const [chatDocked, setChatDocked] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -728,6 +857,14 @@ function App() {
   }, [query]);
 
   useEffect(() => {
+    setIncidentPageIndex(0);
+  }, [activeView, incidentFilters]);
+
+  useEffect(() => {
+    setAlertPageIndex(0);
+  }, [alertFilters]);
+
+  useEffect(() => {
     detailVersionRef.current += 1;
   }, [detail]);
 
@@ -739,20 +876,18 @@ function App() {
 
   const filteredIncidents = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return dashboardIncidents;
     return dashboardIncidents.filter((incident) =>
-      [incident.title, incident.severity, incident.status, incident.correlation_key]
+      matchesIncidentFilters(incident, incidentFilters) && (!q || [incident.title, incident.severity, incident.status, incident.correlation_key]
         .join(' ')
         .toLowerCase()
-        .includes(q),
+        .includes(q)),
     );
-  }, [dashboardIncidents, query]);
+  }, [dashboardIncidents, incidentFilters, query]);
 
   const filteredAlerts = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return dashboardAlerts;
     return dashboardAlerts.filter((alert) =>
-      [
+      matchesAlertFilters(alert, alertFilters) && (!q || [
         alert.alarm_title,
         alert.severity,
         alert.status,
@@ -764,37 +899,14 @@ function App() {
       ]
         .join(' ')
         .toLowerCase()
-        .includes(q),
+        .includes(q)),
     );
-  }, [dashboardAlerts, query]);
+  }, [alertFilters, dashboardAlerts, query]);
 
   const analysisRecords = useMemo(
     () => buildAnalysisRecords(analysisAlerts, dashboardAnalysisRuns),
     [analysisAlerts, dashboardAnalysisRuns],
   );
-
-  const filteredAnalysis = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return analysisRecords;
-    return analysisRecords.filter((record) =>
-      [
-        record.title,
-        record.target,
-        record.source,
-        record.severity,
-        record.alertStatus,
-        record.analysisStatus,
-        record.quality,
-        record.summary,
-        record.missingData.join(' '),
-        record.warnings.join(' '),
-        Object.entries(record.capabilities).map(([agent, status]) => `${agent} ${status}`).join(' '),
-      ]
-        .join(' ')
-        .toLowerCase()
-        .includes(q),
-    );
-  }, [analysisRecords, query]);
 
   const liveEvidenceItems = useMemo<EvidenceItem[]>(() => {
     return alerts.flatMap((alert) =>
@@ -826,7 +938,7 @@ function App() {
       return {
         id: `agent-${agent}`,
         agent,
-        name: `${agentLabel(agent)} Collector`,
+        name: agentLabel(agent),
         status: signal.status,
         summary:
           agentEvidence.length > 0
@@ -858,28 +970,6 @@ function App() {
       runCount: analysisRecords.length,
     };
   }, [analysisRecords]);
-
-  const filteredAgents = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return agentSummaries;
-    return agentSummaries.filter((agent) =>
-      [agent.name, agent.agent, agent.status, agent.summary, agent.source]
-        .join(' ')
-        .toLowerCase()
-        .includes(q),
-    );
-  }, [agentSummaries, query]);
-
-  const visibleSynthesis = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return synthesisSummary;
-    return [synthesisSummary.name, synthesisSummary.status, synthesisSummary.summary, synthesisSummary.source]
-      .join(' ')
-      .toLowerCase()
-      .includes(q)
-      ? synthesisSummary
-      : null;
-  }, [query, synthesisSummary]);
 
   const loadRoute = useCallback(async (route: RouteState) => {
     const version = routeLoadVersionRef.current + 1;
@@ -939,8 +1029,9 @@ function App() {
   const closeDetail = () => navigateToHash(hashForView(activeView));
 
   const openIncident = useCallback(async (id: string) => {
-    navigateToHash(hashForDetail('incident', id, 'incidents'));
-  }, [navigateToHash]);
+    const view = activeView === 'archived' || activeView === 'trash' ? activeView : 'incidents';
+    navigateToHash(hashForDetail('incident', id, view));
+  }, [activeView, navigateToHash]);
 
   const openAlert = useCallback(async (id: string) => {
     navigateToHash(hashForDetail('alert', id, 'alerts'));
@@ -973,6 +1064,26 @@ function App() {
     }
   }, [load, refreshDetail, refreshing]);
 
+  const handleArchiveIncident = useCallback(async (id: string) => {
+    await archiveIncident(id);
+    await refreshCurrentView();
+  }, [refreshCurrentView]);
+
+  const handleUnarchiveIncident = useCallback(async (id: string) => {
+    await unarchiveIncident(id);
+    await refreshCurrentView();
+  }, [refreshCurrentView]);
+
+  const handleRestoreIncident = useCallback(async (id: string) => {
+    await restoreIncident(id);
+    await refreshCurrentView();
+  }, [refreshCurrentView]);
+
+  const handleDeleteIncident = useCallback(async (id: string, permanent = false) => {
+    await deleteIncident(id, permanent);
+    await refreshCurrentView();
+  }, [refreshCurrentView]);
+
   useEffect(() => {
     if (realtimeEventMatchesDetail(detail, realtimePayload)) {
       void refreshDetail();
@@ -989,7 +1100,7 @@ function App() {
           <p className="eyebrow">NVIDIA Run:ai</p>
           <h1>Run:AI RCA</h1>
         </div>
-        <nav>
+        <nav className="primary-nav">
           <button
             className={`nav-item ${activeView === 'incidents' ? 'active' : ''}`}
             onClick={() => switchView('incidents')}
@@ -1011,12 +1122,27 @@ function App() {
           >
             <ListChecks size={18} /> Analysis
           </button>
+        </nav>
+        <nav className="utility-nav" aria-label="Incident lifecycle views">
           <button
-            className={`nav-item ${activeView === 'agents' ? 'active' : ''}`}
-            onClick={() => switchView('agents')}
+            className={`nav-item icon-only-nav-item ${activeView === 'archived' ? 'active' : ''}`}
+            onClick={() => switchView('archived')}
             type="button"
+            aria-label="Archive"
+            title="Archive"
           >
-            <Bot size={18} /> Agents
+            <Archive size={18} />
+            <span className="sr-only">Archive</span>
+          </button>
+          <button
+            className={`nav-item icon-only-nav-item ${activeView === 'trash' ? 'active' : ''}`}
+            onClick={() => switchView('trash')}
+            type="button"
+            aria-label="Trash"
+            title="Trash"
+          >
+            <Trash2 size={18} />
+            <span className="sr-only">Trash</span>
           </button>
         </nav>
       </aside>
@@ -1032,7 +1158,7 @@ function App() {
             <input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder={viewCopy.placeholder}
+              placeholder="Search"
             />
           </div>
           <button
@@ -1054,51 +1180,43 @@ function App() {
 
         {error && <div className="error-banner">{error}</div>}
 
-        {activeView === 'incidents' && (
+        {(activeView === 'incidents' || activeView === 'archived' || activeView === 'trash') && (
           <IncidentsDashboard
+            view={incidentViewForMainView(activeView)}
             incidents={dashboardIncidents}
             filteredIncidents={filteredIncidents}
+            filters={incidentFilters}
             page={incidentPage}
             loading={loading}
             onOpenIncident={openIncident}
             onPageChange={setIncidentPageIndex}
+            onFilterChange={setIncidentFilters}
+            onArchive={handleArchiveIncident}
+            onUnarchive={handleUnarchiveIncident}
+            onRestore={handleRestoreIncident}
+            onDelete={handleDeleteIncident}
           />
         )}
         {activeView === 'alerts' && (
           <AlertsDashboard
             alerts={dashboardAlerts}
             filteredAlerts={filteredAlerts}
+            filters={alertFilters}
             page={alertPage}
             loading={loading}
             onOpenAlert={openAlert}
             onOpenIncident={openIncident}
             onPageChange={setAlertPageIndex}
+            onFilterChange={setAlertFilters}
           />
         )}
         {activeView === 'analysis' && (
           <AnalysisDashboard
-            records={filteredAnalysis}
             allRecords={analysisRecords}
+            agents={agentSummaries}
+            synthesis={synthesisSummary}
             incidents={analysisIncidents}
             alerts={analysisAlerts}
-            page={analysisPage}
-            totalCount={analysisPage.total}
-            loading={loading}
-            onAnalyze={async (id) => {
-              await analyzeIncident(id);
-              await refreshCurrentView();
-            }}
-            onOpenAlert={openAlert}
-            onOpenIncident={openIncident}
-            onPageChange={setAnalysisPageIndex}
-          />
-        )}
-        {activeView === 'agents' && (
-          <AgentsRegistry
-            agents={filteredAgents}
-            synthesis={visibleSynthesis}
-            synthesisRuns={synthesisSummary.runCount}
-            totalCount={agentSummaries.length}
           />
         )}
       </main>
@@ -1130,19 +1248,33 @@ function App() {
 }
 
 function IncidentsDashboard({
+  view,
   incidents,
   filteredIncidents,
+  filters,
   page,
   loading,
   onOpenIncident,
   onPageChange,
+  onFilterChange,
+  onArchive,
+  onUnarchive,
+  onRestore,
+  onDelete,
 }: {
+  view: IncidentView;
   incidents: Incident[];
   filteredIncidents: Incident[];
+  filters: IncidentFilterState;
   page: PageInfo;
   loading: boolean;
   onOpenIncident: (id: string) => Promise<void>;
   onPageChange: (page: number) => void;
+  onFilterChange: (filters: IncidentFilterState) => void;
+  onArchive: (id: string) => Promise<void>;
+  onUnarchive: (id: string) => Promise<void>;
+  onRestore: (id: string) => Promise<void>;
+  onDelete: (id: string, permanent?: boolean) => Promise<void>;
 }) {
   let openCount = 0;
   let resolvedCount = 0;
@@ -1152,6 +1284,9 @@ function IncidentsDashboard({
     else openCount++;
     if (i.is_analyzing) analyzingIncidentCount++;
   }
+  const updateFilter = <K extends keyof IncidentFilterState>(key: K, value: IncidentFilterState[K]) => {
+    onFilterChange({ ...filters, [key]: value });
+  };
 
   return (
     <>
@@ -1164,15 +1299,37 @@ function IncidentsDashboard({
 
       <section className="content-grid single-dashboard-grid">
         <div className="panel full-width-panel">
-          <PanelHeader title="Incidents" count={page.total === filteredIncidents.length ? filteredIncidents.length : `${filteredIncidents.length} / ${page.total}`} />
           <table className="operations-table incidents-table">
             <thead>
               <tr>
                 <th>Incident</th>
-                <th>Severity</th>
-                <th>Status</th>
+                <th>
+                  <ColumnFilter
+                    label="Severity"
+                    value={filters.severity}
+                    options={INCIDENT_SEVERITY_OPTIONS}
+                    onChange={(value) => updateFilter('severity', value)}
+                  />
+                </th>
+                <th>
+                  <ColumnFilter
+                    label="Status"
+                    value={filters.status}
+                    options={INCIDENT_STATUS_OPTIONS}
+                    onChange={(value) => updateFilter('status', value)}
+                  />
+                </th>
+                <th>
+                  <ColumnFilter
+                    label="Final decision"
+                    value={filters.finalDecision}
+                    options={INCIDENT_DECISION_OPTIONS}
+                    onChange={(value) => updateFilter('finalDecision', value)}
+                  />
+                </th>
                 <th>Alerts</th>
                 <th>Started</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -1184,8 +1341,19 @@ function IncidentsDashboard({
                   </td>
                   <td><Severity value={incident.severity} /></td>
                   <td><Status value={incident.status} analyzing={incident.is_analyzing} /></td>
+                  <td><FinalDecision approvedAt={incident.user_approved_at} /></td>
                   <td>{incident.alert_count}</td>
                   <td>{formatTime(incident.fired_at)}</td>
+                  <td>
+                    <IncidentRowActions
+                      incident={incident}
+                      view={view}
+                      onArchive={onArchive}
+                      onUnarchive={onUnarchive}
+                      onRestore={onRestore}
+                      onDelete={onDelete}
+                    />
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -1199,27 +1367,144 @@ function IncidentsDashboard({
   );
 }
 
+function ColumnFilter<T extends string>({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: T;
+  options: Array<{ label: string; value: T }>;
+  onChange: (value: T) => void;
+}) {
+  const active = value !== 'all';
+  return (
+    <label className={`column-filter ${active ? 'is-active' : ''}`}>
+      <span>{label}</span>
+      <select
+        aria-label={`Filter ${label}`}
+        value={value}
+        onChange={(event) => onChange(event.target.value as T)}
+      >
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>{option.label}</option>
+        ))}
+      </select>
+      <ChevronDown size={12} aria-hidden="true" />
+    </label>
+  );
+}
+
+function IncidentRowActions({
+  incident,
+  view,
+  onArchive,
+  onUnarchive,
+  onRestore,
+  onDelete,
+}: {
+  incident: Incident;
+  view: IncidentView;
+  onArchive: (id: string) => Promise<void>;
+  onUnarchive: (id: string) => Promise<void>;
+  onRestore: (id: string) => Promise<void>;
+  onDelete: (id: string, permanent?: boolean) => Promise<void>;
+}) {
+  const run = (event: MouseEvent, work: () => Promise<void>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.closest('details')?.removeAttribute('open');
+    void work();
+  };
+  const menuItems = view === 'archived'
+    ? [
+        { label: 'Unarchive', icon: <RotateCcw size={14} />, action: () => onUnarchive(incident.incident_id) },
+        {
+          label: 'Delete',
+          icon: <Trash2 size={14} />,
+          tone: 'danger' as const,
+          action: async () => {
+            if (window.confirm('Move this archived incident to trash?')) await onDelete(incident.incident_id);
+          },
+        },
+      ]
+    : view === 'trash'
+      ? [
+          { label: 'Restore', icon: <RotateCcw size={14} />, action: () => onRestore(incident.incident_id) },
+          {
+            label: 'Forever',
+            icon: <Trash2 size={14} />,
+            tone: 'danger' as const,
+            action: async () => {
+              if (window.confirm('Delete this incident forever? This cannot be undone.')) await onDelete(incident.incident_id, true);
+            },
+          },
+        ]
+      : [
+          { label: 'Archive', icon: <Archive size={14} />, action: () => onArchive(incident.incident_id) },
+          {
+            label: 'Delete',
+            icon: <Trash2 size={14} />,
+            tone: 'danger' as const,
+            action: async () => {
+              if (window.confirm('Move this incident to trash?')) await onDelete(incident.incident_id);
+            },
+          },
+        ];
+  return (
+    <div className="row-action-wrap" onClick={(event) => event.stopPropagation()}>
+      <details className="row-action-menu">
+        <summary aria-label="Incident actions">
+          <MoreHorizontal size={18} />
+        </summary>
+        <div className="row-action-popover">
+          {menuItems.map((item) => (
+            <button
+              className={item.tone === 'danger' ? 'is-danger' : ''}
+              key={item.label}
+              onClick={(event) => run(event, item.action)}
+              type="button"
+            >
+              {item.icon}
+              {item.label}
+            </button>
+          ))}
+        </div>
+      </details>
+      {view === 'trash' && <span className="trash-retention">{trashDaysRemaining(incident.deleted_at)}d left</span>}
+    </div>
+  );
+}
+
 function AlertsDashboard({
   alerts,
   filteredAlerts,
+  filters,
   page,
   loading,
   onOpenAlert,
   onOpenIncident,
   onPageChange,
+  onFilterChange,
 }: {
   alerts: AlertRecord[];
   filteredAlerts: AlertRecord[];
+  filters: AlertFilterState;
   page: PageInfo;
   loading: boolean;
   onOpenAlert: (id: string) => Promise<void>;
   onOpenIncident: (id: string) => Promise<void>;
   onPageChange: (page: number) => void;
+  onFilterChange: (filters: AlertFilterState) => void;
 }) {
   const analyzingCount = alerts.filter((alert) => alert.is_analyzing).length;
   const totalOccurrences = sumAlertOccurrences(alerts);
   const firingOccurrences = sumAlertOccurrences(alerts.filter((alert) => alert.status !== 'resolved'));
   const resolvedOccurrences = sumAlertOccurrences(alerts.filter((alert) => alert.status === 'resolved'));
+  const updateFilter = <K extends keyof AlertFilterState>(key: K, value: AlertFilterState[K]) => {
+    onFilterChange({ ...filters, [key]: value });
+  };
 
   return (
     <>
@@ -1232,14 +1517,27 @@ function AlertsDashboard({
 
       <section className="content-grid single-dashboard-grid">
         <div className="panel full-width-panel">
-          <PanelHeader title="Alerts" count={page.total === filteredAlerts.length ? filteredAlerts.length : `${filteredAlerts.length} / ${page.total}`} />
           <table className="operations-table alerts-table">
             <thead>
               <tr>
                 <th>Alert</th>
                 <th>Target</th>
-                <th>Severity</th>
-                <th>Status</th>
+                <th>
+                  <ColumnFilter
+                    label="Severity"
+                    value={filters.severity}
+                    options={INCIDENT_SEVERITY_OPTIONS}
+                    onChange={(value) => updateFilter('severity', value)}
+                  />
+                </th>
+                <th>
+                  <ColumnFilter
+                    label="Status"
+                    value={filters.status}
+                    options={ALERT_STATUS_OPTIONS}
+                    onChange={(value) => updateFilter('status', value)}
+                  />
+                </th>
                 <th>Incident</th>
               </tr>
             </thead>
@@ -1292,51 +1590,56 @@ function AlertsDashboard({
 }
 
 function AnalysisDashboard({
-  records,
   allRecords,
+  agents,
+  synthesis,
   incidents,
   alerts,
-  page,
-  totalCount,
-  loading,
-  onAnalyze,
-  onOpenAlert,
-  onOpenIncident,
-  onPageChange,
 }: {
-  records: AnalysisRecord[];
   allRecords: AnalysisRecord[];
+  agents: AgentSummary[];
+  synthesis: SynthesisSummary;
   incidents: Incident[];
   alerts: AlertRecord[];
-  page: PageInfo;
-  totalCount: number;
-  loading: boolean;
-  onAnalyze: (id: string) => Promise<void>;
-  onOpenAlert: (id: string) => Promise<void>;
-  onOpenIncident: (id: string) => Promise<void>;
-  onPageChange: (page: number) => void;
 }) {
   const [windowDays, setWindowDays] = useState(14);
-  const [pendingAnalyzeID, setPendingAnalyzeID] = useState('');
+  const [recurrence, setRecurrence] = useState<RecurrenceStats | null>(null);
   const analytics = useMemo(
     () => buildAnalysisAnalytics(allRecords, incidents, alerts, windowDays),
     [allRecords, alerts, incidents, windowDays],
   );
-  const recentRecords = useMemo(
-    () => records.filter((record) => isWithinWindow(record.createdAt, windowDays, analytics.anchorDate)),
-    [analytics.anchorDate, records, windowDays],
+  const recurringIncidentRows = useMemo(
+    () => buildRecurringIncidentRows(incidents, alerts, windowDays, analytics.anchorDate),
+    [alerts, analytics.anchorDate, incidents, windowDays],
   );
   const completed = allRecords.filter((record) => record.analysisStatus === 'complete').length;
   const highQuality = allRecords.filter((record) => record.quality === 'high').length;
-  const runAnalyze = async (incidentID: string) => {
-    if (pendingAnalyzeID) return;
-    setPendingAnalyzeID(incidentID);
-    try {
-      await onAnalyze(incidentID);
-    } finally {
-      setPendingAnalyzeID('');
-    }
-  };
+  const topQuality = analytics.breakdown.analysisQuality[0];
+  const topQueue = analytics.breakdown.topQueues[0];
+  const topNamespace = analytics.breakdown.topNamespaces[0];
+  const topProject = analytics.breakdown.topProjects[0];
+  const totalAnalyses = analytics.breakdown.analysisQuality.reduce((sum, item) => sum + item.count, 0);
+  const analysisStatCards = [
+    { label: 'Severity warning', value: analytics.breakdown.incidentSeverity.find((item) => item.key === 'warning')?.count ?? 0, total: analytics.summary.totalIncidents, detail: 'incidents' },
+    { label: 'Severity critical', value: analytics.breakdown.incidentSeverity.find((item) => item.key === 'critical')?.count ?? 0, total: analytics.summary.totalIncidents, detail: 'incidents' },
+    { label: 'Analysis quality', value: topQuality?.count ?? 0, total: totalAnalyses, detail: topQuality?.key || 'no data' },
+    { label: 'Top queue', value: topQueue?.count ?? 0, total: analytics.summary.totalAlerts, detail: topQueue?.key || 'no data' },
+    { label: 'Top namespace', value: topNamespace?.count ?? 0, total: analytics.summary.totalAlerts, detail: topNamespace?.key || 'no data' },
+    { label: 'Top project', value: topProject?.count ?? 0, total: analytics.summary.totalAlerts, detail: topProject?.key || 'no data' },
+  ];
+  useEffect(() => {
+    let cancelled = false;
+    fetchRecurrenceStats(windowDays)
+      .then((stats) => {
+        if (!cancelled) setRecurrence(stats);
+      })
+      .catch(() => {
+        if (!cancelled) setRecurrence(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [windowDays]);
 
   return (
     <>
@@ -1368,7 +1671,7 @@ function AnalysisDashboard({
           <PipelineStep
             key={agent}
             agent={agent}
-            title={`${agentLabel(agent)} Collector`}
+            title={agentLabel(agent)}
             status={dominantCapability(allRecords, agent)}
           />
         ))}
@@ -1380,118 +1683,27 @@ function AnalysisDashboard({
         />
       </section>
 
-      <section className="analysis-focus-grid">
-        <section className="panel view-panel recent-analysis-panel">
-          <PanelHeader title="Recent analyses" count={page.total === recentRecords.length ? recentRecords.length : `${recentRecords.length} / ${page.total}`} />
-          <div className="analysis-list">
-            {recentRecords.map((record) => {
-              const alertID = record.alertID;
-              const incidentID = record.incidentID;
-              return (
-                <article className="analysis-card" key={record.id}>
-                  <div className="analysis-card-head">
-                    <div>
-                      <div className="section-title compact-title">
-                        <ListChecks size={18} />
-                        <span>{record.title}</span>
-                        <span className={`source-pill source-${analysisSourceClass(record.source)}`}>
-                          {sourceLabel(record.source)}
-                        </span>
-                      </div>
-                      <div className="meta-line">
-                        <span>{record.alertID || record.id}</span>
-                        <span>{record.target}</span>
-                        <Severity value={record.severity} />
-                        <Status value={record.analysisStatus} />
-                      </div>
-                    </div>
-                    <strong className={`quality quality-${record.quality || 'pending'}`}>{record.quality || 'pending'}</strong>
-                  </div>
-
-                  <p className="analysis-summary">
-                    {record.summary ||
-                      (record.isAnalyzing
-                        ? 'Analysis is running. Waiting for new RCA output.'
-                        : 'Analysis has not produced a summary yet.')}
-                  </p>
-
-                  <div className="coverage-strip">
-                    {COMPONENT_AGENT_ORDER.map((agent) => (
-                      <span className={`coverage-pill coverage-${record.capabilities[agent] || 'pending'}`} key={agent}>
-                        {agentIcon(agent)}
-                        <span className="coverage-label">{agentLabel(agent)}</span>
-                        <strong>{statusLabel(record.capabilities[agent] || 'pending')}</strong>
-                      </span>
-                    ))}
-                  </div>
-
-                  <div className="analysis-grid">
-                    <span>Artifacts <strong>{record.artifactCount}</strong></span>
-                    <span>Similar <strong>{record.similarCount}</strong></span>
-                    <span>Feedback <strong>{record.positiveFeedback}/{record.negativeFeedback}</strong></span>
-                    <span>Comments <strong>{record.commentCount}</strong></span>
-                  </div>
-
-                  {(record.missingData.length > 0 || record.warnings.length > 0) && (
-                    <div className="analysis-flags">
-                      {record.missingData.slice(0, 3).map((item) => (
-                        <span key={`missing-${record.id}-${item}`}>{item}</span>
-                      ))}
-                      {record.warnings.slice(0, 3).map((item) => (
-                        <span key={`warning-${record.id}-${item}`}>{item}</span>
-                      ))}
-                    </div>
-                  )}
-
-                  <div className="analysis-actions">
-                    <span>{formatTime(record.createdAt)}</span>
-                    <div>
-                      {alertID && (
-                        <button className="ghost-button" onClick={() => void onOpenAlert(alertID)} type="button">
-                          <FileText size={16} /> Open report
-                        </button>
-                      )}
-                      {incidentID && (
-                        <button className="ghost-button" onClick={() => void onOpenIncident(incidentID)} type="button">
-                          <ArrowLeft size={16} /> Incident
-                        </button>
-                      )}
-                      {incidentID && (
-                        <button
-                          className={`primary-button ${pendingAnalyzeID === incidentID ? 'is-busy' : ''}`}
-                          disabled={Boolean(pendingAnalyzeID)}
-                          onClick={() => void runAnalyze(incidentID)}
-                          type="button"
-                        >
-                          <Bot size={16} /> {pendingAnalyzeID === incidentID ? 'Re-analyzing...' : 'Re-analyze'}
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                </article>
-              );
-            })}
-            {loading && <p className="empty">Loading analysis...</p>}
-            {!loading && totalCount === 0 && <p className="empty">No analysis records have been created yet.</p>}
-            {!loading && totalCount > 0 && recentRecords.length === 0 && <p className="empty">No analyses match the selected time window or search.</p>}
-          </div>
-          <PaginationControls page={page} disabled={loading} onPageChange={onPageChange} />
+      <section className="analysis-trend-row">
+        <section className="analysis-stat-grid" aria-label="Analysis summary">
+          {analysisStatCards.map((card) => (
+            <article className="analysis-stat-card" key={card.label}>
+              <span>{card.label}</span>
+              <strong><b>{card.value}</b><em>/{card.total}</em></strong>
+              <small>{card.detail}</small>
+            </article>
+          ))}
         </section>
-
-        <div className="analysis-focus-side">
-          <TrendLineChart points={analytics.series} />
-          <div className="analysis-side-stack">
-            <DistributionBars title="Incident severity" items={analytics.breakdown.incidentSeverity} />
-            <DistributionBars title="Analysis quality" items={analytics.breakdown.analysisQuality} />
-          </div>
-        </div>
+        <TrendLineChart points={analytics.series} />
       </section>
 
-      <section className="analysis-insight-grid">
-        <TopDimensionList title="Top queues" items={analytics.breakdown.topQueues} />
-        <TopDimensionList title="Top namespaces" items={analytics.breakdown.topNamespaces} />
-        <TopDimensionList title="Top projects" items={analytics.breakdown.topProjects} />
-        <AnalysisReadiness records={allRecords} />
+      <section className="analysis-focus-grid">
+        <AgentStatePanel agents={agents} synthesis={synthesis} />
+
+        <div className="analysis-focus-side">
+          <div className="analysis-side-stack">
+            <RecurrencePanel rows={recurringIncidentRows} stats={recurrence} />
+          </div>
+        </div>
       </section>
     </>
   );
@@ -1516,13 +1728,76 @@ function TrendLineChart({ points }: { points: TrendPoint[] }) {
           <TrendChartCanvas points={points} maxValue={maxValue} yTicks={yTicks} />
         </Suspense>
       </div>
-      <div className="trend-bars" style={{ gridTemplateColumns: `repeat(${points.length}, minmax(0, 1fr))` }}>
-        {points.map((point) => (
-          <div className="trend-bar-group" key={point.date} title={`${point.date}: ${point.incidents} incidents, ${point.alerts} alerts`}>
-            <span style={{ height: point.incidents ? `${Math.max((point.incidents / maxValue) * 100, 8)}%` : '0%' }} />
-            <span style={{ height: point.alerts ? `${Math.max((point.alerts / maxValue) * 100, 8)}%` : '0%' }} />
+    </section>
+  );
+}
+
+function AgentStatePanel({ agents, synthesis }: { agents: AgentSummary[]; synthesis: SynthesisSummary }) {
+  const rows = [
+    ...agents.map((agent) => ({
+      id: agent.id,
+      agent: agent.agent,
+      name: agent.name,
+      status: agent.status,
+      lastRun: agent.lastRun,
+    })),
+    {
+      id: synthesis.id,
+      agent: ANALYSIS_AGENT_ID,
+      name: 'Analysis Agent',
+      status: synthesis.status,
+      lastRun: synthesis.lastRun,
+    },
+  ];
+  const readyCount = rows.filter((row) => normalizeAgentStatus(row.status) === 'ok').length;
+
+  return (
+    <section className="agent-state-panel">
+      <div className="panel-header compact-panel-header">
+        <h3>Agent state</h3>
+        <span>{readyCount}/{rows.length}</span>
+      </div>
+      <div className="agent-state-list">
+        {rows.map((row) => (
+          <div className="agent-state-row" key={row.id}>
+            <div className="agent-state-name">
+              <span className="agent-state-icon" aria-hidden="true">{agentIcon(row.agent)}</span>
+              <strong>{row.name}</strong>
+            </div>
+            <span className={`agent-health agent-health-${agentHealthState(row.status)}`}>{agentHealthState(row.status)}</span>
+            <time>{formatTime(row.lastRun)}</time>
           </div>
         ))}
+      </div>
+    </section>
+  );
+}
+
+function agentHealthState(value: string) {
+  const status = normalizeAgentStatus(value);
+  if (status === 'analyzing') return 'analyzing';
+  return status === 'ok' || status === 'partial' ? 'normal' : 'abnormal';
+}
+
+function RecurrencePanel({ rows, stats }: { rows: RecurringIncidentRow[]; stats: RecurrenceStats | null }) {
+  return (
+    <section className="recurrence-panel">
+      <div className="panel-header compact-panel-header">
+        <h3>Recurring incidents</h3>
+        <span>{stats ? `${Math.round(stats.rate * 100)}%` : '-'}</span>
+      </div>
+      <div className="recurrence-leaderboard">
+        {rows.map((item) => (
+          <div className="recurrence-row" key={item.id}>
+            <div>
+              <strong>{item.title}</strong>
+              <span>{item.meta}</span>
+            </div>
+            <b>+{item.delta}</b>
+            <i className={item.delta > 0 ? 'is-up' : 'is-down'} aria-hidden="true" />
+          </div>
+        ))}
+        {rows.length === 0 && <p className="empty compact-empty">No recurrence data</p>}
       </div>
     </section>
   );
@@ -1552,7 +1827,7 @@ function TopDimensionList({ title, items }: { title: string; items: Distribution
     <section className="top-dimension-panel">
       <div className="compact-panel-title">{title}</div>
       <div className="top-dimension-list">
-        {items.map((item) => (
+        {items.slice(0, 6).map((item) => (
           <div key={item.key || 'unknown'}>
             <span>{item.key || 'unknown'}</span>
             <strong>{item.count}</strong>
@@ -1599,8 +1874,8 @@ function PipelineStep({
 }) {
   return (
     <article className={`pipeline-step ${synthesis ? 'synthesis-step' : ''}`}>
-      {agentIcon(agent)}
-      <div>
+      <span className="pipeline-icon" aria-hidden="true">{agentIcon(agent)}</span>
+      <div className="pipeline-copy">
         <strong>{title}</strong>
         <Status value={status || 'pending'} />
       </div>
@@ -1678,11 +1953,24 @@ function AgentsRegistry({
   );
 }
 
+function metricIconFor(label: string) {
+  const normalized = label.toLowerCase();
+  if (normalized.includes('resolved')) return CheckCircle2;
+  if (normalized.includes('analyzing')) return Activity;
+  if (normalized.includes('total') || normalized.includes('groups')) return ListChecks;
+  if (normalized.includes('open') || normalized.includes('firing')) return AlertTriangle;
+  return Activity;
+}
+
 function Metric({ label, value }: { label: string; value: string | number }) {
+  const Icon = metricIconFor(label);
   return (
     <div className="metric">
-      <span>{label}</span>
-      <strong>{value}</strong>
+      <span className="metric-icon" aria-hidden="true"><Icon size={17} /></span>
+      <span className="metric-copy">
+        <strong>{value}</strong>
+        <span>{label}</span>
+      </span>
     </div>
   );
 }
@@ -1708,10 +1996,9 @@ function PaginationControls({
   const limit = Math.max(1, page.limit || DASHBOARD_PAGE_SIZE);
   const currentPage = Math.floor(page.offset / limit);
   const totalPages = Math.max(1, Math.ceil(page.total / limit));
-  const start = page.total === 0 ? 0 : page.offset + 1;
-  const end = Math.min(page.offset + limit, page.total);
   const canGoPrevious = currentPage > 0;
   const canGoNext = page.has_more && currentPage < totalPages - 1;
+  const pages = Array.from({ length: totalPages }, (_, index) => index);
 
   if (page.total <= limit && currentPage === 0) {
     return null;
@@ -1719,27 +2006,38 @@ function PaginationControls({
 
   return (
     <div className="pagination-bar">
-      <span>{start}-{end} / {page.total}</span>
-      <div>
+      <button
+        className="pagination-arrow"
+        disabled={disabled || !canGoPrevious}
+        onClick={() => onPageChange(currentPage - 1)}
+        type="button"
+        aria-label="Previous page"
+      >
+        <ChevronLeft size={18} />
+      </button>
+      <div className="pagination-pages">
+        {pages.map((pageIndex) => (
+          <button
+            aria-current={pageIndex === currentPage ? 'page' : undefined}
+            className={`pagination-page ${pageIndex === currentPage ? 'active' : ''}`}
+            disabled={disabled}
+            key={pageIndex}
+            onClick={() => onPageChange(pageIndex)}
+            type="button"
+          >
+            {pageIndex + 1}
+          </button>
+        ))}
+      </div>
         <button
-          className="icon-button compact-icon-button"
-          disabled={disabled || !canGoPrevious}
-          onClick={() => onPageChange(currentPage - 1)}
-          type="button"
-          aria-label="Previous page"
-        >
-          <ChevronLeft size={16} />
-        </button>
-        <button
-          className="icon-button compact-icon-button"
+          className="pagination-arrow"
           disabled={disabled || !canGoNext}
           onClick={() => onPageChange(currentPage + 1)}
           type="button"
           aria-label="Next page"
         >
-          <ChevronRight size={16} />
+          <ChevronRight size={18} />
         </button>
-      </div>
     </div>
   );
 }
@@ -1839,6 +2137,7 @@ function UnifiedWorkspace({
   const capabilities = incident?.capabilities ?? alert?.capabilities ?? {};
   const missingData = incident?.missing_data ?? alert?.missing_data ?? [];
   const warnings = incident?.warnings ?? alert?.warnings ?? [];
+  const tokenUsage = incident?.token_usage;
   const analysis = incident?.analysis_detail ?? alert?.analysis_detail;
   const summary = incident?.analysis_summary ?? alert?.analysis_summary;
   const isAnalyzing = Boolean(detail.data.is_analyzing);
@@ -1862,11 +2161,19 @@ function UnifiedWorkspace({
             <span className="entity-id">{id}</span>
             <span>{targetLine(labels)}</span>
             <Severity value={detail.data.severity} />
+            <span>Incident status</span>
             <Status value={detail.data.status} analyzing={detail.data.is_analyzing} />
+            {incident && (
+              <>
+                <span>Final decision</span>
+                <FinalDecision approvedAt={incident.user_approved_at} />
+              </>
+            )}
           </div>
           <div className="meta-line meta-time">
             <span>Fired: {formatTime(detail.data.fired_at)}</span>
-            <span>Resolved: {detail.data.resolved_at ? formatTime(detail.data.resolved_at) : '—'}</span>
+            <span>Alertmanager resolved: {detail.data.resolved_at ? formatTime(detail.data.resolved_at) : '—'}</span>
+            {incident && <span>User approved: {incident.user_approved_at ? formatTime(incident.user_approved_at) : '—'}</span>}
           </div>
           <AffectedPods pods={affectedPods} />
         </div>
@@ -1891,12 +2198,20 @@ function UnifiedWorkspace({
                 <Bot size={16} /> {busyAction === 'analyze' ? 'Analyzing...' : 'Analyze'}
               </button>
               <button
+                className={`ghost-button ${busyAction === 'export' ? 'is-busy' : ''}`}
+                disabled={Boolean(busyAction)}
+                onClick={() => void runWorkspaceAction('export', () => exportIncidentDocx(incident))}
+                type="button"
+              >
+                <Download size={16} /> {busyAction === 'export' ? 'Exporting...' : 'Export'}
+              </button>
+              <button
                 className={`primary-button ${busyAction === 'resolve' ? 'is-busy' : ''}`}
                 disabled={Boolean(busyAction)}
                 onClick={() => void runWorkspaceAction('resolve', () => onResolve(incident.incident_id))}
                 type="button"
               >
-                <CheckCircle2 size={16} /> {busyAction === 'resolve' ? 'Updating...' : incident.status === 'resolved' ? 'Reopen' : 'Resolve'}
+                <CheckCircle2 size={16} /> {busyAction === 'resolve' ? 'Updating...' : incident.user_approved_at ? 'Unapprove' : 'Approve'}
               </button>
             </>
           )}
@@ -1949,7 +2264,7 @@ function UnifiedWorkspace({
         </section>
 
         {incident ? (
-          <SimilarIncidentsPanel items={similarIncidents} />
+          <SimilarIncidentsPanel items={similarIncidents} recentCount={incident.similar_recent_count ?? 0} />
         ) : (
           alert && <RelatedIncidentPanel alert={alert} onOpenIncident={onOpenIncident} />
         )}
@@ -1982,8 +2297,8 @@ function UnifiedWorkspace({
           </div>
         </section>
 
-        {(missingData.length > 0 || warnings.length > 0) && (
-          <DiagnosticsPanel missingData={missingData} warnings={warnings} />
+        {(missingData.length > 0 || warnings.length > 0 || tokenUsage) && (
+          <DiagnosticsPanel missingData={missingData} warnings={warnings} tokenUsage={tokenUsage} />
         )}
 
         <FeedbackPanel
@@ -2043,9 +2358,10 @@ function RelatedIncidentPanel({
   );
 }
 
-function DiagnosticsPanel({ missingData, warnings }: { missingData: string[]; warnings: string[] }) {
+function DiagnosticsPanel({ missingData, warnings, tokenUsage }: { missingData: string[]; warnings: string[]; tokenUsage?: Record<string, unknown> }) {
   return (
     <section className="diagnostics">
+      {tokenUsage && <div className="token-usage">LLM tokens: {formatTokenUsage(tokenUsage)}</div>}
       {missingData.length > 0 && <DiagnosticGroup title="Missing Data" items={missingData} tone="missing" />}
       {warnings.length > 0 && <DiagnosticGroup title="Warnings" items={warnings} tone="warning" />}
     </section>
@@ -2086,7 +2402,7 @@ function DiagnosticGroup({
   );
 }
 
-function SimilarIncidentsPanel({ items }: { items: SimilarIncident[] }) {
+function SimilarIncidentsPanel({ items, recentCount }: { items: SimilarIncident[]; recentCount: number }) {
   const visibleItems = useMemo(
     () =>
       [...items]
@@ -2099,7 +2415,10 @@ function SimilarIncidentsPanel({ items }: { items: SimilarIncident[] }) {
   );
   return (
     <section className="similar-panel">
-      <div className="section-title"><Search size={18} /> Similar Incidents</div>
+      <div className="section-title">
+        <Search size={18} /> Similar Incidents
+        <span className="similar-recent-badge">Recent 7d {recentCount}</span>
+      </div>
       {visibleItems.length === 0 ? (
         <p className="empty">No similar incident memory yet.</p>
       ) : (
@@ -3239,6 +3558,49 @@ function buildAnalysisAnalytics(
   };
 }
 
+function buildRecurringIncidentRows(
+  incidents: Incident[],
+  alerts: AlertRecord[],
+  windowDays: number,
+  anchorDate: Date,
+): RecurringIncidentRow[] {
+  const incidentsByID = new Map(incidents.map((incident) => [incident.incident_id, incident]));
+  const grouped = new Map<string, { id: string; title: string; occurrences: number; alerts: number; similar: number; latest: string }>();
+  for (const alert of alerts) {
+    if (!isActiveWithinWindow(alert.fired_at, alert.resolved_at ?? '', alert.status, windowDays, anchorDate)) continue;
+    const incident = incidentsByID.get(alert.incident_id);
+    const id = alert.incident_id || alert.alert_id;
+    const row = grouped.get(id) ?? {
+      id,
+      title: incident?.title || alert.alarm_title,
+      occurrences: 0,
+      alerts: 0,
+      similar: 0,
+      latest: alert.fired_at,
+    };
+    row.occurrences += alertOccurrenceCount(alert);
+    row.alerts++;
+    row.similar += alert.similar_incidents?.length || 0;
+    if (alert.fired_at > row.latest) row.latest = alert.fired_at;
+    grouped.set(id, row);
+  }
+  return [...grouped.values()]
+    .map((row) => {
+      const recurrenceCount = Math.max(0, row.occurrences - row.alerts);
+      const increase = Math.max(recurrenceCount, row.similar);
+      return {
+        id: row.id,
+        title: row.title,
+        meta: `${increase} recurrence${increase === 1 ? '' : 's'}`,
+        score: row.occurrences + row.similar,
+        delta: increase,
+      };
+    })
+    .filter((row) => row.delta > 0)
+    .sort((a, b) => b.delta - a.delta || b.score - a.score || a.title.localeCompare(b.title))
+    .slice(0, 5);
+}
+
 function buildDailySeries(
   incidents: Incident[],
   alerts: AlertRecord[],
@@ -3510,6 +3872,10 @@ function Status({ value, analyzing = false }: { value: string; analyzing?: boole
   return <span className={`status status-${displayValue}`}>{label}</span>;
 }
 
+function FinalDecision({ approvedAt }: { approvedAt?: string | null }) {
+  return <span className={`status ${approvedAt ? 'status-resolved' : 'status-pending'}`}>{approvedAt ? 'approved' : 'pending'}</span>;
+}
+
 function targetLine(labels: Record<string, string>) {
   const project = projectNameFromLabels(labels);
   const namespace = labels.namespace || labels.kubernetes_namespace || '';
@@ -3546,7 +3912,6 @@ const KST_FORMAT = new Intl.DateTimeFormat('sv-SE', {
   day: '2-digit',
   hour: '2-digit',
   minute: '2-digit',
-  second: '2-digit',
   hour12: false,
 });
 
@@ -3554,7 +3919,32 @@ function formatTime(value: string) {
   if (!value) return '-';
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-  return `${KST_FORMAT.format(date).replace(',', '')} KST`;
+  return KST_FORMAT.format(date).replace(',', '');
+}
+
+function trashDaysRemaining(deletedAt?: string | null) {
+  if (!deletedAt) return 30;
+  const deleted = new Date(deletedAt).getTime();
+  if (Number.isNaN(deleted)) return 30;
+  const expires = deleted + 30 * 24 * 60 * 60 * 1000;
+  return Math.max(0, Math.ceil((expires - Date.now()) / (24 * 60 * 60 * 1000)));
+}
+
+function formatTokenUsage(usage: Record<string, unknown>) {
+  const total = numberField(usage.total_tokens);
+  const prompt = numberField(usage.prompt_tokens);
+  const completion = numberField(usage.completion_tokens);
+  const calls = numberField(usage.calls);
+  return [
+    total !== undefined ? `${total} total` : undefined,
+    prompt !== undefined ? `${prompt} prompt` : undefined,
+    completion !== undefined ? `${completion} completion` : undefined,
+    calls !== undefined ? `${calls} call${calls === 1 ? '' : 's'}` : undefined,
+  ].filter(Boolean).join(' · ') || 'recorded';
+}
+
+function numberField(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
 function agentLabel(agent: string) {
