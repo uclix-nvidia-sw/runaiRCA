@@ -151,12 +151,19 @@ kubectl create secret generic runai-rca-secrets \
   --from-literal=POSTGRES_DSN='postgres://user:password@postgres.example.com:5432/runai_rca?sslmode=require' \
   --from-literal=RUNAI_DB_DSN='<optional: read-only DSN for the Run:ai control-plane Postgres, enables the postgres drill-down>' \
   --from-literal=SLACK_BOT_TOKEN='<optional: xoxb- bot token, chat:write>' \
-  --from-literal=SLACK_CHANNEL_ID='<optional: channel for incident-analysis summaries>'
+  --from-literal=SLACK_CHANNEL_ID='<optional: channel for incident-analysis summaries>' \
+  --from-literal=SLACK_APP_TOKEN='<optional: xapp- app token, connections:write, for the Re-analyze button>'
 ```
 
-`RUNAI_DB_DSN`과 두 개의 `SLACK_*` 키는 선택 사항입니다 — 이들을 생략하면 각각 플랫폼 DB
+`RUNAI_DB_DSN`과 세 개의 `SLACK_*` 키는 선택 사항입니다 — 이들을 생략하면 각각 플랫폼 DB
 드릴다운과 Slack 알림이 비활성화됩니다. Slack에서 "Open Incident" 링크를 사용하려면
 `backend.env.dashboardUrl`도 설정해야 합니다.
+
+> **실제 토큰 값을 절대 커밋하지 마세요.** 모든 시크릿은 이 Kubernetes Secret(또는
+> `secrets.existingSecret`으로 직접 만든 Secret)에만 넣으세요 — `SLACK_APP_TOKEN`(`xapp-`),
+> `SLACK_BOT_TOKEN`(`xoxb-`), API 키, DSN 모두. 차트의 `values.yaml`에 있는 `secrets.*`
+> 값은 기본이 빈 문자열이며 Git에서는 빈 상태로 유지해야 합니다. 실제 토큰은 클러스터
+> Secret에만 두고, 커밋되는 파일에는 절대 넣지 않습니다.
 
 `--namespace runai-rca --create-namespace`로 해당 네임스페이스에 설치하거나, 위 네임스페이스를
 릴리스 네임스페이스로 교체하세요. 서로 다른 Secret 키 이름을 사용한다면 `secrets.keys.*`를
