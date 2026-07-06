@@ -57,12 +57,14 @@ def make_settings() -> Settings:
         loki_query_limit=10,
         loki_mcp_url="",
         runai_log_namespaces=("runai", "runai-backend"),
+        collectors=("runai", "kubernetes", "postgres", "prometheus", "loki", "system", "change"),
         postgres_dsn="",
         runai_db_dsn="",
         architecture_file="knowledge/runai_architecture.yaml",
         postgres_timeout_seconds=1,
         troubleshooting_cases_file="knowledge/troubleshooting_cases.md",
         failure_modes_file="knowledge/failure_modes.yaml",
+        families_file="knowledge/families.yaml",
         runai_alerts_file="knowledge/runai_alerts_catalog.yaml",
         runai_known_issues_file="knowledge/runai_known_issues.yaml",
         enable_system_agent=False,
@@ -120,6 +122,17 @@ def make_target() -> AnalysisTarget:
         severity="warning",
         alert_name="RunAIWorkloadPending",
     )
+
+
+def test_orchestrator_uses_configured_collectors() -> None:
+    orchestrator = AnalysisOrchestrator(
+        replace(make_settings(), collectors=("kubernetes", "loki"))
+    )
+
+    assert [c.__class__.__name__ for c in orchestrator._collectors] == [
+        "KubernetesCollector",
+        "LokiCollector",
+    ]
 
 
 def test_resolve_target_derives_project_from_runai_namespace() -> None:

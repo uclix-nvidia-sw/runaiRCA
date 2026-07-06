@@ -91,12 +91,14 @@ class Settings:
     loki_query_limit: int
     loki_mcp_url: str
     runai_log_namespaces: tuple[str, ...]
+    collectors: tuple[str, ...]
     postgres_dsn: str
     postgres_timeout_seconds: int
     runai_db_dsn: str
     troubleshooting_cases_file: str
     architecture_file: str
     failure_modes_file: str
+    families_file: str
     runai_alerts_file: str
     runai_known_issues_file: str
     enable_system_agent: bool
@@ -191,6 +193,10 @@ def load_settings() -> Settings:
         loki_query_limit=max(1, _int_env("LOKI_QUERY_LIMIT", 20)),
         loki_mcp_url=os.getenv("LOKI_MCP_URL", "").strip().rstrip("/"),
         runai_log_namespaces=_csv_env("RUNAI_LOG_NAMESPACES", ("runai", "runai-backend")),
+        collectors=_csv_env(
+            "COLLECTORS",
+            ("runai", "kubernetes", "postgres", "prometheus", "loki", "system", "change"),
+        ),
         postgres_dsn=os.getenv("POSTGRES_DSN", "").strip(),
         postgres_timeout_seconds=_int_env("POSTGRES_TIMEOUT_SECONDS", 60),
         # Optional DSN for the Run:ai control-plane Postgres (the platform's own
@@ -213,6 +219,10 @@ def load_settings() -> Settings:
         failure_modes_file=os.getenv(
             "FAILURE_MODES_FILE",
             "knowledge/failure_modes.yaml",
+        ).strip(),
+        families_file=os.getenv(
+            "FAMILIES_FILE",
+            "knowledge/families.yaml",
         ).strip(),
         runai_alerts_file=os.getenv(
             "RUNAI_ALERTS_FILE",

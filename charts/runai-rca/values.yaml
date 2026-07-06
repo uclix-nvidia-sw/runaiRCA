@@ -292,6 +292,7 @@ agent:
     runaiVersionPath: /api/v1/version
     runaiTimeoutSeconds: 120
     runaiLogNamespaces: runai,runai-backend
+    collectors: runai,kubernetes,postgres,prometheus,loki,system,change
     prometheusUrl: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
     prometheusTimeoutSeconds: 120
     prometheusMcpUrl: ""
@@ -302,6 +303,7 @@ agent:
     postgresTimeoutSeconds: 60
     typedbTimeoutSeconds: 60
     troubleshootingCasesFile: knowledge/troubleshooting_cases.md
+    familiesFile: knowledge/families.yaml
     agentSoulsFile: prompts/agent_souls.md
     maskingRegexListJson: "[]"
     builtinRedactionEnabled: true

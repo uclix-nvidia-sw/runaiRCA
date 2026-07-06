@@ -16,12 +16,7 @@ from uuid import uuid4
 from pydantic import BaseModel
 
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, resolve_target
-from app.collectors.kubernetes import KubernetesCollector
-from app.collectors.loki import LokiCollector
-from app.collectors.postgres import PostgresCollector
-from app.collectors.prometheus import PrometheusCollector
-from app.collectors.runai import RunAICollector
-from app.collectors.system import SystemCollector
+from app.collectors.registry import build_collectors
 from app.config import Settings
 from app.knowledge import (
     component_check_lines,
@@ -164,21 +159,7 @@ class AnalysisOrchestrator:
         self._settings = settings
         self._masker = _build_settings_masker(settings)
         self._nat = NemoWorkflowRunner(settings)
-        self._collectors = [
-            RunAICollector(settings),
-            KubernetesCollector(settings),
-            PostgresCollector(settings),
-            PrometheusCollector(settings),
-            LokiCollector(settings),
-            SystemCollector(settings),
-        ]
-        # Optional change/timeline capability agent — probe-able tool once it exists.
-        try:
-            from app.collectors.change import ChangeCollector
-        except ImportError:
-            pass
-        else:
-            self._collectors.append(ChangeCollector(settings))
+        self._collectors = build_collectors(settings)
 
     async def analyze(self, request: AlertAnalysisRequest) -> AlertAnalysisResponse:
         """Run one analysis under an overall hard deadline.

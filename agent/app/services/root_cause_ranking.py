@@ -17,85 +17,16 @@ detail parsing (or an LLM judge) only if the eval hit-rate stalls.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 
 from app.collectors.base import AnalysisTarget, CollectorResult
+from app.knowledge import load_family_catalog
 
-# Families, ordered; insufficient_evidence is the explicit fallback (R6), not scored.
-FAMILIES = (
-    "node_kubelet_pressure",
-    "runai_scheduling_quota",
-    "k8s_scheduling_error",
-    "runai_control_plane_error",
-    "k8s_control_plane_error",
-    "workload_startup_error",
-    "image_pull_error",
-)
+_FAMILY_CATALOG = load_family_catalog(os.getenv("FAMILIES_FILE", "knowledge/families.yaml"))
+FAMILIES = _FAMILY_CATALOG.families
 INSUFFICIENT = "insufficient_evidence"
-
-# family -> (canonical agent, relevant agents to scan, keywords)
-_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
-    "node_kubelet_pressure": (
-        "kubernetes",
-        ("kubernetes", "prometheus"),
-        ("diskpressure", "memorypressure", "pidpressure", "node pressure",
-         "evict", "kubelet", "device plugin", "node condition"),
-    ),
-    "runai_scheduling_quota": (
-        "prometheus",
-        ("prometheus", "kubernetes", "runai"),
-        # Run:ai scheduler's OWN decisions: reclaim/preempt/over-quota/fairshare/
-        # gang. NOT the kube-scheduler predicates (those are k8s_scheduling_error).
-        ("preempt", "reclaim", "pod group", "podgroup", "gang", "fairshare",
-         "over-quota", "over quota", "requested gpus", "quota", "idleness"),
-    ),
-    "k8s_scheduling_error": (
-        "kubernetes",
-        ("kubernetes", "prometheus"),
-        # kube-scheduler predicate failures — placement the DEFAULT scheduler can't
-        # satisfy (taint/affinity/selector/topology/ResourceQuota admission).
-        ("failedscheduling", "unschedulable", "untolerated taint",
-         "node affinity/selector", "topology spread", "anti-affinity",
-         "exceeded quota", "default-scheduler", "0/"),
-    ),
-    "runai_control_plane_error": (
-        "loki",
-        ("loki", "kubernetes"),
-        # Run:ai PLATFORM control plane only. No bare "scheduler" (matches the
-        # runai-scheduler pod name in every stream) and no bare "control plane"/
-        # "control-plane" — those coarse tokens over-routed unrelated alerts here.
-        # Keep Run:ai-subsystem-specific phrases so a k8s apiserver/etcd fault lands
-        # in k8s_control_plane_error, not here.
-        ("reconcile", "runai-backend", "cluster-sync",
-         "authorization", "database error"),
-    ),
-    "k8s_control_plane_error": (
-        "kubernetes",
-        ("kubernetes", "loki"),
-        # The Kubernetes cluster's OWN control plane — apiserver/etcd/kube-scheduler/
-        # controller-manager/kubelet certs/admission webhooks. Distinct subsystem
-        # from the Run:ai platform control plane above.
-        ("apiserver", "kube-apiserver", "etcd", "etcdserver", "kube-controller-manager",
-         "kubeadm", "leaderelection", "failed calling webhook", "admission webhook"),
-    ),
-    "workload_startup_error": (
-        "kubernetes",
-        ("kubernetes", "loki"),
-        # The container's OWN startup/config/crash (NOT the image pull — that's
-        # image_pull_error): crashloop, OOM, config/mount/entrypoint, probe.
-        ("crashloopbackoff", "oomkilled", "failedmount", "createcontainer",
-         "back-off restarting", "startup probe", "runcontainererror",
-         "importerror", "permission denied"),
-    ),
-    "image_pull_error": (
-        "kubernetes",
-        ("kubernetes", "loki"),
-        # Getting the IMAGE onto the node: pull backoff, bad tag/manifest, registry
-        # auth/TLS/rate-limit/5xx. A registry problem, not the workload's code.
-        ("imagepullbackoff", "errimagepull", "errimageneverpull", "manifest for",
-         "toomanyrequests", "pull access denied", "no such host", "registry"),
-    ),
-}
+_FAMILY_RULES = _FAMILY_CATALOG.rules
 
 _FLOOR = 2.0          # min top score below which we fall back to insufficient_evidence
 _HIGH = 5.0           # score needed (with >=2 corroborating agents) for high confidence

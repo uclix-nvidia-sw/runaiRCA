@@ -125,6 +125,8 @@ spec:
               value: {{ .Values.agent.env.runaiTimeoutSeconds | quote }}
             - name: RUNAI_LOG_NAMESPACES
               value: {{ .Values.agent.env.runaiLogNamespaces | quote }}
+            - name: COLLECTORS
+              value: {{ .Values.agent.env.collectors | quote }}
             - name: PROMETHEUS_URL
               value: {{ .Values.agent.env.prometheusUrl | quote }}
             - name: PROMETHEUS_TIMEOUT_SECONDS
@@ -143,6 +145,8 @@ spec:
               value: {{ .Values.agent.env.postgresTimeoutSeconds | quote }}
             - name: TROUBLESHOOTING_CASES_FILE
               value: {{ .Values.agent.env.troubleshootingCasesFile | quote }}
+            - name: FAMILIES_FILE
+              value: {{ .Values.agent.env.familiesFile | quote }}
             - name: AGENT_SOULS_FILE
               value: {{ .Values.agent.env.agentSoulsFile | quote }}
             - name: MASKING_REGEX_LIST_JSON
