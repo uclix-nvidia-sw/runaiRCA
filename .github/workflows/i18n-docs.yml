@@ -1,0 +1,30 @@
+name: i18n Docs
+
+# EN (docs/*.md) and KO (docs/ko/*.md) are managed as parallel trees because
+# GitBook's per-page language switcher is a paid feature. This flags drift:
+# missing/orphan translations fail; a Korean page older than its English source
+# is reported as a retranslate TODO. Runs only when docs change.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "README.md"
+      - "scripts/check-i18n.sh"
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "docs/**"
+      - "README.md"
+      - "scripts/check-i18n.sh"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # commit timestamps drive the staleness check
+      - name: Check EN/KO doc parity and freshness
+        run: bash scripts/check-i18n.sh

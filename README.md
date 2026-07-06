@@ -1,3 +1,5 @@
+**🇬🇧 English** · [🇰🇷 한국어](docs/ko/README.md)
+
 # Run:AI RCA
 
 Run:AI RCA is a KubeRCA-inspired incident analysis cockpit for NVIDIA Run:ai

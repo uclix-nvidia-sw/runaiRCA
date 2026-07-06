@@ -1,0 +1,213 @@
+# 구성 레퍼런스
+
+> **관점:** 무엇을 구성할 수 있는가 — 모든 설정을 다룹니다. 일반적인 경로는 README에서 설명합니다.
+> **이 문서에서 다루는 것:** 환경 변수 · Helm 값 · 동작 참고 사항(pgvector, 레닥션).
+
+Run:AI RCA에서 사용할 수 있는 모든 설정입니다. README는 일반적인 경로를 다루며, 이 문서는 전체 레퍼런스입니다.
+
+## 환경 변수
+
+백엔드와 에이전트는 시작 시점에 이 값들을 읽으며, Helm은 아래 값에서 이들을 매핑합니다.
+
+| Variable | Purpose |
+| --- | --- |
+| `PORT` | 백엔드/에이전트 HTTP 포트. Helm은 이를 컴포넌트 서비스 포트에서 매핑합니다 |
+| `AGENT_URL` | 백엔드에서 에이전트로 접근하는 URL. 기본값 `http://localhost:8000` |
+| `AGENT_REQUEST_TIMEOUT_SECONDS` | 에이전트 `/analyze` 및 `/chat` 요청에 대한 백엔드 타임아웃. 기본값 `1560`(에이전트의 `ANALYSIS_DEADLINE_SECONDS`보다 커야 합니다) |
+| `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | 운영자가 직접 트리거한 에이전트 `/analyze` 요청에 대한 백엔드 타임아웃. 기본값 `1560` |
+| `SLACK_BOT_TOKEN` | 백엔드 Slack 봇 토큰(`xoxb-`, `chat:write` 스코프, 채널에 초대된 봇). 인시던트 분석 알림을 활성화하려면 `SLACK_CHANNEL_ID`와 함께 설정합니다. incoming webhook이 아니라 봇 토큰이 필요한 이유는 `chat.postMessage`가 재분석 스레딩에 사용되는 `ts`를 반환하기 때문입니다. 차트 시크릿 키 `slackBotToken` |
+| `SLACK_CHANNEL_ID` | 백엔드가 인시던트 분석 요약을 게시하는 채널. 차트 시크릿 키 `slackChannelId` |
+| `SLACK_APP_TOKEN` | 선택 사항인 앱 레벨 토큰(`xapp-`, `connections:write` 스코프). 메시지 내 Re-analyze 버튼을 활성화합니다. 클릭은 Socket Mode(아웃바운드 WebSocket)로 전달되므로 공개 엔드포인트가 필요 없습니다. Slack 앱 설정에서 Socket Mode와 Interactivity를 켜야 합니다. 차트 시크릿 키 `slackAppToken` |
+| `DASHBOARD_URL` | 선택 사항인 외부 대시보드 URL. 설정하면 Slack 메시지에 "Open Incident" 딥링크 버튼이 추가됩니다(Helm 값 `backend.env.dashboardUrl`) |
+| `LOG_LEVEL` | 에이전트 로그 레벨. 기본값 `info` |
+| `LANGUAGE` | 백엔드/에이전트 응답 언어. `en` 또는 `ko` |
+| `KUBERNETES_API_URL` | 클러스터 내부 Kubernetes API URL. 기본값 `https://kubernetes.default.svc` |
+| `KUBERNETES_TOKEN_PATH` | 클러스터 내부 Kubernetes 수집을 위한 서비스 계정 토큰 경로 |
+| `KUBERNETES_CA_PATH` | 클러스터 내부 Kubernetes 수집을 위한 서비스 계정 CA 경로 |
+| `KUBERNETES_TIMEOUT_SECONDS` | Kubernetes API 요청 타임아웃 |
+| `KUBERNETES_LIST_LIMIT` | 증거 수집을 위한 Kubernetes 파드/이벤트 목록 페이지 크기. 기본값 `50` |
+| `KUBERNETES_NAMESPACES` | Kubernetes 직접 수집을 위한 선택 사항인 쉼표 구분 네임스페이스 허용 목록 |
+| `KUBERNETES_CLUSTER_SCOPE_ENABLED` | 노드 조회와 같은 클러스터 범위 Kubernetes 호출을 활성화합니다. Helm은 `agent.rbac.clusterWide`를 따릅니다 |
+| `RUNAI_BASE_URL` | Run:ai 컨트롤 플레인 URL |
+| `RUNAI_BEARER_TOKEN` | 선택 사항인 Run:ai bearer 토큰 시크릿 |
+| `RUNAI_CLIENT_ID` | Run:ai 애플리케이션 클라이언트 ID |
+| `RUNAI_CLIENT_SECRET` | Run:ai 애플리케이션 클라이언트 시크릿 |
+| `RUNAI_TOKEN_URL` | Run:ai 클라이언트 자격 증명을 위한 선택 사항인 OAuth 토큰 URL |
+| `RUNAI_WORKLOADS_PATH` | Run:ai 워크로드 API 경로. 기본값 `/api/v1/workloads` |
+| `RUNAI_PROJECTS_PATH` | Run:ai 프로젝트 API 경로. 기본값 `/api/v1/projects` |
+| `RUNAI_QUEUES_PATH` | Run:ai 큐 API 경로. 기본값 `/api/v1/queues` |
+| `RUNAI_VERSION_PATH` | Run:ai 컨트롤 플레인 버전 API 경로. 기본값 `/api/v1/version` — 이미 수정된 알려진 이슈를 버전 기반으로 억제할 수 있게 합니다 |
+| `RUNAI_TIMEOUT_SECONDS` | Run:ai API 요청 타임아웃. 기본값 `120` |
+| `RUNAI_MCP_URL` | 선택 사항인 runai-mcp 사이드카 URL(stdio→HTTP 브리지, 예: `http://localhost:8809/mcp`). 설정하면 runai 수집기와 드릴다운이 426개 Run:ai API를 스펙 인식 방식으로 접근합니다. 실패 시에는 고정 엔드포인트 수집기로 폴백합니다 |
+| `RUNAI_LOG_NAMESPACES` | 쉼표로 구분된 Run:ai 컨트롤 플레인 로그 네임스페이스. 기본값 `runai,runai-backend` |
+| `PROMETHEUS_URL` | Prometheus 기본 URL |
+| `PROMETHEUS_TIMEOUT_SECONDS` | Prometheus 쿼리 타임아웃 |
+| `PROMETHEUS_MCP_URL` | MCP 워크플로용 선택 사항인 원격 Prometheus MCP URL |
+| `LOKI_URL` | Loki 기본 URL. Helm에서는 일반적으로 인증 게이트웨이가 아니라 직접 읽기/쿼리 서비스를 가리켜야 합니다(예: `http://loki-read.monitoring.svc.cluster.local:3100`). |
+| `LOKI_TIMEOUT_SECONDS` | Loki 쿼리 타임아웃 |
+| `LOKI_QUERY_LIMIT` | Loki 쿼리 그룹당 요청하는 최대 로그 라인 수. 기본값 `20` |
+| `LOKI_MCP_URL` | MCP 워크플로용 선택 사항인 원격 Loki MCP URL |
+| `ENABLE_SYSTEM_AGENT` | 노드 인프라 System 수집기(노드별 DaemonSet을 통한 dmesg/journalctl/syslog)를 활성화합니다. 기본값 `true`. `SYSTEM_AGENT_URL`이 설정되지 않으면 `unavailable`로 축소됩니다 |
+| `SYSTEM_AGENT_URL` | 노드별 System 에이전트 DaemonSet 엔드포인트(`GET /logs?source=dmesg\|journal\|syslog`) |
+| `SYSTEM_AGENT_TOKEN` | System 에이전트 엔드포인트용 선택 사항인 bearer 토큰 |
+| `SYSTEM_AGENT_TIMEOUT_SECONDS` | System 에이전트 요청 타임아웃. 기본값 `120` |
+| `ENABLE_POD_EXEC` | Kubernetes 수집기가 읽기 전용 pod-exec를 수행하도록 허용합니다(허용 목록 명령: `nvidia-smi`, …). 기본값 `true` |
+| `POD_EXEC_TIMEOUT_SECONDS` | pod-exec 타임아웃. 기본값 `120` |
+| `DATABASE_URL` | 인시던트, 알림, 임베딩, 피드백, 코멘트, 분석 실행을 저장하는 백엔드 Postgres 저장소 DSN |
+| `DATABASE_CONNECT_TIMEOUT_SECONDS` | 백엔드 Postgres 시작 연결 타임아웃. 기본값 `5` |
+| `POSTGRES_DSN` | 에이전트 Postgres 진단 DSN. Helm에서는 기본적으로 `DATABASE_URL`로 설정됩니다 |
+| `POSTGRES_TIMEOUT_SECONDS` | 에이전트 Postgres 진단 쿼리 타임아웃 |
+| `RUNAI_DB_DSN` | Run:ai 컨트롤 플레인 Postgres에 대한 선택 사항인 읽기 전용 DSN. 설정하면 postgres 에이전트의 드릴다운이 문제 해결 중에 플랫폼 데이터(워크로드, 감사, 클러스터 등)를 `SELECT`할 수 있습니다. READ ONLY 트랜잭션 내의 단일 문장 SELECT입니다. 읽기 전용 DB 역할을 프로비저닝하세요. |
+| `TROUBLESHOOTING_CASES_FILE` | 로컬 알려진 사례/플레이북 마크다운 경로 |
+| `ARCHITECTURE_FILE` | Run:ai 플랫폼 토폴로지 YAML(컴포넌트, depends_on, DB 스키마 소유권). 기본값 `knowledge/runai_architecture.yaml` — 플레이북 점검 경로와 postgres 드릴다운 스키마 힌트를 구동합니다 |
+| `AGENT_SOULS_FILE` | 에이전트 역할 계약 프롬프트 경로. 기본값 `prompts/agent_souls.md` |
+| `MASKING_REGEX_LIST_JSON` | 사용자 정의 레닥션 정규식의 선택 사항인 JSON 배열 |
+| `BUILTIN_REDACTION_ENABLED` | 내장 시크릿 레닥션을 활성화합니다. 기본값 `true` |
+| `BUILTIN_REDACTION_HASH_MODE` | 시크릿을 `[MASKED]` 대신 안정적인 짧은 해시로 대체합니다. 기본값 `false` |
+| `NVIDIA_API_KEY` | NeMo Agent Toolkit 워크플로용 NIM 키 |
+| `LLM_BASE_URL` | LiteLLM NAT 워크플로와 운영자 채팅 코파일럿용 OpenAI 호환 기본 URL |
+| `LLM_MODEL` | OpenAI 호환 모델 이름(예: `auto-router`) |
+| `LLM_API_KEY` | OpenAI 호환 API 키 시크릿. 세 가지 LLM 변수가 모두 설정되면 대화형 채팅 응답이 활성화됩니다 |
+| `LLM_REQUEST_TIMEOUT_SECONDS` | 호출당 LLM 요청 타임아웃(채팅, 추론, 구체화된 NAT 구성). 기본값 `300`, `0` = 무제한 |
+| `ENABLE_NAT_RUNTIME` | 결정론적 인프로세스 폴백 대신 NeMo Agent Toolkit CLI를 통해 RCA 종합을 실행합니다. 기본값 `false` |
+| `NAT_CONFIG_FILE` | 선택 사항인 NeMo 워크플로 구성 경로. 기본값 `configs/runai_rca_workflow.yml` |
+| `NAT_TIMEOUT_SECONDS` | NeMo Agent Toolkit CLI 실행 타임아웃 |
+| `ENABLE_INVESTIGATION_LOOP` | 중앙 LLM 조사 루프: 계획 → 가장 관련성 높은 에이전트 탐색 → 관찰 → 재계획. 기본값 `false`(Helm은 `true`로 설정) |
+| `MAX_INVESTIGATION_STEPS` | 분석당 최대 중앙 조사 스텝 수. 기본값 `12` |
+| `MAX_REANALYSIS_STEPS` | 최상위 원인이 반증된 후 한 번의 재분석 패스를 위한 조사 예산. 기본값 `6` |
+| `ENABLE_AGENT_DRILLDOWN` | 수집기별 자율 드릴다운: 각 증거 에이전트(kubernetes/prometheus/loki/runai)가 자기 도메인의 읽기 전용 도구만으로 자체 제한된 LLM 루프를 실행합니다. 기본값 `false`(Helm은 `true`로 설정) |
+| `DRILLDOWN_MAX_STEPS` | 증거 에이전트당 최대 드릴다운 스텝 수. 기본값 `4` |
+| `ANALYSIS_DEADLINE_SECONDS` | 분석당 전체 하드 상한(초과 시 우아하게 축소된 리포트). 기본값 `1500`(25분), `0` = 상한 없음. 백엔드 `AGENT_REQUEST_TIMEOUT_SECONDS`를 이 값보다 크게 유지하세요. |
+| `MAX_AUTO_ANALYZE_FANOUT` | 백엔드: 웹훅당 시작되는 최대 분석 수. 기본값 `50` |
+| `MAX_CONCURRENT_AGENT_RUNS` | 백엔드: 에이전트에 대해 동시에 실행되는 최대 분석 수. 기본값 `50` |
+| `FLAPPING_GROUP_WINDOW_MINUTES` | 백엔드: 반복되는 알림이 또 다른 발생이 아니라 NEW 인시던트가 되기 전의 정적 구간. 코드 기본값 `120`(Helm은 `360`으로 설정) |
+| `ANALYSIS_BACKFILL_INTERVAL_SECONDS` | 백엔드: RCA를 완료하지 못한 채 남은 알림을 다시 처리하는 주기. 기본값 `300`(`0`은 비활성화) |
+| `ANALYSIS_BACKFILL_BATCH` | 백엔드: 백필 틱당 다시 처리하는 알림 수. 기본값 `10` |
+| `ANALYSIS_BACKFILL_RETRY_COOLDOWN_SECONDS` | 백엔드: 실패한 알림을 재시도하기 전의 쿨다운. 기본값 `900` |
+| `EMBEDDING_URL` | 백엔드: 유사 인시던트 검색을 위한 OpenAI 호환 `/embeddings` 엔드포인트. 비어 있으면 오프라인 피처 해시 폴백(기본값, 어휘 기반) |
+| `EMBEDDING_MODEL` | 백엔드: 임베딩 모델 이름(`EMBEDDING_URL`과 함께 사용) |
+| `EMBEDDING_DIM` | 백엔드: 임베딩 벡터 차원. 기본값 `384`. 모델과 일치해야 하며, 변경하면 기존 행을 다시 임베딩해야 합니다 |
+| `EMBEDDING_API_KEY` | 백엔드: 임베딩 엔드포인트용 API 키(시크릿 키 `embeddingApiKey`) |
+| `ENABLE_TYPEDB` | TypeDB 온톨로지의 마스터 스위치. 기본값 `false`(Helm은 `typedb.enabled`에서 설정하며 기본적으로 켜짐). 연결 변수는 아래에 있으며, 자세한 내용은 [데이터 스토어](DATABASE.md)를 참고하세요 |
+| `TYPEDB_ADDRESS` | TypeDB 서버 주소. 기본값 `localhost:1729`. 클러스터 내부에서는 `<release>-typedb:1729` |
+| `TYPEDB_DATABASE` | TypeDB 데이터베이스 이름. 기본값 `runai_rca` |
+| `TYPEDB_USERNAME` / `TYPEDB_PASSWORD` | TypeDB 자격 증명. 기본값 `admin` / `password`(CE 기본값 — PoC 이후에는 재정의) |
+| `TYPEDB_TLS_ENABLED` | TypeDB 연결에 TLS를 사용합니다. 기본값 `false` |
+| `TYPEDB_TIMEOUT_SECONDS` | TypeDB 쿼리 타임아웃. 기본값 `60` |
+
+기본 배포에서는 Loki를 클러스터 내부 읽기/쿼리 서비스를 통해 쿼리하는 것으로 가정하기 때문에
+Helm 차트는 Loki 자격 증명 값을 노출하지 않습니다.
+배포에서 인증된 외부 Loki 엔드포인트를 호출해야 한다면
+`agent.extraEnv`로 `LOKI_BEARER_TOKEN`, `LOKI_BASIC_USERNAME` / `LOKI_BASIC_PASSWORD`,
+또는 `LOKI_TENANT_ID`를 명시적으로 주입하세요.
+
+NeMo Agent Toolkit 워크플로:
+
+- `agent/configs/runai_rca_workflow.yml`은 NAT `parallel_executor`와 `analysis_agent`
+  RCA 스텝을 통해 컴포넌트 수집기를 실행합니다. 외부 MCP 서버가 필요하지 않습니다.
+- `agent/configs/runai_rca_workflow_mcp.yml`은 해당 서비스를 사용할 수 있는 환경을 위해
+  Prometheus/Loki MCP 클라이언트 그룹과 NIM 기반 Analysis Agent 검토 경로를 추가합니다.
+- `agent/configs/runai_rca_workflow_litellm.yml`은 LiteLLM/OpenAI 호환 Analysis Agent
+  검토 경로를 추가합니다. `ENABLE_NAT_RUNTIME=true`를 설정하고 `NAT_CONFIG_FILE`을 해당
+  구성으로 지정한 뒤, 환경 변수나 Helm Secret 값을 통해 `LLM_BASE_URL`, `LLM_MODEL`,
+  `LLM_API_KEY`를 제공하세요.
+
+LiteLLM/OpenAI 호환 엔드포인트를 위한 Helm 재정의 예시:
+
+```bash
+helm upgrade --install runai-rca charts/runai-rca \
+  --set agent.env.enableNatRuntime=true \
+  --set agent.env.natConfigFile=/app/configs/runai_rca_workflow_litellm.yml \
+  --set-string agent.env.llmBaseUrl=https://litellm.example.com/v1 \
+  --set-string agent.env.llmModel=auto-router \
+  --set-string secrets.llmApiKey='<llm-api-key>'
+```
+
+## Helm 값
+
+자주 조정하는 Helm 값:
+
+| Value | Purpose |
+| --- | --- |
+| `nameOverride` / `fullnameOverride` | 기존 명명 규칙에 맞출 때 생성된 Kubernetes 리소스 이름을 재정의합니다 |
+| `global.imageRegistry` / `imagePullSecrets` | 모든 런타임 이미지에 적용되는 프라이빗 레지스트리 접두사와 pull 시크릿 |
+| `{backend,agent,frontend,postgresql}.image.*` | 컴포넌트별 이미지 리포지토리, 태그, pull 정책. 태그가 비어 있으면 차트 앱 버전으로 기본 설정됩니다 |
+| `{backend,agent,frontend}.replicaCount` | 무상태 런타임 컴포넌트를 스케일링합니다. 번들 Postgres는 레플리카 하나로 유지하세요 |
+| `{backend,agent,frontend,postgresql}.resources` | 프로덕션 스케줄링을 위한 CPU/메모리 requests 및 limits |
+| `backend.env.agentUrl` | 에이전트가 외부 또는 원격에 있을 때 백엔드에서 에이전트로 접근하는 URL을 재정의합니다 |
+| `backend.env.language` / `agent.env.language` | RCA 언어를 `en` 또는 `ko`로 설정합니다 |
+| `backend.env.databaseConnectTimeoutSeconds` / `agentRequestTimeoutSeconds` / `manualAgentRequestTimeoutSeconds` | 백엔드 시작 DB 타임아웃, 자동/채팅 에이전트 타임아웃, 운영자가 트리거한 분석 타임아웃 |
+| `secrets.keys.*` | DB, Run:ai, NVIDIA, LLM 자격 증명에 대한 기존 Secret 키 이름 |
+| `secrets.existingSecret` | Run:ai/NVIDIA/LLM 자격 증명, 그리고 기본적으로 DB 키를 위한 기존 Secret |
+| `secrets.databaseExistingSecret` | `DATABASE_URL` / `POSTGRES_DSN`에만 사용되는 기존 Secret |
+| `postgresql.enabled` / `postgresql.auth.*` | 번들 Postgres를 설치하고 생성된 DSN의 사용자, 비밀번호, 데이터베이스를 설정합니다 |
+| `agent.rbac.clusterWide` | Kubernetes 증거 수집에 ClusterRole을 사용합니다. 기본값 `true` |
+| `agent.rbac.namespaces` | `agent.rbac.clusterWide=false`일 때 Role/RoleBinding을 받는 네임스페이스. 기본값은 릴리스 네임스페이스 |
+| `agent.env.kubernetesNamespaces` | 에이전트 측 Kubernetes 네임스페이스 허용 목록. 비어 있고 `clusterWide=false`이면 Helm이 `agent.rbac.namespaces`에서 유도합니다 |
+| `agent.serviceAccount.annotations` | 워크로드 아이덴티티 통합을 위한 ServiceAccount 어노테이션 |
+| `{backend,frontend,postgresql}.automountServiceAccountToken` | 클러스터 API 접근이 필요 없는 파드의 Kubernetes API 토큰 마운트를 비활성화합니다. 기본값 `false` |
+| `agent.automountServiceAccountToken` | 에이전트 Kubernetes API 토큰 마운트. 직접 Kubernetes 수집이 서비스 계정 토큰을 사용하므로 기본값은 `true` |
+| `agent.env.runaiBaseUrl` / `agent.env.runaiTokenUrl` | Run:ai API와 선택 사항인 OAuth 토큰 엔드포인트. Run:ai HTTP 401을 방지하려면 `secrets.runaiBearerToken` 또는 클라이언트 자격 증명을 제공하세요 |
+| `agent.env.runaiWorkloadsPath`, `runaiProjectsPath`, `runaiQueuesPath` | 서로 다른 Run:ai 버전을 위한 Run:ai API 경로 재정의 |
+| `agent.env.runaiLogNamespaces` | Run:ai 컨트롤 플레인/백엔드 로그의 네임스페이스. 기본값 `runai,runai-backend` |
+| `agent.env.prometheusUrl` | 클러스터 내부 Prometheus URL(예: `http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090`) |
+| `agent.env.lokiUrl` | 클러스터 내부 Loki 쿼리 URL(예: `http://loki-read.monitoring.svc.cluster.local:3100`). 차트는 기본적으로 인증된 `loki-gateway` 경로를 의도적으로 피합니다. |
+| `agent.env.prometheusMcpUrl` / `agent.env.lokiMcpUrl` | MCP 워크플로를 사용할 때의 원격 MCP 엔드포인트 |
+| `agent.env.llmBaseUrl` / `agent.env.llmModel` / `secrets.llmApiKey` | `runai_rca_workflow_litellm.yml`을 위한 LiteLLM/OpenAI 호환 엔드포인트, 모델, Secret 기반 API 키 |
+| `agent.env.*TimeoutSeconds` | Kubernetes, Run:ai, Prometheus, Loki, Postgres, NAT의 요청/런타임 타임아웃 |
+| `agent.env.kubernetesListLimit` / `agent.env.lokiQueryLimit` | Kubernetes 목록 호출과 Loki 로그 쿼리 그룹의 증거 볼륨 제어 |
+| `agent.env.troubleshootingCasesFile` / `agent.env.agentSoulsFile` | 주입되는 문제 해결 메모리와 에이전트 역할 계약의 경로 |
+| `agent.env.maskingRegexListJson` / `builtinRedaction*` | 클러스터별 시크릿 마스킹 정규식과 내장 레닥션 활성화/해시 제어 |
+| `frontend.config.apiBaseUrl` | 번들 nginx `/api` 프록시를 사용하지 않을 때의 브라우저 API 오리진. 기본 프록시는 비워 두고, 외부 백엔드에는 절대 URL 또는 localhost host:port를 사용하세요 |
+| `frontend.nginx.*` | REST, 웹훅, SSE 트래픽에 대한 프런트엔드 nginx 프록시 타임아웃과 본문 크기 제어. 기본값은 이벤트 스트림을 한 시간 동안 열어 둡니다 |
+| `backend.extraEnv`, `agent.extraEnv`, `frontend.extraEnv` | 배포별 설정을 위한 추가 컨테이너 env 항목 |
+| `podAnnotations` / `podLabels` | 백엔드, 에이전트, 프런트엔드, 번들 Postgres에 적용되는 전역 파드 메타데이터 |
+| `{backend,agent,frontend,postgresql}.podAnnotations` / `.podLabels` | 전역 메타데이터 위에 병합되는 컴포넌트별 파드 메타데이터 |
+| `podSecurityContext` / `securityContext` | 전역 파드 및 컨테이너 보안 컨텍스트 |
+| `{backend,agent,frontend,postgresql}.podSecurityContext` / `.securityContext` | 컴포넌트별 파드 및 컨테이너 보안 컨텍스트 |
+| `priorityClassName` / `topologySpreadConstraints` / `nodeSelector` / `affinity` / `tolerations` | 모든 파드에 대한 전역 스케줄링 정책 |
+| `{backend,agent,frontend,postgresql}.priorityClassName` / `.topologySpreadConstraints` | 컴포넌트별 우선순위 및 분산 스케줄링 재정의 |
+| `{backend,agent,frontend,postgresql}.nodeSelector` / `.affinity` / `.tolerations` | 컴포넌트별 노드 배치 재정의. 지정하지 않으면 전역 스케줄링 값으로 폴백합니다 |
+| `{backend,agent,frontend}.service.type` / `.port` | 각 런타임 컴포넌트의 서비스 노출 유형과 포트 |
+| `{backend,agent,frontend,postgresql}.service.annotations` | 클라우드/로드 밸런서 또는 메시 통합을 위한 서비스 어노테이션 |
+| `ingress.*` | 프런트엔드 서비스를 위한 선택 사항인 Ingress 호스트, 경로, 클래스, 어노테이션, TLS 설정 |
+| `{backend,agent,frontend}.readinessProbe` / `.livenessProbe` | 각 서비스에 대한 HTTP 프로브 재정의 |
+| `postgresql.readinessProbe` / `postgresql.livenessProbe` | 번들 Postgres 프로브 재정의. 비어 있으면 `postgresql.auth.username`을 기반으로 한 `pg_isready` 기본값을 사용합니다 |
+| `postgresql.persistence.*` | 번들 Postgres를 위한 PVC 활성화, 스토리지 클래스, 크기 |
+
+## 동작 참고 사항
+
+
+점(.)이나 슬래시(/)가 포함된 어노테이션 키의 경우 작은 values 파일을 사용하는 것이 좋습니다.
+`--set`을 사용한다면 점을 이스케이프하고 `--set-string`을 사용하세요. 예시:
+
+```bash
+helm upgrade --install runai-rca charts/runai-rca \
+  --set-string 'backend.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-type=nlb'
+```
+
+`DATABASE_URL`이 구성되면 백엔드는 `incidents`, `alerts`, `incident_embeddings`,
+`rca_feedback`, `rca_comments`, `analysis_runs`를 생성하고 사용합니다. 명시적으로 분석을
+요청하는 코멘트와 채팅 요청은 별도의 분석 실행을 생성하므로, Analysis Dashboard가 원본
+RCA를 덮어쓰지 않고 이를 추적할 수 있습니다. 시작 시 `CREATE EXTENSION vector`가 성공하면
+`pgvector=enabled`를 로그로 남기고, `incident_embeddings`에 dense `embedding vector(384)`
+컬럼과 HNSW 코사인 인덱스를 추가합니다. dense 벡터는 부호가 있는 피처 해싱으로 인시던트
+텍스트에서 결정론적으로 유도되며(임베딩 모델 의존성이 없으므로 백엔드는 에이전트 옆에서
+자족적으로 유지됩니다), 자유 텍스트 메모리 검색은 pgvector `<=>` 코사인 연산자를 통해
+Postgres에서 실행됩니다. pgvector 확장을 사용할 수 없으면 백엔드는 여전히 sparse 텍스트
+벡터를 JSONB에 저장하고 인프로세스 코사인 유사도로 유사 인시던트 검색을 제공합니다.
+`POSTGRES_DSN`이 구성되면 Postgres 에이전트는 연결성, 활성 연결, 장기 실행 트랜잭션,
+pgvector 가용성, 예상되는 RCA 테이블 존재 여부를 점검합니다. 구성되지 않으면 에이전트는
+나머지 RCA를 차단하지 않고 Postgres 증거를 사용 불가로 표시합니다.
+
+새 데이터베이스에서 이 RCA 테이블을 위한 별도의 마이그레이션 명령은 필요하지 않습니다.
+백엔드 시작은 멱등적인 `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`,
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 문장을 사용합니다. 외부 Postgres에서는 여전히
+데이터베이스/사용자가 존재해야 하고, 사용자에게 스키마/테이블 생성 및 읽기/쓰기 권한이
+있어야 합니다.
+
+민감한 값은 증거가 백엔드로 반환되거나 NeMo 종합에 전달되기 전에 레닥션됩니다. 내장
+레닥터는 일반적인 시크릿 키, Authorization 헤더, JWT 유사 값, 토큰 쿼리 파라미터, Postgres
+URL 비밀번호, 긴 base64 블롭, Kubernetes env 값, 명령 플래그, 민감한 어노테이션 키,
+임베디드 어노테이션 시크릿을 마스킹합니다. 필요할 때 `MASKING_REGEX_LIST_JSON`으로
+클러스터별 패턴을 추가하세요.
