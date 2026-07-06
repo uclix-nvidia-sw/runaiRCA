@@ -385,7 +385,7 @@ async def plan_investigation(
     # their feedback) is a human directive — the LLM refine must honor it.
     guidance = str((getattr(alert, "annotations", None) or {}).get("operator_prompt") or "")
 
-    if llm_configured(settings):
+    if llm_configured(settings, settings.llm_model_planner):
         try:
             refined = await _llm_refine(
                 settings, target, plan, kg_context, similar_incidents, guidance
@@ -456,7 +456,7 @@ async def _llm_refine(
         f"focus={plan.focus}\nstrategy={plan.strategy}\n"
         f"hypotheses={plan.hypotheses}\nnarrative={plan.narrative}\n"
     )
-    data = await complete_json(settings, system=system, user=user)
+    data = await complete_json(settings, system=system, user=user, model=settings.llm_model_planner)
     if not data:
         return None
 

@@ -272,7 +272,10 @@ class AnalysisOrchestrator:
         # subset — an early/partial synthesis would produce a confident-but-wrong RCA.
         # LLM-gated senior-SRE loop when enabled; otherwise the one-shot gather. Both
         # return one CollectorResult per collector (investigate runs any it skipped).
-        if llm_configured(self._settings) and self._settings.enable_investigation_loop:
+        if (
+            llm_configured(self._settings, self._settings.llm_model_investigation)
+            and self._settings.enable_investigation_loop
+        ):
             from app.services.investigator import investigate
 
             results = await investigate(
@@ -411,7 +414,7 @@ class AnalysisOrchestrator:
         if (
             self_check_refuted
             and root_cause_candidates
-            and llm_configured(self._settings)
+            and llm_configured(self._settings, self._settings.llm_model_investigation)
             and self._settings.enable_investigation_loop
         ):
             outcome = await self._reanalyze_once(
@@ -536,7 +539,7 @@ class AnalysisOrchestrator:
         if (
             not nat_text
             and getattr(self._settings, "language", "en") == "ko"
-            and llm_configured(self._settings)
+            and llm_configured(self._settings, self._settings.llm_model_synthesis)
         ):
             synth = await _synthesize_korean(
                 self._settings,
@@ -959,6 +962,7 @@ async def _complete_synthesis_json(settings: Settings, *, system: str, user: str
         system=system + "\n\nJSON 객체 하나로만, 프롬프트나 코드펜스 없이 응답하세요.",
         user=user,
         temperature=0.2,
+        model=settings.llm_model_synthesis,
     )
     if not text:
         return None
@@ -2002,7 +2006,7 @@ async def _operator_questions(
         )
     questions = questions[:4]
 
-    if llm_configured(settings):
+    if llm_configured(settings, settings.llm_model_synthesis):
         try:
             sharpened = await _sharpen_operator_questions(settings, questions, missing, plan)
         except Exception:  # noqa: BLE001 - sharpening is best-effort
@@ -2037,7 +2041,13 @@ async def _sharpen_operator_questions(
         ensure_ascii=False,
         default=str,
     )
-    data = await complete_json(settings, system=system, user=user, temperature=0.2)
+    data = await complete_json(
+        settings,
+        system=system,
+        user=user,
+        temperature=0.2,
+        model=settings.llm_model_synthesis,
+    )
     if not isinstance(data, dict):
         return None
     raw = data.get("questions")

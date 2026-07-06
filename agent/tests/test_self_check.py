@@ -106,7 +106,7 @@ def test_llm_unsupported_downgrades_and_marks_refuted():
 
     orig_configured = mod.llm_configured
     orig_json = mod.complete_json
-    mod.llm_configured = lambda _s: True
+    mod.llm_configured = lambda *_args, **_kwargs: True
     mod.complete_json = fake_complete_json
     try:
         out = _run(refute_top_cause(settings, _top(confidence="high"), results))

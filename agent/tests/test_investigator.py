@@ -63,7 +63,7 @@ async def test_returns_all_collectors_even_when_llm_probes_subset(monkeypatch) -
     )
     calls = {"n": 0}
 
-    async def fake_complete_json(settings, *, system, user, temperature=0.1):
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
         calls["n"] += 1
         # Probe only loki, then conclude — the other two must still be run at the end.
         if calls["n"] == 1:

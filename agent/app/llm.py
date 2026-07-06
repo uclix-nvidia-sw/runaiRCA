@@ -22,8 +22,8 @@ _usage: ContextVar[dict[str, Any] | None] = ContextVar("llm_usage", default=None
 _RETRY_STATUSES = {0, 429, 500, 502, 503, 504}
 
 
-def llm_configured(settings: Settings) -> bool:
-    return bool(settings.llm_base_url and settings.llm_model and settings.llm_api_key)
+def llm_configured(settings: Settings, model: str | None = None) -> bool:
+    return bool(settings.llm_base_url and (model or settings.llm_model) and settings.llm_api_key)
 
 
 def begin_usage_tracking() -> dict[str, Any]:
@@ -66,12 +66,14 @@ async def complete(
     user: str,
     temperature: float = 0.2,
     max_tokens: int | None = None,
+    model: str | None = None,
 ) -> str | None:
     """Return the model's text answer, or None when unavailable/failed."""
-    if not llm_configured(settings):
+    selected_model = (model or settings.llm_model).strip()
+    if not llm_configured(settings, selected_model):
         return None
     payload: dict[str, Any] = {
-        "model": settings.llm_model,
+        "model": selected_model,
         "messages": [
             {"role": "system", "content": f"{system}\n\n{PROMPT_INJECTION_GUARD}"},
             {"role": "user", "content": user},
@@ -92,12 +94,12 @@ async def complete(
             break
         await asyncio.sleep((0.25 * (2**attempt)) + random.uniform(0, 0.1))
     if not response.ok:
-        _record_failed_call(settings.llm_model)
+        _record_failed_call(selected_model)
         return None
     if not isinstance(response.data, dict):
-        _record_failed_call(settings.llm_model)
+        _record_failed_call(selected_model)
         return None
-    _record_usage(settings.llm_model, response.data)
+    _record_usage(selected_model, response.data)
     choices = response.data.get("choices")
     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
         message = choices[0].get("message")
@@ -167,6 +169,7 @@ async def complete_json(
     system: str,
     user: str,
     temperature: float = 0.1,
+    model: str | None = None,
 ) -> dict[str, Any] | None:
     """Ask for a JSON object and parse it, tolerating ```json fences. None on failure."""
     text = await complete(
@@ -174,6 +177,7 @@ async def complete_json(
         system=system + "\n\nRespond with ONLY a valid JSON object, no prose, no code fences.",
         user=user,
         temperature=temperature,
+        model=model,
     )
     if not text:
         return None

@@ -111,6 +111,12 @@ class Settings:
     builtin_redaction_hash_mode: bool
     llm_base_url: str
     llm_model: str
+    llm_model_planner: str
+    llm_model_investigation: str
+    llm_model_drilldown: str
+    llm_model_self_check: str
+    llm_model_synthesis: str
+    llm_model_chat: str
     llm_api_key: str
     llm_request_timeout_seconds: int
     nat_config_file: str
@@ -229,6 +235,12 @@ def load_settings() -> Settings:
         builtin_redaction_hash_mode=_bool_env("BUILTIN_REDACTION_HASH_MODE", False),
         llm_base_url=os.getenv("LLM_BASE_URL", "").strip().rstrip("/"),
         llm_model=os.getenv("LLM_MODEL", "").strip(),
+        llm_model_planner=os.getenv("LLM_MODEL_PLANNER", "").strip(),
+        llm_model_investigation=os.getenv("LLM_MODEL_INVESTIGATION", "").strip(),
+        llm_model_drilldown=os.getenv("LLM_MODEL_DRILLDOWN", "").strip(),
+        llm_model_self_check=os.getenv("LLM_MODEL_SELF_CHECK", "").strip(),
+        llm_model_synthesis=os.getenv("LLM_MODEL_SYNTHESIS", "").strip(),
+        llm_model_chat=os.getenv("LLM_MODEL_CHAT", "").strip(),
         llm_api_key=os.getenv("LLM_API_KEY", "").strip(),
         # Generous per-call ceiling so a reasoning agent is never cut off mid-thought;
         # the overall analysis deadline below is the real bound. (0 = unlimited.)

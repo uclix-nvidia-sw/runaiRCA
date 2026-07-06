@@ -55,7 +55,7 @@ async def run_drilldowns(
     plan: InvestigationPlan | None,
 ) -> None:
     """Run every domain's drill-down loop concurrently. Never raises."""
-    if not settings.enable_agent_drilldown or not llm_configured(settings):
+    if not settings.enable_agent_drilldown or not llm_configured(settings, settings.llm_model_drilldown):
         return
     registry = _domain_tools(settings)
     tasks = [
@@ -82,6 +82,7 @@ async def _drill_one(
                 settings,
                 system=_system_prompt(result.agent, tools),
                 user=_user_prompt(result, target, plan, history),
+                model=settings.llm_model_drilldown,
             )
             if not isinstance(decision, dict) or decision.get("action") != "query":
                 break

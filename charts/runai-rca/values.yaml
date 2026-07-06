@@ -305,6 +305,12 @@ agent:
     builtinRedactionHashMode: false
     llmBaseUrl: ""
     llmModel: ""
+    llmModelPlanner: ""
+    llmModelInvestigation: ""
+    llmModelDrilldown: ""
+    llmModelSelfCheck: ""
+    llmModelSynthesis: ""
+    llmModelChat: ""
     llmRequestTimeoutSeconds: 300
   podAnnotations: {}
   podLabels: {}

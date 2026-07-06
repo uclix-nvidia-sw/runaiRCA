@@ -143,6 +143,7 @@ async def investigate(
                     '"queries":[{"kind":str,"namespace"?,"name"?,"label_selector"?}]}'
                 ),
                 user=_build_user_prompt(plan, kg_context, evidence, by_name, adhoc),
+                model=settings.llm_model_investigation,
             )
             if not isinstance(decision, dict):
                 break  # unusable response -> fall through to full gather

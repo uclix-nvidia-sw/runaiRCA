@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from app.collectors.http_json import JsonResponse
-from app.llm import complete
+from app.llm import begin_usage_tracking, complete, llm_configured
 from app.schemas import Alert, AlertAnalysisRequest, AlertAnalysisResponse
 from app.services.orchestrator import AnalysisOrchestrator
 from tests.test_orchestrator import make_settings
@@ -169,3 +169,39 @@ async def test_llm_usage_counts_exhausted_retry(monkeypatch) -> None:
     assert response.context["llm_usage"]["calls"] == 0
     assert response.context["llm_usage"]["failed_calls"] == 1
     assert response.context["llm_usage"]["by_model"]["m"]["failed_calls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_complete_uses_stage_model_override(monkeypatch) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.local",
+        llm_model="default-model",
+        llm_api_key="k",
+    )
+    seen: dict[str, str] = {}
+
+    async def fake_post_json(**kwargs):
+        seen["model"] = kwargs["json_body"]["model"]
+        return JsonResponse(
+            url="u",
+            status_code=200,
+            data={
+                "choices": [{"message": {"content": "done"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            },
+        )
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    usage = begin_usage_tracking()
+
+    assert await complete(settings, system="s", user="u", model="planner-model") == "done"
+    assert seen["model"] == "planner-model"
+    assert usage["by_model"]["planner-model"]["total_tokens"] == 3
+
+
+def test_llm_configured_accepts_stage_model_without_default_model() -> None:
+    settings = replace(make_settings(), llm_base_url="https://llm.local", llm_model="", llm_api_key="k")
+
+    assert llm_configured(settings, "planner-model")
+    assert not llm_configured(settings)
