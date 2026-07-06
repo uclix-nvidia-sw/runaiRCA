@@ -5,6 +5,8 @@
 
 ## Architecture & Design
 * [Architecture](docs/ARCHITECTURE.md)
+* [RCA Pipeline](docs/RCA-PIPELINE.md)
+* [Knowledge Base](docs/KNOWLEDGE-BASE.md)
 * [Operating Model](docs/OPERATING-MODEL.md)
 * [Data Stores](docs/DATABASE.md)
 * [UI Direction](docs/UI-DIRECTION.md)
@@ -21,6 +23,6 @@
 * [Backend](backend/README.md)
 * [Frontend](frontend/README.md)
 
-## Knowledge Base
+## Knowledge Catalogs (raw)
 * [Troubleshooting Cases](agent/knowledge/troubleshooting_cases.md)
 * [Agent Souls (role contracts)](agent/prompts/agent_souls.md)

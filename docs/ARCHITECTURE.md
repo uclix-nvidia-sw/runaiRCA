@@ -1,13 +1,18 @@
 # Architecture
 
 > **Lens:** How it's built — the contract from Alertmanager webhook to a stored RCA.
-> **In this doc:** runtime flow · the three services · feedback/memory loop · ontology knowledge graph · evidence contract.
+> **In this doc:** runtime flow · the three services · feedback/memory loop · ontology knowledge graph · Slack notifications · evidence contract.
 
 Run:AI RCA is organized around three runtime services: Backend, Agent, and
 Frontend. The Backend can run with an in-memory fallback for local development,
 but production-style deployments should provide Postgres through
 `DATABASE_URL`. The API stores incidents, alerts, operator feedback, comments,
 and similar-incident vectors without changing the UI contract.
+
+The Agent's analysis is a multi-stage pipeline, not a single prompt — this doc
+gives the service-level contract; the [RCA Pipeline](RCA-PIPELINE.md) doc walks
+every stage, and the [Knowledge Base](KNOWLEDGE-BASE.md) doc covers the catalogs
+and ontology it consults.
 
 ## Runtime Flow
 
@@ -17,20 +22,23 @@ and similar-incident vectors without changing the UI contract.
 3. Backend correlates alerts into incidents using:
    `cluster + project + queue + namespace + workload`, then `cluster + node`,
    then Alertmanager `groupKey`.
-4. Backend creates or updates the incident and alert records.
-5. Backend asynchronously calls Agent `POST /analyze`.
-6. Agent runs component evidence collectors in parallel:
-   Run:ai, Kubernetes, Postgres, Prometheus, Loki.
-7. The analysis/synthesis step consults the optional TypeDB ontology knowledge
-   base once (node blast radius and prior same-alert incidents), and a
-   deterministic root-cause ranking scores the five failure families
-   (node/kubelet pressure, scheduling/quota exhaustion, control-plane error,
-   workload/image startup failure, insufficient evidence) using rules R1-R6,
-   never naming a cause without a corroborating source.
-8. Agent synthesizes a single RCA — grounded in the collected evidence, the
-   ranked candidates, and the knowledge-base facts — plus an `artifacts` list
-   that preserves each agent's query, summary, confidence, and status.
-9. Backend stores the analysis response and broadcasts SSE updates.
+4. Backend creates or updates the incident and alert records, and attaches
+   pgvector-similar prior incidents + feedback hints.
+5. Backend asynchronously calls Agent `POST /analyze` under an overall deadline.
+6. The Agent **orchestrator** plans the investigation, then runs seven evidence
+   collectors in parallel — Run:ai, Kubernetes, Prometheus, Loki, Postgres,
+   System, Change — deepened by a central investigation loop and per-collector
+   autonomous drill-down (each agent, read-only, own-domain tools only).
+7. Signature matching (built-in alert / known issue / failure-mode symptom /
+   NVIDIA XID, with a BM25 recall fallback) plus deterministic ranking (rules
+   R1–R6) name the cause; a skeptical self-check may trigger one bounded
+   re-analysis. The orchestrator consults the optional TypeDB ontology for node
+   blast radius, prior same-alert incidents, and graph-derived remediation.
+8. The Agent synthesizes a single RCA — Problem → Root Cause → Recommended
+   Actions → Appendix — plus an `artifacts` list preserving each agent's real
+   query, summary, highlighted findings, confidence, and status.
+9. Backend stores the analysis response, broadcasts SSE updates, and (planned)
+   posts a summary + dashboard link to Slack on completion.
 10. Backend writes analyzed incidents into `incident_embeddings` and includes
    similar prior incidents plus feedback hints in future Agent requests.
 11. Frontend renders the final RCA and the agent evidence trail on the same
@@ -48,6 +56,13 @@ development and tests can run before external Run:ai, Kubernetes, Postgres,
 Prometheus, Loki, or NIM credentials exist. When `ENABLE_NAT_RUNTIME=true`, the
 `NemoWorkflowRunner` can delegate to the `nat` CLI with the configured workflow.
 
+Every LLM stage (planner refine, investigation loop, per-collector drill-down,
+self-check, Korean synthesis) is optional and best-effort: with no LLM, or on any
+failure, the orchestrator degrades to its deterministic path and still returns a
+report. The whole run is bounded by `ANALYSIS_DEADLINE_SECONDS` (default 1500s);
+the backend's `AGENT_REQUEST_TIMEOUT_SECONDS` (1560s) stays above it so a
+graceful degraded report is never lost. See [RCA Pipeline](RCA-PIPELINE.md).
+
 ### Backend
 
 The Backend is a Go HTTP API. It uses Postgres when `DATABASE_URL` or
@@ -58,10 +73,12 @@ It owns:
 
 - Alertmanager webhook intake
 - Incident and alert correlation
-- Agent request lifecycle
+- Agent request lifecycle (async run, deadline, stale-run reaping)
 - Postgres persistence for incidents, alerts, embeddings, feedback, comments, and analysis runs
+- **pgvector similarity** — the `incident_embeddings` cosine search (HNSW, JSONB fallback) that finds prior incidents; results are passed into each Agent request as `similar_incidents` + `feedback_hints`
 - KubeRCA-style `/api/v1/embeddings/search` similar-incident API
 - SSE event fanout
+- Slack notification on analysis completion *(in progress)* — summary + dashboard link, threaded by `thread_ts`
 - Chat proxy
 - Unified API response shape for the frontend
 
@@ -95,32 +112,45 @@ The key interaction is the Unified RCA Workspace:
 
 ## Ontology Knowledge Graph
 
-An optional TypeDB knowledge graph (`typedb.enabled`, default off) gives the
-final analysis/synthesis step relational reasoning that pgvector similarity and
-label overlap cannot express. It is a knowledge resource consulted once at
-synthesis time — not a parallel evidence collector.
+An optional TypeDB knowledge graph (`typedb.enabled`, default **on** in Helm)
+gives the **orchestrator** relational reasoning that pgvector similarity and
+label overlap cannot express. It is a knowledge resource the orchestrator
+consults around synthesis time — not a parallel evidence collector, and not a
+separate agent. Full detail: [Knowledge Base](KNOWLEDGE-BASE.md).
 
-- **Schema** (`agent/ontology/schema.tql`): typed entities (cluster, node, GPU,
-  pod, workload, project, queue, namespace, alert, incident, symptom, root
-  cause, ...) and relations (`pod runsOn node`,
-  `workload submittedToQueue queue`, `incident hasSymptom symptom`, ...), with
-  the five root-cause families modeled as `sub` types.
-- **Ingestion** (`agent/ontology/ingest.py`): a deterministic, review-gated
-  projection of the existing `incidents`/`alerts` Postgres rows into the graph.
-  Only incidents an operator has reviewed (an up-vote or a comment) are
-  committed, so the graph is not poisoned by unverified auto-analysis.
-- **Enrichment** (`agent/app/services/kg_enrichment.py`): the analysis/synthesis
-  step queries the graph once for facts the flat collectors miss — node blast
-  radius (how many workloads share the alerting node) and prior incidents that
-  fired the same alert, with their stored RCA. Degrades to an empty context when
-  TypeDB is disabled or unreachable; never raises into the analysis path.
-- **Ranking** (`agent/app/services/root_cause_ranking.py`): scores the five
-  failure families for the current incident (rules R1-R6). This ranks *causes*,
-  not similarity — pgvector still owns "which past incidents are similar".
+- **Schema** (`agent/ontology/schema.tql`): typed entities (cluster, node, pod,
+  workload, project, queue, namespace, alert, incident, symptom, root cause,
+  `control_plane_component`, `xid_error`, ...) and relations (`runs_on`,
+  `submitted_to`, `grouped_into`, `indicates`, `depends_on`, `leads_to`, ...),
+  with 15 root-cause families modeled as `sub` types.
+- **Ingestion** (`agent/ontology/ingest.py`, CronJob): a deterministic projection
+  of resolved `incidents`/`alerts` into the graph after a grace window. Optionally
+  review-gated (`requireReview`) and can promote operator-confirmed RCAs into
+  reusable knowledge (`--promote-knowledge`).
+- **Enrichment** (`agent/app/services/kg_enrichment.py`): the orchestrator queries
+  the graph for facts the flat collectors miss — node blast radius, prior
+  same-alert incidents with their stored RCA (`enrich`), and graph-derived
+  family/XID remediation with root-cause chains (`graph_remediation`). Degrades to
+  an empty context when TypeDB is disabled/unreachable; never raises.
+- **Ranking** (`agent/app/services/root_cause_ranking.py`) scores failure families
+  (rules R1-R6) and **signature promotion** headlines the most specific match.
+  This ranks *causes*, not similarity — pgvector (owned by the backend) still owns
+  "which past incidents are similar".
 
+Verify what the graph holds with `python -m ontology.query` or TypeDB Studio —
+see [Knowledge Base → Querying the graph](KNOWLEDGE-BASE.md#querying-the-graph).
 TypeDB runs as a single-node StatefulSet
 (`charts/runai-rca/templates/typedb.yaml`); Community Edition is single-node, so
 HA/clustering would require the paid Enterprise tier.
+
+## Slack Notifications *(in progress)*
+
+On analysis-run completion the Backend posts a concise Slack message — the
+problem/cause summary, severity and confidence, and a link to the full RCA in the
+dashboard — threaded by the incident's `thread_ts` so repeat analyses of the same
+incident stay in one thread. The Backend is the natural owner: it already holds
+the run lifecycle, the SSE broadcast, and the `thread_ts`. The long-form report
+stays in the UI; Slack is the notification, not the report.
 
 ## Evidence Contract
 
@@ -139,17 +169,24 @@ Agent responses contain both the synthesized RCA and source-level artifacts.
   },
   "artifacts": [
     {
-      "agent": "runai",
-      "source": "runai",
-      "type": "workload_context",
+      "agent": "kubernetes",
+      "source": "kubernetes",
+      "type": "adhoc_query",
       "status": "ok",
       "confidence": "medium",
-      "query": "workload lookup",
-      "summary": "Workload is pending in project vision queue gpu-a."
+      "title": "파드 조회",
+      "query": "kubectl get pods train-0 -n runai",
+      "summary": "signals: CrashLoopBackOff, OOMKilled",
+      "highlights": ["CrashLoopBackOff", "OOMKilled"]
     }
   ]
 }
 ```
+
+`title` is the human card name, `query` is the *real* command an operator can
+replay, and `highlights` are problem signals the UI marks in red so the finding
+reads before the boilerplate — see
+[RCA Pipeline → Evidence presentation](RCA-PIPELINE.md#evidence-presentation).
 
 The UI must not route operators to separate agent pages. It may use accordions
 or tabs inside the detail page, but all evidence stays in context.

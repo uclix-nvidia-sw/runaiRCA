@@ -15,6 +15,8 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `AGENT_URL` | Backend to Agent URL, default `http://localhost:8000` |
 | `AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for Agent `/analyze` and `/chat` requests, default `1560` (must exceed the agent's `ANALYSIS_DEADLINE_SECONDS`) |
 | `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for operator-triggered Agent `/analyze` requests, default `1560` |
+| `SLACK_WEBHOOK_URL` | *(in progress)* Backend Slack incoming-webhook URL; when set, the backend posts a summary + dashboard link on analysis completion. Empty = disabled |
+| `PUBLIC_BASE_URL` | *(in progress)* External dashboard base URL used to build the RCA link in Slack messages |
 | `LOG_LEVEL` | Agent log level, default `info` |
 | `LANGUAGE` | Backend/Agent response language, `en` or `ko` |
 | `KUBERNETES_API_URL` | In-cluster Kubernetes API URL, default `https://kubernetes.default.svc` |
