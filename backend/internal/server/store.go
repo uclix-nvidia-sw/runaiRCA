@@ -32,6 +32,8 @@ const (
 	maxStoredCommentBodyBytes = 8000
 	maxFeedbackAuthorBytes    = 120
 
+	maxProgressLogEntries = 200
+
 	incidentViewActive   = "active"
 	incidentViewArchived = "archived"
 	incidentViewTrash    = "trash"
@@ -1100,6 +1102,51 @@ func metadataFromAgentContext(context map[string]any) map[string]any {
 	return map[string]any{"llm_usage": usage}
 }
 
+func mergeAnalysisMetadata(existing map[string]any, incoming map[string]any) map[string]any {
+	if len(existing) == 0 {
+		return cloneAnyMap(incoming)
+	}
+	out := cloneAnyMap(existing)
+	for key, value := range incoming {
+		if child, ok := value.(map[string]any); ok {
+			out[key] = cloneAnyMap(child)
+			continue
+		}
+		out[key] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func progressLogFromMetadata(metadata map[string]any) []any {
+	raw, ok := metadata["progress_log"].([]any)
+	if !ok {
+		return []any{}
+	}
+	return append([]any{}, raw...)
+}
+
+func nextProgressSeq(log []any) int {
+	if len(log) == 0 {
+		return 1
+	}
+	if item, ok := log[len(log)-1].(map[string]any); ok {
+		return usageInt(item["seq"]) + 1
+	}
+	return len(log) + 1
+}
+
+func normalizeProgressEntry(entry map[string]any, seq int, now time.Time) map[string]any {
+	out := cloneAnyMap(entry)
+	out["seq"] = seq
+	if _, ok := out["timestamp"]; !ok {
+		out["timestamp"] = now
+	}
+	return out
+}
+
 func (s *Store) latestTokenUsageLocked(incidentID string) map[string]any {
 	alertIDs := map[string]struct{}{}
 	for _, alert := range s.alerts {
@@ -1328,6 +1375,26 @@ func (s *Store) latestReusableAnalysisRunLocked(targetType string, targetID stri
 	return selected
 }
 
+func (s *Store) AppendAnalysisProgress(runID string, entry map[string]any) (AnalysisRun, map[string]any, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run := s.analysisRuns[runID]
+	if run == nil || run.Status != "analyzing" {
+		return AnalysisRun{}, nil, false
+	}
+	if run.Metadata == nil {
+		run.Metadata = map[string]any{}
+	}
+	log := progressLogFromMetadata(run.Metadata)
+	progress := normalizeProgressEntry(entry, nextProgressSeq(log), time.Now().UTC())
+	log = append(log, progress)
+	if len(log) > maxProgressLogEntries {
+		log = log[len(log)-maxProgressLogEntries:]
+	}
+	run.Metadata["progress_log"] = log
+	return cloneAnalysisRun(run), cloneAnyMap(progress), true
+}
+
 func (s *Store) CompleteAnalysisRun(runID string, response AgentAnalysisResponse) (AnalysisRun, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1347,7 +1414,7 @@ func (s *Store) CompleteAnalysisRun(runID string, response AgentAnalysisResponse
 	run.MissingData = response.MissingData
 	run.Warnings = response.Warnings
 	run.Artifacts = response.Artifacts
-	run.Metadata = metadataFromAgentContext(response.Context)
+	run.Metadata = mergeAnalysisMetadata(run.Metadata, metadataFromAgentContext(response.Context))
 	run.UpdatedAt = time.Now().UTC()
 	if run.FirstCompletedAt == nil {
 		run.FirstCompletedAt = &run.UpdatedAt
@@ -1378,7 +1445,7 @@ func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (A
 	run.MissingData = response.MissingData
 	run.Warnings = response.Warnings
 	run.Artifacts = response.Artifacts
-	run.Metadata = metadataFromAgentContext(response.Context)
+	run.Metadata = mergeAnalysisMetadata(run.Metadata, metadataFromAgentContext(response.Context))
 	run.UpdatedAt = time.Now().UTC()
 	if !s.persistAnalysisRunLocked(run) {
 		*run = before

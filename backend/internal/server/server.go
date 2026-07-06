@@ -283,6 +283,7 @@ const (
 	flappingGroupWindow       = 30 * time.Minute
 	maxListLimit              = 200
 	maxJSONBodyBytes          = 1 << 20
+	maxProgressBodyBytes      = 64 << 10
 	maxEmbeddingQueryBytes    = 4000
 	maxWebhookAlerts          = 500
 	// Default caps; overridable via MAX_AUTO_ANALYZE_FANOUT / MAX_CONCURRENT_AGENT_RUNS.
@@ -435,6 +436,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleEmbeddingSearch(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/analysis-runs":
 		s.handleAnalysisRunList(w, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/v1/analysis-runs/"):
+		s.handleAnalysisRunAction(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/stats/recurrence":
 		s.handleRecurrenceStats(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/stats/llm-spend":

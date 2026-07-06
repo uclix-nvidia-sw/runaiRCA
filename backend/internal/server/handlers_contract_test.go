@@ -401,6 +401,48 @@ func TestSSEPayloadContract(t *testing.T) {
 	}
 }
 
+func TestAnalysisProgressSSEPayloadContract(t *testing.T) {
+	event := analysisProgressEvent(AnalysisRun{
+		RunID:      "ANL-1",
+		Source:     "manual",
+		Status:     "analyzing",
+		TargetType: "incident",
+		TargetID:   "INC-1",
+		IncidentID: "INC-1",
+		AlertID:    "ALR-1",
+	}, map[string]any{
+		"phase":   "planning",
+		"message": "building hypotheses",
+		"seq":     7,
+	})
+	var buf bytes.Buffer
+	writeSSE(&buf, event)
+	output := buf.String()
+	if !strings.Contains(output, "event: analysis.progress\n") {
+		t.Fatalf("missing event name: %q", output)
+	}
+	dataLine := ""
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "data: ") {
+			dataLine = strings.TrimPrefix(line, "data: ")
+			break
+		}
+	}
+	var payload Event
+	if err := json.Unmarshal([]byte(dataLine), &payload); err != nil {
+		t.Fatalf("decode SSE data: %v", err)
+	}
+	if payload.Type != eventAnalysisProgress ||
+		payload.Data["run_id"] != "ANL-1" ||
+		payload.Data["target_type"] != "incident" ||
+		payload.Data["incident_id"] != "INC-1" ||
+		payload.Data["alert_id"] != "ALR-1" ||
+		payload.Data["phase"] != "planning" ||
+		usageInt(payload.Data["seq"]) != 7 {
+		t.Fatalf("unexpected progress SSE payload: %+v", payload)
+	}
+}
+
 func TestWebhookBroadcastsAlertAndAnalysisEvents(t *testing.T) {
 	server := NewServer()
 	ch := server.hub.Subscribe()

@@ -13,6 +13,7 @@ const (
 	eventConnected         = "connected"
 	eventAlertCreated      = "alert.created"
 	eventAnalysisStarted   = "analysis.started"
+	eventAnalysisProgress  = "analysis.progress"
 	eventAnalysisCompleted = "analysis.completed"
 	eventFeedbackUpdated   = "feedback.updated"
 	eventIncidentResolved  = "incident.resolved"
@@ -100,6 +101,18 @@ func analysisCompletedEvent(runID, source, status, targetType, targetID, inciden
 		"incident_id": incidentID,
 		"alert_id":    alertID,
 	}}
+}
+
+func analysisProgressEvent(run AnalysisRun, progress map[string]any) Event {
+	data := cloneAnyMap(progress)
+	data["run_id"] = run.RunID
+	data["source"] = first(run.Source, "auto")
+	data["status"] = run.Status
+	data["target_type"] = run.TargetType
+	data["target_id"] = run.TargetID
+	data["incident_id"] = run.IncidentID
+	data["alert_id"] = run.AlertID
+	return Event{Type: eventAnalysisProgress, Data: data}
 }
 
 func feedbackUpdatedEvent(summary FeedbackSummary, incidentID string, alertID string) Event {

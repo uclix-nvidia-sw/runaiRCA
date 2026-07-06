@@ -125,6 +125,12 @@ func TestAnalysisRunStoresLLMUsageMetadataAndClearsOnReanalysis(t *testing.T) {
 		Fingerprint: "fp-usage",
 	})
 	run := store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Manual", "")
+	if _, _, ok := store.AppendAnalysisProgress(run.RunID, map[string]any{
+		"phase":   "planning",
+		"message": "building hypotheses",
+	}); !ok {
+		t.Fatalf("progress append failed")
+	}
 	completed, ok := store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{
 		AnalysisSummary: "done",
 		Context: map[string]any{
@@ -141,6 +147,10 @@ func TestAnalysisRunStoresLLMUsageMetadataAndClearsOnReanalysis(t *testing.T) {
 	if !ok || usage["total_tokens"] != float64(8) {
 		t.Fatalf("usage metadata missing: %+v", completed.Metadata)
 	}
+	progress, ok := completed.Metadata["progress_log"].([]any)
+	if !ok || len(progress) != 1 {
+		t.Fatalf("progress log missing after complete: %+v", completed.Metadata)
+	}
 	detail, ok := store.IncidentDetail(incident.IncidentID)
 	if !ok || detail.TokenUsage["total_tokens"] != float64(8) {
 		t.Fatalf("incident detail missing token usage: ok=%t detail=%+v", ok, detail)
@@ -149,6 +159,90 @@ func TestAnalysisRunStoresLLMUsageMetadataAndClearsOnReanalysis(t *testing.T) {
 	reused, created := store.CreateAnalysisRunIfAllowed("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Again", "")
 	if !created || reused.RunID != run.RunID || reused.Metadata != nil || reused.FirstCompletedAt == nil {
 		t.Fatalf("reanalysis should reuse row and clear metadata, created=%t run=%+v", created, reused)
+	}
+}
+
+func TestAnalysisProgressHandlerAppendsAndBroadcasts(t *testing.T) {
+	server := NewServer()
+	ch := server.hub.Subscribe()
+	defer server.hub.Unsubscribe(ch)
+	incident, alert := seedAlert(t, server, "fp-progress")
+	run := server.store.CreateAnalysisRun("manual", "alert", alert.AlertID, incident.IncidentID, alert.AlertID, "Manual", "")
+
+	body, _ := json.Marshal(map[string]any{
+		"phase":   "planning",
+		"message": "hypothesis check",
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/analysis-runs/"+run.RunID+"/progress", bytes.NewReader(body))
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d: %s", rec.Code, rec.Body.String())
+	}
+	event := receiveEvent(t, ch)
+	if event.Type != eventAnalysisProgress ||
+		event.Data["run_id"] != run.RunID ||
+		event.Data["incident_id"] != incident.IncidentID ||
+		event.Data["alert_id"] != alert.AlertID ||
+		event.Data["phase"] != "planning" ||
+		usageInt(event.Data["seq"]) != 1 {
+		t.Fatalf("unexpected progress event: %+v", event)
+	}
+	stored := waitForRunIDStatus(t, server, run.RunID, "analyzing")
+	progress, ok := stored.Metadata["progress_log"].([]any)
+	if !ok || len(progress) != 1 {
+		t.Fatalf("progress was not stored in metadata: %+v", stored.Metadata)
+	}
+}
+
+func TestAnalysisProgressCapsLogAndRejectsTerminalRuns(t *testing.T) {
+	store := NewStore()
+	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "cap"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-progress-cap",
+	})
+	run := store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Manual", "")
+	for i := 0; i < maxProgressLogEntries+5; i++ {
+		if _, _, ok := store.AppendAnalysisProgress(run.RunID, map[string]any{"message": fmt.Sprintf("step-%03d", i)}); !ok {
+			t.Fatalf("append %d failed", i)
+		}
+	}
+	stored := store.ListAnalysisRuns()[0]
+	log, ok := stored.Metadata["progress_log"].([]any)
+	if !ok || len(log) != maxProgressLogEntries {
+		t.Fatalf("progress log cap failed: len=%d metadata=%+v", len(log), stored.Metadata)
+	}
+	firstEntry := log[0].(map[string]any)
+	lastEntry := log[len(log)-1].(map[string]any)
+	if usageInt(firstEntry["seq"]) != 6 || usageInt(lastEntry["seq"]) != maxProgressLogEntries+5 {
+		t.Fatalf("unexpected progress seq window: first=%+v last=%+v", firstEntry, lastEntry)
+	}
+
+	store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{AnalysisSummary: "done"})
+	if _, _, ok := store.AppendAnalysisProgress(run.RunID, map[string]any{"message": "late"}); ok {
+		t.Fatalf("terminal run accepted progress")
+	}
+}
+
+func TestAnalysisProgressHandlerReturnsConflictForNonAnalyzingRun(t *testing.T) {
+	server := NewServer()
+	incident, alert := seedAlert(t, server, "fp-progress-conflict")
+	run := server.store.CreateAnalysisRun("manual", "alert", alert.AlertID, incident.IncidentID, alert.AlertID, "Manual", "")
+	server.store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{AnalysisSummary: "done"})
+
+	body := []byte(`{"message":"late"}`)
+	for _, path := range []string{
+		"/api/v1/analysis-runs/" + run.RunID + "/progress",
+		"/api/v1/analysis-runs/ANL-missing/progress",
+	} {
+		rec := httptest.NewRecorder()
+		server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body)))
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("expected 409 for %s, got %d: %s", path, rec.Code, rec.Body.String())
+		}
 	}
 }
 
