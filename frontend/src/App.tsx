@@ -308,6 +308,53 @@ function formatArtifactValue(value: unknown) {
   return typeof value === 'string' ? value : safeJSONStringify(value, 2);
 }
 
+// Problem signals marked in red inside rendered evidence even when the agent
+// sent no explicit highlights. Deliberately specific (CamelCase reasons,
+// kernel/GPU markers, phrases) — a bare lowercase "error" would light up every
+// JSON blob that merely has an error field.
+const DEFAULT_HIGHLIGHT_PATTERN =
+  /CrashLoopBackOff|OOMKill(?:ed|ing)?|ImagePullBackOff|ErrImagePull(?:BackOff)?|ErrImageNeverPull|CreateContainerConfigError|CreateContainerError|RunContainerError|ContainerCannotRun|FailedScheduling|FailedMount|FailedAttachVolume|FailedCreate|Unschedulable|Evicted|Preempt(?:ed|ion|or)?|NotReady|DiskPressure|MemoryPressure|PIDPressure|NetworkUnavailable|Unhealthy|Back-?[Oo]ff restarting|startup probe failed|liveness probe failed|readiness probe failed|Xid\s*[:=]?\s*\d+|NVRM|NCCL\s+WARN|fell off the bus|no space left|read-?only file ?system|connection refused|permission denied|panic:|segfault|out of memory|deadline exceeded|exit code \d+/;
+
+function escapeRegExp(text: string) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Split `text` into plain segments and red <mark>s for known problem signals
+ *  plus the agent-extracted `extraTerms` (artifact.highlights). */
+function highlightSegments(text: string, extraTerms?: string[]) {
+  if (!text) return [text];
+  const extras = (extraTerms ?? []).map((term) => term.trim()).filter(Boolean).map(escapeRegExp);
+  const source = extras.length
+    ? `${DEFAULT_HIGHLIGHT_PATTERN.source}|${extras.join('|')}`
+    : DEFAULT_HIGHLIGHT_PATTERN.source;
+  let pattern: RegExp;
+  try {
+    pattern = new RegExp(source, 'gi');
+  } catch {
+    return [text];
+  }
+  const nodes: Array<string | JSX.Element> = [];
+  let last = 0;
+  let match: RegExpExecArray | null;
+  let key = 0;
+  while ((match = pattern.exec(text)) !== null) {
+    if (match[0].length === 0) {
+      pattern.lastIndex += 1;
+      continue;
+    }
+    if (match.index > last) nodes.push(text.slice(last, match.index));
+    nodes.push(
+      <mark className="evidence-mark" key={`hl-${key++}`}>
+        {match[0]}
+      </mark>,
+    );
+    last = match.index + match[0].length;
+  }
+  if (last === 0) return [text];
+  if (last < text.length) nodes.push(text.slice(last));
+  return nodes;
+}
+
 function safeJSONStringify(value: unknown, space?: number) {
   const seen = new WeakSet<object>();
   try {
@@ -1416,7 +1463,7 @@ function AnalysisDashboard({
                           onClick={() => void runAnalyze(incidentID)}
                           type="button"
                         >
-                          <Bot size={16} /> {pendingAnalyzeID === incidentID ? 'Analyzing...' : 'Analyze'}
+                          <Bot size={16} /> {pendingAnalyzeID === incidentID ? 'Re-analyzing...' : 'Re-analyze'}
                         </button>
                       )}
                     </div>
@@ -1735,17 +1782,19 @@ function CopyableBlock({
   title,
   value,
   kind,
+  highlights,
 }: {
   title: string;
   value: string;
   kind: 'code' | 'pre';
+  highlights?: string[];
 }) {
   return (
     <div className="copyable-block">
       <div className="copyable-head">{title}</div>
       <div className="copyable-frame">
         <CopyButton value={value} label={`Copy ${title}`} />
-        {kind === 'code' ? <code>{value}</code> : <pre>{value}</pre>}
+        {kind === 'code' ? <code>{value}</code> : <pre>{highlightSegments(value, highlights)}</pre>}
       </div>
     </div>
   );
@@ -2638,20 +2687,27 @@ function ArtifactResult({ artifact }: { artifact: Artifact }) {
     <div className="artifact">
       <button className="artifact-toggle compact-artifact-toggle" onClick={() => setOpen((value) => !value)} type="button">
         <div className="artifact-head">
-          <strong>{artifact.type}</strong>
+          <strong>{artifact.title || artifact.type}</strong>
           <span>{artifact.confidence}</span>
         </div>
         <ChevronDown size={16} />
       </button>
       {open && (
         <div className="artifact-body">
-          <p>{artifact.summary}</p>
+          <p>{highlightSegments(artifact.summary ?? '', artifact.highlights)}</p>
           {queryItems.length > 0 ? (
-            <QueryResultList items={queryItems} />
+            <QueryResultList items={queryItems} highlights={artifact.highlights} />
           ) : (
             <>
               {artifact.query && <CopyableBlock title="Query" value={artifact.query} kind="code" />}
-              {artifact.result !== undefined && <CopyableBlock title="Result summary" value={resultText} kind="pre" />}
+              {artifact.result !== undefined && (
+                <CopyableBlock
+                  title="Result summary"
+                  value={resultText}
+                  kind="pre"
+                  highlights={artifact.highlights}
+                />
+              )}
             </>
           )}
         </div>
@@ -2660,17 +2716,17 @@ function ArtifactResult({ artifact }: { artifact: Artifact }) {
   );
 }
 
-function QueryResultList({ items }: { items: QueryDisplayItem[] }) {
+function QueryResultList({ items, highlights }: { items: QueryDisplayItem[]; highlights?: string[] }) {
   return (
     <div className="query-result-list">
       {items.map((item) => (
-        <QueryResultCard item={item} key={item.id} />
+        <QueryResultCard item={item} key={item.id} highlights={highlights} />
       ))}
     </div>
   );
 }
 
-function QueryResultCard({ item }: { item: QueryDisplayItem }) {
+function QueryResultCard({ item, highlights }: { item: QueryDisplayItem; highlights?: string[] }) {
   const previewText = item.preview === undefined ? '' : formatArtifactValue(item.preview);
   const [open, setOpen] = useState(false);
   return (
@@ -2693,7 +2749,7 @@ function QueryResultCard({ item }: { item: QueryDisplayItem }) {
         <>
           {item.queryText && <CopyableBlock title={item.queryLabel} value={item.queryText} kind="code" />}
           {item.preview !== undefined && (
-            <CopyableBlock title="Relevant result" value={previewText} kind="pre" />
+            <CopyableBlock title="Relevant result" value={previewText} kind="pre" highlights={highlights} />
           )}
         </>
       )}

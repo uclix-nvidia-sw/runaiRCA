@@ -65,6 +65,11 @@ class AlertAnalysisArtifact(BaseModel):
     query: str | None = None
     result: dict[str, Any] | list[Any] | str | None = None
     summary: str | None = None
+    # Human-facing card title (e.g. "파드 조회") — the UI falls back to `type`.
+    title: str | None = None
+    # Problem signals extracted from `result` (base.salient_markers) — the UI
+    # marks these in red inside the rendered evidence.
+    highlights: list[str] | None = None
 
 
 class AlertAnalysisResponse(BaseModel):

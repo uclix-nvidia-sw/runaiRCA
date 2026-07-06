@@ -52,6 +52,10 @@ type Artifact struct {
 	Query      string `json:"query,omitempty"`
 	Result     any    `json:"result,omitempty"`
 	Summary    string `json:"summary,omitempty"`
+	// Human-facing card title (e.g. "파드 조회"); the UI falls back to Type.
+	Title string `json:"title,omitempty"`
+	// Problem signals the agent extracted from Result; the UI marks them in red.
+	Highlights []string `json:"highlights,omitempty"`
 }
 
 type SimilarIncident struct {
@@ -142,6 +146,10 @@ type Incident struct {
 	ResolvedAt       *time.Time `json:"resolved_at"`
 	AlertCount       int        `json:"alert_count"`
 	IsAnalyzing      bool       `json:"is_analyzing"`
+	// AnalysisSeq counts Slack-notified analyses (1 = Initial Analysis). Runs
+	// are updated in place on re-analysis, so rows can't be counted instead.
+	AnalysisSeq      int        `json:"analysis_seq"`
+	SlackThreadTS    string     `json:"-"`
 	LatestActivityAt time.Time  `json:"-"`
 }
 
@@ -200,6 +208,7 @@ type Server struct {
 	backfillInterval          time.Duration
 	backfillBatch             int
 	backfillRetryCooldown     time.Duration
+	slack                     *SlackNotifier
 }
 
 const (
@@ -247,6 +256,7 @@ func Run() {
 
 	go server.runBackfill(ctx)
 	go server.runStaleRunReaper(ctx)
+	go server.runSlackSocketMode(ctx)
 
 	go func() {
 		log.Printf("Run:AI RCA backend listening on :%s", port)
@@ -267,16 +277,16 @@ func Run() {
 
 func NewServer() *Server {
 	store := NewStore()
-	// Defaults must exceed the agent's ANALYSIS_DEADLINE_SECONDS (1200): the agent
+	// Defaults must exceed the agent's ANALYSIS_DEADLINE_SECONDS (1500): the agent
 	// works up to that budget then returns a graceful degraded report — hanging up
 	// earlier loses the report and leaves the alert with a useless fallback.
-	agentRequestTimeout := time.Duration(getenvInt("AGENT_REQUEST_TIMEOUT_SECONDS", 1260)) * time.Second
+	agentRequestTimeout := time.Duration(getenvInt("AGENT_REQUEST_TIMEOUT_SECONDS", 1560)) * time.Second
 	if agentRequestTimeout <= 0 {
-		agentRequestTimeout = 1260 * time.Second
+		agentRequestTimeout = 1560 * time.Second
 	}
-	manualAgentRequestTimeout := time.Duration(getenvInt("MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS", 1260)) * time.Second
+	manualAgentRequestTimeout := time.Duration(getenvInt("MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS", 1560)) * time.Second
 	if manualAgentRequestTimeout <= 0 {
-		manualAgentRequestTimeout = 1260 * time.Second
+		manualAgentRequestTimeout = 1560 * time.Second
 	}
 	store.ConnectDatabase(
 		first(os.Getenv("DATABASE_URL"), os.Getenv("POSTGRES_DSN")),
@@ -312,6 +322,7 @@ func NewServer() *Server {
 		backfillInterval:      time.Duration(getenvInt("ANALYSIS_BACKFILL_INTERVAL_SECONDS", 300)) * time.Second,
 		backfillBatch:         backfillBatch,
 		backfillRetryCooldown: time.Duration(getenvInt("ANALYSIS_BACKFILL_RETRY_COOLDOWN_SECONDS", 900)) * time.Second,
+		slack:                 NewSlackNotifierFromEnv(),
 	}
 }
 

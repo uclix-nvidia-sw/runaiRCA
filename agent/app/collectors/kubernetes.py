@@ -26,8 +26,29 @@ _EXEC_ALLOWLIST: tuple[tuple[str, ...], ...] = (
 # Never allow these regardless of the allowlist (defence in depth against a bad edit above).
 _EXEC_FORBIDDEN_TOKENS: frozenset[str] = frozenset(
     {
-        ";", "&&", "||", "|", ">", ">>", "<", "`", "$(", "rm", "kill", "mv", "cp", "dd",
-        "chmod", "chown", "reboot", "shutdown", "mkfs", "delete", "sh", "bash", "-c",
+        ";",
+        "&&",
+        "||",
+        "|",
+        ">",
+        ">>",
+        "<",
+        "`",
+        "$(",
+        "rm",
+        "kill",
+        "mv",
+        "cp",
+        "dd",
+        "chmod",
+        "chown",
+        "reboot",
+        "shutdown",
+        "mkfs",
+        "delete",
+        "sh",
+        "bash",
+        "-c",
     }
 )
 
@@ -67,22 +88,37 @@ _READ_KINDS: dict[str, tuple[str, bool]] = {
     "storageclasses": ("/apis/storage.k8s.io/v1", False),
 }
 _KIND_ALIASES = {
-    "po": "pods", "pod": "pods",
-    "no": "nodes", "node": "nodes",
+    "po": "pods",
+    "pod": "pods",
+    "no": "nodes",
+    "node": "nodes",
     "event": "events",
-    "ns": "namespaces", "namespace": "namespaces",
-    "svc": "services", "service": "services",
-    "ep": "endpoints", "endpoint": "endpoints",
-    "pvc": "persistentvolumeclaims", "persistentvolumeclaim": "persistentvolumeclaims",
-    "pv": "persistentvolumes", "persistentvolume": "persistentvolumes",
-    "cm": "configmaps", "configmap": "configmaps",
-    "quota": "resourcequotas", "resourcequota": "resourcequotas",
-    "deploy": "deployments", "deployment": "deployments",
-    "rs": "replicasets", "replicaset": "replicasets",
-    "sts": "statefulsets", "statefulset": "statefulsets",
-    "ds": "daemonsets", "daemonset": "daemonsets",
-    "job": "jobs", "cronjob": "cronjobs",
-    "sc": "storageclasses", "storageclass": "storageclasses",
+    "ns": "namespaces",
+    "namespace": "namespaces",
+    "svc": "services",
+    "service": "services",
+    "ep": "endpoints",
+    "endpoint": "endpoints",
+    "pvc": "persistentvolumeclaims",
+    "persistentvolumeclaim": "persistentvolumeclaims",
+    "pv": "persistentvolumes",
+    "persistentvolume": "persistentvolumes",
+    "cm": "configmaps",
+    "configmap": "configmaps",
+    "quota": "resourcequotas",
+    "resourcequota": "resourcequotas",
+    "deploy": "deployments",
+    "deployment": "deployments",
+    "rs": "replicasets",
+    "replicaset": "replicasets",
+    "sts": "statefulsets",
+    "statefulset": "statefulsets",
+    "ds": "daemonsets",
+    "daemonset": "daemonsets",
+    "job": "jobs",
+    "cronjob": "cronjobs",
+    "sc": "storageclasses",
+    "storageclass": "storageclasses",
 }
 
 
@@ -92,6 +128,50 @@ def resolve_read_kind(kind: str) -> str | None:
     if normalized in _READ_KINDS:
         return normalized
     return _KIND_ALIASES.get(normalized)
+
+
+# Operator-facing Korean labels for the read kinds ("파드 조회" artifact titles).
+_KIND_LABELS_KO = {
+    "pods": "파드",
+    "events": "이벤트",
+    "nodes": "노드",
+    "namespaces": "네임스페이스",
+    "services": "서비스",
+    "endpoints": "엔드포인트",
+    "persistentvolumeclaims": "PVC",
+    "persistentvolumes": "PV",
+    "configmaps": "컨피그맵",
+    "resourcequotas": "리소스쿼터",
+    "deployments": "디플로이먼트",
+    "replicasets": "레플리카셋",
+    "statefulsets": "스테이트풀셋",
+    "daemonsets": "데몬셋",
+    "jobs": "잡",
+    "cronjobs": "크론잡",
+    "storageclasses": "스토리지클래스",
+}
+
+
+def kind_lookup_title(kind: str, language: str) -> str:
+    """Human card title for a read of `kind` — "파드 조회" (ko) / "pods lookup" (en)."""
+    resolved = resolve_read_kind(kind) or (kind or "resource")
+    if language == "ko":
+        return f"{_KIND_LABELS_KO.get(resolved, resolved)} 조회"
+    return f"{resolved} lookup"
+
+
+def kubectl_repr(kind: str, namespace: str = "", name: str = "", label_selector: str = "") -> str:
+    """The read as the kubectl command an operator would have typed — artifacts
+    show the REAL query shape ("kubectl get pods -n runai train-0"), not an
+    internal param dump."""
+    parts = ["kubectl get", resolve_read_kind(kind) or str(kind)]
+    if name:
+        parts.append(str(name))
+    if namespace:
+        parts.append(f"-n {namespace}")
+    if label_selector:
+        parts.append(f"-l {label_selector}")
+    return " ".join(parts)
 
 
 async def k8s_read(
@@ -472,12 +552,20 @@ def _state_reason(state: object) -> dict[str, object] | None:
     for kind in ("waiting", "running", "terminated"):
         inner = state.get(kind)
         if isinstance(inner, dict):
-            return {"phase": kind, **{k: inner.get(k) for k in
-                                     ("reason", "message", "exitCode", "signal", "startedAt",
-                                      "finishedAt") if inner.get(k) is not None}}
+            return {
+                "phase": kind,
+                **{
+                    k: inner.get(k)
+                    for k in ("reason", "message", "exitCode", "signal", "startedAt", "finishedAt")
+                    if inner.get(k) is not None
+                },
+            }
     # Already an inner state dict (e.g. terminated) passed directly.
-    return {k: state.get(k) for k in ("reason", "message", "exitCode", "signal", "finishedAt")
-            if state.get(k) is not None} or None
+    return {
+        k: state.get(k)
+        for k in ("reason", "message", "exitCode", "signal", "finishedAt")
+        if state.get(k) is not None
+    } or None
 
 
 async def _collect_pod_logs(
@@ -585,16 +673,16 @@ async def _senior_insight(
 ) -> str:
     """One-line senior insight via the LLM; deterministic fallback when unconfigured."""
     restarts = [
-        d for d in container_diagnostics if isinstance(d.get("restartCount"), int)
-        and d["restartCount"] > 0
+        d
+        for d in container_diagnostics
+        if isinstance(d.get("restartCount"), int) and d["restartCount"] > 0
     ]
     log_error_lines = [
         line
         for entry in logs
         for line in entry.get("lines", [])
-        if isinstance(line, str) and any(
-            token in line.lower() for token in ("error", "fail", "oom", "cuda", "panic")
-        )
+        if isinstance(line, str)
+        and any(token in line.lower() for token in ("error", "fail", "oom", "cuda", "panic"))
     ]
     if not llm_configured(settings):
         parts: list[str] = []
@@ -679,8 +767,7 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
     if name == "pod":
         return _pod_summary(data)
     if (
-        name in {"pod_events", "namespace_events"}
-        or name.startswith("runai_control_plane_events:")
+        name in {"pod_events", "namespace_events"} or name.startswith("runai_control_plane_events:")
     ) and isinstance(data.get("items"), list):
         events = [
             _event_summary(item)
@@ -817,28 +904,32 @@ def _runai_control_plane_warning_events(
 # investigation loop, so evidence collection stays iterative even when the LLM
 # (litellm) is unavailable — which is exactly when the ReAct loop is skipped.
 _FOLLOWUP_WAITING = {
-    "crashloopbackoff", "imagepullbackoff", "errimagepull", "errimageneverpull",
-    "createcontainerconfigerror", "createcontainererror", "runcontainererror",
+    "crashloopbackoff",
+    "imagepullbackoff",
+    "errimagepull",
+    "errimageneverpull",
+    "createcontainerconfigerror",
+    "createcontainererror",
+    "runcontainererror",
     "containercannotrun",
 }
 
 
-def _followup_queries(
-    details: dict, prior: list[dict], namespace: str
-) -> list[dict[str, str]]:
+def _followup_queries(details: dict, prior: list[dict], namespace: str) -> list[dict[str, str]]:
     if not namespace or not isinstance(details, dict):
         return []
     queries: list[dict[str, str]] = []
     statuses = details.get("pod_statuses") or []
     pending = any(
-        isinstance(p, dict) and str(p.get("phase", "")).lower() == "pending"
-        for p in statuses
+        isinstance(p, dict) and str(p.get("phase", "")).lower() == "pending" for p in statuses
     )
     waiting = False
     for d in details.get("container_diagnostics") or []:
         state = d.get("state") if isinstance(d, dict) else None
-        if isinstance(state, dict) and str(state.get("phase")) == "waiting" and (
-            str(state.get("reason", "")).lower() in _FOLLOWUP_WAITING
+        if (
+            isinstance(state, dict)
+            and str(state.get("phase")) == "waiting"
+            and (str(state.get("reason", "")).lower() in _FOLLOWUP_WAITING)
         ):
             waiting = True
     if pending:
@@ -889,8 +980,10 @@ async def k8s_followup(
             done.add(_followup_key(q))
             results.append(
                 await k8s_read(
-                    settings, q["kind"],
-                    namespace=q.get("namespace", ""), name=q.get("name", ""),
+                    settings,
+                    q["kind"],
+                    namespace=q.get("namespace", ""),
+                    name=q.get("name", ""),
                     label_selector=q.get("label_selector", ""),
                 )
             )
@@ -899,11 +992,15 @@ async def k8s_followup(
         loc = f" -n {res['namespace']}" if res.get("namespace") else ""
         kubernetes_result.artifacts.append(
             artifact(
-                agent="kubernetes", source="kubernetes", type="followup_query",
-                status="unavailable" if err else "ok", confidence="medium",
+                agent="kubernetes",
+                source="kubernetes",
+                type="followup_query",
+                status="unavailable" if err else "ok",
+                confidence="medium",
                 query=f"get {res.get('kind')}{loc}",
                 summary=(
-                    str(err) if err
+                    str(err)
+                    if err
                     else f"flowchart follow-up: {res.get('kind')} → HTTP {res.get('status_code')}"
                 ),
                 result=res,

@@ -7,6 +7,10 @@ export type Artifact = {
   query?: string;
   result?: unknown;
   summary?: string;
+  /** Human-facing card title (e.g. "파드 조회"); fall back to `type`. */
+  title?: string;
+  /** Problem signals extracted from `result`; rendered in red. */
+  highlights?: string[];
 };
 
 export type SimilarIncident = {

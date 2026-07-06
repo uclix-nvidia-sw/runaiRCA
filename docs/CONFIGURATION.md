@@ -13,8 +13,12 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | --- | --- |
 | `PORT` | Backend/Agent HTTP port; Helm maps this from the component service port |
 | `AGENT_URL` | Backend to Agent URL, default `http://localhost:8000` |
-| `AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for Agent `/analyze` and `/chat` requests, default `180` |
-| `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for operator-triggered Agent `/analyze` requests, default `900` |
+| `AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for Agent `/analyze` and `/chat` requests, default `1560` (must exceed the agent's `ANALYSIS_DEADLINE_SECONDS`) |
+| `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for operator-triggered Agent `/analyze` requests, default `1560` |
+| `SLACK_BOT_TOKEN` | Backend Slack bot token (`xoxb-`, `chat:write` scope, bot invited to the channel). Set together with `SLACK_CHANNEL_ID` to enable incident-analysis notifications. A bot token — not an incoming webhook — is required because `chat.postMessage` returns the `ts` used to thread re-analyses. Chart secret key `slackBotToken` |
+| `SLACK_CHANNEL_ID` | Channel the backend posts incident-analysis summaries into. Chart secret key `slackChannelId` |
+| `SLACK_APP_TOKEN` | Optional app-level token (`xapp-`, `connections:write` scope). Enables the in-message Re-analyze button: clicks arrive over Socket Mode (outbound WebSocket), so no public endpoint is needed. Requires Socket Mode + Interactivity toggled on in the Slack app settings. Chart secret key `slackAppToken` |
+| `DASHBOARD_URL` | Optional external dashboard URL; when set, Slack messages add an "Open Incident" deep-link button (Helm value `backend.env.dashboardUrl`) |
 | `LOG_LEVEL` | Agent log level, default `info` |
 | `LANGUAGE` | Backend/Agent response language, `en` or `ko` |
 | `KUBERNETES_API_URL` | In-cluster Kubernetes API URL, default `https://kubernetes.default.svc` |
@@ -32,7 +36,9 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `RUNAI_WORKLOADS_PATH` | Run:ai workloads API path, default `/api/v1/workloads` |
 | `RUNAI_PROJECTS_PATH` | Run:ai projects API path, default `/api/v1/projects` |
 | `RUNAI_QUEUES_PATH` | Run:ai queues API path, default `/api/v1/queues` |
-| `RUNAI_TIMEOUT_SECONDS` | Run:ai API request timeout |
+| `RUNAI_VERSION_PATH` | Run:ai control-plane version API path, default `/api/v1/version` — enables version-aware suppression of already-fixed known issues |
+| `RUNAI_TIMEOUT_SECONDS` | Run:ai API request timeout, default `120` |
+| `RUNAI_MCP_URL` | Optional runai-mcp sidecar URL (stdio→HTTP bridge, e.g. `http://localhost:8809/mcp`). When set, the runai collector + drill-down reach the 426 Run:ai APIs spec-aware; any failure falls back to the fixed-endpoint collector |
 | `RUNAI_LOG_NAMESPACES` | Comma-separated Run:ai control-plane log namespaces, default `runai,runai-backend` |
 | `PROMETHEUS_URL` | Prometheus base URL |
 | `PROMETHEUS_TIMEOUT_SECONDS` | Prometheus query timeout |
@@ -41,11 +47,19 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `LOKI_TIMEOUT_SECONDS` | Loki query timeout |
 | `LOKI_QUERY_LIMIT` | Maximum log lines requested per Loki query group, default `20` |
 | `LOKI_MCP_URL` | Optional remote Loki MCP URL for the MCP workflow |
+| `ENABLE_SYSTEM_AGENT` | Enable the node-infra System collector (dmesg/journalctl/syslog via a per-node DaemonSet), default `true`; degrades to `unavailable` when `SYSTEM_AGENT_URL` is unset |
+| `SYSTEM_AGENT_URL` | Per-node System-agent DaemonSet endpoint (`GET /logs?source=dmesg\|journal\|syslog`) |
+| `SYSTEM_AGENT_TOKEN` | Optional bearer token for the System-agent endpoint |
+| `SYSTEM_AGENT_TIMEOUT_SECONDS` | System-agent request timeout, default `120` |
+| `ENABLE_POD_EXEC` | Allow the Kubernetes collector read-only pod-exec (allowlisted commands: `nvidia-smi`, …), default `true` |
+| `POD_EXEC_TIMEOUT_SECONDS` | Pod-exec timeout, default `120` |
 | `DATABASE_URL` | Backend Postgres store DSN for incidents, alerts, embeddings, feedback, comments, and analysis runs |
 | `DATABASE_CONNECT_TIMEOUT_SECONDS` | Backend Postgres startup connection timeout, default `5` |
 | `POSTGRES_DSN` | Agent Postgres diagnostic DSN; defaults to `DATABASE_URL` in Helm |
 | `POSTGRES_TIMEOUT_SECONDS` | Agent Postgres diagnostic query timeout |
+| `RUNAI_DB_DSN` | Optional read-only DSN for the Run:ai control-plane Postgres. When set, the postgres agent's drill-down can `SELECT` platform data (workloads, audit, clusters, ...) during troubleshooting; single-statement SELECT in a READ ONLY transaction. Provision a read-only DB role. |
 | `TROUBLESHOOTING_CASES_FILE` | Local known-cases/playbook markdown path |
+| `ARCHITECTURE_FILE` | Run:ai platform topology YAML (components, depends_on, DB schema ownership), default `knowledge/runai_architecture.yaml` — powers playbook check paths and postgres drill-down schema hints |
 | `AGENT_SOULS_FILE` | Agent role-contract prompt path, default `prompts/agent_souls.md` |
 | `MASKING_REGEX_LIST_JSON` | Optional JSON array of custom redaction regexes |
 | `BUILTIN_REDACTION_ENABLED` | Enable built-in secret redaction, default `true` |
@@ -54,10 +68,32 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `LLM_BASE_URL` | OpenAI-compatible base URL for the LiteLLM NAT workflow and the operator chat copilot |
 | `LLM_MODEL` | OpenAI-compatible model name, for example `auto-router` |
 | `LLM_API_KEY` | OpenAI-compatible API key secret; enables conversational chat answers when all three LLM vars are set |
-| `LLM_REQUEST_TIMEOUT_SECONDS` | LiteLLM request timeout used in the materialized NAT config, default `120` |
+| `LLM_REQUEST_TIMEOUT_SECONDS` | LLM request timeout per call (chat, reasoning, and the materialized NAT config), default `300`, `0` = unlimited |
 | `ENABLE_NAT_RUNTIME` | Run RCA synthesis through the NeMo Agent Toolkit CLI instead of the deterministic in-process fallback, default `false` |
 | `NAT_CONFIG_FILE` | Optional NeMo workflow config path, default `configs/runai_rca_workflow.yml` |
 | `NAT_TIMEOUT_SECONDS` | NeMo Agent Toolkit CLI execution timeout |
+| `ENABLE_INVESTIGATION_LOOP` | Central LLM investigation loop: plan → probe the most relevant agents → observe → re-plan, default `false` (Helm sets `true`) |
+| `MAX_INVESTIGATION_STEPS` | Max central investigation steps per analysis, default `12` |
+| `MAX_REANALYSIS_STEPS` | Investigation budget for the one re-analysis pass after a refuted top cause, default `6` |
+| `ENABLE_AGENT_DRILLDOWN` | Per-collector autonomous drill-down: each evidence agent (kubernetes/prometheus/loki/runai) runs its own bounded LLM loop with only its domain's read-only tools, default `false` (Helm sets `true`) |
+| `DRILLDOWN_MAX_STEPS` | Max drill-down steps per evidence agent, default `4` |
+| `ANALYSIS_DEADLINE_SECONDS` | Overall hard cap per analysis (graceful degraded report on overrun), default `1500` (25 min), `0` = no cap. Keep the backend `AGENT_REQUEST_TIMEOUT_SECONDS` above this. |
+| `MAX_AUTO_ANALYZE_FANOUT` | Backend: max analyses started per webhook, default `50` |
+| `MAX_CONCURRENT_AGENT_RUNS` | Backend: max analyses running against the Agent concurrently, default `50` |
+| `FLAPPING_GROUP_WINDOW_MINUTES` | Backend: quiet window before a recurring alert becomes a NEW incident vs another occurrence, code default `120` (Helm sets `360`) |
+| `ANALYSIS_BACKFILL_INTERVAL_SECONDS` | Backend: how often to re-drive alerts left without a completed RCA, default `300` (`0` disables) |
+| `ANALYSIS_BACKFILL_BATCH` | Backend: alerts re-driven per backfill tick, default `10` |
+| `ANALYSIS_BACKFILL_RETRY_COOLDOWN_SECONDS` | Backend: cooldown before retrying a failed alert, default `900` |
+| `EMBEDDING_URL` | Backend: OpenAI-compatible `/embeddings` endpoint for similar-incident search. Empty = offline feature-hash fallback (default, lexical) |
+| `EMBEDDING_MODEL` | Backend: embedding model name (with `EMBEDDING_URL`) |
+| `EMBEDDING_DIM` | Backend: embedding vector dimension, default `384`. Must match the model; changing it requires re-embedding existing rows |
+| `EMBEDDING_API_KEY` | Backend: API key for the embedding endpoint (secret key `embeddingApiKey`) |
+| `ENABLE_TYPEDB` | Master switch for the TypeDB ontology, default `false` (Helm sets it from `typedb.enabled`, default on). Connection vars below — full detail in [Data Stores](DATABASE.md) |
+| `TYPEDB_ADDRESS` | TypeDB server address, default `localhost:1729`; in-cluster `<release>-typedb:1729` |
+| `TYPEDB_DATABASE` | TypeDB database name, default `runai_rca` |
+| `TYPEDB_USERNAME` / `TYPEDB_PASSWORD` | TypeDB credentials, default `admin` / `password` (CE defaults — override beyond PoC) |
+| `TYPEDB_TLS_ENABLED` | Use TLS for the TypeDB connection, default `false` |
+| `TYPEDB_TIMEOUT_SECONDS` | TypeDB query timeout, default `60` |
 
 The Helm chart does not expose Loki credential values because the default
 deployment is expected to query Loki through the in-cluster read/query service.

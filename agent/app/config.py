@@ -93,7 +93,9 @@ class Settings:
     runai_log_namespaces: tuple[str, ...]
     postgres_dsn: str
     postgres_timeout_seconds: int
+    runai_db_dsn: str
     troubleshooting_cases_file: str
+    architecture_file: str
     failure_modes_file: str
     runai_alerts_file: str
     runai_known_issues_file: str
@@ -124,6 +126,8 @@ class Settings:
     enable_investigation_loop: bool
     max_investigation_steps: int
     max_reanalysis_steps: int
+    enable_agent_drilldown: bool
+    drilldown_max_steps: int
     analysis_deadline_seconds: int
 
 
@@ -181,9 +185,22 @@ def load_settings() -> Settings:
         runai_log_namespaces=_csv_env("RUNAI_LOG_NAMESPACES", ("runai", "runai-backend")),
         postgres_dsn=os.getenv("POSTGRES_DSN", "").strip(),
         postgres_timeout_seconds=_int_env("POSTGRES_TIMEOUT_SECONDS", 60),
+        # Optional DSN for the Run:ai control-plane Postgres (the platform's own
+        # DB: workloads/clusters/audit/... schemas). When set, the postgres
+        # agent's drill-down can SELECT related platform data during
+        # troubleshooting instead of only health-checking the RCA store. Use a
+        # read-only DB role; the tool additionally enforces single-statement
+        # SELECT inside a READ ONLY transaction.
+        runai_db_dsn=os.getenv("RUNAI_DB_DSN", "").strip(),
         troubleshooting_cases_file=os.getenv(
             "TROUBLESHOOTING_CASES_FILE",
             "knowledge/troubleshooting_cases.md",
+        ).strip(),
+        # Run:ai platform topology (components, depends_on, DB schema ownership)
+        # — powers playbook check paths and the postgres drill-down schema hints.
+        architecture_file=os.getenv(
+            "ARCHITECTURE_FILE",
+            "knowledge/runai_architecture.yaml",
         ).strip(),
         failure_modes_file=os.getenv(
             "FAILURE_MODES_FILE",
@@ -216,9 +233,7 @@ def load_settings() -> Settings:
         # Generous per-call ceiling so a reasoning agent is never cut off mid-thought;
         # the overall analysis deadline below is the real bound. (0 = unlimited.)
         llm_request_timeout_seconds=_int_env("LLM_REQUEST_TIMEOUT_SECONDS", 300),
-        nat_config_file=os.getenv(
-            "NAT_CONFIG_FILE", "configs/runai_rca_workflow.yml"
-        ).strip(),
+        nat_config_file=os.getenv("NAT_CONFIG_FILE", "configs/runai_rca_workflow.yml").strip(),
         enable_nat_runtime=_bool_env("ENABLE_NAT_RUNTIME", False),
         # Bounded below the overall deadline so the workflow subprocess is killed
         # cleanly if it overruns. (0 = unlimited.)
@@ -237,7 +252,14 @@ def load_settings() -> Settings:
         # Re-analysis (after the first top cause is refuted) gets a generous
         # investigation budget of its own — accuracy over speed.
         max_reanalysis_steps=max(1, _int_env("MAX_REANALYSIS_STEPS", 6)),
+        # Per-collector autonomous drill-down: each evidence agent gets its own LLM
+        # loop with ONLY its domain's read-only tools (see services/drilldown.py).
+        # LLM-gated and best-effort like the investigation loop.
+        enable_agent_drilldown=_bool_env("ENABLE_AGENT_DRILLDOWN", False),
+        drilldown_max_steps=max(1, _int_env("DRILLDOWN_MAX_STEPS", 4)),
         # Overall hard cap on one analysis: agents get generous per-step time above,
         # but the whole run always finishes within this budget. (0 = no overall cap.)
-        analysis_deadline_seconds=max(0, _int_env("ANALYSIS_DEADLINE_SECONDS", 1200)),
+        # Owner priority is accuracy over latency; the backend's
+        # AGENT_REQUEST_TIMEOUT_SECONDS must stay above this (deadline + 60s).
+        analysis_deadline_seconds=max(0, _int_env("ANALYSIS_DEADLINE_SECONDS", 1500)),
     )

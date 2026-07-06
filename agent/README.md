@@ -2,20 +2,32 @@
 
 FastAPI analysis service for Run:AI RCA.
 
-The service is structured around component collectors that map directly to the
-planned multi-agent topology:
+The service is a component-oriented multi-agent pipeline run by one orchestrator.
+Seven evidence collectors gather in parallel, a central investigation loop and
+per-collector autonomous drill-down deepen the evidence, then signature matching
+(+ BM25 recall), ranking, a skeptical self-check, and synthesis produce one
+grounded RCA under an overall deadline. Every LLM stage is optional; with no LLM,
+or on any failure, the orchestrator degrades to its deterministic path. See the
+**[RCA Pipeline](../docs/RCA-PIPELINE.md)** doc for every stage and the
+**[Knowledge Base](../docs/KNOWLEDGE-BASE.md)** doc for the catalogs and ontology
+it consults.
 
-- Run:ai collector
-- Kubernetes collector
-- Prometheus collector
-- Loki collector
-- Postgres collector
-- Analysis Agent
+Collectors (each owns one domain):
+
+- Run:ai collector — workload/project/queue/quota context (optional runai-mcp sidecar)
+- Kubernetes collector — pods/events/nodes, control-plane pod health, read-only pod-exec
+- Prometheus collector — queue/project GPU metrics
+- Loki collector — workload + `runai`/`runai-backend` control-plane logs
+- Postgres collector — RCA-store health (and platform-DB drill-down via `RUNAI_DB_DSN`)
+- System collector — node infra (dmesg/journalctl, NVIDIA XID) via a per-node DaemonSet
+- Change collector — "what changed?" around the alert window
 
 `configs/runai_rca_workflow.yml` is the default NeMo Agent Toolkit workflow used
-as the orchestration backbone. It runs the Run:ai, Kubernetes, Postgres,
-Prometheus, and Loki collectors in parallel, then invokes `analysis_agent` to
-produce the KubeRCA-style RCA shown in the Analysis Dashboard.
+as the orchestration backbone. It runs the collectors in parallel, then invokes
+`analysis_agent` to produce the KubeRCA-style RCA shown in the Analysis Dashboard.
+Pipeline switches: `ENABLE_INVESTIGATION_LOOP`, `ENABLE_AGENT_DRILLDOWN`,
+`ANALYSIS_DEADLINE_SECONDS` (default 1500s) — full list in the
+[Configuration Reference](../docs/CONFIGURATION.md).
 
 `configs/runai_rca_workflow_mcp.yml` is the MCP/LLM variant. Use it when
 Prometheus/Loki MCP servers and NVIDIA NIM credentials are available.

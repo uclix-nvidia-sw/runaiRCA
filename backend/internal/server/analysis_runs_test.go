@@ -1047,7 +1047,7 @@ func TestDashboardAnalyzeCreatesAnalysisRun(t *testing.T) {
 	}
 
 	run := waitForRunStatus(t, server, "manual", "complete")
-	if run.TargetType != "alert" || run.IncidentID != incident.IncidentID {
+	if run.TargetType != "incident" || run.IncidentID != incident.IncidentID || run.AlertID == "" {
 		t.Fatalf("dashboard run missing target linkage: %+v", run)
 	}
 	if !strings.Contains(run.Title, "Dashboard analysis") {
@@ -1106,7 +1106,7 @@ func TestDashboardAnalyzeSkipsDuplicateWhenIncidentAlreadyAnalyzing(t *testing.T
 	}
 }
 
-func TestDashboardAnalyzeStartsRemainingAlertsWhileOneIsAnalyzing(t *testing.T) {
+func TestDashboardAnalyzeStartsIncidentRunWhileAlertRunInFlight(t *testing.T) {
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	released := false
@@ -1183,7 +1183,7 @@ func TestDashboardAnalyzeStartsRemainingAlertsWhileOneIsAnalyzing(t *testing.T) 
 	}
 }
 
-func TestDashboardAnalyzeLargeIncidentStartsCappedRuns(t *testing.T) {
+func TestDashboardAnalyzeLargeIncidentStartsSingleRun(t *testing.T) {
 	var hit atomic.Int32
 	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
 		hit.Add(1)
@@ -1227,19 +1227,16 @@ func TestDashboardAnalyzeLargeIncidentStartsCappedRuns(t *testing.T) {
 		t.Fatalf("decode response: %v", err)
 	}
 	if response["status"] != "analysis_requested" ||
-		response["analysis_runs"].(float64) != float64(maxManualAnalyzeFanout) ||
-		response["analysis_limit"].(float64) != float64(maxManualAnalyzeFanout) {
-		t.Fatalf("expected capped large incident analysis, got %+v", response)
+		response["mode"] != "incident" ||
+		response["analysis_runs"].(float64) != 1 {
+		t.Fatalf("expected single incident analysis, got %+v", response)
 	}
-	if runs := server.store.ListAnalysisRuns(); len(runs) != maxManualAnalyzeFanout {
-		t.Fatalf("large incident should start capped runs, got %+v", runs)
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 {
+		t.Fatalf("large incident should start exactly one run, got %+v", runs)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && hit.Load() < int32(maxManualAnalyzeFanout) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if hit.Load() != int32(maxManualAnalyzeFanout) {
-		t.Fatalf("agent calls should be capped, got %d", hit.Load())
+	waitForRunStatus(t, server, "manual", "complete")
+	if hit.Load() != 1 {
+		t.Fatalf("expected exactly one agent call, got %d", hit.Load())
 	}
 }
 

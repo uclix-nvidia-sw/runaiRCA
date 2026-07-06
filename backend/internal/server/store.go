@@ -888,6 +888,34 @@ func (s *Store) OccurrenceSummaryForTarget(incidentID string, alertID string) ([
 	return pods, count
 }
 
+// BumpIncidentAnalysisSeq increments the incident's Slack analysis counter and
+// returns the new value (1 = Initial Analysis, 2 = 2nd Analysis, ...).
+func (s *Store) BumpIncidentAnalysisSeq(id string) (int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	incident := s.incidents[id]
+	if incident == nil {
+		return 0, false
+	}
+	incident.AnalysisSeq++
+	s.persistIncidentLocked(incident)
+	return incident.AnalysisSeq, true
+}
+
+// SetIncidentSlackThread stores the Slack root-message timestamp so later
+// re-analyses reply into the same thread (survives restarts, unlike an
+// in-memory map).
+func (s *Store) SetIncidentSlackThread(id string, ts string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	incident := s.incidents[id]
+	if incident == nil {
+		return
+	}
+	incident.SlackThreadTS = ts
+	s.persistIncidentLocked(incident)
+}
+
 func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

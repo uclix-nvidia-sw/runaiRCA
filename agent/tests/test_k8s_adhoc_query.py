@@ -115,7 +115,9 @@ async def test_investigator_runs_queries_and_attaches_artifacts(monkeypatch) -> 
     adhoc = [a for a in k8s_result.artifacts if a.type == "adhoc_query"]
     assert len(adhoc) == 2
     ok = next(a for a in adhoc if a.status == "ok")
-    assert "pvc" in (ok.query or "")
+    # The real command, alias resolved to the canonical kind, kubectl-prefixed.
+    assert ok.query == "kubectl get persistentvolumeclaims -n team-a"
+    assert ok.title  # human card title ("PVC 조회" / "persistentvolumeclaims lookup")
     refused = next(a for a in adhoc if a.status == "unavailable")
     assert "allowlist" in refused.summary
 

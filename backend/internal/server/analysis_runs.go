@@ -152,6 +152,7 @@ func (s *Server) requestAnalysisRun(
 		return
 	}
 	s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
+	s.notifySlackAnalysis(run, incidentID)
 }
 
 // runBackfill periodically re-drives alerts that never produced a completed RCA:

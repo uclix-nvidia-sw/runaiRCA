@@ -109,6 +109,26 @@ spec:
                   name: {{ include "runai-rca.databaseSecretName" . }}
                   key: {{ .Values.secrets.keys.postgresDsn | quote }}
                   optional: true
+            - name: DASHBOARD_URL
+              value: {{ .Values.backend.env.dashboardUrl | quote }}
+            - name: SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "runai-rca.secretName" . }}
+                  key: {{ .Values.secrets.keys.slackBotToken | quote }}
+                  optional: true
+            - name: SLACK_CHANNEL_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "runai-rca.secretName" . }}
+                  key: {{ .Values.secrets.keys.slackChannelId | quote }}
+                  optional: true
+            - name: SLACK_APP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "runai-rca.secretName" . }}
+                  key: {{ .Values.secrets.keys.slackAppToken | quote }}
+                  optional: true
             {{- with .Values.backend.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

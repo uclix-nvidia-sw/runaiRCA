@@ -16,11 +16,17 @@ source of truth.
 
 ```mermaid
 flowchart LR
-  BE[Backend] <-->|read/write| PG[(PostgreSQL + pgvector)]
+  BE[Backend] <-->|"read/write · pgvector similarity"| PG[(PostgreSQL + pgvector)]
   PG -.->|review-gated ingestion| TDB[(TypeDB ontology)]
-  AG[Agent synthesis] -->|similar_incidents| PG
-  AG -->|blast radius, prior incidents, remediation| TDB
+  BE -->|similar_incidents + feedback_hints| AG[Agent orchestrator]
+  AG -->|"enrich / graph_remediation"| TDB
 ```
+
+**pgvector** similarity is owned by the **backend** (Go), not the agent: the
+backend runs the cosine search and passes the matches into each `/analyze`
+request. The agent **orchestrator** owns the **TypeDB** side — it consults the
+graph during analysis. See [RCA Pipeline](RCA-PIPELINE.md) and
+[Knowledge Base](KNOWLEDGE-BASE.md).
 
 ---
 
@@ -59,30 +65,39 @@ GPU is modeled as attributes (`gpu_allocated`, `gpu_requested`) on
 `alert`, `incident` (owns `analysis_summary` so prior RCA is queryable),
 `analysis_run`.
 
-### Knowledge layer — *curated; seeded from `knowledge/failure_modes.yaml`*
-`symptom` (owns `keyword` for matching), `root_cause`, `action`, `evidence`,
-`runbook`. This is the "this symptom → this cause → fixed by this action"
-knowledge the synthesis step consults.
+### Knowledge layer — *curated; seeded from the `knowledge/` catalogs*
+`symptom` (owns `keyword` for matching), `root_cause`, `action`, plus the
+`xid_error` GPU-fault catalog (with `leads_to` chains) and
+`control_plane_component` platform topology (with `depends_on`). This is the
+"this symptom → this cause → fixed by this action" knowledge the orchestrator
+consults. Fed by five loaders — see [How data gets in](#3-how-data-gets-in) and
+the [Knowledge Base](KNOWLEDGE-BASE.md) doc.
 
-### Root-cause taxonomy (5 families, `sub root_cause`)
-`node_kubelet_pressure`, `scheduling_quota_exhaustion`, `control_plane_error`,
-`workload_startup_image_failure`, `insufficient_evidence`. Mirrors the ranking
-families in `agent/app/services/root_cause_ranking.py`.
+### Root-cause taxonomy (15 families, `sub root_cause`)
+`node_kubelet_pressure`, `runai_scheduling_quota`, `k8s_scheduling_error`,
+`runai_control_plane_error`, `k8s_control_plane_error`, `workload_startup_error`,
+`image_pull_error`, `gpu_hardware_error`, `network_fabric_error`,
+`cluster_network_error`, `k8s_storage_error`, `storage_backend_error`,
+`workload_runtime_error`, `observability_accuracy`, `platform_auth_error`
+(+ `insufficient_evidence`). Must stay in sync with the loader `FAMILIES` sets and
+`agent/app/services/root_cause_ranking.py`; guardrail tests enforce it.
 
 ### Relations
 - **Topology**: `scopes` (cluster→node/project), `runs_on` (node→pod),
   `belongs_to` (workload→pod), `in_project`, `submitted_to` (workload→queue),
-  `contains` (namespace→pod/workload/component)
+  `contains` (namespace→pod/workload/component), `depends_on` (component→component)
 - **Incident**: `grouped_into` (incident←alert), `analyzed_by`, `similar_to`
 - **Knowledge**: `has_symptom`, `indicates` (symptom→cause), `has_cause`,
-  `fixed_by` (cause→action), `supported_by` (←evidence), `emits`
+  `fixed_by` (cause→action), `resolved_by` (symptom→action), `supported_by`
+  (←evidence), `emits`, `applies_to` (xid→gpu_model), `leads_to` (xid→xid)
 
 ### Populated vs modeled
 | Status | Entities / relations |
 |---|---|
 | ✅ Populated (`ontology/ingest.py`) | infra + incident layer + topology/`grouped_into` |
-| 🟦 Knowledge (`ontology/load_knowledge.py`) | `symptom`/`root_cause`/`action` + `indicates`/`fixed_by` |
-| ⬜ Modeled, not yet fed | `evidence`, `runbook`, `control_plane_component`, `analysis_run`, `similar_to`, `has_symptom`, `supported_by`, GPU attrs |
+| ✅ Knowledge (`load_knowledge` / `load_xids` / `load_alerts` / `load_known_issues` / `load_architecture`) | `symptom`/`root_cause`/`action` + `indicates`/`resolved_by`, `xid_error` + `leads_to`, `control_plane_component` + `depends_on` |
+| 🟦 Promoted (`ingest.py --promote-knowledge`) | `confirmed:<alert>` symptom → family → action, from operator-confirmed RCAs |
+| ⬜ Modeled, not yet fed | `evidence`, `runbook`, `analysis_run`, `similar_to`, `supported_by`, GPU attrs |
 
 ---
 
@@ -90,13 +105,16 @@ families in `agent/app/services/root_cause_ranking.py`.
 
 | Path | Script | Source | Gate |
 |---|---|---|---|
-| Topology + incidents | `ontology/ingest.py` | Postgres `incidents`/`alerts` | Review-gated (operator up-vote or comment); `--all` for bulk PoC load |
-| Failure-mode knowledge | `ontology/load_knowledge.py` | `knowledge/failure_modes.yaml` (team-curated) | Version-controlled file |
-| Schema | `ontology/load_schema.py` | `ontology/schema.tql` | Helm post-install hook (`typedb-schema-job.yaml`) |
+| Schema + functions | `load_schema` / `load_functions` | `schema.tql` / `functions.tql` | Helm post-install/upgrade hook (`typedb-schema-job.yaml`) |
+| Curated knowledge | `load_knowledge`, `load_xids`, `load_alerts`, `load_known_issues`, `load_architecture` | the `knowledge/` catalogs | Version-controlled files, run in the schema job |
+| Topology + incidents | `ontology/ingest.py` (CronJob) | Postgres `incidents`/`alerts` | Resolved ≥ `resolvedGraceHours` ago; review-gated unless `requireReview=false` |
+| Knowledge promotion | `ingest.py --promote-knowledge` | operator-confirmed RCAs | Resolved + net-positive feedback |
 
-The agent **consults** TypeDB once at synthesis (`agent/app/services/kg_enrichment.py`):
-node blast radius, prior same-alert incidents, and curated remediation for the
-ranked family. It degrades to an empty context when TypeDB is off/unreachable.
+The **orchestrator** consults TypeDB during analysis
+(`agent/app/services/kg_enrichment.py`): node blast radius, prior same-alert
+incidents, and graph-derived remediation. It degrades to an empty context when
+TypeDB is off/unreachable. Inspect the graph with `python -m ontology.query`
+(`--incident` / `--recent` / `--count`) or TypeDB Studio.
 
 ---
 
@@ -109,6 +127,7 @@ ranked family. It degrades to an empty context when TypeDB is off/unreachable.
 | `TYPEDB_DATABASE` | `runai_rca` | |
 | `TYPEDB_USERNAME` / `TYPEDB_PASSWORD` | `admin` / `password` | CE defaults — override beyond PoC |
 | `POSTGRES_DSN` | — | Backend Postgres (also read by agent collectors/ingestion) |
+| `RUNAI_DB_DSN` | — | Optional read-only DSN for the **Run:ai control-plane** Postgres; enables the postgres drill-down's `sql_select` over platform schemas (workloads/audit/…). Use a read-only role. |
 
 TypeDB deploys as a single-node `StatefulSet` + PVC
 (`charts/runai-rca/templates/typedb.yaml`). Community Edition is single-node;

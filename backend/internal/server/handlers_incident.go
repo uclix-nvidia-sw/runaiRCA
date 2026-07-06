@@ -70,21 +70,13 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "incident has no alerts to analyze")
 			return
 		}
-		started := 0
-		alreadyRunning := false
-		for _, alert := range detail.Alerts {
-			if started >= maxManualAnalyzeFanout {
-				break
-			}
-			run, ok := s.startAnalysisRun("alert", alert.AlertID, "manual", "")
-			if ok {
-				started++
-			} else if run != nil && run.Status == "analyzing" {
-				alreadyRunning = true
-			}
-		}
-		if started == 0 {
-			if alreadyRunning {
+		// One incident-scoped run per click: the agent analyzes the representative
+		// firing alert with full incident context, and Slack gets exactly one
+		// thread reply. The old per-alert fanout made one click on a 3-alert
+		// incident produce 3 runs (and would have produced 3 Slack replies).
+		run, ok := s.startAnalysisRun("incident", id, "manual", "")
+		if !ok {
+			if run != nil && run.Status == "analyzing" {
 				writeJSON(w, http.StatusAccepted, map[string]any{
 					"status": "analysis_already_running",
 				})
@@ -94,11 +86,10 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusAccepted, map[string]any{
-			"status":         "analysis_requested",
-			"mode":           "alerts",
-			"analysis_runs":  started,
-			"alert_count":    len(detail.Alerts),
-			"analysis_limit": maxManualAnalyzeFanout,
+			"status":        "analysis_requested",
+			"mode":          "incident",
+			"analysis_runs": 1,
+			"alert_count":   len(detail.Alerts),
 		})
 	case "resolve":
 		if len(parts) != 2 || r.Method != http.MethodPost {

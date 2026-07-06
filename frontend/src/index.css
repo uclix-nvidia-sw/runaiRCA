@@ -1591,6 +1591,21 @@ td span.occurrence-pill {
   position: relative;
 }
 
+/* Problem signals inside rendered evidence (artifact.highlights + built-in
+   patterns) — red so the operator's eye lands on the finding first. */
+.evidence-mark {
+  background: transparent;
+  color: var(--danger);
+  font-weight: 700;
+}
+
+pre .evidence-mark,
+code .evidence-mark {
+  background: rgba(220, 38, 38, 0.08);
+  border-radius: 0.2rem;
+  padding: 0 0.1rem;
+}
+
 .copy-button {
   border: 1px solid transparent;
   border-radius: 0.35rem;
@@ -2359,6 +2374,10 @@ td span.occurrence-pill {
   align-self: flex-start;
   background: #f3f4f6;
   color: var(--ink);
+  /* react-markdown emits newline text nodes between blocks; with the
+     container's pre-wrap each one renders as an EXTRA blank line on top of
+     the block margins, doubling every gap. */
+  white-space: normal;
 }
 
 .chat-message.pending {
@@ -2366,6 +2385,44 @@ td span.occurrence-pill {
 }
 
 .chat-message p:last-child {
+  margin-bottom: 0;
+}
+
+.chat-message.assistant p,
+.chat-message.assistant ul,
+.chat-message.assistant ol,
+.chat-message.assistant pre {
+  margin: 0.35em 0;
+}
+
+.chat-message.assistant h1,
+.chat-message.assistant h2,
+.chat-message.assistant h3,
+.chat-message.assistant h4 {
+  margin: 0.6em 0 0.25em;
+  font-size: 0.9rem;
+}
+
+.chat-message.assistant ul,
+.chat-message.assistant ol {
+  padding-left: 1.15rem;
+}
+
+.chat-message.assistant li {
+  margin: 0.15em 0;
+}
+
+/* Loose markdown lists wrap each item in <p>; without this every bullet gets
+   paragraph margins and the list reads triple-spaced. */
+.chat-message.assistant li > p {
+  margin: 0;
+}
+
+.chat-message.assistant > :first-child {
+  margin-top: 0;
+}
+
+.chat-message.assistant > :last-child {
   margin-bottom: 0;
 }
 

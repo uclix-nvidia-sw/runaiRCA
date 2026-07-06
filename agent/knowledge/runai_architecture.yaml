@@ -1,0 +1,624 @@
+# Run:ai platform architecture knowledge — component topology for RCA.
+#
+# Curated 2026-07-06 from the Run:ai platform/control-plane architecture diagrams,
+# with component names calibrated against a live self-hosted 2.x cluster
+# (`kubectl get deploy,ds,sts -n runai / -n runai-backend`). Used three ways:
+#   1. failure_modes.yaml symptoms carry `component: <name>`; the playbook then
+#      renders THAT component's checks + its dependency path (who to check next).
+#   2. The postgres drill-down's sql_select tool description is enriched with
+#      `owns_schema` (which control-plane DB schema holds what).
+#   3. Mirrored into TypeDB (ontology/load_architecture.py) as
+#      control_plane_component + depends_on, for graph joins with live incidents.
+#
+# Field notes:
+#   layer:        cluster | control_plane | external
+#   depends_on:   OTHER `component` values this one needs to do its job — the
+#                 troubleshooting order ("X is broken" -> also check its deps).
+#   owns_schema:  the control-plane Postgres schema this service owns (diagram 2).
+#   checks:       real commands an operator can run as-is.
+#   saas_only:    true = exists in the SaaS control plane only; kept for context,
+#                 excluded from self-hosted check-path rendering.
+#
+# The team maintains this file; load into TypeDB with:
+#   ENABLE_TYPEDB=true TYPEDB_ADDRESS=localhost:1729 python -m ontology.load_architecture
+
+# --- cluster side (namespace: runai) ----------------------------------------
+
+- component: runai-agent
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Pulls desired state DOWN from the control plane: projects/departments, access rules, policies, node pools, settings — and applies them as cluster CRDs."
+  failure_effect: "Changes made in the UI (new project, policy edit, access rule) never appear in the cluster; runaiconfig drift."
+  depends_on: [runai-backend-traefik, runai-backend-cluster-service]
+  checks:
+    - "kubectl logs -n runai deploy/runai-agent --tail=200"
+    - "kubectl get projects,departments,nodepools -A | head"
+
+- component: cluster-sync
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Pushes cluster state UP to the control plane (workload/cluster status stream the UI shows)."
+  failure_effect: "UI shows stale/disconnected cluster and outdated workload states while the cluster itself is fine."
+  depends_on: [status-updater, runai-backend-traefik, runai-backend-cluster-service, runai-backend-workloads]
+  checks:
+    - "kubectl logs -n runai deploy/cluster-sync --tail=200"
+    - "kubectl top pod -n runai | grep cluster-sync   # OOM/restart pressure"
+
+- component: assets-sync
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Syncs workload assets (environments, data sources, compute templates) from the control plane into the cluster."
+  failure_effect: "New/edited environments or data sources missing when submitting workloads."
+  depends_on: [runai-backend-traefik, runai-backend-assets-service]
+  checks:
+    - "kubectl logs -n runai deploy/assets-sync --tail=200"
+
+- component: runai-operator
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Reconciles runaiconfig: installs/upgrades every runai-namespace component."
+  failure_effect: "Components missing, stuck at old versions, or config changes (resources, features) never applied."
+  depends_on: []
+  checks:
+    - "kubectl logs -n runai deploy/runai-operator --tail=200"
+    - "kubectl get runaiconfig -n runai -o yaml | tail -40   # status/conditions"
+
+- component: runai-scheduler-default
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Run:ai's own scheduler (NOT kube-scheduler): gang scheduling by pod-group, deserved vs over-quota, fairshare, priority preemption, reclaim."
+  failure_effect: "Workloads Pending forever, sudden preempt/reclaim decisions, gang groups never starting."
+  depends_on: [pod-group-controller, queue-controller, nodepool-controller]
+  checks:
+    - "kubectl logs -n runai deploy/runai-scheduler-default --tail=300 | grep -i <workload>"
+
+- component: pod-grouper
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Creates the PodGroup for a workload's pods — the unit the scheduler gang-schedules."
+  failure_effect: "Pods exist but no PodGroup: the scheduler never even considers the workload (stuck Pending with no scheduler events)."
+  depends_on: []
+  checks:
+    - "kubectl logs -n runai deploy/pod-grouper --tail=200"
+    - "kubectl get podgroups -n <workload-ns> | grep <workload>"
+
+- component: pod-group-controller
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "PodGroup lifecycle/status (scheduled, running, recovering)."
+  failure_effect: "PodGroups stuck in a stale phase; gang state wrong even though pods moved."
+  depends_on: []
+  checks:
+    - "kubectl logs -n runai deploy/pod-group-controller --tail=200"
+
+- component: pod-group-assigner
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Assigns pods/pod-groups to node pools before scheduling."
+  failure_effect: "Workloads pending with node-pool mismatch even though capacity exists."
+  depends_on: [nodepool-controller]
+  checks:
+    - "kubectl logs -n runai deploy/pod-group-assigner --tail=200"
+
+- component: binder
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Binds scheduled pods to nodes, including GPU-fraction reservations (works with runai-container-toolkit)."
+  failure_effect: "Pods stay Pending AFTER a scheduling decision ('failed to bind'), or fraction pods stuck ContainerCreating."
+  depends_on: [runai-scheduler-default, runai-container-toolkit]
+  checks:
+    - "kubectl logs -n runai deploy/binder --tail=200"
+
+- component: workload-controller
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Reconciles Workload CRDs (TrainingWorkload/InteractiveWorkload/...) into RunaiJobs / distributed jobs."
+  failure_effect: "Workload submitted (CRD exists) but NOTHING is created underneath — no RunaiJob, no pods, no events."
+  depends_on: [runai-job-controller]
+  checks:
+    - "kubectl logs -n runai deploy/workload-controller --tail=200"
+    - "kubectl get trainingworkloads,interactiveworkloads -n <ns> | grep <name>"
+
+- component: runai-job-controller
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Reconciles RunaiJob into actual pods (and Kubeflow PyTorchJob/MPIJob for distributed)."
+  failure_effect: "RunaiJob exists but pods never appear, or distributed replicas half-created."
+  depends_on: []
+  checks:
+    - "kubectl logs -n runai deploy/runai-job-controller --tail=200"
+    - "kubectl get runaijobs -n <ns> -o wide | grep <name>"
+
+- component: inference-workload-controller
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Reconciles inference workloads (autoscaling serving)."
+  failure_effect: "Inference deployments not created/scaled while training workloads are fine."
+  depends_on: []
+  checks:
+    - "kubectl logs -n runai deploy/inference-workload-controller --tail=200"
+
+- component: external-workload-integrator
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Adopts non-Run:ai (external) workloads into Run:ai scheduling/visibility (ExternalWorkload objects)."
+  failure_effect: "Third-party workloads invisible to quota/UI or double-counted."
+  depends_on: []
+  checks:
+    - "kubectl logs -n runai deploy/external-workload-integrator --tail=200"
+
+- component: status-updater
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Aggregates workload/pod phase into the status the UI shows, feeding cluster-sync."
+  failure_effect: "Cluster truth fine, but workload phases in the UI wrong/frozen (Running shown as Pending etc.)."
+  depends_on: [cluster-sync]
+  checks:
+    - "kubectl logs -n runai deploy/status-updater --tail=200"
+
+- component: queue-controller
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Reconciles scheduling queues from projects/departments."
+  failure_effect: "New projects get no queue — their workloads unschedulable; quota changes not reflected."
+  depends_on: [runai-project-controller]
+  checks:
+    - "kubectl logs -n runai deploy/queue-controller --tail=200"
+    - "kubectl get queues -A | grep <project>"
+
+- component: runai-project-controller
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Reconciles Project CRDs: creates the project namespace, role bindings, defaults."
+  failure_effect: "Project created in UI but its namespace/rolebindings never materialise ('reconcile failure' alerts)."
+  depends_on: [runai-agent]
+  checks:
+    - "kubectl logs -n runai deploy/runai-project-controller --tail=200"
+    - "kubectl get project <name> -o yaml | tail -20"
+
+- component: nodepool-controller
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Reconciles NodePool CRDs (node labeling/partitioning for scheduling)."
+  failure_effect: "Node pool changes not applied; workloads pinned to a pool stay Pending."
+  depends_on: []
+  checks:
+    - "kubectl logs -n runai deploy/nodepool-controller --tail=200"
+    - "kubectl get nodepools -A"
+
+- component: accessrule-controller
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Applies access rules (who can use which project/scope) as cluster RBAC."
+  failure_effect: "Users lose/never get access even though the rule exists in the UI."
+  depends_on: [runai-agent]
+  checks:
+    - "kubectl logs -n runai deploy/accessrule-controller --tail=200"
+
+- component: shared-objects-controller
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Distributes shared objects (PVCs, secrets, configmaps declared as data sources) into project namespaces."
+  failure_effect: "Workloads fail mounting a shared data source that exists in the source namespace only."
+  depends_on: [runai-agent]
+  checks:
+    - "kubectl logs -n runai deploy/shared-objects-controller --tail=200"
+
+- component: runai-admission-controller
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Mutating/validating webhooks on workload pods (GPU fractions, env injection, policy enforcement)."
+  failure_effect: "Pod CREATION itself fails cluster-wide in project namespaces: 'failed calling webhook' — can block everything."
+  depends_on: []
+  checks:
+    - "kubectl logs -n runai deploy/runai-admission-controller --tail=200"
+    - "kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations | grep runai"
+
+- component: engine-admission
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Engine-level admission webhook (second admission path alongside runai-admission-controller)."
+  failure_effect: "Same blast pattern as runai-admission-controller: pod creation rejected/timing out."
+  depends_on: []
+  checks:
+    - "kubectl logs -n runai deploy/engine-admission --tail=200"
+
+- component: researcher-service
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "In-cluster API used by the runai CLI (v1) and SDK for job submission."
+  failure_effect: "CLI submissions fail while UI submissions still work (or vice versa)."
+  depends_on: [runai-backend-traefik]
+  checks:
+    - "kubectl logs -n runai deploy/researcher-service --tail=200"
+
+- component: cluster-api
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Cluster-side API endpoint the control plane calls into (workload actions from the UI: stop/delete/suspend)."
+  failure_effect: "UI actions on workloads (stop/delete) silently do nothing in the cluster."
+  depends_on: [cluster-redis]
+  checks:
+    - "kubectl logs -n runai deploy/cluster-api --tail=200"
+
+- component: cluster-redis
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "In-cluster cache/queue backing cluster-api."
+  failure_effect: "cluster-api errors/timeouts on UI-triggered actions."
+  depends_on: []
+  checks:
+    - "kubectl logs -n runai deploy/cluster-redis --tail=100"
+
+- component: metrics-exporter
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Exports Run:ai scheduling/quota metrics for Prometheus to scrape."
+  failure_effect: "Quota/allocation panels empty while node GPU metrics still work."
+  depends_on: [prometheus-runai]
+  checks:
+    - "kubectl logs -n runai deploy/metrics-exporter --tail=100"
+
+- component: workload-exporter
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Exports per-workload metrics."
+  failure_effect: "Per-workload utilisation graphs empty."
+  depends_on: [prometheus-runai]
+  checks:
+    - "kubectl logs -n runai deploy/workload-exporter --tail=100"
+
+- component: prometheus-runai
+  layer: cluster
+  namespace: runai
+  kind: StatefulSet
+  purpose: "Run:ai's bundled Prometheus: scrapes cluster/GPU metrics and remote-writes them to the control plane (thanos-receive)."
+  failure_effect: "ALL UI metrics stop (dashboards empty) while the cluster itself is healthy; gaps if remote_write backlogs."
+  depends_on: [runai-backend-thanos-receive, runai-node-exporter, metrics-exporter]
+  checks:
+    - "kubectl logs -n runai sts/prometheus-runai --tail=200 | grep -i 'remote_write\\|error'"
+    - "kubectl get pvc -n runai | grep prometheus"
+
+- component: runai-node-exporter
+  layer: cluster
+  namespace: runai
+  kind: DaemonSet
+  purpose: "Per-node GPU/DCGM metrics exporter."
+  failure_effect: "One node's GPU metrics missing (per-node gap, not platform-wide)."
+  depends_on: []
+  checks:
+    - "kubectl get pods -n runai -o wide | grep node-exporter | grep <node>"
+
+- component: runai-container-toolkit
+  layer: cluster
+  namespace: runai
+  kind: DaemonSet
+  purpose: "Per-node runtime piece enabling GPU fractions/memory limits inside containers."
+  failure_effect: "Fraction workloads on that node fail to start or see wrong GPU memory."
+  depends_on: []
+  checks:
+    - "kubectl logs -n runai ds/runai-container-toolkit --tail=100   # add --selector spec.nodeName=<node>"
+
+- component: workload-overseer
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Watches workloads for lifecycle housekeeping (cleanup, idle/timeout enforcement)."
+  failure_effect: "Idle/timeout policies not enforced; finished workloads never cleaned up."
+  depends_on: []
+  checks:
+    - "kubectl logs -n runai deploy/workload-overseer --tail=200"
+
+- component: engine-operator
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Operator for the workload engine stack (controllers above)."
+  failure_effect: "Engine controllers missing/outdated after upgrades."
+  depends_on: [runai-operator]
+  checks:
+    - "kubectl logs -n runai deploy/engine-operator --tail=200"
+
+# --- control plane (namespace: runai-backend, self-hosted) ------------------
+
+- component: runai-backend-traefik
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  purpose: "API gateway — every UI/CLI/cluster-sync/agent request enters here."
+  failure_effect: "EVERYTHING at once: UI down, CLI failing, clusters disconnected. Also the place token errors surface ('token used before issued' = clock skew)."
+  depends_on: [keycloak]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-traefik --tail=200"
+
+- component: keycloak
+  layer: control_plane
+  namespace: runai-backend
+  kind: StatefulSet
+  owns_schema: identity
+  purpose: "Identity provider (logins, tokens, SSO/OIDC/SAML federation)."
+  failure_effect: "Nobody can log in; CLI/agent tokens rejected platform-wide (401s everywhere)."
+  depends_on: [runai-backend-postgres]
+  checks:
+    - "kubectl logs -n runai-backend sts/keycloak --tail=200"
+
+- component: runai-backend-identity-manager
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  purpose: "Login/token orchestration in front of Keycloak (app tokens, user flows)."
+  failure_effect: "Login loops or app-token (client id/secret) auth failing while Keycloak itself is up."
+  depends_on: [keycloak]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-identity-manager --tail=200"
+
+- component: runai-backend-authorization
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  owns_schema: authorization
+  purpose: "RBAC decisions (roles, access rules) for every API call."
+  failure_effect: "403 Forbidden storms for users who should have access; access rules not taking effect."
+  depends_on: [runai-backend-postgres]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-authorization --tail=200"
+
+- component: runai-backend-tenants-manager
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  owns_schema: tenants
+  purpose: "Tenant lifecycle/config."
+  failure_effect: "Tenant-wide settings unreadable; login lands on a broken tenant."
+  depends_on: [runai-backend-postgres]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-tenants-manager --tail=200"
+
+- component: runai-backend-cluster-service
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  owns_schema: clusters
+  purpose: "Cluster registration + connectivity state (what 'Connected/Disconnected' in the UI reflects)."
+  failure_effect: "Clusters show Disconnected, cluster-sync/agent get errors pushing state."
+  depends_on: [runai-backend-postgres]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-cluster-service --tail=200"
+
+- component: runai-backend-org-unit-service
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  owns_schema: org_unit
+  purpose: "Departments/projects (organizational units) + quotas at the org level."
+  failure_effect: "Project/department CRUD failing in UI; quota edits not saved."
+  depends_on: [runai-backend-postgres]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-org-unit-service --tail=200"
+
+- component: runai-backend-workloads
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  owns_schema: workloads
+  purpose: "Workload state read-model the UI queries (fed by cluster-sync)."
+  failure_effect: "Workload list/detail pages empty or stale for ALL clusters."
+  depends_on: [runai-backend-postgres, runai-backend-nats]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-workloads --tail=200"
+
+- component: runai-backend-workloads-manager
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  purpose: "Workload aggregation/cache in front of the workloads read-model (known to grow memory to its cache cap)."
+  failure_effect: "Workload pages slow/OOM-restarting; memory growth to the cap is EXPECTED cache behaviour, not a leak."
+  depends_on: [runai-backend-workloads]
+  checks:
+    - "kubectl top pod -n runai-backend | grep workloads-manager"
+
+- component: runai-backend-workloads-helper
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  purpose: "Helper jobs for the workloads read-model (migrations/backfills)."
+  failure_effect: "Workload history/backfill gaps."
+  depends_on: [runai-backend-workloads]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-workloads-helper --tail=100"
+
+- component: runai-backend-policy-service
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  owns_schema: policies
+  purpose: "Workload policies (defaults/constraints applied at submission)."
+  failure_effect: "Policies not enforced or blocking submissions with policy errors."
+  depends_on: [runai-backend-postgres]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-policy-service --tail=200"
+
+- component: runai-backend-assets-service
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  owns_schema: assets
+  purpose: "Workload assets: environments, compute templates, data-source definitions."
+  failure_effect: "Assets missing in the submission form; assets-sync on clusters erroring."
+  depends_on: [runai-backend-postgres]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-assets-service --tail=200"
+
+- component: runai-backend-datavolumes
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  purpose: "Data volume asset management."
+  failure_effect: "Data-volume assets un-creatable/miss-syncing."
+  depends_on: [runai-backend-postgres]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-datavolumes --tail=100"
+
+- component: runai-backend-k8s-objects-tracker
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  owns_schema: k8s_object_tracker
+  purpose: "Mirror of cluster K8s objects the control plane needs (synced up from clusters)."
+  failure_effect: "UI views built on cluster objects (nodes, pods) stale/empty."
+  depends_on: [runai-backend-postgres]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-k8s-objects-tracker --tail=200"
+
+- component: runai-backend-audit-service
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  owns_schema: audit
+  purpose: "Audit log of user/API actions (who did what when — check here for 'what changed before the incident')."
+  failure_effect: "Audit trail gaps."
+  depends_on: [runai-backend-postgres]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-audit-service --tail=100"
+
+- component: runai-backend-metrics-service
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  purpose: "Metrics API the UI queries (reads Thanos)."
+  failure_effect: "All UI metric panels erroring even though Thanos has the data."
+  depends_on: [runai-backend-thanos-query]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-metrics-service --tail=200"
+
+- component: runai-backend-thanos-receive
+  layer: control_plane
+  namespace: runai-backend
+  kind: StatefulSet
+  purpose: "Receives remote-written metrics from every cluster's prometheus-runai; persists to its PVC."
+  failure_effect: "Metrics stop for ALL clusters (storage full/OOM are the classic causes)."
+  depends_on: []
+  checks:
+    - "kubectl logs -n runai-backend sts/runai-backend-thanos-receive --tail=200"
+    - "kubectl get pvc -n runai-backend | grep thanos"
+
+- component: runai-backend-thanos-query
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  purpose: "Query layer over thanos-receive."
+  failure_effect: "Dashboards empty/slow while ingestion continues fine."
+  depends_on: [runai-backend-thanos-receive]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-thanos-query --tail=200"
+
+- component: runai-backend-grafana
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  purpose: "Embedded dashboards in the UI."
+  failure_effect: "Dashboard iframes broken; metrics API may still be fine."
+  depends_on: [runai-backend-thanos-query]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-grafana --tail=100"
+
+- component: runai-backend-notifications-service
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  owns_schema: notifications
+  purpose: "User notifications (with notifications-proxy) over the NATS bus."
+  failure_effect: "Email/UI notifications silently not delivered."
+  depends_on: [runai-backend-nats, runai-backend-postgres]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-notifications-service --tail=100"
+
+- component: runai-backend-nats
+  layer: control_plane
+  namespace: runai-backend
+  kind: StatefulSet
+  purpose: "Message bus between control-plane services (events, workload streams)."
+  failure_effect: "Cross-service updates stall: workload events not propagating, notifications dead — while HTTP APIs still answer."
+  depends_on: []
+  checks:
+    - "kubectl logs -n runai-backend sts/runai-backend-nats --tail=200"
+
+- component: runai-backend-backend
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  owns_schema: backend
+  purpose: "Legacy monolith (deprecated): node pools, settings, backward compatibility."
+  failure_effect: "Settings/node-pool pages erroring on older API paths."
+  depends_on: [runai-backend-postgres]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-backend --tail=200"
+
+- component: runai-backend-frontend
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  purpose: "The web UI itself."
+  failure_effect: "UI unreachable while APIs still work."
+  depends_on: [runai-backend-traefik]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-frontend --tail=100"
+
+- component: runai-backend-cli-exposer
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  purpose: "Serves runai CLI (v2) binaries/config to users."
+  failure_effect: "CLI download/setup fails."
+  depends_on: []
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-cli-exposer --tail=100"
+
+- component: runai-backend-catalog-service
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  purpose: "Model/template catalog."
+  failure_effect: "Catalog pages empty."
+  depends_on: [runai-backend-postgres]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-catalog-service --tail=100"
+
+# --- shared external dependencies -------------------------------------------
+
+- component: runai-backend-postgres
+  layer: external
+  namespace: runai-backend
+  kind: External
+  purpose: "The control-plane PostgreSQL holding every service schema (identity, authorization, tenants, clusters, org_unit, workloads, policies, assets, k8s_object_tracker, audit, notifications, backend)."
+  failure_effect: "Platform-wide 5xx from MANY services at once — when several control-plane services fail together, check the DB first."
+  depends_on: []
+  checks:
+    - "kubectl get pods -n runai-backend | grep -i postgres"
+    - "kubectl get pvc -n runai-backend | grep -i postgres   # storage full is the classic"

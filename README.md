@@ -1,3 +1,5 @@
+**🇬🇧 English** · [🇰🇷 한국어](docs/ko/README.md)
+
 # Run:AI RCA
 
 Run:AI RCA is a KubeRCA-inspired incident analysis cockpit for NVIDIA Run:ai
@@ -24,36 +26,37 @@ docs/       Architecture and operation notes
 flowchart TD
   AM[Alertmanager] -->|webhook| BE[Backend API]
   FE[Frontend] <-->|REST + SSE| BE
-  BE -->|/analyze / chat| AG[Agent API]
-  BE <-->|incidents alerts feedback embeddings| DB[(PostgreSQL + pgvector / JSONB fallback)]
+  BE <-->|"persist + pgvector search: incidents · alerts · embeddings · feedback"| DB[(PostgreSQL + pgvector / JSONB fallback)]
+  BE -->|"summary + dashboard link on analysis complete (Slack)"| SLACK[Slack]
+  BE -->|"/analyze · /chat"| ORCH
 
-  subgraph "NeMo Agent Toolkit workflow"
-    ORCH[Parallel evidence orchestration]
-    RA[Run:ai agent]
-    KA[Kubernetes agent]
-    DBA[Postgres agent]
-    PA[Prometheus agent]
-    LA[Loki agent]
-    AA[Analysis / synthesis agent]
+  subgraph AG["Agent — analysis orchestrator"]
+    ORCH[Orchestrator]
+    PLAN[Planner: scope + hypotheses]
+    COLL["7 parallel collectors:<br/>runai · kubernetes · prometheus<br/>loki · postgres · system · change"]
+    INV["Central investigation loop<br/>+ per-collector autonomous drill-down"]
+    SYN["Signature match · BM25 recall<br/>ranking · self-check · synthesis"]
+    ORCH --> PLAN --> COLL --> INV --> SYN
   end
 
-  AG --> ORCH
-  ORCH --> RA & KA & DBA & PA & LA
-  RA & KA & DBA & PA & LA --> AA
-  AA <-->|"consults: blast radius, prior incidents"| KG[("TypeDB ontology knowledge base")]
-  AA -->|dashboard RCA + ranked causes| FE
-
-  DB -.->|review-gated ingestion| KG
+  DB -.->|"similar incidents + feedback hints (retrieved by backend)"| ORCH
+  ORCH <-->|"blast radius · prior incidents · family/XID fixes"| KG[("TypeDB ontology")]
+  COLL -->|Run:ai API| MCP[runai-mcp sidecar]
+  SYN -->|"RCA + ranked causes + evidence trail"| BE
+  DB -.->|review-gated ingest| KG
 ```
 
-The **Analysis/synthesis agent** — the step that aggregates every collector into a
-single RCA — consults the optional **TypeDB ontology knowledge base** once at
-synthesis time (`typedb.enabled`, default off) for relational facts pgvector
-can't express: node blast radius and prior incidents that fired the same alert
-(with their past RCA). The deterministic root-cause ranking (five families, rules
-R1–R6) runs as a tool of this same step. The knowledge base is a *resource the
-final agent reads*, not a separate parallel collector; it is populated by
-review-gated ingestion from the Postgres incident store.
+The **orchestrator** runs the whole pipeline: a planner scopes the work, seven
+collectors gather evidence in parallel, a central investigation loop and
+per-collector drill-down deepen it, then signature matching, ranking, a skeptical
+self-check, and synthesis produce one grounded RCA. The orchestrator itself
+consults the optional **TypeDB ontology** (`typedb.enabled`, default on in Helm)
+for relational facts pgvector can't express — node blast radius, prior same-alert
+incidents, and graph-derived family/XID remediation — populated by review-gated
+ingestion from the Postgres store. **pgvector** similarity is owned by the
+backend, which passes similar incidents and feedback hints into each analysis
+request. Full walkthrough: [RCA Pipeline](docs/RCA-PIPELINE.md) ·
+[Knowledge Base](docs/KNOWLEDGE-BASE.md).
 
 ## Local Development
 
@@ -176,6 +179,8 @@ Full table of contents (GitBook-ready): [`SUMMARY.md`](SUMMARY.md).
 
 - [Getting Started](docs/GETTING-STARTED.md) — run locally and get your first RCA
 - [Architecture](docs/ARCHITECTURE.md) — implementation contract
+- [RCA Pipeline](docs/RCA-PIPELINE.md) — every analysis stage, planner → synthesis
+- [Knowledge Base](docs/KNOWLEDGE-BASE.md) — curated catalogs + TypeDB ontology
 - [Operating Model](docs/OPERATING-MODEL.md) — operating model
 - [Data Stores](docs/DATABASE.md) — PostgreSQL + TypeDB ontology
 - [UI Direction](docs/UI-DIRECTION.md) — UI/UX direction
