@@ -38,7 +38,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `RUNAI_QUEUES_PATH` | Run:ai queues API path, default `/api/v1/queues` |
 | `RUNAI_VERSION_PATH` | Run:ai control-plane version API path, default `/api/v1/version` — enables version-aware suppression of already-fixed known issues |
 | `RUNAI_TIMEOUT_SECONDS` | Run:ai API request timeout, default `120` |
-| `RUNAI_MCP_URL` | Optional runai-mcp sidecar URL (stdio→HTTP bridge, e.g. `http://localhost:8809/mcp`). When set, the runai collector + drill-down reach the 426 Run:ai APIs spec-aware; any failure falls back to the fixed-endpoint collector |
+| `RUNAI_MCP_URL` | runai-mcp sidecar URL (stdio→HTTP bridge, e.g. `http://localhost:8809/mcp`). When set, the runai collector + drill-down reach the 426 Run:ai APIs spec-aware; any failure falls back to the fixed-endpoint collector. Helm runs the sidecar and sets this by default (`runaiMcp.enabled: true`) |
 | `RUNAI_LOG_NAMESPACES` | Comma-separated Run:ai control-plane log namespaces, default `runai,runai-backend` |
 | `PROMETHEUS_URL` | Prometheus base URL |
 | `PROMETHEUS_TIMEOUT_SECONDS` | Prometheus query timeout |

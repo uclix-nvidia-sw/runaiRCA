@@ -212,9 +212,10 @@ Every artifact is built for an operator to read at a glance:
 
 When `RUNAI_MCP_URL` is set, the runai collector and the runai drill-down agent
 reach the [runai-mcp](https://github.com/sejongjeong/runai-mcp) server (deployed
-as a sidecar behind mcp-proxy) for spec-aware access to the 426 Run:ai APIs. Any
-failure falls back to the fixed-endpoint direct-HTTP collector — strictly
-additive, never breaks analysis.
+as a sidecar behind mcp-proxy) for spec-aware access to the 426 Run:ai APIs. The
+Helm chart runs the sidecar and sets the URL by default (`runaiMcp.enabled:
+true`). Any failure falls back to the fixed-endpoint direct-HTTP collector —
+strictly additive, never breaks analysis.
 
 ## Configuration
 
