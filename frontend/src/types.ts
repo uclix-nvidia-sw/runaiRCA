@@ -170,6 +170,26 @@ export type LLMSpendStats = LLMSpendBucket & {
   daily: LLMSpendDay[];
 };
 
+export type KPIBucket = {
+  count: number;
+  avg_minutes: number;
+  p50_minutes: number;
+  p90_minutes: number;
+};
+
+export type KPIDay = {
+  date: string;
+  time_to_rca: KPIBucket;
+  time_to_resolve: KPIBucket;
+};
+
+export type KPIStats = {
+  days: number;
+  time_to_rca: KPIBucket;
+  time_to_resolve: KPIBucket;
+  daily: KPIDay[];
+};
+
 export type Envelope<T> = {
   status: string;
   data: T;

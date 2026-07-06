@@ -58,6 +58,7 @@ import {
   fetchAlerts,
   fetchIncident,
   fetchIncidents,
+  fetchKPIStats,
   fetchLLMSpendStats,
   fetchRecurrenceStats,
   resolveIncident,
@@ -72,7 +73,7 @@ import {
 } from './api';
 import nvidiaLogo from './assets/nvidia-logo.svg';
 import { exportIncidentDocx } from './exportDocx';
-import { AlertRecord, AnalysisRun, Artifact, FeedbackSummary, Incident, IncidentDetail, LLMSpendStats, PageInfo, RecurrenceStats, SimilarIncident } from './types';
+import { AlertRecord, AnalysisRun, Artifact, FeedbackSummary, Incident, IncidentDetail, KPIStats, LLMSpendStats, PageInfo, RecurrenceStats, SimilarIncident } from './types';
 
 const TrendChartCanvas = lazy(() => import('./TrendChartCanvas'));
 const DASHBOARD_PAGE_SIZE = 15;
@@ -1606,6 +1607,7 @@ function AnalysisDashboard({
   const [windowDays, setWindowDays] = useState(14);
   const [recurrence, setRecurrence] = useState<RecurrenceStats | null>(null);
   const [llmSpend, setLLMSpend] = useState<LLMSpendStats | null>(null);
+  const [kpiStats, setKpiStats] = useState<KPIStats | null>(null);
   const analytics = useMemo(
     () => buildAnalysisAnalytics(allRecords, incidents, alerts, windowDays),
     [allRecords, alerts, incidents, windowDays],
@@ -1645,6 +1647,13 @@ function AnalysisDashboard({
       .catch(() => {
         if (!cancelled) setLLMSpend(null);
       });
+    fetchKPIStats(windowDays)
+      .then((stats) => {
+        if (!cancelled) setKpiStats(stats);
+      })
+      .catch(() => {
+        if (!cancelled) setKpiStats(null);
+      });
     return () => {
       cancelled = true;
     };
@@ -1671,8 +1680,8 @@ function AnalysisDashboard({
       <section className="metric-row">
         <Metric label="Incidents" value={analytics.summary.totalIncidents} />
         <Metric label="Alerts" value={analytics.summary.totalAlerts} />
-        <Metric label="Avg MTTR" value={formatDurationMinutes(analytics.summary.avgMttrMinutes)} />
-        <Metric label="Alerts / Incident" value={formatDecimal(analytics.summary.avgAlertsPerIncident)} />
+        <Metric label="Avg RCA" value={formatDurationMinutes(kpiStats?.time_to_rca.avg_minutes ?? 0)} />
+        <Metric label="Avg MTTR" value={formatDurationMinutes(kpiStats?.time_to_resolve.avg_minutes ?? analytics.summary.avgMttrMinutes)} />
       </section>
 
       <section className="analysis-pipeline" aria-label="Collector and synthesis pipeline">

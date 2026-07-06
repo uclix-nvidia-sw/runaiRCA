@@ -134,6 +134,9 @@ func TestAnalysisRunStoresLLMUsageMetadataAndClearsOnReanalysis(t *testing.T) {
 	if !ok {
 		t.Fatalf("complete failed")
 	}
+	if completed.FirstCompletedAt == nil {
+		t.Fatalf("first completion timestamp was not set: %+v", completed)
+	}
 	usage, ok := completed.Metadata["llm_usage"].(map[string]any)
 	if !ok || usage["total_tokens"] != float64(8) {
 		t.Fatalf("usage metadata missing: %+v", completed.Metadata)
@@ -144,8 +147,43 @@ func TestAnalysisRunStoresLLMUsageMetadataAndClearsOnReanalysis(t *testing.T) {
 	}
 
 	reused, created := store.CreateAnalysisRunIfAllowed("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Again", "")
-	if !created || reused.RunID != run.RunID || reused.Metadata != nil {
+	if !created || reused.RunID != run.RunID || reused.Metadata != nil || reused.FirstCompletedAt == nil {
 		t.Fatalf("reanalysis should reuse row and clear metadata, created=%t run=%+v", created, reused)
+	}
+}
+
+func TestKPIStatsUsesFirstCompletedAt(t *testing.T) {
+	store := NewStore()
+	now := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
+	firedAt := now.Add(-2 * time.Hour)
+	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "kpi"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-kpi",
+		StartsAt:    firedAt.Format(time.RFC3339),
+	})
+	run := store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Manual", "")
+	store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{AnalysisSummary: "done"})
+	firstCompletedAt := firedAt.Add(15 * time.Minute)
+	resolvedAt := firedAt.Add(60 * time.Minute)
+	store.mu.Lock()
+	store.analysisRuns[run.RunID].FirstCompletedAt = &firstCompletedAt
+	store.analysisRuns[run.RunID].UpdatedAt = firedAt.Add(90 * time.Minute)
+	store.incidents[incident.IncidentID].ResolvedAt = &resolvedAt
+	store.incidents[incident.IncidentID].Status = "resolved"
+	store.mu.Unlock()
+
+	stats := store.KPIStats(7, now)
+
+	if stats.TimeToRCA.Count != 1 || stats.TimeToRCA.AvgMinutes != 15 {
+		t.Fatalf("expected 15m time-to-RCA from first_completed_at, got %+v", stats.TimeToRCA)
+	}
+	if stats.TimeToResolve.Count != 1 || stats.TimeToResolve.AvgMinutes != 60 {
+		t.Fatalf("expected 60m time-to-resolve, got %+v", stats.TimeToResolve)
+	}
+	if stats.Daily[len(stats.Daily)-1].TimeToRCA.Count != 1 {
+		t.Fatalf("expected KPI in latest day bucket, got %+v", stats.Daily)
 	}
 }
 

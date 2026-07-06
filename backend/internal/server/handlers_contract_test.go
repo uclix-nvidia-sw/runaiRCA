@@ -233,6 +233,33 @@ func TestLLMSpendStatsEndpointContract(t *testing.T) {
 	}
 }
 
+func TestKPIStatsEndpointContract(t *testing.T) {
+	server := NewServer()
+	incident, alert := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "kpi-contract"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-kpi-contract",
+	})
+	run := server.store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Manual", "")
+	server.store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{AnalysisSummary: "done"})
+
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/stats/kpi?days=7", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected kpi stats 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var envelope struct {
+		Data KPIStats `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode kpi stats: %v", err)
+	}
+	if envelope.Data.TimeToRCA.Count != 1 || len(envelope.Data.Daily) != 7 {
+		t.Fatalf("unexpected kpi stats: %+v", envelope.Data)
+	}
+}
+
 func TestIncidentLifecycleActionContractsAndEvents(t *testing.T) {
 	server := NewServer()
 	incident, _ := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "action-contract"}, Alert{

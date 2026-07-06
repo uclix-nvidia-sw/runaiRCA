@@ -282,10 +282,12 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			warnings JSONB NOT NULL DEFAULT '[]'::jsonb,
 			artifacts JSONB NOT NULL DEFAULT '[]'::jsonb,
 			metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+			first_completed_at TIMESTAMPTZ,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb`,
+		`ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS first_completed_at TIMESTAMPTZ`,
 		`CREATE INDEX IF NOT EXISTS idx_alerts_incident_id ON alerts (incident_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_feedback_target ON rca_feedback (target_type, target_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_comments_target ON rca_comments (target_type, target_id)`,
@@ -701,7 +703,7 @@ func (s *Store) loadAnalysisRuns(ctx context.Context) {
 		`SELECT run_id, source, status, target_type, target_id, incident_id,
 		        alert_id, title, prompt, analysis_summary, analysis_detail,
 		        analysis_quality, capabilities, missing_data, warnings, artifacts, metadata,
-		        created_at, updated_at
+		        first_completed_at, created_at, updated_at
 		   FROM analysis_runs`,
 	)
 	if err != nil {
@@ -732,6 +734,7 @@ func (s *Store) loadAnalysisRuns(ctx context.Context) {
 			&warningsRaw,
 			&artifactsRaw,
 			&metadataRaw,
+			&run.FirstCompletedAt,
 			&run.CreatedAt,
 			&run.UpdatedAt,
 		); err != nil {
@@ -1059,10 +1062,10 @@ func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) bool {
 		`INSERT INTO analysis_runs (
 			run_id, source, status, target_type, target_id, incident_id, alert_id,
 			title, prompt, analysis_summary, analysis_detail, analysis_quality,
-			capabilities, missing_data, warnings, artifacts, metadata, created_at, updated_at
+			capabilities, missing_data, warnings, artifacts, metadata, first_completed_at, created_at, updated_at
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-			$15, $16, $17, $18, $19
+			$15, $16, $17, $18, $19, $20
 		)
 		ON CONFLICT (run_id) DO UPDATE SET
 			source = EXCLUDED.source,
@@ -1081,6 +1084,7 @@ func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) bool {
 			warnings = EXCLUDED.warnings,
 			artifacts = EXCLUDED.artifacts,
 			metadata = EXCLUDED.metadata,
+			first_completed_at = EXCLUDED.first_completed_at,
 			updated_at = EXCLUDED.updated_at`,
 		run.RunID,
 		run.Source,
@@ -1099,6 +1103,7 @@ func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) bool {
 		mustJSON(run.Warnings),
 		mustJSON(run.Artifacts),
 		mustJSON(firstAnyMap(run.Metadata)),
+		run.FirstCompletedAt,
 		run.CreatedAt,
 		run.UpdatedAt,
 	)

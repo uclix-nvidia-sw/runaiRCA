@@ -39,6 +39,7 @@ func TestPostgresConnectReportsPGVectorEnabledAndLoadsState(t *testing.T) {
 		"ADD COLUMN IF NOT EXISTS archived_at",
 		"ADD COLUMN IF NOT EXISTS deleted_at",
 		"ADD COLUMN IF NOT EXISTS metadata",
+		"ADD COLUMN IF NOT EXISTS first_completed_at",
 	} {
 		if !state.Executed(ddl) {
 			t.Fatalf("expected DDL %q, got %+v", ddl, state.Execs())

@@ -14,25 +14,26 @@ import (
 // webhook analysis is alert-scoped and idempotent; explicit operator requests
 // still create their own runs so manual follow-up remains auditable.
 type AnalysisRun struct {
-	RunID           string            `json:"run_id"`
-	Source          string            `json:"source"`
-	Status          string            `json:"status"`
-	TargetType      string            `json:"target_type"`
-	TargetID        string            `json:"target_id"`
-	IncidentID      string            `json:"incident_id,omitempty"`
-	AlertID         string            `json:"alert_id,omitempty"`
-	Title           string            `json:"title"`
-	Prompt          string            `json:"prompt,omitempty"`
-	AnalysisSummary string            `json:"analysis_summary"`
-	AnalysisDetail  string            `json:"analysis_detail"`
-	AnalysisQuality string            `json:"analysis_quality"`
-	Capabilities    map[string]string `json:"capabilities"`
-	MissingData     []string          `json:"missing_data"`
-	Warnings        []string          `json:"warnings"`
-	Artifacts       []Artifact        `json:"artifacts"`
-	Metadata        map[string]any    `json:"metadata,omitempty"`
-	CreatedAt       time.Time         `json:"created_at"`
-	UpdatedAt       time.Time         `json:"updated_at"`
+	RunID            string            `json:"run_id"`
+	Source           string            `json:"source"`
+	Status           string            `json:"status"`
+	TargetType       string            `json:"target_type"`
+	TargetID         string            `json:"target_id"`
+	IncidentID       string            `json:"incident_id,omitempty"`
+	AlertID          string            `json:"alert_id,omitempty"`
+	Title            string            `json:"title"`
+	Prompt           string            `json:"prompt,omitempty"`
+	AnalysisSummary  string            `json:"analysis_summary"`
+	AnalysisDetail   string            `json:"analysis_detail"`
+	AnalysisQuality  string            `json:"analysis_quality"`
+	Capabilities     map[string]string `json:"capabilities"`
+	MissingData      []string          `json:"missing_data"`
+	Warnings         []string          `json:"warnings"`
+	Artifacts        []Artifact        `json:"artifacts"`
+	Metadata         map[string]any    `json:"metadata,omitempty"`
+	FirstCompletedAt *time.Time        `json:"first_completed_at,omitempty"`
+	CreatedAt        time.Time         `json:"created_at"`
+	UpdatedAt        time.Time         `json:"updated_at"`
 }
 
 // startAnalysisRun resolves the analysis target, creates an analyzing run when

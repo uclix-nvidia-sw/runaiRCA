@@ -235,6 +235,26 @@ type LLMSpendStats struct {
 	Daily   []LLMSpendDay             `json:"daily"`
 }
 
+type KPIBucket struct {
+	Count      int     `json:"count"`
+	AvgMinutes float64 `json:"avg_minutes"`
+	P50Minutes float64 `json:"p50_minutes"`
+	P90Minutes float64 `json:"p90_minutes"`
+}
+
+type KPIDay struct {
+	Date          string    `json:"date"`
+	TimeToRCA     KPIBucket `json:"time_to_rca"`
+	TimeToResolve KPIBucket `json:"time_to_resolve"`
+}
+
+type KPIStats struct {
+	Days          int       `json:"days"`
+	TimeToRCA     KPIBucket `json:"time_to_rca"`
+	TimeToResolve KPIBucket `json:"time_to_resolve"`
+	Daily         []KPIDay  `json:"daily"`
+}
+
 type Server struct {
 	store                     *Store
 	hub                       *Hub
@@ -419,6 +439,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleRecurrenceStats(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/stats/llm-spend":
 		s.handleLLMSpendStats(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/stats/kpi":
+		s.handleKPIStats(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/events":
 		s.handleEvents(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/chat":
@@ -506,6 +528,14 @@ func (s *Server) handleLLMSpendStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, envelope(s.store.LLMSpendStats(days, time.Now().UTC())))
+}
+
+func (s *Server) handleKPIStats(w http.ResponseWriter, r *http.Request) {
+	days, ok := daysFromRequest(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, envelope(s.store.KPIStats(days, time.Now().UTC())))
 }
 
 func daysFromRequest(w http.ResponseWriter, r *http.Request) (int, bool) {

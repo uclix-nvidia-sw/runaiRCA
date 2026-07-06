@@ -974,6 +974,111 @@ func usageFloat(value any) float64 {
 	}
 }
 
+func (s *Store) KPIStats(days int, now time.Time) KPIStats {
+	if days <= 0 {
+		days = 7
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	since := now.AddDate(0, 0, -days)
+	stats := KPIStats{Days: days, Daily: make([]KPIDay, 0, days)}
+	byDate := map[string]int{}
+	rcaByDay := make([][]float64, days)
+	resolveByDay := make([][]float64, days)
+	for i := days - 1; i >= 0; i-- {
+		date := now.AddDate(0, 0, -i).Format("2006-01-02")
+		stats.Daily = append(stats.Daily, KPIDay{Date: date})
+		byDate[date] = len(stats.Daily) - 1
+	}
+
+	rcaMinutes := []float64{}
+	resolveMinutes := []float64{}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, incident := range s.incidents {
+		if incident == nil || incidentDeleted(incident) || incident.FiredAt.Before(since) || incident.FiredAt.After(now) {
+			continue
+		}
+		day, hasDay := byDate[incident.FiredAt.Format("2006-01-02")]
+		if firstCompleted := s.firstCompletedAtForIncidentLocked(incident.IncidentID); firstCompleted != nil && !firstCompleted.Before(incident.FiredAt) {
+			minutes := firstCompleted.Sub(incident.FiredAt).Minutes()
+			rcaMinutes = append(rcaMinutes, minutes)
+			if hasDay {
+				rcaByDay[day] = append(rcaByDay[day], minutes)
+			}
+		}
+		if incident.ResolvedAt != nil && !incident.ResolvedAt.Before(incident.FiredAt) {
+			minutes := incident.ResolvedAt.Sub(incident.FiredAt).Minutes()
+			resolveMinutes = append(resolveMinutes, minutes)
+			if hasDay {
+				resolveByDay[day] = append(resolveByDay[day], minutes)
+			}
+		}
+	}
+	stats.TimeToRCA = kpiBucket(rcaMinutes)
+	stats.TimeToResolve = kpiBucket(resolveMinutes)
+	for i := range stats.Daily {
+		stats.Daily[i].TimeToRCA = kpiBucket(rcaByDay[i])
+		stats.Daily[i].TimeToResolve = kpiBucket(resolveByDay[i])
+	}
+	return stats
+}
+
+func (s *Store) firstCompletedAtForIncidentLocked(incidentID string) *time.Time {
+	var selected *time.Time
+	for _, run := range s.analysisRuns {
+		if run == nil || run.Status != "complete" || run.IncidentID != incidentID {
+			continue
+		}
+		completedAt := run.FirstCompletedAt
+		if completedAt == nil {
+			completedAt = &run.UpdatedAt
+		}
+		if selected == nil || completedAt.Before(*selected) {
+			value := *completedAt
+			selected = &value
+		}
+	}
+	return selected
+}
+
+func kpiBucket(values []float64) KPIBucket {
+	if len(values) == 0 {
+		return KPIBucket{}
+	}
+	sorted := append([]float64(nil), values...)
+	sort.Float64s(sorted)
+	sum := 0.0
+	for _, value := range sorted {
+		sum += value
+	}
+	return KPIBucket{
+		Count:      len(sorted),
+		AvgMinutes: roundMinutes(sum / float64(len(sorted))),
+		P50Minutes: roundMinutes(percentile(sorted, 0.50)),
+		P90Minutes: roundMinutes(percentile(sorted, 0.90)),
+	}
+}
+
+func percentile(sorted []float64, q float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	index := int(float64(len(sorted)-1)*q + 0.5)
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(sorted) {
+		index = len(sorted) - 1
+	}
+	return sorted[index]
+}
+
+func roundMinutes(value float64) float64 {
+	return float64(int(value*10+0.5)) / 10
+}
+
 func recurrenceRate(recurred int, total int) float64 {
 	if total <= 0 {
 		return 0
@@ -1244,6 +1349,9 @@ func (s *Store) CompleteAnalysisRun(runID string, response AgentAnalysisResponse
 	run.Artifacts = response.Artifacts
 	run.Metadata = metadataFromAgentContext(response.Context)
 	run.UpdatedAt = time.Now().UTC()
+	if run.FirstCompletedAt == nil {
+		run.FirstCompletedAt = &run.UpdatedAt
+	}
 	if !s.persistAnalysisRunLocked(run) {
 		*run = before
 		return cloneAnalysisRun(run), false

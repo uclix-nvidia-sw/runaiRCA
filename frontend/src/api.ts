@@ -1,4 +1,4 @@
-import { AlertRecord, AnalysisRun, Envelope, FeedbackSummary, Incident, IncidentDetail, LLMSpendStats, PageInfo, RecurrenceStats } from './types';
+import { AlertRecord, AnalysisRun, Envelope, FeedbackSummary, Incident, IncidentDetail, KPIStats, LLMSpendStats, PageInfo, RecurrenceStats } from './types';
 
 const runtimeApiBase = window.__RUNAI_RCA_CONFIG__?.apiBaseUrl;
 const fallbackApiBase = import.meta.env.DEV ? 'http://localhost:8080' : '';
@@ -117,6 +117,10 @@ export async function fetchRecurrenceStats(days = 7): Promise<RecurrenceStats> {
 
 export async function fetchLLMSpendStats(days = 7): Promise<LLMSpendStats> {
   return (await read<Envelope<LLMSpendStats>>(`/api/v1/stats/llm-spend?days=${encodeURIComponent(String(days))}`)).data;
+}
+
+export async function fetchKPIStats(days = 7): Promise<KPIStats> {
+  return (await read<Envelope<KPIStats>>(`/api/v1/stats/kpi?days=${encodeURIComponent(String(days))}`)).data;
 }
 
 export async function submitFeedback(

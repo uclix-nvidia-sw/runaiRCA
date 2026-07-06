@@ -330,13 +330,13 @@ func (s *PostgresState) rowsFor(query string) driver.Rows {
 				"run_id", "source", "status", "target_type", "target_id", "incident_id",
 				"alert_id", "title", "prompt", "analysis_summary", "analysis_detail",
 				"analysis_quality", "capabilities", "missing_data", "warnings", "artifacts",
-				"metadata", "created_at", "updated_at",
+				"metadata", "first_completed_at", "created_at", "updated_at",
 			},
 			values: [][]driver.Value{{
 				"ANL-db", "comment", "complete", "incident", "INC-db", "INC-db",
 				"", "Comment reanalysis", "check scheduler logs", "Reanalysis completed.",
 				"Scheduler logs confirmed quota saturation.", "high", s.capabilitiesJSON,
-				s.emptyArrayJSON, s.emptyArrayJSON, s.emptyArrayJSON, s.emptyObjectJSON, s.now, s.now,
+				s.emptyArrayJSON, s.emptyArrayJSON, s.emptyArrayJSON, s.emptyObjectJSON, s.now, s.now, s.now,
 			}},
 		}
 	default:
