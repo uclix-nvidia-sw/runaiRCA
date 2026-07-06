@@ -1259,6 +1259,7 @@ td span.occurrence-pill {
 
 .trend-panel,
 .recurrence-panel,
+.llm-spend-panel,
 .agent-state-panel,
 .distribution-panel,
 .top-dimension-panel {
@@ -1331,6 +1332,68 @@ td span.occurrence-pill {
 
 .recurrence-row i.is-down {
   border-top: 0.55rem solid #ff3e13;
+}
+
+.llm-spend-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.5rem;
+  padding: 0.15rem 0.8rem 0.55rem;
+}
+
+.llm-spend-summary div {
+  min-width: 0;
+  border-radius: 0.45rem;
+  background: #f7faf3;
+  padding: 0.48rem 0.55rem;
+}
+
+.llm-spend-summary span,
+.llm-model-row span,
+.llm-model-row em {
+  color: #6c7487;
+  font-size: 0.68rem;
+  font-style: normal;
+  font-weight: 750;
+}
+
+.llm-spend-summary strong {
+  display: block;
+  color: #050816;
+  font-size: 0.92rem;
+  font-weight: 850;
+  line-height: 1.2;
+}
+
+.llm-model-list {
+  display: grid;
+  padding: 0 0.8rem 0.62rem;
+}
+
+.llm-model-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 4.5rem 4rem;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2rem;
+  border-top: 1px solid #f2f4f7;
+}
+
+.llm-model-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.llm-model-row b {
+  color: #151e23;
+  font-size: 0.76rem;
+  font-weight: 850;
+  text-align: right;
+}
+
+.llm-model-row em {
+  text-align: right;
 }
 
 .agent-state-list {

@@ -2,6 +2,7 @@ package server
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -876,6 +877,101 @@ func (s *Store) invalidateRecurrenceStatsLocked() {
 func cloneRecurrenceStats(stats RecurrenceStats) RecurrenceStats {
 	stats.Daily = append([]RecurrenceDay(nil), stats.Daily...)
 	return stats
+}
+
+func (s *Store) LLMSpendStats(days int, now time.Time) LLMSpendStats {
+	if days <= 0 {
+		days = 7
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	since := now.AddDate(0, 0, -days)
+	stats := LLMSpendStats{
+		Days:    days,
+		ByModel: map[string]LLMSpendBucket{},
+		Daily:   make([]LLMSpendDay, 0, days),
+	}
+	byDate := map[string]int{}
+	for i := days - 1; i >= 0; i-- {
+		date := now.AddDate(0, 0, -i).Format("2006-01-02")
+		stats.Daily = append(stats.Daily, LLMSpendDay{Date: date})
+		byDate[date] = len(stats.Daily) - 1
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, run := range s.analysisRuns {
+		if run == nil || run.UpdatedAt.Before(since) || run.UpdatedAt.After(now) {
+			continue
+		}
+		usage, ok := run.Metadata["llm_usage"].(map[string]any)
+		if !ok {
+			continue
+		}
+		addUsageBucket(&stats.LLMSpendBucket, usage)
+		if day, ok := byDate[run.UpdatedAt.Format("2006-01-02")]; ok {
+			addUsageBucket(&stats.Daily[day].LLMSpendBucket, usage)
+		}
+		if rawByModel, ok := usage["by_model"].(map[string]any); ok {
+			for model, rawBucket := range rawByModel {
+				bucketMap, ok := rawBucket.(map[string]any)
+				if !ok {
+					continue
+				}
+				bucket := stats.ByModel[model]
+				addUsageBucket(&bucket, bucketMap)
+				stats.ByModel[model] = bucket
+			}
+		}
+	}
+	return stats
+}
+
+func addUsageBucket(bucket *LLMSpendBucket, usage map[string]any) {
+	bucket.Calls += usageInt(usage["calls"])
+	bucket.CallsWithoutUsage += usageInt(usage["calls_without_usage"])
+	bucket.FailedCalls += usageInt(usage["failed_calls"])
+	bucket.PromptTokens += usageInt(usage["prompt_tokens"])
+	bucket.CompletionTokens += usageInt(usage["completion_tokens"])
+	bucket.TotalTokens += usageInt(usage["total_tokens"])
+	bucket.CostUSD += usageFloat(usage["cost_usd"])
+}
+
+func usageInt(value any) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case float32:
+		return int(v)
+	case json.Number:
+		out, _ := v.Int64()
+		return int(out)
+	default:
+		return 0
+	}
+}
+
+func usageFloat(value any) float64 {
+	switch v := value.(type) {
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case float64:
+		return v
+	case float32:
+		return float64(v)
+	case json.Number:
+		out, _ := v.Float64()
+		return out
+	default:
+		return 0
+	}
 }
 
 func recurrenceRate(recurred int, total int) float64 {

@@ -58,6 +58,7 @@ import {
   fetchAlerts,
   fetchIncident,
   fetchIncidents,
+  fetchLLMSpendStats,
   fetchRecurrenceStats,
   resolveIncident,
   restoreIncident,
@@ -71,7 +72,7 @@ import {
 } from './api';
 import nvidiaLogo from './assets/nvidia-logo.svg';
 import { exportIncidentDocx } from './exportDocx';
-import { AlertRecord, AnalysisRun, Artifact, FeedbackSummary, Incident, IncidentDetail, PageInfo, RecurrenceStats, SimilarIncident } from './types';
+import { AlertRecord, AnalysisRun, Artifact, FeedbackSummary, Incident, IncidentDetail, LLMSpendStats, PageInfo, RecurrenceStats, SimilarIncident } from './types';
 
 const TrendChartCanvas = lazy(() => import('./TrendChartCanvas'));
 const DASHBOARD_PAGE_SIZE = 15;
@@ -1604,6 +1605,7 @@ function AnalysisDashboard({
 }) {
   const [windowDays, setWindowDays] = useState(14);
   const [recurrence, setRecurrence] = useState<RecurrenceStats | null>(null);
+  const [llmSpend, setLLMSpend] = useState<LLMSpendStats | null>(null);
   const analytics = useMemo(
     () => buildAnalysisAnalytics(allRecords, incidents, alerts, windowDays),
     [allRecords, alerts, incidents, windowDays],
@@ -1635,6 +1637,13 @@ function AnalysisDashboard({
       })
       .catch(() => {
         if (!cancelled) setRecurrence(null);
+      });
+    fetchLLMSpendStats(windowDays)
+      .then((stats) => {
+        if (!cancelled) setLLMSpend(stats);
+      })
+      .catch(() => {
+        if (!cancelled) setLLMSpend(null);
       });
     return () => {
       cancelled = true;
@@ -1702,6 +1711,7 @@ function AnalysisDashboard({
         <div className="analysis-focus-side">
           <div className="analysis-side-stack">
             <RecurrencePanel rows={recurringIncidentRows} stats={recurrence} />
+            <LLMSpendPanel stats={llmSpend} />
           </div>
         </div>
       </section>
@@ -1798,6 +1808,44 @@ function RecurrencePanel({ rows, stats }: { rows: RecurringIncidentRow[]; stats:
           </div>
         ))}
         {rows.length === 0 && <p className="empty compact-empty">No recurrence data</p>}
+      </div>
+    </section>
+  );
+}
+
+function LLMSpendPanel({ stats }: { stats: LLMSpendStats | null }) {
+  const models = Object.entries(stats?.by_model ?? {})
+    .sort(([, left], [, right]) => (right.cost_usd || right.total_tokens) - (left.cost_usd || left.total_tokens))
+    .slice(0, 3);
+  return (
+    <section className="llm-spend-panel">
+      <div className="panel-header compact-panel-header">
+        <h3>LLM usage</h3>
+        <span>{stats ? formatUSD(stats.cost_usd) : '-'}</span>
+      </div>
+      <div className="llm-spend-summary">
+        <div>
+          <span>Tokens</span>
+          <strong>{formatCompactNumber(stats?.total_tokens ?? 0)}</strong>
+        </div>
+        <div>
+          <span>Calls</span>
+          <strong>{stats?.calls ?? 0}</strong>
+        </div>
+        <div>
+          <span>Failed</span>
+          <strong>{stats?.failed_calls ?? 0}</strong>
+        </div>
+      </div>
+      <div className="llm-model-list">
+        {models.map(([model, bucket]) => (
+          <div className="llm-model-row" key={model}>
+            <span>{model}</span>
+            <b>{formatCompactNumber(bucket.total_tokens)}</b>
+            <em>{formatUSD(bucket.cost_usd)}</em>
+          </div>
+        ))}
+        {models.length === 0 && <p className="empty compact-empty">No LLM usage</p>}
       </div>
     </section>
   );
@@ -3848,6 +3896,17 @@ function formatDurationMinutes(value: number) {
 
 function formatDecimal(value: number) {
   return value.toFixed(1);
+}
+
+function formatCompactNumber(value: number) {
+  if (!Number.isFinite(value)) return '0';
+  return new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(value);
+}
+
+function formatUSD(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return '$0';
+  if (value < 0.01) return `$${value.toFixed(4)}`;
+  return `$${value.toFixed(2)}`;
 }
 
 function dominantCapability(records: AnalysisRecord[], agent: string) {

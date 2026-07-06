@@ -213,6 +213,28 @@ type RecurrenceStats struct {
 	Daily    []RecurrenceDay `json:"daily"`
 }
 
+type LLMSpendBucket struct {
+	Calls             int     `json:"calls"`
+	CallsWithoutUsage int     `json:"calls_without_usage"`
+	FailedCalls       int     `json:"failed_calls"`
+	PromptTokens      int     `json:"prompt_tokens"`
+	CompletionTokens  int     `json:"completion_tokens"`
+	TotalTokens       int     `json:"total_tokens"`
+	CostUSD           float64 `json:"cost_usd"`
+}
+
+type LLMSpendDay struct {
+	Date string `json:"date"`
+	LLMSpendBucket
+}
+
+type LLMSpendStats struct {
+	Days int `json:"days"`
+	LLMSpendBucket
+	ByModel map[string]LLMSpendBucket `json:"by_model"`
+	Daily   []LLMSpendDay             `json:"daily"`
+}
+
 type Server struct {
 	store                     *Store
 	hub                       *Hub
@@ -395,6 +417,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleAnalysisRunList(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/stats/recurrence":
 		s.handleRecurrenceStats(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/stats/llm-spend":
+		s.handleLLMSpendStats(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/events":
 		s.handleEvents(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/chat":
@@ -469,12 +493,28 @@ func (s *Server) handleAnalysisRunList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRecurrenceStats(w http.ResponseWriter, r *http.Request) {
+	days, ok := daysFromRequest(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, envelope(s.store.RecurrenceStats(days, time.Now().UTC())))
+}
+
+func (s *Server) handleLLMSpendStats(w http.ResponseWriter, r *http.Request) {
+	days, ok := daysFromRequest(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, envelope(s.store.LLMSpendStats(days, time.Now().UTC())))
+}
+
+func daysFromRequest(w http.ResponseWriter, r *http.Request) (int, bool) {
 	days := 7
 	if raw := strings.TrimSpace(r.URL.Query().Get("days")); raw != "" {
 		parsed, err := strconv.Atoi(raw)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid days")
-			return
+			return 0, false
 		}
 		days = parsed
 	}
@@ -484,7 +524,7 @@ func (s *Server) handleRecurrenceStats(w http.ResponseWriter, r *http.Request) {
 	if days > 90 {
 		days = 90
 	}
-	writeJSON(w, http.StatusOK, envelope(s.store.RecurrenceStats(days, time.Now().UTC())))
+	return days, true
 }
 
 func correlationKey(webhook AlertmanagerWebhook, alert Alert) string {

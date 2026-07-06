@@ -149,6 +149,78 @@ func TestAnalysisRunStoresLLMUsageMetadataAndClearsOnReanalysis(t *testing.T) {
 	}
 }
 
+func TestLLMSpendStatsAggregatesUsageMetadata(t *testing.T) {
+	store := NewStore()
+	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "spend"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-spend",
+	})
+	now := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
+	run := store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Manual", "")
+	store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "done",
+		Context: map[string]any{
+			"llm_usage": map[string]any{
+				"calls":               float64(2),
+				"calls_without_usage": float64(1),
+				"failed_calls":        float64(1),
+				"prompt_tokens":       float64(30),
+				"completion_tokens":   float64(20),
+				"total_tokens":        float64(50),
+				"cost_usd":            float64(0.25),
+				"by_model": map[string]any{
+					"cheap": map[string]any{
+						"calls":             float64(1),
+						"prompt_tokens":     float64(10),
+						"completion_tokens": float64(5),
+						"total_tokens":      float64(15),
+						"cost_usd":          float64(0.05),
+					},
+					"smart": map[string]any{
+						"calls":             float64(1),
+						"failed_calls":      float64(1),
+						"prompt_tokens":     float64(20),
+						"completion_tokens": float64(15),
+						"total_tokens":      float64(35),
+						"cost_usd":          float64(0.20),
+					},
+				},
+			},
+		},
+	})
+	oldRun := store.CreateAnalysisRun("manual", "alert", alert.AlertID, incident.IncidentID, alert.AlertID, "Old", "")
+	store.FailAnalysisRun(oldRun.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "old",
+		Context: map[string]any{
+			"llm_usage": map[string]any{
+				"calls":        float64(99),
+				"total_tokens": float64(99),
+				"cost_usd":     float64(99),
+			},
+		},
+	})
+	store.mu.Lock()
+	store.analysisRuns[run.RunID].UpdatedAt = now
+	store.analysisRuns[oldRun.RunID].UpdatedAt = now.AddDate(0, 0, -10)
+	store.mu.Unlock()
+
+	stats := store.LLMSpendStats(7, now)
+
+	if stats.Calls != 2 || stats.CallsWithoutUsage != 1 || stats.FailedCalls != 1 ||
+		stats.PromptTokens != 30 || stats.CompletionTokens != 20 || stats.TotalTokens != 50 ||
+		stats.CostUSD != 0.25 {
+		t.Fatalf("unexpected spend stats: %+v", stats)
+	}
+	if stats.ByModel["cheap"].TotalTokens != 15 || stats.ByModel["smart"].FailedCalls != 1 {
+		t.Fatalf("unexpected model breakdown: %+v", stats.ByModel)
+	}
+	if stats.Daily[len(stats.Daily)-1].TotalTokens != 50 {
+		t.Fatalf("expected spend in latest day bucket, got %+v", stats.Daily)
+	}
+}
+
 func TestAnalysisRunCompactsSimilarIncidentsForAgent(t *testing.T) {
 	agentReqCh := make(chan AgentAnalysisRequest, 1)
 	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {

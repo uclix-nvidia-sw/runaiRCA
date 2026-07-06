@@ -188,6 +188,51 @@ func TestAlertFeedbackCommentAndSearchEndpoints(t *testing.T) {
 	}
 }
 
+func TestLLMSpendStatsEndpointContract(t *testing.T) {
+	server := NewServer()
+	incident, alert := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "spend-contract"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-spend-contract",
+	})
+	run := server.store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Manual", "")
+	server.store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "done",
+		Context: map[string]any{
+			"llm_usage": map[string]any{
+				"calls":        float64(1),
+				"total_tokens": float64(42),
+				"cost_usd":     float64(0.12),
+				"by_model": map[string]any{
+					"m": map[string]any{"calls": float64(1), "total_tokens": float64(42), "cost_usd": float64(0.12)},
+				},
+			},
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(
+		rec,
+		httptest.NewRequest(http.MethodGet, "/api/v1/stats/llm-spend?days=7", nil),
+	)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected llm spend stats 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var envelope struct {
+		Data LLMSpendStats `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode llm spend stats: %v", err)
+	}
+	if envelope.Data.Calls != 1 || envelope.Data.TotalTokens != 42 || envelope.Data.CostUSD != 0.12 {
+		t.Fatalf("unexpected llm spend stats: %+v", envelope.Data)
+	}
+	if envelope.Data.ByModel["m"].TotalTokens != 42 || len(envelope.Data.Daily) != 7 {
+		t.Fatalf("unexpected llm spend breakdown: %+v", envelope.Data)
+	}
+}
+
 func TestIncidentLifecycleActionContractsAndEvents(t *testing.T) {
 	server := NewServer()
 	incident, _ := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "action-contract"}, Alert{

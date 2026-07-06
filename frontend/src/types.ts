@@ -150,6 +150,26 @@ export type RecurrenceStats = {
   daily: RecurrenceDay[];
 };
 
+export type LLMSpendBucket = {
+  calls: number;
+  calls_without_usage: number;
+  failed_calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+};
+
+export type LLMSpendDay = LLMSpendBucket & {
+  date: string;
+};
+
+export type LLMSpendStats = LLMSpendBucket & {
+  days: number;
+  by_model: Record<string, LLMSpendBucket>;
+  daily: LLMSpendDay[];
+};
+
 export type Envelope<T> = {
   status: string;
   data: T;

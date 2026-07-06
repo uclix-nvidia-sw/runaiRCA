@@ -1,4 +1,4 @@
-import { AlertRecord, AnalysisRun, Envelope, FeedbackSummary, Incident, IncidentDetail, PageInfo, RecurrenceStats } from './types';
+import { AlertRecord, AnalysisRun, Envelope, FeedbackSummary, Incident, IncidentDetail, LLMSpendStats, PageInfo, RecurrenceStats } from './types';
 
 const runtimeApiBase = window.__RUNAI_RCA_CONFIG__?.apiBaseUrl;
 const fallbackApiBase = import.meta.env.DEV ? 'http://localhost:8080' : '';
@@ -113,6 +113,10 @@ export async function deleteIncident(id: string, permanent = false): Promise<voi
 
 export async function fetchRecurrenceStats(days = 7): Promise<RecurrenceStats> {
   return (await read<Envelope<RecurrenceStats>>(`/api/v1/stats/recurrence?days=${encodeURIComponent(String(days))}`)).data;
+}
+
+export async function fetchLLMSpendStats(days = 7): Promise<LLMSpendStats> {
+  return (await read<Envelope<LLMSpendStats>>(`/api/v1/stats/llm-spend?days=${encodeURIComponent(String(days))}`)).data;
 }
 
 export async function submitFeedback(
