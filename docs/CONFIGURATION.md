@@ -13,6 +13,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | --- | --- |
 | `PORT` | Backend/Agent HTTP port; Helm maps this from the component service port |
 | `AGENT_URL` | Backend to Agent URL, default `http://localhost:8000` |
+| `BACKEND_URL` | Agent to Backend URL used for fire-and-forget analysis progress events. Empty disables progress POSTs; Helm points it at the backend service by default |
 | `AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for Agent `/analyze` and `/chat` requests, default `1560` (must exceed the agent's `ANALYSIS_DEADLINE_SECONDS`) |
 | `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for operator-triggered Agent `/analyze` requests, default `1560` |
 | `TRASH_RETENTION_DAYS` | Backend soft-delete retention before trash incidents are purged, default `30` |
@@ -62,20 +63,26 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `TROUBLESHOOTING_CASES_FILE` | Local known-cases/playbook markdown path |
 | `ARCHITECTURE_FILE` | Run:ai platform topology YAML (components, depends_on, DB schema ownership), default `knowledge/runai_architecture.yaml` — powers playbook check paths and postgres drill-down schema hints |
 | `AGENT_SOULS_FILE` | Agent role-contract prompt path, default `prompts/agent_souls.md` |
+| `FAMILIES_FILE` | Root-cause family catalog YAML path, default `knowledge/families.yaml`. Load failure falls back to the built-in catalog |
+| `COLLECTORS` | Comma-separated collector registry allowlist. Empty/default enables all built-in collectors |
+| `EVAL_MIN_TOP1` | Eval gate minimum Top-1 accuracy used by CI/run scripts when no explicit `--min-top1` is passed |
 | `MASKING_REGEX_LIST_JSON` | Optional JSON array of custom redaction regexes |
 | `BUILTIN_REDACTION_ENABLED` | Enable built-in secret redaction, default `true` |
 | `BUILTIN_REDACTION_HASH_MODE` | Replace secrets with stable short hashes instead of `[MASKED]`, default `false` |
 | `NVIDIA_API_KEY` | NIM key for NeMo Agent Toolkit workflows |
 | `LLM_BASE_URL` | OpenAI-compatible base URL for the LiteLLM NAT workflow and the operator chat copilot |
 | `LLM_MODEL` | OpenAI-compatible model name, for example `auto-router` |
+| `LLM_MODEL_PLANNER` / `LLM_MODEL_INVESTIGATION` / `LLM_MODEL_DRILLDOWN` / `LLM_MODEL_SELF_CHECK` / `LLM_MODEL_SYNTHESIS` / `LLM_MODEL_CHAT` | Optional stage-specific model overrides. Empty values fall back to `LLM_MODEL` |
 | `LLM_API_KEY` | OpenAI-compatible API key secret; enables conversational chat answers when all three LLM vars are set |
 | `LLM_REQUEST_TIMEOUT_SECONDS` | LLM request timeout per call (chat, reasoning, and the materialized NAT config), default `300`, `0` = unlimited |
+| `LLM_PRICING_JSON` | Optional JSON map for estimated LLM cost, keyed by model with `prompt_per_mtok` and `completion_per_mtok` values |
 | `ENABLE_NAT_RUNTIME` | Run RCA synthesis through the NeMo Agent Toolkit CLI instead of the deterministic in-process fallback, default `false` |
 | `NAT_CONFIG_FILE` | Optional NeMo workflow config path, default `configs/runai_rca_workflow.yml` |
 | `NAT_TIMEOUT_SECONDS` | NeMo Agent Toolkit CLI execution timeout |
 | `ENABLE_INVESTIGATION_LOOP` | Central LLM investigation loop: plan → probe the most relevant agents → observe → re-plan, default `false` (Helm sets `true`) |
 | `MAX_INVESTIGATION_STEPS` | Max central investigation steps per analysis, default `12` |
 | `MAX_REANALYSIS_STEPS` | Investigation budget for the one re-analysis pass after a refuted top cause, default `6` |
+| `ANALYSIS_TOKEN_BUDGET` | Optional per-analysis LLM token budget. `0` means unlimited; when exceeded, investigation/drill-down stop at the next safe step boundary and record a warning |
 | `ENABLE_AGENT_DRILLDOWN` | Per-collector autonomous drill-down: each evidence agent (kubernetes/prometheus/loki/runai) runs its own bounded LLM loop with only its domain's read-only tools, default `false` (Helm sets `true`) |
 | `DRILLDOWN_MAX_STEPS` | Max drill-down steps per evidence agent, default `4` |
 | `ANALYSIS_DEADLINE_SECONDS` | Overall hard cap per analysis (graceful degraded report on overrun), default `1500` (25 min), `0` = no cap. Keep the backend `AGENT_REQUEST_TIMEOUT_SECONDS` above this. |

@@ -33,7 +33,10 @@ Backend:
 - `DELETE /api/v1/alerts/{id}/comments/{comment_id}`
 - `POST /api/v1/embeddings/search`
 - `GET /api/v1/analysis-runs`
+- `POST /api/v1/analysis-runs/{id}/progress`
 - `GET /api/v1/stats/recurrence?days=7`
+- `GET /api/v1/stats/llm-spend?days=7`
+- `GET /api/v1/stats/kpi?days=7`
 - `GET /api/v1/events`
 - `POST /api/v1/chat`
 
@@ -76,6 +79,19 @@ Backend:
 }
 ```
 
+`GET /api/v1/stats/llm-spend?days=N`은 analysis-run `metadata.llm_usage`를
+토큰, 호출 수, 실패 호출 수, 추정 USD 비용, 일별 버킷, 모델별 breakdown으로 집계합니다.
+조회 기간은 1..90일 범위입니다.
+
+`GET /api/v1/stats/kpi?days=N`은 time-to-RCA와 time-to-resolve의 평균/p50/p90,
+일별 버킷을 반환합니다. time-to-RCA는 인시던트별 최초 성공 완료 시각을 사용하므로 이후
+재분석이 기준선을 덮어쓰지 않습니다.
+
+`POST /api/v1/analysis-runs/{id}/progress`는 실행 상태가 `analyzing`인 동안 에이전트의
+진행 이벤트를 받습니다. 백엔드는 항목을 `metadata.progress_log`에 최대 200개까지 append하고,
+수락한 각 항목을 SSE `analysis.progress`로 broadcast합니다. 완료/실패 실행도 누적된
+progress log를 보존합니다.
+
 인시던트 응답은 Alertmanager 상태를 `status` / `resolved_at`으로, 운영자 최종 승인을
 `user_approved_at`으로 노출합니다. `AnalysisRun` 응답은 선택 사항인 `metadata`를 포함합니다.
 에이전트가 usage 데이터를 반환하면 LLM 토큰 계측값은 `metadata.llm_usage`에 저장됩니다.
@@ -84,7 +100,10 @@ Backend:
 
 `GET /api/v1/events`는 named SSE 이벤트를 내보냅니다. 인시던트 archive, unarchive,
 delete, restore, 수동 permanent delete 변경은 `incident.updated`를 발행하므로 다른 대시보드
-세션이 active, archived, trash 뷰를 갱신할 수 있습니다.
+세션이 active, archived, trash 뷰를 갱신할 수 있습니다. 분석 라이프사이클 이벤트에는
+`analysis.started`, `analysis.progress`, `analysis.completed`가 포함됩니다. progress 이벤트는
+`run_id`, `phase`, 선택 사항인 collector/hypothesis 필드, confidence 스냅샷, timestamp를
+포함합니다.
 
 Agent:
 

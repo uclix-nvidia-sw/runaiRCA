@@ -33,7 +33,10 @@ Backend:
 - `DELETE /api/v1/alerts/{id}/comments/{comment_id}`
 - `POST /api/v1/embeddings/search`
 - `GET /api/v1/analysis-runs`
+- `POST /api/v1/analysis-runs/{id}/progress`
 - `GET /api/v1/stats/recurrence?days=7`
+- `GET /api/v1/stats/llm-spend?days=7`
+- `GET /api/v1/stats/kpi?days=7`
 - `GET /api/v1/events`
 - `POST /api/v1/chat`
 
@@ -81,6 +84,20 @@ Incident lifecycle actions:
 }
 ```
 
+`GET /api/v1/stats/llm-spend?days=N` aggregates analysis-run `metadata.llm_usage`
+into tokens, calls, failed calls, estimated USD cost, daily buckets, and per-model
+breakdowns for the selected 1..90 day window.
+
+`GET /api/v1/stats/kpi?days=N` returns mean/p50/p90 time-to-RCA and
+time-to-resolve metrics plus daily buckets. Time-to-RCA uses the first successful
+completion timestamp for each incident, so later re-analysis does not rewrite the
+baseline.
+
+`POST /api/v1/analysis-runs/{id}/progress` accepts agent progress while a run is
+`analyzing`. The backend appends entries to `metadata.progress_log` with a cap of
+200 and broadcasts each accepted entry as `analysis.progress` over SSE. Completed
+and failed runs preserve the accumulated progress log.
+
 Incident responses expose Alertmanager state as `status` / `resolved_at` and
 operator final approval as `user_approved_at`. `AnalysisRun` responses include
 optional `metadata`. LLM token accounting is stored under `metadata.llm_usage`
@@ -91,6 +108,9 @@ similar-incident count shown in the UI.
 `GET /api/v1/events` emits named SSE events. Incident archive, unarchive,
 delete, restore, and manual permanent delete changes emit `incident.updated` so
 other dashboard sessions can refresh the active, archived, and trash views.
+Analysis lifecycle events include `analysis.started`, `analysis.progress`, and
+`analysis.completed`; progress events carry `run_id`, `phase`, optional
+collector/hypothesis fields, confidence snapshots, and a timestamp.
 
 Agent:
 
