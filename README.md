@@ -23,34 +23,35 @@ docs/       Architecture and operation notes
 ## Architecture
 
 ```mermaid
-flowchart TD
-  AM[Alertmanager] -->|webhook| BE[Backend API]
-  FE[Frontend] <-->|REST + SSE| BE
-  BE <-->|"persist · pgvector"| DB[(PostgreSQL + pgvector)]
-  BE -->|"summary + link"| SLACK([Slack])
-  BE -->|"/analyze · /chat"| ORCH
+flowchart TB
+  AM[Alertmanager] -->|Webhook| BE
 
-  subgraph AG["Agent — analysis orchestrator"]
-    ORCH[Orchestrator] --> PLAN[Planner] --> COLL
-    subgraph COLL["Parallel evidence collectors"]
-      direction LR
-      RA([runai]) ~~~ KA([kubernetes]) ~~~ PA([prometheus]) ~~~ LA([loki]) ~~~ DBA([postgres]) ~~~ SA([system]) ~~~ CA([change])
-    end
-    COLL --> INV["Investigate + drill-down"]
-    INV --> SYN["Rank · self-check · synthesize"]
+  subgraph SYS["Run:AI RCA"]
+    FE[Frontend]
+    BE[Backend]
+    AG[Agent]
+    DB[(PostgreSQL + pgvector)]
+    KG[(TypeDB ontology)]
+    BE <-->|REST + SSE| FE
+    BE -->|"Analyze / Chat"| AG
+    BE <-->|"incidents · alerts · embeddings"| DB
+    AG <-->|"blast radius · prior incidents"| KG
+    DB -.->|review-gated ingest| KG
   end
 
-  DB -.->|"similar incidents (via backend)"| ORCH
-  ORCH <-->|"blast radius · prior incidents · fixes"| KG[(TypeDB ontology)]
-  COLL -->|"Run:ai API"| MCP([runai-mcp sidecar])
-  SYN -->|"RCA + evidence"| BE
-  DB -.->|"review-gated ingest"| KG
+  BE -->|Analysis summary| SLACK[Slack]
+  AG -->|Cluster context| K8S[Kubernetes API]
+  AG -->|Metrics| PROM[Prometheus]
+  AG -->|Logs| LOKI[Loki]
+  AG -->|"Run:ai API"| RUNAI[Run:ai control plane]
+  AG -->|Inference| LLM[LLM Provider]
 ```
 
-The **orchestrator** runs the whole pipeline: a planner scopes the work, seven
-collectors gather evidence in parallel, a central investigation loop and
-per-collector drill-down deepen it, then signature matching, ranking, a skeptical
-self-check, and synthesis produce one grounded RCA. The orchestrator itself
+The diagram shows the components and the external systems the Agent reads.
+Inside the Agent, an **orchestrator** runs the analysis pipeline — planner →
+seven parallel collectors → central investigation loop and per-collector
+drill-down → signature matching, ranking, a skeptical self-check → synthesis —
+detailed in [RCA Pipeline](docs/RCA-PIPELINE.md). The orchestrator itself
 consults the optional **TypeDB ontology** (`typedb.enabled`, default on in Helm)
 for relational facts pgvector can't express — node blast radius, prior same-alert
 incidents, and graph-derived family/XID remediation — populated by review-gated
