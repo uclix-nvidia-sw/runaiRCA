@@ -57,6 +57,19 @@ export type FeedbackSummary = {
   learning_hints?: FeedbackHint[];
 };
 
+export type AnalysisProgressEntry = {
+  seq?: number;
+  phase?: string;
+  message?: string;
+  timestamp?: string;
+  collector?: string;
+  status?: string;
+  summary?: string;
+  selected_hypothesis?: string;
+  hypothesis_ledger?: unknown;
+  [key: string]: unknown;
+};
+
 export type AnalysisRun = {
   run_id: string;
   source: string;
@@ -74,7 +87,9 @@ export type AnalysisRun = {
   missing_data: string[];
   warnings: string[];
   artifacts: Artifact[];
-  metadata?: Record<string, unknown>;
+  metadata?: Record<string, unknown> & {
+    progress_log?: AnalysisProgressEntry[];
+  };
   created_at: string;
   updated_at: string;
 };

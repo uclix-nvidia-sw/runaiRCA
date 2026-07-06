@@ -73,7 +73,7 @@ import {
 } from './api';
 import nvidiaLogo from './assets/nvidia-logo.svg';
 import { exportIncidentDocx } from './exportDocx';
-import { AlertRecord, AnalysisRun, Artifact, FeedbackSummary, Incident, IncidentDetail, KPIStats, LLMSpendStats, PageInfo, RecurrenceStats, SimilarIncident } from './types';
+import { AlertRecord, AnalysisProgressEntry, AnalysisRun, Artifact, FeedbackSummary, Incident, IncidentDetail, KPIStats, LLMSpendStats, PageInfo, RecurrenceStats, SimilarIncident } from './types';
 
 const TrendChartCanvas = lazy(() => import('./TrendChartCanvas'));
 const DASHBOARD_PAGE_SIZE = 15;
@@ -86,11 +86,14 @@ type DetailState =
 type RealtimeEventPayload = {
   type?: string;
   data?: {
+    run_id?: string;
+    source?: string;
+    status?: string;
     target_type?: 'incident' | 'alert';
     target_id?: string;
     incident_id?: string;
     alert_id?: string;
-  };
+  } & AnalysisProgressEntry;
 };
 
 type EditorTab = 'write' | 'preview';
@@ -581,6 +584,26 @@ function parseRealtimeEvent(event: Event): RealtimeEventPayload | undefined {
   }
 }
 
+function appendProgress(
+  current: Record<string, AnalysisProgressEntry[]>,
+  payload: RealtimeEventPayload | undefined,
+) {
+  if (payload?.type !== 'analysis.progress' || !payload.data?.run_id) return current;
+  const runID = payload.data.run_id;
+  const entry: AnalysisProgressEntry = {
+    ...payload.data,
+    seq: typeof payload.data.seq === 'number' ? payload.data.seq : Number(payload.data.seq || 0),
+  };
+  const existing = current[runID] ?? [];
+  const withoutDuplicate = entry.seq
+    ? existing.filter((item) => item.seq !== entry.seq)
+    : existing;
+  return {
+    ...current,
+    [runID]: [...withoutDuplicate, entry].slice(-200),
+  };
+}
+
 function realtimeEventMatchesDetail(detail: DetailState, payload: RealtimeEventPayload | undefined) {
   if (!detail || !payload?.data) return false;
   const data = payload.data;
@@ -598,6 +621,43 @@ function realtimeEventMatchesDetail(detail: DetailState, payload: RealtimeEventP
     (data.target_type === 'alert' && data.target_id === alertID) ||
     (data.target_type === 'incident' && data.target_id === detail.data.incident_id)
   );
+}
+
+function analysisRunMatchesDetail(run: AnalysisRun, detail: DetailState) {
+  if (!detail) return false;
+  if (detail.kind === 'incident') {
+    const incidentID = detail.data.incident_id;
+    const alertIDs = new Set(detail.data.alerts.map((alert) => alert.alert_id));
+    return (
+      run.incident_id === incidentID ||
+      (run.target_type === 'incident' && run.target_id === incidentID) ||
+      (run.alert_id ? alertIDs.has(run.alert_id) : false) ||
+      (run.target_type === 'alert' && alertIDs.has(run.target_id))
+    );
+  }
+  const alertID = detail.data.alert_id;
+  return (
+    run.alert_id === alertID ||
+    (run.target_type === 'alert' && run.target_id === alertID) ||
+    run.incident_id === detail.data.incident_id ||
+    (run.target_type === 'incident' && run.target_id === detail.data.incident_id)
+  );
+}
+
+function latestAnalysisRunForDetail(detail: DetailState, runs: AnalysisRun[]) {
+  return [...runs]
+    .filter((run) => analysisRunMatchesDetail(run, detail))
+    .sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0];
+}
+
+function progressForRun(
+  run: AnalysisRun | undefined,
+  progressByRun: Record<string, AnalysisProgressEntry[]>,
+) {
+  if (!run) return [];
+  const live = progressByRun[run.run_id] ?? [];
+  if (live.length > 0) return live;
+  return Array.isArray(run.metadata?.progress_log) ? run.metadata.progress_log : [];
 }
 
 function useEditorHistory(initialValue = '') {
@@ -722,6 +782,7 @@ function useDashboardData(
   const [incidentPage, setIncidentPage] = useState<PageInfo>(() => emptyPage());
   const [alertPage, setAlertPage] = useState<PageInfo>(() => emptyPage());
   const [analysisPage, setAnalysisPage] = useState<PageInfo>(() => emptyPage());
+  const [progressByRun, setProgressByRun] = useState<Record<string, AnalysisProgressEntry[]>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [realtimePayload, setRealtimePayload] = useState<RealtimeEventPayload>();
@@ -791,9 +852,14 @@ function useDashboardData(
         void load({ silent: true });
       }, 750);
     };
+    const handleProgressEvent = (event: Event) => {
+      const payload = parseRealtimeEvent(event);
+      setProgressByRun((current) => appendProgress(current, payload));
+    };
     source.onmessage = handleRealtimeEvent;
     source.addEventListener('alert.created', handleRealtimeEvent);
     source.addEventListener('analysis.started', handleRealtimeEvent);
+    source.addEventListener('analysis.progress', handleProgressEvent);
     source.addEventListener('analysis.completed', handleRealtimeEvent);
     source.addEventListener('incident.resolved', handleRealtimeEvent);
     source.addEventListener('incident.updated', handleRealtimeEvent);
@@ -817,6 +883,7 @@ function useDashboardData(
     error,
     load,
     realtimePayload,
+    progressByRun,
   };
 }
 
@@ -840,6 +907,7 @@ function App() {
     error,
     load,
     realtimePayload,
+    progressByRun,
   } = useDashboardData({
     incidents: incidentPageIndex,
     alerts: alertPageIndex,
@@ -972,6 +1040,15 @@ function App() {
       runCount: analysisRecords.length,
     };
   }, [analysisRecords]);
+
+  const workspaceAnalysisRun = useMemo(
+    () => latestAnalysisRunForDetail(detail, dashboardAnalysisRuns),
+    [dashboardAnalysisRuns, detail],
+  );
+  const workspaceProgress = useMemo(
+    () => progressForRun(workspaceAnalysisRun, progressByRun),
+    [progressByRun, workspaceAnalysisRun],
+  );
 
   const loadRoute = useCallback(async (route: RouteState) => {
     const version = routeLoadVersionRef.current + 1;
@@ -1225,6 +1302,8 @@ function App() {
 
       <UnifiedWorkspace
         detail={detail}
+        analysisRun={workspaceAnalysisRun}
+        progressEvents={workspaceProgress}
         onClose={closeDetail}
         onRefresh={refreshDetail}
         onAnalyze={async (id) => {
@@ -2157,6 +2236,8 @@ function CopyableBlock({
 
 function UnifiedWorkspace({
   detail,
+  analysisRun,
+  progressEvents,
   onClose,
   onRefresh,
   onAnalyze,
@@ -2164,6 +2245,8 @@ function UnifiedWorkspace({
   onResolve,
 }: {
   detail: DetailState;
+  analysisRun?: AnalysisRun;
+  progressEvents: AnalysisProgressEntry[];
   onClose: () => void;
   onRefresh: () => Promise<void>;
   onAnalyze: (id: string) => Promise<void>;
@@ -2320,6 +2403,14 @@ function UnifiedWorkspace({
           </div>
         </section>
 
+        {(isAnalyzing || progressEvents.length > 0) && (
+          <ProgressTimeline
+            events={progressEvents}
+            live={isAnalyzing || analysisRun?.status === 'analyzing'}
+            run={analysisRun}
+          />
+        )}
+
         {incident ? (
           <SimilarIncidentsPanel items={similarIncidents} recentCount={incident.similar_recent_count ?? 0} />
         ) : (
@@ -2367,6 +2458,86 @@ function UnifiedWorkspace({
       </div>
     </section>
   );
+}
+
+function ProgressTimeline({
+  events,
+  live,
+  run,
+}: {
+  events: AnalysisProgressEntry[];
+  live: boolean;
+  run?: AnalysisRun;
+}) {
+  const [open, setOpen] = useState(live);
+  useEffect(() => {
+    if (live) setOpen(true);
+  }, [live]);
+  const visible = events.slice(-12);
+  const ledger = latestProgressLedger(events);
+  return (
+    <section className={`progress-timeline ${live ? 'is-live' : ''}`}>
+      <button className="progress-timeline-head" onClick={() => setOpen((value) => !value)} type="button">
+        <span><ListChecks size={18} /> Thought Process</span>
+        <span className="progress-timeline-meta">
+          {live ? 'live' : run?.updated_at ? formatTime(run.updated_at) : 'complete'}
+          <ChevronDown size={15} />
+        </span>
+      </button>
+      {open && (
+        <div className="progress-timeline-body">
+          {ledger.length > 0 && (
+            <div className="hypothesis-strip">
+              {ledger.slice(0, 4).map((item) => (
+                <span key={String(item.id)} className={`hypothesis-chip status-${String(item.status || 'open')}`}>
+                  <strong>{String(item.family || item.id || 'hypothesis').replace(/_/g, ' ')}</strong>
+                  {typeof item.confidence === 'number' && <em>{Math.round(item.confidence * 100)}%</em>}
+                </span>
+              ))}
+            </div>
+          )}
+          {visible.length === 0 ? (
+            <p className="empty">Analysis has started. Waiting for the first reasoning update.</p>
+          ) : (
+            <ol className="progress-events">
+              {visible.map((event, index) => (
+                <li key={`${event.seq ?? index}-${event.phase ?? 'phase'}`}>
+                  <span className="progress-dot" />
+                  <div>
+                    <div className="progress-event-head">
+                      <strong>{progressEventTitle(event)}</strong>
+                      <time>{formatProgressTimestamp(event.timestamp)}</time>
+                    </div>
+                    {event.message && <p>{String(event.message)}</p>}
+                  </div>
+                </li>
+              ))}
+            </ol>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function latestProgressLedger(events: AnalysisProgressEntry[]) {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const ledger = events[index].hypothesis_ledger;
+    if (Array.isArray(ledger)) return ledger as Array<Record<string, unknown>>;
+  }
+  return [];
+}
+
+function progressEventTitle(event: AnalysisProgressEntry) {
+  const phase = String(event.phase || 'progress').replace(/_/g, ' ');
+  if (event.collector) return `${phase} · ${agentLabel(String(event.collector))}`;
+  if (event.selected_hypothesis) return `${phase} · ${String(event.selected_hypothesis)}`;
+  return phase;
+}
+
+function formatProgressTimestamp(value: unknown) {
+  if (typeof value !== 'string' || !value) return '';
+  return formatTime(value);
 }
 
 function AffectedPods({ pods }: { pods: string[] }) {

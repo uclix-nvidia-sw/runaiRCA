@@ -2025,6 +2025,7 @@ td span.occurrence-pill {
 }
 
 .rca-report,
+.progress-timeline,
 .agent-trail,
 .diagnostics,
 .similar-panel,
@@ -2058,6 +2059,129 @@ td span.occurrence-pill {
   display: inline-flex;
   width: fit-content;
   margin-bottom: 0.75rem;
+}
+
+.progress-timeline {
+  border-radius: 0.55rem;
+  background: #fbfcfa;
+  border: 1px solid #dde6d2;
+  overflow: hidden;
+}
+
+.progress-timeline.is-live {
+  border-color: #b8e986;
+}
+
+.progress-timeline-head {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: #101828;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 0.9rem;
+  font-weight: 850;
+  cursor: pointer;
+}
+
+.progress-timeline-head span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.progress-timeline-meta {
+  color: #667085;
+  font-size: 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
+.progress-timeline-body {
+  border-top: 1px solid #edf2e8;
+  padding: 0.75rem 0.9rem 0.9rem;
+}
+
+.hypothesis-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-bottom: 0.75rem;
+}
+
+.hypothesis-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  border: 1px solid #d8e6c7;
+  background: #f7fbf2;
+  color: #365314;
+  border-radius: 999px;
+  padding: 0.22rem 0.55rem;
+  font-size: 0.72rem;
+  font-weight: 850;
+}
+
+.hypothesis-chip em {
+  color: #667085;
+  font-style: normal;
+}
+
+.hypothesis-chip.status-refuted {
+  color: #991b1b;
+  background: #fff5f5;
+  border-color: #fecaca;
+}
+
+.progress-events {
+  display: grid;
+  gap: 0.65rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.progress-events li {
+  display: grid;
+  grid-template-columns: 0.7rem 1fr;
+  gap: 0.55rem;
+  align-items: start;
+}
+
+.progress-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 999px;
+  background: var(--nvidia);
+  margin-top: 0.42rem;
+}
+
+.progress-event-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  color: #101828;
+}
+
+.progress-event-head strong {
+  font-size: 0.84rem;
+  text-transform: capitalize;
+}
+
+.progress-event-head time {
+  color: #667085;
+  font-size: 0.74rem;
+  white-space: nowrap;
+}
+
+.progress-events p {
+  margin: 0.15rem 0 0;
+  color: #475467;
+  font-size: 0.8rem;
+  line-height: 1.45;
 }
 
 .rca-report h2,
