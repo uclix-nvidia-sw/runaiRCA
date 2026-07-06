@@ -18,6 +18,18 @@ from app.config import load_settings
 
 SCHEMA_FILE = Path(__file__).resolve().parent / "schema.tql"
 
+# One-off annotation changes for databases created by an older schema.tql.
+# `define` cannot alter an existing annotation, so each entry is applied with
+# `redefine` in its own transaction BEFORE the main define. Failures are
+# non-fatal: a fresh database has nothing to redefine (define below covers it),
+# and an already-migrated database rejects the no-op redefine.
+SCHEMA_MIGRATIONS = [
+    # check_command widened from the implicit @card(0..1): components ship
+    # several ready-to-run checks, so the architecture loader could never
+    # commit a 2-check component against the old card.
+    "redefine control_plane_component owns check_command @card(0..);",
+]
+
 
 def main() -> int:
     settings = load_settings()
@@ -36,6 +48,14 @@ def main() -> int:
         if not driver.databases.contains(settings.typedb_database):
             driver.databases.create(settings.typedb_database)
             print(f"created database '{settings.typedb_database}'")
+        for migration in SCHEMA_MIGRATIONS:
+            try:
+                with driver.transaction(settings.typedb_database, TransactionType.SCHEMA) as tx:
+                    tx.query(migration).resolve()
+                    tx.commit()
+                print(f"schema migration applied: {migration}")
+            except Exception as exc:  # fresh DB / already migrated — define below is authoritative
+                print(f"schema migration skipped (non-fatal): {migration} -> {exc.__class__.__name__}")
         with driver.transaction(settings.typedb_database, TransactionType.SCHEMA) as tx:
             tx.query(schema).resolve()
             tx.commit()
