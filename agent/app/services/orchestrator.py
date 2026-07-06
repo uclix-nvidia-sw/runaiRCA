@@ -89,9 +89,7 @@ class NemoWorkflowRunner:
             nat_timeout = self._settings.nat_timeout_seconds
             try:
                 if nat_timeout and nat_timeout > 0:
-                    stdout, _ = await asyncio.wait_for(
-                        proc.communicate(), timeout=nat_timeout
-                    )
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=nat_timeout)
                 else:  # 0 = no timeout: let the agent workflow run to completion
                     stdout, _ = await proc.communicate()
             except TimeoutError:
@@ -137,9 +135,7 @@ class NemoWorkflowRunner:
         if "__RUNAI_RCA_LLM" in rendered:
             return self._settings.nat_config_file
 
-        fd, target_name = tempfile.mkstemp(
-            prefix="runai-rca-nat-workflow-", suffix=".yml"
-        )
+        fd, target_name = tempfile.mkstemp(prefix="runai-rca-nat-workflow-", suffix=".yml")
         target = Path(target_name)
         with os.fdopen(fd, "w", encoding="utf-8") as file:
             file.write(rendered)
@@ -229,7 +225,10 @@ class AnalysisOrchestrator:
         target = resolve_target(request.alert.labels, request.alert.annotations)
         _log.info(
             "analyze start: alert=%s ns=%s node=%s workload=%s",
-            target.alert_name, target.namespace, target.node, target.workload_name,
+            target.alert_name,
+            target.namespace,
+            target.node,
+            target.workload_name,
         )
         # Knowledge graph is consulted once here, at synthesis time, as a
         # knowledge resource for the final RCA — not as a parallel collector.
@@ -245,7 +244,8 @@ class AnalysisOrchestrator:
         )
         _log.info(
             "plan: strategy=%s focus=%s hypotheses=%s",
-            plan.strategy, plan.focus,
+            plan.strategy,
+            plan.focus,
             [h.get("family") for h in (plan.hypotheses or [])[:3]],
         )
         nat_payload = request.model_dump(mode="json")
@@ -314,7 +314,10 @@ class AnalysisOrchestrator:
         for r in results:
             _log.info(
                 "evidence: agent=%s status=%s confidence=%s — %s",
-                r.agent, r.status, r.confidence, " ".join((r.summary or "").split())[:160],
+                r.agent,
+                r.status,
+                r.confidence,
+                " ".join((r.summary or "").split())[:160],
             )
 
         capabilities = {result.agent: result.status for result in results}
@@ -371,7 +374,10 @@ class AnalysisOrchestrator:
             top = root_cause_candidates[0]
             _log.info(
                 "ranked cause: %s (confidence=%s score=%.1f agents=%s)",
-                top.family, top.confidence, top.score, top.evidence_agents,
+                top.family,
+                top.confidence,
+                top.score,
+                top.evidence_agents,
             )
         # Optional self-check: refute the top cause, apply its calibrated confidence
         # to the top candidate, and keep the caveat text for the report.
@@ -384,9 +390,7 @@ class AnalysisOrchestrator:
             pass
         else:
             if root_cause_candidates:
-                check = await refute_top_cause(
-                    self._settings, root_cause_candidates[0], results
-                )
+                check = await refute_top_cause(self._settings, root_cause_candidates[0], results)
                 if isinstance(check, dict):
                     calibrated = check.get("confidence")
                     if calibrated in ("low", "medium", "high"):
@@ -425,12 +429,8 @@ class AnalysisOrchestrator:
                 ) = outcome
                 # Re-derive the evidence aggregates from the merged results.
                 capabilities = {result.agent: result.status for result in results}
-                artifacts = [
-                    artifact for result in results for artifact in result.artifacts
-                ]
-                missing = sorted(
-                    {item for result in results for item in result.missing_data}
-                )
+                artifacts = [artifact for result in results for artifact in result.artifacts]
+                missing = sorted({item for result in results for item in result.missing_data})
                 warnings = sorted(
                     {item for result in results for item in result.warnings}
                     | set(nat_warnings)
@@ -439,9 +439,7 @@ class AnalysisOrchestrator:
         # Graph-derived remediation from the validated TypeDB reasoning functions,
         # keyed to the ranked top family + any Xid codes / GPU model in the evidence.
         # Best-effort: an empty result when TypeDB is off/unreachable.
-        top_family = (
-            root_cause_candidates[0].family if root_cause_candidates else ""
-        )
+        top_family = root_cause_candidates[0].family if root_cause_candidates else ""
         graph_fixes = await graph_remediation(
             self._settings,
             family=top_family if top_family != "insufficient_evidence" else "",
@@ -506,29 +504,34 @@ class AnalysisOrchestrator:
                                 continue
                             graph_fixes.xid_fixes.pop(code, None)
                             graph_fixes.root_xids.pop(code, None)
-        playbook_fallback = load_troubleshooting_cases(
-            self._settings.troubleshooting_cases_file
-        )
-        detail = nat_text if nat_text else _detail_from(
-            request,
-            results,
-            missing,
-            failure_modes,
-            playbook_fallback,
-            agent_souls,
-            root_cause_candidates,
-            kg_context.as_dict(),
-            plan,
-            graph_fixes,
-            language=getattr(self._settings, "language", "en"),
-            known_issues=known_issues,
-            components=load_architecture(self._settings.architecture_file),
+        playbook_fallback = load_troubleshooting_cases(self._settings.troubleshooting_cases_file)
+        detail = (
+            nat_text
+            if nat_text
+            else _detail_from(
+                request,
+                results,
+                missing,
+                failure_modes,
+                playbook_fallback,
+                agent_souls,
+                root_cause_candidates,
+                kg_context.as_dict(),
+                plan,
+                graph_fixes,
+                language=getattr(self._settings, "language", "en"),
+                known_issues=known_issues,
+                components=load_architecture(self._settings.architecture_file),
+            )
         )
         # Korean LLM synthesis (preferred when language == "ko" and LLM configured):
         # rewrite summary + detail grounded STRICTLY in the evidence just gathered.
         # Falls back to the deterministic English report on any failure.
-        if not nat_text and getattr(self._settings, "language", "en") == "ko" \
-                and llm_configured(self._settings):
+        if (
+            not nat_text
+            and getattr(self._settings, "language", "en") == "ko"
+            and llm_configured(self._settings)
+        ):
             synth = await _synthesize_korean(
                 self._settings,
                 request=request,
@@ -587,9 +590,7 @@ class AnalysisOrchestrator:
                 "similar_incidents": [
                     item.model_dump(mode="json") for item in request.similar_incidents
                 ],
-                "feedback_hints": [
-                    item.model_dump(mode="json") for item in request.feedback_hints
-                ],
+                "feedback_hints": [item.model_dump(mode="json") for item in request.feedback_hints],
                 "agent_souls_file": self._settings.agent_souls_file,
                 "agent_souls_applied": bool(agent_souls),
                 "root_cause_candidates": [
@@ -606,9 +607,7 @@ class AnalysisOrchestrator:
         )
         return _mask_model(response, AlertAnalysisResponse, self._masker)
 
-    async def summarize_incident(
-        self, request: IncidentSummaryRequest
-    ) -> IncidentSummaryResponse:
+    async def summarize_incident(self, request: IncidentSummaryRequest) -> IncidentSummaryResponse:
         alerts = request.alerts
         title = request.title if request.title and request.title != "Ongoing" else "Run:AI incident"
         summaries = [
@@ -652,9 +651,12 @@ class AnalysisOrchestrator:
             "llm_configured": llm_configured,
             "nat_config_file": self._settings.nat_config_file,
             "runai_configured": bool(self._settings.runai_base_url),
+            "runai_mcp_configured": bool(self._settings.runai_mcp_url),
             "prometheus_configured": bool(self._settings.prometheus_url),
             "loki_configured": bool(self._settings.loki_url),
             "postgres_configured": bool(self._settings.postgres_dsn),
+            "investigation_loop_enabled": bool(self._settings.enable_investigation_loop),
+            "agent_drilldown_enabled": bool(self._settings.enable_agent_drilldown),
         }
         entity = (
             request.incident_id
@@ -664,17 +666,32 @@ class AnalysisOrchestrator:
             or request.page
             or "current RCA workspace"
         )
-        grounding = _chat_answer_from_context(request, context, str(entity), self._masker)
+        language = getattr(self._settings, "language", "en")
+        grounding = _chat_answer_from_context(
+            request, context, str(entity), self._masker, language=language
+        )
         answer = grounding
         if llm_configured:
             try:
-                llm_answer = await self._llm_chat_answer(request, grounding)
+                llm_answer, llm_error = await self._llm_chat_answer(request, grounding)
             except Exception as exc:
                 warning = self._masker.mask_text(_unexpected_runtime_warning("llm", exc))
-                answer = _append_chat_warning(grounding, warning)
+                answer = _append_chat_warning(grounding, warning, language)
             else:
                 if llm_answer:
                     answer = self._masker.mask_text(llm_answer)
+                else:
+                    # LLM path failed: fall back to the context dump but SAY SO —
+                    # a silent English dump reads like a broken chatbot.
+                    note = (
+                        f"LLM 채팅 호출이 실패하여 컨텍스트 요약으로 대신 답합니다 ({llm_error})."
+                        if language == "ko"
+                        else (
+                            f"The LLM chat call failed ({llm_error}); "
+                            "showing the grounded context instead."
+                        )
+                    )
+                    answer = _append_chat_warning(grounding, self._masker.mask_text(note), language)
         response = ChatResponse(
             status="ok",
             answer=answer,
@@ -761,9 +778,7 @@ class AnalysisOrchestrator:
             refuted = False
             next_check = ""
             if candidates:
-                check = await refute_top_cause(
-                    self._settings, candidates[0], merged_results
-                )
+                check = await refute_top_cause(self._settings, candidates[0], merged_results)
                 if isinstance(check, dict):
                     calibrated = check.get("confidence")
                     if calibrated in ("low", "medium", "high"):
@@ -786,15 +801,24 @@ class AnalysisOrchestrator:
         except Exception:  # noqa: BLE001 - re-analysis is best-effort; keep 1st result
             return None
 
-    async def _llm_chat_answer(self, request: ChatRequest, grounding: str) -> str | None:
+    async def _llm_chat_answer(
+        self, request: ChatRequest, grounding: str
+    ) -> tuple[str | None, str | None]:
+        """(answer, error_detail). The error is surfaced to the operator so an
+        LLM failure never silently degrades into the context dump."""
         question = (request.message or "").strip()
         if not question:
-            return None
+            return None, "empty question"
+        language_rule = (
+            "반드시 한국어로 답변하세요."
+            if getattr(self._settings, "language", "en") == "ko"
+            else "Reply in the operator's language."
+        )
         system = (
             "You are the RCA copilot for an NVIDIA Run:AI GPU platform. Answer the operator's "
-            "question conversationally and concisely using only the grounded context provided. "
-            "If the context lacks the answer, say so and suggest the next diagnostic step. "
-            "Reply in the operator's language."
+            "question DIRECTLY and concisely, using the grounded context provided. Lead with "
+            "the answer to the question itself — do not recite the context. If the context "
+            f"lacks the answer, say so and suggest the next diagnostic step. {language_rule}"
             f"\n\n{PROMPT_INJECTION_GUARD}"  # this path posts directly, bypassing app.llm.complete
         )
         payload = {
@@ -815,15 +839,16 @@ class AnalysisOrchestrator:
             headers={"Authorization": f"Bearer {self._settings.llm_api_key}"},
         )
         if not response.ok or not isinstance(response.data, dict):
-            return None
+            detail = " ".join(str(response.error or "").split())[:200]
+            return None, f"HTTP {response.status_code or '?'} {detail}".strip()
         choices = response.data.get("choices")
         if isinstance(choices, list) and choices:
             message = choices[0].get("message") if isinstance(choices[0], dict) else None
             if isinstance(message, dict):
                 content = message.get("content")
                 if isinstance(content, str) and content.strip():
-                    return content.strip()
-        return None
+                    return content.strip(), None
+        return None, "unexpected response shape from the LLM endpoint"
 
 
 async def _synthesize_korean(
@@ -906,9 +931,7 @@ async def _synthesize_korean(
         '- 반드시 JSON 객체 하나로만 응답하세요: {"summary": <한국어 한 문장: 문제+원인 요약>, '
         '"detail": <위 구조의 한국어 마크다운 본문>}'
     )
-    user = "증거(JSON):\n" + json.dumps(
-        compact(evidence, limit=8), ensure_ascii=False, default=str
-    )
+    user = "증거(JSON):\n" + json.dumps(compact(evidence, limit=8), ensure_ascii=False, default=str)
     try:
         data = await _complete_synthesis_json(settings, system=system, user=user)
     except Exception:  # noqa: BLE001 - synthesis is best-effort; keep deterministic report
@@ -924,9 +947,7 @@ async def _synthesize_korean(
     return _short_sentence(summary, limit=280), detail.strip()
 
 
-async def _complete_synthesis_json(
-    settings: Settings, *, system: str, user: str
-) -> dict | None:
+async def _complete_synthesis_json(settings: Settings, *, system: str, user: str) -> dict | None:
     text = await complete(
         settings,
         system=system + "\n\nJSON 객체 하나로만, 프롬프트나 코드펜스 없이 응답하세요.",
@@ -987,10 +1008,12 @@ def _unexpected_runtime_warning(component: str, exc: Exception) -> str:
     return f"{component} failed unexpectedly: {type(exc).__name__}: {exc}"
 
 
-def _append_chat_warning(answer: str, warning: str) -> str:
-    if "## Warnings" in answer:
-        return f"{answer}\n- {warning}"
-    return "\n".join([answer, "", "## Warnings", "", f"- {warning}"])
+def _append_chat_warning(answer: str, warning: str, language: str = "en") -> str:
+    heading = "## 경고" if language == "ko" else "## Warnings"
+    for existing in ("## Warnings", "## 경고"):
+        if existing in answer:
+            return f"{answer}\n- {warning}"
+    return "\n".join([answer, "", heading, "", f"- {warning}"])
 
 
 def _build_settings_masker(settings: Settings) -> Masker:
@@ -1023,9 +1046,7 @@ def _summary_from(
     results: list[CollectorResult],
     root_cause_candidates: list[RankedCause],
 ) -> str:
-    return _short_sentence(
-        _ranked_root_cause_statement(root_cause_candidates, request), limit=280
-    )
+    return _short_sentence(_ranked_root_cause_statement(root_cause_candidates, request), limit=280)
 
 
 # Section headings for the report document (Word-export-clean markdown).
@@ -1088,8 +1109,7 @@ def _detail_from(
     if request.alert.startsAt:
         meta.insert(0, f"{h['fired']}: {request.alert.startsAt}")
     where = " / ".join(
-        part for part in (target.namespace, target.workload_name or target.pod, target.node)
-        if part
+        part for part in (target.namespace, target.workload_name or target.pod, target.node) if part
     )
     if where:
         meta.append(f"{h['target']}: {where}")
@@ -1304,9 +1324,7 @@ def _promote_signature_cause(
     return candidates
 
 
-def _promote_xid_cause(
-    candidates: list[RankedCause], xid_codes: list[int]
-) -> list[RankedCause]:
+def _promote_xid_cause(candidates: list[RankedCause], xid_codes: list[int]) -> list[RankedCause]:
     """Lead with gpu_hardware_error when an NVIDIA XID is present.
 
     An XID in the alert/evidence is dispositive for the cause CATEGORY (the GPU
@@ -1423,9 +1441,7 @@ def _numbered_actions(
         failure_modes, observed_text, top_family, fuzzy_query=fuzzy
     ):
         ordered.extend(str(a) for a in symptom.get("actions", []))
-    ordered.extend(
-        line.removeprefix("- ") for line in _recommended_action_lines(missing, request)
-    )
+    ordered.extend(line.removeprefix("- ") for line in _recommended_action_lines(missing, request))
     seen: set[str] = set()
     numbered: list[str] = []
     for action in ordered:
@@ -1671,9 +1687,7 @@ def _playbook_lines(
         # Architecture layer: the implicated platform component's failure effect,
         # dependency check order, and ready-to-run checks (runai_architecture.yaml).
         if symptom.get("component"):
-            lines.extend(
-                component_check_lines(components or {}, str(symptom["component"]))
-            )
+            lines.extend(component_check_lines(components or {}, str(symptom["component"])))
     if lines:
         return lines
     # No precise signature matched: fall back to the ranked family's general
@@ -1785,8 +1799,7 @@ def _kubernetes_highlights(details: dict[str, object]) -> list[str]:
             message = event.get("message") or ""
             if message:
                 lines.append(
-                    f"- Kubernetes event {reason}: "
-                    f"{_short_sentence(str(message), limit=220)}"
+                    f"- Kubernetes event {reason}: {_short_sentence(str(message), limit=220)}"
                 )
     pod_statuses = details.get("pod_statuses")
     if isinstance(pod_statuses, list):
@@ -1876,8 +1889,7 @@ def _runai_highlights(details: dict[str, object]) -> list[str]:
                 continue
             if query.get("error"):
                 lines.append(
-                    "- Run:ai "
-                    f"{query.get('name', 'query')} failed with {query.get('error')}."
+                    f"- Run:ai {query.get('name', 'query')} failed with {query.get('error')}."
                 )
     return lines
 
@@ -2033,14 +2045,10 @@ async def _sharpen_operator_questions(
 
 # Xid codes appear as "Xid 79", "Xid: 79", or "NVRM: Xid (PCI:0000:3b:00): 79" —
 # skip the optional parenthesized PCI address before the code so we don't capture it.
-_XID_PATTERN = re.compile(
-    r"\bxid\s*(?:\([^)]*\))?\s*[:=]?\s*(\d{1,4})", re.IGNORECASE
-)
+_XID_PATTERN = re.compile(r"\bxid\s*(?:\([^)]*\))?\s*[:=]?\s*(\d{1,4})", re.IGNORECASE)
 
 
-def _xid_codes_from_results(
-    results: list[CollectorResult], alert_text: str = ""
-) -> list[int]:
+def _xid_codes_from_results(results: list[CollectorResult], alert_text: str = "") -> list[int]:
     """Distinct NVIDIA Xid codes in the alert's own text + loki/system/kubernetes
     evidence. The alert text matters: an NVRM Xid alert names its code even when
     every collector comes back empty."""
@@ -2119,9 +2127,7 @@ def _affected_pods_lines(request: AlertAnalysisRequest) -> list[str]:
 def _top_similar_incident(request: AlertAnalysisRequest):
     """Highest-similarity incident at/above the 0.80 trust floor, else None."""
     qualified = [
-        item
-        for item in request.similar_incidents
-        if (item.similarity or 0) >= _SIMILARITY_FLOOR
+        item for item in request.similar_incidents if (item.similarity or 0) >= _SIMILARITY_FLOOR
     ]
     if not qualified:
         return None
@@ -2159,12 +2165,68 @@ def _feedback_hint_lines(request: AlertAnalysisRequest) -> list[str]:
     return lines
 
 
+# Deterministic chat scaffold strings, localized: the operator-facing fallback
+# must follow settings.language like the reports do.
+_CHAT_STRINGS = {
+    "en": {
+        "title": "## RCA Chat",
+        "context": "**Context:**",
+        "question": "**Question:**",
+        "answer": "## Grounded Answer",
+        "no_detail": (
+            "No incident or alert detail RCA text was attached, so I am answering from "
+            "the current Backend and Agent runtime state supplied with this chat request."
+        ),
+        "no_state": (
+            "No incident, alert, analysis-run, or agent runtime state was attached to "
+            "this chat request. I cannot determine whether the agent is healthy, timed "
+            "out, or waiting for Alertmanager intake from this payload alone."
+        ),
+        "state": "## Current Agent State",
+        "memory": "## Related RCA Memory",
+        "missing": "## Missing Data",
+        "warnings": "## Warnings",
+        "next": "## Next Step",
+        "next_body": (
+            "Use the RCA detail and Agent Evidence Trail to confirm this against Run:AI, "
+            "Kubernetes, Prometheus, Loki, and Postgres evidence before taking action."
+        ),
+    },
+    "ko": {
+        "title": "## RCA 챗",
+        "context": "**컨텍스트:**",
+        "question": "**질문:**",
+        "answer": "## 근거 기반 답변",
+        "no_detail": (
+            "이 채팅 요청에 인시던트/알림 상세 RCA 본문이 첨부되지 않아, 함께 전달된 "
+            "백엔드·에이전트 런타임 상태를 기준으로 답합니다."
+        ),
+        "no_state": (
+            "이 채팅 요청에는 인시던트, 알림, 분석 실행, 에이전트 런타임 상태가 첨부되지 "
+            "않았습니다. 이 페이로드만으로는 에이전트의 상태(정상/타임아웃/수집 대기)를 "
+            "판단할 수 없습니다."
+        ),
+        "state": "## 현재 에이전트 상태",
+        "memory": "## 관련 RCA 메모리",
+        "missing": "## 누락된 데이터",
+        "warnings": "## 경고",
+        "next": "## 다음 단계",
+        "next_body": (
+            "조치 전에 RCA 상세와 Agent Evidence Trail에서 Run:AI, Kubernetes, "
+            "Prometheus, Loki, Postgres 증거로 이 내용을 확인하세요."
+        ),
+    },
+}
+
+
 def _chat_answer_from_context(
     request: ChatRequest,
     context: dict[str, object],
     entity: str,
     masker: Masker,
+    language: str = "en",
 ) -> str:
+    text = _CHAT_STRINGS.get(language, _CHAT_STRINGS["en"])
     question = masker.mask_text(request.message.strip())
     incident_content = masker.mask_text((request.incident_content or "").strip())
     alert_content = masker.mask_text((request.alert_content or "").strip())
@@ -2177,62 +2239,42 @@ def _chat_answer_from_context(
     runtime_lines = _runtime_snapshot_lines(context)
 
     lines = [
-        "## RCA Chat",
+        text["title"],
         "",
-        f"**Context:** {title}",
-        f"**Question:** {question}",
+        f"{text['context']} {title}",
+        f"{text['question']} {question}",
         "",
     ]
     if active_content:
         lines.extend(
             [
-                "## Grounded Answer",
+                text["answer"],
                 "",
                 _focused_chat_response(question, active_content),
                 "",
             ]
         )
     else:
-        if runtime_lines:
-            lines.extend(
-                [
-                    "## Grounded Answer",
-                    "",
-                    "No incident or alert detail RCA text was attached, so I am answering from "
-                    "the current Backend and Agent runtime state supplied with this chat request.",
-                    "",
-                ]
-            )
-        else:
-            lines.extend(
-                [
-                    "## Grounded Answer",
-                    "",
-                    "No incident, alert, analysis-run, or agent runtime state was attached to "
-                    "this chat request. I cannot determine whether the agent is healthy, timed "
-                    "out, or waiting for Alertmanager intake from this payload alone.",
-                    "",
-                ]
-            )
+        lines.extend(
+            [
+                text["answer"],
+                "",
+                text["no_detail"] if runtime_lines else text["no_state"],
+                "",
+            ]
+        )
 
     if runtime_lines:
-        lines.extend(["## Current Agent State", "", *runtime_lines, ""])
+        lines.extend([text["state"], "", *runtime_lines, ""])
 
     memory_lines = _memory_lines(memory or similar)
     if memory_lines:
-        lines.extend(["## Related RCA Memory", "", *memory_lines, ""])
+        lines.extend([text["memory"], "", *memory_lines, ""])
     if missing:
-        lines.extend(["## Missing Data", "", *[f"- {item}" for item in missing[:8]], ""])
+        lines.extend([text["missing"], "", *[f"- {item}" for item in missing[:8]], ""])
     if warnings:
-        lines.extend(["## Warnings", "", *[f"- {item}" for item in warnings[:8]], ""])
-    lines.extend(
-        [
-            "## Next Step",
-            "",
-            "Use the RCA detail and Agent Evidence Trail to confirm this against Run:AI, "
-            "Kubernetes, Prometheus, Loki, and Postgres evidence before taking action.",
-        ]
-    )
+        lines.extend([text["warnings"], "", *[f"- {item}" for item in warnings[:8]], ""])
+    lines.extend([text["next"], "", text["next_body"]])
     return "\n".join(lines)
 
 
@@ -2313,12 +2355,18 @@ def _runtime_snapshot_lines(context: dict[str, object]) -> list[str]:
         integrations = []
         for key in [
             "runai_configured",
+            "runai_mcp_configured",
             "prometheus_configured",
             "loki_configured",
             "postgres_configured",
         ]:
             integrations.append(f"{key.replace('_configured', '')}={agent_service.get(key)}")
         lines.append("- Agent integration config: " + ", ".join(integrations) + ".")
+        lines.append(
+            "- Agent reasoning config: "
+            f"investigation_loop={agent_service.get('investigation_loop_enabled')}, "
+            f"agent_drilldown={agent_service.get('agent_drilldown_enabled')}."
+        )
 
     return lines
 

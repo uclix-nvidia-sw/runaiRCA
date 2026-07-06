@@ -20,7 +20,8 @@ _LLM_SETTINGS = SimpleNamespace(
 def _capture_post_json(captured: dict):
     async def fake_post_json(*, url, timeout_seconds, json_body, headers):
         captured.update(json_body)
-        return SimpleNamespace(ok=False, data=None)
+        # Mirror JsonResponse's shape — chat reads status_code/error on failure.
+        return SimpleNamespace(ok=False, status_code=503, error="stubbed", data=None)
 
     return fake_post_json
 
