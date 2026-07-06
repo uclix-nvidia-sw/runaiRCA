@@ -78,7 +78,7 @@ def _install_stubs(
     pass replaces it with scheduling-quota evidence so the re-rank flips families.
     """
 
-    async def fake_investigate(settings, target, collectors, plan, kg, max_steps):
+    async def fake_investigate(settings, target, collectors, plan, kg, max_steps, reporter=None):
         call = len(investigate_calls)
         investigate_calls.append(max_steps)
         if fail_second_investigate and call > 0:
@@ -93,7 +93,7 @@ def _install_stubs(
                 "kubernetes": "no further node findings",
                 "prometheus": "runai reclaimed over-quota gpus; gang pod group preempt",
             }
-        return [
+        results = [
             CollectorResult(
                 agent=_collector_name(collector),
                 status="ok",
@@ -101,6 +101,7 @@ def _install_stubs(
             )
             for collector in collectors
         ]
+        return results, {"hypothesis_ledger": []}
 
     async def fake_refute(settings, top, results, plan=None):
         refute_calls.append(top.family)

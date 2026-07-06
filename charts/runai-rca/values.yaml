@@ -293,6 +293,7 @@ agent:
     runaiTimeoutSeconds: 120
     runaiLogNamespaces: runai,runai-backend
     collectors: runai,kubernetes,postgres,prometheus,loki,system,change
+    backendUrl: ""
     prometheusUrl: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
     prometheusTimeoutSeconds: 120
     prometheusMcpUrl: ""

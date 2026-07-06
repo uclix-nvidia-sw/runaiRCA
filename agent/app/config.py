@@ -92,6 +92,7 @@ class Settings:
     loki_mcp_url: str
     runai_log_namespaces: tuple[str, ...]
     collectors: tuple[str, ...]
+    backend_url: str
     postgres_dsn: str
     postgres_timeout_seconds: int
     runai_db_dsn: str
@@ -197,6 +198,7 @@ def load_settings() -> Settings:
             "COLLECTORS",
             ("runai", "kubernetes", "postgres", "prometheus", "loki", "system", "change"),
         ),
+        backend_url=os.getenv("BACKEND_URL", "").strip().rstrip("/"),
         postgres_dsn=os.getenv("POSTGRES_DSN", "").strip(),
         postgres_timeout_seconds=_int_env("POSTGRES_TIMEOUT_SECONDS", 60),
         # Optional DSN for the Run:ai control-plane Postgres (the platform's own

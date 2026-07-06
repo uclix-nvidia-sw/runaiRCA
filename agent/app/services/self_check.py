@@ -94,7 +94,7 @@ async def refute_top_cause(
                 )
             return _default(confidence)
 
-        verdict = await _llm_refute(settings, top_candidate, results, has_evidence)
+        verdict = await _llm_refute(settings, top_candidate, results, has_evidence, plan)
         if not verdict:
             # LLM failed/empty: fall back to the deterministic gate.
             if not has_evidence:
@@ -146,6 +146,7 @@ async def _llm_refute(
     top: RankedCause,
     results: list[CollectorResult],
     has_evidence: bool,
+    plan: object = None,
 ) -> dict | None:
     ko = getattr(settings, "language", "en") == "ko"
     evidence = "\n".join(
@@ -171,6 +172,7 @@ async def _llm_refute(
         f"Ranked confidence: {top.confidence}\n"
         f"Canonical source has usable evidence: {has_evidence}\n"
         f"Rationale: {'; '.join(top.rationale) or '(none)'}\n\n"
+        f"Hypothesis ledger: {_hypothesis_ledger_hint(plan)}\n\n"
         f"Gathered evidence:\n{evidence}"
     )
     return await complete_json(
@@ -180,6 +182,15 @@ async def _llm_refute(
         temperature=0.1,
         model=settings.llm_model_self_check,
     )
+
+
+def _hypothesis_ledger_hint(plan: object) -> str:
+    if not isinstance(plan, dict):
+        return "(none)"
+    ledger = plan.get("hypothesis_ledger")
+    if not ledger:
+        return "(none)"
+    return str(ledger)[:2000]
 
 
 async def verify_matches(

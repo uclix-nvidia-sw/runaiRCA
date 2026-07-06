@@ -39,6 +39,7 @@ from app.llm import (
 )
 from app.masking import Masker, build_masker
 from app.plan import InvestigationPlan
+from app.progress import ProgressReporter
 from app.prompts import load_agent_souls
 from app.schemas import (
     AlertAnalysisRequest,
@@ -218,6 +219,12 @@ class AnalysisOrchestrator:
 
     async def _analyze_impl(self, request: AlertAnalysisRequest) -> AlertAnalysisResponse:
         target = resolve_target(request.alert.labels, request.alert.annotations)
+        progress = ProgressReporter.from_alert(self._settings, request.alert, self._masker)
+        progress.emit(
+            "planning",
+            "Analysis started",
+            target=target.__dict__,
+        )
         _log.info(
             "analyze start: alert=%s ns=%s node=%s workload=%s",
             target.alert_name,
@@ -237,6 +244,12 @@ class AnalysisOrchestrator:
             kg_context.as_dict(),
             list(request.similar_incidents),
         )
+        progress.emit(
+            "planning",
+            "Investigation plan built",
+            plan=plan.as_dict(),
+            hypotheses=plan.hypotheses,
+        )
         _log.info(
             "plan: strategy=%s focus=%s hypotheses=%s",
             plan.strategy,
@@ -255,6 +268,7 @@ class AnalysisOrchestrator:
             nat_text = await self._nat.run(nat_payload)
         except Exception as exc:
             nat_warnings.append(_unexpected_runtime_warning("nemo", exc))
+        investigation_context: dict[str, object] = {}
 
         # Synthesis MUST see EVERY collector's result. Await the full gather over ALL
         # collectors here, before any ranking/synthesis, and never synthesize from a
@@ -267,19 +281,26 @@ class AnalysisOrchestrator:
         ):
             from app.services.investigator import investigate
 
-            results = await investigate(
+            results, investigation_context = await investigate(
                 self._settings,
                 target,
                 self._collectors,
                 plan,
                 kg_context.as_dict(),
                 self._settings.max_investigation_steps,
+                reporter=progress,
             )
         else:
+            progress.emit("collection", "Gathering collector evidence")
             results = list(
                 await asyncio.gather(
                     *(_collect_safely(collector, target, plan) for collector in self._collectors)
                 )
+            )
+            progress.emit(
+                "collection",
+                "Collector evidence gathered",
+                collectors=[result.agent for result in results],
             )
         assert len(results) == len(self._collectors), (
             "synthesis must wait for all collectors: "
@@ -334,6 +355,11 @@ class AnalysisOrchestrator:
             pass
         else:
             priors = derive_priors(request.feedback_hints)
+        progress.emit(
+            "ranking",
+            "Ranking root-cause candidates",
+            hypothesis_ledger=investigation_context.get("hypothesis_ledger"),
+        )
         root_cause_candidates = rank_root_cause_candidates(
             target,
             results,
@@ -370,6 +396,12 @@ class AnalysisOrchestrator:
         )
         if root_cause_candidates:
             top = root_cause_candidates[0]
+            progress.emit(
+                "ranking",
+                f"Top candidate: {top.family}",
+                top_root_cause=top.as_dict(),
+                root_cause_candidates=[candidate.as_dict() for candidate in root_cause_candidates],
+            )
             _log.info(
                 "ranked cause: %s (confidence=%s score=%.1f agents=%s)",
                 top.family,
@@ -388,7 +420,13 @@ class AnalysisOrchestrator:
             pass
         else:
             if root_cause_candidates:
-                check = await refute_top_cause(self._settings, root_cause_candidates[0], results)
+                progress.emit("self_check", "Checking whether the top cause can be refuted")
+                check = await refute_top_cause(
+                    self._settings,
+                    root_cause_candidates[0],
+                    results,
+                    plan=investigation_context,
+                )
                 if isinstance(check, dict):
                     calibrated = check.get("confidence")
                     if calibrated in ("low", "medium", "high"):
@@ -396,6 +434,13 @@ class AnalysisOrchestrator:
                     self_check_caveat = str(check.get("caveat") or "").strip()
                     self_check_refuted = bool(check.get("refuted"))
                     self_check_next = str(check.get("next_check") or "").strip()
+                progress.emit(
+                    "self_check",
+                    "Self-check complete",
+                    refuted=self_check_refuted,
+                    caveat=self_check_caveat,
+                    next_check=self_check_next,
+                )
         # RE-ANALYSIS ON REFUTATION (LLM-gated): when the self-check refuted the top
         # cause, do EXACTLY ONE bounded re-analysis pass leading with the next-best
         # hypothesis. Hard guard: this block runs once and never re-enters analyze().
@@ -603,6 +648,8 @@ class AnalysisOrchestrator:
                 ),
                 "knowledge_base": kg_context.as_dict(),
                 "plan": plan.as_dict(),
+                "hypothesis_ledger": investigation_context.get("hypothesis_ledger"),
+                "investigation": investigation_context,
                 **({"timeline": timeline} if timeline else {}),
             },
             artifacts=artifacts,
@@ -754,7 +801,7 @@ class AnalysisOrchestrator:
                 if isinstance(h, dict) and h.get("family") != next_cause.family
             ]
             replan = replace(plan, hypotheses=[lead, *rest])
-            fresh = await investigate(
+            fresh, re_context = await investigate(
                 self._settings,
                 target,
                 self._collectors,
@@ -778,7 +825,12 @@ class AnalysisOrchestrator:
             refuted = False
             next_check = ""
             if candidates:
-                check = await refute_top_cause(self._settings, candidates[0], merged_results)
+                check = await refute_top_cause(
+                    self._settings,
+                    candidates[0],
+                    merged_results,
+                    plan=re_context,
+                )
                 if isinstance(check, dict):
                     calibrated = check.get("confidence")
                     if calibrated in ("low", "medium", "high"):

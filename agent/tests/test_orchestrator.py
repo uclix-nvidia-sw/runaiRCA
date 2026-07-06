@@ -58,6 +58,7 @@ def make_settings() -> Settings:
         loki_mcp_url="",
         runai_log_namespaces=("runai", "runai-backend"),
         collectors=("runai", "kubernetes", "postgres", "prometheus", "loki", "system", "change"),
+        backend_url="",
         postgres_dsn="",
         runai_db_dsn="",
         architecture_file="knowledge/runai_architecture.yaml",

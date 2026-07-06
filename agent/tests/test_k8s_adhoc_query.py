@@ -106,7 +106,7 @@ async def test_investigator_runs_queries_and_attaches_artifacts(monkeypatch) -> 
     settings = replace(
         make_settings(), llm_base_url="http://x", llm_model="m", llm_api_key="k"
     )
-    results = await investigator.investigate(
+    results, _context = await investigator.investigate(
         settings, object(), [KubernetesCollector()], InvestigationPlan(), {}, max_steps=4
     )
 

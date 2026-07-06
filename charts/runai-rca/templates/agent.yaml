@@ -127,6 +127,8 @@ spec:
               value: {{ .Values.agent.env.runaiLogNamespaces | quote }}
             - name: COLLECTORS
               value: {{ .Values.agent.env.collectors | quote }}
+            - name: BACKEND_URL
+              value: {{ default (printf "http://%s:%v" (include "runai-rca.backend.fullname" .) .Values.backend.service.port) .Values.agent.env.backendUrl | quote }}
             - name: PROMETHEUS_URL
               value: {{ .Values.agent.env.prometheusUrl | quote }}
             - name: PROMETHEUS_TIMEOUT_SECONDS
