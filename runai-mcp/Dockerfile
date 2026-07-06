@@ -31,6 +31,11 @@ WORKDIR /app
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/package.json ./package.json
+# The server reads the OpenAPI spec at runtime — index.js resolves
+# `<dist>/../spec/saas-latest.yaml` and process.exit(1)s if it's missing.
+# tsc does NOT emit the YAML into dist, so copy the spec dir explicitly or the
+# sidecar CrashLoopBackOffs on startup ("Failed to build registry").
+COPY --from=build /app/spec ./spec
 # Non-root; the chart also applies its securityContext.
 USER 1000
 EXPOSE 8809
