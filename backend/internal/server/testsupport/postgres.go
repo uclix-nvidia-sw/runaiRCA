@@ -230,9 +230,9 @@ func (s *PostgresState) rowsFor(query string) driver.Rows {
 		}
 	case strings.Contains(lowered, "from incidents"):
 		return &fakeRows{
-			columns: []string{"incident_id", "correlation_key", "title", "severity", "status", "fired_at", "resolved_at", "alert_count"},
+			columns: []string{"incident_id", "correlation_key", "title", "severity", "status", "fired_at", "resolved_at", "alert_count", "analysis_seq", "slack_thread_ts"},
 			values: [][]driver.Value{{
-				"INC-db", "group:db", "Prior GPU quota saturation", "warning", "firing", s.now, nil, int64(1),
+				"INC-db", "group:db", "Prior GPU quota saturation", "warning", "firing", s.now, nil, int64(1), int64(0), "",
 			}},
 		}
 	case strings.Contains(lowered, "from alerts"):

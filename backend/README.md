@@ -53,6 +53,7 @@ go test ./...
 | `DATABASE_CONNECT_TIMEOUT_SECONDS` | `5` | Startup timeout for Postgres connection and schema initialization |
 | `SLACK_BOT_TOKEN` | empty | Slack bot token (`xoxb-`, `chat:write`); with `SLACK_CHANNEL_ID` enables incident analysis summaries in Slack |
 | `SLACK_CHANNEL_ID` | empty | Slack channel for incident analysis summaries; re-analyses reply in the incident's thread |
+| `SLACK_APP_TOKEN` | empty | App-level token (`xapp-`, `connections:write`); enables the in-message Re-analyze button via Socket Mode (Socket Mode + Interactivity must be on in the app settings) |
 | `DASHBOARD_URL` | empty | External dashboard URL; adds an "Open Incident" button to Slack messages |
 
 ## Existing Postgres Prerequisites

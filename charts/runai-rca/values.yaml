@@ -28,6 +28,9 @@ secrets:
     nvidiaApiKey: NVIDIA_API_KEY
     llmApiKey: LLM_API_KEY
     embeddingApiKey: EMBEDDING_API_KEY
+    slackBotToken: SLACK_BOT_TOKEN
+    slackChannelId: SLACK_CHANNEL_ID
+    slackAppToken: SLACK_APP_TOKEN
   databaseUrl: ""
   postgresDsn: ""
   runaiDbDsn: ""
@@ -37,6 +40,15 @@ secrets:
   nvidiaApiKey: ""
   llmApiKey: ""
   embeddingApiKey: ""
+  # Slack incident-analysis notifications: set BOTH to enable. Bot token
+  # (xoxb-, chat:write scope, bot invited to the channel) — an incoming webhook
+  # can't return the thread_ts needed for re-analysis thread replies.
+  slackBotToken: ""
+  slackChannelId: ""
+  # Optional app-level token (xapp-, connections:write) — enables the
+  # in-message Re-analyze button via Socket Mode (no public endpoint needed).
+  # Requires Socket Mode + Interactivity toggled on in the Slack app settings.
+  slackAppToken: ""
 
 postgresql:
   enabled: false
@@ -169,6 +181,9 @@ backend:
     embeddingUrl: ""
     embeddingModel: ""
     embeddingDim: 384
+    # External dashboard URL (e.g. https://rca.example.com). When set, Slack
+    # messages carry an "Open Incident" deep-link button.
+    dashboardUrl: ""
   service:
     annotations: {}
     type: ClusterIP

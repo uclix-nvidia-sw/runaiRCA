@@ -146,6 +146,10 @@ type Incident struct {
 	ResolvedAt       *time.Time `json:"resolved_at"`
 	AlertCount       int        `json:"alert_count"`
 	IsAnalyzing      bool       `json:"is_analyzing"`
+	// AnalysisSeq counts Slack-notified analyses (1 = Initial Analysis). Runs
+	// are updated in place on re-analysis, so rows can't be counted instead.
+	AnalysisSeq      int        `json:"analysis_seq"`
+	SlackThreadTS    string     `json:"-"`
 	LatestActivityAt time.Time  `json:"-"`
 }
 
@@ -204,6 +208,7 @@ type Server struct {
 	backfillInterval          time.Duration
 	backfillBatch             int
 	backfillRetryCooldown     time.Duration
+	slack                     *SlackNotifier
 }
 
 const (
@@ -251,6 +256,7 @@ func Run() {
 
 	go server.runBackfill(ctx)
 	go server.runStaleRunReaper(ctx)
+	go server.runSlackSocketMode(ctx)
 
 	go func() {
 		log.Printf("Run:AI RCA backend listening on :%s", port)
@@ -316,6 +322,7 @@ func NewServer() *Server {
 		backfillInterval:      time.Duration(getenvInt("ANALYSIS_BACKFILL_INTERVAL_SECONDS", 300)) * time.Second,
 		backfillBatch:         backfillBatch,
 		backfillRetryCooldown: time.Duration(getenvInt("ANALYSIS_BACKFILL_RETRY_COOLDOWN_SECONDS", 900)) * time.Second,
+		slack:                 NewSlackNotifierFromEnv(),
 	}
 }
 

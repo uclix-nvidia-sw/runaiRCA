@@ -175,8 +175,12 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			fired_at TIMESTAMPTZ NOT NULL,
 			resolved_at TIMESTAMPTZ,
 			alert_count INTEGER NOT NULL DEFAULT 0,
+			analysis_seq INTEGER NOT NULL DEFAULT 0,
+			slack_thread_ts TEXT NOT NULL DEFAULT '',
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS analysis_seq INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS slack_thread_ts TEXT NOT NULL DEFAULT ''`,
 		`CREATE TABLE IF NOT EXISTS alerts (
 			alert_id TEXT PRIMARY KEY,
 			incident_id TEXT NOT NULL,
@@ -375,7 +379,7 @@ func (s *Store) loadIncidents(ctx context.Context) {
 	rows, err := s.db.QueryContext(
 		ctx,
 		`SELECT incident_id, correlation_key, title, severity, status, fired_at,
-		        resolved_at, alert_count
+		        resolved_at, alert_count, analysis_seq, slack_thread_ts
 		   FROM incidents`,
 	)
 	if err != nil {
@@ -396,6 +400,8 @@ func (s *Store) loadIncidents(ctx context.Context) {
 			&incident.FiredAt,
 			&incident.ResolvedAt,
 			&incident.AlertCount,
+			&incident.AnalysisSeq,
+			&incident.SlackThreadTS,
 		); err != nil {
 			log.Printf("Failed to scan incident: %v", err)
 			continue
@@ -727,8 +733,8 @@ func (s *Store) persistIncidentLocked(incident *Incident) bool {
 	_, err := s.execPostgres(
 		`INSERT INTO incidents (
 			incident_id, correlation_key, title, severity, status, fired_at,
-			resolved_at, alert_count, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+			resolved_at, alert_count, analysis_seq, slack_thread_ts, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
 		ON CONFLICT (incident_id) DO UPDATE SET
 			correlation_key = EXCLUDED.correlation_key,
 			title = EXCLUDED.title,
@@ -737,6 +743,8 @@ func (s *Store) persistIncidentLocked(incident *Incident) bool {
 			fired_at = EXCLUDED.fired_at,
 			resolved_at = EXCLUDED.resolved_at,
 			alert_count = EXCLUDED.alert_count,
+			analysis_seq = EXCLUDED.analysis_seq,
+			slack_thread_ts = EXCLUDED.slack_thread_ts,
 			updated_at = now()`,
 		incident.IncidentID,
 		incident.CorrelationKey,
@@ -746,6 +754,8 @@ func (s *Store) persistIncidentLocked(incident *Incident) bool {
 		incident.FiredAt,
 		incident.ResolvedAt,
 		incident.AlertCount,
+		incident.AnalysisSeq,
+		incident.SlackThreadTS,
 	)
 	if err != nil {
 		log.Printf("Failed to persist incident %s: %v", incident.IncidentID, err)

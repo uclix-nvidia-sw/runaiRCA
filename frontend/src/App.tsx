@@ -1463,7 +1463,7 @@ function AnalysisDashboard({
                           onClick={() => void runAnalyze(incidentID)}
                           type="button"
                         >
-                          <Bot size={16} /> {pendingAnalyzeID === incidentID ? 'Analyzing...' : 'Analyze'}
+                          <Bot size={16} /> {pendingAnalyzeID === incidentID ? 'Re-analyzing...' : 'Re-analyze'}
                         </button>
                       )}
                     </div>

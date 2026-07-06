@@ -17,6 +17,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for operator-triggered Agent `/analyze` requests, default `1560` |
 | `SLACK_BOT_TOKEN` | Backend Slack bot token (`xoxb-`, `chat:write` scope, bot invited to the channel). Set together with `SLACK_CHANNEL_ID` to enable incident-analysis notifications. A bot token — not an incoming webhook — is required because `chat.postMessage` returns the `ts` used to thread re-analyses. Chart secret key `slackBotToken` |
 | `SLACK_CHANNEL_ID` | Channel the backend posts incident-analysis summaries into. Chart secret key `slackChannelId` |
+| `SLACK_APP_TOKEN` | Optional app-level token (`xapp-`, `connections:write` scope). Enables the in-message Re-analyze button: clicks arrive over Socket Mode (outbound WebSocket), so no public endpoint is needed. Requires Socket Mode + Interactivity toggled on in the Slack app settings. Chart secret key `slackAppToken` |
 | `DASHBOARD_URL` | Optional external dashboard URL; when set, Slack messages add an "Open Incident" deep-link button (Helm value `backend.env.dashboardUrl`) |
 | `LOG_LEVEL` | Agent log level, default `info` |
 | `LANGUAGE` | Backend/Agent response language, `en` or `ko` |
