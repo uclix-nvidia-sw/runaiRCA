@@ -27,24 +27,20 @@ flowchart TB
   AM[Alertmanager] -->|Webhook| BE
 
   subgraph SYS["Run:AI RCA"]
-    FE[Frontend]
-    BE[Backend]
-    AG[Agent]
-    DB[(PostgreSQL + pgvector)]
-    KG[(TypeDB ontology)]
-    BE <-->|REST + SSE| FE
-    BE -->|"Analyze / Chat"| AG
-    BE <-->|"incidents · alerts · embeddings"| DB
-    AG <-->|"blast radius · prior incidents"| KG
+    FE[Frontend] <-->|REST + SSE| BE[Backend]
+    BE -->|"Analyze / Chat"| AG[Agent]
+    BE <-->|"incidents · alerts · embeddings"| DB[(PostgreSQL + pgvector)]
+    AG <-->|"blast radius · prior incidents"| KG[(TypeDB ontology)]
     DB -.->|review-gated ingest| KG
   end
 
   BE -->|Analysis summary| SLACK[Slack]
-  AG -->|Cluster context| K8S[Kubernetes API]
-  AG -->|Metrics| PROM[Prometheus]
-  AG -->|Logs| LOKI[Loki]
-  AG -->|"Run:ai API"| RUNAI[Run:ai control plane]
   AG -->|Inference| LLM[LLM Provider]
+  AG -->|Evidence| SRC
+  subgraph SRC["Data sources"]
+    direction LR
+    K8S[Kubernetes] ~~~ PROM[Prometheus] ~~~ LOKI[Loki] ~~~ RUNAI[Run:ai]
+  end
 ```
 
 The diagram shows the components and the external systems the Agent reads.

@@ -21,24 +21,20 @@ flowchart TB
   AM[Alertmanager] -->|Webhook| BE
 
   subgraph SYS["Run:AI RCA"]
-    FE[Frontend]
-    BE[Backend]
-    AG[Agent]
-    DB[(PostgreSQL + pgvector)]
-    KG[(TypeDB ontology)]
-    BE <-->|REST + SSE| FE
-    BE -->|"Analyze / Chat"| AG
-    BE <-->|"incidents · alerts · embeddings"| DB
-    AG <-->|"blast radius · prior incidents"| KG
+    FE[Frontend] <-->|REST + SSE| BE[Backend]
+    BE -->|"Analyze / Chat"| AG[Agent]
+    BE <-->|"incidents · alerts · embeddings"| DB[(PostgreSQL + pgvector)]
+    AG <-->|"blast radius · prior incidents"| KG[(TypeDB ontology)]
     DB -.->|review-gated ingest| KG
   end
 
   BE -->|Analysis summary| SLACK[Slack]
-  AG -->|Cluster context| K8S[Kubernetes API]
-  AG -->|Metrics| PROM[Prometheus]
-  AG -->|Logs| LOKI[Loki]
-  AG -->|"Run:ai API"| RUNAI[Run:ai control plane]
   AG -->|Inference| LLM[LLM Provider]
+  AG -->|Evidence| SRC
+  subgraph SRC["Data sources"]
+    direction LR
+    K8S[Kubernetes] ~~~ PROM[Prometheus] ~~~ LOKI[Loki] ~~~ RUNAI[Run:ai]
+  end
 ```
 
 위 다이어그램은 컴포넌트와 Agent가 읽는 외부 시스템을 보여줍니다. Agent 내부에서는 **오케스트레이터**가 분석 파이프라인을 실행합니다 — 플래너 → 7개의 병렬 수집기 → 중앙 조사 루프 및 수집기별 드릴다운 → 시그니처 매칭, 랭킹, 회의적인 자기 점검 → 종합 — 자세한 내용은 [RCA Pipeline](RCA-PIPELINE.md)에 있습니다. 오케스트레이터는 pgvector가 표현할 수 없는 관계형 사실 — 노드 blast radius(영향 범위), 동일 알림에 대한 과거 인시던트, 그래프에서 도출된 family/XID 조치 — 를 위해 선택적 **TypeDB 온톨로지**(`typedb.enabled`, Helm에서 기본 활성화)를 참조하며, 이는 Postgres 저장소로부터 리뷰 기반 수집(review-gated ingestion)으로 채워집니다. **pgvector** 유사도는 백엔드가 소유하며, 백엔드는 각 분석 요청에 유사 인시던트와 피드백 힌트를 전달합니다. 전체 설명: [RCA Pipeline](RCA-PIPELINE.md) ·
