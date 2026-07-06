@@ -18,7 +18,7 @@ import yaml
 VALUES = Path(__file__).parents[2] / "charts" / "runai-rca" / "values.yaml"
 # Images we build and publish to the org registry — the ONLY repositories allowed
 # to be short (unqualified), because global.imageRegistry is meant to prefix them.
-OWN_IMAGES = {"runai-rca-agent", "runai-rca-backend", "runai-rca-frontend"}
+OWN_IMAGES = {"runai-rca-agent", "runai-rca-backend", "runai-rca-frontend", "runai-rca-mcp"}
 
 
 def _values() -> dict[str, Any]:
