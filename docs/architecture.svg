@@ -1,0 +1,61 @@
+<svg viewBox="0 0 1200 740" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" role="img">
+  <title>Run:AI RCA architecture</title>
+  <desc>Run:AI RCA: Alertmanager posts webhooks to the Backend; the box groups Backend, Frontend, Agent, PostgreSQL+pgvector and TypeDB (ontology); the Agent reads a row of evidence sources (Kubernetes, Prometheus, Loki, Run:ai) plus an LLM Provider; the Backend posts analysis summaries to Slack.</desc>
+  <defs>
+    <marker id="arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#555"/>
+    </marker>
+  </defs>
+  <rect x="200" y="55" width="790" height="495" rx="10" fill="#FEFDF0" stroke="#D9D9A6" stroke-width="1.5"/>
+  <text x="595" y="80" text-anchor="middle" font-size="15" font-weight="600" fill="#5b5b1e">Run:AI RCA</text>
+  <g stroke="#555" stroke-width="1.5" fill="none">
+    <path d="M180,105 C320,120 430,132 543,140" marker-end="url(#arw)"/>
+    <path d="M808,112 C750,124 710,132 677,140" marker-start="url(#arw)" marker-end="url(#arw)"/>
+    <path d="M610,170 L610,318" marker-end="url(#arw)"/>
+    <path d="M420,288 C470,250 500,205 545,168" marker-start="url(#arw)" marker-end="url(#arw)"/>
+    <path d="M543,352 C495,382 455,405 421,428" marker-start="url(#arw)" marker-end="url(#arw)"/>
+    <path d="M300,331 C280,360 285,385 305,408" stroke-dasharray="3 4" marker-end="url(#arw)"/>
+    <path d="M677,150 C820,205 950,275 1035,315" marker-end="url(#arw)"/>
+    <path d="M600,372 C500,470 380,560 285,653" marker-end="url(#arw)"/>
+    <path d="M605,372 C540,470 470,560 435,653" marker-end="url(#arw)"/>
+    <path d="M610,372 L600,653" marker-end="url(#arw)"/>
+    <path d="M617,372 C680,470 730,560 750,653" marker-end="url(#arw)"/>
+    <path d="M622,372 C760,470 860,560 918,653" marker-end="url(#arw)"/>
+  </g>
+  <g font-size="13" fill="#333">
+    <g><rect x="316" y="107" width="66" height="20" rx="3" fill="#ededed"/><text x="349" y="121" text-anchor="middle">Webhook</text></g>
+    <g><rect x="700" y="104" width="80" height="20" rx="3" fill="#ededed"/><text x="740" y="118" text-anchor="middle">REST + SSE</text></g>
+    <g><rect x="620" y="235" width="108" height="20" rx="3" fill="#ededed"/><text x="674" y="249" text-anchor="middle">Analyze / Chat</text></g>
+    <g><rect x="345" y="212" width="210" height="20" rx="3" fill="#ededed"/><text x="450" y="226" text-anchor="middle">incidents · alerts · embeddings</text></g>
+    <g><rect x="396" y="372" width="196" height="20" rx="3" fill="#ededed"/><text x="494" y="386" text-anchor="middle">blast radius · prior incidents</text></g>
+    <g><rect x="250" y="344" width="128" height="20" rx="3" fill="#ededed"/><text x="314" y="358" text-anchor="middle">review-gated ingest</text></g>
+    <g><rect x="800" y="222" width="118" height="20" rx="3" fill="#ededed"/><text x="859" y="236" text-anchor="middle">Analysis summary</text></g>
+    <g><rect x="266" y="600" width="106" height="20" rx="3" fill="#ededed"/><text x="319" y="614" text-anchor="middle">Cluster context</text></g>
+    <g><rect x="432" y="600" width="58" height="20" rx="3" fill="#ededed"/><text x="461" y="614" text-anchor="middle">Metrics</text></g>
+    <g><rect x="576" y="600" width="46" height="20" rx="3" fill="#ededed"/><text x="599" y="614" text-anchor="middle">Logs</text></g>
+    <g><rect x="694" y="600" width="80" height="20" rx="3" fill="#ededed"/><text x="734" y="614" text-anchor="middle">Run:ai API</text></g>
+    <g><rect x="838" y="600" width="72" height="20" rx="3" fill="#ededed"/><text x="874" y="614" text-anchor="middle">Inference</text></g>
+  </g>
+  <g font-size="14" fill="#1a1a2e">
+    <g><rect x="30" y="80" width="150" height="50" rx="6" fill="#ECECFF" stroke="#9370DB" stroke-width="1.5"/><text x="105" y="110" text-anchor="middle">Alertmanager</text></g>
+    <g><rect x="545" y="120" width="130" height="50" rx="6" fill="#ECECFF" stroke="#9370DB" stroke-width="1.5"/><text x="610" y="150" text-anchor="middle">Backend</text></g>
+    <g><rect x="810" y="85" width="130" height="50" rx="6" fill="#ECECFF" stroke="#9370DB" stroke-width="1.5"/><text x="875" y="115" text-anchor="middle">Frontend</text></g>
+    <g><rect x="545" y="320" width="130" height="50" rx="6" fill="#ECECFF" stroke="#9370DB" stroke-width="1.5"/><text x="610" y="350" text-anchor="middle">Agent</text></g>
+    <g><rect x="1035" y="300" width="130" height="50" rx="6" fill="#ECECFF" stroke="#9370DB" stroke-width="1.5"/><text x="1100" y="330" text-anchor="middle">Slack</text></g>
+    <g>
+      <path d="M245,277 a87.5,12 0 0 1 175,0 v40 a87.5,12 0 0 1 -175,0 z" fill="#ECECFF" stroke="#9370DB" stroke-width="1.5"/>
+      <path d="M245,277 a87.5,12 0 0 0 175,0" fill="none" stroke="#9370DB" stroke-width="1.5"/>
+      <text x="332" y="305" text-anchor="middle">PostgreSQL + pgvector</text>
+    </g>
+    <g>
+      <path d="M245,422 a87.5,12 0 0 1 175,0 v40 a87.5,12 0 0 1 -175,0 z" fill="#ECECFF" stroke="#9370DB" stroke-width="1.5"/>
+      <path d="M245,422 a87.5,12 0 0 0 175,0" fill="none" stroke="#9370DB" stroke-width="1.5"/>
+      <text x="332" y="450" text-anchor="middle">TypeDB (ontology)</text>
+    </g>
+    <g><rect x="205" y="655" width="130" height="50" rx="6" fill="#ECECFF" stroke="#9370DB" stroke-width="1.5"/><text x="270" y="685" text-anchor="middle">Kubernetes</text></g>
+    <g><rect x="375" y="655" width="130" height="50" rx="6" fill="#ECECFF" stroke="#9370DB" stroke-width="1.5"/><text x="440" y="685" text-anchor="middle">Prometheus</text></g>
+    <g><rect x="545" y="655" width="105" height="50" rx="6" fill="#ECECFF" stroke="#9370DB" stroke-width="1.5"/><text x="597" y="685" text-anchor="middle">Loki</text></g>
+    <g><rect x="700" y="655" width="105" height="50" rx="6" fill="#ECECFF" stroke="#9370DB" stroke-width="1.5"/><text x="752" y="685" text-anchor="middle">Run:ai</text></g>
+    <g><rect x="850" y="655" width="140" height="50" rx="6" fill="#ECECFF" stroke="#9370DB" stroke-width="1.5"/><text x="920" y="685" text-anchor="middle">LLM Provider</text></g>
+  </g>
+</svg>

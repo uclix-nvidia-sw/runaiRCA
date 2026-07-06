@@ -22,26 +22,7 @@ docs/       Architecture and operation notes
 
 ## Architecture
 
-```mermaid
-flowchart TB
-  AM[Alertmanager] -->|Webhook| BE
-
-  subgraph SYS["Run:AI RCA"]
-    FE[Frontend] <-->|REST + SSE| BE[Backend]
-    BE -->|"Analyze / Chat"| AG[Agent]
-    BE <-->|"incidents · alerts · embeddings"| DB[(PostgreSQL + pgvector)]
-    AG <-->|"blast radius · prior incidents"| KG[("TypeDB (ontology)")]
-    DB -.->|review-gated ingest| KG
-  end
-
-  BE -->|Analysis summary| SLACK[Slack]
-  AG -->|Cluster context| K8S[Kubernetes]
-  AG -->|Metrics| PROM[Prometheus]
-  AG -->|Logs| LOKI[Loki]
-  AG -->|"Run:ai API"| RUNAI[Run:ai]
-  AG -->|Inference| LLM[LLM Provider]
-  K8S ~~~ PROM ~~~ LOKI ~~~ RUNAI ~~~ LLM
-```
+![Run:AI RCA architecture](docs/architecture.svg)
 
 The diagram shows the components and the external systems the Agent reads.
 Inside the Agent, an **orchestrator** runs the analysis pipeline — planner →
