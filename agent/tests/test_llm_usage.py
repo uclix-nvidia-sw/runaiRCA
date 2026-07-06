@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from app.collectors.http_json import JsonResponse
-from app.llm import begin_usage_tracking, complete, llm_configured
+from app.llm import begin_usage_tracking, complete, complete_with_error, llm_configured
 from app.schemas import Alert, AlertAnalysisRequest, AlertAnalysisResponse
 from app.services.orchestrator import AnalysisOrchestrator
 from tests.test_orchestrator import make_settings
@@ -169,6 +169,30 @@ async def test_llm_usage_counts_exhausted_retry(monkeypatch) -> None:
     assert response.context["llm_usage"]["calls"] == 0
     assert response.context["llm_usage"]["failed_calls"] == 1
     assert response.context["llm_usage"]["by_model"]["m"]["failed_calls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_complete_with_error_returns_http_detail(monkeypatch) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.local",
+        llm_model="m",
+        llm_api_key="k",
+        analysis_deadline_seconds=0,
+    )
+
+    async def fake_post_json(**_kwargs):
+        return JsonResponse(url="u", status_code=400, error="bad request")
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    usage = begin_usage_tracking()
+
+    text, error = await complete_with_error(settings, system="s", user="u")
+
+    assert text is None
+    assert error == "HTTP 400 bad request"
+    assert usage["failed_calls"] == 1
+    assert usage["by_model"]["m"]["failed_calls"] == 1
 
 
 @pytest.mark.asyncio

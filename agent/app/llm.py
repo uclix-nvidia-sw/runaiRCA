@@ -69,9 +69,30 @@ async def complete(
     model: str | None = None,
 ) -> str | None:
     """Return the model's text answer, or None when unavailable/failed."""
+    text, _error = await complete_with_error(
+        settings,
+        system=system,
+        user=user,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        model=model,
+    )
+    return text
+
+
+async def complete_with_error(
+    settings: Settings,
+    *,
+    system: str,
+    user: str,
+    temperature: float = 0.2,
+    max_tokens: int | None = None,
+    model: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Return (text, error_detail) so chat can surface LLM failures."""
     selected_model = (model or settings.llm_model).strip()
     if not llm_configured(settings, selected_model):
-        return None
+        return None, "LLM is not configured"
     payload: dict[str, Any] = {
         "model": selected_model,
         "messages": [
@@ -95,10 +116,11 @@ async def complete(
         await asyncio.sleep((0.25 * (2**attempt)) + random.uniform(0, 0.1))
     if not response.ok:
         _record_failed_call(selected_model)
-        return None
+        detail = " ".join(str(response.error or "").split())[:200]
+        return None, f"HTTP {response.status_code or '?'} {detail}".strip()
     if not isinstance(response.data, dict):
         _record_failed_call(selected_model)
-        return None
+        return None, "unexpected response shape from the LLM endpoint"
     _record_usage(selected_model, response.data)
     choices = response.data.get("choices")
     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
@@ -106,8 +128,8 @@ async def complete(
         if isinstance(message, dict):
             content = message.get("content")
             if isinstance(content, str) and content.strip():
-                return content.strip()
-    return None
+                return content.strip(), None
+    return None, "unexpected response shape from the LLM endpoint"
 
 
 def _record_usage(model: str, data: dict[str, Any]) -> None:

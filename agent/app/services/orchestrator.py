@@ -16,7 +16,6 @@ from uuid import uuid4
 from pydantic import BaseModel
 
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, resolve_target
-from app.collectors.http_json import post_json
 from app.collectors.kubernetes import KubernetesCollector
 from app.collectors.loki import LokiCollector
 from app.collectors.postgres import PostgresCollector
@@ -33,7 +32,7 @@ from app.knowledge import (
     match_failure_mode_symptoms,
     match_runai_known_issues,
 )
-from app.llm import PROMPT_INJECTION_GUARD, begin_usage_tracking, complete, complete_json, llm_configured
+from app.llm import begin_usage_tracking, complete, complete_json, complete_with_error, llm_configured
 from app.masking import Masker, build_masker
 from app.plan import InvestigationPlan
 from app.prompts import load_agent_souls
@@ -650,14 +649,12 @@ class AnalysisOrchestrator:
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
         context = dict(request.context or {})
-        llm_configured = bool(
-            self._settings.llm_base_url and self._settings.llm_model and self._settings.llm_api_key
-        )
+        chat_llm_configured = llm_configured(self._settings, self._settings.llm_model_chat)
         context["agent_service"] = {
             "nemo_runtime": "enabled" if self._nat.enabled() else "fallback",
-            "chat_mode": "llm" if llm_configured else "deterministic_context",
-            "chat_llm_runtime": "active" if llm_configured else "not_directly_used",
-            "llm_configured": llm_configured,
+            "chat_mode": "llm" if chat_llm_configured else "deterministic_context",
+            "chat_llm_runtime": "active" if chat_llm_configured else "not_directly_used",
+            "llm_configured": chat_llm_configured,
             "nat_config_file": self._settings.nat_config_file,
             "runai_configured": bool(self._settings.runai_base_url),
             "runai_mcp_configured": bool(self._settings.runai_mcp_url),
@@ -680,7 +677,7 @@ class AnalysisOrchestrator:
             request, context, str(entity), self._masker, language=language
         )
         answer = grounding
-        if llm_configured:
+        if chat_llm_configured:
             try:
                 llm_answer, llm_error = await self._llm_chat_answer(request, grounding)
             except Exception as exc:
@@ -828,36 +825,15 @@ class AnalysisOrchestrator:
             "question DIRECTLY and concisely, using the grounded context provided. Lead with "
             "the answer to the question itself — do not recite the context. If the context "
             f"lacks the answer, say so and suggest the next diagnostic step. {language_rule}"
-            f"\n\n{PROMPT_INJECTION_GUARD}"  # this path posts directly, bypassing app.llm.complete
         )
-        payload = {
-            "model": self._settings.llm_model,
-            "messages": [
-                {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": f"Grounded context:\n{grounding}\n\nQuestion: {question}",
-                },
-            ],
-            "temperature": 0.2,
-        }
-        response = await post_json(
-            url=f"{self._settings.llm_base_url}/chat/completions",
-            timeout_seconds=self._settings.llm_request_timeout_seconds,
-            json_body=payload,
-            headers={"Authorization": f"Bearer {self._settings.llm_api_key}"},
+        answer, error = await complete_with_error(
+            self._settings,
+            system=system,
+            user=f"Grounded context:\n{grounding}\n\nQuestion: {question}",
+            temperature=0.2,
+            model=getattr(self._settings, "llm_model_chat", ""),
         )
-        if not response.ok or not isinstance(response.data, dict):
-            detail = " ".join(str(response.error or "").split())[:200]
-            return None, f"HTTP {response.status_code or '?'} {detail}".strip()
-        choices = response.data.get("choices")
-        if isinstance(choices, list) and choices:
-            message = choices[0].get("message") if isinstance(choices[0], dict) else None
-            if isinstance(message, dict):
-                content = message.get("content")
-                if isinstance(content, str) and content.strip():
-                    return content.strip(), None
-        return None, "unexpected response shape from the LLM endpoint"
+        return answer, error
 
 
 async def _synthesize_korean(

@@ -592,6 +592,7 @@ async def test_chat_uses_llm_when_configured(monkeypatch) -> None:
         make_settings(),
         llm_base_url="https://llm.example.com/v1",
         llm_model="rca-router",
+        llm_model_chat="rca-chat",
         llm_api_key="secret",
     )
     captured: dict[str, object] = {}
@@ -608,7 +609,7 @@ async def test_chat_uses_llm_when_configured(monkeypatch) -> None:
             },
         )
 
-    monkeypatch.setattr("app.services.orchestrator.post_json", fake_post_json)
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
     orchestrator = AnalysisOrchestrator(settings)
     response = await orchestrator.chat(
         ChatRequest(message="왜 워크로드가 멈췄어?", page="operations")
@@ -616,7 +617,7 @@ async def test_chat_uses_llm_when_configured(monkeypatch) -> None:
 
     assert response.answer == "Live LLM reply about the pending workload."
     assert captured["url"] == "https://llm.example.com/v1/chat/completions"
-    assert captured["json_body"]["model"] == "rca-router"
+    assert captured["json_body"]["model"] == "rca-chat"
 
 
 @pytest.mark.anyio
@@ -631,7 +632,7 @@ async def test_chat_falls_back_when_llm_unavailable(monkeypatch) -> None:
     async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
         return SimpleNamespace(ok=False, data=None)
 
-    monkeypatch.setattr("app.services.orchestrator.post_json", fake_post_json)
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
     orchestrator = AnalysisOrchestrator(settings)
     response = await orchestrator.chat(ChatRequest(message="status?", page="operations"))
 
@@ -650,7 +651,7 @@ async def test_chat_falls_back_when_llm_call_raises(monkeypatch) -> None:
     async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
         raise RuntimeError("LLM transport exploded")
 
-    monkeypatch.setattr("app.services.orchestrator.post_json", fake_post_json)
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
     orchestrator = AnalysisOrchestrator(settings)
     response = await orchestrator.chat(ChatRequest(message="status?", page="operations"))
 

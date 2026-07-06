@@ -14,7 +14,6 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 from app.schemas import ChatRequest
-from app.services import orchestrator as orch_mod
 from app.services.orchestrator import AnalysisOrchestrator
 from tests.test_orchestrator import make_settings
 
@@ -56,7 +55,7 @@ def test_llm_answer_wins_and_is_returned_verbatim(monkeypatch) -> None:
             data={"choices": [{"message": {"content": "네, 지금은 MCP가 비활성입니다."}}]},
         )
 
-    monkeypatch.setattr(orch_mod, "post_json", ok_post_json)
+    monkeypatch.setattr("app.llm.post_json", ok_post_json)
     orchestrator = _orchestrator(language="ko", **_llm())
     response = asyncio.run(orchestrator.chat(ChatRequest(message="mcp 쓸 수 있나?")))
     assert response.answer == "네, 지금은 MCP가 비활성입니다."
@@ -66,7 +65,7 @@ def test_llm_failure_is_surfaced_not_silent(monkeypatch) -> None:
     async def failing_post_json(*, url, timeout_seconds, json_body, headers):
         return SimpleNamespace(ok=False, status_code=502, error="bad gateway", data=None)
 
-    monkeypatch.setattr(orch_mod, "post_json", failing_post_json)
+    monkeypatch.setattr("app.llm.post_json", failing_post_json)
     orchestrator = _orchestrator(language="ko", **_llm())
     response = asyncio.run(orchestrator.chat(ChatRequest(message="상태?")))
     assert "LLM 채팅 호출이 실패" in response.answer
