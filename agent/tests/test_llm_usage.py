@@ -5,7 +5,15 @@ from dataclasses import replace
 import pytest
 
 from app.collectors.http_json import JsonResponse
-from app.llm import begin_usage_tracking, complete, complete_with_error, llm_configured
+from app.llm import (
+    begin_usage_tracking,
+    complete,
+    complete_with_error,
+    llm_configured,
+    token_budget_exceeded,
+    token_budget_warning,
+    usage_with_cost,
+)
 from app.schemas import Alert, AlertAnalysisRequest, AlertAnalysisResponse
 from app.services.orchestrator import AnalysisOrchestrator
 from tests.test_orchestrator import make_settings
@@ -63,6 +71,7 @@ async def test_llm_usage_is_injected_by_analyze(monkeypatch) -> None:
         "prompt_tokens": 3,
         "completion_tokens": 5,
         "total_tokens": 8,
+        "cost_usd": 0.0,
         "by_model": {
             "m": {
                 "calls": 1,
@@ -71,6 +80,7 @@ async def test_llm_usage_is_injected_by_analyze(monkeypatch) -> None:
                 "prompt_tokens": 3,
                 "completion_tokens": 5,
                 "total_tokens": 8,
+                "cost_usd": 0.0,
             },
         },
     }
@@ -229,3 +239,43 @@ def test_llm_configured_accepts_stage_model_without_default_model() -> None:
 
     assert llm_configured(settings, "planner-model")
     assert not llm_configured(settings)
+
+
+def test_usage_with_cost_estimates_by_model() -> None:
+    settings = replace(
+        make_settings(),
+        llm_pricing_json=(
+            '{"cheap":{"prompt_per_mtok":0.10,"completion_per_mtok":0.20},'
+            '"smart":{"prompt_per_mtok":1,"completion_per_mtok":2}}'
+        ),
+    )
+    usage = {
+        "calls": 2,
+        "calls_without_usage": 0,
+        "failed_calls": 0,
+        "prompt_tokens": 3_000_000,
+        "completion_tokens": 2_000_000,
+        "total_tokens": 5_000_000,
+        "by_model": {
+            "cheap": {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000},
+            "smart": {"prompt_tokens": 2_000_000, "completion_tokens": 1_000_000},
+        },
+    }
+
+    enriched = usage_with_cost(settings, usage)
+
+    assert enriched["by_model"]["cheap"]["cost_usd"] == 0.3
+    assert enriched["by_model"]["smart"]["cost_usd"] == 4.0
+    assert enriched["cost_usd"] == 4.3
+    assert "cost_usd" not in usage["by_model"]["cheap"]
+
+
+def test_token_budget_exceeded_uses_current_usage() -> None:
+    settings = replace(make_settings(), analysis_token_budget=10)
+    usage = begin_usage_tracking()
+
+    assert not token_budget_exceeded(settings)
+    usage["total_tokens"] = 10
+
+    assert token_budget_exceeded(settings)
+    assert "10/10" in token_budget_warning(settings)

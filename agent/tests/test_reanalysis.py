@@ -176,6 +176,38 @@ async def test_not_refuted_means_no_reanalysis(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_token_budget_skips_reanalysis(monkeypatch) -> None:
+    _stub_llm_http(monkeypatch)
+    investigate_calls: list[int] = []
+    refute_calls: list[str] = []
+    _install_stubs(
+        monkeypatch,
+        verdicts=[
+            {
+                "confidence": "low",
+                "caveat": "Competing cause fits better.",
+                "refuted": True,
+                "next_check": "Check the scheduler queue directly.",
+            }
+        ],
+        investigate_calls=investigate_calls,
+        refute_calls=refute_calls,
+    )
+    monkeypatch.setattr("app.services.orchestrator.token_budget_exceeded", lambda settings: True)
+    monkeypatch.setattr(
+        "app.services.orchestrator.token_budget_warning",
+        lambda settings: "analysis token budget exceeded (10/10 tokens); skipped additional LLM reasoning",
+    )
+
+    orchestrator = AnalysisOrchestrator(llm_settings())
+    response = await orchestrator.analyze(_request())
+
+    assert len(investigate_calls) == 1
+    assert len(refute_calls) == 1
+    assert any("token budget" in warning for warning in response.warnings)
+
+
+@pytest.mark.asyncio
 async def test_reanalysis_failure_falls_back_to_first_result(monkeypatch) -> None:
     _stub_llm_http(monkeypatch)
     investigate_calls: list[int] = []

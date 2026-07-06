@@ -6,6 +6,7 @@ from dataclasses import replace
 import pytest
 
 from app.collectors.base import AnalysisTarget, CollectorResult
+from app.llm import begin_usage_tracking
 from app.services import drilldown
 from app.services.drilldown import _tool_runai_get, run_drilldowns
 from tests.test_orchestrator import make_settings
@@ -112,6 +113,28 @@ def test_loop_is_bounded_by_max_steps_and_queries_per_step(monkeypatch) -> None:
     asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
     assert llm_calls[0] == 3  # drilldown_max_steps
     assert tool_calls[0] == 9  # 3 steps x 3 queries/step cap (9 requested per step)
+
+
+def test_token_budget_stops_drilldown_loop(monkeypatch) -> None:
+    usage = begin_usage_tracking()
+    usage["total_tokens"] = 10
+
+    async def should_not_call_llm(*args, **kwargs):
+        raise AssertionError("budget should stop drilldown before another LLM call")
+
+    monkeypatch.setattr(drilldown, "complete_json", should_not_call_llm)
+    result = _k8s_result()
+    asyncio.run(
+        run_drilldowns(
+            drill_settings(analysis_token_budget=10),
+            [result],
+            _target(),
+            None,
+        )
+    )
+
+    assert result.artifacts == []
+    assert any("token budget" in warning for warning in result.warnings)
 
 
 def test_tool_scoping_is_structural(monkeypatch) -> None:

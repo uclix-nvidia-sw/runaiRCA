@@ -21,7 +21,7 @@ from dataclasses import replace
 from app.collectors.base import CollectorResult, artifact, salient_markers
 from app.collectors.kubernetes import _READ_KINDS, k8s_read, kind_lookup_title, kubectl_repr
 from app.config import Settings
-from app.llm import complete_json
+from app.llm import complete_json, token_budget_exceeded, token_budget_warning
 from app.plan import InvestigationPlan
 
 # Ad-hoc kubectl-style reads per step are capped so a chatty LLM can't turn one
@@ -120,9 +120,13 @@ async def investigate(
         evidence[name] = await _collect_safely(collector, target, _scoped_plan(plan, scope))
 
     adhoc: list[dict] = []
+    budget_warning = ""
     try:
         ran_queries_last_step = False
         for _ in range(max(1, max_steps)):
+            if token_budget_exceeded(settings):
+                budget_warning = token_budget_warning(settings)
+                break
             if all_names <= set(evidence) and not ran_queries_last_step:
                 break  # every collector probed and no ad-hoc drill-down pending
             decision = await complete_json(
@@ -228,7 +232,10 @@ async def investigate(
                 )
             )
 
-    return list(evidence.values())
+    results = list(evidence.values())
+    if budget_warning and results:
+        results[0].warnings.append(budget_warning)
+    return results
 
 
 def _build_user_prompt(

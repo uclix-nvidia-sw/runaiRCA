@@ -276,6 +276,9 @@ agent:
     # LLM is configured; each step is extra LLM calls (accuracy over latency).
     enableAgentDrilldown: true
     drilldownMaxSteps: 4
+    # Stop optional LLM reasoning loops after this many tokens have been used in
+    # one analysis. 0 = unlimited; the overall deadline still applies.
+    analysisTokenBudget: 0
     # Overall hard cap per analysis: generous per-step time, but the whole run always
     # finishes within this budget (default 25 min). 0 = no overall cap.
     analysisDeadlineSeconds: 1500
@@ -311,6 +314,8 @@ agent:
     llmModelSelfCheck: ""
     llmModelSynthesis: ""
     llmModelChat: ""
+    # JSON: {"model":{"prompt_per_mtok":0.15,"completion_per_mtok":0.60}}
+    llmPricingJson: "{}"
     llmRequestTimeoutSeconds: 300
   podAnnotations: {}
   podLabels: {}

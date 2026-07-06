@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from app.collectors.base import CollectorResult
+from app.llm import begin_usage_tracking
 from app.plan import InvestigationPlan
 from app.services.investigator import investigate
 from tests.test_orchestrator import make_settings, make_target
@@ -90,7 +91,7 @@ async def test_loop_is_bounded_by_max_steps(monkeypatch) -> None:
     )
     calls = {"n": 0}
 
-    async def never_conclude(settings, *, system, user, temperature=0.1):
+    async def never_conclude(settings, *, system, user, temperature=0.1, model=None):
         calls["n"] += 1
         # Always re-probe the same collector so only "conclude" or max_steps can stop it.
         return {"action": "probe", "reason": "again", "probes": [{"collector": "runai"}]}
@@ -102,6 +103,31 @@ async def test_loop_is_bounded_by_max_steps(monkeypatch) -> None:
 
     assert calls["n"] <= 2  # bounded
     assert {r.agent for r in results} == {"runai", "kubernetes", "loki"}
+
+
+@pytest.mark.asyncio
+async def test_token_budget_stops_investigation_loop(monkeypatch) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.example/v1",
+        llm_model="m",
+        llm_api_key="k",
+        analysis_token_budget=10,
+    )
+    usage = begin_usage_tracking()
+    usage["total_tokens"] = 10
+
+    async def should_not_call_llm(*args, **kwargs):
+        raise AssertionError("budget should stop the loop before another LLM call")
+
+    monkeypatch.setattr("app.services.investigator.complete_json", should_not_call_llm)
+    collectors = _collectors()
+    results = await investigate(
+        settings, make_target(), collectors, InvestigationPlan(), {}, max_steps=4
+    )
+
+    assert {r.agent for r in results} == {"runai", "kubernetes", "loki"}
+    assert any("token budget" in warning for result in results for warning in result.warnings)
 
 
 @pytest.mark.asyncio

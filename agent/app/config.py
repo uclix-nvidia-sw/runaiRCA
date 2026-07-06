@@ -117,6 +117,7 @@ class Settings:
     llm_model_self_check: str
     llm_model_synthesis: str
     llm_model_chat: str
+    llm_pricing_json: str
     llm_api_key: str
     llm_request_timeout_seconds: int
     nat_config_file: str
@@ -132,6 +133,7 @@ class Settings:
     enable_investigation_loop: bool
     max_investigation_steps: int
     max_reanalysis_steps: int
+    analysis_token_budget: int
     enable_agent_drilldown: bool
     drilldown_max_steps: int
     analysis_deadline_seconds: int
@@ -241,6 +243,7 @@ def load_settings() -> Settings:
         llm_model_self_check=os.getenv("LLM_MODEL_SELF_CHECK", "").strip(),
         llm_model_synthesis=os.getenv("LLM_MODEL_SYNTHESIS", "").strip(),
         llm_model_chat=os.getenv("LLM_MODEL_CHAT", "").strip(),
+        llm_pricing_json=os.getenv("LLM_PRICING_JSON", "{}").strip(),
         llm_api_key=os.getenv("LLM_API_KEY", "").strip(),
         # Generous per-call ceiling so a reasoning agent is never cut off mid-thought;
         # the overall analysis deadline below is the real bound. (0 = unlimited.)
@@ -264,6 +267,7 @@ def load_settings() -> Settings:
         # Re-analysis (after the first top cause is refuted) gets a generous
         # investigation budget of its own — accuracy over speed.
         max_reanalysis_steps=max(1, _int_env("MAX_REANALYSIS_STEPS", 6)),
+        analysis_token_budget=max(0, _int_env("ANALYSIS_TOKEN_BUDGET", 0)),
         # Per-collector autonomous drill-down: each evidence agent gets its own LLM
         # loop with ONLY its domain's read-only tools (see services/drilldown.py).
         # LLM-gated and best-effort like the investigation loop.

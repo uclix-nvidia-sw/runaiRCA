@@ -32,7 +32,16 @@ from app.knowledge import (
     match_failure_mode_symptoms,
     match_runai_known_issues,
 )
-from app.llm import begin_usage_tracking, complete, complete_json, complete_with_error, llm_configured
+from app.llm import (
+    begin_usage_tracking,
+    complete,
+    complete_json,
+    complete_with_error,
+    llm_configured,
+    token_budget_exceeded,
+    token_budget_warning,
+    usage_with_cost,
+)
 from app.masking import Masker, build_masker
 from app.plan import InvestigationPlan
 from app.prompts import load_agent_souls
@@ -183,14 +192,14 @@ class AnalysisOrchestrator:
         if not deadline or deadline <= 0:
             response = await self._analyze_impl(request)
             if isinstance(getattr(response, "context", None), dict):
-                response.context["llm_usage"] = dict(usage)
+                response.context["llm_usage"] = usage_with_cost(self._settings, usage)
             return response
         try:
             response = await asyncio.wait_for(self._analyze_impl(request), timeout=deadline)
         except TimeoutError:  # asyncio.TimeoutError is this builtin on 3.11+
             _log.warning("analysis exceeded the %ss deadline; returning degraded report", deadline)
             response = self._deadline_response(request, deadline)
-        response.context["llm_usage"] = dict(usage)
+        response.context["llm_usage"] = usage_with_cost(self._settings, usage)
         return response
 
     def _deadline_response(
@@ -416,16 +425,20 @@ class AnalysisOrchestrator:
             and llm_configured(self._settings, self._settings.llm_model_investigation)
             and self._settings.enable_investigation_loop
         ):
-            outcome = await self._reanalyze_once(
-                target=target,
-                plan=plan,
-                kg_context=kg_context,
-                results=results,
-                request=request,
-                priors=priors,
-                refuted_family=root_cause_candidates[0].family,
-                prior_candidates=root_cause_candidates,
-            )
+            if token_budget_exceeded(self._settings):
+                warnings.append(token_budget_warning(self._settings))
+                outcome = None
+            else:
+                outcome = await self._reanalyze_once(
+                    target=target,
+                    plan=plan,
+                    kg_context=kg_context,
+                    results=results,
+                    request=request,
+                    priors=priors,
+                    refuted_family=root_cause_candidates[0].family,
+                    prior_candidates=root_cause_candidates,
+                )
             if outcome is not None:
                 (
                     results,

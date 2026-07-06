@@ -40,10 +40,93 @@ def begin_usage_tracking() -> dict[str, Any]:
     return usage
 
 
-# Appended to EVERY system prompt sent through this module (and manually to the
-# one chat path that posts directly). The evidence fed to the LLM — log lines,
-# event messages, alert labels/annotations, resource names — is collected from
-# the cluster, so anyone who can write a log line can write to our prompts.
+def usage_with_cost(settings: Settings, usage: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of usage enriched with model cost_usd from LLM_PRICING_JSON."""
+    enriched = dict(usage)
+    pricing = _pricing_table(settings)
+    total_cost = 0.0
+    raw_by_model = usage.get("by_model")
+    by_model: dict[str, Any] = {}
+    if isinstance(raw_by_model, dict):
+        for model, raw_bucket in raw_by_model.items():
+            if not isinstance(raw_bucket, dict):
+                continue
+            bucket = dict(raw_bucket)
+            cost = _estimate_bucket_cost(pricing.get(str(model)), bucket)
+            bucket["cost_usd"] = round(cost, 8)
+            by_model[str(model)] = bucket
+            total_cost += cost
+    enriched["by_model"] = by_model
+    enriched["cost_usd"] = round(total_cost, 8)
+    return enriched
+
+
+def token_budget_exceeded(settings: Settings) -> bool:
+    budget = int(getattr(settings, "analysis_token_budget", 0) or 0)
+    if budget <= 0:
+        return False
+    current = _usage.get()
+    if not isinstance(current, dict):
+        return False
+    return int(current.get("total_tokens") or 0) >= budget
+
+
+def token_budget_warning(settings: Settings) -> str:
+    current = _usage.get() or {}
+    used = int(current.get("total_tokens") or 0) if isinstance(current, dict) else 0
+    budget = int(getattr(settings, "analysis_token_budget", 0) or 0)
+    return (
+        f"analysis token budget exceeded ({used}/{budget} tokens); "
+        "skipped additional LLM reasoning"
+    )
+
+
+def _pricing_table(settings: Settings) -> dict[str, dict[str, float]]:
+    try:
+        raw = json.loads(getattr(settings, "llm_pricing_json", "{}") or "{}")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, float]] = {}
+    for model, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        prompt = _float(value.get("prompt_per_mtok"))
+        completion = _float(value.get("completion_per_mtok"))
+        out[str(model)] = {
+            "prompt_per_mtok": prompt,
+            "completion_per_mtok": completion,
+        }
+    return out
+
+
+def _estimate_bucket_cost(pricing: dict[str, float] | None, bucket: dict[str, Any]) -> float:
+    if not pricing:
+        return 0.0
+    prompt_tokens = int(bucket.get("prompt_tokens") or 0)
+    completion_tokens = int(bucket.get("completion_tokens") or 0)
+    return (
+        (prompt_tokens / 1_000_000) * pricing.get("prompt_per_mtok", 0.0)
+        + (completion_tokens / 1_000_000) * pricing.get("completion_per_mtok", 0.0)
+    )
+
+
+def _float(value: Any) -> float:
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+# Appended to EVERY system prompt sent through this module. The evidence fed to
+# the LLM — log lines, event messages, alert labels/annotations, resource names
+# — is collected from the cluster, so anyone who can write a log line can write
+# to our prompts.
 # Masking (app.masking) strips secrets; this line neutralises embedded
 # instructions. operator_guidance is the one deliberate instruction channel
 # (see _synthesize_korean) and stays exempt.
