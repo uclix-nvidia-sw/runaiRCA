@@ -37,9 +37,13 @@ jobs:
       - name: Test
         working-directory: agent
         run: pytest -q
-      - name: Eval smoke
+      - name: Eval gate
         working-directory: agent
-        run: python -m eval.run_eval
+        run: python -m eval.run_eval --fixtures eval/fixtures.jsonl --min-top1 0.8
+      - name: Eval holdout report
+        working-directory: agent
+        continue-on-error: true
+        run: python -m eval.run_eval --fixtures eval/fixtures_holdout.jsonl
 
   frontend:
     runs-on: ubuntu-latest

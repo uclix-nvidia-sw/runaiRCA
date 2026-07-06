@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from app.collectors.base import AnalysisTarget, CollectorResult
 from app.services.root_cause_ranking import rank_root_cause_candidates
 
-FIXTURES = Path(__file__).resolve().parent / "fixtures.jsonl"
+DEFAULT_FIXTURES = Path(__file__).resolve().parent / "fixtures.jsonl"
 
 _EMPTY_TARGET = AnalysisTarget(
     cluster="", project="", queue="", namespace="", workload_name="",
@@ -49,13 +50,24 @@ def _results(fixture: dict, kg_on: bool) -> list[CollectorResult]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Root-cause ranking eval.")
+    parser.add_argument(
+        "--fixtures",
+        type=Path,
+        default=DEFAULT_FIXTURES,
+        help="JSONL fixture file to grade",
+    )
     parser.add_argument("--kg-off", action="store_true", help="drop the KG blast-radius signal")
+    parser.add_argument("--min-top1", type=float, default=0.0, help="fail when Top-1 rate is below this")
+    parser.add_argument("--max-false-assertions", type=int, default=0)
     args = parser.parse_args()
     kg_on = not args.kg_off
 
     fixtures = [
-        json.loads(line) for line in FIXTURES.read_text().splitlines() if line.strip()
+        json.loads(line) for line in args.fixtures.read_text().splitlines() if line.strip()
     ]
+    if not fixtures:
+        print(f"No fixtures found in {args.fixtures}", file=sys.stderr)
+        return 1
     top1 = top3 = false_assert = 0
     for fx in fixtures:
         ranked = rank_root_cause_candidates(
@@ -79,11 +91,21 @@ def main() -> int:
         print(f"  [{mark}] {fx['id']:<16} expected={expected:<28} got={got}")
 
     n = len(fixtures)
+    top1_rate = top1 / n
     print(
         f"\nKG signal: {'on' if kg_on else 'off'} | n={n} | "
-        f"Top-1={top1}/{n} ({top1/n:.0%}) | Top-3={top3}/{n} ({top3/n:.0%}) | "
+        f"Top-1={top1}/{n} ({top1_rate:.0%}) | Top-3={top3}/{n} ({top3/n:.0%}) | "
         f"false-assertions={false_assert}"
     )
+    if top1_rate < args.min_top1:
+        print(f"Top-1 below threshold: {top1_rate:.3f} < {args.min_top1:.3f}", file=sys.stderr)
+        return 1
+    if false_assert > args.max_false_assertions:
+        print(
+            f"false assertions above threshold: {false_assert} > {args.max_false_assertions}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
