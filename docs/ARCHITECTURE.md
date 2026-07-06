@@ -37,8 +37,9 @@ and ontology it consults.
 8. The Agent synthesizes a single RCA — Problem → Root Cause → Recommended
    Actions → Appendix — plus an `artifacts` list preserving each agent's real
    query, summary, highlighted findings, confidence, and status.
-9. Backend stores the analysis response, broadcasts SSE updates, and (planned)
-   posts a summary + dashboard link to Slack on completion.
+9. Backend stores the analysis response, broadcasts SSE updates, and posts an
+   incident summary to Slack on completion (first analysis opens a thread;
+   operator re-analyses reply into it).
 10. Backend writes analyzed incidents into `incident_embeddings` and includes
    similar prior incidents plus feedback hints in future Agent requests.
 11. Frontend renders the final RCA and the agent evidence trail on the same
@@ -78,7 +79,7 @@ It owns:
 - **pgvector similarity** — the `incident_embeddings` cosine search (HNSW, JSONB fallback) that finds prior incidents; results are passed into each Agent request as `similar_incidents` + `feedback_hints`
 - KubeRCA-style `/api/v1/embeddings/search` similar-incident API
 - SSE event fanout
-- Slack notification on analysis completion *(in progress)* — summary + dashboard link, threaded by `thread_ts`
+- Slack notification on analysis completion — incident summary + Recommended Action + Open-Incident link, threaded per incident (see [Slack Notifications](#slack-notifications))
 - Chat proxy
 - Unified API response shape for the frontend
 
@@ -143,14 +144,33 @@ TypeDB runs as a single-node StatefulSet
 (`charts/runai-rca/templates/typedb.yaml`); Community Edition is single-node, so
 HA/clustering would require the paid Enterprise tier.
 
-## Slack Notifications *(in progress)*
+## Slack Notifications
 
-On analysis-run completion the Backend posts a concise Slack message — the
-problem/cause summary, severity and confidence, and a link to the full RCA in the
-dashboard — threaded by the incident's `thread_ts` so repeat analyses of the same
-incident stay in one thread. The Backend is the natural owner: it already holds
-the run lifecycle, the SSE broadcast, and the `thread_ts`. The long-form report
-stays in the UI; Slack is the notification, not the report.
+On analysis-run completion the Backend posts a concise incident summary to one
+Slack channel (`backend/internal/server/slack.go`). It is the natural owner: it
+holds the run lifecycle, the SSE broadcast, and the incident's Slack thread.
+
+**Delivery rules** (incident-level, not per-alert):
+
+- The **first** completed analysis of an incident posts a root channel message
+  (*"Initial Analysis"*) and stores its `thread_ts` on the incident row so
+  threading survives restarts.
+- Later **operator-driven** re-analyses (`manual`/`comment`/`feedback`/`chat`)
+  reply into that thread (*"2nd Analysis"*, *"3rd Analysis"*, …), tracked by the
+  incident's `analysis_seq`.
+- Follow-up **auto/backfill** completions and **failed** runs never reach Slack —
+  raw alerts already arrive via other channels and the dashboard keeps the full
+  per-alert history.
+
+Each message carries a severity color bar, the **Root Cause** summary, the first
+**Recommended Action** lines, key fields (namespace/node/severity/alert count),
+and — when `DASHBOARD_URL` is set — an **Open Incident** deep-link button. The
+long-form report stays in the UI; Slack is the notification, not the report.
+
+A **bot token** (`SLACK_BOT_TOKEN` + `SLACK_CHANNEL_ID`), not an incoming webhook,
+is required: `chat.postMessage` returns the message `ts` needed to thread
+replies. Delivery is fire-and-forget — errors are logged and never affect run
+persistence.
 
 ## Evidence Contract
 

@@ -15,8 +15,9 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `AGENT_URL` | Backend to Agent URL, default `http://localhost:8000` |
 | `AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for Agent `/analyze` and `/chat` requests, default `1560` (must exceed the agent's `ANALYSIS_DEADLINE_SECONDS`) |
 | `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for operator-triggered Agent `/analyze` requests, default `1560` |
-| `SLACK_WEBHOOK_URL` | *(in progress)* Backend Slack incoming-webhook URL; when set, the backend posts a summary + dashboard link on analysis completion. Empty = disabled |
-| `PUBLIC_BASE_URL` | *(in progress)* External dashboard base URL used to build the RCA link in Slack messages |
+| `SLACK_BOT_TOKEN` | Backend Slack bot token (`xoxb-`, `chat:write` scope, bot invited to the channel). Set together with `SLACK_CHANNEL_ID` to enable incident-analysis notifications. A bot token — not an incoming webhook — is required because `chat.postMessage` returns the `ts` used to thread re-analyses. Chart secret key `slackBotToken` |
+| `SLACK_CHANNEL_ID` | Channel the backend posts incident-analysis summaries into. Chart secret key `slackChannelId` |
+| `DASHBOARD_URL` | Optional external dashboard URL; when set, Slack messages add an "Open Incident" deep-link button (Helm value `backend.env.dashboardUrl`) |
 | `LOG_LEVEL` | Agent log level, default `info` |
 | `LANGUAGE` | Backend/Agent response language, `en` or `ko` |
 | `KUBERNETES_API_URL` | In-cluster Kubernetes API URL, default `https://kubernetes.default.svc` |

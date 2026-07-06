@@ -24,9 +24,9 @@ docs/       Architecture and operation notes
 flowchart TD
   AM[Alertmanager] -->|webhook| BE[Backend API]
   FE[Frontend] <-->|REST + SSE| BE
-  BE <-->|"incidents · alerts · pgvector similarity · feedback"| DB[(PostgreSQL + pgvector / JSONB fallback)]
+  BE <-->|"persist + pgvector search: incidents · alerts · embeddings · feedback"| DB[(PostgreSQL + pgvector / JSONB fallback)]
   BE -->|"summary + dashboard link on analysis complete (Slack)"| SLACK[Slack]
-  BE -->|"/analyze · /chat  (+ similar_incidents, feedback_hints)"| ORCH
+  BE -->|"/analyze · /chat"| ORCH
 
   subgraph AG["Agent — analysis orchestrator"]
     ORCH[Orchestrator]
@@ -37,6 +37,7 @@ flowchart TD
     ORCH --> PLAN --> COLL --> INV --> SYN
   end
 
+  DB -.->|"similar incidents + feedback hints (retrieved by backend)"| ORCH
   ORCH <-->|"blast radius · prior incidents · family/XID fixes"| KG[("TypeDB ontology")]
   COLL -->|Run:ai API| MCP[runai-mcp sidecar]
   SYN -->|"RCA + ranked causes + evidence trail"| BE
