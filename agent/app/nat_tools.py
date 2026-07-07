@@ -6,11 +6,13 @@ from typing import Any
 from nat.plugin_api import Builder, FunctionBaseConfig, FunctionInfo, register_function
 
 from app.collectors.base import CollectorResult, resolve_target
+from app.collectors.change import ChangeCollector
 from app.collectors.kubernetes import KubernetesCollector
 from app.collectors.loki import LokiCollector
 from app.collectors.postgres import PostgresCollector
 from app.collectors.prometheus import PrometheusCollector
 from app.collectors.runai import RunAICollector
+from app.collectors.system import SystemCollector
 from app.config import load_settings
 from app.knowledge import load_troubleshooting_cases
 from app.masking import build_masker
@@ -36,6 +38,14 @@ class PrometheusContextConfig(FunctionBaseConfig, name="prometheus_context"):
 
 class LokiContextConfig(FunctionBaseConfig, name="loki_context"):
     """Collect workload logs plus runai/runai-backend control-plane and backend log evidence."""
+
+
+class SystemContextConfig(FunctionBaseConfig, name="system_context"):
+    """Collect node-level dmesg/journal/syslog and NVIDIA XID evidence."""
+
+
+class ChangeContextConfig(FunctionBaseConfig, name="change_context"):
+    """Collect recent workload, controller, node-condition, and event changes."""
 
 
 class TroubleshootingCasesConfig(FunctionBaseConfig, name="troubleshooting_cases"):
@@ -92,6 +102,22 @@ async def loki_context(_config: LokiContextConfig, _builder: Builder):
         return await _run_collector(input_message, LokiCollector(load_settings()))
 
     yield FunctionInfo.from_fn(_collect, description=LokiContextConfig.__doc__ or "")
+
+
+@register_function(config_type=SystemContextConfig)
+async def system_context(_config: SystemContextConfig, _builder: Builder):
+    async def _collect(input_message: str) -> str:
+        return await _run_collector(input_message, SystemCollector(load_settings()))
+
+    yield FunctionInfo.from_fn(_collect, description=SystemContextConfig.__doc__ or "")
+
+
+@register_function(config_type=ChangeContextConfig)
+async def change_context(_config: ChangeContextConfig, _builder: Builder):
+    async def _collect(input_message: str) -> str:
+        return await _run_collector(input_message, ChangeCollector(load_settings()))
+
+    yield FunctionInfo.from_fn(_collect, description=ChangeContextConfig.__doc__ or "")
 
 
 @register_function(config_type=TroubleshootingCasesConfig)

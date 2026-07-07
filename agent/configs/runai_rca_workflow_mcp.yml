@@ -27,6 +27,10 @@ functions:
     _type: prometheus_context
   loki_context:
     _type: loki_context
+  system_context:
+    _type: system_context
+  change_context:
+    _type: change_context
   troubleshooting_cases:
     _type: troubleshooting_cases
   analysis_memory:
@@ -40,6 +44,8 @@ functions:
       - postgres_context
       - prometheus_context
       - loki_context
+      - system_context
+      - change_context
       - troubleshooting_cases
       - analysis_memory
     detailed_logs: true
@@ -60,6 +66,8 @@ functions:
       - postgres_context
       - prometheus_context
       - loki_context
+      - system_context
+      - change_context
       - troubleshooting_cases
       - analysis_memory
     llm_name: nim_llm
@@ -76,8 +84,9 @@ functions:
       scheduling-blocker evidence. Treat Prometheus as queue/project GPU and pod
       metric evidence. Treat Loki as workload plus runai/runai-backend log
       evidence. Treat Postgres as RCA store, pgvector, feedback, comments, and
-      memory health evidence. Use similar incidents and feedback hints as memory
-      only after checking live evidence.
+      memory health evidence. Treat System as node-level kernel/GPU/runtime
+      evidence. Treat Change as the recent rollout/event timeline. Use similar
+      incidents and feedback hints as memory only after checking live evidence.
 
 workflow:
   _type: sequential_executor

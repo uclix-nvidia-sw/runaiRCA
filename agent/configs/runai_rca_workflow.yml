@@ -20,6 +20,10 @@ functions:
     _type: prometheus_context
   loki_context:
     _type: loki_context
+  system_context:
+    _type: system_context
+  change_context:
+    _type: change_context
   troubleshooting_cases:
     _type: troubleshooting_cases
   analysis_memory:
@@ -33,6 +37,8 @@ functions:
       - postgres_context
       - prometheus_context
       - loki_context
+      - system_context
+      - change_context
       - troubleshooting_cases
       - analysis_memory
     detailed_logs: true

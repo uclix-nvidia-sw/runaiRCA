@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from app.collectors.base import AnalysisTarget
 from app.collectors.kubernetes import (
@@ -12,14 +14,19 @@ from app.collectors.kubernetes import (
     _list_params,
 )
 from app.collectors.prometheus import _queries_for
+from app.collectors.registry import DEFAULT_COLLECTORS
 from app.config import load_settings
 from app.nat_tools import (
     AnalysisAgentConfig,
+    ChangeContextConfig,
     KubernetesContextConfig,
     LokiContextConfig,
     RunAIContextConfig,
+    SystemContextConfig,
 )
 from app.prompts import agent_role_coverage_lines, load_agent_souls
+
+CONFIG_DIR = Path(__file__).parents[1] / "configs"
 
 
 def make_target() -> AnalysisTarget:
@@ -62,6 +69,22 @@ def test_nat_tool_descriptions_expose_agent_boundaries() -> None:
     assert "no CLI by default" in (RunAIContextConfig.__doc__ or "")
     assert "Run:ai control-plane pod/event" in (KubernetesContextConfig.__doc__ or "")
     assert "runai/runai-backend" in (LokiContextConfig.__doc__ or "")
+    assert "node-level" in (SystemContextConfig.__doc__ or "")
+    assert "recent" in (ChangeContextConfig.__doc__ or "")
+
+
+def test_nat_workflows_cover_default_collectors() -> None:
+    expected = {f"{name}_context" for name in DEFAULT_COLLECTORS}
+    for name in (
+        "runai_rca_workflow.yml",
+        "runai_rca_workflow_litellm.yml",
+        "runai_rca_workflow_mcp.yml",
+    ):
+        functions = yaml.safe_load((CONFIG_DIR / name).read_text(encoding="utf-8"))["functions"]
+        assert expected <= set(functions)
+        assert expected <= set(functions["evidence_parallel"]["tool_list"])
+        if "final_synthesis" in functions:
+            assert expected <= set(functions["final_synthesis"]["tool_names"])
 
 
 def test_role_coverage_lines_are_operator_visible() -> None:
