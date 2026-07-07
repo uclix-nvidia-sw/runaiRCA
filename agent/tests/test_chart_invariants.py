@@ -16,9 +16,17 @@ from typing import Any
 import yaml
 
 VALUES = Path(__file__).parents[2] / "charts" / "runai-rca" / "values.yaml"
+MCP_TEMPLATE = Path(__file__).parents[2] / "charts" / "runai-rca" / "templates" / "mcp-services.yaml"
+AGENT_TEMPLATE = Path(__file__).parents[2] / "charts" / "runai-rca" / "templates" / "agent.yaml"
 # Images we build and publish to the org registry — the ONLY repositories allowed
 # to be short (unqualified), because global.imageRegistry is meant to prefix them.
-OWN_IMAGES = {"runai-rca-agent", "runai-rca-backend", "runai-rca-frontend", "runai-rca-mcp"}
+OWN_IMAGES = {
+    "runai-rca-agent",
+    "runai-rca-backend",
+    "runai-rca-frontend",
+    "runai-rca-mcp",
+    "runai-rca-postgres-mcp",
+}
 
 
 def _values() -> dict[str, Any]:
@@ -72,3 +80,36 @@ def test_third_party_images_are_fully_qualified() -> None:
             "the private org where it does not exist (ImagePullBackOff). Fully qualify "
             "it (e.g. docker.io/library/...)"
         )
+
+
+def test_managed_mcp_values_keep_expected_secret_and_images() -> None:
+    values = _values()
+    assert values["secrets"]["keys"]["grafanaServiceAccountToken"] == (
+        "GRAFANA_SERVICE_ACCOUNT_TOKEN"
+    )
+    assert values["grafanaMcp"]["image"]["repository"] == "docker.io/grafana/mcp-grafana"
+    assert values["kubernetesMcp"]["image"]["repository"] == (
+        "quay.io/containers/kubernetes_mcp_server"
+    )
+    assert values["postgresMcp"]["image"]["repository"] == "runai-rca-postgres-mcp"
+
+
+def test_agent_env_uses_shared_mcp_service_urls_when_managed_enabled() -> None:
+    text = AGENT_TEMPLATE.read_text(encoding="utf-8")
+    assert "PROMETHEUS_MCP_URL" in text and "runai-rca.grafanaMcp.fullname" in text
+    assert "LOKI_MCP_URL" in text and "runai-rca.grafanaMcp.fullname" in text
+    assert "KUBERNETES_MCP_URL" in text and "runai-rca.kubernetesMcp.fullname" in text
+    assert "POSTGRES_MCP_URL" in text and "runai-rca.postgresMcp.fullname" in text
+
+
+def test_kubernetes_mcp_rbac_is_read_only_and_excludes_sensitive_subresources() -> None:
+    text = MCP_TEMPLATE.read_text(encoding="utf-8")
+    assert "pods/exec" not in text
+    assert "- secrets" not in text
+    assert 'resources: ["secrets"]' not in text
+    assert "verbs: [\"create\"" not in text
+    assert "verbs: [\"update\"" not in text
+    assert "verbs: [\"patch\"" not in text
+    assert "verbs: [\"delete\"" not in text
+    assert "verbs: [\"get\", \"list\", \"watch\"]" in text
+    assert "resources: [\"pods/log\"]" in text

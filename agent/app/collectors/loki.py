@@ -3,11 +3,13 @@ from __future__ import annotations
 import base64
 import json
 import re
+from typing import Any
 
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import complete, llm_configured
+from app.mcp_client import MCP_FALLBACK_WARNING, mcp_call, mcp_error, mcp_tool_json
 
 
 class LokiCollector:
@@ -17,7 +19,7 @@ class LokiCollector:
         self._settings = settings
 
     async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:
-        if not self._settings.loki_url:
+        if not self._settings.loki_url and not self._settings.loki_mcp_url:
             summary = f"{NO_EVIDENCE} Loki is not configured; log evidence was skipped."
             return CollectorResult(
                 agent=self.name,
@@ -91,45 +93,44 @@ class LokiCollector:
                     )
                 )
         query_results = []
-        headers, warnings = _loki_headers(self._settings)
+        warnings: list[str] = []
         if skipped_target_scope:
             warnings.append(skipped_target_scope)
 
-        for name, query in queries:
-            response = await get_json(
-                base_url=self._settings.loki_url,
-                path="/loki/api/v1/query_range",
-                timeout_seconds=self._settings.loki_timeout_seconds,
-                params={
-                    "query": query,
-                    "limit": str(self._settings.loki_query_limit),
-                    "direction": "BACKWARD",
-                },
-                headers=headers,
-            )
-            streams = _loki_streams(response.data)
-            line_count = sum(len(stream.get("values", [])) for stream in streams)
-            query_results.append(
-                {
-                    "name": name,
-                    "query": query,
-                    "url": response.url,
-                    "status_code": response.status_code,
-                    "status": _loki_status(response.data),
-                    "stream_count": len(streams),
-                    "line_count": line_count,
-                    # The ACTUAL log lines, newest first — the evidence an operator
-                    # judges the RCA by. compact() alone collapsed the nested Loki
-                    # values into "[2 item(s)]", leaving the trail unreadable.
-                    "sample_lines": _sample_lines(streams),
-                    "sample": compact(streams, limit=3),
-                    "error": response.error,
-                }
-            )
-            if response.error:
-                warnings.append(f"Loki query failed for {name}: {response.error}")
-                if response.status_code == 401:
-                    warnings.append(_loki_unauthorized_warning(self._settings))
+        used_mcp = False
+        if self._settings.loki_mcp_url:
+            try:
+                query_results = await _collect_loki_mcp(self._settings, queries)
+                used_mcp = True
+            except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
+                warnings.append(f"{MCP_FALLBACK_WARNING}: {exc.__class__.__name__}")
+        else:
+            warnings.append(f"{MCP_FALLBACK_WARNING}: LOKI_MCP_URL not configured")
+
+        if not used_mcp:
+            if not self._settings.loki_url:
+                summary = f"{NO_EVIDENCE} Loki MCP failed and direct URL is not configured."
+                return CollectorResult(
+                    agent=self.name,
+                    status="unavailable",
+                    summary=summary,
+                    confidence="low",
+                    missing_data=["loki.url"],
+                    warnings=warnings,
+                    artifacts=[
+                        artifact(
+                            agent=self.name,
+                            source="loki",
+                            type="logql",
+                            status="unavailable",
+                            confidence="low",
+                            query="; ".join(query for _, query in queries),
+                            summary=summary,
+                            result={"loki_mcp_url_configured": True},
+                        )
+                    ],
+                )
+            query_results = await _collect_loki_direct(self._settings, queries, warnings)
 
         successful = [item for item in query_results if not item["error"]]
         populated = [item for item in successful if item["line_count"]]
@@ -138,7 +139,7 @@ class LokiCollector:
             status = "ok"
             confidence = "high"
             summary = (
-                "Loki direct queries completed with matching log lines "
+                f"Loki {'MCP' if used_mcp else 'direct'} queries completed with matching log lines "
                 f"for {len(populated)} of {len(query_results)} query group(s)."
             )
         elif successful:
@@ -158,6 +159,8 @@ class LokiCollector:
             summary = insight
         result = {
             "loki_url": self._settings.loki_url,
+            "loki_mcp_url": self._settings.loki_mcp_url,
+            "used_mcp": used_mcp,
             "queries": query_results,
         }
         missing_data = [] if successful else ["loki.query"]
@@ -240,6 +243,170 @@ def _loki_headers(settings: Settings) -> tuple[dict[str, str], list[str]]:
                 "LOKI_BASIC_USERNAME and LOKI_BASIC_PASSWORD must both be set for Loki basic auth."
             )
     return headers, warnings
+
+
+async def _collect_loki_direct(
+    settings: Settings, queries: list[tuple[str, str]], warnings: list[str]
+) -> list[dict[str, object]]:
+    query_results: list[dict[str, object]] = []
+    headers, auth_warnings = _loki_headers(settings)
+    warnings.extend(auth_warnings)
+    for name, query in queries:
+        response = await get_json(
+            base_url=settings.loki_url,
+            path="/loki/api/v1/query_range",
+            timeout_seconds=settings.loki_timeout_seconds,
+            params={
+                "query": query,
+                "limit": str(settings.loki_query_limit),
+                "direction": "BACKWARD",
+            },
+            headers=headers,
+        )
+        streams = _loki_streams(response.data)
+        line_count = sum(len(stream.get("values", [])) for stream in streams)
+        query_results.append(
+            {
+                "name": name,
+                "query": query,
+                "url": response.url,
+                "status_code": response.status_code,
+                "status": _loki_status(response.data),
+                "stream_count": len(streams),
+                "line_count": line_count,
+                "sample_lines": _sample_lines(streams),
+                "sample": compact(streams, limit=3),
+                "error": response.error,
+            }
+        )
+        if response.error:
+            warnings.append(f"Loki query failed for {name}: {response.error}")
+            if response.status_code == 401:
+                warnings.append(_loki_unauthorized_warning(settings))
+    return query_results
+
+
+async def _collect_loki_mcp(
+    settings: Settings, queries: list[tuple[str, str]]
+) -> list[dict[str, object]]:
+    datasource_uid = await _grafana_datasource_uid(settings.loki_mcp_url, "loki")
+    return [
+        await _mcp_query_loki(settings.loki_mcp_url, name, query, settings.loki_query_limit, datasource_uid)
+        for name, query in queries
+    ]
+
+
+async def loki_mcp_query(settings: Settings, name: str, logql: str) -> dict[str, object]:
+    datasource_uid = await _grafana_datasource_uid(settings.loki_mcp_url, "loki")
+    return await _mcp_query_loki(settings.loki_mcp_url, name, logql, settings.loki_query_limit, datasource_uid)
+
+
+async def _mcp_query_loki(
+    url: str, name: str, logql: str, limit: int, datasource_uid: str = ""
+) -> dict[str, object]:
+    args_list: list[dict[str, object]] = []
+    base_args = {"limit": limit, "direction": "BACKWARD"}
+    if datasource_uid:
+        args_list.extend(
+            [
+                {"datasourceUid": datasource_uid, "query": logql, **base_args},
+                {"datasourceUid": datasource_uid, "logql": logql, **base_args},
+                {"datasource_uid": datasource_uid, "query": logql, **base_args},
+            ]
+        )
+    args_list.extend([{"query": logql, **base_args}, {"logql": logql, **base_args}])
+    data = await _call_mcp_json(url, "query_loki_logs", args_list)
+    streams = _loki_streams(data)
+    lines = _sample_lines(streams)
+    if not lines:
+        lines = _log_lines_from_mcp_data(data)
+    line_count = sum(len(stream.get("values", [])) for stream in streams) or len(lines)
+    return {
+        "name": name,
+        "query": logql,
+        "url": f"{url}#query_loki_logs",
+        "status_code": 200,
+        "status": _loki_status(data),
+        "stream_count": len(streams),
+        "line_count": line_count,
+        "sample_lines": lines[:8],
+        "sample": compact(streams or data, limit=3),
+        "error": None,
+    }
+
+
+async def _grafana_datasource_uid(url: str, datasource_type: str) -> str:
+    try:
+        data = await _call_mcp_json(url, "list_datasources", [{}])
+    except Exception:  # noqa: BLE001 - query tools may work without discovery.
+        return ""
+    for datasource in _datasource_items(data):
+        dtype = str(datasource.get("type") or "").lower()
+        name = str(datasource.get("name") or "").lower()
+        if datasource_type in dtype or datasource_type in name:
+            uid = datasource.get("uid") or datasource.get("id") or datasource.get("name")
+            return str(uid) if uid else ""
+    return ""
+
+
+def _datasource_items(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if not isinstance(data, dict):
+        return []
+    for key in ("datasources", "items", "result"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    nested = data.get("data")
+    if isinstance(nested, list):
+        return [item for item in nested if isinstance(item, dict)]
+    return []
+
+
+async def _call_mcp_json(
+    url: str, tool: str, args_list: list[dict[str, object]]
+) -> object:
+    last_error = ""
+    for args in args_list:
+        try:
+            result = await mcp_call(url, tool, args)
+        except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
+            last_error = f"{exc.__class__.__name__}: {exc}"
+            continue
+        error = mcp_error(result)
+        if error:
+            last_error = error
+            continue
+        data = mcp_tool_json(result)
+        if isinstance(data, dict) and "raw" in data:
+            last_error = "MCP result was not JSON"
+            continue
+        return data
+    raise RuntimeError(last_error or f"{tool} failed")
+
+
+def _log_lines_from_mcp_data(data: object) -> list[str]:
+    if isinstance(data, str):
+        return [line[:240] for line in data.splitlines() if line.strip()][:8]
+    if isinstance(data, list):
+        lines: list[str] = []
+        for item in data:
+            if isinstance(item, str) and item.strip():
+                lines.append(item[:240])
+            elif isinstance(item, dict):
+                text = item.get("line") or item.get("message") or item.get("body")
+                if isinstance(text, str) and text.strip():
+                    lines.append(text[:240])
+            if len(lines) >= 8:
+                break
+        return lines
+    if isinstance(data, dict):
+        for key in ("lines", "logs", "entries"):
+            lines = _log_lines_from_mcp_data(data.get(key))
+            if lines:
+                return lines
+    return []
 
 
 def _bearer_header_value(token: str) -> str:

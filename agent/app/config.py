@@ -68,6 +68,7 @@ class Settings:
     kubernetes_list_limit: int
     kubernetes_namespaces: tuple[str, ...]
     kubernetes_cluster_scope_enabled: bool
+    kubernetes_mcp_url: str
     runai_base_url: str
     runai_bearer_token: str
     runai_client_id: str
@@ -96,6 +97,7 @@ class Settings:
     postgres_dsn: str
     postgres_timeout_seconds: int
     runai_db_dsn: str
+    postgres_mcp_url: str
     troubleshooting_cases_file: str
     architecture_file: str
     failure_modes_file: str
@@ -169,6 +171,7 @@ def load_settings() -> Settings:
         kubernetes_list_limit=max(1, _int_env("KUBERNETES_LIST_LIMIT", 50)),
         kubernetes_namespaces=_csv_env("KUBERNETES_NAMESPACES", ()),
         kubernetes_cluster_scope_enabled=_bool_env("KUBERNETES_CLUSTER_SCOPE_ENABLED", True),
+        kubernetes_mcp_url=os.getenv("KUBERNETES_MCP_URL", "").strip().rstrip("/"),
         runai_base_url=os.getenv("RUNAI_BASE_URL", "").strip().rstrip("/"),
         runai_bearer_token=os.getenv("RUNAI_BEARER_TOKEN", "").strip(),
         runai_client_id=os.getenv("RUNAI_CLIENT_ID", "").strip(),
@@ -208,6 +211,7 @@ def load_settings() -> Settings:
         # read-only DB role; the tool additionally enforces single-statement
         # SELECT inside a READ ONLY transaction.
         runai_db_dsn=os.getenv("RUNAI_DB_DSN", "").strip(),
+        postgres_mcp_url=os.getenv("POSTGRES_MCP_URL", "").strip().rstrip("/"),
         troubleshooting_cases_file=os.getenv(
             "TROUBLESHOOTING_CASES_FILE",
             "knowledge/troubleshooting_cases.md",

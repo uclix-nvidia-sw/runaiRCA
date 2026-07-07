@@ -9,6 +9,13 @@ from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, ar
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import complete, llm_configured
+from app.mcp_client import (
+    MCP_FALLBACK_WARNING,
+    mcp_call,
+    mcp_error,
+    mcp_tool_json,
+    mcp_tool_text,
+)
 
 # READ-ONLY diagnostic commands allowed inside a container via pods/exec.
 # Strictly non-mutating: viewing GPU/driver/env state only. Anything not here is refused.
@@ -247,70 +254,91 @@ class KubernetesCollector:
         if target.namespace and not _namespace_allowed(self._settings, target.namespace):
             missing.append("kubernetes.namespace_scope")
 
-        token = _read_file(self._settings.kubernetes_token_path)
-        if not token:
-            summary = f"{NO_EVIDENCE} Kubernetes service account token is not available."
-            return CollectorResult(
-                agent=self.name,
-                status="unavailable",
-                summary=summary,
-                confidence="low",
-                details={"kubernetes_api_url": self._settings.kubernetes_api_url},
-                missing_data=missing + ["kubernetes.service_account_token"],
-                artifacts=[
-                    artifact(
-                        agent=self.name,
-                        source="kubernetes",
-                        type="cluster_api",
-                        status="unavailable",
-                        confidence="low",
-                        query=None,
-                        summary=summary,
-                        result={"token_path": self._settings.kubernetes_token_path},
-                    )
-                ],
-            )
+        warnings: list[str] = []
+        used_mcp = False
+        control_plane_in_scope = plan.check_control_plane if plan is not None else True
+        if self._settings.kubernetes_mcp_url:
+            try:
+                responses = await _collect_kubernetes_responses_via_mcp(
+                    settings=self._settings,
+                    target=target,
+                    control_plane_in_scope=control_plane_in_scope,
+                )
+                pod_summary_data = _target_pod_summary(responses)
+                containers = _container_names(pod_summary_data)
+                logs = await _collect_pod_logs_via_mcp(
+                    settings=self._settings,
+                    target=target,
+                    containers=containers,
+                )
+                exec_probes = []
+                used_mcp = True
+            except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
+                warnings.append(f"{MCP_FALLBACK_WARNING}: {exc.__class__.__name__}")
+        else:
+            warnings.append(f"{MCP_FALLBACK_WARNING}: KUBERNETES_MCP_URL not configured")
 
-        headers = {"Authorization": f"Bearer {token}"}
-        verify: bool | str = (
-            self._settings.kubernetes_ca_path
-            if Path(self._settings.kubernetes_ca_path).exists()
-            else True
-        )
-        responses = await _collect_kubernetes_responses(
-            settings=self._settings,
-            target=target,
-            headers=headers,
-            verify=verify,
-            # Only sweep the Run:ai control-plane namespaces when the plan says this
-            # alert implicates the control plane — mirrors the loki collector so a
-            # node/GPU/workload alert stops always scraping runai/runai-backend.
-            control_plane_in_scope=(plan.check_control_plane if plan is not None else True),
-        )
-        # Deeper, read-only inspection: container logs (always) and, when explicitly
-        # enabled, allowlisted read-only exec probes. Both degrade gracefully.
-        pod_summary_data = _target_pod_summary(responses)
-        containers = _container_names(pod_summary_data)
-        logs = await _collect_pod_logs(
-            settings=self._settings,
-            target=target,
-            containers=containers,
-            headers=headers,
-            verify=verify,
-        )
-        exec_probes = await _collect_exec_probes(
-            settings=self._settings,
-            target=target,
-            containers=containers,
-            headers=headers,
-            verify=verify,
-        )
+        if not used_mcp:
+            token = _read_file(self._settings.kubernetes_token_path)
+            if not token:
+                summary = f"{NO_EVIDENCE} Kubernetes service account token is not available."
+                return CollectorResult(
+                    agent=self.name,
+                    status="unavailable",
+                    summary=summary,
+                    confidence="low",
+                    details={"kubernetes_api_url": self._settings.kubernetes_api_url},
+                    missing_data=missing + ["kubernetes.service_account_token"],
+                    warnings=warnings,
+                    artifacts=[
+                        artifact(
+                            agent=self.name,
+                            source="kubernetes",
+                            type="cluster_api",
+                            status="unavailable",
+                            confidence="low",
+                            query=None,
+                            summary=summary,
+                            result={"token_path": self._settings.kubernetes_token_path},
+                        )
+                    ],
+                )
+
+            headers = {"Authorization": f"Bearer {token}"}
+            verify: bool | str = (
+                self._settings.kubernetes_ca_path
+                if Path(self._settings.kubernetes_ca_path).exists()
+                else True
+            )
+            responses = await _collect_kubernetes_responses(
+                settings=self._settings,
+                target=target,
+                headers=headers,
+                verify=verify,
+                control_plane_in_scope=control_plane_in_scope,
+            )
+            pod_summary_data = _target_pod_summary(responses)
+            containers = _container_names(pod_summary_data)
+            logs = await _collect_pod_logs(
+                settings=self._settings,
+                target=target,
+                containers=containers,
+                headers=headers,
+                verify=verify,
+            )
+            exec_probes = await _collect_exec_probes(
+                settings=self._settings,
+                target=target,
+                containers=containers,
+                headers=headers,
+                verify=verify,
+            )
         container_diagnostics = _container_diagnostics(pod_summary_data)
-        warnings = [
+        warnings.extend(
             f"Kubernetes {item['name']} query failed: {item['error']}"
             for item in responses
             if item.get("error")
-        ]
+        )
         successful = [item for item in responses if not item.get("error")]
         pod_statuses = _pod_statuses(responses)
         warning_events = _warning_events(responses)
@@ -345,6 +373,8 @@ class KubernetesCollector:
 
         details = {
             "kubernetes_api_url": self._settings.kubernetes_api_url,
+            "kubernetes_mcp_url": self._settings.kubernetes_mcp_url,
+            "used_mcp": used_mcp,
             "kubernetes_namespaces": self._settings.kubernetes_namespaces,
             "kubernetes_cluster_scope_enabled": self._settings.kubernetes_cluster_scope_enabled,
             "namespace": target.namespace,
@@ -464,6 +494,196 @@ async def _collect_kubernetes_responses(
             }
         )
     return responses
+
+
+async def _collect_kubernetes_responses_via_mcp(
+    *,
+    settings: Settings,
+    target: AnalysisTarget,
+    control_plane_in_scope: bool = True,
+) -> list[dict[str, object]]:
+    responses: list[dict[str, object]] = []
+    target_namespace_allowed = _namespace_allowed(settings, target.namespace)
+    if target.namespace and target_namespace_allowed and target.pod:
+        pod_data = await _k8s_mcp_json(
+            settings,
+            [
+                ("pods_get", {"namespace": target.namespace, "name": target.pod}),
+                ("pods_get", {"namespace": target.namespace, "pod": target.pod}),
+                (
+                    "resources_get",
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "namespace": target.namespace,
+                        "name": target.pod,
+                    },
+                ),
+            ],
+        )
+        responses.append(_mcp_k8s_response("pod", "MCP pods_get", pod_data, target))
+        event_data = await _k8s_mcp_json(
+            settings,
+            [
+                (
+                    "events_list",
+                    {
+                        "namespace": target.namespace,
+                        "fieldSelector": f"involvedObject.name={target.pod}",
+                    },
+                ),
+                (
+                    "resources_list",
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Event",
+                        "namespace": target.namespace,
+                        "fieldSelector": f"involvedObject.name={target.pod}",
+                    },
+                ),
+            ],
+        )
+        responses.append(_mcp_k8s_response("pod_events", "MCP events_list", event_data, target))
+    elif target.namespace and target_namespace_allowed:
+        pod_data = await _k8s_mcp_json(
+            settings,
+            [
+                ("pods_list_in_namespace", {"namespace": target.namespace}),
+                ("pods_list", {"namespace": target.namespace}),
+                (
+                    "resources_list",
+                    {"apiVersion": "v1", "kind": "Pod", "namespace": target.namespace},
+                ),
+            ],
+        )
+        responses.append(
+            _mcp_k8s_response("namespace_pods", "MCP pods_list", pod_data, target)
+        )
+        event_data = await _k8s_mcp_json(
+            settings,
+            [
+                ("events_list", {"namespace": target.namespace}),
+                (
+                    "resources_list",
+                    {"apiVersion": "v1", "kind": "Event", "namespace": target.namespace},
+                ),
+            ],
+        )
+        responses.append(
+            _mcp_k8s_response("namespace_events", "MCP events_list", event_data, target)
+        )
+    if target.node and settings.kubernetes_cluster_scope_enabled:
+        node_data = await _k8s_mcp_json(
+            settings,
+            [
+                (
+                    "resources_get",
+                    {"apiVersion": "v1", "kind": "Node", "name": target.node},
+                ),
+                ("resources_get", {"kind": "nodes", "name": target.node}),
+            ],
+        )
+        responses.append(_mcp_k8s_response("node", "MCP resources_get node", node_data, target))
+    for runai_namespace in settings.runai_log_namespaces if control_plane_in_scope else ():
+        if not _namespace_allowed(settings, runai_namespace):
+            continue
+        pod_data = await _k8s_mcp_json(
+            settings,
+            [
+                ("pods_list_in_namespace", {"namespace": runai_namespace}),
+                ("pods_list", {"namespace": runai_namespace}),
+                (
+                    "resources_list",
+                    {"apiVersion": "v1", "kind": "Pod", "namespace": runai_namespace},
+                ),
+            ],
+        )
+        responses.append(
+            _mcp_k8s_response(
+                f"runai_control_plane_pods:{runai_namespace}",
+                f"MCP pods_list {runai_namespace}",
+                pod_data,
+                target,
+            )
+        )
+        event_data = await _k8s_mcp_json(
+            settings,
+            [
+                ("events_list", {"namespace": runai_namespace}),
+                (
+                    "resources_list",
+                    {"apiVersion": "v1", "kind": "Event", "namespace": runai_namespace},
+                ),
+            ],
+        )
+        responses.append(
+            _mcp_k8s_response(
+                f"runai_control_plane_events:{runai_namespace}",
+                f"MCP events_list {runai_namespace}",
+                event_data,
+                target,
+            )
+        )
+    return responses
+
+
+def _mcp_k8s_response(
+    name: str, path: str, data: object, target: AnalysisTarget
+) -> dict[str, object]:
+    normalized = _normalize_k8s_payload(data)
+    return {
+        "name": name,
+        "path": path,
+        "url": path,
+        "status_code": 200,
+        "error": None,
+        "data": compact(_filter_kubernetes_data(name, normalized, target), limit=5),
+    }
+
+
+def _normalize_k8s_payload(data: object) -> object:
+    if isinstance(data, list):
+        return {"items": data}
+    if not isinstance(data, dict):
+        return data
+    for key in ("items", "metadata", "status"):
+        if key in data:
+            return data
+    for key in ("resources", "result", "data"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return {"items": value}
+        if isinstance(value, dict):
+            return value
+    return data
+
+
+async def _k8s_mcp_json(
+    settings: Settings, candidates: list[tuple[str, dict[str, object]]]
+) -> object:
+    result = await _k8s_mcp_result(settings, candidates)
+    data = mcp_tool_json(result)
+    if isinstance(data, dict) and "raw" in data:
+        raise RuntimeError("MCP result was not JSON")
+    return data
+
+
+async def _k8s_mcp_result(
+    settings: Settings, candidates: list[tuple[str, dict[str, object]]]
+):
+    last_error = ""
+    for tool, args in candidates:
+        try:
+            result = await mcp_call(settings.kubernetes_mcp_url, tool, args)
+        except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
+            last_error = f"{tool}: {exc.__class__.__name__}: {exc}"
+            continue
+        error = mcp_error(result)
+        if error:
+            last_error = f"{tool}: {error}"
+            continue
+        return result
+    raise RuntimeError(last_error or "Kubernetes MCP tool failed")
 
 
 def _scope_target(target: AnalysisTarget, plan) -> AnalysisTarget:  # noqa: ANN001
@@ -604,6 +824,50 @@ async def _collect_pod_logs(
                 "status_code": response.status_code,
                 "error": response.error,
                 "lines": _log_lines(response.data),
+            }
+        )
+    return logs
+
+
+async def _collect_pod_logs_via_mcp(
+    *,
+    settings: Settings,
+    target: AnalysisTarget,
+    containers: list[str],
+) -> list[dict[str, object]]:
+    """Fetch READ-ONLY container logs through the Kubernetes MCP server."""
+    if not (target.namespace and target.pod and _namespace_allowed(settings, target.namespace)):
+        return []
+    targets: list[str | None] = list(containers) if containers else [None]
+    logs: list[dict[str, object]] = []
+    for container in targets:
+        args: dict[str, object] = {
+            "namespace": target.namespace,
+            "name": target.pod,
+            "tailLines": settings.kubernetes_list_limit,
+        }
+        if container:
+            args["container"] = container
+        candidates = [
+            ("pods_log", args),
+            (
+                "pods_log",
+                {
+                    **args,
+                    "pod": target.pod,
+                },
+            ),
+        ]
+        result = await _k8s_mcp_result(settings, candidates)
+        text = mcp_tool_text(result)
+        data = mcp_tool_json(result)
+        lines = _log_lines(text or data)
+        logs.append(
+            {
+                "container": container,
+                "status_code": 200,
+                "error": None,
+                "lines": lines,
             }
         )
     return logs

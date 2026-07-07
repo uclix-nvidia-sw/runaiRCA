@@ -50,6 +50,9 @@ jobs:
           - component: runai-mcp
             context: runai-mcp
             image: runai-rca-mcp
+          - component: postgres-mcp
+            context: postgres-mcp
+            image: runai-rca-postgres-mcp
 
     steps:
       - name: Checkout

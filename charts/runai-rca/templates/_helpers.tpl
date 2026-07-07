@@ -36,6 +36,18 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{ include "runai-rca.fullname" . }}-agent
 {{- end -}}
 
+{{- define "runai-rca.grafanaMcp.fullname" -}}
+{{ include "runai-rca.fullname" . }}-grafana-mcp
+{{- end -}}
+
+{{- define "runai-rca.kubernetesMcp.fullname" -}}
+{{ include "runai-rca.fullname" . }}-kubernetes-mcp
+{{- end -}}
+
+{{- define "runai-rca.postgresMcp.fullname" -}}
+{{ include "runai-rca.fullname" . }}-postgres-mcp
+{{- end -}}
+
 {{- define "runai-rca.frontend.fullname" -}}
 {{ include "runai-rca.fullname" . }}-frontend
 {{- end -}}
@@ -111,6 +123,14 @@ true
 {{- default (include "runai-rca.agent.fullname" .) .Values.agent.serviceAccount.name -}}
 {{- else -}}
 {{- default "default" .Values.agent.serviceAccount.name -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "runai-rca.kubernetesMcp.serviceAccountName" -}}
+{{- if .Values.kubernetesMcp.serviceAccount.create -}}
+{{- default (include "runai-rca.kubernetesMcp.fullname" .) .Values.kubernetesMcp.serviceAccount.name -}}
+{{- else -}}
+{{- default "default" .Values.kubernetesMcp.serviceAccount.name -}}
 {{- end -}}
 {{- end -}}
 
