@@ -84,6 +84,36 @@ async def test_explicit_model_override_uses_http(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_nat_client_failure_falls_back_to_http(monkeypatch) -> None:
+    settings = _settings()
+
+    class BrokenClient:
+        async def ainvoke(self, messages):  # litellm "LLM Provider NOT provided" etc.
+            raise RuntimeError("LLM Provider NOT provided")
+
+    captured = {}
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        captured["url"] = url
+        return SimpleNamespace(
+            ok=True,
+            data={"choices": [{"message": {"content": '{"http": true}'}}], "usage": {}},
+        )
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    token = llm.set_nat_client(BrokenClient())
+    try:
+        data = await llm.complete_json(settings, system="system", user="user")
+    finally:
+        llm.reset_nat_client(token)
+
+    # Default model + broken NAT client → falls back to the proven httpx path,
+    # so a transport misconfiguration never leaves the analysis with no LLM.
+    assert data == {"http": True}
+    assert captured["url"] == "https://llm.local/v1/chat/completions"
+
+
+@pytest.mark.asyncio
 async def test_no_nat_client_uses_http(monkeypatch) -> None:
     settings = _settings()
     captured = {}
