@@ -120,6 +120,13 @@ def test_agent_env_uses_shared_mcp_service_urls_when_managed_enabled() -> None:
     assert "POSTGRES_MCP_URL" in text and "runai-rca.postgresMcp.fullname" in text
 
 
+def test_grafana_mcp_args_match_current_image_flags() -> None:
+    text = MCP_TEMPLATE.read_text(encoding="utf-8")
+    assert "--allowed-hosts" not in text
+    assert "--endpoint-path" in text
+    assert "--disable-write" in text
+
+
 def test_kubernetes_mcp_rbac_is_read_only_and_excludes_sensitive_subresources() -> None:
     text = MCP_TEMPLATE.read_text(encoding="utf-8")
     assert "pods/exec" not in text

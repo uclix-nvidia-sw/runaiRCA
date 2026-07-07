@@ -143,7 +143,6 @@ spec:
             - :{{ .Values.grafanaMcp.service.port }}
             - --endpoint-path
             - /mcp
-            - --allowed-hosts=*
             - --disable-write
             - --disable-admin
             - --disable-alerting
