@@ -184,9 +184,15 @@ async def plan_stage(state: PipelineState) -> PipelineState:
 
 async def evidence_stage(state: PipelineState) -> PipelineState:
     settings = state.settings
-    target = state.target
     plan = state.plan
     assert plan is not None
+    # The plan is authoritative after plan_stage — it may carry a re-resolved
+    # LIVE pod/node for a stale alert pod. Scope the stage's working target ONCE
+    # so the flowchart follow-ups, drill-down, and investigation loop query the
+    # live pod too, not just the base collectors (which scope internally).
+    from app.collectors.kubernetes import _scope_target
+
+    target = _scope_target(state.target, plan)
     state.investigation_context = {}
 
     # Synthesis MUST see EVERY collector's result. Await the full gather over ALL

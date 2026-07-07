@@ -389,3 +389,42 @@ def test_target_match_survives_incidental_longer_evidence_match(monkeypatch) -> 
     lines2 = drilldown._implicated_architecture(make_settings(), result, target2)
     assert any(line.startswith("runai-backend-workloads:") for line in lines2)
     assert not any(line.startswith("runai-backend:") for line in lines2)
+
+
+# --- followups must query the LIVE pod, not the alert's stale name -------------------
+
+
+@pytest.mark.asyncio
+async def test_evidence_stage_scopes_followup_target_to_the_plan(monkeypatch) -> None:
+    from app.plan import InvestigationPlan
+    from app.progress import ProgressReporter
+    from app.schemas import Alert, AlertAnalysisRequest
+
+    seen: dict[str, str] = {}
+
+    async def fake_k8s_followup(settings, k8s_result, target, **kwargs):
+        seen["k8s"] = target.pod
+        return []
+
+    async def fake_prom_followup(settings, prom_result, k8s_result, target, **kwargs):
+        seen["prom"] = target.pod
+        return []
+
+    monkeypatch.setattr("app.collectors.kubernetes.k8s_followup", fake_k8s_followup)
+    monkeypatch.setattr("app.collectors.prometheus.prometheus_followup", fake_prom_followup)
+    stale_target = make_target().__class__(
+        **{**make_target().__dict__, "pod": "toolkit-dead1"}
+    )
+    state = pipeline.PipelineState(
+        settings=make_settings(),  # no LLM -> one-shot gather; no drill-down
+        request=AlertAnalysisRequest(alert=Alert(labels={}, annotations={})),
+        target=stale_target,
+        progress=ProgressReporter(make_settings(), run_id=""),
+        masker=None,
+        collectors=[],
+        plan=InvestigationPlan(pod="toolkit-live2", namespaces=[stale_target.namespace]),
+    )
+    await pipeline.evidence_stage(state)
+    assert seen == {"k8s": "toolkit-live2", "prom": "toolkit-live2"}, (
+        "follow-ups must query the plan's re-resolved live pod"
+    )
