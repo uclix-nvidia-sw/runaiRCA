@@ -31,7 +31,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `KUBERNETES_NAMESPACES` | Optional comma-separated namespace allowlist for Kubernetes direct collection |
 | `KUBERNETES_CLUSTER_SCOPE_ENABLED` | Enables cluster-scoped Kubernetes calls such as node lookups; Helm follows `agent.rbac.clusterWide` |
 | `KUBERNETES_MCP_URL` | Kubernetes MCP shared-service URL. When set, Kubernetes collection and drill-down call MCP first and fall back to direct Kubernetes API reads on failure |
-| `RUNAI_BASE_URL` | Run:ai control plane URL, default `http://runai-backend-traefik.runai-backend.svc.cluster.local` |
+| `RUNAI_BASE_URL` | Run:ai control plane URL. No chart default; required as `agent.env.runaiBaseUrl` when `runaiMcp.enabled=true` |
 | `RUNAI_BEARER_TOKEN` | Optional Run:ai bearer token secret |
 | `GRAFANA_SERVICE_ACCOUNT_TOKEN` | Grafana service-account token used by the managed `grafanaMcp` service for Prometheus/Loki datasource read/query access |
 | `RUNAI_CLIENT_ID` | Run:ai application client ID |
@@ -154,7 +154,7 @@ Frequently tuned Helm values:
 | `agent.serviceAccount.annotations` | ServiceAccount annotations for workload identity integrations |
 | `{backend,frontend,postgresql}.automountServiceAccountToken` | Disable Kubernetes API token mounts for pods that do not need cluster API access; default `false` |
 | `agent.automountServiceAccountToken` | Agent Kubernetes API token mount; default `true` because direct Kubernetes collection uses the service account token |
-| `agent.env.runaiBaseUrl` / `agent.env.runaiTokenUrl` | Run:ai API and optional OAuth token endpoint; default Run:ai API is `http://runai-backend-traefik.runai-backend.svc.cluster.local`; provide `secrets.runaiBearerToken` or client credentials to avoid Run:ai HTTP 401 |
+| `agent.env.runaiBaseUrl` / `agent.env.runaiTokenUrl` | Run:ai API and optional OAuth token endpoint; `agent.env.runaiBaseUrl` has no default and is required when `runaiMcp.enabled=true`; provide `secrets.runaiBearerToken` or client credentials to avoid Run:ai HTTP 401 |
 | `agent.env.runaiWorkloadsPath`, `runaiProjectsPath`, `runaiQueuesPath` | Run:ai API path overrides for different Run:ai versions |
 | `agent.env.runaiLogNamespaces` | Namespaces for Run:ai control-plane/backend logs, default `runai,runai-backend` |
 | `agent.env.prometheusUrl` | In-cluster Prometheus URL, for example `http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090` |

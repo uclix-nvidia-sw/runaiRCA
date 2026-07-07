@@ -93,7 +93,6 @@ def test_third_party_images_are_fully_qualified() -> None:
 def test_managed_mcp_values_keep_expected_secret_and_images() -> None:
     values = _values()
     assert values["runaiMcp"]["enabled"] is True
-    assert values["agent"]["env"]["runaiBaseUrl"]
     assert values["grafanaMcp"]["enabled"] is True
     assert values["kubernetesMcp"]["enabled"] is True
     assert values["postgresMcp"]["enabled"] is True
@@ -107,6 +106,12 @@ def test_managed_mcp_values_keep_expected_secret_and_images() -> None:
         "quay.io/containers/kubernetes_mcp_server"
     )
     assert values["postgresMcp"]["image"]["repository"] == "runai-rca-postgres-mcp"
+
+
+def test_runai_mcp_requires_explicit_runai_api_url() -> None:
+    template = MCP_TEMPLATE.read_text(encoding="utf-8")
+    assert "agent.env.runaiBaseUrl is required when runaiMcp.enabled=true" in template
+    assert "RUNAI_API_BASE_URL" in template
 
 
 def test_agent_env_uses_shared_mcp_service_urls_when_managed_enabled() -> None:

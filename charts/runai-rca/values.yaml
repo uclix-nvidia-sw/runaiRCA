@@ -368,7 +368,7 @@ agent:
     # Overall hard cap per analysis: generous per-step time, but the whole run always
     # finishes within this budget (default 25 min). 0 = no overall cap.
     analysisDeadlineSeconds: 1500
-    runaiBaseUrl: http://runai-backend-traefik.runai-backend.svc.cluster.local
+    runaiBaseUrl: ""
     runaiTokenUrl: ""
     runaiWorkloadsPath: /api/v1/workloads
     runaiProjectsPath: /api/v1/projects
