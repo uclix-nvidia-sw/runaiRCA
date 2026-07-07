@@ -90,6 +90,10 @@ def test_third_party_images_are_fully_qualified() -> None:
 
 def test_managed_mcp_values_keep_expected_secret_and_images() -> None:
     values = _values()
+    assert values["grafanaMcp"]["enabled"] is True
+    assert values["kubernetesMcp"]["enabled"] is True
+    assert values["postgresMcp"]["enabled"] is True
+    assert values["grafanaMcp"]["grafanaUrl"]
     assert values["secrets"]["keys"]["grafanaServiceAccountToken"] == (
         "GRAFANA_SERVICE_ACCOUNT_TOKEN"
     )
