@@ -1872,7 +1872,10 @@ td span.occurrence-pill {
 .workspace {
   position: fixed;
   top: 1rem;
-  left: 18rem;
+  /* Flush with the sidebar's right edge (app-shell grid column is 13rem). Was
+     18rem, which left a ~5rem strip of the incident list peeking between the
+     sidebar and this panel. */
+  left: 13rem;
   right: 1rem;
   bottom: 1rem;
   width: auto;
