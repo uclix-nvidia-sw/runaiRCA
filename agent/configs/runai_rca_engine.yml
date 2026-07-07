@@ -14,6 +14,12 @@ llms:
     base_url: ${LLM_BASE_URL:-}
     api_key: ${LLM_API_KEY:-dummy}
     temperature: 0.0
+    # Treat LLM_BASE_URL as an OpenAI-compatible endpoint (e.g. a LiteLLM proxy).
+    # Without this, litellm tries to infer the provider from the model name and a
+    # router model like "auto-router" (no provider prefix) fails with "LLM Provider
+    # NOT provided". With openai, litellm POSTs {model} to {base_url}/chat/completions
+    # exactly like the direct httpx path, so the proxy does the routing.
+    custom_llm_provider: openai
 
 functions:
   enrich: { _type: rca_stage, stage: enrich }

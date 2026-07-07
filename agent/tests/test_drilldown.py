@@ -357,3 +357,15 @@ def test_postgres_agent_has_no_sql_tool_without_any_dsn(monkeypatch) -> None:
     result = CollectorResult(agent="postgres", status="ok", summary="db")
     asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
     assert calls[0] == 0  # make_settings has no postgres_dsn / runai_db_dsn
+
+
+def test_signals_are_bolded_in_evidence_text() -> None:
+    # Emphasis lives in the text (markdown **), so it survives report/export/JSON
+    # instead of relying on a frontend-only red highlight (option A).
+    from app.collectors.base import signals_line
+
+    assert signals_line(["NetworkUnavailable", "DiskPressure"], "ko") == (
+        "주요 신호: **NetworkUnavailable**, **DiskPressure**"
+    )
+    assert signals_line(["OOMKilled"], "en") == "signals: **OOMKilled**"
+    assert signals_line([], "ko") == ""

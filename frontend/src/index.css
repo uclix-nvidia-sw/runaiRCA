@@ -1872,7 +1872,10 @@ td span.occurrence-pill {
 .workspace {
   position: fixed;
   top: 1rem;
-  left: 18rem;
+  /* Flush with the sidebar's right edge (app-shell grid column is 13rem). Was
+     18rem, which left a ~5rem strip of the incident list peeking between the
+     sidebar and this panel. */
+  left: 13rem;
   right: 1rem;
   bottom: 1rem;
   width: auto;
@@ -2279,6 +2282,16 @@ td span.occurrence-pill {
 
 .artifact-body {
   margin-top: 0.65rem;
+}
+
+/* Markdown-rendered artifact summary: keep it tight like the old <p>, and let the
+   backend's **bold** signals stand out via weight (emphasis lives in the text). */
+.artifact-summary p {
+  margin: 0;
+}
+
+.artifact-summary strong {
+  font-weight: 700;
 }
 
 .artifact pre {

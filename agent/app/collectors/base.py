@@ -99,6 +99,18 @@ def salient_markers(value: Any, *, limit: int = 6) -> list[str]:
     return found
 
 
+def signals_line(markers: list[str], language: str = "en") -> str:
+    """A finding-first 'signals' line with each marker bolded in the text itself.
+
+    The emphasis lives in the evidence TEXT (markdown `**`), not a frontend-only
+    colour, so it survives into the report, the Word export, and the raw JSON —
+    the UI just renders the markdown. Empty markers -> empty string."""
+    if not markers:
+        return ""
+    label = "주요 신호" if language == "ko" else "signals"
+    return f"{label}: " + ", ".join(f"**{marker}**" for marker in markers)
+
+
 def project_from_namespace(namespace: str) -> str:
     prefix = "runai-"
     return namespace[len(prefix) :] if namespace.startswith(prefix) else ""
