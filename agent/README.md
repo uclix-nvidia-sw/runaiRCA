@@ -55,8 +55,8 @@ comma-separated namespace allowlist, and set `KUBERNETES_CLUSTER_SCOPE_ENABLED=f
 when the service account has namespaced RBAC only.
 
 Known troubleshooting cases are loaded from `TROUBLESHOOTING_CASES_FILE`
-(`knowledge/troubleshooting_cases.md` by default) and injected into fallback and
-NeMo synthesis. This is static operator memory.
+(`knowledge/troubleshooting_cases.md` by default) and injected into RCA
+synthesis. This is static operator memory.
 
 Agent role contracts are loaded from `AGENT_SOULS_FILE`
 (`prompts/agent_souls.md` by default). The Run:ai agent is defined as a direct
@@ -67,7 +67,7 @@ and event state belongs to the Kubernetes collector, and `runai` /
 
 Similar incident retrieval and feedback learning come from the Backend. The
 Backend sends `similar_incidents` and `feedback_hints` in each `/analyze`
-request, and the fallback/NeMo synthesis paths include those hints in the RCA.
+request, and synthesis includes those hints in the RCA.
 The Analysis Agent owns the final RCA verdict, confidence, impact, missing data,
 manual actions, prevention notes, and dashboard summary.
 For `/chat`, the Backend also attaches the active incident or alert RCA content
@@ -96,8 +96,18 @@ python -m compileall app
 nat validate --config_file configs/runai_rca_engine.yml
 nat run --config_file configs/runai_rca_engine.yml --input '{"alert":{"status":"firing","labels":{"alertname":"RunAIWorkloadPending","namespace":"runai"},"annotations":{"summary":"smoke"},"fingerprint":"fp-smoke"}}'
 nat validate --config_file configs/runai_rca_eval.yml
-nat eval --config_file configs/runai_rca_eval.yml
+python -m eval.check_nat_eval --min-avg 1.0
+python -m eval.run_eval --fixtures eval/fixtures.jsonl --min-top1 0.8
 ```
+
+Eval has two layers:
+
+- `eval/run_eval.py` measures ranker accuracy over injected collector evidence
+  (`fixtures.jsonl`), including Top-1/Top-3 and false-assertion checks.
+- `nat eval` through `eval/check_nat_eval.py` runs the real NAT workflow over
+  alert text fixtures (`nat_dataset.jsonl`) and gates end-to-end family routing.
+  Offline collectors are unavailable by design; only alert-signature routing is
+  scored.
 
 Profiler: `configs/runai_rca_engine.yml` includes a commented bottleneck-analysis
 example. Enable the same `profiler` block under `eval.general` when running

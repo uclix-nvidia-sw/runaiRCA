@@ -38,9 +38,10 @@ that collector. If no artifact is attached yet, the UI shows `pending` even when
 all pods are healthy.
 
 Agent `/healthz` reports `nemo_runtime` as `enabled` or `fallback`.
-`fallback` means the service will use deterministic in-process RCA synthesis.
-`enabled` means `/analyze` will attempt the configured NeMo Agent Toolkit
-workflow before falling back. It is not a chat-specific LLM readiness signal.
+`enabled` means the in-process NAT engine orchestrates the pipeline stages.
+`fallback` means the same pipeline ran directly because the engine was disabled
+or failed. Both modes are in-process and produce complete RCAs; this is not a
+chat-specific LLM readiness signal.
 
 ## Agent Role Contracts
 

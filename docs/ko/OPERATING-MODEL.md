@@ -36,9 +36,10 @@ Kubernetes `Running`과 Agent `/healthz`는 프로세스가 살아 있음을 확
 않았다면, 모든 파드가 정상이더라도 UI는 `pending`을 표시합니다.
 
 Agent `/healthz`는 `nemo_runtime`을 `enabled` 또는 `fallback`으로 보고합니다.
-`fallback`은 서비스가 결정론적 인프로세스 RCA 합성을 사용한다는 의미입니다.
-`enabled`는 `/analyze`가 폴백하기 전에 구성된 NeMo Agent Toolkit 워크플로를 시도한다는
-의미입니다. 이것은 채팅 전용 LLM 준비 상태 신호가 아닙니다.
+`enabled`는 인프로세스 NAT 엔진이 파이프라인 단계를 오케스트레이션한다는 의미입니다.
+`fallback`은 엔진이 비활성화되었거나 실패해서 동일한 파이프라인이 직접 실행되었다는
+의미입니다. 두 모드 모두 인프로세스이며 완전한 RCA를 생성합니다. 이것은 채팅 전용 LLM
+준비 상태 신호가 아닙니다.
 
 ## Agent Role Contracts
 

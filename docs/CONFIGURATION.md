@@ -80,7 +80,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `LLM_REQUEST_TIMEOUT_SECONDS` | LLM request timeout per call (chat and direct fallback reasoning), default `300`, `0` = unlimited |
 | `LLM_PRICING_JSON` | Optional JSON map for estimated LLM cost, keyed by model with `prompt_per_mtok` and `completion_per_mtok` values |
 | `ENABLE_NAT_RUNTIME` | Run analysis through the in-process NeMo Agent Toolkit engine; default `true` |
-| `NAT_CONFIG_FILE` | NeMo engine workflow config path, default `configs/runai_rca_engine.yml` |
+| `NAT_CONFIG_FILE` | Internal NeMo engine workflow config path, default `configs/runai_rca_engine.yml` |
 | `ENABLE_INVESTIGATION_LOOP` | Central LLM investigation loop: plan → probe the most relevant agents → observe → re-plan, default `false` (Helm sets `true`) |
 | `MAX_INVESTIGATION_STEPS` | Max central investigation steps per analysis, default `12` |
 | `MAX_REANALYSIS_STEPS` | Investigation budget for the one re-analysis pass after a refuted top cause, default `6` |
@@ -118,6 +118,8 @@ NeMo Agent Toolkit workflow:
   `runai_rca_pipeline` controller. Provide `LLM_BASE_URL`, `LLM_MODEL`, and
   `LLM_API_KEY` through env or Helm Secret values to let NAT own the default LLM
   transport during analysis.
+- `NAT_CONFIG_FILE` is an internal fixed path baked into the agent image.
+  Overriding it in deployments is unsupported.
 
 Example Helm override for a LiteLLM/OpenAI-compatible endpoint:
 
@@ -198,7 +200,10 @@ When `DATABASE_URL` is configured, the backend creates and uses `incidents`,
 `alerts`, `incident_embeddings`, `rca_feedback`, `rca_comments`, and
 `analysis_runs`. Incidents include `user_approved_at`, `archived_at`, and
 `deleted_at` lifecycle columns; analysis runs include `metadata` JSONB for
-fields such as `llm_usage`. Comments and chat requests that explicitly ask for analysis create
+fields such as `llm_usage`. `context.llm_usage` may include a `nat` subkey with
+per-stage token breakdowns (`{stage: {calls, prompt_tokens, completion_tokens,
+total_tokens}}`); the top-level keys remain the authoritative totals. Comments
+and chat requests that explicitly ask for analysis create
 separate analysis runs, so the Analysis Dashboard can track them without
 overwriting the original RCA. On startup it logs `pgvector=enabled` when
 `CREATE EXTENSION vector` succeeds, then adds a dense `embedding vector(384)`

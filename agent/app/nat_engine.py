@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import AsyncExitStack
+from typing import Any
 
 from nat.builder.evaluator import EvaluatorInfo
 from nat.builder.framework_enum import LLMFrameworkEnum
@@ -51,22 +52,38 @@ async def rca_stage(config: RcaStageConfig, _builder: Builder):
     yield FunctionInfo.from_fn(_run, description=f"Run:ai RCA {config.stage} stage.")
 
 
-class NonEmptyRcaEvaluatorConfig(EvaluatorBaseConfig, name="non_empty_rca"):
-    """Offline evaluator that passes when the workflow produced non-empty RCA text."""
+class RcaFamilyEvaluatorConfig(EvaluatorBaseConfig, name="rca_family"):
+    """Score whether the workflow's top root-cause family matches the labeled family."""
+
+    top_k: int = 3
+    partial_credit: float = 0.5
 
 
-@register_evaluator(config_type=NonEmptyRcaEvaluatorConfig)
-async def non_empty_rca_evaluator(config: NonEmptyRcaEvaluatorConfig, _builder: Builder):
+@register_evaluator(config_type=RcaFamilyEvaluatorConfig)
+async def rca_family_evaluator(config: RcaFamilyEvaluatorConfig, _builder: Builder):
     async def _evaluate(eval_input: EvalInput) -> EvalOutput:
         items = []
+        top_k = max(1, int(config.top_k))
         for item in eval_input.eval_input_items:
-            text = _analysis_text(item.output_obj)
-            score = 1.0 if text else 0.0
+            response = _response_dict(item.output_obj)
+            candidates = _root_cause_candidates(response)
+            got = [str(c.get("family") or "") for c in candidates[:top_k] if c.get("family")]
+            expected = _expected_family(item.expected_output_obj)
+            if got and got[0] == expected:
+                score = 1.0
+            elif expected and expected in got:
+                score = float(config.partial_credit)
+            else:
+                score = 0.0
             items.append(
                 EvalOutputItem(
                     id=item.id,
                     score=score,
-                    reasoning={"non_empty": bool(text)},
+                    reasoning={
+                        "expected": expected,
+                        "got": got,
+                        "false_assertion": _false_assertion(expected, candidates),
+                    },
                 )
             )
         average = sum(float(item.score) for item in items) / len(items) if items else 0.0
@@ -75,7 +92,7 @@ async def non_empty_rca_evaluator(config: NonEmptyRcaEvaluatorConfig, _builder: 
     yield EvaluatorInfo(
         config=config,
         evaluate_fn=_evaluate,
-        description=NonEmptyRcaEvaluatorConfig.__doc__ or "",
+        description=RcaFamilyEvaluatorConfig.__doc__ or "",
     )
 
 
@@ -142,20 +159,40 @@ def _request_from(value: object) -> AlertAnalysisRequest:
     return AlertAnalysisRequest.model_validate(raw)
 
 
-def _analysis_text(value: object) -> str:
+def _response_dict(value: object) -> dict[str, Any]:
     if isinstance(value, AlertAnalysisResponse):
-        return value.analysis_detail or value.analysis_summary or value.analysis
+        return value.model_dump()
     if isinstance(value, str):
         try:
             value = json.loads(value)
         except json.JSONDecodeError:
-            return value.strip()
-    if isinstance(value, dict):
-        for key in ("analysis_detail", "analysis_summary", "analysis"):
-            text = value.get(key)
-            if isinstance(text, str) and text.strip():
-                return text.strip()
-    return ""
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _expected_family(value: object) -> str:
+    expected = _response_dict(value)
+    return str(expected.get("expected_family") or "").strip()
+
+
+def _root_cause_candidates(response: dict[str, Any]) -> list[dict[str, Any]]:
+    context = response.get("context")
+    if not isinstance(context, dict):
+        return []
+    candidates = context.get("root_cause_candidates")
+    if not isinstance(candidates, list):
+        return []
+    return [candidate for candidate in candidates if isinstance(candidate, dict)]
+
+
+def _false_assertion(expected: str, candidates: list[dict[str, Any]]) -> bool:
+    if expected != "insufficient_evidence" or not candidates:
+        return False
+    top = candidates[0]
+    return (
+        top.get("family") != "insufficient_evidence"
+        and str(top.get("confidence") or "") == "high"
+    )
 
 
 class NatEngine:

@@ -53,7 +53,7 @@ docker build -t runai-rca-frontend:0.1.0 frontend
 ```
 
 Helm 차트는 프런트엔드, 백엔드, 에이전트 서비스, 증거 수집을 위한 읽기 전용 Kubernetes
-RBAC, 그리고 Run:ai, Prometheus, Loki, Postgres, NeMo Agent Toolkit에 대한
+RBAC, 그리고 Run:ai, Prometheus, Loki, Postgres에 대한
 시크릿/구성 경계를 배포합니다.
 
 ```bash

@@ -1,16 +1,36 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from nat.data_models.evaluator import EvalInput, EvalInputItem
 
+from app.nat_engine import RcaFamilyEvaluatorConfig, rca_family_evaluator
 from app.progress import ProgressReporter
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services.orchestrator import AnalysisOrchestrator
 from tests.test_orchestrator import make_settings
 
 CONFIG = Path(__file__).parents[1] / "configs" / "runai_rca_engine.yml"
+NAT_DATASET = Path(__file__).parents[1] / "eval" / "nat_dataset.jsonl"
+VALID_FAMILIES = {
+    # families.yaml plus signature-only families from failure_modes.yaml and
+    # runai_known_issues.yaml.
+    "gpu_hardware_error",
+    "node_kubelet_pressure",
+    "runai_scheduling_quota",
+    "k8s_scheduling_error",
+    "runai_control_plane_error",
+    "k8s_control_plane_error",
+    "workload_startup_error",
+    "image_pull_error",
+    "insufficient_evidence",
+    "platform_version_bug",
+    "observability_accuracy",
+    "expected_known_behavior",
+}
 
 
 def _request() -> AlertAnalysisRequest:
@@ -22,6 +42,75 @@ def _request() -> AlertAnalysisRequest:
             fingerprint="fp-nat-engine",
         )
     )
+
+
+def _eval_item(
+    item_id: str,
+    expected: str,
+    candidates: list[dict[str, object]],
+    *,
+    as_json: bool = False,
+) -> EvalInputItem:
+    output = {"context": {"root_cause_candidates": candidates}}
+    return EvalInputItem(
+        id=item_id,
+        input_obj={},
+        expected_output_obj={"expected_family": expected},
+        output_obj=json.dumps(output) if as_json else output,
+        full_dataset_entry={},
+    )
+
+
+@pytest.mark.asyncio
+async def test_rca_family_evaluator_scores_ranked_family_matches() -> None:
+    async with rca_family_evaluator(RcaFamilyEvaluatorConfig(), None) as info:
+        output = await info.evaluate_fn(
+            EvalInput(
+                eval_input_items=[
+                    _eval_item(
+                        "exact",
+                        "gpu_hardware_error",
+                        [{"family": "gpu_hardware_error", "confidence": "high"}],
+                    ),
+                    _eval_item(
+                        "partial",
+                        "image_pull_error",
+                        [
+                            {"family": "k8s_scheduling_error", "confidence": "medium"},
+                            {"family": "image_pull_error", "confidence": "medium"},
+                        ],
+                        as_json=True,
+                    ),
+                    _eval_item(
+                        "miss",
+                        "runai_scheduling_quota",
+                        [{"family": "k8s_scheduling_error", "confidence": "medium"}],
+                    ),
+                    _eval_item(
+                        "false-assertion",
+                        "insufficient_evidence",
+                        [{"family": "gpu_hardware_error", "confidence": "high"}],
+                        as_json=True,
+                    ),
+                ]
+            )
+        )
+
+    by_id = {item.id: item for item in output.eval_output_items}
+    assert by_id["exact"].score == 1.0
+    assert by_id["partial"].score == 0.5
+    assert by_id["miss"].score == 0.0
+    assert by_id["false-assertion"].score == 0.0
+    assert by_id["false-assertion"].reasoning["false_assertion"] is True
+
+
+def test_nat_dataset_schema_and_families() -> None:
+    for line in NAT_DATASET.read_text(encoding="utf-8").splitlines():
+        item = json.loads(line)
+        expected = item.get("answer", {}).get("expected_family")
+        assert item.get("id")
+        assert item.get("question", {}).get("alert")
+        assert expected in VALID_FAMILIES
 
 
 @pytest.mark.asyncio

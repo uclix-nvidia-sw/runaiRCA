@@ -55,7 +55,7 @@ docker build -t runai-rca-frontend:0.1.0 frontend
 
 The Helm chart deploys the frontend, backend, agent service, read-only
 Kubernetes RBAC for evidence collection, and the secret/config boundaries for
-Run:ai, Prometheus, Loki, Postgres, and NeMo Agent Toolkit.
+Run:ai, Prometheus, Loki, and Postgres.
 
 ```bash
 helm template runai-rca charts/runai-rca
