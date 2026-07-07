@@ -131,7 +131,7 @@ class RunAICollector:
                     ],
                 )
             # Prefer the runai-mcp server when configured (richer, spec-aware,
-            # auto-authed in the sidecar); fall back to direct HTTP on any MCP issue.
+            # auto-authed by the managed service); fall back to direct HTTP on any MCP issue.
             query_results = await gather_runai_via_mcp(self._settings, target)
             used_mcp = query_results is not None
             if not used_mcp:

@@ -40,6 +40,10 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{ include "runai-rca.fullname" . }}-grafana-mcp
 {{- end -}}
 
+{{- define "runai-rca.runaiMcp.fullname" -}}
+{{ include "runai-rca.fullname" . }}-runai-mcp
+{{- end -}}
+
 {{- define "runai-rca.kubernetesMcp.fullname" -}}
 {{ include "runai-rca.fullname" . }}-kubernetes-mcp
 {{- end -}}

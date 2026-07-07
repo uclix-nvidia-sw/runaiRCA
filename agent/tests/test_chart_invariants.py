@@ -92,6 +92,7 @@ def test_third_party_images_are_fully_qualified() -> None:
 
 def test_managed_mcp_values_keep_expected_secret_and_images() -> None:
     values = _values()
+    assert values["runaiMcp"]["enabled"] is True
     assert values["grafanaMcp"]["enabled"] is True
     assert values["kubernetesMcp"]["enabled"] is True
     assert values["postgresMcp"]["enabled"] is True
@@ -99,6 +100,7 @@ def test_managed_mcp_values_keep_expected_secret_and_images() -> None:
     assert values["secrets"]["keys"]["grafanaServiceAccountToken"] == (
         "GRAFANA_SERVICE_ACCOUNT_TOKEN"
     )
+    assert values["runaiMcp"]["image"]["repository"] == "runai-rca-mcp"
     assert values["grafanaMcp"]["image"]["repository"] == "docker.io/grafana/mcp-grafana"
     assert values["kubernetesMcp"]["image"]["repository"] == (
         "quay.io/containers/kubernetes_mcp_server"
@@ -108,6 +110,10 @@ def test_managed_mcp_values_keep_expected_secret_and_images() -> None:
 
 def test_agent_env_uses_shared_mcp_service_urls_when_managed_enabled() -> None:
     text = AGENT_TEMPLATE.read_text(encoding="utf-8")
+    assert "RUNAI_MCP_URL" in text and "runai-rca.runaiMcp.fullname" in text
+    assert "http://localhost:%v/mcp" not in text
+    assert "name: runai-mcp" not in text
+    assert "runai-rca.runaiMcp.fullname" in MCP_TEMPLATE.read_text(encoding="utf-8")
     assert "PROMETHEUS_MCP_URL" in text and "runai-rca.grafanaMcp.fullname" in text
     assert "LOKI_MCP_URL" in text and "runai-rca.grafanaMcp.fullname" in text
     assert "KUBERNETES_MCP_URL" in text and "runai-rca.kubernetesMcp.fullname" in text

@@ -14,7 +14,7 @@ it consults.
 
 Collectors (each owns one domain):
 
-- Run:ai collector — workload/project/queue/quota context (optional runai-mcp sidecar)
+- Run:ai collector — workload/project/queue/quota context (optional runai-mcp service)
 - Kubernetes collector — pods/events/nodes, control-plane pod health, read-only pod-exec
 - Prometheus collector — queue/project GPU metrics
 - Loki collector — workload + `runai`/`runai-backend` control-plane logs
