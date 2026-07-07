@@ -343,8 +343,8 @@ agent:
     # Allow the Kubernetes agent to run read-only diagnostic commands (nvidia-smi,
     # etc.) via the pod exec subresource. Requires pods/exec RBAC (agent-rbac.yaml).
     enablePodExec: true
-    enableNatRuntime: false
-    natConfigFile: /app/configs/runai_rca_workflow.yml
+    enableNatRuntime: true
+    natConfigFile: /app/configs/runai_rca_workflow_litellm.yml
     natTimeoutSeconds: 300
     # Human-like iterative investigation: the orchestrator plans, probes the most
     # relevant agent, observes, and re-plans (bounded by maxInvestigationSteps)

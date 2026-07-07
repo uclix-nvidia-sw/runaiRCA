@@ -79,8 +79,8 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `LLM_API_KEY` | OpenAI-compatible API key secret; enables conversational chat answers when all three LLM vars are set |
 | `LLM_REQUEST_TIMEOUT_SECONDS` | LLM request timeout per call (chat, reasoning, and the materialized NAT config), default `300`, `0` = unlimited |
 | `LLM_PRICING_JSON` | Optional JSON map for estimated LLM cost, keyed by model with `prompt_per_mtok` and `completion_per_mtok` values |
-| `ENABLE_NAT_RUNTIME` | Run RCA synthesis through the NeMo Agent Toolkit CLI instead of the deterministic in-process fallback, default `false` |
-| `NAT_CONFIG_FILE` | Optional NeMo workflow config path, default `configs/runai_rca_workflow.yml` |
+| `ENABLE_NAT_RUNTIME` | Run RCA synthesis through the NeMo Agent Toolkit CLI; default `true` |
+| `NAT_CONFIG_FILE` | NeMo workflow config path, default `configs/runai_rca_workflow_litellm.yml` |
 | `NAT_TIMEOUT_SECONDS` | NeMo Agent Toolkit CLI execution timeout |
 | `ENABLE_INVESTIGATION_LOOP` | Central LLM investigation loop: plan → probe the most relevant agents → observe → re-plan, default `false` (Helm sets `true`) |
 | `MAX_INVESTIGATION_STEPS` | Max central investigation steps per analysis, default `12` |
@@ -121,17 +121,14 @@ NeMo Agent Toolkit workflows:
   review path, but does not expose raw MCP client groups to final synthesis. MCP
   calls happen inside each domain collector/drill-down, then final synthesis sees
   only the resulting artifacts.
-- `agent/configs/runai_rca_workflow_litellm.yml` adds a LiteLLM/OpenAI-compatible
-  Analysis Agent review path. Set `ENABLE_NAT_RUNTIME=true`, point
-  `NAT_CONFIG_FILE` at that config, and provide `LLM_BASE_URL`, `LLM_MODEL`, and
-  `LLM_API_KEY` through env or Helm Secret values.
+- `agent/configs/runai_rca_workflow_litellm.yml` is the default runtime workflow.
+  Provide `LLM_BASE_URL`, `LLM_MODEL`, and `LLM_API_KEY` through env or Helm
+  Secret values.
 
 Example Helm override for a LiteLLM/OpenAI-compatible endpoint:
 
 ```bash
 helm upgrade --install runai-rca charts/runai-rca \
-  --set agent.env.enableNatRuntime=true \
-  --set agent.env.natConfigFile=/app/configs/runai_rca_workflow_litellm.yml \
   --set-string agent.env.llmBaseUrl=https://litellm.example.com/v1 \
   --set-string agent.env.llmModel=auto-router \
   --set-string secrets.llmApiKey='<llm-api-key>'

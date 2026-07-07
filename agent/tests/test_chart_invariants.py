@@ -57,6 +57,12 @@ def test_agent_step_ceilings_fit_inside_the_deadline() -> None:
         )
 
 
+def test_helm_defaults_run_analysis_through_nat() -> None:
+    env = _values()["agent"]["env"]
+    assert env["enableNatRuntime"] is True
+    assert env["natConfigFile"] == "/app/configs/runai_rca_workflow_litellm.yml"
+
+
 def _image_repos(node: Any, path: str = "") -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     if isinstance(node, dict):

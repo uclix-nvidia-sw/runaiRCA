@@ -46,13 +46,13 @@ Agent의 분석은 단일 프롬프트가 아니라 다단계 파이프라인(pi
 
 ### Agent
 
-Agent는 `agent/configs/runai_rca_workflow.yml` 아래에 NeMo Agent Toolkit 워크플로 구성을 갖춘
-FastAPI 서비스입니다.
+Agent는 기본적으로 `agent/configs/runai_rca_workflow_litellm.yml` NeMo Agent Toolkit
+워크플로 구성을 사용하는 FastAPI 서비스입니다.
 
 이 Python 서비스에는 결정론적 폴백 오케스트레이터가 포함되어, 외부 Run:ai, Kubernetes,
-Postgres, Prometheus, Loki, NIM 자격 증명이 아직 없어도 로컬 개발과 테스트를 실행할 수 있습니다.
-`ENABLE_NAT_RUNTIME=true`일 때 `NemoWorkflowRunner`는 구성된 워크플로로 `nat` CLI에 위임할 수
-있습니다.
+Postgres, Prometheus, Loki, LLM 자격 증명이 아직 없어도 로컬 개발과 테스트를 실행할 수 있습니다.
+`NemoWorkflowRunner`는 기본적으로 구성된 워크플로로 `nat` CLI에 위임하고, NAT가 실패하면
+결정론적 경로로 폴백합니다.
 
 모든 LLM 단계(플래너 정제, 조사 루프, 수집기별 드릴다운, 자기 점검, 한국어 종합)는 선택적이며
 최선 노력(best-effort) 방식입니다. LLM이 없거나 어떤 실패가 발생하면, 오케스트레이터는

@@ -264,8 +264,10 @@ def load_settings() -> Settings:
         # Generous per-call ceiling so a reasoning agent is never cut off mid-thought;
         # the overall analysis deadline below is the real bound. (0 = unlimited.)
         llm_request_timeout_seconds=_int_env("LLM_REQUEST_TIMEOUT_SECONDS", 300),
-        nat_config_file=os.getenv("NAT_CONFIG_FILE", "configs/runai_rca_workflow.yml").strip(),
-        enable_nat_runtime=_bool_env("ENABLE_NAT_RUNTIME", False),
+        nat_config_file=os.getenv(
+            "NAT_CONFIG_FILE", "configs/runai_rca_workflow_litellm.yml"
+        ).strip(),
+        enable_nat_runtime=_bool_env("ENABLE_NAT_RUNTIME", True),
         # Bounded below the overall deadline so the workflow subprocess is killed
         # cleanly if it overruns. (0 = unlimited.)
         nat_timeout_seconds=_int_env("NAT_TIMEOUT_SECONDS", 300),

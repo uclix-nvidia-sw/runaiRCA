@@ -59,11 +59,11 @@ TModel = TypeVar("TModel", bound=BaseModel)
 
 
 class NemoWorkflowRunner:
-    """Optional bridge to NeMo Agent Toolkit's `nat` CLI.
+    """Bridge to NeMo Agent Toolkit's `nat` CLI.
 
-    The local collector orchestrator remains the default so the service is useful
-    without external credentials. This runner is intentionally isolated: when it
-    fails, the service falls back to deterministic synthesis.
+    NAT is the normal runtime. This runner is intentionally isolated: when it
+    fails, the service falls back to deterministic synthesis instead of dropping
+    the incident.
     """
 
     def __init__(self, settings: Settings) -> None:
