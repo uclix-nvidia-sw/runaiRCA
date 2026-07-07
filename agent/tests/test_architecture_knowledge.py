@@ -95,3 +95,25 @@ def test_playbook_appends_component_check_path() -> None:
     assert "Cluster-Sync Out Of Sync" in joined
     assert "Check order:" in joined
     assert "kubectl logs -n runai deploy/cluster-sync" in joined
+
+
+def test_container_toolkit_check_path_reaches_the_gpu_operator_stack() -> None:
+    """Owner rule: runai-container-toolkit down -> look at the GPU Operator side."""
+    components = load_architecture(ARCHITECTURE)
+    chain = dependency_path(components, "runai-container-toolkit")
+    assert "nvidia-container-toolkit-daemonset" in chain
+    assert "nvidia-driver-daemonset" in chain
+
+
+def test_nvidia_operator_symptoms_resolve_and_match() -> None:
+    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+
+    modes = load_failure_modes(FAILURE_MODES)
+    hits = match_failure_mode_symptoms(
+        modes, 'failed to create pod sandbox: no runtime for "nvidia" is configured'
+    )
+    assert any(s.get("component") == "nvidia-container-toolkit-daemonset" for _, s in hits)
+    hits = match_failure_mode_symptoms(
+        modes, "nicclusterpolicy is not ready; gpudirect rdma missing"
+    )
+    assert any(s.get("component") == "network-operator" for _, s in hits)

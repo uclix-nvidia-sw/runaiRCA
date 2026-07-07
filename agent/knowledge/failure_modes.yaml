@@ -180,6 +180,33 @@
         - "Run `nvidia-smi` on the node — if it fails, the driver is the problem, not the plugin."
         - "Confirm the container runtime is configured with the NVIDIA runtime (nvidia-container-toolkit) on that node."
         - "Restart the device-plugin pod after fixing the driver/runtime so the GPU count is re-advertised."
+    # --- added from the NVIDIA GPU Operator 25.10 troubleshooting guide ---
+    # docs.nvidia.com/datacenter/cloud-native/gpu-operator/25.10/troubleshooting.html
+    - name: No Runtime For Nvidia Configured
+      component: nvidia-container-toolkit-daemonset
+      keywords: ["no runtime for \"nvidia\"", "failed to get sandbox runtime"]
+      actions:
+        - "The container runtime on the node has no 'nvidia' runtime handler, so every GPU pod there fails sandbox creation. This is the nvidia-container-toolkit daemonset failing to configure containerd/CRI-O — read `kubectl logs -n gpu-operator ds/nvidia-container-toolkit-daemonset -c nvidia-container-toolkit-ctr`."
+        - "Verify the nvidia-driver daemonset pod on that node is Running first — the toolkit waits on the driver."
+        - "Confirm the 'nvidia' runtime handler exists in the runtime config: `containerd config` (or `crio status config`) on the node."
+    - name: GPU Marked Unhealthy By Device Plugin (Xid)
+      component: nvidia-device-plugin-daemonset
+      keywords: [xidcriticalerror, "device marked unhealthy", "marking device as unhealthy"]
+      actions:
+        - "The device plugin saw a critical Xid and withdrew that GPU from Allocatable — the node now advertises fewer GPUs than installed and workloads queue for the missing one. Read the Xid code: `kubectl logs -n gpu-operator ds/nvidia-device-plugin-daemonset | grep -i xid` plus the node's dmesg."
+        - "Cross-reference the Xid code with the NVIDIA Xid documentation; if the same GPU keeps faulting, drain the node and replace the GPU (RMA)."
+    - name: GPU Driver Init Blocked (nouveau / Secure Boot)
+      component: nvidia-driver-daemonset
+      keywords: [nouveau, "failed to enable msi-x", "gpu-driver-upgrade-state=upgrade-failed"]
+      actions:
+        - "The NVIDIA kernel driver cannot initialize: the in-tree nouveau module is still loaded ('Failed to enable MSI-X' in dmesg) or EFI Secure Boot blocks the module. Blacklist nouveau (blacklist-nouveau.conf + `update-initramfs -u` + reboot) and disable EFI Secure Boot."
+        - "While the driver is down, EVERY GPU operand pod on the node sits in Init — fix the driver first; the rest recovers by itself."
+        - "For a stuck driver UPGRADE: `kubectl get nodes -l nvidia.com/gpu-driver-upgrade-state=upgrade-failed`, fix the cause, then relabel the node upgrade-required (or delete the driver pod there)."
+    - name: GPU infoROM Corrupted
+      component: nvidia-driver-daemonset
+      keywords: ["inforom is corrupted"]
+      actions:
+        - "nvidia-smi exits with return code 14 ('WARNING: infoROM is corrupted at gpu ...') and the operator validator/driver daemonset fail on that node. GPU firmware corruption is a hardware fault: replace the GPU."
     - name: GPU Fallen Off The Bus
       keywords: ["fallen off the bus", "gpu is lost"]
       actions:
@@ -227,13 +254,37 @@
         - "Reseat or replace the cable/transceiver if one link flaps repeatedly; check the subnet manager (opensm/UFM) logs."
         - "Multi-node training on the affected node will stall or crash with NCCL timeouts — cordon the node until the link is stable."
     - name: Fabric Manager Unhealthy
-      keywords: ["fabric manager", nvswitch, "nv-fabricmanager"]
+      keywords: ["fabric manager", nvswitch, "nv-fabricmanager", fabricmanager, "system not yet initialized"]
       actions:
         - "NVSwitch systems need a healthy Fabric Manager for GPU-to-GPU traffic. Check `systemctl status nvidia-fabricmanager` and its log on the node."
+        - "GPU Operator validator pods crashing with 'error code system not yet initialized' mean exactly this on DGX/HGX: the fabric is not configured yet. Verify with `nvidia-smi -q` (Fabric State) and read /var/log/fabricmanager.log; ensure nvidia-fabricmanager is installed on NVSwitch systems."
         - "Restart order matters: stop CUDA apps -> restart Fabric Manager -> (if needed) `nvidia-smi -r` -> restart apps."
+    # --- added from the NVIDIA Network Operator troubleshooting guide ---
+    # docs.nvidia.com/dgx-superpod/dgx-explained/network-operator/latest/common-issues-troubleshooting.html
+    - name: NicClusterPolicy Not Ready / RDMA Stack Missing
+      component: network-operator
+      keywords: [nicclusterpolicy, "gpudirect rdma", "rdma shared device plugin", "rdma-shared-dp"]
+      actions:
+        - "The Network Operator installed fine but RDMA / GPUDirect RDMA / SR-IOV never reach workloads when the NicClusterPolicy is missing, incomplete, or not reconciled. Check `kubectl get nicclusterpolicy -A -o wide` (state must be ready) and the operator pods in nvidia-network-operator."
+        - "Verify node labels expose the expected NIC capabilities and the hardware/driver combination is supported; a duplicate Node Feature Discovery deployment also conflicts — set nfd.enabled=false when NFD already runs in the cluster."
+        - "If pods lack expected secondary interfaces, validate Multus, the SR-IOV/RDMA device plugins, CNI plugins, and NVIDIA IPAM in that order (cluster dependencies -> NicClusterPolicy -> node labels/operands -> driver-level debugging)."
+    - name: DOCA-OFED Driver Reload Disrupted The Primary NIC
+      component: doca-ofed-driver
+      keywords: [doca-ofed, mofed, "ofed driver"]
+      actions:
+        - "When the NVIDIA NIC is the node's PRIMARY interface, deploying the DOCA-OFED driver container unloads and replaces the live driver — the node can drop off the network and only basic IP configuration comes back automatically. Check node reachability and `ibstat` after the driver pod cycles."
+        - "Review the NIC primary-interface situation BEFORE enabling driver replacement on such nodes; stage the rollout node-by-node."
 
 - family: cluster_network_error
   symptoms:
+    # From the NVIDIA GPU Operator troubleshooting guide: exporter-to-dcgm traffic
+    # blocked by NetworkPolicy/firewall — a networking cause with a metrics symptom.
+    - name: DCGM Exporter Cannot Reach The DCGM Service
+      component: gpu-operator
+      keywords: ["nvidia-dcgm:5555", "attempting to connect to remote hostengine"]
+      actions:
+        - "dcgm-exporter crash-loops trying to reach the standalone dcgm pod ('Attempting to connect to remote hostengine at nvidia-dcgm:5555' then a failure). Verify NetworkPolicies allow dcgm-exporter -> nvidia-dcgm traffic on port 5555."
+        - "Check security groups / node firewalls permit pod-to-pod traffic both intra-node and inter-node; GPU metrics return once the exporter connects."
     - name: Pod DNS Resolution Failure
       keywords: [nxdomain, "temporary failure in name resolution", "no such host", "server misbehaving"]
       actions:
