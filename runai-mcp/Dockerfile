@@ -39,6 +39,6 @@ COPY --from=build /app/spec ./spec
 # Non-root; the chart also applies its securityContext.
 USER 1000
 EXPOSE 8809
-# Expose the stdio runai-mcp server over streamable HTTP at :8809/mcp.
-# (mcp-proxy flags vary by version — override the chart command if yours differs.)
-CMD ["mcp-proxy", "--host", "0.0.0.0", "--port", "8809", "--", "node", "/app/dist/index.js"]
+# Expose stdio runai-mcp over HTTP. mcp-proxy does not reliably pass custom pod
+# env to the child process, so inject the env that runai-mcp reads explicitly.
+CMD ["sh", "-c", "exec mcp-proxy --host 0.0.0.0 --port 8809 -- env RUNAI_API_BASE_URL=\"$RUNAI_API_BASE_URL\" RUNAI_CLIENT_ID=\"$RUNAI_CLIENT_ID\" RUNAI_CLIENT_SECRET=\"$RUNAI_CLIENT_SECRET\" RUNAI_API_TOKEN=\"$RUNAI_API_TOKEN\" LOG_LEVEL=\"${LOG_LEVEL:-info}\" node /app/dist/index.js"]

@@ -20,6 +20,7 @@ MCP_TEMPLATE = (
     Path(__file__).parents[2] / "charts" / "runai-rca" / "templates" / "mcp-services.yaml"
 )
 AGENT_TEMPLATE = Path(__file__).parents[2] / "charts" / "runai-rca" / "templates" / "agent.yaml"
+RUNAI_MCP_DOCKERFILE = Path(__file__).parents[2] / "runai-mcp" / "Dockerfile"
 # Images we build and publish to the org registry — the ONLY repositories allowed
 # to be short (unqualified), because global.imageRegistry is meant to prefix them.
 OWN_IMAGES = {
@@ -112,6 +113,13 @@ def test_runai_mcp_requires_explicit_runai_api_url() -> None:
     template = MCP_TEMPLATE.read_text(encoding="utf-8")
     assert "agent.env.runaiBaseUrl is required when runaiMcp.enabled=true" in template
     assert "RUNAI_API_BASE_URL" in template
+
+
+def test_runai_mcp_proxy_passes_auth_env_to_stdio_child() -> None:
+    dockerfile = RUNAI_MCP_DOCKERFILE.read_text(encoding="utf-8")
+    assert "-- env RUNAI_API_BASE_URL=" in dockerfile
+    assert "RUNAI_CLIENT_ID=" in dockerfile
+    assert "RUNAI_CLIENT_SECRET=" in dockerfile
 
 
 def test_agent_env_uses_shared_mcp_service_urls_when_managed_enabled() -> None:

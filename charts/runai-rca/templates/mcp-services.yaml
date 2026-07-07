@@ -58,6 +58,12 @@ spec:
                   name: {{ include "runai-rca.secretName" . }}
                   key: {{ .Values.secrets.keys.runaiClientSecret | quote }}
                   optional: true
+            - name: RUNAI_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "runai-rca.secretName" . }}
+                  key: {{ .Values.secrets.keys.runaiBearerToken | quote }}
+                  optional: true
           resources:
             {{- toYaml .Values.runaiMcp.resources | nindent 12 }}
 ---
