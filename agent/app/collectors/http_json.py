@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from app.masking import build_masker
+
 
 @dataclass(frozen=True)
 class JsonResponse:
@@ -29,7 +31,7 @@ async def get_json(
         import httpx
     except ImportError:
         return JsonResponse(
-            url=_join_url(base_url, path),
+            url=_safe_text(_join_url(base_url, path), limit=2000),
             status_code=0,
             error="python.httpx is not installed",
         )
@@ -41,18 +43,19 @@ async def get_json(
         ) as client:
             response = await client.get(url, params=params, headers=headers)
     except Exception as exc:  # noqa: BLE001 - collectors report diagnostics, not failures.
-        return JsonResponse(url=url, status_code=0, error=f"{exc.__class__.__name__}: {exc}")
+        return JsonResponse(
+            url=_safe_text(url, limit=2000),
+            status_code=0,
+            error=_safe_text(f"{exc.__class__.__name__}: {exc}", limit=1000),
+        )
 
-    try:
-        data: Any = response.json()
-    except ValueError:
-        data = {"body": response.text[:1000]}
+    data = _response_data(response)
 
     error = None
     if response.status_code >= 400:
         error = f"HTTP {response.status_code}"
     return JsonResponse(
-        url=str(response.url),
+        url=_safe_text(str(response.url), limit=2000),
         status_code=response.status_code,
         data=data,
         error=error,
@@ -70,7 +73,11 @@ async def post_form_json(
     try:
         import httpx
     except ImportError:
-        return JsonResponse(url=url, status_code=0, error="python.httpx is not installed")
+        return JsonResponse(
+            url=_safe_text(url, limit=2000),
+            status_code=0,
+            error="python.httpx is not installed",
+        )
 
     try:
         async with httpx.AsyncClient(
@@ -78,18 +85,19 @@ async def post_form_json(
         ) as client:
             response = await client.post(url, data=data, headers=headers)
     except Exception as exc:  # noqa: BLE001 - collectors report diagnostics, not failures.
-        return JsonResponse(url=url, status_code=0, error=f"{exc.__class__.__name__}: {exc}")
+        return JsonResponse(
+            url=_safe_text(url, limit=2000),
+            status_code=0,
+            error=_safe_text(f"{exc.__class__.__name__}: {exc}", limit=1000),
+        )
 
-    try:
-        payload: Any = response.json()
-    except ValueError:
-        payload = {"body": response.text[:1000]}
+    payload = _response_data(response)
 
     error = None
     if response.status_code >= 400:
         error = f"HTTP {response.status_code}"
     return JsonResponse(
-        url=str(response.url),
+        url=_safe_text(str(response.url), limit=2000),
         status_code=response.status_code,
         data=payload,
         error=error,
@@ -107,7 +115,11 @@ async def post_json(
     try:
         import httpx
     except ImportError:
-        return JsonResponse(url=url, status_code=0, error="python.httpx is not installed")
+        return JsonResponse(
+            url=_safe_text(url, limit=2000),
+            status_code=0,
+            error="python.httpx is not installed",
+        )
 
     try:
         async with httpx.AsyncClient(
@@ -115,18 +127,19 @@ async def post_json(
         ) as client:
             response = await client.post(url, json=json_body, headers=headers)
     except Exception as exc:  # noqa: BLE001 - collectors report diagnostics, not failures.
-        return JsonResponse(url=url, status_code=0, error=f"{exc.__class__.__name__}: {exc}")
+        return JsonResponse(
+            url=_safe_text(url, limit=2000),
+            status_code=0,
+            error=_safe_text(f"{exc.__class__.__name__}: {exc}", limit=1000),
+        )
 
-    try:
-        payload: Any = response.json()
-    except ValueError:
-        payload = {"body": response.text[:1000]}
+    payload = _response_data(response)
 
     error = None
     if response.status_code >= 400:
         error = f"HTTP {response.status_code}"
     return JsonResponse(
-        url=str(response.url),
+        url=_safe_text(str(response.url), limit=2000),
         status_code=response.status_code,
         data=payload,
         error=error,
@@ -155,3 +168,17 @@ def _client_timeout(timeout_seconds: int) -> float | None:
 
 def _join_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
+def _response_data(response: Any) -> Any:
+    try:
+        return build_masker(()).mask_object(response.json())
+    except ValueError:
+        return {"body": _safe_text(response.text, limit=1000)}
+
+
+def _safe_text(value: str, *, limit: int) -> str:
+    text = " ".join(build_masker(()).mask_text(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"

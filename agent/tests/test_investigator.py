@@ -7,7 +7,7 @@ import pytest
 from app.collectors.base import CollectorResult
 from app.llm import begin_usage_tracking
 from app.plan import InvestigationPlan
-from app.services.investigator import investigate
+from app.services.investigator import _build_user_prompt, _evidence_summary, investigate
 from tests.test_orchestrator import make_settings, make_target
 
 
@@ -40,6 +40,53 @@ class LokiCollector:
 
 def _collectors() -> list[object]:
     return [RunaiCollector(), KubernetesCollector(), LokiCollector()]
+
+
+def test_unavailable_evidence_summary_does_not_expose_stale_signal_text() -> None:
+    summaries = _evidence_summary(
+        {
+            "kubernetes": CollectorResult(
+                agent="kubernetes",
+                status="unavailable",
+                summary="kubectl failed; stale output mentioned DiskPressure and evicted pods",
+                missing_data=["kubernetes.api"],
+                warnings=["api unreachable"],
+            )
+        }
+    )
+
+    assert summaries == [
+        {
+            "collector": "kubernetes",
+            "status": "unavailable",
+            "confidence": "low",
+            "summary": "collector unavailable; no evidence collected",
+            "missing_data": ["kubernetes.api"],
+            "warnings": ["api unreachable"],
+        }
+    ]
+
+
+def test_failed_adhoc_result_is_not_replayed_as_prompt_evidence() -> None:
+    prompt = _build_user_prompt(
+        InvestigationPlan(),
+        {},
+        {},
+        {"kubernetes": object()},
+        [],
+        adhoc=[
+            {
+                "kind": "pods",
+                "namespace": "runai",
+                "error": "query failed; stale output mentioned DiskPressure",
+                "data": {"message": "DiskPressure=True; pods evicted"},
+            }
+        ],
+    )
+
+    assert "DiskPressure" not in prompt
+    assert "pods evicted" not in prompt
+    assert "query failed" in prompt
 
 
 @pytest.mark.asyncio
@@ -79,6 +126,95 @@ async def test_returns_all_collectors_even_when_llm_probes_subset(monkeypatch) -
 
     assert {r.agent for r in results} == {"runai", "kubernetes", "loki"}
     assert all(c.calls == 1 for c in collectors)
+
+
+@pytest.mark.asyncio
+async def test_investigation_prompts_redact_sensitive_inputs(monkeypatch) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.example/v1",
+        llm_model="m",
+        llm_api_key="k",
+    )
+    prompts: list[str] = []
+
+    class SecretCollector:
+        async def collect(self, target, plan=None):
+            return CollectorResult(
+                agent="runai",
+                status="ok",
+                summary="quota check token=collector-token-12345",
+            )
+
+    async def fake_complete_json(settings, *, system, user, **_kwargs):
+        prompts.append(user)
+        if len(prompts) == 1:
+            return {"action": "probe", "probes": [{"collector": "runai"}]}
+        if "final skeptical reflection" in system:
+            return {"hypothesis_updates": [], "new_hypotheses": []}
+        return {"action": "conclude", "hypothesis_updates": []}
+
+    monkeypatch.setattr("app.services.investigator.complete_json", fake_complete_json)
+    plan = InvestigationPlan(
+        hypotheses=[{"family": "runai_scheduling_quota", "reason": "password=plan-secret-12345"}]
+    )
+    kg = {
+        "blast_radius_workloads": 1,
+        "prior_incidents": [{"analysis_summary": "api_key=kg-key-12345"}],
+    }
+
+    await investigate(settings, make_target(), [SecretCollector()], plan, kg, max_steps=3)
+
+    joined = "\n".join(prompts)
+    for secret in ["plan-secret-12345", "kg-key-12345", "collector-token-12345"]:
+        assert secret not in joined
+    assert "[MASKED]" in joined
+
+
+@pytest.mark.asyncio
+async def test_investigation_context_masks_llm_decision_outputs(monkeypatch) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.example/v1",
+        llm_model="m",
+        llm_api_key="k",
+    )
+
+    async def fake_complete_json(settings, *, system, user, **_kwargs):
+        if "final skeptical reflection" in system:
+            return {
+                "hypothesis_updates": [
+                    {"id": "H1", "evidence_for": ["token=reflect-secret-12345"]}
+                ],
+                "new_hypotheses": [
+                    {
+                        "family": "image_pull_error",
+                        "statement": "api_key=newhyp-secret-12345",
+                    }
+                ],
+            }
+        return {
+            "action": "conclude",
+            "reason": "api_key=reason-secret-12345",
+            "hypothesis_updates": [
+                {"id": "H1", "evidence_for": ["password=ledger-secret-12345"]}
+            ],
+        }
+
+    monkeypatch.setattr("app.services.investigator.complete_json", fake_complete_json)
+    plan = InvestigationPlan(hypotheses=[{"family": "runai_scheduling_quota", "reason": "quota"}])
+
+    _, context = await investigate(settings, make_target(), _collectors(), plan, {}, max_steps=2)
+
+    serialized = str(context)
+    for secret in [
+        "reason-secret-12345",
+        "ledger-secret-12345",
+        "reflect-secret-12345",
+        "newhyp-secret-12345",
+    ]:
+        assert secret not in serialized
+    assert "[MASKED]" in serialized
 
 
 @pytest.mark.asyncio
@@ -216,7 +352,7 @@ async def test_token_budget_stops_investigation_loop(monkeypatch) -> None:
 async def test_collector_exception_does_not_raise(monkeypatch) -> None:
     class RunaiCollectorBoom:
         async def collect(self, target, plan=None):
-            raise RuntimeError("boom")
+            raise RuntimeError("api_key=collector-boom-secret-12345")
 
     # class name -> "runai_collector_boom"; only the mapped names matter here.
     collectors = [RunaiCollectorBoom(), LokiCollector()]
@@ -227,3 +363,6 @@ async def test_collector_exception_does_not_raise(monkeypatch) -> None:
     by_status = {r.status for r in results}
     assert by_status == {"unavailable", "ok"}
     assert len(results) == 2
+    serialized = str(results)
+    assert "collector-boom-secret-12345" not in serialized
+    assert "RuntimeError" in serialized

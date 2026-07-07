@@ -29,6 +29,7 @@ from app.llm import (
     token_budget_exceeded,
     token_budget_warning,
 )
+from app.masking import build_masker
 from app.schemas import Alert, AlertAnalysisRequest, AlertAnalysisResponse, ChatRequest
 from app.services.drilldown import _call_tool_safely, _domain_tools
 
@@ -64,6 +65,9 @@ async def answer_chat(
     question = (request.message or "").strip()
     if not question:
         return None, "empty question"
+    masker = _chat_masker(settings)
+    question = masker.mask_text(question)
+    grounding = masker.mask_text(grounding)
     try:
         tools = _flat_tools(settings)
         target = resolve_target({}, {})  # tools read their params from args, not target
@@ -72,10 +76,13 @@ async def answer_chat(
             if token_budget_exceeded(settings):
                 history.append({"note": token_budget_warning(settings)})
                 break
+            safe_history = masker.mask_object(history)
+            if not isinstance(safe_history, list):
+                safe_history = []
             decision = await complete_json(
                 settings,
                 system=_system_prompt(tools, settings),
-                user=_user_prompt(grounding, question, history),
+                user=_user_prompt(grounding, question, safe_history),
                 model=settings.llm_model_chat,
             )
             if not isinstance(decision, dict):
@@ -84,7 +91,7 @@ async def answer_chat(
             if action == "answer":
                 text = str(decision.get("answer") or "").strip()
                 if text:
-                    return text, None
+                    return masker.mask_text(text), None
                 break
             if action == "query":
                 await _run_queries(settings, tools, target, decision, history)
@@ -97,7 +104,7 @@ async def answer_chat(
         return await _final_answer(settings, grounding, question, history)
     except Exception as exc:  # noqa: BLE001 - chat is best-effort; caller degrades
         _log.debug("agentic chat aborted", exc_info=True)
-        return None, f"{exc.__class__.__name__}: {exc}"
+        return None, masker.mask_text(f"{exc.__class__.__name__}: {exc}")
 
 
 async def _run_queries(
@@ -116,12 +123,18 @@ async def _run_queries(
         name = str(q.get("tool"))
         args = q.get("args") if isinstance(q.get("args"), dict) else {}
         outcome = await _call_tool_safely(tools[name]["call"], settings, target, args)
+        outcome = _chat_masker(settings).mask_object(outcome)
+        if not isinstance(outcome, dict):
+            outcome = {"error": "tool returned no result"}
+        error = outcome.get("error")
         history.append(
             {
                 "tool": name,
                 "query": outcome.get("query") or name,
-                "summary": outcome.get("summary") or outcome.get("error"),
-                "result": json.dumps(outcome.get("result"), default=str)[:_RESULT_CHARS],
+                "summary": "query failed" if error else outcome.get("summary"),
+                "result": ""
+                if error
+                else json.dumps(outcome.get("result"), default=str)[:_RESULT_CHARS],
             }
         )
 
@@ -132,6 +145,7 @@ async def _run_analysis(
     decision: dict,
     history: list[dict],
 ) -> None:
+    masker = _chat_masker(settings)
     spec = decision.get("target") if isinstance(decision.get("target"), dict) else {}
     labels = {
         key: str(spec.get(key))
@@ -149,15 +163,19 @@ async def _run_analysis(
         response = await analyze_fn(request)
     except Exception as exc:  # noqa: BLE001 - a failed analysis is an observation
         history.append(
-            {"tool": "analyze", "target": spec, "error": f"{exc.__class__.__name__}: {exc}"}
+            {
+                "tool": "analyze",
+                "target": masker.mask_object(spec),
+                "error": masker.mask_text(f"{exc.__class__.__name__}: {exc}"),
+            }
         )
         return
     history.append(
         {
             "tool": "analyze",
-            "target": spec,
-            "summary": (response.analysis_summary or "")[:600],
-            "result": (response.analysis_detail or "")[:_RESULT_CHARS],
+            "target": masker.mask_object(spec),
+            "summary": masker.mask_text((response.analysis_summary or "")[:600]),
+            "result": masker.mask_text((response.analysis_detail or "")[:_RESULT_CHARS]),
         }
     )
 
@@ -165,6 +183,7 @@ async def _run_analysis(
 async def _final_answer(
     settings: Settings, grounding: str, question: str, history: list[dict]
 ) -> tuple[str | None, str | None]:
+    masker = _chat_masker(settings)
     language_rule = (
         "반드시 한국어로 답변하세요."
         if getattr(settings, "language", "en") == "ko"
@@ -177,11 +196,16 @@ async def _final_answer(
         "(the actual kubectl/PromQL/LogQL query or the analysis verdict). If nothing "
         f"answered it, say so and suggest the next diagnostic step. {language_rule}"
     )
-    tool_dump = json.dumps(history, ensure_ascii=False, default=str)[:6000] if history else "(none)"
+    safe_history = masker.mask_object(history)
+    tool_dump = (
+        json.dumps(safe_history, ensure_ascii=False, default=str)[:6000]
+        if safe_history
+        else "(none)"
+    )
     user = (
-        f"Grounded context:\n{grounding}\n\n"
+        f"Grounded context:\n{masker.mask_text(grounding)}\n\n"
         f"Tool/analysis results:\n{tool_dump}\n\n"
-        f"Question: {question}"
+        f"Question: {masker.mask_text(question)}"
     )
     # complete_with_error (not complete) so an LLM failure surfaces its detail
     # (HTTP status, provider error) instead of a generic "no answer".
@@ -193,8 +217,16 @@ async def _final_answer(
         model=settings.llm_model_chat,
     )
     if text and text.strip():
-        return text.strip(), None
-    return None, error or "the chat agent produced no answer"
+        return masker.mask_text(text.strip()), None
+    return None, masker.mask_text(error or "the chat agent produced no answer")
+
+
+def _chat_masker(settings: Settings):
+    return build_masker(
+        settings.masking_regex_list,
+        builtin_enabled=settings.builtin_redaction_enabled,
+        hash_mode=settings.builtin_redaction_hash_mode,
+    )
 
 
 def _system_prompt(tools: dict[str, dict], settings: Settings) -> str:

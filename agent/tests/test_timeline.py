@@ -93,3 +93,88 @@ def test_bad_details_never_raises() -> None:
     # details not a dict / wrong-typed inner values must degrade, not throw.
     r = CollectorResult(agent="loki", status="ok", summary="", details={"queries": "nope"})
     assert build_timeline([r]) == []
+
+
+def test_unavailable_collector_details_are_not_timeline_evidence() -> None:
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="unavailable",
+            summary="kubectl failed",
+            details={
+                "warning_events": [
+                    {
+                        "lastTimestamp": "2026-07-02T10:02:00Z",
+                        "reason": "Evicted",
+                        "message": "DiskPressure",
+                    },
+                ],
+            },
+        ),
+        CollectorResult(
+            agent="loki",
+            status="unavailable",
+            summary="loki failed",
+            details={
+                "queries": [
+                    {
+                        "name": "errors",
+                        "sample": [{"values": [["1782986460000000000", "CUDA error"]]}],
+                    },
+                ],
+            },
+        ),
+    ]
+    assert build_timeline(results) == []
+
+
+def test_timeline_masks_sensitive_messages_at_capture() -> None:
+    results = [
+        CollectorResult(
+            agent="loki",
+            status="ok",
+            summary="",
+            details={
+                "queries": [
+                    {
+                        "name": "errors",
+                        "sample": [
+                            {
+                                "values": [
+                                    [
+                                        "1782986460000000000",
+                                        "panic api_key=timeline-secret-12345",
+                                    ]
+                                ]
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+    ]
+
+    timeline = build_timeline(results)
+    serialized = str(timeline)
+
+    assert "timeline-secret-12345" not in serialized
+    assert "[MASKED]" in serialized
+    assert timeline[0]["message"] == "panic api_key=[MASKED]"
+
+
+def test_timeline_markdown_masks_and_folds_raw_entries() -> None:
+    md = to_markdown(
+        [
+            {
+                "timestamp": "2026-07-02T10:00:00Z",
+                "source": "loki",
+                "kind": "errors",
+                "message": "panic password=timeline-md-secret-12345\n## injected",
+            }
+        ]
+    )
+
+    assert "timeline-md-secret-12345" not in md
+    assert "[MASKED]" in md
+    assert "\n## injected" not in md
+    assert "## injected" in md

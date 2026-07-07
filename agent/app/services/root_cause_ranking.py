@@ -16,12 +16,12 @@ detail parsing (or an LLM judge) only if the eval hit-rate stalls.
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass, field
+from typing import Any
 
 from app.collectors.base import AnalysisTarget, CollectorResult
-from app.knowledge import load_family_catalog
+from app.knowledge import _keyword_hits, load_family_catalog
 
 _FAMILY_CATALOG = load_family_catalog(os.getenv("FAMILIES_FILE", "knowledge/families.yaml"))
 FAMILIES = _FAMILY_CATALOG.families
@@ -32,6 +32,7 @@ _FLOOR = 2.0          # min top score below which we fall back to insufficient_e
 _HIGH = 5.0           # score needed (with >=2 corroborating agents) for high confidence
 _MED = 2.5
 _CONF_ORDER = ("low", "medium", "high")
+_METADATA_VALUE_KEYS = {"expr", "expression", "metric", "metric_name", "name", "query"}
 
 
 @dataclass
@@ -84,7 +85,7 @@ def rank_root_cause_candidates(
             text = text_by_agent.get(agent, "")
             if not text:
                 continue
-            hits = sorted({kw for kw in keywords if kw in text})
+            hits = sorted(set(_keyword_hits(text, list(keywords))[0]))
             if not hits:
                 continue
             weight = 2.0 if agent == canonical else 1.0
@@ -193,28 +194,62 @@ def _insufficient(
 
 
 def _result_text(result: CollectorResult) -> str:
+    if not _collector_is_evidence(result):
+        return ""
     parts = [result.summary or ""]
     for art in result.artifacts:
+        if not _artifact_is_evidence(art):
+            continue
         if art.summary:
             parts.append(art.summary)
         if art.result is not None:
-            parts.append(_stringify(art.result))
+            parts.append(_leaf_text(art.result))
     if result.details:
-        parts.append(_stringify(result.details))
+        parts.append(_leaf_text(result.details))
     return " ".join(parts).lower()
 
 
-def _stringify(value: object) -> str:
-    try:
-        return json.dumps(value, default=str)
-    except (TypeError, ValueError):
-        return str(value)
+def _collector_is_evidence(result: CollectorResult) -> bool:
+    return result.status in ("ok", "partial")
+
+
+def _artifact_is_evidence(art: object) -> bool:
+    return getattr(art, "status", "") in ("ok", "partial")
+
+
+def _leaf_text(value: Any) -> str:
+    """Match evidence values, not JSON schema/key names."""
+    parts: list[str] = []
+
+    def walk(node: Any, key: str = "") -> None:
+        if node is None:
+            return
+        key_l = key.lower()
+        if isinstance(node, dict):
+            for child_key, child in node.items():
+                walk(child, str(child_key))
+        elif isinstance(node, (list, tuple)):
+            for child in node:
+                walk(child, key)
+        elif key_l in _METADATA_VALUE_KEYS:
+            return
+        elif key_l in {"xid", "xid_code", "nvidia_xid"}:
+            parts.append(f"xid {node}")
+        elif isinstance(node, (str, int, float, bool)):
+            parts.append(str(node))
+        else:
+            parts.append(str(node))
+
+    walk(value)
+    return " ".join(" ".join(parts).split())
 
 
 def _kg_blast_radius(results: list[CollectorResult]) -> tuple[int, set[str]]:
     best = 0
     agents: set[str] = set()
     for r in results:
+        if not _collector_is_evidence(r):
+            continue
         raw = r.details.get("blast_radius_workloads") or r.details.get("kg_blast_radius")
         if raw is None:
             continue

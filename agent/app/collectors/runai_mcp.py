@@ -14,11 +14,12 @@ endpoint (http://localhost:<port>/mcp).
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from app.collectors.base import AnalysisTarget
 from app.config import Settings
+from app.masking import build_masker
+from app.mcp_client import mcp_error, mcp_tool_json, mcp_tool_text
 
 
 async def gather_runai_via_mcp(
@@ -67,31 +68,27 @@ async def _call_api(
         result = await session.call_tool("call_runai_api", args)
         if getattr(result, "isError", False):
             return {"name": name, "query": query, "status_code": None,
-                    "error": _tool_text(result)[:300] or "tool error", "data": None}
+                    "error": mcp_error(result), "data": None}
         return {"name": name, "query": query, "status_code": 200, "error": None,
                 "data": _tool_json(result)}
     except Exception as exc:  # noqa: BLE001 - per-query failure is an observation
         return {"name": name, "query": query, "status_code": None,
-                "error": f"{exc.__class__.__name__}: {exc}", "data": None}
+                "error": _safe_text(f"{exc.__class__.__name__}: {exc}", limit=300), "data": None}
 
 
 def _tool_text(result: Any) -> str:
-    parts = []
-    for block in getattr(result, "content", None) or []:
-        text = getattr(block, "text", None)
-        if isinstance(text, str):
-            parts.append(text)
-    return "\n".join(parts)
+    return mcp_tool_text(result)
 
 
 def _tool_json(result: Any) -> Any:
-    blob = _tool_text(result).strip()
-    if not blob:
-        return {}
-    try:
-        return json.loads(blob)
-    except (ValueError, TypeError):
-        return {"raw": blob[:2000]}
+    return mcp_tool_json(result)
+
+
+def _safe_text(value: str, *, limit: int) -> str:
+    text = " ".join(build_masker(()).mask_text(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
 
 
 def _workload_params(target: AnalysisTarget) -> dict[str, str] | None:

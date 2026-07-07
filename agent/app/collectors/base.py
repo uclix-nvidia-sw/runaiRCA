@@ -81,11 +81,17 @@ def salient_markers(value: Any, *, limit: int = 6) -> list[str]:
         if len(found) >= limit:
             return
         if isinstance(node, str):
-            for match in SALIENT_PATTERN.findall(node):
-                key = match.lower().strip()
+            from app.knowledge import _keyword_negated
+
+            lowered = node.lower()
+            for match in SALIENT_PATTERN.finditer(node):
+                if _keyword_negated(lowered, match.start(), match.end()):
+                    continue
+                marker = match.group(0)
+                key = marker.lower().strip()
                 if key and key not in seen:
                     seen.add(key)
-                    found.append(match.strip())
+                    found.append(marker.strip())
                     if len(found) >= limit:
                         return
         elif isinstance(node, dict):

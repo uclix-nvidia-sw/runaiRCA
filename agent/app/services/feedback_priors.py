@@ -13,6 +13,8 @@ makes flat accumulation too blunt.
 
 from __future__ import annotations
 
+from app.knowledge import _keyword_hits
+
 # Family -> phrases that, in feedback text, point at that family. Reuses the
 # ranking vocabulary but tuned for human comments ("control plane", "GPU").
 _FAMILY_KEYWORDS: dict[str, tuple[str, ...]] = {
@@ -29,8 +31,11 @@ _FAMILY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "runai-backend", "backend", "authorization", "database",
     ),
     "workload_startup_error": (
-        "image pull", "imagepull", "crashloop", "oomkill", "startup",
-        "container", "registry", "image", "mount",
+        "crashloop", "oomkill", "startup", "container", "mount",
+    ),
+    "image_pull_error": (
+        "image pull", "imagepull", "errimagepull", "imagepullbackoff",
+        "registry", "image", "manifest",
     ),
     "gpu_hardware_error": (
         "gpu hardware", "gpu error", "xid", "ecc", "nvlink", "hardware",
@@ -59,7 +64,7 @@ def derive_priors(feedback_hints: list) -> dict[str, float]:
                 continue
             weight = _weight(_attr(hint, "weight"))
             text = (_attr(hint, "text") or "").lower()
-            for family in _families_in(text):
+            for family in _families_in(text, require_supported=direction > 0):
                 deltas[family] = deltas.get(family, 0.0) + direction * _STEP * weight
         except Exception:  # noqa: BLE001 — never raise into ranking
             continue
@@ -97,11 +102,16 @@ def _weight(raw: object) -> float:
     return min(w, 3.0)
 
 
-def _families_in(text: str) -> set[str]:
+def _families_in(text: str, *, require_supported: bool = False) -> set[str]:
     if not text:
         return set()
-    return {
-        fam
+    hits_by_family = {
+        fam: _keyword_hits(text, list(keywords))
         for fam, keywords in _FAMILY_KEYWORDS.items()
-        if any(kw in text for kw in keywords)
     }
+    if require_supported:
+        return {fam for fam, (hits, _negated) in hits_by_family.items() if hits}
+    negated = {fam for fam, (_hits, was_negated) in hits_by_family.items() if was_negated}
+    if negated:
+        return negated
+    return {fam for fam, (hits, _negated) in hits_by_family.items() if hits}

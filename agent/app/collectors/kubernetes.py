@@ -10,6 +10,7 @@ from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, ar
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import complete, llm_configured
+from app.masking import build_masker
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
     mcp_call,
@@ -28,7 +29,6 @@ _EXEC_ALLOWLIST: tuple[tuple[str, ...], ...] = (
     ("nvidia-smi", "-L"),
     ("nvidia-smi", "--query-gpu=name,memory.total,memory.used,utilization.gpu", "--format=csv"),
     ("cat", "/proc/driver/nvidia/version"),
-    ("env",),
     ("nproc",),
     ("uptime",),
 )
@@ -173,13 +173,16 @@ def kubectl_repr(kind: str, namespace: str = "", name: str = "", label_selector:
     """The read as the kubectl command an operator would have typed — artifacts
     show the REAL query shape ("kubectl get pods -n runai train-0"), not an
     internal param dump."""
-    parts = ["kubectl get", resolve_read_kind(kind) or str(kind)]
+    def quote_arg(value: str) -> str:
+        return shlex.quote(" ".join(str(value).split()))
+
+    parts = ["kubectl get", resolve_read_kind(kind) or quote_arg(kind)]
     if name:
-        parts.append(str(name))
+        parts.append(quote_arg(name))
     if namespace:
-        parts.append(f"-n {namespace}")
+        parts.append(f"-n {quote_arg(namespace)}")
     if label_selector:
-        parts.append(f"-l {label_selector}")
+        parts.append(f"-l {quote_arg(label_selector)}")
     return " ".join(parts)
 
 
@@ -218,10 +221,10 @@ async def k8s_read(
     prefix, namespaced = _READ_KINDS[resolved]
     parts = [prefix.rstrip("/")]
     if namespaced and namespace:
-        parts += ["namespaces", quote(namespace)]
+        parts += ["namespaces", quote(namespace, safe="")]
     parts.append(resolved)
     if name:
-        parts.append(quote(name))
+        parts.append(quote(name, safe=""))
     path = "/".join(parts)
     params: dict[str, str] = {}
     if not name:
@@ -343,7 +346,10 @@ def _apply_label_selector(data: object, selector: str) -> object:
         if any(op in part for op in ("!=", "!", "(", " in ", " notin ")) or "=" not in part:
             return data  # not pure equality — leave the server's result as-is
         key, _, value = part.partition("==") if "==" in part else part.partition("=")
-        terms[key.strip()] = value.strip()
+        key = key.strip()
+        if not key:
+            return data
+        terms[key] = value.strip()
     items = data if isinstance(data, list) else None
     if items is None and isinstance(data, dict) and isinstance(data.get("items"), list):
         items = data["items"]
@@ -965,9 +971,11 @@ async def resolve_live_pod_node(
         settings.kubernetes_ca_path if Path(settings.kubernetes_ca_path).exists() else True
     )
     try:
+        encoded_namespace = quote(namespace, safe="")
+        encoded_pod = quote(pod, safe="")
         response = await get_json(
             base_url=settings.kubernetes_api_url,
-            path=f"/api/v1/namespaces/{quote(namespace)}/pods/{quote(pod)}",
+            path=f"/api/v1/namespaces/{encoded_namespace}/pods/{encoded_pod}",
             timeout_seconds=settings.kubernetes_timeout_seconds,
             headers=headers,
             verify=verify,
@@ -981,7 +989,7 @@ async def resolve_live_pod_node(
         for name in names[:3]:
             events = await get_json(
                 base_url=settings.kubernetes_api_url,
-                path=f"/api/v1/namespaces/{quote(namespace)}/events",
+                path=f"/api/v1/namespaces/{encoded_namespace}/events",
                 timeout_seconds=settings.kubernetes_timeout_seconds,
                 params=_list_params(
                     settings, {"fieldSelector": f"involvedObject.name={name}"}
@@ -998,7 +1006,7 @@ async def resolve_live_pod_node(
 
         listing = await get_json(
             base_url=settings.kubernetes_api_url,
-            path=f"/api/v1/namespaces/{quote(namespace)}/pods",
+            path=f"/api/v1/namespaces/{encoded_namespace}/pods",
             timeout_seconds=settings.kubernetes_timeout_seconds,
             params=_list_params(settings),
             headers=headers,
@@ -1281,10 +1289,18 @@ async def _senior_insight(
     insight = await complete(
         settings,
         system=system,
-        user=str(user),
+        user=_collector_masker(settings).mask_text(str(user)),
         max_tokens=160,
     )
-    return insight or ""
+    return _collector_masker(settings).mask_text(insight or "")
+
+
+def _collector_masker(settings: Settings):
+    return build_masker(
+        settings.masking_regex_list,
+        builtin_enabled=settings.builtin_redaction_enabled,
+        hash_mode=settings.builtin_redaction_hash_mode,
+    )
 
 
 def _namespace_allowed(settings: Settings, namespace: str) -> bool:
@@ -1553,7 +1569,6 @@ async def k8s_followup(
             )
     for res in results:
         err = res.get("error")
-        loc = f" -n {res['namespace']}" if res.get("namespace") else ""
         kubernetes_result.artifacts.append(
             artifact(
                 agent="kubernetes",
@@ -1561,7 +1576,12 @@ async def k8s_followup(
                 type="followup_query",
                 status="unavailable" if err else "ok",
                 confidence="medium",
-                query=f"get {res.get('kind')}{loc}",
+                query=kubectl_repr(
+                    str(res.get("kind") or ""),
+                    namespace=str(res.get("namespace") or ""),
+                    name=str(res.get("name") or ""),
+                    label_selector=str(res.get("label_selector") or ""),
+                ),
                 summary=(
                     str(err)
                     if err

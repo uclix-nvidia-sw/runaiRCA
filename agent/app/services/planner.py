@@ -16,11 +16,20 @@ The LLM only refines what the deterministic pass already produced.
 from __future__ import annotations
 
 import logging
+import re
 
 from app.collectors.base import AnalysisTarget
 from app.config import Settings
-from app.knowledge import FamilyCatalog, load_family_catalog, load_runai_alerts, match_runai_alert
+from app.knowledge import (
+    FamilyCatalog,
+    _keyword_negated,
+    load_family_catalog,
+    load_runai_alerts,
+    match_failure_mode_symptoms,
+    match_runai_alert,
+)
 from app.llm import complete_json, llm_configured
+from app.masking import build_masker
 from app.plan import InvestigationPlan
 
 _log = logging.getLogger(__name__)
@@ -38,6 +47,22 @@ _CONTROL_PLANE_KEYWORDS = (
     "queue",
     "runai-backend",
 )
+_SIMILAR_STOPWORDS = {
+    "alert",
+    "and",
+    "error",
+    "failure",
+    "firing",
+    "gpu",
+    "namespace",
+    "old",
+    "pod",
+    "pods",
+    "run",
+    "runai",
+    "status",
+    "the",
+}
 
 def _is_runai_namespace(namespace: str) -> bool:
     ns = (namespace or "").lower()
@@ -151,15 +176,36 @@ def _node_first_hypotheses(
     return promoted + [h for h in hypotheses if h["family"] != node_family]
 
 
-def _best_similar(similar_incidents: list) -> object | None:
+def _best_similar(similar_incidents: list, alert_text: str = "") -> object | None:
     best = None
     best_sim = _SIMILARITY_FLOOR
     for item in similar_incidents or []:
         sim = getattr(item, "similarity", 0) or 0
-        if sim >= best_sim:
+        if sim >= best_sim and _similar_relevant(item, alert_text):
             best_sim = sim
             best = item
     return best
+
+
+def _similar_relevant(item: object, alert_text: str) -> bool:
+    prior_text = " ".join(
+        str(getattr(item, field, "") or "")
+        for field in ("title", "analysis_summary", "analysis_detail")
+    )
+    if not prior_text.strip() or not alert_text.strip():
+        return True
+    return bool(_similar_tokens(alert_text) & _similar_tokens(prior_text))
+
+
+def _similar_tokens(text: str) -> set[str]:
+    lowered = (text or "").lower()
+    return {
+        match.group(0)
+        for match in re.finditer(r"[a-z0-9]+", lowered)
+        if len(match.group(0)) > 2
+        and match.group(0) not in _SIMILAR_STOPWORDS
+        and not _keyword_negated(lowered, match.start(), match.end())
+    }
 
 
 def _ontology_match(kg_context, alert_text: str) -> bool:
@@ -177,13 +223,7 @@ def _ontology_match(kg_context, alert_text: str) -> bool:
     text = (alert_text or "").lower()
     if not text:
         return False
-    for symptoms in (kg_context.get("knowledge") or {}).values():
-        for symptom in symptoms or []:
-            if any(
-                str(kw).lower() in text for kw in (symptom.get("keywords") or [])
-            ):
-                return True
-    return False
+    return bool(match_failure_mode_symptoms(kg_context.get("knowledge") or {}, text))
 
 
 def _alert_haystack(target: AnalysisTarget, alert) -> str:
@@ -238,9 +278,10 @@ async def plan_investigation(
         hypotheses = [{"family": fam, "reason": reason}] + [
             h for h in hypotheses if h["family"] != fam
         ]
-    best_similar = _best_similar(similar_incidents)
+    alert_text = _alert_haystack(target, alert)
+    best_similar = _best_similar(similar_incidents, alert_text)
     used_similarity = best_similar is not None
-    used_ontology = _ontology_match(kg_context, _alert_haystack(target, alert))
+    used_ontology = _ontology_match(kg_context, alert_text)
 
     if used_similarity or used_ontology:
         strategy = "targeted"
@@ -404,7 +445,7 @@ async def _llm_refine(
     )
     if getattr(settings, "language", "en") == "ko":
         system += " Write the focus, reason, and narrative values in Korean."
-    user = (
+    user = _planner_masker(settings).mask_text(
         f"Alert: {target.alert_name}\n"
         f"Operator guidance: {guidance or '(none)'}\n"
         f"Namespace: {target.namespace} (scope: {_namespace_scope(target, settings)})  "
@@ -421,10 +462,11 @@ async def _llm_refine(
     if not data:
         return None
 
+    masker = _planner_masker(settings)
     focus = data.get("focus")
     strategy = data.get("strategy")
     narrative = data.get("narrative")
-    hypotheses = _coerce_hypotheses(data.get("hypotheses"))
+    hypotheses = _coerce_hypotheses(data.get("hypotheses"), masker)
 
     # Scope may only WIDEN, never narrow: when the LLM re-reasons the cause toward the
     # platform, it can turn control-plane reading ON, but it cannot switch off evidence
@@ -440,7 +482,9 @@ async def _llm_refine(
                 namespaces.append(ns)
 
     return InvestigationPlan(
-        focus=focus if isinstance(focus, str) and focus.strip() else plan.focus,
+        focus=_plan_text(masker, focus, limit=240)
+        if isinstance(focus, str) and focus.strip()
+        else plan.focus,
         namespaces=namespaces,
         node=plan.node,
         workload=plan.workload,
@@ -450,18 +494,38 @@ async def _llm_refine(
         strategy=strategy if strategy in ("targeted", "breadth_first") else plan.strategy,
         used_similarity=plan.used_similarity,
         used_ontology=plan.used_ontology,
-        narrative=narrative if isinstance(narrative, str) and narrative.strip() else plan.narrative,
+        narrative=_plan_text(masker, narrative, limit=800)
+        if isinstance(narrative, str) and narrative.strip()
+        else plan.narrative,
         matched_alert=plan.matched_alert,
     )
 
 
-def _coerce_hypotheses(value: object) -> list[dict[str, str]]:
+def _planner_masker(settings: Settings):
+    return build_masker(
+        settings.masking_regex_list,
+        builtin_enabled=settings.builtin_redaction_enabled,
+        hash_mode=settings.builtin_redaction_hash_mode,
+    )
+
+
+def _plan_text(masker, value: object, *, limit: int) -> str:
+    text = " ".join(masker.mask_text(str(value or "")).split())
+    return text[:limit]
+
+
+def _coerce_hypotheses(value: object, masker=None) -> list[dict[str, str]]:
     if not isinstance(value, list):
         return []
     out: list[dict[str, str]] = []
     for item in value:
         if isinstance(item, dict) and item.get("family"):
+            family = str(item["family"])
+            reason = str(item.get("reason", ""))
+            if masker is not None:
+                family = _plan_text(masker, family, limit=120)
+                reason = _plan_text(masker, reason, limit=360)
             out.append(
-                {"family": str(item["family"]), "reason": str(item.get("reason", ""))}
+                {"family": family, "reason": reason}
             )
     return out

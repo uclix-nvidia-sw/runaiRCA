@@ -3,9 +3,15 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from app.knowledge import load_runai_known_issues, match_runai_known_issues
+from app.collectors.base import CollectorResult, artifact
+from app.knowledge import (
+    load_failure_modes,
+    load_runai_known_issues,
+    match_failure_mode_symptoms,
+    match_runai_known_issues,
+)
 from app.schemas import Alert, AlertAnalysisRequest
-from app.services.pipeline import _known_issue_cause_lines, _numbered_actions
+from app.services.pipeline import _known_issue_cause_lines, _numbered_actions, _observed_text
 from app.services.root_cause_ranking import RankedCause
 
 CATALOG = "knowledge/runai_known_issues.yaml"
@@ -47,6 +53,123 @@ def test_cause_line_grounds_headline_with_version() -> None:
     assert "Locked hostPath Policy" in lines[0]
     assert "fixed in 2.23.60" in lines[0]
     assert _known_issue_cause_lines(catalog, "nothing relevant here", "en") == []
+
+
+def test_known_issue_signature_in_drilldown_result_is_observed() -> None:
+    catalog = load_runai_known_issues(CATALOG)
+    result = CollectorResult(agent="postgres", status="ok", summary="db drilldown ok")
+    result.artifacts.append(
+        artifact(
+            agent="postgres",
+            source="postgres",
+            type="drilldown_query",
+            status="ok",
+            confidence="medium",
+            summary="1 row(s)",
+            result={"rows": [{"log": "reclaim/reclaim.go:91 runtime/panic.go:785"}]},
+        )
+    )
+    request = AlertAnalysisRequest(
+        alert=Alert(status="firing", labels={"alertname": "SchedulerCrash"})
+    )
+    hits = match_runai_known_issues(catalog, _observed_text([result], request))
+    assert [h["issue"] for h in hits] == ["Scheduler Reclaim Panic On Large GPU Job"]
+
+
+def test_unavailable_artifact_signature_is_not_observed_evidence() -> None:
+    catalog = load_runai_known_issues(CATALOG)
+    result = CollectorResult(agent="postgres", status="ok", summary="db drilldown failed")
+    result.artifacts.append(
+        artifact(
+            agent="postgres",
+            source="postgres",
+            type="drilldown_query",
+            status="unavailable",
+            confidence="low",
+            summary="failed query mentioned reclaim/reclaim.go:91 runtime/panic.go:785",
+            result={"error": "reclaim/reclaim.go:91 runtime/panic.go:785"},
+        )
+    )
+    request = AlertAnalysisRequest(
+        alert=Alert(status="firing", labels={"alertname": "SchedulerCrash"})
+    )
+
+    assert match_runai_known_issues(catalog, _observed_text([result], request)) == []
+
+
+def test_unavailable_collector_summary_is_not_observed_evidence() -> None:
+    catalog = load_runai_known_issues(CATALOG)
+    result = CollectorResult(
+        agent="postgres",
+        status="unavailable",
+        summary=(
+            "failed before evidence; error mentioned reclaim/reclaim.go:91 "
+            "runtime/panic.go:785"
+        ),
+    )
+    request = AlertAnalysisRequest(
+        alert=Alert(status="firing", labels={"alertname": "SchedulerCrash"})
+    )
+
+    assert match_runai_known_issues(catalog, _observed_text([result], request)) == []
+
+
+def test_known_issue_signature_in_schema_or_doc_example_is_ignored() -> None:
+    catalog = load_runai_known_issues(CATALOG)
+    request = AlertAnalysisRequest(
+        alert=Alert(status="firing", labels={"alertname": "SchemaDiscovery"})
+    )
+    result = CollectorResult(agent="postgres", status="ok", summary="db schema discovery")
+    result.artifacts.append(
+        artifact(
+            agent="postgres",
+            source="postgres",
+            type="drilldown_query",
+            status="ok",
+            confidence="medium",
+            summary="schema rows",
+            result={
+                "schema": {
+                    "columns": [
+                        "created_by",
+                        "cache_max_store_size_mb",
+                        "runai_pod_info_unique",
+                    ]
+                },
+                "rows": [{"message": "docs example: administrator prohibited modifying item"}],
+            },
+        )
+    )
+    assert match_runai_known_issues(catalog, _observed_text([result], request)) == []
+
+
+def test_observed_artifact_keys_are_not_signature_evidence() -> None:
+    catalog = load_runai_known_issues(CATALOG)
+    failure_modes = load_failure_modes("knowledge/failure_modes.yaml")
+    request = AlertAnalysisRequest(
+        alert=Alert(status="firing", labels={"alertname": "SchemaDiscovery"})
+    )
+    result = CollectorResult(agent="postgres", status="ok", summary="metadata only")
+    result.artifacts.append(
+        artifact(
+            agent="postgres",
+            source="postgres",
+            type="drilldown_query",
+            status="ok",
+            confidence="medium",
+            summary="schema rows",
+            result={
+                "reclaim.go": False,
+                "reclaim": False,
+                "runai_pod_info_unique": None,
+                "rows": [{"status": "healthy"}],
+            },
+        )
+    )
+    observed = _observed_text([result], request)
+
+    assert match_runai_known_issues(catalog, observed) == []
+    assert match_failure_mode_symptoms(failure_modes, observed) == []
 
 
 def test_no_false_match() -> None:

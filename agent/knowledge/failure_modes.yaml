@@ -70,7 +70,7 @@
     # Ref: run-ai-docs.nvidia.com/self-hosted/platform-management/runai-scheduler/scheduling/concepts-and-principles
     - name: Reclaimed To Rebalance Fairshare
       component: runai-scheduler-default
-      keywords: [reclaim, reclaimed, reclaiming, fairshare, "fair share"]
+      keywords: [reclaim, reclaimed, reclaiming, fairshare, "fair share", "another project could use"]
       actions:
         - "The Run:ai scheduler reclaimed this workload's OVER-QUOTA GPUs to return them to a project that deserves them (deserved quota) or to rebalance fairshare across projects/departments. This inter-project reclaim is distinct from priority preemption and is expected Run:ai elasticity, not a fault. Read the Run:ai scheduler logs: `kubectl logs -n runai deploy/runai-scheduler-default` and grep the workload/project name for the reclaim decision."
         - "To keep GPUs stable, run the workload WITHIN the project's deserved (guaranteed, non-reclaimable) quota instead of over-quota."
@@ -242,7 +242,7 @@
         - "Recover the NVSwitch/NVLink coherent state: stop CUDA apps and the Fabric Manager service, run `nvidia-smi -r` to reset the GPUs, then restart Fabric Manager (per the Fabric Manager User Guide)."
         - "If it recurs, collect fabric/FM logs before rebooting and check GPU/NVSwitch fabric-state consistency (see NCCL issues #1562, #1672)."
     - name: NCCL Communication Failure
-      keywords: ["nccl warn", "nccl error", "unhandled system error", "nccl timeout", "watchdog caught collective operation timeout"]
+      keywords: ["nccl warn", "nccl error", "unhandled system error", "nccl timeout", "watchdog caught collective operation timeout", "nccl allreduce", "allreduce timed out", "ib fabric"]
       actions:
         - "A collective (AllReduce/broadcast) failed or timed out between ranks. Check whether ONE rank/pod died first (its failure cascades to every other rank as an NCCL timeout) — find the first failing pod, not the loudest."
         - "Validate inter-node connectivity on the compute fabric (IB/RoCE): `ibstat`, `ib_write_bw` between the involved nodes."
@@ -534,7 +534,7 @@
         - "Read the etcd static-pod logs (`crictl logs <etcd-container>`) for 'etcdserver: leader changed' / 'request timed out'; 'failed to send out heartbeat' / 'waiting for readindex response took too long' point at slow disk or CPU starvation — check `iostat -x 1`, give etcd dedicated SSD/NVMe."
         - "Restore quorum BEFORE touching workloads — bring the down member's node back, don't delete etcd data while degraded; verify apiserver-etcd-client cert validity (`kubeadm certs check-expiration`) if etcd rejects the apiserver."
     - name: Control-Plane / kubelet Certificate Expired
-      keywords: ["kubeadm certs check-expiration", "unable to load server certificate"]
+      keywords: ["kubeadm certs check-expiration", "unable to load server certificate", "client certificate has expired"]
       actions:
         - "A control-plane client/serving cert expired (or 'is not yet valid' = a node clock is BEHIND), so apiserver/controller-manager/scheduler/kubelet reject each other's TLS. On a control-plane node run `kubeadm certs check-expiration` to see which cert is past EXPIRES."
         - "Renew with `kubeadm certs renew all`, then restart the control-plane static pods (move manifests out/in of /etc/kubernetes/manifests, or `crictl rm` them) so they reload; refresh the admin kubeconfig with `kubeadm init phase kubeconfig admin`."
@@ -615,7 +615,7 @@
         - "List the tags that actually exist: `crane ls <repo>` or `skopeo list-tags docker://<repo>`, then fix `spec.containers[].image`; pin an immutable digest (`<repo>@sha256:...`) so a deleted/re-pushed tag can't reintroduce it."
         - "For 'no matching manifest for linux/arm64...' the tag is valid but has no layer for this node's CPU arch — inspect platforms with `docker buildx imagetools inspect <image:tag>`, then publish a multi-arch image or pin the pod to matching nodes with a `kubernetes.io/arch` nodeSelector."
     - name: Registry Server 5xx / DNS Lookup Failure On Pull
-      keywords: ["received unexpected http status: 5", "unexpected status: 503", "dial tcp: lookup", "server gave http response to https client"]
+      keywords: ["received unexpected http status: 5", "unexpected status: 503", "dial tcp: lookup", "no such host", "server gave http response to https client"]
       actions:
         - "For 'received unexpected HTTP status: 5xx': the registry is reachable and auth passed but returned 500/503 serving the manifest/blob — the registry itself is unhealthy/overloaded. A shared-registry 5xx fails EVERY node's pull, so expect broad correlated ImagePull failures; retry `crictl pull <image>` on a node once it recovers, else escalate to the registry owner."
         - "For 'dial tcp: lookup <registry> ... no such host': the NODE can't resolve the registry hostname (distinct from in-cluster pod DNS). Test node-level resolution on the scheduled node: `nslookup <registry-host>` / `getent hosts <registry-host>` (uses the node's /etc/resolv.conf, not CoreDNS); fix the node's upstream DNS or airgap hosts entry."

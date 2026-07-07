@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.collectors.base import AnalysisTarget, CollectorResult
+from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.services.root_cause_ranking import rank_root_cause_candidates
 
 
@@ -22,8 +22,20 @@ def _target(**overrides: str) -> AnalysisTarget:
     return AnalysisTarget(**base)
 
 
-def _r(agent: str, status: str = "ok", summary: str = "", details=None) -> CollectorResult:
-    return CollectorResult(agent=agent, status=status, summary=summary, details=details or {})
+def _r(
+    agent: str,
+    status: str = "ok",
+    summary: str = "",
+    details=None,
+    artifacts=None,
+) -> CollectorResult:
+    return CollectorResult(
+        agent=agent,
+        status=status,
+        summary=summary,
+        details=details or {},
+        artifacts=artifacts or [],
+    )
 
 
 def test_r1_node_pressure_wins_with_blast_radius() -> None:
@@ -91,6 +103,24 @@ def test_scheduler_pod_name_does_not_elevate_control_plane() -> None:
     assert ranked[0].family != "runai_control_plane_error"
 
 
+def test_normal_or_negated_keyword_mentions_do_not_rank_as_causes() -> None:
+    results = [
+        _r(
+            "kubernetes",
+            summary=(
+                "kubelet healthy; no DiskPressure; no CrashLoopBackOff; "
+                "no ImagePullBackOff; no FailedScheduling"
+            ),
+        ),
+        _r(
+            "loki",
+            summary="registry connectivity ok; no pull access denied; no reconcile errors",
+        ),
+    ]
+    ranked = rank_root_cause_candidates(_target(alert_name="NoisyHealthCheck"), results, top_n=5)
+    assert [candidate.family for candidate in ranked] == ["insufficient_evidence"]
+
+
 def test_r6_insufficient_evidence_when_nothing_corroborates() -> None:
     results = [
         _r("kubernetes", status="unavailable", summary="kubernetes API not configured"),
@@ -99,3 +129,94 @@ def test_r6_insufficient_evidence_when_nothing_corroborates() -> None:
     ]
     ranked = rank_root_cause_candidates(_target(), results)
     assert ranked[0].family == "insufficient_evidence"
+
+
+def test_unavailable_collector_summary_does_not_rank_as_evidence() -> None:
+    results = [
+        _r(
+            "kubernetes",
+            status="unavailable",
+            summary="kubectl unavailable; stale note mentioned DiskPressure and evicted pods",
+        ),
+        _r("loki", summary="workload logs nominal"),
+    ]
+    ranked = rank_root_cause_candidates(_target(), results)
+    assert ranked[0].family == "insufficient_evidence"
+
+
+def test_unavailable_artifact_result_does_not_rank_as_evidence() -> None:
+    results = [
+        _r(
+            "kubernetes",
+            summary="pod events unavailable",
+            artifacts=[
+                artifact(
+                    agent="kubernetes",
+                    source="kubernetes",
+                    type="events",
+                    status="unavailable",
+                    confidence="low",
+                    summary="query failed",
+                    result={"message": "DiskPressure=True; pods evicted"},
+                )
+            ],
+        ),
+        _r("loki", summary="workload logs nominal"),
+    ]
+    ranked = rank_root_cause_candidates(_target(), results)
+    assert ranked[0].family == "insufficient_evidence"
+
+
+def test_result_json_keys_do_not_rank_as_evidence() -> None:
+    results = [
+        _r(
+            "kubernetes",
+            summary="structured payload had no failure values",
+            details={
+                "DiskPressure": None,
+                "CrashLoopBackOff": False,
+                "FailedScheduling": [],
+                "quota": {"hard": None},
+            },
+        ),
+        _r("loki", summary="logs nominal"),
+    ]
+    ranked = rank_root_cause_candidates(_target(alert_name="StructuredPayload"), results)
+    assert ranked[0].family == "insufficient_evidence"
+
+
+def test_empty_metric_query_metadata_does_not_rank_as_evidence() -> None:
+    results = [
+        _r(
+            "prometheus",
+            status="partial",
+            summary=(
+                f"{NO_EVIDENCE} Prometheus is reachable, but the workload metric queries "
+                "returned no series."
+            ),
+            details={
+                "queries": [
+                    {
+                        "name": "queue_quota_saturation",
+                        "query": "sum(runai_queue_gpu_quota) by (queue)",
+                        "metric": "runai_queue_gpu_quota",
+                        "expr": "runai_queue_gpu_quota > 0",
+                        "samples": [],
+                    }
+                ]
+            },
+        )
+    ]
+
+    ranked = rank_root_cause_candidates(_target(alert_name="SparseMetrics"), results)
+    assert ranked[0].family == "insufficient_evidence"
+
+
+def test_unavailable_blast_radius_does_not_upgrade_node_pressure() -> None:
+    results = [
+        _r("kubernetes", summary="Node gpu-node-17 condition DiskPressure=True; pods evicted"),
+        _r("typedb", status="unavailable", summary="kg offline", details={"kg_blast_radius": 3}),
+    ]
+    ranked = rank_root_cause_candidates(_target(), results)
+    assert ranked[0].family == "node_kubelet_pressure"
+    assert ranked[0].confidence == "medium"

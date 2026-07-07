@@ -10,6 +10,7 @@ import pytest
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 
+from app import mcp_client
 from app.collectors.kubernetes import KubernetesCollector
 from app.collectors.loki import LokiCollector
 from app.collectors.postgres import PostgresCollector
@@ -143,6 +144,67 @@ def _fake_datasource_mcp() -> FastMCP:
         return []
 
     return mcp
+
+
+class _Result:
+    def __init__(
+        self,
+        *,
+        text: str = "",
+        structured: object = None,
+        is_error: bool = False,
+    ) -> None:
+        self.content = [type("Block", (), {"text": text})()] if text else []
+        self.structuredContent = structured
+        self.isError = is_error
+
+
+def test_mcp_error_and_fallback_messages_are_masked_and_folded() -> None:
+    text = mcp_client.mcp_tool_text(
+        _Result(text="line one password=mcp-text-secret-12345\nline two")
+    )
+    warning = mcp_client.mcp_fallback_warning(
+        RuntimeError("gateway failed api_key=mcp-fallback-secret-12345\n## injected")
+    )
+    error = mcp_client.mcp_error(
+        _Result(
+            text="tool failed password=mcp-error-secret-12345\n## injected",
+            is_error=True,
+        )
+    )
+
+    joined = f"{text}\n{warning}\n{error}"
+    assert "mcp-text-secret-12345" not in joined
+    assert "mcp-fallback-secret-12345" not in joined
+    assert "mcp-error-secret-12345" not in joined
+    assert "line one password=[MASKED]\nline two" in text
+    assert "\n## injected" not in joined
+    assert "[MASKED]" in joined
+
+
+def test_mcp_tool_json_masks_structured_and_raw_text() -> None:
+    structured = mcp_client.mcp_tool_json(
+        _Result(structured={"message": "ok", "api_key": "mcp-structured-secret-12345"})
+    )
+    text_json = mcp_client.mcp_tool_json(
+        _Result(
+            text='{"message":"ok","access_token":"mcp-json-secret-12345",'
+            '"nested":{"password":"mcp-nested-secret-12345"}}'
+        )
+    )
+    raw = mcp_client.mcp_tool_json(
+        _Result(text="not-json token=mcp-raw-secret-12345\n## injected")
+    )
+
+    assert structured == {"message": "ok", "api_key": "[MASKED]"}
+    assert text_json == {
+        "message": "ok",
+        "access_token": "[MASKED]",
+        "nested": {"password": "[MASKED]"},
+    }
+    assert "mcp-raw-secret-12345" not in raw["raw"]
+    assert "\n## injected" not in raw["raw"]
+    assert "[MASKED]" in raw["raw"]
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,7 @@ import pytest
 
 from app.collectors.base import AnalysisTarget, CollectorResult
 from app.llm import begin_usage_tracking
+from app.schemas import AlertAnalysisArtifact
 from app.services import drilldown
 from app.services.drilldown import _tool_runai_get, run_drilldowns
 from tests.test_orchestrator import make_settings
@@ -92,6 +93,98 @@ def test_drilldown_appends_tagged_artifacts_and_stops_on_done(monkeypatch) -> No
     assert result.artifacts[0].status == "ok"
 
 
+def test_drilldown_prompts_redact_sensitive_evidence(monkeypatch) -> None:
+    prompts: list[str] = []
+    decisions = iter(
+        [
+            {
+                "action": "query",
+                "queries": [{"tool": "k8s_read", "args": {"kind": "pods"}}],
+            },
+            {"action": "done"},
+        ]
+    )
+
+    async def fake_complete_json(settings, *, user, **_kwargs):
+        prompts.append(user)
+        return next(decisions)
+
+    async def fake_k8s_read(settings, kind, **kwargs):
+        return {
+            "kind": kind,
+            "query": "kubectl get pods",
+            "summary": "api_key=tool-key-12345",
+            "result": {"data": "password=tool-password-12345"},
+        }
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
+    result = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="DiskPressure=True token=summary-token-12345",
+    )
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
+
+    joined = "\n".join(prompts)
+    for secret in ["summary-token-12345", "tool-key-12345", "tool-password-12345"]:
+        assert secret not in joined
+    assert "[MASKED]" in joined
+    artifact_text = str(result.artifacts[0].__dict__)
+    assert "tool-key-12345" not in artifact_text
+    assert "tool-password-12345" not in artifact_text
+    assert "[MASKED]" in artifact_text
+
+
+def test_drilldown_prompt_includes_prior_artifact_result() -> None:
+    result = CollectorResult(
+        agent="runai",
+        status="ok",
+        summary="Run:ai collector returned workload metadata.",
+        artifacts=[
+            AlertAnalysisArtifact(
+                agent="runai",
+                source="runai",
+                type="workload",
+                status="ok",
+                summary="metadata rows",
+                result={
+                    "component": "pod-group-controller",
+                    "condition": "stale gang phase",
+                },
+            )
+        ],
+    )
+
+    prompt = drilldown._user_prompt(result, _target(), None, [], [])
+
+    assert "pod-group-controller" in prompt
+    assert "stale gang phase" in prompt
+
+
+def test_drilldown_prompt_skips_unavailable_artifact_result() -> None:
+    result = CollectorResult(
+        agent="runai",
+        status="ok",
+        summary="Run:ai collector returned workload metadata.",
+        artifacts=[
+            AlertAnalysisArtifact(
+                agent="runai",
+                source="runai",
+                type="workload",
+                status="unavailable",
+                summary="failed query mentioned pod-group-controller",
+                result={"error": "pod-group-controller stale gang phase"},
+            )
+        ],
+    )
+
+    prompt = drilldown._user_prompt(result, _target(), None, [], [])
+
+    assert "pod-group-controller" not in prompt
+    assert "stale gang phase" not in prompt
+
+
 def test_loop_is_bounded_by_max_steps_and_queries_per_step(monkeypatch) -> None:
     llm_calls = [0]
     tool_calls = [0]
@@ -158,6 +251,20 @@ def test_tool_scoping_is_structural(monkeypatch) -> None:
     assert drilled_agents == ["kubernetes"]
 
 
+def test_cross_domain_drilldown_query_is_visible_in_warnings(monkeypatch) -> None:
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
+        return {
+            "action": "query",
+            "queries": [{"tool": "runai_get", "args": {"path": "/api/v1/workloads"}}],
+        }
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    result = _k8s_result()
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
+    assert result.artifacts == []
+    assert any("no allowed read-only query" in warning for warning in result.warnings)
+
+
 def test_unavailable_collectors_are_skipped(monkeypatch) -> None:
     calls = [0]
 
@@ -194,6 +301,41 @@ def test_tool_failure_becomes_observation_not_crash(monkeypatch) -> None:
     assert "apiserver exploded" in (result.artifacts[0].summary or "")
 
 
+def test_failed_tool_result_is_not_replayed_as_next_prompt_evidence(monkeypatch) -> None:
+    prompts: list[str] = []
+    decisions = iter(
+        [
+            {"action": "query", "queries": [{"tool": "k8s_read", "args": {"kind": "pods"}}]},
+            {"action": "done"},
+        ]
+    )
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
+        prompts.append(user)
+        return next(decisions)
+
+    async def exploding_tool(call, settings, target, args):
+        return {
+            "query": "kubectl get pods",
+            "summary": "query failed; stale output mentioned DiskPressure",
+            "error": "query failed; stale output mentioned DiskPressure",
+            "result": {"message": "DiskPressure=True; pods evicted"},
+        }
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "_call_tool_safely", exploding_tool)
+    result = CollectorResult(agent="kubernetes", status="ok", summary="base evidence")
+
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
+
+    assert len(prompts) == 2
+    assert "DiskPressure" not in prompts[1]
+    assert "pods evicted" not in prompts[1]
+    assert "query failed" in prompts[1]
+    assert result.artifacts[0].status == "unavailable"
+    assert not result.artifacts[0].highlights
+
+
 def test_runai_get_tool_refuses_non_api_paths(monkeypatch) -> None:
     mcp_calls = [0]
 
@@ -205,6 +347,32 @@ def test_runai_get_tool_refuses_non_api_paths(monkeypatch) -> None:
     settings = drill_settings(runai_mcp_url="http://localhost:8809/mcp")
     outcome = asyncio.run(_tool_runai_get(settings, _target(), {"path": "/auth/token"}))
     assert outcome["error"] and "GET" in outcome["error"]
+    assert mcp_calls[0] == 0
+
+
+def test_runai_get_tool_refuses_path_traversal_and_inline_query(monkeypatch) -> None:
+    mcp_calls = [0]
+
+    async def fake_mcp_call(settings, tool, arguments):
+        mcp_calls[0] += 1
+        raise AssertionError("must not be reached")
+
+    monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
+    settings = drill_settings(runai_mcp_url="http://localhost:8809/mcp")
+    for path in (
+        "/api/../auth/token",
+        "/api/%2e%2e/auth/token",
+        "/api/v1/./workloads",
+        "/api/v1/workloads?x=y",
+        "/api/v1/workloads%0a/api/v1/projects",
+        "/api/v1/workloads%2Fsecret",
+        "/api/%252e%252e/auth/token",
+        "/api/%252Fsecret",
+        "/api/v1/%255csecret",
+        "/api/v1/workloads%250aGET",
+    ):
+        outcome = asyncio.run(_tool_runai_get(settings, _target(), {"path": path}))
+        assert outcome["error"] and "GET" in outcome["error"]
     assert mcp_calls[0] == 0
 
 
@@ -236,15 +404,104 @@ def test_runai_get_tool_locks_method_to_get(monkeypatch) -> None:
     assert outcome["error"] is None
 
 
+def test_runai_get_tool_urlencodes_display_query(monkeypatch) -> None:
+    class _Result:
+        isError = False
+        content = []
+
+    async def fake_mcp_call(settings, tool, arguments):
+        return _Result()
+
+    monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
+    settings = drill_settings(runai_mcp_url="http://localhost:8809/mcp")
+    outcome = asyncio.run(
+        _tool_runai_get(
+            settings,
+            _target(),
+            {
+                "path": "/api/v1/workloads",
+                "query": {
+                    "name": "trainer&includeSecrets=true",
+                    "newline": "ok\nGET /api/delete",
+                },
+            },
+        )
+    )
+    assert "includeSecrets=true" not in outcome["query"]
+    assert "\n" not in outcome["query"]
+    assert "trainer%26includeSecrets%3Dtrue" in outcome["query"]
+
+
+def test_runai_search_tool_masks_text_result_and_error(monkeypatch) -> None:
+    class _Result:
+        def __init__(self, text: str, *, is_error: bool = False) -> None:
+            self.isError = is_error
+            self.content = [type("Block", (), {"text": text})()]
+
+    calls = iter(
+        [
+            _Result("GET /api/v1/workloads api_key=search-secret-12345\n## injected"),
+            _Result("tool failed password=search-error-secret-12345\n## injected", is_error=True),
+        ]
+    )
+
+    async def fake_mcp_call(settings, tool, arguments):
+        return next(calls)
+
+    monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
+    settings = drill_settings(runai_mcp_url="http://localhost:8809/mcp")
+
+    ok = asyncio.run(drilldown._tool_runai_search(settings, _target(), {"query": "workloads"}))
+    failed = asyncio.run(
+        drilldown._tool_runai_search(settings, _target(), {"query": "workloads"})
+    )
+
+    rendered = str([ok, failed])
+    assert "search-secret-12345" not in rendered
+    assert "search-error-secret-12345" not in rendered
+    assert "\n## injected" not in rendered
+    assert "[MASKED]" in rendered
+
+
+def test_runai_get_tool_masks_text_json_result(monkeypatch) -> None:
+    class _Result:
+        isError = False
+        content = [
+            type(
+                "Block",
+                (),
+                {
+                    "text": '{"access_token":"get-secret-12345",'
+                    '"nested":{"password":"nested-get-secret-12345"}}'
+                },
+            )()
+        ]
+
+    async def fake_mcp_call(settings, tool, arguments):
+        return _Result()
+
+    monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
+    settings = drill_settings(runai_mcp_url="http://localhost:8809/mcp")
+
+    outcome = asyncio.run(_tool_runai_get(settings, _target(), {"path": "/api/v1/workloads"}))
+
+    assert outcome["result"] == {
+        "access_token": "[MASKED]",
+        "nested": {"password": "[MASKED]"},
+    }
+
+
 @pytest.mark.asyncio
 async def test_never_raises_even_if_llm_layer_explodes(monkeypatch) -> None:
     async def broken_complete_json(settings, *, system, user, temperature=0.1, model=None):
-        raise RuntimeError("llm gateway down")
+        raise RuntimeError("llm gateway down password=drilldown-llm-secret-12345")
 
     monkeypatch.setattr(drilldown, "complete_json", broken_complete_json)
     result = _k8s_result()
     await run_drilldowns(drill_settings(), [result], _target(), None)
     assert result.artifacts == []
+    assert any("llm gateway down" in warning for warning in result.warnings)
+    assert "drilldown-llm-secret-12345" not in " ".join(result.warnings)
 
 
 def test_salient_markers_scan_only_string_leaves() -> None:
@@ -260,6 +517,16 @@ def test_salient_markers_scan_only_string_leaves() -> None:
     assert "CrashLoopBackOff" in markers
     assert any("Xid" in m for m in markers)
     assert salient_markers({"status": {"phase": "Running"}, "error": None}) == []
+
+
+def test_salient_markers_ignore_negated_signals() -> None:
+    from app.collectors.base import salient_markers
+
+    assert salient_markers({"status": "no ImagePullBackOff; registry is fine"}) == []
+    assert salient_markers({"status": "CrashLoopBackOff not observed; pod running"}) == []
+    assert salient_markers({"status": "ImagePullBackOff observed on trainer"}) == [
+        "ImagePullBackOff"
+    ]
 
 
 def test_k8s_tool_reports_kubectl_command_title_and_highlights(monkeypatch) -> None:
@@ -308,11 +575,42 @@ def test_sql_validate_select_is_fail_closed() -> None:
     assert ok is None and sql.endswith("name = 'x'")
     assert _validate_select("")[0]
     assert _validate_select("DELETE FROM workloads")[0]
+    assert _validate_select("SELECT * INTO scratch_copy FROM workloads")[0]
+    assert _validate_select("SELECT pg_sleep(60)")[0]
+    assert _validate_select("SELECT pg_terminate_backend(pid) FROM pg_stat_activity")[0]
+    assert _validate_select("SELECT lo_export(123, '/tmp/x')")[0]
+    assert _validate_select("SELECT nextval('workloads_id_seq')")[0]
+    assert _validate_select("SELECT pg_advisory_lock(42)")[0]
+    assert _validate_select("SELECT pg_notify('chan', 'msg')")[0]
+    assert _validate_select("SELECT pg_read_file('/etc/passwd')")[0]
+    assert _validate_select("SELECT * FROM dblink('host=other', 'SELECT 1') AS t(x int)")[0]
+    assert _validate_select("SELECT * FROM pg_ls_waldir()")[0]
     assert _validate_select("SELECT 1; DROP TABLE workloads")[0]
     assert _validate_select("WITH x AS (SELECT 1) INSERT INTO y SELECT * FROM x")[0]
     assert _validate_select("EXPLAIN SELECT 1")[0]  # not SELECT/WITH-leading
     # column names containing forbidden words as substrings are fine
     assert _validate_select("SELECT created_at, updated_at FROM audit")[0] is None
+
+
+def test_sql_validate_select_ignores_literals_but_rejects_comments() -> None:
+    from app.services.drilldown import _validate_select
+
+    ok, sql = _validate_select(
+        "SELECT id FROM audit WHERE message = 'delete;   still text' "
+        "AND raw = $$DROP TABLE workloads;$$;"
+    )
+    assert ok is None
+    assert "'delete;   still text'" in sql
+    assert "$$DROP TABLE workloads;$$" in sql
+    assert _validate_select("SELECT id FROM workloads -- hide the rest")[0]
+    assert _validate_select("SELECT id FROM workloads /* hide the rest */")[0]
+
+
+def test_sql_validate_select_rejects_quoted_dangerous_functions() -> None:
+    from app.services.drilldown import _validate_select
+
+    assert _validate_select('SELECT "pg_sleep"(60)')[0]
+    assert _validate_select('SELECT pg_catalog."pg_read_file"(\'/etc/passwd\')')[0]
 
 
 def test_sql_tool_targets_runai_db_and_appends_limit(monkeypatch) -> None:
@@ -344,6 +642,32 @@ def test_sql_tool_targets_runai_db_and_appends_limit(monkeypatch) -> None:
     assert captured["dsn"] == "postgres://ro@runai-db/runai"
     assert captured["sql"] == "SELECT id FROM workloads LIMIT 50"
     assert result.artifacts[0].query == "SELECT id FROM workloads LIMIT 50"
+
+
+def test_sql_tool_only_trusts_trailing_limit(monkeypatch) -> None:
+    captured: dict = {}
+
+    async def fake_run_select(dsn, sql, timeout):
+        captured["sql"] = sql
+        return [{"id": 1}]
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
+        return {
+            "action": "query",
+            "queries": [
+                {
+                    "tool": "sql_select",
+                    "args": {"query": "SELECT id FROM workloads WHERE note = 'limit 1'"},
+                }
+            ],
+        }
+
+    monkeypatch.setattr(drilldown, "_run_select", fake_run_select)
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    settings = drill_settings(runai_db_dsn="postgres://ro@runai-db/runai")
+    result = CollectorResult(agent="postgres", status="ok", summary="db health ok")
+    asyncio.run(run_drilldowns(settings, [result], _target(), None))
+    assert captured["sql"] == "SELECT id FROM workloads WHERE note = 'limit 1' LIMIT 50"
 
 
 def test_postgres_agent_has_no_sql_tool_without_any_dsn(monkeypatch) -> None:

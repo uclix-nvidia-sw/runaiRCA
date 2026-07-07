@@ -15,6 +15,7 @@ from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, re
 from app.collectors.registry import build_collectors
 from app.config import Settings
 from app.knowledge import (
+    _keyword_negated,
     component_check_lines,
     load_architecture,
     load_failure_modes,
@@ -219,7 +220,10 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
         state.progress.emit("collection", "Gathering collector evidence")
         state.results = list(
             await asyncio.gather(
-                *(_collect_safely(collector, target, plan) for collector in state.collectors)
+                *(
+                    _collect_safely(collector, target, plan, state.masker)
+                    for collector in state.collectors
+                )
             )
         )
         state.progress.emit(
@@ -401,7 +405,6 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
     else:
         state.timeline = build_timeline(state.results)
     state.quality = _quality_from(state.results)
-    state.summary = _summary_from(request, state.results, state.root_cause_candidates)
     # Adversarial precision: LLM-verify signature/keyword matches (known issues,
     # failure-mode symptoms, GPU XIDs) and drop ones the evidence doesn't support.
     # Best-effort + LLM-gated: with no LLM nothing is suppressed. (failure_modes /
@@ -417,6 +420,9 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         if ki_matches:
             refuted = await verify_known_issues(settings, ki_matches, state.results)
             if refuted:
+                state.root_cause_candidates = _drop_refuted_signature_candidates(
+                    state.root_cause_candidates, refuted
+                )
                 state.known_issues = [
                     k for k in state.known_issues if k.get("issue") not in refuted
                 ]
@@ -439,6 +445,9 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                 settings, ev_candidates, state.results, subject="matched symptom or GPU XID"
             )
             if refuted:
+                state.root_cause_candidates = _drop_refuted_signature_candidates(
+                    state.root_cause_candidates, refuted
+                )
                 state.failure_modes = {
                     fam: [s for s in syms if s.get("symptom") not in refuted]
                     for fam, syms in state.failure_modes.items()
@@ -451,6 +460,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                             continue
                         state.graph_fixes.xid_fixes.pop(code, None)
                         state.graph_fixes.root_xids.pop(code, None)
+    state.summary = _summary_from(request, state.results, state.root_cause_candidates)
     playbook_fallback = load_troubleshooting_cases(settings.troubleshooting_cases_file)
     state.detail = _detail_from(
         request,
@@ -466,6 +476,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         language=getattr(settings, "language", "en"),
         known_issues=state.known_issues,
         components=load_architecture(settings.architecture_file),
+        masker=state.masker,
     )
     # Korean LLM synthesis (preferred when language == "ko" and LLM configured):
     # rewrite summary + detail grounded STRICTLY in the evidence just gathered.
@@ -728,6 +739,20 @@ async def _synthesize_korean(
     """
     from app.collectors.http_json import compact
 
+    observed_text = _observed_text(results, request)
+    similar_incidents = (
+        [
+            {
+                "incident_id": i.incident_id,
+                "similarity": i.similarity,
+                "analysis_summary": i.analysis_summary or i.title,
+            }
+            for i in request.similar_incidents
+            if (i.similarity or 0) >= _SIMILARITY_FLOOR
+        ]
+        if _similar_incident_relevant(request, observed_text)
+        else []
+    )
     evidence = {
         "alert": {
             "name": request.alert.labels.get("alertname"),
@@ -741,7 +766,19 @@ async def _synthesize_korean(
                 "agent": r.agent,
                 "status": r.status,
                 "confidence": r.confidence,
-                "summary": r.summary,
+                "summary": r.summary if _collector_is_evidence(r) else NO_EVIDENCE,
+                "artifacts": [
+                    {
+                        "type": art.type,
+                        "title": art.title,
+                        "status": art.status,
+                        "query": art.query,
+                        "summary": art.summary,
+                        "highlights": art.highlights,
+                        "result": art.result,
+                    }
+                    for art in [a for a in r.artifacts if _artifact_is_evidence(a)][-3:]
+                ],
             }
             for r in results
         ],
@@ -752,19 +789,11 @@ async def _synthesize_korean(
         },
         "graph_remediation": graph_fixes.as_dict(),
         "matched_alert": plan.matched_alert,
-        "similar_incidents": [
-            {
-                "incident_id": i.incident_id,
-                "similarity": i.similarity,
-                "analysis_summary": i.analysis_summary or i.title,
-            }
-            for i in request.similar_incidents
-            if (i.similarity or 0) >= _SIMILARITY_FLOOR
-        ],
+        "similar_incidents": similar_incidents,
     }
     operator_guidance = (request.alert.annotations or {}).get("operator_prompt", "")
     if operator_guidance:
-        evidence["operator_guidance"] = operator_guidance
+        evidence["operator_guidance"] = _short_sentence(str(operator_guidance), limit=500)
     system = (
         "당신은 NVIDIA Run:ai GPU 플랫폼을 담당하는 시니어 SRE입니다. 제공된 증거(수집기별 "
         "발견 사항, 조사 계획, 순위가 매겨진 원인 후보, 지식 그래프/함수 기반 조치, 매칭된 "
@@ -790,7 +819,8 @@ async def _synthesize_korean(
         '- 반드시 JSON 객체 하나로만 응답하세요: {"summary": <한국어 한 문장: 문제+원인 요약>, '
         '"detail": <위 구조의 한국어 마크다운 본문>}'
     )
-    user = "증거(JSON):\n" + json.dumps(compact(evidence, limit=8), ensure_ascii=False, default=str)
+    safe_evidence = _build_settings_masker(settings).mask_object(compact(evidence, limit=8))
+    user = "증거(JSON):\n" + json.dumps(safe_evidence, ensure_ascii=False, default=str)
     try:
         data = await _complete_synthesis_json(settings, system=system, user=user)
     except Exception:  # noqa: BLE001 - synthesis is best-effort; keep deterministic report
@@ -857,20 +887,21 @@ def _quality_from(results: list[CollectorResult]) -> str:
 
 
 async def _collect_safely(
-    collector: object, target: object, plan: object = None
+    collector: object, target: object, plan: object = None, masker: Masker | None = None
 ) -> CollectorResult:
     try:
         return await collector.collect(target, plan)  # type: ignore[attr-defined]
     except Exception as exc:
         agent = _collector_name(collector)
+        error = _masked_exception_text(exc, masker)
         return CollectorResult(
             agent=agent,
             status="unavailable",
             summary=f"{agent} collector failed unexpectedly before returning evidence.",
             confidence="low",
-            details={"error": f"{type(exc).__name__}: {exc}"},
+            details={"error": error},
             missing_data=[f"{agent}.collector_exception"],
-            warnings=[_unexpected_runtime_warning(agent, exc)],
+            warnings=[_unexpected_runtime_warning(agent, exc, masker)],
         )
 
 
@@ -882,8 +913,15 @@ def _collector_name(collector: object) -> str:
     return normalized.replace("_a_i", "ai") or "collector"
 
 
-def _unexpected_runtime_warning(component: str, exc: Exception) -> str:
-    return f"{component} failed unexpectedly: {type(exc).__name__}: {exc}"
+def _unexpected_runtime_warning(
+    component: str, exc: Exception, masker: Masker | None = None
+) -> str:
+    return f"{component} failed unexpectedly: {_masked_exception_text(exc, masker)}"
+
+
+def _masked_exception_text(exc: Exception, masker: Masker | None = None) -> str:
+    active_masker = masker or build_masker(())
+    return active_masker.mask_text(f"{type(exc).__name__}: {exc}")
 
 
 
@@ -954,6 +992,7 @@ def _detail_from(
     language: str = "en",
     known_issues: list[dict] | None = None,
     components: dict[str, dict] | None = None,
+    masker: Masker | None = None,
 ) -> str:
     """Problem -> Root Cause -> Recommended Actions, then everything else in an
     appendix. Sections 1-3 are the ~1-page report an operator (or a Word export)
@@ -1033,7 +1072,7 @@ def _detail_from(
     # --- 4. Appendix (full evidence trail; children demoted to ###) -----------
     lines.extend(["", h["appendix"], "", "### Evidence", ""])
     for result in results:
-        lines.append(f"- **{result.agent}**: {_best_evidence_line(result)}")
+        lines.append(f"- **{result.agent}**: {_appendix_evidence_line(result)}")
     lines.extend(_investigation_plan_lines(plan))
     lines.extend(
         _knowledge_base_lines(
@@ -1041,11 +1080,20 @@ def _detail_from(
             root_cause_candidates,
             _observed_text(results, request),
             _alert_text(request),
+            masker,
         )
     )
     operator_prompt = annotations.get("operator_prompt")
     if operator_prompt:
-        lines.extend(["", "### Operator Guidance", "", operator_prompt])
+        active_masker = masker or build_masker(())
+        lines.extend(
+            [
+                "",
+                "### Operator Guidance",
+                "",
+                _short_sentence(active_masker.mask_text(str(operator_prompt)), limit=500),
+            ]
+        )
     # ponytail: no "Agent Role Coverage" section — it was the same static
     # collector-catalog text in every report, telling the operator nothing about
     # THIS incident. (Kept in prompts.py for the NAT workflow's system prompt.)
@@ -1062,6 +1110,7 @@ def _detail_from(
             known_issues or [],
             _alert_text(request),
             components,
+            masker,
         )
     )
     lines.extend(_similar_incident_lines(request))
@@ -1109,7 +1158,8 @@ async def _translate_playbook_ko(settings: Settings, detail: str) -> str:
         return detail
     if not translated or not translated.strip():
         return detail
-    return f"{detail[:body_start]}\n{translated.strip()}\n{detail[end:]}"
+    translated = _build_settings_masker(settings).mask_text(translated.strip())
+    return f"{detail[:body_start]}\n{translated}\n{detail[end:]}"
 
 
 def _insert_before_appendix(detail: str, block: str) -> str:
@@ -1130,8 +1180,6 @@ def _supporting_evidence(results: list[CollectorResult]) -> list[tuple[str, str]
     picked: list[tuple[str, str]] = []
     for result in results:
         if result.status not in ("ok", "partial"):
-            continue
-        if (result.summary or "").startswith(NO_EVIDENCE):
             continue
         line = _best_evidence_line(result)
         if line.startswith(NO_EVIDENCE):
@@ -1192,7 +1240,12 @@ def _promote_signature_cause(
         if not family:
             continue
         if family == top_family:
-            return candidates
+            return [
+                _with_signature_support(
+                    candidates[0], f"matched known-issue signature: {entry.get('issue')}", 8.0
+                ),
+                *candidates[1:],
+            ]
         lead = RankedCause(
             family=family,
             confidence="medium",
@@ -1205,7 +1258,12 @@ def _promote_signature_cause(
         if not family:
             continue
         if family == top_family:
-            return candidates
+            return [
+                _with_signature_support(
+                    candidates[0], f"matched curated symptom: {symptom.get('symptom')}", 7.0
+                ),
+                *candidates[1:],
+            ]
         lead = RankedCause(
             family=family,
             confidence="medium",
@@ -1215,6 +1273,21 @@ def _promote_signature_cause(
         )
         return [lead] + [c for c in candidates if c.family != family]
     return candidates
+
+
+def _with_signature_support(
+    candidate: RankedCause, rationale: str, score_floor: float
+) -> RankedCause:
+    rationale_items = [*candidate.rationale]
+    if rationale not in rationale_items:
+        rationale_items.append(rationale)
+    return RankedCause(
+        family=candidate.family,
+        confidence="medium" if candidate.confidence == "low" else candidate.confidence,
+        score=max(candidate.score, score_floor),
+        rationale=rationale_items,
+        evidence_agents=sorted({*candidate.evidence_agents, "signature"}),
+    )
 
 
 def _promote_xid_cause(candidates: list[RankedCause], xid_codes: list[int]) -> list[RankedCause]:
@@ -1234,6 +1307,53 @@ def _promote_xid_cause(candidates: list[RankedCause], xid_codes: list[int]) -> l
         evidence_agents=["alert"],
     )
     return [gpu] + [c for c in candidates if c.family != "gpu_hardware_error"]
+
+
+def _drop_refuted_signature_candidates(
+    candidates: list[RankedCause], refuted: set[str]
+) -> list[RankedCause]:
+    if not refuted:
+        return candidates
+    labels = {item.lower() for item in refuted if item}
+    kept: list[RankedCause] = []
+    for candidate in candidates:
+        rationale = " ".join(candidate.rationale).lower()
+        if "nvidia xid" in rationale and _xid_candidate_still_supported(rationale, labels):
+            kept.append(candidate)
+            continue
+        signature_claim = (
+            "matched known-issue signature" in rationale
+            or "matched curated symptom" in rationale
+            or "nvidia xid" in rationale
+        )
+        if signature_claim and any(label in rationale for label in labels):
+            continue
+        kept.append(candidate)
+    if kept:
+        return kept
+    return [
+        RankedCause(
+            family="insufficient_evidence",
+            confidence="low",
+            score=0.0,
+            rationale=[
+                "The signature match was refuted; no other family cleared the evidence gate."
+            ],
+            evidence_agents=[],
+        )
+    ]
+
+
+def _xid_candidate_still_supported(rationale: str, refuted_labels: set[str]) -> bool:
+    codes = set(re.findall(r"\b\d{1,4}\b", rationale))
+    if not codes:
+        return False
+    refuted_codes = {
+        code
+        for label in refuted_labels
+        for code in re.findall(r"\b\d{1,4}\b", label)
+    }
+    return bool(codes - refuted_codes)
 
 
 def _runai_version_from(results: list[CollectorResult]) -> str:
@@ -1311,34 +1431,61 @@ def _numbered_actions(
     recognised known-issue fixes, then graph-derived and curated family fixes,
     then infra-restore steps."""
     ordered: list[str] = []
+    specific_actions = 0
     fuzzy = _alert_text(request)
+    top_family = candidates[0].family if candidates else ""
+    filter_to_top = _top_family_settled(candidates)
     if plan is not None and plan.matched_alert:
-        ordered.extend(str(a) for a in plan.matched_alert.get("actions", []))
+        alert_family = str(plan.matched_alert.get("family") or "")
+        if (not top_family or alert_family == top_family) and top_family != "insufficient_evidence":
+            ordered.extend(str(a) for a in plan.matched_alert.get("actions", []))
     # Known operator cases recognised by their signature keywords in the evidence
     # (ranking-independent): version-regression / observability / expected-behavior
     # fixes surface even when the coarse family ranking points elsewhere.
-    for issue in match_runai_known_issues(known_issues or [], observed_text, fuzzy_query=fuzzy):
-        ordered.extend(str(a) for a in issue.get("actions", []))
+    if top_family != "insufficient_evidence":
+        for issue in match_runai_known_issues(known_issues or [], observed_text, fuzzy_query=fuzzy):
+            if filter_to_top and str(issue.get("family") or "") != top_family:
+                continue
+            actions = [str(a) for a in issue.get("actions", [])]
+            specific_actions += len(actions)
+            ordered.extend(actions)
     if graph_fixes is not None:
+        specific_actions += len(graph_fixes.family_fixes)
         ordered.extend(graph_fixes.family_fixes)
         root_codes = {r for roots in graph_fixes.root_xids.values() for r in roots}
         # Fix the ROOT of the causal chain before its downstream symptoms.
         for code in sorted(graph_fixes.xid_fixes, key=lambda c: (c not in root_codes, c)):
             label = "root XID" if code in root_codes else "XID"
-            ordered.extend(f"({label} {code}) {fix}" for fix in graph_fixes.xid_fixes[code])
-    # Curated failure-mode fixes: entry point is the fine-grained signature match
-    # across ALL families (ranker orders, doesn't gate) — so a precise fix surfaces
-    # even from a family the ranker mis-scored or can't nominate (gpu_hardware_error).
-    top_family = candidates[0].family if candidates else ""
-    for _family, symptom in match_failure_mode_symptoms(
-        failure_modes, observed_text, top_family, fuzzy_query=fuzzy
-    ):
-        ordered.extend(str(a) for a in symptom.get("actions", []))
-    ordered.extend(line.removeprefix("- ") for line in _recommended_action_lines(missing, request))
+            fixes = [f"({label} {code}) {fix}" for fix in graph_fixes.xid_fixes[code]]
+            specific_actions += len(fixes)
+            ordered.extend(fixes)
+    # Curated failure-mode fixes for the settled top family only. The promotion
+    # step already used cross-family signatures to choose that family; repeating
+    # every side-match here pollutes actions with stale/context text.
+    if top_family != "insufficient_evidence":
+        for family, symptom in match_failure_mode_symptoms(
+            failure_modes, observed_text, top_family, fuzzy_query=fuzzy
+        ):
+            if filter_to_top and family != top_family:
+                continue
+            actions = [str(a) for a in symptom.get("actions", [])]
+            specific_actions += len(actions)
+            ordered.extend(actions)
+    ordered.extend(
+        line.removeprefix("- ")
+        for line in _recommended_action_lines(
+            missing,
+            request,
+            include_similar=(
+                specific_actions == 0 or _similar_incident_relevant(request, fuzzy)
+            ),
+        )
+    )
     seen: set[str] = set()
     numbered: list[str] = []
+    action_masker = build_masker(())
     for action in ordered:
-        action = " ".join(action.split())
+        action = _safe_line(action, limit=420, masker=action_masker)
         if not action or action in seen:
             continue
         seen.add(action)
@@ -1360,6 +1507,15 @@ def _root_cause_statement(request: AlertAnalysisRequest) -> str:
     return _short_sentence(text, limit=320)
 
 
+def _top_family_settled(candidates: list[RankedCause] | None) -> bool:
+    if not candidates:
+        return False
+    top = candidates[0]
+    return top.family != "insufficient_evidence" and (
+        top.confidence != "low" or top.score >= 2.0
+    )
+
+
 def _ranked_root_cause_statement(
     candidates: list[RankedCause], request: AlertAnalysisRequest
 ) -> str:
@@ -1369,8 +1525,8 @@ def _ranked_root_cause_statement(
     top = candidates[0]
     if top.family == "insufficient_evidence":
         return _short_sentence(
-            f"{subject} There is not yet enough evidence to point at a specific cause; "
-            "the collected signals are inconclusive.",
+            f"{subject} Insufficient evidence: there is not yet enough evidence to point "
+            "at a specific cause; the collected signals are inconclusive.",
             limit=320,
         )
     explanation = _FAMILY_EXPLANATION.get(top.family) or _family_label(top.family)
@@ -1480,10 +1636,47 @@ def _observed_text(
         # empty matches NOTHING even though its own text names the fault.
         parts.append(_alert_text(request))
     for result in results:
+        if not _collector_is_evidence(result):
+            continue
         if result.summary:
             parts.append(result.summary)
-        parts.extend(art.summary for art in result.artifacts if art.summary)
+        for art in result.artifacts:
+            if not _artifact_is_evidence(art):
+                continue
+            if art.summary:
+                parts.append(art.summary)
+            if art.result is not None:
+                parts.append(_evidence_leaf_text(art.result, limit=2000))
     return " ".join(parts).lower()
+
+
+def _evidence_leaf_text(value: Any, *, limit: int = 2000) -> str:
+    """Evidence matching should see values, not JSON schema/key names."""
+    parts: list[str] = []
+
+    def add(text: object) -> None:
+        if len(" ".join(parts)) < limit:
+            parts.append(str(text))
+
+    def walk(node: Any, key: str = "") -> None:
+        if node is None:
+            return
+        key_l = key.lower()
+        if isinstance(node, dict):
+            for child_key, child in node.items():
+                walk(child, str(child_key))
+        elif isinstance(node, (list, tuple)):
+            for child in node:
+                walk(child, key)
+        elif key_l in {"xid", "xid_code", "nvidia_xid"}:
+            add(f"xid {node}")
+        elif isinstance(node, (str, int, float, bool)):
+            add(node)
+        else:
+            add(node)
+
+    walk(value)
+    return " ".join(" ".join(parts).split())[:limit]
 
 
 def _knowledge_base_lines(
@@ -1491,6 +1684,7 @@ def _knowledge_base_lines(
     candidates: list[RankedCause] | None = None,
     observed_text: str = "",
     fuzzy_query: str = "",
+    masker: Masker | None = None,
 ) -> list[str]:
     if not kg_context or not kg_context.get("enabled"):
         return []
@@ -1498,6 +1692,7 @@ def _knowledge_base_lines(
         # Optional enrichment; when it is not available we simply omit the section
         # rather than surfacing infra jargon. The reason is carried in `warnings`.
         return []
+    active_masker = masker or build_masker(())
     body: list[str] = []
     blast = kg_context.get("blast_radius_workloads") or 0
     if blast:
@@ -1509,9 +1704,22 @@ def _knowledge_base_lines(
     if prior:
         body.append(f"- This alert recurred in {len(prior)} prior incident(s):")
         for item in prior[:5]:
-            summary = item.get("analysis_summary") or "(no stored RCA summary)"
-            body.append(f"  - {item.get('incident_id')}: {summary}")
-    body.extend(_kb_remediation_lines(kg_context, candidates, observed_text, fuzzy_query))
+            incident_id = _short_sentence(
+                active_masker.mask_text(str(item.get("incident_id") or "(unknown)")),
+                limit=80,
+            )
+            summary = _short_sentence(
+                active_masker.mask_text(
+                    str(item.get("analysis_summary") or "(no stored RCA summary)")
+                ),
+                limit=320,
+            )
+            body.append(f"  - {incident_id}: {summary}")
+    body.extend(
+        _kb_remediation_lines(
+            kg_context, candidates, observed_text, fuzzy_query, active_masker
+        )
+    )
     if not body:
         body.append("- No related knowledge-graph facts were found for this entity yet.")
     return ["", "### Knowledge Base (Ontology)", "", *body]
@@ -1522,6 +1730,7 @@ def _kb_remediation_lines(
     candidates: list[RankedCause] | None,
     observed_text: str,
     fuzzy_query: str = "",
+    masker: Masker | None = None,
 ) -> list[str]:
     knowledge = kg_context.get("knowledge") or {}
     if not knowledge:
@@ -1530,16 +1739,24 @@ def _kb_remediation_lines(
     # coarse ranked family (which can be wrong, or can't even nominate the right one
     # such as gpu_hardware_error). The ranker only orders the matches.
     top_family = candidates[0].family if candidates else ""
+    filter_to_top = _top_family_settled(candidates)
+    active_masker = masker or build_masker(())
     for family, symptom in match_failure_mode_symptoms(
         knowledge, observed_text, top_family, fuzzy_query=fuzzy_query
     ):
+        if filter_to_top and family != top_family:
+            continue
         actions = symptom.get("actions", [])
         if actions:
+            symptom_name = _safe_line(symptom.get("symptom"), limit=160, masker=active_masker)
             header = (
-                f"- Matched symptom **{symptom.get('symptom')}** "
+                f"- Matched symptom **{symptom_name}** "
                 f"({_family_label(family)}); known fixes from the knowledge base:"
             )
-            return [header, *[f"  - {a}" for a in actions[:5]]]
+            return [
+                header,
+                *[f"  - {_safe_line(a, limit=360, masker=active_masker)}" for a in actions[:5]],
+            ]
     # No symptom keyword matched the observed evidence: don't dump a generic family
     # checklist as if it were a match — say so plainly.
     return ["- No closely-matching prior knowledge for this evidence yet."]
@@ -1553,30 +1770,44 @@ def _playbook_lines(
     known_issues: list[dict] | None = None,
     fuzzy_query: str = "",
     components: dict[str, dict] | None = None,
+    masker: Masker | None = None,
 ) -> list[str]:
     """Root-cause-relevant remediation, most specific first.
 
-    Precision order: matched known issues (real operator cases), then every
-    curated symptom whose keyword matches the evidence — across ALL families (the
-    fine-grained signature is the entry point, not the coarse ranked family).
-    Only when nothing matches does it fall back to the ranked family's general
-    checklist, then the full case library.
+    Precision order: matched known issues (real operator cases), then matched
+    curated symptoms for the settled top family. Cross-family signatures have
+    already been used to pick that top family; unrelated side text should not
+    become playbook guidance.
     """
     lines: list[str] = []
+    active_masker = masker or build_masker(())
+    top_family = candidates[0].family if candidates else ""
+    filter_to_top = _top_family_settled(candidates)
     for issue in match_runai_known_issues(
         known_issues or [], observed_text, fuzzy_query=fuzzy_query
     )[:2]:
-        lines.append(f"- **{issue.get('issue')}** (known issue)")
-        reason = " ".join(str(issue.get("reason") or "").split())
+        if filter_to_top and str(issue.get("family") or "") != top_family:
+            continue
+        issue_name = _safe_line(issue.get("issue"), limit=180, masker=active_masker)
+        lines.append(f"- **{issue_name}** (known issue)")
+        reason = _safe_line(issue.get("reason"), limit=360, masker=active_masker)
         if reason:
             lines.append(f"  - {reason}")
-        lines.extend(f"  - {action}" for action in issue.get("actions", [])[:4])
-    top_family = candidates[0].family if candidates else ""
+        lines.extend(
+            f"  - {_safe_line(action, limit=360, masker=active_masker)}"
+            for action in issue.get("actions", [])[:4]
+        )
     for family, symptom in match_failure_mode_symptoms(
         failure_modes, observed_text, top_family, fuzzy_query=fuzzy_query
     ):
-        lines.append(f"- **{symptom.get('symptom')}** ({_family_label(family)})")
-        lines.extend(f"  - {action}" for action in symptom.get("actions", [])[:5])
+        if filter_to_top and family != top_family:
+            continue
+        symptom_name = _safe_line(symptom.get("symptom"), limit=180, masker=active_masker)
+        lines.append(f"- **{symptom_name}** ({_family_label(family)})")
+        lines.extend(
+            f"  - {_safe_line(action, limit=360, masker=active_masker)}"
+            for action in symptom.get("actions", [])[:5]
+        )
         # Architecture layer: the implicated platform component's failure effect,
         # dependency check order, and ready-to-run checks (runai_architecture.yaml).
         if symptom.get("component"):
@@ -1586,8 +1817,16 @@ def _playbook_lines(
     # No precise signature matched: fall back to the ranked family's general
     # checklist (the coarse ranking's legitimate role), else the full case library.
     symptoms = failure_modes.get(top_family) if top_family else None
+    if top_family == "insufficient_evidence":
+        return ["- No troubleshooting playbook matched the available evidence yet."]
     if symptoms:
-        actions = sorted({a for s in symptoms for a in s.get("actions", [])})
+        actions = sorted(
+            {
+                _safe_line(a, limit=360, masker=active_masker)
+                for s in symptoms
+                for a in s.get("actions", [])
+            }
+        )
         header = f"Guidance for the most likely cause: **{_family_label(top_family)}**."
         return [header, "", *[f"- {action}" for action in actions[:6]]]
     if fallback_cases:
@@ -1623,6 +1862,14 @@ def _short_sentence(value: str, *, limit: int) -> str:
     text = " ".join(value.split())
     if not text:
         return "The agent has not received enough alert context to name a root cause."
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _safe_line(value: object, *, limit: int, masker: Masker | None = None) -> str:
+    active_masker = masker or build_masker(())
+    text = " ".join(active_masker.mask_text(str(value or "")).split())
     if len(text) <= limit:
         return text
     return text[: limit - 1].rstrip() + "…"
@@ -1667,6 +1914,9 @@ def _investigation_plan_lines(plan: InvestigationPlan | None) -> list[str]:
 
 def _best_evidence_line(result: CollectorResult) -> str:
     """The single most useful finding for this agent, not a status blurb."""
+    artifact_line = _artifact_evidence_line(result)
+    if artifact_line:
+        return artifact_line
     if result.agent == "kubernetes":
         picked = _kubernetes_highlights(result.details)
     elif result.agent == "loki":
@@ -1679,6 +1929,52 @@ def _best_evidence_line(result: CollectorResult) -> str:
         # highlight lines start with "- "; strip the marker for inline use.
         return picked[0].lstrip("- ").strip()
     return result.summary
+
+
+def _appendix_evidence_line(result: CollectorResult) -> str:
+    artifact_line = _artifact_evidence_line(result)
+    if artifact_line:
+        return artifact_line
+    unavailable_line = _artifact_evidence_line(result, include_unavailable=True)
+    return unavailable_line or _best_evidence_line(result)
+
+
+_GENERIC_ARTIFACT_SUMMARY_RE = re.compile(
+    r"^(?:\d+\s+row\(s\)|metadata rows?|schema rows?|ok|success|drilldown ok)$",
+    re.IGNORECASE,
+)
+
+
+def _artifact_evidence_line(
+    result: CollectorResult, *, include_unavailable: bool = False
+) -> str:
+    for art in reversed(getattr(result, "artifacts", []) or []):
+        if not _artifact_is_evidence(art) and not include_unavailable:
+            continue
+        summary = " ".join(str(art.summary or "").split())
+        result_text = _evidence_leaf_text(art.result, limit=500) if art.result is not None else ""
+        if summary and not _GENERIC_ARTIFACT_SUMMARY_RE.match(summary):
+            finding = summary
+        elif result_text and result_text.lower() not in {"true", "false", "none", "null"}:
+            finding = result_text
+        else:
+            finding = ""
+        if not finding and art.highlights:
+            finding = "signals: " + ", ".join(f"**{marker}**" for marker in art.highlights[:6])
+        if not finding:
+            continue
+        title = str(art.title or art.type or "artifact").strip()
+        query = f" via {_short_sentence(str(art.query), limit=120)}" if art.query else ""
+        return f"{title}: {_short_sentence(finding, limit=260)}{query}"
+    return ""
+
+
+def _artifact_is_evidence(art: object) -> bool:
+    return getattr(art, "status", "") in ("ok", "partial")
+
+
+def _collector_is_evidence(result: object) -> bool:
+    return getattr(result, "status", "ok") in ("ok", "partial")
 
 
 def _kubernetes_highlights(details: dict[str, object]) -> list[str]:
@@ -1791,14 +2087,17 @@ _SIMILARITY_FLOOR = 0.80
 
 
 def _recommended_action_lines(
-    missing: list[str], request: AlertAnalysisRequest | None = None
+    missing: list[str],
+    request: AlertAnalysisRequest | None = None,
+    *,
+    include_similar: bool = True,
 ) -> list[str]:
     # Concrete actions only — no generic "trust the evidence" filler.
     lines: list[str] = []
     # Weave the proven RCA/fix from a high-similarity past incident into the actions.
-    top = _top_similar_incident(request) if request else None
+    top = _top_similar_incident(request) if request and include_similar else None
     if top is not None:
-        proven = (top.analysis_summary or top.title or "").strip()
+        proven = _short_sentence(top.analysis_summary or top.title or "", limit=320)
         if proven:
             lines.append(
                 f"- Similar past incident {top.incident_id} (similarity "
@@ -1896,7 +2195,7 @@ async def _operator_questions(
             sharpened = None
         if sharpened:
             return sharpened
-    return questions
+    return [_short_sentence(question, limit=240) for question in questions]
 
 
 async def _sharpen_operator_questions(
@@ -1915,7 +2214,7 @@ async def _sharpen_operator_questions(
         + ("반드시 한국어로 작성하세요. " if ko else "Write in English. ")
         + 'Respond with ONLY JSON: {"questions": [str, ...]} containing 2 to 4 questions.'
     )
-    user = json.dumps(
+    user = _build_settings_masker(settings).mask_text(json.dumps(
         {
             "draft_questions": questions,
             "missing_data": missing,
@@ -1923,7 +2222,7 @@ async def _sharpen_operator_questions(
         },
         ensure_ascii=False,
         default=str,
-    )
+    ))
     data = await complete_json(
         settings,
         system=system,
@@ -1936,7 +2235,12 @@ async def _sharpen_operator_questions(
     raw = data.get("questions")
     if not isinstance(raw, list):
         return None
-    cleaned = [str(item).strip() for item in raw if str(item).strip()]
+    masker = _build_settings_masker(settings)
+    cleaned = [
+        _short_sentence(masker.mask_text(str(item)), limit=240)
+        for item in raw
+        if str(item).strip()
+    ]
     if 2 <= len(cleaned) <= 4:
         return cleaned
     return None
@@ -1955,11 +2259,13 @@ def _xid_codes_from_results(results: list[CollectorResult], alert_text: str = ""
     texts.extend(
         _stringify_result(result)
         for result in results
-        if result.agent in ("loki", "system", "kubernetes")
+        if result.agent in ("loki", "system", "kubernetes") and _collector_is_evidence(result)
     )
     codes: list[int] = []
     for text in texts:
         for match in _XID_PATTERN.finditer(text):
+            if _keyword_negated(text.lower(), match.start(), match.end()):
+                continue
             code = int(match.group(1))
             if code not in codes:
                 codes.append(code)
@@ -1978,26 +2284,36 @@ def _gpu_model_from(target: AnalysisTarget, results: list[CollectorResult]) -> s
 
 def _stringify_result(result: CollectorResult) -> str:
     parts = [result.summary or ""]
-    if result.details:
-        try:
-            parts.append(json.dumps(result.details, default=str))
-        except (TypeError, ValueError):
-            parts.append(str(result.details))
+    artifacts = getattr(result, "artifacts", []) or []
+    parts.extend(art.summary or "" for art in artifacts if _artifact_is_evidence(art))
+    parts.extend(
+        _evidence_leaf_text(art.result)
+        for art in artifacts
+        if _artifact_is_evidence(art) and art.result
+    )
+    details = getattr(result, "details", {})
+    if details:
+        parts.append(_evidence_leaf_text(details))
     return " ".join(parts)
 
 
 def _graph_remediation_lines(graph_fixes: GraphRemediation | None) -> list[str]:
     if graph_fixes is None or graph_fixes.is_empty():
         return []
+    masker = build_masker(())
     lines = ["- Knowledge-graph derived remediation:"]
     for statement in graph_fixes.family_fixes[:5]:
-        lines.append(f"  - {statement}")
+        lines.append(f"  - {_safe_line(statement, limit=360, masker=masker)}")
     for code, fixes in graph_fixes.xid_fixes.items():
         lines.append(f"  - NVIDIA Xid {code}:")
-        lines.extend(f"    - {statement}" for statement in fixes[:5])
+        lines.extend(
+            f"    - {_safe_line(statement, limit=360, masker=masker)}"
+            for statement in fixes[:5]
+        )
     for model, xids in graph_fixes.model_xids.items():
         rendered = ", ".join(str(x) for x in xids)
-        lines.append(f"  - Known Xid codes for {model}: {rendered}.")
+        safe_model = _safe_line(model, limit=120, masker=masker)
+        lines.append(f"  - Known Xid codes for {safe_model}: {rendered}.")
     return lines
 
 
@@ -2043,6 +2359,59 @@ def _top_similar_incident(request: AlertAnalysisRequest):
     return max(qualified, key=lambda item: item.similarity or 0)
 
 
+_SIMILAR_STOPWORDS = {
+    "alert",
+    "and",
+    "ai",
+    "because",
+    "check",
+    "critical",
+    "during",
+    "error",
+    "errors",
+    "failed",
+    "failure",
+    "firing",
+    "gpu",
+    "incident",
+    "namespace",
+    "nvidia",
+    "old",
+    "out",
+    "over",
+    "pod",
+    "pods",
+    "run",
+    "runai",
+    "status",
+    "the",
+    "training",
+    "warning",
+}
+
+
+def _similar_incident_relevant(request: AlertAnalysisRequest, observed_text: str) -> bool:
+    top = _top_similar_incident(request)
+    if top is None:
+        return False
+    current = _similar_tokens(observed_text)
+    prior = _similar_tokens(
+        " ".join([top.title or "", top.analysis_summary or "", top.analysis_detail or ""])
+    )
+    return bool(current & prior)
+
+
+def _similar_tokens(text: str) -> set[str]:
+    lowered = (text or "").lower()
+    return {
+        match.group(0)
+        for match in re.finditer(r"[a-z0-9]+", lowered)
+        if len(match.group(0)) > 2
+        and match.group(0) not in _SIMILAR_STOPWORDS
+        and not _keyword_negated(lowered, match.start(), match.end())
+    }
+
+
 def _similar_incident_lines(request: AlertAnalysisRequest) -> list[str]:
     lines = ["", "### Similar Incidents", ""]
     # Only surface vector hits we actually trust; a 0.70 "match" is noise.
@@ -2060,7 +2429,7 @@ def _similar_incident_lines(request: AlertAnalysisRequest) -> list[str]:
         )
         lines.append(
             f"- {item.incident_id} ({item.similarity:.3f}, {feedback}): "
-            f"{item.analysis_summary or item.title}"
+            f"{_short_sentence(item.analysis_summary or item.title or '', limit=320)}"
         )
     return lines
 
@@ -2070,5 +2439,8 @@ def _feedback_hint_lines(request: AlertAnalysisRequest) -> list[str]:
     if not request.feedback_hints:
         return [*lines, "- No operator feedback hints were provided."]
     for hint in request.feedback_hints[:5]:
-        lines.append(f"- {hint.sentiment} from {hint.source_id}: {hint.text}")
+        lines.append(
+            f"- {hint.sentiment} from {hint.source_id}: "
+            f"{_short_sentence(hint.text, limit=320)}"
+        )
     return lines

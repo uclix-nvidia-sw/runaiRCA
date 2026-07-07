@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import pytest
 
-from app.collectors.base import NO_EVIDENCE
+from app.collectors.base import NO_EVIDENCE, CollectorResult, artifact
 from app.collectors.kubernetes import best_matching_pod, pod_name_stem
 from app.collectors.postgres import _postgres_result
+from app.schemas import Alert, AlertAnalysisRequest
 from app.services import pipeline
+from app.services.root_cause_ranking import RankedCause
 from tests.test_orchestrator import make_settings, make_target
 
 # --- stale-pod re-resolution ---------------------------------------------------
@@ -127,7 +129,10 @@ async def test_translate_playbook_ko_splices_only_the_playbook(monkeypatch) -> N
 
     async def fake_complete(settings, *, system, user, **kwargs):
         assert "GPU Allocation" in user
-        return "- **대시보드 GPU 할당 0 표시** (알려진 이슈)\n  - 문제 파드를 삭제하세요."
+        return (
+            "- **대시보드 GPU 할당 0 표시** (알려진 이슈)\n"
+            "  - 문제 파드를 삭제하세요. api_key=translation-secret-12345"
+        )
 
     monkeypatch.setattr(pipeline, "complete", fake_complete)
     translated = await pipeline._translate_playbook_ko(make_settings(), detail)
@@ -135,6 +140,8 @@ async def test_translate_playbook_ko_splices_only_the_playbook(monkeypatch) -> N
     assert "Delete the offending pod" not in translated
     assert "### Similar Incidents" in translated  # neighbouring sections untouched
     assert "- No similar past incident found." in translated
+    assert "translation-secret-12345" not in translated
+    assert "[MASKED]" in translated
 
 
 @pytest.mark.asyncio
@@ -144,6 +151,124 @@ async def test_translate_playbook_ko_keeps_detail_without_marker() -> None:
 
 
 # --- drill-down observability -----------------------------------------------------
+
+
+def test_report_evidence_prefers_drilldown_artifact_result_over_generic_summary() -> None:
+    result = CollectorResult(agent="postgres", status="ok", summary="db drilldown ok")
+    result.artifacts.append(
+        artifact(
+            agent="postgres",
+            source="postgres",
+            type="drilldown_query",
+            status="ok",
+            confidence="medium",
+            query="SELECT message FROM scheduler_logs LIMIT 1",
+            summary="1 row(s)",
+            result={"rows": [{"message": "reclaim/reclaim.go:91 runtime/panic.go:785"}]},
+        )
+    )
+    detail = pipeline._detail_from(
+        AlertAnalysisRequest(alert=Alert(status="firing", labels={"alertname": "SchedulerCrash"})),
+        [result],
+        [],
+        root_cause_candidates=[
+            RankedCause(family="platform_version_bug", confidence="medium", score=7.0)
+        ],
+    )
+
+    evidence = detail.split("### Evidence", 1)[1].split("###", 1)[0]
+    assert "runtime/panic.go:785" in evidence
+    assert "1 row(s)" not in evidence
+
+
+def test_root_cause_supporting_evidence_uses_drilldown_after_no_evidence_base() -> None:
+    result = CollectorResult(agent="postgres", status="ok", summary=NO_EVIDENCE)
+    result.artifacts.append(
+        artifact(
+            agent="postgres",
+            source="postgres",
+            type="drilldown_query",
+            status="ok",
+            confidence="medium",
+            summary="1 row(s)",
+            result={"rows": [{"message": "scheduler panic at reclaim/reclaim.go:91"}]},
+        )
+    )
+    detail = pipeline._detail_from(
+        AlertAnalysisRequest(alert=Alert(status="firing", labels={"alertname": "SchedulerCrash"})),
+        [result],
+        [],
+        root_cause_candidates=[
+            RankedCause(family="platform_version_bug", confidence="medium", score=7.0)
+        ],
+    )
+
+    root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
+    assert "scheduler panic at reclaim/reclaim.go:91" in root_cause
+
+
+def test_unavailable_drilldown_artifact_is_appendix_context_not_supporting_evidence() -> None:
+    result = CollectorResult(agent="postgres", status="ok", summary=NO_EVIDENCE)
+    result.artifacts.append(
+        artifact(
+            agent="postgres",
+            source="postgres",
+            type="drilldown_query",
+            status="unavailable",
+            confidence="low",
+            summary="postgres drilldown failed: connection refused",
+        )
+    )
+    detail = pipeline._detail_from(
+        AlertAnalysisRequest(alert=Alert(status="firing", labels={"alertname": "SchedulerCrash"})),
+        [result],
+        [],
+        root_cause_candidates=[
+            RankedCause(family="platform_version_bug", confidence="medium", score=7.0)
+        ],
+    )
+
+    root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
+    evidence = detail.split("### Evidence", 1)[1].split("###", 1)[0]
+    assert "connection refused" not in root_cause
+    assert "connection refused" in evidence
+
+
+def test_appendix_prefers_successful_artifact_over_later_failed_artifact() -> None:
+    result = CollectorResult(agent="postgres", status="ok", summary=NO_EVIDENCE)
+    result.artifacts.extend(
+        [
+            artifact(
+                agent="postgres",
+                source="postgres",
+                type="drilldown_query",
+                status="ok",
+                confidence="medium",
+                summary="1 row(s)",
+                result={"rows": [{"message": "scheduler panic at reclaim/reclaim.go:91"}]},
+            ),
+            artifact(
+                agent="postgres",
+                source="postgres",
+                type="drilldown_query",
+                status="unavailable",
+                confidence="low",
+                summary="later postgres drilldown failed: connection refused",
+            ),
+        ]
+    )
+    detail = pipeline._detail_from(
+        AlertAnalysisRequest(alert=Alert(status="firing", labels={"alertname": "SchedulerCrash"})),
+        [result],
+        [],
+        root_cause_candidates=[
+            RankedCause(family="platform_version_bug", confidence="medium", score=7.0)
+        ],
+    )
+
+    evidence = detail.split("### Evidence", 1)[1].split("###", 1)[0]
+    assert "scheduler panic at reclaim/reclaim.go:91" in evidence
+    assert "connection refused" not in evidence
 
 
 @pytest.mark.asyncio
@@ -273,7 +398,7 @@ async def test_mcp_k8s_list_candidates_all_carry_label_selector(monkeypatch) -> 
 
 
 def test_apply_label_selector_filters_equality_only() -> None:
-    from app.collectors.kubernetes import _apply_label_selector
+    from app.collectors.kubernetes import _apply_label_selector, kubectl_repr
 
     data = {
         "items": [
@@ -287,6 +412,10 @@ def test_apply_label_selector_filters_equality_only() -> None:
     # set-based selectors pass through untouched
     assert _apply_label_selector(data, "app in (toolkit,other)") is data
     assert _apply_label_selector(data, "app!=other") is data
+    assert _apply_label_selector(data, "=toolkit") is data
+    assert kubectl_repr("pods; delete secrets", namespace="runai") == (
+        "kubectl get 'pods; delete secrets' -n runai"
+    )
 
 
 # --- architecture knowledge reaches the drill-down loop -----------------------------
@@ -389,6 +518,151 @@ def test_target_match_survives_incidental_longer_evidence_match(monkeypatch) -> 
     lines2 = drilldown._implicated_architecture(make_settings(), result, target2)
     assert any(line.startswith("runai-backend-workloads:") for line in lines2)
     assert not any(line.startswith("runai-backend:") for line in lines2)
+
+
+def test_implicated_architecture_ignores_healthy_evidence_mentions(monkeypatch) -> None:
+    """Healthy component names in a broad sweep are context, not suspects."""
+    from app.collectors.base import CollectorResult
+    from app.schemas import AlertAnalysisArtifact
+    from app.services import drilldown
+
+    components = {
+        name: {"component": name, "failure_effect": f"{name} broken.", "depends_on": []}
+        for name in ["runai-agent", "cluster-sync", "assets-sync"]
+    }
+    monkeypatch.setattr("app.knowledge.load_architecture", lambda path: components)
+    target = make_target()
+
+    healthy = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary=(
+            "control-plane sweep: runai-agent ok, cluster-sync running, "
+            "healthy components: assets-sync"
+        ),
+    )
+    assert drilldown._implicated_architecture(make_settings(), healthy, target) == []
+
+    healthy_artifact = CollectorResult(
+        agent="runai",
+        status="ok",
+        summary="Run:ai sweep returned rows.",
+        artifacts=[
+            AlertAnalysisArtifact(
+                agent="runai",
+                source="runai",
+                type="component",
+                status="ok",
+                summary="metadata rows",
+                result={"component": "runai-agent", "status": "healthy"},
+            )
+        ],
+    )
+    assert drilldown._implicated_architecture(make_settings(), healthy_artifact, target) == []
+
+    failing_artifact = CollectorResult(
+        agent="runai",
+        status="ok",
+        summary="Run:ai sweep returned rows.",
+        artifacts=[
+            AlertAnalysisArtifact(
+                agent="runai",
+                source="runai",
+                type="component",
+                status="ok",
+                summary="metadata rows",
+                result={"component": "cluster-sync", "status": "disconnected"},
+            )
+        ],
+    )
+    artifact_lines = drilldown._implicated_architecture(
+        make_settings(), failing_artifact, target
+    )
+    assert any(line.startswith("cluster-sync:") for line in artifact_lines)
+
+    unavailable_artifact = CollectorResult(
+        agent="runai",
+        status="ok",
+        summary="Run:ai sweep returned rows.",
+        artifacts=[
+            AlertAnalysisArtifact(
+                agent="runai",
+                source="runai",
+                type="component",
+                status="unavailable",
+                summary="failed query mentioned cluster-sync disconnected",
+                result={"error": "cluster-sync disconnected"},
+            )
+        ],
+    )
+    assert drilldown._implicated_architecture(make_settings(), unavailable_artifact, target) == []
+
+    failing = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="runai-agent is not healthy; cluster-sync disconnected",
+    )
+    lines = drilldown._implicated_architecture(make_settings(), failing, target)
+    assert any(line.startswith("runai-agent:") for line in lines)
+    assert any(line.startswith("cluster-sync:") for line in lines)
+
+
+def test_implicated_architecture_ignores_refuted_component_mentions(monkeypatch) -> None:
+    """Refuted component mentions must not steer the drill-down prompt."""
+    from app.collectors.base import CollectorResult
+    from app.services import drilldown
+
+    components = {
+        name: {"component": name, "failure_effect": f"{name} broken.", "depends_on": []}
+        for name in ["runai-agent", "cluster-sync"]
+    }
+    monkeypatch.setattr("app.knowledge.load_architecture", lambda path: components)
+    target = make_target()
+
+    for summary in [
+        "runai-agent has no errors; cluster-sync has no restarts",
+        "no issues in runai-agent or cluster-sync after rollout",
+        "runai-agent not implicated; cluster-sync healthy",
+        "runai-agent errors were ruled out; cluster-sync ok",
+        "checked runai-agent logs and found no matching errors",
+    ]:
+        result = CollectorResult(agent="kubernetes", status="ok", summary=summary)
+        assert drilldown._implicated_architecture(make_settings(), result, target) == []
+
+    mixed = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="runai-agent has no errors but cluster-sync disconnected",
+    )
+    lines = drilldown._implicated_architecture(make_settings(), mixed, target)
+    assert any(line.startswith("cluster-sync:") for line in lines)
+    assert not any(line.startswith("runai-agent:") for line in lines)
+
+
+def test_implicated_architecture_ignores_doc_and_question_mentions(monkeypatch) -> None:
+    """Docs/templates/questions are not live evidence for platform topology."""
+    from app.collectors.base import CollectorResult
+    from app.services import drilldown
+
+    components = {
+        name: {"component": name, "failure_effect": f"{name} broken.", "depends_on": []}
+        for name in ["runai-agent", "cluster-sync"]
+    }
+    monkeypatch.setattr("app.knowledge.load_architecture", lambda path: components)
+    target = make_target()
+
+    for summary in [
+        "docs example: runai-agent disconnected",
+        "runbook example says cluster-sync disconnected",
+        "question: could this be runai-agent unavailable?",
+        "template includes cluster-sync error",
+    ]:
+        result = CollectorResult(agent="kubernetes", status="ok", summary=summary)
+        assert drilldown._implicated_architecture(make_settings(), result, target) == []
+
+    live = CollectorResult(agent="kubernetes", status="ok", summary="cluster-sync disconnected")
+    lines = drilldown._implicated_architecture(make_settings(), live, target)
+    assert any(line.startswith("cluster-sync:") for line in lines)
 
 
 # --- followups must query the LIVE pod, not the alert's stale name -------------------

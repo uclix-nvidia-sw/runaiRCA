@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from app.collectors.base import AnalysisTarget
-from app.schemas import SimilarIncidentContext
+from app.schemas import Alert, SimilarIncidentContext
 from app.services.planner import plan_investigation
 from tests.test_orchestrator import make_settings
 
@@ -85,6 +85,32 @@ async def test_similarity_at_or_above_floor_is_targeted() -> None:
 
     assert plan.used_similarity is True
     assert plan.strategy == "targeted"
+
+
+@pytest.mark.asyncio
+async def test_unrelated_high_similarity_text_is_not_targeted() -> None:
+    settings = make_settings()
+    target = _target(alert_name="NCCLTimeout", namespace="runai-research")
+    alert = Alert(
+        status="firing",
+        labels={},
+        annotations={
+            "summary": "NCCL WARN socket timeout and ibv_poll_cq failed during allreduce"
+        },
+    )
+    similar = [
+        SimilarIncidentContext(
+            incident_id="INC-OLD",
+            similarity=0.98,
+            title="old cluster-sync auth incident",
+            analysis_summary="restart cluster-sync and rotate SAML metadata",
+        )
+    ]
+
+    plan = await plan_investigation(settings, target, alert, {}, similar)
+
+    assert plan.used_similarity is False
+    assert plan.strategy == "breadth_first"
 
 
 @pytest.mark.asyncio
@@ -176,6 +202,95 @@ async def test_llm_refinement_kept_on_success(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_llm_refinement_prompt_redacts_sensitive_inputs(monkeypatch) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.example/v1",
+        llm_model="m",
+        llm_api_key="k",
+    )
+    prompts: list[str] = []
+
+    async def fake_complete_json(settings, *, user, **_kwargs):
+        prompts.append(user)
+        return None
+
+    monkeypatch.setattr("app.services.planner.complete_json", fake_complete_json)
+    target = _target(
+        alert_name="RunAIAlert",
+        namespace="runai",
+        project="password=project-secret-12345",
+        workload_name="trainer",
+    )
+    alert = Alert(
+        status="firing",
+        labels={},
+        annotations={"operator_prompt": "api_key=operator-key-12345"},
+    )
+    similar = [
+        SimilarIncidentContext(
+            incident_id="INC-SECRET",
+            similarity=0.9,
+            title="token=title-token-12345",
+            analysis_summary="client_secret=similar-secret-12345",
+        )
+    ]
+
+    await plan_investigation(settings, target, alert, {}, similar)
+
+    joined = "\n".join(prompts)
+    for secret in [
+        "project-secret-12345",
+        "operator-key-12345",
+        "title-token-12345",
+        "similar-secret-12345",
+    ]:
+        assert secret not in joined
+    assert "[MASKED]" in joined
+
+
+@pytest.mark.asyncio
+async def test_llm_refinement_output_is_masked_and_single_line(monkeypatch) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.example/v1",
+        llm_model="m",
+        llm_api_key="k",
+    )
+
+    async def fake_complete_json(settings, *, system, user, **_kwargs):
+        return {
+            "focus": "Check scheduler token=focus-secret-12345\n## injected focus",
+            "strategy": "targeted",
+            "hypotheses": [
+                {
+                    "family": "runai_control_plane_error",
+                    "reason": "api_key=hypothesis-secret-12345\n## injected reason",
+                }
+            ],
+            "narrative": "Investigate backend password=narrative-secret-12345\n## injected section",
+        }
+
+    monkeypatch.setattr("app.services.planner.complete_json", fake_complete_json)
+
+    plan = await plan_investigation(
+        settings,
+        _target(alert_name="RunAISchedulerError", namespace="runai"),
+        None,
+        {},
+        [],
+    )
+
+    serialized = str(plan.as_dict())
+    for secret in ["focus-secret-12345", "hypothesis-secret-12345", "narrative-secret-12345"]:
+        assert secret not in serialized
+    assert "[MASKED]" in serialized
+    assert "\n" not in plan.focus
+    assert "\n" not in plan.narrative
+    assert "\n" not in plan.hypotheses[0]["reason"]
+
+
+@pytest.mark.asyncio
 async def test_llm_failure_falls_back_to_deterministic(monkeypatch) -> None:
     settings = replace(
         make_settings(),
@@ -234,6 +349,32 @@ async def test_knowledge_keyword_matching_alert_text_is_targeted() -> None:
     plan = await plan_investigation(settings, target, None, kg, [])
     assert plan.used_ontology is True
     assert plan.strategy == "targeted"
+
+
+@pytest.mark.asyncio
+async def test_negated_knowledge_keyword_is_not_targeted() -> None:
+    settings = make_settings()
+    target = _target(alert_name="NoisyAlert", namespace="monitoring")
+    alert = Alert(
+        status="firing",
+        labels={},
+        annotations={"summary": "no ImagePullBackOff and no DiskPressure observed"},
+    )
+    kg = {
+        "available": True,
+        "prior_incidents": [],
+        "knowledge": {
+            "image_pull_error": [
+                {"symptom": "Image Pull Error", "keywords": ["imagepullbackoff"]}
+            ],
+            "node_kubelet_pressure": [
+                {"symptom": "Node Disk Pressure", "keywords": ["diskpressure"]}
+            ],
+        },
+    }
+    plan = await plan_investigation(settings, target, alert, kg, [])
+    assert plan.used_ontology is False
+    assert plan.strategy == "breadth_first"
 
 
 @pytest.mark.asyncio

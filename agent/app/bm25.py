@@ -32,7 +32,6 @@ _STOPWORDS = frozenset(
 # Domain synonym groups: each token also matches the others in its group.
 # Small and curated like the keyword lists themselves — extend as gaps show up.
 _SYNONYM_GROUPS: tuple[tuple[str, ...], ...] = (
-    ("job", "workload", "pod"),
     (
         "preempt",
         "preempted",
@@ -48,12 +47,14 @@ _SYNONYM_GROUPS: tuple[tuple[str, ...], ...] = (
     ("oom", "oomkill", "oomkilled"),
     ("quota", "overquota"),
     ("gpu", "cuda", "nvidia"),
-    ("crash", "crashed", "crashing", "crashloop", "crashloopbackoff"),
+    ("crash", "crashed"),
+    ("crashloop", "crashloopbackoff"),
     ("imagepullbackoff", "errimagepull", "errimageneverpull"),
     ("pending", "unschedulable", "unscheduled"),
     ("namespace", "ns", "project"),
     ("delete", "deleted", "remove", "removed"),
-    ("disk", "storage", "volume", "pvc", "filesystem"),
+    ("disk", "filesystem"),
+    ("volume", "pvc"),
     ("permission", "denied", "forbidden", "unauthorized", "rbac"),
 )
 
@@ -66,6 +67,101 @@ for _group in _SYNONYM_GROUPS:
 _RARE_DF_RATIO = 0.25
 _SIGNATURE_DF = 2
 _SIGNATURE_LEN = 6
+_NON_EVIDENCE_TERMS = frozenset(
+    {
+        "application",
+        "app",
+        "alert",
+        "auth",
+        "bound",
+        "cache",
+        "cached",
+        "catalog",
+        "caught",
+        "capacity",
+        "completed",
+        "config",
+        "container",
+        "count",
+        "coredns",
+        "cuda",
+        "current",
+        "dashboard",
+        "delete",
+        "deleted",
+        "defined",
+        "docs",
+        "documentation",
+        "enabled",
+        "entry",
+        "error",
+        "errors",
+        "event",
+        "exception",
+        "exceeded",
+        "enough",
+        "example",
+        "expression",
+        "failed",
+        "failure",
+        "field",
+        "filesystem",
+        "free",
+        "job",
+        "key",
+        "kubelet",
+        "label",
+        "legend",
+        "limit",
+        "lines",
+        "logs",
+        "manager",
+        "metric",
+        "mounted",
+        "name",
+        "gpu",
+        "healthy",
+        "image",
+        "memory",
+        "network",
+        "namespace",
+        "nvidia",
+        "normal",
+        "normally",
+        "node",
+        "pod",
+        "present",
+        "placeholder",
+        "payload",
+        "prometheus",
+        "quota",
+        "query",
+        "reason",
+        "recording",
+        "remove",
+        "removed",
+        "reachable",
+        "ready",
+        "running",
+        "rule",
+        "rules",
+        "sample",
+        "schema",
+        "scheduler",
+        "series",
+        "state",
+        "succeeded",
+        "succeeding",
+        "stayed",
+        "storage",
+        "startup",
+        "stable",
+        "threshold",
+        "unknown",
+        "workload",
+        "zero",
+    }
+)
 
 
 def tokenize(text: str) -> list[str]:
@@ -124,6 +220,7 @@ class BM25Index:
                     continue
                 idf = self._idf(term)
                 rare = df / self._n <= _RARE_DF_RATIO
+                evidence = source not in _NON_EVIDENCE_TERMS and term not in _NON_EVIDENCE_TERMS
                 signature = rare and df <= _SIGNATURE_DF and len(term) >= _SIGNATURE_LEN
                 for i, counts in enumerate(self._tf):
                     tf = counts.get(term)
@@ -133,9 +230,10 @@ class BM25Index:
                         1 - self._b + self._b * self._lengths[i] / (self._avgdl or 1.0)
                     )
                     scores[i] += idf * tf * (self._k1 + 1) / denom
-                    hit_sources[i].add(source)
-                    rare_hit[i] = rare_hit[i] or rare
-                    signature_hit[i] = signature_hit[i] or signature
+                    if evidence:
+                        hit_sources[i].add(source)
+                        rare_hit[i] = rare_hit[i] or rare
+                        signature_hit[i] = signature_hit[i] or signature
         qualified = [
             (self._keys[i], scores[i])
             for i in range(self._n)

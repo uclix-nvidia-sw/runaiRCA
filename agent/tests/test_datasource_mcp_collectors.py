@@ -169,7 +169,12 @@ async def test_kubernetes_collector_uses_mcp_before_service_account_token(
                 }
             )
         if tool == "pods_log":
-            return _McpResult(text="2026-07-07T00:00:00Z training started")
+            return _McpResult(
+                text=(
+                    "2026-07-07T00:00:00Z training started\n"
+                    "2026-07-07T00:00:01Z error password=k8s-mcp-log-secret-12345"
+                )
+            )
         return _McpResult({"items": []})
 
     def token_should_not_be_read(path: str) -> str:
@@ -184,3 +189,6 @@ async def test_kubernetes_collector_uses_mcp_before_service_account_token(
     assert result.details["used_mcp"] is True
     assert "pods_get" in calls
     assert "pods_log" in calls
+    rendered = str(result.details["pod_logs"])
+    assert "k8s-mcp-log-secret-12345" not in rendered
+    assert "[MASKED]" in rendered

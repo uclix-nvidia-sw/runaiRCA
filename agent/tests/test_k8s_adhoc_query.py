@@ -53,9 +53,48 @@ def test_k8s_read_builds_get_list_paths(monkeypatch) -> None:
     asyncio.run(k8s.k8s_read(settings, "deployment", namespace="runai", name="scheduler"))
     assert calls[-1]["path"] == "/apis/apps/v1/namespaces/runai/deployments/scheduler"
     assert calls[-1]["params"] is None
+    # path segments stay segments even if a hallucinated query includes slash/dot text
+    asyncio.run(k8s.k8s_read(settings, "pods", namespace="../runai", name="train/0"))
+    assert calls[-1]["path"] == "/api/v1/namespaces/..%2Frunai/pods/train%2F0"
     # cluster-scoped kind ignores the namespace segment
     asyncio.run(k8s.k8s_read(settings, "storageclass"))
     assert calls[-1]["path"] == "/apis/storage.k8s.io/v1/storageclasses"
+
+
+def test_resolve_live_pod_node_encodes_path_segments(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def fake_get_json(**kwargs):
+        calls.append(kwargs["path"])
+        return JsonResponse(url=kwargs["path"], status_code=404, data={})
+
+    monkeypatch.setattr(k8s, "get_json", fake_get_json)
+    monkeypatch.setattr(k8s, "_read_file", lambda _path: "token")
+
+    asyncio.run(
+        k8s.resolve_live_pod_node(
+            make_settings(),
+            namespace="runai/../../api",
+            pod="pod/../../nodes",
+        )
+    )
+
+    assert calls == [
+        "/api/v1/namespaces/runai%2F..%2F..%2Fapi/pods/pod%2F..%2F..%2Fnodes",
+        "/api/v1/namespaces/runai%2F..%2F..%2Fapi/events",
+        "/api/v1/namespaces/runai%2F..%2F..%2Fapi/pods",
+    ]
+
+
+def test_kubectl_repr_quotes_multiline_values() -> None:
+    rendered = k8s.kubectl_repr("pods", namespace="runai\nbad", name="train/0")
+    assert "\n" not in rendered
+    assert "'runai\nbad'" not in rendered
+    assert "$'runai" not in rendered
+    assert "kubectl get pods train/0 -n" in rendered
+    assert k8s.kubectl_repr("pods; delete secrets", namespace="runai") == (
+        "kubectl get 'pods; delete secrets' -n runai"
+    )
 
 
 def test_k8s_read_refuses_unlisted_kind_without_calling_api(monkeypatch) -> None:
@@ -149,6 +188,32 @@ def test_flowchart_followup_pending_pod_pulls_events_quota_pvc(monkeypatch) -> N
     assert "storageclasses" in reads
     # each read is attached as a followup_query artifact
     assert any(a.type == "followup_query" for a in result.artifacts)
+
+
+def test_flowchart_followup_artifact_query_quotes_namespace(monkeypatch) -> None:
+    async def fake_k8s_read(settings, kind, namespace="", name="", label_selector=""):
+        return {
+            "kind": k8s.resolve_read_kind(kind),
+            "namespace": namespace,
+            "status_code": 200,
+            "error": None,
+            "data": {"items": []},
+        }
+
+    monkeypatch.setattr(k8s, "k8s_read", fake_k8s_read)
+    result = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="k8s",
+        confidence="medium",
+        details={"pod_statuses": [{"name": "p", "phase": "Pending"}]},
+    )
+    target = replace(make_target(), namespace="team-a; delete pods")
+
+    asyncio.run(k8s.k8s_followup(make_settings(), result, target, max_rounds=1))
+
+    assert result.artifacts
+    assert result.artifacts[0].query == "kubectl get events -n 'team-a; delete pods'"
 
 
 def test_flowchart_followup_noop_when_healthy(monkeypatch) -> None:

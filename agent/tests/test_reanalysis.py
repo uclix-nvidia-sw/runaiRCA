@@ -13,8 +13,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.collectors.base import CollectorResult
+from app.collectors.base import AnalysisTarget, CollectorResult
 from app.schemas import Alert, AlertAnalysisRequest
+from app.services import pipeline
 from app.services.orchestrator import AnalysisOrchestrator
 from app.services.pipeline import _collector_name
 from tests.test_orchestrator import make_settings
@@ -262,6 +263,33 @@ async def test_insufficient_evidence_adds_korean_questions_without_llm() -> None
     questions = [line for line in section.splitlines() if line.startswith("- ")]
     assert 2 <= len(questions) <= 4
     assert any("확인해 주세요" in q for q in questions)
+
+
+@pytest.mark.asyncio
+async def test_llm_sharpened_operator_questions_are_single_line(monkeypatch) -> None:
+    async def fake_complete_json(*_args, **_kwargs):
+        return {
+            "questions": [
+                "Check kubelet pressure\n## injected heading\n" + ("detail " * 80),
+                "Check scheduler queue token=question-secret-12345",
+            ]
+        }
+
+    monkeypatch.setattr(pipeline, "complete_json", fake_complete_json)
+    settings = replace(llm_settings(), llm_model_synthesis="m")
+    questions = await pipeline._operator_questions(
+        settings,
+        ["loki.query"],
+        None,
+        AnalysisTarget("", "", "", "", "", "", "", "", "", "warning", "X"),
+        "next check\n## bad",
+    )
+
+    assert len(questions) == 2
+    assert all("\n" not in question for question in questions)
+    assert questions[0].endswith("…")
+    assert "question-secret-12345" not in "\n".join(questions)
+    assert "[MASKED]" in "\n".join(questions)
 
 
 @pytest.mark.asyncio

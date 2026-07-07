@@ -23,6 +23,7 @@ from app.collectors.base import CollectorResult, artifact, salient_markers, sign
 from app.collectors.kubernetes import _READ_KINDS, k8s_read, kind_lookup_title, kubectl_repr
 from app.config import Settings
 from app.llm import complete_json, token_budget_exceeded, token_budget_warning
+from app.masking import build_masker
 from app.plan import InvestigationPlan
 from app.progress import ProgressReporter
 
@@ -64,9 +65,9 @@ async def _collect_safely(collector: object, target: object, plan: object) -> Co
             status="unavailable",
             summary=f"{agent} collector failed unexpectedly before returning evidence.",
             confidence="low",
-            details={"error": f"{type(exc).__name__}: {exc}"},
+            details={"error": type(exc).__name__},
             missing_data=[f"{agent}.collector_exception"],
-            warnings=[f"{agent} failed unexpectedly: {type(exc).__name__}: {exc}"],
+            warnings=[f"{agent} failed unexpectedly: {type(exc).__name__}"],
         )
 
 
@@ -96,15 +97,23 @@ def _adhoc_query_repr(item: dict) -> str:
 
 
 def _evidence_summary(evidence: dict[str, CollectorResult]) -> list[dict]:
-    return [
-        {
+    summaries = []
+    for name, r in evidence.items():
+        item = {
             "collector": name,
             "status": r.status,
             "confidence": r.confidence,
-            "summary": (r.summary or "")[:400],
         }
-        for name, r in evidence.items()
-    ]
+        if r.status in ("ok", "partial"):
+            item["summary"] = (r.summary or "")[:400]
+        else:
+            item["summary"] = "collector unavailable; no evidence collected"
+            if r.missing_data:
+                item["missing_data"] = r.missing_data[:5]
+            if r.warnings:
+                item["warnings"] = r.warnings[:3]
+        summaries.append(item)
+    return summaries
 
 
 def _initial_ledger(plan: InvestigationPlan | None) -> list[dict[str, Any]]:
@@ -321,7 +330,9 @@ async def investigate(
                     '"evidence_for":[str],"evidence_against":[str],'
                     '"status":"open|testing|supported|refuted|uncertain"}]}'
                 ),
-                user=_build_user_prompt(plan, kg_context, evidence, by_name, ledger, adhoc),
+                user=_investigator_masker(settings).mask_text(
+                    _build_user_prompt(plan, kg_context, evidence, by_name, ledger, adhoc)
+                ),
                 model=settings.llm_model_investigation,
             )
             if not isinstance(decision, dict):
@@ -450,11 +461,13 @@ async def investigate(
     results = list(evidence.values())
     if budget_warning and results:
         results[0].warnings.append(budget_warning)
-    return results, {
+    context = {
         "hypothesis_ledger": _ledger_summary(ledger),
         "investigation_steps": investigation_steps,
         "adhoc_query_count": len(adhoc),
     }
+    safe_context = _investigator_masker(settings).mask_object(context)
+    return results, safe_context if isinstance(safe_context, dict) else context
 
 
 async def _reflect_hypotheses(
@@ -480,7 +493,9 @@ async def _reflect_hypotheses(
             '"new_hypotheses":[{"family":str,"statement":str,"confidence":number,'
             '"evidence_for":[str],"evidence_against":[str],"status":str}]}'
         ),
-        user=_build_user_prompt(plan, kg_context, evidence, by_name, ledger, adhoc),
+        user=_investigator_masker(settings).mask_text(
+            _build_user_prompt(plan, kg_context, evidence, by_name, ledger, adhoc)
+        ),
         model=settings.llm_model_investigation,
     )
     if not isinstance(reflection, dict):
@@ -510,6 +525,26 @@ def _build_user_prompt(
         "adhoc_query_kinds": sorted(_READ_KINDS),
         # The last few ad-hoc reads, trimmed — enough for the LLM to chain
         # "PVC is Pending -> check the storageclass" style drill-downs.
-        "adhoc_results": [json.dumps(item, default=str)[:600] for item in (adhoc or [])[-6:]],
+        "adhoc_results": _adhoc_prompt_results(adhoc),
     }
     return json.dumps(payload, default=str)[:8000]
+
+
+def _adhoc_prompt_results(adhoc: list[dict] | None) -> list[str]:
+    return [
+        json.dumps(
+            {"query": _adhoc_query_repr(item), "error": "query failed"}
+            if item.get("error")
+            else item,
+            default=str,
+        )[:600]
+        for item in (adhoc or [])[-6:]
+    ]
+
+
+def _investigator_masker(settings: Settings):
+    return build_masker(
+        settings.masking_regex_list,
+        builtin_enabled=settings.builtin_redaction_enabled,
+        hash_mode=settings.builtin_redaction_hash_mode,
+    )

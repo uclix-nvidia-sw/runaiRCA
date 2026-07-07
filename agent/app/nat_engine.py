@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import AsyncExitStack
+from contextvars import ContextVar
 from typing import Any
 
 from nat.builder.evaluator import EvaluatorInfo
@@ -27,6 +28,7 @@ from app.schemas import AlertAnalysisRequest, AlertAnalysisResponse
 from app.services import pipeline
 
 _settings_holder: Settings | None = None
+_settings_var: ContextVar[Settings | None] = ContextVar("runai_rca_settings", default=None)
 _STAGES = {"enrich", "plan", "evidence", "rank", "self_check", "synthesize"}
 
 
@@ -120,7 +122,7 @@ async def runai_rca_pipeline(config: RunaiRcaPipelineConfig, builder: Builder):
     }
 
     async def _run(request: object) -> object:
-        settings = _settings_holder or load_settings()
+        settings = _settings_var.get() or _settings_holder or load_settings()
         cli_input = isinstance(request, str)
         state = pipeline.new_state(settings, _request_from(request), runtime_label="enabled")
         client = None
@@ -223,14 +225,18 @@ class NatEngine:
             self._settings, request.alert, pipeline._build_settings_masker(self._settings)
         )
         nat_usage: dict[str, dict[str, int]] = {}
-        async with self._sm.run(request) as runner:
-            subscription = runner.context.intermediate_step_manager.subscribe(
-                lambda step: _bridge_step(step, reporter, nat_usage)
-            )
-            try:
-                result = await runner.result(AlertAnalysisResponse)
-            finally:
-                subscription.unsubscribe()
+        settings_token = _settings_var.set(self._settings)
+        try:
+            async with self._sm.run(request) as runner:
+                subscription = runner.context.intermediate_step_manager.subscribe(
+                    lambda step: _bridge_step(step, reporter, nat_usage)
+                )
+                try:
+                    result = await runner.result(AlertAnalysisResponse)
+                finally:
+                    subscription.unsubscribe()
+        finally:
+            _settings_var.reset(settings_token)
         if isinstance(result, AlertAnalysisResponse):
             response = result
         else:

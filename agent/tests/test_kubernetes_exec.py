@@ -28,7 +28,7 @@ def _target() -> AnalysisTarget:
 def test_readonly_command_allowed() -> None:
     assert exec_command_allowed(["nvidia-smi"]) is True
     assert exec_command_allowed(["cat", "/proc/driver/nvidia/version"]) is True
-    assert exec_command_allowed(["env"]) is True
+    assert exec_command_allowed(["env"]) is False  # environment variables often carry secrets
 
 
 def test_mutating_command_rejected() -> None:

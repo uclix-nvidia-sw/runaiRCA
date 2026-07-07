@@ -9,6 +9,7 @@ from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, ar
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import complete, llm_configured
+from app.masking import build_masker
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
     mcp_call,
@@ -209,6 +210,10 @@ async def _llm_insight(
         blob = json.dumps(evidence, default=str)[:3000]
     except (TypeError, ValueError):
         blob = str(evidence)[:3000]
+    masker = _collector_masker(settings)
+    source = masker.mask_text(source)
+    blob = masker.mask_text(blob)
+    deterministic = masker.mask_text(deterministic)
     system = (
         "You are a senior SRE reporting a finding to a colleague. From this one "
         "collector's raw evidence, write ONE (max two) sentence shaped: what you "
@@ -230,7 +235,15 @@ async def _llm_insight(
     )
     if not text:
         return None
-    return " ".join(text.split())[:400]
+    return masker.mask_text(" ".join(text.split())[:400])
+
+
+def _collector_masker(settings: Settings):
+    return build_masker(
+        settings.masking_regex_list,
+        builtin_enabled=settings.builtin_redaction_enabled,
+        hash_mode=settings.builtin_redaction_hash_mode,
+    )
 
 
 def _loki_headers(settings: Settings) -> tuple[dict[str, str], list[str]]:
