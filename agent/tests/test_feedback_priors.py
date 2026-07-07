@@ -18,6 +18,27 @@ def test_upvote_upweights_family():
     assert priors["node_kubelet_pressure"] > 1.0
 
 
+def test_image_pull_feedback_targets_image_pull_family():
+    priors = derive_priors([_hint("up", "image pull registry auth was the cause")])
+    assert priors["image_pull_error"] > 1.0
+    assert "workload_startup_error" not in priors
+
+
+def test_positive_feedback_ignores_negated_family_mentions():
+    priors = derive_priors(
+        [_hint("up", "control plane was fine; not quota; image pull auth was the cause")]
+    )
+    assert priors["image_pull_error"] > 1.0
+    assert "runai_control_plane_error" not in priors
+    assert "runai_scheduling_quota" not in priors
+
+
+def test_negative_feedback_downweights_rejected_family_not_correct_alternative():
+    priors = derive_priors([_hint("down", "not quota; image pull auth was the cause")])
+    assert priors["runai_scheduling_quota"] < 1.0
+    assert "image_pull_error" not in priors
+
+
 def test_empty_hints_returns_empty():
     assert derive_priors([]) == {}
     assert derive_priors(None) == {}
@@ -58,6 +79,9 @@ def test_dict_hints_supported():
 if __name__ == "__main__":
     test_downvote_mentioning_control_plane_downweights_family()
     test_upvote_upweights_family()
+    test_image_pull_feedback_targets_image_pull_family()
+    test_positive_feedback_ignores_negated_family_mentions()
+    test_negative_feedback_downweights_rejected_family_not_correct_alternative()
     test_empty_hints_returns_empty()
     test_hint_without_known_family_ignored()
     test_neutral_sentiment_ignored()

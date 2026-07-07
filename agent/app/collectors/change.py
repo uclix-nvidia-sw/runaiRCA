@@ -23,6 +23,7 @@ from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, ar
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import complete, llm_configured
+from app.masking import build_masker
 
 # How far back a change still counts as "recent" and relevant to this alert.
 # ponytail: fixed window; make it an env setting only if a real alert needs tuning.
@@ -310,8 +311,19 @@ async def _senior_insight(settings: Settings, changes: list[dict]) -> str:
     )
     if getattr(settings, "language", "en") == "ko":
         system += " 한국어로 답하세요 (무엇이 언제 바뀌었고 → 알림을 유발했을 가능성)."
-    user = str(compact([c.get("summary") for c in changes[:15]], limit=15))
-    return await complete(settings, system=system, user=user, max_tokens=160) or ""
+    user = _collector_masker(settings).mask_text(
+        str(compact([c.get("summary") for c in changes[:15]], limit=15))
+    )
+    text = await complete(settings, system=system, user=user, max_tokens=160) or ""
+    return _collector_masker(settings).mask_text(text)
+
+
+def _collector_masker(settings: Settings):
+    return build_masker(
+        settings.masking_regex_list,
+        builtin_enabled=settings.builtin_redaction_enabled,
+        hash_mode=settings.builtin_redaction_hash_mode,
+    )
 
 
 def _first_namespace(plan) -> str:  # noqa: ANN001

@@ -5,6 +5,7 @@ empty (the exact production case: system agent unreachable, loki failed)."""
 
 from __future__ import annotations
 
+from app.collectors.base import CollectorResult, artifact
 from app.knowledge import load_failure_modes, match_failure_mode_symptoms
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services.pipeline import (
@@ -32,6 +33,65 @@ def _xid_request() -> AlertAnalysisRequest:
 def test_xid_code_extracted_from_alert_text_alone() -> None:
     # No collector evidence at all — the code must still come from the alert.
     assert _xid_codes_from_results([], _alert_text(_xid_request())) == [79]
+
+
+def test_xid_code_extracted_from_drilldown_artifact() -> None:
+    # Drill-down can be the first place a GPU fault appears; it must still feed
+    # XID promotion and graph remediation, not just the appendix evidence card.
+    result = CollectorResult(agent="system", status="ok", summary="checked dmesg")
+    result.artifacts.append(
+        artifact(
+            agent="system",
+            source="system",
+            type="drilldown_query",
+            status="ok",
+            confidence="medium",
+            summary="dmesg returned signals: **Xid 79**",
+            result={"lines": ["NVRM: Xid 79 GPU has fallen off the bus"]},
+        )
+    )
+    assert _xid_codes_from_results([result]) == [79]
+
+
+def test_xid_code_extracted_from_structured_artifact_value() -> None:
+    result = CollectorResult(agent="system", status="ok", summary="checked dcgm")
+    result.artifacts.append(
+        artifact(
+            agent="system",
+            source="system",
+            type="drilldown_query",
+            status="ok",
+            confidence="medium",
+            summary="dcgm returned a structured fault",
+            result={"xid": 79, "status": "faulted"},
+        )
+    )
+    assert _xid_codes_from_results([result]) == [79]
+
+
+def test_unavailable_artifact_xid_is_not_evidence() -> None:
+    result = CollectorResult(agent="system", status="ok", summary="dcgm query failed")
+    result.artifacts.append(
+        artifact(
+            agent="system",
+            source="system",
+            type="drilldown_query",
+            status="unavailable",
+            confidence="low",
+            summary="failed query mentioned Xid 79",
+            result={"xid": 79, "error": "connection refused"},
+        )
+    )
+    assert _xid_codes_from_results([result]) == []
+
+
+def test_unavailable_collector_xid_summary_is_not_evidence() -> None:
+    result = CollectorResult(
+        agent="system",
+        status="unavailable",
+        summary="system agent failed before evidence; error mentioned Xid 79",
+    )
+    assert _xid_codes_from_results([result]) == []
 
 
 def test_symptom_matches_from_alert_text_alone() -> None:
@@ -84,8 +144,12 @@ def test_signature_promotion_beats_ranker_and_respects_precedence() -> None:
     # XID outranks both
     out = _promote_signature_cause(ranked, [79], ki, sym)
     assert out[0].family == "gpu_hardware_error" and out[0].confidence == "high"
-    # signature agreeing with the ranker keeps the richer ranked entry
+    # signature agreeing with the ranker keeps the ranked family and adds signature support
     agree = [("node_kubelet_pressure", {"symptom": "Node Disk Pressure"})]
-    assert _promote_signature_cause(ranked, [], [], agree)[0] is ranked[0]
+    out = _promote_signature_cause(ranked, [], [], agree)
+    assert out[0].family == "node_kubelet_pressure"
+    assert out[0].score == 7.0
+    assert out[0].rationale == ["matched curated symptom: Node Disk Pressure"]
+    assert out[0].evidence_agents == ["signature"]
     # nothing matched -> ranker stands
     assert _promote_signature_cause(ranked, [], [], [])[0].family == "node_kubelet_pressure"

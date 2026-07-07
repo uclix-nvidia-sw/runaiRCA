@@ -2060,8 +2060,13 @@ td span.occurrence-pill {
 
 .token-usage {
   display: inline-flex;
+  align-items: center;
   width: fit-content;
   margin-bottom: 0.75rem;
+  /* .diagnostics is a 2-col grid: without these the pill is stretched to the
+     tallest neighbouring group and renders as a giant capsule */
+  grid-column: 1 / -1;
+  align-self: start;
 }
 
 .progress-timeline {

@@ -320,10 +320,11 @@
   namespace: runai
   kind: DaemonSet
   purpose: "Per-node runtime piece enabling GPU fractions/memory limits inside containers."
-  failure_effect: "Fraction workloads on that node fail to start or see wrong GPU memory."
-  depends_on: []
+  failure_effect: "Fraction workloads on that node fail to start or see wrong GPU memory. If this daemonset itself won't come up on a node, the NVIDIA GPU Operator stack on that node (driver -> container toolkit -> device plugin) is the usual upstream cause."
+  depends_on: [nvidia-container-toolkit-daemonset, nvidia-driver-daemonset]
   checks:
     - "kubectl logs -n runai ds/runai-container-toolkit --tail=100   # add --selector spec.nodeName=<node>"
+    - "kubectl get pods -n gpu-operator -o wide | grep <node>   # upstream GPU stack health on that node"
 
 - component: workload-overseer
   layer: cluster
@@ -344,6 +345,78 @@
   depends_on: [runai-operator]
   checks:
     - "kubectl logs -n runai deploy/engine-operator --tail=200"
+
+# --- NVIDIA operators (GPU + network stacks Run:ai sits on) -----------------
+# GPU Operator: docs.nvidia.com/datacenter/cloud-native/gpu-operator/25.10/troubleshooting.html
+# Network Operator: docs.nvidia.com/dgx-superpod/dgx-explained/network-operator/latest/common-issues-troubleshooting.html
+# Namespaces are the defaults (gpu-operator / nvidia-network-operator) — adjust
+# per install if the operators were deployed elsewhere.
+
+- component: gpu-operator
+  layer: cluster
+  namespace: gpu-operator
+  kind: Deployment
+  purpose: "NVIDIA GPU Operator: orchestrates the per-node GPU stack (driver, container toolkit, device plugin, DCGM, validator) as operand daemonsets."
+  failure_effect: "GPU operand daemonsets missing or stuck cluster-wide (DESIRED 0 usually = NoSchedule taints); on 300+ node clusters the operator itself can OOM-crashloop at its default memory limit."
+  depends_on: []
+  checks:
+    - "kubectl get ds -n gpu-operator   # DESIRED 0 -> check node taints"
+    - "kubectl get pod -n gpu-operator -l app=gpu-operator"
+
+- component: nvidia-driver-daemonset
+  layer: cluster
+  namespace: gpu-operator
+  kind: DaemonSet
+  purpose: "Installs/loads the NVIDIA kernel driver on every GPU node; all other GPU operands wait on it (they sit in Init until the driver is ready)."
+  failure_effect: "Every GPU operand pod on the node stays in Init and workloads see no GPUs. Usual causes: nouveau still loaded ('Failed to enable MSI-X'), no internet for driver packages, EFI Secure Boot enabled, NVSwitch fabric manager not initialized."
+  depends_on: [gpu-operator]
+  checks:
+    - "kubectl logs -n gpu-operator ds/nvidia-driver-daemonset -c nvidia-driver-ctr --tail=100"
+    - "kubectl exec -n gpu-operator <driver-pod> -c nvidia-driver-ctr -- dmesg | grep -iE 'nvrm|xid|nouveau'"
+    - "kubectl get nodes -l nvidia.com/gpu-driver-upgrade-state=upgrade-failed"
+
+- component: nvidia-container-toolkit-daemonset
+  layer: cluster
+  namespace: gpu-operator
+  kind: DaemonSet
+  purpose: "Registers the 'nvidia' runtime handler in containerd/CRI-O so GPU containers can start on the node."
+  failure_effect: "GPU pods on the node fail sandbox creation with 'no runtime for \"nvidia\" is configured'; Run:ai's container toolkit and fraction workloads cannot start there."
+  depends_on: [nvidia-driver-daemonset]
+  checks:
+    - "kubectl logs -n gpu-operator ds/nvidia-container-toolkit-daemonset -c nvidia-container-toolkit-ctr --tail=100"
+
+- component: nvidia-device-plugin-daemonset
+  layer: cluster
+  namespace: gpu-operator
+  kind: DaemonSet
+  purpose: "Advertises nvidia.com/gpu to kubelet and health-checks GPUs — marks Xid-faulted GPUs unhealthy and withdraws them from Allocatable."
+  failure_effect: "The node advertises 0 or fewer GPUs than physically installed, so GPU workloads stay Pending; its log names the faulted GPU (XidCriticalError)."
+  depends_on: [nvidia-container-toolkit-daemonset, nvidia-driver-daemonset]
+  checks:
+    - "kubectl logs -n gpu-operator ds/nvidia-device-plugin-daemonset --tail=100 | grep -i xid"
+    - "kubectl describe node <node> | grep -A3 'nvidia.com/gpu'"
+
+- component: network-operator
+  layer: cluster
+  namespace: nvidia-network-operator
+  kind: Deployment
+  purpose: "NVIDIA Network Operator: reconciles NicClusterPolicy into the high-speed networking stack (DOCA-OFED NIC driver, RDMA shared device plugin, SR-IOV, Multus/secondary networks, IPAM)."
+  failure_effect: "RDMA / GPUDirect RDMA / SR-IOV never exposed to workloads (NicClusterPolicy missing, incomplete, or not reconciled); multi-node training falls back to TCP or fails. Duplicate NFD deployments also conflict here (set nfd.enabled=false when NFD already exists)."
+  depends_on: []
+  checks:
+    - "kubectl get nicclusterpolicy -A -o wide   # state must be ready"
+    - "kubectl get pods -n nvidia-network-operator"
+
+- component: doca-ofed-driver
+  layer: cluster
+  namespace: nvidia-network-operator
+  kind: DaemonSet
+  purpose: "DOCA-OFED NIC driver container for NVIDIA NICs (InfiniBand/RoCE)."
+  failure_effect: "RDMA capability lost on the node. Caution: when the NVIDIA NIC is the node's PRIMARY interface, unloading/replacing the active driver can drop node networking — only basic IP configuration is restored automatically."
+  depends_on: [network-operator]
+  checks:
+    - "kubectl get pods -n nvidia-network-operator -o wide | grep -i ofed"
+    - "kubectl exec -n nvidia-network-operator <ofed-pod> -- ibstat   # link state after a driver reload"
 
 # --- control plane (namespace: runai-backend, self-hosted) ------------------
 

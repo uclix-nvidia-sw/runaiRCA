@@ -27,7 +27,6 @@ _ALLOWED_KEYS = {
     "secret_name",
     "secret_ref",
     "secret_key_ref",
-    "service_account_token",
     "token_budget",
     "token_path",
     "kubernetes_token_path",
@@ -54,15 +53,16 @@ _TEXT_PATTERNS: tuple[Pattern[str], ...] = (
     ),
     re.compile(
         r"(?i)([\"']?(?:access[_-]?key|api[_-]?key|client[_-]?secret|"
-        r"credential|password|secret|token)[\"']?\s*:\s*[\"']?)([^\"',\s}{]+)([\"']?)"
+        r"credential|password|secret|[a-z0-9_-]*token)[\"']?\s*:\s*[\"']?)"
+        r"([^\"',\s}{]+)([\"']?)"
     ),
     re.compile(
         r"(?i)\b((?:access[_-]?key|api[_-]?key|client[_-]?secret|"
-        r"credential|password|secret|token)\s*[:=]\s*)([^\s,;]+)"
+        r"credential|password|secret|[a-z0-9_-]*token)\s*[:=]\s*)([^\s,;]+)"
     ),
     re.compile(
         r"(?i)(--(?:access[_-]?key|api[_-]?key|client[_-]?secret|"
-        r"credential|password|secret|token)=)(\S+)"
+        r"credential|password|secret|[a-z0-9_-]*token)=)(\S+)"
     ),
 )
 _LONG_BASE64_RE = re.compile(

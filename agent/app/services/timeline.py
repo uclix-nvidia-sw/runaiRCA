@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.collectors.base import CollectorResult
+from app.masking import Masker, build_masker
 
 # Leading timestamp on a raw kernel/host log line, e.g.
 # "2026-07-02T10:15:03Z ...", "Jul  2 10:15:03 ...", or "[ 1234.56] ...".
@@ -33,9 +34,12 @@ def build_timeline(results: list[CollectorResult]) -> list[dict]:
     last (stable) so nothing is silently dropped.
     """
     entries: list[dict] = []
+    masker = build_masker(())
     for result in results or []:
+        if result.status not in ("ok", "partial"):
+            continue
         try:
-            entries.extend(_from_result(result))
+            entries.extend(_sanitize_entry(entry, masker) for entry in _from_result(result))
         except Exception:  # noqa: BLE001 - a bad collector shape never breaks the timeline
             continue
     entries.sort(key=lambda e: (_sort_key(e.get("timestamp")), e.get("source", "")))
@@ -46,11 +50,13 @@ def to_markdown(timeline: list[dict], *, limit: int = 30) -> str:
     if not timeline:
         return "- No timestamped signals were correlated across collectors."
     lines = []
+    masker = build_masker(())
     for entry in timeline[:limit]:
-        ts = entry.get("timestamp") or "unknown-time"
+        ts = _clean_timestamp(entry.get("timestamp") or "unknown-time", masker)
         lines.append(
-            f"- `{ts}` **{entry.get('source', '?')}** "
-            f"({entry.get('kind', 'event')}): {entry.get('message', '')}"
+            f"- `{ts}` **{_clean(entry.get('source', '?'), masker, limit=80)}** "
+            f"({_clean(entry.get('kind', 'event'), masker, limit=120)}): "
+            f"{_clean(entry.get('message', ''), masker, limit=300)}"
         )
     if len(timeline) > limit:
         lines.append(f"- … and {len(timeline) - limit} more signal(s)")
@@ -166,6 +172,29 @@ def _sort_key(ts: object) -> tuple[int, float, str]:
     if parsed is None:
         return (1, 0.0, text)
     return (0, parsed.timestamp(), text)
+
+
+def _sanitize_entry(entry: dict, masker: Masker) -> dict:
+    return {
+        "timestamp": _clean_timestamp(entry.get("timestamp"), masker),
+        "source": _clean(entry.get("source"), masker, limit=80),
+        "kind": _clean(entry.get("kind"), masker, limit=120),
+        "message": _clean(entry.get("message"), masker, limit=300),
+    }
+
+
+def _clean_timestamp(value: object, masker: Masker) -> str:
+    text = masker.mask_text(_str(value)).replace("\n", " ").replace("\r", " ")
+    if len(text) <= 120:
+        return text
+    return text[:119].rstrip() + "…"
+
+
+def _clean(value: object, masker: Masker, *, limit: int) -> str:
+    text = " ".join(masker.mask_text(_str(value)).split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
 
 
 def _parse(text: str) -> datetime | None:

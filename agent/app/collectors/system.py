@@ -19,6 +19,7 @@ from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, ar
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import complete, llm_configured
+from app.masking import build_masker
 
 # Host/kernel/GPU/hardware error signatures worth surfacing to RCA. Case-insensitive.
 # ponytail: flat regex list, not a rule engine — add patterns here as they show up.
@@ -207,8 +208,19 @@ async def _llm_insight(settings: Settings, node: str, error_lines: list[str]) ->
     )
     if getattr(settings, "language", "en") == "ko":
         system += " 한국어로 답하세요 (관찰한 것 → 의미 → 시작 시점)."
-    user = f"Node {node} recent kernel/host error lines:\n" + "\n".join(error_lines[:20])
-    return await complete(settings, system=system, user=user, max_tokens=160)
+    user = _collector_masker(settings).mask_text(
+        f"Node {node} recent kernel/host error lines:\n" + "\n".join(error_lines[:20])
+    )
+    text = await complete(settings, system=system, user=user, max_tokens=160) or ""
+    return _collector_masker(settings).mask_text(text)
+
+
+def _collector_masker(settings: Settings):
+    return build_masker(
+        settings.masking_regex_list,
+        builtin_enabled=settings.builtin_redaction_enabled,
+        hash_mode=settings.builtin_redaction_hash_mode,
+    )
 
 
 async def _node_internal_ip(settings: Settings, node: str) -> str:
@@ -226,7 +238,7 @@ async def _node_internal_ip(settings: Settings, node: str) -> str:
         )
         response = await get_json(
             base_url=settings.kubernetes_api_url,
-            path=f"/api/v1/nodes/{quote(node)}",
+            path=f"/api/v1/nodes/{quote(node, safe='')}",
             timeout_seconds=settings.kubernetes_timeout_seconds,
             headers={"Authorization": f"Bearer {token}"},
             verify=verify,
@@ -252,7 +264,7 @@ def _base_url_for_node(url_template: str, node: str) -> str:
     present the value is used as-is (single shared endpoint that routes by ?node).
     """
     if "{node}" in url_template:
-        return url_template.replace("{node}", node)
+        return url_template.replace("{node}", quote(node, safe=".-"))
     return url_template
 
 

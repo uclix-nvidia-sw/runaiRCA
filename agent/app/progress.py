@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
+from urllib.parse import quote
 
 from app.collectors.http_json import post_json
 from app.config import Settings
 from app.masking import Masker, RedactingMasker
+
+_RUN_ID_RE = re.compile(r"^ANL-[A-Za-z0-9._-]{1,128}$")
 
 
 class ProgressReporter:
@@ -28,7 +32,7 @@ class ProgressReporter:
 
     @property
     def enabled(self) -> bool:
-        return bool(self._backend_url and self._run_id)
+        return bool(self._backend_url and _RUN_ID_RE.fullmatch(self._run_id))
 
     def emit(self, phase: str, message: str, **fields: Any) -> None:
         if not self.enabled:
@@ -40,14 +44,19 @@ class ProgressReporter:
         }
         try:
             masked = self._masker.mask_object(payload)
-            asyncio.create_task(self._post(masked if isinstance(masked, dict) else payload))
+            if not isinstance(masked, dict):
+                return
+            asyncio.create_task(self._post(masked))
         except Exception:  # noqa: BLE001 - progress must never affect analysis
             return
 
     async def _post(self, payload: dict[str, Any]) -> None:
         try:
             await post_json(
-                url=f"{self._backend_url}/api/v1/analysis-runs/{self._run_id}/progress",
+                url=(
+                    f"{self._backend_url}/api/v1/analysis-runs/"
+                    f"{quote(self._run_id, safe='')}/progress"
+                ),
                 timeout_seconds=3,
                 json_body=payload,
             )

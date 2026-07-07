@@ -30,6 +30,7 @@ import json
 import logging
 import re
 from typing import Any
+from urllib.parse import unquote, urlencode
 
 from app.collectors.base import (
     AnalysisTarget,
@@ -44,14 +45,20 @@ from app.collectors.kubernetes import (
     k8s_read,
     kind_lookup_title,
     kubectl_repr,
-    resolve_read_kind,
 )
 from app.collectors.loki import _loki_headers, _loki_streams, _sample_lines, loki_mcp_query
 from app.collectors.prometheus import prom_mcp_query, prom_query
 from app.collectors.runai_mcp import _tool_json, _tool_text
 from app.config import Settings
 from app.llm import complete_json, llm_configured, token_budget_exceeded, token_budget_warning
-from app.mcp_client import MCP_FALLBACK_WARNING, mcp_call, mcp_error, mcp_tool_json
+from app.masking import build_masker
+from app.mcp_client import (
+    MCP_FALLBACK_WARNING,
+    mcp_call,
+    mcp_error,
+    mcp_fallback_warning,
+    mcp_tool_json,
+)
 from app.plan import InvestigationPlan
 
 _log = logging.getLogger(__name__)
@@ -90,19 +97,39 @@ async def _drill_one(
     plan: InvestigationPlan | None,
 ) -> None:
     """One agent's bounded think->query->observe loop over its own evidence."""
+    masker = _drilldown_masker(settings)
     try:
+        architecture = _implicated_architecture(settings, result, target)
         history: list[dict[str, Any]] = []
-        for _ in range(max(1, settings.drilldown_max_steps)):
+        for step in range(max(1, settings.drilldown_max_steps)):
             if token_budget_exceeded(settings):
                 result.warnings.append(token_budget_warning(settings))
                 break
+            user_prompt = masker.mask_text(
+                _user_prompt(result, target, plan, history, architecture)
+            )
             decision = await complete_json(
                 settings,
                 system=_system_prompt(result.agent, tools),
-                user=_user_prompt(result, target, plan, history),
+                user=user_prompt,
                 model=settings.llm_model_drilldown,
             )
+            if decision is None:
+                # An LLM transport/parse failure must be distinguishable from a
+                # legitimate "done" — otherwise a dead LLM looks like a satisfied
+                # agent and nobody notices drill-down never ran (the litellm
+                # provider incident). Surface it in the report warnings.
+                result.warnings.append(
+                    f"{result.agent} drill-down stopped at step {step + 1}: "
+                    "LLM decision call failed"
+                )
+                break
             if not isinstance(decision, dict) or decision.get("action") != "query":
+                _log.info(
+                    "drilldown %s: done after %d follow-up quer(ies)",
+                    result.agent,
+                    len(history),
+                )
                 break
             queries = [
                 q
@@ -110,22 +137,37 @@ async def _drill_one(
                 if isinstance(q, dict) and str(q.get("tool") or "") in tools
             ][:_MAX_QUERIES_PER_STEP]
             if not queries:
+                result.warnings.append(
+                    f"{result.agent} drill-down stopped at step {step + 1}: "
+                    "no allowed read-only query was returned"
+                )
                 break
+            _log.info(
+                "drilldown %s: step %d running %d quer(ies)",
+                result.agent,
+                step + 1,
+                len(queries),
+            )
             for q in queries:
                 name = str(q.get("tool"))
                 args = q.get("args") if isinstance(q.get("args"), dict) else {}
                 outcome = await _call_tool_safely(tools[name]["call"], settings, target, args)
+                outcome = masker.mask_object(outcome)
+                if not isinstance(outcome, dict):
+                    outcome = {"error": "tool returned no result"}
+                error = outcome.get("error")
+                history_outcome = {"error": "query failed"} if error else outcome
                 history.append(
                     {
                         "tool": name,
                         "args": json.dumps(args, default=str)[:300],
-                        "outcome": json.dumps(outcome, default=str)[:_RESULT_CHARS],
+                        "outcome": json.dumps(history_outcome, default=str)[:_RESULT_CHARS],
                     }
                 )
                 # Finding-first: surface the problem signals in the data and hand
                 # them to the UI as highlights; the raw result stays attached.
-                markers = salient_markers(outcome.get("result"))
-                summary = str(outcome.get("summary") or outcome.get("error") or name)
+                markers = [] if error else salient_markers(outcome.get("result"))
+                summary = str(outcome.get("summary") or error or name)
                 if markers:
                     summary = (
                         f"{summary} — {signals_line(markers, getattr(settings, 'language', 'en'))}"
@@ -135,7 +177,7 @@ async def _drill_one(
                         agent=result.agent,
                         source=result.agent,
                         type="drilldown_query",
-                        status="unavailable" if outcome.get("error") else "ok",
+                        status="unavailable" if error else "ok",
                         confidence="medium",
                         query=str(outcome.get("query") or name),
                         title=outcome.get("title"),
@@ -144,7 +186,11 @@ async def _drill_one(
                         result=outcome.get("result"),
                     )
                 )
-    except Exception:  # noqa: BLE001 - drill-down is best-effort; base evidence stands
+    except Exception as exc:  # noqa: BLE001 - drill-down is best-effort; base evidence stands
+        result.warnings.append(
+            f"{result.agent} drill-down aborted: "
+            f"{masker.mask_text(f'{exc.__class__.__name__}: {exc}')}"
+        )
         _log.debug("drill-down for %s aborted", result.agent, exc_info=True)
 
 
@@ -156,6 +202,14 @@ async def _call_tool_safely(
         return outcome if isinstance(outcome, dict) else {"error": "tool returned no result"}
     except Exception as exc:  # noqa: BLE001 - a failing query is an observation
         return {"error": f"{exc.__class__.__name__}: {exc}"}
+
+
+def _drilldown_masker(settings: Settings):
+    return build_masker(
+        settings.masking_regex_list,
+        builtin_enabled=settings.builtin_redaction_enabled,
+        hash_mode=settings.builtin_redaction_hash_mode,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +240,7 @@ def _user_prompt(
     target: AnalysisTarget,
     plan: InvestigationPlan | None,
     history: list[dict[str, Any]],
+    architecture: list[str] | None = None,
 ) -> str:
     plan_dict = plan.as_dict() if plan else {}
     payload = {
@@ -197,12 +252,196 @@ def _user_prompt(
         "hypotheses": (plan_dict.get("hypotheses") or [])[:4],
         "my_summary": (result.summary or "")[:1200],
         "my_artifacts": [
-            {"type": art.type, "summary": (art.summary or "")[:300]}
+            _artifact_prompt_item(art)
             for art in result.artifacts[-8:]
+            if _artifact_is_evidence(art)
         ],
         "drilldown_so_far": history[-8:],
     }
-    return json.dumps(payload, default=str)[:_USER_PROMPT_CHARS]
+    if architecture:
+        # Curated platform topology for the components THIS incident implicates:
+        # what each does when broken and which dependency to check next — the
+        # "thinking material" that used to reach only the playbook renderer.
+        payload["platform_architecture"] = architecture
+    return json.dumps(payload, default=str, ensure_ascii=False)[:_USER_PROMPT_CHARS]
+
+
+def _compact_value(value: Any, *, limit: int) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+    return " ".join(text.split())[:limit]
+
+
+def _artifact_prompt_item(art: Any) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "type": art.type,
+        "status": art.status,
+        "summary": (art.summary or "")[:300],
+    }
+    if art.query:
+        item["query"] = _compact_value(art.query, limit=300)
+    if art.highlights:
+        item["highlights"] = art.highlights[:6]
+    if art.result is not None:
+        item["result"] = _compact_value(art.result, limit=900)
+    return item
+
+
+def _artifact_is_evidence(art: Any) -> bool:
+    return getattr(art, "status", "") in ("ok", "partial")
+
+
+def _string_leaf_text(value: Any, *, limit: int = 1200) -> str:
+    leaves: list[str] = []
+
+    def walk(node: Any) -> None:
+        if len(" ".join(leaves)) >= limit:
+            return
+        if isinstance(node, str):
+            leaves.append(node)
+        elif isinstance(node, dict):
+            for child in node.values():
+                walk(child)
+        elif isinstance(node, (list, tuple)):
+            for child in node:
+                walk(child)
+
+    walk(value)
+    return " ".join(" ".join(leaves).split())[:limit]
+
+
+def _artifact_architecture_text(art: Any) -> str:
+    if not _artifact_is_evidence(art):
+        return ""
+    parts = [art.summary or ""]
+    if art.highlights:
+        parts.append(" ".join(map(str, art.highlights[:6])))
+    if art.result is not None:
+        parts.append(_string_leaf_text(art.result))
+    return " ".join(part for part in parts if part)
+
+
+def _implicated_architecture(
+    settings: Settings, result: CollectorResult, target: AnalysisTarget
+) -> list[str]:
+    """Topology lines for the platform components this incident implicates.
+
+    A component is implicated when its name appears in the target identifiers
+    (workload/pod/alert) or this agent's evidence text. Ranked by relevance —
+    target-identifier matches (the alert's actual subject) before incidental
+    evidence mentions, more specific names first, and names subsumed by a more
+    specific match are dropped — so a broad evidence sweep can't crowd the
+    subject component out of the cap. Each implicated component contributes its
+    failure effect plus its dependency check order — a deterministic slice of
+    runai_architecture.yaml, no knowledge-graph round-trip. Empty for pure
+    user-workload incidents (correct: a user's training job is not a platform
+    component)."""
+    from app.knowledge import dependency_path, load_architecture
+
+    components = load_architecture(getattr(settings, "architecture_file", ""))
+    if not components:
+        return []
+    target_text = " ".join([target.workload_name, target.pod, target.alert_name]).lower()
+    evidence_text = " ".join(
+        [result.summary or "", *(_artifact_architecture_text(art) for art in result.artifacts[-8:])]
+    ).lower()
+    ranked: list[tuple[int, int, str]] = []
+    for name in components:
+        lowered = name.lower()
+        if lowered in target_text:
+            ranked.append((0, -len(name), name))
+        elif _component_mentioned_as_evidence(evidence_text, lowered):
+            ranked.append((1, -len(name), name))
+    ranked.sort()
+    rank_of = {name: bucket for bucket, _, name in ranked}
+    implicated = [name for _, _, name in ranked]
+    # A name is subsumed only by a more specific match of EQUAL OR BETTER rank —
+    # an incidental evidence mention must never eat the alert's target match.
+    implicated = [
+        name
+        for name in implicated
+        if not any(
+            other != name
+            and name.lower() in other.lower()
+            and rank_of[other] <= rank_of[name]
+            for other in implicated
+        )
+    ]
+    lines: list[str] = []
+    seen: set[str] = set()
+    for name in implicated[:3]:
+        chain = dependency_path(components, name)
+        if len(chain) > 1:
+            lines.append(f"{name} check order: " + " → ".join(chain))
+        for dep in chain[:4]:
+            if dep in seen:
+                continue
+            seen.add(dep)
+            entry = components.get(dep) or {}
+            effect = entry.get("failure_effect") or entry.get("purpose") or ""
+            if effect:
+                lines.append(f"{dep}: {effect}")
+    return lines[:10]
+
+
+_HEALTHY_COMPONENT_SUFFIX_RE = re.compile(
+    r"^\W*(?:is|are|was|were|looks?|looked)?\s*"
+    r"(?:ok|healthy|running|ready|stable|normal|reachable|up)\b"
+    r"|^\W*(?:has|had|shows?|showed|reports?|reported)?\s*(?:no|zero|0)\s+"
+    r"(?:issues?|errors?|restarts?|failures?|problems?|warnings?|matching\s+errors)\b"
+    r"|^\W*(?:logs?\s+)?(?:and\s+)?found\s+(?:no|zero|0)\s+"
+    r"(?:matching\s+)?(?:errors?|issues?|failures?)\b"
+    r"|^\W*(?:not\s+implicated|unrelated|excluded)\b"
+    r"|^\W*(?:errors?|issues?|failures?|problems?)\s+(?:were\s+)?ruled\s+out\b"
+)
+_HEALTHY_COMPONENT_PREFIX_RE = re.compile(
+    r"\b(?:ok|healthy|running|ready|stable|normal|reachable|up)"
+    r"(?:\s+components?)?\W+(?:[\w-]+\W+){0,4}$"
+    r"|\b(?:no|without)\s+"
+    r"(?:issues?|errors?|restarts?|failures?|problems?|warnings?)\s+"
+    r"(?:in|with|for|on)\b.{0,80}$"
+)
+_CONTRAST_WORD_RE = re.compile(r"\b(?:but|however|except|though|yet)\b")
+_NON_EVIDENCE_COMPONENT_PREFIX_RE = re.compile(
+    r"\b(?:docs?\s+example|runbook\s+example|sample\s+(?:payload|log\s+line)|"
+    r"example\s+alert|question|template\s+includes|playbook\s+mentions|"
+    r"todo\s+check|check\s+for)\b"
+)
+_UNHEALTHY_COMPONENT_SUFFIX_RE = re.compile(
+    r"^\W*(?:is|are|was|were|looks?|looked)?\s*"
+    r"(?:not\s+(?:ok|healthy|running|ready|stable|normal|reachable|up)|"
+    r"unhealthy|disconnected|unavailable|down|failing|failed|error|errors?)\b"
+)
+
+
+def _component_mentioned_as_evidence(text: str, component: str) -> bool:
+    from app.knowledge import _keyword_negated
+
+    for match in re.finditer(re.escape(component), text):
+        prefix = text[max(0, match.start() - 80) : match.start()]
+        suffix = text[match.end() : match.end() + 80]
+        prefix_clause = re.split(r"[.;\n]", prefix)[-1]
+        suffix_clause = re.split(r"[.;\n]", suffix)[0]
+        if _NON_EVIDENCE_COMPONENT_PREFIX_RE.search(prefix_clause):
+            continue
+        if _HEALTHY_COMPONENT_SUFFIX_RE.match(suffix_clause) or (
+            _HEALTHY_COMPONENT_PREFIX_RE.search(prefix_clause)
+            and not _CONTRAST_WORD_RE.search(prefix_clause)
+        ):
+            continue
+        if _keyword_negated(text, match.start(), match.end()) and not (
+            _UNHEALTHY_COMPONENT_SUFFIX_RE.match(suffix_clause)
+        ):
+            continue
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -314,33 +553,15 @@ async def _tool_k8s_read(settings: Settings, target: AnalysisTarget, args: dict)
     namespace = str(args.get("namespace") or "")
     name = str(args.get("name") or "")
     label_selector = str(args.get("label_selector") or "")
-    fallback = ""
-    if settings.kubernetes_mcp_url:
-        try:
-            item = await _k8s_read_mcp(
-                settings, kind, namespace=namespace, name=name, label_selector=label_selector
-            )
-            error = item.get("error")
-            return {
-                "query": kubectl_repr(
-                    kind, namespace=namespace, name=name, label_selector=label_selector
-                ),
-                "title": kind_lookup_title(kind, getattr(settings, "language", "en")),
-                "summary": (str(error) if error else "MCP read ok"),
-                "error": error,
-                "result": item,
-            }
-        except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
-            fallback = f"{MCP_FALLBACK_WARNING}: {exc.__class__.__name__}"
-    else:
-        fallback = f"{MCP_FALLBACK_WARNING}: KUBERNETES_MCP_URL not configured"
+    # k8s_read is MCP-first with direct fallback — transport policy lives THERE,
+    # so every k8s read path (followup / investigation / drill-down) shares it.
     item = await k8s_read(
         settings, kind, namespace=namespace, name=name, label_selector=label_selector
     )
     error = item.get("error")
     summary = str(error) if error else f"HTTP {item.get('status_code')}"
-    if fallback:
-        summary = f"{fallback}; {summary}"
+    if item.get("mcp_fallback"):
+        summary = f"{item['mcp_fallback']}; {summary}"
     return {
         # The real command an operator would have typed, not a param dump.
         "query": kubectl_repr(kind, namespace=namespace, name=name, label_selector=label_selector),
@@ -349,125 +570,6 @@ async def _tool_k8s_read(settings: Settings, target: AnalysisTarget, args: dict)
         "error": error,
         "result": item,
     }
-
-
-async def _k8s_read_mcp(
-    settings: Settings,
-    kind: str,
-    namespace: str = "",
-    name: str = "",
-    label_selector: str = "",
-) -> dict:
-    resolved = resolve_read_kind(kind)
-    if not resolved:
-        return {
-            "kind": kind,
-            "error": "kind is not in the read-only allowlist",
-            "allowed_kinds": sorted(_READ_KINDS),
-        }
-    api_version, mcp_kind = _k8s_mcp_resource_kind(resolved)
-    candidates: list[tuple[str, dict[str, object]]] = []
-    if name:
-        if resolved == "pods":
-            candidates.extend(
-                [
-                    ("pods_get", {"namespace": namespace, "name": name}),
-                    ("pods_get", {"namespace": namespace, "pod": name}),
-                ]
-            )
-        candidates.extend(
-            [
-                (
-                    "resources_get",
-                    {
-                        "apiVersion": api_version,
-                        "kind": mcp_kind,
-                        "namespace": namespace,
-                        "name": name,
-                    },
-                ),
-                ("resources_get", {"kind": resolved, "namespace": namespace, "name": name}),
-            ]
-        )
-    else:
-        if resolved == "pods":
-            candidates.extend(
-                [
-                    ("pods_list_in_namespace", {"namespace": namespace}),
-                    ("pods_list", {"namespace": namespace}),
-                ]
-            )
-        elif resolved == "events":
-            candidates.append(("events_list", {"namespace": namespace}))
-        args: dict[str, object] = {
-            "apiVersion": api_version,
-            "kind": mcp_kind,
-            "namespace": namespace,
-        }
-        if label_selector:
-            args["labelSelector"] = label_selector
-        candidates.extend(
-            [
-                ("resources_list", args),
-                ("resources_list", {"kind": resolved, "namespace": namespace}),
-            ]
-        )
-    data = await _mcp_json_candidates(settings.kubernetes_mcp_url, candidates)
-    return {
-        "kind": resolved,
-        "namespace": namespace,
-        "name": name,
-        "label_selector": label_selector,
-        "url": f"{settings.kubernetes_mcp_url}#read_{resolved}",
-        "status_code": 200,
-        "error": None,
-        "data": data,
-    }
-
-
-def _k8s_mcp_resource_kind(kind: str) -> tuple[str, str]:
-    mapping = {
-        "pods": ("v1", "Pod"),
-        "events": ("v1", "Event"),
-        "nodes": ("v1", "Node"),
-        "namespaces": ("v1", "Namespace"),
-        "services": ("v1", "Service"),
-        "endpoints": ("v1", "Endpoints"),
-        "persistentvolumeclaims": ("v1", "PersistentVolumeClaim"),
-        "persistentvolumes": ("v1", "PersistentVolume"),
-        "configmaps": ("v1", "ConfigMap"),
-        "resourcequotas": ("v1", "ResourceQuota"),
-        "deployments": ("apps/v1", "Deployment"),
-        "replicasets": ("apps/v1", "ReplicaSet"),
-        "statefulsets": ("apps/v1", "StatefulSet"),
-        "daemonsets": ("apps/v1", "DaemonSet"),
-        "jobs": ("batch/v1", "Job"),
-        "cronjobs": ("batch/v1", "CronJob"),
-        "storageclasses": ("storage.k8s.io/v1", "StorageClass"),
-    }
-    return mapping.get(kind, ("v1", kind))
-
-
-async def _mcp_json_candidates(
-    url: str, candidates: list[tuple[str, dict[str, object]]]
-) -> object:
-    last_error = ""
-    for tool, arguments in candidates:
-        try:
-            result = await mcp_call(url, tool, arguments)
-        except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
-            last_error = f"{tool}: {exc.__class__.__name__}: {exc}"
-            continue
-        error = mcp_error(result)
-        if error:
-            last_error = f"{tool}: {error}"
-            continue
-        data = mcp_tool_json(result)
-        if isinstance(data, dict) and "raw" in data:
-            last_error = "MCP result was not JSON"
-            continue
-        return data
-    raise RuntimeError(last_error or "MCP tool failed")
 
 
 async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
@@ -492,7 +594,7 @@ async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -
                 "result": item,
             }
         except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
-            fallback = f"{MCP_FALLBACK_WARNING}: {exc.__class__.__name__}"
+            fallback = mcp_fallback_warning(exc)
     else:
         fallback = f"{MCP_FALLBACK_WARNING}: PROMETHEUS_MCP_URL not configured"
     if not settings.prometheus_url:
@@ -533,7 +635,7 @@ async def _tool_logql(settings: Settings, target: AnalysisTarget, args: dict) ->
                 "result": item,
             }
         except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
-            fallback = f"{MCP_FALLBACK_WARNING}: {exc.__class__.__name__}"
+            fallback = mcp_fallback_warning(exc)
     else:
         fallback = f"{MCP_FALLBACK_WARNING}: LOKI_MCP_URL not configured"
     if not settings.loki_url:
@@ -572,21 +674,68 @@ async def _tool_logql(settings: Settings, target: AnalysisTarget, args: dict) ->
 
 _SQL_FORBIDDEN = re.compile(
     r"\b(insert|update|delete|drop|alter|create|grant|revoke|truncate|copy|vacuum|"
-    r"call|do|execute|set|listen|notify|lock|reindex|refresh|prepare|deallocate|merge)\b",
+    r"call|do|execute|set|listen|notify|lock|reindex|refresh|prepare|deallocate|"
+    r"merge|into|pg_sleep|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|"
+    r"pg_rotate_logfile|pg_create_restore_point|pg_start_backup|pg_stop_backup|"
+    r"nextval|setval|pg_advisory_lock|pg_try_advisory_lock|pg_notify|"
+    r"lo_import|lo_export|pg_read_file|pg_read_binary_file|pg_ls_dir|"
+    r"pg_ls_waldir|pg_ls_logdir|pg_ls_archive_statusdir|pg_stat_file|"
+    r"dblink|dblink_exec)\b",
     re.IGNORECASE,
 )
+_SQL_DOLLAR_QUOTE_RE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
+
+
+def _mask_sql_literals(sql: str) -> str:
+    chars = list(sql)
+    i = 0
+    while i < len(sql):
+        char = sql[i]
+        if char == "'":
+            quote = "'"
+            chars[i] = " "
+            i += 1
+            while i < len(sql):
+                chars[i] = " "
+                if sql[i] == quote:
+                    if i + 1 < len(sql) and sql[i + 1] == quote:
+                        chars[i + 1] = " "
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        if char == "$":
+            match = _SQL_DOLLAR_QUOTE_RE.match(sql, i)
+            if match:
+                end = sql.find(match.group(0), match.end())
+                if end >= 0:
+                    end += len(match.group(0))
+                    chars[i:end] = " " * (end - i)
+                    i = end
+                    continue
+        i += 1
+    return "".join(chars)
 
 
 def _validate_select(sql: str) -> tuple[str | None, str]:
     """(error, normalized_sql). Fail-closed: single statement, SELECT/WITH only."""
-    text = " ".join((sql or "").split()).strip().rstrip(";").strip()
+    text = (sql or "").strip()
     if not text:
         return "empty SQL query", text
-    if ";" in text:
+    masked = _mask_sql_literals(text).rstrip()
+    text = text.rstrip()
+    if re.search(r"--|/\*", masked):
+        return "SQL comments are not allowed", text
+    if masked.endswith(";"):
+        text = text[: len(masked) - 1].rstrip()
+        masked = masked[:-1].rstrip()
+    if ";" in masked:
         return "a single SQL statement is required", text
-    if not re.match(r"(?i)^(select|with)\b", text):
+    if not re.match(r"(?i)^\s*(select|with)\b", masked):
         return "only SELECT/WITH queries are allowed", text
-    match = _SQL_FORBIDDEN.search(text)
+    match = _SQL_FORBIDDEN.search(masked)
     if match:
         return f"forbidden SQL keyword: {match.group(0)}", text
     return None, text
@@ -637,7 +786,7 @@ async def _tool_sql_select(settings: Settings, target: AnalysisTarget, args: dic
     error, sql = _validate_select(str(args.get("query") or ""))
     if error:
         return {"query": sql, "title": title, "summary": error, "error": error}
-    if not re.search(r"(?i)\blimit\s+\d", sql):
+    if not re.search(r"(?i)\blimit\s+\d+(?:\s+offset\s+\d+)?\s*$", sql):
         sql = f"{sql} LIMIT 50"
     fallback = ""
     if settings.postgres_mcp_url:
@@ -651,7 +800,7 @@ async def _tool_sql_select(settings: Settings, target: AnalysisTarget, args: dic
                 "result": {"rows": rows},
             }
         except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
-            fallback = f"{MCP_FALLBACK_WARNING}: {exc.__class__.__name__}"
+            fallback = mcp_fallback_warning(exc)
     else:
         fallback = f"{MCP_FALLBACK_WARNING}: POSTGRES_MCP_URL not configured"
     dsn = settings.runai_db_dsn or settings.postgres_dsn
@@ -685,13 +834,14 @@ async def _tool_runai_search(settings: Settings, target: AnalysisTarget, args: d
             "error": "empty search query",
         }
     result = await _mcp_call(settings, "search_runai_api_spec", {"query": query})
-    text = _tool_text(result)[:_RESULT_CHARS]
+    text = _safe_text(_tool_text(result), limit=_RESULT_CHARS)
     if getattr(result, "isError", False):
+        error = mcp_error(result)
         return {
             "query": query,
             "title": title,
-            "summary": text or "tool error",
-            "error": text or "tool error",
+            "summary": error,
+            "error": error,
         }
     return {
         "query": f"search_runai_api_spec {query!r}",
@@ -707,7 +857,17 @@ async def _tool_runai_get(settings: Settings, target: AnalysisTarget, args: dict
     title = _title(settings, "Run:ai API 조회 (GET)", "Run:ai API call (GET)")
     # GET-only under /api/ regardless of what the LLM asks for — the drill-down
     # must never mutate Run:ai state or reach non-API routes.
-    if not path.startswith("/api/"):
+    decoded_path = unquote(path)
+    path_parts = decoded_path.split("/")
+    raw_path_parts = path.split("/")
+    if (
+        not path.startswith("/api/")
+        or "%" in path
+        or len(path_parts) != len(raw_path_parts)
+        or any(part in (".", "..") for part in path_parts)
+        or any(char in decoded_path for char in ("\\", "?", "#"))
+        or any(char.isspace() for char in decoded_path)
+    ):
         error = "only GET requests under /api/ are allowed"
         return {"query": path, "title": title, "summary": error, "error": error}
     raw_params = args.get("query") if isinstance(args.get("query"), dict) else {}
@@ -717,11 +877,9 @@ async def _tool_runai_get(settings: Settings, target: AnalysisTarget, args: dict
         arguments["query"] = params
     result = await _mcp_call(settings, "call_runai_api", arguments)
     # The real request an operator could replay with curl.
-    query = f"GET {path}" + (
-        "?" + "&".join(f"{k}={v}" for k, v in params.items()) if params else ""
-    )
+    query = f"GET {path}" + ("?" + urlencode(params) if params else "")
     if getattr(result, "isError", False):
-        error = _tool_text(result)[:300] or "tool error"
+        error = mcp_error(result)
         return {"query": query, "title": title, "summary": error, "error": error}
     return {
         "query": query,
@@ -730,3 +888,10 @@ async def _tool_runai_get(settings: Settings, target: AnalysisTarget, args: dict
         "error": None,
         "result": _tool_json(result),
     }
+
+
+def _safe_text(value: str, *, limit: int) -> str:
+    text = " ".join(build_masker(()).mask_text(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"

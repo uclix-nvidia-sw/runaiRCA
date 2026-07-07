@@ -8,26 +8,30 @@ orchestrator waits for ALL collectors and runs Korean LLM synthesis when configu
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget
+from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.collectors.loki import LokiCollector
 from app.collectors.postgres import PostgresCollector
 from app.collectors.prometheus import PrometheusCollector
 from app.collectors.runai import RunAICollector
 from app.config import load_settings
-from app.schemas import Alert, AlertAnalysisRequest
+from app.plan import InvestigationPlan
+from app.schemas import Alert, AlertAnalysisRequest, SimilarIncidentContext
 from app.services.kg_enrichment import GraphRemediation, graph_remediation
 from app.services.orchestrator import AnalysisOrchestrator
 from app.services.pipeline import (
     _gpu_model_from,
     _graph_remediation_lines,
+    _synthesize_korean,
     _xid_codes_from_results,
 )
 from app.services.planner import plan_investigation
+from app.services.root_cause_ranking import RankedCause
 from tests.test_orchestrator import make_settings, make_target
 
 
@@ -112,6 +116,17 @@ def test_xid_codes_extracted_from_gpu_evidence() -> None:
     assert _xid_codes_from_results(results) == [79]
 
 
+def test_negated_xid_does_not_promote_gpu_hardware() -> None:
+    results = [
+        CollectorResult(
+            agent="system",
+            status="ok",
+            summary="no Xid 79 observed; GPU healthy",
+        )
+    ]
+    assert _xid_codes_from_results(results, "Xid 31 not observed in alert") == []
+
+
 def test_gpu_model_derived_from_details() -> None:
     results = [SimpleNamespace(agent="prometheus", summary="", details={"gpu_model": "H100"})]
     assert _gpu_model_from(_target(), results) == "H100"
@@ -119,14 +134,19 @@ def test_gpu_model_derived_from_details() -> None:
 
 def test_graph_remediation_lines_render() -> None:
     fixes = GraphRemediation(
-        family_fixes=["Reset the GPU / contact support."],
-        xid_fixes={79: ["Reset the GPU / contact support."]},
-        model_xids={"H100": [79]},
+        family_fixes=["Reset the GPU / contact support api_key=graph-secret-12345.\n## bad"],
+        xid_fixes={79: ["Reset the GPU / contact support password=graph-xid-secret-12345."]},
+        model_xids={"H100\n## bad-model": [79]},
     )
     text = "\n".join(_graph_remediation_lines(fixes))
     assert "Knowledge-graph derived remediation" in text
     assert "NVIDIA Xid 79" in text
-    assert "Known Xid codes for H100: 79" in text
+    assert "Known Xid codes for H100" in text
+    assert "79" in text
+    assert "graph-secret-12345" not in text
+    assert "graph-xid-secret-12345" not in text
+    assert "\n## bad" not in text
+    assert "[MASKED]" in text
     assert _graph_remediation_lines(None) == []
     assert _graph_remediation_lines(GraphRemediation()) == []
 
@@ -196,6 +216,298 @@ async def test_korean_llm_synthesis_replaces_report(monkeypatch) -> None:
     assert response.analysis_summary == "노드 디스크 압박이 근본 원인입니다."
     assert "노드 디스크 압박" in response.analysis_detail
     assert response.analysis_detail == response.analysis
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_prompt_redacts_sensitive_evidence(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko")
+    captured: list[str] = []
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        captured.append(user)
+        return {"summary": "요약", "detail": "본문"}
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "SecretAlert", "namespace": "runai"},
+            annotations={
+                "summary": "token=alert-token-12345",
+                "operator_prompt": "api_key=operator-key-12345",
+            },
+            fingerprint="fp-ko-secret",
+        ),
+        similar_incidents=[
+            {
+                "incident_id": "INC-SECRET",
+                "similarity": 0.9,
+                "analysis_summary": "client_secret=similar-secret-12345",
+            }
+        ],
+    )
+
+    result = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="DiskPressure=True password=collector-password-12345",
+    )
+    result.artifacts.append(
+        artifact(
+            agent="kubernetes",
+            source="kubernetes",
+            type="drilldown_query",
+            status="ok",
+            confidence="medium",
+            query="kubectl get events -n runai",
+            summary="NVRM: Xid 79 token=artifact-token-12345",
+            result={"lines": ["GPU has fallen off the bus api_key=artifact-key-12345"]},
+        )
+    )
+
+    await _synthesize_korean(
+        settings,
+        request=request,
+        results=[result],
+        plan=InvestigationPlan(focus="password=plan-secret-12345"),
+        root_cause_candidates=[
+            RankedCause(
+                family="node_kubelet_pressure",
+                confidence="high",
+                score=6.0,
+                rationale=["api_key=rank-key-12345"],
+            )
+        ],
+        kg_context={
+            "prior_incidents": [{"analysis_summary": "token=kg-token-12345"}],
+            "knowledge": {},
+        },
+        graph_fixes=GraphRemediation(),
+        fallback_detail="fallback",
+    )
+
+    joined = "\n".join(captured)
+    for secret in [
+        "alert-token-12345",
+        "operator-key-12345",
+        "similar-secret-12345",
+        "collector-password-12345",
+        "artifact-token-12345",
+        "artifact-key-12345",
+        "plan-secret-12345",
+        "rank-key-12345",
+        "kg-token-12345",
+    ]:
+        assert secret not in joined
+    assert "NVRM: Xid 79" in joined
+    assert "GPU has fallen off the bus" in joined
+    assert "[MASKED]" in joined
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_folds_operator_guidance_before_prompt(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko")
+    captured: list[str] = []
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        captured.append(user)
+        return {"summary": "요약", "detail": "본문"}
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+
+    await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={"alertname": "RunAIPending", "namespace": "runai"},
+                annotations={
+                    "summary": "GPU quota pending",
+                    "operator_prompt": (
+                        "사람 지시: gpu-a quota부터 확인하세요.\n"
+                        "## Injected Heading\n"
+                        + ("x" * 700)
+                    ),
+                },
+            )
+        ),
+        results=[
+            CollectorResult(
+                agent="runai",
+                status="ok",
+                summary="queue gpu-a has no allocatable quota",
+            )
+        ],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="queue_quota_exhausted", confidence="high", score=9.0)
+        ],
+        kg_context={},
+        graph_fixes=GraphRemediation(),
+        fallback_detail="fallback",
+    )
+
+    payload = json.loads(captured[0].removeprefix("증거(JSON):\n"))
+    guidance = payload["operator_guidance"]
+    assert "\n" not in guidance
+    assert len(guidance) <= 500
+    assert "## Injected Heading" in guidance
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_skips_unavailable_artifacts(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko")
+    captured: list[str] = []
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        captured.append(user)
+        return {"summary": "요약", "detail": "본문"}
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    result = CollectorResult(agent="postgres", status="ok", summary="base check complete")
+    result.artifacts.extend(
+        [
+            artifact(
+                agent="postgres",
+                source="postgres",
+                type="drilldown_query",
+                status="ok",
+                confidence="medium",
+                summary="1 row(s)",
+                result={"rows": [{"message": "scheduler panic at reclaim/reclaim.go:91"}]},
+            ),
+            artifact(
+                agent="postgres",
+                source="postgres",
+                type="drilldown_query",
+                status="unavailable",
+                confidence="low",
+                summary="failed query mentioned runtime/panic.go:785",
+                result={"error": "runtime/panic.go:785"},
+            ),
+        ]
+    )
+
+    await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "SchedulerCrash"})
+        ),
+        results=[result],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="platform_version_bug", confidence="medium", score=7.0)
+        ],
+        kg_context={},
+        graph_fixes=GraphRemediation(),
+        fallback_detail="fallback",
+    )
+
+    joined = "\n".join(captured)
+    assert "scheduler panic at reclaim/reclaim.go:91" in joined
+    assert "runtime/panic.go:785" not in joined
+    assert "failed query mentioned" not in joined
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_sanitizes_unavailable_collector_summary(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko")
+    captured: list[str] = []
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        captured.append(user)
+        return {"summary": "요약", "detail": "본문"}
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+
+    await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "GenericAlert"})
+        ),
+        results=[
+            CollectorResult(
+                agent="kubernetes",
+                status="unavailable",
+                summary="kubectl failed; stale output mentioned DiskPressure and evicted pods",
+            )
+        ],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="insufficient_evidence", confidence="low", score=0.0)
+        ],
+        kg_context={},
+        graph_fixes=GraphRemediation(),
+        fallback_detail="fallback",
+    )
+
+    joined = "\n".join(captured)
+    assert "DiskPressure" not in joined
+    assert "evicted pods" not in joined
+    assert NO_EVIDENCE in joined
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_skips_unrelated_similar_incident(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko")
+    captured: list[str] = []
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        captured.append(user)
+        return {"summary": "요약", "detail": "본문"}
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+
+    await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={"alertname": "NCCLTimeout", "namespace": "runai"},
+                annotations={
+                    "summary": "NCCL WARN socket timeout and ibv_poll_cq failed during allreduce"
+                },
+            ),
+            similar_incidents=[
+                SimilarIncidentContext(
+                    incident_id="INC-OLD",
+                    similarity=0.98,
+                    title="old Run:ai control-plane auth incident",
+                    analysis_summary="restart cluster-sync and rotate SAML credentials",
+                )
+            ],
+        ),
+        results=[
+            CollectorResult(
+                agent="loki",
+                status="ok",
+                summary="NCCL WARN socket timeout and ibv_poll_cq failed during allreduce",
+            )
+        ],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="network_fabric_error", confidence="high", score=8.0)
+        ],
+        kg_context={},
+        graph_fixes=GraphRemediation(),
+        fallback_detail="fallback",
+    )
+
+    joined = "\n".join(captured)
+    assert "NCCL WARN" in joined
+    assert "INC-OLD" not in joined
+    assert "cluster-sync" not in joined
+    assert "SAML" not in joined
 
 
 @pytest.mark.asyncio

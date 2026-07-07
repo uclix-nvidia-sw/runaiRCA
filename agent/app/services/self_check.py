@@ -20,9 +20,12 @@ verbatim.
 
 from __future__ import annotations
 
+import json
+
 from app.collectors.base import NO_EVIDENCE, CollectorResult
 from app.config import Settings
 from app.llm import complete_json, llm_configured
+from app.masking import build_masker
 from app.services.root_cause_ranking import _FAMILY_RULES, RankedCause
 
 _CONF_ORDER = ("low", "medium", "high")
@@ -62,8 +65,21 @@ def _canonical_has_evidence(family: str, results: list[CollectorResult]) -> bool
         if r.status == "unavailable":
             return False
         summary = (r.summary or "").strip()
-        return bool(summary) and summary != NO_EVIDENCE
+        if summary and summary != NO_EVIDENCE:
+            return True
+        return any(_artifact_has_evidence(art) for art in getattr(r, "artifacts", []) or [])
     return False  # canonical collector did not even run
+
+
+def _artifact_has_evidence(art: object) -> bool:
+    if getattr(art, "status", "") not in ("ok", "partial"):
+        return False
+    summary = str(getattr(art, "summary", "") or "").strip()
+    return bool(
+        (summary and summary != NO_EVIDENCE)
+        or getattr(art, "result", None) is not None
+        or getattr(art, "highlights", None)
+    )
 
 
 async def refute_top_cause(
@@ -80,7 +96,9 @@ async def refute_top_cause(
         if not family or family == "insufficient_evidence":
             return _default(confidence)
 
-        has_evidence = _canonical_has_evidence(family, results)
+        has_evidence = _canonical_has_evidence(family, results) or _has_signature_evidence(
+            top_candidate
+        )
 
         if not llm_configured(settings, settings.llm_model_self_check):
             # ponytail: deterministic gate — the only signal we have without an LLM
@@ -106,8 +124,11 @@ async def refute_top_cause(
             return _default(confidence)
 
         supported = bool(verdict.get("supported", True))
-        caveat = str(verdict.get("caveat") or "").strip()
-        next_check = str(verdict.get("next_check") or "").strip()
+        masker = _self_check_masker(settings)
+        caveat = _one_line(masker.mask_text(str(verdict.get("caveat") or "")), limit=360)
+        next_check = _one_line(
+            masker.mask_text(str(verdict.get("next_check") or "")), limit=240
+        )
         new_conf = confidence if supported else _downgrade(confidence)
         # Also honour an explicit weaker confidence from the model, never a stronger one.
         model_conf = str(verdict.get("confidence") or "").strip().lower()
@@ -117,6 +138,10 @@ async def refute_top_cause(
         return _default(new_conf, caveat, refuted=not supported, next_check=next_check)
     except Exception:  # noqa: BLE001 - self-check is best-effort; never break analyze()
         return _default(getattr(top_candidate, "confidence", "low"))
+
+
+def _one_line(value: object, *, limit: int) -> str:
+    return " ".join(str(value or "").split())[:limit]
 
 
 def _caveat_missing_evidence(family: str, settings: Settings) -> str:
@@ -141,6 +166,54 @@ def _next_check_missing_evidence(family: str, settings: Settings) -> str:
     return f"Check the canonical evidence source ({canonical}) directly for this cause."
 
 
+def _has_signature_evidence(top_candidate: RankedCause) -> bool:
+    agents = {str(a).lower() for a in getattr(top_candidate, "evidence_agents", [])}
+    rationale = " ".join(getattr(top_candidate, "rationale", [])).lower()
+    return "signature" in agents and (
+        "matched known-issue signature" in rationale
+        or "matched curated symptom" in rationale
+        or "nvidia xid" in rationale
+    )
+
+
+def _compact_evidence_value(value: object, *, limit: int = 1200) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+    text = " ".join(text.split())
+    return text[:limit]
+
+
+def _evidence_digest(results: list[CollectorResult], masker) -> str:
+    lines: list[str] = []
+    for r in results:
+        summary = (r.summary or "").strip() or NO_EVIDENCE
+        lines.append(f"- {r.agent} [{r.status}]: {masker.mask_text(summary)}")
+        for art in (getattr(r, "artifacts", []) or [])[-3:]:
+            if art.status not in ("ok", "partial"):
+                continue
+            parts = [
+                str(art.title or art.type or "artifact").strip(),
+                f"status={art.status}",
+            ]
+            if art.query:
+                parts.append(f"query={_compact_evidence_value(art.query, limit=400)}")
+            if art.summary:
+                parts.append(f"summary={_compact_evidence_value(art.summary, limit=600)}")
+            if art.highlights:
+                parts.append(f"highlights={', '.join(map(str, art.highlights[:6]))}")
+            if art.result is not None:
+                parts.append(f"result={_compact_evidence_value(art.result)}")
+            lines.append(f"  artifact: {masker.mask_text(' | '.join(parts))}")
+    return "\n".join(lines)
+
+
 async def _llm_refute(
     settings: Settings,
     top: RankedCause,
@@ -149,9 +222,8 @@ async def _llm_refute(
     plan: object = None,
 ) -> dict | None:
     ko = getattr(settings, "language", "en") == "ko"
-    evidence = "\n".join(
-        f"- {r.agent} [{r.status}]: {(r.summary or '').strip() or NO_EVIDENCE}" for r in results
-    )
+    masker = _self_check_masker(settings)
+    evidence = _evidence_digest(results, masker)
     caveat_lang = "Korean" if ko else "English"
     system = (
         "You are a skeptical senior SRE reviewing a proposed root cause for a Run:ai "
@@ -170,9 +242,9 @@ async def _llm_refute(
     user = (
         f"Proposed root cause family: {top.family}\n"
         f"Ranked confidence: {top.confidence}\n"
-        f"Canonical source has usable evidence: {has_evidence}\n"
-        f"Rationale: {'; '.join(top.rationale) or '(none)'}\n\n"
-        f"Hypothesis ledger: {_hypothesis_ledger_hint(plan)}\n\n"
+        f"Specific or canonical evidence present: {has_evidence}\n"
+        f"Rationale: {masker.mask_text('; '.join(top.rationale) or '(none)')}\n\n"
+        f"Hypothesis ledger: {masker.mask_text(_hypothesis_ledger_hint(plan))}\n\n"
         f"Gathered evidence:\n{evidence}"
     )
     return await complete_json(
@@ -242,12 +314,11 @@ async def _llm_verify_matches(
     results: list[CollectorResult],
     subject: str,
 ) -> dict | None:
-    evidence = "\n".join(
-        f"- {r.agent} [{r.status}]: {(r.summary or '').strip() or NO_EVIDENCE}" for r in results
-    )
+    masker = _self_check_masker(settings)
+    evidence = _evidence_digest(results, masker)
     cand = "\n".join(
         f"- {str(c.get('name') or '').strip()}: "
-        f"{' '.join(str(c.get('detail') or '').split())}"
+        f"{masker.mask_text(' '.join(str(c.get('detail') or '').split()))}"
         for c in candidates
     )
     system = (
@@ -265,4 +336,12 @@ async def _llm_verify_matches(
         user=user,
         temperature=0.1,
         model=settings.llm_model_self_check,
+    )
+
+
+def _self_check_masker(settings: Settings):
+    return build_masker(
+        settings.masking_regex_list,
+        builtin_enabled=settings.builtin_redaction_enabled,
+        hash_mode=settings.builtin_redaction_hash_mode,
     )

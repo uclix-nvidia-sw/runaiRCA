@@ -45,7 +45,10 @@ def test_root_xid_fix_is_ordered_first() -> None:
     # Drill-down precision: the ROOT of the causal chain (74) is fixed before its
     # downstream symptom (45), and labelled as the root.
     gr = GraphRemediation(
-        xid_fixes={45: ["patch the app"], 74: ["reset the NVLink fabric"]},
+        xid_fixes={
+            45: ["patch the app password=xid-action-secret-12345"],
+            74: ["reset the NVLink fabric\n## injected"],
+        },
         root_xids={45: [74]},
     )
     request = AlertAnalysisRequest(
@@ -63,3 +66,6 @@ def test_root_xid_fix_is_ordered_first() -> None:
     joined = "\n".join(actions)
     assert "root XID 74" in joined
     assert joined.index("root XID 74") < joined.index("XID 45")
+    assert "xid-action-secret-12345" not in joined
+    assert "\n## injected" not in joined
+    assert "[MASKED]" in joined

@@ -326,9 +326,9 @@ export function formatTokenUsage(usage: Record<string, unknown>) {
   const completion = numberField(usage.completion_tokens);
   const calls = numberField(usage.calls);
   return [
-    total !== undefined ? `${total} total` : undefined,
-    prompt !== undefined ? `${prompt} prompt` : undefined,
-    completion !== undefined ? `${completion} completion` : undefined,
+    total !== undefined ? `${total.toLocaleString()} total` : undefined,
+    prompt !== undefined ? `${prompt.toLocaleString()} prompt` : undefined,
+    completion !== undefined ? `${completion.toLocaleString()} completion` : undefined,
     calls !== undefined ? `${calls} call${calls === 1 ? '' : 's'}` : undefined,
   ].filter(Boolean).join(' · ') || 'recorded';
 }

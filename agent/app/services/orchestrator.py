@@ -24,7 +24,12 @@ from app.schemas import (
     IncidentSummaryResponse,
 )
 from app.services import pipeline
-from app.services.pipeline import _build_settings_masker, _mask_model, _unexpected_runtime_warning
+from app.services.pipeline import (
+    _build_settings_masker,
+    _mask_model,
+    _short_sentence,
+    _unexpected_runtime_warning,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -85,15 +90,16 @@ class AnalysisOrchestrator:
 
     def _record_engine_failure(self, exc: object) -> None:
         now = datetime.now(UTC).isoformat()
+        masked_error = self._masker.mask_text(str(exc))
         if self._engine_state != "failed":  # edge only: first failure after healthy
             _log.error(
                 "nemo engine FAILING since %s; analyses fall back to the direct "
                 "pipeline (LLM synthesis off). Check the engine config/LLM endpoint: %s",
                 now,
-                exc,
+                masked_error,
             )
         self._engine_state = "failed"
-        self._engine_last_error = str(exc)
+        self._engine_last_error = masked_error
         self._engine_last_error_at = now
         self._engine_consecutive_failures += 1
 
@@ -166,10 +172,16 @@ class AnalysisOrchestrator:
                 response = await self._engine_run(request)
             except Exception as exc:  # noqa: BLE001 - engine failure degrades, never breaks analysis
                 self._record_engine_failure(exc)
-                nat_warning = pipeline._unexpected_runtime_warning("nemo", exc)
+                nat_warning = pipeline._unexpected_runtime_warning("nemo", exc, self._masker)
             else:
-                self._record_engine_ok()
-                return response
+                incomplete = self._incomplete_engine_response_reason(response)
+                if incomplete:
+                    exc = RuntimeError(incomplete)
+                    self._record_engine_failure(exc)
+                    nat_warning = pipeline._unexpected_runtime_warning("nemo", exc, self._masker)
+                else:
+                    self._record_engine_ok()
+                    return response
         state = pipeline.new_state(self._settings, request, collectors=self._collectors)
         if nat_warning:
             state.extra_warnings.append(nat_warning)
@@ -182,29 +194,61 @@ class AnalysisOrchestrator:
             self._engine = NatEngine(self._settings)
         return await self._engine.run(request)
 
+    def _incomplete_engine_response_reason(self, response: AlertAnalysisResponse) -> str:
+        if not str(response.analysis_summary or "").strip():
+            return "nemo engine returned an incomplete RCA response: missing analysis_summary"
+        if not str(response.analysis_detail or "").strip():
+            return "nemo engine returned an incomplete RCA response: missing analysis_detail"
+        context = response.context if isinstance(response.context, dict) else {}
+        candidates = context.get("root_cause_candidates")
+        if not isinstance(candidates, list) or not candidates:
+            return "nemo engine returned an incomplete RCA response: missing root_cause_candidates"
+        top = candidates[0]
+        if not isinstance(top, dict) or not str(top.get("family") or "").strip():
+            return (
+                "nemo engine returned an incomplete RCA response: "
+                "invalid top root-cause candidate"
+            )
+        top_context = context.get("top_root_cause")
+        if not isinstance(top_context, dict) or top_context.get("family") != top.get("family"):
+            return (
+                "nemo engine returned an incomplete RCA response: "
+                "top_root_cause does not match root_cause_candidates[0]"
+            )
+        return ""
+
     async def summarize_incident(self, request: IncidentSummaryRequest) -> IncidentSummaryResponse:
         alerts = request.alerts
+        safe = lambda value, limit: _short_sentence(  # noqa: E731 - local formatting helper
+            self._masker.mask_text(str(value or "-")), limit=limit
+        )
         title = request.title if request.title and request.title != "Ongoing" else "Run:AI incident"
+        title = safe(title, 180)
         summaries = [
             alert.analysis_summary
             for alert in alerts
             if alert.analysis_summary and alert.analysis_summary.strip()
         ]
-        summary = summaries[0] if summaries else f"{len(alerts)} alert(s) were correlated."
+        summary = (
+            safe(summaries[0], 320)
+            if summaries
+            else f"{len(alerts)} alert(s) were correlated."
+        )
         detail_lines = [
             "## Incident Summary",
             "",
-            f"- Incident: {request.incident_id}",
-            f"- Severity: {request.severity}",
+            f"- Incident: {safe(request.incident_id, 120)}",
+            f"- Severity: {safe(request.severity, 80)}",
             f"- Alert count: {len(alerts)}",
-            f"- Window: {request.fired_at} to {request.resolved_at}",
+            f"- Window: {safe(request.fired_at, 120)} to {safe(request.resolved_at, 120)}",
             "",
             "## Alert Evidence",
         ]
         for alert in alerts:
+            alert_summary = safe(alert.analysis_summary or "No analysis summary yet.", 320)
             detail_lines.append(
-                f"- {alert.alert_name} ({alert.status}, {alert.severity}): "
-                f"{alert.analysis_summary or 'No analysis summary yet.'}"
+                f"- {safe(alert.alert_name, 120)} ({safe(alert.status, 40)}, "
+                f"{safe(alert.severity, 40)}): {alert_summary}"
             )
         response = IncidentSummaryResponse(
             status="ok",
@@ -288,6 +332,10 @@ class AnalysisOrchestrator:
         question = (request.message or "").strip()
         if not question:
             return None, "empty question"
+        masker = getattr(self, "_masker", None)
+        if masker is not None:
+            question = masker.mask_text(question)
+            grounding = masker.mask_text(grounding)
         language_rule = (
             "반드시 한국어로 답변하세요."
             if getattr(self._settings, "language", "en") == "ko"
@@ -421,7 +469,7 @@ def _chat_answer_from_context(
     if runtime_lines:
         lines.extend([text["state"], "", *runtime_lines, ""])
 
-    memory_lines = _memory_lines(memory or similar)
+    memory_lines = _memory_lines(memory or similar, masker)
     if memory_lines:
         lines.extend([text["memory"], "", *memory_lines, ""])
     if missing:
@@ -565,7 +613,7 @@ def _focused_chat_response(question: str, content: str) -> str:
     return f"Based on the attached RCA context:\n\n{excerpted}"
 
 
-def _memory_lines(memory: object) -> list[str]:
+def _memory_lines(memory: object, masker: Masker) -> list[str]:
     if not isinstance(memory, list):
         return []
     lines: list[str] = []
@@ -576,7 +624,12 @@ def _memory_lines(memory: object) -> list[str]:
         summary = item.get("analysis_summary") or item.get("AnalysisSummary") or item.get("title")
         similarity = item.get("similarity") or item.get("Similarity")
         if summary:
-            lines.append(f"- {incident_id} ({similarity or 'memory'}): {summary}")
+            rendered_id = _short_sentence(masker.mask_text(str(incident_id)), limit=80)
+            rendered_similarity = _short_sentence(
+                masker.mask_text(str(similarity or "memory")), limit=40
+            )
+            rendered_summary = _short_sentence(masker.mask_text(str(summary)), limit=320)
+            lines.append(f"- {rendered_id} ({rendered_similarity}): {rendered_summary}")
     return lines
 
 

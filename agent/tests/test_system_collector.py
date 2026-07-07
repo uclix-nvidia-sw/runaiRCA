@@ -37,8 +37,33 @@ class _Settings:
 
 def test_base_url_substitutes_node() -> None:
     assert _base_url_for_node("http://{node}:9095", "n1") == "http://n1:9095"
+    assert _base_url_for_node("http://{node}:9095", "n1/../../evil@host") == (
+        "http://n1%2F..%2F..%2Fevil%40host:9095"
+    )
     # No placeholder -> used as-is (shared endpoint).
     assert _base_url_for_node("http://svc:9095", "n1") == "http://svc:9095"
+
+
+@pytest.mark.asyncio
+async def test_node_internal_ip_encodes_node_path_segment(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    class Settings(_Settings):
+        kubernetes_token_path = "/token"
+        kubernetes_ca_path = ""
+        kubernetes_api_url = "https://kubernetes.default.svc"
+        kubernetes_timeout_seconds = 5
+
+    async def fake_get_json(**kwargs):
+        calls.append(kwargs["path"])
+        return JsonResponse(url=kwargs["path"], status_code=404, data={})
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+    monkeypatch.setattr("app.collectors.kubernetes._read_file", lambda _path: "token")
+
+    await system_mod._node_internal_ip(Settings(), "node/../../pods")
+
+    assert calls == ["/api/v1/nodes/node%2F..%2F..%2Fpods"]
 
 
 def test_lines_tolerates_shapes() -> None:

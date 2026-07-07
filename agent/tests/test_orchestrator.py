@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.collectors.base import AnalysisTarget, resolve_target
+from app.collectors.base import AnalysisTarget, CollectorResult, artifact, resolve_target
 from app.collectors.loki import LokiCollector, _loki_headers
 from app.collectors.runai import RunAICollector, _runai_headers
 from app.config import Settings
@@ -13,8 +13,10 @@ from app.masking import build_masker
 from app.schemas import (
     Alert,
     AlertAnalysisRequest,
+    AlertSummaryInput,
     ChatRequest,
     FeedbackHintContext,
+    IncidentSummaryRequest,
     SimilarIncidentContext,
 )
 from app.services.orchestrator import AnalysisOrchestrator
@@ -143,6 +145,41 @@ def test_resolve_target_derives_project_from_runai_namespace() -> None:
 
     assert target.project == "vision"
     assert target.namespace == "runai-vision"
+
+
+@pytest.mark.asyncio
+async def test_incident_summary_folds_and_masks_alert_summaries() -> None:
+    response = await AnalysisOrchestrator(make_settings()).summarize_incident(
+        IncidentSummaryRequest(
+            incident_id="INC-1\n## injected incident",
+            title="Ongoing",
+            severity="critical password=incident-severity-secret-12345",
+            fired_at="2026-07-02T10:00:00Z",
+            resolved_at="2026-07-02T10:05:00Z",
+            alerts=[
+                AlertSummaryInput(
+                    fingerprint="fp",
+                    alert_name="RunAIWorkloadPending\n## injected alert",
+                    severity="warning",
+                    status="firing",
+                    analysis_summary=(
+                        "Queue saturated api_key=incident-summary-secret-12345\n"
+                        "## injected summary\n"
+                        + ("detail " * 100)
+                    ),
+                )
+            ],
+        )
+    )
+
+    serialized = response.model_dump_json()
+    assert response.title == "Run:AI incident"
+    assert "\n## injected" not in response.detail
+    assert "\n" not in response.summary
+    assert "incident-severity-secret-12345" not in serialized
+    assert "incident-summary-secret-12345" not in serialized
+    assert "[MASKED]" in serialized
+    assert response.summary.endswith("…")
 
 
 def test_loki_headers_prefer_bearer_and_include_tenant() -> None:
@@ -397,6 +434,67 @@ async def test_analyze_includes_similar_incidents_and_feedback_hints() -> None:
     assert "Operators confirmed quota saturation" in response.analysis_detail
 
 
+def test_similar_incident_summary_is_trimmed_before_rendering() -> None:
+    from app.services.pipeline import (
+        _feedback_hint_lines,
+        _recommended_action_lines,
+        _similar_incident_lines,
+    )
+
+    summary = "resolved by restarting scheduler\n## injected heading\n" + ("details " * 100)
+    request = AlertAnalysisRequest(
+        alert=Alert(labels={"alertname": "X"}, annotations={}, fingerprint="fp-similar-long"),
+        similar_incidents=[
+            SimilarIncidentContext(
+                incident_id="INC-LONG",
+                similarity=0.99,
+                title="old incident",
+                analysis_summary=summary,
+            )
+        ],
+        feedback_hints=[
+            FeedbackHintContext(
+                source_id="INC-LONG",
+                sentiment="comment",
+                weight=0.99,
+                text=summary,
+            )
+        ],
+    )
+
+    similar_line = next(line for line in _similar_incident_lines(request) if "INC-LONG" in line)
+    action_line = next(
+        line for line in _recommended_action_lines([], request) if "INC-LONG" in line
+    )
+    feedback_line = next(line for line in _feedback_hint_lines(request) if "INC-LONG" in line)
+    assert "\n" not in similar_line
+    assert "\n" not in action_line
+    assert "\n" not in feedback_line
+    assert similar_line.endswith("…")
+    assert feedback_line.endswith("…")
+    assert "— verify this fix applies here before repeating it." in action_line
+
+
+@pytest.mark.asyncio
+async def test_operator_guidance_does_not_break_report_structure() -> None:
+    response = await AnalysisOrchestrator(make_settings()).analyze(
+        AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={"alertname": "RunAIWorkloadPending", "namespace": "runai"},
+                annotations={
+                    "summary": "pending",
+                    "operator_prompt": "Please check scheduler first.\n## Injected Heading",
+                },
+                fingerprint="fp-operator-guidance-structure",
+            )
+        )
+    )
+
+    assert "Please check scheduler first. ## Injected Heading" in response.analysis_detail
+    assert "\n## Injected Heading" not in response.analysis_detail
+
+
 @pytest.mark.asyncio
 async def test_analyze_includes_investigation_plan_section() -> None:
     orchestrator = AnalysisOrchestrator(make_settings())
@@ -502,7 +600,7 @@ async def test_analyze_lists_grouped_pods() -> None:
 async def test_analyze_isolates_collector_exceptions() -> None:
     class ExplodingCollector:
         async def collect(self, target, plan=None):
-            raise RuntimeError("collector boom")
+            raise RuntimeError("collector boom api_key=collector-boom-secret-12345")
 
     orchestrator = AnalysisOrchestrator(make_settings())
     orchestrator._collectors = [ExplodingCollector()]
@@ -523,7 +621,25 @@ async def test_analyze_isolates_collector_exceptions() -> None:
     assert response.capabilities["exploding"] == "unavailable"
     assert "exploding.collector_exception" in response.missing_data
     assert any("collector boom" in warning for warning in response.warnings)
+    assert "collector-boom-secret-12345" not in response.model_dump_json()
     assert "**exploding**:" in response.analysis_detail
+
+
+@pytest.mark.asyncio
+async def test_collect_safely_masks_exception_payloads() -> None:
+    from app.services import pipeline
+
+    class SecretFailingCollector:
+        async def collect(self, target, plan=None):
+            raise RuntimeError("boom password=direct-collector-secret-12345")
+
+    result = await pipeline._collect_safely(SecretFailingCollector(), make_target())
+    serialized = str(result.__dict__)
+
+    assert result.status == "unavailable"
+    assert "RuntimeError" in result.details["error"]
+    assert "direct-collector-secret-12345" not in serialized
+    assert "[MASKED]" in serialized
 
 
 @pytest.mark.asyncio
@@ -532,7 +648,7 @@ async def test_analyze_falls_back_when_nat_runtime_raises(monkeypatch) -> None:
     orchestrator = AnalysisOrchestrator(settings)
 
     async def broken_nat_run(request):
-        raise RuntimeError("nat executable missing")
+        raise RuntimeError("nat executable missing api_key=nemo-runtime-secret-12345")
 
     orchestrator._engine = SimpleNamespace(run=broken_nat_run)
 
@@ -550,6 +666,7 @@ async def test_analyze_falls_back_when_nat_runtime_raises(monkeypatch) -> None:
     assert response.status == "ok"
     assert "NAT failed but fallback should continue" in response.analysis_detail
     assert any("nemo failed unexpectedly" in warning for warning in response.warnings)
+    assert "nemo-runtime-secret-12345" not in response.model_dump_json()
 
 
 @pytest.mark.asyncio
@@ -685,11 +802,13 @@ def test_masker_redacts_sensitive_object_values() -> None:
     )
     payload = {
         "password": "plain-secret",
+        "service_account_token": "sa-token-very-secret-12345",
         "token_path": "/var/run/secrets/kubernetes.io/serviceaccount/token",
         "message": (
             "Authorization: Bearer abcdefghijklmnop "
             "postgresql://user:dbpassword@postgres/runai "
             "owner=internal-user-42 "
+            "service_account_token=sa-token-very-secret-12345 "
             f"blob={secret_blob}"
         ),
         "env": [{"name": "RUNAI_TOKEN", "value": "runtime-secret"}],
@@ -698,10 +817,12 @@ def test_masker_redacts_sensitive_object_values() -> None:
     masked = masker.mask_object(payload)
 
     assert masked["password"] == "[MASKED]"
+    assert masked["service_account_token"] == "[MASKED]"
     assert masked["token_path"] == "/var/run/secrets/kubernetes.io/serviceaccount/token"
     assert "abcdefghijklmnop" not in masked["message"]
     assert "dbpassword" not in masked["message"]
     assert "internal-user-42" not in masked["message"]
+    assert "sa-token-very-secret-12345" not in masked["message"]
     assert secret_blob not in masked["message"]
     assert masked["env"][0]["value"] == "[MASKED]"
 
@@ -728,6 +849,53 @@ async def test_analyze_masks_sensitive_alert_text() -> None:
     serialized = response.model_dump_json()
     assert "abcdefghijklmnop" not in serialized
     assert "do-not-show" not in serialized
+    assert "[MASKED]" in serialized
+
+
+@pytest.mark.asyncio
+async def test_analyze_masks_sensitive_artifact_evidence() -> None:
+    class SecretArtifactCollector:
+        async def collect(self, target, plan=None):
+            return CollectorResult(
+                agent="postgres",
+                status="ok",
+                summary="metadata rows",
+                artifacts=[
+                    artifact(
+                        agent="postgres",
+                        source="postgres",
+                        type="drilldown_query",
+                        status="ok",
+                        confidence="medium",
+                        summary="1 row(s)",
+                        result={
+                            "message": (
+                                "scheduler panic token=artifact-token-12345 "
+                                "api_key=artifact-key-12345"
+                            )
+                        },
+                    )
+                ],
+            )
+
+    orchestrator = AnalysisOrchestrator(make_settings())
+    orchestrator._collectors = [SecretArtifactCollector()]
+
+    response = await orchestrator.analyze(
+        AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={"alertname": "SchedulerCrash", "namespace": "runai"},
+                annotations={"summary": "scheduler panic"},
+                fingerprint="fp-secret-artifact",
+            )
+        )
+    )
+
+    serialized = response.model_dump_json()
+    assert "artifact-token-12345" not in serialized
+    assert "artifact-key-12345" not in serialized
+    assert "scheduler panic" in response.analysis_detail
     assert "[MASKED]" in serialized
 
 
@@ -761,6 +929,39 @@ async def test_chat_agent_answers_from_attached_rca_memory() -> None:
     assert "Related RCA Memory" in response.answer
     assert "INC-000000" in response.answer
     assert "gpu-a has no available GPU quota" in response.answer
+
+
+@pytest.mark.asyncio
+async def test_chat_similar_incident_memory_is_folded_and_masked() -> None:
+    orchestrator = AnalysisOrchestrator(make_settings())
+    response = await orchestrator.chat(
+        ChatRequest(
+            message="이전 유사 RCA랑 비교해줘",
+            page="incident_detail",
+            incident_title="GPU quota pending",
+            context={
+                "similar_incidents": [
+                    {
+                        "incident_id": "INC-LONG\n## injected id",
+                        "similarity": 0.99,
+                        "analysis_summary": (
+                            "Prior quota saturation resolved by increasing gpu-a quota.\n"
+                            "## Injected Heading\n"
+                            "service_account_token=memory-secret-12345 "
+                            + ("evidence detail " * 50)
+                        ),
+                    }
+                ]
+            },
+        )
+    )
+
+    memory_line = next(line for line in response.answer.splitlines() if "INC-LONG" in line)
+    assert "Related RCA Memory" in response.answer
+    assert "\n## Injected Heading" not in response.answer
+    assert "memory-secret-12345" not in response.answer
+    assert "\n" not in memory_line
+    assert memory_line.endswith("…")
 
 
 def test_pod_describe_line_carries_limits_restarts_oomkilled() -> None:

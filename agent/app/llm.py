@@ -354,6 +354,45 @@ def _usage_bucket(current: dict[str, Any], model: str) -> dict[str, int]:
     return bucket
 
 
+def parse_json_object(text: str) -> dict[str, Any] | None:
+    """The first JSON OBJECT inside an LLM reply, or None.
+
+    Models keep breaking the "JSON only" rule in the same few ways — ```json
+    fences, leading prose ("물론입니다! {...}"), trailing commentary. String-aware
+    brace matching finds the object wherever it sits, so one bad token of
+    preamble no longer throws away an otherwise-valid synthesis/decision."""
+    if not text:
+        return None
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            ch = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(text[start : index + 1])
+                    except (ValueError, TypeError):
+                        break  # unbalanced/invalid here — try the next '{'
+                    return parsed if isinstance(parsed, dict) else None
+        start = text.find("{", start + 1)
+    return None
+
+
 async def complete_json(
     settings: Settings,
     *,
@@ -362,7 +401,7 @@ async def complete_json(
     temperature: float = 0.1,
     model: str | None = None,
 ) -> dict[str, Any] | None:
-    """Ask for a JSON object and parse it, tolerating ```json fences. None on failure."""
+    """Ask for a JSON object and parse it, tolerating fences/prose. None on failure."""
     text = await complete(
         settings,
         system=system + "\n\nRespond with ONLY a valid JSON object, no prose, no code fences.",
@@ -370,16 +409,4 @@ async def complete_json(
         temperature=temperature,
         model=model,
     )
-    if not text:
-        return None
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("\n", 1)[-1] if "\n" in cleaned else cleaned
-        cleaned = cleaned.removeprefix("json").strip()
-        if cleaned.endswith("```"):
-            cleaned = cleaned[: cleaned.rfind("```")].strip()
-    try:
-        parsed = json.loads(cleaned)
-    except (ValueError, TypeError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
+    return parse_json_object(text or "")
