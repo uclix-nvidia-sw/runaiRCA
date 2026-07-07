@@ -93,6 +93,7 @@ def test_third_party_images_are_fully_qualified() -> None:
 def test_managed_mcp_values_keep_expected_secret_and_images() -> None:
     values = _values()
     assert values["runaiMcp"]["enabled"] is True
+    assert values["agent"]["env"]["runaiBaseUrl"]
     assert values["grafanaMcp"]["enabled"] is True
     assert values["kubernetesMcp"]["enabled"] is True
     assert values["postgresMcp"]["enabled"] is True
