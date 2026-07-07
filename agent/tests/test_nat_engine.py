@@ -167,3 +167,32 @@ async def test_engine_failure_falls_back_to_direct_pipeline() -> None:
     assert response.status == "ok"
     assert any("nemo failed unexpectedly" in warning for warning in response.warnings)
     assert response.context["nemo_runtime"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_engine_health_surfaces_failure_and_logs_once(caplog) -> None:
+    settings = replace(
+        make_settings(),
+        enable_nat_runtime=True,
+        nat_config_file="/nonexistent.yml",
+    )
+    orch = AnalysisOrchestrator(settings)
+    assert orch.engine_health()["state"] == "unknown"
+
+    with caplog.at_level("ERROR", logger="app.services.orchestrator"):
+        await orch.analyze(_request())
+        await orch.analyze(_request())
+
+    health = orch.engine_health()
+    assert health["state"] == "failed"
+    assert health["consecutive_failures"] == 2  # both runs failed
+    assert health["last_error"]
+    # Edge-triggered: two consecutive failures log the FAILING line exactly once,
+    # so kubelet-frequency retries never spam the log.
+    failing = [r for r in caplog.records if "nemo engine FAILING" in r.getMessage()]
+    assert len(failing) == 1
+
+
+def test_engine_health_disabled_when_runtime_off() -> None:
+    settings = replace(make_settings(), enable_nat_runtime=False)
+    assert AnalysisOrchestrator(settings).engine_health()["state"] == "disabled"

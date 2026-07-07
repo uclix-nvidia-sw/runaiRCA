@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from app.collectors.base import resolve_target
@@ -34,6 +35,15 @@ class AnalysisOrchestrator:
         self._masker = _build_settings_masker(settings)
         self._collectors = build_collectors(settings)
         self._engine = None
+        # NAT engine runtime health, edge-logged: "disabled" (off), "unknown"
+        # (on, not yet exercised), "ok" (a run went through the engine), "failed"
+        # (build/run threw; analyses silently fall back to the direct pipeline).
+        # All updates run on the single asyncio loop thread, so no lock is needed.
+        self._engine_state = "disabled" if not settings.enable_nat_runtime else "unknown"
+        self._engine_last_error = ""
+        self._engine_last_error_at = ""
+        self._engine_last_ok_at = ""
+        self._engine_consecutive_failures = 0
 
     async def start_engine(self) -> None:
         if not self._settings.enable_nat_runtime:
@@ -45,16 +55,47 @@ class AnalysisOrchestrator:
                 self._engine = NatEngine(self._settings)
             await self._engine.start()
         except Exception as exc:  # noqa: BLE001 - startup is best-effort; analyze falls back
-            _log.warning(
-                "nemo engine startup failed; direct pipeline fallback remains available: %s",
-                exc,
-            )
+            self._record_engine_failure(exc)
 
     async def close_engine(self) -> None:
         engine = self._engine
         if engine is None:
             return
         await engine.aclose()
+
+    def engine_health(self) -> dict[str, object]:
+        """Runtime NAT-engine health for /healthz. Pure state read — never logs,
+        so kubelet probes don't spam the log."""
+        return {
+            "enabled": self._settings.enable_nat_runtime,
+            "state": self._engine_state,
+            "consecutive_failures": self._engine_consecutive_failures,
+            "last_error": self._engine_last_error,
+            "last_error_at": self._engine_last_error_at,
+            "last_ok_at": self._engine_last_ok_at,
+        }
+
+    def _record_engine_ok(self) -> None:
+        now = datetime.now(UTC).isoformat()
+        if self._engine_state == "failed":  # edge only: recovery
+            _log.info("nemo engine recovered at %s", now)
+        self._engine_state = "ok"
+        self._engine_last_ok_at = now
+        self._engine_consecutive_failures = 0
+
+    def _record_engine_failure(self, exc: object) -> None:
+        now = datetime.now(UTC).isoformat()
+        if self._engine_state != "failed":  # edge only: first failure after healthy
+            _log.error(
+                "nemo engine FAILING since %s; analyses fall back to the direct "
+                "pipeline (LLM synthesis off). Check the engine config/LLM endpoint: %s",
+                now,
+                exc,
+            )
+        self._engine_state = "failed"
+        self._engine_last_error = str(exc)
+        self._engine_last_error_at = now
+        self._engine_consecutive_failures += 1
 
     async def analyze(self, request: AlertAnalysisRequest) -> AlertAnalysisResponse:
         """Run one analysis under an overall hard deadline.
@@ -122,9 +163,13 @@ class AnalysisOrchestrator:
         nat_warning = None
         if self._settings.enable_nat_runtime:
             try:
-                return await self._engine_run(request)
+                response = await self._engine_run(request)
             except Exception as exc:  # noqa: BLE001 - engine failure degrades, never breaks analysis
+                self._record_engine_failure(exc)
                 nat_warning = pipeline._unexpected_runtime_warning("nemo", exc)
+            else:
+                self._record_engine_ok()
+                return response
         state = pipeline.new_state(self._settings, request, collectors=self._collectors)
         if nat_warning:
             state.extra_warnings.append(nat_warning)

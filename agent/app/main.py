@@ -69,10 +69,11 @@ def ping() -> str:
 
 
 @app.get("/healthz")
-def healthz() -> dict[str, str]:
+def healthz() -> dict[str, object]:
     return {
         "status": "ok",
         "nemo_runtime": "enabled" if settings.enable_nat_runtime else "fallback",
+        "nemo_engine": orchestrator.engine_health(),
     }
 
 
