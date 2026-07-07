@@ -248,7 +248,6 @@ async def test_english_language_keeps_deterministic_report(monkeypatch) -> None:
         return SimpleNamespace(ok=False, data=None)
 
     monkeypatch.setattr("app.llm.post_json", fake_post_json)
-    monkeypatch.setattr("app.services.orchestrator.post_json", fake_post_json)
     orchestrator = AnalysisOrchestrator(settings)
     response = await orchestrator.analyze(
         AlertAnalysisRequest(

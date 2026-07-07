@@ -78,7 +78,7 @@ def _install_stubs(
     pass replaces it with scheduling-quota evidence so the re-rank flips families.
     """
 
-    async def fake_investigate(settings, target, collectors, plan, kg, max_steps):
+    async def fake_investigate(settings, target, collectors, plan, kg, max_steps, reporter=None):
         call = len(investigate_calls)
         investigate_calls.append(max_steps)
         if fail_second_investigate and call > 0:
@@ -93,7 +93,7 @@ def _install_stubs(
                 "kubernetes": "no further node findings",
                 "prometheus": "runai reclaimed over-quota gpus; gang pod group preempt",
             }
-        return [
+        results = [
             CollectorResult(
                 agent=_collector_name(collector),
                 status="ok",
@@ -101,6 +101,7 @@ def _install_stubs(
             )
             for collector in collectors
         ]
+        return results, {"hypothesis_ledger": []}
 
     async def fake_refute(settings, top, results, plan=None):
         refute_calls.append(top.family)
@@ -173,6 +174,38 @@ async def test_not_refuted_means_no_reanalysis(monkeypatch) -> None:
     assert "re-analysis pass was performed" not in response.analysis_detail
     top = response.context["root_cause_candidates"][0]
     assert top["family"] == "node_kubelet_pressure"
+
+
+@pytest.mark.asyncio
+async def test_token_budget_skips_reanalysis(monkeypatch) -> None:
+    _stub_llm_http(monkeypatch)
+    investigate_calls: list[int] = []
+    refute_calls: list[str] = []
+    _install_stubs(
+        monkeypatch,
+        verdicts=[
+            {
+                "confidence": "low",
+                "caveat": "Competing cause fits better.",
+                "refuted": True,
+                "next_check": "Check the scheduler queue directly.",
+            }
+        ],
+        investigate_calls=investigate_calls,
+        refute_calls=refute_calls,
+    )
+    monkeypatch.setattr("app.services.orchestrator.token_budget_exceeded", lambda settings: True)
+    monkeypatch.setattr(
+        "app.services.orchestrator.token_budget_warning",
+        lambda settings: "analysis token budget exceeded (10/10 tokens); skipped additional LLM reasoning",
+    )
+
+    orchestrator = AnalysisOrchestrator(llm_settings())
+    response = await orchestrator.analyze(_request())
+
+    assert len(investigate_calls) == 1
+    assert len(refute_calls) == 1
+    assert any("token budget" in warning for warning in response.warnings)
 
 
 @pytest.mark.asyncio

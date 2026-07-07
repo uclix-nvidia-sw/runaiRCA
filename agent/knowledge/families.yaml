@@ -1,0 +1,160 @@
+- family: node_kubelet_pressure
+  canonical_agent: kubernetes
+  agents:
+    - kubernetes
+    - prometheus
+  keywords:
+    - diskpressure
+    - memorypressure
+    - pidpressure
+    - node pressure
+    - evict
+    - kubelet
+    - device plugin
+    - node condition
+  planner_keywords:
+    - diskpressure
+    - memorypressure
+    - pidpressure
+    - kubelet
+    - node
+    - evict
+  reason: alert points at node/kubelet resource pressure
+
+- family: runai_scheduling_quota
+  canonical_agent: prometheus
+  agents:
+    - prometheus
+    - kubernetes
+    - runai
+  keywords:
+    - preempt
+    - reclaim
+    - pod group
+    - podgroup
+    - gang
+    - fairshare
+    - over-quota
+    - over quota
+    - requested gpus
+    - quota
+    - idleness
+  planner_keywords:
+    - quota
+    - queue
+    - preempt
+    - reclaim
+    - fairshare
+    - gang
+    - over-quota
+  reason: "alert points at Run:ai scheduling / GPU quota (preempt/reclaim)"
+
+- family: k8s_scheduling_error
+  canonical_agent: kubernetes
+  agents:
+    - kubernetes
+    - prometheus
+  keywords:
+    - failedscheduling
+    - unschedulable
+    - untolerated taint
+    - node affinity/selector
+    - topology spread
+    - anti-affinity
+    - exceeded quota
+    - default-scheduler
+    - 0/
+  planner_keywords:
+    - failedscheduling
+    - unschedul
+    - taint
+    - affinity
+    - topology
+  reason: "alert points at kube-scheduler placement (taint/affinity/quota)"
+
+- family: runai_control_plane_error
+  canonical_agent: loki
+  agents:
+    - loki
+    - kubernetes
+  keywords:
+    - reconcile
+    - runai-backend
+    - cluster-sync
+    - authorization
+    - database error
+  planner_keywords:
+    - reconcile
+    - runai-backend
+    - cluster-sync
+    - authorization
+  reason: alert implicates the Run:ai platform control plane
+
+- family: k8s_control_plane_error
+  canonical_agent: kubernetes
+  agents:
+    - kubernetes
+    - loki
+  keywords:
+    - apiserver
+    - kube-apiserver
+    - etcd
+    - etcdserver
+    - kube-controller-manager
+    - kubeadm
+    - leaderelection
+    - failed calling webhook
+    - admission webhook
+  planner_keywords:
+    - apiserver
+    - etcd
+    - kubeadm
+    - leaderelection
+    - webhook
+    - kube-controller
+  reason: alert implicates the Kubernetes cluster control plane
+
+- family: workload_startup_error
+  canonical_agent: kubernetes
+  agents:
+    - kubernetes
+    - loki
+  keywords:
+    - crashloopbackoff
+    - oomkilled
+    - failedmount
+    - createcontainer
+    - back-off restarting
+    - startup probe
+    - runcontainererror
+    - importerror
+    - permission denied
+  planner_keywords:
+    - crashloop
+    - oom
+    - createcontainer
+    - startup probe
+    - runcontainer
+  reason: alert points at a workload-local startup/config/crash fault
+
+- family: image_pull_error
+  canonical_agent: kubernetes
+  agents:
+    - kubernetes
+    - loki
+  keywords:
+    - imagepullbackoff
+    - errimagepull
+    - errimageneverpull
+    - manifest for
+    - toomanyrequests
+    - pull access denied
+    - no such host
+    - registry
+  planner_keywords:
+    - imagepull
+    - errimagepull
+    - image
+    - registry
+    - manifest
+  reason: alert points at an image pull / registry failure

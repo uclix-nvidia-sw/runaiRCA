@@ -57,6 +57,19 @@ export type FeedbackSummary = {
   learning_hints?: FeedbackHint[];
 };
 
+export type AnalysisProgressEntry = {
+  seq?: number;
+  phase?: string;
+  message?: string;
+  timestamp?: string;
+  collector?: string;
+  status?: string;
+  summary?: string;
+  selected_hypothesis?: string;
+  hypothesis_ledger?: unknown;
+  [key: string]: unknown;
+};
+
 export type AnalysisRun = {
   run_id: string;
   source: string;
@@ -74,6 +87,9 @@ export type AnalysisRun = {
   missing_data: string[];
   warnings: string[];
   artifacts: Artifact[];
+  metadata?: Record<string, unknown> & {
+    progress_log?: AnalysisProgressEntry[];
+  };
   created_at: string;
   updated_at: string;
 };
@@ -86,6 +102,9 @@ export type Incident = {
   status: string;
   fired_at: string;
   resolved_at?: string | null;
+  user_approved_at?: string | null;
+  archived_at?: string | null;
+  deleted_at?: string | null;
   alert_count: number;
   is_analyzing: boolean;
 };
@@ -125,8 +144,65 @@ export type IncidentDetail = Incident & {
   warnings: string[];
   artifacts: Artifact[];
   similar_incidents: SimilarIncident[];
+  similar_recent_count: number;
+  token_usage?: Record<string, unknown>;
   feedback: FeedbackSummary;
   alerts: AlertRecord[];
+};
+
+export type RecurrenceDay = {
+  date: string;
+  total: number;
+  recurred: number;
+  rate: number;
+};
+
+export type RecurrenceStats = {
+  days: number;
+  rate: number;
+  total: number;
+  recurred: number;
+  daily: RecurrenceDay[];
+};
+
+export type LLMSpendBucket = {
+  calls: number;
+  calls_without_usage: number;
+  failed_calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+};
+
+export type LLMSpendDay = LLMSpendBucket & {
+  date: string;
+};
+
+export type LLMSpendStats = LLMSpendBucket & {
+  days: number;
+  by_model: Record<string, LLMSpendBucket>;
+  daily: LLMSpendDay[];
+};
+
+export type KPIBucket = {
+  count: number;
+  avg_minutes: number;
+  p50_minutes: number;
+  p90_minutes: number;
+};
+
+export type KPIDay = {
+  date: string;
+  time_to_rca: KPIBucket;
+  time_to_resolve: KPIBucket;
+};
+
+export type KPIStats = {
+  days: number;
+  time_to_rca: KPIBucket;
+  time_to_resolve: KPIBucket;
+  daily: KPIDay[];
 };
 
 export type Envelope<T> = {

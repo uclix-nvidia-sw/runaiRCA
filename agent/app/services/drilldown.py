@@ -38,7 +38,7 @@ from app.collectors.loki import _loki_headers, _loki_streams, _sample_lines
 from app.collectors.prometheus import prom_query
 from app.collectors.runai_mcp import _tool_json, _tool_text
 from app.config import Settings
-from app.llm import complete_json, llm_configured
+from app.llm import complete_json, llm_configured, token_budget_exceeded, token_budget_warning
 from app.plan import InvestigationPlan
 
 _log = logging.getLogger(__name__)
@@ -55,7 +55,7 @@ async def run_drilldowns(
     plan: InvestigationPlan | None,
 ) -> None:
     """Run every domain's drill-down loop concurrently. Never raises."""
-    if not settings.enable_agent_drilldown or not llm_configured(settings):
+    if not settings.enable_agent_drilldown or not llm_configured(settings, settings.llm_model_drilldown):
         return
     registry = _domain_tools(settings)
     tasks = [
@@ -78,10 +78,14 @@ async def _drill_one(
     try:
         history: list[dict[str, Any]] = []
         for _ in range(max(1, settings.drilldown_max_steps)):
+            if token_budget_exceeded(settings):
+                result.warnings.append(token_budget_warning(settings))
+                break
             decision = await complete_json(
                 settings,
                 system=_system_prompt(result.agent, tools),
                 user=_user_prompt(result, target, plan, history),
+                model=settings.llm_model_drilldown,
             )
             if not isinstance(decision, dict) or decision.get("action") != "query":
                 break

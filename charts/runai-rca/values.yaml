@@ -209,15 +209,17 @@ backend:
   extraEnv: []
   resources: {}
 
-# Optional Run:ai MCP sidecar. When enabled, the agent gathers Run:ai evidence
-# through the runai-mcp server (426 APIs, spec-aware) instead of the fixed curls.
-# runai-mcp is stdio-only, so this runs it behind mcp-proxy (streamable HTTP) as a
-# sidecar in the agent pod. The image (runai-rca-mcp) is published by CI alongside
-# the others, so global.imageRegistry + the chart appVersion resolve it just like
-# backend/agent/frontend — set enabled: true and it works. Auth reuses the
-# runai-rca secret's runaiClientId/runaiClientSecret. Off by default.
+# Run:ai MCP sidecar. When enabled, the agent gathers Run:ai evidence through
+# the runai-mcp server (426 APIs, spec-aware) instead of the fixed curls, and the
+# runai drill-down agent gets its API search/GET tools. runai-mcp is stdio-only,
+# so this runs it behind mcp-proxy (streamable HTTP) as a sidecar in the agent
+# pod. The image (runai-rca-mcp) is published by CI alongside the others, so
+# global.imageRegistry + the chart appVersion resolve it just like
+# backend/agent/frontend. Auth reuses the runai-rca secret's runaiClientId/
+# runaiClientSecret. ON by default; the agent falls back to direct HTTP when
+# disabled or when the sidecar is unreachable — never breaks analysis.
 runaiMcp:
-  enabled: false
+  enabled: true
   image:
     repository: runai-rca-mcp   # prefixed by global.imageRegistry, like the other first-party images
     tag: ""                     # defaults to the chart appVersion
@@ -274,6 +276,9 @@ agent:
     # LLM is configured; each step is extra LLM calls (accuracy over latency).
     enableAgentDrilldown: true
     drilldownMaxSteps: 4
+    # Stop optional LLM reasoning loops after this many tokens have been used in
+    # one analysis. 0 = unlimited; the overall deadline still applies.
+    analysisTokenBudget: 0
     # Overall hard cap per analysis: generous per-step time, but the whole run always
     # finishes within this budget (default 25 min). 0 = no overall cap.
     analysisDeadlineSeconds: 1500
@@ -287,6 +292,8 @@ agent:
     runaiVersionPath: /api/v1/version
     runaiTimeoutSeconds: 120
     runaiLogNamespaces: runai,runai-backend
+    collectors: runai,kubernetes,postgres,prometheus,loki,system,change
+    backendUrl: ""
     prometheusUrl: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
     prometheusTimeoutSeconds: 120
     prometheusMcpUrl: ""
@@ -297,12 +304,21 @@ agent:
     postgresTimeoutSeconds: 60
     typedbTimeoutSeconds: 60
     troubleshootingCasesFile: knowledge/troubleshooting_cases.md
+    familiesFile: knowledge/families.yaml
     agentSoulsFile: prompts/agent_souls.md
     maskingRegexListJson: "[]"
     builtinRedactionEnabled: true
     builtinRedactionHashMode: false
     llmBaseUrl: ""
     llmModel: ""
+    llmModelPlanner: ""
+    llmModelInvestigation: ""
+    llmModelDrilldown: ""
+    llmModelSelfCheck: ""
+    llmModelSynthesis: ""
+    llmModelChat: ""
+    # JSON: {"model":{"prompt_per_mtok":0.15,"completion_per_mtok":0.60}}
+    llmPricingJson: "{}"
     llmRequestTimeoutSeconds: 300
   podAnnotations: {}
   podLabels: {}

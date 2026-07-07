@@ -8,7 +8,7 @@
 # Build:  docker build -t <registry>/runai-mcp:latest ./runai-mcp
 # Pin RUNAI_MCP_REF to a commit/tag for reproducible builds.
 ARG RUNAI_MCP_REPO=https://github.com/sejongjeong/runai-mcp.git
-ARG RUNAI_MCP_REF=main
+ARG RUNAI_MCP_REF=527b14087c35edf3467f5028fcc3793475976855
 
 FROM node:20-slim AS build
 ARG RUNAI_MCP_REPO
@@ -31,6 +31,11 @@ WORKDIR /app
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/package.json ./package.json
+# The server reads the OpenAPI spec at runtime — index.js resolves
+# `<dist>/../spec/saas-latest.yaml` and process.exit(1)s if it's missing.
+# tsc does NOT emit the YAML into dist, so copy the spec dir explicitly or the
+# sidecar CrashLoopBackOffs on startup ("Failed to build registry").
+COPY --from=build /app/spec ./spec
 # Non-root; the chart also applies its securityContext.
 USER 1000
 EXPOSE 8809

@@ -156,7 +156,7 @@ async def test_llm_refinement_kept_on_success(monkeypatch) -> None:
         llm_api_key="k",
     )
 
-    async def fake_complete_json(settings, *, system, user, temperature=0.1):
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
         return {
             "focus": "refined focus",
             "strategy": "targeted",
@@ -273,7 +273,7 @@ async def test_llm_can_widen_scope_to_control_plane(monkeypatch) -> None:
     # reading ON, and the runai control-plane namespaces get added.
     settings = replace(make_settings(), llm_base_url="x", llm_model="m", llm_api_key="k")
 
-    async def fake(settings, *, system, user, temperature=0.1):
+    async def fake(settings, *, system, user, temperature=0.1, model=None):
         return {"strategy": "targeted", "check_control_plane": True,
                 "hypotheses": [{"family": "runai_control_plane_error", "reason": "platform"}]}
 

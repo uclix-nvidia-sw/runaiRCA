@@ -103,6 +103,8 @@ spec:
               value: {{ .Values.agent.env.enableAgentDrilldown | quote }}
             - name: DRILLDOWN_MAX_STEPS
               value: {{ .Values.agent.env.drilldownMaxSteps | quote }}
+            - name: ANALYSIS_TOKEN_BUDGET
+              value: {{ .Values.agent.env.analysisTokenBudget | quote }}
             - name: ANALYSIS_DEADLINE_SECONDS
               value: {{ .Values.agent.env.analysisDeadlineSeconds | quote }}
             - name: RUNAI_BASE_URL
@@ -123,6 +125,10 @@ spec:
               value: {{ .Values.agent.env.runaiTimeoutSeconds | quote }}
             - name: RUNAI_LOG_NAMESPACES
               value: {{ .Values.agent.env.runaiLogNamespaces | quote }}
+            - name: COLLECTORS
+              value: {{ .Values.agent.env.collectors | quote }}
+            - name: BACKEND_URL
+              value: {{ default (printf "http://%s:%v" (include "runai-rca.backend.fullname" .) .Values.backend.service.port) .Values.agent.env.backendUrl | quote }}
             - name: PROMETHEUS_URL
               value: {{ .Values.agent.env.prometheusUrl | quote }}
             - name: PROMETHEUS_TIMEOUT_SECONDS
@@ -141,6 +147,8 @@ spec:
               value: {{ .Values.agent.env.postgresTimeoutSeconds | quote }}
             - name: TROUBLESHOOTING_CASES_FILE
               value: {{ .Values.agent.env.troubleshootingCasesFile | quote }}
+            - name: FAMILIES_FILE
+              value: {{ .Values.agent.env.familiesFile | quote }}
             - name: AGENT_SOULS_FILE
               value: {{ .Values.agent.env.agentSoulsFile | quote }}
             - name: MASKING_REGEX_LIST_JSON
@@ -153,6 +161,20 @@ spec:
               value: {{ .Values.agent.env.llmBaseUrl | quote }}
             - name: LLM_MODEL
               value: {{ .Values.agent.env.llmModel | quote }}
+            - name: LLM_MODEL_PLANNER
+              value: {{ .Values.agent.env.llmModelPlanner | quote }}
+            - name: LLM_MODEL_INVESTIGATION
+              value: {{ .Values.agent.env.llmModelInvestigation | quote }}
+            - name: LLM_MODEL_DRILLDOWN
+              value: {{ .Values.agent.env.llmModelDrilldown | quote }}
+            - name: LLM_MODEL_SELF_CHECK
+              value: {{ .Values.agent.env.llmModelSelfCheck | quote }}
+            - name: LLM_MODEL_SYNTHESIS
+              value: {{ .Values.agent.env.llmModelSynthesis | quote }}
+            - name: LLM_MODEL_CHAT
+              value: {{ .Values.agent.env.llmModelChat | quote }}
+            - name: LLM_PRICING_JSON
+              value: {{ .Values.agent.env.llmPricingJson | quote }}
             - name: LLM_REQUEST_TIMEOUT_SECONDS
               value: {{ .Values.agent.env.llmRequestTimeoutSeconds | quote }}
             - name: ENABLE_TYPEDB

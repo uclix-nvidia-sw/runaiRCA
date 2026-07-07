@@ -19,7 +19,7 @@ import logging
 
 from app.collectors.base import AnalysisTarget
 from app.config import Settings
-from app.knowledge import load_runai_alerts, match_runai_alert
+from app.knowledge import FamilyCatalog, load_family_catalog, load_runai_alerts, match_runai_alert
 from app.llm import complete_json, llm_configured
 from app.plan import InvestigationPlan
 
@@ -38,49 +38,6 @@ _CONTROL_PLANE_KEYWORDS = (
     "queue",
     "runai-backend",
 )
-
-# Alert-name / evidence keywords -> failure family, for ordering hypotheses.
-_FAMILY_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    (
-        "node_kubelet_pressure",
-        ("diskpressure", "memorypressure", "pidpressure", "kubelet", "node", "evict"),
-    ),
-    (
-        "runai_scheduling_quota",
-        ("quota", "queue", "preempt", "reclaim", "fairshare", "gang", "over-quota"),
-    ),
-    (
-        "k8s_scheduling_error",
-        ("failedscheduling", "unschedul", "taint", "affinity", "topology"),
-    ),
-    (
-        "runai_control_plane_error",
-        ("reconcile", "runai-backend", "cluster-sync", "authorization"),
-    ),
-    (
-        "k8s_control_plane_error",
-        ("apiserver", "etcd", "kubeadm", "leaderelection", "webhook", "kube-controller"),
-    ),
-    (
-        "workload_startup_error",
-        ("crashloop", "oom", "createcontainer", "startup probe", "runcontainer"),
-    ),
-    (
-        "image_pull_error",
-        ("imagepull", "errimagepull", "image", "registry", "manifest"),
-    ),
-)
-
-_FAMILY_REASON = {
-    "node_kubelet_pressure": "alert points at node/kubelet resource pressure",
-    "runai_scheduling_quota": "alert points at Run:ai scheduling / GPU quota (preempt/reclaim)",
-    "k8s_scheduling_error": "alert points at kube-scheduler placement (taint/affinity/quota)",
-    "runai_control_plane_error": "alert implicates the Run:ai platform control plane",
-    "k8s_control_plane_error": "alert implicates the Kubernetes cluster control plane",
-    "workload_startup_error": "alert points at a workload-local startup/config/crash fault",
-    "image_pull_error": "alert points at an image pull / registry failure",
-}
-
 
 def _is_runai_namespace(namespace: str) -> bool:
     ns = (namespace or "").lower()
@@ -153,7 +110,9 @@ def _promote_families(
     return lead + rest
 
 
-def _ordered_hypotheses(target: AnalysisTarget) -> tuple[list[dict[str, str]], bool]:
+def _ordered_hypotheses(
+    target: AnalysisTarget, family_catalog: FamilyCatalog
+) -> tuple[list[dict[str, str]], bool]:
     """Ranked families + whether ANY family actually matched a keyword.
 
     The bool matters: on a 0-0-0-0 tie the declaration-order tiebreak would make
@@ -164,7 +123,7 @@ def _ordered_hypotheses(target: AnalysisTarget) -> tuple[list[dict[str, str]], b
         [target.alert_name or "", target.workload_name or "", target.workload_type or ""]
     ).lower()
     scored: list[tuple[int, str]] = []
-    for family, keywords in _FAMILY_HINTS:
+    for family, keywords in family_catalog.hints:
         hits = sum(1 for kw in keywords if kw in haystack)
         scored.append((hits, family))
     # Highest keyword-hit families first; keep declaration order as the tiebreak
@@ -172,7 +131,8 @@ def _ordered_hypotheses(target: AnalysisTarget) -> tuple[list[dict[str, str]], b
     scored_indexed = [(hits, -i, fam) for i, (hits, fam) in enumerate(scored)]
     scored_indexed.sort(reverse=True)
     hypotheses = [
-        {"family": fam, "reason": _FAMILY_REASON[fam]} for _, _, fam in scored_indexed
+        {"family": fam, "reason": family_catalog.reasons.get(fam, fam)}
+        for _, _, fam in scored_indexed
     ]
     return hypotheses, any(hits for hits, _ in scored)
 
@@ -252,7 +212,8 @@ async def plan_investigation(
             if ns and ns not in namespaces:
                 namespaces.append(ns)
 
-    hypotheses, keyword_signal = _ordered_hypotheses(target)
+    family_catalog = load_family_catalog(settings.families_file)
+    hypotheses, keyword_signal = _ordered_hypotheses(target, family_catalog)
     # Namespace decides the emphasis: a Run:ai platform namespace (runai/runai-backend)
     # means the control plane itself is unhealthy -> lead control-plane + node/system
     # broadly; a user workload namespace inside Run:ai -> lead the scheduler/scheduling.
@@ -385,7 +346,7 @@ async def plan_investigation(
     # their feedback) is a human directive — the LLM refine must honor it.
     guidance = str((getattr(alert, "annotations", None) or {}).get("operator_prompt") or "")
 
-    if llm_configured(settings):
+    if llm_configured(settings, settings.llm_model_planner):
         try:
             refined = await _llm_refine(
                 settings, target, plan, kg_context, similar_incidents, guidance
@@ -456,7 +417,7 @@ async def _llm_refine(
         f"focus={plan.focus}\nstrategy={plan.strategy}\n"
         f"hypotheses={plan.hypotheses}\nnarrative={plan.narrative}\n"
     )
-    data = await complete_json(settings, system=system, user=user)
+    data = await complete_json(settings, system=system, user=user, model=settings.llm_model_planner)
     if not data:
         return None
 

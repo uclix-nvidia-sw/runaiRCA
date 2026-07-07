@@ -249,7 +249,7 @@ func (s *Store) SearchIncidentMemory(query string, limit int) []SimilarIncident 
 	defer s.mu.RUnlock()
 	results := make([]SimilarIncident, 0, len(s.memories))
 	for _, memory := range s.memories {
-		if memory == nil {
+		if memory == nil || !incidentUserApproved(s.incidents[memory.IncidentID]) || incidentDeleted(s.incidents[memory.IncidentID]) {
 			continue
 		}
 		score := cosineSimilarity(queryVector, memory.Vector)
@@ -336,9 +336,9 @@ func (s *Store) ApplyAnalysisForRun(runID string, alertID string, response Agent
 	}
 	if incident := s.incidents[alert.IncidentID]; incident != nil {
 		s.refreshIncidentAnalyzingLocked(incident.IncidentID)
-		s.upsertMemoryLocked(incident, alert)
 		s.persistIncidentLocked(incident)
 	}
+	s.invalidateRecurrenceStatsLocked()
 	return true
 }
 
@@ -356,10 +356,10 @@ func (s *Store) applyAnalysisLocked(alert *AlertRecord, response AgentAnalysisRe
 	alert.IsAnalyzing = false
 	if incident := s.incidents[alert.IncidentID]; incident != nil {
 		s.refreshIncidentAnalyzingLocked(incident.IncidentID)
-		s.upsertMemoryLocked(incident, alert)
 		s.persistIncidentLocked(incident)
 	}
 	s.persistAlertLocked(alert)
+	s.invalidateRecurrenceStatsLocked()
 }
 
 func (s *Store) MarkAnalyzing(incidentID string, analyzing bool) {
@@ -438,6 +438,7 @@ func (s *Store) applyFallbackAnalysisIfAbsentLocked(alert *AlertRecord, response
 			s.persistIncidentLocked(incident)
 		}
 		s.persistAlertLocked(alert)
+		s.invalidateRecurrenceStatsLocked()
 		return false
 	}
 	alert.AnalysisSummary = response.AnalysisSummary
@@ -456,6 +457,7 @@ func (s *Store) applyFallbackAnalysisIfAbsentLocked(alert *AlertRecord, response
 		s.persistIncidentLocked(incident)
 	}
 	s.persistAlertLocked(alert)
+	s.invalidateRecurrenceStatsLocked()
 	return true
 }
 
@@ -494,6 +496,9 @@ func (s *Store) refreshIncidentAnalyzingLocked(incidentID string) {
 }
 
 func (s *Store) upsertMemoryLocked(incident *Incident, alert *AlertRecord) {
+	if incident == nil || alert == nil || !incidentUserApproved(incident) {
+		return
+	}
 	if strings.TrimSpace(alert.AnalysisSummary) == "" && strings.TrimSpace(alert.AnalysisDetail) == "" {
 		return
 	}
@@ -511,6 +516,18 @@ func (s *Store) upsertMemoryLocked(incident *Incident, alert *AlertRecord) {
 	memory.Vector = textVector(memoryText(*memory))
 	s.memories[first(memory.AlertID, memory.IncidentID)] = memory
 	s.persistMemoryLocked(memory)
+	s.invalidateRecurrenceStatsLocked()
+}
+
+func (s *Store) upsertApprovedIncidentMemoriesLocked(incident *Incident) {
+	if !incidentUserApproved(incident) {
+		return
+	}
+	for _, alert := range s.alerts {
+		if alert != nil && alert.IncidentID == incident.IncidentID {
+			s.upsertMemoryLocked(incident, alert)
+		}
+	}
 }
 
 func (s *Store) similarIncidentsLocked(
@@ -522,7 +539,7 @@ func (s *Store) similarIncidentsLocked(
 	queryVector := textVector(alertSearchText(alert))
 	results := make([]SimilarIncident, 0, len(s.memories))
 	for _, memory := range s.memories {
-		if memory == nil || memory.IncidentID == currentIncidentID {
+		if memory == nil || !incidentUserApproved(s.incidents[memory.IncidentID]) || memory.IncidentID == currentIncidentID || incidentDeleted(s.incidents[memory.IncidentID]) {
 			continue
 		}
 		score := cosineSimilarity(queryVector, memory.Vector)
@@ -557,6 +574,34 @@ func (s *Store) similarIncidentsLocked(
 		return results[i].Similarity > results[j].Similarity
 	})
 	return dedupeSimilarByIncident(results, limit)
+}
+
+func (s *Store) similarRecentCountLocked(
+	alert Alert,
+	currentIncidentID string,
+	since time.Time,
+	before *time.Time,
+) int {
+	queryVector := textVector(alertSearchText(alert))
+	seen := map[string]struct{}{}
+	for _, memory := range s.memories {
+		if memory == nil || !incidentUserApproved(s.incidents[memory.IncidentID]) || memory.IncidentID == currentIncidentID {
+			continue
+		}
+		incident := s.incidents[memory.IncidentID]
+		if incident == nil || incidentDeleted(incident) || incident.FiredAt.Before(since) {
+			continue
+		}
+		if before != nil && !incident.FiredAt.Before(*before) {
+			continue
+		}
+		score := cosineSimilarity(queryVector, memory.Vector)
+		score += labelSimilarityBonus(alert.Labels, memory.Labels)
+		if score >= minFeedbackHintSimilarity {
+			seen[memory.IncidentID] = struct{}{}
+		}
+	}
+	return len(seen)
 }
 
 func dedupeSimilarByIncident(results []SimilarIncident, limit int) []SimilarIncident {

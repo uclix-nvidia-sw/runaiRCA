@@ -91,12 +91,15 @@ class Settings:
     loki_query_limit: int
     loki_mcp_url: str
     runai_log_namespaces: tuple[str, ...]
+    collectors: tuple[str, ...]
+    backend_url: str
     postgres_dsn: str
     postgres_timeout_seconds: int
     runai_db_dsn: str
     troubleshooting_cases_file: str
     architecture_file: str
     failure_modes_file: str
+    families_file: str
     runai_alerts_file: str
     runai_known_issues_file: str
     enable_system_agent: bool
@@ -111,6 +114,13 @@ class Settings:
     builtin_redaction_hash_mode: bool
     llm_base_url: str
     llm_model: str
+    llm_model_planner: str
+    llm_model_investigation: str
+    llm_model_drilldown: str
+    llm_model_self_check: str
+    llm_model_synthesis: str
+    llm_model_chat: str
+    llm_pricing_json: str
     llm_api_key: str
     llm_request_timeout_seconds: int
     nat_config_file: str
@@ -126,6 +136,7 @@ class Settings:
     enable_investigation_loop: bool
     max_investigation_steps: int
     max_reanalysis_steps: int
+    analysis_token_budget: int
     enable_agent_drilldown: bool
     drilldown_max_steps: int
     analysis_deadline_seconds: int
@@ -183,6 +194,11 @@ def load_settings() -> Settings:
         loki_query_limit=max(1, _int_env("LOKI_QUERY_LIMIT", 20)),
         loki_mcp_url=os.getenv("LOKI_MCP_URL", "").strip().rstrip("/"),
         runai_log_namespaces=_csv_env("RUNAI_LOG_NAMESPACES", ("runai", "runai-backend")),
+        collectors=_csv_env(
+            "COLLECTORS",
+            ("runai", "kubernetes", "postgres", "prometheus", "loki", "system", "change"),
+        ),
+        backend_url=os.getenv("BACKEND_URL", "").strip().rstrip("/"),
         postgres_dsn=os.getenv("POSTGRES_DSN", "").strip(),
         postgres_timeout_seconds=_int_env("POSTGRES_TIMEOUT_SECONDS", 60),
         # Optional DSN for the Run:ai control-plane Postgres (the platform's own
@@ -205,6 +221,10 @@ def load_settings() -> Settings:
         failure_modes_file=os.getenv(
             "FAILURE_MODES_FILE",
             "knowledge/failure_modes.yaml",
+        ).strip(),
+        families_file=os.getenv(
+            "FAMILIES_FILE",
+            "knowledge/families.yaml",
         ).strip(),
         runai_alerts_file=os.getenv(
             "RUNAI_ALERTS_FILE",
@@ -229,6 +249,13 @@ def load_settings() -> Settings:
         builtin_redaction_hash_mode=_bool_env("BUILTIN_REDACTION_HASH_MODE", False),
         llm_base_url=os.getenv("LLM_BASE_URL", "").strip().rstrip("/"),
         llm_model=os.getenv("LLM_MODEL", "").strip(),
+        llm_model_planner=os.getenv("LLM_MODEL_PLANNER", "").strip(),
+        llm_model_investigation=os.getenv("LLM_MODEL_INVESTIGATION", "").strip(),
+        llm_model_drilldown=os.getenv("LLM_MODEL_DRILLDOWN", "").strip(),
+        llm_model_self_check=os.getenv("LLM_MODEL_SELF_CHECK", "").strip(),
+        llm_model_synthesis=os.getenv("LLM_MODEL_SYNTHESIS", "").strip(),
+        llm_model_chat=os.getenv("LLM_MODEL_CHAT", "").strip(),
+        llm_pricing_json=os.getenv("LLM_PRICING_JSON", "{}").strip(),
         llm_api_key=os.getenv("LLM_API_KEY", "").strip(),
         # Generous per-call ceiling so a reasoning agent is never cut off mid-thought;
         # the overall analysis deadline below is the real bound. (0 = unlimited.)
@@ -252,6 +279,7 @@ def load_settings() -> Settings:
         # Re-analysis (after the first top cause is refuted) gets a generous
         # investigation budget of its own — accuracy over speed.
         max_reanalysis_steps=max(1, _int_env("MAX_REANALYSIS_STEPS", 6)),
+        analysis_token_budget=max(0, _int_env("ANALYSIS_TOKEN_BUDGET", 0)),
         # Per-collector autonomous drill-down: each evidence agent gets its own LLM
         # loop with ONLY its domain's read-only tools (see services/drilldown.py).
         # LLM-gated and best-effort like the investigation loop.

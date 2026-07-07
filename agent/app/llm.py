@@ -7,21 +7,126 @@ configured, or the call fails, the callers fall back to deterministic behaviour.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import random
+from contextvars import ContextVar
 from typing import Any
 
 from app.collectors.http_json import post_json
 from app.config import Settings
 
+_log = logging.getLogger(__name__)
+_usage: ContextVar[dict[str, Any] | None] = ContextVar("llm_usage", default=None)
+_RETRY_STATUSES = {0, 429, 500, 502, 503, 504}
 
-def llm_configured(settings: Settings) -> bool:
-    return bool(settings.llm_base_url and settings.llm_model and settings.llm_api_key)
+
+def llm_configured(settings: Settings, model: str | None = None) -> bool:
+    return bool(settings.llm_base_url and (model or settings.llm_model) and settings.llm_api_key)
 
 
-# Appended to EVERY system prompt sent through this module (and manually to the
-# one chat path that posts directly). The evidence fed to the LLM — log lines,
-# event messages, alert labels/annotations, resource names — is collected from
-# the cluster, so anyone who can write a log line can write to our prompts.
+def begin_usage_tracking() -> dict[str, Any]:
+    usage = {
+        "calls": 0,
+        "calls_without_usage": 0,
+        "failed_calls": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "by_model": {},
+    }
+    _usage.set(usage)
+    return usage
+
+
+def usage_with_cost(settings: Settings, usage: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of usage enriched with model cost_usd from LLM_PRICING_JSON."""
+    enriched = dict(usage)
+    pricing = _pricing_table(settings)
+    total_cost = 0.0
+    raw_by_model = usage.get("by_model")
+    by_model: dict[str, Any] = {}
+    if isinstance(raw_by_model, dict):
+        for model, raw_bucket in raw_by_model.items():
+            if not isinstance(raw_bucket, dict):
+                continue
+            bucket = dict(raw_bucket)
+            cost = _estimate_bucket_cost(pricing.get(str(model)), bucket)
+            bucket["cost_usd"] = round(cost, 8)
+            by_model[str(model)] = bucket
+            total_cost += cost
+    enriched["by_model"] = by_model
+    enriched["cost_usd"] = round(total_cost, 8)
+    return enriched
+
+
+def token_budget_exceeded(settings: Settings) -> bool:
+    budget = int(getattr(settings, "analysis_token_budget", 0) or 0)
+    if budget <= 0:
+        return False
+    current = _usage.get()
+    if not isinstance(current, dict):
+        return False
+    return int(current.get("total_tokens") or 0) >= budget
+
+
+def token_budget_warning(settings: Settings) -> str:
+    current = _usage.get() or {}
+    used = int(current.get("total_tokens") or 0) if isinstance(current, dict) else 0
+    budget = int(getattr(settings, "analysis_token_budget", 0) or 0)
+    return (
+        f"analysis token budget exceeded ({used}/{budget} tokens); "
+        "skipped additional LLM reasoning"
+    )
+
+
+def _pricing_table(settings: Settings) -> dict[str, dict[str, float]]:
+    try:
+        raw = json.loads(getattr(settings, "llm_pricing_json", "{}") or "{}")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, float]] = {}
+    for model, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        prompt = _float(value.get("prompt_per_mtok"))
+        completion = _float(value.get("completion_per_mtok"))
+        out[str(model)] = {
+            "prompt_per_mtok": prompt,
+            "completion_per_mtok": completion,
+        }
+    return out
+
+
+def _estimate_bucket_cost(pricing: dict[str, float] | None, bucket: dict[str, Any]) -> float:
+    if not pricing:
+        return 0.0
+    prompt_tokens = int(bucket.get("prompt_tokens") or 0)
+    completion_tokens = int(bucket.get("completion_tokens") or 0)
+    return (
+        (prompt_tokens / 1_000_000) * pricing.get("prompt_per_mtok", 0.0)
+        + (completion_tokens / 1_000_000) * pricing.get("completion_per_mtok", 0.0)
+    )
+
+
+def _float(value: Any) -> float:
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+# Appended to EVERY system prompt sent through this module. The evidence fed to
+# the LLM — log lines, event messages, alert labels/annotations, resource names
+# — is collected from the cluster, so anyone who can write a log line can write
+# to our prompts.
 # Masking (app.masking) strips secrets; this line neutralises embedded
 # instructions. operator_guidance is the one deliberate instruction channel
 # (see _synthesize_korean) and stays exempt.
@@ -44,12 +149,35 @@ async def complete(
     user: str,
     temperature: float = 0.2,
     max_tokens: int | None = None,
+    model: str | None = None,
 ) -> str | None:
     """Return the model's text answer, or None when unavailable/failed."""
-    if not llm_configured(settings):
-        return None
+    text, _error = await complete_with_error(
+        settings,
+        system=system,
+        user=user,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        model=model,
+    )
+    return text
+
+
+async def complete_with_error(
+    settings: Settings,
+    *,
+    system: str,
+    user: str,
+    temperature: float = 0.2,
+    max_tokens: int | None = None,
+    model: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Return (text, error_detail) so chat can surface LLM failures."""
+    selected_model = (model or settings.llm_model).strip()
+    if not llm_configured(settings, selected_model):
+        return None, "LLM is not configured"
     payload: dict[str, Any] = {
-        "model": settings.llm_model,
+        "model": selected_model,
         "messages": [
             {"role": "system", "content": f"{system}\n\n{PROMPT_INJECTION_GUARD}"},
             {"role": "user", "content": user},
@@ -58,22 +186,86 @@ async def complete(
     }
     if max_tokens:
         payload["max_tokens"] = max_tokens
-    response = await post_json(
-        url=f"{settings.llm_base_url}/chat/completions",
-        timeout_seconds=settings.llm_request_timeout_seconds,
-        json_body=payload,
-        headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-    )
-    if not response.ok or not isinstance(response.data, dict):
-        return None
+    response = None
+    for attempt in range(3):
+        response = await post_json(
+            url=f"{settings.llm_base_url}/chat/completions",
+            timeout_seconds=settings.llm_request_timeout_seconds,
+            json_body=payload,
+            headers={"Authorization": f"Bearer {settings.llm_api_key}"},
+        )
+        if response.ok or response.status_code not in _RETRY_STATUSES or attempt == 2:
+            break
+        await asyncio.sleep((0.25 * (2**attempt)) + random.uniform(0, 0.1))
+    if not response.ok:
+        _record_failed_call(selected_model)
+        detail = " ".join(str(response.error or "").split())[:200]
+        return None, f"HTTP {response.status_code or '?'} {detail}".strip()
+    if not isinstance(response.data, dict):
+        _record_failed_call(selected_model)
+        return None, "unexpected response shape from the LLM endpoint"
+    _record_usage(selected_model, response.data)
     choices = response.data.get("choices")
     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
         message = choices[0].get("message")
         if isinstance(message, dict):
             content = message.get("content")
             if isinstance(content, str) and content.strip():
-                return content.strip()
-    return None
+                return content.strip(), None
+    return None, "unexpected response shape from the LLM endpoint"
+
+
+def _record_usage(model: str, data: dict[str, Any]) -> None:
+    current = _usage.get()
+    if current is None:
+        return
+    bucket = _usage_bucket(current, model)
+    current["calls"] += 1
+    bucket["calls"] += 1
+
+    raw = data.get("usage")
+    if not isinstance(raw, dict):
+        current["calls_without_usage"] += 1
+        bucket["calls_without_usage"] += 1
+        _log.info("llm usage", extra={"llm_usage": {"model": model, "calls_without_usage": 1}})
+        return
+
+    per_call: dict[str, Any] = {"model": model}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = raw.get(key)
+        if isinstance(value, int | float):
+            current[key] += int(value)
+            bucket[key] += int(value)
+            per_call[key] = int(value)
+    _log.info("llm usage", extra={"llm_usage": per_call})
+
+
+def _record_failed_call(model: str) -> None:
+    current = _usage.get()
+    if current is None:
+        return
+    bucket = _usage_bucket(current, model)
+    current["failed_calls"] += 1
+    bucket["failed_calls"] += 1
+
+
+def _usage_bucket(current: dict[str, Any], model: str) -> dict[str, int]:
+    by_model = current.setdefault("by_model", {})
+    if not isinstance(by_model, dict):
+        by_model = {}
+        current["by_model"] = by_model
+    bucket = by_model.setdefault(
+        model,
+        {
+            "calls": 0,
+            "calls_without_usage": 0,
+            "failed_calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+    )
+    return bucket
 
 
 async def complete_json(
@@ -82,6 +274,7 @@ async def complete_json(
     system: str,
     user: str,
     temperature: float = 0.1,
+    model: str | None = None,
 ) -> dict[str, Any] | None:
     """Ask for a JSON object and parse it, tolerating ```json fences. None on failure."""
     text = await complete(
@@ -89,6 +282,7 @@ async def complete_json(
         system=system + "\n\nRespond with ONLY a valid JSON object, no prose, no code fences.",
         user=user,
         temperature=temperature,
+        model=model,
     )
     if not text:
         return None

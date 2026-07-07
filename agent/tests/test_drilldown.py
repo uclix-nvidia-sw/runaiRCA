@@ -6,6 +6,7 @@ from dataclasses import replace
 import pytest
 
 from app.collectors.base import AnalysisTarget, CollectorResult
+from app.llm import begin_usage_tracking
 from app.services import drilldown
 from app.services.drilldown import _tool_runai_get, run_drilldowns
 from tests.test_orchestrator import make_settings
@@ -48,7 +49,7 @@ def _k8s_result() -> CollectorResult:
 def test_disabled_flag_means_no_llm_calls(monkeypatch) -> None:
     calls: list[str] = []
 
-    async def fake_complete_json(settings, *, system, user, temperature=0.1):
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
         calls.append(system)
         return {"action": "done"}
 
@@ -75,7 +76,7 @@ def test_drilldown_appends_tagged_artifacts_and_stops_on_done(monkeypatch) -> No
     )
     seen_args: list[dict] = []
 
-    async def fake_complete_json(settings, *, system, user, temperature=0.1):
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
         return next(decisions)
 
     async def fake_k8s_read(settings, kind, *, namespace="", name="", label_selector=""):
@@ -95,7 +96,7 @@ def test_loop_is_bounded_by_max_steps_and_queries_per_step(monkeypatch) -> None:
     llm_calls = [0]
     tool_calls = [0]
 
-    async def always_query(settings, *, system, user, temperature=0.1):
+    async def always_query(settings, *, system, user, temperature=0.1, model=None):
         llm_calls[0] += 1
         return {
             "action": "query",
@@ -114,13 +115,35 @@ def test_loop_is_bounded_by_max_steps_and_queries_per_step(monkeypatch) -> None:
     assert tool_calls[0] == 9  # 3 steps x 3 queries/step cap (9 requested per step)
 
 
+def test_token_budget_stops_drilldown_loop(monkeypatch) -> None:
+    usage = begin_usage_tracking()
+    usage["total_tokens"] = 10
+
+    async def should_not_call_llm(*args, **kwargs):
+        raise AssertionError("budget should stop drilldown before another LLM call")
+
+    monkeypatch.setattr(drilldown, "complete_json", should_not_call_llm)
+    result = _k8s_result()
+    asyncio.run(
+        run_drilldowns(
+            drill_settings(analysis_token_budget=10),
+            [result],
+            _target(),
+            None,
+        )
+    )
+
+    assert result.artifacts == []
+    assert any("token budget" in warning for warning in result.warnings)
+
+
 def test_tool_scoping_is_structural(monkeypatch) -> None:
     # No loki_url / runai_mcp_url in settings -> those agents get NO tools and no
     # loop; kubernetes still drills. An agent can never reach another domain's
     # tools because its registry simply doesn't contain them.
     drilled_agents: list[str] = []
 
-    async def fake_complete_json(settings, *, system, user, temperature=0.1):
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
         drilled_agents.append(system.split(" ")[3])  # "You are the {agent} evidence..."
         return {"action": "done"}
 
@@ -138,7 +161,7 @@ def test_tool_scoping_is_structural(monkeypatch) -> None:
 def test_unavailable_collectors_are_skipped(monkeypatch) -> None:
     calls = [0]
 
-    async def fake_complete_json(settings, *, system, user, temperature=0.1):
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
         calls[0] += 1
         return {"action": "done"}
 
@@ -156,7 +179,7 @@ def test_tool_failure_becomes_observation_not_crash(monkeypatch) -> None:
         ]
     )
 
-    async def fake_complete_json(settings, *, system, user, temperature=0.1):
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
         return next(decisions)
 
     async def broken_k8s_read(settings, kind, **kwargs):
@@ -215,7 +238,7 @@ def test_runai_get_tool_locks_method_to_get(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_never_raises_even_if_llm_layer_explodes(monkeypatch) -> None:
-    async def broken_complete_json(settings, *, system, user, temperature=0.1):
+    async def broken_complete_json(settings, *, system, user, temperature=0.1, model=None):
         raise RuntimeError("llm gateway down")
 
     monkeypatch.setattr(drilldown, "complete_json", broken_complete_json)
@@ -255,7 +278,7 @@ def test_k8s_tool_reports_kubectl_command_title_and_highlights(monkeypatch) -> N
         ]
     )
 
-    async def fake_complete_json(settings, *, system, user, temperature=0.1):
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
         return next(decisions)
 
     async def fake_k8s_read(settings, kind, *, namespace="", name="", label_selector=""):
@@ -311,7 +334,7 @@ def test_sql_tool_targets_runai_db_and_appends_limit(monkeypatch) -> None:
         ]
     )
 
-    async def fake_complete_json(settings, *, system, user, temperature=0.1):
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
         return next(decisions)
 
     monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
@@ -326,7 +349,7 @@ def test_sql_tool_targets_runai_db_and_appends_limit(monkeypatch) -> None:
 def test_postgres_agent_has_no_sql_tool_without_any_dsn(monkeypatch) -> None:
     calls = [0]
 
-    async def fake_complete_json(settings, *, system, user, temperature=0.1):
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
         calls[0] += 1
         return {"action": "done"}
 

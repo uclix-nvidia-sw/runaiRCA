@@ -57,12 +57,15 @@ def make_settings() -> Settings:
         loki_query_limit=10,
         loki_mcp_url="",
         runai_log_namespaces=("runai", "runai-backend"),
+        collectors=("runai", "kubernetes", "postgres", "prometheus", "loki", "system", "change"),
+        backend_url="",
         postgres_dsn="",
         runai_db_dsn="",
         architecture_file="knowledge/runai_architecture.yaml",
         postgres_timeout_seconds=1,
         troubleshooting_cases_file="knowledge/troubleshooting_cases.md",
         failure_modes_file="knowledge/failure_modes.yaml",
+        families_file="knowledge/families.yaml",
         runai_alerts_file="knowledge/runai_alerts_catalog.yaml",
         runai_known_issues_file="knowledge/runai_known_issues.yaml",
         enable_system_agent=False,
@@ -77,6 +80,13 @@ def make_settings() -> Settings:
         builtin_redaction_hash_mode=False,
         llm_base_url="",
         llm_model="",
+        llm_model_planner="",
+        llm_model_investigation="",
+        llm_model_drilldown="",
+        llm_model_self_check="",
+        llm_model_synthesis="",
+        llm_model_chat="",
+        llm_pricing_json="{}",
         llm_api_key="",
         llm_request_timeout_seconds=120,
         nat_config_file="configs/runai_rca_workflow.yml",
@@ -92,6 +102,7 @@ def make_settings() -> Settings:
         enable_investigation_loop=False,
         max_investigation_steps=4,
         max_reanalysis_steps=2,
+        analysis_token_budget=0,
         enable_agent_drilldown=False,
         drilldown_max_steps=4,
         analysis_deadline_seconds=300,
@@ -112,6 +123,17 @@ def make_target() -> AnalysisTarget:
         severity="warning",
         alert_name="RunAIWorkloadPending",
     )
+
+
+def test_orchestrator_uses_configured_collectors() -> None:
+    orchestrator = AnalysisOrchestrator(
+        replace(make_settings(), collectors=("kubernetes", "loki"))
+    )
+
+    assert [c.__class__.__name__ for c in orchestrator._collectors] == [
+        "KubernetesCollector",
+        "LokiCollector",
+    ]
 
 
 def test_resolve_target_derives_project_from_runai_namespace() -> None:
@@ -586,6 +608,7 @@ async def test_chat_uses_llm_when_configured(monkeypatch) -> None:
         make_settings(),
         llm_base_url="https://llm.example.com/v1",
         llm_model="rca-router",
+        llm_model_chat="rca-chat",
         llm_api_key="secret",
     )
     captured: dict[str, object] = {}
@@ -602,7 +625,7 @@ async def test_chat_uses_llm_when_configured(monkeypatch) -> None:
             },
         )
 
-    monkeypatch.setattr("app.services.orchestrator.post_json", fake_post_json)
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
     orchestrator = AnalysisOrchestrator(settings)
     response = await orchestrator.chat(
         ChatRequest(message="왜 워크로드가 멈췄어?", page="operations")
@@ -610,7 +633,7 @@ async def test_chat_uses_llm_when_configured(monkeypatch) -> None:
 
     assert response.answer == "Live LLM reply about the pending workload."
     assert captured["url"] == "https://llm.example.com/v1/chat/completions"
-    assert captured["json_body"]["model"] == "rca-router"
+    assert captured["json_body"]["model"] == "rca-chat"
 
 
 @pytest.mark.anyio
@@ -625,7 +648,7 @@ async def test_chat_falls_back_when_llm_unavailable(monkeypatch) -> None:
     async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
         return SimpleNamespace(ok=False, data=None)
 
-    monkeypatch.setattr("app.services.orchestrator.post_json", fake_post_json)
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
     orchestrator = AnalysisOrchestrator(settings)
     response = await orchestrator.chat(ChatRequest(message="status?", page="operations"))
 
@@ -644,7 +667,7 @@ async def test_chat_falls_back_when_llm_call_raises(monkeypatch) -> None:
     async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
         raise RuntimeError("LLM transport exploded")
 
-    monkeypatch.setattr("app.services.orchestrator.post_json", fake_post_json)
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
     orchestrator = AnalysisOrchestrator(settings)
     response = await orchestrator.chat(ChatRequest(message="status?", page="operations"))
 

@@ -34,6 +34,17 @@ func TestPostgresConnectReportsPGVectorEnabledAndLoadsState(t *testing.T) {
 	if !state.Executed("idx_analysis_runs_one_analyzing_alert") {
 		t.Fatalf("expected alert-scoped analyzing run uniqueness DDL, got %+v", state.Execs())
 	}
+	for _, ddl := range []string{
+		"ADD COLUMN IF NOT EXISTS user_approved_at",
+		"ADD COLUMN IF NOT EXISTS archived_at",
+		"ADD COLUMN IF NOT EXISTS deleted_at",
+		"ADD COLUMN IF NOT EXISTS metadata",
+		"ADD COLUMN IF NOT EXISTS first_completed_at",
+	} {
+		if !state.Executed(ddl) {
+			t.Fatalf("expected DDL %q, got %+v", ddl, state.Execs())
+		}
+	}
 	cleanupIndex := state.ExecIndex("duplicate analyzing run was closed before enforcing alert uniqueness")
 	uniqueIndex := state.ExecIndex("idx_analysis_runs_one_analyzing_alert")
 	if cleanupIndex < 0 || uniqueIndex < 0 || cleanupIndex > uniqueIndex {
@@ -103,6 +114,61 @@ func TestPostgresLoadRestoresGroupAlertIndex(t *testing.T) {
 	}
 	if alerts := store.ListAlerts(); len(alerts) != 1 {
 		t.Fatalf("expected one alert after reload upsert, got %+v", alerts)
+	}
+}
+
+func TestPostgresLoadSkipsDeletedIncidentIndexes(t *testing.T) {
+	state := testsupport.NewPostgresState(false)
+	state.SetIncidentDeletedAt(time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC))
+	store := NewStore()
+
+	store.connectDatabaseWithDriver(testsupport.RegisterPostgresDriver(state), "fake://runai_rca", time.Second)
+	defer store.db.Close()
+
+	if active := store.ListIncidents(); len(active) != 0 {
+		t.Fatalf("deleted incident should not load into active view: %+v", active)
+	}
+	if trash, total := store.ListIncidentsPage(0, 0, incidentViewTrash); total != 1 || len(trash) != 1 {
+		t.Fatalf("deleted incident should load only in trash view, total=%d items=%+v", total, trash)
+	}
+	_, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "db"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIWorkloadPending", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue still blocked"},
+		Fingerprint: "fp-db",
+	})
+	if alert.AlertID == "ALR-db" {
+		t.Fatalf("loaded deleted incident alert index should not be reused")
+	}
+}
+
+func TestPostgresHardDeleteUsesSingleTransaction(t *testing.T) {
+	state := testsupport.NewPostgresState(false)
+	store := NewStore()
+
+	store.connectDatabaseWithDriver(testsupport.RegisterPostgresDriver(state), "fake://runai_rca", time.Second)
+	defer store.db.Close()
+	beforeBegins, beforeCommits, beforeRollbacks := state.TxCounts()
+
+	if !store.HardDeleteIncident("INC-db") {
+		t.Fatalf("expected hard delete to succeed")
+	}
+	afterBegins, afterCommits, afterRollbacks := state.TxCounts()
+	if afterBegins != beforeBegins+1 || afterCommits != beforeCommits+1 || afterRollbacks != beforeRollbacks {
+		t.Fatalf("expected one committed hard-delete transaction, before=%d/%d/%d after=%d/%d/%d",
+			beforeBegins, beforeCommits, beforeRollbacks, afterBegins, afterCommits, afterRollbacks)
+	}
+	for _, fragment := range []string{
+		"DELETE FROM analysis_runs",
+		"DELETE FROM rca_comments",
+		"DELETE FROM rca_feedback",
+		"DELETE FROM incident_embeddings",
+		"DELETE FROM alerts",
+		"DELETE FROM incidents",
+	} {
+		if !state.Executed(fragment) {
+			t.Fatalf("expected hard delete statement %q, got %+v", fragment, state.Execs())
+		}
 	}
 }
 

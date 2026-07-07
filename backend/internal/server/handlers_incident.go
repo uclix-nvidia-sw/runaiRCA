@@ -50,6 +50,31 @@ func (s *Server) handleIncident(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 	rest := pathPart(r.URL.Path, "/api/v1/incidents/")
 	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	if len(parts) == 1 && r.Method == http.MethodDelete {
+		id := parts[0]
+		if id == "" {
+			writeError(w, http.StatusNotFound, "incident id required")
+			return
+		}
+		permanent := strings.EqualFold(r.URL.Query().Get("permanent"), "true")
+		if permanent {
+			if !s.store.HardDeleteIncident(id) {
+				writeError(w, http.StatusNotFound, "incident not found")
+				return
+			}
+			s.hub.Broadcast(incidentUpdatedEvent(id, "delete_permanent", "", nil, nil))
+			writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+			return
+		}
+		incident, ok := s.store.SoftDeleteIncident(id)
+		if !ok {
+			writeError(w, http.StatusNotFound, "incident not found")
+			return
+		}
+		s.hub.Broadcast(incidentUpdatedEvent(id, "delete", incident.Status, incident.ArchivedAt, incident.DeletedAt))
+		writeJSON(w, http.StatusOK, envelope(incident))
+		return
+	}
 	if len(parts) < 2 {
 		writeError(w, http.StatusNotFound, "unknown incident action")
 		return
@@ -97,8 +122,6 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		now := time.Now().UTC()
-		nextStatus := "resolved"
-		var resolvedAt *time.Time
 		s.store.mu.Lock()
 		incident := s.store.incidents[id]
 		if incident == nil {
@@ -106,26 +129,41 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "incident not found")
 			return
 		}
-		if incident.Status == "resolved" {
-			nextStatus = "firing"
-			incident.Status = nextStatus
-			incident.ResolvedAt = nil
+		if incident.UserApprovedAt == nil {
+			incident.UserApprovedAt = &now
+			s.store.upsertApprovedIncidentMemoriesLocked(incident)
 		} else {
-			incident.Status = nextStatus
-			incident.ResolvedAt = &now
-			resolvedAt = &now
+			incident.UserApprovedAt = nil
 		}
+		status := incident.Status
+		resolvedAt := incident.ResolvedAt
+		userApprovedAt := incident.UserApprovedAt
 		s.store.persistIncidentLocked(incident)
-		for _, memory := range s.store.memories {
-			if memory == nil || memory.IncidentID != id {
-				continue
-			}
-			memory.Status = nextStatus
-			s.store.persistMemoryLocked(memory)
-		}
+		s.store.invalidateRecurrenceStatsLocked()
 		s.store.mu.Unlock()
-		s.hub.Broadcast(incidentResolvedEvent(id, nextStatus, resolvedAt))
-		writeJSON(w, http.StatusOK, map[string]string{"status": nextStatus})
+		s.hub.Broadcast(incidentResolvedEvent(id, status, resolvedAt, userApprovedAt))
+		writeJSON(w, http.StatusOK, map[string]any{"status": status, "user_approved_at": userApprovedAt})
+	case "archive", "unarchive", "restore":
+		if len(parts) != 2 || r.Method != http.MethodPost {
+			writeError(w, http.StatusNotFound, "unknown incident action")
+			return
+		}
+		var incident *Incident
+		var ok bool
+		switch action {
+		case "archive":
+			incident, ok = s.store.ArchiveIncident(id, true)
+		case "unarchive":
+			incident, ok = s.store.ArchiveIncident(id, false)
+		case "restore":
+			incident, ok = s.store.RestoreIncident(id)
+		}
+		if !ok {
+			writeError(w, http.StatusNotFound, "incident not found")
+			return
+		}
+		s.hub.Broadcast(incidentUpdatedEvent(id, action, incident.Status, incident.ArchivedAt, incident.DeletedAt))
+		writeJSON(w, http.StatusOK, envelope(incident))
 	case "feedback":
 		if len(parts) != 2 || r.Method != http.MethodPost {
 			writeError(w, http.StatusNotFound, "unknown incident action")

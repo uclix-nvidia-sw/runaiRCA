@@ -1,11 +1,245 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from app.bm25 import BM25Index
+
+
+@dataclass(frozen=True)
+class FamilyCatalog:
+    families: tuple[str, ...]
+    rules: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]]
+    hints: tuple[tuple[str, tuple[str, ...]], ...]
+    reasons: dict[str, str]
+
+
+DEFAULT_FAMILIES = (
+    "node_kubelet_pressure",
+    "runai_scheduling_quota",
+    "k8s_scheduling_error",
+    "runai_control_plane_error",
+    "k8s_control_plane_error",
+    "workload_startup_error",
+    "image_pull_error",
+)
+
+DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
+    "node_kubelet_pressure": (
+        "kubernetes",
+        ("kubernetes", "prometheus"),
+        (
+            "diskpressure",
+            "memorypressure",
+            "pidpressure",
+            "node pressure",
+            "evict",
+            "kubelet",
+            "device plugin",
+            "node condition",
+        ),
+    ),
+    "runai_scheduling_quota": (
+        "prometheus",
+        ("prometheus", "kubernetes", "runai"),
+        (
+            "preempt",
+            "reclaim",
+            "pod group",
+            "podgroup",
+            "gang",
+            "fairshare",
+            "over-quota",
+            "over quota",
+            "requested gpus",
+            "quota",
+            "idleness",
+        ),
+    ),
+    "k8s_scheduling_error": (
+        "kubernetes",
+        ("kubernetes", "prometheus"),
+        (
+            "failedscheduling",
+            "unschedulable",
+            "untolerated taint",
+            "node affinity/selector",
+            "topology spread",
+            "anti-affinity",
+            "exceeded quota",
+            "default-scheduler",
+            "0/",
+        ),
+    ),
+    "runai_control_plane_error": (
+        "loki",
+        ("loki", "kubernetes"),
+        (
+            "reconcile",
+            "runai-backend",
+            "cluster-sync",
+            "authorization",
+            "database error",
+        ),
+    ),
+    "k8s_control_plane_error": (
+        "kubernetes",
+        ("kubernetes", "loki"),
+        (
+            "apiserver",
+            "kube-apiserver",
+            "etcd",
+            "etcdserver",
+            "kube-controller-manager",
+            "kubeadm",
+            "leaderelection",
+            "failed calling webhook",
+            "admission webhook",
+        ),
+    ),
+    "workload_startup_error": (
+        "kubernetes",
+        ("kubernetes", "loki"),
+        (
+            "crashloopbackoff",
+            "oomkilled",
+            "failedmount",
+            "createcontainer",
+            "back-off restarting",
+            "startup probe",
+            "runcontainererror",
+            "importerror",
+            "permission denied",
+        ),
+    ),
+    "image_pull_error": (
+        "kubernetes",
+        ("kubernetes", "loki"),
+        (
+            "imagepullbackoff",
+            "errimagepull",
+            "errimageneverpull",
+            "manifest for",
+            "toomanyrequests",
+            "pull access denied",
+            "no such host",
+            "registry",
+        ),
+    ),
+}
+
+DEFAULT_FAMILY_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "node_kubelet_pressure",
+        ("diskpressure", "memorypressure", "pidpressure", "kubelet", "node", "evict"),
+    ),
+    (
+        "runai_scheduling_quota",
+        ("quota", "queue", "preempt", "reclaim", "fairshare", "gang", "over-quota"),
+    ),
+    (
+        "k8s_scheduling_error",
+        ("failedscheduling", "unschedul", "taint", "affinity", "topology"),
+    ),
+    (
+        "runai_control_plane_error",
+        ("reconcile", "runai-backend", "cluster-sync", "authorization"),
+    ),
+    (
+        "k8s_control_plane_error",
+        ("apiserver", "etcd", "kubeadm", "leaderelection", "webhook", "kube-controller"),
+    ),
+    (
+        "workload_startup_error",
+        ("crashloop", "oom", "createcontainer", "startup probe", "runcontainer"),
+    ),
+    (
+        "image_pull_error",
+        ("imagepull", "errimagepull", "image", "registry", "manifest"),
+    ),
+)
+
+DEFAULT_FAMILY_REASONS = {
+    "node_kubelet_pressure": "alert points at node/kubelet resource pressure",
+    "runai_scheduling_quota": "alert points at Run:ai scheduling / GPU quota (preempt/reclaim)",
+    "k8s_scheduling_error": "alert points at kube-scheduler placement (taint/affinity/quota)",
+    "runai_control_plane_error": "alert implicates the Run:ai platform control plane",
+    "k8s_control_plane_error": "alert implicates the Kubernetes cluster control plane",
+    "workload_startup_error": "alert points at a workload-local startup/config/crash fault",
+    "image_pull_error": "alert points at an image pull / registry failure",
+}
+
+
+def default_family_catalog() -> FamilyCatalog:
+    return FamilyCatalog(
+        families=DEFAULT_FAMILIES,
+        rules=dict(DEFAULT_FAMILY_RULES),
+        hints=DEFAULT_FAMILY_HINTS,
+        reasons=dict(DEFAULT_FAMILY_REASONS),
+    )
+
+
+def family_catalog_from_entries(raw: object) -> FamilyCatalog | None:
+    entries = raw.get("families") if isinstance(raw, dict) else raw
+    if not isinstance(entries, list):
+        return None
+
+    families: list[str] = []
+    rules: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {}
+    hints: list[tuple[str, tuple[str, ...]]] = []
+    reasons: dict[str, str] = {}
+    seen: set[str] = set()
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return None
+        family = str(entry.get("family") or "").strip()
+        if not family or family in seen:
+            return None
+        canonical = str(entry.get("canonical_agent") or "").strip()
+        agents = _string_tuple(entry.get("agents"))
+        keywords = _string_tuple(entry.get("keywords"), lower=True)
+        planner_keywords = _string_tuple(
+            entry.get("planner_keywords") or entry.get("keywords"),
+            lower=True,
+        )
+        reason = str(entry.get("reason") or "").strip()
+        if not (canonical and agents and keywords and planner_keywords and reason):
+            return None
+        seen.add(family)
+        families.append(family)
+        rules[family] = (canonical, agents, keywords)
+        hints.append((family, planner_keywords))
+        reasons[family] = reason
+
+    if not families:
+        return None
+    return FamilyCatalog(tuple(families), rules, tuple(hints), reasons)
+
+
+def load_family_catalog(path: str) -> FamilyCatalog:
+    if not path:
+        return default_family_catalog()
+    try:
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or []
+    except (OSError, yaml.YAMLError):
+        return default_family_catalog()
+    return family_catalog_from_entries(raw) or default_family_catalog()
+
+
+def _string_tuple(value: object, *, lower: bool = False) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    strings: list[str] = []
+    for item in value:
+        text = str(item).strip()
+        if not text:
+            continue
+        strings.append(text.lower() if lower else text)
+    return tuple(strings)
 
 
 def load_troubleshooting_cases(path: str, *, max_chars: int = 12000) -> str:

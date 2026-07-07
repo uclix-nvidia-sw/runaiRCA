@@ -116,6 +116,243 @@ func TestAnalysisRunSuccessAppliesRCA(t *testing.T) {
 	}
 }
 
+func TestAnalysisRunStoresLLMUsageMetadataAndClearsOnReanalysis(t *testing.T) {
+	store := NewStore()
+	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "usage"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-usage",
+	})
+	run := store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Manual", "")
+	if _, _, ok := store.AppendAnalysisProgress(run.RunID, map[string]any{
+		"phase":   "planning",
+		"message": "building hypotheses",
+	}); !ok {
+		t.Fatalf("progress append failed")
+	}
+	completed, ok := store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "done",
+		Context: map[string]any{
+			"llm_usage": map[string]any{"prompt_tokens": float64(3), "completion_tokens": float64(5), "total_tokens": float64(8)},
+		},
+	})
+	if !ok {
+		t.Fatalf("complete failed")
+	}
+	if completed.FirstCompletedAt == nil {
+		t.Fatalf("first completion timestamp was not set: %+v", completed)
+	}
+	usage, ok := completed.Metadata["llm_usage"].(map[string]any)
+	if !ok || usage["total_tokens"] != float64(8) {
+		t.Fatalf("usage metadata missing: %+v", completed.Metadata)
+	}
+	progress, ok := completed.Metadata["progress_log"].([]any)
+	if !ok || len(progress) != 1 {
+		t.Fatalf("progress log missing after complete: %+v", completed.Metadata)
+	}
+	detail, ok := store.IncidentDetail(incident.IncidentID)
+	if !ok || detail.TokenUsage["total_tokens"] != float64(8) {
+		t.Fatalf("incident detail missing token usage: ok=%t detail=%+v", ok, detail)
+	}
+
+	reused, created := store.CreateAnalysisRunIfAllowed("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Again", "")
+	if !created || reused.RunID != run.RunID || reused.Metadata != nil || reused.FirstCompletedAt == nil {
+		t.Fatalf("reanalysis should reuse row and clear metadata, created=%t run=%+v", created, reused)
+	}
+}
+
+func TestAnalysisProgressHandlerAppendsAndBroadcasts(t *testing.T) {
+	server := NewServer()
+	ch := server.hub.Subscribe()
+	defer server.hub.Unsubscribe(ch)
+	incident, alert := seedAlert(t, server, "fp-progress")
+	run := server.store.CreateAnalysisRun("manual", "alert", alert.AlertID, incident.IncidentID, alert.AlertID, "Manual", "")
+
+	body, _ := json.Marshal(map[string]any{
+		"phase":   "planning",
+		"message": "hypothesis check",
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/analysis-runs/"+run.RunID+"/progress", bytes.NewReader(body))
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d: %s", rec.Code, rec.Body.String())
+	}
+	event := receiveEvent(t, ch)
+	if event.Type != eventAnalysisProgress ||
+		event.Data["run_id"] != run.RunID ||
+		event.Data["incident_id"] != incident.IncidentID ||
+		event.Data["alert_id"] != alert.AlertID ||
+		event.Data["phase"] != "planning" ||
+		usageInt(event.Data["seq"]) != 1 {
+		t.Fatalf("unexpected progress event: %+v", event)
+	}
+	stored := waitForRunIDStatus(t, server, run.RunID, "analyzing")
+	progress, ok := stored.Metadata["progress_log"].([]any)
+	if !ok || len(progress) != 1 {
+		t.Fatalf("progress was not stored in metadata: %+v", stored.Metadata)
+	}
+}
+
+func TestAnalysisProgressCapsLogAndRejectsTerminalRuns(t *testing.T) {
+	store := NewStore()
+	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "cap"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-progress-cap",
+	})
+	run := store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Manual", "")
+	for i := 0; i < maxProgressLogEntries+5; i++ {
+		if _, _, ok := store.AppendAnalysisProgress(run.RunID, map[string]any{"message": fmt.Sprintf("step-%03d", i)}); !ok {
+			t.Fatalf("append %d failed", i)
+		}
+	}
+	stored := store.ListAnalysisRuns()[0]
+	log, ok := stored.Metadata["progress_log"].([]any)
+	if !ok || len(log) != maxProgressLogEntries {
+		t.Fatalf("progress log cap failed: len=%d metadata=%+v", len(log), stored.Metadata)
+	}
+	firstEntry := log[0].(map[string]any)
+	lastEntry := log[len(log)-1].(map[string]any)
+	if usageInt(firstEntry["seq"]) != 6 || usageInt(lastEntry["seq"]) != maxProgressLogEntries+5 {
+		t.Fatalf("unexpected progress seq window: first=%+v last=%+v", firstEntry, lastEntry)
+	}
+
+	store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{AnalysisSummary: "done"})
+	if _, _, ok := store.AppendAnalysisProgress(run.RunID, map[string]any{"message": "late"}); ok {
+		t.Fatalf("terminal run accepted progress")
+	}
+}
+
+func TestAnalysisProgressHandlerReturnsConflictForNonAnalyzingRun(t *testing.T) {
+	server := NewServer()
+	incident, alert := seedAlert(t, server, "fp-progress-conflict")
+	run := server.store.CreateAnalysisRun("manual", "alert", alert.AlertID, incident.IncidentID, alert.AlertID, "Manual", "")
+	server.store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{AnalysisSummary: "done"})
+
+	body := []byte(`{"message":"late"}`)
+	for _, path := range []string{
+		"/api/v1/analysis-runs/" + run.RunID + "/progress",
+		"/api/v1/analysis-runs/ANL-missing/progress",
+	} {
+		rec := httptest.NewRecorder()
+		server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body)))
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("expected 409 for %s, got %d: %s", path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestKPIStatsUsesFirstCompletedAt(t *testing.T) {
+	store := NewStore()
+	now := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
+	firedAt := now.Add(-2 * time.Hour)
+	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "kpi"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-kpi",
+		StartsAt:    firedAt.Format(time.RFC3339),
+	})
+	run := store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Manual", "")
+	store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{AnalysisSummary: "done"})
+	firstCompletedAt := firedAt.Add(15 * time.Minute)
+	resolvedAt := firedAt.Add(60 * time.Minute)
+	store.mu.Lock()
+	store.analysisRuns[run.RunID].FirstCompletedAt = &firstCompletedAt
+	store.analysisRuns[run.RunID].UpdatedAt = firedAt.Add(90 * time.Minute)
+	store.incidents[incident.IncidentID].ResolvedAt = &resolvedAt
+	store.incidents[incident.IncidentID].Status = "resolved"
+	store.mu.Unlock()
+
+	stats := store.KPIStats(7, now)
+
+	if stats.TimeToRCA.Count != 1 || stats.TimeToRCA.AvgMinutes != 15 {
+		t.Fatalf("expected 15m time-to-RCA from first_completed_at, got %+v", stats.TimeToRCA)
+	}
+	if stats.TimeToResolve.Count != 1 || stats.TimeToResolve.AvgMinutes != 60 {
+		t.Fatalf("expected 60m time-to-resolve, got %+v", stats.TimeToResolve)
+	}
+	if stats.Daily[len(stats.Daily)-1].TimeToRCA.Count != 1 {
+		t.Fatalf("expected KPI in latest day bucket, got %+v", stats.Daily)
+	}
+}
+
+func TestLLMSpendStatsAggregatesUsageMetadata(t *testing.T) {
+	store := NewStore()
+	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "spend"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-spend",
+	})
+	now := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
+	run := store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Manual", "")
+	store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "done",
+		Context: map[string]any{
+			"llm_usage": map[string]any{
+				"calls":               float64(2),
+				"calls_without_usage": float64(1),
+				"failed_calls":        float64(1),
+				"prompt_tokens":       float64(30),
+				"completion_tokens":   float64(20),
+				"total_tokens":        float64(50),
+				"cost_usd":            float64(0.25),
+				"by_model": map[string]any{
+					"cheap": map[string]any{
+						"calls":             float64(1),
+						"prompt_tokens":     float64(10),
+						"completion_tokens": float64(5),
+						"total_tokens":      float64(15),
+						"cost_usd":          float64(0.05),
+					},
+					"smart": map[string]any{
+						"calls":             float64(1),
+						"failed_calls":      float64(1),
+						"prompt_tokens":     float64(20),
+						"completion_tokens": float64(15),
+						"total_tokens":      float64(35),
+						"cost_usd":          float64(0.20),
+					},
+				},
+			},
+		},
+	})
+	oldRun := store.CreateAnalysisRun("manual", "alert", alert.AlertID, incident.IncidentID, alert.AlertID, "Old", "")
+	store.FailAnalysisRun(oldRun.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "old",
+		Context: map[string]any{
+			"llm_usage": map[string]any{
+				"calls":        float64(99),
+				"total_tokens": float64(99),
+				"cost_usd":     float64(99),
+			},
+		},
+	})
+	store.mu.Lock()
+	store.analysisRuns[run.RunID].UpdatedAt = now
+	store.analysisRuns[oldRun.RunID].UpdatedAt = now.AddDate(0, 0, -10)
+	store.mu.Unlock()
+
+	stats := store.LLMSpendStats(7, now)
+
+	if stats.Calls != 2 || stats.CallsWithoutUsage != 1 || stats.FailedCalls != 1 ||
+		stats.PromptTokens != 30 || stats.CompletionTokens != 20 || stats.TotalTokens != 50 ||
+		stats.CostUSD != 0.25 {
+		t.Fatalf("unexpected spend stats: %+v", stats)
+	}
+	if stats.ByModel["cheap"].TotalTokens != 15 || stats.ByModel["smart"].FailedCalls != 1 {
+		t.Fatalf("unexpected model breakdown: %+v", stats.ByModel)
+	}
+	if stats.Daily[len(stats.Daily)-1].TotalTokens != 50 {
+		t.Fatalf("expected spend in latest day bucket, got %+v", stats.Daily)
+	}
+}
+
 func TestAnalysisRunCompactsSimilarIncidentsForAgent(t *testing.T) {
 	agentReqCh := make(chan AgentAnalysisRequest, 1)
 	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
@@ -142,6 +379,7 @@ func TestAnalysisRunCompactsSimilarIncidentsForAgent(t *testing.T) {
 		AnalysisSummary: strings.Repeat("summary ", 200),
 		AnalysisDetail:  strings.Repeat("detail ", 500),
 	})
+	approveIncidentForTest(t, server.store, priorIncident.IncidentID)
 	_, record := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "compact-current"}, Alert{
 		Status:      "firing",
 		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning", "queue": "gpu-a"},
@@ -1338,6 +1576,7 @@ func TestChatContextAttachesMemoryAndFeedbackHints(t *testing.T) {
 		AnalysisQuality: "high",
 		Capabilities:    map[string]string{"runai": "ok"},
 	})
+	approveIncidentForTest(t, server.store, priorIncident.IncidentID)
 	_, _, _ = server.store.AddFeedback("incident", priorIncident.IncidentID, FeedbackRequest{
 		Vote:    "up",
 		Comment: "Matched the quota saturation incident.",

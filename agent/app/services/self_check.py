@@ -82,7 +82,7 @@ async def refute_top_cause(
 
         has_evidence = _canonical_has_evidence(family, results)
 
-        if not llm_configured(settings):
+        if not llm_configured(settings, settings.llm_model_self_check):
             # ponytail: deterministic gate — the only signal we have without an LLM
             # is whether the canonical source actually backed the claim.
             if not has_evidence:
@@ -94,7 +94,7 @@ async def refute_top_cause(
                 )
             return _default(confidence)
 
-        verdict = await _llm_refute(settings, top_candidate, results, has_evidence)
+        verdict = await _llm_refute(settings, top_candidate, results, has_evidence, plan)
         if not verdict:
             # LLM failed/empty: fall back to the deterministic gate.
             if not has_evidence:
@@ -146,6 +146,7 @@ async def _llm_refute(
     top: RankedCause,
     results: list[CollectorResult],
     has_evidence: bool,
+    plan: object = None,
 ) -> dict | None:
     ko = getattr(settings, "language", "en") == "ko"
     evidence = "\n".join(
@@ -171,9 +172,25 @@ async def _llm_refute(
         f"Ranked confidence: {top.confidence}\n"
         f"Canonical source has usable evidence: {has_evidence}\n"
         f"Rationale: {'; '.join(top.rationale) or '(none)'}\n\n"
+        f"Hypothesis ledger: {_hypothesis_ledger_hint(plan)}\n\n"
         f"Gathered evidence:\n{evidence}"
     )
-    return await complete_json(settings, system=system, user=user, temperature=0.1)
+    return await complete_json(
+        settings,
+        system=system,
+        user=user,
+        temperature=0.1,
+        model=settings.llm_model_self_check,
+    )
+
+
+def _hypothesis_ledger_hint(plan: object) -> str:
+    if not isinstance(plan, dict):
+        return "(none)"
+    ledger = plan.get("hypothesis_ledger")
+    if not ledger:
+        return "(none)"
+    return str(ledger)[:2000]
 
 
 async def verify_matches(
@@ -197,7 +214,7 @@ async def verify_matches(
     try:
         names = {str(c.get("name") or "").strip() for c in candidates}
         names.discard("")
-        if not names or not llm_configured(settings):
+        if not names or not llm_configured(settings, settings.llm_model_self_check):
             return set()
         verdict = await _llm_verify_matches(settings, candidates, results, subject)
         refuted = (verdict or {}).get("refuted")
@@ -242,4 +259,10 @@ async def _llm_verify_matches(
         'names that are NOT supported by the evidence]}.'
     )
     user = f"Candidates:\n{cand}\n\nGathered evidence:\n{evidence}"
-    return await complete_json(settings, system=system, user=user, temperature=0.1)
+    return await complete_json(
+        settings,
+        system=system,
+        user=user,
+        temperature=0.1,
+        model=settings.llm_model_self_check,
+    )

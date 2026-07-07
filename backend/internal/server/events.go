@@ -13,9 +13,11 @@ const (
 	eventConnected         = "connected"
 	eventAlertCreated      = "alert.created"
 	eventAnalysisStarted   = "analysis.started"
+	eventAnalysisProgress  = "analysis.progress"
 	eventAnalysisCompleted = "analysis.completed"
 	eventFeedbackUpdated   = "feedback.updated"
 	eventIncidentResolved  = "incident.resolved"
+	eventIncidentUpdated   = "incident.updated"
 )
 
 type Event struct {
@@ -101,6 +103,18 @@ func analysisCompletedEvent(runID, source, status, targetType, targetID, inciden
 	}}
 }
 
+func analysisProgressEvent(run AnalysisRun, progress map[string]any) Event {
+	data := cloneAnyMap(progress)
+	data["run_id"] = run.RunID
+	data["source"] = first(run.Source, "auto")
+	data["status"] = run.Status
+	data["target_type"] = run.TargetType
+	data["target_id"] = run.TargetID
+	data["incident_id"] = run.IncidentID
+	data["alert_id"] = run.AlertID
+	return Event{Type: eventAnalysisProgress, Data: data}
+}
+
 func feedbackUpdatedEvent(summary FeedbackSummary, incidentID string, alertID string) Event {
 	return Event{Type: eventFeedbackUpdated, Data: map[string]any{
 		"target_type":   summary.TargetType,
@@ -113,11 +127,22 @@ func feedbackUpdatedEvent(summary FeedbackSummary, incidentID string, alertID st
 	}}
 }
 
-func incidentResolvedEvent(incidentID string, status string, resolvedAt *time.Time) Event {
+func incidentResolvedEvent(incidentID string, status string, resolvedAt *time.Time, userApprovedAt *time.Time) Event {
 	return Event{Type: eventIncidentResolved, Data: map[string]any{
+		"incident_id":      incidentID,
+		"status":           status,
+		"resolved_at":      resolvedAt,
+		"user_approved_at": userApprovedAt,
+	}}
+}
+
+func incidentUpdatedEvent(incidentID string, action string, status string, archivedAt *time.Time, deletedAt *time.Time) Event {
+	return Event{Type: eventIncidentUpdated, Data: map[string]any{
 		"incident_id": incidentID,
+		"action":      action,
 		"status":      status,
-		"resolved_at": resolvedAt,
+		"archived_at": archivedAt,
+		"deleted_at":  deletedAt,
 	}}
 }
 

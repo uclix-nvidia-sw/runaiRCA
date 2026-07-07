@@ -17,16 +17,22 @@ import asyncio
 import json
 import re
 from dataclasses import replace
+from typing import Any
 
 from app.collectors.base import CollectorResult, artifact, salient_markers
 from app.collectors.kubernetes import _READ_KINDS, k8s_read, kind_lookup_title, kubectl_repr
 from app.config import Settings
-from app.llm import complete_json
+from app.llm import complete_json, token_budget_exceeded, token_budget_warning
 from app.plan import InvestigationPlan
+from app.progress import ProgressReporter
 
 # Ad-hoc kubectl-style reads per step are capped so a chatty LLM can't turn one
 # investigation into an API-server sweep.
 _MAX_QUERIES_PER_STEP = 4
+_MAX_HYPOTHESES = 8
+_CONFIDENT_STOP = 0.80
+_CONFIDENT_GAP = 0.25
+_LEDGER_STATUSES = {"open", "testing", "supported", "refuted", "uncertain"}
 
 # What each collector is good for — fed to the LLM so it picks the right probe.
 _COLLECTOR_HINTS = {
@@ -101,6 +107,144 @@ def _evidence_summary(evidence: dict[str, CollectorResult]) -> list[dict]:
     ]
 
 
+def _initial_ledger(plan: InvestigationPlan | None) -> list[dict[str, Any]]:
+    hypotheses = plan.hypotheses if plan else []
+    ledger: list[dict[str, Any]] = []
+    for idx, item in enumerate(hypotheses[:_MAX_HYPOTHESES], start=1):
+        if not isinstance(item, dict):
+            continue
+        family = str(item.get("family") or "").strip()
+        if not family:
+            continue
+        reason = str(item.get("reason") or "").strip()
+        ledger.append(
+            {
+                "id": f"H{idx}",
+                "family": family,
+                "statement": reason or family.replace("_", " "),
+                "confidence": 0.5,
+                "evidence_for": [],
+                "evidence_against": [],
+                "status": "open",
+            }
+        )
+    return ledger
+
+
+def _ledger_summary(ledger: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": item.get("id"),
+            "family": item.get("family"),
+            "statement": item.get("statement"),
+            "confidence": item.get("confidence"),
+            "status": item.get("status"),
+            "evidence_for": item.get("evidence_for", [])[-3:],
+            "evidence_against": item.get("evidence_against", [])[-3:],
+        }
+        for item in ledger
+    ]
+
+
+def _apply_ledger_updates(
+    ledger: list[dict[str, Any]], updates: object
+) -> list[dict[str, Any]]:
+    if not isinstance(updates, list):
+        return ledger
+    by_id = {str(item.get("id")): item for item in ledger}
+    for update in updates:
+        if not isinstance(update, dict):
+            continue
+        item = by_id.get(str(update.get("id") or ""))
+        if item is None:
+            continue
+        if "confidence" in update:
+            item["confidence"] = _clamp_confidence(update.get("confidence"), item["confidence"])
+        status = str(update.get("status") or "").strip().lower()
+        if status in _LEDGER_STATUSES:
+            item["status"] = status
+        _extend_text_list(item, "evidence_for", update.get("evidence_for"))
+        _extend_text_list(item, "evidence_against", update.get("evidence_against"))
+    return ledger
+
+
+def _add_reflected_hypotheses(
+    ledger: list[dict[str, Any]], candidates: object
+) -> list[dict[str, Any]]:
+    if not isinstance(candidates, list):
+        return ledger
+    existing = {str(item.get("family")) for item in ledger}
+    for candidate in candidates:
+        if len(ledger) >= _MAX_HYPOTHESES:
+            break
+        if not isinstance(candidate, dict):
+            continue
+        family = str(candidate.get("family") or "").strip()
+        if not family or family in existing:
+            continue
+        statement = str(candidate.get("statement") or candidate.get("reason") or "").strip()
+        ledger.append(
+            {
+                "id": f"H{len(ledger) + 1}",
+                "family": family,
+                "statement": statement or family.replace("_", " "),
+                "confidence": _clamp_confidence(candidate.get("confidence"), 0.4),
+                "evidence_for": _texts(candidate.get("evidence_for"))[:5],
+                "evidence_against": _texts(candidate.get("evidence_against"))[:5],
+                "status": str(candidate.get("status") or "open")
+                if str(candidate.get("status") or "open") in _LEDGER_STATUSES
+                else "open",
+            }
+        )
+        existing.add(family)
+    return ledger
+
+
+def _extend_text_list(item: dict[str, Any], key: str, value: object) -> None:
+    texts = _texts(value)
+    if not texts:
+        return
+    current = item.get(key)
+    if not isinstance(current, list):
+        current = []
+    item[key] = [*current, *texts][-8:]
+
+
+def _texts(value: object) -> list[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if not isinstance(value, list):
+        return []
+    return [text for item in value if (text := str(item).strip())]
+
+
+def _clamp_confidence(value: object, fallback: object) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        try:
+            number = float(fallback)
+        except (TypeError, ValueError):
+            number = 0.5
+    return max(0.0, min(1.0, number))
+
+
+def _confident_enough(ledger: list[dict[str, Any]]) -> bool:
+    scores = sorted(
+        (
+            _clamp_confidence(item.get("confidence"), 0)
+            for item in ledger
+            if item.get("status") != "refuted"
+        ),
+        reverse=True,
+    )
+    if not scores or scores[0] < _CONFIDENT_STOP:
+        return False
+    runner_up = scores[1] if len(scores) > 1 else 0.0
+    return scores[0] - runner_up >= _CONFIDENT_GAP
+
+
 async def investigate(
     settings: Settings,
     target: object,
@@ -108,44 +252,98 @@ async def investigate(
     plan: InvestigationPlan | None,
     kg_context: dict,
     max_steps: int,
-) -> list[CollectorResult]:
+    reporter: ProgressReporter | None = None,
+) -> tuple[list[CollectorResult], dict[str, Any]]:
     by_name = {_collector_name(c): c for c in collectors}
     all_names = set(by_name)
     evidence: dict[str, CollectorResult] = {}
+    ledger = _initial_ledger(plan)
+    investigation_steps: list[dict[str, Any]] = []
 
     async def run_probe(name: str, scope: dict) -> None:
         collector = by_name.get(name)
         if collector is None:
             return
-        evidence[name] = await _collect_safely(collector, target, _scoped_plan(plan, scope))
+        if reporter:
+            reporter.emit(
+                "investigation",
+                f"Probing {name}",
+                collector=name,
+                scope=scope,
+                hypothesis_ledger=_ledger_summary(ledger),
+            )
+        result = await _collect_safely(collector, target, _scoped_plan(plan, scope))
+        evidence[name] = result
+        if reporter:
+            reporter.emit(
+                "investigation",
+                f"{name} evidence collected",
+                collector=name,
+                status=result.status,
+                summary=(result.summary or "")[:300],
+                hypothesis_ledger=_ledger_summary(ledger),
+            )
 
     adhoc: list[dict] = []
+    budget_warning = ""
     try:
         ran_queries_last_step = False
-        for _ in range(max(1, max_steps)):
+        for step in range(max(1, max_steps)):
+            if token_budget_exceeded(settings):
+                budget_warning = token_budget_warning(settings)
+                break
             if all_names <= set(evidence) and not ran_queries_last_step:
                 break  # every collector probed and no ad-hoc drill-down pending
+            if reporter:
+                reporter.emit(
+                    "investigation",
+                    "Choosing next diagnostic step",
+                    step=step + 1,
+                    hypothesis_ledger=_ledger_summary(ledger),
+                )
             decision = await complete_json(
                 settings,
                 system=(
                     "You are a senior SRE investigating a Run:ai GPU-platform alert. "
-                    "Given the plan, hypotheses, evidence so far, and the available "
-                    "collectors, decide the next diagnostic step. Probe the collectors "
-                    "most likely to confirm or refute a hypothesis; you can ALSO run "
-                    "kubectl-style READ-ONLY Kubernetes queries (get/list of an "
-                    "allowlisted kind, see adhoc_query_kinds) to drill into anything "
-                    "the collectors don't cover — e.g. check a PVC, a deployment, a "
-                    "storageclass. Conclude once the evidence is sufficient. Respond "
-                    "with ONLY JSON: "
+                    "Given the plan, hypothesis ledger, evidence so far, and available "
+                    "collectors, decide the next diagnostic step. Pick the hypothesis "
+                    "you are testing, probe collectors most likely to confirm/refute it, "
+                    "and update confidence using only observed evidence. You can ALSO "
+                    "run kubectl-style READ-ONLY Kubernetes queries (get/list of an "
+                    "allowlisted kind, see adhoc_query_kinds). Conclude once evidence "
+                    "is sufficient. Respond with ONLY JSON: "
                     '{"action":"probe"|"conclude","reason":str,'
+                    '"selected_hypothesis":str,'
                     '"probes":[{"collector":str,'
                     '"scope":{"namespace"?,"pod"?,"node"?,"workload"?}}],'
-                    '"queries":[{"kind":str,"namespace"?,"name"?,"label_selector"?}]}'
+                    '"queries":[{"kind":str,"namespace"?,"name"?,"label_selector"?}],'
+                    '"hypothesis_updates":[{"id":str,"confidence":number,'
+                    '"evidence_for":[str],"evidence_against":[str],'
+                    '"status":"open|testing|supported|refuted|uncertain"}]}'
                 ),
-                user=_build_user_prompt(plan, kg_context, evidence, by_name, adhoc),
+                user=_build_user_prompt(plan, kg_context, evidence, by_name, ledger, adhoc),
+                model=settings.llm_model_investigation,
             )
             if not isinstance(decision, dict):
                 break  # unusable response -> fall through to full gather
+            ledger = _apply_ledger_updates(ledger, decision.get("hypothesis_updates"))
+            investigation_steps.append(
+                {
+                    "step": step + 1,
+                    "action": str(decision.get("action") or ""),
+                    "reason": str(decision.get("reason") or "")[:300],
+                    "selected_hypothesis": str(decision.get("selected_hypothesis") or ""),
+                }
+            )
+            if reporter:
+                reporter.emit(
+                    "investigation",
+                    str(decision.get("reason") or "Diagnostic step selected")[:300],
+                    step=step + 1,
+                    action=str(decision.get("action") or ""),
+                    selected_hypothesis=str(decision.get("selected_hypothesis") or ""),
+                    hypothesis_ledger=_ledger_summary(ledger),
+                )
             if decision.get("action") == "conclude":
                 break
             probes = decision.get("probes")
@@ -167,6 +365,13 @@ async def investigate(
                     *(run_probe(p["collector"], p.get("scope") or {}) for p in fresh)
                 )
             for q in wanted:
+                if reporter:
+                    reporter.emit(
+                        "investigation",
+                        f"Running {_adhoc_query_repr(q)}",
+                        step=step + 1,
+                        query=_adhoc_query_repr(q),
+                    )
                 adhoc.append(
                     await k8s_read(
                         settings,
@@ -177,7 +382,20 @@ async def investigate(
                     )
                 )
             ran_queries_last_step = bool(wanted)
+            if _confident_enough(ledger):
+                break
     except Exception:  # noqa: BLE001 - never raise into analyze; keep whatever we have
+        pass
+
+    try:
+        ledger = await _reflect_hypotheses(settings, plan, kg_context, evidence, by_name, ledger, adhoc)
+        if reporter:
+            reporter.emit(
+                "reflection",
+                "Checked for missing or contradictory hypotheses",
+                hypothesis_ledger=_ledger_summary(ledger),
+            )
+    except Exception:  # noqa: BLE001 - reflection is best-effort
         pass
 
     # Synthesis waits for ALL collectors: run any we never probed, unscoped.
@@ -227,7 +445,46 @@ async def investigate(
                 )
             )
 
-    return list(evidence.values())
+    results = list(evidence.values())
+    if budget_warning and results:
+        results[0].warnings.append(budget_warning)
+    return results, {
+        "hypothesis_ledger": _ledger_summary(ledger),
+        "investigation_steps": investigation_steps,
+        "adhoc_query_count": len(adhoc),
+    }
+
+
+async def _reflect_hypotheses(
+    settings: Settings,
+    plan: InvestigationPlan | None,
+    kg_context: dict,
+    evidence: dict[str, CollectorResult],
+    by_name: dict,
+    ledger: list[dict[str, Any]],
+    adhoc: list[dict] | None = None,
+) -> list[dict[str, Any]]:
+    if token_budget_exceeded(settings):
+        return ledger
+    reflection = await complete_json(
+        settings,
+        system=(
+            "You are doing one final skeptical reflection before concluding an RCA "
+            "investigation. Look for a missed hypothesis, contradiction, or weakly "
+            "supported confidence. Do not invent evidence. Respond with ONLY JSON: "
+            '{"hypothesis_updates":[{"id":str,"confidence":number,'
+            '"evidence_for":[str],"evidence_against":[str],'
+            '"status":"open|testing|supported|refuted|uncertain"}],'
+            '"new_hypotheses":[{"family":str,"statement":str,"confidence":number,'
+            '"evidence_for":[str],"evidence_against":[str],"status":str}]}'
+        ),
+        user=_build_user_prompt(plan, kg_context, evidence, by_name, ledger, adhoc),
+        model=settings.llm_model_investigation,
+    )
+    if not isinstance(reflection, dict):
+        return ledger
+    ledger = _apply_ledger_updates(ledger, reflection.get("hypothesis_updates"))
+    return _add_reflected_hypotheses(ledger, reflection.get("new_hypotheses"))
 
 
 def _build_user_prompt(
@@ -235,11 +492,12 @@ def _build_user_prompt(
     kg_context: dict,
     evidence: dict[str, CollectorResult],
     by_name: dict,
+    ledger: list[dict[str, Any]],
     adhoc: list[dict] | None = None,
 ) -> str:
     payload = {
         "plan": plan.as_dict() if plan else {},
-        "hypotheses": plan.hypotheses if plan else [],
+        "hypothesis_ledger": _ledger_summary(ledger),
         "knowledge_graph": {
             "blast_radius_workloads": kg_context.get("blast_radius_workloads"),
             "prior_incidents": kg_context.get("prior_incidents"),

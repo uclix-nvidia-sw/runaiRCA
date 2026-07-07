@@ -32,6 +32,7 @@ func TestIncidentAndAlertDetailContracts(t *testing.T) {
 		AnalysisQuality: "high",
 		Capabilities:    map[string]string{"runai": "ok"},
 	})
+	approveIncidentForTest(t, server.store, priorIncident.IncidentID)
 	_, ok, err := server.store.AddFeedback("incident", priorIncident.IncidentID, FeedbackRequest{
 		Vote:   "up",
 		Author: "operator",
@@ -187,6 +188,135 @@ func TestAlertFeedbackCommentAndSearchEndpoints(t *testing.T) {
 	}
 }
 
+func TestLLMSpendStatsEndpointContract(t *testing.T) {
+	server := NewServer()
+	incident, alert := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "spend-contract"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-spend-contract",
+	})
+	run := server.store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Manual", "")
+	server.store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "done",
+		Context: map[string]any{
+			"llm_usage": map[string]any{
+				"calls":        float64(1),
+				"total_tokens": float64(42),
+				"cost_usd":     float64(0.12),
+				"by_model": map[string]any{
+					"m": map[string]any{"calls": float64(1), "total_tokens": float64(42), "cost_usd": float64(0.12)},
+				},
+			},
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(
+		rec,
+		httptest.NewRequest(http.MethodGet, "/api/v1/stats/llm-spend?days=7", nil),
+	)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected llm spend stats 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var envelope struct {
+		Data LLMSpendStats `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode llm spend stats: %v", err)
+	}
+	if envelope.Data.Calls != 1 || envelope.Data.TotalTokens != 42 || envelope.Data.CostUSD != 0.12 {
+		t.Fatalf("unexpected llm spend stats: %+v", envelope.Data)
+	}
+	if envelope.Data.ByModel["m"].TotalTokens != 42 || len(envelope.Data.Daily) != 7 {
+		t.Fatalf("unexpected llm spend breakdown: %+v", envelope.Data)
+	}
+}
+
+func TestKPIStatsEndpointContract(t *testing.T) {
+	server := NewServer()
+	incident, alert := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "kpi-contract"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-kpi-contract",
+	})
+	run := server.store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Manual", "")
+	server.store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{AnalysisSummary: "done"})
+
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/stats/kpi?days=7", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected kpi stats 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var envelope struct {
+		Data KPIStats `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode kpi stats: %v", err)
+	}
+	if envelope.Data.TimeToRCA.Count != 1 || len(envelope.Data.Daily) != 7 {
+		t.Fatalf("unexpected kpi stats: %+v", envelope.Data)
+	}
+}
+
+func TestIncidentLifecycleActionContractsAndEvents(t *testing.T) {
+	server := NewServer()
+	incident, _ := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "action-contract"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-action-contract",
+	})
+	events := server.hub.Subscribe()
+	defer server.hub.Unsubscribe(events)
+
+	post := func(path string) Event {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected %s 200, got %d: %s", path, rec.Code, rec.Body.String())
+		}
+		select {
+		case event := <-events:
+			if event.Type != eventIncidentUpdated {
+				t.Fatalf("expected incident.updated, got %+v", event)
+			}
+			return event
+		case <-time.After(time.Second):
+			t.Fatalf("missing incident.updated event for %s", path)
+			return Event{}
+		}
+	}
+
+	if event := post("/api/v1/incidents/" + incident.IncidentID + "/archive"); event.Data["action"] != "archive" {
+		t.Fatalf("unexpected archive event: %+v", event)
+	}
+	if event := post("/api/v1/incidents/" + incident.IncidentID + "/unarchive"); event.Data["action"] != "unarchive" {
+		t.Fatalf("unexpected unarchive event: %+v", event)
+	}
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/incidents/"+incident.IncidentID, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected soft delete 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if event := <-events; event.Type != eventIncidentUpdated || event.Data["action"] != "delete" {
+		t.Fatalf("unexpected delete event: %+v", event)
+	}
+	if event := post("/api/v1/incidents/" + incident.IncidentID + "/restore"); event.Data["action"] != "restore" {
+		t.Fatalf("unexpected restore event: %+v", event)
+	}
+	rec = httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/incidents/"+incident.IncidentID+"?permanent=true", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected permanent delete 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if event := <-events; event.Type != eventIncidentUpdated || event.Data["action"] != "delete_permanent" {
+		t.Fatalf("unexpected permanent delete event: %+v", event)
+	}
+}
+
 func TestAPIErrorShapeFor400And404(t *testing.T) {
 	server := NewServer()
 	tests := []struct {
@@ -268,6 +398,48 @@ func TestSSEPayloadContract(t *testing.T) {
 		payload.Data["incident_id"] != "INC-1" ||
 		payload.Data["alert_id"] != "ALR-1" {
 		t.Fatalf("unexpected SSE payload: %+v", payload)
+	}
+}
+
+func TestAnalysisProgressSSEPayloadContract(t *testing.T) {
+	event := analysisProgressEvent(AnalysisRun{
+		RunID:      "ANL-1",
+		Source:     "manual",
+		Status:     "analyzing",
+		TargetType: "incident",
+		TargetID:   "INC-1",
+		IncidentID: "INC-1",
+		AlertID:    "ALR-1",
+	}, map[string]any{
+		"phase":   "planning",
+		"message": "building hypotheses",
+		"seq":     7,
+	})
+	var buf bytes.Buffer
+	writeSSE(&buf, event)
+	output := buf.String()
+	if !strings.Contains(output, "event: analysis.progress\n") {
+		t.Fatalf("missing event name: %q", output)
+	}
+	dataLine := ""
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "data: ") {
+			dataLine = strings.TrimPrefix(line, "data: ")
+			break
+		}
+	}
+	var payload Event
+	if err := json.Unmarshal([]byte(dataLine), &payload); err != nil {
+		t.Fatalf("decode SSE data: %v", err)
+	}
+	if payload.Type != eventAnalysisProgress ||
+		payload.Data["run_id"] != "ANL-1" ||
+		payload.Data["target_type"] != "incident" ||
+		payload.Data["incident_id"] != "INC-1" ||
+		payload.Data["alert_id"] != "ALR-1" ||
+		payload.Data["phase"] != "planning" ||
+		usageInt(payload.Data["seq"]) != 7 {
+		t.Fatalf("unexpected progress SSE payload: %+v", payload)
 	}
 }
 

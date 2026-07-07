@@ -2,6 +2,7 @@ package server
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -30,30 +31,49 @@ const (
 
 	maxStoredCommentBodyBytes = 8000
 	maxFeedbackAuthorBytes    = 120
+
+	maxProgressLogEntries = 200
+
+	incidentViewActive   = "active"
+	incidentViewArchived = "archived"
+	incidentViewTrash    = "trash"
+
+	recurrenceStatsCacheTTL = time.Minute
 )
 
+type recurrenceStatsCacheKey struct {
+	days int
+	asOf time.Time
+}
+
+type recurrenceStatsCacheEntry struct {
+	expiresAt time.Time
+	stats     RecurrenceStats
+}
+
 type Store struct {
-	mu             sync.RWMutex
-	incidentSeq    atomic.Int64
-	alertSeq       atomic.Int64
-	feedbackSeq    atomic.Int64
-	commentSeq     atomic.Int64
-	analysisRunSeq atomic.Int64
-	incidents      map[string]*Incident
-	incidentByKey  map[string]string
-	alerts         map[string]*AlertRecord
-	alertByFinger  map[string]string
-	alertByGroup   map[string]string
-	memories       map[string]*IncidentMemory
-	feedback       map[string]*FeedbackRecord
-	comments       map[string]*CommentRecord
-	analysisRuns   map[string]*AnalysisRun
-	db             *sql.DB
-	dbReady        bool
-	pgvectorReady  bool
-	pgvectorDetail string
-	embedder       *embedder
-	flappingWindow time.Duration
+	mu                   sync.RWMutex
+	incidentSeq          atomic.Int64
+	alertSeq             atomic.Int64
+	feedbackSeq          atomic.Int64
+	commentSeq           atomic.Int64
+	analysisRunSeq       atomic.Int64
+	incidents            map[string]*Incident
+	incidentByKey        map[string]string
+	alerts               map[string]*AlertRecord
+	alertByFinger        map[string]string
+	alertByGroup         map[string]string
+	memories             map[string]*IncidentMemory
+	feedback             map[string]*FeedbackRecord
+	comments             map[string]*CommentRecord
+	analysisRuns         map[string]*AnalysisRun
+	recurrenceStatsCache map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry
+	db                   *sql.DB
+	dbReady              bool
+	pgvectorReady        bool
+	pgvectorDetail       string
+	embedder             *embedder
+	flappingWindow       time.Duration
 }
 
 type AlertUpsertResult struct {
@@ -87,7 +107,10 @@ func NewStore() *Store {
 		feedback:      make(map[string]*FeedbackRecord),
 		comments:      make(map[string]*CommentRecord),
 		analysisRuns:  make(map[string]*AnalysisRun),
-		embedder:      newEmbedder(),
+		recurrenceStatsCache: make(
+			map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry,
+		),
+		embedder: newEmbedder(),
 		// How long an alert signature can be quiet before a recurrence is treated as
 		// a NEW incident rather than another occurrence of the flapping one. 30 min
 		// was too tight — real alerts recur over hours, so each firing spawned its
@@ -138,6 +161,99 @@ func sameTimePtr(left, right *time.Time) bool {
 		return left == right
 	}
 	return left.Equal(*right)
+}
+
+func validIncidentView(view string) bool {
+	return view == incidentViewActive || view == incidentViewArchived || view == incidentViewTrash
+}
+
+type IncidentListFilter struct {
+	Status        string
+	Severity      string
+	FinalDecision string
+}
+
+type AlertListFilter struct {
+	Status   string
+	Severity string
+}
+
+func validIncidentStatusFilter(status string) bool {
+	return status == "" || status == "firing" || status == "resolved" || status == "analyzing"
+}
+
+func validIncidentSeverityFilter(severity string) bool {
+	return severity == "" || severity == "critical" || severity == "warning" || severity == "info"
+}
+
+func validIncidentFinalDecisionFilter(decision string) bool {
+	return decision == "" || decision == "approved" || decision == "pending"
+}
+
+func incidentInView(incident *Incident, view string) bool {
+	if incident == nil {
+		return false
+	}
+	switch view {
+	case incidentViewArchived:
+		return incident.DeletedAt == nil && incident.ArchivedAt != nil
+	case incidentViewTrash:
+		return incident.DeletedAt != nil
+	default:
+		return incident.DeletedAt == nil && incident.ArchivedAt == nil
+	}
+}
+
+func incidentMatchesListFilter(incident *Incident, filter IncidentListFilter) bool {
+	if incident == nil {
+		return false
+	}
+	if filter.Status != "" {
+		if filter.Status == "analyzing" {
+			if !incident.IsAnalyzing {
+				return false
+			}
+		} else if incident.Status != filter.Status {
+			return false
+		}
+	}
+	if filter.Severity != "" && incident.Severity != filter.Severity {
+		return false
+	}
+	if filter.FinalDecision == "approved" && incident.UserApprovedAt == nil {
+		return false
+	}
+	if filter.FinalDecision == "pending" && incident.UserApprovedAt != nil {
+		return false
+	}
+	return true
+}
+
+func alertMatchesListFilter(alert *AlertRecord, filter AlertListFilter) bool {
+	if alert == nil {
+		return false
+	}
+	if filter.Status != "" {
+		if filter.Status == "analyzing" {
+			if !alert.IsAnalyzing {
+				return false
+			}
+		} else if alert.Status != filter.Status {
+			return false
+		}
+	}
+	if filter.Severity != "" && alert.Severity != filter.Severity {
+		return false
+	}
+	return true
+}
+
+func incidentDeleted(incident *Incident) bool {
+	return incident != nil && incident.DeletedAt != nil
+}
+
+func incidentUserApproved(incident *Incident) bool {
+	return incident != nil && incident.UserApprovedAt != nil
 }
 
 func (s *Store) databaseHealth() map[string]any {
@@ -225,6 +341,9 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 		}
 	}
 	incident := s.incidents[incidentID]
+	if incident.ArchivedAt != nil {
+		incident.ArchivedAt = nil
+	}
 	incident.Severity = maxSeverity(incident.Severity, severity(alert))
 	if alertStatus == "resolved" && incident.ResolvedAt == nil {
 		t := firstTime(alert.EndsAt, now)
@@ -233,6 +352,7 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	} else if alertStatus != "resolved" && incident.Status == "resolved" {
 		incident.Status = "firing"
 		incident.ResolvedAt = nil
+		incident.UserApprovedAt = nil
 	}
 
 	if alertID == "" {
@@ -306,6 +426,7 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 		!sameTimePtr(previousResolvedAt, record.ResolvedAt)
 	s.persistIncidentLocked(incident)
 	s.persistAlertLocked(record)
+	s.invalidateRecurrenceStatsLocked()
 	return AlertUpsertResult{
 		Incident:       cloneIncident(incident),
 		Alert:          cloneAlert(record),
@@ -317,7 +438,7 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 }
 
 func (s *Store) shouldReuseIncidentForAlertLocked(key string, incident *Incident, firedAt time.Time) bool {
-	if incident == nil {
+	if incident == nil || incidentDeleted(incident) {
 		return false
 	}
 	if !strings.HasPrefix(key, "flap:") {
@@ -336,15 +457,26 @@ func (s *Store) shouldReuseIncidentForAlertLocked(key string, incident *Incident
 }
 
 func (s *Store) ListIncidents() []Incident {
-	items, _ := s.ListIncidentsPage(0, 0)
+	items, _ := s.ListIncidentsPage(0, 0, incidentViewActive)
 	return items
 }
 
-func (s *Store) ListIncidentsPage(limit, offset int) ([]Incident, int) {
+func (s *Store) ListIncidentsPage(limit, offset int, views ...string) ([]Incident, int) {
+	view := incidentViewActive
+	if len(views) > 0 && views[0] != "" {
+		view = views[0]
+	}
+	return s.ListIncidentsPageFiltered(limit, offset, view, IncidentListFilter{})
+}
+
+func (s *Store) ListIncidentsPageFiltered(limit, offset int, view string, filter IncidentListFilter) ([]Incident, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	ordered := make([]*Incident, 0, len(s.incidents))
 	for _, incident := range s.incidents {
+		if !incidentInView(incident, view) || !incidentMatchesListFilter(incident, filter) {
+			continue
+		}
 		ordered = append(ordered, incident)
 	}
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].FiredAt.After(ordered[j].FiredAt) })
@@ -362,10 +494,17 @@ func (s *Store) ListAlerts() []AlertRecord {
 }
 
 func (s *Store) ListAlertsPage(limit, offset int) ([]AlertRecord, int) {
+	return s.ListAlertsPageFiltered(limit, offset, AlertListFilter{})
+}
+
+func (s *Store) ListAlertsPageFiltered(limit, offset int, filter AlertListFilter) ([]AlertRecord, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	ordered := make([]*AlertRecord, 0, len(s.alerts))
 	for _, alert := range s.alerts {
+		if alert == nil || incidentDeleted(s.incidents[alert.IncidentID]) || !alertMatchesListFilter(alert, filter) {
+			continue
+		}
 		ordered = append(ordered, alert)
 	}
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].FiredAt.After(ordered[j].FiredAt) })
@@ -401,6 +540,218 @@ func (s *Store) ListAnalysisRunsPage(limit, offset int) ([]AnalysisRun, int) {
 	return items, len(ordered)
 }
 
+func (s *Store) ArchiveIncident(id string, archived bool) (*Incident, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	incident := s.incidents[id]
+	if incidentDeleted(incident) {
+		return nil, false
+	}
+	if archived {
+		now := time.Now().UTC()
+		incident.ArchivedAt = &now
+	} else {
+		incident.ArchivedAt = nil
+	}
+	if !s.persistIncidentLocked(incident) {
+		return nil, false
+	}
+	s.invalidateRecurrenceStatsLocked()
+	return cloneIncident(incident), true
+}
+
+func (s *Store) SoftDeleteIncident(id string) (*Incident, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	incident := s.incidents[id]
+	if incident == nil {
+		return nil, false
+	}
+	if incident.DeletedAt == nil {
+		now := time.Now().UTC()
+		incident.DeletedAt = &now
+	}
+	s.removeIncidentIndexesLocked(id)
+	if !s.persistIncidentLocked(incident) {
+		return nil, false
+	}
+	s.invalidateRecurrenceStatsLocked()
+	return cloneIncident(incident), true
+}
+
+func (s *Store) RestoreIncident(id string) (*Incident, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	incident := s.incidents[id]
+	if incident == nil {
+		return nil, false
+	}
+	incident.DeletedAt = nil
+	incident.ArchivedAt = nil
+	s.registerIncidentIndexesLocked(incident)
+	if !s.persistIncidentLocked(incident) {
+		return nil, false
+	}
+	s.invalidateRecurrenceStatsLocked()
+	return cloneIncident(incident), true
+}
+
+func (s *Store) HardDeleteIncident(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	incident := s.incidents[id]
+	if incident == nil {
+		return false
+	}
+	alertIDs := map[string]struct{}{}
+	for alertID, alert := range s.alerts {
+		if alert != nil && alert.IncidentID == id {
+			alertIDs[alertID] = struct{}{}
+		}
+	}
+	alertList := make([]string, 0, len(alertIDs))
+	for alertID := range alertIDs {
+		alertList = append(alertList, alertID)
+	}
+	if !s.persistHardDeleteIncidentLocked(id, alertList) {
+		return false
+	}
+	s.removeIncidentIndexesLocked(id)
+	delete(s.incidents, id)
+	for alertID := range alertIDs {
+		delete(s.alerts, alertID)
+	}
+	for key, memory := range s.memories {
+		if memory == nil {
+			continue
+		}
+		if memory.IncidentID == id {
+			delete(s.memories, key)
+			continue
+		}
+		if _, ok := alertIDs[memory.AlertID]; ok {
+			delete(s.memories, key)
+		}
+	}
+	for key, record := range s.feedback {
+		if record == nil {
+			continue
+		}
+		if record.IncidentID == id || (record.TargetType == "incident" && record.TargetID == id) {
+			delete(s.feedback, key)
+			continue
+		}
+		if _, ok := alertIDs[record.AlertID]; ok {
+			delete(s.feedback, key)
+			continue
+		}
+		if record.TargetType == "alert" {
+			if _, ok := alertIDs[record.TargetID]; ok {
+				delete(s.feedback, key)
+			}
+		}
+	}
+	for key, record := range s.comments {
+		if record == nil {
+			continue
+		}
+		if record.IncidentID == id || (record.TargetType == "incident" && record.TargetID == id) {
+			delete(s.comments, key)
+			continue
+		}
+		if _, ok := alertIDs[record.AlertID]; ok {
+			delete(s.comments, key)
+			continue
+		}
+		if record.TargetType == "alert" {
+			if _, ok := alertIDs[record.TargetID]; ok {
+				delete(s.comments, key)
+			}
+		}
+	}
+	for key, run := range s.analysisRuns {
+		if run == nil {
+			continue
+		}
+		if run.IncidentID == id {
+			delete(s.analysisRuns, key)
+			continue
+		}
+		if _, ok := alertIDs[run.AlertID]; ok {
+			delete(s.analysisRuns, key)
+		}
+	}
+	s.invalidateRecurrenceStatsLocked()
+	return true
+}
+
+func (s *Store) PurgeExpiredTrash(retention time.Duration, now time.Time) int {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	cutoff := now.Add(-retention)
+	ids := []string{}
+	s.mu.RLock()
+	for id, incident := range s.incidents {
+		if incident == nil || incident.DeletedAt == nil {
+			continue
+		}
+		if !incident.DeletedAt.After(cutoff) {
+			ids = append(ids, id)
+		}
+	}
+	s.mu.RUnlock()
+	purged := 0
+	for _, id := range ids {
+		if s.HardDeleteIncident(id) {
+			purged++
+		}
+	}
+	return purged
+}
+
+func (s *Store) removeIncidentIndexesLocked(incidentID string) {
+	incident := s.incidents[incidentID]
+	if incident != nil && s.incidentByKey[incident.CorrelationKey] == incidentID {
+		delete(s.incidentByKey, incident.CorrelationKey)
+	}
+	for _, alert := range s.alerts {
+		if alert == nil || alert.IncidentID != incidentID {
+			continue
+		}
+		if s.alertByFinger[alert.Fingerprint] == alert.AlertID {
+			delete(s.alertByFinger, alert.Fingerprint)
+		}
+		if incident != nil {
+			key := "correlation:" + incident.CorrelationKey
+			if s.alertByGroup[key] == alert.AlertID {
+				delete(s.alertByGroup, key)
+			}
+		}
+	}
+}
+
+func (s *Store) registerIncidentIndexesLocked(incident *Incident) {
+	if incident == nil || incident.DeletedAt != nil {
+		return
+	}
+	if incident.CorrelationKey != "" && s.incidentByKey[incident.CorrelationKey] == "" {
+		s.incidentByKey[incident.CorrelationKey] = incident.IncidentID
+	}
+	for _, alert := range s.alerts {
+		if alert == nil || alert.IncidentID != incident.IncidentID {
+			continue
+		}
+		if alert.Fingerprint != "" && s.alertByFinger[alert.Fingerprint] == "" {
+			s.alertByFinger[alert.Fingerprint] = alert.AlertID
+		}
+		key := "correlation:" + incident.CorrelationKey
+		if incident.CorrelationKey != "" && s.alertByGroup[key] == "" {
+			s.alertByGroup[key] = alert.AlertID
+		}
+	}
+}
+
 func (s *Store) DashboardSnapshot(recentLimit int) DashboardSnapshot {
 	if recentLimit < 0 {
 		recentLimit = 0
@@ -416,7 +767,7 @@ func (s *Store) DashboardSnapshot(recentLimit int) DashboardSnapshot {
 	alerts := make([]*AlertRecord, 0, len(s.alerts))
 	runs := make([]*AnalysisRun, 0, len(s.analysisRuns))
 	for _, incident := range s.incidents {
-		if incident == nil {
+		if incidentDeleted(incident) {
 			continue
 		}
 		snapshot.IncidentCount++
@@ -425,7 +776,7 @@ func (s *Store) DashboardSnapshot(recentLimit int) DashboardSnapshot {
 		}
 	}
 	for _, alert := range s.alerts {
-		if alert == nil {
+		if alert == nil || incidentDeleted(s.incidents[alert.IncidentID]) {
 			continue
 		}
 		snapshot.AlertCount++
@@ -463,13 +814,401 @@ func (s *Store) DashboardSnapshot(recentLimit int) DashboardSnapshot {
 	return snapshot
 }
 
+func (s *Store) RecurrenceStats(days int, now time.Time) RecurrenceStats {
+	if days <= 0 {
+		days = 7
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	since := now.AddDate(0, 0, -days)
+	stats := RecurrenceStats{Days: days, Daily: make([]RecurrenceDay, 0, days)}
+	byDate := map[string]int{}
+	for i := days - 1; i >= 0; i-- {
+		date := now.AddDate(0, 0, -i).Format("2006-01-02")
+		stats.Daily = append(stats.Daily, RecurrenceDay{Date: date})
+		byDate[date] = len(stats.Daily) - 1
+	}
+
+	cacheKey := recurrenceStatsCacheKey{days: days, asOf: now.Truncate(time.Minute)}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if entry, ok := s.recurrenceStatsCache[cacheKey]; ok && now.Before(entry.expiresAt) {
+		return cloneRecurrenceStats(entry.stats)
+	}
+	// ponytail: O(recent incidents * memories), cached for the dashboard's polling cadence.
+	for _, incident := range s.incidents {
+		if incident == nil || incidentDeleted(incident) || incident.FiredAt.Before(since) || incident.FiredAt.After(now) {
+			continue
+		}
+		alert := s.latestAlertForIncidentLocked(incident.IncidentID)
+		if alert == nil {
+			continue
+		}
+		stats.Total++
+		day, ok := byDate[incident.FiredAt.Format("2006-01-02")]
+		if ok {
+			stats.Daily[day].Total++
+		}
+		before := incident.FiredAt
+		if s.similarRecentCountLocked(alertFromRecord(*alert), incident.IncidentID, incident.FiredAt.AddDate(0, 0, -days), &before) == 0 {
+			continue
+		}
+		stats.Recurred++
+		if ok {
+			stats.Daily[day].Recurred++
+		}
+	}
+	stats.Rate = recurrenceRate(stats.Recurred, stats.Total)
+	for i := range stats.Daily {
+		stats.Daily[i].Rate = recurrenceRate(stats.Daily[i].Recurred, stats.Daily[i].Total)
+	}
+	s.recurrenceStatsCache[cacheKey] = recurrenceStatsCacheEntry{
+		expiresAt: now.Add(recurrenceStatsCacheTTL),
+		stats:     cloneRecurrenceStats(stats),
+	}
+	return cloneRecurrenceStats(stats)
+}
+
+func (s *Store) invalidateRecurrenceStatsLocked() {
+	if len(s.recurrenceStatsCache) > 0 {
+		s.recurrenceStatsCache = make(map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry)
+	}
+}
+
+func cloneRecurrenceStats(stats RecurrenceStats) RecurrenceStats {
+	stats.Daily = append([]RecurrenceDay(nil), stats.Daily...)
+	return stats
+}
+
+func (s *Store) LLMSpendStats(days int, now time.Time) LLMSpendStats {
+	if days <= 0 {
+		days = 7
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	since := now.AddDate(0, 0, -days)
+	stats := LLMSpendStats{
+		Days:    days,
+		ByModel: map[string]LLMSpendBucket{},
+		Daily:   make([]LLMSpendDay, 0, days),
+	}
+	byDate := map[string]int{}
+	for i := days - 1; i >= 0; i-- {
+		date := now.AddDate(0, 0, -i).Format("2006-01-02")
+		stats.Daily = append(stats.Daily, LLMSpendDay{Date: date})
+		byDate[date] = len(stats.Daily) - 1
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, run := range s.analysisRuns {
+		if run == nil || run.UpdatedAt.Before(since) || run.UpdatedAt.After(now) {
+			continue
+		}
+		usage, ok := run.Metadata["llm_usage"].(map[string]any)
+		if !ok {
+			continue
+		}
+		addUsageBucket(&stats.LLMSpendBucket, usage)
+		if day, ok := byDate[run.UpdatedAt.Format("2006-01-02")]; ok {
+			addUsageBucket(&stats.Daily[day].LLMSpendBucket, usage)
+		}
+		if rawByModel, ok := usage["by_model"].(map[string]any); ok {
+			for model, rawBucket := range rawByModel {
+				bucketMap, ok := rawBucket.(map[string]any)
+				if !ok {
+					continue
+				}
+				bucket := stats.ByModel[model]
+				addUsageBucket(&bucket, bucketMap)
+				stats.ByModel[model] = bucket
+			}
+		}
+	}
+	return stats
+}
+
+func addUsageBucket(bucket *LLMSpendBucket, usage map[string]any) {
+	bucket.Calls += usageInt(usage["calls"])
+	bucket.CallsWithoutUsage += usageInt(usage["calls_without_usage"])
+	bucket.FailedCalls += usageInt(usage["failed_calls"])
+	bucket.PromptTokens += usageInt(usage["prompt_tokens"])
+	bucket.CompletionTokens += usageInt(usage["completion_tokens"])
+	bucket.TotalTokens += usageInt(usage["total_tokens"])
+	bucket.CostUSD += usageFloat(usage["cost_usd"])
+}
+
+func usageInt(value any) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case float32:
+		return int(v)
+	case json.Number:
+		out, _ := v.Int64()
+		return int(out)
+	default:
+		return 0
+	}
+}
+
+func usageFloat(value any) float64 {
+	switch v := value.(type) {
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case float64:
+		return v
+	case float32:
+		return float64(v)
+	case json.Number:
+		out, _ := v.Float64()
+		return out
+	default:
+		return 0
+	}
+}
+
+func (s *Store) KPIStats(days int, now time.Time) KPIStats {
+	if days <= 0 {
+		days = 7
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	since := now.AddDate(0, 0, -days)
+	stats := KPIStats{Days: days, Daily: make([]KPIDay, 0, days)}
+	byDate := map[string]int{}
+	rcaByDay := make([][]float64, days)
+	resolveByDay := make([][]float64, days)
+	for i := days - 1; i >= 0; i-- {
+		date := now.AddDate(0, 0, -i).Format("2006-01-02")
+		stats.Daily = append(stats.Daily, KPIDay{Date: date})
+		byDate[date] = len(stats.Daily) - 1
+	}
+
+	rcaMinutes := []float64{}
+	resolveMinutes := []float64{}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, incident := range s.incidents {
+		if incident == nil || incidentDeleted(incident) || incident.FiredAt.Before(since) || incident.FiredAt.After(now) {
+			continue
+		}
+		day, hasDay := byDate[incident.FiredAt.Format("2006-01-02")]
+		if firstCompleted := s.firstCompletedAtForIncidentLocked(incident.IncidentID); firstCompleted != nil && !firstCompleted.Before(incident.FiredAt) {
+			minutes := firstCompleted.Sub(incident.FiredAt).Minutes()
+			rcaMinutes = append(rcaMinutes, minutes)
+			if hasDay {
+				rcaByDay[day] = append(rcaByDay[day], minutes)
+			}
+		}
+		if incident.ResolvedAt != nil && !incident.ResolvedAt.Before(incident.FiredAt) {
+			minutes := incident.ResolvedAt.Sub(incident.FiredAt).Minutes()
+			resolveMinutes = append(resolveMinutes, minutes)
+			if hasDay {
+				resolveByDay[day] = append(resolveByDay[day], minutes)
+			}
+		}
+	}
+	stats.TimeToRCA = kpiBucket(rcaMinutes)
+	stats.TimeToResolve = kpiBucket(resolveMinutes)
+	for i := range stats.Daily {
+		stats.Daily[i].TimeToRCA = kpiBucket(rcaByDay[i])
+		stats.Daily[i].TimeToResolve = kpiBucket(resolveByDay[i])
+	}
+	return stats
+}
+
+func (s *Store) firstCompletedAtForIncidentLocked(incidentID string) *time.Time {
+	var selected *time.Time
+	for _, run := range s.analysisRuns {
+		if run == nil || run.Status != "complete" || run.IncidentID != incidentID {
+			continue
+		}
+		completedAt := run.FirstCompletedAt
+		if completedAt == nil {
+			completedAt = &run.UpdatedAt
+		}
+		if selected == nil || completedAt.Before(*selected) {
+			value := *completedAt
+			selected = &value
+		}
+	}
+	return selected
+}
+
+func kpiBucket(values []float64) KPIBucket {
+	if len(values) == 0 {
+		return KPIBucket{}
+	}
+	sorted := append([]float64(nil), values...)
+	sort.Float64s(sorted)
+	sum := 0.0
+	for _, value := range sorted {
+		sum += value
+	}
+	return KPIBucket{
+		Count:      len(sorted),
+		AvgMinutes: roundMinutes(sum / float64(len(sorted))),
+		P50Minutes: roundMinutes(percentile(sorted, 0.50)),
+		P90Minutes: roundMinutes(percentile(sorted, 0.90)),
+	}
+}
+
+func percentile(sorted []float64, q float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	index := int(float64(len(sorted)-1)*q + 0.5)
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(sorted) {
+		index = len(sorted) - 1
+	}
+	return sorted[index]
+}
+
+func roundMinutes(value float64) float64 {
+	return float64(int(value*10+0.5)) / 10
+}
+
+func recurrenceRate(recurred int, total int) float64 {
+	if total <= 0 {
+		return 0
+	}
+	return float64(recurred) / float64(total)
+}
+
+func metadataFromAgentContext(context map[string]any) map[string]any {
+	if context == nil {
+		return nil
+	}
+	usage, ok := context["llm_usage"]
+	if !ok {
+		return nil
+	}
+	if usageMap, ok := usage.(map[string]any); ok {
+		return map[string]any{"llm_usage": cloneAnyMap(usageMap)}
+	}
+	return map[string]any{"llm_usage": usage}
+}
+
+func mergeAnalysisMetadata(existing map[string]any, incoming map[string]any) map[string]any {
+	if len(existing) == 0 {
+		return cloneAnyMap(incoming)
+	}
+	out := cloneAnyMap(existing)
+	for key, value := range incoming {
+		if child, ok := value.(map[string]any); ok {
+			out[key] = cloneAnyMap(child)
+			continue
+		}
+		out[key] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func progressLogFromMetadata(metadata map[string]any) []any {
+	raw, ok := metadata["progress_log"].([]any)
+	if !ok {
+		return []any{}
+	}
+	return append([]any{}, raw...)
+}
+
+func nextProgressSeq(log []any) int {
+	if len(log) == 0 {
+		return 1
+	}
+	if item, ok := log[len(log)-1].(map[string]any); ok {
+		return usageInt(item["seq"]) + 1
+	}
+	return len(log) + 1
+}
+
+func normalizeProgressEntry(entry map[string]any, seq int, now time.Time) map[string]any {
+	out := cloneAnyMap(entry)
+	out["seq"] = seq
+	if _, ok := out["timestamp"]; !ok {
+		out["timestamp"] = now
+	}
+	return out
+}
+
+func (s *Store) latestTokenUsageLocked(incidentID string) map[string]any {
+	alertIDs := map[string]struct{}{}
+	for _, alert := range s.alerts {
+		if alert != nil && alert.IncidentID == incidentID {
+			alertIDs[alert.AlertID] = struct{}{}
+		}
+	}
+	var selected *AnalysisRun
+	for _, run := range s.analysisRuns {
+		if run == nil || len(run.Metadata) == 0 {
+			continue
+		}
+		matches := run.IncidentID == incidentID
+		if !matches {
+			_, matches = alertIDs[run.AlertID]
+		}
+		if !matches {
+			continue
+		}
+		if _, ok := run.Metadata["llm_usage"]; !ok {
+			continue
+		}
+		if selected == nil || run.UpdatedAt.After(selected.UpdatedAt) {
+			selected = run
+		}
+	}
+	if selected == nil {
+		return nil
+	}
+	if usage, ok := selected.Metadata["llm_usage"].(map[string]any); ok {
+		return cloneAnyMap(usage)
+	}
+	return map[string]any{"value": selected.Metadata["llm_usage"]}
+}
+
+func (s *Store) latestAlertForIncidentLocked(incidentID string) *AlertRecord {
+	var selected *AlertRecord
+	var selectedFiring *AlertRecord
+	for _, alert := range s.alerts {
+		if alert == nil || alert.IncidentID != incidentID {
+			continue
+		}
+		if selected == nil || alert.FiredAt.After(selected.FiredAt) {
+			selected = alert
+		}
+		if alert.Status != "resolved" && (selectedFiring == nil || alert.FiredAt.After(selectedFiring.FiredAt)) {
+			selectedFiring = alert
+		}
+	}
+	if selectedFiring != nil {
+		return selectedFiring
+	}
+	return selected
+}
+
 func (s *Store) LatestAlertID() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var latest *AlertRecord
 	var latestFiring *AlertRecord
 	for _, alert := range s.alerts {
-		if alert == nil {
+		if alert == nil || incidentDeleted(s.incidents[alert.IncidentID]) {
 			continue
 		}
 		if latest == nil || alert.FiredAt.After(latest.FiredAt) {
@@ -554,6 +1293,7 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 		existing.MissingData = []string{}
 		existing.Warnings = []string{}
 		existing.Artifacts = []Artifact{}
+		existing.Metadata = nil
 		// This IS a new analysis occupying the old row, so it must also become the
 		// NEWEST run: isLatestAnalysisRunForAlert compares CreatedAt, and with the
 		// old timestamp any run created later (e.g. a comment reanalysis) stayed
@@ -635,6 +1375,26 @@ func (s *Store) latestReusableAnalysisRunLocked(targetType string, targetID stri
 	return selected
 }
 
+func (s *Store) AppendAnalysisProgress(runID string, entry map[string]any) (AnalysisRun, map[string]any, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run := s.analysisRuns[runID]
+	if run == nil || run.Status != "analyzing" {
+		return AnalysisRun{}, nil, false
+	}
+	if run.Metadata == nil {
+		run.Metadata = map[string]any{}
+	}
+	log := progressLogFromMetadata(run.Metadata)
+	progress := normalizeProgressEntry(entry, nextProgressSeq(log), time.Now().UTC())
+	log = append(log, progress)
+	if len(log) > maxProgressLogEntries {
+		log = log[len(log)-maxProgressLogEntries:]
+	}
+	run.Metadata["progress_log"] = log
+	return cloneAnalysisRun(run), cloneAnyMap(progress), true
+}
+
 func (s *Store) CompleteAnalysisRun(runID string, response AgentAnalysisResponse) (AnalysisRun, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -654,7 +1414,11 @@ func (s *Store) CompleteAnalysisRun(runID string, response AgentAnalysisResponse
 	run.MissingData = response.MissingData
 	run.Warnings = response.Warnings
 	run.Artifacts = response.Artifacts
+	run.Metadata = mergeAnalysisMetadata(run.Metadata, metadataFromAgentContext(response.Context))
 	run.UpdatedAt = time.Now().UTC()
+	if run.FirstCompletedAt == nil {
+		run.FirstCompletedAt = &run.UpdatedAt
+	}
 	if !s.persistAnalysisRunLocked(run) {
 		*run = before
 		return cloneAnalysisRun(run), false
@@ -681,6 +1445,7 @@ func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (A
 	run.MissingData = response.MissingData
 	run.Warnings = response.Warnings
 	run.Artifacts = response.Artifacts
+	run.Metadata = mergeAnalysisMetadata(run.Metadata, metadataFromAgentContext(response.Context))
 	run.UpdatedAt = time.Now().UTC()
 	if !s.persistAnalysisRunLocked(run) {
 		*run = before
@@ -782,6 +1547,9 @@ func (s *Store) AlertIDsNeedingAnalysis(limit int, retryCooldown time.Duration, 
 		if alert == nil || alert.IsAnalyzing {
 			continue
 		}
+		if incidentDeleted(s.incidents[alert.IncidentID]) {
+			continue
+		}
 		if status(alert.Status) == "resolved" {
 			continue
 		}
@@ -808,13 +1576,13 @@ func (s *Store) AnalysisTarget(targetType string, targetID string) (Alert, strin
 	switch targetType {
 	case "alert":
 		alert := s.alerts[targetID]
-		if alert == nil {
+		if alert == nil || incidentDeleted(s.incidents[alert.IncidentID]) {
 			return Alert{}, "", "", "", "", false
 		}
 		return alertFromRecord(*alert), alert.IncidentID, alert.AlertID, alert.ThreadTS, alert.AlarmTitle, true
 	case "incident":
 		incident := s.incidents[targetID]
-		if incident == nil {
+		if incident == nil || incidentDeleted(incident) {
 			return Alert{}, "", "", "", "", false
 		}
 		var selected *AlertRecord
@@ -894,7 +1662,7 @@ func (s *Store) BumpIncidentAnalysisSeq(id string) (int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[id]
-	if incident == nil {
+	if incident == nil || incidentDeleted(incident) {
 		return 0, false
 	}
 	incident.AnalysisSeq++
@@ -909,7 +1677,7 @@ func (s *Store) SetIncidentSlackThread(id string, ts string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[id]
-	if incident == nil {
+	if incident == nil || incidentDeleted(incident) {
 		return
 	}
 	incident.SlackThreadTS = ts
@@ -1000,7 +1768,9 @@ func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 			id,
 			similarIncidentLimit,
 		)
+		detail.SimilarRecentCount = s.similarRecentCountLocked(alertFromRecord(detail.Alerts[0]), id, time.Now().UTC().AddDate(0, 0, -7), nil)
 	}
+	detail.TokenUsage = s.latestTokenUsageLocked(id)
 	return detail, true
 }
 
@@ -1008,7 +1778,7 @@ func (s *Store) AlertDetail(id string) (*AlertRecord, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	alert := s.alerts[id]
-	if alert == nil {
+	if alert == nil || incidentDeleted(s.incidents[alert.IncidentID]) {
 		return nil, false
 	}
 	copied := cloneAlert(alert)
