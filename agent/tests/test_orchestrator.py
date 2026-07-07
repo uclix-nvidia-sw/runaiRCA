@@ -673,7 +673,9 @@ async def test_chat_falls_back_when_llm_call_raises(monkeypatch) -> None:
     assert response.status == "ok"
     assert "## RCA Chat" in response.answer
     assert "## Warnings" in response.answer
-    assert "llm failed unexpectedly" in response.answer
+    # The agentic chat catches the transport failure and surfaces its detail in the
+    # fallback note (more informative than the old generic "llm failed unexpectedly").
+    assert "The LLM chat call failed" in response.answer
     assert "LLM transport exploded" in response.answer
 
 def test_masker_redacts_sensitive_object_values() -> None:

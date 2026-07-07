@@ -246,7 +246,13 @@ class AnalysisOrchestrator:
         answer = grounding
         if chat_llm_configured:
             try:
-                llm_answer, llm_error = await self._llm_chat_answer(request, grounding)
+                from app.services.chat_agent import answer_chat
+
+                # Agentic chat: the copilot can run read-only cluster queries and
+                # on-demand RCA, not just answer from the loaded workspace context.
+                llm_answer, llm_error = await answer_chat(
+                    self._settings, request, grounding, analyze_fn=self.analyze
+                )
             except Exception as exc:
                 warning = self._masker.mask_text(_unexpected_runtime_warning("llm", exc))
                 answer = _append_chat_warning(grounding, warning, language)
