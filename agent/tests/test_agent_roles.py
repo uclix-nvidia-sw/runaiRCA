@@ -14,16 +14,8 @@ from app.collectors.kubernetes import (
     _list_params,
 )
 from app.collectors.prometheus import _queries_for
-from app.collectors.registry import DEFAULT_COLLECTORS
 from app.config import load_settings
-from app.nat_tools import (
-    AnalysisAgentConfig,
-    ChangeContextConfig,
-    KubernetesContextConfig,
-    LokiContextConfig,
-    RunAIContextConfig,
-    SystemContextConfig,
-)
+from app.nat_engine import RcaStageConfig, RunaiRcaPipelineConfig
 from app.prompts import agent_role_coverage_lines, load_agent_souls
 
 CONFIG_DIR = Path(__file__).parents[1] / "configs"
@@ -65,26 +57,23 @@ def test_agent_role_contracts_cover_each_component_agent() -> None:
 
 
 def test_nat_tool_descriptions_expose_agent_boundaries() -> None:
-    assert "KubeRCA-style RCA analysis" in (AnalysisAgentConfig.__doc__ or "")
-    assert "no CLI by default" in (RunAIContextConfig.__doc__ or "")
-    assert "Run:ai control-plane pod/event" in (KubernetesContextConfig.__doc__ or "")
-    assert "runai/runai-backend" in (LokiContextConfig.__doc__ or "")
-    assert "node-level" in (SystemContextConfig.__doc__ or "")
-    assert "recent" in (ChangeContextConfig.__doc__ or "")
+    assert "pipeline stage" in (RcaStageConfig.__doc__ or "")
+    assert "controller" in (RunaiRcaPipelineConfig.__doc__ or "")
 
 
-def test_nat_workflows_cover_default_collectors() -> None:
-    expected = {f"{name}_context" for name in DEFAULT_COLLECTORS}
-    for name in (
-        "runai_rca_workflow.yml",
-        "runai_rca_workflow_litellm.yml",
-        "runai_rca_workflow_mcp.yml",
-    ):
-        functions = yaml.safe_load((CONFIG_DIR / name).read_text(encoding="utf-8"))["functions"]
-        assert expected <= set(functions)
-        assert expected <= set(functions["evidence_parallel"]["tool_list"])
-        if "final_synthesis" in functions:
-            assert expected <= set(functions["final_synthesis"]["tool_names"])
+def test_engine_workflow_declares_all_pipeline_stages() -> None:
+    expected = {"enrich", "plan", "evidence", "rank", "self_check", "synthesize"}
+    config = yaml.safe_load((CONFIG_DIR / "runai_rca_engine.yml").read_text(encoding="utf-8"))
+    workflow = config["workflow"]
+    functions = config["functions"]
+
+    assert workflow["_type"] == "runai_rca_pipeline"
+    stages = set()
+    for name in expected:
+        ref = workflow[name]
+        assert functions[ref]["_type"] == "rca_stage"
+        stages.add(functions[ref]["stage"])
+    assert stages == expected
 
 
 def test_role_coverage_lines_are_operator_visible() -> None:

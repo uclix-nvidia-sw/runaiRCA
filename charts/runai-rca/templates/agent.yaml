@@ -91,8 +91,6 @@ spec:
               value: {{ .Values.agent.env.enableNatRuntime | quote }}
             - name: NAT_CONFIG_FILE
               value: {{ .Values.agent.env.natConfigFile | quote }}
-            - name: NAT_TIMEOUT_SECONDS
-              value: {{ .Values.agent.env.natTimeoutSeconds | quote }}
             - name: ENABLE_INVESTIGATION_LOOP
               value: {{ .Values.agent.env.enableInvestigationLoop | quote }}
             - name: MAX_INVESTIGATION_STEPS

@@ -16,7 +16,9 @@ from typing import Any
 import yaml
 
 VALUES = Path(__file__).parents[2] / "charts" / "runai-rca" / "values.yaml"
-MCP_TEMPLATE = Path(__file__).parents[2] / "charts" / "runai-rca" / "templates" / "mcp-services.yaml"
+MCP_TEMPLATE = (
+    Path(__file__).parents[2] / "charts" / "runai-rca" / "templates" / "mcp-services.yaml"
+)
 AGENT_TEMPLATE = Path(__file__).parents[2] / "charts" / "runai-rca" / "templates" / "agent.yaml"
 # Images we build and publish to the org registry — the ONLY repositories allowed
 # to be short (unqualified), because global.imageRegistry is meant to prefix them.
@@ -50,7 +52,7 @@ def test_backend_agent_call_outlives_agent_deadline() -> None:
 def test_agent_step_ceilings_fit_inside_the_deadline() -> None:
     env = _values()["agent"]["env"]
     deadline = int(env["analysisDeadlineSeconds"])
-    for key in ("llmRequestTimeoutSeconds", "natTimeoutSeconds"):
+    for key in ("llmRequestTimeoutSeconds",):
         assert int(env[key]) < deadline, (
             f"agent.env.{key} must stay below analysisDeadlineSeconds so a single "
             "hung step cannot eat the whole analysis budget"
@@ -60,7 +62,7 @@ def test_agent_step_ceilings_fit_inside_the_deadline() -> None:
 def test_helm_defaults_run_analysis_through_nat() -> None:
     env = _values()["agent"]["env"]
     assert env["enableNatRuntime"] is True
-    assert env["natConfigFile"] == "/app/configs/runai_rca_workflow_litellm.yml"
+    assert env["natConfigFile"] == "/app/configs/runai_rca_engine.yml"
 
 
 def _image_repos(node: Any, path: str = "") -> list[tuple[str, str]]:

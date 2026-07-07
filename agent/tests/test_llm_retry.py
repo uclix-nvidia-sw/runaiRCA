@@ -10,7 +10,9 @@ from tests.test_orchestrator import make_settings
 
 
 def _settings():
-    return replace(make_settings(), llm_base_url="https://llm.local", llm_model="m", llm_api_key="k")
+    return replace(
+        make_settings(), llm_base_url="https://llm.local", llm_model="m", llm_api_key="k"
+    )
 
 
 @pytest.mark.asyncio

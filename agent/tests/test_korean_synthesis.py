@@ -21,8 +21,8 @@ from app.collectors.runai import RunAICollector
 from app.config import load_settings
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services.kg_enrichment import GraphRemediation, graph_remediation
-from app.services.orchestrator import (
-    AnalysisOrchestrator,
+from app.services.orchestrator import AnalysisOrchestrator
+from app.services.pipeline import (
     _gpu_model_from,
     _graph_remediation_lines,
     _xid_codes_from_results,

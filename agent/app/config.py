@@ -127,7 +127,6 @@ class Settings:
     llm_request_timeout_seconds: int
     nat_config_file: str
     enable_nat_runtime: bool
-    nat_timeout_seconds: int
     typedb_address: str
     typedb_database: str
     typedb_username: str
@@ -264,13 +263,9 @@ def load_settings() -> Settings:
         # Generous per-call ceiling so a reasoning agent is never cut off mid-thought;
         # the overall analysis deadline below is the real bound. (0 = unlimited.)
         llm_request_timeout_seconds=_int_env("LLM_REQUEST_TIMEOUT_SECONDS", 300),
-        nat_config_file=os.getenv(
-            "NAT_CONFIG_FILE", "configs/runai_rca_workflow_litellm.yml"
-        ).strip(),
+        nat_config_file=os.getenv("NAT_CONFIG_FILE", "configs/runai_rca_engine.yml").strip(),
+        # Run analysis through the in-process NAT engine.
         enable_nat_runtime=_bool_env("ENABLE_NAT_RUNTIME", True),
-        # Bounded below the overall deadline so the workflow subprocess is killed
-        # cleanly if it overruns. (0 = unlimited.)
-        nat_timeout_seconds=_int_env("NAT_TIMEOUT_SECONDS", 300),
         typedb_address=os.getenv("TYPEDB_ADDRESS", "").strip(),
         typedb_database=os.getenv("TYPEDB_DATABASE", "runai_rca").strip(),
         typedb_username=os.getenv("TYPEDB_USERNAME", "admin").strip(),

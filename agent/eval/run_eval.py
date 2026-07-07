@@ -57,7 +57,9 @@ def main() -> int:
         help="JSONL fixture file to grade",
     )
     parser.add_argument("--kg-off", action="store_true", help="drop the KG blast-radius signal")
-    parser.add_argument("--min-top1", type=float, default=0.0, help="fail when Top-1 rate is below this")
+    parser.add_argument(
+        "--min-top1", type=float, default=0.0, help="fail when Top-1 rate is below this"
+    )
     parser.add_argument("--max-false-assertions", type=int, default=0)
     args = parser.parse_args()
     kg_on = not args.kg_off

@@ -1,0 +1,2 @@
+{"id":"pending","question":{"alert":{"status":"firing","labels":{"alertname":"RunAIWorkloadPending","namespace":"runai"},"annotations":{"summary":"workload pending smoke"},"fingerprint":"fp-eval-pending"}},"answer":{"non_empty":true}}
+{"id":"xid","question":{"alert":{"status":"firing","labels":{"alertname":"NVRM Xid Alert","node":"dgx01"},"annotations":{"description":"dgx01 - XID 79 - GPU has fallen off the bus."},"fingerprint":"fp-eval-xid"}},"answer":{"non_empty":true}}

@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import sys
 import urllib.parse
 import urllib.request
 from typing import Any
@@ -28,8 +27,9 @@ def main() -> int:
     args = parser.parse_args()
 
     base = args.base_url.rstrip("/")
+    query = urllib.parse.urlencode({"limit": args.limit, "view": args.view})
     listing = _get_json(
-        f"{base}/api/v1/incidents?{urllib.parse.urlencode({'limit': args.limit, 'view': args.view})}"
+        f"{base}/api/v1/incidents?{query}"
     )
     items = listing.get("data") if isinstance(listing, dict) else []
     lines = []

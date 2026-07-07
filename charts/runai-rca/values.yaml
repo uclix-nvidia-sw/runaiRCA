@@ -344,8 +344,7 @@ agent:
     # etc.) via the pod exec subresource. Requires pods/exec RBAC (agent-rbac.yaml).
     enablePodExec: true
     enableNatRuntime: true
-    natConfigFile: /app/configs/runai_rca_workflow_litellm.yml
-    natTimeoutSeconds: 300
+    natConfigFile: /app/configs/runai_rca_engine.yml
     # Human-like iterative investigation: the orchestrator plans, probes the most
     # relevant agent, observes, and re-plans (bounded by maxInvestigationSteps)
     # instead of gathering everything once. Only active when an LLM is configured

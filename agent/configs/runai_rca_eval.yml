@@ -1,0 +1,46 @@
+general:
+  telemetry:
+    enabled: false
+
+llms:
+  local_llm:
+    _type: litellm
+    model_name: ${LLM_MODEL:-unconfigured}
+    base_url: ${LLM_BASE_URL:-}
+    api_key: ${LLM_API_KEY:-dummy}
+    temperature: 0.0
+
+functions:
+  enrich: { _type: rca_stage, stage: enrich }
+  plan: { _type: rca_stage, stage: plan }
+  evidence: { _type: rca_stage, stage: evidence }
+  rank: { _type: rca_stage, stage: rank }
+  self_check: { _type: rca_stage, stage: self_check }
+  synthesize: { _type: rca_stage, stage: synthesize }
+
+workflow:
+  _type: runai_rca_pipeline
+  enrich: enrich
+  plan: plan
+  evidence: evidence
+  rank: rank
+  self_check: self_check
+  synthesize: synthesize
+  llm: local_llm
+
+eval:
+  general:
+    max_concurrency: 1
+    dataset:
+      _type: jsonl
+      file_path: eval/nat_dataset.jsonl
+      id_key: id
+      structure:
+        question_key: question
+        answer_key: answer
+    output:
+      dir: .tmp/nat/runai_rca_eval
+      cleanup: true
+  evaluators:
+    non_empty:
+      _type: non_empty_rca

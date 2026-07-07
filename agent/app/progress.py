@@ -20,7 +20,9 @@ class ProgressReporter:
         )
 
     @classmethod
-    def from_alert(cls, settings: Settings, alert: object, masker: Masker | None = None) -> ProgressReporter:
+    def from_alert(
+        cls, settings: Settings, alert: object, masker: Masker | None = None
+    ) -> ProgressReporter:
         annotations = getattr(alert, "annotations", None) or {}
         return cls(settings, str(annotations.get("analysis_run_id") or ""), masker)
 

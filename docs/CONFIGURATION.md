@@ -73,15 +73,14 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `BUILTIN_REDACTION_ENABLED` | Enable built-in secret redaction, default `true` |
 | `BUILTIN_REDACTION_HASH_MODE` | Replace secrets with stable short hashes instead of `[MASKED]`, default `false` |
 | `NVIDIA_API_KEY` | NIM key for NeMo Agent Toolkit workflows |
-| `LLM_BASE_URL` | OpenAI-compatible base URL for the LiteLLM NAT workflow and the operator chat copilot |
+| `LLM_BASE_URL` | OpenAI-compatible base URL for the NAT-managed default LLM and the operator chat copilot |
 | `LLM_MODEL` | OpenAI-compatible model name, for example `auto-router` |
 | `LLM_MODEL_PLANNER` / `LLM_MODEL_INVESTIGATION` / `LLM_MODEL_DRILLDOWN` / `LLM_MODEL_SELF_CHECK` / `LLM_MODEL_SYNTHESIS` / `LLM_MODEL_CHAT` | Optional stage-specific model overrides. Empty values fall back to `LLM_MODEL` |
 | `LLM_API_KEY` | OpenAI-compatible API key secret; enables conversational chat answers when all three LLM vars are set |
-| `LLM_REQUEST_TIMEOUT_SECONDS` | LLM request timeout per call (chat, reasoning, and the materialized NAT config), default `300`, `0` = unlimited |
+| `LLM_REQUEST_TIMEOUT_SECONDS` | LLM request timeout per call (chat and direct fallback reasoning), default `300`, `0` = unlimited |
 | `LLM_PRICING_JSON` | Optional JSON map for estimated LLM cost, keyed by model with `prompt_per_mtok` and `completion_per_mtok` values |
-| `ENABLE_NAT_RUNTIME` | Run RCA synthesis through the NeMo Agent Toolkit CLI; default `true` |
-| `NAT_CONFIG_FILE` | NeMo workflow config path, default `configs/runai_rca_workflow_litellm.yml` |
-| `NAT_TIMEOUT_SECONDS` | NeMo Agent Toolkit CLI execution timeout |
+| `ENABLE_NAT_RUNTIME` | Run analysis through the in-process NeMo Agent Toolkit engine; default `true` |
+| `NAT_CONFIG_FILE` | NeMo engine workflow config path, default `configs/runai_rca_engine.yml` |
 | `ENABLE_INVESTIGATION_LOOP` | Central LLM investigation loop: plan → probe the most relevant agents → observe → re-plan, default `false` (Helm sets `true`) |
 | `MAX_INVESTIGATION_STEPS` | Max central investigation steps per analysis, default `12` |
 | `MAX_REANALYSIS_STEPS` | Investigation budget for the one re-analysis pass after a refuted top cause, default `6` |
@@ -112,18 +111,13 @@ If a deployment must call an authenticated external Loki endpoint, inject
 `LOKI_BEARER_TOKEN`, `LOKI_BASIC_USERNAME` / `LOKI_BASIC_PASSWORD`, or
 `LOKI_TENANT_ID` explicitly with `agent.extraEnv`.
 
-NeMo Agent Toolkit workflows:
+NeMo Agent Toolkit workflow:
 
-- `agent/configs/runai_rca_workflow.yml` runs the component collectors through
-  NAT `parallel_executor` and the `analysis_agent` RCA step. It does not require
-  external MCP servers.
-- `agent/configs/runai_rca_workflow_mcp.yml` keeps the NIM-backed Analysis Agent
-  review path, but does not expose raw MCP client groups to final synthesis. MCP
-  calls happen inside each domain collector/drill-down, then final synthesis sees
-  only the resulting artifacts.
-- `agent/configs/runai_rca_workflow_litellm.yml` is the default runtime workflow.
-  Provide `LLM_BASE_URL`, `LLM_MODEL`, and `LLM_API_KEY` through env or Helm
-  Secret values.
+- `agent/configs/runai_rca_engine.yml` is the runtime workflow. It declares the
+  six RCA pipeline stages as NAT functions and runs them through the in-process
+  `runai_rca_pipeline` controller. Provide `LLM_BASE_URL`, `LLM_MODEL`, and
+  `LLM_API_KEY` through env or Helm Secret values to let NAT own the default LLM
+  transport during analysis.
 
 Example Helm override for a LiteLLM/OpenAI-compatible endpoint:
 
@@ -167,8 +161,8 @@ Frequently tuned Helm values:
 | `kubernetesMcp.enabled` | Run the shared Kubernetes MCP ClusterIP service with its own read-only ServiceAccount/RBAC, default `true`; no `secrets` or `pods/exec` permissions |
 | `postgresMcp.enabled` | Run the shared Postgres MCP ClusterIP service backed by the `runai-rca-postgres-mcp` wrapper image, default `true` |
 | `agent.env.prometheusMcpUrl` / `agent.env.lokiMcpUrl` / `agent.env.kubernetesMcpUrl` / `agent.env.postgresMcpUrl` | Remote MCP endpoints when not using the managed shared services |
-| `agent.env.llmBaseUrl` / `agent.env.llmModel` / `secrets.llmApiKey` | LiteLLM/OpenAI-compatible endpoint, model, and Secret-backed API key for `runai_rca_workflow_litellm.yml` |
-| `agent.env.*TimeoutSeconds` | Request/runtime timeouts for Kubernetes, Run:ai, Prometheus, Loki, Postgres, and NAT |
+| `agent.env.llmBaseUrl` / `agent.env.llmModel` / `secrets.llmApiKey` | LiteLLM/OpenAI-compatible endpoint, model, and Secret-backed API key for the in-process NAT engine |
+| `agent.env.*TimeoutSeconds` | Request/runtime timeouts for Kubernetes, Run:ai, Prometheus, Loki, and Postgres |
 | `agent.env.kubernetesListLimit` / `agent.env.lokiQueryLimit` | Evidence volume controls for Kubernetes list calls and Loki log query groups |
 | `agent.env.troubleshootingCasesFile` / `agent.env.agentSoulsFile` | Paths for injected troubleshooting memory and agent role contracts |
 | `agent.env.maskingRegexListJson` / `builtinRedaction*` | Cluster-specific secret masking regexes plus built-in redaction enable/hash controls |

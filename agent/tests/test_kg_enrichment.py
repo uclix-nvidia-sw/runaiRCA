@@ -5,7 +5,7 @@ import asyncio
 from app.collectors.base import AnalysisTarget
 from app.config import load_settings
 from app.services.kg_enrichment import KGContext, enrich
-from app.services.orchestrator import _knowledge_base_lines
+from app.services.pipeline import _knowledge_base_lines
 from app.services.root_cause_ranking import RankedCause
 
 

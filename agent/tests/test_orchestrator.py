@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import stat
 from dataclasses import replace
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -19,7 +17,7 @@ from app.schemas import (
     FeedbackHintContext,
     SimilarIncidentContext,
 )
-from app.services.orchestrator import AnalysisOrchestrator, NemoWorkflowRunner, _extract_nat_result
+from app.services.orchestrator import AnalysisOrchestrator
 
 
 def make_settings() -> Settings:
@@ -91,9 +89,8 @@ def make_settings() -> Settings:
         llm_pricing_json="{}",
         llm_api_key="",
         llm_request_timeout_seconds=120,
-        nat_config_file="configs/runai_rca_workflow.yml",
+        nat_config_file="configs/runai_rca_engine.yml",
         enable_nat_runtime=False,
-        nat_timeout_seconds=1,
         typedb_address="",
         typedb_database="runai_rca",
         typedb_username="admin",
@@ -534,10 +531,10 @@ async def test_analyze_falls_back_when_nat_runtime_raises(monkeypatch) -> None:
     settings = replace(make_settings(), enable_nat_runtime=True)
     orchestrator = AnalysisOrchestrator(settings)
 
-    async def broken_nat_run(payload):
+    async def broken_nat_run(request):
         raise RuntimeError("nat executable missing")
 
-    monkeypatch.setattr(orchestrator._nat, "run", broken_nat_run)
+    orchestrator._engine = SimpleNamespace(run=broken_nat_run)
 
     response = await orchestrator.analyze(
         AlertAnalysisRequest(
@@ -679,109 +676,6 @@ async def test_chat_falls_back_when_llm_call_raises(monkeypatch) -> None:
     assert "llm failed unexpectedly" in response.answer
     assert "LLM transport exploded" in response.answer
 
-
-def test_extract_nat_result_strips_console_wrapper() -> None:
-    output = (
-        "\x1b[32mWorkflow Result:\n## Root Cause\n\nBody\n"
-        "--------------------------------------------------\x1b[39m"
-    )
-
-    assert _extract_nat_result(output) == "## Root Cause\n\nBody"
-
-
-def test_nat_runner_can_materialize_remote_mcp_urls(tmp_path: Path) -> None:
-    config = tmp_path / "workflow.yml"
-    config.write_text(
-        """
-function_groups:
-  prometheus_mcp:
-    server:
-      url: http://localhost:9901/mcp
-  loki_mcp:
-    server:
-      url: http://localhost:9902/mcp
-""".strip(),
-        encoding="utf-8",
-    )
-    settings = replace(
-        make_settings(),
-        nat_config_file=str(config),
-        prometheus_mcp_url="https://prometheus-mcp.example.com/mcp",
-        loki_mcp_url="https://loki-mcp.example.com/mcp",
-    )
-
-    rendered = Path(NemoWorkflowRunner(settings)._materialize_config_file()).read_text(
-        encoding="utf-8"
-    )
-
-    assert "https://prometheus-mcp.example.com/mcp" in rendered
-    assert "https://loki-mcp.example.com/mcp" in rendered
-    assert "localhost:9901" not in rendered
-    assert "localhost:9902" not in rendered
-
-
-def test_nat_runner_materializes_litellm_placeholders(tmp_path: Path) -> None:
-    config = tmp_path / "workflow_litellm.yml"
-    config.write_text(
-        """
-llms:
-  litellm_llm:
-    _type: litellm
-    model_name: __RUNAI_RCA_LLM_MODEL__
-    base_url: __RUNAI_RCA_LLM_BASE_URL__
-    api_key: __RUNAI_RCA_LLM_API_KEY__
-    request_timeout: __RUNAI_RCA_LLM_REQUEST_TIMEOUT_SECONDS__
-""".strip(),
-        encoding="utf-8",
-    )
-    settings = replace(
-        make_settings(),
-        nat_config_file=str(config),
-        llm_base_url="https://litellm.example.com/v1",
-        llm_model="auto-router",
-        llm_api_key="test-secret",
-        llm_request_timeout_seconds=45,
-    )
-
-    rendered_path = Path(NemoWorkflowRunner(settings)._materialize_config_file())
-    rendered = rendered_path.read_text(encoding="utf-8")
-
-    assert "https://litellm.example.com/v1" in rendered
-    assert "auto-router" in rendered
-    assert "test-secret" in rendered
-    assert "request_timeout: 45" in rendered
-    assert "__RUNAI_RCA_LLM" not in rendered
-    assert stat.S_IMODE(rendered_path.stat().st_mode) == 0o600
-
-    NemoWorkflowRunner(settings)._cleanup_materialized_config(str(rendered_path))
-
-    assert not rendered_path.exists()
-
-
-def test_nat_runner_skips_partial_litellm_materialization(tmp_path: Path) -> None:
-    config = tmp_path / "workflow_litellm.yml"
-    config.write_text(
-        """
-llms:
-  litellm_llm:
-    _type: litellm
-    model_name: __RUNAI_RCA_LLM_MODEL__
-    base_url: __RUNAI_RCA_LLM_BASE_URL__
-    api_key: __RUNAI_RCA_LLM_API_KEY__
-    request_timeout: __RUNAI_RCA_LLM_REQUEST_TIMEOUT_SECONDS__
-""".strip(),
-        encoding="utf-8",
-    )
-    settings = replace(
-        make_settings(),
-        nat_config_file=str(config),
-        llm_api_key="test-secret",
-        llm_request_timeout_seconds=45,
-    )
-
-    assert NemoWorkflowRunner(settings)._materialize_config_file() == str(config)
-
-
 def test_masker_redacts_sensitive_object_values() -> None:
     masker = build_masker((r"internal-user-[0-9]+",))
     secret_blob = (
@@ -870,7 +764,7 @@ async def test_chat_agent_answers_from_attached_rca_memory() -> None:
 def test_pod_describe_line_carries_limits_restarts_oomkilled() -> None:
     # "phase Running" alone tells the operator nothing on a memory-limit alert:
     # the describe-grade line must carry the limit, restarts, and last OOMKilled.
-    from app.services.orchestrator import _pod_describe_line
+    from app.services.pipeline import _pod_describe_line
 
     pod = {
         "name": "workloads-manager-x",

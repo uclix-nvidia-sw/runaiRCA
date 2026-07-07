@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from app.knowledge import load_failure_modes, match_failure_mode_symptoms
 from app.schemas import Alert, AlertAnalysisRequest
-from app.services.orchestrator import (
+from app.services.pipeline import (
     _alert_text,
     _observed_text,
     _promote_xid_cause,
@@ -70,7 +70,7 @@ def test_xid_promotes_gpu_hardware_over_keyword_noise() -> None:
 
 
 def test_signature_promotion_beats_ranker_and_respects_precedence() -> None:
-    from app.services.orchestrator import _promote_signature_cause
+    from app.services.pipeline import _promote_signature_cause
 
     ranked = [RankedCause(family="node_kubelet_pressure", confidence="medium", score=3.0)]
     # known-issue signature beats the ranker

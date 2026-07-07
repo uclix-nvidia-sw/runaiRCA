@@ -117,7 +117,9 @@ async def test_hypothesis_ledger_updates_and_confident_stop(monkeypatch) -> None
         }
 
     monkeypatch.setattr("app.services.investigator.complete_json", fake_complete_json)
-    results, context = await investigate(settings, make_target(), _collectors(), plan, {}, max_steps=4)
+    results, context = await investigate(
+        settings, make_target(), _collectors(), plan, {}, max_steps=4
+    )
 
     ledger = context["hypothesis_ledger"]
     assert ledger[0]["id"] == "H1"

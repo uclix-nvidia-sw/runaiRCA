@@ -75,7 +75,7 @@ helm upgrade --install runai-rca oci://ghcr.io/<owner>/charts/runai-rca \
 
 #### LLM synthesis
 
-RCA 종합은 기본적으로 NeMo Agent Toolkit 런타임에서 실행됩니다. OpenAI 호환 엔드포인트(예: LiteLLM)를 지정하려면:
+RCA 종합은 기본적으로 인프로세스 NeMo Agent Toolkit 엔진에서 실행됩니다. NAT가 OpenAI 호환 엔드포인트(예: LiteLLM)를 통해 기본 LLM 전송을 소유하게 하려면:
 
 ```bash
   --set agent.env.llmBaseUrl=https://llm.example.com/v1 \
@@ -83,7 +83,7 @@ RCA 종합은 기본적으로 NeMo Agent Toolkit 런타임에서 실행됩니다
   --set secrets.llmApiKey='<llm-api-key>'
 ```
 
-워크플로 설정: `_litellm.yml`(기본값, OpenAI 호환), `runai_rca_workflow.yml`(외부 LLM 없음), `_mcp.yml`(Prometheus/Loki MCP + NIM).
+워크플로 설정: `runai_rca_engine.yml`.
 
 #### Runtime checks
 

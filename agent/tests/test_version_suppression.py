@@ -6,7 +6,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from app.collectors.runai import _extract_version
-from app.services.orchestrator import (
+from app.services.pipeline import (
     _known_issue_fixed_in_running,
     _runai_version_from,
     _suppress_fixed_known_issues,

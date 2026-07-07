@@ -22,29 +22,19 @@ Collectors (each owns one domain):
 - System collector — node infra (dmesg/journalctl, NVIDIA XID) via a per-node DaemonSet
 - Change collector — "what changed?" around the alert window
 
-`configs/runai_rca_workflow_litellm.yml` is the default NeMo Agent Toolkit
-workflow used as the orchestration backbone. It runs the collectors in parallel,
-then invokes `analysis_agent` to produce the KubeRCA-style RCA shown in the
-Analysis Dashboard.
+`configs/runai_rca_engine.yml` is the NeMo Agent Toolkit workflow used as the
+in-process orchestration engine. It declares the six RCA pipeline stages as NAT
+functions and runs them through the `runai_rca_pipeline` controller.
 Pipeline switches: `ENABLE_INVESTIGATION_LOOP`, `ENABLE_AGENT_DRILLDOWN`,
 `ANALYSIS_DEADLINE_SECONDS` (default 1500s) — full list in the
 [Configuration Reference](../docs/CONFIGURATION.md).
 
-`configs/runai_rca_workflow.yml` is the deterministic NAT workflow without an
-external LLM review endpoint.
+Set `LLM_BASE_URL`, `LLM_MODEL`, and `LLM_API_KEY` to let NAT own the default
+LLM transport during analysis. The direct fallback path and `/chat` keep using
+the existing HTTP client.
 
-`configs/runai_rca_workflow_mcp.yml` is the MCP/LLM variant. Use it when
-Prometheus/Loki MCP servers and NVIDIA NIM credentials are available.
-By default it points at local MCP endpoints; set `PROMETHEUS_MCP_URL` and
-`LOKI_MCP_URL` to use remote MCP servers without editing the workflow file.
-
-For the default LiteLLM/OpenAI-compatible workflow, set `LLM_BASE_URL`,
-`LLM_MODEL`, and `LLM_API_KEY`; the service writes a temporary 0600 workflow
-config with those values during each NAT run and removes it after the run
-finishes.
-
-The Python service normally delegates analysis to the `nat` CLI. It can still run
-in deterministic fallback mode for local development and tests; set
+The Python service normally runs analysis through the in-process NAT engine. It
+can still run the same pipeline directly for local development and tests; set
 `ENABLE_NAT_RUNTIME=false` only when you need to force that path.
 
 When deployed in the same Kubernetes cluster as Run:ai, Prometheus, and Loki,
@@ -103,6 +93,12 @@ uvicorn app.main:app --reload --port 8000
 ```bash
 pytest
 python -m compileall app
-nat validate --config_file configs/runai_rca_workflow.yml
-nat validate --config_file configs/runai_rca_workflow_litellm.yml
+nat validate --config_file configs/runai_rca_engine.yml
+nat run --config_file configs/runai_rca_engine.yml --input '{"alert":{"status":"firing","labels":{"alertname":"RunAIWorkloadPending","namespace":"runai"},"annotations":{"summary":"smoke"},"fingerprint":"fp-smoke"}}'
+nat validate --config_file configs/runai_rca_eval.yml
+nat eval --config_file configs/runai_rca_eval.yml
 ```
+
+Profiler: `configs/runai_rca_engine.yml` includes a commented bottleneck-analysis
+example. Enable the same `profiler` block under `eval.general` when running
+`nat eval`; NAT writes profiler output under `.tmp/nat/runai_rca_eval`.

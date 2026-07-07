@@ -78,7 +78,7 @@ def test_check_lines_render_path_and_commands() -> None:
 
 
 def test_playbook_appends_component_check_path() -> None:
-    from app.services.orchestrator import _playbook_lines
+    from app.services.pipeline import _playbook_lines
 
     components = load_architecture(ARCHITECTURE)
     failure_modes = load_failure_modes(FAILURE_MODES)

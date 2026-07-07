@@ -5,7 +5,7 @@ from pathlib import Path
 
 from app.knowledge import load_runai_known_issues, match_runai_known_issues
 from app.schemas import Alert, AlertAnalysisRequest
-from app.services.orchestrator import _known_issue_cause_lines, _numbered_actions
+from app.services.pipeline import _known_issue_cause_lines, _numbered_actions
 from app.services.root_cause_ranking import RankedCause
 
 CATALOG = "knowledge/runai_known_issues.yaml"
@@ -83,7 +83,7 @@ def test_playbook_leads_with_known_issue_not_full_dump() -> None:
     # A known-issue-headlined incident (e.g. workloads-manager cache growth) has no
     # failure_modes symptoms for its family — the playbook used to dump the entire
     # troubleshooting_cases.md. It must list the matched known issue precisely.
-    from app.services.orchestrator import _playbook_lines
+    from app.services.pipeline import _playbook_lines
     from app.services.root_cause_ranking import RankedCause
 
     catalog = load_runai_known_issues(CATALOG)

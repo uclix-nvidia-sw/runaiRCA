@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from app.knowledge import load_failure_modes, match_failure_mode_symptoms
 from app.schemas import Alert, AlertAnalysisRequest
-from app.services.orchestrator import _numbered_actions
+from app.services.pipeline import _numbered_actions
 from app.services.root_cause_ranking import RankedCause
 
 FM = "knowledge/failure_modes.yaml"

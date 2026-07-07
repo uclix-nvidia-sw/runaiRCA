@@ -49,13 +49,14 @@ and ontology it consults.
 
 ### Agent
 
-The Agent is a FastAPI service backed by the NeMo Agent Toolkit workflow
-configuration under `agent/configs/runai_rca_workflow_litellm.yml` by default.
+The Agent is a FastAPI service backed by one in-process NeMo Agent Toolkit
+workflow, `agent/configs/runai_rca_engine.yml`. The RCA pipeline stages are NAT
+functions, and the `runai_rca_pipeline` controller workflow owns the sequence.
 
-The Python service includes a deterministic fallback orchestrator so local
-development and tests can run before external Run:ai, Kubernetes, Postgres,
-Prometheus, Loki, or LLM credentials exist. `NemoWorkflowRunner` delegates to the
-`nat` CLI by default and falls back to the deterministic path if NAT fails.
+The Python service builds the NAT workflow once at startup. If the engine cannot
+start or a per-request engine run fails, the same pipeline stages run directly in
+process so local development and tests still work before external Run:ai,
+Kubernetes, Postgres, Prometheus, Loki, or LLM credentials exist.
 
 Every LLM stage (planner refine, investigation loop, per-collector drill-down,
 self-check, Korean synthesis) is optional and best-effort: with no LLM, or on any
