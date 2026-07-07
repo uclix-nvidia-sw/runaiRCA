@@ -20,10 +20,14 @@ from tests.test_orchestrator import make_settings, make_target
 
 def _free_port() -> int:
     sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = int(sock.getsockname()[1])
-    sock.close()
-    return port
+    try:
+        sock.bind(("127.0.0.1", 0))
+        port = int(sock.getsockname()[1])
+        return port
+    except PermissionError as exc:
+        pytest.skip(f"local port bind is not permitted in this sandbox: {exc}")
+    finally:
+        sock.close()
 
 
 @contextlib.asynccontextmanager

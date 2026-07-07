@@ -930,6 +930,7 @@ func (s *Store) LLMSpendStats(days int, now time.Time) LLMSpendStats {
 	return stats
 }
 
+// llm_usage may carry a nested "nat" per-stage breakdown of these same totals; it is deliberately not aggregated here (it would double count).
 func addUsageBucket(bucket *LLMSpendBucket, usage map[string]any) {
 	bucket.Calls += usageInt(usage["calls"])
 	bucket.CallsWithoutUsage += usageInt(usage["calls_without_usage"])

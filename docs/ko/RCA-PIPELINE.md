@@ -9,10 +9,16 @@ Agent는 단일 프롬프트가 **아닙니다**. 단일 전체 데드라인(dea
 오케스트레이터(orchestrator)(`agent/app/services/orchestrator.py`)가 실행하는 컴포넌트 지향
 다중 에이전트 파이프라인(pipeline)입니다. 모든 LLM 단계는 선택적입니다: LLM이 구성되지 않았거나
 어떤 실패가 발생하면, 파이프라인은 결정론적 경로로 저하(degrade)되며 여전히 리포트를 생성합니다.
+여섯 파이프라인 단계는 시작 시 한 번 빌드되는 `runai_rca_pipeline` 컨트롤러 워크플로
+(`agent/configs/runai_rca_engine.yml`) 아래에서 NAT 함수로 실행됩니다. NAT 엔진이
+비활성화되었거나 실패하면, 동일한 단계가 실패 폴백으로 프로세스 안에서 직접 실행됩니다.
 
 ```mermaid
 flowchart TD
-  REQ([/analyze request]) --> PLAN
+  REQ([/analyze request]) --> ORCH([Orchestrator])
+  ORCH --> NAT[NAT controller: runai_rca_pipeline]
+  NAT --> PLAN
+  ORCH -. direct fallback .-> PLAN
   PLAN[1 · Planner] --> COLL
   subgraph COLL["2 · Parallel evidence collectors"]
     direction LR
@@ -26,7 +32,7 @@ flowchart TD
   KG --> SYN[8 · Synthesis]
   SYN --> RESP([RCA + evidence trail])
   INV[Central investigation loop] -.->|wraps 2-4| COLL
-  ORCH([Orchestrator]) <-->|"enrich / graph_remediation"| TDB[(TypeDB ontology)]
+  ORCH <-->|"enrich / graph_remediation"| TDB[(TypeDB ontology)]
 ```
 
 전체 실행은 `asyncio.wait_for(analyze, ANALYSIS_DEADLINE_SECONDS)`로 감싸집니다

@@ -5,7 +5,7 @@ from __future__ import annotations
 from app.collectors.http_json import _client_timeout
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services.kg_enrichment import GraphRemediation
-from app.services.orchestrator import _causal_chain_line, _numbered_actions
+from app.services.pipeline import _causal_chain_line, _numbered_actions
 from app.services.root_cause_ranking import RankedCause
 
 

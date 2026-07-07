@@ -44,6 +44,14 @@ jobs:
         working-directory: agent
         continue-on-error: true
         run: python -m eval.run_eval --fixtures eval/fixtures_holdout.jsonl
+      - name: NAT config validate
+        working-directory: agent
+        run: |
+          nat validate --config_file configs/runai_rca_engine.yml
+          nat validate --config_file configs/runai_rca_eval.yml
+      - name: NAT eval gate
+        working-directory: agent
+        run: python -m eval.check_nat_eval --min-avg 1.0
 
   frontend:
     runs-on: ubuntu-latest

@@ -75,17 +75,19 @@ Bundled single-pod Postgres instead of an external DB: `--set postgresql.enabled
 
 #### LLM synthesis (optional)
 
-RCA synthesis runs deterministically in-process unless the NeMo runtime is enabled. To synthesize through an OpenAI-compatible endpoint (e.g. LiteLLM):
+RCA synthesis runs through the in-process NeMo Agent Toolkit engine by default.
+To let NAT own the default LLM transport through an OpenAI-compatible endpoint
+(e.g. LiteLLM):
 
 ```bash
   --set agent.env.enableNatRuntime=true \
-  --set agent.env.natConfigFile=/app/configs/runai_rca_workflow_litellm.yml \
+  --set agent.env.natConfigFile=/app/configs/runai_rca_engine.yml \
   --set agent.env.llmBaseUrl=https://llm.example.com/v1 \
   --set agent.env.llmModel=<model> \
   --set secrets.llmApiKey='<llm-api-key>'
 ```
 
-Workflow configs: `runai_rca_workflow.yml` (default, no external LLM), `_litellm.yml` (OpenAI-compatible), `_mcp.yml` (Prometheus/Loki MCP + NIM).
+Workflow config: `runai_rca_engine.yml`.
 
 #### Runtime checks
 

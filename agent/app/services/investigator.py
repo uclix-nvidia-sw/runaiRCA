@@ -388,7 +388,9 @@ async def investigate(
         pass
 
     try:
-        ledger = await _reflect_hypotheses(settings, plan, kg_context, evidence, by_name, ledger, adhoc)
+        ledger = await _reflect_hypotheses(
+            settings, plan, kg_context, evidence, by_name, ledger, adhoc
+        )
         if reporter:
             reporter.emit(
                 "reflection",

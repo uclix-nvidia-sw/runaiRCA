@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from app.collectors.base import AnalysisTarget
 from app.collectors.kubernetes import (
@@ -13,13 +15,10 @@ from app.collectors.kubernetes import (
 )
 from app.collectors.prometheus import _queries_for
 from app.config import load_settings
-from app.nat_tools import (
-    AnalysisAgentConfig,
-    KubernetesContextConfig,
-    LokiContextConfig,
-    RunAIContextConfig,
-)
+from app.nat_engine import RcaStageConfig, RunaiRcaPipelineConfig
 from app.prompts import agent_role_coverage_lines, load_agent_souls
+
+CONFIG_DIR = Path(__file__).parents[1] / "configs"
 
 
 def make_target() -> AnalysisTarget:
@@ -58,10 +57,23 @@ def test_agent_role_contracts_cover_each_component_agent() -> None:
 
 
 def test_nat_tool_descriptions_expose_agent_boundaries() -> None:
-    assert "KubeRCA-style RCA analysis" in (AnalysisAgentConfig.__doc__ or "")
-    assert "no CLI by default" in (RunAIContextConfig.__doc__ or "")
-    assert "Run:ai control-plane pod/event" in (KubernetesContextConfig.__doc__ or "")
-    assert "runai/runai-backend" in (LokiContextConfig.__doc__ or "")
+    assert "pipeline stage" in (RcaStageConfig.__doc__ or "")
+    assert "controller" in (RunaiRcaPipelineConfig.__doc__ or "")
+
+
+def test_engine_workflow_declares_all_pipeline_stages() -> None:
+    expected = {"enrich", "plan", "evidence", "rank", "self_check", "synthesize"}
+    config = yaml.safe_load((CONFIG_DIR / "runai_rca_engine.yml").read_text(encoding="utf-8"))
+    workflow = config["workflow"]
+    functions = config["functions"]
+
+    assert workflow["_type"] == "runai_rca_pipeline"
+    stages = set()
+    for name in expected:
+        ref = workflow[name]
+        assert functions[ref]["_type"] == "rca_stage"
+        stages.add(functions[ref]["stage"])
+    assert stages == expected
 
 
 def test_role_coverage_lines_are_operator_visible() -> None:

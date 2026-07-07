@@ -62,7 +62,9 @@ async def run_drilldowns(
     plan: InvestigationPlan | None,
 ) -> None:
     """Run every domain's drill-down loop concurrently. Never raises."""
-    if not settings.enable_agent_drilldown or not llm_configured(settings, settings.llm_model_drilldown):
+    if not settings.enable_agent_drilldown or not llm_configured(
+        settings, settings.llm_model_drilldown
+    ):
         return
     registry = _domain_tools(settings)
     tasks = [

@@ -22,25 +22,20 @@ Collectors (each owns one domain):
 - System collector — node infra (dmesg/journalctl, NVIDIA XID) via a per-node DaemonSet
 - Change collector — "what changed?" around the alert window
 
-`configs/runai_rca_workflow.yml` is the default NeMo Agent Toolkit workflow used
-as the orchestration backbone. It runs the collectors in parallel, then invokes
-`analysis_agent` to produce the KubeRCA-style RCA shown in the Analysis Dashboard.
+`configs/runai_rca_engine.yml` is the NeMo Agent Toolkit workflow used as the
+in-process orchestration engine. It declares the six RCA pipeline stages as NAT
+functions and runs them through the `runai_rca_pipeline` controller.
 Pipeline switches: `ENABLE_INVESTIGATION_LOOP`, `ENABLE_AGENT_DRILLDOWN`,
 `ANALYSIS_DEADLINE_SECONDS` (default 1500s) — full list in the
 [Configuration Reference](../docs/CONFIGURATION.md).
 
-`configs/runai_rca_workflow_mcp.yml` is the MCP/LLM variant. Use it when
-Prometheus/Loki MCP servers and NVIDIA NIM credentials are available.
-By default it points at local MCP endpoints; set `PROMETHEUS_MCP_URL` and
-`LOKI_MCP_URL` to use remote MCP servers without editing the workflow file.
+Set `LLM_BASE_URL`, `LLM_MODEL`, and `LLM_API_KEY` to let NAT own the default
+LLM transport during analysis. The direct fallback path and `/chat` keep using
+the existing HTTP client.
 
-`configs/runai_rca_workflow_litellm.yml` is the LiteLLM/OpenAI-compatible LLM
-variant. Set `LLM_BASE_URL`, `LLM_MODEL`, and `LLM_API_KEY`; the service writes a
-temporary 0600 workflow config with those values when `ENABLE_NAT_RUNTIME=true`
-and removes it after the NAT run finishes.
-
-The Python service can run in deterministic fallback mode for local development
-and tests. Set `ENABLE_NAT_RUNTIME=true` to delegate analysis to the `nat` CLI.
+The Python service normally runs analysis through the in-process NAT engine. It
+can still run the same pipeline directly for local development and tests; set
+`ENABLE_NAT_RUNTIME=false` only when you need to force that path.
 
 When deployed in the same Kubernetes cluster as Run:ai, Prometheus, and Loki,
 the collectors query cluster-local service URLs directly. The Helm chart defaults
@@ -60,8 +55,8 @@ comma-separated namespace allowlist, and set `KUBERNETES_CLUSTER_SCOPE_ENABLED=f
 when the service account has namespaced RBAC only.
 
 Known troubleshooting cases are loaded from `TROUBLESHOOTING_CASES_FILE`
-(`knowledge/troubleshooting_cases.md` by default) and injected into fallback and
-NeMo synthesis. This is static operator memory.
+(`knowledge/troubleshooting_cases.md` by default) and injected into RCA
+synthesis. This is static operator memory.
 
 Agent role contracts are loaded from `AGENT_SOULS_FILE`
 (`prompts/agent_souls.md` by default). The Run:ai agent is defined as a direct
@@ -72,7 +67,7 @@ and event state belongs to the Kubernetes collector, and `runai` /
 
 Similar incident retrieval and feedback learning come from the Backend. The
 Backend sends `similar_incidents` and `feedback_hints` in each `/analyze`
-request, and the fallback/NeMo synthesis paths include those hints in the RCA.
+request, and synthesis includes those hints in the RCA.
 The Analysis Agent owns the final RCA verdict, confidence, impact, missing data,
 manual actions, prevention notes, and dashboard summary.
 For `/chat`, the Backend also attaches the active incident or alert RCA content
@@ -98,6 +93,22 @@ uvicorn app.main:app --reload --port 8000
 ```bash
 pytest
 python -m compileall app
-nat validate --config_file configs/runai_rca_workflow.yml
-nat validate --config_file configs/runai_rca_workflow_litellm.yml
+nat validate --config_file configs/runai_rca_engine.yml
+nat run --config_file configs/runai_rca_engine.yml --input '{"alert":{"status":"firing","labels":{"alertname":"RunAIWorkloadPending","namespace":"runai"},"annotations":{"summary":"smoke"},"fingerprint":"fp-smoke"}}'
+nat validate --config_file configs/runai_rca_eval.yml
+python -m eval.check_nat_eval --min-avg 1.0
+python -m eval.run_eval --fixtures eval/fixtures.jsonl --min-top1 0.8
 ```
+
+Eval has two layers:
+
+- `eval/run_eval.py` measures ranker accuracy over injected collector evidence
+  (`fixtures.jsonl`), including Top-1/Top-3 and false-assertion checks.
+- `nat eval` through `eval/check_nat_eval.py` runs the real NAT workflow over
+  alert text fixtures (`nat_dataset.jsonl`) and gates end-to-end family routing.
+  Offline collectors are unavailable by design; only alert-signature routing is
+  scored.
+
+Profiler: `configs/runai_rca_engine.yml` includes a commented bottleneck-analysis
+example. Enable the same `profiler` block under `eval.general` when running
+`nat eval`; NAT writes profiler output under `.tmp/nat/runai_rca_eval`.

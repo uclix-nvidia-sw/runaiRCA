@@ -3,7 +3,7 @@
 > **관점:** 사용 방법 — 처음부터 몇 분 만에 첫 RCA까지.
 > **이 문서에서 다루는 것:** 사전 요구사항 · 로컬 실행 · 첫 분석 트리거 · Kubernetes 배포 · 다음 단계 안내.
 
-Run:AI RCA는 세 개의 서비스로 구성됩니다 — **Backend**(Go: Alertmanager 수집 + API), **Agent**(FastAPI: 증거 수집 + RCA 합성), **Frontend**(React 대시보드). 세 서비스 모두 외부 의존성 없이 로컬에서 실행됩니다. 자격 증명이 없으면 Backend는 인메모리 저장소로 폴백하고, Agent는 프로세스 내부의 결정론적 RCA를 사용합니다.
+Run:AI RCA는 세 개의 서비스로 구성됩니다 — **Backend**(Go: Alertmanager 수집 + API), **Agent**(FastAPI: 증거 수집 + RCA 합성), **Frontend**(React 대시보드). 세 서비스 모두 외부 의존성 없이 로컬에서 실행됩니다. 자격 증명이 없으면 Backend는 인메모리 저장소로 폴백하고, Agent는 기본적으로 NAT 엔진을 실행합니다. LLM 자격 증명이 없으면 각 단계가 결정론적으로 저하되며, 엔진이 실패하면 동일한 파이프라인이 직접 실행됩니다.
 
 ## 사전 요구사항
 

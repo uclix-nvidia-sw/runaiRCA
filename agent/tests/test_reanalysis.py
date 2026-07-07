@@ -15,7 +15,8 @@ import pytest
 
 from app.collectors.base import CollectorResult
 from app.schemas import Alert, AlertAnalysisRequest
-from app.services.orchestrator import AnalysisOrchestrator, _collector_name
+from app.services.orchestrator import AnalysisOrchestrator
+from app.services.pipeline import _collector_name
 from tests.test_orchestrator import make_settings
 
 
@@ -194,10 +195,12 @@ async def test_token_budget_skips_reanalysis(monkeypatch) -> None:
         investigate_calls=investigate_calls,
         refute_calls=refute_calls,
     )
-    monkeypatch.setattr("app.services.orchestrator.token_budget_exceeded", lambda settings: True)
+    monkeypatch.setattr("app.services.pipeline.token_budget_exceeded", lambda settings: True)
     monkeypatch.setattr(
-        "app.services.orchestrator.token_budget_warning",
-        lambda settings: "analysis token budget exceeded (10/10 tokens); skipped additional LLM reasoning",
+        "app.services.pipeline.token_budget_warning",
+        lambda settings: (
+            "analysis token budget exceeded (10/10 tokens); skipped additional LLM reasoning"
+        ),
     )
 
     orchestrator = AnalysisOrchestrator(llm_settings())

@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.entry-points."nat.components"]
-runai_rca = "app.nat_tools"
+runai_rca = "app.nat_engine"
 
 [project.optional-dependencies]
 dev = [

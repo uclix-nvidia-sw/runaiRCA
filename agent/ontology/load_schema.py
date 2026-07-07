@@ -55,7 +55,10 @@ def main() -> int:
                     tx.commit()
                 print(f"schema migration applied: {migration}")
             except Exception as exc:  # fresh DB / already migrated — define below is authoritative
-                print(f"schema migration skipped (non-fatal): {migration} -> {exc.__class__.__name__}")
+                print(
+                    "schema migration skipped (non-fatal): "
+                    f"{migration} -> {exc.__class__.__name__}"
+                )
         with driver.transaction(settings.typedb_database, TransactionType.SCHEMA) as tx:
             tx.query(schema).resolve()
             tx.commit()

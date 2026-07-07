@@ -1007,8 +1007,22 @@ function latestProgressLedger(events: AnalysisProgressEntry[]) {
   return [];
 }
 
+const PHASE_LABELS: Record<string, string> = {
+  enrich: 'Enrichment',
+  plan: 'Planning',
+  planning: 'Planning',
+  evidence: 'Evidence',
+  collection: 'Evidence',
+  rank: 'Ranking',
+  ranking: 'Ranking',
+  self_check: 'Self-check',
+  synthesize: 'Synthesis',
+  reflection: 'Synthesis',
+};
+
 function progressEventTitle(event: AnalysisProgressEntry) {
-  const phase = String(event.phase || 'progress').replace(/_/g, ' ');
+  const rawPhase = String(event.phase || 'progress');
+  const phase = PHASE_LABELS[rawPhase] || rawPhase.replace(/_/g, ' ');
   if (event.collector) return `${phase} · ${agentLabel(String(event.collector))}`;
   if (event.selected_hypothesis) return `${phase} · ${String(event.selected_hypothesis)}`;
   return phase;

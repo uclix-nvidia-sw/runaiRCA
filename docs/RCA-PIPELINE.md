@@ -11,11 +11,17 @@ The Agent is **not** a single prompt. It is a component-oriented multi-agent
 pipeline run by one orchestrator (`agent/app/services/orchestrator.py`) under a
 single overall deadline. Every LLM stage is optional: with no LLM configured, or
 on any failure, the pipeline degrades to its deterministic path and still
-produces a report.
+produces a report. The six pipeline stages run as NAT functions under the
+`runai_rca_pipeline` controller workflow (`agent/configs/runai_rca_engine.yml`),
+which is built once at startup. If the NAT engine is disabled or fails, the same
+stages run directly in process as the failure fallback.
 
 ```mermaid
 flowchart TD
-  REQ([/analyze request]) --> PLAN
+  REQ([/analyze request]) --> ORCH([Orchestrator])
+  ORCH --> NAT[NAT controller: runai_rca_pipeline]
+  NAT --> PLAN
+  ORCH -. direct fallback .-> PLAN
   PLAN[1 · Planner] --> COLL
   subgraph COLL["2 · Parallel evidence collectors"]
     direction LR
@@ -29,7 +35,7 @@ flowchart TD
   KG --> SYN[8 · Synthesis]
   SYN --> RESP([RCA + evidence trail])
   INV[Central investigation loop] -.->|wraps 2-4| COLL
-  ORCH([Orchestrator]) <-->|"enrich / graph_remediation"| TDB[(TypeDB ontology)]
+  ORCH <-->|"enrich / graph_remediation"| TDB[(TypeDB ontology)]
 ```
 
 The whole run is wrapped in `asyncio.wait_for(analyze, ANALYSIS_DEADLINE_SECONDS)`

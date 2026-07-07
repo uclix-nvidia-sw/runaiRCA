@@ -11,7 +11,7 @@ import asyncio
 import json
 import logging
 import random
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from typing import Any
 
 from app.collectors.http_json import post_json
@@ -19,6 +19,7 @@ from app.config import Settings
 
 _log = logging.getLogger(__name__)
 _usage: ContextVar[dict[str, Any] | None] = ContextVar("llm_usage", default=None)
+_nat_client: ContextVar[Any | None] = ContextVar("nat_llm_client", default=None)
 _RETRY_STATUSES = {0, 429, 500, 502, 503, 504}
 
 
@@ -38,6 +39,14 @@ def begin_usage_tracking() -> dict[str, Any]:
     }
     _usage.set(usage)
     return usage
+
+
+def set_nat_client(client: Any) -> Token:
+    return _nat_client.set(client)
+
+
+def reset_nat_client(token: Token) -> None:
+    _nat_client.reset(token)
 
 
 def usage_with_cost(settings: Settings, usage: dict[str, Any]) -> dict[str, Any]:
@@ -176,6 +185,16 @@ async def complete_with_error(
     selected_model = (model or settings.llm_model).strip()
     if not llm_configured(settings, selected_model):
         return None, "LLM is not configured"
+    # NAT owns only the default app model; explicit stage model overrides stay on HTTP.
+    if _nat_client.get() is not None and selected_model == settings.llm_model:
+        return await _complete_with_nat_client(
+            settings,
+            system=system,
+            user=user,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            model=selected_model,
+        )
     payload: dict[str, Any] = {
         "model": selected_model,
         "messages": [
@@ -213,6 +232,70 @@ async def complete_with_error(
             if isinstance(content, str) and content.strip():
                 return content.strip(), None
     return None, "unexpected response shape from the LLM endpoint"
+
+
+async def _complete_with_nat_client(
+    settings: Settings,
+    *,
+    system: str,
+    user: str,
+    temperature: float,
+    max_tokens: int | None,
+    model: str,
+) -> tuple[str | None, str | None]:
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    client = _nat_client.get()
+    messages = [
+        SystemMessage(content=f"{system}\n\n{PROMPT_INJECTION_GUARD}"),
+        HumanMessage(content=user),
+    ]
+    kwargs: dict[str, Any] = {"temperature": temperature}
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens
+    call_client = client.bind(**kwargs) if hasattr(client, "bind") else client
+    for attempt in range(3):
+        try:
+            response = await call_client.ainvoke(messages)
+            break
+        except Exception as exc:  # noqa: BLE001 - preserve graceful LLM degradation
+            if attempt == 2:
+                _record_failed_call(model)
+                return None, f"{type(exc).__name__}: {exc}"
+            await asyncio.sleep((0.25 * (2**attempt)) + random.uniform(0, 0.1))
+    else:
+        _record_failed_call(model)
+        return None, "NAT LLM client failed"
+    usage = _langchain_usage(response)
+    _record_usage(model, {"usage": usage} if usage else {})
+    text = getattr(response, "content", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip(), None
+    if isinstance(response, str) and response.strip():
+        return response.strip(), None
+    return None, "unexpected response shape from the NAT LLM client"
+
+
+def _langchain_usage(response: Any) -> dict[str, int] | None:
+    for raw in (
+        getattr(response, "usage_metadata", None),
+        (getattr(response, "response_metadata", None) or {}).get("token_usage")
+        if isinstance(getattr(response, "response_metadata", None), dict)
+        else None,
+    ):
+        if not isinstance(raw, dict):
+            continue
+        prompt = raw.get("prompt_tokens", raw.get("input_tokens"))
+        completion = raw.get("completion_tokens", raw.get("output_tokens"))
+        total = raw.get("total_tokens")
+        usage = {
+            "prompt_tokens": int(prompt or 0),
+            "completion_tokens": int(completion or 0),
+            "total_tokens": int(total or (int(prompt or 0) + int(completion or 0))),
+        }
+        if any(usage.values()):
+            return usage
+    return None
 
 
 def _record_usage(model: str, data: dict[str, Any]) -> None:

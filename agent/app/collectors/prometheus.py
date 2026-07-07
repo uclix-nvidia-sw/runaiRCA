@@ -93,7 +93,8 @@ class PrometheusCollector:
             status = "ok"
             confidence = "high"
             summary = (
-                f"Prometheus {'MCP' if used_mcp else 'direct'} queries completed with matching metric series "
+                f"Prometheus {'MCP' if used_mcp else 'direct'} queries completed with "
+                "matching metric series "
                 f"for {len(populated)} of {len(query_results)} query group(s)."
             )
         elif successful:

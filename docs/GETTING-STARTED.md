@@ -6,7 +6,8 @@
 Run:AI RCA has three services — **Backend** (Go: Alertmanager intake + API), **Agent**
 (FastAPI: evidence collection + RCA synthesis), and **Frontend** (React dashboard). All three
 run locally with no external dependencies: the Backend falls back to an in-memory store and the
-Agent uses a deterministic in-process RCA when no credentials are present.
+Agent runs the NAT engine by default. Without LLM credentials, each stage
+degrades deterministically; if the engine fails, the same pipeline runs directly.
 
 ## Prerequisites
 

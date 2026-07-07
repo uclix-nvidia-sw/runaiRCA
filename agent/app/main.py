@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
@@ -35,10 +36,25 @@ logging.basicConfig(level=logging.INFO)
 settings = load_settings()
 orchestrator = AnalysisOrchestrator(settings)
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    if settings.enable_nat_runtime:
+        try:
+            await orchestrator.start_engine()
+        except Exception:  # noqa: BLE001 - startup is best-effort
+            logging.getLogger(__name__).exception("failed to start NAT engine")
+    try:
+        yield
+    finally:
+        await orchestrator.close_engine()
+
+
 app = FastAPI(
     title="Run:AI RCA Agent",
     description="NeMo Agent Toolkit backed multi-agent RCA service",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 
@@ -53,10 +69,11 @@ def ping() -> str:
 
 
 @app.get("/healthz")
-def healthz() -> dict[str, str]:
+def healthz() -> dict[str, object]:
     return {
         "status": "ok",
         "nemo_runtime": "enabled" if settings.enable_nat_runtime else "fallback",
+        "nemo_engine": orchestrator.engine_health(),
     }
 
 

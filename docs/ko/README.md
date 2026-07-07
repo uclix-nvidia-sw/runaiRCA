@@ -73,19 +73,17 @@ helm upgrade --install runai-rca oci://ghcr.io/<owner>/charts/runai-rca \
 
 외부 DB 대신 번들된 단일 파드 Postgres를 사용하려면: `--set postgresql.enabled=true`.
 
-#### LLM synthesis (optional)
+#### LLM synthesis
 
-RCA 종합은 NeMo 런타임이 활성화되지 않는 한 프로세스 내에서 결정론적으로 실행됩니다. OpenAI 호환 엔드포인트(예: LiteLLM)를 통해 종합하려면:
+RCA 종합은 기본적으로 인프로세스 NeMo Agent Toolkit 엔진에서 실행됩니다. NAT가 OpenAI 호환 엔드포인트(예: LiteLLM)를 통해 기본 LLM 전송을 소유하게 하려면:
 
 ```bash
-  --set agent.env.enableNatRuntime=true \
-  --set agent.env.natConfigFile=/app/configs/runai_rca_workflow_litellm.yml \
   --set agent.env.llmBaseUrl=https://llm.example.com/v1 \
   --set agent.env.llmModel=<model> \
   --set secrets.llmApiKey='<llm-api-key>'
 ```
 
-워크플로 설정: `runai_rca_workflow.yml`(기본값, 외부 LLM 없음), `_litellm.yml`(OpenAI 호환), `_mcp.yml`(Prometheus/Loki MCP + NIM).
+워크플로 설정: `runai_rca_engine.yml`.
 
 #### Runtime checks
 

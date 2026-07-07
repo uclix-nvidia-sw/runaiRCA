@@ -235,7 +235,9 @@ async def test_complete_uses_stage_model_override(monkeypatch) -> None:
 
 
 def test_llm_configured_accepts_stage_model_without_default_model() -> None:
-    settings = replace(make_settings(), llm_base_url="https://llm.local", llm_model="", llm_api_key="k")
+    settings = replace(
+        make_settings(), llm_base_url="https://llm.local", llm_model="", llm_api_key="k"
+    )
 
     assert llm_configured(settings, "planner-model")
     assert not llm_configured(settings)
