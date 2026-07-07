@@ -211,15 +211,15 @@ backend:
   extraEnv: []
   resources: {}
 
-# Run:ai MCP sidecar. When enabled, the agent gathers Run:ai evidence through
+# Run:ai MCP shared service. When enabled, the agent gathers Run:ai evidence through
 # the runai-mcp server (426 APIs, spec-aware) instead of the fixed curls, and the
 # runai drill-down agent gets its API search/GET tools. runai-mcp is stdio-only,
-# so this runs it behind mcp-proxy (streamable HTTP) as a sidecar in the agent
-# pod. The image (runai-rca-mcp) is published by CI alongside the others, so
+# so this runs it behind mcp-proxy (streamable HTTP). The image (runai-rca-mcp)
+# is published by CI alongside the others, so
 # global.imageRegistry + the chart appVersion resolve it just like
 # backend/agent/frontend. Auth reuses the runai-rca secret's runaiClientId/
 # runaiClientSecret. ON by default; the agent falls back to direct HTTP when
-# disabled or when the sidecar is unreachable — never breaks analysis.
+# disabled or when the service is unreachable — never breaks analysis.
 runaiMcp:
   enabled: true
   image:
@@ -227,6 +227,9 @@ runaiMcp:
     tag: ""                     # defaults to the chart appVersion
     pullPolicy: IfNotPresent
   port: 8809
+  service:
+    annotations: {}
+    type: ClusterIP
   # Override if your mcp-proxy version needs different flags/endpoint.
   command: []
   resources: {}

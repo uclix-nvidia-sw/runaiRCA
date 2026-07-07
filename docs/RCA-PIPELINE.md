@@ -68,7 +68,7 @@ Each collector owns one domain and returns a `CollectorResult` (summary +
 
 | Collector | Owns |
 |---|---|
-| **runai** | Run:ai API workload/project/queue/quota/version context (optionally via the [runai-mcp sidecar](#run-ai-mcp-sidecar), 426 APIs) |
+| **runai** | Run:ai API workload/project/queue/quota/version context (optionally via the [runai-mcp service](#run-ai-mcp-service), 426 APIs) |
 | **kubernetes** | Workload pods/events, Run:ai control-plane pod health, node conditions, scheduling blockers; optional read-only pod-exec (allowlisted: `nvidia-smi`, …) |
 | **prometheus** | Queue/project GPU metrics, pending/restart/resource signals |
 | **loki** | Workload logs + `runai`/`runai-backend` control-plane logs |
@@ -214,12 +214,12 @@ Every artifact is built for an operator to read at a glance:
   `MASKING_REGEX_LIST_JSON` patterns are redacted before evidence leaves a
   collector or reaches an LLM.
 
-## Run:ai MCP sidecar
+## Run:ai MCP Service
 
 When `RUNAI_MCP_URL` is set, the runai collector and the runai drill-down agent
 reach the [runai-mcp](https://github.com/sejongjeong/runai-mcp) server (deployed
-as a sidecar behind mcp-proxy) for spec-aware access to the 426 Run:ai APIs. The
-Helm chart runs the sidecar and sets the URL by default (`runaiMcp.enabled:
+as a ClusterIP service behind mcp-proxy) for spec-aware access to the 426 Run:ai APIs. The
+Helm chart runs the service and sets the URL by default (`runaiMcp.enabled:
 true`). Any failure falls back to the fixed-endpoint direct-HTTP collector —
 strictly additive, never breaks analysis.
 

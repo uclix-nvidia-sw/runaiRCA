@@ -1,8 +1,8 @@
-# Sidecar image for the Run:ai MCP integration.
+# Image for the Run:ai MCP integration.
 #
 # runai-mcp (github.com/sejongjeong/runai-mcp) is a stdio-only MCP server, so it
 # runs behind mcp-proxy which exposes it over streamable HTTP for the RCA agent
-# (RUNAI_MCP_URL=http://localhost:8809/mcp). Auth (RUNAI_CLIENT_ID/SECRET,
+# (RUNAI_MCP_URL=http://<release>-runai-mcp:8809/mcp). Auth (RUNAI_CLIENT_ID/SECRET,
 # RUNAI_API_BASE_URL) is injected as env by the chart from the runai-rca secret.
 #
 # Build:  docker build -t <registry>/runai-mcp:latest ./runai-mcp
@@ -34,7 +34,7 @@ COPY --from=build /app/package.json ./package.json
 # The server reads the OpenAPI spec at runtime — index.js resolves
 # `<dist>/../spec/saas-latest.yaml` and process.exit(1)s if it's missing.
 # tsc does NOT emit the YAML into dist, so copy the spec dir explicitly or the
-# sidecar CrashLoopBackOffs on startup ("Failed to build registry").
+# container CrashLoopBackOffs on startup ("Failed to build registry").
 COPY --from=build /app/spec ./spec
 # Non-root; the chart also applies its securityContext.
 USER 1000

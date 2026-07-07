@@ -2,12 +2,12 @@
 
 When RUNAI_MCP_URL is set, the Run:ai collector pulls its context through the
 runai-mcp server's `call_runai_api` tool (426 Run:ai APIs, spec-aware, auto-authed
-in the sidecar) instead of the fixed curl endpoints. ANY failure — the mcp package
-not installed, the sidecar unreachable, a tool error, an unparseable result —
+by the managed service) instead of the fixed curl endpoints. ANY failure — the mcp package
+not installed, the service unreachable, a tool error, an unparseable result —
 returns None so the caller falls back to the direct-HTTP collector. The MCP path is
 strictly additive and never breaks analysis.
 
-The runai-mcp server is stdio-only; deploy it as a sidecar behind a stdio->HTTP
+The runai-mcp server is stdio-only; deploy it behind a stdio->HTTP
 bridge (e.g. mcp-proxy) and point RUNAI_MCP_URL at the bridge's streamable-HTTP
 endpoint (http://localhost:<port>/mcp).
 """
@@ -35,7 +35,7 @@ async def gather_runai_via_mcp(
 
 
 async def _gather(settings: Settings, target: AnalysisTarget) -> list[dict[str, Any]] | None:
-    # Lazy import so the agent runs without the `mcp` package until the sidecar ships.
+    # Lazy import so the agent runs without the `mcp` package until MCP is configured.
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
