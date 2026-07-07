@@ -2284,6 +2284,16 @@ td span.occurrence-pill {
   margin-top: 0.65rem;
 }
 
+/* Markdown-rendered artifact summary: keep it tight like the old <p>, and let the
+   backend's **bold** signals stand out via weight (emphasis lives in the text). */
+.artifact-summary p {
+  margin: 0;
+}
+
+.artifact-summary strong {
+  font-weight: 700;
+}
+
 .artifact pre {
   max-height: 16rem;
   overflow: auto;

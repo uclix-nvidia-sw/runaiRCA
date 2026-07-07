@@ -19,7 +19,7 @@ import re
 from dataclasses import replace
 from typing import Any
 
-from app.collectors.base import CollectorResult, artifact, salient_markers
+from app.collectors.base import CollectorResult, artifact, salient_markers, signals_line
 from app.collectors.kubernetes import _READ_KINDS, k8s_read, kind_lookup_title, kubectl_repr
 from app.config import Settings
 from app.llm import complete_json, token_budget_exceeded, token_budget_warning
@@ -425,7 +425,7 @@ async def investigate(
             if error:
                 summary = str(error)
             elif markers:
-                summary = ("주요 신호: " if language == "ko" else "signals: ") + ", ".join(markers)
+                summary = signals_line(markers, language)
             else:
                 summary = (
                     "특이 신호 없음 (HTTP {code})"

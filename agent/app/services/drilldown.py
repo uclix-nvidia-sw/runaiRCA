@@ -31,7 +31,13 @@ import logging
 import re
 from typing import Any
 
-from app.collectors.base import AnalysisTarget, CollectorResult, artifact, salient_markers
+from app.collectors.base import (
+    AnalysisTarget,
+    CollectorResult,
+    artifact,
+    salient_markers,
+    signals_line,
+)
 from app.collectors.http_json import get_json
 from app.collectors.kubernetes import (
     _READ_KINDS,
@@ -121,10 +127,9 @@ async def _drill_one(
                 markers = salient_markers(outcome.get("result"))
                 summary = str(outcome.get("summary") or outcome.get("error") or name)
                 if markers:
-                    label = (
-                        "주요 신호" if getattr(settings, "language", "en") == "ko" else "signals"
+                    summary = (
+                        f"{summary} — {signals_line(markers, getattr(settings, 'language', 'en'))}"
                     )
-                    summary = f"{summary} — {label}: {', '.join(markers)}"
                 result.artifacts.append(
                     artifact(
                         agent=result.agent,

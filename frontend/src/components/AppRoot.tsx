@@ -36,7 +36,7 @@ import {
   unarchiveIncident,
 } from '../api';
 import nvidiaLogo from '../assets/nvidia-logo.svg';
-import { CopyableBlock, highlightSegments } from './common/UiParts';
+import { CopyableBlock } from './common/UiParts';
 import { AnalysisDashboard } from './dashboards/AnalysisDashboard';
 import { AlertsDashboard } from './dashboards/AlertsDashboard';
 import { IncidentsDashboard } from './dashboards/IncidentsDashboard';
@@ -1238,7 +1238,12 @@ function ArtifactResult({ artifact }: { artifact: Artifact }) {
       </button>
       {open && (
         <div className="artifact-body">
-          <p>{highlightSegments(artifact.summary ?? '', artifact.highlights)}</p>
+          {/* Emphasis (salient signals) is baked into the summary text as markdown
+              bold by the backend, so it also survives Word export / raw JSON — render
+              it as markdown instead of overlaying a frontend-only red highlight. */}
+          <div className="artifact-summary">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{artifact.summary ?? ''}</ReactMarkdown>
+          </div>
           {queryItems.length > 0 ? (
             <QueryResultList items={queryItems} highlights={artifact.highlights} />
           ) : (
