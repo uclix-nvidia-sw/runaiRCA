@@ -33,10 +33,15 @@ spec:
         {{- with $podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with $podAnnotations }}
       annotations:
+        # Roll the pod when the secret changes so rotated credentials (LLM/Run:ai
+        # keys) are picked up — env from secretKeyRef is frozen at pod start, so
+        # without this a `helm upgrade` that only changes the secret leaves the
+        # running pod using the old value.
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with $podAnnotations }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
     spec:
       serviceAccountName: {{ include "runai-rca.agent.serviceAccountName" . }}
       automountServiceAccountToken: {{ .Values.agent.automountServiceAccountToken }}
