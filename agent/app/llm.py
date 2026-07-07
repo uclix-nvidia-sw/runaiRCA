@@ -186,8 +186,11 @@ async def complete_with_error(
     if not llm_configured(settings, selected_model):
         return None, "LLM is not configured"
     # NAT owns only the default app model; explicit stage model overrides stay on HTTP.
+    # No httpx fallback on purpose: while validating the NAT/langchain litellm client
+    # we want its failures to surface (error + English report), not be masked by a
+    # silent fallback — otherwise you can't tell whether langchain actually works.
     if _nat_client.get() is not None and selected_model == settings.llm_model:
-        text, error = await _complete_with_nat_client(
+        return await _complete_with_nat_client(
             settings,
             system=system,
             user=user,
@@ -195,12 +198,6 @@ async def complete_with_error(
             max_tokens=max_tokens,
             model=selected_model,
         )
-        if text is not None:
-            return text, error
-        # The NAT/langchain client failed — fall through to the proven httpx path so
-        # a transport misconfiguration never silently kills every analysis (English
-        # fallback, no drill-down). The NAT client is the primary; httpx is the net.
-        _log.warning("NAT LLM client failed (%s); falling back to httpx transport", error)
     payload: dict[str, Any] = {
         "model": selected_model,
         "messages": [

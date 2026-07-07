@@ -84,33 +84,31 @@ async def test_explicit_model_override_uses_http(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_nat_client_failure_falls_back_to_http(monkeypatch) -> None:
+async def test_nat_client_failure_surfaces_and_does_not_use_http(monkeypatch) -> None:
     settings = _settings()
 
     class BrokenClient:
         async def ainvoke(self, messages):  # litellm "LLM Provider NOT provided" etc.
             raise RuntimeError("LLM Provider NOT provided")
 
-    captured = {}
+    called = {"http": False}
 
     async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
-        captured["url"] = url
-        return SimpleNamespace(
-            ok=True,
-            data={"choices": [{"message": {"content": '{"http": true}'}}], "usage": {}},
-        )
+        called["http"] = True
+        return SimpleNamespace(ok=True, data={"choices": []})
 
     monkeypatch.setattr("app.llm.post_json", fake_post_json)
     token = llm.set_nat_client(BrokenClient())
     try:
-        data = await llm.complete_json(settings, system="system", user="user")
+        text, error = await llm.complete_with_error(settings, system="system", user="user")
     finally:
         llm.reset_nat_client(token)
 
-    # Default model + broken NAT client → falls back to the proven httpx path,
-    # so a transport misconfiguration never leaves the analysis with no LLM.
-    assert data == {"http": True}
-    assert captured["url"] == "https://llm.local/v1/chat/completions"
+    # langchain-only while validating: a NAT client failure surfaces as an error and
+    # does NOT silently fall back to httpx (which would mask whether langchain works).
+    assert text is None
+    assert error
+    assert called["http"] is False
 
 
 @pytest.mark.asyncio
