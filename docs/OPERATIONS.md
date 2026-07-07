@@ -118,6 +118,42 @@ not an incoming webhook (`chat.postMessage` returns the `ts` needed to thread).
 - The **Open Incident** button needs `DASHBOARD_URL` set. The **Re-analyze**
   button needs `SLACK_APP_TOKEN` (Socket Mode + Interactivity enabled in the app).
 
+### Slack notifications fail with invalid_auth
+
+Symptom: backend logs show `slack socket mode connected`, but every completed
+analysis logs `slack notify failed for incident ...: slack API error:
+invalid_auth`. Socket Mode can still work because it uses the app-level
+`SLACK_APP_TOKEN` (`xapp-`), while posting uses the bot token
+`SLACK_BOT_TOKEN` (`xoxb-`).
+
+The usual causes are a Slack app reinstall, which reissues the Bot User OAuth
+Token and invalidates the old `xoxb-`, or an `xapp-` token pasted into the bot
+token slot.
+
+Diagnose on the cluster:
+
+```bash
+SECRET=$(kubectl get secret -n runai-rca -o name | grep -i secret | head -1)
+kubectl get $SECRET -n runai-rca -o jsonpath='{.data.SLACK_BOT_TOKEN}' | base64 -d | cut -c1-5   # expect xoxb-
+TOKEN=$(kubectl get $SECRET -n runai-rca -o jsonpath='{.data.SLACK_BOT_TOKEN}' | base64 -d)
+curl -s -H "Authorization: Bearer $TOKEN" https://slack.com/api/auth.test                        # {"ok":false,"error":"invalid_auth"} = reissue needed
+```
+
+Fix: reissue the Bot User OAuth Token in `api.slack.com/apps` -> **OAuth &
+Permissions**. Reinstalling the app rotates the `xoxb-` token. Then update the
+cluster secret:
+
+```bash
+helm upgrade --reuse-values --set secrets.slackBotToken='xoxb-...' <release> <chart>
+# or:
+kubectl patch secret $SECRET -n runai-rca --type merge -p '{"stringData":{"SLACK_BOT_TOKEN":"xoxb-..."}}'
+kubectl rollout restart deploy/<backend> -n runai-rca
+```
+
+Verify `/healthz` reports `slack.auth=ok` and a fresh completed analysis reaches
+the channel. The backend also logs a transition line such as `slack:
+notifications are FAILING (invalid_auth) since ...` when posting first fails.
+
 ## Evidence looks thin
 
 If a collector card is `unavailable` or a report says *"증거를 찾기 어렵습니다"*:

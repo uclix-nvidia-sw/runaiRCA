@@ -29,6 +29,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -46,11 +47,28 @@ type SlackNotifier struct {
 	channelID          string
 	dashboard          string
 	apiURL             string
+	authTestURL        string
 	connectionsOpenURL string
 	client             *http.Client
 	// ponytail: one global mutex serializes deliveries so the root message is
 	// created exactly once per incident; per-incident locks if volume matters.
 	mu sync.Mutex
+
+	stateMu             sync.Mutex
+	lastOKAt            time.Time
+	lastErr             string
+	lastErrAt           time.Time
+	consecutiveFailures int
+}
+
+type SlackHealth struct {
+	Configured          bool   `json:"configured"`
+	BotTokenShape       string `json:"bot_token_shape"`
+	Auth                string `json:"auth"`
+	LastError           string `json:"last_error"`
+	LastErrorAt         string `json:"last_error_at"`
+	LastOKAt            string `json:"last_ok_at"`
+	ConsecutiveFailures int    `json:"consecutive_failures"`
 }
 
 func NewSlackNotifierFromEnv() *SlackNotifier {
@@ -60,6 +78,7 @@ func NewSlackNotifierFromEnv() *SlackNotifier {
 		channelID:          strings.TrimSpace(os.Getenv("SLACK_CHANNEL_ID")),
 		dashboard:          strings.TrimSpace(os.Getenv("DASHBOARD_URL")),
 		apiURL:             "https://slack.com/api/chat.postMessage",
+		authTestURL:        "https://slack.com/api/auth.test",
 		connectionsOpenURL: "https://slack.com/api/apps.connections.open",
 		client:             &http.Client{Timeout: 10 * time.Second},
 	}
@@ -68,6 +87,101 @@ func NewSlackNotifierFromEnv() *SlackNotifier {
 // IsConfigured is nil-safe so tests building Server literals never notify.
 func (n *SlackNotifier) IsConfigured() bool {
 	return n != nil && n.botToken != "" && n.channelID != ""
+}
+
+func (n *SlackNotifier) Validate() error {
+	if n == nil {
+		return nil
+	}
+	if n.appToken != "" && !strings.HasPrefix(n.appToken, "xapp-") {
+		log.Printf("slack: SLACK_APP_TOKEN does not look like an app-level token (xapp-)")
+	}
+	if n.botToken == "" {
+		return nil
+	}
+	if !strings.HasPrefix(n.botToken, "xoxb-") {
+		msg := "SLACK_BOT_TOKEN does not look like a bot token (xoxb-)"
+		if strings.HasPrefix(n.botToken, "xapp-") {
+			msg += "; an app-level token (xapp-) was pasted into the bot-token slot"
+		}
+		err := errors.New(msg)
+		n.recordSlackFailure(err)
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, first(n.authTestURL, "https://slack.com/api/auth.test"), nil)
+	if err != nil {
+		err = fmt.Errorf("validate SLACK_BOT_TOKEN with Slack: %w", err)
+		n.recordSlackFailure(err)
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+n.botToken)
+	resp, err := n.httpClient().Do(req)
+	if err != nil {
+		err = fmt.Errorf("validate SLACK_BOT_TOKEN with Slack: %w", err)
+		n.recordSlackFailure(err)
+		return err
+	}
+	defer resp.Body.Close()
+	var parsed struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+		Team  string `json:"team"`
+		User  string `json:"user"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		err = fmt.Errorf("validate SLACK_BOT_TOKEN with Slack: parse auth.test response: %w", err)
+		n.recordSlackFailure(err)
+		return err
+	}
+	if !parsed.OK {
+		err := fmt.Errorf("SLACK_BOT_TOKEN rejected by Slack (%s) — if the Slack app was reinstalled the xoxb- token was reissued; update the secret", first(parsed.Error, "unknown"))
+		n.recordSlackFailure(err)
+		return err
+	}
+	n.recordSlackOK(time.Now().UTC())
+	log.Printf("slack: bot token valid (team=%s user=%s)", parsed.Team, parsed.User)
+	return nil
+}
+
+func (n *SlackNotifier) Health() SlackHealth {
+	if n == nil {
+		return SlackHealth{BotTokenShape: "missing", Auth: "unknown"}
+	}
+	h := SlackHealth{
+		Configured:    n.IsConfigured(),
+		BotTokenShape: n.botTokenShape(),
+		Auth:          "unknown",
+	}
+	n.stateMu.Lock()
+	defer n.stateMu.Unlock()
+	if !n.lastOKAt.IsZero() {
+		h.LastOKAt = n.lastOKAt.UTC().Format(time.RFC3339)
+	}
+	if !n.lastErrAt.IsZero() {
+		h.LastError = n.lastErr
+		h.LastErrorAt = n.lastErrAt.UTC().Format(time.RFC3339)
+	}
+	h.ConsecutiveFailures = n.consecutiveFailures
+	switch {
+	case n.failingLocked():
+		h.Auth = "failed"
+	case !n.lastOKAt.IsZero():
+		h.Auth = "ok"
+	}
+	return h
+}
+
+func (n *SlackNotifier) botTokenShape() string {
+	switch {
+	case n == nil || n.botToken == "":
+		return "missing"
+	case strings.HasPrefix(n.botToken, "xoxb-"):
+		return "xoxb"
+	case strings.HasPrefix(n.botToken, "xapp-"):
+		return "xapp"
+	default:
+		return "other"
+	}
 }
 
 // slackReplySources are run sources that represent an operator asking for a
@@ -94,14 +208,14 @@ func (s *Server) deliverSlackAnalysis(run AnalysisRun, incidentID string) {
 	if threadTS != "" && !slackReplySources[run.Source] {
 		return
 	}
-	seq, ok := s.store.BumpIncidentAnalysisSeq(incidentID)
-	if !ok {
-		return
-	}
+	seq := detail.AnalysisSeq + 1
 	msg := s.slack.buildAnalysisMessage(detail, run, seq, threadTS)
 	ts, err := s.slack.post(msg)
 	if err != nil {
 		log.Printf("slack notify failed for incident %s: %v", incidentID, err)
+		return
+	}
+	if _, ok := s.store.BumpIncidentAnalysisSeq(incidentID); !ok {
 		return
 	}
 	if threadTS == "" {
@@ -112,21 +226,26 @@ func (s *Server) deliverSlackAnalysis(run AnalysisRun, incidentID string) {
 func (n *SlackNotifier) post(msg map[string]any) (string, error) {
 	payload, err := json.Marshal(msg)
 	if err != nil {
-		return "", fmt.Errorf("marshal slack message: %w", err)
+		err = fmt.Errorf("marshal slack message: %w", err)
+		n.recordSlackFailure(err)
+		return "", err
 	}
 	req, err := http.NewRequest(http.MethodPost, n.apiURL, bytes.NewReader(payload))
 	if err != nil {
+		n.recordSlackFailure(err)
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+n.botToken)
-	resp, err := n.client.Do(req)
+	resp, err := n.httpClient().Do(req)
 	if err != nil {
+		n.recordSlackFailure(err)
 		return "", err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
+		n.recordSlackFailure(err)
 		return "", err
 	}
 	var parsed struct {
@@ -135,12 +254,64 @@ func (n *SlackNotifier) post(msg map[string]any) (string, error) {
 		TS    string `json:"ts"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", fmt.Errorf("parse slack response: %w", err)
+		err = fmt.Errorf("parse slack response: %w", err)
+		n.recordSlackFailure(err)
+		return "", err
 	}
 	if !parsed.OK {
-		return "", fmt.Errorf("slack API error: %s", parsed.Error)
+		err := fmt.Errorf("slack API error: %s", first(parsed.Error, "unknown"))
+		n.recordSlackFailure(err)
+		return "", err
 	}
+	n.recordSlackOK(time.Now().UTC())
 	return parsed.TS, nil
+}
+
+func (n *SlackNotifier) httpClient() *http.Client {
+	if n.client != nil {
+		return n.client
+	}
+	return &http.Client{Timeout: 10 * time.Second}
+}
+
+func (n *SlackNotifier) recordSlackOK(at time.Time) {
+	n.stateMu.Lock()
+	wasFailing := n.failingLocked()
+	n.lastOKAt = at
+	n.consecutiveFailures = 0
+	n.stateMu.Unlock()
+	if wasFailing {
+		log.Printf("slack: notifications recovered at %s", at.UTC().Format(time.RFC3339))
+	}
+}
+
+func (n *SlackNotifier) recordSlackFailure(err error) {
+	at := time.Now().UTC()
+	n.stateMu.Lock()
+	wasFailing := n.failingLocked()
+	n.lastErr = err.Error()
+	n.lastErrAt = at
+	n.consecutiveFailures++
+	n.stateMu.Unlock()
+	if !wasFailing {
+		log.Printf("slack: notifications are FAILING (%s) since %s — check SLACK_BOT_TOKEN (see docs/OPERATIONS.md runbook)", slackFailureReason(err), at.Format(time.RFC3339))
+	}
+}
+
+func (n *SlackNotifier) failingLocked() bool {
+	return !n.lastErrAt.IsZero() && (n.lastOKAt.IsZero() || !n.lastOKAt.After(n.lastErrAt))
+}
+
+func slackFailureReason(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "invalid_auth"):
+		return "invalid_auth"
+	case strings.Contains(msg, "does not look like a bot token"):
+		return "token_shape"
+	default:
+		return "request_failed"
+	}
 }
 
 // buildAnalysisMessage renders a root message (big title + severity color

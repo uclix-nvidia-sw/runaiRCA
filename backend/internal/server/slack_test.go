@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -45,6 +47,76 @@ func TestRecommendedActionsExcerpt(t *testing.T) {
 	}
 	if got := recommendedActionsExcerpt("## Root Cause\n\nonly"); got != "" {
 		t.Fatalf("expected empty excerpt without heading, got %q", got)
+	}
+}
+
+func TestSlackValidateSuccess(t *testing.T) {
+	logs := captureLogs(t)
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer xoxb-valid" {
+			t.Fatalf("Authorization = %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "team": "SRE", "user": "runai-rca"})
+	}))
+	defer stub.Close()
+
+	n := &SlackNotifier{botToken: "xoxb-valid", authTestURL: stub.URL, client: stub.Client()}
+	if err := n.Validate(); err != nil {
+		t.Fatalf("Validate returned error: %v", err)
+	}
+	if got := logs.String(); !strings.Contains(got, "slack: bot token valid (team=SRE user=runai-rca)") {
+		t.Fatalf("expected identity log, got %q", got)
+	}
+	if health := n.Health(); health.Auth != "ok" || health.LastOKAt == "" {
+		t.Fatalf("expected ok health after validate, got %+v", health)
+	}
+}
+
+func TestSlackValidateInvalidAuth(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "invalid_auth"})
+	}))
+	defer stub.Close()
+
+	n := &SlackNotifier{botToken: "xoxb-dead", authTestURL: stub.URL, client: stub.Client()}
+	err := n.Validate()
+	if err == nil {
+		t.Fatal("expected invalid_auth error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"SLACK_BOT_TOKEN", "invalid_auth", "reinstalled", "reissued"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error %q missing %q", msg, want)
+		}
+	}
+	if health := n.Health(); health.Auth != "failed" || health.ConsecutiveFailures != 1 || !strings.Contains(health.LastError, "invalid_auth") {
+		t.Fatalf("expected failed health after invalid_auth, got %+v", health)
+	}
+}
+
+func TestSlackValidateDetectsAppTokenInBotSlot(t *testing.T) {
+	var called bool
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer stub.Close()
+
+	n := &SlackNotifier{botToken: "xapp-wrong", authTestURL: stub.URL, client: stub.Client()}
+	err := n.Validate()
+	if err == nil {
+		t.Fatal("expected token shape error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "SLACK_BOT_TOKEN does not look like a bot token (xoxb-)") ||
+		!strings.Contains(msg, "app-level token (xapp-) was pasted into the bot-token slot") {
+		t.Fatalf("unexpected shape error: %q", msg)
+	}
+	if called {
+		t.Fatal("Validate should not call Slack when the bot token shape is xapp-")
+	}
+	if health := n.Health(); health.BotTokenShape != "xapp" || health.Auth != "failed" {
+		t.Fatalf("expected xapp/failed health, got %+v", health)
 	}
 }
 
@@ -147,6 +219,113 @@ func TestSlackRootThenReplyFlow(t *testing.T) {
 	}
 }
 
+func TestSlackHealthReflectsFailedAndRecoveredPosts(t *testing.T) {
+	calls := 0
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "invalid_auth"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ts": "1710000000.000001"})
+	}))
+	defer stub.Close()
+
+	server := &Server{
+		store: NewStore(),
+		slack: &SlackNotifier{botToken: "xoxb-test", channelID: "C1", apiURL: stub.URL, client: stub.Client()},
+	}
+	if _, err := server.slack.post(map[string]any{"channel": "C1", "text": "one"}); err == nil {
+		t.Fatal("expected failed post")
+	}
+	failed := getHealth(t, server).Slack
+	if failed.Auth != "failed" || failed.BotTokenShape != "xoxb" || failed.ConsecutiveFailures != 1 || failed.LastErrorAt == "" {
+		t.Fatalf("expected failed slack health, got %+v", failed)
+	}
+
+	if _, err := server.slack.post(map[string]any{"channel": "C1", "text": "two"}); err != nil {
+		t.Fatalf("expected recovered post: %v", err)
+	}
+	ok := getHealth(t, server).Slack
+	if ok.Auth != "ok" || ok.ConsecutiveFailures != 0 || ok.LastOKAt == "" {
+		t.Fatalf("expected ok slack health after success, got %+v", ok)
+	}
+}
+
+func TestSlackTransitionLogsOncePerStateChange(t *testing.T) {
+	logs := captureLogs(t)
+	calls := 0
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 3 {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ts": "1710000000.000003"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "invalid_auth"})
+	}))
+	defer stub.Close()
+
+	n := &SlackNotifier{botToken: "xoxb-test", channelID: "C1", apiURL: stub.URL, client: stub.Client()}
+	for i := 0; i < 4; i++ {
+		_, _ = n.post(map[string]any{"channel": "C1", "text": fmt.Sprintf("msg-%d", i)})
+	}
+	got := logs.String()
+	if count := strings.Count(got, "slack: notifications are FAILING (invalid_auth)"); count != 2 {
+		t.Fatalf("expected 2 failing transition logs, got %d: %s", count, got)
+	}
+	if count := strings.Count(got, "slack: notifications recovered"); count != 1 {
+		t.Fatalf("expected 1 recovery log, got %d: %s", count, got)
+	}
+}
+
+func TestSlackFailedPostDoesNotBurnAnalysisSequence(t *testing.T) {
+	var payloads []map[string]any
+	calls := 0
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var msg map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&msg)
+		payloads = append(payloads, msg)
+		calls++
+		if calls == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "invalid_auth"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ts": "1710000000.000002"})
+	}))
+	defer stub.Close()
+
+	server := &Server{
+		store: NewStore(),
+		hub:   NewHub(),
+		slack: &SlackNotifier{botToken: "xoxb-test", channelID: "C1", apiURL: stub.URL, client: stub.Client()},
+	}
+	incident, record := seedAlert(t, server, "fp-slack-failed-seq")
+	run := AnalysisRun{
+		RunID:           "ANL-slack-seq",
+		Source:          "auto",
+		Status:          "complete",
+		IncidentID:      incident.IncidentID,
+		AlertID:         record.AlertID,
+		AnalysisSummary: "first try fails",
+		AnalysisQuality: "high",
+	}
+
+	server.deliverSlackAnalysis(run, incident.IncidentID)
+	detail, _ := server.store.IncidentDetail(incident.IncidentID)
+	if detail.AnalysisSeq != 0 || detail.SlackThreadTS != "" {
+		t.Fatalf("failed delivery should not advance Slack state, got %+v", detail.Incident)
+	}
+
+	server.deliverSlackAnalysis(run, incident.IncidentID)
+	detail, _ = server.store.IncidentDetail(incident.IncidentID)
+	if detail.AnalysisSeq != 1 || detail.SlackThreadTS == "" {
+		t.Fatalf("successful retry should store first Slack delivery, got %+v", detail.Incident)
+	}
+	if len(payloads) != 2 || !strings.Contains(payloads[1]["text"].(string), "Initial Analysis") {
+		t.Fatalf("retry should still be labeled Initial Analysis, got %+v", payloads)
+	}
+}
+
 // TestSlackReanalyzeButtonClick drives the Socket Mode interactive payload end
 // to end: button click → manual incident run → immediate thread note → the
 // completed re-analysis replying into the same thread.
@@ -235,4 +414,31 @@ func TestSlackReanalyzeButtonClick(t *testing.T) {
 	if len(snapshot()) != 3 {
 		t.Fatalf("unrelated actions should not post messages")
 	}
+}
+
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+	return &buf
+}
+
+func getHealth(t *testing.T, server *Server) struct {
+	Slack SlackHealth `json:"slack"`
+} {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	server.routes().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("healthz status = %d", rr.Code)
+	}
+	var body struct {
+		Slack SlackHealth `json:"slack"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode healthz: %v", err)
+	}
+	return body
 }

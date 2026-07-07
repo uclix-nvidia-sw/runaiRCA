@@ -319,6 +319,10 @@ func Run() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if err := server.slack.Validate(); err != nil {
+		log.Printf("slack: startup validation failed: %v", err)
+	}
+
 	go server.runBackfill(ctx)
 	go server.runStaleRunReaper(ctx)
 	go server.runTrashPurge(ctx)
@@ -415,6 +419,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":   "ok",
 			"database": s.store.databaseHealth(),
+			"slack":    s.slack.Health(),
 		})
 	case r.Method == http.MethodPost && r.URL.Path == "/webhook/alertmanager":
 		s.handleAlertmanager(w, r)
