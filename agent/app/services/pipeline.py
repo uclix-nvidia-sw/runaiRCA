@@ -27,6 +27,7 @@ from app.llm import (
     complete,
     complete_json,
     llm_configured,
+    parse_json_object,
     token_budget_exceeded,
     token_budget_warning,
 )
@@ -145,6 +146,26 @@ async def plan_stage(state: PipelineState) -> PipelineState:
         state.kg_context.as_dict(),
         list(state.request.similar_incidents),
     )
+    # Alert labels frequently name a pod the controller already replaced (grouped
+    # CrashLoop occurrences) and carry no node label — so kubernetes GETs 404 and
+    # the system agent skips node/kernel evidence entirely. Re-resolve a LIVE pod
+    # and its node ONCE here; every collector then scopes off the plan.
+    seed_pod = state.plan.pod or state.target.pod
+    if state.target.namespace and seed_pod:
+        from app.collectors.kubernetes import resolve_live_pod_node
+
+        live_pod, live_node = await resolve_live_pod_node(
+            state.settings,
+            state.target.namespace,
+            seed_pod,
+            list(state.request.occurrence_pods),
+        )
+        if live_pod and live_pod != seed_pod:
+            _log.info("plan: stale pod %s re-resolved to live pod %s", seed_pod, live_pod)
+        if live_pod:
+            state.plan.pod = live_pod
+        # Never override an explicit node label from the alert itself.
+        state.plan.node = state.plan.node or live_node
     state.progress.emit(
         "planning",
         "Investigation plan built",
@@ -443,21 +464,26 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
     # Korean LLM synthesis (preferred when language == "ko" and LLM configured):
     # rewrite summary + detail grounded STRICTLY in the evidence just gathered.
     # Falls back to the deterministic English report on any failure.
-    if getattr(settings, "language", "en") == "ko" and llm_configured(
-        settings, settings.llm_model_synthesis
-    ):
-        synth = await _synthesize_korean(
-            settings,
-            request=request,
-            results=state.results,
-            plan=plan,
-            root_cause_candidates=state.root_cause_candidates,
-            kg_context=state.kg_context.as_dict(),
-            graph_fixes=state.graph_fixes,
-            fallback_detail=state.detail,
-        )
+    if getattr(settings, "language", "en") == "ko":
+        synth = None
+        if llm_configured(settings, settings.llm_model_synthesis):
+            synth = await _synthesize_korean(
+                settings,
+                request=request,
+                results=state.results,
+                plan=plan,
+                root_cause_candidates=state.root_cause_candidates,
+                kg_context=state.kg_context.as_dict(),
+                graph_fixes=state.graph_fixes,
+                fallback_detail=state.detail,
+            )
         if synth:
             state.summary, state.detail = synth
+        elif llm_configured(settings):
+            # Synthesis fell back to the deterministic report, which splices the
+            # curated KB playbook in verbatim ENGLISH — translate that one
+            # section so the operator guidance still reads in their language.
+            state.detail = await _translate_playbook_ko(settings, state.detail)
 
     # Self-check caveat (optional hook) + re-analysis note — inserted BEFORE the
     # appendix so the document reads problem -> cause -> actions -> checks -> appendix.
@@ -775,26 +801,44 @@ async def _synthesize_korean(
 
 
 async def _complete_synthesis_json(settings: Settings, *, system: str, user: str) -> dict | None:
-    text = await complete(
-        settings,
-        system=system + "\n\nJSON 객체 하나로만, 프롬프트나 코드펜스 없이 응답하세요.",
-        user=user,
-        temperature=0.2,
-        model=settings.llm_model_synthesis,
-    )
-    if not text:
-        return None
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("\n", 1)[-1] if "\n" in cleaned else cleaned
-        cleaned = cleaned.removeprefix("json").strip()
-        if cleaned.endswith("```"):
-            cleaned = cleaned[: cleaned.rfind("```")].strip()
-    try:
-        parsed = json.loads(cleaned)
-    except (ValueError, TypeError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
+    """Synthesis JSON with ONE retry: a single malformed reply must not silently
+    downgrade the whole report to the deterministic English fallback.
+
+    max_tokens is EXPLICIT: without it the gateway's own completion cap applies,
+    and a full Korean report JSON that gets cut mid-string parses as nothing —
+    the LLM "worked" (call succeeded, tokens billed) while the report silently
+    fell back to English. The log names which way it failed."""
+    instruction = "\n\nJSON 객체 하나로만, 프롬프트나 코드펜스 없이 응답하세요."
+    for attempt in range(2):
+        text = await complete(
+            settings,
+            system=system
+            + instruction
+            + (
+                "\n(직전 응답이 유효한 JSON 객체가 아니었습니다 — 이번에는 반드시 "
+                "JSON 객체 하나만 출력하세요.)"
+                if attempt
+                else ""
+            ),
+            user=user,
+            temperature=0.2,
+            max_tokens=4096,
+            model=settings.llm_model_synthesis,
+        )
+        parsed = parse_json_object(text or "")
+        if parsed is not None:
+            return parsed
+        if text is None:
+            _log.warning("korean synthesis call failed (attempt %d): no reply", attempt + 1)
+        else:
+            truncated = not text.rstrip().endswith("}")
+            _log.warning(
+                "korean synthesis reply was not valid JSON (attempt %d)%s: %r",
+                attempt + 1,
+                " — looks TRUNCATED (completion cap?)" if truncated else "",
+                text[:160],
+            )
+    return None
 
 
 def _quality_from(results: list[CollectorResult]) -> str:
@@ -1001,7 +1045,7 @@ def _detail_from(
     # THIS incident. (Kept in prompts.py for the NAT workflow's system prompt.)
     if not agent_souls:
         lines.append("- Agent role contract file was not loaded; fallback guidance was used.")
-    lines.extend(_affected_pods_lines(request))
+    lines.extend(_affected_pods_lines(request, language))
     lines.extend(["", "### Troubleshooting Playbook", ""])
     lines.extend(
         _playbook_lines(
@@ -1027,6 +1071,39 @@ def _detail_from(
         ]
     )
     return "\n".join(lines)
+
+
+async def _translate_playbook_ko(settings: Settings, detail: str) -> str:
+    """Translate ONLY the Troubleshooting Playbook section to Korean.
+
+    The deterministic fallback report splices curated KB text (known issues /
+    failure-mode actions) in verbatim English. One bounded LLM call fixes the
+    operator-facing section; on any failure the English original stays (honest
+    degradation, same as synthesis itself)."""
+    marker = "\n### Troubleshooting Playbook\n"
+    start = detail.find(marker)
+    if start < 0:
+        return detail
+    body_start = start + len(marker)
+    end = detail.find("\n### ", body_start)
+    if end < 0:
+        end = len(detail)
+    block = detail[body_start:end].strip()
+    if not block:
+        return detail
+    system = (
+        "다음 마크다운 트러블슈팅 지침을 자연스러운 한국어로 번역하세요. "
+        "목록 구조·볼드·들여쓰기를 그대로 유지하고, 백틱 안의 명령어, 리소스/메트릭 "
+        "이름, 제품명(Run:ai, Prometheus, Thanos 등), 버전 표기는 원문 그대로 두세요. "
+        "설명을 추가하지 말고 번역문만 출력하세요."
+    )
+    try:
+        translated = await complete(settings, system=system, user=block, max_tokens=1600)
+    except Exception:  # noqa: BLE001 - translation is best-effort polish
+        return detail
+    if not translated or not translated.strip():
+        return detail
+    return f"{detail[:body_start]}\n{translated.strip()}\n{detail[end:]}"
 
 
 def _insert_before_appendix(detail: str, block: str) -> str:
@@ -1918,15 +1995,20 @@ def _graph_remediation_lines(graph_fixes: GraphRemediation | None) -> list[str]:
     return lines
 
 
-def _affected_pods_lines(request: AlertAnalysisRequest) -> list[str]:
+def _affected_pods_lines(request: AlertAnalysisRequest, language: str = "en") -> list[str]:
     pods = [pod.strip() for pod in request.occurrence_pods if pod and pod.strip()]
     count = request.occurrence_count
     if not pods and count <= 1:
         return []
+    ko = language == "ko"
     lines = ["", "### Affected Pods", ""]
     if count > 1:
         lines.append(
-            f"- This alert was grouped from {count} occurrence(s) of the same workload; "
+            f"- 같은 워크로드에서 {count}회 발생한 알림을 묶었습니다. 컨트롤러가 파드를 "
+            "새 이름으로 계속 재생성하므로, 아래 이름들은 개별 장애가 아니라 하나의 "
+            "순환(재시작) 워크로드로 보세요."
+            if ko
+            else f"- This alert was grouped from {count} occurrence(s) of the same workload; "
             "the controller keeps recreating pods under new names, so treat the names "
             "below as one cycling workload rather than separate failures."
         )
@@ -1934,9 +2016,14 @@ def _affected_pods_lines(request: AlertAnalysisRequest) -> list[str]:
         shown = pods[:20]
         lines.extend(f"- `{pod}`" for pod in shown)
         if len(pods) > len(shown):
-            lines.append(f"- … and {len(pods) - len(shown)} more pod(s)")
+            more = len(pods) - len(shown)
+            lines.append(f"- … 외 {more}개 파드" if ko else f"- … and {more} more pod(s)")
     else:
-        lines.append("- Individual pod names were not present on the alert labels.")
+        lines.append(
+            "- 알림 라벨에 개별 파드 이름이 없었습니다."
+            if ko
+            else "- Individual pod names were not present on the alert labels."
+        )
     return lines
 
 

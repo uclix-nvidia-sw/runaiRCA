@@ -6,7 +6,13 @@ from typing import Any
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.collectors.loki import _llm_insight
 from app.config import Settings
-from app.mcp_client import MCP_FALLBACK_WARNING, mcp_call, mcp_error, mcp_tool_json
+from app.mcp_client import (
+    MCP_FALLBACK_WARNING,
+    mcp_call,
+    mcp_error,
+    mcp_fallback_warning,
+    mcp_tool_json,
+)
 
 
 class PostgresCollector:
@@ -56,7 +62,7 @@ class PostgresCollector:
                 )
                 used_mcp = True
             except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
-                warnings.append(f"{MCP_FALLBACK_WARNING}: {exc.__class__.__name__}")
+                warnings.append(mcp_fallback_warning(exc))
         else:
             warnings.append(f"{MCP_FALLBACK_WARNING}: POSTGRES_MCP_URL not configured")
 
@@ -205,14 +211,23 @@ async def _postgres_result(
             f"{checks['active_connections']} active connection(s), "
             f"pgvector={'installed' if pgvector else 'missing'}."
         )
-    insight = await _llm_insight(settings, "Postgres diagnostics", summary, checks)
-    if insight:
-        summary = insight
+    # Owner rule: a PASSING healthcheck is NOT incident evidence. Lead with the
+    # no-evidence marker (drops it from supporting evidence / signature matching)
+    # and skip the LLM insight — only an actual DB finding earns evidence weight.
+    healthy = status == "ok"
+    confidence = "medium"
+    if healthy:
+        summary = f"{NO_EVIDENCE} {summary}"
+        confidence = "low"
+    else:
+        insight = await _llm_insight(settings, "Postgres diagnostics", summary, checks)
+        if insight:
+            summary = insight
     return CollectorResult(
         agent="postgres",
         status=status,
         summary=summary,
-        confidence="medium",
+        confidence=confidence,
         details={**checks, "used_mcp": used_mcp, "database_kind": database_kind},
         warnings=warnings,
         artifacts=[
@@ -221,7 +236,7 @@ async def _postgres_result(
                 source="postgres",
                 type="database_health",
                 status=status,
-                confidence="medium",
+                confidence=confidence,
                 query=(
                     "SELECT 1; pg_stat_activity long transaction scan; "
                     "pg_extension vector check; to_regclass RCA table check"

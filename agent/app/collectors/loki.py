@@ -9,7 +9,13 @@ from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, ar
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import complete, llm_configured
-from app.mcp_client import MCP_FALLBACK_WARNING, mcp_call, mcp_error, mcp_tool_json
+from app.mcp_client import (
+    MCP_FALLBACK_WARNING,
+    mcp_call,
+    mcp_error,
+    mcp_fallback_warning,
+    mcp_tool_json,
+)
 
 
 class LokiCollector:
@@ -103,7 +109,7 @@ class LokiCollector:
                 query_results = await _collect_loki_mcp(self._settings, queries)
                 used_mcp = True
             except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
-                warnings.append(f"{MCP_FALLBACK_WARNING}: {exc.__class__.__name__}")
+                warnings.append(mcp_fallback_warning(exc))
         else:
             warnings.append(f"{MCP_FALLBACK_WARNING}: LOKI_MCP_URL not configured")
 

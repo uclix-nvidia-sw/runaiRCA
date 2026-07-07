@@ -44,6 +44,23 @@ async def lifespan(_app: FastAPI):
             await orchestrator.start_engine()
         except Exception:  # noqa: BLE001 - startup is best-effort
             logging.getLogger(__name__).exception("failed to start NAT engine")
+    # Answer "are the agents actually on MCP?" in the FIRST lines of the pod log:
+    # one tools/list per configured MCP service; failures name the real error.
+    # Log-only (never gates startup) — services may still be coming up.
+    try:
+        from app.mcp_client import mcp_reachability
+
+        await mcp_reachability(
+            {
+                "runai": settings.runai_mcp_url,
+                "kubernetes": settings.kubernetes_mcp_url,
+                "prometheus": settings.prometheus_mcp_url,
+                "loki": settings.loki_mcp_url,
+                "postgres": settings.postgres_mcp_url,
+            }
+        )
+    except Exception:  # noqa: BLE001 - reachability report is best-effort
+        logging.getLogger(__name__).debug("mcp reachability check failed", exc_info=True)
     try:
         yield
     finally:

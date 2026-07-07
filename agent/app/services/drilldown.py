@@ -44,14 +44,19 @@ from app.collectors.kubernetes import (
     k8s_read,
     kind_lookup_title,
     kubectl_repr,
-    resolve_read_kind,
 )
 from app.collectors.loki import _loki_headers, _loki_streams, _sample_lines, loki_mcp_query
 from app.collectors.prometheus import prom_mcp_query, prom_query
 from app.collectors.runai_mcp import _tool_json, _tool_text
 from app.config import Settings
 from app.llm import complete_json, llm_configured, token_budget_exceeded, token_budget_warning
-from app.mcp_client import MCP_FALLBACK_WARNING, mcp_call, mcp_error, mcp_tool_json
+from app.mcp_client import (
+    MCP_FALLBACK_WARNING,
+    mcp_call,
+    mcp_error,
+    mcp_fallback_warning,
+    mcp_tool_json,
+)
 from app.plan import InvestigationPlan
 
 _log = logging.getLogger(__name__)
@@ -91,18 +96,34 @@ async def _drill_one(
 ) -> None:
     """One agent's bounded think->query->observe loop over its own evidence."""
     try:
+        architecture = _implicated_architecture(settings, result, target)
         history: list[dict[str, Any]] = []
-        for _ in range(max(1, settings.drilldown_max_steps)):
+        for step in range(max(1, settings.drilldown_max_steps)):
             if token_budget_exceeded(settings):
                 result.warnings.append(token_budget_warning(settings))
                 break
             decision = await complete_json(
                 settings,
                 system=_system_prompt(result.agent, tools),
-                user=_user_prompt(result, target, plan, history),
+                user=_user_prompt(result, target, plan, history, architecture),
                 model=settings.llm_model_drilldown,
             )
+            if decision is None:
+                # An LLM transport/parse failure must be distinguishable from a
+                # legitimate "done" — otherwise a dead LLM looks like a satisfied
+                # agent and nobody notices drill-down never ran (the litellm
+                # provider incident). Surface it in the report warnings.
+                result.warnings.append(
+                    f"{result.agent} drill-down stopped at step {step + 1}: "
+                    "LLM decision call failed"
+                )
+                break
             if not isinstance(decision, dict) or decision.get("action") != "query":
+                _log.info(
+                    "drilldown %s: done after %d follow-up quer(ies)",
+                    result.agent,
+                    len(history),
+                )
                 break
             queries = [
                 q
@@ -111,6 +132,12 @@ async def _drill_one(
             ][:_MAX_QUERIES_PER_STEP]
             if not queries:
                 break
+            _log.info(
+                "drilldown %s: step %d running %d quer(ies)",
+                result.agent,
+                step + 1,
+                len(queries),
+            )
             for q in queries:
                 name = str(q.get("tool"))
                 args = q.get("args") if isinstance(q.get("args"), dict) else {}
@@ -186,6 +213,7 @@ def _user_prompt(
     target: AnalysisTarget,
     plan: InvestigationPlan | None,
     history: list[dict[str, Any]],
+    architecture: list[str] | None = None,
 ) -> str:
     plan_dict = plan.as_dict() if plan else {}
     payload = {
@@ -202,7 +230,75 @@ def _user_prompt(
         ],
         "drilldown_so_far": history[-8:],
     }
-    return json.dumps(payload, default=str)[:_USER_PROMPT_CHARS]
+    if architecture:
+        # Curated platform topology for the components THIS incident implicates:
+        # what each does when broken and which dependency to check next — the
+        # "thinking material" that used to reach only the playbook renderer.
+        payload["platform_architecture"] = architecture
+    return json.dumps(payload, default=str, ensure_ascii=False)[:_USER_PROMPT_CHARS]
+
+
+def _implicated_architecture(
+    settings: Settings, result: CollectorResult, target: AnalysisTarget
+) -> list[str]:
+    """Topology lines for the platform components this incident implicates.
+
+    A component is implicated when its name appears in the target identifiers
+    (workload/pod/alert) or this agent's evidence text. Ranked by relevance —
+    target-identifier matches (the alert's actual subject) before incidental
+    evidence mentions, more specific names first, and names subsumed by a more
+    specific match are dropped — so a broad evidence sweep can't crowd the
+    subject component out of the cap. Each implicated component contributes its
+    failure effect plus its dependency check order — a deterministic slice of
+    runai_architecture.yaml, no knowledge-graph round-trip. Empty for pure
+    user-workload incidents (correct: a user's training job is not a platform
+    component)."""
+    from app.knowledge import dependency_path, load_architecture
+
+    components = load_architecture(getattr(settings, "architecture_file", ""))
+    if not components:
+        return []
+    target_text = " ".join([target.workload_name, target.pod, target.alert_name]).lower()
+    evidence_text = " ".join(
+        [result.summary or "", *(art.summary or "" for art in result.artifacts[-8:])]
+    ).lower()
+    ranked: list[tuple[int, int, str]] = []
+    for name in components:
+        lowered = name.lower()
+        if lowered in target_text:
+            ranked.append((0, -len(name), name))
+        elif lowered in evidence_text:
+            ranked.append((1, -len(name), name))
+    ranked.sort()
+    rank_of = {name: bucket for bucket, _, name in ranked}
+    implicated = [name for _, _, name in ranked]
+    # A name is subsumed only by a more specific match of EQUAL OR BETTER rank —
+    # an incidental evidence mention must never eat the alert's target match.
+    implicated = [
+        name
+        for name in implicated
+        if not any(
+            other != name
+            and name.lower() in other.lower()
+            and rank_of[other] <= rank_of[name]
+            for other in implicated
+        )
+    ]
+    lines: list[str] = []
+    seen: set[str] = set()
+    for name in implicated[:3]:
+        chain = dependency_path(components, name)
+        if len(chain) > 1:
+            lines.append(f"{name} check order: " + " → ".join(chain))
+        for dep in chain[:4]:
+            if dep in seen:
+                continue
+            seen.add(dep)
+            entry = components.get(dep) or {}
+            effect = entry.get("failure_effect") or entry.get("purpose") or ""
+            if effect:
+                lines.append(f"{dep}: {effect}")
+    return lines[:10]
 
 
 # ---------------------------------------------------------------------------
@@ -314,33 +410,15 @@ async def _tool_k8s_read(settings: Settings, target: AnalysisTarget, args: dict)
     namespace = str(args.get("namespace") or "")
     name = str(args.get("name") or "")
     label_selector = str(args.get("label_selector") or "")
-    fallback = ""
-    if settings.kubernetes_mcp_url:
-        try:
-            item = await _k8s_read_mcp(
-                settings, kind, namespace=namespace, name=name, label_selector=label_selector
-            )
-            error = item.get("error")
-            return {
-                "query": kubectl_repr(
-                    kind, namespace=namespace, name=name, label_selector=label_selector
-                ),
-                "title": kind_lookup_title(kind, getattr(settings, "language", "en")),
-                "summary": (str(error) if error else "MCP read ok"),
-                "error": error,
-                "result": item,
-            }
-        except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
-            fallback = f"{MCP_FALLBACK_WARNING}: {exc.__class__.__name__}"
-    else:
-        fallback = f"{MCP_FALLBACK_WARNING}: KUBERNETES_MCP_URL not configured"
+    # k8s_read is MCP-first with direct fallback — transport policy lives THERE,
+    # so every k8s read path (followup / investigation / drill-down) shares it.
     item = await k8s_read(
         settings, kind, namespace=namespace, name=name, label_selector=label_selector
     )
     error = item.get("error")
     summary = str(error) if error else f"HTTP {item.get('status_code')}"
-    if fallback:
-        summary = f"{fallback}; {summary}"
+    if item.get("mcp_fallback"):
+        summary = f"{item['mcp_fallback']}; {summary}"
     return {
         # The real command an operator would have typed, not a param dump.
         "query": kubectl_repr(kind, namespace=namespace, name=name, label_selector=label_selector),
@@ -349,125 +427,6 @@ async def _tool_k8s_read(settings: Settings, target: AnalysisTarget, args: dict)
         "error": error,
         "result": item,
     }
-
-
-async def _k8s_read_mcp(
-    settings: Settings,
-    kind: str,
-    namespace: str = "",
-    name: str = "",
-    label_selector: str = "",
-) -> dict:
-    resolved = resolve_read_kind(kind)
-    if not resolved:
-        return {
-            "kind": kind,
-            "error": "kind is not in the read-only allowlist",
-            "allowed_kinds": sorted(_READ_KINDS),
-        }
-    api_version, mcp_kind = _k8s_mcp_resource_kind(resolved)
-    candidates: list[tuple[str, dict[str, object]]] = []
-    if name:
-        if resolved == "pods":
-            candidates.extend(
-                [
-                    ("pods_get", {"namespace": namespace, "name": name}),
-                    ("pods_get", {"namespace": namespace, "pod": name}),
-                ]
-            )
-        candidates.extend(
-            [
-                (
-                    "resources_get",
-                    {
-                        "apiVersion": api_version,
-                        "kind": mcp_kind,
-                        "namespace": namespace,
-                        "name": name,
-                    },
-                ),
-                ("resources_get", {"kind": resolved, "namespace": namespace, "name": name}),
-            ]
-        )
-    else:
-        if resolved == "pods":
-            candidates.extend(
-                [
-                    ("pods_list_in_namespace", {"namespace": namespace}),
-                    ("pods_list", {"namespace": namespace}),
-                ]
-            )
-        elif resolved == "events":
-            candidates.append(("events_list", {"namespace": namespace}))
-        args: dict[str, object] = {
-            "apiVersion": api_version,
-            "kind": mcp_kind,
-            "namespace": namespace,
-        }
-        if label_selector:
-            args["labelSelector"] = label_selector
-        candidates.extend(
-            [
-                ("resources_list", args),
-                ("resources_list", {"kind": resolved, "namespace": namespace}),
-            ]
-        )
-    data = await _mcp_json_candidates(settings.kubernetes_mcp_url, candidates)
-    return {
-        "kind": resolved,
-        "namespace": namespace,
-        "name": name,
-        "label_selector": label_selector,
-        "url": f"{settings.kubernetes_mcp_url}#read_{resolved}",
-        "status_code": 200,
-        "error": None,
-        "data": data,
-    }
-
-
-def _k8s_mcp_resource_kind(kind: str) -> tuple[str, str]:
-    mapping = {
-        "pods": ("v1", "Pod"),
-        "events": ("v1", "Event"),
-        "nodes": ("v1", "Node"),
-        "namespaces": ("v1", "Namespace"),
-        "services": ("v1", "Service"),
-        "endpoints": ("v1", "Endpoints"),
-        "persistentvolumeclaims": ("v1", "PersistentVolumeClaim"),
-        "persistentvolumes": ("v1", "PersistentVolume"),
-        "configmaps": ("v1", "ConfigMap"),
-        "resourcequotas": ("v1", "ResourceQuota"),
-        "deployments": ("apps/v1", "Deployment"),
-        "replicasets": ("apps/v1", "ReplicaSet"),
-        "statefulsets": ("apps/v1", "StatefulSet"),
-        "daemonsets": ("apps/v1", "DaemonSet"),
-        "jobs": ("batch/v1", "Job"),
-        "cronjobs": ("batch/v1", "CronJob"),
-        "storageclasses": ("storage.k8s.io/v1", "StorageClass"),
-    }
-    return mapping.get(kind, ("v1", kind))
-
-
-async def _mcp_json_candidates(
-    url: str, candidates: list[tuple[str, dict[str, object]]]
-) -> object:
-    last_error = ""
-    for tool, arguments in candidates:
-        try:
-            result = await mcp_call(url, tool, arguments)
-        except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
-            last_error = f"{tool}: {exc.__class__.__name__}: {exc}"
-            continue
-        error = mcp_error(result)
-        if error:
-            last_error = f"{tool}: {error}"
-            continue
-        data = mcp_tool_json(result)
-        if isinstance(data, dict) and "raw" in data:
-            last_error = "MCP result was not JSON"
-            continue
-        return data
-    raise RuntimeError(last_error or "MCP tool failed")
 
 
 async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
@@ -492,7 +451,7 @@ async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -
                 "result": item,
             }
         except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
-            fallback = f"{MCP_FALLBACK_WARNING}: {exc.__class__.__name__}"
+            fallback = mcp_fallback_warning(exc)
     else:
         fallback = f"{MCP_FALLBACK_WARNING}: PROMETHEUS_MCP_URL not configured"
     if not settings.prometheus_url:
@@ -533,7 +492,7 @@ async def _tool_logql(settings: Settings, target: AnalysisTarget, args: dict) ->
                 "result": item,
             }
         except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
-            fallback = f"{MCP_FALLBACK_WARNING}: {exc.__class__.__name__}"
+            fallback = mcp_fallback_warning(exc)
     else:
         fallback = f"{MCP_FALLBACK_WARNING}: LOKI_MCP_URL not configured"
     if not settings.loki_url:
@@ -651,7 +610,7 @@ async def _tool_sql_select(settings: Settings, target: AnalysisTarget, args: dic
                 "result": {"rows": rows},
             }
         except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
-            fallback = f"{MCP_FALLBACK_WARNING}: {exc.__class__.__name__}"
+            fallback = mcp_fallback_warning(exc)
     else:
         fallback = f"{MCP_FALLBACK_WARNING}: POSTGRES_MCP_URL not configured"
     dsn = settings.runai_db_dsn or settings.postgres_dsn
