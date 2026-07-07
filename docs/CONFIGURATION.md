@@ -30,8 +30,10 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `KUBERNETES_LIST_LIMIT` | Kubernetes pod/event list page size for evidence collection, default `50` |
 | `KUBERNETES_NAMESPACES` | Optional comma-separated namespace allowlist for Kubernetes direct collection |
 | `KUBERNETES_CLUSTER_SCOPE_ENABLED` | Enables cluster-scoped Kubernetes calls such as node lookups; Helm follows `agent.rbac.clusterWide` |
+| `KUBERNETES_MCP_URL` | Kubernetes MCP shared-service URL. When set, Kubernetes collection and drill-down call MCP first and fall back to direct Kubernetes API reads on failure |
 | `RUNAI_BASE_URL` | Run:ai control plane URL |
 | `RUNAI_BEARER_TOKEN` | Optional Run:ai bearer token secret |
+| `GRAFANA_SERVICE_ACCOUNT_TOKEN` | Grafana service-account token used by the managed `grafanaMcp` service for Prometheus/Loki datasource read/query access |
 | `RUNAI_CLIENT_ID` | Run:ai application client ID |
 | `RUNAI_CLIENT_SECRET` | Run:ai application client secret |
 | `RUNAI_TOKEN_URL` | Optional OAuth token URL for Run:ai client credentials |
@@ -44,11 +46,11 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `RUNAI_LOG_NAMESPACES` | Comma-separated Run:ai control-plane log namespaces, default `runai,runai-backend` |
 | `PROMETHEUS_URL` | Prometheus base URL |
 | `PROMETHEUS_TIMEOUT_SECONDS` | Prometheus query timeout |
-| `PROMETHEUS_MCP_URL` | Optional remote Prometheus MCP URL for the MCP workflow |
+| `PROMETHEUS_MCP_URL` | Grafana MCP URL for Prometheus tools. Helm sets this to the managed `grafanaMcp` ClusterIP service when enabled; fallback uses `PROMETHEUS_URL` |
 | `LOKI_URL` | Loki base URL. In Helm this should normally point to the direct read/query service, for example `http://loki-read.monitoring.svc.cluster.local:3100`, not an authenticated gateway. |
 | `LOKI_TIMEOUT_SECONDS` | Loki query timeout |
 | `LOKI_QUERY_LIMIT` | Maximum log lines requested per Loki query group, default `20` |
-| `LOKI_MCP_URL` | Optional remote Loki MCP URL for the MCP workflow |
+| `LOKI_MCP_URL` | Grafana MCP URL for Loki tools. Helm sets this to the same managed `grafanaMcp` ClusterIP service when enabled; fallback uses `LOKI_URL` |
 | `ENABLE_SYSTEM_AGENT` | Enable the node-infra System collector (dmesg/journalctl/syslog via a per-node DaemonSet), default `true`; degrades to `unavailable` when `SYSTEM_AGENT_URL` is unset |
 | `SYSTEM_AGENT_URL` | Per-node System-agent DaemonSet endpoint (`GET /logs?source=dmesg\|journal\|syslog`) |
 | `SYSTEM_AGENT_TOKEN` | Optional bearer token for the System-agent endpoint |
@@ -60,6 +62,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `POSTGRES_DSN` | Agent Postgres diagnostic DSN; defaults to `DATABASE_URL` in Helm |
 | `POSTGRES_TIMEOUT_SECONDS` | Agent Postgres diagnostic query timeout |
 | `RUNAI_DB_DSN` | Optional read-only DSN for the Run:ai control-plane Postgres. When set, the postgres agent's drill-down can `SELECT` platform data (workloads, audit, clusters, ...) during troubleshooting; single-statement SELECT in a READ ONLY transaction. Provision a read-only DB role. |
+| `POSTGRES_MCP_URL` | Postgres MCP shared-service URL. Postgres collection and drill-down call MCP first; fallback uses `RUNAI_DB_DSN` first, then `POSTGRES_DSN` |
 | `TROUBLESHOOTING_CASES_FILE` | Local known-cases/playbook markdown path |
 | `ARCHITECTURE_FILE` | Run:ai platform topology YAML (components, depends_on, DB schema ownership), default `knowledge/runai_architecture.yaml` — powers playbook check paths and postgres drill-down schema hints |
 | `AGENT_SOULS_FILE` | Agent role-contract prompt path, default `prompts/agent_souls.md` |
@@ -114,9 +117,10 @@ NeMo Agent Toolkit workflows:
 - `agent/configs/runai_rca_workflow.yml` runs the component collectors through
   NAT `parallel_executor` and the `analysis_agent` RCA step. It does not require
   external MCP servers.
-- `agent/configs/runai_rca_workflow_mcp.yml` adds Prometheus/Loki MCP client
-  groups and a NIM-backed Analysis Agent review path for environments where
-  those services are available.
+- `agent/configs/runai_rca_workflow_mcp.yml` keeps the NIM-backed Analysis Agent
+  review path, but does not expose raw MCP client groups to final synthesis. MCP
+  calls happen inside each domain collector/drill-down, then final synthesis sees
+  only the resulting artifacts.
 - `agent/configs/runai_rca_workflow_litellm.yml` adds a LiteLLM/OpenAI-compatible
   Analysis Agent review path. Set `ENABLE_NAT_RUNTIME=true`, point
   `NAT_CONFIG_FILE` at that config, and provide `LLM_BASE_URL`, `LLM_MODEL`, and
@@ -147,7 +151,7 @@ Frequently tuned Helm values:
 | `backend.env.agentUrl` | Override Backend-to-Agent URL when the Agent is external or remote |
 | `backend.env.language` / `agent.env.language` | Set RCA language to `en` or `ko` |
 | `backend.env.databaseConnectTimeoutSeconds` / `agentRequestTimeoutSeconds` / `manualAgentRequestTimeoutSeconds` | Backend startup DB timeout, automatic/chat Agent timeout, and operator-triggered analysis timeout |
-| `secrets.keys.*` | Existing Secret key names for DB, Run:ai, NVIDIA, and LLM credentials |
+| `secrets.keys.*` | Existing Secret key names for DB, Run:ai, Grafana, NVIDIA, and LLM credentials |
 | `secrets.existingSecret` | Existing Secret for Run:ai/NVIDIA/LLM credentials and, by default, DB keys |
 | `secrets.databaseExistingSecret` | Existing Secret used only for `DATABASE_URL` / `POSTGRES_DSN` |
 | `postgresql.enabled` / `postgresql.auth.*` | Install the bundled Postgres and set its generated DSN user, password, and database |
@@ -162,7 +166,10 @@ Frequently tuned Helm values:
 | `agent.env.runaiLogNamespaces` | Namespaces for Run:ai control-plane/backend logs, default `runai,runai-backend` |
 | `agent.env.prometheusUrl` | In-cluster Prometheus URL, for example `http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090` |
 | `agent.env.lokiUrl` | In-cluster Loki query URL, for example `http://loki-read.monitoring.svc.cluster.local:3100`. The chart intentionally avoids the authenticated `loki-gateway` path by default. |
-| `agent.env.prometheusMcpUrl` / `agent.env.lokiMcpUrl` | Remote MCP endpoints when using the MCP workflow |
+| `grafanaMcp.enabled` / `grafanaMcp.grafanaUrl` | Run the shared Grafana MCP ClusterIP service for Prometheus/Loki datasource tools; token comes from `GRAFANA_SERVICE_ACCOUNT_TOKEN` in `secrets.existingSecret` |
+| `kubernetesMcp.enabled` | Run the shared Kubernetes MCP ClusterIP service with its own read-only ServiceAccount/RBAC; no `secrets` or `pods/exec` permissions |
+| `postgresMcp.enabled` | Run the shared Postgres MCP ClusterIP service backed by the `runai-rca-postgres-mcp` wrapper image |
+| `agent.env.prometheusMcpUrl` / `agent.env.lokiMcpUrl` / `agent.env.kubernetesMcpUrl` / `agent.env.postgresMcpUrl` | Remote MCP endpoints when not using the managed shared services |
 | `agent.env.llmBaseUrl` / `agent.env.llmModel` / `secrets.llmApiKey` | LiteLLM/OpenAI-compatible endpoint, model, and Secret-backed API key for `runai_rca_workflow_litellm.yml` |
 | `agent.env.*TimeoutSeconds` | Request/runtime timeouts for Kubernetes, Run:ai, Prometheus, Loki, Postgres, and NAT |
 | `agent.env.kubernetesListLimit` / `agent.env.lokiQueryLimit` | Evidence volume controls for Kubernetes list calls and Loki log query groups |

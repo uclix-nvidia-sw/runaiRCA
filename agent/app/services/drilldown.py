@@ -33,12 +33,19 @@ from typing import Any
 
 from app.collectors.base import AnalysisTarget, CollectorResult, artifact, salient_markers
 from app.collectors.http_json import get_json
-from app.collectors.kubernetes import _READ_KINDS, k8s_read, kind_lookup_title, kubectl_repr
-from app.collectors.loki import _loki_headers, _loki_streams, _sample_lines
-from app.collectors.prometheus import prom_query
+from app.collectors.kubernetes import (
+    _READ_KINDS,
+    k8s_read,
+    kind_lookup_title,
+    kubectl_repr,
+    resolve_read_kind,
+)
+from app.collectors.loki import _loki_headers, _loki_streams, _sample_lines, loki_mcp_query
+from app.collectors.prometheus import prom_mcp_query, prom_query
 from app.collectors.runai_mcp import _tool_json, _tool_text
 from app.config import Settings
 from app.llm import complete_json, llm_configured, token_budget_exceeded, token_budget_warning
+from app.mcp_client import MCP_FALLBACK_WARNING, mcp_call, mcp_error, mcp_tool_json
 from app.plan import InvestigationPlan
 
 _log = logging.getLogger(__name__)
@@ -209,22 +216,22 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
             }
         }
     }
-    if settings.prometheus_url:
+    if settings.prometheus_mcp_url or settings.prometheus_url:
         registry["prometheus"] = {
             "promql_query": {
                 "description": (
-                    "One PromQL instant query against the cluster Prometheus. args: "
+                    "One MCP-first PromQL instant query against cluster metrics. args: "
                     "query (PromQL, e.g. 'rate(kube_pod_container_status_restarts_"
                     'total{namespace="x"}[15m])\')'
                 ),
                 "call": _tool_promql,
             }
         }
-    if settings.loki_url:
+    if settings.loki_mcp_url or settings.loki_url:
         registry["loki"] = {
             "logql_query": {
                 "description": (
-                    "One LogQL range query against Loki (recent window, backward). "
+                    "One MCP-first LogQL range query against Loki (recent window, backward). "
                     'args: query (LogQL, e.g. \'{namespace="runai"} |~ "(?i)(error|panic)"\')'
                 ),
                 "call": _tool_logql,
@@ -250,7 +257,7 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
             },
         }
     sql_dsn = settings.runai_db_dsn or settings.postgres_dsn
-    if sql_dsn:
+    if settings.postgres_mcp_url or sql_dsn:
         if settings.runai_db_dsn:
             db_desc = (
                 "the Run:ai CONTROL-PLANE database (platform schemas: workloads, "
@@ -300,18 +307,160 @@ async def _tool_k8s_read(settings: Settings, target: AnalysisTarget, args: dict)
     namespace = str(args.get("namespace") or "")
     name = str(args.get("name") or "")
     label_selector = str(args.get("label_selector") or "")
+    fallback = ""
+    if settings.kubernetes_mcp_url:
+        try:
+            item = await _k8s_read_mcp(
+                settings, kind, namespace=namespace, name=name, label_selector=label_selector
+            )
+            error = item.get("error")
+            return {
+                "query": kubectl_repr(
+                    kind, namespace=namespace, name=name, label_selector=label_selector
+                ),
+                "title": kind_lookup_title(kind, getattr(settings, "language", "en")),
+                "summary": (str(error) if error else "MCP read ok"),
+                "error": error,
+                "result": item,
+            }
+        except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
+            fallback = f"{MCP_FALLBACK_WARNING}: {exc.__class__.__name__}"
+    else:
+        fallback = f"{MCP_FALLBACK_WARNING}: KUBERNETES_MCP_URL not configured"
     item = await k8s_read(
         settings, kind, namespace=namespace, name=name, label_selector=label_selector
     )
     error = item.get("error")
+    summary = str(error) if error else f"HTTP {item.get('status_code')}"
+    if fallback:
+        summary = f"{fallback}; {summary}"
     return {
         # The real command an operator would have typed, not a param dump.
         "query": kubectl_repr(kind, namespace=namespace, name=name, label_selector=label_selector),
         "title": kind_lookup_title(kind, getattr(settings, "language", "en")),
-        "summary": (str(error) if error else f"HTTP {item.get('status_code')}"),
+        "summary": summary,
         "error": error,
         "result": item,
     }
+
+
+async def _k8s_read_mcp(
+    settings: Settings,
+    kind: str,
+    namespace: str = "",
+    name: str = "",
+    label_selector: str = "",
+) -> dict:
+    resolved = resolve_read_kind(kind)
+    if not resolved:
+        return {
+            "kind": kind,
+            "error": "kind is not in the read-only allowlist",
+            "allowed_kinds": sorted(_READ_KINDS),
+        }
+    api_version, mcp_kind = _k8s_mcp_resource_kind(resolved)
+    candidates: list[tuple[str, dict[str, object]]] = []
+    if name:
+        if resolved == "pods":
+            candidates.extend(
+                [
+                    ("pods_get", {"namespace": namespace, "name": name}),
+                    ("pods_get", {"namespace": namespace, "pod": name}),
+                ]
+            )
+        candidates.extend(
+            [
+                (
+                    "resources_get",
+                    {
+                        "apiVersion": api_version,
+                        "kind": mcp_kind,
+                        "namespace": namespace,
+                        "name": name,
+                    },
+                ),
+                ("resources_get", {"kind": resolved, "namespace": namespace, "name": name}),
+            ]
+        )
+    else:
+        if resolved == "pods":
+            candidates.extend(
+                [
+                    ("pods_list_in_namespace", {"namespace": namespace}),
+                    ("pods_list", {"namespace": namespace}),
+                ]
+            )
+        elif resolved == "events":
+            candidates.append(("events_list", {"namespace": namespace}))
+        args: dict[str, object] = {
+            "apiVersion": api_version,
+            "kind": mcp_kind,
+            "namespace": namespace,
+        }
+        if label_selector:
+            args["labelSelector"] = label_selector
+        candidates.extend(
+            [
+                ("resources_list", args),
+                ("resources_list", {"kind": resolved, "namespace": namespace}),
+            ]
+        )
+    data = await _mcp_json_candidates(settings.kubernetes_mcp_url, candidates)
+    return {
+        "kind": resolved,
+        "namespace": namespace,
+        "name": name,
+        "label_selector": label_selector,
+        "url": f"{settings.kubernetes_mcp_url}#read_{resolved}",
+        "status_code": 200,
+        "error": None,
+        "data": data,
+    }
+
+
+def _k8s_mcp_resource_kind(kind: str) -> tuple[str, str]:
+    mapping = {
+        "pods": ("v1", "Pod"),
+        "events": ("v1", "Event"),
+        "nodes": ("v1", "Node"),
+        "namespaces": ("v1", "Namespace"),
+        "services": ("v1", "Service"),
+        "endpoints": ("v1", "Endpoints"),
+        "persistentvolumeclaims": ("v1", "PersistentVolumeClaim"),
+        "persistentvolumes": ("v1", "PersistentVolume"),
+        "configmaps": ("v1", "ConfigMap"),
+        "resourcequotas": ("v1", "ResourceQuota"),
+        "deployments": ("apps/v1", "Deployment"),
+        "replicasets": ("apps/v1", "ReplicaSet"),
+        "statefulsets": ("apps/v1", "StatefulSet"),
+        "daemonsets": ("apps/v1", "DaemonSet"),
+        "jobs": ("batch/v1", "Job"),
+        "cronjobs": ("batch/v1", "CronJob"),
+        "storageclasses": ("storage.k8s.io/v1", "StorageClass"),
+    }
+    return mapping.get(kind, ("v1", kind))
+
+
+async def _mcp_json_candidates(
+    url: str, candidates: list[tuple[str, dict[str, object]]]
+) -> object:
+    last_error = ""
+    for tool, arguments in candidates:
+        try:
+            result = await mcp_call(url, tool, arguments)
+        except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
+            last_error = f"{tool}: {exc.__class__.__name__}: {exc}"
+            continue
+        error = mcp_error(result)
+        if error:
+            last_error = f"{tool}: {error}"
+            continue
+        data = mcp_tool_json(result)
+        if isinstance(data, dict) and "raw" in data:
+            last_error = "MCP result was not JSON"
+            continue
+        return data
+    raise RuntimeError(last_error or "MCP tool failed")
 
 
 async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
@@ -324,12 +473,32 @@ async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -
             "summary": "empty PromQL query",
             "error": "empty PromQL query",
         }
+    fallback = ""
+    if settings.prometheus_mcp_url:
+        try:
+            item = await prom_mcp_query(settings, "drilldown", promql)
+            return {
+                "query": promql,
+                "title": title,
+                "summary": "MCP query_prometheus ok",
+                "error": None,
+                "result": item,
+            }
+        except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
+            fallback = f"{MCP_FALLBACK_WARNING}: {exc.__class__.__name__}"
+    else:
+        fallback = f"{MCP_FALLBACK_WARNING}: PROMETHEUS_MCP_URL not configured"
+    if not settings.prometheus_url:
+        return {"query": promql, "title": title, "summary": fallback, "error": fallback}
     item = await prom_query(settings, "drilldown", promql)
     error = item.get("error")
+    summary = str(error) if error else f"HTTP {item.get('status_code')}"
+    if fallback:
+        summary = f"{fallback}; {summary}"
     return {
         "query": promql,
         "title": title,
-        "summary": str(error) if error else f"HTTP {item.get('status_code')}",
+        "summary": summary,
         "error": error,
         "result": item,
     }
@@ -345,6 +514,23 @@ async def _tool_logql(settings: Settings, target: AnalysisTarget, args: dict) ->
             "summary": "empty LogQL query",
             "error": "empty LogQL query",
         }
+    fallback = ""
+    if settings.loki_mcp_url:
+        try:
+            item = await loki_mcp_query(settings, "drilldown", logql)
+            return {
+                "query": logql,
+                "title": title,
+                "summary": f"{item.get('line_count', 0)} MCP log line(s)",
+                "error": None,
+                "result": item,
+            }
+        except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
+            fallback = f"{MCP_FALLBACK_WARNING}: {exc.__class__.__name__}"
+    else:
+        fallback = f"{MCP_FALLBACK_WARNING}: LOKI_MCP_URL not configured"
+    if not settings.loki_url:
+        return {"query": logql, "title": title, "summary": fallback, "error": fallback}
     headers, _warnings = _loki_headers(settings)
     response = await get_json(
         base_url=settings.loki_url,
@@ -359,12 +545,17 @@ async def _tool_logql(settings: Settings, target: AnalysisTarget, args: dict) ->
     )
     if response.error or not response.ok:
         error = response.error or f"HTTP {response.status_code}"
+        if fallback:
+            error = f"{fallback}; {error}"
         return {"query": logql, "title": title, "summary": error, "error": error}
     lines = _sample_lines(_loki_streams(response.data), limit=10)
+    summary = f"{len(lines)} sample log line(s)" if lines else "no matching log lines"
+    if fallback:
+        summary = f"{fallback}; {summary}"
     return {
         "query": logql,
         "title": title,
-        "summary": f"{len(lines)} sample log line(s)" if lines else "no matching log lines",
+        "summary": summary,
         "error": None,
         "result": {"lines": lines},
     }
@@ -410,6 +601,30 @@ async def _run_select(dsn: str, sql: str, timeout: int) -> list[dict]:
         await conn.close()
 
 
+async def _run_select_mcp(settings: Settings, sql: str) -> list[dict]:
+    result = await mcp_call(settings.postgres_mcp_url, "query", {"sql": sql})
+    error = mcp_error(result)
+    if error:
+        raise RuntimeError(error)
+    data = mcp_tool_json(result)
+    if isinstance(data, dict) and "raw" in data:
+        raise RuntimeError("MCP result was not JSON")
+    return [row for row in _postgres_rows(data)[:50] if isinstance(row, dict)]
+
+
+def _postgres_rows(data: Any) -> list[Any]:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("rows", "result", "data"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+        if all(not isinstance(value, (list, dict)) for value in data.values()):
+            return [data]
+    return []
+
+
 async def _tool_sql_select(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
     title = _title(settings, "DB 조회 (SQL)", "Database query (SQL)")
     error, sql = _validate_select(str(args.get("query") or ""))
@@ -417,27 +632,39 @@ async def _tool_sql_select(settings: Settings, target: AnalysisTarget, args: dic
         return {"query": sql, "title": title, "summary": error, "error": error}
     if not re.search(r"(?i)\blimit\s+\d", sql):
         sql = f"{sql} LIMIT 50"
+    fallback = ""
+    if settings.postgres_mcp_url:
+        try:
+            rows = await _run_select_mcp(settings, sql)
+            return {
+                "query": sql,
+                "title": title,
+                "summary": f"{len(rows)} MCP row(s)",
+                "error": None,
+                "result": {"rows": rows},
+            }
+        except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
+            fallback = f"{MCP_FALLBACK_WARNING}: {exc.__class__.__name__}"
+    else:
+        fallback = f"{MCP_FALLBACK_WARNING}: POSTGRES_MCP_URL not configured"
     dsn = settings.runai_db_dsn or settings.postgres_dsn
+    if not dsn:
+        return {"query": sql, "title": title, "summary": fallback, "error": fallback}
     rows = await _run_select(dsn, sql, settings.postgres_timeout_seconds)
+    summary = f"{len(rows)} row(s)"
+    if fallback:
+        summary = f"{fallback}; {summary}"
     return {
         "query": sql,
         "title": title,
-        "summary": f"{len(rows)} row(s)",
+        "summary": summary,
         "error": None,
         "result": {"rows": rows},
     }
 
 
-async def _mcp_call(settings: Settings, tool: str, arguments: dict) -> Any:
-    # Lazy import mirrors app.collectors.runai_mcp: the agent runs without the
-    # `mcp` package until the sidecar ships.
-    from mcp import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
-
-    async with streamablehttp_client(settings.runai_mcp_url) as (read, write, *_rest):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            return await session.call_tool(tool, arguments)
+async def _mcp_call(settings: Settings, tool: str, arguments: dict, url: str = "") -> Any:
+    return await mcp_call(url or settings.runai_mcp_url, tool, arguments)
 
 
 async def _tool_runai_search(settings: Settings, target: AnalysisTarget, args: dict) -> dict:

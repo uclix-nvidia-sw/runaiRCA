@@ -1,8 +1,8 @@
 # NeMo Agent Toolkit workflow variant with MCP and LLM synthesis enabled.
 #
-# Use this when Prometheus/Loki MCP servers and NVIDIA NIM credentials are
-# available. The default runai_rca_workflow.yml remains MCP-free so local
-# development and CI can execute without external servers.
+# Use this when datasource MCP services and NVIDIA NIM credentials are available.
+# Raw MCP clients are intentionally not exposed to final_synthesis: domain
+# collectors/drilldowns call MCP first, then attach artifacts for synthesis.
 
 general:
   telemetry:
@@ -15,18 +15,6 @@ llms:
     temperature: 0.0
     chat_template_kwargs:
       enable_thinking: false
-
-function_groups:
-  prometheus_mcp:
-    _type: mcp_client
-    server:
-      transport: streamable-http
-      url: http://localhost:9901/mcp
-  loki_mcp:
-    _type: mcp_client
-    server:
-      transport: streamable-http
-      url: http://localhost:9902/mcp
 
 functions:
   runai_context:
@@ -65,7 +53,7 @@ functions:
     return_error_on_exception: true
   final_synthesis:
     _type: react_agent
-    description: LLM Analysis Agent with MCP-aware evidence tools.
+    description: LLM Analysis Agent over collector/drilldown artifacts.
     tool_names:
       - runai_context
       - kubernetes_context
@@ -74,8 +62,6 @@ functions:
       - loki_context
       - troubleshooting_cases
       - analysis_memory
-      - prometheus_mcp
-      - loki_mcp
     llm_name: nim_llm
     max_tool_calls: 8
     system_prompt: >

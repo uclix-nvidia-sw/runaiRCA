@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.collectors.http_json import compact, get_json
 from app.collectors.loki import _llm_insight
 from app.config import Settings
+from app.mcp_client import MCP_FALLBACK_WARNING, mcp_call, mcp_error, mcp_tool_json
 
 
 class PrometheusCollector:
@@ -15,7 +17,7 @@ class PrometheusCollector:
         self._settings = settings
 
     async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:
-        if not self._settings.prometheus_url:
+        if not self._settings.prometheus_url and not self._settings.prometheus_mcp_url:
             summary = f"{NO_EVIDENCE} Prometheus is not configured; metric evidence was skipped."
             return CollectorResult(
                 agent=self.name,
@@ -46,28 +48,40 @@ class PrometheusCollector:
         query_results = []
         warnings: list[str] = []
 
-        for name, query in queries:
-            response = await get_json(
-                base_url=self._settings.prometheus_url,
-                path="/api/v1/query",
-                timeout_seconds=self._settings.prometheus_timeout_seconds,
-                params={"query": query},
-            )
-            result_data = _prometheus_result(response.data)
-            query_results.append(
-                {
-                    "name": name,
-                    "query": query,
-                    "url": response.url,
-                    "status_code": response.status_code,
-                    "status": _prometheus_status(response.data),
-                    "series_count": len(result_data),
-                    "sample": compact(result_data, limit=3),
-                    "error": response.error,
-                }
-            )
-            if response.error:
-                warnings.append(f"Prometheus query failed for {name}: {response.error}")
+        used_mcp = False
+        if self._settings.prometheus_mcp_url:
+            try:
+                query_results = await _collect_prometheus_mcp(self._settings, queries)
+                used_mcp = True
+            except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
+                warnings.append(f"{MCP_FALLBACK_WARNING}: {exc.__class__.__name__}")
+        else:
+            warnings.append(f"{MCP_FALLBACK_WARNING}: PROMETHEUS_MCP_URL not configured")
+
+        if not used_mcp:
+            if not self._settings.prometheus_url:
+                summary = f"{NO_EVIDENCE} Prometheus MCP failed and direct URL is not configured."
+                return CollectorResult(
+                    agent=self.name,
+                    status="unavailable",
+                    summary=summary,
+                    confidence="low",
+                    missing_data=["prometheus.url"],
+                    warnings=warnings,
+                    artifacts=[
+                        artifact(
+                            agent=self.name,
+                            source="prometheus",
+                            type="promql",
+                            status="unavailable",
+                            confidence="low",
+                            query="; ".join(query for _, query in queries),
+                            summary=summary,
+                            result={"prometheus_mcp_url_configured": True},
+                        )
+                    ],
+                )
+            query_results = await _collect_prometheus_direct(self._settings, queries, warnings)
 
         successful = [item for item in query_results if not item["error"]]
         populated = [
@@ -79,7 +93,7 @@ class PrometheusCollector:
             status = "ok"
             confidence = "high"
             summary = (
-                "Prometheus direct queries completed with matching metric series "
+                f"Prometheus {'MCP' if used_mcp else 'direct'} queries completed with matching metric series "
                 f"for {len(populated)} of {len(query_results)} query group(s)."
             )
         elif successful:
@@ -101,6 +115,8 @@ class PrometheusCollector:
             summary = insight
         result = {
             "prometheus_url": self._settings.prometheus_url,
+            "prometheus_mcp_url": self._settings.prometheus_mcp_url,
+            "used_mcp": used_mcp,
             "queries": query_results,
         }
         return CollectorResult(
@@ -237,6 +253,144 @@ def _prometheus_result(data: object) -> list[object]:
         return []
     result = payload.get("result")
     return result if isinstance(result, list) else []
+
+
+async def _collect_prometheus_direct(
+    settings: Settings, queries: list[tuple[str, str]], warnings: list[str]
+) -> list[dict[str, object]]:
+    query_results: list[dict[str, object]] = []
+    for name, query in queries:
+        response = await get_json(
+            base_url=settings.prometheus_url,
+            path="/api/v1/query",
+            timeout_seconds=settings.prometheus_timeout_seconds,
+            params={"query": query},
+        )
+        result_data = _prometheus_result(response.data)
+        query_results.append(
+            {
+                "name": name,
+                "query": query,
+                "url": response.url,
+                "status_code": response.status_code,
+                "status": _prometheus_status(response.data),
+                "series_count": len(result_data),
+                "sample": compact(result_data, limit=3),
+                "error": response.error,
+            }
+        )
+        if response.error:
+            warnings.append(f"Prometheus query failed for {name}: {response.error}")
+    return query_results
+
+
+async def _collect_prometheus_mcp(
+    settings: Settings, queries: list[tuple[str, str]]
+) -> list[dict[str, object]]:
+    datasource_uid = await _grafana_datasource_uid(settings.prometheus_mcp_url, "prometheus")
+    return [
+        await _mcp_query_prometheus(settings.prometheus_mcp_url, name, query, datasource_uid)
+        for name, query in queries
+    ]
+
+
+async def prom_mcp_query(settings: Settings, name: str, promql: str) -> dict[str, object]:
+    datasource_uid = await _grafana_datasource_uid(settings.prometheus_mcp_url, "prometheus")
+    return await _mcp_query_prometheus(settings.prometheus_mcp_url, name, promql, datasource_uid)
+
+
+async def _mcp_query_prometheus(
+    url: str, name: str, promql: str, datasource_uid: str = ""
+) -> dict[str, object]:
+    args_list: list[dict[str, object]] = []
+    if datasource_uid:
+        args_list.extend(
+            [
+                {"datasourceUid": datasource_uid, "query": promql},
+                {"datasourceUid": datasource_uid, "expr": promql},
+                {"datasource_uid": datasource_uid, "query": promql},
+            ]
+        )
+    args_list.extend([{"query": promql}, {"expr": promql}])
+    data = await _call_mcp_json(url, "query_prometheus", args_list)
+    result_data = _prometheus_result(data)
+    if not result_data:
+        result_data = _first_result_list(data)
+    return {
+        "name": name,
+        "query": promql,
+        "url": f"{url}#query_prometheus",
+        "status_code": 200,
+        "status": _prometheus_status(data),
+        "series_count": len(result_data),
+        "sample": compact(result_data, limit=3),
+        "error": None,
+    }
+
+
+async def _grafana_datasource_uid(url: str, datasource_type: str) -> str:
+    try:
+        data = await _call_mcp_json(url, "list_datasources", [{}])
+    except Exception:  # noqa: BLE001 - query tools may work without discovery.
+        return ""
+    for datasource in _datasource_items(data):
+        dtype = str(datasource.get("type") or "").lower()
+        name = str(datasource.get("name") or "").lower()
+        if datasource_type in dtype or datasource_type in name:
+            uid = datasource.get("uid") or datasource.get("id") or datasource.get("name")
+            return str(uid) if uid else ""
+    return ""
+
+
+def _datasource_items(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if not isinstance(data, dict):
+        return []
+    for key in ("datasources", "items", "result"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    nested = data.get("data")
+    if isinstance(nested, list):
+        return [item for item in nested if isinstance(item, dict)]
+    return []
+
+
+async def _call_mcp_json(
+    url: str, tool: str, args_list: list[dict[str, object]]
+) -> object:
+    last_error = ""
+    for args in args_list:
+        try:
+            result = await mcp_call(url, tool, args)
+        except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
+            last_error = f"{exc.__class__.__name__}: {exc}"
+            continue
+        error = mcp_error(result)
+        if error:
+            last_error = error
+            continue
+        data = mcp_tool_json(result)
+        if isinstance(data, dict) and "raw" in data:
+            last_error = "MCP result was not JSON"
+            continue
+        return data
+    raise RuntimeError(last_error or f"{tool} failed")
+
+
+def _first_result_list(data: object) -> list[object]:
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    for value in data.values():
+        if isinstance(value, list):
+            return value
+        found = _first_result_list(value)
+        if found:
+            return found
+    return []
 
 
 # --- Cross-collector deterministic follow-up -----------------------------------

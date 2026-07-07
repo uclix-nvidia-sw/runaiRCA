@@ -1,0 +1,457 @@
+{{- if .Values.grafanaMcp.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "runai-rca.grafanaMcp.fullname" . }}
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "runai-rca.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: grafana-mcp
+  template:
+    metadata:
+      labels:
+        {{- include "runai-rca.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: grafana-mcp
+        {{- with .Values.grafanaMcp.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.grafanaMcp.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: {{ .Values.grafanaMcp.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default .Values.podSecurityContext .Values.grafanaMcp.podSecurityContext) }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default .Values.priorityClassName .Values.grafanaMcp.priorityClassName) }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      containers:
+        - name: grafana-mcp
+          image: {{ include "runai-rca.image" (dict "root" . "image" .Values.grafanaMcp.image) | quote }}
+          imagePullPolicy: {{ .Values.grafanaMcp.image.pullPolicy }}
+          {{- with (default .Values.securityContext .Values.grafanaMcp.securityContext) }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.grafanaMcp.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          args:
+            {{- if .Values.grafanaMcp.args }}
+            {{- toYaml .Values.grafanaMcp.args | nindent 12 }}
+            {{- else }}
+            - -t
+            - streamable-http
+            - --address
+            - :{{ .Values.grafanaMcp.service.port }}
+            - --endpoint-path
+            - /mcp
+            - --allowed-hosts=*
+            - --disable-write
+            - --disable-admin
+            - --disable-alerting
+            - --disable-incident
+            - --disable-oncall
+            - --disable-sift
+            - --disable-snapshot
+            - --disable-rendering
+            - --disable-provisioning
+            {{- end }}
+          ports:
+            - name: mcp
+              containerPort: {{ .Values.grafanaMcp.service.port }}
+          env:
+            - name: GRAFANA_URL
+              value: {{ .Values.grafanaMcp.grafanaUrl | quote }}
+            - name: GRAFANA_SERVICE_ACCOUNT_TOKEN_FILE
+              value: /var/run/secrets/grafana/token
+            {{- with .Values.grafanaMcp.grafanaOrgId }}
+            - name: GRAFANA_ORG_ID
+              value: {{ . | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: grafana-token
+              mountPath: /var/run/secrets/grafana
+              readOnly: true
+          resources:
+            {{- toYaml .Values.grafanaMcp.resources | nindent 12 }}
+      volumes:
+        - name: grafana-token
+          secret:
+            secretName: {{ include "runai-rca.secretName" . }}
+            optional: true
+            items:
+              - key: {{ .Values.secrets.keys.grafanaServiceAccountToken | quote }}
+                path: token
+      {{- with (default .Values.nodeSelector .Values.grafanaMcp.nodeSelector) }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default .Values.affinity .Values.grafanaMcp.affinity) }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default .Values.tolerations .Values.grafanaMcp.tolerations) }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "runai-rca.grafanaMcp.fullname" . }}
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana-mcp
+  {{- with .Values.grafanaMcp.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.grafanaMcp.service.type | default "ClusterIP" }}
+  ports:
+    - name: mcp
+      port: {{ .Values.grafanaMcp.service.port }}
+      targetPort: mcp
+  selector:
+    {{- include "runai-rca.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana-mcp
+{{- end }}
+{{- if .Values.kubernetesMcp.enabled }}
+---
+{{- if .Values.kubernetesMcp.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "runai-rca.kubernetesMcp.serviceAccountName" . }}
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kubernetes-mcp
+  {{- with .Values.kubernetesMcp.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "runai-rca.kubernetesMcp.fullname" . }}
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kubernetes-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "runai-rca.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: kubernetes-mcp
+  template:
+    metadata:
+      labels:
+        {{- include "runai-rca.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: kubernetes-mcp
+        {{- with .Values.kubernetesMcp.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.kubernetesMcp.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "runai-rca.kubernetesMcp.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.kubernetesMcp.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default .Values.podSecurityContext .Values.kubernetesMcp.podSecurityContext) }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: kubernetes-mcp
+          image: {{ include "runai-rca.image" (dict "root" . "image" .Values.kubernetesMcp.image) | quote }}
+          imagePullPolicy: {{ .Values.kubernetesMcp.image.pullPolicy }}
+          {{- with (default .Values.securityContext .Values.kubernetesMcp.securityContext) }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.kubernetesMcp.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          args:
+            {{- if .Values.kubernetesMcp.args }}
+            {{- toYaml .Values.kubernetesMcp.args | nindent 12 }}
+            {{- else }}
+            - --port
+            - {{ .Values.kubernetesMcp.service.port | quote }}
+            - --read-only
+            - --disable-multi-cluster
+            - --stateless
+            - --toolsets=core
+            {{- end }}
+          ports:
+            - name: mcp
+              containerPort: {{ .Values.kubernetesMcp.service.port }}
+          resources:
+            {{- toYaml .Values.kubernetesMcp.resources | nindent 12 }}
+      {{- with (default .Values.nodeSelector .Values.kubernetesMcp.nodeSelector) }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default .Values.affinity .Values.kubernetesMcp.affinity) }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default .Values.tolerations .Values.kubernetesMcp.tolerations) }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "runai-rca.kubernetesMcp.fullname" . }}
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kubernetes-mcp
+  {{- with .Values.kubernetesMcp.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.kubernetesMcp.service.type | default "ClusterIP" }}
+  ports:
+    - name: mcp
+      port: {{ .Values.kubernetesMcp.service.port }}
+      targetPort: mcp
+  selector:
+    {{- include "runai-rca.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: kubernetes-mcp
+{{- if .Values.kubernetesMcp.rbac.create }}
+{{- $rbacNamespaces := default (list .Release.Namespace) .Values.kubernetesMcp.rbac.namespaces }}
+{{- if .Values.kubernetesMcp.rbac.clusterWide }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "runai-rca.kubernetesMcp.fullname" . }}
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kubernetes-mcp
+rules:
+  - apiGroups: [""]
+    resources:
+      - configmaps
+      - endpoints
+      - events
+      - namespaces
+      - nodes
+      - persistentvolumeclaims
+      - persistentvolumes
+      - pods
+      - resourcequotas
+      - services
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets", "deployments", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs", "jobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "runai-rca.kubernetesMcp.fullname" . }}
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kubernetes-mcp
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "runai-rca.kubernetesMcp.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "runai-rca.kubernetesMcp.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- else }}
+{{- range $namespace := $rbacNamespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "runai-rca.kubernetesMcp.fullname" $ }}
+  namespace: {{ $namespace | quote }}
+  labels:
+    {{- include "runai-rca.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: kubernetes-mcp
+rules:
+  - apiGroups: [""]
+    resources:
+      - configmaps
+      - endpoints
+      - events
+      - persistentvolumeclaims
+      - pods
+      - resourcequotas
+      - services
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets", "deployments", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs", "jobs"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "runai-rca.kubernetesMcp.fullname" $ }}
+  namespace: {{ $namespace | quote }}
+  labels:
+    {{- include "runai-rca.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: kubernetes-mcp
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "runai-rca.kubernetesMcp.fullname" $ }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "runai-rca.kubernetesMcp.serviceAccountName" $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if .Values.postgresMcp.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "runai-rca.postgresMcp.fullname" . }}
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "runai-rca.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: postgres-mcp
+  template:
+    metadata:
+      labels:
+        {{- include "runai-rca.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: postgres-mcp
+        {{- with .Values.postgresMcp.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.postgresMcp.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: {{ .Values.postgresMcp.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default .Values.podSecurityContext .Values.postgresMcp.podSecurityContext) }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: postgres-mcp
+          image: {{ include "runai-rca.image" (dict "root" . "image" .Values.postgresMcp.image) | quote }}
+          imagePullPolicy: {{ .Values.postgresMcp.image.pullPolicy }}
+          {{- with (default .Values.securityContext .Values.postgresMcp.securityContext) }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.postgresMcp.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.postgresMcp.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: mcp
+              containerPort: {{ .Values.postgresMcp.service.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.postgresMcp.service.port | quote }}
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "runai-rca.databaseSecretName" . }}
+                  key: {{ .Values.secrets.keys.postgresDsn | quote }}
+                  optional: true
+            - name: RUNAI_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "runai-rca.databaseSecretName" . }}
+                  key: {{ .Values.secrets.keys.runaiDbDsn | quote }}
+                  optional: true
+          resources:
+            {{- toYaml .Values.postgresMcp.resources | nindent 12 }}
+      {{- with (default .Values.nodeSelector .Values.postgresMcp.nodeSelector) }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default .Values.affinity .Values.postgresMcp.affinity) }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (default .Values.tolerations .Values.postgresMcp.tolerations) }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "runai-rca.postgresMcp.fullname" . }}
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres-mcp
+  {{- with .Values.postgresMcp.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.postgresMcp.service.type | default "ClusterIP" }}
+  ports:
+    - name: mcp
+      port: {{ .Values.postgresMcp.service.port }}
+      targetPort: mcp
+  selector:
+    {{- include "runai-rca.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres-mcp
+{{- end }}

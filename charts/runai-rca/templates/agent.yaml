@@ -134,7 +134,9 @@ spec:
             - name: PROMETHEUS_TIMEOUT_SECONDS
               value: {{ .Values.agent.env.prometheusTimeoutSeconds | quote }}
             - name: PROMETHEUS_MCP_URL
-              value: {{ .Values.agent.env.prometheusMcpUrl | quote }}
+              value: {{ if .Values.grafanaMcp.enabled }}{{ printf "http://%s:%v/mcp" (include "runai-rca.grafanaMcp.fullname" .) .Values.grafanaMcp.service.port | quote }}{{ else }}{{ .Values.agent.env.prometheusMcpUrl | quote }}{{ end }}
+            - name: KUBERNETES_MCP_URL
+              value: {{ if .Values.kubernetesMcp.enabled }}{{ printf "http://%s:%v/mcp" (include "runai-rca.kubernetesMcp.fullname" .) .Values.kubernetesMcp.service.port | quote }}{{ else }}{{ .Values.agent.env.kubernetesMcpUrl | quote }}{{ end }}
             - name: LOKI_URL
               value: {{ .Values.agent.env.lokiUrl | quote }}
             - name: LOKI_TIMEOUT_SECONDS
@@ -142,7 +144,9 @@ spec:
             - name: LOKI_QUERY_LIMIT
               value: {{ .Values.agent.env.lokiQueryLimit | quote }}
             - name: LOKI_MCP_URL
-              value: {{ .Values.agent.env.lokiMcpUrl | quote }}
+              value: {{ if .Values.grafanaMcp.enabled }}{{ printf "http://%s:%v/mcp" (include "runai-rca.grafanaMcp.fullname" .) .Values.grafanaMcp.service.port | quote }}{{ else }}{{ .Values.agent.env.lokiMcpUrl | quote }}{{ end }}
+            - name: POSTGRES_MCP_URL
+              value: {{ if .Values.postgresMcp.enabled }}{{ printf "http://%s:%v/mcp" (include "runai-rca.postgresMcp.fullname" .) .Values.postgresMcp.service.port | quote }}{{ else }}{{ .Values.agent.env.postgresMcpUrl | quote }}{{ end }}
             - name: POSTGRES_TIMEOUT_SECONDS
               value: {{ .Values.agent.env.postgresTimeoutSeconds | quote }}
             - name: TROUBLESHOOTING_CASES_FILE
