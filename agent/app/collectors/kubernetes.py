@@ -19,6 +19,7 @@ from app.mcp_client import (
     mcp_error,
     mcp_fallback_warning,
     mcp_tool_json,
+    mcp_tool_raw_text,
     mcp_tool_text,
 )
 
@@ -878,13 +879,17 @@ async def _k8s_mcp_json(
         # kubernetes-mcp-server answers in YAML, not JSON (get ops always; list
         # ops with --list-output=yaml — the chart sets it). Rejecting non-JSON
         # here demoted EVERY query to the direct API ("MCP result was not
-        # JSON"). Parse the FULL text — the "raw" preview is truncated.
-        return _k8s_yaml_payload(mcp_tool_text(result))
+        # JSON"). Parse the RAW text — masking first corrupted the YAML
+        # (base64 certs → "[MASKED]" broke the block structure), and the
+        # "raw" preview is truncated anyway. The parsed object is masked.
+        return _k8s_yaml_payload(mcp_tool_raw_text(result))
     return data
 
 
 def _k8s_yaml_payload(text: str) -> object:
-    """A dict/list from a YAML (or JSON) MCP tool reply; raises on table/plain text."""
+    """A MASKED dict/list from a YAML (or JSON) MCP tool reply.
+
+    Raises on table/plain text so the caller records an observation."""
     try:
         parsed = yaml.safe_load(text or "")
     except yaml.YAMLError:
@@ -894,7 +899,8 @@ def _k8s_yaml_payload(text: str) -> object:
             raise RuntimeError(f"MCP result was not JSON or YAML: {exc}") from exc
         parsed = docs[0] if len(docs) == 1 else {"items": docs}
     if isinstance(parsed, (dict, list)):
-        return parsed
+        # Mask AFTER parsing: same secret protection, intact structure.
+        return build_masker(()).mask_object(parsed)
     # A bare string means table/plain-text output — not machine-readable.
     raise RuntimeError("MCP result was not JSON or YAML (set --list-output=yaml)")
 

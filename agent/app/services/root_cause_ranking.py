@@ -1,6 +1,8 @@
 """Deterministic root-cause *candidate* ranking.
 
-Ranks the 5 root-cause families for the CURRENT incident from the evidence the
+Ranks EVERY family in knowledge/families.yaml (the same 15-family universe the
+curated failure modes use — the ranked categories and the ontology knowledge
+finally speak one vocabulary) for the CURRENT incident from the evidence the
 collectors already gathered. This is NOT incident similarity — pgvector /
 `similarIncidentsLocked` in the Go backend owns "which past incidents are
 similar". Here we answer "which failure family does this incident's evidence
@@ -56,6 +58,11 @@ METADATA_VALUE_KEYS = {
     "sql",
     "kubectl",
     "runai_control_plane_pods",
+    # Our OWN probe/transport failures ("no route to host" to an MCP service,
+    # a 401 from a stale agent credential) are not cluster evidence. Kernel/log
+    # lines live under "errors"/"lines"/"message" keys and stay matchable.
+    "error",
+    "mcp_fallback",
 }
 _METADATA_VALUE_KEYS = METADATA_VALUE_KEYS
 

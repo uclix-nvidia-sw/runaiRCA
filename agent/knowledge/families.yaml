@@ -158,3 +158,168 @@
     - registry
     - manifest
   reason: alert points at an image pull / registry failure
+
+# ---------------------------------------------------------------------------
+# The families below complete the RANKED universe to match failure_modes.yaml.
+# They previously existed only as signature-promotion targets, so the planner
+# hypotheses / ranked candidates (the "categories" operators see) could never
+# name them even though the ontology carried their knowledge. Keywords are
+# hardware/error-string signatures — NOT generic infra words, which would match
+# the pipeline's own probe/summary text (see METADATA_VALUE_KEYS).
+# ---------------------------------------------------------------------------
+
+- family: gpu_hardware_error
+  canonical_agent: system
+  agents:
+    - system
+    - loki
+    - kubernetes
+  keywords:
+    - "xid"
+    - "nvrm"
+    - "fallen off the bus"
+    - "no runtime for \"nvidia\""
+    - "xidcriticalerror"
+    - "inforom"
+    - "nouveau"
+    - "gpu is lost"
+  planner_keywords:
+    - "xid"
+    - "nvidia"
+    - "gpu"
+    - "dcgm"
+  reason: alert points at a GPU hardware/driver fault (NVIDIA XID)
+
+- family: network_fabric_error
+  canonical_agent: loki
+  agents:
+    - loki
+    - system
+  keywords:
+    - "nccl"
+    - "infiniband"
+    - "rdma"
+    - "nvlink"
+    - "nicclusterpolicy"
+    - "fabric manager"
+    - "gpudirect"
+    - "link flap"
+  planner_keywords:
+    - "nccl"
+    - "infiniband"
+    - "rdma"
+    - "nvlink"
+    - "fabric"
+  reason: alert points at the GPU interconnect / multi-node fabric (NCCL/IB/NVLink)
+
+- family: cluster_network_error
+  canonical_agent: kubernetes
+  agents:
+    - kubernetes
+    - loki
+  keywords:
+    - "coredns"
+    - "cni plugin"
+    - "name resolution failed"
+    - "networkplugin"
+    - "no route to host"
+  planner_keywords:
+    - "dns"
+    - "coredns"
+    - "cni"
+    - "network"
+  reason: alert points at cluster networking (CNI/DNS/pod network)
+
+- family: k8s_storage_error
+  canonical_agent: kubernetes
+  agents:
+    - kubernetes
+    - loki
+  keywords:
+    - "failedmount"
+    - "failedattachvolume"
+    - "provisioningfailed"
+    - "volumebinding"
+    - "storageclass"
+    - "persistentvolumeclaim"
+  planner_keywords:
+    - "volume"
+    - "pvc"
+    - "storageclass"
+    - "mount"
+  reason: alert points at the Kubernetes storage layer (CSI/PVC/StorageClass)
+
+- family: storage_backend_error
+  canonical_agent: system
+  agents:
+    - system
+    - loki
+    - kubernetes
+  keywords:
+    - "stale file handle"
+    - "read-only file system"
+    - "nfs server"
+    - "ceph"
+    - "input/output error"
+  planner_keywords:
+    - "nfs"
+    - "ceph"
+    - "read-only"
+  reason: alert points at the backing storage system (NFS/Ceph/filesystem)
+
+- family: workload_runtime_error
+  canonical_agent: loki
+  agents:
+    - loki
+    - kubernetes
+  keywords:
+    - "cuda out of memory"
+    - "torch.cuda"
+    - "traceback (most recent call last)"
+    - "segmentation fault"
+    - "core dumped"
+  planner_keywords:
+    - "cuda"
+    - "runtime"
+    - "application"
+  reason: alert points at the workload's own code failing at runtime
+
+- family: observability_accuracy
+  canonical_agent: prometheus
+  agents:
+    - prometheus
+    - kubernetes
+  keywords:
+    - "dcgm-exporter"
+    - "metrics-exporter"
+    - "thanos"
+    - "missingruleevaluations"
+    - "rule evaluation"
+  planner_keywords:
+    - "metrics"
+    - "dcgm"
+    - "thanos"
+    - "prometheus"
+  reason: alert points at the metrics/observability pipeline, not the workload
+
+- family: platform_auth_error
+  canonical_agent: loki
+  agents:
+    - loki
+    - kubernetes
+    - runai
+  keywords:
+    - "saml"
+    - "oidc"
+    - "keycloak"
+    - "login failed"
+    - "invalid_grant"
+    - "access rule"
+  planner_keywords:
+    - "auth"
+    - "login"
+    - "sso"
+    - "saml"
+    - "oidc"
+    - "permission"
+  reason: alert points at login/SSO/permissions (auth control plane)

@@ -73,11 +73,21 @@ async def mcp_reachability(urls: dict[str, str]) -> dict[str, str]:
 
 
 def mcp_tool_text(result: Any) -> str:
+    return build_masker(()).mask_text(mcp_tool_raw_text(result))
+
+
+def mcp_tool_raw_text(result: Any) -> str:
+    """UNMASKED tool text — for parsers only, never for display/evidence.
+
+    Masking replaces secret-looking spans (base64 certs, tokens) with
+    "[MASKED]" INSIDE the serialized YAML/JSON, which breaks the syntax
+    ("MCP result was not JSON or YAML ... [MASKED] 420"). Parse the raw text
+    first, then mask the parsed OBJECT — same protection, intact structure."""
     parts = []
     for block in getattr(result, "content", None) or []:
         text = getattr(block, "text", None)
         if isinstance(text, str):
-            parts.append(build_masker(()).mask_text(text))
+            parts.append(text)
     return "\n".join(parts)
 
 
@@ -87,7 +97,7 @@ def mcp_tool_json(result: Any) -> Any:
         structured = getattr(result, "structured_content", None)
     if structured is not None:
         return _mask_object(structured)
-    blob = mcp_tool_text(result).strip()
+    blob = mcp_tool_raw_text(result).strip()
     if not blob:
         return {}
     try:

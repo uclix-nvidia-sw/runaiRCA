@@ -269,6 +269,13 @@ class AnalysisOrchestrator:
             "nat_config_file": self._settings.nat_config_file,
             "runai_configured": bool(self._settings.runai_base_url),
             "runai_mcp_configured": bool(self._settings.runai_mcp_url),
+            # MCP transports per domain — without these the chat honestly
+            # concluded "kubernetes 전용 MCP는 구성되어 있지 않습니다" from an
+            # incomplete config listing.
+            "kubernetes_mcp_configured": bool(self._settings.kubernetes_mcp_url),
+            "prometheus_mcp_configured": bool(self._settings.prometheus_mcp_url),
+            "loki_mcp_configured": bool(self._settings.loki_mcp_url),
+            "postgres_mcp_configured": bool(self._settings.postgres_mcp_url),
             "prometheus_configured": bool(self._settings.prometheus_url),
             "loki_configured": bool(self._settings.loki_url),
             "postgres_configured": bool(self._settings.postgres_dsn),
@@ -558,6 +565,10 @@ def _runtime_snapshot_lines(context: dict[str, object]) -> list[str]:
         for key in [
             "runai_configured",
             "runai_mcp_configured",
+            "kubernetes_mcp_configured",
+            "prometheus_mcp_configured",
+            "loki_mcp_configured",
+            "postgres_mcp_configured",
             "prometheus_configured",
             "loki_configured",
             "postgres_configured",

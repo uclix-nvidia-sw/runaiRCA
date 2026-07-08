@@ -225,6 +225,35 @@ def test_k8s_yaml_payload_parses_yaml_and_rejects_tables() -> None:
         _k8s_yaml_payload("NAME   READY   STATUS\nfoo    1/1     Running")
 
 
+# The 0.1.42 run's exact corruption: masking TEXT before parsing swallowed the
+# newline after "secret:" and produced "secret: [MASKED] 420" — invalid YAML
+# ("expected <block end>, but found '<scalar>' ... [MASKED] 420"). Parsing must
+# happen on the RAW text; masking applies to the parsed object.
+_POD_YAML_WITH_SECRET_VOLUME = (
+    "metadata:\n"
+    "  name: runai-backend-xyz\n"
+    "  annotations:\n"
+    "    example.io/auth: Bearer abcdefghijklmnop123456\n"
+    "spec:\n"
+    "  volumes:\n"
+    "  - name: runai-ca\n"
+    "    secret:\n"
+    "      defaultMode: 420\n"
+    "      secretName: runai-ca-cert\n"
+    "status:\n"
+    "  phase: Running\n"
+)
+
+
+def test_k8s_yaml_payload_survives_secret_shaped_fields_and_masks_values() -> None:
+    parsed = _k8s_yaml_payload(_POD_YAML_WITH_SECRET_VOLUME)
+    # Structure is intact (text-masking corrupted it into a parse error before).
+    assert parsed["spec"]["volumes"][0]["name"] == "runai-ca"
+    assert parsed["status"]["phase"] == "Running"
+    # Secrets are still masked — on the parsed object, not the serialized text.
+    assert "abcdefghijklmnop" not in str(parsed)
+
+
 @pytest.mark.asyncio
 async def test_k8s_read_uses_mcp_yaml_reply_without_fallback(monkeypatch) -> None:
     from app.collectors import kubernetes as k8s
@@ -294,6 +323,61 @@ def test_target_pod_missing_detection() -> None:
     assert _target_pod_missing(target, gone_mcp) is True
     assert _target_pod_missing(target, rbac) is False
     assert _target_pod_missing(replace(target, pod=""), gone_direct) is False
+
+
+# --- unified family universe -----------------------------------------------------
+
+
+def test_ranker_can_nominate_ontology_families_directly() -> None:
+    # The ranked universe used to stop at 7 coarse families; GPU/fabric/storage/
+    # runtime/observability/auth knowledge existed in the ontology but could
+    # never appear as a ranked category without a signature promotion.
+    results = [
+        CollectorResult(
+            agent="system",
+            status="ok",
+            confidence="high",
+            summary=(
+                "Node dgx01: 3 kernel/hardware error line(s) found in dmesg: "
+                "NVRM: Xid (PCI:0000:3b:00): 79, GPU has fallen off the bus"
+            ),
+            details={},
+        ),
+        CollectorResult(
+            agent="loki",
+            status="ok",
+            confidence="medium",
+            summary="matched log line: XidCriticalError reported by device plugin",
+            details={},
+        ),
+    ]
+    candidates = rank_root_cause_candidates(_toolkit_target(), results)
+    assert candidates[0].family == "gpu_hardware_error", [c.as_dict() for c in candidates]
+
+
+def test_ranker_ignores_own_transport_errors() -> None:
+    # "no route to host" toward OUR MCP service is a probe failure, not
+    # cluster-network evidence.
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            confidence="high",
+            summary="Kubernetes API queries completed for the resolved alert target.",
+            details={
+                "queries": [
+                    {
+                        "name": "pod",
+                        "error": "MCP fallback: no route to host; coredns lookup failed",
+                        "data": None,
+                    }
+                ],
+                "mcp_fallback": "MCP unavailable; used direct API fallback: no route to host",
+            },
+        ),
+    ]
+    candidates = rank_root_cause_candidates(_toolkit_target(), results)
+    assert candidates[0].family == "insufficient_evidence", [c.as_dict() for c in candidates]
 
 
 # --- component identity entry point ---------------------------------------------
