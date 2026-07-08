@@ -2,5 +2,5 @@ apiVersion: v2
 name: runai-rca
 description: KubeRCA-inspired multi-agent RCA cockpit for NVIDIA Run:ai.
 type: application
-version: 0.1.45
-appVersion: "0.1.45"
+version: 0.1.46
+appVersion: "0.1.46"
