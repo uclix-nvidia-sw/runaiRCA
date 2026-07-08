@@ -270,11 +270,25 @@ async def plan_investigation(
     node_focused = not target.namespace and not target.project and not target.queue
     if node_focused:
         hypotheses = _node_first_hypotheses(hypotheses)
+    # family, and fix — lead with that family and carry the definition on the plan.
+    matched_alert = match_runai_alert(
+        load_runai_alerts(settings.runai_alerts_file), target.alert_name
+    )
+    if matched_alert and matched_alert.get("family"):
+        fam = matched_alert["family"]
+        reason = f"documented Run:ai built-in alert: {matched_alert.get('trigger', '')}".strip()
+        hypotheses = [{"family": fam, "reason": reason}] + [
+            h for h in hypotheses if h["family"] != fam
+        ]
     # Component identity: when the alert TARGET itself is a known platform
     # component (pod/workload name), that names the entry point directly — e.g.
     # runai-container-toolkit-* implicates the NVIDIA GPU Operator stack via its
-    # depends_on chain, with or without any error string in the evidence. More
-    # specific than the namespace scope, so it outranks the scope lead.
+    # depends_on chain, with or without any error string in the evidence. WHO the
+    # alert is about is more specific than both the namespace scope and the alert
+    # catalog's coarse family (a "DaemonSet Rollout Stuck" catalog entry says
+    # runai_control_plane_error even when the stuck daemonset is the container
+    # toolkit), so this promotion runs LAST and wins the lead; the catalog
+    # definition stays on the plan for its actions/narrative.
     component_entry = component_for_target(
         load_architecture(settings.architecture_file), target.pod, target.workload_name
     )
@@ -286,16 +300,6 @@ async def plan_investigation(
         reason = f"alert targets platform component '{component}' — {effect}".strip(" —")
         hypotheses = [{"family": str(component_entry["family"]), "reason": reason}] + [
             h for h in hypotheses if h["family"] != component_entry["family"]
-        ]
-    # family, and fix — lead with that family and carry the definition on the plan.
-    matched_alert = match_runai_alert(
-        load_runai_alerts(settings.runai_alerts_file), target.alert_name
-    )
-    if matched_alert and matched_alert.get("family"):
-        fam = matched_alert["family"]
-        reason = f"documented Run:ai built-in alert: {matched_alert.get('trigger', '')}".strip()
-        hypotheses = [{"family": fam, "reason": reason}] + [
-            h for h in hypotheses if h["family"] != fam
         ]
     alert_text = _alert_haystack(target, alert)
     best_similar = _best_similar(similar_incidents, alert_text)

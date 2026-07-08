@@ -278,6 +278,26 @@ async def test_planner_leads_with_the_component_family() -> None:
     assert "runai-container-toolkit" in plan.hypotheses[0]["reason"]
 
 
+@pytest.mark.asyncio
+async def test_component_identity_outranks_the_alert_catalog_family() -> None:
+    # "Run:ai DaemonSet Rollout Stuck" is a documented catalog alert carrying
+    # family runai_control_plane_error — but when the stuck daemonset IS the
+    # container toolkit, WHO the alert is about is the more specific signal and
+    # must keep the lead (the catalog definition stays on the plan for actions).
+    target = replace(
+        _toolkit_target(),
+        alert_name="RunaiDaemonSetRolloutStuck",
+    )
+    plan = await plan_investigation(
+        make_settings(), target, None, kg_context=None, similar_incidents=None
+    )
+    assert plan.matched_alert is not None  # the catalog entry was recognised
+    assert plan.component == "runai-container-toolkit"
+    assert plan.hypotheses[0]["family"] == "gpu_hardware_error"
+    families = [h["family"] for h in plan.hypotheses]
+    assert "runai_control_plane_error" in families  # catalog family still ranked
+
+
 def test_numbered_actions_lead_with_component_checks() -> None:
     from app.plan import InvestigationPlan
 
