@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
+from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
 from app.collectors.loki import _llm_insight
 from app.config import Settings
 from app.mcp_client import (
@@ -201,15 +201,22 @@ async def _postgres_result(
         warnings.append(f"Missing RCA table(s): {', '.join(missing_tables)}.")
 
     if database_kind == "runai_control_plane":
-        summary = (
+        summary = ko_en(
+            settings,
+            "Run:ai 컨트롤플레인 Postgres 읽기 전용 점검: 연결 정상, "
+            f"활성 연결 {checks['active_connections']}개.",
             "Run:ai control-plane Postgres read-only check: connectivity ok, "
-            f"{checks['active_connections']} active connection(s)."
+            f"{checks['active_connections']} active connection(s).",
         )
     else:
-        summary = (
+        summary = ko_en(
+            settings,
+            "RCA 저장소 자체 점검(장애 원인 아님): 연결 정상, "
+            f"활성 연결 {checks['active_connections']}개, "
+            f"pgvector {'설치됨' if pgvector else '미설치'}.",
             "RCA store self-check (not an incident cause): connectivity ok, "
             f"{checks['active_connections']} active connection(s), "
-            f"pgvector={'installed' if pgvector else 'missing'}."
+            f"pgvector={'installed' if pgvector else 'missing'}.",
         )
     # Owner rule: a PASSING healthcheck is NOT incident evidence. Lead with the
     # no-evidence marker (drops it from supporting evidence / signature matching)

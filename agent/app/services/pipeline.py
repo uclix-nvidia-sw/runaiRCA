@@ -16,6 +16,7 @@ from app.collectors.registry import build_collectors
 from app.config import Settings
 from app.knowledge import (
     _keyword_negated,
+    component_action_lines,
     component_check_lines,
     load_architecture,
     load_failure_modes,
@@ -858,7 +859,7 @@ async def _complete_synthesis_json(settings: Settings, *, system: str, user: str
             ),
             user=user,
             temperature=0.2,
-            max_tokens=4096,
+            max_tokens=settings.llm_synthesis_max_tokens,
             model=settings.llm_model_synthesis,
         )
         parsed = parse_json_object(text or "")
@@ -1056,6 +1057,7 @@ def _detail_from(
         missing,
         request,
         known_issues or [],
+        components=components,
     )
     if numbered:
         lines.extend(numbered)
@@ -1111,6 +1113,7 @@ def _detail_from(
             _alert_text(request),
             components,
             masker,
+            component=getattr(plan, "component", "") if plan is not None else "",
         )
     )
     lines.extend(_similar_incident_lines(request))
@@ -1426,10 +1429,11 @@ def _numbered_actions(
     missing: list[str],
     request: AlertAnalysisRequest,
     known_issues: list[dict] | None = None,
+    components: dict[str, dict] | None = None,
 ) -> list[str]:
     """One deduped, numbered priority list — documented-alert fixes first, then
-    recognised known-issue fixes, then graph-derived and curated family fixes,
-    then infra-restore steps."""
+    the alert target's own component checks, then recognised known-issue fixes,
+    graph-derived and curated family fixes, then infra-restore steps."""
     ordered: list[str] = []
     specific_actions = 0
     fuzzy = _alert_text(request)
@@ -1439,6 +1443,13 @@ def _numbered_actions(
         alert_family = str(plan.matched_alert.get("family") or "")
         if (not top_family or alert_family == top_family) and top_family != "insufficient_evidence":
             ordered.extend(str(a) for a in plan.matched_alert.get("actions", []))
+    # Component identity: the alert target IS this platform component, so its
+    # own checks + dependency chain (e.g. runai-container-toolkit → the NVIDIA
+    # GPU Operator stack) come before any keyword-matched guidance.
+    if plan is not None and getattr(plan, "component", ""):
+        component_actions = component_action_lines(components or {}, plan.component)
+        specific_actions += len(component_actions)
+        ordered.extend(component_actions)
     # Known operator cases recognised by their signature keywords in the evidence
     # (ranking-independent): version-regression / observability / expected-behavior
     # fixes surface even when the coarse family ranking points elsewhere.
@@ -1651,7 +1662,12 @@ def _observed_text(
 
 
 def _evidence_leaf_text(value: Any, *, limit: int = 2000) -> str:
-    """Evidence matching should see values, not JSON schema/key names."""
+    """Evidence matching should see RETURNED values — not JSON key names, and not
+    the probe text we sent (queries/paths/urls/name listings; see
+    root_cause_ranking.METADATA_VALUE_KEYS). A LogQL probe carrying
+    "cluster-sync" must not signature-match a cluster-sync symptom."""
+    from app.services.root_cause_ranking import METADATA_VALUE_KEYS
+
     parts: list[str] = []
 
     def add(text: object) -> None:
@@ -1668,6 +1684,8 @@ def _evidence_leaf_text(value: Any, *, limit: int = 2000) -> str:
         elif isinstance(node, (list, tuple)):
             for child in node:
                 walk(child, key)
+        elif key_l in METADATA_VALUE_KEYS:
+            return
         elif key_l in {"xid", "xid_code", "nvidia_xid"}:
             add(f"xid {node}")
         elif isinstance(node, (str, int, float, bool)):
@@ -1771,10 +1789,12 @@ def _playbook_lines(
     fuzzy_query: str = "",
     components: dict[str, dict] | None = None,
     masker: Masker | None = None,
+    component: str = "",
 ) -> list[str]:
     """Root-cause-relevant remediation, most specific first.
 
-    Precision order: matched known issues (real operator cases), then matched
+    Precision order: the alert target's OWN component (identity beats any
+    keyword), then matched known issues (real operator cases), then matched
     curated symptoms for the settled top family. Cross-family signatures have
     already been used to pick that top family; unrelated side text should not
     become playbook guidance.
@@ -1783,6 +1803,11 @@ def _playbook_lines(
     active_masker = masker or build_masker(())
     top_family = candidates[0].family if candidates else ""
     filter_to_top = _top_family_settled(candidates)
+    if component:
+        comp_lines = component_check_lines(components or {}, component)
+        if comp_lines:
+            lines.append(f"- **{component}** (the alert target itself)")
+            lines.extend(comp_lines)
     for issue in match_runai_known_issues(
         known_issues or [], observed_text, fuzzy_query=fuzzy_query
     )[:2]:

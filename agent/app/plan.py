@@ -37,6 +37,9 @@ class InvestigationPlan:
     # The matched Run:ai built-in alert definition (name/severity/trigger/actions),
     # when this alert is one of the documented built-in alerts. None otherwise.
     matched_alert: dict[str, Any] | None = None
+    # The platform component the alert target ITSELF is (runai_architecture.yaml
+    # name, e.g. "runai-container-toolkit"), resolved from the pod/workload name.
+    component: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -52,4 +55,5 @@ class InvestigationPlan:
             "used_ontology": self.used_ontology,
             "narrative": self.narrative,
             "matched_alert": self.matched_alert,
+            "component": self.component,
         }

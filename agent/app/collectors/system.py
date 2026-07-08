@@ -15,7 +15,7 @@ import re
 from pathlib import Path
 from urllib.parse import quote
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
+from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import complete, llm_configured
@@ -70,9 +70,12 @@ class SystemCollector:
 
         node = (getattr(plan, "node", "") or target.node or "").strip()
         if not node:
-            summary = (
-                f"{NO_EVIDENCE} No node is associated with this alert; node/kernel "
-                "evidence was skipped."
+            summary = f"{NO_EVIDENCE} " + ko_en(
+                self._settings,
+                "이 알림에서 노드를 특정할 수 없어 노드/커널 증거 수집을 건너뛰었습니다 "
+                "(노드 레이블이 없고 대상 pod로도 노드를 찾지 못한 경우).",
+                "No node is associated with this alert; node/kernel "
+                "evidence was skipped.",
             )
             return CollectorResult(
                 agent=self.name,
@@ -143,23 +146,33 @@ class SystemCollector:
         if with_errors:
             status = "ok"
             confidence = "high"
-            deterministic = (
+            sources_text = ", ".join(sorted({item["source"] for item in with_errors}))
+            deterministic = ko_en(
+                self._settings,
+                f"노드 {node}: {sources_text}에서 커널/하드웨어 에러 라인 "
+                f"{len(error_lines)}건을 발견했습니다.",
                 f"Node {node}: {len(error_lines)} kernel/hardware error line(s) found in "
-                + ", ".join(sorted({item["source"] for item in with_errors}))
-                + "."
+                f"{sources_text}.",
             )
         elif successful:
             # Clean node is a POSITIVE finding (status ok) — NOT a "no evidence" case.
             status = "ok"
             confidence = "medium"
-            deterministic = (
+            deterministic = ko_en(
+                self._settings,
+                f"노드 {node}: 시스템 에이전트 접속 정상, 최근 dmesg/journal/syslog에 "
+                "커널/GPU/하드웨어 에러 시그니처가 없습니다.",
                 f"Node {node}: system agent reachable, no kernel/GPU/hardware "
-                "error signatures in recent dmesg/journal/syslog."
+                "error signatures in recent dmesg/journal/syslog.",
             )
         else:
             status = "unavailable"
             confidence = "low"
-            deterministic = f"{NO_EVIDENCE} Node {node}: system agent unreachable on all sources."
+            deterministic = f"{NO_EVIDENCE} " + ko_en(
+                self._settings,
+                f"노드 {node}: 모든 소스에서 시스템 에이전트에 접속하지 못했습니다.",
+                f"Node {node}: system agent unreachable on all sources.",
+            )
 
         summary = deterministic
         if with_errors and llm_configured(self._settings):

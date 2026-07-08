@@ -245,7 +245,10 @@ grafanaMcp:
     type: ClusterIP
     port: 9901
   grafanaUrl: http://prometheus-grafana.monitoring.svc.cluster.local:80
-  grafanaOrgId: ""
+  # Grafana org for datasource lookups. Grafana's default org id is 1; leaving
+  # this empty makes mcp-grafana warn "No org ID found ... using default org"
+  # on every request and can miss datasources on multi-org installs.
+  grafanaOrgId: "1"
   command: []
   args: []
   podAnnotations: {}

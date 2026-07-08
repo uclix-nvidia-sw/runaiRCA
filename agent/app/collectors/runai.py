@@ -4,7 +4,7 @@ import re
 from typing import Any
 from urllib.parse import quote
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
+from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
 from app.collectors.http_json import compact, get_json, post_form_json, post_json
 from app.collectors.loki import _llm_insight
 from app.collectors.runai_mcp import gather_runai_via_mcp
@@ -154,21 +154,30 @@ class RunAICollector:
                     auth_failed = any(item.get("status_code") == 401 for item in query_results)
             successful = [item for item in query_results if not item.get("error")]
             if successful and not missing:
-                summary = (
+                summary = ko_en(
+                    self._settings,
+                    "Run:ai API에서 워크로드/프로젝트/큐 컨텍스트 조회를 완료했습니다.",
                     "Run:ai API direct queries completed for workload, project, "
-                    "and queue context."
+                    "and queue context.",
                 )
                 status = "ok"
                 confidence = "high"
             elif successful:
-                summary = (
+                summary = ko_en(
+                    self._settings,
+                    "Run:ai API에는 접속했지만 알림 레이블에 프로젝트/큐/워크로드 식별 "
+                    "정보가 없어 완전한 상관 분석이 어렵습니다.",
                     "Run:ai API is reachable, but alert labels are missing some project, queue, "
-                    "or workload identity needed for complete correlation."
+                    "or workload identity needed for complete correlation.",
                 )
                 status = "partial"
                 confidence = "medium"
             else:
-                summary = f"{NO_EVIDENCE} Run:ai API direct queries failed."
+                summary = f"{NO_EVIDENCE} " + ko_en(
+                    self._settings,
+                    "Run:ai API 조회가 실패했습니다.",
+                    "Run:ai API direct queries failed.",
+                )
                 status = "unavailable"
                 confidence = "low"
                 missing.append("runai.query")

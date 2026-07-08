@@ -6,7 +6,7 @@ export type DetailState =
   | null;
 
 export type EditorTab = 'write' | 'preview';
-export type MainView = 'incidents' | 'archived' | 'trash' | 'alerts' | 'analysis';
+export type MainView = 'incidents' | 'archived' | 'trash' | 'alerts' | 'analysis' | 'chat';
 export type DetailKind = 'incident' | 'alert';
 export type IncidentStatusFilter = 'all' | 'firing' | 'resolved' | 'analyzing';
 export type IncidentSeverityFilter = 'all' | 'critical' | 'warning' | 'info';
@@ -220,5 +220,10 @@ export const VIEW_COPY: Record<MainView, { eyebrow: string; title: string; place
     eyebrow: 'Analysis dashboard',
     title: 'RCA analysis lifecycle',
     placeholder: 'Search RCA, quality, missing data, agent',
+  },
+  chat: {
+    eyebrow: 'Operator chat',
+    title: 'RCA Chat',
+    placeholder: 'Search chat history',
   },
 };

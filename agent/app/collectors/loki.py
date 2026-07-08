@@ -5,7 +5,7 @@ import json
 import re
 from typing import Any
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
+from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import complete, llm_configured
@@ -145,21 +145,32 @@ class LokiCollector:
         if populated:
             status = "ok"
             confidence = "high"
-            summary = (
+            summary = ko_en(
+                self._settings,
+                f"Loki {'MCP' if used_mcp else '직접'} 조회 완료 — "
+                f"{len(query_results)}개 쿼리 그룹 중 {len(populated)}개에서 "
+                "일치하는 로그 라인을 확인했습니다.",
                 f"Loki {'MCP' if used_mcp else 'direct'} queries completed with matching log lines "
-                f"for {len(populated)} of {len(query_results)} query group(s)."
+                f"for {len(populated)} of {len(query_results)} query group(s).",
             )
         elif successful:
             status = "partial"
             confidence = "medium"
-            summary = (
-                f"{NO_EVIDENCE} Loki is reachable, but the workload log queries returned "
-                "no lines. Check label names and log retention."
+            summary = f"{NO_EVIDENCE} " + ko_en(
+                self._settings,
+                "Loki에는 접속했지만 워크로드 로그 쿼리에 일치하는 라인이 없습니다. "
+                "레이블 이름과 로그 보존 기간을 확인하세요.",
+                "Loki is reachable, but the workload log queries returned "
+                "no lines. Check label names and log retention.",
             )
         else:
             status = "unavailable"
             confidence = "low"
-            summary = f"{NO_EVIDENCE} Loki direct queries failed."
+            summary = f"{NO_EVIDENCE} " + ko_en(
+                self._settings,
+                "Loki 직접 조회가 실패했습니다.",
+                "Loki direct queries failed.",
+            )
 
         insight = await _llm_insight(self._settings, "Loki logs", summary, query_results)
         if insight:
@@ -358,6 +369,12 @@ async def _mcp_query_loki(
     }
 
 
+# Grafana datasource uids are ^[a-zA-Z0-9\-_]{1,40}$; a numeric row id or a
+# display name passed as datasourceUid makes grafana-mcp fail EVERY query with
+# 400 "id is invalid" — which demoted the whole collector to the direct fallback.
+_GRAFANA_UID = re.compile(r"^[a-zA-Z0-9\-_]{1,40}$")
+
+
 async def _grafana_datasource_uid(url: str, datasource_type: str) -> str:
     try:
         data = await _call_mcp_json(url, "list_datasources", [{}])
@@ -367,8 +384,9 @@ async def _grafana_datasource_uid(url: str, datasource_type: str) -> str:
         dtype = str(datasource.get("type") or "").lower()
         name = str(datasource.get("name") or "").lower()
         if datasource_type in dtype or datasource_type in name:
-            uid = datasource.get("uid") or datasource.get("id") or datasource.get("name")
-            return str(uid) if uid else ""
+            uid = str(datasource.get("uid") or "")
+            if _GRAFANA_UID.match(uid):
+                return uid
     return ""
 
 

@@ -141,6 +141,11 @@ class Settings:
     enable_agent_drilldown: bool
     drilldown_max_steps: int
     analysis_deadline_seconds: int
+    # Defaulted (keeps existing Settings(...) constructions source-compatible).
+    # Completion budget for the one-shot Korean report JSON: reasoning models
+    # spend it on reasoning tokens FIRST — if synthesis logs empty replies
+    # (finish_reason=length), raise this rather than shrinking the prompt.
+    llm_synthesis_max_tokens: int = 8192
 
 
 def load_settings() -> Settings:
@@ -263,6 +268,10 @@ def load_settings() -> Settings:
         # Generous per-call ceiling so a reasoning agent is never cut off mid-thought;
         # the overall analysis deadline below is the real bound. (0 = unlimited.)
         llm_request_timeout_seconds=_int_env("LLM_REQUEST_TIMEOUT_SECONDS", 300),
+        # Completion budget for the one-shot Korean report JSON. Reasoning models
+        # spend this on reasoning tokens FIRST — if synthesis logs empty replies
+        # (finish_reason=length), raise this rather than shrinking the prompt.
+        llm_synthesis_max_tokens=_int_env("LLM_SYNTHESIS_MAX_TOKENS", 8192),
         nat_config_file=os.getenv("NAT_CONFIG_FILE", "configs/runai_rca_engine.yml").strip(),
         # Run analysis through the in-process NAT engine.
         enable_nat_runtime=_bool_env("ENABLE_NAT_RUNTIME", True),

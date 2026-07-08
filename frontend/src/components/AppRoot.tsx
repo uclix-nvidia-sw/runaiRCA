@@ -39,9 +39,11 @@ import nvidiaLogo from '../assets/nvidia-logo.svg';
 import { CopyableBlock } from './common/UiParts';
 import { AnalysisDashboard } from './dashboards/AnalysisDashboard';
 import { AlertsDashboard } from './dashboards/AlertsDashboard';
+import { ChatDashboard } from './dashboards/ChatDashboard';
 import { IncidentsDashboard } from './dashboards/IncidentsDashboard';
 import { FeedbackPanel } from './workspace/FeedbackPanel';
 import { FloatingChat } from './workspace/FloatingChat';
+import { useRcaChat } from './workspace/chatSession';
 import { exportIncidentDocx } from '../exportDocx';
 import { useDashboardData } from '../hooks/useDashboardData';
 import { useEditorHistory } from '../hooks/useEditorHistory';
@@ -548,6 +550,14 @@ function App() {
     await refreshCurrentView();
   }, [refreshCurrentView]);
 
+  const chatSession = useRcaChat({
+    detail,
+    activeView,
+    incidents: dashboardIncidents,
+    alerts: dashboardAlerts,
+    onAnalysisCreated: () => load({ silent: true }),
+  });
+
   useEffect(() => {
     if (realtimeEventMatchesDetail(detail, realtimePayload)) {
       void refreshDetail();
@@ -586,6 +596,13 @@ function App() {
           >
             <ListChecks size={18} /> Analysis
           </button>
+          <button
+            className={`nav-item ${activeView === 'chat' ? 'active' : ''}`}
+            onClick={() => switchView('chat')}
+            type="button"
+          >
+            <MessageSquare size={18} /> Chat
+          </button>
         </nav>
         <nav className="utility-nav" aria-label="Incident lifecycle views">
           <button
@@ -622,7 +639,7 @@ function App() {
             <input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search"
+              placeholder={viewCopy.placeholder}
             />
           </div>
           <button
@@ -683,6 +700,9 @@ function App() {
             alerts={analysisAlerts}
           />
         )}
+        {activeView === 'chat' && (
+          <ChatDashboard chat={chatSession} query={query} />
+        )}
       </main>
 
       <UnifiedWorkspace
@@ -702,12 +722,8 @@ function App() {
         }}
       />
       <FloatingChat
-        detail={detail}
-        activeView={activeView}
-        incidents={dashboardIncidents}
-        alerts={dashboardAlerts}
+        chat={chatSession}
         onDockedChange={setChatDocked}
-        onAnalysisCreated={load}
       />
     </div>
   );
@@ -967,12 +983,17 @@ function ProgressTimeline({
         <div className="progress-timeline-body">
           {ledger.length > 0 && (
             <div className="hypothesis-strip">
-              {ledger.slice(0, 4).map((item) => (
-                <span key={String(item.id)} className={`hypothesis-chip status-${String(item.status || 'open')}`}>
-                  <strong>{String(item.family || item.id || 'hypothesis').replace(/_/g, ' ')}</strong>
-                  {typeof item.confidence === 'number' && <em>{Math.round(item.confidence * 100)}%</em>}
-                </span>
-              ))}
+              {ledger.slice(0, 4).map((item) => {
+                // 0.5 with status "open" is the investigator's untouched seed, not a
+                // computed probability — showing "50%" on every chip misled operators.
+                const seeded = String(item.status || 'open') === 'open' && item.confidence === 0.5;
+                return (
+                  <span key={String(item.id)} className={`hypothesis-chip status-${String(item.status || 'open')}`}>
+                    <strong>{String(item.family || item.id || 'hypothesis').replace(/_/g, ' ')}</strong>
+                    {typeof item.confidence === 'number' && !seeded && <em>{Math.round(item.confidence * 100)}%</em>}
+                  </span>
+                );
+              })}
             </div>
           )}
           {visible.length === 0 ? (
@@ -1183,6 +1204,15 @@ function agentReasons(agent: string, missingData: string[], warnings: string[]):
   return Array.from(new Set([...fromMissing, ...fromWarnings]));
 }
 
+// Owner rule: a no-evidence check (e.g. a PASSING DB healthcheck) is not worth
+// a card — show only artifacts that actually helped, with the rest behind a
+// count the operator can expand.
+const NO_EVIDENCE_PREFIX = '증거를 찾기 어렵습니다.';
+
+function isNoEvidenceArtifact(artifact: Artifact) {
+  return String(artifact.summary || '').trim().startsWith(NO_EVIDENCE_PREFIX);
+}
+
 function AgentEvidence({
   agent,
   status,
@@ -1195,8 +1225,12 @@ function AgentEvidence({
   reasons?: string[];
 }) {
   const [open, setOpen] = useState(false);
+  const [showAll, setShowAll] = useState(false);
   const icon = agentIcon(agent);
   const emptyText = reasons.length > 0 ? reasons.join(' ') : 'No evidence yet.';
+  const helpful = artifacts.filter((artifact) => !isNoEvidenceArtifact(artifact));
+  const hidden = artifacts.length - helpful.length;
+  const visible = showAll ? artifacts : helpful;
   return (
     <article className="agent-evidence">
       <button className="agent-toggle" onClick={() => setOpen((value) => !value)} type="button">
@@ -1207,15 +1241,20 @@ function AgentEvidence({
       </button>
       {open && (
         <div className="agent-content">
-          {artifacts.length === 0 ? (
+          {visible.length === 0 ? (
             <p className="empty">{emptyText}</p>
           ) : (
-            artifacts.map((artifact, index) => (
+            visible.map((artifact, index) => (
               <ArtifactResult
                 artifact={artifact}
                 key={`${artifact.agent}-${artifact.type}-${index}`}
               />
             ))
+          )}
+          {hidden > 0 && (
+            <button className="artifact-toggle compact-artifact-toggle" onClick={() => setShowAll((value) => !value)} type="button">
+              {showAll ? `Hide ${hidden} no-evidence item(s)` : `Show ${hidden} no-evidence item(s)`}
+            </button>
           )}
         </div>
       )}
