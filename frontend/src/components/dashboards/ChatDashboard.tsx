@@ -103,7 +103,7 @@ export function ChatDashboard({
             {chat.activeConversation && (
               <button
                 type="button"
-                onClick={() => chat.deleteConversation(chat.activeConversationID)}
+                onClick={() => void chat.deleteConversation(chat.activeConversationID)}
                 aria-label="Delete chat"
                 title="Delete chat"
               >

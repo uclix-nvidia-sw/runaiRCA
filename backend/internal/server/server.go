@@ -451,6 +451,9 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleKPIStats(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/events":
 		s.handleEvents(w, r)
+	case (r.Method == http.MethodGet || r.Method == http.MethodDelete) &&
+		strings.HasPrefix(r.URL.Path, "/api/v1/chat/conversations"):
+		s.handleChatConversations(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/chat":
 		s.handleChat(w, r)
 	default:

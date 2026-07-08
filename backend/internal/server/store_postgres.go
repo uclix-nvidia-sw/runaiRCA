@@ -288,11 +288,22 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 		)`,
 		`ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb`,
 		`ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS first_completed_at TIMESTAMPTZ`,
+		`CREATE TABLE IF NOT EXISTS chat_conversations (
+			conversation_id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			context_label TEXT NOT NULL DEFAULT '',
+			incident_id TEXT NOT NULL DEFAULT '',
+			alert_id TEXT NOT NULL DEFAULT '',
+			messages JSONB NOT NULL DEFAULT '[]'::jsonb,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_alerts_incident_id ON alerts (incident_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_feedback_target ON rca_feedback (target_type, target_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_comments_target ON rca_comments (target_type, target_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_created_at ON analysis_runs (created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_target ON analysis_runs (target_type, target_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_chat_conversations_updated_at ON chat_conversations (updated_at DESC)`,
 		`UPDATE analysis_runs
 			SET status = 'failed',
 				analysis_quality = COALESCE(NULLIF(analysis_quality, ''), 'low'),
@@ -381,6 +392,7 @@ func (s *Store) loadDatabaseState(ctx context.Context) {
 	s.loadFeedback(ctx)
 	s.loadComments(ctx)
 	s.loadAnalysisRuns(ctx)
+	s.loadChatConversations(ctx)
 }
 
 func (s *Store) loadIncidents(ctx context.Context) {
@@ -750,6 +762,44 @@ func (s *Store) loadAnalysisRuns(ctx context.Context) {
 	}
 }
 
+func (s *Store) loadChatConversations(ctx context.Context) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT conversation_id, title, context_label, incident_id, alert_id,
+		        messages, created_at, updated_at
+		   FROM chat_conversations`,
+	)
+	if err != nil {
+		log.Printf("Failed to load chat conversations: %v", err)
+		return
+	}
+	defer rows.Close()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for rows.Next() {
+		var conversation ChatConversation
+		var messagesRaw []byte
+		if err := rows.Scan(
+			&conversation.ID,
+			&conversation.Title,
+			&conversation.ContextLabel,
+			&conversation.IncidentID,
+			&conversation.AlertID,
+			&messagesRaw,
+			&conversation.CreatedAt,
+			&conversation.UpdatedAt,
+		); err != nil {
+			log.Printf("Failed to scan chat conversation: %v", err)
+			continue
+		}
+		_ = json.Unmarshal(messagesRaw, &conversation.Messages)
+		if conversation.Messages == nil {
+			conversation.Messages = []ChatMessageRecord{}
+		}
+		s.chatConversations[conversation.ID] = &conversation
+	}
+}
+
 func (s *Store) persistIncidentLocked(incident *Incident) bool {
 	if s.db == nil || !s.dbReady || incident == nil {
 		return true
@@ -813,6 +863,7 @@ func (s *Store) persistHardDeleteIncidentLocked(incidentID string, alertIDs []st
 	}()
 	for _, query := range []string{
 		`DELETE FROM analysis_runs WHERE incident_id = $1 OR alert_id = ANY($2)`,
+		`DELETE FROM chat_conversations WHERE incident_id = $1 OR alert_id = ANY($2)`,
 		`DELETE FROM rca_comments WHERE incident_id = $1 OR target_id = $1 OR alert_id = ANY($2) OR target_id = ANY($2)`,
 		`DELETE FROM rca_feedback WHERE incident_id = $1 OR target_id = $1 OR alert_id = ANY($2) OR target_id = ANY($2)`,
 		`DELETE FROM incident_embeddings WHERE incident_id = $1 OR alert_id = ANY($2)`,
@@ -1112,4 +1163,43 @@ func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) bool {
 		return false
 	}
 	return true
+}
+
+func (s *Store) persistChatConversationLocked(conversation *ChatConversation) {
+	if s.db == nil || !s.dbReady || conversation == nil {
+		return
+	}
+	_, err := s.execPostgres(
+		`INSERT INTO chat_conversations (
+			conversation_id, title, context_label, incident_id, alert_id,
+			messages, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (conversation_id) DO UPDATE SET
+			title = EXCLUDED.title,
+			context_label = EXCLUDED.context_label,
+			incident_id = EXCLUDED.incident_id,
+			alert_id = EXCLUDED.alert_id,
+			messages = EXCLUDED.messages,
+			updated_at = EXCLUDED.updated_at`,
+		conversation.ID,
+		conversation.Title,
+		conversation.ContextLabel,
+		conversation.IncidentID,
+		conversation.AlertID,
+		mustJSON(conversation.Messages),
+		conversation.CreatedAt,
+		conversation.UpdatedAt,
+	)
+	if err != nil {
+		log.Printf("Failed to persist chat conversation %s: %v", conversation.ID, err)
+	}
+}
+
+func (s *Store) persistChatConversationDeleteLocked(id string) {
+	if s.db == nil || !s.dbReady || id == "" {
+		return
+	}
+	if _, err := s.execPostgres(`DELETE FROM chat_conversations WHERE conversation_id = $1`, id); err != nil {
+		log.Printf("Failed to delete chat conversation %s: %v", id, err)
+	}
 }

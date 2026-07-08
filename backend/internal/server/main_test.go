@@ -926,6 +926,57 @@ func TestChatRouteProxiesContextualRCARequestToAgent(t *testing.T) {
 	}
 }
 
+func TestChatHistoryPersistsListsAndDeletes(t *testing.T) {
+	server := NewServer()
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(ChatResponse{
+			Status:         "ok",
+			Answer:         "The scheduler is blocked by GPU quota.",
+			ConversationID: "chat-history",
+		})
+	}))
+	defer agent.Close()
+	server.agentURL = agent.URL
+
+	body, _ := json.Marshal(ChatRequest{
+		Message:        "Why is the workload pending?",
+		ConversationID: "chat-history",
+		Page:           "chat_dashboard",
+	})
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected chat 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	listRec := httptest.NewRecorder()
+	server.routes().ServeHTTP(listRec, httptest.NewRequest(http.MethodGet, "/api/v1/chat/conversations", nil))
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("expected history 200, got %d: %s", listRec.Code, listRec.Body.String())
+	}
+	var list struct {
+		Data []ChatConversation `json:"data"`
+	}
+	if err := json.Unmarshal(listRec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode history: %v", err)
+	}
+	if len(list.Data) != 1 || list.Data[0].ID != "chat-history" || len(list.Data[0].Messages) != 2 {
+		t.Fatalf("unexpected history: %+v", list.Data)
+	}
+	if list.Data[0].Messages[0].Role != "user" || list.Data[0].Messages[1].Role != "assistant" {
+		t.Fatalf("unexpected message roles: %+v", list.Data[0].Messages)
+	}
+
+	deleteRec := httptest.NewRecorder()
+	server.routes().ServeHTTP(deleteRec, httptest.NewRequest(http.MethodDelete, "/api/v1/chat/conversations/chat-history", nil))
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("expected delete 200, got %d: %s", deleteRec.Code, deleteRec.Body.String())
+	}
+	if _, total := server.store.ListChatConversationsPage(0, 0); total != 0 {
+		t.Fatalf("expected chat history to be deleted, total=%d", total)
+	}
+}
+
 func TestIncidentChatContextSummarizesAlerts(t *testing.T) {
 	alerts := []AlertRecord{{
 		AlertID:         "ALR-chat-context",

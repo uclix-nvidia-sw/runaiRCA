@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
-import { chat, type ChatRequest } from '../../api';
+import {
+  chat,
+  deleteChatConversation,
+  fetchChatConversations,
+  type ChatHistoryConversation,
+  type ChatRequest,
+} from '../../api';
 import { type DetailState, type MainView, VIEW_COPY } from '../../models/appTypes';
 import { type AlertRecord, type Incident, type IncidentDetail } from '../../types';
 import { alertOccurrenceCount, sumAlertOccurrences } from '../../utils/formatters';
@@ -35,7 +41,6 @@ export type ChatContextValue = {
   context: Record<string, unknown>;
 };
 
-const CHAT_HISTORY_KEY = 'runai-rca-chat-history-v1';
 const MAX_CONVERSATIONS = 30;
 
 export function useRcaChat({
@@ -51,9 +56,8 @@ export function useRcaChat({
   alerts: AlertRecord[];
   onAnalysisCreated: () => Promise<void> | void;
 }) {
-  const [initialState] = useState(loadInitialChatState);
-  const [conversations, setConversations] = useState(initialState.conversations);
-  const [activeConversationID, setActiveConversationID] = useState(initialState.activeConversationID);
+  const [conversations, setConversations] = useState<ChatConversation[]>([]);
+  const [activeConversationID, setActiveConversationID] = useState('');
   const [manualIncidentID, setManualIncidentID] = useState('');
   const [manualAlertID, setManualAlertID] = useState('');
   const [input, setInput] = useState('');
@@ -76,13 +80,19 @@ export function useRcaChat({
   }, [chatContext.incidentID, chatContext.alertID]);
 
   useEffect(() => {
-    // ponytail: browser-local history; move to backend when history must follow users across devices.
-    try {
-      window.localStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(conversations));
-    } catch {
-      // Local history is best-effort; chat itself should keep working.
-    }
-  }, [conversations]);
+    let cancelled = false;
+    fetchChatConversations({ limit: MAX_CONVERSATIONS, offset: 0 })
+      .then((result) => {
+        if (cancelled) return;
+        const next = result.items.map(fromHistoryConversation);
+        setConversations(next);
+        setActiveConversationID((current) => current || next[0]?.id || '');
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const startNewConversation = useCallback(() => {
     setActiveConversationID('');
@@ -94,7 +104,8 @@ export function useRcaChat({
     setInput('');
   }, []);
 
-  const deleteConversation = useCallback((id: string) => {
+  const deleteConversation = useCallback(async (id: string) => {
+    await deleteChatConversation(id);
     setConversations((previous) => previous.filter((conversation) => conversation.id !== id));
     setActiveConversationID((current) => (current === id ? '' : current));
   }, []);
@@ -216,14 +227,6 @@ export function useRcaChat({
 
 export type RcaChatController = ReturnType<typeof useRcaChat>;
 
-function loadInitialChatState() {
-  const conversations = readChatHistory();
-  return {
-    conversations,
-    activeConversationID: conversations[0]?.id ?? '',
-  };
-}
-
 function makeChatMessage(role: ChatMessage['role'], content: string): ChatMessage {
   return {
     id: randomID(role),
@@ -250,25 +253,24 @@ function upsertConversation(conversations: ChatConversation[], conversation: Cha
   return next.slice(0, MAX_CONVERSATIONS);
 }
 
-function readChatHistory(): ChatConversation[] {
-  try {
-    const parsed = JSON.parse(window.localStorage.getItem(CHAT_HISTORY_KEY) || '[]');
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(isChatConversation).slice(0, MAX_CONVERSATIONS);
-  } catch {
-    return [];
-  }
-}
-
-function isChatConversation(value: unknown): value is ChatConversation {
-  if (!value || typeof value !== 'object') return false;
-  const item = value as Partial<ChatConversation>;
-  return Boolean(
-    typeof item.id === 'string' &&
-    typeof item.title === 'string' &&
-    typeof item.updatedAt === 'string' &&
-    Array.isArray(item.messages),
-  );
+function fromHistoryConversation(conversation: ChatHistoryConversation): ChatConversation {
+  return {
+    id: conversation.id,
+    title: conversation.title,
+    contextLabel: conversation.context_label,
+    incidentID: conversation.incident_id ?? '',
+    alertID: conversation.alert_id ?? '',
+    createdAt: conversation.created_at,
+    updatedAt: conversation.updated_at,
+    messages: (conversation.messages ?? [])
+      .filter((message) => message.role === 'user' || message.role === 'assistant')
+      .map((message) => ({
+        id: message.id,
+        role: message.role,
+        content: message.content,
+        createdAt: message.created_at,
+      })),
+  };
 }
 
 function buildChatContext(

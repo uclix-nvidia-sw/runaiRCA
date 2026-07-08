@@ -34,6 +34,10 @@ func TestPostgresConnectReportsPGVectorEnabledAndLoadsState(t *testing.T) {
 	if !state.Executed("idx_analysis_runs_one_analyzing_alert") {
 		t.Fatalf("expected alert-scoped analyzing run uniqueness DDL, got %+v", state.Execs())
 	}
+	if !state.Executed("CREATE TABLE IF NOT EXISTS chat_conversations") ||
+		!state.Executed("idx_chat_conversations_updated_at") {
+		t.Fatalf("expected chat history schema statements, got %+v", state.Execs())
+	}
 	for _, ddl := range []string{
 		"ADD COLUMN IF NOT EXISTS user_approved_at",
 		"ADD COLUMN IF NOT EXISTS archived_at",
@@ -160,6 +164,7 @@ func TestPostgresHardDeleteUsesSingleTransaction(t *testing.T) {
 	}
 	for _, fragment := range []string{
 		"DELETE FROM analysis_runs",
+		"DELETE FROM chat_conversations",
 		"DELETE FROM rca_comments",
 		"DELETE FROM rca_feedback",
 		"DELETE FROM incident_embeddings",
@@ -216,6 +221,12 @@ func TestPostgresRuntimeOperationsUseDeadlines(t *testing.T) {
 	store.DeleteComment("incident", incident.IncidentID, summary.Comments[0].CommentID)
 	run := store.CreateAnalysisRun("manual", "alert", alert.AlertID, incident.IncidentID, alert.AlertID, "deadline run", "")
 	store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{Status: "ok", AnalysisSummary: "done"})
+	chat := store.SaveChatExchange(
+		ChatRequest{Message: "Why is this firing?", ConversationID: "chat-deadline", IncidentID: incident.IncidentID},
+		ChatResponse{Status: "ok", Answer: "Quota is saturated.", ConversationID: "chat-deadline"},
+		time.Now().UTC(),
+	)
+	store.DeleteChatConversation(chat.ID)
 	store.SearchIncidentMemory("gpu quota scheduling", 5)
 
 	if execs, queries := state.DeadlineMisses(); execs != 0 || queries != 0 {
@@ -244,5 +255,9 @@ func assertLoadedPostgresMemory(t *testing.T, store *Store) {
 	runs := store.ListAnalysisRuns()
 	if len(runs) != 1 || runs[0].RunID != "ANL-db" || runs[0].Status != "complete" {
 		t.Fatalf("expected analysis run to reload, got %+v", runs)
+	}
+	chats, total := store.ListChatConversationsPage(0, 0)
+	if total != 1 || len(chats) != 1 || chats[0].ID != "chat-db" || len(chats[0].Messages) != 2 {
+		t.Fatalf("expected chat conversation to reload, total=%d chats=%+v", total, chats)
 	}
 }
