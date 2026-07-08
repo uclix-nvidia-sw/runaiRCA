@@ -2625,11 +2625,66 @@ func TestFlappingWindowGroupsRecurrenceWithinConfiguredWindow(t *testing.T) {
 	if r2.NewAlert {
 		t.Fatalf("2h recurrence should not create a new alert row")
 	}
+	if r2.Alert.OccurrenceCount != 2 {
+		t.Fatalf("2h recurrence should grow occurrence to 2, got %d", r2.Alert.OccurrenceCount)
+	}
+	if r2.Incident.AlertCount != 2 {
+		t.Fatalf("2h recurrence should grow incident AlertCount to 2, got %d", r2.Incident.AlertCount)
+	}
 	// recurrence 5h after the last → beyond 3h window → NEW incident
 	wh, a = mk(base.Add(7 * time.Hour))
 	r3 := store.UpsertAlertResult(wh, a)
 	if r3.Incident.IncidentID == r1.Incident.IncidentID {
 		t.Fatalf("recurrence beyond window should start a new incident")
+	}
+}
+
+func TestResolvedThenRefiringGrowsOccurrence(t *testing.T) {
+	// The user's real cadence: an alert fires, resolves, then fires again ~2h later
+	// with the SAME Alertmanager fingerprint. Each fresh firing episode must grow the
+	// occurrence count — not merely toggle status firing↔resolved with the count
+	// stuck at 1. The resolve itself must NOT grow the count.
+	t.Setenv("FLAPPING_GROUP_WINDOW_MINUTES", "180") // 3h, so the 2h re-fire reuses the incident
+	store := NewStore()
+	mk := func(alertStatus string, ts time.Time) (AlertmanagerWebhook, Alert) {
+		a := Alert{
+			Status:      alertStatus,
+			Labels:      map[string]string{"alertname": "RunaiReconcile", "namespace": "runai", "pod": "runai-project-controller-5d696ddbf9-hct89"},
+			Annotations: map[string]string{},
+			Fingerprint: "fp-reconcile",
+			StartsAt:    ts.Format(time.RFC3339),
+		}
+		if alertStatus == "resolved" {
+			a.EndsAt = ts.Format(time.RFC3339)
+		}
+		return AlertmanagerWebhook{}, a
+	}
+	base := time.Now().UTC().Add(-4 * time.Hour)
+	wh, a := mk("firing", base)
+	r1 := store.UpsertAlertResult(wh, a)
+	if r1.Alert.OccurrenceCount != 1 {
+		t.Fatalf("first firing occurrence = %d, want 1", r1.Alert.OccurrenceCount)
+	}
+	// resolve — must NOT grow the count
+	wh, a = mk("resolved", base.Add(30*time.Minute))
+	rResolved := store.UpsertAlertResult(wh, a)
+	if rResolved.Alert.OccurrenceCount != 1 {
+		t.Fatalf("resolve must not grow occurrence, got %d", rResolved.Alert.OccurrenceCount)
+	}
+	// re-fire 2h later, same fingerprint — a genuine new episode → occurrence grows
+	wh, a = mk("firing", base.Add(2*time.Hour))
+	r2 := store.UpsertAlertResult(wh, a)
+	if r2.Incident.IncidentID != r1.Incident.IncidentID {
+		t.Fatalf("re-fire should reuse incident: %s vs %s", r2.Incident.IncidentID, r1.Incident.IncidentID)
+	}
+	if r2.Alert.Status != "firing" {
+		t.Fatalf("re-fire status = %s, want firing", r2.Alert.Status)
+	}
+	if r2.Alert.OccurrenceCount != 2 {
+		t.Fatalf("resolved→re-fire must grow occurrence to 2, got %d", r2.Alert.OccurrenceCount)
+	}
+	if r2.Incident.AlertCount != 2 {
+		t.Fatalf("resolved→re-fire must grow incident AlertCount to 2, got %d", r2.Incident.AlertCount)
 	}
 }
 

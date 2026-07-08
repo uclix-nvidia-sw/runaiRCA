@@ -383,7 +383,15 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 		previousResolvedAt = record.ResolvedAt
 		previousOccurrenceCount = record.OccurrenceCount
 	}
-	newOccurrence := newAlert || existingIDForFingerprint == "" || existingIDForFingerprint != alertID
+	// A fresh firing EPISODE is a genuine new occurrence, not a duplicate resend.
+	// Real Alertmanager reuses the same fingerprint across resolve→firing AND
+	// across repeat_interval resends, so fingerprint-novelty alone (below) freezes
+	// the count at 1. A new episode shows up as either a resolved→firing transition
+	// or a strictly newer StartsAt; repeat resends of a still-firing alert keep the
+	// same StartsAt, so they stay uncounted.
+	reFired := alertStatus != "resolved" &&
+		(previousStatus == "resolved" || alertFiredAt.After(previousFiredAt))
+	newOccurrence := newAlert || existingIDForFingerprint == "" || existingIDForFingerprint != alertID || reFired
 	if newOccurrence {
 		incident.AlertCount++
 	}
