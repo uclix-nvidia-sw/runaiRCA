@@ -1889,7 +1889,10 @@ td span.occurrence-pill {
 .workspace::before {
   content: "";
   position: fixed;
-  inset: 0 0 0 17rem;
+  /* Must match .workspace left (13rem). Was 17rem — a leftover from when the
+     panel sat at 18rem — which left the top/bottom-left frame gap uncovered, so
+     the dashboard behind bled through as a clipped sliver above the header. */
+  inset: 0 0 0 13rem;
   z-index: -1;
   background: #ffffff;
 }
