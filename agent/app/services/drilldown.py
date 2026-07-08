@@ -492,6 +492,25 @@ def _component_mentioned_as_evidence(text: str, component: str) -> bool:
 # Domain tools. Each: async (settings, target, args) -> {query, summary, error?, result?}
 
 
+# Valid metric-name reference, spliced into the metric-querying tool descriptions
+# (rendered into both the drilldown and chat LLM system prompts) so the model uses
+# real names instead of inventing ones that 400. PromQL series are the ones this
+# agent already queries (known-present in this deployment); Run:ai metricType enums
+# are from the Run:ai supported-metrics/telemetry docs, GPU-profiling omitted:
+# https://run-ai-docs.nvidia.com/saas/platform-management/monitor-performance/metrics
+_KNOWN_PROMQL_SERIES = (
+    "runai_queue_allocated_gpus, runai_queue_requested_gpus, "
+    "runai_project_allocated_gpus, runai_project_requested_gpus, "
+    "kube_pod_status_phase, kube_pod_container_status_restarts_total, "
+    "container_memory_working_set_bytes, container_cpu_usage_seconds_total"
+)
+_RUNAI_METRIC_TYPES = (
+    "GPU_UTILIZATION, GPU_MEMORY_USAGE_BYTES, GPU_MEMORY_UTILIZATION, ALLOCATED_GPU, "
+    "TOTAL_GPU, CPU_UTILIZATION, CPU_MEMORY_USAGE_BYTES, POD_COUNT, RUNNING_POD_COUNT, "
+    "AVG_WORKLOAD_WAIT_TIME, ALLOCATED_GPUS, FREE_GPUS, IDLE_ALLOCATED_GPUS"
+)
+
+
 def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
     """Per-agent tool registries — THE scoping boundary between domains."""
     registry: dict[str, dict[str, dict[str, Any]]] = {
@@ -512,7 +531,9 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
                 "description": (
                     "One MCP-first PromQL instant query against cluster metrics. args: "
                     "query (PromQL, e.g. 'rate(kube_pod_container_status_restarts_"
-                    'total{namespace="x"}[15m])\')'
+                    'total{namespace="x"}[15m])\'). '
+                    f"Prefer these known-present series: {_KNOWN_PROMQL_SERIES}. "
+                    "Use exact metric names — an invented/misspelled name 400s."
                 ),
                 "call": _tool_promql,
             }
@@ -541,7 +562,8 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
                 "description": (
                     "Call one Run:ai REST API operation — GET ONLY, path must start "
                     "with /api/. args: path (e.g. '/api/v1/workloads'), query? "
-                    "(param map, e.g. {'name': 'job-1'})"
+                    "(param map, e.g. {'name': 'job-1'}). "
+                    f"For metrics endpoints, valid metricType values include: {_RUNAI_METRIC_TYPES}."
                 ),
                 "call": _tool_runai_get,
             },

@@ -3,13 +3,47 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from typing import Any
+
+import httpx
 
 from app.masking import build_masker
 
 _log = logging.getLogger(__name__)
 
 MCP_FALLBACK_WARNING = "MCP unavailable; used direct API fallback"
+
+
+def _mcp_client_factory():
+    """httpx client factory for MCP streamable-HTTP calls.
+
+    MCP endpoints here are internal and served with self-signed certs, so default
+    to skipping TLS verification — otherwise every https MCP call fails the
+    handshake and demotes the whole collector to the noisier direct-API fallback.
+    This is an internal RCA tool; set MCP_TLS_VERIFY=true once the endpoints
+    present a trusted cert to restore verification.
+    ponytail: insecure-by-default MCP TLS; flip MCP_TLS_VERIFY=true to harden.
+    """
+    if os.getenv("MCP_TLS_VERIFY", "").strip().lower() in ("1", "true", "yes"):
+        return None  # None → SDK's default client (system trust store)
+
+    def factory(
+        headers: dict[str, str] | None = None,
+        timeout: httpx.Timeout | None = None,
+        auth: httpx.Auth | None = None,
+    ) -> httpx.AsyncClient:
+        # Mirrors mcp.shared._httpx_utils.create_mcp_http_client (follow_redirects +
+        # 30s/300s default timeout) with TLS verification disabled.
+        kwargs: dict[str, Any] = {"follow_redirects": True, "verify": False}
+        kwargs["timeout"] = timeout if timeout is not None else httpx.Timeout(30.0, read=300.0)
+        if headers is not None:
+            kwargs["headers"] = headers
+        if auth is not None:
+            kwargs["auth"] = auth
+        return httpx.AsyncClient(**kwargs)
+
+    return factory
 
 
 def mcp_fallback_warning(exc: Exception) -> str:
@@ -36,9 +70,12 @@ async def mcp_call(url: str, tool: str, arguments: dict[str, Any]) -> Any:
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
+    factory = _mcp_client_factory()
+    extra = {"httpx_client_factory": factory} if factory else {}
+
     for attempt in range(2):
         try:
-            async with streamablehttp_client(url) as (read, write, *_rest):
+            async with streamablehttp_client(url, **extra) as (read, write, *_rest):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     return await session.call_tool(tool, arguments)
@@ -56,12 +93,14 @@ async def mcp_reachability(urls: dict[str, str]) -> dict[str, str]:
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
+    factory = _mcp_client_factory()
+    extra = {"httpx_client_factory": factory} if factory else {}
     report: dict[str, str] = {}
     for name, url in urls.items():
         if not url:
             continue
         try:
-            async with streamablehttp_client(url) as (read, write, *_rest):
+            async with streamablehttp_client(url, **extra) as (read, write, *_rest):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     tools = await session.list_tools()
