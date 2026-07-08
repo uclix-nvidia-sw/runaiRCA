@@ -39,9 +39,11 @@ import nvidiaLogo from '../assets/nvidia-logo.svg';
 import { CopyableBlock } from './common/UiParts';
 import { AnalysisDashboard } from './dashboards/AnalysisDashboard';
 import { AlertsDashboard } from './dashboards/AlertsDashboard';
+import { ChatDashboard } from './dashboards/ChatDashboard';
 import { IncidentsDashboard } from './dashboards/IncidentsDashboard';
 import { FeedbackPanel } from './workspace/FeedbackPanel';
 import { FloatingChat } from './workspace/FloatingChat';
+import { useRcaChat } from './workspace/chatSession';
 import { exportIncidentDocx } from '../exportDocx';
 import { useDashboardData } from '../hooks/useDashboardData';
 import { useEditorHistory } from '../hooks/useEditorHistory';
@@ -548,6 +550,14 @@ function App() {
     await refreshCurrentView();
   }, [refreshCurrentView]);
 
+  const chatSession = useRcaChat({
+    detail,
+    activeView,
+    incidents: dashboardIncidents,
+    alerts: dashboardAlerts,
+    onAnalysisCreated: () => load({ silent: true }),
+  });
+
   useEffect(() => {
     if (realtimeEventMatchesDetail(detail, realtimePayload)) {
       void refreshDetail();
@@ -586,6 +596,13 @@ function App() {
           >
             <ListChecks size={18} /> Analysis
           </button>
+          <button
+            className={`nav-item ${activeView === 'chat' ? 'active' : ''}`}
+            onClick={() => switchView('chat')}
+            type="button"
+          >
+            <MessageSquare size={18} /> Chat
+          </button>
         </nav>
         <nav className="utility-nav" aria-label="Incident lifecycle views">
           <button
@@ -622,7 +639,7 @@ function App() {
             <input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search"
+              placeholder={viewCopy.placeholder}
             />
           </div>
           <button
@@ -683,6 +700,9 @@ function App() {
             alerts={analysisAlerts}
           />
         )}
+        {activeView === 'chat' && (
+          <ChatDashboard chat={chatSession} query={query} />
+        )}
       </main>
 
       <UnifiedWorkspace
@@ -702,12 +722,8 @@ function App() {
         }}
       />
       <FloatingChat
-        detail={detail}
-        activeView={activeView}
-        incidents={dashboardIncidents}
-        alerts={dashboardAlerts}
+        chat={chatSession}
         onDockedChange={setChatDocked}
-        onAnalysisCreated={load}
       />
     </div>
   );
