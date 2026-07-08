@@ -11,7 +11,7 @@ import yaml
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
-from app.llm import complete, llm_configured
+from app.llm import cached_insight, complete, insight_cache_key, llm_configured
 from app.masking import build_masker
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
@@ -19,6 +19,7 @@ from app.mcp_client import (
     mcp_error,
     mcp_fallback_warning,
     mcp_tool_json,
+    mcp_tool_raw_text,
     mcp_tool_text,
 )
 
@@ -78,8 +79,44 @@ def exec_command_allowed(argv: list[str]) -> bool:
 # what was missing was FREEFORM querying beyond the collector's fixed set. Kind
 # allowlist + GET/LIST-only by construction (secrets deliberately absent); RBAC
 # (agent-rbac.yaml) is the second fence.
+# Run:ai CRDs the scheduler-RCA path must be able to read (kubectl parity:
+# `kubectl get project/queue/podgroup …`). API versions differ across Run:ai
+# releases, so the group's preferredVersion is discovered at runtime (cached);
+# these kinds carry an empty prefix in _READ_KINDS as the discovery marker.
+_RUNAI_CRD_KINDS: dict[str, tuple[str, str, bool]] = {
+    # kind -> (API group, Kind, namespaced)
+    "projects": ("run.ai", "Project", False),
+    "queues": ("scheduling.run.ai", "Queue", False),
+    "departments": ("scheduling.run.ai", "Department", False),
+    "podgroups": ("scheduling.run.ai", "PodGroup", True),
+    "bindrequests": ("scheduling.run.ai", "BindRequest", True),
+    "nodepools": ("run.ai", "NodePool", False),
+    "runaijobs": ("run.ai", "RunaiJob", True),
+    "trainingworkloads": ("run.ai", "TrainingWorkload", True),
+    "interactiveworkloads": ("run.ai", "InteractiveWorkload", True),
+    "inferenceworkloads": ("run.ai", "InferenceWorkload", True),
+    "distributedworkloads": ("run.ai", "DistributedWorkload", True),
+    "distributedinferenceworkloads": ("run.ai", "DistributedInferenceWorkload", True),
+    "externalworkloads": ("run.ai", "ExternalWorkload", True),
+    "workloadrunners": ("run.ai", "WorkloadRunner", True),
+    "runaiconfigs": ("run.ai", "RunaiConfig", True),
+}
+
+# The Run:ai workload CRD kinds (namespaced), most-specific first — enumerated
+# when an alert lands in a Run:ai namespace but names no workload, so the RCA
+# still finds which workloads are unhealthy from their own status.conditions.
+_RUNAI_WORKLOAD_KINDS: tuple[str, ...] = (
+    "trainingworkloads",
+    "interactiveworkloads",
+    "inferenceworkloads",
+    "distributedworkloads",
+    "distributedinferenceworkloads",
+    "externalworkloads",
+    "runaijobs",
+)
+
 _READ_KINDS: dict[str, tuple[str, bool]] = {
-    # kind -> (API prefix, namespaced)
+    # kind -> (API prefix, namespaced); "" prefix = discover via _RUNAI_CRD_KINDS
     "pods": ("/api/v1", True),
     "events": ("/api/v1", True),
     "nodes": ("/api/v1", False),
@@ -97,6 +134,7 @@ _READ_KINDS: dict[str, tuple[str, bool]] = {
     "jobs": ("/apis/batch/v1", True),
     "cronjobs": ("/apis/batch/v1", True),
     "storageclasses": ("/apis/storage.k8s.io/v1", False),
+    **{kind: ("", crd[2]) for kind, crd in _RUNAI_CRD_KINDS.items()},
 }
 _KIND_ALIASES = {
     "po": "pods",
@@ -130,6 +168,20 @@ _KIND_ALIASES = {
     "cronjob": "cronjobs",
     "sc": "storageclasses",
     "storageclass": "storageclasses",
+    "project": "projects",
+    "queue": "queues",
+    "department": "departments",
+    "podgroup": "podgroups",
+    "pg": "podgroups",
+    "bindrequest": "bindrequests",
+    "nodepool": "nodepools",
+    "runaijob": "runaijobs",
+    "trainingworkload": "trainingworkloads",
+    "interactiveworkload": "interactiveworkloads",
+    "inferenceworkload": "inferenceworkloads",
+    "distributedworkload": "distributedworkloads",
+    "externalworkload": "externalworkloads",
+    "runaiconfig": "runaiconfigs",
 }
 
 
@@ -209,6 +261,11 @@ async def k8s_read(
             "error": "kind is not in the read-only allowlist",
             "allowed_kinds": sorted(_READ_KINDS),
         }
+    crd = _RUNAI_CRD_KINDS.get(resolved)
+    if crd:
+        # Warm the group→preferredVersion cache (one tiny discovery GET) so BOTH
+        # transports address the CRD with the version this cluster actually runs.
+        await _api_group_prefix(settings, crd[0])
     mcp_note = ""
     if settings.kubernetes_mcp_url:
         try:
@@ -234,6 +291,18 @@ async def k8s_read(
     if not token:
         return {"kind": resolved, "error": "kubernetes service account token unavailable"}
     prefix, namespaced = _READ_KINDS[resolved]
+    if not prefix and crd:
+        prefix = await _api_group_prefix(settings, crd[0])
+        if not prefix:
+            return {
+                "kind": resolved,
+                "namespace": namespace,
+                "name": name,
+                "error": (
+                    f"could not discover the API version for group '{crd[0]}' "
+                    "(is the Run:ai CRD installed?)"
+                ),
+            }
     parts = [prefix.rstrip("/")]
     if namespaced and namespace:
         parts += ["namespaces", quote(namespace, safe="")]
@@ -280,7 +349,7 @@ async def _k8s_read_via_mcp(
     label_selector: str = "",
 ) -> dict:
     """k8s_read over the Kubernetes MCP server; same result shape, raises to fall back."""
-    api_version, mcp_kind = _k8s_mcp_resource_kind(resolved)
+    api_kinds = _k8s_mcp_api_kinds(resolved)
     candidates: list[tuple[str, dict[str, object]]] = []
     if name:
         if resolved == "pods":
@@ -291,18 +360,19 @@ async def _k8s_read_via_mcp(
                 ]
             )
         candidates.extend(
-            [
-                (
-                    "resources_get",
-                    {
-                        "apiVersion": api_version,
-                        "kind": mcp_kind,
-                        "namespace": namespace,
-                        "name": name,
-                    },
-                ),
-                ("resources_get", {"kind": resolved, "namespace": namespace, "name": name}),
-            ]
+            (
+                "resources_get",
+                {
+                    "apiVersion": api_version,
+                    "kind": mcp_kind,
+                    "namespace": namespace,
+                    "name": name,
+                },
+            )
+            for api_version, mcp_kind in api_kinds
+        )
+        candidates.append(
+            ("resources_get", {"kind": resolved, "namespace": namespace, "name": name})
         )
     else:
         # A requested label selector must ride on EVERY candidate — a shortcut
@@ -320,16 +390,19 @@ async def _k8s_read_via_mcp(
             )
         elif resolved == "events" and not label_selector:
             candidates.append(("events_list", {"namespace": namespace}))
-        args: dict[str, object] = {
-            "apiVersion": api_version,
-            "kind": mcp_kind,
-            "namespace": namespace,
-        }
+        for api_version, mcp_kind in api_kinds:
+            args: dict[str, object] = {
+                "apiVersion": api_version,
+                "kind": mcp_kind,
+                "namespace": namespace,
+            }
+            if label_selector:
+                args["labelSelector"] = label_selector
+            candidates.append(("resources_list", args))
         fallback_args: dict[str, object] = {"kind": resolved, "namespace": namespace}
         if label_selector:
-            args["labelSelector"] = label_selector
             fallback_args["labelSelector"] = label_selector
-        candidates.extend([("resources_list", args), ("resources_list", fallback_args)])
+        candidates.append(("resources_list", fallback_args))
     data = await _k8s_mcp_json(settings, candidates)
     if not name and label_selector:
         # Belt and suspenders: an MCP server may ACCEPT labelSelector and still
@@ -380,6 +453,68 @@ def _apply_label_selector(data: object, selector: str) -> object:
         )
     ]
     return filtered if isinstance(data, list) else {**data, "items": filtered}
+
+
+# group -> "/apis/{group}/{preferredVersion}" once discovered. Module-level on
+# purpose: the group's served version is a cluster property, not per-request.
+_API_GROUP_PREFIX_CACHE: dict[str, str] = {}
+
+
+async def _api_group_prefix(settings: Settings, group: str) -> str:
+    """Discover "/apis/{group}/{version}" from the group's preferredVersion.
+
+    Cached per group; "" when the group is not served (CRD not installed) or
+    discovery itself failed."""
+    cached = _API_GROUP_PREFIX_CACHE.get(group)
+    if cached:
+        return cached
+    token = _read_file(settings.kubernetes_token_path)
+    if not token:
+        return ""
+    verify: bool | str = (
+        settings.kubernetes_ca_path if Path(settings.kubernetes_ca_path).exists() else True
+    )
+    response = await get_json(
+        base_url=settings.kubernetes_api_url,
+        path=f"/apis/{quote(group, safe='')}",
+        timeout_seconds=settings.kubernetes_timeout_seconds,
+        headers={"Authorization": f"Bearer {token}"},
+        verify=verify,
+    )
+    group_version = ""
+    if response.ok and isinstance(response.data, dict):
+        preferred = response.data.get("preferredVersion")
+        if isinstance(preferred, dict):
+            group_version = str(preferred.get("groupVersion") or "")
+        if not group_version:
+            versions = response.data.get("versions")
+            if isinstance(versions, list) and versions and isinstance(versions[0], dict):
+                group_version = str(versions[0].get("groupVersion") or "")
+    if not group_version:
+        return ""
+    prefix = f"/apis/{group_version}"
+    _API_GROUP_PREFIX_CACHE[group] = prefix
+    return prefix
+
+
+def _k8s_mcp_api_kinds(kind: str) -> list[tuple[str, str]]:
+    """Ordered (apiVersion, Kind) candidates for the MCP resources_* tools.
+
+    Core kinds have one fixed mapping. Run:ai CRDs use the discovered
+    preferredVersion when the cache is warm (k8s_read warms it), else a short
+    list of versions Run:ai has shipped."""
+    crd = _RUNAI_CRD_KINDS.get(kind)
+    if not crd:
+        return [_k8s_mcp_resource_kind(kind)]
+    group, kind_name, _namespaced = crd
+    discovered = _API_GROUP_PREFIX_CACHE.get(group, "").removeprefix("/apis/")
+    versions = [discovered] if discovered else []
+    versions.extend(
+        f"{group}/{version}"
+        for version in ("v2alpha1", "v1", "v2")
+        if f"{group}/{version}" != discovered
+    )
+    return [(version, kind_name) for version in versions if version]
 
 
 def _k8s_mcp_resource_kind(kind: str) -> tuple[str, str]:
@@ -513,6 +648,21 @@ class KubernetesCollector:
         runai_control_plane_pods = _runai_control_plane_pods(responses)
         runai_control_plane_events = _runai_control_plane_warning_events(responses)
 
+        # Run:ai CRD enumeration: when the alert is in a Run:ai namespace, read
+        # the actual project/queue/workload/podgroup CRDs (status.conditions) so
+        # a control-plane alert with NO workload label still yields "project X
+        # not Ready" instead of "can't correlate". Best-effort, MCP-first.
+        runai_crds: dict[str, object] = {"checked": [], "findings": []}
+        if control_plane_in_scope:
+            crd_namespaces = [target.namespace, *self._settings.runai_log_namespaces]
+            try:
+                runai_crds = await collect_runai_crd_findings(
+                    self._settings, target, crd_namespaces
+                )
+            except Exception:  # noqa: BLE001 - enumeration is best-effort
+                pass
+        crd_findings = runai_crds.get("findings") or []
+
         if successful and not missing:
             status = "ok"
             confidence = "high"
@@ -557,6 +707,21 @@ class KubernetesCollector:
             )
             summary = f"{note} {summary}"
 
+        # A CRD finding IS the correlation the missing label denied us: name the
+        # not-Ready Run:ai entities and lift the result out of "partial".
+        if crd_findings:
+            named = ", ".join(
+                f"{f['kind']}/{f['name']} ({f['reason']})" for f in crd_findings[:3]
+            )
+            lead = ko_en(
+                self._settings,
+                f"정상 상태가 아닌 Run:ai 리소스 {len(crd_findings)}건 확인: {named}.",
+                f"Found {len(crd_findings)} Run:ai resource(s) not Ready: {named}.",
+            )
+            summary = f"{lead} {summary}"
+            if status != "ok":
+                status, confidence = "ok", "high"
+
         insight = await _senior_insight(
             self._settings,
             summary=summary,
@@ -586,6 +751,8 @@ class KubernetesCollector:
             "exec_probes": exec_probes,
             "runai_control_plane_pods": runai_control_plane_pods,
             "runai_control_plane_warning_events": runai_control_plane_events,
+            "runai_crd_findings": crd_findings,
+            "runai_crds_checked": runai_crds.get("checked"),
             "insight": insight,
             "queries": responses,
         }
@@ -878,13 +1045,17 @@ async def _k8s_mcp_json(
         # kubernetes-mcp-server answers in YAML, not JSON (get ops always; list
         # ops with --list-output=yaml — the chart sets it). Rejecting non-JSON
         # here demoted EVERY query to the direct API ("MCP result was not
-        # JSON"). Parse the FULL text — the "raw" preview is truncated.
-        return _k8s_yaml_payload(mcp_tool_text(result))
+        # JSON"). Parse the RAW text — masking first corrupted the YAML
+        # (base64 certs → "[MASKED]" broke the block structure), and the
+        # "raw" preview is truncated anyway. The parsed object is masked.
+        return _k8s_yaml_payload(mcp_tool_raw_text(result))
     return data
 
 
 def _k8s_yaml_payload(text: str) -> object:
-    """A dict/list from a YAML (or JSON) MCP tool reply; raises on table/plain text."""
+    """A MASKED dict/list from a YAML (or JSON) MCP tool reply.
+
+    Raises on table/plain text so the caller records an observation."""
     try:
         parsed = yaml.safe_load(text or "")
     except yaml.YAMLError:
@@ -894,7 +1065,8 @@ def _k8s_yaml_payload(text: str) -> object:
             raise RuntimeError(f"MCP result was not JSON or YAML: {exc}") from exc
         parsed = docs[0] if len(docs) == 1 else {"items": docs}
     if isinstance(parsed, (dict, list)):
-        return parsed
+        # Mask AFTER parsing: same secret protection, intact structure.
+        return build_masker(()).mask_object(parsed)
     # A bare string means table/plain-text output — not machine-readable.
     raise RuntimeError("MCP result was not JSON or YAML (set --list-output=yaml)")
 
@@ -1342,6 +1514,8 @@ async def _senior_insight(
     exec_probes: list[dict[str, object]],
 ) -> str:
     """One-line senior insight via the LLM; deterministic fallback when unconfigured."""
+    if summary.strip().startswith(NO_EVIDENCE):
+        return ""
     restarts = [
         d
         for d in container_diagnostics
@@ -1354,7 +1528,8 @@ async def _senior_insight(
         if isinstance(line, str)
         and any(token in line.lower() for token in ("error", "fail", "oom", "cuda", "panic"))
     ]
-    if not llm_configured(settings):
+    insight_model = getattr(settings, "llm_model_insight", "")
+    if not llm_configured(settings, insight_model):
         parts: list[str] = []
         if restarts:
             names = ", ".join(str(d.get("name")) for d in restarts)
@@ -1384,12 +1559,19 @@ async def _senior_insight(
     )
     if getattr(settings, "language", "en") == "ko":
         system += " 한국어로 답하세요 (관찰한 것 → 의미 → 시작 시점)."
-    insight = await complete(
-        settings,
-        system=system,
-        user=_collector_masker(settings).mask_text(str(user)),
-        max_tokens=160,
-    )
+    masked_user = _collector_masker(settings).mask_text(str(user))
+    key = insight_cache_key("kubernetes", getattr(settings, "language", "en"), masked_user)
+
+    async def compute() -> str | None:
+        return await complete(
+            settings,
+            system=system,
+            user=masked_user,
+            max_tokens=160,
+            model=insight_model or None,
+        )
+
+    insight = await cached_insight(key, compute)
     return _collector_masker(settings).mask_text(insight or "")
 
 
@@ -1539,12 +1721,36 @@ def _warning_events(responses: list[dict[str, object]]) -> list[object]:
 
 
 def _node_conditions(responses: list[dict[str, object]]) -> list[object]:
+    """Only ABNORMAL node conditions become evidence text.
+
+    Healthy conditions carry the failure vocabulary anyway — type
+    "DiskPressure" status False, message "kubelet has sufficient memory" —
+    and kept feeding the keyword ranker a node_kubelet_pressure score on
+    perfectly healthy nodes (the 2026-07-08 re-analysis landed on
+    node_kubelet_pressure while its own self-check said there was no pressure
+    evidence). A healthy node is summarized as one marker entry instead."""
     for response in responses:
         if response.get("name") != "node":
             continue
         data = response.get("data")
         if isinstance(data, dict) and isinstance(data.get("conditions"), list):
-            return data["conditions"]
+            conditions = [c for c in data["conditions"] if isinstance(c, dict)]
+            abnormal = [
+                c
+                for c in conditions
+                if (
+                    str(c.get("type")) == "Ready"
+                    and str(c.get("status")) != "True"
+                )
+                or (
+                    str(c.get("type")) != "Ready"
+                    and str(c.get("status")) == "True"
+                )
+            ]
+            if abnormal:
+                return abnormal
+            if conditions:
+                return [{"node_conditions_healthy": True, "checked": len(conditions)}]
     return []
 
 
@@ -1574,6 +1780,102 @@ def _runai_control_plane_warning_events(
         if isinstance(data, dict) and isinstance(data.get("items"), list):
             events[namespace] = [item for item in data["items"] if isinstance(item, dict)]
     return events
+
+
+def _crd_items(read_result: dict) -> list[dict]:
+    data = read_result.get("data") if isinstance(read_result, dict) else None
+    if isinstance(data, dict):
+        items = data.get("items")
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+        # A single object (name= read) — treat as a one-item list.
+        if data.get("kind") or data.get("metadata"):
+            return [data]
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    return []
+
+
+def _crd_not_ready(item: dict) -> dict[str, str] | None:
+    """A {kind,name,reason,message} finding when a Run:ai CRD object is NOT healthy.
+
+    Reads the standard K8s status.conditions (Ready/Succeeded != True is a
+    problem; explicit Failed/Degraded == True is a problem) plus a top-level
+    status.phase of Failed/Error/Pending. None for a healthy object."""
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    status = item.get("status") if isinstance(item.get("status"), dict) else {}
+    name = str(metadata.get("name") or "")
+    conditions = status.get("conditions")
+    for cond in conditions if isinstance(conditions, list) else []:
+        if not isinstance(cond, dict):
+            continue
+        ctype = str(cond.get("type") or "")
+        cstatus = str(cond.get("status") or "")
+        bad = (ctype in ("Ready", "Available", "Succeeded") and cstatus == "False") or (
+            ctype in ("Failed", "Degraded", "Error") and cstatus == "True"
+        )
+        if bad:
+            return {
+                "kind": str(item.get("kind") or ""),
+                "name": name,
+                "reason": str(cond.get("reason") or ctype),
+                "message": _clip(str(cond.get("message") or ""), 200),
+            }
+    phase = str(status.get("phase") or "")
+    if phase and phase.lower() in ("failed", "error", "pending", "unschedulable"):
+        return {
+            "kind": str(item.get("kind") or ""),
+            "name": name,
+            "reason": phase,
+            "message": _clip(str(status.get("message") or ""), 200),
+        }
+    return None
+
+
+def _clip(text: str, limit: int) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+async def collect_runai_crd_findings(
+    settings: Settings, target: AnalysisTarget, namespaces: list[str]
+) -> dict[str, object]:
+    """Enumerate the Run:ai CRDs a human would check for a control-plane alert.
+
+    Uses k8s_read (MCP-first), so it works even when the alert carries no
+    workload/project label — turning "no workload identity, can't correlate"
+    into "these projects/workloads are NOT Ready". Best-effort: returns
+    {checked, findings} with findings=[] on any failure, never raises."""
+    findings: list[dict[str, str]] = []
+    checked: list[str] = []
+
+    async def scan(kind: str, namespace: str = "") -> None:
+        try:
+            result = await k8s_read(settings, kind, namespace=namespace)
+        except Exception:  # noqa: BLE001 - enumeration is best-effort evidence
+            return
+        if result.get("error"):
+            return
+        checked.append(f"{kind}{('/' + namespace) if namespace else ''}")
+        for item in _crd_items(result)[: settings.kubernetes_list_limit]:
+            finding = _crd_not_ready(item)
+            if finding:
+                finding["namespace"] = namespace
+                findings.append(finding)
+
+    # Cluster-scoped org tree: which projects/queues/departments are unhealthy.
+    for kind in ("projects", "queues", "departments"):
+        await scan(kind)
+    # Namespaced workloads + their pod-groups in the alert's own namespaces.
+    scan_namespaces = _dedup_str([n for n in namespaces if n])
+    for namespace in scan_namespaces[:4]:
+        for kind in (*_RUNAI_WORKLOAD_KINDS, "podgroups"):
+            await scan(kind, namespace)
+    return {"checked": checked, "findings": findings[:20]}
+
+
+def _dedup_str(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
 
 
 # --- Deterministic flowchart-driven follow-up ---------------------------------

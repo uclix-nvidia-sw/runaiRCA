@@ -46,6 +46,8 @@ _log = logging.getLogger(__name__)
 
 TModel = TypeVar("TModel", bound=BaseModel)
 Stage = Callable[["PipelineState"], Awaitable["PipelineState"]]
+_SYNTHESIS_ARTIFACT_RESULT_CHARS = 1200
+_SYNTHESIS_USER_CHARS = 12000
 
 
 @dataclass
@@ -497,7 +499,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             )
         if synth:
             state.summary, state.detail = synth
-        elif llm_configured(settings):
+        elif llm_configured(settings, getattr(settings, "llm_model_insight", "")):
             # Synthesis fell back to the deterministic report, which splices the
             # curated KB playbook in verbatim ENGLISH — translate that one
             # section so the operator guidance still reads in their language.
@@ -689,6 +691,17 @@ async def _reanalyze_once(
             kg_blast_radius=kg_blast,
             priors=state.priors,
         )
+        # The signature-first rule applies to the RE-rank too. Without it the
+        # raw keyword ranker decided alone here — the 2026-07-08 re-analysis
+        # "concluded" node_kubelet_pressure on a healthy node while the loki
+        # reconcile errors still carried the real (signature-backed) cause.
+        observed = _observed_text(merged_results, state.request)
+        candidates = _promote_signature_cause(
+            candidates,
+            _xid_codes_from_results(merged_results, _alert_text(state.request)),
+            match_runai_known_issues(state.known_issues, observed),
+            match_failure_mode_symptoms(state.failure_modes, observed),
+        )
         caveat = ""
         refuted = False
         next_check = ""
@@ -706,6 +719,12 @@ async def _reanalyze_once(
                 caveat = str(check.get("caveat") or "").strip()
                 refuted = bool(check.get("refuted"))
                 next_check = str(check.get("next_check") or "").strip()
+        # A re-analysis conclusion that its OWN self-check refutes must not
+        # replace the first conclusion — that shipped a report whose headline
+        # (node_kubelet_pressure) was contradicted by its own Self-Check text.
+        # Keep the original (with its caveat + operator questions) instead.
+        if refuted:
+            return None
         new_family = candidates[0].family if candidates else "insufficient_evidence"
         if getattr(state.settings, "language", "en") == "ko":
             note = (
@@ -754,7 +773,16 @@ async def _synthesize_korean(
         if _similar_incident_relevant(request, observed_text)
         else []
     )
+    # Key ORDER matters: the final JSON is hard-capped at _SYNTHESIS_USER_CHARS,
+    # which tail-truncates. Put the SMALL high-value inputs FIRST so a heavy
+    # collector_findings block (many artifacts with trimmed-but-still-bulky raw
+    # results) can only cost its OWN tail. operator_guidance leads: it is the
+    # human operator's direct instruction (highest priority per the system
+    # prompt) and must NEVER be truncated away.
+    guidance_raw = (request.alert.annotations or {}).get("operator_prompt", "")
+    operator_guidance = _short_sentence(str(guidance_raw), limit=500) if guidance_raw else ""
     evidence = {
+        **({"operator_guidance": operator_guidance} if operator_guidance else {}),
         "alert": {
             "name": request.alert.labels.get("alertname"),
             "labels": request.alert.labels,
@@ -762,6 +790,16 @@ async def _synthesize_korean(
         },
         "plan": plan.as_dict(),
         "ranked_root_cause_candidates": [c.as_dict() for c in root_cause_candidates],
+        "knowledge_graph": {
+            "blast_radius_workloads": kg_context.get("blast_radius_workloads"),
+            "prior_incidents": kg_context.get("prior_incidents"),
+            "knowledge": kg_context.get("knowledge"),
+        },
+        "graph_remediation": graph_fixes.as_dict(),
+        "matched_alert": plan.matched_alert,
+        "similar_incidents": similar_incidents,
+        # Bulky — kept LAST so the char cap trims raw collector result tails
+        # rather than the reasoning inputs above.
         "collector_findings": [
             {
                 "agent": r.agent,
@@ -776,25 +814,16 @@ async def _synthesize_korean(
                         "query": art.query,
                         "summary": art.summary,
                         "highlights": art.highlights,
-                        "result": art.result,
+                        "result": _compact_synthesis_value(
+                            art.result, limit=_SYNTHESIS_ARTIFACT_RESULT_CHARS
+                        ),
                     }
                     for art in [a for a in r.artifacts if _artifact_is_evidence(a)][-3:]
                 ],
             }
             for r in results
         ],
-        "knowledge_graph": {
-            "blast_radius_workloads": kg_context.get("blast_radius_workloads"),
-            "prior_incidents": kg_context.get("prior_incidents"),
-            "knowledge": kg_context.get("knowledge"),
-        },
-        "graph_remediation": graph_fixes.as_dict(),
-        "matched_alert": plan.matched_alert,
-        "similar_incidents": similar_incidents,
     }
-    operator_guidance = (request.alert.annotations or {}).get("operator_prompt", "")
-    if operator_guidance:
-        evidence["operator_guidance"] = _short_sentence(str(operator_guidance), limit=500)
     system = (
         "당신은 NVIDIA Run:ai GPU 플랫폼을 담당하는 시니어 SRE입니다. 제공된 증거(수집기별 "
         "발견 사항, 조사 계획, 순위가 매겨진 원인 후보, 지식 그래프/함수 기반 조치, 매칭된 "
@@ -821,7 +850,7 @@ async def _synthesize_korean(
         '"detail": <위 구조의 한국어 마크다운 본문>}'
     )
     safe_evidence = _build_settings_masker(settings).mask_object(compact(evidence, limit=8))
-    user = "증거(JSON):\n" + json.dumps(safe_evidence, ensure_ascii=False, default=str)
+    user = "증거(JSON):\n" + _synthesis_evidence_json(safe_evidence, _SYNTHESIS_USER_CHARS)
     try:
         data = await _complete_synthesis_json(settings, system=system, user=user)
     except Exception:  # noqa: BLE001 - synthesis is best-effort; keep deterministic report
@@ -876,6 +905,39 @@ async def _complete_synthesis_json(settings: Settings, *, system: str, user: str
                 text[:160],
             )
     return None
+
+
+def _synthesis_evidence_json(evidence: dict, max_chars: int) -> str:
+    """Serialize the synthesis evidence to VALID JSON within max_chars.
+
+    A blunt string slice would cut the JSON mid-structure and hand the model
+    malformed evidence (unterminated string / unbalanced braces). Instead drop
+    whole collector_findings entries from the END — the lowest-priority,
+    most-likely-NO_EVIDENCE collectors, whose summaries still live in the
+    deterministic detail — and re-serialize, so the JSON stays well-formed and
+    the leading reasoning inputs (operator_guidance, ranked cause, graph/KG
+    remediation) are always intact. The non-collector part is bounded by
+    construction (short_sentence caps, compact), so it fits well under the cap."""
+    findings = evidence.get("collector_findings")
+    text = json.dumps(evidence, ensure_ascii=False, default=str)
+    while len(text) > max_chars and isinstance(findings, list) and findings:
+        findings = findings[:-1]
+        evidence = {**evidence, "collector_findings": findings}
+        text = json.dumps(evidence, ensure_ascii=False, default=str)
+    return text
+
+
+def _compact_synthesis_value(value: object, *, limit: int) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+    return " ".join(text.split())[:limit]
 
 
 def _quality_from(results: list[CollectorResult]) -> str:
@@ -1156,7 +1218,13 @@ async def _translate_playbook_ko(settings: Settings, detail: str) -> str:
         "설명을 추가하지 말고 번역문만 출력하세요."
     )
     try:
-        translated = await complete(settings, system=system, user=block, max_tokens=1600)
+        translated = await complete(
+            settings,
+            system=system,
+            user=block,
+            max_tokens=1600,
+            model=getattr(settings, "llm_model_insight", "") or None,
+        )
     except Exception:  # noqa: BLE001 - translation is best-effort polish
         return detail
     if not translated or not translated.strip():
@@ -2004,6 +2072,20 @@ def _collector_is_evidence(result: object) -> bool:
 
 def _kubernetes_highlights(details: dict[str, object]) -> list[str]:
     lines: list[str] = []
+    # Run:ai CRD findings first — a not-Ready project/workload is the most direct
+    # answer for a control-plane alert that carried no workload label.
+    crd_findings = details.get("runai_crd_findings")
+    if isinstance(crd_findings, list):
+        for finding in crd_findings[:3]:
+            if not isinstance(finding, dict) or not finding.get("name"):
+                continue
+            kind = finding.get("kind") or "resource"
+            reason = finding.get("reason") or "NotReady"
+            message = str(finding.get("message") or "")
+            line = f"- Run:ai {kind} {finding.get('name')} is not Ready ({reason})"
+            if message:
+                line += f": {_short_sentence(message, limit=200)}"
+            lines.append(line)
     warning_events = details.get("warning_events")
     if isinstance(warning_events, list):
         for event in warning_events[:3]:
@@ -2213,7 +2295,7 @@ async def _operator_questions(
         )
     questions = questions[:4]
 
-    if llm_configured(settings, settings.llm_model_synthesis):
+    if llm_configured(settings, getattr(settings, "llm_model_insight", "")):
         try:
             sharpened = await _sharpen_operator_questions(settings, questions, missing, plan)
         except Exception:  # noqa: BLE001 - sharpening is best-effort
@@ -2253,7 +2335,7 @@ async def _sharpen_operator_questions(
         system=system,
         user=user,
         temperature=0.2,
-        model=settings.llm_model_synthesis,
+        model=getattr(settings, "llm_model_insight", "") or None,
     )
     if not isinstance(data, dict):
         return None

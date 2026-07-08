@@ -111,6 +111,16 @@ DEFAULT_FAMILIES = (
     "k8s_control_plane_error",
     "workload_startup_error",
     "image_pull_error",
+    # The ranked universe matches failure_modes.yaml — the ontology's families
+    # are rankable categories, not just signature-promotion targets.
+    "gpu_hardware_error",
+    "network_fabric_error",
+    "cluster_network_error",
+    "k8s_storage_error",
+    "storage_backend_error",
+    "workload_runtime_error",
+    "observability_accuracy",
+    "platform_auth_error",
 )
 
 DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
@@ -215,6 +225,102 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "registry",
         ),
     ),
+    "gpu_hardware_error": (
+        "system",
+        ("system", "loki", "kubernetes"),
+        (
+            "xid",
+            "nvrm",
+            "fallen off the bus",
+            'no runtime for "nvidia"',
+            "xidcriticalerror",
+            "inforom",
+            "nouveau",
+            "gpu is lost",
+        ),
+    ),
+    "network_fabric_error": (
+        "loki",
+        ("loki", "system"),
+        (
+            "nccl",
+            "infiniband",
+            "rdma",
+            "nvlink",
+            "nicclusterpolicy",
+            "fabric manager",
+            "gpudirect",
+            "link flap",
+        ),
+    ),
+    "cluster_network_error": (
+        "kubernetes",
+        ("kubernetes", "loki"),
+        (
+            "coredns",
+            "cni plugin",
+            "name resolution failed",
+            "networkplugin",
+            "no route to host",
+        ),
+    ),
+    "k8s_storage_error": (
+        "kubernetes",
+        ("kubernetes", "loki"),
+        (
+            "failedmount",
+            "failedattachvolume",
+            "provisioningfailed",
+            "volumebinding",
+            "storageclass",
+            "persistentvolumeclaim",
+        ),
+    ),
+    "storage_backend_error": (
+        "system",
+        ("system", "loki", "kubernetes"),
+        (
+            "stale file handle",
+            "read-only file system",
+            "nfs server",
+            "ceph",
+            "input/output error",
+        ),
+    ),
+    "workload_runtime_error": (
+        "loki",
+        ("loki", "kubernetes"),
+        (
+            "cuda out of memory",
+            "torch.cuda",
+            "traceback (most recent call last)",
+            "segmentation fault",
+            "core dumped",
+        ),
+    ),
+    "observability_accuracy": (
+        "prometheus",
+        ("prometheus", "kubernetes"),
+        (
+            "dcgm-exporter",
+            "metrics-exporter",
+            "thanos",
+            "missingruleevaluations",
+            "rule evaluation",
+        ),
+    ),
+    "platform_auth_error": (
+        "loki",
+        ("loki", "kubernetes", "runai"),
+        (
+            "saml",
+            "oidc",
+            "keycloak",
+            "login failed",
+            "invalid_grant",
+            "access rule",
+        ),
+    ),
 }
 
 DEFAULT_FAMILY_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -246,6 +352,38 @@ DEFAULT_FAMILY_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "image_pull_error",
         ("imagepull", "errimagepull", "image", "registry", "manifest"),
     ),
+    (
+        "gpu_hardware_error",
+        ("xid", "nvidia", "gpu", "dcgm"),
+    ),
+    (
+        "network_fabric_error",
+        ("nccl", "infiniband", "rdma", "nvlink", "fabric"),
+    ),
+    (
+        "cluster_network_error",
+        ("dns", "coredns", "cni", "network"),
+    ),
+    (
+        "k8s_storage_error",
+        ("volume", "pvc", "storageclass", "mount"),
+    ),
+    (
+        "storage_backend_error",
+        ("nfs", "ceph", "read-only"),
+    ),
+    (
+        "workload_runtime_error",
+        ("cuda", "runtime", "application"),
+    ),
+    (
+        "observability_accuracy",
+        ("metrics", "dcgm", "thanos", "prometheus"),
+    ),
+    (
+        "platform_auth_error",
+        ("auth", "login", "sso", "saml", "oidc", "permission"),
+    ),
 )
 
 DEFAULT_FAMILY_REASONS = {
@@ -256,6 +394,18 @@ DEFAULT_FAMILY_REASONS = {
     "k8s_control_plane_error": "alert implicates the Kubernetes cluster control plane",
     "workload_startup_error": "alert points at a workload-local startup/config/crash fault",
     "image_pull_error": "alert points at an image pull / registry failure",
+    "gpu_hardware_error": "alert points at a GPU hardware/driver fault (NVIDIA XID)",
+    "network_fabric_error": (
+        "alert points at the GPU interconnect / multi-node fabric (NCCL/IB/NVLink)"
+    ),
+    "cluster_network_error": "alert points at cluster networking (CNI/DNS/pod network)",
+    "k8s_storage_error": "alert points at the Kubernetes storage layer (CSI/PVC/StorageClass)",
+    "storage_backend_error": "alert points at the backing storage system (NFS/Ceph/filesystem)",
+    "workload_runtime_error": "alert points at the workload's own code failing at runtime",
+    "observability_accuracy": (
+        "alert points at the metrics/observability pipeline, not the workload"
+    ),
+    "platform_auth_error": "alert points at login/SSO/permissions (auth control plane)",
 }
 
 

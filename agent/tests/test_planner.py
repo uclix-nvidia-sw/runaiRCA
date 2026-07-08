@@ -379,9 +379,26 @@ async def test_negated_knowledge_keyword_is_not_targeted() -> None:
 
 @pytest.mark.asyncio
 async def test_no_signal_alert_does_not_default_to_node_pressure() -> None:
-    # PrometheusMissingRuleEvaluations matches no family keyword. The old tiebreak
-    # made node_kubelet_pressure the confident "most likely" leader. It must now be
-    # honest: insufficient_evidence, breadth-first, no fabricated family.
+    # A truly signal-less alert must stay honest: insufficient_evidence,
+    # breadth-first, no fabricated family from the declaration-order tiebreak.
+    settings = make_settings()
+    target = _target(
+        alert_name="SomethingCompletelyUnrecognized",
+        namespace="acme-team",
+        pod="widget-worker-0",
+    )
+    plan = await plan_investigation(settings, target, None, {}, [])
+    assert plan.hypotheses[0]["family"] == "insufficient_evidence"
+    assert "most likely" not in plan.focus
+    assert "node kubelet pressure" not in plan.focus
+
+
+@pytest.mark.asyncio
+async def test_observability_alert_now_maps_to_its_own_family() -> None:
+    # PrometheusMissingRuleEvaluations used to match NO family (the ranked
+    # universe stopped at 7 coarse families) and fell to insufficient_evidence;
+    # with the unified catalog it names the observability pipeline — and still
+    # never the node-pressure tiebreak.
     settings = make_settings()
     target = _target(
         alert_name="PrometheusMissingRuleEvaluations",
@@ -389,8 +406,7 @@ async def test_no_signal_alert_does_not_default_to_node_pressure() -> None:
         pod="prometheus-prometheus-kube-prometheus-prometheus-0",
     )
     plan = await plan_investigation(settings, target, None, {}, [])
-    assert plan.hypotheses[0]["family"] == "insufficient_evidence"
-    assert "most likely" not in plan.focus
+    assert plan.hypotheses[0]["family"] == "observability_accuracy"
     assert "node kubelet pressure" not in plan.focus
 
 

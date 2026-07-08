@@ -225,6 +225,35 @@ def test_k8s_yaml_payload_parses_yaml_and_rejects_tables() -> None:
         _k8s_yaml_payload("NAME   READY   STATUS\nfoo    1/1     Running")
 
 
+# The 0.1.42 run's exact corruption: masking TEXT before parsing swallowed the
+# newline after "secret:" and produced "secret: [MASKED] 420" — invalid YAML
+# ("expected <block end>, but found '<scalar>' ... [MASKED] 420"). Parsing must
+# happen on the RAW text; masking applies to the parsed object.
+_POD_YAML_WITH_SECRET_VOLUME = (
+    "metadata:\n"
+    "  name: runai-backend-xyz\n"
+    "  annotations:\n"
+    "    example.io/auth: Bearer abcdefghijklmnop123456\n"
+    "spec:\n"
+    "  volumes:\n"
+    "  - name: runai-ca\n"
+    "    secret:\n"
+    "      defaultMode: 420\n"
+    "      secretName: runai-ca-cert\n"
+    "status:\n"
+    "  phase: Running\n"
+)
+
+
+def test_k8s_yaml_payload_survives_secret_shaped_fields_and_masks_values() -> None:
+    parsed = _k8s_yaml_payload(_POD_YAML_WITH_SECRET_VOLUME)
+    # Structure is intact (text-masking corrupted it into a parse error before).
+    assert parsed["spec"]["volumes"][0]["name"] == "runai-ca"
+    assert parsed["status"]["phase"] == "Running"
+    # Secrets are still masked — on the parsed object, not the serialized text.
+    assert "abcdefghijklmnop" not in str(parsed)
+
+
 @pytest.mark.asyncio
 async def test_k8s_read_uses_mcp_yaml_reply_without_fallback(monkeypatch) -> None:
     from app.collectors import kubernetes as k8s
@@ -294,6 +323,228 @@ def test_target_pod_missing_detection() -> None:
     assert _target_pod_missing(target, gone_mcp) is True
     assert _target_pod_missing(target, rbac) is False
     assert _target_pod_missing(replace(target, pod=""), gone_direct) is False
+
+
+@pytest.mark.asyncio
+async def test_drilldown_summary_never_carries_the_mcp_fallback_note(monkeypatch) -> None:
+    # The fallback note used to be prefixed into the artifact SUMMARY, which the
+    # ranker/signature matchers read — "no route to host" toward OUR MCP service
+    # scored as cluster-network evidence. It now travels under "mcp_fallback"
+    # (a non-matchable key) and is surfaced via collector warnings.
+    from app.services import drilldown
+
+    async def fake_k8s_read(settings, kind, namespace="", name="", label_selector=""):
+        return {
+            "kind": "pods",
+            "status_code": 200,
+            "error": None,
+            "data": {"items": []},
+            "mcp_fallback": "MCP unavailable; used direct API fallback: no route to host",
+        }
+
+    monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
+    outcome = await drilldown._tool_k8s_read(make_settings(), make_target(), {"kind": "pods"})
+    assert "no route to host" not in str(outcome.get("summary"))
+    assert "no route to host" in str(outcome.get("mcp_fallback"))
+
+
+# --- unified family universe -----------------------------------------------------
+
+
+def test_ranker_can_nominate_ontology_families_directly() -> None:
+    # The ranked universe used to stop at 7 coarse families; GPU/fabric/storage/
+    # runtime/observability/auth knowledge existed in the ontology but could
+    # never appear as a ranked category without a signature promotion.
+    results = [
+        CollectorResult(
+            agent="system",
+            status="ok",
+            confidence="high",
+            summary=(
+                "Node dgx01: 3 kernel/hardware error line(s) found in dmesg: "
+                "NVRM: Xid (PCI:0000:3b:00): 79, GPU has fallen off the bus"
+            ),
+            details={},
+        ),
+        CollectorResult(
+            agent="loki",
+            status="ok",
+            confidence="medium",
+            summary="matched log line: XidCriticalError reported by device plugin",
+            details={},
+        ),
+    ]
+    candidates = rank_root_cause_candidates(_toolkit_target(), results)
+    assert candidates[0].family == "gpu_hardware_error", [c.as_dict() for c in candidates]
+
+
+def test_ranker_ignores_own_transport_errors() -> None:
+    # "no route to host" toward OUR MCP service is a probe failure, not
+    # cluster-network evidence.
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            confidence="high",
+            summary="Kubernetes API queries completed for the resolved alert target.",
+            details={
+                "queries": [
+                    {
+                        "name": "pod",
+                        "error": "MCP fallback: no route to host; coredns lookup failed",
+                        "data": None,
+                    }
+                ],
+                "mcp_fallback": "MCP unavailable; used direct API fallback: no route to host",
+            },
+        ),
+    ]
+    candidates = rank_root_cause_candidates(_toolkit_target(), results)
+    assert candidates[0].family == "insufficient_evidence", [c.as_dict() for c in candidates]
+
+
+# --- Run:ai CRD reads (kubectl parity) --------------------------------------------
+
+
+def test_runai_crd_kinds_are_readable_aliases() -> None:
+    from app.collectors.kubernetes import resolve_read_kind
+
+    assert resolve_read_kind("project") == "projects"
+    assert resolve_read_kind("queues") == "queues"
+    assert resolve_read_kind("podgroup") == "podgroups"
+    assert resolve_read_kind("trainingworkload") == "trainingworkloads"
+    assert resolve_read_kind("runaiconfig") == "runaiconfigs"
+
+
+@pytest.mark.asyncio
+async def test_k8s_read_discovers_runai_crd_group_version(monkeypatch, tmp_path) -> None:
+    from app.collectors import kubernetes as k8s
+
+    token = tmp_path / "token"
+    token.write_text("t")
+    calls: list[str] = []
+
+    async def fake_get_json(*, base_url, path, timeout_seconds, params=None, headers=None, verify=True):
+        calls.append(path)
+        if path == "/apis/run.ai":
+            return SimpleNamespace(
+                ok=True,
+                url=path,
+                status_code=200,
+                error=None,
+                data={"preferredVersion": {"groupVersion": "run.ai/v2"}},
+            )
+        return SimpleNamespace(
+            ok=True,
+            url=path,
+            status_code=200,
+            error=None,
+            data={"kind": "Project", "metadata": {"name": "test-pro"}},
+        )
+
+    monkeypatch.setattr(k8s, "get_json", fake_get_json)
+    monkeypatch.setattr(k8s, "_API_GROUP_PREFIX_CACHE", {})
+    settings = replace(
+        make_settings(), kubernetes_mcp_url="", kubernetes_token_path=str(token)
+    )
+    result = await k8s.k8s_read(settings, "project", name="test-pro")
+    assert result["error"] is None
+    assert "/apis/run.ai" in calls[0]
+    # Cluster-scoped CRD: no /namespaces/ segment, discovered version used.
+    assert calls[1] == "/apis/run.ai/v2/projects/test-pro"
+
+
+def test_mcp_api_kind_candidates_prefer_discovered_version(monkeypatch) -> None:
+    from app.collectors import kubernetes as k8s
+
+    monkeypatch.setattr(
+        k8s, "_API_GROUP_PREFIX_CACHE", {"scheduling.run.ai": "/apis/scheduling.run.ai/v2"}
+    )
+    pairs = k8s._k8s_mcp_api_kinds("podgroups")
+    assert pairs[0] == ("scheduling.run.ai/v2", "PodGroup")
+    assert all(kind == "PodGroup" for _, kind in pairs)
+
+
+def test_crd_not_ready_reads_conditions_and_phase() -> None:
+    from app.collectors.kubernetes import _crd_not_ready
+
+    ready = {
+        "kind": "Project",
+        "metadata": {"name": "ok-pro"},
+        "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+    }
+    assert _crd_not_ready(ready) is None
+
+    not_ready = {
+        "kind": "Project",
+        "metadata": {"name": "test-pro"},
+        "status": {
+            "conditions": [
+                {"type": "Ready", "status": "False", "reason": "ReconcileFailed",
+                 "message": "the object has been modified; please apply your changes"}
+            ]
+        },
+    }
+    finding = _crd_not_ready(not_ready)
+    assert finding is not None
+    assert finding["name"] == "test-pro" and finding["reason"] == "ReconcileFailed"
+
+    failed_phase = {"kind": "TrainingWorkload", "metadata": {"name": "job-1"},
+                    "status": {"phase": "Failed"}}
+    assert _crd_not_ready(failed_phase)["reason"] == "Failed"
+
+
+@pytest.mark.asyncio
+async def test_collect_runai_crd_findings_enumerates_and_flags_not_ready(monkeypatch) -> None:
+    from app.collectors import kubernetes as k8s
+
+    async def fake_k8s_read(settings, kind, namespace="", name="", label_selector=""):
+        if kind == "projects":
+            return {
+                "kind": "projects",
+                "error": None,
+                "data": {
+                    "items": [
+                        {"kind": "Project", "metadata": {"name": "project-test-a"},
+                         "status": {"conditions": [{"type": "Ready", "status": "True"}]}},
+                        {"kind": "Project", "metadata": {"name": "test-pro"},
+                         "status": {"conditions": [
+                             {"type": "Ready", "status": "False", "reason": "ReconcileFailed"}]}},
+                    ]
+                },
+            }
+        return {"kind": kind, "error": None, "data": {"items": []}}
+
+    monkeypatch.setattr(k8s, "k8s_read", fake_k8s_read)
+    result = await k8s.collect_runai_crd_findings(make_settings(), _toolkit_target(), ["runai"])
+    findings = result["findings"]
+    assert len(findings) == 1
+    assert findings[0]["name"] == "test-pro"
+    assert findings[0]["kind"] == "Project"
+    assert "projects" in result["checked"]
+
+
+@pytest.mark.asyncio
+async def test_runai_mcp_projects_falls_back_to_org_unit_path() -> None:
+    from app.collectors.runai_mcp import _call_api
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.paths: list[str] = []
+
+        async def call_tool(self, tool, args):
+            self.paths.append(args["path"])
+            if args["path"] == "/api/v1/projects":
+                return _McpResult(text="404 page not found", is_error=True)
+            return _McpResult({"projects": [{"name": "test-pro"}]})
+
+    session = FakeSession()
+    item = await _call_api(
+        session, "projects", "GET", ["/api/v1/projects", "/api/v1/org-unit/projects"], None
+    )
+    assert session.paths == ["/api/v1/projects", "/api/v1/org-unit/projects"]
+    assert item["error"] is None
+    assert "/api/v1/org-unit/projects" in item["query"]
 
 
 # --- component identity entry point ---------------------------------------------

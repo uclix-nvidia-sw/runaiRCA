@@ -89,6 +89,28 @@ def test_failed_adhoc_result_is_not_replayed_as_prompt_evidence() -> None:
     assert "query failed" in prompt
 
 
+def test_investigation_prompt_orders_stable_prefix_and_keeps_latest_evidence() -> None:
+    evidence: dict[str, CollectorResult] = {}
+    by_name: dict[str, object] = {}
+    for idx in range(30):
+        name = f"collector-{idx:02d}"
+        by_name[name] = object()
+        marker = "OLDEST-SIGNAL " if idx == 0 else "LATEST-SIGNAL " if idx == 29 else ""
+        evidence[name] = CollectorResult(
+            agent=name,
+            status="ok",
+            summary=marker + ("x" * 390),
+            confidence="medium",
+        )
+
+    prompt = _build_user_prompt(InvestigationPlan(), {}, evidence, by_name, [], adhoc=[])
+
+    assert len(prompt) <= 8000
+    assert prompt.find('"plan"') < prompt.find('"evidence_so_far"')
+    assert "LATEST-SIGNAL" in prompt
+    assert "OLDEST-SIGNAL" not in prompt
+
+
 @pytest.mark.asyncio
 async def test_no_llm_falls_back_to_full_gather() -> None:
     # No LLM configured -> complete_json returns None -> loop bails, full gather runs.

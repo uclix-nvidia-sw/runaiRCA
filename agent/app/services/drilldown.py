@@ -164,6 +164,13 @@ async def _drill_one(
                         "outcome": json.dumps(history_outcome, default=str)[:_RESULT_CHARS],
                     }
                 )
+                # Transport notes surface as collector warnings (Diagnostics
+                # panel), NEVER inside artifact summaries — those feed the
+                # ranker/signature matchers and our own "no route to host"
+                # must not score as cluster evidence.
+                note = str(outcome.get("mcp_fallback") or "")
+                if note and note not in result.warnings:
+                    result.warnings.append(note)
                 # Finding-first: surface the problem signals in the data and hand
                 # them to the UI as highlights; the raw result stays attached.
                 markers = [] if error else salient_markers(outcome.get("result"))
@@ -243,13 +250,20 @@ def _user_prompt(
     architecture: list[str] | None = None,
 ) -> str:
     plan_dict = plan.as_dict() if plan else {}
-    payload = {
+    stable = {
         "target": {
             key: getattr(target, key, "")
             for key in ("namespace", "workload_name", "pod", "node", "project")
         },
         "plan_focus": plan_dict.get("focus"),
         "hypotheses": (plan_dict.get("hypotheses") or [])[:4],
+    }
+    if architecture:
+        # Curated platform topology for the components THIS incident implicates:
+        # what each does when broken and which dependency to check next — the
+        # "thinking material" that used to reach only the playbook renderer.
+        stable["platform_architecture"] = architecture
+    variable = {
         "my_summary": (result.summary or "")[:1200],
         "my_artifacts": [
             _artifact_prompt_item(art)
@@ -258,12 +272,42 @@ def _user_prompt(
         ],
         "drilldown_so_far": history[-8:],
     }
-    if architecture:
-        # Curated platform topology for the components THIS incident implicates:
-        # what each does when broken and which dependency to check next — the
-        # "thinking material" that used to reach only the playbook renderer.
-        payload["platform_architecture"] = architecture
-    return json.dumps(payload, default=str, ensure_ascii=False)[:_USER_PROMPT_CHARS]
+    return _capped_json_prompt(
+        stable,
+        variable,
+        max_chars=_USER_PROMPT_CHARS,
+        trim_keys=("drilldown_so_far", "my_artifacts"),
+    )
+
+
+def _capped_json_prompt(
+    stable: dict[str, Any],
+    variable: dict[str, Any],
+    *,
+    max_chars: int,
+    trim_keys: tuple[str, ...],
+) -> str:
+    variable = {
+        key: list(value) if isinstance(value, list) else value for key, value in variable.items()
+    }
+    payload = {**stable, **variable}
+    text = json.dumps(payload, default=str, ensure_ascii=False)
+    while len(text) > max_chars:
+        for key in trim_keys:
+            value = variable.get(key)
+            if isinstance(value, list) and len(value) > 1:
+                variable[key] = value[1:]
+                payload = {**stable, **variable}
+                text = json.dumps(payload, default=str, ensure_ascii=False)
+                break
+        else:
+            break
+    if len(text) <= max_chars:
+        return text
+    marker = '"...truncated older prompt context..."'
+    tail = max_chars // 4
+    head = max_chars - tail - len(marker)
+    return text[:head] + marker + text[-tail:]
 
 
 def _compact_value(value: Any, *, limit: int) -> str:
@@ -560,8 +604,6 @@ async def _tool_k8s_read(settings: Settings, target: AnalysisTarget, args: dict)
     )
     error = item.get("error")
     summary = str(error) if error else f"HTTP {item.get('status_code')}"
-    if item.get("mcp_fallback"):
-        summary = f"{item['mcp_fallback']}; {summary}"
     return {
         # The real command an operator would have typed, not a param dump.
         "query": kubectl_repr(kind, namespace=namespace, name=name, label_selector=label_selector),
@@ -569,6 +611,11 @@ async def _tool_k8s_read(settings: Settings, target: AnalysisTarget, args: dict)
         "summary": summary,
         "error": error,
         "result": item,
+        # Transport note stays OUT of summary: artifact summaries feed the
+        # ranker/signature matchers, and "no route to host" toward OUR MCP
+        # service must not score as cluster-network evidence. The drill-down
+        # loop surfaces this via collector warnings instead.
+        **({"mcp_fallback": item["mcp_fallback"]} if item.get("mcp_fallback") else {}),
     }
 
 
@@ -602,14 +649,13 @@ async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -
     item = await prom_query(settings, "drilldown", promql)
     error = item.get("error")
     summary = str(error) if error else f"HTTP {item.get('status_code')}"
-    if fallback:
-        summary = f"{fallback}; {summary}"
     return {
         "query": promql,
         "title": title,
         "summary": summary,
         "error": error,
         "result": item,
+        **({"mcp_fallback": fallback} if fallback else {}),
     }
 
 
@@ -654,19 +700,22 @@ async def _tool_logql(settings: Settings, target: AnalysisTarget, args: dict) ->
     )
     if response.error or not response.ok:
         error = response.error or f"HTTP {response.status_code}"
-        if fallback:
-            error = f"{fallback}; {error}"
-        return {"query": logql, "title": title, "summary": error, "error": error}
+        return {
+            "query": logql,
+            "title": title,
+            "summary": error,
+            "error": error,
+            **({"mcp_fallback": fallback} if fallback else {}),
+        }
     lines = _sample_lines(_loki_streams(response.data), limit=10)
     summary = f"{len(lines)} sample log line(s)" if lines else "no matching log lines"
-    if fallback:
-        summary = f"{fallback}; {summary}"
     return {
         "query": logql,
         "title": title,
         "summary": summary,
         "error": None,
         "result": {"lines": lines},
+        **({"mcp_fallback": fallback} if fallback else {}),
     }
 
 
@@ -807,15 +856,13 @@ async def _tool_sql_select(settings: Settings, target: AnalysisTarget, args: dic
     if not dsn:
         return {"query": sql, "title": title, "summary": fallback, "error": fallback}
     rows = await _run_select(dsn, sql, settings.postgres_timeout_seconds)
-    summary = f"{len(rows)} row(s)"
-    if fallback:
-        summary = f"{fallback}; {summary}"
     return {
         "query": sql,
         "title": title,
-        "summary": summary,
+        "summary": f"{len(rows)} row(s)",
         "error": None,
         "result": {"rows": rows},
+        **({"mcp_fallback": fallback} if fallback else {}),
     }
 
 

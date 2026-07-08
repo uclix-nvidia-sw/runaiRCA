@@ -22,7 +22,7 @@ from urllib.parse import quote
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
-from app.llm import complete, llm_configured
+from app.llm import cached_insight, complete, insight_cache_key, llm_configured
 from app.masking import build_masker
 
 # How far back a change still counts as "recent" and relevant to this alert.
@@ -306,7 +306,8 @@ def _deterministic_summary(changes: list[dict], namespace: str) -> str:
 
 
 async def _senior_insight(settings: Settings, changes: list[dict]) -> str:
-    if not llm_configured(settings):
+    insight_model = getattr(settings, "llm_model_insight", "")
+    if not llm_configured(settings, insight_model):
         return ""
     system = (
         "You are a senior SRE asking the first question of any incident: what changed? "
@@ -320,7 +321,18 @@ async def _senior_insight(settings: Settings, changes: list[dict]) -> str:
     user = _collector_masker(settings).mask_text(
         str(compact([c.get("summary") for c in changes[:15]], limit=15))
     )
-    text = await complete(settings, system=system, user=user, max_tokens=160) or ""
+    key = insight_cache_key("change", getattr(settings, "language", "en"), user)
+
+    async def compute() -> str | None:
+        return await complete(
+            settings,
+            system=system,
+            user=user,
+            max_tokens=160,
+            model=insight_model or None,
+        )
+
+    text = await cached_insight(key, compute) or ""
     return _collector_masker(settings).mask_text(text)
 
 

@@ -33,7 +33,8 @@ def test_every_llm_call_carries_the_injection_guard(monkeypatch) -> None:
     monkeypatch.setattr(llm, "post_json", _capture_post_json(captured))
     asyncio.run(llm.complete(_LLM_SETTINGS, system="base prompt", user="evidence"))
     system = captured["messages"][0]["content"]
-    assert system.startswith("base prompt")
+    assert system.startswith(PROMPT_INJECTION_GUARD)
+    assert "base prompt" in system
     assert PROMPT_INJECTION_GUARD in system
 
 

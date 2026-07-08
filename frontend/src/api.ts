@@ -184,8 +184,35 @@ export type ChatResponse = {
   analysis_run?: AnalysisRun;
 };
 
+export type ChatHistoryMessage = {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  created_at: string;
+};
+
+export type ChatHistoryConversation = {
+  id: string;
+  title: string;
+  context_label: string;
+  incident_id?: string;
+  alert_id?: string;
+  messages: ChatHistoryMessage[];
+  created_at: string;
+  updated_at: string;
+};
+
 export async function chat(payload: ChatRequest) {
   return write<ChatResponse>('/api/v1/chat', payload);
+}
+
+export async function fetchChatConversations(page?: PageRequest): Promise<PageResult<ChatHistoryConversation>> {
+  const response = await read<Envelope<ChatHistoryConversation[]>>(`/api/v1/chat/conversations${pageQuery(page)}`);
+  return pageResult(response, page);
+}
+
+export async function deleteChatConversation(id: string): Promise<void> {
+  await mutate<Envelope<{ id: string }>>('DELETE', `/api/v1/chat/conversations/${encodeURIComponent(id)}`);
 }
 
 export function eventSource(): EventSource {

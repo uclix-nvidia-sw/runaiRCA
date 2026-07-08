@@ -5,6 +5,8 @@ from dataclasses import replace
 import pytest
 
 from app.collectors import change, kubernetes, loki, system
+from app.collectors.base import NO_EVIDENCE
+from app.llm import begin_usage_tracking
 from tests.test_orchestrator import make_settings
 
 
@@ -15,6 +17,92 @@ def _settings():
         llm_model="m",
         llm_api_key="k",
     )
+
+
+@pytest.mark.asyncio
+async def test_collector_insight_is_cached_within_usage_scope(monkeypatch) -> None:
+    calls = 0
+
+    async def fake_complete(_settings, *, user, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return f"insight {calls}"
+
+    monkeypatch.setattr(loki, "complete", fake_complete)
+    begin_usage_tracking()
+    settings = _settings()
+
+    first = await loki._llm_insight(settings, "source", "summary", [{"line": "evidence"}])
+    second = await loki._llm_insight(settings, "source", "summary", [{"line": "evidence"}])
+
+    assert first == "insight 1"
+    assert second == "insight 1"
+    assert calls == 1
+
+    begin_usage_tracking()
+    await loki._llm_insight(settings, "source", "summary", [{"line": "evidence"}])
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_no_evidence_collectors_skip_insight_llm(monkeypatch) -> None:
+    async def should_not_call(*_args, **_kwargs):
+        raise AssertionError("no-evidence summaries should not call the LLM")
+
+    monkeypatch.setattr(loki, "complete", should_not_call)
+    monkeypatch.setattr(kubernetes, "complete", should_not_call)
+    settings = _settings()
+
+    assert (
+        await loki._llm_insight(
+            settings, "Prometheus metrics", f"{NO_EVIDENCE} no matching series.", []
+        )
+        is None
+    )
+    assert (
+        await kubernetes._senior_insight(
+            settings,
+            summary=f"{NO_EVIDENCE} Kubernetes query failed.",
+            container_diagnostics=[],
+            warning_events=[],
+            logs=[],
+            exec_probes=[],
+        )
+        == ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_insight_calls_use_stage_model_override(monkeypatch) -> None:
+    models: list[str | None] = []
+
+    async def fake_complete(_settings, *, model=None, **_kwargs):
+        models.append(model)
+        return "ok"
+
+    for module in (change, kubernetes, loki):
+        monkeypatch.setattr(module, "complete", fake_complete)
+
+    settings = replace(_settings(), llm_model_insight="super")
+    begin_usage_tracking()
+    await loki._llm_insight(settings, "source", "summary", [{"line": "evidence"}])
+    await kubernetes._senior_insight(
+        settings,
+        summary="summary",
+        container_diagnostics=[],
+        warning_events=[{"message": "FailedScheduling"}],
+        logs=[],
+        exec_probes=[],
+    )
+    await change._senior_insight(settings, [{"summary": "deployment changed"}])
+
+    assert models == ["super", "super", "super"]
+
+    models.clear()
+    await loki._llm_insight(
+        replace(settings, llm_model_insight=""), "source", "summary", [{"line": "new evidence"}]
+    )
+    assert models == [None]
 
 
 @pytest.mark.asyncio

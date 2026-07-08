@@ -67,6 +67,7 @@ type Store struct {
 	feedback             map[string]*FeedbackRecord
 	comments             map[string]*CommentRecord
 	analysisRuns         map[string]*AnalysisRun
+	chatConversations    map[string]*ChatConversation
 	recurrenceStatsCache map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry
 	db                   *sql.DB
 	dbReady              bool
@@ -98,15 +99,16 @@ type DashboardSnapshot struct {
 
 func NewStore() *Store {
 	return &Store{
-		incidents:     make(map[string]*Incident),
-		incidentByKey: make(map[string]string),
-		alerts:        make(map[string]*AlertRecord),
-		alertByFinger: make(map[string]string),
-		alertByGroup:  make(map[string]string),
-		memories:      make(map[string]*IncidentMemory),
-		feedback:      make(map[string]*FeedbackRecord),
-		comments:      make(map[string]*CommentRecord),
-		analysisRuns:  make(map[string]*AnalysisRun),
+		incidents:         make(map[string]*Incident),
+		incidentByKey:     make(map[string]string),
+		alerts:            make(map[string]*AlertRecord),
+		alertByFinger:     make(map[string]string),
+		alertByGroup:      make(map[string]string),
+		memories:          make(map[string]*IncidentMemory),
+		feedback:          make(map[string]*FeedbackRecord),
+		comments:          make(map[string]*CommentRecord),
+		analysisRuns:      make(map[string]*AnalysisRun),
+		chatConversations: make(map[string]*ChatConversation),
 		recurrenceStatsCache: make(
 			map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry,
 		),
@@ -538,6 +540,138 @@ func (s *Store) ListAnalysisRunsPage(limit, offset int) ([]AnalysisRun, int) {
 		items = append(items, cloneAnalysisRun(run))
 	}
 	return items, len(ordered)
+}
+
+func (s *Store) ListChatConversationsPage(limit, offset int) ([]ChatConversation, int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ordered := make([]*ChatConversation, 0, len(s.chatConversations))
+	for _, conversation := range s.chatConversations {
+		if conversation != nil {
+			ordered = append(ordered, conversation)
+		}
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].UpdatedAt.After(ordered[j].UpdatedAt) })
+	start, end := pageRange(len(ordered), limit, offset)
+	items := make([]ChatConversation, 0, end-start)
+	for _, conversation := range ordered[start:end] {
+		items = append(items, cloneChatConversation(conversation))
+	}
+	return items, len(ordered)
+}
+
+func (s *Store) DeleteChatConversation(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.chatConversations[id] == nil {
+		return false
+	}
+	delete(s.chatConversations, id)
+	s.persistChatConversationDeleteLocked(id)
+	return true
+}
+
+func (s *Store) SaveChatExchange(req ChatRequest, answer ChatResponse, userMessageAt time.Time) ChatConversation {
+	conversationID := strings.TrimSpace(first(answer.ConversationID, req.ConversationID))
+	if conversationID == "" {
+		conversationID = fmt.Sprintf("chat-%d", time.Now().UnixNano())
+	}
+	if userMessageAt.IsZero() {
+		userMessageAt = time.Now().UTC()
+	}
+	assistantAt := time.Now().UTC()
+	userMessage := ChatMessageRecord{
+		ID:        fmt.Sprintf("%s-user-%d", conversationID, userMessageAt.UnixNano()),
+		Role:      "user",
+		Content:   req.Message,
+		CreatedAt: userMessageAt,
+	}
+	assistantMessage := ChatMessageRecord{
+		ID:        fmt.Sprintf("%s-assistant-%d", conversationID, assistantAt.UnixNano()),
+		Role:      "assistant",
+		Content:   chatAnswerForHistory(answer),
+		CreatedAt: assistantAt,
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.chatConversations == nil {
+		s.chatConversations = make(map[string]*ChatConversation)
+	}
+	conversation := s.chatConversations[conversationID]
+	if conversation == nil {
+		conversation = &ChatConversation{
+			ID:           conversationID,
+			Title:        chatTitleFromMessage(req.Message),
+			ContextLabel: chatContextLabel(req),
+			IncidentID:   req.IncidentID,
+			AlertID:      req.AlertID,
+			Messages:     []ChatMessageRecord{},
+			CreatedAt:    userMessageAt,
+		}
+		s.chatConversations[conversationID] = conversation
+	}
+	conversation.ContextLabel = first(chatContextLabel(req), conversation.ContextLabel)
+	conversation.IncidentID = first(req.IncidentID, conversation.IncidentID)
+	conversation.AlertID = first(req.AlertID, conversation.AlertID)
+	conversation.Messages = append(conversation.Messages, userMessage, assistantMessage)
+	if len(conversation.Messages) > maxChatHistoryMessages {
+		conversation.Messages = conversation.Messages[len(conversation.Messages)-maxChatHistoryMessages:]
+	}
+	conversation.UpdatedAt = assistantAt
+	s.persistChatConversationLocked(conversation)
+	return cloneChatConversation(conversation)
+}
+
+func chatAnswerForHistory(answer ChatResponse) string {
+	if answer.AnalysisRun == nil {
+		return answer.Answer
+	}
+	return fmt.Sprintf(
+		"%s\n\nAnalysis run %s was created and added to the Analysis Dashboard.",
+		answer.Answer,
+		answer.AnalysisRun.RunID,
+	)
+}
+
+func chatTitleFromMessage(message string) string {
+	title := strings.TrimSpace(strings.Split(message, "\n")[0])
+	if title == "" {
+		return "New chat"
+	}
+	return excerpt(title, 80)
+}
+
+func chatContextLabel(req ChatRequest) string {
+	if req.AlertID != "" {
+		return "Alert " + req.AlertID
+	}
+	if req.IncidentID != "" {
+		return "Incident " + req.IncidentID
+	}
+	page := strings.TrimSuffix(strings.TrimSpace(req.Page), "_dashboard")
+	page = strings.ReplaceAll(page, "_", " ")
+	if page == "" {
+		return "RCA Chat"
+	}
+	return strings.ToUpper(page[:1]) + page[1:]
+}
+
+func cloneChatConversation(in *ChatConversation) ChatConversation {
+	if in == nil {
+		return ChatConversation{}
+	}
+	out := *in
+	if in.Messages == nil {
+		out.Messages = []ChatMessageRecord{}
+	} else {
+		out.Messages = append([]ChatMessageRecord{}, in.Messages...)
+	}
+	return out
 }
 
 func (s *Store) ArchiveIncident(id string, archived bool) (*Incident, bool) {

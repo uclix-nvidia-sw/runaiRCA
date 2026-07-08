@@ -34,6 +34,7 @@ _MAX_HYPOTHESES = 8
 _CONFIDENT_STOP = 0.80
 _CONFIDENT_GAP = 0.25
 _LEDGER_STATUSES = {"open", "testing", "supported", "refuted", "uncertain"}
+_USER_PROMPT_CHARS = 8000
 
 # What each collector is good for — fed to the LLM so it picks the right probe.
 _COLLECTOR_HINTS = {
@@ -512,22 +513,59 @@ def _build_user_prompt(
     ledger: list[dict[str, Any]],
     adhoc: list[dict] | None = None,
 ) -> str:
-    payload = {
+    stable = {
         "plan": plan.as_dict() if plan else {},
-        "hypothesis_ledger": _ledger_summary(ledger),
         "knowledge_graph": {
             "blast_radius_workloads": kg_context.get("blast_radius_workloads"),
             "prior_incidents": kg_context.get("prior_incidents"),
         },
         "available_collectors": {name: _COLLECTOR_HINTS.get(name, "") for name in by_name},
+        "adhoc_query_kinds": sorted(_READ_KINDS),
+    }
+    variable = {
+        "hypothesis_ledger": _ledger_summary(ledger),
         "evidence_so_far": _evidence_summary(evidence),
         "not_yet_probed": [name for name in by_name if name not in evidence],
-        "adhoc_query_kinds": sorted(_READ_KINDS),
         # The last few ad-hoc reads, trimmed — enough for the LLM to chain
         # "PVC is Pending -> check the storageclass" style drill-downs.
         "adhoc_results": _adhoc_prompt_results(adhoc),
     }
-    return json.dumps(payload, default=str)[:8000]
+    return _capped_json_prompt(
+        stable,
+        variable,
+        max_chars=_USER_PROMPT_CHARS,
+        trim_keys=("evidence_so_far", "adhoc_results"),
+    )
+
+
+def _capped_json_prompt(
+    stable: dict[str, Any],
+    variable: dict[str, Any],
+    *,
+    max_chars: int,
+    trim_keys: tuple[str, ...],
+) -> str:
+    variable = {
+        key: list(value) if isinstance(value, list) else value for key, value in variable.items()
+    }
+    payload = {**stable, **variable}
+    text = json.dumps(payload, default=str)
+    while len(text) > max_chars:
+        for key in trim_keys:
+            value = variable.get(key)
+            if isinstance(value, list) and len(value) > 1:
+                variable[key] = value[1:]
+                payload = {**stable, **variable}
+                text = json.dumps(payload, default=str)
+                break
+        else:
+            break
+    if len(text) <= max_chars:
+        return text
+    marker = '"...truncated older prompt context..."'
+    tail = max_chars // 4
+    head = max_chars - tail - len(marker)
+    return text[:head] + marker + text[-tail:]
 
 
 def _adhoc_prompt_results(adhoc: list[dict] | None) -> list[str]:

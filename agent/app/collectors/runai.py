@@ -163,12 +163,18 @@ class RunAICollector:
                 status = "ok"
                 confidence = "high"
             elif successful:
+                # We DID enumerate (projects/queues/departments/workloads) even
+                # without a workload label — say what came back, and let the
+                # kubernetes CRD enumeration surface which entities are not Ready.
+                retrieved = ", ".join(
+                    sorted({str(item.get("name")) for item in successful if item.get("name")})
+                )
                 summary = ko_en(
                     self._settings,
-                    "Run:ai API에는 접속했지만 알림 레이블에 프로젝트/큐/워크로드 식별 "
-                    "정보가 없어 완전한 상관 분석이 어렵습니다.",
-                    "Run:ai API is reachable, but alert labels are missing some project, queue, "
-                    "or workload identity needed for complete correlation.",
+                    f"알림에 워크로드 식별자는 없지만 Run:ai API로 {retrieved} 목록을 "
+                    "조회했습니다. 개별 리소스 상태는 Kubernetes CRD 조회를 참고하세요.",
+                    f"No workload identifier on the alert; queried Run:ai API for {retrieved}. "
+                    "See the Kubernetes CRD findings for which resources are not Ready.",
                 )
                 status = "partial"
                 confidence = "medium"

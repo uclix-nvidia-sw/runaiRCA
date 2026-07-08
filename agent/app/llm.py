@@ -8,9 +8,11 @@ configured, or the call fails, the callers fall back to deterministic behaviour.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import random
+from collections.abc import Awaitable, Callable
 from contextvars import ContextVar, Token
 from typing import Any
 
@@ -19,6 +21,9 @@ from app.config import Settings
 
 _log = logging.getLogger(__name__)
 _usage: ContextVar[dict[str, Any] | None] = ContextVar("llm_usage", default=None)
+_insight_cache: ContextVar[dict[str, str | None] | None] = ContextVar(
+    "llm_insight_cache", default=None
+)
 _nat_client: ContextVar[Any | None] = ContextVar("nat_llm_client", default=None)
 _RETRY_STATUSES = {0, 429, 500, 502, 503, 504}
 
@@ -38,7 +43,26 @@ def begin_usage_tracking() -> dict[str, Any]:
         "by_model": {},
     }
     _usage.set(usage)
+    _insight_cache.set({})
     return usage
+
+
+def insight_cache_key(*parts: object) -> str:
+    raw = "\x1f".join(str(part) for part in parts)
+    return hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+async def cached_insight(
+    key: str, compute: Callable[[], Awaitable[str | None]]
+) -> str | None:
+    cache = _insight_cache.get()
+    if cache is None:
+        return await compute()
+    if key in cache:
+        return cache[key]
+    value = await compute()
+    cache[key] = value
+    return value
 
 
 def set_nat_client(client: Any) -> Token:
@@ -206,7 +230,7 @@ async def complete_with_error(
     payload: dict[str, Any] = {
         "model": selected_model,
         "messages": [
-            {"role": "system", "content": f"{system}\n\n{PROMPT_INJECTION_GUARD}"},
+            {"role": "system", "content": f"{PROMPT_INJECTION_GUARD}\n\n{system}"},
             {"role": "user", "content": user},
         ],
         "temperature": temperature,
@@ -255,7 +279,7 @@ async def _complete_with_nat_client(
 
     client = _nat_client.get()
     messages = [
-        SystemMessage(content=f"{system}\n\n{PROMPT_INJECTION_GUARD}"),
+        SystemMessage(content=f"{PROMPT_INJECTION_GUARD}\n\n{system}"),
         HumanMessage(content=user),
     ]
     kwargs: dict[str, Any] = {"temperature": temperature}

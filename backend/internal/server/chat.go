@@ -35,10 +35,29 @@ type ChatResponse struct {
 	AnalysisRun    *AnalysisRun `json:"analysis_run,omitempty"`
 }
 
+type ChatMessageRecord struct {
+	ID        string    `json:"id"`
+	Role      string    `json:"role"`
+	Content   string    `json:"content"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type ChatConversation struct {
+	ID           string              `json:"id"`
+	Title        string              `json:"title"`
+	ContextLabel string              `json:"context_label"`
+	IncidentID   string              `json:"incident_id,omitempty"`
+	AlertID      string              `json:"alert_id,omitempty"`
+	Messages     []ChatMessageRecord `json:"messages"`
+	CreatedAt    time.Time           `json:"created_at"`
+	UpdatedAt    time.Time           `json:"updated_at"`
+}
+
 const (
 	dashboardChatRecentLimit = 5
 	maxChatMessageBytes      = 8000
 	maxChatMetadataBytes     = 256
+	maxChatHistoryMessages   = 200
 )
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -56,6 +75,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "message is too long")
 		return
 	}
+	userMessageAt := time.Now().UTC()
 	req = s.enrichChatRequest(req)
 	if wantsAnalysisRun(req.Message) {
 		targetType, targetID, inferred := s.chatAnalysisTarget(req)
@@ -90,6 +110,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 					AnalysisRun:    run,
 				}
 				finalizeChatResponse(&answer, req)
+				s.store.SaveChatExchange(req, answer, userMessageAt)
 				writeJSON(w, http.StatusAccepted, answer)
 				return
 			}
@@ -107,6 +128,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			AnalysisRun:    run,
 		}
 		finalizeChatResponse(&answer, req)
+		s.store.SaveChatExchange(req, answer, userMessageAt)
 		writeJSON(w, http.StatusAccepted, answer)
 		return
 	}
@@ -115,7 +137,34 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		answer = fallbackChatResponse(req, err)
 	}
 	finalizeChatResponse(&answer, req)
+	s.store.SaveChatExchange(req, answer, userMessageAt)
 	writeJSON(w, http.StatusOK, answer)
+}
+
+func (s *Server) handleChatConversations(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/chat/conversations":
+		page, err := paginationFromRequest(r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		items, total := s.store.ListChatConversationsPage(page.Limit, page.Offset)
+		writeJSON(w, http.StatusOK, paginatedEnvelope(items, page, total))
+	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/v1/chat/conversations/"):
+		id := pathPart(r.URL.Path, "/api/v1/chat/conversations/")
+		if id == "" {
+			writeError(w, http.StatusNotFound, "conversation not found")
+			return
+		}
+		if !s.store.DeleteChatConversation(id) {
+			writeError(w, http.StatusNotFound, "conversation not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, envelope(map[string]string{"id": id}))
+	default:
+		writeError(w, http.StatusNotFound, "not found")
+	}
 }
 
 // finalizeChatResponse ensures the conversation id and mirror fields used by the

@@ -3,6 +3,8 @@ healthcheck demoted to non-evidence, and Korean playbook translation splicing.""
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from app.collectors.base import NO_EVIDENCE, CollectorResult, artifact
@@ -129,13 +131,16 @@ async def test_translate_playbook_ko_splices_only_the_playbook(monkeypatch) -> N
 
     async def fake_complete(settings, *, system, user, **kwargs):
         assert "GPU Allocation" in user
+        assert kwargs["model"] == "super"
         return (
             "- **대시보드 GPU 할당 0 표시** (알려진 이슈)\n"
             "  - 문제 파드를 삭제하세요. api_key=translation-secret-12345"
         )
 
     monkeypatch.setattr(pipeline, "complete", fake_complete)
-    translated = await pipeline._translate_playbook_ko(make_settings(), detail)
+    translated = await pipeline._translate_playbook_ko(
+        replace(make_settings(), llm_model_insight="super"), detail
+    )
     assert "대시보드 GPU 할당 0 표시" in translated
     assert "Delete the offending pod" not in translated
     assert "### Similar Incidents" in translated  # neighbouring sections untouched
@@ -148,6 +153,27 @@ async def test_translate_playbook_ko_splices_only_the_playbook(monkeypatch) -> N
 async def test_translate_playbook_ko_keeps_detail_without_marker() -> None:
     detail = "## 2. 원인\n\n- 근거"
     assert await pipeline._translate_playbook_ko(make_settings(), detail) == detail
+
+
+@pytest.mark.asyncio
+async def test_sharpen_operator_questions_uses_insight_model(monkeypatch) -> None:
+    models: list[str | None] = []
+
+    async def fake_complete_json(settings, *, model=None, **_kwargs):
+        models.append(model)
+        return {"questions": ["Which queue was saturated?", "Which pod stayed pending?"]}
+
+    monkeypatch.setattr(pipeline, "complete_json", fake_complete_json)
+
+    questions = await pipeline._sharpen_operator_questions(
+        replace(make_settings(), llm_model_insight="super"),
+        ["queue?", "pod?"],
+        ["prometheus.metrics"],
+        None,
+    )
+
+    assert questions == ["Which queue was saturated?", "Which pod stayed pending?"]
+    assert models == ["super"]
 
 
 # --- drill-down observability -----------------------------------------------------

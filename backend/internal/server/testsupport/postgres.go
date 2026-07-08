@@ -339,6 +339,18 @@ func (s *PostgresState) rowsFor(query string) driver.Rows {
 				s.emptyArrayJSON, s.emptyArrayJSON, s.emptyArrayJSON, s.emptyObjectJSON, s.now, s.now, s.now,
 			}},
 		}
+	case strings.Contains(lowered, "from chat_conversations"):
+		return &fakeRows{
+			columns: []string{
+				"conversation_id", "title", "context_label", "incident_id", "alert_id",
+				"messages", "created_at", "updated_at",
+			},
+			values: [][]driver.Value{{
+				"chat-db", "Why is the queue blocked?", "Incident INC-db", "INC-db", "",
+				[]byte(`[{"id":"msg-user","role":"user","content":"Why is the queue blocked?","created_at":"2026-06-26T12:00:00Z"},{"id":"msg-assistant","role":"assistant","content":"GPU quota is saturated.","created_at":"2026-06-26T12:00:01Z"}]`),
+				s.now, s.now,
+			}},
+		}
 	default:
 		return &fakeRows{}
 	}

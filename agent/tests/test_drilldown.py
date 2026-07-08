@@ -162,6 +162,32 @@ def test_drilldown_prompt_includes_prior_artifact_result() -> None:
     assert "stale gang phase" in prompt
 
 
+def test_drilldown_prompt_orders_stable_prefix_and_keeps_latest_history() -> None:
+    result = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="pod pending " + ("x" * 1100),
+    )
+    history = [
+        {
+            "tool": "k8s_read",
+            "args": "{}",
+            "outcome": (
+                ("OLDEST-HISTORY " if idx == 12 else "LATEST-HISTORY " if idx == 19 else "")
+                + ("x" * 1400)
+            ),
+        }
+        for idx in range(20)
+    ]
+
+    prompt = drilldown._user_prompt(result, _target(), None, history, [])
+
+    assert len(prompt) <= 6000
+    assert prompt.find('"target"') < prompt.find('"my_summary"')
+    assert "LATEST-HISTORY" in prompt
+    assert "OLDEST-HISTORY" not in prompt
+
+
 def test_drilldown_prompt_skips_unavailable_artifact_result() -> None:
     result = CollectorResult(
         agent="runai",

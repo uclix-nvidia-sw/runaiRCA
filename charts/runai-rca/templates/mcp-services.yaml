@@ -373,6 +373,30 @@ rules:
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses"]
     verbs: ["get", "list", "watch"]
+  # Run:ai CRDs — exactly the k8s_read allowlist (_RUNAI_CRD_KINDS), read-only.
+  # The agent reads these MCP-first, so the MCP server needs the same access or
+  # every CRD query would 403 here and silently demote to the direct API.
+  - apiGroups: ["run.ai"]
+    resources:
+      - distributedworkloads
+      - distributedinferenceworkloads
+      - externalworkloads
+      - inferenceworkloads
+      - interactiveworkloads
+      - nodepools
+      - projects
+      - runaiconfigs
+      - runaijobs
+      - workloadrunners
+      - trainingworkloads
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["scheduling.run.ai"]
+    resources:
+      - bindrequests
+      - departments
+      - podgroups
+      - queues
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -419,6 +443,26 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["batch"]
     resources: ["cronjobs", "jobs"]
+    verbs: ["get", "list", "watch"]
+  # Run:ai CRDs — the NAMESPACED subset of the k8s_read allowlist only: a Role
+  # cannot authorize cluster-scoped resources (projects/queues/departments/
+  # nodepools need rbac.clusterWide, same as nodes/storageclasses).
+  - apiGroups: ["run.ai"]
+    resources:
+      - distributedworkloads
+      - distributedinferenceworkloads
+      - externalworkloads
+      - inferenceworkloads
+      - interactiveworkloads
+      - runaiconfigs
+      - runaijobs
+      - workloadrunners
+      - trainingworkloads
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["scheduling.run.ai"]
+    resources:
+      - bindrequests
+      - podgroups
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
