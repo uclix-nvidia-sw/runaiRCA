@@ -32,7 +32,32 @@ _FLOOR = 2.0          # min top score below which we fall back to insufficient_e
 _HIGH = 5.0           # score needed (with >=2 corroborating agents) for high confidence
 _MED = 2.5
 _CONF_ORDER = ("low", "medium", "high")
-_METADATA_VALUE_KEYS = {"expr", "expression", "metric", "metric_name", "name", "query"}
+# Values that describe what we ASKED or which objects EXIST, not what came back.
+# Matching keywords against them let a run with ZERO error evidence score
+# runai_control_plane_error 8.0/high: the LogQL probe strings carried
+# "reconcile|cluster-sync|authorization" and the healthy control-plane pod
+# LISTING carried "runai-backend-*" names. Evidence text = returned values only.
+METADATA_VALUE_KEYS = {
+    "expr",
+    "expression",
+    "metric",
+    "metric_name",
+    "name",
+    "query",
+    "path",
+    "url",
+    "title",
+    "label_selector",
+    "labelselector",
+    "field_selector",
+    "fieldselector",
+    "logql",
+    "promql",
+    "sql",
+    "kubectl",
+    "runai_control_plane_pods",
+}
+_METADATA_VALUE_KEYS = METADATA_VALUE_KEYS
 
 
 @dataclass

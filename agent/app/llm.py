@@ -186,11 +186,13 @@ async def complete_with_error(
     if not llm_configured(settings, selected_model):
         return None, "LLM is not configured"
     # NAT owns only the default app model; explicit stage model overrides stay on HTTP.
-    # No httpx fallback on purpose: while validating the NAT/langchain litellm client
-    # we want its failures to surface (error + English report), not be masked by a
-    # silent fallback — otherwise you can't tell whether langchain actually works.
+    # A NAT reply with no usable text falls back to the direct HTTP path (owner
+    # decision after the langchain validation run: one empty reply must not
+    # silently degrade the whole analysis to the deterministic English report).
+    # The warning names WHY it was empty (finish_reason / shape) so the pod log
+    # finally tells the truth instead of a blind "no reply".
     if _nat_client.get() is not None and selected_model == settings.llm_model:
-        return await _complete_with_nat_client(
+        text, nat_error = await _complete_with_nat_client(
             settings,
             system=system,
             user=user,
@@ -198,6 +200,9 @@ async def complete_with_error(
             max_tokens=max_tokens,
             model=selected_model,
         )
+        if text:
+            return text, None
+        _log.warning("NAT LLM reply unusable (%s); retrying via direct HTTP", nat_error)
     payload: dict[str, Any] = {
         "model": selected_model,
         "messages": [
@@ -271,12 +276,37 @@ async def _complete_with_nat_client(
         return None, "NAT LLM client failed"
     usage = _langchain_usage(response)
     _record_usage(model, {"usage": usage} if usage else {})
-    text = getattr(response, "content", None)
-    if isinstance(text, str) and text.strip():
-        return text.strip(), None
-    if isinstance(response, str) and response.strip():
-        return response.strip(), None
-    return None, "unexpected response shape from the NAT LLM client"
+    text = _langchain_text(response)
+    if text:
+        return text, None
+    # Empty content with usage recorded = the model DID reply. The classic cause
+    # is a reasoning model spending the whole completion budget on reasoning
+    # tokens (finish_reason=length, content=""), so name it in the error.
+    meta = getattr(response, "response_metadata", None)
+    finish = meta.get("finish_reason") if isinstance(meta, dict) else None
+    completion = (usage or {}).get("completion_tokens")
+    return None, (
+        f"empty content from the NAT LLM client "
+        f"(finish_reason={finish}, completion_tokens={completion})"
+    )
+
+
+def _langchain_text(response: Any) -> str:
+    """The text of a langchain reply — plain str, or joined text content blocks."""
+    content = getattr(response, "content", response)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                value = block.get("text") or block.get("content")
+                if isinstance(value, str):
+                    parts.append(value)
+        return "\n".join(part.strip() for part in parts if part.strip()).strip()
+    return ""
 
 
 def _langchain_usage(response: Any) -> dict[str, int] | None:

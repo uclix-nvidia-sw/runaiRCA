@@ -427,12 +427,56 @@ def load_architecture(path: str) -> dict[str, dict[str, Any]]:
             "kind": str(entry.get("kind") or ""),
             "purpose": str(entry.get("purpose") or ""),
             "failure_effect": str(entry.get("failure_effect") or ""),
+            "family": str(entry.get("family") or ""),
             "owns_schema": str(entry.get("owns_schema") or ""),
             "depends_on": [str(d) for d in (entry.get("depends_on") or [])],
             "checks": [str(c) for c in (entry.get("checks") or [])],
             "saas_only": bool(entry.get("saas_only")),
         }
     return out
+
+
+def component_for_target(
+    components: dict[str, dict[str, Any]], *names: str
+) -> dict[str, Any] | None:
+    """The platform component the alert TARGET itself is, by pod/workload name.
+
+    The identity entry point into the topology knowledge: an alert ON
+    runai-container-toolkit-vttmr implicates the runai-container-toolkit
+    component (and its depends_on chain — the NVIDIA GPU Operator stack) even
+    when every collector comes back empty, so no error-string signature is
+    needed to reach the right playbook. Token-boundary match, longest component
+    name wins (runai-backend-workloads over runai-backend)."""
+    best: dict[str, Any] | None = None
+    best_len = 0
+    for raw in names:
+        stem = str(raw or "").strip().lower()
+        if not stem:
+            continue
+        padded = f"-{stem}-"
+        for name, entry in components.items():
+            token = f"-{name.lower()}-"
+            if token in padded and len(name) > best_len:
+                best = entry
+                best_len = len(name)
+    return best
+
+
+def component_action_lines(components: dict[str, dict[str, Any]], name: str) -> list[str]:
+    """Flat action strings for an implicated component — the identity-entry
+    version of component_check_lines, shaped for the numbered actions list."""
+    entry = components.get(name)
+    if not entry:
+        return []
+    lines: list[str] = []
+    effect = entry.get("failure_effect") or entry.get("purpose")
+    if effect:
+        lines.append(f"({name}) {effect}")
+    chain = dependency_path(components, name)
+    if len(chain) > 1:
+        lines.append(f"Check order for {name}: " + " → ".join(chain))
+    lines.extend(str(check) for check in (entry.get("checks") or [])[:3])
+    return lines
 
 
 def dependency_path(

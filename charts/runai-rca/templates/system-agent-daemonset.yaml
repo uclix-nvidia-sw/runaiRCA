@@ -78,6 +78,15 @@ data:
             pass
 
         def do_GET(self):
+            # Probes (kubelet /healthz) may close the socket before the reply is
+            # written; without this guard every such race dumps a BrokenPipeError
+            # traceback into the pod log and reads as a crashing agent.
+            try:
+                self._get()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def _get(self):
             u = urlparse(self.path)
             if u.path == "/healthz":
                 self.send_response(200); self.end_headers(); self.wfile.write(b"ok"); return

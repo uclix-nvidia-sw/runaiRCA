@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
+from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
 from app.collectors.http_json import compact, get_json
 from app.collectors.loki import _llm_insight
 from app.config import Settings
@@ -98,22 +98,33 @@ class PrometheusCollector:
         if populated:
             status = "ok"
             confidence = "high"
-            summary = (
+            summary = ko_en(
+                self._settings,
+                f"Prometheus {'MCP' if used_mcp else '직접'} 조회 완료 — "
+                f"{len(query_results)}개 쿼리 그룹 중 {len(populated)}개에서 "
+                "메트릭 시리즈를 확인했습니다.",
                 f"Prometheus {'MCP' if used_mcp else 'direct'} queries completed with "
                 "matching metric series "
-                f"for {len(populated)} of {len(query_results)} query group(s)."
+                f"for {len(populated)} of {len(query_results)} query group(s).",
             )
         elif successful:
             status = "partial"
             confidence = "medium"
-            summary = (
-                f"{NO_EVIDENCE} Prometheus is reachable, but the workload metric queries "
-                "returned no series. Check metric labels and scrape configuration."
+            summary = f"{NO_EVIDENCE} " + ko_en(
+                self._settings,
+                "Prometheus에는 접속했지만 워크로드 메트릭 쿼리에 시리즈가 없습니다. "
+                "메트릭 레이블과 수집(scrape) 설정을 확인하세요.",
+                "Prometheus is reachable, but the workload metric queries "
+                "returned no series. Check metric labels and scrape configuration.",
             )
         else:
             status = "unavailable"
             confidence = "low"
-            summary = f"{NO_EVIDENCE} Prometheus direct queries failed."
+            summary = f"{NO_EVIDENCE} " + ko_en(
+                self._settings,
+                "Prometheus 직접 조회가 실패했습니다.",
+                "Prometheus direct queries failed.",
+            )
 
         insight = await _llm_insight(
             self._settings, "Prometheus metrics", summary, query_results

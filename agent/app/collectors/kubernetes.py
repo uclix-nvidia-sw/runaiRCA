@@ -6,7 +6,7 @@ import shlex
 from pathlib import Path
 from urllib.parse import quote
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
+from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import complete, llm_configured
@@ -214,6 +214,19 @@ async def k8s_read(
                 settings, resolved, namespace=namespace, name=name, label_selector=label_selector
             )
         except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
+            # "not found" is an ANSWER (the resource is gone), not a transport
+            # failure — the direct API would only 404 the same question again.
+            if "not found" in str(exc).lower() or "notfound" in str(exc).lower():
+                return {
+                    "kind": resolved,
+                    "namespace": namespace,
+                    "name": name,
+                    "label_selector": label_selector,
+                    "url": f"{settings.kubernetes_mcp_url}#read_{resolved}",
+                    "status_code": 404,
+                    "error": str(exc),
+                    "data": None,
+                }
             mcp_note = mcp_fallback_warning(exc)
     token = _read_file(settings.kubernetes_token_path)
     if not token:
@@ -501,18 +514,46 @@ class KubernetesCollector:
         if successful and not missing:
             status = "ok"
             confidence = "high"
-            summary = "Kubernetes API queries completed for the resolved alert target."
+            summary = ko_en(
+                self._settings,
+                "알림 대상에 대한 Kubernetes 조회를 완료했습니다.",
+                "Kubernetes API queries completed for the resolved alert target.",
+            )
         elif successful:
             status = "partial"
             confidence = "medium"
-            summary = (
+            summary = ko_en(
+                self._settings,
+                "Kubernetes API에는 접속했지만 알림 대상 정보가 불완전합니다. "
+                "네임스페이스/파드/워크로드/노드 레이블이 없을 수 있습니다.",
                 "Kubernetes API is reachable, but the alert target is incomplete. "
-                "Namespace, pod, workload, or node labels may be missing."
+                "Namespace, pod, workload, or node labels may be missing.",
             )
         else:
             status = "unavailable"
             confidence = "low"
-            summary = f"{NO_EVIDENCE} Kubernetes API direct queries failed."
+            summary = f"{NO_EVIDENCE} " + ko_en(
+                self._settings,
+                "Kubernetes API 조회가 실패했습니다.",
+                "Kubernetes API direct queries failed.",
+            )
+
+        # The alert names a pod that no longer exists (and left no live sibling
+        # or events): say so — it IS the finding. Without this the report blames
+        # whatever keyword noise survives, when the truth is "already replaced /
+        # recovered, or a stale alert".
+        target_pod_missing = _target_pod_missing(target, responses)
+        if target_pod_missing:
+            note = (
+                f"알림 대상 pod '{target.pod}'은(는) 현재 클러스터에 존재하지 않습니다 — "
+                "이미 교체/복구되었거나 오래된 알림일 수 있습니다."
+                if self._settings.language == "ko"
+                else (
+                    f"The alerted pod '{target.pod}' no longer exists in the cluster — "
+                    "it may have been replaced/recovered already, or the alert is stale."
+                )
+            )
+            summary = f"{note} {summary}"
 
         insight = await _senior_insight(
             self._settings,
@@ -527,6 +568,7 @@ class KubernetesCollector:
             "kubernetes_api_url": self._settings.kubernetes_api_url,
             "kubernetes_mcp_url": self._settings.kubernetes_mcp_url,
             "used_mcp": used_mcp,
+            "target_pod_missing": target_pod_missing,
             "kubernetes_namespaces": self._settings.kubernetes_namespaces,
             "kubernetes_cluster_scope_enabled": self._settings.kubernetes_cluster_scope_enabled,
             "namespace": target.namespace,
@@ -654,11 +696,42 @@ async def _collect_kubernetes_responses_via_mcp(
     target: AnalysisTarget,
     control_plane_in_scope: bool = True,
 ) -> list[dict[str, object]]:
+    """The base sweep over the Kubernetes MCP service.
+
+    Per-query errors are OBSERVATIONS, not transport failures: a dead alert pod
+    404ing its GET used to raise out of the first query and demote the WHOLE
+    sweep to the direct API (so MCP looked permanently unused). Mirror the
+    direct sweep: record {name, error} and keep going. Only when EVERY query
+    errored (transport truly down) does this raise so collect() falls back."""
     responses: list[dict[str, object]] = []
+    ok_count = 0
+
+    async def block(
+        name: str, label: str, candidates: list[tuple[str, dict[str, object]]]
+    ) -> None:
+        nonlocal ok_count
+        try:
+            data = await _k8s_mcp_json(settings, candidates)
+        except Exception as exc:  # noqa: BLE001 - a per-query miss is evidence
+            responses.append(
+                {
+                    "name": name,
+                    "path": label,
+                    "url": label,
+                    "status_code": None,
+                    "error": str(exc),
+                    "data": None,
+                }
+            )
+            return
+        ok_count += 1
+        responses.append(_mcp_k8s_response(name, label, data, target))
+
     target_namespace_allowed = _namespace_allowed(settings, target.namespace)
     if target.namespace and target_namespace_allowed and target.pod:
-        pod_data = await _k8s_mcp_json(
-            settings,
+        await block(
+            "pod",
+            "MCP pods_get",
             [
                 ("pods_get", {"namespace": target.namespace, "name": target.pod}),
                 ("pods_get", {"namespace": target.namespace, "pod": target.pod}),
@@ -673,9 +746,9 @@ async def _collect_kubernetes_responses_via_mcp(
                 ),
             ],
         )
-        responses.append(_mcp_k8s_response("pod", "MCP pods_get", pod_data, target))
-        event_data = await _k8s_mcp_json(
-            settings,
+        await block(
+            "pod_events",
+            "MCP events_list",
             [
                 (
                     "events_list",
@@ -695,10 +768,10 @@ async def _collect_kubernetes_responses_via_mcp(
                 ),
             ],
         )
-        responses.append(_mcp_k8s_response("pod_events", "MCP events_list", event_data, target))
     elif target.namespace and target_namespace_allowed:
-        pod_data = await _k8s_mcp_json(
-            settings,
+        await block(
+            "namespace_pods",
+            "MCP pods_list",
             [
                 ("pods_list_in_namespace", {"namespace": target.namespace}),
                 ("pods_list", {"namespace": target.namespace}),
@@ -708,11 +781,9 @@ async def _collect_kubernetes_responses_via_mcp(
                 ),
             ],
         )
-        responses.append(
-            _mcp_k8s_response("namespace_pods", "MCP pods_list", pod_data, target)
-        )
-        event_data = await _k8s_mcp_json(
-            settings,
+        await block(
+            "namespace_events",
+            "MCP events_list",
             [
                 ("events_list", {"namespace": target.namespace}),
                 (
@@ -721,12 +792,10 @@ async def _collect_kubernetes_responses_via_mcp(
                 ),
             ],
         )
-        responses.append(
-            _mcp_k8s_response("namespace_events", "MCP events_list", event_data, target)
-        )
     if target.node and settings.kubernetes_cluster_scope_enabled:
-        node_data = await _k8s_mcp_json(
-            settings,
+        await block(
+            "node",
+            "MCP resources_get node",
             [
                 (
                     "resources_get",
@@ -735,12 +804,12 @@ async def _collect_kubernetes_responses_via_mcp(
                 ("resources_get", {"kind": "nodes", "name": target.node}),
             ],
         )
-        responses.append(_mcp_k8s_response("node", "MCP resources_get node", node_data, target))
     for runai_namespace in settings.runai_log_namespaces if control_plane_in_scope else ():
         if not _namespace_allowed(settings, runai_namespace):
             continue
-        pod_data = await _k8s_mcp_json(
-            settings,
+        await block(
+            f"runai_control_plane_pods:{runai_namespace}",
+            f"MCP pods_list {runai_namespace}",
             [
                 ("pods_list_in_namespace", {"namespace": runai_namespace}),
                 ("pods_list", {"namespace": runai_namespace}),
@@ -750,16 +819,9 @@ async def _collect_kubernetes_responses_via_mcp(
                 ),
             ],
         )
-        responses.append(
-            _mcp_k8s_response(
-                f"runai_control_plane_pods:{runai_namespace}",
-                f"MCP pods_list {runai_namespace}",
-                pod_data,
-                target,
-            )
-        )
-        event_data = await _k8s_mcp_json(
-            settings,
+        await block(
+            f"runai_control_plane_events:{runai_namespace}",
+            f"MCP events_list {runai_namespace}",
             [
                 ("events_list", {"namespace": runai_namespace}),
                 (
@@ -768,14 +830,9 @@ async def _collect_kubernetes_responses_via_mcp(
                 ),
             ],
         )
-        responses.append(
-            _mcp_k8s_response(
-                f"runai_control_plane_events:{runai_namespace}",
-                f"MCP events_list {runai_namespace}",
-                event_data,
-                target,
-            )
-        )
+    if responses and ok_count == 0:
+        first_error = next((str(r.get("error")) for r in responses if r.get("error")), "")
+        raise RuntimeError(first_error or "every Kubernetes MCP query failed")
     return responses
 
 
@@ -1023,6 +1080,25 @@ async def resolve_live_pod_node(
         return live_pod, event_node or live_node
     except Exception:  # noqa: BLE001 - resolution is best-effort enrichment
         return "", ""
+
+
+def _target_pod_missing(target: AnalysisTarget, responses: list[dict[str, object]]) -> bool:
+    """True when the alert's named pod was queried and is definitively gone.
+
+    Requires an explicit not-found answer on the pod GET (HTTP 404, or an MCP
+    not-found observation with no data) — a transport error or an RBAC failure
+    is NOT "the pod is gone"."""
+    if not target.pod:
+        return False
+    for item in responses:
+        if item.get("name") != "pod":
+            continue
+        if item.get("status_code") == 404:
+            return True
+        error_text = str(item.get("error") or "").lower()
+        if item.get("data") is None and ("not found" in error_text or "notfound" in error_text):
+            return True
+    return False
 
 
 def _target_pod_summary(responses: list[dict[str, object]]) -> dict[str, object] | None:

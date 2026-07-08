@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
+from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import complete, llm_configured
@@ -70,9 +70,15 @@ class ChangeCollector:
 
         if not changes:
             return self._empty(
-                f"{NO_EVIDENCE} No recently-changed workloads, pods, nodes, or events "
-                f"found in namespace {namespace} within the last "
-                f"{_RECENT_WINDOW_SECONDS // 60}m.",
+                f"{NO_EVIDENCE} "
+                + ko_en(
+                    self._settings,
+                    f"최근 {_RECENT_WINDOW_SECONDS // 60}분 내 네임스페이스 {namespace}에서 "
+                    "변경된 워크로드/파드/노드/이벤트가 없습니다.",
+                    "No recently-changed workloads, pods, nodes, or events "
+                    f"found in namespace {namespace} within the last "
+                    f"{_RECENT_WINDOW_SECONDS // 60}m.",
+                ),
                 missing=[],
                 warnings=warnings,
                 details={"namespace": namespace, "node": node},

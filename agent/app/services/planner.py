@@ -23,6 +23,8 @@ from app.config import Settings
 from app.knowledge import (
     FamilyCatalog,
     _keyword_negated,
+    component_for_target,
+    load_architecture,
     load_family_catalog,
     load_runai_alerts,
     match_failure_mode_symptoms,
@@ -268,6 +270,23 @@ async def plan_investigation(
     node_focused = not target.namespace and not target.project and not target.queue
     if node_focused:
         hypotheses = _node_first_hypotheses(hypotheses)
+    # Component identity: when the alert TARGET itself is a known platform
+    # component (pod/workload name), that names the entry point directly — e.g.
+    # runai-container-toolkit-* implicates the NVIDIA GPU Operator stack via its
+    # depends_on chain, with or without any error string in the evidence. More
+    # specific than the namespace scope, so it outranks the scope lead.
+    component_entry = component_for_target(
+        load_architecture(settings.architecture_file), target.pod, target.workload_name
+    )
+    component = str(component_entry.get("component") or "") if component_entry else ""
+    if component_entry and component_entry.get("family"):
+        effect = str(
+            component_entry.get("failure_effect") or component_entry.get("purpose") or ""
+        )
+        reason = f"alert targets platform component '{component}' — {effect}".strip(" —")
+        hypotheses = [{"family": str(component_entry["family"]), "reason": reason}] + [
+            h for h in hypotheses if h["family"] != component_entry["family"]
+        ]
     # family, and fix — lead with that family and carry the definition on the plan.
     matched_alert = match_runai_alert(
         load_runai_alerts(settings.runai_alerts_file), target.alert_name
@@ -294,6 +313,7 @@ async def plan_investigation(
     leader_earned = (
         keyword_signal
         or bool(matched_alert)
+        or bool(component)
         or scope in _SCOPE_LEAD
         or node_focused
     )
@@ -367,6 +387,12 @@ async def plan_investigation(
             f"({matched_alert.get('severity', 'n/a')}): {matched_alert.get('trigger', '')} "
             + narrative
         )
+    if component_entry:
+        narrative = (
+            f"The alert target IS the platform component '{component}' "
+            f"({component_entry.get('failure_effect') or component_entry.get('purpose')}). "
+            "Check that component and its depends_on chain first. " + narrative
+        )
 
     plan = InvestigationPlan(
         focus=focus,
@@ -381,6 +407,7 @@ async def plan_investigation(
         used_ontology=used_ontology,
         narrative=narrative,
         matched_alert=matched_alert,
+        component=component,
     )
 
     # Operator guidance (the prompt an operator attached to this Analyze request /
@@ -498,6 +525,7 @@ async def _llm_refine(
         if isinstance(narrative, str) and narrative.strip()
         else plan.narrative,
         matched_alert=plan.matched_alert,
+        component=plan.component,
     )
 
 

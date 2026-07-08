@@ -14,6 +14,14 @@ from app.schemas import AlertAnalysisArtifact
 NO_EVIDENCE = "증거를 찾기 어렵습니다."
 
 
+def ko_en(settings: Any, ko: str, en: str) -> str:
+    """The reason text that follows NO_EVIDENCE, in the deployment language.
+
+    These strings surface verbatim on the evidence cards; a Korean deployment
+    was showing '증거를 찾기 어렵습니다. Prometheus is reachable, but …'."""
+    return ko if getattr(settings, "language", "en") == "ko" else en
+
+
 @dataclass(frozen=True)
 class AnalysisTarget:
     cluster: str

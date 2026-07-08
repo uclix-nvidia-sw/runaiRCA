@@ -84,18 +84,21 @@ async def test_explicit_model_override_uses_http(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_nat_client_failure_surfaces_and_does_not_use_http(monkeypatch) -> None:
+async def test_nat_client_failure_falls_back_to_http(monkeypatch) -> None:
+    # Validation of the langchain client is done (2026-07-08: it returned empty
+    # replies and every Korean synthesis fell back to English). Owner decision:
+    # an unusable NAT reply now retries once via the direct HTTP path.
     settings = _settings()
 
     class BrokenClient:
         async def ainvoke(self, messages):  # litellm "LLM Provider NOT provided" etc.
             raise RuntimeError("LLM Provider NOT provided")
 
-    called = {"http": False}
-
     async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
-        called["http"] = True
-        return SimpleNamespace(ok=True, data={"choices": []})
+        return SimpleNamespace(
+            ok=True,
+            data={"choices": [{"message": {"content": "직접 경로 응답"}}], "usage": {}},
+        )
 
     monkeypatch.setattr("app.llm.post_json", fake_post_json)
     token = llm.set_nat_client(BrokenClient())
@@ -104,11 +107,70 @@ async def test_nat_client_failure_surfaces_and_does_not_use_http(monkeypatch) ->
     finally:
         llm.reset_nat_client(token)
 
-    # langchain-only while validating: a NAT client failure surfaces as an error and
-    # does NOT silently fall back to httpx (which would mask whether langchain works).
-    assert text is None
-    assert error
-    assert called["http"] is False
+    assert text == "직접 경로 응답"
+    assert error is None
+
+
+@pytest.mark.asyncio
+async def test_nat_empty_reasoning_reply_falls_back_to_http(monkeypatch) -> None:
+    # The 2026-07-08 incident shape: the model DID reply (usage recorded) but
+    # content was empty — a reasoning model spending the whole completion budget
+    # on reasoning tokens. Must not surface as a blind "no reply".
+    settings = _settings()
+
+    class EmptyReplyClient:
+        def bind(self, **kwargs):
+            return self
+
+        async def ainvoke(self, messages):
+            return SimpleNamespace(
+                content="",
+                usage_metadata={"input_tokens": 9000, "output_tokens": 4096},
+                response_metadata={"finish_reason": "length"},
+            )
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        return SimpleNamespace(
+            ok=True,
+            data={"choices": [{"message": {"content": '{"summary": "요약"}'}}], "usage": {}},
+        )
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    token = llm.set_nat_client(EmptyReplyClient())
+    try:
+        text, error = await llm.complete_with_error(settings, system="system", user="user")
+    finally:
+        llm.reset_nat_client(token)
+
+    assert text == '{"summary": "요약"}'
+    assert error is None
+
+
+@pytest.mark.asyncio
+async def test_nat_content_blocks_list_is_joined() -> None:
+    settings = _settings()
+
+    class BlockClient:
+        def bind(self, **kwargs):
+            return self
+
+        async def ainvoke(self, messages):
+            return SimpleNamespace(
+                content=[
+                    {"type": "text", "text": '{"summary":'},
+                    {"type": "text", "text": ' "블록 응답"}'},
+                ],
+                usage_metadata={"input_tokens": 5, "output_tokens": 5},
+            )
+
+    token = llm.set_nat_client(BlockClient())
+    try:
+        text, error = await llm.complete_with_error(settings, system="system", user="user")
+    finally:
+        llm.reset_nat_client(token)
+
+    assert error is None
+    assert text is not None and "블록 응답" in text
 
 
 @pytest.mark.asyncio
