@@ -408,6 +408,7 @@ agent:
     llmModelSelfCheck: ""
     llmModelSynthesis: ""
     llmModelChat: ""
+    llmModelInsight: ""
     # JSON: {"model":{"prompt_per_mtok":0.15,"completion_per_mtok":0.60}}
     llmPricingJson: "{}"
     llmRequestTimeoutSeconds: 300

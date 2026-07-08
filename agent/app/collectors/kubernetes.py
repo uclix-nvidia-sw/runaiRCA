@@ -11,7 +11,7 @@ import yaml
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
-from app.llm import complete, llm_configured
+from app.llm import cached_insight, complete, insight_cache_key, llm_configured
 from app.masking import build_masker
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
@@ -1514,6 +1514,8 @@ async def _senior_insight(
     exec_probes: list[dict[str, object]],
 ) -> str:
     """One-line senior insight via the LLM; deterministic fallback when unconfigured."""
+    if summary.strip().startswith(NO_EVIDENCE):
+        return ""
     restarts = [
         d
         for d in container_diagnostics
@@ -1526,7 +1528,8 @@ async def _senior_insight(
         if isinstance(line, str)
         and any(token in line.lower() for token in ("error", "fail", "oom", "cuda", "panic"))
     ]
-    if not llm_configured(settings):
+    insight_model = getattr(settings, "llm_model_insight", "")
+    if not llm_configured(settings, insight_model):
         parts: list[str] = []
         if restarts:
             names = ", ".join(str(d.get("name")) for d in restarts)
@@ -1556,12 +1559,19 @@ async def _senior_insight(
     )
     if getattr(settings, "language", "en") == "ko":
         system += " 한국어로 답하세요 (관찰한 것 → 의미 → 시작 시점)."
-    insight = await complete(
-        settings,
-        system=system,
-        user=_collector_masker(settings).mask_text(str(user)),
-        max_tokens=160,
-    )
+    masked_user = _collector_masker(settings).mask_text(str(user))
+    key = insight_cache_key("kubernetes", getattr(settings, "language", "en"), masked_user)
+
+    async def compute() -> str | None:
+        return await complete(
+            settings,
+            system=system,
+            user=masked_user,
+            max_tokens=160,
+            model=insight_model or None,
+        )
+
+    insight = await cached_insight(key, compute)
     return _collector_masker(settings).mask_text(insight or "")
 
 

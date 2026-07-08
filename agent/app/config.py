@@ -146,6 +146,7 @@ class Settings:
     # spend it on reasoning tokens FIRST — if synthesis logs empty replies
     # (finish_reason=length), raise this rather than shrinking the prompt.
     llm_synthesis_max_tokens: int = 8192
+    llm_model_insight: str = ""
 
 
 def load_settings() -> Settings:
@@ -263,6 +264,7 @@ def load_settings() -> Settings:
         llm_model_self_check=os.getenv("LLM_MODEL_SELF_CHECK", "").strip(),
         llm_model_synthesis=os.getenv("LLM_MODEL_SYNTHESIS", "").strip(),
         llm_model_chat=os.getenv("LLM_MODEL_CHAT", "").strip(),
+        llm_model_insight=os.getenv("LLM_MODEL_INSIGHT", "").strip(),
         llm_pricing_json=os.getenv("LLM_PRICING_JSON", "{}").strip(),
         llm_api_key=os.getenv("LLM_API_KEY", "").strip(),
         # Generous per-call ceiling so a reasoning agent is never cut off mid-thought;

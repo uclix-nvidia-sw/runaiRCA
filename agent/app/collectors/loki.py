@@ -8,7 +8,7 @@ from typing import Any
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
-from app.llm import complete, llm_configured
+from app.llm import cached_insight, complete, insight_cache_key, llm_configured
 from app.masking import build_masker
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
@@ -215,7 +215,10 @@ async def _llm_insight(
     Returns None when no LLM is configured or the call fails, so callers keep
     their deterministic summary.
     """
-    if not llm_configured(settings):
+    if deterministic.strip().startswith(NO_EVIDENCE):
+        return None
+    insight_model = getattr(settings, "llm_model_insight", "")
+    if not llm_configured(settings, insight_model):
         return None
     try:
         blob = json.dumps(evidence, default=str)[:3000]
@@ -238,12 +241,19 @@ async def _llm_insight(
             " 한국어로 답하세요 (관찰한 것 → 의미 → 시작 시점). "
             "증거가 없으면 '증거를 찾기 어렵습니다.'라고만 답하세요."
         )
-    text = await complete(
-        settings,
-        system=system,
-        user=f"Source: {source}\nDeterministic summary: {deterministic}\nRaw evidence:\n{blob}",
-        max_tokens=160,
-    )
+    user = f"Source: {source}\nDeterministic summary: {deterministic}\nRaw evidence:\n{blob}"
+    key = insight_cache_key(source, getattr(settings, "language", "en"), deterministic, blob)
+
+    async def compute() -> str | None:
+        return await complete(
+            settings,
+            system=system,
+            user=user,
+            max_tokens=160,
+            model=insight_model or None,
+        )
+
+    text = await cached_insight(key, compute)
     if not text:
         return None
     return masker.mask_text(" ".join(text.split())[:400])

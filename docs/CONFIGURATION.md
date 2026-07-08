@@ -75,7 +75,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `NVIDIA_API_KEY` | NIM key for NeMo Agent Toolkit workflows |
 | `LLM_BASE_URL` | OpenAI-compatible base URL for the NAT-managed default LLM and the operator chat copilot |
 | `LLM_MODEL` | OpenAI-compatible model name, for example `auto-router` |
-| `LLM_MODEL_PLANNER` / `LLM_MODEL_INVESTIGATION` / `LLM_MODEL_DRILLDOWN` / `LLM_MODEL_SELF_CHECK` / `LLM_MODEL_SYNTHESIS` / `LLM_MODEL_CHAT` | Optional stage-specific model overrides. Empty values fall back to `LLM_MODEL` |
+| `LLM_MODEL_PLANNER` / `LLM_MODEL_INVESTIGATION` / `LLM_MODEL_DRILLDOWN` / `LLM_MODEL_SELF_CHECK` / `LLM_MODEL_SYNTHESIS` / `LLM_MODEL_CHAT` / `LLM_MODEL_INSIGHT` | Optional stage-specific model overrides. Empty values fall back to `LLM_MODEL` |
 | `LLM_API_KEY` | OpenAI-compatible API key secret; enables conversational chat answers when all three LLM vars are set |
 | `LLM_REQUEST_TIMEOUT_SECONDS` | LLM request timeout per call (chat and direct fallback reasoning), default `300`, `0` = unlimited |
 | `LLM_PRICING_JSON` | Optional JSON map for estimated LLM cost, keyed by model with `prompt_per_mtok` and `completion_per_mtok` values |

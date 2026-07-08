@@ -250,13 +250,20 @@ def _user_prompt(
     architecture: list[str] | None = None,
 ) -> str:
     plan_dict = plan.as_dict() if plan else {}
-    payload = {
+    stable = {
         "target": {
             key: getattr(target, key, "")
             for key in ("namespace", "workload_name", "pod", "node", "project")
         },
         "plan_focus": plan_dict.get("focus"),
         "hypotheses": (plan_dict.get("hypotheses") or [])[:4],
+    }
+    if architecture:
+        # Curated platform topology for the components THIS incident implicates:
+        # what each does when broken and which dependency to check next — the
+        # "thinking material" that used to reach only the playbook renderer.
+        stable["platform_architecture"] = architecture
+    variable = {
         "my_summary": (result.summary or "")[:1200],
         "my_artifacts": [
             _artifact_prompt_item(art)
@@ -265,12 +272,42 @@ def _user_prompt(
         ],
         "drilldown_so_far": history[-8:],
     }
-    if architecture:
-        # Curated platform topology for the components THIS incident implicates:
-        # what each does when broken and which dependency to check next — the
-        # "thinking material" that used to reach only the playbook renderer.
-        payload["platform_architecture"] = architecture
-    return json.dumps(payload, default=str, ensure_ascii=False)[:_USER_PROMPT_CHARS]
+    return _capped_json_prompt(
+        stable,
+        variable,
+        max_chars=_USER_PROMPT_CHARS,
+        trim_keys=("drilldown_so_far", "my_artifacts"),
+    )
+
+
+def _capped_json_prompt(
+    stable: dict[str, Any],
+    variable: dict[str, Any],
+    *,
+    max_chars: int,
+    trim_keys: tuple[str, ...],
+) -> str:
+    variable = {
+        key: list(value) if isinstance(value, list) else value for key, value in variable.items()
+    }
+    payload = {**stable, **variable}
+    text = json.dumps(payload, default=str, ensure_ascii=False)
+    while len(text) > max_chars:
+        for key in trim_keys:
+            value = variable.get(key)
+            if isinstance(value, list) and len(value) > 1:
+                variable[key] = value[1:]
+                payload = {**stable, **variable}
+                text = json.dumps(payload, default=str, ensure_ascii=False)
+                break
+        else:
+            break
+    if len(text) <= max_chars:
+        return text
+    marker = '"...truncated older prompt context..."'
+    tail = max_chars // 4
+    head = max_chars - tail - len(marker)
+    return text[:head] + marker + text[-tail:]
 
 
 def _compact_value(value: Any, *, limit: int) -> str:

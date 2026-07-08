@@ -25,8 +25,10 @@ from app.schemas import Alert, AlertAnalysisRequest, SimilarIncidentContext
 from app.services.kg_enrichment import GraphRemediation, graph_remediation
 from app.services.orchestrator import AnalysisOrchestrator
 from app.services.pipeline import (
+    _SYNTHESIS_USER_CHARS,
     _gpu_model_from,
     _graph_remediation_lines,
+    _synthesis_evidence_json,
     _synthesize_korean,
     _xid_codes_from_results,
 )
@@ -307,6 +309,50 @@ async def test_korean_synthesis_prompt_redacts_sensitive_evidence(monkeypatch) -
 
 
 @pytest.mark.asyncio
+async def test_korean_synthesis_caps_large_artifact_prompt(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko", llm_model_synthesis="m")
+    captured: list[str] = []
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        captured.append(user)
+        return {"summary": "요약", "detail": "본문"}
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    result = CollectorResult(agent="loki", status="ok", summary="errors")
+    result.artifacts.append(
+        artifact(
+            agent="loki",
+            source="loki",
+            type="logs",
+            status="ok",
+            confidence="medium",
+            summary="error rows",
+            result={"lines": ["x" * 50_000]},
+        )
+    )
+
+    await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "RunAITest"}, annotations={})
+        ),
+        results=[result],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="loki_errors", confidence="medium", score=1.0, rationale=[])
+        ],
+        kg_context={},
+        graph_fixes=GraphRemediation(),
+        fallback_detail="fallback",
+    )
+
+    assert len(captured[0]) <= _SYNTHESIS_USER_CHARS
+    assert "x" * 1300 not in captured[0]
+
+
+@pytest.mark.asyncio
 async def test_korean_synthesis_folds_operator_guidance_before_prompt(monkeypatch) -> None:
     settings = replace(make_settings(), language="ko")
     captured: list[str] = []
@@ -575,3 +621,36 @@ async def test_english_language_keeps_deterministic_report(monkeypatch) -> None:
     assert "Agent Role Coverage" not in response.analysis_detail  # static boilerplate removed
     # The Korean synthesis system prompt is Korean; it must never be sent for en.
     assert not any("한국어" in body for body in seen), "Korean synthesis must not run for en"
+
+
+def test_synthesis_evidence_json_is_valid_under_heavy_load() -> None:
+    # A blunt string slice used to hand the model malformed JSON. The cap must
+    # trim at the DATA level (drop lowest-priority collectors from the end) so
+    # the evidence is always parseable and the leading reasoning inputs survive.
+    heavy = {
+        "operator_guidance": "GPU 하드웨어부터 확인하라." * 5,
+        "alert": {"name": "KubePodNotReady"},
+        "plan": {"narrative": "N" * 400},
+        "ranked_root_cause_candidates": [{"family": "gpu_hardware_error"}] * 3,
+        "graph_remediation": {"family_fixes": ["fix" * 20] * 5},
+        "collector_findings": [
+            {"agent": a, "summary": "S" * 300,
+             "artifacts": [{"result": "R" * 1200, "summary": "f" * 200} for _ in range(3)]}
+            for a in ["runai", "kubernetes", "postgres", "prometheus", "loki", "system", "change"]
+        ],
+    }
+    out = _synthesis_evidence_json(heavy, _SYNTHESIS_USER_CHARS)
+    assert len(out) <= _SYNTHESIS_USER_CHARS
+    parsed = json.loads(out)  # MUST NOT raise — valid JSON, not a mid-structure cut
+    # Human directive + graph-derived fixes are never dropped.
+    assert parsed["operator_guidance"].startswith("GPU")
+    assert "graph_remediation" in parsed
+    # At least the highest-priority collectors survive; drops come from the end.
+    assert parsed["collector_findings"]
+    assert parsed["collector_findings"][0]["agent"] == "runai"
+
+
+def test_synthesis_evidence_json_keeps_everything_when_small() -> None:
+    small = {"operator_guidance": "x", "collector_findings": [{"agent": "runai", "summary": "ok"}]}
+    parsed = json.loads(_synthesis_evidence_json(small, _SYNTHESIS_USER_CHARS))
+    assert len(parsed["collector_findings"]) == 1  # nothing dropped under the cap
