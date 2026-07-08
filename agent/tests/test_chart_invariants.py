@@ -158,26 +158,34 @@ def test_runai_crd_rbac_matches_the_k8s_read_allowlist_exactly() -> None:
     # Least privilege that stays in sync: the chart must grant read access to
     # EXACTLY the Run:ai CRDs k8s_read can query — no wildcard (accessrules/
     # applications/policies stay out), and no kind the code can read but RBAC
-    # would 403 (which silently demotes the read to the direct API).
+    # would 403 (which silently demotes the read to the direct API). The
+    # namespaced Role variant carries only the NAMESPACED kinds: a Role cannot
+    # authorize cluster-scoped resources (projects/queues/departments/nodepools
+    # need rbac.clusterWide, same as nodes/storageclasses).
     from app.collectors.kubernetes import _RUNAI_CRD_KINDS
 
-    expected_by_group: dict[str, set[str]] = {}
-    for kind, (group, _kind_name, _namespaced) in _RUNAI_CRD_KINDS.items():
-        expected_by_group.setdefault(group, set()).add(kind)
+    all_by_group: dict[str, set[str]] = {}
+    namespaced_by_group: dict[str, set[str]] = {}
+    for kind, (group, _kind_name, namespaced) in _RUNAI_CRD_KINDS.items():
+        all_by_group.setdefault(group, set()).add(kind)
+        if namespaced:
+            namespaced_by_group.setdefault(group, set()).add(kind)
 
     agent_template = AGENT_TEMPLATE.parent / "agent-rbac.yaml"
     for template in (agent_template, MCP_TEMPLATE):
         text = template.read_text(encoding="utf-8")
         assert '- apiGroups: ["run.ai", "scheduling.run.ai"]' not in text, template.name
-        for group, kinds in expected_by_group.items():
-            # Each role variant (cluster-wide + namespaced) carries the group rule.
+        for group in all_by_group:
+            # Variant order in both templates: the ClusterRole comes first,
+            # then the namespaced Role inside the range loop.
             blocks = text.split(f'- apiGroups: ["{group}"]')[1:]
             assert len(blocks) == 2, (template.name, group, len(blocks))
-            for block in blocks:
+            expected_per_block = [all_by_group[group], namespaced_by_group.get(group, set())]
+            for block, expected in zip(blocks, expected_per_block):
                 resources_block = block.split("verbs:")[0]
                 granted = {
                     line.strip().removeprefix("- ")
                     for line in resources_block.splitlines()
                     if line.strip().startswith("- ")
                 }
-                assert granted == kinds, (template.name, group, granted ^ kinds)
+                assert granted == expected, (template.name, group, granted ^ expected)

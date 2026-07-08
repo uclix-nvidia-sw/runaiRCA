@@ -150,17 +150,15 @@ rules:
       - cronjobs
       - jobs
     verbs: ["get", "list", "watch"]
-  # Run:ai CRDs — exactly the k8s_read allowlist (_RUNAI_CRD_KINDS), read-only;
-  # kubectl parity for the scheduler RCA path. Kept least-privilege on purpose
-  # (no accessrules/applications/policies).
+  # Run:ai CRDs — the NAMESPACED subset of the k8s_read allowlist only: a Role
+  # cannot authorize cluster-scoped resources (projects/queues/departments/
+  # nodepools need rbac.clusterWide, same as nodes/storageclasses).
   - apiGroups: ["run.ai"]
     resources:
       - distributedworkloads
       - externalworkloads
       - inferenceworkloads
       - interactiveworkloads
-      - nodepools
-      - projects
       - runaiconfigs
       - runaijobs
       - trainingworkloads
@@ -168,9 +166,7 @@ rules:
   - apiGroups: ["scheduling.run.ai"]
     resources:
       - bindrequests
-      - departments
       - podgroups
-      - queues
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
