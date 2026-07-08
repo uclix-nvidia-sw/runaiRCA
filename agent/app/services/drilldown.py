@@ -164,6 +164,13 @@ async def _drill_one(
                         "outcome": json.dumps(history_outcome, default=str)[:_RESULT_CHARS],
                     }
                 )
+                # Transport notes surface as collector warnings (Diagnostics
+                # panel), NEVER inside artifact summaries — those feed the
+                # ranker/signature matchers and our own "no route to host"
+                # must not score as cluster evidence.
+                note = str(outcome.get("mcp_fallback") or "")
+                if note and note not in result.warnings:
+                    result.warnings.append(note)
                 # Finding-first: surface the problem signals in the data and hand
                 # them to the UI as highlights; the raw result stays attached.
                 markers = [] if error else salient_markers(outcome.get("result"))
@@ -560,8 +567,6 @@ async def _tool_k8s_read(settings: Settings, target: AnalysisTarget, args: dict)
     )
     error = item.get("error")
     summary = str(error) if error else f"HTTP {item.get('status_code')}"
-    if item.get("mcp_fallback"):
-        summary = f"{item['mcp_fallback']}; {summary}"
     return {
         # The real command an operator would have typed, not a param dump.
         "query": kubectl_repr(kind, namespace=namespace, name=name, label_selector=label_selector),
@@ -569,6 +574,11 @@ async def _tool_k8s_read(settings: Settings, target: AnalysisTarget, args: dict)
         "summary": summary,
         "error": error,
         "result": item,
+        # Transport note stays OUT of summary: artifact summaries feed the
+        # ranker/signature matchers, and "no route to host" toward OUR MCP
+        # service must not score as cluster-network evidence. The drill-down
+        # loop surfaces this via collector warnings instead.
+        **({"mcp_fallback": item["mcp_fallback"]} if item.get("mcp_fallback") else {}),
     }
 
 
@@ -602,14 +612,13 @@ async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -
     item = await prom_query(settings, "drilldown", promql)
     error = item.get("error")
     summary = str(error) if error else f"HTTP {item.get('status_code')}"
-    if fallback:
-        summary = f"{fallback}; {summary}"
     return {
         "query": promql,
         "title": title,
         "summary": summary,
         "error": error,
         "result": item,
+        **({"mcp_fallback": fallback} if fallback else {}),
     }
 
 
@@ -654,19 +663,22 @@ async def _tool_logql(settings: Settings, target: AnalysisTarget, args: dict) ->
     )
     if response.error or not response.ok:
         error = response.error or f"HTTP {response.status_code}"
-        if fallback:
-            error = f"{fallback}; {error}"
-        return {"query": logql, "title": title, "summary": error, "error": error}
+        return {
+            "query": logql,
+            "title": title,
+            "summary": error,
+            "error": error,
+            **({"mcp_fallback": fallback} if fallback else {}),
+        }
     lines = _sample_lines(_loki_streams(response.data), limit=10)
     summary = f"{len(lines)} sample log line(s)" if lines else "no matching log lines"
-    if fallback:
-        summary = f"{fallback}; {summary}"
     return {
         "query": logql,
         "title": title,
         "summary": summary,
         "error": None,
         "result": {"lines": lines},
+        **({"mcp_fallback": fallback} if fallback else {}),
     }
 
 
@@ -807,15 +819,13 @@ async def _tool_sql_select(settings: Settings, target: AnalysisTarget, args: dic
     if not dsn:
         return {"query": sql, "title": title, "summary": fallback, "error": fallback}
     rows = await _run_select(dsn, sql, settings.postgres_timeout_seconds)
-    summary = f"{len(rows)} row(s)"
-    if fallback:
-        summary = f"{fallback}; {summary}"
     return {
         "query": sql,
         "title": title,
-        "summary": summary,
+        "summary": f"{len(rows)} row(s)",
         "error": None,
         "result": {"rows": rows},
+        **({"mcp_fallback": fallback} if fallback else {}),
     }
 
 

@@ -325,6 +325,29 @@ def test_target_pod_missing_detection() -> None:
     assert _target_pod_missing(replace(target, pod=""), gone_direct) is False
 
 
+@pytest.mark.asyncio
+async def test_drilldown_summary_never_carries_the_mcp_fallback_note(monkeypatch) -> None:
+    # The fallback note used to be prefixed into the artifact SUMMARY, which the
+    # ranker/signature matchers read — "no route to host" toward OUR MCP service
+    # scored as cluster-network evidence. It now travels under "mcp_fallback"
+    # (a non-matchable key) and is surfaced via collector warnings.
+    from app.services import drilldown
+
+    async def fake_k8s_read(settings, kind, namespace="", name="", label_selector=""):
+        return {
+            "kind": "pods",
+            "status_code": 200,
+            "error": None,
+            "data": {"items": []},
+            "mcp_fallback": "MCP unavailable; used direct API fallback: no route to host",
+        }
+
+    monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
+    outcome = await drilldown._tool_k8s_read(make_settings(), make_target(), {"kind": "pods"})
+    assert "no route to host" not in str(outcome.get("summary"))
+    assert "no route to host" in str(outcome.get("mcp_fallback"))
+
+
 # --- unified family universe -----------------------------------------------------
 
 
@@ -378,6 +401,91 @@ def test_ranker_ignores_own_transport_errors() -> None:
     ]
     candidates = rank_root_cause_candidates(_toolkit_target(), results)
     assert candidates[0].family == "insufficient_evidence", [c.as_dict() for c in candidates]
+
+
+# --- Run:ai CRD reads (kubectl parity) --------------------------------------------
+
+
+def test_runai_crd_kinds_are_readable_aliases() -> None:
+    from app.collectors.kubernetes import resolve_read_kind
+
+    assert resolve_read_kind("project") == "projects"
+    assert resolve_read_kind("queues") == "queues"
+    assert resolve_read_kind("podgroup") == "podgroups"
+    assert resolve_read_kind("trainingworkload") == "trainingworkloads"
+    assert resolve_read_kind("runaiconfig") == "runaiconfigs"
+
+
+@pytest.mark.asyncio
+async def test_k8s_read_discovers_runai_crd_group_version(monkeypatch, tmp_path) -> None:
+    from app.collectors import kubernetes as k8s
+
+    token = tmp_path / "token"
+    token.write_text("t")
+    calls: list[str] = []
+
+    async def fake_get_json(*, base_url, path, timeout_seconds, params=None, headers=None, verify=True):
+        calls.append(path)
+        if path == "/apis/run.ai":
+            return SimpleNamespace(
+                ok=True,
+                url=path,
+                status_code=200,
+                error=None,
+                data={"preferredVersion": {"groupVersion": "run.ai/v2"}},
+            )
+        return SimpleNamespace(
+            ok=True,
+            url=path,
+            status_code=200,
+            error=None,
+            data={"kind": "Project", "metadata": {"name": "test-pro"}},
+        )
+
+    monkeypatch.setattr(k8s, "get_json", fake_get_json)
+    monkeypatch.setattr(k8s, "_API_GROUP_PREFIX_CACHE", {})
+    settings = replace(
+        make_settings(), kubernetes_mcp_url="", kubernetes_token_path=str(token)
+    )
+    result = await k8s.k8s_read(settings, "project", name="test-pro")
+    assert result["error"] is None
+    assert "/apis/run.ai" in calls[0]
+    # Cluster-scoped CRD: no /namespaces/ segment, discovered version used.
+    assert calls[1] == "/apis/run.ai/v2/projects/test-pro"
+
+
+def test_mcp_api_kind_candidates_prefer_discovered_version(monkeypatch) -> None:
+    from app.collectors import kubernetes as k8s
+
+    monkeypatch.setattr(
+        k8s, "_API_GROUP_PREFIX_CACHE", {"scheduling.run.ai": "/apis/scheduling.run.ai/v2"}
+    )
+    pairs = k8s._k8s_mcp_api_kinds("podgroups")
+    assert pairs[0] == ("scheduling.run.ai/v2", "PodGroup")
+    assert all(kind == "PodGroup" for _, kind in pairs)
+
+
+@pytest.mark.asyncio
+async def test_runai_mcp_projects_falls_back_to_org_unit_path() -> None:
+    from app.collectors.runai_mcp import _call_api
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.paths: list[str] = []
+
+        async def call_tool(self, tool, args):
+            self.paths.append(args["path"])
+            if args["path"] == "/api/v1/projects":
+                return _McpResult(text="404 page not found", is_error=True)
+            return _McpResult({"projects": [{"name": "test-pro"}]})
+
+    session = FakeSession()
+    item = await _call_api(
+        session, "projects", "GET", ["/api/v1/projects", "/api/v1/org-unit/projects"], None
+    )
+    assert session.paths == ["/api/v1/projects", "/api/v1/org-unit/projects"]
+    assert item["error"] is None
+    assert "/api/v1/org-unit/projects" in item["query"]
 
 
 # --- component identity entry point ---------------------------------------------

@@ -689,6 +689,17 @@ async def _reanalyze_once(
             kg_blast_radius=kg_blast,
             priors=state.priors,
         )
+        # The signature-first rule applies to the RE-rank too. Without it the
+        # raw keyword ranker decided alone here — the 2026-07-08 re-analysis
+        # "concluded" node_kubelet_pressure on a healthy node while the loki
+        # reconcile errors still carried the real (signature-backed) cause.
+        observed = _observed_text(merged_results, state.request)
+        candidates = _promote_signature_cause(
+            candidates,
+            _xid_codes_from_results(merged_results, _alert_text(state.request)),
+            match_runai_known_issues(state.known_issues, observed),
+            match_failure_mode_symptoms(state.failure_modes, observed),
+        )
         caveat = ""
         refuted = False
         next_check = ""
@@ -706,6 +717,12 @@ async def _reanalyze_once(
                 caveat = str(check.get("caveat") or "").strip()
                 refuted = bool(check.get("refuted"))
                 next_check = str(check.get("next_check") or "").strip()
+        # A re-analysis conclusion that its OWN self-check refutes must not
+        # replace the first conclusion — that shipped a report whose headline
+        # (node_kubelet_pressure) was contradicted by its own Self-Check text.
+        # Keep the original (with its caveat + operator questions) instead.
+        if refuted:
+            return None
         new_family = candidates[0].family if candidates else "insufficient_evidence"
         if getattr(state.settings, "language", "en") == "ko":
             note = (

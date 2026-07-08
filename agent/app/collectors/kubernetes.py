@@ -79,8 +79,29 @@ def exec_command_allowed(argv: list[str]) -> bool:
 # what was missing was FREEFORM querying beyond the collector's fixed set. Kind
 # allowlist + GET/LIST-only by construction (secrets deliberately absent); RBAC
 # (agent-rbac.yaml) is the second fence.
+# Run:ai CRDs the scheduler-RCA path must be able to read (kubectl parity:
+# `kubectl get project/queue/podgroup …`). API versions differ across Run:ai
+# releases, so the group's preferredVersion is discovered at runtime (cached);
+# these kinds carry an empty prefix in _READ_KINDS as the discovery marker.
+_RUNAI_CRD_KINDS: dict[str, tuple[str, str, bool]] = {
+    # kind -> (API group, Kind, namespaced)
+    "projects": ("run.ai", "Project", False),
+    "queues": ("scheduling.run.ai", "Queue", False),
+    "departments": ("scheduling.run.ai", "Department", False),
+    "podgroups": ("scheduling.run.ai", "PodGroup", True),
+    "bindrequests": ("scheduling.run.ai", "BindRequest", True),
+    "nodepools": ("run.ai", "NodePool", False),
+    "runaijobs": ("run.ai", "RunaiJob", True),
+    "trainingworkloads": ("run.ai", "TrainingWorkload", True),
+    "interactiveworkloads": ("run.ai", "InteractiveWorkload", True),
+    "inferenceworkloads": ("run.ai", "InferenceWorkload", True),
+    "distributedworkloads": ("run.ai", "DistributedWorkload", True),
+    "externalworkloads": ("run.ai", "ExternalWorkload", True),
+    "runaiconfigs": ("run.ai", "RunaiConfig", True),
+}
+
 _READ_KINDS: dict[str, tuple[str, bool]] = {
-    # kind -> (API prefix, namespaced)
+    # kind -> (API prefix, namespaced); "" prefix = discover via _RUNAI_CRD_KINDS
     "pods": ("/api/v1", True),
     "events": ("/api/v1", True),
     "nodes": ("/api/v1", False),
@@ -98,6 +119,7 @@ _READ_KINDS: dict[str, tuple[str, bool]] = {
     "jobs": ("/apis/batch/v1", True),
     "cronjobs": ("/apis/batch/v1", True),
     "storageclasses": ("/apis/storage.k8s.io/v1", False),
+    **{kind: ("", crd[2]) for kind, crd in _RUNAI_CRD_KINDS.items()},
 }
 _KIND_ALIASES = {
     "po": "pods",
@@ -131,6 +153,20 @@ _KIND_ALIASES = {
     "cronjob": "cronjobs",
     "sc": "storageclasses",
     "storageclass": "storageclasses",
+    "project": "projects",
+    "queue": "queues",
+    "department": "departments",
+    "podgroup": "podgroups",
+    "pg": "podgroups",
+    "bindrequest": "bindrequests",
+    "nodepool": "nodepools",
+    "runaijob": "runaijobs",
+    "trainingworkload": "trainingworkloads",
+    "interactiveworkload": "interactiveworkloads",
+    "inferenceworkload": "inferenceworkloads",
+    "distributedworkload": "distributedworkloads",
+    "externalworkload": "externalworkloads",
+    "runaiconfig": "runaiconfigs",
 }
 
 
@@ -210,6 +246,11 @@ async def k8s_read(
             "error": "kind is not in the read-only allowlist",
             "allowed_kinds": sorted(_READ_KINDS),
         }
+    crd = _RUNAI_CRD_KINDS.get(resolved)
+    if crd:
+        # Warm the group→preferredVersion cache (one tiny discovery GET) so BOTH
+        # transports address the CRD with the version this cluster actually runs.
+        await _api_group_prefix(settings, crd[0])
     mcp_note = ""
     if settings.kubernetes_mcp_url:
         try:
@@ -235,6 +276,18 @@ async def k8s_read(
     if not token:
         return {"kind": resolved, "error": "kubernetes service account token unavailable"}
     prefix, namespaced = _READ_KINDS[resolved]
+    if not prefix and crd:
+        prefix = await _api_group_prefix(settings, crd[0])
+        if not prefix:
+            return {
+                "kind": resolved,
+                "namespace": namespace,
+                "name": name,
+                "error": (
+                    f"could not discover the API version for group '{crd[0]}' "
+                    "(is the Run:ai CRD installed?)"
+                ),
+            }
     parts = [prefix.rstrip("/")]
     if namespaced and namespace:
         parts += ["namespaces", quote(namespace, safe="")]
@@ -281,7 +334,7 @@ async def _k8s_read_via_mcp(
     label_selector: str = "",
 ) -> dict:
     """k8s_read over the Kubernetes MCP server; same result shape, raises to fall back."""
-    api_version, mcp_kind = _k8s_mcp_resource_kind(resolved)
+    api_kinds = _k8s_mcp_api_kinds(resolved)
     candidates: list[tuple[str, dict[str, object]]] = []
     if name:
         if resolved == "pods":
@@ -292,18 +345,19 @@ async def _k8s_read_via_mcp(
                 ]
             )
         candidates.extend(
-            [
-                (
-                    "resources_get",
-                    {
-                        "apiVersion": api_version,
-                        "kind": mcp_kind,
-                        "namespace": namespace,
-                        "name": name,
-                    },
-                ),
-                ("resources_get", {"kind": resolved, "namespace": namespace, "name": name}),
-            ]
+            (
+                "resources_get",
+                {
+                    "apiVersion": api_version,
+                    "kind": mcp_kind,
+                    "namespace": namespace,
+                    "name": name,
+                },
+            )
+            for api_version, mcp_kind in api_kinds
+        )
+        candidates.append(
+            ("resources_get", {"kind": resolved, "namespace": namespace, "name": name})
         )
     else:
         # A requested label selector must ride on EVERY candidate — a shortcut
@@ -321,16 +375,19 @@ async def _k8s_read_via_mcp(
             )
         elif resolved == "events" and not label_selector:
             candidates.append(("events_list", {"namespace": namespace}))
-        args: dict[str, object] = {
-            "apiVersion": api_version,
-            "kind": mcp_kind,
-            "namespace": namespace,
-        }
+        for api_version, mcp_kind in api_kinds:
+            args: dict[str, object] = {
+                "apiVersion": api_version,
+                "kind": mcp_kind,
+                "namespace": namespace,
+            }
+            if label_selector:
+                args["labelSelector"] = label_selector
+            candidates.append(("resources_list", args))
         fallback_args: dict[str, object] = {"kind": resolved, "namespace": namespace}
         if label_selector:
-            args["labelSelector"] = label_selector
             fallback_args["labelSelector"] = label_selector
-        candidates.extend([("resources_list", args), ("resources_list", fallback_args)])
+        candidates.append(("resources_list", fallback_args))
     data = await _k8s_mcp_json(settings, candidates)
     if not name and label_selector:
         # Belt and suspenders: an MCP server may ACCEPT labelSelector and still
@@ -381,6 +438,68 @@ def _apply_label_selector(data: object, selector: str) -> object:
         )
     ]
     return filtered if isinstance(data, list) else {**data, "items": filtered}
+
+
+# group -> "/apis/{group}/{preferredVersion}" once discovered. Module-level on
+# purpose: the group's served version is a cluster property, not per-request.
+_API_GROUP_PREFIX_CACHE: dict[str, str] = {}
+
+
+async def _api_group_prefix(settings: Settings, group: str) -> str:
+    """Discover "/apis/{group}/{version}" from the group's preferredVersion.
+
+    Cached per group; "" when the group is not served (CRD not installed) or
+    discovery itself failed."""
+    cached = _API_GROUP_PREFIX_CACHE.get(group)
+    if cached:
+        return cached
+    token = _read_file(settings.kubernetes_token_path)
+    if not token:
+        return ""
+    verify: bool | str = (
+        settings.kubernetes_ca_path if Path(settings.kubernetes_ca_path).exists() else True
+    )
+    response = await get_json(
+        base_url=settings.kubernetes_api_url,
+        path=f"/apis/{quote(group, safe='')}",
+        timeout_seconds=settings.kubernetes_timeout_seconds,
+        headers={"Authorization": f"Bearer {token}"},
+        verify=verify,
+    )
+    group_version = ""
+    if response.ok and isinstance(response.data, dict):
+        preferred = response.data.get("preferredVersion")
+        if isinstance(preferred, dict):
+            group_version = str(preferred.get("groupVersion") or "")
+        if not group_version:
+            versions = response.data.get("versions")
+            if isinstance(versions, list) and versions and isinstance(versions[0], dict):
+                group_version = str(versions[0].get("groupVersion") or "")
+    if not group_version:
+        return ""
+    prefix = f"/apis/{group_version}"
+    _API_GROUP_PREFIX_CACHE[group] = prefix
+    return prefix
+
+
+def _k8s_mcp_api_kinds(kind: str) -> list[tuple[str, str]]:
+    """Ordered (apiVersion, Kind) candidates for the MCP resources_* tools.
+
+    Core kinds have one fixed mapping. Run:ai CRDs use the discovered
+    preferredVersion when the cache is warm (k8s_read warms it), else a short
+    list of versions Run:ai has shipped."""
+    crd = _RUNAI_CRD_KINDS.get(kind)
+    if not crd:
+        return [_k8s_mcp_resource_kind(kind)]
+    group, kind_name, _namespaced = crd
+    discovered = _API_GROUP_PREFIX_CACHE.get(group, "").removeprefix("/apis/")
+    versions = [discovered] if discovered else []
+    versions.extend(
+        f"{group}/{version}"
+        for version in ("v2alpha1", "v1", "v2")
+        if f"{group}/{version}" != discovered
+    )
+    return [(version, kind_name) for version in versions if version]
 
 
 def _k8s_mcp_resource_kind(kind: str) -> tuple[str, str]:
@@ -1545,12 +1664,36 @@ def _warning_events(responses: list[dict[str, object]]) -> list[object]:
 
 
 def _node_conditions(responses: list[dict[str, object]]) -> list[object]:
+    """Only ABNORMAL node conditions become evidence text.
+
+    Healthy conditions carry the failure vocabulary anyway — type
+    "DiskPressure" status False, message "kubelet has sufficient memory" —
+    and kept feeding the keyword ranker a node_kubelet_pressure score on
+    perfectly healthy nodes (the 2026-07-08 re-analysis landed on
+    node_kubelet_pressure while its own self-check said there was no pressure
+    evidence). A healthy node is summarized as one marker entry instead."""
     for response in responses:
         if response.get("name") != "node":
             continue
         data = response.get("data")
         if isinstance(data, dict) and isinstance(data.get("conditions"), list):
-            return data["conditions"]
+            conditions = [c for c in data["conditions"] if isinstance(c, dict)]
+            abnormal = [
+                c
+                for c in conditions
+                if (
+                    str(c.get("type")) == "Ready"
+                    and str(c.get("status")) != "True"
+                )
+                or (
+                    str(c.get("type")) != "Ready"
+                    and str(c.get("status")) == "True"
+                )
+            ]
+            if abnormal:
+                return abnormal
+            if conditions:
+                return [{"node_conditions_healthy": True, "checked": len(conditions)}]
     return []
 
 

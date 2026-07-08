@@ -65,6 +65,11 @@ rules:
       - cronjobs
       - jobs
     verbs: ["get", "list", "watch"]
+  # Run:ai CRDs (projects/queues/podgroups/workloads/...) — kubectl parity for
+  # the scheduler RCA path (k8s_read allowlist); read-only.
+  - apiGroups: ["run.ai", "scheduling.run.ai"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -127,6 +132,11 @@ rules:
     resources:
       - cronjobs
       - jobs
+    verbs: ["get", "list", "watch"]
+  # Run:ai CRDs (projects/queues/podgroups/workloads/...) — kubectl parity for
+  # the scheduler RCA path (k8s_read allowlist); read-only.
+  - apiGroups: ["run.ai", "scheduling.run.ai"]
+    resources: ["*"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
