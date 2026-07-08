@@ -465,6 +465,65 @@ def test_mcp_api_kind_candidates_prefer_discovered_version(monkeypatch) -> None:
     assert all(kind == "PodGroup" for _, kind in pairs)
 
 
+def test_crd_not_ready_reads_conditions_and_phase() -> None:
+    from app.collectors.kubernetes import _crd_not_ready
+
+    ready = {
+        "kind": "Project",
+        "metadata": {"name": "ok-pro"},
+        "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+    }
+    assert _crd_not_ready(ready) is None
+
+    not_ready = {
+        "kind": "Project",
+        "metadata": {"name": "test-pro"},
+        "status": {
+            "conditions": [
+                {"type": "Ready", "status": "False", "reason": "ReconcileFailed",
+                 "message": "the object has been modified; please apply your changes"}
+            ]
+        },
+    }
+    finding = _crd_not_ready(not_ready)
+    assert finding is not None
+    assert finding["name"] == "test-pro" and finding["reason"] == "ReconcileFailed"
+
+    failed_phase = {"kind": "TrainingWorkload", "metadata": {"name": "job-1"},
+                    "status": {"phase": "Failed"}}
+    assert _crd_not_ready(failed_phase)["reason"] == "Failed"
+
+
+@pytest.mark.asyncio
+async def test_collect_runai_crd_findings_enumerates_and_flags_not_ready(monkeypatch) -> None:
+    from app.collectors import kubernetes as k8s
+
+    async def fake_k8s_read(settings, kind, namespace="", name="", label_selector=""):
+        if kind == "projects":
+            return {
+                "kind": "projects",
+                "error": None,
+                "data": {
+                    "items": [
+                        {"kind": "Project", "metadata": {"name": "project-test-a"},
+                         "status": {"conditions": [{"type": "Ready", "status": "True"}]}},
+                        {"kind": "Project", "metadata": {"name": "test-pro"},
+                         "status": {"conditions": [
+                             {"type": "Ready", "status": "False", "reason": "ReconcileFailed"}]}},
+                    ]
+                },
+            }
+        return {"kind": kind, "error": None, "data": {"items": []}}
+
+    monkeypatch.setattr(k8s, "k8s_read", fake_k8s_read)
+    result = await k8s.collect_runai_crd_findings(make_settings(), _toolkit_target(), ["runai"])
+    findings = result["findings"]
+    assert len(findings) == 1
+    assert findings[0]["name"] == "test-pro"
+    assert findings[0]["kind"] == "Project"
+    assert "projects" in result["checked"]
+
+
 @pytest.mark.asyncio
 async def test_runai_mcp_projects_falls_back_to_org_unit_path() -> None:
     from app.collectors.runai_mcp import _call_api

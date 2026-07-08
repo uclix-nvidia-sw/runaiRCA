@@ -71,6 +71,7 @@ rules:
   - apiGroups: ["run.ai"]
     resources:
       - distributedworkloads
+      - distributedinferenceworkloads
       - externalworkloads
       - inferenceworkloads
       - interactiveworkloads
@@ -78,6 +79,7 @@ rules:
       - projects
       - runaiconfigs
       - runaijobs
+      - workloadrunners
       - trainingworkloads
     verbs: ["get", "list", "watch"]
   - apiGroups: ["scheduling.run.ai"]
@@ -156,11 +158,13 @@ rules:
   - apiGroups: ["run.ai"]
     resources:
       - distributedworkloads
+      - distributedinferenceworkloads
       - externalworkloads
       - inferenceworkloads
       - interactiveworkloads
       - runaiconfigs
       - runaijobs
+      - workloadrunners
       - trainingworkloads
     verbs: ["get", "list", "watch"]
   - apiGroups: ["scheduling.run.ai"]

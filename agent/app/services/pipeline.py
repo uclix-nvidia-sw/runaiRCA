@@ -2021,6 +2021,20 @@ def _collector_is_evidence(result: object) -> bool:
 
 def _kubernetes_highlights(details: dict[str, object]) -> list[str]:
     lines: list[str] = []
+    # Run:ai CRD findings first — a not-Ready project/workload is the most direct
+    # answer for a control-plane alert that carried no workload label.
+    crd_findings = details.get("runai_crd_findings")
+    if isinstance(crd_findings, list):
+        for finding in crd_findings[:3]:
+            if not isinstance(finding, dict) or not finding.get("name"):
+                continue
+            kind = finding.get("kind") or "resource"
+            reason = finding.get("reason") or "NotReady"
+            message = str(finding.get("message") or "")
+            line = f"- Run:ai {kind} {finding.get('name')} is not Ready ({reason})"
+            if message:
+                line += f": {_short_sentence(message, limit=200)}"
+            lines.append(line)
     warning_events = details.get("warning_events")
     if isinstance(warning_events, list):
         for event in warning_events[:3]:

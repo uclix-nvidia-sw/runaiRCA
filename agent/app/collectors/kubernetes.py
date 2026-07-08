@@ -96,9 +96,24 @@ _RUNAI_CRD_KINDS: dict[str, tuple[str, str, bool]] = {
     "interactiveworkloads": ("run.ai", "InteractiveWorkload", True),
     "inferenceworkloads": ("run.ai", "InferenceWorkload", True),
     "distributedworkloads": ("run.ai", "DistributedWorkload", True),
+    "distributedinferenceworkloads": ("run.ai", "DistributedInferenceWorkload", True),
     "externalworkloads": ("run.ai", "ExternalWorkload", True),
+    "workloadrunners": ("run.ai", "WorkloadRunner", True),
     "runaiconfigs": ("run.ai", "RunaiConfig", True),
 }
+
+# The Run:ai workload CRD kinds (namespaced), most-specific first — enumerated
+# when an alert lands in a Run:ai namespace but names no workload, so the RCA
+# still finds which workloads are unhealthy from their own status.conditions.
+_RUNAI_WORKLOAD_KINDS: tuple[str, ...] = (
+    "trainingworkloads",
+    "interactiveworkloads",
+    "inferenceworkloads",
+    "distributedworkloads",
+    "distributedinferenceworkloads",
+    "externalworkloads",
+    "runaijobs",
+)
 
 _READ_KINDS: dict[str, tuple[str, bool]] = {
     # kind -> (API prefix, namespaced); "" prefix = discover via _RUNAI_CRD_KINDS
@@ -633,6 +648,21 @@ class KubernetesCollector:
         runai_control_plane_pods = _runai_control_plane_pods(responses)
         runai_control_plane_events = _runai_control_plane_warning_events(responses)
 
+        # Run:ai CRD enumeration: when the alert is in a Run:ai namespace, read
+        # the actual project/queue/workload/podgroup CRDs (status.conditions) so
+        # a control-plane alert with NO workload label still yields "project X
+        # not Ready" instead of "can't correlate". Best-effort, MCP-first.
+        runai_crds: dict[str, object] = {"checked": [], "findings": []}
+        if control_plane_in_scope:
+            crd_namespaces = [target.namespace, *self._settings.runai_log_namespaces]
+            try:
+                runai_crds = await collect_runai_crd_findings(
+                    self._settings, target, crd_namespaces
+                )
+            except Exception:  # noqa: BLE001 - enumeration is best-effort
+                pass
+        crd_findings = runai_crds.get("findings") or []
+
         if successful and not missing:
             status = "ok"
             confidence = "high"
@@ -677,6 +707,21 @@ class KubernetesCollector:
             )
             summary = f"{note} {summary}"
 
+        # A CRD finding IS the correlation the missing label denied us: name the
+        # not-Ready Run:ai entities and lift the result out of "partial".
+        if crd_findings:
+            named = ", ".join(
+                f"{f['kind']}/{f['name']} ({f['reason']})" for f in crd_findings[:3]
+            )
+            lead = ko_en(
+                self._settings,
+                f"정상 상태가 아닌 Run:ai 리소스 {len(crd_findings)}건 확인: {named}.",
+                f"Found {len(crd_findings)} Run:ai resource(s) not Ready: {named}.",
+            )
+            summary = f"{lead} {summary}"
+            if status != "ok":
+                status, confidence = "ok", "high"
+
         insight = await _senior_insight(
             self._settings,
             summary=summary,
@@ -706,6 +751,8 @@ class KubernetesCollector:
             "exec_probes": exec_probes,
             "runai_control_plane_pods": runai_control_plane_pods,
             "runai_control_plane_warning_events": runai_control_plane_events,
+            "runai_crd_findings": crd_findings,
+            "runai_crds_checked": runai_crds.get("checked"),
             "insight": insight,
             "queries": responses,
         }
@@ -1723,6 +1770,102 @@ def _runai_control_plane_warning_events(
         if isinstance(data, dict) and isinstance(data.get("items"), list):
             events[namespace] = [item for item in data["items"] if isinstance(item, dict)]
     return events
+
+
+def _crd_items(read_result: dict) -> list[dict]:
+    data = read_result.get("data") if isinstance(read_result, dict) else None
+    if isinstance(data, dict):
+        items = data.get("items")
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+        # A single object (name= read) — treat as a one-item list.
+        if data.get("kind") or data.get("metadata"):
+            return [data]
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    return []
+
+
+def _crd_not_ready(item: dict) -> dict[str, str] | None:
+    """A {kind,name,reason,message} finding when a Run:ai CRD object is NOT healthy.
+
+    Reads the standard K8s status.conditions (Ready/Succeeded != True is a
+    problem; explicit Failed/Degraded == True is a problem) plus a top-level
+    status.phase of Failed/Error/Pending. None for a healthy object."""
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    status = item.get("status") if isinstance(item.get("status"), dict) else {}
+    name = str(metadata.get("name") or "")
+    conditions = status.get("conditions")
+    for cond in conditions if isinstance(conditions, list) else []:
+        if not isinstance(cond, dict):
+            continue
+        ctype = str(cond.get("type") or "")
+        cstatus = str(cond.get("status") or "")
+        bad = (ctype in ("Ready", "Available", "Succeeded") and cstatus == "False") or (
+            ctype in ("Failed", "Degraded", "Error") and cstatus == "True"
+        )
+        if bad:
+            return {
+                "kind": str(item.get("kind") or ""),
+                "name": name,
+                "reason": str(cond.get("reason") or ctype),
+                "message": _clip(str(cond.get("message") or ""), 200),
+            }
+    phase = str(status.get("phase") or "")
+    if phase and phase.lower() in ("failed", "error", "pending", "unschedulable"):
+        return {
+            "kind": str(item.get("kind") or ""),
+            "name": name,
+            "reason": phase,
+            "message": _clip(str(status.get("message") or ""), 200),
+        }
+    return None
+
+
+def _clip(text: str, limit: int) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+async def collect_runai_crd_findings(
+    settings: Settings, target: AnalysisTarget, namespaces: list[str]
+) -> dict[str, object]:
+    """Enumerate the Run:ai CRDs a human would check for a control-plane alert.
+
+    Uses k8s_read (MCP-first), so it works even when the alert carries no
+    workload/project label — turning "no workload identity, can't correlate"
+    into "these projects/workloads are NOT Ready". Best-effort: returns
+    {checked, findings} with findings=[] on any failure, never raises."""
+    findings: list[dict[str, str]] = []
+    checked: list[str] = []
+
+    async def scan(kind: str, namespace: str = "") -> None:
+        try:
+            result = await k8s_read(settings, kind, namespace=namespace)
+        except Exception:  # noqa: BLE001 - enumeration is best-effort evidence
+            return
+        if result.get("error"):
+            return
+        checked.append(f"{kind}{('/' + namespace) if namespace else ''}")
+        for item in _crd_items(result)[: settings.kubernetes_list_limit]:
+            finding = _crd_not_ready(item)
+            if finding:
+                finding["namespace"] = namespace
+                findings.append(finding)
+
+    # Cluster-scoped org tree: which projects/queues/departments are unhealthy.
+    for kind in ("projects", "queues", "departments"):
+        await scan(kind)
+    # Namespaced workloads + their pod-groups in the alert's own namespaces.
+    scan_namespaces = _dedup_str([n for n in namespaces if n])
+    for namespace in scan_namespaces[:4]:
+        for kind in (*_RUNAI_WORKLOAD_KINDS, "podgroups"):
+            await scan(kind, namespace)
+    return {"checked": checked, "findings": findings[:20]}
+
+
+def _dedup_str(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
 
 
 # --- Deterministic flowchart-driven follow-up ---------------------------------
