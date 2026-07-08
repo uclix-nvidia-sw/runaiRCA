@@ -208,6 +208,42 @@ def test_mcp_tool_json_masks_structured_and_raw_text() -> None:
 
 
 @pytest.mark.asyncio
+async def test_k8s_mcp_json_skips_unparseable_table_for_yaml_candidate(monkeypatch) -> None:
+    # kubernetes-mcp-server's events_list answers with a human table (not YAML);
+    # it "succeeds" at the protocol level but can't be parsed. _k8s_mcp_json must
+    # fall through to the yaml-capable resources_list instead of raising and
+    # losing the events evidence to the direct-API fallback.
+    from app.collectors import kubernetes
+
+    async def fake_mcp_call(url, tool, arguments):
+        if tool == "events_list":
+            return _Result(
+                text="NAMESPACE  LAST SEEN  TYPE     REASON   OBJECT    MESSAGE\n"
+                "runai      2m         Warning  BackOff  pod/foo   Back-off restarting"
+            )
+        if tool == "resources_list":
+            return _Result(text="items:\n- kind: Event\n  reason: BackOff\n")
+        return _Result(text="")
+
+    monkeypatch.setattr(kubernetes, "mcp_call", fake_mcp_call)
+    candidates = [
+        ("events_list", {"namespace": "runai"}),
+        ("resources_list", {"kind": "Event", "namespace": "runai"}),
+    ]
+    result = await kubernetes._k8s_mcp_json(make_settings(), candidates)
+    assert isinstance(result, dict) and result.get("items"), result
+
+
+def test_mcp_client_factory_defaults_insecure_and_hardens_via_env(monkeypatch) -> None:
+    # Internal self-signed MCP endpoints: default to a custom (verify-off) factory;
+    # MCP_TLS_VERIFY=true restores the SDK default (system trust → None).
+    monkeypatch.delenv("MCP_TLS_VERIFY", raising=False)
+    assert mcp_client._mcp_client_factory() is not None
+    monkeypatch.setenv("MCP_TLS_VERIFY", "true")
+    assert mcp_client._mcp_client_factory() is None
+
+
+@pytest.mark.asyncio
 async def test_mcp_client_connects_to_real_streamable_http_server() -> None:
     async with _serve_mcp(_fake_datasource_mcp()) as url:
         result = await mcp_call(url, "echo", {"value": "ok"})

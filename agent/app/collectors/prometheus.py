@@ -237,7 +237,12 @@ def _queries_for(
     # Control-plane health: when the alert implicates Run:ai, check whether the
     # scheduler/backend pods themselves are crashlooping or stuck Pending — a dying
     # workload's cause is often an unhealthy control plane, not the workload.
-    ns_re = "|".join(re.escape(ns) for ns in control_plane_namespaces if ns)
+    # Namespaces are DNS-1123 labels (lowercase alnum + '-'), none of which are
+    # RE2-special, so they drop straight into the =~ matcher. NOT re.escape():
+    # that emits Python-regex backslashes ("runai-backend" -> "runai\\-backend"),
+    # and "\\-" is an illegal escape INSIDE a PromQL double-quoted string literal,
+    # which Prometheus rejects at the lexer with HTTP 400 before any regex runs.
+    ns_re = "|".join(ns for ns in control_plane_namespaces if ns)
     if ns_re:
         cp = f'namespace=~"{ns_re}"'
         queries.extend(

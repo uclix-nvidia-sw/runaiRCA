@@ -1039,17 +1039,36 @@ def _normalize_k8s_payload(data: object) -> object:
 async def _k8s_mcp_json(
     settings: Settings, candidates: list[tuple[str, dict[str, object]]]
 ) -> object:
-    result = await _k8s_mcp_result(settings, candidates)
-    data = mcp_tool_json(result)
-    if isinstance(data, dict) and "raw" in data:
-        # kubernetes-mcp-server answers in YAML, not JSON (get ops always; list
-        # ops with --list-output=yaml — the chart sets it). Rejecting non-JSON
-        # here demoted EVERY query to the direct API ("MCP result was not
-        # JSON"). Parse the RAW text — masking first corrupted the YAML
-        # (base64 certs → "[MASKED]" broke the block structure), and the
-        # "raw" preview is truncated anyway. The parsed object is masked.
-        return _k8s_yaml_payload(mcp_tool_raw_text(result))
-    return data
+    # Walk candidates and return the first one that yields a machine-readable
+    # payload. A candidate can "succeed" at the MCP protocol level yet answer with
+    # a human table (kubernetes-mcp-server's events_list does) that _k8s_yaml_payload
+    # can't parse — when that happens, fall through to the next candidate (e.g.
+    # resources_list, which honors --list-output=yaml) instead of raising and
+    # losing the evidence to the direct-API fallback.
+    last_error = ""
+    for tool, args in candidates:
+        try:
+            result = await mcp_call(settings.kubernetes_mcp_url, tool, args)
+        except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
+            last_error = f"{tool}: {exc.__class__.__name__}: {exc}"
+            continue
+        error = mcp_error(result)
+        if error:
+            last_error = f"{tool}: {error}"
+            continue
+        data = mcp_tool_json(result)
+        if isinstance(data, dict) and "raw" in data:
+            # kubernetes-mcp-server answers in YAML, not JSON. Parse the RAW text
+            # (masking first corrupted the YAML — base64 certs → "[MASKED]" broke
+            # the block structure — and the "raw" preview is truncated); the
+            # parsed object is masked afterward.
+            try:
+                return _k8s_yaml_payload(mcp_tool_raw_text(result))
+            except RuntimeError as exc:
+                last_error = f"{tool}: {exc}"
+                continue
+        return data
+    raise RuntimeError(last_error or "Kubernetes MCP tool failed")
 
 
 def _k8s_yaml_payload(text: str) -> object:
