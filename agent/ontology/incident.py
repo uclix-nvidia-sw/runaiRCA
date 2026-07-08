@@ -50,5 +50,9 @@ class OntologyIncident(BaseModel):
     occurrence_count: int = 0
     occurrence_pods: list[str] = Field(default_factory=list)
     root_cause: RootCause | None = None
+    # Backend-persisted top root-cause family (empty for legacy rows).
+    root_cause_family: str = ""
+    # Explicit operator approval timestamp (dashboard Approve button); "" = not approved.
+    user_approved_at: str = ""
     # KB-poisoning guard (critique #1): only reviewed incidents are committed.
     reviewed: bool = False

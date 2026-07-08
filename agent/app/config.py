@@ -296,7 +296,7 @@ def load_settings() -> Settings:
         # loop with ONLY its domain's read-only tools (see services/drilldown.py).
         # LLM-gated and best-effort like the investigation loop.
         enable_agent_drilldown=_bool_env("ENABLE_AGENT_DRILLDOWN", False),
-        drilldown_max_steps=max(1, _int_env("DRILLDOWN_MAX_STEPS", 4)),
+        drilldown_max_steps=max(1, _int_env("DRILLDOWN_MAX_STEPS", 6)),
         # Overall hard cap on one analysis: agents get generous per-step time above,
         # but the whole run always finishes within this budget. (0 = no overall cap.)
         # Owner priority is accuracy over latency; the backend's
