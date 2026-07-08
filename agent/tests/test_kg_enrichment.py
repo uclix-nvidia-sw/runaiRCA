@@ -19,6 +19,77 @@ def _target() -> AnalysisTarget:
     )
 
 
+def test_root_chain_walks_leads_to_transitively() -> None:
+    """Observing XID 154 must surface the true origin 144 (chain 144 -> 48 -> 154),
+    not just the one-hop intermediate 48."""
+    import re
+
+    # reverse leads_to graph: effect -> [immediate causes]
+    causes = {154: [48], 48: [144], 144: []}
+
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                m = re.search(r"root_xids_for\((\d+)\)", query)
+                if m:
+                    code = int(m.group(1))
+                    return [{"x": c} for c in causes.get(code, [])]
+                if "fixes_for_xid" in query:
+                    return [{"x": "reset the GPU"}]
+                return []
+
+            yield run
+
+    out = _query_remediation(FakeClient(), "", [154], "")  # type: ignore[arg-type]
+    # Transitive ancestors, nearest hop first.
+    assert out.root_xids[154] == [48, 144]
+    # Fixes fetched for each discovered root too.
+    assert 48 in out.xid_fixes and 144 in out.xid_fixes
+
+
+def test_root_chain_is_cycle_safe() -> None:
+    import re
+
+    # pathological cycle 45 -> 74 -> 45; must terminate and not repeat.
+    causes = {45: [74], 74: [45]}
+
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                m = re.search(r"root_xids_for\((\d+)\)", query)
+                if m:
+                    return [{"x": c} for c in causes.get(int(m.group(1)), [])]
+                return []
+
+            yield run
+
+    out = _query_remediation(FakeClient(), "", [45], "")  # type: ignore[arg-type]
+    assert out.root_xids[45] == [74]  # 45 itself excluded, no infinite loop
+
+
+def test_root_chain_hop_failure_is_isolated() -> None:
+    import re
+
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "fixes_for_xid" in query:
+                    return [{"x": "reset the GPU"}]
+                if re.search(r"root_xids_for\(\d+\)", query):
+                    raise RuntimeError("leads_to function missing on this TypeDB build")
+                return []
+
+            yield run
+
+    # A broken root walk must not wipe the observed XID's own fixes.
+    out = _query_remediation(FakeClient(), "", [79], "")  # type: ignore[arg-type]
+    assert out.xid_fixes[79] == ["reset the GPU"]
+    assert 79 not in out.root_xids
+
+
 def test_enrich_disabled_returns_empty_context() -> None:
     # load_settings() defaults ENABLE_TYPEDB off -> no query, empty context.
     ctx = asyncio.run(enrich(load_settings(), _target()))

@@ -540,6 +540,9 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         analysis_detail=state.detail,
         analysis_type=request.analysis_type or request.alert.status or "firing",
         analysis_quality=state.quality,
+        root_cause_family=(
+            state.root_cause_candidates[0].family if state.root_cause_candidates else ""
+        ),
         missing_data=state.missing,
         warnings=state.warnings,
         capabilities=state.capabilities,

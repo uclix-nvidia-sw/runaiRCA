@@ -132,6 +132,26 @@ def test_promotion_from_row_happy_path() -> None:
     assert len(actions) == 3
 
 
+def test_promotion_uses_stored_family_over_text_inference() -> None:
+    # Backend-persisted family wins even when the analysis text would infer a
+    # different family (or none at all) — this is the fundamental fix that lets
+    # families like gpu_hardware_error (not in _FAMILY_MARKERS) be promoted.
+    row = _row(root_cause_family="gpu_hardware_error", analysis_summary="fine", analysis_detail="fine")
+    rec = ingest._promotion_from_row(row)
+    assert rec is not None
+    _, family, _ = rec
+    assert family == "gpu_hardware_error"
+
+
+def test_promotion_falls_back_to_text_when_family_empty() -> None:
+    # Legacy rows (no stored family) still recover via text inference.
+    row = _row(root_cause_family="")
+    rec = ingest._promotion_from_row(row)
+    assert rec is not None
+    _, family, _ = rec
+    assert family == "node_kubelet_pressure"
+
+
 def test_promotion_from_row_skips_malformed_rows() -> None:
     assert ingest._promotion_from_row(_row(status="firing")) is None
     assert ingest._promotion_from_row(_row(positive_feedback=1, negative_feedback=1)) is None

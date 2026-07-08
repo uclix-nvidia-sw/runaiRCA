@@ -109,6 +109,11 @@ typedb:
     # so the next similar alert matches what operators already validated. This is
     # what makes the agent get smarter over time from real feedback.
     promoteKnowledge: true
+    # Also accumulate confirmed/pending incident rows into the rca_dataset store
+    # (durable answer-key for eval), chained onto this same job so it runs right
+    # after the KG refresh. Approve status comes from incidents.user_approved_at;
+    # materialize the measured set later with `gen_dataset --export-curated`.
+    generateDataset: true
   image:
     # Fully qualified (docker.io/...) so global.imageRegistry does NOT rewrite it
     # to a private org. Air-gapped? Point this at your mirror, e.g.
@@ -364,7 +369,7 @@ agent:
     # domain's read-only tools to deepen its own evidence. Only active when an
     # LLM is configured; each step is extra LLM calls (accuracy over latency).
     enableAgentDrilldown: true
-    drilldownMaxSteps: 4
+    drilldownMaxSteps: 6
     # Stop optional LLM reasoning loops after this many tokens have been used in
     # one analysis. 0 = unlimited; the overall deadline still applies.
     analysisTokenBudget: 0

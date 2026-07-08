@@ -202,6 +202,7 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			analysis_summary TEXT NOT NULL DEFAULT '',
 			analysis_detail TEXT NOT NULL DEFAULT '',
 			analysis_quality TEXT NOT NULL DEFAULT '',
+			root_cause_family TEXT NOT NULL DEFAULT '',
 			capabilities JSONB NOT NULL DEFAULT '{}'::jsonb,
 			missing_data JSONB NOT NULL DEFAULT '[]'::jsonb,
 			warnings JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -210,6 +211,7 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 		)`,
 		`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS occurrence_count INTEGER NOT NULL DEFAULT 1`,
 		`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS occurrence_pods JSONB NOT NULL DEFAULT '[]'::jsonb`,
+		`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS root_cause_family TEXT NOT NULL DEFAULT ''`,
 		`CREATE TABLE IF NOT EXISTS incident_embeddings (
 			incident_id TEXT NOT NULL,
 			alert_id TEXT NOT NULL,
@@ -277,6 +279,7 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			analysis_summary TEXT NOT NULL DEFAULT '',
 			analysis_detail TEXT NOT NULL DEFAULT '',
 			analysis_quality TEXT NOT NULL DEFAULT '',
+			root_cause_family TEXT NOT NULL DEFAULT '',
 			capabilities JSONB NOT NULL DEFAULT '{}'::jsonb,
 			missing_data JSONB NOT NULL DEFAULT '[]'::jsonb,
 			warnings JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -286,6 +289,7 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS root_cause_family TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb`,
 		`ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS first_completed_at TIMESTAMPTZ`,
 		`CREATE TABLE IF NOT EXISTS chat_conversations (
@@ -441,7 +445,7 @@ func (s *Store) loadAlerts(ctx context.Context) {
 		ctx,
 		`SELECT alert_id, incident_id, alarm_title, severity, status, fired_at,
 		        resolved_at, fingerprint, occurrence_count, occurrence_pods, thread_ts, labels, annotations,
-		        analysis_summary, analysis_detail, analysis_quality, capabilities,
+		        analysis_summary, analysis_detail, analysis_quality, root_cause_family, capabilities,
 		        missing_data, warnings, artifacts
 		   FROM alerts`,
 	)
@@ -473,6 +477,7 @@ func (s *Store) loadAlerts(ctx context.Context) {
 			&alert.AnalysisSummary,
 			&alert.AnalysisDetail,
 			&alert.AnalysisQuality,
+			&alert.RootCauseFamily,
 			&capabilitiesRaw,
 			&missingRaw,
 			&warningsRaw,
@@ -714,7 +719,7 @@ func (s *Store) loadAnalysisRuns(ctx context.Context) {
 		ctx,
 		`SELECT run_id, source, status, target_type, target_id, incident_id,
 		        alert_id, title, prompt, analysis_summary, analysis_detail,
-		        analysis_quality, capabilities, missing_data, warnings, artifacts, metadata,
+		        analysis_quality, root_cause_family, capabilities, missing_data, warnings, artifacts, metadata,
 		        first_completed_at, created_at, updated_at
 		   FROM analysis_runs`,
 	)
@@ -741,6 +746,7 @@ func (s *Store) loadAnalysisRuns(ctx context.Context) {
 			&run.AnalysisSummary,
 			&run.AnalysisDetail,
 			&run.AnalysisQuality,
+			&run.RootCauseFamily,
 			&capabilitiesRaw,
 			&missingRaw,
 			&warningsRaw,
@@ -892,10 +898,10 @@ func (s *Store) persistAlertLocked(alert *AlertRecord) bool {
 			alert_id, incident_id, alarm_title, severity, status, fired_at,
 			resolved_at, fingerprint, occurrence_count, occurrence_pods, thread_ts, labels, annotations,
 			analysis_summary, analysis_detail, analysis_quality, capabilities,
-			missing_data, warnings, artifacts, updated_at
+			missing_data, warnings, artifacts, root_cause_family, updated_at
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-			$16, $17, $18, $19, $20, now()
+			$16, $17, $18, $19, $20, $21, now()
 		)
 		ON CONFLICT (alert_id) DO UPDATE SET
 			incident_id = EXCLUDED.incident_id,
@@ -913,6 +919,7 @@ func (s *Store) persistAlertLocked(alert *AlertRecord) bool {
 			analysis_summary = EXCLUDED.analysis_summary,
 			analysis_detail = EXCLUDED.analysis_detail,
 			analysis_quality = EXCLUDED.analysis_quality,
+			root_cause_family = EXCLUDED.root_cause_family,
 			capabilities = EXCLUDED.capabilities,
 			missing_data = EXCLUDED.missing_data,
 			warnings = EXCLUDED.warnings,
@@ -938,6 +945,7 @@ func (s *Store) persistAlertLocked(alert *AlertRecord) bool {
 		mustJSON(alert.MissingData),
 		mustJSON(alert.Warnings),
 		mustJSON(alert.Artifacts),
+		alert.RootCauseFamily,
 	)
 	if err != nil {
 		log.Printf("Failed to persist alert %s: %v", alert.AlertID, err)
@@ -1113,10 +1121,11 @@ func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) bool {
 		`INSERT INTO analysis_runs (
 			run_id, source, status, target_type, target_id, incident_id, alert_id,
 			title, prompt, analysis_summary, analysis_detail, analysis_quality,
-			capabilities, missing_data, warnings, artifacts, metadata, first_completed_at, created_at, updated_at
+			capabilities, missing_data, warnings, artifacts, metadata, first_completed_at, created_at, updated_at,
+			root_cause_family
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-			$15, $16, $17, $18, $19, $20
+			$15, $16, $17, $18, $19, $20, $21
 		)
 		ON CONFLICT (run_id) DO UPDATE SET
 			source = EXCLUDED.source,
@@ -1130,6 +1139,7 @@ func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) bool {
 			analysis_summary = EXCLUDED.analysis_summary,
 			analysis_detail = EXCLUDED.analysis_detail,
 			analysis_quality = EXCLUDED.analysis_quality,
+			root_cause_family = EXCLUDED.root_cause_family,
 			capabilities = EXCLUDED.capabilities,
 			missing_data = EXCLUDED.missing_data,
 			warnings = EXCLUDED.warnings,
@@ -1157,6 +1167,7 @@ func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) bool {
 		run.FirstCompletedAt,
 		run.CreatedAt,
 		run.UpdatedAt,
+		run.RootCauseFamily,
 	)
 	if err != nil {
 		log.Printf("Failed to persist analysis run %s: %v", run.RunID, err)

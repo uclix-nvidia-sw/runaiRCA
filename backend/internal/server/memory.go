@@ -182,6 +182,7 @@ func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int)
 				Sentiment: "positive",
 				Weight:    item.Similarity,
 				Text:      excerpt(fmt.Sprintf("Operators found this prior RCA useful: %s", item.AnalysisSummary), maxFeedbackHintTextBytes),
+				CreatedAt: item.CreatedAt,
 			})
 			if len(hints) >= limit {
 				return hints
@@ -193,6 +194,7 @@ func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int)
 				Sentiment: "negative",
 				Weight:    item.Similarity,
 				Text:      excerpt(fmt.Sprintf("Operators pushed back on this prior RCA: %s", item.AnalysisSummary), maxFeedbackHintTextBytes),
+				CreatedAt: item.CreatedAt,
 			})
 			if len(hints) >= limit {
 				return hints
@@ -211,6 +213,7 @@ func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int)
 				Sentiment: "comment",
 				Weight:    item.Similarity,
 				Text:      excerpt(comment.Body, maxFeedbackHintTextBytes),
+				CreatedAt: comment.CreatedAt,
 			})
 			if len(hints) >= limit {
 				return hints
@@ -319,6 +322,7 @@ func (s *Store) ApplyAnalysisForRun(runID string, alertID string, response Agent
 		alert.AnalysisDetail = response.Analysis
 	}
 	alert.AnalysisQuality = response.AnalysisQuality
+	alert.RootCauseFamily = response.RootCauseFamily
 	alert.Capabilities = response.Capabilities
 	alert.MissingData = response.MissingData
 	alert.Warnings = response.Warnings
@@ -349,6 +353,7 @@ func (s *Store) applyAnalysisLocked(alert *AlertRecord, response AgentAnalysisRe
 		alert.AnalysisDetail = response.Analysis
 	}
 	alert.AnalysisQuality = response.AnalysisQuality
+	alert.RootCauseFamily = response.RootCauseFamily
 	alert.Capabilities = response.Capabilities
 	alert.MissingData = response.MissingData
 	alert.Warnings = response.Warnings
@@ -447,6 +452,7 @@ func (s *Store) applyFallbackAnalysisIfAbsentLocked(alert *AlertRecord, response
 		alert.AnalysisDetail = response.Analysis
 	}
 	alert.AnalysisQuality = first(response.AnalysisQuality, "low")
+	alert.RootCauseFamily = response.RootCauseFamily
 	alert.Capabilities = response.Capabilities
 	alert.MissingData = response.MissingData
 	alert.Warnings = response.Warnings

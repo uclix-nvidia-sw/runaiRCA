@@ -288,13 +288,13 @@ func (s *PostgresState) rowsFor(query string) driver.Rows {
 			columns: []string{
 				"alert_id", "incident_id", "alarm_title", "severity", "status", "fired_at",
 				"resolved_at", "fingerprint", "occurrence_count", "occurrence_pods", "thread_ts",
-				"labels", "annotations", "analysis_summary", "analysis_detail", "analysis_quality", "capabilities",
+				"labels", "annotations", "analysis_summary", "analysis_detail", "analysis_quality", "root_cause_family", "capabilities",
 				"missing_data", "warnings", "artifacts",
 			},
 			values: [][]driver.Value{{
 				"ALR-db", "INC-db", "RunAIWorkloadPending", "warning", "firing", s.now,
 				nil, "fp-db", int64(1), s.emptyArrayJSON, "thread-db", s.labelsJSON, s.annotationsJSON,
-				"Run:AI queue gpu-a was saturated.", "GPU quota blocked scheduling.", "high", s.capabilitiesJSON,
+				"Run:AI queue gpu-a was saturated.", "GPU quota blocked scheduling.", "high", "", s.capabilitiesJSON,
 				s.missingDataJSON, s.warningsJSON, s.artifactsJSON,
 			}},
 		}
@@ -329,13 +329,13 @@ func (s *PostgresState) rowsFor(query string) driver.Rows {
 			columns: []string{
 				"run_id", "source", "status", "target_type", "target_id", "incident_id",
 				"alert_id", "title", "prompt", "analysis_summary", "analysis_detail",
-				"analysis_quality", "capabilities", "missing_data", "warnings", "artifacts",
+				"analysis_quality", "root_cause_family", "capabilities", "missing_data", "warnings", "artifacts",
 				"metadata", "first_completed_at", "created_at", "updated_at",
 			},
 			values: [][]driver.Value{{
 				"ANL-db", "comment", "complete", "incident", "INC-db", "INC-db",
 				"", "Comment reanalysis", "check scheduler logs", "Reanalysis completed.",
-				"Scheduler logs confirmed quota saturation.", "high", s.capabilitiesJSON,
+				"Scheduler logs confirmed quota saturation.", "high", "", s.capabilitiesJSON,
 				s.emptyArrayJSON, s.emptyArrayJSON, s.emptyArrayJSON, s.emptyObjectJSON, s.now, s.now, s.now,
 			}},
 		}

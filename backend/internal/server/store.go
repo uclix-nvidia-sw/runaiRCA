@@ -1432,6 +1432,7 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 		existing.AnalysisSummary = ""
 		existing.AnalysisDetail = ""
 		existing.AnalysisQuality = ""
+		existing.RootCauseFamily = ""
 		existing.Capabilities = map[string]string{}
 		existing.MissingData = []string{}
 		existing.Warnings = []string{}
@@ -1553,6 +1554,7 @@ func (s *Store) CompleteAnalysisRun(runID string, response AgentAnalysisResponse
 		run.AnalysisDetail = response.Analysis
 	}
 	run.AnalysisQuality = response.AnalysisQuality
+	run.RootCauseFamily = response.RootCauseFamily
 	run.Capabilities = response.Capabilities
 	run.MissingData = response.MissingData
 	run.Warnings = response.Warnings
@@ -1584,6 +1586,7 @@ func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (A
 		run.AnalysisDetail = response.Analysis
 	}
 	run.AnalysisQuality = first(response.AnalysisQuality, "low")
+	run.RootCauseFamily = response.RootCauseFamily
 	run.Capabilities = response.Capabilities
 	run.MissingData = response.MissingData
 	run.Warnings = response.Warnings
@@ -1871,6 +1874,9 @@ func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 		}
 		if detail.AnalysisQuality == "" {
 			detail.AnalysisQuality = alert.AnalysisQuality
+		}
+		if detail.RootCauseFamily == "" {
+			detail.RootCauseFamily = alert.RootCauseFamily
 		}
 		for key, value := range alert.Capabilities {
 			detail.Capabilities[key] = value

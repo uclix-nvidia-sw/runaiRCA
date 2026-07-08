@@ -34,6 +34,7 @@ type AgentAnalysisResponse struct {
 	AnalysisDetail  string            `json:"analysis_detail"`
 	AnalysisType    string            `json:"analysis_type"`
 	AnalysisQuality string            `json:"analysis_quality"`
+	RootCauseFamily string            `json:"root_cause_family"`
 	MissingData     []string          `json:"missing_data"`
 	Warnings        []string          `json:"warnings"`
 	Capabilities    map[string]string `json:"capabilities"`

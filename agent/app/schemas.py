@@ -41,6 +41,7 @@ class FeedbackHintContext(BaseModel):
     sentiment: str = ""
     weight: float = 0
     text: str = ""
+    created_at: str | None = None
 
 
 class AlertAnalysisRequest(BaseModel):
@@ -80,6 +81,7 @@ class AlertAnalysisResponse(BaseModel):
     analysis_detail: str
     analysis_type: str
     analysis_quality: str
+    root_cause_family: str = ""
     missing_data: list[str]
     warnings: list[str]
     capabilities: dict[str, str]

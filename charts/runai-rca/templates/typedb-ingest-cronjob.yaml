@@ -3,6 +3,14 @@
 {{- $allFlag := ternary "" "--all " .Values.typedb.ingest.requireReview }}
 {{- /* promoteKnowledge -> also learn confirmed RCAs into reusable knowledge (closes the loop) */ -}}
 {{- $promoteFlag := ternary "--promote-knowledge " "" .Values.typedb.ingest.promoteKnowledge }}
+{{- /* generateDataset -> after ingest, accumulate confirmed/pending incident rows into the
+       rca_dataset store (approve status from incidents.user_approved_at). Same job so it shares
+       env + runs right after the KG is refreshed, matching the ingest timing. */ -}}
+{{- $ingestCmd := printf "python -m ontology.ingest %s%s--resolved-grace-hours %v --limit %v" $allFlag $promoteFlag .Values.typedb.ingest.resolvedGraceHours .Values.typedb.ingest.limit }}
+{{- $genCmd := "" }}
+{{- if .Values.typedb.ingest.generateDataset }}
+{{- $genCmd = printf " && python -m eval.gen_dataset --from-incidents --resolved-grace-hours %v --limit %v" .Values.typedb.ingest.resolvedGraceHours .Values.typedb.ingest.limit }}
+{{- end }}
 # Periodic projection of resolved incidents (resolved >= resolvedGraceHours ago)
 # into the TypeDB knowledge graph. The grace window lets late feedback / re-analysis
 # settle; re-fired incidents flip back to 'firing' and are excluded automatically.
@@ -40,7 +48,7 @@ spec:
               imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
               command: ["sh", "-c"]
               args:
-                - "python -m ontology.ingest {{ $allFlag }}{{ $promoteFlag }}--resolved-grace-hours {{ .Values.typedb.ingest.resolvedGraceHours }} --limit {{ .Values.typedb.ingest.limit }}"
+                - "{{ $ingestCmd }}{{ $genCmd }}"
               env:
                 - name: ENABLE_TYPEDB
                   value: "true"

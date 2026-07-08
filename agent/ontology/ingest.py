@@ -41,8 +41,10 @@ from ontology.load_knowledge import (
 _SELECT_INCIDENTS = """
 SELECT i.incident_id, i.correlation_key, i.title, i.severity, i.status,
        i.fired_at::text AS fired_at,
+       i.user_approved_at::text AS user_approved_at,
        a.alert_id, a.fingerprint, a.occurrence_count, a.occurrence_pods,
        a.labels, a.annotations, a.analysis_summary, a.analysis_detail,
+       a.root_cause_family,
        (SELECT count(*) FROM rca_feedback f
          WHERE f.target_id IN (i.incident_id, a.alert_id)
            AND f.vote = 'up') AS positive_feedback,
@@ -117,6 +119,8 @@ def _to_incident(row: dict[str, Any]) -> OntologyIncident:
         fingerprint=str(row.get("fingerprint") or ""),
         occurrence_count=int(row.get("occurrence_count") or 0),
         occurrence_pods=_list(row.get("occurrence_pods")),
+        root_cause_family=str(row.get("root_cause_family") or ""),
+        user_approved_at=str(row.get("user_approved_at") or ""),
         reviewed=bool(row.get("reviewed")),
     )
 
@@ -349,7 +353,12 @@ def _promotion_from_row(row: dict[str, Any]) -> tuple[str, str, list[str]] | Non
         return None
     summary = str(row.get("analysis_summary") or "")
     detail = str(row.get("analysis_detail") or "")
-    family = _derive_family(f"{summary}\n{detail}")
+    # Prefer the family the backend persisted from the ranked root-cause
+    # candidate; fall back to text inference only for legacy rows written
+    # before root_cause_family was stored.
+    family = str(row.get("root_cause_family") or "").strip() or _derive_family(
+        f"{summary}\n{detail}"
+    )
     if not family:
         return None
     return alert_name, family, _extract_actions(detail)

@@ -75,10 +75,11 @@ type SimilarIncident struct {
 }
 
 type FeedbackHint struct {
-	SourceID  string  `json:"source_id"`
-	Sentiment string  `json:"sentiment"`
-	Weight    float64 `json:"weight"`
-	Text      string  `json:"text"`
+	SourceID  string    `json:"source_id"`
+	Sentiment string    `json:"sentiment"`
+	Weight    float64   `json:"weight"`
+	Text      string    `json:"text"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
 }
 
 type FeedbackRecord struct {
@@ -173,6 +174,7 @@ type AlertRecord struct {
 	AnalysisSummary  string            `json:"analysis_summary"`
 	AnalysisDetail   string            `json:"analysis_detail"`
 	AnalysisQuality  string            `json:"analysis_quality"`
+	RootCauseFamily  string            `json:"root_cause_family"`
 	Capabilities     map[string]string `json:"capabilities"`
 	MissingData      []string          `json:"missing_data"`
 	Warnings         []string          `json:"warnings"`
@@ -187,6 +189,7 @@ type IncidentDetail struct {
 	AnalysisSummary    string            `json:"analysis_summary"`
 	AnalysisDetail     string            `json:"analysis_detail"`
 	AnalysisQuality    string            `json:"analysis_quality"`
+	RootCauseFamily    string            `json:"root_cause_family"`
 	Capabilities       map[string]string `json:"capabilities"`
 	MissingData        []string          `json:"missing_data"`
 	Warnings           []string          `json:"warnings"`

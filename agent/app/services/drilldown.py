@@ -223,18 +223,70 @@ def _drilldown_masker(settings: Settings):
 # Prompts
 
 
+# Per-domain "what to actively hunt for" hints. These nudge each agent to use its
+# knowledge of common Run:ai / GPU / Kubernetes failure modes INSIDE its own
+# territory, so it keeps digging for the real fault instead of accepting the base
+# collector's shallow first pass.
+_DOMAIN_FOCUS = {
+    "kubernetes": (
+        "pod phase and container waiting/terminated reasons, restart counts and "
+        "last-state exit codes, OOMKilled / CrashLoopBackOff / ImagePullBackOff / "
+        "FailedScheduling / FailedMount / Evicted events, the owning controller "
+        "(Job / Deployment / RunaiJob / ReplicaSet), and node conditions, "
+        "pressure and taints for the assigned node"
+    ),
+    "prometheus": (
+        "restart and OOM counters, pending and unschedulable pods, GPU / CPU / "
+        "memory saturation, resource-quota vs allocation for the project/queue, "
+        "and metric TRENDS across the incident window — not just the instant value"
+    ),
+    "loki": (
+        "crash / panic / fatal stack traces, GPU Xid / NVRM / NCCL lines, and "
+        "scheduler / admission / quota / reconcile errors that NAME this workload; "
+        "find the FIRST error line in the incident window (the origin, not the "
+        "repeated downstream symptom)"
+    ),
+    "runai": (
+        "workload phase and status history, project and queue quota vs allocation, "
+        "the scheduling / preemption reason, and the workload's controller and pod "
+        "identity"
+    ),
+    "postgres": (
+        "the control-plane rows for THIS workload / project / queue — status, "
+        "quota, scheduling decisions, and audit / authorization entries around the "
+        "incident time"
+    ),
+}
+
+
 def _system_prompt(agent: str, tools: dict[str, dict[str, Any]]) -> str:
     tool_lines = "\n".join(f"- {name}: {spec['description']}" for name, spec in tools.items())
+    focus = _DOMAIN_FOCUS.get(
+        agent, "the evidence most relevant to the incident within your domain"
+    )
     return (
         f"You are the {agent} evidence agent for a Run:ai GPU-platform RCA, autonomously "
-        "drilling deeper into YOUR domain only. Look at your evidence so far and decide "
-        "whether one more round of READ-ONLY follow-up queries would materially confirm or "
-        "refute the investigation's hypotheses. Fetch data RELATED to the incident — the "
-        "workload's controller, its project/queue, the Run:ai control-plane component "
-        "involved, correlated namespaces and time windows — never your own datasource's "
-        "health (the base collector already covered that). Prefer narrowing: one pod, one "
-        "namespace, one resource, a tighter filter. Conclude (action=done) as soon as the "
-        "evidence is sufficient — never query for completeness.\n"
+        "and AGGRESSIVELY investigating YOUR domain only. Do not settle for the base "
+        "collector's first pass: use your expert knowledge of common Run:ai / GPU / "
+        "Kubernetes failure modes to actively hunt down the fault inside your own "
+        "territory.\n"
+        f"For your domain, dig into: {focus}.\n"
+        "How to work:\n"
+        "- Form a concrete hypothesis from the evidence so far, then run READ-ONLY "
+        "follow-up queries that would confirm or refute it. When a lead is ambiguous, "
+        "re-query with a NARROWER scope (one pod, one namespace, one metric series, a "
+        "tighter time filter or regex) to pin it down.\n"
+        "- Fetch data RELATED to the incident — the workload's controller, its "
+        "project/queue, the Run:ai control-plane component involved, correlated "
+        "namespaces and time windows — never your own datasource's health (the base "
+        "collector already covered that).\n"
+        "- KEEP GOING while a plausible in-domain cause is still untested, your key "
+        "evidence is thin or ambiguous, or you have not yet found the ORIGIN (not just "
+        "a downstream symptom). Do NOT stop at the first plausible-looking line. Answer "
+        "action=done ONLY when your own domain is thoroughly covered and further queries "
+        "would be redundant.\n"
+        "- Stay strictly read-only and inside your tools, and avoid blind sweeps — every "
+        "query must test a specific idea.\n"
         f"Tools available to you (your only tools; there are no others):\n{tool_lines}\n"
         'Respond with ONLY JSON: {"action":"query"|"done","reason":str,'
         '"queries":[{"tool":str,"args":{...}}]} with at most '

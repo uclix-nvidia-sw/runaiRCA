@@ -26,6 +26,7 @@ type AnalysisRun struct {
 	AnalysisSummary  string            `json:"analysis_summary"`
 	AnalysisDetail   string            `json:"analysis_detail"`
 	AnalysisQuality  string            `json:"analysis_quality"`
+	RootCauseFamily  string            `json:"root_cause_family"`
 	Capabilities     map[string]string `json:"capabilities"`
 	MissingData      []string          `json:"missing_data"`
 	Warnings         []string          `json:"warnings"`

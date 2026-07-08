@@ -140,7 +140,9 @@ class GraphRemediation:
     family_fixes: list[str] = field(default_factory=list)
     xid_fixes: dict[int, list[str]] = field(default_factory=dict)
     model_xids: dict[str, list[int]] = field(default_factory=dict)
-    # observed XID -> root XID(s) that escalate into it (leads_to chain, one hop back)
+    # observed XID -> root XID(s) that escalate into it, walked TRANSITIVELY back
+    # along the leads_to chain (nearest hop first). E.g. observing 154 with chain
+    # 144 -> 48 -> 154 yields [48, 144]: both the near cause and the true origin.
     root_xids: dict[int, list[int]] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
@@ -213,17 +215,15 @@ def _query_remediation(
             fixes = _statements(run(_FN_FIXES_FOR_XID.format(code=code)))
             if fixes:
                 out.xid_fixes[code] = fixes
-            # Drill to the root of the leads_to causal chain: which fault(s)
-            # escalate INTO this observed XID. Surfacing the root (and its fix) is
-            # the ontology's precision win — fix the origin, not the downstream
-            # symptom. root_xids_for is newer than the validated functions, so a
-            # query error here must NOT wipe the fixes above: isolate it.
-            try:
-                root_rows = run(_FN_ROOT_XIDS_FOR.format(code=code))
-            except Exception:  # noqa: BLE001 - best-effort drill-down, never fatal
-                root_rows = []
-            root_codes = {int(v) for v in _values(root_rows) if _is_int(v)}
-            roots = [r for r in sorted(root_codes) if r != code]
+            # Drill to the ROOT of the leads_to causal chain: which fault(s)
+            # escalate INTO this observed XID. root_xids_for is one hop back, so
+            # we walk it TRANSITIVELY (bounded BFS) — a chain 144 → 48 → 154 must
+            # surface 144 as the origin of 154, not just the intermediate 48.
+            # Surfacing the true root (and its fix) is the ontology's precision
+            # win: fix the origin, not the downstream symptom. root_xids_for is
+            # newer than the validated functions, so a query error must NOT wipe
+            # the fixes above: _root_chain_for isolates per-hop failures.
+            roots = _root_chain_for(run, code)
             if roots:
                 out.root_xids[code] = roots
                 for root in roots:
@@ -237,6 +237,49 @@ def _query_remediation(
             if xids:
                 out.model_xids[gpu_model] = xids
     return out
+
+
+# Cap the causal walk so a mis-loaded cyclic edge can never spin forever and the
+# root list stays operator-legible. Real XID chains are short (<= a few hops).
+_MAX_CHAIN_NODES = 16
+_MAX_CHAIN_DEPTH = 6
+
+
+def _root_chain_for(run: Any, code: int) -> list[int]:
+    """Transitive ancestors of `code` along leads_to, nearest hop first.
+
+    Repeatedly applies the validated one-hop `root_xids_for` backward from the
+    observed code, accumulating every fault that (directly or indirectly)
+    escalates into it. Cycle-safe (visited set) and bounded (`_MAX_CHAIN_*`).
+    Best-effort: a failed hop is skipped, never fatal.
+    """
+    ordered: list[int] = []
+    seen: set[int] = {code}
+    frontier: list[int] = [code]
+    depth = 0
+    while frontier and depth < _MAX_CHAIN_DEPTH and len(ordered) < _MAX_CHAIN_NODES:
+        depth += 1
+        nxt: list[int] = []
+        for cur in frontier:
+            try:
+                rows = run(_FN_ROOT_XIDS_FOR.format(code=cur))
+            except Exception:  # noqa: BLE001 - best-effort drill-down, never fatal
+                continue
+            for value in _values(rows):
+                if not _is_int(value):
+                    continue
+                root = int(value)
+                if root in seen:
+                    continue
+                seen.add(root)
+                ordered.append(root)
+                nxt.append(root)
+                if len(ordered) >= _MAX_CHAIN_NODES:
+                    break
+            if len(ordered) >= _MAX_CHAIN_NODES:
+                break
+        frontier = nxt
+    return ordered
 
 
 def _statements(rows: list[dict[str, Any]]) -> list[str]:
