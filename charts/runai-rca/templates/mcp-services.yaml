@@ -373,6 +373,12 @@ rules:
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses"]
     verbs: ["get", "list", "watch"]
+  # Run:ai CRDs (projects/queues/podgroups/workloads/...) — the agent reads
+  # them MCP-first, so the MCP server needs the same read-only access or every
+  # CRD query would 403 here and silently demote to the direct API.
+  - apiGroups: ["run.ai", "scheduling.run.ai"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -419,6 +425,12 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["batch"]
     resources: ["cronjobs", "jobs"]
+    verbs: ["get", "list", "watch"]
+  # Run:ai CRDs (projects/queues/podgroups/workloads/...) — the agent reads
+  # them MCP-first, so the MCP server needs the same read-only access or every
+  # CRD query would 403 here and silently demote to the direct API.
+  - apiGroups: ["run.ai", "scheduling.run.ai"]
+    resources: ["*"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
