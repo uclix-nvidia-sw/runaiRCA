@@ -18,6 +18,7 @@ import pytest
 from app.collectors.base import CollectorResult, artifact
 from app.collectors.kubernetes import (
     _collect_kubernetes_responses_via_mcp,
+    _k8s_yaml_payload,
     _target_pod_missing,
     k8s_read,
 )
@@ -213,6 +214,58 @@ async def test_mcp_sweep_raises_only_when_everything_fails(monkeypatch) -> None:
         await _collect_kubernetes_responses_via_mcp(
             settings=settings, target=_toolkit_target(), control_plane_in_scope=True
         )
+
+
+def test_k8s_yaml_payload_parses_yaml_and_rejects_tables() -> None:
+    # kubernetes-mcp-server speaks YAML (the 2026-07-08 run demoted EVERY query
+    # to the direct API with "MCP result was not JSON").
+    pod = _k8s_yaml_payload("metadata:\n  name: x\nspec:\n  nodeName: dgx01\n")
+    assert isinstance(pod, dict) and pod["spec"]["nodeName"] == "dgx01"
+    with pytest.raises(RuntimeError):
+        _k8s_yaml_payload("NAME   READY   STATUS\nfoo    1/1     Running")
+
+
+@pytest.mark.asyncio
+async def test_k8s_read_uses_mcp_yaml_reply_without_fallback(monkeypatch) -> None:
+    from app.collectors import kubernetes as k8s
+
+    async def fake_mcp_call(url, tool, arguments):
+        return _McpResult(
+            text=(
+                "metadata:\n  name: runai-container-toolkit-vttmr\n"
+                "spec:\n  nodeName: dgx01\nstatus:\n  phase: Running\n"
+            )
+        )
+
+    async def direct_should_not_run(**kwargs):
+        raise AssertionError("direct API fallback should not run for a YAML MCP reply")
+
+    monkeypatch.setattr(k8s, "mcp_call", fake_mcp_call)
+    monkeypatch.setattr(k8s, "get_json", direct_should_not_run)
+    settings = replace(make_settings(), kubernetes_mcp_url="http://mcp:9903/mcp")
+    result = await k8s_read(settings, "pods", namespace="runai", name="runai-container-toolkit-vttmr")
+    assert result["error"] is None
+    assert "#read_pods" in result["url"]
+    assert result["data"]["spec"]["nodeName"] == "dgx01"
+
+
+@pytest.mark.asyncio
+async def test_grafana_datasource_uid_rejects_ids_and_names(monkeypatch) -> None:
+    # Passing a numeric row id / display name as datasourceUid made grafana-mcp
+    # fail every query with 400 "id is invalid" -> whole collector fell back.
+    from app.collectors import prometheus as prom
+
+    async def fake_call(url, tool, args_list):
+        return [{"type": "prometheus", "name": "Prometheus (default)", "id": 1}]
+
+    monkeypatch.setattr(prom, "_call_mcp_json", fake_call)
+    assert await prom._grafana_datasource_uid("http://mcp", "prometheus") == ""
+
+    async def fake_call_uid(url, tool, args_list):
+        return [{"type": "prometheus", "name": "Prometheus", "uid": "prom-main_1"}]
+
+    monkeypatch.setattr(prom, "_call_mcp_json", fake_call_uid)
+    assert await prom._grafana_datasource_uid("http://mcp", "prometheus") == "prom-main_1"
 
 
 @pytest.mark.asyncio

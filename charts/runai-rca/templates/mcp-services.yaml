@@ -294,6 +294,9 @@ spec:
             - --disable-multi-cluster
             - --stateless
             - --toolsets=core
+            # Default "table" output is human text the agent cannot parse; the
+            # agent expects YAML/JSON from list tools (get tools are YAML already).
+            - --list-output=yaml
             {{- end }}
           ports:
             - name: mcp

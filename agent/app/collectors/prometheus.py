@@ -346,6 +346,13 @@ async def _mcp_query_prometheus(
     }
 
 
+# Grafana datasource uids are ^[a-zA-Z0-9\-_]{1,40}$; a numeric row id or a
+# display name ("Prometheus (default)") passed as datasourceUid makes grafana-mcp
+# fail EVERY query with 400 "id is invalid" — which demoted the whole collector
+# to the direct HTTP fallback.
+_GRAFANA_UID = re.compile(r"^[a-zA-Z0-9\-_]{1,40}$")
+
+
 async def _grafana_datasource_uid(url: str, datasource_type: str) -> str:
     try:
         data = await _call_mcp_json(url, "list_datasources", [{}])
@@ -355,8 +362,9 @@ async def _grafana_datasource_uid(url: str, datasource_type: str) -> str:
         dtype = str(datasource.get("type") or "").lower()
         name = str(datasource.get("name") or "").lower()
         if datasource_type in dtype or datasource_type in name:
-            uid = datasource.get("uid") or datasource.get("id") or datasource.get("name")
-            return str(uid) if uid else ""
+            uid = str(datasource.get("uid") or "")
+            if _GRAFANA_UID.match(uid):
+                return uid
     return ""
 
 

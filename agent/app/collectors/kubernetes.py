@@ -6,6 +6,8 @@ import shlex
 from pathlib import Path
 from urllib.parse import quote
 
+import yaml
+
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
@@ -873,8 +875,28 @@ async def _k8s_mcp_json(
     result = await _k8s_mcp_result(settings, candidates)
     data = mcp_tool_json(result)
     if isinstance(data, dict) and "raw" in data:
-        raise RuntimeError("MCP result was not JSON")
+        # kubernetes-mcp-server answers in YAML, not JSON (get ops always; list
+        # ops with --list-output=yaml — the chart sets it). Rejecting non-JSON
+        # here demoted EVERY query to the direct API ("MCP result was not
+        # JSON"). Parse the FULL text — the "raw" preview is truncated.
+        return _k8s_yaml_payload(mcp_tool_text(result))
     return data
+
+
+def _k8s_yaml_payload(text: str) -> object:
+    """A dict/list from a YAML (or JSON) MCP tool reply; raises on table/plain text."""
+    try:
+        parsed = yaml.safe_load(text or "")
+    except yaml.YAMLError:
+        try:
+            docs = [doc for doc in yaml.safe_load_all(text or "") if doc is not None]
+        except yaml.YAMLError as exc:
+            raise RuntimeError(f"MCP result was not JSON or YAML: {exc}") from exc
+        parsed = docs[0] if len(docs) == 1 else {"items": docs}
+    if isinstance(parsed, (dict, list)):
+        return parsed
+    # A bare string means table/plain-text output — not machine-readable.
+    raise RuntimeError("MCP result was not JSON or YAML (set --list-output=yaml)")
 
 
 async def _k8s_mcp_result(

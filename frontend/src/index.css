@@ -2028,7 +2028,6 @@ td span.occurrence-pill {
 }
 
 .rca-report,
-.progress-timeline,
 .agent-trail,
 .diagnostics,
 .similar-panel,
@@ -2036,6 +2035,13 @@ td span.occurrence-pill {
 .feedback-panel {
   border-top: 1px solid var(--line);
   padding-top: 1rem;
+  margin-top: 1rem;
+}
+
+/* The timeline is a bordered CARD, not a plain section: the shared separator
+   rule above gave it a second top border and 1rem of dead interior space, so
+   the collapsed "Thought Process" bar rendered abnormally tall. */
+.progress-timeline {
   margin-top: 1rem;
 }
 
@@ -3249,6 +3255,23 @@ code .evidence-mark {
 
 .chat-message.pending {
   color: var(--muted);
+}
+
+/* PromQL / API paths are long unbroken tokens; without wrapping they clip at
+   the bubble edge mid-query. */
+.chat-message code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.chat-message pre {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.chat-message.assistant {
+  overflow-wrap: anywhere;
 }
 
 .chat-message p:last-child {
