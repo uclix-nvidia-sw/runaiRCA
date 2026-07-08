@@ -65,10 +65,27 @@ rules:
       - cronjobs
       - jobs
     verbs: ["get", "list", "watch"]
-  # Run:ai CRDs (projects/queues/podgroups/workloads/...) — kubectl parity for
-  # the scheduler RCA path (k8s_read allowlist); read-only.
-  - apiGroups: ["run.ai", "scheduling.run.ai"]
-    resources: ["*"]
+  # Run:ai CRDs — exactly the k8s_read allowlist (_RUNAI_CRD_KINDS), read-only;
+  # kubectl parity for the scheduler RCA path. Kept least-privilege on purpose
+  # (no accessrules/applications/policies).
+  - apiGroups: ["run.ai"]
+    resources:
+      - distributedworkloads
+      - externalworkloads
+      - inferenceworkloads
+      - interactiveworkloads
+      - nodepools
+      - projects
+      - runaiconfigs
+      - runaijobs
+      - trainingworkloads
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["scheduling.run.ai"]
+    resources:
+      - bindrequests
+      - departments
+      - podgroups
+      - queues
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -133,10 +150,27 @@ rules:
       - cronjobs
       - jobs
     verbs: ["get", "list", "watch"]
-  # Run:ai CRDs (projects/queues/podgroups/workloads/...) — kubectl parity for
-  # the scheduler RCA path (k8s_read allowlist); read-only.
-  - apiGroups: ["run.ai", "scheduling.run.ai"]
-    resources: ["*"]
+  # Run:ai CRDs — exactly the k8s_read allowlist (_RUNAI_CRD_KINDS), read-only;
+  # kubectl parity for the scheduler RCA path. Kept least-privilege on purpose
+  # (no accessrules/applications/policies).
+  - apiGroups: ["run.ai"]
+    resources:
+      - distributedworkloads
+      - externalworkloads
+      - inferenceworkloads
+      - interactiveworkloads
+      - nodepools
+      - projects
+      - runaiconfigs
+      - runaijobs
+      - trainingworkloads
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["scheduling.run.ai"]
+    resources:
+      - bindrequests
+      - departments
+      - podgroups
+      - queues
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

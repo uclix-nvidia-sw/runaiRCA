@@ -152,3 +152,32 @@ def test_kubernetes_mcp_rbac_is_read_only_and_excludes_sensitive_subresources() 
     assert "verbs: [\"delete\"" not in text
     assert "verbs: [\"get\", \"list\", \"watch\"]" in text
     assert "resources: [\"pods/log\"]" in text
+
+
+def test_runai_crd_rbac_matches_the_k8s_read_allowlist_exactly() -> None:
+    # Least privilege that stays in sync: the chart must grant read access to
+    # EXACTLY the Run:ai CRDs k8s_read can query — no wildcard (accessrules/
+    # applications/policies stay out), and no kind the code can read but RBAC
+    # would 403 (which silently demotes the read to the direct API).
+    from app.collectors.kubernetes import _RUNAI_CRD_KINDS
+
+    expected_by_group: dict[str, set[str]] = {}
+    for kind, (group, _kind_name, _namespaced) in _RUNAI_CRD_KINDS.items():
+        expected_by_group.setdefault(group, set()).add(kind)
+
+    agent_template = AGENT_TEMPLATE.parent / "agent-rbac.yaml"
+    for template in (agent_template, MCP_TEMPLATE):
+        text = template.read_text(encoding="utf-8")
+        assert '- apiGroups: ["run.ai", "scheduling.run.ai"]' not in text, template.name
+        for group, kinds in expected_by_group.items():
+            # Each role variant (cluster-wide + namespaced) carries the group rule.
+            blocks = text.split(f'- apiGroups: ["{group}"]')[1:]
+            assert len(blocks) == 2, (template.name, group, len(blocks))
+            for block in blocks:
+                resources_block = block.split("verbs:")[0]
+                granted = {
+                    line.strip().removeprefix("- ")
+                    for line in resources_block.splitlines()
+                    if line.strip().startswith("- ")
+                }
+                assert granted == kinds, (template.name, group, granted ^ kinds)
