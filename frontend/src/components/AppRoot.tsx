@@ -179,9 +179,24 @@ function queryDisplayItems(result: unknown): QueryDisplayItem[] {
       const name = stringValue(query.name) || `query_${index + 1}`;
       const statusCode = numberValue(query.status_code);
       const error = stringValue(query.error);
-      const status = error ? 'failed' : stringValue(query.status) || (statusCode ? String(statusCode) : 'ok');
-      const queryText = stringValue(query.query) || stringValue(query.path) || stringValue(query.url) || '';
+      const rawStatus = stringValue(query.status);
+      // Collectors that pre-extract the salient content (e.g. Loki's flat
+      // sample_lines: the actual log text) win over the nested sample/data,
+      // which compactArtifactValue would otherwise crush to "[N item(s)]".
+      const sampleLines = Array.isArray(query.sample_lines) ? (query.sample_lines as unknown[]) : undefined;
       const previewSource = query.sample !== undefined ? query.sample : query.data;
+      // A query failed if the transport 4xx/5xx'd OR the response BODY reports an
+      // error. MCP builders stamp a fixed status_code:200/error:None and hide the
+      // real failure in the body — runai as a numeric {status:404,…}, Prometheus/
+      // Loki as a "error" status. Any of these must render red, not a green pill.
+      const bodyStatus = isPlainObject(previewSource) ? numberValue(previewSource.status) : undefined;
+      const failed =
+        Boolean(error) ||
+        (statusCode !== undefined && statusCode >= 400) ||
+        (bodyStatus !== undefined && bodyStatus >= 400) ||
+        rawStatus === 'error';
+      const status = failed ? 'failed' : rawStatus || (statusCode ? String(statusCode) : 'ok');
+      const queryText = stringValue(query.query) || stringValue(query.path) || stringValue(query.url) || '';
       const facts = [
         statusCode ? `HTTP ${statusCode}` : '',
         numberValue(query.stream_count) !== undefined ? `${numberValue(query.stream_count)} stream(s)` : '',
@@ -197,7 +212,7 @@ function queryDisplayItems(result: unknown): QueryDisplayItem[] {
         statusCode,
         error,
         facts,
-        preview: previewSource === undefined ? undefined : compactArtifactValue(previewSource),
+        preview: sampleLines ?? (previewSource === undefined ? undefined : compactArtifactValue(previewSource)),
       };
     });
 }
@@ -212,6 +227,16 @@ function numberValue(value: unknown) {
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+// Empty results ([], {}, "") are noise — collectors that ran and found nothing
+// still show their status/facts, just not a barren "Relevant result: []".
+function isEmptyResult(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  if (Array.isArray(value)) return value.length === 0;
+  if (isPlainObject(value)) return Object.keys(value).length === 0;
+  if (typeof value === 'string') return value.trim() === '';
+  return false;
 }
 
 function humanizeKey(value: string) {
@@ -558,7 +583,15 @@ function App() {
     onAnalysisCreated: () => load({ silent: true }),
   });
 
+  // Refresh the open detail ONLY when a genuinely new realtime event arrives.
+  // refreshDetail() calls setDetail(), which changes `detail`, which recreates
+  // refreshDetail (its dep) — so keying this effect on those would re-fire it on
+  // its own output while `realtimePayload` kept matching, hammering the detail
+  // endpoint ~1×/sec forever. Gate on the payload identity to break that loop.
+  const lastRealtimePayloadRef = useRef<RealtimeEventPayload | undefined>(undefined);
   useEffect(() => {
+    if (!realtimePayload || realtimePayload === lastRealtimePayloadRef.current) return;
+    lastRealtimePayloadRef.current = realtimePayload;
     if (realtimeEventMatchesDetail(detail, realtimePayload)) {
       void refreshDetail();
     }
@@ -795,6 +828,9 @@ function UnifiedWorkspace({
           <div className="meta-line">
             <span className="entity-id">{id}</span>
             <span>{targetLine(labels)}</span>
+          </div>
+          <div className="meta-line">
+            <span>Severity</span>
             <Severity value={detail.data.severity} />
             <span>Incident status</span>
             <Status value={detail.data.status} analyzing={detail.data.is_analyzing} />
@@ -909,7 +945,7 @@ function UnifiedWorkspace({
         {incident ? (
           <SimilarIncidentsPanel items={similarIncidents} recentCount={incident.similar_recent_count ?? 0} />
         ) : (
-          alert && <RelatedIncidentPanel alert={alert} onOpenIncident={onOpenIncident} />
+          alert && <RelatedIncidentPanel alert={alert} />
         )}
 
         <section className="rca-report">
@@ -1071,13 +1107,7 @@ function AffectedPods({ pods }: { pods: string[] }) {
   );
 }
 
-function RelatedIncidentPanel({
-  alert,
-  onOpenIncident,
-}: {
-  alert: AlertRecord;
-  onOpenIncident: (id: string) => Promise<void>;
-}) {
+function RelatedIncidentPanel({ alert }: { alert: AlertRecord }) {
   return (
     <section className="related-panel">
       <div className="section-title"><Link size={18} /> Related Incident</div>
@@ -1092,9 +1122,6 @@ function RelatedIncidentPanel({
           </div>
           <p>{alert.analysis_summary || 'This alert is grouped into the incident RCA workspace.'}</p>
         </div>
-        <button className="ghost-button" onClick={() => void onOpenIncident(alert.incident_id)} type="button">
-          <ArrowLeft size={16} /> Open incident dashboard
-        </button>
       </article>
     </section>
   );
@@ -1288,7 +1315,7 @@ function ArtifactResult({ artifact }: { artifact: Artifact }) {
           ) : (
             <>
               {artifact.query && <CopyableBlock title="Query" value={artifact.query} kind="code" />}
-              {artifact.result !== undefined && (
+              {artifact.result !== undefined && !isEmptyResult(artifact.result) && (
                 <CopyableBlock
                   title="Result summary"
                   value={resultText}
@@ -1305,9 +1332,14 @@ function ArtifactResult({ artifact }: { artifact: Artifact }) {
 }
 
 function QueryResultList({ items, highlights }: { items: QueryDisplayItem[]; highlights?: string[] }) {
+  // A query that came back empty ([]/{}/blank) is noise — drop the whole card, not
+  // just its result block, and don't flag it red. Its failure (if any) still shows
+  // in the Warnings panel.
+  const visible = items.filter((item) => !isEmptyResult(item.preview));
+  if (visible.length === 0) return null;
   return (
     <div className="query-result-list">
-      {items.map((item) => (
+      {visible.map((item) => (
         <QueryResultCard item={item} key={item.id} highlights={highlights} />
       ))}
     </div>
@@ -1322,7 +1354,7 @@ function QueryResultCard({ item, highlights }: { item: QueryDisplayItem; highlig
       <button className="query-result-toggle" onClick={() => setOpen((value) => !value)} type="button">
         <div className="query-result-head">
           <strong>{item.name}</strong>
-          <span className={item.error ? 'query-status query-status-error' : 'query-status'}>{item.status}</span>
+          <span className={item.status === 'failed' ? 'query-status query-status-error' : 'query-status'}>{item.status}</span>
         </div>
         <ChevronDown size={16} />
       </button>
@@ -1336,7 +1368,7 @@ function QueryResultCard({ item, highlights }: { item: QueryDisplayItem; highlig
       {open && (
         <>
           {item.queryText && <CopyableBlock title={item.queryLabel} value={item.queryText} kind="code" />}
-          {item.preview !== undefined && (
+          {item.preview !== undefined && !isEmptyResult(item.preview) && (
             <CopyableBlock title="Relevant result" value={previewText} kind="pre" highlights={highlights} />
           )}
         </>
