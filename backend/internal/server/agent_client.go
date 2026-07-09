@@ -40,6 +40,10 @@ type AgentAnalysisResponse struct {
 	Capabilities    map[string]string `json:"capabilities"`
 	Context         map[string]any    `json:"context"`
 	Artifacts       []Artifact        `json:"artifacts"`
+	// AffectedPods are the concrete workload pod names the agent discovered for
+	// the alert subject (empty for unscoped alerts). Used to replace the
+	// kube-state-metrics exporter pod named in the raw alert payload.
+	AffectedPods []string `json:"affected_pods,omitempty"`
 }
 
 // agentErrorKind classifies why an agent call failed so callers can attach a

@@ -337,11 +337,21 @@ func (s *Store) ApplyAnalysisForRun(runID string, alertID string, response Agent
 	if alert == nil || !s.isLatestAnalysisRunForAlertLocked(runID, alertID) {
 		return false
 	}
-	// The RCA itself lives on the analysis run (CompleteAnalysisRun); here we only
-	// clear the analyzing flag and refresh the incident's aggregate state. The
-	// `response` is retained on the run, not duplicated onto the alert.
+	// The RCA itself lives on the analysis run (CompleteAnalysisRun); here we
+	// clear the analyzing flag, apply the agent-discovered affected pods, and
+	// refresh the incident's aggregate state. The `response` is otherwise
+	// retained on the run, not duplicated onto the alert.
 	before := cloneAlert(alert)
 	alert.IsAnalyzing = false
+	// Fold the real workload pods the agent discovered for the alert subject into
+	// the occurrence list (dedup + cap). Because ingestion no longer seeds the
+	// kube-state-metrics exporter for workload-kind alerts, the KSM case starts
+	// empty and ends up holding only the real pods; direct pod alerts keep their
+	// cross-firing history and simply re-affirm the current pod. Empty means the
+	// investigation was unscoped, so nothing changes.
+	for _, pod := range response.AffectedPods {
+		alert.OccurrencePods = appendOccurrencePod(alert.OccurrencePods, pod)
+	}
 	if !s.persistAlertLocked(alert) {
 		*alert = *before
 		alert.IsAnalyzing = false

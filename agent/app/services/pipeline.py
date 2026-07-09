@@ -334,6 +334,50 @@ def _component_identity(
     return family, component, chain
 
 
+def _affected_pods_from_results(results: list[CollectorResult]) -> list[str]:
+    """Concrete pod names the kubernetes collector discovered for the alert subject.
+
+    Alerts routed through kube-state-metrics name the KSM EXPORTER pod, not the
+    workload that actually broke. When the investigation was scoped to a concrete
+    subject (a named pod, or a workload whose pods we listed), the kubernetes
+    collector already fetched the real pods into ``details["pod_statuses"]`` — each
+    entry carries a top-level ``name``. Surface those so the dashboard can show the
+    impacted pods. Returns ``[]`` for unscoped (namespace/node-only) investigations,
+    where a pod listing would not represent "affected" pods.
+    """
+    for result in results:
+        if getattr(result, "agent", "") != "kubernetes":
+            continue
+        details = result.details if isinstance(result.details, dict) else None
+        if not details:
+            return []
+        scoped = bool(
+            str(details.get("workload_name") or "").strip()
+            or str(details.get("pod") or "").strip()
+        )
+        if not scoped:
+            return []
+        statuses = details.get("pod_statuses")
+        if not isinstance(statuses, list):
+            return []
+        names: list[str] = []
+        seen: set[str] = set()
+        for entry in statuses:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            if not isinstance(name, str):
+                meta = entry.get("metadata")
+                name = meta.get("name") if isinstance(meta, dict) else None
+            if isinstance(name, str):
+                cleaned = name.strip()
+                if cleaned and cleaned not in seen:
+                    seen.add(cleaned)
+                    names.append(cleaned)
+        return names[:25]
+    return []
+
+
 def _lifecycle_signal(
     results: list[CollectorResult], component: str, chain: list[str]
 ) -> dict[str, object]:
@@ -670,6 +714,8 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             body = "\n".join(f"- {question}" for question in questions)
             state.detail = _insert_before_appendix(state.detail, f"{header}\n\n{body}")
 
+    affected_pods = _affected_pods_from_results(state.results)
+
     state.response = AlertAnalysisResponse(
         status="ok",
         thread_ts=request.thread_ts,
@@ -684,11 +730,13 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         missing_data=state.missing,
         warnings=state.warnings,
         capabilities=state.capabilities,
+        affected_pods=affected_pods,
         context={
             "target": state.target.__dict__,
             "nemo_runtime": "enabled" if state.runtime_label == "enabled" else "fallback",
             "occurrence_count": request.occurrence_count,
             "occurrence_pods": request.occurrence_pods,
+            "affected_pods": affected_pods,
             "similar_incidents": [
                 item.model_dump(mode="json") for item in request.similar_incidents
             ],
