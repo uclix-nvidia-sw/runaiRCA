@@ -1431,14 +1431,11 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 		existing.Source = source
 		existing.Title = run.Title
 		existing.Prompt = run.Prompt
-		existing.AnalysisSummary = ""
-		existing.AnalysisDetail = ""
-		existing.AnalysisQuality = ""
-		existing.RootCauseFamily = ""
-		existing.Capabilities = map[string]string{}
-		existing.MissingData = []string{}
-		existing.Warnings = []string{}
-		existing.Artifacts = []Artifact{}
+		// Keep the last-good RCA content on the run while the re-analysis is in
+		// progress (so the incident keeps showing it) and preserved if this attempt
+		// fails; only a new SUCCESS (CompleteAnalysisRun) replaces it. This makes the
+		// run the durable RCA store, so the alert analysis columns are redundant.
+		// Only the per-attempt metadata (llm_usage, progress_log) is reset.
 		existing.Metadata = nil
 		// This IS a new analysis occupying the old row, so it must also become the
 		// NEWEST run: isLatestAnalysisRunForAlert compares CreatedAt, and with the
@@ -1582,17 +1579,19 @@ func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (A
 	}
 	before := cloneAnalysisRun(run)
 	run.Status = "failed"
-	run.AnalysisSummary = response.AnalysisSummary
-	run.AnalysisDetail = response.AnalysisDetail
-	if run.AnalysisDetail == "" {
-		run.AnalysisDetail = response.Analysis
+	// Preserve a prior successful RCA on this (reused) run — a failed re-analysis
+	// must not clobber the last-good result. Surface the fallback only when there is
+	// nothing to keep (the first analysis failed).
+	if strings.TrimSpace(run.AnalysisSummary) == "" && strings.TrimSpace(run.AnalysisDetail) == "" {
+		run.AnalysisSummary = response.AnalysisSummary
+		run.AnalysisDetail = first(response.AnalysisDetail, response.Analysis)
+		run.AnalysisQuality = first(response.AnalysisQuality, "low")
+		run.RootCauseFamily = response.RootCauseFamily
+		run.Capabilities = response.Capabilities
+		run.MissingData = response.MissingData
+		run.Warnings = response.Warnings
+		run.Artifacts = response.Artifacts
 	}
-	run.AnalysisQuality = first(response.AnalysisQuality, "low")
-	run.RootCauseFamily = response.RootCauseFamily
-	run.Capabilities = response.Capabilities
-	run.MissingData = response.MissingData
-	run.Warnings = response.Warnings
-	run.Artifacts = response.Artifacts
 	run.Metadata = mergeAnalysisMetadata(run.Metadata, metadataFromAgentContext(response.Context))
 	run.UpdatedAt = time.Now().UTC()
 	if !s.persistAnalysisRunLocked(run) {

@@ -314,14 +314,11 @@ func (s *PostgresState) rowsFor(query string) driver.Rows {
 			columns: []string{
 				"alert_id", "incident_id", "alarm_title", "severity", "status", "fired_at",
 				"resolved_at", "fingerprint", "occurrence_count", "occurrence_pods", "thread_ts",
-				"labels", "annotations", "analysis_summary", "analysis_detail", "analysis_quality", "root_cause_family", "capabilities",
-				"missing_data", "warnings", "artifacts",
+				"labels", "annotations",
 			},
 			values: [][]driver.Value{{
 				"ALR-db", "INC-db", "RunAIWorkloadPending", "warning", "firing", s.now,
 				nil, "fp-db", int64(1), s.emptyArrayJSON, "thread-db", s.labelsJSON, s.annotationsJSON,
-				"Run:AI queue gpu-a was saturated.", "GPU quota blocked scheduling.", "high", "", s.capabilitiesJSON,
-				s.missingDataJSON, s.warningsJSON, s.artifactsJSON,
 			}},
 		}
 	case strings.Contains(lowered, "from incident_embeddings"):

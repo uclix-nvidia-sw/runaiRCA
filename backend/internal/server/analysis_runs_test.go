@@ -111,8 +111,8 @@ func TestAnalysisRunSuccessAppliesRCA(t *testing.T) {
 		t.Fatalf("run did not capture RCA: %+v", completed)
 	}
 	alert, _ := server.store.AlertDetail(record.AlertID)
-	if !strings.Contains(alert.AnalysisSummary, "saturated") || alert.IsAnalyzing {
-		t.Fatalf("successful run did not apply RCA to alert: %+v", alert)
+	if alert.IsAnalyzing {
+		t.Fatalf("successful run should clear the alert analyzing flag: %+v", alert)
 	}
 }
 
@@ -789,8 +789,8 @@ func TestAnalysisRunUpdatePersistFailureSkipsAlertRCA(t *testing.T) {
 		t.Fatalf("expected exactly one agent call, got %d", hit.Load())
 	}
 	alert, _ := store.AlertDetail(record.AlertID)
-	if alert.AnalysisSummary != "" || alert.AnalysisDetail != "" || !alert.IsAnalyzing {
-		t.Fatalf("alert RCA should not apply when run update persist fails: %+v", alert)
+	if !alert.IsAnalyzing {
+		t.Fatalf("alert should stay analyzing when the run update persist fails: %+v", alert)
 	}
 	after := waitForRunIDStatus(t, server, run.RunID, "analyzing")
 	if after.AnalysisSummary != "" {
@@ -798,7 +798,7 @@ func TestAnalysisRunUpdatePersistFailureSkipsAlertRCA(t *testing.T) {
 	}
 }
 
-func TestAlertRCAPersistFailureFailsRun(t *testing.T) {
+func TestAlertPersistFailureKeepsRCAOnRun(t *testing.T) {
 	state := testsupport.NewPostgresState(false)
 	store := NewStore()
 	store.connectDatabaseWithDriver(testsupport.RegisterPostgresDriver(state), "fake://runai_rca", time.Second)
@@ -831,12 +831,14 @@ func TestAlertRCAPersistFailureFailsRun(t *testing.T) {
 	server.startAnalysisRun("alert", record.AlertID, "manual", "")
 
 	run := waitForRunStatus(t, server, "manual", "failed")
-	if run.Capabilities["database"] != "alert_persist_failed" {
-		t.Fatalf("expected database persistence failure on run, got %+v", run)
+	// The RCA is durably stored on the run (CompleteAnalysisRun); an alert-flag
+	// persist failure marks the run failed but must NOT lose the analysis.
+	if !strings.Contains(run.AnalysisSummary, "RCA should not look successful") {
+		t.Fatalf("alert persist failure should preserve the run RCA, got %+v", run)
 	}
 	alert, _ := store.AlertDetail(record.AlertID)
-	if alert.AnalysisSummary != "" || alert.AnalysisDetail != "" || alert.IsAnalyzing {
-		t.Fatalf("failed alert RCA persist should not leave visible RCA/analyzing state: %+v", alert)
+	if alert.IsAnalyzing {
+		t.Fatalf("failed run should clear the alert analyzing state: %+v", alert)
 	}
 }
 
@@ -907,8 +909,12 @@ func TestManualAnalysisKeepsRCAAndSkipsAgentTimeout(t *testing.T) {
 	server.startAnalysisRun("alert", record.AlertID, "manual", "")
 
 	alert, _ := server.store.AlertDetail(record.AlertID)
-	if !strings.Contains(alert.AnalysisSummary, "Old RCA") || !alert.IsAnalyzing {
-		t.Fatalf("manual analysis should keep the last RCA visible while analyzing: %+v", alert)
+	if !alert.IsAnalyzing {
+		t.Fatalf("manual analysis should mark the alert analyzing: %+v", alert)
+	}
+	detail, _ := server.store.IncidentDetail(record.IncidentID)
+	if !strings.Contains(detail.AnalysisSummary, "Old RCA") {
+		t.Fatalf("manual analysis should keep the last RCA visible while analyzing: %q", detail.AnalysisSummary)
 	}
 	agentReq := <-agentReqCh
 	prompt := agentReq.Alert.Annotations["operator_prompt"]
@@ -939,11 +945,12 @@ func TestFailedManualRunPreservesExistingSuccessfulRCA(t *testing.T) {
 	waitForRunStatus(t, server, "manual", "failed")
 
 	alert, _ := server.store.AlertDetail(record.AlertID)
-	if !strings.Contains(alert.AnalysisSummary, "Trusted manual RCA") {
-		t.Fatalf("failed manual run overwrote a successful RCA: %+v", alert.AnalysisSummary)
+	if alert.IsAnalyzing {
+		t.Fatalf("failed manual run should clear the alert analyzing flag: %+v", alert)
 	}
-	if alert.AnalysisQuality != "high" || alert.IsAnalyzing {
-		t.Fatalf("alert state corrupted by failed manual run: quality=%s analyzing=%t", alert.AnalysisQuality, alert.IsAnalyzing)
+	detail, _ := server.store.IncidentDetail(record.IncidentID)
+	if !strings.Contains(detail.AnalysisSummary, "Trusted manual RCA") || detail.AnalysisQuality != "high" {
+		t.Fatalf("failed manual run overwrote the successful RCA: summary=%q quality=%s", detail.AnalysisSummary, detail.AnalysisQuality)
 	}
 }
 
@@ -1052,11 +1059,12 @@ func TestFailedRunPreservesExistingSuccessfulRCA(t *testing.T) {
 	waitForRunStatus(t, server, "comment", "failed")
 
 	alert, _ := server.store.AlertDetail(record.AlertID)
-	if !strings.Contains(alert.AnalysisSummary, "Trusted RCA") {
-		t.Fatalf("failed run overwrote a successful RCA: %+v", alert.AnalysisSummary)
+	if alert.IsAnalyzing {
+		t.Fatalf("failed run should clear the alert analyzing flag: %+v", alert)
 	}
-	if alert.AnalysisQuality != "high" || alert.IsAnalyzing {
-		t.Fatalf("alert state corrupted by failed run: quality=%s analyzing=%t", alert.AnalysisQuality, alert.IsAnalyzing)
+	detail, _ := server.store.IncidentDetail(record.IncidentID)
+	if !strings.Contains(detail.AnalysisSummary, "Trusted RCA") || detail.AnalysisQuality != "high" {
+		t.Fatalf("failed run overwrote a successful RCA: summary=%q quality=%s", detail.AnalysisSummary, detail.AnalysisQuality)
 	}
 }
 
@@ -1071,11 +1079,15 @@ func TestFailedRunWritesFallbackWhenNoPriorRCA(t *testing.T) {
 	waitForRunStatus(t, server, "auto", "failed")
 
 	alert, _ := server.store.AlertDetail(record.AlertID)
-	if alert.AnalysisQuality != "low" || alert.IsAnalyzing {
-		t.Fatalf("expected fallback RCA surfaced on alert, got %+v", alert)
+	if alert.IsAnalyzing {
+		t.Fatalf("failed run should clear the alert analyzing flag: %+v", alert)
 	}
-	if len(alert.MissingData) == 0 || alert.MissingData[0] != "agent.response" {
-		t.Fatalf("expected fallback missing_data, got %+v", alert.MissingData)
+	detail, _ := server.store.IncidentDetail(record.IncidentID)
+	if detail.AnalysisQuality != "low" {
+		t.Fatalf("expected fallback RCA surfaced on the incident, got quality=%s", detail.AnalysisQuality)
+	}
+	if len(detail.MissingData) == 0 || detail.MissingData[0] != "agent.response" {
+		t.Fatalf("expected fallback missing_data, got %+v", detail.MissingData)
 	}
 }
 
@@ -1148,9 +1160,9 @@ func TestAnalyzingRunRejectsDuplicateManualRun(t *testing.T) {
 	release()
 	waitForRunIDStatus(t, server, firstRun.RunID, "complete")
 
-	alert, _ := server.store.AlertDetail(record.AlertID)
-	if alert.AnalysisSummary != "Manual RCA complete." || alert.AnalysisQuality != "medium" {
-		t.Fatalf("first run result was not applied: %+v", alert)
+	detail, _ := server.store.IncidentDetail(record.IncidentID)
+	if detail.AnalysisSummary != "Manual RCA complete." || detail.AnalysisQuality != "medium" {
+		t.Fatalf("first run result was not applied: %+v", detail)
 	}
 	if hit.Load() != 1 {
 		t.Fatalf("expected exactly one agent call, got %d", hit.Load())
@@ -1223,8 +1235,12 @@ func TestAnalysisRunHugeAgentResponseFailsRun(t *testing.T) {
 		t.Fatalf("expected response_too_large failure, got %+v", run)
 	}
 	alert, _ := server.store.AlertDetail(record.AlertID)
-	if alert.IsAnalyzing || alert.AnalysisQuality != "low" {
-		t.Fatalf("huge response should clear analyzing with low-quality fallback, got %+v", alert)
+	if alert.IsAnalyzing {
+		t.Fatalf("huge response should clear the alert analyzing flag, got %+v", alert)
+	}
+	detail, _ := server.store.IncidentDetail(record.IncidentID)
+	if detail.AnalysisQuality != "low" {
+		t.Fatalf("huge response should surface a low-quality fallback, got quality=%s", detail.AnalysisQuality)
 	}
 }
 
@@ -1543,12 +1559,12 @@ func TestBackfillStartsRunForMissingAlert(t *testing.T) {
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if alert, ok := server.store.AlertDetail(record.AlertID); ok && alert.AnalysisSummary != "" {
+		if detail, ok := server.store.IncidentDetail(record.IncidentID); ok && detail.AnalysisSummary != "" {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("backfill run never applied an RCA to the alert")
+	t.Fatalf("backfill run never produced an RCA for the incident")
 }
 
 func TestChatContextAttachesMemoryAndFeedbackHints(t *testing.T) {

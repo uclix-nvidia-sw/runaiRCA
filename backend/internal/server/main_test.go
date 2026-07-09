@@ -979,13 +979,11 @@ func TestChatHistoryPersistsListsAndDeletes(t *testing.T) {
 
 func TestIncidentChatContextSummarizesAlerts(t *testing.T) {
 	alerts := []AlertRecord{{
-		AlertID:         "ALR-chat-context",
-		AlarmTitle:      "RunAIQueueBlocked",
-		Severity:        "warning",
-		Status:          "firing",
-		AnalysisSummary: "large RCA summary",
-		AnalysisDetail:  strings.Repeat("detail ", 100),
-		Labels:          map[string]string{"queue": "gpu-a"},
+		AlertID:    "ALR-chat-context",
+		AlarmTitle: "RunAIQueueBlocked",
+		Severity:   "warning",
+		Status:     "firing",
+		Labels:     map[string]string{"queue": "gpu-a"},
 	}}
 	for i := 0; i < dashboardChatRecentLimit+2; i++ {
 		alerts = append(alerts, AlertRecord{
@@ -1505,7 +1503,9 @@ func TestFeedbackAndSimilarIncidentMemory(t *testing.T) {
 	}
 }
 
-func TestIncidentMemoryKeepsMultipleAlertAnalyses(t *testing.T) {
+func TestIncidentMemoryIsOnePerIncidentFromLatestRun(t *testing.T) {
+	// Memory is one embedding per incident now (not one per alert), sourced from the
+	// incident's latest analysis run.
 	store := NewStore()
 	incident, first := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "multi-memory"}, Alert{
 		Status:      "firing",
@@ -1544,16 +1544,16 @@ func TestIncidentMemoryKeepsMultipleAlertAnalyses(t *testing.T) {
 		t.Fatalf("unresolved analysis should not create memory, got %+v", store.memories)
 	}
 	approveIncidentForTest(t, store, incident.IncidentID)
-	if len(store.memories) != 2 {
-		t.Fatalf("expected two alert memories, got %+v", store.memories)
+	if len(store.memories) != 1 {
+		t.Fatalf("expected exactly one incident memory, got %+v", store.memories)
 	}
-	firstMemory := store.memories[first.AlertID]
-	if firstMemory == nil || firstMemory.AnalysisSummary != "Queue saturation RCA." {
-		t.Fatalf("first alert memory was overwritten: %+v", firstMemory)
-	}
-	secondMemory := store.memories[secondID]
-	if secondMemory == nil || secondMemory.AnalysisSummary != "Quota exhaustion RCA." {
-		t.Fatalf("second alert memory missing: %+v", secondMemory)
+	for _, memory := range store.memories {
+		if memory.IncidentID != incident.IncidentID {
+			t.Fatalf("memory not keyed to the incident: %+v", memory)
+		}
+		if memory.AnalysisSummary != "Quota exhaustion RCA." {
+			t.Fatalf("incident memory should carry the latest run's RCA, got %q", memory.AnalysisSummary)
+		}
 	}
 }
 

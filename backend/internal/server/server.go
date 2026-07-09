@@ -171,14 +171,6 @@ type AlertRecord struct {
 	ThreadTS         string            `json:"thread_ts"`
 	Labels           map[string]string `json:"labels"`
 	Annotations      map[string]string `json:"annotations"`
-	AnalysisSummary  string            `json:"analysis_summary"`
-	AnalysisDetail   string            `json:"analysis_detail"`
-	AnalysisQuality  string            `json:"analysis_quality"`
-	RootCauseFamily  string            `json:"root_cause_family"`
-	Capabilities     map[string]string `json:"capabilities"`
-	MissingData      []string          `json:"missing_data"`
-	Warnings         []string          `json:"warnings"`
-	Artifacts        []Artifact        `json:"artifacts"`
 	SimilarIncidents []SimilarIncident `json:"similar_incidents"`
 	Feedback         FeedbackSummary   `json:"feedback"`
 	IsAnalyzing      bool              `json:"is_analyzing"`
@@ -880,10 +872,6 @@ func cloneAlert(in *AlertRecord) *AlertRecord {
 	out.Labels = cloneMap(in.Labels)
 	out.Annotations = cloneMap(in.Annotations)
 	out.OccurrencePods = cloneStrings(in.OccurrencePods)
-	out.Capabilities = cloneMap(in.Capabilities)
-	out.MissingData = cloneStrings(in.MissingData)
-	out.Warnings = cloneStrings(in.Warnings)
-	out.Artifacts = cloneArtifacts(in.Artifacts)
 	out.SimilarIncidents = cloneSimilar(in.SimilarIncidents)
 	out.Feedback = cloneFeedbackSummary(in.Feedback)
 	return &out

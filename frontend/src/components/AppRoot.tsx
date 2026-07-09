@@ -385,32 +385,33 @@ function App() {
   }, [alertFilters, dashboardAlerts, query]);
 
   const analysisRecords = useMemo(
-    () => buildAnalysisRecords(analysisAlerts, dashboardAnalysisRuns),
-    [analysisAlerts, dashboardAnalysisRuns],
+    () => buildAnalysisRecords(dashboardAnalysisRuns),
+    [dashboardAnalysisRuns],
   );
 
   const liveEvidenceItems = useMemo<EvidenceItem[]>(() => {
-    return alerts.flatMap((alert) =>
-      alert.artifacts
+    // Evidence artifacts live on the analysis runs now (not per-alert columns).
+    return dashboardAnalysisRuns.flatMap((run) =>
+      (run.artifacts ?? [])
         .filter((artifact) => isCollectorAgent(artifact.agent))
         .map((artifact, index) => ({
-          id: `${alert.alert_id}-${artifact.agent}-${artifact.type}-${index}`,
+          id: `${run.run_id}-${artifact.agent}-${artifact.type}-${index}`,
           title: artifact.summary || `${agentLabel(artifact.agent)} ${artifact.type}`,
           agent: artifact.agent,
           source: artifact.source,
           type: artifact.type,
           status: artifact.status || 'ok',
           confidence: artifact.confidence || 'medium',
-          target: targetLine(alert.labels),
+          target: `${run.target_type} / ${run.target_id}`,
           summary: artifact.summary || 'Evidence was collected without a summary.',
           query: artifact.query,
           result: artifact.result,
-          alertID: alert.alert_id,
-          incidentID: alert.incident_id,
-          createdAt: alert.fired_at,
+          alertID: run.alert_id,
+          incidentID: run.incident_id,
+          createdAt: run.created_at,
         })),
     );
-  }, [alerts]);
+  }, [dashboardAnalysisRuns]);
 
   const agentSummaries = useMemo<AgentSummary[]>(() => {
     return COMPONENT_AGENT_ORDER.map((agent) => {
@@ -789,13 +790,13 @@ function UnifiedWorkspace({
   const affectedPods = incident
     ? Array.from(new Set(incident.alerts.flatMap((item) => item.occurrence_pods ?? []))).filter(Boolean)
     : (alert?.occurrence_pods ?? []).filter(Boolean);
-  const artifacts = incident?.artifacts ?? alert?.artifacts ?? [];
-  const capabilities = incident?.capabilities ?? alert?.capabilities ?? {};
-  const missingData = incident?.missing_data ?? alert?.missing_data ?? [];
-  const warnings = incident?.warnings ?? alert?.warnings ?? [];
+  const artifacts = incident?.artifacts ?? [];
+  const capabilities = incident?.capabilities ?? {};
+  const missingData = incident?.missing_data ?? [];
+  const warnings = incident?.warnings ?? [];
   const tokenUsage = incident?.token_usage;
-  const analysis = incident?.analysis_detail ?? alert?.analysis_detail;
-  const summary = incident?.analysis_summary ?? alert?.analysis_summary;
+  const analysis = incident?.analysis_detail;
+  const summary = incident?.analysis_summary;
   const isAnalyzing = Boolean(detail.data.is_analyzing);
   const similarIncidents = incident?.similar_incidents ?? [];
   const feedback = incident?.feedback ?? alert?.feedback;

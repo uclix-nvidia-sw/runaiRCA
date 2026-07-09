@@ -199,19 +199,15 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			thread_ts TEXT NOT NULL,
 			labels JSONB NOT NULL DEFAULT '{}'::jsonb,
 			annotations JSONB NOT NULL DEFAULT '{}'::jsonb,
-			analysis_summary TEXT NOT NULL DEFAULT '',
-			analysis_detail TEXT NOT NULL DEFAULT '',
-			analysis_quality TEXT NOT NULL DEFAULT '',
-			root_cause_family TEXT NOT NULL DEFAULT '',
-			capabilities JSONB NOT NULL DEFAULT '{}'::jsonb,
-			missing_data JSONB NOT NULL DEFAULT '[]'::jsonb,
-			warnings JSONB NOT NULL DEFAULT '[]'::jsonb,
-			artifacts JSONB NOT NULL DEFAULT '[]'::jsonb,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		// Per-alert RCA columns (analysis_summary/detail/quality/root_cause_family/
+		// capabilities/missing_data/warnings/artifacts) are NO LONGER used — the RCA
+		// lives on analysis_runs. They are intentionally not (re)created here; drop
+		// them from existing DBs manually. No ADD COLUMN for them (that would undo the
+		// manual DROP on the next startup).
 		`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS occurrence_count INTEGER NOT NULL DEFAULT 1`,
 		`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS occurrence_pods JSONB NOT NULL DEFAULT '[]'::jsonb`,
-		`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS root_cause_family TEXT NOT NULL DEFAULT ''`,
 		`CREATE TABLE IF NOT EXISTS incident_embeddings (
 			incident_id TEXT NOT NULL,
 			alert_id TEXT NOT NULL,
@@ -444,9 +440,7 @@ func (s *Store) loadAlerts(ctx context.Context) {
 	rows, err := s.db.QueryContext(
 		ctx,
 		`SELECT alert_id, incident_id, alarm_title, severity, status, fired_at,
-		        resolved_at, fingerprint, occurrence_count, occurrence_pods, thread_ts, labels, annotations,
-		        analysis_summary, analysis_detail, analysis_quality, root_cause_family, capabilities,
-		        missing_data, warnings, artifacts
+		        resolved_at, fingerprint, occurrence_count, occurrence_pods, thread_ts, labels, annotations
 		   FROM alerts`,
 	)
 	if err != nil {
@@ -458,7 +452,7 @@ func (s *Store) loadAlerts(ctx context.Context) {
 	defer s.mu.Unlock()
 	for rows.Next() {
 		var alert AlertRecord
-		var labelsRaw, annotationsRaw, capabilitiesRaw, missingRaw, warningsRaw, artifactsRaw []byte
+		var labelsRaw, annotationsRaw []byte
 		var occurrencePodsRaw []byte
 		if err := rows.Scan(
 			&alert.AlertID,
@@ -474,14 +468,6 @@ func (s *Store) loadAlerts(ctx context.Context) {
 			&alert.ThreadTS,
 			&labelsRaw,
 			&annotationsRaw,
-			&alert.AnalysisSummary,
-			&alert.AnalysisDetail,
-			&alert.AnalysisQuality,
-			&alert.RootCauseFamily,
-			&capabilitiesRaw,
-			&missingRaw,
-			&warningsRaw,
-			&artifactsRaw,
 		); err != nil {
 			log.Printf("Failed to scan alert: %v", err)
 			continue
@@ -489,10 +475,6 @@ func (s *Store) loadAlerts(ctx context.Context) {
 		_ = json.Unmarshal(labelsRaw, &alert.Labels)
 		_ = json.Unmarshal(annotationsRaw, &alert.Annotations)
 		_ = json.Unmarshal(occurrencePodsRaw, &alert.OccurrencePods)
-		_ = json.Unmarshal(capabilitiesRaw, &alert.Capabilities)
-		_ = json.Unmarshal(missingRaw, &alert.MissingData)
-		_ = json.Unmarshal(warningsRaw, &alert.Warnings)
-		_ = json.Unmarshal(artifactsRaw, &alert.Artifacts)
 		if alert.OccurrenceCount <= 0 {
 			alert.OccurrenceCount = 1
 		}
@@ -904,12 +886,9 @@ func (s *Store) persistAlertLocked(alert *AlertRecord) bool {
 	_, err := s.execPostgres(
 		`INSERT INTO alerts (
 			alert_id, incident_id, alarm_title, severity, status, fired_at,
-			resolved_at, fingerprint, occurrence_count, occurrence_pods, thread_ts, labels, annotations,
-			analysis_summary, analysis_detail, analysis_quality, capabilities,
-			missing_data, warnings, artifacts, root_cause_family, updated_at
+			resolved_at, fingerprint, occurrence_count, occurrence_pods, thread_ts, labels, annotations, updated_at
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-			$16, $17, $18, $19, $20, $21, now()
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now()
 		)
 		ON CONFLICT (alert_id) DO UPDATE SET
 			incident_id = EXCLUDED.incident_id,
@@ -924,14 +903,6 @@ func (s *Store) persistAlertLocked(alert *AlertRecord) bool {
 			thread_ts = EXCLUDED.thread_ts,
 			labels = EXCLUDED.labels,
 			annotations = EXCLUDED.annotations,
-			analysis_summary = EXCLUDED.analysis_summary,
-			analysis_detail = EXCLUDED.analysis_detail,
-			analysis_quality = EXCLUDED.analysis_quality,
-			root_cause_family = EXCLUDED.root_cause_family,
-			capabilities = EXCLUDED.capabilities,
-			missing_data = EXCLUDED.missing_data,
-			warnings = EXCLUDED.warnings,
-			artifacts = EXCLUDED.artifacts,
 			updated_at = now()`,
 		alert.AlertID,
 		alert.IncidentID,
@@ -946,14 +917,6 @@ func (s *Store) persistAlertLocked(alert *AlertRecord) bool {
 		alert.ThreadTS,
 		mustJSON(alert.Labels),
 		mustJSON(alert.Annotations),
-		alert.AnalysisSummary,
-		alert.AnalysisDetail,
-		alert.AnalysisQuality,
-		mustJSON(alert.Capabilities),
-		mustJSON(alert.MissingData),
-		mustJSON(alert.Warnings),
-		mustJSON(alert.Artifacts),
-		alert.RootCauseFamily,
 	)
 	if err != nil {
 		log.Printf("Failed to persist alert %s: %v", alert.AlertID, err)
