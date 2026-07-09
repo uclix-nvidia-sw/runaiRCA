@@ -555,16 +555,20 @@ def _insufficient(
 # ``details["queries"]`` (and mirrors the same dict into its artifact ``result``).
 # A perfectly HEALTHY node object still literally contains the failure vocabulary
 # — condition type "DiskPressure"/"MemoryPressure" (status False) and messages
-# like "kubelet has no disk pressure" — so the substring keyword scan below scored
-# ``node_kubelet_pressure`` on nodes that had NO pressure at all (the recurring
-# "왜 다 False인데 아직도 그게 있다고 하냐" misfire). The collector already distils its
-# real signal into structured keys (``node_conditions`` is abnormal-only,
-# ``warning_events``, ``pod_logs``, ``container_diagnostics``, …), so we drop the
-# raw ``queries`` duplicate from the RANKING text only. loki/prometheus/runai put
-# their PRIMARY signal in ``queries``, so the drop is scoped to kubernetes.
-_RANKING_TEXT_DROP_KEYS: dict[str, frozenset[str]] = {
+# like "kubelet has no disk pressure" — so a substring keyword scan scored
+# ``node_kubelet_pressure`` (and matched the curated "Node Disk Pressure" symptom)
+# on nodes that had NO pressure at all (the recurring "왜 다 False인데 아직도 그게
+# 있다고 하냐" misfire). The collector already distils its real signal into
+# structured keys (``node_conditions`` is abnormal-only, ``warning_events``,
+# ``pod_logs``, ``container_diagnostics``, …), so we drop the raw ``queries``
+# duplicate from EVERY keyword-scan text (both the family ranker here and the
+# signature/symptom matcher in pipeline._evidence_leaf_text — they must share one
+# policy or the leak reappears in whichever path is missed). loki/prometheus/runai
+# put their PRIMARY signal in ``queries``, so the drop is scoped to kubernetes.
+COLLECTOR_TEXT_DROP_KEYS: dict[str, frozenset[str]] = {
     "kubernetes": frozenset({"queries"}),
 }
+_RANKING_TEXT_DROP_KEYS = COLLECTOR_TEXT_DROP_KEYS  # backward-compatible alias
 
 
 def _result_text(result: CollectorResult) -> str:

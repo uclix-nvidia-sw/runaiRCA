@@ -2155,6 +2155,8 @@ def _alert_text(request: AlertAnalysisRequest) -> str:
 def _observed_text(
     results: list[CollectorResult], request: AlertAnalysisRequest | None = None
 ) -> str:
+    from app.services.root_cause_ranking import COLLECTOR_TEXT_DROP_KEYS
+
     parts: list[str] = []
     if request is not None:
         # The alert message itself is evidence: signature matching (symptoms, known
@@ -2164,6 +2166,7 @@ def _observed_text(
     for result in results:
         if not _collector_is_evidence(result):
             continue
+        drop_keys = COLLECTOR_TEXT_DROP_KEYS.get(getattr(result, "agent", ""))
         if result.summary:
             parts.append(result.summary)
         for art in result.artifacts:
@@ -2172,18 +2175,27 @@ def _observed_text(
             if art.summary:
                 parts.append(art.summary)
             if art.result is not None:
-                parts.append(_evidence_leaf_text(art.result, limit=2000))
+                parts.append(_evidence_leaf_text(art.result, limit=2000, drop_keys=drop_keys))
     return " ".join(parts).lower()
 
 
-def _evidence_leaf_text(value: Any, *, limit: int = 2000) -> str:
+def _evidence_leaf_text(
+    value: Any, *, limit: int = 2000, drop_keys: "frozenset[str] | set[str] | None" = None
+) -> str:
     """Evidence matching should see RETURNED values — not JSON key names, and not
     the probe text we sent (queries/paths/urls/name listings; see
     root_cause_ranking.METADATA_VALUE_KEYS). A LogQL probe carrying
-    "cluster-sync" must not signature-match a cluster-sync symptom."""
+    "cluster-sync" must not signature-match a cluster-sync symptom.
+
+    ``drop_keys`` prunes whole subtrees whose dict key matches (case-insensitive) —
+    the kubernetes ``queries`` firehose embeds the RAW node/pod objects, and a
+    healthy node literally contains "DiskPressure"/"MemoryPressure" type names, so
+    it must be dropped here exactly as it is for the family ranker
+    (COLLECTOR_TEXT_DROP_KEYS) or a healthy node signature-matches node-pressure."""
     from app.services.root_cause_ranking import METADATA_VALUE_KEYS
 
     parts: list[str] = []
+    drop = {k.lower() for k in drop_keys} if drop_keys else None
 
     def add(text: object) -> None:
         if len(" ".join(parts)) < limit:
@@ -2195,6 +2207,8 @@ def _evidence_leaf_text(value: Any, *, limit: int = 2000) -> str:
         key_l = key.lower()
         if isinstance(node, dict):
             for child_key, child in node.items():
+                if drop and str(child_key).lower() in drop:
+                    continue
                 walk(child, str(child_key))
         elif isinstance(node, (list, tuple)):
             for child in node:
