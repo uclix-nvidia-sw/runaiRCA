@@ -496,9 +496,12 @@ func (s *Store) upsertMemoryLocked(incident *Incident, alert *AlertRecord) {
 	if run == nil {
 		return
 	}
+	// Incident-scoped, not alert-scoped: key by incident so a changed representative
+	// alert across re-approvals updates the one row instead of accumulating dupes.
+	// AlertID stays empty -> map key = IncidentID, DB unique (incident_id, '') = 1/incident.
 	memory := &IncidentMemory{
 		IncidentID:      incident.IncidentID,
-		AlertID:         alert.AlertID,
+		AlertID:         "",
 		Title:           incident.Title,
 		Severity:        incident.Severity,
 		Status:          incident.Status,

@@ -1913,8 +1913,8 @@ func TestResolveEndpointTogglesUserApproval(t *testing.T) {
 	if !ok || detail.Status != "firing" || detail.ResolvedAt != nil || detail.UserApprovedAt == nil {
 		t.Fatalf("expected incident status to stay firing and user approval to be set, got ok=%t detail=%+v", ok, detail)
 	}
-	if memory := server.store.memories[record.AlertID]; memory == nil || memory.Status != "firing" {
-		t.Fatalf("expected alert memory to load after user approval, got %+v", memory)
+	if memory := server.store.memories[incident.IncidentID]; memory == nil || memory.Status != "firing" {
+		t.Fatalf("expected incident memory to load after user approval, got %+v", memory)
 	}
 
 	rec = httptest.NewRecorder()
@@ -1926,7 +1926,7 @@ func TestResolveEndpointTogglesUserApproval(t *testing.T) {
 	if !ok || detail.Status != "firing" || detail.ResolvedAt != nil || detail.UserApprovedAt != nil {
 		t.Fatalf("expected second resolve click to clear user approval only, got ok=%t detail=%+v", ok, detail)
 	}
-	if memory := server.store.memories[record.AlertID]; memory == nil {
+	if memory := server.store.memories[incident.IncidentID]; memory == nil {
 		t.Fatalf("expected memory row to remain for future reapproval, got %+v", memory)
 	}
 	if search := server.store.SearchIncidentMemory("quota blocked scheduling", 5); len(search) != 0 {
