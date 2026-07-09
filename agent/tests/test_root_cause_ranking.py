@@ -49,6 +49,205 @@ def test_r1_node_pressure_wins_with_blast_radius() -> None:
     assert ranked[0].confidence == "high"
 
 
+def test_r1_soft_tokens_only_do_not_force_high_without_node_condition() -> None:
+    # P3: during a GPU-Operator rollout the device-plugin DaemonSet restarts and
+    # kubelet is mentioned in logs, so node_kubelet_pressure scores on SOFT tokens.
+    # The KG reports a blast radius (the co-located operator DaemonSets). With NO
+    # actual node condition reported, the blast must NOT force node pressure HIGH —
+    # this is the single-owner/subsystem multi-node rollout case that neither
+    # component-identity nor a lifecycle signal caught.
+    results = [
+        _r(
+            "kubernetes",
+            summary=(
+                "kubelet restarted nvidia-device-plugin; device plugin re-registered "
+                "on gpu-node-17 (node reports Ready)"
+            ),
+        ),
+        _r("typedb", summary="kg lookup", details={"blast_radius_workloads": 4}),
+        _r("loki", summary="workload namespace logs nominal"),
+    ]
+    ranked = rank_root_cause_candidates(_target(), results, occurrence_count=5)
+    by_family = {c.family: c for c in ranked}
+    if "node_kubelet_pressure" in by_family:
+        node = by_family["node_kubelet_pressure"]
+        assert node.confidence != "high"
+        assert not any("blast radius" in r for r in node.rationale)
+
+
+def test_r1_prometheus_node_condition_still_force_highs() -> None:
+    # The hard node-condition signal may come from prometheus (not just kubernetes).
+    results = [
+        _r("prometheus", summary="kube_node_status_condition MemoryPressure=true on gpu-node-17"),
+        _r("kubernetes", summary="kubelet evicting pods on gpu-node-17"),
+        _r("typedb", summary="kg lookup", details={"blast_radius_workloads": 3}),
+    ]
+    ranked = rank_root_cause_candidates(_target(), results, occurrence_count=5)
+    assert ranked[0].family == "node_kubelet_pressure"
+    assert ranked[0].confidence == "high"
+
+
+def test_facets_annotate_family_locus_and_nature() -> None:
+    # P4: every candidate carries its intrinsic (subsystem/Locus, nature) facets.
+    results = [
+        _r("kubernetes", summary="Node gpu-node-17 condition DiskPressure=True; pods evicted"),
+        _r("typedb", summary="kg lookup", details={"blast_radius_workloads": 3}),
+    ]
+    ranked = rank_root_cause_candidates(_target(), results, occurrence_count=5)
+    top = ranked[0]
+    assert top.family == "node_kubelet_pressure"
+    assert top.subsystem == "node"
+    assert top.nature == "saturation"
+    # Facets are exposed in the serialized form too.
+    d = top.as_dict()
+    assert d["subsystem"] == "node" and d["nature"] == "saturation"
+
+
+def test_lifecycle_candidate_carries_trigger_facet() -> None:
+    # P4: the Trigger facet names the proximate change on the lifecycle candidate.
+    results = [
+        _r("kubernetes", summary="Node gpu-node-17 MemoryPressure noted once"),
+        _r("loki", summary="logs nominal"),
+        _change_result(
+            [
+                {"name": "runai-container-toolkit", "kind": "DaemonSet", "rollout": True,
+                 "namespace": "runai", "summary": "mid-rollout"},
+            ]
+        ),
+    ]
+    ranked = rank_root_cause_candidates(
+        _target(alert_name="KubeDaemonSetRolloutStuck", pod="runai-container-toolkit-vttmr"),
+        results,
+        component_family="gpu_hardware_error",
+        component="runai-container-toolkit",
+        depends_on_chain=["runai-container-toolkit", "gpu-operator"],
+        lifecycle={
+            "active": True,
+            "components": ["runai-container-toolkit"],
+            "target_rollout": True,
+            "helm": ["gpu-operator rev 3 (pending-upgrade)"],
+        },
+    )
+    top = ranked[0]
+    assert top.family == "platform_lifecycle_change"
+    assert top.subsystem == "platform-lifecycle"
+    assert top.nature == "lifecycle_change"
+    assert "runai-container-toolkit" in top.trigger
+    assert "pending-upgrade" in top.trigger
+    # A non-lifecycle candidate must NOT claim the rollout as its trigger.
+    others = [c for c in ranked if c.family != "platform_lifecycle_change"]
+    assert all(c.trigger == "" for c in others)
+
+
+def test_trigger_facet_survives_signature_promotion() -> None:
+    # Regression for the P4 reviewer finding: _promote_signature_cause rebuilds the
+    # top candidate (via _with_signature_support, or a fresh lead RankedCause for a
+    # different family). subsystem/nature re-derive from the family in __post_init__,
+    # but Trigger is ranker-computed and has no such fallback — so it must be carried
+    # through both promotion paths or it is silently dropped from the report/as_dict.
+    from app.services.pipeline import _promote_signature_cause
+
+    results = [
+        _r("kubernetes", summary="Node gpu-node-17 MemoryPressure noted once"),
+        _change_result(
+            [
+                {"name": "runai-container-toolkit", "kind": "DaemonSet", "rollout": True,
+                 "namespace": "runai", "summary": "mid-rollout"},
+            ]
+        ),
+    ]
+    ranked = rank_root_cause_candidates(
+        _target(alert_name="KubeDaemonSetRolloutStuck", pod="runai-container-toolkit-vttmr"),
+        results,
+        lifecycle={
+            "active": True,
+            "components": ["runai-container-toolkit"],
+            "target_rollout": True,
+            "helm": ["gpu-operator rev 3 (pending-upgrade)"],
+        },
+    )
+    lifecycle_cause = next(c for c in ranked if c.family == "platform_lifecycle_change")
+    assert lifecycle_cause.trigger  # ranker set it
+
+    symptom = ("platform_lifecycle_change", {"symptom": "Controller Rollout In Progress"})
+
+    # Path A: lifecycle family is already the ranker's top → _with_signature_support.
+    top_first = [lifecycle_cause, *[c for c in ranked if c.family != "platform_lifecycle_change"]]
+    promoted_a = _promote_signature_cause(top_first, [], [], [symptom])
+    assert promoted_a[0].family == "platform_lifecycle_change"
+    assert promoted_a[0].trigger == lifecycle_cause.trigger
+    assert promoted_a[0].as_dict()["trigger"] == lifecycle_cause.trigger
+
+    # Path B: a different family leads → fresh lead RankedCause for the lifecycle family.
+    other = next(c for c in ranked if c.family != "platform_lifecycle_change")
+    top_other = [other, *[c for c in ranked if c.family != other.family]]
+    promoted_b = _promote_signature_cause(top_other, [], [], [symptom])
+    assert promoted_b[0].family == "platform_lifecycle_change"
+    assert promoted_b[0].trigger == lifecycle_cause.trigger
+
+
+def test_r1_healthy_node_object_in_details_does_not_force_high() -> None:
+    # Regression for the P3 reviewer finding: the kubernetes collector embeds the
+    # RAW node object in details["queries"], and a HEALTHY node still literally
+    # carries type "DiskPressure"/"MemoryPressure" + "kubelet has no disk pressure"
+    # text. A naive substring guard sees those and wrongly re-enables the blast
+    # force-high. With soft tokens only and the collector's abnormal-filtered
+    # node_conditions marked healthy, node pressure must NOT be forced HIGH.
+    healthy_node = {
+        "node_conditions": [{"node_conditions_healthy": True, "checked": 4}],
+        "queries": [
+            {
+                "name": "node",
+                "data": {
+                    "conditions": [
+                        {"type": "DiskPressure", "status": "False",
+                         "reason": "KubeletHasNoDiskPressure",
+                         "message": "kubelet has no disk pressure"},
+                        {"type": "MemoryPressure", "status": "False",
+                         "reason": "KubeletHasSufficientMemory",
+                         "message": "kubelet has sufficient memory available"},
+                        {"type": "Ready", "status": "True",
+                         "reason": "KubeletReady", "message": "kubelet is posting ready status"},
+                    ]
+                },
+            }
+        ],
+    }
+    results = [
+        _r(
+            "kubernetes",
+            summary="kubelet restarted nvidia-device-plugin; device plugin re-registered",
+            details=healthy_node,
+        ),
+        _r("typedb", summary="kg lookup", details={"blast_radius_workloads": 4}),
+        _r("loki", summary="workload namespace logs nominal"),
+    ]
+    ranked = rank_root_cause_candidates(_target(), results, occurrence_count=5)
+    by_family = {c.family: c for c in ranked}
+    if "node_kubelet_pressure" in by_family:
+        node = by_family["node_kubelet_pressure"]
+        assert node.confidence != "high"
+        assert not any("blast radius" in r for r in node.rationale)
+
+
+def test_r1_abnormal_node_condition_in_details_force_highs() -> None:
+    # The structured, abnormal-only node_conditions signal (DiskPressure status
+    # True) IS a genuine node condition and must still force-high with a blast.
+    pressured_node = {
+        "node_conditions": [
+            {"type": "DiskPressure", "status": "True", "reason": "KubeletHasDiskPressure",
+             "message": "kubelet has disk pressure"}
+        ],
+    }
+    results = [
+        _r("kubernetes", summary="node under pressure; pods being removed", details=pressured_node),
+        _r("typedb", summary="kg lookup", details={"blast_radius_workloads": 3}),
+    ]
+    ranked = rank_root_cause_candidates(_target(), results, occurrence_count=5)
+    assert ranked[0].family == "node_kubelet_pressure"
+    assert ranked[0].confidence == "high"
+
+
 def test_r2_quota_exhaustion_wins() -> None:
     results = [
         _r("kubernetes", summary="pod Pending FailedScheduling: insufficient nvidia.com/gpu"),
@@ -220,3 +419,213 @@ def test_unavailable_blast_radius_does_not_upgrade_node_pressure() -> None:
     ranked = rank_root_cause_candidates(_target(), results)
     assert ranked[0].family == "node_kubelet_pressure"
     assert ranked[0].confidence == "medium"
+
+
+def test_component_identity_leads_over_incidental_node_pressure() -> None:
+    # The reported mis-attribution: a KubeDaemonSetRolloutStuck alert ON the
+    # runai-container-toolkit DaemonSet, while the node happens to carry a stray
+    # pressure line. Without topology, node_kubelet_pressure won on the keyword.
+    # With the component identity (runai-container-toolkit → gpu_hardware_error,
+    # depends_on the GPU Operator stack) the right subsystem must lead.
+    results = [
+        _r("kubernetes", summary="Node gpu-node-17 condition MemoryPressure noted once"),
+        _r("loki", summary="workload namespace logs nominal"),
+    ]
+    ranked = rank_root_cause_candidates(
+        _target(alert_name="KubeDaemonSetRolloutStuck", pod="runai-container-toolkit-vttmr"),
+        results,
+        component_family="gpu_hardware_error",
+        component="runai-container-toolkit",
+        depends_on_chain=[
+            "runai-container-toolkit",
+            "nvidia-container-toolkit-daemonset",
+            "nvidia-driver-daemonset",
+            "gpu-operator",
+        ],
+    )
+    assert ranked[0].family == "gpu_hardware_error"
+    assert any("depends_on" in r for r in ranked[0].rationale)
+
+
+def test_component_identity_disables_node_force_high_from_blast() -> None:
+    # A non-node component is the alert target, yet the KG reports blast radius.
+    # The blast must NOT force node_kubelet_pressure to HIGH — the component's
+    # rollout/health explains the multi-pod impact.
+    results = [
+        _r("kubernetes", summary="Node gpu-node-17 DiskPressure=True; kubelet evicting pods"),
+        _r("typedb", summary="kg lookup", details={"blast_radius_workloads": 4}),
+        _r("loki", summary="logs nominal"),
+    ]
+    ranked = rank_root_cause_candidates(
+        _target(alert_name="KubeDaemonSetRolloutStuck", pod="runai-container-toolkit-vttmr"),
+        results,
+        component_family="gpu_hardware_error",
+        component="runai-container-toolkit",
+        depends_on_chain=["runai-container-toolkit", "gpu-operator"],
+    )
+    by_family = {c.family: c for c in ranked}
+    # node pressure may still appear, but never as a forced-HIGH top cause here.
+    assert ranked[0].family == "gpu_hardware_error"
+    if "node_kubelet_pressure" in by_family:
+        assert by_family["node_kubelet_pressure"].confidence != "high"
+
+
+def test_component_identity_absent_keeps_legacy_behavior() -> None:
+    # Regression guard: with no component identity passed, ranking is unchanged
+    # (R1 still force-highs node pressure with blast radius).
+    results = [
+        _r("kubernetes", summary="Node gpu-node-17 condition DiskPressure=True; pods evicted"),
+        _r("typedb", summary="kg lookup", details={"blast_radius_workloads": 3}),
+        _r("loki", summary="workload namespace logs nominal"),
+    ]
+    ranked = rank_root_cause_candidates(_target(), results, occurrence_count=5)
+    assert ranked[0].family == "node_kubelet_pressure"
+    assert ranked[0].confidence == "high"
+
+
+def test_component_identity_single_weak_hit_not_high_confidence() -> None:
+    # The synthetic "topology" agent floors the identity family's score, but it
+    # does NOT independently observe a failure. With only ONE real evidence agent
+    # weakly matching, the family must stay at medium — HIGH needs >=2 real agents.
+    results = [
+        _r("kubernetes", summary="nouveau driver noted on gpu-node-17"),
+        _r("loki", summary="workload namespace logs nominal"),
+    ]
+    ranked = rank_root_cause_candidates(
+        _target(alert_name="KubeDaemonSetRolloutStuck", pod="runai-container-toolkit-vttmr"),
+        results,
+        component_family="gpu_hardware_error",
+        component="runai-container-toolkit",
+        depends_on_chain=["runai-container-toolkit", "gpu-operator"],
+    )
+    top = ranked[0]
+    assert top.family == "gpu_hardware_error"
+    assert top.confidence != "high"
+
+
+def _change_result(changes, summary="recent changes"):
+    return CollectorResult(
+        agent="change",
+        status="ok",
+        summary=summary,
+        details={"changes": changes},
+        artifacts=[],
+    )
+
+
+def test_lifecycle_gate_leads_when_target_component_mid_rollout() -> None:
+    # The reported case: a KubeDaemonSetRolloutStuck alert on runai-container-toolkit
+    # caused by a GPU-operator upgrade. The DaemonSet is mid-rollout, the node has a
+    # stray pressure line. Nature (lifecycle/upgrade) must headline over the fault.
+    results = [
+        _r("kubernetes", summary="Node gpu-node-17 MemoryPressure noted once"),
+        _r("loki", summary="workload namespace logs nominal"),
+        _change_result(
+            [
+                {
+                    "name": "runai-container-toolkit",
+                    "kind": "DaemonSet",
+                    "rollout": True,
+                    "namespace": "runai",
+                    "summary": "mid-rollout (generation 5, observed 3)",
+                }
+            ]
+        ),
+    ]
+    ranked = rank_root_cause_candidates(
+        _target(alert_name="KubeDaemonSetRolloutStuck", pod="runai-container-toolkit-vttmr"),
+        results,
+        component_family="gpu_hardware_error",
+        component="runai-container-toolkit",
+        depends_on_chain=["runai-container-toolkit", "gpu-operator"],
+        lifecycle={
+            "active": True,
+            "components": ["runai-container-toolkit"],
+            "target_rollout": True,
+        },
+    )
+    assert ranked[0].family == "platform_lifecycle_change"
+    assert ranked[0].confidence == "high"  # the alert's own component is rolling => dispositive
+    by_family = {c.family: c for c in ranked}
+    if "node_kubelet_pressure" in by_family:
+        assert by_family["node_kubelet_pressure"].confidence != "high"
+
+
+def test_lifecycle_gate_absent_keeps_legacy_behavior() -> None:
+    # No lifecycle signal => ranking is 100% unchanged (R1 still force-highs node).
+    results = [
+        _r("kubernetes", summary="Node gpu-node-17 condition DiskPressure=True; pods evicted"),
+        _r("typedb", summary="kg lookup", details={"blast_radius_workloads": 3}),
+        _r("loki", summary="workload namespace logs nominal"),
+    ]
+    ranked = rank_root_cause_candidates(_target(), results, occurrence_count=5)
+    assert ranked[0].family == "node_kubelet_pressure"
+    assert ranked[0].confidence == "high"
+
+
+def test_lifecycle_upstream_rollout_is_medium_not_forced_high() -> None:
+    # Only an UPSTREAM dependency (gpu-operator) is rolling, the alert's own
+    # component is not => lifecycle leads but stays medium (one real observer,
+    # not dispositive) rather than forced HIGH.
+    results = [
+        _r("kubernetes", summary="workload events sparse"),
+        _r("loki", summary="logs nominal"),
+        _change_result(
+            [
+                {
+                    "name": "gpu-operator",
+                    "kind": "Deployment",
+                    "rollout": True,
+                    "namespace": "gpu-operator",
+                    "summary": "mid-rollout (generation 8, observed 7)",
+                }
+            ]
+        ),
+    ]
+    ranked = rank_root_cause_candidates(
+        _target(alert_name="KubeDaemonSetRolloutStuck", pod="runai-container-toolkit-vttmr"),
+        results,
+        component_family="gpu_hardware_error",
+        component="runai-container-toolkit",
+        depends_on_chain=["runai-container-toolkit", "gpu-operator"],
+        lifecycle={
+            "active": True,
+            "components": ["gpu-operator"],
+            "target_rollout": False,
+        },
+    )
+    assert ranked[0].family == "platform_lifecycle_change"
+    assert ranked[0].confidence == "medium"
+
+
+def test_lifecycle_gate_clears_node_force_high_from_blast() -> None:
+    # A rollout is active AND the KG reports blast radius that R1 would force-high
+    # node pressure on. The lifecycle event must strip that node force-high even
+    # when the target is NOT a known component (component identity can't guard it).
+    results = [
+        _r("kubernetes", summary="Node gpu-node-17 DiskPressure=True; kubelet evicting pods"),
+        _r("typedb", summary="kg lookup", details={"blast_radius_workloads": 4}),
+        _change_result(
+            [
+                {
+                    "name": "some-daemonset",
+                    "kind": "DaemonSet",
+                    "rollout": True,
+                    "namespace": "runai",
+                    "summary": "mid-rollout (generation 2, observed 1)",
+                }
+            ]
+        ),
+    ]
+    ranked = rank_root_cause_candidates(
+        _target(alert_name="KubeDaemonSetRolloutStuck"),
+        results,
+        lifecycle={
+            "active": True,
+            "components": ["some-daemonset"],
+            "target_rollout": False,
+        },
+    )
+    by_family = {c.family: c for c in ranked}
+    assert "node_kubelet_pressure" in by_family
+    assert by_family["node_kubelet_pressure"].confidence != "high"

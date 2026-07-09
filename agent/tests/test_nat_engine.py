@@ -31,6 +31,7 @@ VALID_FAMILIES = {
     "platform_version_bug",
     "observability_accuracy",
     "expected_known_behavior",
+    "platform_lifecycle_change",
 }
 
 

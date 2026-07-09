@@ -50,6 +50,7 @@ FAMILIES = {
     "observability_accuracy",
     "expected_known_behavior",
     "platform_auth_error",
+    "platform_lifecycle_change",
     "insufficient_evidence",
 }
 

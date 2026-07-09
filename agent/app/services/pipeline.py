@@ -20,6 +20,7 @@ from app.knowledge import (
     _keyword_negated,
     component_action_lines,
     component_check_lines,
+    dependency_path,
     load_architecture,
     load_failure_modes,
     load_runai_known_issues,
@@ -309,11 +310,102 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
     return state
 
 
+def _component_identity(
+    settings: Settings, plan: InvestigationPlan | None
+) -> tuple[str, str, list[str]]:
+    """Topology signal for the ranker: (component_family, component, depends_on chain).
+
+    The planner already resolved which platform component the alert target IS
+    (``plan.component``). Look up its curated family and dependency check order
+    from runai_architecture.yaml so the ranker can lead with the right subsystem
+    (e.g. runai-container-toolkit → gpu_hardware_error, check the GPU Operator
+    stack) instead of a keyword-only node/workload guess. Empty when the target
+    is not a known component or the map is unavailable.
+    """
+    component = str(getattr(plan, "component", "") or "")
+    if not component:
+        return "", "", []
+    components = load_architecture(settings.architecture_file)
+    entry = components.get(component)
+    if not entry:
+        return "", component, []
+    family = str(entry.get("family") or "")
+    chain = dependency_path(components, component)
+    return family, component, chain
+
+
+def _lifecycle_signal(
+    results: list[CollectorResult], component: str, chain: list[str]
+) -> dict[str, object]:
+    """Nature signal for the ranker: is the implicated component mid-rollout?
+
+    Reads the change collector's structured rollout flags. A lifecycle event is
+    "active" only when a controller that IS the alert's component (or sits in its
+    depends_on chain) is mid-rollout — so unrelated namespace churn never trips
+    it. ``target_rollout`` means the alert's OWN component is the one rolling,
+    which is dispositive. Empty dict = no lifecycle signal (ranking stays legacy).
+    """
+    change = next((r for r in results if getattr(r, "agent", "") == "change"), None)
+    if change is None or getattr(change, "status", "") not in ("ok", "partial"):
+        return {}
+    details = change.details if isinstance(change.details, dict) else {}
+    changes = details.get("changes") if isinstance(details.get("changes"), list) else []
+    rolling = {
+        str(c.get("name"))
+        for c in changes
+        if isinstance(c, dict) and c.get("rollout") and c.get("name")
+    }
+    if not rolling:
+        return {}
+    implicated = set(chain or ([component] if component else []))
+    hit = sorted(rolling & implicated)
+    if not hit:
+        return {}
+    # Name the upstream Helm trigger (if any) among the matched components so the
+    # ranker rationale can point at the real change instead of a downstream symptom.
+    helm = [
+        f"{c.get('name')} rev {c.get('revision')} ({c.get('helm_status') or 'changed'})"
+        for c in changes
+        if isinstance(c, dict)
+        and c.get("kind") == "HelmRelease"
+        and str(c.get("name")) in set(hit)
+    ]
+    signal: dict[str, object] = {
+        "active": True,
+        "components": hit,
+        "target_rollout": bool(component and component in rolling),
+    }
+    if helm:
+        signal["helm"] = helm
+    return signal
+
+
+_LIFECYCLE_FAMILY = "platform_lifecycle_change"
+
+
+def _gate_lifecycle_symptoms(
+    matches: list[tuple[str, dict]], lifecycle: dict[str, object] | None
+) -> list[tuple[str, dict]]:
+    """Drop lifecycle symptom matches unless the lifecycle signal is active.
+
+    ``_promote_signature_cause`` runs after the ranker and can override its top
+    family from a curated symptom keyword. The lifecycle symptoms match the
+    change collector's generic ``mid-rollout`` text, so WITHOUT this gate a
+    coincidental unrelated rollout in the alert namespace could promote
+    ``platform_lifecycle_change`` over a genuine fault — the exact ungated
+    over-attribution the ranker's component-chain gate was built to prevent.
+    """
+    if lifecycle and lifecycle.get("active"):
+        return matches
+    return [(fam, sym) for fam, sym in matches if fam != _LIFECYCLE_FAMILY]
+
+
 async def rank_stage(state: PipelineState) -> PipelineState:
     settings = state.settings
     request = state.request
-    # Optional feedback-derived priors from operator hints — nudge ranking.
-    state.priors = None
+    # Topology identity resolved by the planner (which component the alert IS).
+    comp_family, comp_name, comp_chain = _component_identity(settings, state.plan)
+    lifecycle = _lifecycle_signal(state.results, comp_name, comp_chain)
     try:
         from app.services.feedback_priors import derive_priors
     except ImportError:
@@ -331,6 +423,10 @@ async def rank_stage(state: PipelineState) -> PipelineState:
         occurrence_count=request.occurrence_count,
         kg_blast_radius=state.kg_context.blast_radius_workloads,
         priors=state.priors,
+        component_family=comp_family,
+        component=comp_name,
+        depends_on_chain=comp_chain,
+        lifecycle=lifecycle,
     )
     # Signature-first headline: the keyword ranker only decides when NOTHING
     # specific matched. A specific signature — an NVIDIA XID (dispositive), a
@@ -359,7 +455,9 @@ async def rank_stage(state: PipelineState) -> PipelineState:
         state.root_cause_candidates,
         state.xid_codes,
         match_runai_known_issues(state.known_issues, state.observed),
-        match_failure_mode_symptoms(state.failure_modes, state.observed),
+        _gate_lifecycle_symptoms(
+            match_failure_mode_symptoms(state.failure_modes, state.observed), lifecycle
+        ),
     )
     if state.root_cause_candidates:
         top = state.root_cause_candidates[0]
@@ -725,6 +823,8 @@ def _next_reanalysis_target(
                     not state.reanalysis_note,
                 )
         kg_blast = getattr(state.kg_context, "blast_radius_workloads", 0)
+        comp_family, comp_name, comp_chain = _component_identity(state.settings, state.plan)
+        lifecycle = _lifecycle_signal(state.results, comp_name, comp_chain)
         for candidate in rank_root_cause_candidates(
             state.target,
             state.results,
@@ -732,6 +832,10 @@ def _next_reanalysis_target(
             top_n=5,
             kg_blast_radius=kg_blast,
             priors=state.priors,
+            component_family=comp_family,
+            component=comp_name,
+            depends_on_chain=comp_chain,
+            lifecycle=lifecycle,
         ):
             if candidate.family not in excluded:
                 return _ReanalysisTarget(
@@ -820,6 +924,7 @@ async def _reanalyze_once(
         assert plan is not None
         kg_dict = state.kg_context.as_dict()
         kg_blast = getattr(state.kg_context, "blast_radius_workloads", 0)
+        comp_family, comp_name, comp_chain = _component_identity(state.settings, plan)
 
         lead = {
             "family": target.family,
@@ -844,12 +949,17 @@ async def _reanalyze_once(
             merged[result.agent] = result
         merged_results = list(merged.values())
 
+        lifecycle = _lifecycle_signal(merged_results, comp_name, comp_chain)
         candidates = rank_root_cause_candidates(
             state.target,
             merged_results,
             occurrence_count=state.request.occurrence_count,
             kg_blast_radius=kg_blast,
             priors=state.priors,
+            component_family=comp_family,
+            component=comp_name,
+            depends_on_chain=comp_chain,
+            lifecycle=lifecycle,
         )
         # The signature-first rule applies to the RE-rank too. Without it the
         # raw keyword ranker decided alone here — the 2026-07-08 re-analysis
@@ -860,7 +970,9 @@ async def _reanalyze_once(
             candidates,
             _xid_codes_from_results(merged_results, _alert_text(state.request)),
             match_runai_known_issues(state.known_issues, observed),
-            match_failure_mode_symptoms(state.failure_modes, observed),
+            _gate_lifecycle_symptoms(
+                match_failure_mode_symptoms(state.failure_modes, observed), lifecycle
+            ),
         )
         if token_budget_exceeded(state.settings) or _deadline_exceeded(state):
             if token_budget_exceeded(state.settings):
@@ -1314,6 +1426,12 @@ def _detail_from(
     # --- 2. Root Cause --------------------------------------------------------
     lines.extend(["", h["cause"], ""])
     lines.append(_ranked_root_cause_statement(root_cause_candidates or [], request))
+    # Multi-axis facets (Locus / Nature / Trigger) for the top cause — names the
+    # subsystem, the KIND of cause, and (when known) what set it off.
+    if root_cause_candidates:
+        facets = _facets_line(root_cause_candidates[0], language)
+        if facets:
+            lines.append(facets)
     # Ground the coarse family in the most specific signature match when one exists:
     # a recognised known issue (with its affected/fixed version) is far more precise.
     lines.extend(
@@ -1544,6 +1662,7 @@ def _promote_signature_cause(
             score=8.0,
             rationale=[f"matched known-issue signature: {entry.get('issue')}"],
             evidence_agents=["signature"],
+            trigger=_trigger_for_family(candidates, family),
         )
         return [lead] + [c for c in candidates if c.family != family]
     for family, symptom in symptom_matches:
@@ -1562,9 +1681,24 @@ def _promote_signature_cause(
             score=7.0,
             rationale=[f"matched curated symptom: {symptom.get('symptom')}"],
             evidence_agents=["signature"],
+            trigger=_trigger_for_family(candidates, family),
         )
         return [lead] + [c for c in candidates if c.family != family]
     return candidates
+
+
+def _trigger_for_family(candidates: list[RankedCause], family: str) -> str:
+    """Carry the ranker-computed Trigger facet across signature promotion.
+
+    Trigger is the one facet that is not intrinsic to the family (subsystem and
+    nature auto-derive in ``RankedCause.__post_init__``); it is set dynamically on
+    the lifecycle candidate by the ranker. When a promoted family displaces the
+    ranker's top, copy the trigger from that family's pre-promotion candidate so
+    it is not silently lost from the report and ``as_dict()`` output."""
+    for candidate in candidates:
+        if candidate.family == family and candidate.trigger:
+            return candidate.trigger
+    return ""
 
 
 def _with_signature_support(
@@ -1579,6 +1713,7 @@ def _with_signature_support(
         score=max(candidate.score, score_floor),
         rationale=rationale_items,
         evidence_agents=sorted({*candidate.evidence_agents, "signature"}),
+        trigger=candidate.trigger,
     )
 
 
@@ -1833,6 +1968,44 @@ def _ranked_root_cause_statement(
     return _short_sentence(f"{subject} Likely cause: {explanation}.", limit=320)
 
 
+# Nature axis labels for the operator-facing facets line.
+_NATURE_LABELS = {
+    "en": {
+        "fault": "fault (a defect)",
+        "saturation": "saturation (resource exhaustion)",
+        "lifecycle_change": "lifecycle change (expected rollout/upgrade disruption)",
+        "observability": "observability (monitoring accuracy, not the workload)",
+    },
+    "ko": {
+        "fault": "결함(fault)",
+        "saturation": "리소스 포화(saturation)",
+        "lifecycle_change": "라이프사이클 변경(rollout/upgrade — 정상 교체 중단)",
+        "observability": "관측성(모니터링 정확도 — 워크로드 아님)",
+    },
+}
+
+
+def _facets_line(top: RankedCause, language: str) -> str:
+    """One compact line annotating the top cause on the (Locus, Nature, Trigger)
+    axes — WHERE the cause sits, WHAT KIND it is, and WHAT SET IT OFF. Skips
+    empty axes (e.g. no trigger known) and returns '' for non-causes."""
+    if not top or top.family == "insufficient_evidence":
+        return ""
+    ko = language == "ko"
+    parts: list[str] = []
+    if top.subsystem:
+        parts.append(("서브시스템" if ko else "Subsystem") + f": {top.subsystem}")
+    if top.nature:
+        nature = _NATURE_LABELS.get(language, _NATURE_LABELS["en"]).get(top.nature, top.nature)
+        parts.append(("성격" if ko else "Nature") + f": {nature}")
+    if top.trigger:
+        parts.append(("트리거" if ko else "Trigger") + f": {top.trigger}")
+    if not parts:
+        return ""
+    label = "분류(Facets)" if ko else "Facets"
+    return f"- {label}: " + " · ".join(parts)
+
+
 def _as_sentence(text: str) -> str:
     text = " ".join((text or "").split())
     if text and text[-1] not in ".!?":
@@ -1912,6 +2085,11 @@ _FAMILY_EXPLANATION = {
         "login/permissions/SSO is failing (JWT attributes, SAML/OIDC config, "
         "Access Rules) or a UI/API call returned 401/403/503/500 — an auth or "
         "control-plane service issue, not a workload fault"
+    ),
+    "platform_lifecycle_change": (
+        "a platform rollout/upgrade is in progress (GPU Operator, a controller, or "
+        "a Helm release) — the disruption is EXPECTED churn from that change, not a "
+        "fault; verify the rollout/Helm release finished before digging elsewhere"
     ),
 }
 

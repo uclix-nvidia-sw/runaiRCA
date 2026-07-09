@@ -66,6 +66,132 @@ METADATA_VALUE_KEYS = {
 }
 _METADATA_VALUE_KEYS = METADATA_VALUE_KEYS
 
+# ---------------------------------------------------------------------------
+# Multi-axis facets: (Locus, Nature) per family. The family label stays the
+# headline; these annotate the incident on two intrinsic axes so operators (and
+# downstream calibration) can reason across families:
+#   - subsystem (Locus): WHERE the cause sits (gpu / node / network / ...).
+#   - nature: WHAT KIND of cause — "fault" (a defect), "saturation" (resource
+#     exhaustion/pressure), "lifecycle_change" (expected rollout/upgrade
+#     disruption), or "observability" (the monitoring itself, not the workload).
+# The Trigger axis (what SET IT OFF) is dynamic, not intrinsic to the family, so
+# it is filled by the ranker from the lifecycle/change signal, not from here.
+# ---------------------------------------------------------------------------
+_FAMILY_FACETS: dict[str, tuple[str, str]] = {
+    "node_kubelet_pressure": ("node", "saturation"),
+    "runai_scheduling_quota": ("scheduling", "saturation"),
+    "k8s_scheduling_error": ("scheduling", "fault"),
+    "runai_control_plane_error": ("control-plane", "fault"),
+    "k8s_control_plane_error": ("control-plane", "fault"),
+    "workload_startup_error": ("workload", "fault"),
+    "image_pull_error": ("registry", "fault"),
+    "gpu_hardware_error": ("gpu", "fault"),
+    "network_fabric_error": ("network", "fault"),
+    "cluster_network_error": ("network", "fault"),
+    "k8s_storage_error": ("storage", "fault"),
+    "storage_backend_error": ("storage", "fault"),
+    "workload_runtime_error": ("workload", "fault"),
+    "observability_accuracy": ("observability", "observability"),
+    "platform_auth_error": ("auth", "fault"),
+    "platform_lifecycle_change": ("platform-lifecycle", "lifecycle_change"),
+}
+
+
+def _family_facets(family: str) -> tuple[str, str]:
+    """(subsystem, nature) for a family; ('', '') for non-causes (insufficient)."""
+    return _FAMILY_FACETS.get(family, ("", ""))
+
+
+def _lifecycle_trigger(lifecycle: dict[str, Any] | None) -> str:
+    """Human-readable Trigger facet from the change/lifecycle signal, if active.
+
+    Names the proximate change that set the incident off — the rolling
+    component(s) and any Helm revision — so the ``platform_lifecycle_change``
+    headline can state WHAT triggered the disruption instead of leaving it
+    implicit. Empty when no lifecycle signal is active."""
+    if not lifecycle or not lifecycle.get("active"):
+        return ""
+    components = [str(c) for c in (lifecycle.get("components") or []) if c]
+    parts: list[str] = []
+    if components:
+        parts.append("rollout/upgrade on " + ", ".join(components))
+    helm = lifecycle.get("helm")
+    if helm:
+        helm_note = (
+            ", ".join(str(h) for h in helm)
+            if isinstance(helm, (list, tuple))
+            else str(helm)
+        )
+        parts.append(f"Helm: {helm_note}")
+    return "; ".join(parts)
+
+# R1 (node_kubelet_pressure) HARD node-condition tokens: an actual kubelet/node
+# resource condition or eviction. These are what make "the node is crushing its
+# tenants" a defensible ROOT CAUSE. The family's OTHER keywords ("kubelet",
+# "device plugin") are SOFT co-occurrence tokens that fire constantly during an
+# unrelated GPU-Operator rollout (the device-plugin DaemonSet restarts, kubelet
+# is mentioned) — they must NOT, on their own, let a blast radius force node
+# pressure to HIGH. A genuine node-pressure incident always carries a hard token.
+_NODE_CONDITION_TOKENS = (
+    "diskpressure",
+    "disk pressure",
+    "memorypressure",
+    "memory pressure",
+    "pidpressure",
+    "pid pressure",
+    "node pressure",
+    "node condition",
+    "evict",
+)
+
+
+def _node_condition_present(results: list[CollectorResult]) -> bool:
+    """True when a real node-condition/eviction signal is present.
+
+    P3: the R1 blast force-high must be backed by an ACTUAL node condition, not
+    the soft co-occurrence tokens ("kubelet", "device plugin") a subsystem's
+    rollout emits. The naive approach — substring-scanning the collector text —
+    is defeated because the kubernetes collector embeds the RAW node object in
+    ``details["queries"]``, and a HEALTHY node object still literally contains
+    "DiskPressure"/"MemoryPressure" types and "kubelet has no disk pressure"
+    messages. So instead we:
+      1. Trust the kubernetes collector's ALREADY-FILTERED structured signal
+         (``details["node_conditions"]`` is abnormal-only; a healthy node
+         collapses to a ``node_conditions_healthy`` marker), and
+      2. fall back to a NEGATION-AWARE keyword scan over a SCOPED text (summary +
+         warning events for kubernetes, full text for prometheus) that excludes
+         the raw ``queries`` payload — so healthy-node vocabulary can't misfire.
+    """
+    for r in results:
+        if not _collector_is_evidence(r):
+            continue
+        agent = getattr(r, "agent", "")
+        details = r.details if isinstance(r.details, dict) else {}
+        if agent == "kubernetes":
+            # Primary: the collector already dropped healthy conditions; a real
+            # abnormal condition entry is a genuine pressure/NotReady signal.
+            conds = details.get("node_conditions")
+            if isinstance(conds, list) and any(
+                isinstance(c, dict) and c.get("type") and not c.get("node_conditions_healthy")
+                for c in conds
+            ):
+                return True
+            # Secondary: an actual eviction (kubelet acting under pressure). Scope
+            # to summary + warning_events so the raw node object in
+            # details["queries"] (healthy "DiskPressure"/"no disk pressure" text)
+            # cannot produce a false positive.
+            scoped = " ".join(
+                [r.summary or "", _leaf_text(details.get("warning_events"))]
+            ).lower()
+            if _keyword_hits(scoped, list(_NODE_CONDITION_TOKENS))[0]:
+                return True
+        elif agent == "prometheus":
+            # Prometheus carries no raw node object; a negation-aware hit on its
+            # metric/summary text (e.g. condition MemoryPressure=true) is genuine.
+            if _keyword_hits(_result_text(r), list(_NODE_CONDITION_TOKENS))[0]:
+                return True
+    return False
+
 
 @dataclass
 class RankedCause:
@@ -74,6 +200,22 @@ class RankedCause:
     score: float
     rationale: list[str] = field(default_factory=list)
     evidence_agents: list[str] = field(default_factory=list)
+    # Multi-axis facets (the (Locus, Nature, Trigger) frame). The `family` stays
+    # the headline label; these annotate WHERE (subsystem/Locus), WHAT KIND
+    # (nature: fault / saturation / lifecycle_change / observability), and WHAT
+    # SET IT OFF (trigger: the proximate change, when known). subsystem/nature are
+    # intrinsic to the family and auto-filled in __post_init__ so every
+    # construction site (ranker + pipeline promotions) carries them; trigger is
+    # dynamic and set by the ranker from the lifecycle/change signal when present.
+    subsystem: str = ""
+    nature: str = ""
+    trigger: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.subsystem or not self.nature:
+            sub, nat = _family_facets(self.family)
+            self.subsystem = self.subsystem or sub
+            self.nature = self.nature or nat
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -82,6 +224,9 @@ class RankedCause:
             "score": round(self.score, 2),
             "rationale": self.rationale,
             "evidence_agents": self.evidence_agents,
+            "subsystem": self.subsystem,
+            "nature": self.nature,
+            "trigger": self.trigger,
         }
 
 
@@ -100,7 +245,27 @@ def rank_root_cause_candidates(
     top_n: int = 3,
     kg_blast_radius: int = 0,
     priors: dict[str, float] | None = None,
+    component_family: str = "",
+    component: str = "",
+    depends_on_chain: list[str] | None = None,
+    lifecycle: dict[str, Any] | None = None,
 ) -> list[RankedCause]:
+    """Rank failure families for THIS incident from collector evidence.
+
+    ``component_family`` / ``component`` / ``depends_on_chain`` carry the
+    *topology* signal the planner already resolved (``component_for_target``):
+    when the alert TARGET itself IS a known platform component, its curated
+    family is a topology FACT (WHO the alert is about), not a keyword guess. It
+    is injected as a first-class candidate so a keyword-only node/workload match
+    cannot bury the real subsystem — while an exact dispositive signature (XID /
+    known-issue) still overrides later via ``_promote_signature_cause``.
+
+    ``lifecycle`` carries the Nature axis: when the change collector shows the
+    implicated component (or its depends_on chain) is mid-rollout / upgrading,
+    the disruption is EXPECTED, not a fault — the ``platform_lifecycle_change``
+    family leads and node-pressure blast is not force-flagged. An empty/absent
+    ``lifecycle`` leaves ranking unchanged (backward compatible).
+    """
     top_n = max(1, top_n)
     text_by_agent = {r.agent: _result_text(r) for r in results}
     status_by_agent = {r.agent: r.status for r in results}
@@ -126,7 +291,26 @@ def rank_root_cause_candidates(
             s.agents.add(agent)
             s.rationale.append(f"{agent} evidence matched {', '.join(hits[:3])}")
 
-    _apply_bonuses(scores, blast, blast_agents, occurrence_count)
+    _apply_bonuses(
+        scores,
+        blast,
+        blast_agents,
+        occurrence_count,
+        component_family,
+        lifecycle_active=bool(lifecycle and lifecycle.get("active")),
+        node_condition=_node_condition_present(results),
+    )
+
+    # Topology identity: the alert TARGET itself IS a known platform component.
+    # Its curated family leads over keyword-only competitors and its depends_on
+    # chain names the subsystem to inspect (e.g. runai-container-toolkit → the
+    # NVIDIA GPU Operator stack), even when every collector came back empty.
+    _apply_component_identity(scores, component_family, component, depends_on_chain or [])
+
+    # Nature axis: a rollout/upgrade in progress on the implicated component is a
+    # lifecycle EVENT, not a fault. Applied AFTER component identity so it floors
+    # above the (already boosted) subsystem-fault family.
+    _apply_lifecycle_gate(scores, lifecycle)
 
     # Optional feedback-derived priors nudge a family that already has a signal
     # (multiplier on its score). Priors never create a candidate from nothing.
@@ -148,6 +332,14 @@ def rank_root_cause_candidates(
         for fam, s in scores.items()
         if s.points > 0
     ]
+    # Trigger facet: name the proximate change on the lifecycle candidate (its
+    # nature is a rollout/upgrade, so the Trigger is that change). Subsystem/nature
+    # are auto-filled per family in RankedCause.__post_init__.
+    trigger = _lifecycle_trigger(lifecycle)
+    if trigger:
+        for c in ranked:
+            if c.family == _LIFECYCLE_FAMILY:
+                c.trigger = trigger
     ranked.sort(key=lambda c: c.score, reverse=True)
 
     # R6 evidence gate: no family clears the floor / has no corroboration.
@@ -162,6 +354,9 @@ def _apply_bonuses(
     blast: int,
     blast_agents: set[str],
     occurrence_count: int,
+    component_family: str = "",
+    lifecycle_active: bool = False,
+    node_condition: bool = True,
 ) -> None:
     node = scores["node_kubelet_pressure"]
     startup = scores["workload_startup_error"]
@@ -169,7 +364,28 @@ def _apply_bonuses(
     control = scores["runai_control_plane_error"]
 
     # R1: node pressure with blast radius across >=2 workloads on the node.
-    if node.points > 0 and blast >= 2:
+    # BUT when the alert TARGET itself IS a non-node platform component, OR a
+    # rollout/upgrade is in progress, that explains the multi-pod impact — a stuck
+    # DaemonSet / rolling operand touches many nodes/pods without the NODE being
+    # under pressure. In those cases the blast bonus must NOT inflate or force
+    # node_kubelet_pressure high (this exact misfire ranked a gpu-operator upgrade
+    # as "node kubelet pressure, HIGH").
+    #
+    # P3: the blast force-high ALSO requires a genuine node-CONDITION signal
+    # (DiskPressure/MemoryPressure/PIDPressure/eviction). The family can score on
+    # SOFT tokens ("kubelet", "device plugin") that a subsystem's coordinated
+    # DaemonSet rollout emits without any node condition; a blast radius must not
+    # turn that soft co-occurrence into a forced HIGH when the node itself reports
+    # no pressure — that's the single-owner/subsystem multi-node rollout case that
+    # neither component-identity nor a (possibly undetected) lifecycle signal caught.
+    node_is_identified = component_family in ("", "node_kubelet_pressure")
+    if (
+        node.points > 0
+        and blast >= 2
+        and node_is_identified
+        and not lifecycle_active
+        and node_condition
+    ):
         node.points += 3.0
         node.agents.update(blast_agents)
         node.force_high = True
@@ -190,8 +406,118 @@ def _apply_bonuses(
                 s.rationale.append("alert is flapping (grouped occurrences) — cycling workload")
 
 
+# The alert TARGET being a known platform component is a topology fact, not a
+# keyword guess. This weight lets its curated family lead a keyword-only node or
+# workload match, yet stays low enough that a strongly corroborated (>=2 agents)
+# error family, or an exact dispositive signature applied AFTER ranking (XID /
+# known-issue via _promote_signature_cause), can still win.
+_COMPONENT_IDENTITY_WEIGHT = 4.0
+
+# Synthetic agents are topology/KG facts injected by the ranker itself; they do
+# not independently OBSERVE a failure, so they must not count as one of the
+# corroborating evidence sources required for HIGH confidence.
+_SYNTHETIC_AGENTS = {"topology", "knowledge-graph"}
+
+
+def _apply_component_identity(
+    scores: dict[str, _Score],
+    family: str,
+    component: str,
+    chain: list[str],
+) -> None:
+    """Elevate the family named by the alert target's component identity.
+
+    ``family`` is ``component_entry['family']`` from runai_architecture.yaml
+    (already resolved by the planner). Adds a ``topology`` agent so the candidate
+    clears the evidence floor from a real, non-keyword source, and records the
+    depends_on check order so the report points at the right subsystem.
+
+    Leadership rule: the identity must out-rank any family that is NOT
+    corroborated by >=2 real evidence agents (a keyword-only node/workload guess),
+    yet concede to a family that IS multi-source corroborated. So we raise it a
+    fixed step, then floor it just above the strongest weakly-corroborated rival.
+    """
+    if not family or family not in scores:
+        return
+    s = scores[family]
+    s.agents.add("topology")
+    # "Real" corroboration = distinct evidence agents, excluding the synthetic
+    # topology/KG signals that don't independently observe a failure.
+    strongest_weak_rival = max(
+        (
+            other.points
+            for fam, other in scores.items()
+            if fam != family and len(other.agents - _SYNTHETIC_AGENTS) < 2
+        ),
+        default=0.0,
+    )
+    s.points = max(s.points + _COMPONENT_IDENTITY_WEIGHT, strongest_weak_rival + 1.0)
+    where = f"alert target IS platform component {component}" if component else (
+        "alert target is a known platform component"
+    )
+    if len(chain) > 1:
+        where += f" → check depends_on: {' → '.join(chain)}"
+    s.rationale.append(f"{where} ⇒ {family}")
+
+
+_LIFECYCLE_FAMILY = "platform_lifecycle_change"
+
+
+def _apply_lifecycle_gate(scores: dict[str, _Score], lifecycle: dict[str, Any] | None) -> None:
+    """Lead the lifecycle family when the implicated component is mid-rollout.
+
+    ``lifecycle`` (from the change collector, resolved in the pipeline) carries:
+      - ``active``: a rollout/upgrade touching the implicated component or a
+        component in its depends_on chain is in progress,
+      - ``components``: the names of those rolling components (for the rationale),
+      - ``target_rollout``: the alert's OWN component is the one rolling out — the
+        alert IS about the rollout, which is dispositive (force high),
+      - ``helm``: optional Helm-revision note.
+
+    Absent/inactive ``lifecycle`` is a no-op (ranking stays legacy). The ``change``
+    collector is a REAL observer, so it counts toward the >=2-agent HIGH gate; but
+    with only ``change`` observing, confidence stays medium unless ``target_rollout``
+    makes it dispositive. An exact hardware signature (XID) still overrides later
+    via ``_promote_signature_cause`` — an upgrade window doesn't excuse a real fault.
+    """
+    if not lifecycle or not lifecycle.get("active"):
+        return
+    fam = _LIFECYCLE_FAMILY
+    if fam not in scores:
+        return
+    s = scores[fam]
+    s.agents.add("change")
+    strongest_weak_rival = max(
+        (
+            other.points
+            for f, other in scores.items()
+            if f != fam and len(other.agents - _SYNTHETIC_AGENTS) < 2
+        ),
+        default=0.0,
+    )
+    s.points = max(s.points + _COMPONENT_IDENTITY_WEIGHT, strongest_weak_rival + 1.0)
+    components = [c for c in (lifecycle.get("components") or []) if c]
+    where = "rollout/upgrade in progress"
+    if components:
+        where += " on " + ", ".join(components)
+    helm = lifecycle.get("helm")
+    if helm:
+        helm_note = ", ".join(str(h) for h in helm) if isinstance(helm, (list, tuple)) else str(helm)
+        where += f"; {helm_note}"
+    s.rationale.append(
+        f"{where} ⇒ expected disruption, not a fault — "
+        "verify the rollout/Helm release completed"
+    )
+    # The alert's OWN component is the one rolling => the alert IS the rollout.
+    if lifecycle.get("target_rollout"):
+        s.force_high = True
+
+
 def _confidence(fam: str, s: _Score, status_by_agent: dict[str, str]) -> str:
-    if s.force_high or (s.points >= _HIGH and len(s.agents) >= 2):
+    # HIGH requires >=2 agents that genuinely OBSERVED the failure; the synthetic
+    # topology/KG signals can floor a score but cannot, alone, unlock HIGH.
+    real_agents = len(s.agents - _SYNTHETIC_AGENTS)
+    if s.force_high or (s.points >= _HIGH and real_agents >= 2):
         level = 2  # high
     elif s.points >= _MED or s.agents:
         level = 1  # medium
