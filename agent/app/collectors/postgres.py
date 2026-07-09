@@ -299,7 +299,6 @@ async def _collect_postgres_checks(
               'alerts',
               'incident_embeddings',
               'rca_feedback',
-              'rca_comments',
               'analysis_runs'
             ])
               AS table_name
@@ -387,7 +386,6 @@ async def _collect_postgres_checks_mcp(
               'alerts',
               'incident_embeddings',
               'rca_feedback',
-              'rca_comments',
               'analysis_runs'
             ])
               AS table_name

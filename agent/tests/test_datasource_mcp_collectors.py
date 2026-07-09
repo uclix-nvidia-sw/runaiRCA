@@ -128,7 +128,6 @@ async def test_postgres_collector_uses_mcp_before_asyncpg(monkeypatch) -> None:
                     {"table_name": "alerts", "exists": True},
                     {"table_name": "incident_embeddings", "exists": True},
                     {"table_name": "rca_feedback", "exists": True},
-                    {"table_name": "rca_comments", "exists": True},
                     {"table_name": "analysis_runs", "exists": True},
                 ]
             )

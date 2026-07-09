@@ -199,19 +199,15 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			thread_ts TEXT NOT NULL,
 			labels JSONB NOT NULL DEFAULT '{}'::jsonb,
 			annotations JSONB NOT NULL DEFAULT '{}'::jsonb,
-			analysis_summary TEXT NOT NULL DEFAULT '',
-			analysis_detail TEXT NOT NULL DEFAULT '',
-			analysis_quality TEXT NOT NULL DEFAULT '',
-			root_cause_family TEXT NOT NULL DEFAULT '',
-			capabilities JSONB NOT NULL DEFAULT '{}'::jsonb,
-			missing_data JSONB NOT NULL DEFAULT '[]'::jsonb,
-			warnings JSONB NOT NULL DEFAULT '[]'::jsonb,
-			artifacts JSONB NOT NULL DEFAULT '[]'::jsonb,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		// Per-alert RCA columns (analysis_summary/detail/quality/root_cause_family/
+		// capabilities/missing_data/warnings/artifacts) are NO LONGER used — the RCA
+		// lives on analysis_runs. They are intentionally not (re)created here; drop
+		// them from existing DBs manually. No ADD COLUMN for them (that would undo the
+		// manual DROP on the next startup).
 		`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS occurrence_count INTEGER NOT NULL DEFAULT 1`,
 		`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS occurrence_pods JSONB NOT NULL DEFAULT '[]'::jsonb`,
-		`ALTER TABLE alerts ADD COLUMN IF NOT EXISTS root_cause_family TEXT NOT NULL DEFAULT ''`,
 		`CREATE TABLE IF NOT EXISTS incident_embeddings (
 			incident_id TEXT NOT NULL,
 			alert_id TEXT NOT NULL,
@@ -247,25 +243,60 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 		END $$`,
 		`CREATE TABLE IF NOT EXISTS rca_feedback (
 			feedback_id TEXT PRIMARY KEY,
+			kind TEXT NOT NULL DEFAULT 'vote',
 			target_type TEXT NOT NULL,
 			target_id TEXT NOT NULL,
 			incident_id TEXT,
 			alert_id TEXT,
-			vote TEXT NOT NULL,
-			comment TEXT NOT NULL DEFAULT '',
+			vote TEXT,
+			body TEXT NOT NULL DEFAULT '',
 			author TEXT NOT NULL DEFAULT '',
-			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
-		`CREATE TABLE IF NOT EXISTS rca_comments (
-			comment_id TEXT PRIMARY KEY,
-			target_type TEXT NOT NULL,
-			target_id TEXT NOT NULL,
-			incident_id TEXT,
-			alert_id TEXT,
-			body TEXT NOT NULL,
-			author TEXT NOT NULL DEFAULT '',
-			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-		)`,
+		`ALTER TABLE rca_feedback ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'vote'`,
+		`ALTER TABLE rca_feedback ADD COLUMN IF NOT EXISTS body TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE rca_feedback ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()`,
+		`ALTER TABLE rca_feedback ALTER COLUMN vote DROP NOT NULL`,
+		`UPDATE rca_feedback SET kind = 'vote' WHERE kind IS NULL OR kind = ''`,
+		`DO $$
+		BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = 'public' AND table_name = 'rca_feedback' AND column_name = 'comment'
+			) THEN
+				EXECUTE '
+					UPDATE rca_feedback
+					   SET body = comment
+					 WHERE kind = ''vote''
+					   AND body = ''''
+					   AND comment IS NOT NULL
+					   AND comment <> ''''
+				';
+			END IF;
+		END $$`,
+		`DO $$
+		BEGIN
+			IF to_regclass('public.rca_comments') IS NOT NULL THEN
+				INSERT INTO rca_feedback (
+					feedback_id, kind, target_type, target_id, incident_id, alert_id,
+					vote, body, author, created_at, updated_at
+				)
+				SELECT
+					comment_id, 'comment', target_type, target_id, incident_id, alert_id,
+					NULL, body, author, created_at, created_at
+				FROM rca_comments
+				ON CONFLICT (feedback_id) DO NOTHING;
+				-- rca_comments is kept for operator verification/rollback; DROP TABLE manually after migration.
+			END IF;
+		END $$`,
+		`ALTER TABLE rca_feedback DROP CONSTRAINT IF EXISTS rca_feedback_kind_check`,
+		`ALTER TABLE rca_feedback ADD CONSTRAINT rca_feedback_kind_check CHECK (kind IN ('vote', 'comment')) NOT VALID`,
+		`ALTER TABLE rca_feedback DROP CONSTRAINT IF EXISTS rca_feedback_payload_check`,
+		`ALTER TABLE rca_feedback ADD CONSTRAINT rca_feedback_payload_check CHECK (
+			(kind = 'vote' AND vote IN ('up', 'down')) OR
+			(kind = 'comment' AND vote IS NULL AND body <> '')
+		) NOT VALID`,
 		`CREATE TABLE IF NOT EXISTS analysis_runs (
 			run_id TEXT PRIMARY KEY,
 			source TEXT NOT NULL,
@@ -304,7 +335,7 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_alerts_incident_id ON alerts (incident_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_feedback_target ON rca_feedback (target_type, target_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_comments_target ON rca_comments (target_type, target_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_one_vote_per_author ON rca_feedback (target_type, target_id, author) WHERE kind = 'vote'`,
 		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_created_at ON analysis_runs (created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_target ON analysis_runs (target_type, target_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_chat_conversations_updated_at ON chat_conversations (updated_at DESC)`,
@@ -444,9 +475,7 @@ func (s *Store) loadAlerts(ctx context.Context) {
 	rows, err := s.db.QueryContext(
 		ctx,
 		`SELECT alert_id, incident_id, alarm_title, severity, status, fired_at,
-		        resolved_at, fingerprint, occurrence_count, occurrence_pods, thread_ts, labels, annotations,
-		        analysis_summary, analysis_detail, analysis_quality, root_cause_family, capabilities,
-		        missing_data, warnings, artifacts
+		        resolved_at, fingerprint, occurrence_count, occurrence_pods, thread_ts, labels, annotations
 		   FROM alerts`,
 	)
 	if err != nil {
@@ -458,7 +487,7 @@ func (s *Store) loadAlerts(ctx context.Context) {
 	defer s.mu.Unlock()
 	for rows.Next() {
 		var alert AlertRecord
-		var labelsRaw, annotationsRaw, capabilitiesRaw, missingRaw, warningsRaw, artifactsRaw []byte
+		var labelsRaw, annotationsRaw []byte
 		var occurrencePodsRaw []byte
 		if err := rows.Scan(
 			&alert.AlertID,
@@ -474,14 +503,6 @@ func (s *Store) loadAlerts(ctx context.Context) {
 			&alert.ThreadTS,
 			&labelsRaw,
 			&annotationsRaw,
-			&alert.AnalysisSummary,
-			&alert.AnalysisDetail,
-			&alert.AnalysisQuality,
-			&alert.RootCauseFamily,
-			&capabilitiesRaw,
-			&missingRaw,
-			&warningsRaw,
-			&artifactsRaw,
 		); err != nil {
 			log.Printf("Failed to scan alert: %v", err)
 			continue
@@ -489,10 +510,6 @@ func (s *Store) loadAlerts(ctx context.Context) {
 		_ = json.Unmarshal(labelsRaw, &alert.Labels)
 		_ = json.Unmarshal(annotationsRaw, &alert.Annotations)
 		_ = json.Unmarshal(occurrencePodsRaw, &alert.OccurrencePods)
-		_ = json.Unmarshal(capabilitiesRaw, &alert.Capabilities)
-		_ = json.Unmarshal(missingRaw, &alert.MissingData)
-		_ = json.Unmarshal(warningsRaw, &alert.Warnings)
-		_ = json.Unmarshal(artifactsRaw, &alert.Artifacts)
 		if alert.OccurrenceCount <= 0 {
 			alert.OccurrenceCount = 1
 		}
@@ -651,8 +668,9 @@ func (s *Store) loadFeedback(ctx context.Context) {
 	rows, err := s.db.QueryContext(
 		ctx,
 		`SELECT feedback_id, target_type, target_id, incident_id, alert_id, vote,
-		        comment, author, created_at
-		   FROM rca_feedback`,
+		        body, author, created_at
+		   FROM rca_feedback
+		  WHERE kind = 'vote'`,
 	)
 	if err != nil {
 		log.Printf("Failed to load feedback: %v", err)
@@ -684,9 +702,10 @@ func (s *Store) loadFeedback(ctx context.Context) {
 func (s *Store) loadComments(ctx context.Context) {
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT comment_id, target_type, target_id, incident_id, alert_id, body,
+		`SELECT feedback_id, target_type, target_id, incident_id, alert_id, body,
 		        author, created_at
-		   FROM rca_comments`,
+		   FROM rca_feedback
+		  WHERE kind = 'comment'`,
 	)
 	if err != nil {
 		log.Printf("Failed to load comments: %v", err)
@@ -867,16 +886,23 @@ func (s *Store) persistHardDeleteIncidentLocked(incidentID string, alertIDs []st
 			_ = tx.Rollback()
 		}
 	}()
-	for _, query := range []string{
-		`DELETE FROM analysis_runs WHERE incident_id = $1 OR alert_id = ANY($2)`,
-		`DELETE FROM chat_conversations WHERE incident_id = $1 OR alert_id = ANY($2)`,
-		`DELETE FROM rca_comments WHERE incident_id = $1 OR target_id = $1 OR alert_id = ANY($2) OR target_id = ANY($2)`,
-		`DELETE FROM rca_feedback WHERE incident_id = $1 OR target_id = $1 OR alert_id = ANY($2) OR target_id = ANY($2)`,
-		`DELETE FROM incident_embeddings WHERE incident_id = $1 OR alert_id = ANY($2)`,
-		`DELETE FROM alerts WHERE incident_id = $1`,
-		`DELETE FROM incidents WHERE incident_id = $1`,
-	} {
-		if _, err := tx.ExecContext(ctx, query, incidentID, alertIDs); err != nil {
+	// Each query gets EXACTLY the args it references. The last two use only $1 —
+	// passing $2 too made pgx/Postgres reject the bind ("2 parameters, statement
+	// requires 1"), failing the whole tx so hard delete silently 404'd. (The unit
+	// test's fake driver doesn't enforce bind-param counts, so it never caught this.)
+	ops := []struct {
+		query string
+		args  []any
+	}{
+		{`DELETE FROM analysis_runs WHERE incident_id = $1 OR alert_id = ANY($2)`, []any{incidentID, alertIDs}},
+		{`DELETE FROM chat_conversations WHERE incident_id = $1 OR alert_id = ANY($2)`, []any{incidentID, alertIDs}},
+		{`DELETE FROM rca_feedback WHERE incident_id = $1 OR target_id = $1 OR alert_id = ANY($2) OR target_id = ANY($2)`, []any{incidentID, alertIDs}},
+		{`DELETE FROM incident_embeddings WHERE incident_id = $1 OR alert_id = ANY($2)`, []any{incidentID, alertIDs}},
+		{`DELETE FROM alerts WHERE incident_id = $1`, []any{incidentID}},
+		{`DELETE FROM incidents WHERE incident_id = $1`, []any{incidentID}},
+	}
+	for _, op := range ops {
+		if _, err := tx.ExecContext(ctx, op.query, op.args...); err != nil {
 			log.Printf("Failed to hard delete incident %s: %v", incidentID, err)
 			return false
 		}
@@ -896,12 +922,9 @@ func (s *Store) persistAlertLocked(alert *AlertRecord) bool {
 	_, err := s.execPostgres(
 		`INSERT INTO alerts (
 			alert_id, incident_id, alarm_title, severity, status, fired_at,
-			resolved_at, fingerprint, occurrence_count, occurrence_pods, thread_ts, labels, annotations,
-			analysis_summary, analysis_detail, analysis_quality, capabilities,
-			missing_data, warnings, artifacts, root_cause_family, updated_at
+			resolved_at, fingerprint, occurrence_count, occurrence_pods, thread_ts, labels, annotations, updated_at
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-			$16, $17, $18, $19, $20, $21, now()
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now()
 		)
 		ON CONFLICT (alert_id) DO UPDATE SET
 			incident_id = EXCLUDED.incident_id,
@@ -916,14 +939,6 @@ func (s *Store) persistAlertLocked(alert *AlertRecord) bool {
 			thread_ts = EXCLUDED.thread_ts,
 			labels = EXCLUDED.labels,
 			annotations = EXCLUDED.annotations,
-			analysis_summary = EXCLUDED.analysis_summary,
-			analysis_detail = EXCLUDED.analysis_detail,
-			analysis_quality = EXCLUDED.analysis_quality,
-			root_cause_family = EXCLUDED.root_cause_family,
-			capabilities = EXCLUDED.capabilities,
-			missing_data = EXCLUDED.missing_data,
-			warnings = EXCLUDED.warnings,
-			artifacts = EXCLUDED.artifacts,
 			updated_at = now()`,
 		alert.AlertID,
 		alert.IncidentID,
@@ -938,14 +953,6 @@ func (s *Store) persistAlertLocked(alert *AlertRecord) bool {
 		alert.ThreadTS,
 		mustJSON(alert.Labels),
 		mustJSON(alert.Annotations),
-		alert.AnalysisSummary,
-		alert.AnalysisDetail,
-		alert.AnalysisQuality,
-		mustJSON(alert.Capabilities),
-		mustJSON(alert.MissingData),
-		mustJSON(alert.Warnings),
-		mustJSON(alert.Artifacts),
-		alert.RootCauseFamily,
 	)
 	if err != nil {
 		log.Printf("Failed to persist alert %s: %v", alert.AlertID, err)
@@ -1029,9 +1036,9 @@ func (s *Store) persistFeedbackLocked(record *FeedbackRecord) {
 	}
 	_, err := s.execPostgres(
 		`INSERT INTO rca_feedback (
-			feedback_id, target_type, target_id, incident_id, alert_id, vote,
-			comment, author, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			feedback_id, kind, target_type, target_id, incident_id, alert_id,
+			vote, body, author, created_at, updated_at
+		) VALUES ($1, 'vote', $2, $3, $4, $5, $6, $7, $8, $9, $9)
 		ON CONFLICT (feedback_id) DO NOTHING`,
 		record.FeedbackID,
 		record.TargetType,
@@ -1054,7 +1061,7 @@ func (s *Store) persistFeedbackDeleteForActorLocked(targetType string, targetID 
 	}
 	if _, err := s.execPostgres(
 		`DELETE FROM rca_feedback
-		  WHERE target_type = $1 AND target_id = $2 AND author = $3`,
+		  WHERE kind = 'vote' AND target_type = $1 AND target_id = $2 AND author = $3`,
 		targetType,
 		targetID,
 		feedbackActor(author),
@@ -1068,11 +1075,11 @@ func (s *Store) persistCommentLocked(record *CommentRecord) {
 		return
 	}
 	_, err := s.execPostgres(
-		`INSERT INTO rca_comments (
-			comment_id, target_type, target_id, incident_id, alert_id, body,
-			author, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (comment_id) DO NOTHING`,
+		`INSERT INTO rca_feedback (
+			feedback_id, kind, target_type, target_id, incident_id, alert_id,
+			vote, body, author, created_at, updated_at
+		) VALUES ($1, 'comment', $2, $3, $4, $5, NULL, $6, $7, $8, $8)
+		ON CONFLICT (feedback_id) DO NOTHING`,
 		record.CommentID,
 		record.TargetType,
 		record.TargetID,
@@ -1092,9 +1099,9 @@ func (s *Store) persistCommentUpdateLocked(record *CommentRecord) {
 		return
 	}
 	_, err := s.execPostgres(
-		`UPDATE rca_comments
-		    SET body = $1, author = $2
-		  WHERE comment_id = $3`,
+		`UPDATE rca_feedback
+		    SET body = $1, author = $2, updated_at = now()
+		  WHERE feedback_id = $3 AND kind = 'comment'`,
 		record.Body,
 		record.Author,
 		record.CommentID,
@@ -1108,8 +1115,24 @@ func (s *Store) persistCommentDeleteLocked(commentID string) {
 	if s.db == nil || !s.dbReady || commentID == "" {
 		return
 	}
-	if _, err := s.execPostgres(`DELETE FROM rca_comments WHERE comment_id = $1`, commentID); err != nil {
+	if _, err := s.execPostgres(`DELETE FROM rca_feedback WHERE feedback_id = $1 AND kind = 'comment'`, commentID); err != nil {
 		log.Printf("Failed to delete comment %s: %v", commentID, err)
+	}
+}
+
+func (s *Store) persistFeedbackCommentUpdateLocked(record *FeedbackRecord) {
+	if s.db == nil || !s.dbReady || record == nil {
+		return
+	}
+	_, err := s.execPostgres(
+		`UPDATE rca_feedback
+		    SET body = $1, updated_at = now()
+		  WHERE feedback_id = $2 AND kind = 'vote'`,
+		record.Comment,
+		record.FeedbackID,
+	)
+	if err != nil {
+		log.Printf("Failed to update feedback comment %s: %v", record.FeedbackID, err)
 	}
 }
 

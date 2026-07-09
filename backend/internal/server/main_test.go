@@ -979,13 +979,11 @@ func TestChatHistoryPersistsListsAndDeletes(t *testing.T) {
 
 func TestIncidentChatContextSummarizesAlerts(t *testing.T) {
 	alerts := []AlertRecord{{
-		AlertID:         "ALR-chat-context",
-		AlarmTitle:      "RunAIQueueBlocked",
-		Severity:        "warning",
-		Status:          "firing",
-		AnalysisSummary: "large RCA summary",
-		AnalysisDetail:  strings.Repeat("detail ", 100),
-		Labels:          map[string]string{"queue": "gpu-a"},
+		AlertID:    "ALR-chat-context",
+		AlarmTitle: "RunAIQueueBlocked",
+		Severity:   "warning",
+		Status:     "firing",
+		Labels:     map[string]string{"queue": "gpu-a"},
 	}}
 	for i := 0; i < dashboardChatRecentLimit+2; i++ {
 		alerts = append(alerts, AlertRecord{
@@ -1505,7 +1503,9 @@ func TestFeedbackAndSimilarIncidentMemory(t *testing.T) {
 	}
 }
 
-func TestIncidentMemoryKeepsMultipleAlertAnalyses(t *testing.T) {
+func TestIncidentMemoryIsOnePerIncidentFromLatestRun(t *testing.T) {
+	// Memory is one embedding per incident now (not one per alert), sourced from the
+	// incident's latest analysis run.
 	store := NewStore()
 	incident, first := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "multi-memory"}, Alert{
 		Status:      "firing",
@@ -1529,31 +1529,34 @@ func TestIncidentMemoryKeepsMultipleAlertAnalyses(t *testing.T) {
 	}
 	store.mu.Unlock()
 
-	store.ApplyAnalysis(first.AlertID, AgentAnalysisResponse{
-		Status:          "ok",
-		AnalysisSummary: "Queue saturation RCA.",
-		AnalysisDetail:  "Queue workers are waiting.",
-	})
-	store.ApplyAnalysis(secondID, AgentAnalysisResponse{
-		Status:          "ok",
-		AnalysisSummary: "Quota exhaustion RCA.",
-		AnalysisDetail:  "GPU quota is exhausted.",
-	})
+	// Seed two completed runs with distinct timestamps so "latest" is deterministic.
+	base := first.FiredAt
+	store.mu.Lock()
+	store.analysisRuns["RUN-first"] = &AnalysisRun{
+		RunID: "RUN-first", Status: "complete", IncidentID: incident.IncidentID, AlertID: first.AlertID,
+		AnalysisSummary: "Queue saturation RCA.", AnalysisDetail: "Queue workers are waiting.", UpdatedAt: base,
+	}
+	store.analysisRuns["RUN-second"] = &AnalysisRun{
+		RunID: "RUN-second", Status: "complete", IncidentID: incident.IncidentID, AlertID: secondID,
+		AnalysisSummary: "Quota exhaustion RCA.", AnalysisDetail: "GPU quota is exhausted.",
+		UpdatedAt: base.Add(time.Minute),
+	}
+	store.mu.Unlock()
 
 	if len(store.memories) != 0 {
 		t.Fatalf("unresolved analysis should not create memory, got %+v", store.memories)
 	}
 	approveIncidentForTest(t, store, incident.IncidentID)
-	if len(store.memories) != 2 {
-		t.Fatalf("expected two alert memories, got %+v", store.memories)
+	if len(store.memories) != 1 {
+		t.Fatalf("expected exactly one incident memory, got %+v", store.memories)
 	}
-	firstMemory := store.memories[first.AlertID]
-	if firstMemory == nil || firstMemory.AnalysisSummary != "Queue saturation RCA." {
-		t.Fatalf("first alert memory was overwritten: %+v", firstMemory)
-	}
-	secondMemory := store.memories[secondID]
-	if secondMemory == nil || secondMemory.AnalysisSummary != "Quota exhaustion RCA." {
-		t.Fatalf("second alert memory missing: %+v", secondMemory)
+	for _, memory := range store.memories {
+		if memory.IncidentID != incident.IncidentID {
+			t.Fatalf("memory not keyed to the incident: %+v", memory)
+		}
+		if memory.AnalysisSummary != "Quota exhaustion RCA." {
+			t.Fatalf("incident memory should carry the latest run's RCA, got %q", memory.AnalysisSummary)
+		}
 	}
 }
 
@@ -1913,8 +1916,8 @@ func TestResolveEndpointTogglesUserApproval(t *testing.T) {
 	if !ok || detail.Status != "firing" || detail.ResolvedAt != nil || detail.UserApprovedAt == nil {
 		t.Fatalf("expected incident status to stay firing and user approval to be set, got ok=%t detail=%+v", ok, detail)
 	}
-	if memory := server.store.memories[record.AlertID]; memory == nil || memory.Status != "firing" {
-		t.Fatalf("expected alert memory to load after user approval, got %+v", memory)
+	if memory := server.store.memories[incident.IncidentID]; memory == nil || memory.Status != "firing" {
+		t.Fatalf("expected incident memory to load after user approval, got %+v", memory)
 	}
 
 	rec = httptest.NewRecorder()
@@ -1926,7 +1929,7 @@ func TestResolveEndpointTogglesUserApproval(t *testing.T) {
 	if !ok || detail.Status != "firing" || detail.ResolvedAt != nil || detail.UserApprovedAt != nil {
 		t.Fatalf("expected second resolve click to clear user approval only, got ok=%t detail=%+v", ok, detail)
 	}
-	if memory := server.store.memories[record.AlertID]; memory == nil {
+	if memory := server.store.memories[incident.IncidentID]; memory == nil {
 		t.Fatalf("expected memory row to remain for future reapproval, got %+v", memory)
 	}
 	if search := server.store.SearchIncidentMemory("quota blocked scheduling", 5); len(search) != 0 {
@@ -1941,62 +1944,47 @@ func TestResolveEndpointTogglesUserApproval(t *testing.T) {
 	}
 }
 
-func TestIncidentDetailAggregatesAlertAnalyses(t *testing.T) {
+func TestIncidentDetailUsesLatestAnalysisRun(t *testing.T) {
+	// Incident RCA now comes from the incident's latest completed analysis run
+	// (the durable store), not from concatenating the per-alert analysis columns.
 	store := NewStore()
-	incident, first := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "aggregate-rca"}, Alert{
+	incident, first := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "latest-run-rca"}, Alert{
 		Status:      "firing",
 		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
 		Annotations: map[string]string{"summary": "Queue blocked"},
-		Fingerprint: "fp-aggregate-first",
+		Fingerprint: "fp-latest-run",
 	})
-	secondID := "ALR-aggregate-second"
+	base := first.FiredAt
 	store.mu.Lock()
-	store.alerts[secondID] = &AlertRecord{
-		AlertID:     secondID,
-		IncidentID:  incident.IncidentID,
-		AlarmTitle:  "Quota alert",
-		Severity:    "critical",
-		Status:      "firing",
-		FiredAt:     first.FiredAt.Add(time.Minute),
-		Fingerprint: "fp-aggregate-second",
-		ThreadTS:    "thread-" + secondID,
-		Labels:      map[string]string{"alertname": "RunAIQuotaBlocked", "severity": "critical"},
-		Annotations: map[string]string{"summary": "Quota blocked"},
+	store.analysisRuns["RUN-old"] = &AnalysisRun{
+		RunID: "RUN-old", Status: "complete", IncidentID: incident.IncidentID, AlertID: first.AlertID,
+		AnalysisSummary: "Old superseded RCA.", AnalysisDetail: "Old detail.", UpdatedAt: base,
+	}
+	store.analysisRuns["RUN-new"] = &AnalysisRun{
+		RunID: "RUN-new", Status: "complete", IncidentID: incident.IncidentID, AlertID: first.AlertID,
+		AnalysisSummary: "Latest RCA.", AnalysisDetail: "GPU quota is exhausted.",
+		AnalysisQuality: "high", RootCauseFamily: "runai_scheduling_quota",
+		MissingData: []string{"loki.logs"}, Warnings: []string{"partial logs"},
+		Artifacts: []Artifact{{Agent: "runai", Source: "workloads", Type: "api", Status: "ok", Confidence: "high"}},
+		UpdatedAt: base.Add(time.Minute),
 	}
 	store.mu.Unlock()
-	store.ApplyAnalysis(first.AlertID, AgentAnalysisResponse{
-		Status:          "ok",
-		AnalysisSummary: "Queue saturation RCA.",
-		AnalysisDetail:  "Queue workers are waiting.",
-		AnalysisQuality: "medium",
-		MissingData:     []string{"loki.logs"},
-		Warnings:        []string{"partial logs"},
-		Artifacts:       []Artifact{{Agent: "runai", Source: "workloads", Type: "api", Status: "ok", Confidence: "high"}},
-	})
-	store.ApplyAnalysis(secondID, AgentAnalysisResponse{
-		Status:          "ok",
-		AnalysisSummary: "Quota exhaustion RCA.",
-		AnalysisDetail:  "GPU quota is exhausted.",
-		AnalysisQuality: "high",
-		MissingData:     []string{"loki.logs"},
-		Warnings:        []string{"partial logs"},
-		Artifacts:       []Artifact{{Agent: "runai", Source: "workloads", Type: "api", Status: "ok", Confidence: "high"}},
-	})
 
 	detail, ok := store.IncidentDetail(incident.IncidentID)
 	if !ok {
 		t.Fatalf("incident detail missing")
 	}
-	if !strings.Contains(detail.AnalysisSummary, "Queue saturation RCA.") ||
-		!strings.Contains(detail.AnalysisSummary, "Quota exhaustion RCA.") {
-		t.Fatalf("incident summary should aggregate alert RCA summaries, got %q", detail.AnalysisSummary)
+	if !strings.Contains(detail.AnalysisSummary, "Latest RCA.") || strings.Contains(detail.AnalysisSummary, "Old superseded RCA.") {
+		t.Fatalf("incident summary should be the latest run only, got %q", detail.AnalysisSummary)
 	}
-	if !strings.Contains(detail.AnalysisDetail, "Queue workers are waiting.") ||
-		!strings.Contains(detail.AnalysisDetail, "GPU quota is exhausted.") {
-		t.Fatalf("incident detail should aggregate alert RCA details, got %q", detail.AnalysisDetail)
+	if !strings.Contains(detail.AnalysisDetail, "GPU quota is exhausted.") {
+		t.Fatalf("incident detail should come from the latest run, got %q", detail.AnalysisDetail)
+	}
+	if detail.AnalysisQuality != "high" || detail.RootCauseFamily != "runai_scheduling_quota" {
+		t.Fatalf("incident should take quality/family from the latest run, got %q/%q", detail.AnalysisQuality, detail.RootCauseFamily)
 	}
 	if len(detail.MissingData) != 1 || len(detail.Warnings) != 1 || len(detail.Artifacts) != 1 {
-		t.Fatalf("incident RCA metadata should be deduplicated, got missing=%v warnings=%v artifacts=%v", detail.MissingData, detail.Warnings, detail.Artifacts)
+		t.Fatalf("incident RCA metadata should come from the run, got missing=%v warnings=%v artifacts=%v", detail.MissingData, detail.Warnings, detail.Artifacts)
 	}
 }
 
@@ -2010,11 +1998,12 @@ func TestIncidentDetailCapsAggregateAnalysisTextOnly(t *testing.T) {
 	})
 	longSummary := strings.Repeat("s", maxIncidentAggregateSummaryBytes+100)
 	longDetail := strings.Repeat("d", maxIncidentAggregateDetailBytes+100)
-	store.ApplyAnalysis(alert.AlertID, AgentAnalysisResponse{
-		Status:          "ok",
-		AnalysisSummary: longSummary,
-		AnalysisDetail:  longDetail,
-	})
+	store.mu.Lock()
+	store.analysisRuns["RUN-cap"] = &AnalysisRun{
+		RunID: "RUN-cap", Status: "complete", IncidentID: incident.IncidentID, AlertID: alert.AlertID,
+		AnalysisSummary: longSummary, AnalysisDetail: longDetail, UpdatedAt: alert.FiredAt,
+	}
+	store.mu.Unlock()
 
 	detail, ok := store.IncidentDetail(incident.IncidentID)
 	if !ok {
@@ -2022,14 +2011,11 @@ func TestIncidentDetailCapsAggregateAnalysisTextOnly(t *testing.T) {
 	}
 	if len(detail.AnalysisSummary) > maxIncidentAggregateSummaryBytes+len("...") ||
 		!strings.HasSuffix(detail.AnalysisSummary, "...") {
-		t.Fatalf("incident summary aggregate was not capped, len=%d", len(detail.AnalysisSummary))
+		t.Fatalf("incident summary was not capped, len=%d", len(detail.AnalysisSummary))
 	}
 	if len(detail.AnalysisDetail) > maxIncidentAggregateDetailBytes+len("...") ||
 		!strings.HasSuffix(detail.AnalysisDetail, "...") {
-		t.Fatalf("incident detail aggregate was not capped, len=%d", len(detail.AnalysisDetail))
-	}
-	if len(detail.Alerts) != 1 || detail.Alerts[0].AnalysisSummary != longSummary || detail.Alerts[0].AnalysisDetail != longDetail {
-		t.Fatalf("alert-level RCA should remain complete in incident detail")
+		t.Fatalf("incident detail was not capped, len=%d", len(detail.AnalysisDetail))
 	}
 }
 
@@ -2401,6 +2387,36 @@ func TestFeedbackVoteToggleCancelsSameActorVote(t *testing.T) {
 	}
 }
 
+func TestFeedbackInlineCommentStoredOnce(t *testing.T) {
+	store := NewStore()
+	incident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "feedback-inline-comment"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-feedback-inline-comment",
+	})
+
+	summary, ok, err := store.AddFeedback("incident", incident.IncidentID, FeedbackRequest{
+		Vote:    "up",
+		Comment: "useful RCA",
+		Author:  "operator",
+	})
+	if err != nil || !ok {
+		t.Fatalf("feedback failed: ok=%t err=%v", ok, err)
+	}
+	if summary.Positive != 1 || len(summary.Comments) != 1 || summary.Comments[0].Body != "useful RCA" {
+		t.Fatalf("unexpected summary: %+v", summary)
+	}
+	for _, record := range store.feedback {
+		if record.Comment != "" {
+			t.Fatalf("vote row should not duplicate inline comment text: %+v", record)
+		}
+	}
+	if prompt := store.OperatorPromptForTarget("incident", incident.IncidentID); !strings.Contains(prompt, "useful RCA") {
+		t.Fatalf("operator prompt should include inline comment, got %q", prompt)
+	}
+}
+
 func TestFeedbackRejectsOversizedCommentFields(t *testing.T) {
 	store := NewStore()
 	incident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "feedback-bounds"}, Alert{
@@ -2688,6 +2704,66 @@ func TestResolvedThenRefiringGrowsOccurrence(t *testing.T) {
 	}
 }
 
+func TestAutoAnalyzeSeverityGate(t *testing.T) {
+	if parseAutoAnalyzeSeverities("") != nil || parseAutoAnalyzeSeverities("all") != nil || parseAutoAnalyzeSeverities("*") != nil {
+		t.Fatalf("empty/all/* should mean no severity gating")
+	}
+	set := parseAutoAnalyzeSeverities("warning, Critical")
+	if !set["warning"] || !set["critical"] || set["none"] {
+		t.Fatalf("expected {warning,critical}, got %+v", set)
+	}
+	gated := &Server{autoAnalyzeSeverities: set}
+	if !gated.severityAutoAnalyzable("warning") || !gated.severityAutoAnalyzable("CRITICAL") {
+		t.Fatalf("warning/critical must be auto-analyzable")
+	}
+	if gated.severityAutoAnalyzable("none") || gated.severityAutoAnalyzable("info") {
+		t.Fatalf("none/info must be gated out of auto-analysis")
+	}
+	if !(&Server{}).severityAutoAnalyzable("none") {
+		t.Fatalf("a nil allowlist must auto-analyze every severity")
+	}
+}
+
+func TestApprovalSurvivesResolvedRefire(t *testing.T) {
+	// Regression: an approved incident was silently un-approved overnight when the
+	// same alert re-fired (resolved→firing cleared UserApprovedAt). Approval of the
+	// RCA must survive a recurrence of the same incident.
+	store := NewStore()
+	mk := func(status string, ts time.Time) (AlertmanagerWebhook, Alert) {
+		a := Alert{
+			Status:      status,
+			Labels:      map[string]string{"alertname": "RunaiReconcile", "namespace": "runai", "pod": "p-0"},
+			Annotations: map[string]string{},
+			Fingerprint: "fp-approve-refire",
+			StartsAt:    ts.Format(time.RFC3339),
+		}
+		if status == "resolved" {
+			a.EndsAt = ts.Format(time.RFC3339)
+		}
+		return AlertmanagerWebhook{}, a
+	}
+	base := time.Now().UTC().Add(-4 * time.Hour)
+	wh, a := mk("firing", base)
+	r1 := store.UpsertAlertResult(wh, a)
+	// Operator approves the incident's RCA.
+	now := time.Now().UTC()
+	store.incidents[r1.Incident.IncidentID].UserApprovedAt = &now
+	// Resolve, then the SAME alert re-fires within the reuse window (reuses the incident).
+	wh, a = mk("resolved", base.Add(30*time.Minute))
+	store.UpsertAlertResult(wh, a)
+	wh, a = mk("firing", base.Add(2*time.Hour))
+	r2 := store.UpsertAlertResult(wh, a)
+	if r2.Incident.IncidentID != r1.Incident.IncidentID {
+		t.Fatalf("re-fire should reuse incident: %s vs %s", r2.Incident.IncidentID, r1.Incident.IncidentID)
+	}
+	if r2.Incident.Status != "firing" {
+		t.Fatalf("re-fire status = %s, want firing", r2.Incident.Status)
+	}
+	if store.incidents[r1.Incident.IncidentID].UserApprovedAt == nil {
+		t.Fatalf("approval must survive a resolved→firing re-fire, got nil")
+	}
+}
+
 func TestTokenizeKeepsKoreanAndSimilarityIsHighForNearDuplicates(t *testing.T) {
 	// The old tokenizer dropped all Hangul, so near-identical Korean reports scored
 	// ~50%. Korean eojeols must now survive and drive a high similarity.
@@ -2766,7 +2842,7 @@ func TestIncidentLifecycleViewsAndDeletedGuards(t *testing.T) {
 	if got := store.LatestAlertID(); got != "" {
 		t.Fatalf("latest alert should exclude deleted incident alert, got %s", got)
 	}
-	if ids := store.AlertIDsNeedingAnalysis(10, 0, time.Now().UTC()); len(ids) != 0 {
+	if ids := store.AlertIDsNeedingAnalysis(10, 0, time.Now().UTC(), nil); len(ids) != 0 {
 		t.Fatalf("backfill should exclude deleted incident alerts: %+v", ids)
 	}
 	if _, _, _, _, _, ok := store.AnalysisTarget("incident", incident.IncidentID); ok {

@@ -348,17 +348,22 @@ async def loki_mcp_query(settings: Settings, name: str, logql: str) -> dict[str,
 async def _mcp_query_loki(
     url: str, name: str, logql: str, limit: int, datasource_uid: str = ""
 ) -> dict[str, object]:
-    args_list: list[dict[str, object]] = []
-    base_args = {"limit": limit, "direction": "BACKWARD"}
-    if datasource_uid:
-        args_list.extend(
-            [
-                {"datasourceUid": datasource_uid, "query": logql, **base_args},
-                {"datasourceUid": datasource_uid, "logql": logql, **base_args},
-                {"datasource_uid": datasource_uid, "query": logql, **base_args},
-            ]
+    # grafana-mcp's query_loki_logs REQUIRES a real datasourceUid. Sending an empty
+    # one (uid unresolved) makes it GET /datasources/uid/ -> 400 "id is invalid" on
+    # EVERY query. Fail fast with an actionable message instead of that noise; the
+    # caller records a clean fallback warning. (uid usually empty because grafana-mcp
+    # can't list datasources — set secrets.grafanaServiceAccountToken.)
+    if not datasource_uid:
+        raise RuntimeError(
+            "grafana datasource uid unresolved for loki — set "
+            "secrets.grafanaServiceAccountToken so grafana-mcp can list datasources"
         )
-    args_list.extend([{"query": logql, **base_args}, {"logql": logql, **base_args}])
+    base_args = {"limit": limit, "direction": "BACKWARD"}
+    args_list: list[dict[str, object]] = [
+        {"datasourceUid": datasource_uid, "query": logql, **base_args},
+        {"datasourceUid": datasource_uid, "logql": logql, **base_args},
+        {"datasource_uid": datasource_uid, "query": logql, **base_args},
+    ]
     data = await _call_mcp_json(url, "query_loki_logs", args_list)
     streams = _loki_streams(data)
     lines = _sample_lines(streams)

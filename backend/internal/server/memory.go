@@ -293,6 +293,28 @@ func (s *Store) ApplyAnalysis(alertID string, response AgentAnalysisResponse) {
 		return
 	}
 	s.applyAnalysisLocked(alert, response)
+	// Test-only helper: mirror production, where every applied analysis is backed by
+	// a completed analysis_run. IncidentDetail sources the incident RCA from the run.
+	now := time.Now().UTC()
+	runID := "RUN-" + alertID
+	s.analysisRuns[runID] = &AnalysisRun{
+		RunID:           runID,
+		Status:          "complete",
+		TargetType:      "alert",
+		TargetID:        alertID,
+		IncidentID:      alert.IncidentID,
+		AlertID:         alertID,
+		AnalysisSummary: response.AnalysisSummary,
+		AnalysisDetail:  first(response.AnalysisDetail, response.Analysis),
+		AnalysisQuality: response.AnalysisQuality,
+		RootCauseFamily: response.RootCauseFamily,
+		Capabilities:    response.Capabilities,
+		MissingData:     response.MissingData,
+		Warnings:        response.Warnings,
+		Artifacts:       response.Artifacts,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
 }
 
 // IsSupersededAnalysisRun reports whether a fresher analysis run has been started
@@ -315,18 +337,10 @@ func (s *Store) ApplyAnalysisForRun(runID string, alertID string, response Agent
 	if alert == nil || !s.isLatestAnalysisRunForAlertLocked(runID, alertID) {
 		return false
 	}
+	// The RCA itself lives on the analysis run (CompleteAnalysisRun); here we only
+	// clear the analyzing flag and refresh the incident's aggregate state. The
+	// `response` is retained on the run, not duplicated onto the alert.
 	before := cloneAlert(alert)
-	alert.AnalysisSummary = response.AnalysisSummary
-	alert.AnalysisDetail = response.AnalysisDetail
-	if alert.AnalysisDetail == "" {
-		alert.AnalysisDetail = response.Analysis
-	}
-	alert.AnalysisQuality = response.AnalysisQuality
-	alert.RootCauseFamily = response.RootCauseFamily
-	alert.Capabilities = response.Capabilities
-	alert.MissingData = response.MissingData
-	alert.Warnings = response.Warnings
-	alert.Artifacts = response.Artifacts
 	alert.IsAnalyzing = false
 	if !s.persistAlertLocked(alert) {
 		*alert = *before
@@ -347,17 +361,8 @@ func (s *Store) ApplyAnalysisForRun(runID string, alertID string, response Agent
 }
 
 func (s *Store) applyAnalysisLocked(alert *AlertRecord, response AgentAnalysisResponse) {
-	alert.AnalysisSummary = response.AnalysisSummary
-	alert.AnalysisDetail = response.AnalysisDetail
-	if alert.AnalysisDetail == "" {
-		alert.AnalysisDetail = response.Analysis
-	}
-	alert.AnalysisQuality = response.AnalysisQuality
-	alert.RootCauseFamily = response.RootCauseFamily
-	alert.Capabilities = response.Capabilities
-	alert.MissingData = response.MissingData
-	alert.Warnings = response.Warnings
-	alert.Artifacts = response.Artifacts
+	// RCA lives on the analysis run now; this only clears the analyzing flag.
+	_ = response
 	alert.IsAnalyzing = false
 	if incident := s.incidents[alert.IncidentID]; incident != nil {
 		s.refreshIncidentAnalyzingLocked(incident.IncidentID)
@@ -434,29 +439,11 @@ func (s *Store) ApplyFallbackAnalysisIfAbsentForRun(runID string, alertID string
 }
 
 func (s *Store) applyFallbackAnalysisIfAbsentLocked(alert *AlertRecord, response AgentAnalysisResponse) bool {
-	hasExistingRCA := strings.TrimSpace(alert.AnalysisSummary) != "" ||
-		strings.TrimSpace(alert.AnalysisDetail) != ""
-	if hasExistingRCA {
-		alert.IsAnalyzing = false
-		if incident := s.incidents[alert.IncidentID]; incident != nil {
-			s.refreshIncidentAnalyzingLocked(incident.IncidentID)
-			s.persistIncidentLocked(incident)
-		}
-		s.persistAlertLocked(alert)
-		s.invalidateRecurrenceStatsLocked()
-		return false
-	}
-	alert.AnalysisSummary = response.AnalysisSummary
-	alert.AnalysisDetail = response.AnalysisDetail
-	if alert.AnalysisDetail == "" {
-		alert.AnalysisDetail = response.Analysis
-	}
-	alert.AnalysisQuality = first(response.AnalysisQuality, "low")
-	alert.RootCauseFamily = response.RootCauseFamily
-	alert.Capabilities = response.Capabilities
-	alert.MissingData = response.MissingData
-	alert.Warnings = response.Warnings
-	alert.Artifacts = response.Artifacts
+	// The fallback RCA is already stored on the failed run (FailAnalysisRun), and
+	// latestAnalysisRunForIncidentLocked prefers a `complete` run over a failed one —
+	// so the "keep the successful RCA, only surface fallback if nothing else" policy
+	// is handled by run selection. Here we just clear the analyzing state.
+	_ = response
 	alert.IsAnalyzing = false
 	if incident := s.incidents[alert.IncidentID]; incident != nil {
 		s.refreshIncidentAnalyzingLocked(incident.IncidentID)
@@ -505,17 +492,21 @@ func (s *Store) upsertMemoryLocked(incident *Incident, alert *AlertRecord) {
 	if incident == nil || alert == nil || !incidentUserApproved(incident) {
 		return
 	}
-	if strings.TrimSpace(alert.AnalysisSummary) == "" && strings.TrimSpace(alert.AnalysisDetail) == "" {
+	run := s.latestAnalysisRunForIncidentLocked(incident.IncidentID)
+	if run == nil {
 		return
 	}
+	// Incident-scoped, not alert-scoped: key by incident so a changed representative
+	// alert across re-approvals updates the one row instead of accumulating dupes.
+	// AlertID stays empty -> map key = IncidentID, DB unique (incident_id, '') = 1/incident.
 	memory := &IncidentMemory{
 		IncidentID:      incident.IncidentID,
-		AlertID:         alert.AlertID,
+		AlertID:         "",
 		Title:           incident.Title,
 		Severity:        incident.Severity,
 		Status:          incident.Status,
-		AnalysisSummary: alert.AnalysisSummary,
-		AnalysisDetail:  alert.AnalysisDetail,
+		AnalysisSummary: run.AnalysisSummary,
+		AnalysisDetail:  run.AnalysisDetail,
 		Labels:          cloneMap(alert.Labels),
 		CreatedAt:       time.Now().UTC(),
 	}
@@ -529,11 +520,22 @@ func (s *Store) upsertApprovedIncidentMemoriesLocked(incident *Incident) {
 	if !incidentUserApproved(incident) {
 		return
 	}
-	for _, alert := range s.alerts {
-		if alert != nil && alert.IncidentID == incident.IncidentID {
-			s.upsertMemoryLocked(incident, alert)
+	// One memory per incident, keyed to the analyzed alert (the run's target), so
+	// approving doesn't fan out identical embeddings across sibling alerts.
+	run := s.latestAnalysisRunForIncidentLocked(incident.IncidentID)
+	if run == nil {
+		return
+	}
+	alert := s.alerts[run.AlertID]
+	if alert == nil {
+		for _, member := range s.alerts {
+			if member != nil && member.IncidentID == incident.IncidentID {
+				alert = member
+				break
+			}
 		}
 	}
+	s.upsertMemoryLocked(incident, alert)
 }
 
 func (s *Store) similarIncidentsLocked(

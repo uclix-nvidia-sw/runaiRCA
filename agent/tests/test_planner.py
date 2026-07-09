@@ -161,6 +161,69 @@ async def test_user_workload_namespace_focuses_scheduler() -> None:
     assert plan.check_control_plane is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("change", "expected_family"),
+    [
+        (
+            {"kind": "NodeCondition", "summary": "Node gpu-1 condition Ready=False."},
+            "node_kubelet_pressure",
+        ),
+        (
+            {"kind": "PodDeleted", "summary": "Pod trainer-old is terminating."},
+            "workload_startup_error",
+        ),
+    ],
+)
+async def test_recent_change_leads_before_scheduler(
+    change: dict, expected_family: str
+) -> None:
+    settings = make_settings()
+    target = _target(alert_name="SomeAlert", namespace="runai-test1", node="gpu-1")
+    plan = await plan_investigation(settings, target, None, {}, [], [change])
+
+    assert plan.hypotheses[0]["family"] == expected_family
+    assert plan.hypotheses[0]["family"] != "runai_scheduling_quota"
+
+
+@pytest.mark.asyncio
+async def test_plan_stage_feeds_recent_changes_into_the_planner() -> None:
+    # Integration: the parametrized unit test above calls plan_investigation directly,
+    # so it does NOT exercise the pipeline wiring. This drives the real plan_stage with
+    # a stub "change" collector and asserts the change signal actually reaches the plan.
+    from app.collectors.base import CollectorResult
+    from app.progress import ProgressReporter
+    from app.schemas import Alert, AlertAnalysisRequest
+    from app.services import pipeline
+    from app.services.kg_enrichment import KGContext
+
+    class _StubChange:
+        name = "change"
+
+        async def collect(self, target, plan=None):  # noqa: ANN001
+            return CollectorResult(
+                agent="change",
+                status="ok",
+                summary="recent change",
+                details={"changes": [{"kind": "NodeCondition", "summary": "Node gpu-1 Ready=False."}]},
+            )
+
+    settings = make_settings()
+    # No pod -> plan_stage skips the live-pod k8s re-resolution, so this stays offline.
+    target = _target(alert_name="SomeAlert", namespace="runai-test1", node="gpu-1")
+    state = pipeline.PipelineState(
+        settings=settings,
+        request=AlertAnalysisRequest(alert=Alert(labels={"alertname": "SomeAlert"}, annotations={})),
+        target=target,
+        progress=ProgressReporter(settings, run_id=""),
+        masker=None,
+        collectors=[_StubChange()],
+        kg_context=KGContext(),
+    )
+    await pipeline.plan_stage(state)
+    assert state.plan.hypotheses[0]["family"] == "node_kubelet_pressure", state.plan.hypotheses
+
+
 def test_namespace_scope_classifies() -> None:
     from app.services.planner import _namespace_scope
 
@@ -171,6 +234,20 @@ def test_namespace_scope_classifies() -> None:
     assert _namespace_scope(_target(namespace="team-a", queue="gpu-a"), settings) == "workload"
     assert _namespace_scope(_target(namespace="monitoring"), settings) == "infra"
     assert _namespace_scope(_target(namespace=""), settings) == "infra"
+
+
+def test_generic_infra_component_is_infra_not_runai_workload() -> None:
+    # The reported bug: kube-state-metrics in a runai-* namespace was routed to the
+    # Run:ai scheduler. A generic monitoring component is a plain Kubernetes problem.
+    from app.services.planner import _implicates_control_plane, _namespace_scope
+
+    settings = make_settings()
+    ksm = _target(namespace="runai-rca", pod="prometheus-kube-state-metrics-76f7f4dd55-4lj5q")
+    assert _namespace_scope(ksm, settings) == "infra"
+    assert _implicates_control_plane(ksm) is False
+    # A real Run:ai workload in the same-shaped namespace still routes to workload.
+    trainer = _target(namespace="runai-team-a", pod="trainer-0")
+    assert _namespace_scope(trainer, settings) == "workload"
 
 
 @pytest.mark.asyncio

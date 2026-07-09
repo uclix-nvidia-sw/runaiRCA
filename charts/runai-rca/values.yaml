@@ -38,6 +38,10 @@ secrets:
   runaiClientId: ""
   runaiClientSecret: ""
   runaiBearerToken: ""
+  # Grafana service-account token for grafana-mcp. LEAVE EMPTY and grafana-mcp
+  # can't list datasources -> the Loki/Prometheus datasource uid stays unresolved
+  # -> every MCP query fails "get datasource by uid ... 400 id is invalid" and the
+  # collector demotes to the direct API. Set this to make the MCP log/metric path work.
   grafanaServiceAccountToken: ""
   nvidiaApiKey: ""
   llmApiKey: ""
@@ -165,6 +169,11 @@ backend:
     # Max analyses started per webhook and per 1-minute window. Raise if bursts of
     # alerts get dropped without a report; ultimately bounded by the agent's capacity.
     maxAutoAnalyzeFanout: 50
+    # Only these severities are AUTO-analyzed (webhook + backfill), so noise like the
+    # Watchdog (severity "none") is tracked but never burns tokens. Manual/comment
+    # re-analysis is always allowed regardless. "all" (or empty) = analyze every
+    # ingested severity (info is dropped earlier by ignoredAlert).
+    autoAnalyzeSeverities: "warning,critical"
     # Max analyses running against the agent concurrently.
     maxConcurrentAgentRuns: 50
     # How long (minutes) an alert signature can be QUIET before a recurrence is

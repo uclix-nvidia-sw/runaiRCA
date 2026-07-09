@@ -4,9 +4,11 @@ import asyncio
 import json
 import logging
 import re
+import time
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, TypeVar
 
 from pydantic import BaseModel
@@ -38,6 +40,7 @@ from app.plan import InvestigationPlan
 from app.progress import ProgressReporter
 from app.prompts import load_agent_souls
 from app.schemas import AlertAnalysisRequest, AlertAnalysisResponse
+from app.services.decision_tree import load_tree, walk_tree
 from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
 from app.services.planner import plan_investigation
 from app.services.root_cause_ranking import RankedCause, rank_root_cause_candidates
@@ -77,6 +80,7 @@ class PipelineState:
     reanalysis_note: str = ""
     graph_fixes: GraphRemediation | None = None
     timeline: object | None = None
+    troubleshooting_path: dict[str, Any] | None = None
     quality: str = ""
     summary: str = ""
     detail: str = ""
@@ -86,6 +90,25 @@ class PipelineState:
     missing: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     response: AlertAnalysisResponse | None = None
+    analysis_started_at: float = field(default_factory=time.monotonic)
+
+
+@dataclass(frozen=True)
+class _ReanalysisTarget:
+    family: str
+    reason: str
+    refuted_family: str = ""
+    initial_refutation: bool = False
+
+
+@dataclass(frozen=True)
+class _ReanalysisOutcome:
+    results: list[CollectorResult]
+    candidates: list[RankedCause]
+    caveat: str
+    note: str
+    refuted: bool
+    next_check: str
 
 
 def new_state(
@@ -141,6 +164,7 @@ async def enrich_stage(state: PipelineState) -> PipelineState:
 
 
 async def plan_stage(state: PipelineState) -> PipelineState:
+    recent_changes = await _preplan_recent_changes(state)
     # Plan first (senior-SRE "think before you dig"): scope every collector to
     # what THIS alert needs instead of always scraping the control plane.
     state.plan = await plan_investigation(
@@ -149,6 +173,7 @@ async def plan_stage(state: PipelineState) -> PipelineState:
         state.request.alert,
         state.kg_context.as_dict(),
         list(state.request.similar_incidents),
+        recent_changes,
     )
     # Alert labels frequently name a pod the controller already replaced (grouped
     # CrashLoop occurrences) and carry no node label — so kubernetes GETs 404 and
@@ -184,6 +209,15 @@ async def plan_stage(state: PipelineState) -> PipelineState:
     )
     state.agent_souls = load_agent_souls(state.settings.agent_souls_file)
     return state
+
+
+async def _preplan_recent_changes(state: PipelineState) -> list[dict]:
+    collector = next((c for c in state.collectors if getattr(c, "name", "") == "change"), None)
+    if collector is None:
+        return []
+    result = await _collect_safely(collector, state.target, None, state.masker)
+    changes = result.details.get("changes") if isinstance(result.details, dict) else None
+    return [c for c in changes if isinstance(c, dict)] if isinstance(changes, list) else []
 
 
 async def evidence_stage(state: PipelineState) -> PipelineState:
@@ -407,6 +441,10 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         pass
     else:
         state.timeline = build_timeline(state.results)
+    state.troubleshooting_path = walk_tree(
+        load_tree(_k8s_troubleshooting_tree_path(settings)),
+        _observed_text(state.results, request),
+    )
     state.quality = _quality_from(state.results)
     # Adversarial precision: LLM-verify signature/keyword matches (known issues,
     # failure-mode symptoms, GPU XIDs) and drop ones the evidence doesn't support.
@@ -496,6 +534,8 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                 kg_context=state.kg_context.as_dict(),
                 graph_fixes=state.graph_fixes,
                 fallback_detail=state.detail,
+                timeline=state.timeline,
+                troubleshooting_path=state.troubleshooting_path,
             )
         if synth:
             state.summary, state.detail = synth
@@ -568,6 +608,11 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             "hypothesis_ledger": state.investigation_context.get("hypothesis_ledger"),
             "investigation": state.investigation_context,
             **({"timeline": state.timeline} if state.timeline else {}),
+            **(
+                {"troubleshooting_path": state.troubleshooting_path}
+                if state.troubleshooting_path and state.troubleshooting_path.get("path")
+                else {}
+            ),
         },
         artifacts=state.artifacts,
     )
@@ -589,55 +634,184 @@ async def run_pipeline(
     ):
         state = await stages.get(name, stage)(state)
 
-    # RE-ANALYSIS ON REFUTATION (LLM-gated): when the self-check refuted the top
-    # cause, do EXACTLY ONE bounded re-analysis pass leading with the next-best
-    # hypothesis. Hard guard: this block runs once and never re-enters analyze().
-    if (
-        state.self_check_refuted
-        and state.root_cause_candidates
-        and llm_configured(state.settings, state.settings.llm_model_investigation)
-        and state.settings.enable_investigation_loop
-    ):
-        if token_budget_exceeded(state.settings):
-            state.extra_warnings.append(token_budget_warning(state.settings))
-            _aggregate_evidence(state)
-            outcome = None
-        else:
-            outcome = await _reanalyze_once(
-                state,
-                refuted_family=state.root_cause_candidates[0].family,
-                prior_candidates=state.root_cause_candidates,
-            )
-        if outcome is not None:
-            (
-                state.results,
-                state.root_cause_candidates,
-                state.self_check_caveat,
-                state.reanalysis_note,
-                state.self_check_refuted,
-                state.self_check_next,
-            ) = outcome
-            # Re-derive the evidence aggregates from the merged results.
-            _aggregate_evidence(state)
+    await _investigate_until_settled(state)
 
     state = await stages.get("synthesize", synthesize_stage)(state)
     assert state.response is not None
     return state.response
 
 
+async def _investigate_until_settled(state: PipelineState) -> None:
+    if not (
+        state.root_cause_candidates
+        and llm_configured(state.settings, state.settings.llm_model_investigation)
+        and state.settings.enable_investigation_loop
+    ):
+        return
+    cap = max(0, int(getattr(state.settings, "max_investigation_iterations", 0) or 0))
+    if cap <= 0:
+        return
+
+    attempted: set[str] = set()
+    # ponytail: cap 0 disables this control-flow expansion; the loop never recurses.
+    for _ in range(cap):
+        if not _needs_more_investigation(state):
+            break
+        if token_budget_exceeded(state.settings):
+            state.extra_warnings.append(token_budget_warning(state.settings))
+            _aggregate_evidence(state)
+            break
+        if _deadline_exceeded(state):
+            state.extra_warnings.append(
+                "analysis deadline reached; skipped additional investigation iterations"
+            )
+            _aggregate_evidence(state)
+            break
+
+        target = _next_reanalysis_target(state, attempted)
+        if target is None:
+            break
+        before_evidence = _evidence_signature(state.results)
+        before_family = state.root_cause_candidates[0].family if state.root_cause_candidates else ""
+        attempted.add(target.family)
+        outcome = await _reanalyze_once(state, target=target)
+        if outcome is None:
+            break
+
+        state.results = outcome.results
+        state.root_cause_candidates = outcome.candidates
+        state.self_check_caveat = outcome.caveat
+        state.reanalysis_note = "\n\n".join(
+            note for note in (state.reanalysis_note, outcome.note) if note
+        )
+        state.self_check_refuted = outcome.refuted
+        state.self_check_next = outcome.next_check
+        _aggregate_evidence(state)
+
+        after_family = state.root_cause_candidates[0].family if state.root_cause_candidates else ""
+        if after_family == before_family and _evidence_signature(state.results) == before_evidence:
+            break
+
+
+def _needs_more_investigation(state: PipelineState) -> bool:
+    if not state.root_cause_candidates:
+        return False
+    top = state.root_cause_candidates[0]
+    return (
+        state.self_check_refuted
+        or top.confidence not in {"medium", "high"}
+        or bool(state.missing)
+    )
+
+
+def _next_reanalysis_target(
+    state: PipelineState, attempted: set[str]
+) -> _ReanalysisTarget | None:
+    top = state.root_cause_candidates[0] if state.root_cause_candidates else None
+    refuted_family = top.family if top and state.self_check_refuted else ""
+    excluded = {
+        family
+        for family in (*attempted, refuted_family, "insufficient_evidence")
+        if family
+    }
+
+    if state.self_check_refuted:
+        for candidate in state.root_cause_candidates[1:]:
+            if candidate.family not in excluded:
+                return _ReanalysisTarget(
+                    candidate.family,
+                    "re-analysis after the previous conclusion was refuted",
+                    refuted_family,
+                    not state.reanalysis_note,
+                )
+        kg_blast = getattr(state.kg_context, "blast_radius_workloads", 0)
+        for candidate in rank_root_cause_candidates(
+            state.target,
+            state.results,
+            occurrence_count=state.request.occurrence_count,
+            top_n=5,
+            kg_blast_radius=kg_blast,
+            priors=state.priors,
+        ):
+            if candidate.family not in excluded:
+                return _ReanalysisTarget(
+                    candidate.family,
+                    "re-analysis after the previous conclusion was refuted",
+                    refuted_family,
+                    not state.reanalysis_note,
+                )
+
+    if top and top.family not in excluded:
+        return _ReanalysisTarget(
+            top.family,
+            "targeted follow-up for low-confidence or missing evidence",
+            refuted_family,
+        )
+
+    plan = state.plan
+    for hypothesis in (plan.hypotheses if plan else []) or []:
+        family = str(hypothesis.get("family") or "").strip()
+        if family and family not in excluded:
+            return _ReanalysisTarget(
+                family,
+                str(hypothesis.get("reason") or "targeted follow-up for missing evidence"),
+                refuted_family,
+            )
+
+    if state.missing and "evidence_gap" not in excluded:
+        return _ReanalysisTarget(
+            "evidence_gap",
+            "targeted follow-up for missing evidence: " + ", ".join(state.missing[:5]),
+            refuted_family,
+        )
+    return None
+
+
+def _deadline_exceeded(state: PipelineState) -> bool:
+    deadline = int(getattr(state.settings, "analysis_deadline_seconds", 0) or 0)
+    return deadline > 0 and time.monotonic() - state.analysis_started_at >= deadline
+
+
+def _evidence_signature(results: list[CollectorResult]) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        sorted(
+            (
+                result.agent,
+                result.status,
+                result.confidence,
+                result.summary,
+                tuple(result.missing_data),
+                tuple(result.warnings),
+                _json_fingerprint(result.details),
+                tuple(_artifact_signature(artifact) for artifact in result.artifacts),
+            )
+            for result in results
+        )
+    )
+
+
+def _artifact_signature(artifact: object) -> tuple[object, ...]:
+    return (
+        getattr(artifact, "title", ""),
+        getattr(artifact, "status", ""),
+        getattr(artifact, "summary", ""),
+        _json_fingerprint(getattr(artifact, "result", None)),
+    )
+
+
+def _json_fingerprint(value: object) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, default=str)
+    except TypeError:
+        return repr(value)
+
+
 async def _reanalyze_once(
     state: PipelineState,
     *,
-    refuted_family: str,
-    prior_candidates: list[RankedCause],
-) -> tuple[list[CollectorResult], list[RankedCause], str, str, bool, str] | None:
-    """EXACTLY ONE bounded re-analysis pass after the self-check refuted the top cause.
-
-    Leads with the next-best hypothesis, re-runs a small investigation, merges the
-    fresh evidence by agent name, re-ranks, and refutes the new top ONCE. Returns
-    (results, candidates, caveat, note, refuted, next_check), or None on ANY
-    failure so the caller keeps the pre-re-analysis result. Never re-enters.
-    """
+    target: _ReanalysisTarget,
+) -> _ReanalysisOutcome | None:
+    """One bounded targeted investigation pass. Never re-enters analyze()."""
     try:
         from app.services.investigator import investigate
         from app.services.self_check import refute_top_cause
@@ -646,32 +820,15 @@ async def _reanalyze_once(
         assert plan is not None
         kg_dict = state.kg_context.as_dict()
         kg_blast = getattr(state.kg_context, "blast_radius_workloads", 0)
-        # Next-best hypothesis: candidates[1] when usable, else re-rank and take
-        # the best family that is neither the refuted one nor the fallback gate.
-        next_cause = None
-        pool = list(prior_candidates[1:]) or rank_root_cause_candidates(
-            state.target,
-            state.results,
-            occurrence_count=state.request.occurrence_count,
-            top_n=5,
-            kg_blast_radius=kg_blast,
-            priors=state.priors,
-        )
-        for candidate in pool:
-            if candidate.family not in (refuted_family, "insufficient_evidence"):
-                next_cause = candidate
-                break
-        if next_cause is None:
-            return None
 
         lead = {
-            "family": next_cause.family,
-            "reason": "re-analysis after the first conclusion was refuted",
+            "family": target.family,
+            "reason": target.reason,
         }
         rest = [
             h
             for h in (plan.hypotheses or [])
-            if isinstance(h, dict) and h.get("family") != next_cause.family
+            if isinstance(h, dict) and h.get("family") != target.family
         ]
         replan = replace(plan, hypotheses=[lead, *rest])
         fresh, re_context = await investigate(
@@ -705,6 +862,14 @@ async def _reanalyze_once(
             match_runai_known_issues(state.known_issues, observed),
             match_failure_mode_symptoms(state.failure_modes, observed),
         )
+        if token_budget_exceeded(state.settings) or _deadline_exceeded(state):
+            if token_budget_exceeded(state.settings):
+                state.extra_warnings.append(token_budget_warning(state.settings))
+            else:
+                state.extra_warnings.append(
+                    "analysis deadline reached; skipped additional investigation iterations"
+                )
+            return None
         caveat = ""
         refuted = False
         next_check = ""
@@ -722,24 +887,33 @@ async def _reanalyze_once(
                 caveat = str(check.get("caveat") or "").strip()
                 refuted = bool(check.get("refuted"))
                 next_check = str(check.get("next_check") or "").strip()
-        # A re-analysis conclusion that its OWN self-check refutes must not
-        # replace the first conclusion — that shipped a report whose headline
-        # (node_kubelet_pressure) was contradicted by its own Self-Check text.
-        # Keep the original (with its caveat + operator questions) instead.
-        if refuted:
-            return None
         new_family = candidates[0].family if candidates else "insufficient_evidence"
-        if getattr(state.settings, "language", "en") == "ko":
+        if target.refuted_family and getattr(state.settings, "language", "en") == "ko":
+            label = "1차 결론" if target.initial_refutation else "이전 결론"
             note = (
-                f"1차 결론({refuted_family})이 반증되어 재분석을 수행했습니다 → "
+                f"{label}({target.refuted_family})이 반증되어 "
+                "재분석을 수행했습니다 → "
                 f"재분석 결론: {new_family}"
+            )
+        elif target.refuted_family:
+            label = "initial" if target.initial_refutation else "previous"
+            note = (
+                f"The {label} conclusion ({target.refuted_family}) was refuted, so a "
+                f"targeted re-analysis pass was performed → revised conclusion: {new_family}."
+            )
+        elif getattr(state.settings, "language", "en") == "ko":
+            note = (
+                "낮은 확신/증거 공백 때문에 추가 조사를 수행했습니다 → "
+                f"결론: {new_family}"
             )
         else:
             note = (
-                f"The initial conclusion ({refuted_family}) was refuted, so one "
-                f"re-analysis pass was performed → revised conclusion: {new_family}."
+                "A targeted investigation pass was performed for low confidence "
+                f"or evidence gaps → revised conclusion: {new_family}."
             )
-        return merged_results, candidates, caveat, note, refuted, next_check
+        return _ReanalysisOutcome(
+            merged_results, candidates, caveat, note, refuted, next_check
+        )
     except Exception:  # noqa: BLE001 - re-analysis is best-effort; keep 1st result
         return None
 
@@ -754,6 +928,8 @@ async def _synthesize_korean(
     kg_context: dict,
     graph_fixes: GraphRemediation,
     fallback_detail: str,
+    timeline: list[dict] | None = None,
+    troubleshooting_path: dict[str, Any] | None = None,
 ) -> tuple[str, str] | None:
     """LLM synthesis of the RCA report in Korean, grounded STRICTLY in the evidence.
 
@@ -791,6 +967,22 @@ async def _synthesize_korean(
             "labels": request.alert.labels,
             "annotations": request.alert.annotations,
         },
+        # Past-incident re-analysis signal: a resolved alert means the live state is
+        # likely healthy again, so live collectors can legitimately be thin.
+        **(
+            {"incident_state": "resolved — alert no longer firing; live state likely normal, so live evidence may be limited (past-incident re-analysis)"}
+            if str(getattr(request.alert, "status", "")).lower() == "resolved"
+            else {}
+        ),
+        # Chronological event chain (oldest first): recent deploy/rollout, node
+        # reboot/condition, pod delete/create, warning events → the alert. Small +
+        # high-value, so it leads the reasoning inputs and the char cap won't trim it.
+        **({"timeline": (timeline or [])[-40:]} if timeline else {}),
+        **(
+            {"troubleshooting_path": troubleshooting_path}
+            if troubleshooting_path and troubleshooting_path.get("path")
+            else {}
+        ),
         "plan": plan.as_dict(),
         "ranked_root_cause_candidates": [c.as_dict() for c in root_cause_candidates],
         "knowledge_graph": {
@@ -839,13 +1031,31 @@ async def _synthesize_korean(
         "- 길게 쓰지 마세요. 아래 1~3 섹션 합쳐서 A4 한 페이지 이내가 목표입니다.\n"
         "- 증거에 없는 사실을 절대 만들어내지 마세요.\n"
         "- 특정 수집기가 아무것도 찾지 못했으면 '증거를 찾기 어렵습니다.'라고 명시하세요.\n"
+        "- 증거에 incident_state가 resolved(과거 인시던트 재분석)면, 현재 상태가 정상이라 "
+        "라이브 증거가 제한적일 수 있습니다. 증거가 얇으면 억지로 원인을 단정하지 말고 '현재는 "
+        "정상 상태로 회복되어 라이브 수집·분석이 제한적입니다'를 명시한 뒤, 남은 흔적·과거 기록·"
+        "타임라인 기반으로 신중히 설명하세요.\n"
+        "- 증거에 timeline(시간순 이벤트)이 있으면, 알림 직전의 '최근 변경'을 근본 원인으로 "
+        "최우선 검토하세요: 배포/rollout(generation 변경), 노드 리부트·컨디션 변화, 파드 삭제/"
+        "드레인, MIG/설정 변경 등. 스케줄러·증상성 경고(예: PodGroup Warning)보다 '무엇이 바뀌어 "
+        "이 알림이 촉발됐는가'를 먼저 의심하고, 시간 순서(변경 → 결과 → 알림)로 인과를 설명하세요.\n"
+        "- 증거에 troubleshooting_path가 있으면 그 steps를 사용해 진단 흐름을 단계별로 설명하세요. "
+        "단, troubleshooting_path의 conclusion은 보강 근거일 뿐이며 XID/known-issue 같은 정밀 "
+        "signature 또는 ranked_root_cause_candidates의 1순위 원인을 절대 덮어쓰지 마세요.\n"
         "- 반드시 이 문서 구조를 따르세요 (Word 제출용이므로 헤딩/번호목록만 사용, 표·HTML 금지):\n"
         "  # 장애 분석 보고서 — {알림명}\n"
         "  발생/심각도/대상 메타 한 줄\n"
         "  ## 1. 문제 (Problem) — 무엇이/어디서/언제부터/어떤 영향, 3~4문장.\n"
-        "  ## 2. 원인 (Root Cause) — 결론 한 문장 먼저, 그다음 뒷받침 근거 2~4개(수집기별 "
-        "핵심 발견: 관찰한 것과 시작 시점), XID 인과 사슬이 있으면 명시 "
-        "(예: 'XID 74(NVLink) → XID 45 앱 크래시 — 뿌리는 NVLink').\n"
+        "  ## 2. 원인 (Root Cause) — 운영자가 AI 판단을 검증할 수 있게 다음 항목을 "
+        "굵은 라벨로 명확히 구분해 쓰세요:\n"
+        "    - **결론**: 한 문장 (근본 원인).\n"
+        "    - **확신도**: 높음/중간/낮음 (analysis_quality와 근거의 양·일관성 기준) + 한 줄 이유.\n"
+        "    - **근거(Evidence)**: 직접 '관찰된 사실'만 2~4개 (수집기별: 무엇을 관찰, 언제부터). "
+        "추론이 아니라 사실만.\n"
+        "    - **추론(Inference)**: 위 근거가 왜 그 결론으로 이어지는지 논리 (시간 순서 인과 포함). "
+        "XID 인과 사슬이 있으면 명시 (예: 'XID 74(NVLink) → XID 45 앱 크래시 — 뿌리는 NVLink').\n"
+        "    - **반대 증거·한계(Contradicting evidence)**: 결론과 상충하거나 확인하지 못한 것, "
+        "self-check가 반박한 내용 (없으면 '특이사항 없음').\n"
         "  ## 3. 권장 조치 (Recommended Actions) — 번호 목록, 즉시/후속/예방 순서, "
         "구체적 명령·확인 포함, 중복 금지.\n"
         "  ## 4. 부록 (Appendix) — 수집기별 증거 한 줄씩, 조사 계획 요약.\n"
@@ -997,6 +1207,14 @@ def _build_settings_masker(settings: Settings) -> Masker:
         builtin_enabled=settings.builtin_redaction_enabled,
         hash_mode=settings.builtin_redaction_hash_mode,
     )
+
+
+def _k8s_troubleshooting_tree_path(settings: Settings) -> str:
+    base = Path(settings.failure_modes_file or "knowledge/failure_modes.yaml")
+    try:
+        return str(base.with_name("k8s_troubleshooting_tree.yaml"))
+    except ValueError:
+        return "knowledge/k8s_troubleshooting_tree.yaml"
 
 
 def _mask_model(model: TModel, model_type: type[TModel], masker: Masker) -> TModel:

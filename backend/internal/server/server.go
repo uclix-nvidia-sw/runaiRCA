@@ -171,14 +171,6 @@ type AlertRecord struct {
 	ThreadTS         string            `json:"thread_ts"`
 	Labels           map[string]string `json:"labels"`
 	Annotations      map[string]string `json:"annotations"`
-	AnalysisSummary  string            `json:"analysis_summary"`
-	AnalysisDetail   string            `json:"analysis_detail"`
-	AnalysisQuality  string            `json:"analysis_quality"`
-	RootCauseFamily  string            `json:"root_cause_family"`
-	Capabilities     map[string]string `json:"capabilities"`
-	MissingData      []string          `json:"missing_data"`
-	Warnings         []string          `json:"warnings"`
-	Artifacts        []Artifact        `json:"artifacts"`
 	SimilarIncidents []SimilarIncident `json:"similar_incidents"`
 	Feedback         FeedbackSummary   `json:"feedback"`
 	IsAnalyzing      bool              `json:"is_analyzing"`
@@ -270,6 +262,9 @@ type Server struct {
 	autoAnalyzeMu             sync.Mutex
 	autoAnalyzeStarts         []time.Time
 	autoAnalyzeFanout         int
+	// Severities eligible for AUTO analysis. nil = every ingested severity (except
+	// info, dropped by ignoredAlert). Manual analysis is never gated by this.
+	autoAnalyzeSeverities map[string]bool
 	backfillInterval          time.Duration
 	backfillBatch             int
 	backfillRetryCooldown     time.Duration
@@ -304,6 +299,39 @@ func (s *Server) autoFanoutLimit() int {
 		return s.autoAnalyzeFanout
 	}
 	return maxAutoAnalyzeFanout
+}
+
+// parseAutoAnalyzeSeverities parses AUTO_ANALYZE_SEVERITIES (e.g. "warning,critical").
+// Empty / "all" / "*" -> nil, meaning no severity gating (auto-analyze every ingested
+// severity). Otherwise only the listed severities are auto-analyzed.
+func parseAutoAnalyzeSeverities(raw string) map[string]bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.EqualFold(raw, "all") || raw == "*" {
+		return nil
+	}
+	set := map[string]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		if v := strings.ToLower(strings.TrimSpace(part)); v != "" {
+			set[v] = true
+		}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	return set
+}
+
+// severityAutoAnalyzable reports whether a severity is eligible for AUTO analysis
+// (webhook fan-out + backfill). Manual/comment re-analysis is never gated by this.
+func (s *Server) severityAutoAnalyzable(sev string) bool {
+	if s.autoAnalyzeSeverities == nil {
+		return true
+	}
+	return s.autoAnalyzeSeverities[strings.ToLower(strings.TrimSpace(sev))]
+}
+
+func (s *Server) autoAnalyzeAllowed(alert Alert) bool {
+	return s.severityAutoAnalyzable(severity(alert))
 }
 
 func Run() {
@@ -394,6 +422,7 @@ func NewServer() *Server {
 		client:                    &http.Client{},
 		agentSlots:                make(chan struct{}, concurrency),
 		autoAnalyzeFanout:         autoFanout,
+		autoAnalyzeSeverities:     parseAutoAnalyzeSeverities(getenv("AUTO_ANALYZE_SEVERITIES", "")),
 		// Backfill re-drives alerts left without a completed RCA (dropped by the
 		// caps, or a prior failed run). Interval 0 disables it.
 		backfillInterval:      time.Duration(getenvInt("ANALYSIS_BACKFILL_INTERVAL_SECONDS", 300)) * time.Second,
@@ -880,10 +909,6 @@ func cloneAlert(in *AlertRecord) *AlertRecord {
 	out.Labels = cloneMap(in.Labels)
 	out.Annotations = cloneMap(in.Annotations)
 	out.OccurrencePods = cloneStrings(in.OccurrencePods)
-	out.Capabilities = cloneMap(in.Capabilities)
-	out.MissingData = cloneStrings(in.MissingData)
-	out.Warnings = cloneStrings(in.Warnings)
-	out.Artifacts = cloneArtifacts(in.Artifacts)
 	out.SimilarIncidents = cloneSimilar(in.SimilarIncidents)
 	out.Feedback = cloneFeedbackSummary(in.Feedback)
 	return &out

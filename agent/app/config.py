@@ -23,6 +23,16 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _nonnegative_int_env(name: str, default: int, invalid: int = 0) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return invalid
+
+
 def _csv_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     raw = os.getenv(name)
     if not raw:
@@ -147,6 +157,7 @@ class Settings:
     # (finish_reason=length), raise this rather than shrinking the prompt.
     llm_synthesis_max_tokens: int = 8192
     llm_model_insight: str = ""
+    max_investigation_iterations: int = 2
 
 
 def load_settings() -> Settings:
@@ -302,4 +313,5 @@ def load_settings() -> Settings:
         # Owner priority is accuracy over latency; the backend's
         # AGENT_REQUEST_TIMEOUT_SECONDS must stay above this (deadline + 60s).
         analysis_deadline_seconds=max(0, _int_env("ANALYSIS_DEADLINE_SECONDS", 1500)),
+        max_investigation_iterations=_nonnegative_int_env("MAX_INVESTIGATION_ITERATIONS", 2),
     )

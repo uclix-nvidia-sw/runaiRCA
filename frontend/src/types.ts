@@ -123,13 +123,6 @@ export type AlertRecord = {
   thread_ts: string;
   labels: Record<string, string>;
   annotations: Record<string, string>;
-  analysis_summary: string;
-  analysis_detail: string;
-  analysis_quality: string;
-  capabilities: Record<string, string>;
-  missing_data: string[];
-  warnings: string[];
-  artifacts: Artifact[];
   similar_incidents: SimilarIncident[];
   feedback: FeedbackSummary;
   is_analyzing: boolean;

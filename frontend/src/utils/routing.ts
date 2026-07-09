@@ -11,17 +11,12 @@ export function routeFromHash(hash: string): RouteState {
     if (collection === 'incidents' && id) {
       return { view: isMainView(view) ? view : 'incidents', detailKind: 'incident', detailID: id };
     }
-    if (collection === 'alerts' && id) {
-      return { view: isMainView(view) ? view : 'alerts', detailKind: 'alert', detailID: id };
-    }
+    // Alerts are list-only — no per-alert detail route (RCA lives on the incident).
   }
   const rawKind = view;
   const id = second ? decodeRoutePart([second, ...rest].join('/')) : '';
   if ((rawKind === 'incidents' || rawKind === 'incident') && id) {
     return { view: 'incidents', detailKind: 'incident', detailID: id };
-  }
-  if ((rawKind === 'alerts' || rawKind === 'alert') && id) {
-    return { view: 'alerts', detailKind: 'alert', detailID: id };
   }
   if (isMainView(rawKind)) {
     return { view: rawKind };

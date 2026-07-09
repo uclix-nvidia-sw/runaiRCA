@@ -68,6 +68,38 @@ async def test_exec_probes_skipped_when_pod_exec_disabled() -> None:
 
 
 @pytest.mark.asyncio
+async def test_k8s_exec_gate_and_allowlist() -> None:
+    from app.collectors.kubernetes import k8s_exec
+
+    # Disabled -> refuses regardless of command.
+    off = replace(load_settings(), enable_pod_exec=False, kubernetes_mcp_url="http://mcp")
+    r = await k8s_exec(off, "runai", "trainer-0", ["nvidia-smi"])
+    assert "disabled" in (r.get("error") or "")
+
+    # Enabled but a non-allowlisted command is refused before any transport call.
+    on = replace(load_settings(), enable_pod_exec=True, kubernetes_mcp_url="http://mcp")
+    r = await k8s_exec(on, "runai", "trainer-0", ["env"])  # env leaks secrets -> not allowlisted
+    assert "allowlist" in (r.get("error") or "")
+    r = await k8s_exec(on, "runai", "trainer-0", ["cat", "/etc/shadow"])
+    assert "allowlist" in (r.get("error") or "")
+
+
+def test_exec_frame_demux_routes_channels() -> None:
+    from app.collectors.kubernetes import _accumulate_exec_frame
+
+    out: list[str] = []
+    err: list[str] = []
+    # channel 1 = stdout, channel 2 = stderr, channel 3 = status (Success -> no error).
+    assert _accumulate_exec_frame(b"\x01GPU-0\n", out, err) == ""
+    assert _accumulate_exec_frame(b"\x02warn\n", out, err) == ""
+    assert _accumulate_exec_frame(b'\x03{"status":"Success"}', out, err) == ""
+    assert out == ["GPU-0\n"] and err == ["warn\n"]
+    # A Failure status surfaces its message as the error.
+    msg = _accumulate_exec_frame(b'\x03{"status":"Failure","message":"boom"}', out, err)
+    assert msg == "boom"
+
+
+@pytest.mark.asyncio
 async def test_exec_probes_are_allowlisted_and_not_executed_when_enabled() -> None:
     from app.collectors import kubernetes as k8s
 

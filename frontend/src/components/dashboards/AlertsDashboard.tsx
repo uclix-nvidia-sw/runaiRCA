@@ -21,7 +21,6 @@ export function AlertsDashboard({
   filters,
   page,
   loading,
-  onOpenAlert,
   onOpenIncident,
   onPageChange,
   onFilterChange,
@@ -31,7 +30,6 @@ export function AlertsDashboard({
   filters: AlertFilterState;
   page: PageInfo;
   loading: boolean;
-  onOpenAlert: (id: string) => Promise<void>;
   onOpenIncident: (id: string) => Promise<void>;
   onPageChange: (page: number) => void;
   onFilterChange: (filters: AlertFilterState) => void;
@@ -81,7 +79,7 @@ export function AlertsDashboard({
             </thead>
             <tbody>
               {filteredAlerts.map((alert) => (
-                <tr key={alert.alert_id} onClick={() => void onOpenAlert(alert.alert_id)}>
+                <tr key={alert.alert_id} onClick={() => void onOpenIncident(alert.incident_id)}>
                   <td>
                     <strong>{alert.alarm_title}</strong>
                     <span className="table-subline">

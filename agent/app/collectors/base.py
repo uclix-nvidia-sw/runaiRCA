@@ -125,7 +125,16 @@ def signals_line(markers: list[str], language: str = "en") -> str:
     return f"{label}: " + ", ".join(f"**{marker}**" for marker in markers)
 
 
+# Namespaces that start with "runai-" but are NOT a Run:ai user project: the
+# platform (runai-backend) and the RCA product's own namespace (runai-rca).
+# Stripping "runai-" off these fabricated a bogus project ("backend"/"rca") that
+# both mislabeled the UI and pulled the RCA toward a Run:ai-workload framing.
+_NON_PROJECT_NAMESPACES = frozenset({"runai", "runai-backend", "runai-rca"})
+
+
 def project_from_namespace(namespace: str) -> str:
+    if namespace in _NON_PROJECT_NAMESPACES:
+        return ""
     prefix = "runai-"
     return namespace[len(prefix) :] if namespace.startswith(prefix) else ""
 

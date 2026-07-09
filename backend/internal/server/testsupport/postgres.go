@@ -190,7 +190,33 @@ func (c *fakePostgresConn) Ping(context.Context) error {
 	return nil
 }
 
-func (c *fakePostgresConn) ExecContext(ctx context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+// maxDollarPlaceholder returns the highest N among the query's $N placeholders
+// (0 if none) — the parameter count Postgres binds for the statement.
+func maxDollarPlaceholder(query string) int {
+	max := 0
+	for i := 0; i < len(query); i++ {
+		if query[i] != '$' {
+			continue
+		}
+		j, n := i+1, 0
+		for j < len(query) && query[j] >= '0' && query[j] <= '9' {
+			n = n*10 + int(query[j]-'0')
+			j++
+		}
+		if j > i+1 && n > max {
+			max = n
+		}
+	}
+	return max
+}
+
+func (c *fakePostgresConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	// Mimic Postgres bind semantics: it binds exactly the number of $N params the
+	// statement references. Passing extra args (a real bug that fails at runtime)
+	// used to silently "work" against this fake driver.
+	if want := maxDollarPlaceholder(query); len(args) != want {
+		return nil, fmt.Errorf("bind message supplies %d parameters, but statement requires %d", len(args), want)
+	}
 	failAnalysisRun := false
 	c.state.mu.Lock()
 	if _, ok := ctx.Deadline(); !ok {
@@ -288,14 +314,11 @@ func (s *PostgresState) rowsFor(query string) driver.Rows {
 			columns: []string{
 				"alert_id", "incident_id", "alarm_title", "severity", "status", "fired_at",
 				"resolved_at", "fingerprint", "occurrence_count", "occurrence_pods", "thread_ts",
-				"labels", "annotations", "analysis_summary", "analysis_detail", "analysis_quality", "root_cause_family", "capabilities",
-				"missing_data", "warnings", "artifacts",
+				"labels", "annotations",
 			},
 			values: [][]driver.Value{{
 				"ALR-db", "INC-db", "RunAIWorkloadPending", "warning", "firing", s.now,
 				nil, "fp-db", int64(1), s.emptyArrayJSON, "thread-db", s.labelsJSON, s.annotationsJSON,
-				"Run:AI queue gpu-a was saturated.", "GPU quota blocked scheduling.", "high", "", s.capabilitiesJSON,
-				s.missingDataJSON, s.warningsJSON, s.artifactsJSON,
 			}},
 		}
 	case strings.Contains(lowered, "from incident_embeddings"):
@@ -310,18 +333,18 @@ func (s *PostgresState) rowsFor(query string) driver.Rows {
 				s.labelsJSON, s.memoryVectorJSON, s.now,
 			}},
 		}
-	case strings.Contains(lowered, "from rca_feedback"):
+	case strings.Contains(lowered, "from rca_feedback") && strings.Contains(lowered, "kind = 'comment'"):
 		return &fakeRows{
-			columns: []string{"feedback_id", "target_type", "target_id", "incident_id", "alert_id", "vote", "comment", "author", "created_at"},
-			values: [][]driver.Value{{
-				"FDB-db", "incident", "INC-db", "INC-db", "", "up", "This matched the prior quota issue.", "operator", s.now,
-			}},
-		}
-	case strings.Contains(lowered, "from rca_comments"):
-		return &fakeRows{
-			columns: []string{"comment_id", "target_type", "target_id", "incident_id", "alert_id", "body", "author", "created_at"},
+			columns: []string{"feedback_id", "target_type", "target_id", "incident_id", "alert_id", "body", "author", "created_at"},
 			values: [][]driver.Value{{
 				"CMT-db", "incident", "INC-db", "INC-db", "", "Persisted operator comment.", "operator", s.now,
+			}},
+		}
+	case strings.Contains(lowered, "from rca_feedback"):
+		return &fakeRows{
+			columns: []string{"feedback_id", "target_type", "target_id", "incident_id", "alert_id", "vote", "body", "author", "created_at"},
+			values: [][]driver.Value{{
+				"FDB-db", "incident", "INC-db", "INC-db", "", "up", "", "operator", s.now,
 			}},
 		}
 	case strings.Contains(lowered, "from analysis_runs"):

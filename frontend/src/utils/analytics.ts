@@ -23,37 +23,8 @@ import {
   targetLine,
 } from './formatters';
 
-export function buildAnalysisRecords(alerts: AlertRecord[], analysisRuns: AnalysisRun[] = []): AnalysisRecord[] {
-  const alertRecords = alerts
-    .map((alert) => {
-      const hasAnalysis = Boolean(alert.analysis_summary || alert.analysis_detail);
-      const analysisStatus = alert.is_analyzing ? 'analyzing' : hasAnalysis ? 'complete' : 'pending';
-      const collectorArtifacts = alert.artifacts?.filter((artifact) => isCollectorAgent(artifact.agent)) ?? [];
-      return {
-        id: `analysis-${alert.alert_id}`,
-        incidentID: alert.incident_id,
-        alertID: alert.alert_id,
-        title: alert.alarm_title || alert.labels.alertname || alert.alert_id,
-        target: targetLine(alert.labels),
-        source: 'auto',
-        severity: alert.severity,
-        alertStatus: alert.status,
-        analysisStatus,
-        quality: alert.analysis_quality || (hasAnalysis ? 'medium' : 'pending'),
-        summary: alert.analysis_summary,
-        detail: alert.analysis_detail,
-        capabilities: alert.capabilities || {},
-        missingData: alert.missing_data || [],
-        warnings: alert.warnings || [],
-        artifactCount: collectorArtifacts.length,
-        similarCount: alert.similar_incidents?.length || 0,
-        positiveFeedback: alert.feedback?.positive || 0,
-        negativeFeedback: alert.feedback?.negative || 0,
-        commentCount: alert.feedback?.comments?.length || 0,
-        createdAt: alert.fired_at,
-        isAnalyzing: alert.is_analyzing,
-      };
-    });
+export function buildAnalysisRecords(analysisRuns: AnalysisRun[] = []): AnalysisRecord[] {
+  // Analysis lives on runs now (not per-alert columns), so records come from runs.
   const runRecords = analysisRuns.map((run) => ({
     id: run.run_id,
     incidentID: run.incident_id || undefined,
@@ -78,7 +49,7 @@ export function buildAnalysisRecords(alerts: AlertRecord[], analysisRuns: Analys
     createdAt: run.created_at,
     isAnalyzing: run.status === 'analyzing',
   }));
-  return [...runRecords, ...alertRecords]
+  return runRecords
     .sort((left, right) => {
       const statusWeight: Record<string, number> = { analyzing: 0, pending: 1, failed: 2, complete: 3 };
       const delta = (statusWeight[left.analysisStatus] ?? 4) - (statusWeight[right.analysisStatus] ?? 4);

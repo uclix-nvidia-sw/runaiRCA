@@ -26,7 +26,6 @@ class FakePostgresConnection:
             {"table_name": "alerts", "exists": True},
             {"table_name": "incident_embeddings", "exists": True},
             {"table_name": "rca_feedback", "exists": True},
-            {"table_name": "rca_comments", "exists": True},
             {"table_name": "analysis_runs", "exists": True},
         ]
 
@@ -57,7 +56,6 @@ async def test_postgres_checks_include_all_backend_rca_tables() -> None:
         "alerts",
         "incident_embeddings",
         "rca_feedback",
-        "rca_comments",
         "analysis_runs",
     }
     assert "'analysis_runs'" in conn.table_check_query

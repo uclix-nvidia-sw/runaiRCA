@@ -328,9 +328,6 @@ function buildChatContext(
         status: alert.status,
         labels: alert.labels,
         annotations: alert.annotations,
-        capabilities: alert.capabilities,
-        missing_data: alert.missing_data,
-        warnings: alert.warnings,
         similar_incidents: alert.similar_incidents ?? [],
       },
     };
@@ -392,10 +389,7 @@ function alertChatContent(alert: AlertRecord) {
       `Occurrences: ${alertOccurrenceCount(alert)}`,
       `Labels: ${safeJSONStringify(alert.labels)}`,
       `Annotations: ${safeJSONStringify(alert.annotations)}`,
-      `Summary: ${alert.analysis_summary}`,
-      alert.analysis_detail,
-      `Missing data: ${alert.missing_data.join(', ') || 'none'}`,
-      `Warnings: ${alert.warnings.join(', ') || 'none'}`,
+      // RCA is incident-level now; the alert carries no analysis.
     ].join('\n\n'),
   );
 }

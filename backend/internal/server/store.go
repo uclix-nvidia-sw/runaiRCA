@@ -354,7 +354,9 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	} else if alertStatus != "resolved" && incident.Status == "resolved" {
 		incident.Status = "firing"
 		incident.ResolvedAt = nil
-		incident.UserApprovedAt = nil
+		// Keep UserApprovedAt: a recurrence of the SAME incident (same correlation
+		// key) does not invalidate the operator's approval of its RCA. Clearing it
+		// here silently un-approved incidents overnight whenever an alert re-fired.
 	}
 
 	if alertID == "" {
@@ -1429,14 +1431,11 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 		existing.Source = source
 		existing.Title = run.Title
 		existing.Prompt = run.Prompt
-		existing.AnalysisSummary = ""
-		existing.AnalysisDetail = ""
-		existing.AnalysisQuality = ""
-		existing.RootCauseFamily = ""
-		existing.Capabilities = map[string]string{}
-		existing.MissingData = []string{}
-		existing.Warnings = []string{}
-		existing.Artifacts = []Artifact{}
+		// Keep the last-good RCA content on the run while the re-analysis is in
+		// progress (so the incident keeps showing it) and preserved if this attempt
+		// fails; only a new SUCCESS (CompleteAnalysisRun) replaces it. This makes the
+		// run the durable RCA store, so the alert analysis columns are redundant.
+		// Only the per-attempt metadata (llm_usage, progress_log) is reset.
 		existing.Metadata = nil
 		// This IS a new analysis occupying the old row, so it must also become the
 		// NEWEST run: isLatestAnalysisRunForAlert compares CreatedAt, and with the
@@ -1580,17 +1579,19 @@ func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (A
 	}
 	before := cloneAnalysisRun(run)
 	run.Status = "failed"
-	run.AnalysisSummary = response.AnalysisSummary
-	run.AnalysisDetail = response.AnalysisDetail
-	if run.AnalysisDetail == "" {
-		run.AnalysisDetail = response.Analysis
+	// Preserve a prior successful RCA on this (reused) run — a failed re-analysis
+	// must not clobber the last-good result. Surface the fallback only when there is
+	// nothing to keep (the first analysis failed).
+	if strings.TrimSpace(run.AnalysisSummary) == "" && strings.TrimSpace(run.AnalysisDetail) == "" {
+		run.AnalysisSummary = response.AnalysisSummary
+		run.AnalysisDetail = first(response.AnalysisDetail, response.Analysis)
+		run.AnalysisQuality = first(response.AnalysisQuality, "low")
+		run.RootCauseFamily = response.RootCauseFamily
+		run.Capabilities = response.Capabilities
+		run.MissingData = response.MissingData
+		run.Warnings = response.Warnings
+		run.Artifacts = response.Artifacts
 	}
-	run.AnalysisQuality = first(response.AnalysisQuality, "low")
-	run.RootCauseFamily = response.RootCauseFamily
-	run.Capabilities = response.Capabilities
-	run.MissingData = response.MissingData
-	run.Warnings = response.Warnings
-	run.Artifacts = response.Artifacts
 	run.Metadata = mergeAnalysisMetadata(run.Metadata, metadataFromAgentContext(response.Context))
 	run.UpdatedAt = time.Now().UTC()
 	if !s.persistAnalysisRunLocked(run) {
@@ -1669,7 +1670,7 @@ func (s *Store) ReapStaleAnalyzingRuns(staleAfter time.Duration, manualStaleAfte
 // fan-out / rate caps) and alerts whose latest run failed longer ago than
 // retryCooldown. Completed and in-flight alerts are skipped, so backfill never
 // re-runs a good RCA and does not hammer a just-failed one.
-func (s *Store) AlertIDsNeedingAnalysis(limit int, retryCooldown time.Duration, now time.Time) []string {
+func (s *Store) AlertIDsNeedingAnalysis(limit int, retryCooldown time.Duration, now time.Time, allow func(severity string) bool) []string {
 	if limit <= 0 {
 		return nil
 	}
@@ -1697,6 +1698,12 @@ func (s *Store) AlertIDsNeedingAnalysis(limit int, retryCooldown time.Duration, 
 			continue
 		}
 		if status(alert.Status) == "resolved" {
+			continue
+		}
+		// Filter ineligible severities HERE (not in the caller) so a queue full of
+		// never-analyzable alerts (e.g. Watchdog/none) can't starve the batch and
+		// keep eligible warning/critical alerts from ever being backfilled.
+		if allow != nil && !allow(alert.Severity) {
 			continue
 		}
 		if info, ok := latest[alert.AlertID]; ok {
@@ -1830,6 +1837,47 @@ func (s *Store) SetIncidentSlackThread(id string, ts string) {
 	s.persistIncidentLocked(incident)
 }
 
+// latestAnalysisRunForIncidentLocked returns the newest run carrying an RCA for this
+// incident (matched by incident_id or a member alert_id), preferring completed runs.
+// analysis_runs is the durable RCA store now that IncidentDetail no longer reads the
+// per-alert analysis columns.
+func (s *Store) latestAnalysisRunForIncidentLocked(incidentID string) *AnalysisRun {
+	alertIDs := map[string]struct{}{}
+	for _, alert := range s.alerts {
+		if alert != nil && alert.IncidentID == incidentID {
+			alertIDs[alert.AlertID] = struct{}{}
+		}
+	}
+	var selected *AnalysisRun
+	for _, run := range s.analysisRuns {
+		if run == nil {
+			continue
+		}
+		if strings.TrimSpace(run.AnalysisSummary) == "" && strings.TrimSpace(run.AnalysisDetail) == "" {
+			continue
+		}
+		if run.IncidentID != incidentID {
+			if _, ok := alertIDs[run.AlertID]; !ok {
+				continue
+			}
+		}
+		if selected == nil || betterAnalysisRun(run, selected) {
+			selected = run
+		}
+	}
+	return selected
+}
+
+// betterAnalysisRun ranks a completed run above a non-completed one, then by recency.
+func betterAnalysisRun(candidate, current *AnalysisRun) bool {
+	candidateComplete := candidate.Status == "complete"
+	currentComplete := current.Status == "complete"
+	if candidateComplete != currentComplete {
+		return candidateComplete
+	}
+	return candidate.UpdatedAt.After(current.UpdatedAt)
+}
+
 func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1856,59 +1904,20 @@ func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 	sort.Slice(detail.Alerts, func(i, j int) bool {
 		return detail.Alerts[i].FiredAt.After(detail.Alerts[j].FiredAt)
 	})
-	summaryLines := []string{}
-	detailSections := []string{}
-	seenMissingData := map[string]struct{}{}
-	seenWarnings := map[string]struct{}{}
-	seenArtifacts := map[string]struct{}{}
-	for _, alert := range detail.Alerts {
-		if strings.TrimSpace(alert.AnalysisSummary) == "" && strings.TrimSpace(alert.AnalysisDetail) == "" {
-			continue
-		}
-		title := first(alert.AlarmTitle, alert.AlertID)
-		if strings.TrimSpace(alert.AnalysisSummary) != "" {
-			summaryLines = append(summaryLines, fmt.Sprintf("- %s: %s", title, alert.AnalysisSummary))
-		}
-		if strings.TrimSpace(alert.AnalysisDetail) != "" {
-			detailSections = append(detailSections, fmt.Sprintf("## %s\n\n%s", title, alert.AnalysisDetail))
-		}
-		if detail.AnalysisQuality == "" {
-			detail.AnalysisQuality = alert.AnalysisQuality
-		}
-		if detail.RootCauseFamily == "" {
-			detail.RootCauseFamily = alert.RootCauseFamily
-		}
-		for key, value := range alert.Capabilities {
+	// Incident RCA comes from the incident's latest analysis run (the durable store),
+	// not by concatenating the per-alert analysis columns. Analysis is already
+	// one-per-incident, so this is the same RCA without the alert-column duplication.
+	if run := s.latestAnalysisRunForIncidentLocked(id); run != nil {
+		detail.AnalysisSummary = excerpt(run.AnalysisSummary, maxIncidentAggregateSummaryBytes)
+		detail.AnalysisDetail = excerpt(run.AnalysisDetail, maxIncidentAggregateDetailBytes)
+		detail.AnalysisQuality = run.AnalysisQuality
+		detail.RootCauseFamily = run.RootCauseFamily
+		for key, value := range run.Capabilities {
 			detail.Capabilities[key] = value
 		}
-		for _, item := range alert.MissingData {
-			if _, ok := seenMissingData[item]; ok {
-				continue
-			}
-			seenMissingData[item] = struct{}{}
-			detail.MissingData = append(detail.MissingData, item)
-		}
-		for _, item := range alert.Warnings {
-			if _, ok := seenWarnings[item]; ok {
-				continue
-			}
-			seenWarnings[item] = struct{}{}
-			detail.Warnings = append(detail.Warnings, item)
-		}
-		for _, artifact := range alert.Artifacts {
-			key := string(mustJSON(artifact))
-			if _, ok := seenArtifacts[key]; ok {
-				continue
-			}
-			seenArtifacts[key] = struct{}{}
-			detail.Artifacts = append(detail.Artifacts, artifact)
-		}
-	}
-	if len(summaryLines) > 0 {
-		detail.AnalysisSummary = excerpt(strings.Join(summaryLines, "\n"), maxIncidentAggregateSummaryBytes)
-	}
-	if len(detailSections) > 0 {
-		detail.AnalysisDetail = excerpt(strings.Join(detailSections, "\n\n"), maxIncidentAggregateDetailBytes)
+		detail.MissingData = append(detail.MissingData, run.MissingData...)
+		detail.Warnings = append(detail.Warnings, run.Warnings...)
+		detail.Artifacts = append(detail.Artifacts, run.Artifacts...)
 	}
 	detail.Feedback = s.feedbackSummaryLocked("incident", id)
 	if len(detail.Alerts) > 0 {
@@ -1977,20 +1986,19 @@ func (s *Store) AddFeedback(
 		IncidentID: incidentID,
 		AlertID:    alertID,
 		Vote:       vote,
-		Comment:    comment,
 		Author:     actor,
 		CreatedAt:  time.Now().UTC(),
 	}
 	s.feedback[record.FeedbackID] = record
 	s.persistFeedbackLocked(record)
-	if record.Comment != "" {
+	if comment != "" {
 		comment := &CommentRecord{
 			CommentID:  nextID("CMT", s.commentSeq.Add(1)),
 			TargetType: targetType,
 			TargetID:   targetID,
 			IncidentID: incidentID,
 			AlertID:    alertID,
-			Body:       record.Comment,
+			Body:       comment,
 			Author:     record.Author,
 			CreatedAt:  record.CreatedAt,
 		}
@@ -2061,7 +2069,13 @@ func (s *Store) UpdateComment(
 	}
 	comment := s.comments[commentID]
 	if comment == nil || comment.TargetType != targetType || comment.TargetID != targetID {
-		return FeedbackSummary{}, false, nil
+		feedback := s.feedback[commentID]
+		if feedback == nil || feedback.TargetType != targetType || feedback.TargetID != targetID || strings.TrimSpace(feedback.Comment) == "" {
+			return FeedbackSummary{}, false, nil
+		}
+		feedback.Comment = body
+		s.persistFeedbackCommentUpdateLocked(feedback)
+		return s.feedbackSummaryLocked(targetType, targetID), true, nil
 	}
 	comment.Body = body
 	if author != "" {
@@ -2128,7 +2142,13 @@ func (s *Store) DeleteComment(
 	}
 	comment := s.comments[commentID]
 	if comment == nil || comment.TargetType != targetType || comment.TargetID != targetID {
-		return FeedbackSummary{}, false
+		feedback := s.feedback[commentID]
+		if feedback == nil || feedback.TargetType != targetType || feedback.TargetID != targetID || strings.TrimSpace(feedback.Comment) == "" {
+			return FeedbackSummary{}, false
+		}
+		feedback.Comment = ""
+		s.persistFeedbackCommentUpdateLocked(feedback)
+		return s.feedbackSummaryLocked(targetType, targetID), true
 	}
 	delete(s.comments, commentID)
 	s.persistCommentDeleteLocked(commentID)
@@ -2201,13 +2221,40 @@ func (s *Store) deleteFeedbackForActorLocked(targetType string, targetID string,
 
 func (s *Store) commentsForTargetLocked(targetType string, targetID string) []CommentRecord {
 	items := []CommentRecord{}
+	seen := map[string]struct{}{}
 	for _, comment := range s.comments {
 		if comment.TargetType == targetType && comment.TargetID == targetID {
 			items = append(items, *cloneComment(comment))
+			seen[commentDedupeKey(comment.Body, comment.Author, comment.CreatedAt)] = struct{}{}
 		}
+	}
+	for _, record := range s.feedback {
+		body := strings.TrimSpace(record.Comment)
+		if record.TargetType != targetType || record.TargetID != targetID || body == "" {
+			continue
+		}
+		key := commentDedupeKey(body, record.Author, record.CreatedAt)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		items = append(items, CommentRecord{
+			CommentID:  record.FeedbackID,
+			TargetType: record.TargetType,
+			TargetID:   record.TargetID,
+			IncidentID: record.IncidentID,
+			AlertID:    record.AlertID,
+			Body:       body,
+			Author:     record.Author,
+			CreatedAt:  record.CreatedAt,
+		})
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].CreatedAt.Before(items[j].CreatedAt) })
 	return items
+}
+
+func commentDedupeKey(body string, author string, createdAt time.Time) string {
+	return strings.TrimSpace(body) + "\x00" + feedbackActor(author) + "\x00" + createdAt.UTC().Format(time.RFC3339Nano)
 }
 
 func (s *Store) targetIDsLocked(targetType string, targetID string) (string, string, bool) {

@@ -321,11 +321,6 @@ func alertSummary(alert AlertRecord) map[string]any {
 		"status":           alert.Status,
 		"fired_at":         alert.FiredAt,
 		"is_analyzing":     alert.IsAnalyzing,
-		"analysis_quality": alert.AnalysisQuality,
-		"capabilities":     alert.Capabilities,
-		"missing_data":     alert.MissingData,
-		"warnings":         alert.Warnings,
-		"artifact_count":   len(alert.Artifacts),
 	}
 }
 
@@ -517,10 +512,7 @@ func alertChatContent(alert *AlertRecord) string {
 		"Severity: " + alert.Severity,
 		"Labels: " + excerpt(string(labels), 1200),
 		"Annotations: " + excerpt(string(annotations), 1200),
-		"Analysis summary: " + alert.AnalysisSummary,
-		"Analysis detail: " + excerpt(alert.AnalysisDetail, 4000),
-		"Missing data: " + strings.Join(alert.MissingData, ", "),
-		"Warnings: " + strings.Join(alert.Warnings, ", "),
+		// RCA is incident-level now (see incidentChatContext); the alert carries no analysis.
 	}, "\n")
 }
 
@@ -564,14 +556,8 @@ func alertChatContext(alert *AlertRecord) map[string]any {
 		"title":             excerpt(alert.AlarmTitle, 120),
 		"severity":          alert.Severity,
 		"status":            alert.Status,
-		"analysis_summary":  alert.AnalysisSummary,
-		"analysis_quality":  alert.AnalysisQuality,
-		"capabilities":      alert.Capabilities,
-		"missing_data":      alert.MissingData,
-		"warnings":          alert.Warnings,
 		"similar_incidents": compactSimilarIncidentContext(alert.SimilarIncidents),
 		"feedback":          feedbackChatContext(alert.Feedback),
-		"artifact_count":    len(alert.Artifacts),
 	}
 }
 

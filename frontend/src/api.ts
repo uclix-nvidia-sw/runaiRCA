@@ -80,11 +80,6 @@ export async function fetchAnalysisRuns(page?: PageRequest): Promise<PageResult<
   return pageResult(response, page);
 }
 
-export async function fetchAlert(id: string): Promise<AlertRecord> {
-  return (
-    await read<Envelope<AlertRecord>>(`/api/v1/alerts/${encodeURIComponent(id)}${feedbackActorQuery()}`)
-  ).data;
-}
 
 export async function analyzeIncident(id: string): Promise<void> {
   await write(`/api/v1/incidents/${encodeURIComponent(id)}/analyze`);

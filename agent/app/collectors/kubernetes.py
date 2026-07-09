@@ -26,12 +26,28 @@ from app.mcp_client import (
 # READ-ONLY diagnostic commands allowed inside a container via pods/exec.
 # Strictly non-mutating: viewing GPU/driver/env state only. Anything not here is refused.
 # ponytail: allowlist of exact argv prefixes, extend here if new read-only probes are needed.
+# Exact read-only commands only (not an argv[0] allowlist) — every argument is
+# pinned, so there's no room to pass a path/flag that reads secrets or writes.
+# Deliberately NO `env`/`printenv` (leak secrets) and NO `ps aux` (cmdlines leak
+# tokens). To broaden, add an exact tuple here — keep it inspection-only.
 _EXEC_ALLOWLIST: tuple[tuple[str, ...], ...] = (
     ("nvidia-smi",),
     ("nvidia-smi", "-q"),
     ("nvidia-smi", "-L"),
     ("nvidia-smi", "--query-gpu=name,memory.total,memory.used,utilization.gpu", "--format=csv"),
+    ("nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv"),
     ("cat", "/proc/driver/nvidia/version"),
+    ("cat", "/proc/meminfo"),
+    ("cat", "/proc/loadavg"),
+    ("cat", "/proc/uptime"),
+    ("cat", "/sys/fs/cgroup/memory.max"),
+    ("cat", "/sys/fs/cgroup/memory.current"),
+    ("cat", "/etc/resolv.conf"),
+    ("free", "-m"),
+    ("free", "-h"),
+    ("df", "-h"),
+    ("mount",),
+    ("uname", "-a"),
     ("nproc",),
     ("uptime",),
 )
@@ -339,6 +355,215 @@ async def k8s_read(
     if mcp_note:
         result["mcp_fallback"] = mcp_note
     return result
+
+
+async def k8s_logs(
+    settings: Settings,
+    namespace: str,
+    pod: str,
+    container: str = "",
+    tail: int = 0,
+) -> dict:
+    """One READ-ONLY pod-log fetch — MCP-first (pods_log), direct /pods/{}/log fallback.
+
+    The on-demand sibling of the base sweep's _collect_pod_logs*, exposed to the
+    drill-down/chat LLM loops so "look at the pod's logs" is executable. NOT
+    namespace-gated (RBAC / the MCP server are the boundary). Never raises."""
+    if not (namespace and pod):
+        return {"error": "namespace and pod are required", "lines": []}
+    tail_lines = tail if tail > 0 else settings.kubernetes_list_limit
+    mcp_note = ""
+    if settings.kubernetes_mcp_url:
+        args: dict[str, object] = {"namespace": namespace, "name": pod, "tailLines": tail_lines}
+        if container:
+            args["container"] = container
+        try:
+            result = await _k8s_mcp_result(
+                settings, [("pods_log", args), ("pods_log", {**args, "pod": pod})]
+            )
+            lines = _log_lines(mcp_tool_text(result) or mcp_tool_json(result))
+            return {
+                "namespace": namespace, "pod": pod, "container": container,
+                "status_code": 200, "error": None, "lines": lines,
+            }
+        except Exception as exc:  # noqa: BLE001 - direct fallback is the behavior.
+            mcp_note = mcp_fallback_warning(exc)
+    token = _read_file(settings.kubernetes_token_path)
+    if not token:
+        return {"namespace": namespace, "pod": pod,
+                "error": "kubernetes service account token unavailable", "lines": []}
+    verify: bool | str = (
+        settings.kubernetes_ca_path if Path(settings.kubernetes_ca_path).exists() else True
+    )
+    params: dict[str, str] = {"tailLines": str(tail_lines), "timestamps": "true"}
+    if container:
+        params["container"] = container
+    path = f"/api/v1/namespaces/{quote(namespace, safe='')}/pods/{quote(pod, safe='')}/log"
+    response = await get_json(
+        base_url=settings.kubernetes_api_url,
+        path=path,
+        timeout_seconds=settings.kubernetes_timeout_seconds,
+        params=params,
+        headers={"Authorization": f"Bearer {token}"},
+        verify=verify,
+    )
+    result: dict = {
+        "namespace": namespace, "pod": pod, "container": container,
+        "status_code": response.status_code, "error": response.error,
+        "lines": _log_lines(response.data),
+    }
+    if mcp_note:
+        result["mcp_fallback"] = mcp_note
+    return result
+
+
+async def k8s_describe(
+    settings: Settings, kind: str, namespace: str = "", name: str = ""
+) -> dict:
+    """A describe-style read: the named object's full spec/status PLUS its events.
+
+    Reuses k8s_read (MCP-first, direct fallback) for the object; events are pulled
+    with a fieldSelector so only THIS object's events come back. Read-only."""
+    resolved = resolve_read_kind(kind)
+    if not resolved:
+        return {"kind": kind, "error": "kind is not in the read-only allowlist",
+                "allowed_kinds": sorted(_READ_KINDS)}
+    if not name:
+        return {"kind": resolved, "error": "name is required to describe a resource"}
+    obj = await k8s_read(settings, resolved, namespace=namespace, name=name)
+    events = await _describe_events(settings, namespace=namespace, name=name)
+    return {"kind": resolved, "namespace": namespace, "name": name,
+            "object": obj.get("data"), "status_code": obj.get("status_code"),
+            "error": obj.get("error"), "events": events,
+            **({"mcp_fallback": obj["mcp_fallback"]} if obj.get("mcp_fallback") else {})}
+
+
+async def _describe_events(settings: Settings, *, namespace: str, name: str) -> list:
+    """Events for ONE object via fieldSelector=involvedObject.name — direct API only
+    (the MCP events tool has no field filter). Best-effort; [] on any failure."""
+    if not name:
+        return []
+    token = _read_file(settings.kubernetes_token_path)
+    if not token:
+        return []
+    verify: bool | str = (
+        settings.kubernetes_ca_path if Path(settings.kubernetes_ca_path).exists() else True
+    )
+    parts = ["/api/v1"]
+    if namespace:
+        parts += ["namespaces", quote(namespace, safe="")]
+    parts.append("events")
+    response = await get_json(
+        base_url=settings.kubernetes_api_url,
+        path="/".join(parts),
+        timeout_seconds=settings.kubernetes_timeout_seconds,
+        params={"fieldSelector": f"involvedObject.name={name}",
+                "limit": str(settings.kubernetes_list_limit)},
+        headers={"Authorization": f"Bearer {token}"},
+        verify=verify,
+    )
+    items = (response.data or {}).get("items") if isinstance(response.data, dict) else None
+    return compact(items, limit=12) if items else []
+
+
+async def k8s_exec(
+    settings: Settings, namespace: str, pod: str, command: list[str], container: str = ""
+) -> dict:
+    """Actually run ONE read-only allowlisted command in a container.
+
+    Uses the agent's OWN ServiceAccount over the Kubernetes exec subresource
+    (WebSocket, v4.channel.k8s.io) — deliberately NOT the MCP, which the chart pins
+    to a hard read-only boundary (no pods/exec). Gate = the same enable_pod_exec +
+    exec_command_allowed the base sweep uses (exact allowlist + forbidden-token
+    defense, so env/shells/writes are refused). Never raises; returns an observation.
+    This is the path the base _collect_exec_probes deliberately leaves unattempted."""
+    if not settings.enable_pod_exec:
+        return {"error": "pod exec is disabled (set ENABLE_POD_EXEC=true + grant pods/exec RBAC)"}
+    if not (namespace and pod and command):
+        return {"error": "namespace, pod and command (argv list) are required"}
+    if not exec_command_allowed(command):
+        return {"error": f"command not on the read-only allowlist: {command}",
+                "allowed": [list(cmd) for cmd in _EXEC_ALLOWLIST]}
+    token = _read_file(settings.kubernetes_token_path)
+    if not token:
+        return {"namespace": namespace, "pod": pod, "command": command,
+                "error": "kubernetes service account token unavailable"}
+    try:
+        stdout, stderr, status_err = await _exec_via_websocket(
+            settings, namespace=namespace, pod=pod, command=command,
+            container=container, token=token,
+        )
+    except Exception as exc:  # noqa: BLE001 - observation, not a raise.
+        return {"namespace": namespace, "pod": pod, "command": command,
+                "error": f"exec failed: {exc.__class__.__name__}: {exc}"}
+    result: dict = {
+        "namespace": namespace, "pod": pod, "container": container, "command": command,
+        "status_code": 200, "error": status_err or None, "output": (stdout or "")[-4000:],
+    }
+    if stderr.strip():
+        result["stderr"] = stderr[-1000:]
+    return result
+
+
+async def _exec_via_websocket(
+    settings: Settings, *, namespace: str, pod: str, command: list[str],
+    container: str, token: str,
+) -> tuple[str, str, str]:
+    """Stream one command via the pod exec subresource. Returns (stdout, stderr,
+    status_error). k8s channels: 1=stdout, 2=stderr, 3=error/status (JSON)."""
+    import ssl
+
+    import aiohttp
+
+    base = settings.kubernetes_api_url.replace("https://", "wss://").replace("http://", "ws://")
+    params: list[tuple[str, str]] = [("container", container)] if container else []
+    params += [("command", part) for part in command]
+    params += [("stdout", "true"), ("stderr", "true"), ("stdin", "false"), ("tty", "false")]
+    query = "&".join(f"{k}={quote(str(v), safe='')}" for k, v in params)
+    url = (
+        f"{base}/api/v1/namespaces/{quote(namespace, safe='')}"
+        f"/pods/{quote(pod, safe='')}/exec?{query}"
+    )
+    ca = settings.kubernetes_ca_path
+    ssl_ctx = ssl.create_default_context(cafile=ca) if ca and Path(ca).exists() \
+        else ssl.create_default_context()
+    out: list[str] = []
+    err: list[str] = []
+    status_err = ""
+    timeout = aiohttp.ClientTimeout(total=settings.pod_exec_timeout_seconds)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.ws_connect(
+            url,
+            protocols=("v4.channel.k8s.io", "channel.k8s.io"),
+            headers={"Authorization": f"Bearer {token}"},
+            ssl=ssl_ctx,
+        ) as ws:
+            async for msg in ws:
+                if msg.type != aiohttp.WSMsgType.BINARY or not msg.data:
+                    continue
+                status_err = _accumulate_exec_frame(msg.data, out, err) or status_err
+    return "".join(out), "".join(err), status_err
+
+
+def _accumulate_exec_frame(data: bytes, out: list[str], err: list[str]) -> str:
+    """Route one k8s exec WS binary frame by its channel byte (1=stdout, 2=stderr,
+    3=error/status). Appends stdout/stderr in place; returns a status-error message
+    only when channel 3 reports a Failure, else ''."""
+    if not data:
+        return ""
+    channel, text = data[0], data[1:].decode("utf-8", "replace")
+    if channel == 1:
+        out.append(text)
+    elif channel == 2:
+        err.append(text)
+    elif channel == 3:
+        try:
+            status = json.loads(text)
+        except ValueError:
+            return text
+        if isinstance(status, dict) and status.get("status") == "Failure":
+            return status.get("message") or text
+    return ""
 
 
 async def _k8s_read_via_mcp(
@@ -1394,6 +1619,10 @@ async def _collect_pod_logs(
     verify: bool | str,
 ) -> list[dict[str, object]]:
     """Fetch READ-ONLY container logs via the pods/log subresource (GET, plain text)."""
+    # Respect the KUBERNETES_NAMESPACES scope like the rest of the base sweep (pods/
+    # events gate the same way) — an operator that restricts namespaces must not have
+    # logs leak from excluded ones. On-demand log reads for a specific alerting pod go
+    # through the ungated k8s_logs tool (RBAC-bounded, like k8s_read) instead.
     if not (target.namespace and target.pod and _namespace_allowed(settings, target.namespace)):
         return []
     namespace = quote(target.namespace, safe="")
@@ -1433,6 +1662,7 @@ async def _collect_pod_logs_via_mcp(
     containers: list[str],
 ) -> list[dict[str, object]]:
     """Fetch READ-ONLY container logs through the Kubernetes MCP server."""
+    # See _collect_pod_logs: same KUBERNETES_NAMESPACES scope as the rest of the sweep.
     if not (target.namespace and target.pod and _namespace_allowed(settings, target.namespace)):
         return []
     targets: list[str | None] = list(containers) if containers else [None]

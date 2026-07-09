@@ -48,6 +48,12 @@
         - "A startupProbe keeps failing, so kubelet never hands off to the liveness/readiness probes and eventually restarts the container before it finishes booting (Warning Unhealthy: Startup probe failed). The app needs longer to start than failureThreshold*periodSeconds allows. Confirm via `kubectl describe pod <pod>` Events."
         - "Raise the startupProbe failureThreshold/periodSeconds to cover the real cold-start time (model download, DB migration, cache warm) so slow-but-healthy boots survive."
         - "If the probe endpoint is wrong (path/port), fix it — the app may already be healthy on a different port; confirm with `kubectl logs <pod>`."
+    - name: Job Failed (BackoffLimitExceeded / DeadlineExceeded)
+      keywords: [backofflimitexceeded, "job has reached the specified backoff limit", "reached backoff limit", deadlineexceeded, "job was active longer than the specified deadline"]
+      actions:
+        - "A batch/Job (or CronJob-spawned Job) is marked Failed, not a bare pod: BackoffLimitExceeded means its pods failed .spec.backoffLimit+1 times; DeadlineExceeded means it ran past .spec.activeDeadlineSeconds. Find the Job and its last pod: `kubectl -n <ns> describe job <job>` then `kubectl -n <ns> logs job/<job> --previous`."
+        - "Root-cause is the POD's failure (read its logs / exit code — treat as CrashLoop/OOM/config above); the Job status only tells you it gave up retrying. Fix the underlying pod error, then re-run the Job (delete+recreate, or let the CronJob fire)."
+        - "If it's DeadlineExceeded and the work is legitimately long, raise activeDeadlineSeconds; if pods never even start, check scheduling (quota/taints) — the Job can't complete pods it can't place."
 
 - family: runai_scheduling_quota
   symptoms:
@@ -652,6 +658,12 @@
         - "A topologySpreadConstraints (whenUnsatisfiable: DoNotSchedule) or inter-pod (anti-)affinity rule can't be met given where matching pods run. Read the rule: `kubectl get pod <p> -n <ns> -o jsonpath='{.spec.topologySpreadConstraints}{.spec.affinity}'`."
         - "Check how many schedulable domains carry the topologyKey label (`kubectl get nodes -L <topologyKey>`) — anti-affinity/spread needs at least as many labelled domains as replicas; too few domains or missing labels makes it impossible."
         - "Relax it (raise maxSkew, set whenUnsatisfiable: ScheduleAnyway, or switch required→preferredDuringScheduling), widen the topologyKey, or add capacity in the under-filled domain."
+    - name: DaemonSet Pods Not Scheduling On Some Nodes
+      keywords: [daemonset, "numberunavailable", "numbermisscheduled", "desirednumberscheduled"]
+      actions:
+        - "A DaemonSet should run one pod per (matching) node; when status.numberReady < desiredNumberScheduled, some nodes have no ready pod. This is usually a SCHEDULING problem, not a crash: the node is tainted and the DaemonSet lacks the matching toleration, or nodeSelector/affinity excludes it. Check `kubectl -n <ns> describe ds <name>` (Events) and `kubectl -n <ns> get pods -l <ds-selector> -o wide` to see WHICH nodes are missing a pod."
+        - "Compare the DaemonSet's tolerations against the target nodes' taints (`kubectl get nodes -o json | jq '.items[].spec.taints'`). System DaemonSets (CNI, kube-proxy, nvidia-device-plugin, CSI node) typically need broad tolerations incl. NoSchedule; a GPU-only DaemonSet needs a nodeSelector like nvidia.com/gpu.present=true. Fix the toleration/selector so the intended nodes are covered."
+        - "If pods ARE placed but not ready, it's a normal pod failure on those nodes — read one pod's logs/events (CrashLoop/config/image) and treat via workload_startup_error; a rollout stuck mid-update points at the DaemonSet updateStrategy/maxUnavailable."
     - name: Namespace ResourceQuota Rejection At Admission
       keywords: ["exceeded quota:", "forbidden: exceeded quota", "must specify limits.cpu", "must specify requests.memory"]
       actions:
