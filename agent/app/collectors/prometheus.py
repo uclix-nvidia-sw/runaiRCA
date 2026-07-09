@@ -325,16 +325,20 @@ async def prom_mcp_query(settings: Settings, name: str, promql: str) -> dict[str
 async def _mcp_query_prometheus(
     url: str, name: str, promql: str, datasource_uid: str = ""
 ) -> dict[str, object]:
-    args_list: list[dict[str, object]] = []
-    if datasource_uid:
-        args_list.extend(
-            [
-                {"datasourceUid": datasource_uid, "query": promql},
-                {"datasourceUid": datasource_uid, "expr": promql},
-                {"datasource_uid": datasource_uid, "query": promql},
-            ]
+    # Same contract as Loki: grafana-mcp needs a real datasourceUid. An empty one
+    # 400s with "id is invalid" on every query; fail fast so the caller falls back
+    # cleanly. (uid usually empty when grafana-mcp can't list datasources — set
+    # secrets.grafanaServiceAccountToken.)
+    if not datasource_uid:
+        raise RuntimeError(
+            "grafana datasource uid unresolved for prometheus — set "
+            "secrets.grafanaServiceAccountToken so grafana-mcp can list datasources"
         )
-    args_list.extend([{"query": promql}, {"expr": promql}])
+    args_list: list[dict[str, object]] = [
+        {"datasourceUid": datasource_uid, "query": promql},
+        {"datasourceUid": datasource_uid, "expr": promql},
+        {"datasource_uid": datasource_uid, "query": promql},
+    ]
     data = await _call_mcp_json(url, "query_prometheus", args_list)
     result_data = _prometheus_result(data)
     if not result_data:

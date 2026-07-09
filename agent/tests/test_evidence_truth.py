@@ -298,6 +298,26 @@ async def test_grafana_datasource_uid_rejects_ids_and_names(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
+async def test_empty_datasource_uid_fails_fast_not_400(monkeypatch) -> None:
+    # An unresolved (empty) uid must NOT be sent to grafana-mcp — that produced the
+    # recurring GET /datasources/uid/ -> 400 "id is invalid". Fail fast, actionably,
+    # WITHOUT calling the MCP at all.
+    import pytest as _pytest
+
+    from app.collectors import loki, prometheus as prom
+
+    async def boom(*args, **kwargs):  # must never be reached
+        raise AssertionError("MCP was called with an empty datasource uid")
+
+    monkeypatch.setattr(loki, "_call_mcp_json", boom)
+    monkeypatch.setattr(prom, "_call_mcp_json", boom)
+    with _pytest.raises(RuntimeError, match="datasource uid unresolved"):
+        await loki._mcp_query_loki("http://mcp", "q", '{app="x"}', 10, datasource_uid="")
+    with _pytest.raises(RuntimeError, match="datasource uid unresolved"):
+        await prom._mcp_query_prometheus("http://mcp", "q", "up", datasource_uid="")
+
+
+@pytest.mark.asyncio
 async def test_k8s_read_not_found_is_an_answer_not_a_fallback(monkeypatch) -> None:
     from app.collectors import kubernetes as k8s
 

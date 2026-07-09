@@ -287,7 +287,13 @@ export function projectNameFromLabels(labels: Record<string, string>) {
   return projectNameFromNamespace(labels.namespace || labels.kubernetes_namespace || '');
 }
 
+// Namespaces that start with "runai-" but are NOT a Run:ai user project — the
+// platform and the RCA product's own namespace. Deriving a project off these
+// showed a bogus "backend"/"rca" instead of the real namespace (runai-rca).
+const NON_PROJECT_NAMESPACES = new Set(['runai', 'runai-backend', 'runai-rca']);
+
 function projectNameFromNamespace(namespace: string) {
+  if (NON_PROJECT_NAMESPACES.has(namespace)) return '';
   return namespace.startsWith('runai-') ? namespace.slice('runai-'.length) : '';
 }
 

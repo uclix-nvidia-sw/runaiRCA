@@ -41,7 +41,11 @@ from app.collectors.base import (
 )
 from app.collectors.http_json import get_json
 from app.collectors.kubernetes import (
+    _EXEC_ALLOWLIST,
     _READ_KINDS,
+    k8s_describe,
+    k8s_exec,
+    k8s_logs,
     k8s_read,
     kind_lookup_title,
     kubectl_repr,
@@ -574,9 +578,36 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
                     "namespace?, name?, label_selector?"
                 ),
                 "call": _tool_k8s_read,
-            }
+            },
+            "k8s_logs": {
+                "description": (
+                    "Read a pod's container logs (tail). USE THIS to inspect what a pod "
+                    "actually logged. args: pod, namespace, container? (defaults to the "
+                    "pod's main container), tail? (line count)"
+                ),
+                "call": _tool_k8s_logs,
+            },
+            "k8s_describe": {
+                "description": (
+                    "Describe one object: its full spec/status PLUS its events (like "
+                    "`kubectl describe`). Best for a Pod's waiting/terminated reason, "
+                    "restart count, last-state exit code and scheduling events. args: "
+                    "kind, name, namespace?"
+                ),
+                "call": _tool_k8s_describe,
+            },
         }
     }
+    if settings.enable_pod_exec:
+        _allow = "; ".join(" ".join(cmd) for cmd in _EXEC_ALLOWLIST)
+        registry["kubernetes"]["k8s_exec"] = {
+            "description": (
+                "Run ONE read-only inspection command inside a container (no shell, no "
+                "writes). args: pod, namespace, command (argv list, EXACTLY one of the "
+                f"allowlisted commands), container?. Allowed: {_allow}"
+            ),
+            "call": _tool_k8s_exec,
+        }
     if settings.prometheus_mcp_url or settings.prometheus_url:
         registry["prometheus"] = {
             "promql_query": {
@@ -690,6 +721,64 @@ async def _tool_k8s_read(settings: Settings, target: AnalysisTarget, args: dict)
         # service must not score as cluster-network evidence. The drill-down
         # loop surfaces this via collector warnings instead.
         **({"mcp_fallback": item["mcp_fallback"]} if item.get("mcp_fallback") else {}),
+    }
+
+
+async def _tool_k8s_logs(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
+    pod = str(args.get("pod") or args.get("name") or target.pod or "")
+    namespace = str(args.get("namespace") or target.namespace or "")
+    container = str(args.get("container") or "")
+    try:
+        tail = int(args.get("tail") or 0)
+    except (TypeError, ValueError):
+        tail = 0
+    item = await k8s_logs(settings, namespace, pod, container=container, tail=tail)
+    error = item.get("error")
+    lines = item.get("lines") or []
+    ns_flag = f" -n {namespace}" if namespace else ""
+    c_flag = f" -c {container}" if container else ""
+    return {
+        "query": f"kubectl logs {pod}{ns_flag}{c_flag}",
+        "title": _title(settings, "Pod 로그", "Pod logs"),
+        "summary": str(error) if error else f"{len(lines)} log line(s)",
+        "error": error,
+        "result": item,
+        **({"mcp_fallback": item["mcp_fallback"]} if item.get("mcp_fallback") else {}),
+    }
+
+
+async def _tool_k8s_describe(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
+    kind = str(args.get("kind") or "")
+    namespace = str(args.get("namespace") or target.namespace or "")
+    name = str(args.get("name") or "")
+    item = await k8s_describe(settings, kind, namespace=namespace, name=name)
+    error = item.get("error")
+    events = item.get("events") or []
+    ns_flag = f" -n {namespace}" if namespace else ""
+    return {
+        "query": f"kubectl describe {kind} {name}{ns_flag}",
+        "title": _title(settings, "리소스 상세 (describe)", "Describe resource"),
+        "summary": str(error) if error else f"{kind}/{name}, {len(events)} event(s)",
+        "error": error,
+        "result": item,
+        **({"mcp_fallback": item["mcp_fallback"]} if item.get("mcp_fallback") else {}),
+    }
+
+
+async def _tool_k8s_exec(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
+    pod = str(args.get("pod") or args.get("name") or target.pod or "")
+    namespace = str(args.get("namespace") or target.namespace or "")
+    container = str(args.get("container") or "")
+    raw = args.get("command")
+    command = raw if isinstance(raw, list) else str(raw or "").split()
+    item = await k8s_exec(settings, namespace, pod, [str(c) for c in command], container=container)
+    error = item.get("error")
+    return {
+        "query": f"kubectl exec {pod} -- {' '.join(str(c) for c in command)}",
+        "title": _title(settings, "컨테이너 조회 (exec)", "Container exec"),
+        "summary": str(error) if error else "exec ok",
+        "error": error,
+        "result": item,
     }
 
 

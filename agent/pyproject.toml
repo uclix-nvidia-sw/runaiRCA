@@ -9,6 +9,7 @@ description = "Run:AI RCA NeMo Agent Toolkit service"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "aiohttp>=3.9,<4.0",  # k8s exec WebSocket (v4.channel.k8s.io) in collectors/kubernetes.py
   "asyncpg>=0.29,<1.0",
   "fastapi>=0.115,<1.0",
   "httpx>=0.27,<1.0",

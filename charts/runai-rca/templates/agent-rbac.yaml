@@ -46,8 +46,9 @@ rules:
     verbs: ["get"]
   {{- if .Values.agent.env.enablePodExec }}
   # pods/exec is read-only-by-policy: the agent only runs an allowlisted set of
-  # non-mutating diagnostic commands (nvidia-smi, cat /proc/driver/nvidia/version,
-  # env, ...). Enforced in code (exec_command_allowed); RBAC cannot scope by argv.
+  # non-mutating diagnostic commands (nvidia-smi, cat /proc/meminfo, free -m, ...).
+  # `env`/shells are deliberately NOT allowed (secret leak). Enforced in code
+  # (exec_command_allowed); RBAC cannot scope by argv.
   # Gated on enablePodExec so turning the feature off also drops the permission.
   - apiGroups: [""]
     resources: ["pods/exec"]
@@ -133,8 +134,9 @@ rules:
     verbs: ["get"]
   {{- if $.Values.agent.env.enablePodExec }}
   # pods/exec is read-only-by-policy: the agent only runs an allowlisted set of
-  # non-mutating diagnostic commands (nvidia-smi, cat /proc/driver/nvidia/version,
-  # env, ...). Enforced in code (exec_command_allowed); RBAC cannot scope by argv.
+  # non-mutating diagnostic commands (nvidia-smi, cat /proc/meminfo, free -m, ...).
+  # `env`/shells are deliberately NOT allowed (secret leak). Enforced in code
+  # (exec_command_allowed); RBAC cannot scope by argv.
   # Gated on enablePodExec so turning the feature off also drops the permission.
   - apiGroups: [""]
     resources: ["pods/exec"]

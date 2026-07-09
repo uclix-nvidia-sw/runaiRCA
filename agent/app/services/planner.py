@@ -67,11 +67,35 @@ _SIMILAR_STOPWORDS = {
 }
 
 def _is_runai_namespace(namespace: str) -> bool:
+    # A Run:ai platform/project namespace. Excludes runai-rca — the RCA tool's OWN
+    # namespace, which is a plain Kubernetes problem, not a Run:ai workload/control
+    # plane. (runai and runai-backend stay in — they ARE the Run:ai platform.)
     ns = (namespace or "").lower()
-    return ns.startswith("runai")
+    return ns.startswith("runai") and ns != "runai-rca"
+
+
+# Generic cluster/monitoring components that are NOT a Run:ai workload. A failing
+# kube-state-metrics / node-exporter / prometheus pod that happens to live in a
+# runai-* namespace is a plain Kubernetes problem — routing it to the Run:ai
+# scheduler is the misclassification we're guarding against. Matched on the pod
+# name (token boundary), so component identity beats the namespace prefix.
+_GENERIC_INFRA_STEMS: tuple[str, ...] = (
+    "kube-state-metrics", "node-exporter", "prometheus", "alertmanager", "grafana",
+    "loki", "promtail", "thanos", "kube-proxy", "coredns", "kube-dns", "metrics-server",
+    "cadvisor", "fluent-bit", "fluentd", "otel-collector", "opentelemetry",
+)
+
+
+def _is_generic_infra(target: AnalysisTarget) -> bool:
+    """True when the alert target is a generic k8s/monitoring component, not a
+    Run:ai workload — so it must follow general Kubernetes troubleshooting."""
+    name = (target.pod or target.workload_name or "").lower()
+    return any(stem in name for stem in _GENERIC_INFRA_STEMS)
 
 
 def _implicates_control_plane(target: AnalysisTarget) -> bool:
+    if _is_generic_infra(target):
+        return False
     if _is_runai_namespace(target.namespace):
         return True
     if target.project or target.queue:
@@ -100,7 +124,11 @@ def _namespace_scope(target: AnalysisTarget, settings: Settings) -> str:
       or any namespace carrying a Run:ai project/queue). Focus on the Run:ai scheduler
       and the workload's scheduling/quota/startup.
     - "infra": node-level / namespace-less / non-Run:ai — node & system first.
+      Also generic k8s/monitoring components (kube-state-metrics, prometheus, …)
+      wherever they run: they are a Kubernetes problem, not a Run:ai workload.
     """
+    if _is_generic_infra(target):
+        return "infra"
     if _is_platform_namespace(target.namespace, settings):
         return "platform"
     if _is_runai_namespace(target.namespace) or target.project or target.queue:
@@ -375,6 +403,14 @@ async def plan_investigation(
             "This alert is a user workload inside the Run:ai platform. Focus on the "
             "Run:ai scheduler and the workload's scheduling/quota/startup, and read the "
             "scheduler/control-plane logs. " + narrative
+        )
+    elif scope == "infra" and _is_generic_infra(target):
+        narrative = (
+            "This alert targets a generic Kubernetes/monitoring component, NOT a Run:ai "
+            "workload — treat it as ordinary Kubernetes troubleshooting: read the pod's "
+            "logs, describe its state/events (waiting/terminated reason, restarts, "
+            "last-state exit code), and check node/system health. Do not assume the "
+            "Run:ai scheduler or control plane. " + narrative
         )
     if node_focused:
         node_note = (

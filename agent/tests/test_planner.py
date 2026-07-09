@@ -173,6 +173,20 @@ def test_namespace_scope_classifies() -> None:
     assert _namespace_scope(_target(namespace=""), settings) == "infra"
 
 
+def test_generic_infra_component_is_infra_not_runai_workload() -> None:
+    # The reported bug: kube-state-metrics in a runai-* namespace was routed to the
+    # Run:ai scheduler. A generic monitoring component is a plain Kubernetes problem.
+    from app.services.planner import _implicates_control_plane, _namespace_scope
+
+    settings = make_settings()
+    ksm = _target(namespace="runai-rca", pod="prometheus-kube-state-metrics-76f7f4dd55-4lj5q")
+    assert _namespace_scope(ksm, settings) == "infra"
+    assert _implicates_control_plane(ksm) is False
+    # A real Run:ai workload in the same-shaped namespace still routes to workload.
+    trainer = _target(namespace="runai-team-a", pod="trainer-0")
+    assert _namespace_scope(trainer, settings) == "workload"
+
+
 @pytest.mark.asyncio
 async def test_llm_refinement_kept_on_success(monkeypatch) -> None:
     settings = replace(

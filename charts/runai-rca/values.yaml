@@ -38,6 +38,10 @@ secrets:
   runaiClientId: ""
   runaiClientSecret: ""
   runaiBearerToken: ""
+  # Grafana service-account token for grafana-mcp. LEAVE EMPTY and grafana-mcp
+  # can't list datasources -> the Loki/Prometheus datasource uid stays unresolved
+  # -> every MCP query fails "get datasource by uid ... 400 id is invalid" and the
+  # collector demotes to the direct API. Set this to make the MCP log/metric path work.
   grafanaServiceAccountToken: ""
   nvidiaApiKey: ""
   llmApiKey: ""
