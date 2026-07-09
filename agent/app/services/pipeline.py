@@ -8,6 +8,7 @@ import time
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, TypeVar
 
 from pydantic import BaseModel
@@ -39,6 +40,7 @@ from app.plan import InvestigationPlan
 from app.progress import ProgressReporter
 from app.prompts import load_agent_souls
 from app.schemas import AlertAnalysisRequest, AlertAnalysisResponse
+from app.services.decision_tree import load_tree, walk_tree
 from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
 from app.services.planner import plan_investigation
 from app.services.root_cause_ranking import RankedCause, rank_root_cause_candidates
@@ -78,6 +80,7 @@ class PipelineState:
     reanalysis_note: str = ""
     graph_fixes: GraphRemediation | None = None
     timeline: object | None = None
+    troubleshooting_path: dict[str, Any] | None = None
     quality: str = ""
     summary: str = ""
     detail: str = ""
@@ -438,6 +441,10 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         pass
     else:
         state.timeline = build_timeline(state.results)
+    state.troubleshooting_path = walk_tree(
+        load_tree(_k8s_troubleshooting_tree_path(settings)),
+        _observed_text(state.results, request),
+    )
     state.quality = _quality_from(state.results)
     # Adversarial precision: LLM-verify signature/keyword matches (known issues,
     # failure-mode symptoms, GPU XIDs) and drop ones the evidence doesn't support.
@@ -528,6 +535,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                 graph_fixes=state.graph_fixes,
                 fallback_detail=state.detail,
                 timeline=state.timeline,
+                troubleshooting_path=state.troubleshooting_path,
             )
         if synth:
             state.summary, state.detail = synth
@@ -600,6 +608,11 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             "hypothesis_ledger": state.investigation_context.get("hypothesis_ledger"),
             "investigation": state.investigation_context,
             **({"timeline": state.timeline} if state.timeline else {}),
+            **(
+                {"troubleshooting_path": state.troubleshooting_path}
+                if state.troubleshooting_path and state.troubleshooting_path.get("path")
+                else {}
+            ),
         },
         artifacts=state.artifacts,
     )
@@ -916,6 +929,7 @@ async def _synthesize_korean(
     graph_fixes: GraphRemediation,
     fallback_detail: str,
     timeline: list[dict] | None = None,
+    troubleshooting_path: dict[str, Any] | None = None,
 ) -> tuple[str, str] | None:
     """LLM synthesis of the RCA report in Korean, grounded STRICTLY in the evidence.
 
@@ -964,6 +978,11 @@ async def _synthesize_korean(
         # reboot/condition, pod delete/create, warning events → the alert. Small +
         # high-value, so it leads the reasoning inputs and the char cap won't trim it.
         **({"timeline": (timeline or [])[-40:]} if timeline else {}),
+        **(
+            {"troubleshooting_path": troubleshooting_path}
+            if troubleshooting_path and troubleshooting_path.get("path")
+            else {}
+        ),
         "plan": plan.as_dict(),
         "ranked_root_cause_candidates": [c.as_dict() for c in root_cause_candidates],
         "knowledge_graph": {
@@ -1020,6 +1039,9 @@ async def _synthesize_korean(
         "최우선 검토하세요: 배포/rollout(generation 변경), 노드 리부트·컨디션 변화, 파드 삭제/"
         "드레인, MIG/설정 변경 등. 스케줄러·증상성 경고(예: PodGroup Warning)보다 '무엇이 바뀌어 "
         "이 알림이 촉발됐는가'를 먼저 의심하고, 시간 순서(변경 → 결과 → 알림)로 인과를 설명하세요.\n"
+        "- 증거에 troubleshooting_path가 있으면 그 steps를 사용해 진단 흐름을 단계별로 설명하세요. "
+        "단, troubleshooting_path의 conclusion은 보강 근거일 뿐이며 XID/known-issue 같은 정밀 "
+        "signature 또는 ranked_root_cause_candidates의 1순위 원인을 절대 덮어쓰지 마세요.\n"
         "- 반드시 이 문서 구조를 따르세요 (Word 제출용이므로 헤딩/번호목록만 사용, 표·HTML 금지):\n"
         "  # 장애 분석 보고서 — {알림명}\n"
         "  발생/심각도/대상 메타 한 줄\n"
@@ -1185,6 +1207,14 @@ def _build_settings_masker(settings: Settings) -> Masker:
         builtin_enabled=settings.builtin_redaction_enabled,
         hash_mode=settings.builtin_redaction_hash_mode,
     )
+
+
+def _k8s_troubleshooting_tree_path(settings: Settings) -> str:
+    base = Path(settings.failure_modes_file or "knowledge/failure_modes.yaml")
+    try:
+        return str(base.with_name("k8s_troubleshooting_tree.yaml"))
+    except ValueError:
+        return "knowledge/k8s_troubleshooting_tree.yaml"
 
 
 def _mask_model(model: TModel, model_type: type[TModel], masker: Masker) -> TModel:

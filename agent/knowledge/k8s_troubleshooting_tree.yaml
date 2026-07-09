@@ -1,0 +1,288 @@
+root: pod_or_node_symptom
+nodes:
+  - id: pod_or_node_symptom
+    question: "Which Kubernetes symptom appears first?"
+    match:
+      any:
+        - pending
+        - failedscheduling
+        - crashloopbackoff
+        - back-off restarting
+        - oomkilled
+        - imagepullbackoff
+        - errimagepull
+        - failedmount
+        - failedattachvolume
+        - notready
+        - ready=false
+        - readiness probe failed
+        - liveness probe failed
+        - failed to create pod sandbox
+    branches:
+      - match:
+          any: [pending, failedscheduling]
+          fields:
+            pod_phase: Pending
+        next: pod_pending
+      - match:
+          any: [crashloopbackoff, back-off restarting, oomkilled, backoff]
+        next: pod_crashing
+      - match:
+          any: [imagepullbackoff, errimagepull, failed to pull image]
+        next: image_pull_failure
+      - match:
+          any: [failedmount, failedattachvolume, unable to attach or mount volumes]
+        next: volume_failure
+      - match:
+          any: [notready, ready=false, node is not ready]
+        next: node_not_ready
+      - match:
+          any: [readiness probe failed, liveness probe failed, startup probe failed]
+        next: probe_failure
+      - match:
+          any: [failed to create pod sandbox, cni plugin, network plugin]
+        next: pod_network_failure
+
+  - id: pod_pending
+    question: "Why is the pod Pending?"
+    match:
+      any: [pending, failedscheduling, unschedulable]
+      fields:
+        pod_phase: Pending
+    branches:
+      - match:
+          any:
+            - failedscheduling
+            - unschedulable
+            - insufficient cpu
+            - insufficient memory
+            - insufficient nvidia.com/gpu
+            - untolerated taint
+            - node affinity
+            - node selector
+            - topology spread
+            - 0/
+        next: pending_failed_scheduling
+      - match:
+          any:
+            - unbound immediate persistentvolumeclaims
+            - volumebinding
+            - persistentvolumeclaim
+            - storageclass
+            - provisioningfailed
+        next: pending_volume_binding
+      - match:
+          any: [imagepullbackoff, errimagepull, failed to pull image]
+        next: image_pull_failure
+      - match:
+          any: [notready, node is not ready, ready=false]
+        next: node_not_ready
+
+  - id: pending_failed_scheduling
+    question: "Did kube-scheduler report a FailedScheduling reason?"
+    match:
+      any:
+        - failedscheduling
+        - unschedulable
+        - insufficient nvidia.com/gpu
+        - untolerated taint
+        - node affinity
+        - node selector
+        - topology spread
+        - 0/
+      fields:
+        event_reason: FailedScheduling
+    conclusion:
+      family: k8s_scheduling_error
+      summary: "The pod is Pending because kube-scheduler could not place it on any node."
+      next_steps:
+        - "Read the FailedScheduling event breakdown in kubectl describe pod."
+        - "Compare requested CPU, memory, GPU, taints, tolerations, selectors, and affinity against schedulable nodes."
+        - "Fix the blocking predicate or add capacity in the matching node pool."
+
+  - id: pending_volume_binding
+    question: "Is Pending caused by PVC or StorageClass binding?"
+    match:
+      any:
+        - unbound immediate persistentvolumeclaims
+        - persistentvolumeclaim
+        - storageclass
+        - volumebinding
+        - provisioningfailed
+    conclusion:
+      family: k8s_storage_error
+      summary: "The pod is Pending because Kubernetes cannot bind or provision its volume."
+      next_steps:
+        - "Run kubectl describe pvc and read the provisioning or binding event."
+        - "Confirm the StorageClass exists and its provisioner is healthy."
+        - "Check storage capacity and topology constraints for the requested volume."
+
+  - id: pod_crashing
+    question: "Why is the container restarting?"
+    match:
+      any: [crashloopbackoff, back-off restarting, backoff, oomkilled]
+    branches:
+      - match:
+          any: [oomkilled, out of memory, exit code 137]
+          fields:
+            terminated_reason: OOMKilled
+        next: crash_oomkilled
+      - match:
+          any: [runcontainererror, containercannotrun, executable file not found]
+        next: container_start_error
+      - match:
+          any: [startup probe failed, liveness probe failed, readiness probe failed]
+        next: probe_failure
+      - match:
+          any: [crashloopbackoff, back-off restarting, backoff]
+        next: crashloop_backoff
+
+  - id: crash_oomkilled
+    question: "Was the previous container terminated by OOMKilled?"
+    match:
+      any: [oomkilled, out of memory, exit code 137]
+      fields:
+        terminated_reason: OOMKilled
+    conclusion:
+      family: workload_startup_error
+      summary: "The workload restarts because the container is being OOMKilled."
+      next_steps:
+        - "Check whether memory spikes at startup or grows over time."
+        - "Raise the memory limit only if usage is expected; otherwise fix the leak or input size."
+        - "Compare limits and recent image or config changes with the last healthy revision."
+
+  - id: crashloop_backoff
+    question: "Is the pod repeatedly failing after process start?"
+    match:
+      any: [crashloopbackoff, back-off restarting, backoff]
+    conclusion:
+      family: workload_startup_error
+      summary: "The workload process starts and exits repeatedly, causing CrashLoopBackOff."
+      next_steps:
+        - "Read current and previous container logs for the first application error."
+        - "Check command, args, env, ConfigMap, Secret, and recent image changes."
+        - "Fix the workload-level crash before changing platform scheduling."
+
+  - id: container_start_error
+    question: "Could kubelet create the container process?"
+    match:
+      any: [runcontainererror, containercannotrun, executable file not found]
+    conclusion:
+      family: workload_startup_error
+      summary: "The container cannot start because its command or runtime setup is invalid."
+      next_steps:
+        - "Inspect the pod event message for the exact missing executable or permission error."
+        - "Compare command and args with the image contents."
+        - "Fix the image, entrypoint, file mode, or securityContext."
+
+  - id: image_pull_failure
+    question: "Did the node fail before the image was available?"
+    match:
+      any:
+        - imagepullbackoff
+        - errimagepull
+        - failed to pull image
+        - pull access denied
+        - manifest unknown
+        - toomanyrequests
+    conclusion:
+      family: image_pull_error
+      summary: "The pod cannot start because the node cannot pull the container image."
+      next_steps:
+        - "Read the image pull event for tag, auth, DNS, TLS, rate limit, or registry 5xx details."
+        - "Confirm the image tag exists and imagePullSecrets are present in the same namespace."
+        - "Test a manual pull from the affected node or mirror the image to a reachable registry."
+
+  - id: volume_failure
+    question: "Did volume attach or mount fail?"
+    match:
+      any:
+        - failedmount
+        - failedattachvolume
+        - unable to attach or mount volumes
+        - mountvolume.setup failed
+        - multi-attach error
+    conclusion:
+      family: k8s_storage_error
+      summary: "The pod is blocked because Kubernetes cannot attach or mount a volume."
+      next_steps:
+        - "Check the PVC is Bound and describe the pod for the exact mount or attach event."
+        - "Inspect the CSI node and controller pods for the affected volume."
+        - "Check backend storage health and volume topology before restarting the workload."
+
+  - id: node_not_ready
+    question: "Is the target node NotReady or under pressure?"
+    match:
+      any: [notready, node is not ready, ready=false, diskpressure, memorypressure, pidpressure]
+      fields:
+        node_ready: "False"
+    branches:
+      - match:
+          any: [diskpressure, memorypressure, pidpressure, evicted, low on resource]
+        next: node_pressure
+      - match:
+          any:
+            - container runtime network not ready
+            - failed to create pod sandbox
+            - cni plugin
+            - network plugin
+        next: pod_network_failure
+      - match:
+          any: [notready, node is not ready, ready=false]
+        next: node_condition_failure
+
+  - id: node_pressure
+    question: "Which node pressure condition is active?"
+    match:
+      any: [diskpressure, memorypressure, pidpressure, evicted, low on resource]
+    conclusion:
+      family: node_kubelet_pressure
+      summary: "The node is under kubelet pressure and is disrupting pods."
+      next_steps:
+        - "Cordon the node if unrelated workloads are affected."
+        - "Inspect kubelet conditions, evictions, disk, memory, PID usage, and image or log growth."
+        - "Remove the pressure source before uncordoning."
+
+  - id: node_condition_failure
+    question: "Did kubelet report the node as NotReady?"
+    match:
+      any: [notready, node is not ready, ready=false]
+      fields:
+        node_ready: "False"
+    conclusion:
+      family: node_kubelet_pressure
+      summary: "The node is NotReady, so pod placement or running pods on that node are unreliable."
+      next_steps:
+        - "Check kubelet and container runtime status on the node."
+        - "Read node conditions and recent kubelet events for heartbeat, runtime, disk, memory, or PID failures."
+        - "Cordon or drain the node while recovering kubelet or the runtime."
+
+  - id: probe_failure
+    question: "Are health probes keeping the pod unready or restarting it?"
+    match:
+      any: [readiness probe failed, liveness probe failed, startup probe failed, unhealthy]
+    conclusion:
+      family: workload_startup_error
+      summary: "The workload is failing Kubernetes health probes."
+      next_steps:
+        - "Check probe path, port, timeout, period, and failureThreshold against real startup time."
+        - "Read application logs around the probe failures."
+        - "Fix the app endpoint or tune the probe only after confirming the app is otherwise healthy."
+
+  - id: pod_network_failure
+    question: "Did sandbox creation, CNI, or DNS fail?"
+    match:
+      any:
+        - failed to create pod sandbox
+        - failed to setup network for sandbox
+        - cni plugin
+        - network plugin
+        - coredns
+        - no such host
+    conclusion:
+      family: cluster_network_error
+      summary: "Pod startup or reachability is blocked by cluster networking."
+      next_steps:
+        - "Check the CNI daemonset on the target node and recent sandbox events."
+        - "If DNS is implicated, check CoreDNS pods and resolve kubernetes.default from a pod."
+        - "Inspect NetworkPolicy, IPAM exhaustion, MTU, or kube-proxy only if the event points there."
