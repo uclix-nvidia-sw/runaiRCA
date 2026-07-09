@@ -11,6 +11,7 @@ COPY configs ./configs
 COPY knowledge ./knowledge
 COPY prompts ./prompts
 COPY ontology ./ontology
+COPY eval ./eval
 
 RUN pip install --no-cache-dir .
 
