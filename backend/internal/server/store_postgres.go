@@ -867,16 +867,24 @@ func (s *Store) persistHardDeleteIncidentLocked(incidentID string, alertIDs []st
 			_ = tx.Rollback()
 		}
 	}()
-	for _, query := range []string{
-		`DELETE FROM analysis_runs WHERE incident_id = $1 OR alert_id = ANY($2)`,
-		`DELETE FROM chat_conversations WHERE incident_id = $1 OR alert_id = ANY($2)`,
-		`DELETE FROM rca_comments WHERE incident_id = $1 OR target_id = $1 OR alert_id = ANY($2) OR target_id = ANY($2)`,
-		`DELETE FROM rca_feedback WHERE incident_id = $1 OR target_id = $1 OR alert_id = ANY($2) OR target_id = ANY($2)`,
-		`DELETE FROM incident_embeddings WHERE incident_id = $1 OR alert_id = ANY($2)`,
-		`DELETE FROM alerts WHERE incident_id = $1`,
-		`DELETE FROM incidents WHERE incident_id = $1`,
-	} {
-		if _, err := tx.ExecContext(ctx, query, incidentID, alertIDs); err != nil {
+	// Each query gets EXACTLY the args it references. The last two use only $1 —
+	// passing $2 too made pgx/Postgres reject the bind ("2 parameters, statement
+	// requires 1"), failing the whole tx so hard delete silently 404'd. (The unit
+	// test's fake driver doesn't enforce bind-param counts, so it never caught this.)
+	ops := []struct {
+		query string
+		args  []any
+	}{
+		{`DELETE FROM analysis_runs WHERE incident_id = $1 OR alert_id = ANY($2)`, []any{incidentID, alertIDs}},
+		{`DELETE FROM chat_conversations WHERE incident_id = $1 OR alert_id = ANY($2)`, []any{incidentID, alertIDs}},
+		{`DELETE FROM rca_comments WHERE incident_id = $1 OR target_id = $1 OR alert_id = ANY($2) OR target_id = ANY($2)`, []any{incidentID, alertIDs}},
+		{`DELETE FROM rca_feedback WHERE incident_id = $1 OR target_id = $1 OR alert_id = ANY($2) OR target_id = ANY($2)`, []any{incidentID, alertIDs}},
+		{`DELETE FROM incident_embeddings WHERE incident_id = $1 OR alert_id = ANY($2)`, []any{incidentID, alertIDs}},
+		{`DELETE FROM alerts WHERE incident_id = $1`, []any{incidentID}},
+		{`DELETE FROM incidents WHERE incident_id = $1`, []any{incidentID}},
+	}
+	for _, op := range ops {
+		if _, err := tx.ExecContext(ctx, op.query, op.args...); err != nil {
 			log.Printf("Failed to hard delete incident %s: %v", incidentID, err)
 			return false
 		}

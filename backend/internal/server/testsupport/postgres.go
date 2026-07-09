@@ -190,7 +190,33 @@ func (c *fakePostgresConn) Ping(context.Context) error {
 	return nil
 }
 
-func (c *fakePostgresConn) ExecContext(ctx context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+// maxDollarPlaceholder returns the highest N among the query's $N placeholders
+// (0 if none) — the parameter count Postgres binds for the statement.
+func maxDollarPlaceholder(query string) int {
+	max := 0
+	for i := 0; i < len(query); i++ {
+		if query[i] != '$' {
+			continue
+		}
+		j, n := i+1, 0
+		for j < len(query) && query[j] >= '0' && query[j] <= '9' {
+			n = n*10 + int(query[j]-'0')
+			j++
+		}
+		if j > i+1 && n > max {
+			max = n
+		}
+	}
+	return max
+}
+
+func (c *fakePostgresConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	// Mimic Postgres bind semantics: it binds exactly the number of $N params the
+	// statement references. Passing extra args (a real bug that fails at runtime)
+	// used to silently "work" against this fake driver.
+	if want := maxDollarPlaceholder(query); len(args) != want {
+		return nil, fmt.Errorf("bind message supplies %d parameters, but statement requires %d", len(args), want)
+	}
 	failAnalysisRun := false
 	c.state.mu.Lock()
 	if _, ok := ctx.Deadline(); !ok {
