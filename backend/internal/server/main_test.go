@@ -2688,6 +2688,46 @@ func TestResolvedThenRefiringGrowsOccurrence(t *testing.T) {
 	}
 }
 
+func TestApprovalSurvivesResolvedRefire(t *testing.T) {
+	// Regression: an approved incident was silently un-approved overnight when the
+	// same alert re-fired (resolved→firing cleared UserApprovedAt). Approval of the
+	// RCA must survive a recurrence of the same incident.
+	store := NewStore()
+	mk := func(status string, ts time.Time) (AlertmanagerWebhook, Alert) {
+		a := Alert{
+			Status:      status,
+			Labels:      map[string]string{"alertname": "RunaiReconcile", "namespace": "runai", "pod": "p-0"},
+			Annotations: map[string]string{},
+			Fingerprint: "fp-approve-refire",
+			StartsAt:    ts.Format(time.RFC3339),
+		}
+		if status == "resolved" {
+			a.EndsAt = ts.Format(time.RFC3339)
+		}
+		return AlertmanagerWebhook{}, a
+	}
+	base := time.Now().UTC().Add(-4 * time.Hour)
+	wh, a := mk("firing", base)
+	r1 := store.UpsertAlertResult(wh, a)
+	// Operator approves the incident's RCA.
+	now := time.Now().UTC()
+	store.incidents[r1.Incident.IncidentID].UserApprovedAt = &now
+	// Resolve, then the SAME alert re-fires within the reuse window (reuses the incident).
+	wh, a = mk("resolved", base.Add(30*time.Minute))
+	store.UpsertAlertResult(wh, a)
+	wh, a = mk("firing", base.Add(2*time.Hour))
+	r2 := store.UpsertAlertResult(wh, a)
+	if r2.Incident.IncidentID != r1.Incident.IncidentID {
+		t.Fatalf("re-fire should reuse incident: %s vs %s", r2.Incident.IncidentID, r1.Incident.IncidentID)
+	}
+	if r2.Incident.Status != "firing" {
+		t.Fatalf("re-fire status = %s, want firing", r2.Incident.Status)
+	}
+	if store.incidents[r1.Incident.IncidentID].UserApprovedAt == nil {
+		t.Fatalf("approval must survive a resolved→firing re-fire, got nil")
+	}
+}
+
 func TestTokenizeKeepsKoreanAndSimilarityIsHighForNearDuplicates(t *testing.T) {
 	// The old tokenizer dropped all Hangul, so near-identical Korean reports scored
 	// ~50%. Korean eojeols must now survive and drive a high similarity.

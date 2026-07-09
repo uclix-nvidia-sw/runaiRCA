@@ -354,7 +354,9 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	} else if alertStatus != "resolved" && incident.Status == "resolved" {
 		incident.Status = "firing"
 		incident.ResolvedAt = nil
-		incident.UserApprovedAt = nil
+		// Keep UserApprovedAt: a recurrence of the SAME incident (same correlation
+		// key) does not invalidate the operator's approval of its RCA. Clearing it
+		// here silently un-approved incidents overnight whenever an alert re-fired.
 	}
 
 	if alertID == "" {
