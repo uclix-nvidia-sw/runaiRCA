@@ -1670,7 +1670,7 @@ func (s *Store) ReapStaleAnalyzingRuns(staleAfter time.Duration, manualStaleAfte
 // fan-out / rate caps) and alerts whose latest run failed longer ago than
 // retryCooldown. Completed and in-flight alerts are skipped, so backfill never
 // re-runs a good RCA and does not hammer a just-failed one.
-func (s *Store) AlertIDsNeedingAnalysis(limit int, retryCooldown time.Duration, now time.Time) []string {
+func (s *Store) AlertIDsNeedingAnalysis(limit int, retryCooldown time.Duration, now time.Time, allow func(severity string) bool) []string {
 	if limit <= 0 {
 		return nil
 	}
@@ -1698,6 +1698,12 @@ func (s *Store) AlertIDsNeedingAnalysis(limit int, retryCooldown time.Duration, 
 			continue
 		}
 		if status(alert.Status) == "resolved" {
+			continue
+		}
+		// Filter ineligible severities HERE (not in the caller) so a queue full of
+		// never-analyzable alerts (e.g. Watchdog/none) can't starve the batch and
+		// keep eligible warning/critical alerts from ever being backfilled.
+		if allow != nil && !allow(alert.Severity) {
 			continue
 		}
 		if info, ok := latest[alert.AlertID]; ok {

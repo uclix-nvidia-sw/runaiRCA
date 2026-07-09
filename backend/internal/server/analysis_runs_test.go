@@ -1494,6 +1494,28 @@ func TestDashboardAnalyzeLargeIncidentStartsSingleRun(t *testing.T) {
 	}
 }
 
+func TestAlertIDsNeedingAnalysisSeverityFilterAvoidsStarvation(t *testing.T) {
+	store := NewStore()
+	_, warn := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "w"}, Alert{
+		Status: "firing", Fingerprint: "fp-w",
+		Labels: map[string]string{"alertname": "A", "severity": "warning"},
+	})
+	store.UpsertAlert(AlertmanagerWebhook{GroupKey: "n"}, Alert{
+		Status: "firing", Fingerprint: "fp-n",
+		Labels: map[string]string{"alertname": "B", "severity": "none"},
+	})
+	allow := func(sev string) bool { return sev == "warning" || sev == "critical" }
+	// The never-analyzable none alert must be filtered at the source so it can't fill
+	// the batch and starve the eligible warning alert.
+	ids := store.AlertIDsNeedingAnalysis(10, 0, time.Now().UTC(), allow)
+	if len(ids) != 1 || ids[0] != warn.AlertID {
+		t.Fatalf("expected only the warning alert, got %+v", ids)
+	}
+	if all := store.AlertIDsNeedingAnalysis(10, 0, time.Now().UTC(), nil); len(all) != 2 {
+		t.Fatalf("nil predicate should return both severities, got %+v", all)
+	}
+}
+
 func TestAlertIDsNeedingAnalysis(t *testing.T) {
 	store := NewStore()
 	now := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
@@ -1514,7 +1536,7 @@ func TestAlertIDsNeedingAnalysis(t *testing.T) {
 	addAlert("resolved", "resolved", false)              // resolved -> exclude
 	addAlert("inflight", "firing", true)                 // analyzing -> exclude
 
-	got := store.AlertIDsNeedingAnalysis(10, 15*time.Minute, now)
+	got := store.AlertIDsNeedingAnalysis(10, 15*time.Minute, now, nil)
 	set := map[string]bool{}
 	for _, id := range got {
 		set[id] = true

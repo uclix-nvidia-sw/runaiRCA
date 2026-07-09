@@ -2812,7 +2812,7 @@ func TestIncidentLifecycleViewsAndDeletedGuards(t *testing.T) {
 	if got := store.LatestAlertID(); got != "" {
 		t.Fatalf("latest alert should exclude deleted incident alert, got %s", got)
 	}
-	if ids := store.AlertIDsNeedingAnalysis(10, 0, time.Now().UTC()); len(ids) != 0 {
+	if ids := store.AlertIDsNeedingAnalysis(10, 0, time.Now().UTC(), nil); len(ids) != 0 {
 		t.Fatalf("backfill should exclude deleted incident alerts: %+v", ids)
 	}
 	if _, _, _, _, _, ok := store.AnalysisTarget("incident", incident.IncidentID); ok {
