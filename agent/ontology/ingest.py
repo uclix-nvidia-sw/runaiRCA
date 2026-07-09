@@ -43,8 +43,10 @@ SELECT i.incident_id, i.correlation_key, i.title, i.severity, i.status,
        i.fired_at::text AS fired_at,
        i.user_approved_at::text AS user_approved_at,
        a.alert_id, a.fingerprint, a.occurrence_count, a.occurrence_pods,
-       a.labels, a.annotations, a.analysis_summary, a.analysis_detail,
-       a.root_cause_family,
+       a.labels, a.annotations,
+       COALESCE(r.analysis_summary, '') AS analysis_summary,
+       COALESCE(r.analysis_detail, '')  AS analysis_detail,
+       COALESCE(r.root_cause_family, '') AS root_cause_family,
        (SELECT count(*) FROM rca_feedback f
          WHERE f.target_id IN (i.incident_id, a.alert_id)
            AND f.kind = 'vote'
@@ -61,6 +63,17 @@ SELECT i.incident_id, i.correlation_key, i.title, i.severity, i.status,
                       AND c.kind = 'comment')) AS reviewed
 FROM incidents i
 JOIN alerts a ON a.incident_id = i.incident_id
+-- RCA now lives on analysis_runs (the per-alert columns were dropped). Take the
+-- incident's latest COMPLETED run (fall back to the newest with content), matching
+-- the backend's latestAnalysisRunForIncident selection.
+LEFT JOIN LATERAL (
+    SELECT ar.analysis_summary, ar.analysis_detail, ar.root_cause_family
+      FROM analysis_runs ar
+     WHERE (ar.incident_id = i.incident_id OR ar.alert_id = a.alert_id)
+       AND (ar.analysis_summary <> '' OR ar.analysis_detail <> '')
+     ORDER BY (ar.status = 'complete') DESC, ar.updated_at DESC
+     LIMIT 1
+) r ON TRUE
 {where}
 ORDER BY i.fired_at DESC
 LIMIT $1
