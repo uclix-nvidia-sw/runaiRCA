@@ -2387,6 +2387,36 @@ func TestFeedbackVoteToggleCancelsSameActorVote(t *testing.T) {
 	}
 }
 
+func TestFeedbackInlineCommentStoredOnce(t *testing.T) {
+	store := NewStore()
+	incident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "feedback-inline-comment"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-feedback-inline-comment",
+	})
+
+	summary, ok, err := store.AddFeedback("incident", incident.IncidentID, FeedbackRequest{
+		Vote:    "up",
+		Comment: "useful RCA",
+		Author:  "operator",
+	})
+	if err != nil || !ok {
+		t.Fatalf("feedback failed: ok=%t err=%v", ok, err)
+	}
+	if summary.Positive != 1 || len(summary.Comments) != 1 || summary.Comments[0].Body != "useful RCA" {
+		t.Fatalf("unexpected summary: %+v", summary)
+	}
+	for _, record := range store.feedback {
+		if record.Comment != "" {
+			t.Fatalf("vote row should not duplicate inline comment text: %+v", record)
+		}
+	}
+	if prompt := store.OperatorPromptForTarget("incident", incident.IncidentID); !strings.Contains(prompt, "useful RCA") {
+		t.Fatalf("operator prompt should include inline comment, got %q", prompt)
+	}
+}
+
 func TestFeedbackRejectsOversizedCommentFields(t *testing.T) {
 	store := NewStore()
 	incident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "feedback-bounds"}, Alert{

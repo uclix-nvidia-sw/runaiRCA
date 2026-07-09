@@ -243,25 +243,60 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 		END $$`,
 		`CREATE TABLE IF NOT EXISTS rca_feedback (
 			feedback_id TEXT PRIMARY KEY,
+			kind TEXT NOT NULL DEFAULT 'vote',
 			target_type TEXT NOT NULL,
 			target_id TEXT NOT NULL,
 			incident_id TEXT,
 			alert_id TEXT,
-			vote TEXT NOT NULL,
-			comment TEXT NOT NULL DEFAULT '',
+			vote TEXT,
+			body TEXT NOT NULL DEFAULT '',
 			author TEXT NOT NULL DEFAULT '',
-			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
-		`CREATE TABLE IF NOT EXISTS rca_comments (
-			comment_id TEXT PRIMARY KEY,
-			target_type TEXT NOT NULL,
-			target_id TEXT NOT NULL,
-			incident_id TEXT,
-			alert_id TEXT,
-			body TEXT NOT NULL,
-			author TEXT NOT NULL DEFAULT '',
-			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-		)`,
+		`ALTER TABLE rca_feedback ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'vote'`,
+		`ALTER TABLE rca_feedback ADD COLUMN IF NOT EXISTS body TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE rca_feedback ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()`,
+		`ALTER TABLE rca_feedback ALTER COLUMN vote DROP NOT NULL`,
+		`UPDATE rca_feedback SET kind = 'vote' WHERE kind IS NULL OR kind = ''`,
+		`DO $$
+		BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = 'public' AND table_name = 'rca_feedback' AND column_name = 'comment'
+			) THEN
+				EXECUTE '
+					UPDATE rca_feedback
+					   SET body = comment
+					 WHERE kind = ''vote''
+					   AND body = ''''
+					   AND comment IS NOT NULL
+					   AND comment <> ''''
+				';
+			END IF;
+		END $$`,
+		`DO $$
+		BEGIN
+			IF to_regclass('public.rca_comments') IS NOT NULL THEN
+				INSERT INTO rca_feedback (
+					feedback_id, kind, target_type, target_id, incident_id, alert_id,
+					vote, body, author, created_at, updated_at
+				)
+				SELECT
+					comment_id, 'comment', target_type, target_id, incident_id, alert_id,
+					NULL, body, author, created_at, created_at
+				FROM rca_comments
+				ON CONFLICT (feedback_id) DO NOTHING;
+				-- rca_comments is kept for operator verification/rollback; DROP TABLE manually after migration.
+			END IF;
+		END $$`,
+		`ALTER TABLE rca_feedback DROP CONSTRAINT IF EXISTS rca_feedback_kind_check`,
+		`ALTER TABLE rca_feedback ADD CONSTRAINT rca_feedback_kind_check CHECK (kind IN ('vote', 'comment')) NOT VALID`,
+		`ALTER TABLE rca_feedback DROP CONSTRAINT IF EXISTS rca_feedback_payload_check`,
+		`ALTER TABLE rca_feedback ADD CONSTRAINT rca_feedback_payload_check CHECK (
+			(kind = 'vote' AND vote IN ('up', 'down')) OR
+			(kind = 'comment' AND vote IS NULL AND body <> '')
+		) NOT VALID`,
 		`CREATE TABLE IF NOT EXISTS analysis_runs (
 			run_id TEXT PRIMARY KEY,
 			source TEXT NOT NULL,
@@ -300,7 +335,7 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_alerts_incident_id ON alerts (incident_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_feedback_target ON rca_feedback (target_type, target_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_comments_target ON rca_comments (target_type, target_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_one_vote_per_author ON rca_feedback (target_type, target_id, author) WHERE kind = 'vote'`,
 		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_created_at ON analysis_runs (created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_target ON analysis_runs (target_type, target_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_chat_conversations_updated_at ON chat_conversations (updated_at DESC)`,
@@ -633,8 +668,9 @@ func (s *Store) loadFeedback(ctx context.Context) {
 	rows, err := s.db.QueryContext(
 		ctx,
 		`SELECT feedback_id, target_type, target_id, incident_id, alert_id, vote,
-		        comment, author, created_at
-		   FROM rca_feedback`,
+		        body, author, created_at
+		   FROM rca_feedback
+		  WHERE kind = 'vote'`,
 	)
 	if err != nil {
 		log.Printf("Failed to load feedback: %v", err)
@@ -666,9 +702,10 @@ func (s *Store) loadFeedback(ctx context.Context) {
 func (s *Store) loadComments(ctx context.Context) {
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT comment_id, target_type, target_id, incident_id, alert_id, body,
+		`SELECT feedback_id, target_type, target_id, incident_id, alert_id, body,
 		        author, created_at
-		   FROM rca_comments`,
+		   FROM rca_feedback
+		  WHERE kind = 'comment'`,
 	)
 	if err != nil {
 		log.Printf("Failed to load comments: %v", err)
@@ -859,7 +896,6 @@ func (s *Store) persistHardDeleteIncidentLocked(incidentID string, alertIDs []st
 	}{
 		{`DELETE FROM analysis_runs WHERE incident_id = $1 OR alert_id = ANY($2)`, []any{incidentID, alertIDs}},
 		{`DELETE FROM chat_conversations WHERE incident_id = $1 OR alert_id = ANY($2)`, []any{incidentID, alertIDs}},
-		{`DELETE FROM rca_comments WHERE incident_id = $1 OR target_id = $1 OR alert_id = ANY($2) OR target_id = ANY($2)`, []any{incidentID, alertIDs}},
 		{`DELETE FROM rca_feedback WHERE incident_id = $1 OR target_id = $1 OR alert_id = ANY($2) OR target_id = ANY($2)`, []any{incidentID, alertIDs}},
 		{`DELETE FROM incident_embeddings WHERE incident_id = $1 OR alert_id = ANY($2)`, []any{incidentID, alertIDs}},
 		{`DELETE FROM alerts WHERE incident_id = $1`, []any{incidentID}},
@@ -1000,9 +1036,9 @@ func (s *Store) persistFeedbackLocked(record *FeedbackRecord) {
 	}
 	_, err := s.execPostgres(
 		`INSERT INTO rca_feedback (
-			feedback_id, target_type, target_id, incident_id, alert_id, vote,
-			comment, author, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			feedback_id, kind, target_type, target_id, incident_id, alert_id,
+			vote, body, author, created_at, updated_at
+		) VALUES ($1, 'vote', $2, $3, $4, $5, $6, $7, $8, $9, $9)
 		ON CONFLICT (feedback_id) DO NOTHING`,
 		record.FeedbackID,
 		record.TargetType,
@@ -1025,7 +1061,7 @@ func (s *Store) persistFeedbackDeleteForActorLocked(targetType string, targetID 
 	}
 	if _, err := s.execPostgres(
 		`DELETE FROM rca_feedback
-		  WHERE target_type = $1 AND target_id = $2 AND author = $3`,
+		  WHERE kind = 'vote' AND target_type = $1 AND target_id = $2 AND author = $3`,
 		targetType,
 		targetID,
 		feedbackActor(author),
@@ -1039,11 +1075,11 @@ func (s *Store) persistCommentLocked(record *CommentRecord) {
 		return
 	}
 	_, err := s.execPostgres(
-		`INSERT INTO rca_comments (
-			comment_id, target_type, target_id, incident_id, alert_id, body,
-			author, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (comment_id) DO NOTHING`,
+		`INSERT INTO rca_feedback (
+			feedback_id, kind, target_type, target_id, incident_id, alert_id,
+			vote, body, author, created_at, updated_at
+		) VALUES ($1, 'comment', $2, $3, $4, $5, NULL, $6, $7, $8, $8)
+		ON CONFLICT (feedback_id) DO NOTHING`,
 		record.CommentID,
 		record.TargetType,
 		record.TargetID,
@@ -1063,9 +1099,9 @@ func (s *Store) persistCommentUpdateLocked(record *CommentRecord) {
 		return
 	}
 	_, err := s.execPostgres(
-		`UPDATE rca_comments
-		    SET body = $1, author = $2
-		  WHERE comment_id = $3`,
+		`UPDATE rca_feedback
+		    SET body = $1, author = $2, updated_at = now()
+		  WHERE feedback_id = $3 AND kind = 'comment'`,
 		record.Body,
 		record.Author,
 		record.CommentID,
@@ -1079,8 +1115,24 @@ func (s *Store) persistCommentDeleteLocked(commentID string) {
 	if s.db == nil || !s.dbReady || commentID == "" {
 		return
 	}
-	if _, err := s.execPostgres(`DELETE FROM rca_comments WHERE comment_id = $1`, commentID); err != nil {
+	if _, err := s.execPostgres(`DELETE FROM rca_feedback WHERE feedback_id = $1 AND kind = 'comment'`, commentID); err != nil {
 		log.Printf("Failed to delete comment %s: %v", commentID, err)
+	}
+}
+
+func (s *Store) persistFeedbackCommentUpdateLocked(record *FeedbackRecord) {
+	if s.db == nil || !s.dbReady || record == nil {
+		return
+	}
+	_, err := s.execPostgres(
+		`UPDATE rca_feedback
+		    SET body = $1, updated_at = now()
+		  WHERE feedback_id = $2 AND kind = 'vote'`,
+		record.Comment,
+		record.FeedbackID,
+	)
+	if err != nil {
+		log.Printf("Failed to update feedback comment %s: %v", record.FeedbackID, err)
 	}
 }
 

@@ -165,7 +165,6 @@ func TestPostgresHardDeleteUsesSingleTransaction(t *testing.T) {
 	for _, fragment := range []string{
 		"DELETE FROM analysis_runs",
 		"DELETE FROM chat_conversations",
-		"DELETE FROM rca_comments",
 		"DELETE FROM rca_feedback",
 		"DELETE FROM incident_embeddings",
 		"DELETE FROM alerts",

@@ -333,18 +333,18 @@ func (s *PostgresState) rowsFor(query string) driver.Rows {
 				s.labelsJSON, s.memoryVectorJSON, s.now,
 			}},
 		}
-	case strings.Contains(lowered, "from rca_feedback"):
+	case strings.Contains(lowered, "from rca_feedback") && strings.Contains(lowered, "kind = 'comment'"):
 		return &fakeRows{
-			columns: []string{"feedback_id", "target_type", "target_id", "incident_id", "alert_id", "vote", "comment", "author", "created_at"},
-			values: [][]driver.Value{{
-				"FDB-db", "incident", "INC-db", "INC-db", "", "up", "This matched the prior quota issue.", "operator", s.now,
-			}},
-		}
-	case strings.Contains(lowered, "from rca_comments"):
-		return &fakeRows{
-			columns: []string{"comment_id", "target_type", "target_id", "incident_id", "alert_id", "body", "author", "created_at"},
+			columns: []string{"feedback_id", "target_type", "target_id", "incident_id", "alert_id", "body", "author", "created_at"},
 			values: [][]driver.Value{{
 				"CMT-db", "incident", "INC-db", "INC-db", "", "Persisted operator comment.", "operator", s.now,
+			}},
+		}
+	case strings.Contains(lowered, "from rca_feedback"):
+		return &fakeRows{
+			columns: []string{"feedback_id", "target_type", "target_id", "incident_id", "alert_id", "vote", "body", "author", "created_at"},
+			values: [][]driver.Value{{
+				"FDB-db", "incident", "INC-db", "INC-db", "", "up", "", "operator", s.now,
 			}},
 		}
 	case strings.Contains(lowered, "from analysis_runs"):

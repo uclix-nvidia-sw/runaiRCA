@@ -47,14 +47,18 @@ SELECT i.incident_id, i.correlation_key, i.title, i.severity, i.status,
        a.root_cause_family,
        (SELECT count(*) FROM rca_feedback f
          WHERE f.target_id IN (i.incident_id, a.alert_id)
+           AND f.kind = 'vote'
            AND f.vote = 'up') AS positive_feedback,
        (SELECT count(*) FROM rca_feedback f
          WHERE f.target_id IN (i.incident_id, a.alert_id)
+           AND f.kind = 'vote'
            AND f.vote = 'down') AS negative_feedback,
        (EXISTS (SELECT 1 FROM rca_feedback f
-                 WHERE f.target_id IN (i.incident_id, a.alert_id) AND f.vote = 'up')
-        OR EXISTS (SELECT 1 FROM rca_comments c
-                    WHERE c.target_id IN (i.incident_id, a.alert_id))) AS reviewed
+                 WHERE f.target_id IN (i.incident_id, a.alert_id)
+                   AND f.kind = 'vote' AND f.vote = 'up')
+        OR EXISTS (SELECT 1 FROM rca_feedback c
+                    WHERE c.target_id IN (i.incident_id, a.alert_id)
+                      AND c.kind = 'comment')) AS reviewed
 FROM incidents i
 JOIN alerts a ON a.incident_id = i.incident_id
 {where}
@@ -340,7 +344,7 @@ def _extract_actions(detail: str) -> list[str]:
 def _promotion_from_row(row: dict[str, Any]) -> tuple[str, str, list[str]] | None:
     """(alert_name, family, actions) when the row is promotable, else None.
 
-    Promotable = resolved + net-positive operator feedback (rca_feedback votes)
+    Promotable = resolved + net-positive operator feedback (rca_feedback kind='vote')
     + a recoverable root-cause family + a real alertname label.
     """
     if str(row.get("status") or "") != "resolved":
