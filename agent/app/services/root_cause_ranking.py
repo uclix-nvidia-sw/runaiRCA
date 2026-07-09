@@ -551,9 +551,26 @@ def _insufficient(
     )
 
 
+# The kubernetes collector embeds the RAW node/pod objects it fetched under
+# ``details["queries"]`` (and mirrors the same dict into its artifact ``result``).
+# A perfectly HEALTHY node object still literally contains the failure vocabulary
+# — condition type "DiskPressure"/"MemoryPressure" (status False) and messages
+# like "kubelet has no disk pressure" — so the substring keyword scan below scored
+# ``node_kubelet_pressure`` on nodes that had NO pressure at all (the recurring
+# "왜 다 False인데 아직도 그게 있다고 하냐" misfire). The collector already distils its
+# real signal into structured keys (``node_conditions`` is abnormal-only,
+# ``warning_events``, ``pod_logs``, ``container_diagnostics``, …), so we drop the
+# raw ``queries`` duplicate from the RANKING text only. loki/prometheus/runai put
+# their PRIMARY signal in ``queries``, so the drop is scoped to kubernetes.
+_RANKING_TEXT_DROP_KEYS: dict[str, frozenset[str]] = {
+    "kubernetes": frozenset({"queries"}),
+}
+
+
 def _result_text(result: CollectorResult) -> str:
     if not _collector_is_evidence(result):
         return ""
+    drop_keys = _RANKING_TEXT_DROP_KEYS.get(getattr(result, "agent", ""))
     parts = [result.summary or ""]
     for art in result.artifacts:
         if not _artifact_is_evidence(art):
@@ -561,9 +578,9 @@ def _result_text(result: CollectorResult) -> str:
         if art.summary:
             parts.append(art.summary)
         if art.result is not None:
-            parts.append(_leaf_text(art.result))
+            parts.append(_leaf_text(art.result, drop_keys))
     if result.details:
-        parts.append(_leaf_text(result.details))
+        parts.append(_leaf_text(result.details, drop_keys))
     return " ".join(parts).lower()
 
 
@@ -575,9 +592,14 @@ def _artifact_is_evidence(art: object) -> bool:
     return getattr(art, "status", "") in ("ok", "partial")
 
 
-def _leaf_text(value: Any) -> str:
-    """Match evidence values, not JSON schema/key names."""
+def _leaf_text(value: Any, drop_keys: "frozenset[str] | set[str] | None" = None) -> str:
+    """Match evidence values, not JSON schema/key names.
+
+    ``drop_keys`` prunes whole subtrees whose dict key matches (case-insensitive)
+    — used to keep the raw ``queries`` firehose of a collector out of the ranking
+    keyword scan while leaving the collector's structured evidence intact."""
     parts: list[str] = []
+    drop = {k.lower() for k in drop_keys} if drop_keys else None
 
     def walk(node: Any, key: str = "") -> None:
         if node is None:
@@ -585,6 +607,8 @@ def _leaf_text(value: Any) -> str:
         key_l = key.lower()
         if isinstance(node, dict):
             for child_key, child in node.items():
+                if drop and str(child_key).lower() in drop:
+                    continue
                 walk(child, str(child_key))
         elif isinstance(node, (list, tuple)):
             for child in node:

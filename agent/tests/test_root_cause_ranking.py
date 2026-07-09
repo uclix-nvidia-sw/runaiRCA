@@ -87,6 +87,83 @@ def test_r1_prometheus_node_condition_still_force_highs() -> None:
     assert ranked[0].confidence == "high"
 
 
+def test_healthy_node_object_in_queries_does_not_score_node_pressure() -> None:
+    # A HEALTHY node object still literally carries the failure vocabulary — the
+    # condition TYPES "DiskPressure"/"MemoryPressure" (status False) and the message
+    # "kubelet has no disk pressure". The kubernetes collector embeds that raw object
+    # under details["queries"] (and mirrors it into its artifact result). The base
+    # keyword scan used to score node_kubelet_pressure on a perfectly healthy node
+    # from that text alone — the recurring "왜 다 False인데 아직도 그게 있다고 하냐" misfire.
+    # The raw queries duplicate must be excluded from the ranking text.
+    healthy_node = {
+        "name": "k8s-lb-01",
+        "conditions": [
+            {"type": "MemoryPressure", "status": "False", "reason": "KubeletHasSufficientMemory",
+             "message": "kubelet has sufficient memory available"},
+            {"type": "DiskPressure", "status": "False", "reason": "KubeletHasNoDiskPressure",
+             "message": "kubelet has no disk pressure"},
+            {"type": "PIDPressure", "status": "False", "reason": "KubeletHasSufficientPID",
+             "message": "kubelet has sufficient PID available"},
+            {"type": "Ready", "status": "True", "reason": "KubeletReady",
+             "message": "kubelet is posting ready status"},
+        ],
+    }
+    details = {
+        "namespace": "runai",
+        "workload_name": "runai-container-toolkit",
+        "node": "k8s-lb-01",
+        # The collector's structured signal collapses a healthy node to a marker.
+        "node_conditions": [{"node_conditions_healthy": True, "checked": 4}],
+        "warning_events": [],
+        "queries": [
+            {"name": "node", "path": "/api/v1/nodes/k8s-lb-01", "status_code": 200, "data": healthy_node}
+        ],
+    }
+    k8s = _r(
+        "kubernetes",
+        summary="Node k8s-lb-01 checked; conditions nominal.",
+        details=details,
+        artifacts=[
+            artifact(
+                agent="kubernetes", source="kubernetes", type="cluster_api", status="ok",
+                confidence="high", summary="Node k8s-lb-01 checked",
+                query="/api/v1/nodes/k8s-lb-01", result=details,
+            )
+        ],
+    )
+    ranked = rank_root_cause_candidates(
+        _target(workload_name="runai-container-toolkit", node="k8s-lb-01",
+                alert_name="RunaiDaemonSetUnavailableOnNodes"),
+        [k8s],
+    )
+    families = {c.family for c in ranked}
+    assert "node_kubelet_pressure" not in families
+
+
+def test_real_node_pressure_still_scores_after_queries_drop() -> None:
+    # Guard the fix above from over-correcting: when a condition is genuinely
+    # abnormal (DiskPressure=True), it surfaces in the structured node_conditions
+    # (not just the raw queries), so node_kubelet_pressure must still score.
+    details = {
+        "namespace": "runai",
+        "node": "dgx01",
+        "node_conditions": [
+            {"type": "DiskPressure", "status": "True", "reason": "KubeletHasDiskPressure",
+             "message": "kubelet has disk pressure"}
+        ],
+        "warning_events": [
+            {"reason": "EvictionThresholdMet", "type": "Warning",
+             "message": "Attempting to reclaim ephemeral-storage"}
+        ],
+        "queries": [{"name": "node", "path": "/api/v1/nodes/dgx01", "status_code": 200, "data": {}}],
+    }
+    k8s = _r("kubernetes", summary="Node dgx01 reports DiskPressure=True.", details=details)
+    ranked = rank_root_cause_candidates(
+        _target(node="dgx01", alert_name="KubeNodeDiskPressure"), [k8s]
+    )
+    assert any(c.family == "node_kubelet_pressure" for c in ranked)
+
+
 def test_facets_annotate_family_locus_and_nature() -> None:
     # P4: every candidate carries its intrinsic (subsystem/Locus, nature) facets.
     results = [
