@@ -143,9 +143,39 @@ def normalize_project_name(value: str) -> str:
     return project_from_namespace(value) or value
 
 
+# kube-state-metrics names the failing object in a workload-KIND label
+# (kube_daemonset_*{daemonset=…}, kube_deployment_*{deployment=…}, …). On those
+# metric families the `pod` label is the KSM EXPORTER pod that served the metric,
+# NOT a subject pod — so an alert like RunaiDaemonSetUnavailableOnNodes carries
+# daemonset="runai-container-toolkit" (the real subject) alongside
+# pod="prometheus-kube-state-metrics-…" (the exporter). We must read the subject
+# from the workload-kind label, or the topology identity (component_for_target →
+# GPU Operator depends_on chain) resolves to the exporter and the RCA misfires.
+# NOTE: bare `job` is deliberately excluded — in Prometheus that is the SCRAPE
+# job (e.g. job="kube-state-metrics"), not a Kubernetes Job; the Job object's KSM
+# label is `job_name`.
+_WORKLOAD_KIND_LABELS = (
+    "daemonset",
+    "deployment",
+    "statefulset",
+    "replicaset",
+    "cronjob",
+    "job_name",
+)
+
+
 def resolve_target(labels: dict[str, str], annotations: dict[str, str]) -> AnalysisTarget:
     namespace = value_from(labels, annotations, "namespace", "kubernetes_namespace")
     project = value_from(labels, annotations, "project", "runai_project", "runai.io/project")
+    # If a workload-kind label named the subject, the `pod` label is the KSM
+    # exporter — drop it so collectors discover the real workload's pods by name
+    # instead of investigating the (healthy) metrics pod.
+    workload_kind_name = value_from(labels, annotations, *_WORKLOAD_KIND_LABELS)
+    pod = (
+        ""
+        if workload_kind_name
+        else value_from(labels, annotations, "pod", "pod_name", "kubernetes_pod_name")
+    )
     return AnalysisTarget(
         cluster=value_from(labels, annotations, "cluster", "runai_cluster", "runai.io/cluster"),
         project=normalize_project_name(project) if project else project_from_namespace(namespace),
@@ -157,15 +187,17 @@ def resolve_target(labels: dict[str, str], annotations: dict[str, str]) -> Analy
             "workload",
             "workload_name",
             "runai_workload_name",
+            # KSM workload-kind labels name the real subject; consult them before
+            # falling back to the `pod` label (which may be the exporter).
+            *_WORKLOAD_KIND_LABELS,
             "pod",
-            "job_name",
         ),
         workload_type=value_from(
             labels, annotations, "workload_type", "kind", "runai_workload_type"
         ),
         runai_workload_id=value_from(labels, annotations, "runai_workload_id", "workload_id"),
         node=value_from(labels, annotations, "node", "node_name", "kubernetes_node"),
-        pod=value_from(labels, annotations, "pod", "pod_name", "kubernetes_pod_name"),
+        pod=pod,
         severity=value_from(labels, annotations, "severity") or "warning",
         alert_name=value_from(labels, annotations, "alertname", "alert_name") or "RunAIAlert",
     )

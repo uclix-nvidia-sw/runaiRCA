@@ -147,6 +147,61 @@ def test_resolve_target_derives_project_from_runai_namespace() -> None:
     assert target.namespace == "runai-vision"
 
 
+def test_resolve_target_reads_workload_from_kube_state_metrics_daemonset_label() -> None:
+    # A kube-state-metrics-exported alert (e.g. RunaiDaemonSetUnavailableOnNodes)
+    # names the REAL failing object in the `daemonset` label; the `pod` label is
+    # the KSM exporter pod, not the subject. The workload identity — which drives
+    # component_for_target → the GPU Operator depends_on chain — must come from the
+    # workload-kind label, and the exporter pod must be dropped so collectors
+    # discover the daemonset's own pods instead of the (healthy) metrics pod.
+    target = resolve_target(
+        {
+            "alertname": "RunaiDaemonSetUnavailableOnNodes",
+            "namespace": "runai",
+            "container": "kube-state-metrics",
+            "daemonset": "runai-container-toolkit",
+            "job": "kube-state-metrics",
+            "pod": "prometheus-kube-state-metrics-76f7f4dd55-4lj5q",
+            "severity": "critical",
+        },
+        {},
+    )
+
+    assert target.workload_name == "runai-container-toolkit"
+    assert target.pod == ""  # the exporter pod is not the subject
+    # bare `job` is the Prometheus scrape job, never the workload name.
+    assert target.workload_name != "kube-state-metrics"
+
+
+def test_resolve_target_keeps_pod_subject_for_pod_level_alerts() -> None:
+    # A genuine pod-level alert (no workload-kind label) still treats the `pod`
+    # label as the subject — the KSM-exporter special case must not regress these.
+    target = resolve_target(
+        {"alertname": "KubePodCrashLooping", "namespace": "runai", "pod": "trainer-abc-x1"},
+        {},
+    )
+
+    assert target.pod == "trainer-abc-x1"
+    assert target.workload_name == "trainer-abc-x1"
+
+
+def test_resolve_target_explicit_workload_label_wins_over_workload_kind() -> None:
+    # An explicit Run:ai workload label is the most direct identity and still wins
+    # over both the workload-kind label and the pod fallback.
+    target = resolve_target(
+        {
+            "namespace": "runai",
+            "workload": "my-training-job",
+            "deployment": "some-deployment",
+            "pod": "prometheus-kube-state-metrics-abc",
+        },
+        {},
+    )
+
+    assert target.workload_name == "my-training-job"
+    assert target.pod == ""  # workload-kind label present → exporter pod dropped
+
+
 @pytest.mark.asyncio
 async def test_incident_summary_folds_and_masks_alert_summaries() -> None:
     response = await AnalysisOrchestrator(make_settings()).summarize_incident(
