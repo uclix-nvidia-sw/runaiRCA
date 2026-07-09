@@ -793,6 +793,13 @@ async def _synthesize_korean(
             "labels": request.alert.labels,
             "annotations": request.alert.annotations,
         },
+        # Past-incident re-analysis signal: a resolved alert means the live state is
+        # likely healthy again, so live collectors can legitimately be thin.
+        **(
+            {"incident_state": "resolved — alert no longer firing; live state likely normal, so live evidence may be limited (past-incident re-analysis)"}
+            if str(getattr(request.alert, "status", "")).lower() == "resolved"
+            else {}
+        ),
         # Chronological event chain (oldest first): recent deploy/rollout, node
         # reboot/condition, pod delete/create, warning events → the alert. Small +
         # high-value, so it leads the reasoning inputs and the char cap won't trim it.
@@ -845,6 +852,10 @@ async def _synthesize_korean(
         "- 길게 쓰지 마세요. 아래 1~3 섹션 합쳐서 A4 한 페이지 이내가 목표입니다.\n"
         "- 증거에 없는 사실을 절대 만들어내지 마세요.\n"
         "- 특정 수집기가 아무것도 찾지 못했으면 '증거를 찾기 어렵습니다.'라고 명시하세요.\n"
+        "- 증거에 incident_state가 resolved(과거 인시던트 재분석)면, 현재 상태가 정상이라 "
+        "라이브 증거가 제한적일 수 있습니다. 증거가 얇으면 억지로 원인을 단정하지 말고 '현재는 "
+        "정상 상태로 회복되어 라이브 수집·분석이 제한적입니다'를 명시한 뒤, 남은 흔적·과거 기록·"
+        "타임라인 기반으로 신중히 설명하세요.\n"
         "- 증거에 timeline(시간순 이벤트)이 있으면, 알림 직전의 '최근 변경'을 근본 원인으로 "
         "최우선 검토하세요: 배포/rollout(generation 변경), 노드 리부트·컨디션 변화, 파드 삭제/"
         "드레인, MIG/설정 변경 등. 스케줄러·증상성 경고(예: PodGroup Warning)보다 '무엇이 바뀌어 "
