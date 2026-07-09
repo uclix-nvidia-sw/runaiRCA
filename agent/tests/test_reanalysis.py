@@ -1,6 +1,6 @@
-"""Tests for the re-analysis-on-refutation pass and the operator-questions section.
+"""Tests for the iterative re-analysis loop and the operator-questions section.
 
-Covers: refuted -> exactly one bounded re-analysis; not refuted -> none;
+Covers: refuted -> bounded re-analysis; not refuted -> none;
 re-analysis failure -> clean fallback to the first result; insufficient
 evidence -> operator questions section (Korean under ko); no LLM -> behavior
 unchanged (no re-analysis, deterministic questions).
@@ -114,6 +114,90 @@ def _install_stubs(
     monkeypatch.setattr("app.services.self_check.refute_top_cause", fake_refute)
 
 
+def _install_iterative_stubs(
+    monkeypatch,
+    investigate_calls: list[int],
+    refute_calls: list[str],
+) -> None:
+    async def fake_investigate(settings, target, collectors, plan, kg, max_steps, reporter=None):
+        call = len(investigate_calls)
+        investigate_calls.append(max_steps)
+        summaries_by_call = [
+            {
+                "kubernetes": "Node condition DiskPressure=True; kubelet evicting pods",
+                "prometheus": "requested gpus exceed allocated gpus",
+            },
+            {
+                "kubernetes": "CrashLoopBackOff startup probe failed",
+                "prometheus": "runai reclaimed over-quota gpus; gang pod group preempt",
+            },
+            {
+                "kubernetes": "CrashLoopBackOff startup probe failed permission denied",
+                "loki": "container ImportError and permission denied during startup",
+            },
+        ]
+        summaries = summaries_by_call[min(call, len(summaries_by_call) - 1)]
+        results = [
+            CollectorResult(
+                agent=_collector_name(collector),
+                status="ok",
+                summary=summaries.get(_collector_name(collector), "nothing notable"),
+            )
+            for collector in collectors
+        ]
+        return results, {"hypothesis_ledger": []}
+
+    verdicts = [
+        {
+            "confidence": "low",
+            "caveat": "Node pressure does not explain the scheduler evidence.",
+            "refuted": True,
+            "next_check": "Check quota evidence.",
+        },
+        {
+            "confidence": "low",
+            "caveat": "Quota does not explain the container crash.",
+            "refuted": True,
+            "next_check": "Check startup logs.",
+        },
+        {"confidence": "high", "caveat": "", "refuted": False, "next_check": ""},
+    ]
+
+    async def fake_refute(settings, top, results, plan=None):
+        refute_calls.append(top.family)
+        return dict(verdicts[min(len(refute_calls) - 1, len(verdicts) - 1)])
+
+    monkeypatch.setattr("app.services.investigator.investigate", fake_investigate)
+    monkeypatch.setattr("app.services.self_check.refute_top_cause", fake_refute)
+
+
+@pytest.mark.asyncio
+async def test_default_cap_allows_multiple_reanalysis_passes_until_resolved(monkeypatch) -> None:
+    _stub_llm_http(monkeypatch)
+    investigate_calls: list[int] = []
+    refute_calls: list[str] = []
+    _install_iterative_stubs(monkeypatch, investigate_calls, refute_calls)
+
+    orchestrator = AnalysisOrchestrator(llm_settings())
+    response = await orchestrator.analyze(_request())
+
+    assert investigate_calls == [4, 2, 2]
+    assert refute_calls == [
+        "node_kubelet_pressure",
+        "runai_scheduling_quota",
+        "workload_startup_error",
+    ]
+    top = response.context["root_cause_candidates"][0]
+    assert top["family"] == "workload_startup_error"
+    assert top["confidence"] == "high"
+    assert "The initial conclusion (node_kubelet_pressure) was refuted" in response.analysis_detail
+    assert (
+        "The previous conclusion (runai_scheduling_quota) was refuted"
+        in response.analysis_detail
+    )
+    assert "## Questions for the Operator" not in response.analysis_detail
+
+
 @pytest.mark.asyncio
 async def test_refuted_top_cause_triggers_exactly_one_reanalysis(monkeypatch) -> None:
     _stub_llm_http(monkeypatch)
@@ -154,6 +238,36 @@ async def test_refuted_top_cause_triggers_exactly_one_reanalysis(monkeypatch) ->
     assert top["family"] == "runai_scheduling_quota"
     # Not refuted anymore -> no operator questions section.
     assert "## Questions for the Operator" not in response.analysis_detail
+
+
+@pytest.mark.asyncio
+async def test_cap_zero_disables_reanalysis_loop(monkeypatch) -> None:
+    _stub_llm_http(monkeypatch)
+    investigate_calls: list[int] = []
+    refute_calls: list[str] = []
+    _install_stubs(
+        monkeypatch,
+        verdicts=[
+            {
+                "confidence": "low",
+                "caveat": "Competing cause fits better.",
+                "refuted": True,
+                "next_check": "Check the scheduler queue directly.",
+            }
+        ],
+        investigate_calls=investigate_calls,
+        refute_calls=refute_calls,
+    )
+
+    settings = replace(llm_settings(), max_investigation_iterations=0)
+    orchestrator = AnalysisOrchestrator(settings)
+    response = await orchestrator.analyze(_request())
+
+    assert len(investigate_calls) == 1
+    assert len(refute_calls) == 1
+    assert "re-analysis pass was performed" not in response.analysis_detail
+    top = response.context["root_cause_candidates"][0]
+    assert top["family"] == "node_kubelet_pressure"
 
 
 @pytest.mark.asyncio
