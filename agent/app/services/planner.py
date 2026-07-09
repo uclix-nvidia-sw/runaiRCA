@@ -65,6 +65,9 @@ _SIMILAR_STOPWORDS = {
     "status",
     "the",
 }
+_XID_PATTERN = re.compile(r"\bxid\s*(?:\([^)]*\))?\s*[:=]?\s*(\d{1,4})", re.IGNORECASE)
+_ROLLOUT_CHANGE_KINDS = {"Deployment", "StatefulSet", "DaemonSet"}
+
 
 def _is_runai_namespace(namespace: str) -> bool:
     # A Run:ai platform/project namespace. Excludes runai-rca — the RCA tool's OWN
@@ -265,15 +268,78 @@ def _alert_haystack(target: AnalysisTarget, alert) -> str:
     return " ".join(parts)
 
 
+def _recent_change_lead(
+    settings: Settings,
+    target: AnalysisTarget,
+    recent_changes: list[dict],
+) -> dict[str, str] | None:
+    changes = [c for c in recent_changes or [] if isinstance(c, dict)]
+    if not changes:
+        return None
+    for change in changes:
+        kind = str(change.get("kind") or "")
+        if kind == "NodeCondition":
+            return _change_hypothesis(settings, "node_kubelet_pressure", change)
+        if kind == "PodDeleted" or kind in _ROLLOUT_CHANGE_KINDS:
+            return _change_hypothesis(settings, "workload_startup_error", change)
+    family = (
+        "node_kubelet_pressure"
+        if _ambiguous_change_is_node(target, changes)
+        else "workload_startup_error"
+    )
+    return _change_hypothesis(settings, family, changes[0])
+
+
+def _ambiguous_change_is_node(target: AnalysisTarget, changes: list[dict]) -> bool:
+    if target.node and not target.namespace:
+        return True
+    node = (target.node or "").lower()
+    if not node:
+        return False
+    return any(
+        node in " ".join(str(c.get(k) or "") for k in ("kind", "name", "summary")).lower()
+        for c in changes
+    )
+
+
+def _change_hypothesis(settings: Settings, family: str, change: dict) -> dict[str, str]:
+    kind = str(change.get("kind") or "change")
+    summary = str(change.get("summary") or change.get("name") or "recent Kubernetes change")
+    if getattr(settings, "language", "en") == "ko":
+        reason = f"계획 전 확인된 최근 Kubernetes 변경({kind}: {summary})"
+    else:
+        reason = f"recent Kubernetes change before planning ({kind}: {summary})"
+    return {"family": family, "reason": reason}
+
+
+def _recent_change_narrative(settings: Settings, change_lead: dict[str, str]) -> str:
+    if getattr(settings, "language", "en") == "ko":
+        return (
+            "계획 단계에서 최근 Kubernetes 변경이 먼저 확인되었습니다. "
+            "스케줄러/쿼터 가정보다 해당 변경이 알림을 유발했는지 먼저 확인하세요. "
+        )
+    return (
+        "A recent Kubernetes change was found before planning. Verify whether that "
+        "change triggered the alert before treating scheduler/quota as the lead. "
+    )
+
+
+def _has_precise_xid(alert_text: str) -> bool:
+    return bool(_XID_PATTERN.search(alert_text or ""))
+
+
 async def plan_investigation(
     settings: Settings,
     target: AnalysisTarget,
     alert,
     kg_context: dict | None,
     similar_incidents: list | None,
+    recent_changes: list[dict] | None = None,
 ) -> InvestigationPlan:
     kg_context = kg_context or {}
     similar_incidents = similar_incidents or []
+    recent_changes = recent_changes or []
+    alert_text = _alert_haystack(target, alert)
 
     namespaces = [target.namespace] if target.namespace else []
     check_control_plane = _implicates_control_plane(target)
@@ -308,6 +374,18 @@ async def plan_investigation(
         hypotheses = [{"family": fam, "reason": reason}] + [
             h for h in hypotheses if h["family"] != fam
         ]
+    change_lead = _recent_change_lead(settings, target, recent_changes)
+    if change_lead:
+        hypotheses = [change_lead] + [
+            h for h in hypotheses if h["family"] != change_lead["family"]
+        ]
+    if _has_precise_xid(alert_text):
+        hypotheses = [
+            {
+                "family": "gpu_hardware_error",
+                "reason": "alert contains a precise NVIDIA XID code",
+            }
+        ] + [h for h in hypotheses if h["family"] != "gpu_hardware_error"]
     # Component identity: when the alert TARGET itself is a known platform
     # component (pod/workload name), that names the entry point directly — e.g.
     # runai-container-toolkit-* implicates the NVIDIA GPU Operator stack via its
@@ -329,7 +407,6 @@ async def plan_investigation(
         hypotheses = [{"family": str(component_entry["family"]), "reason": reason}] + [
             h for h in hypotheses if h["family"] != component_entry["family"]
         ]
-    alert_text = _alert_haystack(target, alert)
     best_similar = _best_similar(similar_incidents, alert_text)
     used_similarity = best_similar is not None
     used_ontology = _ontology_match(kg_context, alert_text)
@@ -346,6 +423,7 @@ async def plan_investigation(
         keyword_signal
         or bool(matched_alert)
         or bool(component)
+        or bool(change_lead)
         or scope in _SCOPE_LEAD
         or node_focused
     )
@@ -420,6 +498,8 @@ async def plan_investigation(
             "Kubernetes node conditions are the primary evidence sources. "
         )
         narrative = node_note + narrative
+    if change_lead:
+        narrative = _recent_change_narrative(settings, change_lead) + narrative
 
     if matched_alert:
         narrative = (

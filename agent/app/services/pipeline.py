@@ -141,6 +141,7 @@ async def enrich_stage(state: PipelineState) -> PipelineState:
 
 
 async def plan_stage(state: PipelineState) -> PipelineState:
+    recent_changes = await _preplan_recent_changes(state)
     # Plan first (senior-SRE "think before you dig"): scope every collector to
     # what THIS alert needs instead of always scraping the control plane.
     state.plan = await plan_investigation(
@@ -149,6 +150,7 @@ async def plan_stage(state: PipelineState) -> PipelineState:
         state.request.alert,
         state.kg_context.as_dict(),
         list(state.request.similar_incidents),
+        recent_changes,
     )
     # Alert labels frequently name a pod the controller already replaced (grouped
     # CrashLoop occurrences) and carry no node label — so kubernetes GETs 404 and
@@ -184,6 +186,15 @@ async def plan_stage(state: PipelineState) -> PipelineState:
     )
     state.agent_souls = load_agent_souls(state.settings.agent_souls_file)
     return state
+
+
+async def _preplan_recent_changes(state: PipelineState) -> list[dict]:
+    collector = next((c for c in state.collectors if getattr(c, "name", "") == "change"), None)
+    if collector is None:
+        return []
+    result = await _collect_safely(collector, state.target, None, state.masker)
+    changes = result.details.get("changes") if isinstance(result.details, dict) else None
+    return [c for c in changes if isinstance(c, dict)] if isinstance(changes, list) else []
 
 
 async def evidence_stage(state: PipelineState) -> PipelineState:

@@ -35,10 +35,14 @@ class ChangeCollector:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        self._cache: dict[tuple[str, str, int], CollectorResult] = {}
 
     async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:  # noqa: ANN001
         namespace = _first_namespace(plan) or target.namespace
         node = getattr(plan, "node", "") or target.node
+        cache_key = (namespace or "", node or "", _RECENT_WINDOW_SECONDS)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
 
         token = _read_file(self._settings.kubernetes_token_path)
         if not token or not namespace or not _namespace_allowed(self._settings, namespace):
@@ -47,7 +51,9 @@ class ChangeCollector:
                 if not token
                 else "no in-scope namespace was resolved for change detection."
             )
-            return self._empty(f"{NO_EVIDENCE} {reason}", missing=["change.unconfigured"])
+            result = self._empty(f"{NO_EVIDENCE} {reason}", missing=["change.unconfigured"])
+            self._cache[cache_key] = result
+            return result
 
         headers = {"Authorization": f"Bearer {token}"}
         verify: bool | str = (
@@ -69,7 +75,7 @@ class ChangeCollector:
         changes.sort(key=lambda c: c.get("timestamp") or "", reverse=True)
 
         if not changes:
-            return self._empty(
+            result = self._empty(
                 f"{NO_EVIDENCE} "
                 + ko_en(
                     self._settings,
@@ -83,6 +89,8 @@ class ChangeCollector:
                 warnings=warnings,
                 details={"namespace": namespace, "node": node},
             )
+            self._cache[cache_key] = result
+            return result
 
         summary = _deterministic_summary(changes, namespace)
         insight = await _senior_insight(self._settings, changes)
@@ -96,7 +104,7 @@ class ChangeCollector:
             "changes": changes,
             "insight": insight,
         }
-        return CollectorResult(
+        result = CollectorResult(
             agent=self.name,
             status="ok",
             summary=summary,
@@ -117,6 +125,8 @@ class ChangeCollector:
                 )
             ],
         )
+        self._cache[cache_key] = result
+        return result
 
     def _empty(
         self,
