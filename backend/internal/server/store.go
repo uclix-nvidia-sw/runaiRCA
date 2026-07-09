@@ -1832,6 +1832,47 @@ func (s *Store) SetIncidentSlackThread(id string, ts string) {
 	s.persistIncidentLocked(incident)
 }
 
+// latestAnalysisRunForIncidentLocked returns the newest run carrying an RCA for this
+// incident (matched by incident_id or a member alert_id), preferring completed runs.
+// analysis_runs is the durable RCA store now that IncidentDetail no longer reads the
+// per-alert analysis columns.
+func (s *Store) latestAnalysisRunForIncidentLocked(incidentID string) *AnalysisRun {
+	alertIDs := map[string]struct{}{}
+	for _, alert := range s.alerts {
+		if alert != nil && alert.IncidentID == incidentID {
+			alertIDs[alert.AlertID] = struct{}{}
+		}
+	}
+	var selected *AnalysisRun
+	for _, run := range s.analysisRuns {
+		if run == nil {
+			continue
+		}
+		if strings.TrimSpace(run.AnalysisSummary) == "" && strings.TrimSpace(run.AnalysisDetail) == "" {
+			continue
+		}
+		if run.IncidentID != incidentID {
+			if _, ok := alertIDs[run.AlertID]; !ok {
+				continue
+			}
+		}
+		if selected == nil || betterAnalysisRun(run, selected) {
+			selected = run
+		}
+	}
+	return selected
+}
+
+// betterAnalysisRun ranks a completed run above a non-completed one, then by recency.
+func betterAnalysisRun(candidate, current *AnalysisRun) bool {
+	candidateComplete := candidate.Status == "complete"
+	currentComplete := current.Status == "complete"
+	if candidateComplete != currentComplete {
+		return candidateComplete
+	}
+	return candidate.UpdatedAt.After(current.UpdatedAt)
+}
+
 func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1858,59 +1899,20 @@ func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 	sort.Slice(detail.Alerts, func(i, j int) bool {
 		return detail.Alerts[i].FiredAt.After(detail.Alerts[j].FiredAt)
 	})
-	summaryLines := []string{}
-	detailSections := []string{}
-	seenMissingData := map[string]struct{}{}
-	seenWarnings := map[string]struct{}{}
-	seenArtifacts := map[string]struct{}{}
-	for _, alert := range detail.Alerts {
-		if strings.TrimSpace(alert.AnalysisSummary) == "" && strings.TrimSpace(alert.AnalysisDetail) == "" {
-			continue
-		}
-		title := first(alert.AlarmTitle, alert.AlertID)
-		if strings.TrimSpace(alert.AnalysisSummary) != "" {
-			summaryLines = append(summaryLines, fmt.Sprintf("- %s: %s", title, alert.AnalysisSummary))
-		}
-		if strings.TrimSpace(alert.AnalysisDetail) != "" {
-			detailSections = append(detailSections, fmt.Sprintf("## %s\n\n%s", title, alert.AnalysisDetail))
-		}
-		if detail.AnalysisQuality == "" {
-			detail.AnalysisQuality = alert.AnalysisQuality
-		}
-		if detail.RootCauseFamily == "" {
-			detail.RootCauseFamily = alert.RootCauseFamily
-		}
-		for key, value := range alert.Capabilities {
+	// Incident RCA comes from the incident's latest analysis run (the durable store),
+	// not by concatenating the per-alert analysis columns. Analysis is already
+	// one-per-incident, so this is the same RCA without the alert-column duplication.
+	if run := s.latestAnalysisRunForIncidentLocked(id); run != nil {
+		detail.AnalysisSummary = excerpt(run.AnalysisSummary, maxIncidentAggregateSummaryBytes)
+		detail.AnalysisDetail = excerpt(run.AnalysisDetail, maxIncidentAggregateDetailBytes)
+		detail.AnalysisQuality = run.AnalysisQuality
+		detail.RootCauseFamily = run.RootCauseFamily
+		for key, value := range run.Capabilities {
 			detail.Capabilities[key] = value
 		}
-		for _, item := range alert.MissingData {
-			if _, ok := seenMissingData[item]; ok {
-				continue
-			}
-			seenMissingData[item] = struct{}{}
-			detail.MissingData = append(detail.MissingData, item)
-		}
-		for _, item := range alert.Warnings {
-			if _, ok := seenWarnings[item]; ok {
-				continue
-			}
-			seenWarnings[item] = struct{}{}
-			detail.Warnings = append(detail.Warnings, item)
-		}
-		for _, artifact := range alert.Artifacts {
-			key := string(mustJSON(artifact))
-			if _, ok := seenArtifacts[key]; ok {
-				continue
-			}
-			seenArtifacts[key] = struct{}{}
-			detail.Artifacts = append(detail.Artifacts, artifact)
-		}
-	}
-	if len(summaryLines) > 0 {
-		detail.AnalysisSummary = excerpt(strings.Join(summaryLines, "\n"), maxIncidentAggregateSummaryBytes)
-	}
-	if len(detailSections) > 0 {
-		detail.AnalysisDetail = excerpt(strings.Join(detailSections, "\n\n"), maxIncidentAggregateDetailBytes)
+		detail.MissingData = append(detail.MissingData, run.MissingData...)
+		detail.Warnings = append(detail.Warnings, run.Warnings...)
+		detail.Artifacts = append(detail.Artifacts, run.Artifacts...)
 	}
 	detail.Feedback = s.feedbackSummaryLocked("incident", id)
 	if len(detail.Alerts) > 0 {

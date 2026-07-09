@@ -1941,62 +1941,47 @@ func TestResolveEndpointTogglesUserApproval(t *testing.T) {
 	}
 }
 
-func TestIncidentDetailAggregatesAlertAnalyses(t *testing.T) {
+func TestIncidentDetailUsesLatestAnalysisRun(t *testing.T) {
+	// Incident RCA now comes from the incident's latest completed analysis run
+	// (the durable store), not from concatenating the per-alert analysis columns.
 	store := NewStore()
-	incident, first := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "aggregate-rca"}, Alert{
+	incident, first := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "latest-run-rca"}, Alert{
 		Status:      "firing",
 		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
 		Annotations: map[string]string{"summary": "Queue blocked"},
-		Fingerprint: "fp-aggregate-first",
+		Fingerprint: "fp-latest-run",
 	})
-	secondID := "ALR-aggregate-second"
+	base := first.FiredAt
 	store.mu.Lock()
-	store.alerts[secondID] = &AlertRecord{
-		AlertID:     secondID,
-		IncidentID:  incident.IncidentID,
-		AlarmTitle:  "Quota alert",
-		Severity:    "critical",
-		Status:      "firing",
-		FiredAt:     first.FiredAt.Add(time.Minute),
-		Fingerprint: "fp-aggregate-second",
-		ThreadTS:    "thread-" + secondID,
-		Labels:      map[string]string{"alertname": "RunAIQuotaBlocked", "severity": "critical"},
-		Annotations: map[string]string{"summary": "Quota blocked"},
+	store.analysisRuns["RUN-old"] = &AnalysisRun{
+		RunID: "RUN-old", Status: "complete", IncidentID: incident.IncidentID, AlertID: first.AlertID,
+		AnalysisSummary: "Old superseded RCA.", AnalysisDetail: "Old detail.", UpdatedAt: base,
+	}
+	store.analysisRuns["RUN-new"] = &AnalysisRun{
+		RunID: "RUN-new", Status: "complete", IncidentID: incident.IncidentID, AlertID: first.AlertID,
+		AnalysisSummary: "Latest RCA.", AnalysisDetail: "GPU quota is exhausted.",
+		AnalysisQuality: "high", RootCauseFamily: "runai_scheduling_quota",
+		MissingData: []string{"loki.logs"}, Warnings: []string{"partial logs"},
+		Artifacts: []Artifact{{Agent: "runai", Source: "workloads", Type: "api", Status: "ok", Confidence: "high"}},
+		UpdatedAt: base.Add(time.Minute),
 	}
 	store.mu.Unlock()
-	store.ApplyAnalysis(first.AlertID, AgentAnalysisResponse{
-		Status:          "ok",
-		AnalysisSummary: "Queue saturation RCA.",
-		AnalysisDetail:  "Queue workers are waiting.",
-		AnalysisQuality: "medium",
-		MissingData:     []string{"loki.logs"},
-		Warnings:        []string{"partial logs"},
-		Artifacts:       []Artifact{{Agent: "runai", Source: "workloads", Type: "api", Status: "ok", Confidence: "high"}},
-	})
-	store.ApplyAnalysis(secondID, AgentAnalysisResponse{
-		Status:          "ok",
-		AnalysisSummary: "Quota exhaustion RCA.",
-		AnalysisDetail:  "GPU quota is exhausted.",
-		AnalysisQuality: "high",
-		MissingData:     []string{"loki.logs"},
-		Warnings:        []string{"partial logs"},
-		Artifacts:       []Artifact{{Agent: "runai", Source: "workloads", Type: "api", Status: "ok", Confidence: "high"}},
-	})
 
 	detail, ok := store.IncidentDetail(incident.IncidentID)
 	if !ok {
 		t.Fatalf("incident detail missing")
 	}
-	if !strings.Contains(detail.AnalysisSummary, "Queue saturation RCA.") ||
-		!strings.Contains(detail.AnalysisSummary, "Quota exhaustion RCA.") {
-		t.Fatalf("incident summary should aggregate alert RCA summaries, got %q", detail.AnalysisSummary)
+	if !strings.Contains(detail.AnalysisSummary, "Latest RCA.") || strings.Contains(detail.AnalysisSummary, "Old superseded RCA.") {
+		t.Fatalf("incident summary should be the latest run only, got %q", detail.AnalysisSummary)
 	}
-	if !strings.Contains(detail.AnalysisDetail, "Queue workers are waiting.") ||
-		!strings.Contains(detail.AnalysisDetail, "GPU quota is exhausted.") {
-		t.Fatalf("incident detail should aggregate alert RCA details, got %q", detail.AnalysisDetail)
+	if !strings.Contains(detail.AnalysisDetail, "GPU quota is exhausted.") {
+		t.Fatalf("incident detail should come from the latest run, got %q", detail.AnalysisDetail)
+	}
+	if detail.AnalysisQuality != "high" || detail.RootCauseFamily != "runai_scheduling_quota" {
+		t.Fatalf("incident should take quality/family from the latest run, got %q/%q", detail.AnalysisQuality, detail.RootCauseFamily)
 	}
 	if len(detail.MissingData) != 1 || len(detail.Warnings) != 1 || len(detail.Artifacts) != 1 {
-		t.Fatalf("incident RCA metadata should be deduplicated, got missing=%v warnings=%v artifacts=%v", detail.MissingData, detail.Warnings, detail.Artifacts)
+		t.Fatalf("incident RCA metadata should come from the run, got missing=%v warnings=%v artifacts=%v", detail.MissingData, detail.Warnings, detail.Artifacts)
 	}
 }
 
@@ -2010,11 +1995,12 @@ func TestIncidentDetailCapsAggregateAnalysisTextOnly(t *testing.T) {
 	})
 	longSummary := strings.Repeat("s", maxIncidentAggregateSummaryBytes+100)
 	longDetail := strings.Repeat("d", maxIncidentAggregateDetailBytes+100)
-	store.ApplyAnalysis(alert.AlertID, AgentAnalysisResponse{
-		Status:          "ok",
-		AnalysisSummary: longSummary,
-		AnalysisDetail:  longDetail,
-	})
+	store.mu.Lock()
+	store.analysisRuns["RUN-cap"] = &AnalysisRun{
+		RunID: "RUN-cap", Status: "complete", IncidentID: incident.IncidentID, AlertID: alert.AlertID,
+		AnalysisSummary: longSummary, AnalysisDetail: longDetail, UpdatedAt: alert.FiredAt,
+	}
+	store.mu.Unlock()
 
 	detail, ok := store.IncidentDetail(incident.IncidentID)
 	if !ok {
@@ -2022,14 +2008,11 @@ func TestIncidentDetailCapsAggregateAnalysisTextOnly(t *testing.T) {
 	}
 	if len(detail.AnalysisSummary) > maxIncidentAggregateSummaryBytes+len("...") ||
 		!strings.HasSuffix(detail.AnalysisSummary, "...") {
-		t.Fatalf("incident summary aggregate was not capped, len=%d", len(detail.AnalysisSummary))
+		t.Fatalf("incident summary was not capped, len=%d", len(detail.AnalysisSummary))
 	}
 	if len(detail.AnalysisDetail) > maxIncidentAggregateDetailBytes+len("...") ||
 		!strings.HasSuffix(detail.AnalysisDetail, "...") {
-		t.Fatalf("incident detail aggregate was not capped, len=%d", len(detail.AnalysisDetail))
-	}
-	if len(detail.Alerts) != 1 || detail.Alerts[0].AnalysisSummary != longSummary || detail.Alerts[0].AnalysisDetail != longDetail {
-		t.Fatalf("alert-level RCA should remain complete in incident detail")
+		t.Fatalf("incident detail was not capped, len=%d", len(detail.AnalysisDetail))
 	}
 }
 

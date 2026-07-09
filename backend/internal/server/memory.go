@@ -293,6 +293,28 @@ func (s *Store) ApplyAnalysis(alertID string, response AgentAnalysisResponse) {
 		return
 	}
 	s.applyAnalysisLocked(alert, response)
+	// Test-only helper: mirror production, where every applied analysis is backed by
+	// a completed analysis_run. IncidentDetail sources the incident RCA from the run.
+	now := time.Now().UTC()
+	runID := "RUN-" + alertID
+	s.analysisRuns[runID] = &AnalysisRun{
+		RunID:           runID,
+		Status:          "complete",
+		TargetType:      "alert",
+		TargetID:        alertID,
+		IncidentID:      alert.IncidentID,
+		AlertID:         alertID,
+		AnalysisSummary: response.AnalysisSummary,
+		AnalysisDetail:  first(response.AnalysisDetail, response.Analysis),
+		AnalysisQuality: response.AnalysisQuality,
+		RootCauseFamily: response.RootCauseFamily,
+		Capabilities:    response.Capabilities,
+		MissingData:     response.MissingData,
+		Warnings:        response.Warnings,
+		Artifacts:       response.Artifacts,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
 }
 
 // IsSupersededAnalysisRun reports whether a fresher analysis run has been started
