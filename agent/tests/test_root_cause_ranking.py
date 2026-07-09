@@ -706,3 +706,77 @@ def test_lifecycle_gate_clears_node_force_high_from_blast() -> None:
     by_family = {c.family: c for c in ranked}
     assert "node_kubelet_pressure" in by_family
     assert by_family["node_kubelet_pressure"].confidence != "high"
+
+
+def test_soft_tokens_alone_do_not_create_node_pressure_candidate() -> None:
+    # Fix A: kubelet / device plugin / node condition are SOFT co-occurrence
+    # tokens a GPU-Operator (device-plugin DaemonSet) rollout always emits with NO
+    # node pressure. They were removed from the scoring keywords, so with a Ready
+    # node and no hard condition token, node_kubelet_pressure must not even appear.
+    results = [
+        _r(
+            "kubernetes",
+            summary=(
+                "kubelet restarted nvidia-device-plugin; device plugin re-registered "
+                "on gpu-node-17 (node reports Ready); node condition changed"
+            ),
+        ),
+        _r("typedb", summary="kg lookup", details={"blast_radius_workloads": 4}),
+    ]
+    ranked = rank_root_cause_candidates(_target(), results, occurrence_count=5)
+    assert "node_kubelet_pressure" not in {c.family for c in ranked}
+
+
+def test_hard_token_still_scores_node_pressure_after_soft_token_removal() -> None:
+    # Guard Fix A from over-correcting: a real hard token (evict) must still score.
+    results = [_r("kubernetes", summary="kubelet evicting pods on gpu-node-17")]
+    ranked = rank_root_cause_candidates(_target(), results)
+    assert "node_kubelet_pressure" in {c.family for c in ranked}
+
+
+def test_benign_container_ready_ratio_does_not_score_scheduling() -> None:
+    # Fix B: a bare "0/" matched benign transient states — a pod showing "0/1"
+    # containers ready, a deployment at "0/3" available. Only the scheduler
+    # predicate phrase ("nodes are available") should score k8s_scheduling_error.
+    results = [
+        _r("kubernetes", summary="pods: web 0/1 running, sidecar 0/3 available; all starting normally")
+    ]
+    ranked = rank_root_cause_candidates(_target(), results)
+    assert "k8s_scheduling_error" not in {c.family for c in ranked}
+
+
+def test_real_failedscheduling_still_scores_after_token_tightening() -> None:
+    results = [
+        _r(
+            "kubernetes",
+            summary="FailedScheduling: 0/5 nodes are available: 5 node(s) had untolerated taint",
+        )
+    ]
+    ranked = rank_root_cause_candidates(_target(), results)
+    assert "k8s_scheduling_error" in {c.family for c in ranked}
+
+
+def test_prometheus_metric_labels_do_not_leak_or_score_node_pressure() -> None:
+    # Fix C: a prometheus series' `metric` label set is query IDENTITY, not
+    # evidence. A HEALTHY node's kube_node_status_condition{condition="DiskPressure",
+    # status="true"} series has VALUE 0 — but the label literals "DiskPressure" /
+    # "true" used to leak (the metadata-key prune only fired on scalar leaves, and
+    # `metric` holds a dict). node_kubelet_pressure must not score off them.
+    details = {
+        "queries": {
+            "result": [
+                {
+                    "metric": {
+                        "__name__": "kube_node_status_condition",
+                        "condition": "DiskPressure",
+                        "status": "true",
+                        "node": "gpu-01",
+                    },
+                    "value": [1720000000, "0"],
+                }
+            ]
+        }
+    }
+    results = [_r("prometheus", summary="node condition series returned; all conditions nominal", details=details)]
+    ranked = rank_root_cause_candidates(_target(alert_name="SparseMetrics"), results)
+    assert "node_kubelet_pressure" not in {c.family for c in ranked}

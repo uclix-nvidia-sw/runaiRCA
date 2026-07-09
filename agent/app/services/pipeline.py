@@ -2205,6 +2205,12 @@ def _evidence_leaf_text(
         if node is None:
             return
         key_l = key.lower()
+        # Prune metadata-key subtrees BEFORE recursing (mirrors _leaf_text): a
+        # metadata key can hold a dict/list (e.g. a prometheus ``metric`` label
+        # set), and checking only at the scalar leaf let those identity literals
+        # ("DiskPressure", status "true") leak and signature-match a healthy node.
+        if key_l in METADATA_VALUE_KEYS:
+            return
         if isinstance(node, dict):
             for child_key, child in node.items():
                 if drop and str(child_key).lower() in drop:
@@ -2213,8 +2219,6 @@ def _evidence_leaf_text(
         elif isinstance(node, (list, tuple)):
             for child in node:
                 walk(child, key)
-        elif key_l in METADATA_VALUE_KEYS:
-            return
         elif key_l in {"xid", "xid_code", "nvidia_xid"}:
             add(f"xid {node}")
         elif isinstance(node, (str, int, float, bool)):

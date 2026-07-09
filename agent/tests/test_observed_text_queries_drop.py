@@ -90,3 +90,21 @@ def test_real_node_pressure_still_signature_matches():
     assert "diskpressure" in observed
     matches = match_failure_mode_symptoms(_failure_modes(), observed)
     assert any(family == "node_kubelet_pressure" for family, _ in matches)
+
+
+def test_evidence_leaf_text_prunes_metadata_key_subtrees():
+    # Fix C: a metadata key (metric, error, ...) can hold a DICT/LIST, not just a
+    # scalar. The prune must drop the whole subtree so a prometheus `metric` label
+    # set ("DiskPressure"/"true") or an MCP transport `error` message
+    # ("no route to host") cannot leak into the signature-match text.
+    payload = {
+        "metric": {"condition": "DiskPressure", "status": "true", "node": "gpu-01"},
+        "error": {"message": "no route to host"},
+        "value": [1720000000, "0"],
+        "warning_events": [{"message": "Attempting to reclaim ephemeral-storage"}],
+    }
+    text = _evidence_leaf_text(payload)
+    assert "diskpressure" not in text.lower()
+    assert "no route to host" not in text.lower()
+    # Real, non-metadata evidence still survives.
+    assert "reclaim ephemeral-storage" in text.lower()

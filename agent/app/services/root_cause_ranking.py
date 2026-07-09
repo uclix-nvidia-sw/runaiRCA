@@ -186,8 +186,12 @@ def _node_condition_present(results: list[CollectorResult]) -> bool:
             if _keyword_hits(scoped, list(_NODE_CONDITION_TOKENS))[0]:
                 return True
         elif agent == "prometheus":
-            # Prometheus carries no raw node object; a negation-aware hit on its
-            # metric/summary text (e.g. condition MemoryPressure=true) is genuine.
+            # Prometheus carries no raw node object. Its metric-LABEL identity is
+            # value-blind (a healthy node's kube_node_status_condition{condition=
+            # "MemoryPressure"} series has the label but VALUE 0), so those label
+            # literals are pruned from _result_text (METADATA_VALUE_KEYS subtree
+            # drop). A hit here therefore comes from the collector's own SUMMARY
+            # (e.g. "MemoryPressure=true"), which is a real, negation-aware signal.
             if _keyword_hits(_result_text(r), list(_NODE_CONDITION_TOKENS))[0]:
                 return True
     return False
@@ -609,6 +613,14 @@ def _leaf_text(value: Any, drop_keys: "frozenset[str] | set[str] | None" = None)
         if node is None:
             return
         key_l = key.lower()
+        # Prune metadata-key subtrees BEFORE recursing: a metadata key (metric,
+        # expr, query, name, ...) can hold a dict/list — e.g. a prometheus series'
+        # ``metric`` label set {"condition":"DiskPressure","status":"true"} whose
+        # VALUE is 0 (healthy). Checking only at the scalar leaf let those label
+        # literals leak and score node_kubelet_pressure on a healthy node. We match
+        # RETURNED values, never the query/label identity.
+        if key_l in _METADATA_VALUE_KEYS:
+            return
         if isinstance(node, dict):
             for child_key, child in node.items():
                 if drop and str(child_key).lower() in drop:
@@ -617,8 +629,6 @@ def _leaf_text(value: Any, drop_keys: "frozenset[str] | set[str] | None" = None)
         elif isinstance(node, (list, tuple)):
             for child in node:
                 walk(child, key)
-        elif key_l in _METADATA_VALUE_KEYS:
-            return
         elif key_l in {"xid", "xid_code", "nvidia_xid"}:
             parts.append(f"xid {node}")
         elif isinstance(node, (str, int, float, bool)):

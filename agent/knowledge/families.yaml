@@ -4,14 +4,18 @@
     - kubernetes
     - prometheus
   keywords:
+    # HARD node-resource signals only. The SOFT co-occurrence tokens (kubelet,
+    # device plugin, node condition) fire on any GPU-Operator/device-plugin
+    # rollout — the DaemonSet restarts and "kubelet" is mentioned — with NO node
+    # pressure, and used to give this family a medium score (the recurring
+    # node-pressure mis-attribution). They stay in planner_keywords for hypothesis
+    # recall but must not SCORE the family. A genuine pressure incident always
+    # carries one of these hard tokens.
     - diskpressure
     - memorypressure
     - pidpressure
     - node pressure
     - evict
-    - kubelet
-    - device plugin
-    - node condition
   planner_keywords:
     - diskpressure
     - memorypressure
@@ -63,7 +67,11 @@
     - anti-affinity
     - exceeded quota
     - default-scheduler
-    - 0/
+    # the kube-scheduler predicate breakdown ("0/N nodes are available: ..."). A
+    # bare "0/" matched benign transient states (a pod showing "0/1" containers
+    # ready, a deployment at "0/3" available, even date strings) — require the
+    # scheduler phrase so only a real placement failure scores.
+    - nodes are available
   planner_keywords:
     - failedscheduling
     - unschedul
