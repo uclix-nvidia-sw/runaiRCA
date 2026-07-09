@@ -22,6 +22,7 @@ from urllib.parse import quote
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
+from app.knowledge import dependency_path, load_architecture
 from app.llm import cached_insight, complete, insight_cache_key, llm_configured
 from app.masking import build_masker
 
@@ -35,12 +36,22 @@ class ChangeCollector:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._cache: dict[tuple[str, str, int], CollectorResult] = {}
+        self._cache: dict[tuple, CollectorResult] = {}
+        self._components: dict[str, dict] | None = None
 
     async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:  # noqa: ANN001
         namespace = _first_namespace(plan) or target.namespace
         node = getattr(plan, "node", "") or target.node
-        cache_key = (namespace or "", node or "", _RECENT_WINDOW_SECONDS)
+        # depends_on namespaces (e.g. gpu-operator) the alert's component sits on:
+        # an upstream operator/Helm upgrade is the usual root cause of a stuck
+        # downstream DaemonSet, so scan those too (P2b).
+        dep_namespaces = self._dependency_namespaces(plan, namespace)
+        cache_key = (
+            namespace or "",
+            node or "",
+            tuple(dep_namespaces),
+            _RECENT_WINDOW_SECONDS,
+        )
         if cache_key in self._cache:
             return self._cache[cache_key]
 
@@ -70,8 +81,19 @@ class ChangeCollector:
         pods = await self._recent_pods(ns, headers, verify, now, warnings)
         node_changes = await self._node_conditions(node, headers, verify, now, warnings)
         events = await self._recent_events(ns, limit, headers, verify, warnings)
+        helm = await self._recent_helm_releases(namespace, ns, limit, headers, verify, now, warnings)
 
-        changes = controllers + pods + node_changes + events
+        changes = controllers + pods + node_changes + events + helm
+        # Upstream depends_on namespaces: only rollouts / Helm changes there matter
+        # (that's what a downstream stall points back to) — skip pod/event churn.
+        for dep_ns in dep_namespaces:
+            dep_q = quote(dep_ns, safe="")
+            changes += await self._recent_controllers(
+                dep_q, "", headers, verify, now, warnings
+            )
+            changes += await self._recent_helm_releases(
+                dep_ns, dep_q, limit, headers, verify, now, warnings
+            )
         changes.sort(key=lambda c: c.get("timestamp") or "", reverse=True)
 
         if not changes:
@@ -100,6 +122,7 @@ class ChangeCollector:
         details = {
             "namespace": namespace,
             "node": node,
+            "dependency_namespaces": dep_namespaces,
             "window_seconds": _RECENT_WINDOW_SECONDS,
             "changes": changes,
             "insight": insight,
@@ -203,6 +226,8 @@ class ChangeCollector:
                         "timestamp": cond_ts or meta.get("creationTimestamp"),
                         "kind": kind,
                         "name": meta.get("name"),
+                        "namespace": meta.get("namespace"),
+                        "rollout": bool(rollout),
                         "summary": (
                             f"{kind} {meta.get('name')} "
                             + (
@@ -213,6 +238,87 @@ class ChangeCollector:
                         ),
                     }
                 )
+        return out
+
+    def _dependency_namespaces(self, plan, primary_ns: str) -> list[str]:  # noqa: ANN001
+        """Namespaces of the alert component's depends_on chain (P2b).
+
+        An alert ON runai-container-toolkit (ns runai) depends on the GPU Operator
+        stack (ns gpu-operator); an upstream Helm upgrade / operator rollout there
+        is the real trigger of a downstream stall. We scan those namespaces for
+        rollouts + Helm changes so `_lifecycle_signal` can attribute the upstream
+        cause. Returns a sorted, de-duped list excluding the primary namespace and
+        anything outside the configured namespace allowlist."""
+        component = str(getattr(plan, "component", "") or "").strip()
+        if not component:
+            return []
+        if self._components is None:
+            self._components = load_architecture(
+                getattr(self._settings, "architecture_file", "")
+            )
+        components = self._components or {}
+        if component not in components:
+            return []
+        chain = dependency_path(components, component)
+        out: set[str] = set()
+        for name in chain:
+            entry = components.get(name) or {}
+            dep_ns = str(entry.get("namespace") or "").strip()
+            if dep_ns and dep_ns != primary_ns and _namespace_allowed(self._settings, dep_ns):
+                out.add(dep_ns)
+        return sorted(out)
+
+    async def _recent_helm_releases(
+        self, namespace, ns, limit, headers, verify, now, warnings
+    ) -> list[dict]:  # noqa: ANN001
+        """Helm v3 release revisions changed within the window (P2b).
+
+        Helm v3 stores each revision as a Secret `sh.helm.release.v1.<rel>.v<N>`
+        (labels owner=helm, name=<release>, version=<N>, status=<deployed|
+        pending-upgrade|pending-install|failed|...>). A revision Secret created
+        inside the window means an install/upgrade just happened; a non-deployed
+        status means it's mid-flight. Either way it's a lifecycle signal. RBAC on
+        secrets may 403 — that degrades to a warning + no entries, never an error."""
+        data = await self._get(
+            f"/api/v1/namespaces/{ns}/secrets",
+            {"labelSelector": "owner=helm", "limit": str(limit)},
+            headers, verify, warnings, "helm",
+        )
+        # Keep only the newest revision per release within the window.
+        latest: dict[str, dict] = {}
+        for item in _items(data):
+            meta = _dict(item.get("metadata"))
+            labels = _dict(meta.get("labels"))
+            release = str(labels.get("name") or "").strip()
+            created = meta.get("creationTimestamp")
+            if not release or not _within_window(created, now):
+                continue
+            try:
+                version = int(labels.get("version") or 0)
+            except (TypeError, ValueError):
+                version = 0
+            prev = latest.get(release)
+            if prev is None or version >= prev["_version"]:
+                status = str(labels.get("status") or "").strip()
+                pending = status in {"pending-upgrade", "pending-install", "pending-rollback"}
+                latest[release] = {
+                    "_version": version,
+                    "timestamp": created,
+                    "kind": "HelmRelease",
+                    "name": release,
+                    "namespace": namespace,
+                    # A recent Helm revision (deployed or mid-flight) is a rollout
+                    # signal — it explains churn in the release's workloads.
+                    "rollout": True,
+                    "helm_status": status,
+                    "helm_pending": pending,
+                    "revision": version,
+                    "summary": (
+                        f"Helm release {release} revision {version} is "
+                        f"{status or 'changed'} in {namespace}"
+                    ),
+                }
+        out = [{k: v for k, v in e.items() if k != "_version"} for e in latest.values()]
         return out
 
     async def _recent_pods(self, ns, headers, verify, now, warnings) -> list[dict]:  # noqa: ANN001

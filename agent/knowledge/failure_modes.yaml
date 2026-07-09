@@ -676,3 +676,23 @@
         - "Each node pool is a SEPARATE scheduling domain — check free GPU/CPU/CPU-memory in the workload's node pool, not the whole cluster. The scheduling event says how many resources are missing on how many nodes."
         - "For non-GPU shortfalls, read the pod YAML (`kubectl -n <project-ns> get po <pod> -o yaml`) for the requested cpu/memory/other resources."
         - "Confirm the requested PVC is Bound: `kubectl -n <project-ns> get pvc <name>` — an unbound volume keeps the pod Pending."
+
+- family: platform_lifecycle_change
+  symptoms:
+    - name: GPU Operator Stack Upgrade In Progress
+      keywords: ["gpu-operator upgrade", "gpu-driver-upgrade", "driver-upgrade-state", "upgrade-failed", "operator is being upgraded", "helm upgrade gpu-operator"]
+      actions:
+        - "This is a lifecycle event, NOT a hardware/node fault: the NVIDIA GPU Operator stack is mid-rollout, so its operand DaemonSets (nvidia-driver → nvidia-container-toolkit → nvidia-device-plugin) and the dependent runai-container-toolkit cycle as pods drain and re-create. The downstream 'rollout stuck' / 'not ready' alert is a symptom of the upgrade, not a separate failure."
+        - "Verify the Helm release actually converged: `helm -n gpu-operator history <release>` (or `helm list -n gpu-operator`) — confirm the latest revision is STATUS deployed, not failed/pending-upgrade."
+        - "Check every operand pod is Ready on every GPU node: `kubectl get pods -n gpu-operator -o wide` and `kubectl get ds -n gpu-operator` (DESIRED == READY). DESIRED 0 usually means NoSchedule node taints, not a fault."
+        - "Only after the operator namespace is healthy, re-check the downstream: `kubectl -n runai rollout status ds/runai-container-toolkit`. If the upstream stack is Ready and this is still stuck, THEN dig into the node (driver load, containerd 'nvidia' runtime)."
+    - name: Controller Rollout In Progress (generation != observedGeneration)
+      keywords: ["mid-rollout", "observedgeneration", "rollingupdate"]
+      actions:
+        - "The implicated Deployment/DaemonSet/StatefulSet is mid-rollout (spec generation the status hasn't caught up to). Pods terminating/creating during this window are EXPECTED. Watch it converge: `kubectl -n <ns> rollout status <kind>/<name>`."
+        - "If it is genuinely stuck, read WHY the new pods aren't going Ready: `kubectl -n <ns> describe <kind>/<name>` and the newest pod's events/logs — treat that specific reason (ImagePull, CrashLoop, scheduling) as the real sub-cause. Do NOT attribute it to node pressure unless the node conditions are actually True."
+    - name: Helm Release Recently Changed
+      keywords: ["pending-upgrade", "pending-install", "helm.sh/release", "helm history", "helm upgrade"]
+      actions:
+        - "A Helm release around the alert window changed. Confirm it converged: `helm -n <ns> history <release>` — a revision stuck in pending-upgrade/pending-install/failed is the root cause; roll back or re-run the upgrade."
+        - "Reconcile what the chart changed (image tags, resource limits, node selectors) against the pods that won't come up — the new spec, not the node, is the suspect."

@@ -153,3 +153,32 @@ def test_signature_promotion_beats_ranker_and_respects_precedence() -> None:
     assert out[0].evidence_agents == ["signature"]
     # nothing matched -> ranker stands
     assert _promote_signature_cause(ranked, [], [], [])[0].family == "node_kubelet_pressure"
+
+
+def test_lifecycle_symptom_promotion_is_gated_by_active_signal() -> None:
+    # A coincidental, unrelated rollout injects "mid-rollout" into observed text and
+    # matches the lifecycle symptom. Without the gate it would promote
+    # platform_lifecycle_change over a genuine fault. The gate drops lifecycle
+    # symptom matches unless the component-chain lifecycle signal is active.
+    from app.services.pipeline import _gate_lifecycle_symptoms, _promote_signature_cause
+
+    ranked = [RankedCause(family="node_kubelet_pressure", confidence="high", score=9.0)]
+    sym = [("platform_lifecycle_change", {"symptom": "Controller Rollout In Progress"})]
+
+    # inactive (or absent) lifecycle -> lifecycle symptom is dropped, ranker stands
+    gated = _gate_lifecycle_symptoms(sym, {"active": False})
+    assert gated == []
+    assert _promote_signature_cause(ranked, [], [], gated)[0].family == "node_kubelet_pressure"
+    assert _gate_lifecycle_symptoms(sym, None) == []
+
+    # a NON-lifecycle symptom is never gated
+    other = [("gpu_hardware_error", {"symptom": "GPU Fallen Off The Bus"})]
+    assert _gate_lifecycle_symptoms(other, {"active": False}) == other
+
+    # active lifecycle -> lifecycle symptom passes through and can promote
+    passed = _gate_lifecycle_symptoms(sym, {"active": True, "components": ["x"]})
+    assert passed == sym
+    assert (
+        _promote_signature_cause(ranked, [], [], passed)[0].family
+        == "platform_lifecycle_change"
+    )

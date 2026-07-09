@@ -131,3 +131,78 @@ async def test_query_failure_degrades(monkeypatch: pytest.MonkeyPatch) -> None:
     result = await ChangeCollector(_Settings()).collect(_target())
     assert result.status == "partial"
     assert result.warnings  # each failed query recorded a warning
+
+
+class _ArchSettings(_Settings):
+    architecture_file = "knowledge/runai_architecture.yaml"
+
+
+def _plan(component: str, namespace: str = "runai", node: str = "gpu-node-1"):
+    from app.plan import InvestigationPlan
+
+    return InvestigationPlan(namespaces=[namespace], node=node, component=component)
+
+
+@pytest.mark.asyncio
+async def test_dependency_namespaces_scanned_for_upstream_rollout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Alert is ON runai-container-toolkit (ns runai) but the real trigger is an
+    # upstream GPU Operator DaemonSet mid-rollout in ns gpu-operator (P2b).
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, base_url, path, timeout_seconds, params, headers, verify):
+        if "/namespaces/gpu-operator/daemonsets" in path:
+            data = {"items": [{
+                "metadata": {"name": "nvidia-driver-daemonset", "namespace": "gpu-operator",
+                             "generation": 7, "creationTimestamp": _iso(-100000)},
+                "status": {"observedGeneration": 6, "conditions": []},
+            }]}
+        else:
+            data = {"items": []}
+        return JsonResponse(url=f"{base_url}{path}", status_code=200, data=data)
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    result = await ChangeCollector(_ArchSettings()).collect(
+        _target(), plan=_plan("runai-container-toolkit")
+    )
+    assert result.status == "ok"
+    assert "gpu-operator" in result.details["dependency_namespaces"]
+    upstream = [
+        c for c in result.details["changes"]
+        if c.get("namespace") == "gpu-operator" and c.get("rollout")
+    ]
+    assert upstream and upstream[0]["name"] == "nvidia-driver-daemonset"
+
+
+@pytest.mark.asyncio
+async def test_helm_release_detected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, base_url, path, timeout_seconds, params, headers, verify):
+        if path.endswith("/secrets"):
+            data = {"items": [
+                {"metadata": {"name": "sh.helm.release.v1.gpu-operator.v3",
+                              "namespace": "gpu-operator",
+                              "creationTimestamp": _iso(-60),
+                              "labels": {"owner": "helm", "name": "gpu-operator",
+                                         "version": "3", "status": "pending-upgrade"}}},
+                {"metadata": {"name": "sh.helm.release.v1.gpu-operator.v2",
+                              "namespace": "gpu-operator",
+                              "creationTimestamp": _iso(-100000),
+                              "labels": {"owner": "helm", "name": "gpu-operator",
+                                         "version": "2", "status": "superseded"}}},
+            ]}
+        else:
+            data = {"items": []}
+        return JsonResponse(url=f"{base_url}{path}", status_code=200, data=data)
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    result = await ChangeCollector(_Settings()).collect(_target())
+    assert result.status == "ok"
+    helm = [c for c in result.details["changes"] if c.get("kind") == "HelmRelease"]
+    # Only the newest in-window revision (v3) is reported, marked as a rollout.
+    assert len(helm) == 1
+    assert helm[0]["revision"] == 3
+    assert helm[0]["rollout"] is True
+    assert helm[0]["helm_status"] == "pending-upgrade"

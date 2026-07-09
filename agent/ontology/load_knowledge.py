@@ -49,6 +49,7 @@ FAMILIES = {
     "workload_runtime_error",
     "observability_accuracy",
     "platform_auth_error",
+    "platform_lifecycle_change",
     "insufficient_evidence",
 }
 

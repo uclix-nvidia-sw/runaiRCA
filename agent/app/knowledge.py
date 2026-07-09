@@ -121,6 +121,11 @@ DEFAULT_FAMILIES = (
     "workload_runtime_error",
     "observability_accuracy",
     "platform_auth_error",
+    # Nature axis: not a FAULT but a lifecycle event (rollout/upgrade in
+    # progress). Cycling pods during a controller rollout or Helm upgrade are
+    # expected disruption, not a hardware/node fault — this family names that so
+    # an upgrade isn't mis-attributed to the incidental symptoms it produces.
+    "platform_lifecycle_change",
 )
 
 DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
@@ -321,6 +326,18 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "access rule",
         ),
     ),
+    "platform_lifecycle_change": (
+        "change",
+        ("change",),
+        (
+            "mid-rollout",
+            "observedgeneration",
+            "rollingupdate",
+            "pending-upgrade",
+            "pending-install",
+            "helm.sh/release",
+        ),
+    ),
 }
 
 DEFAULT_FAMILY_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -384,6 +401,10 @@ DEFAULT_FAMILY_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "platform_auth_error",
         ("auth", "login", "sso", "saml", "oidc", "permission"),
     ),
+    (
+        "platform_lifecycle_change",
+        ("rollout", "upgrade", "rollingupdate", "helm", "revision", "rolloutstuck"),
+    ),
 )
 
 DEFAULT_FAMILY_REASONS = {
@@ -406,6 +427,10 @@ DEFAULT_FAMILY_REASONS = {
         "alert points at the metrics/observability pipeline, not the workload"
     ),
     "platform_auth_error": "alert points at login/SSO/permissions (auth control plane)",
+    "platform_lifecycle_change": (
+        "alert coincides with a rollout/upgrade of the implicated component or its "
+        "dependencies — expected disruption; verify the rollout/Helm release completed"
+    ),
 }
 
 

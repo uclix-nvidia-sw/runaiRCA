@@ -323,3 +323,25 @@
     - "oidc"
     - "permission"
   reason: alert points at login/SSO/permissions (auth control plane)
+
+- family: platform_lifecycle_change
+  canonical_agent: change
+  agents:
+    - change
+  keywords:
+    - "mid-rollout"
+    - "observedgeneration"
+    - "rollingupdate"
+    - "pending-upgrade"
+    - "pending-install"
+    - "helm.sh/release"
+  planner_keywords:
+    - "rollout"
+    - "upgrade"
+    - "rollingupdate"
+    - "helm"
+    - "revision"
+    - "rolloutstuck"
+  reason: >-
+    alert coincides with a rollout/upgrade of the implicated component or its
+    dependencies — expected disruption; verify the rollout/Helm release completed

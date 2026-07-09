@@ -202,6 +202,10 @@ entity k8s_storage_error sub root_cause;        # CSI/PVC/NFS/Ceph/disk-IO layer
 entity storage_backend_error sub root_cause;   # backend storage health: NFS, Ceph, node filesystem
 entity workload_runtime_error sub root_cause;  # running-phase app faults (vs startup)
 entity platform_auth_error sub root_cause;     # login/permissions/SAML/OIDC/JWT, UI-API 401/403/503/500
+# Nature axis (2026-07-09): a rollout/upgrade in progress is a lifecycle EVENT,
+# not a fault — cycling pods during a controller rollout or Helm upgrade are
+# expected disruption. Names the case an upgrade would otherwise be mis-blamed on.
+entity platform_lifecycle_change sub root_cause;
 
 entity action,
     owns statement,
