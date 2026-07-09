@@ -166,26 +166,21 @@ spec:
           env:
             - name: GRAFANA_URL
               value: {{ .Values.grafanaMcp.grafanaUrl | quote }}
-            - name: GRAFANA_SERVICE_ACCOUNT_TOKEN_FILE
-              value: /var/run/secrets/grafana/token
+            # mcp-grafana reads the token from this env var directly; it does NOT
+            # honor a *_FILE path. Wire it via secretKeyRef exactly like every other
+            # component (backend/agent) so the same secret works consistently.
+            - name: GRAFANA_SERVICE_ACCOUNT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "runai-rca.secretName" . }}
+                  key: {{ .Values.secrets.keys.grafanaServiceAccountToken | quote }}
+                  optional: true
             {{- with .Values.grafanaMcp.grafanaOrgId }}
             - name: GRAFANA_ORG_ID
               value: {{ . | quote }}
             {{- end }}
-          volumeMounts:
-            - name: grafana-token
-              mountPath: /var/run/secrets/grafana
-              readOnly: true
           resources:
             {{- toYaml .Values.grafanaMcp.resources | nindent 12 }}
-      volumes:
-        - name: grafana-token
-          secret:
-            secretName: {{ include "runai-rca.secretName" . }}
-            optional: true
-            items:
-              - key: {{ .Values.secrets.keys.grafanaServiceAccountToken | quote }}
-                path: token
       {{- with (default .Values.nodeSelector .Values.grafanaMcp.nodeSelector) }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
