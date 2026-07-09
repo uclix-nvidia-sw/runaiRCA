@@ -29,7 +29,6 @@ import {
   analyzeIncident,
   archiveIncident,
   deleteIncident,
-  fetchAlert,
   fetchIncident,
   resolveIncident,
   restoreIncident,
@@ -478,9 +477,10 @@ function App() {
         }
         return;
       }
-      const nextAlert = await fetchAlert(route.detailID);
+      // Alerts are list-only — there is no per-alert detail view. A stale
+      // alert-detail route just falls back to the list.
       if (routeLoadVersionRef.current === version) {
-        setDetail({ kind: 'alert', data: nextAlert });
+        setDetail(null);
       }
     } catch {
       if (routeLoadVersionRef.current === version) {
@@ -524,24 +524,13 @@ function App() {
     navigateToHash(hashForDetail('incident', id, view));
   }, [activeView, navigateToHash]);
 
-  const openAlert = useCallback(async (id: string) => {
-    navigateToHash(hashForDetail('alert', id, 'alerts'));
-  }, [navigateToHash]);
-
   const refreshDetail = useCallback(async () => {
     const currentDetail = detail;
     const version = detailVersionRef.current;
-    if (!currentDetail) return;
-    if (currentDetail.kind === 'incident') {
-      const nextDetail = await fetchIncident(currentDetail.data.incident_id);
-      if (detailVersionRef.current === version) {
-        setDetail({ kind: 'incident', data: nextDetail });
-      }
-      return;
-    }
-    const nextAlert = await fetchAlert(currentDetail.data.alert_id);
+    if (!currentDetail || currentDetail.kind !== 'incident') return;
+    const nextDetail = await fetchIncident(currentDetail.data.incident_id);
     if (detailVersionRef.current === version) {
-      setDetail({ kind: 'alert', data: nextAlert });
+      setDetail({ kind: 'incident', data: nextDetail });
     }
   }, [detail]);
 
@@ -718,7 +707,6 @@ function App() {
             filters={alertFilters}
             page={alertPage}
             loading={loading}
-            onOpenAlert={openAlert}
             onOpenIncident={openIncident}
             onPageChange={setAlertPageIndex}
             onFilterChange={setAlertFilters}
@@ -942,10 +930,8 @@ function UnifiedWorkspace({
           />
         )}
 
-        {incident ? (
+        {incident && (
           <SimilarIncidentsPanel items={similarIncidents} recentCount={incident.similar_recent_count ?? 0} />
-        ) : (
-          alert && <RelatedIncidentPanel alert={alert} />
         )}
 
         <section className="rca-report">
@@ -1107,25 +1093,6 @@ function AffectedPods({ pods }: { pods: string[] }) {
   );
 }
 
-function RelatedIncidentPanel({ alert }: { alert: AlertRecord }) {
-  return (
-    <section className="related-panel">
-      <div className="section-title"><Link size={18} /> Related Incident</div>
-      <article className="related-incident-card">
-        <div>
-          <strong>{alert.incident_id}</strong>
-          <div className="meta-line">
-            <span>{targetLine(alert.labels)}</span>
-            <span>{formatOccurrenceCount(alert)}</span>
-            <Severity value={alert.severity} />
-            <Status value={alert.status} analyzing={alert.is_analyzing} />
-          </div>
-          <p>{alert.analysis_summary || 'This alert is grouped into the incident RCA workspace.'}</p>
-        </div>
-      </article>
-    </section>
-  );
-}
 
 function DiagnosticsPanel({ missingData, warnings, tokenUsage }: { missingData: string[]; warnings: string[]; tokenUsage?: Record<string, unknown> }) {
   return (
