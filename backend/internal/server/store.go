@@ -173,11 +173,107 @@ type IncidentListFilter struct {
 	Status        string
 	Severity      string
 	FinalDecision string
+	// Search is a free-text query matched case-insensitively against the
+	// incident's title/metadata AND its analysis content + member-alert
+	// labels/annotations (see incidentMatchesSearchLocked).
+	Search string
 }
 
 type AlertListFilter struct {
 	Status   string
 	Severity string
+	// Search is a free-text query matched case-insensitively against the alert
+	// title, severity/status, and every label/annotation value (which is where
+	// the human-readable description/summary lives). See alertMatchesSearch.
+	Search string
+}
+
+// searchNeedle normalises a raw search query for case-insensitive substring
+// matching. Returns "" when the query is blank (meaning "match everything").
+func searchNeedle(raw string) string {
+	return strings.ToLower(strings.TrimSpace(raw))
+}
+
+// alertMatchesSearch reports whether the alert's title + status + every
+// label/annotation value + affected pod contains the (already lowercased)
+// needle. An empty needle matches everything.
+func alertMatchesSearch(alert *AlertRecord, needle string) bool {
+	if needle == "" {
+		return true
+	}
+	if alert == nil {
+		return false
+	}
+	var b strings.Builder
+	writeSearchToken(&b, alert.AlarmTitle)
+	writeSearchToken(&b, alert.Severity)
+	writeSearchToken(&b, alert.Status)
+	writeSearchToken(&b, alert.Fingerprint)
+	for _, v := range alert.Labels {
+		writeSearchToken(&b, v)
+	}
+	for _, v := range alert.Annotations {
+		writeSearchToken(&b, v)
+	}
+	for _, pod := range alert.OccurrencePods {
+		writeSearchToken(&b, pod)
+	}
+	return strings.Contains(strings.ToLower(b.String()), needle)
+}
+
+// incidentMatchesSearchLocked reports whether the incident matches the needle.
+// Beyond the incident's own title/metadata it folds in the CONTENT operators
+// actually search by: the latest analysis run's RCA text (summary/detail/family)
+// and every member alert's title + label/annotation values. memberAlerts is the
+// incident's alerts, grouped once by the caller so we don't rescan s.alerts per
+// incident. Caller must hold the store lock (reads s.analysisRuns).
+func (s *Store) incidentMatchesSearchLocked(incident *Incident, memberAlerts []*AlertRecord, needle string) bool {
+	if needle == "" {
+		return true
+	}
+	if incident == nil {
+		return false
+	}
+	// Cheap path first: the incident's own title/metadata. Most searches are by
+	// name/severity/status, so a title hit skips the analysis-run + alert fold.
+	var own strings.Builder
+	writeSearchToken(&own, incident.Title)
+	writeSearchToken(&own, incident.CorrelationKey)
+	writeSearchToken(&own, incident.Severity)
+	writeSearchToken(&own, incident.Status)
+	if strings.Contains(strings.ToLower(own.String()), needle) {
+		return true
+	}
+	// Fold in member-alert titles/labels/annotations + the latest RCA content.
+	var b strings.Builder
+	alertIDs := make(map[string]struct{}, len(memberAlerts))
+	for _, alert := range memberAlerts {
+		if alert == nil {
+			continue
+		}
+		alertIDs[alert.AlertID] = struct{}{}
+		writeSearchToken(&b, alert.AlarmTitle)
+		for _, v := range alert.Labels {
+			writeSearchToken(&b, v)
+		}
+		for _, v := range alert.Annotations {
+			writeSearchToken(&b, v)
+		}
+	}
+	if run := s.latestAnalysisRunForAlertIDsLocked(incident.IncidentID, alertIDs); run != nil {
+		writeSearchToken(&b, run.AnalysisSummary)
+		writeSearchToken(&b, run.AnalysisDetail)
+		writeSearchToken(&b, run.RootCauseFamily)
+	}
+	return strings.Contains(strings.ToLower(b.String()), needle)
+}
+
+func writeSearchToken(b *strings.Builder, token string) {
+	if token == "" {
+		return
+	}
+	b.WriteString(token)
+	b.WriteByte(' ')
 }
 
 func validIncidentStatusFilter(status string) bool {
@@ -484,9 +580,22 @@ func (s *Store) ListIncidentsPage(limit, offset int, views ...string) ([]Inciden
 func (s *Store) ListIncidentsPageFiltered(limit, offset int, view string, filter IncidentListFilter) ([]Incident, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	needle := searchNeedle(filter.Search)
+	var alertsByIncident map[string][]*AlertRecord
+	if needle != "" {
+		alertsByIncident = make(map[string][]*AlertRecord)
+		for _, alert := range s.alerts {
+			if alert != nil {
+				alertsByIncident[alert.IncidentID] = append(alertsByIncident[alert.IncidentID], alert)
+			}
+		}
+	}
 	ordered := make([]*Incident, 0, len(s.incidents))
 	for _, incident := range s.incidents {
 		if !incidentInView(incident, view) || !incidentMatchesListFilter(incident, filter) {
+			continue
+		}
+		if !s.incidentMatchesSearchLocked(incident, alertsByIncident[incident.IncidentID], needle) {
 			continue
 		}
 		ordered = append(ordered, incident)
@@ -512,9 +621,13 @@ func (s *Store) ListAlertsPage(limit, offset int) ([]AlertRecord, int) {
 func (s *Store) ListAlertsPageFiltered(limit, offset int, filter AlertListFilter) ([]AlertRecord, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	needle := searchNeedle(filter.Search)
 	ordered := make([]*AlertRecord, 0, len(s.alerts))
 	for _, alert := range s.alerts {
 		if alert == nil || incidentDeleted(s.incidents[alert.IncidentID]) || !alertMatchesListFilter(alert, filter) {
+			continue
+		}
+		if !alertMatchesSearch(alert, needle) {
 			continue
 		}
 		ordered = append(ordered, alert)
@@ -1848,6 +1961,14 @@ func (s *Store) latestAnalysisRunForIncidentLocked(incidentID string) *AnalysisR
 			alertIDs[alert.AlertID] = struct{}{}
 		}
 	}
+	return s.latestAnalysisRunForAlertIDsLocked(incidentID, alertIDs)
+}
+
+// latestAnalysisRunForAlertIDsLocked is the core of latestAnalysisRunForIncidentLocked
+// with the member alert-ID set supplied by the caller. Callers that already have the
+// incident's alerts grouped (e.g. the search path) use this to avoid re-scanning
+// s.alerts for every incident.
+func (s *Store) latestAnalysisRunForAlertIDsLocked(incidentID string, alertIDs map[string]struct{}) *AnalysisRun {
 	var selected *AnalysisRun
 	for _, run := range s.analysisRuns {
 		if run == nil {

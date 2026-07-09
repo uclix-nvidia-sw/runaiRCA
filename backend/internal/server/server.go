@@ -508,6 +508,7 @@ func (s *Server) handleIncidentList(w http.ResponseWriter, r *http.Request) {
 		Status:        strings.TrimSpace(r.URL.Query().Get("status")),
 		Severity:      strings.TrimSpace(r.URL.Query().Get("severity")),
 		FinalDecision: strings.TrimSpace(r.URL.Query().Get("final_decision")),
+		Search:        strings.TrimSpace(r.URL.Query().Get("q")),
 	}
 	if !validIncidentStatusFilter(filter.Status) {
 		writeError(w, http.StatusBadRequest, "invalid incident status filter")
@@ -534,6 +535,7 @@ func (s *Server) handleAlertList(w http.ResponseWriter, r *http.Request) {
 	filter := AlertListFilter{
 		Status:   strings.TrimSpace(r.URL.Query().Get("status")),
 		Severity: strings.TrimSpace(r.URL.Query().Get("severity")),
+		Search:   strings.TrimSpace(r.URL.Query().Get("q")),
 	}
 	if !validIncidentStatusFilter(filter.Status) {
 		writeError(w, http.StatusBadRequest, "invalid alert status filter")

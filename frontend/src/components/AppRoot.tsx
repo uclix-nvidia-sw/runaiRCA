@@ -79,7 +79,6 @@ import {
   isCollectorAgent,
   latestAgentSignal,
   latestEvidenceForAgent,
-  projectNameFromLabels,
   targetLine,
   uniqueStrings,
 } from '../utils/formatters';
@@ -305,8 +304,20 @@ function App() {
   const [analysisPageIndex, setAnalysisPageIndex] = useState(0);
   const [incidentFilters, setIncidentFilters] = useState<IncidentFilterState>(DEFAULT_INCIDENT_FILTERS);
   const [alertFilters, setAlertFilters] = useState<AlertFilterState>(DEFAULT_ALERT_FILTERS);
-  const incidentQueryFilters = useMemo(() => incidentFiltersForAPI(incidentFilters), [incidentFilters]);
-  const alertQueryFilters = useMemo(() => alertFiltersForAPI(alertFilters), [alertFilters]);
+  const [query, setQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
+  useEffect(() => {
+    const handle = window.setTimeout(() => setDebouncedQuery(query.trim()), 300);
+    return () => window.clearTimeout(handle);
+  }, [query]);
+  const incidentQueryFilters = useMemo(
+    () => ({ ...incidentFiltersForAPI(incidentFilters), search: debouncedQuery || undefined }),
+    [incidentFilters, debouncedQuery],
+  );
+  const alertQueryFilters = useMemo(
+    () => ({ ...alertFiltersForAPI(alertFilters), search: debouncedQuery || undefined }),
+    [alertFilters, debouncedQuery],
+  );
   const {
     incidents,
     alerts,
@@ -325,7 +336,6 @@ function App() {
     analysis: analysisPageIndex,
   }, incidentViewForMainView(activeView), incidentQueryFilters, alertQueryFilters);
   const [detail, setDetail] = useState<DetailState>(null);
-  const [query, setQuery] = useState('');
   const [chatDocked, setChatDocked] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const detailVersionRef = useRef(0);
@@ -335,7 +345,7 @@ function App() {
     setIncidentPageIndex(0);
     setAlertPageIndex(0);
     setAnalysisPageIndex(0);
-  }, [query]);
+  }, [debouncedQuery]);
 
   useEffect(() => {
     setIncidentPageIndex(0);
@@ -355,34 +365,18 @@ function App() {
   const analysisAlerts = alerts;
   const dashboardAnalysisRuns = analysisRuns;
 
-  const filteredIncidents = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return dashboardIncidents.filter((incident) =>
-      matchesIncidentFilters(incident, incidentFilters) && (!q || [incident.title, incident.severity, incident.status, incident.correlation_key]
-        .join(' ')
-        .toLowerCase()
-        .includes(q)),
-    );
-  }, [dashboardIncidents, incidentFilters, query]);
+  // Text search is executed server-side (title + RCA content + labels/annotations,
+  // across the whole dataset — not just this page). Only the status/severity
+  // structural filters remain client-side.
+  const filteredIncidents = useMemo(
+    () => dashboardIncidents.filter((incident) => matchesIncidentFilters(incident, incidentFilters)),
+    [dashboardIncidents, incidentFilters],
+  );
 
-  const filteredAlerts = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return dashboardAlerts.filter((alert) =>
-      matchesAlertFilters(alert, alertFilters) && (!q || [
-        alert.alarm_title,
-        alert.severity,
-        alert.status,
-        alert.labels.project,
-        projectNameFromLabels(alert.labels),
-        alert.labels.queue,
-        alert.labels.workload,
-        alert.labels.namespace,
-      ]
-        .join(' ')
-        .toLowerCase()
-        .includes(q)),
-    );
-  }, [alertFilters, dashboardAlerts, query]);
+  const filteredAlerts = useMemo(
+    () => dashboardAlerts.filter((alert) => matchesAlertFilters(alert, alertFilters)),
+    [alertFilters, dashboardAlerts],
+  );
 
   const analysisRecords = useMemo(
     () => buildAnalysisRecords(dashboardAnalysisRuns),
