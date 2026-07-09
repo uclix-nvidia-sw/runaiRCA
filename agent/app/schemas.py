@@ -87,6 +87,10 @@ class AlertAnalysisResponse(BaseModel):
     capabilities: dict[str, str]
     context: dict[str, Any]
     artifacts: list[AlertAnalysisArtifact]
+    # Concrete pod names the agent actually discovered for the alert subject
+    # (the real workload's pods), so the dashboard can show the impacted pods
+    # instead of the kube-state-metrics EXPORTER pod named in the alert payload.
+    affected_pods: list[str] = Field(default_factory=list)
 
 
 class AlertSummaryInput(BaseModel):

@@ -186,8 +186,12 @@ def _node_condition_present(results: list[CollectorResult]) -> bool:
             if _keyword_hits(scoped, list(_NODE_CONDITION_TOKENS))[0]:
                 return True
         elif agent == "prometheus":
-            # Prometheus carries no raw node object; a negation-aware hit on its
-            # metric/summary text (e.g. condition MemoryPressure=true) is genuine.
+            # Prometheus carries no raw node object. Its metric-LABEL identity is
+            # value-blind (a healthy node's kube_node_status_condition{condition=
+            # "MemoryPressure"} series has the label but VALUE 0), so those label
+            # literals are pruned from _result_text (METADATA_VALUE_KEYS subtree
+            # drop). A hit here therefore comes from the collector's own SUMMARY
+            # (e.g. "MemoryPressure=true"), which is a real, negation-aware signal.
             if _keyword_hits(_result_text(r), list(_NODE_CONDITION_TOKENS))[0]:
                 return True
     return False
@@ -551,9 +555,30 @@ def _insufficient(
     )
 
 
+# The kubernetes collector embeds the RAW node/pod objects it fetched under
+# ``details["queries"]`` (and mirrors the same dict into its artifact ``result``).
+# A perfectly HEALTHY node object still literally contains the failure vocabulary
+# — condition type "DiskPressure"/"MemoryPressure" (status False) and messages
+# like "kubelet has no disk pressure" — so a substring keyword scan scored
+# ``node_kubelet_pressure`` (and matched the curated "Node Disk Pressure" symptom)
+# on nodes that had NO pressure at all (the recurring "왜 다 False인데 아직도 그게
+# 있다고 하냐" misfire). The collector already distils its real signal into
+# structured keys (``node_conditions`` is abnormal-only, ``warning_events``,
+# ``pod_logs``, ``container_diagnostics``, …), so we drop the raw ``queries``
+# duplicate from EVERY keyword-scan text (both the family ranker here and the
+# signature/symptom matcher in pipeline._evidence_leaf_text — they must share one
+# policy or the leak reappears in whichever path is missed). loki/prometheus/runai
+# put their PRIMARY signal in ``queries``, so the drop is scoped to kubernetes.
+COLLECTOR_TEXT_DROP_KEYS: dict[str, frozenset[str]] = {
+    "kubernetes": frozenset({"queries"}),
+}
+_RANKING_TEXT_DROP_KEYS = COLLECTOR_TEXT_DROP_KEYS  # backward-compatible alias
+
+
 def _result_text(result: CollectorResult) -> str:
     if not _collector_is_evidence(result):
         return ""
+    drop_keys = _RANKING_TEXT_DROP_KEYS.get(getattr(result, "agent", ""))
     parts = [result.summary or ""]
     for art in result.artifacts:
         if not _artifact_is_evidence(art):
@@ -561,9 +586,9 @@ def _result_text(result: CollectorResult) -> str:
         if art.summary:
             parts.append(art.summary)
         if art.result is not None:
-            parts.append(_leaf_text(art.result))
+            parts.append(_leaf_text(art.result, drop_keys))
     if result.details:
-        parts.append(_leaf_text(result.details))
+        parts.append(_leaf_text(result.details, drop_keys))
     return " ".join(parts).lower()
 
 
@@ -575,22 +600,35 @@ def _artifact_is_evidence(art: object) -> bool:
     return getattr(art, "status", "") in ("ok", "partial")
 
 
-def _leaf_text(value: Any) -> str:
-    """Match evidence values, not JSON schema/key names."""
+def _leaf_text(value: Any, drop_keys: "frozenset[str] | set[str] | None" = None) -> str:
+    """Match evidence values, not JSON schema/key names.
+
+    ``drop_keys`` prunes whole subtrees whose dict key matches (case-insensitive)
+    — used to keep the raw ``queries`` firehose of a collector out of the ranking
+    keyword scan while leaving the collector's structured evidence intact."""
     parts: list[str] = []
+    drop = {k.lower() for k in drop_keys} if drop_keys else None
 
     def walk(node: Any, key: str = "") -> None:
         if node is None:
             return
         key_l = key.lower()
+        # Prune metadata-key subtrees BEFORE recursing: a metadata key (metric,
+        # expr, query, name, ...) can hold a dict/list — e.g. a prometheus series'
+        # ``metric`` label set {"condition":"DiskPressure","status":"true"} whose
+        # VALUE is 0 (healthy). Checking only at the scalar leaf let those label
+        # literals leak and score node_kubelet_pressure on a healthy node. We match
+        # RETURNED values, never the query/label identity.
+        if key_l in _METADATA_VALUE_KEYS:
+            return
         if isinstance(node, dict):
             for child_key, child in node.items():
+                if drop and str(child_key).lower() in drop:
+                    continue
                 walk(child, str(child_key))
         elif isinstance(node, (list, tuple)):
             for child in node:
                 walk(child, key)
-        elif key_l in _METADATA_VALUE_KEYS:
-            return
         elif key_l in {"xid", "xid_code", "nvidia_xid"}:
             parts.append(f"xid {node}")
         elif isinstance(node, (str, int, float, bool)):

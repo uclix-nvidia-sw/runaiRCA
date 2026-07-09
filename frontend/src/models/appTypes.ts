@@ -199,22 +199,22 @@ export const VIEW_COPY: Record<MainView, { eyebrow: string; title: string; place
   incidents: {
     eyebrow: 'Incident cockpit',
     title: 'Incident',
-    placeholder: 'Search incident, severity, status',
+    placeholder: 'Search title, RCA content, severity, status',
   },
   archived: {
     eyebrow: 'Incident archive',
     title: 'Archived incidents',
-    placeholder: 'Search archived incident, severity, status',
+    placeholder: 'Search title, RCA content, severity, status',
   },
   trash: {
     eyebrow: 'Incident trash',
     title: 'Trash',
-    placeholder: 'Search deleted incident, severity, status',
+    placeholder: 'Search title, RCA content, severity, status',
   },
   alerts: {
     eyebrow: 'Alert stream',
     title: 'Alerts',
-    placeholder: 'Search alert, project, queue, namespace',
+    placeholder: 'Search title, description, labels, namespace',
   },
   analysis: {
     eyebrow: 'Analysis dashboard',

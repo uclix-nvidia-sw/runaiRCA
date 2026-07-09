@@ -508,6 +508,7 @@ func (s *Server) handleIncidentList(w http.ResponseWriter, r *http.Request) {
 		Status:        strings.TrimSpace(r.URL.Query().Get("status")),
 		Severity:      strings.TrimSpace(r.URL.Query().Get("severity")),
 		FinalDecision: strings.TrimSpace(r.URL.Query().Get("final_decision")),
+		Search:        strings.TrimSpace(r.URL.Query().Get("q")),
 	}
 	if !validIncidentStatusFilter(filter.Status) {
 		writeError(w, http.StatusBadRequest, "invalid incident status filter")
@@ -534,6 +535,7 @@ func (s *Server) handleAlertList(w http.ResponseWriter, r *http.Request) {
 	filter := AlertListFilter{
 		Status:   strings.TrimSpace(r.URL.Query().Get("status")),
 		Severity: strings.TrimSpace(r.URL.Query().Get("severity")),
+		Search:   strings.TrimSpace(r.URL.Query().Get("q")),
 	}
 	if !validIncidentStatusFilter(filter.Status) {
 		writeError(w, http.StatusBadRequest, "invalid alert status filter")
@@ -746,8 +748,32 @@ func normalizePodName(pod string) string {
 // name list is capped so a perpetually flapping workload cannot bloat the row.
 const maxOccurrencePods = 25
 
-// podName extracts the concrete pod name behind an alert occurrence.
+// workloadKindLabels mirror the agent's resolve_target: kube-state-metrics names
+// the failing object in a workload-KIND label (daemonset/deployment/…), and on
+// those metric families the `pod` label is the KSM EXPORTER pod that served the
+// metric, NOT a subject pod. `job` is deliberately excluded (in Prometheus that
+// is the scrape job, e.g. job="kube-state-metrics"); the KSM Job object uses
+// `job_name`.
+var workloadKindLabels = []string{
+	"daemonset",
+	"deployment",
+	"statefulset",
+	"replicaset",
+	"cronjob",
+	"job_name",
+}
+
+// podName extracts the concrete pod name behind an alert occurrence. When a
+// workload-kind label named the subject, the `pod` label is the KSM exporter and
+// is dropped — the real workload pods are discovered later by the agent and
+// applied in ApplyAnalysisForRun. Direct pod alerts (no workload-kind label)
+// keep the `pod` label, which is the real subject.
 func podName(alert Alert) string {
+	for _, key := range workloadKindLabels {
+		if strings.TrimSpace(alert.Labels[key]) != "" || strings.TrimSpace(alert.Annotations[key]) != "" {
+			return ""
+		}
+	}
 	return first(alert.Labels["pod"], alert.Labels["pod_name"], alert.Labels["kubernetes_pod_name"])
 }
 

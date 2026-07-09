@@ -334,6 +334,50 @@ def _component_identity(
     return family, component, chain
 
 
+def _affected_pods_from_results(results: list[CollectorResult]) -> list[str]:
+    """Concrete pod names the kubernetes collector discovered for the alert subject.
+
+    Alerts routed through kube-state-metrics name the KSM EXPORTER pod, not the
+    workload that actually broke. When the investigation was scoped to a concrete
+    subject (a named pod, or a workload whose pods we listed), the kubernetes
+    collector already fetched the real pods into ``details["pod_statuses"]`` — each
+    entry carries a top-level ``name``. Surface those so the dashboard can show the
+    impacted pods. Returns ``[]`` for unscoped (namespace/node-only) investigations,
+    where a pod listing would not represent "affected" pods.
+    """
+    for result in results:
+        if getattr(result, "agent", "") != "kubernetes":
+            continue
+        details = result.details if isinstance(result.details, dict) else None
+        if not details:
+            return []
+        scoped = bool(
+            str(details.get("workload_name") or "").strip()
+            or str(details.get("pod") or "").strip()
+        )
+        if not scoped:
+            return []
+        statuses = details.get("pod_statuses")
+        if not isinstance(statuses, list):
+            return []
+        names: list[str] = []
+        seen: set[str] = set()
+        for entry in statuses:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            if not isinstance(name, str):
+                meta = entry.get("metadata")
+                name = meta.get("name") if isinstance(meta, dict) else None
+            if isinstance(name, str):
+                cleaned = name.strip()
+                if cleaned and cleaned not in seen:
+                    seen.add(cleaned)
+                    names.append(cleaned)
+        return names[:25]
+    return []
+
+
 def _lifecycle_signal(
     results: list[CollectorResult], component: str, chain: list[str]
 ) -> dict[str, object]:
@@ -670,6 +714,8 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             body = "\n".join(f"- {question}" for question in questions)
             state.detail = _insert_before_appendix(state.detail, f"{header}\n\n{body}")
 
+    affected_pods = _affected_pods_from_results(state.results)
+
     state.response = AlertAnalysisResponse(
         status="ok",
         thread_ts=request.thread_ts,
@@ -684,11 +730,13 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         missing_data=state.missing,
         warnings=state.warnings,
         capabilities=state.capabilities,
+        affected_pods=affected_pods,
         context={
             "target": state.target.__dict__,
             "nemo_runtime": "enabled" if state.runtime_label == "enabled" else "fallback",
             "occurrence_count": request.occurrence_count,
             "occurrence_pods": request.occurrence_pods,
+            "affected_pods": affected_pods,
             "similar_incidents": [
                 item.model_dump(mode="json") for item in request.similar_incidents
             ],
@@ -2107,6 +2155,8 @@ def _alert_text(request: AlertAnalysisRequest) -> str:
 def _observed_text(
     results: list[CollectorResult], request: AlertAnalysisRequest | None = None
 ) -> str:
+    from app.services.root_cause_ranking import COLLECTOR_TEXT_DROP_KEYS
+
     parts: list[str] = []
     if request is not None:
         # The alert message itself is evidence: signature matching (symptoms, known
@@ -2116,6 +2166,7 @@ def _observed_text(
     for result in results:
         if not _collector_is_evidence(result):
             continue
+        drop_keys = COLLECTOR_TEXT_DROP_KEYS.get(getattr(result, "agent", ""))
         if result.summary:
             parts.append(result.summary)
         for art in result.artifacts:
@@ -2124,18 +2175,27 @@ def _observed_text(
             if art.summary:
                 parts.append(art.summary)
             if art.result is not None:
-                parts.append(_evidence_leaf_text(art.result, limit=2000))
+                parts.append(_evidence_leaf_text(art.result, limit=2000, drop_keys=drop_keys))
     return " ".join(parts).lower()
 
 
-def _evidence_leaf_text(value: Any, *, limit: int = 2000) -> str:
+def _evidence_leaf_text(
+    value: Any, *, limit: int = 2000, drop_keys: "frozenset[str] | set[str] | None" = None
+) -> str:
     """Evidence matching should see RETURNED values — not JSON key names, and not
     the probe text we sent (queries/paths/urls/name listings; see
     root_cause_ranking.METADATA_VALUE_KEYS). A LogQL probe carrying
-    "cluster-sync" must not signature-match a cluster-sync symptom."""
+    "cluster-sync" must not signature-match a cluster-sync symptom.
+
+    ``drop_keys`` prunes whole subtrees whose dict key matches (case-insensitive) —
+    the kubernetes ``queries`` firehose embeds the RAW node/pod objects, and a
+    healthy node literally contains "DiskPressure"/"MemoryPressure" type names, so
+    it must be dropped here exactly as it is for the family ranker
+    (COLLECTOR_TEXT_DROP_KEYS) or a healthy node signature-matches node-pressure."""
     from app.services.root_cause_ranking import METADATA_VALUE_KEYS
 
     parts: list[str] = []
+    drop = {k.lower() for k in drop_keys} if drop_keys else None
 
     def add(text: object) -> None:
         if len(" ".join(parts)) < limit:
@@ -2145,14 +2205,20 @@ def _evidence_leaf_text(value: Any, *, limit: int = 2000) -> str:
         if node is None:
             return
         key_l = key.lower()
+        # Prune metadata-key subtrees BEFORE recursing (mirrors _leaf_text): a
+        # metadata key can hold a dict/list (e.g. a prometheus ``metric`` label
+        # set), and checking only at the scalar leaf let those identity literals
+        # ("DiskPressure", status "true") leak and signature-match a healthy node.
+        if key_l in METADATA_VALUE_KEYS:
+            return
         if isinstance(node, dict):
             for child_key, child in node.items():
+                if drop and str(child_key).lower() in drop:
+                    continue
                 walk(child, str(child_key))
         elif isinstance(node, (list, tuple)):
             for child in node:
                 walk(child, key)
-        elif key_l in METADATA_VALUE_KEYS:
-            return
         elif key_l in {"xid", "xid_code", "nvidia_xid"}:
             add(f"xid {node}")
         elif isinstance(node, (str, int, float, bool)):

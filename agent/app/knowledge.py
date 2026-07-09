@@ -138,9 +138,6 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "pidpressure",
             "node pressure",
             "evict",
-            "kubelet",
-            "device plugin",
-            "node condition",
         ),
     ),
     "runai_scheduling_quota": (
@@ -172,7 +169,7 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "anti-affinity",
             "exceeded quota",
             "default-scheduler",
-            "0/",
+            "nodes are available",
         ),
     ),
     "runai_control_plane_error": (

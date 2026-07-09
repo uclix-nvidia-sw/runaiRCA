@@ -15,10 +15,12 @@ export type IncidentFilters = {
   status?: string;
   severity?: string;
   finalDecision?: string;
+  search?: string;
 };
 export type AlertFilters = {
   status?: string;
   severity?: string;
+  search?: string;
 };
 
 async function read<T>(path: string): Promise<T> {
@@ -52,6 +54,7 @@ export async function fetchIncidents(page?: PageRequest, view: IncidentView = 'a
       status: filters.status,
       severity: filters.severity,
       final_decision: filters.finalDecision,
+      q: filters.search,
     })}`,
   );
   return pageResult(response, page);
@@ -70,6 +73,7 @@ export async function fetchAlerts(page?: PageRequest, filters: AlertFilters = {}
     `/api/v1/alerts${pageQuery(page, {
       status: filters.status,
       severity: filters.severity,
+      q: filters.search,
     })}`,
   );
   return pageResult(response, page);
