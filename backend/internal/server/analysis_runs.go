@@ -231,6 +231,11 @@ func (s *Server) backfillOnce() int {
 	ids := s.store.AlertIDsNeedingAnalysis(batch, s.backfillRetryCooldown, time.Now().UTC())
 	started := 0
 	for _, id := range ids {
+		// Respect the auto-analysis severity gate so backfill doesn't re-drive the
+		// severities the webhook fan-out intentionally skipped (e.g. Watchdog/none).
+		if alert, ok := s.store.AlertDetail(id); ok && !s.severityAutoAnalyzable(alert.Severity) {
+			continue
+		}
 		if _, ok := s.startAnalysisRun("alert", id, "backfill", ""); ok {
 			started++
 		}

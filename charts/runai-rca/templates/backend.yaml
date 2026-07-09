@@ -80,6 +80,8 @@ spec:
               value: {{ .Values.backend.env.manualAgentRequestTimeoutSeconds | quote }}
             - name: MAX_AUTO_ANALYZE_FANOUT
               value: {{ .Values.backend.env.maxAutoAnalyzeFanout | quote }}
+            - name: AUTO_ANALYZE_SEVERITIES
+              value: {{ .Values.backend.env.autoAnalyzeSeverities | quote }}
             - name: MAX_CONCURRENT_AGENT_RUNS
               value: {{ .Values.backend.env.maxConcurrentAgentRuns | quote }}
             - name: FLAPPING_GROUP_WINDOW_MINUTES

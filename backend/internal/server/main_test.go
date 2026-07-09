@@ -1529,16 +1529,19 @@ func TestIncidentMemoryIsOnePerIncidentFromLatestRun(t *testing.T) {
 	}
 	store.mu.Unlock()
 
-	store.ApplyAnalysis(first.AlertID, AgentAnalysisResponse{
-		Status:          "ok",
-		AnalysisSummary: "Queue saturation RCA.",
-		AnalysisDetail:  "Queue workers are waiting.",
-	})
-	store.ApplyAnalysis(secondID, AgentAnalysisResponse{
-		Status:          "ok",
-		AnalysisSummary: "Quota exhaustion RCA.",
-		AnalysisDetail:  "GPU quota is exhausted.",
-	})
+	// Seed two completed runs with distinct timestamps so "latest" is deterministic.
+	base := first.FiredAt
+	store.mu.Lock()
+	store.analysisRuns["RUN-first"] = &AnalysisRun{
+		RunID: "RUN-first", Status: "complete", IncidentID: incident.IncidentID, AlertID: first.AlertID,
+		AnalysisSummary: "Queue saturation RCA.", AnalysisDetail: "Queue workers are waiting.", UpdatedAt: base,
+	}
+	store.analysisRuns["RUN-second"] = &AnalysisRun{
+		RunID: "RUN-second", Status: "complete", IncidentID: incident.IncidentID, AlertID: secondID,
+		AnalysisSummary: "Quota exhaustion RCA.", AnalysisDetail: "GPU quota is exhausted.",
+		UpdatedAt: base.Add(time.Minute),
+	}
+	store.mu.Unlock()
 
 	if len(store.memories) != 0 {
 		t.Fatalf("unresolved analysis should not create memory, got %+v", store.memories)
@@ -2668,6 +2671,26 @@ func TestResolvedThenRefiringGrowsOccurrence(t *testing.T) {
 	}
 	if r2.Incident.AlertCount != 2 {
 		t.Fatalf("resolved→re-fire must grow incident AlertCount to 2, got %d", r2.Incident.AlertCount)
+	}
+}
+
+func TestAutoAnalyzeSeverityGate(t *testing.T) {
+	if parseAutoAnalyzeSeverities("") != nil || parseAutoAnalyzeSeverities("all") != nil || parseAutoAnalyzeSeverities("*") != nil {
+		t.Fatalf("empty/all/* should mean no severity gating")
+	}
+	set := parseAutoAnalyzeSeverities("warning, Critical")
+	if !set["warning"] || !set["critical"] || set["none"] {
+		t.Fatalf("expected {warning,critical}, got %+v", set)
+	}
+	gated := &Server{autoAnalyzeSeverities: set}
+	if !gated.severityAutoAnalyzable("warning") || !gated.severityAutoAnalyzable("CRITICAL") {
+		t.Fatalf("warning/critical must be auto-analyzable")
+	}
+	if gated.severityAutoAnalyzable("none") || gated.severityAutoAnalyzable("info") {
+		t.Fatalf("none/info must be gated out of auto-analysis")
+	}
+	if !(&Server{}).severityAutoAnalyzable("none") {
+		t.Fatalf("a nil allowlist must auto-analyze every severity")
 	}
 }
 

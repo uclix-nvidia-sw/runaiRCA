@@ -262,6 +262,9 @@ type Server struct {
 	autoAnalyzeMu             sync.Mutex
 	autoAnalyzeStarts         []time.Time
 	autoAnalyzeFanout         int
+	// Severities eligible for AUTO analysis. nil = every ingested severity (except
+	// info, dropped by ignoredAlert). Manual analysis is never gated by this.
+	autoAnalyzeSeverities map[string]bool
 	backfillInterval          time.Duration
 	backfillBatch             int
 	backfillRetryCooldown     time.Duration
@@ -296,6 +299,39 @@ func (s *Server) autoFanoutLimit() int {
 		return s.autoAnalyzeFanout
 	}
 	return maxAutoAnalyzeFanout
+}
+
+// parseAutoAnalyzeSeverities parses AUTO_ANALYZE_SEVERITIES (e.g. "warning,critical").
+// Empty / "all" / "*" -> nil, meaning no severity gating (auto-analyze every ingested
+// severity). Otherwise only the listed severities are auto-analyzed.
+func parseAutoAnalyzeSeverities(raw string) map[string]bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.EqualFold(raw, "all") || raw == "*" {
+		return nil
+	}
+	set := map[string]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		if v := strings.ToLower(strings.TrimSpace(part)); v != "" {
+			set[v] = true
+		}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	return set
+}
+
+// severityAutoAnalyzable reports whether a severity is eligible for AUTO analysis
+// (webhook fan-out + backfill). Manual/comment re-analysis is never gated by this.
+func (s *Server) severityAutoAnalyzable(sev string) bool {
+	if s.autoAnalyzeSeverities == nil {
+		return true
+	}
+	return s.autoAnalyzeSeverities[strings.ToLower(strings.TrimSpace(sev))]
+}
+
+func (s *Server) autoAnalyzeAllowed(alert Alert) bool {
+	return s.severityAutoAnalyzable(severity(alert))
 }
 
 func Run() {
@@ -386,6 +422,7 @@ func NewServer() *Server {
 		client:                    &http.Client{},
 		agentSlots:                make(chan struct{}, concurrency),
 		autoAnalyzeFanout:         autoFanout,
+		autoAnalyzeSeverities:     parseAutoAnalyzeSeverities(getenv("AUTO_ANALYZE_SEVERITIES", "")),
 		// Backfill re-drives alerts left without a completed RCA (dropped by the
 		// caps, or a prior failed run). Interval 0 disables it.
 		backfillInterval:      time.Duration(getenvInt("ANALYSIS_BACKFILL_INTERVAL_SECONDS", 300)) * time.Second,

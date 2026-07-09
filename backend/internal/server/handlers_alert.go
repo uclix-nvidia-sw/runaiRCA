@@ -33,7 +33,7 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 		if result.Changed {
 			s.hub.Broadcast(alertCreatedEvent(incident, record))
 		}
-		if status(alert.Status) != "resolved" {
+		if status(alert.Status) != "resolved" && s.autoAnalyzeAllowed(alert) {
 			if _, queued := autoAlertIDs[record.AlertID]; !queued {
 				autoAlertIDs[record.AlertID] = struct{}{}
 				autoAlertOrder = append(autoAlertOrder, record.AlertID)
