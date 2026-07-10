@@ -58,7 +58,6 @@ flowchart LR
 | `affected_workloads_for_node` | 노드 blast radius | 영향 범위 |
 | `approved_incidents_for_cause` / `evidence_for_approved_cause` | 승인된 과거 사례 | synthesis 문맥만 |
 | `verified_actions_for_family` | 운영자가 효과를 확인한 조치 | 과거 해결 가이드 |
-| `ancestor_xids_for` | XID 인과 체인 재귀 조회 | GPU remediation |
 
 과거 evidence는 현재 RCA의 근거가 될 수 없고, TypeDB prior만으로 high confidence가
 만들어지지 않습니다. graph bonus는 최대 2점이며 live evidence 또는 확정 signature가

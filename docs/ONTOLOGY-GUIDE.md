@@ -59,7 +59,6 @@ cannot survive as current evidence.
 | `affected_workloads_for_node` | Node blast radius | impact context |
 | `approved_incidents_for_cause` / `evidence_for_approved_cause` | Approved historical context | synthesis only |
 | `verified_actions_for_family` | Actions confirmed effective by an operator | labelled historical guidance |
-| `ancestor_xids_for` | Recursive XID causal chain | GPU remediation |
 
 Historical context can never satisfy the current RCA's evidence gate or create
 high confidence by itself. The ranker caps graph corroboration at two points and
