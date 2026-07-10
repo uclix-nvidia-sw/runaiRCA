@@ -58,6 +58,9 @@ class AlertAnalysisRequest(BaseModel):
 
 
 class AlertAnalysisArtifact(BaseModel):
+    # Stable within one analysis response (E01, E02, ...). The TypeDB ingest
+    # qualifies this with run_id, so the same readable ID may safely recur later.
+    evidence_id: str | None = None
     agent: str
     source: str
     type: str

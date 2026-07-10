@@ -11,13 +11,15 @@ runtime flow; this document is the data-structure reference.
 | **PostgreSQL** | Operational source of truth: incidents, alerts, RCA results, operator feedback, similarity vectors | Go backend | Yes (in-memory fallback for local dev) |
 | **TypeDB** | Ontology knowledge graph: typed entities + relations for relational reasoning at synthesis | Agent | No (`typedb.enabled`, default on in Helm) |
 
-The graph is **derived from** Postgres — a review-gated projection, not a second
-source of truth.
+The graph is **derived from** Postgres — an eligibility-gated projection, not a
+second source of truth. By default it contains resolved incidents after the
+grace period; set `typedb.ingest.requireReview=true` to make operator approval
+an additional gate.
 
 ```mermaid
 flowchart LR
   BE[Backend] <-->|"read/write · pgvector similarity"| PG[(PostgreSQL + pgvector)]
-  PG -.->|review-gated ingestion| TDB[(TypeDB ontology)]
+  PG -.->|eligible-incident ingestion| TDB[(TypeDB ontology)]
   BE -->|similar_incidents + feedback_hints| AG[Agent orchestrator]
   AG -->|"enrich / graph_remediation"| TDB
 ```
@@ -95,9 +97,9 @@ the [Knowledge Base](KNOWLEDGE-BASE.md) doc.
 | Status | Entities / relations |
 |---|---|
 | ✅ Populated (`ontology/ingest.py`) | infra + incident layer + topology/`grouped_into` |
-| ✅ Knowledge (`load_knowledge` / `load_xids` / `load_alerts` / `load_known_issues` / `load_architecture`) | `symptom`/`root_cause`/`action` + `indicates`/`resolved_by`, `xid_error` + `leads_to`, `control_plane_component` + `depends_on` |
+| ✅ Knowledge (`load_knowledge` / `load_troubleshooting` / other `load_*`) | symptom/cause/action plus executable runbook steps, transitions, outcomes, recommendations, XIDs, and component dependencies |
 | 🟦 Promoted (`ingest.py --promote-knowledge`) | `confirmed:<alert>` symptom → family → action, from operator-confirmed RCAs |
-| ⬜ Modeled, not yet fed | `evidence`, `runbook`, `analysis_run`, `similar_to`, `supported_by`, GPU attrs |
+| ⬜ Modeled, not yet fed | `evidence`, `analysis_run`, `similar_to`, `supported_by`, GPU attrs |
 
 ---
 
@@ -106,8 +108,8 @@ the [Knowledge Base](KNOWLEDGE-BASE.md) doc.
 | Path | Script | Source | Gate |
 |---|---|---|---|
 | Schema + functions | `load_schema` / `load_functions` | `schema.tql` / `functions.tql` | Helm post-install/upgrade hook (`typedb-schema-job.yaml`) |
-| Curated knowledge | `load_knowledge`, `load_xids`, `load_alerts`, `load_known_issues`, `load_architecture` | the `knowledge/` catalogs | Version-controlled files, run in the schema job |
-| Topology + incidents | `ontology/ingest.py` (CronJob) | Postgres `incidents`/`alerts` | Resolved ≥ `resolvedGraceHours` ago; review-gated unless `requireReview=false` |
+| Curated knowledge | `load_knowledge`, `load_troubleshooting`, `load_xids`, `load_alerts`, `load_known_issues`, `load_architecture` | the `knowledge/` catalogs | Version-controlled files, run in the schema job |
+| Topology + incidents | `ontology/ingest.py` (CronJob) | Postgres `incidents`/`alerts` | Resolved ≥ `resolvedGraceHours` ago; default `requireReview=false` includes eligible incidents regardless of approval, `true` requires `user_approved_at` |
 | Knowledge promotion | `ingest.py --promote-knowledge` | operator-confirmed RCAs | Resolved + net-positive feedback |
 
 The **orchestrator** consults TypeDB during analysis

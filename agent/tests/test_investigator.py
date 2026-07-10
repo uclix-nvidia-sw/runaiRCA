@@ -23,9 +23,11 @@ class RunaiCollector:
 class KubernetesCollector:
     def __init__(self) -> None:
         self.calls = 0
+        self.last_plan = None
 
     async def collect(self, target, plan=None) -> CollectorResult:
         self.calls += 1
+        self.last_plan = plan
         return CollectorResult(agent="kubernetes", status="ok", summary="kubernetes ok")
 
 
@@ -111,6 +113,24 @@ def test_investigation_prompt_orders_stable_prefix_and_keeps_latest_evidence() -
     assert "OLDEST-SIGNAL" not in prompt
 
 
+def test_investigator_prompt_receives_ontology_diagnostic_directive() -> None:
+    plan = InvestigationPlan(
+        diagnostic_directive={
+            "source": "typedb",
+            "questions": ["Did the node report an XID before the timeout?"],
+            "checks": ["Compare dmesg and per-rank timestamps"],
+            "disconfirm": ["The XID is outside the incident window"],
+            "provisional_family": "gpu_hardware_error",
+        }
+    )
+
+    prompt = _build_user_prompt(plan, {}, {}, {"system": object()}, [], adhoc=[])
+
+    assert '"source": "typedb"' in prompt
+    assert "per-rank timestamps" in prompt
+    assert "outside the incident window" in prompt
+
+
 @pytest.mark.asyncio
 async def test_no_llm_falls_back_to_full_gather() -> None:
     # No LLM configured -> complete_json returns None -> loop bails, full gather runs.
@@ -121,6 +141,24 @@ async def test_no_llm_falls_back_to_full_gather() -> None:
 
     assert {r.agent for r in results} == {"runai", "kubernetes", "loki"}
     assert all(c.calls == 1 for c in collectors)
+
+
+@pytest.mark.asyncio
+async def test_each_collector_receives_an_ontology_scoped_role() -> None:
+    collector = KubernetesCollector()
+    plan = InvestigationPlan(
+        diagnostic_directive={
+            "checks": ["Read pod events"],
+            "recommended_collectors": ["kubernetes"],
+        }
+    )
+
+    await investigate(make_settings(), make_target(), [collector], plan, {}, max_steps=1)
+
+    directive = collector.last_plan.diagnostic_directive
+    assert directive["collector"] == "kubernetes"
+    assert directive["primary"] is True
+    assert "disconfirming evidence" in directive["collector_instruction"]
 
 
 @pytest.mark.asyncio

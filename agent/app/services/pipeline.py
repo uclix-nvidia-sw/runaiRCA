@@ -8,7 +8,6 @@ import time
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
-from pathlib import Path
 from typing import Any, TypeVar
 
 from pydantic import BaseModel
@@ -41,7 +40,7 @@ from app.plan import InvestigationPlan
 from app.progress import ProgressReporter
 from app.prompts import load_agent_souls
 from app.schemas import AlertAnalysisRequest, AlertAnalysisResponse
-from app.services.decision_tree import load_tree, walk_tree
+from app.services.decision_tree import resolve_tree, walk_tree
 from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
 from app.services.planner import plan_investigation
 from app.services.root_cause_ranking import RankedCause, rank_root_cause_candidates
@@ -119,7 +118,12 @@ def new_state(
     collectors: list[object] | None = None,
     runtime_label: str = "fallback",
 ) -> PipelineState:
-    target = resolve_target(request.alert.labels, request.alert.annotations)
+    target = resolve_target(
+        request.alert.labels,
+        request.alert.annotations,
+        fired_at=request.alert.startsAt or "",
+        resolved_at=request.alert.endsAt or "",
+    )
     masker = _build_settings_masker(settings)
     return PipelineState(
         settings=settings,
@@ -135,7 +139,11 @@ def new_state(
 def _aggregate_evidence(state: PipelineState) -> None:
     kg_warnings = getattr(state.kg_context, "warnings", []) if state.kg_context is not None else []
     state.capabilities = {result.agent: result.status for result in state.results}
-    state.artifacts = [artifact for result in state.results for artifact in result.artifacts]
+    # Evidence IDs are assigned after every collector has completed. They are
+    # response-local, deterministic, and become run-qualified during TypeDB ingest.
+    from app.services.harness import assign_evidence_ids
+
+    state.artifacts = assign_evidence_ids(state.results)
     state.missing = sorted({item for result in state.results for item in result.missing_data})
     state.warnings = sorted(
         {item for result in state.results for item in result.warnings}
@@ -158,8 +166,8 @@ async def enrich_stage(state: PipelineState) -> PipelineState:
         target.node,
         target.workload_name,
     )
-    # Knowledge graph is consulted once here, at synthesis time, as a
-    # knowledge resource for the final RCA — not as a parallel collector.
+    # Knowledge graph is consulted once here before planning, then the same
+    # snapshot guides collectors and final synthesis — not a parallel collector.
     state.kg_context = await enrich(state.settings, target)
     return state
 
@@ -480,13 +488,52 @@ async def rank_stage(state: PipelineState) -> PipelineState:
     # the k8s node-conditions text even when every condition is False).
     state.observed = _observed_text(state.results, request)
     state.xid_codes = _xid_codes_from_results(state.results, _alert_text(request))
-    state.failure_modes = load_failure_modes(settings.failure_modes_file)
+    # TypeDB is the runtime source of truth. The version-controlled YAML matcher
+    # remains only for deployments where the graph is disabled/unavailable.
+    state.failure_modes = (
+        state.kg_context.knowledge
+        or load_failure_modes(settings.failure_modes_file)
+    )
     state.known_issues = load_runai_known_issues(settings.runai_known_issues_file)
     # Version-aware precision: drop known issues already fixed in the cluster's
     # running Run:ai version so we don't attribute a symptom to a patched bug.
     state.known_issues = _suppress_fixed_known_issues(
         state.known_issues, _runai_version_from(state.results)
     )
+    # TypeDB only sees approved historical incidents. It can corroborate a
+    # symptom already observed live, but never supplies evidence by itself.
+    symptom_names = [
+        str(symptom.get("symptom") or "")
+        for _family, symptom in match_failure_mode_symptoms(state.failure_modes, state.observed)
+        if isinstance(symptom, dict)
+    ]
+    if state.target.alert_name:
+        symptom_names.append(state.target.alert_name)
+    try:
+        from app.services.kg_enrichment import candidate_families_for_symptoms
+
+        graph_counts, graph_warnings = await candidate_families_for_symptoms(
+            settings, symptom_names
+        )
+    except Exception:  # noqa: BLE001 - graph prior is optional
+        graph_counts, graph_warnings = {}, []
+    if graph_warnings:
+        state.extra_warnings.extend(graph_warnings)
+    if graph_counts:
+        state.root_cause_candidates = rank_root_cause_candidates(
+            state.target,
+            state.results,
+            occurrence_count=request.occurrence_count,
+            kg_blast_radius=state.kg_context.blast_radius_workloads,
+            priors=state.priors,
+            component_family=comp_family,
+            component=comp_name,
+            depends_on_chain=comp_chain,
+            lifecycle=lifecycle,
+            graph_candidate_counts=graph_counts,
+        )
+        if isinstance(getattr(state.kg_context, "reasoning", None), dict):
+            state.kg_context.reasoning["candidate_families"] = graph_counts
     # Fuzzy recall (BM25+synonyms, app.bm25) queries the alert's OWN text only:
     # collector summaries would feed pipeline boilerplate to the matcher. And it
     # informs, never headlines: promotion below stays exact-signature-only (a
@@ -583,10 +630,14 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         pass
     else:
         state.timeline = build_timeline(state.results)
-    state.troubleshooting_path = walk_tree(
-        load_tree(_k8s_troubleshooting_tree_path(settings)),
-        _observed_text(state.results, request),
+    diagnostic_tree, diagnostic_source = resolve_tree(
+        getattr(state.kg_context, "diagnostic_tree", {}), settings.failure_modes_file
     )
+    state.troubleshooting_path = walk_tree(
+        diagnostic_tree, _observed_text(state.results, request)
+    )
+    if state.troubleshooting_path.get("path"):
+        state.troubleshooting_path["source"] = diagnostic_source
     state.quality = _quality_from(state.results)
     # Adversarial precision: LLM-verify signature/keyword matches (known issues,
     # failure-mode symptoms, GPU XIDs) and drop ones the evidence doesn't support.
@@ -749,7 +800,8 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             "top_root_cause": (
                 state.root_cause_candidates[0].as_dict() if state.root_cause_candidates else None
             ),
-            "knowledge_base": state.kg_context.as_dict(),
+            "knowledge_base": state.kg_context.public_dict(),
+            "ontology_reasoning": state.kg_context.as_dict().get("reasoning", {}),
             "plan": plan.as_dict(),
             "hypothesis_ledger": state.investigation_context.get("hypothesis_ledger"),
             "investigation": state.investigation_context,
@@ -763,6 +815,79 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         artifacts=state.artifacts,
     )
     state.response = _mask_model(state.response, AlertAnalysisResponse, state.masker)
+    return state
+
+
+async def harness_stage(state: PipelineState) -> PipelineState:
+    """Validate the already-synthesized RCA and make bounded safe repairs."""
+    from app.services.harness import (
+        abstain,
+        analysis_hash,
+        apply_confidence_downgrade,
+        apply_safety_guardrail,
+        apply_trace,
+        evaluate,
+        payload,
+    )
+
+    response = state.response
+    assert response is not None
+    if not state.settings.enable_rca_output_harness:
+        response.context["harness"] = {
+            "rubric_version": "1",
+            "status": "disabled",
+            "repair_attempts": 0,
+        }
+        response.context["analysis_hash"] = analysis_hash(response)
+        return state
+
+    repairs = 0
+    verdict = evaluate(
+        response,
+        state.results,
+        state.root_cause_candidates,
+        next_check=state.self_check_next,
+    )
+    for _ in range(state.settings.max_rca_repair_attempts):
+        if not verdict.failed_gates and verdict.score >= state.settings.rca_harness_pass_score:
+            break
+        changed = False
+        if verdict.gates["missing_evidence_trace"]:
+            changed = apply_trace(response, verdict) or changed
+        if verdict.gates["unsafe_action_without_guardrail"]:
+            changed = apply_safety_guardrail(response) or changed
+        if verdict.gates["unsupported_high_confidence"]:
+            changed = apply_confidence_downgrade(state.root_cause_candidates) or changed
+        if not changed:
+            break
+        repairs += 1
+        verdict = evaluate(
+            response,
+            state.results,
+            state.root_cause_candidates,
+            next_check=state.self_check_next,
+        )
+
+    status = "pass"
+    if verdict.failed_gates:
+        abstain(response, state.root_cause_candidates, verdict)
+        verdict = evaluate(response, state.results, state.root_cause_candidates, next_check=state.self_check_next)
+        status = "abstained"
+    elif verdict.score < state.settings.rca_harness_pass_score:
+        response.analysis_quality = "degraded"
+        response.warnings = sorted(set(response.warnings) | {"RCA harness quality score below threshold"})
+        status = "degraded"
+
+    top = state.root_cause_candidates[0] if state.root_cause_candidates else None
+    response.root_cause_family = top.family if top else ""
+    response.context["root_cause_candidates"] = [
+        candidate.as_dict() for candidate in state.root_cause_candidates
+    ]
+    response.context["top_root_cause"] = top.as_dict() if top else None
+    response.context["harness"] = payload(verdict, status=status, repairs=repairs)
+    response.context["analysis_hash"] = analysis_hash(response)
+    response.analysis = response.analysis_detail
+    state.response = response
     return state
 
 
@@ -783,6 +908,7 @@ async def run_pipeline(
     await _investigate_until_settled(state)
 
     state = await stages.get("synthesize", synthesize_stage)(state)
+    state = await stages.get("harness", harness_stage)(state)
     assert state.response is not None
     return state.response
 
@@ -1200,6 +1326,9 @@ async def _synthesize_korean(
         "드레인, MIG/설정 변경 등. 스케줄러·증상성 경고(예: PodGroup Warning)보다 '무엇이 바뀌어 "
         "이 알림이 촉발됐는가'를 먼저 의심하고, 시간 순서(변경 → 결과 → 알림)로 인과를 설명하세요.\n"
         "- 증거에 troubleshooting_path가 있으면 그 steps를 사용해 진단 흐름을 단계별로 설명하세요. "
+        "steps 안의 alternatives는 동시에 성립한 경쟁 가설이므로, 선택한 경로와 함께 무엇을 추가로 "
+        "확인하면 반증되는지 설명하세요. principles와 conclusion.disconfirm이 있으면 성급한 확정을 "
+        "막는 검증 규칙으로 적용하세요. "
         "단, troubleshooting_path의 conclusion은 보강 근거일 뿐이며 XID/known-issue 같은 정밀 "
         "signature 또는 ranked_root_cause_candidates의 1순위 원인을 절대 덮어쓰지 마세요.\n"
         "- 반드시 이 문서 구조를 따르세요 (Word 제출용이므로 헤딩/번호목록만 사용, 표·HTML 금지):\n"
@@ -1326,7 +1455,9 @@ async def _collect_safely(
     collector: object, target: object, plan: object = None, masker: Masker | None = None
 ) -> CollectorResult:
     try:
-        return await collector.collect(target, plan)  # type: ignore[attr-defined]
+        agent = _collector_name(collector)
+        scoped_plan = plan.for_collector(agent) if isinstance(plan, InvestigationPlan) else plan
+        return await collector.collect(target, scoped_plan)  # type: ignore[attr-defined]
     except Exception as exc:
         agent = _collector_name(collector)
         error = _masked_exception_text(exc, masker)
@@ -1367,14 +1498,6 @@ def _build_settings_masker(settings: Settings) -> Masker:
         builtin_enabled=settings.builtin_redaction_enabled,
         hash_mode=settings.builtin_redaction_hash_mode,
     )
-
-
-def _k8s_troubleshooting_tree_path(settings: Settings) -> str:
-    base = Path(settings.failure_modes_file or "knowledge/failure_modes.yaml")
-    try:
-        return str(base.with_name("k8s_troubleshooting_tree.yaml"))
-    except ValueError:
-        return "knowledge/k8s_troubleshooting_tree.yaml"
 
 
 def _mask_model(model: TModel, model_type: type[TModel], masker: Masker) -> TModel:
@@ -2876,6 +2999,11 @@ def _graph_remediation_lines(graph_fixes: GraphRemediation | None) -> list[str]:
     lines = ["- Knowledge-graph derived remediation:"]
     for statement in graph_fixes.family_fixes[:5]:
         lines.append(f"  - {_safe_line(statement, limit=360, masker=masker)}")
+    for statement in graph_fixes.verified_actions[:5]:
+        lines.append(
+            f"  - Verified in an approved historical resolution: "
+            f"{_safe_line(statement, limit=360, masker=masker)}"
+        )
     for code, fixes in graph_fixes.xid_fixes.items():
         lines.append(f"  - NVIDIA Xid {code}:")
         lines.extend(

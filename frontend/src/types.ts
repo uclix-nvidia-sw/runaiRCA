@@ -1,4 +1,5 @@
 export type Artifact = {
+  evidence_id?: string;
   agent: string;
   source: string;
   type: string;
@@ -56,6 +57,33 @@ export type FeedbackSummary = {
   comments: CommentRecord[];
   learning_hints?: FeedbackHint[];
 };
+
+export type EvaluationReview = {
+  review_id: string;
+  run_id: string;
+  analysis_hash: string;
+  reviewer: string;
+  case_type: 'known' | 'compositional' | 'novel' | 'tool_degraded';
+  expected_family?: string;
+  scores: Record<string, number>;
+  hard_gates: Record<string, boolean>;
+  resolution_outcome: 'resolved' | 'mitigated' | 'ineffective' | 'unknown';
+  effective_action?: string;
+  notes?: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type EvaluationView = {
+  run_id: string;
+  analysis_hash: string;
+  harness?: Record<string, unknown>;
+  my_review?: EvaluationReview;
+  reviews: EvaluationReview[];
+  average_score: number;
+};
+
+export type EvaluationReviewInput = Omit<EvaluationReview, 'review_id' | 'run_id' | 'reviewer' | 'created_at' | 'updated_at'>;
 
 export type AnalysisProgressEntry = {
   seq?: number;
@@ -129,6 +157,8 @@ export type AlertRecord = {
 };
 
 export type IncidentDetail = Incident & {
+  analysis_run_id?: string;
+  analysis_hash?: string;
   analysis_summary: string;
   analysis_detail: string;
   analysis_quality: string;
@@ -139,6 +169,8 @@ export type IncidentDetail = Incident & {
   similar_incidents: SimilarIncident[];
   similar_recent_count: number;
   token_usage?: Record<string, unknown>;
+  harness?: Record<string, unknown>;
+  ontology_reasoning?: Record<string, unknown>;
   feedback: FeedbackSummary;
   alerts: AlertRecord[];
 };

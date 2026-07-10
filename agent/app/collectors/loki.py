@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
@@ -107,7 +108,9 @@ class LokiCollector:
         used_mcp = False
         if self._settings.loki_mcp_url:
             try:
-                query_results = await _collect_loki_mcp(self._settings, queries)
+                query_results = await _collect_loki_mcp(
+                    self._settings, queries, _incident_time_range(target)
+                )
                 used_mcp = True
             except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
                 warnings.append(mcp_fallback_warning(exc))
@@ -137,7 +140,9 @@ class LokiCollector:
                         )
                     ],
                 )
-            query_results = await _collect_loki_direct(self._settings, queries, warnings)
+            query_results = await _collect_loki_direct(
+                self._settings, queries, warnings, _incident_time_range(target)
+            )
 
         successful = [item for item in query_results if not item["error"]]
         populated = [item for item in successful if item["line_count"]]
@@ -286,7 +291,10 @@ def _loki_headers(settings: Settings) -> tuple[dict[str, str], list[str]]:
 
 
 async def _collect_loki_direct(
-    settings: Settings, queries: list[tuple[str, str]], warnings: list[str]
+    settings: Settings,
+    queries: list[tuple[str, str]],
+    warnings: list[str],
+    time_range: dict[str, str] | None = None,
 ) -> list[dict[str, object]]:
     query_results: list[dict[str, object]] = []
     headers, auth_warnings = _loki_headers(settings)
@@ -300,6 +308,7 @@ async def _collect_loki_direct(
                 "query": query,
                 "limit": str(settings.loki_query_limit),
                 "direction": "BACKWARD",
+                **(time_range or {}),
             },
             headers=headers,
         )
@@ -317,6 +326,7 @@ async def _collect_loki_direct(
                 "sample_lines": _sample_lines(streams),
                 "sample": compact(streams, limit=3),
                 "error": response.error,
+                **({"time_range": time_range} if time_range else {}),
             }
         )
         if response.error:
@@ -327,12 +337,17 @@ async def _collect_loki_direct(
 
 
 async def _collect_loki_mcp(
-    settings: Settings, queries: list[tuple[str, str]]
+    settings: Settings, queries: list[tuple[str, str]], time_range: dict[str, str] | None = None
 ) -> list[dict[str, object]]:
     datasource_uid = await _grafana_datasource_uid(settings.loki_mcp_url, "loki")
     return [
         await _mcp_query_loki(
-            settings.loki_mcp_url, name, query, settings.loki_query_limit, datasource_uid
+            settings.loki_mcp_url,
+            name,
+            query,
+            settings.loki_query_limit,
+            datasource_uid,
+            time_range,
         )
         for name, query in queries
     ]
@@ -346,7 +361,12 @@ async def loki_mcp_query(settings: Settings, name: str, logql: str) -> dict[str,
 
 
 async def _mcp_query_loki(
-    url: str, name: str, logql: str, limit: int, datasource_uid: str = ""
+    url: str,
+    name: str,
+    logql: str,
+    limit: int,
+    datasource_uid: str = "",
+    time_range: dict[str, str] | None = None,
 ) -> dict[str, object]:
     # grafana-mcp's query_loki_logs REQUIRES a real datasourceUid. Sending an empty
     # one (uid unresolved) makes it GET /datasources/uid/ -> 400 "id is invalid" on
@@ -358,7 +378,11 @@ async def _mcp_query_loki(
             "grafana datasource uid unresolved for loki — set "
             "secrets.grafanaServiceAccountToken so grafana-mcp can list datasources"
         )
-    base_args = {"limit": limit, "direction": "BACKWARD"}
+    base_args: dict[str, object] = {"limit": limit, "direction": "BACKWARD"}
+    if time_range:
+        # grafana-mcp expects RFC3339 startTime/endTime, while Loki's direct API
+        # calls them start/end. Keep the conversion at this boundary.
+        base_args.update({"startTime": time_range["start"], "endTime": time_range["end"]})
     args_list: list[dict[str, object]] = [
         {"datasourceUid": datasource_uid, "query": logql, **base_args},
         {"datasourceUid": datasource_uid, "logql": logql, **base_args},
@@ -388,7 +412,46 @@ async def _mcp_query_loki(
         "sample_lines": lines[:8],
         "sample": compact(streams or data, limit=3),
         "error": None,
+        **({"time_range": time_range} if time_range else {}),
     }
+
+
+_INCIDENT_PRELUDE = timedelta(minutes=5)
+_INCIDENT_EPILOGUE = timedelta(minutes=5)
+_FIRING_INCIDENT_DURATION = timedelta(minutes=15)
+
+
+def _incident_time_range(target: AnalysisTarget) -> dict[str, str] | None:
+    """Return a bounded Loki window centered on the alert occurrence.
+
+    Without an Alertmanager start time, leave Loki's normal recent-window default
+    untouched. A firing alert has no trustworthy end time, so cap it at 15 minutes
+    after it began rather than querying from an old firing timestamp through now.
+    """
+    fired = _parse_alert_time(target.fired_at)
+    if fired is None:
+        return None
+    resolved = _parse_alert_time(target.resolved_at)
+    if resolved is None or resolved < fired:
+        resolved = fired + _FIRING_INCIDENT_DURATION
+    return {
+        "start": _format_loki_time(fired - _INCIDENT_PRELUDE),
+        "end": _format_loki_time(resolved + _INCIDENT_EPILOGUE),
+    }
+
+
+def _parse_alert_time(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _format_loki_time(value: datetime) -> str:
+    return value.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 # Grafana datasource uids are ^[a-zA-Z0-9\-_]{1,40}$; a numeric row id or a

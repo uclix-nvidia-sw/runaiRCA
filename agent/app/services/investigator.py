@@ -44,6 +44,7 @@ _COLLECTOR_HINTS = {
     "prometheus": "GPU/node/scheduling metrics, saturation, pending/unschedulable signals.",
     "loki": "Container and control-plane logs (crashes, errors, Xid, stack traces).",
     "system": "Node infra via the per-node agent: syslog/journalctl/dmesg, kernel/Xid.",
+    "change": "Recent Deployment/DaemonSet/Helm/node changes and rollout timing.",
 }
 
 
@@ -58,7 +59,9 @@ def _collector_name(collector: object) -> str:
 async def _collect_safely(collector: object, target: object, plan: object) -> CollectorResult:
     # Mirror the orchestrator: a collector must never raise into the loop.
     try:
-        return await collector.collect(target, plan)  # type: ignore[attr-defined]
+        agent = _collector_name(collector)
+        scoped_plan = plan.for_collector(agent) if isinstance(plan, InvestigationPlan) else plan
+        return await collector.collect(target, scoped_plan)  # type: ignore[attr-defined]
     except Exception as exc:  # noqa: BLE001 - graceful degradation
         agent = _collector_name(collector)
         return CollectorResult(
@@ -318,7 +321,10 @@ async def investigate(
                     "Given the plan, hypothesis ledger, evidence so far, and available "
                     "collectors, decide the next diagnostic step. Pick the hypothesis "
                     "you are testing, probe collectors most likely to confirm/refute it, "
-                    "and update confidence using only observed evidence. You can ALSO "
+                    "and use plan.diagnostic_directive as neutral ontology guidance: "
+                    "follow its checks and disconfirmations, but never treat its "
+                    "provisional_family as observed evidence. Update confidence using "
+                    "only observed evidence. You can ALSO "
                     "run kubectl-style READ-ONLY Kubernetes queries (get/list of an "
                     "allowlisted kind, see adhoc_query_kinds). Conclude once evidence "
                     "is sufficient. Respond with ONLY JSON: "

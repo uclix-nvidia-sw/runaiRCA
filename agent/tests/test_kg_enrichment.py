@@ -99,6 +99,19 @@ def test_enrich_disabled_returns_empty_context() -> None:
     assert ctx.prior_incidents == []
 
 
+def test_public_context_summarizes_instead_of_embedding_diagnostic_graph() -> None:
+    ctx = KGContext(
+        enabled=True,
+        available=True,
+        diagnostic_tree={"root": "root", "nodes": {"root": {}, "leaf": {}}},
+    )
+
+    public = ctx.public_dict()
+
+    assert "diagnostic_tree" not in public
+    assert public["diagnostic_runbook"] == {"available": True, "steps": 2}
+
+
 def test_query_kg_escapes_typeql_literals() -> None:
     class FakeClient:
         def __init__(self) -> None:

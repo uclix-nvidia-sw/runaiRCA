@@ -140,6 +140,51 @@ async def test_loki_mcp_parses_grafana_log_entries(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_loki_mcp_queries_the_alert_time_window(monkeypatch) -> None:
+    query_args: list[dict] = []
+
+    async def fake_mcp_call(url, tool, arguments):
+        if tool == "list_datasources":
+            return _McpResult([{"type": "loki", "uid": "loki"}])
+        query_args.append(arguments)
+        return _McpResult({"status": "success", "data": {"result": []}})
+
+    monkeypatch.setattr(loki, "mcp_call", fake_mcp_call)
+    target = replace(
+        make_target(),
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    await loki.LokiCollector(
+        replace(make_settings(), loki_mcp_url="http://grafana-mcp/mcp")
+    ).collect(target)
+
+    assert query_args
+    assert all(args["startTime"] == "2026-07-10T00:55:00Z" for args in query_args)
+    assert all(args["endTime"] == "2026-07-10T01:15:00Z" for args in query_args)
+
+
+@pytest.mark.asyncio
+async def test_loki_direct_queries_the_alert_time_window(monkeypatch) -> None:
+    direct_args: list[dict] = []
+
+    async def fake_get_json(**kwargs):
+        direct_args.append(kwargs["params"])
+        return JsonResponse(
+            url="http://loki/loki/api/v1/query_range", status_code=200,
+            data={"status": "success", "data": {"result": []}},
+        )
+
+    monkeypatch.setattr(loki, "get_json", fake_get_json)
+    target = replace(make_target(), fired_at="2026-07-10T01:00:00Z")
+    await loki.LokiCollector(replace(make_settings(), loki_url="http://loki")).collect(target)
+
+    assert direct_args
+    assert all(args["start"] == "2026-07-10T00:55:00Z" for args in direct_args)
+    assert all(args["end"] == "2026-07-10T01:20:00Z" for args in direct_args)
+
+
+@pytest.mark.asyncio
 async def test_postgres_collector_uses_mcp_before_asyncpg(monkeypatch) -> None:
     async def fake_mcp_call(url, tool, arguments):
         sql = arguments["sql"].lower()

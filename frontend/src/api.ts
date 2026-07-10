@@ -1,4 +1,4 @@
-import { AlertRecord, AnalysisRun, Envelope, FeedbackSummary, Incident, IncidentDetail, KPIStats, LLMSpendStats, PageInfo, RecurrenceStats } from './types';
+import { AlertRecord, AnalysisRun, Envelope, EvaluationReview, EvaluationReviewInput, EvaluationView, FeedbackSummary, Incident, IncidentDetail, KPIStats, LLMSpendStats, PageInfo, RecurrenceStats } from './types';
 
 const runtimeApiBase = window.__RUNAI_RCA_CONFIG__?.apiBaseUrl;
 const fallbackApiBase = import.meta.env.DEV ? 'http://localhost:8080' : '';
@@ -82,6 +82,20 @@ export async function fetchAlerts(page?: PageRequest, filters: AlertFilters = {}
 export async function fetchAnalysisRuns(page?: PageRequest): Promise<PageResult<AnalysisRun>> {
   const response = await read<Envelope<AnalysisRun[]>>(`/api/v1/analysis-runs${pageQuery(page)}`);
   return pageResult(response, page);
+}
+
+export async function fetchAnalysisEvaluation(runID: string): Promise<EvaluationView> {
+  return (await read<Envelope<EvaluationView>>(
+    `/api/v1/analysis-runs/${encodeURIComponent(runID)}/evaluation?author=${encodeURIComponent(feedbackActorID())}`,
+  )).data;
+}
+
+export async function saveAnalysisEvaluation(runID: string, input: EvaluationReviewInput): Promise<EvaluationReview> {
+  return (await mutate<Envelope<EvaluationReview>>(
+    'PUT',
+    `/api/v1/analysis-runs/${encodeURIComponent(runID)}/evaluation?author=${encodeURIComponent(feedbackActorID())}`,
+    { ...input, author: feedbackActorID() },
+  )).data;
 }
 
 

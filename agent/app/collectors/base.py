@@ -35,6 +35,8 @@ class AnalysisTarget:
     pod: str
     severity: str
     alert_name: str
+    fired_at: str = ""
+    resolved_at: str = ""
 
 
 @dataclass
@@ -164,7 +166,13 @@ _WORKLOAD_KIND_LABELS = (
 )
 
 
-def resolve_target(labels: dict[str, str], annotations: dict[str, str]) -> AnalysisTarget:
+def resolve_target(
+    labels: dict[str, str],
+    annotations: dict[str, str],
+    *,
+    fired_at: str = "",
+    resolved_at: str = "",
+) -> AnalysisTarget:
     namespace = value_from(labels, annotations, "namespace", "kubernetes_namespace")
     project = value_from(labels, annotations, "project", "runai_project", "runai.io/project")
     # If a workload-kind label named the subject, the `pod` label is the KSM
@@ -200,6 +208,8 @@ def resolve_target(labels: dict[str, str], annotations: dict[str, str]) -> Analy
         pod=pod,
         severity=value_from(labels, annotations, "severity") or "warning",
         alert_name=value_from(labels, annotations, "alertname", "alert_name") or "RunAIAlert",
+        fired_at=fired_at,
+        resolved_at=resolved_at,
     )
 
 

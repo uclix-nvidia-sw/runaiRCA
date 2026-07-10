@@ -52,6 +52,7 @@ def _row(**overrides: Any) -> dict[str, Any]:
         "incident_id": "inc-1",
         "alert_id": "al-1",
         "status": "resolved",
+        "user_approved_at": "2026-07-10T00:00:00Z",
         "positive_feedback": 2,
         "negative_feedback": 0,
         "labels": {"alertname": "KubeNodeDiskPressure", "node": "gpu-node-1"},
@@ -129,7 +130,7 @@ def test_promotion_from_row_happy_path() -> None:
     alert_name, family, actions = rec
     assert alert_name == "KubeNodeDiskPressure"
     assert family == "node_kubelet_pressure"
-    assert len(actions) == 3
+    assert actions == []
 
 
 def test_promotion_uses_stored_family_over_text_inference() -> None:
@@ -154,8 +155,7 @@ def test_promotion_falls_back_to_text_when_family_empty() -> None:
 
 def test_promotion_from_row_skips_malformed_rows() -> None:
     assert ingest._promotion_from_row(_row(status="firing")) is None
-    assert ingest._promotion_from_row(_row(positive_feedback=1, negative_feedback=1)) is None
-    assert ingest._promotion_from_row(_row(positive_feedback=0, negative_feedback=0)) is None
+    assert ingest._promotion_from_row(_row(user_approved_at="")) is None
     # no alertname label -> resolve_target falls back to RunAIAlert -> skip
     assert ingest._promotion_from_row(_row(labels={}, annotations={})) is None
     # labels not valid JSON -> same fallback path, skipped, no raise
@@ -164,10 +164,8 @@ def test_promotion_from_row_skips_malformed_rows() -> None:
     assert (
         ingest._promotion_from_row(_row(analysis_summary="fine", analysis_detail="fine")) is None
     )
-    # feedback columns absent entirely (old rows) -> not promotable, no raise
-    row = _row()
-    del row["positive_feedback"], row["negative_feedback"]
-    assert ingest._promotion_from_row(row) is None
+    # Feedback columns are not an approval substitute.
+    assert ingest._promotion_from_row(_row(positive_feedback=9, negative_feedback=0, user_approved_at="")) is None
 
 
 # --- idempotency (read-then-insert contract) -------------------------------------

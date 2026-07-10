@@ -35,7 +35,27 @@ def load_tree(path: str | Path) -> dict[str, Any] | None:
         nodes[node_id] = node
     if root not in nodes:
         return None
-    return {"root": root, "nodes": nodes}
+    return {
+        "root": root,
+        "nodes": nodes,
+        "principles": [str(item) for item in raw.get("principles") or []],
+        "sources": [str(item) for item in raw.get("sources") or []],
+    }
+
+
+def resolve_tree(
+    graph_tree: object, failure_modes_path: str | Path
+) -> tuple[dict[str, Any] | None, str]:
+    """TypeDB is authoritative; the adjacent YAML is an availability fallback."""
+    if isinstance(graph_tree, dict) and graph_tree.get("root") and graph_tree.get("nodes"):
+        return graph_tree, "typedb"
+    try:
+        fallback = Path(failure_modes_path or "knowledge/failure_modes.yaml").with_name(
+            "k8s_troubleshooting_tree.yaml"
+        )
+    except (TypeError, ValueError):
+        fallback = Path("knowledge/k8s_troubleshooting_tree.yaml")
+    return load_tree(fallback), "yaml-fallback"
 
 
 def walk_tree(tree: dict[str, Any] | None, evidence_text: str) -> dict[str, Any]:
@@ -61,12 +81,19 @@ def walk_tree(tree: dict[str, Any] | None, evidence_text: str) -> dict[str, Any]
                 "question": str(node.get("question") or ""),
                 "matched": hits,
             }
+            # The tree is curated operational knowledge, not just a classifier.
+            # Keep the senior operator's check/decision with each matched branch so
+            # synthesis can explain why it moved to the next branch.
+            for key in ("verify", "interpretation", "avoid"):
+                value = str(node.get(key) or "").strip()
+                if value:
+                    step[key] = value
             steps.append(step)
             if not hits:
                 break
             conclusion = node.get("conclusion")
             if isinstance(conclusion, dict):
-                return {
+                result = {
                     "path": path,
                     "steps": steps,
                     "conclusion": {
@@ -77,15 +104,47 @@ def walk_tree(tree: dict[str, Any] | None, evidence_text: str) -> dict[str, Any]
                         ],
                     },
                 }
-            next_id = ""
+                for key in ("confidence", "disconfirm"):
+                    value = conclusion.get(key)
+                    if value:
+                        result["conclusion"][key] = value
+                if tree.get("principles"):
+                    result["principles"] = tree["principles"]
+                if tree.get("sources"):
+                    result["sources"] = tree["sources"]
+                return result
+            candidates: list[tuple[str, list[str]]] = []
             for branch in node.get("branches") or []:
                 if not isinstance(branch, dict):
                     continue
                 branch_hits = _match_condition(branch.get("match"), text)
-                if branch_hits:
-                    step["matched"] = branch_hits
-                    next_id = str(branch.get("next") or "").strip()
-                    break
+                next_id = str(branch.get("next") or "").strip()
+                if branch_hits and next_id in nodes:
+                    candidates.append((next_id, branch_hits))
+            specific = [candidate for candidate in candidates if candidate[1] != ["always"]]
+            candidates = specific or candidates
+            if not candidates:
+                break
+            next_id, branch_hits = candidates[0]
+            step["matched"] = branch_hits
+            alternatives = []
+            for alternative_id, alternative_hits in candidates[1:]:
+                alternative = nodes[alternative_id]
+                conclusion = alternative.get("conclusion") or {}
+                alternatives.append(
+                    {
+                        "id": alternative_id,
+                        "question": str(alternative.get("question") or ""),
+                        "matched": alternative_hits,
+                        **(
+                            {"family": str(conclusion.get("family") or "")}
+                            if isinstance(conclusion, dict)
+                            else {}
+                        ),
+                    }
+                )
+            if alternatives:
+                step["alternatives"] = alternatives
             if not next_id or next_id not in nodes:
                 break
             node_id = next_id
@@ -95,6 +154,8 @@ def walk_tree(tree: dict[str, Any] | None, evidence_text: str) -> dict[str, Any]
 
 
 def _match_condition(condition: object, text: str) -> list[str]:
+    if isinstance(condition, dict) and condition.get("always") is True:
+        return ["always"]
     if not text:
         return []
     if isinstance(condition, str):
@@ -104,12 +165,19 @@ def _match_condition(condition: object, text: str) -> list[str]:
     if not isinstance(condition, dict):
         return []
 
+    # A root/fallback node may deliberately represent the universal first
+    # triage step. This keeps an unfamiliar symptom visible as "need evidence"
+    # instead of making the whole operational path disappear.
     matched: list[str] = []
     for blocked in _hits(text, _strings(condition.get("not"))):
         if blocked:
             return []
 
     any_terms = _strings(condition.get("any") or condition.get("keywords"))
+    # Some Kubernetes event signatures contain words such as "no endpoints"
+    # that are normally negation-filtered for RCA ranking. In a curated decision
+    # branch, `literal_any` names the complete event signature and must win.
+    literal_hits = _literal_hits(text, _strings(condition.get("literal_any")))
     fields = condition.get("fields")
     field_hits: list[str] = []
     if isinstance(fields, dict):
@@ -122,9 +190,13 @@ def _match_condition(condition: object, text: str) -> list[str]:
 
     if any_terms:
         hits = _hits(text, any_terms)
-        if not hits and not field_hits:
+        if not hits and not literal_hits and not field_hits:
             return []
         matched.extend(hits)
+        matched.extend(literal_hits)
+        matched.extend(field_hits)
+    elif literal_hits:
+        matched.extend(literal_hits)
         matched.extend(field_hits)
     elif field_hits:
         matched.extend(field_hits)
@@ -144,6 +216,15 @@ def _hits(text: str, terms: list[object]) -> list[str]:
     if not keywords:
         return []
     return _keyword_hits(text, keywords)[0]
+
+
+def _literal_hits(text: str, terms: list[object]) -> list[str]:
+    hits: list[str] = []
+    for term in terms:
+        value = str(term).strip().lower()
+        if value and value in text:
+            hits.append(value)
+    return hits
 
 
 def _strings(value: object) -> list[object]:

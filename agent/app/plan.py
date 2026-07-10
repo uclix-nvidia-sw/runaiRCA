@@ -9,7 +9,7 @@ imports) so collectors can import the type without a cycle.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 
@@ -40,6 +40,29 @@ class InvestigationPlan:
     # The platform component the alert target ITSELF is (runai_architecture.yaml
     # name, e.g. "runai-container-toolkit"), resolved from the pod/workload name.
     component: str = ""
+    # Neutral ontology guidance shared with every collector/investigator. It
+    # contains questions/checks/disconfirmation, never a command to prove a
+    # predetermined cause.
+    diagnostic_directive: dict[str, Any] = field(default_factory=dict)
+
+    def for_collector(self, name: str) -> InvestigationPlan:
+        """Give one collector the shared directive plus its neutral role."""
+        if not self.diagnostic_directive:
+            return self
+        directive = dict(self.diagnostic_directive)
+        recommended = {str(item) for item in directive.get("recommended_collectors") or []}
+        primary = not recommended or name in recommended
+        directive["collector"] = name
+        directive["primary"] = primary
+        directive["collector_instruction"] = (
+            "Run the ontology checks relevant to this source and seek disconfirming evidence."
+            if primary
+            else (
+                "Collect normal scoped evidence and report contradictions to the "
+                "primary hypotheses."
+            )
+        )
+        return replace(self, diagnostic_directive=directive)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -56,4 +79,5 @@ class InvestigationPlan:
             "narrative": self.narrative,
             "matched_alert": self.matched_alert,
             "component": self.component,
+            "diagnostic_directive": self.diagnostic_directive,
         }

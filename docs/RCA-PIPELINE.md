@@ -4,7 +4,7 @@
 > in order.
 > **In this doc:** the orchestrator flow · planner · 7 collectors · central
 > investigation loop · per-collector autonomous drill-down · signature matching +
-> BM25 recall · ranking · self-check / re-analysis · synthesis · evidence
+> BM25 recall · ranking · self-check / re-analysis · synthesis · runtime harness · evidence
 > presentation · safety envelope.
 
 The Agent is **not** a single prompt. It is a component-oriented multi-agent
@@ -33,7 +33,8 @@ flowchart TD
   SIG --> CHK[6 · Self-check + re-analysis]
   CHK --> KG[7 · Ontology enrichment]
   KG --> SYN[8 · Synthesis]
-  SYN --> RESP([RCA + evidence trail])
+ SYN --> HAR[9 · Runtime harness]
+ HAR --> RESP([RCA + evidence trail])
   INV[Central investigation loop] -.->|wraps 2-4| COLL
   ORCH <-->|"enrich / graph_remediation"| TDB[(TypeDB ontology)]
 ```
@@ -189,6 +190,18 @@ component, its failure effect, its BFS **dependency check order** (e.g.
 `cluster-sync → status-updater → runai-backend-traefik`), and its ready-to-run
 `kubectl` checks — from the [architecture topology](KNOWLEDGE-BASE.md#platform-architecture-topology).
 
+## 9. Runtime harness
+
+After synthesis, the response-boundary harness assigns stable response-local
+artifact IDs (`E01`, `E02`, …), creates a root-cause claim ledger, and validates
+the report before it reaches the backend. A high-confidence cause requires two
+independent live sources or a dispositive signature; material claims must cite
+usable current-run evidence; and disruptive actions require a preceding safety
+guardrail. The guard applies deterministic repairs up to
+`MAX_RCA_REPAIR_ATTEMPTS` (default 3). If a hard gate remains, the Agent returns
+`insufficient_evidence` rather than guessing. Historical TypeDB evidence is
+context only and cannot satisfy a live-evidence gate. See [Evaluation](EVALUATION.md).
+
 ## Evidence presentation
 
 Every artifact is built for an operator to read at a glance:
@@ -228,4 +241,5 @@ strictly additive, never breaks analysis.
 See the [Configuration Reference](CONFIGURATION.md) for every env var. Pipeline
 switches: `ENABLE_INVESTIGATION_LOOP`, `MAX_INVESTIGATION_STEPS`,
 `ENABLE_AGENT_DRILLDOWN`, `DRILLDOWN_MAX_STEPS`, `RUNAI_DB_DSN`,
-`ANALYSIS_DEADLINE_SECONDS`, `RUNAI_MCP_URL`.
+`ANALYSIS_DEADLINE_SECONDS`, `ENABLE_RCA_OUTPUT_HARNESS`,
+`MAX_RCA_REPAIR_ATTEMPTS`, `RCA_HARNESS_PASS_SCORE`, `RUNAI_MCP_URL`.

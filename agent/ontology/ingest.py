@@ -28,6 +28,7 @@ from typing import Any
 
 from app.collectors.base import resolve_target
 from app.config import load_settings
+from app.knowledge import load_family_catalog
 from app.ontology.typedb_client import escape_typeql as esc
 from ontology.incident import OntologyIncident
 from ontology.load_knowledge import (
@@ -44,9 +45,20 @@ SELECT i.incident_id, i.correlation_key, i.title, i.severity, i.status,
        i.user_approved_at::text AS user_approved_at,
        a.alert_id, a.fingerprint, a.occurrence_count, a.occurrence_pods,
        a.labels, a.annotations,
+       COALESCE(r.run_id, '') AS run_id,
        COALESCE(r.analysis_summary, '') AS analysis_summary,
        COALESCE(r.analysis_detail, '')  AS analysis_detail,
        COALESCE(r.root_cause_family, '') AS root_cause_family,
+       COALESCE(r.artifacts, '[]'::jsonb) AS artifacts,
+       COALESCE(r.metadata, '{}'::jsonb) AS analysis_metadata,
+       COALESCE((
+         SELECT jsonb_agg(er.effective_action)
+           FROM rca_eval_reviews er
+          WHERE er.run_id = r.run_id
+            AND er.analysis_hash = COALESCE(r.metadata->>'analysis_hash', '')
+            AND er.resolution_outcome IN ('resolved', 'mitigated')
+            AND er.effective_action <> ''
+       ), '[]'::jsonb) AS verified_actions,
        (SELECT count(*) FROM rca_feedback f
          WHERE f.target_id IN (i.incident_id, a.alert_id)
            AND f.kind = 'vote'
@@ -67,7 +79,8 @@ JOIN alerts a ON a.incident_id = i.incident_id
 -- incident's latest COMPLETED run (fall back to the newest with content), matching
 -- the backend's latestAnalysisRunForIncident selection.
 LEFT JOIN LATERAL (
-    SELECT ar.analysis_summary, ar.analysis_detail, ar.root_cause_family
+    SELECT ar.run_id, ar.analysis_summary, ar.analysis_detail, ar.root_cause_family,
+           ar.artifacts, ar.metadata
       FROM analysis_runs ar
      WHERE (ar.incident_id = i.incident_id OR ar.alert_id = a.alert_id)
        AND (ar.analysis_summary <> '' OR ar.analysis_detail <> '')
@@ -112,15 +125,34 @@ def _list(value: Any) -> list[str]:
     return []
 
 
+def _json_list(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
+    return []
+
+
 def _to_incident(row: dict[str, Any]) -> OntologyIncident:
     labels = _json(row.get("labels"))
     annotations = _json(row.get("annotations"))
     target = resolve_target(labels, annotations)
+    metadata = _json(row.get("analysis_metadata"))
+    harness = metadata.get("harness")
     return OntologyIncident(
         incident_id=str(row["incident_id"]),
         alert_id=str(row.get("alert_id") or ""),
         correlation_key=str(row.get("correlation_key") or ""),
         analysis_summary=str(row.get("analysis_summary") or ""),
+        analysis_detail=str(row.get("analysis_detail") or ""),
+        run_id=str(row.get("run_id") or ""),
+        analysis_hash=str(metadata.get("analysis_hash") or ""),
+        artifacts=_json_list(row.get("artifacts")),
+        harness=harness if isinstance(harness, dict) else {},
         title=str(row.get("title") or ""),
         severity=str(row.get("severity") or "warning"),
         status=str(row.get("status") or "firing"),
@@ -218,6 +250,151 @@ def _relate(
     tx.query(f"match {match} insert {relation};").resolve()
 
 
+def _clear_run_projection(tx: Any, run_id: str) -> None:
+    """Remove only run-local diagnosis edges before a re-analysis projection."""
+    if not run_id:
+        return
+    match = f'$r isa analysis_run, has run_id "{esc(run_id)}"; '
+    tx.query(
+        f"match {match} $d isa diagnosis, links (run: $r); "
+        f"$s isa supported_by, links (claim: $d, proof: $e); delete $s;"
+    ).resolve()
+    tx.query(f"match {match} $d isa diagnosis, links (run: $r); delete $d;").resolve()
+
+
+def _ensure_diagnosis(
+    tx: Any,
+    inc: OntologyIncident,
+    family: str,
+    *,
+    confidence: str,
+    diagnosis_state: str,
+    harness_status: str,
+    harness_score: int,
+) -> None:
+    if not inc.run_id or not family:
+        return
+    match = (
+        f'$r isa analysis_run, has run_id "{esc(inc.run_id)}"; '
+        f'$i isa incident, has incident_id "{esc(inc.incident_id)}"; '
+        f'$c isa {family}, has subtype "{esc(family)}"; '
+    )
+    tx.query(
+        f"match {match} insert $d isa diagnosis, links (run: $r, incident: $i, cause: $c);"
+    ).resolve()
+    attrs = {
+        "confidence": confidence or "low",
+        "diagnosis_state": diagnosis_state or "unresolved",
+        "analysis_hash": inc.analysis_hash,
+        "harness_status": harness_status or "degraded",
+        "harness_score": str(max(0, min(100, harness_score))),
+    }
+    for attr, value in attrs.items():
+        if not value and attr == "analysis_hash":
+            continue
+        tx.query(
+            f"match {match} $d isa diagnosis, links (run: $r, incident: $i, cause: $c), has {attr} $old; "
+            f"delete has $old of $d;"
+        ).resolve()
+        literal = value if attr == "harness_score" else f'"{esc(value)}"'
+        tx.query(
+            f"match {match} $d isa diagnosis, links (run: $r, incident: $i, cause: $c); "
+            f"insert $d has {attr} {literal};"
+        ).resolve()
+
+
+def _ensure_evidence(tx: Any, inc: OntologyIncident, item: dict[str, Any]) -> str:
+    evidence_id = str(item.get("evidence_id") or "").strip()
+    if not inc.run_id or not evidence_id:
+        return ""
+    key = f"{inc.run_id}:{evidence_id}"
+    _ensure(tx, "evidence", "evidence_id", key)
+    values = {
+        "artifact_ref": key,
+        "source": str(item.get("source") or item.get("agent") or ""),
+        "evidence_type": str(item.get("type") or ""),
+        "summary": " ".join(str(item.get("summary") or "").split())[:1200],
+        "confidence": str(item.get("confidence") or "low"),
+    }
+    for attr, value in values.items():
+        if value:
+            _replace_attr(tx, "evidence", "evidence_id", key, attr, value)
+    return key
+
+
+def _relate_diagnosis_evidence(tx: Any, inc: OntologyIncident, family: str, evidence_key: str) -> None:
+    if not inc.run_id or not family or not evidence_key:
+        return
+    match = (
+        f'$r isa analysis_run, has run_id "{esc(inc.run_id)}"; '
+        f'$i isa incident, has incident_id "{esc(inc.incident_id)}"; '
+        f'$c isa {family}, has subtype "{esc(family)}"; '
+        f'$d isa diagnosis, links (run: $r, incident: $i, cause: $c); '
+        f'$e isa evidence, has evidence_id "{esc(evidence_key)}"; '
+    )
+    exists = list(
+        tx.query(f"match {match} $s isa supported_by, links (claim: $d, proof: $e); select $d;")
+        .resolve()
+        .as_concept_rows()
+    )
+    if not exists:
+        tx.query(f"match {match} insert $s isa supported_by, links (claim: $d, proof: $e);").resolve()
+
+
+def _write_run_projection(tx: Any, inc: OntologyIncident) -> None:
+    if not inc.run_id:
+        return
+    _ensure(tx, "analysis_run", "run_id", inc.run_id)
+    _replace_attr(tx, "analysis_run", "run_id", inc.run_id, "status", "complete")
+    _relate(
+        tx,
+        ("incident", "incident_id", inc.incident_id),
+        ("analysis_run", "run_id", inc.run_id),
+        "analyzed_by",
+        "incident",
+        "run",
+    )
+    _clear_run_projection(tx, inc.run_id)
+
+    catalog = load_family_catalog("knowledge/families.yaml")
+    family = inc.root_cause_family if inc.root_cause_family in catalog.families else "insufficient_evidence"
+    _ensure_cause(tx, family)
+    harness = inc.harness
+    claims = harness.get("claims") if isinstance(harness.get("claims"), list) else []
+    root_claim = next(
+        (claim for claim in claims if isinstance(claim, dict) and claim.get("kind") == "root_cause"),
+        {},
+    )
+    confidence = str(root_claim.get("confidence") or "low") if isinstance(root_claim, dict) else "low"
+    state = str(harness.get("diagnosis_state") or "unresolved")
+    status = str(harness.get("status") or "degraded")
+    try:
+        score = int(harness.get("overall_score") or 0)
+    except (TypeError, ValueError):
+        score = 0
+    _ensure_diagnosis(
+        tx,
+        inc,
+        family,
+        confidence=confidence,
+        diagnosis_state=state,
+        harness_status=status,
+        harness_score=score,
+    )
+    evidence_by_id = {
+        str(item.get("evidence_id") or ""): item
+        for item in inc.artifacts
+        if isinstance(item, dict) and item.get("evidence_id")
+    }
+    for item in evidence_by_id.values():
+        _ensure_evidence(tx, inc, item)
+    support = root_claim.get("supporting_evidence") if isinstance(root_claim, dict) else []
+    for evidence_id in support if isinstance(support, list) else []:
+        item = evidence_by_id.get(str(evidence_id))
+        if item:
+            _relate_diagnosis_evidence(tx, inc, family, _ensure_evidence(tx, inc, item))
+
+
 def _write_incident(tx: Any, inc: OntologyIncident) -> None:
     # keyed singletons (match-or-insert)
     _ensure(tx, "cluster", "name", inc.cluster)
@@ -238,6 +415,10 @@ def _write_incident(tx: Any, inc: OntologyIncident) -> None:
         ("analysis_summary", inc.analysis_summary),
     ):
         _replace_attr(tx, "incident", "incident_id", inc.incident_id, attr, value)
+    if inc.user_approved_at:
+        _replace_attr(
+            tx, "incident", "incident_id", inc.incident_id, "approved_at", inc.user_approved_at
+        )
 
     # alert attributes + grouped_into(incident, alert). Replace-in-place (like the
     # incident attrs above) so re-projecting the same alert with a changed value
@@ -281,11 +462,13 @@ def _write_incident(tx: Any, inc: OntologyIncident) -> None:
         _relate(tx, ("namespace", "name", inc.namespace), ("pod", "name", pod),
                 "contains", "space", "occupant")
 
+    _write_run_projection(tx, inc)
+
 
 # --- knowledge promotion (--promote-knowledge) --------------------------------
-# Promote operator-CONFIRMED RCAs into the knowledge layer the synthesis step
-# consults: symptom "confirmed:{alert_name}" -indicates-> family root_cause,
-# -resolved_by-> action(s) from the stored report. The backend does NOT persist
+# Promote approved RCAs into the knowledge layer the synthesis step consults:
+# symptom "confirmed:{alert_name}" -indicates-> family root_cause, with only
+# actions an operator marked resolved/mitigated. The backend does NOT persist
 # the agent's ranked_root_cause_candidates (the response `context` dict is
 # dropped by the Go store), so the top family is recovered from the stored
 # analysis text instead — a printed family label is decisive, otherwise >= 2
@@ -357,12 +540,16 @@ def _extract_actions(detail: str) -> list[str]:
 def _promotion_from_row(row: dict[str, Any]) -> tuple[str, str, list[str]] | None:
     """(alert_name, family, actions) when the row is promotable, else None.
 
-    Promotable = resolved + net-positive operator feedback (rca_feedback kind='vote')
-    + a recoverable root-cause family + a real alertname label.
+    Promotable = resolved + Dashboard approval + a non-abstained, recoverable
+    root-cause family + a real alertname label. Only evaluation-confirmed actions
+    are promoted as remedies.
     """
     if str(row.get("status") or "") != "resolved":
         return None
-    if int(row.get("positive_feedback") or 0) <= int(row.get("negative_feedback") or 0):
+    if not str(row.get("user_approved_at") or "").strip():
+        return None
+    harness = _json(row.get("analysis_metadata"))
+    if str((harness.get("harness") or {}).get("status") or "") == "abstained":
         return None
     target = resolve_target(_json(row.get("labels")), _json(row.get("annotations")))
     alert_name = (target.alert_name or "").strip()
@@ -378,7 +565,7 @@ def _promotion_from_row(row: dict[str, Any]) -> tuple[str, str, list[str]] | Non
     )
     if not family:
         return None
-    return alert_name, family, _extract_actions(detail)
+    return alert_name, family, _list(row.get("verified_actions"))[:_ACTION_CAP]
 
 
 def _promote_one(tx: Any, alert_name: str, family: str, actions: list[str]) -> None:
@@ -441,7 +628,16 @@ def _write(incidents: list[OntologyIncident]) -> tuple[int, int]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Ingest backend incidents into TypeDB.")
     parser.add_argument("--limit", type=int, default=50)
-    parser.add_argument("--all", action="store_true", help="ingest unreviewed incidents too")
+    parser.add_argument(
+        "--approved-only",
+        action="store_true",
+        help="ingest only incidents approved in the dashboard (default behavior)",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="override the approval gate for one-off sample/backfill use",
+    )
     parser.add_argument(
         "--resolved-grace-hours",
         type=int,
@@ -458,11 +654,11 @@ def main() -> int:
 
     rows = asyncio.run(_fetch(args.limit, args.resolved_grace_hours))
     incidents = [_to_incident(r) for r in rows]
-    selected = [i for i in incidents if args.all or i.reviewed]
+    selected = [i for i in incidents if args.all or bool(i.user_approved_at)]
     skipped = len(incidents) - len(selected)
     print(
         f"fetched {len(incidents)} incident(s); "
-        f"ingesting {len(selected)}, skipping {skipped} unreviewed"
+        f"ingesting {len(selected)}, skipping {skipped} unapproved"
     )
     written = failed = 0
     if selected:

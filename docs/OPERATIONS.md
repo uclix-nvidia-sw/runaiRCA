@@ -87,6 +87,46 @@ kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --count
 See [Knowledge Base → Querying the graph](KNOWLEDGE-BASE.md#querying-the-graph)
 for TypeDB Studio access.
 
+## Grafana MCP (Prometheus / Loki) diagnostics
+
+Prometheus and Loki use the same managed `grafanaMcp` service, but they are
+separate Grafana datasources. A successful Prometheus query therefore does not
+prove that the Loki datasource is visible or queryable. The collectors try MCP
+first, then fall back to `PROMETHEUS_URL` or `LOKI_URL`; the collector artifact
+records which path supplied evidence.
+
+For an Alertmanager alert with `startsAt`, Loki queries use the incident window:
+five minutes before the alert through five minutes after `endsAt`. A firing
+alert without an end time is capped at 20 minutes after it started. The direct
+Loki API receives `start`/`end`; Grafana MCP receives `startTime`/`endTime`.
+Alerts without a parseable start time retain the datasource's normal recent
+window.
+
+```bash
+# Grafana MCP must see both datasource UIDs in the configured organization.
+kubectl logs -n <ns> deploy/<release>-grafana-mcp --tail=200
+
+# Inspect the service endpoint and the MCP pod's configured Grafana target.
+kubectl get svc -n <ns> <release>-grafana-mcp
+kubectl get pod -n <ns> -l app.kubernetes.io/component=grafana-mcp \
+  -o jsonpath='{range .items[*]}{.spec.containers[0].env[?(@.name=="GRAFANA_URL")].value}{"\n"}{end}'
+```
+
+- **`get datasource by uid ... 400 id is invalid`** — verify that
+  `GRAFANA_SERVICE_ACCOUNT_TOKEN` is present in the chart secret, that
+  `grafanaMcp.grafanaUrl` reaches Grafana from inside the cluster, and that
+  `grafanaMcp.grafanaOrgId` matches the Loki datasource's organization. The
+  datasource UID must be the concrete value returned by Grafana; a literal
+  `{uid}` path is invalid.
+- **MCP lists Prometheus but not Loki** — create or expose the Loki datasource
+  in that Grafana organization and grant the service account datasource query
+  access. This is a datasource/RBAC problem, not a Loki gateway credential
+  problem.
+- **MCP fails but direct Loki evidence succeeds** — keep `LOKI_URL` pointed at
+  the in-cluster read service (normally `loki-read:3100`) while fixing Grafana
+  MCP. This is the intended graceful fallback, but it lacks MCP-specific
+  datasource semantics.
+
 ## pgvector diagnostics
 
 pgvector is owned by the **backend**. It degrades gracefully to a JSONB

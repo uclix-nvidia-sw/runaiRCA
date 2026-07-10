@@ -320,6 +320,22 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`CREATE TABLE IF NOT EXISTS rca_eval_reviews (
+			review_id TEXT PRIMARY KEY,
+			run_id TEXT NOT NULL,
+			analysis_hash TEXT NOT NULL,
+			reviewer TEXT NOT NULL,
+			case_type TEXT NOT NULL,
+			expected_family TEXT NOT NULL DEFAULT '',
+			scores JSONB NOT NULL DEFAULT '{}'::jsonb,
+			hard_gates JSONB NOT NULL DEFAULT '{}'::jsonb,
+			resolution_outcome TEXT NOT NULL DEFAULT 'unknown',
+			effective_action TEXT NOT NULL DEFAULT '',
+			notes TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			UNIQUE (run_id, analysis_hash, reviewer)
+		)`,
 		`ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS root_cause_family TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb`,
 		`ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS first_completed_at TIMESTAMPTZ`,
@@ -338,6 +354,7 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_one_vote_per_author ON rca_feedback (target_type, target_id, author) WHERE kind = 'vote'`,
 		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_created_at ON analysis_runs (created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_target ON analysis_runs (target_type, target_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_rca_eval_reviews_run ON rca_eval_reviews (run_id, analysis_hash)`,
 		`CREATE INDEX IF NOT EXISTS idx_chat_conversations_updated_at ON chat_conversations (updated_at DESC)`,
 		`UPDATE analysis_runs
 			SET status = 'failed',
@@ -427,6 +444,7 @@ func (s *Store) loadDatabaseState(ctx context.Context) {
 	s.loadFeedback(ctx)
 	s.loadComments(ctx)
 	s.loadAnalysisRuns(ctx)
+	s.loadEvaluationReviews(ctx)
 	s.loadChatConversations(ctx)
 }
 
@@ -787,6 +805,38 @@ func (s *Store) loadAnalysisRuns(ctx context.Context) {
 	}
 }
 
+func (s *Store) loadEvaluationReviews(ctx context.Context) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT review_id, run_id, analysis_hash, reviewer, case_type, expected_family,
+		        scores, hard_gates, resolution_outcome, effective_action, notes, created_at, updated_at
+		   FROM rca_eval_reviews`,
+	)
+	if err != nil {
+		log.Printf("Failed to load evaluation reviews: %v", err)
+		return
+	}
+	defer rows.Close()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for rows.Next() {
+		var review EvaluationReview
+		var scoresRaw, gatesRaw []byte
+		if err := rows.Scan(
+			&review.ReviewID, &review.RunID, &review.AnalysisHash, &review.Reviewer,
+			&review.CaseType, &review.ExpectedFamily, &scoresRaw, &gatesRaw,
+			&review.ResolutionOutcome, &review.EffectiveAction, &review.Notes,
+			&review.CreatedAt, &review.UpdatedAt,
+		); err != nil {
+			log.Printf("Failed to scan evaluation review: %v", err)
+			continue
+		}
+		_ = json.Unmarshal(scoresRaw, &review.Scores)
+		_ = json.Unmarshal(gatesRaw, &review.HardGates)
+		s.evaluationReviews[evaluationKey(review.RunID, review.AnalysisHash, review.Reviewer)] = &review
+	}
+}
+
 func (s *Store) loadChatConversations(ctx context.Context) {
 	rows, err := s.db.QueryContext(
 		ctx,
@@ -894,6 +944,7 @@ func (s *Store) persistHardDeleteIncidentLocked(incidentID string, alertIDs []st
 		query string
 		args  []any
 	}{
+		{`DELETE FROM rca_eval_reviews WHERE run_id IN (SELECT run_id FROM analysis_runs WHERE incident_id = $1 OR alert_id = ANY($2))`, []any{incidentID, alertIDs}},
 		{`DELETE FROM analysis_runs WHERE incident_id = $1 OR alert_id = ANY($2)`, []any{incidentID, alertIDs}},
 		{`DELETE FROM chat_conversations WHERE incident_id = $1 OR alert_id = ANY($2)`, []any{incidentID, alertIDs}},
 		{`DELETE FROM rca_feedback WHERE incident_id = $1 OR target_id = $1 OR alert_id = ANY($2) OR target_id = ANY($2)`, []any{incidentID, alertIDs}},
@@ -1197,6 +1248,33 @@ func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) bool {
 		return false
 	}
 	return true
+}
+
+func (s *Store) persistEvaluationReviewLocked(review *EvaluationReview) {
+	if s.db == nil || !s.dbReady || review == nil {
+		return
+	}
+	_, err := s.execPostgres(
+		`INSERT INTO rca_eval_reviews (
+			review_id, run_id, analysis_hash, reviewer, case_type, expected_family,
+			scores, hard_gates, resolution_outcome, effective_action, notes, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		ON CONFLICT (run_id, analysis_hash, reviewer) DO UPDATE SET
+			case_type = EXCLUDED.case_type,
+			expected_family = EXCLUDED.expected_family,
+			scores = EXCLUDED.scores,
+			hard_gates = EXCLUDED.hard_gates,
+			resolution_outcome = EXCLUDED.resolution_outcome,
+			effective_action = EXCLUDED.effective_action,
+			notes = EXCLUDED.notes,
+			updated_at = EXCLUDED.updated_at`,
+		review.ReviewID, review.RunID, review.AnalysisHash, review.Reviewer,
+		review.CaseType, review.ExpectedFamily, mustJSON(review.Scores), mustJSON(review.HardGates),
+		review.ResolutionOutcome, review.EffectiveAction, review.Notes, review.CreatedAt, review.UpdatedAt,
+	)
+	if err != nil {
+		log.Printf("Failed to persist evaluation review %s: %v", review.ReviewID, err)
+	}
 }
 
 func (s *Store) persistChatConversationLocked(conversation *ChatConversation) {

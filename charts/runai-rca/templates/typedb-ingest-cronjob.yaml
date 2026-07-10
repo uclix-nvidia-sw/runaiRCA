@@ -1,12 +1,12 @@
 {{- if and .Values.typedb.enabled .Values.typedb.ingest.enabled }}
-{{- /* requireReview=false -> pass --all (ingest resolved incidents regardless of review) */ -}}
-{{- $allFlag := ternary "" "--all " .Values.typedb.ingest.requireReview }}
+{{- /* requireApproval=true -> ingest only Dashboard-approved incidents. */ -}}
+{{- $allFlag := ternary "" "--all " .Values.typedb.ingest.requireApproval }}
 {{- /* promoteKnowledge -> also learn confirmed RCAs into reusable knowledge (closes the loop) */ -}}
 {{- $promoteFlag := ternary "--promote-knowledge " "" .Values.typedb.ingest.promoteKnowledge }}
 {{- /* generateDataset -> after ingest, accumulate confirmed/pending incident rows into the
        rca_dataset store (approve status from incidents.user_approved_at). Same job so it shares
        env + runs right after the KG is refreshed, matching the ingest timing. */ -}}
-{{- $ingestCmd := printf "python -m ontology.ingest %s%s--resolved-grace-hours %v --limit %v" $allFlag $promoteFlag .Values.typedb.ingest.resolvedGraceHours .Values.typedb.ingest.limit }}
+{{- $ingestCmd := printf "python -m ontology.ingest --approved-only %s%s--resolved-grace-hours %v --limit %v" $allFlag $promoteFlag .Values.typedb.ingest.resolvedGraceHours .Values.typedb.ingest.limit }}
 {{- $genCmd := "" }}
 {{- if .Values.typedb.ingest.generateDataset }}
 {{- $genCmd = printf " && python -m eval.gen_dataset --from-incidents --resolved-grace-hours %v --limit %v" .Values.typedb.ingest.resolvedGraceHours .Values.typedb.ingest.limit }}
