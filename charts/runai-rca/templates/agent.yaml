@@ -98,16 +98,14 @@ spec:
               value: {{ .Values.agent.env.natConfigFile | quote }}
             - name: ENABLE_INVESTIGATION_LOOP
               value: {{ .Values.agent.env.enableInvestigationLoop | quote }}
+            - name: OPEN_WORLD_RCA_MODE
+              value: {{ .Values.agent.env.openWorldRcaMode | quote }}
             - name: MAX_INVESTIGATION_STEPS
               value: {{ .Values.agent.env.maxInvestigationSteps | quote }}
             - name: MAX_REANALYSIS_STEPS
               value: {{ .Values.agent.env.maxReanalysisSteps | quote }}
             - name: ENABLE_AGENT_DRILLDOWN
               value: {{ .Values.agent.env.enableAgentDrilldown | quote }}
-            - name: DRILLDOWN_MAX_STEPS
-              value: {{ .Values.agent.env.drilldownMaxSteps | quote }}
-            - name: ANALYSIS_TOKEN_BUDGET
-              value: {{ .Values.agent.env.analysisTokenBudget | quote }}
             - name: ANALYSIS_DEADLINE_SECONDS
               value: {{ .Values.agent.env.analysisDeadlineSeconds | quote }}
             - name: ENABLE_RCA_OUTPUT_HARNESS
@@ -188,6 +186,8 @@ spec:
               value: {{ .Values.agent.env.llmModelChat | quote }}
             - name: LLM_MODEL_INSIGHT
               value: {{ .Values.agent.env.llmModelInsight | quote }}
+            - name: LLM_MODEL_CRITIC
+              value: {{ .Values.agent.env.llmModelCritic | quote }}
             - name: LLM_PRICING_JSON
               value: {{ .Values.agent.env.llmPricingJson | quote }}
             - name: LLM_REQUEST_TIMEOUT_SECONDS

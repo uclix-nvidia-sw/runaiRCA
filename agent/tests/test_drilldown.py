@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 
 import pytest
 
 from app.collectors.base import AnalysisTarget, CollectorResult
 from app.llm import begin_usage_tracking
+from app.plan import InvestigationPlan
 from app.schemas import AlertAnalysisArtifact
 from app.services import drilldown
 from app.services.drilldown import _tool_runai_get, run_drilldowns
@@ -17,7 +19,6 @@ def drill_settings(**overrides):
     return replace(
         make_settings(),
         enable_agent_drilldown=True,
-        drilldown_max_steps=3,
         llm_base_url="https://llm.example/v1",
         llm_model="m",
         llm_api_key="k",
@@ -162,6 +163,206 @@ def test_drilldown_prompt_includes_prior_artifact_result() -> None:
     assert "stale gang phase" in prompt
 
 
+def test_drilldown_receives_source_scoped_ontology_guidance(monkeypatch) -> None:
+    prompts: list[str] = []
+
+    async def fake_complete_json(settings, *, user, **_kwargs):
+        prompts.append(user)
+        return {"action": "done"}
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    plan = InvestigationPlan(
+        diagnostic_directive={
+            "source": "typedb",
+            "path": ["incident_scope", "pod_pending", "scheduling_capacity"],
+            "questions": ["Why is the pod Pending?"],
+            "checks": ["Compare requested and allocatable GPU capacity."],
+            "disconfirm": ["A matching node has allocatable GPU capacity."],
+            "provisional_family": "k8s_scheduling_error",
+            "competing_hypotheses": [{"id": "pending_volume_binding"}],
+            "recommended_collectors": ["prometheus"],
+        }
+    )
+
+    asyncio.run(run_drilldowns(drill_settings(), [_k8s_result()], _target(), plan))
+
+    payload = json.loads(prompts[0])
+    guidance = payload["ontology_guidance"]
+    assert guidance["source"] == "typedb"
+    assert guidance["collector"] == "kubernetes"
+    assert guidance["primary"] is False
+    assert guidance["candidate_family"] == "k8s_scheduling_error"
+    assert guidance["checks"] == ["Compare requested and allocatable GPU capacity."]
+    assert guidance["disconfirm"] == ["A matching node has allocatable GPU capacity."]
+
+
+def test_drilldown_runs_resolved_ontology_probe_before_llm_query(monkeypatch) -> None:
+    seen_args: list[dict] = []
+
+    async def fake_complete_json(settings, *, user, **_kwargs):
+        return {"action": "done"}
+
+    async def fake_k8s_read(settings, kind, *, namespace="", name="", label_selector=""):
+        seen_args.append({"kind": kind, "namespace": namespace, "name": name})
+        return {"kind": kind, "status_code": 200, "error": None, "items": []}
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
+    plan = InvestigationPlan(
+        diagnostic_directive={
+            "probes": [
+                {
+                    "tool": "k8s_read",
+                    "arguments_template": {"kind": "events", "namespace": "{{namespace}}"},
+                }
+            ]
+        }
+    )
+    result = _k8s_result()
+
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), plan))
+
+    assert seen_args == [{"kind": "events", "namespace": "runai-vision", "name": ""}]
+    assert [item.type for item in result.artifacts] == ["ontology_probe"]
+
+
+def test_ontology_probe_records_structured_support_verdict(monkeypatch) -> None:
+    async def fake_complete_json(settings, *, user, **_kwargs):
+        return {"action": "done"}
+
+    async def fake_k8s_read(settings, kind, **_kwargs):
+        return {"kind": kind, "status_code": 200, "error": None, "items": [{"reason": "FailedMount"}]}
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
+    plan = InvestigationPlan(
+        diagnostic_directive={
+            "probes": [
+                {
+                    "id": "mount-check",
+                    "tool": "k8s_read",
+                    "arguments_template": {"kind": "events", "namespace": "{{namespace}}"},
+                    "support_signal_any": ["FailedMount"],
+                    "refute_signal_any": ["mounted successfully"],
+                }
+            ]
+        }
+    )
+    result = _k8s_result()
+
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), plan))
+
+    assert result.details["ontology_probe_assessments"] == [
+        {
+            "probe_id": "mount-check",
+            "tool": "k8s_read",
+            "verdict": "supports",
+            "support_signals": ["FailedMount"],
+            "refute_signals": [],
+            "hypothesis_family": "",
+            "artifact_index": 0,
+        }
+    ]
+
+
+def test_ontology_probe_with_unresolved_placeholder_is_not_broadened(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def fake_complete_json(settings, *, user, **_kwargs):
+        return {"action": "done"}
+
+    async def fake_k8s_read(settings, kind, **_kwargs):
+        calls.append(kind)
+        return {"kind": kind, "status_code": 200, "error": None}
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
+    plan = InvestigationPlan(
+        diagnostic_directive={
+            "probes": [
+                {
+                    "tool": "k8s_read",
+                    "arguments_template": {"kind": "pods", "name": "{{pod}}"},
+                }
+            ]
+        }
+    )
+
+    asyncio.run(run_drilldowns(drill_settings(), [_k8s_result()], _target(), plan))
+
+    assert calls == []
+
+
+def test_ontology_probe_resolves_explicit_resource_identifiers(monkeypatch) -> None:
+    seen_args: list[dict] = []
+
+    async def fake_complete_json(settings, *, user, **_kwargs):
+        return {"action": "done"}
+
+    async def fake_k8s_describe(settings, kind, *, namespace="", name=""):
+        seen_args.append({"kind": kind, "namespace": namespace, "name": name})
+        return {"kind": kind, "status_code": 200, "error": None, "events": []}
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "k8s_describe", fake_k8s_describe)
+    target = replace(
+        _target(),
+        service="training-api",
+        component="controller",
+        storage_claim="dataset-cache",
+        volume="pvc-48f2",
+    )
+    plan = InvestigationPlan(
+        diagnostic_directive={
+            "probes": [
+                {
+                    "tool": "k8s_describe",
+                    "arguments_template": {
+                        "kind": "persistentvolumeclaims",
+                        "name": "{{storage_claim}}",
+                        "namespace": "{{namespace}}",
+                    },
+                }
+            ]
+        }
+    )
+
+    asyncio.run(run_drilldowns(drill_settings(), [_k8s_result()], target, plan))
+
+    assert seen_args == [
+        {"kind": "persistentvolumeclaims", "namespace": "runai-vision", "name": "dataset-cache"}
+    ]
+
+
+def test_ontology_probe_rejects_unsafe_target_value_instead_of_widening(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def fake_complete_json(settings, *, user, **_kwargs):
+        return {"action": "done"}
+
+    async def fake_k8s_describe(settings, kind, **_kwargs):
+        calls.append(kind)
+        return {"kind": kind, "status_code": 200, "error": None}
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "k8s_describe", fake_k8s_describe)
+    target = replace(_target(), storage_claim="claim\nall-pvcs")
+    plan = InvestigationPlan(
+        diagnostic_directive={
+            "probes": [
+                {
+                    "tool": "k8s_describe",
+                    "arguments_template": {"kind": "persistentvolumeclaims", "name": "{{storage_claim}}"},
+                }
+            ]
+        }
+    )
+
+    asyncio.run(run_drilldowns(drill_settings(), [_k8s_result()], target, plan))
+
+    assert calls == []
+
+
 def test_drilldown_prompt_orders_stable_prefix_and_keeps_latest_history() -> None:
     result = CollectorResult(
         agent="kubernetes",
@@ -211,16 +412,29 @@ def test_drilldown_prompt_skips_unavailable_artifact_result() -> None:
     assert "stale gang phase" not in prompt
 
 
-def test_loop_is_bounded_by_max_steps_and_queries_per_step(monkeypatch) -> None:
+def test_drilldown_runs_all_new_allowed_queries(monkeypatch) -> None:
     llm_calls = [0]
     tool_calls = [0]
 
+    decisions = iter(
+        [
+            {
+                "action": "query",
+                "queries": [
+                    {
+                        "tool": "k8s_read",
+                        "args": {"kind": "pods", "label_selector": f"app={idx}"},
+                    }
+                    for idx in range(9)
+                ],
+            },
+            {"action": "done"},
+        ]
+    )
+
     async def always_query(settings, *, system, user, temperature=0.1, model=None):
         llm_calls[0] += 1
-        return {
-            "action": "query",
-            "queries": [{"tool": "k8s_read", "args": {"kind": "pods"}} for _ in range(9)],
-        }
+        return next(decisions)
 
     async def fake_k8s_read(settings, kind, **kwargs):
         tool_calls[0] += 1
@@ -230,30 +444,86 @@ def test_loop_is_bounded_by_max_steps_and_queries_per_step(monkeypatch) -> None:
     monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
     result = _k8s_result()
     asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
-    assert llm_calls[0] == 3  # drilldown_max_steps
-    assert tool_calls[0] == 9  # 3 steps x 3 queries/step cap (9 requested per step)
+    assert llm_calls[0] == 2
+    assert tool_calls[0] == 9
 
 
-def test_token_budget_stops_drilldown_loop(monkeypatch) -> None:
+def test_drilldown_continues_past_the_former_step_cap(monkeypatch) -> None:
+    decisions = iter(
+        [
+            {
+                "action": "query",
+                "queries": [
+                    {
+                        "tool": "k8s_read",
+                        "args": {"kind": "events", "label_selector": f"n={idx}"},
+                    }
+                ],
+            }
+            for idx in range(7)
+        ]
+        + [{"action": "done"}]
+    )
+    calls = [0]
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
+        calls[0] += 1
+        return next(decisions)
+
+    async def fake_k8s_read(settings, kind, **kwargs):
+        return {"kind": kind, "status_code": 200, "error": None}
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
+    result = _k8s_result()
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
+
+    assert calls[0] == 8
+    assert len(result.artifacts) == 7
+
+
+def test_unlimited_drilldown_stops_when_a_query_repeats(monkeypatch) -> None:
+    decisions = iter(
+        [
+            {"action": "query", "queries": [{"tool": "k8s_read", "args": {"kind": "events"}}]},
+            {"action": "query", "queries": [{"tool": "k8s_read", "args": {"kind": "events"}}]},
+        ]
+    )
+    calls = [0]
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
+        calls[0] += 1
+        return next(decisions)
+
+    async def fake_k8s_read(settings, kind, **kwargs):
+        return {"kind": kind, "status_code": 200, "error": None}
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
+    result = _k8s_result()
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
+
+    assert calls[0] == 2
+    assert len(result.artifacts) == 1
+    assert any("no new allowed read-only query" in warning for warning in result.warnings)
+
+
+def test_drilldown_does_not_stop_for_high_usage(monkeypatch) -> None:
     usage = begin_usage_tracking()
     usage["total_tokens"] = 10
 
-    async def should_not_call_llm(*args, **kwargs):
-        raise AssertionError("budget should stop drilldown before another LLM call")
+    calls = [0]
 
-    monkeypatch.setattr(drilldown, "complete_json", should_not_call_llm)
+    async def should_call_llm(*args, **kwargs):
+        calls[0] += 1
+        return {"action": "done"}
+
+    monkeypatch.setattr(drilldown, "complete_json", should_call_llm)
     result = _k8s_result()
-    asyncio.run(
-        run_drilldowns(
-            drill_settings(analysis_token_budget=10),
-            [result],
-            _target(),
-            None,
-        )
-    )
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
 
     assert result.artifacts == []
-    assert any("token budget" in warning for warning in result.warnings)
+    assert calls == [1]
 
 
 def test_tool_scoping_is_structural(monkeypatch) -> None:
@@ -288,7 +558,7 @@ def test_cross_domain_drilldown_query_is_visible_in_warnings(monkeypatch) -> Non
     result = _k8s_result()
     asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
     assert result.artifacts == []
-    assert any("no allowed read-only query" in warning for warning in result.warnings)
+    assert any("no new allowed read-only query" in warning for warning in result.warnings)
 
 
 def test_unavailable_collectors_are_skipped(monkeypatch) -> None:

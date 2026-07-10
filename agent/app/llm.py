@@ -94,26 +94,6 @@ def usage_with_cost(settings: Settings, usage: dict[str, Any]) -> dict[str, Any]
     return enriched
 
 
-def token_budget_exceeded(settings: Settings) -> bool:
-    budget = int(getattr(settings, "analysis_token_budget", 0) or 0)
-    if budget <= 0:
-        return False
-    current = _usage.get()
-    if not isinstance(current, dict):
-        return False
-    return int(current.get("total_tokens") or 0) >= budget
-
-
-def token_budget_warning(settings: Settings) -> str:
-    current = _usage.get() or {}
-    used = int(current.get("total_tokens") or 0) if isinstance(current, dict) else 0
-    budget = int(getattr(settings, "analysis_token_budget", 0) or 0)
-    return (
-        f"analysis token budget exceeded ({used}/{budget} tokens); "
-        "skipped additional LLM reasoning"
-    )
-
-
 def _pricing_table(settings: Settings) -> dict[str, dict[str, float]]:
     try:
         raw = json.loads(getattr(settings, "llm_pricing_json", "{}") or "{}")

@@ -41,7 +41,7 @@ The review criteria were treated as:
 - Moved pagination controls to the center so the chat launcher no longer blocks
   them.
 - Added stage-specific LLM model routing, missing-usage accounting, estimated
-  LLM spend, token budgets, and `/api/v1/stats/llm-spend`.
+  LLM spend, and `/api/v1/stats/llm-spend`.
 - Added MTTR/time-to-RCA KPI stats with first-completion baselines and frontend
   widgets.
 - Expanded eval fixtures to 23 gated cases plus a holdout set, added real-data
@@ -65,7 +65,7 @@ After the expanded fixture gate:
 
 | Run | Result |
 | --- | --- |
-| `python -m eval.run_eval --min-top1 0.8` | KG on, n=23, Top-1 23/23 (100%), Top-3 23/23 (100%), false assertions 0 |
+| `python -m eval.run_eval --min-top1 0.8` | KG on, n=23, Top-1 22/23 (96%), Top-3 22/23 (96%), false assertions 0. The ambiguous device-plugin-only case correctly abstains rather than being mislabelled as node pressure. |
 | `python -m eval.run_eval --kg-off --min-top1 0.8` | KG off A/B gate; record alongside KG-on results when changing family rules or TypeDB weighting |
 
 The gated set now blocks regressions. The holdout set is intentionally

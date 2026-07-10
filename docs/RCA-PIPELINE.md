@@ -91,7 +91,7 @@ LLM is available.
 ## 4. Per-collector autonomous drill-down
 
 `agent/app/services/drilldown.py` (`ENABLE_AGENT_DRILLDOWN`, Helm default on).
-After the base gather, **each evidence agent runs its own bounded LLM loop** over
+After the base gather, **each evidence agent runs its own adaptive LLM loop** over
 its own evidence and decides read-only follow-up queries in its own domain.
 
 **Tool scoping is structural, not prompt-based** — each loop receives *only* its
@@ -112,8 +112,9 @@ RCA store. The tool description is enriched with schema ownership from the
 [architecture topology](KNOWLEDGE-BASE.md#platform-architecture-topology), so the
 loop knows where to look.
 
-Bounds: `DRILLDOWN_MAX_STEPS` (4), 3 queries/step, unavailable collectors and
-unconfigured data sources skipped, never raises. Untrusted log/event text feeds
+It continues until the agent is done, repeats a query, or reaches the analysis
+deadline. Unavailable collectors and unconfigured data
+sources are skipped; it never raises. Untrusted log/event text feeds
 these loops, so the [prompt-injection guard](#safety-envelope) rides on every
 decision.
 
@@ -122,8 +123,10 @@ decision.
 Distinct from per-collector drill-down: `agent/app/services/investigator.py`
 (`ENABLE_INVESTIGATION_LOOP`, Helm default on) is the **cross-domain router**. An
 LLM decides which collector to probe next and can run ad-hoc read-only Kubernetes
-reads across the same 18-kind allowlist. `MAX_INVESTIGATION_STEPS` (12). Synthesis
-always waits for *all* collectors — an early/partial synthesis would produce a
+reads across the same 18-kind allowlist. Its default `MAX_INVESTIGATION_STEPS=0`
+means semantic completion: explicit conclusion, duplicate/exhausted probes, or
+the overall analysis deadline — not a fixed agent-step quota. Synthesis always
+waits for *all* collectors — an early/partial synthesis would produce a
 confident-but-wrong RCA.
 
 ## 5. Signature matching + BM25 recall + ranking
@@ -156,9 +159,11 @@ cannot even nominate (e.g. `gpu_hardware_error`) still headline correctly.
 - **Refute** (`self_check.refute_top_cause`): a skeptical senior-SRE LLM tries to
   refute the top cause using only the gathered evidence, calibrates its confidence,
   and writes a one-line caveat + next check.
-- **Re-analysis once**: if refuted, exactly one bounded re-analysis pass runs
-  (`MAX_REANALYSIS_STEPS`, 6) leading with the next-best hypothesis. Hard-guarded
-  to never re-enter `analyze()`.
+- **Re-analysis**: if refuted or evidence remains insufficient, a targeted
+  re-analysis pass follows the next discriminating hypothesis until semantic
+  completion or the analysis deadline. `MAX_REANALYSIS_STEPS=0` is the default;
+  a positive value is legacy compatibility only. It is hard-guarded to never
+  re-enter `analyze()`.
 - **Verify matches** (`verify_matches`): a skeptical pass drops keyword/signature
   matches (known issues, symptoms, XIDs) the evidence doesn't actually support.
 
@@ -240,6 +245,6 @@ strictly additive, never breaks analysis.
 
 See the [Configuration Reference](CONFIGURATION.md) for every env var. Pipeline
 switches: `ENABLE_INVESTIGATION_LOOP`, `MAX_INVESTIGATION_STEPS`,
-`ENABLE_AGENT_DRILLDOWN`, `DRILLDOWN_MAX_STEPS`, `RUNAI_DB_DSN`,
+`ENABLE_AGENT_DRILLDOWN`, `RUNAI_DB_DSN`,
 `ANALYSIS_DEADLINE_SECONDS`, `ENABLE_RCA_OUTPUT_HARNESS`,
 `MAX_RCA_REPAIR_ATTEMPTS`, `RCA_HARNESS_PASS_SCORE`, `RUNAI_MCP_URL`.

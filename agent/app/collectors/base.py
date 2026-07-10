@@ -37,6 +37,15 @@ class AnalysisTarget:
     alert_name: str
     fired_at: str = ""
     resolved_at: str = ""
+    # Optional resource identities are intentionally separate from the workload
+    # target.  A PVC or Service alert often has no affected pod yet, and using a
+    # broad namespace query in its place makes an executable runbook probe both
+    # noisier and less trustworthy.  Keep these at the end with defaults so
+    # existing positional callers remain compatible.
+    service: str = ""
+    component: str = ""
+    storage_claim: str = ""
+    volume: str = ""
 
 
 @dataclass
@@ -55,6 +64,34 @@ def value_from(labels: dict[str, str], annotations: dict[str, str], *keys: str) 
     for key in keys:
         value = labels.get(key) or annotations.get(key)
         if value:
+            return value
+    return ""
+
+
+def target_identifier_from(
+    labels: dict[str, str], annotations: dict[str, str], *keys: str
+) -> str:
+    """Return an alert-declared resource identifier safe for probe substitution.
+
+    These values are passed through to Kubernetes and query tools.  They are not
+    inferred from prose or evidence, and a control character/template marker is
+    rejected rather than being allowed to alter a later query.  Normal resource
+    names are otherwise left intact: different APIs permit different valid name
+    shapes (for example a CSI volume handle need not look like a DNS label).
+    """
+    # Prefer any label over any annotation.  An annotation named ``component``
+    # must not eclipse a label using the canonical Kubernetes spelling
+    # ``app.kubernetes.io/component``.
+    for metadata in (labels, annotations):
+        for key in keys:
+            raw = metadata.get(key)
+            if raw is None:
+                continue
+            value = str(raw).strip()
+            if not value or "{{" in value or "}}" in value:
+                continue
+            if any(ord(char) < 32 or ord(char) == 127 for char in value):
+                continue
             return value
     return ""
 
@@ -210,6 +247,42 @@ def resolve_target(
         alert_name=value_from(labels, annotations, "alertname", "alert_name") or "RunAIAlert",
         fired_at=fired_at,
         resolved_at=resolved_at,
+        # These are explicit alert metadata only.  In particular, do not guess
+        # a Service/PVC from a workload or from free-form annotation prose.
+        service=target_identifier_from(
+            labels,
+            annotations,
+            "service",
+            "service_name",
+            "kubernetes_service",
+            "k8s_service",
+        ),
+        component=target_identifier_from(
+            labels,
+            annotations,
+            "component",
+            "kubernetes_component",
+            "app.kubernetes.io/component",
+            "app_kubernetes_io_component",
+        ),
+        storage_claim=target_identifier_from(
+            labels,
+            annotations,
+            "persistentvolumeclaim",
+            "persistent_volume_claim",
+            "pvc",
+            "claim_name",
+            "volume_claim_name",
+        ),
+        volume=target_identifier_from(
+            labels,
+            annotations,
+            "persistentvolume",
+            "persistent_volume",
+            "pv",
+            "volume_name",
+            "volume",
+        ),
     )
 
 

@@ -370,22 +370,22 @@ agent:
     enableNatRuntime: true
     natConfigFile: /app/configs/runai_rca_engine.yml
     # Human-like iterative investigation: the orchestrator plans, probes the most
-    # relevant agent, observes, and re-plans (bounded by maxInvestigationSteps)
+    # relevant agent, observes, and re-plans.  0 means semantic completion;
+    # ANALYSIS_DEADLINE_SECONDS remains the execution safety boundary.
     # instead of gathering everything once. Only active when an LLM is configured
     # (no-op otherwise); each step is an extra LLM call, so it costs more per RCA.
     enableInvestigationLoop: true
-    maxInvestigationSteps: 12
+    maxInvestigationSteps: 0
     # Re-analysis (after a refuted top cause) gets its own investigation budget.
-    maxReanalysisSteps: 6
+    maxReanalysisSteps: 0
+    # off | shadow | assist | authoritative. Shadow is the safe default: it
+    # records evidence-gated novel hypotheses but never changes the headline.
+    openWorldRcaMode: "shadow"
     # Per-collector autonomous drill-down: each evidence agent (kubernetes /
-    # prometheus / loki / runai) runs its own bounded LLM loop with ONLY its
+    # prometheus / loki / runai) runs its own adaptive LLM loop with ONLY its
     # domain's read-only tools to deepen its own evidence. Only active when an
     # LLM is configured; each step is extra LLM calls (accuracy over latency).
     enableAgentDrilldown: true
-    drilldownMaxSteps: 6
-    # Stop optional LLM reasoning loops after this many tokens have been used in
-    # one analysis. 0 = unlimited; the overall deadline still applies.
-    analysisTokenBudget: 0
     # Overall hard cap per analysis: generous per-step time, but the whole run always
     # finishes within this budget (default 25 min). 0 = no overall cap.
     analysisDeadlineSeconds: 1500
@@ -432,6 +432,7 @@ agent:
     llmModelSynthesis: ""
     llmModelChat: ""
     llmModelInsight: ""
+    llmModelCritic: ""
     # JSON: {"model":{"prompt_per_mtok":0.15,"completion_per_mtok":0.60}}
     llmPricingJson: "{}"
     llmRequestTimeoutSeconds: 300

@@ -10,8 +10,6 @@ from app.llm import (
     complete,
     complete_with_error,
     llm_configured,
-    token_budget_exceeded,
-    token_budget_warning,
     usage_with_cost,
 )
 from app.schemas import Alert, AlertAnalysisRequest, AlertAnalysisResponse
@@ -270,14 +268,3 @@ def test_usage_with_cost_estimates_by_model() -> None:
     assert enriched["by_model"]["smart"]["cost_usd"] == 4.0
     assert enriched["cost_usd"] == 4.3
     assert "cost_usd" not in usage["by_model"]["cheap"]
-
-
-def test_token_budget_exceeded_uses_current_usage() -> None:
-    settings = replace(make_settings(), analysis_token_budget=10)
-    usage = begin_usage_tracking()
-
-    assert not token_budget_exceeded(settings)
-    usage["total_tokens"] = 10
-
-    assert token_budget_exceeded(settings)
-    assert "10/10" in token_budget_warning(settings)

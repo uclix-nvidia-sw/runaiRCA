@@ -75,18 +75,17 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `NVIDIA_API_KEY` | NIM key for NeMo Agent Toolkit workflows |
 | `LLM_BASE_URL` | OpenAI-compatible base URL for the NAT-managed default LLM and the operator chat copilot |
 | `LLM_MODEL` | OpenAI-compatible model name, for example `auto-router` |
-| `LLM_MODEL_PLANNER` / `LLM_MODEL_INVESTIGATION` / `LLM_MODEL_DRILLDOWN` / `LLM_MODEL_SELF_CHECK` / `LLM_MODEL_SYNTHESIS` / `LLM_MODEL_CHAT` / `LLM_MODEL_INSIGHT` | Optional stage-specific model overrides. Empty values fall back to `LLM_MODEL` |
+| `LLM_MODEL_PLANNER` / `LLM_MODEL_INVESTIGATION` / `LLM_MODEL_DRILLDOWN` / `LLM_MODEL_SELF_CHECK` / `LLM_MODEL_SYNTHESIS` / `LLM_MODEL_CHAT` / `LLM_MODEL_INSIGHT` / `LLM_MODEL_CRITIC` | Optional stage-specific model overrides. Empty values fall back to `LLM_MODEL` |
 | `LLM_API_KEY` | OpenAI-compatible API key secret; enables conversational chat answers when all three LLM vars are set |
 | `LLM_REQUEST_TIMEOUT_SECONDS` | LLM request timeout per call (chat and direct fallback reasoning), default `300`, `0` = unlimited |
 | `LLM_PRICING_JSON` | Optional JSON map for estimated LLM cost, keyed by model with `prompt_per_mtok` and `completion_per_mtok` values |
 | `ENABLE_NAT_RUNTIME` | Run analysis through the in-process NeMo Agent Toolkit engine; default `true` |
 | `NAT_CONFIG_FILE` | Internal NeMo engine workflow config path, default `configs/runai_rca_engine.yml` |
 | `ENABLE_INVESTIGATION_LOOP` | Central LLM investigation loop: plan → probe the most relevant agents → observe → re-plan, default `false` (Helm sets `true`) |
-| `MAX_INVESTIGATION_STEPS` | Max central investigation steps per analysis, default `12` |
-| `MAX_REANALYSIS_STEPS` | Investigation budget for the one re-analysis pass after a refuted top cause, default `6` |
-| `ANALYSIS_TOKEN_BUDGET` | Optional per-analysis LLM token budget. `0` means unlimited; when exceeded, investigation/drill-down stop at the next safe step boundary and record a warning |
-| `ENABLE_AGENT_DRILLDOWN` | Per-collector autonomous drill-down: each evidence agent (kubernetes/prometheus/loki/runai) runs its own bounded LLM loop with only its domain's read-only tools, default `false` (Helm sets `true`) |
-| `DRILLDOWN_MAX_STEPS` | Max drill-down steps per evidence agent, default `4` |
+| `OPEN_WORLD_RCA_MODE` | `off`, `shadow`, `assist`, or `authoritative`; defaults to `shadow`. Shadow records open-world reasoning without changing the RCA headline. |
+| `MAX_INVESTIGATION_STEPS` | Legacy compatibility limit; default `0` means semantic completion under the overall analysis deadline. |
+| `MAX_REANALYSIS_STEPS` | Legacy compatibility limit for a re-analysis pass; default `0` means semantic completion under the overall analysis deadline. |
+| `ENABLE_AGENT_DRILLDOWN` | Per-collector autonomous drill-down: each evidence agent (kubernetes/prometheus/loki/runai) continues through distinct read-only probes until it is done, repeats a query, or reaches the analysis deadline; default `false` (Helm sets `true`) |
 | `ANALYSIS_DEADLINE_SECONDS` | Overall hard cap per analysis (graceful degraded report on overrun), default `1500` (25 min), `0` = no cap. Keep the backend `AGENT_REQUEST_TIMEOUT_SECONDS` above this. |
 | `ENABLE_RCA_OUTPUT_HARNESS` | Validate the final RCA against live evidence and safety gates, default `true` |
 | `MAX_RCA_REPAIR_ATTEMPTS` | Maximum final-report repair passes after harness validation, default `3` |

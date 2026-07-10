@@ -59,6 +59,13 @@ attribute harness_status, value string;
 attribute harness_score, value integer;
 attribute approved_at, value string;
 attribute outcome, value string;
+attribute case_id, value string;
+attribute approval_state, value string;
+attribute cause_id, value string;
+attribute mechanism, value string;
+attribute mechanism_fingerprint, value string;
+attribute case_card, value string;
+attribute quality_score, value integer;
 # --- executable diagnostic runbooks ---------------------------------------
 attribute diagnostic_id, value string;
 attribute runbook_name, value string;
@@ -72,6 +79,7 @@ attribute sequence_index, value integer;
 attribute source_url, value string;
 attribute principle, value string;
 attribute disconfirm, value string;
+attribute probe_template, value string;
 
 # --- entities ---------------------------------------------------------------
 entity cluster,
@@ -207,6 +215,25 @@ entity root_cause,
     plays diagnosis:cause,
     plays diagnostic_outcome:cause;
 
+# A run-specific, open-world mechanism. Unlike the fixed catalog family types,
+# this is an entity with a stable data key, so a novel mechanism is never
+# coerced into insufficient_evidence simply because it lacks a schema subtype.
+entity cause_instance sub root_cause,
+    owns cause_id @key,
+    owns mechanism,
+    owns mechanism_fingerprint;
+
+entity case_snapshot,
+    owns case_id @key,
+    owns approval_state,
+    owns approved_at,
+    owns analysis_hash,
+    owns mechanism,
+    owns mechanism_fingerprint,
+    owns case_card,
+    owns quality_score,
+    plays case_projection:case;
+
 # root-cause taxonomy — families as sub-types (see knowledge/troubleshooting_cases.md)
 entity node_kubelet_pressure sub root_cause;
 entity runai_scheduling_quota sub root_cause;
@@ -273,6 +300,7 @@ entity diagnostic_step,
     owns interpretation,
     owns avoidance,
     owns match_expression,
+    owns probe_template @card(0..),
     plays runbook_contains:step,
     plays runbook_entry:step,
     plays diagnostic_transition:prior,
@@ -310,9 +338,11 @@ relation diagnosis,
     owns harness_score,
     plays supported_by:claim,
     plays contradicted_by:claim,
+    plays case_projection:finding,
     plays resolution:finding;
 relation observed_symptom, relates run, relates incident, relates symptom, relates proof;
 relation resolution, relates finding, relates remedy, owns outcome;
+relation case_projection, relates case, relates finding;
 
 # Executable senior-SRE diagnostic graph. YAML is the version-controlled seed;
 # ontology/load_troubleshooting.py mirrors it here for runtime traversal.

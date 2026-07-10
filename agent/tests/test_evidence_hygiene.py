@@ -312,7 +312,6 @@ async def test_drilldown_llm_failure_is_visible_in_warnings(monkeypatch) -> None
     settings = replace(
         make_settings(),
         enable_agent_drilldown=True,
-        drilldown_max_steps=3,
         llm_base_url="https://llm.example/v1",
         llm_model="m",
         llm_api_key="k",

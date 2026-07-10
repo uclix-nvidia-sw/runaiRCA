@@ -68,14 +68,21 @@ def main() -> int:
                     with driver.transaction(settings.typedb_database, TransactionType.SCHEMA) as tx:
                         tx.query(definition).resolve()
                         tx.commit()
-                except Exception:
+                except Exception as define_error:
                     # Existing functions need an explicit schema redefine on
                     # upgrade; a newly-added function succeeds in the define
                     # branch above and never reaches this path.
                     redefined = definition.replace("define\n", "redefine\n", 1)
-                    with driver.transaction(settings.typedb_database, TransactionType.SCHEMA) as tx:
-                        tx.query(redefined).resolve()
-                        tx.commit()
+                    try:
+                        with driver.transaction(settings.typedb_database, TransactionType.SCHEMA) as tx:
+                            tx.query(redefined).resolve()
+                            tx.commit()
+                    except Exception as redefine_error:
+                        function = definition.splitlines()[2].split("(", 1)[0].strip()
+                        raise RuntimeError(
+                            f"{function}: define failed ({define_error}); "
+                            f"redefine also failed ({redefine_error})"
+                        ) from redefine_error
         print(f"defined/redefined {len(definitions)} ontology reasoning functions")
         return 0
     except Exception as exc:  # noqa: BLE001 - surface schema drift to Helm

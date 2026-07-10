@@ -253,6 +253,10 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "fabric manager",
             "gpudirect",
             "link flap",
+            "collective communicator",
+            "remote transport",
+            "completion queue",
+            "retry exhaustion",
         ),
     ),
     "cluster_network_error": (
@@ -276,6 +280,9 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "volumebinding",
             "storageclass",
             "persistentvolumeclaim",
+            "volume attach operation",
+            "persistent claim",
+            "device publication conflict",
         ),
     ),
     "storage_backend_error": (

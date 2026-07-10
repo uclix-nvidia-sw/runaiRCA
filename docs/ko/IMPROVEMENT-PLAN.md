@@ -35,7 +35,7 @@ CI 커버리지, 라이선스 명확성, eval taxonomy 드리프트, 일시적 L
 - 대시보드 전역 재발 통계와 인시던트별 최근 유사 발생 카운트를 추가했습니다.
 - 인시던트 RCA 상세, evidence, alert, 유사 인시던트를 Word로 export하는 기능을 추가했습니다.
 - 챗봇 런처가 가리지 않도록 페이지네이션 컨트롤을 가운데로 옮겼습니다.
-- 단계별 LLM 모델 라우팅, usage 누락 계측, 추정 LLM 비용, 토큰 예산,
+- 단계별 LLM 모델 라우팅, usage 누락 계측, 추정 LLM 비용과 사용량 관측,
   `/api/v1/stats/llm-spend`를 추가했습니다.
 - 최초 완료 기준선을 사용하는 MTTR/time-to-RCA KPI 통계와 프런트엔드 위젯을 추가했습니다.
 - gated fixture를 23개로 확장하고 holdout 세트와 실데이터 fixture export 도구를 추가했으며,
@@ -59,7 +59,7 @@ CI 커버리지, 라이선스 명확성, eval taxonomy 드리프트, 일시적 L
 
 | 실행 | 결과 |
 | --- | --- |
-| `python -m eval.run_eval --min-top1 0.8` | KG on, n=23, Top-1 23/23 (100%), Top-3 23/23 (100%), false assertions 0 |
+| `python -m eval.run_eval --min-top1 0.8` | KG on, n=23, Top-1 22/23 (96%), Top-3 22/23 (96%), false assertions 0. device-plugin만 있는 모호한 사례는 node pressure로 오판하지 않고 보류합니다. |
 | `python -m eval.run_eval --kg-off --min-top1 0.8` | KG off A/B gate. family rule 또는 TypeDB weighting 변경 시 KG-on 결과와 함께 기록합니다 |
 
 gated 세트는 이제 회귀를 차단합니다. holdout 세트는 의도적으로 report-only로 두어,

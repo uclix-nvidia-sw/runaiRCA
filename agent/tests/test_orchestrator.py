@@ -103,9 +103,7 @@ def make_settings() -> Settings:
         enable_investigation_loop=False,
         max_investigation_steps=4,
         max_reanalysis_steps=2,
-        analysis_token_budget=0,
         enable_agent_drilldown=False,
-        drilldown_max_steps=4,
         analysis_deadline_seconds=300,
     )
 
@@ -200,6 +198,36 @@ def test_resolve_target_explicit_workload_label_wins_over_workload_kind() -> Non
 
     assert target.workload_name == "my-training-job"
     assert target.pod == ""  # workload-kind label present → exporter pod dropped
+
+
+def test_resolve_target_reads_optional_probe_resource_identifiers() -> None:
+    target = resolve_target(
+        {
+            "namespace": "runai-vision",
+            "service": "training-api",
+            "app.kubernetes.io/component": "controller",
+            "pvc": "dataset-cache",
+            "pv": "pvc-48f2",
+        },
+        # Labels are preferred; annotations fill only absent identities.
+        {"service": "ignored", "component": "ignored", "volume": "ignored"},
+    )
+
+    assert target.service == "training-api"
+    assert target.component == "controller"
+    assert target.storage_claim == "dataset-cache"
+    assert target.volume == "pvc-48f2"
+
+
+def test_resolve_target_rejects_unsafe_optional_probe_identifier() -> None:
+    target = resolve_target(
+        {"service": "api\nother", "pvc": "{{untrusted}}", "volume": "safe-volume"},
+        {},
+    )
+
+    assert target.service == ""
+    assert target.storage_claim == ""
+    assert target.volume == "safe-volume"
 
 
 @pytest.mark.asyncio

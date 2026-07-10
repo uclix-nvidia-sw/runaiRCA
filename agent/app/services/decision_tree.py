@@ -88,6 +88,9 @@ def walk_tree(tree: dict[str, Any] | None, evidence_text: str) -> dict[str, Any]
                 value = str(node.get(key) or "").strip()
                 if value:
                     step[key] = value
+            probes = node.get("probes")
+            if isinstance(probes, list):
+                step["probes"] = [probe for probe in probes if isinstance(probe, dict)][:4]
             steps.append(step)
             if not hits:
                 break

@@ -46,19 +46,44 @@ SELECT i.incident_id, i.correlation_key, i.title, i.severity, i.status,
        a.alert_id, a.fingerprint, a.occurrence_count, a.occurrence_pods,
        a.labels, a.annotations,
        COALESCE(r.run_id, '') AS run_id,
+       COALESCE(r.case_id, '') AS case_id,
+       COALESCE(r.approval_state, '') AS approval_state,
+       COALESCE(r.mechanism, '') AS mechanism,
+       COALESCE(r.mechanism_fingerprint, '') AS mechanism_fingerprint,
+       COALESCE(r.case_analysis_hash, '') AS case_analysis_hash,
        COALESCE(r.analysis_summary, '') AS analysis_summary,
        COALESCE(r.analysis_detail, '')  AS analysis_detail,
        COALESCE(r.root_cause_family, '') AS root_cause_family,
        COALESCE(r.artifacts, '[]'::jsonb) AS artifacts,
        COALESCE(r.metadata, '{}'::jsonb) AS analysis_metadata,
        COALESCE((
-         SELECT jsonb_agg(er.effective_action)
+         SELECT jsonb_agg(jsonb_build_object(
+           'statement', er.effective_action,
+           'outcome', er.resolution_outcome
+         ))
            FROM rca_eval_reviews er
           WHERE er.run_id = r.run_id
-            AND er.analysis_hash = COALESCE(r.metadata->>'analysis_hash', '')
+            AND er.analysis_hash = r.case_analysis_hash
             AND er.resolution_outcome IN ('resolved', 'mitigated')
             AND er.effective_action <> ''
        ), '[]'::jsonb) AS verified_actions,
+       COALESCE((
+         SELECT jsonb_agg(jsonb_build_object(
+           'statement', er.effective_action,
+           'outcome', er.resolution_outcome
+         ))
+           FROM rca_eval_reviews er
+          WHERE er.run_id = r.run_id
+            AND er.analysis_hash = r.case_analysis_hash
+            AND er.resolution_outcome = 'ineffective'
+            AND er.effective_action <> ''
+       ), '[]'::jsonb) AS ineffective_actions,
+       COALESCE((
+         SELECT jsonb_agg(er.scores)
+           FROM rca_eval_reviews er
+          WHERE er.run_id = r.run_id
+            AND er.analysis_hash = r.case_analysis_hash
+       ), '[]'::jsonb) AS evaluation_scores,
        (SELECT count(*) FROM rca_feedback f
          WHERE f.target_id IN (i.incident_id, a.alert_id)
            AND f.kind = 'vote'
@@ -75,16 +100,22 @@ SELECT i.incident_id, i.correlation_key, i.title, i.severity, i.status,
                       AND c.kind = 'comment')) AS reviewed
 FROM incidents i
 JOIN alerts a ON a.incident_id = i.incident_id
--- RCA now lives on analysis_runs (the per-alert columns were dropped). Take the
--- incident's latest COMPLETED run (fall back to the newest with content), matching
--- the backend's latestAnalysisRunForIncident selection.
+-- Approved historical knowledge must bind to the exact immutable snapshot, not
+-- to whichever analysis_run happened to become latest after approval.
 LEFT JOIN LATERAL (
-    SELECT ar.run_id, ar.analysis_summary, ar.analysis_detail, ar.root_cause_family,
-           ar.artifacts, ar.metadata
-      FROM analysis_runs ar
-     WHERE (ar.incident_id = i.incident_id OR ar.alert_id = a.alert_id)
-       AND (ar.analysis_summary <> '' OR ar.analysis_detail <> '')
-     ORDER BY (ar.status = 'complete') DESC, ar.updated_at DESC
+    SELECT cs.case_id, cs.approval_state, cs.mechanism, cs.mechanism_fingerprint,
+           cs.analysis_hash AS case_analysis_hash,
+           cs.run_id,
+           COALESCE(cs.snapshot->>'analysis_summary', '') AS analysis_summary,
+           COALESCE(cs.snapshot->>'analysis_detail', '') AS analysis_detail,
+           cs.root_cause_family,
+           COALESCE(cs.snapshot->'artifacts', '[]'::jsonb) AS artifacts,
+           COALESCE(cs.snapshot->'metadata', '{}'::jsonb) AS metadata,
+           COALESCE(cs.snapshot->'case_card', '{}'::jsonb) AS case_card
+      FROM rca_case_snapshots cs
+     WHERE cs.incident_id = i.incident_id
+       AND cs.approval_state = 'active'
+     ORDER BY cs.approved_at DESC
      LIMIT 1
 ) r ON TRUE
 {where}
@@ -137,12 +168,59 @@ def _json_list(value: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _action_list(value: Any) -> list[dict[str, str]]:
+    """Normalize review actions without treating arbitrary text as verified."""
+    actions: list[dict[str, str]] = []
+    for item in _json_list(value):
+        statement = " ".join(str(item.get("statement") or "").split())[:_ACTION_MAXLEN]
+        outcome = str(item.get("outcome") or "").strip()
+        if statement and outcome in {"resolved", "mitigated", "ineffective"}:
+            actions.append({"statement": statement, "outcome": outcome})
+    return actions
+
+
+_REVIEW_DIMENSIONS = (
+    "evidence_grounding",
+    "diagnostic_reasoning",
+    "investigation_plan",
+    "uncertainty_calibration",
+    "operational_usefulness",
+    "tool_efficiency",
+    "safety",
+)
+
+
+def _quality_score(metadata: dict[str, Any], review_scores: Any) -> tuple[int | None, str]:
+    """Prefer operator review score; harness is an explicitly labelled fallback."""
+    complete: list[float] = []
+    for scores in _json_list(review_scores):
+        try:
+            values = [int(scores[dimension]) for dimension in _REVIEW_DIMENSIONS]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if all(0 <= value <= 5 for value in values):
+            complete.append(sum(values) / len(values) * 20)
+    if complete:
+        return round(sum(complete) / len(complete)), "operator_review"
+    harness = metadata.get("harness")
+    if isinstance(harness, dict):
+        try:
+            score = int(harness.get("overall_score"))
+            if 0 <= score <= 100:
+                return score, "harness"
+        except (TypeError, ValueError):
+            pass
+    return None, ""
+
+
 def _to_incident(row: dict[str, Any]) -> OntologyIncident:
     labels = _json(row.get("labels"))
     annotations = _json(row.get("annotations"))
     target = resolve_target(labels, annotations)
     metadata = _json(row.get("analysis_metadata"))
     harness = metadata.get("harness")
+    case_card = _json(row.get("case_card"))
+    quality_score, quality_source = _quality_score(metadata, row.get("evaluation_scores"))
     return OntologyIncident(
         incident_id=str(row["incident_id"]),
         alert_id=str(row.get("alert_id") or ""),
@@ -150,7 +228,16 @@ def _to_incident(row: dict[str, Any]) -> OntologyIncident:
         analysis_summary=str(row.get("analysis_summary") or ""),
         analysis_detail=str(row.get("analysis_detail") or ""),
         run_id=str(row.get("run_id") or ""),
-        analysis_hash=str(metadata.get("analysis_hash") or ""),
+        analysis_hash=str(row.get("case_analysis_hash") or metadata.get("analysis_hash") or ""),
+        case_id=str(row.get("case_id") or ""),
+        approval_state=str(row.get("approval_state") or ""),
+        mechanism=str(row.get("mechanism") or ""),
+        mechanism_fingerprint=str(row.get("mechanism_fingerprint") or ""),
+        case_card=case_card,
+        successful_actions=_action_list(row.get("verified_actions")),
+        failed_actions=_action_list(row.get("ineffective_actions")),
+        quality_score=quality_score,
+        quality_source=quality_source,
         artifacts=_json_list(row.get("artifacts")),
         harness=harness if isinstance(harness, dict) else {},
         title=str(row.get("title") or ""),
@@ -259,7 +346,46 @@ def _clear_run_projection(tx: Any, run_id: str) -> None:
         f"match {match} $d isa diagnosis, links (run: $r); "
         f"$s isa supported_by, links (claim: $d, proof: $e); delete $s;"
     ).resolve()
+    tx.query(
+        f"match {match} $d isa diagnosis, links (run: $r); "
+        f"$c isa contradicted_by, links (claim: $d, proof: $e); delete $c;"
+    ).resolve()
+    tx.query(
+        f"match {match} $d isa diagnosis, links (run: $r); "
+        f"$p isa case_projection, links (finding: $d, case: $case); delete $p;"
+    ).resolve()
     tx.query(f"match {match} $d isa diagnosis, links (run: $r); delete $d;").resolve()
+
+
+def _is_novel_family(family: str) -> bool:
+    return family.startswith("novel_")
+
+
+def _cause_instance_id(inc: OntologyIncident) -> str:
+    return inc.case_id or f"{inc.run_id}:{inc.analysis_hash or 'unhashed'}"
+
+
+def _ensure_cause_instance(tx: Any, inc: OntologyIncident, family: str) -> None:
+    cause_id = _cause_instance_id(inc)
+    _ensure(tx, "cause_instance", "cause_id", cause_id)
+    _replace_attr(tx, "cause_instance", "cause_id", cause_id, "subtype", family)
+    if inc.mechanism:
+        _replace_attr(tx, "cause_instance", "cause_id", cause_id, "mechanism", inc.mechanism)
+    if inc.mechanism_fingerprint:
+        _replace_attr(
+            tx,
+            "cause_instance",
+            "cause_id",
+            cause_id,
+            "mechanism_fingerprint",
+            inc.mechanism_fingerprint,
+        )
+
+
+def _cause_match(inc: OntologyIncident, family: str) -> str:
+    if _is_novel_family(family):
+        return f'$c isa cause_instance, has cause_id "{esc(_cause_instance_id(inc))}"; '
+    return f'$c isa {family}, has subtype "{esc(family)}"; '
 
 
 def _ensure_diagnosis(
@@ -277,7 +403,7 @@ def _ensure_diagnosis(
     match = (
         f'$r isa analysis_run, has run_id "{esc(inc.run_id)}"; '
         f'$i isa incident, has incident_id "{esc(inc.incident_id)}"; '
-        f'$c isa {family}, has subtype "{esc(family)}"; '
+        + _cause_match(inc, family)
     )
     tx.query(
         f"match {match} insert $d isa diagnosis, links (run: $r, incident: $i, cause: $c);"
@@ -322,23 +448,152 @@ def _ensure_evidence(tx: Any, inc: OntologyIncident, item: dict[str, Any]) -> st
     return key
 
 
-def _relate_diagnosis_evidence(tx: Any, inc: OntologyIncident, family: str, evidence_key: str) -> None:
+def _relate_diagnosis_evidence(
+    tx: Any,
+    inc: OntologyIncident,
+    family: str,
+    evidence_key: str,
+    relation: str = "supported_by",
+) -> None:
     if not inc.run_id or not family or not evidence_key:
         return
     match = (
         f'$r isa analysis_run, has run_id "{esc(inc.run_id)}"; '
         f'$i isa incident, has incident_id "{esc(inc.incident_id)}"; '
-        f'$c isa {family}, has subtype "{esc(family)}"; '
-        f'$d isa diagnosis, links (run: $r, incident: $i, cause: $c); '
-        f'$e isa evidence, has evidence_id "{esc(evidence_key)}"; '
+        + _cause_match(inc, family)
+        + f'$d isa diagnosis, links (run: $r, incident: $i, cause: $c); '
+        + f'$e isa evidence, has evidence_id "{esc(evidence_key)}"; '
     )
     exists = list(
-        tx.query(f"match {match} $s isa supported_by, links (claim: $d, proof: $e); select $d;")
+        tx.query(f"match {match} $s isa {relation}, links (claim: $d, proof: $e); select $d;")
         .resolve()
         .as_concept_rows()
     )
     if not exists:
-        tx.query(f"match {match} insert $s isa supported_by, links (claim: $d, proof: $e);").resolve()
+        tx.query(f"match {match} insert $s isa {relation}, links (claim: $d, proof: $e);").resolve()
+
+
+def _ensure_case_projection(tx: Any, inc: OntologyIncident, family: str) -> None:
+    if not inc.case_id or not inc.run_id:
+        return
+    _ensure(tx, "case_snapshot", "case_id", inc.case_id)
+    _replace_attr(tx, "case_snapshot", "case_id", inc.case_id, "approval_state", inc.approval_state or "active")
+    if inc.analysis_hash:
+        _replace_attr(tx, "case_snapshot", "case_id", inc.case_id, "analysis_hash", inc.analysis_hash)
+    if inc.user_approved_at:
+        _replace_attr(tx, "case_snapshot", "case_id", inc.case_id, "approved_at", inc.user_approved_at)
+    # Keep the immutable approval record self-describing for the retrieval
+    # projection. Empty mechanism values are represented inside case_card rather
+    # than forced as TypeDB attributes, so legacy snapshots remain queryable.
+    if inc.mechanism:
+        _replace_attr(tx, "case_snapshot", "case_id", inc.case_id, "mechanism", inc.mechanism)
+    if inc.mechanism_fingerprint:
+        _replace_attr(
+            tx,
+            "case_snapshot",
+            "case_id",
+            inc.case_id,
+            "mechanism_fingerprint",
+            inc.mechanism_fingerprint,
+        )
+    card = _case_card_for_graph(inc, family)
+    _replace_attr(
+        tx,
+        "case_snapshot",
+        "case_id",
+        inc.case_id,
+        "case_card",
+        json.dumps(card, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+    )
+    if inc.quality_score is not None:
+        _replace_attr(
+            tx,
+            "case_snapshot",
+            "case_id",
+            inc.case_id,
+            "quality_score",
+            max(0, min(100, inc.quality_score)),
+            quoted=False,
+        )
+    match = (
+        f'$case isa case_snapshot, has case_id "{esc(inc.case_id)}"; '
+        f'$r isa analysis_run, has run_id "{esc(inc.run_id)}"; '
+        f'$i isa incident, has incident_id "{esc(inc.incident_id)}"; '
+        + _cause_match(inc, family)
+        + '$d isa diagnosis, links (run: $r, incident: $i, cause: $c); '
+    )
+    exists = list(
+        tx.query(f"match {match} $p isa case_projection, links (case: $case, finding: $d); select $p;")
+        .resolve()
+        .as_concept_rows()
+    )
+    if not exists:
+        tx.query(f"match {match} insert $p isa case_projection, links (case: $case, finding: $d);").resolve()
+
+
+def _case_card_for_graph(inc: OntologyIncident, family: str) -> dict[str, Any]:
+    """Merge immutable snapshot facts and hash-bound review outcomes.
+
+    This is a stored *projection*, not a generated RCA: values originate from
+    CaseSnapshot payload, harness links, or evaluation rows selected by the
+    same `(run_id, analysis_hash)` as the approved case.
+    """
+    raw = inc.case_card if isinstance(inc.case_card, dict) else {}
+    card = json.loads(json.dumps(raw, ensure_ascii=False)) if raw else {}
+    try:
+        card["schema_version"] = max(1, int(card.get("schema_version") or 1))
+    except (TypeError, ValueError):
+        card["schema_version"] = 1
+    card["historical_prior"] = True
+    card["case_id"] = inc.case_id
+    card["incident_id"] = inc.incident_id
+    card["family"] = family
+    card["approval_analysis_hash"] = inc.analysis_hash
+    if inc.mechanism and not card.get("mechanism"):
+        card["mechanism"] = inc.mechanism
+    if inc.mechanism_fingerprint and not card.get("mechanism_fingerprint"):
+        card["mechanism_fingerprint"] = inc.mechanism_fingerprint
+    if inc.quality_score is not None:
+        card["quality_score"] = max(0, min(100, inc.quality_score))
+        card["quality_source"] = inc.quality_source or "harness"
+    if inc.successful_actions:
+        card["successful_actions"] = inc.successful_actions
+    if inc.failed_actions:
+        card["failed_actions"] = inc.failed_actions
+    return card
+
+
+def _ensure_resolution(
+    tx: Any,
+    inc: OntologyIncident,
+    family: str,
+    action: dict[str, str],
+) -> None:
+    statement = " ".join(str(action.get("statement") or "").split())[:_ACTION_MAXLEN]
+    outcome = str(action.get("outcome") or "").strip()
+    if not statement or outcome not in {"resolved", "mitigated", "ineffective"}:
+        return
+    _ensure_action(tx, statement)
+    match = (
+        f'$r isa analysis_run, has run_id "{esc(inc.run_id)}"; '
+        f'$i isa incident, has incident_id "{esc(inc.incident_id)}"; '
+        + _cause_match(inc, family)
+        + '$d isa diagnosis, links (run: $r, incident: $i, cause: $c); '
+        + f'$a isa action, has statement "{esc(statement)}"; '
+    )
+    exists = list(
+        tx.query(
+            f'match {match} $resolution isa resolution, '
+            f'links (finding: $d, remedy: $a), has outcome "{esc(outcome)}"; select $resolution;'
+        )
+        .resolve()
+        .as_concept_rows()
+    )
+    if not exists:
+        tx.query(
+            f'match {match} insert $resolution isa resolution, '
+            f'links (finding: $d, remedy: $a), has outcome "{esc(outcome)}";'
+        ).resolve()
 
 
 def _write_run_projection(tx: Any, inc: OntologyIncident) -> None:
@@ -357,8 +612,18 @@ def _write_run_projection(tx: Any, inc: OntologyIncident) -> None:
     _clear_run_projection(tx, inc.run_id)
 
     catalog = load_family_catalog("knowledge/families.yaml")
-    family = inc.root_cause_family if inc.root_cause_family in catalog.families else "insufficient_evidence"
-    _ensure_cause(tx, family)
+    # Preserve an evidence-backed open-world family as a run-local
+    # cause_instance. Only malformed/empty non-catalog values abstain into the
+    # legacy insufficient_evidence bucket.
+    if inc.root_cause_family in catalog.families:
+        family = inc.root_cause_family
+        _ensure_cause(tx, family)
+    elif _is_novel_family(inc.root_cause_family):
+        family = inc.root_cause_family
+        _ensure_cause_instance(tx, inc, family)
+    else:
+        family = "insufficient_evidence"
+        _ensure_cause(tx, family)
     harness = inc.harness
     claims = harness.get("claims") if isinstance(harness.get("claims"), list) else []
     root_claim = next(
@@ -381,6 +646,7 @@ def _write_run_projection(tx: Any, inc: OntologyIncident) -> None:
         harness_status=status,
         harness_score=score,
     )
+    _ensure_case_projection(tx, inc, family)
     evidence_by_id = {
         str(item.get("evidence_id") or ""): item
         for item in inc.artifacts
@@ -393,6 +659,26 @@ def _write_run_projection(tx: Any, inc: OntologyIncident) -> None:
         item = evidence_by_id.get(str(evidence_id))
         if item:
             _relate_diagnosis_evidence(tx, inc, family, _ensure_evidence(tx, inc, item))
+    contradictions = []
+    if isinstance(root_claim, dict):
+        raw = root_claim.get("contradicting_evidence") or root_claim.get("contradiction_evidence_ids")
+        if isinstance(raw, list):
+            contradictions = raw
+    for evidence_id in contradictions:
+        item = evidence_by_id.get(str(evidence_id))
+        if item:
+            _relate_diagnosis_evidence(
+                tx,
+                inc,
+                family,
+                _ensure_evidence(tx, inc, item),
+                relation="contradicted_by",
+            )
+    # Resolution outcomes are allowed into the graph only from hash-bound
+    # evaluation reviews.  This keeps recommended actions separate from actions
+    # that an operator actually reported as effective or ineffective.
+    for action in [*inc.successful_actions, *inc.failed_actions]:
+        _ensure_resolution(tx, inc, family, action)
 
 
 def _write_incident(tx: Any, inc: OntologyIncident) -> None:
@@ -537,6 +823,20 @@ def _extract_actions(detail: str) -> list[str]:
     return actions
 
 
+def _action_statements(value: Any) -> list[str]:
+    """Return only outcome-qualified action text from the CaseCard SQL shape."""
+    structured = [
+        action["statement"]
+        for action in _action_list(value)
+        if action.get("outcome") in {"resolved", "mitigated"}
+    ]
+    if structured:
+        return structured
+    # Compatibility with rows fetched before verified_actions became structured:
+    # that legacy SQL column was already filtered to resolved/mitigated reviews.
+    return [" ".join(item.split())[:_ACTION_MAXLEN] for item in _list(value) if item.strip()]
+
+
 def _promotion_from_row(row: dict[str, Any]) -> tuple[str, str, list[str]] | None:
     """(alert_name, family, actions) when the row is promotable, else None.
 
@@ -565,7 +865,7 @@ def _promotion_from_row(row: dict[str, Any]) -> tuple[str, str, list[str]] | Non
     )
     if not family:
         return None
-    return alert_name, family, _list(row.get("verified_actions"))[:_ACTION_CAP]
+    return alert_name, family, _action_statements(row.get("verified_actions"))[:_ACTION_CAP]
 
 
 def _promote_one(tx: Any, alert_name: str, family: str, actions: list[str]) -> None:

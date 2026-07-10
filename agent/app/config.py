@@ -147,9 +147,7 @@ class Settings:
     enable_investigation_loop: bool
     max_investigation_steps: int
     max_reanalysis_steps: int
-    analysis_token_budget: int
     enable_agent_drilldown: bool
-    drilldown_max_steps: int
     analysis_deadline_seconds: int
     # Settings(...) fixtures and third-party callers stay legacy-compatible;
     # deployed load_settings()/Helm defaults explicitly enable the guard.
@@ -162,7 +160,14 @@ class Settings:
     # (finish_reason=length), raise this rather than shrinking the prompt.
     llm_synthesis_max_tokens: int = 8192
     llm_model_insight: str = ""
-    max_investigation_iterations: int = 2
+    # Deprecated no-op retained only for Settings(...) compatibility. The
+    # re-analysis loop stops on semantic completion or the outer deadline.
+    max_investigation_iterations: int = 0
+    # Open-world reasoning is introduced in shadow mode first.  Keeping this a
+    # single mode rather than a cluster of booleans makes it possible to roll
+    # back the whole behaviour without changing collector configuration.
+    open_world_rca_mode: str = "shadow"  # off | shadow | assist | authoritative
+    llm_model_critic: str = ""
 
 
 def load_settings() -> Settings:
@@ -281,6 +286,7 @@ def load_settings() -> Settings:
         llm_model_synthesis=os.getenv("LLM_MODEL_SYNTHESIS", "").strip(),
         llm_model_chat=os.getenv("LLM_MODEL_CHAT", "").strip(),
         llm_model_insight=os.getenv("LLM_MODEL_INSIGHT", "").strip(),
+        llm_model_critic=os.getenv("LLM_MODEL_CRITIC", "").strip(),
         llm_pricing_json=os.getenv("LLM_PRICING_JSON", "{}").strip(),
         llm_api_key=os.getenv("LLM_API_KEY", "").strip(),
         # Generous per-call ceiling so a reasoning agent is never cut off mid-thought;
@@ -301,18 +307,15 @@ def load_settings() -> Settings:
         typedb_timeout_seconds=_int_env("TYPEDB_TIMEOUT_SECONDS", 60),
         enable_typedb=_bool_env("ENABLE_TYPEDB", False),
         enable_investigation_loop=_bool_env("ENABLE_INVESTIGATION_LOOP", False),
-        # Generous by default: give the investigation loop room to keep digging
-        # (more "opportunity to think"), not just more time per step.
-        max_investigation_steps=max(1, _int_env("MAX_INVESTIGATION_STEPS", 12)),
-        # Re-analysis (after the first top cause is refuted) gets a generous
-        # investigation budget of its own — accuracy over speed.
-        max_reanalysis_steps=max(1, _int_env("MAX_REANALYSIS_STEPS", 6)),
-        analysis_token_budget=max(0, _int_env("ANALYSIS_TOKEN_BUDGET", 0)),
+        # 0 means semantic completion: the outer analysis deadline, exhausted
+        # evidence, or duplicate probes stop work.  Positive values remain a
+        # legacy compatibility override, never the default quality boundary.
+        max_investigation_steps=_nonnegative_int_env("MAX_INVESTIGATION_STEPS", 0),
+        max_reanalysis_steps=_nonnegative_int_env("MAX_REANALYSIS_STEPS", 0),
         # Per-collector autonomous drill-down: each evidence agent gets its own LLM
         # loop with ONLY its domain's read-only tools (see services/drilldown.py).
         # LLM-gated and best-effort like the investigation loop.
         enable_agent_drilldown=_bool_env("ENABLE_AGENT_DRILLDOWN", False),
-        drilldown_max_steps=max(1, _int_env("DRILLDOWN_MAX_STEPS", 6)),
         # Overall hard cap on one analysis: agents get generous per-step time above,
         # but the whole run always finishes within this budget. (0 = no overall cap.)
         # Owner priority is accuracy over latency; the backend's
@@ -321,5 +324,11 @@ def load_settings() -> Settings:
         enable_rca_output_harness=_bool_env("ENABLE_RCA_OUTPUT_HARNESS", True),
         max_rca_repair_attempts=_nonnegative_int_env("MAX_RCA_REPAIR_ATTEMPTS", 3),
         rca_harness_pass_score=max(0, min(100, _int_env("RCA_HARNESS_PASS_SCORE", 70))),
-        max_investigation_iterations=_nonnegative_int_env("MAX_INVESTIGATION_ITERATIONS", 2),
+        max_investigation_iterations=_nonnegative_int_env("MAX_INVESTIGATION_ITERATIONS", 0),
+        open_world_rca_mode=_open_world_mode_env(),
     )
+
+
+def _open_world_mode_env() -> str:
+    mode = os.getenv("OPEN_WORLD_RCA_MODE", "shadow").strip().lower()
+    return mode if mode in {"off", "shadow", "assist", "authoritative"} else "shadow"

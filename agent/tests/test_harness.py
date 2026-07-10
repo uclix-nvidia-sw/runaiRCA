@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from app.collectors.base import CollectorResult, artifact
 from app.schemas import AlertAnalysisResponse
-from app.services.harness import apply_safety_guardrail, apply_trace, assign_evidence_ids, evaluate
+from app.services.harness import (
+    EvidenceLink,
+    analysis_hash,
+    apply_safety_guardrail,
+    apply_trace,
+    assign_evidence_ids,
+    evaluate,
+    validate_evidence_links,
+)
 from app.services.root_cause_ranking import RankedCause
 
 
@@ -87,3 +95,57 @@ def test_safety_guardrail_covers_a_long_report() -> None:
 
     assert apply_safety_guardrail(response) is True
     assert evaluate(response, [], []).gates["unsafe_action_without_guardrail"] is False
+
+
+def test_typed_evidence_links_preserve_contradicting_evidence() -> None:
+    results = [_result("loki"), _result("system", "GPU remains healthy")]
+    assign_evidence_ids(results)
+    response = _response("## Root Cause\n\nLikely Xid [E01] despite the counter-signal [E02].")
+    verdict = evaluate(
+        response,
+        results,
+        [RankedCause("gpu_hardware_error", "high", 9)],
+        evidence_links=[
+            EvidenceLink("E01", "support", "Xid is present"),
+            {"evidence_id": "E02", "role": "contradict", "explanation": "node appears healthy"},
+        ],
+    )
+
+    assert verdict.claims[0]["supporting_evidence"] == ["E01"]
+    assert verdict.claims[0]["contradicting_evidence"] == ["E02"]
+    assert verdict.gates["missing_evidence_trace"] is False
+    assert verdict.gates["unresolved_contradiction"] is True
+    assert "tool_efficiency" not in verdict.dimensions
+    assert verdict.score <= 100
+
+
+def test_invalid_typed_evidence_link_is_a_hard_gate_not_an_exception() -> None:
+    results = [_result("loki")]
+    assign_evidence_ids(results)
+    valid, errors = validate_evidence_links(
+        [{"evidence_id": "unknown", "role": "support"}, {"evidence_id": "E01", "role": "made_up"}],
+        ["E01"],
+    )
+    assert valid == []
+    assert len(errors) == 2
+
+    verdict = evaluate(
+        _response(),
+        results,
+        [RankedCause("gpu_hardware_error", "medium", 5)],
+        evidence_links=[{"evidence_id": "unknown", "role": "support"}],
+    )
+    assert verdict.gates["invalid_evidence_links"] is True
+
+
+def test_analysis_hash_changes_when_the_approved_reasoning_changes() -> None:
+    response = _response()
+    response.context = {
+        "top_root_cause": {"mechanism": "CSI attach timeout"},
+        "reasoning_trace_v2": {"hypothesis_id": "H-1", "support": ["E01"]},
+    }
+    first = analysis_hash(response)
+
+    response.context["reasoning_trace_v2"] = {"hypothesis_id": "H-2", "support": ["E02"]}
+
+    assert analysis_hash(response) != first

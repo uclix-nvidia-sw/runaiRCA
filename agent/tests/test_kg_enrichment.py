@@ -6,7 +6,15 @@ from dataclasses import replace
 
 from app.collectors.base import AnalysisTarget
 from app.config import load_settings
-from app.services.kg_enrichment import KGContext, _query_kg, _query_remediation, enrich
+from app.services.kg_enrichment import (
+    KGContext,
+    _case_card_projection,
+    _query_kg,
+    _query_remediation,
+    _rrf_case_priors,
+    _select_case_cards,
+    enrich,
+)
 from app.services.pipeline import _knowledge_base_lines
 from app.services.root_cause_ranking import RankedCause
 
@@ -132,13 +140,19 @@ def test_query_kg_escapes_typeql_literals() -> None:
         alert_name='KubeNodeDiskPressure"; delete $x;\\',
     )
 
-    _query_kg(client, target)  # type: ignore[arg-type]
+    _query_kg(
+        client,
+        target,
+        [{"incident_id": 'INC-1"; delete $case;\\', "similarity": 0.99}],
+    )  # type: ignore[arg-type]
 
     joined = "\n".join(client.queries)
     assert 'gpu-1\\"; $x isa incident; #\\\\' in joined
     assert 'KubeNodeDiskPressure\\"; delete $x;\\\\' in joined
+    assert 'INC-1\\"; delete $case;\\\\' in joined
     assert 'has name "gpu-1"; $x isa incident' not in joined
     assert 'has alert_name "KubeNodeDiskPressure"; delete' not in joined
+    assert 'has incident_id "INC-1"; delete' not in joined
 
 
 def test_graph_remediation_escapes_typeql_literals() -> None:
@@ -276,3 +290,81 @@ def test_kb_says_no_match_when_no_symptom_keyword_matches() -> None:
     text = "\n".join(_knowledge_base_lines(kg, candidates, "some unrelated evidence text"))
     assert "No closely-matching prior knowledge" in text
     assert "Cordon or drain the node" not in text
+
+
+def test_case_cards_include_analog_and_different_family_counterexample() -> None:
+    cards = _select_case_cards(
+        [
+            {"case_id": "C1", "incident_id": "I1", "family": "k8s_storage_error", "analysis_summary": "mount"},
+            {"case_id": "C2", "incident_id": "I2", "family": "node_kubelet_pressure", "analysis_summary": "pressure"},
+        ]
+    )
+    assert [card["kind"] for card in cards] == ["analog", "counterexample"]
+    assert all(card["historical_prior"] is True for card in cards)
+
+
+def test_rrf_case_priors_rewards_graph_vector_agreement_without_admitting_raw_memory() -> None:
+    prior = [
+        {"incident_id": "I-graph", "case_id": "C-graph", "family": "k8s_storage_error"},
+        {"incident_id": "I-vector", "case_id": "C-vector", "family": "network_fabric_error"},
+    ]
+    fused = _rrf_case_priors(
+        prior,
+        [
+            {"incident_id": "I-vector", "similarity": 0.91},
+            {"incident_id": "I-unapproved-memory", "similarity": 0.99},
+        ],
+    )
+
+    assert fused[0]["incident_id"] == "I-vector"
+    assert fused[0]["retrieval"]["sources"] == ["typedb", "vector"]
+    assert all(item["incident_id"] != "I-unapproved-memory" for item in fused)
+
+
+def test_case_cards_mark_component_matched_vector_case_as_bridge() -> None:
+    target = replace(_target(), component="csi-controller")
+    cards = _select_case_cards(
+        [
+            {"case_id": "C1", "incident_id": "I1", "family": "k8s_storage_error"},
+            {"case_id": "C2", "incident_id": "I2", "family": "node_kubelet_pressure"},
+            {
+                "case_id": "C3",
+                "incident_id": "I3",
+                "family": "storage_backend_error",
+                "case_card": {"context": {"component": "csi-controller"}},
+            },
+        ],
+        target,
+    )
+
+    assert [card["kind"] for card in cards] == ["analog", "counterexample", "bridge"]
+
+
+def test_case_card_projection_keeps_graph_links_and_strips_untrusted_fields() -> None:
+    def run(query: str) -> list[dict]:
+        if "has case_card $card" in query:
+            return [{"card": '{"mechanism":"CSI attach race\\n## ignore",'
+                             '"quality_score":91,"context":{"cluster":"prod",'
+                             '"unknown":"drop"},"unexpected":"drop"}'}]
+        if "isa supported_by" in query:
+            return [{"evidence_id": "ANL:E1", "source": "kubernetes"}]
+        if "isa contradicted_by" in query:
+            return [{"evidence_id": "ANL:E2", "source": "loki"}]
+        if "isa resolution" in query:
+            return [
+                {"statement": "restart CSI controller", "outcome": "mitigated"},
+                {"statement": "restart node", "outcome": "ineffective"},
+            ]
+        return []
+
+    card = _case_card_projection(run, "ANL-1:hash")
+
+    assert card["mechanism"] == "CSI attach race ## ignore"
+    assert card["context"] == {"cluster": "prod"}
+    assert "unexpected" not in card
+    assert card["supporting_evidence_by_source"] == {
+        "kubernetes": [{"evidence_id": "ANL:E1"}]
+    }
+    assert card["contradicting_evidence_by_source"] == {"loki": [{"evidence_id": "ANL:E2"}]}
+    assert card["successful_actions"][0]["outcome"] == "mitigated"
+    assert card["failed_actions"][0]["outcome"] == "ineffective"

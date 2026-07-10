@@ -44,6 +44,9 @@ class InvestigationPlan:
     # contains questions/checks/disconfirmation, never a command to prove a
     # predetermined cause.
     diagnostic_directive: dict[str, Any] = field(default_factory=dict)
+    # Approved historical cases are priors only; collectors receive them to
+    # choose discriminating tests, never as current-incident evidence.
+    case_cards: list[dict[str, Any]] = field(default_factory=list)
 
     def for_collector(self, name: str) -> InvestigationPlan:
         """Give one collector the shared directive plus its neutral role."""
@@ -80,4 +83,5 @@ class InvestigationPlan:
             "matched_alert": self.matched_alert,
             "component": self.component,
             "diagnostic_directive": self.diagnostic_directive,
+            "case_cards": self.case_cards,
         }

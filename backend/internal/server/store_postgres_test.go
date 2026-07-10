@@ -38,6 +38,11 @@ func TestPostgresConnectReportsPGVectorEnabledAndLoadsState(t *testing.T) {
 		!state.Executed("idx_chat_conversations_updated_at") {
 		t.Fatalf("expected chat history schema statements, got %+v", state.Execs())
 	}
+	if !state.Executed("CREATE TABLE IF NOT EXISTS rca_case_snapshots") ||
+		!state.Executed("CREATE TABLE IF NOT EXISTS novel_cause_registry") ||
+		!state.Executed("idx_rca_case_snapshots_active_incident") {
+		t.Fatalf("expected immutable case snapshot schema statements, got %+v", state.Execs())
+	}
 	for _, ddl := range []string{
 		"ADD COLUMN IF NOT EXISTS user_approved_at",
 		"ADD COLUMN IF NOT EXISTS archived_at",

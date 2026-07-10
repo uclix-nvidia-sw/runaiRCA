@@ -29,6 +29,20 @@ class OntologyIncident(BaseModel):
     analysis_detail: str = ""
     run_id: str = ""
     analysis_hash: str = ""
+    # Immutable approval-bound CaseSnapshot identity. Empty only for legacy or
+    # explicitly --all ingestion where no approved snapshot exists.
+    case_id: str = ""
+    approval_state: str = ""
+    mechanism: str = ""
+    mechanism_fingerprint: str = ""
+    # Immutable backend CaseCard snapshot. The ingest path may add later
+    # operator-review outcomes keyed to the same approval hash, but never
+    # invents facts not present in this card or its attached reviews.
+    case_card: dict[str, Any] = Field(default_factory=dict)
+    successful_actions: list[dict[str, str]] = Field(default_factory=list)
+    failed_actions: list[dict[str, str]] = Field(default_factory=list)
+    quality_score: int | None = None
+    quality_source: str = ""
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     harness: dict[str, Any] = Field(default_factory=dict)
     title: str = ""

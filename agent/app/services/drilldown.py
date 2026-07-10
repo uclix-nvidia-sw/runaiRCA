@@ -9,7 +9,9 @@ collector's artifacts, where the existing pipeline (masking, signature matching,
 the verify pass, synthesis) consumes them with zero changes.
 
 Best-effort like the central investigation loop: flag off (ENABLE_AGENT_DRILLDOWN),
-no LLM, or ANY failure -> the base evidence stands. Read-only by construction:
+no LLM, or ANY failure -> the base evidence stands. There is no fixed query or
+step limit: a loop ends on `done`, a repeated query, or the analysis-wide
+deadline. Read-only by construction:
 the k8s tool is the allowlisted `k8s_read`, Run:ai calls are locked to GET under
 /api/, PromQL/LogQL only hit query endpoints, and SQL is a single SELECT inside
 a READ ONLY transaction (RUNAI_DB_DSN lets the postgres agent query the Run:ai
@@ -54,7 +56,7 @@ from app.collectors.loki import _loki_headers, _loki_streams, _sample_lines, lok
 from app.collectors.prometheus import prom_mcp_query, prom_query
 from app.collectors.runai_mcp import _tool_json, _tool_text
 from app.config import Settings
-from app.llm import complete_json, llm_configured, token_budget_exceeded, token_budget_warning
+from app.llm import complete_json, llm_configured
 from app.masking import build_masker
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
@@ -64,10 +66,10 @@ from app.mcp_client import (
     mcp_tool_json,
 )
 from app.plan import InvestigationPlan
+from app.services.probe_evaluation import evaluate_probe
 
 _log = logging.getLogger(__name__)
 
-_MAX_QUERIES_PER_STEP = 3
 _RESULT_CHARS = 1500  # per-query result excerpt fed back into the loop
 _USER_PROMPT_CHARS = 6000
 
@@ -77,6 +79,8 @@ async def run_drilldowns(
     results: list[CollectorResult],
     target: AnalysisTarget,
     plan: InvestigationPlan | None,
+    *,
+    blackboard: Any = None,
 ) -> None:
     """Run every domain's drill-down loop concurrently. Never raises."""
     if not settings.enable_agent_drilldown or not llm_configured(
@@ -85,7 +89,14 @@ async def run_drilldowns(
         return
     registry = _domain_tools(settings)
     tasks = [
-        _drill_one(settings, result, registry[result.agent], target, plan)
+        _drill_one(
+            settings,
+            result,
+            registry[result.agent],
+            target,
+            plan.for_collector(result.agent) if plan else None,
+            blackboard=blackboard,
+        )
         for result in results
         if result.agent in registry and result.status != "unavailable"
     ]
@@ -99,18 +110,31 @@ async def _drill_one(
     tools: dict[str, dict[str, Any]],
     target: AnalysisTarget,
     plan: InvestigationPlan | None,
+    *,
+    blackboard: Any = None,
 ) -> None:
-    """One agent's bounded think->query->observe loop over its own evidence."""
+    """One agent's adaptive think->query->observe loop over its own evidence."""
     masker = _drilldown_masker(settings)
     try:
         architecture = _implicated_architecture(settings, result, target)
         history: list[dict[str, Any]] = []
-        for step in range(max(1, settings.drilldown_max_steps)):
-            if token_budget_exceeded(settings):
-                result.warnings.append(token_budget_warning(settings))
-                break
+        seen_queries: set[str] = set()
+        # A TypeDB/YAML probe is executable only through this agent's existing
+        # read-only registry.  Run it before asking the LLM to improvise a
+        # query: the declarative probe is the durable operational knowledge,
+        # while the LLM decides what additional discriminator is worthwhile.
+        for query in _declared_probe_queries(plan, tools, target):
+            key = _query_fingerprint(query)
+            seen_queries.add(key)
+            await _run_query(
+                settings, result, tools, target, query, history, masker, blackboard=blackboard,
+                artifact_type="ontology_probe",
+            )
+        step = 0
+        while True:
+            step += 1
             user_prompt = masker.mask_text(
-                _user_prompt(result, target, plan, history, architecture)
+                _user_prompt(result, target, plan, history, architecture, blackboard=blackboard)
             )
             decision = await complete_json(
                 settings,
@@ -124,7 +148,7 @@ async def _drill_one(
                 # agent and nobody notices drill-down never ran (the litellm
                 # provider incident). Surface it in the report warnings.
                 result.warnings.append(
-                    f"{result.agent} drill-down stopped at step {step + 1}: "
+                    f"{result.agent} drill-down stopped at step {step}: "
                     "LLM decision call failed"
                 )
                 break
@@ -135,15 +159,19 @@ async def _drill_one(
                     len(history),
                 )
                 break
-            queries = [
-                q
-                for q in (decision.get("queries") or [])
-                if isinstance(q, dict) and str(q.get("tool") or "") in tools
-            ][:_MAX_QUERIES_PER_STEP]
+            queries = []
+            for q in decision.get("queries") or []:
+                if not isinstance(q, dict) or str(q.get("tool") or "") not in tools:
+                    continue
+                key = _query_fingerprint(q)
+                if key in seen_queries:
+                    continue
+                seen_queries.add(key)
+                queries.append(q)
             if not queries:
                 result.warnings.append(
-                    f"{result.agent} drill-down stopped at step {step + 1}: "
-                    "no allowed read-only query was returned"
+                    f"{result.agent} drill-down stopped at step {step}: "
+                    "no new allowed read-only query was returned"
                 )
                 break
             _log.info(
@@ -153,49 +181,8 @@ async def _drill_one(
                 len(queries),
             )
             for q in queries:
-                name = str(q.get("tool"))
-                args = q.get("args") if isinstance(q.get("args"), dict) else {}
-                outcome = await _call_tool_safely(tools[name]["call"], settings, target, args)
-                outcome = masker.mask_object(outcome)
-                if not isinstance(outcome, dict):
-                    outcome = {"error": "tool returned no result"}
-                error = outcome.get("error")
-                history_outcome = {"error": "query failed"} if error else outcome
-                history.append(
-                    {
-                        "tool": name,
-                        "args": json.dumps(args, default=str)[:300],
-                        "outcome": json.dumps(history_outcome, default=str)[:_RESULT_CHARS],
-                    }
-                )
-                # Transport notes surface as collector warnings (Diagnostics
-                # panel), NEVER inside artifact summaries — those feed the
-                # ranker/signature matchers and our own "no route to host"
-                # must not score as cluster evidence.
-                note = str(outcome.get("mcp_fallback") or "")
-                if note and note not in result.warnings:
-                    result.warnings.append(note)
-                # Finding-first: surface the problem signals in the data and hand
-                # them to the UI as highlights; the raw result stays attached.
-                markers = [] if error else salient_markers(outcome.get("result"))
-                summary = str(outcome.get("summary") or error or name)
-                if markers:
-                    summary = (
-                        f"{summary} — {signals_line(markers, getattr(settings, 'language', 'en'))}"
-                    )
-                result.artifacts.append(
-                    artifact(
-                        agent=result.agent,
-                        source=result.agent,
-                        type="drilldown_query",
-                        status="unavailable" if error else "ok",
-                        confidence="medium",
-                        query=str(outcome.get("query") or name),
-                        title=outcome.get("title"),
-                        highlights=markers or None,
-                        summary=summary,
-                        result=outcome.get("result"),
-                    )
+                await _run_query(
+                    settings, result, tools, target, q, history, masker, blackboard=blackboard
                 )
     except Exception as exc:  # noqa: BLE001 - drill-down is best-effort; base evidence stands
         result.warnings.append(
@@ -213,6 +200,176 @@ async def _call_tool_safely(
         return outcome if isinstance(outcome, dict) else {"error": "tool returned no result"}
     except Exception as exc:  # noqa: BLE001 - a failing query is an observation
         return {"error": f"{exc.__class__.__name__}: {exc}"}
+
+
+async def _run_query(
+    settings: Settings,
+    result: CollectorResult,
+    tools: dict[str, dict[str, Any]],
+    target: AnalysisTarget,
+    query: dict[str, Any],
+    history: list[dict[str, Any]],
+    masker: Any,
+    *,
+    blackboard: Any = None,
+    artifact_type: str = "drilldown_query",
+) -> None:
+    """Execute one registry-validated query and preserve its observation."""
+    name = str(query.get("tool") or "")
+    if name not in tools:
+        return
+    args = query.get("args") if isinstance(query.get("args"), dict) else {}
+    outcome = await _call_tool_safely(tools[name]["call"], settings, target, args)
+    outcome = masker.mask_object(outcome)
+    if not isinstance(outcome, dict):
+        outcome = {"error": "tool returned no result"}
+    error = outcome.get("error")
+    probe = query.get("_ontology_probe")
+    if artifact_type == "ontology_probe" and isinstance(probe, dict):
+        assessment = evaluate_probe(probe, outcome).as_dict()
+        assessment["hypothesis_family"] = str(probe.get("hypothesis_family") or "")
+        assessments = result.details.setdefault("ontology_probe_assessments", [])
+        if isinstance(assessments, list):
+            assessments.append(assessment)
+    history_outcome = {"error": "query failed"} if error else outcome
+    history.append(
+        {
+            "tool": name,
+            "args": json.dumps(args, default=str)[:300],
+            "outcome": json.dumps(history_outcome, default=str)[:_RESULT_CHARS],
+        }
+    )
+    # Transport notes surface as collector warnings (Diagnostics panel), never
+    # inside evidence summaries which feed the ranker/signature matchers.
+    note = str(outcome.get("mcp_fallback") or "")
+    if note and note not in result.warnings:
+        result.warnings.append(note)
+    markers = [] if error else salient_markers(outcome.get("result"))
+    summary = str(outcome.get("summary") or error or name)
+    if markers:
+        summary = f"{summary} — {signals_line(markers, getattr(settings, 'language', 'en'))}"
+    result.artifacts.append(
+        artifact(
+            agent=result.agent,
+            source=result.agent,
+            type=artifact_type,
+            status="unavailable" if error else "ok",
+            confidence="medium",
+            query=str(outcome.get("query") or name),
+            title=outcome.get("title"),
+            highlights=markers or None,
+            summary=summary,
+            result=outcome.get("result"),
+        )
+    )
+    if artifact_type == "ontology_probe" and isinstance(probe, dict):
+        assessments = result.details.get("ontology_probe_assessments")
+        if isinstance(assessments, list) and assessments:
+            assessments[-1]["artifact_index"] = len(result.artifacts) - 1
+    _record_blackboard(blackboard, result, target)
+
+
+_PROBE_PLACEHOLDER = re.compile(r"{{([a-zA-Z_][a-zA-Z0-9_]*)}}")
+
+
+def _probe_target_values(target: AnalysisTarget) -> dict[str, str]:
+    """The complete, deliberately small placeholder vocabulary for probes.
+
+    Values come only from the resolved alert target.  Do not add evidence text,
+    LLM output, or an empty fallback here: a missing identifier must skip the
+    targeted probe rather than widening it into a namespace/cluster sweep.
+    """
+    names = (
+        "namespace",
+        "pod",
+        "node",
+        "workload",
+        "workload_name",
+        "project",
+        "service",
+        "component",
+        "storage_claim",
+        "volume",
+    )
+    aliases = {"workload": "workload_name"}
+    values: dict[str, str] = {}
+    for name in names:
+        value = str(getattr(target, aliases.get(name, name), "") or "").strip()
+        # Alert metadata is untrusted.  Reject query-breaking control characters
+        # and nested template syntax; _resolve_probe_template then treats this
+        # exactly like an unresolved value and skips the probe safely.
+        if "{{" in value or "}}" in value or any(ord(char) < 32 or ord(char) == 127 for char in value):
+            value = ""
+        values[name] = value
+    return values
+
+
+def _declared_probe_queries(
+    plan: InvestigationPlan | None,
+    tools: dict[str, dict[str, Any]],
+    target: AnalysisTarget,
+) -> list[dict[str, Any]]:
+    """Resolve only curated probe templates that this agent can safely execute.
+
+    Unknown or empty placeholders cause the whole probe to be skipped.  That is
+    intentional: falling back to an empty namespace/name could turn a targeted
+    diagnostic into a cluster-wide sweep.
+    """
+    directive = plan.diagnostic_directive if plan else {}
+    raw_probes = directive.get("probes") if isinstance(directive, dict) else []
+    if not isinstance(raw_probes, list):
+        return []
+    values = _probe_target_values(target)
+    queries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_probe in raw_probes:
+        if not isinstance(raw_probe, dict):
+            continue
+        tool = str(raw_probe.get("tool") or "")
+        template = raw_probe.get("arguments_template")
+        if tool not in tools or not isinstance(template, dict):
+            continue
+        args = _resolve_probe_template(template, values)
+        if args is None:
+            continue
+        query = {"tool": tool, "args": args, "_ontology_probe": raw_probe}
+        fingerprint = _query_fingerprint(query)
+        if fingerprint not in seen:
+            seen.add(fingerprint)
+            queries.append(query)
+    return queries
+
+
+def _query_fingerprint(query: dict[str, Any]) -> str:
+    """Deduplicate execution identity, not internal ontology metadata."""
+    return json.dumps(
+        {key: value for key, value in query.items() if not str(key).startswith("_")},
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _resolve_probe_template(value: Any, values: dict[str, str]) -> Any | None:
+    if isinstance(value, dict):
+        resolved = {str(key): _resolve_probe_template(item, values) for key, item in value.items()}
+        return None if any(item is None for item in resolved.values()) else resolved
+    if isinstance(value, list):
+        resolved = [_resolve_probe_template(item, values) for item in value]
+        return None if any(item is None for item in resolved) else resolved
+    if not isinstance(value, str):
+        return value
+
+    unresolved = False
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal unresolved
+        replacement = values.get(match.group(1), "")
+        if not replacement:
+            unresolved = True
+        return replacement
+
+    resolved = _PROBE_PLACEHOLDER.sub(replace, value)
+    return None if unresolved else resolved
 
 
 def _drilldown_masker(settings: Settings):
@@ -289,12 +446,16 @@ def _system_prompt(agent: str, tools: dict[str, dict[str, Any]]) -> str:
         "a downstream symptom). Do NOT stop at the first plausible-looking line. Answer "
         "action=done ONLY when your own domain is thoroughly covered and further queries "
         "would be redundant.\n"
+        "- If ontology_guidance is supplied, turn its questions and checks into narrow "
+        "queries using only your tools. Its candidate family is a hypothesis, not evidence: "
+        "actively look for the listed disconfirmations too. Never execute check prose as a "
+        "command. If it includes structured probes, use only probes whose tool is in your "
+        "registry and resolve their placeholders from the incident scope.\n"
         "- Stay strictly read-only and inside your tools, and avoid blind sweeps — every "
         "query must test a specific idea.\n"
         f"Tools available to you (your only tools; there are no others):\n{tool_lines}\n"
         'Respond with ONLY JSON: {"action":"query"|"done","reason":str,'
-        '"queries":[{"tool":str,"args":{...}}]} with at most '
-        f"{_MAX_QUERIES_PER_STEP} queries per step."
+        '"queries":[{"tool":str,"args":{...}}]}.'
     )
 
 
@@ -304,15 +465,29 @@ def _user_prompt(
     plan: InvestigationPlan | None,
     history: list[dict[str, Any]],
     architecture: list[str] | None = None,
+    *,
+    blackboard: Any = None,
 ) -> str:
     plan_dict = plan.as_dict() if plan else {}
     stable = {
         "target": {
             key: getattr(target, key, "")
-            for key in ("namespace", "workload_name", "pod", "node", "project")
+            for key in (
+                "namespace",
+                "workload_name",
+                "pod",
+                "node",
+                "project",
+                "service",
+                "component",
+                "storage_claim",
+                "volume",
+            )
         },
         "plan_focus": plan_dict.get("focus"),
         "hypotheses": (plan_dict.get("hypotheses") or [])[:4],
+        "historical_case_cards": (plan_dict.get("case_cards") or [])[:3],
+        "ontology_guidance": _ontology_guidance(plan),
     }
     if architecture:
         # Curated platform topology for the components THIS incident implicates:
@@ -327,13 +502,89 @@ def _user_prompt(
             if _artifact_is_evidence(art)
         ],
         "drilldown_so_far": history[-8:],
+        "shared_observations": _blackboard_prompt_view(blackboard, target),
     }
     return _capped_json_prompt(
         stable,
         variable,
         max_chars=_USER_PROMPT_CHARS,
-        trim_keys=("drilldown_so_far", "my_artifacts"),
+        trim_keys=("drilldown_so_far", "my_artifacts", "shared_observations"),
     )
+
+
+def _record_blackboard(blackboard: Any, result: CollectorResult, target: AnalysisTarget) -> None:
+    method = getattr(blackboard, "add_result", None)
+    if not callable(method):
+        return
+    entity = next(
+        (
+            f"{key}:{value}"
+            for key in ("pod", "node", "workload_name", "service", "storage_claim", "namespace")
+            if (value := str(getattr(target, key, "") or "").strip())
+        ),
+        "",
+    )
+    try:
+        method(result.agent, result, entity=entity, timestamp=str(getattr(target, "fired_at", "") or ""))
+    except Exception:  # noqa: BLE001 - shared reasoning is advisory
+        return
+
+
+def _blackboard_prompt_view(blackboard: Any, target: AnalysisTarget) -> list[dict[str, Any]]:
+    method = getattr(blackboard, "prompt_view", None)
+    if not callable(method):
+        return []
+    hints = [
+        f"{key}:{value}"
+        for key in ("pod", "node", "workload_name", "namespace")
+        if (value := str(getattr(target, key, "") or "").strip())
+    ]
+    try:
+        view = method(entity_hints=hints, limit=12)
+    except Exception:  # noqa: BLE001
+        return []
+    return view if isinstance(view, list) else []
+
+
+def _ontology_guidance(plan: InvestigationPlan | None) -> dict[str, Any]:
+    """Bounded, source-scoped TypeDB guidance for one evidence agent.
+
+    The evidence agents receive the runbook as hypotheses and questions, never as
+    executable commands. Their domain tool registry remains the enforcement point
+    for read-only access.
+    """
+    directive = plan.diagnostic_directive if plan else {}
+    if not isinstance(directive, dict):
+        return {}
+
+    def strings(key: str, limit: int) -> list[str]:
+        values = directive.get(key) or []
+        if not isinstance(values, list):
+            return []
+        return [str(value)[:500] for value in values if str(value).strip()][0:limit]
+
+    guidance = {
+        "source": str(directive.get("source") or ""),
+        "path": strings("path", 6),
+        "questions": strings("questions", 4),
+        "checks": strings("checks", 4),
+        "probes": [
+            item
+            for item in (directive.get("probes") or [])
+            if isinstance(item, dict)
+        ][:4],
+        "disconfirm": strings("disconfirm", 4),
+        "competing_hypotheses": [
+            item
+            for item in (directive.get("competing_hypotheses") or [])
+            if isinstance(item, dict)
+        ][:4],
+        "candidate_family": str(directive.get("provisional_family") or ""),
+        "collector": str(directive.get("collector") or ""),
+        "primary": bool(directive.get("primary")),
+        "collector_instruction": str(directive.get("collector_instruction") or ""),
+    }
+    return {key: value for key, value in guidance.items() if value not in ("", [], None)}
 
 
 def _capped_json_prompt(

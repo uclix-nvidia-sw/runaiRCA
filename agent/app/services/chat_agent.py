@@ -23,12 +23,7 @@ from collections.abc import Awaitable, Callable
 
 from app.collectors.base import AnalysisTarget, resolve_target
 from app.config import Settings
-from app.llm import (
-    complete_json,
-    complete_with_error,
-    token_budget_exceeded,
-    token_budget_warning,
-)
+from app.llm import complete_json, complete_with_error
 from app.masking import build_masker
 from app.schemas import Alert, AlertAnalysisRequest, AlertAnalysisResponse, ChatRequest
 from app.services.drilldown import _call_tool_safely, _domain_tools
@@ -73,9 +68,6 @@ async def answer_chat(
         target = resolve_target({}, {})  # tools read their params from args, not target
         history: list[dict] = []
         for _ in range(_MAX_STEPS):
-            if token_budget_exceeded(settings):
-                history.append({"note": token_budget_warning(settings)})
-                break
             safe_history = masker.mask_object(history)
             if not isinstance(safe_history, list):
                 safe_history = []

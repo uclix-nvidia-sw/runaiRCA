@@ -212,6 +212,10 @@
     - "fabric manager"
     - "gpudirect"
     - "link flap"
+    - "collective communicator"
+    - "remote transport"
+    - "completion queue"
+    - "retry exhaustion"
   planner_keywords:
     - "nccl"
     - "infiniband"
@@ -250,6 +254,9 @@
     - "volumebinding"
     - "storageclass"
     - "persistentvolumeclaim"
+    - "volume attach operation"
+    - "persistent claim"
+    - "device publication conflict"
   planner_keywords:
     - "volume"
     - "pvc"

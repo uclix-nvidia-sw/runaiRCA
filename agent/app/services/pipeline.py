@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -32,8 +33,6 @@ from app.llm import (
     complete_json,
     llm_configured,
     parse_json_object,
-    token_budget_exceeded,
-    token_budget_warning,
 )
 from app.masking import Masker, build_masker
 from app.plan import InvestigationPlan
@@ -43,7 +42,11 @@ from app.schemas import AlertAnalysisRequest, AlertAnalysisResponse
 from app.services.decision_tree import resolve_tree, walk_tree
 from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
 from app.services.planner import plan_investigation
-from app.services.root_cause_ranking import RankedCause, rank_root_cause_candidates
+from app.services.root_cause_ranking import (
+    RankedCause,
+    merge_open_world_candidates,
+    rank_root_cause_candidates,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -67,6 +70,10 @@ class PipelineState:
     plan: InvestigationPlan | None = None
     results: list[CollectorResult] = field(default_factory=list)
     investigation_context: dict[str, object] = field(default_factory=dict)
+    # Per-analysis shared, query-safe facts.  This is intentionally runtime
+    # state; the selected trace is persisted only after the response passes the
+    # approval path.
+    blackboard: Any = None
     priors: dict[str, float] | None = None
     observed: str = ""
     alert_fuzzy: str = ""
@@ -74,6 +81,7 @@ class PipelineState:
     failure_modes: dict[str, list[dict]] = field(default_factory=dict)
     known_issues: list[dict] = field(default_factory=list)
     root_cause_candidates: list[RankedCause] = field(default_factory=list)
+    open_world_candidates: list[RankedCause] = field(default_factory=list)
     self_check_caveat: str = ""
     self_check_refuted: bool = False
     self_check_next: str = ""
@@ -105,6 +113,7 @@ class _ReanalysisTarget:
 class _ReanalysisOutcome:
     results: list[CollectorResult]
     candidates: list[RankedCause]
+    investigation_context: dict[str, Any]
     caveat: str
     note: str
     refuted: bool
@@ -168,7 +177,9 @@ async def enrich_stage(state: PipelineState) -> PipelineState:
     )
     # Knowledge graph is consulted once here before planning, then the same
     # snapshot guides collectors and final synthesis — not a parallel collector.
-    state.kg_context = await enrich(state.settings, target)
+    state.kg_context = await enrich(
+        state.settings, target, list(state.request.similar_incidents)
+    )
     return state
 
 
@@ -241,6 +252,9 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
 
     target = _scope_target(state.target, plan)
     state.investigation_context = {}
+    from app.services.evidence_blackboard import Blackboard
+
+    state.blackboard = Blackboard()
 
     # Synthesis MUST see EVERY collector's result. Await the full gather over ALL
     # collectors here, before any ranking/synthesis, and never synthesize from a
@@ -253,6 +267,12 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
     ):
         from app.services.investigator import investigate
 
+        investigation_kwargs: dict[str, Any] = {"reporter": state.progress}
+        if (
+            getattr(settings, "open_world_rca_mode", "off") != "off"
+            and _accepts_keyword(investigate, "blackboard")
+        ):
+            investigation_kwargs["blackboard"] = state.blackboard
         state.results, state.investigation_context = await investigate(
             settings,
             target,
@@ -260,7 +280,7 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
             plan,
             state.kg_context.as_dict(),
             settings.max_investigation_steps,
-            reporter=state.progress,
+            **investigation_kwargs,
         )
     else:
         state.progress.emit("collection", "Gathering collector evidence")
@@ -281,6 +301,15 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
         "synthesis must wait for all collectors: "
         f"{len(state.results)} results for {len(state.collectors)} collectors"
     )
+    # The investigator receives the board only in open-world mode for backward
+    # compatibility with legacy integrations, but every evidence agent must
+    # still receive the same shared observations during drill-down. Seeding is
+    # idempotent, so this also covers results already recorded by investigate.
+    state.blackboard.seed_results(
+        state.results,
+        entity=_blackboard_target_entity(target),
+        timestamp=getattr(target, "fired_at", ""),
+    )
     # Deterministic flowchart-driven follow-up: keep pulling k8s evidence based on
     # what was found (Pending -> events/quota/pvc -> storageclass; CrashLoop/
     # ImagePull -> events). Runs with OR without the LLM loop, so collection stays
@@ -294,6 +323,11 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
         await k8s_followup(settings, k8s_result, target)
         # Cross-collector: k8s findings (OOM/restart/Pending) -> derived PromQL.
         await prometheus_followup(settings, prom_result, k8s_result, target)
+        state.blackboard.seed_results(
+            state.results,
+            entity=_blackboard_target_entity(target),
+            timestamp=getattr(target, "fired_at", ""),
+        )
     except Exception:  # noqa: BLE001 - follow-up is best-effort, never fail analysis
         pass
     # Per-collector autonomous drill-down (LLM-gated): each domain agent runs a
@@ -302,7 +336,7 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
     try:
         from app.services.drilldown import run_drilldowns
 
-        await run_drilldowns(settings, state.results, target, plan)
+        await run_drilldowns(settings, state.results, target, plan, blackboard=state.blackboard)
     except Exception:  # noqa: BLE001 - drill-down is best-effort
         pass
     for r in state.results:
@@ -315,7 +349,147 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
         )
 
     _aggregate_evidence(state)
+    _link_probe_assessments_to_ledger(state)
+    # The blackboard facts are an additive, compact trace for ranking/synthesis;
+    # raw artifacts remain the source for the existing response contract.
+    state.investigation_context.setdefault(
+        "reasoning_trace_v2",
+        {
+            "schema_version": 2,
+            "hypotheses": state.investigation_context.get("hypothesis_ledger", []),
+            "referenced_facts": state.blackboard.prompt_view(limit=30),
+            "stop_reason": "base_evidence_complete",
+        },
+    )
+    state.investigation_context["reasoning_trace_v2"] = _public_reasoning_trace(
+        state.investigation_context.get("reasoning_trace_v2"), state
+    )
+    assessments = _probe_assessments(state.results)
+    if assessments:
+        trace = state.investigation_context.get("reasoning_trace_v2")
+        if isinstance(trace, dict):
+            trace["probe_assessments"] = assessments
     return state
+
+
+def _blackboard_target_entity(target: AnalysisTarget) -> str:
+    for field_name in ("pod", "node", "workload_name", "namespace", "alert_name"):
+        value = str(getattr(target, field_name, "") or "").strip()
+        if value:
+            return f"{field_name}:{value}"
+    return ""
+
+
+def _accepts_keyword(callable_obj: Any, name: str) -> bool:
+    """Keep the optional blackboard additive for legacy integrations/tests."""
+    try:
+        parameters = inspect.signature(callable_obj).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == name or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _probe_assessments(results: list[CollectorResult]) -> list[dict[str, Any]]:
+    """Expose only structured, query-free probe verdicts to subsequent reasoning."""
+    assessments: list[dict[str, Any]] = []
+    for result in results:
+        raw = result.details.get("ontology_probe_assessments")
+        if not isinstance(raw, list):
+            continue
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            verdict = str(item.get("verdict") or "")
+            if verdict not in {"supports", "refutes", "inconclusive", "unavailable"}:
+                continue
+            assessments.append(
+                {
+                    "agent": result.agent,
+                    "probe_id": str(item.get("probe_id") or "")[:120],
+                    "tool": str(item.get("tool") or "")[:80],
+                    "verdict": verdict,
+                    "support_signals": [str(value)[:160] for value in item.get("support_signals") or []],
+                    "refute_signals": [str(value)[:160] for value in item.get("refute_signals") or []],
+                    "hypothesis_family": str(item.get("hypothesis_family") or "")[:120],
+                    "evidence_id": _assessment_evidence_id(result, item),
+                }
+            )
+    return assessments[:30]
+
+
+def _assessment_evidence_id(result: CollectorResult, assessment: dict[str, Any]) -> str:
+    try:
+        index = int(assessment.get("artifact_index"))
+    except (TypeError, ValueError):
+        return ""
+    if 0 <= index < len(result.artifacts):
+        return str(getattr(result.artifacts[index], "evidence_id", "") or "")
+    return ""
+
+
+def _link_probe_assessments_to_ledger(state: PipelineState) -> None:
+    """Attach deterministic probe verdicts to matching hypotheses, never promote them.
+
+    The authored directive identifies the *known-family* hypothesis a probe was
+    designed to discriminate.  A verdict only contributes a real response-local
+    evidence ID; status/confidence still require the investigator/ranker to
+    weigh all corroborating and contradicting observations.
+    """
+    ledger = state.investigation_context.get("hypothesis_ledger")
+    if not isinstance(ledger, list):
+        return
+    for assessment in _probe_assessments(state.results):
+        family = assessment.get("hypothesis_family")
+        evidence_id = assessment.get("evidence_id")
+        verdict = assessment.get("verdict")
+        if not family or not evidence_id or verdict not in {"supports", "refutes"}:
+            continue
+        for hypothesis in ledger:
+            if not isinstance(hypothesis, dict) or hypothesis.get("family") != family:
+                continue
+            key = "evidence_for" if verdict == "supports" else "evidence_against"
+            current = hypothesis.setdefault(key, [])
+            if isinstance(current, list) and evidence_id not in current:
+                current.append(evidence_id)
+
+
+def _blackboard_artifact_evidence_ids(state: PipelineState) -> dict[str, str]:
+    board = state.blackboard
+    identify = getattr(board, "evidence_id_for", None)
+    if not callable(identify):
+        return {}
+    aliases: dict[str, str] = {}
+    for result in state.results:
+        for artifact in result.artifacts:
+            evidence_id = str(getattr(artifact, "evidence_id", "") or "")
+            if not evidence_id:
+                continue
+            try:
+                aliases[str(identify(artifact))] = evidence_id
+            except Exception:  # noqa: BLE001 - a missing alias is harmless
+                continue
+    return aliases
+
+
+def _public_reasoning_trace(trace: object, state: PipelineState) -> dict[str, Any]:
+    if not isinstance(trace, dict):
+        return {}
+    aliases = _blackboard_artifact_evidence_ids(state)
+    output = dict(trace)
+    facts = output.get("referenced_facts")
+    if isinstance(facts, list):
+        output["referenced_facts"] = [
+            {
+                **fact,
+                "evidence_id": aliases.get(str(fact.get("evidence_id") or ""), fact.get("evidence_id")),
+            }
+            for fact in facts
+            if isinstance(fact, dict)
+        ]
+    return output
 
 
 def _component_identity(
@@ -550,8 +724,17 @@ async def rank_stage(state: PipelineState) -> PipelineState:
             match_failure_mode_symptoms(state.failure_modes, state.observed), lifecycle
         ),
     )
+    open_world = _merge_open_world_candidates(state, state.root_cause_candidates)
+    # Shadow and assist expose evidence-gated novel reasoning in context without
+    # changing the headline.  Only authoritative mode may replace the final RCA.
+    if getattr(settings, "open_world_rca_mode", "off") == "authoritative":
+        state.root_cause_candidates = open_world
     if state.root_cause_candidates:
         top = state.root_cause_candidates[0]
+        # A shadow/assist candidate is explicitly not the approved diagnosis.
+        # Persist a mechanism only when the final headline is itself the
+        # evidence-gated open-world candidate.
+        _record_selected_open_world_hypothesis(state)
         state.progress.emit(
             "ranking",
             f"Top candidate: {top.family}",
@@ -568,6 +751,93 @@ async def rank_stage(state: PipelineState) -> PipelineState:
             top.evidence_agents,
         )
     return state
+
+
+def _merge_open_world_candidates(
+    state: PipelineState, known_candidates: list[RankedCause]
+) -> list[RankedCause]:
+    """Merge evidence-gated novel candidates for both initial and follow-up ranks."""
+    _prepare_open_world_ledger(state)
+    merged = merge_open_world_candidates(
+        known_candidates,
+        state.investigation_context.get("hypothesis_ledger"),
+        fact_groups=_blackboard_fact_groups(
+            state.blackboard, _blackboard_artifact_evidence_ids(state)
+        ),
+        enabled=getattr(state.settings, "open_world_rca_mode", "off") != "off",
+    )
+    state.open_world_candidates = [
+        candidate for candidate in merged if candidate.novelty == "open_world"
+    ]
+    return merged
+
+
+def _refresh_public_reasoning_trace(state: PipelineState) -> None:
+    """Convert private F-id references to response-local E-id citations."""
+    trace = state.investigation_context.get("reasoning_trace_v2")
+    if isinstance(trace, dict):
+        state.investigation_context["reasoning_trace_v2"] = _public_reasoning_trace(
+            trace, state
+        )
+
+
+def _record_selected_open_world_hypothesis(state: PipelineState) -> None:
+    """Persist a mechanism only if the open-world candidate is the headline."""
+    trace = state.investigation_context.get("reasoning_trace_v2")
+    if not state.root_cause_candidates or not isinstance(trace, dict):
+        return
+    top = state.root_cause_candidates[0]
+    if top.novelty != "open_world" or not top.mechanism:
+        return
+    trace["selected_hypothesis"] = {
+        "hypothesis_id": top.hypothesis_id,
+        "mechanism": top.mechanism,
+        "mechanism_fingerprint": top.mechanism_fingerprint,
+        "family": top.family,
+        "supporting_evidence_ids": top.support_evidence_ids,
+        "contradicting_evidence_ids": top.contradiction_evidence_ids,
+    }
+
+
+def _prepare_open_world_ledger(state: PipelineState) -> None:
+    ledger = state.investigation_context.get("hypothesis_ledger")
+    if not isinstance(ledger, list):
+        return
+    aliases = _blackboard_artifact_evidence_ids(state)
+    known = set(aliases.values())
+    for item in ledger:
+        if not isinstance(item, dict):
+            continue
+        for source_key, target_key in (
+            ("evidence_for", "support_evidence_ids"),
+            ("evidence_against", "contradiction_evidence_ids"),
+        ):
+            references = item.get(source_key)
+            if not isinstance(references, list):
+                continue
+            ids = [
+                match.group(0)
+                for value in references
+                for match in re.finditer(r"F-[0-9a-f]{12,64}", str(value))
+                if aliases.get(match.group(0)) in known
+            ]
+            if ids:
+                item[target_key] = list(dict.fromkeys(aliases[fact_id] for fact_id in ids))
+
+
+def _blackboard_fact_groups(blackboard: Any, aliases: dict[str, str] | None = None) -> dict[str, str]:
+    facts = getattr(blackboard, "facts", None)
+    if not callable(facts):
+        return {}
+    try:
+        aliases = aliases or {}
+        return {
+            aliases.get(str(fact.fact_id), str(fact.fact_id)): str(fact.independence_group)
+            for fact in facts()
+            if getattr(fact, "fact_id", "")
+        }
+    except Exception:  # noqa: BLE001 - blackboard remains an optional enhancement
+        return {}
 
 
 async def self_check_stage(state: PipelineState) -> PipelineState:
@@ -729,6 +999,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                 fallback_detail=state.detail,
                 timeline=state.timeline,
                 troubleshooting_path=state.troubleshooting_path,
+                reasoning_trace=state.investigation_context.get("reasoning_trace_v2"),
             )
         if synth:
             state.summary, state.detail = synth
@@ -805,6 +1076,10 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             "plan": plan.as_dict(),
             "hypothesis_ledger": state.investigation_context.get("hypothesis_ledger"),
             "investigation": state.investigation_context,
+            "reasoning_trace_v2": state.investigation_context.get("reasoning_trace_v2", {}),
+            "open_world_candidates": [
+                candidate.as_dict() for candidate in state.open_world_candidates
+            ],
             **({"timeline": state.timeline} if state.timeline else {}),
             **(
                 {"troubleshooting_path": state.troubleshooting_path}
@@ -829,6 +1104,11 @@ async def harness_stage(state: PipelineState) -> PipelineState:
         evaluate,
         payload,
     )
+    from app.services.critic import (
+        CriticResult,
+        apply_safe_patches,
+        critique_claims,
+    )
 
     response = state.response
     assert response is not None
@@ -848,6 +1128,27 @@ async def harness_stage(state: PipelineState) -> PipelineState:
         state.root_cause_candidates,
         next_check=state.self_check_next,
     )
+    evidence_ids = [
+        str(getattr(artifact, "evidence_id", ""))
+        for artifact in state.artifacts
+        if getattr(artifact, "evidence_id", "")
+    ]
+    critic = critique_claims(verdict.claims, available_evidence_ids=evidence_ids)
+    llm_critic = await _semantic_critic(
+        state.settings,
+        verdict.claims,
+        available_evidence_ids=evidence_ids,
+    )
+    if not llm_critic.is_noop:
+        critic = CriticResult(
+            issues=(*critic.issues, *llm_critic.issues),
+            patches=(*critic.patches, *llm_critic.patches),
+            status="issues",
+        )
+    patched_claims = apply_safe_patches(verdict.claims, critic)
+    for claim in patched_claims:
+        if claim.get("claim_id") == "C01" and claim.get("confidence") == "medium":
+            apply_confidence_downgrade(state.root_cause_candidates)
     for _ in range(state.settings.max_rca_repair_attempts):
         if not verdict.failed_gates and verdict.score >= state.settings.rca_harness_pass_score:
             break
@@ -885,10 +1186,54 @@ async def harness_stage(state: PipelineState) -> PipelineState:
     ]
     response.context["top_root_cause"] = top.as_dict() if top else None
     response.context["harness"] = payload(verdict, status=status, repairs=repairs)
+    response.context["harness"]["critic"] = critic.as_dict()
     response.context["analysis_hash"] = analysis_hash(response)
     response.analysis = response.analysis_detail
     state.response = response
     return state
+
+
+async def _semantic_critic(
+    settings: Settings,
+    claims: list[dict[str, Any]],
+    *,
+    available_evidence_ids: list[str],
+):
+    """Ask an optional critic for whitelist-only claim patches.
+
+    The critic never sees raw credentials or tool output and its response is
+    parsed by ``parse_critic_result``; it can only downgrade confidence or mark
+    a claim inferred, never manufacture an RCA or remediation.
+    """
+    from app.services.critic import CriticResult, parse_critic_result
+
+    # Stage-model overrides conventionally fall back to LLM_MODEL. Leaving
+    # LLM_MODEL_CRITIC empty must not silently disable the semantic critic.
+    model = str(getattr(settings, "llm_model_critic", "") or "").strip() or settings.llm_model
+    if not llm_configured(settings, model):
+        return CriticResult()
+    try:
+        raw = await complete_json(
+            settings,
+            system=(
+                "You are a skeptical RCA claim critic. Inspect only evidence IDs and claim links. "
+                "Return JSON with optional issues and patches. Allowed patches are exclusively "
+                "downgrade_confidence to low/medium or mark_inferred to inferred. Never add "
+                "evidence, actions, mechanisms, or prose."
+            ),
+            user=json.dumps(
+                {"claims": claims, "available_evidence_ids": available_evidence_ids},
+                ensure_ascii=False,
+            ),
+            model=model,
+        )
+    except Exception:  # noqa: BLE001 - critic is advisory, hard gates remain local
+        return CriticResult()
+    return parse_critic_result(
+        raw,
+        claim_ids=[str(claim.get("claim_id") or "") for claim in claims],
+        available_evidence_ids=available_evidence_ids,
+    )
 
 
 async def run_pipeline(
@@ -920,18 +1265,12 @@ async def _investigate_until_settled(state: PipelineState) -> None:
         and state.settings.enable_investigation_loop
     ):
         return
-    cap = max(0, int(getattr(state.settings, "max_investigation_iterations", 0) or 0))
-    if cap <= 0:
-        return
-
     attempted: set[str] = set()
-    # ponytail: cap 0 disables this control-flow expansion; the loop never recurses.
-    for _ in range(cap):
+    # Completion is semantic: stop only after the candidate is settled, every
+    # candidate has been tried, no new evidence arrives, or the outer deadline
+    # cancels the analysis.  Query/agent-step counters are not quality gates.
+    while True:
         if not _needs_more_investigation(state):
-            break
-        if token_budget_exceeded(state.settings):
-            state.extra_warnings.append(token_budget_warning(state.settings))
-            _aggregate_evidence(state)
             break
         if _deadline_exceeded(state):
             state.extra_warnings.append(
@@ -951,6 +1290,11 @@ async def _investigate_until_settled(state: PipelineState) -> None:
             break
 
         state.results = outcome.results
+        # Keep the latest hypothesis/evidence ledger.  Previously re-analysis
+        # ranked its fresh evidence but discarded the ledger that explained it,
+        # so a valid open-world hypothesis could neither cite evidence nor
+        # participate in the final headline.
+        state.investigation_context = outcome.investigation_context
         state.root_cause_candidates = outcome.candidates
         state.self_check_caveat = outcome.caveat
         state.reanalysis_note = "\n\n".join(
@@ -959,6 +1303,11 @@ async def _investigate_until_settled(state: PipelineState) -> None:
         state.self_check_refuted = outcome.refuted
         state.self_check_next = outcome.next_check
         _aggregate_evidence(state)
+        _refresh_public_reasoning_trace(state)
+        open_world = _merge_open_world_candidates(state, state.root_cause_candidates)
+        if getattr(state.settings, "open_world_rca_mode", "off") == "authoritative":
+            state.root_cause_candidates = open_world
+        _record_selected_open_world_hypothesis(state)
 
         after_family = state.root_cause_candidates[0].family if state.root_cause_candidates else ""
         if after_family == before_family and _evidence_signature(state.results) == before_evidence:
@@ -1110,6 +1459,12 @@ async def _reanalyze_once(
             if isinstance(h, dict) and h.get("family") != target.family
         ]
         replan = replace(plan, hypotheses=[lead, *rest])
+        investigation_kwargs: dict[str, Any] = {}
+        if (
+            getattr(state.settings, "open_world_rca_mode", "off") != "off"
+            and _accepts_keyword(investigate, "blackboard")
+        ):
+            investigation_kwargs["blackboard"] = state.blackboard
         fresh, re_context = await investigate(
             state.settings,
             state.target,
@@ -1117,6 +1472,7 @@ async def _reanalyze_once(
             replan,
             kg_dict,
             min(state.settings.max_reanalysis_steps, state.settings.max_investigation_steps),
+            **investigation_kwargs,
         )
         merged = {result.agent: result for result in state.results}
         for result in fresh:
@@ -1148,13 +1504,10 @@ async def _reanalyze_once(
                 match_failure_mode_symptoms(state.failure_modes, observed), lifecycle
             ),
         )
-        if token_budget_exceeded(state.settings) or _deadline_exceeded(state):
-            if token_budget_exceeded(state.settings):
-                state.extra_warnings.append(token_budget_warning(state.settings))
-            else:
-                state.extra_warnings.append(
-                    "analysis deadline reached; skipped additional investigation iterations"
-                )
+        if _deadline_exceeded(state):
+            state.extra_warnings.append(
+                "analysis deadline reached; skipped additional investigation iterations"
+            )
             return None
         caveat = ""
         refuted = False
@@ -1198,7 +1551,13 @@ async def _reanalyze_once(
                 f"or evidence gaps → revised conclusion: {new_family}."
             )
         return _ReanalysisOutcome(
-            merged_results, candidates, caveat, note, refuted, next_check
+            merged_results,
+            candidates,
+            re_context if isinstance(re_context, dict) else {},
+            caveat,
+            note,
+            refuted,
+            next_check,
         )
     except Exception:  # noqa: BLE001 - re-analysis is best-effort; keep 1st result
         return None
@@ -1216,6 +1575,7 @@ async def _synthesize_korean(
     fallback_detail: str,
     timeline: list[dict] | None = None,
     troubleshooting_path: dict[str, Any] | None = None,
+    reasoning_trace: object | None = None,
 ) -> tuple[str, str] | None:
     """LLM synthesis of the RCA report in Korean, grounded STRICTLY in the evidence.
 
@@ -1271,9 +1631,11 @@ async def _synthesize_korean(
         ),
         "plan": plan.as_dict(),
         "ranked_root_cause_candidates": [c.as_dict() for c in root_cause_candidates],
+        **({"reasoning_trace_v2": reasoning_trace} if isinstance(reasoning_trace, dict) else {}),
         "knowledge_graph": {
             "blast_radius_workloads": kg_context.get("blast_radius_workloads"),
             "prior_incidents": kg_context.get("prior_incidents"),
+            "historical_case_cards": kg_context.get("case_cards") or [],
             "knowledge": kg_context.get("knowledge"),
         },
         "graph_remediation": graph_fixes.as_dict(),
@@ -1316,6 +1678,10 @@ async def _synthesize_korean(
         "- 반드시 한국어로, 비전문가도 이해할 수 있게 작성합니다 (전문용어는 풀어서).\n"
         "- 길게 쓰지 마세요. 아래 1~3 섹션 합쳐서 A4 한 페이지 이내가 목표입니다.\n"
         "- 증거에 없는 사실을 절대 만들어내지 마세요.\n"
+        "- reasoning_trace_v2의 evidence_id는 현재 인시던트 관측입니다. 원인·반증 주장을 "
+        "쓸 때 해당 ID를 [E01] 형식으로 인용하고, historical prior는 현재 증거로 쓰지 마세요.\n"
+        "- historical_case_cards는 승인된 과거 사례의 prior이며 현재 evidence가 아닙니다. "
+        "유사 사례가 있어도 현재 관측으로 별도 확인될 때만 원인으로 사용하세요.\n"
         "- 특정 수집기가 아무것도 찾지 못했으면 '증거를 찾기 어렵습니다.'라고 명시하세요.\n"
         "- 증거에 incident_state가 resolved(과거 인시던트 재분석)면, 현재 상태가 정상이라 "
         "라이브 증거가 제한적일 수 있습니다. 증거가 얇으면 억지로 원인을 단정하지 말고 '현재는 "

@@ -131,8 +131,22 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 		}
 		if incident.UserApprovedAt == nil {
 			incident.UserApprovedAt = &now
+			// The approval binds a CaseSnapshot to the exact completed analysis
+			// hash. Re-analysis may update the run later, but it cannot rewrite
+			// this approved historical record.
+			if !s.store.approveCaseSnapshotLocked(incident, now) {
+				incident.UserApprovedAt = nil
+				s.store.mu.Unlock()
+				writeError(w, http.StatusInternalServerError, "could not persist approved RCA snapshot")
+				return
+			}
 			s.store.upsertApprovedIncidentMemoriesLocked(incident)
 		} else {
+			if !s.store.revokeCaseSnapshotsLocked(incident.IncidentID, now) {
+				s.store.mu.Unlock()
+				writeError(w, http.StatusInternalServerError, "could not revoke approved RCA snapshot")
+				return
+			}
 			incident.UserApprovedAt = nil
 		}
 		status := incident.Status

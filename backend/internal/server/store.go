@@ -69,6 +69,8 @@ type Store struct {
 	comments             map[string]*CommentRecord
 	analysisRuns         map[string]*AnalysisRun
 	evaluationReviews    map[string]*EvaluationReview
+	caseSnapshots        map[string]*CaseSnapshot
+	activeCaseByIncident map[string]string
 	chatConversations    map[string]*ChatConversation
 	recurrenceStatsCache map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry
 	db                   *sql.DB
@@ -101,17 +103,19 @@ type DashboardSnapshot struct {
 
 func NewStore() *Store {
 	return &Store{
-		incidents:         make(map[string]*Incident),
-		incidentByKey:     make(map[string]string),
-		alerts:            make(map[string]*AlertRecord),
-		alertByFinger:     make(map[string]string),
-		alertByGroup:      make(map[string]string),
-		memories:          make(map[string]*IncidentMemory),
-		feedback:          make(map[string]*FeedbackRecord),
-		comments:          make(map[string]*CommentRecord),
-		analysisRuns:      make(map[string]*AnalysisRun),
-		evaluationReviews: make(map[string]*EvaluationReview),
-		chatConversations: make(map[string]*ChatConversation),
+		incidents:            make(map[string]*Incident),
+		incidentByKey:        make(map[string]string),
+		alerts:               make(map[string]*AlertRecord),
+		alertByFinger:        make(map[string]string),
+		alertByGroup:         make(map[string]string),
+		memories:             make(map[string]*IncidentMemory),
+		feedback:             make(map[string]*FeedbackRecord),
+		comments:             make(map[string]*CommentRecord),
+		analysisRuns:         make(map[string]*AnalysisRun),
+		evaluationReviews:    make(map[string]*EvaluationReview),
+		caseSnapshots:        make(map[string]*CaseSnapshot),
+		activeCaseByIncident: make(map[string]string),
+		chatConversations:    make(map[string]*ChatConversation),
 		recurrenceStatsCache: make(
 			map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry,
 		),
@@ -1366,7 +1370,7 @@ func metadataFromAgentContext(context map[string]any) map[string]any {
 			out["llm_usage"] = usage
 		}
 	}
-	for _, key := range []string{"harness", "ontology_reasoning"} {
+	for _, key := range []string{"harness", "ontology_reasoning", "reasoning_trace_v2"} {
 		if value, ok := context[key].(map[string]any); ok {
 			out[key] = cloneAnyMap(value)
 		}
