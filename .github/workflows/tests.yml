@@ -51,7 +51,9 @@ jobs:
           nat validate --config_file configs/runai_rca_eval.yml
       - name: NAT eval gate
         working-directory: agent
-        run: python -m eval.check_nat_eval --min-avg 1.0
+        # Family fixtures exercise signature classification without live collector
+        # artifacts. Harness safety is covered separately by its unit tests.
+        run: ENABLE_RCA_OUTPUT_HARNESS=false python -m eval.check_nat_eval --min-avg 1.0
 
   frontend:
     runs-on: ubuntu-latest
