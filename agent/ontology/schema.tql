@@ -49,6 +49,16 @@ attribute check_command, value string;   # ready-to-run operator check
 # --- Run:ai known-issues catalog attributes (version-linked issues) ---
 attribute affected_version, value string;
 attribute fixed_version, value string;
+# --- RCA harness / approved-history attributes ---
+attribute evidence_id, value string;
+attribute evidence_type, value string;
+attribute artifact_ref, value string;
+attribute analysis_hash, value string;
+attribute diagnosis_state, value string;
+attribute harness_status, value string;
+attribute harness_score, value integer;
+attribute approved_at, value string;
+attribute outcome, value string;
 
 # --- entities ---------------------------------------------------------------
 entity cluster,
@@ -133,19 +143,24 @@ entity incident,
     owns severity,
     owns status,
     owns created_at,
+    owns approved_at,
     plays grouped_into:incident,
     plays has_symptom:incident,
     plays has_cause:incident,
     plays analyzed_by:incident,
     plays similar_to:this,
-    plays similar_to:other;
+    plays similar_to:other,
+    plays diagnosis:incident,
+    plays observed_symptom:incident;
 
 entity analysis_run,
     owns run_id @key,
     owns source,
     owns status,
     owns confidence,
-    plays analyzed_by:run;
+    plays analyzed_by:run,
+    plays diagnosis:run,
+    plays observed_symptom:run;
 
 entity symptom,
     owns name,
@@ -164,7 +179,8 @@ entity symptom,
     plays indicates:symptom,
     plays resolved_by:symptom,
     plays supported_by:claim,
-    plays emits:signal;
+    plays emits:signal,
+    plays observed_symptom:symptom;
 
 entity root_cause,
     owns subtype,
@@ -174,7 +190,8 @@ entity root_cause,
     plays has_cause:cause,
     plays indicates:cause,
     plays fixed_by:cause,
-    plays supported_by:claim;
+    plays supported_by:claim,
+    plays diagnosis:cause;
 
 # root-cause taxonomy — families as sub-types (see knowledge/troubleshooting_cases.md)
 entity node_kubelet_pressure sub root_cause;
@@ -210,14 +227,20 @@ entity platform_lifecycle_change sub root_cause;
 entity action,
     owns statement,
     plays fixed_by:remedy,
-    plays resolved_by:remedy;
+    plays resolved_by:remedy,
+    plays resolution:remedy;
 
 entity evidence,
+    owns evidence_id @key,
+    owns evidence_type,
+    owns artifact_ref,
     owns source,
     owns summary,
     owns confidence,
     plays supported_by:proof,
-    plays emits:signal;
+    plays emits:signal,
+    plays observed_symptom:proof,
+    plays contradicted_by:proof;
 
 entity runbook,
     owns name,
@@ -237,10 +260,25 @@ relation has_cause, relates incident, relates cause;
 relation fixed_by, relates cause, relates remedy;         # root_cause fixed_by action (family-level)
 relation resolved_by, relates symptom, relates remedy;    # symptom resolved_by action (precise)
 relation supported_by, relates claim, relates proof;      # (symptom|root_cause) <- evidence
+relation contradicted_by, relates claim, relates proof;   # run-local diagnosis <- conflicting evidence
 relation analyzed_by, relates incident, relates run;
 relation similar_to, relates this, relates other;
 relation emits, relates emitter, relates signal;          # component emits evidence/symptom
 relation depends_on, relates dependent, relates dependency;  # component needs component (check order)
+relation diagnosis,
+    relates run,
+    relates incident,
+    relates cause,
+    owns confidence,
+    owns diagnosis_state,
+    owns analysis_hash,
+    owns harness_status,
+    owns harness_score,
+    plays supported_by:claim,
+    plays contradicted_by:claim,
+    plays resolution:finding;
+relation observed_symptom, relates run, relates incident, relates symptom, relates proof;
+relation resolution, relates finding, relates remedy, owns outcome;
 
 # --- XID GPU-error catalog ---------------------------------------------------
 # A first-class GPU-hardware-fault RCA path. An xid_error is a catalog entry

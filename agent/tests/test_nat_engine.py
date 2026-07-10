@@ -142,7 +142,7 @@ async def test_engine_yaml_builds_and_analyzes_end_to_end(monkeypatch) -> None:
     assert response.context["plan"]
     assert response.context["root_cause_candidates"]
     assert not any("nemo failed" in warning for warning in response.warnings)
-    for stage in ("enrich", "plan", "evidence", "rank", "self_check", "synthesize"):
+    for stage in ("enrich", "plan", "evidence", "rank", "self_check", "synthesize", "harness"):
         assert (stage, "stage started") in events
         assert (stage, "stage finished") in events
     assert set(response.context["llm_usage"]) == {

@@ -58,6 +58,7 @@ type Store struct {
 	feedbackSeq          atomic.Int64
 	commentSeq           atomic.Int64
 	analysisRunSeq       atomic.Int64
+	evaluationSeq        atomic.Int64
 	incidents            map[string]*Incident
 	incidentByKey        map[string]string
 	alerts               map[string]*AlertRecord
@@ -67,6 +68,7 @@ type Store struct {
 	feedback             map[string]*FeedbackRecord
 	comments             map[string]*CommentRecord
 	analysisRuns         map[string]*AnalysisRun
+	evaluationReviews    map[string]*EvaluationReview
 	chatConversations    map[string]*ChatConversation
 	recurrenceStatsCache map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry
 	db                   *sql.DB
@@ -108,6 +110,7 @@ func NewStore() *Store {
 		feedback:          make(map[string]*FeedbackRecord),
 		comments:          make(map[string]*CommentRecord),
 		analysisRuns:      make(map[string]*AnalysisRun),
+		evaluationReviews: make(map[string]*EvaluationReview),
 		chatConversations: make(map[string]*ChatConversation),
 		recurrenceStatsCache: make(
 			map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry,
@@ -930,11 +933,16 @@ func (s *Store) HardDeleteIncident(id string) bool {
 		if run == nil {
 			continue
 		}
-		if run.IncidentID == id {
-			delete(s.analysisRuns, key)
-			continue
+		remove := run.IncidentID == id
+		if !remove {
+			_, remove = alertIDs[run.AlertID]
 		}
-		if _, ok := alertIDs[run.AlertID]; ok {
+		if remove {
+			for reviewKey, review := range s.evaluationReviews {
+				if review != nil && review.RunID == run.RunID {
+					delete(s.evaluationReviews, reviewKey)
+				}
+			}
 			delete(s.analysisRuns, key)
 		}
 	}
@@ -1350,14 +1358,26 @@ func metadataFromAgentContext(context map[string]any) map[string]any {
 	if context == nil {
 		return nil
 	}
-	usage, ok := context["llm_usage"]
-	if !ok {
+	out := map[string]any{}
+	if usage, ok := context["llm_usage"]; ok {
+		if usageMap, ok := usage.(map[string]any); ok {
+			out["llm_usage"] = cloneAnyMap(usageMap)
+		} else {
+			out["llm_usage"] = usage
+		}
+	}
+	for _, key := range []string{"harness", "ontology_reasoning"} {
+		if value, ok := context[key].(map[string]any); ok {
+			out[key] = cloneAnyMap(value)
+		}
+	}
+	if hash, ok := context["analysis_hash"].(string); ok && hash != "" {
+		out["analysis_hash"] = hash
+	}
+	if len(out) == 0 {
 		return nil
 	}
-	if usageMap, ok := usage.(map[string]any); ok {
-		return map[string]any{"llm_usage": cloneAnyMap(usageMap)}
-	}
-	return map[string]any{"llm_usage": usage}
+	return out
 }
 
 func mergeAnalysisMetadata(existing map[string]any, incoming map[string]any) map[string]any {
@@ -2029,6 +2049,16 @@ func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 	// not by concatenating the per-alert analysis columns. Analysis is already
 	// one-per-incident, so this is the same RCA without the alert-column duplication.
 	if run := s.latestAnalysisRunForIncidentLocked(id); run != nil {
+		detail.AnalysisRunID = run.RunID
+		if hash, ok := run.Metadata["analysis_hash"].(string); ok {
+			detail.AnalysisHash = hash
+		}
+		if harness, ok := run.Metadata["harness"].(map[string]any); ok {
+			detail.Harness = cloneAnyMap(harness)
+		}
+		if reasoning, ok := run.Metadata["ontology_reasoning"].(map[string]any); ok {
+			detail.OntologyReasoning = cloneAnyMap(reasoning)
+		}
 		detail.AnalysisSummary = excerpt(run.AnalysisSummary, maxIncidentAggregateSummaryBytes)
 		detail.AnalysisDetail = excerpt(run.AnalysisDetail, maxIncidentAggregateDetailBytes)
 		detail.AnalysisQuality = run.AnalysisQuality

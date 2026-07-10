@@ -8,21 +8,13 @@ existing data — no LLM extraction.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from typing import Any
 
-# Allowed root-cause families — must match schema.tql sub-types and
-# app/services/root_cause_ranking.py.
-FAMILIES = (
-    "node_kubelet_pressure",
-    "runai_scheduling_quota",
-    "runai_control_plane_error",
-    "workload_startup_error",
-    "insufficient_evidence",
-)
+from pydantic import BaseModel, Field
 
 
 class RootCause(BaseModel):
-    category: str = ""        # one of FAMILIES
+    category: str = ""        # validated against knowledge/families.yaml by ingest
     subtype: str = ""
     confidence: str = "low"   # low | medium | high
     blast_radius: str = ""    # node | queue | workload | ""
@@ -34,6 +26,11 @@ class OntologyIncident(BaseModel):
     alert_id: str = ""
     correlation_key: str = ""
     analysis_summary: str = ""
+    analysis_detail: str = ""
+    run_id: str = ""
+    analysis_hash: str = ""
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    harness: dict[str, Any] = Field(default_factory=dict)
     title: str = ""
     severity: str = "warning"
     status: str = "firing"
@@ -54,5 +51,5 @@ class OntologyIncident(BaseModel):
     root_cause_family: str = ""
     # Explicit operator approval timestamp (dashboard Approve button); "" = not approved.
     user_approved_at: str = ""
-    # KB-poisoning guard (critique #1): only reviewed incidents are committed.
+    # Kept only to parse legacy fetch rows. Eligibility is user_approved_at.
     reviewed: bool = False

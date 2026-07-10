@@ -89,7 +89,10 @@ as a parallel collector.
   `xid_error` GPU-fault catalog with `leads_to` causal chains.
 
 **Reasoning functions** (`ontology/functions.tql`, validated TypeQL 3.11.x):
-`fixes_for_family`, `fixes_for_xid`, `xids_for_gpu_model`, `root_xids_for`.
+`fixes_for_family`, `fixes_for_xid`, `xids_for_gpu_model`, `root_xids_for`,
+live-symptom family lookup, recursive component/XID paths, and approved-history
+verified-action lookup. The full model and Studio checks are in the
+[Ontology & Ingestion Guide](ONTOLOGY-GUIDE.md).
 
 ### How data gets in
 
@@ -97,14 +100,13 @@ as a parallel collector.
 |---|---|---|---|
 | Schema + functions | `load_schema` / `load_functions` | `schema.tql` / `functions.tql` | Helm post-install/upgrade hook |
 | Curated knowledge | `load_knowledge`, `load_xids`, `load_alerts`, `load_known_issues`, `load_architecture` | the catalogs above | version-controlled files, run in the schema job |
-| Incidents + topology | `ontology/ingest.py` (cron) | Postgres `incidents`/`alerts` | resolved ≥ `resolvedGraceHours` ago; review-gated unless `requireReview=false` |
-| Knowledge promotion | `ingest.py --promote-knowledge` | operator-confirmed RCAs | resolved + net-positive feedback → `confirmed:<alert>` symptom |
+| Incidents + topology | `ontology/ingest.py` (cron) | Postgres incidents, runs, artifacts | dashboard-approved + resolved ≥ `resolvedGraceHours`; `requireApproval=true` by default |
+| Knowledge promotion | `ingest.py --promote-knowledge` | approved non-abstained RCAs | only operator-confirmed effective actions become verified remedies |
 
 The ingest **CronJob** (`typedb.ingest.schedule`, default every 3h) projects
-resolved incidents into the graph. The grace window lets late feedback /
-re-analysis settle; re-fired incidents flip back to `firing` and are excluded.
-With `requireReview: false` (default) it ingests resolved incidents regardless of
-review — flip to `true` to keep unreviewed auto-analysis out of the graph.
+dashboard-approved resolved incidents into the graph. The grace window lets
+late feedback and re-analysis settle; re-fired incidents flip back to `firing`
+and are excluded. `requireReview` is deprecated; use `requireApproval`.
 
 ### Querying the graph
 

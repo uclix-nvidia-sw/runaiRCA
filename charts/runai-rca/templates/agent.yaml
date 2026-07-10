@@ -110,6 +110,12 @@ spec:
               value: {{ .Values.agent.env.analysisTokenBudget | quote }}
             - name: ANALYSIS_DEADLINE_SECONDS
               value: {{ .Values.agent.env.analysisDeadlineSeconds | quote }}
+            - name: ENABLE_RCA_OUTPUT_HARNESS
+              value: {{ .Values.agent.env.enableRcaOutputHarness | quote }}
+            - name: MAX_RCA_REPAIR_ATTEMPTS
+              value: {{ .Values.agent.env.maxRcaRepairAttempts | quote }}
+            - name: RCA_HARNESS_PASS_SCORE
+              value: {{ .Values.agent.env.rcaHarnessPassScore | quote }}
             - name: RUNAI_BASE_URL
               value: {{ .Values.agent.env.runaiBaseUrl | quote }}
             - name: RUNAI_TOKEN_URL

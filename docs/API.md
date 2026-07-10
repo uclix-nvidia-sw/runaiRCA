@@ -33,6 +33,8 @@ Backend:
 - `DELETE /api/v1/alerts/{id}/comments/{comment_id}`
 - `POST /api/v1/embeddings/search`
 - `GET /api/v1/analysis-runs`
+- `GET /api/v1/analysis-runs/{id}/evaluation?author=...`
+- `PUT /api/v1/analysis-runs/{id}/evaluation?author=...`
 - `POST /api/v1/analysis-runs/{id}/progress`
 - `GET /api/v1/stats/recurrence?days=7`
 - `GET /api/v1/stats/llm-spend?days=7`
@@ -104,6 +106,12 @@ optional `metadata`. LLM token accounting is stored under `metadata.llm_usage`
 when the agent returns usage data. Incident detail responses expose the latest
 run usage as `token_usage`, and include `similar_recent_count` for the recent
 similar-incident count shown in the UI.
+
+Incident detail also exposes `analysis_run_id`, `analysis_hash`, optional
+`harness`, and optional `ontology_reasoning` for the newest RCA. The evaluation
+GET returns only reviews whose hash matches the current RCA; PUT upserts the
+current browser actor's review. A stale hash is rejected with HTTP 400 so a
+review cannot be attached to a re-analysed report.
 
 `GET /api/v1/events` emits named SSE events. Incident archive, unarchive,
 delete, restore, and manual permanent delete changes emit `incident.updated` so

@@ -5,6 +5,46 @@ import (
 	"strings"
 )
 
+func (s *Server) handleAnalysisRunEvaluation(w http.ResponseWriter, r *http.Request) {
+	rest := pathPart(r.URL.Path, "/api/v1/analysis-runs/")
+	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] != "evaluation" {
+		writeError(w, http.StatusNotFound, "unknown analysis run evaluation")
+		return
+	}
+	runID := parts[0]
+	switch r.Method {
+	case http.MethodGet:
+		view, ok := s.store.EvaluationForRun(runID, r.URL.Query().Get("author"))
+		if !ok {
+			writeError(w, http.StatusNotFound, "analysis run not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, envelope(view))
+	case http.MethodPut:
+		var req EvaluationReviewRequest
+		if status, err := decodeJSONBody(w, r, &req, maxJSONBodyBytes); err != nil {
+			writeError(w, status, err.Error())
+			return
+		}
+		if req.Author == "" {
+			req.Author = r.URL.Query().Get("author")
+		}
+		review, ok, err := s.store.UpsertEvaluationReview(runID, req)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if !ok {
+			writeError(w, http.StatusNotFound, "analysis run not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, envelope(review))
+	default:
+		writeError(w, http.StatusNotFound, "unknown analysis run evaluation")
+	}
+}
+
 func (s *Server) handleAnalysisRunAction(w http.ResponseWriter, r *http.Request) {
 	rest := pathPart(r.URL.Path, "/api/v1/analysis-runs/")
 	parts := strings.Split(strings.Trim(rest, "/"), "/")

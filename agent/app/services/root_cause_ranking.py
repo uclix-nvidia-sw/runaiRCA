@@ -253,6 +253,7 @@ def rank_root_cause_candidates(
     component: str = "",
     depends_on_chain: list[str] | None = None,
     lifecycle: dict[str, Any] | None = None,
+    graph_candidate_counts: dict[str, int] | None = None,
 ) -> list[RankedCause]:
     """Rank failure families for THIS incident from collector evidence.
 
@@ -324,6 +325,17 @@ def rank_root_cause_candidates(
             if factor is not None and s.points > 0:
                 s.points *= factor
                 s.rationale.append(f"feedback prior adjusted score x{factor:.2f}")
+
+    # The graph is allowed to corroborate a symptom that was already matched in
+    # THIS run, never to create a high-confidence cause from historical memory.
+    # A cap keeps a broad catalog from drowning out live collector evidence.
+    for family, count in (graph_candidate_counts or {}).items():
+        score = scores.get(family)
+        if score is None or count <= 0:
+            continue
+        bonus = min(2.0, float(count))
+        score.points += bonus
+        score.rationale.append(f"ontology matched {int(bonus)} live symptom signal(s)")
 
     ranked = [
         RankedCause(

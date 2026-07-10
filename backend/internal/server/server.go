@@ -44,6 +44,7 @@ type Alert struct {
 }
 
 type Artifact struct {
+	EvidenceID string `json:"evidence_id,omitempty"`
 	Agent      string `json:"agent"`
 	Source     string `json:"source"`
 	Type       string `json:"type"`
@@ -178,6 +179,8 @@ type AlertRecord struct {
 
 type IncidentDetail struct {
 	Incident
+	AnalysisRunID      string            `json:"analysis_run_id,omitempty"`
+	AnalysisHash       string            `json:"analysis_hash,omitempty"`
 	AnalysisSummary    string            `json:"analysis_summary"`
 	AnalysisDetail     string            `json:"analysis_detail"`
 	AnalysisQuality    string            `json:"analysis_quality"`
@@ -189,6 +192,8 @@ type IncidentDetail struct {
 	SimilarIncidents   []SimilarIncident `json:"similar_incidents"`
 	SimilarRecentCount int               `json:"similar_recent_count"`
 	TokenUsage         map[string]any    `json:"token_usage,omitempty"`
+	Harness            map[string]any    `json:"harness,omitempty"`
+	OntologyReasoning  map[string]any    `json:"ontology_reasoning,omitempty"`
 	Feedback           FeedbackSummary   `json:"feedback"`
 	Alerts             []AlertRecord     `json:"alerts"`
 }
@@ -265,11 +270,11 @@ type Server struct {
 	// Severities eligible for AUTO analysis. nil = every ingested severity (except
 	// info, dropped by ignoredAlert). Manual analysis is never gated by this.
 	autoAnalyzeSeverities map[string]bool
-	backfillInterval          time.Duration
-	backfillBatch             int
-	backfillRetryCooldown     time.Duration
-	trashRetention            time.Duration
-	slack                     *SlackNotifier
+	backfillInterval      time.Duration
+	backfillBatch         int
+	backfillRetryCooldown time.Duration
+	trashRetention        time.Duration
+	slack                 *SlackNotifier
 }
 
 const (
@@ -473,6 +478,9 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleEmbeddingSearch(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/analysis-runs":
 		s.handleAnalysisRunList(w, r)
+	case (r.Method == http.MethodGet || r.Method == http.MethodPut) &&
+		strings.HasPrefix(r.URL.Path, "/api/v1/analysis-runs/"):
+		s.handleAnalysisRunEvaluation(w, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/v1/analysis-runs/"):
 		s.handleAnalysisRunAction(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/stats/recurrence":

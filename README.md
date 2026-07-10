@@ -127,6 +127,8 @@ Full table of contents (GitBook-ready): [`SUMMARY.md`](SUMMARY.md).
 * [Architecture](docs/ARCHITECTURE.md) — implementation contract
 * [RCA Pipeline](docs/RCA-PIPELINE.md) — every analysis stage, planner → synthesis
 * [Knowledge Base](docs/KNOWLEDGE-BASE.md) — curated catalogs + TypeDB ontology
+* [Ontology & Ingestion Guide](docs/ONTOLOGY-GUIDE.md) — approved RCA graph model and Studio checks
+* [Evaluation & Runtime Harness](docs/EVALUATION.md) — output gates, repair, and operator scoring
 * [Operating Model](docs/OPERATING-MODEL.md) — operating model
 * [Data Stores](docs/DATABASE.md) — PostgreSQL + TypeDB ontology
 * [UI Direction](docs/UI-DIRECTION.md) — UI/UX direction

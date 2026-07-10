@@ -29,7 +29,7 @@ from app.services import pipeline
 
 _settings_holder: Settings | None = None
 _settings_var: ContextVar[Settings | None] = ContextVar("runai_rca_settings", default=None)
-_STAGES = {"enrich", "plan", "evidence", "rank", "self_check", "synthesize"}
+_STAGES = {"enrich", "plan", "evidence", "rank", "self_check", "synthesize", "harness"}
 
 
 class RcaStageConfig(FunctionBaseConfig, name="rca_stage"):
@@ -107,6 +107,7 @@ class RunaiRcaPipelineConfig(FunctionBaseConfig, name="runai_rca_pipeline"):
     rank: FunctionRef
     self_check: FunctionRef
     synthesize: FunctionRef
+    harness: FunctionRef
     llm: LLMRef = "local_llm"
 
 
@@ -119,6 +120,7 @@ async def runai_rca_pipeline(config: RunaiRcaPipelineConfig, builder: Builder):
         "rank": await builder.get_function(config.rank),
         "self_check": await builder.get_function(config.self_check),
         "synthesize": await builder.get_function(config.synthesize),
+        "harness": await builder.get_function(config.harness),
     }
 
     async def _run(request: object) -> object:

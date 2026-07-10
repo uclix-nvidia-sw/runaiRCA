@@ -33,6 +33,8 @@ Backend:
 - `DELETE /api/v1/alerts/{id}/comments/{comment_id}`
 - `POST /api/v1/embeddings/search`
 - `GET /api/v1/analysis-runs`
+- `GET /api/v1/analysis-runs/{id}/evaluation?author=...`
+- `PUT /api/v1/analysis-runs/{id}/evaluation?author=...`
 - `POST /api/v1/analysis-runs/{id}/progress`
 - `GET /api/v1/stats/recurrence?days=7`
 - `GET /api/v1/stats/llm-spend?days=7`
@@ -97,6 +99,11 @@ progress log를 보존합니다.
 에이전트가 usage 데이터를 반환하면 LLM 토큰 계측값은 `metadata.llm_usage`에 저장됩니다.
 인시던트 상세 응답은 최신 실행의 usage를 `token_usage`로 노출하고, UI의 최근 유사 발생
 카운트에 쓰이는 `similar_recent_count`를 포함합니다.
+
+인시던트 상세에는 최신 RCA의 `analysis_run_id`, `analysis_hash`, 선택적 `harness`, 선택적
+`ontology_reasoning`도 포함됩니다. evaluation GET은 현재 hash와 일치하는 평가만 반환하고,
+PUT은 현재 browser actor의 평가를 upsert합니다. 재분석된 RCA에 과거 평가가 붙지 않도록
+stale hash는 HTTP 400으로 거절합니다.
 
 `GET /api/v1/events`는 named SSE 이벤트를 내보냅니다. 인시던트 archive, unarchive,
 delete, restore, 수동 permanent delete 변경은 `incident.updated`를 발행하므로 다른 대시보드

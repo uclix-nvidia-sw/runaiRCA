@@ -151,6 +151,11 @@ class Settings:
     enable_agent_drilldown: bool
     drilldown_max_steps: int
     analysis_deadline_seconds: int
+    # Settings(...) fixtures and third-party callers stay legacy-compatible;
+    # deployed load_settings()/Helm defaults explicitly enable the guard.
+    enable_rca_output_harness: bool = False
+    max_rca_repair_attempts: int = 3
+    rca_harness_pass_score: int = 70
     # Defaulted (keeps existing Settings(...) constructions source-compatible).
     # Completion budget for the one-shot Korean report JSON: reasoning models
     # spend it on reasoning tokens FIRST — if synthesis logs empty replies
@@ -313,5 +318,8 @@ def load_settings() -> Settings:
         # Owner priority is accuracy over latency; the backend's
         # AGENT_REQUEST_TIMEOUT_SECONDS must stay above this (deadline + 60s).
         analysis_deadline_seconds=max(0, _int_env("ANALYSIS_DEADLINE_SECONDS", 1500)),
+        enable_rca_output_harness=_bool_env("ENABLE_RCA_OUTPUT_HARNESS", True),
+        max_rca_repair_attempts=_nonnegative_int_env("MAX_RCA_REPAIR_ATTEMPTS", 3),
+        rca_harness_pass_score=max(0, min(100, _int_env("RCA_HARNESS_PASS_SCORE", 70))),
         max_investigation_iterations=_nonnegative_int_env("MAX_INVESTIGATION_ITERATIONS", 2),
     )

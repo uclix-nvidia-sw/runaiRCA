@@ -107,15 +107,19 @@ typedb:
     schedule: "17 */3 * * *"    # every 3 hours
     resolvedGraceHours: 6       # only incidents resolved >= N hours ago
     limit: 200
-    requireReview: false        # true = only operator-reviewed incidents
-    # Close the learning loop: also promote operator-CONFIRMED RCAs (resolved with
-    # net-positive feedback) into reusable knowledge (confirmed:<alert> -> family),
-    # so the next similar alert matches what operators already validated. This is
-    # what makes the agent get smarter over time from real feedback.
+    # Only the Dashboard Approve action (incidents.user_approved_at) may enter
+    # the graph. `requireReview` used upvotes/comments and is intentionally
+    # replaced by this stronger, unambiguous gate.
+    requireApproval: true
+    # Deprecated compatibility setting. It is not consulted by new chart logic.
+    requireReview: null
+    # Promote only approved, non-abstained RCA knowledge. Recommended actions are
+    # still curated guidance; an action becomes verified only after an operator
+    # records an effective resolution outcome.
     promoteKnowledge: true
     # Also accumulate confirmed/pending incident rows into the rca_dataset store
     # (durable answer-key for eval), chained onto this same job so it runs right
-    # after the KG refresh. Approve status comes from incidents.user_approved_at;
+    # after the KG refresh. Approval status comes from incidents.user_approved_at;
     # materialize the measured set later with `gen_dataset --export-curated`.
     generateDataset: true
   image:
@@ -385,6 +389,11 @@ agent:
     # Overall hard cap per analysis: generous per-step time, but the whole run always
     # finishes within this budget (default 25 min). 0 = no overall cap.
     analysisDeadlineSeconds: 1500
+    # Final RCA output guard: cites collected evidence, calibrates confidence,
+    # and converts an unsafe unresolved conclusion into an honest abstention.
+    enableRcaOutputHarness: true
+    maxRcaRepairAttempts: 3
+    rcaHarnessPassScore: 70
     runaiBaseUrl: ""
     runaiTokenUrl: ""
     runaiWorkloadsPath: /api/v1/workloads

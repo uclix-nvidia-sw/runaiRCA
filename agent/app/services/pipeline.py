@@ -135,7 +135,11 @@ def new_state(
 def _aggregate_evidence(state: PipelineState) -> None:
     kg_warnings = getattr(state.kg_context, "warnings", []) if state.kg_context is not None else []
     state.capabilities = {result.agent: result.status for result in state.results}
-    state.artifacts = [artifact for result in state.results for artifact in result.artifacts]
+    # Evidence IDs are assigned after every collector has completed. They are
+    # response-local, deterministic, and become run-qualified during TypeDB ingest.
+    from app.services.harness import assign_evidence_ids
+
+    state.artifacts = assign_evidence_ids(state.results)
     state.missing = sorted({item for result in state.results for item in result.missing_data})
     state.warnings = sorted(
         {item for result in state.results for item in result.warnings}
@@ -487,6 +491,40 @@ async def rank_stage(state: PipelineState) -> PipelineState:
     state.known_issues = _suppress_fixed_known_issues(
         state.known_issues, _runai_version_from(state.results)
     )
+    # TypeDB only sees approved historical incidents. It can corroborate a
+    # symptom already observed live, but never supplies evidence by itself.
+    symptom_names = [
+        str(symptom.get("symptom") or "")
+        for _family, symptom in match_failure_mode_symptoms(state.failure_modes, state.observed)
+        if isinstance(symptom, dict)
+    ]
+    if state.target.alert_name:
+        symptom_names.append(state.target.alert_name)
+    try:
+        from app.services.kg_enrichment import candidate_families_for_symptoms
+
+        graph_counts, graph_warnings = await candidate_families_for_symptoms(
+            settings, symptom_names
+        )
+    except Exception:  # noqa: BLE001 - graph prior is optional
+        graph_counts, graph_warnings = {}, []
+    if graph_warnings:
+        state.extra_warnings.extend(graph_warnings)
+    if graph_counts:
+        state.root_cause_candidates = rank_root_cause_candidates(
+            state.target,
+            state.results,
+            occurrence_count=request.occurrence_count,
+            kg_blast_radius=state.kg_context.blast_radius_workloads,
+            priors=state.priors,
+            component_family=comp_family,
+            component=comp_name,
+            depends_on_chain=comp_chain,
+            lifecycle=lifecycle,
+            graph_candidate_counts=graph_counts,
+        )
+        if isinstance(getattr(state.kg_context, "reasoning", None), dict):
+            state.kg_context.reasoning["candidate_families"] = graph_counts
     # Fuzzy recall (BM25+synonyms, app.bm25) queries the alert's OWN text only:
     # collector summaries would feed pipeline boilerplate to the matcher. And it
     # informs, never headlines: promotion below stays exact-signature-only (a
@@ -750,6 +788,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                 state.root_cause_candidates[0].as_dict() if state.root_cause_candidates else None
             ),
             "knowledge_base": state.kg_context.as_dict(),
+            "ontology_reasoning": state.kg_context.as_dict().get("reasoning", {}),
             "plan": plan.as_dict(),
             "hypothesis_ledger": state.investigation_context.get("hypothesis_ledger"),
             "investigation": state.investigation_context,
@@ -763,6 +802,79 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         artifacts=state.artifacts,
     )
     state.response = _mask_model(state.response, AlertAnalysisResponse, state.masker)
+    return state
+
+
+async def harness_stage(state: PipelineState) -> PipelineState:
+    """Validate the already-synthesized RCA and make bounded safe repairs."""
+    from app.services.harness import (
+        abstain,
+        analysis_hash,
+        apply_confidence_downgrade,
+        apply_safety_guardrail,
+        apply_trace,
+        evaluate,
+        payload,
+    )
+
+    response = state.response
+    assert response is not None
+    if not state.settings.enable_rca_output_harness:
+        response.context["harness"] = {
+            "rubric_version": "1",
+            "status": "disabled",
+            "repair_attempts": 0,
+        }
+        response.context["analysis_hash"] = analysis_hash(response)
+        return state
+
+    repairs = 0
+    verdict = evaluate(
+        response,
+        state.results,
+        state.root_cause_candidates,
+        next_check=state.self_check_next,
+    )
+    for _ in range(state.settings.max_rca_repair_attempts):
+        if not verdict.failed_gates and verdict.score >= state.settings.rca_harness_pass_score:
+            break
+        changed = False
+        if verdict.gates["missing_evidence_trace"]:
+            changed = apply_trace(response, verdict) or changed
+        if verdict.gates["unsafe_action_without_guardrail"]:
+            changed = apply_safety_guardrail(response) or changed
+        if verdict.gates["unsupported_high_confidence"]:
+            changed = apply_confidence_downgrade(state.root_cause_candidates) or changed
+        if not changed:
+            break
+        repairs += 1
+        verdict = evaluate(
+            response,
+            state.results,
+            state.root_cause_candidates,
+            next_check=state.self_check_next,
+        )
+
+    status = "pass"
+    if verdict.failed_gates:
+        abstain(response, state.root_cause_candidates, verdict)
+        verdict = evaluate(response, state.results, state.root_cause_candidates, next_check=state.self_check_next)
+        status = "abstained"
+    elif verdict.score < state.settings.rca_harness_pass_score:
+        response.analysis_quality = "degraded"
+        response.warnings = sorted(set(response.warnings) | {"RCA harness quality score below threshold"})
+        status = "degraded"
+
+    top = state.root_cause_candidates[0] if state.root_cause_candidates else None
+    response.root_cause_family = top.family if top else ""
+    response.context["root_cause_candidates"] = [
+        candidate.as_dict() for candidate in state.root_cause_candidates
+    ]
+    response.context["top_root_cause"] = top.as_dict() if top else None
+    response.context["harness"] = payload(verdict, status=status, repairs=repairs)
+    response.context["analysis_hash"] = analysis_hash(response)
+    response.analysis = response.analysis_detail
+    state.response = response
     return state
 
 
@@ -783,6 +895,7 @@ async def run_pipeline(
     await _investigate_until_settled(state)
 
     state = await stages.get("synthesize", synthesize_stage)(state)
+    state = await stages.get("harness", harness_stage)(state)
     assert state.response is not None
     return state.response
 
@@ -2876,6 +2989,11 @@ def _graph_remediation_lines(graph_fixes: GraphRemediation | None) -> list[str]:
     lines = ["- Knowledge-graph derived remediation:"]
     for statement in graph_fixes.family_fixes[:5]:
         lines.append(f"  - {_safe_line(statement, limit=360, masker=masker)}")
+    for statement in graph_fixes.verified_actions[:5]:
+        lines.append(
+            f"  - Verified in an approved historical resolution: "
+            f"{_safe_line(statement, limit=360, masker=masker)}"
+        )
     for code, fixes in graph_fixes.xid_fixes.items():
         lines.append(f"  - NVIDIA Xid {code}:")
         lines.extend(

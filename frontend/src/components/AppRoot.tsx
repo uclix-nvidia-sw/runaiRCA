@@ -41,6 +41,7 @@ import { AlertsDashboard } from './dashboards/AlertsDashboard';
 import { ChatDashboard } from './dashboards/ChatDashboard';
 import { IncidentsDashboard } from './dashboards/IncidentsDashboard';
 import { FeedbackPanel } from './workspace/FeedbackPanel';
+import { EvaluationPanel } from './workspace/EvaluationPanel';
 import { FloatingChat } from './workspace/FloatingChat';
 import { useRcaChat } from './workspace/chatSession';
 import { exportIncidentDocx } from '../exportDocx';
@@ -961,6 +962,13 @@ function UnifiedWorkspace({
           <DiagnosticsPanel missingData={missingData} warnings={warnings} tokenUsage={tokenUsage} />
         )}
 
+        <EvaluationPanel
+          runID={incident?.analysis_run_id}
+          analysisHash={incident?.analysis_hash}
+          harness={incident?.harness}
+          onSaved={onRefresh}
+        />
+
         <FeedbackPanel
           targetType={targetType}
           targetID={id}
@@ -1259,7 +1267,7 @@ function ArtifactResult({ artifact }: { artifact: Artifact }) {
     <div className="artifact">
       <button className="artifact-toggle compact-artifact-toggle" onClick={() => setOpen((value) => !value)} type="button">
         <div className="artifact-head">
-          <strong>{artifact.title || artifact.type}</strong>
+          <strong>{artifact.evidence_id ? `[${artifact.evidence_id}] ` : ''}{artifact.title || artifact.type}</strong>
           <span>{artifact.confidence}</span>
         </div>
         <ChevronDown size={16} />

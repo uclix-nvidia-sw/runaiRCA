@@ -28,6 +28,7 @@ functions:
   rank: { _type: rca_stage, stage: rank }
   self_check: { _type: rca_stage, stage: self_check }
   synthesize: { _type: rca_stage, stage: synthesize }
+  harness: { _type: rca_stage, stage: harness }
 
 workflow:
   _type: runai_rca_pipeline
@@ -37,4 +38,5 @@ workflow:
   rank: rank
   self_check: self_check
   synthesize: synthesize
+  harness: harness
   llm: local_llm

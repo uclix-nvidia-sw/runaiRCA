@@ -88,6 +88,9 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `ENABLE_AGENT_DRILLDOWN` | Per-collector autonomous drill-down: each evidence agent (kubernetes/prometheus/loki/runai) runs its own bounded LLM loop with only its domain's read-only tools, default `false` (Helm sets `true`) |
 | `DRILLDOWN_MAX_STEPS` | Max drill-down steps per evidence agent, default `4` |
 | `ANALYSIS_DEADLINE_SECONDS` | Overall hard cap per analysis (graceful degraded report on overrun), default `1500` (25 min), `0` = no cap. Keep the backend `AGENT_REQUEST_TIMEOUT_SECONDS` above this. |
+| `ENABLE_RCA_OUTPUT_HARNESS` | Validate the final RCA against live evidence and safety gates, default `true` |
+| `MAX_RCA_REPAIR_ATTEMPTS` | Maximum final-report repair passes after harness validation, default `3` |
+| `RCA_HARNESS_PASS_SCORE` | Non-fatal harness score threshold (0..100), default `70` |
 | `MAX_AUTO_ANALYZE_FANOUT` | Backend: max analyses started per webhook, default `50` |
 | `MAX_CONCURRENT_AGENT_RUNS` | Backend: max analyses running against the Agent concurrently, default `50` |
 | `FLAPPING_GROUP_WINDOW_MINUTES` | Backend: quiet window before a recurring alert becomes a NEW incident vs another occurrence, code default `120` (Helm sets `360`) |
@@ -165,6 +168,8 @@ Frequently tuned Helm values:
 | `agent.env.prometheusMcpUrl` / `agent.env.lokiMcpUrl` / `agent.env.kubernetesMcpUrl` / `agent.env.postgresMcpUrl` | Remote MCP endpoints when not using the managed shared services |
 | `agent.env.llmBaseUrl` / `agent.env.llmModel` / `secrets.llmApiKey` | LiteLLM/OpenAI-compatible endpoint, model, and Secret-backed API key for the in-process NAT engine |
 | `agent.env.*TimeoutSeconds` | Request/runtime timeouts for Kubernetes, Run:ai, Prometheus, Loki, and Postgres |
+| `agent.env.enableRcaOutputHarness` / `maxRcaRepairAttempts` / `rcaHarnessPassScore` | Final RCA harness switch, repair cap, and quality threshold |
+| `typedb.ingest.requireApproval` | Ingest only Dashboard-approved incidents (`user_approved_at`), default `true`; `requireReview` is deprecated |
 | `agent.env.kubernetesListLimit` / `agent.env.lokiQueryLimit` | Evidence volume controls for Kubernetes list calls and Loki log query groups |
 | `agent.env.troubleshootingCasesFile` / `agent.env.agentSoulsFile` | Paths for injected troubleshooting memory and agent role contracts |
 | `agent.env.maskingRegexListJson` / `builtinRedaction*` | Cluster-specific secret masking regexes plus built-in redaction enable/hash controls |
