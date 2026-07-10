@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import pytest
 import yaml
 
 from app.collectors.base import CollectorResult
+from app.collectors.kubernetes import resolve_read_kind
 from app.masking import build_masker
 from app.plan import InvestigationPlan
 from app.progress import ProgressReporter
@@ -18,6 +20,59 @@ from app.services.root_cause_ranking import RankedCause
 from tests.test_orchestrator import make_settings, make_target
 
 TREE = Path("knowledge/k8s_troubleshooting_tree.yaml")
+
+
+def test_curated_probe_templates_use_only_executable_read_only_tools() -> None:
+    """Runbook probes are data, but must stay compatible with drilldown's registry.
+
+    This catches a tempting but unsafe regression where a prose-only command or
+    an unknown placeholder is added to YAML and silently becomes a no-op at
+    runtime.  Optional backends (Prometheus/Loki) are still valid: the domain
+    registry decides whether they are available for a particular deployment.
+    """
+    raw = yaml.safe_load(TREE.read_text(encoding="utf-8"))
+    allowed_tools = {"k8s_read", "k8s_describe", "k8s_logs", "promql_query", "logql_query"}
+    allowed_placeholders = {
+        "namespace",
+        "pod",
+        "node",
+        "workload",
+        "workload_name",
+        "project",
+        "service",
+        "component",
+        "storage_claim",
+        "volume",
+    }
+    probes = [
+        probe
+        for node in raw["nodes"]
+        for probe in node.get("probes", [])
+    ]
+    assert len(probes) >= 20, "keep executable coverage broad across RCA layers"
+    for probe in probes:
+        assert probe["tool"] in allowed_tools
+        arguments = probe.get("arguments_template")
+        assert isinstance(arguments, dict) and arguments
+        serialized = yaml.safe_dump(arguments)
+        for placeholder in re.findall(r"{{([a-zA-Z_][a-zA-Z0-9_]*)}}", serialized):
+            assert placeholder in allowed_placeholders
+        if probe["tool"] == "k8s_describe":
+            assert {"kind", "name"} <= arguments.keys()
+            assert resolve_read_kind(str(arguments["kind"])) is not None
+        if probe["tool"] == "k8s_read":
+            assert resolve_read_kind(str(arguments.get("kind") or "")) is not None
+        support_signals = probe.get("support_signal_any") or []
+        refute_signals = probe.get("refute_signal_any") or []
+        assert isinstance(support_signals, list)
+        assert isinstance(refute_signals, list)
+        assert all(isinstance(signal, str) and signal.strip() for signal in support_signals)
+        assert all(isinstance(signal, str) and signal.strip() for signal in refute_signals)
+        assert not {signal.lower() for signal in support_signals} & {
+            signal.lower() for signal in refute_signals
+        }
+        if probe["tool"] == "k8s_logs":
+            assert {"pod", "namespace"} <= arguments.keys()
 
 
 def test_pending_failed_scheduling_walks_to_scheduling_leaf() -> None:

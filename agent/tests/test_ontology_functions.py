@@ -20,7 +20,7 @@ def test_functions_tql_defines_the_expected_functions() -> None:
         "causes_for_symptom",
         "dependencies_for_component",
         "verified_actions_for_family",
-        "ancestor_xids_for",
+        "approved_case_card",
         "diagnostic_steps_for_runbook",
         "entry_steps_for_runbook",
         "next_diagnostic_steps",

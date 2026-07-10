@@ -67,27 +67,41 @@ fun causes_for_symptom($symptom_name: string) -> { subtype }:
 fun approved_incidents_for_cause($family: string) -> { incident_id, analysis_summary }:
   match
     $i isa incident, has incident_id $incident_id, has analysis_summary $analysis_summary,
-      has approved_at $approved_at;
+      has status "resolved";
+    $case isa case_snapshot, has approval_state "active";
+    $i isa incident, has status "resolved";
     $diagnosis isa diagnosis, links (run: $run, incident: $i, cause: $cause), has diagnosis_state "supported";
+    (case: $case, finding: $diagnosis) isa case_projection;
     $cause has subtype $subtype; $subtype == $family;
   return { $incident_id, $analysis_summary };
 
 # Concrete evidence which supported an approved historical diagnosis.
 fun evidence_for_approved_cause($family: string) -> { evidence_id, source, summary }:
   match
-    $i isa incident, has approved_at $approved_at;
+    $case isa case_snapshot, has approval_state "active";
+    $i isa incident, has status "resolved";
     $diagnosis isa diagnosis, links (run: $run, incident: $i, cause: $cause), has diagnosis_state "supported";
+    (case: $case, finding: $diagnosis) isa case_projection;
     $cause has subtype $subtype; $subtype == $family;
     $support isa supported_by, links (claim: $diagnosis, proof: $e);
     $e isa evidence, has evidence_id $evidence_id, has source $source, has summary $summary;
   return { $evidence_id, $source, $summary };
 
+# Immutable, approval-bound CaseCard payload. It is a historical prior only;
+# callers must still collect current-incident evidence before asserting an RCA.
+fun approved_case_card($case_id: string) -> { case_card }:
+  match
+    $case isa case_snapshot, has case_id $id, has approval_state "active", has case_card $card;
+    $id == $case_id;
+  return { $card };
+
 # Only operator-confirmed effective actions are returned here. Curated actions
 # remain available through fixes_for_family and are labelled as such by synthesis.
 fun verified_actions_for_family($family: string) -> { statement }:
   match
-    $i isa incident, has approved_at $approved_at;
+    $case isa case_snapshot, has approval_state "active";
     $diagnosis isa diagnosis, links (run: $run, incident: $i, cause: $cause), has diagnosis_state "supported";
+    (case: $case, finding: $diagnosis) isa case_projection;
     $cause has subtype $subtype; $subtype == $family;
     $resolution isa resolution, links (finding: $diagnosis, remedy: $action), has outcome $outcome;
     { $outcome == "resolved"; } or { $outcome == "mitigated"; };
@@ -145,20 +159,6 @@ fun affected_workloads_for_node($node_name: string) -> { name }:
     $workload has name $workload_name;
   return { $workload_name };
 
-fun ancestor_xids_for($code: integer) -> { xid_code }:
-  match
-    $effect isa xid_error, has xid_code $effect_code; $effect_code == $code;
-    {
-      (cause_fault: $ancestor, effect_fault: $effect) isa leads_to;
-    } or {
-      (cause_fault: $next, effect_fault: $effect) isa leads_to;
-      $next has xid_code $next_code;
-      let $ancestor_code in ancestor_xids_for($next_code);
-      $ancestor isa xid_error, has xid_code $ancestor_code;
-    };
-    $ancestor has xid_code $xid_code;
-  return { $xid_code };
-
 # All executable steps in a runbook. The loader materializes empty strings for
 # optional prose fields so every row has a stable tuple shape for the agent.
 fun diagnostic_steps_for_runbook($runbook: string) -> {
@@ -174,6 +174,16 @@ fun diagnostic_steps_for_runbook($runbook: string) -> {
        has avoidance $a,
        has match_expression $m;
   return { $id, $q, $v, $i, $a, $m };
+
+# Structured, read-only probe templates. They are authored in the YAML seed,
+# validated by the loader, and projected to all reasoning agents through the
+# same TypeDB runbook path as questions and disconfirmations.
+fun diagnostic_probes_for_runbook($runbook: string) -> { diagnostic_id, probe_template }:
+  match
+    $r isa runbook, has name $rn; $rn == $runbook;
+    (runbook: $r, step: $s) isa runbook_contains;
+    $s has diagnostic_id $id, has probe_template $probe;
+  return { $id, $probe };
 
 # Entry point(s) for an executable runbook.
 fun entry_steps_for_runbook($runbook: string) -> { diagnostic_id }:

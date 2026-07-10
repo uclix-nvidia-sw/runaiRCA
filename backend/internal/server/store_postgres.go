@@ -336,6 +336,33 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			UNIQUE (run_id, analysis_hash, reviewer)
 		)`,
+		`CREATE TABLE IF NOT EXISTS rca_case_snapshots (
+			case_id TEXT PRIMARY KEY,
+			incident_id TEXT NOT NULL,
+			alert_id TEXT NOT NULL DEFAULT '',
+			run_id TEXT NOT NULL,
+			analysis_hash TEXT NOT NULL,
+			approval_state TEXT NOT NULL CHECK (approval_state IN ('active', 'revoked', 'superseded')),
+			root_cause_family TEXT NOT NULL DEFAULT '',
+			mechanism TEXT NOT NULL DEFAULT '',
+			mechanism_fingerprint TEXT NOT NULL DEFAULT '',
+			snapshot JSONB NOT NULL,
+			approved_at TIMESTAMPTZ NOT NULL,
+			revoked_at TIMESTAMPTZ,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			UNIQUE (run_id, analysis_hash)
+		)`,
+		`CREATE TABLE IF NOT EXISTS novel_cause_registry (
+			mechanism_fingerprint TEXT PRIMARY KEY,
+			canonical_family TEXT NOT NULL,
+			mechanism TEXT NOT NULL DEFAULT '',
+			schema_version INTEGER NOT NULL DEFAULT 1,
+			aliases JSONB NOT NULL DEFAULT '[]'::jsonb,
+			merged_into TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
 		`ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS root_cause_family TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb`,
 		`ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS first_completed_at TIMESTAMPTZ`,
@@ -355,6 +382,8 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_created_at ON analysis_runs (created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_analysis_runs_target ON analysis_runs (target_type, target_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_rca_eval_reviews_run ON rca_eval_reviews (run_id, analysis_hash)`,
+		`CREATE INDEX IF NOT EXISTS idx_rca_case_snapshots_active_incident ON rca_case_snapshots (incident_id, approved_at DESC) WHERE approval_state = 'active'`,
+		`CREATE INDEX IF NOT EXISTS idx_rca_case_snapshots_family ON rca_case_snapshots (root_cause_family, approved_at DESC) WHERE approval_state = 'active'`,
 		`CREATE INDEX IF NOT EXISTS idx_chat_conversations_updated_at ON chat_conversations (updated_at DESC)`,
 		`UPDATE analysis_runs
 			SET status = 'failed',
@@ -445,6 +474,7 @@ func (s *Store) loadDatabaseState(ctx context.Context) {
 	s.loadComments(ctx)
 	s.loadAnalysisRuns(ctx)
 	s.loadEvaluationReviews(ctx)
+	s.loadCaseSnapshots(ctx)
 	s.loadChatConversations(ctx)
 }
 
@@ -837,6 +867,44 @@ func (s *Store) loadEvaluationReviews(ctx context.Context) {
 	}
 }
 
+func (s *Store) loadCaseSnapshots(ctx context.Context) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT case_id, incident_id, alert_id, run_id, analysis_hash, approval_state,
+		        root_cause_family, mechanism, mechanism_fingerprint, snapshot,
+		        approved_at, revoked_at
+		   FROM rca_case_snapshots`,
+	)
+	if err != nil {
+		log.Printf("Failed to load RCA case snapshots: %v", err)
+		return
+	}
+	defer rows.Close()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for rows.Next() {
+		var snapshot CaseSnapshot
+		var payload []byte
+		if err := rows.Scan(
+			&snapshot.CaseID, &snapshot.IncidentID, &snapshot.AlertID, &snapshot.RunID,
+			&snapshot.AnalysisHash, &snapshot.ApprovalState, &snapshot.RootCauseFamily,
+			&snapshot.Mechanism, &snapshot.MechanismFingerprint, &payload,
+			&snapshot.ApprovedAt, &snapshot.RevokedAt,
+		); err != nil {
+			log.Printf("Failed to scan RCA case snapshot: %v", err)
+			continue
+		}
+		_ = json.Unmarshal(payload, &snapshot.Snapshot)
+		if snapshot.Snapshot == nil {
+			snapshot.Snapshot = map[string]any{}
+		}
+		s.caseSnapshots[snapshot.CaseID] = &snapshot
+		if snapshot.ApprovalState == "active" {
+			s.activeCaseByIncident[snapshot.IncidentID] = snapshot.CaseID
+		}
+	}
+}
+
 func (s *Store) loadChatConversations(ctx context.Context) {
 	rows, err := s.db.QueryContext(
 		ctx,
@@ -1185,6 +1253,66 @@ func (s *Store) persistFeedbackCommentUpdateLocked(record *FeedbackRecord) {
 	if err != nil {
 		log.Printf("Failed to update feedback comment %s: %v", record.FeedbackID, err)
 	}
+}
+
+func (s *Store) persistNewCaseSnapshotLocked(snapshot *CaseSnapshot) bool {
+	if s.db == nil || !s.dbReady || snapshot == nil {
+		return true
+	}
+	_, err := s.execPostgres(
+		`INSERT INTO rca_case_snapshots (
+			case_id, incident_id, alert_id, run_id, analysis_hash, approval_state,
+			root_cause_family, mechanism, mechanism_fingerprint, snapshot, approved_at, revoked_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		ON CONFLICT (case_id) DO NOTHING`,
+		snapshot.CaseID, snapshot.IncidentID, snapshot.AlertID, snapshot.RunID,
+		snapshot.AnalysisHash, snapshot.ApprovalState, snapshot.RootCauseFamily,
+		snapshot.Mechanism, snapshot.MechanismFingerprint, mustJSON(snapshot.Snapshot),
+		snapshot.ApprovedAt, snapshot.RevokedAt,
+	)
+	if err != nil {
+		log.Printf("Failed to persist RCA case snapshot %s: %v", snapshot.CaseID, err)
+		return false
+	}
+	return true
+}
+
+// persistCaseSnapshotLifecycleLocked may change only lifecycle fields. The
+// snapshot payload is intentionally absent from this UPDATE so an approved
+// historical case cannot be silently rewritten by a re-analysis.
+func (s *Store) persistCaseSnapshotLifecycleLocked(snapshot *CaseSnapshot) bool {
+	if s.db == nil || !s.dbReady || snapshot == nil {
+		return true
+	}
+	_, err := s.execPostgres(
+		`UPDATE rca_case_snapshots
+		    SET approval_state = $1, revoked_at = $2, updated_at = now()
+		  WHERE case_id = $3`,
+		snapshot.ApprovalState, snapshot.RevokedAt, snapshot.CaseID,
+	)
+	if err != nil {
+		log.Printf("Failed to update RCA case snapshot lifecycle %s: %v", snapshot.CaseID, err)
+		return false
+	}
+	return true
+}
+
+func (s *Store) persistNovelCauseRegistryLocked(snapshot *CaseSnapshot) bool {
+	if s.db == nil || !s.dbReady || snapshot == nil || snapshot.MechanismFingerprint == "" {
+		return true
+	}
+	_, err := s.execPostgres(
+		`INSERT INTO novel_cause_registry (
+			mechanism_fingerprint, canonical_family, mechanism, schema_version, aliases, merged_into
+		) VALUES ($1, $2, $3, 1, '[]'::jsonb, '')
+		ON CONFLICT (mechanism_fingerprint) DO NOTHING`,
+		snapshot.MechanismFingerprint, snapshot.RootCauseFamily, snapshot.Mechanism,
+	)
+	if err != nil {
+		log.Printf("Failed to persist novel cause registry %s: %v", snapshot.MechanismFingerprint, err)
+		return false
+	}
+	return true
 }
 
 func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) bool {

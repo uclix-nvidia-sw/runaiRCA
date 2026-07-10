@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -106,11 +107,54 @@ def _insert_step(tx: Any, node: dict[str, Any]) -> None:
         f'insert $x isa diagnostic_step, has diagnostic_id "{esc(step_id)}", '
         f'has runbook_name "{esc(RUNBOOK_NAME)}", {attrs};'
     ).resolve()
+    for probe in _probe_templates(node.get("probes")):
+        tx.query(
+            f'match $s isa diagnostic_step, has diagnostic_id "{esc(step_id)}"; '
+            f'insert $s has probe_template "{esc(json.dumps(probe, sort_keys=True))}";'
+        ).resolve()
     tx.query(
         f'match $r isa runbook, has name "{esc(RUNBOOK_NAME)}"; '
         f'$s isa diagnostic_step, has diagnostic_id "{esc(step_id)}"; '
         f"insert (runbook: $r, step: $s) isa runbook_contains;"
     ).resolve()
+
+
+def _probe_templates(value: object) -> list[dict[str, object]]:
+    """Validate portable probe metadata without allowing executable commands."""
+    if value is None:
+        return []
+    raw = value if isinstance(value, list) else [value]
+    output: list[dict[str, object]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("diagnostic probe must be a mapping")
+        tool = str(item.get("tool") or "").strip()
+        if not re.fullmatch(r"[a-z][a-z0-9_.-]{0,80}", tool):
+            raise ValueError(f"invalid diagnostic probe tool: {tool!r}")
+        arguments = item.get("arguments_template") or {}
+        if not isinstance(arguments, dict):
+            raise ValueError("diagnostic probe arguments_template must be a mapping")
+        output.append(
+            {
+                "tool": tool,
+                "arguments_template": arguments,
+                "incident_time_window": str(item.get("incident_time_window") or "incident"),
+                "expected_result_shape": str(item.get("expected_result_shape") or ""),
+                "supports_when": [str(v) for v in item.get("supports_when") or [] if str(v)],
+                "refutes_when": [str(v) for v in item.get("refutes_when") or [] if str(v)],
+                # Only explicit signal tokens are machine-evaluated. The prose
+                # fields above remain LLM/operator guidance and cannot make a
+                # probe pass itself.
+                "support_signal_any": [
+                    str(v) for v in item.get("support_signal_any") or [] if str(v)
+                ],
+                "refute_signal_any": [
+                    str(v) for v in item.get("refute_signal_any") or [] if str(v)
+                ],
+                "source_group": str(item.get("source_group") or ""),
+            }
+        )
+    return output
 
 
 def _ensure_cause(tx: Any, family: str) -> None:

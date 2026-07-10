@@ -41,8 +41,47 @@ _PRIOR_QUERY = """
 match
   $a isa alert, has alert_name "{alert}";
   (incident: $i, member: $a) isa grouped_into;
-  $i isa incident, has incident_id $iid, has analysis_summary $sum;
-select $iid, $sum;
+  $i isa incident, has incident_id $iid, has analysis_summary $sum, has status "resolved";
+  $case isa case_snapshot, has approval_state "active", has case_id $case_id;
+  $diagnosis isa diagnosis, links (incident: $i, cause: $cause);
+  (case: $case, finding: $diagnosis) isa case_projection;
+  $cause has subtype $family;
+select $iid, $sum, $case_id, $family;
+"""
+
+_CASE_BY_INCIDENT_QUERY = """
+match
+  $i isa incident, has incident_id "{incident_id}", has analysis_summary $sum, has status "resolved";
+  $case isa case_snapshot, has approval_state "active", has case_id $case_id;
+  $diagnosis isa diagnosis, links (incident: $i, cause: $cause);
+  (case: $case, finding: $diagnosis) isa case_projection;
+  $cause has subtype $family;
+select $sum, $case_id, $family;
+"""
+
+# CaseCards deliberately retrieve graph links separately from the immutable
+# JSON projection. That keeps operator review outcomes/evidence relations
+# queryable without requiring optional TypeQL attributes on legacy snapshots.
+_CASE_CARD_QUERY = """
+match
+  $case isa case_snapshot, has case_id "{case_id}", has case_card $card;
+select $card;
+"""
+_CASE_CARD_EVIDENCE_QUERY = """
+match
+  $case isa case_snapshot, has case_id "{case_id}";
+  (case: $case, finding: $diagnosis) isa case_projection;
+  $link isa {relation}, links (claim: $diagnosis, proof: $evidence);
+  $evidence isa evidence, has evidence_id $evidence_id, has source $source;
+select $evidence_id, $source;
+"""
+_CASE_CARD_ACTIONS_QUERY = """
+match
+  $case isa case_snapshot, has case_id "{case_id}";
+  (case: $case, finding: $diagnosis) isa case_projection;
+  $resolution isa resolution, links (finding: $diagnosis, remedy: $action), has outcome $outcome;
+  $action isa action, has statement $statement;
+select $statement, $outcome;
 """
 
 # Validated TypeDB 3.x reasoning functions (ontology/functions.tql). Called after
@@ -53,7 +92,6 @@ _FN_FIXES_FOR_XID = "match let $x in fixes_for_xid({code}); select $x;"
 _FN_XIDS_FOR_GPU_MODEL = 'match let $x in xids_for_gpu_model("{model}"); select $x;'
 # Reverse leads_to: the root fault(s) that escalate INTO an observed XID.
 _FN_ROOT_XIDS_FOR = "match let $x in root_xids_for({code}); select $x;"
-_FN_ANCESTOR_XIDS_FOR = "match let $x in ancestor_xids_for({code}); select $x;"
 _FN_CAUSES_FOR_SYMPTOM = 'match let $x in causes_for_symptom("{symptom}"); select $x;'
 _FN_DEPENDENCIES_FOR_COMPONENT = 'match let $x in dependencies_for_component("{component}"); select $x;'
 _FN_CHECKS_FOR_COMPONENT_PATH = 'match let $x, $y in checks_for_component_path("{component}"); select $x, $y;'
@@ -83,6 +121,9 @@ _FN_DIAGNOSTIC_DISCONFIRM = (
     'match let $id, $d in diagnostic_disconfirmations_for_runbook("{runbook}"); '
     "select $id, $d;"
 )
+_FN_DIAGNOSTIC_PROBES = (
+    'match let $id, $probe in diagnostic_probes_for_runbook("{runbook}"); select $id, $probe;'
+)
 
 # Curated failure-mode knowledge (knowledge layer), loaded by
 # ontology/load_knowledge.py: family -> symptom(keywords) -> action. The synthesis
@@ -105,6 +146,7 @@ class KGContext:
     blast_radius_workloads: int = 0
     blast_radius_workload_names: list[str] = field(default_factory=list)
     prior_incidents: list[dict[str, str]] = field(default_factory=list)
+    case_cards: list[dict[str, Any]] = field(default_factory=list)
     # family -> [{symptom, keywords[], actions[]}]  (curated knowledge layer)
     knowledge: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     reasoning: dict[str, Any] = field(default_factory=dict)
@@ -120,6 +162,7 @@ class KGContext:
             "blast_radius_workloads": self.blast_radius_workloads,
             "blast_radius_workload_names": self.blast_radius_workload_names,
             "prior_incidents": self.prior_incidents,
+            "case_cards": self.case_cards,
             "knowledge": self.knowledge,
             "reasoning": self.reasoning,
             "diagnostic_tree": self.diagnostic_tree,
@@ -137,7 +180,11 @@ class KGContext:
         return payload
 
 
-async def enrich(settings: Settings, target: AnalysisTarget) -> KGContext:
+async def enrich(
+    settings: Settings,
+    target: AnalysisTarget,
+    similar_incidents: list[Any] | None = None,
+) -> KGContext:
     if not settings.enable_typedb or not settings.typedb_address:
         return KGContext(enabled=False, available=False)
 
@@ -153,7 +200,7 @@ async def enrich(settings: Settings, target: AnalysisTarget) -> KGContext:
     client = TypeDBClient(settings)
     try:
         data = await asyncio.wait_for(
-            asyncio.to_thread(_query_kg, client, target),
+            asyncio.to_thread(_query_kg, client, target, similar_incidents or []),
             timeout=settings.typedb_timeout_seconds + 1,
         )
     except Exception as exc:  # noqa: BLE001 - enrichment is best-effort, never fatal
@@ -176,6 +223,7 @@ async def enrich(settings: Settings, target: AnalysisTarget) -> KGContext:
         blast_radius_workloads=data["blast_radius_workloads"],
         blast_radius_workload_names=data["blast_radius_workload_names"],
         prior_incidents=data["prior_incidents"],
+        case_cards=data["case_cards"],
         knowledge=data["knowledge"],
         reasoning=data["reasoning"],
         diagnostic_tree=data["diagnostic_tree"],
@@ -286,14 +334,11 @@ def _query_remediation(
             # win: fix the origin, not the downstream symptom. root_xids_for is
             # newer than the validated functions, so a query error must NOT wipe
             # the fixes above: _root_chain_for isolates per-hop failures.
-            try:
-                roots = [int(v) for v in _values(run(_FN_ANCESTOR_XIDS_FOR.format(code=code))) if _is_int(v)]
-            except Exception:  # noqa: BLE001 - retain the validated one-hop fallback
-                roots = _root_chain_for(run, code)
-            if not roots:
-                # Older deployments may accept the function call but not have
-                # the new definition yet; keep the established one-hop walk.
-                roots = _root_chain_for(run, code)
+            # TypeDB 3.11 rejects a recursive function whose input is also
+            # read from an attribute. Keep the traversal in Python instead:
+            # it is bounded, cycle-safe, and composes the validated one-hop
+            # root_xids_for function without a failed query per XID.
+            roots = _root_chain_for(run, code)
             if roots:
                 out.root_xids[code] = roots
                 for root in roots:
@@ -381,7 +426,192 @@ def _is_int(value: Any) -> bool:
         return False
 
 
-def _query_kg(client: TypeDBClient, target: AnalysisTarget) -> dict[str, Any]:
+def _select_case_cards(
+    prior: list[dict[str, Any]], target: AnalysisTarget | None = None
+) -> list[dict[str, Any]]:
+    """Return diverse historical priors without letting them become evidence.
+
+    The alert-family query naturally produces close analogs.  A different
+    approved family for the same alert is useful as a counterexample; bridge
+    cards require topology/entity retrieval and are deliberately omitted until
+    that relation exists rather than fabricating a misleading role.
+    """
+    if not prior:
+        return []
+    cards: list[dict[str, Any]] = []
+    analog = prior[0]
+    cards.append(_case_card(analog, "analog"))
+    analog_family = analog.get("family") or ""
+    counterexample = next(
+        (item for item in prior[1:] if item.get("family") and item.get("family") != analog_family),
+        None,
+    )
+    if counterexample is not None:
+        cards.append(_case_card(counterexample, "counterexample"))
+    component = str(getattr(target, "component", "") or "").strip()
+    bridge = next(
+        (
+            item
+            for item in prior
+            if item is not analog
+            and item is not counterexample
+            and component
+            and isinstance(item.get("case_card"), dict)
+            and str((item["case_card"].get("context") or {}).get("component") or "")
+            == component
+        ),
+        None,
+    )
+    if bridge is not None:
+        cards.append(_case_card(bridge, "bridge"))
+    return cards
+
+
+def _case_card(item: dict[str, Any], kind: str) -> dict[str, Any]:
+    raw = item.get("case_card")
+    card = _safe_case_card(raw)
+    # The role and identifiers are set by the retrieval path, never taken from
+    # stored free text. Historical priors must not be mistaken for live proof.
+    card.update({
+        "kind": kind,
+        "historical_prior": True,
+        "case_id": _card_text(item.get("case_id"), 180),
+        "incident_id": _card_text(item.get("incident_id"), 180),
+        "family": _card_text(item.get("family"), 160),
+        "analysis_summary": _card_text(item.get("analysis_summary"), 500),
+    })
+    retrieval = item.get("retrieval")
+    if isinstance(retrieval, dict):
+        card["retrieval"] = {
+            key: retrieval[key]
+            for key in ("sources", "rrf_score", "vector_similarity")
+            if key in retrieval
+        }
+    return card
+
+
+_CASE_CONTEXT_FIELDS = frozenset(
+    {
+        "alert_name",
+        "cluster",
+        "node",
+        "namespace",
+        "project",
+        "queue",
+        "workload",
+        "workload_type",
+        "component",
+        "version",
+        "gpu_model",
+        "incident_phase",
+        "incident_status_at_approval",
+    }
+)
+
+
+def _card_text(value: Any, limit: int = 300) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _safe_case_card(raw: Any) -> dict[str, Any]:
+    """Allowlist the historical prior payload before it reaches an LLM prompt."""
+    if not isinstance(raw, dict):
+        return {}
+    card: dict[str, Any] = {}
+    for key, limit in (
+        ("mechanism", 500),
+        ("mechanism_fingerprint", 160),
+        ("approval_analysis_hash", 160),
+        ("quality_source", 64),
+    ):
+        if value := _card_text(raw.get(key), limit):
+            card[key] = value
+    try:
+        quality = int(raw.get("quality_score"))
+        if 0 <= quality <= 100:
+            card["quality_score"] = quality
+    except (TypeError, ValueError):
+        pass
+    context = raw.get("context")
+    if isinstance(context, dict):
+        safe_context = {
+            key: value
+            for key, value in (
+                (key, _card_text(context.get(key), 160)) for key in _CASE_CONTEXT_FIELDS
+            )
+            if value
+        }
+        if safe_context:
+            card["context"] = safe_context
+    return card
+
+
+def _case_card_projection(run: Any, case_id: str) -> dict[str, Any]:
+    """Read a CaseCard's immutable payload plus actual TypeDB link facts."""
+    if not case_id:
+        return {}
+    encoded_id = escape_typeql(case_id)
+    card: dict[str, Any] = {}
+    try:
+        rows = run(_CASE_CARD_QUERY.format(case_id=encoded_id))
+        if rows:
+            raw = next((row.get("card") for row in rows if row.get("card")), "")
+            if isinstance(raw, str):
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    card = _safe_case_card(parsed)
+    except Exception:  # noqa: BLE001 - schema rollout must retain legacy priors
+        # A rolling schema upgrade may not yet expose case_card; legacy priors
+        # still retain their graph-linked evidence/action fields below.
+        card = {}
+
+    for relation, key in (
+        ("supported_by", "supporting_evidence_by_source"),
+        ("contradicted_by", "contradicting_evidence_by_source"),
+    ):
+        try:
+            rows = run(
+                _CASE_CARD_EVIDENCE_QUERY.format(case_id=encoded_id, relation=relation)
+            )
+        except Exception:  # noqa: BLE001 - a partial graph must not discard the card
+            continue
+        grouped: dict[str, list[dict[str, str]]] = {}
+        for row in rows:
+            evidence_id = str(row.get("evidence_id") or "").strip()
+            source = str(row.get("source") or "unknown").strip() or "unknown"
+            if evidence_id:
+                grouped.setdefault(source, []).append({"evidence_id": evidence_id})
+        if grouped:
+            card[key] = grouped
+
+    try:
+        rows = run(_CASE_CARD_ACTIONS_QUERY.format(case_id=encoded_id))
+    except Exception:  # noqa: BLE001 - pre-resolution schema is an allowed fallback
+        rows = []
+    successful: list[dict[str, str]] = []
+    failed: list[dict[str, str]] = []
+    for row in rows:
+        statement = " ".join(str(row.get("statement") or "").split())[:200]
+        outcome = str(row.get("outcome") or "").strip()
+        if not statement:
+            continue
+        item = {"statement": statement, "outcome": outcome}
+        if outcome in {"resolved", "mitigated"}:
+            successful.append(item)
+        elif outcome == "ineffective":
+            failed.append(item)
+    if successful:
+        card["successful_actions"] = successful
+    if failed:
+        card["failed_actions"] = failed
+    return card
+
+
+def _query_kg(
+    client: TypeDBClient,
+    target: AnalysisTarget,
+    similar_incidents: list[Any] | None = None,
+) -> dict[str, Any]:
     # One connection for all three synthesis queries: a transient connect blip on
     # any single fresh connection would fail the whole enrichment, so opening once
     # (instead of per query) shrinks that failure surface ~3x.
@@ -391,7 +621,7 @@ def _query_kg(client: TypeDBClient, target: AnalysisTarget) -> dict[str, Any]:
             rows = run(_BLAST_QUERY.format(node=escape_typeql(target.node)))
             workloads = sorted({str(r.get("wn")) for r in rows if r.get("wn")})
 
-        prior: list[dict[str, str]] = []
+        prior: list[dict[str, Any]] = []
         if target.alert_name:
             rows = run(_PRIOR_QUERY.format(alert=escape_typeql(target.alert_name)))
             seen: set[str] = set()
@@ -399,9 +629,45 @@ def _query_kg(client: TypeDBClient, target: AnalysisTarget) -> dict[str, Any]:
                 iid = str(r.get("iid") or "")
                 if iid and iid not in seen:
                     seen.add(iid)
+                    case_id = str(r.get("case_id") or "")
                     prior.append(
-                        {"incident_id": iid, "analysis_summary": str(r.get("sum") or "")}
+                        {
+                            "incident_id": iid,
+                            "case_id": case_id,
+                            "family": str(r.get("family") or ""),
+                            "analysis_summary": str(r.get("sum") or ""),
+                            "case_card": _case_card_projection(run, case_id),
+                        }
                     )
+
+        # A vector memory becomes a CaseCard only when TypeDB independently
+        # verifies that this exact incident has an active approved snapshot.
+        # This prevents unreviewed memory text from entering few-shot context.
+        for vector_rank, similar in enumerate((similar_incidents or [])[:5], start=1):
+            incident_id = _similar_incident_id(similar)
+            if not incident_id or any(item.get("incident_id") == incident_id for item in prior):
+                continue
+            try:
+                rows = run(
+                    _CASE_BY_INCIDENT_QUERY.format(incident_id=escape_typeql(incident_id))
+                )
+            except Exception:  # noqa: BLE001 - stale vector result is non-fatal
+                continue
+            row = next((candidate for candidate in rows if candidate.get("case_id")), None)
+            if not isinstance(row, dict):
+                continue
+            case_id = str(row.get("case_id") or "")
+            prior.append(
+                {
+                    "incident_id": incident_id,
+                    "case_id": case_id,
+                    "family": str(row.get("family") or ""),
+                    "analysis_summary": str(row.get("sum") or _similar_summary(similar)),
+                    "case_card": _case_card_projection(run, case_id),
+                    "vector_rank": vector_rank,
+                    "vector_similarity": _similarity(similar),
+                }
+            )
 
         knowledge_rows = run(_KNOWLEDGE_QUERY)
         reasoning: dict[str, Any] = {}
@@ -447,14 +713,66 @@ def _query_kg(client: TypeDBClient, target: AnalysisTarget) -> dict[str, Any]:
             }
         )
 
+    prior = _rrf_case_priors(prior, similar_incidents or [])
+    case_cards = _select_case_cards(prior, target)
     return {
         "blast_radius_workloads": len(workloads),
         "blast_radius_workload_names": workloads[:20],
         "prior_incidents": prior[:5],
+        "case_cards": case_cards,
         "knowledge": knowledge,
         "reasoning": reasoning,
         "diagnostic_tree": diagnostic_tree,
     }
+
+
+def _similar_incident_id(item: Any) -> str:
+    if isinstance(item, dict):
+        return str(item.get("incident_id") or "").strip()
+    return str(getattr(item, "incident_id", "") or "").strip()
+
+
+def _similarity(item: Any) -> float:
+    value = item.get("similarity") if isinstance(item, dict) else getattr(item, "similarity", 0)
+    try:
+        return max(0.0, min(1.0, float(value or 0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _similar_summary(item: Any) -> str:
+    value = item.get("analysis_summary") if isinstance(item, dict) else getattr(item, "analysis_summary", "")
+    return str(value or "")
+
+
+def _rrf_case_priors(prior: list[dict[str, Any]], similar_incidents: list[Any]) -> list[dict[str, Any]]:
+    """Fuse same-alert graph and vector-retrieved approved cases with RRF."""
+    vector_by_id = {
+        incident_id: (rank, item)
+        for rank, item in enumerate(similar_incidents, start=1)
+        if (incident_id := _similar_incident_id(item))
+    }
+    fused: list[dict[str, Any]] = []
+    for graph_rank, item in enumerate(prior, start=1):
+        incident_id = str(item.get("incident_id") or "")
+        ranks = [graph_rank]
+        vector = vector_by_id.get(incident_id)
+        if vector is not None:
+            ranks.append(vector[0])
+        copy = dict(item)
+        copy["retrieval"] = {
+            "sources": ["typedb", *( ["vector"] if vector is not None else [])],
+            "rrf_score": round(sum(1.0 / (60 + rank) for rank in ranks), 6),
+            "vector_similarity": _similarity(vector[1]) if vector is not None else 0.0,
+        }
+        fused.append(copy)
+    return sorted(
+        fused,
+        key=lambda item: (
+            -float((item.get("retrieval") or {}).get("rrf_score") or 0),
+            str(item.get("incident_id") or ""),
+        ),
+    )
 
 
 async def candidate_families_for_symptoms(
@@ -510,6 +828,16 @@ def _query_diagnostic_tree(run: Any) -> dict[str, Any]:
             "avoid": str(row.get("a") or ""),
             "match": _json_object(row.get("m")),
         }
+
+    try:
+        probe_rows = run(_FN_DIAGNOSTIC_PROBES.format(runbook=runbook))
+    except Exception:  # noqa: BLE001 - schema v1 remains a rolling-upgrade fallback
+        probe_rows = []
+    for row in probe_rows:
+        node = nodes.get(str(row.get("id") or ""))
+        probe = _json_object(row.get("probe"))
+        if node is not None and probe:
+            node.setdefault("probes", []).append(probe)
 
     transitions = run(_FN_DIAGNOSTIC_TRANSITIONS.format(runbook=runbook))
     for row in sorted(transitions, key=lambda item: int(item.get("priority") or 0)):
