@@ -114,6 +114,32 @@ async def test_loki_collector_uses_only_loki_mcp_tools(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_loki_mcp_parses_grafana_log_entries(monkeypatch) -> None:
+    async def fake_mcp_call(url, tool, arguments):
+        return _McpResult(
+            {
+                "data": [
+                    {
+                        "timestamp": '"1783644593824076217"',
+                        "line": "scheduler reconciled workload",
+                        "labels": {"namespace": "runai"},
+                    }
+                ],
+                "metadata": {"linesReturned": 20},
+            }
+        )
+
+    monkeypatch.setattr(loki, "mcp_call", fake_mcp_call)
+    result = await loki._mcp_query_loki(
+        "http://grafana-mcp/mcp", "smoke", '{namespace="runai"}', 20, "loki"
+    )
+
+    assert result["status"] == "success"
+    assert result["line_count"] == 20
+    assert result["sample_lines"] == ["scheduler reconciled workload"]
+
+
+@pytest.mark.asyncio
 async def test_postgres_collector_uses_mcp_before_asyncpg(monkeypatch) -> None:
     async def fake_mcp_call(url, tool, arguments):
         sql = arguments["sql"].lower()

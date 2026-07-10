@@ -369,13 +369,20 @@ async def _mcp_query_loki(
     lines = _sample_lines(streams)
     if not lines:
         lines = _log_lines_from_mcp_data(data)
-    line_count = sum(len(stream.get("values", [])) for stream in streams) or len(lines)
+    line_count = sum(len(stream.get("values", [])) for stream in streams) or _mcp_line_count(data)
+    if not line_count:
+        line_count = len(lines)
+    status = _loki_status(data)
+    # grafana-mcp returns log entries as {data: [{timestamp, line, labels}, ...]}
+    # rather than Loki's native {data: {result: [...]}} payload.
+    if status == "unknown" and lines:
+        status = "success"
     return {
         "name": name,
         "query": logql,
         "url": f"{url}#query_loki_logs",
         "status_code": 200,
-        "status": _loki_status(data),
+        "status": status,
         "stream_count": len(streams),
         "line_count": line_count,
         "sample_lines": lines[:8],
@@ -458,11 +465,27 @@ def _log_lines_from_mcp_data(data: object) -> list[str]:
                 break
         return lines
     if isinstance(data, dict):
-        for key in ("lines", "logs", "entries"):
+        for key in ("lines", "logs", "entries", "data"):
             lines = _log_lines_from_mcp_data(data.get(key))
             if lines:
                 return lines
     return []
+
+
+def _mcp_line_count(data: object) -> int:
+    """Count Grafana MCP log entries without mistaking metadata for evidence."""
+    if not isinstance(data, dict):
+        return 0
+    metadata = data.get("metadata")
+    if isinstance(metadata, dict):
+        try:
+            return max(0, int(metadata.get("linesReturned") or 0))
+        except (TypeError, ValueError):
+            pass
+    entries = data.get("data")
+    if isinstance(entries, list):
+        return sum(1 for entry in entries if isinstance(entry, dict) and entry.get("line"))
+    return 0
 
 
 def _bearer_header_value(token: str) -> str:
