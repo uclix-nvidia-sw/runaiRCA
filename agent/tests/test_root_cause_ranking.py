@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
-from app.services.root_cause_ranking import rank_root_cause_candidates
+from app.services.root_cause_ranking import (
+    RankedCause,
+    merge_open_world_candidates,
+    novel_family_slug,
+    rank_root_cause_candidates,
+)
 
 
 def _target(**overrides: str) -> AnalysisTarget:
@@ -36,6 +41,39 @@ def _r(
         details=details or {},
         artifacts=artifacts or [],
     )
+
+
+def test_novel_family_slug_keeps_distinct_unicode_mechanisms() -> None:
+    first, first_fingerprint = novel_family_slug("CSI attach race on gpu-03")
+    korean, korean_fingerprint = novel_family_slug("CSI 연결 경합으로 볼륨 마운트 실패")
+
+    assert first.startswith("novel_csi_attach_race")
+    assert korean.startswith("novel_csi_")
+    assert first_fingerprint != korean_fingerprint
+    assert first != korean
+
+
+def test_open_world_candidate_requires_known_independence_provenance() -> None:
+    known = [RankedCause("insufficient_evidence", "low", 0.0)]
+    ledger = [
+        {
+            "id": "H-new",
+            "mechanism": "CSI controller races a stale attach operation",
+            "status": "supported",
+            "support_evidence_ids": ["E01", "E02"],
+        }
+    ]
+
+    unprovenanced = merge_open_world_candidates(known, ledger, enabled=True)
+    verified = merge_open_world_candidates(
+        known,
+        ledger,
+        fact_groups={"E01": "kubernetes_api", "E02": "loki"},
+        enabled=True,
+    )
+
+    assert unprovenanced == known
+    assert any(candidate.novelty == "open_world" for candidate in verified)
 
 
 def test_r1_node_pressure_wins_with_blast_radius() -> None:

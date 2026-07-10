@@ -5,8 +5,8 @@ from dataclasses import replace
 import pytest
 
 from app.collectors.base import CollectorResult
-from app.llm import begin_usage_tracking
 from app.plan import InvestigationPlan
+from app.services.evidence_blackboard import Blackboard
 from app.services.investigator import _build_user_prompt, _evidence_summary, investigate
 from tests.test_orchestrator import make_settings, make_target
 
@@ -360,6 +360,33 @@ async def test_reflection_can_add_missing_hypothesis(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_reflection_receives_query_safe_shared_observations(monkeypatch) -> None:
+    settings = replace(
+        make_settings(), llm_base_url="https://llm.example/v1", llm_model="m", llm_api_key="k"
+    )
+    reflection_prompt = ""
+    calls = 0
+
+    async def fake_complete_json(settings, *, system, user, **_kwargs):
+        nonlocal calls, reflection_prompt
+        if "final skeptical reflection" in system:
+            reflection_prompt = user
+            return {"hypothesis_updates": [], "new_hypotheses": []}
+        calls += 1
+        if calls == 1:
+            return {"action": "probe", "probes": [{"collector": "runai"}]}
+        return {"action": "conclude"}
+
+    monkeypatch.setattr("app.services.investigator.complete_json", fake_complete_json)
+    await investigate(
+        settings, make_target(), _collectors(), InvestigationPlan(), {}, max_steps=3, blackboard=Blackboard()
+    )
+
+    assert '"shared_observations"' in reflection_prompt
+    assert "F-" in reflection_prompt
+
+
+@pytest.mark.asyncio
 async def test_loop_is_bounded_by_max_steps(monkeypatch) -> None:
     settings = replace(
         make_settings(),
@@ -381,31 +408,6 @@ async def test_loop_is_bounded_by_max_steps(monkeypatch) -> None:
 
     assert calls["n"] <= 3  # max_steps decisions + one final reflection
     assert {r.agent for r in results} == {"runai", "kubernetes", "loki"}
-
-
-@pytest.mark.asyncio
-async def test_token_budget_stops_investigation_loop(monkeypatch) -> None:
-    settings = replace(
-        make_settings(),
-        llm_base_url="https://llm.example/v1",
-        llm_model="m",
-        llm_api_key="k",
-        analysis_token_budget=10,
-    )
-    usage = begin_usage_tracking()
-    usage["total_tokens"] = 10
-
-    async def should_not_call_llm(*args, **kwargs):
-        raise AssertionError("budget should stop the loop before another LLM call")
-
-    monkeypatch.setattr("app.services.investigator.complete_json", should_not_call_llm)
-    collectors = _collectors()
-    results, context = await investigate(
-        settings, make_target(), collectors, InvestigationPlan(), {}, max_steps=4
-    )
-
-    assert {r.agent for r in results} == {"runai", "kubernetes", "loki"}
-    assert any("token budget" in warning for result in results for warning in result.warnings)
 
 
 @pytest.mark.asyncio

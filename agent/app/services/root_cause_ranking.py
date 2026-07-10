@@ -19,6 +19,9 @@ detail parsing (or an LLM judge) only if the eval hit-rate stalls.
 from __future__ import annotations
 
 import os
+import hashlib
+import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -214,6 +217,16 @@ class RankedCause:
     subsystem: str = ""
     nature: str = ""
     trigger: str = ""
+    # Open-world candidates keep a concrete mechanism separate from the broad
+    # catalog family.  Existing callers can ignore these additive fields.
+    mechanism: str = ""
+    mechanism_fingerprint: str = ""
+    hypothesis_id: str = ""
+    novelty: str = "catalog"
+    broad_family: str = ""
+    support_evidence_ids: list[str] = field(default_factory=list)
+    contradiction_evidence_ids: list[str] = field(default_factory=list)
+    rank_basis: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.subsystem or not self.nature:
@@ -231,7 +244,119 @@ class RankedCause:
             "subsystem": self.subsystem,
             "nature": self.nature,
             "trigger": self.trigger,
+            "mechanism": self.mechanism,
+            "mechanism_fingerprint": self.mechanism_fingerprint,
+            "hypothesis_id": self.hypothesis_id,
+            "novelty": self.novelty,
+            "broad_family": self.broad_family,
+            "supporting_evidence_ids": self.support_evidence_ids,
+            "contradicting_evidence_ids": self.contradiction_evidence_ids,
+            "rank_basis": self.rank_basis,
         }
+
+
+def novel_family_slug(mechanism: str) -> tuple[str, str]:
+    """Return a deterministic public family and stable mechanism fingerprint.
+
+    The LLM never supplies a TypeQL type or a final slug.  Normalising the
+    mechanism here prevents spelling variants from producing unstable API
+    values and the fingerprint prevents collisions after truncation.
+    """
+    canonical = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", mechanism).casefold()).strip()
+    # The public slug remains ASCII for downstream metrics and TypeQL values,
+    # while the fingerprint deliberately uses the Unicode canonical mechanism.
+    # Korean/Japanese/etc. therefore share a readable `mechanism` prefix but
+    # never collapse into one cause family.
+    ascii_hint = unicodedata.normalize("NFKD", canonical).encode("ascii", "ignore").decode()
+    slug = re.sub(r"[^a-z0-9]+", "_", ascii_hint).strip("_") or "mechanism"
+    fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8]
+    return f"novel_{slug[:42].rstrip('_')}_{fingerprint}"[:64], fingerprint
+
+
+def merge_open_world_candidates(
+    known: list[RankedCause],
+    ledger: object,
+    *,
+    fact_groups: dict[str, str] | None = None,
+    enabled: bool = False,
+) -> list[RankedCause]:
+    """Merge only evidence-gated novel hypotheses into the ranked list.
+
+    A numeric magic score is deliberately avoided.  The score is derived from
+    corroborating independent facts and is only a compatibility tie-breaker;
+    ``rank_basis`` carries the real adjudication explanation.
+    """
+    if not enabled or not isinstance(ledger, list):
+        return known
+    groups = fact_groups or {}
+    novel: list[RankedCause] = []
+    for item in ledger:
+        if not isinstance(item, dict) or str(item.get("status") or "") != "supported":
+            continue
+        family = str(item.get("family") or "").strip()
+        if family in FAMILIES:
+            continue
+        mechanism = str(item.get("mechanism") or item.get("statement") or "").strip()
+        support = _fact_ids(item.get("support_evidence_ids") or item.get("evidence_for"))
+        contradict = _fact_ids(
+            item.get("contradiction_evidence_ids") or item.get("evidence_against")
+        )
+        if not mechanism or not support or contradict:
+            continue
+        # Evidence IDs are labels, not provenance.  Treating an unknown E-id as
+        # its own independent source would let a hallucinated pair (E01, E02)
+        # satisfy corroboration.  The pipeline supplies this map from the
+        # blackboard only after resolving each fact to a response artifact.
+        if not groups or any(fact_id not in groups for fact_id in support):
+            continue
+        independent = {groups[fact_id] for fact_id in support}
+        if len(independent) < 2:
+            continue
+        slug, fingerprint = novel_family_slug(mechanism)
+        confidence = "high" if len(independent) >= 3 else "medium"
+        novel.append(
+            RankedCause(
+                family=slug,
+                confidence=confidence,
+                score=float(len(independent) * 3 + len(support)),
+                rationale=[mechanism],
+                evidence_agents=sorted(independent),
+                mechanism=mechanism,
+                mechanism_fingerprint=fingerprint,
+                hypothesis_id=str(item.get("id") or ""),
+                novelty="open_world",
+                broad_family=family,
+                support_evidence_ids=support,
+                contradiction_evidence_ids=contradict,
+                rank_basis=[
+                    f"{len(independent)} independent source groups",
+                    f"{len(support)} supporting observations",
+                    "discriminating hypothesis marked supported",
+                ],
+            )
+        )
+    if not novel:
+        return known
+    merged = [*known, *novel]
+    merged.sort(
+        key=lambda candidate: (
+            candidate.confidence == "high",
+            candidate.novelty == "catalog" and any(
+                "signature" in str(reason).lower() or "xid" in str(reason).lower()
+                for reason in candidate.rationale
+            ),
+            not candidate.contradiction_evidence_ids,
+            candidate.score,
+        ),
+        reverse=True,
+    )
+    return merged[: max(3, len(known))]
+
+
+def _fact_ids(value: object) -> list[str]:
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
 
 
 @dataclass

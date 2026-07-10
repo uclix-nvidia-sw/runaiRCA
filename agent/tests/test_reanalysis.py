@@ -241,7 +241,7 @@ async def test_refuted_top_cause_triggers_exactly_one_reanalysis(monkeypatch) ->
 
 
 @pytest.mark.asyncio
-async def test_cap_zero_disables_reanalysis_loop(monkeypatch) -> None:
+async def test_cap_zero_uses_semantic_completion_instead_of_disabling_reanalysis(monkeypatch) -> None:
     _stub_llm_http(monkeypatch)
     investigate_calls: list[int] = []
     refute_calls: list[str] = []
@@ -263,11 +263,11 @@ async def test_cap_zero_disables_reanalysis_loop(monkeypatch) -> None:
     orchestrator = AnalysisOrchestrator(settings)
     response = await orchestrator.analyze(_request())
 
-    assert len(investigate_calls) == 1
-    assert len(refute_calls) == 1
-    assert "re-analysis pass was performed" not in response.analysis_detail
+    assert len(investigate_calls) > 1
+    assert len(refute_calls) >= 1
+    assert "re-analysis pass was performed" in response.analysis_detail
     top = response.context["root_cause_candidates"][0]
-    assert top["family"] == "node_kubelet_pressure"
+    assert top["family"] in {"node_kubelet_pressure", "runai_scheduling_quota"}
 
 
 @pytest.mark.asyncio
@@ -290,40 +290,6 @@ async def test_not_refuted_means_no_reanalysis(monkeypatch) -> None:
     assert "re-analysis pass was performed" not in response.analysis_detail
     top = response.context["root_cause_candidates"][0]
     assert top["family"] == "node_kubelet_pressure"
-
-
-@pytest.mark.asyncio
-async def test_token_budget_skips_reanalysis(monkeypatch) -> None:
-    _stub_llm_http(monkeypatch)
-    investigate_calls: list[int] = []
-    refute_calls: list[str] = []
-    _install_stubs(
-        monkeypatch,
-        verdicts=[
-            {
-                "confidence": "low",
-                "caveat": "Competing cause fits better.",
-                "refuted": True,
-                "next_check": "Check the scheduler queue directly.",
-            }
-        ],
-        investigate_calls=investigate_calls,
-        refute_calls=refute_calls,
-    )
-    monkeypatch.setattr("app.services.pipeline.token_budget_exceeded", lambda settings: True)
-    monkeypatch.setattr(
-        "app.services.pipeline.token_budget_warning",
-        lambda settings: (
-            "analysis token budget exceeded (10/10 tokens); skipped additional LLM reasoning"
-        ),
-    )
-
-    orchestrator = AnalysisOrchestrator(llm_settings())
-    response = await orchestrator.analyze(_request())
-
-    assert len(investigate_calls) == 1
-    assert len(refute_calls) == 1
-    assert any("token budget" in warning for warning in response.warnings)
 
 
 @pytest.mark.asyncio

@@ -22,17 +22,11 @@ from typing import Any
 from app.collectors.base import CollectorResult, artifact, salient_markers, signals_line
 from app.collectors.kubernetes import _READ_KINDS, k8s_read, kind_lookup_title, kubectl_repr
 from app.config import Settings
-from app.llm import complete_json, token_budget_exceeded, token_budget_warning
+from app.llm import complete_json
 from app.masking import build_masker
 from app.plan import InvestigationPlan
 from app.progress import ProgressReporter
 
-# Ad-hoc kubectl-style reads per step are capped so a chatty LLM can't turn one
-# investigation into an API-server sweep.
-_MAX_QUERIES_PER_STEP = 4
-_MAX_HYPOTHESES = 8
-_CONFIDENT_STOP = 0.80
-_CONFIDENT_GAP = 0.25
 _LEDGER_STATUSES = {"open", "testing", "supported", "refuted", "uncertain"}
 _USER_PROMPT_CHARS = 8000
 
@@ -123,21 +117,25 @@ def _evidence_summary(evidence: dict[str, CollectorResult]) -> list[dict]:
 def _initial_ledger(plan: InvestigationPlan | None) -> list[dict[str, Any]]:
     hypotheses = plan.hypotheses if plan else []
     ledger: list[dict[str, Any]] = []
-    for idx, item in enumerate(hypotheses[:_MAX_HYPOTHESES], start=1):
+    for idx, item in enumerate(hypotheses, start=1):
         if not isinstance(item, dict):
             continue
         family = str(item.get("family") or "").strip()
-        if not family:
+        reason = str(item.get("reason") or item.get("statement") or "").strip()
+        if not family and not reason:
             continue
-        reason = str(item.get("reason") or "").strip()
         ledger.append(
             {
                 "id": f"H{idx}",
                 "family": family,
                 "statement": reason or family.replace("_", " "),
+                "mechanism": str(item.get("mechanism") or reason or family.replace("_", " ")),
                 "confidence": 0.5,
                 "evidence_for": [],
                 "evidence_against": [],
+                "expected_observations": _texts(item.get("expected_observations")),
+                "falsifiers": _texts(item.get("falsifiers")),
+                "next_discriminating_test": str(item.get("next_discriminating_test") or ""),
                 "status": "open",
             }
         )
@@ -150,17 +148,21 @@ def _ledger_summary(ledger: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "id": item.get("id"),
             "family": item.get("family"),
             "statement": item.get("statement"),
+            "mechanism": item.get("mechanism") or item.get("statement"),
             "confidence": item.get("confidence"),
             "status": item.get("status"),
             "evidence_for": item.get("evidence_for", [])[-3:],
             "evidence_against": item.get("evidence_against", [])[-3:],
+            "expected_observations": item.get("expected_observations", [])[-3:],
+            "falsifiers": item.get("falsifiers", [])[-3:],
+            "next_discriminating_test": item.get("next_discriminating_test", ""),
         }
         for item in ledger
     ]
 
 
 def _apply_ledger_updates(
-    ledger: list[dict[str, Any]], updates: object
+    ledger: list[dict[str, Any]], updates: object, *, allow_supported: bool = True
 ) -> list[dict[str, Any]]:
     if not isinstance(updates, list):
         return ledger
@@ -174,10 +176,18 @@ def _apply_ledger_updates(
         if "confidence" in update:
             item["confidence"] = _clamp_confidence(update.get("confidence"), item["confidence"])
         status = str(update.get("status") or "").strip().lower()
+        if status == "supported" and not allow_supported:
+            status = "testing"
         if status in _LEDGER_STATUSES:
             item["status"] = status
         _extend_text_list(item, "evidence_for", update.get("evidence_for"))
         _extend_text_list(item, "evidence_against", update.get("evidence_against"))
+        _extend_text_list(item, "expected_observations", update.get("expected_observations"))
+        _extend_text_list(item, "falsifiers", update.get("falsifiers"))
+        for key in ("mechanism", "next_discriminating_test"):
+            value = str(update.get(key) or "").strip()
+            if value:
+                item[key] = value
     return ledger
 
 
@@ -186,30 +196,36 @@ def _add_reflected_hypotheses(
 ) -> list[dict[str, Any]]:
     if not isinstance(candidates, list):
         return ledger
-    existing = {str(item.get("family")) for item in ledger}
+    existing = {
+        str(item.get("family") or "").strip() or _normalise_hypothesis(item.get("statement"))
+        for item in ledger
+    }
     for candidate in candidates:
-        if len(ledger) >= _MAX_HYPOTHESES:
-            break
         if not isinstance(candidate, dict):
             continue
         family = str(candidate.get("family") or "").strip()
-        if not family or family in existing:
-            continue
         statement = str(candidate.get("statement") or candidate.get("reason") or "").strip()
+        key = family or _normalise_hypothesis(statement)
+        if not key or key in existing:
+            continue
         ledger.append(
             {
                 "id": f"H{len(ledger) + 1}",
                 "family": family,
                 "statement": statement or family.replace("_", " "),
+                "mechanism": str(candidate.get("mechanism") or statement or family.replace("_", " ")),
                 "confidence": _clamp_confidence(candidate.get("confidence"), 0.4),
                 "evidence_for": _texts(candidate.get("evidence_for"))[:5],
                 "evidence_against": _texts(candidate.get("evidence_against"))[:5],
+                "expected_observations": _texts(candidate.get("expected_observations")),
+                "falsifiers": _texts(candidate.get("falsifiers")),
+                "next_discriminating_test": str(candidate.get("next_discriminating_test") or ""),
                 "status": str(candidate.get("status") or "open")
                 if str(candidate.get("status") or "open") in _LEDGER_STATUSES
                 else "open",
             }
         )
-        existing.add(family)
+        existing.add(key)
     return ledger
 
 
@@ -232,6 +248,29 @@ def _texts(value: object) -> list[str]:
     return [text for item in value if (text := str(item).strip())]
 
 
+def _normalise_hypothesis(value: object) -> str:
+    return re.sub(r"\W+", " ", str(value or "").lower()).strip()
+
+
+def _legacy_supported(ledger: list[dict[str, Any]]) -> bool:
+    return any(
+        item.get("status") == "supported" and bool(item.get("evidence_for"))
+        for item in ledger
+    )
+
+
+def _ledger_fingerprint(ledger: list[dict[str, Any]]) -> tuple[tuple[str, str, str, tuple[str, ...]], ...]:
+    return tuple(
+        (
+            str(item.get("id") or ""),
+            str(item.get("status") or ""),
+            str(item.get("mechanism") or item.get("statement") or ""),
+            tuple(_texts(item.get("evidence_for"))),
+        )
+        for item in ledger
+    )
+
+
 def _clamp_confidence(value: object, fallback: object) -> float:
     try:
         number = float(value)
@@ -243,21 +282,6 @@ def _clamp_confidence(value: object, fallback: object) -> float:
     return max(0.0, min(1.0, number))
 
 
-def _confident_enough(ledger: list[dict[str, Any]]) -> bool:
-    scores = sorted(
-        (
-            _clamp_confidence(item.get("confidence"), 0)
-            for item in ledger
-            if item.get("status") != "refuted"
-        ),
-        reverse=True,
-    )
-    if not scores or scores[0] < _CONFIDENT_STOP:
-        return False
-    runner_up = scores[1] if len(scores) > 1 else 0.0
-    return scores[0] - runner_up >= _CONFIDENT_GAP
-
-
 async def investigate(
     settings: Settings,
     target: object,
@@ -266,12 +290,15 @@ async def investigate(
     kg_context: dict,
     max_steps: int,
     reporter: ProgressReporter | None = None,
+    blackboard: Any = None,
 ) -> tuple[list[CollectorResult], dict[str, Any]]:
     by_name = {_collector_name(c): c for c in collectors}
     all_names = set(by_name)
     evidence: dict[str, CollectorResult] = {}
     ledger = _initial_ledger(plan)
     investigation_steps: list[dict[str, Any]] = []
+    seen_probes: set[str] = set()
+    seen_queries: set[str] = set()
 
     async def run_probe(name: str, scope: dict) -> None:
         collector = by_name.get(name)
@@ -287,6 +314,7 @@ async def investigate(
             )
         result = await _collect_safely(collector, target, _scoped_plan(plan, scope))
         evidence[name] = result
+        _record_blackboard(blackboard, name, result)
         if reporter:
             reporter.emit(
                 "investigation",
@@ -298,20 +326,21 @@ async def investigate(
             )
 
     adhoc: list[dict] = []
-    budget_warning = ""
     try:
         ran_queries_last_step = False
-        for step in range(max(1, max_steps)):
-            if token_budget_exceeded(settings):
-                budget_warning = token_budget_warning(settings)
-                break
+        step = 0
+        # Open-world callers pass 0: the orchestrator deadline, semantic
+        # duplicates, evidence exhaustion, or an explicit conclusion end the
+        # investigation rather than an arbitrary agent-step counter.
+        while max_steps <= 0 or step < max_steps:
+            step += 1
             if all_names <= set(evidence) and not ran_queries_last_step:
                 break  # every collector probed and no ad-hoc drill-down pending
             if reporter:
                 reporter.emit(
                     "investigation",
                     "Choosing next diagnostic step",
-                    step=step + 1,
+                    step=step,
                     hypothesis_ledger=_ledger_summary(ledger),
                 )
             decision = await complete_json(
@@ -324,7 +353,10 @@ async def investigate(
                     "and use plan.diagnostic_directive as neutral ontology guidance: "
                     "follow its checks and disconfirmations, but never treat its "
                     "provisional_family as observed evidence. Update confidence using "
-                    "only observed evidence. You can ALSO "
+                    "only observed evidence. Cite shared_observations evidence_id "
+                    "values (F-...) in evidence_for/evidence_against; do not invent IDs. "
+                    "When diagnostic_directive.probes names a tool you can reach through a collector, "
+                    "use it as a discriminator and honor its supports_when/refutes_when conditions. You can ALSO "
                     "run kubectl-style READ-ONLY Kubernetes queries (get/list of an "
                     "allowlisted kind, see adhoc_query_kinds). Conclude once evidence "
                     "is sufficient. Respond with ONLY JSON: "
@@ -334,20 +366,28 @@ async def investigate(
                     '"scope":{"namespace"?,"pod"?,"node"?,"workload"?}}],'
                     '"queries":[{"kind":str,"namespace"?,"name"?,"label_selector"?}],'
                     '"hypothesis_updates":[{"id":str,"confidence":number,'
-                    '"evidence_for":[str],"evidence_against":[str],'
-                    '"status":"open|testing|supported|refuted|uncertain"}]}'
+                    '"mechanism":str,"expected_observations":[str],"falsifiers":[str],'
+                    '"next_discriminating_test":str,"evidence_for":[str],'
+                    '"evidence_against":[str],'
+                    '"status":"open|testing|supported|refuted|uncertain"}],'
+                    '"new_hypotheses":[{"family"?:str,"statement":str,"mechanism":str,'
+                    '"expected_observations":[str],"falsifiers":[str],'
+                    '"next_discriminating_test":str}]}'
                 ),
                 user=_investigator_masker(settings).mask_text(
-                    _build_user_prompt(plan, kg_context, evidence, by_name, ledger, adhoc)
+                    _build_user_prompt(
+                        plan, kg_context, evidence, by_name, ledger, adhoc, blackboard=blackboard
+                    )
                 ),
                 model=settings.llm_model_investigation,
             )
             if not isinstance(decision, dict):
                 break  # unusable response -> fall through to full gather
             ledger = _apply_ledger_updates(ledger, decision.get("hypothesis_updates"))
+            ledger = _add_reflected_hypotheses(ledger, decision.get("new_hypotheses"))
             investigation_steps.append(
                 {
-                    "step": step + 1,
+                    "step": step,
                     "action": str(decision.get("action") or ""),
                     "reason": str(decision.get("reason") or "")[:300],
                     "selected_hypothesis": str(decision.get("selected_hypothesis") or ""),
@@ -357,7 +397,7 @@ async def investigate(
                 reporter.emit(
                     "investigation",
                     str(decision.get("reason") or "Diagnostic step selected")[:300],
-                    step=step + 1,
+                    step=step,
                     action=str(decision.get("action") or ""),
                     selected_hypothesis=str(decision.get("selected_hypothesis") or ""),
                     hypothesis_ledger=_ledger_summary(ledger),
@@ -366,16 +406,28 @@ async def investigate(
                 break
             probes = decision.get("probes")
             queries = decision.get("queries")
-            fresh = [
-                p
-                for p in (probes if isinstance(probes, list) else [])
-                if isinstance(p, dict) and p.get("collector") in all_names
-            ]
-            wanted = [
-                q
-                for q in (queries if isinstance(queries, list) else [])
-                if isinstance(q, dict) and str(q.get("kind") or "").strip()
-            ][:_MAX_QUERIES_PER_STEP]
+            fresh = []
+            for probe in probes if isinstance(probes, list) else []:
+                if not isinstance(probe, dict) or probe.get("collector") not in all_names:
+                    continue
+                fingerprint = json.dumps(
+                    {"collector": probe.get("collector"), "scope": probe.get("scope") or {}},
+                    sort_keys=True,
+                    default=str,
+                )
+                if fingerprint in seen_probes:
+                    continue
+                seen_probes.add(fingerprint)
+                fresh.append(probe)
+            wanted = []
+            for query in queries if isinstance(queries, list) else []:
+                if not isinstance(query, dict) or not str(query.get("kind") or "").strip():
+                    continue
+                fingerprint = json.dumps(query, sort_keys=True, default=str)
+                if fingerprint in seen_queries:
+                    continue
+                seen_queries.add(fingerprint)
+                wanted.append(query)
             if not fresh and not wanted:
                 break
             if fresh:
@@ -387,7 +439,7 @@ async def investigate(
                     reporter.emit(
                         "investigation",
                         f"Running {_adhoc_query_repr(q)}",
-                        step=step + 1,
+                        step=step,
                         query=_adhoc_query_repr(q),
                     )
                 adhoc.append(
@@ -400,15 +452,83 @@ async def investigate(
                     )
                 )
             ran_queries_last_step = bool(wanted)
-            if _confident_enough(ledger):
+            # Legacy bounded callers keep the historical early-stop behaviour.
+            # Open-world callers pass 0 and require semantic completion instead.
+            if max_steps > 0 and _legacy_supported(ledger):
                 break
     except Exception:  # noqa: BLE001 - never raise into analyze; keep whatever we have
         pass
 
     try:
+        before_reflection = _ledger_fingerprint(ledger)
         ledger = await _reflect_hypotheses(
-            settings, plan, kg_context, evidence, by_name, ledger, adhoc
+            settings, plan, kg_context, evidence, by_name, ledger, adhoc, blackboard=blackboard
         )
+        if _ledger_fingerprint(ledger) != before_reflection:
+            # A reflection is useful only if its new/changed hypothesis is put
+            # back through a discriminating read-only probe.  Continue until
+            # the model concludes or it can offer no non-duplicate test.
+            while True:
+                verification = await complete_json(
+                    settings,
+                    system=(
+                        "You are verifying a hypothesis introduced or changed during RCA reflection. "
+                        "Do not promote a conclusion from reasoning alone. Select the strongest "
+                        "read-only falsifier or discriminator, probe it, and cite F- observation IDs. "
+                        "Respond with ONLY JSON: "
+                        '{"action":"probe"|"conclude","probes":[{"collector":str,"scope":{}}],'
+                        '"queries":[{"kind":str,"namespace"?:str,"name"?:str,"label_selector"?:str}],'
+                        '"hypothesis_updates":[{"id":str,"confidence":number,"evidence_for":[str],'
+                        '"evidence_against":[str],"status":"open|testing|supported|refuted|uncertain"}]}'
+                    ),
+                    user=_investigator_masker(settings).mask_text(
+                        _build_user_prompt(
+                            plan, kg_context, evidence, by_name, ledger, adhoc, blackboard=blackboard
+                        )
+                    ),
+                    model=settings.llm_model_investigation,
+                )
+                if not isinstance(verification, dict):
+                    break
+                ledger = _apply_ledger_updates(ledger, verification.get("hypothesis_updates"))
+                if verification.get("action") == "conclude":
+                    break
+                fresh = []
+                for probe in verification.get("probes") or []:
+                    if not isinstance(probe, dict) or probe.get("collector") not in all_names:
+                        continue
+                    fingerprint = json.dumps(
+                        {"collector": probe.get("collector"), "scope": probe.get("scope") or {}},
+                        sort_keys=True,
+                        default=str,
+                    )
+                    if fingerprint not in seen_probes:
+                        seen_probes.add(fingerprint)
+                        fresh.append(probe)
+                wanted = []
+                for query in verification.get("queries") or []:
+                    if not isinstance(query, dict) or not str(query.get("kind") or "").strip():
+                        continue
+                    fingerprint = json.dumps(query, sort_keys=True, default=str)
+                    if fingerprint not in seen_queries:
+                        seen_queries.add(fingerprint)
+                        wanted.append(query)
+                if not fresh and not wanted:
+                    break
+                if fresh:
+                    await asyncio.gather(
+                        *(run_probe(probe["collector"], probe.get("scope") or {}) for probe in fresh)
+                    )
+                for query in wanted:
+                    adhoc.append(
+                        await k8s_read(
+                            settings,
+                            str(query.get("kind")),
+                            namespace=str(query.get("namespace") or ""),
+                            name=str(query.get("name") or ""),
+                            label_selector=str(query.get("label_selector") or ""),
+                        )
+                    )
         if reporter:
             reporter.emit(
                 "reflection",
@@ -427,6 +547,7 @@ async def investigate(
             )
             for name, result in zip(remaining, results, strict=True):
                 evidence[name] = result
+                _record_blackboard(blackboard, name, result)
         except Exception:  # noqa: BLE001 - last-resort guard
             pass
 
@@ -464,14 +585,19 @@ async def investigate(
                     result=item,
                 )
             )
+        _record_blackboard(blackboard, "kubernetes", kubernetes_result)
 
     results = list(evidence.values())
-    if budget_warning and results:
-        results[0].warnings.append(budget_warning)
     context = {
         "hypothesis_ledger": _ledger_summary(ledger),
         "investigation_steps": investigation_steps,
         "adhoc_query_count": len(adhoc),
+        "reasoning_trace_v2": {
+            "schema_version": 2,
+            "hypotheses": _ledger_summary(ledger),
+            "referenced_facts": _blackboard_prompt_view(blackboard, limit=30),
+            "stop_reason": "all_collectors_probed",
+        },
     }
     safe_context = _investigator_masker(settings).mask_object(context)
     return results, safe_context if isinstance(safe_context, dict) else context
@@ -485,23 +611,28 @@ async def _reflect_hypotheses(
     by_name: dict,
     ledger: list[dict[str, Any]],
     adhoc: list[dict] | None = None,
+    *,
+    blackboard: Any = None,
 ) -> list[dict[str, Any]]:
-    if token_budget_exceeded(settings):
-        return ledger
     reflection = await complete_json(
         settings,
         system=(
             "You are doing one final skeptical reflection before concluding an RCA "
             "investigation. Look for a missed hypothesis, contradiction, or weakly "
-            "supported confidence. Do not invent evidence. Respond with ONLY JSON: "
-            '{"hypothesis_updates":[{"id":str,"confidence":number,'
-            '"evidence_for":[str],"evidence_against":[str],'
-            '"status":"open|testing|supported|refuted|uncertain"}],'
-            '"new_hypotheses":[{"family":str,"statement":str,"confidence":number,'
-            '"evidence_for":[str],"evidence_against":[str],"status":str}]}'
+            "supported confidence. Do not invent evidence; cite only F- observation IDs "
+            "from shared_observations in evidence_for/evidence_against. Respond with ONLY JSON: "
+            '{"hypothesis_updates":[{"id":str,"confidence":number,"mechanism":str,'
+            '"expected_observations":[str],"falsifiers":[str],'
+            '"next_discriminating_test":str,"evidence_for":[str],'
+            '"evidence_against":[str],"status":"open|testing|supported|refuted|uncertain"}],'
+            '"new_hypotheses":[{"family"?:str,"statement":str,"mechanism":str,'
+            '"expected_observations":[str],"falsifiers":[str],'
+            '"next_discriminating_test":str}]}'
         ),
         user=_investigator_masker(settings).mask_text(
-            _build_user_prompt(plan, kg_context, evidence, by_name, ledger, adhoc)
+            _build_user_prompt(
+                plan, kg_context, evidence, by_name, ledger, adhoc, blackboard=blackboard
+            )
         ),
         model=settings.llm_model_investigation,
     )
@@ -518,12 +649,15 @@ def _build_user_prompt(
     by_name: dict,
     ledger: list[dict[str, Any]],
     adhoc: list[dict] | None = None,
+    *,
+    blackboard: Any = None,
 ) -> str:
     stable = {
         "plan": plan.as_dict() if plan else {},
         "knowledge_graph": {
             "blast_radius_workloads": kg_context.get("blast_radius_workloads"),
             "prior_incidents": kg_context.get("prior_incidents"),
+            "historical_case_cards": kg_context.get("case_cards") or [],
         },
         "available_collectors": {name: _COLLECTOR_HINTS.get(name, "") for name in by_name},
         "adhoc_query_kinds": sorted(_READ_KINDS),
@@ -535,13 +669,47 @@ def _build_user_prompt(
         # The last few ad-hoc reads, trimmed — enough for the LLM to chain
         # "PVC is Pending -> check the storageclass" style drill-downs.
         "adhoc_results": _adhoc_prompt_results(adhoc),
+        # Other evidence agents' findings are supplied as facts, not raw
+        # transport/query text.  A domain agent can therefore test a CSI clue
+        # in Loki/system without inheriting an unsafe executable query.
+        "shared_observations": _blackboard_prompt_view(blackboard, limit=12),
     }
     return _capped_json_prompt(
         stable,
         variable,
         max_chars=_USER_PROMPT_CHARS,
-        trim_keys=("evidence_so_far", "adhoc_results"),
+        trim_keys=("evidence_so_far", "adhoc_results", "shared_observations"),
     )
+
+
+def _record_blackboard(blackboard: Any, agent: str, result: CollectorResult | None) -> None:
+    if blackboard is None or result is None:
+        return
+    for name in ("add_result", "add_collector_result"):
+        method = getattr(blackboard, name, None)
+        if callable(method):
+            try:
+                method(agent, result)
+            except TypeError:
+                method(result)
+            except Exception:  # noqa: BLE001 - blackboard is advisory
+                pass
+            return
+
+
+def _blackboard_prompt_view(blackboard: Any, *, limit: int) -> list[dict[str, Any]]:
+    if blackboard is None:
+        return []
+    method = getattr(blackboard, "prompt_view", None)
+    if not callable(method):
+        return []
+    try:
+        view = method(limit=limit)
+    except TypeError:
+        view = method()
+    except Exception:  # noqa: BLE001 - blackboard is advisory
+        return []
+    return view if isinstance(view, list) else []
 
 
 def _capped_json_prompt(

@@ -297,6 +297,12 @@ def _diagnostic_directive(
             :6
         ],
         "checks": [str(step["verify"])[:500] for step in steps if step.get("verify")][:6],
+        "probes": [
+            {**probe, "hypothesis_family": family}
+            for step in steps
+            for probe in (step.get("probes") or [])
+            if isinstance(probe, dict)
+        ][:8],
         "avoid": [str(step["avoid"])[:400] for step in steps if step.get("avoid")][:4],
         "disconfirm": [str(item)[:500] for item in conclusion.get("disconfirm") or []][:6],
         "provisional_family": family,
@@ -582,6 +588,7 @@ async def plan_investigation(
         matched_alert=matched_alert,
         component=component,
         diagnostic_directive=diagnostic_directive,
+        case_cards=list(kg_context.get("case_cards") or [])[:3],
     )
 
     # Operator guidance (the prompt an operator attached to this Analyze request /
@@ -701,6 +708,7 @@ async def _llm_refine(
         matched_alert=plan.matched_alert,
         component=plan.component,
         diagnostic_directive=plan.diagnostic_directive,
+        case_cards=plan.case_cards,
     )
 
 
