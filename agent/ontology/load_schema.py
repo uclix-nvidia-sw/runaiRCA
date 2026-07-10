@@ -28,6 +28,9 @@ SCHEMA_MIGRATIONS = [
     # several ready-to-run checks, so the architecture loader could never
     # commit a 2-check component against the old card.
     "redefine control_plane_component owns check_command @card(0..);",
+    # Older schemas had a placeholder runbook with a non-key name. Diagnostic
+    # loading needs one stable runbook identity for replace-in-place semantics.
+    "redefine runbook owns name @key;",
 ]
 
 

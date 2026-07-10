@@ -85,6 +85,40 @@ kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --count
 TypeDB Studio 접근은 [Knowledge Base → Querying the graph](KNOWLEDGE-BASE.md)를
 참고하십시오.
 
+## Grafana MCP (Prometheus / Loki) 진단
+
+Prometheus와 Loki는 같은 managed `grafanaMcp` 서비스를 쓰지만 Grafana에서는 별도
+datasource입니다. 따라서 Prometheus 쿼리가 성공해도 Loki datasource가 보이고 쿼리된다는
+뜻은 아닙니다. 수집기는 MCP를 먼저 시도한 뒤 `PROMETHEUS_URL` 또는 `LOKI_URL`로 폴백하며,
+수집기 artifact에 실제 증거를 제공한 경로가 남습니다.
+
+Alertmanager alert에 `startsAt`이 있으면 Loki는 인시던트 시간 창을 조회합니다. 즉 알림 전
+5분부터 `endsAt` 후 5분까지이며, 종료 시각이 없는 firing alert은 시작 후 20분에서 끝냅니다.
+직접 Loki API에는 `start`/`end`를, Grafana MCP에는 `startTime`/`endTime`을 전달합니다.
+파싱 가능한 시작 시각이 없는 alert은 datasource의 일반 recent window를 그대로 사용합니다.
+
+```bash
+# Grafana MCP가 설정한 조직에서 두 datasource UID를 모두 보는지 확인합니다.
+kubectl logs -n <ns> deploy/<release>-grafana-mcp --tail=200
+
+# 서비스 엔드포인트와 MCP 파드가 받은 Grafana URL을 확인합니다.
+kubectl get svc -n <ns> <release>-grafana-mcp
+kubectl get pod -n <ns> -l app.kubernetes.io/component=grafana-mcp \
+  -o jsonpath='{range .items[*]}{.spec.containers[0].env[?(@.name=="GRAFANA_URL")].value}{"\n"}{end}'
+```
+
+- **`get datasource by uid ... 400 id is invalid`** — chart secret에
+  `GRAFANA_SERVICE_ACCOUNT_TOKEN`이 있는지, `grafanaMcp.grafanaUrl`이 클러스터
+  내부에서 Grafana에 도달하는지, `grafanaMcp.grafanaOrgId`가 Loki datasource의 조직과
+  같은지 확인하세요. datasource UID는 Grafana가 반환한 실제 값이어야 하며, 리터럴
+  `{uid}` 경로는 유효하지 않습니다.
+- **MCP가 Prometheus만 나열하고 Loki는 나열하지 않음** — 해당 Grafana 조직에 Loki
+  datasource를 만들거나 노출하고, service account에 datasource query 권한을 부여하세요.
+  이는 Loki gateway 자격 증명이 아니라 datasource/RBAC 문제입니다.
+- **MCP는 실패하지만 direct Loki 증거는 성공함** — Grafana MCP를 고치는 동안
+  `LOKI_URL`은 클러스터 내부 read 서비스(보통 `loki-read:3100`)를 가리키게 유지하세요.
+  이는 의도된 graceful fallback이지만 MCP 고유의 datasource 의미 정보는 제공하지 못합니다.
+
 ## pgvector diagnostics
 
 pgvector는 **백엔드**가 소유합니다. JSONB 희소 벡터 코사인 폴백으로 우아하게 저하되므로,

@@ -6,6 +6,7 @@ import pytest
 
 from app.collectors.base import AnalysisTarget
 from app.schemas import Alert, SimilarIncidentContext
+from app.services.decision_tree import load_tree
 from app.services.planner import plan_investigation
 from tests.test_orchestrator import make_settings
 
@@ -468,6 +469,36 @@ async def test_no_signal_alert_does_not_default_to_node_pressure() -> None:
     assert plan.hypotheses[0]["family"] == "insufficient_evidence"
     assert "most likely" not in plan.focus
     assert "node kubelet pressure" not in plan.focus
+
+
+@pytest.mark.asyncio
+async def test_typedb_diagnostic_graph_is_injected_as_neutral_collector_directive() -> None:
+    settings = make_settings()
+    target = _target(
+        alert_name="NvidiaXidCriticalError",
+        namespace="runai-vision",
+        node="gpu-1",
+    )
+    alert = Alert(
+        status="firing",
+        labels={"alertname": "NvidiaXidCriticalError"},
+        annotations={"summary": "NVRM: Xid 79 GPU has fallen off the bus"},
+    )
+    kg = {
+        "available": True,
+        "prior_incidents": [],
+        "knowledge": {},
+        "diagnostic_tree": load_tree("knowledge/k8s_troubleshooting_tree.yaml"),
+    }
+
+    plan = await plan_investigation(settings, target, alert, kg, [])
+
+    directive = plan.diagnostic_directive
+    assert directive["source"] == "typedb"
+    assert directive["provisional_family"] == "gpu_hardware_error"
+    assert "system" in directive["recommended_collectors"]
+    assert directive["checks"]
+    assert "confirm or refute" in directive["instruction"]
 
 
 @pytest.mark.asyncio

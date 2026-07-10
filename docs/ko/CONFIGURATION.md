@@ -161,7 +161,7 @@ helm upgrade --install runai-rca charts/runai-rca \
 | `agent.env.runaiLogNamespaces` | Run:ai 컨트롤 플레인/백엔드 로그의 네임스페이스. 기본값 `runai,runai-backend` |
 | `agent.env.prometheusUrl` | 클러스터 내부 Prometheus URL(예: `http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090`) |
 | `agent.env.lokiUrl` | 클러스터 내부 Loki 쿼리 URL(예: `http://loki-read.monitoring.svc.cluster.local:3100`). 차트는 기본적으로 인증된 `loki-gateway` 경로를 의도적으로 피합니다. |
-| `grafanaMcp.enabled` / `grafanaMcp.grafanaUrl` | Prometheus/Loki datasource tool을 위한 shared Grafana MCP ClusterIP 서비스를 실행합니다. 기본값 `true`이며, 기본 Grafana URL은 `http://prometheus-grafana.monitoring.svc.cluster.local:80`입니다. 토큰은 `secrets.existingSecret`의 `GRAFANA_SERVICE_ACCOUNT_TOKEN`을 사용합니다 |
+| `grafanaMcp.enabled` / `grafanaMcp.grafanaUrl` / `grafanaMcp.grafanaOrgId` | Prometheus/Loki datasource tool을 위한 shared Grafana MCP ClusterIP 서비스를 실행합니다. 기본값은 `true`, Grafana URL은 `http://prometheus-grafana.monitoring.svc.cluster.local:80`, 조직은 `1`입니다. 토큰은 `secrets.existingSecret`의 `GRAFANA_SERVICE_ACCOUNT_TOKEN`을 사용하며 두 datasource를 나열하고 쿼리할 권한이 있어야 합니다 |
 | `kubernetesMcp.enabled` | 자체 읽기 전용 ServiceAccount/RBAC로 shared Kubernetes MCP ClusterIP 서비스를 실행합니다. 기본값 `true`이며, `secrets`와 `pods/exec` 권한은 부여하지 않습니다 |
 | `postgresMcp.enabled` | `runai-rca-postgres-mcp` 래퍼 이미지 기반 shared Postgres MCP ClusterIP 서비스를 실행합니다. 기본값 `true`입니다 |
 | `agent.env.prometheusMcpUrl` / `agent.env.lokiMcpUrl` / `agent.env.kubernetesMcpUrl` / `agent.env.postgresMcpUrl` | managed shared service를 쓰지 않을 때 지정하는 원격 MCP 엔드포인트 |

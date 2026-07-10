@@ -21,6 +21,17 @@ def test_functions_tql_defines_the_expected_functions() -> None:
         "dependencies_for_component",
         "verified_actions_for_family",
         "ancestor_xids_for",
+        "diagnostic_steps_for_runbook",
+        "entry_steps_for_runbook",
+        "next_diagnostic_steps",
+        "diagnostic_outcomes_for",
+        "diagnostic_actions_for",
+        "diagnostic_disconfirmations_for",
+        "diagnostic_steps_for_family",
+        "diagnostic_transitions_for_runbook",
+        "diagnostic_outcomes_for_runbook",
+        "diagnostic_actions_for_runbook",
+        "diagnostic_disconfirmations_for_runbook",
     ):
         assert f"fun {name}(" in text
         assert "return {" in text

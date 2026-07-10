@@ -7,7 +7,8 @@
 #
 # Loaded AFTER the schema by ontology/load_functions.py — as a SEPARATE define so
 # a function issue on a future TypeDB patch can never break the core schema/data
-# load. VALIDATED against TypeDB CE 3.11.5 (HTTP /v1/query) on 2026-07-02:
+# load. VALIDATED against TypeDB CE 3.11.5 on 2026-07-10, including the
+# executable diagnostic runbook functions below. Original function examples:
 #   fixes_for_xid(79)                    -> "Reset the GPU / contact support."
 #   xids_for_gpu_model("H100")           -> 79
 #   fixes_for_family("gpu_hardware_error") -> "Reset the GPU / contact support."
@@ -157,3 +158,125 @@ fun ancestor_xids_for($code: integer) -> { xid_code }:
     };
     $ancestor has xid_code $xid_code;
   return { $xid_code };
+
+# All executable steps in a runbook. The loader materializes empty strings for
+# optional prose fields so every row has a stable tuple shape for the agent.
+fun diagnostic_steps_for_runbook($runbook: string) -> {
+  diagnostic_id, question, verification, interpretation, avoidance, match_expression
+}:
+  match
+    $r isa runbook, has name $rn; $rn == $runbook;
+    (runbook: $r, step: $s) isa runbook_contains;
+    $s has diagnostic_id $id,
+       has question $q,
+       has verification $v,
+       has interpretation $i,
+       has avoidance $a,
+       has match_expression $m;
+  return { $id, $q, $v, $i, $a, $m };
+
+# Entry point(s) for an executable runbook.
+fun entry_steps_for_runbook($runbook: string) -> { diagnostic_id }:
+  match
+    $r isa runbook, has name $rn; $rn == $runbook;
+    (runbook: $r, step: $s) isa runbook_entry;
+    $s has diagnostic_id $id;
+  return { $id };
+
+# Ordered outgoing transitions from one diagnostic step. The application sorts
+# the returned priority because TypeDB functions intentionally return sets.
+fun next_diagnostic_steps($step: string) -> {
+  diagnostic_id, match_expression, transition_priority
+}:
+  match
+    $s isa diagnostic_step, has diagnostic_id $sid; $sid == $step;
+    (prior: $s, next: $n) isa diagnostic_transition,
+      has match_expression $m,
+      has transition_priority $p;
+    $n has diagnostic_id $nid;
+  return { $nid, $m, $p };
+
+# Root-cause outcome attached to a terminal diagnostic step.
+fun diagnostic_outcomes_for($step: string) -> { subtype, summary, confidence }:
+  match
+    $s isa diagnostic_step, has diagnostic_id $sid; $sid == $step;
+    $o isa diagnostic_outcome(step: $s, cause: $c),
+      has summary $sum,
+      has confidence $conf;
+    $c has subtype $family;
+  return { $family, $sum, $conf };
+
+# Ordered remediation statements for a terminal diagnostic step.
+fun diagnostic_actions_for($step: string) -> { statement, sequence_index }:
+  match
+    $s isa diagnostic_step, has diagnostic_id $sid; $sid == $step;
+    (step: $s, remedy: $a) isa diagnostic_recommendation,
+      has sequence_index $seq;
+    $a has statement $st;
+  return { $st, $seq };
+
+# Evidence that should refute or weaken a terminal outcome.
+fun diagnostic_disconfirmations_for($step: string) -> { disconfirm }:
+  match
+    $s isa diagnostic_step, has diagnostic_id $sid; $sid == $step;
+    (step: $s, cause: $c) isa diagnostic_outcome, has disconfirm $d;
+  return { $d };
+
+# Reverse lookup used by planners/collectors: which diagnostic steps can lead
+# to a given root-cause family?
+fun diagnostic_steps_for_family($fam: string) -> { diagnostic_id }:
+  match
+    $c isa root_cause, has subtype $family; $family == $fam;
+    (step: $s, cause: $c) isa diagnostic_outcome;
+    $s has diagnostic_id $id;
+  return { $id };
+
+# Bulk graph projections used by the runtime. They avoid issuing one query per
+# step while preserving the same typed relations as the per-step functions.
+fun diagnostic_transitions_for_runbook($runbook: string) -> {
+  diagnostic_id, diagnostic_id, match_expression, transition_priority
+}:
+  match
+    $r isa runbook, has name $rn; $rn == $runbook;
+    (runbook: $r, step: $p) isa runbook_contains;
+    (prior: $p, next: $n) isa diagnostic_transition,
+      has match_expression $m,
+      has transition_priority $priority;
+    $p has diagnostic_id $pid;
+    $n has diagnostic_id $nid;
+  return { $pid, $nid, $m, $priority };
+
+fun diagnostic_outcomes_for_runbook($runbook: string) -> {
+  diagnostic_id, subtype, summary, confidence
+}:
+  match
+    $r isa runbook, has name $rn; $rn == $runbook;
+    (runbook: $r, step: $s) isa runbook_contains;
+    (step: $s, cause: $c) isa diagnostic_outcome,
+      has summary $sum,
+      has confidence $conf;
+    $s has diagnostic_id $id;
+    $c has subtype $family;
+  return { $id, $family, $sum, $conf };
+
+fun diagnostic_actions_for_runbook($runbook: string) -> {
+  diagnostic_id, statement, sequence_index
+}:
+  match
+    $r isa runbook, has name $rn; $rn == $runbook;
+    (runbook: $r, step: $s) isa runbook_contains;
+    (step: $s, remedy: $a) isa diagnostic_recommendation,
+      has sequence_index $seq;
+    $s has diagnostic_id $id;
+    $a has statement $st;
+  return { $id, $st, $seq };
+
+fun diagnostic_disconfirmations_for_runbook($runbook: string) -> {
+  diagnostic_id, disconfirm
+}:
+  match
+    $r isa runbook, has name $rn; $rn == $runbook;
+    (runbook: $r, step: $s) isa runbook_contains;
+    (step: $s, cause: $c) isa diagnostic_outcome, has disconfirm $d;
+    $s has diagnostic_id $id;
+  return { $id, $d };

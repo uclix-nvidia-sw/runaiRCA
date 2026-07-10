@@ -33,6 +33,7 @@ from app.knowledge import (
 from app.llm import complete_json, llm_configured
 from app.masking import build_masker
 from app.plan import InvestigationPlan
+from app.services.decision_tree import resolve_tree, walk_tree
 
 _log = logging.getLogger(__name__)
 
@@ -253,10 +254,59 @@ def _ontology_match(kg_context, alert_text: str) -> bool:
         return False
     if kg_context.get("prior_incidents"):
         return True
+    diagnostic = walk_tree(kg_context.get("diagnostic_tree"), alert_text)
+    conclusion = diagnostic.get("conclusion") if isinstance(diagnostic, dict) else None
+    if isinstance(conclusion, dict) and conclusion.get("family") not in (
+        "",
+        "insufficient_evidence",
+    ):
+        return True
     text = (alert_text or "").lower()
     if not text:
         return False
     return bool(match_failure_mode_symptoms(kg_context.get("knowledge") or {}, text))
+
+
+def _diagnostic_directive(
+    settings: Settings,
+    kg_context: dict,
+    alert_text: str,
+    family_catalog: FamilyCatalog,
+) -> dict:
+    tree, source = resolve_tree(
+        kg_context.get("diagnostic_tree"), settings.failure_modes_file
+    )
+    walked = walk_tree(tree, alert_text)
+    if not walked.get("path"):
+        return {}
+    steps = walked.get("steps") or []
+    conclusion = walked.get("conclusion") or {}
+    family = str(conclusion.get("family") or "")
+    rule = family_catalog.rules.get(family)
+    collectors = list(rule[1]) if rule else []
+    alternatives = [
+        alternative
+        for step in steps
+        for alternative in step.get("alternatives") or []
+        if isinstance(alternative, dict)
+    ]
+    return {
+        "source": source,
+        "path": list(walked.get("path") or []),
+        "questions": [str(step["question"])[:400] for step in steps if step.get("question")][
+            :6
+        ],
+        "checks": [str(step["verify"])[:500] for step in steps if step.get("verify")][:6],
+        "avoid": [str(step["avoid"])[:400] for step in steps if step.get("avoid")][:4],
+        "disconfirm": [str(item)[:500] for item in conclusion.get("disconfirm") or []][:6],
+        "provisional_family": family,
+        "competing_hypotheses": alternatives[:6],
+        "recommended_collectors": collectors,
+        "instruction": (
+            "Collect evidence that can confirm or refute every live hypothesis; "
+            "do not search only for the provisional family."
+        ),
+    }
 
 
 def _alert_haystack(target: AnalysisTarget, alert) -> str:
@@ -349,6 +399,9 @@ async def plan_investigation(
                 namespaces.append(ns)
 
     family_catalog = load_family_catalog(settings.families_file)
+    diagnostic_directive = _diagnostic_directive(
+        settings, kg_context, alert_text, family_catalog
+    )
     hypotheses, keyword_signal = _ordered_hypotheses(target, family_catalog)
     # Namespace decides the emphasis: a Run:ai platform namespace (runai/runai-backend)
     # means the control plane itself is unhealthy -> lead control-plane + node/system
@@ -528,6 +581,7 @@ async def plan_investigation(
         narrative=narrative,
         matched_alert=matched_alert,
         component=component,
+        diagnostic_directive=diagnostic_directive,
     )
 
     # Operator guidance (the prompt an operator attached to this Analyze request /
@@ -646,6 +700,7 @@ async def _llm_refine(
         else plan.narrative,
         matched_alert=plan.matched_alert,
         component=plan.component,
+        diagnostic_directive=plan.diagnostic_directive,
     )
 
 

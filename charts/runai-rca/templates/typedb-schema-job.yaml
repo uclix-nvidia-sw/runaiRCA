@@ -63,7 +63,7 @@ spec:
           command:
             - sh
             - -c
-            - python -m ontology.load_schema && python -m ontology.load_functions && python -m ontology.load_knowledge && python -m ontology.load_xids && python -m ontology.load_alerts && python -m ontology.load_known_issues && python -m ontology.load_architecture
+            - python -m ontology.load_schema && python -m ontology.load_functions && python -m ontology.load_knowledge && python -m ontology.load_troubleshooting && python -m ontology.load_xids && python -m ontology.load_alerts && python -m ontology.load_known_issues && python -m ontology.load_architecture
           env:
             - name: ENABLE_TYPEDB
               value: "true"

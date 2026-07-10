@@ -162,7 +162,7 @@ Frequently tuned Helm values:
 | `agent.env.runaiLogNamespaces` | Namespaces for Run:ai control-plane/backend logs, default `runai,runai-backend` |
 | `agent.env.prometheusUrl` | In-cluster Prometheus URL, for example `http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090` |
 | `agent.env.lokiUrl` | In-cluster Loki query URL, for example `http://loki-read.monitoring.svc.cluster.local:3100`. The chart intentionally avoids the authenticated `loki-gateway` path by default. |
-| `grafanaMcp.enabled` / `grafanaMcp.grafanaUrl` | Run the shared Grafana MCP ClusterIP service for Prometheus/Loki datasource tools, default `true`; default Grafana URL is `http://prometheus-grafana.monitoring.svc.cluster.local:80`; token comes from `GRAFANA_SERVICE_ACCOUNT_TOKEN` in `secrets.existingSecret` |
+| `grafanaMcp.enabled` / `grafanaMcp.grafanaUrl` / `grafanaMcp.grafanaOrgId` | Run the shared Grafana MCP ClusterIP service for Prometheus/Loki datasource tools, default `true`; the default URL is `http://prometheus-grafana.monitoring.svc.cluster.local:80` and the default org is `1`. The service-account token comes from `GRAFANA_SERVICE_ACCOUNT_TOKEN` in `secrets.existingSecret`; it must be able to list and query both datasources. |
 | `kubernetesMcp.enabled` | Run the shared Kubernetes MCP ClusterIP service with its own read-only ServiceAccount/RBAC, default `true`; no `secrets` or `pods/exec` permissions |
 | `postgresMcp.enabled` | Run the shared Postgres MCP ClusterIP service backed by the `runai-rca-postgres-mcp` wrapper image, default `true` |
 | `agent.env.prometheusMcpUrl` / `agent.env.lokiMcpUrl` / `agent.env.kubernetesMcpUrl` / `agent.env.postgresMcpUrl` | Remote MCP endpoints when not using the managed shared services |

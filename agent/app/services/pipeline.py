@@ -8,7 +8,6 @@ import time
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
-from pathlib import Path
 from typing import Any, TypeVar
 
 from pydantic import BaseModel
@@ -41,7 +40,7 @@ from app.plan import InvestigationPlan
 from app.progress import ProgressReporter
 from app.prompts import load_agent_souls
 from app.schemas import AlertAnalysisRequest, AlertAnalysisResponse
-from app.services.decision_tree import load_tree, walk_tree
+from app.services.decision_tree import resolve_tree, walk_tree
 from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
 from app.services.planner import plan_investigation
 from app.services.root_cause_ranking import RankedCause, rank_root_cause_candidates
@@ -119,7 +118,12 @@ def new_state(
     collectors: list[object] | None = None,
     runtime_label: str = "fallback",
 ) -> PipelineState:
-    target = resolve_target(request.alert.labels, request.alert.annotations)
+    target = resolve_target(
+        request.alert.labels,
+        request.alert.annotations,
+        fired_at=request.alert.startsAt or "",
+        resolved_at=request.alert.endsAt or "",
+    )
     masker = _build_settings_masker(settings)
     return PipelineState(
         settings=settings,
@@ -162,8 +166,8 @@ async def enrich_stage(state: PipelineState) -> PipelineState:
         target.node,
         target.workload_name,
     )
-    # Knowledge graph is consulted once here, at synthesis time, as a
-    # knowledge resource for the final RCA — not as a parallel collector.
+    # Knowledge graph is consulted once here before planning, then the same
+    # snapshot guides collectors and final synthesis — not a parallel collector.
     state.kg_context = await enrich(state.settings, target)
     return state
 
@@ -484,7 +488,12 @@ async def rank_stage(state: PipelineState) -> PipelineState:
     # the k8s node-conditions text even when every condition is False).
     state.observed = _observed_text(state.results, request)
     state.xid_codes = _xid_codes_from_results(state.results, _alert_text(request))
-    state.failure_modes = load_failure_modes(settings.failure_modes_file)
+    # TypeDB is the runtime source of truth. The version-controlled YAML matcher
+    # remains only for deployments where the graph is disabled/unavailable.
+    state.failure_modes = (
+        state.kg_context.knowledge
+        or load_failure_modes(settings.failure_modes_file)
+    )
     state.known_issues = load_runai_known_issues(settings.runai_known_issues_file)
     # Version-aware precision: drop known issues already fixed in the cluster's
     # running Run:ai version so we don't attribute a symptom to a patched bug.
@@ -621,10 +630,14 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         pass
     else:
         state.timeline = build_timeline(state.results)
-    state.troubleshooting_path = walk_tree(
-        load_tree(_k8s_troubleshooting_tree_path(settings)),
-        _observed_text(state.results, request),
+    diagnostic_tree, diagnostic_source = resolve_tree(
+        getattr(state.kg_context, "diagnostic_tree", {}), settings.failure_modes_file
     )
+    state.troubleshooting_path = walk_tree(
+        diagnostic_tree, _observed_text(state.results, request)
+    )
+    if state.troubleshooting_path.get("path"):
+        state.troubleshooting_path["source"] = diagnostic_source
     state.quality = _quality_from(state.results)
     # Adversarial precision: LLM-verify signature/keyword matches (known issues,
     # failure-mode symptoms, GPU XIDs) and drop ones the evidence doesn't support.
@@ -787,7 +800,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             "top_root_cause": (
                 state.root_cause_candidates[0].as_dict() if state.root_cause_candidates else None
             ),
-            "knowledge_base": state.kg_context.as_dict(),
+            "knowledge_base": state.kg_context.public_dict(),
             "ontology_reasoning": state.kg_context.as_dict().get("reasoning", {}),
             "plan": plan.as_dict(),
             "hypothesis_ledger": state.investigation_context.get("hypothesis_ledger"),
@@ -1313,6 +1326,9 @@ async def _synthesize_korean(
         "드레인, MIG/설정 변경 등. 스케줄러·증상성 경고(예: PodGroup Warning)보다 '무엇이 바뀌어 "
         "이 알림이 촉발됐는가'를 먼저 의심하고, 시간 순서(변경 → 결과 → 알림)로 인과를 설명하세요.\n"
         "- 증거에 troubleshooting_path가 있으면 그 steps를 사용해 진단 흐름을 단계별로 설명하세요. "
+        "steps 안의 alternatives는 동시에 성립한 경쟁 가설이므로, 선택한 경로와 함께 무엇을 추가로 "
+        "확인하면 반증되는지 설명하세요. principles와 conclusion.disconfirm이 있으면 성급한 확정을 "
+        "막는 검증 규칙으로 적용하세요. "
         "단, troubleshooting_path의 conclusion은 보강 근거일 뿐이며 XID/known-issue 같은 정밀 "
         "signature 또는 ranked_root_cause_candidates의 1순위 원인을 절대 덮어쓰지 마세요.\n"
         "- 반드시 이 문서 구조를 따르세요 (Word 제출용이므로 헤딩/번호목록만 사용, 표·HTML 금지):\n"
@@ -1439,7 +1455,9 @@ async def _collect_safely(
     collector: object, target: object, plan: object = None, masker: Masker | None = None
 ) -> CollectorResult:
     try:
-        return await collector.collect(target, plan)  # type: ignore[attr-defined]
+        agent = _collector_name(collector)
+        scoped_plan = plan.for_collector(agent) if isinstance(plan, InvestigationPlan) else plan
+        return await collector.collect(target, scoped_plan)  # type: ignore[attr-defined]
     except Exception as exc:
         agent = _collector_name(collector)
         error = _masked_exception_text(exc, masker)
@@ -1480,14 +1498,6 @@ def _build_settings_masker(settings: Settings) -> Masker:
         builtin_enabled=settings.builtin_redaction_enabled,
         hash_mode=settings.builtin_redaction_hash_mode,
     )
-
-
-def _k8s_troubleshooting_tree_path(settings: Settings) -> str:
-    base = Path(settings.failure_modes_file or "knowledge/failure_modes.yaml")
-    try:
-        return str(base.with_name("k8s_troubleshooting_tree.yaml"))
-    except ValueError:
-        return "knowledge/k8s_troubleshooting_tree.yaml"
 
 
 def _mask_model(model: TModel, model_type: type[TModel], masker: Masker) -> TModel:

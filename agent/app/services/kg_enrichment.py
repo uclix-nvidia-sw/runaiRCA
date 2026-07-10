@@ -1,11 +1,11 @@
-"""Synthesis-time knowledge-graph enrichment.
+"""Planning and synthesis knowledge-graph enrichment.
 
 The ontology knowledge graph is NOT a parallel evidence collector. It is a
-knowledge resource the final synthesis/analysis step consults once to make a
-better, grounded RCA: node blast radius (relational impact pgvector can't see)
-and prior incidents that fired the same alert, with their past RCA.
+knowledge resource the pipeline consults once before planning, then reuses for
+collector guidance and final synthesis: executable diagnostics, node blast
+radius, and prior incidents that fired the same alert with their past RCA.
 
-Queried a single time per analysis (centralized at synthesis) to keep load low.
+Queried a single time per analysis (centralized in enrich_stage) to keep load low.
 Degrades to an empty, "available: false" context when TypeDB is disabled,
 the driver is missing, or the server is unreachable — never raises into analyze.
 
@@ -17,6 +17,7 @@ confirmed cause->action edges are a later enrichment (needs richer ingestion).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -58,6 +59,31 @@ _FN_DEPENDENCIES_FOR_COMPONENT = 'match let $x in dependencies_for_component("{c
 _FN_CHECKS_FOR_COMPONENT_PATH = 'match let $x, $y in checks_for_component_path("{component}"); select $x, $y;'
 _FN_VERIFIED_ACTIONS_FOR_FAMILY = 'match let $x in verified_actions_for_family("{family}"); select $x;'
 
+_DIAGNOSTIC_RUNBOOK = "k8s-senior-troubleshooting"
+_FN_DIAGNOSTIC_STEPS = (
+    'match let $id, $q, $v, $i, $a, $m in diagnostic_steps_for_runbook("{runbook}"); '
+    "select $id, $q, $v, $i, $a, $m;"
+)
+_FN_DIAGNOSTIC_ENTRY = (
+    'match let $id in entry_steps_for_runbook("{runbook}"); select $id;'
+)
+_FN_DIAGNOSTIC_TRANSITIONS = (
+    'match let $pid, $nid, $m, $priority in diagnostic_transitions_for_runbook("{runbook}"); '
+    "select $pid, $nid, $m, $priority;"
+)
+_FN_DIAGNOSTIC_OUTCOMES = (
+    'match let $id, $family, $sum, $conf in diagnostic_outcomes_for_runbook("{runbook}"); '
+    "select $id, $family, $sum, $conf;"
+)
+_FN_DIAGNOSTIC_ACTIONS = (
+    'match let $id, $st, $seq in diagnostic_actions_for_runbook("{runbook}"); '
+    "select $id, $st, $seq;"
+)
+_FN_DIAGNOSTIC_DISCONFIRM = (
+    'match let $id, $d in diagnostic_disconfirmations_for_runbook("{runbook}"); '
+    "select $id, $d;"
+)
+
 # Curated failure-mode knowledge (knowledge layer), loaded by
 # ontology/load_knowledge.py: family -> symptom(keywords) -> action. The synthesis
 # matches the incident's evidence against the keywords to pick precise actions.
@@ -82,6 +108,9 @@ class KGContext:
     # family -> [{symptom, keywords[], actions[]}]  (curated knowledge layer)
     knowledge: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     reasoning: dict[str, Any] = field(default_factory=dict)
+    # Executable diagnostic graph projected from TypeDB. Empty means the caller
+    # should use the version-controlled YAML fallback.
+    diagnostic_tree: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -93,8 +122,19 @@ class KGContext:
             "prior_incidents": self.prior_incidents,
             "knowledge": self.knowledge,
             "reasoning": self.reasoning,
+            "diagnostic_tree": self.diagnostic_tree,
             "warnings": self.warnings,
         }
+
+    def public_dict(self) -> dict[str, Any]:
+        """Operator context without duplicating the full 64-node graph payload."""
+        payload = self.as_dict()
+        tree = payload.pop("diagnostic_tree", {})
+        payload["diagnostic_runbook"] = {
+            "available": bool(tree),
+            "steps": len(tree.get("nodes") or {}) if isinstance(tree, dict) else 0,
+        }
+        return payload
 
 
 async def enrich(settings: Settings, target: AnalysisTarget) -> KGContext:
@@ -138,6 +178,7 @@ async def enrich(settings: Settings, target: AnalysisTarget) -> KGContext:
         prior_incidents=data["prior_incidents"],
         knowledge=data["knowledge"],
         reasoning=data["reasoning"],
+        diagnostic_tree=data["diagnostic_tree"],
     )
 
 
@@ -379,6 +420,11 @@ def _query_kg(client: TypeDBClient, target: AnalysisTarget) -> dict[str, Any]:
                 ][:30]
             except Exception as exc:  # noqa: BLE001 - YAML topology remains the fallback
                 reasoning["warning"] = f"ontology component reasoning unavailable: {type(exc).__name__}"
+        try:
+            diagnostic_tree = _query_diagnostic_tree(run)
+        except Exception:  # noqa: BLE001 - old schema during rolling upgrades
+            _log.warning("TypeDB diagnostic runbook query failed; YAML fallback will be used")
+            diagnostic_tree = {}
 
     grouped: dict[tuple[str, str], dict[str, set[str]]] = {}
     for r in knowledge_rows:
@@ -407,6 +453,7 @@ def _query_kg(client: TypeDBClient, target: AnalysisTarget) -> dict[str, Any]:
         "prior_incidents": prior[:5],
         "knowledge": knowledge,
         "reasoning": reasoning,
+        "diagnostic_tree": diagnostic_tree,
     }
 
 
@@ -441,3 +488,81 @@ def _query_candidate_families(client: TypeDBClient, names: list[str]) -> tuple[d
                 if value:
                     counts[value] = counts.get(value, 0) + 1
     return counts, []
+
+
+def _query_diagnostic_tree(run: Any) -> dict[str, Any]:
+    runbook = escape_typeql(_DIAGNOSTIC_RUNBOOK)
+    step_rows = run(_FN_DIAGNOSTIC_STEPS.format(runbook=runbook))
+    entry_rows = run(_FN_DIAGNOSTIC_ENTRY.format(runbook=runbook))
+    if not step_rows or not entry_rows:
+        return {}
+
+    nodes: dict[str, dict[str, Any]] = {}
+    for row in step_rows:
+        step_id = str(row.get("id") or "")
+        if not step_id:
+            continue
+        nodes[step_id] = {
+            "id": step_id,
+            "question": str(row.get("q") or ""),
+            "verify": str(row.get("v") or ""),
+            "interpretation": str(row.get("i") or ""),
+            "avoid": str(row.get("a") or ""),
+            "match": _json_object(row.get("m")),
+        }
+
+    transitions = run(_FN_DIAGNOSTIC_TRANSITIONS.format(runbook=runbook))
+    for row in sorted(transitions, key=lambda item: int(item.get("priority") or 0)):
+        prior = nodes.get(str(row.get("pid") or ""))
+        next_id = str(row.get("nid") or "")
+        if prior is None or next_id not in nodes:
+            continue
+        prior.setdefault("branches", []).append(
+            {"match": _json_object(row.get("m")), "next": next_id}
+        )
+
+    for row in run(_FN_DIAGNOSTIC_OUTCOMES.format(runbook=runbook)):
+        node = nodes.get(str(row.get("id") or ""))
+        if node is None:
+            continue
+        node["conclusion"] = {
+            "family": str(row.get("family") or ""),
+            "summary": str(row.get("sum") or ""),
+            "confidence": str(row.get("conf") or ""),
+            "next_steps": [],
+        }
+
+    action_rows = run(_FN_DIAGNOSTIC_ACTIONS.format(runbook=runbook))
+    for row in sorted(action_rows, key=lambda item: int(item.get("seq") or 0)):
+        conclusion = (nodes.get(str(row.get("id") or "")) or {}).get("conclusion")
+        if isinstance(conclusion, dict) and row.get("st"):
+            conclusion["next_steps"].append(str(row["st"]))
+
+    for row in run(_FN_DIAGNOSTIC_DISCONFIRM.format(runbook=runbook)):
+        conclusion = (nodes.get(str(row.get("id") or "")) or {}).get("conclusion")
+        if isinstance(conclusion, dict) and row.get("d"):
+            conclusion.setdefault("disconfirm", []).append(str(row["d"]))
+
+    principle_rows = run(
+        f'match $r isa runbook, has name "{runbook}", has principle $p; select $p;'
+    )
+    source_rows = run(
+        f'match $r isa runbook, has name "{runbook}", has source_url $s; select $s;'
+    )
+    root = str(entry_rows[0].get("id") or "")
+    if root not in nodes:
+        return {}
+    return {
+        "root": root,
+        "nodes": nodes,
+        "principles": sorted({str(row["p"]) for row in principle_rows if row.get("p")}),
+        "sources": sorted({str(row["s"]) for row in source_rows if row.get("s")}),
+    }
+
+
+def _json_object(value: object) -> dict[str, Any]:
+    try:
+        parsed = json.loads(str(value or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}

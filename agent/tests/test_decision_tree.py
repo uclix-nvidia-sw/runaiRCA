@@ -32,9 +32,9 @@ def test_pending_failed_scheduling_walks_to_scheduling_leaf() -> None:
         """,
     )
 
-    assert walked["path"][-1] == "pending_failed_scheduling"
+    assert walked["path"][-1] == "scheduling_capacity"
     assert walked["conclusion"]["family"] == "k8s_scheduling_error"
-    assert "failedscheduling" in walked["steps"][-1]["matched"]
+    assert "insufficient nvidia.com/gpu" in walked["steps"][-1]["matched"]
 
 
 def test_crashloop_oomkilled_walks_to_startup_leaf() -> None:
@@ -51,6 +51,109 @@ def test_crashloop_oomkilled_walks_to_startup_leaf() -> None:
     assert walked["path"][-1] == "crash_oomkilled"
     assert walked["conclusion"]["family"] == "workload_startup_error"
     assert "oomkilled" in walked["steps"][-1]["matched"]
+
+
+def test_pending_capacity_preserves_senior_diagnostic_sequence() -> None:
+    tree = load_tree(TREE)
+    walked = walk_tree(
+        tree,
+        """
+        Pod trainer-0 phase: Pending.
+        Warning FailedScheduling from default-scheduler:
+        0/4 nodes are available: 4 Insufficient nvidia.com/gpu.
+        """,
+    )
+
+    assert walked["path"][-1] == "scheduling_capacity"
+    assert "Compare the pod's requests" in walked["steps"][-1]["verify"]
+    assert "total cluster free capacity" in walked["steps"][-1]["interpretation"]
+
+
+def test_admission_webhook_takes_control_plane_path() -> None:
+    walked = walk_tree(
+        load_tree(TREE),
+        "failed calling webhook validate.example.io: no endpoints available",
+    )
+
+    assert walked["path"] == [
+        "incident_scope",
+        "control_plane_failure",
+        "admission_webhook_failure",
+    ]
+    assert walked["conclusion"]["family"] == "k8s_control_plane_error"
+
+
+def test_unknown_symptom_keeps_an_explicit_evidence_path() -> None:
+    walked = walk_tree(load_tree(TREE), "workload emitted an unfamiliar warning")
+
+    assert walked["path"] == ["incident_scope", "insufficient_k8s_evidence"]
+    assert walked["conclusion"]["family"] == "insufficient_evidence"
+
+
+def test_empty_evidence_still_returns_collection_plan() -> None:
+    walked = walk_tree(load_tree(TREE), "")
+
+    assert walked["path"] == ["incident_scope", "insufficient_k8s_evidence"]
+    assert walked["conclusion"]["next_steps"]
+
+
+def test_multi_signal_incident_preserves_competing_branches() -> None:
+    walked = walk_tree(
+        load_tree(TREE),
+        "node NotReady with DiskPressure while pod also reports FailedMount",
+    )
+
+    assert walked["path"][1] == "node_not_ready"
+    alternatives = walked["steps"][0]["alternatives"]
+    assert any(item["id"] == "storage_failure" for item in alternatives)
+    assert walked["principles"]
+
+
+@pytest.mark.parametrize(
+    ("evidence", "leaf", "family"),
+    [
+        (
+            "NVRM: Xid 79 GPU has fallen off the bus; NCCL WARN collective timeout",
+            "gpu_xid_failure",
+            "gpu_hardware_error",
+        ),
+        (
+            "NCCL WARN collective operation timeout in rank 3",
+            "nccl_unresolved_collective_failure",
+            "insufficient_evidence",
+        ),
+        (
+            "runai-scheduler-default reclaimed over-quota workload for fairshare",
+            "runai_reclaim_or_preemption",
+            "runai_scheduling_quota",
+        ),
+        (
+            "forbidden: serviceaccount trainer cannot list resource pods",
+            "kubernetes_rbac_failure",
+            "platform_auth_error",
+        ),
+        (
+            "thanos-receive target down and metrics missing",
+            "metrics_pipeline_failure",
+            "observability_accuracy",
+        ),
+    ],
+)
+def test_extended_senior_tracks(evidence: str, leaf: str, family: str) -> None:
+    walked = walk_tree(load_tree(TREE), evidence)
+
+    assert walked["path"][-1] == leaf
+    assert walked["conclusion"]["family"] == family
+
+
+def test_precise_gpu_fault_keeps_downstream_nccl_as_alternative() -> None:
+    walked = walk_tree(
+        load_tree(TREE),
+        "NVRM: Xid 79 GPU has fallen off the bus; NCCL WARN collective timeout",
+    )
+
+    alternatives = walked["steps"][0]["alternatives"]
+    assert any(item["id"] == "distributed_training_failure" for item in alternatives)
 
 
 @pytest.mark.asyncio
@@ -121,4 +224,6 @@ def test_tree_families_exist_in_catalog() -> None:
         if isinstance(node, dict) and isinstance(node.get("conclusion"), dict)
     }
 
-    assert tree_families <= families
+    # insufficient_evidence is a deliberate terminal state, not a ranked
+    # operational family in families.yaml.
+    assert tree_families - {"insufficient_evidence"} <= families

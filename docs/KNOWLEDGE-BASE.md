@@ -22,6 +22,7 @@ All live under `agent/knowledge/` and ship in the agent image.
 | **Built-in alerts** | `runai_alerts_catalog.yaml` | alert name | recognise a documented Run:ai alert and its fix |
 | **NVIDIA XID catalog** | `xid_catalog.yaml` | XID code | GPU-hardware fault path + causal chains |
 | **Platform architecture** | `runai_architecture.yaml` | component name (via symptom `component:` tag) | dependency check paths + DB schema hints |
+| **Kubernetes diagnostic runbook** | `k8s_troubleshooting_tree.yaml` | ordered evidence conditions | senior-SRE questions, competing branches, disconfirmation, actions |
 
 Matching is substring-first (precise) with a conservative **BM25 + synonym**
 recall fallback (`agent/app/bm25.py`) when nothing matches — see the
@@ -77,8 +78,8 @@ Three consumers (`agent/app/knowledge.py`):
 An optional TypeDB 3.x knowledge graph (`typedb.enabled`, Helm default **on**)
 gives the orchestrator relational reasoning that pgvector similarity and label
 overlap cannot express. Schema: `agent/ontology/schema.tql`. It is consulted
-**by the orchestrator** around synthesis time — not by a separate agent, and not
-as a parallel collector.
+**by the orchestrator** before planning (to inject neutral collector guidance)
+and again at synthesis — not by a separate agent or parallel collector.
 
 **Layers**
 - *Infra / topology* — `cluster`, `node`, `namespace`, `project`, `queue`,
@@ -87,6 +88,8 @@ as a parallel collector.
   queryable), `analysis_run`.
 - *Knowledge* — `symptom` (owns `keyword`), `root_cause`, `action`, plus the
   `xid_error` GPU-fault catalog with `leads_to` causal chains.
+- *Executable diagnostics* — `runbook`, `diagnostic_step`, ordered
+  `diagnostic_transition`, `diagnostic_outcome`, and `diagnostic_recommendation`.
 
 **Reasoning functions** (`ontology/functions.tql`, validated TypeQL 3.11.x):
 `fixes_for_family`, `fixes_for_xid`, `xids_for_gpu_model`, `root_xids_for`,
@@ -94,12 +97,21 @@ live-symptom family lookup, recursive component/XID paths, and approved-history
 verified-action lookup. The full model and Studio checks are in the
 [Ontology & Ingestion Guide](ONTOLOGY-GUIDE.md).
 
+Before collection, the planner converts the matched graph path into a compact
+`diagnostic_directive` (questions, checks, disconfirmation, competing branches).
+Every collector receives a source-specific copy marked as primary or supporting;
+the provisional family is guidance, never observed evidence.
+
+The same function set also provides runbook entry, next-step, outcome, action,
+disconfirmation, and family-to-step lookups. Runtime loads the runbook from
+TypeDB first; the adjacent YAML is used only when TypeDB is unavailable.
+
 ### How data gets in
 
 | Path | Loader | Source | Gate |
 |---|---|---|---|
 | Schema + functions | `load_schema` / `load_functions` | `schema.tql` / `functions.tql` | Helm post-install/upgrade hook |
-| Curated knowledge | `load_knowledge`, `load_xids`, `load_alerts`, `load_known_issues`, `load_architecture` | the catalogs above | version-controlled files, run in the schema job |
+| Curated knowledge | `load_knowledge`, `load_troubleshooting`, `load_xids`, `load_alerts`, `load_known_issues`, `load_architecture` | the catalogs above | version-controlled files, run in the schema job |
 | Incidents + topology | `ontology/ingest.py` (cron) | Postgres incidents, runs, artifacts | dashboard-approved + resolved ≥ `resolvedGraceHours`; `requireApproval=true` by default |
 | Knowledge promotion | `ingest.py --promote-knowledge` | approved non-abstained RCAs | only operator-confirmed effective actions become verified remedies |
 
@@ -135,5 +147,6 @@ select $iid, $sum;
 
 ## See also
 
+- [Ontology & Ingestion Guide](ONTOLOGY-GUIDE.md) — every entity, relation, attribute, and ingestion rule.
 - [Data Stores](DATABASE.md) — table-level reference for both stores.
 - [RCA Pipeline](RCA-PIPELINE.md) — how this knowledge is consumed during analysis.

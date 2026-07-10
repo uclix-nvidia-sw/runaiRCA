@@ -20,7 +20,7 @@ docs/       Architecture and operation notes
 
 ![Run:AI RCA architecture](.gitbook/assets/architecture.svg)
 
-The diagram shows the components and the external systems the Agent reads. Inside the Agent, an **orchestrator** runs the analysis pipeline — planner → seven parallel collectors → central investigation loop and per-collector drill-down → signature matching, ranking, a skeptical self-check → synthesis — detailed in [RCA Pipeline](docs/RCA-PIPELINE.md). The orchestrator itself consults the optional **TypeDB ontology** (`typedb.enabled`, default on in Helm) for relational facts pgvector can't express — node blast radius, prior same-alert incidents, and graph-derived family/XID remediation — populated by review-gated ingestion from the Postgres store. **pgvector** similarity is owned by the backend, which passes similar incidents and feedback hints into each analysis request. Full walkthrough: [RCA Pipeline](docs/RCA-PIPELINE.md) · [Knowledge Base](docs/KNOWLEDGE-BASE.md).
+The diagram shows the components and the external systems the Agent reads. Inside the Agent, an **orchestrator** runs the analysis pipeline — planner → seven parallel collectors → central investigation loop and per-collector drill-down → signature matching, ranking, a skeptical self-check → synthesis — detailed in [RCA Pipeline](docs/RCA-PIPELINE.md). The orchestrator itself consults the optional **TypeDB ontology** (`typedb.enabled`, default on in Helm) for relational facts pgvector can't express — node blast radius, prior same-alert incidents, and graph-derived family/XID remediation — populated from eligible resolved incidents in the Postgres store. Set `typedb.ingest.requireReview=true` when only operator-approved incidents should enter the graph. **pgvector** similarity is owned by the backend, which passes similar incidents and feedback hints into each analysis request. Full walkthrough: [RCA Pipeline](docs/RCA-PIPELINE.md) · [Knowledge Base](docs/KNOWLEDGE-BASE.md).
 
 ### Local Development
 
@@ -55,7 +55,8 @@ kubectl create secret generic runai-rca-secrets -n runai-rca \
   --from-literal=DATABASE_URL='postgres://user:pw@pg-host:5432/runai_rca?sslmode=require' \
   --from-literal=POSTGRES_DSN='postgres://user:pw@pg-host:5432/runai_rca?sslmode=require' \
   --from-literal=RUNAI_CLIENT_ID='<id>' \
-  --from-literal=RUNAI_CLIENT_SECRET='<secret>'
+  --from-literal=RUNAI_CLIENT_SECRET='<secret>' \
+  --from-literal=GRAFANA_SERVICE_ACCOUNT_TOKEN='<grafana-service-account-token>'
 ```
 
 #### 2. Install
@@ -110,6 +111,8 @@ Key values (full secret keys: `DATABASE_URL`, `POSTGRES_DSN`, `RUNAI_CLIENT_ID`,
 | `secrets.existingSecret`                       | Existing Secret with DB/Run:ai/NVIDIA/LLM credentials                                                       |
 | `agent.env.runaiBaseUrl` / `runaiTokenUrl`     | Run:ai API URL and OAuth token URL (token URL required for client\_id/secret)                               |
 | `agent.env.prometheusUrl` / `lokiUrl`          | In-cluster Prometheus / Loki URLs. Loki defaults to the direct read service, not the authenticated gateway. |
+| `grafanaMcp.grafanaUrl` / `grafanaOrgId`       | Grafana endpoint and organization used by the shared MCP service; its service-account token is `GRAFANA_SERVICE_ACCOUNT_TOKEN`. |
+| `typedb.ingest.requireReview`                  | Keep `false` (default) to ingest eligible resolved incidents, or set `true` to limit graph ingestion to operator-approved incidents. |
 | `agent.env.enableNatRuntime` / `natConfigFile` | Enable NeMo synthesis and select workflow config                                                            |
 | `agent.env.llmBaseUrl` / `llmModel`            | OpenAI-compatible endpoint and model                                                                        |
 | `agent.rbac.clusterWide` / `namespaces`        | Read-only RBAC scope for evidence collection                                                                |
@@ -127,7 +130,7 @@ Full table of contents (GitBook-ready): [`SUMMARY.md`](SUMMARY.md).
 * [Architecture](docs/ARCHITECTURE.md) — implementation contract
 * [RCA Pipeline](docs/RCA-PIPELINE.md) — every analysis stage, planner → synthesis
 * [Knowledge Base](docs/KNOWLEDGE-BASE.md) — curated catalogs + TypeDB ontology
-* [Ontology & Ingestion Guide](docs/ONTOLOGY-GUIDE.md) — approved RCA graph model and Studio checks
+* [Ontology & Ingestion Guide](docs/ONTOLOGY-GUIDE.md) — approved RCA graph model, data-shaping rules, and Studio checks
 * [Evaluation & Runtime Harness](docs/EVALUATION.md) — output gates, repair, and operator scoring
 * [Operating Model](docs/OPERATING-MODEL.md) — operating model
 * [Data Stores](docs/DATABASE.md) — PostgreSQL + TypeDB ontology
