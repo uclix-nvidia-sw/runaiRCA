@@ -2917,7 +2917,10 @@ func TestIncidentHardDeleteAndTrashPurge(t *testing.T) {
 
 func TestRecurrenceStatsAndIncidentSimilarRecentCount(t *testing.T) {
 	store := NewStore()
-	now := time.Date(2026, 7, 6, 12, 0, 0, 0, time.UTC)
+	// IncidentDetail calculates its rolling seven-day window from the real
+	// service clock. Keep the fixture in that same window; a fixed calendar
+	// date makes this test start failing after one week.
+	now := time.Now().UTC()
 	prior, priorAlert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "recurrence-prior"}, Alert{
 		Status:      "firing",
 		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning", "queue": "gpu-a", "namespace": "runai"},

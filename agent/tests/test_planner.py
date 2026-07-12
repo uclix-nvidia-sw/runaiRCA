@@ -498,6 +498,7 @@ async def test_typedb_diagnostic_graph_is_injected_as_neutral_collector_directiv
     assert directive["provisional_family"] == "gpu_hardware_error"
     assert "system" in directive["recommended_collectors"]
     assert directive["checks"]
+    assert directive["interpretation"]
     assert "confirm or refute" in directive["instruction"]
 
 

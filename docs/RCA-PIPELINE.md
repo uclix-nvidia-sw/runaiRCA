@@ -129,6 +129,12 @@ the overall analysis deadline — not a fixed agent-step quota. Synthesis always
 waits for *all* collectors — an early/partial synthesis would produce a
 confident-but-wrong RCA.
 
+The Kubernetes diagnostic tree is projected as questions, checks, structured
+read-only probes, interpretations, avoid guidance, and explicit
+disconfirmations. Every terminal branch also states its confidence boundary, so
+an evidence agent can leave a plausible branch when contradictory live evidence
+appears instead of treating the runbook as a list of answers.
+
 ## 5. Signature matching + BM25 recall + ranking
 
 The retrieval entry point is the **fine-grained signature match**, not the coarse

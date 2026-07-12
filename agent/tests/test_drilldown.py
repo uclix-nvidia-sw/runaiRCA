@@ -177,6 +177,8 @@ def test_drilldown_receives_source_scoped_ontology_guidance(monkeypatch) -> None
             "path": ["incident_scope", "pod_pending", "scheduling_capacity"],
             "questions": ["Why is the pod Pending?"],
             "checks": ["Compare requested and allocatable GPU capacity."],
+            "interpretation": ["Capacity is relevant only after eligibility filters pass."],
+            "avoid": ["Do not change requests before reading the FailedScheduling predicate."],
             "disconfirm": ["A matching node has allocatable GPU capacity."],
             "provisional_family": "k8s_scheduling_error",
             "competing_hypotheses": [{"id": "pending_volume_binding"}],
@@ -193,6 +195,8 @@ def test_drilldown_receives_source_scoped_ontology_guidance(monkeypatch) -> None
     assert guidance["primary"] is False
     assert guidance["candidate_family"] == "k8s_scheduling_error"
     assert guidance["checks"] == ["Compare requested and allocatable GPU capacity."]
+    assert guidance["interpretation"] == ["Capacity is relevant only after eligibility filters pass."]
+    assert guidance["avoid"] == ["Do not change requests before reading the FailedScheduling predicate."]
     assert guidance["disconfirm"] == ["A matching node has allocatable GPU capacity."]
 
 

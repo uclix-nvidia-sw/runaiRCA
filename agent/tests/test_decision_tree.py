@@ -282,3 +282,22 @@ def test_tree_families_exist_in_catalog() -> None:
     # insufficient_evidence is a deliberate terminal state, not a ranked
     # operational family in families.yaml.
     assert tree_families - {"insufficient_evidence"} <= families
+
+
+def test_every_conclusion_has_disconfirm_and_confidence() -> None:
+    """Terminal diagnoses need both a confidence boundary and a falsifier."""
+    tree = yaml.safe_load(TREE.read_text())
+    conclusions = [
+        node["conclusion"]
+        for node in tree["nodes"]
+        if isinstance(node, dict) and isinstance(node.get("conclusion"), dict)
+    ]
+
+    assert conclusions
+    for conclusion in conclusions:
+        confidence = conclusion.get("confidence")
+        disconfirm = conclusion.get("disconfirm")
+        assert isinstance(confidence, str) and confidence.strip()
+        assert isinstance(disconfirm, list) and any(
+            isinstance(item, str) and item.strip() for item in disconfirm
+        )

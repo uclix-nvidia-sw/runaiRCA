@@ -244,6 +244,9 @@ nodes:
     conclusion:
       family: k8s_scheduling_error
       summary: "An eligible node lacks a resource requested by the pod."
+      confidence: "high only when the complete FailedScheduling predicate names the missing resource for this pod"
+      disconfirm:
+        - "A taint, affinity, PVC, quota, or Run:ai policy predicate—not resource capacity—is the first failed condition."
       next_steps:
         - "Capture the full FailedScheduling predicate breakdown and the pod resource requests."
         - "Compare requests against allocatable capacity on eligible nodes, including GPU fragmentation on the target pool."
@@ -259,6 +262,9 @@ nodes:
     conclusion:
       family: k8s_scheduling_error
       summary: "A node taint excludes the pod from otherwise candidate nodes."
+      confidence: "high only when FailedScheduling names an untolerated taint on otherwise eligible nodes"
+      disconfirm:
+        - "The pod tolerates the taint or another scheduler predicate excludes candidates first."
       next_steps:
         - "Read the exact taint/effect in the FailedScheduling event and list tolerations from the pod spec."
         - "Add the narrow matching toleration only when this workload is allowed on that node class."
@@ -274,6 +280,9 @@ nodes:
     conclusion:
       family: k8s_scheduling_error
       summary: "Required selector or affinity rules eliminate every candidate node."
+      confidence: "high only when the event names the selector or required affinity mismatch and node labels confirm it"
+      disconfirm:
+        - "A matching node exists and resource, taint, topology, or volume evidence blocks placement first."
       next_steps:
         - "Identify the first selector or required-affinity term with zero matching nodes."
         - "Correct stale labels or relax only the constraint that is not a workload requirement."
@@ -289,6 +298,9 @@ nodes:
     conclusion:
       family: k8s_scheduling_error
       summary: "A topology spread constraint prevents the pod from being placed."
+      confidence: "high only when FailedScheduling names the topology spread constraint and current skew exceeds its limit"
+      disconfirm:
+        - "The topology constraint is satisfied or another scheduler predicate appears earlier."
       next_steps:
         - "Verify that every intended node has the topology label and that enough domains are available."
         - "Correct label drift or expand the eligible node pool first."
@@ -314,6 +326,9 @@ nodes:
     conclusion:
       family: k8s_scheduling_error
       summary: "A Kubernetes ResourceQuota blocks the pod request."
+      confidence: "high only when the admission error identifies the exceeded ResourceQuota and requested dimension"
+      disconfirm:
+        - "Quota has headroom or scheduling, image, storage, or Run:ai policy fails before quota admission."
       next_steps:
         - "Capture the exact quota dimension that is exhausted."
         - "Release stale namespace usage or adjust the approved quota budget."
@@ -328,6 +343,9 @@ nodes:
     conclusion:
       family: k8s_scheduling_error
       summary: "The pod is Pending because kube-scheduler could not place it on any node."
+      confidence: "provisional until the full FailedScheduling predicate is captured"
+      disconfirm:
+        - "The first blocking event is PVC binding, image pull, sandbox creation, or a non-scheduler error."
       next_steps:
         - "Read the FailedScheduling event breakdown in kubectl describe pod."
         - "Compare requested CPU, memory, GPU, taints, tolerations, selectors, and affinity against schedulable nodes."
@@ -358,6 +376,9 @@ nodes:
     conclusion:
       family: k8s_storage_error
       summary: "The pod is Pending because Kubernetes cannot bind or provision its volume."
+      confidence: "high only when PVC or provisioner events show the claim cannot bind or provision during the incident"
+      disconfirm:
+        - "The claim is Bound before the incident and a scheduler, attachment, mount, or application failure occurs first."
       next_steps:
         - "Run kubectl describe pvc and read the provisioning or binding event."
         - "Confirm the StorageClass exists and its provisioner is healthy."
@@ -404,6 +425,9 @@ nodes:
     conclusion:
       family: k8s_storage_error
       summary: "The volume cannot attach to the selected node."
+      confidence: "high only when FailedAttachVolume or CSI controller events identify the same volume and node"
+      disconfirm:
+        - "The volume attaches successfully or binding, node readiness, or mount execution fails first."
       next_steps:
         - "Identify the active VolumeAttachment and the node holding the volume."
         - "Resolve zone/topology mismatch or safely detach the stale attachment."
@@ -419,6 +443,9 @@ nodes:
     conclusion:
       family: k8s_storage_error
       summary: "Node-side CSI or kubelet mounting prevents the pod from starting."
+      confidence: "high only when FailedMount or CSI node logs identify the target volume after attachment"
+      disconfirm:
+        - "The volume mounts successfully or an earlier attach, binding, credentials, or sandbox failure explains startup."
       next_steps:
         - "Capture the mount command/error, CSI node logs, and backend reachability from the affected node."
         - "Fix credentials, filesystem, export policy, or node connectivity indicated by that error."
@@ -478,6 +505,9 @@ nodes:
     conclusion:
       family: workload_startup_error
       summary: "An init container is blocking workload startup."
+      confidence: "high only when an init-container state, previous log, or event fails before the main container starts"
+      disconfirm:
+        - "All init containers completed and the earliest failing signal belongs to the main container or platform."
       next_steps:
         - "Read logs from the failing init container, including `--previous` when it restarted."
         - "Route image-pull, mount, permission, and exit-code errors to their matching lower-level evidence."
@@ -492,6 +522,9 @@ nodes:
     conclusion:
       family: workload_startup_error
       summary: "The workload restarts because the container is being OOMKilled."
+      confidence: "high only when the terminated container reason is OOMKilled or the kernel confirms an incident-era OOM kill"
+      disconfirm:
+        - "The termination reason is different or an application exit, probe, or node eviction occurs first."
       next_steps:
         - "Check whether memory spikes at startup or grows over time."
         - "Raise the memory limit only if usage is expected; otherwise fix the leak or input size."
@@ -515,6 +548,9 @@ nodes:
     conclusion:
       family: workload_startup_error
       summary: "The workload process starts and exits repeatedly, causing CrashLoopBackOff."
+      confidence: "provisional until previous-container logs or termination state identify the first process failure"
+      disconfirm:
+        - "OOMKilled, probes, image pull, mount, or node-side failure predates process exit."
       next_steps:
         - "Read current and previous container logs for the first application error."
         - "Check command, args, env, ConfigMap, Secret, and recent image changes."
@@ -527,6 +563,9 @@ nodes:
     conclusion:
       family: workload_startup_error
       summary: "The container cannot start because its command or runtime setup is invalid."
+      confidence: "high only when kubelet reports RunContainerError, ContainerCannotRun, or a command/runtime error"
+      disconfirm:
+        - "The process starts and a later application, probe, image, or platform signal is the first failure."
       next_steps:
         - "Inspect the pod event message for the exact missing executable or permission error."
         - "Compare command and args with the image contents."
@@ -558,6 +597,9 @@ nodes:
     conclusion:
       family: image_pull_error
       summary: "The pod cannot start because the node cannot pull the container image."
+      confidence: "high only when ErrImagePull or ImagePullBackOff names the image, registry, or credentials failure"
+      disconfirm:
+        - "The image pulls successfully and another lifecycle failure occurs first."
       next_steps:
         - "Read the image pull event for tag, auth, DNS, TLS, rate limit, or registry 5xx details."
         - "Confirm the image tag exists and imagePullSecrets are present in the same namespace."
@@ -575,6 +617,9 @@ nodes:
     conclusion:
       family: k8s_storage_error
       summary: "The pod is blocked because Kubernetes cannot attach or mount a volume."
+      confidence: "provisional until the first storage event distinguishes binding, attachment, or mount failure"
+      disconfirm:
+        - "PVC, attachment, and mount events are healthy and scheduler, image, sandbox, or workload evidence starts earlier."
       next_steps:
         - "Check the PVC is Bound and describe the pod for the exact mount or attach event."
         - "Inspect the CSI node and controller pods for the affected volume."
@@ -642,6 +687,9 @@ nodes:
     conclusion:
       family: k8s_control_plane_error
       summary: "etcd availability, quorum, or latency is disrupting Kubernetes control-plane requests."
+      confidence: "high only when etcd health, quorum, or latency evidence overlaps the failed API operations"
+      disconfirm:
+        - "etcd is healthy and API failures are isolated to admission, authentication, or one client workload."
       next_steps:
         - "Preserve etcd member health and latency evidence from every control-plane node."
         - "Investigate quorum, disk saturation, and network reachability before member recovery."
@@ -657,6 +705,9 @@ nodes:
     conclusion:
       family: k8s_control_plane_error
       summary: "A validating or mutating admission webhook blocks Kubernetes API requests."
+      confidence: "high only when the API response names the webhook and its endpoint or TLS failure"
+      disconfirm:
+        - "The request reaches admission or API-server, RBAC, DNS, or workload evidence precedes webhook handling."
       next_steps:
         - "Identify the named webhook and verify its Service has ready endpoints."
         - "Check webhook TLS/certificate, failurePolicy, timeout, and deployment rollout state."
@@ -671,6 +722,9 @@ nodes:
     conclusion:
       family: k8s_control_plane_error
       summary: "Kubernetes API-server availability, leadership, or access is affecting workload operations."
+      confidence: "high only when API-server logs, readiness, or client errors show the same incident-era failure"
+      disconfirm:
+        - "The API server is healthy and etcd, admission, credentials, or a downstream controller fails first."
       next_steps:
         - "Confirm API endpoint health and scope the impact across namespaces and clients."
         - "Inspect apiserver, controller-manager, and load-balancer evidence for the first shared failure."
@@ -683,6 +737,9 @@ nodes:
     conclusion:
       family: node_kubelet_pressure
       summary: "The node is under kubelet pressure and is disrupting pods."
+      confidence: "high only when the target node condition and eviction or kubelet event overlap affected pods"
+      disconfirm:
+        - "Node pressure is absent or a pod-local, storage, GPU, or control-plane failure occurs first."
       next_steps:
         - "Cordon the node if unrelated workloads are affected."
         - "Inspect kubelet conditions, evictions, disk, memory, PID usage, and image or log growth."
@@ -697,6 +754,9 @@ nodes:
     conclusion:
       family: node_kubelet_pressure
       summary: "The node is NotReady, so pod placement or running pods on that node are unreliable."
+      confidence: "high only when the same node transitions NotReady before the affected pod symptoms"
+      disconfirm:
+        - "The node remains Ready or workloads fail on healthy nodes for a different earlier reason."
       next_steps:
         - "Check kubelet and container runtime status on the node."
         - "Read node conditions and recent kubelet events for heartbeat, runtime, disk, memory, or PID failures."
@@ -709,6 +769,9 @@ nodes:
     conclusion:
       family: workload_startup_error
       summary: "The workload is failing Kubernetes health probes."
+      confidence: "high only when kubelet events identify a failed startup, readiness, or liveness probe"
+      disconfirm:
+        - "Probe state is healthy or process, network, dependency, or node failure occurs before probe evaluation."
       next_steps:
         - "Check probe path, port, timeout, period, and failureThreshold against real startup time."
         - "Read application logs around the probe failures."
@@ -754,6 +817,9 @@ nodes:
     conclusion:
       family: cluster_network_error
       summary: "Cluster DNS cannot resolve a required name for the workload."
+      confidence: "high only when target-pod lookup failures correlate with CoreDNS or resolver evidence"
+      disconfirm:
+        - "DNS resolves the dependency and connection, endpoint, policy, or application behavior fails later."
       next_steps:
         - "Confirm whether the failing name is a valid Kubernetes Service/namespace FQDN."
         - "Check CoreDNS health, upstream reachability, and the affected pod's DNS configuration."
@@ -768,6 +834,9 @@ nodes:
     conclusion:
       family: cluster_network_error
       summary: "The Service has no ready endpoints for the requested traffic."
+      confidence: "high only when EndpointSlice or Endpoints data shows no ready backend at failure time"
+      disconfirm:
+        - "Ready endpoints exist and DNS, policy, dataplane, TLS, or backend application behavior explains the failure."
       next_steps:
         - "Verify selector labels and EndpointSlice membership."
         - "Fix pod readiness or selector drift; do not focus on CNI until endpoints exist."
@@ -782,6 +851,9 @@ nodes:
     conclusion:
       family: cluster_network_error
       summary: "Traffic policy or the cluster dataplane blocks a reachable dependency."
+      confidence: "high only when endpoints are ready and policy, routing, or dataplane evidence blocks the same path"
+      disconfirm:
+        - "DNS, endpoints, application health, or an external dependency fails first."
       next_steps:
         - "Confirm DNS and EndpointSlice are healthy first."
         - "Identify the blocked source/destination/port and evaluate matching ingress/egress policy."
@@ -808,6 +880,9 @@ nodes:
     conclusion:
       family: workload_runtime_error
       summary: "The workload reached runtime but application code or its dependency failed."
+      confidence: "provisional until logs identify the first application exception or unavailable dependency"
+      disconfirm:
+        - "A lifecycle, node, storage, GPU, or network failure predates the application error."
       next_steps:
         - "Identify the first failing request/rank/process and correlate it with the latest deployment or configuration change."
         - "Separate application exceptions from dependency timeouts and infrastructure errors using timestamps."
@@ -833,6 +908,9 @@ nodes:
     conclusion:
       family: platform_lifecycle_change
       summary: "The event coincides with a Kubernetes workload rollout or platform lifecycle change."
+      confidence: "provisional until the new revision or lifecycle event is shown to precede the first failure"
+      disconfirm:
+        - "No relevant change occurred before the incident or the prior revision fails identically."
       next_steps:
         - "Confirm the rollout/release generation and whether replacement replicas become Ready within the expected window."
         - "If it is stuck, follow the first failed pod event rather than the rollout status alone."
@@ -889,6 +967,9 @@ nodes:
     conclusion:
       family: runai_control_plane_error
       summary: "A Run:ai backend or database dependency failure disrupts platform operations."
+      confidence: "high only when Run:ai backend/database logs or health checks show the same dependency failure"
+      disconfirm:
+        - "Run:ai backend and database are healthy while Kubernetes scheduling, workload, or network fails first."
       next_steps:
         - "Identify the first failing backend endpoint and its owning dependency."
         - "Check database saturation, connection exhaustion, migrations, and recent backend rollout."
@@ -953,6 +1034,9 @@ nodes:
     conclusion:
       family: gpu_hardware_error
       summary: "An NVIDIA XID or inaccessible GPU is the earliest hardware/driver-layer failure."
+      confidence: "high only when XID, NVML, or device-access failure predates workload and NCCL symptoms on the node"
+      disconfirm:
+        - "GPU health is clean or peer, fabric, scheduler, or application failure occurs first."
       disconfirm:
         - "the XID predates this incident and the GPU remained healthy throughout the failure window"
       next_steps:
@@ -969,6 +1053,9 @@ nodes:
     conclusion:
       family: gpu_hardware_error
       summary: "The node container runtime lacks the NVIDIA runtime handler required by GPU pods."
+      confidence: "high only when kubelet or runtime configuration reports a missing NVIDIA handler"
+      disconfirm:
+        - "The handler is registered and a driver, device plugin, image, or workload error occurs first."
       disconfirm:
         - "the active CRI configuration contains the handler and a GPU test pod starts on the same node"
       next_steps:
@@ -996,6 +1083,9 @@ nodes:
     conclusion:
       family: gpu_hardware_error
       summary: "The NVIDIA device plugin is not registering healthy GPUs with Kubernetes."
+      confidence: "high only when allocatable GPU capacity or device-plugin logs show registration failure on the node"
+      disconfirm:
+        - "Allocatable GPUs are healthy and scheduler capacity, driver, runtime, or workload fails first."
       next_steps:
         - "Confirm host GPUs and driver health first."
         - "Inspect device-plugin registration and XidCriticalError messages."
@@ -1010,6 +1100,9 @@ nodes:
     conclusion:
       family: gpu_hardware_error
       summary: "The NVIDIA kernel driver or NVML userspace stack is unavailable or mismatched."
+      confidence: "high only when nvidia-smi, NVML, or kernel logs show a mismatch or unavailable device"
+      disconfirm:
+        - "Driver and NVML are healthy and device plugin, fabric, scheduler, or application fails first."
       next_steps:
         - "Drain the node before driver/module recovery."
         - "Align the loaded module and userspace driver versions; reboot when an in-place upgrade left stale modules."
@@ -1024,6 +1117,9 @@ nodes:
     conclusion:
       family: network_fabric_error
       summary: "GPU fabric initialization or Fabric Manager prevents GPU validation and peer communication."
+      confidence: "high only when Fabric Manager or GPU fabric state is unhealthy before peer or NCCL failures"
+      disconfirm:
+        - "Fabric state is healthy or GPU XID, driver, NIC, peer process, or application failure occurs first."
       next_steps:
         - "Confirm Fabric State and Fabric Manager version/service health."
         - "Use the documented stop-apps, recover fabric, validate, restart-apps order."
@@ -1048,6 +1144,8 @@ nodes:
     conclusion:
       family: gpu_hardware_error
       confidence: "provisional until the first failed operand is identified"
+      disconfirm:
+        - "All GPU Operator operands are Ready and a lower-level driver, runtime, device-plugin, fabric, or workload failure occurs first."
       summary: "GPU Operator reconciliation has not produced a complete healthy GPU stack."
       next_steps:
         - "Follow the first non-ready operand rather than the loudest validator."
@@ -1107,6 +1205,9 @@ nodes:
     conclusion:
       family: workload_runtime_error
       summary: "A single rank or peer failed first and caused downstream collective timeouts."
+      confidence: "high only when rank-specific logs identify one peer failure before collective timeout propagation"
+      disconfirm:
+        - "All ranks fail simultaneously or fabric, GPU, bootstrap, or scheduler evidence predates any peer failure."
       next_steps:
         - "Root-cause the first failed rank using its exit code and local node/GPU evidence."
         - "Confirm all other ranks timed out after that timestamp."
@@ -1132,6 +1233,9 @@ nodes:
     conclusion:
       family: network_fabric_error
       summary: "NCCL cannot register pinned/shared memory required by its transport."
+      confidence: "high only when NCCL reports memory-registration errors and host memory, driver, and transport evidence aligns"
+      disconfirm:
+        - "The first cause is peer exit, fabric reachability, GPU XID, or bootstrap rather than registration."
       next_steps:
         - "Record memlock and shared-memory limits from the actual training container."
         - "Apply the smallest approved limit/shared-memory correction."
@@ -1146,6 +1250,9 @@ nodes:
     conclusion:
       family: network_fabric_error
       summary: "The InfiniBand/RoCE transport path is degraded or misconfigured for the affected ranks."
+      confidence: "high only when NCCL/verbs logs and NIC, RDMA, or fabric counters identify the transport path"
+      disconfirm:
+        - "Transport checks are healthy and peer, GPU, DNS/bootstrap, or application failure starts earlier."
       next_steps:
         - "Use ibstat/ibstatus plus bandwidth and latency tests on the failing pair."
         - "Inspect RDMA, NIC, and switch counters for the implicated rail."
@@ -1169,6 +1276,9 @@ nodes:
     conclusion:
       family: network_fabric_error
       summary: "NCCL bootstrap or network-interface selection prevents communicator formation."
+      confidence: "high only when NCCL bootstrap logs identify interface selection, resolution, or connect failure"
+      disconfirm:
+        - "Bootstrap completes and a later collective, peer, GPU, or transport failure is first."
       next_steps:
         - "Confirm the selected interface is reachable between all ranks."
         - "Check host networking/firewall and port-range policy before forcing NCCL_SOCKET_IFNAME."
@@ -1183,6 +1293,8 @@ nodes:
     conclusion:
       family: insufficient_evidence
       confidence: "low"
+      disconfirm:
+        - "A timestamped peer, GPU, bootstrap, or fabric failure clearly predates the collective timeout."
       summary: "The collective failed, but current evidence does not identify the initiating rank or transport layer."
       next_steps:
         - "Enable timestamped NCCL WARN/INFO for INIT, BOOTSTRAP, and NET subsystems."
@@ -1229,6 +1341,9 @@ nodes:
     conclusion:
       family: runai_scheduling_quota
       summary: "Run:ai preempted or reclaimed a preemptible workload according to priority or fairshare policy."
+      confidence: "high only when Run:ai events identify reclaim or preemption for this workload and queue"
+      disconfirm:
+        - "No reclaim decision occurred or Kubernetes scheduling, quota, node, or workload failure occurs first."
       next_steps:
         - "Name the exact policy decision and the workload/queue that received the resource."
         - "If stability is required, place the workload within deserved quota and use the approved non-preemptible policy."
@@ -1243,6 +1358,9 @@ nodes:
     conclusion:
       family: runai_scheduling_quota
       summary: "A Run:ai gang or sub-group placement constraint keeps the distributed workload Pending."
+      confidence: "high only when Run:ai scheduler events name the gang or subgroup constraint"
+      disconfirm:
+        - "The workload is not gang-scheduled or Kubernetes predicate, quota, node, or PVC evidence blocks it first."
       next_steps:
         - "Find the first unschedulable member and its exact predicate."
         - "Compare the group's aggregate request with contiguous capacity in the eligible node pool."
@@ -1257,6 +1375,9 @@ nodes:
     conclusion:
       family: runai_scheduling_quota
       summary: "Run:ai selected a node but binding or resource reservation failed."
+      confidence: "high only when Run:ai binding/reservation events identify the node and failed resource operation"
+      disconfirm:
+        - "No Run:ai binding attempt exists or Kubernetes scheduling, node readiness, or workload startup fails first."
       next_steps:
         - "Capture the selected node and exact binder rejection."
         - "Check binder plus node-local Run:ai toolkit state for fractional GPU workloads."
@@ -1281,6 +1402,9 @@ nodes:
     conclusion:
       family: runai_scheduling_quota
       summary: "Run:ai queue entitlement or limits prevent the workload from receiving requested resources."
+      confidence: "high only when Run:ai queue policy or entitlement identifies the denied resource request"
+      disconfirm:
+        - "Queue entitlement has capacity or Kubernetes placement, node health, or another policy is first."
       next_steps:
         - "Identify the exact project/department and node-pool limit."
         - "Separate entitlement from physical fragmentation and workload topology."
@@ -1321,6 +1445,9 @@ nodes:
     conclusion:
       family: platform_auth_error
       summary: "Kubernetes RBAC denies the required operation for the authenticated subject."
+      confidence: "high only when the API response names Forbidden and the same subject, resource, and verb"
+      disconfirm:
+        - "The request is authorized or authentication, admission, network, or API availability fails before RBAC."
       next_steps:
         - "Confirm the exact denied verb/resource/subresource and namespace."
         - "Trace RoleBinding/ClusterRoleBinding to the subject and correct only the missing permission."
@@ -1335,6 +1462,9 @@ nodes:
     conclusion:
       family: platform_auth_error
       summary: "Identity-provider configuration or credential validation prevents authentication."
+      confidence: "high only when token, OIDC, certificate, or identity-provider validation fails for the request"
+      disconfirm:
+        - "Credentials validate successfully and RBAC, admission, API availability, or workload behavior fails later."
       next_steps:
         - "Capture the validator's exact reason without exposing token contents."
         - "Compare issuer/audience/claims/time against the configured identity provider."
@@ -1382,6 +1512,9 @@ nodes:
     conclusion:
       family: observability_accuracy
       summary: "A metrics collection, transport, or storage hop stopped delivering fresh samples."
+      confidence: "high only when missing/stale series is traced to a failed scrape, transport, receiver, or storage hop"
+      disconfirm:
+        - "Raw source metrics are fresh and the alert is caused by query logic, labels, or threshold configuration."
       next_steps:
         - "Locate the first hop whose last-sample timestamp stops advancing."
         - "Check exporter health, scrape error, receiver/storage capacity, and recent config changes at that hop."
@@ -1407,6 +1540,9 @@ nodes:
     conclusion:
       family: observability_accuracy
       summary: "Derived dashboard or metric state disagrees with the live cluster/GPU state."
+      confidence: "high only when a direct live Kubernetes or GPU read contradicts the derived metric at the same time"
+      disconfirm:
+        - "The live state matches the derived unhealthy value or the mismatch is an expected scrape/window delay."
       next_steps:
         - "Document the raw/live truth and the mismatching derived value."
         - "Inspect label joins, query windows, exporter coverage, and stale-series handling."
@@ -1432,6 +1568,9 @@ nodes:
     conclusion:
       family: insufficient_evidence
       summary: "The available evidence does not identify a Kubernetes failure layer yet."
+      confidence: "low until an incident-era event, state transition, log, or change identifies the first failed control point"
+      disconfirm:
+        - "A scoped timestamped signal already identifies scheduler, storage, node, network, GPU, control-plane, or workload failure."
       next_steps:
         - "Preserve the oldest event and exact error text rather than restarting the workload."
         - "Collect pod phase/container states, node conditions, and a short change timeline."
@@ -1461,6 +1600,9 @@ nodes:
     conclusion:
       family: cluster_network_error
       summary: "Pod startup or reachability is blocked by cluster networking."
+      confidence: "high only when sandbox, CNI, DNS, or dataplane evidence predates container or application failure"
+      disconfirm:
+        - "Pod networking is healthy and storage, image, runtime, endpoint, node, or workload evidence occurs first."
       next_steps:
         - "Check the CNI daemonset on the target node and recent sandbox events."
         - "If DNS is implicated, check CoreDNS pods and resolve kubernetes.default from a pod."
