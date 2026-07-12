@@ -297,6 +297,11 @@ def _diagnostic_directive(
             :6
         ],
         "checks": [str(step["verify"])[:500] for step in steps if step.get("verify")][:6],
+        "interpretation": [
+            str(step["interpretation"])[:400]
+            for step in steps
+            if step.get("interpretation")
+        ][:4],
         "probes": [
             {**probe, "hypothesis_family": family}
             for step in steps

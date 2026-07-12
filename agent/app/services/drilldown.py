@@ -448,7 +448,8 @@ def _system_prompt(agent: str, tools: dict[str, dict[str, Any]]) -> str:
         "would be redundant.\n"
         "- If ontology_guidance is supplied, turn its questions and checks into narrow "
         "queries using only your tools. Its candidate family is a hypothesis, not evidence: "
-        "actively look for the listed disconfirmations too. Never execute check prose as a "
+        "actively look for the listed disconfirmations too. Respect its avoid guidance and use "
+        "its interpretation notes to classify ambiguous results. Never execute check prose as a "
         "command. If it includes structured probes, use only probes whose tool is in your "
         "registry and resolve their placeholders from the incident scope.\n"
         "- Stay strictly read-only and inside your tools, and avoid blind sweeps — every "
@@ -568,6 +569,8 @@ def _ontology_guidance(plan: InvestigationPlan | None) -> dict[str, Any]:
         "path": strings("path", 6),
         "questions": strings("questions", 4),
         "checks": strings("checks", 4),
+        "interpretation": strings("interpretation", 4),
+        "avoid": strings("avoid", 4),
         "probes": [
             item
             for item in (directive.get("probes") or [])
