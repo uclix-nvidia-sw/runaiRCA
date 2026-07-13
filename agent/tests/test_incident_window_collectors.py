@@ -366,6 +366,28 @@ def test_runai_query_observation_requires_identity_scoped_coverage() -> None:
     assert (broad_nonmatch["polarity"], broad_nonmatch["coverage"]) == ("unknown", "partial")
 
 
+def test_runai_current_resource_state_is_context_for_historical_incident() -> None:
+    target = replace(
+        make_target(),
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    present = runai._runai_query_observation(
+        {"name": "workloads", "status_code": 200, "data": {"workloads": [{"name": "trainer"}]}},
+        target=target,
+        used_mcp=True,
+    )
+    missing = runai._runai_query_observation(
+        {"name": "project", "status_code": 404, "error": "HTTP 404", "data": None},
+        target=target,
+        used_mcp=False,
+    )
+
+    assert (present["polarity"], present["coverage"]) == ("unknown", "partial")
+    assert (missing["polarity"], missing["coverage"]) == ("unknown", "partial")
+    assert present["observation_window"]["start"] == "2026-07-10T00:55:00Z"
+
+
 @pytest.mark.asyncio
 async def test_kubernetes_logs_use_incident_since_time_and_previous_restart_log(
     monkeypatch,

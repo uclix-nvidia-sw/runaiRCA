@@ -4,7 +4,14 @@ import re
 from typing import Any
 from urllib.parse import quote
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
+from app.collectors.base import (
+    NO_EVIDENCE,
+    AnalysisTarget,
+    CollectorResult,
+    artifact,
+    incident_time_range,
+    ko_en,
+)
 from app.collectors.http_json import compact, get_json, post_form_json, post_json
 from app.collectors.loki import _llm_insight
 from app.collectors.runai_mcp import gather_runai_via_mcp
@@ -516,6 +523,7 @@ def _runai_query_observation(
     so a missing name there remains unknown rather than becoming false evidence.
     """
     name = str(item.get("name") or "resource")
+    time_range = incident_time_range(target)
     expected = _runai_expected_identity(name, target)
     status_code = item.get("status_code")
     if item.get("error"):
@@ -542,6 +550,13 @@ def _runai_query_observation(
         polarity, coverage = "present", "scoped"
     else:
         polarity, coverage = "unknown", "partial"
+    # The Run:ai API exposes present resource state; unlike audit/event APIs it
+    # does not make this lookup historical merely because the alert has a past
+    # timestamp.  A current 404 or a currently-present workload is useful for
+    # recovery context, but cannot prove the resource's state during a closed
+    # incident window without a returned resource timestamp in that window.
+    if time_range and polarity in {"present", "absent"}:
+        polarity, coverage = "unknown", "partial"
     return {
         "kind": "runai_api_query",
         "predicate": f"runai:{name}",
@@ -549,6 +564,7 @@ def _runai_query_observation(
         "coverage": coverage,
         "expected_identity": expected,
         "status_code": status_code,
+        "observation_window": time_range or {},
     }
 
 
