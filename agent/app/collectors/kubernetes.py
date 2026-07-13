@@ -266,12 +266,24 @@ def kubectl_repr(kind: str, namespace: str = "", name: str = "", label_selector:
     return " ".join(parts)
 
 
+def pod_inspection_repr(namespace: str, pod: str) -> str:
+    """The full read-only Pod inspection shown to operators as familiar kubectl."""
+    ns = f" -n {shlex.quote(namespace)}" if namespace else ""
+    quoted_pod = shlex.quote(pod)
+    return (
+        f"kubectl get pod {quoted_pod}{ns} -o yaml; "
+        f"kubectl describe pod {quoted_pod}{ns}"
+    )
+
+
 async def k8s_read(
     settings: Settings,
     kind: str,
     namespace: str = "",
     name: str = "",
     label_selector: str = "",
+    *,
+    full_object: bool = False,
 ) -> dict:
     """One read-only GET/LIST of a Kubernetes kind — MCP-first, direct fallback.
 
@@ -296,7 +308,12 @@ async def k8s_read(
     if settings.kubernetes_mcp_url:
         try:
             return await _k8s_read_via_mcp(
-                settings, resolved, namespace=namespace, name=name, label_selector=label_selector
+                settings,
+                resolved,
+                namespace=namespace,
+                name=name,
+                label_selector=label_selector,
+                full_object=full_object,
             )
         except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
             # "not found" is an ANSWER (the resource is gone), not a transport
@@ -360,7 +377,11 @@ async def k8s_read(
         "url": response.url,
         "status_code": response.status_code,
         "error": response.error,
-        "data": compact(response.data, limit=8),
+        # A named Pod inspection is a diagnostic artifact, not a broad list.
+        # Keep its full spec/status so the operator can inspect exactly what a
+        # `kubectl get pod -o yaml` would expose. This remains one named,
+        # read-only object rather than broadening the collector's data scope.
+        "data": response.data if full_object else compact(response.data, limit=8),
     }
     if mcp_note:
         result["mcp_fallback"] = mcp_note
@@ -462,8 +483,8 @@ async def k8s_describe(
 ) -> dict:
     """A describe-style read: the named object's full spec/status PLUS its events.
 
-    Reuses k8s_read (MCP-first, direct fallback) for the object; events are pulled
-    with a fieldSelector so only THIS object's events come back. Read-only."""
+    Reuses k8s_read (MCP-first, direct fallback) for the object and filters the
+    named object's events. Read-only."""
     resolved = resolve_read_kind(kind)
     if not resolved:
         return {
@@ -473,7 +494,9 @@ async def k8s_describe(
         }
     if not name:
         return {"kind": resolved, "error": "name is required to describe a resource"}
-    obj = await k8s_read(settings, resolved, namespace=namespace, name=name)
+    obj = await k8s_read(
+        settings, resolved, namespace=namespace, name=name, full_object=True
+    )
     events = await _describe_events(
         settings, namespace=namespace, name=name, time_range=time_range
     )
@@ -496,10 +519,39 @@ async def _describe_events(
     name: str,
     time_range: dict[str, str] | None = None,
 ) -> list:
-    """Events for ONE object via fieldSelector=involvedObject.name — direct API only
-    (the MCP events tool has no field filter). Best-effort; [] on any failure."""
+    """Events for ONE object, preferring Kubernetes MCP with client-side filtering.
+
+    The MCP event-list tool does not expose an involvedObject field selector, so
+    fetch the namespace-scoped list through MCP and filter it locally. Direct API
+    is retained only as the fallback when MCP is unavailable.
+    """
     if not name:
         return []
+    if settings.kubernetes_mcp_url:
+        try:
+            data = await _k8s_mcp_json(
+                settings,
+                [
+                    ("events_list", {"namespace": namespace}),
+                    (
+                        "resources_list",
+                        {"apiVersion": "v1", "kind": "Event", "namespace": namespace},
+                    ),
+                ],
+            )
+            normalized = _normalize_k8s_payload(data)
+            raw_items = normalized.get("items") if isinstance(normalized, dict) else None
+            items = raw_items if isinstance(raw_items, list) else []
+            matching = [
+                item
+                for item in items
+                if isinstance(item, dict)
+                if str((item.get("involvedObject") or {}).get("name") or "") == name
+            ]
+            filtered = _events_in_time_range(matching, time_range)
+            return compact(filtered, limit=12) if filtered else []
+        except Exception:  # noqa: BLE001 - direct API fallback is the behavior.
+            pass
     token = _read_file(settings.kubernetes_token_path)
     if not token:
         return []
@@ -659,6 +711,7 @@ async def _k8s_read_via_mcp(
     namespace: str = "",
     name: str = "",
     label_selector: str = "",
+    full_object: bool = False,
 ) -> dict:
     """k8s_read over the Kubernetes MCP server; same result shape, raises to fall back."""
     api_kinds = _k8s_mcp_api_kinds(resolved)
@@ -728,7 +781,7 @@ async def _k8s_read_via_mcp(
         "url": f"{settings.kubernetes_mcp_url}#read_{resolved}",
         "status_code": 200,
         "error": None,
-        "data": compact(data, limit=8),
+        "data": data if full_object else compact(data, limit=8),
     }
 
 
@@ -954,6 +1007,24 @@ class KubernetesCollector:
                 verify=verify,
             )
 
+        # The initial sweep's `pods_get` is deliberately compact so broad RCA
+        # evidence stays readable. A named alert pod is different: preserve one
+        # full MCP-backed object + its filtered events, equivalent to `get -o
+        # yaml` and `describe`, so lifecycle/volume/security/resource details
+        # are available before the optional LLM loop decides whether to drill in.
+        target_pod_describe: dict[str, object] = {}
+        if target.namespace and target.pod and _namespace_allowed(self._settings, target.namespace):
+            target_pod_describe = await k8s_describe(
+                self._settings,
+                "pods",
+                namespace=target.namespace,
+                name=target.pod,
+                time_range=time_range,
+            )
+            described_object = target_pod_describe.get("object")
+            if isinstance(described_object, dict):
+                pod_summary_data = _pod_summary(described_object)
+
         # Controller-level alerts (Deployment/StatefulSet/DaemonSet/ReplicaSet/
         # Job/CronJob) commonly carry only the controller label. Resolve its pod
         # selector deterministically, choose the most unhealthy pod, then collect
@@ -993,6 +1064,13 @@ class KubernetesCollector:
         successful = [item for item in responses if not item.get("error")]
         pod_statuses = _pod_statuses(responses)
         warning_events = _warning_events(responses)
+        target_described_events = target_pod_describe.get("events")
+        if isinstance(target_described_events, list):
+            warning_events.extend(
+                event
+                for event in target_described_events
+                if isinstance(event, dict) and event.get("type") == "Warning"
+            )
         if pod_summary_data and workload_resolution.get("selected_pod"):
             pod_statuses.append(pod_summary_data)
         described_events = resolved_pod_describe.get("events")
@@ -1106,6 +1184,7 @@ class KubernetesCollector:
             "warning_events": warning_events,
             "node_conditions": node_conditions,
             "pod_logs": logs,
+            "target_pod_describe": target_pod_describe,
             "workload_resolution": workload_resolution,
             "resolved_pod_describe": resolved_pod_describe,
             "exec_probes": exec_probes,
@@ -1119,6 +1198,47 @@ class KubernetesCollector:
         if insight:
             summary = f"{summary} {insight}"
 
+        artifacts = [
+            artifact(
+                agent=self.name,
+                source="kubernetes",
+                type="cluster_api",
+                status=status,
+                confidence=confidence,
+                query="; ".join(item["path"] for item in responses),
+                summary=summary,
+                result=details,
+            )
+        ]
+        if target_pod_describe:
+            describe_error = target_pod_describe.get("error")
+            describe_events = target_pod_describe.get("events")
+            event_count = len(describe_events) if isinstance(describe_events, list) else 0
+            artifacts.append(
+                artifact(
+                    agent=self.name,
+                    source="kubernetes",
+                    type="pod_inspection",
+                    status="unavailable" if describe_error else "ok",
+                    confidence="high" if not describe_error else "low",
+                    title=ko_en(self._settings, "Pod YAML + 상세 점검", "Pod YAML + describe"),
+                    query=pod_inspection_repr(target.namespace, target.pod),
+                    summary=(
+                        str(describe_error)
+                        if describe_error
+                        else ko_en(
+                            self._settings,
+                            (
+                                "Pod 전체 YAML과 incident 시간창 이벤트 "
+                                f"{event_count}건을 확인했습니다."
+                            ),
+                            f"Collected full Pod YAML and {event_count} incident-window event(s).",
+                        )
+                    ),
+                    result=target_pod_describe,
+                )
+            )
+
         return CollectorResult(
             agent=self.name,
             status=status,
@@ -1127,18 +1247,7 @@ class KubernetesCollector:
             details=details,
             missing_data=missing,
             warnings=warnings,
-            artifacts=[
-                artifact(
-                    agent=self.name,
-                    source="kubernetes",
-                    type="cluster_api",
-                    status=status,
-                    confidence=confidence,
-                    query="; ".join(item["path"] for item in responses),
-                    summary=summary,
-                    result=details,
-                )
-            ],
+            artifacts=artifacts,
         )
 
 
@@ -2319,6 +2428,19 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
         name in {"pod_events", "namespace_events"} or name.startswith("runai_control_plane_events:")
     ) and isinstance(data.get("items"), list):
         items = _events_in_time_range(data["items"], incident_time_range(target))
+        # Kubernetes MCP's events_list does not reliably honor fieldSelector.
+        # The named-pod sweep must never promote another object's warning as
+        # evidence for this alert, so apply the selector locally as well.
+        if name == "pod_events" and target.pod:
+            items = [
+                item
+                for item in items
+                if isinstance(item, dict)
+                and (
+                    not isinstance(item.get("involvedObject"), dict)
+                    or str((item.get("involvedObject") or {}).get("name") or "") == target.pod
+                )
+            ]
         events = [
             _event_summary(item)
             for item in items

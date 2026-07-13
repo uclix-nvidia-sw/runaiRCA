@@ -106,6 +106,70 @@ def test_k8s_read_refuses_unlisted_kind_without_calling_api(monkeypatch) -> None
     assert "allowlist" in out["error"]
 
 
+def test_k8s_describe_uses_mcp_full_pod_and_filters_its_events(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class Result:
+        isError = False
+        content: list = []
+
+        def __init__(self, value: dict) -> None:
+            self.structuredContent = value
+
+    async def fake_mcp_call(_url, tool, _arguments):
+        calls.append(tool)
+        if tool == "pods_get":
+            return Result(
+                {
+                    "metadata": {"name": "worker-0", "namespace": "team-a"},
+                    "spec": {
+                        "containers": [
+                            {"name": "main", "env": [{"name": "MODE", "value": "train"}]}
+                        ]
+                    },
+                    "status": {"phase": "Failed"},
+                }
+            )
+        return Result(
+            {
+                "items": [
+                    {
+                        "type": "Warning",
+                        "reason": "OOMKilled",
+                        "involvedObject": {"name": "worker-0"},
+                        "lastTimestamp": "2026-07-10T01:00:00Z",
+                    },
+                    {
+                        "type": "Warning",
+                        "reason": "Unrelated",
+                        "involvedObject": {"name": "other-pod"},
+                        "lastTimestamp": "2026-07-10T01:00:00Z",
+                    },
+                ]
+            }
+        )
+
+    def direct_token_should_not_be_read(_path: str) -> str:
+        raise AssertionError("direct Kubernetes API fallback should not run")
+
+    monkeypatch.setattr(k8s, "mcp_call", fake_mcp_call)
+    monkeypatch.setattr(k8s, "_read_file", direct_token_should_not_be_read)
+    result = asyncio.run(
+        k8s.k8s_describe(
+            replace(make_settings(), kubernetes_mcp_url="http://kubernetes-mcp/mcp"),
+            "pods",
+            namespace="team-a",
+            name="worker-0",
+            time_range={"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:05:00Z"},
+        )
+    )
+
+    assert "pods_get" in calls
+    assert "events_list" in calls or "resources_list" in calls
+    assert result["object"]["spec"]["containers"][0]["env"][0]["value"] == "[MASKED]"
+    assert [event["reason"] for event in result["events"]] == ["OOMKilled"]
+
+
 class KubernetesCollector:  # name derives to "kubernetes" in the loop
     async def collect(self, target, plan=None) -> CollectorResult:
         return CollectorResult(
@@ -159,6 +223,56 @@ async def test_investigator_runs_queries_and_attaches_artifacts(monkeypatch) -> 
     assert ok.title  # human card title ("PVC 조회" / "persistentvolumeclaims lookup")
     refused = next(a for a in adhoc if a.status == "unavailable")
     assert "allowlist" in refused.summary
+
+
+@pytest.mark.asyncio
+async def test_investigator_promotes_named_pod_query_to_describe(monkeypatch) -> None:
+    decisions = iter(
+        [
+            {
+                "action": "probe",
+                "probes": [{"collector": "kubernetes"}],
+                "queries": [{"kind": "pods", "namespace": "team-a", "name": "worker-0"}],
+            },
+            {"action": "conclude"},
+        ]
+    )
+
+    async def fake_complete_json(*_a, **_k):
+        return next(decisions)
+
+    async def fake_describe(_settings, kind, namespace="", name="", **_kwargs):
+        assert (kind, namespace, name) == ("pods", "team-a", "worker-0")
+        return {
+            "kind": "pods",
+            "namespace": namespace,
+            "name": name,
+            "status_code": 200,
+            "error": None,
+            "object": {"metadata": {"name": name}, "status": {"phase": "Failed"}},
+            "events": [{"type": "Warning", "reason": "OOMKilled"}],
+        }
+
+    async def generic_read_must_not_run(*_a, **_k):
+        raise AssertionError("named pod must use describe rather than compact get")
+
+    monkeypatch.setattr(investigator, "complete_json", fake_complete_json)
+    monkeypatch.setattr(investigator, "k8s_describe", fake_describe)
+    monkeypatch.setattr(investigator, "k8s_read", generic_read_must_not_run)
+    settings = replace(
+        make_settings(), llm_base_url="http://x", llm_model="m", llm_api_key="k"
+    )
+    results, _context = await investigator.investigate(
+        settings, object(), [KubernetesCollector()], InvestigationPlan(), {}, max_steps=4
+    )
+
+    result = next(item for item in results if item.agent == "kubernetes")
+    artifact = next(item for item in result.artifacts if item.type == "adhoc_query")
+    assert artifact.title == "Pod YAML + describe"
+    assert artifact.query == (
+        "kubectl get pod worker-0 -n team-a -o yaml; "
+        "kubectl describe pod worker-0 -n team-a"
+    )
 
 
 def test_flowchart_followup_pending_pod_pulls_events_quota_pvc(monkeypatch) -> None:

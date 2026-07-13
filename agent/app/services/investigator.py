@@ -22,7 +22,15 @@ from dataclasses import replace
 from typing import Any
 
 from app.collectors.base import CollectorResult, artifact, salient_markers, signals_line
-from app.collectors.kubernetes import _READ_KINDS, k8s_read, kind_lookup_title, kubectl_repr
+from app.collectors.kubernetes import (
+    _READ_KINDS,
+    k8s_describe,
+    k8s_read,
+    kind_lookup_title,
+    kubectl_repr,
+    pod_inspection_repr,
+    resolve_read_kind,
+)
 from app.config import Settings
 from app.llm import complete_json
 from app.masking import build_masker
@@ -178,11 +186,36 @@ def _adhoc_query_repr(item: dict) -> str:
     """The ad-hoc read as the real kubectl command an operator would have typed
     ("kubectl get pods -n runai -l app=x") — operators asked for the actual
     query, not an internal 'ns=... name=...' param dump."""
+    if item.get("operation") == "describe":
+        return pod_inspection_repr(
+            str(item.get("namespace") or ""), str(item.get("name") or "")
+        )
     return kubectl_repr(
         str(item.get("kind") or ""),
         namespace=str(item.get("namespace") or ""),
         name=str(item.get("name") or ""),
         label_selector=str(item.get("label_selector") or ""),
+    )
+
+
+async def _run_adhoc_kubernetes_query(settings: Settings, query: dict) -> dict:
+    """Promote a named Pod read to full MCP-backed YAML + describe evidence."""
+    kind = str(query.get("kind") or "")
+    namespace = str(query.get("namespace") or "")
+    name = str(query.get("name") or "")
+    if resolve_read_kind(kind) == "pods" and name:
+        described = await k8s_describe(settings, "pods", namespace=namespace, name=name)
+        return {
+            **described,
+            "operation": "describe",
+            "data": {"object": described.get("object"), "events": described.get("events")},
+        }
+    return await k8s_read(
+        settings,
+        kind,
+        namespace=namespace,
+        name=name,
+        label_selector=str(query.get("label_selector") or ""),
     )
 
 
@@ -464,7 +497,9 @@ async def investigate(
                         "When diagnostic_directive.probes names a tool you can reach through a collector, "
                         "use it as a discriminator and honor its supports_when/refutes_when conditions. You can ALSO "
                         "run kubectl-style READ-ONLY Kubernetes queries (get/list of an "
-                        "allowlisted kind, see adhoc_query_kinds). Batch all independent "
+                        "allowlisted kind, see adhoc_query_kinds). When the alert names a pod, "
+                        "request that named pod before broad project/namespace reads: it is "
+                        "automatically promoted to full YAML + describe/events evidence. Batch all independent "
                         "discriminating queries for this step instead of spending another "
                         "reasoning round on each query. Conclude once evidence is sufficient. "
                         "Respond with ONLY JSON: "
@@ -590,13 +625,7 @@ async def investigate(
                 adhoc.append(
                     await _within_budget(
                         deadline_monotonic,
-                        lambda q=q: k8s_read(
-                            settings,
-                            str(q.get("kind")),
-                            namespace=str(q.get("namespace") or ""),
-                            name=str(q.get("name") or ""),
-                            label_selector=str(q.get("label_selector") or ""),
-                        ),
+                        lambda q=q: _run_adhoc_kubernetes_query(settings, q),
                     )
                 )
             ran_queries_last_step = bool(wanted)
@@ -707,13 +736,7 @@ async def investigate(
                     adhoc.append(
                         await _within_budget(
                             deadline_monotonic,
-                            lambda query=query: k8s_read(
-                                settings,
-                                str(query.get("kind")),
-                                namespace=str(query.get("namespace") or ""),
-                                name=str(query.get("name") or ""),
-                                label_selector=str(query.get("label_selector") or ""),
-                            ),
+                            lambda query=query: _run_adhoc_kubernetes_query(settings, query),
                         )
                     )
         if reporter:
@@ -791,7 +814,13 @@ async def investigate(
                     status="unavailable" if error else "ok",
                     confidence="medium",
                     query=_adhoc_query_repr(item),
-                    title=kind_lookup_title(str(item.get("kind") or ""), language),
+                    title=(
+                        "Pod YAML + 상세 점검"
+                        if language == "ko" and item.get("operation") == "describe"
+                        else "Pod YAML + describe"
+                        if item.get("operation") == "describe"
+                        else kind_lookup_title(str(item.get("kind") or ""), language)
+                    ),
                     highlights=markers or None,
                     summary=summary,
                     result=item,
@@ -878,6 +907,10 @@ def _build_user_prompt(
         },
         "available_collectors": {name: _COLLECTOR_HINTS.get(name, "") for name in by_name},
         "adhoc_query_kinds": sorted(_READ_KINDS),
+        "named_pod_query_behavior": (
+            "A query for kind=pods with a specific name is executed as Kubernetes MCP-backed "
+            "Pod YAML + describe/events, not a compact get. Use it before unrelated broad reads."
+        ),
     }
     variable = {
         "hypothesis_ledger": _ledger_summary(ledger),
