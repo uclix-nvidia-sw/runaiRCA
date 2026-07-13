@@ -51,6 +51,73 @@ def test_merges_and_orders_across_collectors() -> None:
     assert timeline[1]["timestamp"].startswith("2026-07-02T10:01:00")  # loki ns -> iso
 
 
+def test_merges_prometheus_postgres_and_flat_loki_mcp_entries() -> None:
+    results = [
+        CollectorResult(
+            agent="prometheus",
+            status="ok",
+            summary="",
+            details={
+                "queries": [
+                    {
+                        "name": "memory_pressure",
+                        "sample": [
+                            {
+                                "metric": {"node": "gpu-01", "condition": "MemoryPressure"},
+                                "values": [["1782986400", "0"], ["1782986520", "1"]],
+                            }
+                        ],
+                    }
+                ]
+            },
+        ),
+        CollectorResult(
+            agent="postgres",
+            status="ok",
+            summary="",
+            details={
+                "incident_history": {
+                    "tables": [
+                        {
+                            "schema": "audit",
+                            "table": "workload_history",
+                            "rows": [
+                                {"event_time": "2026-07-02T10:01:30Z", "action": "suspended"}
+                            ],
+                        }
+                    ]
+                }
+            },
+        ),
+        CollectorResult(
+            agent="loki",
+            status="ok",
+            summary="",
+            details={
+                "queries": [
+                    {
+                        "name": "scheduler_errors",
+                        "sample_entries": [
+                            {"timestamp": "2026-07-02T10:01:00Z", "line": "preemption denied"}
+                        ],
+                    }
+                ]
+            },
+        ),
+    ]
+
+    timeline = build_timeline(results)
+
+    assert [(entry["source"], entry["kind"]) for entry in timeline] == [
+        ("prometheus", "memory_pressure"),
+        ("loki", "scheduler_errors"),
+        ("postgres", "audit.audit.workload_history"),
+        ("prometheus", "memory_pressure"),
+    ]
+    assert timeline[0]["message"] == "memory_pressure {node=gpu-01, condition=MemoryPressure} = 0"
+    assert timeline[2]["message"] == "action=suspended"
+
+
 def test_unparseable_timestamps_sort_last_not_dropped() -> None:
     results = [
         CollectorResult(

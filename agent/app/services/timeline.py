@@ -1,8 +1,9 @@
 """Merge timestamped signals across collectors into one time-ordered list.
 
 Lets the synthesis narrate "T0 …, T0+2m …": we pull the events that carry a
-timestamp out of each collector's details (kubernetes warning events, loki log
-lines, system node log lines, change-detection events) and sort them by time.
+timestamp out of each collector's details (kubernetes warning events, Loki log
+lines, Prometheus samples, Postgres audit rows, system node log lines, and
+change-detection events) and sort them by time.
 
 Defensive by design — collectors vary in shape and timestamp format, and the
 no-LLM test suite feeds sample CollectorResults, so every accessor tolerates
@@ -72,6 +73,10 @@ def _from_result(result: CollectorResult) -> list[dict]:
         return _from_kubernetes(details)
     if agent == "loki":
         return _from_loki(details)
+    if agent == "prometheus":
+        return _from_prometheus(details)
+    if agent == "postgres":
+        return _from_postgres(details)
     if agent == "system":
         return _from_system(details)
     return []
@@ -116,6 +121,23 @@ def _from_loki(details: dict) -> list[dict]:
     for query in _list(details.get("queries")):
         query = _dict(query)
         name = query.get("name") or "loki"
+        # Native Loki responses retain streams/values. grafana-mcp instead
+        # commonly returns a flat [{timestamp, line, labels}] list; keep both
+        # contracts on the causal timeline instead of treating successful MCP
+        # log collection as timestamp-less context.
+        for entry in _list(query.get("sample_entries")):
+            entry = _dict(entry)
+            line = _str(entry.get("line") or entry.get("message"))
+            if not line:
+                continue
+            out.append(
+                {
+                    "timestamp": _timestamp_to_iso(entry.get("timestamp")),
+                    "source": "loki",
+                    "kind": str(name),
+                    "message": line[:300],
+                }
+            )
         for stream in _list(query.get("sample")):
             for pair in _list(_dict(stream).get("values")):
                 if not isinstance(pair, list) or len(pair) < 2:
@@ -128,6 +150,63 @@ def _from_loki(details: dict) -> list[dict]:
                         "message": _str(pair[1])[:300],
                     }
                 )
+    return out
+
+
+def _from_prometheus(details: dict) -> list[dict]:
+    """Project bounded metric samples into causal evidence.
+
+    Prometheus range results are already compacted by the collector. Keeping
+    returned samples makes an explicit zero/false visible beside events and
+    logs, rather than leaving synthesis to infer it from extrema alone.
+    """
+    out = []
+    for query in _list(details.get("queries")):
+        query = _dict(query)
+        name = str(query.get("name") or "prometheus")
+        for series in _list(query.get("sample")):
+            series = _dict(series)
+            labels = _prometheus_labels(series.get("metric"))
+            suffix = f" {{{labels}}}" if labels else ""
+            for timestamp, value in _prometheus_pairs(series):
+                out.append(
+                    {
+                        "timestamp": _timestamp_to_iso(timestamp),
+                        "source": "prometheus",
+                        "kind": name,
+                        "message": f"{name}{suffix} = {value}",
+                    }
+                )
+    return out
+
+
+def _from_postgres(details: dict) -> list[dict]:
+    """Add incident-window audit rows without exposing SQL or arbitrary schema."""
+    out = []
+    history = _dict(details.get("incident_history"))
+    for table in _list(history.get("tables")):
+        table = _dict(table)
+        schema = _str(table.get("schema"))
+        name = _str(table.get("table"))
+        kind = f"audit.{schema + '.' if schema else ''}{name or 'history'}"
+        for row in _list(table.get("rows")):
+            row = _dict(row)
+            timestamp = row.get("event_time")
+            if not timestamp:
+                continue
+            fields = [
+                f"{key}={_str(value)}"
+                for key, value in sorted(row.items())
+                if key != "event_time" and value not in (None, "")
+            ]
+            out.append(
+                {
+                    "timestamp": _timestamp_to_iso(timestamp),
+                    "source": "postgres",
+                    "kind": kind,
+                    "message": "; ".join(fields)[:300] or "audit history record",
+                }
+            )
     return out
 
 
@@ -156,6 +235,39 @@ def _loki_ns_to_iso(value: object) -> str:
         return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
     except (ValueError, TypeError, OSError, OverflowError):
         return _str(value)
+
+
+def _timestamp_to_iso(value: object) -> str:
+    """Normalize Prometheus seconds and Loki nanoseconds while retaining RFC3339."""
+    text = _str(value)
+    try:
+        numeric = float(text)
+    except (TypeError, ValueError):
+        return text
+    # Loki uses nanoseconds, while Prometheus range samples use seconds.
+    seconds = numeric / 1e9 if abs(numeric) >= 1e12 else numeric
+    try:
+        return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
+    except (ValueError, OSError, OverflowError):
+        return text
+
+
+def _prometheus_pairs(series: dict) -> list[tuple[object, object]]:
+    values = series.get("values")
+    if not isinstance(values, list):
+        value = series.get("value")
+        values = [value] if isinstance(value, list) else []
+    return [
+        (pair[0], pair[1])
+        for pair in values
+        if isinstance(pair, list) and len(pair) >= 2
+    ]
+
+
+def _prometheus_labels(raw: object) -> str:
+    labels = _dict(raw)
+    allowed = ("namespace", "pod", "container", "node", "condition", "phase", "project", "queue")
+    return ", ".join(f"{key}={_str(labels[key])}" for key in allowed if labels.get(key))
 
 
 def _timestamp_from_line(line: str) -> str:
