@@ -535,6 +535,15 @@ class ChangeCollector:
         details: dict | None = None,
         observation: dict | None = None,
     ) -> CollectorResult:
+        # Even an unconfigured collector must publish a typed verdict. Without
+        # it this otherwise-structured collector falls back to legacy summary
+        # parsing in downstream consumers.
+        observation = observation or {
+            "kind": "change_detection",
+            "predicate": "change_detection",
+            "polarity": "unavailable" if missing else "unknown",
+            "coverage": "unknown" if missing else "partial",
+        }
         return CollectorResult(
             agent=self.name,
             status="unavailable" if missing else "partial",
@@ -553,7 +562,7 @@ class ChangeCollector:
                     summary=summary,
                     result={
                         **(details or {}),
-                        **({"observation": observation} if observation else {}),
+                        "observation": observation,
                     },
                 )
             ],

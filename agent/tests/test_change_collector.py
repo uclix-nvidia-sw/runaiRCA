@@ -45,6 +45,7 @@ async def test_no_token_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.status == "unavailable"
     assert result.missing_data == ["change.unconfigured"]
     assert result.summary.startswith("증거를 찾기 어렵습니다.")
+    assert result.artifacts[0].result["observation"]["polarity"] == "unavailable"
 
 
 @pytest.mark.asyncio
