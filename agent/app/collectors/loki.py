@@ -71,6 +71,12 @@ class LokiCollector:
                 f'{selector} |~ "(?i)(error|fail|oom|evict|crash|pending|unschedul|back-off)"'
             )
             queries = [("error_logs", error_query), ("recent_logs", selector)]
+            # Pod names are ephemeral. A restarted/replaced Pod can no longer
+            # match the alert's exact {pod="…"} stream label even though Loki
+            # still retains its incident-window lines. Add a narrowly scoped
+            # namespace/body correlation using stable workload identity.
+            if history_query := _workload_history_query(target, plan):
+                queries.append(("workload_history_logs", history_query))
         # Control-plane sweep only when the plan says this alert implicates Run:ai —
         # otherwise every alert scraped runai/runai-backend and skewed ranking.
         control_plane_in_scope = plan.check_control_plane if plan is not None else True
@@ -593,6 +599,39 @@ def _selector_for(target: AnalysisTarget, plan=None) -> str:
     elif workload:
         selector_parts.append(f'app=~".*{workload}.*"')
     return "{" + ",".join(selector_parts) + "}" if selector_parts else "{}"
+
+
+def _workload_history_query(target: AnalysisTarget, plan=None) -> str:
+    """Find retained logs for replaced Pods through a stable workload identifier.
+
+    Kubernetes Pod UID/name labels are intentionally not assumed: Loki label
+    sets differ by deployment. Namespace plus an escaped workload name or
+    Run:AI workload ID is portable and remains bounded to this incident.
+    """
+    namespace = target.namespace
+    workload = target.workload_name
+    if plan is not None:
+        if plan.namespaces:
+            namespace = plan.namespaces[0]
+        workload = plan.workload or workload
+    if not namespace:
+        return ""
+    terms = _workload_history_terms(workload, target.runai_workload_id)
+    if not terms:
+        return ""
+    return f'{{namespace="{namespace}"}} |~ "(?i)({"|".join(terms)})"'
+
+
+def _workload_history_terms(*values: str) -> list[str]:
+    terms: list[str] = []
+    for value in values:
+        normalized = str(value or "").strip()
+        if len(normalized) < 3:
+            continue
+        escaped = re.escape(normalized).replace('"', r'\"')
+        if escaped not in terms:
+            terms.append(escaped)
+    return terms
 
 
 def _control_plane_correlation_term(target: AnalysisTarget, plan=None) -> str:

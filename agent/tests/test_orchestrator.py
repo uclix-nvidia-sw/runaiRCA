@@ -1118,6 +1118,42 @@ async def test_loki_correlates_control_plane_logs_to_dying_workload(monkeypatch)
     assert any("reconcile" in q for q in seen_queries), joined
 
 
+@pytest.mark.asyncio
+async def test_loki_queries_workload_history_when_alerted_pod_can_be_replaced(monkeypatch) -> None:
+    # Exact Pod labels are useful, but Pod names change after an eviction or
+    # rollout. The namespace/body query preserves historical Loki evidence via
+    # stable workload identifiers.
+    from types import SimpleNamespace
+
+    seen_queries: list[str] = []
+
+    async def fake_get_json(**kwargs) -> SimpleNamespace:
+        seen_queries.append(kwargs["params"]["query"])
+        return SimpleNamespace(
+            url="http://loki/x",
+            status_code=200,
+            error=None,
+            data={"status": "success", "data": {"result": []}},
+        )
+
+    monkeypatch.setattr("app.collectors.loki.get_json", fake_get_json)
+    target = replace(
+        make_target(),
+        namespace="runai-vision",
+        pod="trainer-old-abc",
+        workload_name="trainer",
+        runai_workload_id="workload-42",
+    )
+    await LokiCollector(replace(make_settings(), loki_url="http://loki.example")).collect(target)
+
+    assert any(
+        'namespace="runai-vision"' in query
+        and "trainer" in query
+        and r"workload\-42" in query
+        for query in seen_queries
+    )
+
+
 def test_correlation_term_skips_too_short_identifiers() -> None:
     from app.collectors.base import AnalysisTarget
     from app.collectors.loki import _control_plane_correlation_term
