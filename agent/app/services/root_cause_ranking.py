@@ -471,8 +471,14 @@ def rank_root_cause_candidates(
                 c.trigger = trigger
     ranked.sort(key=lambda c: c.score, reverse=True)
 
-    # R6 evidence gate: no family clears the floor / has no corroboration.
-    if not ranked or ranked[0].score < _FLOOR or not ranked[0].evidence_agents:
+    # R6 evidence gate: topology/KG identity can focus investigation but cannot
+    # establish a root cause by itself. A final family needs at least one real
+    # collector observer; synthetic agents remain visible on the candidate for
+    # follow-up planning without allowing it to bypass insufficient-evidence.
+    top_has_live_observer = bool(
+        ranked and (set(ranked[0].evidence_agents) - _SYNTHETIC_AGENTS)
+    )
+    if not ranked or ranked[0].score < _FLOOR or not top_has_live_observer:
         gate = _insufficient(results, status_by_agent)
         return [gate, *ranked][:top_n]
     return ranked[:top_n]

@@ -686,8 +686,9 @@ def test_component_identity_leads_over_incidental_node_pressure() -> None:
             "gpu-operator",
         ],
     )
-    assert ranked[0].family == "gpu_hardware_error"
-    assert any("depends_on" in r for r in ranked[0].rationale)
+    assert ranked[0].family == "insufficient_evidence"
+    component_candidate = next(c for c in ranked if c.family == "gpu_hardware_error")
+    assert any("depends_on" in rationale for rationale in component_candidate.rationale)
 
 
 def test_component_identity_disables_node_force_high_from_blast() -> None:
@@ -708,7 +709,8 @@ def test_component_identity_disables_node_force_high_from_blast() -> None:
     )
     by_family = {c.family: c for c in ranked}
     # node pressure may still appear, but never as a forced-HIGH top cause here.
-    assert ranked[0].family == "gpu_hardware_error"
+    assert ranked[0].family == "insufficient_evidence"
+    assert "gpu_hardware_error" in by_family
     if "node_kubelet_pressure" in by_family:
         assert by_family["node_kubelet_pressure"].confidence != "high"
 
@@ -744,6 +746,20 @@ def test_component_identity_single_weak_hit_not_high_confidence() -> None:
     top = ranked[0]
     assert top.family == "gpu_hardware_error"
     assert top.confidence != "high"
+
+
+def test_component_identity_cannot_bypass_evidence_gate_on_its_own() -> None:
+    ranked = rank_root_cause_candidates(
+        _target(alert_name="KubeDaemonSetRolloutStuck", pod="runai-container-toolkit-vttmr"),
+        [_r("loki", summary="all logs nominal")],
+        component_family="gpu_hardware_error",
+        component="runai-container-toolkit",
+        depends_on_chain=["runai-container-toolkit", "gpu-operator"],
+    )
+
+    assert ranked[0].family == "insufficient_evidence"
+    candidate = next(c for c in ranked if c.family == "gpu_hardware_error")
+    assert candidate.evidence_agents == ["topology"]
 
 
 def test_ontology_bonus_cannot_create_candidate_without_live_collector_signal() -> None:
