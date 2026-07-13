@@ -151,6 +151,31 @@ class PrometheusCollector:
             "time_range": time_range,
             "queries": query_results,
         }
+        # Keep the collector-level artifact as operational context only. Exact
+        # query artifacts below carry the predicate and polarity used by RCA.
+        collector_observation = {
+            "kind": "prometheus_collector_summary",
+            "predicate": "prometheus_collector_summary",
+            "polarity": "unknown",
+            "coverage": "partial",
+            "observation_window": time_range or {},
+        }
+        artifacts = [
+            artifact(
+                agent=self.name,
+                source="prometheus",
+                type="promql",
+                status=status,
+                confidence=confidence,
+                query="; ".join(item["query"] for item in query_results),
+                summary=summary,
+                result={**result, "observation": collector_observation},
+            )
+        ]
+        artifacts.extend(
+            _prometheus_query_artifact(self.name, item, time_range=time_range)
+            for item in query_results
+        )
         return CollectorResult(
             agent=self.name,
             status=status,
@@ -165,18 +190,7 @@ class PrometheusCollector:
                 else ["prometheus.query"]
             ),
             warnings=warnings,
-            artifacts=[
-                artifact(
-                    agent=self.name,
-                    source="prometheus",
-                    type="promql",
-                    status=status,
-                    confidence=confidence,
-                    query="; ".join(item["query"] for item in query_results),
-                    summary=summary,
-                    result=result,
-                )
-            ],
+            artifacts=artifacts,
         )
 
 
@@ -418,7 +432,17 @@ def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
         labels = {
             str(key): str(metric[key])
             for key in sorted(metric)
-            if key in {"namespace", "pod", "container", "node", "phase", "condition", "project", "queue"}
+            if key
+            in {
+                "namespace",
+                "pod",
+                "container",
+                "node",
+                "phase",
+                "condition",
+                "project",
+                "queue",
+            }
         }
         summary: dict[str, object] = {
             "labels": labels,
@@ -453,6 +477,74 @@ def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
             }
         )
     return aggregate
+
+
+def _prometheus_query_artifact(
+    agent: str, item: dict[str, object], *, time_range: dict[str, str] | None
+):
+    """Expose one query's verified truth value as an RCA-safe evidence card."""
+    observation = _prometheus_query_observation(item, time_range=time_range)
+    name = str(item.get("name") or "metric")
+    polarity = str(observation["polarity"])
+    status = "unavailable" if polarity == "unavailable" else "ok"
+    confidence = "high" if polarity in {"present", "absent"} else "low"
+    if polarity == "present":
+        summary = f"Prometheus {name}: incident-window signal was present."
+    elif polarity == "absent":
+        summary = f"{NO_EVIDENCE} Prometheus {name}: signal was absent in the incident window."
+    else:
+        summary = f"Prometheus {name}: query result was unavailable or inconclusive."
+    return artifact(
+        agent=agent,
+        source="prometheus",
+        type="promql_signal",
+        status=status,
+        confidence=confidence,
+        title=f"Prometheus · {name}",
+        query=str(item.get("query") or ""),
+        summary=summary,
+        result={
+            "observation": observation,
+            "value_summary": item.get("value_summary") or {},
+            "sample": item.get("sample") or [],
+            "time_range": time_range,
+        },
+    )
+
+
+def _prometheus_query_observation(
+    item: dict[str, object], *, time_range: dict[str, str] | None
+) -> dict[str, object]:
+    """Classify output without treating a non-empty all-zero vector as a failure."""
+    name = str(item.get("name") or "metric")
+    if item.get("error"):
+        polarity, coverage = "unavailable", "unknown"
+    else:
+        series_count = int(item.get("series_count") or 0)
+        value_summary = item.get("value_summary")
+        summary = value_summary if isinstance(value_summary, dict) else {}
+        numeric_count = int(summary.get("numeric_sample_count") or 0)
+        all_zero = summary.get("all_zero")
+        if series_count == 0:
+            polarity, coverage = "absent", "scoped"
+        elif numeric_count == 0:
+            polarity, coverage = "unknown", "partial"
+        elif name == "prometheus_up":
+            # The up metric is inverted: 0 is the observed scrape failure.
+            polarity = "present" if bool(all_zero) else "absent"
+            coverage = "scoped"
+        elif all_zero is True:
+            polarity, coverage = "absent", "scoped"
+        else:
+            polarity, coverage = "present", "scoped"
+    return {
+        "kind": "prometheus_query",
+        "predicate": f"metric:{name}",
+        "polarity": polarity,
+        "coverage": coverage,
+        "series_count": int(item.get("series_count") or 0),
+        "observation_window": time_range or {},
+    }
 
 
 def _prometheus_samples(item: dict[str, object]) -> list[tuple[str, float | None]]:

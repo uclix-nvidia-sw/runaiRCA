@@ -64,13 +64,38 @@ async def test_prometheus_records_zero_and_peak_values_for_evidence(monkeypatch)
         replace(make_settings(), prometheus_url="http://prometheus")
     ).collect(make_target())
 
-    restarts = next(item for item in result.details["queries"] if item["name"] == "container_restarts")
+    restarts = next(
+        item for item in result.details["queries"] if item["name"] == "container_restarts"
+    )
     summary = restarts["value_summary"]
     assert summary["min"] == 0.0
     assert summary["max"] == 2.5
     assert summary["all_zero"] is False
     assert summary["series"][0]["last"] == 0.0
     assert summary["series"][0]["nonzero_sample_count"] == 1
+
+
+def test_prometheus_query_observation_keeps_zero_as_refuting_evidence() -> None:
+    absent = prometheus._prometheus_query_observation(
+        {
+            "name": "node_memory_pressure",
+            "series_count": 1,
+            "value_summary": {"numeric_sample_count": 3, "all_zero": True},
+        },
+        time_range={"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"},
+    )
+    present = prometheus._prometheus_query_observation(
+        {
+            "name": "node_memory_pressure",
+            "series_count": 1,
+            "value_summary": {"numeric_sample_count": 3, "all_zero": False},
+        },
+        time_range={"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"},
+    )
+
+    assert absent["polarity"] == "absent"
+    assert absent["coverage"] == "scoped"
+    assert present["polarity"] == "present"
 
 
 @pytest.mark.asyncio
