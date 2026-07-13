@@ -27,6 +27,18 @@ def drill_settings(**overrides):
     )
 
 
+def test_kubernetes_read_rejects_non_resource_kind_before_execution() -> None:
+    assert not drilldown._valid_domain_query(
+        {"tool": "k8s_read", "args": {"kind": "promql"}}
+    )
+    assert not drilldown._valid_domain_query(
+        {"tool": "k8s_read", "args": {"kind": "deployment_history"}}
+    )
+    assert drilldown._valid_domain_query(
+        {"tool": "k8s_read", "args": {"kind": "deployments"}}
+    )
+
+
 def _target() -> AnalysisTarget:
     return AnalysisTarget(
         cluster="",

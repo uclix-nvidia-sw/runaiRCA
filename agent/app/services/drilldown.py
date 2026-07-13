@@ -54,6 +54,7 @@ from app.collectors.kubernetes import (
     k8s_read,
     kind_lookup_title,
     kubectl_repr,
+    resolve_read_kind,
 )
 from app.collectors.loki import _loki_headers, _loki_streams, _sample_lines, loki_mcp_query
 from app.collectors.prometheus import prom_mcp_query, prom_query
@@ -208,6 +209,12 @@ async def _drill_one(
             for q in decision.get("queries") or []:
                 if not isinstance(q, dict) or str(q.get("tool") or "") not in tools:
                     continue
+                if not _valid_domain_query(q):
+                    # Do not turn a PromQL/LogQL name hallucinated as a
+                    # Kubernetes kind into an unavailable evidence card. The
+                    # tool descriptions already name the valid kinds; keeping
+                    # this out of the history also prevents repeated noise.
+                    continue
                 key = _query_fingerprint(q)
                 if key in seen_queries:
                     continue
@@ -263,7 +270,7 @@ async def _run_query(
 ) -> None:
     """Execute one registry-validated query and preserve its observation."""
     name = str(query.get("tool") or "")
-    if name not in tools:
+    if name not in tools or not _valid_domain_query(query):
         return
     args = query.get("args") if isinstance(query.get("args"), dict) else {}
     outcome = await _call_tool_safely(tools[name]["call"], settings, target, args)
@@ -438,6 +445,14 @@ def _query_fingerprint(query: dict[str, Any]) -> str:
         sort_keys=True,
         default=str,
     )
+
+
+def _valid_domain_query(query: dict[str, Any]) -> bool:
+    """Reject malformed per-domain arguments before invoking a transport."""
+    if str(query.get("tool") or "") != "k8s_read":
+        return True
+    args = query.get("args")
+    return isinstance(args, dict) and resolve_read_kind(str(args.get("kind") or "")) is not None
 
 
 def _resolve_probe_template(value: Any, values: dict[str, str]) -> Any | None:
