@@ -2069,30 +2069,7 @@ async def _synthesize_korean(
         "similar_incidents": similar_incidents,
         # Bulky — kept LAST so the char cap trims raw collector result tails
         # rather than the reasoning inputs above.
-        "collector_findings": [
-            {
-                "agent": r.agent,
-                "status": r.status,
-                "confidence": r.confidence,
-                "summary": r.summary if _collector_is_evidence(r) else NO_EVIDENCE,
-                "artifacts": [
-                    {
-                        "type": art.type,
-                        "title": art.title,
-                        "status": art.status,
-                        "query": art.query,
-                        "summary": art.summary,
-                        "highlights": art.highlights,
-                        "condition_checks": condition_observations(art.result),
-                        "result": _compact_synthesis_value(
-                            art.result, limit=_SYNTHESIS_ARTIFACT_RESULT_CHARS
-                        ),
-                    }
-                    for art in [a for a in r.artifacts if _artifact_is_evidence(a)][-3:]
-                ],
-            }
-            for r in results
-        ],
+        "collector_findings": _synthesis_collector_findings(results),
     }
     system = (
         "당신은 NVIDIA Run:ai GPU 플랫폼을 담당하는 시니어 SRE입니다. 제공된 증거(수집기별 "
@@ -2105,10 +2082,14 @@ async def _synthesize_korean(
         "- 반드시 한국어로, 비전문가도 이해할 수 있게 작성합니다 (전문용어는 풀어서).\n"
         "- 길게 쓰지 마세요. 아래 1~3 섹션 합쳐서 A4 한 페이지 이내가 목표입니다.\n"
         "- 증거에 없는 사실을 절대 만들어내지 마세요.\n"
+        "- collector_findings의 supporting_artifacts만 원인을 지지하는 직접 근거입니다. "
+        "contradicting_artifacts는 결론을 반박하는 직접 근거이고, context_artifacts 및 "
+        "collection_summary는 운영 맥락일 뿐 원인·반증 근거가 아닙니다.\n"
         "- MemoryPressure/DiskPressure/PIDPressure/NetworkUnavailable 같은 condition 이름은 "
-        "존재 자체가 장애 증거가 아닙니다. collector_findings.artifacts.condition_checks의 "
-        "active=true만 지지 증거이며, active=false는 명시적 반대 증거입니다. 원문 result의 "
-        "키워드만 보고 상태를 추정하지 마세요.\n"
+        "존재 자체가 장애 증거가 아닙니다. artifact의 evidence_role=support 안의 "
+        "condition_checks.active=true만 지지 증거이며, evidence_role=contradict 안의 "
+        "active=false만 명시적 반대 증거입니다. 원문 result의 키워드만 보고 상태를 "
+        "추정하지 마세요.\n"
         "- reasoning_trace_v2의 evidence_id는 현재 인시던트 관측입니다. 원인·반증 주장을 "
         "쓸 때 해당 ID를 [E01] 형식으로 인용하고, historical prior는 현재 증거로 쓰지 마세요.\n"
         "- historical_case_cards는 승인된 과거 사례의 prior이며 현재 evidence가 아닙니다. "
@@ -2224,6 +2205,76 @@ def _synthesis_evidence_json(evidence: dict, max_chars: int) -> str:
         evidence = {**evidence, "collector_findings": findings}
         text = json.dumps(evidence, ensure_ascii=False, default=str)
     return text
+
+
+def _synthesis_collector_findings(results: list[CollectorResult]) -> list[dict[str, object]]:
+    """Project artifacts into evidence roles before giving them to synthesis.
+
+    This is intentionally stricter than a transport-success check. The LLM may
+    see useful context, but it receives a machine-readable boundary that only
+    a scoped observation can support or contradict the RCA.
+    """
+    findings: list[dict[str, object]] = []
+    for result in results:
+        grouped: dict[str, list[dict[str, object]]] = {
+            "supporting_artifacts": [],
+            "contradicting_artifacts": [],
+            "context_artifacts": [],
+        }
+        for artifact in (artifact for artifact in result.artifacts if _artifact_is_evidence(artifact)):
+            payload = _synthesis_artifact_payload(artifact)
+            role = str(payload["evidence_role"])
+            key = {
+                "support": "supporting_artifacts",
+                "contradict": "contradicting_artifacts",
+            }.get(role, "context_artifacts")
+            grouped[key].append(payload)
+        findings.append(
+            {
+                "agent": result.agent,
+                "status": result.status,
+                "confidence": result.confidence,
+                # A collector headline is operational context, never a direct
+                # observation. Retain it without inviting the model to cite it.
+                "collection_summary": (
+                    result.summary if _collector_is_evidence(result) else NO_EVIDENCE
+                ),
+                **{key: artifacts[-3:] for key, artifacts in grouped.items()},
+            }
+        )
+    return findings
+
+
+def _synthesis_artifact_payload(artifact: object) -> dict[str, object]:
+    result = getattr(artifact, "result", None)
+    observation = result.get("observation") if isinstance(result, dict) else None
+    polarity = "unknown"
+    coverage = "partial"
+    if isinstance(observation, dict):
+        candidate_polarity = str(observation.get("polarity") or "").strip().lower()
+        candidate_coverage = str(observation.get("coverage") or "").strip().lower()
+        if candidate_polarity in {"present", "absent", "unknown", "unavailable"}:
+            polarity = candidate_polarity
+        if candidate_coverage in {"scoped", "partial", "unknown"}:
+            coverage = candidate_coverage
+    if polarity == "present" and coverage == "scoped":
+        role = "support"
+    elif polarity == "absent" and coverage == "scoped":
+        role = "contradict"
+    else:
+        role = "context"
+    return {
+        "type": str(getattr(artifact, "type", "")),
+        "title": str(getattr(artifact, "title", "")),
+        "status": str(getattr(artifact, "status", "")),
+        "query": str(getattr(artifact, "query", "")),
+        "summary": str(getattr(artifact, "summary", "")),
+        "highlights": list(getattr(artifact, "highlights", []) or []),
+        "evidence_role": role,
+        "observation": {"polarity": polarity, "coverage": coverage},
+        "condition_checks": condition_observations(result),
+        "result": _compact_synthesis_value(result, limit=_SYNTHESIS_ARTIFACT_RESULT_CHARS),
+    }
 
 
 def _compact_synthesis_value(value: object, *, limit: int) -> str:

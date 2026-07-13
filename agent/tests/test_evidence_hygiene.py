@@ -267,6 +267,36 @@ def test_context_only_artifact_stays_out_of_root_cause_evidence() -> None:
     assert "container memory was observed" in evidence
 
 
+def test_synthesis_input_separates_support_contradiction_and_context() -> None:
+    result = CollectorResult(agent="prometheus", status="ok", summary="all metrics queried")
+    for name, polarity, coverage in (
+        ("capacity gap", "present", "scoped"),
+        ("restart unchanged", "absent", "scoped"),
+        ("memory snapshot", "unknown", "partial"),
+    ):
+        result.artifacts.append(
+            artifact(
+                agent="prometheus",
+                source="prometheus",
+                type="promql_signal",
+                status="ok",
+                confidence="medium",
+                summary=name,
+                result={"observation": {"polarity": polarity, "coverage": coverage}},
+            )
+        )
+
+    finding = pipeline._synthesis_collector_findings([result])[0]
+
+    assert finding["collection_summary"] == "all metrics queried"
+    assert [item["summary"] for item in finding["supporting_artifacts"]] == ["capacity gap"]
+    assert [item["summary"] for item in finding["contradicting_artifacts"]] == [
+        "restart unchanged"
+    ]
+    assert [item["summary"] for item in finding["context_artifacts"]] == ["memory snapshot"]
+    assert finding["context_artifacts"][0]["evidence_role"] == "context"
+
+
 def test_unavailable_drilldown_artifact_is_appendix_context_not_supporting_evidence() -> None:
     result = CollectorResult(agent="postgres", status="ok", summary=NO_EVIDENCE)
     result.artifacts.append(

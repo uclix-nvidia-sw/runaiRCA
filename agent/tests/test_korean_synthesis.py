@@ -547,7 +547,7 @@ async def test_korean_synthesis_exposes_condition_polarity(monkeypatch) -> None:
     )
 
     payload = json.loads(captured[0].removeprefix("증거(JSON):\n"))
-    checks = payload["collector_findings"][0]["artifacts"][0]["condition_checks"]
+    checks = payload["collector_findings"][0]["context_artifacts"][0]["condition_checks"]
     assert checks == [
         {
             "condition": "MemoryPressure",
