@@ -42,7 +42,10 @@ def _healthy_node_k8s_result(node_conditions: list) -> CollectorResult:
                 confidence="high",
                 query="/api/v1/nodes/n1",
                 summary="Kubernetes API queries completed.",
-                result=details,
+                result={
+                    **details,
+                    "observation": {"polarity": "unknown", "coverage": "partial"},
+                },
             )
         ],
     )
@@ -73,9 +76,9 @@ def test_healthy_node_does_not_signature_match_node_pressure_symptom():
     assert not any(family == "node_kubelet_pressure" for family, _ in matches)
 
 
-def test_real_node_pressure_still_signature_matches():
-    # A genuine DiskPressure=True lives in the abnormal-only node_conditions (NOT
-    # the dropped queries), so the symptom must still match.
+def test_current_node_pressure_snapshot_does_not_signature_match():
+    # A current node condition is useful context, but a resolved historical
+    # incident needs a time-bounded artifact before it can promote a signature.
     result = _healthy_node_k8s_result(
         [
             {
@@ -87,9 +90,34 @@ def test_real_node_pressure_still_signature_matches():
         ]
     )
     observed = _observed_text([result])
-    assert "diskpressure" in observed
+    assert "diskpressure" not in observed
     matches = match_failure_mode_symptoms(_failure_modes(), observed)
-    assert any(family == "node_kubelet_pressure" for family, _ in matches)
+    assert not any(family == "node_kubelet_pressure" for family, _ in matches)
+
+
+def test_scoped_warning_event_can_signature_match_node_pressure():
+    result = _healthy_node_k8s_result([{"node_conditions_healthy": True, "checked": 4}])
+    result.artifacts.append(
+        artifact(
+            agent="kubernetes",
+            source="kubernetes",
+            type="kubernetes_warning_events",
+            status="ok",
+            confidence="high",
+            summary="EvictionThresholdMet in incident window",
+            result={
+                "observation": {"polarity": "present", "coverage": "scoped"},
+                "events": [{"reason": "EvictionThresholdMet", "message": "DiskPressure"}],
+            },
+        )
+    )
+
+    observed = _observed_text([result])
+    assert "diskpressure" in observed
+    assert any(
+        family == "node_kubelet_pressure"
+        for family, _ in match_failure_mode_symptoms(_failure_modes(), observed)
+    )
 
 
 def test_evidence_leaf_text_prunes_metadata_key_subtrees():

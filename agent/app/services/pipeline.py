@@ -3164,9 +3164,16 @@ def _observed_text(
         if not _collector_is_evidence(result):
             continue
         drop_keys = COLLECTOR_TEXT_DROP_KEYS.get(getattr(result, "agent", ""))
-        if result.summary:
+        artifacts = list(result.artifacts)
+        # Once a collector publishes typed observations, do not let its broad
+        # summary/current snapshot re-enter signature promotion by keyword. The
+        # alert's own text above remains a separate direct observation, while
+        # legacy collectors retain their compatibility path until upgraded.
+        if any(_artifact_observation(art) is not None for art in artifacts):
+            artifacts = [art for art in artifacts if _artifact_is_scoped_support(art)]
+        elif result.summary:
             parts.append(result.summary)
-        for art in result.artifacts:
+        for art in artifacts:
             if not _artifact_is_evidence(art):
                 continue
             if art.summary:
@@ -3539,16 +3546,21 @@ def _artifact_is_evidence(art: object) -> bool:
 
 def _artifact_is_scoped_support(art: object) -> bool:
     """Whether an artifact may be printed as Root Cause supporting evidence."""
-    result = getattr(art, "result", None)
-    if not isinstance(result, dict):
-        return False
-    observation = result.get("observation")
-    if not isinstance(observation, dict):
+    observation = _artifact_observation(art)
+    if observation is None:
         return False
     return (
         str(observation.get("polarity") or "").strip().lower() == "present"
         and str(observation.get("coverage") or "").strip().lower() == "scoped"
     )
+
+
+def _artifact_observation(art: object) -> dict[str, object] | None:
+    result = getattr(art, "result", None)
+    if not isinstance(result, dict):
+        return None
+    observation = result.get("observation")
+    return observation if isinstance(observation, dict) else None
 
 
 def _collector_is_evidence(result: object) -> bool:
