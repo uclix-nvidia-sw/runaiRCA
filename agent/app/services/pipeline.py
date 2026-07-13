@@ -2554,13 +2554,18 @@ def _insert_before_appendix(detail: str, block: str) -> str:
 
 
 def _supporting_evidence(results: list[CollectorResult]) -> list[tuple[str, str]]:
-    """Up to 4 (agent, finding) pairs with a REAL finding — no no-evidence lines."""
+    """Up to four scoped positive findings for the Root Cause section.
+
+    The Appendix can retain partial/current context for an operator, but this
+    headline section must agree with the ranker and self-check: a successful
+    query alone is not proof that its signal was present during the incident.
+    """
     picked: list[tuple[str, str]] = []
     for result in results:
         if result.status not in ("ok", "partial"):
             continue
-        line = _best_evidence_line(result)
-        if line.startswith(NO_EVIDENCE):
+        line = _artifact_evidence_line(result)
+        if not line:
             continue
         picked.append((result.agent, line))
         if len(picked) >= 4:
@@ -3413,6 +3418,9 @@ def _appendix_evidence_line(result: CollectorResult) -> str:
     artifact_line = _artifact_evidence_line(result)
     if artifact_line:
         return artifact_line
+    context_line = _artifact_evidence_line(result, include_context=True)
+    if context_line:
+        return context_line
     unavailable_line = _artifact_evidence_line(result, include_unavailable=True)
     return unavailable_line or _best_evidence_line(result)
 
@@ -3424,10 +3432,15 @@ _GENERIC_ARTIFACT_SUMMARY_RE = re.compile(
 
 
 def _artifact_evidence_line(
-    result: CollectorResult, *, include_unavailable: bool = False
+    result: CollectorResult, *, include_unavailable: bool = False, include_context: bool = False
 ) -> str:
     for art in reversed(getattr(result, "artifacts", []) or []):
-        if not _artifact_is_evidence(art) and not include_unavailable:
+        is_context = getattr(art, "status", "") in ("ok", "partial")
+        if (
+            not _artifact_is_scoped_support(art)
+            and not (include_context and is_context)
+            and not include_unavailable
+        ):
             continue
         summary = " ".join(str(art.summary or "").split())
         result_text = _evidence_leaf_text(art.result, limit=500) if art.result is not None else ""
@@ -3448,7 +3461,22 @@ def _artifact_evidence_line(
 
 
 def _artifact_is_evidence(art: object) -> bool:
+    """Whether an artifact is usable investigation input in any capacity."""
     return getattr(art, "status", "") in ("ok", "partial")
+
+
+def _artifact_is_scoped_support(art: object) -> bool:
+    """Whether an artifact may be printed as Root Cause supporting evidence."""
+    result = getattr(art, "result", None)
+    if not isinstance(result, dict):
+        return False
+    observation = result.get("observation")
+    if not isinstance(observation, dict):
+        return False
+    return (
+        str(observation.get("polarity") or "").strip().lower() == "present"
+        and str(observation.get("coverage") or "").strip().lower() == "scoped"
+    )
 
 
 def _collector_is_evidence(result: object) -> bool:

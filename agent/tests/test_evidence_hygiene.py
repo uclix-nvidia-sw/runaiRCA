@@ -217,7 +217,10 @@ def test_root_cause_supporting_evidence_uses_drilldown_after_no_evidence_base() 
             status="ok",
             confidence="medium",
             summary="1 row(s)",
-            result={"rows": [{"message": "scheduler panic at reclaim/reclaim.go:91"}]},
+            result={
+                "rows": [{"message": "scheduler panic at reclaim/reclaim.go:91"}],
+                "observation": {"polarity": "present", "coverage": "scoped"},
+            },
         )
     )
     detail = pipeline._detail_from(
@@ -231,6 +234,37 @@ def test_root_cause_supporting_evidence_uses_drilldown_after_no_evidence_base() 
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
     assert "scheduler panic at reclaim/reclaim.go:91" in root_cause
+
+
+def test_context_only_artifact_stays_out_of_root_cause_evidence() -> None:
+    result = CollectorResult(agent="prometheus", status="ok", summary="metrics queried")
+    result.artifacts.append(
+        artifact(
+            agent="prometheus",
+            source="prometheus",
+            type="promql_signal",
+            status="ok",
+            confidence="low",
+            summary="container memory was observed",
+            result={
+                "observation": {"polarity": "unknown", "coverage": "partial"},
+            },
+        )
+    )
+
+    detail = pipeline._detail_from(
+        AlertAnalysisRequest(alert=Alert(status="firing", labels={"alertname": "MemoryAlert"})),
+        [result],
+        [],
+        root_cause_candidates=[
+            RankedCause(family="node_kubelet_pressure", confidence="medium", score=7.0)
+        ],
+    )
+
+    root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
+    evidence = detail.split("### Evidence", 1)[1].split("###", 1)[0]
+    assert "container memory was observed" not in root_cause
+    assert "container memory was observed" in evidence
 
 
 def test_unavailable_drilldown_artifact_is_appendix_context_not_supporting_evidence() -> None:
