@@ -242,3 +242,82 @@ export type PageInfo = {
   offset: number;
   has_more: boolean;
 };
+
+// Learned knowledge is derived from completed incident analysis. These records
+// are intentionally review-only: the dashboard may decide their lifecycle but
+// never constructs or mutates their evidence payloads.
+export type KnowledgeEvidenceSummary = {
+  evidence_id: string;
+  entity?: string;
+  source?: string;
+  source_group?: string;
+  predicate?: string;
+  polarity?: string;
+  coverage?: string;
+  quality?: string;
+};
+
+export type KnowledgeCandidate = {
+  candidate_id: string;
+  status: string;
+  title?: string;
+  summary?: string;
+  root_cause_family?: string;
+  kind?: string;
+  confidence?: number;
+  validation_error?: string;
+  incident_id?: string;
+  supporting_case_count?: number;
+  analysis_run_id?: string;
+  analysis_hash?: string;
+  evidence_summaries?: KnowledgeEvidenceSummary[];
+  probe_template_ids?: string[];
+  provenance?: Record<string, unknown>;
+  created_at?: string;
+  decided_at?: string;
+  decided_by?: string;
+};
+
+export type KnowledgePackage = {
+  package_id: string;
+  status: string;
+  title?: string;
+  summary?: string;
+  root_cause_family?: string;
+  candidate_id?: string;
+  confidence?: number;
+  provenance?: Record<string, unknown>;
+  evidence_summaries?: KnowledgeEvidenceSummary[];
+  probe_template_ids?: string[];
+  analysis_run_id?: string;
+  analysis_hash?: string;
+  published_at?: string;
+  retired_at?: string;
+  mirror_status?: string;
+  runtime_status?: string;
+  mirror_last_error?: string;
+  mirror_updated_at?: string;
+};
+
+export type ProbeMetric = {
+  template_id: string;
+  case_count: number;
+  executions: number;
+  supports: number;
+  refutes: number;
+  inconclusive: number;
+  linked_evidence_count: number;
+  linked_hypothesis_count: number;
+  final_diagnosis_tests: number;
+  final_diagnosis_supported: number;
+};
+
+export type ProbeMetricsSnapshot = {
+  case_count: number;
+  metrics: ProbeMetric[];
+};
+
+export type KnowledgeRuntimeSnapshot = {
+  revision: string;
+  packages: KnowledgePackage[];
+};

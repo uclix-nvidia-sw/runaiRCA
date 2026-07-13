@@ -1,4 +1,4 @@
-import { AlertRecord, AnalysisRun, Envelope, EvaluationReview, EvaluationReviewInput, EvaluationView, FeedbackSummary, Incident, IncidentDetail, KPIStats, LLMSpendStats, PageInfo, RecurrenceStats } from './types';
+import { AlertRecord, AnalysisRun, Envelope, EvaluationReview, EvaluationReviewInput, EvaluationView, FeedbackSummary, Incident, IncidentDetail, KPIStats, KnowledgeCandidate, KnowledgePackage, KnowledgeRuntimeSnapshot, LLMSpendStats, PageInfo, ProbeMetricsSnapshot, RecurrenceStats } from './types';
 
 const runtimeApiBase = window.__RUNAI_RCA_CONFIG__?.apiBaseUrl;
 const fallbackApiBase = import.meta.env.DEV ? 'http://localhost:8080' : '';
@@ -226,6 +226,40 @@ export async function fetchChatConversations(page?: PageRequest): Promise<PageRe
 
 export async function deleteChatConversation(id: string): Promise<void> {
   await mutate<Envelope<{ id: string }>>('DELETE', `/api/v1/chat/conversations/${encodeURIComponent(id)}`);
+}
+
+export type KnowledgeCandidateFilters = {
+  status?: string;
+  search?: string;
+};
+
+export async function fetchKnowledgeCandidates(filters: KnowledgeCandidateFilters = {}): Promise<KnowledgeCandidate[]> {
+  return (await read<Envelope<KnowledgeCandidate[]>>(
+    `/api/v1/knowledge-candidates${pageQuery(undefined, { status: filters.status, q: filters.search })}`,
+  )).data;
+}
+
+export async function decideKnowledgeCandidate(id: string, action: 'approve' | 'shadow' | 'activate' | 'reject', reason?: string): Promise<void> {
+  await write(`/api/v1/knowledge-candidates/${encodeURIComponent(id)}/decision`, {
+    action,
+    ...(reason ? { reason } : {}),
+  });
+}
+
+export async function fetchKnowledgePackages(): Promise<KnowledgePackage[]> {
+  return (await read<Envelope<KnowledgePackage[]>>('/api/v1/knowledge-packages')).data;
+}
+
+export async function retireKnowledgePackage(id: string): Promise<void> {
+  await write(`/api/v1/knowledge-packages/${encodeURIComponent(id)}/retire`);
+}
+
+export async function fetchKnowledgeRuntimeStatus(): Promise<KnowledgeRuntimeSnapshot> {
+  return read<KnowledgeRuntimeSnapshot>('/api/v1/knowledge/runtime-snapshot');
+}
+
+export async function fetchProbeMetrics(): Promise<ProbeMetricsSnapshot> {
+  return (await read<Envelope<ProbeMetricsSnapshot>>('/api/v1/knowledge/probe-metrics')).data;
 }
 
 export function eventSource(): EventSource {
