@@ -204,12 +204,14 @@ async def _postgres_result(
         incident_history.get("tables", []) if isinstance(incident_history, dict) else []
     )
     history_rows = sum(
-        int(item.get("matching_rows") or 0)
+        int(item.get("target_matching_rows") or 0)
         for item in history_tables
         if isinstance(item, dict)
     )
     history_match_tables = sum(
-        1 for item in history_tables if isinstance(item, dict) and item.get("matching_rows")
+        1
+        for item in history_tables
+        if isinstance(item, dict) and item.get("target_matching_rows")
     )
     missing_tables = [name for name, exists in rca_tables.items() if not exists]
     status = "ok"
@@ -285,9 +287,23 @@ async def _postgres_result(
                     "incident-window audit/history scan"
                 ),
                 summary=summary,
-                result={**checks, "used_mcp": used_mcp, "database_kind": database_kind},
+                result={
+                    **checks,
+                    "used_mcp": used_mcp,
+                    "database_kind": database_kind,
+                    # Health-state aggregation is operational context. The
+                    # table-specific historical artifacts below are the only
+                    # Postgres records eligible to express incident predicates.
+                    "observation": {
+                        "kind": "postgres_collector_summary",
+                        "predicate": "postgres_collector_summary",
+                        "polarity": "unknown",
+                        "coverage": "partial",
+                    },
+                },
             )
-        ],
+        ]
+        + _postgres_history_artifacts(target, incident_history),
     )
 
 
@@ -548,13 +564,20 @@ async def _collect_incident_history_direct(conn: Any, target: AnalysisTarget) ->
             time_range["start"],
             time_range["end"],
         )
+        row_dicts = [_record_to_dict(row) for row in rows]
+        target_rows = _history_target_rows(row_dicts, target, table.get("context_columns", []))
         tables.append(
             {
                 **table,
                 "matching_rows": int(aggregate.get("matching_rows") or 0),
                 "first_event_at": aggregate.get("first_event_at"),
                 "last_event_at": aggregate.get("last_event_at"),
-                "rows": [_record_to_dict(row) for row in rows],
+                "rows": row_dicts,
+                "target_correlation_available": _history_correlation_available(
+                    table.get("context_columns", []), target
+                ),
+                "target_matching_rows": len(target_rows),
+                "target_rows": target_rows,
             }
         )
     history["tables"] = tables
@@ -576,6 +599,7 @@ async def _collect_incident_history_mcp(
         )
         aggregate = aggregate_rows[0] if aggregate_rows else {}
         rows = await _mcp_fetch(settings, _history_query(table, mcp=True, time_range=time_range))
+        target_rows = _history_target_rows(rows, target, table.get("context_columns", []))
         tables.append(
             {
                 **table,
@@ -583,6 +607,11 @@ async def _collect_incident_history_mcp(
                 "first_event_at": aggregate.get("first_event_at"),
                 "last_event_at": aggregate.get("last_event_at"),
                 "rows": rows,
+                "target_correlation_available": _history_correlation_available(
+                    table.get("context_columns", []), target
+                ),
+                "target_matching_rows": len(target_rows),
+                "target_rows": target_rows,
             }
         )
     history["tables"] = tables
@@ -706,3 +735,122 @@ def _postgres_rows(data: Any) -> list[Any]:
         if all(not isinstance(value, (list, dict)) for value in data.values()):
             return [data]
     return []
+
+
+_HISTORY_TARGET_COLUMNS = frozenset(
+    {
+        "workload",
+        "workload_name",
+        "workload_id",
+        "project",
+        "project_name",
+        "namespace",
+        "resource_id",
+        "id",
+    }
+)
+
+
+def _history_correlation_available(columns: object, target: AnalysisTarget) -> bool:
+    available = {str(column).strip().lower() for column in columns if str(column).strip()}
+    if not available.intersection(_HISTORY_TARGET_COLUMNS):
+        return False
+    return bool(
+        target.runai_workload_id
+        or target.workload_name
+        or target.project
+        or target.namespace
+    )
+
+
+def _history_target_rows(
+    rows: list[dict[str, Any]], target: AnalysisTarget, context_columns: object
+) -> list[dict[str, Any]]:
+    if not _history_correlation_available(context_columns, target):
+        return []
+    return [row for row in rows if _history_row_matches_target(row, target)]
+
+
+def _history_row_matches_target(row: dict[str, Any], target: AnalysisTarget) -> bool:
+    """Require an exact value in an identity field; never keyword-match audit text."""
+    expected = {
+        "workload": {target.workload_name, target.runai_workload_id},
+        "workload_name": {target.workload_name},
+        "workload_id": {target.runai_workload_id},
+        "project": {target.project},
+        "project_name": {target.project},
+        "namespace": {target.namespace},
+        "resource_id": {target.workload_name, target.runai_workload_id},
+        "id": {target.runai_workload_id},
+    }
+    for key, value in row.items():
+        candidates = {
+            item.strip().casefold()
+            for item in expected.get(str(key).lower(), set())
+            if item
+        }
+        if candidates and str(value).strip().casefold() in candidates:
+            return True
+    return False
+
+
+def _postgres_history_artifacts(
+    target: AnalysisTarget, incident_history: object
+) -> list[Any]:
+    """Expose target-correlated audit tables as bounded, independent facts."""
+    history = incident_history if isinstance(incident_history, dict) else {}
+    time_range = history.get("time_range") if isinstance(history.get("time_range"), dict) else None
+    artifacts = []
+    for table in history.get("tables", []):
+        if not isinstance(table, dict):
+            continue
+        schema = str(table.get("schema") or "audit")
+        name = str(table.get("table") or "history")
+        matches = int(table.get("target_matching_rows") or 0)
+        correlated = bool(table.get("target_correlation_available"))
+        if not time_range or not correlated:
+            polarity, coverage = "unknown", "partial"
+        elif matches:
+            polarity, coverage = "present", "scoped"
+        else:
+            polarity, coverage = "absent", "scoped"
+        if polarity == "present":
+            summary = (
+                f"Postgres {schema}.{name}: {matches} target-correlated audit row(s) "
+                "in incident window."
+            )
+        elif polarity == "absent":
+            summary = (
+                f"{NO_EVIDENCE} Postgres {schema}.{name}: no target-correlated audit rows "
+                "in incident window."
+            )
+        else:
+            summary = (
+                f"Postgres {schema}.{name}: audit rows could not be correlated "
+                "to the incident target."
+            )
+        artifacts.append(
+            artifact(
+                agent="postgres",
+                source="postgres",
+                type="postgres_incident_history",
+                status="ok",
+                confidence="high" if polarity in {"present", "absent"} else "low",
+                title=f"Postgres · {schema}.{name}",
+                query=f"incident-window audit/history {schema}.{name}",
+                summary=summary,
+                result={
+                    "observation": {
+                        "kind": "postgres_incident_history",
+                        "predicate": f"postgres_history:{schema}.{name}",
+                        "polarity": polarity,
+                        "coverage": coverage,
+                        "observation_window": time_range or {},
+                    },
+                    "target_matching_rows": matches,
+                    "target_rows": table.get("target_rows") or [],
+                    "time_range": time_range,
+                },
+            )
+        )
+    return artifacts

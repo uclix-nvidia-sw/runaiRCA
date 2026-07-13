@@ -189,7 +189,11 @@ def _from_postgres(details: dict) -> list[dict]:
         schema = _str(table.get("schema"))
         name = _str(table.get("table"))
         kind = f"audit.{schema + '.' if schema else ''}{name or 'history'}"
-        for row in _list(table.get("rows")):
+        # New collectors retain all time-window rows for diagnostics but only
+        # project target-correlated rows into causal evidence. Keep ``rows`` as
+        # a compatibility fallback for older stored analysis results.
+        rows = table.get("target_rows") if "target_rows" in table else table.get("rows")
+        for row in _list(rows):
             row = _dict(row)
             timestamp = row.get("event_time")
             if not timestamp:

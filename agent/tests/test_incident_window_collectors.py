@@ -11,7 +11,7 @@ from app.collectors.kubernetes import (
     _filter_kubernetes_data,
     _warning_event_observation,
 )
-from app.collectors.postgres import _collect_postgres_checks
+from app.collectors.postgres import _collect_postgres_checks, _postgres_result
 from tests.test_orchestrator import make_settings, make_target
 
 
@@ -259,6 +259,12 @@ class _HistoryConnection:
                     "column_name": "action",
                     "data_type": "text",
                 },
+                {
+                    "table_schema": "audit",
+                    "table_name": "workload_history",
+                    "column_name": "workload_name",
+                    "data_type": "text",
+                },
             ]
         if 'FROM "audit"."workload_history"' in query:
             assert args == ("2026-07-10T00:55:00Z", "2026-07-10T01:15:00Z")
@@ -270,7 +276,13 @@ class _HistoryConnection:
                         "last_event_at": "2026-07-10T01:02:00Z",
                     }
                 ]
-            return [{"event_time": "2026-07-10T01:02:00Z", "action": "evicted"}]
+            return [
+                {
+                    "event_time": "2026-07-10T01:02:00Z",
+                    "action": "evicted",
+                    "workload_name": "trainer",
+                }
+            ]
         if "information_schema.tables" in query:
             return [{"table_schema": "audit", "table_name": "workload_history"}]
         return []
@@ -297,10 +309,70 @@ async def test_postgres_reads_only_timestamped_audit_history_in_incident_window(
             "schema": "audit",
             "table": "workload_history",
             "timestamp_column": "created_at",
-            "context_columns": ["action"],
+            "context_columns": ["action", "workload_name"],
             "matching_rows": 1,
             "first_event_at": "2026-07-10T01:02:00Z",
             "last_event_at": "2026-07-10T01:02:00Z",
-            "rows": [{"event_time": "2026-07-10T01:02:00Z", "action": "evicted"}],
+            "rows": [
+                {
+                    "event_time": "2026-07-10T01:02:00Z",
+                    "action": "evicted",
+                    "workload_name": "trainer",
+                }
+            ],
+            "target_correlation_available": True,
+            "target_matching_rows": 1,
+            "target_rows": [
+                {
+                    "event_time": "2026-07-10T01:02:00Z",
+                    "action": "evicted",
+                    "workload_name": "trainer",
+                }
+            ],
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_history_evidence_requires_target_identity() -> None:
+    target = replace(
+        make_target(), fired_at="2026-07-10T01:00:00Z", resolved_at="2026-07-10T01:10:00Z"
+    )
+    checks = {
+        "connected": True,
+        "active_connections": 1,
+        "long_transactions": [],
+        "pgvector_extension": True,
+        "rca_tables": {},
+        "incident_history": {
+            "time_range": {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"},
+            "tables": [
+                {
+                    "schema": "audit",
+                    "table": "workload_history",
+                    "target_correlation_available": True,
+                    "target_matching_rows": 0,
+                    "target_rows": [],
+                },
+                {
+                    "schema": "audit",
+                    "table": "unattributed_history",
+                    "target_correlation_available": False,
+                    "target_matching_rows": 1,
+                    "target_rows": [{"event_time": "2026-07-10T01:02:00Z"}],
+                },
+            ],
+        },
+    }
+    result = await _postgres_result(
+        make_settings(), target, checks=checks, warnings=[], used_mcp=False,
+        database_kind="runai_control_plane", check_rca_tables=False,
+    )
+    observations = {
+        artifact.result["observation"]["predicate"]: artifact.result["observation"]
+        for artifact in result.artifacts
+        if artifact.type == "postgres_incident_history"
+    }
+
+    assert observations["postgres_history:audit.workload_history"]["polarity"] == "absent"
+    assert observations["postgres_history:audit.unattributed_history"]["polarity"] == "unknown"
