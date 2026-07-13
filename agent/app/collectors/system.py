@@ -16,7 +16,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
+from app.collectors.base import (
+    NO_EVIDENCE,
+    AnalysisTarget,
+    CollectorResult,
+    artifact,
+    incident_time_range,
+    ko_en,
+)
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import complete, llm_configured
@@ -347,13 +354,20 @@ class SystemCollector:
         base_url = _base_url_for_node(self._settings.system_agent_url, address)
         token = self._settings.system_agent_token
         headers = {"Authorization": f"Bearer {token}"} if token else None
+        time_range = incident_time_range(target)
         source_results = []
         for source in _SOURCES:
+            params = {"source": source, "lines": "500"}
+            # Only journalctl has a trustworthy historical time predicate. A
+            # dmesg/syslog tail is retained as *current-state* context but must
+            # not be treated as proof about a past incident.
+            if source == "journal" and time_range:
+                params.update({"since": time_range["start"], "until": time_range["end"]})
             response = await get_json(
                 base_url=base_url,
                 path="/logs",
                 timeout_seconds=self._settings.system_agent_timeout_seconds,
-                params={"source": source, "lines": "500"},
+                params=params,
                 headers=headers,
             )
             lines = _lines(response.data)
@@ -367,13 +381,21 @@ class SystemCollector:
                     "error_count": len(matches),
                     "errors": compact(matches, limit=8),
                     "error": response.error,
+                    "time_range": time_range if source == "journal" and time_range else None,
+                    "historical_scope": bool(source == "journal" and time_range),
                 }
             )
             if response.error:
                 warnings.append(f"System agent query failed for {source}: {response.error}")
 
         successful = [item for item in source_results if not item["error"]]
-        with_errors = [item for item in successful if item["error_count"]]
+        incident_sources = (
+            [item for item in source_results if item["source"] == "journal"]
+            if time_range
+            else source_results
+        )
+        incident_successful = [item for item in incident_sources if not item["error"]]
+        with_errors = [item for item in incident_successful if item["error_count"]]
         error_lines = [line for item in with_errors for line in item["errors"]]
 
         if with_errors:
@@ -387,16 +409,33 @@ class SystemCollector:
                 f"Node {node}: {len(error_lines)} kernel/hardware error line(s) found in "
                 f"{sources_text}.",
             )
-        elif successful:
-            # Clean node is a POSITIVE finding (status ok) — NOT a "no evidence" case.
+        elif incident_successful:
+            # Clean node is a POSITIVE finding only when the source covers the
+            # incident window. For historical incidents, that is journalctl.
             status = "ok"
             confidence = "medium"
             deterministic = ko_en(
                 self._settings,
-                f"노드 {node}: 시스템 에이전트 접속 정상, 최근 dmesg/journal/syslog에 "
+                f"노드 {node}: incident 시간창의 journal에서 커널/GPU/하드웨어 "
+                "에러 시그니처가 없습니다. dmesg/syslog는 현재 상태 참고입니다."
+                if time_range
+                else f"노드 {node}: 시스템 에이전트 접속 정상, 최근 dmesg/journal/syslog에 "
                 "커널/GPU/하드웨어 에러 시그니처가 없습니다.",
-                f"Node {node}: system agent reachable, no kernel/GPU/hardware "
+                f"Node {node}: no kernel/GPU/hardware error signatures in journal for "
+                "the incident window; dmesg/syslog are current-state context."
+                if time_range
+                else f"Node {node}: system agent reachable, no kernel/GPU/hardware "
                 "error signatures in recent dmesg/journal/syslog.",
+            )
+        elif successful and time_range:
+            status = "partial"
+            confidence = "low"
+            deterministic = f"{NO_EVIDENCE} " + ko_en(
+                self._settings,
+                f"노드 {node}: incident 시간창 journal 조회에 실패했습니다. "
+                "dmesg/syslog는 현재 상태만 보여 과거 incident 반증으로 사용할 수 없습니다.",
+                f"Node {node}: the incident-window journal query failed. Current dmesg/syslog "
+                "tails cannot disprove a past incident.",
             )
         else:
             status = "unavailable"
@@ -417,9 +456,12 @@ class SystemCollector:
             "node": node,
             "node_address": address,
             "base_url": base_url,
+            "time_range": time_range,
             "sources": source_results,
         }
         missing_data = [] if successful else ["system_agent.query"]
+        if time_range and not incident_successful:
+            missing_data.append("system_agent.journal_time_window")
         return CollectorResult(
             agent=self.name,
             status=status,

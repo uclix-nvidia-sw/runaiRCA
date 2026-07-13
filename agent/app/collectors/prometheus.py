@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
@@ -319,6 +320,7 @@ async def _collect_prometheus_direct(
                 "status": _prometheus_status(response.data),
                 "series_count": len(result_data),
                 "sample": compact(result_data, limit=3),
+                "value_summary": _prometheus_value_summary(result_data),
                 "error": response.error,
                 **({"time_range": time_range} if time_range else {}),
             }
@@ -390,9 +392,86 @@ async def _mcp_query_prometheus(
         "status": _prometheus_status(data),
         "series_count": len(result_data),
         "sample": compact(result_data, limit=3),
+        "value_summary": _prometheus_value_summary(result_data),
         "error": None,
         "time_range": query_window,
     }
+
+
+def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
+    """Summarise range values so zero/False is visible as refuting evidence.
+
+    A non-empty Prometheus vector is not automatically evidence of a failure:
+    e.g. ``kube_pod_status_phase{phase="Pending"}`` can legitimately be all
+    zero. Preserve a bounded per-series timeline plus aggregate extrema rather
+    than asking the ranker to infer state from raw samples.
+    """
+    summaries: list[dict[str, object]] = []
+    all_values: list[float] = []
+    for item in result_data[:3]:
+        if not isinstance(item, dict):
+            continue
+        samples = _prometheus_samples(item)
+        numeric = [value for _, value in samples if value is not None]
+        all_values.extend(numeric)
+        metric = item.get("metric") if isinstance(item.get("metric"), dict) else {}
+        labels = {
+            str(key): str(metric[key])
+            for key in sorted(metric)
+            if key in {"namespace", "pod", "container", "node", "phase", "condition", "project", "queue"}
+        }
+        summary: dict[str, object] = {
+            "labels": labels,
+            "sample_count": len(samples),
+            "numeric_sample_count": len(numeric),
+        }
+        if samples:
+            summary["first_timestamp"] = samples[0][0]
+            summary["last_timestamp"] = samples[-1][0]
+        if numeric:
+            summary.update(
+                {
+                    "min": min(numeric),
+                    "max": max(numeric),
+                    "last": numeric[-1],
+                    "nonzero_sample_count": sum(value != 0 for value in numeric),
+                    "all_zero": all(value == 0 for value in numeric),
+                }
+            )
+        summaries.append(summary)
+    aggregate: dict[str, object] = {
+        "series": summaries,
+        "numeric_sample_count": len(all_values),
+    }
+    if all_values:
+        aggregate.update(
+            {
+                "min": min(all_values),
+                "max": max(all_values),
+                "nonzero_sample_count": sum(value != 0 for value in all_values),
+                "all_zero": all(value == 0 for value in all_values),
+            }
+        )
+    return aggregate
+
+
+def _prometheus_samples(item: dict[str, object]) -> list[tuple[str, float | None]]:
+    raw = item.get("values")
+    if not isinstance(raw, list):
+        value = item.get("value")
+        raw = [value] if isinstance(value, list) else []
+    samples: list[tuple[str, float | None]] = []
+    for pair in raw:
+        if not isinstance(pair, list) or len(pair) < 2:
+            continue
+        try:
+            numeric = float(str(pair[1]))
+        except (TypeError, ValueError):
+            numeric = None
+        if numeric is not None and not math.isfinite(numeric):
+            numeric = None
+        samples.append((str(pair[0]), numeric))
+    return samples
 
 
 # Grafana datasource uids are ^[a-zA-Z0-9\-_]{1,40}$; a numeric row id or a

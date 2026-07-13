@@ -152,6 +152,8 @@ async def test_loki_mcp_parses_grafana_log_entries(monkeypatch) -> None:
     assert result["status"] == "success"
     assert result["line_count"] == 20
     assert result["sample_lines"] == ["scheduler reconciled workload"]
+    assert result["sample_entries"][0]["timestamp"].endswith("Z")
+    assert result["sample_entries"][0]["line"] == "scheduler reconciled workload"
 
 
 @pytest.mark.asyncio

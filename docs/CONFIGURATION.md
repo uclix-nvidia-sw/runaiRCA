@@ -58,7 +58,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `LOKI_QUERY_LIMIT` | Maximum log lines requested per Loki query group, default `20` |
 | `LOKI_MCP_URL` | Grafana MCP URL for Loki tools. Helm sets this to the same managed `grafanaMcp` ClusterIP service when enabled; fallback uses `LOKI_URL` |
 | `ENABLE_SYSTEM_AGENT` | Enable the node-infra System collector (dmesg/journalctl/syslog via a per-node DaemonSet), default `true`; degrades to `unavailable` when `SYSTEM_AGENT_URL` is unset |
-| `SYSTEM_AGENT_URL` | Per-node System-agent DaemonSet endpoint (`GET /logs?source=dmesg\|journal\|syslog`) |
+| `SYSTEM_AGENT_URL` | Per-node System-agent DaemonSet endpoint (`GET /logs?source=dmesg\|journal\|syslog`). Historical incident collection passes its exact RFC3339 time window to `journal`; dmesg/syslog remain current-state tails. |
 | `SYSTEM_AGENT_TOKEN` | Optional bearer token for the System-agent endpoint |
 | `SYSTEM_AGENT_TIMEOUT_SECONDS` | System-agent request timeout, default `120` |
 | `ENABLE_POD_EXEC` | Allow the Kubernetes collector read-only pod-exec (allowlisted commands: `nvidia-smi`, …), default `true` |

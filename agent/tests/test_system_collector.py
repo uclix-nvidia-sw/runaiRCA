@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from app.collectors import system as system_mod
@@ -131,6 +133,47 @@ async def test_reachable_but_clean(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.status == "ok"
     assert result.confidence == "medium"
     assert result.missing_data == []
+
+
+@pytest.mark.asyncio
+async def test_historical_incident_scopes_journal_and_ignores_current_tails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+
+    async def fake_get_json(*, params, **kwargs):
+        calls.append(params)
+        source = params["source"]
+        # A current dmesg/syslog error is useful context, but cannot establish
+        # a cause for a months-old incident. The time-bounded journal is clean.
+        lines = ["NVRM: Xid 79"] if source in {"dmesg", "syslog"} else ["all good"]
+        return JsonResponse(url="http://node/logs", status_code=200, data={"lines": lines})
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-01-02T03:00:00Z",
+        resolved_at="2026-01-02T03:10:00Z",
+    )
+    result = await SystemCollector(_Settings()).collect(target)
+
+    journal_params = next(params for params in calls if params["source"] == "journal")
+    assert journal_params == {
+        "source": "journal",
+        "lines": "500",
+        "since": "2026-01-02T02:55:00Z",
+        "until": "2026-01-02T03:15:00Z",
+    }
+    assert all(
+        "since" not in params for params in calls if params["source"] in {"dmesg", "syslog"}
+    )
+    assert result.status == "ok"
+    assert result.confidence == "medium"
+    assert "journal" in result.summary
+    assert result.details["time_range"] == {
+        "start": "2026-01-02T02:55:00Z",
+        "end": "2026-01-02T03:15:00Z",
+    }
 
 
 @pytest.mark.asyncio

@@ -32,10 +32,13 @@ metadata:
     app.kubernetes.io/component: system-agent
 data:
   # Tiny read-only log endpoint. stdlib only, no deps.
-  # GET /logs?source=dmesg|journal|syslog&lines=N&grep=REGEX -> {"lines": [...]}
+  # GET /logs?source=dmesg|journal|syslog&lines=N&grep=REGEX&since=RFC3339&until=RFC3339
+  # -> {"lines": [...]}. since/until are applied only to journalctl; dmesg and
+  # syslog are current-state tails and must not be presented as past-time evidence.
   # ponytail: stdlib http.server is enough for a per-node read endpoint; no framework.
   server.py: |
     import os, re, subprocess
+    from datetime import datetime
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import parse_qs, urlparse
 
@@ -47,7 +50,7 @@ data:
     NSENTER = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"]
     SOURCES = {
         "dmesg": NSENTER + ["dmesg", "-T"],
-        "journal": NSENTER + ["journalctl", "-k", "--no-pager", "-n"],
+        "journal": NSENTER + ["journalctl", "-k", "--no-pager"],
         # syslog/kern.log are bind-mounted read-only at /host/var/log.
         "syslog": None,
     }
@@ -61,12 +64,25 @@ data:
                 break
         return out[-lines:]
 
-    def collect(source, lines):
+    def rfc3339(value):
+        if not value or len(value) > 40:
+            return ""
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return ""
+        return value
+
+    def collect(source, lines, since="", until=""):
         if source == "syslog":
             return read_syslog(lines)
-        cmd = SOURCES[source]
+        cmd = list(SOURCES[source])
         if source == "journal":
-            cmd = cmd + [str(lines)]
+            if since:
+                cmd += ["--since", since]
+            if until:
+                cmd += ["--until", until]
+            cmd += ["-n", str(lines)]
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         except Exception as exc:
@@ -102,13 +118,19 @@ data:
                 lines = min(int(q.get("lines", ["500"])[0]), MAX_LINES)
             except ValueError:
                 lines = 500
-            data = collect(source, lines)
+            raw_since = q.get("since", [""])[0]
+            raw_until = q.get("until", [""])[0]
+            since, until = rfc3339(raw_since), rfc3339(raw_until)
+            if (raw_since and not since) or (raw_until and not until):
+                self.send_response(400); self.end_headers(); return
+            data = collect(source, lines, since, until)
             grep = q.get("grep", [""])[0]
             if grep:
                 rx = re.compile(grep, re.IGNORECASE)
                 data = [ln for ln in data if rx.search(ln)]
             import json
-            body = json.dumps({"source": source, "lines": data}).encode()
+            body = json.dumps({"source": source, "since": since or None,
+                               "until": until or None, "lines": data}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()

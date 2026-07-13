@@ -154,6 +154,13 @@ def test_kubernetes_mcp_rbac_is_read_only_and_excludes_sensitive_subresources() 
     assert "resources: [\"pods/log\"]" in text
 
 
+def test_system_agent_supports_time_bounded_journal_reads() -> None:
+    text = (Path(__file__).parents[2] / "charts" / "runai-rca" / "templates" / "system-agent-daemonset.yaml").read_text(encoding="utf-8")
+    assert '"--since", since' in text
+    assert '"--until", until' in text
+    assert "def rfc3339(value):" in text
+
+
 def test_runai_crd_rbac_matches_the_k8s_read_allowlist_exactly() -> None:
     # Least privilege that stays in sync: the chart must grant read access to
     # EXACTLY the Run:ai CRDs k8s_read can query — no wildcard (accessrules/

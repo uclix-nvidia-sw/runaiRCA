@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -118,6 +119,52 @@ async def test_detects_rollout_new_pod_node_and_event(monkeypatch: pytest.Monkey
     assert any(k.startswith("Event/") for k in kinds)
     # Sorted most-recent first: the OOM event (-5s) leads.
     assert "OOMKilling" in result.details["changes"][0]["summary"]
+
+
+@pytest.mark.asyncio
+async def test_historical_incident_uses_its_own_change_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, path, **_kwargs):
+        if path.endswith("/events"):
+            return JsonResponse(
+                url="u",
+                status_code=200,
+                data={
+                    "items": [
+                        {
+                            "type": "Warning",
+                            "reason": "DuringIncident",
+                            "lastTimestamp": "2026-01-02T03:04:00Z",
+                            "involvedObject": {"name": "trainer"},
+                        },
+                        {
+                            "type": "Warning",
+                            "reason": "MuchLater",
+                            "lastTimestamp": "2026-07-13T09:00:00Z",
+                            "involvedObject": {"name": "trainer"},
+                        },
+                    ]
+                },
+            )
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-01-02T03:00:00Z",
+        resolved_at="2026-01-02T03:10:00Z",
+    )
+    result = await ChangeCollector(_Settings()).collect(target)
+
+    assert result.details["time_range"] == {
+        "start": "2026-01-02T02:55:00Z",
+        "end": "2026-01-02T03:15:00Z",
+    }
+    assert [change["reason"] for change in result.details["changes"]] == ["DuringIncident"]
+    assert "start=2026-01-02T02:55:00Z" in result.artifacts[0].query
 
 
 @pytest.mark.asyncio

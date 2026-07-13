@@ -20,7 +20,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
+from app.collectors.base import (
+    NO_EVIDENCE,
+    AnalysisTarget,
+    CollectorResult,
+    artifact,
+    incident_time_range,
+    ko_en,
+    parse_incident_time,
+)
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.knowledge import dependency_path, load_architecture
@@ -313,6 +321,33 @@ def _observation_window(
     return {"start": start.isoformat(), "end": end.isoformat()}
 
 
+def _collection_window(
+    target: AnalysisTarget,
+) -> tuple[datetime, datetime, dict[str, str]]:
+    """Use the incident's historical window, not a moving 'last hour'.
+
+    Change evidence is causal only when it is adjacent to the alert. A past
+    incident therefore cannot safely use the collector's current wall clock.
+    Alerts without a timestamp retain the bounded one-hour live fallback.
+    """
+    time_range = incident_time_range(target)
+    if time_range:
+        start = parse_incident_time(time_range.get("start"))
+        end = parse_incident_time(time_range.get("end"))
+        if start is not None and end is not None and end >= start:
+            return start, end, time_range
+    end = datetime.now(UTC)
+    start = end - timedelta(seconds=_RECENT_WINDOW_SECONDS)
+    return (
+        start,
+        end,
+        {
+            "start": start.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "end": end.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        },
+    )
+
+
 class ChangeCollector:
     name = "change"
 
@@ -324,6 +359,9 @@ class ChangeCollector:
     async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:  # noqa: ANN001
         namespace = _first_namespace(plan) or target.namespace
         node = getattr(plan, "node", "") or target.node
+        window_start, window_end, time_range = _collection_window(target)
+        window_seconds = max(1, int((window_end - window_start).total_seconds()))
+        historical_window = incident_time_range(target) is not None
         # depends_on namespaces (e.g. gpu-operator) the alert's component sits on:
         # an upstream operator/Helm upgrade is the usual root cause of a stuck
         # downstream DaemonSet, so scan those too (P2b).
@@ -332,7 +370,9 @@ class ChangeCollector:
             namespace or "",
             node or "",
             tuple(dep_namespaces),
-            _RECENT_WINDOW_SECONDS,
+            (time_range["start"], time_range["end"])
+            if historical_window
+            else ("live", _RECENT_WINDOW_SECONDS),
         )
         if cache_key in self._cache:
             return self._cache[cache_key]
@@ -354,17 +394,31 @@ class ChangeCollector:
             if Path(self._settings.kubernetes_ca_path).exists()
             else True
         )
-        now = datetime.now(UTC)
         ns = quote(namespace, safe="")
         limit = str(self._settings.kubernetes_list_limit)
         warnings: list[str] = []
 
-        controllers = await self._recent_controllers(ns, node, headers, verify, now, warnings)
-        pods = await self._recent_pods(ns, headers, verify, now, warnings)
-        node_changes = await self._node_conditions(node, headers, verify, now, warnings)
-        events = await self._recent_events(ns, limit, headers, verify, now, warnings)
+        controllers = await self._recent_controllers(
+            ns, node, headers, verify, window_end, warnings, window_seconds=window_seconds
+        )
+        pods = await self._recent_pods(
+            ns, headers, verify, window_end, warnings, window_seconds=window_seconds
+        )
+        node_changes = await self._node_conditions(
+            node, headers, verify, window_end, warnings, window_seconds=window_seconds
+        )
+        events = await self._recent_events(
+            ns, limit, headers, verify, window_end, warnings, window_seconds=window_seconds
+        )
         helm = await self._recent_helm_releases(
-            namespace, ns, limit, headers, verify, now, warnings
+            namespace,
+            ns,
+            limit,
+            headers,
+            verify,
+            window_end,
+            warnings,
+            window_seconds=window_seconds,
         )
 
         changes = controllers + pods + node_changes + events + helm
@@ -373,10 +427,23 @@ class ChangeCollector:
         for dep_ns in dep_namespaces:
             dep_q = quote(dep_ns, safe="")
             changes += await self._recent_controllers(
-                dep_q, "", headers, verify, now, warnings
+                dep_q,
+                "",
+                headers,
+                verify,
+                window_end,
+                warnings,
+                window_seconds=window_seconds,
             )
             changes += await self._recent_helm_releases(
-                dep_ns, dep_q, limit, headers, verify, now, warnings
+                dep_ns,
+                dep_q,
+                limit,
+                headers,
+                verify,
+                window_end,
+                warnings,
+                window_seconds=window_seconds,
             )
         changes.sort(key=lambda c: c.get("timestamp") or "", reverse=True)
 
@@ -385,15 +452,18 @@ class ChangeCollector:
                 f"{NO_EVIDENCE} "
                 + ko_en(
                     self._settings,
-                    f"최근 {_RECENT_WINDOW_SECONDS // 60}분 내 네임스페이스 {namespace}에서 "
+                    f"incident 시간창 내 네임스페이스 {namespace}에서 "
                     "변경된 워크로드/파드/노드/이벤트가 없습니다.",
-                    "No recently-changed workloads, pods, nodes, or events "
-                    f"found in namespace {namespace} within the last "
-                    f"{_RECENT_WINDOW_SECONDS // 60}m.",
+                    "No changed workloads, pods, nodes, or events were found in "
+                    f"namespace {namespace} inside the incident time window.",
                 ),
                 missing=[],
                 warnings=warnings,
-                details={"namespace": namespace, "node": node},
+                details={
+                    "namespace": namespace,
+                    "node": node,
+                    "time_range": time_range,
+                },
             )
             self._cache[cache_key] = result
             return result
@@ -407,7 +477,8 @@ class ChangeCollector:
             "namespace": namespace,
             "node": node,
             "dependency_namespaces": dep_namespaces,
-            "window_seconds": _RECENT_WINDOW_SECONDS,
+            "time_range": time_range,
+            "window_seconds": window_seconds,
             "changes": changes,
             "insight": insight,
         }
@@ -426,7 +497,10 @@ class ChangeCollector:
                     type="change_detection",
                     status="ok",
                     confidence="high",
-                    query=f"namespace={namespace} node={node or 'n/a'}",
+                    query=(
+                        f"namespace={namespace} node={node or 'n/a'} "
+                        f"start={time_range['start']} end={time_range['end']}"
+                    ),
                     summary=summary,
                     result=details,
                 )

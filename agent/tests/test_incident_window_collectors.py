@@ -41,6 +41,39 @@ async def test_prometheus_direct_uses_incident_query_range(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_prometheus_records_zero_and_peak_values_for_evidence(monkeypatch) -> None:
+    async def fake_get_json(**_kwargs):
+        return JsonResponse(
+            url="http://prometheus/api/v1/query_range",
+            status_code=200,
+            data={
+                "status": "success",
+                "data": {
+                    "result": [
+                        {
+                            "metric": {"namespace": "runai-vision", "pod": "trainer-0"},
+                            "values": [["100", "0"], ["160", "2.5"], ["220", "0"]],
+                        }
+                    ]
+                },
+            },
+        )
+
+    monkeypatch.setattr(prometheus, "get_json", fake_get_json)
+    result = await prometheus.PrometheusCollector(
+        replace(make_settings(), prometheus_url="http://prometheus")
+    ).collect(make_target())
+
+    restarts = next(item for item in result.details["queries"] if item["name"] == "container_restarts")
+    summary = restarts["value_summary"]
+    assert summary["min"] == 0.0
+    assert summary["max"] == 2.5
+    assert summary["all_zero"] is False
+    assert summary["series"][0]["last"] == 0.0
+    assert summary["series"][0]["nonzero_sample_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_kubernetes_logs_use_incident_since_time_and_previous_restart_log(
     monkeypatch,
 ) -> None:

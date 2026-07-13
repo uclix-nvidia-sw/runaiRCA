@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+from datetime import UTC, datetime
 from typing import Any
 
 from app.collectors.base import (
@@ -330,6 +331,7 @@ async def _collect_loki_direct(
                 "stream_count": len(streams),
                 "line_count": line_count,
                 "sample_lines": _sample_lines(streams),
+                "sample_entries": _sample_entries(streams),
                 "sample": compact(streams, limit=3),
                 "error": response.error,
                 **({"time_range": time_range} if time_range else {}),
@@ -406,9 +408,18 @@ async def _mcp_query_loki(
         )
     data = await _call_mcp_json(url, "query_loki_logs", [args])
     streams = _loki_streams(data)
-    lines = _sample_lines(streams)
-    if not lines:
-        lines = _log_lines_from_mcp_data(data)
+    entries = _sample_entries(streams)
+    if not entries:
+        entries = _log_entries_from_mcp_data(data)
+    if not entries:
+        # Keep compatibility with MCP implementations that return plain text
+        # rather than timestamped entries. Lack of a timestamp is explicit,
+        # but the useful log line is not silently discarded.
+        entries = [
+            {"timestamp": "", "line": line}
+            for line in _log_lines_from_mcp_data(data)
+        ]
+    lines = [entry["line"] for entry in entries]
     line_count = sum(len(stream.get("values", [])) for stream in streams) or _mcp_line_count(data)
     if not line_count:
         line_count = len(lines)
@@ -426,6 +437,7 @@ async def _mcp_query_loki(
         "stream_count": len(streams),
         "line_count": line_count,
         "sample_lines": lines[:8],
+        "sample_entries": entries[:8],
         "sample": compact(streams or data, limit=3),
         "error": None,
         **({"time_range": time_range} if time_range else {}),
@@ -642,3 +654,65 @@ def _sample_lines(streams: list[dict[str, object]], limit: int = 8) -> list[str]
             if len(lines) >= limit:
                 return lines
     return lines
+
+
+def _sample_entries(streams: list[dict[str, object]], limit: int = 8) -> list[dict[str, str]]:
+    """Bounded timestamped entries preserving the incident's log order."""
+    entries: list[dict[str, str]] = []
+    for stream in streams:
+        values = stream.get("values")
+        if not isinstance(values, list):
+            continue
+        for pair in values:
+            if not isinstance(pair, list) or len(pair) < 2:
+                continue
+            line = " ".join(str(pair[1]).split())
+            if not line:
+                continue
+            entries.append(
+                {"timestamp": _log_timestamp(pair[0]), "line": line[:240]}
+            )
+            if len(entries) >= limit:
+                return entries
+    return entries
+
+
+def _log_entries_from_mcp_data(data: object, limit: int = 8) -> list[dict[str, str]]:
+    """Extract timestamped Grafana MCP entries ({timestamp, line, labels})."""
+    if isinstance(data, list):
+        entries: list[dict[str, str]] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            line = item.get("line") or item.get("message") or item.get("body")
+            if not isinstance(line, str) or not line.strip():
+                continue
+            entries.append(
+                {
+                    "timestamp": _log_timestamp(item.get("timestamp") or ""),
+                    "line": " ".join(line.split())[:240],
+                }
+            )
+            if len(entries) >= limit:
+                break
+        return entries
+    if isinstance(data, dict):
+        for key in ("lines", "logs", "entries", "data"):
+            entries = _log_entries_from_mcp_data(data.get(key), limit)
+            if entries:
+                return entries
+    return []
+
+
+def _log_timestamp(value: object) -> str:
+    """Render Loki nanoseconds as UTC RFC3339 while retaining unknown formats."""
+    raw = str(value).strip().strip('"')
+    try:
+        numeric = int(raw)
+        if numeric >= 10**15:  # Loki normally sends nanoseconds since epoch.
+            return datetime.fromtimestamp(numeric / 1_000_000_000, UTC).isoformat().replace(
+                "+00:00", "Z"
+            )
+    except (TypeError, ValueError, OverflowError, OSError):
+        pass
+    return raw
