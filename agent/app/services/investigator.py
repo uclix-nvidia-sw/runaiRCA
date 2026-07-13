@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any
 
@@ -30,6 +32,21 @@ from app.services.evidence_blackboard import source_independence_group
 
 _LEDGER_STATUSES = {"open", "testing", "supported", "refuted", "uncertain"}
 _USER_PROMPT_CHARS = 8000
+
+
+def _budget_remaining(deadline_monotonic: float | None) -> float | None:
+    return None if deadline_monotonic is None else deadline_monotonic - time.monotonic()
+
+
+async def _within_budget(
+    deadline_monotonic: float | None, factory: Callable[[], Awaitable[Any]]
+) -> Any:
+    remaining = _budget_remaining(deadline_monotonic)
+    if remaining is not None and remaining <= 0:
+        raise TimeoutError("shared evidence budget exhausted")
+    awaitable = factory()
+    return await awaitable if remaining is None else await asyncio.wait_for(awaitable, remaining)
+
 
 # What each collector is good for — fed to the LLM so it picks the right probe.
 _COLLECTOR_HINTS = {
@@ -65,18 +82,16 @@ def _prioritize_probes(
     }
     used_groups = {source_independence_group(name) for name in evidence}
     directive = plan.diagnostic_directive if plan else {}
-    recommended = {
-        str(item)
-        for item in (directive.get("recommended_collectors") or [])
-        if str(item).strip()
-    } if isinstance(directive, dict) else set()
+    recommended = (
+        {str(item) for item in (directive.get("recommended_collectors") or []) if str(item).strip()}
+        if isinstance(directive, dict)
+        else set()
+    )
 
     def score(probe: dict[str, Any]) -> tuple[int, int, int, int, str, str]:
         collector = str(probe.get("collector") or "")
         hypothesis_ids = {
-            str(item)
-            for item in (probe.get("hypothesis_ids") or [])
-            if str(item).strip()
+            str(item) for item in (probe.get("hypothesis_ids") or []) if str(item).strip()
         }
         selected = str(probe.get("hypothesis_id") or "")
         if selected:
@@ -107,9 +122,7 @@ def _fallback_probe(
 ) -> dict[str, Any] | None:
     """Pick one unused collector when an LLM asks to probe but names none."""
     candidates = [
-        {"collector": name, "scope": {}}
-        for name in collector_names
-        if name not in evidence
+        {"collector": name, "scope": {}} for name in collector_names if name not in evidence
     ]
     ordered = _prioritize_probes(
         candidates,
@@ -292,7 +305,9 @@ def _add_reflected_hypotheses(
                 "id": f"H{len(ledger) + 1}",
                 "family": family,
                 "statement": statement or family.replace("_", " "),
-                "mechanism": str(candidate.get("mechanism") or statement or family.replace("_", " ")),
+                "mechanism": str(
+                    candidate.get("mechanism") or statement or family.replace("_", " ")
+                ),
                 "confidence": _clamp_confidence(candidate.get("confidence"), 0.4),
                 "evidence_for": _texts(candidate.get("evidence_for"))[:5],
                 "evidence_against": _texts(candidate.get("evidence_against"))[:5],
@@ -333,12 +348,13 @@ def _normalise_hypothesis(value: object) -> str:
 
 def _legacy_supported(ledger: list[dict[str, Any]]) -> bool:
     return any(
-        item.get("status") == "supported" and bool(item.get("evidence_for"))
-        for item in ledger
+        item.get("status") == "supported" and bool(item.get("evidence_for")) for item in ledger
     )
 
 
-def _ledger_fingerprint(ledger: list[dict[str, Any]]) -> tuple[tuple[str, str, str, tuple[str, ...]], ...]:
+def _ledger_fingerprint(
+    ledger: list[dict[str, Any]],
+) -> tuple[tuple[str, str, str, tuple[str, ...]], ...]:
     return tuple(
         (
             str(item.get("id") or ""),
@@ -370,6 +386,7 @@ async def investigate(
     max_steps: int,
     reporter: ProgressReporter | None = None,
     blackboard: Any = None,
+    deadline_monotonic: float | None = None,
 ) -> tuple[list[CollectorResult], dict[str, Any]]:
     by_name = {_collector_name(c): c for c in collectors}
     all_names = set(by_name)
@@ -391,7 +408,10 @@ async def investigate(
                 scope=scope,
                 hypothesis_ledger=_ledger_summary(ledger),
             )
-        result = await _collect_safely(collector, target, _scoped_plan(plan, scope))
+        result = await _within_budget(
+            deadline_monotonic,
+            lambda: _collect_safely(collector, target, _scoped_plan(plan, scope)),
+        )
         evidence[name] = result
         _record_blackboard(blackboard, name, result)
         if reporter:
@@ -412,6 +432,9 @@ async def investigate(
         # duplicates, evidence exhaustion, or an explicit conclusion end the
         # investigation rather than an arbitrary agent-step counter.
         while max_steps <= 0 or step < max_steps:
+            remaining_budget = _budget_remaining(deadline_monotonic)
+            if remaining_budget is not None and remaining_budget <= 0:
+                break
             step += 1
             if all_names <= set(evidence) and not ran_queries_last_step:
                 break  # every collector probed and no ad-hoc drill-down pending
@@ -422,44 +445,53 @@ async def investigate(
                     step=step,
                     hypothesis_ledger=_ledger_summary(ledger),
                 )
-            decision = await complete_json(
-                settings,
-                system=(
-                    "You are a senior SRE investigating a Run:ai GPU-platform alert. "
-                    "Given the plan, hypothesis ledger, evidence so far, and available "
-                    "collectors, decide the next diagnostic step. Pick the hypothesis "
-                    "you are testing, probe collectors most likely to confirm/refute it, "
-                    "and use plan.diagnostic_directive as neutral ontology guidance: "
-                    "follow its checks and disconfirmations, but never treat its "
-                    "provisional_family as observed evidence. Update confidence using "
-                    "only observed evidence. Cite shared_observations evidence_id "
-                    "values (F-...) in evidence_for/evidence_against; do not invent IDs. "
-                    "When diagnostic_directive.probes names a tool you can reach through a collector, "
-                    "use it as a discriminator and honor its supports_when/refutes_when conditions. You can ALSO "
-                    "run kubectl-style READ-ONLY Kubernetes queries (get/list of an "
-                    "allowlisted kind, see adhoc_query_kinds). Conclude once evidence "
-                    "is sufficient. Respond with ONLY JSON: "
-                    '{"action":"probe"|"conclude","reason":str,'
-                    '"selected_hypothesis":str,'
-                    '"probes":[{"collector":str,'
-                    '"scope":{"namespace"?,"pod"?,"node"?,"workload"?},'
-                    '"hypothesis_ids":[str]}],'
-                    '"queries":[{"kind":str,"namespace"?,"name"?,"label_selector"?}],'
-                    '"hypothesis_updates":[{"id":str,"confidence":number,'
-                    '"mechanism":str,"expected_observations":[str],"falsifiers":[str],'
-                    '"next_discriminating_test":str,"evidence_for":[str],'
-                    '"evidence_against":[str],'
-                    '"status":"open|testing|supported|refuted|uncertain"}],'
-                    '"new_hypotheses":[{"family"?:str,"statement":str,"mechanism":str,'
-                    '"expected_observations":[str],"falsifiers":[str],'
-                    '"next_discriminating_test":str}]}'
+            decision = await _within_budget(
+                deadline_monotonic,
+                lambda ledger=ledger: complete_json(
+                    settings,
+                    system=(
+                        "You are a senior SRE investigating a Run:ai GPU-platform alert. "
+                        "Given the plan, hypothesis ledger, evidence so far, and available "
+                        "collectors, decide the next diagnostic step. Pick the hypothesis "
+                        "you are testing, probe collectors most likely to confirm/refute it, "
+                        "and use plan.diagnostic_directive as neutral ontology guidance: "
+                        "follow its checks and disconfirmations, but never treat its "
+                        "provisional_family as observed evidence. Update confidence using "
+                        "only observed evidence. Cite shared_observations evidence_id "
+                        "values (F-...) in evidence_for/evidence_against; do not invent IDs. "
+                        "When diagnostic_directive.probes names a tool you can reach through a collector, "
+                        "use it as a discriminator and honor its supports_when/refutes_when conditions. You can ALSO "
+                        "run kubectl-style READ-ONLY Kubernetes queries (get/list of an "
+                        "allowlisted kind, see adhoc_query_kinds). Conclude once evidence "
+                        "is sufficient. Respond with ONLY JSON: "
+                        '{"action":"probe"|"conclude","reason":str,'
+                        '"selected_hypothesis":str,'
+                        '"probes":[{"collector":str,'
+                        '"scope":{"namespace"?,"pod"?,"node"?,"workload"?},'
+                        '"hypothesis_ids":[str]}],'
+                        '"queries":[{"kind":str,"namespace"?,"name"?,"label_selector"?}],'
+                        '"hypothesis_updates":[{"id":str,"confidence":number,'
+                        '"mechanism":str,"expected_observations":[str],"falsifiers":[str],'
+                        '"next_discriminating_test":str,"evidence_for":[str],'
+                        '"evidence_against":[str],'
+                        '"status":"open|testing|supported|refuted|uncertain"}],'
+                        '"new_hypotheses":[{"family"?:str,"statement":str,"mechanism":str,'
+                        '"expected_observations":[str],"falsifiers":[str],'
+                        '"next_discriminating_test":str}]}'
+                    ),
+                    user=_investigator_masker(settings).mask_text(
+                        _build_user_prompt(
+                            plan,
+                            kg_context,
+                            evidence,
+                            by_name,
+                            ledger,
+                            adhoc,
+                            blackboard=blackboard,
+                        )
+                    ),
+                    model=settings.llm_model_investigation,
                 ),
-                user=_investigator_masker(settings).mask_text(
-                    _build_user_prompt(
-                        plan, kg_context, evidence, by_name, ledger, adhoc, blackboard=blackboard
-                    )
-                ),
-                model=settings.llm_model_investigation,
             )
             if not isinstance(decision, dict):
                 break  # unusable response -> fall through to full gather
@@ -534,8 +566,11 @@ async def investigate(
             if not fresh and not wanted:
                 break
             if fresh:
-                await asyncio.gather(
-                    *(run_probe(p["collector"], p.get("scope") or {}) for p in fresh)
+                await _within_budget(
+                    deadline_monotonic,
+                    lambda fresh=fresh: asyncio.gather(
+                        *(run_probe(p["collector"], p.get("scope") or {}) for p in fresh)
+                    ),
                 )
             for q in wanted:
                 if reporter:
@@ -546,12 +581,15 @@ async def investigate(
                         query=_adhoc_query_repr(q),
                     )
                 adhoc.append(
-                    await k8s_read(
-                        settings,
-                        str(q.get("kind")),
-                        namespace=str(q.get("namespace") or ""),
-                        name=str(q.get("name") or ""),
-                        label_selector=str(q.get("label_selector") or ""),
+                    await _within_budget(
+                        deadline_monotonic,
+                        lambda q=q: k8s_read(
+                            settings,
+                            str(q.get("kind")),
+                            namespace=str(q.get("namespace") or ""),
+                            name=str(q.get("name") or ""),
+                            label_selector=str(q.get("label_selector") or ""),
+                        ),
                     )
                 )
             ran_queries_last_step = bool(wanted)
@@ -564,32 +602,56 @@ async def investigate(
 
     try:
         before_reflection = _ledger_fingerprint(ledger)
-        ledger = await _reflect_hypotheses(
-            settings, plan, kg_context, evidence, by_name, ledger, adhoc, blackboard=blackboard
-        )
+        reflection_budget = _budget_remaining(deadline_monotonic)
+        if reflection_budget is None or reflection_budget > 0:
+            ledger = await _within_budget(
+                deadline_monotonic,
+                lambda ledger=ledger: _reflect_hypotheses(
+                    settings,
+                    plan,
+                    kg_context,
+                    evidence,
+                    by_name,
+                    ledger,
+                    adhoc,
+                    blackboard=blackboard,
+                ),
+            )
         if _ledger_fingerprint(ledger) != before_reflection:
             # A reflection is useful only if its new/changed hypothesis is put
             # back through a discriminating read-only probe.  Continue until
             # the model concludes or it can offer no non-duplicate test.
             while True:
-                verification = await complete_json(
-                    settings,
-                    system=(
-                        "You are verifying a hypothesis introduced or changed during RCA reflection. "
-                        "Do not promote a conclusion from reasoning alone. Select the strongest "
-                        "read-only falsifier or discriminator, probe it, and cite F- observation IDs. "
-                        "Respond with ONLY JSON: "
-                        '{"action":"probe"|"conclude","probes":[{"collector":str,"scope":{}}],'
-                        '"queries":[{"kind":str,"namespace"?:str,"name"?:str,"label_selector"?:str}],'
-                        '"hypothesis_updates":[{"id":str,"confidence":number,"evidence_for":[str],'
-                        '"evidence_against":[str],"status":"open|testing|supported|refuted|uncertain"}]}'
+                remaining_budget = _budget_remaining(deadline_monotonic)
+                if remaining_budget is not None and remaining_budget <= 0:
+                    break
+                verification = await _within_budget(
+                    deadline_monotonic,
+                    lambda ledger=ledger: complete_json(
+                        settings,
+                        system=(
+                            "You are verifying a hypothesis introduced or changed during RCA reflection. "
+                            "Do not promote a conclusion from reasoning alone. Select the strongest "
+                            "read-only falsifier or discriminator, probe it, and cite F- observation IDs. "
+                            "Respond with ONLY JSON: "
+                            '{"action":"probe"|"conclude","probes":[{"collector":str,"scope":{}}],'
+                            '"queries":[{"kind":str,"namespace"?:str,"name"?:str,"label_selector"?:str}],'
+                            '"hypothesis_updates":[{"id":str,"confidence":number,"evidence_for":[str],'
+                            '"evidence_against":[str],"status":"open|testing|supported|refuted|uncertain"}]}'
+                        ),
+                        user=_investigator_masker(settings).mask_text(
+                            _build_user_prompt(
+                                plan,
+                                kg_context,
+                                evidence,
+                                by_name,
+                                ledger,
+                                adhoc,
+                                blackboard=blackboard,
+                            )
+                        ),
+                        model=settings.llm_model_investigation,
                     ),
-                    user=_investigator_masker(settings).mask_text(
-                        _build_user_prompt(
-                            plan, kg_context, evidence, by_name, ledger, adhoc, blackboard=blackboard
-                        )
-                    ),
-                    model=settings.llm_model_investigation,
                 )
                 if not isinstance(verification, dict):
                     break
@@ -625,17 +687,26 @@ async def investigate(
                 if not fresh and not wanted:
                     break
                 if fresh:
-                    await asyncio.gather(
-                        *(run_probe(probe["collector"], probe.get("scope") or {}) for probe in fresh)
+                    await _within_budget(
+                        deadline_monotonic,
+                        lambda fresh=fresh: asyncio.gather(
+                            *(
+                                run_probe(probe["collector"], probe.get("scope") or {})
+                                for probe in fresh
+                            )
+                        ),
                     )
                 for query in wanted:
                     adhoc.append(
-                        await k8s_read(
-                            settings,
-                            str(query.get("kind")),
-                            namespace=str(query.get("namespace") or ""),
-                            name=str(query.get("name") or ""),
-                            label_selector=str(query.get("label_selector") or ""),
+                        await _within_budget(
+                            deadline_monotonic,
+                            lambda query=query: k8s_read(
+                                settings,
+                                str(query.get("kind")),
+                                namespace=str(query.get("namespace") or ""),
+                                name=str(query.get("name") or ""),
+                                label_selector=str(query.get("label_selector") or ""),
+                            ),
                         )
                     )
         if reporter:
@@ -650,15 +721,40 @@ async def investigate(
     # Synthesis waits for ALL collectors: run any we never probed, unscoped.
     remaining = [name for name in by_name if name not in evidence]
     if remaining:
-        try:
-            results = await asyncio.gather(
-                *(_collect_safely(by_name[name], target, plan) for name in remaining)
+        tasks = {
+            asyncio.create_task(_collect_safely(by_name[name], target, plan)): name
+            for name in remaining
+        }
+        budget = _budget_remaining(deadline_monotonic)
+        timeout = None if budget is None else max(0.0, budget)
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        for task in done:
+            name = tasks[task]
+            try:
+                result = task.result()
+            except Exception as exc:  # noqa: BLE001 - collector failure is an observation
+                result = CollectorResult(
+                    agent=name,
+                    status="unavailable",
+                    summary=f"{name} collector failed before returning evidence.",
+                    missing_data=[f"{name}.collector_exception"],
+                    warnings=[f"{name} failed unexpectedly: {type(exc).__name__}"],
+                )
+            evidence[name] = result
+            _record_blackboard(blackboard, name, result)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for task in pending:
+            name = tasks[task]
+            evidence[name] = CollectorResult(
+                agent=name,
+                status="unavailable",
+                summary=f"{name} collector skipped when the shared evidence budget expired.",
+                missing_data=[f"{name}.analysis_budget"],
+                warnings=["shared investigation/drill-down budget exhausted"],
             )
-            for name, result in zip(remaining, results, strict=True):
-                evidence[name] = result
-                _record_blackboard(blackboard, name, result)
-        except Exception:  # noqa: BLE001 - last-resort guard
-            pass
 
     # Ad-hoc reads are evidence too: attach them to the kubernetes result so the
     # report's evidence trail (and signature matching) sees what was drilled into.
@@ -705,7 +801,12 @@ async def investigate(
             "schema_version": 2,
             "hypotheses": _ledger_summary(ledger),
             "referenced_facts": _blackboard_prompt_view(blackboard, limit=30),
-            "stop_reason": "all_collectors_probed",
+            "stop_reason": (
+                "analysis_budget_exhausted"
+                if (_budget_remaining(deadline_monotonic) is not None)
+                and (_budget_remaining(deadline_monotonic) or 0) <= 0
+                else "all_collectors_probed"
+            ),
         },
     }
     safe_context = _investigator_masker(settings).mask_object(context)

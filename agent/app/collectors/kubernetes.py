@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import quote
 
@@ -243,6 +244,7 @@ def kubectl_repr(kind: str, namespace: str = "", name: str = "", label_selector:
     """The read as the kubectl command an operator would have typed — artifacts
     show the REAL query shape ("kubectl get pods -n runai train-0"), not an
     internal param dump."""
+
     def quote_arg(value: str) -> str:
         return shlex.quote(" ".join(str(value).split()))
 
@@ -383,15 +385,23 @@ async def k8s_logs(
             )
             lines = _log_lines(mcp_tool_text(result) or mcp_tool_json(result))
             return {
-                "namespace": namespace, "pod": pod, "container": container,
-                "status_code": 200, "error": None, "lines": lines,
+                "namespace": namespace,
+                "pod": pod,
+                "container": container,
+                "status_code": 200,
+                "error": None,
+                "lines": lines,
             }
         except Exception as exc:  # noqa: BLE001 - direct fallback is the behavior.
             mcp_note = mcp_fallback_warning(exc)
     token = _read_file(settings.kubernetes_token_path)
     if not token:
-        return {"namespace": namespace, "pod": pod,
-                "error": "kubernetes service account token unavailable", "lines": []}
+        return {
+            "namespace": namespace,
+            "pod": pod,
+            "error": "kubernetes service account token unavailable",
+            "lines": [],
+        }
     verify: bool | str = (
         settings.kubernetes_ca_path if Path(settings.kubernetes_ca_path).exists() else True
     )
@@ -408,8 +418,11 @@ async def k8s_logs(
         verify=verify,
     )
     result: dict = {
-        "namespace": namespace, "pod": pod, "container": container,
-        "status_code": response.status_code, "error": response.error,
+        "namespace": namespace,
+        "pod": pod,
+        "container": container,
+        "status_code": response.status_code,
+        "error": response.error,
         "lines": _log_lines(response.data),
     }
     if mcp_note:
@@ -417,25 +430,32 @@ async def k8s_logs(
     return result
 
 
-async def k8s_describe(
-    settings: Settings, kind: str, namespace: str = "", name: str = ""
-) -> dict:
+async def k8s_describe(settings: Settings, kind: str, namespace: str = "", name: str = "") -> dict:
     """A describe-style read: the named object's full spec/status PLUS its events.
 
     Reuses k8s_read (MCP-first, direct fallback) for the object; events are pulled
     with a fieldSelector so only THIS object's events come back. Read-only."""
     resolved = resolve_read_kind(kind)
     if not resolved:
-        return {"kind": kind, "error": "kind is not in the read-only allowlist",
-                "allowed_kinds": sorted(_READ_KINDS)}
+        return {
+            "kind": kind,
+            "error": "kind is not in the read-only allowlist",
+            "allowed_kinds": sorted(_READ_KINDS),
+        }
     if not name:
         return {"kind": resolved, "error": "name is required to describe a resource"}
     obj = await k8s_read(settings, resolved, namespace=namespace, name=name)
     events = await _describe_events(settings, namespace=namespace, name=name)
-    return {"kind": resolved, "namespace": namespace, "name": name,
-            "object": obj.get("data"), "status_code": obj.get("status_code"),
-            "error": obj.get("error"), "events": events,
-            **({"mcp_fallback": obj["mcp_fallback"]} if obj.get("mcp_fallback") else {})}
+    return {
+        "kind": resolved,
+        "namespace": namespace,
+        "name": name,
+        "object": obj.get("data"),
+        "status_code": obj.get("status_code"),
+        "error": obj.get("error"),
+        "events": events,
+        **({"mcp_fallback": obj["mcp_fallback"]} if obj.get("mcp_fallback") else {}),
+    }
 
 
 async def _describe_events(settings: Settings, *, namespace: str, name: str) -> list:
@@ -457,8 +477,10 @@ async def _describe_events(settings: Settings, *, namespace: str, name: str) -> 
         base_url=settings.kubernetes_api_url,
         path="/".join(parts),
         timeout_seconds=settings.kubernetes_timeout_seconds,
-        params={"fieldSelector": f"involvedObject.name={name}",
-                "limit": str(settings.kubernetes_list_limit)},
+        params={
+            "fieldSelector": f"involvedObject.name={name}",
+            "limit": str(settings.kubernetes_list_limit),
+        },
         headers={"Authorization": f"Bearer {token}"},
         verify=verify,
     )
@@ -482,23 +504,42 @@ async def k8s_exec(
     if not (namespace and pod and command):
         return {"error": "namespace, pod and command (argv list) are required"}
     if not exec_command_allowed(command):
-        return {"error": f"command not on the read-only allowlist: {command}",
-                "allowed": [list(cmd) for cmd in _EXEC_ALLOWLIST]}
+        return {
+            "error": f"command not on the read-only allowlist: {command}",
+            "allowed": [list(cmd) for cmd in _EXEC_ALLOWLIST],
+        }
     token = _read_file(settings.kubernetes_token_path)
     if not token:
-        return {"namespace": namespace, "pod": pod, "command": command,
-                "error": "kubernetes service account token unavailable"}
+        return {
+            "namespace": namespace,
+            "pod": pod,
+            "command": command,
+            "error": "kubernetes service account token unavailable",
+        }
     try:
         stdout, stderr, status_err = await _exec_via_websocket(
-            settings, namespace=namespace, pod=pod, command=command,
-            container=container, token=token,
+            settings,
+            namespace=namespace,
+            pod=pod,
+            command=command,
+            container=container,
+            token=token,
         )
     except Exception as exc:  # noqa: BLE001 - observation, not a raise.
-        return {"namespace": namespace, "pod": pod, "command": command,
-                "error": f"exec failed: {exc.__class__.__name__}: {exc}"}
+        return {
+            "namespace": namespace,
+            "pod": pod,
+            "command": command,
+            "error": f"exec failed: {exc.__class__.__name__}: {exc}",
+        }
     result: dict = {
-        "namespace": namespace, "pod": pod, "container": container, "command": command,
-        "status_code": 200, "error": status_err or None, "output": (stdout or "")[-4000:],
+        "namespace": namespace,
+        "pod": pod,
+        "container": container,
+        "command": command,
+        "status_code": 200,
+        "error": status_err or None,
+        "output": (stdout or "")[-4000:],
     }
     if stderr.strip():
         result["stderr"] = stderr[-1000:]
@@ -506,8 +547,13 @@ async def k8s_exec(
 
 
 async def _exec_via_websocket(
-    settings: Settings, *, namespace: str, pod: str, command: list[str],
-    container: str, token: str,
+    settings: Settings,
+    *,
+    namespace: str,
+    pod: str,
+    command: list[str],
+    container: str,
+    token: str,
 ) -> tuple[str, str, str]:
     """Stream one command via the pod exec subresource. Returns (stdout, stderr,
     status_error). k8s channels: 1=stdout, 2=stderr, 3=error/status (JSON)."""
@@ -525,8 +571,11 @@ async def _exec_via_websocket(
         f"/pods/{quote(pod, safe='')}/exec?{query}"
     )
     ca = settings.kubernetes_ca_path
-    ssl_ctx = ssl.create_default_context(cafile=ca) if ca and Path(ca).exists() \
+    ssl_ctx = (
+        ssl.create_default_context(cafile=ca)
+        if ca and Path(ca).exists()
         else ssl.create_default_context()
+    )
     out: list[str] = []
     err: list[str] = []
     status_err = ""
@@ -860,6 +909,31 @@ class KubernetesCollector:
                 headers=headers,
                 verify=verify,
             )
+
+        # Controller-level alerts (Deployment/StatefulSet/DaemonSet/ReplicaSet/
+        # Job/CronJob) commonly carry only the controller label. Resolve its pod
+        # selector deterministically, choose the most unhealthy pod, then collect
+        # the same describe/log evidence as a pod-level alert. This must not be
+        # left to the optional LLM drill-down loop.
+        workload_resolution: dict[str, object] = {}
+        resolved_pod_describe: dict[str, object] = {}
+        if not target.pod:
+            workload_resolution = await _resolve_workload_pod(self._settings, target)
+            resolved_pod = str(workload_resolution.get("selected_pod") or "")
+            if resolved_pod:
+                resolved_target = replace(target, pod=resolved_pod)
+                resolved_pod_describe = await k8s_describe(
+                    self._settings, "pods", namespace=target.namespace, name=resolved_pod
+                )
+                described_object = resolved_pod_describe.get("object")
+                if isinstance(described_object, dict):
+                    pod_summary_data = _pod_summary(described_object)
+                containers = _container_names(pod_summary_data)
+                logs = await _collect_resolved_pod_logs(
+                    self._settings,
+                    resolved_target,
+                    containers,
+                )
         container_diagnostics = _container_diagnostics(pod_summary_data)
         warnings.extend(
             f"Kubernetes {item['name']} query failed: {item['error']}"
@@ -869,6 +943,15 @@ class KubernetesCollector:
         successful = [item for item in responses if not item.get("error")]
         pod_statuses = _pod_statuses(responses)
         warning_events = _warning_events(responses)
+        if pod_summary_data and workload_resolution.get("selected_pod"):
+            pod_statuses.append(pod_summary_data)
+        described_events = resolved_pod_describe.get("events")
+        if isinstance(described_events, list):
+            warning_events.extend(
+                event
+                for event in described_events
+                if isinstance(event, dict) and event.get("type") == "Warning"
+            )
         node_conditions = _node_conditions(responses)
         runai_control_plane_pods = _runai_control_plane_pods(responses)
         runai_control_plane_events = _runai_control_plane_warning_events(responses)
@@ -935,9 +1018,7 @@ class KubernetesCollector:
         # A CRD finding IS the correlation the missing label denied us: name the
         # not-Ready Run:ai entities and lift the result out of "partial".
         if crd_findings:
-            named = ", ".join(
-                f"{f['kind']}/{f['name']} ({f['reason']})" for f in crd_findings[:3]
-            )
+            named = ", ".join(f"{f['kind']}/{f['name']} ({f['reason']})" for f in crd_findings[:3])
             lead = ko_en(
                 self._settings,
                 f"정상 상태가 아닌 Run:ai 리소스 {len(crd_findings)}건 확인: {named}.",
@@ -965,6 +1046,7 @@ class KubernetesCollector:
             "kubernetes_cluster_scope_enabled": self._settings.kubernetes_cluster_scope_enabled,
             "namespace": target.namespace,
             "pod": target.pod,
+            "resolved_pod": workload_resolution.get("selected_pod", ""),
             "workload_name": target.workload_name,
             "workload_type": target.workload_type,
             "node": target.node,
@@ -973,6 +1055,8 @@ class KubernetesCollector:
             "warning_events": warning_events,
             "node_conditions": node_conditions,
             "pod_logs": logs,
+            "workload_resolution": workload_resolution,
+            "resolved_pod_describe": resolved_pod_describe,
             "exec_probes": exec_probes,
             "runai_control_plane_pods": runai_control_plane_pods,
             "runai_control_plane_warning_events": runai_control_plane_events,
@@ -1100,9 +1184,7 @@ async def _collect_kubernetes_responses_via_mcp(
     responses: list[dict[str, object]] = []
     ok_count = 0
 
-    async def block(
-        name: str, label: str, candidates: list[tuple[str, dict[str, object]]]
-    ) -> None:
+    async def block(name: str, label: str, candidates: list[tuple[str, dict[str, object]]]) -> None:
         nonlocal ok_count
         try:
             data = await _k8s_mcp_json(settings, candidates)
@@ -1315,9 +1397,7 @@ def _k8s_yaml_payload(text: str) -> object:
     raise RuntimeError("MCP result was not JSON or YAML (set --list-output=yaml)")
 
 
-async def _k8s_mcp_result(
-    settings: Settings, candidates: list[tuple[str, dict[str, object]]]
-):
+async def _k8s_mcp_result(settings: Settings, candidates: list[tuple[str, dict[str, object]]]):
     last_error = ""
     for tool, args in candidates:
         try:
@@ -1395,6 +1475,257 @@ def _pod_unhealthy(pod: dict) -> bool:
     return False
 
 
+_WORKLOAD_READ_KINDS = {
+    "deployment": "deployments",
+    "statefulset": "statefulsets",
+    "daemonset": "daemonsets",
+    "replicaset": "replicasets",
+    "job": "jobs",
+    "cronjob": "cronjobs",
+}
+
+
+def _read_items(result: object) -> list[dict]:
+    if not isinstance(result, dict):
+        return []
+    data = result.get("data")
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if not isinstance(data, dict):
+        return []
+    items = data.get("items")
+    return [item for item in items or [] if isinstance(item, dict)]
+
+
+def _controller_observation(result: object) -> dict[str, object]:
+    """Keep controller health/status without retaining its full pod template."""
+    if not isinstance(result, dict):
+        return {}
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    spec = data.get("spec") if isinstance(data.get("spec"), dict) else {}
+    status = data.get("status") if isinstance(data.get("status"), dict) else {}
+    return {
+        "kind": result.get("kind"),
+        "status_code": result.get("status_code"),
+        "error": result.get("error"),
+        "metadata": {
+            key: metadata.get(key)
+            for key in ("name", "namespace", "generation", "creationTimestamp")
+            if metadata.get(key) is not None
+        },
+        "spec": {
+            key: spec.get(key)
+            for key in (
+                "replicas",
+                "parallelism",
+                "completions",
+                "backoffLimit",
+                "activeDeadlineSeconds",
+                "suspend",
+                "schedule",
+            )
+            if spec.get(key) is not None
+        },
+        "status": compact(status, limit=12),
+    }
+
+
+def _list_observation(result: object) -> dict[str, object]:
+    if not isinstance(result, dict):
+        return {}
+    return {
+        "kind": result.get("kind"),
+        "label_selector": result.get("label_selector"),
+        "status_code": result.get("status_code"),
+        "error": result.get("error"),
+    }
+
+
+def _selector_from_controller(controller: object) -> str:
+    if not isinstance(controller, dict):
+        return ""
+    data = controller.get("data")
+    if not isinstance(data, dict):
+        return ""
+    spec = data.get("spec")
+    selector = spec.get("selector") if isinstance(spec, dict) else None
+    if not isinstance(selector, dict):
+        return ""
+    parts: list[str] = []
+    labels = selector.get("matchLabels")
+    if isinstance(labels, dict):
+        parts.extend(f"{key}={value}" for key, value in sorted(labels.items()) if str(key))
+    expressions = selector.get("matchExpressions")
+    for expression in expressions if isinstance(expressions, list) else []:
+        if not isinstance(expression, dict):
+            continue
+        key = str(expression.get("key") or "").strip()
+        operator = str(expression.get("operator") or "").strip()
+        values = [str(value) for value in expression.get("values") or []]
+        if not key:
+            continue
+        if operator in {"In", "NotIn"} and values:
+            token = "in" if operator == "In" else "notin"
+            parts.append(f"{key} {token} ({','.join(values)})")
+        elif operator == "Exists":
+            parts.append(key)
+        elif operator == "DoesNotExist":
+            parts.append(f"!{key}")
+    return ",".join(parts)
+
+
+def _owned_by(item: dict, kind: str, name: str) -> bool:
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    for owner in metadata.get("ownerReferences") or []:
+        if not isinstance(owner, dict):
+            continue
+        if str(owner.get("kind") or "").lower() == kind.lower() and owner.get("name") == name:
+            return True
+    return False
+
+
+def _diagnostic_pod(items: list[dict], workload_name: str) -> dict | None:
+    """Choose the pod most likely to retain the controller's failure evidence."""
+
+    def score(pod: dict) -> tuple[int, str]:
+        metadata = pod.get("metadata") if isinstance(pod.get("metadata"), dict) else {}
+        status = pod.get("status") if isinstance(pod.get("status"), dict) else {}
+        phase = str(status.get("phase") or "")
+        severity = {"Failed": 5, "Pending": 4, "Unknown": 3, "Running": 2, "Succeeded": 1}.get(
+            phase, 0
+        )
+        if _pod_unhealthy(pod):
+            severity += 3
+        return severity, str(metadata.get("creationTimestamp") or "")
+
+    candidates = [
+        item
+        for item in items
+        if str((item.get("metadata") or {}).get("name") or "")
+        and (
+            not workload_name
+            or workload_name in str((item.get("metadata") or {}).get("name") or "")
+            or bool((item.get("metadata") or {}).get("labels"))
+        )
+    ]
+    return max(candidates, key=score) if candidates else None
+
+
+def _diagnostic_job(items: list[dict], cronjob_name: str) -> dict | None:
+    owned = [item for item in items if _owned_by(item, "CronJob", cronjob_name)]
+    if not owned:
+        owned = [
+            item
+            for item in items
+            if str((item.get("metadata") or {}).get("name") or "").startswith(f"{cronjob_name}-")
+        ]
+
+    def score(job: dict) -> tuple[int, str]:
+        metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+        status = job.get("status") if isinstance(job.get("status"), dict) else {}
+        severity = 4 if status.get("failed") else 3 if status.get("active") else 1
+        return severity, str(metadata.get("creationTimestamp") or "")
+
+    return max(owned, key=score) if owned else None
+
+
+async def _resolve_workload_pod(settings: Settings, target: AnalysisTarget) -> dict[str, object]:
+    """Resolve a controller-only alert to one diagnostic pod, MCP-first.
+
+    Selectors are authoritative for Deployment/StatefulSet/DaemonSet/ReplicaSet/
+    Job. CronJob adds the owner-reference hop through its most relevant Job.
+    """
+    kind = _WORKLOAD_READ_KINDS.get(str(target.workload_type or "").lower())
+    if target.pod or not (kind and target.namespace and target.workload_name):
+        return {}
+
+    controller = await k8s_read(
+        settings, kind, namespace=target.namespace, name=target.workload_name
+    )
+    resolution: dict[str, object] = {
+        "workload_kind": kind,
+        "workload_name": target.workload_name,
+        "controller": _controller_observation(controller),
+    }
+
+    if kind == "cronjobs":
+        jobs = await k8s_read(settings, "jobs", namespace=target.namespace)
+        resolution["jobs"] = _list_observation(jobs)
+        job = _diagnostic_job(_read_items(jobs), target.workload_name)
+        if job is None:
+            return resolution
+        job_name = str((job.get("metadata") or {}).get("name") or "")
+        resolution["resolved_job"] = job_name
+        nested = await _resolve_workload_pod(
+            settings,
+            replace(target, workload_name=job_name, workload_type="Job"),
+        )
+        resolution["job_resolution"] = nested
+        resolution["selected_pod"] = nested.get("selected_pod", "")
+        return resolution
+
+    selector = _selector_from_controller(controller)
+    if not selector and kind == "jobs":
+        selector = f"batch.kubernetes.io/job-name={target.workload_name}"
+    pods = await k8s_read(
+        settings,
+        "pods",
+        namespace=target.namespace,
+        label_selector=selector,
+    )
+    items = _read_items(pods)
+    if not selector:
+        items = [
+            item
+            for item in items
+            if _owned_by(item, target.workload_type, target.workload_name)
+            or str((item.get("metadata") or {}).get("name") or "").startswith(
+                f"{target.workload_name}-"
+            )
+        ]
+    selected = _diagnostic_pod(items, target.workload_name)
+    resolution.update(
+        {
+            "selector": selector,
+            "pods": _list_observation(pods),
+            "candidate_pods": [
+                str((item.get("metadata") or {}).get("name") or "") for item in items
+            ],
+            "selected_pod": (
+                str((selected.get("metadata") or {}).get("name") or "") if selected else ""
+            ),
+        }
+    )
+    return resolution
+
+
+async def _collect_resolved_pod_logs(
+    settings: Settings,
+    target: AnalysisTarget,
+    containers: list[str],
+) -> list[dict[str, object]]:
+    targets: list[str | None] = list(containers) if containers else [None]
+    logs: list[dict[str, object]] = []
+    for container in targets:
+        item = await k8s_logs(
+            settings,
+            target.namespace,
+            target.pod,
+            container=container or "",
+            tail=settings.kubernetes_list_limit,
+        )
+        logs.append(
+            {
+                "container": container,
+                "status_code": item.get("status_code"),
+                "error": item.get("error"),
+                "lines": item.get("lines") or [],
+            }
+        )
+    return logs
+
+
 def best_matching_pod(items: list[dict], stems: list[str]) -> dict | None:
     """The stem-matching pod that is most plausibly the alert's subject.
 
@@ -1413,9 +1744,7 @@ def best_matching_pod(items: list[dict], stems: list[str]) -> dict | None:
             continue
         matches.append((str(metadata.get("creationTimestamp") or ""), item))
     pool = [entry for entry in matches if _pod_unhealthy(entry[1])] or matches
-    nodes = {
-        str((entry[1].get("spec") or {}).get("nodeName") or "") for entry in pool
-    }
+    nodes = {str((entry[1].get("spec") or {}).get("nodeName") or "") for entry in pool}
     if pool and (len(pool) == 1 or len(nodes) == 1):
         return max(pool, key=lambda entry: entry[0])[1]
     return None
@@ -1486,9 +1815,7 @@ async def resolve_live_pod_node(
                 base_url=settings.kubernetes_api_url,
                 path=f"/api/v1/namespaces/{encoded_namespace}/events",
                 timeout_seconds=settings.kubernetes_timeout_seconds,
-                params=_list_params(
-                    settings, {"fieldSelector": f"involvedObject.name={name}"}
-                ),
+                params=_list_params(settings, {"fieldSelector": f"involvedObject.name={name}"}),
                 headers=headers,
                 verify=verify,
             )
@@ -1987,14 +2314,8 @@ def _node_conditions(responses: list[dict[str, object]]) -> list[object]:
             abnormal = [
                 c
                 for c in conditions
-                if (
-                    str(c.get("type")) == "Ready"
-                    and str(c.get("status")) != "True"
-                )
-                or (
-                    str(c.get("type")) != "Ready"
-                    and str(c.get("status")) == "True"
-                )
+                if (str(c.get("type")) == "Ready" and str(c.get("status")) != "True")
+                or (str(c.get("type")) != "Ready" and str(c.get("status")) == "True")
             ]
             if abnormal:
                 return abnormal

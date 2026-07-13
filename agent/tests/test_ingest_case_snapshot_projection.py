@@ -101,6 +101,16 @@ def test_fetch_uses_immutable_snapshot_payload_not_mutable_latest_run() -> None:
     assert "JOIN analysis_runs ar" not in ingest._SELECT_INCIDENTS
 
 
+def test_fetch_sql_renders_where_without_interpreting_json_braces() -> None:
+    with_grace = ingest._SELECT_INCIDENTS.replace("{where}", ingest._RESOLVED_GRACE_WHERE)
+    without_grace = ingest._SELECT_INCIDENTS.replace("{where}", "")
+
+    assert "{where}" not in with_grace
+    assert "{where}" not in without_grace
+    assert "'{}'::jsonb" in with_grace
+    assert ingest._RESOLVED_GRACE_WHERE in with_grace
+
+
 def test_trace_v3_projects_only_explicit_ids_and_metadata(monkeypatch: Any) -> None:
     monkeypatch.setattr(
         ingest,
@@ -135,7 +145,10 @@ def test_trace_v3_projects_only_explicit_ids_and_metadata(monkeypatch: Any) -> N
                     "polarity": "positive",
                     "coverage": "target pod",
                     "quality": "high",
-                    "observation_window": {"start": "2026-07-13T00:00:00Z", "end": "2026-07-13T00:01:00Z"},
+                    "observation_window": {
+                        "start": "2026-07-13T00:00:00Z",
+                        "end": "2026-07-13T00:01:00Z",
+                    },
                 }
             ],
             "probe_executions": [

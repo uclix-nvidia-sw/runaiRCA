@@ -289,10 +289,12 @@ async def _fetch(limit: int, resolved_grace_hours: int = 0) -> list[dict[str, An
     conn = await asyncpg.connect(settings.postgres_dsn)
     try:
         if resolved_grace_hours > 0:
-            sql = _SELECT_INCIDENTS.format(where=_RESOLVED_GRACE_WHERE)
+            # Replace only our named sentinel. PostgreSQL JSON literals such as
+            # '{}' are data, not Python format fields.
+            sql = _SELECT_INCIDENTS.replace("{where}", _RESOLVED_GRACE_WHERE)
             rows = await conn.fetch(sql, limit, resolved_grace_hours)
         else:
-            rows = await conn.fetch(_SELECT_INCIDENTS.format(where=""), limit)
+            rows = await conn.fetch(_SELECT_INCIDENTS.replace("{where}", ""), limit)
     finally:
         await conn.close()
     return [dict(r) for r in rows]

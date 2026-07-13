@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import replace
 
 import pytest
@@ -195,8 +196,12 @@ def test_drilldown_receives_source_scoped_ontology_guidance(monkeypatch) -> None
     assert guidance["primary"] is False
     assert guidance["candidate_family"] == "k8s_scheduling_error"
     assert guidance["checks"] == ["Compare requested and allocatable GPU capacity."]
-    assert guidance["interpretation"] == ["Capacity is relevant only after eligibility filters pass."]
-    assert guidance["avoid"] == ["Do not change requests before reading the FailedScheduling predicate."]
+    assert guidance["interpretation"] == [
+        "Capacity is relevant only after eligibility filters pass."
+    ]
+    assert guidance["avoid"] == [
+        "Do not change requests before reading the FailedScheduling predicate."
+    ]
     assert guidance["disconfirm"] == ["A matching node has allocatable GPU capacity."]
 
 
@@ -235,7 +240,12 @@ def test_ontology_probe_records_structured_support_verdict(monkeypatch) -> None:
         return {"action": "done"}
 
     async def fake_k8s_read(settings, kind, **_kwargs):
-        return {"kind": kind, "status_code": 200, "error": None, "items": [{"reason": "FailedMount"}]}
+        return {
+            "kind": kind,
+            "status_code": 200,
+            "error": None,
+            "items": [{"reason": "FailedMount"}],
+        }
 
     monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
     monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
@@ -400,7 +410,10 @@ def test_ontology_probe_rejects_unsafe_target_value_instead_of_widening(monkeypa
             "probes": [
                 {
                     "tool": "k8s_describe",
-                    "arguments_template": {"kind": "persistentvolumeclaims", "name": "{{storage_claim}}"},
+                    "arguments_template": {
+                        "kind": "persistentvolumeclaims",
+                        "name": "{{storage_claim}}",
+                    },
                 }
             ]
         }
@@ -796,9 +809,7 @@ def test_runai_search_tool_masks_text_result_and_error(monkeypatch) -> None:
     settings = drill_settings(runai_mcp_url="http://localhost:8809/mcp")
 
     ok = asyncio.run(drilldown._tool_runai_search(settings, _target(), {"query": "workloads"}))
-    failed = asyncio.run(
-        drilldown._tool_runai_search(settings, _target(), {"query": "workloads"})
-    )
+    failed = asyncio.run(drilldown._tool_runai_search(settings, _target(), {"query": "workloads"}))
 
     rendered = str([ok, failed])
     assert "search-secret-12345" not in rendered
@@ -954,7 +965,7 @@ def test_sql_validate_select_rejects_quoted_dangerous_functions() -> None:
     from app.services.drilldown import _validate_select
 
     assert _validate_select('SELECT "pg_sleep"(60)')[0]
-    assert _validate_select('SELECT pg_catalog."pg_read_file"(\'/etc/passwd\')')[0]
+    assert _validate_select("SELECT pg_catalog.\"pg_read_file\"('/etc/passwd')")[0]
 
 
 def test_sql_tool_targets_runai_db_and_appends_limit(monkeypatch) -> None:
@@ -1037,3 +1048,28 @@ def test_signals_are_bolded_in_evidence_text() -> None:
     )
     assert signals_line(["OOMKilled"], "en") == "signals: **OOMKilled**"
     assert signals_line([], "ko") == ""
+
+
+@pytest.mark.asyncio
+async def test_drilldowns_cancel_at_shared_evidence_deadline(monkeypatch) -> None:
+    started = asyncio.Event()
+
+    async def never_finishes(settings, **kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(drilldown, "complete_json", never_finishes)
+    result = _k8s_result()
+
+    await run_drilldowns(
+        drill_settings(),
+        [result],
+        _target(),
+        None,
+        # Leave enough time for a busy CI event loop to schedule _drill_one
+        # before asserting that the shared deadline cancels it.
+        deadline_monotonic=time.monotonic() + 0.2,
+    )
+
+    assert started.is_set()
+    assert any("shared evidence budget exhausted" in warning for warning in result.warnings)

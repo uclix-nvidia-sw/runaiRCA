@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import random
+import time
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar, Token
 from typing import Any
@@ -25,6 +26,7 @@ _insight_cache: ContextVar[dict[str, str | None] | None] = ContextVar(
     "llm_insight_cache", default=None
 )
 _nat_client: ContextVar[Any | None] = ContextVar("nat_llm_client", default=None)
+_analysis_deadline: ContextVar[float | None] = ContextVar("analysis_deadline", default=None)
 _RETRY_STATUSES = {0, 429, 500, 502, 503, 504}
 
 
@@ -52,9 +54,7 @@ def insight_cache_key(*parts: object) -> str:
     return hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()
 
 
-async def cached_insight(
-    key: str, compute: Callable[[], Awaitable[str | None]]
-) -> str | None:
+async def cached_insight(key: str, compute: Callable[[], Awaitable[str | None]]) -> str | None:
     cache = _insight_cache.get()
     if cache is None:
         return await compute()
@@ -71,6 +71,30 @@ def set_nat_client(client: Any) -> Token:
 
 def reset_nat_client(token: Token) -> None:
     _nat_client.reset(token)
+
+
+def set_analysis_deadline(deadline_monotonic: float | None) -> Token:
+    """Bound every LLM transport call by the orchestrator's remaining budget."""
+    return _analysis_deadline.set(deadline_monotonic)
+
+
+def reset_analysis_deadline(token: Token) -> None:
+    _analysis_deadline.reset(token)
+
+
+def _analysis_time_remaining() -> float | None:
+    deadline = _analysis_deadline.get()
+    return None if deadline is None else deadline - time.monotonic()
+
+
+def _request_timeout(settings: Settings) -> float | None:
+    remaining = _analysis_time_remaining()
+    if remaining is not None and remaining <= 0:
+        return None
+    configured = float(settings.llm_request_timeout_seconds or 0)
+    if remaining is None:
+        return configured
+    return min(configured, remaining) if configured > 0 else remaining
 
 
 def usage_with_cost(settings: Settings, usage: dict[str, Any]) -> dict[str, Any]:
@@ -119,10 +143,9 @@ def _estimate_bucket_cost(pricing: dict[str, float] | None, bucket: dict[str, An
         return 0.0
     prompt_tokens = int(bucket.get("prompt_tokens") or 0)
     completion_tokens = int(bucket.get("completion_tokens") or 0)
-    return (
-        (prompt_tokens / 1_000_000) * pricing.get("prompt_per_mtok", 0.0)
-        + (completion_tokens / 1_000_000) * pricing.get("completion_per_mtok", 0.0)
-    )
+    return (prompt_tokens / 1_000_000) * pricing.get("prompt_per_mtok", 0.0) + (
+        completion_tokens / 1_000_000
+    ) * pricing.get("completion_per_mtok", 0.0)
 
 
 def _float(value: Any) -> float:
@@ -189,6 +212,9 @@ async def complete_with_error(
     selected_model = (model or settings.llm_model).strip()
     if not llm_configured(settings, selected_model):
         return None, "LLM is not configured"
+    remaining = _analysis_time_remaining()
+    if remaining is not None and remaining <= 0:
+        return None, "analysis deadline exhausted before LLM call"
     # NAT owns only the default app model; explicit stage model overrides stay on HTTP.
     # A NAT reply with no usable text falls back to the direct HTTP path (owner
     # decision after the langchain validation run: one empty reply must not
@@ -219,15 +245,24 @@ async def complete_with_error(
         payload["max_tokens"] = max_tokens
     response = None
     for attempt in range(3):
+        timeout = _request_timeout(settings)
+        if timeout is None or timeout <= 0:
+            return None, "analysis deadline exhausted during LLM retries"
         response = await post_json(
             url=f"{settings.llm_base_url}/chat/completions",
-            timeout_seconds=settings.llm_request_timeout_seconds,
+            timeout_seconds=timeout,
             json_body=payload,
             headers={"Authorization": f"Bearer {settings.llm_api_key}"},
         )
         if response.ok or response.status_code not in _RETRY_STATUSES or attempt == 2:
             break
-        await asyncio.sleep((0.25 * (2**attempt)) + random.uniform(0, 0.1))
+        delay = (0.25 * (2**attempt)) + random.uniform(0, 0.1)
+        remaining = _analysis_time_remaining()
+        if remaining is not None:
+            if remaining <= 0:
+                return None, "analysis deadline exhausted during LLM retries"
+            delay = min(delay, remaining)
+        await asyncio.sleep(delay)
     if not response.ok:
         _record_failed_call(selected_model)
         detail = " ".join(str(response.error or "").split())[:200]
@@ -268,13 +303,25 @@ async def _complete_with_nat_client(
     call_client = client.bind(**kwargs) if hasattr(client, "bind") else client
     for attempt in range(3):
         try:
-            response = await call_client.ainvoke(messages)
+            remaining = _analysis_time_remaining()
+            if remaining is not None:
+                if remaining <= 0:
+                    return None, "analysis deadline exhausted before NAT LLM call"
+                response = await asyncio.wait_for(call_client.ainvoke(messages), timeout=remaining)
+            else:
+                response = await call_client.ainvoke(messages)
             break
         except Exception as exc:  # noqa: BLE001 - preserve graceful LLM degradation
             if attempt == 2:
                 _record_failed_call(model)
                 return None, f"{type(exc).__name__}: {exc}"
-            await asyncio.sleep((0.25 * (2**attempt)) + random.uniform(0, 0.1))
+            delay = (0.25 * (2**attempt)) + random.uniform(0, 0.1)
+            remaining = _analysis_time_remaining()
+            if remaining is not None:
+                if remaining <= 0:
+                    return None, "analysis deadline exhausted during NAT LLM retries"
+                delay = min(delay, remaining)
+            await asyncio.sleep(delay)
     else:
         _record_failed_call(model)
         return None, "NAT LLM client failed"

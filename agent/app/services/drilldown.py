@@ -31,6 +31,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any
@@ -83,6 +84,7 @@ async def run_drilldowns(
     plan: InvestigationPlan | None,
     *,
     blackboard: Any = None,
+    deadline_monotonic: float | None = None,
 ) -> None:
     """Run every domain's drill-down loop concurrently. Never raises."""
     if not settings.enable_agent_drilldown or not llm_configured(
@@ -90,20 +92,43 @@ async def run_drilldowns(
     ):
         return
     registry = _domain_tools(settings)
-    tasks = [
-        _drill_one(
-            settings,
+    task_results = [
+        (
             result,
-            registry[result.agent],
-            target,
-            plan.for_collector(result.agent) if plan else None,
-            blackboard=blackboard,
+            asyncio.create_task(
+                _drill_one(
+                    settings,
+                    result,
+                    registry[result.agent],
+                    target,
+                    plan.for_collector(result.agent) if plan else None,
+                    blackboard=blackboard,
+                    deadline_monotonic=deadline_monotonic,
+                )
+            ),
         )
         for result in results
         if result.agent in registry and result.status != "unavailable"
     ]
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+    if not task_results:
+        return
+    tasks = {task: result for result, task in task_results}
+    remaining = None if deadline_monotonic is None else deadline_monotonic - time.monotonic()
+    done, pending = await asyncio.wait(
+        tasks,
+        timeout=None if remaining is None else max(0.0, remaining),
+    )
+    for task in pending:
+        task.cancel()
+        tasks[task].warnings.append(
+            f"{tasks[task].agent} drill-down stopped: shared evidence budget exhausted"
+        )
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    # Consume completed task exceptions: _drill_one is best-effort, but an
+    # unexpected BaseException must not leak out of the coordinator.
+    if done:
+        await asyncio.gather(*done, return_exceptions=True)
 
 
 async def _drill_one(
@@ -114,6 +139,7 @@ async def _drill_one(
     plan: InvestigationPlan | None,
     *,
     blackboard: Any = None,
+    deadline_monotonic: float | None = None,
 ) -> None:
     """One agent's adaptive think->query->observe loop over its own evidence."""
     masker = _drilldown_masker(settings)
@@ -127,6 +153,8 @@ async def _drill_one(
         # query: the declarative probe is the durable operational knowledge,
         # while the LLM decides what additional discriminator is worthwhile.
         for query in _declared_probe_queries(plan, tools, target):
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                return
             key = _query_fingerprint(query)
             seen_queries.add(key)
             await _run_query(
@@ -144,6 +172,11 @@ async def _drill_one(
             )
         step = 0
         while True:
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                result.warnings.append(
+                    f"{result.agent} drill-down stopped: shared evidence budget exhausted"
+                )
+                break
             step += 1
             user_prompt = masker.mask_text(
                 _user_prompt(result, target, plan, history, architecture, blackboard=blackboard)
@@ -160,8 +193,7 @@ async def _drill_one(
                 # agent and nobody notices drill-down never ran (the litellm
                 # provider incident). Surface it in the report warnings.
                 result.warnings.append(
-                    f"{result.agent} drill-down stopped at step {step}: "
-                    "LLM decision call failed"
+                    f"{result.agent} drill-down stopped at step {step}: LLM decision call failed"
                 )
                 break
             if not isinstance(decision, dict) or decision.get("action") != "query":
@@ -332,7 +364,11 @@ def _probe_target_values(target: AnalysisTarget) -> dict[str, str]:
         # Alert metadata is untrusted.  Reject query-breaking control characters
         # and nested template syntax; _resolve_probe_template then treats this
         # exactly like an unresolved value and skips the probe safely.
-        if "{{" in value or "}}" in value or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        if (
+            "{{" in value
+            or "}}" in value
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        ):
             value = ""
         values[name] = value
     return values
@@ -580,7 +616,12 @@ def _record_blackboard(blackboard: Any, result: CollectorResult, target: Analysi
         "",
     )
     try:
-        method(result.agent, result, entity=entity, timestamp=str(getattr(target, "fired_at", "") or ""))
+        method(
+            result.agent,
+            result,
+            entity=entity,
+            timestamp=str(getattr(target, "fired_at", "") or ""),
+        )
     except Exception:  # noqa: BLE001 - shared reasoning is advisory
         return
 
@@ -625,16 +666,10 @@ def _ontology_guidance(plan: InvestigationPlan | None) -> dict[str, Any]:
         "checks": strings("checks", 4),
         "interpretation": strings("interpretation", 4),
         "avoid": strings("avoid", 4),
-        "probes": [
-            item
-            for item in (directive.get("probes") or [])
-            if isinstance(item, dict)
-        ][:4],
+        "probes": [item for item in (directive.get("probes") or []) if isinstance(item, dict)][:4],
         "disconfirm": strings("disconfirm", 4),
         "competing_hypotheses": [
-            item
-            for item in (directive.get("competing_hypotheses") or [])
-            if isinstance(item, dict)
+            item for item in (directive.get("competing_hypotheses") or []) if isinstance(item, dict)
         ][:4],
         "candidate_family": str(directive.get("provisional_family") or ""),
         "collector": str(directive.get("collector") or ""),
@@ -776,9 +811,7 @@ def _implicated_architecture(
         name
         for name in implicated
         if not any(
-            other != name
-            and name.lower() in other.lower()
-            and rank_of[other] <= rank_of[name]
+            other != name and name.lower() in other.lower() and rank_of[other] <= rank_of[name]
             for other in implicated
         )
     ]

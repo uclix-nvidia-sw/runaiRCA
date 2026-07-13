@@ -34,25 +34,58 @@ jobs:
       - name: Install
         working-directory: agent
         run: pip install -e ".[dev]"
-      - name: Test
+      - name: Lint
+        working-directory: agent
+        run: >-
+          ruff check --select F,B,I
+          app/collectors/base.py
+          app/collectors/kubernetes.py
+          app/llm.py
+          app/services/drilldown.py
+          app/services/investigator.py
+          app/services/orchestrator.py
+          app/services/pipeline.py
+          ontology/ingest.py
+          tests/test_ingest_case_snapshot_projection.py
+          tests/test_controller_pod_resolution.py
+          tests/test_analysis_budget.py
+          tests/test_drilldown.py
+          tests/test_investigator.py
+      - name: Critical RCA regression tests
+        if: github.event_name == 'pull_request'
+        working-directory: agent
+        run: >-
+          pytest -q
+          tests/test_ingest_case_snapshot_projection.py
+          tests/test_controller_pod_resolution.py
+          tests/test_analysis_budget.py
+          tests/test_drilldown.py
+          tests/test_investigator.py
+      - name: Full test suite
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         working-directory: agent
         run: pytest -q
       - name: Eval gate
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         working-directory: agent
         run: python -m eval.run_eval --fixtures eval/fixtures.jsonl --min-top1 0.95
       - name: Eval holdout report
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         working-directory: agent
         continue-on-error: true
         run: python -m eval.run_eval --fixtures eval/fixtures_holdout.jsonl
       - name: Novel incident E2E output gate
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         working-directory: agent
         run: python -m eval.run_novel_incident_e2e_eval
       - name: NAT config validate
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         working-directory: agent
         run: |
           nat validate --config_file configs/runai_rca_engine.yml
           nat validate --config_file configs/runai_rca_eval.yml
       - name: NAT eval gate
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         working-directory: agent
         # Family fixtures exercise signature classification without live collector
         # artifacts. Harness safety is covered separately by its unit tests.
