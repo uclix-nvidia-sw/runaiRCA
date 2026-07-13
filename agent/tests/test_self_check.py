@@ -48,11 +48,25 @@ def test_no_llm_downgrades_when_canonical_reports_no_evidence():
     assert out["confidence"] == "low"
 
 
-def test_no_llm_keeps_confidence_when_canonical_evidence_present():
+def test_no_llm_keeps_confidence_when_canonical_evidence_is_scoped_and_present():
     settings = make_settings()
     results = [
         CollectorResult(
-            agent="kubernetes", status="ok", summary="Node condition DiskPressure=True; evictions"
+            agent="kubernetes",
+            status="ok",
+            summary="Node condition DiskPressure=True; evictions",
+            artifacts=[
+                AlertAnalysisArtifact(
+                    agent="kubernetes",
+                    source="kubernetes",
+                    type="warning_events",
+                    status="ok",
+                    summary="DiskPressure active during incident window",
+                    result={
+                        "observation": {"polarity": "present", "coverage": "scoped"}
+                    },
+                )
+            ],
         ),
         CollectorResult(agent="prometheus", status="ok", summary="disk saturated"),
     ]
@@ -76,7 +90,10 @@ def test_no_llm_keeps_confidence_when_canonical_artifact_has_evidence():
                     type="drilldown_query",
                     status="ok",
                     summary="1 row(s)",
-                    result={"message": "DiskPressure=True from node condition"},
+                    result={
+                        "message": "DiskPressure=True from node condition",
+                        "observation": {"polarity": "present", "coverage": "scoped"},
+                    },
                 )
             ],
         )
@@ -86,6 +103,34 @@ def test_no_llm_keeps_confidence_when_canonical_artifact_has_evidence():
 
     assert out["confidence"] == "high"
     assert out["caveat"] == ""
+
+
+def test_no_llm_downgrades_when_canonical_summary_is_only_partial_context():
+    settings = make_settings()
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary="DiskPressure appears in a current snapshot",
+            artifacts=[
+                AlertAnalysisArtifact(
+                    agent="kubernetes",
+                    source="kubernetes",
+                    type="cluster_api",
+                    status="ok",
+                    summary="current Kubernetes context",
+                    result={
+                        "observation": {"polarity": "unknown", "coverage": "partial"}
+                    },
+                )
+            ],
+        )
+    ]
+
+    out = _run(refute_top_cause(settings, _top(confidence="high"), results))
+
+    assert out["confidence"] == "medium"
+    assert out["caveat"]
 
 
 def test_no_llm_ignores_unavailable_canonical_artifact_as_evidence():

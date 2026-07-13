@@ -21,6 +21,7 @@ verbatim.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 
 from app.collectors.base import NO_EVIDENCE, CollectorResult, condition_observations
 from app.config import Settings
@@ -54,7 +55,13 @@ def _downgrade(confidence: str) -> str:
 
 
 def _canonical_has_evidence(family: str, results: list[CollectorResult]) -> bool:
-    """True when the family's canonical collector returned usable evidence."""
+    """True only when the canonical collector has scoped positive evidence.
+
+    The ranker already rejects context-only observations. The deterministic
+    self-check must use the same bar: otherwise a broad collector summary (or
+    a raw usage metric) can preserve confidence after the ranker correctly
+    refused to treat it as proof.
+    """
     rule = _FAMILY_RULES.get(family)
     if not rule:
         return True  # unknown family (e.g. insufficient_evidence) — nothing to refute
@@ -64,21 +71,26 @@ def _canonical_has_evidence(family: str, results: list[CollectorResult]) -> bool
             continue
         if r.status == "unavailable":
             return False
-        summary = (r.summary or "").strip()
-        if summary and summary != NO_EVIDENCE:
-            return True
         return any(_artifact_has_evidence(art) for art in getattr(r, "artifacts", []) or [])
     return False  # canonical collector did not even run
 
 
 def _artifact_has_evidence(art: object) -> bool:
-    if getattr(art, "status", "") not in ("ok", "partial"):
+    """Accept only an explicit scoped positive collector verdict.
+
+    Keyword-bearing summaries are deliberately excluded: a condition's name,
+    an HTTP success line, or a current snapshot is not a verified occurrence in
+    the incident window.
+    """
+    result = getattr(art, "result", None)
+    if not isinstance(result, Mapping):
         return False
-    summary = str(getattr(art, "summary", "") or "").strip()
-    return bool(
-        (summary and summary != NO_EVIDENCE)
-        or getattr(art, "result", None) is not None
-        or getattr(art, "highlights", None)
+    observation = result.get("observation")
+    if not isinstance(observation, Mapping):
+        return False
+    return (
+        str(observation.get("polarity") or "").strip().lower() == "present"
+        and str(observation.get("coverage") or "").strip().lower() == "scoped"
     )
 
 
