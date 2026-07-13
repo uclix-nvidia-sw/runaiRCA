@@ -9,6 +9,7 @@ from app.collectors.http_json import JsonResponse
 from app.collectors.kubernetes import (
     _collect_pod_logs,
     _filter_kubernetes_data,
+    _pod_log_observation,
     _warning_event_observation,
 )
 from app.collectors.postgres import _collect_postgres_checks, _postgres_result
@@ -200,6 +201,31 @@ async def test_kubernetes_logs_use_incident_since_time_and_previous_restart_log(
     assert len(logs) == 2
     assert all(call["params"]["sinceTime"] == "2026-07-10T00:55:00Z" for call in calls)
     assert [call["params"].get("previous") for call in calls] == [None, "true"]
+
+
+def test_kubernetes_pod_log_evidence_uses_only_timestamped_incident_lines() -> None:
+    time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    observation, entries = _pod_log_observation(
+        {
+            "container": "main",
+            "previous": True,
+            "lines": [
+                "2026-07-10T00:54:59Z before incident",
+                "2026-07-10T01:02:00Z OOMKilled",
+                "2026-07-10T01:15:01Z after incident",
+            ],
+        },
+        time_range=time_range,
+    )
+    unknown, no_entries = _pod_log_observation(
+        {"container": "main", "lines": ["untimestamped line"]}, time_range=time_range
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
+    assert observation["previous"] is True
+    assert entries == [{"timestamp": "2026-07-10T01:02:00Z", "line": "OOMKilled"}]
+    assert (unknown["polarity"], unknown["coverage"]) == ("unknown", "partial")
+    assert no_entries == []
 
 
 def test_kubernetes_events_are_filtered_to_the_incident_window() -> None:

@@ -1277,6 +1277,15 @@ class KubernetesCollector:
                 },
             )
         )
+        # Container logs are collected with ``sinceTime`` and can include a
+        # restarted container's ``previous`` instance. Keep them distinct from
+        # live YAML/describe/exec state. A tail-limited logs endpoint cannot
+        # prove absence, but timestamped lines inside the incident window are
+        # precise positive evidence.
+        artifacts.extend(
+            _pod_log_artifact(self.name, log, time_range=time_range)
+            for log in logs
+        )
         if target_pod_describe:
             describe_error = target_pod_describe.get("error")
             describe_events = target_pod_describe.get("events")
@@ -1387,6 +1396,91 @@ def _warning_event_observation(
         "event_count": len(warning_events),
         "observation_window": time_range or {},
     }
+
+
+def _pod_log_artifact(
+    agent: str, log: dict[str, object], *, time_range: dict[str, str] | None
+):
+    """Represent one Pod log request without turning a tail into a negative."""
+    observation, entries = _pod_log_observation(log, time_range=time_range)
+    previous = bool(log.get("previous"))
+    container = str(log.get("container") or "default")
+    label = f"previous {container}" if previous else container
+    polarity = str(observation["polarity"])
+    if polarity == "present":
+        summary = (
+            f"Kubernetes Pod log {label}: {len(entries)} timestamped line(s) "
+            "inside incident window."
+        )
+    elif polarity == "unavailable":
+        summary = f"Kubernetes Pod log {label}: log request was unavailable."
+    else:
+        summary = (
+            f"Kubernetes Pod log {label}: no timestamped line could be confirmed "
+            "inside incident window."
+        )
+    return artifact(
+        agent=agent,
+        source="kubernetes",
+        type="kubernetes_pod_log",
+        status="unavailable" if polarity == "unavailable" else "ok",
+        confidence="high" if polarity == "present" else "low",
+        title=f"Kubernetes · Pod log · {label}",
+        query=f"kubectl logs <pod> -c {container}" + (" --previous" if previous else ""),
+        summary=summary,
+        result={
+            "observation": observation,
+            "container": container,
+            "previous": previous,
+            "sample_entries": entries[:8],
+        },
+    )
+
+
+def _pod_log_observation(
+    log: dict[str, object], *, time_range: dict[str, str] | None
+) -> tuple[dict[str, object], list[dict[str, str]]]:
+    """Return only time-bounded log lines; logs API tails never prove absence."""
+    if log.get("error"):
+        polarity, coverage, entries = "unavailable", "unknown", []
+    elif not time_range:
+        polarity, coverage, entries = "unknown", "partial", []
+    else:
+        entries = _log_entries_in_window(log.get("lines"), time_range)
+        polarity, coverage = (
+            ("present", "scoped") if entries else ("unknown", "partial")
+        )
+    container = str(log.get("container") or "default")
+    predicate = f"kubernetes_pod_log:{'previous:' if log.get('previous') else ''}{container}"
+    return (
+        {
+            "kind": "kubernetes_pod_log",
+            "predicate": predicate,
+            "polarity": polarity,
+            "coverage": coverage,
+            "previous": bool(log.get("previous")),
+            "observation_window": time_range or {},
+        },
+        entries,
+    )
+
+
+def _log_entries_in_window(
+    lines: object, time_range: dict[str, str]
+) -> list[dict[str, str]]:
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None:
+        return []
+    entries: list[dict[str, str]] = []
+    for value in lines if isinstance(lines, list) else []:
+        line = str(value).strip()
+        timestamp, _, message = line.partition(" ")
+        observed_at = parse_incident_time(timestamp)
+        if observed_at is None or not (start <= observed_at <= end):
+            continue
+        entries.append({"timestamp": timestamp, "line": message or line})
+    return entries
 
 
 async def _collect_kubernetes_responses(
