@@ -170,6 +170,19 @@ def test_prometheus_up_marks_a_mixed_vector_with_any_down_target_present() -> No
     assert healthy["polarity"] == "absent"
 
 
+def test_prometheus_unbounded_empty_result_is_not_a_scoped_absence() -> None:
+    observation = prometheus._prometheus_query_observation(
+        {
+            "name": "container_restarts",
+            "series_count": 0,
+            "value_summary": {"numeric_sample_count": 0},
+        },
+        time_range=None,
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+
+
 def test_loki_query_observation_only_refutes_with_a_bounded_incident_window() -> None:
     time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
     absent = loki._loki_query_observation(

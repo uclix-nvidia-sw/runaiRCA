@@ -527,7 +527,12 @@ def _prometheus_query_observation(
         summary = value_summary if isinstance(value_summary, dict) else {}
         numeric_count = int(summary.get("numeric_sample_count") or 0)
         all_zero = summary.get("all_zero")
-        if series_count == 0:
+        if not time_range:
+            # An unbounded/current metric lookup can help an operator, but it
+            # cannot prove a signal was absent (or causal) during a historical
+            # incident. Keep every such answer as context-only.
+            polarity, coverage = "unknown", "partial"
+        elif series_count == 0:
             polarity, coverage = "absent", "scoped"
         elif numeric_count == 0:
             polarity, coverage = "unknown", "partial"
