@@ -184,6 +184,26 @@ def test_eligibility_rejects_unknown_support_and_limits_scoped_absence_to_refuta
     assert absent.eligibility.permits("contradict")
 
 
+def test_eligibility_keeps_partially_covered_positive_as_context_only() -> None:
+    partial = normalize_artifact(
+        _artifact(
+            summary="node log tail contains OOM",
+            result={
+                "observation": {
+                    "kind": "system_log_query",
+                    "predicate": "system_log_query",
+                    "polarity": "present",
+                    "coverage": "partial",
+                }
+            },
+        )
+    )
+
+    assert not partial.eligibility.permits("support")
+    assert not partial.eligibility.permits("contradict")
+    assert partial.eligibility.permits("context")
+
+
 def test_change_source_is_kubernetes_unless_collector_overrides_group() -> None:
     item = _artifact(source="change", agent="change", summary="deployment revision observed")
     board = Blackboard()

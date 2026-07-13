@@ -153,9 +153,10 @@ class EvidenceFact:
 class EvidenceEligibility:
     """Whether one observation may ground a typed reasoning link.
 
-    Availability gaps and unknown observations are useful operational context,
-    but are never proof.  An explicitly empty, fully scoped observation is
-    useful only to refute a hypothesis; it cannot be promoted into support.
+    Availability gaps and partially covered observations are useful operational
+    context, but are never proof. Only a positive observation with scoped
+    coverage may support a hypothesis; an explicitly empty, fully scoped
+    observation may only refute one.
     """
 
     support: bool
@@ -194,8 +195,10 @@ class EvidenceEligibility:
 
     @classmethod
     def from_fields(cls, polarity: str, coverage: str) -> EvidenceEligibility:
-        if polarity == "present":
+        if polarity == "present" and coverage == "scoped":
             return cls(True, True, True)
+        if polarity == "present":
+            return cls(False, False, True, "positive observation is not fully scoped")
         if polarity == "absent" and coverage == "scoped":
             return cls(False, True, True, "scoped absence may only refute")
         if polarity == "absent":
