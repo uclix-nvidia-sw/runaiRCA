@@ -1066,7 +1066,9 @@ async def test_drilldowns_cancel_at_shared_evidence_deadline(monkeypatch) -> Non
         [result],
         _target(),
         None,
-        deadline_monotonic=time.monotonic() + 0.02,
+        # Leave enough time for a busy CI event loop to schedule _drill_one
+        # before asserting that the shared deadline cancels it.
+        deadline_monotonic=time.monotonic() + 0.2,
     )
 
     assert started.is_set()
