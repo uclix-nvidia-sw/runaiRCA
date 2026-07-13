@@ -1243,6 +1243,7 @@ class KubernetesCollector:
             time_range=time_range,
             status=status,
             target_scoped=_warning_events_are_target_scoped(target),
+            queries_complete=_warning_event_queries_complete(responses),
         )
         artifacts.append(
             artifact(
@@ -1383,6 +1384,7 @@ def _warning_event_observation(
     time_range: dict[str, str] | None,
     status: str,
     target_scoped: bool = True,
+    queries_complete: bool = True,
 ) -> dict[str, object]:
     """Make filtered event presence/absence a typed historical predicate."""
     if status == "unavailable":
@@ -1391,12 +1393,19 @@ def _warning_event_observation(
         # A namespace-only event list says nothing about this alert's resource.
         # Do not turn its emptiness into a false negative for the incident.
         polarity, coverage = "unknown", "partial"
+    elif warning_events:
+        # One returned, target-correlated event is a fact even if another Event
+        # source failed. Query completeness is required only to turn EMPTY into
+        # an absence claim.
+        polarity, coverage = ("present", "scoped") if time_range else ("present", "partial")
+    elif not queries_complete:
+        polarity, coverage = "unknown", "partial"
     elif not time_range:
         # Without alert timestamps the Events API read remains useful context,
         # but an empty list is not a time-bounded negative.
-        polarity, coverage = ("present", "partial") if warning_events else ("unknown", "partial")
+        polarity, coverage = "unknown", "partial"
     else:
-        polarity, coverage = ("present", "scoped") if warning_events else ("absent", "scoped")
+        polarity, coverage = "absent", "scoped"
     return {
         "kind": "kubernetes_warning_events",
         "predicate": "kubernetes_warning_events",
@@ -1404,8 +1413,20 @@ def _warning_event_observation(
         "coverage": coverage,
         "event_count": len(warning_events),
         "target_scoped": target_scoped,
+        "queries_complete": queries_complete,
         "observation_window": time_range or {},
     }
+
+
+def _warning_event_queries_complete(responses: list[dict[str, object]]) -> bool:
+    """Whether every Event list included in this evidence pass returned successfully."""
+    event_responses = [
+        response
+        for response in responses
+        if str(response.get("name") or "") in {"pod_events", "namespace_events"}
+        or str(response.get("name") or "").startswith("runai_control_plane_events:")
+    ]
+    return bool(event_responses) and all(not response.get("error") for response in event_responses)
 
 
 def _pod_log_artifact(

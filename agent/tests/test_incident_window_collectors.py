@@ -12,6 +12,7 @@ from app.collectors.kubernetes import (
     _filter_kubernetes_data,
     _pod_log_observation,
     _warning_event_observation,
+    _warning_event_queries_complete,
 )
 from app.collectors.postgres import _collect_postgres_checks, _postgres_result
 from tests.test_orchestrator import make_settings, make_target
@@ -335,7 +336,36 @@ def test_kubernetes_warning_event_observation_is_a_scoped_negative_only_in_windo
     unscoped = _warning_event_observation(
         [], time_range=time_range, status="ok", target_scoped=False
     )
+    incomplete = _warning_event_observation(
+        [], time_range=time_range, status="partial", queries_complete=False
+    )
+    found_despite_gap = _warning_event_observation(
+        [{"reason": "Evicted"}],
+        time_range=time_range,
+        status="partial",
+        queries_complete=False,
+    )
     assert (unscoped["polarity"], unscoped["coverage"]) == ("unknown", "partial")
+    assert (incomplete["polarity"], incomplete["coverage"]) == ("unknown", "partial")
+    assert (found_despite_gap["polarity"], found_despite_gap["coverage"]) == ("present", "scoped")
+
+
+def test_kubernetes_warning_event_absence_requires_all_event_queries_to_succeed() -> None:
+    complete = _warning_event_queries_complete(
+        [
+            {"name": "pod_events", "error": None},
+            {"name": "runai_control_plane_events:runai", "error": None},
+        ]
+    )
+    incomplete = _warning_event_queries_complete(
+        [
+            {"name": "pod_events", "error": None},
+            {"name": "runai_control_plane_events:runai", "error": "HTTP 403"},
+        ]
+    )
+
+    assert complete is True
+    assert incomplete is False
 
 
 class _HistoryConnection:
