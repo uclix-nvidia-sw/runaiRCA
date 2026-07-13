@@ -3887,8 +3887,20 @@ def _gpu_model_from(target: AnalysisTarget, results: list[CollectorResult]) -> s
 
 
 def _stringify_result(result: CollectorResult) -> str:
-    parts = [result.summary or ""]
+    """Render only causally usable text for signature-specific extractors.
+
+    Structured collectors distinguish an observation's polarity and temporal
+    coverage.  Their broad summaries/details are often live topology or query
+    metadata, so letting those strings back into an extractor (such as Xid)
+    would bypass the scoped-evidence rule used by ``_observed_text``.  Legacy
+    collectors retain their existing text path until they publish observations.
+    """
     artifacts = getattr(result, "artifacts", []) or []
+    structured = any(_artifact_observation(art) is not None for art in artifacts)
+    if structured:
+        artifacts = [art for art in artifacts if _artifact_is_scoped_support(art)]
+
+    parts = [] if structured else [result.summary or ""]
     parts.extend(art.summary or "" for art in artifacts if _artifact_is_evidence(art))
     parts.extend(
         _evidence_leaf_text(art.result)
@@ -3896,7 +3908,7 @@ def _stringify_result(result: CollectorResult) -> str:
         if _artifact_is_evidence(art) and art.result
     )
     details = getattr(result, "details", {})
-    if details:
+    if details and not structured:
         parts.append(_evidence_leaf_text(details))
     return " ".join(parts)
 
