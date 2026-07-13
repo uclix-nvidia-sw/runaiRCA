@@ -473,9 +473,20 @@ def normalize_artifact(
     # unavailable; reducing that to an "error" keyword would make every agent
     # reinforce the same false positive during synthesis.
     metadata_polarity = _normalise_token(_clean_text(metadata("polarity")))
+    # Ontology probes evaluate a returned snapshot against declared tokens.
+    # Their supports/refutes verdict is useful diagnostic context, but it does
+    # not by itself establish that the snapshot covers a historical incident.
+    # Until a probe tool supplies its own typed observation, keep it out of
+    # hypothesis support/refutation rather than falling into the legacy prose
+    # inference below.
+    is_unscoped_ontology_probe = (
+        _normalise_token(_clean_text(raw.get("type"))) == "ontology_probe"
+        and metadata_polarity not in _POLARITIES
+    )
     resolved_polarity = (
         polarity
         or (metadata_polarity if metadata_polarity in _POLARITIES else None)
+        or ("unknown" if is_unscoped_ontology_probe else None)
         or _infer_polarity(status, summary, highlights, result)
     )
     if resolved_polarity not in _POLARITIES:
@@ -484,6 +495,7 @@ def normalize_artifact(
     resolved_coverage = (
         coverage
         or (metadata_coverage if metadata_coverage in _COVERAGE else None)
+        or ("partial" if is_unscoped_ontology_probe else None)
         or _infer_coverage(status, resolved_polarity)
     )
     if resolved_coverage not in _COVERAGE:

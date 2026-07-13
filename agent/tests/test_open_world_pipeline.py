@@ -128,7 +128,7 @@ def test_probe_verdict_links_only_explicit_hypothesis_without_promoting_it() -> 
 
     hypothesis = state.investigation_context["hypothesis_ledger"][0]
     assert hypothesis["status"] == "testing"
-    assert hypothesis["evidence_for"] == [probe_artifact.evidence_id]
+    assert "evidence_for" not in hypothesis
 
 
 def test_probe_verdict_never_falls_back_to_same_family_hypotheses() -> None:
@@ -173,7 +173,7 @@ def test_probe_verdict_never_falls_back_to_same_family_hypotheses() -> None:
     _link_probe_assessments_to_ledger(state)
 
     target, same_family = state.investigation_context["hypothesis_ledger"]
-    assert target["evidence_against"] == [probe_artifact.evidence_id]
+    assert "evidence_against" not in target
     assert "evidence_against" not in same_family
 
 
@@ -345,7 +345,7 @@ def test_reasoning_trace_v3_uses_assessment_hypothesis_ids_without_family_infere
         "verdict": "supports",
         "executed_at": "2026-07-13T00:01:00Z",
         "hypothesis_ids": ["H-exact"],
-        "evidence_ids": ["E01"],
+        "evidence_ids": [],
     }
 
     state.root_cause_candidates = [
