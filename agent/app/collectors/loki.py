@@ -55,6 +55,7 @@ class LokiCollector:
                 ],
             )
 
+        time_range = _incident_time_range(target)
         selector = _selector_for(target, plan)
         skipped_target_scope = ""
         # Loki rejects an empty stream selector `{}` with HTTP 400. When the alert has
@@ -122,7 +123,7 @@ class LokiCollector:
         if self._settings.loki_mcp_url:
             try:
                 query_results = await _collect_loki_mcp(
-                    self._settings, queries, _incident_time_range(target)
+                    self._settings, queries, time_range
                 )
                 used_mcp = True
             except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
@@ -154,7 +155,7 @@ class LokiCollector:
                     ],
                 )
             query_results = await _collect_loki_direct(
-                self._settings, queries, warnings, _incident_time_range(target)
+                self._settings, queries, warnings, time_range
             )
 
         successful = [item for item in query_results if not item["error"]]
@@ -197,11 +198,42 @@ class LokiCollector:
             "loki_url": self._settings.loki_url,
             "loki_mcp_url": self._settings.loki_mcp_url,
             "used_mcp": used_mcp,
+            "time_range": time_range,
             "queries": query_results,
         }
         missing_data = [] if successful else ["loki.query"]
         if auth_failed:
             missing_data.append("loki.auth")
+        # The aggregate card is useful context for an operator, but a matching
+        # line in one broad query must not be treated as proof for every log
+        # hypothesis.  Each query below has its own predicate, polarity and
+        # incident window so synthesis can distinguish e.g. "no OOM line" from
+        # "scheduler line present" instead of keyword-counting the whole blob.
+        collector_observation = {
+            "kind": "loki_collector_summary",
+            "predicate": "loki_collector_summary",
+            "polarity": "unknown",
+            "coverage": "partial",
+            "observation_window": time_range or {},
+        }
+        artifacts = [
+            artifact(
+                agent=self.name,
+                source="loki",
+                type="logql",
+                status=status,
+                confidence=confidence,
+                query="; ".join(item["query"] for item in query_results),
+                summary=summary,
+                result={**result, "observation": collector_observation},
+            )
+        ]
+        artifacts.extend(
+            _loki_query_artifact(
+                self.name, item, time_range=time_range
+            )
+            for item in query_results
+        )
         return CollectorResult(
             agent=self.name,
             status=status,
@@ -210,18 +242,7 @@ class LokiCollector:
             details=result,
             missing_data=missing_data,
             warnings=warnings,
-            artifacts=[
-                artifact(
-                    agent=self.name,
-                    source="loki",
-                    type="logql",
-                    status=status,
-                    confidence=confidence,
-                    query="; ".join(item["query"] for item in query_results),
-                    summary=summary,
-                    result=result,
-                )
-            ],
+            artifacts=artifacts,
         )
 
 
@@ -453,6 +474,66 @@ async def _mcp_query_loki(
 def _incident_time_range(target: AnalysisTarget) -> dict[str, str] | None:
     """Compatibility wrapper for callers/tests that imported Loki's helper."""
     return incident_time_range(target)
+
+
+def _loki_query_artifact(
+    agent: str, item: dict[str, object], *, time_range: dict[str, str] | None
+):
+    """Expose one LogQL query's scoped verdict as RCA-safe evidence."""
+    observation = _loki_query_observation(item, time_range=time_range)
+    name = str(item.get("name") or "logs")
+    polarity = str(observation["polarity"])
+    status = "unavailable" if polarity == "unavailable" else "ok"
+    confidence = "high" if polarity in {"present", "absent"} else "low"
+    if polarity == "present":
+        summary = f"Loki {name}: matching log lines were present in the incident window."
+    elif polarity == "absent":
+        summary = f"{NO_EVIDENCE} Loki {name}: no matching log lines in the incident window."
+    else:
+        summary = f"Loki {name}: query result was unavailable or outside an incident window."
+    return artifact(
+        agent=agent,
+        source="loki",
+        type="logql_signal",
+        status=status,
+        confidence=confidence,
+        title=f"Loki · {name}",
+        query=str(item.get("query") or ""),
+        summary=summary,
+        result={
+            "observation": observation,
+            "line_count": int(item.get("line_count") or 0),
+            "stream_count": int(item.get("stream_count") or 0),
+            "sample_entries": item.get("sample_entries") or [],
+            "time_range": time_range,
+        },
+    )
+
+
+def _loki_query_observation(
+    item: dict[str, object], *, time_range: dict[str, str] | None
+) -> dict[str, object]:
+    """Classify a LogQL result without making unbounded empty searches refute RCA."""
+    name = str(item.get("name") or "logs")
+    if item.get("error"):
+        polarity, coverage = "unavailable", "unknown"
+    elif not time_range:
+        # A current/live query can help an operator, but it cannot confirm that
+        # the same condition was absent at the historical incident time.
+        polarity, coverage = "unknown", "partial"
+    elif int(item.get("line_count") or 0) == 0:
+        polarity, coverage = "absent", "scoped"
+    else:
+        polarity, coverage = "present", "scoped"
+    return {
+        "kind": "loki_query",
+        "predicate": f"log:{name}",
+        "polarity": polarity,
+        "coverage": coverage,
+        "line_count": int(item.get("line_count") or 0),
+        "stream_count": int(item.get("stream_count") or 0),
+        "observation_window": time_range or {},
+    }
 
 
 # Grafana datasource uids are ^[a-zA-Z0-9\-_]{1,40}$; a numeric row id or a

@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from app.collectors import kubernetes, prometheus
+from app.collectors import kubernetes, loki, prometheus
 from app.collectors.http_json import JsonResponse
 from app.collectors.kubernetes import (
     _collect_pod_logs,
@@ -42,6 +42,38 @@ async def test_prometheus_direct_uses_incident_query_range(monkeypatch) -> None:
     assert all(call["params"]["start"] == "2026-07-10T00:55:00Z" for call in calls)
     assert all(call["params"]["end"] == "2026-07-10T01:15:00Z" for call in calls)
     assert all(call["params"]["step"] == "60" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_loki_emits_a_scoped_artifact_for_each_incident_query(monkeypatch) -> None:
+    async def fake_get_json(**_kwargs):
+        return JsonResponse(
+            url="http://loki/loki/api/v1/query_range",
+            status_code=200,
+            data={
+                "status": "success",
+                "data": {"result": [{"values": [["1", "failed scheduling trainer"]]}]},
+            },
+        )
+
+    monkeypatch.setattr(loki, "get_json", fake_get_json)
+    target = replace(
+        make_target(),
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    result = await loki.LokiCollector(
+        replace(make_settings(), loki_url="http://loki")
+    ).collect(target)
+
+    signals = [artifact for artifact in result.artifacts if artifact.type == "logql_signal"]
+    assert signals
+    assert all(artifact.result["observation"]["polarity"] == "present" for artifact in signals)
+    assert all(
+        artifact.result["observation"]["observation_window"]
+        == {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+        for artifact in signals
+    )
 
 
 @pytest.mark.asyncio
@@ -100,6 +132,25 @@ def test_prometheus_query_observation_keeps_zero_as_refuting_evidence() -> None:
     assert absent["polarity"] == "absent"
     assert absent["coverage"] == "scoped"
     assert present["polarity"] == "present"
+
+
+def test_loki_query_observation_only_refutes_with_a_bounded_incident_window() -> None:
+    time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    absent = loki._loki_query_observation(
+        {"name": "error_logs", "line_count": 0, "stream_count": 0}, time_range=time_range
+    )
+    present = loki._loki_query_observation(
+        {"name": "error_logs", "line_count": 2, "stream_count": 1}, time_range=time_range
+    )
+    live_empty = loki._loki_query_observation(
+        {"name": "error_logs", "line_count": 0, "stream_count": 0}, time_range=None
+    )
+
+    assert absent["polarity"] == "absent"
+    assert absent["coverage"] == "scoped"
+    assert present["polarity"] == "present"
+    assert live_empty["polarity"] == "unknown"
+    assert live_empty["coverage"] == "partial"
 
 
 @pytest.mark.asyncio
