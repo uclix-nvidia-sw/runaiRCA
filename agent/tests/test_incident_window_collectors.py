@@ -247,6 +247,30 @@ def test_restart_counter_requires_change_during_incident_window() -> None:
     assert (one_sample["polarity"], one_sample["coverage"]) == ("unknown", "partial")
 
 
+@pytest.mark.parametrize(
+    "name, all_zero",
+    [
+        ("container_memory", False),
+        ("container_cpu", False),
+        ("runai_queue_requested_gpus", False),
+        ("runai_project_allocated_gpus", True),
+    ],
+)
+def test_thresholdless_usage_metrics_are_context_not_rca_verdicts(
+    name: str, all_zero: bool
+) -> None:
+    observation = prometheus._prometheus_query_observation(
+        {
+            "name": name,
+            "series_count": 1,
+            "value_summary": {"numeric_sample_count": 3, "all_zero": all_zero},
+        },
+        time_range={"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"},
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+
+
 def test_prometheus_unbounded_empty_result_is_not_a_scoped_absence() -> None:
     observation = prometheus._prometheus_query_observation(
         {

@@ -23,6 +23,21 @@ from app.mcp_client import (
     mcp_tool_json,
 )
 
+# These queries expose useful operating context, but a raw non-zero reading has
+# no failure semantics on its own. They need an explicit threshold or a derived
+# comparison (for example request > allocation) before they can support/refute
+# a root-cause hypothesis.
+_CONTEXT_ONLY_METRICS = frozenset(
+    {
+        "container_memory",
+        "container_cpu",
+        "runai_queue_allocated_gpus",
+        "runai_queue_requested_gpus",
+        "runai_project_allocated_gpus",
+        "runai_project_requested_gpus",
+    }
+)
+
 
 class PrometheusCollector:
     name = "prometheus"
@@ -569,6 +584,8 @@ def _prometheus_query_observation(
             # An unbounded/current metric lookup can help an operator, but it
             # cannot prove a signal was absent (or causal) during a historical
             # incident. Keep every such answer as context-only.
+            polarity, coverage = "unknown", "partial"
+        elif name in _CONTEXT_ONLY_METRICS:
             polarity, coverage = "unknown", "partial"
         elif series_count == 0:
             polarity, coverage = "absent", "scoped"
