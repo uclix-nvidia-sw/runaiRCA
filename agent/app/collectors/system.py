@@ -459,6 +459,7 @@ class SystemCollector:
             "time_range": time_range,
             "sources": source_results,
         }
+        observation = _system_observation(source_results, time_range=time_range)
         missing_data = [] if successful else ["system_agent.query"]
         if time_range and not incident_successful:
             missing_data.append("system_agent.journal_time_window")
@@ -479,10 +480,43 @@ class SystemCollector:
                     confidence=confidence,
                     query=f"node={node} sources={','.join(_SOURCES)}",
                     summary=summary,
-                    result=result,
+                    result={**result, "observation": observation},
                 )
             ],
         )
+
+
+def _system_observation(
+    source_results: list[dict[str, object]], *, time_range: dict[str, str] | None
+) -> dict[str, object]:
+    """Classify only the source that actually covers the incident window."""
+    if time_range:
+        journal = next(
+            (item for item in source_results if item.get("source") == "journal"), None
+        )
+        if not isinstance(journal, dict) or journal.get("error"):
+            polarity, coverage = "unavailable", "unknown"
+        elif int(journal.get("error_count") or 0) > 0:
+            polarity, coverage = "present", "scoped"
+        else:
+            polarity, coverage = "absent", "scoped"
+    else:
+        successful = [item for item in source_results if not item.get("error")]
+        if not successful:
+            polarity, coverage = "unavailable", "unknown"
+        elif any(int(item.get("error_count") or 0) > 0 for item in successful):
+            # dmesg/syslog tails can be useful to an operator but do not prove
+            # timing for an alert with no bounded incident window.
+            polarity, coverage = "present", "partial"
+        else:
+            polarity, coverage = "unknown", "partial"
+    return {
+        "kind": "system_node_logs",
+        "predicate": "system_node_logs",
+        "polarity": polarity,
+        "coverage": coverage,
+        "observation_window": time_range or {},
+    }
 
 
 async def _llm_insight(settings: Settings, node: str, error_lines: list[str]) -> str | None:

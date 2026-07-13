@@ -121,6 +121,8 @@ async def test_detects_kernel_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     assert detail_sources["dmesg"]["error_count"] == 1
     assert detail_sources["journal"]["error_count"] == 0
     assert detail_sources["syslog"]["error_count"] == 1
+    observation = result.artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == ("present", "partial")
 
 
 @pytest.mark.asyncio
@@ -174,6 +176,8 @@ async def test_historical_incident_scopes_journal_and_ignores_current_tails(
         "start": "2026-01-02T02:55:00Z",
         "end": "2026-01-02T03:15:00Z",
     }
+    observation = result.artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == ("absent", "scoped")
 
 
 @pytest.mark.asyncio
