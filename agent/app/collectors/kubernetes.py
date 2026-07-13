@@ -1223,9 +1223,60 @@ class KubernetesCollector:
                 confidence=confidence,
                 query="; ".join(item["path"] for item in responses),
                 summary=summary,
-                result=details,
+                # The broad sweep includes live Pod/Node snapshots. Keep it
+                # available to operators, but do not let a current-state
+                # summary masquerade as a historical root-cause predicate.
+                result={
+                    **details,
+                    "observation": {
+                        "kind": "kubernetes_collector_summary",
+                        "predicate": "kubernetes_collector_summary",
+                        "polarity": "unknown",
+                        "coverage": "partial",
+                    },
+                },
             )
         ]
+        event_observation = _warning_event_observation(
+            warning_events, time_range=time_range, status=status
+        )
+        artifacts.append(
+            artifact(
+                agent=self.name,
+                source="kubernetes",
+                type="kubernetes_warning_events",
+                status="unavailable" if event_observation["polarity"] == "unavailable" else "ok",
+                confidence=(
+                    "high"
+                    if event_observation["polarity"] in {"present", "absent"}
+                    else "low"
+                ),
+                title=ko_en(
+                    self._settings,
+                    "인시던트 시간창 Warning 이벤트",
+                    "Incident-window Warning events",
+                ),
+                query=kubectl_repr("events", namespace=target.namespace),
+                summary=ko_en(
+                    self._settings,
+                    (
+                        f"인시던트 시간창 Warning 이벤트 {len(warning_events)}건을 확인했습니다."
+                        if warning_events
+                        else "인시던트 시간창에 일치하는 Warning 이벤트가 없습니다."
+                    ),
+                    (
+                        f"Collected {len(warning_events)} Warning event(s) in the incident window."
+                        if warning_events
+                        else "No matching Warning events in the incident window."
+                    ),
+                ),
+                result={
+                    "observation": event_observation,
+                    "events": warning_events,
+                    "time_range": time_range,
+                },
+            )
+        )
         if target_pod_describe:
             describe_error = target_pod_describe.get("error")
             describe_events = target_pod_describe.get("events")
@@ -1251,7 +1302,17 @@ class KubernetesCollector:
                             f"Collected full Pod YAML and {event_count} incident-window event(s).",
                         )
                     ),
-                    result=target_pod_describe,
+                    # YAML is a live inspection; its filtered events are
+                    # represented by the dedicated historical event artifact.
+                    result={
+                        **target_pod_describe,
+                        "observation": {
+                            "kind": "kubernetes_pod_snapshot",
+                            "predicate": "kubernetes_pod_snapshot",
+                            "polarity": "unknown",
+                            "coverage": "partial",
+                        },
+                    },
                 )
             )
         if exec_probes:
@@ -1263,7 +1324,9 @@ class KubernetesCollector:
                     type="pod_exec",
                     status="partial" if exec_errors else "ok",
                     confidence="high" if not exec_errors else "medium",
-                    title=ko_en(self._settings, "컨테이너 읽기 전용 exec", "Read-only container exec"),
+                    title=ko_en(
+                        self._settings, "컨테이너 읽기 전용 exec", "Read-only container exec"
+                    ),
                     query="; ".join(
                         f"kubectl exec {target.pod} -n {target.namespace} -- {probe['command']}"
                         for probe in exec_probes
@@ -1277,7 +1340,15 @@ class KubernetesCollector:
                             f"Executed {len(exec_probes)} read-only diagnostic command(s).",
                         )
                     ),
-                    result=exec_probes,
+                    result={
+                        "probes": exec_probes,
+                        "observation": {
+                            "kind": "kubernetes_live_exec",
+                            "predicate": "kubernetes_live_exec",
+                            "polarity": "unknown",
+                            "coverage": "partial",
+                        },
+                    },
                 )
             )
 
@@ -1291,6 +1362,31 @@ class KubernetesCollector:
             warnings=warnings,
             artifacts=artifacts,
         )
+
+
+def _warning_event_observation(
+    warning_events: list[dict[str, object]],
+    *,
+    time_range: dict[str, str] | None,
+    status: str,
+) -> dict[str, object]:
+    """Make filtered event presence/absence a typed historical predicate."""
+    if status == "unavailable":
+        polarity, coverage = "unavailable", "unknown"
+    elif not time_range:
+        # Without alert timestamps the Events API read remains useful context,
+        # but an empty list is not a time-bounded negative.
+        polarity, coverage = ("present", "partial") if warning_events else ("unknown", "partial")
+    else:
+        polarity, coverage = ("present", "scoped") if warning_events else ("absent", "scoped")
+    return {
+        "kind": "kubernetes_warning_events",
+        "predicate": "kubernetes_warning_events",
+        "polarity": polarity,
+        "coverage": coverage,
+        "event_count": len(warning_events),
+        "observation_window": time_range or {},
+    }
 
 
 async def _collect_kubernetes_responses(

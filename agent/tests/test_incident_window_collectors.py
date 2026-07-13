@@ -6,7 +6,11 @@ import pytest
 
 from app.collectors import kubernetes, prometheus
 from app.collectors.http_json import JsonResponse
-from app.collectors.kubernetes import _collect_pod_logs, _filter_kubernetes_data
+from app.collectors.kubernetes import (
+    _collect_pod_logs,
+    _filter_kubernetes_data,
+    _warning_event_observation,
+)
 from app.collectors.postgres import _collect_postgres_checks
 from tests.test_orchestrator import make_settings, make_target
 
@@ -146,6 +150,16 @@ def test_kubernetes_events_are_filtered_to_the_incident_window() -> None:
     filtered = _filter_kubernetes_data("pod_events", data, target)
 
     assert [item["reason"] for item in filtered["items"]] == ["Inside", "SeriesInside"]
+
+
+def test_kubernetes_warning_event_observation_is_a_scoped_negative_only_in_window() -> None:
+    time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+
+    absent = _warning_event_observation([], time_range=time_range, status="ok")
+    unbounded = _warning_event_observation([], time_range=None, status="ok")
+
+    assert (absent["polarity"], absent["coverage"]) == ("absent", "scoped")
+    assert (unbounded["polarity"], unbounded["coverage"]) == ("unknown", "partial")
 
 
 class _HistoryConnection:
