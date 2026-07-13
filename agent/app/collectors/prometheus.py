@@ -458,6 +458,7 @@ def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
                     "min": min(numeric),
                     "max": max(numeric),
                     "last": numeric[-1],
+                    "zero_sample_count": sum(value == 0 for value in numeric),
                     "nonzero_sample_count": sum(value != 0 for value in numeric),
                     "all_zero": all(value == 0 for value in numeric),
                 }
@@ -472,6 +473,7 @@ def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
             {
                 "min": min(all_values),
                 "max": max(all_values),
+                "zero_sample_count": sum(value == 0 for value in all_values),
                 "nonzero_sample_count": sum(value != 0 for value in all_values),
                 "all_zero": all(value == 0 for value in all_values),
             }
@@ -530,8 +532,16 @@ def _prometheus_query_observation(
         elif numeric_count == 0:
             polarity, coverage = "unknown", "partial"
         elif name == "prometheus_up":
-            # The up metric is inverted: 0 is the observed scrape failure.
-            polarity = "present" if bool(all_zero) else "absent"
+            # The up metric is inverted: ANY zero is an observed scrape
+            # failure. A mixed vector (some targets up, one target down) must
+            # not be misclassified as healthy just because it is not all-zero.
+            zero_count = summary.get("zero_sample_count")
+            try:
+                has_zero = int(zero_count) > 0
+            except (TypeError, ValueError):
+                # Backward compatibility for previously stored summaries.
+                has_zero = all_zero is True or summary.get("min") == 0
+            polarity = "present" if has_zero else "absent"
             coverage = "scoped"
         elif all_zero is True:
             polarity, coverage = "absent", "scoped"
@@ -543,6 +553,11 @@ def _prometheus_query_observation(
         "polarity": polarity,
         "coverage": coverage,
         "series_count": int(item.get("series_count") or 0),
+        "zero_sample_count": (
+            (item.get("value_summary") or {}).get("zero_sample_count")
+            if isinstance(item.get("value_summary"), dict)
+            else 0
+        ),
         "observation_window": time_range or {},
     }
 

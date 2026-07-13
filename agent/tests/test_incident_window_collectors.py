@@ -109,6 +109,7 @@ async def test_prometheus_records_zero_and_peak_values_for_evidence(monkeypatch)
     assert summary["min"] == 0.0
     assert summary["max"] == 2.5
     assert summary["all_zero"] is False
+    assert summary["zero_sample_count"] == 2
     assert summary["series"][0]["last"] == 0.0
     assert summary["series"][0]["nonzero_sample_count"] == 1
 
@@ -134,6 +135,38 @@ def test_prometheus_query_observation_keeps_zero_as_refuting_evidence() -> None:
     assert absent["polarity"] == "absent"
     assert absent["coverage"] == "scoped"
     assert present["polarity"] == "present"
+
+
+def test_prometheus_up_marks_a_mixed_vector_with_any_down_target_present() -> None:
+    up_failure = prometheus._prometheus_query_observation(
+        {
+            "name": "prometheus_up",
+            "series_count": 2,
+            "value_summary": {
+                "numeric_sample_count": 4,
+                "zero_sample_count": 1,
+                "all_zero": False,
+                "min": 0.0,
+            },
+        },
+        time_range={"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"},
+    )
+    healthy = prometheus._prometheus_query_observation(
+        {
+            "name": "prometheus_up",
+            "series_count": 2,
+            "value_summary": {
+                "numeric_sample_count": 4,
+                "zero_sample_count": 0,
+                "all_zero": False,
+                "min": 1.0,
+            },
+        },
+        time_range={"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"},
+    )
+
+    assert up_failure["polarity"] == "present"
+    assert healthy["polarity"] == "absent"
 
 
 def test_loki_query_observation_only_refutes_with_a_bounded_incident_window() -> None:
