@@ -165,6 +165,19 @@ async def test_historical_incident_uses_its_own_change_window(
     }
     assert [change["reason"] for change in result.details["changes"]] == ["DuringIncident"]
     assert "start=2026-01-02T02:55:00Z" in result.artifacts[0].query
+    observation = result.artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
+
+
+def test_live_change_window_remains_context_only() -> None:
+    observation = change_mod._collector_change_observation(
+        changes=[{"kind": "PodCreated"}],
+        time_range={"start": "2026-07-13T00:00:00Z", "end": "2026-07-13T01:00:00Z"},
+        historical_window=False,
+        warnings=[],
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("present", "partial")
 
 
 @pytest.mark.asyncio

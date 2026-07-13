@@ -448,6 +448,12 @@ class ChangeCollector:
         changes.sort(key=lambda c: c.get("timestamp") or "", reverse=True)
 
         if not changes:
+            observation = _collector_change_observation(
+                changes=[],
+                time_range=time_range,
+                historical_window=historical_window,
+                warnings=warnings,
+            )
             result = self._empty(
                 f"{NO_EVIDENCE} "
                 + ko_en(
@@ -463,7 +469,9 @@ class ChangeCollector:
                     "namespace": namespace,
                     "node": node,
                     "time_range": time_range,
+                    "historical_window": historical_window,
                 },
+                observation=observation,
             )
             self._cache[cache_key] = result
             return result
@@ -478,6 +486,7 @@ class ChangeCollector:
             "node": node,
             "dependency_namespaces": dep_namespaces,
             "time_range": time_range,
+            "historical_window": historical_window,
             "window_seconds": window_seconds,
             "changes": changes,
             "insight": insight,
@@ -502,7 +511,15 @@ class ChangeCollector:
                         f"start={time_range['start']} end={time_range['end']}"
                     ),
                     summary=summary,
-                    result=details,
+                    result={
+                        **details,
+                        "observation": _collector_change_observation(
+                            changes=changes,
+                            time_range=time_range,
+                            historical_window=historical_window,
+                            warnings=warnings,
+                        ),
+                    },
                 )
             ],
         )
@@ -516,6 +533,7 @@ class ChangeCollector:
         missing: list[str],
         warnings: list[str] | None = None,
         details: dict | None = None,
+        observation: dict | None = None,
     ) -> CollectorResult:
         return CollectorResult(
             agent=self.name,
@@ -533,7 +551,10 @@ class ChangeCollector:
                     status="unavailable" if missing else "partial",
                     confidence="low",
                     summary=summary,
-                    result=details or {},
+                    result={
+                        **(details or {}),
+                        **({"observation": observation} if observation else {}),
+                    },
                 )
             ],
         )
@@ -825,6 +846,36 @@ class ChangeCollector:
             reverse=True,
         )
         return events[:10]
+
+
+def _collector_change_observation(
+    *,
+    changes: list[dict],
+    time_range: dict[str, str],
+    historical_window: bool,
+    warnings: list[str],
+) -> dict[str, object]:
+    """State whether target-scope change evidence is truly incident-bounded."""
+    if not historical_window:
+        # The live one-hour fallback helps an operator but cannot establish a
+        # trigger for an alert with no timestamp.
+        polarity, coverage = ("present", "partial") if changes else ("unknown", "partial")
+    elif warnings:
+        # A failed resource class leaves the historical sweep incomplete; don't
+        # make an empty/partial result refute a lifecycle-change hypothesis.
+        polarity, coverage = ("present", "partial") if changes else ("unknown", "partial")
+    elif changes:
+        polarity, coverage = "present", "scoped"
+    else:
+        polarity, coverage = "absent", "scoped"
+    return {
+        "kind": "kubernetes_change_window",
+        "predicate": "kubernetes_change_window",
+        "polarity": polarity,
+        "coverage": coverage,
+        "change_count": len(changes),
+        "observation_window": time_range,
+    }
 
 
 def _deterministic_summary(changes: list[dict], namespace: str) -> str:
