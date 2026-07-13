@@ -1,0 +1,66 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Run:ai RCA Backend API",
+    "version": "0.1.56",
+    "description": "Versioned HTTP contract for the Run:ai RCA Backend. Responses use { data: ... } unless an operation states otherwise."
+  },
+  "servers": [{ "url": "/" }],
+  "tags": [
+    { "name": "Incidents" },
+    { "name": "Alerts" },
+    { "name": "Analysis" },
+    { "name": "Knowledge" },
+    { "name": "Operations" }
+  ],
+  "paths": {
+    "/healthz": { "get": { "tags": ["Operations"], "summary": "Read backend health", "responses": { "200": { "description": "Healthy" } } } },
+    "/webhook/alertmanager": { "post": { "tags": ["Alerts"], "summary": "Accept an Alertmanager webhook", "responses": { "202": { "description": "Accepted" }, "400": { "$ref": "#/components/responses/Error" } } } },
+    "/api/v1/incidents": { "get": { "tags": ["Incidents"], "summary": "List incidents", "parameters": [{ "$ref": "#/components/parameters/IncidentView" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
+    "/api/v1/incidents/{id}": { "get": { "tags": ["Incidents"], "summary": "Get an incident", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" }, "404": { "$ref": "#/components/responses/Error" } } }, "delete": { "tags": ["Incidents"], "summary": "Trash or permanently delete an incident", "parameters": [{ "$ref": "#/components/parameters/ID" }, { "name": "permanent", "in": "query", "schema": { "type": "boolean" } }], "responses": { "200": { "$ref": "#/components/responses/Envelope" }, "404": { "$ref": "#/components/responses/Error" } } } },
+    "/api/v1/incidents/{id}/analyze": { "post": { "tags": ["Analysis"], "summary": "Start an incident analysis", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "202": { "$ref": "#/components/responses/Envelope" }, "409": { "$ref": "#/components/responses/Error" } } } },
+    "/api/v1/incidents/{id}/resolve": { "post": { "tags": ["Incidents"], "summary": "Toggle operator RCA approval", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
+    "/api/v1/incidents/{id}/{action}": { "post": { "tags": ["Incidents"], "summary": "Archive, unarchive, restore, vote, or comment on an incident", "parameters": [{ "$ref": "#/components/parameters/ID" }, { "name": "action", "in": "path", "required": true, "schema": { "enum": ["archive", "unarchive", "restore", "vote", "comments", "feedback"] } }], "responses": { "200": { "$ref": "#/components/responses/Envelope" }, "404": { "$ref": "#/components/responses/Error" } } } },
+    "/api/v1/alerts": { "get": { "tags": ["Alerts"], "summary": "List alerts", "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
+    "/api/v1/alerts/{id}": { "get": { "tags": ["Alerts"], "summary": "Get an alert", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" }, "404": { "$ref": "#/components/responses/Error" } } } },
+    "/api/v1/alerts/{id}/{action}": { "post": { "tags": ["Alerts"], "summary": "Vote, comment, or give feedback on an alert", "parameters": [{ "$ref": "#/components/parameters/ID" }, { "name": "action", "in": "path", "required": true, "schema": { "enum": ["vote", "comments", "feedback"] } }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
+    "/api/v1/embeddings/search": { "post": { "tags": ["Analysis"], "summary": "Search similar RCA memory", "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
+    "/api/v1/analysis-runs": { "get": { "tags": ["Analysis"], "summary": "List analysis runs", "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
+    "/api/v1/analysis-runs/{id}/evaluation": { "get": { "tags": ["Analysis"], "summary": "Get an analysis evaluation", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } }, "put": { "tags": ["Analysis"], "summary": "Save an analysis evaluation", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
+    "/api/v1/analysis-runs/{id}/progress": { "post": { "tags": ["Analysis"], "summary": "Append analysis progress", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "202": { "$ref": "#/components/responses/Envelope" } } } },
+    "/api/v1/knowledge-candidates": { "get": { "tags": ["Knowledge"], "summary": "List knowledge candidates", "parameters": [{ "name": "status", "in": "query", "schema": { "type": "string" } }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
+    "/api/v1/knowledge-candidates/{id}": { "get": { "tags": ["Knowledge"], "summary": "Get a knowledge candidate", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" }, "404": { "$ref": "#/components/responses/Error" } } } },
+    "/api/v1/knowledge-candidates/{id}/decision": { "post": { "tags": ["Knowledge"], "summary": "Approve, shadow, activate, or reject a candidate", "parameters": [{ "$ref": "#/components/parameters/ID" }], "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/KnowledgeDecision" }, "example": { "action": "shadow", "actor": "on-call@example.com", "note": "Observe before activation." } } } }, "responses": { "200": { "$ref": "#/components/responses/Envelope" }, "400": { "$ref": "#/components/responses/Error" }, "409": { "$ref": "#/components/responses/Error" }, "422": { "$ref": "#/components/responses/Error" } } } },
+    "/api/v1/knowledge-packages": { "get": { "tags": ["Knowledge"], "summary": "List knowledge packages", "parameters": [{ "name": "include_retired", "in": "query", "schema": { "type": "boolean", "default": false } }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
+    "/api/v1/knowledge-packages/{id}": { "get": { "tags": ["Knowledge"], "summary": "Get a knowledge package", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" }, "404": { "$ref": "#/components/responses/Error" } } } },
+    "/api/v1/knowledge-packages/{id}/retire": { "post": { "tags": ["Knowledge"], "summary": "Retire a knowledge package", "parameters": [{ "$ref": "#/components/parameters/ID" }], "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuditNote" } } } }, "responses": { "200": { "$ref": "#/components/responses/Envelope" }, "409": { "$ref": "#/components/responses/Error" } } } },
+    "/api/v1/knowledge/runtime-snapshot": { "get": { "tags": ["Knowledge"], "summary": "Read the active runtime knowledge snapshot", "responses": { "200": { "$ref": "#/components/responses/KnowledgeRuntimeSnapshot" }, "304": { "description": "Not modified" } } } },
+    "/api/v1/knowledge/probe-metrics": { "get": { "tags": ["Knowledge"], "summary": "Read aggregated trace-v3 probe metrics", "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
+    "/api/v1/stats/recurrence": { "get": { "tags": ["Operations"], "summary": "Read recurrence statistics", "parameters": [{ "$ref": "#/components/parameters/Days" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
+    "/api/v1/stats/llm-spend": { "get": { "tags": ["Operations"], "summary": "Read LLM spend statistics", "parameters": [{ "$ref": "#/components/parameters/Days" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
+    "/api/v1/stats/kpi": { "get": { "tags": ["Operations"], "summary": "Read RCA KPI statistics", "parameters": [{ "$ref": "#/components/parameters/Days" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
+    "/api/v1/events": { "get": { "tags": ["Operations"], "summary": "Open the server-sent events stream", "responses": { "200": { "description": "text/event-stream" } } } },
+    "/api/v1/chat": { "post": { "tags": ["Analysis"], "summary": "Chat with the RCA assistant", "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
+    "/api/v1/chat/conversations": { "get": { "tags": ["Analysis"], "summary": "List chat conversations", "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
+    "/api/v1/chat/conversations/{id}": { "delete": { "tags": ["Analysis"], "summary": "Delete a chat conversation", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "204": { "description": "Deleted" } } } }
+  },
+  "components": {
+    "parameters": {
+      "ID": { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+      "Days": { "name": "days", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 90, "default": 7 } },
+      "IncidentView": { "name": "view", "in": "query", "schema": { "type": "string", "enum": ["active", "archived", "trash"], "default": "active" } }
+    },
+    "schemas": {
+      "AuditNote": { "type": "object", "properties": { "actor": { "type": "string" }, "note": { "type": "string" } } },
+      "KnowledgeDecision": { "allOf": [{ "$ref": "#/components/schemas/AuditNote" }, { "type": "object", "required": ["action"], "properties": { "action": { "type": "string", "enum": ["approve", "shadow", "activate", "reject"] } } }] },
+      "Envelope": { "type": "object", "required": ["data"], "properties": { "data": {} } },
+      "Error": { "type": "object", "properties": { "error": { "type": "string" } } },
+      "KnowledgeRuntimeSnapshot": { "type": "object", "required": ["revision", "packages"], "properties": { "revision": { "type": "string" }, "packages": { "type": "array", "items": { "type": "object" } } } }
+    },
+    "responses": {
+      "Envelope": { "description": "Successful envelope response", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Envelope" } } } },
+      "Error": { "description": "Error response", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "KnowledgeRuntimeSnapshot": { "description": "Active runtime snapshot", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/KnowledgeRuntimeSnapshot" } } } }
+    }
+  }
+}

@@ -23,8 +23,9 @@ Collectors (each owns one domain):
 - Change collector — "what changed?" around the alert window
 
 `configs/runai_rca_engine.yml` is the NeMo Agent Toolkit workflow used as the
-in-process orchestration engine. It declares the six RCA pipeline stages as NAT
-functions and runs them through the `runai_rca_pipeline` controller.
+in-process orchestration engine. It declares the seven RCA pipeline stages
+(`enrich`, `plan`, `evidence`, `rank`, `self_check`, `synthesize`, and `harness`)
+as NAT functions and runs them through the `runai_rca_pipeline` controller.
 Pipeline switches: `ENABLE_INVESTIGATION_LOOP`, `ENABLE_AGENT_DRILLDOWN`,
 `ANALYSIS_DEADLINE_SECONDS` (default 1500s) — full list in the
 [Configuration Reference](../docs/CONFIGURATION.md).

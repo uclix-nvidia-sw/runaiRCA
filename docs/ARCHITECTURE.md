@@ -126,9 +126,9 @@ separate agent. Full detail: [Knowledge Base](KNOWLEDGE-BASE.md).
   `submitted_to`, `grouped_into`, `indicates`, `depends_on`, `leads_to`, ...),
   with 15 root-cause families modeled as `sub` types.
 - **Ingestion** (`agent/ontology/ingest.py`, CronJob): a deterministic projection
-  of resolved `incidents`/`alerts` into the graph after a grace window. Optionally
-  review-gated (`requireReview`) and can promote operator-confirmed RCAs into
-  reusable knowledge (`--promote-knowledge`).
+  of Dashboard-approved, resolved `incidents`/`alerts` into the graph after a grace
+  window (`requireApproval=true` by default). It can promote operator-confirmed RCAs
+  into reusable knowledge (`--promote-knowledge`).
 - **Enrichment** (`agent/app/services/kg_enrichment.py`): the orchestrator queries
   the graph for facts the flat collectors miss — node blast radius, prior
   same-alert incidents with their stored RCA (`enrich`), and graph-derived

@@ -115,8 +115,9 @@ Helm 차트는 Loki 자격 증명 값을 노출하지 않습니다.
 
 NeMo Agent Toolkit 워크플로:
 
-- `agent/configs/runai_rca_engine.yml`이 런타임 워크플로입니다. 여섯 RCA 파이프라인
-  단계를 NAT 함수로 선언하고 인프로세스 `runai_rca_pipeline` 컨트롤러로 실행합니다.
+- `agent/configs/runai_rca_engine.yml`이 런타임 워크플로입니다. 일곱 RCA 파이프라인
+  단계(`enrich`, `plan`, `evidence`, `rank`, `self_check`, `synthesize`, `harness`)를 NAT
+  함수로 선언하고 인프로세스 `runai_rca_pipeline` 컨트롤러로 실행합니다.
   분석 중 기본 LLM 전송을 NAT가 소유하게 하려면 환경 변수나 Helm Secret 값으로
   `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`를 제공하세요.
 - `NAT_CONFIG_FILE`은 에이전트 이미지에 고정 경로로 포함된 내부 값입니다. 배포에서
@@ -168,6 +169,8 @@ helm upgrade --install runai-rca charts/runai-rca \
 | `agent.env.*TimeoutSeconds` | Kubernetes, Run:ai, Prometheus, Loki, Postgres의 요청/런타임 타임아웃 |
 | `agent.env.enableRcaOutputHarness` / `maxRcaRepairAttempts` / `rcaHarnessPassScore` | 최종 RCA 하네스 스위치, 수정 횟수, 품질 기준 |
 | `typedb.ingest.requireApproval` | Dashboard 승인(`user_approved_at`) 인시던트만 적재. 기본 `true`; `requireReview`는 deprecated |
+| `typedb.traceV3Backfill.enabled` / `batchSize` / `maxBatches` | 승인된 trace-v3 조사 기록을 TypeDB에 멱등적으로 투영합니다. legacy v1/v2 기록은 변환하지 않습니다. `maxBatches=0`은 모든 페이지를 처리합니다. |
+| `typedb.packageMirror.enabled` / `schedule` / `limit` | Backend knowledge package를 TypeDB에 자문용으로 복사합니다. 기본 스케줄은 매시 정각(`0 * * * *`)이며, 승인·활성화의 기준은 여전히 Backend입니다. |
 | `agent.env.kubernetesListLimit` / `agent.env.lokiQueryLimit` | Kubernetes 목록 호출과 Loki 로그 쿼리 그룹의 증거 볼륨 제어 |
 | `agent.env.troubleshootingCasesFile` / `agent.env.agentSoulsFile` | 주입되는 문제 해결 메모리와 에이전트 역할 계약의 경로 |
 | `agent.env.maskingRegexListJson` / `builtinRedaction*` | 클러스터별 시크릿 마스킹 정규식과 내장 레닥션 활성화/해시 제어 |
