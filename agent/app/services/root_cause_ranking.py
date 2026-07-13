@@ -157,36 +157,21 @@ def _node_condition_present(results: list[CollectorResult]) -> bool:
     is defeated because the kubernetes collector embeds the RAW node object in
     ``details["queries"]``, and a HEALTHY node object still literally contains
     "DiskPressure"/"MemoryPressure" types and "kubelet has no disk pressure"
-    messages. So instead we:
-      1. Trust the kubernetes collector's ALREADY-FILTERED structured signal
-         (``details["node_conditions"]`` is abnormal-only; a healthy node
-         collapses to a ``node_conditions_healthy`` marker), and
-      2. fall back to a NEGATION-AWARE keyword scan over a SCOPED text (summary +
-         warning events for kubernetes, full text for prometheus) that excludes
-         the raw ``queries`` payload — so healthy-node vocabulary can't misfire.
+    messages. Rank only the collector's scoped artifacts instead. A
+    ``node_conditions`` detail is a useful current-state snapshot, but cannot
+    establish that a resolved historical incident was caused by pressure that
+    happens to exist now. Incident-window Warning events and bounded Prometheus
+    predicates keep this force-high gate on the same temporal contract as every
+    other RCA support link.
     """
     for r in results:
         if not _collector_is_evidence(r):
             continue
         agent = getattr(r, "agent", "")
-        details = r.details if isinstance(r.details, dict) else {}
         if agent == "kubernetes":
-            # Primary: the collector already dropped healthy conditions; a real
-            # abnormal condition entry is a genuine pressure/NotReady signal.
-            conds = details.get("node_conditions")
-            if isinstance(conds, list) and any(
-                isinstance(c, dict) and c.get("type") and not c.get("node_conditions_healthy")
-                for c in conds
-            ):
-                return True
-            # Secondary: an actual eviction (kubelet acting under pressure). Scope
-            # to summary + warning_events so the raw node object in
-            # details["queries"] (healthy "DiskPressure"/"no disk pressure" text)
-            # cannot produce a false positive.
-            scoped = " ".join(
-                [r.summary or "", _leaf_text(details.get("warning_events"))]
-            ).lower()
-            if _keyword_hits(scoped, list(_NODE_CONDITION_TOKENS))[0]:
+            # ``_result_text`` excludes broad current Node snapshots once the
+            # collector publishes structured observations.
+            if _keyword_hits(_result_text(r), list(_NODE_CONDITION_TOKENS))[0]:
                 return True
         elif agent == "prometheus":
             # Prometheus carries no raw node object. Its metric-LABEL identity is

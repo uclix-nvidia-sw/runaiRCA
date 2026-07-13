@@ -242,7 +242,31 @@ def test_real_node_pressure_still_scores_after_queries_drop() -> None:
         ],
         "queries": [{"name": "node", "path": "/api/v1/nodes/dgx01", "status_code": 200, "data": {}}],
     }
-    k8s = _r("kubernetes", summary="Node dgx01 reports DiskPressure=True.", details=details)
+    k8s = _r(
+        "kubernetes",
+        summary="Node dgx01 reports DiskPressure=True.",
+        details=details,
+        artifacts=[
+            artifact(
+                agent="kubernetes",
+                source="kubernetes",
+                type="cluster_api",
+                status="ok",
+                confidence="low",
+                summary="current node snapshot",
+                result={"observation": {"polarity": "unknown", "coverage": "partial"}},
+            ),
+            artifact(
+                agent="kubernetes",
+                source="kubernetes",
+                type="kubernetes_warning_events",
+                status="ok",
+                confidence="high",
+                summary="EvictionThresholdMet in incident window",
+                result={"observation": {"polarity": "present", "coverage": "scoped"}},
+            ),
+        ],
+    )
     ranked = rank_root_cause_candidates(
         _target(node="dgx01", alert_name="KubeNodeDiskPressure"), [k8s]
     )
@@ -402,12 +426,69 @@ def test_r1_abnormal_node_condition_in_details_force_highs() -> None:
         ],
     }
     results = [
-        _r("kubernetes", summary="node under pressure; pods being removed", details=pressured_node),
+        _r(
+            "kubernetes",
+            summary="node under pressure; pods being removed",
+            details=pressured_node,
+            artifacts=[
+                artifact(
+                    agent="kubernetes",
+                    source="kubernetes",
+                    type="cluster_api",
+                    status="ok",
+                    confidence="low",
+                    summary="current node snapshot",
+                    result={"observation": {"polarity": "unknown", "coverage": "partial"}},
+                ),
+                artifact(
+                    agent="kubernetes",
+                    source="kubernetes",
+                    type="kubernetes_warning_events",
+                    status="ok",
+                    confidence="high",
+                    summary="EvictionThresholdMet in incident window",
+                    result={"observation": {"polarity": "present", "coverage": "scoped"}},
+                ),
+            ],
+        ),
         _r("typedb", summary="kg lookup", details={"blast_radius_workloads": 3}),
     ]
     ranked = rank_root_cause_candidates(_target(), results, occurrence_count=5)
     assert ranked[0].family == "node_kubelet_pressure"
     assert ranked[0].confidence == "high"
+
+
+def test_r1_current_node_snapshot_cannot_force_high_for_historical_incident() -> None:
+    results = [
+        _r(
+            "kubernetes",
+            summary="Node currently reports DiskPressure=True",
+            details={
+                "node_conditions": [
+                    {"type": "DiskPressure", "status": "True", "reason": "KubeletHasDiskPressure"}
+                ]
+            },
+            artifacts=[
+                artifact(
+                    agent="kubernetes",
+                    source="kubernetes",
+                    type="cluster_api",
+                    status="ok",
+                    confidence="low",
+                    summary="current node snapshot",
+                    result={"observation": {"polarity": "unknown", "coverage": "partial"}},
+                )
+            ],
+        ),
+        _r("typedb", summary="kg lookup", details={"blast_radius_workloads": 3}),
+    ]
+
+    ranked = rank_root_cause_candidates(_target(), results, occurrence_count=5)
+    by_family = {candidate.family: candidate for candidate in ranked}
+
+    if candidate := by_family.get("node_kubelet_pressure"):
+        assert candidate.confidence != "high"
+        assert not any("blast radius" in rationale for rationale in candidate.rationale)
 
 
 def test_r2_quota_exhaustion_wins() -> None:
