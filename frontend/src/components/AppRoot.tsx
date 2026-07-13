@@ -345,6 +345,14 @@ function App() {
   const detailVersionRef = useRef(0);
   const routeLoadVersionRef = useRef(0);
 
+  // The dedicated Chat view owns the complete conversation surface, including
+  // its composer. Leaving the global floating launcher there can cover the
+  // send controls (and an open dock leaves stale layout padding), so keep the
+  // floating shortcut for every other dashboard only.
+  useEffect(() => {
+    if (activeView === 'chat') setChatDocked(false);
+  }, [activeView]);
+
   useEffect(() => {
     setIncidentPageIndex(0);
     setAlertPageIndex(0);
@@ -766,10 +774,12 @@ function App() {
           await refreshCurrentView();
         }}
       />
-      <FloatingChat
-        chat={chatSession}
-        onDockedChange={setChatDocked}
-      />
+      {activeView !== 'chat' && (
+        <FloatingChat
+          chat={chatSession}
+          onDockedChange={setChatDocked}
+        />
+      )}
     </div>
   );
 }
