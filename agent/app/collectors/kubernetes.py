@@ -1238,7 +1238,10 @@ class KubernetesCollector:
             )
         ]
         event_observation = _warning_event_observation(
-            warning_events, time_range=time_range, status=status
+            warning_events,
+            time_range=time_range,
+            status=status,
+            target_scoped=_warning_events_are_target_scoped(target),
         )
         artifacts.append(
             artifact(
@@ -1378,10 +1381,15 @@ def _warning_event_observation(
     *,
     time_range: dict[str, str] | None,
     status: str,
+    target_scoped: bool = True,
 ) -> dict[str, object]:
     """Make filtered event presence/absence a typed historical predicate."""
     if status == "unavailable":
         polarity, coverage = "unavailable", "unknown"
+    elif not target_scoped:
+        # A namespace-only event list says nothing about this alert's resource.
+        # Do not turn its emptiness into a false negative for the incident.
+        polarity, coverage = "unknown", "partial"
     elif not time_range:
         # Without alert timestamps the Events API read remains useful context,
         # but an empty list is not a time-bounded negative.
@@ -1394,6 +1402,7 @@ def _warning_event_observation(
         "polarity": polarity,
         "coverage": coverage,
         "event_count": len(warning_events),
+        "target_scoped": target_scoped,
         "observation_window": time_range or {},
     }
 
@@ -2678,6 +2687,13 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
                     or str((item.get("involvedObject") or {}).get("name") or "") == target.pod
                 )
             ]
+        elif name == "namespace_events" or name.startswith("runai_control_plane_events:"):
+            # Namespace event lists are otherwise unrelated workload noise.
+            # Control-plane Events may live in a different namespace from the
+            # workload, so namespace is deliberately NOT an identity check:
+            # require a concrete Pod/controller/Node name or an explicit target
+            # workload/project/Run:ai ID in the event instead.
+            items = [item for item in items if _event_matches_target(item, target)]
         events = [
             _event_summary(item)
             for item in items
@@ -2688,6 +2704,54 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
     if name == "node":
         return _node_summary(data)
     return data
+
+
+def _warning_events_are_target_scoped(target: AnalysisTarget) -> bool:
+    return bool(
+        target.pod
+        or target.workload_name
+        or target.node
+        or target.project
+        or target.runai_workload_id
+    )
+
+
+def _event_matches_target(event: dict[str, object], target: AnalysisTarget) -> bool:
+    involved = event.get("involvedObject")
+    involved = involved if isinstance(involved, dict) else {}
+    name = str(involved.get("name") or "")
+    kind = str(involved.get("kind") or "").casefold()
+    if target.pod and name == target.pod:
+        return True
+    if target.node and kind == "node" and name == target.node:
+        return True
+    workload = target.workload_name.strip()
+    if workload and (name == workload or name.startswith(f"{workload}-")):
+        return True
+    # A Run:ai scheduler/backend Event commonly involves its own controller
+    # Pod, not the user workload Pod. Accept it only when the event message
+    # explicitly names an alert identity — never based on error vocabulary.
+    message = str(event.get("message") or "")
+    return _event_message_mentions_target(message, target)
+
+
+def _event_message_mentions_target(message: str, target: AnalysisTarget) -> bool:
+    text = message.casefold()
+    identifiers = (
+        target.pod,
+        target.workload_name,
+        target.runai_workload_id,
+        target.project,
+    )
+    for value in identifiers:
+        normalized = value.strip().casefold()
+        if len(normalized) < 3:
+            continue
+        # Token boundaries prevent ``train`` from matching ``trainer`` while
+        # allowing Kubernetes names like ``trainer-0`` / ``trainer/abc``.
+        if re.search(rf"(?<![a-z0-9]){re.escape(normalized)}(?![a-z0-9])", text):
+            return True
+    return False
 
 
 def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
@@ -2794,7 +2858,11 @@ def _pod_statuses(responses: list[dict[str, object]]) -> list[object]:
 def _warning_events(responses: list[dict[str, object]]) -> list[object]:
     events: list[object] = []
     for response in responses:
-        if response.get("name") not in {"pod_events", "namespace_events"}:
+        name = response.get("name")
+        if not isinstance(name, str) or (
+            name not in {"pod_events", "namespace_events"}
+            and not name.startswith("runai_control_plane_events:")
+        ):
             continue
         data = response.get("data")
         if isinstance(data, dict) and isinstance(data.get("items"), list):

@@ -8,6 +8,7 @@ from app.collectors import kubernetes, loki, prometheus, runai
 from app.collectors.http_json import JsonResponse
 from app.collectors.kubernetes import (
     _collect_pod_logs,
+    _event_matches_target,
     _filter_kubernetes_data,
     _pod_log_observation,
     _warning_event_observation,
@@ -252,6 +253,44 @@ def test_kubernetes_events_are_filtered_to_the_incident_window() -> None:
     assert [item["reason"] for item in filtered["items"]] == ["Inside", "SeriesInside"]
 
 
+def test_namespace_events_require_the_alert_resource_identity() -> None:
+    target = replace(
+        make_target(), pod="", workload_name="trainer", fired_at="2026-07-10T01:00:00Z"
+    )
+    matching = {
+        "involvedObject": {"kind": "Pod", "name": "trainer-7f8d9"},
+        "eventTime": "2026-07-10T01:02:00Z",
+        "type": "Warning",
+        "reason": "FailedScheduling",
+    }
+    unrelated = {
+        "involvedObject": {"kind": "Pod", "name": "other-workload-0"},
+        "eventTime": "2026-07-10T01:02:00Z",
+        "type": "Warning",
+        "reason": "FailedScheduling",
+    }
+    cross_namespace = {
+        "metadata": {"namespace": "runai"},
+        "involvedObject": {"kind": "Pod", "name": "runai-scheduler-0"},
+        "eventTime": "2026-07-10T01:02:00Z",
+        "type": "Warning",
+        "reason": "ReconcileFailed",
+        "message": "unable to schedule workload trainer for project vision",
+    }
+    filtered = _filter_kubernetes_data(
+        "namespace_events", {"items": [matching, unrelated]}, target
+    )
+    control_plane_filtered = _filter_kubernetes_data(
+        "runai_control_plane_events:runai", {"items": [cross_namespace, unrelated]}, target
+    )
+
+    assert _event_matches_target(matching, target) is True
+    assert _event_matches_target(unrelated, target) is False
+    assert _event_matches_target(cross_namespace, target) is True
+    assert [item["object"] for item in filtered["items"]] == ["trainer-7f8d9"]
+    assert [item["object"] for item in control_plane_filtered["items"]] == ["runai-scheduler-0"]
+
+
 def test_kubernetes_warning_event_observation_is_a_scoped_negative_only_in_window() -> None:
     time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
 
@@ -260,6 +299,10 @@ def test_kubernetes_warning_event_observation_is_a_scoped_negative_only_in_windo
 
     assert (absent["polarity"], absent["coverage"]) == ("absent", "scoped")
     assert (unbounded["polarity"], unbounded["coverage"]) == ("unknown", "partial")
+    unscoped = _warning_event_observation(
+        [], time_range=time_range, status="ok", target_scoped=False
+    )
+    assert (unscoped["polarity"], unscoped["coverage"]) == ("unknown", "partial")
 
 
 class _HistoryConnection:
