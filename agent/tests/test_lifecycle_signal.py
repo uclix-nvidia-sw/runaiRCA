@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.collectors.base import CollectorResult
+from app.collectors.base import CollectorResult, artifact
 from app.services.pipeline import _lifecycle_signal
 
 
@@ -10,7 +10,17 @@ def _change(changes: list[dict]) -> CollectorResult:
         status="ok",
         summary="recent changes",
         details={"changes": changes},
-        artifacts=[],
+        artifacts=[
+            artifact(
+                agent="change",
+                source="kubernetes",
+                type="change_detection",
+                status="ok",
+                confidence="high",
+                summary="incident-window change",
+                result={"observation": {"polarity": "present", "coverage": "scoped"}},
+            )
+        ],
     )
 
 
@@ -77,3 +87,17 @@ def test_lifecycle_signal_unrelated_rollout_is_inactive() -> None:
 
 def test_lifecycle_signal_no_change_collector_is_empty() -> None:
     assert _lifecycle_signal([], component="x", chain=["x"]) == {}
+
+
+def test_lifecycle_signal_rejects_partial_live_change_context() -> None:
+    result = _change(
+        [{"name": "gpu-operator", "kind": "Deployment", "rollout": True}]
+    )
+    result.artifacts[0].result["observation"] = {
+        "polarity": "present",
+        "coverage": "partial",
+    }
+
+    assert _lifecycle_signal(
+        [result], component="gpu-operator", chain=["gpu-operator"]
+    ) == {}

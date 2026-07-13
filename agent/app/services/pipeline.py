@@ -903,6 +903,8 @@ def _lifecycle_signal(
     change = next((r for r in results if getattr(r, "agent", "") == "change"), None)
     if change is None or getattr(change, "status", "") not in ("ok", "partial"):
         return {}
+    if not _has_scoped_change_observation(change):
+        return {}
     details = change.details if isinstance(change.details, dict) else {}
     changes = details.get("changes") if isinstance(details.get("changes"), list) else []
     rolling = {
@@ -933,6 +935,23 @@ def _lifecycle_signal(
     if helm:
         signal["helm"] = helm
     return signal
+
+
+def _has_scoped_change_observation(change: CollectorResult) -> bool:
+    """Require a bounded change artifact before using rollout as an RCA trigger."""
+    for artifact in change.artifacts:
+        if getattr(artifact, "type", "") != "change_detection":
+            continue
+        result = getattr(artifact, "result", None)
+        observation = result.get("observation") if isinstance(result, dict) else None
+        if not isinstance(observation, dict):
+            continue
+        if (
+            str(observation.get("polarity") or "").lower() == "present"
+            and str(observation.get("coverage") or "").lower() == "scoped"
+        ):
+            return True
+    return False
 
 
 _LIFECYCLE_FAMILY = "platform_lifecycle_change"
@@ -2221,7 +2240,9 @@ def _synthesis_collector_findings(results: list[CollectorResult]) -> list[dict[s
             "contradicting_artifacts": [],
             "context_artifacts": [],
         }
-        for artifact in (artifact for artifact in result.artifacts if _artifact_is_evidence(artifact)):
+        for artifact in result.artifacts:
+            if not _artifact_is_evidence(artifact):
+                continue
             payload = _synthesis_artifact_payload(artifact)
             role = str(payload["evidence_role"])
             key = {
