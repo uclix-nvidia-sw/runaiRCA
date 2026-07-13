@@ -2445,6 +2445,155 @@ td span.occurrence-pill {
   margin-top: 1rem;
 }
 
+.evaluation-panel {
+  color: var(--ink);
+}
+
+.evaluation-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: 0.65rem;
+  margin-bottom: 1rem;
+}
+
+.evaluation-summary p {
+  display: grid;
+  gap: 0.18rem;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: #fafbf8;
+  padding: 0.7rem 0.8rem;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.evaluation-summary strong {
+  color: #344054;
+  font-size: 0.74rem;
+  font-weight: 850;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.evaluation-form {
+  display: grid;
+  gap: 1rem;
+}
+
+.evaluation-basics,
+.evaluation-outcome-grid {
+  display: grid;
+  grid-template-columns: minmax(12rem, 0.65fr) minmax(16rem, 1.35fr);
+  gap: 0.8rem;
+}
+
+.evaluation-field {
+  display: grid;
+  align-content: start;
+  gap: 0.38rem;
+  min-width: 0;
+}
+
+.evaluation-field > span,
+.evaluation-score-field > span {
+  color: #344054;
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.evaluation-field small {
+  margin-left: 0.25rem;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.evaluation-panel input,
+.evaluation-panel select,
+.evaluation-panel textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid #cfd6df;
+  border-radius: 0.45rem;
+  background: #ffffff;
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.84rem;
+  outline: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.evaluation-panel input,
+.evaluation-panel select {
+  min-height: 2.5rem;
+  padding: 0 0.7rem;
+}
+
+.evaluation-panel textarea {
+  min-height: 5.5rem;
+  padding: 0.6rem 0.7rem;
+  resize: vertical;
+}
+
+.evaluation-panel input:focus-visible,
+.evaluation-panel select:focus-visible,
+.evaluation-panel textarea:focus-visible {
+  border-color: var(--nvidia-dark);
+  box-shadow: 0 0 0 3px rgba(118, 185, 0, 0.16);
+}
+
+.evaluation-score-section {
+  min-width: 0;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 0.55rem;
+  background: var(--surface-soft);
+  padding: 0.8rem;
+}
+
+.evaluation-score-section legend {
+  padding: 0 0.35rem;
+  color: #344054;
+  font-size: 0.8rem;
+  font-weight: 850;
+}
+
+.evaluation-scores {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10.5rem, 1fr));
+  gap: 0.65rem;
+}
+
+.evaluation-score-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 3.8rem;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+  border: 1px solid #e1e6dc;
+  border-radius: 0.45rem;
+  background: #ffffff;
+  padding: 0.55rem 0.6rem;
+}
+
+.evaluation-score-field select {
+  min-height: 2rem;
+  padding: 0 0.45rem;
+}
+
+.evaluation-actions {
+  display: flex;
+  justify-content: flex-end;
+  border-top: 1px solid var(--line);
+  padding-top: 0.9rem;
+}
+
+.evaluation-save {
+  min-width: 10rem;
+}
+
 /* The timeline is a bordered CARD, not a plain section: the shared separator
    rule above gave it a second top border and 1rem of dead interior space, so
    the collapsed "Thought Process" bar rendered abnormally tall. */
@@ -2564,11 +2713,36 @@ td span.occurrence-pill {
   padding: 0;
 }
 
+.progress-events-scroll {
+  max-height: min(32rem, 58vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 0.45rem;
+  scrollbar-gutter: stable;
+}
+
+.progress-history-hint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.55rem;
+  color: #667085;
+  font-size: 0.72rem;
+  font-weight: 750;
+}
+
 .progress-events li {
   display: grid;
   grid-template-columns: 0.7rem 1fr;
   gap: 0.55rem;
   align-items: start;
+  content-visibility: auto;
+  contain-intrinsic-size: 4.5rem;
+}
+
+.progress-event-copy {
+  min-width: 0;
 }
 
 .progress-dot {
@@ -2603,6 +2777,91 @@ td span.occurrence-pill {
   color: #475467;
   font-size: 0.8rem;
   line-height: 1.45;
+}
+
+.progress-event-details {
+  margin-top: 0.4rem;
+  border: 1px solid #e3e9dc;
+  border-radius: 0.4rem;
+  background: #ffffff;
+  overflow: hidden;
+}
+
+.progress-event-details summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.42rem 0.55rem;
+  color: #475467;
+  cursor: pointer;
+  font-size: 0.72rem;
+  font-weight: 800;
+  list-style: none;
+}
+
+.progress-event-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.progress-event-details[open] summary {
+  border-bottom: 1px solid #edf2e8;
+  background: #f8faf6;
+}
+
+.progress-detail-groups {
+  display: grid;
+  gap: 0.6rem;
+  padding: 0.55rem;
+}
+
+.progress-detail-group {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.progress-detail-group h4 {
+  margin: 0;
+  color: #365314;
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.progress-detail-field {
+  display: grid;
+  grid-template-columns: minmax(7.5rem, 0.24fr) minmax(0, 1fr);
+  gap: 0.55rem;
+  align-items: start;
+}
+
+.progress-detail-field > span {
+  color: #667085;
+  font-size: 0.7rem;
+  font-weight: 800;
+}
+
+.progress-detail-field > .progress-detail-plain {
+  color: #344054;
+  font-size: 0.74rem;
+  font-weight: 650;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.progress-detail-field pre {
+  max-height: 15rem;
+  overflow: auto;
+  margin: 0;
+  border-radius: 0.32rem;
+  background: #111827;
+  color: #d9f99d;
+  padding: 0.48rem 0.55rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.68rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .rca-report h2,
@@ -4211,6 +4470,28 @@ code .evidence-mark {
 }
 
 @media (max-width: 760px) {
+  .evaluation-basics,
+  .evaluation-outcome-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .evaluation-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .evaluation-actions .evaluation-save {
+    width: 100%;
+  }
+
+  .progress-events-scroll {
+    max-height: min(28rem, 56vh);
+  }
+
+  .progress-detail-field {
+    grid-template-columns: 1fr;
+    gap: 0.25rem;
+  }
+
   .analysis-trend-row,
   .analysis-stat-grid,
   .analysis-insight-grid {

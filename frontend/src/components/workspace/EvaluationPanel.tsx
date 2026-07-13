@@ -78,42 +78,74 @@ export function EvaluationPanel({
   };
 
   return (
-    <section className="feedback-panel" id="rca-evaluation">
+    <section className="feedback-panel evaluation-panel" id="rca-evaluation">
       <div className="section-title"><ClipboardCheck size={18} /> RCA Evaluation</div>
-      {harness && (
-        <p className="empty">
-          Harness: {String(harness.status || 'unknown')} · score {String(harness.overall_score ?? '—')} · repairs {String(harness.repair_attempts ?? 0)}
-        </p>
-      )}
-      {view && <p className="empty">Current-RCA reviews: {view.reviews.length} · average {view.average_score.toFixed(1)}/5</p>}
-      {error && <p className="feedback-error">{error}</p>}
-      <label>Case type
-        <select value={caseType} onChange={(event) => setCaseType(event.target.value as EvaluationReviewInput['case_type'])}>
-          <option value="known">Known</option><option value="compositional">Compositional</option><option value="novel">Novel</option><option value="tool_degraded">Tool degraded</option>
-        </select>
-      </label>
-      {caseType !== 'novel' && <label>Expected family (optional)
-        <input value={expectedFamily} onChange={(event) => setExpectedFamily(event.target.value)} placeholder="gpu_hardware_error" />
-      </label>}
-      <div className="evaluation-scores">
-        {DIMENSIONS.map(([key, label]) => <label key={key}>{label}
-          <select value={scores[key]} onChange={(event) => setScores((current) => ({ ...current, [key]: Number(event.target.value) }))}>
-            {[0, 1, 2, 3, 4, 5].map((value) => <option key={value} value={value}>{value}</option>)}
-          </select>
-        </label>)}
+      <div className="evaluation-summary" aria-label="Evaluation summary">
+        {harness && (
+          <p>
+            <strong>Harness</strong>
+            <span>{String(harness.status || 'unknown')} · score {String(harness.overall_score ?? '—')} · repairs {String(harness.repair_attempts ?? 0)}</span>
+          </p>
+        )}
+        {view && (
+          <p>
+            <strong>Current-RCA reviews</strong>
+            <span>{view.reviews.length} · average {view.average_score.toFixed(1)}/5</span>
+          </p>
+        )}
       </div>
-      <label>Resolution outcome
-        <select value={outcome} onChange={(event) => setOutcome(event.target.value as EvaluationReviewInput['resolution_outcome'])}>
-          <option value="unknown">Unknown</option><option value="resolved">Resolved</option><option value="mitigated">Mitigated</option><option value="ineffective">Ineffective</option>
-        </select>
-      </label>
-      <label>Effective action
-        <input value={effectiveAction} onChange={(event) => setEffectiveAction(event.target.value)} placeholder="Only if an action actually helped" />
-      </label>
-      <label>Notes
-        <textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={3} />
-      </label>
-      <button className="artifact-toggle compact-artifact-toggle" disabled={busy} onClick={() => void save()} type="button"><Save size={16} /> {busy ? 'Saving…' : 'Save evaluation'}</button>
+      {error && <p className="feedback-error">{error}</p>}
+      <form className="evaluation-form" onSubmit={(event) => { event.preventDefault(); void save(); }}>
+        <div className="evaluation-basics">
+          <label className="evaluation-field">
+            <span>Case type</span>
+            <select value={caseType} onChange={(event) => setCaseType(event.target.value as EvaluationReviewInput['case_type'])}>
+              <option value="known">Known</option><option value="compositional">Compositional</option><option value="novel">Novel</option><option value="tool_degraded">Tool degraded</option>
+            </select>
+          </label>
+          {caseType !== 'novel' && (
+            <label className="evaluation-field">
+              <span>Expected family <small>Optional</small></span>
+              <input value={expectedFamily} onChange={(event) => setExpectedFamily(event.target.value)} placeholder="gpu_hardware_error" />
+            </label>
+          )}
+        </div>
+
+        <fieldset className="evaluation-score-section">
+          <legend>RCA quality scores</legend>
+          <div className="evaluation-scores">
+            {DIMENSIONS.map(([key, label]) => (
+              <label className="evaluation-score-field" key={key}>
+                <span>{label}</span>
+                <select value={scores[key]} onChange={(event) => setScores((current) => ({ ...current, [key]: Number(event.target.value) }))}>
+                  {[0, 1, 2, 3, 4, 5].map((value) => <option key={value} value={value}>{value}</option>)}
+                </select>
+              </label>
+            ))}
+          </div>
+        </fieldset>
+
+        <div className="evaluation-outcome-grid">
+          <label className="evaluation-field">
+            <span>Resolution outcome</span>
+            <select value={outcome} onChange={(event) => setOutcome(event.target.value as EvaluationReviewInput['resolution_outcome'])}>
+              <option value="unknown">Unknown</option><option value="resolved">Resolved</option><option value="mitigated">Mitigated</option><option value="ineffective">Ineffective</option>
+            </select>
+          </label>
+          <label className="evaluation-field">
+            <span>Effective action</span>
+            <input value={effectiveAction} onChange={(event) => setEffectiveAction(event.target.value)} placeholder="Only if an action actually helped" />
+          </label>
+        </div>
+
+        <label className="evaluation-field evaluation-notes">
+          <span>Notes</span>
+          <textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={3} />
+        </label>
+        <div className="evaluation-actions">
+          <button className="primary-button evaluation-save" disabled={busy} type="submit"><Save size={16} /> {busy ? 'Saving…' : 'Save evaluation'}</button>
+        </div>
+      </form>
     </section>
   );
 }
