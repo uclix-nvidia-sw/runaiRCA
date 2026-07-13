@@ -242,11 +242,7 @@ def evaluate(
         "evidence_link_errors": link_errors,
     }
     trace = [
-        {
-            "evidence_id": str(getattr(item, "evidence_id", "")),
-            "source": str(getattr(item, "source", "")),
-            "summary": _single_line(getattr(item, "summary", ""), 220),
-        }
+        _trace_item(item)
         for item in _unique_artifacts(
             [
                 item
@@ -276,10 +272,52 @@ def apply_trace(response: AlertAnalysisResponse, verdict: HarnessVerdict) -> boo
     lines = ["## Evidence Trace", ""]
     for item in verdict.trace:
         summary = item["summary"] or "Collected evidence"
-        lines.append(f"- [{item['evidence_id']}] {item['source']}: {summary}")
+        lines.append(
+            f"- [{item['evidence_id']}] {item['source']} · "
+            f"{_trace_verdict_label(item)}: {summary}"
+        )
     response.analysis_detail = response.analysis_detail.rstrip() + "\n\n" + "\n".join(lines)
     response.analysis = response.analysis_detail
     return True
+
+
+def _trace_item(item: object) -> dict[str, str]:
+    """Render the normalized truth state alongside every cited artifact.
+
+    The final report previously carried only a prose summary. That made a
+    scoped absence (useful contradiction) visually indistinguishable from a
+    positive observation, and hid partial/current-context observations. Reuse
+    the same normalizer that the evidence-link gate trusts so the display never
+    invents a stronger verdict than the RCA engine accepted.
+    """
+    polarity, coverage = "unknown", "partial"
+    try:
+        from app.services.evidence_blackboard import normalize_artifact
+
+        fact = normalize_artifact(item)
+        polarity = str(fact.polarity)
+        coverage = str(fact.coverage)
+    except Exception:  # noqa: BLE001 - trace rendering must not block the RCA.
+        pass
+    return {
+        "evidence_id": str(getattr(item, "evidence_id", "")),
+        "source": str(getattr(item, "source", "")),
+        "summary": _single_line(getattr(item, "summary", ""), 220),
+        "polarity": polarity,
+        "coverage": coverage,
+    }
+
+
+def _trace_verdict_label(item: Mapping[str, str]) -> str:
+    polarity = item.get("polarity", "unknown")
+    coverage = item.get("coverage", "partial")
+    if polarity == "present" and coverage == "scoped":
+        return "observed · scoped"
+    if polarity == "absent" and coverage == "scoped":
+        return "not observed · scoped"
+    if polarity == "unavailable":
+        return "source unavailable"
+    return "context only · partial"
 
 
 def apply_safety_guardrail(response: AlertAnalysisResponse) -> bool:

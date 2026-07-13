@@ -72,6 +72,30 @@ def test_trace_repair_uses_response_local_evidence_ids() -> None:
     assert "[E02]" in response.analysis_detail
 
 
+def test_trace_exposes_structured_evidence_verdicts() -> None:
+    results = [_result("prometheus", "restart counter did not change")]
+    results[0].artifacts[0].result = {
+        "observation": {"polarity": "absent", "coverage": "scoped"}
+    }
+    assign_evidence_ids(results)
+    response = _response()
+    cause = RankedCause("workload_startup_error", "medium", 5, evidence_agents=["prometheus"])
+
+    verdict = evaluate(response, results, [cause])
+    assert verdict.trace == [
+        {
+            "evidence_id": "E01",
+            "source": "prometheus",
+            "summary": "restart counter did not change",
+            "polarity": "absent",
+            "coverage": "scoped",
+        }
+    ]
+
+    assert apply_trace(response, verdict) is True
+    assert "not observed · scoped" in response.analysis_detail
+
+
 def test_high_confidence_needs_two_live_agents_or_signature() -> None:
     results = [_result("loki")]
     assign_evidence_ids(results)
