@@ -482,7 +482,10 @@ async def test_typedb_diagnostic_graph_is_injected_as_neutral_collector_directiv
     alert = Alert(
         status="firing",
         labels={"alertname": "NvidiaXidCriticalError"},
-        annotations={"summary": "NVRM: Xid 79 GPU has fallen off the bus"},
+        annotations={
+            "summary": "NVRM: Xid 79 GPU has fallen off the bus",
+            "analysis_run_id": "ANL-42",
+        },
     )
     kg = {
         "available": True,
@@ -500,6 +503,147 @@ async def test_typedb_diagnostic_graph_is_injected_as_neutral_collector_directiv
     assert directive["checks"]
     assert directive["interpretation"]
     assert "confirm or refute" in directive["instruction"]
+    assert [hypothesis["id"] for hypothesis in plan.hypotheses] == [
+        f"ANL-42:H{index}" for index in range(1, len(plan.hypotheses) + 1)
+    ]
+    assert directive["run_id"] == "ANL-42"
+    assert directive["probes"]
+    assert all(probe["template_id"] == probe["id"] for probe in directive["probes"])
+    assert all(
+        probe["hypothesis_ids"] == [
+            hypothesis["id"]
+            for hypothesis in plan.hypotheses
+            if hypothesis["family"] == directive["provisional_family"]
+        ]
+        for probe in directive["probes"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_planner_assigns_a_stable_template_id_to_legacy_probe() -> None:
+    settings = make_settings()
+    target = _target(alert_name="NvidiaXidCriticalError", namespace="runai-vision")
+    alert = Alert(annotations={"analysis_run_id": "ANL-42"})
+    tree = {
+        "root": "scope",
+        "nodes": {
+            "scope": {
+                "id": "scope",
+                "question": "Scope the incident.",
+                "match": {"always": True},
+                "conclusion": {"family": "gpu_hardware_error"},
+                "probes": [
+                    {
+                        "tool": "k8s_read",
+                        "arguments_template": {"kind": "events", "namespace": "{{namespace}}"},
+                    }
+                ],
+            }
+        },
+    }
+
+    first = await plan_investigation(
+        settings, target, alert, {"diagnostic_tree": tree}, []
+    )
+    second = await plan_investigation(
+        settings, target, alert, {"diagnostic_tree": tree}, []
+    )
+    unscoped = await plan_investigation(
+        settings, target, Alert(), {"diagnostic_tree": tree}, []
+    )
+
+    first_probe = first.diagnostic_directive["probes"][0]
+    second_probe = second.diagnostic_directive["probes"][0]
+    assert first_probe["template_id"] == second_probe["template_id"]
+    assert first_probe["template_id"].startswith("scope-probe-01-")
+    assert first_probe["hypothesis_ids"] == [
+        hypothesis["id"]
+        for hypothesis in first.hypotheses
+        if hypothesis["family"] == "gpu_hardware_error"
+    ]
+    assert "run_id" not in unscoped.diagnostic_directive
+    assert "hypothesis_ids" not in unscoped.diagnostic_directive["probes"][0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode, includes_registered",
+    [("off", False), ("shadow", False), ("assist", True), ("authoritative", True)],
+)
+async def test_dynamic_knowledge_can_select_only_registered_tree_probes(
+    monkeypatch, mode: str, includes_registered: bool
+) -> None:
+    from app import knowledge
+
+    class _Registry:
+        def __init__(self) -> None:
+            self.mode = mode
+            self.calls: list[str] = []
+
+        def probe_template_ids_for_family(self, family: str) -> tuple[str, ...]:
+            self.calls.append(family)
+            # Runtime data is deliberately only identifiers; these attempted
+            # arguments are not accepted by the planner.
+            return ("registered-probe", "unknown-probe")
+
+    registry = _Registry()
+    monkeypatch.setattr(knowledge, "_runtime_knowledge_registry", registry)
+    tree = {
+        "root": "scope",
+        "nodes": {
+            "scope": {
+                "id": "scope",
+                "question": "Scope the incident.",
+                "match": {"always": True},
+                "conclusion": {"family": "gpu_hardware_error"},
+                "probes": [
+                    {
+                        "id": "path-probe",
+                        "tool": "k8s_read",
+                        "arguments_template": {"kind": "events", "namespace": "{{namespace}}"},
+                    }
+                ],
+            },
+            "registered": {
+                "id": "registered",
+                "probes": [
+                    {
+                        "id": "registered-probe",
+                        "tool": "k8s_describe",
+                        "arguments_template": {
+                            "kind": "pods",
+                            "name": "{{pod}}",
+                            "namespace": "{{namespace}}",
+                        },
+                    }
+                ],
+            },
+        },
+    }
+
+    plan = await plan_investigation(
+        make_settings(),
+        _target(alert_name="NvidiaXidCriticalError", namespace="runai-vision"),
+        Alert(),
+        {"diagnostic_tree": tree},
+        [],
+    )
+
+    probes = plan.diagnostic_directive["probes"]
+    assert [probe["template_id"] for probe in probes] == (
+        ["path-probe", "registered-probe"] if includes_registered else ["path-probe"]
+    )
+    assert all(probe["template_id"] != "unknown-probe" for probe in probes)
+    assert next(probe for probe in probes if probe["template_id"] == "path-probe")[
+        "arguments_template"
+    ] == {"kind": "events", "namespace": "{{namespace}}"}
+    if includes_registered:
+        assert registry.calls == ["gpu_hardware_error"]
+        assert next(probe for probe in probes if probe["template_id"] == "registered-probe")[
+            "arguments_template"
+        ] == {"kind": "pods", "name": "{{pod}}", "namespace": "{{namespace}}"}
+    else:
+        assert registry.calls == []
 
 
 @pytest.mark.asyncio

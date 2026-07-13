@@ -6,7 +6,7 @@ import pytest
 
 from app.collectors import change as change_mod
 from app.collectors.base import AnalysisTarget
-from app.collectors.change import ChangeCollector
+from app.collectors.change import ChangeCollector, change_query
 from app.collectors.http_json import JsonResponse
 
 
@@ -206,3 +206,99 @@ async def test_helm_release_detected(monkeypatch: pytest.MonkeyPatch) -> None:
     assert helm[0]["revision"] == 3
     assert helm[0]["rollout"] is True
     assert helm[0]["helm_status"] == "pending-upgrade"
+
+
+@pytest.mark.asyncio
+async def test_change_query_is_bounded_scoped_and_never_returns_bodies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+    calls: list[dict] = []
+
+    async def fake_get_json(*, path, params, **kwargs):
+        calls.append({"path": path, "params": params})
+        if path.endswith("/events"):
+            data = {"items": [{
+                "type": "Warning",
+                "reason": "OOMKilling",
+                "message": "token=event-body-secret",
+                "lastTimestamp": _iso(-5),
+                "involvedObject": {"name": "trainer", "kind": "Pod"},
+            }]}
+        elif path.endswith("/secrets"):
+            data = {"items": [{
+                "metadata": {
+                    "name": "sh.helm.release.v1.trainer.v2",
+                    "creationTimestamp": _iso(-10),
+                    "labels": {"owner": "helm", "name": "trainer", "version": "2"},
+                },
+                "data": {"release": "helm-secret-body"},
+            }]}
+        else:
+            data = {"items": []}
+        return JsonResponse(url="u", status_code=200, data=data)
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    query = await change_query(
+        _Settings(),
+        _target(),
+        {"kind": "all", "component": "trainer", "lookback_seconds": 120, "limit": 1},
+    )
+
+    assert all(
+        call["params"] is None or int(call["params"].get("limit", 1)) <= 1 for call in calls
+    )
+    assert query["source_group"] == "kubernetes_api"
+    assert query["independence_group"] == "kubernetes_api"
+    observation = query["observation"]
+    assert observation["observed_entity"] == {"kind": "component", "name": "trainer"}
+    assert observation["window"] == {"lookback_seconds": 120}
+    assert observation["polarity"] == "present"
+    assert observation["coverage"] == "scoped"
+    assert set(observation["observation_window"]) == {"start", "end"}
+    assert observation["body_included"] is False
+    assert len(observation["changes"]) == 1
+    assert "event-body-secret" not in str(query)
+    assert "helm-secret-body" not in str(query)
+    assert "summary" not in observation["changes"][0]
+
+
+@pytest.mark.asyncio
+async def test_change_query_refuses_namespace_or_limit_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+    query = await change_query(
+        _Settings(), _target(), {"namespace": "other", "limit": 999}
+    )
+
+    assert query["error"] == "namespace must match the alert namespace scope"
+    assert query["observation"]["coverage"] == "unknown"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["controller", "pod", "node_condition", "event", "helm"])
+async def test_change_query_accepts_plan_kinds_with_bounded_lookback(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(**kwargs):
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    query = await change_query(_Settings(), _target(), {"kind": kind, "lookback_seconds": 86400})
+
+    assert query["error"] is None
+    assert query["observation"]["polarity"] == "absent"
+    assert query["observation"]["coverage"] == "scoped"
+
+
+@pytest.mark.asyncio
+async def test_change_query_refuses_lookback_outside_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+    query = await change_query(_Settings(), _target(), {"kind": "event", "lookback_seconds": 59})
+
+    assert query["error"] == "lookback_seconds must be between 60 and 86400"

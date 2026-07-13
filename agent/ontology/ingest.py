@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 from typing import Any
 
@@ -240,6 +241,7 @@ def _to_incident(row: dict[str, Any]) -> OntologyIncident:
         quality_source=quality_source,
         artifacts=_json_list(row.get("artifacts")),
         harness=harness if isinstance(harness, dict) else {},
+        reasoning_trace_v3=_trace_v3(metadata),
         title=str(row.get("title") or ""),
         severity=str(row.get("severity") or "warning"),
         status=str(row.get("status") or "firing"),
@@ -261,6 +263,22 @@ def _to_incident(row: dict[str, Any]) -> OntologyIncident:
     )
 
 
+def _trace_v3(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Return only an explicitly versioned trace-v3 payload.
+
+    Version 1/2 records have different semantics and must never be promoted by
+    guesswork into hypothesis or probe-execution graph edges.
+    """
+    trace = metadata.get("reasoning_trace_v3") or metadata.get("trace_v3")
+    if not isinstance(trace, dict):
+        return {}
+    try:
+        version = int(trace.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        return {}
+    return trace if version == 3 else {}
+
+
 async def _fetch(limit: int, resolved_grace_hours: int = 0) -> list[dict[str, Any]]:
     import asyncpg
 
@@ -278,6 +296,69 @@ async def _fetch(limit: int, resolved_grace_hours: int = 0) -> list[dict[str, An
     finally:
         await conn.close()
     return [dict(r) for r in rows]
+
+
+# The trace-v3 backfill has a deliberately separate keyset query. It traverses
+# active approved snapshots (not latest incidents), so a large history can be
+# resumed exactly at `(approved_at, case_id)` without relying on OFFSET.
+_SELECT_TRACE_V3_PAGE = """
+SELECT i.incident_id, i.correlation_key, i.title, i.severity, i.status,
+       i.fired_at::text AS fired_at,
+       i.user_approved_at::text AS user_approved_at,
+       a.alert_id, a.fingerprint, a.occurrence_count, a.occurrence_pods,
+       a.labels, a.annotations,
+       cs.case_id, cs.approval_state, cs.mechanism, cs.mechanism_fingerprint,
+       cs.analysis_hash AS case_analysis_hash, cs.run_id,
+       cs.approved_at::text AS snapshot_approved_at,
+       COALESCE(cs.snapshot->>'analysis_summary', '') AS analysis_summary,
+       COALESCE(cs.snapshot->>'analysis_detail', '') AS analysis_detail,
+       cs.root_cause_family,
+       COALESCE(cs.snapshot->'artifacts', '[]'::jsonb) AS artifacts,
+       COALESCE(cs.snapshot->'metadata', '{}'::jsonb) AS analysis_metadata,
+       COALESCE(cs.snapshot->'case_card', '{}'::jsonb) AS case_card,
+       '[]'::jsonb AS verified_actions,
+       '[]'::jsonb AS ineffective_actions,
+       '[]'::jsonb AS evaluation_scores,
+       false AS reviewed
+FROM rca_case_snapshots cs
+JOIN incidents i ON i.incident_id = cs.incident_id
+JOIN LATERAL (
+    SELECT alert_id, fingerprint, occurrence_count, occurrence_pods, labels, annotations
+      FROM alerts
+     WHERE incident_id = i.incident_id
+     ORDER BY fired_at DESC
+     LIMIT 1
+) a ON TRUE
+WHERE cs.approval_state = 'active'
+  AND cs.approved_at IS NOT NULL
+  AND i.user_approved_at IS NOT NULL
+  AND ($1::timestamptz IS NULL OR (cs.approved_at, cs.case_id) > ($1::timestamptz, $2::text))
+ORDER BY cs.approved_at ASC, cs.case_id ASC
+LIMIT $3
+"""
+
+
+async def _fetch_trace_v3_page(
+    after_approved_at: str = "", after_case_id: str = "", limit: int = 200
+) -> list[dict[str, Any]]:
+    """Fetch one approval-keyset page for the resumable trace-v3 backfill."""
+    import asyncpg
+
+    settings = load_settings()
+    if not settings.postgres_dsn:
+        print("POSTGRES_DSN not set; skipping trace-v3 backfill.")
+        return []
+    conn = await asyncpg.connect(settings.postgres_dsn)
+    try:
+        rows = await conn.fetch(
+            _SELECT_TRACE_V3_PAGE,
+            after_approved_at or None,
+            after_case_id,
+            max(1, limit),
+        )
+    finally:
+        await conn.close()
+    return [dict(row) for row in rows]
 
 
 def _ensure(tx: Any, etype: str, key_attr: str, value: str) -> None:
@@ -448,6 +529,231 @@ def _ensure_evidence(tx: Any, inc: OntologyIncident, item: dict[str, Any]) -> st
     return key
 
 
+_TRACE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+
+
+def _trace_id(value: object) -> str:
+    """Accept an explicit trace ID verbatim, or reject it without fallback."""
+    candidate = str(value or "").strip()
+    return candidate if _TRACE_ID.fullmatch(candidate) else ""
+
+
+def _trace_key(inc: OntologyIncident, local_id: str) -> str:
+    """Namespace response-local trace IDs without changing their local value."""
+    prefix = f"{inc.run_id}:"
+    return local_id if local_id.startswith(prefix) else f"{prefix}{local_id}"
+
+
+def _trace_text(value: object, limit: int = 500) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _ensure_trace_evidence(tx: Any, inc: OntologyIncident, item: dict[str, Any]) -> str:
+    """Project trace-v3 evidence without merging it with legacy artifact rows."""
+    local_id = _trace_id(item.get("evidence_id"))
+    if not local_id:
+        return ""
+    evidence_id = _trace_key(inc, local_id)
+    _ensure(tx, "evidence", "evidence_id", evidence_id)
+    # Every field below is supplied by the trace-v3 evidence object itself.
+    # In particular, do not copy these values from an artifact or a v1/v2 trace.
+    window = item.get("observation_window")
+    window = window if isinstance(window, dict) else {}
+    values = {
+        "artifact_ref": local_id,
+        "trace_local_id": local_id,
+        "source": _trace_text(item.get("source"), 120),
+        "observed_entity": _trace_text(item.get("entity"), 300),
+        "source_group": _trace_text(item.get("source_group"), 120),
+        "predicate": _trace_text(item.get("predicate"), 300),
+        "observed_value": _trace_text(item.get("value"), 500),
+        "polarity": _trace_text(item.get("polarity"), 80),
+        "coverage": _trace_text(item.get("coverage"), 120),
+        "quality": _trace_text(item.get("quality"), 120),
+        "observed_window_start": _trace_text(window.get("start"), 80),
+        "observed_window_end": _trace_text(window.get("end"), 80),
+    }
+    for attr, value in values.items():
+        if value:
+            _replace_attr(tx, "evidence", "evidence_id", evidence_id, attr, value)
+    return evidence_id
+
+
+def _trace_relation(
+    tx: Any,
+    match: str,
+    relation: str,
+    insert: str,
+) -> None:
+    if not list(tx.query(f"match {match} {relation}; select $x;").resolve().as_concept_rows()):
+        tx.query(f"match {match} insert {insert};").resolve()
+
+
+def _clear_trace_v3_projection(tx: Any, run_id: str) -> None:
+    """Detach a run's previous v3 links, retaining legacy evidence untouched."""
+    run = f'$r isa analysis_run, has run_id "{esc(run_id)}"; '
+    hypothesis = '$h isa hypothesis_for, links (run: $r, hypothesis: $hyp); '
+    # Delete dependent trace links before the run-to-hypothesis membership.
+    for _relation, extra in (
+        ("supported_by", '$x isa supported_by, links (claim: $hyp, proof: $e); '),
+        ("contradicted_by", '$x isa contradicted_by, links (claim: $hyp, proof: $e); '),
+        ("rejected_evidence_link", '$x isa rejected_evidence_link, links (hypothesis: $hyp, proof: $e); '),
+        (
+            "probe_execution_evidence",
+            '$t isa probe_execution_tests, links (execution: $execution, hypothesis: $hyp); '
+            '$x isa probe_execution_evidence, links (execution: $execution, proof: $e); ',
+        ),
+        (
+            "probe_execution_for",
+            '$t isa probe_execution_tests, links (execution: $execution, hypothesis: $hyp); '
+            '$x isa probe_execution_for, links (execution: $execution, template: $template); ',
+        ),
+        ("probe_execution_tests", '$x isa probe_execution_tests, links (execution: $execution, hypothesis: $hyp); '),
+        ("hypothesis_for", '$x isa hypothesis_for, links (run: $r, hypothesis: $hyp); '),
+    ):
+        tx.query(f"match {run}{hypothesis}{extra} delete $x;").resolve()
+
+
+def _relate_trace_evidence(
+    tx: Any, hypothesis_id: str, evidence_id: str, relation: str
+) -> None:
+    match = (
+        f'$h isa hypothesis, has hypothesis_id "{esc(hypothesis_id)}"; '
+        f'$e isa evidence, has evidence_id "{esc(evidence_id)}"; '
+    )
+    edge = f"$x isa {relation}, links (claim: $h, proof: $e)"
+    _trace_relation(tx, match, edge, f"$x isa {relation}, links (claim: $h, proof: $e)")
+
+
+def _write_trace_v3_projection(tx: Any, inc: OntologyIncident) -> None:
+    """Write only the explicit, versioned hypothesis/probe trace contract."""
+    trace = inc.reasoning_trace_v3
+    if not inc.run_id or not isinstance(trace, dict):
+        return
+    try:
+        version = int(trace.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        return
+    if version != 3:
+        return
+
+    raw_hypotheses = trace.get("hypotheses")
+    raw_evidence = trace.get("evidence")
+    raw_executions = trace.get("probe_executions")
+    if not isinstance(raw_hypotheses, list):
+        raw_hypotheses = []
+    if not isinstance(raw_evidence, list):
+        raw_evidence = []
+    if not isinstance(raw_executions, list):
+        raw_executions = []
+    _clear_trace_v3_projection(tx, inc.run_id)
+
+    evidence = {
+        evidence_id: evidence_id
+        for item in raw_evidence
+        if isinstance(item, dict)
+        if (evidence_id := _ensure_trace_evidence(tx, inc, item))
+    }
+    hypothesis_ids: dict[str, str] = {}
+    for item in raw_hypotheses:
+        if not isinstance(item, dict):
+            continue
+        local_hypothesis_id = _trace_id(item.get("hypothesis_id"))
+        if not local_hypothesis_id:
+            continue
+        hypothesis_id = _trace_key(inc, local_hypothesis_id)
+        hypothesis_ids[local_hypothesis_id] = hypothesis_id
+        _ensure(tx, "hypothesis", "hypothesis_id", hypothesis_id)
+        for attr, value in {
+            "trace_local_id": local_hypothesis_id,
+            "hypothesis_family": _trace_text(item.get("family"), 160),
+            "mechanism": _trace_text(item.get("mechanism"), 1200),
+            "hypothesis_status": _trace_text(item.get("status"), 80),
+            "confidence": _trace_text(item.get("confidence"), 80),
+        }.items():
+            if value:
+                _replace_attr(tx, "hypothesis", "hypothesis_id", hypothesis_id, attr, value)
+        _replace_attr(tx, "hypothesis", "hypothesis_id", hypothesis_id, "trace_version", version, quoted=False)
+        match = (
+            f'$r isa analysis_run, has run_id "{esc(inc.run_id)}"; '
+            f'$i isa incident, has incident_id "{esc(inc.incident_id)}"; '
+            f'$h isa hypothesis, has hypothesis_id "{esc(hypothesis_id)}"; '
+        )
+        edge = "$x isa hypothesis_for, links (run: $r, incident: $i, hypothesis: $h)"
+        _trace_relation(tx, match, edge, " $x isa hypothesis_for, links (run: $r, incident: $i, hypothesis: $h)")
+        for evidence_id in item.get("evidence_for") or []:
+            if _trace_id(evidence_id) in evidence:
+                _relate_trace_evidence(tx, hypothesis_id, evidence[_trace_id(evidence_id)], "supported_by")
+        for evidence_id in item.get("evidence_against") or []:
+            if _trace_id(evidence_id) in evidence:
+                _relate_trace_evidence(tx, hypothesis_id, evidence[_trace_id(evidence_id)], "contradicted_by")
+
+    for item in raw_executions:
+        if not isinstance(item, dict):
+            continue
+        local_execution_id = _trace_id(item.get("execution_id"))
+        template_id = _trace_id(item.get("template_id"))
+        if not local_execution_id or not template_id:
+            continue
+        execution_id = _trace_key(inc, local_execution_id)
+        # The template must be authored/loaded first. Never create a template
+        # from a trace payload, because that could smuggle query arguments.
+        template_match = f'$p isa diagnostic_probe_template, has probe_id "{esc(template_id)}"; '
+        if not list(tx.query(f"match {template_match} select $p;").resolve().as_concept_rows()):
+            continue
+        _ensure(tx, "probe_execution", "probe_execution_id", execution_id)
+        for attr, value in {
+            "trace_local_id": local_execution_id,
+            "probe_verdict": _trace_text(item.get("verdict"), 80),
+            "executed_at": _trace_text(item.get("executed_at"), 80),
+        }.items():
+            if value:
+                _replace_attr(tx, "probe_execution", "probe_execution_id", execution_id, attr, value)
+        _replace_attr(tx, "probe_execution", "probe_execution_id", execution_id, "trace_version", version, quoted=False)
+        match = (
+            f'$x isa probe_execution, has probe_execution_id "{esc(execution_id)}"; '
+            f'$p isa diagnostic_probe_template, has probe_id "{esc(template_id)}"; '
+        )
+        edge = "$link isa probe_execution_for, links (execution: $x, template: $p)"
+        _trace_relation(tx, match, edge, "$link isa probe_execution_for, links (execution: $x, template: $p)")
+        for hypothesis_id in item.get("hypothesis_ids") or []:
+            hypothesis_id = _trace_id(hypothesis_id)
+            if hypothesis_id not in hypothesis_ids:
+                continue
+            hmatch = match + (
+                f'$h isa hypothesis, has hypothesis_id "{esc(hypothesis_ids[hypothesis_id])}"; '
+            )
+            hedge = "$link isa probe_execution_tests, links (execution: $x, hypothesis: $h)"
+            _trace_relation(tx, hmatch, hedge, "$link isa probe_execution_tests, links (execution: $x, hypothesis: $h)")
+        for evidence_id in item.get("evidence_ids") or []:
+            evidence_id = _trace_id(evidence_id)
+            if evidence_id not in evidence:
+                continue
+            ematch = match + f'$e isa evidence, has evidence_id "{esc(evidence[evidence_id])}"; '
+            eedge = "$link isa probe_execution_evidence, links (execution: $x, proof: $e)"
+            _trace_relation(tx, ematch, eedge, "$link isa probe_execution_evidence, links (execution: $x, proof: $e)")
+
+    for item in trace.get("rejected_evidence_links") or []:
+        if not isinstance(item, dict):
+            continue
+        hypothesis_id = _trace_id(item.get("hypothesis_id"))
+        evidence_id = _trace_id(item.get("evidence_id"))
+        if hypothesis_id not in hypothesis_ids or evidence_id not in evidence:
+            continue
+        match = (
+            f'$h isa hypothesis, has hypothesis_id "{esc(hypothesis_ids[hypothesis_id])}"; '
+            f'$e isa evidence, has evidence_id "{esc(evidence[evidence_id])}"; '
+        )
+        reason = _trace_text(item.get("reason"), 500)
+        edge = "$x isa rejected_evidence_link, links (hypothesis: $h, proof: $e)"
+        if not list(tx.query(f"match {match} {edge}; select $x;").resolve().as_concept_rows()):
+            suffix = f', has rejection_reason "{esc(reason)}"' if reason else ""
+            tx.query(f"match {match} insert $x isa rejected_evidence_link, links (hypothesis: $h, proof: $e){suffix};").resolve()
+    stop_reason = _trace_text(trace.get("stop_reason"), 300)
+    if stop_reason:
+        _replace_attr(tx, "analysis_run", "run_id", inc.run_id, "trace_stop_reason", stop_reason)
+
+
 def _relate_diagnosis_evidence(
     tx: Any,
     inc: OntologyIncident,
@@ -461,7 +767,7 @@ def _relate_diagnosis_evidence(
         f'$r isa analysis_run, has run_id "{esc(inc.run_id)}"; '
         f'$i isa incident, has incident_id "{esc(inc.incident_id)}"; '
         + _cause_match(inc, family)
-        + f'$d isa diagnosis, links (run: $r, incident: $i, cause: $c); '
+        + '$d isa diagnosis, links (run: $r, incident: $i, cause: $c); '
         + f'$e isa evidence, has evidence_id "{esc(evidence_key)}"; '
     )
     exists = list(
@@ -679,6 +985,9 @@ def _write_run_projection(tx: Any, inc: OntologyIncident) -> None:
     # that an operator actually reported as effective or ineffective.
     for action in [*inc.successful_actions, *inc.failed_actions]:
         _ensure_resolution(tx, inc, family, action)
+    # Keep the versioned trace separate from the legacy diagnosis projection:
+    # it is populated solely from explicit reasoning_trace_v3 fields.
+    _write_trace_v3_projection(tx, inc)
 
 
 def _write_incident(tx: Any, inc: OntologyIncident) -> None:

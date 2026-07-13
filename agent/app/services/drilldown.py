@@ -31,6 +31,8 @@ import asyncio
 import json
 import logging
 import re
+from datetime import UTC, datetime
+from hashlib import sha256
 from typing import Any
 from urllib.parse import unquote, urlencode
 
@@ -119,6 +121,7 @@ async def _drill_one(
         architecture = _implicated_architecture(settings, result, target)
         history: list[dict[str, Any]] = []
         seen_queries: set[str] = set()
+        probe_attempts: dict[str, int] = {}
         # A TypeDB/YAML probe is executable only through this agent's existing
         # read-only registry.  Run it before asking the LLM to improvise a
         # query: the declarative probe is the durable operational knowledge,
@@ -127,8 +130,17 @@ async def _drill_one(
             key = _query_fingerprint(query)
             seen_queries.add(key)
             await _run_query(
-                settings, result, tools, target, query, history, masker, blackboard=blackboard,
+                settings,
+                result,
+                tools,
+                target,
+                plan,
+                query,
+                history,
+                masker,
+                blackboard=blackboard,
                 artifact_type="ontology_probe",
+                probe_attempts=probe_attempts,
             )
         step = 0
         while True:
@@ -182,7 +194,7 @@ async def _drill_one(
             )
             for q in queries:
                 await _run_query(
-                    settings, result, tools, target, q, history, masker, blackboard=blackboard
+                    settings, result, tools, target, plan, q, history, masker, blackboard=blackboard
                 )
     except Exception as exc:  # noqa: BLE001 - drill-down is best-effort; base evidence stands
         result.warnings.append(
@@ -207,12 +219,14 @@ async def _run_query(
     result: CollectorResult,
     tools: dict[str, dict[str, Any]],
     target: AnalysisTarget,
+    plan: InvestigationPlan | None,
     query: dict[str, Any],
     history: list[dict[str, Any]],
     masker: Any,
     *,
     blackboard: Any = None,
     artifact_type: str = "drilldown_query",
+    probe_attempts: dict[str, int] | None = None,
 ) -> None:
     """Execute one registry-validated query and preserve its observation."""
     name = str(query.get("tool") or "")
@@ -225,9 +239,26 @@ async def _run_query(
         outcome = {"error": "tool returned no result"}
     error = outcome.get("error")
     probe = query.get("_ontology_probe")
+    execution: dict[str, Any] = {}
     if artifact_type == "ontology_probe" and isinstance(probe, dict):
         assessment = evaluate_probe(probe, outcome).as_dict()
-        assessment["hypothesis_family"] = str(probe.get("hypothesis_family") or "")
+        template_id = _template_id(probe)
+        attempts = probe_attempts if probe_attempts is not None else {}
+        attempt_index = attempts.get(template_id, 0) + 1
+        attempts[template_id] = attempt_index
+        directive = plan.diagnostic_directive if plan else {}
+        run_id = str(directive.get("run_id") or "").strip() if isinstance(directive, dict) else ""
+        execution = {
+            "template_id": template_id,
+            "attempt_index": attempt_index,
+            "executed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        }
+        if run_id and template_id:
+            execution["execution_id"] = f"{run_id}:{template_id}:{attempt_index}"
+            execution["hypothesis_ids"] = [
+                str(value) for value in probe.get("hypothesis_ids") or [] if str(value).strip()
+            ]
+        assessment.update(execution)
         assessments = result.details.setdefault("ontology_probe_assessments", [])
         if isinstance(assessments, list):
             assessments.append(assessment)
@@ -265,7 +296,10 @@ async def _run_query(
     if artifact_type == "ontology_probe" and isinstance(probe, dict):
         assessments = result.details.get("ontology_probe_assessments")
         if isinstance(assessments, list) and assessments:
+            stored_artifact = result.artifacts[-1]
             assessments[-1]["artifact_index"] = len(result.artifacts) - 1
+            if evidence_id := str(getattr(stored_artifact, "evidence_id", "") or ""):
+                assessments[-1]["evidence_ids"] = [evidence_id]
     _record_blackboard(blackboard, result, target)
 
 
@@ -332,12 +366,32 @@ def _declared_probe_queries(
         args = _resolve_probe_template(template, values)
         if args is None:
             continue
-        query = {"tool": tool, "args": args, "_ontology_probe": raw_probe}
-        fingerprint = _query_fingerprint(query)
+        probe = dict(raw_probe)
+        probe["template_id"] = _template_id(probe)
+        query = {"tool": tool, "args": args, "_ontology_probe": probe}
+        fingerprint = f"{probe['template_id']}:{_query_fingerprint(query)}"
         if fingerprint not in seen:
             seen.add(fingerprint)
             queries.append(query)
     return queries
+
+
+def _template_id(probe: dict[str, Any]) -> str:
+    authored = str(
+        probe.get("template_id") or probe.get("id") or probe.get("probe_id") or ""
+    ).strip()
+    if authored:
+        return authored
+    canonical = json.dumps(
+        {
+            "tool": str(probe.get("tool") or ""),
+            "arguments_template": probe.get("arguments_template") or {},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode()
+    return f"legacy-probe-{sha256(canonical).hexdigest()[:12]}"
 
 
 def _query_fingerprint(query: dict[str, Any]) -> str:

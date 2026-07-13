@@ -83,6 +83,26 @@ def test_high_confidence_needs_two_live_agents_or_signature() -> None:
     assert verdict.gates["unsupported_high_confidence"] is True
 
 
+def test_high_confidence_does_not_count_two_kubernetes_api_views_as_independent() -> None:
+    results = [_result("kubernetes"), _result("change")]
+    assign_evidence_ids(results)
+
+    verdict = evaluate(
+        _response(),
+        results,
+        [
+            RankedCause(
+                "workload_startup_error",
+                "high",
+                9,
+                evidence_agents=["kubernetes", "change"],
+            )
+        ],
+    )
+
+    assert verdict.gates["unsupported_high_confidence"] is True
+
+
 def test_dangerous_action_is_repaired_with_a_preceding_guardrail() -> None:
     response = _response("## Recommended Actions\n\n- kubectl delete pod broken-pod")
     assert evaluate(response, [], []).gates["unsafe_action_without_guardrail"] is True
@@ -135,6 +155,30 @@ def test_invalid_typed_evidence_link_is_a_hard_gate_not_an_exception() -> None:
         [RankedCause("gpu_hardware_error", "medium", 5)],
         evidence_links=[{"evidence_id": "unknown", "role": "support"}],
     )
+    assert verdict.gates["invalid_evidence_links"] is True
+
+
+def test_unavailable_or_unknown_artifacts_cannot_be_linked_as_support() -> None:
+    unavailable = _result("loki")
+    unavailable.artifacts[0].status = "unavailable"
+    unavailable.artifacts[0].summary = "transport failed"
+    unknown = _result("system")
+    unknown.artifacts[0].status = "pending"
+    unknown.artifacts[0].summary = "incomplete collection"
+    results = [unavailable, unknown]
+    assign_evidence_ids(results)
+
+    verdict = evaluate(
+        _response(),
+        results,
+        [RankedCause("gpu_hardware_error", "medium", 5)],
+        evidence_links=[
+            {"evidence_id": "E01", "role": "support"},
+            {"evidence_id": "E02", "role": "support"},
+        ],
+    )
+
+    assert verdict.claims[0]["supporting_evidence"] == []
     assert verdict.gates["invalid_evidence_links"] is True
 
 

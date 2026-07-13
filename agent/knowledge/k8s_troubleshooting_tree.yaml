@@ -1,3 +1,4 @@
+runbook_id: k8s_troubleshooting
 root: incident_scope
 sources:
   - "https://kubernetes.io/docs/tasks/debug/debug-application/debug-pods/"
@@ -23,7 +24,8 @@ nodes:
     interpretation: "The same error text can be a pod-local failure or a cluster-wide symptom; blast radius decides which layer to investigate first."
     avoid: "Do not accept a component name in the alert title as the root cause without checking the event timeline."
     probes:
-      - tool: k8s_read
+      - id: k8s_troubleshooting:incident_scope:p01
+        tool: k8s_read
         arguments_template:
           kind: events
           namespace: "{{namespace}}"
@@ -147,7 +149,8 @@ nodes:
     interpretation: "Pending is a placement or prerequisite problem; the first failed predicate is the next diagnostic branch."
     avoid: "Do not increase GPU quota until the event rules out taints, affinity, PVC binding, and topology constraints."
     probes:
-      - tool: k8s_describe
+      - id: k8s_troubleshooting:pod_pending:p01
+        tool: k8s_describe
         arguments_template:
           kind: pods
           name: "{{pod}}"
@@ -230,7 +233,8 @@ nodes:
     interpretation: "This is real capacity pressure only after eligibility filters are applied; total cluster free capacity is not placement capacity."
     avoid: "Do not drain healthy nodes or lower requests blindly; confirm whether a matching node pool can ever satisfy the request."
     probes:
-      - tool: k8s_read
+      - id: k8s_troubleshooting:scheduling_capacity:p01
+        tool: k8s_read
         arguments_template:
           kind: nodes
           name: "{{node}}"
@@ -312,7 +316,8 @@ nodes:
     interpretation: "The request is valid for nodes but not permitted for this namespace's budget."
     avoid: "Do not confuse Kubernetes ResourceQuota with Run:ai project quota; they are enforced by different control paths."
     probes:
-      - tool: k8s_read
+      - id: k8s_troubleshooting:scheduling_quota:p01
+        tool: k8s_read
         arguments_template:
           kind: resourcequotas
           namespace: "{{namespace}}"
@@ -354,7 +359,8 @@ nodes:
   - id: pending_volume_binding
     question: "Is Pending caused by PVC or StorageClass binding?"
     probes:
-      - tool: k8s_read
+      - id: k8s_troubleshooting:pending_volume_binding:p01
+        tool: k8s_read
         arguments_template:
           kind: persistentvolumeclaims
           namespace: "{{namespace}}"
@@ -390,7 +396,8 @@ nodes:
     interpretation: "Storage failures occur before application code executes; the failing verb identifies the owner to inspect."
     avoid: "Do not delete a PVC or restart a stateful workload before confirming attachment state and backend health."
     probes:
-      - tool: k8s_describe
+      - id: k8s_troubleshooting:storage_failure:p01
+        tool: k8s_describe
         arguments_template:
           kind: pod
           name: "{{pod}}"
@@ -454,7 +461,8 @@ nodes:
   - id: pod_crashing
     question: "Why is the container restarting?"
     probes:
-      - tool: k8s_describe
+      - id: k8s_troubleshooting:pod_crashing:p01
+        tool: k8s_describe
         arguments_template:
           kind: pods
           name: "{{pod}}"
@@ -490,7 +498,8 @@ nodes:
     interpretation: "The main container has not started, so its logs and probes are downstream noise."
     avoid: "Do not debug the application container until every required init container completes."
     probes:
-      - tool: k8s_logs
+      - id: k8s_troubleshooting:init_container_failure:p01
+        tool: k8s_logs
         arguments_template:
           pod: "{{pod}}"
           namespace: "{{namespace}}"
@@ -533,7 +542,8 @@ nodes:
   - id: crashloop_backoff
     question: "Is the pod repeatedly failing after process start?"
     probes:
-      - tool: k8s_logs
+      - id: k8s_troubleshooting:crashloop_backoff:p01
+        tool: k8s_logs
         arguments_template:
           pod: "{{pod}}"
           namespace: "{{namespace}}"
@@ -574,7 +584,8 @@ nodes:
   - id: image_pull_failure
     question: "Did the node fail before the image was available?"
     probes:
-      - tool: k8s_describe
+      - id: k8s_troubleshooting:image_pull_failure:p01
+        tool: k8s_describe
         arguments_template:
           kind: pods
           name: "{{pod}}"
@@ -628,7 +639,8 @@ nodes:
   - id: node_not_ready
     question: "Is the target node NotReady or under pressure?"
     probes:
-      - tool: k8s_read
+      - id: k8s_troubleshooting:node_not_ready:p01
+        tool: k8s_read
         arguments_template:
           kind: nodes
           name: "{{node}}"
@@ -783,7 +795,8 @@ nodes:
     interpretation: "`connection refused`, `no endpoints`, and DNS errors have different owners; do not label all of them CNI failures."
     avoid: "Do not restart CoreDNS or relax NetworkPolicy until the failed hop is identified."
     probes:
-      - tool: k8s_read
+      - id: k8s_troubleshooting:service_connectivity_failure:p01
+        tool: k8s_read
         arguments_template:
           kind: endpoints
           namespace: "{{namespace}}"
@@ -865,7 +878,8 @@ nodes:
     interpretation: "A running container with an application exception is not automatically a Kubernetes or node fault."
     avoid: "Do not raise resource limits or roll back blindly until the first error and recent change are correlated."
     probes:
-      - tool: k8s_logs
+      - id: k8s_troubleshooting:workload_runtime_failure:p01
+        tool: k8s_logs
         arguments_template:
           pod: "{{pod}}"
           namespace: "{{namespace}}"
@@ -894,7 +908,8 @@ nodes:
     interpretation: "Expected replacement churn during a healthy rollout is different from a rollout that is stuck because a new pod cannot become ready."
     avoid: "Do not call a transient rollout a node or scheduler incident without a persistent failed condition."
     probes:
-      - tool: k8s_read
+      - id: k8s_troubleshooting:rollout_or_lifecycle:p01
+        tool: k8s_read
         arguments_template:
           kind: deployments
           namespace: "{{namespace}}"
@@ -922,7 +937,8 @@ nodes:
     interpretation: "Run:ai backend and cluster-sync failures sit above workload scheduling and can create stale or inconsistent workload state."
     avoid: "Do not edit generated workload objects until the owning controller and backend state agree."
     probes:
-      - tool: k8s_read
+      - id: k8s_troubleshooting:runai_control_plane_failure:p01
+        tool: k8s_read
         arguments_template:
           kind: events
           namespace: "{{namespace}}"
@@ -981,7 +997,8 @@ nodes:
     interpretation: "Driver, runtime, device plugin, fabric initialization, and physical GPU faults produce different Kubernetes symptoms."
     avoid: "Do not restart every GPU Operator operand; preserve XID and driver evidence and isolate the failing layer first."
     probes:
-      - tool: k8s_read
+      - id: k8s_troubleshooting:gpu_stack_failure:p01
+        tool: k8s_read
         arguments_template:
           kind: nodes
           name: "{{node}}"
@@ -1020,7 +1037,8 @@ nodes:
     interpretation: "The first XID in the chain is usually more causal than later CUDA/NCCL failures in every rank."
     avoid: "Do not reset or reboot before collecting dmesg/NVRM, device-plugin, DCGM, and topology evidence."
     probes:
-      - tool: logql_query
+      - id: k8s_troubleshooting:gpu_xid_failure:p01
+        tool: logql_query
         arguments_template:
           query: "{namespace=\"{{namespace}}\"} |~ \"(?i)(nvrm|xid|fallen off the bus|gpu is lost)\""
         incident_time_window: incident
@@ -1068,7 +1086,8 @@ nodes:
     verify: "Compare host `nvidia-smi -L`, node capacity/allocatable, and the device-plugin pod/log on that exact node."
     interpretation: "Host-visible GPUs plus zero allocatable GPUs isolates the failure above the driver and at device registration/health."
     probes:
-      - tool: k8s_read
+      - id: k8s_troubleshooting:gpu_device_plugin_failure:p01
+        tool: k8s_read
         arguments_template:
           kind: nodes
           name: "{{node}}"
@@ -1130,7 +1149,8 @@ nodes:
     verify: "Inspect ClusterPolicy state and find the first non-ready operand in dependency order: driver, toolkit, device plugin, GFD, DCGM, validators."
     interpretation: "Later operands often fail because an earlier node prerequisite did not become healthy."
     probes:
-      - tool: k8s_read
+      - id: k8s_troubleshooting:gpu_operator_reconciliation_failure:p01
+        tool: k8s_read
         arguments_template:
           kind: pods
           namespace: "{{namespace}}"
@@ -1158,7 +1178,8 @@ nodes:
     interpretation: "NCCL timeout is a distributed symptom; one application/GPU failure can make every healthy peer report a network timeout."
     avoid: "Do not tune NCCL environment variables before low-level GPU, interface, memory, and fabric checks pass."
     probes:
-      - tool: logql_query
+      - id: k8s_troubleshooting:distributed_training_failure:p01
+        tool: logql_query
         arguments_template:
           query: "{namespace=\"{{namespace}}\"} |~ \"(?i)(nccl|xid|ibv|rank)\""
         incident_time_window: incident
@@ -1190,7 +1211,8 @@ nodes:
     verify: "Find the minimum failure timestamp across ranks and inspect that rank's application, CUDA, OOM, and XID evidence."
     interpretation: "The surviving ranks are victims waiting at a collective, not independent root causes."
     probes:
-      - tool: k8s_describe
+      - id: k8s_troubleshooting:distributed_peer_failure:p01
+        tool: k8s_describe
         arguments_template:
           kind: pods
           name: "{{pod}}"
@@ -1218,7 +1240,8 @@ nodes:
     verify: "Check the exact ibv/shm error, pod `/dev/shm` size, memlock limit, and whether the same node pair passes outside the workload."
     interpretation: "Memory registration failure is a host/container limit issue even though NCCL reports it through the network transport."
     probes:
-      - tool: k8s_describe
+      - id: k8s_troubleshooting:nccl_memory_registration_failure:p01
+        tool: k8s_describe
         arguments_template:
           kind: pods
           name: "{{pod}}"
@@ -1263,7 +1286,8 @@ nodes:
     verify: "Capture NCCL INIT/BOOTSTRAP/NET logs, chosen interface, DNS/IP reachability, and allowed TCP port range between ranks."
     interpretation: "Bootstrap fails before high-speed collectives and may use a different network path from RDMA data traffic."
     probes:
-      - tool: logql_query
+      - id: k8s_troubleshooting:nccl_bootstrap_failure:p01
+        tool: logql_query
         arguments_template:
           query: "{namespace=\"{{namespace}}\"} |~ \"(?i)(nccl.*(init|bootstrap|socket|net)|connection timed out)\""
         incident_time_window: incident
@@ -1307,7 +1331,8 @@ nodes:
     interpretation: "Run:ai scheduling policy and kube-scheduler predicates are separate control paths and require different evidence."
     avoid: "Do not call expected reclaim/preemption a platform outage."
     probes:
-      - tool: k8s_read
+      - id: k8s_troubleshooting:runai_scheduling_failure:p01
+        tool: k8s_read
         arguments_template:
           kind: podgroups
           namespace: "{{namespace}}"
@@ -1388,7 +1413,8 @@ nodes:
     verify: "Evaluate project and department deserved quota, over-quota eligibility, ranks/weights, resource limit, physical capacity, and over-subscription per node pool."
     interpretation: "Unused cluster GPUs do not guarantee this queue is entitled to or can place them."
     probes:
-      - tool: k8s_read
+      - id: k8s_troubleshooting:runai_quota_constraint:p01
+        tool: k8s_read
         arguments_template:
           kind: projects
           name: "{{project}}"
@@ -1416,7 +1442,8 @@ nodes:
     interpretation: "Authentication establishes identity; authorization decides permission. Their remedies are different."
     avoid: "Do not grant cluster-admin to diagnose a missing narrow permission."
     probes:
-      - tool: k8s_read
+      - id: k8s_troubleshooting:authorization_failure:p01
+        tool: k8s_read
         arguments_template:
           kind: events
           namespace: "{{namespace}}"
@@ -1476,7 +1503,8 @@ nodes:
     interpretation: "A broken measurement path can produce an incident without a workload failure."
     avoid: "Do not restart a healthy workload to repair a dashboard or exporter."
     probes:
-      - tool: promql_query
+      - id: k8s_troubleshooting:observability_failure:p01
+        tool: promql_query
         arguments_template:
           query: "kube_pod_status_phase{namespace=\"{{namespace}}\",pod=\"{{pod}}\"}"
         incident_time_window: incident
@@ -1499,7 +1527,8 @@ nodes:
     verify: "Walk source exporter → scrape target → remote-write/receiver → query → dashboard and compare last-sample timestamps."
     interpretation: "The first stale hop owns the observability failure; later empty queries are downstream symptoms."
     probes:
-      - tool: promql_query
+      - id: k8s_troubleshooting:metrics_pipeline_failure:p01
+        tool: promql_query
         arguments_template:
           query: "kube_pod_status_phase{namespace=\"{{namespace}}\",pod=\"{{pod}}\"}"
         incident_time_window: incident
@@ -1525,7 +1554,8 @@ nodes:
     verify: "Compare the exact dashboard query/window with live object state and raw exporter series, including labels and staleness."
     interpretation: "A healthy direct state plus stale/missing derived series is an accuracy incident, not resource loss."
     probes:
-      - tool: k8s_read
+      - id: k8s_troubleshooting:observed_state_mismatch:p01
+        tool: k8s_read
         arguments_template:
           kind: pods
           name: "{{pod}}"
@@ -1553,7 +1583,8 @@ nodes:
     verify: "Collect pod describe/events, current and previous logs, node name/conditions, and the nearest recent change before selecting an owner."
     interpretation: "An unfamiliar or sparse alert is not proof of a Kubernetes root cause."
     probes:
-      - tool: k8s_describe
+      - id: k8s_troubleshooting:insufficient_k8s_evidence:p01
+        tool: k8s_describe
         arguments_template:
           kind: pods
           name: "{{pod}}"
@@ -1579,7 +1610,8 @@ nodes:
   - id: pod_network_failure
     question: "Did sandbox creation, CNI, or DNS fail?"
     probes:
-      - tool: k8s_describe
+      - id: k8s_troubleshooting:pod_network_failure:p01
+        tool: k8s_describe
         arguments_template:
           kind: pods
           name: "{{pod}}"

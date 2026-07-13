@@ -80,6 +80,37 @@ attribute source_url, value string;
 attribute principle, value string;
 attribute disconfirm, value string;
 attribute probe_template, value string;
+# --- incident-derived diagnostic trace (v3) -------------------------------
+# These are deliberately separate from the legacy `probe_template` JSON. The
+# JSON remains the runtime compatibility contract; these attributes make the
+# authored templates and an approved incident's explicit trace queryable.
+attribute hypothesis_id, value string;
+attribute hypothesis_family, value string;
+attribute hypothesis_status, value string;
+attribute probe_id, value string;
+attribute probe_tool, value string;
+attribute probe_execution_id, value string;
+attribute probe_verdict, value string;
+attribute trace_version, value integer;
+attribute trace_local_id, value string;
+attribute observed_entity, value string;
+attribute source_group, value string;
+attribute predicate, value string;
+attribute observed_value, value string;
+attribute polarity, value string;
+attribute coverage, value string;
+attribute observed_window_start, value string;
+attribute observed_window_end, value string;
+attribute quality, value string;
+attribute executed_at, value string;
+attribute trace_stop_reason, value string;
+attribute rejection_reason, value string;
+attribute package_id, value string;
+attribute package_status, value string;
+attribute package_published_at, value string;
+attribute package_retired_at, value string;
+attribute package_template_binding_id, value string;
+attribute template_active, value boolean;
 
 # --- entities ---------------------------------------------------------------
 entity cluster,
@@ -172,16 +203,19 @@ entity incident,
     plays similar_to:this,
     plays similar_to:other,
     plays diagnosis:incident,
-    plays observed_symptom:incident;
+    plays observed_symptom:incident,
+    plays hypothesis_for:incident;
 
 entity analysis_run,
     owns run_id @key,
     owns source,
     owns status,
     owns confidence,
+    owns trace_stop_reason,
     plays analyzed_by:run,
     plays diagnosis:run,
-    plays observed_symptom:run;
+    plays observed_symptom:run,
+    plays hypothesis_for:run;
 
 entity symptom,
     owns name,
@@ -275,14 +309,45 @@ entity action,
 entity evidence,
     owns evidence_id @key,
     owns evidence_type,
+    owns trace_local_id,
     owns artifact_ref,
     owns source,
     owns summary,
     owns confidence,
+    # Trace-v3 evidence metadata is populated only from explicit trace fields;
+    # legacy artifacts intentionally remain unannotated rather than guessed.
+    owns observed_entity,
+    owns source_group,
+    owns predicate,
+    owns observed_value,
+    owns polarity,
+    owns coverage,
+    owns observed_window_start,
+    owns observed_window_end,
+    owns quality,
     plays supported_by:proof,
     plays emits:signal,
     plays observed_symptom:proof,
-    plays contradicted_by:proof;
+    plays contradicted_by:proof,
+    plays probe_execution_evidence:proof,
+    plays rejected_evidence_link:proof;
+
+# A hypothesis is a run-local, incident-derived candidate. It is never seeded
+# from historical/legacy data, and does not itself assert an RCA.
+entity hypothesis,
+    owns hypothesis_id @key,
+    owns trace_local_id,
+    owns hypothesis_family,
+    owns hypothesis_status,
+    owns confidence,
+    owns mechanism,
+    owns mechanism_fingerprint,
+    owns trace_version,
+    plays hypothesis_for:hypothesis,
+    plays probe_execution_tests:hypothesis,
+    plays supported_by:claim,
+    plays contradicted_by:claim,
+    plays rejected_evidence_link:hypothesis;
 
 entity runbook,
     owns name @key,
@@ -306,7 +371,49 @@ entity diagnostic_step,
     plays diagnostic_transition:prior,
     plays diagnostic_transition:next,
     plays diagnostic_outcome:step,
-    plays diagnostic_recommendation:step;
+    plays diagnostic_recommendation:step,
+    plays probe_template_for:step;
+
+# Stable IDs are authored in k8s_troubleshooting_tree.yaml. The loader also
+# keeps the complete canonical template for consumers that cannot interpret the
+# legacy JSON attribute on diagnostic_step.
+entity diagnostic_probe_template,
+    owns probe_id @key,
+    owns probe_tool,
+    plays probe_template_for:template,
+    plays probe_execution_for:template,
+    plays package_has_template:template;
+
+# Package mirroring is asynchronous and advisory: runtime activation reads the
+# backend package lifecycle, never this TypeDB projection.
+entity knowledge_package,
+    owns package_id @key,
+    owns package_status,
+    owns case_id,
+    owns title,
+    owns summary,
+    owns hypothesis_family,
+    owns package_published_at,
+    owns package_retired_at,
+    plays package_has_template:package;
+
+entity package_template_binding,
+    owns package_template_binding_id @key,
+    owns template_active,
+    plays package_has_template:binding;
+
+# A recorded execution exists only when an approved trace-v3 explicitly names
+# both a stable template ID and its tested hypothesis. This prevents inferred
+# links from legacy artifacts or prose.
+entity probe_execution,
+    owns probe_execution_id @key,
+    owns trace_local_id,
+    owns probe_verdict,
+    owns trace_version,
+    owns executed_at,
+    plays probe_execution_for:execution,
+    plays probe_execution_tests:execution,
+    plays probe_execution_evidence:execution;
 
 # --- relations --------------------------------------------------------------
 relation scopes, relates scope, relates member;           # cluster scopes node/project
@@ -363,6 +470,19 @@ relation diagnostic_recommendation,
     relates step,
     relates remedy,
     owns sequence_index;
+
+# Trace-v3's exact graph edges. Multiple hypotheses/evidence records attach to
+# a single execution without inventing a cartesian-product relation.
+relation hypothesis_for, relates run, relates incident, relates hypothesis;
+relation probe_template_for, relates step, relates template;
+relation probe_execution_for, relates execution, relates template;
+relation probe_execution_tests, relates execution, relates hypothesis;
+relation probe_execution_evidence, relates execution, relates proof;
+relation rejected_evidence_link,
+    relates hypothesis,
+    relates proof,
+    owns rejection_reason;
+relation package_has_template, relates package, relates template, relates binding;
 
 # --- XID GPU-error catalog ---------------------------------------------------
 # A first-class GPU-hardware-fault RCA path. An xid_error is a catalog entry

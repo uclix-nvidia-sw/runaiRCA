@@ -6,6 +6,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.config import load_settings
+from app.knowledge import (
+    KnowledgeRegistry,
+    set_runtime_knowledge_registry,
+    validate_runtime_knowledge,
+)
 from app.schemas import (
     AlertAnalysisRequest,
     AlertAnalysisResponse,
@@ -13,6 +18,7 @@ from app.schemas import (
     ChatResponse,
     IncidentSummaryRequest,
     IncidentSummaryResponse,
+    RuntimeKnowledgeValidationResponse,
 )
 from app.services.orchestrator import AnalysisOrchestrator
 
@@ -35,10 +41,13 @@ logging.basicConfig(level=logging.INFO)
 
 settings = load_settings()
 orchestrator = AnalysisOrchestrator(settings)
+knowledge_registry = KnowledgeRegistry.from_settings(settings)
+set_runtime_knowledge_registry(knowledge_registry)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    await knowledge_registry.start()
     if settings.enable_nat_runtime:
         try:
             await orchestrator.start_engine()
@@ -64,6 +73,7 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        await knowledge_registry.stop()
         await orchestrator.close_engine()
 
 
@@ -91,7 +101,14 @@ def healthz() -> dict[str, object]:
         "status": "ok",
         "nemo_runtime": "enabled" if settings.enable_nat_runtime else "fallback",
         "nemo_engine": orchestrator.engine_health(),
+        "runtime_knowledge": knowledge_registry.health(),
     }
+
+
+@app.post("/knowledge/validate", response_model=RuntimeKnowledgeValidationResponse)
+def validate_knowledge(payload: dict[str, object]) -> dict[str, object]:
+    """Internal, read-only contract check for compiled runtime knowledge."""
+    return validate_runtime_knowledge(payload)
 
 
 @app.post("/analyze", response_model=AlertAnalysisResponse)

@@ -309,6 +309,8 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
         state.results,
         entity=_blackboard_target_entity(target),
         timestamp=getattr(target, "fired_at", ""),
+        observed_window_start=getattr(target, "fired_at", ""),
+        observed_window_end=getattr(target, "resolved_at", "") or getattr(target, "fired_at", ""),
     )
     # Deterministic flowchart-driven follow-up: keep pulling k8s evidence based on
     # what was found (Pending -> events/quota/pvc -> storageclass; CrashLoop/
@@ -327,6 +329,10 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
             state.results,
             entity=_blackboard_target_entity(target),
             timestamp=getattr(target, "fired_at", ""),
+            observed_window_start=getattr(target, "fired_at", ""),
+            observed_window_end=(
+                getattr(target, "resolved_at", "") or getattr(target, "fired_at", "")
+            ),
         )
     except Exception:  # noqa: BLE001 - follow-up is best-effort, never fail analysis
         pass
@@ -369,6 +375,7 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
         trace = state.investigation_context.get("reasoning_trace_v2")
         if isinstance(trace, dict):
             trace["probe_assessments"] = assessments
+    state.investigation_context["reasoning_trace_v3"] = _public_reasoning_trace_v3(state)
     return state
 
 
@@ -409,14 +416,32 @@ def _probe_assessments(results: list[CollectorResult]) -> list[dict[str, Any]]:
                 {
                     "agent": result.agent,
                     "probe_id": str(item.get("probe_id") or "")[:120],
+                    # IDs are opaque contract values: never truncate or infer them.
+                    "template_id": str(item.get("template_id") or ""),
+                    "execution_id": str(item.get("execution_id") or ""),
+                    "executed_at": str(item.get("executed_at") or "")[:80],
+                    "hypothesis_ids": [
+                        str(value)
+                        for value in item.get("hypothesis_ids") or []
+                        if str(value).strip()
+                    ],
                     "tool": str(item.get("tool") or "")[:80],
                     "verdict": verdict,
-                    "support_signals": [str(value)[:160] for value in item.get("support_signals") or []],
-                    "refute_signals": [str(value)[:160] for value in item.get("refute_signals") or []],
+                    "support_signals": [
+                        str(value)[:160] for value in item.get("support_signals") or []
+                    ],
+                    "refute_signals": [
+                        str(value)[:160] for value in item.get("refute_signals") or []
+                    ],
                     "hypothesis_family": str(item.get("hypothesis_family") or "")[:120],
                     "evidence_id": _assessment_evidence_id(result, item),
                 }
             )
+            assessments[-1]["evidence_ids"] = [
+                str(value)
+                for value in item.get("evidence_ids") or []
+                if str(value).strip()
+            ] or ([assessments[-1]["evidence_id"]] if assessments[-1]["evidence_id"] else [])
     return assessments[:30]
 
 
@@ -433,27 +458,52 @@ def _assessment_evidence_id(result: CollectorResult, assessment: dict[str, Any])
 def _link_probe_assessments_to_ledger(state: PipelineState) -> None:
     """Attach deterministic probe verdicts to matching hypotheses, never promote them.
 
-    The authored directive identifies the *known-family* hypothesis a probe was
-    designed to discriminate.  A verdict only contributes a real response-local
-    evidence ID; status/confidence still require the investigator/ranker to
-    weigh all corroborating and contradicting observations.
+    Links require exact, execution-time hypothesis IDs. A family name is useful
+    planning context but is never a safe identity: multiple hypotheses may
+    share one family. Status/confidence still require the investigator/ranker
+    to weigh all corroborating and contradicting observations.
     """
     ledger = state.investigation_context.get("hypothesis_ledger")
     if not isinstance(ledger, list):
         return
+    by_id = {
+        str(item.get("id") or ""): item
+        for item in ledger
+        if isinstance(item, dict) and str(item.get("id") or "")
+    }
+    available_evidence = {
+        str(getattr(artifact, "evidence_id", "") or "")
+        for artifact in state.artifacts
+        if getattr(artifact, "evidence_id", "")
+    }
+    eligibility_by_id = _public_evidence_eligibility(state)
     for assessment in _probe_assessments(state.results):
-        family = assessment.get("hypothesis_family")
-        evidence_id = assessment.get("evidence_id")
         verdict = assessment.get("verdict")
-        if not family or not evidence_id or verdict not in {"supports", "refutes"}:
+        if verdict not in {"supports", "refutes"}:
             continue
-        for hypothesis in ledger:
-            if not isinstance(hypothesis, dict) or hypothesis.get("family") != family:
+        hypothesis_ids = [
+            str(value) for value in assessment.get("hypothesis_ids") or []
+            if str(value) in by_id
+        ]
+        if not hypothesis_ids:
+            continue
+        evidence_ids = [
+            str(value) for value in assessment.get("evidence_ids") or []
+            if str(value) in available_evidence
+        ]
+        if not evidence_ids:
+            continue
+        key = "evidence_for" if verdict == "supports" else "evidence_against"
+        role = "support" if verdict == "supports" else "contradict"
+        for evidence_id in evidence_ids:
+            eligibility = eligibility_by_id.get(evidence_id)
+            if eligibility is None or not eligibility.permits(role):
                 continue
-            key = "evidence_for" if verdict == "supports" else "evidence_against"
-            current = hypothesis.setdefault(key, [])
-            if isinstance(current, list) and evidence_id not in current:
-                current.append(evidence_id)
+            for hypothesis_id in hypothesis_ids:
+                hypothesis = by_id[hypothesis_id]
+                current = hypothesis.setdefault(key, [])
+                if isinstance(current, list) and evidence_id not in current:
+                    current.append(evidence_id)
 
 
 def _blackboard_artifact_evidence_ids(state: PipelineState) -> dict[str, str]:
@@ -462,6 +512,13 @@ def _blackboard_artifact_evidence_ids(state: PipelineState) -> dict[str, str]:
     if not callable(identify):
         return {}
     aliases: dict[str, str] = {}
+    facts_method = getattr(board, "facts", None)
+    try:
+        facts = tuple(facts_method()) if callable(facts_method) else ()
+    except Exception:  # noqa: BLE001 - blackboard remains optional
+        facts = ()
+    from app.services.evidence_blackboard import normalize_artifact
+
     for result in state.results:
         for artifact in result.artifacts:
             evidence_id = str(getattr(artifact, "evidence_id", "") or "")
@@ -469,6 +526,14 @@ def _blackboard_artifact_evidence_ids(state: PipelineState) -> dict[str, str]:
                 continue
             try:
                 aliases[str(identify(artifact))] = evidence_id
+                # The investigator may have recorded the same artifact before
+                # the pipeline adds the resolved target/window metadata. All
+                # those normalized variants still represent this one public
+                # artifact and must receive the same E-id.
+                artifact_identity = normalize_artifact(artifact).artifact_id
+                for fact in facts:
+                    if str(getattr(fact, "artifact_id", "")) == artifact_identity:
+                        aliases[str(getattr(fact, "fact_id", ""))] = evidence_id
             except Exception:  # noqa: BLE001 - a missing alias is harmless
                 continue
     return aliases
@@ -490,6 +555,231 @@ def _public_reasoning_trace(trace: object, state: PipelineState) -> dict[str, An
             if isinstance(fact, dict)
         ]
     return output
+
+
+def _public_reasoning_trace_v3(state: PipelineState) -> dict[str, Any]:
+    """Serialize a strict, public, fact-level reasoning graph.
+
+    v2 carries the legacy free-form ledger. v3 is deliberately narrower: every
+    evidence reference is a response-local E-id, and a link exists only when
+    the normalized observation is eligible for its reasoning role.
+    """
+    aliases = _blackboard_artifact_evidence_ids(state)
+    board = state.blackboard
+    facts_method = getattr(board, "facts", None)
+    try:
+        facts = tuple(facts_method()) if callable(facts_method) else ()
+    except Exception:  # noqa: BLE001 - v3 is additive, never fatal
+        facts = ()
+
+    facts_by_evidence: dict[str, object] = {}
+    for fact in facts:
+        evidence_id = aliases.get(str(getattr(fact, "fact_id", "")), "")
+        if evidence_id and evidence_id not in facts_by_evidence:
+            facts_by_evidence[evidence_id] = fact
+
+    evidence_context = _evidence_context(state)
+    evidence = [
+        _public_v3_fact(evidence_id, fact, evidence_context)
+        for evidence_id, fact in sorted(facts_by_evidence.items())
+    ]
+    ledger = state.investigation_context.get("hypothesis_ledger")
+    ledger_items = (
+        [item for item in ledger if isinstance(item, dict)] if isinstance(ledger, list) else []
+    )
+    eligibility_by_fact = _blackboard_eligibility(state)
+    hypotheses: list[dict[str, Any]] = []
+    rejected_links: list[dict[str, str]] = []
+    known_ids = set(facts_by_evidence)
+    for item in ledger_items:
+        hypothesis_id = str(item.get("id") or "").strip()
+        if not hypothesis_id:
+            continue
+        eligible_ids = {"support": [], "contradict": []}
+        for evidence_field, role in (
+            ("evidence_for", "support"),
+            ("evidence_against", "contradict"),
+        ):
+            for evidence_id in _public_evidence_ids(item, evidence_field, aliases, known_ids):
+                fact = facts_by_evidence.get(evidence_id)
+                eligibility = eligibility_by_fact.get(str(getattr(fact, "fact_id", "")))
+                if eligibility is not None and eligibility.permits(role):
+                    eligible_ids[role].append(evidence_id)
+                else:
+                    rejected_links.append(
+                        {
+                            "hypothesis_id": hypothesis_id,
+                            "evidence_id": evidence_id,
+                            "role": role,
+                            "reason": str(getattr(eligibility, "reason", "ineligible observation")),
+                        }
+                    )
+        hypotheses.append(
+            _public_v3_hypothesis(
+                item,
+                evidence_for=eligible_ids["support"],
+                evidence_against=eligible_ids["contradict"],
+                facts_by_evidence=facts_by_evidence,
+            )
+        )
+
+    assessments = _probe_assessments(state.results)
+    executions: list[dict[str, Any]] = []
+    for assessment in assessments:
+        execution_id = str(assessment.get("execution_id") or "").strip()
+        template_id = str(assessment.get("template_id") or "").strip()
+        verdict = str(assessment.get("verdict") or "").strip()
+        role = "support" if verdict == "supports" else "contradict" if verdict == "refutes" else ""
+        hypothesis_ids = [
+            str(value) for value in assessment.get("hypothesis_ids") or []
+            if str(value).strip() in {item["hypothesis_id"] for item in hypotheses}
+        ]
+        evidence_ids = [
+            str(value) for value in assessment.get("evidence_ids") or []
+            if str(value).strip() in known_ids
+        ]
+        if not (execution_id and template_id):
+            continue
+        eligible_evidence: list[str] = []
+        for evidence_id in evidence_ids:
+            fact = facts_by_evidence.get(evidence_id)
+            eligibility = eligibility_by_fact.get(str(getattr(fact, "fact_id", "")))
+            if not role or (eligibility is not None and eligibility.permits(role)):
+                eligible_evidence.append(evidence_id)
+                continue
+            for hypothesis_id in hypothesis_ids:
+                rejected_links.append(
+                    {
+                        "hypothesis_id": hypothesis_id,
+                        "execution_id": execution_id,
+                        "evidence_id": evidence_id,
+                        "role": role,
+                        "reason": str(getattr(eligibility, "reason", "ineligible observation")),
+                    }
+                )
+        executions.append(
+            {
+                "execution_id": execution_id,
+                "template_id": template_id,
+                "tool": str(assessment.get("tool") or ""),
+                "verdict": verdict,
+                "executed_at": str(assessment.get("executed_at") or ""),
+                "hypothesis_ids": list(dict.fromkeys(hypothesis_ids)),
+                "evidence_ids": list(dict.fromkeys(eligible_evidence)),
+            }
+        )
+
+    return {
+        "schema_version": 3,
+        "hypotheses": hypotheses,
+        "evidence": evidence,
+        "probe_executions": _dedupe_v3_records(executions),
+        "rejected_evidence_links": _dedupe_v3_records(rejected_links),
+        "stop_reason": _v3_stop_reason(state),
+    }
+
+
+def _public_v3_fact(
+    evidence_id: str, fact: object, evidence_context: dict[str, object]
+) -> dict[str, Any]:
+    from app.services.evidence_blackboard import temporal_relation_to_incident
+
+    observed_start = str(getattr(fact, "observed_window_start", "") or "")
+    observed_end = str(getattr(fact, "observed_window_end", "") or "")
+    return {
+        "evidence_id": evidence_id,
+        "observation_window": {
+            "start": observed_start,
+            "end": observed_end,
+        },
+        # Evidence observed after an alert can corroborate a condition, but is
+        # not silently presented as temporally preceding its symptom.
+        "temporal_relation": temporal_relation_to_incident(
+            observed_start,
+            observed_end,
+            str(evidence_context.get("window_start") or ""),
+            str(evidence_context.get("window_end") or ""),
+        ),
+        "entity": str(getattr(fact, "entity", "") or ""),
+        "source": str(getattr(fact, "source", "") or ""),
+        "source_group": str(
+            getattr(fact, "source_group", "") or getattr(fact, "independence_group", "") or ""
+        ),
+        "predicate": str(getattr(fact, "predicate", "") or ""),
+        "polarity": str(getattr(fact, "polarity", "unknown") or "unknown"),
+        "coverage": str(getattr(fact, "coverage", "unknown") or "unknown"),
+        "quality": str(getattr(fact, "quality", "") or ""),
+    }
+
+
+def _public_v3_hypothesis(
+    item: dict[str, Any],
+    *,
+    evidence_for: list[str],
+    evidence_against: list[str],
+    facts_by_evidence: dict[str, object],
+) -> dict[str, Any]:
+    def groups(evidence_ids: list[str]) -> list[str]:
+        return sorted(
+            {
+                str(
+                    getattr(facts_by_evidence.get(evidence_id), "source_group", "")
+                    or getattr(facts_by_evidence.get(evidence_id), "independence_group", "")
+                    or "unknown"
+                )
+                for evidence_id in evidence_ids
+            }
+        )
+
+    return {
+        "hypothesis_id": str(item.get("id") or ""),
+        "family": str(item.get("family") or ""),
+        "mechanism": str(item.get("mechanism") or item.get("statement") or ""),
+        "status": str(item.get("status") or "uncertain"),
+        "confidence": item.get("confidence"),
+        "evidence_for": list(dict.fromkeys(evidence_for)),
+        "evidence_against": list(dict.fromkeys(evidence_against)),
+        "supporting_source_groups": groups(evidence_for),
+        "contradicting_source_groups": groups(evidence_against),
+    }
+
+
+def _public_evidence_ids(
+    item: dict[str, Any], field: str, aliases: dict[str, str], known_ids: set[str]
+) -> list[str]:
+    values = list(item.get(field) or [])
+    derived_key = (
+        "support_evidence_ids" if field == "evidence_for" else "contradiction_evidence_ids"
+    )
+    values.extend(item.get(derived_key) or [])
+    ids: list[str] = []
+    for value in values:
+        text = str(value)
+        ids.extend(
+            aliases[match.group(0)]
+            for match in re.finditer(r"(?<![A-Za-z0-9_-])F-[0-9a-f]{12,64}(?![A-Za-z0-9_-])", text)
+            if match.group(0) in aliases
+        )
+        ids.extend(
+            match.group(0)
+            for match in re.finditer(r"(?<![A-Za-z0-9_-])E\d+(?![A-Za-z0-9_-])", text)
+            if match.group(0) in known_ids
+        )
+    return list(dict.fromkeys(ids))
+
+
+def _dedupe_v3_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique: dict[str, dict[str, Any]] = {}
+    for item in records:
+        unique[json.dumps(item, sort_keys=True, separators=(",", ":"))] = item
+    return list(unique.values())
+
+
+def _v3_stop_reason(state: PipelineState) -> str:
+    v2 = state.investigation_context.get("reasoning_trace_v2")
+    if not isinstance(v2, dict):
+        return "base_evidence_complete"
+    return str(v2.get("stop_reason") or "base_evidence_complete")
 
 
 def _component_identity(
@@ -735,6 +1025,7 @@ async def rank_stage(state: PipelineState) -> PipelineState:
         # Persist a mechanism only when the final headline is itself the
         # evidence-gated open-world candidate.
         _record_selected_open_world_hypothesis(state)
+        _record_selected_hypothesis_id(state)
         state.progress.emit(
             "ranking",
             f"Top candidate: {top.family}",
@@ -762,7 +1053,9 @@ def _merge_open_world_candidates(
         known_candidates,
         state.investigation_context.get("hypothesis_ledger"),
         fact_groups=_blackboard_fact_groups(
-            state.blackboard, _blackboard_artifact_evidence_ids(state)
+            state.blackboard,
+            _blackboard_artifact_evidence_ids(state),
+            eligibility_by_fact=_blackboard_eligibility(state),
         ),
         enabled=getattr(state.settings, "open_world_rca_mode", "off") != "off",
     )
@@ -773,12 +1066,13 @@ def _merge_open_world_candidates(
 
 
 def _refresh_public_reasoning_trace(state: PipelineState) -> None:
-    """Convert private F-id references to response-local E-id citations."""
+    """Refresh v2 and v3 public traces after response-local IDs are assigned."""
     trace = state.investigation_context.get("reasoning_trace_v2")
     if isinstance(trace, dict):
         state.investigation_context["reasoning_trace_v2"] = _public_reasoning_trace(
             trace, state
         )
+    state.investigation_context["reasoning_trace_v3"] = _public_reasoning_trace_v3(state)
 
 
 def _record_selected_open_world_hypothesis(state: PipelineState) -> None:
@@ -797,6 +1091,30 @@ def _record_selected_open_world_hypothesis(state: PipelineState) -> None:
         "supporting_evidence_ids": top.support_evidence_ids,
         "contradicting_evidence_ids": top.contradiction_evidence_ids,
     }
+
+
+def _record_selected_hypothesis_id(state: PipelineState) -> None:
+    """Publish a final selection only from a candidate's exact hypothesis ID.
+
+    Catalog candidates normally have no hypothesis ID.  In that case—and when
+    a stale candidate ID is not present in the public trace—we deliberately
+    omit the field rather than guessing from the family name.
+    """
+    trace = state.investigation_context.get("reasoning_trace_v3")
+    if not isinstance(trace, dict):
+        return
+    trace.pop("selected_hypothesis_id", None)
+    if not state.root_cause_candidates:
+        return
+    hypothesis_id = str(getattr(state.root_cause_candidates[0], "hypothesis_id", "") or "").strip()
+    hypotheses = trace.get("hypotheses")
+    known = {
+        str(item.get("hypothesis_id") or "")
+        for item in hypotheses
+        if isinstance(item, dict)
+    } if isinstance(hypotheses, list) else set()
+    if hypothesis_id and hypothesis_id in known:
+        trace["selected_hypothesis_id"] = hypothesis_id
 
 
 def _prepare_open_world_ledger(state: PipelineState) -> None:
@@ -825,7 +1143,62 @@ def _prepare_open_world_ledger(state: PipelineState) -> None:
                 item[target_key] = list(dict.fromkeys(aliases[fact_id] for fact_id in ids))
 
 
-def _blackboard_fact_groups(blackboard: Any, aliases: dict[str, str] | None = None) -> dict[str, str]:
+def _evidence_context(state: PipelineState) -> dict[str, object]:
+    target = state.target
+    entities = tuple(
+        f"{field}:{value}"
+        for field in ("pod", "node", "workload_name", "namespace", "storage_claim", "service")
+        if (value := str(getattr(target, field, "") or "").strip())
+    )
+    topology = tuple(
+        f"{field}:{value}"
+        for field in ("cluster", "project", "queue", "namespace", "node", "component")
+        if (value := str(getattr(target, field, "") or "").strip())
+    )
+    return {
+        "run_id": str(state.request.incident_id or ""),
+        "window_start": str(getattr(target, "fired_at", "") or ""),
+        "window_end": str(
+            getattr(target, "resolved_at", "") or getattr(target, "fired_at", "") or ""
+        ),
+        "entities": entities,
+        "topology": topology,
+    }
+
+
+def _blackboard_eligibility(state: PipelineState) -> dict[str, object]:
+    """One central context-aware eligibility verdict for all consumers."""
+    from app.services.evidence_blackboard import EvidenceEligibility
+
+    facts = getattr(state.blackboard, "facts", None)
+    if not callable(facts):
+        return {}
+    try:
+        context = _evidence_context(state)
+        return {
+            str(fact.fact_id): EvidenceEligibility.from_fact(fact, context=context)
+            for fact in facts()
+            if getattr(fact, "fact_id", "")
+        }
+    except Exception:  # noqa: BLE001 - malformed facts are never eligible
+        return {}
+
+
+def _public_evidence_eligibility(state: PipelineState) -> dict[str, object]:
+    aliases = _blackboard_artifact_evidence_ids(state)
+    return {
+        evidence_id: eligibility
+        for fact_id, eligibility in _blackboard_eligibility(state).items()
+        if (evidence_id := aliases.get(fact_id))
+    }
+
+
+def _blackboard_fact_groups(
+    blackboard: Any,
+    aliases: dict[str, str] | None = None,
+    *,
+    eligibility_by_fact: dict[str, object] | None = None,
+) -> dict[str, str]:
     facts = getattr(blackboard, "facts", None)
     if not callable(facts):
         return {}
@@ -835,6 +1208,7 @@ def _blackboard_fact_groups(blackboard: Any, aliases: dict[str, str] | None = No
             aliases.get(str(fact.fact_id), str(fact.fact_id)): str(fact.independence_group)
             for fact in facts()
             if getattr(fact, "fact_id", "")
+            and bool(getattr((eligibility_by_fact or {}).get(str(fact.fact_id)), "support", True))
         }
     except Exception:  # noqa: BLE001 - blackboard remains an optional enhancement
         return {}
@@ -1077,6 +1451,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             "hypothesis_ledger": state.investigation_context.get("hypothesis_ledger"),
             "investigation": state.investigation_context,
             "reasoning_trace_v2": state.investigation_context.get("reasoning_trace_v2", {}),
+            "reasoning_trace_v3": state.investigation_context.get("reasoning_trace_v3", {}),
             "open_world_candidates": [
                 candidate.as_dict() for candidate in state.open_world_candidates
             ],
@@ -1095,6 +1470,11 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
 
 async def harness_stage(state: PipelineState) -> PipelineState:
     """Validate the already-synthesized RCA and make bounded safe repairs."""
+    from app.services.critic import (
+        CriticResult,
+        apply_safe_patches,
+        critique_claims,
+    )
     from app.services.harness import (
         abstain,
         analysis_hash,
@@ -1103,11 +1483,6 @@ async def harness_stage(state: PipelineState) -> PipelineState:
         apply_trace,
         evaluate,
         payload,
-    )
-    from app.services.critic import (
-        CriticResult,
-        apply_safe_patches,
-        critique_claims,
     )
 
     response = state.response
@@ -1127,6 +1502,7 @@ async def harness_stage(state: PipelineState) -> PipelineState:
         state.results,
         state.root_cause_candidates,
         next_check=state.self_check_next,
+        evidence_eligibility=_public_evidence_eligibility(state),
     )
     evidence_ids = [
         str(getattr(artifact, "evidence_id", ""))
@@ -1167,12 +1543,19 @@ async def harness_stage(state: PipelineState) -> PipelineState:
             state.results,
             state.root_cause_candidates,
             next_check=state.self_check_next,
+            evidence_eligibility=_public_evidence_eligibility(state),
         )
 
     status = "pass"
     if verdict.failed_gates:
         abstain(response, state.root_cause_candidates, verdict)
-        verdict = evaluate(response, state.results, state.root_cause_candidates, next_check=state.self_check_next)
+        verdict = evaluate(
+            response,
+            state.results,
+            state.root_cause_candidates,
+            next_check=state.self_check_next,
+            evidence_eligibility=_public_evidence_eligibility(state),
+        )
         status = "abstained"
     elif verdict.score < state.settings.rca_harness_pass_score:
         response.analysis_quality = "degraded"
@@ -1308,6 +1691,7 @@ async def _investigate_until_settled(state: PipelineState) -> None:
         if getattr(state.settings, "open_world_rca_mode", "off") == "authoritative":
             state.root_cause_candidates = open_world
         _record_selected_open_world_hypothesis(state)
+        _record_selected_hypothesis_id(state)
 
         after_family = state.root_cause_candidates[0].family if state.root_cause_candidates else ""
         if after_family == before_family and _evidence_signature(state.results) == before_evidence:

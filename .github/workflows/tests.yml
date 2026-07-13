@@ -39,11 +39,14 @@ jobs:
         run: pytest -q
       - name: Eval gate
         working-directory: agent
-        run: python -m eval.run_eval --fixtures eval/fixtures.jsonl --min-top1 0.8
+        run: python -m eval.run_eval --fixtures eval/fixtures.jsonl --min-top1 0.95
       - name: Eval holdout report
         working-directory: agent
         continue-on-error: true
         run: python -m eval.run_eval --fixtures eval/fixtures_holdout.jsonl
+      - name: Novel incident E2E output gate
+        working-directory: agent
+        run: python -m eval.run_novel_incident_e2e_eval
       - name: NAT config validate
         working-directory: agent
         run: |

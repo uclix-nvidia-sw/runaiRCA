@@ -15,7 +15,8 @@ via the LLM (Korean when settings.language == "ko").
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
@@ -29,6 +30,287 @@ from app.masking import build_masker
 # How far back a change still counts as "recent" and relevant to this alert.
 # ponytail: fixed window; make it an env setting only if a real alert needs tuning.
 _RECENT_WINDOW_SECONDS = 3600
+
+# The query capability is deliberately narrower than the base collector: it can
+# only inspect the alerted namespace/node and returns a small metadata timeline.
+_QUERY_DEFAULT_LOOKBACK_SECONDS = 900
+_QUERY_MIN_LOOKBACK_SECONDS = 60
+_QUERY_MAX_LOOKBACK_SECONDS = 86400
+_QUERY_MAX_RESULTS = 20
+_QUERY_KINDS = frozenset({"all", "controller", "pod", "node_condition", "event", "helm"})
+_QUERY_KIND_ALIASES = {
+    "controllers": "controller",
+    "pods": "pod",
+    "node_conditions": "node_condition",
+    "events": "event",
+}
+_CHANGE_SOURCE_GROUP = "kubernetes_api"
+_COMPONENT_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?")
+
+
+async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
+    """Return a bounded, body-free change timeline for the alert's own scope.
+
+    Kubernetes Event messages and Helm Secret payloads are untrusted bodies and
+    may contain credentials.  This capability exposes only explicit resource
+    metadata (kind/name/timestamp/status), never the API response or summaries
+    derived from body text.  Namespace and node cannot be widened beyond the
+    resolved alert target.
+    """
+    if not isinstance(args, dict):
+        return _query_error("arguments must be an object")
+    source = str(args.get("kind") or args.get("source") or "all").strip().lower()
+    source = _QUERY_KIND_ALIASES.get(source, source)
+    if source not in _QUERY_KINDS:
+        return _query_error("kind must be one of: " + ", ".join(sorted(_QUERY_KINDS)))
+    namespace = str(target.namespace or "").strip()
+    requested_namespace = str(args.get("namespace") or "").strip()
+    if not namespace:
+        return _query_error("the alert has no namespace scope", source=source)
+    if requested_namespace and requested_namespace != namespace:
+        return _query_error("namespace must match the alert namespace scope", source=source)
+    if not _namespace_allowed(settings, namespace):
+        return _query_error("alert namespace is outside the configured allowlist", source=source)
+    node = str(target.node or "").strip()
+    requested_node = str(args.get("node") or "").strip()
+    if requested_node and requested_node != node:
+        return _query_error("node must match the alert node scope", source=source)
+    component = str(args.get("component") or "").strip()
+    if component and not _COMPONENT_RE.fullmatch(component):
+        return _query_error("component must be a bounded resource identifier", source=source)
+    lookback = _bounded_int(
+        args.get("lookback_seconds", _QUERY_DEFAULT_LOOKBACK_SECONDS),
+        minimum=_QUERY_MIN_LOOKBACK_SECONDS,
+        maximum=_QUERY_MAX_LOOKBACK_SECONDS,
+        label="lookback_seconds",
+    )
+    if isinstance(lookback, str):
+        return _query_error(lookback, source=source, namespace=namespace, node=node)
+    limit = _bounded_int(
+        args.get("limit", _QUERY_MAX_RESULTS),
+        minimum=1,
+        maximum=_QUERY_MAX_RESULTS,
+        label="limit",
+    )
+    if isinstance(limit, str):
+        return _query_error(
+            limit, source=source, namespace=namespace, node=node, lookback=lookback
+        )
+    token = _read_file(settings.kubernetes_token_path)
+    if not token:
+        return _query_error(
+            "kubernetes service account token unavailable",
+            source=source,
+            namespace=namespace,
+            node=node,
+            lookback=lookback,
+            limit=limit,
+        )
+
+    headers = {"Authorization": f"Bearer {token}"}
+    verify: bool | str = (
+        settings.kubernetes_ca_path if Path(settings.kubernetes_ca_path).exists() else True
+    )
+    now = datetime.now(UTC)
+    collector = ChangeCollector(settings)
+    warnings: list[str] = []
+    ns = quote(namespace, safe="")
+    query_limit = max(1, min(int(getattr(settings, "kubernetes_list_limit", limit)), limit))
+    changes: list[dict] = []
+    if source in {"all", "controller"}:
+        changes += await collector._recent_controllers(
+            ns, node, headers, verify, now, warnings, window_seconds=lookback, limit=query_limit
+        )
+    if source in {"all", "pod"}:
+        changes += await collector._recent_pods(
+            ns, headers, verify, now, warnings, window_seconds=lookback, limit=query_limit
+        )
+    if source in {"all", "node_condition"} and node:
+        changes += await collector._node_conditions(
+            node, headers, verify, now, warnings, window_seconds=lookback
+        )
+    if source in {"all", "event"}:
+        changes += await collector._recent_events(
+            ns, query_limit, headers, verify, now, warnings, window_seconds=lookback
+        )
+    if source in {"all", "helm"}:
+        changes += await collector._recent_helm_releases(
+            namespace,
+            ns,
+            query_limit,
+            headers,
+            verify,
+            now,
+            warnings,
+            window_seconds=lookback,
+        )
+    # A stalled rollout can be older than the requested window. Do not smuggle
+    # it into a short incident query merely because it remains mid-rollout.
+    changes = [
+        item
+        for item in changes
+        if _within_window(item.get("timestamp"), now, window_seconds=lookback)
+    ]
+    if component:
+        changes = [item for item in changes if str(item.get("name") or "") == component]
+    changes.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+    observation_window = _observation_window(lookback, now)
+    observation = _change_observation(
+        namespace=namespace,
+        node=node,
+        source=source,
+        lookback_seconds=lookback,
+        limit=limit,
+        changes=changes[:limit],
+        truncated=max(0, len(changes) - limit),
+        warnings=warnings,
+        component=component,
+        observation_window=observation_window,
+    )
+    return {
+        "query": (
+            f"kubernetes changes source={source} namespace={namespace} "
+            f"node={node or 'n/a'} lookback<={lookback}s results<={limit}"
+        ),
+        "title": "Kubernetes change timeline",
+        "summary": f"{len(observation['changes'])} recent change observation(s) (metadata only)",
+        "error": None,
+        "source_group": _CHANGE_SOURCE_GROUP,
+        "independence_group": _CHANGE_SOURCE_GROUP,
+        "observed_entity": observation["observed_entity"],
+        "observation_window": observation_window,
+        "polarity": observation["polarity"],
+        "coverage": observation["coverage"],
+        "observation": observation,
+        "result": observation,
+    }
+
+
+def _query_error(
+    error: str,
+    *,
+    source: str = "",
+    namespace: str = "",
+    node: str = "",
+    lookback: int | None = None,
+    limit: int | None = None,
+) -> dict:
+    observation = {
+        "schema_version": "v1",
+        "kind": "change_query",
+        "source_group": _CHANGE_SOURCE_GROUP,
+        "independence_group": _CHANGE_SOURCE_GROUP,
+        "scope": {"namespace": namespace, "node": node, "source": source},
+        "observed_entity": {"kind": "namespace", "name": namespace},
+        "window": {"lookback_seconds": lookback},
+        "observation_window": _observation_window(lookback),
+        "polarity": "unavailable",
+        "coverage": "unknown",
+        "lookback_seconds": lookback,
+        "result_limit": limit,
+        "status": "unavailable",
+        "changes": [],
+    }
+    return {
+        "query": "kubernetes changes (bounded)",
+        "title": "Kubernetes change timeline",
+        "summary": error,
+        "error": error,
+        "source_group": _CHANGE_SOURCE_GROUP,
+        "independence_group": _CHANGE_SOURCE_GROUP,
+        "observed_entity": observation["observed_entity"],
+        "observation_window": observation["observation_window"],
+        "polarity": observation["polarity"],
+        "coverage": observation["coverage"],
+        "observation": observation,
+        "result": observation,
+    }
+
+
+def _bounded_int(value: object, *, minimum: int, maximum: int, label: str) -> int | str:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return f"{label} must be an integer between {minimum} and {maximum}"
+    if not minimum <= parsed <= maximum:
+        return f"{label} must be between {minimum} and {maximum}"
+    return parsed
+
+
+def _change_observation(
+    *,
+    namespace: str,
+    node: str,
+    source: str,
+    lookback_seconds: int,
+    limit: int,
+    changes: list[dict],
+    truncated: int,
+    warnings: list[str],
+    component: str,
+    observation_window: dict[str, str],
+) -> dict:
+    """Project only safe change metadata; never copy Event or Secret bodies."""
+    safe_changes = [_safe_change_metadata(change, namespace) for change in changes]
+    return {
+        "schema_version": "v1",
+        "kind": "change_query",
+        "source_group": _CHANGE_SOURCE_GROUP,
+        "independence_group": _CHANGE_SOURCE_GROUP,
+        "scope": {
+            "namespace": namespace,
+            "node": node,
+            "source": source,
+            **({"component": component} if component else {}),
+        },
+        "observed_entity": {
+            "kind": "component" if component else "namespace",
+            "name": component or namespace,
+        },
+        "window": {"lookback_seconds": lookback_seconds},
+        "observation_window": observation_window,
+        "polarity": "present" if safe_changes else ("unknown" if warnings else "absent"),
+        "coverage": "partial" if warnings else "scoped",
+        "lookback_seconds": lookback_seconds,
+        "result_limit": limit,
+        "status": "partial" if warnings else "ok",
+        "changes": safe_changes,
+        "truncated_count": truncated,
+        "body_included": False,
+    }
+
+
+def _safe_change_metadata(change: dict, namespace: str) -> dict:
+    """Whitelist metadata fields so Event messages and Secret data cannot escape."""
+    safe = {
+        key: change[key]
+        for key in (
+            "timestamp",
+            "kind",
+            "name",
+            "namespace",
+            "rollout",
+            "helm_status",
+            "helm_pending",
+            "revision",
+            "condition",
+            "condition_status",
+            "reason",
+            "object_kind",
+        )
+        if key in change and change[key] is not None
+    }
+    if "namespace" not in safe and change.get("kind") != "NodeCondition":
+        safe["namespace"] = namespace
+    return safe
+
+
+def _observation_window(
+    lookback_seconds: int | None, now: datetime | None = None
+) -> dict[str, str]:
+    end = now or datetime.now(UTC)
+    start = end - timedelta(seconds=lookback_seconds or 0)
+    return {"start": start.isoformat(), "end": end.isoformat()}
 
 
 class ChangeCollector:
@@ -80,8 +362,10 @@ class ChangeCollector:
         controllers = await self._recent_controllers(ns, node, headers, verify, now, warnings)
         pods = await self._recent_pods(ns, headers, verify, now, warnings)
         node_changes = await self._node_conditions(node, headers, verify, now, warnings)
-        events = await self._recent_events(ns, limit, headers, verify, warnings)
-        helm = await self._recent_helm_releases(namespace, ns, limit, headers, verify, now, warnings)
+        events = await self._recent_events(ns, limit, headers, verify, now, warnings)
+        helm = await self._recent_helm_releases(
+            namespace, ns, limit, headers, verify, now, warnings
+        )
 
         changes = controllers + pods + node_changes + events + helm
         # Upstream depends_on namespaces: only rollouts / Helm changes there matter
@@ -195,10 +479,19 @@ class ChangeCollector:
         return response.data
 
     async def _recent_controllers(
-        self, ns, node, headers, verify, now, warnings
+        self,
+        ns,
+        node,
+        headers,
+        verify,
+        now,
+        warnings,
+        *,
+        window_seconds: int = _RECENT_WINDOW_SECONDS,
+        limit: int | None = None,
     ) -> list[dict]:  # noqa: ANN001
         out: list[dict] = []
-        params = {"limit": str(self._settings.kubernetes_list_limit)}
+        params = {"limit": str(limit or self._settings.kubernetes_list_limit)}
         for kind, api in (
             ("Deployment", "deployments"),
             ("StatefulSet", "statefulsets"),
@@ -214,9 +507,11 @@ class ChangeCollector:
                 # A generation bump the status hasn't caught up to = spec just changed.
                 gen = meta.get("generation")
                 observed = status.get("observedGeneration")
-                changed_recently = _within_window(meta.get("creationTimestamp"), now)
+                changed_recently = _within_window(
+                    meta.get("creationTimestamp"), now, window_seconds=window_seconds
+                )
                 cond_ts = _latest_condition_time(status.get("conditions"))
-                if _within_window(cond_ts, now):
+                if _within_window(cond_ts, now, window_seconds=window_seconds):
                     changed_recently = True
                 rollout = isinstance(gen, int) and gen != observed
                 if not (rollout or changed_recently):
@@ -269,7 +564,16 @@ class ChangeCollector:
         return sorted(out)
 
     async def _recent_helm_releases(
-        self, namespace, ns, limit, headers, verify, now, warnings
+        self,
+        namespace,
+        ns,
+        limit,
+        headers,
+        verify,
+        now,
+        warnings,
+        *,
+        window_seconds: int = _RECENT_WINDOW_SECONDS,
     ) -> list[dict]:  # noqa: ANN001
         """Helm v3 release revisions changed within the window (P2b).
 
@@ -291,7 +595,7 @@ class ChangeCollector:
             labels = _dict(meta.get("labels"))
             release = str(labels.get("name") or "").strip()
             created = meta.get("creationTimestamp")
-            if not release or not _within_window(created, now):
+            if not release or not _within_window(created, now, window_seconds=window_seconds):
                 continue
             try:
                 version = int(labels.get("version") or 0)
@@ -321,10 +625,20 @@ class ChangeCollector:
         out = [{k: v for k, v in e.items() if k != "_version"} for e in latest.values()]
         return out
 
-    async def _recent_pods(self, ns, headers, verify, now, warnings) -> list[dict]:  # noqa: ANN001
+    async def _recent_pods(
+        self,
+        ns,
+        headers,
+        verify,
+        now,
+        warnings,
+        *,
+        window_seconds: int = _RECENT_WINDOW_SECONDS,
+        limit: int | None = None,
+    ) -> list[dict]:  # noqa: ANN001
         data = await self._get(
             f"/api/v1/namespaces/{ns}/pods",
-            {"limit": str(self._settings.kubernetes_list_limit)},
+            {"limit": str(limit or self._settings.kubernetes_list_limit)},
             headers, verify, warnings, "pods",
         )
         out: list[dict] = []
@@ -342,7 +656,7 @@ class ChangeCollector:
                         "summary": f"Pod {name} is terminating (deletionTimestamp set).",
                     }
                 )
-            elif _within_window(created, now):
+            elif _within_window(created, now, window_seconds=window_seconds):
                 out.append(
                     {
                         "timestamp": created,
@@ -353,7 +667,16 @@ class ChangeCollector:
                 )
         return out
 
-    async def _node_conditions(self, node, headers, verify, now, warnings) -> list[dict]:  # noqa: ANN001
+    async def _node_conditions(
+        self,
+        node,
+        headers,
+        verify,
+        now,
+        warnings,
+        *,
+        window_seconds: int = _RECENT_WINDOW_SECONDS,
+    ) -> list[dict]:  # noqa: ANN001
         if not (node and self._settings.kubernetes_cluster_scope_enabled):
             return []
         data = await self._get(
@@ -366,7 +689,7 @@ class ChangeCollector:
         for cond in _list(_dict(data.get("status")).get("conditions")):
             cond = _dict(cond)
             transition = cond.get("lastTransitionTime")
-            if not _within_window(transition, now):
+            if not _within_window(transition, now, window_seconds=window_seconds):
                 continue
             ctype, cstatus = cond.get("type"), cond.get("status")
             # Ready=False/Unknown or any pressure=True is a meaningful transition.
@@ -380,13 +703,26 @@ class ChangeCollector:
                     "timestamp": transition,
                     "kind": "NodeCondition",
                     "name": node,
+                    "condition": ctype,
+                    "condition_status": cstatus,
+                    "reason": cond.get("reason"),
                     "summary": f"Node {node} condition {ctype}={cstatus} "
                     f"({cond.get('reason') or 'transitioned'}).",
                 }
             )
         return out
 
-    async def _recent_events(self, ns, limit, headers, verify, warnings) -> list[dict]:  # noqa: ANN001
+    async def _recent_events(
+        self,
+        ns,
+        limit,
+        headers,
+        verify,
+        now,
+        warnings,
+        *,
+        window_seconds: int = _RECENT_WINDOW_SECONDS,
+    ) -> list[dict]:  # noqa: ANN001
         data = await self._get(
             f"/api/v1/namespaces/{ns}/events",
             {"limit": limit}, headers, verify, warnings, "events",
@@ -395,12 +731,16 @@ class ChangeCollector:
         for item in _items(data):
             item = _dict(item)
             ts = item.get("lastTimestamp") or item.get("eventTime")
+            if not _within_window(ts, now, window_seconds=window_seconds):
+                continue
             involved = _dict(item.get("involvedObject"))
             events.append(
                 {
                     "timestamp": ts,
                     "kind": f"Event/{item.get('type', 'Normal')}",
                     "name": involved.get("name"),
+                    "reason": item.get("reason"),
+                    "object_kind": involved.get("kind"),
                     "summary": f"{item.get('reason')}: {item.get('message')}",
                     "_type": item.get("type"),
                 }
@@ -465,11 +805,13 @@ def _first_namespace(plan) -> str:  # noqa: ANN001
     return namespaces[0] if namespaces else ""
 
 
-def _within_window(ts: object, now: datetime) -> bool:
+def _within_window(
+    ts: object, now: datetime, *, window_seconds: int = _RECENT_WINDOW_SECONDS
+) -> bool:
     parsed = _parse_time(ts)
     if parsed is None:
         return False
-    return 0 <= (now - parsed).total_seconds() <= _RECENT_WINDOW_SECONDS
+    return 0 <= (now - parsed).total_seconds() <= window_seconds
 
 
 def _latest_condition_time(conditions: object) -> str | None:

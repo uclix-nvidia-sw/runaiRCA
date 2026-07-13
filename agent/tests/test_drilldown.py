@@ -256,17 +256,61 @@ def test_ontology_probe_records_structured_support_verdict(monkeypatch) -> None:
 
     asyncio.run(run_drilldowns(drill_settings(), [result], _target(), plan))
 
-    assert result.details["ontology_probe_assessments"] == [
-        {
-            "probe_id": "mount-check",
-            "tool": "k8s_read",
-            "verdict": "supports",
-            "support_signals": ["FailedMount"],
-            "refute_signals": [],
-            "hypothesis_family": "",
-            "artifact_index": 0,
+    assessment = result.details["ontology_probe_assessments"][0]
+    assert assessment | {"executed_at": ""} == {
+        "probe_id": "mount-check",
+        "tool": "k8s_read",
+        "verdict": "supports",
+        "support_signals": ["FailedMount"],
+        "refute_signals": [],
+        "template_id": "mount-check",
+        "attempt_index": 1,
+        "artifact_index": 0,
+        "executed_at": "",
+    }
+    assert assessment["executed_at"].endswith("Z")
+    assert "execution_id" not in assessment
+    assert "hypothesis_ids" not in assessment
+
+
+def test_ontology_probe_execution_uses_exact_template_hypotheses_and_run(monkeypatch) -> None:
+    async def fake_complete_json(settings, *, user, **_kwargs):
+        return {"action": "done"}
+
+    async def fake_k8s_read(settings, kind, **_kwargs):
+        return {
+            "kind": kind,
+            "status_code": 200,
+            "error": None,
+            "items": [{"reason": "FailedMount"}],
         }
-    ]
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
+    plan = InvestigationPlan(
+        diagnostic_directive={
+            "run_id": "ANL-42",
+            "probes": [
+                {
+                    "template_id": "storage-mount-v1",
+                    "tool": "k8s_read",
+                    "arguments_template": {"kind": "events", "namespace": "{{namespace}}"},
+                    "support_signal_any": ["FailedMount"],
+                    "hypothesis_ids": ["ANL-42:H2", "ANL-42:H7"],
+                }
+            ],
+        }
+    )
+    result = _k8s_result()
+
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), plan))
+
+    assessment = result.details["ontology_probe_assessments"][0]
+    assert assessment["template_id"] == "storage-mount-v1"
+    assert assessment["hypothesis_ids"] == ["ANL-42:H2", "ANL-42:H7"]
+    assert assessment["attempt_index"] == 1
+    assert assessment["execution_id"] == "ANL-42:storage-mount-v1:1"
+    assert "evidence_ids" not in assessment
 
 
 def test_ontology_probe_with_unresolved_placeholder_is_not_broadened(monkeypatch) -> None:

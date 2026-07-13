@@ -82,6 +82,8 @@ class EvidenceLink:
 def validate_evidence_links(
     links: Iterable[EvidenceLink | Mapping[str, Any]] | None,
     evidence_ids: Iterable[str],
+    *,
+    eligibility_by_id: Mapping[str, object] | None = None,
 ) -> tuple[list[EvidenceLink], list[str]]:
     """Normalize supplied evidence links without allowing bad links to pass.
 
@@ -114,6 +116,14 @@ def validate_evidence_links(
         if link.fact_id not in known:
             errors.append(f"link[{index}] references unknown evidence {link.fact_id!r}")
             continue
+        eligibility = (eligibility_by_id or {}).get(link.fact_id)
+        permits = getattr(eligibility, "permits", None)
+        if callable(permits) and not permits(link.role):
+            reason = str(getattr(eligibility, "reason", "") or "ineligible observation")
+            errors.append(
+                f"link[{index}] cannot use {link.fact_id!r} as {link.role}: {reason}"
+            )
+            continue
         key = (link.fact_id, link.role)
         if key not in seen:
             valid.append(link)
@@ -140,6 +150,7 @@ def evaluate(
     *,
     next_check: str = "",
     evidence_links: Iterable[EvidenceLink | Mapping[str, Any]] | None = None,
+    evidence_eligibility: Mapping[str, object] | None = None,
 ) -> HarnessVerdict:
     top = candidates[0] if candidates else None
     usable = _usable_artifacts(results)
@@ -157,8 +168,11 @@ def evaluate(
         for item in all_artifacts
         if getattr(item, "evidence_id", "")
     ]
+    eligibility_by_id = dict(evidence_eligibility or _artifact_eligibility(all_artifacts))
     supplied_links = _supplied_evidence_links(response, top, evidence_links)
-    links, link_errors = validate_evidence_links(supplied_links, all_ids)
+    links, link_errors = validate_evidence_links(
+        supplied_links, all_ids, eligibility_by_id=eligibility_by_id
+    )
     # Legacy callers derive support from the ranker's evidence agents.  New
     # callers provide explicit support/contradiction links and get exact claim
     # grounding instead of an agent-name approximation.
@@ -338,6 +352,7 @@ def analysis_hash(response: AlertAnalysisResponse) -> str:
         "root_cause_family": response.root_cause_family,
         "top_root_cause": context.get("top_root_cause"),
         "reasoning_trace_v2": context.get("reasoning_trace_v2"),
+        "reasoning_trace_v3": context.get("reasoning_trace_v3"),
         "evidence_links": context.get("evidence_links"),
     }
     value = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
@@ -386,6 +401,22 @@ def _usable_artifacts(results: list[CollectorResult]) -> list[object]:
     return out
 
 
+def _artifact_eligibility(artifacts: Iterable[object]) -> dict[str, object]:
+    """Evaluate links from the normalized fact semantics, not status prose."""
+    from app.services.evidence_blackboard import normalize_artifact
+
+    eligible: dict[str, object] = {}
+    for item in artifacts:
+        evidence_id = str(getattr(item, "evidence_id", "") or "")
+        if not evidence_id:
+            continue
+        try:
+            eligible[evidence_id] = normalize_artifact(item).eligibility
+        except Exception:  # noqa: BLE001 - malformed evidence must not become proof
+            continue
+    return eligible
+
+
 def _signature_support(top: RankedCause | None) -> bool:
     if top is None:
         return False
@@ -407,12 +438,17 @@ def _unique_artifacts(items: list[object]) -> list[object]:
 
 
 def _independence_key(item: object) -> str:
-    """Use an underlying source grouping when the EvidenceFact adapter supplies it."""
-    return str(
-        getattr(item, "independence_group", "")
-        or getattr(item, "source", "")
-        or getattr(item, "agent", "")
-    )
+    """Use the telemetry plane, even for legacy artifacts outside a blackboard."""
+    try:
+        from app.services.evidence_blackboard import normalize_artifact
+
+        return str(normalize_artifact(item).independence_group)
+    except Exception:  # noqa: BLE001 - malformed artifacts are not independent proof
+        return str(
+            getattr(item, "independence_group", "")
+            or getattr(item, "source", "")
+            or getattr(item, "agent", "")
+        )
 
 
 def _unsafe_action_without_guardrail(detail: str) -> bool:

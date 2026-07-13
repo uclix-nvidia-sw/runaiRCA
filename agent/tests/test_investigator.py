@@ -7,7 +7,12 @@ import pytest
 from app.collectors.base import CollectorResult
 from app.plan import InvestigationPlan
 from app.services.evidence_blackboard import Blackboard
-from app.services.investigator import _build_user_prompt, _evidence_summary, investigate
+from app.services.investigator import (
+    _build_user_prompt,
+    _evidence_summary,
+    _prioritize_probes,
+    investigate,
+)
 from tests.test_orchestrator import make_settings, make_target
 
 
@@ -129,6 +134,33 @@ def test_investigator_prompt_receives_ontology_diagnostic_directive() -> None:
     assert '"source": "typedb"' in prompt
     assert "per-rank timestamps" in prompt
     assert "outside the incident window" in prompt
+
+
+def test_probe_priority_prefers_new_telemetry_before_duplicate_source() -> None:
+    probes = _prioritize_probes(
+        [{"collector": "change"}, {"collector": "loki"}],
+        evidence={"kubernetes": CollectorResult(agent="kubernetes", status="ok", summary="ok")},
+        ledger=[{"id": "H1", "status": "testing"}],
+        plan=InvestigationPlan(),
+    )
+
+    # change and Kubernetes both read the Kubernetes API, so Loki is a more
+    # discriminating next observation even though both collectors are unprobed.
+    assert [probe["collector"] for probe in probes] == ["loki", "change"]
+
+
+def test_probe_priority_prefers_probe_covering_unresolved_hypothesis() -> None:
+    probes = _prioritize_probes(
+        [
+            {"collector": "loki", "hypothesis_ids": ["H2"]},
+            {"collector": "runai", "hypothesis_ids": ["H1"]},
+        ],
+        evidence={},
+        ledger=[{"id": "H1", "status": "testing"}, {"id": "H2", "status": "refuted"}],
+        plan=InvestigationPlan(),
+    )
+
+    assert [probe["collector"] for probe in probes] == ["runai", "loki"]
 
 
 @pytest.mark.asyncio

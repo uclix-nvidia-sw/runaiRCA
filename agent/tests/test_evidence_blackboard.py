@@ -3,7 +3,13 @@ from __future__ import annotations
 import json
 
 from app.collectors.base import NO_EVIDENCE, CollectorResult, artifact
-from app.services.evidence_blackboard import Blackboard, EvidenceBlackboard, normalize_artifact
+from app.services.evidence_blackboard import (
+    Blackboard,
+    EvidenceBlackboard,
+    normalize_artifact,
+    source_independence_group,
+    temporal_relation_to_incident,
+)
 
 
 def _artifact(*, source: str = "loki", status: str = "ok", **kwargs):
@@ -138,3 +144,86 @@ def test_response_local_evidence_alias_does_not_change_fact_identity() -> None:
     item.evidence_id = "E01"
 
     assert board.evidence_id_for(item) == original.fact_id
+
+
+def test_eligibility_rejects_unknown_support_and_limits_scoped_absence_to_refutation() -> None:
+    unknown = normalize_artifact(_artifact(status="pending", summary="incomplete", highlights=[]))
+    absent = normalize_artifact(
+        _artifact(summary=f"{NO_EVIDENCE} no matching lines", highlights=[], result={"count": 0})
+    )
+
+    assert not unknown.eligibility.permits("support")
+    assert not unknown.eligibility.permits("contradict")
+    assert not absent.eligibility.permits("support")
+    assert absent.eligibility.permits("contradict")
+
+
+def test_change_source_is_kubernetes_unless_collector_overrides_group() -> None:
+    item = _artifact(source="change", agent="change", summary="deployment revision observed")
+    board = Blackboard()
+    overridden = board.add_result(
+        "change",
+        CollectorResult(
+            agent="change",
+            status="ok",
+            summary=item.summary or "",
+            artifacts=[item],
+            details={"source_group": "external_audit"},
+        ),
+    )
+
+    assert source_independence_group("change") == "kubernetes_api"
+    assert overridden[0].source_group == "external_audit"
+
+
+def test_eligibility_rejects_explicit_wrong_run_window_entity_or_topology() -> None:
+    fact = normalize_artifact(
+        {
+            "agent": "kubernetes",
+            "source": "kubernetes",
+            "type": "event",
+            "status": "ok",
+            "summary": "FailedMount",
+            "run_id": "run-a",
+            "topology": ["cluster:one", "node:gpu-01"],
+        },
+        entity="pod:trainer-0",
+        observed_window_start="2026-07-13T00:00:00Z",
+        observed_window_end="2026-07-13T00:10:00Z",
+    )
+
+    assert not fact.eligibility.from_fact(fact, context={"run_id": "run-b"}).support
+    assert not fact.eligibility.from_fact(
+        fact,
+        context={"window_start": "2026-07-13T01:00:00Z", "window_end": "2026-07-13T02:00:00Z"},
+    ).support
+    assert not fact.eligibility.from_fact(fact, context={"entities": ["pod:other"]}).support
+    assert not fact.eligibility.from_fact(fact, context={"topology": ["cluster:two"]}).support
+
+
+def test_precise_artifact_window_wins_and_is_classified_for_causal_review() -> None:
+    fact = normalize_artifact(
+        {
+            "agent": "change",
+            "source": "change",
+            "type": "rollout",
+            "status": "ok",
+            "summary": "Deployment revision changed",
+            # Drilldown artifacts retain a tool's observation as their result.
+            "result": {
+                "observation_window": {
+                    "start": "2026-07-13T00:00:00Z",
+                    "end": "2026-07-13T00:01:00Z",
+                },
+                "source_group": "external_audit",
+            },
+        },
+        observed_window_start="2026-07-13T00:05:00Z",
+        observed_window_end="2026-07-13T00:10:00Z",
+    )
+
+    assert fact.observation_window == ("2026-07-13T00:00:00Z", "2026-07-13T00:01:00Z")
+    assert fact.source_group == "external_audit"
+    assert temporal_relation_to_incident(
+        *fact.observation_window, "2026-07-13T00:05:00Z", "2026-07-13T00:10:00Z"
+    ) == "precedes_incident"

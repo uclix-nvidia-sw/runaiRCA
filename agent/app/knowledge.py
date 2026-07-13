@@ -1,15 +1,27 @@
 from __future__ import annotations
 
+import asyncio
+import copy
+import logging
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import httpx
 import yaml
 
 from app.bm25 import BM25Index
 
+_log = logging.getLogger(__name__)
+
 _FUZZY_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_-]{2,}")
+_PROBE_TEMPLATE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_BUNDLED_TROUBLESHOOTING_TREE = (
+    Path(__file__).resolve().parent.parent / "knowledge" / "k8s_troubleshooting_tree.yaml"
+)
 _CONTRAST_PREFIX_RE = re.compile(
     r"\b(?:but|however|though|yet)\s+(?:now\s+|currently\s+)?(?:[\w\"'-]+\s+){0,4}$"
     r"|(?:지만|하지만)\s*(?:\S+\s+){0,4}$"
@@ -703,7 +715,234 @@ def component_check_lines(components: dict[str, dict[str, Any]], name: str) -> l
     return lines
 
 
-def load_failure_modes(path: str) -> dict[str, list[dict[str, Any]]]:
+@dataclass(frozen=True)
+class _ApprovedKnowledgeSnapshot:
+    """Validated immutable-in-practice runtime payload ready for an atomic swap."""
+
+    revision: str
+    failure_modes: dict[str, tuple[dict[str, Any], ...]]
+    known_issues: tuple[dict[str, Any], ...]
+    probe_template_ids: dict[str, dict[str, tuple[str, ...]]]
+    package_count: int
+    package_ids: tuple[str, ...]
+
+
+class KnowledgeRegistry:
+    """Read-only runtime knowledge layered over version-controlled catalogs.
+
+    The backend owns approval and exposes a GET-only snapshot endpoint.  A full
+    payload is validated before replacing ``_snapshot``; callers therefore see
+    either the last good revision or no runtime revision, never a partial one.
+    """
+
+    _MODES = {"off", "shadow", "assist", "authoritative"}
+
+    def __init__(
+        self,
+        *,
+        mode: str = "shadow",
+        snapshot_url: str = "",
+        token: str = "",
+        refresh_seconds: int = 30,
+        timeout_seconds: int = 10,
+    ) -> None:
+        self.mode = mode if mode in self._MODES else "shadow"
+        self.snapshot_url = snapshot_url.rstrip("/")
+        self._token = token
+        self.refresh_seconds = max(30, refresh_seconds)
+        self.timeout_seconds = max(1, timeout_seconds)
+        self._snapshot: _ApprovedKnowledgeSnapshot | None = None
+        self._etag = ""
+        self._last_sync_at = ""
+        self._last_sync_error = ""
+        self._refresh_lock = asyncio.Lock()
+        self._refresh_task: asyncio.Task[None] | None = None
+
+    @classmethod
+    def from_settings(cls, settings: Any) -> KnowledgeRegistry:
+        return cls(
+            mode=str(getattr(settings, "dynamic_knowledge_mode", "shadow")),
+            snapshot_url=str(getattr(settings, "runtime_knowledge_url", "")),
+            token=str(getattr(settings, "runtime_knowledge_token", "")),
+            refresh_seconds=int(getattr(settings, "runtime_knowledge_refresh_seconds", 30)),
+            timeout_seconds=int(getattr(settings, "runtime_knowledge_timeout_seconds", 10)),
+        )
+
+    async def start(self) -> None:
+        """Start the best-effort 30-second ETag refresh loop."""
+        if self.mode == "off" or not self.snapshot_url:
+            return
+        await self.refresh()
+        if self._refresh_task is None:
+            self._refresh_task = asyncio.create_task(
+                self._refresh_loop(), name="runtime-knowledge-refresh"
+            )
+
+    async def stop(self) -> None:
+        task, self._refresh_task = self._refresh_task, None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _refresh_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.refresh_seconds)
+            await self.refresh()
+
+    async def refresh(self) -> bool:
+        """Fetch once, preserving the previous revision for every failed update."""
+        if self.mode == "off" or not self.snapshot_url:
+            return False
+        async with self._refresh_lock:
+            headers = {"Accept": "application/json"}
+            if self._etag:
+                headers["If-None-Match"] = self._etag
+            if self._token:
+                headers["Authorization"] = f"Bearer {self._token}"
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                    response = await client.get(self.snapshot_url, headers=headers)
+                if response.status_code == 304:
+                    self._mark_sync_success()
+                    return False
+                response.raise_for_status()
+                snapshot = _validate_approved_snapshot(response.json())
+            except Exception as exc:  # noqa: BLE001 - a sync must never stop RCA
+                self._last_sync_error = _sync_error(exc)
+                _log.warning("runtime knowledge refresh failed: %s", self._last_sync_error)
+                return False
+
+            # This assignment is the sole mutation of the active runtime revision.
+            # All validation above has completed, so readers cannot observe a
+            # mixture of package revisions.
+            self._snapshot = snapshot
+            self._etag = response.headers.get("ETag", self._etag)
+            self._mark_sync_success()
+            return True
+
+    def _mark_sync_success(self) -> None:
+        self._last_sync_at = datetime.now(UTC).isoformat()
+        self._last_sync_error = ""
+
+    def health(self) -> dict[str, Any]:
+        snapshot = self._snapshot
+        return {
+            "mode": self.mode,
+            "configured": bool(self.snapshot_url),
+            "loaded_revision": snapshot.revision if snapshot else None,
+            "loaded_packages": snapshot.package_count if snapshot else 0,
+            "active_package_ids": list(snapshot.package_ids) if snapshot else [],
+            "probe_template_families": sorted(snapshot.probe_template_ids) if snapshot else [],
+            "last_sync_at": self._last_sync_at or None,
+            "last_sync_error": self._last_sync_error or None,
+        }
+
+    def failure_modes(
+        self, baseline: dict[str, list[dict[str, Any]]]
+    ) -> dict[str, list[dict[str, Any]]]:
+        snapshot = self._snapshot
+        # The present pipeline feeds this catalog into ranking. Until it has a
+        # separate provisional candidate channel, only authoritative mode may
+        # change it; assist is deliberately observational.
+        if self.mode != "authoritative" or snapshot is None:
+            return copy.deepcopy(baseline)
+        runtime = {family: list(symptoms) for family, symptoms in snapshot.failure_modes.items()}
+        return _merge_failure_modes(baseline, runtime, authoritative=True)
+
+    def known_issues(self, baseline: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        snapshot = self._snapshot
+        if self.mode != "authoritative" or snapshot is None:
+            return copy.deepcopy(baseline)
+        return _merge_known_issues(baseline, list(snapshot.known_issues), authoritative=True)
+
+    def provisional_catalogs(self) -> dict[str, Any]:
+        """Return a copy of loaded runtime guidance without changing RCA ranking.
+
+        Assist consumers such as a future UI card or probe adviser can use this
+        method while ``load_failure_modes`` remains baseline-only.
+        """
+        snapshot = self._snapshot
+        if snapshot is None or self.mode == "off":
+            return {
+                "revision": None,
+                "failure_modes": {},
+                "known_issues": [],
+                "probe_template_ids": {},
+            }
+        return {
+            "revision": snapshot.revision,
+            "failure_modes": {
+                family: [copy.deepcopy(symptom) for symptom in symptoms]
+                for family, symptoms in snapshot.failure_modes.items()
+            },
+            "known_issues": [copy.deepcopy(issue) for issue in snapshot.known_issues],
+            "probe_template_ids": {
+                family: {package_id: list(ids) for package_id, ids in packages.items()}
+                for family, packages in snapshot.probe_template_ids.items()
+            },
+        }
+
+    def probe_template_ids_for_family(
+        self, family: str, *, include_assist: bool = True
+    ) -> list[str]:
+        """Return validated template IDs for safe planner/probe guidance only.
+
+        Shadow never exposes runtime probes. Assist can expose their identifiers
+        without changing RCA ranking; callers can disable that explicitly with
+        ``include_assist=False``.
+        """
+        snapshot = self._snapshot
+        if snapshot is None or self.mode not in {"assist", "authoritative"}:
+            return []
+        if self.mode == "assist" and not include_assist:
+            return []
+        values: list[str] = []
+        for ids in snapshot.probe_template_ids.get(family, {}).values():
+            for template_id in ids:
+                if template_id not in values:
+                    values.append(template_id)
+        return values
+
+
+_runtime_knowledge_registry: KnowledgeRegistry | None = None
+
+
+def set_runtime_knowledge_registry(registry: KnowledgeRegistry | None) -> None:
+    """Install the process registry used by the existing catalog load points."""
+    global _runtime_knowledge_registry
+    _runtime_knowledge_registry = registry
+
+
+def validate_runtime_knowledge(payload: Any) -> dict[str, Any]:
+    """Validate a read-only snapshot or one active compiled package.
+
+    This is the canonical agent-side validator used by the internal HTTP route.
+    It never writes a package or installs it in the live registry.
+    """
+    if not isinstance(payload, dict):
+        return {"valid": False, "errors": ["payload must be a JSON object"], "normalized": None}
+    snapshot_payload = payload
+    if "packages" not in payload:
+        snapshot_payload = {
+            "revision": str(payload.get("revision") or "validation"),
+            "packages": [payload],
+        }
+    try:
+        snapshot = _validate_approved_snapshot(snapshot_payload)
+    except (TypeError, ValueError) as exc:
+        return {"valid": False, "errors": [str(exc)], "normalized": None}
+    return {
+        "valid": True,
+        "errors": [],
+        "normalized": _normalized_snapshot(snapshot),
+    }
+
+
+def _load_failure_modes(path: str) -> dict[str, list[dict[str, Any]]]:
     """Parse failure_modes.yaml into {family: [{symptom, keywords[], actions[]}]}.
 
     Same shape the TypeDB knowledge layer returns, so the synthesis can render
@@ -738,7 +977,13 @@ def load_failure_modes(path: str) -> dict[str, list[dict[str, Any]]]:
     return knowledge
 
 
-def load_runai_known_issues(path: str) -> list[dict[str, Any]]:
+def load_failure_modes(path: str) -> dict[str, list[dict[str, Any]]]:
+    baseline = _load_failure_modes(path)
+    registry = _runtime_knowledge_registry
+    return registry.failure_modes(baseline) if registry else baseline
+
+
+def _load_runai_known_issues(path: str) -> list[dict[str, Any]]:
     """Parse runai_known_issues.yaml into a list of known-issue entries.
 
     Each entry: {issue, family, keywords[], reason, affected_version,
@@ -772,6 +1017,287 @@ def load_runai_known_issues(path: str) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def load_runai_known_issues(path: str) -> list[dict[str, Any]]:
+    baseline = _load_runai_known_issues(path)
+    registry = _runtime_knowledge_registry
+    return registry.known_issues(baseline) if registry else baseline
+
+
+def _validate_approved_snapshot(payload: Any) -> _ApprovedKnowledgeSnapshot:
+    """Validate the entire backend snapshot before it is eligible for a swap.
+
+    Snapshot packages are intentionally read-only and already active. Each
+    package uses ``package_id``, ``state: active``, and a ``compiled`` object
+    containing optional ``failure_modes`` / ``known_issues`` arrays. ``kind`` +
+    ``entries`` is also accepted so a producer can send one knowledge type per
+    package. Raw incident/case data is not a supported package shape.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("snapshot must be a JSON object")
+    revision = payload.get("revision")
+    packages = payload.get("packages")
+    if not isinstance(revision, str) or not revision.strip():
+        raise ValueError("snapshot revision must be a non-empty string")
+    if not isinstance(packages, list):
+        raise ValueError("snapshot packages must be an array")
+
+    failure_modes: dict[str, list[dict[str, Any]]] = {}
+    known_issues: list[dict[str, Any]] = []
+    probe_template_ids: dict[str, dict[str, tuple[str, ...]]] = {}
+    package_ids: list[str] = []
+    for index, package in enumerate(packages):
+        if not isinstance(package, dict):
+            raise ValueError(f"package {index} must be an object")
+        package_id = package.get("package_id", package.get("id"))
+        if not isinstance(package_id, str) or not package_id.strip():
+            raise ValueError(f"package {index} requires package_id")
+        package_ids.append(package_id.strip())
+        if package.get("state", package.get("status")) != "active":
+            raise ValueError(f"package {package_id} is not active")
+        contents = package.get("compiled", package.get("knowledge", package.get("payload")))
+        # The backend preserves package provenance in ``payload`` and places the
+        # safe, compiled subset under payload.compiled. Never inspect the rest of
+        # that payload (which may contain immutable case-snapshot metadata).
+        if isinstance(contents, dict) and isinstance(contents.get("compiled"), dict):
+            contents = contents["compiled"]
+        if not isinstance(contents, dict):
+            raise ValueError(f"package {package_id} compiled content must be an object")
+        kind = str(package.get("kind") or "").strip().lower()
+        entries = package.get("entries")
+        if not kind and not (
+            {"failure_modes", "known_issues", "probe_template_ids"} & contents.keys()
+        ):
+            raise ValueError(f"package {package_id} has no compiled knowledge")
+        raw_failure_modes = contents.get("failure_modes", [])
+        raw_known_issues = contents.get("known_issues", [])
+        if kind in {"failure_mode", "failure_modes"}:
+            raw_failure_modes = entries
+        elif kind in {"known_issue", "known_issues"}:
+            raw_known_issues = entries
+        validated_modes = _validate_runtime_failure_modes(raw_failure_modes, package_id)
+        for family, symptoms in validated_modes.items():
+            failure_modes.setdefault(family, []).extend(symptoms)
+        known_issues.extend(_validate_runtime_known_issues(raw_known_issues, package_id))
+        for family, ids in _validate_runtime_probe_template_ids(
+            contents.get("probe_template_ids"), package_id
+        ).items():
+            probe_template_ids.setdefault(family, {})[package_id.strip()] = ids
+
+    return _ApprovedKnowledgeSnapshot(
+        revision=revision.strip(),
+        failure_modes={family: tuple(symptoms) for family, symptoms in failure_modes.items()},
+        known_issues=tuple(known_issues),
+        probe_template_ids=probe_template_ids,
+        package_count=len(packages),
+        package_ids=tuple(package_ids),
+    )
+
+
+def _normalized_snapshot(snapshot: _ApprovedKnowledgeSnapshot) -> dict[str, Any]:
+    return {
+        "revision": snapshot.revision,
+        "active_package_ids": list(snapshot.package_ids),
+        "failure_modes": {
+            family: [copy.deepcopy(symptom) for symptom in symptoms]
+            for family, symptoms in snapshot.failure_modes.items()
+        },
+        "known_issues": [copy.deepcopy(issue) for issue in snapshot.known_issues],
+        "probe_template_ids": {
+            family: {package_id: list(ids) for package_id, ids in packages.items()}
+            for family, packages in snapshot.probe_template_ids.items()
+        },
+    }
+
+
+def _validate_runtime_failure_modes(value: Any, package_id: str) -> dict[str, list[dict[str, Any]]]:
+    if isinstance(value, dict):
+        entries = [
+            {"family": family, "symptoms": symptoms}
+            for family, symptoms in value.items()
+        ]
+    elif isinstance(value, list):
+        entries = value
+    else:
+        raise ValueError(f"package {package_id} failure_modes must be an array or object")
+    out: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError(f"package {package_id} has an invalid failure mode")
+        family = entry.get("family")
+        if not isinstance(family, str) or not family.strip():
+            raise ValueError(f"package {package_id} failure mode requires family")
+        raw_symptoms = entry.get("symptoms")
+        if raw_symptoms is None and "symptom" in entry:
+            raw_symptoms = [entry]
+        if not isinstance(raw_symptoms, list):
+            raise ValueError(f"package {package_id} failure mode symptoms must be an array")
+        for symptom in raw_symptoms:
+            if not isinstance(symptom, dict):
+                raise ValueError(f"package {package_id} has an invalid symptom")
+            name = symptom.get("name", symptom.get("symptom"))
+            keywords = symptom.get("keywords")
+            actions = symptom.get("actions", [])
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"package {package_id} symptom requires name")
+            if not isinstance(keywords, list) or not keywords or not all(
+                isinstance(keyword, str) and keyword.strip() for keyword in keywords
+            ):
+                raise ValueError(f"package {package_id} symptom requires string keywords")
+            if not isinstance(actions, list) or not all(
+                isinstance(action, str) for action in actions
+            ):
+                raise ValueError(f"package {package_id} symptom actions must be strings")
+            component = symptom.get("component", "")
+            if not isinstance(component, str):
+                raise ValueError(f"package {package_id} symptom component must be a string")
+            out.setdefault(family.strip(), []).append(
+                {
+                    "symptom": name.strip(),
+                    "keywords": [keyword.strip().lower() for keyword in keywords],
+                    "actions": list(actions),
+                    "component": component,
+                }
+            )
+    return out
+
+
+def _validate_runtime_known_issues(value: Any, package_id: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ValueError(f"package {package_id} known_issues must be an array")
+    out: list[dict[str, Any]] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise ValueError(f"package {package_id} has an invalid known issue")
+        issue = entry.get("issue")
+        keywords = entry.get("keywords")
+        actions = entry.get("actions", [])
+        if not isinstance(issue, str) or not issue.strip():
+            raise ValueError(f"package {package_id} known issue requires issue")
+        if not isinstance(keywords, list) or not keywords or not all(
+            isinstance(keyword, str) and keyword.strip() for keyword in keywords
+        ):
+            raise ValueError(f"package {package_id} known issue requires string keywords")
+        if not isinstance(actions, list) or not all(isinstance(action, str) for action in actions):
+            raise ValueError(f"package {package_id} known issue actions must be strings")
+        text_fields = ("family", "reason", "affected_version", "fixed_version")
+        if any(not isinstance(entry.get(field, ""), str) for field in text_fields):
+            raise ValueError(f"package {package_id} known issue fields must be strings")
+        out.append(
+            {
+                "issue": issue.strip(),
+                "family": entry.get("family", ""),
+                "keywords": [keyword.strip().lower() for keyword in keywords],
+                "reason": entry.get("reason", ""),
+                "affected_version": entry.get("affected_version", ""),
+                "fixed_version": entry.get("fixed_version", ""),
+                "actions": list(actions),
+            }
+        )
+    return out
+
+
+def _validate_runtime_probe_template_ids(
+    value: Any, package_id: str
+) -> dict[str, tuple[str, ...]]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"package {package_id} probe_template_ids must be an object")
+    out: dict[str, tuple[str, ...]] = {}
+    for family, raw_ids in value.items():
+        if not isinstance(family, str) or not family.strip():
+            raise ValueError(f"package {package_id} probe template family must be a string")
+        if not isinstance(raw_ids, list) or not all(
+            isinstance(template_id, str) and _PROBE_TEMPLATE_ID_RE.fullmatch(template_id)
+            for template_id in raw_ids
+        ):
+            raise ValueError(
+                f"package {package_id} probe template IDs must be safe identifier strings"
+            )
+        unknown_ids = [
+            template_id
+            for template_id in raw_ids
+            if template_id not in _bundled_probe_template_ids()
+        ]
+        if unknown_ids:
+            raise ValueError(
+                f"package {package_id} references unknown bundled probe template IDs"
+            )
+        out[family.strip()] = tuple(dict.fromkeys(raw_ids))
+    return out
+
+
+@lru_cache(maxsize=1)
+def _bundled_probe_template_ids() -> frozenset[str]:
+    """Return only the existing bundled tree's stable probe-template IDs.
+
+    A missing or malformed catalog fails closed: runtime packages may still
+    carry failure-mode guidance, but no unverified probe ID can be activated.
+    """
+    try:
+        raw = yaml.safe_load(_BUNDLED_TROUBLESHOOTING_TREE.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return frozenset()
+    if not isinstance(raw, dict):
+        return frozenset()
+    ids: set[str] = set()
+    for node in raw.get("nodes", []):
+        if not isinstance(node, dict):
+            continue
+        for probe in node.get("probes", []):
+            if not isinstance(probe, dict):
+                continue
+            template_id = probe.get("id")
+            if isinstance(template_id, str) and _PROBE_TEMPLATE_ID_RE.fullmatch(template_id):
+                ids.add(template_id)
+    return frozenset(ids)
+
+
+def _merge_failure_modes(
+    baseline: dict[str, list[dict[str, Any]]],
+    runtime: dict[str, list[dict[str, Any]]],
+    *,
+    authoritative: bool,
+) -> dict[str, list[dict[str, Any]]]:
+    merged = copy.deepcopy(baseline)
+    for family, runtime_symptoms in runtime.items():
+        current = merged.setdefault(family, [])
+        existing = {
+            str(symptom.get("symptom") or ""): index
+            for index, symptom in enumerate(current)
+        }
+        for symptom in runtime_symptoms:
+            identity = str(symptom.get("symptom") or "")
+            if identity in existing:
+                if authoritative:
+                    current[existing[identity]] = copy.deepcopy(symptom)
+                continue
+            existing[identity] = len(current)
+            current.append(copy.deepcopy(symptom))
+    return merged
+
+
+def _merge_known_issues(
+    baseline: list[dict[str, Any]], runtime: list[dict[str, Any]], *, authoritative: bool
+) -> list[dict[str, Any]]:
+    merged = copy.deepcopy(baseline)
+    existing = {str(issue.get("issue") or ""): index for index, issue in enumerate(merged)}
+    for issue in runtime:
+        identity = str(issue.get("issue") or "")
+        if identity in existing:
+            if authoritative:
+                merged[existing[identity]] = copy.deepcopy(issue)
+            continue
+        existing[identity] = len(merged)
+        merged.append(copy.deepcopy(issue))
+    return merged
+
+
+def _sync_error(exc: Exception) -> str:
+    detail = str(exc).replace("\n", " ").strip()
+    return f"{exc.__class__.__name__}: {detail[:240]}" if detail else exc.__class__.__name__
 
 
 def match_runai_known_issues(

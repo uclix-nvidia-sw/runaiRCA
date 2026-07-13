@@ -15,9 +15,12 @@ The LLM only refines what the deterministic pass already produced.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+from hashlib import sha256
 
+from app import knowledge as knowledge_module
 from app.collectors.base import AnalysisTarget
 from app.config import Settings
 from app.knowledge import (
@@ -290,6 +293,31 @@ def _diagnostic_directive(
         for alternative in step.get("alternatives") or []
         if isinstance(alternative, dict)
     ]
+    probes: list[dict] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        step_id = str(step.get("id") or "legacy")
+        for index, raw_probe in enumerate(step.get("probes") or [], start=1):
+            if not isinstance(raw_probe, dict):
+                continue
+            probe = dict(raw_probe)
+            template_id = _probe_template_id(probe, step_id, index)
+            probe["id"] = template_id
+            probe["template_id"] = template_id
+            probes.append(probe)
+            if len(probes) == 8:
+                break
+        if len(probes) == 8:
+            break
+    known_template_ids = {str(probe.get("template_id") or "") for probe in probes}
+    for probe in _registered_tree_probes(tree, _runtime_probe_template_ids(family)):
+        if probe["template_id"] in known_template_ids:
+            continue
+        probes.append(probe)
+        known_template_ids.add(probe["template_id"])
+        if len(probes) == 8:
+            break
     return {
         "source": source,
         "path": list(walked.get("path") or []),
@@ -302,12 +330,7 @@ def _diagnostic_directive(
             for step in steps
             if step.get("interpretation")
         ][:4],
-        "probes": [
-            {**probe, "hypothesis_family": family}
-            for step in steps
-            for probe in (step.get("probes") or [])
-            if isinstance(probe, dict)
-        ][:8],
+        "probes": probes,
         "avoid": [str(step["avoid"])[:400] for step in steps if step.get("avoid")][:4],
         "disconfirm": [str(item)[:500] for item in conclusion.get("disconfirm") or []][:6],
         "provisional_family": family,
@@ -318,6 +341,97 @@ def _diagnostic_directive(
             "do not search only for the provisional family."
         ),
     }
+
+
+def _probe_template_id(probe: dict, step_id: str, index: int) -> str:
+    """Keep an authored ID; make legacy templates stable without editing knowledge."""
+    authored = str(
+        probe.get("template_id") or probe.get("id") or probe.get("probe_id") or ""
+    ).strip()
+    if authored:
+        return authored
+    canonical = json.dumps(
+        {
+            "tool": str(probe.get("tool") or ""),
+            "arguments_template": probe.get("arguments_template") or {},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode()
+    return f"{step_id}-probe-{index:02d}-{sha256(canonical).hexdigest()[:12]}"
+
+
+def _runtime_probe_template_ids(family: str) -> tuple[str, ...]:
+    """Read only approved template IDs; runtime knowledge never supplies probe contents."""
+    registry = getattr(knowledge_module, "_runtime_knowledge_registry", None)
+    if not family or getattr(registry, "mode", "") not in {"assist", "authoritative"}:
+        return ()
+    lookup = getattr(registry, "probe_template_ids_for_family", None)
+    if not callable(lookup):
+        return ()
+    try:
+        values = lookup(family)
+    except Exception:  # noqa: BLE001 - dynamic knowledge is advisory
+        _log.warning("runtime probe-template lookup failed", exc_info=True)
+        return ()
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        return ()
+    return tuple(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+
+
+def _registered_tree_probes(tree: object, template_ids: tuple[str, ...]) -> list[dict]:
+    if not template_ids or not isinstance(tree, dict) or not isinstance(tree.get("nodes"), dict):
+        return []
+    requested = set(template_ids)
+    matched: list[dict] = []
+    for step_id in sorted(tree["nodes"]):
+        node = tree["nodes"].get(step_id)
+        if not isinstance(node, dict):
+            continue
+        for index, raw_probe in enumerate(node.get("probes") or [], start=1):
+            if not isinstance(raw_probe, dict):
+                continue
+            probe = dict(raw_probe)
+            template_id = _probe_template_id(probe, str(step_id), index)
+            if template_id not in requested:
+                continue
+            probe["id"] = template_id
+            probe["template_id"] = template_id
+            matched.append(probe)
+    return matched
+
+
+def _assign_hypothesis_ids(hypotheses: list[dict[str, str]], run_id: str) -> list[dict[str, str]]:
+    if not run_id:
+        return [{key: value for key, value in item.items() if key != "id"} for item in hypotheses]
+    return [{**item, "id": f"{run_id}:H{index}"} for index, item in enumerate(hypotheses, start=1)]
+
+
+def _bind_probe_hypotheses(
+    directive: dict, hypotheses: list[dict[str, str]], run_id: str
+) -> dict:
+    """Bind probes to the planner's concrete IDs, never a family lookup at execution."""
+    if not directive:
+        return directive
+    bound = dict(directive)
+    family = str(bound.get("provisional_family") or "")
+    bound["probes"] = []
+    for probe in directive.get("probes") or []:
+        if not isinstance(probe, dict):
+            continue
+        bound_probe = {key: value for key, value in probe.items() if key != "hypothesis_ids"}
+        if run_id:
+            bound_probe["hypothesis_ids"] = [
+                str(hypothesis.get("id") or "")
+                for hypothesis in hypotheses
+                if str(hypothesis.get("family") or "") == family
+                and str(hypothesis.get("id") or "")
+            ]
+        bound["probes"].append(bound_probe)
+    if run_id:
+        bound["run_id"] = run_id
+    return bound
 
 
 def _alert_haystack(target: AnalysisTarget, alert) -> str:
@@ -578,6 +692,9 @@ async def plan_investigation(
             "Check that component and its depends_on chain first. " + narrative
         )
 
+    annotations = getattr(alert, "annotations", None) or {}
+    run_id = str(annotations.get("analysis_run_id") or "").strip()
+    hypotheses = _assign_hypothesis_ids(hypotheses, run_id)
     plan = InvestigationPlan(
         focus=focus,
         namespaces=namespaces,
@@ -610,6 +727,12 @@ async def plan_investigation(
         except Exception:  # noqa: BLE001 - planning is best-effort; keep deterministic plan
             _log.warning("LLM plan refinement failed; using deterministic plan", exc_info=True)
 
+    plan.hypotheses = _assign_hypothesis_ids(plan.hypotheses, run_id)
+    plan.diagnostic_directive = _bind_probe_hypotheses(
+        plan.diagnostic_directive,
+        plan.hypotheses,
+        run_id,
+    )
     return plan
 
 

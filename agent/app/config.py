@@ -168,12 +168,24 @@ class Settings:
     # back the whole behaviour without changing collector configuration.
     open_world_rca_mode: str = "shadow"  # off | shadow | assist | authoritative
     llm_model_critic: str = ""
+    # Approved incident-derived knowledge is fetched read-only from the backend.
+    # These defaults preserve existing Settings(...) callers and keep a rollout
+    # reversible without changing the version-controlled baseline catalogs.
+    dynamic_knowledge_mode: str = "shadow"  # off | shadow | assist | authoritative
+    runtime_knowledge_url: str = ""
+    runtime_knowledge_token: str = ""
+    runtime_knowledge_refresh_seconds: int = 30
+    runtime_knowledge_timeout_seconds: int = 10
 
 
 def load_settings() -> Settings:
     language = os.getenv("LANGUAGE", "en").strip().lower()
     if language not in {"en", "ko"}:
         language = "en"
+    backend_url = os.getenv("BACKEND_URL", "").strip().rstrip("/")
+    runtime_knowledge_url = os.getenv("RUNTIME_KNOWLEDGE_URL", "").strip().rstrip("/")
+    if not runtime_knowledge_url and backend_url:
+        runtime_knowledge_url = f"{backend_url}/api/v1/knowledge/runtime-snapshot"
 
     return Settings(
         port=_int_env("PORT", 8000),
@@ -227,7 +239,7 @@ def load_settings() -> Settings:
             "COLLECTORS",
             ("runai", "kubernetes", "postgres", "prometheus", "loki", "system", "change"),
         ),
-        backend_url=os.getenv("BACKEND_URL", "").strip().rstrip("/"),
+        backend_url=backend_url,
         postgres_dsn=os.getenv("POSTGRES_DSN", "").strip(),
         postgres_timeout_seconds=_int_env("POSTGRES_TIMEOUT_SECONDS", 60),
         # Optional DSN for the Run:ai control-plane Postgres (the platform's own
@@ -326,9 +338,23 @@ def load_settings() -> Settings:
         rca_harness_pass_score=max(0, min(100, _int_env("RCA_HARNESS_PASS_SCORE", 70))),
         max_investigation_iterations=_nonnegative_int_env("MAX_INVESTIGATION_ITERATIONS", 0),
         open_world_rca_mode=_open_world_mode_env(),
+        dynamic_knowledge_mode=_dynamic_knowledge_mode_env(),
+        runtime_knowledge_url=runtime_knowledge_url,
+        runtime_knowledge_token=os.getenv("RUNTIME_KNOWLEDGE_TOKEN", "").strip(),
+        runtime_knowledge_refresh_seconds=max(
+            30, _int_env("RUNTIME_KNOWLEDGE_REFRESH_SECONDS", 30)
+        ),
+        runtime_knowledge_timeout_seconds=max(
+            1, _int_env("RUNTIME_KNOWLEDGE_TIMEOUT_SECONDS", 10)
+        ),
     )
 
 
 def _open_world_mode_env() -> str:
     mode = os.getenv("OPEN_WORLD_RCA_MODE", "shadow").strip().lower()
+    return mode if mode in {"off", "shadow", "assist", "authoritative"} else "shadow"
+
+
+def _dynamic_knowledge_mode_env() -> str:
+    mode = os.getenv("DYNAMIC_KNOWLEDGE_MODE", "shadow").strip().lower()
     return mode if mode in {"off", "shadow", "assist", "authoritative"} else "shadow"
