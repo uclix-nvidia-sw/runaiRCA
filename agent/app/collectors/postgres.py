@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
+from app.collectors.base import (
+    NO_EVIDENCE,
+    AnalysisTarget,
+    CollectorResult,
+    artifact,
+    incident_time_range,
+    ko_en,
+)
 from app.collectors.loki import _llm_insight
 from app.config import Settings
 from app.mcp_client import (
@@ -191,6 +199,18 @@ async def _postgres_result(
     long_tx_count = len(checks["long_transactions"])
     pgvector = checks["pgvector_extension"]
     rca_tables = checks["rca_tables"]
+    incident_history = checks.get("incident_history", {})
+    history_tables = (
+        incident_history.get("tables", []) if isinstance(incident_history, dict) else []
+    )
+    history_rows = sum(
+        int(item.get("matching_rows") or 0)
+        for item in history_tables
+        if isinstance(item, dict)
+    )
+    history_match_tables = sum(
+        1 for item in history_tables if isinstance(item, dict) and item.get("matching_rows")
+    )
     missing_tables = [name for name, exists in rca_tables.items() if not exists]
     status = "ok"
     if long_tx_count:
@@ -201,12 +221,24 @@ async def _postgres_result(
         warnings.append(f"Missing RCA table(s): {', '.join(missing_tables)}.")
 
     if database_kind == "runai_control_plane":
+        history_summary = (
+            f" incident 시간창 audit/history 레코드 {history_rows}건 "
+            f"({history_match_tables}개 테이블)을 조회했습니다."
+            if history_rows
+            else " incident 시간창에 일치하는 audit/history 레코드는 없습니다."
+        )
         summary = ko_en(
             settings,
             "Run:ai 컨트롤플레인 Postgres 읽기 전용 점검: 연결 정상, "
-            f"활성 연결 {checks['active_connections']}개.",
+            f"활성 연결 {checks['active_connections']}개.{history_summary}",
             "Run:ai control-plane Postgres read-only check: connectivity ok, "
-            f"{checks['active_connections']} active connection(s).",
+            f"{checks['active_connections']} active connection(s)."
+            + (
+                f" Read {history_rows} audit/history record(s) from {history_match_tables} "
+                "table(s) in the incident window."
+                if history_rows
+                else " No audit/history records matched the incident window."
+            ),
         )
     else:
         summary = ko_en(
@@ -221,7 +253,10 @@ async def _postgres_result(
     # Owner rule: a PASSING healthcheck is NOT incident evidence. Lead with the
     # no-evidence marker (drops it from supporting evidence / signature matching)
     # and skip the LLM insight — only an actual DB finding earns evidence weight.
-    healthy = status == "ok"
+    # Audit/history rows are time-bounded incident observations. They are not a
+    # health-check failure by themselves, but must not be discarded as a passing
+    # current-state check or turned into a no-evidence marker.
+    healthy = status == "ok" and not history_rows
     confidence = "medium"
     if healthy:
         summary = f"{NO_EVIDENCE} {summary}"
@@ -246,7 +281,8 @@ async def _postgres_result(
                 confidence=confidence,
                 query=(
                     "SELECT 1; pg_stat_activity long transaction scan; "
-                    "pg_extension vector check; to_regclass RCA table check"
+                    "pg_extension vector check; to_regclass RCA table check; "
+                    "incident-window audit/history scan"
                 ),
                 summary=summary,
                 result={**checks, "used_mcp": used_mcp, "database_kind": database_kind},
@@ -314,6 +350,11 @@ async def _collect_postgres_checks(
             LIMIT 20
             """
         )
+    incident_history = (
+        await _collect_incident_history_direct(conn, target)
+        if not check_rca_tables
+        else _empty_incident_history(target)
+    )
     return {
         "connected": True,
         "active_connections": int(active_connections or 0),
@@ -321,6 +362,7 @@ async def _collect_postgres_checks(
         "pgvector_extension": bool(pgvector_extension),
         "rca_tables": {record["table_name"]: bool(record["exists"]) for record in table_rows},
         "visible_tables": [_record_to_dict(record) for record in visible_tables],
+        "incident_history": incident_history,
         "correlation_hint": {
             "cluster": target.cluster,
             "project": target.project,
@@ -337,6 +379,214 @@ def _record_to_dict(record: Any) -> dict[str, Any]:
 
 def _postgres_direct_dsn(settings: Settings) -> str:
     return settings.runai_db_dsn or settings.postgres_dsn
+
+
+_SQL_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_HISTORY_TABLE_LIMIT = 6
+_HISTORY_TIMESTAMP_TYPES = {"timestamp with time zone", "timestamp without time zone"}
+_HISTORY_TIME_COLUMNS = (
+    "occurred_at",
+    "event_time",
+    "created_at",
+    "timestamp",
+    "time",
+    "updated_at",
+)
+_HISTORY_CONTEXT_COLUMNS = (
+    "id",
+    "action",
+    "event_type",
+    "event_name",
+    "operation",
+    "operation_type",
+    "resource_type",
+    "resource_id",
+    "workload",
+    "workload_name",
+    "project",
+    "namespace",
+    "status",
+)
+
+
+def _empty_incident_history(target: AnalysisTarget) -> dict[str, Any]:
+    return {"time_range": incident_time_range(target), "tables": []}
+
+
+def _history_column_discovery_sql() -> str:
+    # Do not probe arbitrary application tables. Both the schema/table name and
+    # timestamp type are constrained here; the result is later identifier-quoted
+    # before it becomes a query. Context columns are a deliberately small allowlist
+    # so audit payloads cannot expose token/password/blob fields as RCA evidence.
+    context_columns = ", ".join(f"'{column}'" for column in _HISTORY_CONTEXT_COLUMNS)
+    return f"""
+        SELECT table_schema, table_name, column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+          AND (
+            table_schema ILIKE '%audit%'
+            OR table_schema ILIKE '%history%'
+            OR table_name ILIKE '%audit%'
+            OR table_name ILIKE '%history%'
+          )
+          AND (
+            data_type IN ('timestamp with time zone', 'timestamp without time zone')
+            OR column_name IN ({context_columns})
+          )
+        ORDER BY table_schema, table_name, ordinal_position
+        LIMIT 160
+    """
+
+
+def _history_tables(column_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in column_rows:
+        schema = str(row.get("table_schema") or "")
+        table = str(row.get("table_name") or "")
+        column = str(row.get("column_name") or "")
+        data_type = str(row.get("data_type") or "").lower()
+        if not all(_SQL_IDENTIFIER.fullmatch(value) for value in (schema, table, column)):
+            continue
+        entry = grouped.setdefault(
+            (schema, table), {"schema": schema, "table": table, "timestamps": [], "context": []}
+        )
+        if data_type in _HISTORY_TIMESTAMP_TYPES:
+            entry["timestamps"].append(column)
+        elif column in _HISTORY_CONTEXT_COLUMNS:
+            entry["context"].append(column)
+
+    candidates: list[dict[str, Any]] = []
+    for entry in grouped.values():
+        timestamps = entry["timestamps"]
+        if not timestamps:
+            continue
+        timestamp_column = next(
+            (column for column in _HISTORY_TIME_COLUMNS if column in timestamps), timestamps[0]
+        )
+        context = [column for column in _HISTORY_CONTEXT_COLUMNS if column in entry["context"]]
+        candidates.append(
+            {
+                "schema": entry["schema"],
+                "table": entry["table"],
+                "timestamp_column": timestamp_column,
+                "context_columns": context[:5],
+            }
+        )
+    return candidates[:_HISTORY_TABLE_LIMIT]
+
+
+def _quoted_identifier(value: str) -> str:
+    if not _SQL_IDENTIFIER.fullmatch(value):
+        raise ValueError("invalid Postgres identifier")
+    return f'"{value}"'
+
+
+def _history_query(table: dict[str, Any], *, mcp: bool, time_range: dict[str, str] | None) -> str:
+    schema = _quoted_identifier(str(table["schema"]))
+    name = _quoted_identifier(str(table["table"]))
+    timestamp = _quoted_identifier(str(table["timestamp_column"]))
+    if mcp:
+        if not time_range:
+            raise ValueError("incident time range is required for audit/history queries")
+        start = f"'{time_range['start']}'::timestamptz"
+        end = f"'{time_range['end']}'::timestamptz"
+    else:
+        start, end = "$1::timestamptz", "$2::timestamptz"
+    columns = [f"{timestamp} AS event_time"]
+    for column in table.get("context_columns", []):
+        quoted = _quoted_identifier(str(column))
+        columns.append(f"left(coalesce({quoted}::text, ''), 240) AS {quoted}")
+    return f"""
+        SELECT {', '.join(columns)}
+        FROM {schema}.{name}
+        WHERE {timestamp} >= {start}
+          AND {timestamp} <= {end}
+        ORDER BY {timestamp} DESC
+        LIMIT 10
+    """
+
+
+def _history_aggregate_query(
+    table: dict[str, Any], *, mcp: bool, time_range: dict[str, str] | None
+) -> str:
+    schema = _quoted_identifier(str(table["schema"]))
+    name = _quoted_identifier(str(table["table"]))
+    timestamp = _quoted_identifier(str(table["timestamp_column"]))
+    if mcp:
+        if not time_range:
+            raise ValueError("incident time range is required for audit/history queries")
+        start = f"'{time_range['start']}'::timestamptz"
+        end = f"'{time_range['end']}'::timestamptz"
+    else:
+        start, end = "$1::timestamptz", "$2::timestamptz"
+    return f"""
+        SELECT count(*) AS matching_rows,
+               min({timestamp}) AS first_event_at,
+               max({timestamp}) AS last_event_at
+        FROM {schema}.{name}
+        WHERE {timestamp} >= {start}
+          AND {timestamp} <= {end}
+    """
+
+
+async def _collect_incident_history_direct(conn: Any, target: AnalysisTarget) -> dict[str, Any]:
+    history = _empty_incident_history(target)
+    time_range = history["time_range"]
+    if not time_range:
+        return history
+    columns = await conn.fetch(_history_column_discovery_sql())
+    tables: list[dict[str, Any]] = []
+    for table in _history_tables([_record_to_dict(row) for row in columns]):
+        aggregate_rows = await conn.fetch(
+            _history_aggregate_query(table, mcp=False, time_range=time_range),
+            time_range["start"],
+            time_range["end"],
+        )
+        aggregate = _record_to_dict(aggregate_rows[0]) if aggregate_rows else {}
+        rows = await conn.fetch(
+            _history_query(table, mcp=False, time_range=time_range),
+            time_range["start"],
+            time_range["end"],
+        )
+        tables.append(
+            {
+                **table,
+                "matching_rows": int(aggregate.get("matching_rows") or 0),
+                "first_event_at": aggregate.get("first_event_at"),
+                "last_event_at": aggregate.get("last_event_at"),
+                "rows": [_record_to_dict(row) for row in rows],
+            }
+        )
+    history["tables"] = tables
+    return history
+
+
+async def _collect_incident_history_mcp(
+    settings: Settings, target: AnalysisTarget
+) -> dict[str, Any]:
+    history = _empty_incident_history(target)
+    time_range = history["time_range"]
+    if not time_range:
+        return history
+    columns = await _mcp_fetch(settings, _history_column_discovery_sql())
+    tables: list[dict[str, Any]] = []
+    for table in _history_tables(columns):
+        aggregate_rows = await _mcp_fetch(
+            settings, _history_aggregate_query(table, mcp=True, time_range=time_range)
+        )
+        aggregate = aggregate_rows[0] if aggregate_rows else {}
+        rows = await _mcp_fetch(settings, _history_query(table, mcp=True, time_range=time_range))
+        tables.append(
+            {
+                **table,
+                "matching_rows": int(aggregate.get("matching_rows") or 0),
+                "first_event_at": aggregate.get("first_event_at"),
+                "last_event_at": aggregate.get("last_event_at"),
+                "rows": rows,
+            }
+        )
+    history["tables"] = tables
+    return history
 
 
 async def _collect_postgres_checks_mcp(
@@ -402,6 +652,11 @@ async def _collect_postgres_checks_mcp(
             LIMIT 20
             """,
         )
+    incident_history = (
+        await _collect_incident_history_mcp(settings, target)
+        if not check_rca_tables
+        else _empty_incident_history(target)
+    )
     return {
         "connected": True,
         "active_connections": int(active_connections or 0),
@@ -409,6 +664,7 @@ async def _collect_postgres_checks_mcp(
         "pgvector_extension": bool(pgvector_extension),
         "rca_tables": {row.get("table_name"): bool(row.get("exists")) for row in table_rows},
         "visible_tables": visible_tables,
+        "incident_history": incident_history,
         "correlation_hint": {
             "cluster": target.cluster,
             "project": target.project,

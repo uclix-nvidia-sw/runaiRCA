@@ -502,6 +502,69 @@ async def test_korean_synthesis_sanitizes_unavailable_collector_summary(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_korean_synthesis_exposes_condition_polarity(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko")
+    captured: list[str] = []
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        captured.append(user)
+        return {"summary": "요약", "detail": "본문"}
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    result = CollectorResult(agent="kubernetes", status="ok", summary="node checked")
+    result.artifacts.append(
+        artifact(
+            agent="kubernetes",
+            source="kubernetes",
+            type="cluster_api",
+            status="ok",
+            confidence="high",
+            summary="node conditions checked",
+            result={
+                "conditions": [
+                    {"type": "MemoryPressure", "status": "False"},
+                    {"type": "DiskPressure", "status": "True"},
+                ]
+            },
+        )
+    )
+
+    await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "NodeCondition"})
+        ),
+        results=[result],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="node_kubelet_pressure", confidence="medium", score=5.0)
+        ],
+        kg_context={},
+        graph_fixes=GraphRemediation(),
+        fallback_detail="fallback",
+    )
+
+    payload = json.loads(captured[0].removeprefix("증거(JSON):\n"))
+    checks = payload["collector_findings"][0]["artifacts"][0]["condition_checks"]
+    assert checks == [
+        {
+            "condition": "MemoryPressure",
+            "active": False,
+            "source": "kubernetes_condition",
+            "status": "False",
+        },
+        {
+            "condition": "DiskPressure",
+            "active": True,
+            "source": "kubernetes_condition",
+            "status": "True",
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_korean_synthesis_skips_unrelated_similar_incident(monkeypatch) -> None:
     settings = replace(make_settings(), language="ko")
     captured: list[str] = []

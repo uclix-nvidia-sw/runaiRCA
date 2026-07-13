@@ -171,7 +171,8 @@ async def _drill_one(
                 probe_attempts=probe_attempts,
             )
         step = 0
-        while True:
+        decision_round_limit = settings.max_investigation_steps or 3
+        while step < decision_round_limit:
             if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
                 result.warnings.append(
                     f"{result.agent} drill-down stopped: shared evidence budget exhausted"
@@ -527,6 +528,8 @@ def _system_prompt(agent: str, tools: dict[str, dict[str, Any]]) -> str:
         "follow-up queries that would confirm or refute it. When a lead is ambiguous, "
         "re-query with a NARROWER scope (one pod, one namespace, one metric series, a "
         "tighter time filter or regex) to pin it down.\n"
+        "- A condition name or metric label alone is not a failure. Verify its status and "
+        "sample value; False or zero is refuting evidence, not a positive signal.\n"
         "- Fetch data RELATED to the incident — the workload's controller, its "
         "project/queue, the Run:ai control-plane component involved, correlated "
         "namespaces and time windows — never your own datasource's health (the base "
@@ -543,7 +546,9 @@ def _system_prompt(agent: str, tools: dict[str, dict[str, Any]]) -> str:
         "command. If it includes structured probes, use only probes whose tool is in your "
         "registry and resolve their placeholders from the incident scope.\n"
         "- Stay strictly read-only and inside your tools, and avoid blind sweeps — every "
-        "query must test a specific idea.\n"
+        "query must test a specific idea. Batch all independent checks you can run now "
+        "into the same queries array; query count is not the scarce resource, reasoning "
+        "rounds are.\n"
         f"Tools available to you (your only tools; there are no others):\n{tool_lines}\n"
         'Respond with ONLY JSON: {"action":"query"|"done","reason":str,'
         '"queries":[{"tool":str,"args":{...}}]}.'

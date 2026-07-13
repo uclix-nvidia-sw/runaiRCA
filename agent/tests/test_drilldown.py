@@ -509,7 +509,7 @@ def test_drilldown_runs_all_new_allowed_queries(monkeypatch) -> None:
     assert tool_calls[0] == 9
 
 
-def test_drilldown_continues_past_the_former_step_cap(monkeypatch) -> None:
+def test_drilldown_stops_at_configured_reasoning_round_cap(monkeypatch) -> None:
     decisions = iter(
         [
             {
@@ -537,10 +537,11 @@ def test_drilldown_continues_past_the_former_step_cap(monkeypatch) -> None:
     monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
     monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
     result = _k8s_result()
-    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
+    settings = replace(drill_settings(), max_investigation_steps=3)
+    asyncio.run(run_drilldowns(settings, [result], _target(), None))
 
-    assert calls[0] == 8
-    assert len(result.artifacts) == 7
+    assert calls[0] == 3
+    assert len(result.artifacts) == 3
 
 
 def test_unlimited_drilldown_stops_when_a_query_repeats(monkeypatch) -> None:
@@ -882,6 +883,88 @@ def test_salient_markers_ignore_negated_signals() -> None:
     assert salient_markers({"status": "ImagePullBackOff observed on trainer"}) == [
         "ImagePullBackOff"
     ]
+
+
+def test_salient_markers_require_active_structured_conditions() -> None:
+    from app.collectors.base import condition_observations, salient_markers
+
+    healthy = {
+        "conditions": [
+            {"type": "DiskPressure", "status": "False", "reason": "KubeletHasNoDiskPressure"},
+            {"type": "MemoryPressure", "status": "False"},
+            {"type": "PIDPressure", "status": "False"},
+            {"type": "NetworkUnavailable", "status": "False"},
+        ]
+    }
+    assert salient_markers(healthy) == []
+    assert {item["condition"] for item in condition_observations(healthy)} == {
+        "DiskPressure",
+        "MemoryPressure",
+        "PIDPressure",
+        "NetworkUnavailable",
+    }
+    assert all(item["active"] is False for item in condition_observations(healthy))
+
+    failing = {"type": "MemoryPressure", "status": "True"}
+    assert salient_markers(failing) == ["MemoryPressure"]
+    assert condition_observations(failing)[0]["active"] is True
+
+
+def test_salient_markers_require_positive_prometheus_condition_sample() -> None:
+    from app.collectors.base import condition_observations, salient_markers
+
+    inactive = {
+        "metric": {"condition": "DiskPressure", "status": "true", "node": "gpu-1"},
+        "value": [1720000000, "0"],
+    }
+    active = {
+        "metric": {"condition": "DiskPressure", "status": "true", "node": "gpu-1"},
+        "value": [1720000000, "1"],
+    }
+    false_series = {
+        "metric": {"condition": "DiskPressure", "status": "false", "node": "gpu-1"},
+        "value": [1720000000, "1"],
+    }
+    assert salient_markers(inactive) == []
+    assert salient_markers(false_series) == []
+    assert salient_markers(active) == ["DiskPressure"]
+    assert condition_observations(inactive)[0]["active"] is False
+    assert condition_observations(active)[0]["active"] is True
+
+
+def test_drilldown_caps_reasoning_rounds_but_batches_queries(monkeypatch) -> None:
+    decision_calls = 0
+    query_calls: list[str] = []
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
+        nonlocal decision_calls
+        decision_calls += 1
+        return {
+            "action": "query",
+            "queries": [
+                {
+                    "tool": "k8s_read",
+                    "args": {
+                        "kind": "events",
+                        "namespace": "runai-vision",
+                        "label_selector": f"round={decision_calls},query={index}",
+                    },
+                }
+                for index in range(5)
+            ],
+        }
+
+    async def fake_k8s_read(settings, kind, *, namespace="", name="", label_selector=""):
+        query_calls.append(label_selector)
+        return {"kind": kind, "status_code": 200, "error": None, "items": []}
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
+    settings = replace(drill_settings(), max_investigation_steps=3)
+    asyncio.run(run_drilldowns(settings, [_k8s_result()], _target(), None))
+
+    assert decision_calls == 3
+    assert len(query_calls) == 15
 
 
 def test_k8s_tool_reports_kubectl_command_title_and_highlights(monkeypatch) -> None:

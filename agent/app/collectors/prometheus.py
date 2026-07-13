@@ -3,7 +3,14 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
+from app.collectors.base import (
+    NO_EVIDENCE,
+    AnalysisTarget,
+    CollectorResult,
+    artifact,
+    incident_time_range,
+    ko_en,
+)
 from app.collectors.http_json import compact, get_json
 from app.collectors.loki import _llm_insight
 from app.config import Settings
@@ -51,13 +58,16 @@ class PrometheusCollector:
             else ()
         )
         queries = _queries_for(target, plan, control_plane_namespaces)
+        time_range = incident_time_range(target)
         query_results = []
         warnings: list[str] = []
 
         used_mcp = False
         if self._settings.prometheus_mcp_url:
             try:
-                query_results = await _collect_prometheus_mcp(self._settings, queries)
+                query_results = await _collect_prometheus_mcp(
+                    self._settings, queries, time_range=time_range
+                )
                 used_mcp = True
             except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
                 warnings.append(mcp_fallback_warning(exc))
@@ -87,7 +97,9 @@ class PrometheusCollector:
                         )
                     ],
                 )
-            query_results = await _collect_prometheus_direct(self._settings, queries, warnings)
+            query_results = await _collect_prometheus_direct(
+                self._settings, queries, warnings, time_range=time_range
+            )
 
         successful = [item for item in query_results if not item["error"]]
         populated = [
@@ -135,6 +147,7 @@ class PrometheusCollector:
             "prometheus_url": self._settings.prometheus_url,
             "prometheus_mcp_url": self._settings.prometheus_mcp_url,
             "used_mcp": used_mcp,
+            "time_range": time_range,
             "queries": query_results,
         }
         return CollectorResult(
@@ -279,15 +292,22 @@ def _prometheus_result(data: object) -> list[object]:
 
 
 async def _collect_prometheus_direct(
-    settings: Settings, queries: list[tuple[str, str]], warnings: list[str]
+    settings: Settings,
+    queries: list[tuple[str, str]],
+    warnings: list[str],
+    time_range: dict[str, str] | None = None,
 ) -> list[dict[str, object]]:
     query_results: list[dict[str, object]] = []
     for name, query in queries:
         response = await get_json(
             base_url=settings.prometheus_url,
-            path="/api/v1/query",
+            path="/api/v1/query_range" if time_range else "/api/v1/query",
             timeout_seconds=settings.prometheus_timeout_seconds,
-            params={"query": query},
+            params=(
+                {"query": query, **time_range, "step": "60"}
+                if time_range
+                else {"query": query}
+            ),
         )
         result_data = _prometheus_result(response.data)
         query_results.append(
@@ -300,6 +320,7 @@ async def _collect_prometheus_direct(
                 "series_count": len(result_data),
                 "sample": compact(result_data, limit=3),
                 "error": response.error,
+                **({"time_range": time_range} if time_range else {}),
             }
         )
         if response.error:
@@ -308,11 +329,16 @@ async def _collect_prometheus_direct(
 
 
 async def _collect_prometheus_mcp(
-    settings: Settings, queries: list[tuple[str, str]]
+    settings: Settings,
+    queries: list[tuple[str, str]],
+    *,
+    time_range: dict[str, str] | None = None,
 ) -> list[dict[str, object]]:
     datasource_uid = await _grafana_datasource_uid(settings.prometheus_mcp_url, "prometheus")
     return [
-        await _mcp_query_prometheus(settings.prometheus_mcp_url, name, query, datasource_uid)
+        await _mcp_query_prometheus(
+            settings.prometheus_mcp_url, name, query, datasource_uid, time_range=time_range
+        )
         for name, query in queries
     ]
 
@@ -323,7 +349,12 @@ async def prom_mcp_query(settings: Settings, name: str, promql: str) -> dict[str
 
 
 async def _mcp_query_prometheus(
-    url: str, name: str, promql: str, datasource_uid: str = ""
+    url: str,
+    name: str,
+    promql: str,
+    datasource_uid: str = "",
+    *,
+    time_range: dict[str, str] | None = None,
 ) -> dict[str, object]:
     # Same contract as Loki: grafana-mcp needs a real datasourceUid. An empty one
     # 400s with "id is invalid" on every query; fail fast so the caller falls back
@@ -334,12 +365,20 @@ async def _mcp_query_prometheus(
             "grafana datasource uid unresolved for prometheus — set "
             "secrets.grafanaServiceAccountToken so grafana-mcp can list datasources"
         )
-    args_list: list[dict[str, object]] = [
-        {"datasourceUid": datasource_uid, "query": promql},
-        {"datasourceUid": datasource_uid, "expr": promql},
-        {"datasource_uid": datasource_uid, "query": promql},
-    ]
-    data = await _call_mcp_json(url, "query_prometheus", args_list)
+    # mcp-grafana query_prometheus takes a range query as datasourceUid/expr/
+    # startTime/endTime/stepSeconds. Keep this exact: the older `query` aliases
+    # silently caused an instant query (or a schema 400), which sampled *now*
+    # instead of the incident.
+    query_window = time_range or {"start": "now-15m", "end": "now"}
+    args = {
+        "datasourceUid": datasource_uid,
+        "expr": promql,
+        "queryType": "range",
+        "startTime": query_window["start"],
+        "endTime": query_window["end"],
+        "stepSeconds": 60,
+    }
+    data = await _call_mcp_json(url, "query_prometheus", [args])
     result_data = _prometheus_result(data)
     if not result_data:
         result_data = _first_result_list(data)
@@ -352,6 +391,7 @@ async def _mcp_query_prometheus(
         "series_count": len(result_data),
         "sample": compact(result_data, limit=3),
         "error": None,
+        "time_range": query_window,
     }
 
 

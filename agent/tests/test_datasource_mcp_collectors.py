@@ -21,11 +21,13 @@ class _McpResult:
 @pytest.mark.asyncio
 async def test_prometheus_collector_uses_mcp_before_direct_http(monkeypatch) -> None:
     calls: list[str] = []
+    query_args: list[dict] = []
 
     async def fake_mcp_call(url, tool, arguments):
         calls.append(tool)
         if tool == "list_datasources":
             return _McpResult([{"type": "prometheus", "uid": "prom"}])
+        query_args.append(arguments)
         return _McpResult(
             {"status": "success", "data": {"result": [{"metric": {}, "value": [1, "1"]}]}}
         )
@@ -41,10 +43,23 @@ async def test_prometheus_collector_uses_mcp_before_direct_http(monkeypatch) -> 
             prometheus_url="http://prometheus",
             prometheus_mcp_url="http://grafana-mcp/mcp",
         )
-    ).collect(make_target())
+    ).collect(
+        replace(
+            make_target(),
+            fired_at="2026-07-10T01:00:00Z",
+            resolved_at="2026-07-10T01:10:00Z",
+        )
+    )
 
     assert result.details["used_mcp"] is True
     assert "query_prometheus" in calls
+    assert query_args
+    assert all(args["datasourceUid"] == "prom" for args in query_args)
+    assert all(args["queryType"] == "range" for args in query_args)
+    assert all(args["startTime"] == "2026-07-10T00:55:00Z" for args in query_args)
+    assert all(args["endTime"] == "2026-07-10T01:15:00Z" for args in query_args)
+    assert all(args["stepSeconds"] == 60 and "expr" in args for args in query_args)
+    assert all("query" not in args and "datasource_uid" not in args for args in query_args)
 
 
 @pytest.mark.asyncio
@@ -160,8 +175,14 @@ async def test_loki_mcp_queries_the_alert_time_window(monkeypatch) -> None:
     ).collect(target)
 
     assert query_args
-    assert all(args["startTime"] == "2026-07-10T00:55:00Z" for args in query_args)
-    assert all(args["endTime"] == "2026-07-10T01:15:00Z" for args in query_args)
+    assert all(args["datasourceUid"] == "loki" for args in query_args)
+    assert all(args["direction"] == "backward" for args in query_args)
+    assert all(args["queryType"] == "range" for args in query_args)
+    assert all(args["startRfc3339"] == "2026-07-10T00:55:00Z" for args in query_args)
+    assert all(args["endRfc3339"] == "2026-07-10T01:15:00Z" for args in query_args)
+    assert all("logql" in args for args in query_args)
+    assert all("query" not in args and "datasource_uid" not in args for args in query_args)
+    assert all("startTime" not in args and "endTime" not in args for args in query_args)
 
 
 @pytest.mark.asyncio

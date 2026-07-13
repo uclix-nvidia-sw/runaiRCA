@@ -13,7 +13,13 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, resolve_target
+from app.collectors.base import (
+    NO_EVIDENCE,
+    AnalysisTarget,
+    CollectorResult,
+    condition_observations,
+    resolve_target,
+)
 from app.collectors.registry import build_collectors
 from app.config import Settings
 from app.knowledge import (
@@ -1682,10 +1688,11 @@ async def _investigate_until_settled(state: PipelineState) -> None:
     ):
         return
     attempted: set[str] = set()
-    # Completion is semantic: stop only after the candidate is settled, every
-    # candidate has been tried, no new evidence arrives, or the outer deadline
-    # cancels the analysis.  Query/agent-step counters are not quality gates.
-    while True:
+    # Re-analysis gets at most three reasoning passes by default. Each pass can
+    # batch many read-only queries, so this bounds repeated candidate churn
+    # without narrowing evidence collection.
+    reanalysis_round_limit = state.settings.max_reanalysis_steps or 3
+    for _round in range(reanalysis_round_limit):
         if not _needs_more_investigation(state):
             break
         if _evidence_budget_exceeded(state):
@@ -1729,6 +1736,11 @@ async def _investigate_until_settled(state: PipelineState) -> None:
         after_family = state.root_cause_candidates[0].family if state.root_cause_candidates else ""
         if after_family == before_family and _evidence_signature(state.results) == before_evidence:
             break
+    else:
+        if _needs_more_investigation(state):
+            state.extra_warnings.append(
+                f"re-analysis stopped after {reanalysis_round_limit} reasoning rounds"
+            )
 
 
 def _needs_more_investigation(state: PipelineState) -> bool:
@@ -2071,6 +2083,7 @@ async def _synthesize_korean(
                         "query": art.query,
                         "summary": art.summary,
                         "highlights": art.highlights,
+                        "condition_checks": condition_observations(art.result),
                         "result": _compact_synthesis_value(
                             art.result, limit=_SYNTHESIS_ARTIFACT_RESULT_CHARS
                         ),
@@ -2092,6 +2105,10 @@ async def _synthesize_korean(
         "- 반드시 한국어로, 비전문가도 이해할 수 있게 작성합니다 (전문용어는 풀어서).\n"
         "- 길게 쓰지 마세요. 아래 1~3 섹션 합쳐서 A4 한 페이지 이내가 목표입니다.\n"
         "- 증거에 없는 사실을 절대 만들어내지 마세요.\n"
+        "- MemoryPressure/DiskPressure/PIDPressure/NetworkUnavailable 같은 condition 이름은 "
+        "존재 자체가 장애 증거가 아닙니다. collector_findings.artifacts.condition_checks의 "
+        "active=true만 지지 증거이며, active=false는 명시적 반대 증거입니다. 원문 result의 "
+        "키워드만 보고 상태를 추정하지 마세요.\n"
         "- reasoning_trace_v2의 evidence_id는 현재 인시던트 관측입니다. 원인·반증 주장을 "
         "쓸 때 해당 ID를 [E01] 형식으로 인용하고, historical prior는 현재 증거로 쓰지 마세요.\n"
         "- historical_case_cards는 승인된 과거 사례의 prior이며 현재 evidence가 아닙니다. "

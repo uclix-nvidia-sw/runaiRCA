@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 
-from app.collectors.base import NO_EVIDENCE, CollectorResult
+from app.collectors.base import NO_EVIDENCE, CollectorResult, condition_observations
 from app.config import Settings
 from app.llm import complete_json, llm_configured
 from app.masking import build_masker
@@ -209,6 +209,9 @@ def _evidence_digest(results: list[CollectorResult], masker) -> str:
             if art.highlights:
                 parts.append(f"highlights={', '.join(map(str, art.highlights[:6]))}")
             if art.result is not None:
+                checks = condition_observations(art.result)
+                if checks:
+                    parts.append(f"condition_checks={_compact_evidence_value(checks)}")
                 parts.append(f"result={_compact_evidence_value(art.result)}")
             lines.append(f"  artifact: {masker.mask_text(' | '.join(parts))}")
     return "\n".join(lines)
@@ -231,7 +234,9 @@ async def _llm_refute(
         "evidence below. Ask: what evidence would we expect if this cause were true, is "
         "it actually present, does a competing cause fit the evidence better, and what "
         "single check would settle it. Do not invent evidence. Be conservative: if the "
-        "evidence does not clearly support the cause, mark it unsupported.\n"
+        "evidence does not clearly support the cause, mark it unsupported. A condition "
+        "name alone is metadata: only condition_checks active=true supports it, while "
+        "active=false is contradicting evidence.\n"
         f"Write the caveat and next_check in {caveat_lang}. Respond with a JSON object: "
         '{"supported": bool, "confidence": "low|medium|high", "caveat": str, '
         '"next_check": str}. '

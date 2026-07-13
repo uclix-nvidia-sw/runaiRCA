@@ -428,10 +428,10 @@ async def investigate(
     try:
         ran_queries_last_step = False
         step = 0
-        # Open-world callers pass 0: the orchestrator deadline, semantic
-        # duplicates, evidence exhaustion, or an explicit conclusion end the
-        # investigation rather than an arbitrary agent-step counter.
-        while max_steps <= 0 or step < max_steps:
+        # Bound LLM decision rounds while allowing every round to batch many
+        # independent read-only queries. Older zero-valued callers use 3.
+        decision_round_limit = max_steps if max_steps > 0 else 3
+        while step < decision_round_limit:
             remaining_budget = _budget_remaining(deadline_monotonic)
             if remaining_budget is not None and remaining_budget <= 0:
                 break
@@ -457,13 +457,17 @@ async def investigate(
                         "and use plan.diagnostic_directive as neutral ontology guidance: "
                         "follow its checks and disconfirmations, but never treat its "
                         "provisional_family as observed evidence. Update confidence using "
-                        "only observed evidence. Cite shared_observations evidence_id "
+                        "only observed evidence. A condition name alone is metadata; verify "
+                        "its status/value and treat False or a zero sample as refutation. "
+                        "Cite shared_observations evidence_id "
                         "values (F-...) in evidence_for/evidence_against; do not invent IDs. "
                         "When diagnostic_directive.probes names a tool you can reach through a collector, "
                         "use it as a discriminator and honor its supports_when/refutes_when conditions. You can ALSO "
                         "run kubectl-style READ-ONLY Kubernetes queries (get/list of an "
-                        "allowlisted kind, see adhoc_query_kinds). Conclude once evidence "
-                        "is sufficient. Respond with ONLY JSON: "
+                        "allowlisted kind, see adhoc_query_kinds). Batch all independent "
+                        "discriminating queries for this step instead of spending another "
+                        "reasoning round on each query. Conclude once evidence is sufficient. "
+                        "Respond with ONLY JSON: "
                         '{"action":"probe"|"conclude","reason":str,'
                         '"selected_hypothesis":str,'
                         '"probes":[{"collector":str,'
@@ -512,6 +516,9 @@ async def investigate(
                     step=step,
                     action=str(decision.get("action") or ""),
                     selected_hypothesis=str(decision.get("selected_hypothesis") or ""),
+                    probes=decision.get("probes"),
+                    queries=decision.get("queries"),
+                    hypothesis_updates=decision.get("hypothesis_updates"),
                     hypothesis_ledger=_ledger_summary(ledger),
                 )
             if decision.get("action") == "conclude":

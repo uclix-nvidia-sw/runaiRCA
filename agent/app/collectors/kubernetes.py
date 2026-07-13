@@ -9,7 +9,15 @@ from urllib.parse import quote
 
 import yaml
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
+from app.collectors.base import (
+    NO_EVIDENCE,
+    AnalysisTarget,
+    CollectorResult,
+    artifact,
+    incident_time_range,
+    ko_en,
+    parse_incident_time,
+)
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import cached_insight, complete, insight_cache_key, llm_configured
@@ -365,6 +373,8 @@ async def k8s_logs(
     pod: str,
     container: str = "",
     tail: int = 0,
+    previous: bool = False,
+    since_time: str = "",
 ) -> dict:
     """One READ-ONLY pod-log fetch — MCP-first (pods_log), direct /pods/{}/log fallback.
 
@@ -379,6 +389,10 @@ async def k8s_logs(
         args: dict[str, object] = {"namespace": namespace, "name": pod, "tailLines": tail_lines}
         if container:
             args["container"] = container
+        if previous:
+            args["previous"] = True
+        if since_time:
+            args["sinceTime"] = since_time
         try:
             result = await _k8s_mcp_result(
                 settings, [("pods_log", args), ("pods_log", {**args, "pod": pod})]
@@ -388,6 +402,8 @@ async def k8s_logs(
                 "namespace": namespace,
                 "pod": pod,
                 "container": container,
+                "previous": previous,
+                "since_time": since_time or None,
                 "status_code": 200,
                 "error": None,
                 "lines": lines,
@@ -408,6 +424,10 @@ async def k8s_logs(
     params: dict[str, str] = {"tailLines": str(tail_lines), "timestamps": "true"}
     if container:
         params["container"] = container
+    if previous:
+        params["previous"] = "true"
+    if since_time:
+        params["sinceTime"] = since_time
     path = f"/api/v1/namespaces/{quote(namespace, safe='')}/pods/{quote(pod, safe='')}/log"
     response = await get_json(
         base_url=settings.kubernetes_api_url,
@@ -421,6 +441,8 @@ async def k8s_logs(
         "namespace": namespace,
         "pod": pod,
         "container": container,
+        "previous": previous,
+        "since_time": since_time or None,
         "status_code": response.status_code,
         "error": response.error,
         "lines": _log_lines(response.data),
@@ -430,7 +452,14 @@ async def k8s_logs(
     return result
 
 
-async def k8s_describe(settings: Settings, kind: str, namespace: str = "", name: str = "") -> dict:
+async def k8s_describe(
+    settings: Settings,
+    kind: str,
+    namespace: str = "",
+    name: str = "",
+    *,
+    time_range: dict[str, str] | None = None,
+) -> dict:
     """A describe-style read: the named object's full spec/status PLUS its events.
 
     Reuses k8s_read (MCP-first, direct fallback) for the object; events are pulled
@@ -445,7 +474,9 @@ async def k8s_describe(settings: Settings, kind: str, namespace: str = "", name:
     if not name:
         return {"kind": resolved, "error": "name is required to describe a resource"}
     obj = await k8s_read(settings, resolved, namespace=namespace, name=name)
-    events = await _describe_events(settings, namespace=namespace, name=name)
+    events = await _describe_events(
+        settings, namespace=namespace, name=name, time_range=time_range
+    )
     return {
         "kind": resolved,
         "namespace": namespace,
@@ -458,7 +489,13 @@ async def k8s_describe(settings: Settings, kind: str, namespace: str = "", name:
     }
 
 
-async def _describe_events(settings: Settings, *, namespace: str, name: str) -> list:
+async def _describe_events(
+    settings,
+    *,
+    namespace: str,
+    name: str,
+    time_range: dict[str, str] | None = None,
+) -> list:
     """Events for ONE object via fieldSelector=involvedObject.name — direct API only
     (the MCP events tool has no field filter). Best-effort; [] on any failure."""
     if not name:
@@ -485,7 +522,8 @@ async def _describe_events(settings: Settings, *, namespace: str, name: str) -> 
         verify=verify,
     )
     items = (response.data or {}).get("items") if isinstance(response.data, dict) else None
-    return compact(items, limit=12) if items else []
+    filtered = _events_in_time_range(items, time_range) if isinstance(items, list) else []
+    return compact(filtered, limit=12) if filtered else []
 
 
 async def k8s_exec(
@@ -822,6 +860,8 @@ class KubernetesCollector:
 
     async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:  # noqa: ANN001
         target = _scope_target(target, plan)
+        time_range = incident_time_range(target)
+        since_time = time_range["start"] if time_range else ""
         missing: list[str] = []
         if not target.namespace:
             missing.append("kubernetes.namespace")
@@ -846,6 +886,8 @@ class KubernetesCollector:
                     settings=self._settings,
                     target=target,
                     containers=containers,
+                    previous_containers=_restarted_container_names(pod_summary_data),
+                    since_time=since_time,
                 )
                 exec_probes = []
                 used_mcp = True
@@ -901,6 +943,8 @@ class KubernetesCollector:
                 containers=containers,
                 headers=headers,
                 verify=verify,
+                previous_containers=_restarted_container_names(pod_summary_data),
+                since_time=since_time,
             )
             exec_probes = await _collect_exec_probes(
                 settings=self._settings,
@@ -923,7 +967,11 @@ class KubernetesCollector:
             if resolved_pod:
                 resolved_target = replace(target, pod=resolved_pod)
                 resolved_pod_describe = await k8s_describe(
-                    self._settings, "pods", namespace=target.namespace, name=resolved_pod
+                    self._settings,
+                    "pods",
+                    namespace=target.namespace,
+                    name=resolved_pod,
+                    time_range=time_range,
                 )
                 described_object = resolved_pod_describe.get("object")
                 if isinstance(described_object, dict):
@@ -933,6 +981,8 @@ class KubernetesCollector:
                     self._settings,
                     resolved_target,
                     containers,
+                    previous_containers=_restarted_container_names(pod_summary_data),
+                    since_time=since_time,
                 )
         container_diagnostics = _container_diagnostics(pod_summary_data)
         warnings.extend(
@@ -1041,6 +1091,7 @@ class KubernetesCollector:
             "kubernetes_api_url": self._settings.kubernetes_api_url,
             "kubernetes_mcp_url": self._settings.kubernetes_mcp_url,
             "used_mcp": used_mcp,
+            "time_range": time_range,
             "target_pod_missing": target_pod_missing,
             "kubernetes_namespaces": self._settings.kubernetes_namespaces,
             "kubernetes_cluster_scope_enabled": self._settings.kubernetes_cluster_scope_enabled,
@@ -1704,25 +1755,38 @@ async def _collect_resolved_pod_logs(
     settings: Settings,
     target: AnalysisTarget,
     containers: list[str],
+    *,
+    previous_containers: list[str] | None = None,
+    since_time: str = "",
 ) -> list[dict[str, object]]:
     targets: list[str | None] = list(containers) if containers else [None]
     logs: list[dict[str, object]] = []
     for container in targets:
-        item = await k8s_logs(
-            settings,
-            target.namespace,
-            target.pod,
-            container=container or "",
-            tail=settings.kubernetes_list_limit,
+        previous_requests = [False] + (
+            [True] if container and container in (previous_containers or []) else []
         )
-        logs.append(
-            {
-                "container": container,
-                "status_code": item.get("status_code"),
-                "error": item.get("error"),
-                "lines": item.get("lines") or [],
-            }
-        )
+        for previous in previous_requests:
+            if previous and not container:
+                continue
+            item = await k8s_logs(
+                settings,
+                target.namespace,
+                target.pod,
+                container=container or "",
+                tail=settings.kubernetes_list_limit,
+                previous=previous,
+                since_time=since_time,
+            )
+            logs.append(
+                {
+                    "container": container,
+                    "previous": previous,
+                    "since_time": since_time or None,
+                    "status_code": item.get("status_code"),
+                    "error": item.get("error"),
+                    "lines": item.get("lines") or [],
+                }
+            )
     return logs
 
 
@@ -1887,6 +1951,27 @@ def _container_names(pod_summary: dict[str, object] | None) -> list[str]:
     return names
 
 
+def _restarted_container_names(pod_summary: dict[str, object] | None) -> list[str]:
+    """Names whose prior terminated instance is available via pods/log previous=true."""
+    if not pod_summary:
+        return []
+    statuses = pod_summary.get("containerStatuses")
+    if not isinstance(statuses, list):
+        return []
+    names: list[str] = []
+    for item in statuses:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        try:
+            restarted = int(item.get("restartCount") or 0) > 0
+        except (TypeError, ValueError):
+            restarted = False
+        if restarted and isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
 def _container_diagnostics(pod_summary: dict[str, object] | None) -> list[dict[str, object]]:
     """Restart reasons + last-terminated detail — the 'describe'-level depth."""
     if not pod_summary:
@@ -1944,6 +2029,8 @@ async def _collect_pod_logs(
     containers: list[str],
     headers: dict[str, str],
     verify: bool | str,
+    previous_containers: list[str] | None = None,
+    since_time: str = "",
 ) -> list[dict[str, object]]:
     """Fetch READ-ONLY container logs via the pods/log subresource (GET, plain text)."""
     # Respect the KUBERNETES_NAMESPACES scope like the rest of the base sweep (pods/
@@ -1959,26 +2046,38 @@ async def _collect_pod_logs(
     targets: list[str | None] = list(containers) if containers else [None]
     logs: list[dict[str, object]] = []
     for container in targets:
-        params: dict[str, str] = {"tailLines": tail, "timestamps": "true"}
-        if container:
-            params["container"] = container
-        path = f"/api/v1/namespaces/{namespace}/pods/{pod}/log"
-        response = await get_json(
-            base_url=settings.kubernetes_api_url,
-            path=path,
-            timeout_seconds=settings.kubernetes_timeout_seconds,
-            params=params,
-            headers=headers,
-            verify=verify,
+        previous_requests = [False] + (
+            [True] if container and container in (previous_containers or []) else []
         )
-        logs.append(
-            {
-                "container": container,
-                "status_code": response.status_code,
-                "error": response.error,
-                "lines": _log_lines(response.data),
-            }
-        )
+        for previous in previous_requests:
+            if previous and not container:
+                continue
+            params: dict[str, str] = {"tailLines": tail, "timestamps": "true"}
+            if container:
+                params["container"] = container
+            if previous:
+                params["previous"] = "true"
+            if since_time:
+                params["sinceTime"] = since_time
+            path = f"/api/v1/namespaces/{namespace}/pods/{pod}/log"
+            response = await get_json(
+                base_url=settings.kubernetes_api_url,
+                path=path,
+                timeout_seconds=settings.kubernetes_timeout_seconds,
+                params=params,
+                headers=headers,
+                verify=verify,
+            )
+            logs.append(
+                {
+                    "container": container,
+                    "previous": previous,
+                    "since_time": since_time or None,
+                    "status_code": response.status_code,
+                    "error": response.error,
+                    "lines": _log_lines(response.data),
+                }
+            )
     return logs
 
 
@@ -1987,6 +2086,8 @@ async def _collect_pod_logs_via_mcp(
     settings: Settings,
     target: AnalysisTarget,
     containers: list[str],
+    previous_containers: list[str] | None = None,
+    since_time: str = "",
 ) -> list[dict[str, object]]:
     """Fetch READ-ONLY container logs through the Kubernetes MCP server."""
     # See _collect_pod_logs: same KUBERNETES_NAMESPACES scope as the rest of the sweep.
@@ -1995,35 +2096,47 @@ async def _collect_pod_logs_via_mcp(
     targets: list[str | None] = list(containers) if containers else [None]
     logs: list[dict[str, object]] = []
     for container in targets:
-        args: dict[str, object] = {
-            "namespace": target.namespace,
-            "name": target.pod,
-            "tailLines": settings.kubernetes_list_limit,
-        }
-        if container:
-            args["container"] = container
-        candidates = [
-            ("pods_log", args),
-            (
-                "pods_log",
-                {
-                    **args,
-                    "pod": target.pod,
-                },
-            ),
-        ]
-        result = await _k8s_mcp_result(settings, candidates)
-        text = mcp_tool_text(result)
-        data = mcp_tool_json(result)
-        lines = _log_lines(text or data)
-        logs.append(
-            {
-                "container": container,
-                "status_code": 200,
-                "error": None,
-                "lines": lines,
-            }
+        previous_requests = [False] + (
+            [True] if container and container in (previous_containers or []) else []
         )
+        for previous in previous_requests:
+            if previous and not container:
+                continue
+            args: dict[str, object] = {
+                "namespace": target.namespace,
+                "name": target.pod,
+                "tailLines": settings.kubernetes_list_limit,
+            }
+            if container:
+                args["container"] = container
+            if previous:
+                args["previous"] = True
+            if since_time:
+                args["sinceTime"] = since_time
+            candidates = [
+                ("pods_log", args),
+                (
+                    "pods_log",
+                    {
+                        **args,
+                        "pod": target.pod,
+                    },
+                ),
+            ]
+            result = await _k8s_mcp_result(settings, candidates)
+            text = mcp_tool_text(result)
+            data = mcp_tool_json(result)
+            lines = _log_lines(text or data)
+            logs.append(
+                {
+                    "container": container,
+                    "previous": previous,
+                    "since_time": since_time or None,
+                    "status_code": 200,
+                    "error": None,
+                    "lines": lines,
+                }
+            )
     return logs
 
 
@@ -2205,9 +2318,10 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
     if (
         name in {"pod_events", "namespace_events"} or name.startswith("runai_control_plane_events:")
     ) and isinstance(data.get("items"), list):
+        items = _events_in_time_range(data["items"], incident_time_range(target))
         events = [
             _event_summary(item)
-            for item in data["items"]
+            for item in items
             if isinstance(item, dict) and item.get("type") in {"Warning", "Normal"}
         ]
         warnings = [event for event in events if event.get("type") == "Warning"]
@@ -2247,10 +2361,43 @@ def _event_summary(event: dict[str, object]) -> dict[str, object]:
         "reason": event.get("reason"),
         "message": event.get("message"),
         "count": event.get("count"),
-        "lastTimestamp": event.get("lastTimestamp") or event.get("eventTime"),
+        "lastTimestamp": _event_timestamp(event),
         "object": involved.get("name"),
         "kind": involved.get("kind"),
     }
+
+
+def _event_timestamp(event: dict[str, object]) -> object:
+    series = event.get("series") if isinstance(event.get("series"), dict) else {}
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    return (
+        event.get("eventTime")
+        or series.get("lastObservedTime")
+        or event.get("lastTimestamp")
+        or metadata.get("creationTimestamp")
+    )
+
+
+def _events_in_time_range(
+    items: object, time_range: dict[str, str] | None
+) -> list[dict[str, object]]:
+    """Client-side event time filter because the Kubernetes Events API has no range selector."""
+    if not isinstance(items, list):
+        return []
+    if not time_range:
+        return [item for item in items if isinstance(item, dict)]
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None:
+        return []
+    filtered: list[dict[str, object]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        observed_at = parse_incident_time(_event_timestamp(item))
+        if observed_at is not None and start <= observed_at <= end:
+            filtered.append(item)
+    return filtered
 
 
 def _node_summary(node: dict[str, object]) -> dict[str, object]:

@@ -3,10 +3,16 @@ from __future__ import annotations
 import base64
 import json
 import re
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
+from app.collectors.base import (
+    NO_EVIDENCE,
+    AnalysisTarget,
+    CollectorResult,
+    artifact,
+    incident_time_range,
+    ko_en,
+)
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import cached_insight, complete, insight_cache_key, llm_configured
@@ -378,17 +384,27 @@ async def _mcp_query_loki(
             "grafana datasource uid unresolved for loki — set "
             "secrets.grafanaServiceAccountToken so grafana-mcp can list datasources"
         )
-    base_args: dict[str, object] = {"limit": limit, "direction": "BACKWARD"}
+    # Match mcp-grafana's query_loki_logs schema exactly. The previous compatibility
+    # retries mixed old argument names (`query`, `datasource_uid`, `startTime`) with
+    # the current schema. When those retries failed, the last error came from a call
+    # with no recognized datasourceUid and misleadingly reported "id is invalid".
+    args: dict[str, object] = {
+        "datasourceUid": datasource_uid,
+        "logql": logql,
+        "limit": limit,
+        "direction": "backward",
+        "queryType": "range",
+    }
     if time_range:
-        # grafana-mcp expects RFC3339 startTime/endTime, while Loki's direct API
-        # calls them start/end. Keep the conversion at this boundary.
-        base_args.update({"startTime": time_range["start"], "endTime": time_range["end"]})
-    args_list: list[dict[str, object]] = [
-        {"datasourceUid": datasource_uid, "query": logql, **base_args},
-        {"datasourceUid": datasource_uid, "logql": logql, **base_args},
-        {"datasource_uid": datasource_uid, "query": logql, **base_args},
-    ]
-    data = await _call_mcp_json(url, "query_loki_logs", args_list)
+        # mcp-grafana expects RFC3339 startRfc3339/endRfc3339, while Loki's
+        # direct API calls them start/end. Keep the conversion at this boundary.
+        args.update(
+            {
+                "startRfc3339": time_range["start"],
+                "endRfc3339": time_range["end"],
+            }
+        )
+    data = await _call_mcp_json(url, "query_loki_logs", [args])
     streams = _loki_streams(data)
     lines = _sample_lines(streams)
     if not lines:
@@ -416,42 +432,9 @@ async def _mcp_query_loki(
     }
 
 
-_INCIDENT_PRELUDE = timedelta(minutes=5)
-_INCIDENT_EPILOGUE = timedelta(minutes=5)
-_FIRING_INCIDENT_DURATION = timedelta(minutes=15)
-
-
 def _incident_time_range(target: AnalysisTarget) -> dict[str, str] | None:
-    """Return a bounded Loki window centered on the alert occurrence.
-
-    Without an Alertmanager start time, leave Loki's normal recent-window default
-    untouched. A firing alert has no trustworthy end time, so cap it at 15 minutes
-    after it began rather than querying from an old firing timestamp through now.
-    """
-    fired = _parse_alert_time(target.fired_at)
-    if fired is None:
-        return None
-    resolved = _parse_alert_time(target.resolved_at)
-    if resolved is None or resolved < fired:
-        resolved = fired + _FIRING_INCIDENT_DURATION
-    return {
-        "start": _format_loki_time(fired - _INCIDENT_PRELUDE),
-        "end": _format_loki_time(resolved + _INCIDENT_EPILOGUE),
-    }
-
-
-def _parse_alert_time(value: str) -> datetime | None:
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
-
-
-def _format_loki_time(value: datetime) -> str:
-    return value.isoformat(timespec="seconds").replace("+00:00", "Z")
+    """Compatibility wrapper for callers/tests that imported Loki's helper."""
+    return incident_time_range(target)
 
 
 # Grafana datasource uids are ^[a-zA-Z0-9\-_]{1,40}$; a numeric row id or a
