@@ -117,6 +117,8 @@ class PrometheusCollector:
                 self._settings, queries, warnings, time_range=time_range
             )
 
+        _annotate_capacity_gap_coverage(query_results)
+
         successful = [item for item in query_results if not item["error"]]
         populated = [
             item
@@ -260,6 +262,15 @@ def _queries_for(
         )
         queries.append(
             (
+                "runai_queue_capacity_gap",
+                "max by (queue) "
+                f'(runai_queue_requested_gpus{{queue="{target.queue}"}}) '
+                "> on(queue) max by (queue) "
+                f'(runai_queue_allocated_gpus{{queue="{target.queue}"}})',
+            )
+        )
+        queries.append(
+            (
                 "runai_queue_requested_gpus",
                 f'runai_queue_requested_gpus{{queue="{target.queue}"}}',
             )
@@ -274,6 +285,13 @@ def _queries_for(
                 (
                     "runai_project_requested_gpus",
                     f'runai_project_requested_gpus{{project="{target.project}"}}',
+                ),
+                (
+                    "runai_project_capacity_gap",
+                    "max by (project) "
+                    f'(runai_project_requested_gpus{{project="{target.project}"}}) '
+                    "> on(project) max by (project) "
+                    f'(runai_project_allocated_gpus{{project="{target.project}"}})',
                 ),
             ]
         )
@@ -567,6 +585,29 @@ def _prometheus_query_artifact(
     )
 
 
+def _annotate_capacity_gap_coverage(query_results: list[dict[str, object]]) -> None:
+    """Allow a capacity-gap absence only when both operands were observed."""
+    by_name = {str(item.get("name") or ""): item for item in query_results}
+    for scope in ("queue", "project"):
+        gap = by_name.get(f"runai_{scope}_capacity_gap")
+        requested = by_name.get(f"runai_{scope}_requested_gpus")
+        allocated = by_name.get(f"runai_{scope}_allocated_gpus")
+        if gap is None:
+            continue
+        gap["capacity_sources_available"] = all(
+            _has_prometheus_samples(item) for item in (requested, allocated)
+        )
+
+
+def _has_prometheus_samples(item: object) -> bool:
+    if not isinstance(item, dict) or item.get("error"):
+        return False
+    if int(item.get("series_count") or 0) == 0:
+        return False
+    summary = item.get("value_summary")
+    return isinstance(summary, dict) and int(summary.get("numeric_sample_count") or 0) > 0
+
+
 def _prometheus_query_observation(
     item: dict[str, object], *, time_range: dict[str, str] | None
 ) -> dict[str, object]:
@@ -587,6 +628,15 @@ def _prometheus_query_observation(
             polarity, coverage = "unknown", "partial"
         elif name in _CONTEXT_ONLY_METRICS:
             polarity, coverage = "unknown", "partial"
+        elif name.endswith("capacity_gap"):
+            if series_count and numeric_count:
+                polarity, coverage = "present", "scoped"
+            elif series_count:
+                polarity, coverage = "unknown", "partial"
+            elif item.get("capacity_sources_available") is True:
+                polarity, coverage = "absent", "scoped"
+            else:
+                polarity, coverage = "unknown", "partial"
         elif series_count == 0:
             polarity, coverage = "absent", "scoped"
         elif numeric_count == 0:

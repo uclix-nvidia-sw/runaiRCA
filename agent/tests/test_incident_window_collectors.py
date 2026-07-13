@@ -271,6 +271,46 @@ def test_thresholdless_usage_metrics_are_context_not_rca_verdicts(
     assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
 
 
+def test_capacity_gap_absence_requires_both_operands_to_be_observed() -> None:
+    window = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    complete = [
+        {
+            "name": "runai_queue_requested_gpus",
+            "series_count": 1,
+            "value_summary": {"numeric_sample_count": 2},
+        },
+        {
+            "name": "runai_queue_allocated_gpus",
+            "series_count": 1,
+            "value_summary": {"numeric_sample_count": 2},
+        },
+        {
+            "name": "runai_queue_capacity_gap",
+            "series_count": 0,
+            "value_summary": {"numeric_sample_count": 0},
+        },
+    ]
+    incomplete = [*complete[:1], {**complete[-1]}]
+
+    prometheus._annotate_capacity_gap_coverage(complete)
+    prometheus._annotate_capacity_gap_coverage(incomplete)
+
+    no_gap = prometheus._prometheus_query_observation(complete[-1], time_range=window)
+    unknown = prometheus._prometheus_query_observation(incomplete[-1], time_range=window)
+    positive = prometheus._prometheus_query_observation(
+        {
+            "name": "runai_queue_capacity_gap",
+            "series_count": 1,
+            "value_summary": {"numeric_sample_count": 2, "all_zero": False},
+        },
+        time_range=window,
+    )
+
+    assert (no_gap["polarity"], no_gap["coverage"]) == ("absent", "scoped")
+    assert (unknown["polarity"], unknown["coverage"]) == ("unknown", "partial")
+    assert (positive["polarity"], positive["coverage"]) == ("present", "scoped")
+
+
 def test_prometheus_unbounded_empty_result_is_not_a_scoped_absence() -> None:
     observation = prometheus._prometheus_query_observation(
         {
