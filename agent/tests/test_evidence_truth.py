@@ -19,6 +19,7 @@ from app.collectors.base import CollectorResult, artifact
 from app.collectors.kubernetes import (
     _collect_kubernetes_responses_via_mcp,
     _k8s_yaml_payload,
+    _pod_lifecycle_artifact,
     _target_pod_missing,
     k8s_read,
 )
@@ -343,6 +344,25 @@ def test_target_pod_missing_detection() -> None:
     assert _target_pod_missing(target, gone_mcp) is True
     assert _target_pod_missing(target, rbac) is False
     assert _target_pod_missing(replace(target, pod=""), gone_direct) is False
+
+
+def test_target_pod_lifecycle_is_current_context_not_historical_cause() -> None:
+    target = make_target()
+    missing = _pod_lifecycle_artifact(
+        "kubernetes", target, [{"name": "pod", "status_code": 404, "error": "HTTP 404"}]
+    )
+    live = _pod_lifecycle_artifact(
+        "kubernetes", target, [{"name": "pod", "status_code": 200, "error": None, "data": {}}]
+    )
+
+    missing_observation = missing.result["observation"]
+    live_observation = live.result["observation"]
+    assert (missing_observation["state"], missing_observation["polarity"]) == (
+        "missing_now", "present"
+    )
+    assert (live_observation["state"], live_observation["coverage"]) == (
+        "live_now", "partial"
+    )
 
 
 @pytest.mark.asyncio

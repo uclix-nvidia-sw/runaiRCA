@@ -1237,6 +1237,7 @@ class KubernetesCollector:
                 },
             )
         ]
+        artifacts.append(_pod_lifecycle_artifact(self.name, target, responses))
         event_observation = _warning_event_observation(
             warning_events,
             time_range=time_range,
@@ -2278,6 +2279,61 @@ def _target_pod_missing(target: AnalysisTarget, responses: list[dict[str, object
         if item.get("data") is None and ("not found" in error_text or "notfound" in error_text):
             return True
     return False
+
+
+def _pod_lifecycle_artifact(
+    agent: str, target: AnalysisTarget, responses: list[dict[str, object]]
+):
+    """Expose the exact alert Pod's current lifecycle without implying cause.
+
+    A Pod GET is necessarily current state. It can establish that an alerting
+    Pod was replaced or still exists, but cannot prove what happened inside the
+    historical incident window. The partial coverage keeps it context-only in
+    the blackboard while making the replacement state visible to the operator.
+    """
+    pod_response = next(
+        (item for item in responses if item.get("name") == "pod"), None
+    )
+    if not target.pod:
+        state, polarity, coverage = "not_targeted", "unknown", "partial"
+    elif _target_pod_missing(target, responses):
+        state, polarity, coverage = "missing_now", "present", "partial"
+    elif not isinstance(pod_response, dict) or pod_response.get("error"):
+        state, polarity, coverage = "unavailable", "unavailable", "unknown"
+    else:
+        state, polarity, coverage = "live_now", "present", "partial"
+    if state == "missing_now":
+        summary = f"Kubernetes target Pod {target.pod} is missing at current inspection."
+    elif state == "live_now":
+        summary = f"Kubernetes target Pod {target.pod} exists at current inspection."
+    elif state == "unavailable":
+        summary = f"Kubernetes target Pod {target.pod} lifecycle inspection was unavailable."
+    else:
+        summary = "Kubernetes target Pod lifecycle was not inspected (no Pod identity)."
+    return artifact(
+        agent=agent,
+        source="kubernetes",
+        type="kubernetes_pod_lifecycle",
+        status="unavailable" if polarity == "unavailable" else "ok",
+        confidence="medium" if polarity == "present" else "low",
+        title="Kubernetes · target Pod lifecycle",
+        query=(f"kubectl get pod {target.pod} -n {target.namespace}" if target.pod else None),
+        summary=summary,
+        result={
+            "observation": {
+                "kind": "kubernetes_pod_lifecycle",
+                "predicate": "kubernetes_target_pod_lifecycle",
+                "polarity": polarity,
+                "coverage": coverage,
+                "state": state,
+            },
+            "pod": target.pod,
+            "namespace": target.namespace,
+            "status_code": (
+                pod_response.get("status_code") if isinstance(pod_response, dict) else None
+            ),
+        },
+    )
 
 
 def _target_pod_summary(responses: list[dict[str, object]]) -> dict[str, object] | None:
