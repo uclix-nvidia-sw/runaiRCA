@@ -64,6 +64,32 @@ def test_unavailable_is_not_absence_and_empty_success_is_scoped_absence() -> Non
     assert not partial.is_reliable_absence
 
 
+def test_structured_probe_metadata_wins_over_keyword_inference() -> None:
+    # The summary deliberately contains a tempting failure keyword. The probe
+    # verified the target condition was false, so it must become refuting
+    # evidence rather than support for a keyword-matched root cause.
+    fact = normalize_artifact(
+        _artifact(
+            source="kubernetes",
+            type="node_condition",
+            summary="MemoryPressure keyword appeared in an unrelated event.",
+            result={
+                "observation": {
+                    "kind": "node_condition",
+                    "polarity": "absent",
+                    "coverage": "scoped",
+                }
+            },
+        )
+    )
+
+    assert fact.predicate == "node_condition"
+    assert fact.polarity == "absent"
+    assert fact.coverage == "scoped"
+    assert not fact.eligibility.support
+    assert fact.eligibility.refutation
+
+
 def test_independence_counts_underlying_source_not_agent() -> None:
     first = normalize_artifact(
         _artifact(source="kubernetes", agent="kubernetes", summary="Pod Evicted")

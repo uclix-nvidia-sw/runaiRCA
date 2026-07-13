@@ -465,10 +465,24 @@ def normalize_artifact(
     highlights = tuple(
         text for item in _as_list(raw.get("highlights")) if (text := _clean_text(item))
     )
-    resolved_polarity = polarity or _infer_polarity(status, summary, highlights, result)
+    # Prefer an explicit collector verdict over text heuristics. Structured
+    # probes already know whether a condition was present, absent, or merely
+    # unavailable; reducing that to an "error" keyword would make every agent
+    # reinforce the same false positive during synthesis.
+    metadata_polarity = _normalise_token(_clean_text(metadata("polarity")))
+    resolved_polarity = (
+        polarity
+        or (metadata_polarity if metadata_polarity in _POLARITIES else None)
+        or _infer_polarity(status, summary, highlights, result)
+    )
     if resolved_polarity not in _POLARITIES:
         raise ValueError(f"invalid polarity: {resolved_polarity}")
-    resolved_coverage = coverage or _infer_coverage(status, resolved_polarity)
+    metadata_coverage = _normalise_token(_clean_text(metadata("coverage")))
+    resolved_coverage = (
+        coverage
+        or (metadata_coverage if metadata_coverage in _COVERAGE else None)
+        or _infer_coverage(status, resolved_polarity)
+    )
     if resolved_coverage not in _COVERAGE:
         raise ValueError(f"invalid coverage: {resolved_coverage}")
     # Missing tool coverage must never masquerade as a verified negative.
@@ -480,6 +494,18 @@ def normalize_artifact(
     safe_highlights = tuple(active_masker.mask_text(item) for item in highlights)
     safe_entity = active_masker.mask_text(entity)
     safe_value = _finding_value(safe_summary, safe_highlights, resolved_polarity)
+    # Legacy artifacts did not name their predicate. Use structured probe
+    # metadata when available, then the artifact type as a bounded fallback.
+    # Explicit callers retain ownership of a more specific predicate.
+    resolved_predicate = predicate
+    if predicate == "observation":
+        resolved_predicate = (
+            _clean_text(metadata("predicate"))
+            or _clean_text(metadata("kind"))
+            or _clean_text(raw.get("type"))
+            or predicate
+        )
+    resolved_predicate = _normalise_token(resolved_predicate) or "observation"
     safe_provenance = (
         ("agent", _clean_text(raw.get("agent"))),
         ("type", _clean_text(raw.get("type"))),
@@ -494,7 +520,7 @@ def normalize_artifact(
         "window": [observed_window_start, observed_window_end],
         "entity": safe_entity,
         "source": source,
-        "predicate": predicate,
+        "predicate": resolved_predicate,
         "value": safe_value,
         "polarity": resolved_polarity,
         "coverage": resolved_coverage,
@@ -514,7 +540,7 @@ def normalize_artifact(
         independence_group=source_independence_group(
             _clean_text(source_group or metadata("source_group")) or source
         ),
-        predicate=predicate,
+        predicate=resolved_predicate,
         value=safe_value,
         quality=_clean_text(raw.get("confidence")) or "low",
         polarity=resolved_polarity,
