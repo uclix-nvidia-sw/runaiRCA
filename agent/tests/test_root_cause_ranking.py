@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.services.root_cause_ranking import (
     RankedCause,
+    _result_text,
     merge_open_world_candidates,
     novel_family_slug,
     rank_root_cause_candidates,
@@ -176,6 +177,52 @@ def test_healthy_node_object_in_queries_does_not_score_node_pressure() -> None:
     )
     families = {c.family for c in ranked}
     assert "node_kubelet_pressure" not in families
+
+
+def test_structured_partial_artifacts_do_not_feed_keyword_ranker() -> None:
+    partial = artifact(
+        agent="system",
+        source="system",
+        type="system_log",
+        status="ok",
+        confidence="medium",
+        summary="OOMKilled seen in a finite node log tail",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "partial",
+            },
+            "lines": ["OOMKilled"],
+        },
+    )
+    result = _r(
+        "system",
+        summary="OOMKilled in a current log tail",
+        details={"errors": ["OOMKilled"]},
+        artifacts=[partial],
+    )
+
+    assert _result_text(result) == ""
+
+
+def test_structured_scoped_artifact_remains_available_to_keyword_ranker() -> None:
+    scoped = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="warning_event",
+        status="ok",
+        confidence="high",
+        summary="Evicted workload in incident window",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+            },
+            "events": [{"reason": "Evicted"}],
+        },
+    )
+
+    assert "evicted" in _result_text(_r("kubernetes", artifacts=[scoped]))
 
 
 def test_real_node_pressure_still_scores_after_queries_drop() -> None:

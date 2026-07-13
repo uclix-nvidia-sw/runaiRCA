@@ -716,8 +716,27 @@ def _result_text(result: CollectorResult) -> str:
     if not _collector_is_evidence(result):
         return ""
     drop_keys = _RANKING_TEXT_DROP_KEYS.get(getattr(result, "agent", ""))
+    artifacts = list(result.artifacts)
+    # New collectors publish explicit polarity/coverage observations. Once a
+    # collector has that contract, never fall back to its broad summary/details
+    # blob: it can contain current snapshots, query text or tail-limited logs.
+    # Only a positive, fully scoped card is eligible for deterministic family
+    # ranking. Legacy collectors keep the prior compatibility path until they
+    # publish structured observations.
+    structured = [art for art in artifacts if _artifact_observation(art) is not None]
+    if structured:
+        parts: list[str] = []
+        for art in structured:
+            if not _artifact_is_evidence(art):
+                continue
+            if art.summary:
+                parts.append(art.summary)
+            if art.result is not None:
+                parts.append(_leaf_text(art.result, drop_keys))
+        return " ".join(parts).lower()
+
     parts = [result.summary or ""]
-    for art in result.artifacts:
+    for art in artifacts:
         if not _artifact_is_evidence(art):
             continue
         if art.summary:
@@ -734,7 +753,23 @@ def _collector_is_evidence(result: CollectorResult) -> bool:
 
 
 def _artifact_is_evidence(art: object) -> bool:
-    return getattr(art, "status", "") in ("ok", "partial")
+    if getattr(art, "status", "") not in ("ok", "partial"):
+        return False
+    observation = _artifact_observation(art)
+    if observation is None:
+        return True
+    return (
+        str(observation.get("polarity") or "") == "present"
+        and str(observation.get("coverage") or "") == "scoped"
+    )
+
+
+def _artifact_observation(art: object) -> dict[str, object] | None:
+    result = getattr(art, "result", None)
+    if not isinstance(result, dict):
+        return None
+    observation = result.get("observation")
+    return observation if isinstance(observation, dict) else None
 
 
 def _leaf_text(value: Any, drop_keys: "frozenset[str] | set[str] | None" = None) -> str:
