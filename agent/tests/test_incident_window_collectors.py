@@ -141,6 +141,7 @@ async def test_prometheus_records_zero_and_peak_values_for_evidence(monkeypatch)
     assert summary["max"] == 2.5
     assert summary["all_zero"] is False
     assert summary["zero_sample_count"] == 2
+    assert summary["any_series_changed_during_window"] is True
     assert summary["series"][0]["last"] == 0.0
     assert summary["series"][0]["nonzero_sample_count"] == 1
 
@@ -198,6 +199,52 @@ def test_prometheus_up_marks_a_mixed_vector_with_any_down_target_present() -> No
 
     assert up_failure["polarity"] == "present"
     assert healthy["polarity"] == "absent"
+
+
+def test_restart_counter_requires_change_during_incident_window() -> None:
+    window = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    stale_counter = prometheus._prometheus_query_observation(
+        {
+            "name": "container_restarts",
+            "series_count": 1,
+            "value_summary": {
+                "numeric_sample_count": 3,
+                "all_zero": False,
+                "series_with_multiple_samples": 1,
+                "any_series_changed_during_window": False,
+            },
+        },
+        time_range=window,
+    )
+    changed_counter = prometheus._prometheus_query_observation(
+        {
+            "name": "container_restarts",
+            "series_count": 1,
+            "value_summary": {
+                "numeric_sample_count": 3,
+                "all_zero": False,
+                "series_with_multiple_samples": 1,
+                "any_series_changed_during_window": True,
+            },
+        },
+        time_range=window,
+    )
+    one_sample = prometheus._prometheus_query_observation(
+        {
+            "name": "container_restarts",
+            "series_count": 1,
+            "value_summary": {
+                "numeric_sample_count": 1,
+                "all_zero": False,
+                "series_with_multiple_samples": 0,
+            },
+        },
+        time_range=window,
+    )
+
+    assert (stale_counter["polarity"], stale_counter["coverage"]) == ("absent", "scoped")
+    assert (changed_counter["polarity"], changed_counter["coverage"]) == ("present", "scoped")
+    assert (one_sample["polarity"], one_sample["coverage"]) == ("unknown", "partial")
 
 
 def test_prometheus_unbounded_empty_result_is_not_a_scoped_absence() -> None:

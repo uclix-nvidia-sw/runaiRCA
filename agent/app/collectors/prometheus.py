@@ -486,6 +486,15 @@ def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
                     "all_zero": all(value == 0 for value in numeric),
                 }
             )
+            if len(numeric) >= 2:
+                # Counter resets are also meaningful lifecycle activity, so a
+                # decrease counts as a change as well as an increase. Compare
+                # every adjacent pair: a counter can increase then reset within
+                # one incident window and finish at its starting value.
+                summary["changed_during_window"] = any(
+                    current != previous
+                    for previous, current in zip(numeric, numeric[1:], strict=False)
+                )
         summaries.append(summary)
     aggregate: dict[str, object] = {
         "series": summaries,
@@ -499,6 +508,12 @@ def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
                 "zero_sample_count": sum(value == 0 for value in all_values),
                 "nonzero_sample_count": sum(value != 0 for value in all_values),
                 "all_zero": all(value == 0 for value in all_values),
+                "series_with_multiple_samples": sum(
+                    int(item.get("numeric_sample_count") or 0) >= 2 for item in summaries
+                ),
+                "any_series_changed_during_window": any(
+                    item.get("changed_during_window") is True for item in summaries
+                ),
             }
         )
     return aggregate
@@ -571,6 +586,17 @@ def _prometheus_query_observation(
                 has_zero = all_zero is True or summary.get("min") == 0
             polarity = "present" if has_zero else "absent"
             coverage = "scoped"
+        elif name.endswith("restarts"):
+            # Restart metrics are monotonically increasing counters. A
+            # non-zero value can have been accumulated long before the alert;
+            # only a change within this incident range supports a restart
+            # hypothesis. One-sample replies cannot establish that difference.
+            if int(summary.get("series_with_multiple_samples") or 0) == 0:
+                polarity, coverage = "unknown", "partial"
+            elif summary.get("any_series_changed_during_window") is True:
+                polarity, coverage = "present", "scoped"
+            else:
+                polarity, coverage = "absent", "scoped"
         elif all_zero is True:
             polarity, coverage = "absent", "scoped"
         else:
