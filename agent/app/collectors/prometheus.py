@@ -324,6 +324,8 @@ async def _collect_prometheus_direct(
                 else {"query": query}
             ),
         )
+        status = _prometheus_status(response.data)
+        error = response.error or _prometheus_api_error(response.data, status)
         result_data = _prometheus_result(response.data)
         query_results.append(
             {
@@ -331,17 +333,33 @@ async def _collect_prometheus_direct(
                 "query": query,
                 "url": response.url,
                 "status_code": response.status_code,
-                "status": _prometheus_status(response.data),
+                "status": status,
                 "series_count": len(result_data),
                 "sample": compact(result_data, limit=3),
                 "value_summary": _prometheus_value_summary(result_data),
-                "error": response.error,
+                "error": error,
                 **({"time_range": time_range} if time_range else {}),
             }
         )
-        if response.error:
-            warnings.append(f"Prometheus query failed for {name}: {response.error}")
+        if error:
+            warnings.append(f"Prometheus query failed for {name}: {error}")
     return query_results
+
+
+def _prometheus_api_error(data: object, status: str) -> str | None:
+    """Return a native Prometheus API error hidden behind an HTTP 200 response.
+
+    A malformed PromQL query can yield ``{status: error}`` without a transport
+    error. It must not fall through as a zero-series result, which would turn a
+    failed lookup into an RCA-safe absence verdict.
+    """
+    if status == "success":
+        return None
+    if isinstance(data, dict):
+        detail = str(data.get("error") or data.get("errorType") or "").strip()
+        if detail:
+            return f"Prometheus API status {status}: {detail}"
+    return f"Prometheus API status {status}"
 
 
 async def _collect_prometheus_mcp(

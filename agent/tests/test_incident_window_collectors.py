@@ -48,6 +48,36 @@ async def test_prometheus_direct_uses_incident_query_range(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_prometheus_api_error_payload_is_not_treated_as_missing_metrics(monkeypatch) -> None:
+    async def fake_get_json(**_kwargs):
+        return JsonResponse(
+            url="http://prometheus/api/v1/query_range",
+            status_code=200,
+            data={
+                "status": "error",
+                "errorType": "bad_data",
+                "error": "parse error: unexpected end of input",
+            },
+        )
+
+    monkeypatch.setattr(prometheus, "get_json", fake_get_json)
+    target = replace(
+        make_target(),
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    result = await prometheus.PrometheusCollector(
+        replace(make_settings(), prometheus_url="http://prometheus")
+    ).collect(target)
+
+    assert result.status == "unavailable"
+    assert all(query["error"] for query in result.details["queries"])
+    signals = [artifact for artifact in result.artifacts if artifact.type == "promql_signal"]
+    assert signals
+    assert all(artifact.result["observation"]["polarity"] == "unavailable" for artifact in signals)
+
+
+@pytest.mark.asyncio
 async def test_loki_emits_a_scoped_artifact_for_each_incident_query(monkeypatch) -> None:
     async def fake_get_json(**_kwargs):
         return JsonResponse(
