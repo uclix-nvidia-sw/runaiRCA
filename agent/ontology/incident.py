@@ -45,6 +45,9 @@ class OntologyIncident(BaseModel):
     quality_source: str = ""
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     harness: dict[str, Any] = Field(default_factory=dict)
+    # Versioned, incident-derived trace. Only schema_version >= 3 is projected
+    # into first-class hypothesis/probe entities; older traces remain untouched.
+    reasoning_trace_v3: dict[str, Any] = Field(default_factory=dict)
     title: str = ""
     severity: str = "warning"
     status: str = "firing"

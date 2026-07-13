@@ -1,0 +1,52 @@
+{{- if and .Values.typedb.enabled .Values.typedb.packageMirror.enabled }}
+# Advisory asynchronous mirror only: the backend remains the runtime authority
+# for package activation, approval, and retirement. Recurrence repairs failed
+# mirrors and propagates retirement without a Helm upgrade.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "runai-rca.typedb.fullname" . }}-package-mirror
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: typedb-package-mirror
+spec:
+  schedule: {{ .Values.typedb.packageMirror.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "runai-rca.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: typedb-package-mirror
+        spec:
+          restartPolicy: OnFailure
+          automountServiceAccountToken: false
+          containers:
+            - name: mirror
+              image: {{ include "runai-rca.image" (dict "root" . "image" .Values.agent.image) | quote }}
+              imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
+              command: ["python", "-m", "ontology.mirror_packages", "--limit", {{ .Values.typedb.packageMirror.limit | quote }}]
+              env:
+                - name: ENABLE_TYPEDB
+                  value: "true"
+                - name: TYPEDB_ADDRESS
+                  value: {{ include "runai-rca.typedb.address" . | quote }}
+                - name: TYPEDB_DATABASE
+                  value: {{ .Values.typedb.auth.database | quote }}
+                - name: TYPEDB_USERNAME
+                  value: {{ .Values.typedb.auth.username | quote }}
+                - name: TYPEDB_PASSWORD
+                  value: {{ .Values.typedb.auth.password | quote }}
+                - name: TYPEDB_TIMEOUT_SECONDS
+                  value: {{ .Values.agent.env.typedbTimeoutSeconds | quote }}
+                - name: POSTGRES_DSN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "runai-rca.databaseSecretName" . }}
+                      key: {{ .Values.secrets.keys.postgresDsn | quote }}
+                      optional: true
+{{- end }}

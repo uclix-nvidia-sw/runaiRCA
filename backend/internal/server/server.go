@@ -259,6 +259,7 @@ type Server struct {
 	store                     *Store
 	hub                       *Hub
 	agentURL                  string
+	knowledgeValidatorURL     string
 	language                  string
 	agentRequestTimeout       time.Duration
 	manualAgentRequestTimeout time.Duration
@@ -417,10 +418,15 @@ func NewServer() *Server {
 	if trashRetentionDays < 0 {
 		trashRetentionDays = defaultTrashRetentionDays
 	}
+	agentURL := strings.TrimRight(getenv("AGENT_URL", "http://localhost:8000"), "/")
 	return &Server{
-		store:                     store,
-		hub:                       NewHub(),
-		agentURL:                  strings.TrimRight(getenv("AGENT_URL", "http://localhost:8000"), "/"),
+		store:    store,
+		hub:      NewHub(),
+		agentURL: agentURL,
+		// KNOWLEDGE_VALIDATOR_URL is the Agent service base URL. The approval
+		// flow consistently appends /knowledge/validate, avoiding a deployment
+		// dependency on the public analysis route or a duplicated path suffix.
+		knowledgeValidatorURL:     strings.TrimRight(first(os.Getenv("KNOWLEDGE_VALIDATOR_URL"), os.Getenv("AGENT_INTERNAL_URL"), agentURL), "/"),
 		language:                  getenv("LANGUAGE", "en"),
 		agentRequestTimeout:       agentRequestTimeout,
 		manualAgentRequestTimeout: manualAgentRequestTimeout,
@@ -478,6 +484,12 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleEmbeddingSearch(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/analysis-runs":
 		s.handleAnalysisRunList(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/knowledge/runtime-snapshot":
+		s.handleKnowledgeRuntimeSnapshot(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/knowledge/probe-metrics":
+		s.handleProbeMetrics(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/v1/knowledge-candidates") || strings.HasPrefix(r.URL.Path, "/api/v1/knowledge-packages"):
+		s.handleKnowledge(w, r)
 	case (r.Method == http.MethodGet || r.Method == http.MethodPut) &&
 		strings.HasPrefix(r.URL.Path, "/api/v1/analysis-runs/"):
 		s.handleAnalysisRunEvaluation(w, r)

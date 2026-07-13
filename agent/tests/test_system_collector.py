@@ -5,7 +5,7 @@ import pytest
 from app.collectors import system as system_mod
 from app.collectors.base import AnalysisTarget
 from app.collectors.http_json import JsonResponse
-from app.collectors.system import SystemCollector, _base_url_for_node, _lines
+from app.collectors.system import SystemCollector, _base_url_for_node, _lines, system_log_query
 
 
 def _target(node: str = "gpu-node-1") -> AnalysisTarget:
@@ -143,3 +143,77 @@ async def test_all_sources_fail(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.status == "unavailable"
     assert result.missing_data == ["system_agent.query"]
     assert result.warnings
+
+
+@pytest.mark.asyncio
+async def test_system_log_query_is_scoped_bounded_and_body_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+
+    async def fake_get_json(**kwargs):
+        calls.append(kwargs)
+        return JsonResponse(
+            url="http://node/logs",
+            status_code=200,
+            data={"body": "api_key=raw-host-secret", "lines": ["NVRM: Xid 79", "healthy"]},
+        )
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+    query = await system_log_query(
+        _Settings(),
+        _target(),
+        {"source": "journal", "lookback_seconds": 120, "lines": 2, "grep": "NVRM: Xid"},
+    )
+
+    assert calls[0]["params"] == {"source": "journal", "lines": "2", "grep": r"NVRM:\ Xid"}
+    assert query["source_group"] == "node_system"
+    assert query["independence_group"] == "node_system"
+    observation = query["observation"]
+    assert observation["observed_entity"] == {"kind": "node", "name": "gpu-node-1"}
+    assert observation["window"] == {"lookback_seconds": 120}
+    assert observation["polarity"] == "present"
+    assert observation["coverage"] == "partial"
+    assert set(observation["observation_window"]) == {"start", "end"}
+    assert observation["signal_types"] == ["gpu_driver"]
+    assert observation["body_included"] is False
+    assert "raw-host-secret" not in str(query)
+    assert "NVRM: Xid 79" not in str(query)
+
+
+@pytest.mark.asyncio
+async def test_system_log_query_refuses_scope_or_limit_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    async def fake_get_json(**kwargs):
+        nonlocal called
+        called = True
+        return JsonResponse(url="u", status_code=200, data={"lines": []})
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+    query = await system_log_query(
+        _Settings(), _target(), {"source": "journal", "node": "other-node", "lines": 1001}
+    )
+
+    assert query["error"] == "node must match the alert node scope"
+    assert query["observation"]["coverage"] == "unknown"
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_system_log_query_refuses_unsafe_grep_and_line_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_get_json(**kwargs):
+        raise AssertionError("invalid arguments must not make a request")
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+    too_many = await system_log_query(_Settings(), _target(), {"source": "journal", "lines": 1001})
+    unsafe = await system_log_query(
+        _Settings(), _target(), {"source": "journal", "grep": "line\nnext"}
+    )
+
+    assert too_many["error"] == "lines must be between 1 and 1000"
+    assert unsafe["error"] == "grep must not contain control characters"

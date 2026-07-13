@@ -43,6 +43,11 @@ func TestPostgresConnectReportsPGVectorEnabledAndLoadsState(t *testing.T) {
 		!state.Executed("idx_rca_case_snapshots_active_incident") {
 		t.Fatalf("expected immutable case snapshot schema statements, got %+v", state.Execs())
 	}
+	contentHashColumn := state.ExecIndex("ADD COLUMN IF NOT EXISTS content_hash")
+	fingerprintIndex := state.ExecIndex("idx_knowledge_candidates_fingerprint_hash")
+	if contentHashColumn < 0 || fingerprintIndex < 0 || contentHashColumn > fingerprintIndex {
+		t.Fatalf("knowledge fingerprint index must follow content_hash migration, column=%d index=%d", contentHashColumn, fingerprintIndex)
+	}
 	for _, ddl := range []string{
 		"ADD COLUMN IF NOT EXISTS user_approved_at",
 		"ADD COLUMN IF NOT EXISTS archived_at",

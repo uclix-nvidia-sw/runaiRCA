@@ -13,6 +13,7 @@ import json
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Literal
 
 from app.collectors.base import NO_EVIDENCE, CollectorResult
@@ -60,7 +61,10 @@ _SOURCE_GROUPS = {
     "runai_api": "runai_api",
     "postgres": "postgres",
     "postgresql": "postgres",
-    "change": "change_control",
+    # The current change collector reads Kubernetes rollout state. It is not an
+    # independent audit plane unless a future collector explicitly identifies
+    # an external GitOps/audit source group.
+    "change": "kubernetes_api",
 }
 
 
@@ -91,6 +95,8 @@ class EvidenceFact:
     observed_window_end: str = ""
     unit: str = ""
     provenance: tuple[tuple[str, str], ...] = ()
+    run_id: str = ""
+    topology: tuple[str, ...] = ()
 
     @property
     def evidence_id(self) -> str:
@@ -101,19 +107,37 @@ class EvidenceFact:
     def is_reliable_absence(self) -> bool:
         return self.polarity == "absent" and self.coverage == "scoped"
 
+    @property
+    def source_group(self) -> str:
+        """Public v3 name for the telemetry-independence grouping."""
+        return self.independence_group
+
+    @property
+    def observation_window(self) -> tuple[str, str]:
+        """The incident window in which this observation was evaluated."""
+        return (self.observed_window_start, self.observed_window_end)
+
+    @property
+    def eligibility(self) -> EvidenceEligibility:
+        return EvidenceEligibility.from_fact(self)
+
     def prompt_dict(self, *, masker: Masker | None = None) -> dict[str, Any]:
         """Return a compact prompt projection with no query or raw result data."""
         active_masker = masker or build_masker(())
+        observed_window = {
+            "start": active_masker.mask_text(self.observed_window_start),
+            "end": active_masker.mask_text(self.observed_window_end),
+        }
         return {
             "evidence_id": self.fact_id,
             "timestamp": active_masker.mask_text(self.timestamp),
-            "observed_window": {
-                "start": active_masker.mask_text(self.observed_window_start),
-                "end": active_masker.mask_text(self.observed_window_end),
-            },
+            # Keep v2's observed_window while offering the clearer v3 name.
+            "observed_window": observed_window,
+            "observation_window": observed_window,
             "entity": active_masker.mask_text(self.entity),
             "source": self.source,
             "independence_group": self.independence_group,
+            "source_group": self.source_group,
             "predicate": self.predicate,
             "value": active_masker.mask_text(self.value),
             "unit": self.unit,
@@ -123,6 +147,69 @@ class EvidenceFact:
             "summary": active_masker.mask_text(self.summary),
             "highlights": [active_masker.mask_text(item) for item in self.highlights],
         }
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceEligibility:
+    """Whether one observation may ground a typed reasoning link.
+
+    Availability gaps and unknown observations are useful operational context,
+    but are never proof.  An explicitly empty, fully scoped observation is
+    useful only to refute a hypothesis; it cannot be promoted into support.
+    """
+
+    support: bool
+    refutation: bool
+    context: bool
+    reason: str = ""
+
+    @classmethod
+    def from_fact(
+        cls, fact: EvidenceFact, *, context: Mapping[str, Any] | None = None
+    ) -> EvidenceEligibility:
+        base = cls.from_fields(fact.polarity, fact.coverage)
+        if not context:
+            return base
+        expected_run = _clean_text(context.get("run_id"))
+        if expected_run and fact.run_id and expected_run != fact.run_id:
+            return cls(False, False, False, "evidence belongs to a different run")
+        if not _window_compatible(
+            fact.observed_window_start,
+            fact.observed_window_end,
+            _clean_text(context.get("window_start")),
+            _clean_text(context.get("window_end")),
+        ):
+            return cls(False, False, False, "evidence is outside the incident window")
+        expected_entities = _context_tokens(context.get("entities"))
+        if expected_entities and fact.entity and not _tokens_overlap(
+            _context_tokens((fact.entity,)), expected_entities
+        ):
+            return cls(False, False, False, "evidence targets a different entity")
+        expected_topology = _context_tokens(context.get("topology"))
+        if expected_topology and fact.topology and not _tokens_overlap(
+            _context_tokens(fact.topology), expected_topology
+        ):
+            return cls(False, False, False, "evidence conflicts with target topology")
+        return base
+
+    @classmethod
+    def from_fields(cls, polarity: str, coverage: str) -> EvidenceEligibility:
+        if polarity == "present":
+            return cls(True, True, True)
+        if polarity == "absent" and coverage == "scoped":
+            return cls(False, True, True, "scoped absence may only refute")
+        if polarity == "absent":
+            return cls(False, False, True, "absence is not fully scoped")
+        if polarity == "unavailable":
+            return cls(False, False, True, "source unavailable")
+        return cls(False, False, True, "observation is unknown")
+
+    def permits(self, role: EvidenceRole | str) -> bool:
+        if role == "support":
+            return self.support
+        if role == "contradict":
+            return self.refutation
+        return self.context
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +332,10 @@ class Blackboard(EvidenceBlackboard):
         observed_window_end: str = "",
     ) -> tuple[EvidenceFact, ...]:
         """Normalize every artifact in a collector result and add new facts."""
+        details = result.details if isinstance(result.details, Mapping) else {}
+        source_group = _clean_text(details.get("source_group"))
+        run_id = _clean_text(details.get("run_id") or details.get("incident_run_id"))
+        topology = details.get("topology") or details.get("target_topology")
         artifacts = result.artifacts or [
             make_artifact(
                 agent=agent,
@@ -269,6 +360,9 @@ class Blackboard(EvidenceBlackboard):
                 timestamp=timestamp,
                 observed_window_start=observed_window_start,
                 observed_window_end=observed_window_end,
+                source_group=source_group,
+                run_id=run_id,
+                topology=topology,
             )
             if self.add(fact):
                 added.append(fact)
@@ -336,6 +430,9 @@ def normalize_artifact(
     predicate: str = "observation",
     polarity: Polarity | None = None,
     coverage: Coverage | None = None,
+    source_group: str = "",
+    run_id: str = "",
+    topology: object = (),
     masker: Masker | None = None,
 ) -> EvidenceFact:
     """Turn a collector artifact into a stable fact without retaining its query.
@@ -345,13 +442,29 @@ def normalize_artifact(
     response ``absent``; an unavailable source is never absence.
     """
     raw = _artifact_mapping(artifact)
+    result = raw.get("result")
+    result_metadata = result if isinstance(result, Mapping) else {}
+    observation = result_metadata.get("observation")
+    observation_metadata = observation if isinstance(observation, Mapping) else {}
+
+    def metadata(key: str) -> object:
+        return raw.get(key) or result_metadata.get(key) or observation_metadata.get(key)
+
+    # A collector-provided observation window is more precise than the broad
+    # incident window supplied by the pipeline.  Preserve it for causal/timing
+    # review rather than overwriting it with the alert's lifetime.
+    raw_window = metadata("observation_window") or metadata("observed_window")
+    if isinstance(raw_window, Mapping):
+        observed_window_start = _clean_text(raw_window.get("start")) or observed_window_start
+        observed_window_end = _clean_text(raw_window.get("end")) or observed_window_end
+    observed_window_start = _clean_text(metadata("observed_window_start")) or observed_window_start
+    observed_window_end = _clean_text(metadata("observed_window_end")) or observed_window_end
     source = _clean_text(raw.get("source")) or "unknown"
     status = _normalise_token(_clean_text(raw.get("status")))
     summary = _clean_text(raw.get("summary"))
     highlights = tuple(
         text for item in _as_list(raw.get("highlights")) if (text := _clean_text(item))
     )
-    result = raw.get("result")
     resolved_polarity = polarity or _infer_polarity(status, summary, highlights, result)
     if resolved_polarity not in _POLARITIES:
         raise ValueError(f"invalid polarity: {resolved_polarity}")
@@ -371,6 +484,10 @@ def normalize_artifact(
         ("agent", _clean_text(raw.get("agent"))),
         ("type", _clean_text(raw.get("type"))),
     )
+    resolved_run_id = _clean_text(run_id or metadata("run_id") or metadata("incident_run_id"))
+    resolved_topology = _context_tokens(
+        topology or metadata("topology") or metadata("target_topology")
+    )
     stable_fields = {
         "artifact_id": artifact_id or _artifact_identity(raw),
         "timestamp": timestamp,
@@ -381,6 +498,8 @@ def normalize_artifact(
         "value": safe_value,
         "polarity": resolved_polarity,
         "coverage": resolved_coverage,
+        "run_id": resolved_run_id,
+        "topology": resolved_topology,
         "summary": safe_summary,
         "highlights": safe_highlights,
         "provenance": safe_provenance,
@@ -392,7 +511,9 @@ def normalize_artifact(
         timestamp=timestamp,
         entity=safe_entity,
         source=source,
-        independence_group=source_independence_group(source),
+        independence_group=source_independence_group(
+            _clean_text(source_group or metadata("source_group")) or source
+        ),
         predicate=predicate,
         value=safe_value,
         quality=_clean_text(raw.get("confidence")) or "low",
@@ -403,6 +524,8 @@ def normalize_artifact(
         observed_window_start=observed_window_start,
         observed_window_end=observed_window_end,
         provenance=tuple((key, value) for key, value in safe_provenance if value),
+        run_id=resolved_run_id,
+        topology=resolved_topology,
     )
 
 
@@ -509,3 +632,66 @@ def _as_list(value: object) -> list[object]:
     if isinstance(value, (list, tuple)):
         return list(value)
     return []
+
+
+def _context_tokens(value: object) -> tuple[str, ...]:
+    if isinstance(value, Mapping):
+        values = (f"{key}:{item}" for key, item in value.items() if _clean_text(item))
+    elif isinstance(value, str):
+        values = (value,)
+    elif isinstance(value, Iterable):
+        values = (str(item) for item in value)
+    else:
+        values = ()
+    return tuple(token for item in values if (token := _normalise_token(_clean_text(item))))
+
+
+def _tokens_overlap(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
+    return bool(set(left) & set(right))
+
+
+def _window_compatible(
+    observed_start: str, observed_end: str, incident_start: str, incident_end: str
+) -> bool:
+    """Reject only explicit non-overlap; missing context remains compatible."""
+    if not (observed_start and observed_end and incident_start and incident_end):
+        return True
+    try:
+        start = _parse_time(observed_start)
+        end = _parse_time(observed_end)
+        incident_from = _parse_time(incident_start)
+        incident_to = _parse_time(incident_end)
+    except ValueError:
+        return True
+    return start <= incident_to and end >= incident_from
+
+
+def temporal_relation_to_incident(
+    observed_start: str, observed_end: str, incident_start: str, incident_end: str
+) -> str:
+    """Classify timing without pretending a post-incident observation is a cause.
+
+    The result is descriptive, not an eligibility gate: a log captured after
+    an alert can still corroborate a condition, but reviewers can no longer
+    mistake it for evidence observed before the symptom.
+    """
+    if not (observed_start and observed_end and incident_start and incident_end):
+        return "unknown"
+    try:
+        start = _parse_time(observed_start)
+        end = _parse_time(observed_end)
+        incident_from = _parse_time(incident_start)
+        incident_to = _parse_time(incident_end)
+    except ValueError:
+        return "unknown"
+    if end < incident_from:
+        return "precedes_incident"
+    if start > incident_to:
+        return "follows_incident"
+    if start >= incident_from and end <= incident_to:
+        return "during_incident"
+    return "overlaps_incident"
+
+
+def _parse_time(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))

@@ -40,6 +40,7 @@ import { AnalysisDashboard } from './dashboards/AnalysisDashboard';
 import { AlertsDashboard } from './dashboards/AlertsDashboard';
 import { ChatDashboard } from './dashboards/ChatDashboard';
 import { IncidentsDashboard } from './dashboards/IncidentsDashboard';
+import { LearnedKnowledgeDashboard } from './dashboards/LearnedKnowledgeDashboard';
 import { FeedbackPanel } from './workspace/FeedbackPanel';
 import { EvaluationPanel } from './workspace/EvaluationPanel';
 import { FloatingChat } from './workspace/FloatingChat';
@@ -339,6 +340,7 @@ function App() {
   const [detail, setDetail] = useState<DetailState>(null);
   const [chatDocked, setChatDocked] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [knowledgeRefreshKey, setKnowledgeRefreshKey] = useState(0);
   const detailVersionRef = useRef(0);
   const routeLoadVersionRef = useRef(0);
 
@@ -534,11 +536,15 @@ function App() {
     if (refreshing) return;
     setRefreshing(true);
     try {
+      if (activeView === 'knowledge') {
+        setKnowledgeRefreshKey((value) => value + 1);
+        return;
+      }
       await Promise.all([load({ silent: true }), refreshDetail()]);
     } finally {
       setRefreshing(false);
     }
-  }, [load, refreshDetail, refreshing]);
+  }, [activeView, load, refreshDetail, refreshing]);
 
   const handleArchiveIncident = useCallback(async (id: string) => {
     await archiveIncident(id);
@@ -613,6 +619,13 @@ function App() {
             type="button"
           >
             <ListChecks size={18} /> Analysis
+          </button>
+          <button
+            className={`nav-item ${activeView === 'knowledge' ? 'active' : ''}`}
+            onClick={() => switchView('knowledge')}
+            type="button"
+          >
+            <Database size={18} /> Knowledge
           </button>
           <button
             className={`nav-item ${activeView === 'chat' ? 'active' : ''}`}
@@ -716,6 +729,9 @@ function App() {
             incidents={analysisIncidents}
             alerts={analysisAlerts}
           />
+        )}
+        {activeView === 'knowledge' && (
+          <LearnedKnowledgeDashboard query={query} refreshKey={knowledgeRefreshKey} />
         )}
         {activeView === 'chat' && (
           <ChatDashboard chat={chatSession} query={query} />

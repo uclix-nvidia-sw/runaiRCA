@@ -29,6 +29,12 @@ from app.services.decision_tree import load_tree
 from ontology.load_knowledge import FAMILIES
 
 RUNBOOK_NAME = "k8s-senior-troubleshooting"
+BUNDLED_RUNBOOK_ID = "k8s_troubleshooting"
+_SCOPED_PROBE_ID = re.compile(
+    r"(?P<runbook>[a-z][a-z0-9_-]{0,80}):"
+    r"(?P<step>[a-z][a-z0-9_-]{0,80}):"
+    r"(?P<local>p[0-9]{2,3})$"
+)
 TREE_FILE = Path(
     os.getenv("K8S_TROUBLESHOOTING_TREE_FILE", "knowledge/k8s_troubleshooting_tree.yaml")
 )
@@ -60,6 +66,7 @@ def _delete_existing(tx: Any, runbook: str) -> None:
         ("diagnostic_transition", "prior"),
         ("diagnostic_outcome", "step"),
         ("diagnostic_recommendation", "step"),
+        ("probe_template_for", "step"),
     ):
         tx.query(
             f'match $s isa diagnostic_step, has runbook_name "{name}"; '
@@ -93,7 +100,30 @@ def _insert_runbook(tx: Any, raw: dict[str, Any]) -> None:
         ).resolve()
 
 
-def _insert_step(tx: Any, node: dict[str, Any]) -> None:
+def _insert_probe_template(tx: Any, step_id: str, probe: dict[str, object]) -> None:
+    """Dual-write the runtime JSON and first-class, stable template entity."""
+    probe_id = str(probe["id"])
+    exists = list(
+        tx.query(
+            f'match $x isa diagnostic_probe_template, has probe_id "{esc(probe_id)}"; '
+            "select $x;"
+        ).resolve().as_concept_rows()
+    )
+    if not exists:
+        tx.query(
+            f'insert $x isa diagnostic_probe_template, has probe_id "{esc(probe_id)}", '
+            f'has probe_tool "{esc(str(probe["tool"]))}";'
+        ).resolve()
+    relation = (
+        f'$s isa diagnostic_step, has diagnostic_id "{esc(step_id)}"; '
+        f'$p isa diagnostic_probe_template, has probe_id "{esc(probe_id)}"; '
+        "(step: $s, template: $p) isa probe_template_for"
+    )
+    if not list(tx.query(f"match {relation}; select $s;").resolve().as_concept_rows()):
+        tx.query(f"match {relation}; insert (step: $s, template: $p) isa probe_template_for;").resolve()
+
+
+def _insert_step(tx: Any, node: dict[str, Any], runbook_id: str) -> None:
     step_id = str(node["id"])
     values = {
         "question": node.get("question") or "",
@@ -107,11 +137,14 @@ def _insert_step(tx: Any, node: dict[str, Any]) -> None:
         f'insert $x isa diagnostic_step, has diagnostic_id "{esc(step_id)}", '
         f'has runbook_name "{esc(RUNBOOK_NAME)}", {attrs};'
     ).resolve()
-    for probe in _probe_templates(node.get("probes")):
+    for probe in _probe_templates(
+        node.get("probes"), step_id, runbook_id=runbook_id, enforce_scoped=True
+    ):
         tx.query(
             f'match $s isa diagnostic_step, has diagnostic_id "{esc(step_id)}"; '
-            f'insert $s has probe_template "{esc(json.dumps(probe, sort_keys=True))}";'
+            f'insert $s has probe_template "{esc(json.dumps(probe, ensure_ascii=False, sort_keys=True))}";'
         ).resolve()
+        _insert_probe_template(tx, step_id, probe)
     tx.query(
         f'match $r isa runbook, has name "{esc(RUNBOOK_NAME)}"; '
         f'$s isa diagnostic_step, has diagnostic_id "{esc(step_id)}"; '
@@ -119,13 +152,19 @@ def _insert_step(tx: Any, node: dict[str, Any]) -> None:
     ).resolve()
 
 
-def _probe_templates(value: object) -> list[dict[str, object]]:
+def _probe_templates(
+    value: object,
+    step_id: str = "",
+    *,
+    runbook_id: str = "",
+    enforce_scoped: bool = False,
+) -> list[dict[str, object]]:
     """Validate portable probe metadata without allowing executable commands."""
     if value is None:
         return []
     raw = value if isinstance(value, list) else [value]
     output: list[dict[str, object]] = []
-    for item in raw:
+    for index, item in enumerate(raw, start=1):
         if not isinstance(item, dict):
             raise ValueError("diagnostic probe must be a mapping")
         tool = str(item.get("tool") or "").strip()
@@ -134,8 +173,24 @@ def _probe_templates(value: object) -> list[dict[str, object]]:
         arguments = item.get("arguments_template") or {}
         if not isinstance(arguments, dict):
             raise ValueError("diagnostic probe arguments_template must be a mapping")
+        probe_id = str(item.get("id") or item.get("probe_id") or "").strip()
+        if not probe_id:
+            # Existing custom trees may not have been migrated yet. This is
+            # stable by node/order and deliberately never derives an ID from
+            # query arguments or an execution trace.
+            probe_id = f"{step_id or 'legacy'}-probe-{index:02d}"
+        if not re.fullmatch(r"[a-z][a-z0-9_:-]{0,180}", probe_id):
+            raise ValueError(f"invalid diagnostic probe id: {probe_id!r}")
+        if enforce_scoped:
+            match = _SCOPED_PROBE_ID.fullmatch(probe_id)
+            if not match or match.group("runbook") != runbook_id or match.group("step") != step_id:
+                raise ValueError(
+                    "bundled diagnostic probe id must be "
+                    f"{runbook_id}:{step_id}:pNN, got {probe_id!r}"
+                )
         output.append(
             {
+                "id": probe_id,
                 "tool": tool,
                 "arguments_template": arguments,
                 "incident_time_window": str(item.get("incident_time_window") or "incident"),
@@ -230,10 +285,15 @@ def _insert_transitions(tx: Any, nodes: list[dict[str, Any]]) -> int:
 
 def _load(tx: Any, raw: dict[str, Any]) -> tuple[int, int, int]:
     nodes = [node for node in raw.get("nodes") or [] if isinstance(node, dict)]
+    runbook_id = str(raw.get("runbook_id") or "").strip()
+    if runbook_id != BUNDLED_RUNBOOK_ID:
+        raise ValueError(
+            f"bundled troubleshooting tree must declare runbook_id {BUNDLED_RUNBOOK_ID!r}"
+        )
     _delete_existing(tx, RUNBOOK_NAME)
     _insert_runbook(tx, raw)
     for node in nodes:
-        _insert_step(tx, node)
+        _insert_step(tx, node, runbook_id)
     root = str(raw.get("root") or "")
     tx.query(
         f'match $r isa runbook, has name "{esc(RUNBOOK_NAME)}"; '

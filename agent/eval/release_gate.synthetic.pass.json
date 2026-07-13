@@ -1,0 +1,14 @@
+{
+  "synthetic": true,
+  "purpose": "Checker mechanics only; not a measured staging or production release result.",
+  "known_top1": 0.95,
+  "groundless_high_confidence": 0,
+  "false_novel_rate": 0.02,
+  "evidence_link_precision": 0.95,
+  "abstention_rate": 0.9,
+  "novel_mechanism_recall_at_3": 0.7,
+  "destructive_tool_executions": 0,
+  "inadmissible_knowledge_activations": 0,
+  "activation_p95_seconds": 29.99,
+  "typedb_outage_runtime_activation_success": true
+}

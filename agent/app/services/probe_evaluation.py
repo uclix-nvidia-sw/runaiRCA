@@ -45,8 +45,24 @@ def evaluate_probe(probe: dict[str, Any], outcome: dict[str, Any]) -> ProbeAsses
     """
     probe_id = str(probe.get("id") or probe.get("probe_id") or probe.get("tool") or "probe")
     tool = str(probe.get("tool") or "")
-    if outcome.get("error"):
+    status = str(outcome.get("status") or "").strip().lower()
+    polarity = str(outcome.get("polarity") or "").strip().lower()
+    coverage = str(outcome.get("coverage") or "").strip().lower()
+    if (
+        outcome.get("error")
+        or status in {"unavailable", "error", "failed", "timeout"}
+        or polarity == "unavailable"
+    ):
         return ProbeAssessment(probe_id, tool, "unavailable")
+    # An unknown result may describe a failed/partial retrieval in its summary.
+    # It must never become support merely because that summary repeats a signal.
+    if polarity == "unknown":
+        return ProbeAssessment(probe_id, tool, "inconclusive")
+    # Empty scope can be informative only when an authored probe explicitly
+    # declares absence as a refuter. Existing probes do not do that, so retain
+    # their conservative inconclusive behavior.
+    if polarity == "absent" and coverage != "scoped":
+        return ProbeAssessment(probe_id, tool, "inconclusive")
     result = outcome.get("result")
     if result is None or (isinstance(result, dict) and not result):
         summary = str(outcome.get("summary") or "")

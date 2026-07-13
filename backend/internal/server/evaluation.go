@@ -187,7 +187,45 @@ func (s *Store) UpsertEvaluationReview(runID string, req EvaluationReviewRequest
 	review.Notes = req.Notes
 	review.UpdatedAt = now
 	s.persistEvaluationReviewLocked(review)
+	// A successful operator outcome is commonly recorded after the immutable
+	// CaseSnapshot was approved. Re-scan that exact run/hash now so eligible
+	// knowledge does not depend on review timing.
+	if review.ResolutionOutcome == "resolved" || review.ResolutionOutcome == "mitigated" {
+		s.generateKnowledgeCandidateForReviewedRunLocked(review.RunID, review.AnalysisHash)
+	}
 	return cloneEvaluationReview(*review), true, nil
+}
+
+func (s *Store) generateKnowledgeCandidateForReviewedRunLocked(runID, analysisHash string) {
+	for _, snapshot := range s.caseSnapshots {
+		if snapshot == nil || snapshot.ApprovalState != "active" || snapshot.RunID != runID || snapshot.AnalysisHash != analysisHash {
+			continue
+		}
+		candidate := s.knowledgeCandidateForSnapshotLocked(snapshot)
+		if candidate == nil {
+			continue
+		}
+		existing := s.knowledgeCandidates[candidate.CandidateID]
+		link := candidate
+		if existing != nil {
+			copy := cloneKnowledgeCandidate(existing)
+			copy.CaseID, copy.CreatedAt = snapshot.CaseID, time.Now().UTC()
+			link = &copy
+		}
+		event := s.newKnowledgeEventLocked(candidate.CandidateID, "", "candidate_generated", "system", "operator outcome recorded", time.Now().UTC())
+		if !s.persistNewKnowledgeCandidateLocked(link, event) {
+			continue
+		}
+		if existing != nil {
+			if !containsString(existing.SupportingCaseIDs, snapshot.CaseID) {
+				existing.SupportingCaseIDs = append(existing.SupportingCaseIDs, snapshot.CaseID)
+				existing.SupportingCaseCount = len(existing.SupportingCaseIDs)
+			}
+		} else {
+			s.knowledgeCandidates[candidate.CandidateID] = candidate
+		}
+		s.knowledgeEvents[event.EventID] = event
+	}
 }
 
 func cloneEvaluationReview(review EvaluationReview) EvaluationReview {

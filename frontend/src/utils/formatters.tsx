@@ -254,7 +254,12 @@ export function Severity({ value }: { value: string }) {
 
 function statusLabel(value: string) {
   const displayValue = value || 'pending';
-  return displayValue === 'ok' || displayValue === 'partial' ? '' : displayValue;
+  if (displayValue === 'ok' || displayValue === 'partial') return '';
+  const labels: Record<string, string> = {
+    ready_for_review: 'ready for review',
+    validation_failed: 'validation failed',
+  };
+  return labels[displayValue] || displayValue;
 }
 
 export function Status({ value, analyzing = false }: { value: string; analyzing?: boolean }) {

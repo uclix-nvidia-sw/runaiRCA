@@ -12,6 +12,7 @@ Degrades gracefully exactly like loki.py: unconfigured -> status='unavailable'.
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
@@ -35,6 +36,238 @@ _ERROR_PATTERNS = re.compile(
 
 # Sources the DaemonSet endpoint understands.
 _SOURCES = ("dmesg", "journal", "syslog")
+
+# The ad-hoc capability remains bounded. It is an incident discriminator, not
+# a way to export host logs.
+_QUERY_MAX_LOOKBACK_SECONDS = 86400
+_QUERY_DEFAULT_LOOKBACK_SECONDS = 900
+_QUERY_MAX_LINES = 1000
+_QUERY_DEFAULT_LINES = 100
+_SYSTEM_LOG_SOURCE_GROUP = "node_system"
+
+
+async def system_log_query(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
+    """Return one bounded, metadata-only node-log observation.
+
+    This is deliberately separate from :class:`SystemCollector`'s base gather.
+    Callers may select one known log source for the alert's node, but cannot
+    redirect the request to another node, expand the lookback, or receive log
+    bodies.  The returned observation contains counts and coarse signal types
+    only, which keeps host logs (where credentials can appear) out of later
+    reasoning and knowledge-candidate paths.
+    """
+    if not isinstance(args, dict):
+        return _query_error("arguments must be an object")
+    source = str(args.get("source") or "").strip().lower()
+    if source not in _SOURCES:
+        return _query_error(
+            "source must be one of: " + ", ".join(_SOURCES),
+            source=source,
+        )
+    node = str(target.node or "").strip()
+    requested_node = str(args.get("node") or "").strip()
+    if not node:
+        return _query_error("the alert has no node scope", source=source)
+    if requested_node and requested_node != node:
+        return _query_error("node must match the alert node scope", source=source, node=node)
+    lookback = _bounded_int(
+        args.get("lookback_seconds", _QUERY_DEFAULT_LOOKBACK_SECONDS),
+        minimum=60,
+        maximum=_QUERY_MAX_LOOKBACK_SECONDS,
+        label="lookback_seconds",
+    )
+    if isinstance(lookback, str):
+        return _query_error(lookback, source=source, node=node)
+    line_value = args.get("lines", args.get("limit", _QUERY_DEFAULT_LINES))
+    lines = _bounded_int(
+        line_value,
+        minimum=1,
+        maximum=_QUERY_MAX_LINES,
+        label="lines",
+    )
+    if isinstance(lines, str):
+        return _query_error(lines, source=source, node=node, lookback=lookback)
+    grep, grep_error = _safe_grep(args.get("grep"))
+    if grep_error:
+        return _query_error(grep_error, source=source, node=node, lookback=lookback, limit=lines)
+    if not getattr(settings, "enable_system_agent", False) or not getattr(
+        settings, "system_agent_url", ""
+    ):
+        return _query_error(
+            "system agent is not configured", source=source, node=node, lookback=lookback
+        )
+
+    address = node
+    if "{node}" in settings.system_agent_url:
+        internal_ip = await _node_internal_ip(settings, node)
+        if internal_ip:
+            address = internal_ip
+    headers = (
+        {"Authorization": f"Bearer {settings.system_agent_token}"}
+        if getattr(settings, "system_agent_token", "")
+        else None
+    )
+    response = await get_json(
+        base_url=_base_url_for_node(settings.system_agent_url, address),
+        path="/logs",
+        timeout_seconds=settings.system_agent_timeout_seconds,
+        # `lines` is enforced by the system agent. `grep` is a literal escaped
+        # here before being sent to the agent's regex endpoint.
+        params={
+            "source": source,
+            "lines": str(lines),
+            **({"grep": grep} if grep else {}),
+        },
+        headers=headers,
+    )
+    if response.error:
+        return _query_error(
+            response.error, source=source, node=node, lookback=lookback, limit=lines
+        )
+    raw_lines = _lines(response.data)[-lines:]
+    matching = [line for line in raw_lines if _ERROR_PATTERNS.search(line)]
+    observation_window = _observation_window(lookback)
+    observation = _system_log_observation(
+        source=source,
+        node=node,
+        lookback_seconds=lookback,
+        limit=lines,
+        scanned=len(raw_lines),
+        matching=matching,
+        observation_window=observation_window,
+    )
+    return {
+        "query": f"system logs source={source} node={node} lookback<={lookback}s lines<={lines}",
+        "title": "Node system logs",
+        "summary": (
+            f"{observation['matching_line_count']} matching system-log line(s) in "
+            f"{source} (metadata only)"
+        ),
+        "error": None,
+        "source_group": _SYSTEM_LOG_SOURCE_GROUP,
+        "independence_group": _SYSTEM_LOG_SOURCE_GROUP,
+        "observed_entity": observation["observed_entity"],
+        "observation_window": observation_window,
+        "polarity": observation["polarity"],
+        "coverage": observation["coverage"],
+        "observation": observation,
+        "result": observation,
+    }
+
+
+def _query_error(
+    error: str,
+    *,
+    source: str = "",
+    node: str = "",
+    lookback: int | None = None,
+    limit: int | None = None,
+) -> dict:
+    """A query failure is itself safe, structured metadata; never include a body."""
+    observation = {
+        "schema_version": "v1",
+        "kind": "system_log_query",
+        "source_group": _SYSTEM_LOG_SOURCE_GROUP,
+        "independence_group": _SYSTEM_LOG_SOURCE_GROUP,
+        "scope": {"node": node, "source": source},
+        "observed_entity": {"kind": "node", "name": node},
+        "window": {"lookback_seconds": lookback},
+        "observation_window": _observation_window(lookback),
+        "polarity": "unavailable",
+        "coverage": "unknown",
+        "lookback_seconds": lookback,
+        "result_limit": limit,
+        "status": "unavailable",
+    }
+    return {
+        "query": "system logs (bounded)",
+        "title": "Node system logs",
+        "summary": error,
+        "error": error,
+        "source_group": _SYSTEM_LOG_SOURCE_GROUP,
+        "independence_group": _SYSTEM_LOG_SOURCE_GROUP,
+        "observed_entity": observation["observed_entity"],
+        "observation_window": observation["observation_window"],
+        "polarity": observation["polarity"],
+        "coverage": observation["coverage"],
+        "observation": observation,
+        "result": observation,
+    }
+
+
+def _bounded_int(value: object, *, minimum: int, maximum: int, label: str) -> int | str:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return f"{label} must be an integer between {minimum} and {maximum}"
+    if not minimum <= parsed <= maximum:
+        return f"{label} must be between {minimum} and {maximum}"
+    return parsed
+
+
+def _safe_grep(value: object) -> tuple[str, str]:
+    """Return a literal bounded grep fit for the system-agent regex endpoint."""
+    if value is None or value == "":
+        return "", ""
+    if not isinstance(value, str):
+        return "", "grep must be a string"
+    literal = value.strip()
+    if not literal or len(literal) > 80:
+        return "", "grep must be 1 to 80 characters"
+    if any(ord(char) < 32 or ord(char) == 127 for char in literal):
+        return "", "grep must not contain control characters"
+    return re.escape(literal), ""
+
+
+def _observation_window(lookback_seconds: int | None) -> dict[str, str]:
+    end = datetime.now(UTC)
+    start = end - timedelta(seconds=lookback_seconds or 0)
+    return {"start": start.isoformat(), "end": end.isoformat()}
+
+
+def _system_log_observation(
+    *,
+    source: str,
+    node: str,
+    lookback_seconds: int,
+    limit: int,
+    scanned: int,
+    matching: list[str],
+    observation_window: dict[str, str],
+) -> dict:
+    """Summarise log matches without retaining raw lines or response bodies."""
+    categories = {
+        "gpu_driver": r"(?i)xid|nvrm|nvlink|fell off the bus",
+        "memory": r"(?i)\boom\b|out of memory|oom-kill",
+        "filesystem": r"(?i)i/o error|ext4-fs error|ext4_|xfs",
+        "hardware": r"(?i)mce:|machine check|hardware error",
+        "kernel": r"(?i)call trace|kernel panic|bug:|segfault",
+    }
+    signal_types = [
+        name
+        for name, pattern in categories.items()
+        if any(re.search(pattern, line) for line in matching)
+    ]
+    return {
+        "schema_version": "v1",
+        "kind": "system_log_query",
+        "source_group": _SYSTEM_LOG_SOURCE_GROUP,
+        "independence_group": _SYSTEM_LOG_SOURCE_GROUP,
+        "scope": {"node": node, "source": source},
+        "observed_entity": {"kind": "node", "name": node},
+        "window": {"lookback_seconds": lookback_seconds},
+        "observation_window": observation_window,
+        "polarity": "present" if matching else "absent",
+        # A finite tail of node logs cannot prove a host-wide absence.
+        "coverage": "partial",
+        "lookback_seconds": lookback_seconds,
+        "result_limit": limit,
+        "status": "ok",
+        "lines_scanned": scanned,
+        "matching_line_count": len(matching),
+        "signal_types": signal_types,
+        "body_included": False,
+    }
 
 
 class SystemCollector:

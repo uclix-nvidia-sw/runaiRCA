@@ -33,7 +33,7 @@ function decodeRoutePart(value: string) {
 }
 
 function isMainView(value: string): value is MainView {
-  return value === 'incidents' || value === 'archived' || value === 'trash' || value === 'alerts' || value === 'analysis' || value === 'chat';
+  return value === 'incidents' || value === 'archived' || value === 'trash' || value === 'alerts' || value === 'analysis' || value === 'knowledge' || value === 'chat';
 }
 
 export function hashForView(view: MainView) {

@@ -1,0 +1,60 @@
+{{- if and .Values.typedb.enabled .Values.typedb.traceV3Backfill.enabled }}
+# Separate from the schema hook: this keyset-paginated job can safely process a
+# large approved CaseSnapshot history without delaying schema availability.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "runai-rca.typedb.fullname" . }}-trace-v3-backfill
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: typedb-trace-v3-backfill
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        {{- include "runai-rca.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: typedb-trace-v3-backfill
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: backfill
+          image: {{ include "runai-rca.image" (dict "root" . "image" .Values.agent.image) | quote }}
+          imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
+          command:
+            - python
+            - -m
+            - ontology.backfill_trace_v3
+            - --batch-size
+            - {{ .Values.typedb.traceV3Backfill.batchSize | quote }}
+            - --max-batches
+            - {{ .Values.typedb.traceV3Backfill.maxBatches | quote }}
+          env:
+            - name: ENABLE_TYPEDB
+              value: "true"
+            - name: TYPEDB_ADDRESS
+              value: {{ include "runai-rca.typedb.address" . | quote }}
+            - name: TYPEDB_DATABASE
+              value: {{ .Values.typedb.auth.database | quote }}
+            - name: TYPEDB_USERNAME
+              value: {{ .Values.typedb.auth.username | quote }}
+            - name: TYPEDB_PASSWORD
+              value: {{ .Values.typedb.auth.password | quote }}
+            - name: TYPEDB_TIMEOUT_SECONDS
+              value: {{ .Values.agent.env.typedbTimeoutSeconds | quote }}
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "runai-rca.databaseSecretName" . }}
+                  key: {{ .Values.secrets.keys.postgresDsn | quote }}
+                  optional: true
+{{- end }}

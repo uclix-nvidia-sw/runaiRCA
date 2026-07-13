@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+
+import pytest
 
 from app.services.decision_tree import walk_tree
 from app.services.kg_enrichment import _query_diagnostic_tree
-from ontology.load_troubleshooting import _document, _load
+from ontology.load_troubleshooting import BUNDLED_RUNBOOK_ID, _document, _load, _probe_templates
 
 TREE = Path("knowledge/k8s_troubleshooting_tree.yaml")
 
@@ -54,8 +57,43 @@ def test_schema_models_executable_runbook_relations() -> None:
         "relation diagnostic_transition",
         "relation diagnostic_outcome",
         "relation diagnostic_recommendation",
+        "entity diagnostic_probe_template",
+        "relation probe_template_for",
     ):
         assert label in schema
+    assert "probe_arguments" not in schema
+
+
+def test_probe_templates_have_stable_ids_and_keep_legacy_json_projection() -> None:
+    raw = _document(TREE)
+    assert raw is not None
+    probes = [probe for node in raw["nodes"] for probe in node.get("probes") or []]
+    ids = [probe.get("id") for probe in probes]
+    assert raw["runbook_id"] == BUNDLED_RUNBOOK_ID
+    assert all(isinstance(probe_id, str) and probe_id for probe_id in ids)
+    assert len(ids) == len(set(ids))
+    for node in raw["nodes"]:
+        for probe in node.get("probes") or []:
+            assert probe["id"].startswith(f"{BUNDLED_RUNBOOK_ID}:{node['id']}:p")
+
+    tx = _Tx()
+    _load(tx, raw)
+    queries = "\n".join(tx.queries)
+    assert "isa diagnostic_probe_template" in queries
+    assert "isa probe_template_for" in queries
+    legacy = next(query for query in tx.queries if "has probe_template" in query)
+    encoded = legacy.split('has probe_template "', 1)[1].rsplit('";', 1)[0]
+    assert json.loads(encoded.replace('\\"', '"'))["id"]
+
+
+def test_bundled_probe_id_must_include_runbook_and_step_scope() -> None:
+    with pytest.raises(ValueError, match="bundled diagnostic probe id"):
+        _probe_templates(
+            [{"id": "scheduling_capacity-probe-01", "tool": "k8s_read"}],
+            "scheduling_capacity",
+            runbook_id=BUNDLED_RUNBOOK_ID,
+            enforce_scoped=True,
+        )
 
 
 def test_typedb_projection_reconstructs_executable_tree() -> None:

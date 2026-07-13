@@ -26,6 +26,7 @@ from app.llm import complete_json
 from app.masking import build_masker
 from app.plan import InvestigationPlan
 from app.progress import ProgressReporter
+from app.services.evidence_blackboard import source_independence_group
 
 _LEDGER_STATUSES = {"open", "testing", "supported", "refuted", "uncertain"}
 _USER_PROMPT_CHARS = 8000
@@ -40,6 +41,84 @@ _COLLECTOR_HINTS = {
     "system": "Node infra via the per-node agent: syslog/journalctl/dmesg, kernel/Xid.",
     "change": "Recent Deployment/DaemonSet/Helm/node changes and rollout timing.",
 }
+
+
+def _prioritize_probes(
+    probes: list[dict[str, Any]],
+    *,
+    evidence: dict[str, CollectorResult],
+    ledger: list[dict[str, Any]],
+    plan: InvestigationPlan | None,
+    selected_hypothesis: str = "",
+) -> list[dict[str, Any]]:
+    """Order probes by expected discrimination before collector-name tie-breaks.
+
+    This is intentionally only a deterministic tie-breaker for the LLM's
+    proposed reads: a new telemetry plane is more useful than a duplicate,
+    and a probe explicitly bound to an unresolved hypothesis is more useful
+    than a generic one.  It never discards a valid requested probe.
+    """
+    unresolved = {
+        str(item.get("id") or "")
+        for item in ledger
+        if str(item.get("status") or "open") in {"open", "testing", "uncertain", "untested"}
+    }
+    used_groups = {source_independence_group(name) for name in evidence}
+    directive = plan.diagnostic_directive if plan else {}
+    recommended = {
+        str(item)
+        for item in (directive.get("recommended_collectors") or [])
+        if str(item).strip()
+    } if isinstance(directive, dict) else set()
+
+    def score(probe: dict[str, Any]) -> tuple[int, int, int, int, str, str]:
+        collector = str(probe.get("collector") or "")
+        hypothesis_ids = {
+            str(item)
+            for item in (probe.get("hypothesis_ids") or [])
+            if str(item).strip()
+        }
+        selected = str(probe.get("hypothesis_id") or "")
+        if selected:
+            hypothesis_ids.add(selected)
+        covered = len(hypothesis_ids & unresolved) if hypothesis_ids else len(unresolved)
+        group = source_independence_group(collector)
+        # Coverage, independence, and unresolved-hypothesis discrimination are
+        # separate so a stable collector-name tie-break cannot hide a duplicate.
+        return (
+            -int(collector not in evidence),
+            -int(group not in used_groups),
+            -covered,
+            -int(collector in recommended or selected_hypothesis in hypothesis_ids),
+            collector,
+            json.dumps(probe.get("scope") or {}, sort_keys=True, default=str),
+        )
+
+    return sorted(probes, key=score)
+
+
+def _fallback_probe(
+    collector_names: set[str],
+    *,
+    evidence: dict[str, CollectorResult],
+    ledger: list[dict[str, Any]],
+    plan: InvestigationPlan | None,
+    selected_hypothesis: str,
+) -> dict[str, Any] | None:
+    """Pick one unused collector when an LLM asks to probe but names none."""
+    candidates = [
+        {"collector": name, "scope": {}}
+        for name in collector_names
+        if name not in evidence
+    ]
+    ordered = _prioritize_probes(
+        candidates,
+        evidence=evidence,
+        ledger=ledger,
+        plan=plan,
+        selected_hypothesis=selected_hypothesis,
+    )
+    return ordered[0] if ordered else None
 
 
 def _collector_name(collector: object) -> str:
@@ -363,7 +442,8 @@ async def investigate(
                     '{"action":"probe"|"conclude","reason":str,'
                     '"selected_hypothesis":str,'
                     '"probes":[{"collector":str,'
-                    '"scope":{"namespace"?,"pod"?,"node"?,"workload"?}}],'
+                    '"scope":{"namespace"?,"pod"?,"node"?,"workload"?},'
+                    '"hypothesis_ids":[str]}],'
                     '"queries":[{"kind":str,"namespace"?,"name"?,"label_selector"?}],'
                     '"hypothesis_updates":[{"id":str,"confidence":number,'
                     '"mechanism":str,"expected_observations":[str],"falsifiers":[str],'
@@ -404,6 +484,7 @@ async def investigate(
                 )
             if decision.get("action") == "conclude":
                 break
+            selected_hypothesis = str(decision.get("selected_hypothesis") or "")
             probes = decision.get("probes")
             queries = decision.get("queries")
             fresh = []
@@ -419,6 +500,13 @@ async def investigate(
                     continue
                 seen_probes.add(fingerprint)
                 fresh.append(probe)
+            fresh = _prioritize_probes(
+                fresh,
+                evidence=evidence,
+                ledger=ledger,
+                plan=plan,
+                selected_hypothesis=selected_hypothesis,
+            )
             wanted = []
             for query in queries if isinstance(queries, list) else []:
                 if not isinstance(query, dict) or not str(query.get("kind") or "").strip():
@@ -428,6 +516,21 @@ async def investigate(
                     continue
                 seen_queries.add(fingerprint)
                 wanted.append(query)
+            if not fresh and not wanted and decision.get("action") == "probe":
+                fallback = _fallback_probe(
+                    all_names,
+                    evidence=evidence,
+                    ledger=ledger,
+                    plan=plan,
+                    selected_hypothesis=selected_hypothesis,
+                )
+                if fallback is not None:
+                    fingerprint = json.dumps(
+                        {"collector": fallback["collector"], "scope": fallback["scope"]},
+                        sort_keys=True,
+                    )
+                    seen_probes.add(fingerprint)
+                    fresh.append(fallback)
             if not fresh and not wanted:
                 break
             if fresh:
@@ -505,6 +608,12 @@ async def investigate(
                     if fingerprint not in seen_probes:
                         seen_probes.add(fingerprint)
                         fresh.append(probe)
+                fresh = _prioritize_probes(
+                    fresh,
+                    evidence=evidence,
+                    ledger=ledger,
+                    plan=plan,
+                )
                 wanted = []
                 for query in verification.get("queries") or []:
                     if not isinstance(query, dict) or not str(query.get("kind") or "").strip():
