@@ -441,7 +441,10 @@ def rank_root_cause_candidates(
     # A cap keeps a broad catalog from drowning out live collector evidence.
     for family, count in (graph_candidate_counts or {}).items():
         score = scores.get(family)
-        if score is None or count <= 0:
+        # The graph corroborates an observation that this run already matched;
+        # it is not an observation source itself and must never materialize a
+        # candidate from historical/ontology context alone.
+        if score is None or count <= 0 or score.points <= 0:
             continue
         bonus = min(2.0, float(count))
         score.points += bonus

@@ -746,6 +746,29 @@ def test_component_identity_single_weak_hit_not_high_confidence() -> None:
     assert top.confidence != "high"
 
 
+def test_ontology_bonus_cannot_create_candidate_without_live_collector_signal() -> None:
+    ranked = rank_root_cause_candidates(
+        _target(alert_name="GenericAlert"),
+        [_r("loki", summary="all logs nominal")],
+        graph_candidate_counts={"gpu_hardware_error": 2},
+    )
+
+    assert ranked[0].family == "insufficient_evidence"
+    assert "gpu_hardware_error" not in {candidate.family for candidate in ranked}
+
+
+def test_ontology_bonus_can_corrobate_existing_live_collector_signal() -> None:
+    ranked = rank_root_cause_candidates(
+        _target(alert_name="GpuAlert"),
+        [_r("system", summary="NVRM: Xid 79 GPU has fallen off the bus")],
+        graph_candidate_counts={"gpu_hardware_error": 2},
+    )
+
+    top = ranked[0]
+    assert top.family == "gpu_hardware_error"
+    assert any("ontology matched" in rationale for rationale in top.rationale)
+
+
 def _change_result(changes, summary="recent changes"):
     return CollectorResult(
         agent="change",
