@@ -97,10 +97,16 @@ receivers:
     slack_configs:
       - api_url: <slack-webhook-url>
         channel: <channel>
+        send_resolved: false
     webhook_configs:
       - url: http://<release-name>-runai-rca-backend.<namespace>.svc.cluster.local:8080/webhook/alertmanager
         send_resolved: true
 ```
+
+직접 Slack 리시버에는 `send_resolved: false`, RCA 웹훅에는 `send_resolved: true`를
+유지하세요. 직접 리시버는 firing 알림만 계속 게시하고, 백엔드는 resolved 전환을 해당
+인시던트의 최초 분석 메시지 아래에 답글로 게시합니다. 두 리시버 모두 resolved 전송을
+활성화하면 스레드형 흐름에서 없애려는 채널 레벨 resolved 메시지가 추가로 생깁니다.
 
 리시버를 분리해서 유지할 때는 Slack 라우트가 RCA 이전에 매칭을 멈추지 않도록 하세요.
 한 가지 흔한 패턴은 Slack 라우트에 `continue: true`를 두는 것입니다:
