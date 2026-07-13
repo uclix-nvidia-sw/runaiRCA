@@ -3,11 +3,24 @@
 > **Lens:** Reference — the HTTP surface.
 > **In this doc:** Backend endpoints · Agent endpoints · webhook accept/ignore semantics.
 
+## OpenAPI contract
+
+The Backend serves its GitBook-compatible **OpenAPI 3.0.3** contract at
+`GET /api/v1/openapi.json`. Use it as the source for an API portal, generated
+clients, or an interactive renderer such as Scalar or Swagger UI. The current
+contract establishes the Backend route map; the Knowledge operations include
+request schemas and lifecycle response codes in detail.
+
+Open `/api-docs` on the deployed RCA URL for the built-in Scalar reference. It
+loads the same-origin contract and can send requests directly with **Try it**;
+no Scalar account or hosted Scalar service is used.
+
 ## Endpoints
 
 Backend:
 
 - `POST /webhook/alertmanager`
+- `GET /api/v1/openapi.json`
 - `GET /api/v1/incidents?view=active|archived|trash`
 - `GET /api/v1/incidents/{id}`
 - `POST /api/v1/incidents/{id}/analyze`
@@ -35,6 +48,14 @@ Backend:
 - `GET /api/v1/analysis-runs`
 - `GET /api/v1/analysis-runs/{id}/evaluation?author=...`
 - `PUT /api/v1/analysis-runs/{id}/evaluation?author=...`
+- `GET /api/v1/knowledge-candidates?status=...`
+- `GET /api/v1/knowledge-candidates/{id}`
+- `POST /api/v1/knowledge-candidates/{id}/decision`
+- `GET /api/v1/knowledge-packages?include_retired=true|false`
+- `GET /api/v1/knowledge-packages/{id}`
+- `POST /api/v1/knowledge-packages/{id}/retire`
+- `GET /api/v1/knowledge/runtime-snapshot`
+- `GET /api/v1/knowledge/probe-metrics`
 - `POST /api/v1/analysis-runs/{id}/progress`
 - `GET /api/v1/stats/recurrence?days=7`
 - `GET /api/v1/stats/llm-spend?days=7`
@@ -70,6 +91,54 @@ Incident lifecycle actions:
   matching indexes are not already owned by a newer incident.
 - `DELETE /api/v1/incidents/{id}?permanent=true` permanently deletes the incident
   and its alerts, embeddings, feedback, comments, and analysis runs.
+
+## Knowledge candidate decisions
+
+All knowledge lifecycle actions use the same endpoint. Replace
+`{candidate_id}` with the value returned by the candidate list or detail API.
+`actor` and `note` are optional audit fields.
+
+```http
+POST /api/v1/knowledge-candidates/{candidate_id}/decision
+Content-Type: application/json
+```
+
+```json
+{
+  "action": "shadow",
+  "actor": "on-call@example.com",
+  "note": "Observe this probe template before activation."
+}
+```
+
+| `action` | Valid when | Result |
+| --- | --- | --- |
+| `shadow` | Candidate is pending | Validates it and creates a non-active package for observation. |
+| `activate` | Candidate is shadowed | Activates that package in the runtime snapshot. |
+| `approve` | Candidate is pending | Validates it and creates an active package immediately. |
+| `reject` | Candidate is pending or shadowed | Rejects the candidate; a shadow package is retired. |
+
+The request body is identical for every action; only `action` changes. `approve`
+and `shadow` invoke the Agent validator before the transition. A successful
+`shadow`, `activate`, or `approve` response contains both `candidate` and
+`package`; a successful pending-candidate `reject` response contains `candidate`.
+Invalid actions return 400, a validation rejection returns 422, and an invalid
+lifecycle transition returns 409.
+
+To retire a package explicitly, send the same optional audit fields without an
+`action` field:
+
+```http
+POST /api/v1/knowledge-packages/{package_id}/retire
+Content-Type: application/json
+```
+
+```json
+{
+  "actor": "on-call@example.com",
+  "note": "Superseded by package kp-newer."
+}
+```
 
 `GET /api/v1/stats/recurrence?days=N` returns recurrence statistics for the last
 `N` days. `days` defaults to 7, clamps to 1..90, and returns:

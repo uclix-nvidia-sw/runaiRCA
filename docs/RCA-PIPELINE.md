@@ -11,32 +11,39 @@ The Agent is **not** a single prompt. It is a component-oriented multi-agent
 pipeline run by one orchestrator (`agent/app/services/orchestrator.py`) under a
 single overall deadline. Every LLM stage is optional: with no LLM configured, or
 on any failure, the pipeline degrades to its deterministic path and still
-produces a report. The six pipeline stages run as NAT functions under the
+produces a report. The seven pipeline stages run as NAT functions under the
 `runai_rca_pipeline` controller workflow (`agent/configs/runai_rca_engine.yml`),
 which is built once at startup. If the NAT engine is disabled or fails, the same
 stages run directly in process as the failure fallback.
 
 ```mermaid
-flowchart TD
+flowchart TB
   REQ([/analyze request]) --> ORCH([Orchestrator])
-  ORCH --> NAT[NAT controller: runai_rca_pipeline]
-  NAT --> PLAN
-  ORCH -. direct fallback .-> PLAN
-  PLAN[1 · Planner] --> COLL
-  subgraph COLL["2 · Parallel evidence collectors"]
-    direction LR
-    RA([runai]) ~~~ KA([kubernetes]) ~~~ PA([prometheus]) ~~~ LA([loki]) ~~~ DBA([postgres]) ~~~ SA([system]) ~~~ CA([change])
+  ORCH --> NAT{NAT controller available?}
+  NAT -->|yes| ENRICH
+  NAT -->|no or failed| ENRICH
+
+  ENRICH["1 · Graph enrichment\nprior incidents · blast radius"] <-->|read-only context| TDB[(TypeDB ontology)]
+  ENRICH --> PLAN["2 · Investigation plan\nscope · hypotheses · probe priority"]
+
+  subgraph EVIDENCE["3 · Evidence cycle — every collector result is awaited"]
+    direction TB
+    INV["Optional central investigation loop\nchoose the next independent, discriminating probe"] -.-> BASE
+    BASE["Base collection in parallel\nRun:ai · Kubernetes · Prometheus · Loki · Postgres · System · Change"]
+    BASE --> FOLLOW["Deterministic follow-up\nfor example: event → quota/PVC → metric"]
+    FOLLOW --> DRILL["Per-collector drill-down\nread-only tools, own domain only"]
+    DRILL --> TRACE["Evidence IDs + trace-v3\nhypothesis · probe · evidence links"]
   end
-  COLL --> FOLL[3 · Deterministic follow-up]
-  FOLL --> DRILL[4 · Per-collector drill-down]
-  DRILL --> SIG[5 · Signature match + BM25 + ranking]
-  SIG --> CHK[6 · Self-check + re-analysis]
-  CHK --> KG[7 · Ontology enrichment]
-  KG --> SYN[8 · Synthesis]
- SYN --> HAR[9 · Runtime harness]
- HAR --> RESP([RCA + evidence trail])
-  INV[Central investigation loop] -.->|wraps 2-4| COLL
-  ORCH <-->|"enrich / graph_remediation"| TDB[(TypeDB ontology)]
+
+  PLAN --> BASE
+  TRACE --> RANK["4 · Signature match + BM25 + ranking"]
+  RANK --> CHECK["5 · Self-check\nrefute or calibrate the leading cause"]
+  CHECK --> MORE{More evidence\nneeded?}
+  MORE -->|yes: targeted re-analysis| BASE
+  MORE -->|no| SYN["6 · Synthesis + graph remediation\nproblem · cause · actions · appendix"]
+  SYN <-->|remediation lookup| TDB
+  SYN --> HAR["7 · Runtime harness\nrepair, downgrade, or abstain"]
+  HAR --> RESP([RCA + evidence trail])
 ```
 
 The whole run is wrapped in `asyncio.wait_for(analyze, ANALYSIS_DEADLINE_SECONDS)`

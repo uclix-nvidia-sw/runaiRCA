@@ -84,6 +84,25 @@ kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --count
 - Re-run ingest on demand:
   `kubectl create job -n <ns> --from=cronjob/<release>-typedb-ingest manual-ingest-1`.
 
+### Trace-v3 backfill and empty investigation traces
+
+The `typedb-trace-v3-backfill` Job runs as a Helm `post-install` / `post-upgrade`
+hook. Helm deletes a successful hook Job, so not finding a completed Job later is
+normal. Check the release events or run the backfill command manually when you
+need an audit trail.
+
+```bash
+# Run one bounded, idempotent page manually; it does not rewrite legacy traces.
+kubectl exec -n <ns> deploy/<release>-agent -- \
+  python -m ontology.backfill_trace_v3 --batch-size 200 --max-batches 1
+```
+
+`0 written` is not an error by itself. `hypothesis` and `probe_execution` are
+created only from an active, Dashboard-approved CaseSnapshot carrying an explicit
+`reasoning_trace_v3` (or `trace_v3`) record. Legacy v1/v2 results and snapshots
+that are not active remain intentionally unconverted. Re-analyze and approve the
+case to create an eligible trace-v3 snapshot, then run the backfill again.
+
 See [Knowledge Base → Querying the graph](KNOWLEDGE-BASE.md#querying-the-graph)
 for TypeDB Studio access.
 

@@ -4,6 +4,7 @@ import {
   Archive,
   ArrowLeft,
   Bot,
+  BookOpen,
   CheckCircle2,
   ChevronDown,
   Database,
@@ -636,6 +637,17 @@ function App() {
           </button>
         </nav>
         <nav className="utility-nav" aria-label="Incident lifecycle views">
+          <a
+            className="nav-item icon-only-nav-item"
+            href="/api-docs"
+            target="_blank"
+            rel="noreferrer"
+            aria-label="API Docs"
+            title="API Docs"
+          >
+            <BookOpen size={18} />
+            <span className="sr-only">API Docs</span>
+          </a>
           <button
             className={`nav-item icon-only-nav-item ${activeView === 'archived' ? 'active' : ''}`}
             onClick={() => switchView('archived')}

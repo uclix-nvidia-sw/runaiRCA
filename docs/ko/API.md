@@ -3,11 +3,23 @@
 > **관점:** 레퍼런스 — HTTP 표면(surface).
 > **이 문서에서 다루는 것:** Backend 엔드포인트 · Agent 엔드포인트 · 웹훅 accept/ignore 시맨틱.
 
+## OpenAPI 계약
+
+Backend는 GitBook 호환 **OpenAPI 3.0.3** 계약을
+`GET /api/v1/openapi.json`으로 제공합니다. API 포털, 생성형 client, Scalar 또는 Swagger UI
+같은 interactive renderer의 기준으로 사용하세요. 현재 계약은 Backend route map을 제공하며,
+Knowledge operation은 요청 schema와 lifecycle 응답 코드를 상세히 정의합니다.
+
+배포된 RCA URL의 `/api-docs`를 열면 내장 Scalar 레퍼런스를 볼 수 있습니다. 같은 origin의
+계약을 읽고 **Try it**으로 요청을 직접 보냅니다. Scalar 계정이나 hosted Scalar 서비스는
+사용하지 않습니다.
+
 ## 엔드포인트
 
 Backend:
 
 - `POST /webhook/alertmanager`
+- `GET /api/v1/openapi.json`
 - `GET /api/v1/incidents?view=active|archived|trash`
 - `GET /api/v1/incidents/{id}`
 - `POST /api/v1/incidents/{id}/analyze`
@@ -35,6 +47,14 @@ Backend:
 - `GET /api/v1/analysis-runs`
 - `GET /api/v1/analysis-runs/{id}/evaluation?author=...`
 - `PUT /api/v1/analysis-runs/{id}/evaluation?author=...`
+- `GET /api/v1/knowledge-candidates?status=...`
+- `GET /api/v1/knowledge-candidates/{id}`
+- `POST /api/v1/knowledge-candidates/{id}/decision`
+- `GET /api/v1/knowledge-packages?include_retired=true|false`
+- `GET /api/v1/knowledge-packages/{id}`
+- `POST /api/v1/knowledge-packages/{id}/retire`
+- `GET /api/v1/knowledge/runtime-snapshot`
+- `GET /api/v1/knowledge/probe-metrics`
 - `POST /api/v1/analysis-runs/{id}/progress`
 - `GET /api/v1/stats/recurrence?days=7`
 - `GET /api/v1/stats/llm-spend?days=7`
@@ -65,6 +85,51 @@ Backend:
   경우 soft delete 인시던트를 복구합니다.
 - `DELETE /api/v1/incidents/{id}?permanent=true`는 인시던트와 연결된 알림, 임베딩,
   피드백, 코멘트, 분석 실행을 영구 삭제합니다.
+
+## Knowledge candidate 결정
+
+모든 knowledge lifecycle 액션은 같은 엔드포인트를 사용합니다. `{candidate_id}`에는
+candidate 목록 또는 상세 API가 반환한 값을 넣으세요. `actor`와 `note`는 선택적인 감사
+필드입니다.
+
+```http
+POST /api/v1/knowledge-candidates/{candidate_id}/decision
+Content-Type: application/json
+```
+
+```json
+{
+  "action": "shadow",
+  "actor": "on-call@example.com",
+  "note": "이 probe template은 활성화 전에 관찰합니다."
+}
+```
+
+| `action` | 가능한 상태 | 결과 |
+| --- | --- | --- |
+| `shadow` | candidate가 pending | 검증 후 관찰용 non-active package를 만듭니다. |
+| `activate` | candidate가 shadow | 해당 package를 runtime snapshot에 활성화합니다. |
+| `approve` | candidate가 pending | 검증 후 즉시 active package를 만듭니다. |
+| `reject` | candidate가 pending 또는 shadow | candidate를 거절하며, shadow package는 retired 처리합니다. |
+
+모든 액션의 요청 본문은 같고 `action`만 바뀝니다. `approve`와 `shadow`는 상태 전환 전에
+Agent validator를 호출합니다. 성공한 `shadow`, `activate`, `approve` 응답에는 `candidate`와
+`package`가 함께 있고, pending candidate의 성공한 `reject` 응답에는 `candidate`가 있습니다.
+잘못된 action은 400, validator 거절은 422, 허용되지 않는 lifecycle 전환은 409를 반환합니다.
+
+package를 명시적으로 retire할 때는 `action` 없이 같은 선택 감사 필드를 보냅니다.
+
+```http
+POST /api/v1/knowledge-packages/{package_id}/retire
+Content-Type: application/json
+```
+
+```json
+{
+  "actor": "on-call@example.com",
+  "note": "더 새로운 package로 대체되었습니다."
+}
+```
 
 `GET /api/v1/stats/recurrence?days=N`은 최근 `N`일 재발 통계를 반환합니다. `days`는
 기본값 7이며 1..90 범위로 클램프됩니다.

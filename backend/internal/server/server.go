@@ -464,6 +464,10 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			"database": s.store.databaseHealth(),
 			"slack":    s.slack.Health(),
 		})
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/openapi.json":
+		s.handleOpenAPISpec(w, r)
+	case r.Method == http.MethodGet && (r.URL.Path == "/api-docs" || r.URL.Path == "/api-docs/"):
+		s.handleAPIDocs(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/webhook/alertmanager":
 		s.handleAlertmanager(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/incidents":

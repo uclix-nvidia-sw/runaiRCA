@@ -82,6 +82,23 @@ kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --count
 - 필요 시 인제스트를 다시 실행하십시오:
   `kubectl create job -n <ns> --from=cronjob/<release>-typedb-ingest manual-ingest-1`.
 
+### Trace-v3 backfill과 비어 있는 조사 trace
+
+`typedb-trace-v3-backfill` Job은 Helm `post-install` / `post-upgrade` hook으로
+실행됩니다. Helm은 성공한 hook Job을 삭제하므로, 나중에 완료된 Job이 보이지 않는 것은
+정상입니다. 감사 로그가 필요하면 release event를 확인하거나 backfill 명령을 직접 실행하세요.
+
+```bash
+# 멱등적인 한 페이지를 수동 실행합니다. legacy trace는 변환하지 않습니다.
+kubectl exec -n <ns> deploy/<release>-agent -- \
+  python -m ontology.backfill_trace_v3 --batch-size 200 --max-batches 1
+```
+
+`0 written`만으로 오류를 뜻하지는 않습니다. `hypothesis`와 `probe_execution`은 명시적인
+`reasoning_trace_v3`(또는 `trace_v3`)를 가진, Dashboard 승인된 active CaseSnapshot에서만
+만들어집니다. legacy v1/v2 결과와 active가 아닌 snapshot은 의도적으로 변환하지 않습니다.
+적격 trace-v3 snapshot을 만들려면 case를 재분석하고 승인한 뒤 backfill을 다시 실행하세요.
+
 TypeDB Studio 접근은 [Knowledge Base → Querying the graph](KNOWLEDGE-BASE.md)를
 참고하십시오.
 

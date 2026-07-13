@@ -38,7 +38,8 @@ flowchart LR
 
 - Dashboard Approve가 기록되어 `user_approved_at`이 존재함
 - Alertmanager 상태가 `resolved`이고 grace period가 지남
-- 최신 analysis run과 현재 `analysis_hash`가 존재함
+- RCA snapshot이 있으면 active immutable CaseSnapshot을 사용하며, 적재는 승인된 snapshot을
+  더 나중의 analysis run으로 대체하지 않음
 
 승인됐지만 원인을 확정하지 못한 RCA도 topology와 evidence 이력으로는 적재합니다.
 다만 `diagnosis_state=unresolved`로 기록하며 원인 지식으로 승격하지 않습니다.

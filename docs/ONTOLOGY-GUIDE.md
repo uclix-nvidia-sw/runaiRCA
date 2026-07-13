@@ -39,7 +39,8 @@ The TypeDB ingest CronJob selects only incidents that satisfy all of these:
 
 - dashboard approval (`incidents.user_approved_at`);
 - Alertmanager status `resolved` and the configured grace period;
-- a latest analysis run with a current `analysis_hash`.
+- when an RCA snapshot is available, its active immutable CaseSnapshot is used;
+  the ingest never substitutes a later analysis run for the approved snapshot.
 
 An approved but unresolved RCA is still useful for topology and evidence
 history, but it is stored as `diagnosis_state=unresolved` and is never promoted

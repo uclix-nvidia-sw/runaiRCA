@@ -12,9 +12,8 @@ runtime flow; this document is the data-structure reference.
 | **TypeDB** | Ontology knowledge graph: typed entities + relations for relational reasoning at synthesis | Agent | No (`typedb.enabled`, default on in Helm) |
 
 The graph is **derived from** Postgres — an eligibility-gated projection, not a
-second source of truth. By default it contains resolved incidents after the
-grace period; set `typedb.ingest.requireReview=true` to make operator approval
-an additional gate.
+second source of truth. It contains only Dashboard-approved incidents after the
+grace period (`typedb.ingest.requireApproval=true` by default).
 
 ```mermaid
 flowchart LR
@@ -109,7 +108,7 @@ the [Knowledge Base](KNOWLEDGE-BASE.md) doc.
 |---|---|---|---|
 | Schema + functions | `load_schema` / `load_functions` | `schema.tql` / `functions.tql` | Helm post-install/upgrade hook (`typedb-schema-job.yaml`) |
 | Curated knowledge | `load_knowledge`, `load_troubleshooting`, `load_xids`, `load_alerts`, `load_known_issues`, `load_architecture` | the `knowledge/` catalogs | Version-controlled files, run in the schema job |
-| Topology + incidents | `ontology/ingest.py` (CronJob) | Postgres `incidents`/`alerts` | Resolved ≥ `resolvedGraceHours` ago; default `requireReview=false` includes eligible incidents regardless of approval, `true` requires `user_approved_at` |
+| Topology + incidents | `ontology/ingest.py` (CronJob) | Postgres `incidents`/`alerts` | Dashboard-approved (`user_approved_at`) and resolved ≥ `resolvedGraceHours` ago; `requireReview` is deprecated |
 | Knowledge promotion | `ingest.py --promote-knowledge` | operator-confirmed RCAs | Resolved + net-positive feedback |
 
 The **orchestrator** consults TypeDB during analysis

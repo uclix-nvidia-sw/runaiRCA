@@ -9,31 +9,38 @@ Agent는 단일 프롬프트가 **아닙니다**. 단일 전체 데드라인(dea
 오케스트레이터(orchestrator)(`agent/app/services/orchestrator.py`)가 실행하는 컴포넌트 지향
 다중 에이전트 파이프라인(pipeline)입니다. 모든 LLM 단계는 선택적입니다: LLM이 구성되지 않았거나
 어떤 실패가 발생하면, 파이프라인은 결정론적 경로로 저하(degrade)되며 여전히 리포트를 생성합니다.
-여섯 파이프라인 단계는 시작 시 한 번 빌드되는 `runai_rca_pipeline` 컨트롤러 워크플로
+일곱 파이프라인 단계는 시작 시 한 번 빌드되는 `runai_rca_pipeline` 컨트롤러 워크플로
 (`agent/configs/runai_rca_engine.yml`) 아래에서 NAT 함수로 실행됩니다. NAT 엔진이
 비활성화되었거나 실패하면, 동일한 단계가 실패 폴백으로 프로세스 안에서 직접 실행됩니다.
 
 ```mermaid
-flowchart TD
-  REQ([/analyze request]) --> ORCH([Orchestrator])
-  ORCH --> NAT[NAT controller: runai_rca_pipeline]
-  NAT --> PLAN
-  ORCH -. direct fallback .-> PLAN
-  PLAN[1 · Planner] --> COLL
-  subgraph COLL["2 · Parallel evidence collectors"]
-    direction LR
-    RA([runai]) ~~~ KA([kubernetes]) ~~~ PA([prometheus]) ~~~ LA([loki]) ~~~ DBA([postgres]) ~~~ SA([system]) ~~~ CA([change])
+flowchart TB
+  REQ([/analyze 요청]) --> ORCH([오케스트레이터])
+  ORCH --> NAT{NAT 컨트롤러 사용 가능?}
+  NAT -->|예| ENRICH
+  NAT -->|아니오 또는 실패| ENRICH
+
+  ENRICH["1 · 그래프 보강\n과거 인시던트 · 영향 범위"] <-->|읽기 전용 문맥| TDB[(TypeDB 온톨로지)]
+  ENRICH --> PLAN["2 · 조사 계획\n범위 · 가설 · probe 우선순위"]
+
+  subgraph EVIDENCE["3 · 증거 순환 — 모든 수집기 결과를 기다림"]
+    direction TB
+    INV["선택적 중앙 조사 루프\n다음 독립·판별 probe 선택"] -.-> BASE
+    BASE["기본 병렬 수집\nRun:ai · Kubernetes · Prometheus · Loki · Postgres · System · Change"]
+    BASE --> FOLLOW["결정론적 후속 점검\n예: 이벤트 → quota/PVC → 메트릭"]
+    FOLLOW --> DRILL["수집기별 드릴다운\n읽기 전용, 각 도메인 도구만 사용"]
+    DRILL --> TRACE["Evidence ID + trace-v3\n가설 · probe · evidence 연결"]
   end
-  COLL --> FOLL[3 · Deterministic follow-up]
-  FOLL --> DRILL[4 · Per-collector drill-down]
-  DRILL --> SIG[5 · Signature match + BM25 + ranking]
-  SIG --> CHK[6 · Self-check + re-analysis]
-  CHK --> KG[7 · Ontology enrichment]
-  KG --> SYN[8 · Synthesis]
-  SYN --> HAR[9 · Runtime harness]
-  HAR --> RESP([RCA + evidence trail])
-  INV[Central investigation loop] -.->|wraps 2-4| COLL
-  ORCH <-->|"enrich / graph_remediation"| TDB[(TypeDB ontology)]
+
+  PLAN --> BASE
+  TRACE --> RANK["4 · 시그니처 매칭 + BM25 + 랭킹"]
+  RANK --> CHECK["5 · 자기 점검\n선두 원인 반박 또는 신뢰도 보정"]
+  CHECK --> MORE{추가 증거가\n필요한가?}
+  MORE -->|예: 목표 재분석| BASE
+  MORE -->|아니오| SYN["6 · 종합 + 그래프 조치 보강\n문제 · 원인 · 조치 · 부록"]
+  SYN <-->|조치 조회| TDB
+  SYN --> HAR["7 · 런타임 하네스\n수정, 신뢰도 하향 또는 보류"]
+  HAR --> RESP([RCA + 증거 추적])
 ```
 
 전체 실행은 `asyncio.wait_for(analyze, ANALYSIS_DEADLINE_SECONDS)`로 감싸집니다
