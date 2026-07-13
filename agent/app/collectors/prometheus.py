@@ -325,7 +325,9 @@ async def _collect_prometheus_direct(
             ),
         )
         status = _prometheus_status(response.data)
-        error = response.error or _prometheus_api_error(response.data, status)
+        error = response.error or _prometheus_api_error(
+            response.data, status, require_success_status=True
+        )
         result_data = _prometheus_result(response.data)
         query_results.append(
             {
@@ -346,14 +348,16 @@ async def _collect_prometheus_direct(
     return query_results
 
 
-def _prometheus_api_error(data: object, status: str) -> str | None:
+def _prometheus_api_error(
+    data: object, status: str, *, require_success_status: bool = False
+) -> str | None:
     """Return a native Prometheus API error hidden behind an HTTP 200 response.
 
     A malformed PromQL query can yield ``{status: error}`` without a transport
     error. It must not fall through as a zero-series result, which would turn a
     failed lookup into an RCA-safe absence verdict.
     """
-    if status == "success":
+    if status == "success" or (status == "unknown" and not require_success_status):
         return None
     if isinstance(data, dict):
         detail = str(data.get("error") or data.get("errorType") or "").strip()
@@ -413,6 +417,7 @@ async def _mcp_query_prometheus(
         "stepSeconds": 60,
     }
     data = await _call_mcp_json(url, "query_prometheus", [args])
+    status = _prometheus_status(data)
     result_data = _prometheus_result(data)
     if not result_data:
         result_data = _first_result_list(data)
@@ -421,11 +426,11 @@ async def _mcp_query_prometheus(
         "query": promql,
         "url": f"{url}#query_prometheus",
         "status_code": 200,
-        "status": _prometheus_status(data),
+        "status": status,
         "series_count": len(result_data),
         "sample": compact(result_data, limit=3),
         "value_summary": _prometheus_value_summary(result_data),
-        "error": None,
+        "error": _prometheus_api_error(data, status),
         "time_range": query_window,
     }
 

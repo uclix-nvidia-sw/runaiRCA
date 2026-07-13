@@ -96,6 +96,36 @@ async def test_prometheus_collector_falls_back_to_direct_http_on_mcp_failure(
 
 
 @pytest.mark.asyncio
+async def test_prometheus_mcp_error_payload_is_not_a_scoped_absence(monkeypatch) -> None:
+    async def fake_mcp_call(url, tool, arguments):
+        if tool == "list_datasources":
+            return _McpResult([{"type": "prometheus", "uid": "prom"}])
+        return _McpResult(
+            {
+                "status": "error",
+                "errorType": "bad_data",
+                "error": "invalid parameter query",
+            }
+        )
+
+    monkeypatch.setattr(prometheus, "mcp_call", fake_mcp_call)
+    result = await prometheus.PrometheusCollector(
+        replace(make_settings(), prometheus_mcp_url="http://grafana-mcp/mcp")
+    ).collect(
+        replace(
+            make_target(),
+            fired_at="2026-07-10T01:00:00Z",
+            resolved_at="2026-07-10T01:10:00Z",
+        )
+    )
+
+    assert result.status == "unavailable"
+    assert all(query["error"] for query in result.details["queries"])
+    signals = [artifact for artifact in result.artifacts if artifact.type == "promql_signal"]
+    assert all(artifact.result["observation"]["polarity"] == "unavailable" for artifact in signals)
+
+
+@pytest.mark.asyncio
 async def test_loki_collector_uses_only_loki_mcp_tools(monkeypatch) -> None:
     calls: list[str] = []
 
