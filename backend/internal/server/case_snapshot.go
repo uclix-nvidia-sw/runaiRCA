@@ -71,6 +71,17 @@ func (s *Store) approveCaseSnapshotLocked(incident *Incident, approvedAt time.Ti
 			return false
 		}
 		s.activeCaseByIncident[incident.IncidentID] = caseID
+		// Snapshots created before knowledge candidates existed are promoted only
+		// from their recorded contents; no legacy trace is inferred or rewritten.
+		if s.knowledgeCandidateForCaseLocked(existing.CaseID) == nil {
+			candidate := s.knowledgeCandidateForSnapshotLocked(existing)
+			if candidate != nil && !s.persistNewKnowledgeCandidateLocked(candidate, s.newKnowledgeEventLocked(candidate.CandidateID, "", "candidate_generated", "system", "approved case snapshot", approvedAt)) {
+				return false
+			}
+			if candidate != nil {
+				s.knowledgeCandidates[candidate.CandidateID] = candidate
+			}
+		}
 		return true
 	}
 
@@ -104,16 +115,61 @@ func (s *Store) approveCaseSnapshotLocked(incident *Incident, approvedAt time.Ti
 		ApprovedAt:           approvedAt,
 		Snapshot:             cloneCaseSnapshotPayload(payload),
 	}
-	if strings.HasPrefix(snapshot.RootCauseFamily, "novel_") &&
-		!s.persistNovelCauseRegistryLocked(snapshot) {
-		return false
-	}
-	if !s.persistNewCaseSnapshotLocked(snapshot) {
-		return false
+	candidate := s.knowledgeCandidateForSnapshotLocked(snapshot)
+	if candidate == nil {
+		if !s.persistNewCaseSnapshotLocked(snapshot) {
+			return false
+		}
+	} else {
+		event := s.newKnowledgeEventLocked(candidate.CandidateID, "", "candidate_generated", "system", "approved case snapshot", approvedAt)
+		link := candidate
+		existingCandidate := s.knowledgeCandidates[candidate.CandidateID]
+		if existingCandidate != nil {
+			linkCopy := cloneKnowledgeCandidate(existingCandidate)
+			linkCopy.CaseID, linkCopy.CreatedAt = snapshot.CaseID, snapshot.ApprovedAt
+			link = &linkCopy
+		}
+		if !s.persistCaseSnapshotAndKnowledgeCandidateLocked(snapshot, link, event) {
+			return false
+		}
+		if existingCandidate != nil {
+			if !containsString(existingCandidate.SupportingCaseIDs, snapshot.CaseID) {
+				existingCandidate.SupportingCaseIDs = append(existingCandidate.SupportingCaseIDs, snapshot.CaseID)
+				existingCandidate.SupportingCaseCount = len(existingCandidate.SupportingCaseIDs)
+			}
+		} else {
+			s.knowledgeCandidates[candidate.CandidateID] = candidate
+		}
+		s.knowledgeEvents[event.EventID] = event
 	}
 	s.caseSnapshots[caseID] = snapshot
 	s.activeCaseByIncident[incident.IncidentID] = caseID
 	return true
+}
+
+func (s *Store) knowledgeCandidateForSnapshotLocked(snapshot *CaseSnapshot) *KnowledgeCandidate {
+	if snapshot == nil {
+		return nil
+	}
+	return knowledgeCandidateForSnapshotWithOutcome(snapshot, len(s.caseReviewOutcomesLocked(snapshot.RunID, snapshot.AnalysisHash)) > 0)
+}
+
+func (s *Store) knowledgeCandidateForCaseLocked(caseID string) *KnowledgeCandidate {
+	for _, candidate := range s.knowledgeCandidates {
+		if candidate != nil && (candidate.CaseID == caseID || containsString(candidate.SupportingCaseIDs, caseID)) {
+			return candidate
+		}
+	}
+	return nil
+}
+
+func containsString(values []string, needle string) bool {
+	for _, value := range values {
+		if value == needle {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) caseCardSnapshotLocked(
@@ -155,7 +211,20 @@ func (s *Store) caseCardSnapshotLocked(
 			card["failed_actions"] = failed
 		}
 	}
+	if outcomes := s.caseReviewOutcomesLocked(run.RunID, analysisHash); len(outcomes) > 0 {
+		card["operator_resolution_outcomes"] = outcomes
+	}
 	return card
+}
+
+func (s *Store) caseReviewOutcomesLocked(runID, analysisHash string) []string {
+	values := map[string]bool{}
+	for _, review := range s.evaluationReviews {
+		if review.RunID == runID && review.AnalysisHash == analysisHash && (review.ResolutionOutcome == "resolved" || review.ResolutionOutcome == "mitigated") {
+			values[review.ResolutionOutcome] = true
+		}
+	}
+	return sortedSet(values)
 }
 
 func (s *Store) caseCardContextLocked(incident *Incident, run *AnalysisRun) map[string]string {
@@ -357,7 +426,7 @@ func caseMechanismFromMetadata(metadata map[string]any) (string, string) {
 	if metadata == nil {
 		return "", ""
 	}
-	for _, key := range []string{"reasoning_trace_v2", "ontology_reasoning"} {
+	for _, key := range []string{"reasoning_trace_v3", "trace_v3", "reasoning_trace_v2", "ontology_reasoning"} {
 		trace, ok := metadata[key].(map[string]any)
 		if !ok {
 			continue

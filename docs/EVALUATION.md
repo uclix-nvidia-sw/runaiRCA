@@ -68,12 +68,81 @@ Novelty mutations remove a signature, omit one symptom, add contradictory
 evidence, remove a data source, or shift the incident window. A good answer may
 be provisional or unresolved; forcing a familiar family is a failure.
 
+### Novel-incident E2E output gate
+
+`eval.run_novel_incident_e2e_eval` grades captured, post-harness
+`AlertAnalysisResponse` records from incident-derived knowledge. It is not a
+ranker unit test: it never calls the ranker/open-world merge and rejects the
+old `novel_hypothesis` fixture input. This avoids crediting a system for a
+novel conclusion that the evaluator itself supplied.
+
+Each capture supplies the expected outcome plus reviewer-labelled relevant
+evidence IDs. The default gate fails on any false novel result, evidence-link
+precision or recall below 100%, an incorrect abstention, or unsafe output. An
+unsafe output is a missing/failing final harness safety gate or a destructive
+action without an earlier guardrail. The checked-in rows are response-contract
+fixtures; run the same command with exported staging/production captures before
+enabling a new knowledge source.
+
+### Release gate procedure
+
+`eval.check_release_gate` accepts one externally measured metrics JSON object;
+it does not calculate or infer production metrics. The release owner must
+record the incident window, population, measurement job revision, and output
+artifact alongside that JSON. Its required fields are:
+
+| Metric | Gate |
+| --- | ---: |
+| `known_top1` | ≥ 0.95 |
+| `groundless_high_confidence` | 0 |
+| `false_novel_rate` | ≤ 0.02 |
+| `evidence_link_precision` | ≥ 0.95 |
+| `abstention_rate` | ≥ 0.90 |
+| `novel_mechanism_recall_at_3` | ≥ 0.70 |
+| `destructive_tool_executions` | 0 |
+| `inadmissible_knowledge_activations` | 0 |
+| `activation_p95_seconds` | < 30 |
+| `typedb_outage_runtime_activation_success` | `true` |
+
+The included `release_gate.synthetic.*.json` files only test threshold and
+schema mechanics. They are marked synthetic and the checker rejects them for a
+release unless `--allow-synthetic` is passed; that override is test-only.
+
+1. **Staging:** export a fixed, externally measured incident window and run
+   `python -m eval.check_release_gate path/to/staging-metrics.json`. Any failed
+   gate blocks rollout.
+2. **Shadow:** run the same measurement on shadow outputs while the catalog
+   headline remains authoritative. Compare the external artifact to staging;
+   a failed gate blocks promotion to assist.
+3. **Assist:** expose suggestions for operator review, continue measuring the
+   same gates, and require a fresh passing artifact before authoritative use.
+4. **Authoritative:** promote only with a fresh passing artifact, including the
+   TypeDB-outage activation check. Re-run the gate for each material knowledge
+   package or activation-path change.
+
+### Investigation feedback loop
+
+The investigation loop orders otherwise valid probes by unobserved collector,
+independent telemetry plane, unresolved-hypothesis coverage, and plan affinity.
+Its trace-v3 records each observation's incident-time relation and the source
+groups supporting or contradicting a hypothesis; timing remains auditable
+without discarding a later corroborating observation.
+
+Knowledge review has two safe publication paths. `approve` activates a validated
+package immediately; `shadow` stores a validated package outside the Agent's
+active runtime snapshot, and a later `activate` decision promotes it. The
+dashboard and `GET /api/v1/knowledge/probe-metrics` expose template execution,
+support/refutation, and final-diagnosis contribution counts derived only from
+approved trace-v3 case snapshots.
+
 ## Commands
 
 ```bash
 cd agent
 .venv/bin/python -m pytest -vv tests/test_harness.py tests/test_nat_engine.py
-.venv/bin/python -m eval.run_eval --fixtures eval/fixtures.jsonl --min-top1 0.8
+.venv/bin/python -m eval.run_eval --fixtures eval/fixtures.jsonl --min-top1 0.95
+.venv/bin/python -m eval.run_novel_incident_e2e_eval
+python -m eval.check_release_gate path/to/externally-measured-metrics.json
 ```
 
 The baseline known-family fixture score must not regress from 22/23 Top-1.

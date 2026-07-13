@@ -9,6 +9,7 @@
 {{- $tolerations := default .Values.tolerations .Values.agent.tolerations -}}
 {{- $rbacNamespaces := default (list .Release.Namespace) .Values.agent.rbac.namespaces -}}
 {{- $kubernetesNamespaces := .Values.agent.env.kubernetesNamespaces -}}
+{{- $backendURL := default (printf "http://%s:%v" (include "runai-rca.backend.fullname" .) .Values.backend.service.port) .Values.agent.env.backendUrl -}}
 {{- if and (not .Values.agent.rbac.clusterWide) (not $kubernetesNamespaces) -}}
 {{- $kubernetesNamespaces = join "," $rbacNamespaces -}}
 {{- end -}}
@@ -135,7 +136,17 @@ spec:
             - name: COLLECTORS
               value: {{ .Values.agent.env.collectors | quote }}
             - name: BACKEND_URL
-              value: {{ default (printf "http://%s:%v" (include "runai-rca.backend.fullname" .) .Values.backend.service.port) .Values.agent.env.backendUrl | quote }}
+              value: {{ $backendURL | quote }}
+            - name: DYNAMIC_KNOWLEDGE_MODE
+              value: {{ .Values.agent.env.dynamicKnowledgeMode | quote }}
+            - name: RUNTIME_KNOWLEDGE_URL
+              value: {{ default (printf "%s/api/v1/knowledge/runtime-snapshot" $backendURL) .Values.agent.env.runtimeKnowledgeUrl | quote }}
+            - name: RUNTIME_KNOWLEDGE_TOKEN
+              value: {{ .Values.agent.env.runtimeKnowledgeToken | quote }}
+            - name: RUNTIME_KNOWLEDGE_REFRESH_SECONDS
+              value: {{ .Values.agent.env.runtimeKnowledgeRefreshSeconds | quote }}
+            - name: RUNTIME_KNOWLEDGE_TIMEOUT_SECONDS
+              value: {{ .Values.agent.env.runtimeKnowledgeTimeoutSeconds | quote }}
             - name: PROMETHEUS_URL
               value: {{ .Values.agent.env.prometheusUrl | quote }}
             - name: PROMETHEUS_TIMEOUT_SECONDS

@@ -363,6 +363,68 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`CREATE TABLE IF NOT EXISTS knowledge_candidates (
+			candidate_id TEXT PRIMARY KEY,
+			case_id TEXT NOT NULL,
+			knowledge_fingerprint TEXT NOT NULL DEFAULT '',
+			supporting_case_count INTEGER NOT NULL DEFAULT 1,
+			incident_id TEXT NOT NULL,
+			run_id TEXT NOT NULL,
+			status TEXT NOT NULL CHECK (status IN ('generated', 'validation_failed', 'ready_for_review', 'active', 'rejected', 'superseded')),
+			package_id TEXT NOT NULL DEFAULT '',
+			content_hash TEXT NOT NULL DEFAULT '',
+			validation_error TEXT NOT NULL DEFAULT '',
+			trace JSONB NOT NULL DEFAULT '{}'::jsonb,
+			payload JSONB NOT NULL,
+			decided_at TIMESTAMPTZ,
+			decided_by TEXT NOT NULL DEFAULT '',
+			decision_note TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL
+		)`,
+		`ALTER TABLE knowledge_candidates ADD COLUMN IF NOT EXISTS knowledge_fingerprint TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE knowledge_candidates ADD COLUMN IF NOT EXISTS supporting_case_count INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE knowledge_candidates DROP CONSTRAINT IF EXISTS knowledge_candidates_case_id_key`,
+		`CREATE TABLE IF NOT EXISTS knowledge_candidate_cases (
+			candidate_id TEXT NOT NULL,
+			case_id TEXT NOT NULL,
+			linked_at TIMESTAMPTZ NOT NULL,
+			PRIMARY KEY (candidate_id, case_id)
+		)`,
+		`ALTER TABLE knowledge_candidates ADD COLUMN IF NOT EXISTS content_hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE knowledge_candidates ADD COLUMN IF NOT EXISTS validation_error TEXT NOT NULL DEFAULT ''`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_candidates_fingerprint_hash ON knowledge_candidates (knowledge_fingerprint, content_hash)`,
+		`UPDATE knowledge_candidates SET status = CASE status WHEN 'proposed' THEN 'ready_for_review' WHEN 'approved' THEN 'active' ELSE status END`,
+		`ALTER TABLE knowledge_candidates DROP CONSTRAINT IF EXISTS knowledge_candidates_status_check`,
+		`ALTER TABLE knowledge_candidates ADD CONSTRAINT knowledge_candidates_status_check CHECK (status IN ('generated', 'validation_failed', 'ready_for_review', 'shadow', 'active', 'rejected', 'superseded')) NOT VALID`,
+		`CREATE TABLE IF NOT EXISTS knowledge_packages (
+			package_id TEXT PRIMARY KEY,
+			candidate_id TEXT NOT NULL UNIQUE,
+			case_id TEXT NOT NULL,
+			status TEXT NOT NULL CHECK (status IN ('active', 'retired')),
+			payload JSONB NOT NULL,
+			published_at TIMESTAMPTZ NOT NULL,
+			retired_at TIMESTAMPTZ,
+			retired_by TEXT NOT NULL DEFAULT '',
+			retirement_note TEXT NOT NULL DEFAULT '',
+			mirror_status TEXT NOT NULL DEFAULT 'pending',
+			mirror_last_error TEXT NOT NULL DEFAULT '',
+			mirror_updated_at TIMESTAMPTZ
+		)`,
+		`ALTER TABLE knowledge_packages ADD COLUMN IF NOT EXISTS mirror_status TEXT NOT NULL DEFAULT 'pending'`,
+		`ALTER TABLE knowledge_packages ADD COLUMN IF NOT EXISTS mirror_last_error TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE knowledge_packages ADD COLUMN IF NOT EXISTS mirror_updated_at TIMESTAMPTZ`,
+		`ALTER TABLE knowledge_packages DROP CONSTRAINT IF EXISTS knowledge_packages_status_check`,
+		`ALTER TABLE knowledge_packages ADD CONSTRAINT knowledge_packages_status_check CHECK (status IN ('shadow', 'active', 'retired')) NOT VALID`,
+		`CREATE TABLE IF NOT EXISTS knowledge_events (
+			event_id TEXT PRIMARY KEY,
+			candidate_id TEXT NOT NULL DEFAULT '',
+			package_id TEXT NOT NULL DEFAULT '',
+			event_type TEXT NOT NULL,
+			actor TEXT NOT NULL DEFAULT '',
+			note TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL
+		)`,
 		`ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS root_cause_family TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb`,
 		`ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS first_completed_at TIMESTAMPTZ`,
@@ -384,6 +446,10 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 		`CREATE INDEX IF NOT EXISTS idx_rca_eval_reviews_run ON rca_eval_reviews (run_id, analysis_hash)`,
 		`CREATE INDEX IF NOT EXISTS idx_rca_case_snapshots_active_incident ON rca_case_snapshots (incident_id, approved_at DESC) WHERE approval_state = 'active'`,
 		`CREATE INDEX IF NOT EXISTS idx_rca_case_snapshots_family ON rca_case_snapshots (root_cause_family, approved_at DESC) WHERE approval_state = 'active'`,
+		`CREATE INDEX IF NOT EXISTS idx_knowledge_candidates_status_created ON knowledge_candidates (status, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_knowledge_candidate_cases_case ON knowledge_candidate_cases (case_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_knowledge_packages_active_published ON knowledge_packages (published_at DESC) WHERE status = 'active'`,
+		`CREATE INDEX IF NOT EXISTS idx_knowledge_events_candidate_created ON knowledge_events (candidate_id, created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_chat_conversations_updated_at ON chat_conversations (updated_at DESC)`,
 		`UPDATE analysis_runs
 			SET status = 'failed',
@@ -475,6 +541,7 @@ func (s *Store) loadDatabaseState(ctx context.Context) {
 	s.loadAnalysisRuns(ctx)
 	s.loadEvaluationReviews(ctx)
 	s.loadCaseSnapshots(ctx)
+	s.loadKnowledge(ctx)
 	s.loadChatConversations(ctx)
 }
 
@@ -905,6 +972,96 @@ func (s *Store) loadCaseSnapshots(ctx context.Context) {
 	}
 }
 
+func (s *Store) loadKnowledge(ctx context.Context) {
+	candidates, err := s.db.QueryContext(ctx, `SELECT candidate_id, case_id, knowledge_fingerprint, supporting_case_count, incident_id, run_id, status, package_id, content_hash, validation_error, trace, payload, decided_at, decided_by, decision_note, created_at, updated_at FROM knowledge_candidates`)
+	if err != nil {
+		log.Printf("Failed to load knowledge candidates: %v", err)
+		return
+	}
+	defer candidates.Close()
+	s.mu.Lock()
+	for candidates.Next() {
+		var candidate KnowledgeCandidate
+		var trace, payload []byte
+		if err := candidates.Scan(&candidate.CandidateID, &candidate.CaseID, &candidate.KnowledgeFingerprint, &candidate.SupportingCaseCount, &candidate.IncidentID, &candidate.RunID, &candidate.Status, &candidate.PackageID, &candidate.ContentHash, &candidate.ValidationError, &trace, &payload, &candidate.DecidedAt, &candidate.DecidedBy, &candidate.DecisionNote, &candidate.CreatedAt, &candidate.UpdatedAt); err != nil {
+			log.Printf("Failed to scan knowledge candidate: %v", err)
+			continue
+		}
+		_ = json.Unmarshal(trace, &candidate.Trace)
+		_ = json.Unmarshal(payload, &candidate.Payload)
+		if candidate.Trace == nil {
+			candidate.Trace = map[string]any{}
+		}
+		if candidate.Payload == nil {
+			candidate.Payload = map[string]any{}
+		}
+		hydrateKnowledgeCandidate(&candidate)
+		s.knowledgeCandidates[candidate.CandidateID] = &candidate
+	}
+	s.mu.Unlock()
+	links, err := s.db.QueryContext(ctx, `SELECT candidate_id, case_id FROM knowledge_candidate_cases ORDER BY linked_at ASC`)
+	if err != nil {
+		log.Printf("Failed to load knowledge candidate case links: %v", err)
+		return
+	}
+	defer links.Close()
+	s.mu.Lock()
+	for links.Next() {
+		var candidateID, caseID string
+		if err := links.Scan(&candidateID, &caseID); err != nil {
+			log.Printf("Failed to scan knowledge candidate case link: %v", err)
+			continue
+		}
+		if candidate := s.knowledgeCandidates[candidateID]; candidate != nil {
+			candidate.SupportingCaseIDs = append(candidate.SupportingCaseIDs, caseID)
+		}
+	}
+	for _, candidate := range s.knowledgeCandidates {
+		if len(candidate.SupportingCaseIDs) > 0 {
+			candidate.SupportingCaseCount = len(candidate.SupportingCaseIDs)
+		}
+	}
+	s.mu.Unlock()
+	packages, err := s.db.QueryContext(ctx, `SELECT package_id, candidate_id, case_id, status, payload, published_at, retired_at, retired_by, retirement_note, mirror_status, mirror_last_error, mirror_updated_at FROM knowledge_packages`)
+	if err != nil {
+		log.Printf("Failed to load knowledge packages: %v", err)
+		return
+	}
+	defer packages.Close()
+	s.mu.Lock()
+	for packages.Next() {
+		var pkg KnowledgePackage
+		var payload []byte
+		if err := packages.Scan(&pkg.PackageID, &pkg.CandidateID, &pkg.CaseID, &pkg.Status, &payload, &pkg.PublishedAt, &pkg.RetiredAt, &pkg.RetiredBy, &pkg.RetirementNote, &pkg.MirrorStatus, &pkg.MirrorLastError, &pkg.MirrorUpdatedAt); err != nil {
+			log.Printf("Failed to scan knowledge package: %v", err)
+			continue
+		}
+		_ = json.Unmarshal(payload, &pkg.Payload)
+		if pkg.Payload == nil {
+			pkg.Payload = map[string]any{}
+		}
+		hydrateKnowledgePackage(&pkg)
+		s.knowledgePackages[pkg.PackageID] = &pkg
+	}
+	s.mu.Unlock()
+	events, err := s.db.QueryContext(ctx, `SELECT event_id, candidate_id, package_id, event_type, actor, note, created_at FROM knowledge_events`)
+	if err != nil {
+		log.Printf("Failed to load knowledge events: %v", err)
+		return
+	}
+	defer events.Close()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for events.Next() {
+		var event KnowledgeEvent
+		if err := events.Scan(&event.EventID, &event.CandidateID, &event.PackageID, &event.Type, &event.Actor, &event.Note, &event.CreatedAt); err != nil {
+			log.Printf("Failed to scan knowledge event: %v", err)
+			continue
+		}
+		s.knowledgeEvents[event.EventID] = &event
+	}
+}
+
 func (s *Store) loadChatConversations(ctx context.Context) {
 	rows, err := s.db.QueryContext(
 		ctx,
@@ -1272,6 +1429,397 @@ func (s *Store) persistNewCaseSnapshotLocked(snapshot *CaseSnapshot) bool {
 	)
 	if err != nil {
 		log.Printf("Failed to persist RCA case snapshot %s: %v", snapshot.CaseID, err)
+		return false
+	}
+	return true
+}
+
+// persistCaseSnapshotAndKnowledgeCandidateLocked keeps the approved source
+// snapshot and its proposed candidate in one database transaction. The maps
+// are updated only after this succeeds, so database failures never expose a
+// half-created candidate or a candidate without its immutable source.
+func (s *Store) persistCaseSnapshotAndKnowledgeCandidateLocked(snapshot *CaseSnapshot, candidate *KnowledgeCandidate, event *KnowledgeEvent) bool {
+	if s.db == nil || !s.dbReady {
+		return true
+	}
+	if snapshot == nil || candidate == nil || event == nil {
+		return false
+	}
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("Failed to start case snapshot knowledge transaction: %v", err)
+		return false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	if strings.HasPrefix(snapshot.RootCauseFamily, "novel_") && snapshot.MechanismFingerprint != "" {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO novel_cause_registry (mechanism_fingerprint, canonical_family, mechanism, schema_version, aliases, merged_into) VALUES ($1, $2, $3, 1, '[]'::jsonb, '') ON CONFLICT (mechanism_fingerprint) DO NOTHING`, snapshot.MechanismFingerprint, snapshot.RootCauseFamily, snapshot.Mechanism); err != nil {
+			log.Printf("Failed to persist novel cause registry %s: %v", snapshot.MechanismFingerprint, err)
+			return false
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO rca_case_snapshots (case_id, incident_id, alert_id, run_id, analysis_hash, approval_state, root_cause_family, mechanism, mechanism_fingerprint, snapshot, approved_at, revoked_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (case_id) DO NOTHING`, snapshot.CaseID, snapshot.IncidentID, snapshot.AlertID, snapshot.RunID, snapshot.AnalysisHash, snapshot.ApprovalState, snapshot.RootCauseFamily, snapshot.Mechanism, snapshot.MechanismFingerprint, mustJSON(snapshot.Snapshot), snapshot.ApprovedAt, snapshot.RevokedAt); err != nil {
+		log.Printf("Failed to persist RCA case snapshot %s: %v", snapshot.CaseID, err)
+		return false
+	}
+	if !persistKnowledgeCandidateTx(ctx, tx, candidate) || !persistKnowledgeEventTx(ctx, tx, event) {
+		return false
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit case snapshot knowledge transaction: %v", err)
+		return false
+	}
+	committed = true
+	return true
+}
+
+func (s *Store) persistNewKnowledgeCandidateLocked(candidate *KnowledgeCandidate, event *KnowledgeEvent) bool {
+	if s.db == nil || !s.dbReady {
+		return true
+	}
+	if candidate == nil || event == nil {
+		return false
+	}
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("Failed to start knowledge candidate transaction: %v", err)
+		return false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	if !persistKnowledgeCandidateTx(ctx, tx, candidate) || !persistKnowledgeEventTx(ctx, tx, event) {
+		return false
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit knowledge candidate transaction: %v", err)
+		return false
+	}
+	committed = true
+	return true
+}
+
+func (s *Store) persistKnowledgeApprovalLocked(candidate *KnowledgeCandidate, pkg *KnowledgePackage, prior *KnowledgePackage, event *KnowledgeEvent) bool {
+	if s.db == nil || !s.dbReady {
+		return true
+	}
+	if candidate == nil || pkg == nil || event == nil {
+		return false
+	}
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("Failed to start knowledge approval transaction: %v", err)
+		return false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, package_id = $2, payload = $3, decided_at = $4, decided_by = $5, decision_note = $6, updated_at = $7 WHERE candidate_id = $8 AND status = 'ready_for_review'`, candidate.Status, candidate.PackageID, mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID)
+	if err != nil {
+		log.Printf("Failed to approve knowledge candidate %s: %v", candidate.CandidateID, err)
+		return false
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		log.Printf("Knowledge candidate %s was not ready for approval", candidate.CandidateID)
+		return false
+	}
+	if prior != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE knowledge_packages SET status = 'retired', retired_at = $1, retired_by = $2, retirement_note = $3 WHERE package_id = $4 AND status = 'active'`, candidate.UpdatedAt, candidate.DecidedBy, "superseded by "+candidate.CandidateID, prior.PackageID); err != nil {
+			log.Printf("Failed to retire superseded knowledge package %s: %v", prior.PackageID, err)
+			return false
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = 'superseded', updated_at = $1 WHERE candidate_id = $2 AND status = 'active'`, candidate.UpdatedAt, prior.CandidateID); err != nil {
+			log.Printf("Failed to supersede knowledge candidate %s: %v", prior.CandidateID, err)
+			return false
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO knowledge_packages (package_id, candidate_id, case_id, status, payload, published_at, retired_at, retired_by, retirement_note, mirror_status, mirror_last_error, mirror_updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`, pkg.PackageID, pkg.CandidateID, pkg.CaseID, pkg.Status, mustJSON(pkg.Payload), pkg.PublishedAt, pkg.RetiredAt, pkg.RetiredBy, pkg.RetirementNote, pkg.MirrorStatus, pkg.MirrorLastError, pkg.MirrorUpdatedAt); err != nil {
+		log.Printf("Failed to publish knowledge package %s: %v", pkg.PackageID, err)
+		return false
+	}
+	if !persistKnowledgeEventTx(ctx, tx, event) {
+		return false
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit knowledge approval transaction: %v", err)
+		return false
+	}
+	committed = true
+	return true
+}
+
+func (s *Store) persistKnowledgeActivationLocked(candidate *KnowledgeCandidate, pkg *KnowledgePackage, prior *KnowledgePackage, event *KnowledgeEvent) bool {
+	if s.db == nil || !s.dbReady {
+		return true
+	}
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("Failed to start knowledge shadow activation transaction: %v", err)
+		return false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, payload = $2, decided_at = $3, decided_by = $4, decision_note = $5, updated_at = $6 WHERE candidate_id = $7 AND status = 'shadow'`, candidate.Status, mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID)
+	if err != nil {
+		log.Printf("Failed to activate knowledge candidate %s: %v", candidate.CandidateID, err)
+		return false
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return false
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE knowledge_packages SET status = $1, payload = $2 WHERE package_id = $3 AND status = 'shadow'`, pkg.Status, mustJSON(pkg.Payload), pkg.PackageID)
+	if err != nil {
+		log.Printf("Failed to activate knowledge package %s: %v", pkg.PackageID, err)
+		return false
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return false
+	}
+	if prior != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE knowledge_packages SET status = 'retired', retired_at = $1, retired_by = $2, retirement_note = $3 WHERE package_id = $4 AND status = 'active'`, candidate.UpdatedAt, candidate.DecidedBy, "superseded by "+candidate.CandidateID, prior.PackageID); err != nil {
+			log.Printf("Failed to retire superseded knowledge package %s: %v", prior.PackageID, err)
+			return false
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = 'superseded', updated_at = $1 WHERE candidate_id = $2 AND status = 'active'`, candidate.UpdatedAt, prior.CandidateID); err != nil {
+			log.Printf("Failed to supersede knowledge candidate %s: %v", prior.CandidateID, err)
+			return false
+		}
+	}
+	if !persistKnowledgeEventTx(ctx, tx, event) {
+		return false
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit knowledge shadow activation transaction: %v", err)
+		return false
+	}
+	committed = true
+	return true
+}
+
+func (s *Store) persistKnowledgeShadowRejectionLocked(candidate *KnowledgeCandidate, pkg *KnowledgePackage, event *KnowledgeEvent) bool {
+	if s.db == nil || !s.dbReady {
+		return true
+	}
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("Failed to start knowledge shadow rejection transaction: %v", err)
+		return false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, payload = $2, decided_at = $3, decided_by = $4, decision_note = $5, updated_at = $6 WHERE candidate_id = $7 AND status = 'shadow'`, candidate.Status, mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID)
+	if err != nil {
+		log.Printf("Failed to reject shadow knowledge candidate %s: %v", candidate.CandidateID, err)
+		return false
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return false
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE knowledge_packages SET status = $1, payload = $2, retired_at = $3, retired_by = $4, retirement_note = $5 WHERE package_id = $6 AND status = 'shadow'`, pkg.Status, mustJSON(pkg.Payload), pkg.RetiredAt, pkg.RetiredBy, pkg.RetirementNote, pkg.PackageID)
+	if err != nil {
+		log.Printf("Failed to retire shadow knowledge package %s: %v", pkg.PackageID, err)
+		return false
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return false
+	}
+	if !persistKnowledgeEventTx(ctx, tx, event) {
+		return false
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit knowledge shadow rejection transaction: %v", err)
+		return false
+	}
+	committed = true
+	return true
+}
+
+func (s *Store) persistKnowledgeMirrorLocked(pkg *KnowledgePackage) bool {
+	if s.db == nil || !s.dbReady {
+		return true
+	}
+	if pkg == nil {
+		return false
+	}
+	result, err := s.execPostgres(`UPDATE knowledge_packages SET mirror_status = $1, mirror_last_error = $2, mirror_updated_at = $3 WHERE package_id = $4`, pkg.MirrorStatus, pkg.MirrorLastError, pkg.MirrorUpdatedAt, pkg.PackageID)
+	if err != nil {
+		log.Printf("Failed to update knowledge package mirror %s: %v", pkg.PackageID, err)
+		return false
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		log.Printf("Knowledge package %s was not found for mirror update", pkg.PackageID)
+		return false
+	}
+	return true
+}
+
+func (s *Store) persistKnowledgeCandidateTransitionLocked(candidate *KnowledgeCandidate, event *KnowledgeEvent) bool {
+	if s.db == nil || !s.dbReady {
+		return true
+	}
+	if candidate == nil || event == nil {
+		return false
+	}
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("Failed to start knowledge rejection transaction: %v", err)
+		return false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, decided_at = $2, decided_by = $3, decision_note = $4, updated_at = $5 WHERE candidate_id = $6 AND status = 'ready_for_review'`, candidate.Status, candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID)
+	if err != nil {
+		log.Printf("Failed to reject knowledge candidate %s: %v", candidate.CandidateID, err)
+		return false
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		log.Printf("Knowledge candidate %s was not ready for rejection", candidate.CandidateID)
+		return false
+	}
+	if !persistKnowledgeEventTx(ctx, tx, event) {
+		return false
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit knowledge rejection transaction: %v", err)
+		return false
+	}
+	committed = true
+	return true
+}
+
+func (s *Store) persistKnowledgeValidationFailureLocked(candidate *KnowledgeCandidate, event *KnowledgeEvent) bool {
+	if s.db == nil || !s.dbReady {
+		return true
+	}
+	if candidate == nil || event == nil {
+		return false
+	}
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("Failed to start knowledge validation failure transaction: %v", err)
+		return false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, validation_error = $2, updated_at = $3 WHERE candidate_id = $4 AND status = 'ready_for_review'`, candidate.Status, candidate.ValidationError, candidate.UpdatedAt, candidate.CandidateID)
+	if err != nil {
+		log.Printf("Failed to mark knowledge candidate validation failure %s: %v", candidate.CandidateID, err)
+		return false
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		log.Printf("Knowledge candidate %s was not ready for validation failure", candidate.CandidateID)
+		return false
+	}
+	if !persistKnowledgeEventTx(ctx, tx, event) {
+		return false
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit knowledge validation failure transaction: %v", err)
+		return false
+	}
+	committed = true
+	return true
+}
+
+func (s *Store) persistKnowledgePackageRetirementLocked(pkg *KnowledgePackage, event *KnowledgeEvent) bool {
+	if s.db == nil || !s.dbReady {
+		return true
+	}
+	if pkg == nil || event == nil {
+		return false
+	}
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("Failed to start knowledge retirement transaction: %v", err)
+		return false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	result, err := tx.ExecContext(ctx, `UPDATE knowledge_packages SET status = $1, payload = $2, retired_at = $3, retired_by = $4, retirement_note = $5 WHERE package_id = $6 AND status = 'active'`, pkg.Status, mustJSON(pkg.Payload), pkg.RetiredAt, pkg.RetiredBy, pkg.RetirementNote, pkg.PackageID)
+	if err != nil {
+		log.Printf("Failed to retire knowledge package %s: %v", pkg.PackageID, err)
+		return false
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		log.Printf("Knowledge package %s was not active for retirement", pkg.PackageID)
+		return false
+	}
+	if !persistKnowledgeEventTx(ctx, tx, event) {
+		return false
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit knowledge retirement transaction: %v", err)
+		return false
+	}
+	committed = true
+	return true
+}
+
+func persistKnowledgeCandidateTx(ctx context.Context, tx *sql.Tx, candidate *KnowledgeCandidate) bool {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO knowledge_candidates (candidate_id, case_id, knowledge_fingerprint, supporting_case_count, incident_id, run_id, status, package_id, content_hash, validation_error, trace, payload, decided_at, decided_by, decision_note, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) ON CONFLICT (candidate_id) DO NOTHING`, candidate.CandidateID, candidate.CaseID, candidate.KnowledgeFingerprint, candidate.SupportingCaseCount, candidate.IncidentID, candidate.RunID, candidate.Status, candidate.PackageID, candidate.ContentHash, candidate.ValidationError, mustJSON(candidate.Trace), mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote, candidate.CreatedAt, candidate.UpdatedAt); err != nil {
+		log.Printf("Failed to persist knowledge candidate %s: %v", candidate.CandidateID, err)
+		return false
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO knowledge_candidate_cases (candidate_id, case_id, linked_at) VALUES ($1, $2, $3) ON CONFLICT (candidate_id, case_id) DO NOTHING`, candidate.CandidateID, candidate.CaseID, candidate.CreatedAt); err != nil {
+		log.Printf("Failed to persist knowledge candidate case link %s/%s: %v", candidate.CandidateID, candidate.CaseID, err)
+		return false
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET supporting_case_count = (SELECT count(*) FROM knowledge_candidate_cases WHERE candidate_id = $1) WHERE candidate_id = $1`, candidate.CandidateID); err != nil {
+		log.Printf("Failed to update knowledge candidate support count %s: %v", candidate.CandidateID, err)
+		return false
+	}
+	return true
+}
+
+func persistKnowledgeEventTx(ctx context.Context, tx *sql.Tx, event *KnowledgeEvent) bool {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO knowledge_events (event_id, candidate_id, package_id, event_type, actor, note, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`, event.EventID, event.CandidateID, event.PackageID, event.Type, event.Actor, event.Note, event.CreatedAt); err != nil {
+		log.Printf("Failed to persist knowledge event %s: %v", event.EventID, err)
 		return false
 	}
 	return true

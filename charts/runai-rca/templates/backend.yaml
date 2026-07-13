@@ -70,6 +70,8 @@ spec:
               value: {{ .Values.backend.service.port | quote }}
             - name: AGENT_URL
               value: {{ default (printf "http://%s:%v" (include "runai-rca.agent.fullname" .) .Values.agent.service.port) .Values.backend.env.agentUrl | quote }}
+            - name: KNOWLEDGE_VALIDATOR_URL
+              value: {{ default (printf "http://%s:%v" (include "runai-rca.agent.fullname" .) .Values.agent.service.port) .Values.backend.env.knowledgeValidatorUrl | quote }}
             - name: LANGUAGE
               value: {{ .Values.backend.env.language | quote }}
             - name: DATABASE_CONNECT_TIMEOUT_SECONDS

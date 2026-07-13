@@ -13,7 +13,13 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | --- | --- |
 | `PORT` | Backend/Agent HTTP port; Helm maps this from the component service port |
 | `AGENT_URL` | Backend to Agent URL, default `http://localhost:8000` |
+| `KNOWLEDGE_VALIDATOR_URL` | Backend approval-time Agent validator base URL. The backend appends `/knowledge/validate`; Helm defaults this to the in-cluster Agent service. |
 | `BACKEND_URL` | Agent to Backend URL used for fire-and-forget analysis progress events. Empty disables progress POSTs; Helm points it at the backend service by default |
+| `DYNAMIC_KNOWLEDGE_MODE` | Runtime use of approved incident-derived knowledge: `off`, `shadow` (default), `assist`, or `authoritative`. `shadow` records observations without changing the headline RCA. |
+| `RUNTIME_KNOWLEDGE_URL` | Read-only approved-knowledge snapshot URL. When empty, the Agent derives `${BACKEND_URL}/api/v1/knowledge/runtime-snapshot`; Helm exposes an explicit override. |
+| `RUNTIME_KNOWLEDGE_TOKEN` | Optional bearer token for the runtime knowledge snapshot endpoint. Empty is safe for the in-cluster default endpoint. |
+| `RUNTIME_KNOWLEDGE_REFRESH_SECONDS` | Runtime knowledge refresh interval, default `30` seconds (values below `30` are raised to `30`). |
+| `RUNTIME_KNOWLEDGE_TIMEOUT_SECONDS` | Runtime knowledge fetch timeout, default `10` seconds (minimum `1`). |
 | `AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for Agent `/analyze` and `/chat` requests, default `1560` (must exceed the agent's `ANALYSIS_DEADLINE_SECONDS`) |
 | `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for operator-triggered Agent `/analyze` requests, default `1560` |
 | `TRASH_RETENTION_DAYS` | Backend soft-delete retention before trash incidents are purged, default `30` |
@@ -144,6 +150,7 @@ Frequently tuned Helm values:
 | `{backend,agent,frontend}.replicaCount` | Scale stateless runtime components; keep the bundled Postgres at one replica |
 | `{backend,agent,frontend,postgresql}.resources` | CPU/memory requests and limits for production scheduling |
 | `backend.env.agentUrl` | Override Backend-to-Agent URL when the Agent is external or remote |
+| `backend.env.knowledgeValidatorUrl` | Override the approval-time Agent validator base URL; empty uses the in-cluster Agent service and the backend appends `/knowledge/validate` |
 | `backend.env.language` / `agent.env.language` | Set RCA language to `en` or `ko` |
 | `backend.env.databaseConnectTimeoutSeconds` / `agentRequestTimeoutSeconds` / `manualAgentRequestTimeoutSeconds` | Backend startup DB timeout, automatic/chat Agent timeout, and operator-triggered analysis timeout |
 | `secrets.keys.*` | Existing Secret key names for DB, Run:ai, Grafana, NVIDIA, and LLM credentials |
@@ -153,6 +160,8 @@ Frequently tuned Helm values:
 | `agent.rbac.clusterWide` | Use a ClusterRole for Kubernetes evidence collection; default `true` |
 | `agent.rbac.namespaces` | Namespaces that receive Role/RoleBinding when `agent.rbac.clusterWide=false`; defaults to the release namespace |
 | `agent.env.kubernetesNamespaces` | Agent-side Kubernetes namespace allowlist; when empty and `clusterWide=false`, Helm derives it from `agent.rbac.namespaces` |
+| `agent.env.dynamicKnowledgeMode` / `runtimeKnowledgeUrl` / `runtimeKnowledgeRefreshSeconds` / `runtimeKnowledgeTimeoutSeconds` | Approved runtime-knowledge mode and snapshot client settings. Defaults are `shadow`, the derived backend snapshot URL, `30`, and `10`. |
+| `agent.env.runtimeKnowledgeToken` | Optional runtime snapshot bearer token; defaults to empty. Use a secret-managed values mechanism in production. |
 | `agent.serviceAccount.annotations` | ServiceAccount annotations for workload identity integrations |
 | `{backend,frontend,postgresql}.automountServiceAccountToken` | Disable Kubernetes API token mounts for pods that do not need cluster API access; default `false` |
 | `agent.automountServiceAccountToken` | Agent Kubernetes API token mount; default `true` because direct Kubernetes collection uses the service account token |

@@ -59,6 +59,7 @@ type Store struct {
 	commentSeq           atomic.Int64
 	analysisRunSeq       atomic.Int64
 	evaluationSeq        atomic.Int64
+	knowledgeEventSeq    atomic.Int64
 	incidents            map[string]*Incident
 	incidentByKey        map[string]string
 	alerts               map[string]*AlertRecord
@@ -71,6 +72,9 @@ type Store struct {
 	evaluationReviews    map[string]*EvaluationReview
 	caseSnapshots        map[string]*CaseSnapshot
 	activeCaseByIncident map[string]string
+	knowledgeCandidates  map[string]*KnowledgeCandidate
+	knowledgePackages    map[string]*KnowledgePackage
+	knowledgeEvents      map[string]*KnowledgeEvent
 	chatConversations    map[string]*ChatConversation
 	recurrenceStatsCache map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry
 	db                   *sql.DB
@@ -115,6 +119,9 @@ func NewStore() *Store {
 		evaluationReviews:    make(map[string]*EvaluationReview),
 		caseSnapshots:        make(map[string]*CaseSnapshot),
 		activeCaseByIncident: make(map[string]string),
+		knowledgeCandidates:  make(map[string]*KnowledgeCandidate),
+		knowledgePackages:    make(map[string]*KnowledgePackage),
+		knowledgeEvents:      make(map[string]*KnowledgeEvent),
 		chatConversations:    make(map[string]*ChatConversation),
 		recurrenceStatsCache: make(
 			map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry,
@@ -1370,7 +1377,7 @@ func metadataFromAgentContext(context map[string]any) map[string]any {
 			out["llm_usage"] = usage
 		}
 	}
-	for _, key := range []string{"harness", "ontology_reasoning", "reasoning_trace_v2"} {
+	for _, key := range []string{"harness", "ontology_reasoning", "reasoning_trace_v2", "reasoning_trace_v3", "trace_v3"} {
 		if value, ok := context[key].(map[string]any); ok {
 			out[key] = cloneAnyMap(value)
 		}
