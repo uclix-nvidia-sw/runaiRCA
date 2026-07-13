@@ -61,8 +61,6 @@ async def test_exec_probes_skipped_when_pod_exec_disabled() -> None:
         settings=settings,
         target=_target(),
         containers=["main"],
-        headers={},
-        verify=True,
     )
     assert probes == []
 
@@ -84,6 +82,39 @@ async def test_k8s_exec_gate_and_allowlist() -> None:
     assert "allowlist" in (r.get("error") or "")
 
 
+@pytest.mark.asyncio
+async def test_k8s_exec_streams_an_allowlisted_command(monkeypatch) -> None:
+    from app.collectors import kubernetes as k8s
+
+    calls: list[dict] = []
+
+    async def fake_exec(_settings, **kwargs):
+        calls.append(kwargs)
+        return "GPU 0\n", "", ""
+
+    monkeypatch.setattr(k8s, "_read_file", lambda _path: "service-account-token")
+    monkeypatch.setattr(k8s, "_exec_via_websocket", fake_exec)
+    result = await k8s.k8s_exec(
+        replace(load_settings(), enable_pod_exec=True),
+        "runai",
+        "trainer-0",
+        ["nvidia-smi"],
+        container="main",
+    )
+
+    assert result["error"] is None
+    assert result["output"] == "GPU 0\n"
+    assert calls == [
+        {
+            "namespace": "runai",
+            "pod": "trainer-0",
+            "command": ["nvidia-smi"],
+            "container": "main",
+            "token": "service-account-token",
+        }
+    ]
+
+
 def test_exec_frame_demux_routes_channels() -> None:
     from app.collectors.kubernetes import _accumulate_exec_frame
 
@@ -100,18 +131,36 @@ def test_exec_frame_demux_routes_channels() -> None:
 
 
 @pytest.mark.asyncio
-async def test_exec_probes_are_allowlisted_and_not_executed_when_enabled() -> None:
+async def test_exec_probes_are_allowlisted_and_executed_when_enabled(monkeypatch) -> None:
     from app.collectors import kubernetes as k8s
 
     settings = replace(load_settings(), enable_pod_exec=True)
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_k8s_exec(settings, namespace, pod, command, container=""):
+        calls.append(tuple(command))
+        return {
+            "namespace": namespace,
+            "pod": pod,
+            "container": container,
+            "status_code": 200,
+            "error": None,
+            "output": "ok",
+        }
+
+    monkeypatch.setattr(k8s, "k8s_exec", fake_k8s_exec)
     probes = await k8s._collect_exec_probes(
         settings=settings,
         target=_target(),
         containers=["main"],
-        headers={},
-        verify=True,
     )
     assert probes, "expected allowlisted probes when pod exec is enabled"
-    # Every recorded probe is read-only allowlisted and not actually streamed (see comment).
+    # The bounded base set is truly streamed, never a placeholder card.
     assert all(p["allowed"] is True for p in probes)
-    assert all(p["attempted"] is False for p in probes)
+    assert all(p["attempted"] is True for p in probes)
+    assert all(p["error"] is None for p in probes)
+    assert calls == [
+        ("free", "-h"),
+        ("df", "-h"),
+        ("nvidia-smi", "--query-gpu=name,memory.total,memory.used,utilization.gpu", "--format=csv"),
+    ]

@@ -36,7 +36,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `KUBERNETES_LIST_LIMIT` | Kubernetes pod/event list page size for evidence collection, default `50` |
 | `KUBERNETES_NAMESPACES` | Optional comma-separated namespace allowlist for Kubernetes direct collection |
 | `KUBERNETES_CLUSTER_SCOPE_ENABLED` | Enables cluster-scoped Kubernetes calls such as node lookups; Helm follows `agent.rbac.clusterWide` |
-| `KUBERNETES_MCP_URL` | Kubernetes MCP shared-service URL. When set, Kubernetes collection and drill-down call MCP first and fall back to direct Kubernetes API reads on failure |
+| `KUBERNETES_MCP_URL` | Kubernetes MCP shared-service URL. When set, Kubernetes get/list/log collection and drill-down call MCP first and fall back to direct Kubernetes API reads on failure. The separately gated, allowlisted `pods/exec` diagnostics use the agent ServiceAccount because the MCP service intentionally has no exec permission. |
 | `RUNAI_BASE_URL` | Run:ai control plane URL. No chart default; required as `agent.env.runaiBaseUrl` when `runaiMcp.enabled=true` |
 | `RUNAI_BEARER_TOKEN` | Optional Run:ai bearer token secret |
 | `GRAFANA_SERVICE_ACCOUNT_TOKEN` | Grafana service-account token used by the managed `grafanaMcp` service for Prometheus/Loki datasource read/query access |

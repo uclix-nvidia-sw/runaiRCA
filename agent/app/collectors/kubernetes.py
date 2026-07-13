@@ -717,14 +717,7 @@ async def _k8s_read_via_mcp(
     api_kinds = _k8s_mcp_api_kinds(resolved)
     candidates: list[tuple[str, dict[str, object]]] = []
     if name:
-        if resolved == "pods":
-            candidates.extend(
-                [
-                    ("pods_get", {"namespace": namespace, "name": name}),
-                    ("pods_get", {"namespace": namespace, "pod": name}),
-                ]
-            )
-        candidates.extend(
+        resource_get_candidates = [
             (
                 "resources_get",
                 {
@@ -735,9 +728,26 @@ async def _k8s_read_via_mcp(
                 },
             )
             for api_version, mcp_kind in api_kinds
-        )
-        candidates.append(
+        ]
+        resource_get_candidates.append(
             ("resources_get", {"kind": resolved, "namespace": namespace, "name": name})
+        )
+        pod_get_candidates: list[tuple[str, dict[str, object]]] = []
+        if resolved == "pods":
+            pod_get_candidates.extend(
+                [
+                    ("pods_get", {"namespace": namespace, "name": name}),
+                    ("pods_get", {"namespace": namespace, "pod": name}),
+                ]
+            )
+        # `resources_get` returns the server's YAML representation. For an
+        # explicit Pod inspection this is deliberately first, matching
+        # `kubectl get pod <name> -n <namespace> -o yaml`; compact sweep reads
+        # retain the shortcut tool first for lower overhead.
+        candidates.extend(
+            resource_get_candidates + pod_get_candidates
+            if full_object
+            else pod_get_candidates + resource_get_candidates
         )
     else:
         # A requested label selector must ride on EVERY candidate — a shortcut
@@ -942,7 +952,15 @@ class KubernetesCollector:
                     previous_containers=_restarted_container_names(pod_summary_data),
                     since_time=since_time,
                 )
-                exec_probes = []
+                # pods/exec is intentionally outside the read-only Kubernetes
+                # MCP ServiceAccount. Run the same tightly allowlisted probes
+                # through the agent's own ServiceAccount; this does not turn
+                # ordinary Kubernetes reads into direct API calls.
+                exec_probes = await _collect_exec_probes(
+                    settings=self._settings,
+                    target=target,
+                    containers=containers,
+                )
                 used_mcp = True
             except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
                 warnings.append(mcp_fallback_warning(exc))
@@ -1003,8 +1021,6 @@ class KubernetesCollector:
                 settings=self._settings,
                 target=target,
                 containers=containers,
-                headers=headers,
-                verify=verify,
             )
 
         # The initial sweep's `pods_get` is deliberately compact so broad RCA
@@ -1236,6 +1252,32 @@ class KubernetesCollector:
                         )
                     ),
                     result=target_pod_describe,
+                )
+            )
+        if exec_probes:
+            exec_errors = [str(probe.get("error")) for probe in exec_probes if probe.get("error")]
+            artifacts.append(
+                artifact(
+                    agent=self.name,
+                    source="kubernetes",
+                    type="pod_exec",
+                    status="partial" if exec_errors else "ok",
+                    confidence="high" if not exec_errors else "medium",
+                    title=ko_en(self._settings, "컨테이너 읽기 전용 exec", "Read-only container exec"),
+                    query="; ".join(
+                        f"kubectl exec {target.pod} -n {target.namespace} -- {probe['command']}"
+                        for probe in exec_probes
+                    ),
+                    summary=(
+                        "; ".join(exec_errors)
+                        if exec_errors
+                        else ko_en(
+                            self._settings,
+                            f"읽기 전용 진단 명령 {len(exec_probes)}개를 실행했습니다.",
+                            f"Executed {len(exec_probes)} read-only diagnostic command(s).",
+                        )
+                    ),
+                    result=exec_probes,
                 )
             )
 
@@ -2267,16 +2309,14 @@ async def _collect_exec_probes(
     settings: Settings,
     target: AnalysisTarget,
     containers: list[str],
-    headers: dict[str, str],
-    verify: bool | str,
 ) -> list[dict[str, object]]:
-    """Best-effort read-only exec probes, gated by enable_pod_exec + allowlist.
+    """Run a small set of read-only, allowlisted exec diagnostics.
 
-    ponytail: the K8s pods/exec subresource speaks SPDY/websocket streaming, which the
-    httpx GET/POST helper here cannot drive. Rather than pull in a websocket dependency,
-    we record the intended allowlisted probes and mark them unattempted. pods/log above
-    already covers the user's stated need ("view container logs"). Upgrade path: swap in
-    kubernetes-asyncio's WsApiClient (or aiohttp ws) if live exec output is required.
+    The base sweep stays bounded: high-signal CPU/memory/filesystem/GPU checks
+    execute once against the alert Pod's primary container. The drill-down
+    agent can request another exact allowlisted probe when that evidence makes
+    it useful. Kubernetes MCP remains the path for get/list/log; its
+    deliberately read-only ServiceAccount has no pods/exec permission.
     """
     if not settings.enable_pod_exec:
         return []
@@ -2284,19 +2324,26 @@ async def _collect_exec_probes(
         return []
     probes: list[dict[str, object]] = []
     container = containers[0] if containers else None
-    for command in _EXEC_ALLOWLIST:
+    base_commands = (
+        ("free", "-h"),
+        ("df", "-h"),
+        ("nvidia-smi", "--query-gpu=name,memory.total,memory.used,utilization.gpu", "--format=csv"),
+    )
+    for command in base_commands:
         argv = list(command)
-        allowed = exec_command_allowed(argv)
+        result = await k8s_exec(
+            settings,
+            target.namespace,
+            target.pod,
+            argv,
+            container=container or "",
+        )
         probes.append(
             {
-                "container": container,
+                **result,
                 "command": shlex.join(argv),
-                "allowed": allowed,
-                # Not executed: streaming subresource unsupported by the httpx helper.
-                "attempted": False,
-                "reason": "read-only allowlisted"
-                if allowed
-                else "refused: not on read-only allowlist",
+                "allowed": True,
+                "attempted": True,
             }
         )
     return probes

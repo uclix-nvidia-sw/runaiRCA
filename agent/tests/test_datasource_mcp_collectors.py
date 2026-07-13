@@ -248,7 +248,7 @@ async def test_kubernetes_collector_uses_mcp_before_service_account_token(
 
     async def fake_mcp_call(url, tool, arguments):
         calls.append(tool)
-        if tool == "pods_get":
+        if tool in {"pods_get", "resources_get"}:
             return _McpResult(
                 {
                     "metadata": {"name": "trainer-0", "namespace": "runai-vision"},
@@ -274,7 +274,11 @@ async def test_kubernetes_collector_uses_mcp_before_service_account_token(
     monkeypatch.setattr(kubernetes, "mcp_call", fake_mcp_call)
     monkeypatch.setattr(kubernetes, "_read_file", token_should_not_be_read)
     result = await kubernetes.KubernetesCollector(
-        replace(make_settings(), kubernetes_mcp_url="http://kubernetes-mcp/mcp")
+        replace(
+            make_settings(),
+            kubernetes_mcp_url="http://kubernetes-mcp/mcp",
+            enable_pod_exec=False,
+        )
     ).collect(make_target())
 
     assert result.details["used_mcp"] is True

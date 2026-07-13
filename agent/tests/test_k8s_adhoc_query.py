@@ -118,7 +118,7 @@ def test_k8s_describe_uses_mcp_full_pod_and_filters_its_events(monkeypatch) -> N
 
     async def fake_mcp_call(_url, tool, _arguments):
         calls.append(tool)
-        if tool == "pods_get":
+        if tool in {"pods_get", "resources_get"}:
             return Result(
                 {
                     "metadata": {"name": "worker-0", "namespace": "team-a"},
@@ -164,7 +164,7 @@ def test_k8s_describe_uses_mcp_full_pod_and_filters_its_events(monkeypatch) -> N
         )
     )
 
-    assert "pods_get" in calls
+    assert calls[0] == "resources_get"
     assert "events_list" in calls or "resources_list" in calls
     assert result["object"]["spec"]["containers"][0]["env"][0]["value"] == "[MASKED]"
     assert [event["reason"] for event in result["events"]] == ["OOMKilled"]
