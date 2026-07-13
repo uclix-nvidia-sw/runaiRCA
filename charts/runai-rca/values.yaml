@@ -134,7 +134,7 @@ typedb:
     enabled: true
     # Reconcile independently of Helm upgrades; backend lifecycle remains the
     # runtime authority, and this mirror is advisory.
-    schedule: "* * * * *"
+    schedule: "0 * * * *"
     limit: 1000
   image:
     # Fully qualified (docker.io/...) so global.imageRegistry does NOT rewrite it
