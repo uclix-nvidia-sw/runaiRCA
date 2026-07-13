@@ -232,6 +232,46 @@ def test_llm_unsupported_downgrades_and_marks_refuted():
     assert out["caveat"] == "Competing cause fits better."
 
 
+def test_llm_cannot_keep_confidence_from_context_only_evidence(monkeypatch):
+    settings = replace(make_settings(), llm_model_self_check="m")
+
+    async def fake_complete_json(*_a, **_k):
+        # This is exactly the unsafe response we must not trust: it treats a
+        # current context snapshot as proof of a historical incident cause.
+        return {
+            "supported": True,
+            "confidence": "high",
+            "caveat": "Current snapshot looks bad.",
+        }
+
+    monkeypatch.setattr("app.services.self_check.llm_configured", lambda *_a, **_k: True)
+    monkeypatch.setattr("app.services.self_check.complete_json", fake_complete_json)
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary="current DiskPressure context",
+            artifacts=[
+                AlertAnalysisArtifact(
+                    agent="kubernetes",
+                    source="kubernetes",
+                    type="cluster_api",
+                    status="ok",
+                    result={
+                        "observation": {"polarity": "unknown", "coverage": "partial"}
+                    },
+                )
+            ],
+        )
+    ]
+
+    out = _run(refute_top_cause(settings, _top(confidence="high"), results))
+
+    assert out["confidence"] == "medium"
+    assert out["refuted"] is True
+    assert out["next_check"]
+
+
 def test_llm_caveat_and_next_check_are_single_line(monkeypatch):
     settings = replace(make_settings(), llm_model_self_check="m")
 

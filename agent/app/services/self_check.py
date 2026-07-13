@@ -135,12 +135,19 @@ async def refute_top_cause(
                 )
             return _default(confidence)
 
-        supported = bool(verdict.get("supported", True))
+        # The model may use context to explain/refute a hypothesis, but it must
+        # never turn that context into support.  ``has_evidence`` is computed
+        # deterministically from a scoped positive canonical observation (or a
+        # direct alert signature), so it is the upper bound on the verdict.
+        supported = bool(verdict.get("supported", True)) and has_evidence
         masker = _self_check_masker(settings)
         caveat = _one_line(masker.mask_text(str(verdict.get("caveat") or "")), limit=360)
         next_check = _one_line(
             masker.mask_text(str(verdict.get("next_check") or "")), limit=240
         )
+        if not has_evidence:
+            caveat = caveat or _caveat_missing_evidence(family, settings)
+            next_check = next_check or _next_check_missing_evidence(family, settings)
         new_conf = confidence if supported else _downgrade(confidence)
         # Also honour an explicit weaker confidence from the model, never a stronger one.
         model_conf = str(verdict.get("confidence") or "").strip().lower()
@@ -248,7 +255,11 @@ async def _llm_refute(
         "single check would settle it. Do not invent evidence. Be conservative: if the "
         "evidence does not clearly support the cause, mark it unsupported. A condition "
         "name alone is metadata: only condition_checks active=true supports it, while "
-        "active=false is contradicting evidence.\n"
+        "active=false is contradicting evidence. A collector summary and an artifact "
+        "whose observation is unknown/partial are context only: they can refute or "
+        "suggest a next check, but can never support the proposed cause. The \"Specific "
+        "or canonical evidence present\" flag is authoritative; when false, you MUST "
+        "return supported=false.\n"
         f"Write the caveat and next_check in {caveat_lang}. Respond with a JSON object: "
         '{"supported": bool, "confidence": "low|medium|high", "caveat": str, '
         '"next_check": str}. '
