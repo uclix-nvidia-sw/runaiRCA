@@ -68,9 +68,7 @@ def value_from(labels: dict[str, str], annotations: dict[str, str], *keys: str) 
     return ""
 
 
-def target_identifier_from(
-    labels: dict[str, str], annotations: dict[str, str], *keys: str
-) -> str:
+def target_identifier_from(labels: dict[str, str], annotations: dict[str, str], *keys: str) -> str:
     """Return an alert-declared resource identifier safe for probe substitution.
 
     These values are passed through to Kubernetes and query tools.  They are not
@@ -202,6 +200,23 @@ _WORKLOAD_KIND_LABELS = (
     "job_name",
 )
 
+_WORKLOAD_KIND_TYPES = {
+    "daemonset": "DaemonSet",
+    "deployment": "Deployment",
+    "statefulset": "StatefulSet",
+    "replicaset": "ReplicaSet",
+    "cronjob": "CronJob",
+    "job_name": "Job",
+}
+
+
+def _workload_kind_identity(labels: dict[str, str], annotations: dict[str, str]) -> tuple[str, str]:
+    for key in _WORKLOAD_KIND_LABELS:
+        value = value_from(labels, annotations, key)
+        if value:
+            return value, _WORKLOAD_KIND_TYPES[key]
+    return "", ""
+
 
 def resolve_target(
     labels: dict[str, str],
@@ -215,7 +230,10 @@ def resolve_target(
     # If a workload-kind label named the subject, the `pod` label is the KSM
     # exporter — drop it so collectors discover the real workload's pods by name
     # instead of investigating the (healthy) metrics pod.
-    workload_kind_name = value_from(labels, annotations, *_WORKLOAD_KIND_LABELS)
+    workload_kind_name, inferred_workload_type = _workload_kind_identity(labels, annotations)
+    explicit_workload_name = value_from(
+        labels, annotations, "workload", "workload_name", "runai_workload_name"
+    )
     pod = (
         ""
         if workload_kind_name
@@ -226,19 +244,16 @@ def resolve_target(
         project=normalize_project_name(project) if project else project_from_namespace(namespace),
         queue=value_from(labels, annotations, "queue", "runai_queue", "runai.io/queue"),
         namespace=namespace,
-        workload_name=value_from(
-            labels,
-            annotations,
-            "workload",
-            "workload_name",
-            "runai_workload_name",
-            # KSM workload-kind labels name the real subject; consult them before
-            # falling back to the `pod` label (which may be the exporter).
-            *_WORKLOAD_KIND_LABELS,
-            "pod",
+        workload_name=(
+            explicit_workload_name or workload_kind_name or value_from(labels, annotations, "pod")
         ),
-        workload_type=value_from(
-            labels, annotations, "workload_type", "kind", "runai_workload_type"
+        workload_type=(
+            value_from(labels, annotations, "workload_type", "kind", "runai_workload_type")
+            # Infer a Kubernetes controller kind only when that controller label
+            # supplied the workload identity. An explicit Run:ai workload name
+            # may coexist with a lower-level Deployment label and must keep its
+            # own type/identity.
+            or (inferred_workload_type if not explicit_workload_name else "")
         ),
         runai_workload_id=value_from(labels, annotations, "runai_workload_id", "workload_id"),
         node=value_from(labels, annotations, "node", "node_name", "kubernetes_node"),

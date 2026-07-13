@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from dataclasses import replace
 
 import pytest
@@ -288,9 +290,7 @@ async def test_investigation_context_masks_llm_decision_outputs(monkeypatch) -> 
         return {
             "action": "conclude",
             "reason": "api_key=reason-secret-12345",
-            "hypothesis_updates": [
-                {"id": "H1", "evidence_for": ["password=ledger-secret-12345"]}
-            ],
+            "hypothesis_updates": [{"id": "H1", "evidence_for": ["password=ledger-secret-12345"]}],
         }
 
     monkeypatch.setattr("app.services.investigator.complete_json", fake_complete_json)
@@ -411,7 +411,13 @@ async def test_reflection_receives_query_safe_shared_observations(monkeypatch) -
 
     monkeypatch.setattr("app.services.investigator.complete_json", fake_complete_json)
     await investigate(
-        settings, make_target(), _collectors(), InvestigationPlan(), {}, max_steps=3, blackboard=Blackboard()
+        settings,
+        make_target(),
+        _collectors(),
+        InvestigationPlan(),
+        {},
+        max_steps=3,
+        blackboard=Blackboard(),
     )
 
     assert '"shared_observations"' in reflection_prompt
@@ -460,3 +466,25 @@ async def test_collector_exception_does_not_raise(monkeypatch) -> None:
     serialized = str(results)
     assert "collector-boom-secret-12345" not in serialized
     assert "RuntimeError" in serialized
+
+
+@pytest.mark.asyncio
+async def test_expired_shared_budget_returns_placeholder_for_unfinished_collector() -> None:
+    class SlowCollector:
+        async def collect(self, target, plan=None):
+            await asyncio.Event().wait()
+
+    results, context = await investigate(
+        make_settings(),
+        make_target(),
+        [SlowCollector()],
+        InvestigationPlan(),
+        {},
+        max_steps=0,
+        deadline_monotonic=time.monotonic() - 1,
+    )
+
+    assert len(results) == 1
+    assert results[0].status == "unavailable"
+    assert results[0].missing_data == ["slow.analysis_budget"]
+    assert context["reasoning_trace_v2"]["stop_reason"] == "analysis_budget_exhausted"

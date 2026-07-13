@@ -126,6 +126,7 @@ def new_state(
     *,
     collectors: list[object] | None = None,
     runtime_label: str = "fallback",
+    analysis_started_at: float | None = None,
 ) -> PipelineState:
     target = resolve_target(
         request.alert.labels,
@@ -142,7 +143,34 @@ def new_state(
         masker=masker,
         collectors=collectors if collectors is not None else build_collectors(settings),
         runtime_label=runtime_label,
+        analysis_started_at=(
+            analysis_started_at if analysis_started_at is not None else time.monotonic()
+        ),
     )
+
+
+def _finalization_reserve_seconds(total_seconds: int) -> float:
+    """Automatically reserve time for rank/self-check/synthesis/harness.
+
+    At the default 1500s deadline, evidence gathering (investigation plus every
+    drill-down) shares 1200s and finalization keeps 300s. Short test/operator
+    deadlines reserve at most half so evidence still gets a useful window.
+    """
+    if total_seconds <= 0:
+        return 0.0
+    return min(300.0, max(30.0, total_seconds * 0.20), total_seconds * 0.50)
+
+
+def _evidence_deadline_monotonic(state: PipelineState) -> float | None:
+    total = int(getattr(state.settings, "analysis_deadline_seconds", 0) or 0)
+    if total <= 0:
+        return None
+    return state.analysis_started_at + total - _finalization_reserve_seconds(total)
+
+
+def _evidence_budget_exceeded(state: PipelineState) -> bool:
+    deadline = _evidence_deadline_monotonic(state)
+    return deadline is not None and time.monotonic() >= deadline
 
 
 def _aggregate_evidence(state: PipelineState) -> None:
@@ -273,6 +301,8 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
             and _accepts_keyword(investigate, "blackboard")
         ):
             investigation_kwargs["blackboard"] = state.blackboard
+        if _accepts_keyword(investigate, "deadline_monotonic"):
+            investigation_kwargs["deadline_monotonic"] = _evidence_deadline_monotonic(state)
         state.results, state.investigation_context = await investigate(
             settings,
             target,
@@ -342,7 +372,10 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
     try:
         from app.services.drilldown import run_drilldowns
 
-        await run_drilldowns(settings, state.results, target, plan, blackboard=state.blackboard)
+        drilldown_kwargs: dict[str, Any] = {"blackboard": state.blackboard}
+        if _accepts_keyword(run_drilldowns, "deadline_monotonic"):
+            drilldown_kwargs["deadline_monotonic"] = _evidence_deadline_monotonic(state)
+        await run_drilldowns(settings, state.results, target, plan, **drilldown_kwargs)
     except Exception:  # noqa: BLE001 - drill-down is best-effort
         pass
     for r in state.results:
@@ -1655,9 +1688,9 @@ async def _investigate_until_settled(state: PipelineState) -> None:
     while True:
         if not _needs_more_investigation(state):
             break
-        if _deadline_exceeded(state):
+        if _evidence_budget_exceeded(state):
             state.extra_warnings.append(
-                "analysis deadline reached; skipped additional investigation iterations"
+                "shared evidence budget reached; skipped additional investigation iterations"
             )
             _aggregate_evidence(state)
             break
@@ -1778,11 +1811,6 @@ def _next_reanalysis_target(
     return None
 
 
-def _deadline_exceeded(state: PipelineState) -> bool:
-    deadline = int(getattr(state.settings, "analysis_deadline_seconds", 0) or 0)
-    return deadline > 0 and time.monotonic() - state.analysis_started_at >= deadline
-
-
 def _evidence_signature(results: list[CollectorResult]) -> tuple[tuple[object, ...], ...]:
     return tuple(
         sorted(
@@ -1849,6 +1877,8 @@ async def _reanalyze_once(
             and _accepts_keyword(investigate, "blackboard")
         ):
             investigation_kwargs["blackboard"] = state.blackboard
+        if _accepts_keyword(investigate, "deadline_monotonic"):
+            investigation_kwargs["deadline_monotonic"] = _evidence_deadline_monotonic(state)
         fresh, re_context = await investigate(
             state.settings,
             state.target,
@@ -1888,9 +1918,9 @@ async def _reanalyze_once(
                 match_failure_mode_symptoms(state.failure_modes, observed), lifecycle
             ),
         )
-        if _deadline_exceeded(state):
+        if _evidence_budget_exceeded(state):
             state.extra_warnings.append(
-                "analysis deadline reached; skipped additional investigation iterations"
+                "shared evidence budget reached; skipped additional investigation iterations"
             )
             return None
         caveat = ""

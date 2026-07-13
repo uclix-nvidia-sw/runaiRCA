@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -12,6 +13,8 @@ from app.llm import (
     begin_usage_tracking,
     complete_with_error,
     llm_configured,
+    reset_analysis_deadline,
+    set_analysis_deadline,
     usage_with_cost,
 )
 from app.masking import Masker
@@ -112,16 +115,31 @@ class AnalysisOrchestrator:
         graceful degraded report if it overruns rather than hanging."""
         usage = begin_usage_tracking()
         deadline = self._settings.analysis_deadline_seconds
+        started_at = time.monotonic()
+        impl_kwargs = (
+            {"analysis_started_at": started_at}
+            if pipeline._accepts_keyword(self._analyze_impl, "analysis_started_at")
+            else {}
+        )
         if not deadline or deadline <= 0:
-            response = await self._analyze_impl(request)
+            response = await self._analyze_impl(request, **impl_kwargs)
             if isinstance(getattr(response, "context", None), dict):
                 response.context["llm_usage"] = self._usage_context(response, usage)
             return response
+        # Stop LLM transports shortly before the public hard deadline so their
+        # deterministic fallbacks can assemble and return the evidence already
+        # collected instead of losing it to the outer wait_for cancellation.
+        completion_margin = min(20.0, max(2.0, deadline * 0.01))
+        token = set_analysis_deadline(started_at + deadline - completion_margin)
         try:
-            response = await asyncio.wait_for(self._analyze_impl(request), timeout=deadline)
+            response = await asyncio.wait_for(
+                self._analyze_impl(request, **impl_kwargs), timeout=deadline
+            )
         except TimeoutError:  # asyncio.TimeoutError is this builtin on 3.11+
             _log.warning("analysis exceeded the %ss deadline; returning degraded report", deadline)
             response = self._deadline_response(request, deadline)
+        finally:
+            reset_analysis_deadline(token)
         response.context["llm_usage"] = self._usage_context(response, usage)
         return response
 
@@ -165,7 +183,9 @@ class AnalysisOrchestrator:
         )
         return _mask_model(response, AlertAnalysisResponse, self._masker)
 
-    async def _analyze_impl(self, request: AlertAnalysisRequest) -> AlertAnalysisResponse:
+    async def _analyze_impl(
+        self, request: AlertAnalysisRequest, *, analysis_started_at: float | None = None
+    ) -> AlertAnalysisResponse:
         nat_warning = None
         if self._settings.enable_nat_runtime:
             try:
@@ -182,7 +202,12 @@ class AnalysisOrchestrator:
                 else:
                     self._record_engine_ok()
                     return response
-        state = pipeline.new_state(self._settings, request, collectors=self._collectors)
+        state = pipeline.new_state(
+            self._settings,
+            request,
+            collectors=self._collectors,
+            analysis_started_at=analysis_started_at,
+        )
         if nat_warning:
             state.extra_warnings.append(nat_warning)
         return await pipeline.run_pipeline(state)
@@ -206,8 +231,7 @@ class AnalysisOrchestrator:
         top = candidates[0]
         if not isinstance(top, dict) or not str(top.get("family") or "").strip():
             return (
-                "nemo engine returned an incomplete RCA response: "
-                "invalid top root-cause candidate"
+                "nemo engine returned an incomplete RCA response: invalid top root-cause candidate"
             )
         top_context = context.get("top_root_cause")
         if not isinstance(top_context, dict) or top_context.get("family") != top.get("family"):
@@ -230,9 +254,7 @@ class AnalysisOrchestrator:
             if alert.analysis_summary and alert.analysis_summary.strip()
         ]
         summary = (
-            safe(summaries[0], 320)
-            if summaries
-            else f"{len(alerts)} alert(s) were correlated."
+            safe(summaries[0], 320) if summaries else f"{len(alerts)} alert(s) were correlated."
         )
         detail_lines = [
             "## Incident Summary",
@@ -370,8 +392,6 @@ def _append_chat_warning(answer: str, warning: str, language: str = "en") -> str
         if existing in answer:
             return f"{answer}\n- {warning}"
     return "\n".join([answer, "", heading, "", f"- {warning}"])
-
-
 
 
 # Deterministic chat scaffold strings, localized: the operator-facing fallback
