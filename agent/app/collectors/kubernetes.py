@@ -3208,7 +3208,18 @@ async def k8s_followup(
                     if err
                     else f"flowchart follow-up: {res.get('kind')} → HTTP {res.get('status_code')}"
                 ),
-                result=res,
+                result={
+                    **res,
+                    # Flowchart reads are live resource/API state.  Preserve
+                    # them for operator context, but do not imply that a GET
+                    # observed the historical incident condition.
+                    "observation": {
+                        "kind": "kubernetes_followup_read",
+                        "predicate": f"kubernetes:{res.get('kind') or 'followup'}",
+                        "polarity": "unavailable" if err else "unknown",
+                        "coverage": "unknown" if err else "partial",
+                    },
+                },
             )
         )
     return results

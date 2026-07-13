@@ -779,17 +779,31 @@ def _first_result_list(data: object) -> list[object]:
 # The k8s->prometheus branches of the unified debug flowchart, as code: given what
 # the kubernetes collector found, derive the PromQL a human runs next. Runs with or
 # without the LLM. Read-only.
-async def prom_query(settings: Settings, name: str, promql: str) -> dict:
-    """One ad-hoc PromQL instant query; never raises."""
+async def prom_query(
+    settings: Settings, name: str, promql: str, *, time_range: dict[str, str] | None = None
+) -> dict:
+    """One ad-hoc PromQL query, bounded to the incident window when available."""
     if not settings.prometheus_url:
         return {"name": name, "query": promql, "error": "prometheus not configured", "data": None}
     resp = await get_json(
-        base_url=settings.prometheus_url, path="/api/v1/query",
-        timeout_seconds=settings.prometheus_timeout_seconds, params={"query": promql},
+        base_url=settings.prometheus_url,
+        path="/api/v1/query_range" if time_range else "/api/v1/query",
+        timeout_seconds=settings.prometheus_timeout_seconds,
+        params={"query": promql, **time_range, "step": "60"} if time_range else {"query": promql},
     )
+    status = _prometheus_status(resp.data)
+    error = resp.error or _prometheus_api_error(resp.data, status, require_success_status=True)
+    result_data = _prometheus_result(resp.data)
     return {
-        "name": name, "query": promql, "status_code": resp.status_code,
-        "error": resp.error, "data": compact(resp.data, limit=8),
+        "name": name,
+        "query": promql,
+        "status_code": resp.status_code,
+        "status": status,
+        "error": error,
+        "series_count": len(result_data),
+        "sample": compact(result_data, limit=3),
+        "value_summary": _prometheus_value_summary(result_data),
+        **({"time_range": time_range} if time_range else {}),
     }
 
 
@@ -853,8 +867,9 @@ async def prometheus_followup(
     details = getattr(kubernetes_result, "details", {}) or {}
     queries = _prom_followup_queries(details, target)[:max_reads]
     results: list[dict] = []
+    time_range = incident_time_range(target)
     for name, promql in queries:
-        results.append(await prom_query(settings, name, promql))
+        results.append(await prom_query(settings, name, promql, time_range=time_range))
     for res in results:
         err = res.get("error")
         prometheus_result.artifacts.append(
@@ -863,7 +878,20 @@ async def prometheus_followup(
                 status="unavailable" if err else "ok", confidence="medium",
                 query=res.get("query"),
                 summary=(str(err) if err else f"flowchart follow-up: {res.get('name')}"),
-                result=res,
+                result={
+                    **res,
+                    # Follow-ups are correlation probes (for example, an OOM
+                    # clue drives a memory-ratio query).  They use the correct
+                    # historical window but have no universal failure threshold,
+                    # so they remain context until a typed predicate is added.
+                    "observation": {
+                        "kind": "prometheus_followup_query",
+                        "predicate": f"metric:{res.get('name') or 'followup'}",
+                        "polarity": "unavailable" if err else "unknown",
+                        "coverage": "unknown" if err else "partial",
+                        "observation_window": time_range or {},
+                    },
+                },
             )
         )
     return results

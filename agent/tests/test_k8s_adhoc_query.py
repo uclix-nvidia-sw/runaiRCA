@@ -301,7 +301,13 @@ def test_flowchart_followup_pending_pod_pulls_events_quota_pvc(monkeypatch) -> N
     # chained: an unbound PVC pulls the storageclass provisioner next
     assert "storageclasses" in reads
     # each read is attached as a followup_query artifact
-    assert any(a.type == "followup_query" for a in result.artifacts)
+    artifact = next(a for a in result.artifacts if a.type == "followup_query")
+    assert artifact.result["observation"] == {
+        "kind": "kubernetes_followup_read",
+        "predicate": "kubernetes:events",
+        "polarity": "unknown",
+        "coverage": "partial",
+    }
 
 
 def test_flowchart_followup_artifact_query_quotes_namespace(monkeypatch) -> None:

@@ -1310,8 +1310,9 @@ async def test_prometheus_followup_derives_promql_from_k8s_oom(monkeypatch) -> N
 
     fired: list[str] = []
 
-    async def fake_prom_query(settings, name, promql):
+    async def fake_prom_query(settings, name, promql, *, time_range=None):
         fired.append(name)
+        assert time_range
         return {"name": name, "query": promql, "status_code": 200, "error": None, "data": {}}
 
     monkeypatch.setattr(prom_mod, "prom_query", fake_prom_query)
@@ -1326,13 +1327,20 @@ async def test_prometheus_followup_derives_promql_from_k8s_oom(monkeypatch) -> N
         },
     )
     prom = CollectorResult(agent="prometheus", status="ok", summary="p", confidence="medium")
-    target = replace(make_target(), namespace="team-a", pod="trainer-0")
+    target = replace(
+        make_target(),
+        namespace="team-a",
+        pod="trainer-0",
+        fired_at="2026-07-13T09:00:00Z",
+        resolved_at="2026-07-13T09:10:00Z",
+    )
     await prom_mod.prometheus_followup(make_settings(), prom, k8s, target)
 
     assert "oom_working_set_vs_limit" in fired
     assert "oom_growth_shape" in fired
     assert "active_restart_rate" in fired
-    assert any(a.type == "followup_query" for a in prom.artifacts)
+    artifact = next(a for a in prom.artifacts if a.type == "followup_query")
+    assert artifact.result["observation"]["coverage"] == "partial"
 
 
 @pytest.mark.asyncio
