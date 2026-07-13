@@ -92,6 +92,10 @@ type AlertUpsertResult struct {
 	NewIncident    bool
 	NewAlert       bool
 	Changed        bool
+	// IncidentResolved is true only for the state transition that closes the
+	// incident. Alertmanager may retry resolved webhooks, so callers must not
+	// infer this from Alert.Status alone.
+	IncidentResolved bool
 }
 
 type DashboardSnapshot struct {
@@ -453,6 +457,7 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 		}
 	}
 	incident := s.incidents[incidentID]
+	previousIncidentStatus := incident.Status
 	if incident.ArchivedAt != nil {
 		incident.ArchivedAt = nil
 	}
@@ -550,12 +555,13 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	s.persistAlertLocked(record)
 	s.invalidateRecurrenceStatsLocked()
 	return AlertUpsertResult{
-		Incident:       cloneIncident(incident),
-		Alert:          cloneAlert(record),
-		CorrelationKey: key,
-		NewIncident:    newIncident,
-		NewAlert:       newAlert,
-		Changed:        changed,
+		Incident:         cloneIncident(incident),
+		Alert:            cloneAlert(record),
+		CorrelationKey:   key,
+		NewIncident:      newIncident,
+		NewAlert:         newAlert,
+		Changed:          changed,
+		IncidentResolved: previousIncidentStatus != "resolved" && incident.Status == "resolved",
 	}
 }
 
