@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from app.collectors import kubernetes, loki, prometheus
+from app.collectors import kubernetes, loki, prometheus, runai
 from app.collectors.http_json import JsonResponse
 from app.collectors.kubernetes import (
     _collect_pod_logs,
@@ -151,6 +151,29 @@ def test_loki_query_observation_only_refutes_with_a_bounded_incident_window() ->
     assert present["polarity"] == "present"
     assert live_empty["polarity"] == "unknown"
     assert live_empty["coverage"] == "partial"
+
+
+def test_runai_query_observation_requires_identity_scoped_coverage() -> None:
+    target = make_target()
+    present = runai._runai_query_observation(
+        {"name": "workloads", "status_code": 200, "data": {"workloads": [{"name": "trainer"}]}},
+        target=target,
+        used_mcp=True,
+    )
+    missing = runai._runai_query_observation(
+        {"name": "project", "status_code": 404, "error": "HTTP 404", "data": None},
+        target=target,
+        used_mcp=False,
+    )
+    broad_nonmatch = runai._runai_query_observation(
+        {"name": "projects", "status_code": 200, "data": {"projects": [{"name": "other"}]}},
+        target=target,
+        used_mcp=True,
+    )
+
+    assert (present["polarity"], present["coverage"]) == ("present", "scoped")
+    assert (missing["polarity"], missing["coverage"]) == ("absent", "scoped")
+    assert (broad_nonmatch["polarity"], broad_nonmatch["coverage"]) == ("unknown", "partial")
 
 
 @pytest.mark.asyncio

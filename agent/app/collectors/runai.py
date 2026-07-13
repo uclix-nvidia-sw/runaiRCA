@@ -218,6 +218,38 @@ class RunAICollector:
             )
             if insight:
                 summary = insight
+            # A successful API round trip is context, not proof that every
+            # queried Run:ai resource was healthy or even present. Preserve the
+            # aggregate for operators, then emit one constrained observation per
+            # API result so synthesis can distinguish an explicit 404/empty
+            # workload result from a broad, paginated MCP list.
+            collector_observation = {
+                "kind": "runai_collector_summary",
+                "predicate": "runai_collector_summary",
+                "polarity": "unknown",
+                "coverage": "partial",
+            }
+            artifacts = [
+                artifact(
+                    agent=self.name,
+                    source="runai",
+                    type="workload_context",
+                    status=status,
+                    confidence=confidence,
+                    query="; ".join(
+                        str(item.get("path") or item.get("query") or "")
+                        for item in query_results
+                    ),
+                    summary=summary,
+                    result={**details, "observation": collector_observation},
+                )
+            ]
+            artifacts.extend(
+                _runai_query_artifact(
+                    self.name, item, target=target, used_mcp=used_mcp
+                )
+                for item in query_results
+            )
             return CollectorResult(
                 agent=self.name,
                 status=status,
@@ -226,21 +258,7 @@ class RunAICollector:
                 details=details,
                 missing_data=missing,
                 warnings=warnings,
-                artifacts=[
-                    artifact(
-                        agent=self.name,
-                        source="runai",
-                        type="workload_context",
-                        status=status,
-                        confidence=confidence,
-                        query="; ".join(
-                            str(item.get("path") or item.get("query") or "")
-                            for item in query_results
-                        ),
-                        summary=summary,
-                        result=details,
-                    )
-                ],
+                artifacts=artifacts,
             )
 
         details = {
@@ -450,3 +468,125 @@ async def _collect_runai_responses(
 
 def _query_params(values: dict[str, str]) -> dict[str, str]:
     return {key: value for key, value in values.items() if value}
+
+
+def _runai_query_artifact(
+    agent: str,
+    item: dict[str, object],
+    *,
+    target: AnalysisTarget,
+    used_mcp: bool,
+):
+    """Turn one Run:ai API result into a narrowly scoped evidence fact."""
+    observation = _runai_query_observation(item, target=target, used_mcp=used_mcp)
+    name = str(item.get("name") or "resource")
+    polarity = str(observation["polarity"])
+    status = "unavailable" if polarity == "unavailable" else "ok"
+    confidence = "high" if polarity in {"present", "absent"} else "low"
+    if polarity == "present":
+        summary = f"Run:ai {name}: queried target resource was present."
+    elif polarity == "absent":
+        summary = f"{NO_EVIDENCE} Run:ai {name}: queried target resource was absent."
+    else:
+        summary = f"Run:ai {name}: query was unavailable or did not prove target coverage."
+    return artifact(
+        agent=agent,
+        source="runai",
+        type="runai_api_signal",
+        status=status,
+        confidence=confidence,
+        title=f"Run:ai · {name}",
+        query=str(item.get("path") or item.get("query") or ""),
+        summary=summary,
+        result={
+            "observation": observation,
+            "status_code": item.get("status_code"),
+            "data": item.get("data"),
+        },
+    )
+
+
+def _runai_query_observation(
+    item: dict[str, object], *, target: AnalysisTarget, used_mcp: bool
+) -> dict[str, object]:
+    """Classify resource presence without treating a broad list as a negative.
+
+    Direct resource paths and filtered workload lookups are scoped to the
+    alert's identity. MCP's projects/queues calls may be paginated broad lists,
+    so a missing name there remains unknown rather than becoming false evidence.
+    """
+    name = str(item.get("name") or "resource")
+    expected = _runai_expected_identity(name, target)
+    status_code = item.get("status_code")
+    if item.get("error"):
+        if expected and status_code == 404:
+            polarity, coverage = "absent", "scoped"
+        else:
+            polarity, coverage = "unavailable", "unknown"
+    elif name == "version" or not expected:
+        polarity, coverage = "unknown", "partial"
+    elif _runai_data_contains_identity(item.get("data"), expected):
+        polarity, coverage = "present", "scoped"
+    elif _runai_is_explicitly_empty(item.get("data")):
+        # A direct lookup or the MCP workload query is identity-filtered. Broad
+        # MCP inventory calls can be paginated, so even an empty page is not a
+        # reliable statement that the target resource does not exist.
+        if not used_mcp or name == "workloads":
+            polarity, coverage = "absent", "scoped"
+        else:
+            polarity, coverage = "unknown", "partial"
+    elif not used_mcp and name in {"workloads", "workload_by_id", "project", "queue"}:
+        # Direct endpoints use either an exact resource path or the alert's
+        # workload/project/queue filter, so a non-empty successful payload is
+        # evidence that the requested target exists even if its schema varies.
+        polarity, coverage = "present", "scoped"
+    else:
+        polarity, coverage = "unknown", "partial"
+    return {
+        "kind": "runai_api_query",
+        "predicate": f"runai:{name}",
+        "polarity": polarity,
+        "coverage": coverage,
+        "expected_identity": expected,
+        "status_code": status_code,
+    }
+
+
+def _runai_expected_identity(name: str, target: AnalysisTarget) -> str:
+    if name in {"workloads", "workload_by_id"}:
+        return target.runai_workload_id or target.workload_name
+    if name in {"project", "projects"}:
+        return target.project
+    if name in {"queue", "queues"}:
+        return target.queue
+    return ""
+
+
+def _runai_data_contains_identity(data: object, expected: str) -> bool:
+    """Look only at identity-shaped fields; do not keyword-match arbitrary text."""
+    wanted = expected.strip().casefold()
+    if not wanted:
+        return False
+    if isinstance(data, dict):
+        for key, value in data.items():
+            key_name = str(key).replace("_", "").replace("-", "").casefold()
+            if key_name in {
+                "name", "id", "workload name", "workload id", "project name", "queue name"
+            } and str(value).strip().casefold() == wanted:
+                return True
+            if _runai_data_contains_identity(value, expected):
+                return True
+    elif isinstance(data, list):
+        return any(_runai_data_contains_identity(value, expected) for value in data)
+    return False
+
+
+def _runai_is_explicitly_empty(data: object) -> bool:
+    if data is None or data == []:
+        return True
+    if not isinstance(data, dict):
+        return False
+    for key in ("items", "workloads", "projects", "queues", "data", "results"):
+        if key in data and data[key] == []:
+            return True
+    return False

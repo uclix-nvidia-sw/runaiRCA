@@ -1263,6 +1263,11 @@ async def test_runai_collector_uses_mcp_results_when_configured(monkeypatch) -> 
     result = await RunAICollector(settings).collect(make_target())
     assert result.details["runai_version"] == "2.23.60"
     assert any("runai-mcp server" in w for w in result.warnings)
+    workload_signal = next(
+        artifact for artifact in result.artifacts if artifact.type == "runai_api_signal"
+        and artifact.result["observation"]["predicate"] == "runai:workloads"
+    )
+    assert workload_signal.result["observation"]["polarity"] == "present"
 
 
 @pytest.mark.asyncio
