@@ -97,6 +97,10 @@ class EvidenceFact:
     provenance: tuple[tuple[str, str], ...] = ()
     run_id: str = ""
     topology: tuple[str, ...] = ()
+    # A namespaced resource's primary entity remains ``pod:<name>`` for
+    # backwards-compatible ranking, while this scope prevents an identically
+    # named Pod in another namespace from passing eligibility by name alone.
+    entity_scope: tuple[str, ...] = ()
 
     @property
     def evidence_id(self) -> str:
@@ -135,6 +139,7 @@ class EvidenceFact:
             "observed_window": observed_window,
             "observation_window": observed_window,
             "entity": active_masker.mask_text(self.entity),
+            "entity_scope": [active_masker.mask_text(item) for item in self.entity_scope],
             "source": self.source,
             "independence_group": self.independence_group,
             "source_group": self.source_group,
@@ -196,10 +201,17 @@ class EvidenceEligibility:
             ):
                 return cls(False, False, False, "evidence is outside the incident window")
         expected_entities = _context_tokens(context.get("entities"))
-        if expected_entities and fact.entity and not _tokens_overlap(
-            _context_tokens((fact.entity,)), expected_entities
-        ):
-            return cls(False, False, False, "evidence targets a different entity")
+        if expected_entities and fact.entity:
+            observed_entities = _context_tokens((fact.entity, *fact.entity_scope))
+            if not _tokens_overlap(observed_entities, expected_entities):
+                return cls(False, False, False, "evidence targets a different entity")
+            for scope in fact.entity_scope:
+                kind, separator, _ = scope.partition(":")
+                expected_same_kind = tuple(
+                    item for item in expected_entities if separator and item.startswith(f"{kind}:")
+                )
+                if expected_same_kind and scope not in expected_same_kind:
+                    return cls(False, False, False, "evidence conflicts with target entity scope")
         expected_topology = _context_tokens(context.get("topology"))
         if expected_topology and fact.topology and not _tokens_overlap(
             _context_tokens(fact.topology), expected_topology
@@ -619,6 +631,7 @@ def normalize_artifact(
     entity_declared, raw_entity = declared_metadata("observed_entity", "entity")
     if entity_declared:
         resolved_entity = _observed_entity(raw_entity)
+        resolved_entity_scope = _observed_entity_scope(raw_entity)
         if not resolved_entity:
             # An explicit malformed entity is not a license to relabel this
             # observation as the alert target.
@@ -635,10 +648,13 @@ def normalize_artifact(
         # for legacy/context-only artifacts below, but a typed scoped verdict
         # must name what it observed before it can support or refute RCA.
         resolved_entity = ""
+        resolved_entity_scope = ()
         resolved_polarity, resolved_coverage = "unknown", "partial"
     else:
         resolved_entity = entity
+        resolved_entity_scope = ()
     safe_entity = active_masker.mask_text(resolved_entity)
+    safe_entity_scope = tuple(active_masker.mask_text(item) for item in resolved_entity_scope)
     safe_value = _finding_value(safe_summary, safe_highlights, resolved_polarity)
     # Legacy artifacts did not name their predicate. Use structured probe
     # metadata when available, then the artifact type as a bounded fallback.
@@ -665,6 +681,7 @@ def normalize_artifact(
         "timestamp": timestamp,
         "window": [observed_window_start, observed_window_end],
         "entity": safe_entity,
+        "entity_scope": safe_entity_scope,
         "source": source,
         "predicate": resolved_predicate,
         "value": safe_value,
@@ -698,6 +715,7 @@ def normalize_artifact(
         provenance=tuple((key, value) for key, value in safe_provenance if value),
         run_id=resolved_run_id,
         topology=resolved_topology,
+        entity_scope=safe_entity_scope,
     )
 
 
@@ -811,6 +829,22 @@ def _observed_entity(value: object) -> str:
     if isinstance(value, str):
         return _clean_text(value)
     return ""
+
+
+def _observed_entity_scope(value: object) -> tuple[str, ...]:
+    """Retain namespace-like identity facets declared by a collector.
+
+    These facets are not substituted for the primary entity because callers
+    still rank by familiar identities such as ``pod:<name>``.  Eligibility,
+    however, must reject a same-name resource when both sides state different
+    namespaces.
+    """
+    if not isinstance(value, Mapping):
+        return ()
+    namespace = _clean_text(value.get("namespace"))
+    if not namespace:
+        return ()
+    return (f"namespace:{namespace}",)
 
 
 def _relevance(fact: EvidenceFact, hints: tuple[str, ...]) -> int:

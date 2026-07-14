@@ -502,6 +502,42 @@ def test_collector_observed_entity_overrides_seed_target_identity() -> None:
     ).support
 
 
+def test_namespaced_observed_entity_rejects_same_named_pod_in_another_namespace() -> None:
+    fact = normalize_artifact(
+        _artifact(
+            source="kubernetes",
+            summary="trainer-0 was OOMKilled",
+            result={
+                "observation": {
+                    "polarity": "present",
+                    "coverage": "scoped",
+                    "observed_entity": {
+                        "kind": "pod",
+                        "name": "trainer-0",
+                        "namespace": "other-team",
+                    },
+                }
+            },
+        ),
+        observed_window_start="2026-07-13T00:00:00Z",
+        observed_window_end="2026-07-13T00:10:00Z",
+        require_typed_observation=True,
+    )
+
+    eligibility = fact.eligibility.from_fact(
+        fact,
+        context={
+            "window_start": "2026-07-13T00:00:00Z",
+            "window_end": "2026-07-13T00:10:00Z",
+            "entities": ["pod:trainer-0", "namespace:target-team"],
+        },
+    )
+
+    assert fact.entity_scope == ("namespace:other-team",)
+    assert not eligibility.support
+    assert "entity scope" in eligibility.reason
+
+
 def test_precise_artifact_window_wins_and_is_classified_for_causal_review() -> None:
     fact = normalize_artifact(
         {
