@@ -624,6 +624,18 @@ def normalize_artifact(
             # observation as the alert target.
             if resolved_coverage == "scoped":
                 resolved_polarity, resolved_coverage = "unknown", "partial"
+    elif (
+        require_typed_observation
+        and resolved_coverage == "scoped"
+        and resolved_polarity in {"present", "absent"}
+    ):
+        # ``entity`` is pipeline context, not a collector observation.  A
+        # broad query can return a scoped result for another Pod while still
+        # being seeded with this incident's target.  Preserve compatibility
+        # for legacy/context-only artifacts below, but a typed scoped verdict
+        # must name what it observed before it can support or refute RCA.
+        resolved_entity = ""
+        resolved_polarity, resolved_coverage = "unknown", "partial"
     else:
         resolved_entity = entity
     safe_entity = active_masker.mask_text(resolved_entity)

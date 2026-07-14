@@ -192,7 +192,9 @@ class PrometheusCollector:
             )
         ]
         artifacts.extend(
-            _prometheus_query_artifact(self.name, item, time_range=time_range)
+            _prometheus_query_artifact(
+                self.name, item, target=target, time_range=time_range
+            )
             for item in query_results
         )
         return CollectorResult(
@@ -521,9 +523,17 @@ def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
     summaries: list[dict[str, object]] = []
     all_series: list[dict[str, object]] = []
     all_values: list[float] = []
+    observed_label_values: dict[str, set[str]] = {}
+    observed_label_series_counts: dict[str, int] = {}
     for index, item in enumerate(result_data):
         if not isinstance(item, dict):
             continue
+        metric = item.get("metric") if isinstance(item.get("metric"), dict) else {}
+        for key in ("namespace", "pod", "node", "project", "queue"):
+            value = metric.get(key)
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                observed_label_values.setdefault(key, set()).add(str(value).strip())
+                observed_label_series_counts[key] = observed_label_series_counts.get(key, 0) + 1
         samples = _prometheus_samples(item)
         numeric = [value for _, value in samples if value is not None]
         all_values.extend(numeric)
@@ -560,7 +570,6 @@ def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
                 )
         all_series.append(summary)
         if index < 3:
-            metric = item.get("metric") if isinstance(item.get("metric"), dict) else {}
             summary = {
                 **summary,
                 "labels": {
@@ -593,6 +602,14 @@ def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
             for summary in all_series
         ],
         "series_count_observed": len(all_series),
+        # Preserve every returned target-relevant label, not merely the first
+        # three display samples.  RCA scope must be validated against the full
+        # vector: a fourth series for another Pod must not be relabelled as the
+        # alert target by the pipeline fallback.
+        "observed_label_values": {
+            key: sorted(values) for key, values in sorted(observed_label_values.items())
+        },
+        "observed_label_series_counts": dict(sorted(observed_label_series_counts.items())),
         "sample_timestamp_verification_required": True,
         "numeric_sample_count": len(all_values),
     }
@@ -616,10 +633,16 @@ def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
 
 
 def _prometheus_query_artifact(
-    agent: str, item: dict[str, object], *, time_range: dict[str, str] | None
+    agent: str,
+    item: dict[str, object],
+    *,
+    target: AnalysisTarget,
+    time_range: dict[str, str] | None,
 ):
     """Expose one query's verified truth value as an RCA-safe evidence card."""
-    observation = _prometheus_query_observation(item, time_range=time_range)
+    observation = _prometheus_query_observation(
+        item, target=target, time_range=time_range
+    )
     name = str(item.get("name") or "metric")
     polarity = str(observation["polarity"])
     status = "unavailable" if polarity == "unavailable" else "ok"
@@ -682,7 +705,10 @@ def _has_prometheus_samples(
 
 
 def _prometheus_query_observation(
-    item: dict[str, object], *, time_range: dict[str, str] | None
+    item: dict[str, object],
+    *,
+    time_range: dict[str, str] | None,
+    target: AnalysisTarget | None = None,
 ) -> dict[str, object]:
     """Classify output without treating a non-empty all-zero vector as a failure."""
     name = str(item.get("name") or "metric")
@@ -747,6 +773,21 @@ def _prometheus_query_observation(
             polarity, coverage = "absent", "scoped"
         else:
             polarity, coverage = "present", "scoped"
+    observed_entity: dict[str, str] | None = None
+    target_scope_verified: bool | None = None
+    if target is not None and polarity in {"present", "absent"}:
+        observed_entity, target_scope_verified = _prometheus_target_scope(
+            name,
+            summary,
+            target,
+            has_series=bool(int(item.get("series_count") or 0)),
+        )
+        if target_scope_verified is not True:
+            # The selector we sent is not proof that the proxy returned only
+            # that selector.  Require labels from every non-empty series before
+            # treating it as evidence for this incident; otherwise a broad or
+            # misrouted response would inherit the pipeline's alert entity.
+            polarity, coverage = "unknown", "partial"
     observation = {
         "kind": "prometheus_query",
         "predicate": f"metric:{name}",
@@ -761,11 +802,74 @@ def _prometheus_query_observation(
         "observation_window": time_range or {},
         "sample_window_verified": sample_window_verified,
     }
+    if observed_entity:
+        observation["observed_entity"] = observed_entity
+    if target_scope_verified is not None:
+        observation["target_scope_verified"] = target_scope_verified
     if polarity == "present":
         evidence_window = _prometheus_evidence_window(summary, time_range)
         if evidence_window:
             observation["evidence_window"] = evidence_window
     return observation
+
+
+def _prometheus_target_scope(
+    name: str,
+    value_summary: dict[str, object],
+    target: AnalysisTarget,
+    *,
+    has_series: bool,
+) -> tuple[dict[str, str] | None, bool | None]:
+    """Return the explicitly queried entity only when response labels prove it.
+
+    Empty vectors are valid responses to the collector's fixed, target-scoped
+    PromQL templates, so their absence can retain that query scope.  Non-empty
+    vectors must carry exactly the requested target labels; the request text
+    alone is not enough because a datasource proxy can ignore or rewrite it.
+    Unknown/ad-hoc metric names intentionally return ``None`` and keep their
+    existing context-only semantics.
+    """
+    requirements: tuple[tuple[str, str], ...]
+    entity: dict[str, str]
+    if name in {"container_memory", "container_cpu", "container_restarts"}:
+        if not (target.namespace and target.pod):
+            return None, False
+        requirements = (("namespace", target.namespace), ("pod", target.pod))
+        entity = {"kind": "pod", "name": target.pod}
+    elif name in {"namespace_pending_pods", "namespace_restarts"}:
+        if not target.namespace:
+            return None, False
+        requirements = (("namespace", target.namespace),)
+        entity = {"kind": "namespace", "name": target.namespace}
+    elif name.startswith("runai_queue_"):
+        if not target.queue:
+            return None, False
+        requirements = (("queue", target.queue),)
+        entity = {"kind": "queue", "name": target.queue}
+    elif name.startswith("runai_project_"):
+        if not target.project:
+            return None, False
+        requirements = (("project", target.project),)
+        entity = {"kind": "project", "name": target.project}
+    else:
+        return None, None
+
+    if not has_series:
+        return entity, True
+    labels = value_summary.get("observed_label_values")
+    label_counts = value_summary.get("observed_label_series_counts")
+    series_count = int(value_summary.get("series_count_observed") or 0)
+    if not isinstance(labels, dict) or not isinstance(label_counts, dict) or series_count <= 0:
+        return None, False
+    for label, expected in requirements:
+        values = labels.get(label)
+        if (
+            not isinstance(values, list)
+            or int(label_counts.get(label) or 0) != series_count
+            or {str(value).strip() for value in values} != {expected}
+        ):
+            return None, False
+    return entity, True
 
 
 def _prometheus_evidence_window(

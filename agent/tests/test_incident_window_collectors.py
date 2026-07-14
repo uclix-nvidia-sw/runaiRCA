@@ -192,6 +192,78 @@ async def test_prometheus_records_zero_and_peak_values_for_evidence(monkeypatch)
     assert summary["series"][0]["nonzero_sample_count"] == 1
 
 
+@pytest.mark.asyncio
+async def test_prometheus_rejects_mismatched_series_labels_as_target_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proxy's broad vector must not inherit the alert Pod's identity."""
+
+    async def fake_get_json(**_kwargs):
+        return JsonResponse(
+            url="http://prometheus/api/v1/query_range",
+            status_code=200,
+            data={
+                "status": "success",
+                "data": {
+                    "result": [
+                        {
+                            "metric": {"namespace": "another-ns", "pod": "another-pod"},
+                            "values": [
+                                ["2026-07-10T01:02:00Z", "1"],
+                                ["2026-07-10T01:03:00Z", "2"],
+                            ],
+                        }
+                    ]
+                },
+            },
+        )
+
+    monkeypatch.setattr(prometheus, "get_json", fake_get_json)
+    target = replace(
+        make_target(),
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    result = await prometheus.PrometheusCollector(
+        replace(make_settings(), prometheus_url="http://prometheus")
+    ).collect(target)
+
+    restarts = next(
+        artifact
+        for artifact in result.artifacts
+        if artifact.result.get("observation", {}).get("predicate") == "metric:container_restarts"
+    )
+    observation = restarts.result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert observation["target_scope_verified"] is False
+    assert "observed_entity" not in observation
+
+
+def test_prometheus_declares_verified_pod_provenance_for_matching_series() -> None:
+    window = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    summary = prometheus._prometheus_value_summary(
+        [
+            {
+                "metric": {"namespace": "runai-vision", "pod": "trainer-0"},
+                "values": [
+                    ["2026-07-10T01:02:00Z", "1"],
+                    ["2026-07-10T01:03:00Z", "2"],
+                ],
+            }
+        ]
+    )
+
+    observation = prometheus._prometheus_query_observation(
+        {"name": "container_restarts", "series_count": 1, "value_summary": summary},
+        target=make_target(),
+        time_range=window,
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
+    assert observation["target_scope_verified"] is True
+    assert observation["observed_entity"] == {"kind": "pod", "name": "trainer-0"}
+
+
 def test_prometheus_query_observation_keeps_zero_as_refuting_evidence() -> None:
     absent = prometheus._prometheus_query_observation(
         {

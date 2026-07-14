@@ -265,6 +265,44 @@ def test_malformed_declared_scope_is_not_relabelled_as_alert_target() -> None:
     assert not eligibility.support
 
 
+def test_typed_scoped_artifact_without_observed_entity_cannot_inherit_alert_target() -> None:
+    """Pipeline target context must not turn a broad result into Pod evidence."""
+    item = _artifact(
+        source="kubernetes",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observation_window": {
+                    "start": "2026-07-13T00:00:00Z",
+                    "end": "2026-07-13T00:10:00Z",
+                },
+            }
+        },
+    )
+    board = Blackboard(run_id="run-a")
+
+    [fact] = board.add_result(
+        "kubernetes",
+        CollectorResult(agent="kubernetes", status="ok", summary=item.summary or "", artifacts=[item]),
+        entity="pod:trainer-0",
+        observed_window_start="2026-07-13T00:00:00Z",
+        observed_window_end="2026-07-13T00:10:00Z",
+    )
+
+    assert fact.entity == ""
+    assert (fact.polarity, fact.coverage) == ("unknown", "partial")
+    assert not fact.eligibility.from_fact(
+        fact,
+        context={
+            "run_id": "run-a",
+            "window_start": "2026-07-13T00:00:00Z",
+            "window_end": "2026-07-13T00:10:00Z",
+            "entities": ["pod:trainer-0"],
+        },
+    ).support
+
+
 def test_response_local_evidence_alias_does_not_change_fact_identity() -> None:
     item = _artifact(agent="kubernetes", source="kubernetes", summary="Pod trainer-0 is Evicted.")
     board = Blackboard()

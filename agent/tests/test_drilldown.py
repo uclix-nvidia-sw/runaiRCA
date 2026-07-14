@@ -102,7 +102,13 @@ def test_drilldown_blackboard_records_the_incident_window() -> None:
                 status="ok",
                 confidence="high",
                 summary="Pod train-1-0 remained Pending during the incident.",
-                result={"observation": {"polarity": "present", "coverage": "scoped"}},
+                    result={
+                        "observation": {
+                            "polarity": "present",
+                            "coverage": "scoped",
+                            "observed_entity": {"kind": "workload_name", "name": "train-1"},
+                        }
+                    },
             )
         ],
     )

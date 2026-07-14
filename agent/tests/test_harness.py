@@ -51,11 +51,20 @@ def _result(agent: str, summary: str = "NVRM Xid 79") -> CollectorResult:
     )
 
 
+def _scoped_observation(polarity: str = "present") -> dict[str, object]:
+    """A synthetic RCA fact must name the resource it observed."""
+    return {
+        "polarity": polarity,
+        "coverage": "scoped",
+        "observed_entity": {"kind": "pod", "name": "trainer-0"},
+    }
+
+
 def test_trace_repair_uses_response_local_evidence_ids() -> None:
     results = [_result("loki"), _result("system")]
     for result in results:
         result.artifacts[0].result = {
-            "observation": {"polarity": "present", "coverage": "scoped"}
+            "observation": _scoped_observation()
         }
     assign_evidence_ids(results)
     response = _response()
@@ -80,7 +89,7 @@ def test_trace_repair_uses_response_local_evidence_ids() -> None:
 def test_trace_exposes_structured_evidence_verdicts() -> None:
     results = [_result("prometheus", "restart counter did not change")]
     results[0].artifacts[0].result = {
-        "observation": {"polarity": "present", "coverage": "scoped"}
+        "observation": _scoped_observation()
     }
     assign_evidence_ids(results)
     response = _response()
@@ -114,7 +123,7 @@ def test_trace_does_not_promote_loose_result_fields_to_scoped_evidence() -> None
 def test_legacy_agent_fallback_excludes_partial_evidence_from_support() -> None:
     scoped = _result("loki", "OOMKilled occurred during the incident")
     scoped.artifacts[0].result = {
-        "observation": {"polarity": "present", "coverage": "scoped"}
+        "observation": _scoped_observation()
     }
     partial = _result("prometheus", "current memory usage is high")
     partial.artifacts[0].result = {
@@ -174,11 +183,11 @@ def test_high_confidence_query_replicas_do_not_receive_full_calibration_score() 
         status="ok",
         confidence="high",
         summary="NVRM Xid 79",
-        result={"observation": {"polarity": "present", "coverage": "scoped"}},
+        result={"observation": _scoped_observation()},
     )
     result.artifacts.extend([replica])
     result.artifacts[0].result = {
-        "observation": {"polarity": "present", "coverage": "scoped"}
+        "observation": _scoped_observation()
     }
     assign_evidence_ids([result])
 
@@ -210,10 +219,10 @@ def test_safety_guardrail_covers_a_long_report() -> None:
 def test_typed_evidence_links_preserve_contradicting_evidence() -> None:
     results = [_result("loki"), _result("system", "GPU remains healthy")]
     results[0].artifacts[0].result = {
-        "observation": {"polarity": "present", "coverage": "scoped"}
+        "observation": _scoped_observation()
     }
     results[1].artifacts[0].result = {
-        "observation": {"polarity": "absent", "coverage": "scoped"}
+        "observation": _scoped_observation("absent")
     }
     assign_evidence_ids(results)
     response = _response("## Root Cause\n\nLikely Xid [E01] despite the counter-signal [E02].")

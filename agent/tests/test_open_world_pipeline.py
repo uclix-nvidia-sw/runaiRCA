@@ -34,7 +34,13 @@ def test_open_world_ledger_maps_private_facts_to_response_evidence_ids() -> None
         confidence="high",
         summary="PVC attach repeatedly conflicts on node gpu-01.",
         highlights=["attach conflict"],
-        result={"observation": {"polarity": "present", "coverage": "scoped"}},
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "namespace", "name": "runai"},
+            }
+        },
     )
     second = artifact(
         agent="loki",
@@ -44,7 +50,13 @@ def test_open_world_ledger_maps_private_facts_to_response_evidence_ids() -> None
         confidence="high",
         summary="CSI controller reports a stale attach operation.",
         highlights=["stale attach"],
-        result={"observation": {"polarity": "present", "coverage": "scoped"}},
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "namespace", "name": "runai"},
+            }
+        },
     )
     state.results = [
         CollectorResult(
@@ -242,7 +254,13 @@ def test_reasoning_trace_v3_contains_only_public_eligible_evidence_links() -> No
         status="ok",
         confidence="high",
         summary="FailedMount for claim data",
-        result={"observation": {"polarity": "present", "coverage": "scoped"}},
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "pod", "name": "trainer-0"},
+            }
+        },
     )
     unavailable = artifact(
         agent="loki",
