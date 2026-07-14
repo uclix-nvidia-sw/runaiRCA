@@ -11,6 +11,7 @@ from app.collectors.base import (
     artifact,
     incident_time_range,
     ko_en,
+    parse_incident_time,
 )
 from app.collectors.loki import _llm_insight
 from app.config import Settings
@@ -207,11 +208,16 @@ async def _postgres_result(
         int(item.get("target_matching_rows") or 0)
         for item in history_tables
         if isinstance(item, dict)
+        and item.get("target_correlation_available")
+        and item.get("target_aggregate_verified")
     )
     history_match_tables = sum(
         1
         for item in history_tables
-        if isinstance(item, dict) and item.get("target_matching_rows")
+        if isinstance(item, dict)
+        and item.get("target_correlation_available")
+        and item.get("target_aggregate_verified")
+        and item.get("target_matching_rows")
     )
     missing_tables = [name for name, exists in rca_tables.items() if not exists]
     status = "ok"
@@ -738,6 +744,31 @@ def _history_target_aggregate_query(
     )
 
 
+def _verified_target_aggregate(
+    aggregate: object, time_range: dict[str, str] | None
+) -> tuple[int, bool]:
+    """Decode a target aggregate without converting malformed data to absence."""
+    if not isinstance(aggregate, dict) or not time_range:
+        return 0, False
+    raw_count = aggregate.get("matching_rows")
+    try:
+        count = int(raw_count)
+    except (TypeError, ValueError):
+        return 0, False
+    if count < 0:
+        return 0, False
+    if count == 0:
+        return 0, True
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    first = parse_incident_time(aggregate.get("first_event_at"))
+    last = parse_incident_time(aggregate.get("last_event_at"))
+    if None in (start, end, first, last):
+        return count, False
+    assert start is not None and end is not None and first is not None and last is not None
+    return count, start <= first <= last <= end
+
+
 async def _collect_incident_history_direct(conn: Any, target: AnalysisTarget) -> dict[str, Any]:
     history = _empty_incident_history(target)
     time_range = history["time_range"]
@@ -775,6 +806,7 @@ async def _collect_incident_history_direct(conn: Any, target: AnalysisTarget) ->
                 _record_to_dict(row)
                 for row in await conn.fetch(query, time_range["start"], time_range["end"], *parameters)
             ]
+        target_matches, target_verified = _verified_target_aggregate(target_aggregate, time_range)
         tables.append(
             {
                 **table,
@@ -783,10 +815,12 @@ async def _collect_incident_history_direct(conn: Any, target: AnalysisTarget) ->
                 "last_event_at": aggregate.get("last_event_at"),
                 "rows": row_dicts,
                 "target_correlation_available": target_aggregate_query is not None,
-                "target_matching_rows": int(target_aggregate.get("matching_rows") or 0),
+                "target_matching_rows": target_matches,
+                "target_aggregate_verified": target_verified,
                 "target_first_event_at": target_aggregate.get("first_event_at"),
                 "target_last_event_at": target_aggregate.get("last_event_at"),
                 "target_rows": target_rows,
+                "target_rows_truncated": target_verified and target_matches > len(target_rows),
             }
         )
     history["tables"] = tables
@@ -820,6 +854,7 @@ async def _collect_incident_history_mcp(
             target_aggregate = aggregate_rows[0] if aggregate_rows else {}
             query, _ = target_query
             target_rows = await _mcp_fetch(settings, query)
+        target_matches, target_verified = _verified_target_aggregate(target_aggregate, time_range)
         tables.append(
             {
                 **table,
@@ -828,10 +863,12 @@ async def _collect_incident_history_mcp(
                 "last_event_at": aggregate.get("last_event_at"),
                 "rows": rows,
                 "target_correlation_available": target_aggregate_query is not None,
-                "target_matching_rows": int(target_aggregate.get("matching_rows") or 0),
+                "target_matching_rows": target_matches,
+                "target_aggregate_verified": target_verified,
                 "target_first_event_at": target_aggregate.get("first_event_at"),
                 "target_last_event_at": target_aggregate.get("last_event_at"),
                 "target_rows": target_rows,
+                "target_rows_truncated": target_verified and target_matches > len(target_rows),
             }
         )
     history["tables"] = tables
@@ -987,7 +1024,8 @@ def _postgres_history_artifacts(
         name = str(table.get("table") or "history")
         matches = int(table.get("target_matching_rows") or 0)
         correlated = bool(table.get("target_correlation_available"))
-        if not time_range or not correlated:
+        aggregate_verified = bool(table.get("target_aggregate_verified"))
+        if not time_range or not correlated or not aggregate_verified:
             polarity, coverage = "unknown", "partial"
         elif matches:
             polarity, coverage = "present", "scoped"
@@ -1028,6 +1066,7 @@ def _postgres_history_artifacts(
                     },
                     "target_matching_rows": matches,
                     "target_rows": table.get("target_rows") or [],
+                    "target_rows_truncated": bool(table.get("target_rows_truncated")),
                     "time_range": time_range,
                 },
             )

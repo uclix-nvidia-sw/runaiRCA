@@ -20,6 +20,7 @@ from app.collectors.kubernetes import (
 from app.collectors.postgres import (
     _collect_postgres_checks,
     _history_target_aggregate_query,
+    _postgres_history_artifacts,
     _postgres_result,
 )
 from tests.test_orchestrator import make_settings, make_target
@@ -1003,17 +1004,19 @@ async def test_postgres_reads_only_timestamped_audit_history_in_incident_window(
                     "workload_name": "trainer",
                 }
             ],
-            "target_correlation_available": True,
-            "target_matching_rows": 1,
+                "target_correlation_available": True,
+                "target_matching_rows": 1,
+                "target_aggregate_verified": True,
             "target_first_event_at": "2026-07-10T01:02:00Z",
             "target_last_event_at": "2026-07-10T01:02:00Z",
-            "target_rows": [
+                "target_rows": [
                 {
                     "event_time": "2026-07-10T01:02:00Z",
                     "action": "evicted",
                     "workload_name": "trainer",
                 }
-            ],
+                ],
+                "target_rows_truncated": False,
         }
     ]
 
@@ -1175,9 +1178,10 @@ async def test_postgres_history_evidence_requires_target_identity() -> None:
                 {
                     "schema": "audit",
                     "table": "workload_history",
-                    "target_correlation_available": True,
-                    "target_matching_rows": 0,
-                    "target_rows": [],
+                        "target_correlation_available": True,
+                        "target_matching_rows": 0,
+                        "target_aggregate_verified": True,
+                        "target_rows": [],
                 },
                 {
                     "schema": "audit",
@@ -1201,3 +1205,28 @@ async def test_postgres_history_evidence_requires_target_identity() -> None:
 
     assert observations["postgres_history:audit.workload_history"]["polarity"] == "absent"
     assert observations["postgres_history:audit.unattributed_history"]["polarity"] == "unknown"
+
+
+def test_postgres_history_malformed_target_aggregate_is_not_scoped_absence() -> None:
+    target = replace(
+        make_target(), fired_at="2026-07-10T01:00:00Z", resolved_at="2026-07-10T01:10:00Z"
+    )
+    artifacts = _postgres_history_artifacts(
+        target,
+        {
+            "time_range": {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"},
+            "tables": [
+                {
+                    "schema": "audit",
+                    "table": "workload_history",
+                    "target_correlation_available": True,
+                    "target_matching_rows": 0,
+                    "target_aggregate_verified": False,
+                    "target_rows": [],
+                }
+            ],
+        },
+    )
+
+    observation = artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
