@@ -466,10 +466,19 @@ def test_runai_query_observation_requires_identity_scoped_coverage() -> None:
         target=target,
         used_mcp=True,
     )
+    direct_workload_nonmatch = runai._runai_query_observation(
+        {"name": "workloads", "status_code": 200, "data": {"workloads": [{"name": "other"}]}},
+        target=target,
+        used_mcp=False,
+    )
 
     assert (present["polarity"], present["coverage"]) == ("present", "scoped")
     assert (missing["polarity"], missing["coverage"]) == ("absent", "scoped")
     assert (broad_nonmatch["polarity"], broad_nonmatch["coverage"]) == ("unknown", "partial")
+    assert (direct_workload_nonmatch["polarity"], direct_workload_nonmatch["coverage"]) == (
+        "unknown",
+        "partial",
+    )
 
 
 def test_runai_current_resource_state_is_context_for_historical_incident() -> None:

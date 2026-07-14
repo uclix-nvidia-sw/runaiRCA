@@ -543,10 +543,10 @@ def _runai_query_observation(
             polarity, coverage = "absent", "scoped"
         else:
             polarity, coverage = "unknown", "partial"
-    elif not used_mcp and name in {"workloads", "workload_by_id", "project", "queue"}:
-        # Direct endpoints use either an exact resource path or the alert's
-        # workload/project/queue filter, so a non-empty successful payload is
-        # evidence that the requested target exists even if its schema varies.
+    elif not used_mcp and name in {"workload_by_id", "project", "queue"}:
+        # These direct endpoints are exact resource paths. A workloads response
+        # is a filtered list and must still contain the requested identity: API
+        # versions/proxies can silently ignore its filter parameters.
         polarity, coverage = "present", "scoped"
     else:
         polarity, coverage = "unknown", "partial"
