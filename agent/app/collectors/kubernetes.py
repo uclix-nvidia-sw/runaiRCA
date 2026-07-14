@@ -1419,14 +1419,17 @@ def _warning_event_observation(
 
 
 def _warning_event_queries_complete(responses: list[dict[str, object]]) -> bool:
-    """Whether every Event list included in this evidence pass returned successfully."""
+    """Whether every Event list completed without an omitted next page."""
     event_responses = [
         response
         for response in responses
         if str(response.get("name") or "") in {"pod_events", "namespace_events"}
         or str(response.get("name") or "").startswith("runai_control_plane_events:")
     ]
-    return bool(event_responses) and all(not response.get("error") for response in event_responses)
+    return bool(event_responses) and all(
+        not response.get("error") and response.get("list_complete", True)
+        for response in event_responses
+    )
 
 
 def _pod_log_artifact(
@@ -1585,6 +1588,7 @@ async def _collect_kubernetes_responses(
                 "url": response.url,
                 "status_code": response.status_code,
                 "error": response.error,
+                "list_complete": _kubernetes_list_complete(response.data),
                 "data": compact(_filter_kubernetes_data(name, response.data, target), limit=5),
             }
         )
@@ -1745,6 +1749,7 @@ def _mcp_k8s_response(
         "url": path,
         "status_code": 200,
         "error": None,
+        "list_complete": _kubernetes_list_complete(normalized),
         "data": compact(_filter_kubernetes_data(name, normalized, target), limit=5),
     }
 
@@ -1764,6 +1769,21 @@ def _normalize_k8s_payload(data: object) -> object:
         if isinstance(value, dict):
             return value
     return data
+
+
+def _kubernetes_list_complete(data: object) -> bool:
+    """Return false when a Kubernetes list response advertises another page.
+
+    Both the direct client and resources_list MCP tools may return a normal 200
+    response with ``metadata.continue``. The display projection intentionally
+    drops metadata, so preserve this bit before filtering to prevent an empty
+    first page from becoming a false incident-window absence verdict.
+    """
+    payload = _normalize_k8s_payload(data)
+    if not isinstance(payload, dict):
+        return True
+    metadata = payload.get("metadata")
+    return not (isinstance(metadata, dict) and bool(metadata.get("continue")))
 
 
 async def _k8s_mcp_json(

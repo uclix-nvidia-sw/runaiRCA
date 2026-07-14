@@ -10,6 +10,7 @@ from app.collectors.kubernetes import (
     _collect_pod_logs,
     _event_matches_target,
     _filter_kubernetes_data,
+    _kubernetes_list_complete,
     _pod_log_observation,
     _warning_event_observation,
     _warning_event_queries_complete,
@@ -543,9 +544,15 @@ def test_kubernetes_warning_event_absence_requires_all_event_queries_to_succeed(
             {"name": "runai_control_plane_events:runai", "error": "HTTP 403"},
         ]
     )
+    paginated = _warning_event_queries_complete(
+        [{"name": "pod_events", "error": None, "list_complete": False}]
+    )
 
     assert complete is True
     assert incomplete is False
+    assert paginated is False
+    assert _kubernetes_list_complete({"items": [], "metadata": {"continue": "next"}}) is False
+    assert _kubernetes_list_complete({"items": [], "metadata": {}}) is True
 
 
 class _HistoryConnection:
