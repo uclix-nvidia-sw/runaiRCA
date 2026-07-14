@@ -25,6 +25,7 @@ from app.collectors.base import (
     AnalysisTarget,
     CollectorResult,
     artifact,
+    incident_time_range,
     kubernetes_salient_markers,
     signals_line,
 )
@@ -46,6 +47,13 @@ from app.services.evidence_blackboard import source_independence_group
 
 _LEDGER_STATUSES = {"open", "testing", "supported", "refuted", "uncertain"}
 _USER_PROMPT_CHARS = 8000
+
+
+def _incident_window_for_target(target: object) -> dict[str, str] | None:
+    """Best-effort window for compatibility collectors/tests with loose targets."""
+    if not isinstance(target, AnalysisTarget):
+        return None
+    return incident_time_range(target)
 
 
 def _budget_remaining(deadline_monotonic: float | None) -> float | None:
@@ -215,25 +223,38 @@ def _adhoc_query_repr(item: dict) -> str:
     )
 
 
-async def _run_adhoc_kubernetes_query(settings: Settings, query: dict) -> dict:
+async def _run_adhoc_kubernetes_query(
+    settings: Settings,
+    query: dict,
+    *,
+    time_range: dict[str, str] | None = None,
+) -> dict:
     """Promote a named Pod read to full MCP-backed YAML + describe evidence."""
     kind = str(query.get("kind") or "")
     namespace = str(query.get("namespace") or "")
     name = str(query.get("name") or "")
     if resolve_read_kind(kind) == "pods" and name:
-        described = await k8s_describe(settings, "pods", namespace=namespace, name=name)
+        described = await k8s_describe(
+            settings,
+            "pods",
+            namespace=namespace,
+            name=name,
+            time_range=time_range,
+        )
         return {
             **described,
             "operation": "describe",
             "data": {"object": described.get("object"), "events": described.get("events")},
+            **({"time_range": time_range} if time_range else {}),
         }
-    return await k8s_read(
+    read = await k8s_read(
         settings,
         kind,
         namespace=namespace,
         name=name,
         label_selector=str(query.get("label_selector") or ""),
     )
+    return {**read, **({"time_range": time_range} if time_range else {})}
 
 
 def _evidence_summary(evidence: dict[str, CollectorResult]) -> list[dict]:
@@ -715,7 +736,11 @@ async def investigate(
                 adhoc.append(
                     await _within_budget(
                         deadline_monotonic,
-                        lambda q=q: _run_adhoc_kubernetes_query(settings, q),
+                        lambda q=q: _run_adhoc_kubernetes_query(
+                            settings,
+                            q,
+                            time_range=_incident_window_for_target(target),
+                        ),
                     )
                 )
             ran_queries_last_step = bool(wanted)
@@ -837,7 +862,11 @@ async def investigate(
                     adhoc.append(
                         await _within_budget(
                             deadline_monotonic,
-                            lambda query=query: _run_adhoc_kubernetes_query(settings, query),
+                            lambda query=query: _run_adhoc_kubernetes_query(
+                                settings,
+                                query,
+                                time_range=_incident_window_for_target(target),
+                            ),
                         )
                     )
         if reporter:
@@ -924,7 +953,20 @@ async def investigate(
                     ),
                     highlights=markers or None,
                     summary=summary,
-                    result=item,
+                    result={
+                        **item,
+                        # Full YAML/describe is valuable operator context, but
+                        # it is a current snapshot. Its filtered events retain
+                        # the incident window separately; the combined ad-hoc
+                        # artifact must never become automatic RCA support.
+                        "observation": {
+                            "kind": "kubernetes_adhoc_query",
+                            "predicate": "kubernetes_adhoc_query",
+                            "polarity": "unavailable" if error else "unknown",
+                            "coverage": "unknown" if error else "partial",
+                            "observation_window": item.get("time_range") or {},
+                        },
+                    },
                 )
             )
         _record_blackboard(blackboard, "kubernetes", kubernetes_result, target)

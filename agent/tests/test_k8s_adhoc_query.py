@@ -317,6 +317,28 @@ async def test_investigator_promotes_named_pod_query_to_describe(monkeypatch) ->
         "kubectl get pod worker-0 -n team-a -o yaml; "
         "kubectl describe pod worker-0 -n team-a"
     )
+    assert artifact.result["observation"]["polarity"] == "unknown"
+    assert artifact.result["observation"]["coverage"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_named_pod_adhoc_describe_passes_incident_window(monkeypatch) -> None:
+    seen_time_range = None
+
+    async def fake_describe(_settings, kind, *, namespace="", name="", time_range=None):
+        nonlocal seen_time_range
+        seen_time_range = time_range
+        return {"kind": kind, "namespace": namespace, "name": name, "error": None}
+
+    monkeypatch.setattr(investigator, "k8s_describe", fake_describe)
+    time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    await investigator._run_adhoc_kubernetes_query(
+        make_settings(),
+        {"kind": "pods", "namespace": "team-a", "name": "worker-0"},
+        time_range=time_range,
+    )
+
+    assert seen_time_range == time_range
 
 
 def test_flowchart_followup_pending_pod_pulls_events_quota_pvc(monkeypatch) -> None:
