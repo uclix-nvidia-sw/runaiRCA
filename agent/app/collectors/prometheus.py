@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from datetime import UTC, datetime
 from typing import Any
 
 from app.collectors.base import (
@@ -11,6 +12,7 @@ from app.collectors.base import (
     artifact,
     incident_time_range,
     ko_en,
+    parse_incident_time,
 )
 from app.collectors.http_json import compact, get_json
 from app.collectors.loki import _llm_insight
@@ -117,7 +119,7 @@ class PrometheusCollector:
                 self._settings, queries, warnings, time_range=time_range
             )
 
-        _annotate_capacity_gap_coverage(query_results)
+        _annotate_capacity_gap_coverage(query_results, time_range=time_range)
 
         successful = [item for item in query_results if not item["error"]]
         populated = [
@@ -585,7 +587,9 @@ def _prometheus_query_artifact(
     )
 
 
-def _annotate_capacity_gap_coverage(query_results: list[dict[str, object]]) -> None:
+def _annotate_capacity_gap_coverage(
+    query_results: list[dict[str, object]], *, time_range: dict[str, str] | None = None
+) -> None:
     """Allow a capacity-gap absence only when both operands were observed."""
     by_name = {str(item.get("name") or ""): item for item in query_results}
     for scope in ("queue", "project"):
@@ -595,17 +599,22 @@ def _annotate_capacity_gap_coverage(query_results: list[dict[str, object]]) -> N
         if gap is None:
             continue
         gap["capacity_sources_available"] = all(
-            _has_prometheus_samples(item) for item in (requested, allocated)
+            _has_prometheus_samples(item, time_range=time_range)
+            for item in (requested, allocated)
         )
 
 
-def _has_prometheus_samples(item: object) -> bool:
+def _has_prometheus_samples(
+    item: object, *, time_range: dict[str, str] | None = None
+) -> bool:
     if not isinstance(item, dict) or item.get("error"):
         return False
     if int(item.get("series_count") or 0) == 0:
         return False
     summary = item.get("value_summary")
-    return isinstance(summary, dict) and int(summary.get("numeric_sample_count") or 0) > 0
+    if not isinstance(summary, dict) or int(summary.get("numeric_sample_count") or 0) <= 0:
+        return False
+    return _prometheus_samples_in_window(summary, time_range) is not False
 
 
 def _prometheus_query_observation(
@@ -613,18 +622,23 @@ def _prometheus_query_observation(
 ) -> dict[str, object]:
     """Classify output without treating a non-empty all-zero vector as a failure."""
     name = str(item.get("name") or "metric")
+    value_summary = item.get("value_summary")
+    summary = value_summary if isinstance(value_summary, dict) else {}
     if item.get("error"):
         polarity, coverage = "unavailable", "unknown"
     else:
         series_count = int(item.get("series_count") or 0)
-        value_summary = item.get("value_summary")
-        summary = value_summary if isinstance(value_summary, dict) else {}
         numeric_count = int(summary.get("numeric_sample_count") or 0)
         all_zero = summary.get("all_zero")
         if not time_range:
             # An unbounded/current metric lookup can help an operator, but it
             # cannot prove a signal was absent (or causal) during a historical
             # incident. Keep every such answer as context-only.
+            polarity, coverage = "unknown", "partial"
+        elif _prometheus_samples_in_window(summary, time_range) is False:
+            # Grafana MCP/proxies can accept a range-shaped request but return
+            # a current instant vector. Never relabel that live sample as
+            # incident evidence merely because the client requested a window.
             polarity, coverage = "unknown", "partial"
         elif name in _CONTEXT_ONLY_METRICS:
             polarity, coverage = "unknown", "partial"
@@ -680,7 +694,46 @@ def _prometheus_query_observation(
             else 0
         ),
         "observation_window": time_range or {},
+        "sample_window_verified": _prometheus_samples_in_window(summary, time_range),
     }
+
+
+def _prometheus_samples_in_window(
+    value_summary: dict[str, object], time_range: dict[str, str] | None
+) -> bool | None:
+    """Return whether reported sample timestamps intersect the requested window.
+
+    ``None`` preserves compatibility with legacy/stub responses that do not
+    expose timestamps. A definite out-of-window timestamp is enough to reject
+    a supposedly historical query, which catches instant-query fallbacks.
+    """
+    if not time_range:
+        return None
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return None
+    timestamps: list[datetime] = []
+    series = value_summary.get("series")
+    for item in series if isinstance(series, list) else []:
+        if not isinstance(item, dict):
+            continue
+        for key in ("first_timestamp", "last_timestamp"):
+            parsed = _parse_prometheus_timestamp(item.get(key))
+            if parsed is not None:
+                timestamps.append(parsed)
+    if not timestamps:
+        return None
+    return any(start <= timestamp <= end for timestamp in timestamps)
+
+
+def _parse_prometheus_timestamp(value: object) -> datetime | None:
+    if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip()):
+        try:
+            return datetime.fromtimestamp(float(value), tz=UTC)
+        except (OverflowError, TypeError, ValueError):
+            pass
+    return parse_incident_time(value)
 
 
 def _prometheus_samples(item: dict[str, object]) -> list[tuple[str, float | None]]:

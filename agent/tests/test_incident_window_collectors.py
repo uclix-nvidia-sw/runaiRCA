@@ -174,6 +174,30 @@ def test_prometheus_query_observation_keeps_zero_as_refuting_evidence() -> None:
     assert present["polarity"] == "present"
 
 
+def test_prometheus_out_of_window_sample_is_not_incident_evidence() -> None:
+    window = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    observation = prometheus._prometheus_query_observation(
+        {
+            "name": "node_memory_pressure",
+            "series_count": 1,
+            "value_summary": {
+                "numeric_sample_count": 1,
+                "all_zero": False,
+                "series": [
+                    {
+                        "first_timestamp": "2026-07-13T09:26:12Z",
+                        "last_timestamp": "2026-07-13T09:26:12Z",
+                    }
+                ],
+            },
+        },
+        time_range=window,
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert observation["sample_window_verified"] is False
+
+
 def test_prometheus_up_marks_a_mixed_vector_with_any_down_target_present() -> None:
     up_failure = prometheus._prometheus_query_observation(
         {
