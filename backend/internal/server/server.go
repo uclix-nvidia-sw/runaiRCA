@@ -492,6 +492,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleKnowledgeRuntimeSnapshot(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/knowledge/probe-metrics":
 		s.handleProbeMetrics(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/knowledge/families":
+		s.handleRootCauseFamilies(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/v1/knowledge-candidates") || strings.HasPrefix(r.URL.Path, "/api/v1/knowledge-packages"):
 		s.handleKnowledge(w, r)
 	case (r.Method == http.MethodGet || r.Method == http.MethodPut) &&

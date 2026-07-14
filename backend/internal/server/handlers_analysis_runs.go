@@ -30,7 +30,16 @@ func (s *Server) handleAnalysisRunEvaluation(w http.ResponseWriter, r *http.Requ
 		if req.Author == "" {
 			req.Author = r.URL.Query().Get("author")
 		}
-		review, ok, err := s.store.UpsertEvaluationReview(runID, req)
+		var allowedFamilies []string
+		if strings.TrimSpace(req.ExpectedFamily) != "" && strings.TrimSpace(req.CaseType) != "novel" {
+			catalog, err := s.fetchRootCauseFamilyCatalog(r.Context())
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, "root-cause family catalog unavailable")
+				return
+			}
+			allowedFamilies = catalog.Families
+		}
+		review, ok, err := s.store.UpsertEvaluationReview(runID, req, allowedFamilies)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return

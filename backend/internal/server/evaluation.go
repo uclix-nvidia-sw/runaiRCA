@@ -66,7 +66,7 @@ func currentAnalysisHash(run *AnalysisRun) string {
 	return hash
 }
 
-func normalizeEvaluationRequest(req EvaluationReviewRequest) (EvaluationReviewRequest, error) {
+func normalizeEvaluationRequest(req EvaluationReviewRequest, allowedFamilies []string) (EvaluationReviewRequest, error) {
 	req.Author = feedbackActor(req.Author)
 	req.AnalysisHash = strings.TrimSpace(req.AnalysisHash)
 	req.CaseType = strings.TrimSpace(req.CaseType)
@@ -79,6 +79,11 @@ func normalizeEvaluationRequest(req EvaluationReviewRequest) (EvaluationReviewRe
 	}
 	if !mapContains([]string{"known", "compositional", "novel", "tool_degraded"}, req.CaseType) {
 		return req, errors.New("invalid case_type")
+	}
+	if req.CaseType == "novel" {
+		req.ExpectedFamily = ""
+	} else if req.ExpectedFamily != "" && !mapContains(allowedFamilies, req.ExpectedFamily) {
+		return req, errors.New("expected_family must be selected from the root-cause family catalog")
 	}
 	if req.ResolutionOutcome == "" {
 		req.ResolutionOutcome = "unknown"
@@ -151,8 +156,8 @@ func (s *Store) EvaluationForRun(runID, author string) (EvaluationView, bool) {
 	return view, true
 }
 
-func (s *Store) UpsertEvaluationReview(runID string, req EvaluationReviewRequest) (EvaluationReview, bool, error) {
-	req, err := normalizeEvaluationRequest(req)
+func (s *Store) UpsertEvaluationReview(runID string, req EvaluationReviewRequest, allowedFamilies []string) (EvaluationReview, bool, error) {
+	req, err := normalizeEvaluationRequest(req, allowedFamilies)
 	if err != nil {
 		return EvaluationReview{}, false, err
 	}
