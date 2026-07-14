@@ -290,6 +290,44 @@ def test_eligibility_requires_an_observation_window_for_historical_support() -> 
     assert "window is missing" in eligibility.reason
 
 
+def test_collector_observed_entity_overrides_seed_target_identity() -> None:
+    board = Blackboard()
+    facts = board.add_result(
+        "kubernetes",
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary="other-worker-0 was OOMKilled",
+            artifacts=[
+                _artifact(
+                    source="kubernetes",
+                    summary="other-worker-0 was OOMKilled",
+                    result={
+                        "observation": {
+                            "polarity": "present",
+                            "coverage": "scoped",
+                            "observed_entity": {"kind": "Pod", "name": "other-worker-0"},
+                        }
+                    },
+                )
+            ],
+        ),
+        entity="pod:trainer-0",
+        observed_window_start="2026-07-13T00:00:00Z",
+        observed_window_end="2026-07-13T00:10:00Z",
+    )
+
+    assert facts[0].entity == "pod:other-worker-0"
+    assert not facts[0].eligibility.from_fact(
+        facts[0],
+        context={
+            "window_start": "2026-07-13T00:00:00Z",
+            "window_end": "2026-07-13T00:10:00Z",
+            "entities": ["pod:trainer-0"],
+        },
+    ).support
+
+
 def test_precise_artifact_window_wins_and_is_classified_for_causal_review() -> None:
     fact = normalize_artifact(
         {

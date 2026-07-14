@@ -524,7 +524,12 @@ def normalize_artifact(
     active_masker = masker or build_masker(())
     safe_summary = active_masker.mask_text(summary)
     safe_highlights = tuple(active_masker.mask_text(item) for item in highlights)
-    safe_entity = active_masker.mask_text(entity)
+    # A collector can name the resource it actually observed. Preserve that
+    # identity instead of relabelling every artifact as the alert target during
+    # blackboard seeding; otherwise an unrelated namespace observation can
+    # pass the later entity-compatibility gate as target evidence.
+    resolved_entity = _observed_entity(metadata("observed_entity") or metadata("entity")) or entity
+    safe_entity = active_masker.mask_text(resolved_entity)
     safe_value = _finding_value(safe_summary, safe_highlights, resolved_polarity)
     # Legacy artifacts did not name their predicate. Use structured probe
     # metadata when available, then the artifact type as a bounded fallback.
@@ -671,6 +676,17 @@ def _artifact_identity(raw: Mapping[str, Any]) -> str:
         for key in ("agent", "source", "type", "status", "summary", "highlights")
     }
     return stable_fact_id(identity)
+
+
+def _observed_entity(value: object) -> str:
+    """Canonicalize a collector-declared resource identity for fact matching."""
+    if isinstance(value, Mapping):
+        kind = _clean_text(value.get("kind") or value.get("type"))
+        name = _clean_text(value.get("name") or value.get("id"))
+        if kind and name:
+            return f"{kind.casefold()}:{name}"
+        return ""
+    return _clean_text(value)
 
 
 def _relevance(fact: EvidenceFact, hints: tuple[str, ...]) -> int:
