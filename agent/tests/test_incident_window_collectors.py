@@ -671,6 +671,7 @@ async def test_kubernetes_logs_use_incident_since_time_and_previous_restart_log(
     assert len(logs) == 2
     assert all(call["params"]["sinceTime"] == "2026-07-10T00:55:00Z" for call in calls)
     assert [call["params"].get("previous") for call in calls] == [None, "true"]
+    assert all(log["source_verified"] is True for log in logs)
 
 
 def test_kubernetes_pod_log_evidence_uses_only_timestamped_incident_lines() -> None:
@@ -696,6 +697,25 @@ def test_kubernetes_pod_log_evidence_uses_only_timestamped_incident_lines() -> N
     assert entries == [{"timestamp": "2026-07-10T01:02:00Z", "line": "OOMKilled"}]
     assert (unknown["polarity"], unknown["coverage"]) == ("unknown", "partial")
     assert no_entries == []
+
+
+def test_unverified_mcp_pod_logs_are_context_not_scoped_evidence() -> None:
+    time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    observation, entries = _pod_log_observation(
+        {
+            "container": "main",
+            "source_verified": False,
+            "lines": ["2026-07-10T01:02:00Z OOMKilled"],
+        },
+        time_range=time_range,
+    )
+
+    # A raw MCP pods_log reply may not identify which Pod emitted this line.
+    # Keep the timestamped context for the operator but never attribute it to
+    # the alert Pod as a fully scoped causal observation.
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert observation["source_verified"] is False
+    assert entries == [{"timestamp": "2026-07-10T01:02:00Z", "line": "OOMKilled"}]
 
 
 def test_kubernetes_events_are_filtered_to_the_incident_window() -> None:

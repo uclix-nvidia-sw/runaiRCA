@@ -141,6 +141,22 @@ def test_k8s_read_refuses_unlisted_kind_without_calling_api(monkeypatch) -> None
     assert "allowlist" in out["error"]
 
 
+@pytest.mark.asyncio
+async def test_mcp_named_read_rejects_a_different_resource(monkeypatch) -> None:
+    async def fake_mcp_json(_settings, _candidates):
+        return {"metadata": {"name": "other-pod", "namespace": "team-a"}}
+
+    monkeypatch.setattr(k8s, "_k8s_mcp_json", fake_mcp_json)
+    with pytest.raises(RuntimeError, match="did not return the requested resource"):
+        await k8s._k8s_read_via_mcp(
+            replace(make_settings(), kubernetes_mcp_url="http://kubernetes-mcp/mcp"),
+            "pods",
+            namespace="team-a",
+            name="worker-0",
+            full_object=True,
+        )
+
+
 def test_k8s_describe_uses_mcp_full_pod_and_filters_its_events(monkeypatch) -> None:
     calls: list[str] = []
 

@@ -419,13 +419,19 @@ async def k8s_logs(
             result = await _k8s_mcp_result(
                 settings, [("pods_log", args), ("pods_log", {**args, "pod": pod})]
             )
-            lines = _log_lines(mcp_tool_text(result) or mcp_tool_json(result))
+            raw = mcp_tool_json(result)
+            lines = _log_lines(mcp_tool_text(result) or raw)
             return {
                 "namespace": namespace,
                 "pod": pod,
                 "container": container,
                 "previous": previous,
                 "since_time": since_time or None,
+                # A plain-text MCP reply has no object identity.  It is still
+                # useful operator context, but must not become scoped causal
+                # evidence for the requested Pod unless the response itself
+                # proves which Pod/namespace produced it.
+                "source_verified": _mcp_pod_log_source_verified(raw, namespace, pod),
                 "status_code": 200,
                 "error": None,
                 "lines": lines,
@@ -465,6 +471,8 @@ async def k8s_logs(
         "container": container,
         "previous": previous,
         "since_time": since_time or None,
+        # The direct API path is an exact /namespaces/{ns}/pods/{pod}/log URL.
+        "source_verified": True,
         "status_code": response.status_code,
         "error": response.error,
         "lines": _log_lines(response.data),
@@ -815,6 +823,19 @@ async def _k8s_read_via_mcp(
             fallback_args["labelSelector"] = label_selector
         candidates.append(("resources_list", fallback_args))
     data = await _k8s_mcp_json(settings, candidates)
+    if name and not _mcp_named_resource_matches(
+        data,
+        expected_name=name,
+        expected_namespace=namespace,
+    ):
+        # MCP servers can accept a resources_get/pods_get call while silently
+        # ignoring its name or namespace.  Never treat another resource's YAML
+        # as the alert object; raise so k8s_read performs its exact direct-API
+        # fallback instead.
+        raise RuntimeError(
+            "Kubernetes MCP named read did not return the requested resource "
+            f"{namespace}/{name}"
+        )
     if not name and label_selector:
         # Belt and suspenders: an MCP server may ACCEPT labelSelector and still
         # ignore it — enforce equality selectors client-side.
@@ -830,6 +851,46 @@ async def _k8s_read_via_mcp(
         "error": None,
         "data": safe_data if full_object else compact(safe_data, limit=8),
     }
+
+
+def _mcp_named_resource_matches(
+    data: object, *, expected_name: str, expected_namespace: str
+) -> bool:
+    """Whether a named MCP get proves it returned the requested object.
+
+    A list wrapper, an object without metadata, or omitted namespace metadata
+    for a namespaced request is deliberately unverified.  The direct API
+    fallback has endpoint-level identity, so rejecting weak MCP replies loses
+    no safe diagnostic path.
+    """
+    payload = _normalize_k8s_payload(data)
+    if not isinstance(payload, dict) or isinstance(payload.get("items"), list):
+        return False
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict) or str(metadata.get("name") or "") != expected_name:
+        return False
+    if expected_namespace and str(metadata.get("namespace") or "") != expected_namespace:
+        return False
+    return True
+
+
+def _mcp_pod_log_source_verified(data: object, namespace: str, pod: str) -> bool:
+    """Whether an MCP log reply itself names the requested Pod.
+
+    pods_log commonly returns raw log text.  Call arguments alone are not
+    evidence that the server honored them, so raw text is intentionally not a
+    source-verified observation.  Structured adapters may include either
+    metadata.name/namespace or top-level name/pod + namespace fields.
+    """
+    payload = _normalize_k8s_payload(data)
+    if not isinstance(payload, dict):
+        return False
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    observed_name = str(
+        metadata.get("name") or payload.get("pod") or payload.get("name") or ""
+    )
+    observed_namespace = str(metadata.get("namespace") or payload.get("namespace") or "")
+    return observed_name == pod and observed_namespace == namespace
 
 
 def _apply_label_selector(data: object, selector: str) -> object:
@@ -1541,6 +1602,12 @@ def _pod_log_observation(
     """Return only time-bounded log lines; logs API tails never prove absence."""
     if log.get("error"):
         polarity, coverage, entries = "unavailable", "unknown", []
+    elif log.get("source_verified") is False:
+        # An MCP text response that does not identify its Pod may contain a
+        # real failure line, but cannot be attributed to this incident's
+        # entity. Keep it visible as context, never scoped causal support.
+        polarity, coverage = "unknown", "partial"
+        entries = _log_entries_in_window(log.get("lines"), time_range or {})
     elif not time_range:
         polarity, coverage, entries = "unknown", "partial", []
     else:
@@ -1557,6 +1624,7 @@ def _pod_log_observation(
             "polarity": polarity,
             "coverage": coverage,
             "previous": bool(log.get("previous")),
+            "source_verified": log.get("source_verified") is not False,
             "observation_window": time_range or {},
         },
         entries,
@@ -2264,6 +2332,7 @@ async def _collect_resolved_pod_logs(
                     "container": container,
                     "previous": previous,
                     "since_time": since_time or None,
+                    "source_verified": item.get("source_verified") is True,
                     "status_code": item.get("status_code"),
                     "error": item.get("error"),
                     "lines": item.get("lines") or [],
@@ -2610,6 +2679,7 @@ async def _collect_pod_logs(
                     "container": container,
                     "previous": previous,
                     "since_time": since_time or None,
+                    "source_verified": True,
                     "status_code": response.status_code,
                     "error": response.error,
                     "lines": _log_lines(response.data),
@@ -2669,6 +2739,9 @@ async def _collect_pod_logs_via_mcp(
                     "container": container,
                     "previous": previous,
                     "since_time": since_time or None,
+                    "source_verified": _mcp_pod_log_source_verified(
+                        data, target.namespace, target.pod
+                    ),
                     "status_code": 200,
                     "error": None,
                     "lines": lines,
