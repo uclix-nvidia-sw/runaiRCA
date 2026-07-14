@@ -14,6 +14,7 @@ from app.schemas import AlertAnalysisArtifact
 from app.services import drilldown
 from app.services.drilldown import _tool_runai_get, run_drilldowns
 from app.services.evidence_blackboard import Blackboard
+from app.services.root_cause_ranking import _artifact_is_evidence
 from tests.test_orchestrator import make_settings
 
 
@@ -125,6 +126,38 @@ def test_drilldown_appends_tagged_artifacts_and_stops_on_done(monkeypatch) -> No
     assert seen_args == [{"kind": "events", "namespace": "runai-vision"}]
     assert [a.type for a in result.artifacts] == ["drilldown_query"]
     assert result.artifacts[0].status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_partial_drilldown_result_cannot_be_promoted_by_failure_keywords() -> None:
+    async def partial_tool(settings, target, args):
+        return {
+            "summary": "FailedMount appeared in a current event tail",
+            "polarity": "present",
+            "coverage": "partial",
+            "result": {"events": [{"reason": "FailedMount"}]},
+        }
+
+    result = _k8s_result()
+    await drilldown._run_query(
+        drill_settings(),
+        result,
+        {"partial_tool": {"call": partial_tool}},
+        _target(),
+        None,
+        {"tool": "partial_tool", "args": {}},
+        [],
+        drilldown._drilldown_masker(drill_settings()),
+    )
+
+    artifact = result.artifacts[0]
+    assert artifact.result["observation"] == {
+        "kind": "drilldown_query",
+        "predicate": "partial_tool",
+        "polarity": "present",
+        "coverage": "partial",
+    }
+    assert not _artifact_is_evidence(artifact)
 
 
 def test_drilldown_prompts_redact_sensitive_evidence(monkeypatch) -> None:

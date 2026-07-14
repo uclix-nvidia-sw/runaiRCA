@@ -320,6 +320,7 @@ async def _run_query(
     summary = str(outcome.get("summary") or error or name)
     if markers:
         summary = f"{summary} — {signals_line(markers, getattr(settings, 'language', 'en'))}"
+    artifact_result = _typed_artifact_result(outcome, error=error, tool=name, artifact_type=artifact_type)
     result.artifacts.append(
         artifact(
             agent=result.agent,
@@ -331,7 +332,7 @@ async def _run_query(
             title=outcome.get("title"),
             highlights=markers or None,
             summary=summary,
-            result=outcome.get("result"),
+            result=artifact_result,
         )
     )
     if artifact_type == "ontology_probe" and isinstance(probe, dict):
@@ -342,6 +343,44 @@ async def _run_query(
             if evidence_id := str(getattr(stored_artifact, "evidence_id", "") or ""):
                 assessments[-1]["evidence_ids"] = [evidence_id]
     _record_blackboard(blackboard, result, target)
+
+
+def _typed_artifact_result(
+    outcome: dict[str, Any], *, error: object, tool: str, artifact_type: str
+) -> dict[str, Any]:
+    """Keep a drilldown tool's verdict attached to its displayed result.
+
+    Tool adapters sometimes put ``polarity``/``coverage`` beside ``result``.
+    Dropping that envelope makes a partial current-state observation look like
+    an unstructured successful artifact, which legacy ranking treats as proof.
+    Unknown is the safe default for adapters that have not yet declared a
+    bounded observation contract.
+    """
+    raw_result = outcome.get("result")
+    payload = dict(raw_result) if isinstance(raw_result, dict) else {"data": raw_result}
+    observation = payload.get("observation")
+    if not isinstance(observation, dict):
+        top_level_observation = outcome.get("observation")
+        observation = dict(top_level_observation) if isinstance(top_level_observation, dict) else {}
+    polarity = str(observation.get("polarity") or outcome.get("polarity") or "").lower()
+    coverage = str(observation.get("coverage") or outcome.get("coverage") or "").lower()
+    if polarity not in {"present", "absent", "unknown", "unavailable"}:
+        polarity = "unavailable" if error else "unknown"
+    if coverage not in {"scoped", "partial", "unknown"}:
+        coverage = "unknown" if polarity == "unavailable" else "partial"
+    observation = {
+        **observation,
+        "kind": str(observation.get("kind") or artifact_type),
+        "predicate": str(observation.get("predicate") or outcome.get("predicate") or tool),
+        "polarity": polarity,
+        "coverage": coverage,
+    }
+    if "observation_window" not in observation and isinstance(
+        outcome.get("observation_window"), dict
+    ):
+        observation["observation_window"] = outcome["observation_window"]
+    payload["observation"] = observation
+    return payload
 
 
 _PROBE_PLACEHOLDER = re.compile(r"{{([a-zA-Z_][a-zA-Z0-9_]*)}}")
