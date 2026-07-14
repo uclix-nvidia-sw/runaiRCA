@@ -7,7 +7,7 @@ from dataclasses import replace
 
 import pytest
 
-from app.collectors.base import CollectorResult
+from app.collectors.base import CollectorResult, artifact
 from app.plan import InvestigationPlan
 from app.services.evidence_blackboard import Blackboard
 from app.services.investigator import (
@@ -185,6 +185,127 @@ def test_repeated_collector_probes_retain_both_artifact_sets() -> None:
     assert "Ready" in merged.summary
     assert merged.artifacts == [*first.artifacts, *second.artifacts]
     assert merged.details["probe_results"][-1]["summary"] == "node gpu-01 is Ready"
+
+
+def test_successful_followup_clears_resolved_collector_gap() -> None:
+    first = CollectorResult(
+        agent="loki",
+        status="unavailable",
+        summary="datasource lookup failed",
+        missing_data=["loki.query"],
+        warnings=["invalid datasource uid"],
+    )
+    second = CollectorResult(
+        agent="loki",
+        status="ok",
+        summary="scheduler log confirms FailedScheduling",
+        artifacts=[{"scope": "historical-window", "summary": "FailedScheduling"}],
+    )
+
+    merged = _merge_collector_results(first, second)
+
+    assert merged.status == "ok"
+    assert merged.missing_data == []
+    assert merged.artifacts == second.artifacts
+    assert [probe["status"] for probe in merged.details["probe_results"]] == [
+        "unavailable",
+        "ok",
+    ]
+
+
+def test_same_scope_success_clears_only_that_scope_gap() -> None:
+    first = CollectorResult(
+        agent="loki",
+        status="unavailable",
+        summary="historical pod query failed",
+        missing_data=["loki.pod_history"],
+    )
+    second = CollectorResult(
+        agent="loki",
+        status="ok",
+        summary="historical pod query succeeded",
+    )
+
+    merged = _merge_collector_results(
+        first,
+        second,
+        previous_scope={"namespace": "runai", "pod": "trainer-0"},
+        current_scope={"namespace": "runai", "pod": "trainer-0"},
+    )
+
+    assert merged.status == "ok"
+    assert merged.missing_data == []
+
+
+def test_different_scope_success_keeps_unresolved_scope_gap() -> None:
+    first = CollectorResult(
+        agent="loki",
+        status="unavailable",
+        summary="historical pod query failed",
+        missing_data=["loki.pod_history"],
+    )
+    second = CollectorResult(
+        agent="loki",
+        status="ok",
+        summary="node query succeeded",
+    )
+
+    merged = _merge_collector_results(
+        first,
+        second,
+        previous_scope={"namespace": "runai", "pod": "trainer-0"},
+        current_scope={"node": "gpu-01"},
+    )
+
+    assert merged.status == "partial"
+    assert merged.missing_data == ["loki.pod_history"]
+    assert [probe["scope"] for probe in merged.details["probe_results"]] == [
+        {"namespace": "runai", "pod": "trainer-0"},
+        {"node": "gpu-01"},
+    ]
+
+
+def test_artifact_merge_dedupes_response_local_evidence_ids() -> None:
+    first_card = artifact(
+        agent="loki",
+        source="loki",
+        type="logql_signal",
+        status="ok",
+        confidence="high",
+        summary="NVRM Xid 79",
+        result={"observation": {"polarity": "present", "coverage": "scoped"}},
+    )
+    first_card.evidence_id = "E01"
+    duplicate = first_card.model_copy(update={"evidence_id": "E47"})
+
+    merged = _merge_collector_results(
+        CollectorResult(agent="loki", status="ok", summary="first", artifacts=[first_card]),
+        CollectorResult(agent="loki", status="ok", summary="again", artifacts=[duplicate]),
+    )
+
+    assert merged.artifacts == [first_card]
+
+
+def test_failed_followup_keeps_prior_evidence_but_is_not_reported_ok() -> None:
+    first = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="pod event confirms FailedScheduling",
+        artifacts=[{"scope": "pod", "summary": "FailedScheduling"}],
+    )
+    second = CollectorResult(
+        agent="kubernetes",
+        status="unavailable",
+        summary="node follow-up denied",
+        missing_data=["kubernetes.node"],
+        artifacts=[{"scope": "pod", "summary": "FailedScheduling"}],
+    )
+
+    merged = _merge_collector_results(first, second)
+
+    assert merged.status == "partial"
+    assert merged.missing_data == ["kubernetes.node"]
+    assert merged.artifacts == first.artifacts
 
 
 def test_failed_adhoc_result_is_not_replayed_as_prompt_evidence() -> None:

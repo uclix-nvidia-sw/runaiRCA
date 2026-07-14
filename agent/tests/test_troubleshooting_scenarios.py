@@ -247,12 +247,13 @@ async def test_nat_and_direct_keep_generic_noise_insufficient() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("alertname", "summary", "expected", "forbidden_actions"),
+    ("alertname", "summary", "expected", "has_typed_support", "forbidden_actions"),
     [
         (
             "NVIDIA Run:ai Agent Cluster Info Push Rate Low",
             "Traceback torch.cuda.OutOfMemoryError: CUDA out of memory while allocating tensor",
             "workload_runtime_error",
+            False,
             ("cluster-sync", "network connectivity between cluster and control plane"),
         ),
         (
@@ -260,14 +261,16 @@ async def test_nat_and_direct_keep_generic_noise_insufficient() -> None:
             "ErrImagePull: dial tcp: lookup registry.airgap.local: no such host "
             "while pulling image",
             "image_pull_error",
+            True,
             ("project-controller", "kubectl get project"),
         ),
     ],
 )
-async def test_misleading_alert_catalog_actions_are_withheld_without_scoped_evidence(
+async def test_misleading_alert_catalog_does_not_override_observed_failure(
     alertname: str,
     summary: str,
     expected: str,
+    has_typed_support: bool,
     forbidden_actions: tuple[str, ...],
 ) -> None:
     direct = AnalysisOrchestrator(replace(make_settings(), enable_nat_runtime=False))
@@ -279,7 +282,9 @@ async def test_misleading_alert_catalog_actions_are_withheld_without_scoped_evid
         for response in (await direct.analyze(request), await nat.analyze(request)):
             actions = _actions_section(response)
             assert _top_family(response) == expected
-            assert "Not enough evidence for concrete actions yet" in actions
+            assert (
+                "Not enough evidence for concrete actions yet" not in actions
+            ) is has_typed_support
             for forbidden in forbidden_actions:
                 assert forbidden not in actions
     finally:
@@ -687,6 +692,8 @@ async def test_refuting_one_xid_keeps_other_supported_xids(monkeypatch) -> None:
     )
 
     assert _top_family(response) == "gpu_hardware_error"
-    assert "Not enough evidence for concrete actions yet" in response.analysis_detail
-    assert "reset the NVLink fabric" not in response.analysis_detail
+    # XID 74 remains an explicit, typed alert observation after XID 45 is
+    # refuted, so its code-specific action is still evidence-backed.
+    assert "Not enough evidence for concrete actions yet" not in response.analysis_detail
+    assert "reset the NVLink fabric" in response.analysis_detail
     assert "do not use app-crash fix" not in response.analysis_detail

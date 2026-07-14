@@ -20,7 +20,12 @@ from typing import Any
 
 from app.collectors.base import NO_EVIDENCE, CollectorResult
 from app.schemas import AlertAnalysisResponse
-from app.services.root_cause_ranking import RankedCause
+from app.services.root_cause_ranking import (
+    FAMILIES,
+    RankedCause,
+    artifact_contradicts_family,
+    artifact_supports_family,
+)
 
 _USABLE = {"ok", "partial"}
 _DANGEROUS_ACTION = re.compile(
@@ -170,6 +175,14 @@ def evaluate(
     family = str(getattr(top, "family", "") or "")
     agents = set(getattr(top, "evidence_agents", []) or []) if top else set()
     agent_supporting = [item for agent in agents for item in by_agent.get(agent, [])]
+    if _signature_support(top):
+        # Signature promotion is logical provenance, not a physical collector.
+        # XID and curated signatures can arrive from Alertmanager, Loki,
+        # Kubernetes, or the system agent.  Claim semantics below are the
+        # authoritative boundary, so consider every family-relevant card here.
+        agent_supporting.extend(
+            item for item in usable if artifact_supports_family(family, item)
+        )
     agent_supporting = _unique_artifacts(agent_supporting)
     all_artifacts = [item for result in results for item in result.artifacts]
     all_ids = [
@@ -177,6 +190,7 @@ def evaluate(
         for item in all_artifacts
         if getattr(item, "evidence_id", "")
     ]
+    by_id = {str(getattr(item, "evidence_id", "")): item for item in all_artifacts}
     # ``None`` means this standalone harness caller has no blackboard context,
     # so derive typed artifact eligibility locally.  An explicitly supplied
     # (including empty) map is authoritative and must remain fail-closed for
@@ -190,6 +204,27 @@ def evaluate(
     links, link_errors = validate_evidence_links(
         supplied_links, all_ids, eligibility_by_id=eligibility_by_id
     )
+    if family in FAMILIES:
+        semantically_valid: list[EvidenceLink] = []
+        for link in links:
+            artifact = by_id.get(link.fact_id)
+            if artifact is not None:
+                if link.role == "support" and not artifact_supports_family(
+                    family, artifact
+                ):
+                    link_errors.append(
+                        f"link to {link.fact_id!r} does not support root-cause family {family!r}"
+                    )
+                    continue
+                if link.role == "contradict" and not artifact_contradicts_family(
+                    family, artifact
+                ):
+                    link_errors.append(
+                        f"link to {link.fact_id!r} does not contradict root-cause family {family!r}"
+                    )
+                    continue
+            semantically_valid.append(link)
+        links = semantically_valid
     # Legacy callers derive support from the ranker's evidence agents.  New
     # callers provide explicit support/contradiction links and get exact claim
     # grounding instead of an agent-name approximation.
@@ -205,6 +240,7 @@ def evaluate(
                 is not None
                 and callable(getattr(eligibility, "permits", None))
                 and eligibility.permits("support")
+                and (family not in FAMILIES or artifact_supports_family(family, item))
             )
         ]
         claim_links = [
@@ -213,7 +249,6 @@ def evaluate(
             if getattr(item, "evidence_id", "")
         ]
     else:
-        by_id = {str(getattr(item, "evidence_id", "")): item for item in all_artifacts}
         supporting = [
             by_id[link.fact_id]
             for link in links
@@ -225,7 +260,7 @@ def evaluate(
     contradiction_ids = [link.fact_id for link in claim_links if link.role == "contradict"]
     traced_ids = [*support_ids, *contradiction_ids]
     support_source_groups = {_independence_key(item) for item in supporting}
-    signature = _signature_support(top)
+    signature = _signature_support(top) and bool(supporting)
     confidence = str(getattr(top, "confidence", "low") or "low")
     insufficient = not family or family == "insufficient_evidence"
 

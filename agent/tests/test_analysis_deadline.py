@@ -20,7 +20,8 @@ def _request() -> AlertAnalysisRequest:
 def test_deadline_response_is_valid_and_degraded() -> None:
     orch = AnalysisOrchestrator(make_settings())
     resp = orch._deadline_response(_request(), 300)
-    assert resp.status == "ok"
+    assert resp.status == "failed"
+    assert resp.terminal_reason == "deadline_exceeded"
     assert resp.analysis_quality == "degraded"
     assert "300" in resp.analysis_summary
     assert any("deadline" in w for w in resp.warnings)
@@ -36,6 +37,8 @@ def test_analyze_returns_degraded_when_impl_overruns() -> None:
 
     orch._analyze_impl = _slow  # type: ignore[assignment]
     resp = asyncio.run(orch.analyze(_request()))
+    assert resp.status == "failed"
+    assert resp.terminal_reason == "deadline_exceeded"
     assert resp.analysis_quality == "degraded"
     assert resp.warnings and "deadline" in resp.warnings[0]
 

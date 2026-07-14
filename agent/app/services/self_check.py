@@ -27,7 +27,11 @@ from app.collectors.base import NO_EVIDENCE, CollectorResult, condition_observat
 from app.config import Settings
 from app.llm import complete_json, llm_configured
 from app.masking import build_masker
-from app.services.root_cause_ranking import _FAMILY_RULES, RankedCause
+from app.services.root_cause_ranking import (
+    _FAMILY_RULES,
+    RankedCause,
+    artifact_supports_family,
+)
 
 _CONF_ORDER = ("low", "medium", "high")
 
@@ -77,14 +81,21 @@ def _canonical_has_evidence(
         if r.status == "unavailable":
             return False
         return any(
-            _artifact_has_evidence(art, evidence_eligibility=evidence_eligibility)
+            _artifact_has_evidence(
+                family,
+                art,
+                evidence_eligibility=evidence_eligibility,
+            )
             for art in getattr(r, "artifacts", []) or []
         )
     return False  # canonical collector did not even run
 
 
 def _artifact_has_evidence(
-    art: object, *, evidence_eligibility: Mapping[str, object] | None = None
+    family: str,
+    art: object,
+    *,
+    evidence_eligibility: Mapping[str, object] | None = None,
 ) -> bool:
     """Accept only an explicit scoped positive collector verdict.
 
@@ -102,7 +113,11 @@ def _artifact_has_evidence(
         evidence_id = str(getattr(art, "evidence_id", "") or "")
         eligibility = evidence_eligibility.get(evidence_id)
         permits = getattr(eligibility, "permits", None)
-        return bool(callable(permits) and permits("support"))
+        return bool(
+            callable(permits)
+            and permits("support")
+            and artifact_supports_family(family, art)
+        )
 
     result = getattr(art, "result", None)
     if not isinstance(result, Mapping):
@@ -110,9 +125,10 @@ def _artifact_has_evidence(
     observation = result.get("observation")
     if not isinstance(observation, Mapping):
         return False
-    return (
+    return bool(
         str(observation.get("polarity") or "").strip().lower() == "present"
         and str(observation.get("coverage") or "").strip().lower() == "scoped"
+        and artifact_supports_family(family, art)
     )
 
 
@@ -134,7 +150,11 @@ async def refute_top_cause(
 
         has_evidence = _canonical_has_evidence(
             family, results, evidence_eligibility=evidence_eligibility
-        ) or _has_signature_evidence(top_candidate)
+        ) or _has_signature_evidence(
+            top_candidate,
+            results,
+            evidence_eligibility=evidence_eligibility,
+        )
 
         if not llm_configured(settings, settings.llm_model_self_check):
             # ponytail: deterministic gate — the only signal we have without an LLM
@@ -209,10 +229,32 @@ def _next_check_missing_evidence(family: str, settings: Settings) -> str:
     return f"Check the canonical evidence source ({canonical}) directly for this cause."
 
 
-def _has_signature_evidence(top_candidate: RankedCause) -> bool:
+def _has_signature_evidence(
+    top_candidate: RankedCause,
+    results: list[CollectorResult],
+    *,
+    evidence_eligibility: Mapping[str, object] | None = None,
+) -> bool:
+    """Accept a signature bypass only when it resolves to auditable evidence.
+
+    Standalone legacy callers have no blackboard/ID map, so retain their narrow
+    rationale fallback.  Production pipeline callers always provide the map;
+    there a signature must be a typed, scoped artifact whose predicate supports
+    the selected family (for example the alert's NVIDIA XID card).
+    """
+    if evidence_eligibility is not None:
+        return any(
+            _artifact_has_evidence(
+                top_candidate.family,
+                art,
+                evidence_eligibility=evidence_eligibility,
+            )
+            for result in results
+            for art in (getattr(result, "artifacts", []) or [])
+        )
     agents = {str(a).lower() for a in getattr(top_candidate, "evidence_agents", [])}
     rationale = " ".join(getattr(top_candidate, "rationale", [])).lower()
-    return "signature" in agents and (
+    return ("signature" in agents or "alert" in agents) and (
         "matched known-issue signature" in rationale
         or "matched curated symptom" in rationale
         or "nvidia xid" in rationale

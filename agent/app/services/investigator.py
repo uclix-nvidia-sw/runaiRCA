@@ -590,6 +590,7 @@ async def investigate(
     by_name = {_collector_name(c): c for c in collectors}
     all_names = set(by_name)
     evidence: dict[str, CollectorResult] = {}
+    latest_probe_scopes: dict[str, dict[str, Any]] = {}
     ledger = _initial_ledger(plan)
     investigation_steps: list[dict[str, Any]] = []
     seen_probes: set[str] = set()
@@ -615,7 +616,13 @@ async def investigate(
             deadline_monotonic,
             lambda: _collect_safely(collector, target, _scoped_plan(plan, scope)),
         )
-        evidence[name] = _merge_collector_results(evidence.get(name), result)
+        evidence[name] = _merge_collector_results(
+            evidence.get(name),
+            result,
+            previous_scope=latest_probe_scopes.get(name),
+            current_scope=scope,
+        )
+        latest_probe_scopes[name] = dict(scope)
         _record_blackboard(blackboard, name, result, target)
         if reporter:
             reporter.emit(
@@ -1304,32 +1311,127 @@ def _record_blackboard(
             return
 
 
+def _probe_history_record(
+    result: CollectorResult, scope: dict[str, Any] | None
+) -> dict[str, Any]:
+    return {
+        "agent": result.agent,
+        "scope": dict(scope or {}),
+        "status": result.status,
+        "summary": (result.summary or "")[:500],
+        "missing_data": list(dict.fromkeys(result.missing_data)),
+    }
+
+
+def _artifact_merge_fingerprint(item: Any) -> str:
+    """Fingerprint semantic card content, not its response-local display ID."""
+    if isinstance(item, dict):
+        payload: Any = dict(item)
+    else:
+        dump = getattr(item, "model_dump", None)
+        if callable(dump):
+            payload = dump(mode="json")
+        else:
+            payload = dict(getattr(item, "__dict__", {})) or item
+    if isinstance(payload, dict):
+        payload.pop("evidence_id", None)
+    try:
+        return json.dumps(payload, sort_keys=True, default=str)
+    except TypeError:
+        return repr(payload)
+
+
 def _merge_collector_results(
-    previous: CollectorResult | None, current: CollectorResult
+    previous: CollectorResult | None,
+    current: CollectorResult,
+    *,
+    previous_scope: dict[str, Any] | None = None,
+    current_scope: dict[str, Any] | None = None,
 ) -> CollectorResult:
     """Retain evidence from repeated collector probes with distinct scopes."""
     if previous is None:
         return current
-    statuses = {previous.status, current.status}
-    status = "ok" if "ok" in statuses else "partial" if "partial" in statuses else "unavailable"
     summaries: list[str] = []
     for candidate in (previous.summary, current.summary):
         if candidate and candidate not in summaries:
             summaries.append(candidate)
     summary = " | ".join(summaries[-4:])[:1600]
-    probe_history = (
+    previous_history = (
         previous.details.get("probe_results")
         if isinstance(previous.details, dict)
         else []
     )
-    history = list(probe_history) if isinstance(probe_history, list) else []
-    history.append(
-        {
-            "agent": current.agent,
-            "status": current.status,
-            "summary": (current.summary or "")[:500],
-        }
+    history = list(previous_history) if isinstance(previous_history, list) else []
+    if not history:
+        history.append(_probe_history_record(previous, previous_scope))
+    current_history = (
+        current.details.get("probe_results")
+        if isinstance(current.details, dict)
+        else []
     )
+    if isinstance(current_history, list) and current_history:
+        history.extend(current_history)
+    else:
+        history.append(_probe_history_record(current, current_scope))
+
+    scope_aware = previous_scope is not None or current_scope is not None
+    if scope_aware:
+        latest_by_scope: dict[str, dict[str, Any]] = {}
+        for record in history:
+            if not isinstance(record, dict):
+                continue
+            scope = record.get("scope")
+            scope_key = json.dumps(
+                scope if isinstance(scope, dict) else {},
+                sort_keys=True,
+                default=str,
+            )
+            latest_by_scope[scope_key] = record
+        latest_records = list(latest_by_scope.values())
+        missing_data = list(
+            dict.fromkeys(
+                str(item)
+                for record in latest_records
+                for item in (
+                    record.get("missing_data")
+                    if isinstance(record.get("missing_data"), list)
+                    else []
+                )
+                if str(item)
+            )
+        )
+        all_latest_ok = bool(latest_records) and all(
+            str(record.get("status") or "") == "ok" for record in latest_records
+        )
+        any_usable = any(
+            str(record.get("status") or "") in {"ok", "partial"}
+            for record in history
+            if isinstance(record, dict)
+        )
+        if all_latest_ok and not missing_data:
+            status = "ok"
+        elif any_usable:
+            status = "partial"
+        else:
+            status = "unavailable"
+    else:
+        # Non-scoped callers retain the historical latest-pass semantics.
+        if current.status == "ok":
+            status = "ok"
+        elif current.status == "partial" or previous.status in {"ok", "partial"}:
+            status = "partial"
+        else:
+            status = "unavailable"
+        missing_data = list(dict.fromkeys(current.missing_data))
+
+    artifacts: list[Any] = []
+    seen_artifacts: set[str] = set()
+    for item in (*previous.artifacts, *current.artifacts):
+        fingerprint = _artifact_merge_fingerprint(item)
+        if fingerprint in seen_artifacts:
+            continue
+        seen_artifacts.add(fingerprint)
+        artifacts.append(item)
     return CollectorResult(
         agent=current.agent or previous.agent,
         status=status,
@@ -1340,9 +1442,11 @@ def _merge_collector_results(
             **(current.details if isinstance(current.details, dict) else {}),
             "probe_results": history[-8:],
         },
-        missing_data=list(dict.fromkeys([*previous.missing_data, *current.missing_data])),
+        # Scoped gaps clear only when that same scope succeeds. A successful
+        # node probe must not silently resolve a failed historical pod query.
+        missing_data=missing_data,
         warnings=list(dict.fromkeys([*previous.warnings, *current.warnings])),
-        artifacts=[*previous.artifacts, *current.artifacts],
+        artifacts=artifacts,
     )
 
 

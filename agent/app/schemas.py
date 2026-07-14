@@ -105,6 +105,9 @@ class AlertAnalysisArtifact(BaseModel):
 
 class AlertAnalysisResponse(BaseModel):
     status: str
+    # Machine-readable terminal outcome for HTTP-200 responses that did not
+    # produce an RCA. Backends must not treat these as successful analyses.
+    terminal_reason: str | None = None
     thread_ts: str
     analysis: str
     analysis_summary: str

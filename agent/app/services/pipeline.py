@@ -24,6 +24,7 @@ from app.collectors.base import (
     resolve_target,
     salient_markers,
 )
+from app.collectors.base import artifact as make_artifact
 from app.collectors.registry import build_collectors
 from app.config import Settings
 from app.knowledge import (
@@ -55,6 +56,7 @@ from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediati
 from app.services.planner import plan_investigation
 from app.services.root_cause_ranking import (
     RankedCause,
+    artifact_supports_family,
     merge_open_world_candidates,
     rank_root_cause_candidates,
 )
@@ -125,6 +127,10 @@ class PipelineState:
     progress: ProgressReporter
     masker: Masker
     collectors: list[object]
+    # Immutable identity resolved from the alert payload. ``target`` becomes
+    # the effective post-plan scope for live analysis; keeping this baseline is
+    # what lets historical pinning remain stable across repeated evidence runs.
+    declared_target: AnalysisTarget | None = None
     runtime_label: str = "fallback"
     agent_souls: str = ""
     kg_context: Any = None
@@ -203,6 +209,7 @@ def new_state(
         progress=ProgressReporter.from_alert(settings, request.alert, masker),
         masker=masker,
         collectors=collectors if collectors is not None else build_collectors(settings),
+        declared_target=target,
         runtime_label=runtime_label,
         analysis_started_at=(
             analysis_started_at if analysis_started_at is not None else time.monotonic()
@@ -285,7 +292,9 @@ def _pin_resolved_target_identity(state: PipelineState) -> None:
     if not _is_resolved_reanalysis(state.request) or state.plan is None:
         return
 
-    target = state.target
+    if state.declared_target is None:
+        state.declared_target = state.target
+    target = state.declared_target
     plan = state.plan
     if target.namespace:
         plan.namespaces = [
@@ -315,6 +324,251 @@ def _pin_resolved_target_identity(state: PipelineState) -> None:
     # substitute a planner guess derived from today's cluster state.
     plan.node = target.node
     plan.workload = target.workload_name
+
+
+def _apply_effective_target(state: PipelineState) -> AnalysisTarget:
+    """Persist the one target identity used after planning.
+
+    Collectors already narrow live alerts through the plan.  Persisting that
+    narrowed identity on ``state.target`` keeps blackboard aliases, eligibility,
+    ranking, self-check, and the harness from validating the returned evidence
+    against the stale alert Pod.  Resolved incidents remain pinned to their
+    historical identity and never adopt a live replacement.
+    """
+    if state.plan is None:
+        return state.target
+    from app.collectors.kubernetes import _scope_target
+
+    if state.declared_target is None:
+        state.declared_target = state.target
+    state.target = _scope_target(state.declared_target, state.plan)
+    return state.target
+
+
+_ALERT_DISPOSITIVE_SIGNATURES: dict[str, tuple[str, ...]] = {
+    "image_pull_error": (
+        "ImagePullBackOff",
+        "ErrImagePull",
+        "ErrImageNeverPull",
+    ),
+    "workload_startup_error": (
+        "CrashLoopBackOff",
+        "OOMKilled",
+        "CreateContainerConfigError",
+        "CreateContainerError",
+        "RunContainerError",
+    ),
+    "k8s_scheduling_error": ("FailedScheduling", "Unschedulable"),
+    "k8s_storage_error": (
+        "FailedMount",
+        "FailedAttachVolume",
+        "ProvisioningFailed",
+        "VolumeBinding",
+    ),
+}
+
+_ALERT_STATE_FIELDS = ("status", "value", "active", "state")
+_ALERT_TRUE_VALUES = frozenset({"true", "1", "yes", "active", "firing", "present"})
+_ALERT_FALSE_VALUES = frozenset(
+    {"false", "0", "no", "inactive", "absent", "cleared", "resolved"}
+)
+_ALERT_NON_EVIDENCE_FIELD_RE = re.compile(
+    r"(?:runbook|operator_prompt|analysis_run_id|dashboard|documentation|docs?|"
+    r"query|expression|command|template|example|sample)",
+    re.IGNORECASE,
+)
+_ALERT_NON_ASSERTIVE_PREFIX_RE = re.compile(
+    r"(?:\b(?:check|verify|inspect|grep|search|test|rule\s+out|look\s+for)\b[^.!?\n]{0,96}"
+    r"|\b(?:possible|possibly|potential|maybe|hypothesis|candidate|runbook|"
+    r"example|sample|template|expected\s+observation)\b[^.!?\n]{0,96})$",
+    re.IGNORECASE,
+)
+_ALERT_NON_ASSERTIVE_SUFFIX_RE = re.compile(
+    r"^\s*(?:[=:,-]\s*)?(?:"
+    r"(?:is\s+|was\s+)?(?:false|inactive|absent|possible|potential|hypothetical)\b"
+    r"|(?:as\s+)?(?:a\s+)?possibility\b|if\b|whether\b|=\s*0\b)",
+    re.IGNORECASE,
+)
+
+
+def _alert_boolean_state(value: object) -> bool | None:
+    normalized = str(value or "").strip().casefold()
+    if normalized in _ALERT_TRUE_VALUES:
+        return True
+    if normalized in _ALERT_FALSE_VALUES:
+        return False
+    return None
+
+
+def _alert_signal_field(key: object) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(key or "").casefold()).strip("_")
+    return (
+        "condition" in normalized
+        or normalized == "reason"
+        or normalized.endswith("_reason")
+        or normalized.endswith("_phase")
+    )
+
+
+def _asserted_alert_texts(request: AlertAnalysisRequest) -> list[str]:
+    """Return alert values that can make an auditable positive assertion.
+
+    Condition/status pairs are evaluated structurally in both labels and
+    annotations, so sender insertion order cannot turn ``False OOMKilled`` into
+    a positive fact.  Runbook/operator/query fields remain hypothesis guidance,
+    never incident evidence.
+    """
+    texts: list[str] = []
+    for metadata in (request.alert.labels or {}, request.alert.annotations or {}):
+        entries = [
+            (str(key), str(value).strip())
+            for key, value in metadata.items()
+            if str(value).strip()
+        ]
+        normalized = {key.casefold(): value for key, value in entries}
+        state = next(
+            (
+                parsed
+                for field in _ALERT_STATE_FIELDS
+                if field in normalized
+                and (parsed := _alert_boolean_state(normalized[field])) is not None
+            ),
+            None,
+        )
+        has_structured_signal = any(_alert_signal_field(key) for key, _value in entries)
+        if state is False and has_structured_signal:
+            continue
+        for key, value in entries:
+            if key.casefold() in _ALERT_STATE_FIELDS:
+                continue
+            if _ALERT_NON_EVIDENCE_FIELD_RE.search(key):
+                continue
+            if value not in texts:
+                texts.append(value)
+    return texts
+
+
+def _alert_signature_is_asserted(text: str, start: int, end: int) -> bool:
+    lowered = text.casefold()
+    if _keyword_negated(lowered, start, end):
+        return False
+    prefix = text[max(0, start - 128) : start]
+    # Restrict the extra False/order and instruction checks to the local clause;
+    # an earlier healthy condition followed by "but OOMKilled" is not negation.
+    local_prefix = re.split(
+        r"(?:[.;!?\n]|\bbut\b|\bhowever\b|하지만)", prefix, flags=re.IGNORECASE
+    )[-1]
+    if re.search(r"\b(?:false|inactive|absent|zero|0)\b", local_prefix, re.IGNORECASE):
+        return False
+    if _ALERT_NON_ASSERTIVE_PREFIX_RE.search(local_prefix):
+        return False
+    suffix = text[end : end + 80]
+    return _ALERT_NON_ASSERTIVE_SUFFIX_RE.match(suffix) is None
+
+
+def _asserted_alert_signatures(
+    request: AlertAnalysisRequest,
+) -> tuple[list[int], dict[str, list[str]]]:
+    codes: list[int] = []
+    matched_by_family: dict[str, list[str]] = {}
+    for text in _asserted_alert_texts(request):
+        for match in _XID_PATTERN.finditer(text):
+            if not _alert_signature_is_asserted(text, match.start(), match.end()):
+                continue
+            code = int(match.group(1))
+            if code not in codes:
+                codes.append(code)
+        for family, markers in _ALERT_DISPOSITIVE_SIGNATURES.items():
+            for marker in markers:
+                for match in re.finditer(re.escape(marker), text, re.IGNORECASE):
+                    if not _alert_signature_is_asserted(text, match.start(), match.end()):
+                        continue
+                    matched = matched_by_family.setdefault(family, [])
+                    if marker not in matched:
+                        matched.append(marker)
+                    break
+    return codes, matched_by_family
+
+
+def _alert_evidence_identity(
+    request: AlertAnalysisRequest, target: AnalysisTarget
+) -> str:
+    return str(request.alert.fingerprint or target.alert_name or "alert").strip() or "alert"
+
+
+def _alert_signature_evidence_result(
+    request: AlertAnalysisRequest, target: AnalysisTarget
+) -> CollectorResult | None:
+    """Materialize explicit alert failure signatures as typed, citable evidence."""
+    codes, matched_by_family = _asserted_alert_signatures(request)
+    if not codes and not matched_by_family:
+        return None
+
+    # The alert payload is an observation by Alertmanager.  Never attach it to
+    # a live replacement Pod/node discovered later by planning; run identity +
+    # alert fingerprint keep it auditable without broadening collector scope.
+    observed_entity = {
+        "kind": "alert",
+        "name": _alert_evidence_identity(request, target),
+    }
+
+    cards = []
+    if codes:
+        signals = [f"NVIDIA XID {code}" for code in codes]
+        summary = "Alert payload explicitly reported " + ", ".join(signals) + "."
+        cards.append(
+            make_artifact(
+                agent="alert",
+                source="alertmanager",
+                type="alert_signature",
+                status="ok",
+                confidence="high",
+                summary=summary,
+                result={
+                    "matched_signals": signals,
+                    "xid_codes": codes,
+                    "observation": {
+                        "predicate": "alert_signature:nvidia_xid",
+                        "polarity": "present",
+                        "coverage": "scoped",
+                        "observed_entity": observed_entity,
+                    },
+                },
+                highlights=signals,
+            )
+        )
+    for family, matched in matched_by_family.items():
+        signals = list(dict.fromkeys(matched))
+        summary = "Alert payload explicitly reported " + ", ".join(signals) + "."
+        cards.append(
+            make_artifact(
+                agent="alert",
+                source="alertmanager",
+                type="alert_signature",
+                status="ok",
+                confidence="high",
+                summary=summary,
+                result={
+                    "matched_signals": signals,
+                    "observation": {
+                        "predicate": f"alert_signature:{family}",
+                        "polarity": "present",
+                        "coverage": "scoped",
+                        "observed_entity": observed_entity,
+                    },
+                },
+                highlights=signals,
+            )
+        )
+    combined = " ".join(str(card.summary or "") for card in cards)
+    return CollectorResult(
+        agent="alert",
+        status="ok",
+        summary=combined,
+        confidence="high",
+        details={"source_group": "alertmanager"},
+        artifacts=cards,
+    )
 
 
 def _aggregate_evidence(state: PipelineState) -> None:
@@ -395,6 +649,7 @@ async def plan_stage(state: PipelineState) -> PipelineState:
             state.plan.node = state.target.node
         elif live_node:
             state.plan.node = live_node
+    _apply_effective_target(state)
     state.progress.emit(
         "planning",
         "Investigation plan built",
@@ -431,9 +686,7 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
     # LIVE pod/node for a stale alert pod. Scope the stage's working target ONCE
     # so the flowchart follow-ups, drill-down, and investigation loop query the
     # live pod too, not just the base collectors (which scope internally).
-    from app.collectors.kubernetes import _scope_target
-
-    target = _scope_target(state.target, plan)
+    target = _apply_effective_target(state)
     causal_window = causal_evidence_time_range(target) or {}
     state.investigation_context = {}
     from app.services.evidence_blackboard import Blackboard
@@ -487,6 +740,9 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
         "synthesis must wait for all collectors: "
         f"{len(state.results)} results for {len(state.collectors)} collectors"
     )
+    alert_evidence = _alert_signature_evidence_result(state.request, target)
+    if alert_evidence is not None and not any(r.agent == "alert" for r in state.results):
+        state.results.append(alert_evidence)
     # The investigator receives the board only in open-world mode for backward
     # compatibility with legacy integrations, but every evidence agent must
     # still receive the same shared observations during drill-down. Seeding is
@@ -1414,20 +1670,30 @@ def _prepare_open_world_ledger(state: PipelineState) -> None:
 
 def _evidence_context(state: PipelineState) -> dict[str, object]:
     target = state.target
+    alert_entities = (
+        [f"alert:{_alert_evidence_identity(state.request, target)}"]
+        if any(result.agent == "alert" for result in state.results)
+        else []
+    )
     entities = tuple(
-        f"{field}:{value}"
-        for field in (
-            "pod",
-            "node",
-            "workload_name",
-            "runai_workload_id",
-            "project",
-            "queue",
-            "namespace",
-            "storage_claim",
-            "service",
+        dict.fromkeys(
+            [
+                f"{field}:{value}"
+                for field in (
+                    "pod",
+                    "node",
+                    "workload_name",
+                    "runai_workload_id",
+                    "project",
+                    "queue",
+                    "namespace",
+                    "storage_claim",
+                    "service",
+                )
+                if (value := str(getattr(target, field, "") or "").strip())
+            ]
+            + alert_entities
         )
-        if (value := str(getattr(target, field, "") or "").strip())
     )
     topology = tuple(
         f"{field}:{value}"
@@ -2094,8 +2360,8 @@ def _needs_more_investigation(state: PipelineState) -> bool:
     top = state.root_cause_candidates[0]
     return (
         state.self_check_refuted
+        or top.family == "insufficient_evidence"
         or top.confidence not in {"medium", "high"}
-        or bool(state.missing)
     )
 
 
@@ -2180,7 +2446,15 @@ def _evidence_signature(results: list[CollectorResult]) -> tuple[tuple[object, .
                 result.summary,
                 tuple(result.missing_data),
                 tuple(result.warnings),
-                _json_fingerprint(result.details),
+                _json_fingerprint(
+                    {
+                        key: value
+                        for key, value in result.details.items()
+                        if key != "probe_results"
+                    }
+                    if isinstance(result.details, dict)
+                    else result.details
+                ),
                 tuple(_artifact_signature(artifact) for artifact in result.artifacts),
             )
             for result in results
@@ -2204,6 +2478,30 @@ def _json_fingerprint(value: object) -> str:
         return repr(value)
 
 
+def _fresh_results_support_family(
+    family: str,
+    fresh_results: list[CollectorResult],
+    evidence_eligibility: Mapping[str, object],
+) -> bool:
+    """Whether this pass added eligible semantic support for a refuted family.
+
+    A prior self-check is a reason to seek an alternative, not a permanent ban.
+    Direct, target/window-scoped evidence found by the follow-up pass may
+    rehabilitate the family; compatibility summaries and ineligible cards may
+    not.
+    """
+    for result in fresh_results:
+        for artifact in result.artifacts:
+            evidence_id = str(getattr(artifact, "evidence_id", "") or "")
+            eligibility = evidence_eligibility.get(evidence_id)
+            permits = getattr(eligibility, "permits", None)
+            if not callable(permits) or not permits("support"):
+                continue
+            if artifact_supports_family(family, artifact):
+                return True
+    return False
+
+
 async def _reanalyze_once(
     state: PipelineState,
     *,
@@ -2211,7 +2509,7 @@ async def _reanalyze_once(
 ) -> _ReanalysisOutcome | None:
     """One bounded targeted investigation pass. Never re-enters analyze()."""
     try:
-        from app.services.investigator import investigate
+        from app.services.investigator import _merge_collector_results, investigate
         from app.services.self_check import refute_top_cause
 
         plan = state.plan
@@ -2249,7 +2547,9 @@ async def _reanalyze_once(
         )
         merged = {result.agent: result for result in state.results}
         for result in fresh:
-            merged[result.agent] = result
+            merged[result.agent] = _merge_collector_results(
+                merged.get(result.agent), result
+            )
         merged_results = list(merged.values())
 
         # Re-analysis returns fresh artifacts after the initial evidence-stage
@@ -2312,13 +2612,28 @@ async def _reanalyze_once(
                 match_failure_mode_symptoms(state.failure_modes, observed), lifecycle
             ),
         )
-        if _evidence_budget_exceeded(state):
+        if target.refuted_family and not _fresh_results_support_family(
+            target.refuted_family,
+            fresh,
+            evidence_eligibility,
+        ):
+            alternatives = [
+                candidate
+                for candidate in candidates
+                if candidate.family != target.refuted_family
+            ]
+            if alternatives:
+                candidates = alternatives
+        skip_self_check = _evidence_budget_exceeded(state)
+        if skip_self_check:
+            # The targeted probes already completed and were normalized/ranked.
+            # Preserve that fresh evidence; only the optional LLM self-check is
+            # skipped so final synthesis can use the last bounded observation.
             _record_evidence_budget_stop(state, "post-reanalysis self-check")
-            return None
         caveat = ""
         refuted = False
         next_check = ""
-        if candidates:
+        if candidates and not skip_self_check:
             self_check_kwargs: dict[str, object] = {"plan": re_context}
             if _accepts_keyword(refute_top_cause, "evidence_eligibility"):
                 self_check_kwargs["evidence_eligibility"] = evidence_eligibility

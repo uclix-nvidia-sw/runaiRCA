@@ -1002,6 +1002,215 @@ async def test_evidence_stage_scopes_followup_target_to_the_plan(monkeypatch) ->
     assert seen == {"k8s": "toolkit-live2", "prom": "toolkit-live2"}, (
         "follow-ups must query the plan's re-resolved live pod"
     )
+    assert (state.target.pod, state.target.node) == ("toolkit-live2", stale_target.node)
+
+
+@pytest.mark.asyncio
+async def test_re_resolved_live_target_drives_blackboard_eligibility(monkeypatch) -> None:
+    """A live replacement is collection scope and validation scope, not just a query hint."""
+    from app.progress import ProgressReporter
+
+    seen: dict[str, str] = {}
+
+    class KubernetesCollector:
+        async def collect(self, target, plan):  # noqa: ANN001
+            seen.update(pod=target.pod, node=target.node)
+            return CollectorResult(
+                agent="kubernetes",
+                status="ok",
+                summary="FailedScheduling on the resolved live Pod",
+                artifacts=[
+                    artifact(
+                        agent="kubernetes",
+                        source="kubernetes",
+                        type="kubernetes_warning_events",
+                        status="ok",
+                        confidence="high",
+                        summary="FailedScheduling on trainer-live2",
+                        result={
+                            "events": [
+                                {
+                                    "type": "Warning",
+                                    "reason": "FailedScheduling",
+                                    "message": "0/2 nodes are available",
+                                }
+                            ],
+                            "observation": {
+                                "predicate": "kubernetes_warning_events",
+                                "polarity": "present",
+                                "coverage": "scoped",
+                                "observed_entity": {
+                                    "kind": "pod",
+                                    "name": target.pod,
+                                    "namespace": target.namespace,
+                                },
+                            },
+                        },
+                    )
+                ],
+            )
+
+    async def no_followup(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr("app.collectors.kubernetes.k8s_followup", no_followup)
+    monkeypatch.setattr("app.collectors.prometheus.prometheus_followup", no_followup)
+    fired_at = "2026-07-14T01:00:00Z"
+    stale_target = replace(
+        make_target(),
+        pod="trainer-dead1",
+        node="",
+        fired_at=fired_at,
+    )
+    state = pipeline.PipelineState(
+        settings=make_settings(),
+        request=AlertAnalysisRequest(
+            incident_id="INC-live-target",
+            alert=Alert(
+                status="firing",
+                labels={},
+                annotations={},
+                startsAt=fired_at,
+            ),
+        ),
+        target=stale_target,
+        progress=ProgressReporter(make_settings(), run_id="INC-live-target"),
+        masker=None,
+        collectors=[KubernetesCollector()],
+        plan=InvestigationPlan(
+            pod="trainer-live2",
+            node="gpu-node-live",
+            workload="trainer",
+            namespaces=[stale_target.namespace],
+        ),
+    )
+
+    await pipeline.evidence_stage(state)
+
+    assert seen == {"pod": "trainer-live2", "node": "gpu-node-live"}
+    assert (state.target.pod, state.target.node) == ("trainer-live2", "gpu-node-live")
+    eligibility = pipeline._public_evidence_eligibility(state)
+    assert eligibility["E01"].support is True
+    assert "pod:trainer-live2" in pipeline._evidence_context(state)["entities"]
+    assert "pod:trainer-dead1" not in pipeline._evidence_context(state)["entities"]
+
+
+@pytest.mark.parametrize(
+    ("labels", "annotations"),
+    [
+        ({"condition": "OOMKilled", "status": "False"}, {}),
+        ({"status": "False", "condition": "OOMKilled"}, {}),
+        ({}, {"condition": "FailedScheduling", "value": "0"}),
+        ({}, {"value": "inactive", "reason": "ImagePullBackOff"}),
+    ],
+)
+def test_false_alert_condition_is_not_positive_signature(labels, annotations) -> None:
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "ConditionProbe", **labels},
+            annotations=annotations,
+            fingerprint="fp-false-condition",
+        )
+    )
+
+    assert pipeline._alert_signature_evidence_result(request, make_target()) is None
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "Check whether this pod is OOMKilled before changing limits.",
+        "Possible ImagePullBackOff; inspect registry credentials.",
+        "Runbook: grep for FailedScheduling in pod events.",
+        "Expected observation: Unschedulable if the queue is exhausted.",
+    ],
+)
+def test_conditional_alert_guidance_is_not_positive_signature(summary) -> None:
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "GenericAlert"},
+            annotations={"summary": summary},
+            fingerprint="fp-conditional",
+        )
+    )
+
+    assert pipeline._alert_signature_evidence_result(request, make_target()) is None
+
+
+def test_asserted_alert_signature_uses_alert_identity_not_live_target() -> None:
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "ContainerFailure"},
+            annotations={"summary": "Container terminated with OOMKilled"},
+            fingerprint="fp-stale-alert",
+        )
+    )
+    live_target = replace(make_target(), pod="replacement-pod", node="replacement-node")
+
+    result = pipeline._alert_signature_evidence_result(request, live_target)
+
+    assert result is not None
+    observation = result.artifacts[0].result["observation"]
+    assert observation["observed_entity"] == {
+        "kind": "alert",
+        "name": "fp-stale-alert",
+    }
+
+
+@pytest.mark.asyncio
+async def test_alert_only_xid_is_auditable_harness_support(monkeypatch) -> None:
+    """A dispositive alert signature gets a real E-link instead of a rationale bypass."""
+    from app.services.kg_enrichment import KGContext
+
+    async def no_followup(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr("app.collectors.kubernetes.k8s_followup", no_followup)
+    monkeypatch.setattr("app.collectors.prometheus.prometheus_followup", no_followup)
+    settings = replace(make_settings(), enable_rca_output_harness=True)
+    request = AlertAnalysisRequest(
+        incident_id="INC-xid-alert",
+        alert=Alert(
+            status="firing",
+            labels={
+                "alertname": "NVRMXidCritical",
+                "namespace": "runai-vision",
+                "node": "gpu-node-1",
+            },
+            annotations={"summary": "NVRM: Xid 79 detected by the GPU driver"},
+            startsAt="2026-07-14T01:00:00Z",
+        ),
+    )
+    state = pipeline.new_state(settings, request, collectors=[])
+    state.kg_context = KGContext()
+    state.plan = InvestigationPlan(
+        namespaces=[state.target.namespace],
+        node=state.target.node,
+        hypotheses=[{"family": "gpu_hardware_error", "reason": "alert XID"}],
+    )
+
+    await pipeline.evidence_stage(state)
+    await pipeline.rank_stage(state)
+    await pipeline.self_check_stage(state)
+    await pipeline.synthesize_stage(state)
+    await pipeline.harness_stage(state)
+
+    assert state.response is not None
+    assert state.response.root_cause_family == "gpu_hardware_error"
+    xid_cards = [card for card in state.response.artifacts if card.agent == "alert"]
+    assert len(xid_cards) == 1
+    assert xid_cards[0].result["observation"]["predicate"] == "alert_signature:nvidia_xid"
+    assert xid_cards[0].result["observation"]["observed_entity"] == {
+        "kind": "alert",
+        "name": "NVRMXidCritical",
+    }
+    assert "alert:NVRMXidCritical" in pipeline._evidence_context(state)["entities"]
+    claim = state.response.context["harness"]["claims"][0]
+    assert claim["supporting_evidence"] == [xid_cards[0].evidence_id]
+    assert state.response.context["harness"]["status"] == "pass"
 
 
 @pytest.mark.asyncio
@@ -1077,6 +1286,13 @@ async def test_resolved_incident_keeps_alert_pod_for_followups(monkeypatch) -> N
     )
     assert seen == {"k8s": expected, "prom": expected}
     assert state.plan.namespaces == ["historical-ns", "current-ns", "runai"]
+    assert (
+        state.target.namespace,
+        state.target.pod,
+        state.target.node,
+        state.target.workload_name,
+    ) == expected
+    assert state.declared_target == alert_target
 
 
 @pytest.mark.asyncio

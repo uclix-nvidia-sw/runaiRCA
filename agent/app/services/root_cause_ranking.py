@@ -959,6 +959,114 @@ def _artifact_observation(art: object) -> dict[str, object] | None:
     return observation if isinstance(observation, dict) else None
 
 
+_ALERT_XID_EVIDENCE_RE = re.compile(r"\bxid\s*(?:\([^)]*\))?\s*[:=]?\s*\d{1,4}\b", re.I)
+
+
+def _artifact_family_semantics(art: object) -> tuple[str, str, str]:
+    """Return ``(agent, predicate, semantic_text)`` for claim-level gates."""
+    observation = _artifact_observation(art) or {}
+    agent = str(getattr(art, "agent", "") or "").strip().casefold()
+    predicate = str(observation.get("predicate") or "").strip().casefold()
+    summary = str(getattr(art, "summary", "") or "")
+    highlights = " ".join(
+        str(item) for item in (getattr(art, "highlights", None) or [])
+    )
+    drop_keys = _RANKING_TEXT_DROP_KEYS.get(agent)
+    semantic_value = _artifact_ranking_value_text(art, drop_keys)
+    return (
+        agent,
+        predicate,
+        " ".join((predicate, summary, highlights, semantic_value)).casefold(),
+    )
+
+
+def _artifact_is_relevant_to_family(family: str, art: object) -> bool:
+    """Whether the card's predicate/value is about ``family`` at all.
+
+    This deliberately ignores polarity.  Support and contradiction apply their
+    own polarity checks around this predicate-level relevance test.
+    """
+    rule = _FAMILY_RULES.get(family)
+    observation = _artifact_observation(art)
+    if rule is None or observation is None:
+        return False
+    agent, predicate, semantic_text = _artifact_family_semantics(art)
+    if agent == "alert":
+        if predicate == "alert_signature:nvidia_xid":
+            return (
+                family == "gpu_hardware_error"
+                and _ALERT_XID_EVIDENCE_RE.search(semantic_text) is not None
+            )
+        return predicate == f"alert_signature:{family}"
+
+    _canonical, allowed_agents, keywords = rule
+    if agent not in {str(item).casefold() for item in allowed_agents}:
+        return False
+    # A scoped absence naturally says "no/false" and therefore cannot use the
+    # normal negation-aware keyword matcher.  At this layer we only establish
+    # predicate relevance; the support path below still applies the stricter
+    # value-aware matcher before accepting a positive claim.
+    return any(str(keyword).casefold() in semantic_text for keyword in keywords)
+
+
+def artifact_supports_family(family: str, art: object) -> bool:
+    """Whether one typed positive artifact actually supports ``family``.
+
+    Target/time eligibility answers *where and when* an observation happened;
+    it does not answer *what proposition* the observation establishes.  Keep
+    this second gate beside the catalog ranker's value-aware text projection so
+    ranking, self-check, and the output harness share the same semantics.  In
+    particular, a Kubernetes ``OOMKilled`` observation must not support
+    ``k8s_scheduling_error`` merely because Kubernetes is that family's
+    canonical collector.
+
+    Alert payloads are admitted only through an explicit, auditable signature
+    predicate.  Today NVIDIA XID is the dispositive alert-only signature; broad
+    alert prose is intentionally not a generic bypass for catalog families.
+    """
+    observation = _artifact_observation(art)
+    if observation is None or not _artifact_is_relevant_to_family(family, art):
+        return False
+    if (
+        str(observation.get("polarity") or "").strip().casefold() != "present"
+        or str(observation.get("coverage") or "").strip().casefold() != "scoped"
+    ):
+        return False
+
+    rule = _FAMILY_RULES[family]
+    agent, predicate, semantic_text = _artifact_family_semantics(art)
+
+    if agent == "alert":
+        if predicate == "alert_signature:nvidia_xid":
+            return (
+                family == "gpu_hardware_error"
+                and _ALERT_XID_EVIDENCE_RE.search(semantic_text) is not None
+            )
+        if predicate != f"alert_signature:{family}":
+            return False
+        return bool(_keyword_hits(semantic_text, list(rule[2]))[0])
+
+    _canonical, allowed_agents, keywords = rule
+    if agent not in {str(item).casefold() for item in allowed_agents}:
+        return False
+    return bool(_keyword_hits(semantic_text, list(keywords))[0])
+
+
+def artifact_contradicts_family(family: str, art: object) -> bool:
+    """Accept only a scoped absence of a predicate relevant to ``family``.
+
+    A positive observation from another subsystem can coexist with the proposed
+    cause; it is not a falsifier merely because an LLM linked it as one.
+    """
+    observation = _artifact_observation(art)
+    return bool(
+        observation is not None
+        and str(observation.get("polarity") or "").strip().casefold() == "absent"
+        and str(observation.get("coverage") or "").strip().casefold() == "scoped"
+        and _artifact_is_relevant_to_family(family, art)
+    )
+
+
 def _has_typed_incident_observation(
     target: AnalysisTarget,
     results: list[CollectorResult],
