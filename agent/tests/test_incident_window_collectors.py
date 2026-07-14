@@ -9,6 +9,7 @@ from app.collectors.http_json import JsonResponse
 from app.collectors.kubernetes import (
     _collect_pod_logs,
     _event_matches_target,
+    _event_time_range_complete,
     _filter_kubernetes_data,
     _kubernetes_list_complete,
     _mcp_k8s_response,
@@ -772,10 +773,14 @@ def test_kubernetes_warning_event_absence_requires_all_event_queries_to_succeed(
     paginated = _warning_event_queries_complete(
         [{"name": "pod_events", "error": None, "list_complete": False}]
     )
+    untimed = _warning_event_queries_complete(
+        [{"name": "pod_events", "error": None, "event_time_complete": False}]
+    )
 
     assert complete is True
     assert incomplete is False
     assert paginated is False
+    assert untimed is False
     assert _kubernetes_list_complete({"items": [], "metadata": {"continue": "next"}}) is False
     assert _kubernetes_list_complete({"items": [], "metadata": {}}) is True
 
@@ -807,6 +812,55 @@ def test_kubernetes_zero_event_time_uses_legacy_timestamp_inside_window() -> Non
 
     assert [item["reason"] for item in filtered["items"]] == ["OOMKilled"]
     assert filtered["items"][0]["lastTimestamp"] == "2026-07-10T01:02:00Z"
+
+
+def test_untimed_target_warning_prevents_historical_event_absence() -> None:
+    target = replace(make_target(), fired_at="2026-07-10T01:00:00Z")
+    data = {
+        "items": [
+            {
+                "type": "Warning",
+                "reason": "OOMKilled",
+                "involvedObject": {"kind": "Pod", "name": "trainer-0"},
+            }
+        ]
+    }
+
+    assert _event_time_range_complete("pod_events", data, target) is False
+
+
+def test_kubernetes_event_uses_all_observation_timestamps_for_incident_window() -> None:
+    target = replace(make_target(), fired_at="2026-07-10T01:00:00Z")
+    filtered = _filter_kubernetes_data(
+        "pod_events",
+        {
+            "items": [
+                {
+                    "type": "Warning",
+                    "reason": "Repeated",
+                    "eventTime": "2026-07-10T00:40:00Z",
+                    "series": {"lastObservedTime": "2026-07-10T01:02:00Z"},
+                    "involvedObject": {"kind": "Pod", "name": "trainer-0"},
+                },
+                {
+                    "type": "Warning",
+                    "reason": "Legacy",
+                    "firstTimestamp": "2026-07-10T01:03:00Z",
+                    "lastTimestamp": "2026-07-10T01:30:00Z",
+                    "involvedObject": {"kind": "Pod", "name": "trainer-0"},
+                },
+            ]
+        },
+        target,
+    )
+
+    assert [item["reason"] for item in filtered["items"]] == ["Repeated", "Legacy"]
+
+
+def test_malformed_historical_event_payload_prevents_absence() -> None:
+    target = replace(make_target(), fired_at="2026-07-10T01:00:00Z")
+
+    assert _event_time_range_complete("pod_events", {"body": "upstream html"}, target) is False
 
 
 class _HistoryConnection:

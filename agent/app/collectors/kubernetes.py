@@ -1450,7 +1450,9 @@ def _warning_event_queries_complete(responses: list[dict[str, object]]) -> bool:
         or str(response.get("name") or "").startswith("runai_control_plane_events:")
     ]
     return bool(event_responses) and all(
-        not response.get("error") and response.get("list_complete", True)
+        not response.get("error")
+        and response.get("list_complete", True)
+        and response.get("event_time_complete", True)
         for response in event_responses
     )
 
@@ -1612,6 +1614,7 @@ async def _collect_kubernetes_responses(
                 "status_code": response.status_code,
                 "error": response.error,
                 "list_complete": _kubernetes_list_complete(response.data),
+                "event_time_complete": _event_time_range_complete(name, response.data, target),
                 "data": compact(_filter_kubernetes_data(name, response.data, target), limit=5),
             }
         )
@@ -1776,6 +1779,7 @@ def _mcp_k8s_response(
         # List metadata.  It may be a server-side capped page, so it must not
         # turn an empty historical Event result into a scoped absence claim.
         "list_complete": _mcp_kubernetes_list_complete(normalized),
+        "event_time_complete": _event_time_range_complete(name, normalized, target),
         "data": compact(_filter_kubernetes_data(name, normalized, target), limit=5),
     }
 
@@ -2855,6 +2859,59 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
     return data
 
 
+def _event_time_range_complete(name: str, data: object, target: AnalysisTarget) -> bool:
+    """Whether target-correlated Warning Events have usable historical times.
+
+    An Event without a usable time cannot be placed inside or outside an
+    incident window.  Dropping it from the range projection is correct, but an
+    otherwise complete empty list must then remain ``unknown/partial`` rather
+    than becoming a false absence claim.
+    """
+    if not (
+        name in {"pod_events", "namespace_events"}
+        or name.startswith("runai_control_plane_events:")
+    ):
+        return True
+    if not incident_time_range(target):
+        return True
+    payload = _normalize_k8s_payload(data)
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return False
+    if name == "pod_events" and target.pod:
+        candidates = [
+            item
+            for item in items
+            if isinstance(item, dict)
+            and isinstance(item.get("involvedObject"), dict)
+            and str((item.get("involvedObject") or {}).get("kind") or "").casefold() == "pod"
+            and str((item.get("involvedObject") or {}).get("name") or "") == target.pod
+            and _event_matches_namespace(item, target.namespace)
+        ]
+    elif name == "namespace_events":
+        candidates = [
+            item
+            for item in items
+            if isinstance(item, dict)
+            and _event_matches_namespace(item, target.namespace)
+            and _event_matches_target(item, target)
+        ]
+    else:
+        candidates = [
+            item
+            for item in items
+            if isinstance(item, dict)
+            and _event_matches_namespace(item, _response_namespace(name) or "")
+            and _event_matches_target(item, target)
+        ]
+    window = incident_time_range(target) or {}
+    return all(
+        _event_times_are_complete_for_window(item, window)
+        for item in candidates
+        if str(item.get("type") or "") == "Warning"
+    )
+
+
 def _warning_events_are_target_scoped(target: AnalysisTarget) -> bool:
     return bool(
         target.pod
@@ -2969,11 +3026,24 @@ def _event_summary(event: dict[str, object]) -> dict[str, object]:
 
 
 def _event_timestamp(event: dict[str, object]) -> object:
+    timestamps = _event_timestamps(event)
+    return timestamps[-1][1] if timestamps else None
+
+
+def _event_timestamps(event: dict[str, object]) -> list[tuple[object, object]]:
+    """All usable Event timestamps, ordered oldest to newest.
+
+    Events can have both an older ``eventTime`` and a newer repeating-series
+    observation.  Filtering only the first populated field loses the latter
+    and can incorrectly assert that nothing happened in an incident window.
+    """
     series = event.get("series") if isinstance(event.get("series"), dict) else {}
     metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    timestamps: list[tuple[object, object]] = []
     for value in (
         event.get("eventTime"),
         series.get("lastObservedTime"),
+        event.get("firstTimestamp"),
         event.get("lastTimestamp"),
         metadata.get("creationTimestamp"),
     ):
@@ -2981,8 +3051,21 @@ def _event_timestamp(event: dict[str, object]) -> object:
         # ``0001-01-01T00:00:00Z`` is Kubernetes' zero-value eventTime.  It is
         # not an observed time and must not hide a usable legacy timestamp.
         if parsed is not None and parsed.year > 1:
-            return value
-    return None
+            timestamps.append((parsed, value))
+    return sorted(timestamps, key=lambda item: item[0])
+
+
+def _event_times_are_complete_for_window(event: dict[str, object], time_range: dict[str, str]) -> bool:
+    """An Event spanning the window cannot establish a negative without a sample."""
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    timestamps = _event_timestamps(event)
+    if start is None or end is None or not timestamps:
+        return False
+    values = [parsed for parsed, _ in timestamps]
+    # A first/last observation on opposite sides of the incident could cover
+    # the window even when neither endpoint itself lies inside it.
+    return not (min(values) < start and max(values) > end)
 
 
 def _events_in_time_range(
@@ -3001,8 +3084,8 @@ def _events_in_time_range(
     for item in items:
         if not isinstance(item, dict):
             continue
-        observed_at = parse_incident_time(_event_timestamp(item))
-        if observed_at is not None and start <= observed_at <= end:
+        timestamps = _event_timestamps(item)
+        if any(start <= observed_at <= end for observed_at, _ in timestamps):
             filtered.append(item)
     return filtered
 
