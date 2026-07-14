@@ -56,6 +56,11 @@ _CHANGE_SOURCE_GROUP = "kubernetes_api"
 _COMPONENT_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?")
 
 
+def _helm_change_detection_enabled(settings: Settings) -> bool:
+    """Whether the caller explicitly allowed Helm's Secret-backed history scan."""
+    return bool(getattr(settings, "enable_helm_change_detection", False))
+
+
 async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
     """Return a bounded, body-free change timeline for the alert's own scope.
 
@@ -71,6 +76,11 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
     source = _QUERY_KIND_ALIASES.get(source, source)
     if source not in _QUERY_KINDS:
         return _query_error("kind must be one of: " + ", ".join(sorted(_QUERY_KINDS)))
+    if source == "helm" and not _helm_change_detection_enabled(settings):
+        return _query_error(
+            "Helm release metadata scanning is disabled because it requires Secret-list RBAC",
+            source=source,
+        )
     namespace = str(target.namespace or "").strip()
     requested_namespace = str(args.get("namespace") or "").strip()
     if not namespace:
@@ -154,7 +164,7 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
         changes += await collector._recent_events(
             ns, query_limit, headers, verify, now, warnings, window_seconds=lookback
         )
-    if source in {"all", "helm"}:
+    if source in {"all", "helm"} and _helm_change_detection_enabled(settings):
         changes += await collector._recent_helm_releases(
             namespace,
             ns,
@@ -479,16 +489,18 @@ class ChangeCollector:
         events = await self._recent_events(
             ns, limit, headers, verify, window_end, warnings, window_seconds=window_seconds
         )
-        helm = await self._recent_helm_releases(
-            namespace,
-            ns,
-            limit,
-            headers,
-            verify,
-            window_end,
-            warnings,
-            window_seconds=window_seconds,
-        )
+        helm = []
+        if _helm_change_detection_enabled(self._settings):
+            helm = await self._recent_helm_releases(
+                namespace,
+                ns,
+                limit,
+                headers,
+                verify,
+                window_end,
+                warnings,
+                window_seconds=window_seconds,
+            )
 
         changes = controllers + pods + node_changes + events + helm
         # Upstream depends_on namespaces: only rollouts / Helm changes there matter
@@ -505,16 +517,17 @@ class ChangeCollector:
                 window_seconds=window_seconds,
                 historical_window=historical_window,
             )
-            changes += await self._recent_helm_releases(
-                dep_ns,
-                dep_q,
-                limit,
-                headers,
-                verify,
-                window_end,
-                warnings,
-                window_seconds=window_seconds,
-            )
+            if _helm_change_detection_enabled(self._settings):
+                changes += await self._recent_helm_releases(
+                    dep_ns,
+                    dep_q,
+                    limit,
+                    headers,
+                    verify,
+                    window_end,
+                    warnings,
+                    window_seconds=window_seconds,
+                )
         changes.sort(key=lambda c: c.get("timestamp") or "", reverse=True)
         correlated_changes, context_changes = _partition_target_changes(
             changes,
@@ -681,7 +694,15 @@ class ChangeCollector:
             verify=verify,
         )
         if response.error:
-            warnings.append(f"change {label} query failed: {response.error}")
+            if label == "helm" and response.status_code == 403:
+                warning = (
+                    "Helm release metadata skipped: Kubernetes RBAC does not allow "
+                    "listing Secrets"
+                )
+            else:
+                warning = f"change {label} query failed: {response.error}"
+            if warning not in warnings:
+                warnings.append(warning)
             return None
         data = response.data
         # A bounded list can be paginated by the API server. Without consuming

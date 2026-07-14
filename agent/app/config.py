@@ -176,6 +176,12 @@ class Settings:
     runtime_knowledge_token: str = ""
     runtime_knowledge_refresh_seconds: int = 30
     runtime_knowledge_timeout_seconds: int = 10
+    prometheus_datasource_uid: str = ""
+    loki_datasource_uid: str = ""
+    # Helm v3 release history is stored in Secrets. Keep that privileged scan
+    # opt-in: the chart's least-privilege ServiceAccount intentionally cannot
+    # list Secrets, while controller/pod/event change detection still works.
+    enable_helm_change_detection: bool = False
 
 
 def load_settings() -> Settings:
@@ -226,6 +232,7 @@ def load_settings() -> Settings:
         prometheus_url=os.getenv("PROMETHEUS_URL", "").strip().rstrip("/"),
         prometheus_timeout_seconds=_int_env("PROMETHEUS_TIMEOUT_SECONDS", 120),
         prometheus_mcp_url=os.getenv("PROMETHEUS_MCP_URL", "").strip().rstrip("/"),
+        prometheus_datasource_uid=os.getenv("PROMETHEUS_DATASOURCE_UID", "").strip(),
         loki_url=os.getenv("LOKI_URL", "").strip().rstrip("/"),
         loki_bearer_token=os.getenv("LOKI_BEARER_TOKEN", "").strip(),
         loki_basic_username=os.getenv("LOKI_BASIC_USERNAME", "").strip(),
@@ -234,6 +241,7 @@ def load_settings() -> Settings:
         loki_timeout_seconds=_int_env("LOKI_TIMEOUT_SECONDS", 120),
         loki_query_limit=max(1, _int_env("LOKI_QUERY_LIMIT", 20)),
         loki_mcp_url=os.getenv("LOKI_MCP_URL", "").strip().rstrip("/"),
+        loki_datasource_uid=os.getenv("LOKI_DATASOURCE_UID", "").strip(),
         runai_log_namespaces=_csv_env("RUNAI_LOG_NAMESPACES", ("runai", "runai-backend")),
         collectors=_csv_env(
             "COLLECTORS",
@@ -349,6 +357,7 @@ def load_settings() -> Settings:
         runtime_knowledge_timeout_seconds=max(
             1, _int_env("RUNTIME_KNOWLEDGE_TIMEOUT_SECONDS", 10)
         ),
+        enable_helm_change_detection=_bool_env("ENABLE_HELM_CHANGE_DETECTION", False),
     )
 
 

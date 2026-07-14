@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from app.collectors import kubernetes, loki, prometheus, runai
+from app.collectors.base import CollectorResult
 from app.collectors.http_json import JsonResponse
 from app.collectors.kubernetes import (
     _collect_pod_logs,
@@ -16,6 +17,8 @@ from app.collectors.kubernetes import (
     _pod_log_observation,
     _warning_event_observation,
     _warning_event_queries_complete,
+    _warning_events_in_time_range,
+    k8s_logs,
 )
 from app.collectors.postgres import (
     _collect_postgres_checks,
@@ -24,6 +27,8 @@ from app.collectors.postgres import (
     _postgres_result,
     _verified_target_aggregate,
 )
+from app.services.evidence_blackboard import Blackboard, EvidenceEligibility
+from app.services.root_cause_ranking import rank_root_cause_candidates
 from tests.test_orchestrator import make_settings, make_target
 
 
@@ -171,7 +176,7 @@ async def test_loki_emits_target_evidence_only_for_verified_native_stream_labels
     )
 
 
-def test_loki_rejects_mismatched_or_flat_mcp_labels_as_target_provenance() -> None:
+def test_loki_accepts_exact_flat_mcp_entry_labels_but_rejects_mismatch() -> None:
     target = make_target()
     window = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
     base = {
@@ -191,11 +196,12 @@ def test_loki_rejects_mismatched_or_flat_mcp_labels_as_target_provenance() -> No
         target=target,
         time_range=window,
     )
-    flat_mcp = loki._loki_query_observation(
+    exact_flat_mcp = loki._loki_query_observation(
         {
             **base,
-            # Flat Grafana MCP entries can expose one label map, but do not
-            # prove that every returned stream carried those labels.
+            # Grafana's flat shape lacks a complete stream list. The exact
+            # labels on every positive entry are still direct provenance for
+            # those returned observations.
             "stream_labels": [],
             "stream_labels_complete": False,
             "sample_entries": [
@@ -210,10 +216,114 @@ def test_loki_rejects_mismatched_or_flat_mcp_labels_as_target_provenance() -> No
         time_range=window,
     )
 
-    for observation in (mismatched, flat_mcp):
-        assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
-        assert observation["target_scope_verified"] is False
-        assert "observed_entity" not in observation
+    assert (mismatched["polarity"], mismatched["coverage"]) == ("unknown", "partial")
+    assert mismatched["target_scope_verified"] is False
+    assert "observed_entity" not in mismatched
+    assert (exact_flat_mcp["polarity"], exact_flat_mcp["coverage"]) == (
+        "present",
+        "scoped",
+    )
+    assert exact_flat_mcp["target_scope_verified"] is True
+    assert exact_flat_mcp["observed_entity"] == {"kind": "pod", "name": "trainer-0"}
+
+
+def test_loki_flat_mcp_positive_entries_fail_closed_if_one_lacks_exact_labels() -> None:
+    target = make_target()
+    window = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    observation = loki._loki_query_observation(
+        {
+            "name": "error_logs",
+            "line_count": 2,
+            "stream_count": 0,
+            "stream_labels": [],
+            "stream_labels_complete": False,
+            "sample_entries": [
+                {
+                    "timestamp": "2026-07-10T01:00:00Z",
+                    "line": "error: Traceback (most recent call last)",
+                    "labels": {"namespace": "runai-vision", "pod": "trainer-0"},
+                },
+                {
+                    "timestamp": "2026-07-10T01:00:01Z",
+                    "line": "failed while starting container",
+                    "labels": {"namespace": "runai-vision", "pod": "other-pod"},
+                },
+            ],
+        },
+        target=target,
+        time_range=window,
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert observation["target_scope_verified"] is False
+
+
+def test_historical_flat_loki_evidence_survives_blackboard_and_ranking() -> None:
+    target = replace(
+        make_target(),
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    query_window = {
+        "start": "2026-07-10T00:55:00Z",
+        "end": "2026-07-10T01:15:00Z",
+    }
+    item = {
+        "name": "error_logs",
+        "query": '{namespace="runai-vision",pod="trainer-0"} |~ "(?i)error"',
+        "line_count": 1,
+        "stream_count": 0,
+        "stream_labels": [],
+        "stream_labels_complete": False,
+        "sample_entries": [
+            {
+                "timestamp": "2026-07-10T01:02:00Z",
+                "line": "error: Traceback (most recent call last)",
+                "labels": {"namespace": "runai-vision", "pod": "trainer-0"},
+            }
+        ],
+    }
+    evidence = loki._loki_query_artifact(
+        "loki",
+        item,
+        target=target,
+        plan=None,
+        time_range=query_window,
+    )
+    evidence.evidence_id = "E01"
+    result = CollectorResult(
+        agent="loki",
+        status="ok",
+        summary="Loki returned a target-scoped historical failure line.",
+        artifacts=[evidence],
+    )
+
+    board = Blackboard(run_id="INC-historical-loki")
+    board.seed_results(
+        [result],
+        entity="pod:trainer-0",
+        timestamp=target.fired_at,
+        observed_window_start="2026-07-10T00:55:00Z",
+        observed_window_end="2026-07-10T01:10:00Z",
+    )
+    fact = board.facts()[0]
+    eligibility = EvidenceEligibility.from_fact(
+        fact,
+        context={
+            "run_id": "INC-historical-loki",
+            "window_start": "2026-07-10T00:55:00Z",
+            "window_end": "2026-07-10T01:10:00Z",
+            "entities": ("pod:trainer-0", "namespace:runai-vision"),
+        },
+    )
+
+    assert eligibility.support is True
+    ranked = rank_root_cause_candidates(
+        target,
+        [result],
+        eligible_evidence_ids={"E01"},
+    )
+    assert ranked[0].family == "workload_runtime_error"
 
 
 @pytest.mark.asyncio
@@ -1094,6 +1204,75 @@ async def test_kubernetes_logs_use_incident_since_time_and_previous_restart_log(
     )
 
 
+@pytest.mark.asyncio
+async def test_historical_kubernetes_logs_prefer_timestamped_direct_api(
+    monkeypatch,
+) -> None:
+    calls: list[dict] = []
+
+    async def fake_get_json(**kwargs):
+        calls.append(kwargs)
+        return JsonResponse(
+            url="http://kubernetes/log",
+            status_code=200,
+            data={"body": "2026-07-10T01:02:00Z failed scheduling"},
+        )
+
+    async def mcp_must_not_run(*_args, **_kwargs):
+        raise AssertionError("historical logs should use the timestamp-capable API")
+
+    monkeypatch.setattr(kubernetes, "get_json", fake_get_json)
+    monkeypatch.setattr(kubernetes, "_read_file", lambda _path: "service-account-token")
+    monkeypatch.setattr(kubernetes, "_k8s_mcp_result", mcp_must_not_run)
+    result = await k8s_logs(
+        replace(make_settings(), kubernetes_mcp_url="http://kubernetes-mcp/mcp"),
+        "runai-vision",
+        "trainer-0",
+        container="main",
+        since_time="2026-07-10T00:55:00Z",
+    )
+
+    assert result["transport"] == "direct"
+    assert result["source_verified"] is True
+    assert result["time_scope_verified"] is True
+    assert calls[0]["params"]["sinceTime"] == "2026-07-10T00:55:00Z"
+    assert calls[0]["params"]["timestamps"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_historical_mcp_log_tail_is_context_even_with_pod_identity(
+    monkeypatch,
+) -> None:
+    class Result:
+        isError = False
+        content: list = []
+        structuredContent = {
+            "metadata": {"name": "trainer-0", "namespace": "runai-vision"},
+            "body": "2026-07-10T01:02:00Z failed scheduling",
+        }
+
+    async def fake_mcp_result(*_args, **_kwargs):
+        return Result()
+
+    monkeypatch.setattr(kubernetes, "_read_file", lambda _path: "")
+    monkeypatch.setattr(kubernetes, "_k8s_mcp_result", fake_mcp_result)
+    result = await k8s_logs(
+        replace(make_settings(), kubernetes_mcp_url="http://kubernetes-mcp/mcp"),
+        "runai-vision",
+        "trainer-0",
+        since_time="2026-07-10T00:55:00Z",
+    )
+    observation, entries = _pod_log_observation(
+        result,
+        time_range={"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:10:00Z"},
+    )
+
+    assert result["source_verified"] is True
+    assert result["time_scope_verified"] is False
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert entries == [{"timestamp": "2026-07-10T01:02:00Z", "line": "failed scheduling"}]
+
+
 def test_kubernetes_pod_log_evidence_uses_only_timestamped_incident_lines() -> None:
     time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
     observation, entries = _pod_log_observation(
@@ -1385,6 +1564,140 @@ def test_workload_events_require_the_expected_controller_or_child_pod_kind() -> 
     assert _event_matches_target(child_pod, target) is True
 
 
+def test_exact_podgroup_event_supports_pod_target_when_workload_type_is_missing() -> None:
+    target = replace(
+        make_target(),
+        namespace="runai-test-pro3",
+        pod="analysistest-01-0-0",
+        workload_name="analysistest-01",
+        workload_type="",
+        fired_at="2026-07-14T01:45:00Z",
+        resolved_at="2026-07-14T01:50:00Z",
+    )
+    event = {
+        "metadata": {"namespace": target.namespace},
+        "involvedObject": {
+            "kind": "PodGroup",
+            "name": target.workload_name,
+            "namespace": target.namespace,
+        },
+        "eventTime": "2026-07-14T01:45:18Z",
+        "type": "Warning",
+        "reason": "Unschedulable",
+        # Deliberately does not repeat the Pod/workload name. Identity must
+        # come from involvedObject, not from a lucky message substring.
+        "message": (
+            "Node dgx02 didn't have enough resources: GPUs, requested: 1, "
+            "used: 8, capacity: 8"
+        ),
+    }
+
+    events = _filter_kubernetes_data("workload_events", {"items": [event]}, target)[
+        "items"
+    ]
+    observation = _warning_event_observation(
+        events,
+        time_range={"start": target.fired_at, "end": target.resolved_at},
+        status="ok",
+        target=target,
+    )
+
+    assert [item["reason"] for item in events] == ["Unschedulable"]
+    assert events[0]["target_identity_verified"] is True
+    assert events[0]["observed_entity"] == {
+        "kind": "pod",
+        "name": target.pod,
+        "namespace": target.namespace,
+    }
+    assert (observation["polarity"], observation["coverage"]) == (
+        "present",
+        "scoped",
+    )
+
+
+def test_workload_event_fallback_rejects_wrong_name_kind_and_namespace() -> None:
+    target = replace(
+        make_target(),
+        namespace="team-a",
+        workload_name="trainer",
+        workload_type="",
+        fired_at="2026-07-10T01:00:00Z",
+    )
+    base = {
+        "eventTime": "2026-07-10T01:02:00Z",
+        "type": "Warning",
+        "reason": "Unschedulable",
+    }
+    events = [
+        {
+            **base,
+            "metadata": {"namespace": "team-a"},
+            "involvedObject": {"kind": "PodGroup", "name": "other"},
+        },
+        {
+            **base,
+            "metadata": {"namespace": "team-a"},
+            "involvedObject": {"kind": "ConfigMap", "name": "trainer"},
+        },
+        {
+            **base,
+            "metadata": {"namespace": "team-b"},
+            "involvedObject": {"kind": "PodGroup", "name": "trainer"},
+        },
+    ]
+
+    filtered = _filter_kubernetes_data("workload_events", {"items": events}, target)
+
+    assert filtered["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_base_sweep_queries_exact_workload_events_even_with_a_pod(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_get_json(**kwargs):
+        calls.append(kwargs)
+        data = (
+            {"metadata": {"name": "trainer-0", "namespace": "team-a"}}
+            if str(kwargs["path"]).endswith("/pods/trainer-0")
+            else {"items": [], "metadata": {}}
+        )
+        return JsonResponse(url="https://kubernetes.test", status_code=200, data=data)
+
+    monkeypatch.setattr(kubernetes, "get_json", fake_get_json)
+    target = replace(
+        make_target(),
+        namespace="team-a",
+        pod="trainer-0",
+        workload_name="trainer",
+        workload_type="",
+        fired_at="2026-07-10T01:00:00Z",
+    )
+
+    responses = await kubernetes._collect_kubernetes_responses(
+        settings=make_settings(),
+        target=target,
+        headers={},
+        verify=True,
+        control_plane_in_scope=False,
+    )
+
+    assert [response["name"] for response in responses] == [
+        "pod",
+        "pod_events",
+        "workload_events",
+    ]
+    selectors = [
+        str((call.get("params") or {}).get("fieldSelector") or "")
+        for call in calls
+        if str(call["path"]).endswith("/events")
+    ]
+    assert selectors == [
+        "involvedObject.name=trainer-0",
+        "involvedObject.name=trainer",
+    ]
+
+
 def test_event_project_text_is_not_a_fallback_for_a_concrete_target() -> None:
     target = make_target()
     other_workload = {"message": "project vision failed to schedule workload batch-9"}
@@ -1440,6 +1753,70 @@ def test_kubernetes_warning_event_observation_exposes_actual_event_span() -> Non
         "start": "2026-07-10T01:11:00Z",
         "end": "2026-07-10T01:12:00Z",
     }
+
+
+def test_kubernetes_warning_event_projection_excludes_recovery_only_failures() -> None:
+    events = [
+        {
+            "reason": "Scheduled",
+            "message": "pod scheduled",
+            "observedTimestamps": ["2026-07-10T01:02:00Z"],
+        },
+        {
+            "reason": "PostResolutionFailure",
+            "message": "failed only after recovery",
+            "observedTimestamps": ["2026-07-10T01:12:00Z"],
+        },
+        {
+            "reason": "Repeating",
+            "message": "same event repeated",
+            "observedTimestamps": [
+                "2026-07-10T01:03:00Z",
+                "2026-07-10T01:13:00Z",
+            ],
+        },
+    ]
+
+    projected = _warning_events_in_time_range(
+        events,
+        {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:10:00Z"},
+    )
+
+    assert [event["reason"] for event in projected] == ["Scheduled", "Repeating"]
+    assert projected[1]["observedTimestamps"] == ["2026-07-10T01:03:00Z"]
+    assert projected[1]["lastTimestamp"] == "2026-07-10T01:03:00Z"
+
+
+def test_kubernetes_warning_events_with_multiple_pod_uids_are_identity_ambiguous() -> None:
+    target = make_target()
+    entity = {
+        "kind": "pod",
+        "name": target.pod,
+        "namespace": target.namespace,
+    }
+    observation = _warning_event_observation(
+        [
+            {
+                "uid": "old-pod-uid",
+                "target_identity_verified": True,
+                "observed_entity": entity,
+                "observedTimestamps": ["2026-07-10T01:02:00Z"],
+            },
+            {
+                "uid": "replacement-pod-uid",
+                "target_identity_verified": True,
+                "observed_entity": entity,
+                "observedTimestamps": ["2026-07-10T01:03:00Z"],
+            },
+        ],
+        time_range={"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:10:00Z"},
+        status="ok",
+        target=target,
+    )
+
+    assert observation["target_identity_ambiguous"] is True
+    assert observation["target_identity_verified"] is False
+    assert (observation["polarity"], observation["coverage"]) == ("present", "partial")
 
 
 def test_kubernetes_warning_events_require_involved_object_identity_for_support() -> None:
@@ -1506,6 +1883,12 @@ def test_kubernetes_warning_event_absence_requires_all_event_queries_to_succeed(
             {"name": "runai_control_plane_events:runai", "error": "HTTP 403"},
         ]
     )
+    workload_incomplete = _warning_event_queries_complete(
+        [
+            {"name": "pod_events", "error": None},
+            {"name": "workload_events", "error": "HTTP 403"},
+        ]
+    )
     paginated = _warning_event_queries_complete(
         [{"name": "pod_events", "error": None, "list_complete": False}]
     )
@@ -1515,6 +1898,7 @@ def test_kubernetes_warning_event_absence_requires_all_event_queries_to_succeed(
 
     assert complete is True
     assert incomplete is False
+    assert workload_incomplete is False
     assert paginated is False
     assert untimed is False
     assert _kubernetes_list_complete({"items": [], "metadata": {"continue": "next"}}) is False

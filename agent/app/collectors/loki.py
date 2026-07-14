@@ -4,7 +4,6 @@ import base64
 import json
 import re
 from datetime import UTC, datetime
-from typing import Any
 
 from app.collectors.base import (
     NO_EVIDENCE,
@@ -15,6 +14,11 @@ from app.collectors.base import (
     ko_en,
     parse_incident_time,
 )
+from app.collectors.grafana_mcp import (
+    mark_grafana_datasource_failure,
+    resolve_grafana_datasource_uid,
+    validate_grafana_datasource_uid,
+)
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.knowledge import _keyword_negated
@@ -23,6 +27,7 @@ from app.masking import build_masker
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
     mcp_call,
+    mcp_call_many,
     mcp_error,
     mcp_fallback_warning,
     mcp_tool_json,
@@ -109,10 +114,12 @@ class LokiCollector:
             # alert regardless of target and always steered ranking to
             # runai_control_plane_error. Keep it specific to real failures.
             runai_error_query = (
-                f'{runai_selector} |~ '
-                '"(?i)(reconcile.*(error|fail)|admission.*(error|denied|reject)|'
-                'scheduler.*(error|fail|panic)|authorization.*(error|denied)|'
-                'database.*(error|fail|timeout)|panic|fatal)"'
+                f"{runai_selector} |~ "
+                + _logql_string(
+                    "(?i)(reconcile.*(error|fail)|admission.*(error|denied|reject)|"
+                    "scheduler.*(error|fail|panic)|authorization.*(error|denied)|"
+                    "database.*(error|fail|timeout)|panic|fatal)"
+                )
             )
             queries.append(("runai_control_plane_errors", runai_error_query))
             # A dying workload's real cause often sits in scheduler/backend logs that
@@ -126,7 +133,8 @@ class LokiCollector:
                 queries.append(
                     (
                         "runai_control_plane_for_workload",
-                        f'{runai_selector} |~ "(?i)({correlation})"',
+                        f"{runai_selector} |~ "
+                        + _logql_string(f"(?i)({correlation})"),
                     )
                 )
         query_results = []
@@ -370,7 +378,7 @@ async def _collect_loki_direct(
         )
         streams = _loki_streams(response.data)
         line_count = sum(len(stream.get("values", [])) for stream in streams)
-        error = response.error
+        error = _loki_response_error(response.error, response.data)
         if error is None and not _loki_native_response_complete(response.data):
             error = "Loki response missing successful data.result"
         query_results.append(
@@ -401,18 +409,43 @@ async def _collect_loki_direct(
 async def _collect_loki_mcp(
     settings: Settings, queries: list[tuple[str, str]], time_range: dict[str, str] | None = None
 ) -> list[dict[str, object]]:
-    datasource_uid = await _grafana_datasource_uid(settings.loki_mcp_url, "loki")
-    return [
-        await _mcp_query_loki(
-            settings.loki_mcp_url,
-            name,
-            query,
-            settings.loki_query_limit,
-            datasource_uid,
-            time_range,
+    datasource_uid = await _grafana_datasource_uid(
+        settings.loki_mcp_url,
+        "loki",
+        settings.loki_datasource_uid,
+    )
+    calls = [
+        (
+            "query_loki_logs",
+            _loki_mcp_args(
+                query,
+                settings.loki_query_limit,
+                datasource_uid,
+                time_range,
+            ),
         )
-        for name, query in queries
+        for _name, query in queries
     ]
+    try:
+        results = await mcp_call_many(settings.loki_mcp_url, calls)
+        return [
+            _loki_mcp_item(
+                name,
+                query,
+                settings.loki_mcp_url,
+                _mcp_result_json(result, "query_loki_logs"),
+                time_range,
+            )
+            for (name, query), result in zip(queries, results, strict=True)
+        ]
+    except Exception as exc:
+        mark_grafana_datasource_failure(
+            settings.loki_mcp_url,
+            "loki",
+            settings.loki_datasource_uid,
+            exc,
+        )
+        raise
 
 
 async def loki_mcp_query(
@@ -422,15 +455,28 @@ async def loki_mcp_query(
     *,
     time_range: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    datasource_uid = await _grafana_datasource_uid(settings.loki_mcp_url, "loki")
-    return await _mcp_query_loki(
+    datasource_uid = await _grafana_datasource_uid(
         settings.loki_mcp_url,
-        name,
-        logql,
-        settings.loki_query_limit,
-        datasource_uid,
-        time_range,
+        "loki",
+        settings.loki_datasource_uid,
     )
+    try:
+        return await _mcp_query_loki(
+            settings.loki_mcp_url,
+            name,
+            logql,
+            settings.loki_query_limit,
+            datasource_uid,
+            time_range,
+        )
+    except Exception as exc:
+        mark_grafana_datasource_failure(
+            settings.loki_mcp_url,
+            "loki",
+            settings.loki_datasource_uid,
+            exc,
+        )
+        raise
 
 
 async def _mcp_query_loki(
@@ -446,15 +492,26 @@ async def _mcp_query_loki(
     # EVERY query. Fail fast with an actionable message instead of that noise; the
     # caller records a clean fallback warning. (uid usually empty because grafana-mcp
     # can't list datasources — set secrets.grafanaServiceAccountToken.)
-    if not datasource_uid:
-        raise RuntimeError(
-            "grafana datasource uid unresolved for loki — set "
-            "secrets.grafanaServiceAccountToken so grafana-mcp can list datasources"
-        )
+    datasource_uid = validate_grafana_datasource_uid(datasource_uid, "loki")
     # Match mcp-grafana's query_loki_logs schema exactly. The previous compatibility
     # retries mixed old argument names (`query`, `datasource_uid`, `startTime`) with
     # the current schema. When those retries failed, the last error came from a call
     # with no recognized datasourceUid and misleadingly reported "id is invalid".
+    args = _loki_mcp_args(logql, limit, datasource_uid, time_range)
+    try:
+        data = await _call_mcp_json(url, "query_loki_logs", [args])
+    except Exception as exc:
+        mark_grafana_datasource_failure(url, "loki", datasource_uid, exc)
+        raise
+    return _loki_mcp_item(name, logql, url, data, time_range)
+
+
+def _loki_mcp_args(
+    logql: str,
+    limit: int,
+    datasource_uid: str,
+    time_range: dict[str, str] | None,
+) -> dict[str, object]:
     args: dict[str, object] = {
         "datasourceUid": datasource_uid,
         "logql": logql,
@@ -471,7 +528,16 @@ async def _mcp_query_loki(
                 "endRfc3339": time_range["end"],
             }
         )
-    data = await _call_mcp_json(url, "query_loki_logs", [args])
+    return args
+
+
+def _loki_mcp_item(
+    name: str,
+    logql: str,
+    url: str,
+    data: object,
+    time_range: dict[str, str] | None,
+) -> dict[str, object]:
     if not _loki_mcp_response_complete(data):
         return {
             "name": name,
@@ -522,8 +588,9 @@ async def _mcp_query_loki(
         "sample_entries": entries[:8],
         # A native Loki result exposes one complete label set per stream.  The
         # Grafana MCP flat-entry shape does not promise that it returned every
-        # stream, even when individual entries happen to include labels, so it
-        # deliberately remains unverifiable for target-scoped RCA evidence.
+        # stream.  It deliberately remains incomplete here; the observation
+        # layer may still use a positive entry only after checking that entry's
+        # own namespace/resource labels exactly match the target.
         "stream_labels": _stream_label_sets(streams),
         "stream_labels_complete": bool(streams) and _stream_labels_complete(streams),
         "sample": compact(streams or data, limit=3),
@@ -625,13 +692,12 @@ def _loki_query_observation(
     target_scope_verified: bool | None = None
     if target is not None and polarity in {"present", "absent"}:
         observed_entity, target_scope_verified = _loki_target_scope(
-            name, item, target=target, plan=plan
+            name, item, target=target, plan=plan, time_range=time_range
         )
         if target_scope_verified is not True:
             # A LogQL selector is request intent, not returned-data
-            # provenance.  A proxy may ignore a matcher, and flat MCP results
-            # do not establish that labels cover every returned stream.  Do
-            # not let either shape inherit the pipeline target as RCA support.
+            # provenance. A proxy may ignore a matcher, and an unlabeled or
+            # mismatched flat MCP entry cannot inherit the pipeline target.
             polarity, coverage = "unknown", "partial"
     observation = {
         "kind": "loki_query",
@@ -702,19 +768,18 @@ def _loki_target_scope(
     *,
     target: AnalysisTarget,
     plan: object | None,
+    time_range: dict[str, str] | None,
 ) -> tuple[dict[str, str] | None, bool]:
     """Validate native Loki stream labels against the selector's target scope.
 
     ``workload_history_logs`` and the Run:ai control-plane correlation query
     intentionally match text inside broader streams.  Their labels cannot
-    prove the alert workload identity, so they stay context-only.  Primary
-    target stream queries require every returned stream to name the requested
-    namespace and either the exact Pod or an exact workload label.
+    prove the alert workload identity, so they stay context-only. Primary
+    target stream queries accept either complete native stream labels or, for
+    Grafana's flat MCP shape, exact labels carried by every positive in-window
+    sample entry. Query text alone never supplies provenance.
     """
     if name not in {"error_logs", "recent_logs"}:
-        return None, False
-    labels = item.get("stream_labels")
-    if item.get("stream_labels_complete") is not True or not isinstance(labels, list) or not labels:
         return None, False
 
     namespace = target.namespace
@@ -741,7 +806,16 @@ def _loki_target_scope(
         required = (("namespace", namespace),)
         entity = {"kind": "namespace", "name": namespace}
 
-    for raw_labels in labels:
+    labels = item.get("stream_labels")
+    if item.get("stream_labels_complete") is True and isinstance(labels, list) and labels:
+        label_sets: list[object] = labels
+    else:
+        entry_labels = _loki_positive_entry_labels(item.get("sample_entries"), time_range)
+        if entry_labels is None:
+            return None, False
+        label_sets = entry_labels
+
+    for raw_labels in label_sets:
         if not isinstance(raw_labels, dict):
             return None, False
         normalized = {
@@ -762,6 +836,43 @@ def _loki_target_scope(
             if workload not in workload_labels:
                 return None, False
     return entity, True
+
+
+def _loki_positive_entry_labels(
+    entries: object,
+    time_range: dict[str, str] | None,
+) -> list[dict[str, object]] | None:
+    """Exact label maps for every positive in-window flat MCP entry.
+
+    ``None`` is fail-closed: no timestamped positive entry, or one unlabeled
+    positive in-window line, means the flat response cannot establish target
+    provenance. Non-causal/recovery rows are ignored because they are not used
+    as support by the observation verdict either.
+    """
+    if not time_range:
+        return None
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return None
+    found: list[dict[str, object]] = []
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        timestamp = parse_incident_time(entry.get("timestamp"))
+        line = entry.get("line")
+        if (
+            timestamp is None
+            or not (start <= timestamp <= end)
+            or not isinstance(line, str)
+            or not _loki_line_affirms_failure(line)
+        ):
+            continue
+        labels = entry.get("labels")
+        if not isinstance(labels, dict) or not labels:
+            return None
+        found.append(labels)
+    return found or None
 
 
 def _loki_evidence_window(
@@ -859,40 +970,17 @@ def _loki_flat_log_result_complete(value: object) -> bool:
     )
 
 
-# Grafana datasource uids are ^[a-zA-Z0-9\-_]{1,40}$; a numeric row id or a
-# display name passed as datasourceUid makes grafana-mcp fail EVERY query with
-# 400 "id is invalid" — which demoted the whole collector to the direct fallback.
-_GRAFANA_UID = re.compile(r"^[a-zA-Z0-9\-_]{1,40}$")
-
-
-async def _grafana_datasource_uid(url: str, datasource_type: str) -> str:
-    try:
-        data = await _call_mcp_json(url, "list_datasources", [{}])
-    except Exception:  # noqa: BLE001 - query tools may work without discovery.
-        return ""
-    for datasource in _datasource_items(data):
-        dtype = str(datasource.get("type") or "").lower()
-        name = str(datasource.get("name") or "").lower()
-        if datasource_type in dtype or datasource_type in name:
-            uid = str(datasource.get("uid") or "")
-            if _GRAFANA_UID.match(uid):
-                return uid
-    return ""
-
-
-def _datasource_items(data: Any) -> list[dict[str, Any]]:
-    if isinstance(data, list):
-        return [item for item in data if isinstance(item, dict)]
-    if not isinstance(data, dict):
-        return []
-    for key in ("datasources", "items", "result"):
-        value = data.get(key)
-        if isinstance(value, list):
-            return [item for item in value if isinstance(item, dict)]
-    nested = data.get("data")
-    if isinstance(nested, list):
-        return [item for item in nested if isinstance(item, dict)]
-    return []
+async def _grafana_datasource_uid(
+    url: str,
+    datasource_type: str,
+    configured_uid: str = "",
+) -> str:
+    return await resolve_grafana_datasource_uid(
+        url,
+        datasource_type,
+        configured_uid,
+        call_json=_call_mcp_json,
+    )
 
 
 async def _call_mcp_json(
@@ -905,16 +993,22 @@ async def _call_mcp_json(
         except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
             last_error = f"{exc.__class__.__name__}: {exc}"
             continue
-        error = mcp_error(result)
-        if error:
-            last_error = error
+        try:
+            return _mcp_result_json(result, tool)
+        except RuntimeError as exc:
+            last_error = str(exc)
             continue
-        data = mcp_tool_json(result)
-        if isinstance(data, dict) and "raw" in data:
-            last_error = "MCP result was not JSON"
-            continue
-        return data
     raise RuntimeError(last_error or f"{tool} failed")
+
+
+def _mcp_result_json(result: object, tool: str) -> object:
+    error = mcp_error(result)
+    if error:
+        raise RuntimeError(error)
+    data = mcp_tool_json(result)
+    if isinstance(data, dict) and "raw" in data:
+        raise RuntimeError(f"{tool} result was not JSON")
+    return data
 
 
 def _log_lines_from_mcp_data(data: object) -> list[str]:
@@ -997,11 +1091,13 @@ def _selector_for(target: AnalysisTarget, plan=None) -> str:
         workload = plan.workload or workload
     selector_parts = []
     if namespace:
-        selector_parts.append(f'namespace="{namespace}"')
+        selector_parts.append(f"namespace={_logql_string(namespace)}")
     if pod:
-        selector_parts.append(f'pod="{pod}"')
+        selector_parts.append(f"pod={_logql_string(pod)}")
     elif workload:
-        selector_parts.append(f'app=~".*{workload}.*"')
+        selector_parts.append(
+            f"app=~{_logql_string(f'.*{re.escape(workload)}.*')}"
+        )
     return "{" + ",".join(selector_parts) + "}" if selector_parts else "{}"
 
 
@@ -1023,7 +1119,9 @@ def _workload_history_query(target: AnalysisTarget, plan=None) -> str:
     terms = _workload_history_terms(workload, target.runai_workload_id)
     if not terms:
         return ""
-    return f'{{namespace="{namespace}"}} |~ "(?i)({"|".join(terms)})"'
+    selector = f"{{namespace={_logql_string(namespace)}}}"
+    pattern = "(?i)(" + "|".join(terms) + ")"
+    return f"{selector} |~ {_logql_string(pattern)}"
 
 
 def _workload_history_terms(*values: str) -> list[str]:
@@ -1032,7 +1130,7 @@ def _workload_history_terms(*values: str) -> list[str]:
         normalized = str(value or "").strip()
         if len(normalized) < 3:
             continue
-        escaped = re.escape(normalized).replace('"', r'\"')
+        escaped = re.escape(normalized)
         if escaped not in terms:
             terms.append(escaped)
     return terms
@@ -1053,10 +1151,26 @@ def _control_plane_correlation_term(target: AnalysisTarget, plan=None) -> str:
 
 
 def _namespace_regex_selector(namespaces: tuple[str, ...]) -> str:
-    escaped = [namespace.replace("\\", "\\\\").replace('"', '\\"') for namespace in namespaces]
+    escaped = [re.escape(namespace) for namespace in namespaces]
     if not escaped:
         return ""
-    return '{namespace=~"' + "|".join(escaped) + '"}'
+    return "{namespace=~" + _logql_string("|".join(escaped)) + "}"
+
+
+def _logql_string(value: str) -> str:
+    """Encode a LogQL/Go quoted string, including regex backslashes."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _loki_response_error(transport_error: str | None, data: object) -> str | None:
+    if not transport_error:
+        return None
+    if not isinstance(data, dict):
+        return transport_error
+    detail = str(data.get("error") or data.get("message") or "").strip()
+    if not detail:
+        return transport_error
+    return f"{transport_error}: {' '.join(detail.split())[:300]}"
 
 
 def _loki_status(data: object) -> str:

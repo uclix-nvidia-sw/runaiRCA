@@ -1,118 +1,106 @@
-"""Optional Run:ai evidence gathering via the runai-mcp server.
+"""Read-only Run:ai evidence gathering through NVIDIA's official MCP server.
 
-When RUNAI_MCP_URL is set, the Run:ai collector pulls its context through the
-runai-mcp server's `call_runai_api` tool (426 Run:ai APIs, spec-aware, auto-authed
-by the managed service) instead of the fixed curl endpoints. ANY failure — the mcp package
-not installed, the service unreachable, a tool error, an unparseable result —
-returns None so the caller falls back to the direct-HTTP collector. The MCP path is
-strictly additive and never breaks analysis.
+The official ``nvcr.io/nvidia/runai/runai-mcp-server`` exposes focused Run:ai
+tools over authenticated streamable HTTP.  It is deliberately *not* an OpenAPI
+proxy: callers must use its supported workload, resource, cluster, and identity
+tools rather than issuing arbitrary API paths.  Every request carries the
+existing Run:ai bearer token (obtained from ``RUNAI_BEARER_TOKEN`` or client
+credentials) because the server protects its ``/mcp`` endpoint with OIDC.
 
-The runai-mcp server is stdio-only; deploy it behind a stdio->HTTP
-bridge (e.g. mcp-proxy) and point RUNAI_MCP_URL at the bridge's streamable-HTTP
-endpoint (http://localhost:<port>/mcp).
+MCP remains additive.  An unavailable service, token, or unsupported response
+returns ``None`` and the collector falls back to its direct HTTP reads.
 """
 
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 from app.collectors.base import AnalysisTarget
 from app.config import Settings
 from app.masking import build_masker
-from app.mcp_client import mcp_error, mcp_tool_json, mcp_tool_text
+from app.mcp_client import mcp_call, mcp_error, mcp_tool_json, mcp_tool_text
 
 
 async def gather_runai_via_mcp(
-    settings: Settings, target: AnalysisTarget
+    settings: Settings, target: AnalysisTarget, *, headers: dict[str, str]
 ) -> list[dict[str, Any]] | None:
-    """Return query_results (same shape as the direct collector) via the MCP, or
-    None to signal the caller to fall back to direct HTTP."""
+    """Return official-MCP query results, or ``None`` for direct-HTTP fallback."""
     if not settings.runai_mcp_url:
         return None
+    if not headers.get("Authorization"):
+        # The official HTTP transport rejects unauthenticated MCP sessions.
+        return None
     try:
-        return await _gather(settings, target)
-    except Exception:  # noqa: BLE001 - MCP is best-effort; never break the collector
+        return await _gather(settings, target, headers=headers)
+    except Exception:  # noqa: BLE001 - MCP is best-effort; never break analysis
         return None
 
 
-async def _gather(settings: Settings, target: AnalysisTarget) -> list[dict[str, Any]] | None:
-    # Lazy import so the agent runs without the `mcp` package until MCP is configured.
-    from mcp import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
-
-    # Per query: ordered path CANDIDATES, first success wins. Run:ai moved the
-    # org tree under /api/v1/org-unit/… (2.18+); older control planes still
-    # serve the flat paths — a 404 on one shape must not lose the whole
-    # context (the "projects/queues 404 — only workloads collected" runs).
-    # departments/clusters ride along: queue fairshare needs the department,
-    # and /clusters carries control-plane connectivity state.
-    plan: list[tuple[str, str, list[str], dict | None]] = [
-        ("workloads", "GET", [settings.runai_workloads_path], _workload_params(target)),
-        (
-            "projects",
-            "GET",
-            _dedup([settings.runai_projects_path, "/api/v1/org-unit/projects"]),
-            None,
-        ),
-        ("departments", "GET", ["/api/v1/org-unit/departments", "/api/v1/departments"], None),
-        ("queues", "GET", [settings.runai_queues_path], None),
-        ("clusters", "GET", ["/api/v1/clusters"], None),
-        ("version", "GET", [settings.runai_version_path], None),
+async def _gather(
+    settings: Settings, target: AnalysisTarget, *, headers: dict[str, str]
+) -> list[dict[str, Any]]:
+    # These are the read-only tools shipped by NVIDIA Run:ai MCP 2.26.13.  Keep
+    # requests narrowly scoped to alert labels; in particular, do not recreate
+    # the former generic ``call_runai_api`` proxy over this trusted server.
+    plan: list[tuple[str, str, dict[str, str]]] = [
+        ("workloads", "get_workloads_summary", _workload_summary_args(target)),
+        ("identity", "whoami", {}),
+        ("node_pools", "list_node_pools", {}),
     ]
-    out: list[dict[str, Any]] = []
-    async with streamablehttp_client(settings.runai_mcp_url) as (read, write, *_rest):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            for name, method, paths, params in plan:
-                paths = [path for path in paths if path]
-                if not paths:
-                    continue
-                out.append(await _call_api(session, name, method, paths, params))
-    return out or None
+    if valid_official_workload_id(target.runai_workload_id):
+        plan.insert(
+            1,
+            ("workload_status", "get_workload_status", {"workloadId": target.runai_workload_id}),
+        )
+    if target.project:
+        plan.append(
+            ("project_resources", "list_project_resources", {"projectName": target.project})
+        )
+
+    return [
+        await _call_tool(settings, name, tool, arguments, headers=headers)
+        for name, tool, arguments in plan
+    ]
 
 
-def _dedup(paths: list[str]) -> list[str]:
-    return list(dict.fromkeys(path for path in paths if path))
-
-
-async def _call_api(
-    session: Any, name: str, method: str, paths: list[str], params: dict | None
+async def _call_tool(
+    settings: Settings,
+    name: str,
+    tool: str,
+    arguments: dict[str, str],
+    *,
+    headers: dict[str, str],
 ) -> dict[str, Any]:
-    last: dict[str, Any] | None = None
-    for path in paths:
-        args: dict[str, Any] = {"method": method, "path": path}
-        if params:
-            args["query"] = params
-        query = f"MCP call_runai_api {method} {path}"
-        try:
-            result = await session.call_tool("call_runai_api", args)
-        except Exception as exc:  # noqa: BLE001 - per-query failure is an observation
-            last = {
-                "name": name,
-                "query": query,
-                "status_code": None,
-                "error": _safe_text(f"{exc.__class__.__name__}: {exc}", limit=300),
-                "data": None,
-            }
-            continue
-        if getattr(result, "isError", False):
-            last = {
-                "name": name,
-                "query": query,
-                "status_code": None,
-                "error": mcp_error(result),
-                "data": None,
-            }
-            continue
+    query = f"MCP {tool}" + (f" {arguments}" if arguments else "")
+    try:
+        result = await mcp_call(settings.runai_mcp_url, tool, arguments, headers=headers)
+    except Exception as exc:  # noqa: BLE001 - per-tool failure is evidence
         return {
             "name": name,
             "query": query,
-            "status_code": 200,
-            "error": None,
-            "data": _tool_json(result),
+            "transport": "mcp",
+            "status_code": None,
+            "error": _safe_text(f"{exc.__class__.__name__}: {exc}", limit=300),
+            "data": None,
         }
-    return last or {"name": name, "query": name, "status_code": None,
-                    "error": "no path configured", "data": None}
+    if getattr(result, "isError", False):
+        return {
+            "name": name,
+            "query": query,
+            "transport": "mcp",
+            "status_code": None,
+            "error": mcp_error(result),
+            "data": None,
+        }
+    return {
+        "name": name,
+        "query": query,
+        "transport": "mcp",
+        "status_code": 200,
+        "error": None,
+        "data": _tool_json(result),
+    }
 
 
 def _tool_text(result: Any) -> str:
@@ -130,10 +118,22 @@ def _safe_text(value: str, *, limit: int) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
-def _workload_params(target: AnalysisTarget) -> dict[str, str] | None:
-    params: dict[str, str] = {}
-    if target.workload_name:
-        params["name"] = target.workload_name
-    if target.project:
-        params["projectName"] = target.project
-    return params or None
+def _workload_summary_args(target: AnalysisTarget) -> dict[str, str]:
+    # NVIDIA's summary tool scopes an organization with the paired
+    # ``orgType``/``orgName`` fields. A workload name is not globally unique,
+    # so keep the project boundary when available rather than pretending a
+    # name-only lookup is scoped evidence.
+    return (
+        {"orgType": "project", "orgName": target.project}
+        if target.project
+        else {}
+    )
+
+
+def valid_official_workload_id(value: str) -> bool:
+    """Whether a label can satisfy the official MCP's UUID workload schema."""
+    try:
+        UUID(value)
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return True

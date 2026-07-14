@@ -427,9 +427,16 @@ class SystemCollector:
         node_origin = "alert" if alert_node else (node_source or ("plan" if planned_node else ""))
         resolved_pod = ""
         if not node:
-            node, resolved_pod = await _node_from_target_pod(self._settings, target, plan)
+            placement = await _node_from_target_pod(self._settings, target, plan)
+            # Keep compatibility with test/custom monkeypatches written against
+            # the old two-field helper while production returns provenance.
+            if len(placement) == 3:
+                node, resolved_pod, resolved_origin = placement
+            else:  # pragma: no cover - compatibility branch exercised by callers
+                node, resolved_pod = placement
+                resolved_origin = "live_pod"
             if node:
-                node_origin = "live_pod"
+                node_origin = resolved_origin
         if not node:
             summary = f"{NO_EVIDENCE} " + ko_en(
                 self._settings,
@@ -477,10 +484,14 @@ class SystemCollector:
         headers = {"Authorization": f"Bearer {token}"} if token else None
         time_range = incident_time_range(target)
         # A node discovered from a current Pod is useful to inspect, but cannot
-        # prove that a historical incident occurred on that node.  Only an
-        # alert-supplied node identity can scope old journal evidence.
+        # prove that a historical incident occurred on that node. An exact Pod
+        # Event inside the incident window does establish historical placement.
         historical_node_scope_verified = bool(
-            time_range and alert_node and node == alert_node
+            time_range
+            and (
+                (alert_node and node == alert_node)
+                or node_origin == "historical_pod_event"
+            )
         )
         source_results = []
         raw_matches: dict[str, list[str]] = {}
@@ -758,7 +769,7 @@ async def _llm_insight(settings: Settings, node: str, error_lines: list[str]) ->
 
 async def _node_from_target_pod(
     settings: Settings, target: AnalysisTarget, plan: object | None
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """Best-effort node resolution from the target Pod's ``spec.nodeName``.
 
     ``resolve_live_pod_node`` first GETs the target Pod and then uses a bounded
@@ -769,14 +780,46 @@ async def _node_from_target_pod(
     namespace = str(target.namespace or "").strip()
     pod = str(getattr(plan, "pod", "") or target.pod or "").strip()
     if not namespace or not pod:
-        return "", ""
+        return "", "", ""
     try:
-        from app.collectors.kubernetes import resolve_live_pod_node
+        from app.collectors.kubernetes import (
+            _describe_events,
+            node_from_pod_events,
+            resolve_live_pod_node,
+        )
 
-        resolved_pod, node = await resolve_live_pod_node(settings, namespace, pod)
-        return str(node or "").strip(), str(resolved_pod or "").strip()
+        # A resolved incident must never follow a same-prefix Pod that exists
+        # today. Resolve only the exact historical Pod's timestamped Events;
+        # those can prove its old node even after the Pod object was deleted.
+        if target.resolved_at:
+            events = await _describe_events(
+                settings,
+                namespace=namespace,
+                name=pod,
+                expected_kind="Pod",
+                expected_uid=target.pod_uid,
+                time_range=incident_time_range(target),
+            )
+            node = node_from_pod_events(
+                [event for event in events if isinstance(event, dict)]
+            )
+            return (
+                str(node or "").strip(),
+                pod if node else "",
+                "historical_pod_event" if node else "",
+            )
+
+        workload = str(target.workload_name or getattr(plan, "workload", "") or "").strip()
+        resolved_pod, node = await resolve_live_pod_node(
+            settings, namespace, pod, workload=workload
+        )
+        return (
+            str(node or "").strip(),
+            str(resolved_pod or "").strip(),
+            "live_pod" if node else "",
+        )
     except Exception:  # noqa: BLE001 - system evidence remains optional
-        return "", ""
+        return "", "", ""
 
 
 def _collector_masker(settings: Settings):

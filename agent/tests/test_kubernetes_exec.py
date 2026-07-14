@@ -120,6 +120,66 @@ async def test_k8s_exec_streams_an_allowlisted_command(monkeypatch) -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_k8s_exec_classifies_forbidden_handshake_without_echoing_url(monkeypatch) -> None:
+    from app.collectors import kubernetes as k8s
+
+    class ForbiddenHandshake(Exception):
+        status = 403
+
+    async def denied(_settings, **_kwargs):
+        raise ForbiddenHandshake(
+            "403, url='wss://kubernetes.default.svc/api/v1/pods/trainer-0/exec?command=free'"
+        )
+
+    monkeypatch.setattr(k8s, "_read_file", lambda _path: "service-account-token")
+    monkeypatch.setattr(k8s, "_exec_via_websocket", denied)
+    result = await k8s.k8s_exec(
+        replace(load_settings(), enable_pod_exec=True),
+        "runai",
+        "trainer-0",
+        ["free", "-h"],
+    )
+
+    assert result["error_code"] == "kubernetes_exec_forbidden"
+    assert result["transport_error"] is True
+    assert result["retryable"] is False
+    assert result["status_code"] == 403
+    assert "get/create" in str(result["error"])
+    assert "pods/exec" in str(result["error"])
+    assert "wss://" not in str(result["error"])
+    assert "command=free" not in str(result["error"])
+
+
+@pytest.mark.asyncio
+async def test_exec_probe_batch_stops_after_transport_failure(monkeypatch) -> None:
+    from app.collectors import kubernetes as k8s
+
+    calls: list[tuple[str, ...]] = []
+
+    async def forbidden(_settings, _namespace, _pod, command, container=""):
+        calls.append(tuple(command))
+        return {
+            "namespace": "runai",
+            "pod": "trainer-0",
+            "container": container,
+            "error": "pod exec denied",
+            "error_code": "kubernetes_exec_forbidden",
+            "transport_error": True,
+        }
+
+    monkeypatch.setattr(k8s, "k8s_exec", forbidden)
+    probes = await k8s._collect_exec_probes(
+        settings=replace(load_settings(), enable_pod_exec=True),
+        target=_target(),
+        containers=["main"],
+    )
+
+    assert calls == [("free", "-h")]
+    assert len(probes) == 1
+    assert probes[0]["error_code"] == "kubernetes_exec_forbidden"
+
+
 def test_exec_probe_aggregate_requires_one_verified_pod_identity() -> None:
     from app.collectors.kubernetes import _exec_probes_observed_entity
 

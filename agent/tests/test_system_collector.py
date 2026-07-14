@@ -423,6 +423,107 @@ async def test_live_pod_node_fallback_runs_but_historical_evidence_stays_partial
 
 
 @pytest.mark.asyncio
+async def test_resolved_pod_node_comes_from_incident_window_event_not_live_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.collectors import kubernetes as k8s
+
+    seen: dict[str, object] = {}
+
+    async def fake_describe_events(
+        _settings,
+        *,
+        namespace,
+        name,
+        expected_kind,
+        expected_uid,
+        time_range,
+    ):
+        seen.update(
+            namespace=namespace,
+            name=name,
+            expected_kind=expected_kind,
+            expected_uid=expected_uid,
+            time_range=time_range,
+        )
+        return [
+            {
+                "source": {"component": "kubelet", "host": "gpu-node-old"},
+                "involvedObject": {"kind": "Pod", "name": name, "uid": expected_uid},
+                "lastTimestamp": "2026-07-13T21:44:00Z",
+            }
+        ]
+
+    async def live_resolver_must_not_run(*_args, **_kwargs):
+        raise AssertionError("resolved incidents must not follow a live replacement Pod")
+
+    monkeypatch.setattr(k8s, "_describe_events", fake_describe_events)
+    monkeypatch.setattr(k8s, "resolve_live_pod_node", live_resolver_must_not_run)
+    target = replace(
+        _target(node=""),
+        pod="trainer-dead",
+        pod_uid="uid-dead",
+        fired_at="2026-07-13T21:43:47Z",
+        resolved_at="2026-07-13T21:45:47Z",
+    )
+
+    placement = await system_mod._node_from_target_pod(
+        _Settings(), target, InvestigationPlan(pod="trainer-dead")
+    )
+
+    assert placement == ("gpu-node-old", "trainer-dead", "historical_pod_event")
+    assert seen == {
+        "namespace": "runai",
+        "name": "trainer-dead",
+        "expected_kind": "Pod",
+        "expected_uid": "uid-dead",
+        "time_range": {
+            "start": "2026-07-13T21:38:47Z",
+            "end": "2026-07-13T21:50:47Z",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_historical_pod_event_node_scopes_incident_journal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_node_from_target_pod(*_args, **_kwargs):
+        return "gpu-node-old", "trainer-dead", "historical_pod_event"
+
+    async def fake_get_json(*, params, **_kwargs):
+        source = params["source"]
+        data = {
+            "source": source,
+            "since": params.get("since"),
+            "until": params.get("until"),
+            "lines": (
+                ["2026-07-13T21:44:00Z kernel: NVRM: Xid 79"]
+                if source == "journal"
+                else []
+            ),
+        }
+        return JsonResponse(url="http://node/logs", status_code=200, data=data)
+
+    monkeypatch.setattr(system_mod, "_node_from_target_pod", fake_node_from_target_pod)
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(node=""),
+        pod="trainer-dead",
+        fired_at="2026-07-13T21:43:47Z",
+        resolved_at="2026-07-13T21:45:47Z",
+    )
+
+    result = await SystemCollector(_Settings()).collect(target)
+
+    assert result.status == "ok"
+    assert result.confidence == "high"
+    assert result.details["node_origin"] == "historical_pod_event"
+    observation = result.artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
+
+
+@pytest.mark.asyncio
 async def test_pipeline_plan_node_provenance_stays_contextual_for_historical_logs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

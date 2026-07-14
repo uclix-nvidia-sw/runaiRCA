@@ -34,6 +34,10 @@ class _Settings:
     language = "en"
 
 
+class _HelmEnabledSettings(_Settings):
+    enable_helm_change_detection = True
+
+
 def _iso(delta_seconds: int) -> str:
     return (datetime.now(UTC) + timedelta(seconds=delta_seconds)).isoformat()
 
@@ -452,6 +456,56 @@ async def test_query_failure_degrades(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.warnings  # each failed query recorded a warning
 
 
+@pytest.mark.asyncio
+async def test_default_change_collection_never_requests_helm_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+    paths: list[str] = []
+
+    async def fake_get_json(*, path, **kwargs):
+        paths.append(path)
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    result = await ChangeCollector(_Settings()).collect(_target())
+
+    assert not any(path.endswith("/secrets") for path in paths)
+    assert not any("helm" in warning.casefold() for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_opt_in_helm_403_is_one_actionable_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, path, **kwargs):
+        if path.endswith("/secrets"):
+            return JsonResponse(url="u", status_code=403, error="HTTP 403")
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    result = await ChangeCollector(_HelmEnabledSettings()).collect(_target())
+
+    assert result.warnings == [
+        "Helm release metadata skipped: Kubernetes RBAC does not allow listing Secrets"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_helm_query_is_rejected_before_api_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def must_not_query(**kwargs):
+        raise AssertionError("Kubernetes API must not be called")
+
+    monkeypatch.setattr(change_mod, "get_json", must_not_query)
+    result = await change_query(_Settings(), _target(), {"kind": "helm"})
+
+    assert "requires Secret-list RBAC" in result["error"]
+
+
 class _ArchSettings(_Settings):
     architecture_file = "knowledge/runai_architecture.yaml"
 
@@ -517,7 +571,7 @@ async def test_helm_release_detected(monkeypatch: pytest.MonkeyPatch) -> None:
         return JsonResponse(url=f"{base_url}{path}", status_code=200, data=data)
 
     monkeypatch.setattr(change_mod, "get_json", fake_get_json)
-    result = await ChangeCollector(_Settings()).collect(_target())
+    result = await ChangeCollector(_HelmEnabledSettings()).collect(_target())
     assert result.status == "ok"
     helm = [c for c in result.details["changes"] if c.get("kind") == "HelmRelease"]
     # Only the newest in-window revision (v3) is reported, marked as a rollout.
@@ -559,7 +613,7 @@ async def test_change_query_is_bounded_scoped_and_never_returns_bodies(
 
     monkeypatch.setattr(change_mod, "get_json", fake_get_json)
     query = await change_query(
-        _Settings(),
+        _HelmEnabledSettings(),
         _target(),
         {"kind": "all", "component": "trainer", "lookback_seconds": 120, "limit": 1},
     )
@@ -708,7 +762,8 @@ async def test_change_query_accepts_plan_kinds_with_bounded_lookback(
         return JsonResponse(url="u", status_code=200, data={"items": []})
 
     monkeypatch.setattr(change_mod, "get_json", fake_get_json)
-    query = await change_query(_Settings(), _target(), {"kind": kind, "lookback_seconds": 86400})
+    settings = _HelmEnabledSettings() if kind == "helm" else _Settings()
+    query = await change_query(settings, _target(), {"kind": kind, "lookback_seconds": 86400})
 
     assert query["error"] is None
     assert query["observation"]["polarity"] == "unknown"

@@ -57,7 +57,13 @@ def mcp_fallback_warning(exc: Exception) -> str:
     return f"{label}: {detail}" if detail else label
 
 
-async def mcp_call(url: str, tool: str, arguments: dict[str, Any]) -> Any:
+async def mcp_call(
+    url: str,
+    tool: str,
+    arguments: dict[str, Any],
+    *,
+    headers: dict[str, str] | None = None,
+) -> Any:
     """Call one tool on a streamable-HTTP MCP server.
 
     One retry on ANY failure: each call opens a fresh session, so a transient
@@ -75,7 +81,9 @@ async def mcp_call(url: str, tool: str, arguments: dict[str, Any]) -> Any:
 
     for attempt in range(2):
         try:
-            async with streamablehttp_client(url, **extra) as (read, write, *_rest):
+            async with streamablehttp_client(
+                url, headers=headers, **extra
+            ) as (read, write, *_rest):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     return await session.call_tool(tool, arguments)
@@ -85,7 +93,53 @@ async def mcp_call(url: str, tool: str, arguments: dict[str, Any]) -> Any:
             await asyncio.sleep(0.5)
 
 
-async def mcp_reachability(urls: dict[str, str]) -> dict[str, str]:
+async def mcp_call_many(
+    url: str,
+    calls: list[tuple[str, dict[str, Any]]],
+    *,
+    headers: dict[str, str] | None = None,
+) -> list[Any]:
+    """Call several tools through one initialized streamable-HTTP session.
+
+    mcp-grafana performs per-session setup and logs it at INFO. Opening a new
+    session for every PromQL/LogQL query produced dozens of identical session
+    messages per analysis. A collector batch has one session (or two only when
+    the whole batch needs its transport retry) while preserving result order.
+    """
+    if not url:
+        raise RuntimeError("MCP URL is not configured")
+    if not calls:
+        return []
+
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    factory = _mcp_client_factory()
+    extra = {"httpx_client_factory": factory} if factory else {}
+
+    for attempt in range(2):
+        try:
+            async with streamablehttp_client(
+                url, headers=headers, **extra
+            ) as (read, write, *_rest):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    return [
+                        await session.call_tool(tool, arguments)
+                        for tool, arguments in calls
+                    ]
+        except Exception:
+            if attempt:
+                raise
+            await asyncio.sleep(0.5)
+
+
+async def mcp_reachability(
+    urls: dict[str, str],
+    *,
+    headers_by_name: dict[str, dict[str, str]] | None = None,
+    timeout_seconds: float = 10.0,
+) -> dict[str, str]:
     """{name: 'ok (N tools)' | error} for each configured MCP URL.
 
     Startup answer to "are the agents actually on MCP?" — one tools/list per
@@ -95,20 +149,35 @@ async def mcp_reachability(urls: dict[str, str]) -> dict[str, str]:
 
     factory = _mcp_client_factory()
     extra = {"httpx_client_factory": factory} if factory else {}
-    report: dict[str, str] = {}
-    for name, url in urls.items():
-        if not url:
-            continue
+    async def probe(name: str, url: str) -> tuple[str, str]:
         try:
-            async with streamablehttp_client(url, **extra) as (read, write, *_rest):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    tools = await session.list_tools()
-                    report[name] = f"ok ({len(tools.tools)} tools)"
+            async with asyncio.timeout(max(0.1, timeout_seconds)):
+                async with streamablehttp_client(
+                    url,
+                    headers=(headers_by_name or {}).get(name),
+                    timeout=timeout_seconds,
+                    sse_read_timeout=timeout_seconds,
+                    **extra,
+                ) as (read, write, *_rest):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        tools = await session.list_tools()
+                        status = f"ok ({len(tools.tools)} tools)"
         except Exception as exc:  # noqa: BLE001 - reachability is a report, not a gate
-            report[name] = f"unreachable: {type(exc).__name__}: {_safe_text(str(exc), limit=120)}"
-        _log.info("mcp self-check %s (%s): %s", name, url, report[name])
-    return report
+            detail = _safe_text(str(exc), limit=120)
+            status = f"unreachable: {type(exc).__name__}"
+            if detail:
+                status += f": {detail}"
+        _log.info("mcp self-check %s (%s): %s", name, url, status)
+        return name, status
+
+    # A hung Run:ai endpoint must not defer the Kubernetes/Grafana/Postgres
+    # diagnostics behind it. Each configured service has its own deadline and
+    # all probes start together.
+    results = await asyncio.gather(
+        *(probe(name, url) for name, url in urls.items() if url)
+    )
+    return dict(results)
 
 
 def mcp_tool_text(result: Any) -> str:

@@ -66,6 +66,18 @@ def test_best_matching_pod_all_healthy_needs_unambiguous_match() -> None:
     assert best_matching_pod(many_healthy, [""]) is None
 
 
+def test_workload_prefix_node_resolution_rejects_multi_node_replicas() -> None:
+    from app.collectors.kubernetes import _best_live_target_pod
+
+    replicas = [
+        _pod("trainer-worker-a1b2c", "dgx01", "2026-07-01T00:00:00Z"),
+        _pod("trainer-worker-d3e4f", "dgx02", "2026-07-02T00:00:00Z"),
+    ]
+
+    assert _best_live_target_pod(replicas, ["trainer-deleted-z9y8x"], "trainer") is None
+    assert _best_live_target_pod(replicas[:1], ["trainer-deleted-z9y8x"], "train") is None
+
+
 # --- healthy Postgres healthcheck is not evidence -------------------------------
 
 
@@ -994,25 +1006,38 @@ async def test_evidence_stage_scopes_followup_target_to_the_plan(monkeypatch) ->
 
 @pytest.mark.asyncio
 async def test_resolved_incident_keeps_alert_pod_for_followups(monkeypatch) -> None:
-    """A current replacement must not erase historical Event identity."""
+    """A current replacement must not erase any historical target identity."""
     from app.plan import InvestigationPlan
     from app.progress import ProgressReporter
 
-    seen: dict[str, str] = {}
+    seen: dict[str, tuple[str, str, str, str]] = {}
 
     async def fake_k8s_followup(settings, k8s_result, target, **kwargs):
-        seen["k8s"] = target.pod
+        seen["k8s"] = (
+            target.namespace,
+            target.pod,
+            target.node,
+            target.workload_name,
+        )
         return []
 
     async def fake_prom_followup(settings, prom_result, k8s_result, target, **kwargs):
-        seen["prom"] = target.pod
+        seen["prom"] = (
+            target.namespace,
+            target.pod,
+            target.node,
+            target.workload_name,
+        )
         return []
 
     monkeypatch.setattr("app.collectors.kubernetes.k8s_followup", fake_k8s_followup)
     monkeypatch.setattr("app.collectors.prometheus.prometheus_followup", fake_prom_followup)
     alert_target = replace(
         make_target(),
+        namespace="historical-ns",
         pod="toolkit-dead1",
+        node="historical-node",
+        workload_name="historical-workload",
         fired_at="2026-07-10T01:00:00Z",
         resolved_at="2026-07-10T01:10:00Z",
     )
@@ -1020,7 +1045,9 @@ async def test_resolved_incident_keeps_alert_pod_for_followups(monkeypatch) -> N
         settings=make_settings(),
         request=AlertAnalysisRequest(
             alert=Alert(
-                status="resolved",
+                # A stored/manual historical run can retain a stale firing
+                # status while endsAt is the authoritative resolved boundary.
+                status="firing",
                 labels={},
                 annotations={},
                 startsAt=alert_target.fired_at,
@@ -1032,12 +1059,77 @@ async def test_resolved_incident_keeps_alert_pod_for_followups(monkeypatch) -> N
         masker=None,
         collectors=[],
         # Simulates the replacement Pod selected by a live plan lookup.
-        plan=InvestigationPlan(pod="toolkit-live2", namespaces=[alert_target.namespace]),
+        plan=InvestigationPlan(
+            pod="toolkit-live2",
+            node="current-node",
+            workload="current-workload",
+            namespaces=["current-ns", "runai"],
+        ),
     )
 
     await pipeline.evidence_stage(state)
 
-    assert seen == {"k8s": "toolkit-dead1", "prom": "toolkit-dead1"}
+    expected = (
+        "historical-ns",
+        "toolkit-dead1",
+        "historical-node",
+        "historical-workload",
+    )
+    assert seen == {"k8s": expected, "prom": expected}
+    assert state.plan.namespaces == ["historical-ns", "current-ns", "runai"]
+
+
+@pytest.mark.asyncio
+async def test_resolved_incident_uses_only_single_concrete_occurrence_pod(monkeypatch) -> None:
+    """Grouped Pod names are history; never replace them with a live planner guess."""
+    from app.plan import InvestigationPlan
+    from app.progress import ProgressReporter
+
+    seen: list[str] = []
+
+    async def fake_k8s_followup(settings, k8s_result, target, **kwargs):
+        seen.append(target.pod)
+        return []
+
+    async def fake_prom_followup(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr("app.collectors.kubernetes.k8s_followup", fake_k8s_followup)
+    monkeypatch.setattr("app.collectors.prometheus.prometheus_followup", fake_prom_followup)
+    target = replace(
+        make_target(),
+        pod="",
+        workload_name="trainer",
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    request = AlertAnalysisRequest(
+        alert=Alert(status="resolved", labels={}, annotations={}),
+        occurrence_pods=["trainer-dead-a"],
+    )
+    state = pipeline.PipelineState(
+        settings=make_settings(),
+        request=request,
+        target=target,
+        progress=ProgressReporter(make_settings(), run_id=""),
+        masker=None,
+        collectors=[],
+        plan=InvestigationPlan(pod="trainer-live-now", namespaces=[target.namespace]),
+    )
+
+    await pipeline.evidence_stage(state)
+
+    assert seen == ["trainer-dead-a"]
+    assert state.plan.pod == "trainer-dead-a"
+
+    # More than one occurrence is a set of affected Pods. Picking one would
+    # silently discard the others and can attach evidence to the wrong node.
+    state.request.occurrence_pods = ["trainer-dead-a", "trainer-dead-b"]
+    state.plan.pod = "trainer-live-now"
+    seen.clear()
+    await pipeline.evidence_stage(state)
+    assert seen == [""]
+    assert state.plan.pod == ""
 
 
 def test_blackboard_aliases_do_not_merge_same_summary_from_different_pods() -> None:

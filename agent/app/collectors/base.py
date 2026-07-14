@@ -187,7 +187,10 @@ SALIENT_PATTERN = re.compile(
     r"(CrashLoopBackOff|OOMKill(?:ed|ing)?|ImagePullBackOff|ErrImagePull(?:BackOff)?|"
     r"ErrImageNeverPull|CreateContainerConfigError|CreateContainerError|RunContainerError|"
     r"ContainerCannotRun|FailedScheduling|FailedMount|FailedAttachVolume|FailedCreate|"
-    r"Unschedulable|Evicted|Preempt(?:ed|ion|or)?|[Rr]eclaim(?:ed|ing)?|NotReady|"
+    r"(?<![A-Za-z0-9_])Unschedulable(?![A-Za-z0-9_])|Evicted|"
+    r"(?<![A-Za-z0-9_])PreemptionByScheduler(?![A-Za-z0-9_])|"
+    r"(?<![A-Za-z0-9_])Preempt(?:ed|ion|or|ing)?(?![A-Za-z0-9_])|"
+    r"[Rr]eclaim(?:ed|ing)?|NotReady|"
     r"DiskPressure|MemoryPressure|PIDPressure|NetworkUnavailable|Unhealthy|"
     r"Back-?[Oo]ff restarting|startup probe failed|liveness probe failed|"
     r"readiness probe failed|Xid\s*[:=]?\s*\d+|NVRM|NCCL\s+WARN|fell off the bus|"
@@ -199,6 +202,21 @@ SALIENT_PATTERN = re.compile(
 _BOOLEAN_CONDITION_TYPES = frozenset(
     {"diskpressure", "memorypressure", "pidpressure", "networkunavailable"}
 )
+
+# Kubernetes conditions do not share one polarity.  Pressure is bad when True,
+# readiness/scheduling is bad when False, and DisruptionTarget is bad when True.
+# Keeping that mapping explicit prevents a condition's reason text from becoming
+# a positive signal merely because a keyword exists somewhere in the object.
+_FALSE_IS_FAILURE_CONDITION_TYPES = frozenset(
+    {"ready", "containersready", "podscheduled"}
+)
+_TRUE_IS_FAILURE_CONDITION_TYPES = frozenset({"disruptiontarget"})
+
+# Kubernetes records a completed scheduler preemption as a target-scoped
+# ``Preempted`` Event, which may be Normal rather than Warning.  Admit only the
+# exact observed reason here; a Normal message that merely says "preempting"
+# still cannot become evidence by keyword alone.
+_OBSERVED_NORMAL_EVENT_REASONS = frozenset({"preempted"})
 
 
 def _truthy_status(value: Any) -> bool:
@@ -257,12 +275,23 @@ def condition_observations(value: Any, *, limit: int = 20) -> list[dict[str, Any
             return
         if isinstance(node, dict):
             condition_type = str(node.get("type") or "").strip()
-            if condition_type.lower() in _BOOLEAN_CONDITION_TYPES and "status" in node:
+            normalized = condition_type.casefold()
+            if normalized in (
+                _BOOLEAN_CONDITION_TYPES
+                | _FALSE_IS_FAILURE_CONDITION_TYPES
+                | _TRUE_IS_FAILURE_CONDITION_TYPES
+            ) and "status" in node:
                 status = _boolean_condition_status(node.get("status"))
                 if status is not None:
+                    failure_active = (
+                        status
+                        if normalized
+                        in (_BOOLEAN_CONDITION_TYPES | _TRUE_IS_FAILURE_CONDITION_TYPES)
+                        else not status
+                    )
                     add(
                         condition_type,
-                        status,
+                        failure_active,
                         "kubernetes_condition",
                         status=str(node.get("status") or ""),
                     )
@@ -377,23 +406,73 @@ def kubernetes_salient_markers(value: Any, *, limit: int = 6) -> list[str]:
                 seen.add(key)
                 found.append(marker)
 
-    def walk(node: Any) -> None:
+    def add_condition(node: dict[str, Any]) -> bool:
+        """Consume a structured condition and apply its declared polarity.
+
+        Returning True means the dict was a recognized condition and callers
+        must not scan any of its other fields.  That fail-closed return is what
+        keeps stale/inconsistent ``reason`` strings from bypassing ``status``.
+        """
+        condition_type = str(node.get("type") or "").strip()
+        normalized = condition_type.casefold()
+        if normalized not in (
+            _BOOLEAN_CONDITION_TYPES
+            | _FALSE_IS_FAILURE_CONDITION_TYPES
+            | _TRUE_IS_FAILURE_CONDITION_TYPES
+        ) or "status" not in node:
+            return False
+        status = _boolean_condition_status(node.get("status"))
+        if status is None:
+            return True
+        if normalized in _BOOLEAN_CONDITION_TYPES:
+            if status:
+                add_text(condition_type)
+            return True
+        failure_active = (
+            (normalized in _FALSE_IS_FAILURE_CONDITION_TYPES and not status)
+            or (normalized in _TRUE_IS_FAILURE_CONDITION_TYPES and status)
+        )
+        if failure_active:
+            # The condition type alone is broad (for example PodScheduled).
+            # Preserve only an observed, problem-specific reason/message.
+            add_text(node.get("reason"))
+            add_text(node.get("message"))
+        return True
+
+    def walk(node: Any, *, scope: str = "") -> None:
         if len(found) >= limit:
             return
         if isinstance(node, list):
             for child in node:
-                walk(child)
+                walk(child, scope=scope)
             return
         if not isinstance(node, dict):
             return
-        condition_type = str(node.get("type") or "")
-        if condition_type.casefold() in _BOOLEAN_CONDITION_TYPES and "status" in node:
-            if _truthy_status(node.get("status")):
-                add_text(condition_type)
+        if add_condition(node):
             return
         # A Kubernetes Event's reason/message is an observation, but only a
-        # Warning is relevant for failure highlights.
-        if str(node.get("type") or "") == "Warning" and "involvedObject" in node:
+        # Warning is relevant for failure highlights.  Require the Event to
+        # name an involved object (raw Event) or to carry the collector's
+        # verified Event projection; an arbitrary {type: Warning} blob is not
+        # enough to establish an observation.
+        event_identity = isinstance(node.get("involvedObject"), dict) or (
+            bool(node.get("target_identity_verified"))
+            and bool(node.get("object"))
+            and bool(node.get("kind"))
+        )
+        event_type = str(node.get("type") or "").casefold()
+        event_reason = str(node.get("reason") or "").strip()
+        observed_event = event_type == "warning" or (
+            event_type == "normal"
+            and event_reason.casefold() in _OBSERVED_NORMAL_EVENT_REASONS
+        )
+        if observed_event and event_identity:
+            add_text(node.get("reason"))
+            add_text(node.get("message"))
+        # A Pod failure reason is meaningful only while the Pod is actually in
+        # Failed phase.  Do not scan a generic ``status.reason`` without that
+        # value-level guard.
+        if scope == "status" and str(node.get("phase") or "").casefold() == "failed":
             add_text(node.get("reason"))
             add_text(node.get("message"))
         # Container runtime states carry actual observed reasons. Pod spec,
@@ -421,7 +500,7 @@ def kubernetes_salient_markers(value: Any, *, limit: int = 6) -> list[str]:
         ):
             child = node.get(key)
             if child is not None:
-                walk(child)
+                walk(child, scope=key)
 
     walk(value)
     return found

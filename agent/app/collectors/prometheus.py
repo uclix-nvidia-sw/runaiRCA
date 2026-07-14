@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import math
-import re
 from datetime import UTC, datetime
-from typing import Any
 
 from app.collectors.base import (
     NO_EVIDENCE,
@@ -14,12 +12,18 @@ from app.collectors.base import (
     ko_en,
     parse_incident_time,
 )
+from app.collectors.grafana_mcp import (
+    mark_grafana_datasource_failure,
+    resolve_grafana_datasource_uid,
+    validate_grafana_datasource_uid,
+)
 from app.collectors.http_json import compact, get_json
 from app.collectors.loki import _llm_insight
 from app.config import Settings
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
     mcp_call,
+    mcp_call_many,
     mcp_error,
     mcp_fallback_warning,
     mcp_tool_json,
@@ -432,13 +436,38 @@ async def _collect_prometheus_mcp(
     *,
     time_range: dict[str, str] | None = None,
 ) -> list[dict[str, object]]:
-    datasource_uid = await _grafana_datasource_uid(settings.prometheus_mcp_url, "prometheus")
-    return [
-        await _mcp_query_prometheus(
-            settings.prometheus_mcp_url, name, query, datasource_uid, time_range=time_range
+    datasource_uid = await _grafana_datasource_uid(
+        settings.prometheus_mcp_url,
+        "prometheus",
+        settings.prometheus_datasource_uid,
+    )
+    calls = [
+        (
+            "query_prometheus",
+            _prometheus_mcp_args(query, datasource_uid, time_range),
         )
-        for name, query in queries
+        for _name, query in queries
     ]
+    try:
+        results = await mcp_call_many(settings.prometheus_mcp_url, calls)
+        return [
+            _prometheus_mcp_item(
+                name,
+                query,
+                settings.prometheus_mcp_url,
+                _mcp_result_json(result, "query_prometheus"),
+                time_range,
+            )
+            for (name, query), result in zip(queries, results, strict=True)
+        ]
+    except Exception as exc:
+        mark_grafana_datasource_failure(
+            settings.prometheus_mcp_url,
+            "prometheus",
+            settings.prometheus_datasource_uid,
+            exc,
+        )
+        raise
 
 
 async def prom_mcp_query(
@@ -448,14 +477,27 @@ async def prom_mcp_query(
     *,
     time_range: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    datasource_uid = await _grafana_datasource_uid(settings.prometheus_mcp_url, "prometheus")
-    return await _mcp_query_prometheus(
+    datasource_uid = await _grafana_datasource_uid(
         settings.prometheus_mcp_url,
-        name,
-        promql,
-        datasource_uid,
-        time_range=time_range,
+        "prometheus",
+        settings.prometheus_datasource_uid,
     )
+    try:
+        return await _mcp_query_prometheus(
+            settings.prometheus_mcp_url,
+            name,
+            promql,
+            datasource_uid,
+            time_range=time_range,
+        )
+    except Exception as exc:
+        mark_grafana_datasource_failure(
+            settings.prometheus_mcp_url,
+            "prometheus",
+            settings.prometheus_datasource_uid,
+            exc,
+        )
+        raise
 
 
 async def _mcp_query_prometheus(
@@ -470,17 +512,27 @@ async def _mcp_query_prometheus(
     # 400s with "id is invalid" on every query; fail fast so the caller falls back
     # cleanly. (uid usually empty when grafana-mcp can't list datasources — set
     # secrets.grafanaServiceAccountToken.)
-    if not datasource_uid:
-        raise RuntimeError(
-            "grafana datasource uid unresolved for prometheus — set "
-            "secrets.grafanaServiceAccountToken so grafana-mcp can list datasources"
-        )
+    datasource_uid = validate_grafana_datasource_uid(datasource_uid, "prometheus")
     # mcp-grafana query_prometheus takes a range query as datasourceUid/expr/
     # startTime/endTime/stepSeconds. Keep this exact: the older `query` aliases
     # silently caused an instant query (or a schema 400), which sampled *now*
     # instead of the incident.
+    args = _prometheus_mcp_args(promql, datasource_uid, time_range)
+    try:
+        data = await _call_mcp_json(url, "query_prometheus", [args])
+    except Exception as exc:
+        mark_grafana_datasource_failure(url, "prometheus", datasource_uid, exc)
+        raise
+    return _prometheus_mcp_item(name, promql, url, data, time_range)
+
+
+def _prometheus_mcp_args(
+    promql: str,
+    datasource_uid: str,
+    time_range: dict[str, str] | None,
+) -> dict[str, object]:
     query_window = time_range or {"start": "now-15m", "end": "now"}
-    args = {
+    return {
         "datasourceUid": datasource_uid,
         "expr": promql,
         "queryType": "range",
@@ -488,7 +540,16 @@ async def _mcp_query_prometheus(
         "endTime": query_window["end"],
         "stepSeconds": 60,
     }
-    data = await _call_mcp_json(url, "query_prometheus", [args])
+
+
+def _prometheus_mcp_item(
+    name: str,
+    promql: str,
+    url: str,
+    data: object,
+    time_range: dict[str, str] | None,
+) -> dict[str, object]:
+    query_window = time_range or {"start": "now-15m", "end": "now"}
     status = _prometheus_status(data)
     result_data = _prometheus_mcp_result(data)
     error = _prometheus_api_error(data, status)
@@ -1023,41 +1084,17 @@ def _prometheus_samples(item: dict[str, object]) -> list[tuple[str, float | None
     return samples
 
 
-# Grafana datasource uids are ^[a-zA-Z0-9\-_]{1,40}$; a numeric row id or a
-# display name ("Prometheus (default)") passed as datasourceUid makes grafana-mcp
-# fail EVERY query with 400 "id is invalid" — which demoted the whole collector
-# to the direct HTTP fallback.
-_GRAFANA_UID = re.compile(r"^[a-zA-Z0-9\-_]{1,40}$")
-
-
-async def _grafana_datasource_uid(url: str, datasource_type: str) -> str:
-    try:
-        data = await _call_mcp_json(url, "list_datasources", [{}])
-    except Exception:  # noqa: BLE001 - query tools may work without discovery.
-        return ""
-    for datasource in _datasource_items(data):
-        dtype = str(datasource.get("type") or "").lower()
-        name = str(datasource.get("name") or "").lower()
-        if datasource_type in dtype or datasource_type in name:
-            uid = str(datasource.get("uid") or "")
-            if _GRAFANA_UID.match(uid):
-                return uid
-    return ""
-
-
-def _datasource_items(data: Any) -> list[dict[str, Any]]:
-    if isinstance(data, list):
-        return [item for item in data if isinstance(item, dict)]
-    if not isinstance(data, dict):
-        return []
-    for key in ("datasources", "items", "result"):
-        value = data.get(key)
-        if isinstance(value, list):
-            return [item for item in value if isinstance(item, dict)]
-    nested = data.get("data")
-    if isinstance(nested, list):
-        return [item for item in nested if isinstance(item, dict)]
-    return []
+async def _grafana_datasource_uid(
+    url: str,
+    datasource_type: str,
+    configured_uid: str = "",
+) -> str:
+    return await resolve_grafana_datasource_uid(
+        url,
+        datasource_type,
+        configured_uid,
+        call_json=_call_mcp_json,
+    )
 
 
 async def _call_mcp_json(
@@ -1070,16 +1107,22 @@ async def _call_mcp_json(
         except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
             last_error = f"{exc.__class__.__name__}: {exc}"
             continue
-        error = mcp_error(result)
-        if error:
-            last_error = error
+        try:
+            return _mcp_result_json(result, tool)
+        except RuntimeError as exc:
+            last_error = str(exc)
             continue
-        data = mcp_tool_json(result)
-        if isinstance(data, dict) and "raw" in data:
-            last_error = "MCP result was not JSON"
-            continue
-        return data
     raise RuntimeError(last_error or f"{tool} failed")
+
+
+def _mcp_result_json(result: object, tool: str) -> object:
+    error = mcp_error(result)
+    if error:
+        raise RuntimeError(error)
+    data = mcp_tool_json(result)
+    if isinstance(data, dict) and "raw" in data:
+        raise RuntimeError(f"{tool} result was not JSON")
+    return data
 
 
 def _first_result_list(data: object) -> list[object]:

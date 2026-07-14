@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from app.collectors import http_json
+from app.collectors.runai import _runai_headers
+from tests.test_orchestrator import make_settings
 
 
 class _Response:
@@ -137,3 +140,53 @@ async def test_post_form_json_masks_exception_diagnostics(monkeypatch: pytest.Mo
     assert "\n" not in result.error
     assert "[MASKED]" in result.url
     assert "[MASKED]" in result.error
+
+
+@pytest.mark.asyncio
+async def test_oauth_token_exchange_keeps_token_usable_but_out_of_repr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_httpx(
+        monkeypatch,
+        response=_Response(
+            status_code=200,
+            url="http://svc/token",
+            payload={"accessToken": "usable-token-1234567890"},
+        ),
+    )
+
+    result = await http_json.post_oauth_token(
+        url="http://svc/token",
+        timeout_seconds=3,
+        json_body={"grantType": "client_credentials"},
+    )
+
+    assert result.ok is True
+    assert result.token == "usable-token-1234567890"
+    assert "usable-token-1234567890" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_runai_headers_use_unredacted_oauth_exchange_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_httpx(
+        monkeypatch,
+        response=_Response(
+            status_code=200,
+            url="https://runai.example/api/v1/token",
+            payload={"accessToken": "runtime-token-1234567890"},
+        ),
+    )
+    settings = replace(
+        make_settings(),
+        runai_base_url="https://runai.example",
+        runai_token_url="https://runai.example/api/v1/token",
+        runai_client_id="client-id",
+        runai_client_secret="client-secret",
+    )
+
+    headers, warnings = await _runai_headers(settings)
+
+    assert headers["Authorization"] == "Bearer runtime-token-1234567890"
+    assert warnings == []

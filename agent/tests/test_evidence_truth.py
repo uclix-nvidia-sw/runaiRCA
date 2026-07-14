@@ -359,12 +359,15 @@ async def test_grafana_datasource_uid_rejects_ids_and_names(monkeypatch) -> None
     # Passing a numeric row id / display name as datasourceUid made grafana-mcp
     # fail every query with 400 "id is invalid" -> whole collector fell back.
     from app.collectors import prometheus as prom
+    from app.collectors.grafana_mcp import clear_grafana_datasource_cache
 
     async def fake_call(url, tool, args_list):
         return [{"type": "prometheus", "name": "Prometheus (default)", "id": 1}]
 
     monkeypatch.setattr(prom, "_call_mcp_json", fake_call)
-    assert await prom._grafana_datasource_uid("http://mcp", "prometheus") == ""
+    with pytest.raises(RuntimeError, match="no accessible prometheus datasource"):
+        await prom._grafana_datasource_uid("http://mcp", "prometheus")
+    clear_grafana_datasource_cache()
 
     async def fake_call_uid(url, tool, args_list):
         return [{"type": "prometheus", "name": "Prometheus", "uid": "prom-main_1"}]
@@ -641,26 +644,27 @@ async def test_collect_runai_crd_findings_enumerates_and_flags_not_ready(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_runai_mcp_projects_falls_back_to_org_unit_path() -> None:
-    from app.collectors.runai_mcp import _call_api
+async def test_official_runai_mcp_uses_project_resources_tool(monkeypatch) -> None:
+    from app.collectors import runai_mcp
 
-    class FakeSession:
-        def __init__(self) -> None:
-            self.paths: list[str] = []
+    captured: dict[str, object] = {}
 
-        async def call_tool(self, tool, args):
-            self.paths.append(args["path"])
-            if args["path"] == "/api/v1/projects":
-                return _McpResult(text="404 page not found", is_error=True)
-            return _McpResult({"projects": [{"name": "test-pro"}]})
+    async def fake_mcp_call(url, tool, arguments, *, headers=None):
+        captured.update(url=url, tool=tool, arguments=arguments, headers=headers)
+        return _McpResult({"resources": [{"projectName": "test-pro"}]})
 
-    session = FakeSession()
-    item = await _call_api(
-        session, "projects", "GET", ["/api/v1/projects", "/api/v1/org-unit/projects"], None
+    monkeypatch.setattr(runai_mcp, "mcp_call", fake_mcp_call)
+    item = await runai_mcp._call_tool(
+        replace(make_settings(), runai_mcp_url="http://runai-mcp:8080/mcp"),
+        "project_resources",
+        "list_project_resources",
+        {"projectName": "test-pro"},
+        headers={"Authorization": "Bearer test"},
     )
-    assert session.paths == ["/api/v1/projects", "/api/v1/org-unit/projects"]
+    assert captured["tool"] == "list_project_resources"
+    assert captured["arguments"] == {"projectName": "test-pro"}
     assert item["error"] is None
-    assert "/api/v1/org-unit/projects" in item["query"]
+    assert "list_project_resources" in item["query"]
 
 
 # --- component identity entry point ---------------------------------------------
