@@ -256,6 +256,88 @@ async def test_partial_drilldown_result_cannot_be_promoted_by_failure_keywords()
     assert not _artifact_is_evidence(artifact)
 
 
+@pytest.mark.asyncio
+async def test_raw_tool_response_observation_cannot_claim_scoped_support() -> None:
+    """A successful API body is not allowed to author our evidence verdict."""
+
+    async def raw_api_tool(settings, target, args):
+        return {
+            "summary": "HTTP 200",
+            # An adapter that merely mirrors these fields from an HTTP/LLM
+            # response has not proven them either.
+            "polarity": "present",
+            "coverage": "scoped",
+            "result": {
+                # This is remote response data, not an adapter-produced result.
+                "observation": {
+                    "polarity": "present",
+                    "coverage": "scoped",
+                    "observed_entity": {"kind": "pod", "name": "other-pod"},
+                    "observation_window": {
+                        "start": "2026-07-01T00:00:00Z",
+                        "end": "2026-07-01T00:01:00Z",
+                    },
+                }
+            },
+        }
+
+    result = _k8s_result()
+    await drilldown._run_query(
+        drill_settings(),
+        result,
+        {"raw_api_tool": {"call": raw_api_tool}},
+        _target(),
+        None,
+        {"tool": "raw_api_tool", "args": {}},
+        [],
+        drilldown._drilldown_masker(drill_settings()),
+    )
+
+    observation = result.artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert not _artifact_is_evidence(result.artifacts[0])
+
+
+@pytest.mark.asyncio
+async def test_change_timeline_keeps_only_adapter_verified_scoped_observation(monkeypatch) -> None:
+    observation = {
+        "kind": "change_query",
+        "predicate": "change:event",
+        "polarity": "present",
+        "coverage": "scoped",
+        "observed_entity": {"kind": "workload", "name": "train-1"},
+        "observation_window": {
+            "start": "2026-07-10T00:55:00Z",
+            "end": "2026-07-10T01:15:00Z",
+        },
+    }
+
+    async def fake_change_query(settings, target, args):
+        return {
+            "query": "bounded timeline",
+            "summary": "one correlated change",
+            "error": None,
+            "observation": observation,
+            "result": {"changes": [{"name": "train-1"}]},
+        }
+
+    monkeypatch.setattr(drilldown, "change_query", fake_change_query)
+    result = _k8s_result()
+    await drilldown._run_query(
+        drill_settings(),
+        result,
+        {"k8s_change_timeline": {"call": drilldown._tool_k8s_change_timeline}},
+        _target(),
+        None,
+        {"tool": "k8s_change_timeline", "args": {"source": "event"}},
+        [],
+        drilldown._drilldown_masker(drill_settings()),
+    )
+
+    assert result.artifacts[0].result["observation"] == observation
+    assert _artifact_is_evidence(result.artifacts[0])
+
+
 def test_drilldown_prompts_redact_sensitive_evidence(monkeypatch) -> None:
     prompts: list[str] = []
     decisions = iter(

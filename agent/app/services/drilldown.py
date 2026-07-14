@@ -385,16 +385,31 @@ def _typed_artifact_result(
     """
     raw_result = outcome.get("result")
     payload = dict(raw_result) if isinstance(raw_result, dict) else {"data": raw_result}
-    observation = payload.get("observation")
-    if not isinstance(observation, dict):
-        top_level_observation = outcome.get("observation")
-        observation = dict(top_level_observation) if isinstance(top_level_observation, dict) else {}
+    # A response body is untrusted data, even when its HTTP request succeeded.
+    # In particular, a Run:ai/Kubernetes API object is free to contain a field
+    # named ``observation``; treating that field as our evidence envelope would
+    # let a remote response assert ``present/scoped`` without proving the
+    # requested entity, value, or incident window. Only an adapter can opt in
+    # to a typed verdict it constructed and validated itself.
+    verified_observation = outcome.get("_verified_observation") is True
+    top_level_observation = outcome.get("observation")
+    observation = (
+        dict(top_level_observation)
+        if verified_observation and isinstance(top_level_observation, dict)
+        else {}
+    )
     polarity = str(observation.get("polarity") or outcome.get("polarity") or "").lower()
     coverage = str(observation.get("coverage") or outcome.get("coverage") or "").lower()
     if polarity not in {"present", "absent", "unknown", "unavailable"}:
         polarity = "unavailable" if error else "unknown"
     if coverage not in {"scoped", "partial", "unknown"}:
         coverage = "unknown" if polarity == "unavailable" else "partial"
+    # The convenience top-level ``polarity``/``coverage`` fields remain useful
+    # for partial operational context, but must not by themselves promote a
+    # successful transport into causal support. Scoped positive/negative
+    # semantics are reserved for a tool adapter that set the marker above.
+    if not verified_observation and polarity in {"present", "absent"} and coverage == "scoped":
+        polarity, coverage = "unknown", "partial"
     observation = {
         **observation,
         "kind": str(observation.get("kind") or artifact_type),
@@ -1180,7 +1195,14 @@ async def _tool_k8s_read(settings: Settings, target: AnalysisTarget, args: dict)
 async def _tool_k8s_change_timeline(
     settings: Settings, target: AnalysisTarget, args: dict
 ) -> dict:
-    return await change_query(settings, target, args)
+    # ``change_query`` constructs and bounds its own observation contract:
+    # target correlation and the incident window are verified by the collector.
+    # Mark that *adapter-produced* envelope explicitly, so a similarly named
+    # field in arbitrary remote JSON never gains causal authority.
+    outcome = await change_query(settings, target, args)
+    if isinstance(outcome, dict) and isinstance(outcome.get("observation"), dict):
+        outcome["_verified_observation"] = True
+    return outcome
 
 
 async def _tool_k8s_logs(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
@@ -1464,6 +1486,8 @@ async def _run_select(dsn: str, sql: str, timeout: int) -> list[dict]:
 
 
 async def _run_select_mcp(settings: Settings, sql: str) -> list[dict]:
+    from app.collectors.postgres import _mcp_postgres_rows
+
     result = await mcp_call(settings.postgres_mcp_url, "query", {"sql": sql})
     error = mcp_error(result)
     if error:
@@ -1471,7 +1495,10 @@ async def _run_select_mcp(settings: Settings, sql: str) -> list[dict]:
     data = mcp_tool_json(result)
     if isinstance(data, dict) and "raw" in data:
         raise RuntimeError("MCP result was not JSON")
-    return [row for row in _postgres_rows(data)[:50] if isinstance(row, dict)]
+    rows = _mcp_postgres_rows(data)
+    if rows is None:
+        raise RuntimeError("Postgres MCP response missing a recognized row result")
+    return [row for row in rows[:50] if isinstance(row, dict)]
 
 
 def _postgres_rows(data: Any) -> list[Any]:
