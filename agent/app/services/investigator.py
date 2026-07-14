@@ -293,7 +293,11 @@ def _ledger_summary(ledger: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _apply_ledger_updates(
-    ledger: list[dict[str, Any]], updates: object, *, allow_supported: bool = True
+    ledger: list[dict[str, Any]],
+    updates: object,
+    *,
+    allow_supported: bool = True,
+    eligible_support_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     if not isinstance(updates, list):
         return ledger
@@ -306,12 +310,23 @@ def _apply_ledger_updates(
             continue
         if "confidence" in update:
             item["confidence"] = _clamp_confidence(update.get("confidence"), item["confidence"])
+        allowed_evidence = _texts(update.get("evidence_for"))
+        if eligible_support_ids is not None:
+            allowed_evidence = [
+                evidence_id for evidence_id in allowed_evidence if evidence_id in eligible_support_ids
+            ]
         status = str(update.get("status") or "").strip().lower()
-        if status == "supported" and not allow_supported:
+        can_support = bool(
+            set(_texts(item.get("evidence_for"))) | set(allowed_evidence)
+        )
+        if status == "supported" and (
+            not allow_supported
+            or (eligible_support_ids is not None and not can_support)
+        ):
             status = "testing"
         if status in _LEDGER_STATUSES:
             item["status"] = status
-        _extend_text_list(item, "evidence_for", update.get("evidence_for"))
+        _extend_text_list(item, "evidence_for", allowed_evidence)
         _extend_text_list(item, "evidence_against", update.get("evidence_against"))
         _extend_text_list(item, "expected_observations", update.get("expected_observations"))
         _extend_text_list(item, "falsifiers", update.get("falsifiers"))
@@ -385,10 +400,33 @@ def _normalise_hypothesis(value: object) -> str:
     return re.sub(r"\W+", " ", str(value or "").lower()).strip()
 
 
-def _legacy_supported(ledger: list[dict[str, Any]]) -> bool:
+def _legacy_supported(
+    ledger: list[dict[str, Any]], *, eligible_support_ids: set[str] | None = None
+) -> bool:
     return any(
-        item.get("status") == "supported" and bool(item.get("evidence_for")) for item in ledger
+        item.get("status") == "supported"
+        and bool(
+            set(_texts(item.get("evidence_for")))
+            & (eligible_support_ids if eligible_support_ids is not None else set())
+        )
+        for item in ledger
     )
+
+
+def _eligible_support_ids(blackboard: Any) -> set[str]:
+    """Return only scoped positive fact IDs the investigator may cite as support."""
+    facts = getattr(blackboard, "facts", None)
+    if not callable(facts):
+        return set()
+    try:
+        return {
+            str(fact.fact_id)
+            for fact in facts()
+            if str(getattr(fact, "fact_id", ""))
+            and bool(getattr(getattr(fact, "eligibility", None), "support", False))
+        }
+    except Exception:  # noqa: BLE001 - malformed shared observations cannot support a claim
+        return set()
 
 
 def _ledger_fingerprint(
@@ -475,8 +513,14 @@ async def investigate(
             if remaining_budget is not None and remaining_budget <= 0:
                 break
             step += 1
-            if all_names <= set(evidence) and not ran_queries_last_step:
-                break  # every collector probed and no ad-hoc drill-down pending
+            if (
+                all_names <= set(evidence)
+                and not ran_queries_last_step
+                and _legacy_supported(
+                    ledger, eligible_support_ids=_eligible_support_ids(blackboard)
+                )
+            ):
+                break  # scoped evidence already grounds a supported hypothesis
             if reporter:
                 reporter.emit(
                     "investigation",
@@ -540,7 +584,12 @@ async def investigate(
             )
             if not isinstance(decision, dict):
                 break  # unusable response -> fall through to full gather
-            ledger = _apply_ledger_updates(ledger, decision.get("hypothesis_updates"))
+            eligible_support_ids = _eligible_support_ids(blackboard)
+            ledger = _apply_ledger_updates(
+                ledger,
+                decision.get("hypothesis_updates"),
+                eligible_support_ids=eligible_support_ids,
+            )
             ledger = _add_reflected_hypotheses(ledger, decision.get("new_hypotheses"))
             investigation_steps.append(
                 {
@@ -562,7 +611,10 @@ async def investigate(
                     hypothesis_updates=decision.get("hypothesis_updates"),
                     hypothesis_ledger=_ledger_summary(ledger),
                 )
-            if decision.get("action") == "conclude":
+            unverified_conclusion = decision.get("action") == "conclude" and not _legacy_supported(
+                ledger, eligible_support_ids=eligible_support_ids
+            )
+            if decision.get("action") == "conclude" and not unverified_conclusion:
                 break
             selected_hypothesis = str(decision.get("selected_hypothesis") or "")
             probes = decision.get("probes")
@@ -596,6 +648,14 @@ async def investigate(
                     continue
                 seen_queries.add(fingerprint)
                 wanted.append(query)
+            if unverified_conclusion and not fresh and not wanted:
+                # Never let a model conclude from its initial, evidence-free
+                # prompt. Collect every remaining base plane concurrently, so
+                # the next bounded reasoning round sees observations to cite.
+                fresh = [
+                    {"collector": collector, "scope": {}}
+                    for collector in sorted(all_names - set(evidence))
+                ]
             if not fresh and not wanted and decision.get("action") == "probe":
                 fallback = _fallback_probe(
                     all_names,
@@ -612,6 +672,10 @@ async def investigate(
                     seen_probes.add(fingerprint)
                     fresh.append(fallback)
             if not fresh and not wanted:
+                if unverified_conclusion and step < decision_round_limit:
+                    # Keep the remaining bounded rounds available for the
+                    # model to reconsider the newly collected base evidence.
+                    continue
                 break
             if fresh:
                 await _within_budget(
@@ -635,9 +699,10 @@ async def investigate(
                     )
                 )
             ran_queries_last_step = bool(wanted)
-            # Legacy bounded callers keep the historical early-stop behaviour.
-            # Open-world callers pass 0 and require semantic completion instead.
-            if max_steps > 0 and _legacy_supported(ledger):
+            # A bounded investigation may finish early only when the ledger
+            # cites an actual scoped fact. Model prose or partial observations
+            # must consume the remaining (at most three) reasoning rounds.
+            if _legacy_supported(ledger, eligible_support_ids=_eligible_support_ids(blackboard)):
                 break
     except Exception:  # noqa: BLE001 - never raise into analyze; keep whatever we have
         pass
@@ -697,7 +762,11 @@ async def investigate(
                 )
                 if not isinstance(verification, dict):
                     break
-                ledger = _apply_ledger_updates(ledger, verification.get("hypothesis_updates"))
+                ledger = _apply_ledger_updates(
+                    ledger,
+                    verification.get("hypothesis_updates"),
+                    eligible_support_ids=_eligible_support_ids(blackboard),
+                )
                 if verification.get("action") == "conclude":
                     break
                 fresh = []
@@ -890,7 +959,11 @@ async def _reflect_hypotheses(
     )
     if not isinstance(reflection, dict):
         return ledger
-    ledger = _apply_ledger_updates(ledger, reflection.get("hypothesis_updates"))
+    ledger = _apply_ledger_updates(
+        ledger,
+        reflection.get("hypothesis_updates"),
+        eligible_support_ids=_eligible_support_ids(blackboard),
+    )
     return _add_reflected_hypotheses(ledger, reflection.get("new_hypotheses"))
 
 

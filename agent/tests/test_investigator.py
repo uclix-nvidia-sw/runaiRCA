@@ -310,14 +310,14 @@ async def test_investigation_context_masks_llm_decision_outputs(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_hypothesis_ledger_updates_and_confident_stop(monkeypatch) -> None:
+async def test_hypothesis_ledger_rejects_prose_support_and_uses_bounded_rounds(monkeypatch) -> None:
     settings = replace(
         make_settings(),
         llm_base_url="https://llm.example/v1",
         llm_model="m",
         llm_api_key="k",
     )
-    calls = {"n": 0}
+    calls = {"decision": 0, "reflection": 0}
     plan = InvestigationPlan(
         hypotheses=[
             {"family": "runai_scheduling_quota", "reason": "queue saturated"},
@@ -326,9 +326,10 @@ async def test_hypothesis_ledger_updates_and_confident_stop(monkeypatch) -> None
     )
 
     async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
-        calls["n"] += 1
         if "final skeptical reflection" in system:
+            calls["reflection"] += 1
             return {"hypothesis_updates": [], "new_hypotheses": []}
+        calls["decision"] += 1
         return {
             "action": "probe",
             "reason": "quota evidence is strongest",
@@ -346,16 +347,46 @@ async def test_hypothesis_ledger_updates_and_confident_stop(monkeypatch) -> None
 
     monkeypatch.setattr("app.services.investigator.complete_json", fake_complete_json)
     results, context = await investigate(
-        settings, make_target(), _collectors(), plan, {}, max_steps=4
+        settings, make_target(), _collectors(), plan, {}, max_steps=3
     )
 
     ledger = context["hypothesis_ledger"]
     assert ledger[0]["id"] == "H1"
     assert ledger[0]["confidence"] == 0.9
-    assert ledger[0]["status"] == "supported"
-    assert "queue saturated" in ledger[0]["evidence_for"]
-    assert calls["n"] == 2  # one decision, one reflection; confident stop avoids extra loop steps
+    assert ledger[0]["status"] == "testing"
+    assert ledger[0]["evidence_for"] == []
+    assert calls == {"decision": 3, "reflection": 1}
     assert {r.agent for r in results} == {"runai", "kubernetes", "loki"}
+
+
+@pytest.mark.asyncio
+async def test_evidence_free_conclusion_collects_base_evidence_before_stopping(monkeypatch) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.example/v1",
+        llm_model="m",
+        llm_api_key="k",
+    )
+    collectors = _collectors()
+    decision_prompts: list[str] = []
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
+        if "final skeptical reflection" in system:
+            return {"hypothesis_updates": [], "new_hypotheses": []}
+        decision_prompts.append(user)
+        return {"action": "conclude", "reason": "no evidence cited"}
+
+    monkeypatch.setattr("app.services.investigator.complete_json", fake_complete_json)
+    results, context = await investigate(
+        settings, make_target(), collectors, InvestigationPlan(), {}, max_steps=3
+    )
+
+    assert len(decision_prompts) == 3
+    assert "runai ok" not in decision_prompts[0]
+    assert "runai ok" in decision_prompts[1]
+    assert all(collector.calls == 1 for collector in collectors)
+    assert len(context["investigation_steps"]) == 3
+    assert {result.agent for result in results} == {"runai", "kubernetes", "loki"}
 
 
 @pytest.mark.asyncio
