@@ -145,20 +145,20 @@ async def test_loki_emits_target_evidence_only_for_verified_native_stream_labels
     observations = {
         artifact.result["observation"]["predicate"]: artifact.result["observation"] for artifact in signals
     }
-    for predicate in ("log:error_logs", "log:recent_logs"):
-        assert (observations[predicate]["polarity"], observations[predicate]["coverage"]) == (
-            "present",
-            "scoped",
-        )
-        assert observations[predicate]["target_scope_verified"] is True
-        assert observations[predicate]["observed_entity"] == {
-            "kind": "pod",
-            "name": "trainer-0",
-        }
+    assert (observations["log:error_logs"]["polarity"], observations["log:error_logs"]["coverage"]) == (
+        "present",
+        "scoped",
+    )
+    assert observations["log:error_logs"]["target_scope_verified"] is True
+    assert observations["log:error_logs"]["observed_entity"] == {
+        "kind": "pod",
+        "name": "trainer-0",
+    }
     assert all(
         (observations[predicate]["polarity"], observations[predicate]["coverage"])
         == ("unknown", "partial")
         for predicate in (
+            "log:recent_logs",
             "log:workload_history_logs",
             "log:runai_control_plane_errors",
             "log:runai_control_plane_for_workload",
@@ -765,6 +765,65 @@ def test_loki_query_observation_only_refutes_with_a_bounded_incident_window() ->
     assert out_of_window["log_window_verified"] is False
     assert live_empty["polarity"] == "unknown"
     assert live_empty["coverage"] == "partial"
+
+
+def test_loki_negative_normal_and_recovery_lines_are_not_causal_support() -> None:
+    target = make_target()
+    window = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    base = {
+        "name": "error_logs",
+        "line_count": 1,
+        "stream_count": 1,
+        "stream_labels": [{"namespace": "runai-vision", "pod": "trainer-0"}],
+        "stream_labels_complete": True,
+    }
+    negative_lines = (
+        "no OOMKilled was observed; pod is healthy",
+        "container crash recovered after retry",
+        "OOMKilled=false; workload normal",
+    )
+    observations = [
+        loki._loki_query_observation(
+            {
+                **base,
+                "sample_entries": [
+                    {"timestamp": "2026-07-10T01:02:00Z", "line": line}
+                ],
+            },
+            target=target,
+            time_range=window,
+        )
+        for line in negative_lines
+    ]
+    affirmative = loki._loki_query_observation(
+        {
+            **base,
+            "sample_entries": [
+                {"timestamp": "2026-07-10T01:02:00Z", "line": "OOMKilled exit code 137"}
+            ],
+        },
+        target=target,
+        time_range=window,
+    )
+    recent = loki._loki_query_observation(
+        {
+            **base,
+            "name": "recent_logs",
+            "sample_entries": [
+                {"timestamp": "2026-07-10T01:02:00Z", "line": "normal startup completed"}
+            ],
+        },
+        target=target,
+        time_range=window,
+    )
+
+    for observation in observations:
+        assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+        assert observation["affirmative_line_count"] == 0
+    assert (affirmative["polarity"], affirmative["coverage"]) == ("present", "scoped")
+    assert affirmative["affirmative_line_count"] == 1
+    assert affirmative["observed_entity"] == {"kind": "pod", "name": "trainer-0"}
+    assert (recent["polarity"], recent["coverage"]) == ("unknown", "partial")
 
 
 def test_prometheus_positive_observation_exposes_actual_sample_window() -> None:

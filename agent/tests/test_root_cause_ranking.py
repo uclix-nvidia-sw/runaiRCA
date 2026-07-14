@@ -289,6 +289,89 @@ def test_structured_scoped_artifact_remains_available_to_keyword_ranker() -> Non
     assert "evicted" in _result_text(_r("kubernetes", artifacts=[scoped]))
 
 
+def test_kubernetes_raw_recovery_or_healthy_tokens_do_not_support_ranking() -> None:
+    """A log line's existence is not proof that its historic failure is active."""
+    pod_log = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_pod_log",
+        status="ok",
+        confidence="high",
+        summary="Kubernetes Pod log: matching incident-window line was present.",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "pod", "name": "trainer-abc-x1"},
+            },
+            "sample_entries": [
+                {"line": "healthy OOMKilled condition is false"},
+                {"line": "OOMKilled recovery complete; pod normal"},
+            ],
+        },
+    )
+    recovery_event = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_warning_events",
+        status="ok",
+        confidence="high",
+        summary="Kubernetes Warning events: recovery record was returned.",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "pod", "name": "trainer-abc-x1"},
+            },
+            "events": [
+                {
+                    "type": "Warning",
+                    "reason": "RecoveryComplete",
+                    "message": "OOMKilled recovered; pod healthy",
+                },
+                {"type": "Normal", "reason": "OOMKilled", "message": "normal"},
+            ],
+        },
+    )
+    result = _r("kubernetes", artifacts=[pod_log, recovery_event])
+
+    text = _result_text(result)
+
+    assert "oomkilled" not in text
+    assert rank_root_cause_candidates(_target(), [result])[0].family == "insufficient_evidence"
+
+
+def test_kubernetes_positive_event_reason_and_log_line_remain_rankable() -> None:
+    pod_log = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_pod_log",
+        status="ok",
+        confidence="high",
+        summary="Kubernetes Pod log: matching incident-window line was present.",
+        result={
+            "observation": {"polarity": "present", "coverage": "scoped"},
+            "sample_entries": [{"line": "container OOMKilled exit code 137"}],
+        },
+    )
+    warning_event = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_warning_events",
+        status="ok",
+        confidence="high",
+        summary="Kubernetes Warning events: one incident event was returned.",
+        result={
+            "observation": {"polarity": "present", "coverage": "scoped"},
+            "events": [{"type": "Warning", "reason": "OOMKilled"}],
+        },
+    )
+
+    text = _result_text(_r("kubernetes", artifacts=[pod_log, warning_event]))
+
+    assert "oomkilled" in text
+
+
 def test_context_ineligible_typed_artifact_cannot_reenter_catalog_ranking() -> None:
     """A scoped query result can still be outside this alert's causal window.
 

@@ -17,6 +17,7 @@ from app.collectors.base import (
 )
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
+from app.knowledge import _keyword_negated
 from app.llm import cached_insight, complete, insight_cache_key, llm_configured
 from app.masking import build_masker
 from app.mcp_client import (
@@ -25,6 +26,19 @@ from app.mcp_client import (
     mcp_error,
     mcp_fallback_warning,
     mcp_tool_json,
+)
+
+_LOKI_FAILURE_TOKEN_RE = re.compile(
+    r"\b(?:error|fail(?:ed|ure)?|oom(?:killed)?|evict(?:ed|ion)?|"
+    r"crash(?:ed|loop)?|pending|unschedul(?:able|ed)?|back-?off)\b",
+    re.IGNORECASE,
+)
+_LOKI_NON_CAUSAL_LINE_RE = re.compile(
+    r"\b(?:healthy|normal|nominal|ready|recovered|recovery|resolved|cleared|"
+    r"fixed|remediated|succeed(?:ed|ing|s)?|success(?:ful(?:ly)?)?|no\s+(?:error|fail|"
+    r"oom|evict|crash|pending|issue)|without\s+(?:error|fail|oom|evict|crash|pending))\b"
+    r"|(?:정상|복구|해결|오류\s*없|실패\s*없|문제\s*없)",
+    re.IGNORECASE,
 )
 
 
@@ -574,6 +588,7 @@ def _loki_query_observation(
     """Classify a LogQL result without making unbounded empty searches refute RCA."""
     name = str(item.get("name") or "logs")
     window_verified = _loki_entries_in_window(item.get("sample_entries"), time_range)
+    affirmative_lines = _loki_affirmative_lines(item.get("sample_entries"), time_range)
     if item.get("error"):
         polarity, coverage = "unavailable", "unknown"
     elif name == "runai_control_plane_errors":
@@ -585,12 +600,24 @@ def _loki_query_observation(
         # A current/live query can help an operator, but it cannot confirm that
         # the same condition was absent at the historical incident time.
         polarity, coverage = "unknown", "partial"
+    elif name == "recent_logs":
+        # This is an intentionally unfiltered tail.  A normal lifecycle line
+        # can mention a failure token (or merely contain application prose),
+        # so its presence cannot ground a causal hypothesis.  The targeted
+        # error query below may still produce a typed signal.
+        polarity, coverage = "unknown", "partial"
     elif int(item.get("line_count") or 0) == 0:
         polarity, coverage = "absent", "scoped"
     elif window_verified is not True:
         # A proxy/MCP can return current logs despite a range-shaped request,
         # and some MCP responses omit timestamps entirely. Historical support
         # requires a retained log timestamp inside the incident window.
+        polarity, coverage = "unknown", "partial"
+    elif name == "error_logs" and not affirmative_lines:
+        # The broad LogQL token matcher also returns e.g. "no OOM", "crash
+        # recovered" and "OOMKilled=false".  Retain those lines for the
+        # operator, but do not let a negated/healthy/recovery sentence become
+        # causal support just because it contains a scary word.
         polarity, coverage = "unknown", "partial"
     else:
         polarity, coverage = "present", "scoped"
@@ -613,6 +640,7 @@ def _loki_query_observation(
         "coverage": coverage,
         "line_count": int(item.get("line_count") or 0),
         "stream_count": int(item.get("stream_count") or 0),
+        "affirmative_line_count": len(affirmative_lines),
         "observation_window": time_range or {},
         "log_window_verified": window_verified,
     }
@@ -625,6 +653,47 @@ def _loki_query_observation(
         if evidence_window:
             observation["evidence_window"] = evidence_window
     return observation
+
+
+def _loki_affirmative_lines(
+    entries: object, time_range: dict[str, str] | None
+) -> list[str]:
+    """Return in-window log lines that affirm, rather than negate, a failure.
+
+    This deliberately analyzes only the error-token query.  It is not an NLP
+    classifier: any ambiguity is excluded from causal support and remains on
+    the evidence card as context.
+    """
+    if not time_range:
+        return []
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return []
+    affirmative: list[str] = []
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        timestamp = parse_incident_time(entry.get("timestamp"))
+        line = entry.get("line")
+        if timestamp is None or not (start <= timestamp <= end) or not isinstance(line, str):
+            continue
+        if _loki_line_affirms_failure(line):
+            affirmative.append(line)
+    return affirmative
+
+
+def _loki_line_affirms_failure(line: str) -> bool:
+    lowered = line.casefold()
+    # A recovery/healthy assertion can share a sentence with the earlier error
+    # token ("failed then recovered").  Favor a false negative over claiming a
+    # resolved status line is the incident's cause.
+    if _LOKI_NON_CAUSAL_LINE_RE.search(lowered):
+        return False
+    return any(
+        not _keyword_negated(lowered, match.start(), match.end())
+        for match in _LOKI_FAILURE_TOKEN_RE.finditer(lowered)
+    )
 
 
 def _loki_target_scope(

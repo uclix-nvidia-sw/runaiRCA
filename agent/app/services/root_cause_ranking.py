@@ -763,6 +763,73 @@ COLLECTOR_TEXT_DROP_KEYS: dict[str, frozenset[str]] = {
 }
 _RANKING_TEXT_DROP_KEYS = COLLECTOR_TEXT_DROP_KEYS  # backward-compatible alias
 
+# A timestamped Pod-log line proves the line existed, not that every failure
+# token inside it is an active condition. Kubernetes commonly logs recovery
+# status alongside a historic reason ("healthy after OOMKilled") and probes
+# often emit negative checks ("OOMKilled=false"). The generic keyword
+# negation helper intentionally permits nuanced prose; at this evidence
+# boundary be conservative instead: a normal/recovery-valued raw line cannot
+# substantiate a root-cause family. Structured Event reasons remain available
+# below when Kubernetes itself reports the positive reason.
+_KUBERNETES_NON_CAUSAL_SIGNAL_RE = re.compile(
+    r"\b(?:no|not|without|none|zero|false|healthy|normal|nominal|stable|ready|"
+    r"recovery|recovering|recovered|resolved|cleared|fixed|remediated|success|"
+    r"succeeded)\b|(?:없음|정상|복구|해결|미발생|아님)"
+)
+
+
+def _kubernetes_signal_is_positive(value: object) -> bool:
+    """Whether a raw Kubernetes value can carry a live failure signal."""
+    text = " ".join(str(value or "").split())
+    return bool(text) and _KUBERNETES_NON_CAUSAL_SIGNAL_RE.search(text.casefold()) is None
+
+
+def _kubernetes_semantic_artifact_text(art: object) -> str:
+    """Keep only value-aware positive signals from Pod logs and Warning Events."""
+    payload = getattr(art, "result", None)
+    if not isinstance(payload, Mapping):
+        return ""
+    artifact_type = str(getattr(art, "type", ""))
+    parts: list[str] = []
+    if artifact_type == "kubernetes_pod_log":
+        entries = payload.get("sample_entries")
+        if not isinstance(entries, list):
+            entries = payload.get("lines") if isinstance(payload.get("lines"), list) else []
+        for entry in entries:
+            line = entry.get("line") if isinstance(entry, Mapping) else entry
+            if _kubernetes_signal_is_positive(line):
+                parts.append(str(line))
+    elif artifact_type == "kubernetes_warning_events":
+        events = payload.get("events")
+        for event in events if isinstance(events, list) else []:
+            if not isinstance(event, Mapping):
+                continue
+            # A Normal Event is never a failure signal. The collector normally
+            # removes these earlier, but keep ranking fail-closed for adapters
+            # and test fixtures that hand us an unfiltered response.
+            event_type = str(event.get("type") or "").strip().casefold()
+            if event_type and event_type != "warning":
+                continue
+            reason = event.get("reason")
+            if _kubernetes_signal_is_positive(reason):
+                parts.append(str(reason))
+            message = event.get("message")
+            if _kubernetes_signal_is_positive(message):
+                parts.append(str(message))
+    return " ".join(parts)
+
+
+def _artifact_ranking_value_text(
+    art: object, drop_keys: "frozenset[str] | set[str] | None"
+) -> str:
+    if str(getattr(art, "type", "")) in {
+        "kubernetes_pod_log",
+        "kubernetes_warning_events",
+    }:
+        return _kubernetes_semantic_artifact_text(art)
+    result = getattr(art, "result", None)
+    return _leaf_text(result, drop_keys) if result is not None else ""
+
 
 def _result_text(
     result: CollectorResult, *, eligible_evidence_ids: set[str] | None = None
@@ -783,10 +850,15 @@ def _result_text(
         for art in structured:
             if not _artifact_is_evidence(art, eligible_evidence_ids=eligible_evidence_ids):
                 continue
-            if art.summary:
+            semantic_kubernetes_card = str(getattr(art, "type", "")) in {
+                "kubernetes_pod_log",
+                "kubernetes_warning_events",
+            }
+            if art.summary and (
+                not semantic_kubernetes_card or _kubernetes_signal_is_positive(art.summary)
+            ):
                 parts.append(art.summary)
-            if art.result is not None:
-                parts.append(_leaf_text(art.result, drop_keys))
+            parts.append(_artifact_ranking_value_text(art, drop_keys))
         return " ".join(parts).lower()
 
     parts = [result.summary or ""]
@@ -795,8 +867,7 @@ def _result_text(
             continue
         if art.summary:
             parts.append(art.summary)
-        if art.result is not None:
-            parts.append(_leaf_text(art.result, drop_keys))
+        parts.append(_artifact_ranking_value_text(art, drop_keys))
     if result.details:
         parts.append(_leaf_text(result.details, drop_keys))
     return " ".join(parts).lower()
