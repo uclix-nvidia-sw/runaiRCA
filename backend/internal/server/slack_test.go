@@ -469,6 +469,435 @@ func TestSlackFailedPostDoesNotBurnAnalysisSequence(t *testing.T) {
 	}
 }
 
+func TestSlackQueuedDeliveryRetriesWithStableClientMessageID(t *testing.T) {
+	var payloads []map[string]any
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var msg map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&msg)
+		payloads = append(payloads, msg)
+		if len(payloads) == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "service_unavailable"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ts": "1710000000.000099"})
+	}))
+	defer stub.Close()
+
+	server := &Server{
+		store: NewStore(),
+		hub:   NewHub(),
+		slack: &SlackNotifier{botToken: "xoxb-test", channelID: "C1", apiURL: stub.URL, client: stub.Client()},
+	}
+	incident, record := seedAlert(t, server, "fp-slack-durable-retry")
+	run := server.store.CreateAnalysisRun("auto", "alert", record.AlertID, incident.IncidentID, record.AlertID, "Auto", "")
+	run, ok := server.store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "durable retry root cause",
+		AnalysisDetail:  "## Recommended Actions\n\n- retry safely",
+		AnalysisQuality: "high",
+	})
+	if !ok {
+		t.Fatal("failed to complete analysis run")
+	}
+	delivery, ok := server.store.QueueSlackAnalysisDelivery(run.RunID, incident.IncidentID)
+	if !ok || !delivery.Tracked {
+		t.Fatalf("delivery was not durably queued: %+v", delivery)
+	}
+
+	server.deliverSlackAnalysisDelivery(delivery)
+	detail, _ := server.store.IncidentDetail(incident.IncidentID)
+	if detail.AnalysisSeq != 0 || detail.SlackThreadTS != "" {
+		t.Fatalf("failed attempt advanced incident Slack state: %+v", detail.Incident)
+	}
+	if pending := server.store.PendingSlackAnalysisDeliveries(time.Now().UTC(), 10); len(pending) != 0 {
+		t.Fatalf("delivery should respect retry backoff, got %+v", pending)
+	}
+
+	server.retryPendingSlackAnalysisDeliveries(time.Now().UTC().Add(slackDeliveryRetryPeriod + time.Second))
+	detail, _ = server.store.IncidentDetail(incident.IncidentID)
+	if detail.AnalysisSeq != 1 || detail.SlackThreadTS != "1710000000.000099" {
+		t.Fatalf("successful retry did not commit root thread state: %+v", detail.Incident)
+	}
+	if len(payloads) != 2 || payloads[0]["client_msg_id"] == "" || payloads[0]["client_msg_id"] != payloads[1]["client_msg_id"] {
+		t.Fatalf("retry must reuse a stable client_msg_id: %+v", payloads)
+	}
+	if pending := server.store.PendingSlackAnalysisDeliveries(time.Now().UTC().Add(24*time.Hour), 10); len(pending) != 0 {
+		t.Fatalf("delivered outbox entry remained pending: %+v", pending)
+	}
+	if server.store.BeginSlackAnalysisDelivery(run.RunID, delivery.ID) {
+		t.Fatal("a concurrent stale retry was allowed to reopen a delivered outbox entry")
+	}
+}
+
+func TestSlackPendingSnapshotSurvivesReusedAnalysisRun(t *testing.T) {
+	server := &Server{store: NewStore(), hub: NewHub(), slack: &SlackNotifier{}}
+	incident, record := seedAlert(t, server, "fp-slack-reused-run")
+	run := server.store.CreateAnalysisRun("auto", "alert", record.AlertID, incident.IncidentID, record.AlertID, "Auto", "")
+	run, _ = server.store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{AnalysisSummary: "first attempt result"})
+	if _, ok := server.store.QueueSlackAnalysisDelivery(run.RunID, incident.IncidentID); !ok {
+		t.Fatal("failed to queue first attempt")
+	}
+
+	reused, created := server.store.CreateAnalysisRunIfAllowed(
+		"manual", "alert", record.AlertID, incident.IncidentID, record.AlertID, "Manual", "reanalyze",
+	)
+	if !created || reused.RunID != run.RunID {
+		t.Fatalf("expected run reuse, got %+v created=%v", reused, created)
+	}
+	if _, ok := server.store.CompleteAnalysisRun(reused.RunID, AgentAnalysisResponse{AnalysisSummary: "second attempt result"}); !ok {
+		t.Fatal("failed to complete reused run")
+	}
+
+	pending := server.store.PendingSlackAnalysisDeliveries(time.Now().UTC(), 10)
+	if len(pending) != 1 || pending[0].Run.AnalysisSummary != "first attempt result" {
+		t.Fatalf("pending delivery lost its original analysis snapshot: %+v", pending)
+	}
+}
+
+func TestSlackCompletionSnapshotQueuesAfterSameRunStartsNextAttempt(t *testing.T) {
+	server := &Server{store: NewStore(), hub: NewHub(), slack: &SlackNotifier{}}
+	incident, record := seedAlert(t, server, "fp-slack-complete-reuse-race")
+	first := server.store.CreateAnalysisRun(
+		"auto", "alert", record.AlertID, incident.IncidentID, record.AlertID, "Auto", "",
+	)
+	first, ok := server.store.CompleteAnalysisRun(first.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "first immutable completion",
+	})
+	if !ok {
+		t.Fatal("failed to complete first attempt")
+	}
+
+	// Reproduce the production interleaving: CompleteAnalysisRun returned its
+	// snapshot, then another request reused the row before notifySlackAnalysis
+	// had a chance to queue the completed attempt.
+	reused, created := server.store.CreateAnalysisRunIfAllowed(
+		"manual", "alert", record.AlertID, incident.IncidentID, record.AlertID,
+		"Manual", "reanalyze immediately",
+	)
+	if !created || reused.RunID != first.RunID || reused.Status != "analyzing" {
+		t.Fatalf("expected the same row to start its next attempt: %+v created=%v", reused, created)
+	}
+
+	delivery, queued := server.store.QueueSlackAnalysisDeliverySnapshot(first, incident.IncidentID)
+	if !queued || !delivery.Tracked {
+		t.Fatalf("completed attempt was not queued after row reuse: %+v queued=%v", delivery, queued)
+	}
+	if delivery.Run.AnalysisSummary != "first immutable completion" || delivery.Run.Status != "complete" {
+		t.Fatalf("delivery used the mutable next-attempt row instead of completion snapshot: %+v", delivery.Run)
+	}
+	if duplicate, queuedAgain := server.store.QueueSlackAnalysisDeliverySnapshot(first, incident.IncidentID); !queuedAgain || duplicate.ID != delivery.ID {
+		t.Fatalf("same completion did not resolve to its existing outbox entry: %+v queued=%v", duplicate, queuedAgain)
+	}
+	pending := server.store.PendingSlackAnalysisDeliveries(time.Now().UTC(), 10)
+	if len(pending) != 1 || pending[0].ID != delivery.ID ||
+		pending[0].Run.AnalysisSummary != "first immutable completion" {
+		t.Fatalf("completion must be queued exactly once with its own snapshot: %+v", pending)
+	}
+	current, ok := server.store.AnalysisRun(first.RunID)
+	if !ok || current.Status != "analyzing" || current.Prompt != "reanalyze immediately" {
+		t.Fatalf("queueing the old completion corrupted the active attempt: %+v", current)
+	}
+}
+
+func TestCompleteAnalysisRunAtomicallyPersistsSlackOutboxSnapshot(t *testing.T) {
+	server := &Server{store: NewStore(), hub: NewHub(), slack: &SlackNotifier{}}
+	incident, record := seedAlert(t, server, "fp-slack-complete-atomic")
+	run := server.store.CreateAnalysisRun(
+		"manual", "alert", record.AlertID, incident.IncidentID, record.AlertID, "Manual", "",
+	)
+	completed, delivery, ok := server.store.CompleteAnalysisRunWithSlackDelivery(
+		run.RunID,
+		AgentAnalysisResponse{AnalysisSummary: "durable completion snapshot"},
+		incident.IncidentID,
+	)
+	if !ok || delivery.ID == "" || !delivery.Tracked {
+		t.Fatalf("completion and outbox were not committed together: run=%+v delivery=%+v ok=%v", completed, delivery, ok)
+	}
+	// No explicit QueueSlackAnalysisDelivery call follows. This is the exact
+	// state a restart observes if the process exits immediately after completion.
+	pending := server.store.PendingSlackAnalysisDeliveries(time.Now().UTC(), 10)
+	if len(pending) != 1 || pending[0].ID != delivery.ID ||
+		pending[0].Run.AnalysisSummary != "durable completion snapshot" {
+		t.Fatalf("completed run did not already contain its retryable snapshot: %+v", pending)
+	}
+	stored, exists := server.store.AnalysisRun(run.RunID)
+	if !exists || stored.Status != "complete" || len(slackOutboxEntries(stored.Metadata)) != 1 {
+		t.Fatalf("completion/outbox persist boundary is not atomic in the stored row: %+v", stored)
+	}
+}
+
+func TestFailedApplySkipsAtomicallyQueuedSlackCompletion(t *testing.T) {
+	server := &Server{store: NewStore(), hub: NewHub(), slack: &SlackNotifier{}}
+	incident, record := seedAlert(t, server, "fp-slack-complete-not-applied")
+	run := server.store.CreateAnalysisRun(
+		"manual", "alert", record.AlertID, incident.IncidentID, record.AlertID, "Manual", "",
+	)
+	completed, delivery, ok := server.store.CompleteAnalysisRunWithSlackDelivery(
+		run.RunID,
+		AgentAnalysisResponse{AnalysisSummary: "result that cannot be applied"},
+		incident.IncidentID,
+	)
+	if !ok || delivery.ID == "" {
+		t.Fatal("failed to atomically queue completion")
+	}
+	if _, ok := server.store.FailAnalysisRun(completed.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "analysis persistence failed",
+	}); !ok {
+		t.Fatal("failed to mark unapplied completion failed")
+	}
+	if pending := server.store.PendingSlackAnalysisDeliveries(time.Now().UTC().Add(time.Hour), 10); len(pending) != 0 {
+		t.Fatalf("unapplied completion remained eligible for Slack delivery: %+v", pending)
+	}
+	stored, _ := server.store.AnalysisRun(run.RunID)
+	entries := slackOutboxEntries(stored.Metadata)
+	if len(entries) != 1 || stringValue(entries[0]["status"]) != slackDeliverySkipped {
+		t.Fatalf("unapplied completion was not durably skipped: %+v", entries)
+	}
+}
+
+func TestDeletedIncidentSlackDeliveryDoesNotStarveRetryQueue(t *testing.T) {
+	server := &Server{store: NewStore(), hub: NewHub(), slack: &SlackNotifier{}}
+	incident, record := seedAlert(t, server, "fp-slack-deleted-incident")
+	run := server.store.CreateAnalysisRun(
+		"manual", "alert", record.AlertID, incident.IncidentID, record.AlertID, "Manual", "",
+	)
+	_, delivery, ok := server.store.CompleteAnalysisRunWithSlackDelivery(
+		run.RunID,
+		AgentAnalysisResponse{AnalysisSummary: "result for deleted incident"},
+		incident.IncidentID,
+	)
+	if !ok || delivery.ID == "" {
+		t.Fatal("failed to queue completion")
+	}
+	if _, ok := server.store.SoftDeleteIncident(incident.IncidentID); !ok {
+		t.Fatal("failed to move incident to trash")
+	}
+
+	server.deliverSlackAnalysisDelivery(delivery)
+	if pending := server.store.PendingSlackAnalysisDeliveries(time.Now().UTC().Add(24*time.Hour), 10); len(pending) != 0 {
+		t.Fatalf("terminal deleted-incident delivery remained in retry queue: %+v", pending)
+	}
+	stored, _ := server.store.AnalysisRun(run.RunID)
+	entries := slackOutboxEntries(stored.Metadata)
+	if len(entries) != 1 || stringValue(entries[0]["status"]) != slackDeliverySkipped {
+		t.Fatalf("deleted incident delivery was not marked terminal: %+v", entries)
+	}
+}
+
+func TestDelayedEarlierAutoCompletionIsNotDroppedAfterLaterManualRoot(t *testing.T) {
+	var mu sync.Mutex
+	var payloads []map[string]any
+	posted := make(chan struct{}, 2)
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var msg map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&msg)
+		mu.Lock()
+		payloads = append(payloads, msg)
+		count := len(payloads)
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok": true,
+			"ts": fmt.Sprintf("1710000000.%06d", count),
+		})
+		posted <- struct{}{}
+	}))
+	defer stub.Close()
+	server := &Server{
+		store: NewStore(), hub: NewHub(),
+		slack: &SlackNotifier{
+			botToken: "xoxb-test", channelID: "C1", apiURL: stub.URL, client: stub.Client(),
+		},
+	}
+	incident, record := seedAlert(t, server, "fp-slack-delayed-auto")
+	first := server.store.CreateAnalysisRun(
+		"auto", "alert", record.AlertID, incident.IncidentID, record.AlertID, "Auto", "",
+	)
+	first, _ = server.store.CompleteAnalysisRun(first.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "earlier automatic result",
+	})
+
+	manual, created := server.store.CreateAnalysisRunIfAllowed(
+		"manual", "alert", record.AlertID, incident.IncidentID, record.AlertID,
+		"Manual", "reanalyze",
+	)
+	if !created {
+		t.Fatal("failed to start later manual attempt")
+	}
+	manual, _ = server.store.CompleteAnalysisRun(manual.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "later manual result",
+	})
+	manualDelivery, ok := server.store.QueueSlackAnalysisDeliverySnapshot(manual, incident.IncidentID)
+	if !ok {
+		t.Fatal("failed to queue later manual result")
+	}
+	server.deliverSlackAnalysisDelivery(manualDelivery)
+	<-posted
+
+	// notifySlackAnalysis used to return before queueing here merely because the
+	// later manual result had already created a thread.
+	server.notifySlackAnalysis(first, incident.IncidentID)
+	select {
+	case <-posted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("earlier automatic completion was silently dropped after manual root")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(payloads) != 2 || payloads[1]["thread_ts"] != "1710000000.000001" {
+		t.Fatalf("delayed earlier completion was not retained as a thread reply: %+v", payloads)
+	}
+	replyJSON, _ := json.Marshal(payloads[1])
+	if !strings.Contains(string(replyJSON), "earlier automatic result") {
+		t.Fatalf("thread reply did not use the earlier immutable snapshot: %+v", payloads[1])
+	}
+}
+
+func TestSlackPendingDeliveriesStayInIncidentAttemptOrder(t *testing.T) {
+	var payloads []map[string]any
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var msg map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&msg)
+		payloads = append(payloads, msg)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ts": fmt.Sprintf("1710000000.%06d", len(payloads))})
+	}))
+	defer stub.Close()
+	server := &Server{
+		store: NewStore(), hub: NewHub(),
+		slack: &SlackNotifier{botToken: "xoxb-test", channelID: "C1", apiURL: stub.URL, client: stub.Client()},
+	}
+	incident, record := seedAlert(t, server, "fp-slack-delivery-order")
+	firstRun := server.store.CreateAnalysisRun("auto", "alert", record.AlertID, incident.IncidentID, record.AlertID, "Auto", "")
+	firstRun, _ = server.store.CompleteAnalysisRun(firstRun.RunID, AgentAnalysisResponse{AnalysisSummary: "first result"})
+	firstDelivery, ok := server.store.QueueSlackAnalysisDelivery(firstRun.RunID, incident.IncidentID)
+	if !ok {
+		t.Fatal("failed to queue first delivery")
+	}
+
+	secondRun, created := server.store.CreateAnalysisRunIfAllowed(
+		"manual", "alert", record.AlertID, incident.IncidentID, record.AlertID, "Manual", "reanalyze",
+	)
+	if !created {
+		t.Fatal("failed to start reused analysis run")
+	}
+	secondRun, _ = server.store.CompleteAnalysisRun(secondRun.RunID, AgentAnalysisResponse{AnalysisSummary: "second result"})
+	secondDelivery, ok := server.store.QueueSlackAnalysisDelivery(secondRun.RunID, incident.IncidentID)
+	if !ok || secondDelivery.ID == firstDelivery.ID {
+		t.Fatalf("failed to queue distinct second delivery: first=%+v second=%+v", firstDelivery, secondDelivery)
+	}
+
+	server.deliverSlackAnalysisDelivery(secondDelivery)
+	if len(payloads) != 0 {
+		t.Fatalf("later analysis overtook pending earlier delivery: %+v", payloads)
+	}
+	server.deliverSlackAnalysisDelivery(firstDelivery)
+	server.deliverSlackAnalysisDelivery(secondDelivery)
+	if len(payloads) != 2 || !strings.Contains(payloads[0]["text"].(string), "Initial Analysis") ||
+		!strings.Contains(payloads[1]["text"].(string), "2nd Analysis") {
+		t.Fatalf("deliveries were not emitted in analysis order: %+v", payloads)
+	}
+	if payloads[1]["thread_ts"] != payloads[0]["ts"] && payloads[1]["thread_ts"] != "1710000000.000001" {
+		t.Fatalf("second delivery was not threaded under the first: %+v", payloads)
+	}
+}
+
+func TestSlackMissingPersistedParentRetriesAsReplacementRoot(t *testing.T) {
+	var payloads []map[string]any
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var msg map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&msg)
+		payloads = append(payloads, msg)
+		if len(payloads) == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "thread_not_found"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ts": "1710000000.000888"})
+	}))
+	defer stub.Close()
+	server := &Server{
+		store: NewStore(), hub: NewHub(),
+		slack: &SlackNotifier{botToken: "xoxb-test", channelID: "C1", apiURL: stub.URL, client: stub.Client()},
+	}
+	incident, record := seedAlert(t, server, "fp-slack-missing-parent")
+	server.store.mu.Lock()
+	server.store.incidents[incident.IncidentID].SlackThreadTS = "1700000000.000001"
+	server.store.incidents[incident.IncidentID].AnalysisSeq = 3
+	server.store.mu.Unlock()
+	run := server.store.CreateAnalysisRun("manual", "alert", record.AlertID, incident.IncidentID, record.AlertID, "Manual", "")
+	run, _ = server.store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{AnalysisSummary: "fresh result"})
+	delivery, _ := server.store.QueueSlackAnalysisDelivery(run.RunID, incident.IncidentID)
+
+	server.deliverSlackAnalysisDelivery(delivery)
+	detail, _ := server.store.IncidentDetail(incident.IncidentID)
+	if detail.SlackThreadTS != "" || detail.AnalysisSeq != 0 {
+		t.Fatalf("missing parent was not cleared for recovery: %+v", detail.Incident)
+	}
+	server.retryPendingSlackAnalysisDeliveries(time.Now().UTC().Add(slackDeliveryRetryPeriod + time.Second))
+	detail, _ = server.store.IncidentDetail(incident.IncidentID)
+	if detail.SlackThreadTS != "1710000000.000888" || detail.AnalysisSeq != 1 {
+		t.Fatalf("replacement root was not committed: %+v", detail.Incident)
+	}
+	if len(payloads) != 2 || payloads[1]["thread_ts"] != nil ||
+		!strings.Contains(payloads[1]["text"].(string), "Initial Analysis") {
+		t.Fatalf("retry did not become a replacement root: %+v", payloads)
+	}
+}
+
+func TestSlackSuccessWithoutTimestampKeepsDeliveryPending(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer stub.Close()
+	server := &Server{
+		store: NewStore(), hub: NewHub(),
+		slack: &SlackNotifier{botToken: "xoxb-test", channelID: "C1", apiURL: stub.URL, client: stub.Client()},
+	}
+	incident, record := seedAlert(t, server, "fp-slack-missing-ts")
+	run := server.store.CreateAnalysisRun("auto", "alert", record.AlertID, incident.IncidentID, record.AlertID, "Auto", "")
+	run, _ = server.store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{AnalysisSummary: "root cause"})
+	delivery, ok := server.store.QueueSlackAnalysisDelivery(run.RunID, incident.IncidentID)
+	if !ok {
+		t.Fatal("failed to queue delivery")
+	}
+
+	server.deliverSlackAnalysisDelivery(delivery)
+	detail, _ := server.store.IncidentDetail(incident.IncidentID)
+	if detail.AnalysisSeq != 0 || detail.SlackThreadTS != "" {
+		t.Fatalf("timestamp-less response committed Slack state: %+v", detail.Incident)
+	}
+	if pending := server.store.PendingSlackAnalysisDeliveries(time.Now().UTC().Add(time.Hour), 10); len(pending) != 1 {
+		t.Fatalf("timestamp-less response should remain retryable: %+v", pending)
+	}
+}
+
+func TestSlackMissingLegacyThreadStartsNewVisibleSequence(t *testing.T) {
+	var payload map[string]any
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ts": "1710000000.000777"})
+	}))
+	defer stub.Close()
+	server := &Server{
+		store: NewStore(), hub: NewHub(),
+		slack: &SlackNotifier{botToken: "xoxb-test", channelID: "C1", apiURL: stub.URL, client: stub.Client()},
+	}
+	incident, record := seedAlert(t, server, "fp-slack-legacy-thread")
+	server.store.mu.Lock()
+	server.store.incidents[incident.IncidentID].AnalysisSeq = 4
+	server.store.mu.Unlock()
+	run := server.store.CreateAnalysisRun("manual", "alert", record.AlertID, incident.IncidentID, record.AlertID, "Manual", "")
+	run, _ = server.store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{AnalysisSummary: "new root"})
+	delivery, _ := server.store.QueueSlackAnalysisDelivery(run.RunID, incident.IncidentID)
+
+	server.deliverSlackAnalysisDelivery(delivery)
+	detail, _ := server.store.IncidentDetail(incident.IncidentID)
+	if detail.AnalysisSeq != 1 || detail.SlackThreadTS != "1710000000.000777" {
+		t.Fatalf("replacement root did not reset visible sequence: %+v", detail.Incident)
+	}
+	if !strings.Contains(payload["text"].(string), "Initial Analysis") {
+		t.Fatalf("replacement root used an orphaned sequence label: %+v", payload)
+	}
+}
+
 // TestSlackReanalyzeButtonClick drives the Socket Mode interactive payload end
 // to end: button click → manual incident run → immediate thread note → the
 // completed re-analysis replying into the same thread.

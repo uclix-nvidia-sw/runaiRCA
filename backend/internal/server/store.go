@@ -669,6 +669,16 @@ func (s *Store) ListAnalysisRuns() []AnalysisRun {
 	return items
 }
 
+func (s *Store) AnalysisRun(id string) (AnalysisRun, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	run := s.analysisRuns[strings.TrimSpace(id)]
+	if run == nil {
+		return AnalysisRun{}, false
+	}
+	return cloneAnalysisRun(run), true
+}
+
 func (s *Store) ListAnalysisRunsPage(limit, offset int) ([]AnalysisRun, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1415,6 +1425,62 @@ func mergeAnalysisMetadata(existing map[string]any, incoming map[string]any) map
 	return out
 }
 
+const previousSuccessMetadataKey = "previous_success_metadata"
+
+func lastGoodMetadataSnapshot(metadata map[string]any) map[string]any {
+	out := cloneAnyMap(metadata)
+	delete(out, previousSuccessMetadataKey)
+	delete(out, "progress_log")
+	delete(out, slackOutboxMetadataKey)
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func currentAttemptMetadata(metadata map[string]any) map[string]any {
+	if metadata == nil {
+		return nil
+	}
+	out := map[string]any{}
+	if progress, ok := metadata["progress_log"]; ok {
+		out["progress_log"] = progress
+	}
+	if outbox, ok := metadata[slackOutboxMetadataKey]; ok {
+		out[slackOutboxMetadataKey] = outbox
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return cloneAnyMap(out)
+}
+
+func previousSuccessMetadata(metadata map[string]any) map[string]any {
+	if metadata == nil {
+		return nil
+	}
+	previous, _ := metadata[previousSuccessMetadataKey].(map[string]any)
+	return cloneAnyMap(previous)
+}
+
+func analysisResultMetadata(run *AnalysisRun) map[string]any {
+	if run == nil {
+		return nil
+	}
+	if previous := previousSuccessMetadata(run.Metadata); len(previous) > 0 {
+		return previous
+	}
+	return run.Metadata
+}
+
+func restorePreviousSuccessMetadata(metadata map[string]any) map[string]any {
+	previous := previousSuccessMetadata(metadata)
+	if len(previous) == 0 {
+		return metadata
+	}
+	return mergeAnalysisMetadata(previous, currentAttemptMetadata(metadata))
+}
+
 func progressLogFromMetadata(metadata map[string]any) []any {
 	raw, ok := metadata["progress_log"].([]any)
 	if !ok {
@@ -1461,7 +1527,8 @@ func (s *Store) latestTokenUsageLocked(incidentID string) map[string]any {
 		if !matches {
 			continue
 		}
-		if _, ok := run.Metadata["llm_usage"]; !ok {
+		metadata := analysisResultMetadata(run)
+		if _, ok := metadata["llm_usage"]; !ok {
 			continue
 		}
 		if selected == nil || run.UpdatedAt.After(selected.UpdatedAt) {
@@ -1471,10 +1538,11 @@ func (s *Store) latestTokenUsageLocked(incidentID string) map[string]any {
 	if selected == nil {
 		return nil
 	}
-	if usage, ok := selected.Metadata["llm_usage"].(map[string]any); ok {
+	metadata := analysisResultMetadata(selected)
+	if usage, ok := metadata["llm_usage"].(map[string]any); ok {
 		return cloneAnyMap(usage)
 	}
-	return map[string]any{"value": selected.Metadata["llm_usage"]}
+	return map[string]any{"value": metadata["llm_usage"]}
 }
 
 func (s *Store) latestAlertForIncidentLocked(incidentID string) *AlertRecord {
@@ -1573,6 +1641,7 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 			return cloneAnalysisRun(existing), false
 		}
 	} else if existing := s.latestReusableAnalysisRunLocked(targetType, targetID); existing != nil {
+		before := cloneAnalysisRun(existing)
 		// Re-analysis updates the existing run in place instead of appending a
 		// new row, so an incident keeps a single evolving RCA run.
 		// Clear previous result fields so stale content is not surfaced while
@@ -1585,8 +1654,21 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 		// progress (so the incident keeps showing it) and preserved if this attempt
 		// fails; only a new SUCCESS (CompleteAnalysisRun) replaces it. This makes the
 		// run the durable RCA store, so the alert analysis columns are redundant.
-		// Only the per-attempt metadata (llm_usage, progress_log) is reset.
+		// Reset per-attempt analysis metadata, but keep the durable Slack outbox:
+		// a fast follow-up must not erase a still-pending delivery from the prior
+		// attempt just because this row is intentionally reused.
+		outbox := slackOutboxEntries(existing.Metadata)
+		lastGoodMetadata := lastGoodMetadataSnapshot(existing.Metadata)
 		existing.Metadata = nil
+		if len(outbox) > 0 {
+			existing.Metadata = metadataWithSlackOutbox(nil, outbox)
+		}
+		if existing.FirstCompletedAt != nil && len(lastGoodMetadata) > 0 {
+			if existing.Metadata == nil {
+				existing.Metadata = map[string]any{}
+			}
+			existing.Metadata[previousSuccessMetadataKey] = lastGoodMetadata
+		}
 		// This IS a new analysis occupying the old row, so it must also become the
 		// NEWEST run: isLatestAnalysisRunForAlert compares CreatedAt, and with the
 		// old timestamp any run created later (e.g. a comment reanalysis) stayed
@@ -1595,6 +1677,7 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 		existing.CreatedAt = now
 		existing.UpdatedAt = now
 		if !s.persistAnalysisRunLocked(existing) {
+			*existing = before
 			return AnalysisRun{}, false
 		}
 		return cloneAnalysisRun(existing), true
@@ -1689,11 +1772,24 @@ func (s *Store) AppendAnalysisProgress(runID string, entry map[string]any) (Anal
 }
 
 func (s *Store) CompleteAnalysisRun(runID string, response AgentAnalysisResponse) (AnalysisRun, bool) {
+	run, _, ok := s.completeAnalysisRun(runID, response, "")
+	return run, ok
+}
+
+// CompleteAnalysisRunWithSlackDelivery persists the completed RCA and its
+// immutable Slack outbox snapshot in one analysis_runs write. A process crash
+// after this method can delay delivery, but the retry worker always has the
+// exact completed attempt to resume from.
+func (s *Store) CompleteAnalysisRunWithSlackDelivery(runID string, response AgentAnalysisResponse, incidentID string) (AnalysisRun, SlackAnalysisDelivery, bool) {
+	return s.completeAnalysisRun(runID, response, incidentID)
+}
+
+func (s *Store) completeAnalysisRun(runID string, response AgentAnalysisResponse, slackIncidentID string) (AnalysisRun, SlackAnalysisDelivery, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	run := s.analysisRuns[runID]
 	if run == nil {
-		return AnalysisRun{}, false
+		return AnalysisRun{}, SlackAnalysisDelivery{}, false
 	}
 	before := cloneAnalysisRun(run)
 	run.Status = "complete"
@@ -1708,16 +1804,29 @@ func (s *Store) CompleteAnalysisRun(runID string, response AgentAnalysisResponse
 	run.MissingData = response.MissingData
 	run.Warnings = response.Warnings
 	run.Artifacts = response.Artifacts
+	if run.Metadata != nil {
+		delete(run.Metadata, previousSuccessMetadataKey)
+	}
 	run.Metadata = mergeAnalysisMetadata(run.Metadata, metadataFromAgentContext(response.Context))
 	run.UpdatedAt = time.Now().UTC()
 	if run.FirstCompletedAt == nil {
 		run.FirstCompletedAt = &run.UpdatedAt
 	}
+	var delivery SlackAnalysisDelivery
+	if slackIncidentID != "" {
+		snapshot := cloneAnalysisRun(run)
+		var queued bool
+		delivery, queued = s.queueSlackAnalysisDeliverySnapshotLocked(snapshot, slackIncidentID, false)
+		if !queued {
+			*run = before
+			return cloneAnalysisRun(run), SlackAnalysisDelivery{}, false
+		}
+	}
 	if !s.persistAnalysisRunLocked(run) {
 		*run = before
-		return cloneAnalysisRun(run), false
+		return cloneAnalysisRun(run), SlackAnalysisDelivery{}, false
 	}
-	return cloneAnalysisRun(run), true
+	return cloneAnalysisRun(run), delivery, true
 }
 
 func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (AnalysisRun, bool) {
@@ -1729,6 +1838,8 @@ func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (A
 	}
 	before := cloneAnalysisRun(run)
 	run.Status = "failed"
+	hadPriorSuccess := run.FirstCompletedAt != nil &&
+		(strings.TrimSpace(run.AnalysisSummary) != "" || strings.TrimSpace(run.AnalysisDetail) != "")
 	// Preserve a prior successful RCA on this (reused) run — a failed re-analysis
 	// must not clobber the last-good result. Surface the fallback only when there is
 	// nothing to keep (the first analysis failed).
@@ -1742,7 +1853,18 @@ func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (A
 		run.Warnings = response.Warnings
 		run.Artifacts = response.Artifacts
 	}
-	run.Metadata = mergeAnalysisMetadata(run.Metadata, metadataFromAgentContext(response.Context))
+	if hadPriorSuccess && len(previousSuccessMetadata(run.Metadata)) > 0 {
+		run.Metadata = restorePreviousSuccessMetadata(run.Metadata)
+	} else {
+		run.Metadata = mergeAnalysisMetadata(run.Metadata, metadataFromAgentContext(response.Context))
+	}
+	if before.Status == "complete" {
+		run.Metadata = metadataSkippingSlackAnalysisDelivery(
+			run.Metadata,
+			slackAnalysisDeliveryID(before),
+			"completed analysis was not applied to the current incident state",
+		)
+	}
 	run.UpdatedAt = time.Now().UTC()
 	if !s.persistAnalysisRunLocked(run) {
 		*run = before
@@ -1773,6 +1895,7 @@ func (s *Store) ReapStaleAnalyzingRuns(staleAfter time.Duration, manualStaleAfte
 			continue
 		}
 		before := cloneAnalysisRun(run)
+		run.Metadata = restorePreviousSuccessMetadata(run.Metadata)
 		run.Status = "failed"
 		run.AnalysisQuality = first(run.AnalysisQuality, "low")
 		if run.Capabilities == nil {
@@ -2032,6 +2155,24 @@ func (s *Store) latestAnalysisRunForAlertIDsLocked(incidentID string, alertIDs m
 	return selected
 }
 
+func (s *Store) latestAnalyzingRunForAlertIDsLocked(incidentID string, alertIDs map[string]struct{}) *AnalysisRun {
+	var selected *AnalysisRun
+	for _, run := range s.analysisRuns {
+		if run == nil || run.Status != "analyzing" {
+			continue
+		}
+		if run.IncidentID != incidentID {
+			if _, ok := alertIDs[run.AlertID]; !ok {
+				continue
+			}
+		}
+		if selected == nil || run.CreatedAt.After(selected.CreatedAt) {
+			selected = run
+		}
+	}
+	return selected
+}
+
 // betterAnalysisRun ranks a completed run above a non-completed one, then by recency.
 func betterAnalysisRun(candidate, current *AnalysisRun) bool {
 	candidateComplete := candidate.Status == "complete"
@@ -2056,6 +2197,7 @@ func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 	detail.Artifacts = []Artifact{}
 	detail.SimilarIncidents = []SimilarIncident{}
 	detail.Alerts = []AlertRecord{}
+	alertIDs := map[string]struct{}{}
 	for _, alert := range s.alerts {
 		if alert.IncidentID != id {
 			continue
@@ -2064,22 +2206,27 @@ func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 		copied.Feedback = s.feedbackSummaryLocked("alert", alert.AlertID)
 		copied.SimilarIncidents = s.similarIncidentsLocked(alertFromRecord(*copied), alert.IncidentID, similarIncidentLimit)
 		detail.Alerts = append(detail.Alerts, *copied)
+		alertIDs[alert.AlertID] = struct{}{}
 	}
 	sort.Slice(detail.Alerts, func(i, j int) bool {
 		return detail.Alerts[i].FiredAt.After(detail.Alerts[j].FiredAt)
 	})
+	if run := s.latestAnalyzingRunForAlertIDsLocked(id, alertIDs); run != nil {
+		detail.ActiveAnalysisRunID = run.RunID
+	}
 	// Incident RCA comes from the incident's latest analysis run (the durable store),
 	// not by concatenating the per-alert analysis columns. Analysis is already
 	// one-per-incident, so this is the same RCA without the alert-column duplication.
 	if run := s.latestAnalysisRunForIncidentLocked(id); run != nil {
 		detail.AnalysisRunID = run.RunID
-		if hash, ok := run.Metadata["analysis_hash"].(string); ok {
+		metadata := analysisResultMetadata(run)
+		if hash, ok := metadata["analysis_hash"].(string); ok {
 			detail.AnalysisHash = hash
 		}
-		if harness, ok := run.Metadata["harness"].(map[string]any); ok {
+		if harness, ok := metadata["harness"].(map[string]any); ok {
 			detail.Harness = cloneAnyMap(harness)
 		}
-		if reasoning, ok := run.Metadata["ontology_reasoning"].(map[string]any); ok {
+		if reasoning, ok := metadata["ontology_reasoning"].(map[string]any); ok {
 			detail.OntologyReasoning = cloneAnyMap(reasoning)
 		}
 		detail.AnalysisSummary = excerpt(run.AnalysisSummary, maxIncidentAggregateSummaryBytes)

@@ -136,7 +136,20 @@ func (s *Server) requestAnalysisRun(
 		s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
 		return
 	}
-	run, ok := s.store.CompleteAnalysisRun(runID, analysis)
+	if isTerminalAgentFailure(analysis) {
+		run, ok := s.store.FailAnalysisRun(runID, analysis)
+		if !ok {
+			return
+		}
+		s.store.ApplyFallbackAnalysisIfAbsentForRun(runID, alertID, analysis)
+		s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
+		return
+	}
+	slackIncidentID := ""
+	if s.slack.IsConfigured() {
+		slackIncidentID = incidentID
+	}
+	run, _, ok := s.store.CompleteAnalysisRunWithSlackDelivery(runID, analysis, slackIncidentID)
 	if !ok {
 		return
 	}
@@ -156,6 +169,11 @@ func (s *Server) requestAnalysisRun(
 	}
 	s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
 	s.notifySlackAnalysis(run, incidentID)
+}
+
+func isTerminalAgentFailure(analysis AgentAnalysisResponse) bool {
+	return strings.EqualFold(strings.TrimSpace(analysis.Status), "failed") ||
+		strings.TrimSpace(analysis.TerminalReason) != ""
 }
 
 // runBackfill periodically re-drives alerts that never produced a completed RCA:

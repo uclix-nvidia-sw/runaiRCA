@@ -28,6 +28,7 @@ type AgentAnalysisRequest struct {
 // AgentAnalysisResponse is the structured RCA returned by the agent /analyze endpoint.
 type AgentAnalysisResponse struct {
 	Status          string            `json:"status"`
+	TerminalReason  string            `json:"terminal_reason,omitempty"`
 	ThreadTS        string            `json:"thread_ts"`
 	Analysis        string            `json:"analysis"`
 	AnalysisSummary string            `json:"analysis_summary"`

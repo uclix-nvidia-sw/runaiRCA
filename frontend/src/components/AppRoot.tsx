@@ -30,6 +30,7 @@ import {
   analyzeIncident,
   archiveIncident,
   deleteIncident,
+  fetchAnalysisRun,
   fetchIncident,
   resolveIncident,
   restoreIncident,
@@ -91,6 +92,7 @@ import {
 import { RealtimeEventPayload } from '../utils/realtime';
 import { hashForDetail, hashForView, routeFromHash } from '../utils/routing';
 import { evidenceMetadata, type EvidenceMetadata, type EvidenceWindow } from '../utils/evidenceMetadata';
+import { analysisRunForDetail, selectedAnalysisRunID as selectedAnalysisRunIDForDetail } from '../utils/analysisRunSelection';
 
 function errorMessage(err: unknown, fallback: string) {
   return err instanceof Error ? err.message : fallback;
@@ -267,40 +269,14 @@ function realtimeEventMatchesDetail(detail: DetailState, payload: RealtimeEventP
   );
 }
 
-function analysisRunMatchesDetail(run: AnalysisRun, detail: DetailState) {
-  if (!detail) return false;
-  if (detail.kind === 'incident') {
-    const incidentID = detail.data.incident_id;
-    const alertIDs = new Set(detail.data.alerts.map((alert) => alert.alert_id));
-    return (
-      run.incident_id === incidentID ||
-      (run.target_type === 'incident' && run.target_id === incidentID) ||
-      (run.alert_id ? alertIDs.has(run.alert_id) : false) ||
-      (run.target_type === 'alert' && alertIDs.has(run.target_id))
-    );
-  }
-  const alertID = detail.data.alert_id;
-  return (
-    run.alert_id === alertID ||
-    (run.target_type === 'alert' && run.target_id === alertID) ||
-    run.incident_id === detail.data.incident_id ||
-    (run.target_type === 'incident' && run.target_id === detail.data.incident_id)
-  );
-}
-
-function latestAnalysisRunForDetail(detail: DetailState, runs: AnalysisRun[]) {
-  return [...runs]
-    .filter((run) => analysisRunMatchesDetail(run, detail))
-    .sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0];
-}
-
 function progressForRun(
   run: AnalysisRun | undefined,
   progressByRun: Record<string, AnalysisProgressEntry[]>,
 ) {
   if (!run) return [];
-  const live = progressByRun[run.run_id] ?? [];
-  if (live.length > 0) return live;
+  if (Object.prototype.hasOwnProperty.call(progressByRun, run.run_id)) {
+    return progressByRun[run.run_id] ?? [];
+  }
   return Array.isArray(run.metadata?.progress_log) ? run.metadata.progress_log : [];
 }
 
@@ -346,6 +322,7 @@ function App() {
   const [chatDocked, setChatDocked] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [knowledgeRefreshKey, setKnowledgeRefreshKey] = useState(0);
+  const [exactAnalysisRun, setExactAnalysisRun] = useState<AnalysisRun>();
   const detailVersionRef = useRef(0);
   const routeLoadVersionRef = useRef(0);
 
@@ -463,9 +440,37 @@ function App() {
     };
   }, [analysisRecords]);
 
+  const selectedAnalysisRunID = selectedAnalysisRunIDForDetail(detail);
+  const selectedAnalysisRunOnPage = dashboardAnalysisRuns.find((run) => run.run_id === selectedAnalysisRunID);
+  const selectedAnalysisAttemptVersion = detail?.kind === 'incident'
+    ? `${detail.data.active_analysis_run_id || ''}:${detail.data.is_analyzing}:${detail.data.analysis_hash || ''}`
+    : '';
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedAnalysisRunID) {
+      setExactAnalysisRun(undefined);
+      return undefined;
+    }
+    if (selectedAnalysisRunOnPage) {
+      setExactAnalysisRun(undefined);
+      return undefined;
+    }
+    setExactAnalysisRun((current) => current?.run_id === selectedAnalysisRunID ? current : undefined);
+    void fetchAnalysisRun(selectedAnalysisRunID)
+      .then((run) => {
+        if (!cancelled) setExactAnalysisRun(run);
+      })
+      .catch(() => {
+        if (!cancelled) setExactAnalysisRun(undefined);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedAnalysisAttemptVersion, selectedAnalysisRunID, selectedAnalysisRunOnPage]);
+
   const workspaceAnalysisRun = useMemo(
-    () => latestAnalysisRunForDetail(detail, dashboardAnalysisRuns),
-    [dashboardAnalysisRuns, detail],
+    () => analysisRunForDetail(detail, dashboardAnalysisRuns, exactAnalysisRun),
+    [dashboardAnalysisRuns, detail, exactAnalysisRun],
   );
   const workspaceProgress = useMemo(
     () => progressForRun(workspaceAnalysisRun, progressByRun),
@@ -584,7 +589,9 @@ function App() {
     activeView,
     incidents: dashboardIncidents,
     alerts: dashboardAlerts,
-    onAnalysisCreated: () => load({ silent: true }),
+    onAnalysisCreated: async () => {
+      await load({ silent: true });
+    },
   });
 
   // Refresh the open detail ONLY when a genuinely new realtime event arrives.
@@ -951,10 +958,11 @@ function UnifiedWorkspace({
         <section className="rca-summary">
           <h3>RCA Summary</h3>
           <p>
-            {summary ||
-              (isAnalyzing
-                ? 'Analysis is running. New RCA content will appear when the agent finishes.'
-                : 'Analysis is pending. The Collector Evidence Trail will populate as collectors finish.')}
+            {isAnalyzing
+              ? summary
+                ? 'Re-analysis is running. The previous RCA is preserved and the new result will replace it when complete.'
+                : 'Analysis is running. New RCA content will appear when the agent finishes.'
+              : summary || 'Analysis is pending. The Collector Evidence Trail will populate as collectors finish.'}
           </p>
           <div className="rca-feedback-strip">
             <span><ThumbsUp size={15} /> {positiveFeedback}</span>

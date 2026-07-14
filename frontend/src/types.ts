@@ -163,6 +163,7 @@ export type AlertRecord = {
 
 export type IncidentDetail = Incident & {
   analysis_run_id?: string;
+  active_analysis_run_id?: string;
   analysis_hash?: string;
   analysis_summary: string;
   analysis_detail: string;

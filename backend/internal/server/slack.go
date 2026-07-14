@@ -30,6 +30,8 @@ package server
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +40,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -193,38 +196,110 @@ func (n *SlackNotifier) botTokenShape() string {
 // fresh analysis; only these become thread replies after the root message.
 var slackReplySources = map[string]bool{"manual": true, "comment": true, "feedback": true, "chat": true}
 
+const (
+	slackOutboxMetadataKey   = "slack_analysis_outbox"
+	slackDeliveryPending     = "pending"
+	slackDeliveryDelivered   = "delivered"
+	slackDeliverySkipped     = "skipped"
+	slackDeliveryRetryPeriod = 30 * time.Second
+	maxSlackOutboxEntries    = 32
+)
+
+// SlackAnalysisDelivery is a durable snapshot of one completed analysis. A
+// run row is reused for manual re-analysis, so retrying from the live run alone
+// could send the next attempt's RCA instead of the one that originally failed.
+type SlackAnalysisDelivery struct {
+	ID            string
+	IncidentID    string
+	Run           AnalysisRun
+	Attempts      int
+	QueuedAt      time.Time
+	LastAttemptAt time.Time
+	Tracked       bool
+}
+
 // notifySlackAnalysis posts a completed run to Slack per the rules above.
-// Fire-and-forget: errors are logged and never affect run persistence.
+// The analysis itself remains successful when Slack is down; delivery is first
+// recorded in the run metadata and retried by runSlackDeliveryRetry.
 func (s *Server) notifySlackAnalysis(run AnalysisRun, incidentID string) {
 	if !s.slack.IsConfigured() || incidentID == "" || run.Status != "complete" {
 		return
 	}
-	go s.deliverSlackAnalysis(run, incidentID)
+	if _, ok := s.store.IncidentDetail(incidentID); !ok {
+		return
+	}
+	delivery, shouldDeliver := s.store.QueueSlackAnalysisDeliverySnapshot(run, incidentID)
+	if !shouldDeliver {
+		if delivery.ID == "" {
+			log.Printf("slack delivery could not be queued for analysis %s", run.RunID)
+		}
+		return
+	}
+	go s.deliverSlackAnalysisDelivery(delivery)
 }
 
 func (s *Server) deliverSlackAnalysis(run AnalysisRun, incidentID string) {
+	delivery := SlackAnalysisDelivery{
+		ID:         slackAnalysisDeliveryID(run),
+		IncidentID: incidentID,
+		Run:        run,
+	}
+	s.deliverSlackAnalysisDelivery(delivery)
+}
+
+func (s *Server) deliverSlackAnalysisDelivery(delivery SlackAnalysisDelivery) {
 	s.slack.mu.Lock()
 	defer s.slack.mu.Unlock()
-	detail, ok := s.store.IncidentDetail(incidentID)
-	if !ok {
+	detail, ok := s.store.IncidentDetail(delivery.IncidentID)
+	if !ok || detail.DeletedAt != nil {
+		// A deleted incident cannot become deliverable without an explicit
+		// restore/re-analysis. Keeping attempts=0 here made old trash entries
+		// occupy the retry batch forever and starve newer Slack notifications.
+		s.store.SkipSlackAnalysisDelivery(delivery.Run.RunID, delivery.ID, "incident no longer exists")
 		return
 	}
 	threadTS := detail.SlackThreadTS
-	if threadTS != "" && !slackReplySources[run.Source] {
+	if threadTS != "" && !slackReplySources[delivery.Run.Source] &&
+		!s.store.SlackAnalysisDeliveryPredatesThread(delivery.IncidentID, threadTS, delivery.Run) {
+		s.store.SkipSlackAnalysisDelivery(delivery.Run.RunID, delivery.ID, "automatic follow-up is not posted after the root analysis")
+		return
+	}
+	if delivery.Tracked && !s.store.BeginSlackAnalysisDelivery(delivery.Run.RunID, delivery.ID) {
 		return
 	}
 	seq := detail.AnalysisSeq + 1
-	msg := s.slack.buildAnalysisMessage(detail, run, seq, threadTS)
+	if threadTS == "" {
+		// A legacy row can have a sequence but no persisted parent timestamp.
+		// Starting a replacement root also starts a new visible thread sequence.
+		seq = 1
+	}
+	msg := s.slack.buildAnalysisMessage(detail, delivery.Run, seq, threadTS)
+	msg["client_msg_id"] = delivery.ID
 	ts, err := s.slack.post(msg)
 	if err != nil {
-		log.Printf("slack notify failed for incident %s: %v", incidentID, err)
+		if threadTS != "" && slackThreadMissingError(err) {
+			if s.store.ResetIncidentSlackThread(delivery.IncidentID, threadTS) {
+				log.Printf("slack thread %s no longer exists for incident %s; next retry will create a replacement root", threadTS, delivery.IncidentID)
+			}
+		}
+		s.store.FailSlackAnalysisDelivery(delivery.Run.RunID, delivery.ID, err.Error())
+		log.Printf("slack notify failed for incident %s: %v", delivery.IncidentID, err)
 		return
 	}
-	if _, ok := s.store.BumpIncidentAnalysisSeq(incidentID); !ok {
-		return
+	if delivery.Tracked {
+		if _, ok := s.store.CompleteSlackAnalysisDelivery(delivery.Run.RunID, delivery.ID, delivery.IncidentID, threadTS == "", ts); !ok {
+			log.Printf("slack delivery state commit failed for incident %s; leaving delivery pending for retry", delivery.IncidentID)
+			return
+		}
+	} else {
+		if _, ok := s.store.BumpIncidentAnalysisSeq(delivery.IncidentID); !ok {
+			return
+		}
+		if threadTS == "" {
+			s.store.SetIncidentSlackThread(delivery.IncidentID, ts)
+		}
 	}
 	if threadTS == "" {
-		s.store.SetIncidentSlackThread(incidentID, ts)
 		detail.SlackThreadTS = ts
 		// Short-lived alerts may resolve before their initial analysis finishes.
 		// Once the root exists, catch up the pending resolved state in its thread.
@@ -232,6 +307,433 @@ func (s *Server) deliverSlackAnalysis(run AnalysisRun, incidentID string) {
 			s.deliverSlackResolutionLocked(detail)
 		}
 	}
+}
+
+func (s *Server) runSlackDeliveryRetry(ctx context.Context) {
+	if !s.slack.IsConfigured() {
+		return
+	}
+	s.retryPendingSlackAnalysisDeliveries(time.Now().UTC())
+	ticker := time.NewTicker(slackDeliveryRetryPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			s.retryPendingSlackAnalysisDeliveries(now.UTC())
+		}
+	}
+}
+
+func (s *Server) retryPendingSlackAnalysisDeliveries(now time.Time) {
+	for _, delivery := range s.store.PendingSlackAnalysisDeliveries(now, 50) {
+		s.deliverSlackAnalysisDelivery(delivery)
+	}
+}
+
+func slackAnalysisDeliveryID(run AnalysisRun) string {
+	attemptStarted := run.CreatedAt.UTC().Format(time.RFC3339Nano)
+	sum := sha256.Sum256([]byte("runai-rca/slack/" + run.RunID + "/" + attemptStarted))
+	// Slack accepts a client-generated UUID as client_msg_id. Make this a stable
+	// RFC 4122-shaped v5 identifier so a retry is deduplicated server-side.
+	sum[6] = (sum[6] & 0x0f) | 0x50
+	sum[8] = (sum[8] & 0x3f) | 0x80
+	hex := fmt.Sprintf("%x", sum[:16])
+	return hex[:8] + "-" + hex[8:12] + "-" + hex[12:16] + "-" + hex[16:20] + "-" + hex[20:32]
+}
+
+func slackRunSnapshot(run AnalysisRun) map[string]any {
+	actionDetail := recommendedActionsExcerpt(run.AnalysisDetail)
+	if actionDetail != "" {
+		actionDetail = "## Recommended Actions\n\n" + excerpt(actionDetail, 700)
+	}
+	return map[string]any{
+		"run_id": run.RunID, "source": run.Source, "status": run.Status,
+		"target_type": run.TargetType, "target_id": run.TargetID,
+		"incident_id": run.IncidentID, "alert_id": run.AlertID,
+		"title": run.Title, "analysis_summary": excerpt(run.AnalysisSummary, 900),
+		"analysis_detail": actionDetail, "analysis_quality": run.AnalysisQuality,
+		"created_at": run.CreatedAt.UTC().Format(time.RFC3339Nano),
+	}
+}
+
+func slackRunFromSnapshot(snapshot map[string]any) AnalysisRun {
+	createdAt, _ := time.Parse(time.RFC3339Nano, stringValue(snapshot["created_at"]))
+	return AnalysisRun{
+		RunID: stringValue(snapshot["run_id"]), Source: stringValue(snapshot["source"]),
+		Status: stringValue(snapshot["status"]), TargetType: stringValue(snapshot["target_type"]),
+		TargetID: stringValue(snapshot["target_id"]), IncidentID: stringValue(snapshot["incident_id"]),
+		AlertID: stringValue(snapshot["alert_id"]), Title: stringValue(snapshot["title"]),
+		AnalysisSummary: stringValue(snapshot["analysis_summary"]), AnalysisDetail: stringValue(snapshot["analysis_detail"]),
+		AnalysisQuality: stringValue(snapshot["analysis_quality"]), CreatedAt: createdAt,
+	}
+}
+
+func slackOutboxEntries(metadata map[string]any) []map[string]any {
+	if metadata == nil {
+		return nil
+	}
+	raw, ok := metadata[slackOutboxMetadataKey].([]any)
+	if !ok {
+		return nil
+	}
+	entries := make([]map[string]any, 0, len(raw))
+	for _, item := range raw {
+		if entry, ok := item.(map[string]any); ok {
+			entries = append(entries, cloneAnyMap(entry))
+		}
+	}
+	return entries
+}
+
+func metadataWithSlackOutbox(metadata map[string]any, entries []map[string]any) map[string]any {
+	out := cloneAnyMap(metadata)
+	if out == nil {
+		out = map[string]any{}
+	}
+	if len(entries) > maxSlackOutboxEntries {
+		pending := make([]map[string]any, 0, len(entries))
+		delivered := make([]map[string]any, 0, len(entries))
+		for _, entry := range entries {
+			if stringValue(entry["status"]) == slackDeliveryPending {
+				pending = append(pending, entry)
+			} else {
+				delivered = append(delivered, entry)
+			}
+		}
+		remaining := maxSlackOutboxEntries - len(pending)
+		if remaining > 0 && len(delivered) > remaining {
+			delivered = delivered[len(delivered)-remaining:]
+		}
+		entries = append(delivered, pending...)
+	}
+	raw := make([]any, 0, len(entries))
+	for _, entry := range entries {
+		raw = append(raw, cloneAnyMap(entry))
+	}
+	out[slackOutboxMetadataKey] = raw
+	return out
+}
+
+func metadataSkippingSlackAnalysisDelivery(metadata map[string]any, deliveryID string, reason string) map[string]any {
+	entries := slackOutboxEntries(metadata)
+	changed := false
+	for _, entry := range entries {
+		if stringValue(entry["delivery_id"]) != deliveryID ||
+			stringValue(entry["status"]) != slackDeliveryPending {
+			continue
+		}
+		entry["status"] = slackDeliverySkipped
+		entry["last_error"] = excerpt(strings.TrimSpace(reason), 500)
+		changed = true
+	}
+	if !changed {
+		return metadata
+	}
+	return metadataWithSlackOutbox(metadata, entries)
+}
+
+func slackDeliveryFromEntry(entry map[string]any, tracked bool) SlackAnalysisDelivery {
+	snapshot, _ := entry["run"].(map[string]any)
+	queuedAt, _ := time.Parse(time.RFC3339Nano, stringValue(entry["queued_at"]))
+	lastAttemptAt, _ := time.Parse(time.RFC3339Nano, stringValue(entry["last_attempt_at"]))
+	return SlackAnalysisDelivery{
+		ID: stringValue(entry["delivery_id"]), IncidentID: stringValue(entry["incident_id"]),
+		Run: slackRunFromSnapshot(snapshot), Attempts: usageInt(entry["attempts"]),
+		QueuedAt: queuedAt, LastAttemptAt: lastAttemptAt, Tracked: tracked,
+	}
+}
+
+func slackRetryDelay(attempts int) time.Duration {
+	if attempts <= 1 {
+		return slackDeliveryRetryPeriod
+	}
+	shift := attempts - 1
+	if shift > 4 {
+		shift = 4
+	}
+	return slackDeliveryRetryPeriod * time.Duration(1<<shift)
+}
+
+func (s *Store) QueueSlackAnalysisDelivery(runID string, incidentID string) (SlackAnalysisDelivery, bool) {
+	s.mu.RLock()
+	run := s.analysisRuns[runID]
+	if run == nil {
+		s.mu.RUnlock()
+		return SlackAnalysisDelivery{}, false
+	}
+	snapshot := cloneAnalysisRun(run)
+	s.mu.RUnlock()
+	return s.QueueSlackAnalysisDeliverySnapshot(snapshot, incidentID)
+}
+
+// QueueSlackAnalysisDeliverySnapshot persists the immutable completion result
+// supplied by requestAnalysisRun. Analysis rows are reused for later attempts,
+// so looking the run up again here can observe the next attempt's "analyzing"
+// state (or, worse, its later completed payload) and lose/mislabel this reply.
+func (s *Store) QueueSlackAnalysisDeliverySnapshot(snapshot AnalysisRun, incidentID string) (SlackAnalysisDelivery, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.queueSlackAnalysisDeliverySnapshotLocked(snapshot, incidentID, true)
+}
+
+// queueSlackAnalysisDeliverySnapshotLocked mutates the current reusable row
+// while retaining the immutable completed payload. Callers that are already
+// completing the run pass persist=false and include the outbox in that same
+// analysis_runs write; standalone/retry callers persist the metadata here.
+func (s *Store) queueSlackAnalysisDeliverySnapshotLocked(snapshot AnalysisRun, incidentID string, persist bool) (SlackAnalysisDelivery, bool) {
+	run := s.analysisRuns[snapshot.RunID]
+	if run == nil || snapshot.Status != "complete" || incidentID == "" {
+		return SlackAnalysisDelivery{}, false
+	}
+	deliveryID := slackAnalysisDeliveryID(snapshot)
+	entries := slackOutboxEntries(run.Metadata)
+	for _, entry := range entries {
+		if stringValue(entry["delivery_id"]) != deliveryID {
+			continue
+		}
+		delivery := slackDeliveryFromEntry(entry, true)
+		return delivery, stringValue(entry["status"]) == slackDeliveryPending
+	}
+	entry := map[string]any{
+		"delivery_id": deliveryID, "incident_id": incidentID, "status": slackDeliveryPending,
+		"attempts": 0, "last_error": "", "queued_at": time.Now().UTC().Format(time.RFC3339Nano),
+		"last_attempt_at": "", "run": slackRunSnapshot(snapshot),
+	}
+	before := cloneAnyMap(run.Metadata)
+	run.Metadata = metadataWithSlackOutbox(run.Metadata, append(entries, entry))
+	if persist && !s.persistAnalysisRunLocked(run) {
+		run.Metadata = before
+		return SlackAnalysisDelivery{}, false
+	}
+	return slackDeliveryFromEntry(entry, true), true
+}
+
+func (s *Store) PendingSlackAnalysisDeliveries(now time.Time, limit int) []SlackAnalysisDelivery {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	items := make([]SlackAnalysisDelivery, 0)
+	for _, run := range s.analysisRuns {
+		if run == nil {
+			continue
+		}
+		for _, entry := range slackOutboxEntries(run.Metadata) {
+			if stringValue(entry["status"]) != slackDeliveryPending {
+				continue
+			}
+			delivery := slackDeliveryFromEntry(entry, true)
+			if delivery.Attempts > 0 && now.Sub(delivery.LastAttemptAt) < slackRetryDelay(delivery.Attempts) {
+				continue
+			}
+			items = append(items, delivery)
+		}
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		return items[i].QueuedAt.Before(items[j].QueuedAt)
+	})
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	return items
+}
+
+// SlackAnalysisDeliveryPredatesThread distinguishes a delayed initial
+// automatic completion from an ordinary automatic follow-up. The latter stays
+// suppressed once a thread exists; the former must still be delivered when a
+// later manual attempt happened to create the visible root first.
+func (s *Store) SlackAnalysisDeliveryPredatesThread(incidentID string, threadTS string, snapshot AnalysisRun) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if snapshot.CreatedAt.IsZero() {
+		return false
+	}
+	for _, run := range s.analysisRuns {
+		if run == nil {
+			continue
+		}
+		for _, entry := range slackOutboxEntries(run.Metadata) {
+			if stringValue(entry["incident_id"]) != incidentID ||
+				stringValue(entry["status"]) != slackDeliveryDelivered ||
+				usageInt(entry["sequence"]) != 1 ||
+				stringValue(entry["message_ts"]) != threadTS {
+				continue
+			}
+			root := slackDeliveryFromEntry(entry, true).Run
+			return !root.CreatedAt.IsZero() && snapshot.CreatedAt.Before(root.CreatedAt)
+		}
+	}
+	// Legacy roots have no attempt provenance. Preserve the historical policy
+	// and suppress non-reply sources rather than guessing their order.
+	return false
+}
+
+func (s *Store) updateSlackDelivery(runID string, deliveryID string, update func(map[string]any)) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run := s.analysisRuns[runID]
+	if run == nil {
+		return false
+	}
+	entries := slackOutboxEntries(run.Metadata)
+	for index, entry := range entries {
+		if stringValue(entry["delivery_id"]) != deliveryID {
+			continue
+		}
+		before := cloneAnyMap(run.Metadata)
+		update(entry)
+		entries[index] = entry
+		run.Metadata = metadataWithSlackOutbox(run.Metadata, entries)
+		if !s.persistAnalysisRunLocked(run) {
+			run.Metadata = before
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func (s *Store) BeginSlackAnalysisDelivery(runID string, deliveryID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run := s.analysisRuns[runID]
+	if run == nil {
+		return false
+	}
+	entries := slackOutboxEntries(run.Metadata)
+	var candidate map[string]any
+	for _, entry := range entries {
+		if stringValue(entry["delivery_id"]) == deliveryID && stringValue(entry["status"]) == slackDeliveryPending {
+			candidate = entry
+			break
+		}
+	}
+	if candidate == nil {
+		return false
+	}
+	candidateIncidentID := stringValue(candidate["incident_id"])
+	candidateQueuedAt, _ := time.Parse(time.RFC3339Nano, stringValue(candidate["queued_at"]))
+	for _, currentRun := range s.analysisRuns {
+		if currentRun == nil {
+			continue
+		}
+		for _, entry := range slackOutboxEntries(currentRun.Metadata) {
+			if stringValue(entry["delivery_id"]) == deliveryID ||
+				stringValue(entry["status"]) != slackDeliveryPending ||
+				stringValue(entry["incident_id"]) != candidateIncidentID {
+				continue
+			}
+			queuedAt, _ := time.Parse(time.RFC3339Nano, stringValue(entry["queued_at"]))
+			if queuedAt.Before(candidateQueuedAt) ||
+				(queuedAt.Equal(candidateQueuedAt) && stringValue(entry["delivery_id"]) < deliveryID) {
+				return false
+			}
+		}
+	}
+	for index, entry := range entries {
+		if stringValue(entry["delivery_id"]) != deliveryID ||
+			stringValue(entry["status"]) != slackDeliveryPending {
+			continue
+		}
+		before := cloneAnyMap(run.Metadata)
+		entry["attempts"] = usageInt(entry["attempts"]) + 1
+		entry["last_attempt_at"] = time.Now().UTC().Format(time.RFC3339Nano)
+		entry["last_error"] = ""
+		entries[index] = entry
+		run.Metadata = metadataWithSlackOutbox(run.Metadata, entries)
+		if !s.persistAnalysisRunLocked(run) {
+			run.Metadata = before
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func (s *Store) ResetIncidentSlackThread(incidentID string, expectedThreadTS string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	incident := s.incidents[incidentID]
+	if incident == nil || incidentDeleted(incident) || incident.SlackThreadTS != expectedThreadTS {
+		return false
+	}
+	before := *incident
+	incident.SlackThreadTS = ""
+	incident.AnalysisSeq = 0
+	if !s.persistIncidentLocked(incident) {
+		*incident = before
+		return false
+	}
+	return true
+}
+
+func slackThreadMissingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "thread_not_found") || strings.Contains(message, "message_not_found")
+}
+
+func (s *Store) FailSlackAnalysisDelivery(runID string, deliveryID string, message string) {
+	_ = s.updateSlackDelivery(runID, deliveryID, func(entry map[string]any) {
+		if stringValue(entry["status"]) == slackDeliveryPending {
+			entry["last_error"] = excerpt(strings.TrimSpace(message), 500)
+		}
+	})
+}
+
+func (s *Store) SkipSlackAnalysisDelivery(runID string, deliveryID string, reason string) {
+	_ = s.updateSlackDelivery(runID, deliveryID, func(entry map[string]any) {
+		if stringValue(entry["status"]) == slackDeliveryPending {
+			entry["status"] = slackDeliverySkipped
+			entry["last_error"] = excerpt(strings.TrimSpace(reason), 500)
+		}
+	})
+}
+
+func (s *Store) CompleteSlackAnalysisDelivery(runID string, deliveryID string, incidentID string, root bool, messageTS string) (int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run := s.analysisRuns[runID]
+	incident := s.incidents[incidentID]
+	if run == nil || incident == nil || incidentDeleted(incident) {
+		return 0, false
+	}
+	entries := slackOutboxEntries(run.Metadata)
+	entryIndex := -1
+	for index, entry := range entries {
+		if stringValue(entry["delivery_id"]) == deliveryID {
+			entryIndex = index
+			if stringValue(entry["status"]) == slackDeliveryDelivered {
+				return incident.AnalysisSeq, true
+			}
+			break
+		}
+	}
+	if entryIndex < 0 {
+		return 0, false
+	}
+	beforeMetadata := cloneAnyMap(run.Metadata)
+	beforeIncident := *incident
+	if root && incident.SlackThreadTS == "" {
+		incident.AnalysisSeq = 1
+		incident.SlackThreadTS = messageTS
+	} else {
+		incident.AnalysisSeq++
+	}
+	entries[entryIndex]["status"] = slackDeliveryDelivered
+	entries[entryIndex]["message_ts"] = messageTS
+	entries[entryIndex]["delivered_at"] = time.Now().UTC().Format(time.RFC3339Nano)
+	entries[entryIndex]["last_error"] = ""
+	entries[entryIndex]["sequence"] = incident.AnalysisSeq
+	run.Metadata = metadataWithSlackOutbox(run.Metadata, entries)
+	if !s.persistSlackAnalysisDeliveryLocked(run, incident) {
+		run.Metadata = beforeMetadata
+		*incident = beforeIncident
+		return 0, false
+	}
+	return incident.AnalysisSeq, true
 }
 
 // notifySlackResolution posts only the transition detected by Store. It is
@@ -311,6 +813,11 @@ func (n *SlackNotifier) post(msg map[string]any) (string, error) {
 	}
 	if !parsed.OK {
 		err := fmt.Errorf("slack API error: %s", first(parsed.Error, "unknown"))
+		n.recordSlackFailure(err)
+		return "", err
+	}
+	if strings.TrimSpace(parsed.TS) == "" {
+		err := errors.New("slack API success response omitted message timestamp")
 		n.recordSlackFailure(err)
 		return "", err
 	}

@@ -41,3 +41,44 @@ export function appendProgress(
     [runID]: [...withoutDuplicate, entry].slice(-200),
   };
 }
+
+export function resetProgress(
+  current: Record<string, AnalysisProgressEntry[]>,
+  payload: RealtimeEventPayload | undefined,
+) {
+  if (payload?.type !== 'analysis.started' || !payload.data?.run_id) return current;
+  return {
+    ...current,
+    [payload.data.run_id]: [],
+  };
+}
+
+export function clearProgress(
+  current: Record<string, AnalysisProgressEntry[]>,
+  runIDs: Iterable<string>,
+) {
+  const next = { ...current };
+  for (const runID of runIDs) {
+    delete next[runID];
+  }
+  return next;
+}
+
+export function updateCompletedProgressRuns(
+  current: Set<string>,
+  payload: RealtimeEventPayload | undefined,
+) {
+  const runID = payload?.data?.run_id;
+  if (!runID || (payload.type !== 'analysis.completed' && payload.type !== 'analysis.started')) {
+    return current;
+  }
+  const next = new Set(current);
+  if (payload.type === 'analysis.completed') {
+    next.add(runID);
+  } else {
+    // Analysis rows are intentionally reused. A new attempt supersedes any
+    // pending cleanup registered by the previous attempt's completion.
+    next.delete(runID);
+  }
+  return next;
+}

@@ -84,6 +84,12 @@ export async function fetchAnalysisRuns(page?: PageRequest): Promise<PageResult<
   return pageResult(response, page);
 }
 
+export async function fetchAnalysisRun(id: string): Promise<AnalysisRun> {
+  return (
+    await read<Envelope<AnalysisRun>>(`/api/v1/analysis-runs/${encodeURIComponent(id)}`)
+  ).data;
+}
+
 export async function fetchAnalysisEvaluation(runID: string): Promise<EvaluationView> {
   return (await read<Envelope<EvaluationView>>(
     `/api/v1/analysis-runs/${encodeURIComponent(runID)}/evaluation?author=${encodeURIComponent(feedbackActorID())}`,

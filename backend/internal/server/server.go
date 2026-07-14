@@ -179,23 +179,24 @@ type AlertRecord struct {
 
 type IncidentDetail struct {
 	Incident
-	AnalysisRunID      string            `json:"analysis_run_id,omitempty"`
-	AnalysisHash       string            `json:"analysis_hash,omitempty"`
-	AnalysisSummary    string            `json:"analysis_summary"`
-	AnalysisDetail     string            `json:"analysis_detail"`
-	AnalysisQuality    string            `json:"analysis_quality"`
-	RootCauseFamily    string            `json:"root_cause_family"`
-	Capabilities       map[string]string `json:"capabilities"`
-	MissingData        []string          `json:"missing_data"`
-	Warnings           []string          `json:"warnings"`
-	Artifacts          []Artifact        `json:"artifacts"`
-	SimilarIncidents   []SimilarIncident `json:"similar_incidents"`
-	SimilarRecentCount int               `json:"similar_recent_count"`
-	TokenUsage         map[string]any    `json:"token_usage,omitempty"`
-	Harness            map[string]any    `json:"harness,omitempty"`
-	OntologyReasoning  map[string]any    `json:"ontology_reasoning,omitempty"`
-	Feedback           FeedbackSummary   `json:"feedback"`
-	Alerts             []AlertRecord     `json:"alerts"`
+	AnalysisRunID       string            `json:"analysis_run_id,omitempty"`
+	ActiveAnalysisRunID string            `json:"active_analysis_run_id,omitempty"`
+	AnalysisHash        string            `json:"analysis_hash,omitempty"`
+	AnalysisSummary     string            `json:"analysis_summary"`
+	AnalysisDetail      string            `json:"analysis_detail"`
+	AnalysisQuality     string            `json:"analysis_quality"`
+	RootCauseFamily     string            `json:"root_cause_family"`
+	Capabilities        map[string]string `json:"capabilities"`
+	MissingData         []string          `json:"missing_data"`
+	Warnings            []string          `json:"warnings"`
+	Artifacts           []Artifact        `json:"artifacts"`
+	SimilarIncidents    []SimilarIncident `json:"similar_incidents"`
+	SimilarRecentCount  int               `json:"similar_recent_count"`
+	TokenUsage          map[string]any    `json:"token_usage,omitempty"`
+	Harness             map[string]any    `json:"harness,omitempty"`
+	OntologyReasoning   map[string]any    `json:"ontology_reasoning,omitempty"`
+	Feedback            FeedbackSummary   `json:"feedback"`
+	Alerts              []AlertRecord     `json:"alerts"`
 }
 
 type RecurrenceDay struct {
@@ -363,6 +364,7 @@ func Run() {
 	go server.runBackfill(ctx)
 	go server.runStaleRunReaper(ctx)
 	go server.runTrashPurge(ctx)
+	go server.runSlackDeliveryRetry(ctx)
 	go server.runSlackSocketMode(ctx)
 
 	go func() {
