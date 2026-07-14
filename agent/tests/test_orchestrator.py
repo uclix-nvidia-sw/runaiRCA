@@ -1321,10 +1321,13 @@ async def test_loki_queries_workload_history_when_alerted_pod_can_be_replaced(mo
     )
     await LokiCollector(replace(make_settings(), loki_url="http://loki.example")).collect(target)
 
+    # An immutable Run:ai workload ID supersedes the mutable workload name.
+    # Keep this historical query exact and failure-only; broad name/ID
+    # alternation can pull healthy rows from another Pod incarnation.
     assert any(
         'namespace="runai-vision"' in query
-        and "trainer" in query
         and r"workload\\-42" in query
+        and "fail(ed|ure)?" in query
         for query in seen_queries
     )
 
@@ -1719,6 +1722,86 @@ async def test_runai_collector_falls_back_from_unparseable_mcp_payload(monkeypat
     assert any("incomplete or unusable" in warning for warning in result.warnings)
     assert not any("official NVIDIA Run:ai MCP" in warning for warning in result.warnings)
     assert result.status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_runai_collector_falls_back_from_blank_mcp_payload_with_reason(
+    monkeypatch,
+) -> None:
+    from app.collectors import runai as runai_mod
+
+    async def fake_mcp(_settings, _target, *, headers):
+        return [
+            {
+                "name": "workloads",
+                "query": "MCP get_workloads_summary",
+                "transport": "mcp",
+                "status_code": 200,
+                "error": None,
+                "data": {},
+            }
+        ]
+
+    async def fake_direct(_settings, _target, _headers):
+        return [
+            {
+                "name": "workloads",
+                "path": "/api/v1/workloads",
+                "transport": "direct",
+                "status_code": 200,
+                "error": None,
+                "data": {"workloads": [{"name": "trainer"}]},
+            }
+        ]
+
+    monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", fake_mcp)
+    monkeypatch.setattr(runai_mod, "_collect_runai_responses", fake_direct)
+    monkeypatch.setattr(runai_mod, "_fetch_runai_version", lambda *a, **k: _async_empty())
+    result = await RunAICollector(
+        replace(
+            make_settings(),
+            runai_base_url="https://runai.example",
+            runai_bearer_token="token",
+            runai_mcp_url="http://runai-mcp/mcp",
+        )
+    ).collect(
+        replace(
+            make_target(),
+            runai_workload_id="550e8400-e29b-41d4-a716-446655440000",
+        )
+    )
+
+    assert result.details["queries"][0]["transport"] == "direct"
+    assert any("contained no resource data" in warning for warning in result.warnings)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"data": {}},
+        {"result": []},
+        {"data": {"result": []}, "status": "success"},
+    ],
+)
+def test_runai_nested_blank_mcp_envelopes_are_unusable(payload) -> None:
+    from app.collectors.runai import _runai_payload_error
+
+    assert (
+        _runai_payload_error(payload, transport="mcp")
+        == "Run:ai MCP response contained no resource data"
+    )
+
+
+def test_runai_empty_envelope_does_not_hide_meaningful_identity() -> None:
+    from app.collectors.runai import _runai_payload_error
+
+    assert (
+        _runai_payload_error(
+            {"data": {}, "identity": {"username": "operator"}},
+            transport="mcp",
+        )
+        == ""
+    )
 
 
 @pytest.mark.asyncio

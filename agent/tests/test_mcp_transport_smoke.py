@@ -31,6 +31,14 @@ def _free_port() -> int:
         sock.close()
 
 
+@pytest.mark.asyncio
+async def test_mcp_budget_is_shared_across_sequential_calls() -> None:
+    async with mcp_client.mcp_budget(0.04):
+        await mcp_client._within_mcp_budget(lambda: asyncio.sleep(0.025))
+        with pytest.raises(TimeoutError, match="before direct fallback"):
+            await mcp_client._within_mcp_budget(lambda: asyncio.sleep(0.025))
+
+
 @contextlib.asynccontextmanager
 async def _serve_mcp(mcp: FastMCP) -> AsyncIterator[str]:
     server = uvicorn.Server(

@@ -22,6 +22,7 @@ from app.collectors.loki import _llm_insight
 from app.config import Settings
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
+    mcp_budget,
     mcp_call,
     mcp_call_many,
     mcp_error,
@@ -122,18 +123,42 @@ class PrometheusCollector:
             query_results = await _collect_prometheus_direct(
                 self._settings, queries, warnings, time_range=time_range
             )
+        elif query_results:
+            warnings.extend(
+                f"Prometheus query failed for {item.get('name') or 'query'}: "
+                f"{item['error']}"
+                for item in query_results
+                if item.get("error")
+            )
 
         _annotate_capacity_gap_coverage(
             query_results, target=target, time_range=time_range
         )
 
         successful = [item for item in query_results if not item["error"]]
+        required_names = {
+            str(item.get("name") or "")
+            for item in query_results
+            if str(item.get("name") or "") != "prometheus_up"
+            and not str(item.get("name") or "").startswith(
+                "runai_control_plane_"
+            )
+        }
+        required_failures = [
+            item
+            for item in query_results
+            if str(item.get("name") or "") in required_names and item.get("error")
+        ]
+        required_complete = bool(required_names) and not required_failures
         populated = [
             item
             for item in successful
             if item["series_count"] and item["name"] != "prometheus_up"
         ]
-        if populated:
+        populated_target = [
+            item for item in populated if str(item.get("name") or "") in required_names
+        ]
+        if populated_target and required_complete:
             status = "ok"
             confidence = "high"
             summary = ko_en(
@@ -148,13 +173,25 @@ class PrometheusCollector:
         elif successful:
             status = "partial"
             confidence = "medium"
-            summary = f"{NO_EVIDENCE} " + ko_en(
-                self._settings,
-                "Prometheus에는 접속했지만 워크로드 메트릭 쿼리에 시리즈가 없습니다. "
-                "메트릭 레이블과 수집(scrape) 설정을 확인하세요.",
-                "Prometheus is reachable, but the workload metric queries "
-                "returned no series. Check metric labels and scrape configuration.",
-            )
+            if required_failures:
+                failed_names = ", ".join(
+                    str(item.get("name") or "query") for item in required_failures
+                )
+                summary = ko_en(
+                    self._settings,
+                    "Prometheus 대상 쿼리 일부가 실패했습니다. 성공한 쿼리 증거는 "
+                    f"유지했습니다. 실패: {failed_names}.",
+                    "Prometheus target queries were incomplete; usable per-query "
+                    f"evidence was retained. Failed: {failed_names}.",
+                )
+            else:
+                summary = f"{NO_EVIDENCE} " + ko_en(
+                    self._settings,
+                    "Prometheus에는 접속했지만 워크로드 메트릭 쿼리에 시리즈가 없습니다. "
+                    "메트릭 레이블과 수집(scrape) 설정을 확인하세요.",
+                    "Prometheus is reachable, but the workload metric queries "
+                    "returned no series. Check metric labels and scrape configuration.",
+                )
         else:
             status = "unavailable"
             confidence = "low"
@@ -209,16 +246,32 @@ class PrometheusCollector:
             summary=summary,
             confidence=confidence,
             details=result,
-            missing_data=(
-                []
-                if populated
-                else ["prometheus.workload_metrics"]
-                if successful
-                else ["prometheus.query"]
+            missing_data=_prometheus_missing_data(
+                successful=bool(successful),
+                populated_target=bool(populated_target),
+                required_names=required_names,
+                required_failures=required_failures,
             ),
             warnings=warnings,
             artifacts=artifacts,
         )
+
+
+def _prometheus_missing_data(
+    *,
+    successful: bool,
+    populated_target: bool,
+    required_names: set[str],
+    required_failures: list[dict[str, object]],
+) -> list[str]:
+    missing: list[str] = []
+    if not successful or required_failures:
+        missing.append("prometheus.query")
+    if not required_names:
+        missing.append("prometheus.target")
+    elif not populated_target:
+        missing.append("prometheus.workload_metrics")
+    return missing
 
 
 def _queries_for(
@@ -436,30 +489,42 @@ async def _collect_prometheus_mcp(
     *,
     time_range: dict[str, str] | None = None,
 ) -> list[dict[str, object]]:
-    datasource_uid = await _grafana_datasource_uid(
-        settings.prometheus_mcp_url,
-        "prometheus",
-        settings.prometheus_datasource_uid,
-    )
-    calls = [
-        (
-            "query_prometheus",
-            _prometheus_mcp_args(query, datasource_uid, time_range),
-        )
-        for _name, query in queries
-    ]
     try:
-        results = await mcp_call_many(settings.prometheus_mcp_url, calls)
-        return [
-            _prometheus_mcp_item(
-                name,
-                query,
+        async with mcp_budget(settings.prometheus_timeout_seconds):
+            datasource_uid = await _grafana_datasource_uid(
                 settings.prometheus_mcp_url,
-                _mcp_result_json(result, "query_prometheus"),
-                time_range,
+                "prometheus",
+                settings.prometheus_datasource_uid,
             )
-            for (name, query), result in zip(queries, results, strict=True)
-        ]
+            calls = [
+                (
+                    "query_prometheus",
+                    _prometheus_mcp_args(query, datasource_uid, time_range),
+                )
+                for _name, query in queries
+            ]
+            results = await mcp_call_many(settings.prometheus_mcp_url, calls)
+            items = [
+                _prometheus_mcp_tool_item(
+                    name,
+                    query,
+                    settings.prometheus_mcp_url,
+                    result,
+                    time_range,
+                )
+                for (name, query), result in zip(queries, results, strict=True)
+            ]
+            datasource_error = next(
+                (
+                    str(item.get("error") or "")
+                    for item in items
+                    if _grafana_datasource_error(str(item.get("error") or ""))
+                ),
+                "",
+            )
+            if datasource_error:
+                raise RuntimeError(datasource_error)
+            return items
     except Exception as exc:
         mark_grafana_datasource_failure(
             settings.prometheus_mcp_url,
@@ -477,19 +542,20 @@ async def prom_mcp_query(
     *,
     time_range: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    datasource_uid = await _grafana_datasource_uid(
-        settings.prometheus_mcp_url,
-        "prometheus",
-        settings.prometheus_datasource_uid,
-    )
     try:
-        return await _mcp_query_prometheus(
-            settings.prometheus_mcp_url,
-            name,
-            promql,
-            datasource_uid,
-            time_range=time_range,
-        )
+        async with mcp_budget(settings.prometheus_timeout_seconds):
+            datasource_uid = await _grafana_datasource_uid(
+                settings.prometheus_mcp_url,
+                "prometheus",
+                settings.prometheus_datasource_uid,
+            )
+            return await _mcp_query_prometheus(
+                settings.prometheus_mcp_url,
+                name,
+                promql,
+                datasource_uid,
+                time_range=time_range,
+            )
     except Exception as exc:
         mark_grafana_datasource_failure(
             settings.prometheus_mcp_url,
@@ -570,6 +636,37 @@ def _prometheus_mcp_item(
         "error": error,
         "time_range": query_window,
     }
+
+
+def _prometheus_mcp_tool_item(
+    name: str,
+    promql: str,
+    url: str,
+    result: object,
+    time_range: dict[str, str] | None,
+) -> dict[str, object]:
+    try:
+        data = _mcp_result_json(result, "query_prometheus")
+    except RuntimeError as exc:
+        query_window = time_range or {"start": "now-15m", "end": "now"}
+        return {
+            "name": name,
+            "query": promql,
+            "url": f"{url}#query_prometheus",
+            "status_code": None,
+            "status": "error",
+            "series_count": 0,
+            "sample": [],
+            "value_summary": _prometheus_value_summary([]),
+            "error": str(exc),
+            "time_range": query_window,
+        }
+    return _prometheus_mcp_item(name, promql, url, data, time_range)
+
+
+def _grafana_datasource_error(error: str) -> bool:
+    lowered = error.casefold()
+    return "get datasource by uid" in lowered or "id is invalid" in lowered
 
 
 def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:

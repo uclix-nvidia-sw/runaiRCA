@@ -179,6 +179,13 @@ class RunAICollector:
             )
             if not used_mcp:
                 if query_results:
+                    for item in query_results:
+                        if item.get("error"):
+                            auth_warnings.append(
+                                "Run:ai MCP "
+                                f"{item.get('name') or 'tool'} failed before direct "
+                                f"fallback: {str(item['error'])[:300]}"
+                            )
                     auth_warnings.append(
                         "Run:ai MCP returned an incomplete or unusable response; used "
                         "direct API fallback."
@@ -607,20 +614,26 @@ def _validated_runai_query_results(
     for raw_item in query_results:
         item = dict(raw_item)
         if not item.get("error"):
-            payload_error = _runai_payload_error(item.get("data"))
+            payload_error = _runai_payload_error(
+                item.get("data"), transport=str(item.get("transport") or "")
+            )
             if payload_error:
                 item["error"] = payload_error
         validated.append(item)
     return validated
 
 
-def _runai_payload_error(data: object) -> str:
+def _runai_payload_error(data: object, *, transport: str = "") -> str:
     if data is None:
         return "Run:ai response did not contain JSON data"
     if isinstance(data, dict) and set(data) == {"raw"}:
         return "Run:ai MCP response was not JSON"
     if isinstance(data, dict) and set(data) == {"body"}:
         return "Run:ai API response was not JSON"
+    if transport == "mcp" and (
+        data in ({}, [], "") or _runai_is_explicitly_empty(data)
+    ):
+        return "Run:ai MCP response contained no resource data"
     return ""
 
 
@@ -851,11 +864,42 @@ def _runai_observed_entity(name: str, target: AnalysisTarget) -> dict[str, str]:
 
 
 def _runai_is_explicitly_empty(data: object) -> bool:
-    if data is None or data == []:
+    if data in (None, "", [], {}):
         return True
+    if isinstance(data, list):
+        return False
     if not isinstance(data, dict):
         return False
-    for key in ("items", "workloads", "projects", "queues", "data", "results"):
-        if key in data and data[key] == []:
-            return True
-    return False
+    envelope_keys = {
+        "items",
+        "workloads",
+        "projects",
+        "queues",
+        "resources",
+        "data",
+        "result",
+        "results",
+    }
+    metadata_keys = {
+        "count",
+        "total",
+        "page",
+        "pageSize",
+        "page_size",
+        "nextPageToken",
+        "next_page_token",
+        "status",
+    }
+    envelopes = [value for key, value in data.items() if key in envelope_keys]
+    if not envelopes:
+        return bool(data) and all(key in metadata_keys for key in data)
+    if not all(_runai_is_explicitly_empty(value) for value in envelopes):
+        return False
+    # An empty resource envelope may carry pagination/status metadata. A real
+    # sibling identity or resource field makes the payload non-empty.
+    return all(
+        key in envelope_keys
+        or key in metadata_keys
+        or _runai_is_explicitly_empty(value)
+        for key, value in data.items()
+    )

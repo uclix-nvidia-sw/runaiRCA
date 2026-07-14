@@ -7,8 +7,9 @@ tools rather than issuing arbitrary API paths.  Every request carries the
 existing Run:ai bearer token (obtained from ``RUNAI_BEARER_TOKEN`` or client
 credentials) because the server protects its ``/mcp`` endpoint with OIDC.
 
-MCP remains additive.  An unavailable service, token, or unsupported response
-returns ``None`` and the collector falls back to its direct HTTP reads.
+MCP remains additive. Missing configuration/auth returns ``None``; setup and
+tool failures are returned as bounded query errors so the collector can retain
+the reason before falling back to its direct HTTP reads.
 """
 
 from __future__ import annotations
@@ -19,22 +20,40 @@ from uuid import UUID
 from app.collectors.base import AnalysisTarget
 from app.config import Settings
 from app.masking import build_masker
-from app.mcp_client import mcp_call, mcp_error, mcp_tool_json, mcp_tool_text
+from app.mcp_client import (
+    mcp_budget,
+    mcp_call,
+    mcp_error,
+    mcp_tool_json,
+    mcp_tool_text,
+)
 
 
 async def gather_runai_via_mcp(
     settings: Settings, target: AnalysisTarget, *, headers: dict[str, str]
 ) -> list[dict[str, Any]] | None:
-    """Return official-MCP query results, or ``None`` for direct-HTTP fallback."""
+    """Return official-MCP results/errors, or ``None`` when MCP is not usable."""
     if not settings.runai_mcp_url:
         return None
     if not headers.get("Authorization"):
         # The official HTTP transport rejects unauthenticated MCP sessions.
         return None
     try:
-        return await _gather(settings, target, headers=headers)
-    except Exception:  # noqa: BLE001 - MCP is best-effort; never break analysis
-        return None
+        async with mcp_budget(settings.runai_timeout_seconds):
+            return await _gather(settings, target, headers=headers)
+    except Exception as exc:  # noqa: BLE001 - preserve the fallback reason
+        return [
+            {
+                "name": "mcp_setup",
+                "query": "initialize official Run:ai MCP session",
+                "transport": "mcp",
+                "status_code": None,
+                "error": _safe_text(
+                    f"{exc.__class__.__name__}: {exc}", limit=300
+                ),
+                "data": None,
+            }
+        ]
 
 
 async def _gather(

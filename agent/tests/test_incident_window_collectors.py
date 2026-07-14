@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from app.collectors import kubernetes, loki, prometheus, runai
-from app.collectors.base import CollectorResult
+from app.collectors.base import CollectorResult, causal_evidence_time_range
 from app.collectors.http_json import JsonResponse
 from app.collectors.kubernetes import (
     _collect_pod_logs,
@@ -14,6 +14,7 @@ from app.collectors.kubernetes import (
     _filter_kubernetes_data,
     _kubernetes_list_complete,
     _mcp_k8s_response,
+    _node_condition_artifacts,
     _pod_log_observation,
     _warning_event_observation,
     _warning_event_queries_complete,
@@ -256,6 +257,128 @@ def test_loki_flat_mcp_positive_entries_fail_closed_if_one_lacks_exact_labels() 
 
     assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
     assert observation["target_scope_verified"] is False
+
+
+def test_loki_empty_range_requires_verified_log_coverage_for_scoped_absence() -> None:
+    target = make_target()
+    window = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    query = '{namespace="runai-vision",pod="trainer-0"} |~ "(?i)error"'
+    direct = loki._loki_query_observation(
+        {
+            "name": "error_logs",
+            "query": query,
+            "transport": "direct",
+            "native_response_complete": True,
+            "time_range": window,
+            "line_count": 0,
+            "stream_count": 0,
+            "stream_labels": [],
+            "stream_labels_complete": True,
+            "sample_entries": [],
+        },
+        target=target,
+        time_range=window,
+    )
+    covered_direct = loki._loki_query_observation(
+        {
+            "name": "error_logs",
+            "query": query,
+            "transport": "direct",
+            "native_response_complete": True,
+            "target_log_coverage_verified": True,
+            "time_range": window,
+            "line_count": 0,
+            "stream_count": 0,
+            "stream_labels": [],
+            "stream_labels_complete": True,
+            "sample_entries": [],
+        },
+        target=target,
+        time_range=window,
+    )
+    proxied = loki._loki_query_observation(
+        {
+            "name": "error_logs",
+            "query": query,
+            "transport": "mcp",
+            "time_range": window,
+            "line_count": 0,
+            "stream_count": 0,
+            "stream_labels": [],
+            "stream_labels_complete": False,
+            "sample_entries": [],
+        },
+        target=target,
+        time_range=window,
+    )
+
+    assert (direct["polarity"], direct["coverage"]) == ("unknown", "partial")
+    assert direct["target_scope_verified"] is False
+    assert (covered_direct["polarity"], covered_direct["coverage"]) == (
+        "absent",
+        "scoped",
+    )
+    assert covered_direct["target_scope_verified"] is True
+    assert covered_direct["observed_entity"] == {
+        "kind": "pod",
+        "name": "trainer-0",
+    }
+    assert (proxied["polarity"], proxied["coverage"]) == ("unknown", "partial")
+    assert proxied["target_scope_verified"] is False
+
+
+def test_loki_recent_target_stream_verifies_empty_error_query_coverage() -> None:
+    target = make_target()
+    window = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    results = [
+        {
+            "name": "error_logs",
+            "query": '{namespace="runai-vision",pod="trainer-0"} |~ "error"',
+            "transport": "direct",
+            "native_response_complete": True,
+            "time_range": window,
+            "line_count": 0,
+            "sample_entries": [],
+            "stream_labels": [],
+            "stream_labels_complete": True,
+            "error": None,
+        },
+        {
+            "name": "recent_logs",
+            "query": '{namespace="runai-vision",pod="trainer-0"}',
+            "transport": "direct",
+            "native_response_complete": True,
+            "time_range": window,
+            "line_count": 1,
+            "sample_entries": [
+                {
+                    "timestamp": "2026-07-10T01:00:00Z",
+                    "line": "application started",
+                }
+            ],
+            "stream_labels": [
+                {"namespace": "runai-vision", "pod": "trainer-0"}
+            ],
+            "stream_labels_complete": True,
+            "error": None,
+        },
+    ]
+
+    loki._annotate_loki_target_log_coverage(
+        results,
+        target=target,
+        plan=None,
+        time_range=window,
+    )
+    observation = loki._loki_query_observation(
+        results[0], target=target, time_range=window
+    )
+
+    assert results[0]["target_log_coverage_verified"] is True
+    assert (observation["polarity"], observation["coverage"]) == (
+        "absent",
+        "scoped",
+    )
 
 
 def test_historical_flat_loki_evidence_survives_blackboard_and_ranking() -> None:
@@ -987,7 +1110,149 @@ def test_generic_control_plane_loki_errors_are_context_not_target_support() -> N
     )
 
     assert (generic["polarity"], generic["coverage"]) == ("unknown", "partial")
-    assert (correlated["polarity"], correlated["coverage"]) == ("present", "scoped")
+    assert (correlated["polarity"], correlated["coverage"]) == ("unknown", "partial")
+
+
+def test_loki_history_accepts_exact_immutable_workload_row_in_incident_window() -> None:
+    workload_id = "550e8400-e29b-41d4-a716-446655440000"
+    target = replace(make_target(), runai_workload_id=workload_id)
+    time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    observation = loki._loki_query_observation(
+        {
+            "name": "workload_history_logs",
+            "query": loki._workload_history_query(target),
+            "transport": "direct",
+            "line_count": 1,
+            "stream_count": 1,
+            "sample_entries": [
+                {
+                    "timestamp": "2026-07-10T01:00:00Z",
+                    "line": f"workload {workload_id} failed scheduling",
+                    "labels": {"namespace": "runai-vision", "pod": "trainer-old-0"},
+                }
+            ],
+        },
+        target=target,
+        time_range=time_range,
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
+    assert observation["target_scope_verified"] is True
+    assert observation["observed_entity"] == {
+        "kind": "runai_workload_id",
+        "name": workload_id,
+    }
+
+
+@pytest.mark.parametrize(
+    ("line", "labels"),
+    [
+        (
+            "workload 550e8400-e29b-41d4-a716-446655440001 failed scheduling",
+            {"namespace": "runai-vision"},
+        ),
+        (
+            "workload x550e8400-e29b-41d4-a716-446655440000 failed scheduling",
+            {"namespace": "runai-vision"},
+        ),
+        (
+            "workload 550e8400-e29b-41d4-a716-446655440000-retry failed scheduling",
+            {"namespace": "runai-vision"},
+        ),
+        ("workload trainer failed scheduling", {"namespace": "runai-vision"}),
+        (
+            "workload 550e8400-e29b-41d4-a716-446655440000 failed scheduling",
+            {"namespace": "other-namespace"},
+        ),
+    ],
+)
+def test_loki_history_keeps_wrong_or_partial_workload_rows_as_context(
+    line: str,
+    labels: dict[str, str],
+) -> None:
+    workload_id = "550e8400-e29b-41d4-a716-446655440000"
+    target = replace(make_target(), runai_workload_id=workload_id)
+    time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    observation = loki._loki_query_observation(
+        {
+            "name": "workload_history_logs",
+            "query": loki._workload_history_query(target),
+            "transport": "mcp",
+            "line_count": 1,
+            "stream_count": 1,
+            "sample_entries": [
+                {
+                    "timestamp": "2026-07-10T01:00:00Z",
+                    "line": line,
+                    "labels": labels,
+                }
+            ],
+        },
+        target=target,
+        time_range=time_range,
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert observation["target_scope_verified"] is False
+
+
+def test_loki_control_plane_accepts_exact_id_with_returned_namespace_labels() -> None:
+    workload_id = "550e8400-e29b-41d4-a716-446655440000"
+    target = replace(make_target(), runai_workload_id=workload_id)
+    time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    selector = loki._namespace_regex_selector(("runai", "runai-system"))
+    observation = loki._loki_query_observation(
+        {
+            "name": "runai_control_plane_for_workload",
+            "query": (
+                f"{selector} |~ "
+                + loki._logql_string(
+                    f"(?i)({loki._bounded_logql_identifier(workload_id)})"
+                )
+            ),
+            "transport": "mcp",
+            "line_count": 1,
+            "stream_count": 1,
+            "sample_entries": [
+                {
+                    "timestamp": "2026-07-10T01:00:00Z",
+                    "line": f"preempted workload {workload_id} due to over quota",
+                    "labels": {"namespace": "runai-system", "pod": "scheduler-0"},
+                }
+            ],
+        },
+        target=target,
+        time_range=time_range,
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
+    assert observation["target_scope_verified"] is True
+
+
+def test_loki_control_plane_mcp_without_returned_labels_stays_context() -> None:
+    workload_id = "550e8400-e29b-41d4-a716-446655440000"
+    target = replace(make_target(), runai_workload_id=workload_id)
+    time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    observation = loki._loki_query_observation(
+        {
+            "name": "runai_control_plane_for_workload",
+            "query": '{namespace=~"runai|runai-system"}',
+            "transport": "mcp",
+            "line_count": 1,
+            "stream_count": 0,
+            "sample_entries": [
+                {
+                    "timestamp": "2026-07-10T01:00:00Z",
+                    "line": f"workload {workload_id} was preempted",
+                }
+            ],
+        },
+        target=target,
+        time_range=time_range,
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert observation["target_scope_verified"] is False
 
 
 @pytest.mark.asyncio
@@ -1753,6 +2018,174 @@ def test_kubernetes_warning_event_observation_exposes_actual_event_span() -> Non
         "start": "2026-07-10T01:11:00Z",
         "end": "2026-07-10T01:12:00Z",
     }
+
+
+def _node_condition_result(target, condition: dict[str, str]) -> CollectorResult:
+    responses = [
+        {
+            "name": "node",
+            "status_code": 200,
+            "error": None,
+            "data": {"name": target.node, "conditions": [condition]},
+        }
+    ]
+    return CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        confidence="high",
+        summary="Kubernetes node condition query completed.",
+        artifacts=_node_condition_artifacts(
+            "kubernetes",
+            target,
+            responses,
+            time_range=causal_evidence_time_range(target),
+        ),
+    )
+
+
+def test_true_node_pressure_condition_is_typed_scoped_and_ranked_without_events() -> None:
+    target = replace(
+        make_target(),
+        node="k8s-lb-02",
+        fired_at="2026-07-14T01:00:00Z",
+        resolved_at="2026-07-14T01:10:00Z",
+    )
+    result = _node_condition_result(
+        target,
+        {
+            "type": "MemoryPressure",
+            "status": "True",
+            "lastTransitionTime": "2026-07-13T20:00:00Z",
+            "lastHeartbeatTime": "2026-07-14T01:05:00Z",
+        },
+    )
+
+    assert len(result.artifacts) == 1
+    observation = result.artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == (
+        "present",
+        "scoped",
+    )
+    assert observation["observed_entity"] == {"kind": "node", "name": "k8s-lb-02"}
+    assert observation["evidence_window"] == {
+        "start": "2026-07-14T01:05:00Z",
+        "end": "2026-07-14T01:05:00Z",
+    }
+    assert result.artifacts[0].result["matched_incident_timestamps"] == {
+        "lastHeartbeatTime": "2026-07-14T01:05:00Z"
+    }
+    result.artifacts[0].evidence_id = "E01"
+    board = Blackboard(run_id="INC-node-pressure")
+    window = causal_evidence_time_range(target)
+    assert window is not None
+    board.seed_results(
+        [result],
+        entity="node:k8s-lb-02",
+        timestamp=target.fired_at,
+        observed_window_start=window["start"],
+        observed_window_end=window["end"],
+    )
+    eligibility = EvidenceEligibility.from_fact(
+        board.facts()[0],
+        context={
+            "run_id": "INC-node-pressure",
+            "window_start": window["start"],
+            "window_end": window["end"],
+            "entities": ("node:k8s-lb-02",),
+        },
+    )
+    assert eligibility.support is True
+    assert (
+        rank_root_cause_candidates(
+            target,
+            [result],
+            eligible_evidence_ids={"E01"},
+        )[0].family
+        == "node_kubelet_pressure"
+    )
+
+
+def test_false_node_pressure_condition_is_scoped_absence_not_rank_support() -> None:
+    target = replace(
+        make_target(),
+        node="k8s-lb-02",
+        fired_at="2026-07-14T01:00:00Z",
+        resolved_at="2026-07-14T01:10:00Z",
+    )
+    result = _node_condition_result(
+        target,
+        {
+            "type": "MemoryPressure",
+            "status": "False",
+            "lastHeartbeatTime": "2026-07-14T01:05:00Z",
+        },
+    )
+
+    observation = result.artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == (
+        "absent",
+        "scoped",
+    )
+    assert rank_root_cause_candidates(target, [result])[0].family == "insufficient_evidence"
+
+
+def test_historical_node_pressure_snapshot_outside_window_is_context_only() -> None:
+    target = replace(
+        make_target(),
+        node="k8s-lb-02",
+        fired_at="2026-07-14T01:00:00Z",
+        resolved_at="2026-07-14T01:10:00Z",
+    )
+    result = _node_condition_result(
+        target,
+        {
+            "type": "MemoryPressure",
+            "status": "True",
+            "lastTransitionTime": "2026-07-13T20:00:00Z",
+            "lastHeartbeatTime": "2026-07-13T22:00:52Z",
+        },
+    )
+
+    artifact_result = result.artifacts[0].result
+    observation = artifact_result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == (
+        "unknown",
+        "partial",
+    )
+    assert observation["snapshot_role"] == "current_context"
+    assert observation["observation_window"] == {}
+    assert artifact_result["timestamp_provenance"] == {
+        "lastTransitionTime": "2026-07-13T20:00:00Z",
+        "lastHeartbeatTime": "2026-07-13T22:00:52Z",
+    }
+    assert rank_root_cause_candidates(target, [result])[0].family == "insufficient_evidence"
+
+
+def test_firing_node_pressure_snapshot_is_scoped_even_with_old_condition_timestamp() -> None:
+    target = replace(
+        make_target(),
+        node="k8s-lb-02",
+        fired_at="2026-07-14T01:00:00Z",
+        resolved_at="",
+    )
+    result = _node_condition_result(
+        target,
+        {
+            "type": "MemoryPressure",
+            "status": "True",
+            "lastTransitionTime": "2026-07-13T20:00:00Z",
+            "lastHeartbeatTime": "2026-07-13T22:00:52Z",
+        },
+    )
+
+    observation = result.artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == (
+        "present",
+        "scoped",
+    )
+    assert observation["snapshot_role"] == "live_incident"
+    assert "evidence_window" not in observation
+    assert rank_root_cause_candidates(target, [result])[0].family == "node_kubelet_pressure"
 
 
 def test_kubernetes_warning_event_projection_excludes_recovery_only_failures() -> None:

@@ -166,13 +166,14 @@ async def test_resolve_live_pod_node_uses_mcp_namespace_wide_list_without_direct
             "status_code": 200,
             "error": None,
             "data": {
+                "metadata": {"continue": ""},
                 "items": [
                     {
                         "metadata": {"name": "trainer-0", "namespace": namespace},
                         "spec": {"nodeName": "gpu-node-7"},
                         "status": {"phase": "Running"},
                     }
-                ]
+                ],
             },
         }
 
@@ -203,6 +204,7 @@ async def test_resolve_live_pod_node_uses_unambiguous_workload_prefix_for_stale_
             "status_code": 200,
             "error": None,
             "data": {
+                "metadata": {"continue": ""},
                 "items": [
                     {
                         "metadata": {
@@ -224,7 +226,7 @@ async def test_resolve_live_pod_node_uses_unambiguous_workload_prefix_for_stale_
                         "spec": {"nodeName": "gpu-node-other"},
                         "status": {"phase": "Running"},
                     },
-                ]
+                ],
             },
         }
 
@@ -243,6 +245,115 @@ async def test_resolve_live_pod_node_uses_unambiguous_workload_prefix_for_stale_
 
     assert resolved == ("slack-test1-worker-new99", "gpu-node-9")
     assert calls == ["slack-test1-deleted99", "<wide-list>"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_live_pod_node_refuses_replacement_from_incomplete_list(
+    monkeypatch,
+) -> None:
+    async def fake_read(_settings, _kind, namespace="", name="", **_kwargs):
+        if name:
+            return {"status_code": 404, "error": "not found", "data": None}
+        return {
+            "status_code": 200,
+            "error": None,
+            "data": {
+                "metadata": {"continue": "next-page"},
+                "items": [
+                    {
+                        "metadata": {
+                            "name": "trainer-worker-a",
+                            "namespace": namespace,
+                        },
+                        "spec": {"nodeName": "gpu-node-1"},
+                        "status": {"phase": "Failed", "containerStatuses": []},
+                    }
+                ],
+            },
+        }
+
+    async def no_events(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(k8s, "k8s_read", fake_read)
+    monkeypatch.setattr(k8s, "_describe_events", no_events)
+    monkeypatch.setattr(k8s, "_read_file", lambda _path: "")
+
+    resolved = await k8s.resolve_live_pod_node(
+        make_settings(),
+        "team-a",
+        "trainer-deleted99",
+        workload="trainer",
+    )
+
+    assert resolved == ("", "")
+
+
+@pytest.mark.asyncio
+async def test_resolve_live_pod_node_paginates_past_50_before_replica_inference(
+    monkeypatch,
+) -> None:
+    calls: list[dict] = []
+
+    def pod(name: str, node: str) -> dict:
+        return {
+            "metadata": {"name": name, "namespace": "team-a"},
+            "spec": {"nodeName": node},
+            "status": {"phase": "Failed", "containerStatuses": []},
+        }
+
+    async def fake_get_json(**kwargs):
+        calls.append(kwargs)
+        path = kwargs["path"]
+        params = kwargs.get("params") or {}
+        if path.endswith("/pods/trainer-deleted99"):
+            return JsonResponse(
+                url=path,
+                status_code=404,
+                data={},
+                error="HTTP 404",
+            )
+        if path.endswith("/pods") and params.get("continue") == "page-2":
+            return JsonResponse(
+                url=path,
+                status_code=200,
+                data={
+                    "metadata": {"continue": ""},
+                    "items": [pod("trainer-worker-b", "gpu-node-2")],
+                },
+            )
+        if path.endswith("/pods"):
+            unrelated = [
+                pod(f"unrelated-{index:02d}", "gpu-node-other") for index in range(49)
+            ]
+            return JsonResponse(
+                url=path,
+                status_code=200,
+                data={
+                    "metadata": {"continue": "page-2"},
+                    "items": [pod("trainer-worker-a", "gpu-node-1"), *unrelated],
+                },
+            )
+        if path.endswith("/events"):
+            return JsonResponse(
+                url=path,
+                status_code=200,
+                data={"metadata": {"continue": ""}, "items": []},
+            )
+        raise AssertionError(f"unexpected Kubernetes path: {path}")
+
+    monkeypatch.setattr(k8s, "get_json", fake_get_json)
+    monkeypatch.setattr(k8s, "_read_file", lambda _path: "token")
+
+    resolved = await k8s.resolve_live_pod_node(
+        make_settings(),
+        "team-a",
+        "trainer-deleted99",
+        workload="trainer",
+    )
+
+    assert resolved == ("", "")
+    assert any((call.get("params") or {}).get("continue") == "page-2" for call in calls)
 
 
 @pytest.mark.asyncio

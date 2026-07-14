@@ -145,17 +145,36 @@ def _select_datasource_uid(data: object, datasource_type: str) -> str:
         candidates.append(datasource)
     if not candidates:
         return ""
-    # Prefer an exact plugin type, then Grafana's default datasource, and keep
-    # the final choice deterministic when several same-type datasources exist.
-    candidates.sort(
-        key=lambda item: (
-            str(item.get("type") or "").strip().lower() != datasource_type,
-            not bool(item.get("isDefault")),
-            str(item.get("name") or "").lower(),
-            str(item.get("uid") or ""),
+    exact_type = [
+        item
+        for item in candidates
+        if str(item.get("type") or "").strip().lower() == datasource_type
+    ]
+    pool = exact_type or candidates
+    if len(pool) == 1:
+        return str(pool[0].get("uid") or "").strip()
+
+    defaults = [item for item in pool if bool(item.get("isDefault"))]
+    if len(defaults) == 1:
+        return str(defaults[0].get("uid") or "").strip()
+
+    env_name = f"{datasource_type.upper()}_DATASOURCE_UID"
+    candidate_labels = ", ".join(
+        sorted(
+            f"{str(item.get('name') or 'unnamed')}"
+            f" ({str(item.get('uid') or 'no-uid')})"
+            for item in pool
         )
     )
-    return str(candidates[0].get("uid") or "").strip()
+    default_detail = (
+        "multiple defaults were returned"
+        if len(defaults) > 1
+        else "none is the unique default"
+    )
+    raise RuntimeError(
+        f"multiple accessible {datasource_type} Grafana datasources are ambiguous; "
+        f"{default_detail}. Set {env_name}. Candidates: {candidate_labels}"
+    )
 
 
 def _datasource_items(data: object) -> list[dict[str, Any]]:

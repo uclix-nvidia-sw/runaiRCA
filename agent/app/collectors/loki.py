@@ -26,6 +26,7 @@ from app.llm import cached_insight, complete, insight_cache_key, llm_configured
 from app.masking import build_masker
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
+    mcp_budget,
     mcp_call,
     mcp_call_many,
     mcp_error,
@@ -44,6 +45,25 @@ _LOKI_NON_CAUSAL_LINE_RE = re.compile(
     r"oom|evict|crash|pending|issue)|without\s+(?:error|fail|oom|evict|crash|pending))\b"
     r"|(?:정상|복구|해결|오류\s*없|실패\s*없|문제\s*없)",
     re.IGNORECASE,
+)
+_LOKI_CORRELATED_FAILURE_RE = re.compile(
+    r"\b(?:error|fail(?:ed|ure)?|oom(?:killed)?|evict(?:ed|ion)?|"
+    r"crash(?:ed|loop)?|pending|unschedul(?:able|ed)?|back-?off|"
+    r"preempt(?:ed|ion)?|denied|reject(?:ed|ion)?|timeout|panic|fatal|"
+    r"insufficient)\b|\bover\s+quota\b|\bquota\s+(?:exceeded|denied)\b",
+    re.IGNORECASE,
+)
+_LOKI_NAMESPACE_SELECTOR_RE = re.compile(
+    r'^\{namespace(?P<operator>=~|=)(?P<value>"(?:\\.|[^"\\])*")'
+)
+_LOKI_CORRELATED_QUERY_NAMES = frozenset(
+    {"workload_history_logs", "runai_control_plane_for_workload"}
+)
+_LOKI_CORRELATED_FAILURE_LOGQL = (
+    r"(?i)(error|fail(ed|ure)?|oom(killed)?|evict(ed|ion)?|crash(ed|loop)?|"
+    r"pending|unschedul(able|ed)?|back-?off|preempt(ed|ion)?|denied|"
+    r"reject(ed|ion)?|timeout|panic|fatal|insufficient|over[[:space:]]+quota|"
+    r"quota[[:space:]]+(exceeded|denied))"
 )
 
 
@@ -130,11 +150,18 @@ class LokiCollector:
             # scrape that skewed every alert to runai_control_plane_error.
             correlation = _control_plane_correlation_term(target, plan)
             if correlation:
+                correlation_query = (
+                    f"{runai_selector} |~ "
+                    + _logql_string(f"(?i)({correlation})")
+                )
+                if str(target.runai_workload_id or "").strip():
+                    correlation_query += (
+                        " |~ " + _logql_string(_LOKI_CORRELATED_FAILURE_LOGQL)
+                    )
                 queries.append(
                     (
                         "runai_control_plane_for_workload",
-                        f"{runai_selector} |~ "
-                        + _logql_string(f"(?i)({correlation})"),
+                        correlation_query,
                     )
                 )
         query_results = []
@@ -180,8 +207,33 @@ class LokiCollector:
             query_results = await _collect_loki_direct(
                 self._settings, queries, warnings, time_range
             )
+        elif query_results:
+            warnings.extend(
+                f"Loki query failed for {item.get('name') or 'query'}: "
+                f"{item['error']}"
+                for item in query_results
+                if item.get("error")
+            )
+
+        _annotate_loki_target_log_coverage(
+            query_results,
+            target=target,
+            plan=plan,
+            time_range=time_range,
+        )
 
         successful = [item for item in query_results if not item["error"]]
+        required_names = {
+            str(item.get("name") or "")
+            for item in query_results
+            if str(item.get("name") or "") in {"error_logs", "recent_logs"}
+        }
+        required_failures = [
+            item
+            for item in query_results
+            if str(item.get("name") or "") in required_names and item.get("error")
+        ]
+        required_complete = bool(required_names) and not required_failures
         populated = [
             item
             for item in successful
@@ -190,8 +242,11 @@ class LokiCollector:
             if item["line_count"]
             and _loki_entries_in_window(item.get("sample_entries"), time_range) is True
         ]
+        populated_target = [
+            item for item in populated if str(item.get("name") or "") in required_names
+        ]
         auth_failed = any(item["status_code"] == 401 for item in query_results)
-        if populated:
+        if populated_target and required_complete:
             status = "ok"
             confidence = "high"
             summary = ko_en(
@@ -205,13 +260,25 @@ class LokiCollector:
         elif successful:
             status = "partial"
             confidence = "medium"
-            summary = f"{NO_EVIDENCE} " + ko_en(
-                self._settings,
-                "Loki에는 접속했지만 워크로드 로그 쿼리에 일치하는 라인이 없습니다. "
-                "레이블 이름과 로그 보존 기간을 확인하세요.",
-                "Loki is reachable, but the workload log queries returned "
-                "no lines. Check label names and log retention.",
-            )
+            if required_failures:
+                failed_names = ", ".join(
+                    str(item.get("name") or "query") for item in required_failures
+                )
+                summary = ko_en(
+                    self._settings,
+                    "Loki 대상 쿼리 일부가 실패했습니다. 성공한 쿼리 증거는 "
+                    f"유지했습니다. 실패: {failed_names}.",
+                    "Loki target queries were incomplete; usable per-query evidence "
+                    f"was retained. Failed: {failed_names}.",
+                )
+            else:
+                summary = f"{NO_EVIDENCE} " + ko_en(
+                    self._settings,
+                    "Loki에는 접속했지만 워크로드 로그 쿼리에 일치하는 라인이 없습니다. "
+                    "레이블 이름과 로그 보존 기간을 확인하세요.",
+                    "Loki is reachable, but the workload log queries returned "
+                    "no lines. Check label names and log retention.",
+                )
         else:
             status = "unavailable"
             confidence = "low"
@@ -231,7 +298,11 @@ class LokiCollector:
             "time_range": time_range,
             "queries": query_results,
         }
-        missing_data = [] if successful else ["loki.query"]
+        missing_data: list[str] = []
+        if not successful or required_failures:
+            missing_data.append("loki.query")
+        if not required_names:
+            missing_data.append("loki.target")
         if auth_failed:
             missing_data.append("loki.auth")
         # The aggregate card is useful context for an operator, but a matching
@@ -396,6 +467,10 @@ async def _collect_loki_direct(
                 "stream_labels_complete": _stream_labels_complete(streams),
                 "sample": compact(streams, limit=3),
                 "error": error,
+                "transport": "direct",
+                "native_response_complete": _loki_native_response_complete(
+                    response.data
+                ),
                 **({"time_range": time_range} if time_range else {}),
             }
         )
@@ -409,35 +484,47 @@ async def _collect_loki_direct(
 async def _collect_loki_mcp(
     settings: Settings, queries: list[tuple[str, str]], time_range: dict[str, str] | None = None
 ) -> list[dict[str, object]]:
-    datasource_uid = await _grafana_datasource_uid(
-        settings.loki_mcp_url,
-        "loki",
-        settings.loki_datasource_uid,
-    )
-    calls = [
-        (
-            "query_loki_logs",
-            _loki_mcp_args(
-                query,
-                settings.loki_query_limit,
-                datasource_uid,
-                time_range,
-            ),
-        )
-        for _name, query in queries
-    ]
     try:
-        results = await mcp_call_many(settings.loki_mcp_url, calls)
-        return [
-            _loki_mcp_item(
-                name,
-                query,
+        async with mcp_budget(settings.loki_timeout_seconds):
+            datasource_uid = await _grafana_datasource_uid(
                 settings.loki_mcp_url,
-                _mcp_result_json(result, "query_loki_logs"),
-                time_range,
+                "loki",
+                settings.loki_datasource_uid,
             )
-            for (name, query), result in zip(queries, results, strict=True)
-        ]
+            calls = [
+                (
+                    "query_loki_logs",
+                    _loki_mcp_args(
+                        query,
+                        settings.loki_query_limit,
+                        datasource_uid,
+                        time_range,
+                    ),
+                )
+                for _name, query in queries
+            ]
+            results = await mcp_call_many(settings.loki_mcp_url, calls)
+            items = [
+                _loki_mcp_tool_item(
+                    name,
+                    query,
+                    settings.loki_mcp_url,
+                    result,
+                    time_range,
+                )
+                for (name, query), result in zip(queries, results, strict=True)
+            ]
+            datasource_error = next(
+                (
+                    str(item.get("error") or "")
+                    for item in items
+                    if _grafana_datasource_error(str(item.get("error") or ""))
+                ),
+                "",
+            )
+            if datasource_error:
+                raise RuntimeError(datasource_error)
+            return items
     except Exception as exc:
         mark_grafana_datasource_failure(
             settings.loki_mcp_url,
@@ -455,20 +542,21 @@ async def loki_mcp_query(
     *,
     time_range: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    datasource_uid = await _grafana_datasource_uid(
-        settings.loki_mcp_url,
-        "loki",
-        settings.loki_datasource_uid,
-    )
     try:
-        return await _mcp_query_loki(
-            settings.loki_mcp_url,
-            name,
-            logql,
-            settings.loki_query_limit,
-            datasource_uid,
-            time_range,
-        )
+        async with mcp_budget(settings.loki_timeout_seconds):
+            datasource_uid = await _grafana_datasource_uid(
+                settings.loki_mcp_url,
+                "loki",
+                settings.loki_datasource_uid,
+            )
+            return await _mcp_query_loki(
+                settings.loki_mcp_url,
+                name,
+                logql,
+                settings.loki_query_limit,
+                datasource_uid,
+                time_range,
+            )
     except Exception as exc:
         mark_grafana_datasource_failure(
             settings.loki_mcp_url,
@@ -553,6 +641,7 @@ def _loki_mcp_item(
             "stream_labels_complete": False,
             "sample": compact(data, limit=3),
             "error": "Loki MCP response missing a recognized log result",
+            "transport": "mcp",
             **({"time_range": time_range} if time_range else {}),
         }
     streams = _loki_streams(data)
@@ -595,8 +684,44 @@ def _loki_mcp_item(
         "stream_labels_complete": bool(streams) and _stream_labels_complete(streams),
         "sample": compact(streams or data, limit=3),
         "error": None,
+        "transport": "mcp",
         **({"time_range": time_range} if time_range else {}),
     }
+
+
+def _loki_mcp_tool_item(
+    name: str,
+    logql: str,
+    url: str,
+    result: object,
+    time_range: dict[str, str] | None,
+) -> dict[str, object]:
+    try:
+        data = _mcp_result_json(result, "query_loki_logs")
+    except RuntimeError as exc:
+        return {
+            "name": name,
+            "query": logql,
+            "url": f"{url}#query_loki_logs",
+            "status_code": None,
+            "status": "error",
+            "stream_count": 0,
+            "line_count": 0,
+            "sample_lines": [],
+            "sample_entries": [],
+            "stream_labels": [],
+            "stream_labels_complete": False,
+            "sample": [],
+            "error": str(exc),
+            "transport": "mcp",
+            **({"time_range": time_range} if time_range else {}),
+        }
+    return _loki_mcp_item(name, logql, url, data, time_range)
+
+
+def _grafana_datasource_error(error: str) -> bool:
+    lowered = error.casefold()
+    return "get datasource by uid" in lowered or "id is invalid" in lowered
 
 
 def _incident_time_range(target: AnalysisTarget) -> dict[str, str] | None:
@@ -662,6 +787,11 @@ def _loki_query_observation(
         # This is intentionally a broad health sweep across Run:ai namespaces.
         # It can explain why to inspect the control plane, but it has no
         # workload/project identity and therefore cannot prove the alert's RCA.
+        polarity, coverage = "unknown", "partial"
+    elif name in _LOKI_CORRELATED_QUERY_NAMES and target is None:
+        # A correlation query name is not provenance.  Historical/control-plane
+        # rows become causal support only after the immutable workload identity,
+        # returned stream namespace, and incident window are checked below.
         polarity, coverage = "unknown", "partial"
     elif not time_range:
         # A current/live query can help an operator, but it cannot confirm that
@@ -772,13 +902,21 @@ def _loki_target_scope(
 ) -> tuple[dict[str, str] | None, bool]:
     """Validate native Loki stream labels against the selector's target scope.
 
-    ``workload_history_logs`` and the Run:ai control-plane correlation query
-    intentionally match text inside broader streams.  Their labels cannot
-    prove the alert workload identity, so they stay context-only. Primary
-    target stream queries accept either complete native stream labels or, for
-    Grafana's flat MCP shape, exact labels carried by every positive in-window
-    sample entry. Query text alone never supplies provenance.
+    Historical and Run:ai control-plane correlation queries may become scoped
+    only when an in-window returned row itself carries the exact immutable
+    Run:ai workload ID and a namespace label satisfying the query selector.
+    Workload-name/project matches remain context. Primary target stream queries
+    accept either complete native stream labels or, for Grafana's flat MCP
+    shape, exact labels carried by every positive in-window sample entry. Query
+    text alone never supplies provenance.
     """
+    if name in _LOKI_CORRELATED_QUERY_NAMES:
+        return _loki_correlated_target_scope(
+            name,
+            item,
+            target=target,
+            time_range=time_range,
+        )
     if name not in {"error_logs", "recent_logs"}:
         return None, False
 
@@ -805,6 +943,25 @@ def _loki_target_scope(
     else:
         required = (("namespace", namespace),)
         entity = {"kind": "namespace", "name": namespace}
+
+    # A native direct range query is authoritative about its exact request
+    # selector even when the result is empty (there are naturally no returned
+    # stream labels to inspect). This exception is deliberately unavailable to
+    # MCP/proxy responses: their request-shaped arguments do not prove that the
+    # upstream honored the selector or historical window.
+    direct_empty = (
+        int(item.get("line_count") or 0) == 0
+        and item.get("transport") == "direct"
+        and item.get("native_response_complete") is True
+        and item.get("target_log_coverage_verified") is True
+        and item.get("time_range") == time_range
+        and str(item.get("query") or "").strip().startswith(
+            _selector_for(target, plan)
+        )
+        and _selector_for(target, plan) != "{}"
+    )
+    if direct_empty:
+        return entity, True
 
     labels = item.get("stream_labels")
     if item.get("stream_labels_complete") is True and isinstance(labels, list) and labels:
@@ -836,6 +993,145 @@ def _loki_target_scope(
             if workload not in workload_labels:
                 return None, False
     return entity, True
+
+
+def _loki_correlated_target_scope(
+    name: str,
+    item: dict[str, object],
+    *,
+    target: AnalysisTarget,
+    time_range: dict[str, str] | None,
+) -> tuple[dict[str, str] | None, bool]:
+    """Verify a historical/control-plane row against immutable target identity.
+
+    The LogQL request is only intent: proxies can ignore its selector or range.
+    Require every retained in-window failure row used for support to expose an
+    exact namespace label and the full Run:ai workload ID on a token boundary.
+    This works for native Loki and Grafana MCP flat entries without allowing a
+    workload name, project, or ID substring to inherit the pipeline target.
+    """
+    workload_id = str(target.runai_workload_id or "").strip()
+    if not workload_id or not time_range:
+        return None, False
+    query = str(item.get("query") or "")
+    entries = _loki_correlated_failure_entries(
+        item.get("sample_entries"),
+        time_range=time_range,
+    )
+    if not entries:
+        return None, False
+    identifier = re.compile(
+        rf"(?<![a-z0-9_-]){re.escape(workload_id.casefold())}(?![a-z0-9_-])"
+    )
+    for entry in entries:
+        line = str(entry.get("line") or "")
+        if not identifier.search(line.casefold()):
+            return None, False
+        labels = entry.get("labels")
+        if not isinstance(labels, dict):
+            return None, False
+        namespace = str(labels.get("namespace") or "").strip()
+        if not namespace or not _loki_query_namespace_matches(query, namespace):
+            return None, False
+    # The target namespace is encoded as the workload-history selector.  The
+    # control-plane query instead validates its configured Run:ai namespace
+    # selector; the globally immutable workload ID supplies target identity.
+    if name == "workload_history_logs":
+        target_namespace = str(target.namespace or "").strip()
+        if not target_namespace or any(
+            str(entry["labels"].get("namespace") or "").strip() != target_namespace
+            for entry in entries
+        ):
+            return None, False
+    return {"kind": "runai_workload_id", "name": workload_id}, True
+
+
+def _loki_correlated_failure_entries(
+    entries: object,
+    *,
+    time_range: dict[str, str],
+) -> list[dict[str, object]]:
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return []
+    matched: list[dict[str, object]] = []
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        timestamp = parse_incident_time(entry.get("timestamp"))
+        line = entry.get("line")
+        if (
+            timestamp is None
+            or not (start <= timestamp <= end)
+            or not isinstance(line, str)
+            or _LOKI_NON_CAUSAL_LINE_RE.search(line)
+            or not _LOKI_CORRELATED_FAILURE_RE.search(line)
+        ):
+            continue
+        matched.append(entry)
+    return matched
+
+
+def _loki_query_namespace_matches(query: str, namespace: str) -> bool:
+    """Check an exact returned namespace against this collector's selector."""
+    match = _LOKI_NAMESPACE_SELECTOR_RE.match(query.strip())
+    if match is None:
+        return False
+    try:
+        expected = json.loads(match.group("value"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(expected, str):
+        return False
+    if match.group("operator") == "=":
+        return namespace == expected
+    try:
+        return re.fullmatch(expected, namespace) is not None
+    except re.error:
+        return False
+
+
+def _annotate_loki_target_log_coverage(
+    query_results: list[dict[str, object]],
+    *,
+    target: AnalysisTarget,
+    plan: object | None,
+    time_range: dict[str, str] | None,
+) -> None:
+    """Record whether retained target logs cover the requested incident window.
+
+    A successful empty LogQL response proves only that Loki answered the query;
+    it does not distinguish a true absence from expired or unscripted logs. The
+    unfiltered target query must return an in-window, target-scoped stream before
+    an empty error-token query can become high-quality negative evidence.
+    """
+    recent = next(
+        (
+            item
+            for item in query_results
+            if str(item.get("name") or "") == "recent_logs"
+        ),
+        None,
+    )
+    coverage_verified = False
+    if (
+        recent is not None
+        and not recent.get("error")
+        and int(recent.get("line_count") or 0) > 0
+        and _loki_entries_in_window(recent.get("sample_entries"), time_range) is True
+    ):
+        _entity, scoped = _loki_target_scope(
+            "recent_logs",
+            recent,
+            target=target,
+            plan=plan,
+            time_range=time_range,
+        )
+        coverage_verified = scoped is True
+    for item in query_results:
+        if str(item.get("name") or "") in {"error_logs", "recent_logs"}:
+            item["target_log_coverage_verified"] = coverage_verified
 
 
 def _loki_positive_entry_labels(
@@ -1116,12 +1412,24 @@ def _workload_history_query(target: AnalysisTarget, plan=None) -> str:
         workload = plan.workload or workload
     if not namespace:
         return ""
-    terms = _workload_history_terms(workload, target.runai_workload_id)
+    immutable_id = str(target.runai_workload_id or "").strip()
+    # When an immutable ID exists, make the query itself exact and failure-only.
+    # The observation layer still verifies returned rows because an MCP/proxy may
+    # ignore request arguments. Name-only fallback stays useful operator context
+    # but can never be promoted to target-scoped support.
+    terms = (
+        [_bounded_logql_identifier(immutable_id)]
+        if immutable_id
+        else _workload_history_terms(workload)
+    )
     if not terms:
         return ""
     selector = f"{{namespace={_logql_string(namespace)}}}"
     pattern = "(?i)(" + "|".join(terms) + ")"
-    return f"{selector} |~ {_logql_string(pattern)}"
+    query = f"{selector} |~ {_logql_string(pattern)}"
+    if immutable_id:
+        query += f" |~ {_logql_string(_LOKI_CORRELATED_FAILURE_LOGQL)}"
+    return query
 
 
 def _workload_history_terms(*values: str) -> list[str]:
@@ -1138,8 +1446,11 @@ def _workload_history_terms(*values: str) -> list[str]:
 
 def _control_plane_correlation_term(target: AnalysisTarget, plan=None) -> str:
     """Regex alternation of the identifiers the control plane logs THIS workload by
-    (workload name, then project). Empty when nothing specific enough to correlate —
-    a too-short term would match unrelated control-plane lines."""
+    (immutable workload ID first; otherwise workload name and project). Empty when
+    nothing specific enough is available. Name/project fallback is context only."""
+    immutable_id = str(target.runai_workload_id or "").strip()
+    if immutable_id:
+        return _bounded_logql_identifier(immutable_id)
     workload = (getattr(plan, "workload", "") or target.workload_name or "").strip()
     project = (target.project or "").strip()
     terms: list[str] = []
@@ -1148,6 +1459,11 @@ def _control_plane_correlation_term(target: AnalysisTarget, plan=None) -> str:
         if len(value) >= 3 and escaped not in terms:
             terms.append(escaped)
     return "|".join(terms)
+
+
+def _bounded_logql_identifier(value: str) -> str:
+    """RE2-safe ASCII token boundaries for an immutable workload identifier."""
+    return rf"(^|[^[:alnum:]_-]){re.escape(value)}($|[^[:alnum:]_-])"
 
 
 def _namespace_regex_selector(namespaces: tuple[str, ...]) -> str:

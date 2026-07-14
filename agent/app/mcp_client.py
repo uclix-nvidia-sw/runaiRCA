@@ -4,6 +4,9 @@ import asyncio
 import json
 import logging
 import os
+import time
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Any
 
 import httpx
@@ -13,6 +16,52 @@ from app.masking import build_masker
 _log = logging.getLogger(__name__)
 
 MCP_FALLBACK_WARNING = "MCP unavailable; used direct API fallback"
+_mcp_deadline: ContextVar[float | None] = ContextVar("mcp_deadline", default=None)
+
+
+@asynccontextmanager
+async def mcp_budget(timeout_seconds: float | int | None):
+    """Share one total deadline across a collector's sequential MCP calls.
+
+    The SDK's streamable-HTTP read timeout is intentionally generous. Without
+    this outer budget, discovery plus several tool calls (and their retries)
+    can consume the entire analysis deadline before the direct fallback gets a
+    chance to run. Nested budgets only tighten an existing deadline, and normal
+    task cancellation still enforces the orchestrator's analysis-wide ceiling.
+    """
+    configured = float(timeout_seconds or 0)
+    deadline = time.monotonic() + configured if configured > 0 else None
+    existing = _mcp_deadline.get()
+    if existing is not None:
+        deadline = existing if deadline is None else min(existing, deadline)
+    token = _mcp_deadline.set(deadline)
+    try:
+        yield
+    finally:
+        _mcp_deadline.reset(token)
+
+
+def _mcp_time_remaining() -> float | None:
+    deadline = _mcp_deadline.get()
+    return None if deadline is None else deadline - time.monotonic()
+
+
+async def _within_mcp_budget(factory):
+    remaining = _mcp_time_remaining()
+    if remaining is not None and remaining <= 0:
+        raise TimeoutError("MCP collector budget exhausted before direct fallback")
+    try:
+        awaitable = factory()
+        if remaining is None:
+            return await awaitable
+        return await asyncio.wait_for(awaitable, remaining)
+    except TimeoutError as exc:
+        if remaining is None:
+            raise
+        still_remaining = _mcp_time_remaining()
+        if still_remaining is not None and still_remaining > 0:
+            raise
+        raise TimeoutError("MCP collector budget exhausted before direct fallback") from exc
 
 
 def _mcp_client_factory():
@@ -79,18 +128,21 @@ async def mcp_call(
     factory = _mcp_client_factory()
     extra = {"httpx_client_factory": factory} if factory else {}
 
-    for attempt in range(2):
-        try:
-            async with streamablehttp_client(
-                url, headers=headers, **extra
-            ) as (read, write, *_rest):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    return await session.call_tool(tool, arguments)
-        except Exception:
-            if attempt:
-                raise
-            await asyncio.sleep(0.5)
+    async def invoke():
+        for attempt in range(2):
+            try:
+                async with streamablehttp_client(
+                    url, headers=headers, **extra
+                ) as (read, write, *_rest):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        return await session.call_tool(tool, arguments)
+            except Exception:
+                if attempt:
+                    raise
+                await asyncio.sleep(0.5)
+
+    return await _within_mcp_budget(invoke)
 
 
 async def mcp_call_many(
@@ -117,21 +169,24 @@ async def mcp_call_many(
     factory = _mcp_client_factory()
     extra = {"httpx_client_factory": factory} if factory else {}
 
-    for attempt in range(2):
-        try:
-            async with streamablehttp_client(
-                url, headers=headers, **extra
-            ) as (read, write, *_rest):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    return [
-                        await session.call_tool(tool, arguments)
-                        for tool, arguments in calls
-                    ]
-        except Exception:
-            if attempt:
-                raise
-            await asyncio.sleep(0.5)
+    async def invoke():
+        for attempt in range(2):
+            try:
+                async with streamablehttp_client(
+                    url, headers=headers, **extra
+                ) as (read, write, *_rest):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        return [
+                            await session.call_tool(tool, arguments)
+                            for tool, arguments in calls
+                        ]
+            except Exception:
+                if attempt:
+                    raise
+                await asyncio.sleep(0.5)
+
+    return await _within_mcp_budget(invoke)
 
 
 async def mcp_reachability(

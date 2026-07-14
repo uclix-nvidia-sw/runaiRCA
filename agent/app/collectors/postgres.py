@@ -17,6 +17,7 @@ from app.collectors.loki import _llm_insight
 from app.config import Settings
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
+    mcp_budget,
     mcp_call,
     mcp_error,
     mcp_fallback_warning,
@@ -66,9 +67,10 @@ class PostgresCollector:
         used_mcp = False
         if self._settings.postgres_mcp_url:
             try:
-                checks = await _collect_postgres_checks_mcp(
-                    self._settings, target, check_rca_tables=check_rca_tables
-                )
+                async with mcp_budget(self._settings.postgres_timeout_seconds):
+                    checks = await _collect_postgres_checks_mcp(
+                        self._settings, target, check_rca_tables=check_rca_tables
+                    )
                 used_mcp = True
             except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
                 warnings.append(mcp_fallback_warning(exc))

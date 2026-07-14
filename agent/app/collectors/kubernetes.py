@@ -27,6 +27,7 @@ from app.llm import cached_insight, complete, insight_cache_key, llm_configured
 from app.masking import build_masker
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
+    mcp_budget,
     mcp_call,
     mcp_error,
     mcp_fallback_warning,
@@ -1262,6 +1263,14 @@ def _k8s_mcp_resource_kind(kind: str) -> tuple[str, str]:
     return mapping.get(kind, ("v1", kind))
 
 
+def _kubernetes_exact_absence(item: dict[str, object]) -> bool:
+    """Treat an exact named-resource 404 as a completed lookup, not outage."""
+    return item.get("status_code") == 404 and str(item.get("name") or "") in {
+        "pod",
+        "node",
+    }
+
+
 class KubernetesCollector:
     name = "kubernetes"
 
@@ -1290,36 +1299,40 @@ class KubernetesCollector:
         control_plane_in_scope = plan.check_control_plane if plan is not None else True
         if self._settings.kubernetes_mcp_url:
             try:
-                responses = await _collect_kubernetes_responses_via_mcp(
-                    settings=self._settings,
-                    target=target,
-                    control_plane_in_scope=control_plane_in_scope,
-                )
-                pod_summary_data = _target_pod_summary(responses)
-                if _pod_matches_target_uid(pod_summary_data, target):
-                    containers = _container_names(pod_summary_data)
-                    logs = await _collect_pod_logs_via_mcp(
+                async with mcp_budget(self._settings.kubernetes_timeout_seconds):
+                    responses = await _collect_kubernetes_responses_via_mcp(
                         settings=self._settings,
                         target=target,
-                        containers=containers,
-                        previous_containers=_restarted_container_names(pod_summary_data),
-                        since_time=since_time,
+                        control_plane_in_scope=control_plane_in_scope,
                     )
-                    # pods/exec is intentionally outside the read-only Kubernetes
-                    # MCP ServiceAccount. Run the same tightly allowlisted probes
-                    # through the agent's own ServiceAccount; this does not turn
-                    # ordinary Kubernetes reads into direct API calls.
-                    exec_probes = await _collect_exec_probes(
-                        settings=self._settings,
-                        target=target,
-                        containers=containers,
-                    )
-                elif target.pod_uid:
-                    warnings.append(
-                        "current Pod UID does not match the alert Pod UID; skipped logs and exec"
-                    )
-                    pod_summary_data = None
-                used_mcp = True
+                    pod_summary_data = _target_pod_summary(responses)
+                    if _pod_matches_target_uid(pod_summary_data, target):
+                        containers = _container_names(pod_summary_data)
+                        logs = await _collect_pod_logs_via_mcp(
+                            settings=self._settings,
+                            target=target,
+                            containers=containers,
+                            previous_containers=_restarted_container_names(
+                                pod_summary_data
+                            ),
+                            since_time=since_time,
+                        )
+                        # pods/exec is intentionally outside the read-only Kubernetes
+                        # MCP ServiceAccount. Run the same tightly allowlisted probes
+                        # through the agent's own ServiceAccount; this does not turn
+                        # ordinary Kubernetes reads into direct API calls.
+                        exec_probes = await _collect_exec_probes(
+                            settings=self._settings,
+                            target=target,
+                            containers=containers,
+                        )
+                    elif target.pod_uid:
+                        warnings.append(
+                            "current Pod UID does not match the alert Pod UID; "
+                            "skipped logs and exec"
+                        )
+                        pod_summary_data = None
+                    used_mcp = True
             except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
                 warnings.append(mcp_fallback_warning(exc))
         else:
@@ -1450,6 +1463,23 @@ class KubernetesCollector:
             if item.get("error")
         )
         successful = [item for item in responses if not item.get("error")]
+        required_responses = [
+            item
+            for item in responses
+            if not str(item.get("name") or "").startswith("runai_control_plane_")
+        ]
+        required_failures = [
+            item
+            for item in required_responses
+            if item.get("error") and not _kubernetes_exact_absence(item)
+        ]
+        required_completed = [
+            item
+            for item in required_responses
+            if not item.get("error") or _kubernetes_exact_absence(item)
+        ]
+        if required_failures and "kubernetes.query" not in missing:
+            missing.append("kubernetes.query")
         pod_statuses = _pod_statuses(responses)
         warning_events = _warning_events(responses)
         target_described_events = (
@@ -1515,7 +1545,7 @@ class KubernetesCollector:
                 pass
         crd_findings = runai_crds.get("findings") or []
 
-        if successful and not missing:
+        if required_completed and not required_failures and not missing:
             status = "ok"
             confidence = "high"
             summary = ko_en(
@@ -1523,16 +1553,28 @@ class KubernetesCollector:
                 "알림 대상에 대한 Kubernetes 조회를 완료했습니다.",
                 "Kubernetes API queries completed for the resolved alert target.",
             )
-        elif successful:
+        elif successful or required_completed:
             status = "partial"
             confidence = "medium"
-            summary = ko_en(
-                self._settings,
-                "Kubernetes API에는 접속했지만 알림 대상 정보가 불완전합니다. "
-                "네임스페이스/파드/워크로드/노드 레이블이 없을 수 있습니다.",
-                "Kubernetes API is reachable, but the alert target is incomplete. "
-                "Namespace, pod, workload, or node labels may be missing.",
-            )
+            if required_failures:
+                failed_names = ", ".join(
+                    str(item.get("name") or "query") for item in required_failures
+                )
+                summary = ko_en(
+                    self._settings,
+                    "Kubernetes 대상 쿼리 일부가 실패했습니다. 성공한 쿼리 증거는 "
+                    f"유지했습니다. 실패: {failed_names}.",
+                    "Kubernetes target queries were incomplete; usable per-query "
+                    f"evidence was retained. Failed: {failed_names}.",
+                )
+            else:
+                summary = ko_en(
+                    self._settings,
+                    "Kubernetes API에는 접속했지만 알림 대상 정보가 불완전합니다. "
+                    "네임스페이스/파드/워크로드/노드 레이블이 없을 수 있습니다.",
+                    "Kubernetes API is reachable, but the alert target is incomplete. "
+                    "Namespace, pod, workload, or node labels may be missing.",
+                )
         else:
             status = "unavailable"
             confidence = "low"
@@ -1569,7 +1611,7 @@ class KubernetesCollector:
                 f"Found {len(crd_findings)} Run:ai resource(s) not Ready: {named}.",
             )
             summary = f"{lead} {summary}"
-            if status != "ok":
+            if status != "ok" and not required_failures:
                 status, confidence = "ok", "high"
 
         insight = await _senior_insight(
@@ -1689,6 +1731,14 @@ class KubernetesCollector:
                     "time_range": causal_time_range,
                     "collection_time_range": time_range,
                 },
+            )
+        )
+        artifacts.extend(
+            _node_condition_artifacts(
+                self.name,
+                target,
+                responses,
+                time_range=causal_time_range,
             )
         )
         artifacts.extend(
@@ -2257,6 +2307,11 @@ async def _collect_kubernetes_responses_via_mcp(
         nonlocal ok_count
         try:
             data = await _k8s_mcp_json(settings, candidates)
+        except TimeoutError:
+            # The shared collector deadline is a transport-level stop, not a
+            # target query observation. Propagate it even after earlier MCP
+            # calls succeeded so collect() can still use the direct API.
+            raise
         except Exception as exc:  # noqa: BLE001 - a per-query miss is evidence
             responses.append(
                 {
@@ -2463,6 +2518,13 @@ def _mcp_kubernetes_list_complete(data: object) -> bool:
 async def _k8s_mcp_json(
     settings: Settings, candidates: list[tuple[str, dict[str, object]]]
 ) -> object:
+    async with mcp_budget(settings.kubernetes_timeout_seconds):
+        return await _k8s_mcp_json_within_budget(settings, candidates)
+
+
+async def _k8s_mcp_json_within_budget(
+    settings: Settings, candidates: list[tuple[str, dict[str, object]]]
+) -> object:
     # Walk candidates and return the first one that yields a machine-readable
     # payload. A candidate can "succeed" at the MCP protocol level yet answer with
     # a human table (kubernetes-mcp-server's events_list does) that _k8s_yaml_payload
@@ -2473,6 +2535,8 @@ async def _k8s_mcp_json(
     for tool, args in candidates:
         try:
             result = await mcp_call(settings.kubernetes_mcp_url, tool, args)
+        except TimeoutError:
+            raise
         except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
             last_error = f"{tool}: {exc.__class__.__name__}: {exc}"
             continue
@@ -2532,11 +2596,22 @@ def _k8s_mcp_payload_recognized(data: object, *, tool: str) -> bool:
     return isinstance(payload.get("metadata"), dict)
 
 
-async def _k8s_mcp_result(settings: Settings, candidates: list[tuple[str, dict[str, object]]]):
+async def _k8s_mcp_result(
+    settings: Settings, candidates: list[tuple[str, dict[str, object]]]
+):
+    async with mcp_budget(settings.kubernetes_timeout_seconds):
+        return await _k8s_mcp_result_within_budget(settings, candidates)
+
+
+async def _k8s_mcp_result_within_budget(
+    settings: Settings, candidates: list[tuple[str, dict[str, object]]]
+):
     last_error = ""
     for tool, args in candidates:
         try:
             result = await mcp_call(settings.kubernetes_mcp_url, tool, args)
+        except TimeoutError:
+            raise
         except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
             last_error = f"{tool}: {exc.__class__.__name__}: {exc}"
             continue
@@ -2984,6 +3059,100 @@ def node_from_pod_events(items: list[dict]) -> str:
     return ""
 
 
+_NODE_RESOLUTION_MAX_LIST_PAGES = 10
+_NODE_RESOLUTION_MAX_LIST_ITEMS = 500
+
+
+async def _node_resolution_pod_items(
+    settings: Settings,
+    namespace: str,
+    listing: dict[str, object],
+) -> tuple[list[dict], bool]:
+    """Return bounded namespace Pods and whether the LIST reached its last page.
+
+    Exact named Pod rows remain usable from any page, but generated-name and
+    workload-prefix replacement inference is safe only after Kubernetes proves
+    the namespace LIST is complete. MCP-only adapters that omit List metadata,
+    an unavailable continuation credential, repeated tokens, page errors, and
+    the page/item ceilings all return ``complete=False``.
+    """
+    status_code = listing.get("status_code")
+    if listing.get("error") or (
+        isinstance(status_code, int) and not 200 <= status_code < 300
+    ):
+        return [], False
+    payload = _normalize_k8s_payload(listing.get("data"))
+    raw_items = payload.get("items") if isinstance(payload, dict) else None
+    items = [item for item in raw_items or [] if isinstance(item, dict)]
+    if len(items) > _NODE_RESOLUTION_MAX_LIST_ITEMS:
+        return items[:_NODE_RESOLUTION_MAX_LIST_ITEMS], False
+    metadata = payload.get("metadata") if isinstance(payload, dict) else None
+    if not isinstance(metadata, dict):
+        return items, False
+    continuation = str(metadata.get("continue") or "")
+    if not continuation:
+        return items, True
+
+    token = _read_file(settings.kubernetes_token_path)
+    if not token:
+        return items, False
+
+    async def paginate() -> tuple[list[dict], bool]:
+        pages = 1
+        seen_tokens: set[str] = set()
+        verify: bool | str = (
+            settings.kubernetes_ca_path
+            if Path(settings.kubernetes_ca_path).exists()
+            else True
+        )
+        path = f"/api/v1/namespaces/{quote(namespace, safe='')}/pods"
+        next_token = continuation
+        while next_token:
+            if (
+                pages >= _NODE_RESOLUTION_MAX_LIST_PAGES
+                or len(items) >= _NODE_RESOLUTION_MAX_LIST_ITEMS
+                or next_token in seen_tokens
+            ):
+                return items, False
+            seen_tokens.add(next_token)
+            response = await get_json(
+                base_url=settings.kubernetes_api_url,
+                path=path,
+                timeout_seconds=settings.kubernetes_timeout_seconds,
+                params={
+                    "limit": str(settings.kubernetes_list_limit),
+                    "continue": next_token,
+                },
+                headers={"Authorization": f"Bearer {token}"},
+                verify=verify,
+            )
+            if not response.ok:
+                return items, False
+            page = _normalize_k8s_payload(
+                _collector_masker(settings).mask_object(response.data)
+            )
+            page_items = page.get("items") if isinstance(page, dict) else None
+            page_metadata = page.get("metadata") if isinstance(page, dict) else None
+            if not isinstance(page_items, list) or not isinstance(page_metadata, dict):
+                return items, False
+            items.extend(item for item in page_items if isinstance(item, dict))
+            pages += 1
+            if len(items) > _NODE_RESOLUTION_MAX_LIST_ITEMS:
+                del items[_NODE_RESOLUTION_MAX_LIST_ITEMS:]
+                return items, False
+            next_token = str(page_metadata.get("continue") or "")
+        return items, True
+
+    try:
+        # One total continuation deadline prevents a large namespace from
+        # multiplying the ordinary per-request timeout across every page.
+        return await asyncio.wait_for(
+            paginate(), timeout=max(1, settings.kubernetes_timeout_seconds)
+        )
+    except TimeoutError:
+        return items, False
+
+
 async def resolve_live_pod_node(
     settings: Settings,
     namespace: str,
@@ -3035,25 +3204,28 @@ async def resolve_live_pod_node(
             namespace=namespace,
             full_object=True,
         )
-        payload = _normalize_k8s_payload(listing.get("data"))
-        raw_items = payload.get("items") if isinstance(payload, dict) else None
-        items = [item for item in raw_items or [] if isinstance(item, dict)]
+
+        first_payload = _normalize_k8s_payload(listing.get("data"))
+        first_raw_items = (
+            first_payload.get("items") if isinstance(first_payload, dict) else None
+        )
+        first_items = [
+            item for item in first_raw_items or [] if isinstance(item, dict)
+        ]
 
         # A named MCP shortcut can miss fields or race a namespace list.  Trust
-        # the exact list row before considering any replacement.
+        # the exact first-page row before spending time on continuation pages.
         listed_exact = next(
             (
                 item
-                for item in items
+                for item in first_items
                 if _pod_object_matches(item, namespace=namespace, name=pod)
             ),
             None,
         )
         if listed_exact is not None:
-            exact_exists = True
             node = str((listed_exact.get("spec") or {}).get("nodeName") or "")
-            if node:
-                return pod, node
+            return pod, node
 
         # A named GET can remain authoritative when a capped/broken MCP list
         # omitted the exact row.
@@ -3065,7 +3237,29 @@ async def resolve_live_pod_node(
         if exact_exists:
             return pod, ""
 
-        match = _best_live_target_pod(items, names, workload)
+        items, listing_complete = await _node_resolution_pod_items(
+            settings,
+            namespace,
+            listing,
+        )
+        # The named GET and first page can race a replacement. A later exact
+        # row remains authoritative even if the bounded LIST ultimately stops
+        # before proving namespace completeness.
+        listed_exact = next(
+            (
+                item
+                for item in items
+                if _pod_object_matches(item, namespace=namespace, name=pod)
+            ),
+            None,
+        )
+        if listed_exact is not None:
+            node = str((listed_exact.get("spec") or {}).get("nodeName") or "")
+            return pod, node
+
+        match = (
+            _best_live_target_pod(items, names, workload) if listing_complete else None
+        )
         if match is not None:
             live_pod = str((match.get("metadata") or {}).get("name") or "")
             live_node = str((match.get("spec") or {}).get("nodeName") or "")
@@ -4463,6 +4657,153 @@ def _node_conditions(responses: list[dict[str, object]]) -> list[object]:
             if conditions:
                 return [{"node_conditions_healthy": True, "checked": len(conditions)}]
     return []
+
+
+_CAUSE_BEARING_NODE_CONDITIONS = frozenset(
+    {"DiskPressure", "MemoryPressure", "PIDPressure", "NetworkUnavailable"}
+)
+_NODE_CONDITION_TIMESTAMP_FIELDS = ("lastTransitionTime", "lastHeartbeatTime")
+
+
+def _node_condition_artifacts(
+    agent: str,
+    target: AnalysisTarget,
+    responses: list[dict[str, object]],
+    *,
+    time_range: dict[str, str] | None,
+):
+    """Publish condition-value facts without backdating a live Node snapshot.
+
+    The broad Node response remains operator context. A pressure/network
+    condition gets a causal card only while the alert is still firing, or when
+    Kubernetes' own transition/heartbeat timestamp falls inside the incident
+    window. This keeps a condition that became true after a historical incident
+    from explaining that incident, while preserving an exact in-window signal
+    that Warning Events or Prometheus may not have captured.
+    """
+    artifacts = []
+    historical = bool(str(target.resolved_at or "").strip())
+    bounded_window = _valid_node_condition_window(time_range)
+    live_scoped = not historical and bounded_window
+    for response in responses:
+        if response.get("name") != "node" or response.get("error"):
+            continue
+        data = response.get("data")
+        if not isinstance(data, dict):
+            continue
+        node = str(data.get("name") or target.node or "").strip()
+        conditions = data.get("conditions")
+        if not node or not isinstance(conditions, list):
+            continue
+        for condition in conditions:
+            if not isinstance(condition, dict):
+                continue
+            condition_type = str(condition.get("type") or "").strip()
+            if condition_type not in _CAUSE_BEARING_NODE_CONDITIONS:
+                continue
+            raw_status = str(condition.get("status") or "").strip()
+            normalized_status = raw_status.casefold()
+            evidence_window, matched_timestamps = _node_condition_evidence_window(
+                condition, time_range
+            )
+            timestamp_scoped = bool(evidence_window)
+            semantically_known = normalized_status in {"true", "false"}
+            scoped = semantically_known and (live_scoped or timestamp_scoped)
+            if scoped:
+                polarity = "present" if normalized_status == "true" else "absent"
+                coverage = "scoped"
+            else:
+                # Unknown condition states and current snapshots taken while
+                # replaying a resolved incident remain visible, not causal.
+                polarity, coverage = "unknown", "partial"
+            if live_scoped:
+                snapshot_role = "live_incident"
+            elif timestamp_scoped:
+                snapshot_role = "incident_window"
+            else:
+                snapshot_role = "current_context"
+
+            observation: dict[str, object] = {
+                "kind": "kubernetes_node_condition",
+                "predicate": f"kubernetes_node_condition:{condition_type.casefold()}",
+                "polarity": polarity,
+                "coverage": coverage,
+                "observed_entity": {"kind": "node", "name": node},
+                "observation_window": time_range if scoped else {},
+                "snapshot_role": snapshot_role,
+            }
+            if evidence_window:
+                observation["evidence_window"] = evidence_window
+
+            timestamps = {
+                field: str(condition.get(field) or "")
+                for field in _NODE_CONDITION_TIMESTAMP_FIELDS
+                if str(condition.get(field) or "").strip()
+            }
+            matched_at = str(evidence_window.get("end") or "")
+            if scoped:
+                scope_note = (
+                    "live firing snapshot"
+                    if live_scoped and not matched_at
+                    else f"incident timestamp {matched_at}"
+                )
+            else:
+                scope_note = "current context; no condition timestamp overlaps the incident"
+            summary = f"node/{node} {condition_type}={raw_status or 'Unknown'} ({scope_note})."
+            artifacts.append(
+                artifact(
+                    agent=agent,
+                    source="kubernetes",
+                    type="kubernetes_node_condition",
+                    status="ok",
+                    confidence="high" if scoped else "low",
+                    title=f"Kubernetes · node/{node} · {condition_type}",
+                    query=f"{kubectl_repr('nodes', name=node)} -o json",
+                    summary=summary,
+                    result={
+                        "node": node,
+                        "condition": condition_type,
+                        "status": raw_status or "Unknown",
+                        "timestamp_provenance": timestamps,
+                        "matched_incident_timestamps": matched_timestamps,
+                        "observation": observation,
+                    },
+                )
+            )
+    return artifacts
+
+
+def _valid_node_condition_window(time_range: dict[str, str] | None) -> bool:
+    if not time_range:
+        return False
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    return start is not None and end is not None and start <= end
+
+
+def _node_condition_evidence_window(
+    condition: dict[str, object], time_range: dict[str, str] | None
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return exact Kubernetes condition timestamps that overlap the incident."""
+    if not _valid_node_condition_window(time_range):
+        return {}, {}
+    assert time_range is not None
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    assert start is not None and end is not None
+    matched: list[tuple[object, str, str]] = []
+    for field in _NODE_CONDITION_TIMESTAMP_FIELDS:
+        raw = str(condition.get(field) or "").strip()
+        observed_at = parse_incident_time(raw)
+        if observed_at is not None and observed_at.year > 1 and start <= observed_at <= end:
+            matched.append((observed_at, field, raw))
+    if not matched:
+        return {}, {}
+    matched.sort(key=lambda item: item[0])
+    return (
+        {"start": matched[0][2], "end": matched[-1][2]},
+        {field: raw for _, field, raw in matched},
+    )
 
 
 def _runai_control_plane_pods(responses: list[dict[str, object]]) -> dict[str, list[object]]:

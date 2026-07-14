@@ -667,6 +667,29 @@ async def test_official_runai_mcp_uses_project_resources_tool(monkeypatch) -> No
     assert "list_project_resources" in item["query"]
 
 
+@pytest.mark.asyncio
+async def test_official_runai_mcp_preserves_session_setup_failure(monkeypatch) -> None:
+    from app.collectors import runai_mcp
+
+    async def broken_gather(*_args, **_kwargs):
+        raise RuntimeError("self-signed certificate")
+
+    monkeypatch.setattr(runai_mcp, "_gather", broken_gather)
+    results = await runai_mcp.gather_runai_via_mcp(
+        replace(
+            make_settings(),
+            runai_mcp_url="https://runai-mcp:8080/mcp",
+            runai_timeout_seconds=1,
+        ),
+        _toolkit_target(),
+        headers={"Authorization": "Bearer test"},
+    )
+
+    assert results is not None
+    assert results[0]["name"] == "mcp_setup"
+    assert "self-signed certificate" in results[0]["error"]
+
+
 # --- component identity entry point ---------------------------------------------
 
 
