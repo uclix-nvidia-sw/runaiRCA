@@ -292,7 +292,15 @@ def merge_open_world_candidates(
         if family in FAMILIES:
             continue
         mechanism = str(item.get("mechanism") or item.get("statement") or "").strip()
-        support = _fact_ids(item.get("support_evidence_ids") or item.get("evidence_for"))
+        # An investigator can cite the same response-local E-id more than once
+        # while revising a hypothesis.  Citations are references, not separate
+        # observations, so preserve their first occurrence only.  More
+        # importantly, several different query cards can expose the same
+        # underlying telemetry plane; their number must not improve an
+        # open-world candidate's rank over independently observed evidence.
+        support = list(
+            dict.fromkeys(_fact_ids(item.get("support_evidence_ids") or item.get("evidence_for")))
+        )
         contradict = _fact_ids(
             item.get("contradiction_evidence_ids") or item.get("evidence_against")
         )
@@ -313,7 +321,12 @@ def merge_open_world_candidates(
             RankedCause(
                 family=slug,
                 confidence=confidence,
-                score=float(len(independent) * 3 + len(support)),
+                # Corroboration strength is the number of independent
+                # telemetry planes, not the number of query replicas from one
+                # plane.  Keeping ``len(support)`` in this score let an LLM
+                # promote a candidate merely by repeatedly citing Loki (or
+                # several views of the Kubernetes API).
+                score=float(len(independent) * 3),
                 rationale=[mechanism],
                 evidence_agents=sorted(independent),
                 mechanism=mechanism,
@@ -325,7 +338,7 @@ def merge_open_world_candidates(
                 contradiction_evidence_ids=contradict,
                 rank_basis=[
                     f"{len(independent)} independent source groups",
-                    f"{len(support)} supporting observations",
+                    f"{len(support)} distinct supporting evidence IDs",
                     "discriminating hypothesis marked supported",
                 ],
             )

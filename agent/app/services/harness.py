@@ -207,6 +207,7 @@ def evaluate(
     support_ids = [link.fact_id for link in claim_links if link.role == "support"]
     contradiction_ids = [link.fact_id for link in claim_links if link.role == "contradict"]
     traced_ids = [*support_ids, *contradiction_ids]
+    support_source_groups = {_independence_key(item) for item in supporting}
     signature = _signature_support(top)
     confidence = str(getattr(top, "confidence", "low") or "low")
     insufficient = not family or family == "insufficient_evidence"
@@ -215,7 +216,7 @@ def evaluate(
         "unsupported_high_confidence": bool(
             not insufficient
             and confidence == "high"
-            and len({_independence_key(item) for item in supporting}) < 2
+            and len(support_source_groups) < 2
             and not signature
         ),
         "missing_evidence_trace": bool(
@@ -270,6 +271,7 @@ def evaluate(
         response,
         candidates,
         support_ids,
+        support_source_groups,
         next_check=next_check,
         unsafe=gates["unsafe_action_without_guardrail"],
     )
@@ -528,6 +530,7 @@ def _dimension_scores(
     response: AlertAnalysisResponse,
     candidates: list[RankedCause],
     support_ids: list[str],
+    support_source_groups: set[str],
     *,
     next_check: str,
     unsafe: bool,
@@ -539,7 +542,12 @@ def _dimension_scores(
         "evidence_grounding": 5 if support_ids else 0,
         "diagnostic_reasoning": 4 if len(candidates) > 1 else 2,
         "investigation_plan": 5 if next_check else (3 if "check" in detail or "확인" in detail else 1),
-        "uncertainty_calibration": 5 if confidence != "high" or len(support_ids) >= 2 else 2,
+        # Repeating an observation from the same collector is useful trace
+        # detail, but it does not corroborate a high-confidence conclusion.
+        # This rubric must agree with the high-confidence gate above instead
+        # of awarding a perfect calibration score for two Loki/Kubernetes
+        # query replicas.
+        "uncertainty_calibration": 5 if confidence != "high" or len(support_source_groups) >= 2 else 2,
         "operational_usefulness": 4 if "action" in detail or "조치" in detail else 2,
         "safety": 0 if unsafe else 5,
     }

@@ -79,6 +79,38 @@ def test_open_world_candidate_requires_known_independence_provenance() -> None:
     assert any(candidate.novelty == "open_world" for candidate in verified)
 
 
+def test_open_world_query_replicas_cannot_inflate_score() -> None:
+    """Many cards from one telemetry plane are not stronger corroboration."""
+    known = [RankedCause("insufficient_evidence", "low", 0.0)]
+    ledger = [
+        {
+            "id": "H-replicas",
+            "mechanism": "Repeated Loki query cards report one mount failure",
+            "status": "supported",
+            # Include an exact duplicate too: an LLM retry must not create a
+            # second supporting observation just by repeating an E-id.
+            "support_evidence_ids": ["E01", "E01", "E02", "E03", "E04"],
+        },
+    ]
+
+    merged = merge_open_world_candidates(
+        known,
+        ledger,
+        fact_groups={
+            "E01": "loki",
+            "E02": "loki",
+            "E03": "loki",
+            "E04": "prometheus",
+        },
+        enabled=True,
+    )
+    candidate = next(item for item in merged if item.novelty == "open_world")
+
+    assert candidate.support_evidence_ids == ["E01", "E02", "E03", "E04"]
+    assert candidate.score == 6.0
+    assert candidate.confidence == "medium"
+
+
 def test_catalog_high_confidence_collapses_change_and_kubernetes_source_group() -> None:
     """Two readers of the Kubernetes API are not independent corroboration."""
     score = _Score(

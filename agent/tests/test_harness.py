@@ -164,6 +164,35 @@ def test_high_confidence_does_not_count_two_kubernetes_api_views_as_independent(
     assert verdict.gates["unsupported_high_confidence"] is True
 
 
+def test_high_confidence_query_replicas_do_not_receive_full_calibration_score() -> None:
+    """Two E-ids from Loki are trace detail, not independent corroboration."""
+    result = _result("loki")
+    replica = artifact(
+        agent="loki",
+        source="loki",
+        type="logs",
+        status="ok",
+        confidence="high",
+        summary="NVRM Xid 79",
+        result={"observation": {"polarity": "present", "coverage": "scoped"}},
+    )
+    result.artifacts.extend([replica])
+    result.artifacts[0].result = {
+        "observation": {"polarity": "present", "coverage": "scoped"}
+    }
+    assign_evidence_ids([result])
+
+    verdict = evaluate(
+        _response(),
+        [result],
+        [RankedCause("gpu_hardware_error", "high", 9, evidence_agents=["loki"])],
+    )
+
+    assert verdict.claims[0]["supporting_evidence"] == ["E01", "E02"]
+    assert verdict.gates["unsupported_high_confidence"] is True
+    assert verdict.dimensions["uncertainty_calibration"] == 2
+
+
 def test_dangerous_action_is_repaired_with_a_preceding_guardrail() -> None:
     response = _response("## Recommended Actions\n\n- kubectl delete pod broken-pod")
     assert evaluate(response, [], []).gates["unsafe_action_without_guardrail"] is True
