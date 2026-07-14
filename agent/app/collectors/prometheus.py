@@ -478,32 +478,19 @@ def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
     zero. Preserve a bounded per-series timeline plus aggregate extrema rather
     than asking the ranker to infer state from raw samples.
     """
+    # Keep only a few labelled series for the artifact UI, but aggregate every
+    # returned series for the RCA verdict. A fourth target must not be able to
+    # hide a scrape outage or a counter change behind three healthy examples.
     summaries: list[dict[str, object]] = []
+    all_series: list[dict[str, object]] = []
     all_values: list[float] = []
-    for item in result_data[:3]:
+    for index, item in enumerate(result_data):
         if not isinstance(item, dict):
             continue
         samples = _prometheus_samples(item)
         numeric = [value for _, value in samples if value is not None]
         all_values.extend(numeric)
-        metric = item.get("metric") if isinstance(item.get("metric"), dict) else {}
-        labels = {
-            str(key): str(metric[key])
-            for key in sorted(metric)
-            if key
-            in {
-                "namespace",
-                "pod",
-                "container",
-                "node",
-                "phase",
-                "condition",
-                "project",
-                "queue",
-            }
-        }
         summary: dict[str, object] = {
-            "labels": labels,
             "sample_count": len(samples),
             "numeric_sample_count": len(numeric),
         }
@@ -530,9 +517,42 @@ def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
                     current != previous
                     for previous, current in zip(numeric, numeric[1:], strict=False)
                 )
-        summaries.append(summary)
+        all_series.append(summary)
+        if index < 3:
+            metric = item.get("metric") if isinstance(item.get("metric"), dict) else {}
+            summary = {
+                **summary,
+                "labels": {
+                    str(key): str(metric[key])
+                    for key in sorted(metric)
+                    if key
+                    in {
+                        "namespace",
+                        "pod",
+                        "container",
+                        "node",
+                        "phase",
+                        "condition",
+                        "project",
+                        "queue",
+                    }
+                },
+            }
+            summaries.append(summary)
     aggregate: dict[str, object] = {
         "series": summaries,
+        # These compact bounds cover every returned series. They are evidence
+        # metadata only; labelled samples above remain intentionally bounded.
+        "sample_windows": [
+            {
+                key: summary[key]
+                for key in ("first_timestamp", "last_timestamp")
+                if key in summary
+            }
+            for summary in all_series
+        ],
+        "series_count_observed": len(all_series),
+        "sample_timestamp_verification_required": True,
         "numeric_sample_count": len(all_values),
     }
     if all_values:
@@ -544,10 +564,10 @@ def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
                 "nonzero_sample_count": sum(value != 0 for value in all_values),
                 "all_zero": all(value == 0 for value in all_values),
                 "series_with_multiple_samples": sum(
-                    int(item.get("numeric_sample_count") or 0) >= 2 for item in summaries
+                    int(item.get("numeric_sample_count") or 0) >= 2 for item in all_series
                 ),
                 "any_series_changed_during_window": any(
-                    item.get("changed_during_window") is True for item in summaries
+                    item.get("changed_during_window") is True for item in all_series
                 ),
             }
         )
@@ -614,7 +634,10 @@ def _has_prometheus_samples(
     summary = item.get("value_summary")
     if not isinstance(summary, dict) or int(summary.get("numeric_sample_count") or 0) <= 0:
         return False
-    return _prometheus_samples_in_window(summary, time_range) is not False
+    verified = _prometheus_samples_in_window(summary, time_range)
+    if summary.get("sample_timestamp_verification_required") is True:
+        return verified is True
+    return verified is not False
 
 
 def _prometheus_query_observation(
@@ -624,6 +647,7 @@ def _prometheus_query_observation(
     name = str(item.get("name") or "metric")
     value_summary = item.get("value_summary")
     summary = value_summary if isinstance(value_summary, dict) else {}
+    sample_window_verified = _prometheus_samples_in_window(summary, time_range)
     if item.get("error"):
         polarity, coverage = "unavailable", "unknown"
     else:
@@ -634,11 +658,6 @@ def _prometheus_query_observation(
             # An unbounded/current metric lookup can help an operator, but it
             # cannot prove a signal was absent (or causal) during a historical
             # incident. Keep every such answer as context-only.
-            polarity, coverage = "unknown", "partial"
-        elif _prometheus_samples_in_window(summary, time_range) is False:
-            # Grafana MCP/proxies can accept a range-shaped request but return
-            # a current instant vector. Never relabel that live sample as
-            # incident evidence merely because the client requested a window.
             polarity, coverage = "unknown", "partial"
         elif name in _CONTEXT_ONLY_METRICS:
             polarity, coverage = "unknown", "partial"
@@ -652,7 +671,18 @@ def _prometheus_query_observation(
             else:
                 polarity, coverage = "unknown", "partial"
         elif series_count == 0:
+            # An empty range response has no sample timestamp to inspect, but
+            # remains a direct answer to the bounded query. Keep its existing
+            # absence semantics; non-empty replies must prove their timing.
             polarity, coverage = "absent", "scoped"
+        elif sample_window_verified is False or (
+            summary.get("sample_timestamp_verification_required") is True
+            and sample_window_verified is not True
+        ):
+            # Grafana MCP/proxies can accept a range-shaped request but return
+            # a current instant vector. Never relabel that live sample as
+            # incident evidence merely because the client requested a window.
+            polarity, coverage = "unknown", "partial"
         elif numeric_count == 0:
             polarity, coverage = "unknown", "partial"
         elif name == "prometheus_up":
@@ -694,7 +724,7 @@ def _prometheus_query_observation(
             else 0
         ),
         "observation_window": time_range or {},
-        "sample_window_verified": _prometheus_samples_in_window(summary, time_range),
+        "sample_window_verified": sample_window_verified,
     }
 
 
@@ -714,7 +744,9 @@ def _prometheus_samples_in_window(
     if start is None or end is None or end < start:
         return None
     timestamps: list[datetime] = []
-    series = value_summary.get("series")
+    series = value_summary.get("sample_windows")
+    if not isinstance(series, list):
+        series = value_summary.get("series")
     for item in series if isinstance(series, list) else []:
         if not isinstance(item, dict):
             continue

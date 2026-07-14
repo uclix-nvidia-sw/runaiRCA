@@ -202,6 +202,46 @@ def test_prometheus_out_of_window_sample_is_not_incident_evidence() -> None:
     assert observation["sample_window_verified"] is False
 
 
+def test_prometheus_verdict_uses_all_series_not_only_display_samples() -> None:
+    summary = prometheus._prometheus_value_summary(
+        [
+            {
+                "metric": {"pod": f"healthy-{index}"},
+                "values": [["2026-07-10T01:00:00Z", "1"]],
+            }
+            for index in range(3)
+        ]
+        + [
+            {
+                "metric": {"pod": "scrape-failed"},
+                "values": [["2026-07-10T01:00:00Z", "0"]],
+            }
+        ]
+    )
+    observation = prometheus._prometheus_query_observation(
+        {"name": "prometheus_up", "series_count": 4, "value_summary": summary},
+        time_range={"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"},
+    )
+
+    assert len(summary["series"]) == 3
+    assert summary["series_count_observed"] == 4
+    assert summary["zero_sample_count"] == 1
+    assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
+
+
+def test_prometheus_timestamp_less_historical_sample_is_context_only() -> None:
+    summary = prometheus._prometheus_value_summary(
+        [{"metric": {"pod": "trainer-0"}, "values": [["", "1"]]}]
+    )
+    observation = prometheus._prometheus_query_observation(
+        {"name": "node_memory_pressure", "series_count": 1, "value_summary": summary},
+        time_range={"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"},
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert observation["sample_window_verified"] is None
+
+
 def test_prometheus_up_marks_a_mixed_vector_with_any_down_target_present() -> None:
     up_failure = prometheus._prometheus_query_observation(
         {
