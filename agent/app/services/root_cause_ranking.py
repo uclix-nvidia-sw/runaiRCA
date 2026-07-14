@@ -22,6 +22,7 @@ import hashlib
 import os
 import re
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -149,7 +150,9 @@ _NODE_CONDITION_TOKENS = (
 )
 
 
-def _node_condition_present(results: list[CollectorResult]) -> bool:
+def _node_condition_present(
+    results: list[CollectorResult], *, eligible_evidence_ids: set[str] | None = None
+) -> bool:
     """True when a real node-condition/eviction signal is present.
 
     P3: the R1 blast force-high must be backed by an ACTUAL node condition, not
@@ -172,7 +175,10 @@ def _node_condition_present(results: list[CollectorResult]) -> bool:
         if agent == "kubernetes":
             # ``_result_text`` excludes broad current Node snapshots once the
             # collector publishes structured observations.
-            if _keyword_hits(_result_text(r), list(_NODE_CONDITION_TOKENS))[0]:
+            if _keyword_hits(
+                _result_text(r, eligible_evidence_ids=eligible_evidence_ids),
+                list(_NODE_CONDITION_TOKENS),
+            )[0]:
                 return True
         elif agent == "prometheus":
             # Prometheus carries no raw node object. Its metric-LABEL identity is
@@ -181,7 +187,10 @@ def _node_condition_present(results: list[CollectorResult]) -> bool:
             # literals are pruned from _result_text (METADATA_VALUE_KEYS subtree
             # drop). A hit here therefore comes from the collector's own SUMMARY
             # (e.g. "MemoryPressure=true"), which is a real, negation-aware signal.
-            if _keyword_hits(_result_text(r), list(_NODE_CONDITION_TOKENS))[0]:
+            if _keyword_hits(
+                _result_text(r, eligible_evidence_ids=eligible_evidence_ids),
+                list(_NODE_CONDITION_TOKENS),
+            )[0]:
                 return True
     return False
 
@@ -365,6 +374,7 @@ def rank_root_cause_candidates(
     depends_on_chain: list[str] | None = None,
     lifecycle: dict[str, Any] | None = None,
     graph_candidate_counts: dict[str, int] | None = None,
+    eligible_evidence_ids: set[str] | None = None,
 ) -> list[RankedCause]:
     """Rank failure families for THIS incident from collector evidence.
 
@@ -383,7 +393,10 @@ def rank_root_cause_candidates(
     ``lifecycle`` leaves ranking unchanged (backward compatible).
     """
     top_n = max(1, top_n)
-    text_by_agent = {r.agent: _result_text(r) for r in results}
+    text_by_agent = {
+        r.agent: _result_text(r, eligible_evidence_ids=eligible_evidence_ids)
+        for r in results
+    }
     status_by_agent = {r.agent: r.status for r in results}
     blast, blast_agents = _kg_blast_radius(results)
     # TypeDB topology is a current/reference graph, not an incident-window
@@ -416,7 +429,9 @@ def rank_root_cause_candidates(
         occurrence_count,
         component_family,
         lifecycle_active=bool(lifecycle and lifecycle.get("active")),
-        node_condition=_node_condition_present(results),
+        node_condition=_node_condition_present(
+            results, eligible_evidence_ids=eligible_evidence_ids
+        ),
     )
 
     # Topology identity: the alert TARGET itself IS a known platform component.
@@ -441,7 +456,7 @@ def rank_root_cause_candidates(
             if (
                 factor is not None
                 and s.points > 0
-                and _has_typed_incident_observation(results, s.agents)
+                and _has_typed_incident_observation(target, results, s.agents)
             ):
                 s.points *= factor
                 s.rationale.append(f"feedback prior adjusted score x{factor:.2f}")
@@ -736,7 +751,9 @@ COLLECTOR_TEXT_DROP_KEYS: dict[str, frozenset[str]] = {
 _RANKING_TEXT_DROP_KEYS = COLLECTOR_TEXT_DROP_KEYS  # backward-compatible alias
 
 
-def _result_text(result: CollectorResult) -> str:
+def _result_text(
+    result: CollectorResult, *, eligible_evidence_ids: set[str] | None = None
+) -> str:
     if not _collector_is_evidence(result):
         return ""
     drop_keys = _RANKING_TEXT_DROP_KEYS.get(getattr(result, "agent", ""))
@@ -751,7 +768,7 @@ def _result_text(result: CollectorResult) -> str:
     if structured:
         parts: list[str] = []
         for art in structured:
-            if not _artifact_is_evidence(art):
+            if not _artifact_is_evidence(art, eligible_evidence_ids=eligible_evidence_ids):
                 continue
             if art.summary:
                 parts.append(art.summary)
@@ -776,16 +793,26 @@ def _collector_is_evidence(result: CollectorResult) -> bool:
     return result.status in ("ok", "partial")
 
 
-def _artifact_is_evidence(art: object) -> bool:
+def _artifact_is_evidence(
+    art: object, *, eligible_evidence_ids: set[str] | None = None
+) -> bool:
     if getattr(art, "status", "") not in ("ok", "partial"):
         return False
     observation = _artifact_observation(art)
     if observation is None:
         return True
-    return (
+    scoped_positive = (
         str(observation.get("polarity") or "") == "present"
         and str(observation.get("coverage") or "") == "scoped"
     )
+    if not scoped_positive:
+        return False
+    # The pipeline calculates a stricter target/time/run eligibility verdict
+    # after normalizing artifacts onto the blackboard.  A typed card can be
+    # scoped for its own query yet still belong to a different entity or a
+    # post-resolution epilogue.  Once that verdict is available, the catalog
+    # ranker must not reintroduce the card through its raw text scan.
+    return eligible_evidence_ids is None or str(getattr(art, "evidence_id", "")) in eligible_evidence_ids
 
 
 def _artifact_observation(art: object) -> dict[str, object] | None:
@@ -797,7 +824,9 @@ def _artifact_observation(art: object) -> dict[str, object] | None:
 
 
 def _has_typed_incident_observation(
-    results: list[CollectorResult], candidate_agents: set[str]
+    target: AnalysisTarget,
+    results: list[CollectorResult],
+    candidate_agents: set[str],
 ) -> bool:
     """Whether feedback has a scoped observation from this incident to nudge.
 
@@ -806,6 +835,24 @@ def _has_typed_incident_observation(
     summary nor a card explicitly marked as a historical prior is enough to
     make that feedback relevant to the current incident.
     """
+    # A prior is deliberately weaker than live telemetry.  It may only adjust
+    # a score when a typed observation names this incident's resource and
+    # actually occurred inside the alert interval.  Checking just the nested
+    # polarity/coverage envelope let a stale query result (or another Pod's
+    # result returned by a broad query) amplify the current candidate.
+    fired_at = str(target.fired_at or "").strip()
+    resolved_at = str(target.resolved_at or "").strip()
+    entities = _target_entity_tokens(target)
+    if not (fired_at and resolved_at and entities):
+        return False
+
+    from app.services.evidence_blackboard import EvidenceEligibility, normalize_artifact
+
+    context = {
+        "window_start": fired_at,
+        "window_end": resolved_at,
+        "entities": entities,
+    }
     for result in results:
         if result.agent not in candidate_agents:
             continue
@@ -820,12 +867,48 @@ def _has_typed_incident_observation(
                 and payload.get("historical_prior") is True
             ):
                 continue
-            if (
-                str(observation.get("polarity") or "") == "present"
-                and str(observation.get("coverage") or "") == "scoped"
-            ):
+            # Do not inherit the pipeline target for a feedback gate. A
+            # collector must identify the observed entity itself; otherwise a
+            # broad namespace/live result can be relabelled as this Pod.
+            if not _declares_observed_entity(observation):
+                continue
+            try:
+                fact = normalize_artifact(card, require_typed_observation=True)
+            except Exception:  # noqa: BLE001 - malformed evidence cannot ground a prior
+                continue
+            if EvidenceEligibility.from_fact(fact, context=context).support:
                 return True
     return False
+
+
+def _declares_observed_entity(observation: Mapping[str, object]) -> bool:
+    """Whether a typed observation owns its resource identity explicitly."""
+    entity = observation.get("observed_entity", observation.get("entity"))
+    if isinstance(entity, Mapping):
+        return bool(
+            str(entity.get("kind") or entity.get("type") or "").strip()
+            and str(entity.get("name") or entity.get("id") or "").strip()
+        )
+    return isinstance(entity, str) and bool(entity.strip())
+
+
+def _target_entity_tokens(target: AnalysisTarget) -> list[str]:
+    """Return the concrete alert identities allowed to ground a prior boost."""
+    return [
+        f"{field}:{value}"
+        for field in (
+            "pod",
+            "node",
+            "workload_name",
+            "runai_workload_id",
+            "project",
+            "queue",
+            "namespace",
+            "storage_claim",
+            "service",
+        )
+        if (value := str(getattr(target, field, "") or "").strip())
+    ]
 
 
 def _leaf_text(value: Any, drop_keys: "frozenset[str] | set[str] | None" = None) -> str:

@@ -257,6 +257,43 @@ def test_structured_scoped_artifact_remains_available_to_keyword_ranker() -> Non
     assert "evicted" in _result_text(_r("kubernetes", artifacts=[scoped]))
 
 
+def test_context_ineligible_typed_artifact_cannot_reenter_catalog_ranking() -> None:
+    """A scoped query result can still be outside this alert's causal window.
+
+    The pipeline supplies the blackboard's response-local eligibility set after
+    target/time/run validation.  The ranker must honor that set instead of
+    treating the raw card's scoped query coverage as causal permission.
+    """
+    stale = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="warning_event",
+        status="ok",
+        confidence="high",
+        summary="Evicted workload after the resolved incident.",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "evidence_window": {
+                    "start": "2026-07-10T02:00:00Z",
+                    "end": "2026-07-10T02:01:00Z",
+                },
+            },
+            "events": [{"reason": "Evicted"}],
+        },
+    )
+    stale.evidence_id = "E01"
+    result = _r("kubernetes", artifacts=[stale])
+
+    assert "evicted" in _result_text(result)
+    assert _result_text(result, eligible_evidence_ids=set()) == ""
+    ranked = rank_root_cause_candidates(
+        _target(), [result], eligible_evidence_ids=set()
+    )
+    assert ranked[0].family == "insufficient_evidence"
+
+
 def test_feedback_prior_requires_typed_current_incident_observation() -> None:
     # Feedback is constructed from a *prior* incident.  A legacy free-text
     # result can still be useful operator context, but it must not receive a
@@ -271,6 +308,10 @@ def test_feedback_prior_requires_typed_current_incident_observation() -> None:
     assert legacy_control.score == 2.0
     assert not any("feedback prior" in reason for reason in legacy_control.rationale)
 
+    target = _target(
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
     current = artifact(
         agent="kubernetes",
         source="kubernetes",
@@ -282,22 +323,70 @@ def test_feedback_prior_requires_typed_current_incident_observation() -> None:
             "observation": {
                 "polarity": "present",
                 "coverage": "scoped",
+                "observed_entity": {"kind": "pod", "name": target.pod},
                 "observation_window": {
                     "start": "2026-07-10T00:55:00Z",
                     "end": "2026-07-10T01:15:00Z",
+                },
+                "evidence_window": {
+                    "start": "2026-07-10T01:04:00Z",
+                    "end": "2026-07-10T01:04:00Z",
                 },
             }
         },
     )
     typed = _r("kubernetes", artifacts=[current])
     grounded = rank_root_cause_candidates(
-        _target(), [typed], priors={"runai_control_plane_error": 1.5}
+        target, [typed], priors={"runai_control_plane_error": 1.5}
     )
     grounded_control = next(
         cause for cause in grounded if cause.family == "runai_control_plane_error"
     )
     assert grounded_control.score == 3.0
     assert any("feedback prior" in reason for reason in grounded_control.rationale)
+
+
+def test_feedback_prior_rejects_other_entity_or_out_of_incident_observation() -> None:
+    """Typed metadata alone cannot make feedback corroborate this incident."""
+    target = _target(
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+
+    def scoped_artifact(*, pod: str, at: str):
+        return artifact(
+            agent="kubernetes",
+            source="kubernetes",
+            type="warning_event",
+            status="ok",
+            confidence="high",
+            summary="runai-backend reconcile failed",
+            result={
+                "observation": {
+                    "polarity": "present",
+                    "coverage": "scoped",
+                    "observed_entity": {"kind": "pod", "name": pod},
+                    "observation_window": {
+                        "start": "2026-07-10T00:55:00Z",
+                        "end": "2026-07-10T01:15:00Z",
+                    },
+                    "evidence_window": {"start": at, "end": at},
+                }
+            },
+        )
+
+    for item in (
+        scoped_artifact(pod="other-pod", at="2026-07-10T01:04:00Z"),
+        scoped_artifact(pod=target.pod, at="2026-07-10T01:14:00Z"),
+    ):
+        ranked = rank_root_cause_candidates(
+            target,
+            [_r("kubernetes", artifacts=[item])],
+            priors={"runai_control_plane_error": 1.5},
+        )
+        control = next(cause for cause in ranked if cause.family == "runai_control_plane_error")
+        assert control.score == 2.0
+        assert not any("feedback prior" in reason for reason in control.rationale)
 
 
 def test_postgres_prior_history_cannot_create_current_catalog_cause() -> None:
