@@ -107,6 +107,31 @@ def test_independence_counts_underlying_source_not_agent() -> None:
     assert board.has_independent_support([first.fact_id, third.fact_id])
 
 
+def test_independence_excludes_positive_partial_coverage() -> None:
+    scoped = normalize_artifact(
+        _artifact(source="kubernetes", agent="kubernetes", summary="Pod was Evicted")
+    )
+    partial = normalize_artifact(
+        _artifact(
+            source="prometheus",
+            agent="prometheus",
+            summary="Memory usage was high in an incomplete sample window",
+            status="partial",
+            result={
+                "observation": {
+                    "kind": "metric",
+                    "polarity": "present",
+                    "coverage": "partial",
+                }
+            },
+        )
+    )
+    board = EvidenceBlackboard([scoped, partial])
+
+    assert board.independence_groups([scoped.fact_id, partial.fact_id]) == {"kubernetes_api"}
+    assert not board.has_independent_support([scoped.fact_id, partial.fact_id])
+
+
 def test_blackboard_deduplicates_stable_fact_ids() -> None:
     fact = normalize_artifact(_artifact(), entity="pod/trainer-0")
     duplicate = normalize_artifact(_artifact(), entity="pod/trainer-0")

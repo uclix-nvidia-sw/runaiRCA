@@ -286,11 +286,17 @@ class EvidenceBlackboard:
         return tuple(self._facts[fact_id] for fact_id in sorted(self._facts))
 
     def independence_groups(self, fact_ids: Iterable[str]) -> frozenset[str]:
-        """Return groups contributing observed support, excluding unknown gaps."""
+        """Return groups with fully scoped observed support.
+
+        A positive result from a partial or unknown coverage probe is useful
+        context, but cannot corroborate a hypothesis independently.
+        """
         return frozenset(
             fact.independence_group
             for fact_id in fact_ids
-            if (fact := self._facts.get(fact_id)) is not None and fact.polarity == "present"
+            if (fact := self._facts.get(fact_id)) is not None
+            and fact.polarity == "present"
+            and fact.coverage == "scoped"
         )
 
     def has_independent_support(self, fact_ids: Iterable[str], *, minimum: int = 2) -> bool:
