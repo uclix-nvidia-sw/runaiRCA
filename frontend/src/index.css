@@ -2971,6 +2971,84 @@ td span.occurrence-pill {
   font-weight: 700;
 }
 
+.evidence-interpretation {
+  margin-top: 0.65rem;
+  border: 1px solid #d9e5cd;
+  border-left: 3px solid var(--nvidia);
+  border-radius: 0.35rem;
+  background: #fbfdf8;
+  padding: 0.55rem 0.65rem;
+}
+
+.evidence-interpretation-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  color: #344054;
+  font-size: 0.78rem;
+}
+
+.evidence-interpretation-head strong {
+  font-weight: 800;
+}
+
+.evidence-typed,
+.evidence-untyped {
+  border-radius: 999px;
+  padding: 0.1rem 0.4rem;
+  font-size: 0.66rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.evidence-typed {
+  background: #e9f7de;
+  color: #2c6515;
+}
+
+.evidence-untyped {
+  background: #fef3c7;
+  color: #854d0e;
+}
+
+.evidence-interpretation dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.45rem 0.75rem;
+  margin: 0.5rem 0 0;
+}
+
+.evidence-interpretation dl > div {
+  min-width: 0;
+}
+
+.evidence-interpretation-wide {
+  grid-column: 1 / -1;
+}
+
+.evidence-interpretation dt {
+  color: #667085;
+  font-size: 0.68rem;
+  font-weight: 750;
+}
+
+.evidence-interpretation dd {
+  margin: 0.08rem 0 0;
+  overflow-wrap: anywhere;
+  color: #344054;
+  font-size: 0.74rem;
+  font-weight: 700;
+}
+
+.evidence-limitation {
+  margin: 0.6rem 0 0;
+  color: #7a4a08;
+  font-size: 0.74rem;
+  line-height: 1.4;
+}
+
 .artifact pre {
   max-height: 16rem;
   overflow: auto;

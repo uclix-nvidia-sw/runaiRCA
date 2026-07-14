@@ -87,6 +87,7 @@ import {
 } from '../utils/formatters';
 import { RealtimeEventPayload } from '../utils/realtime';
 import { hashForDetail, hashForView, routeFromHash } from '../utils/routing';
+import { evidenceMetadata, type EvidenceMetadata, type EvidenceWindow } from '../utils/evidenceMetadata';
 
 function errorMessage(err: unknown, fallback: string) {
   return err instanceof Error ? err.message : fallback;
@@ -1444,6 +1445,7 @@ function ArtifactResult({ artifact }: { artifact: Artifact }) {
   const [open, setOpen] = useState(false);
   const queryItems = queryDisplayItems(artifact.result);
   const resultText = artifact.result !== undefined ? formatArtifactValue(compactArtifactValue(artifact.result)) : '';
+  const evidence = evidenceMetadata(artifact.result);
   return (
     <div className="artifact">
       <button className="artifact-toggle compact-artifact-toggle" onClick={() => setOpen((value) => !value)} type="button">
@@ -1461,6 +1463,7 @@ function ArtifactResult({ artifact }: { artifact: Artifact }) {
           <div className="artifact-summary">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{artifact.summary ?? ''}</ReactMarkdown>
           </div>
+          <EvidenceInterpretation evidence={evidence} />
           {queryItems.length > 0 ? (
             <QueryResultList items={queryItems} highlights={artifact.highlights} />
           ) : (
@@ -1480,6 +1483,86 @@ function ArtifactResult({ artifact }: { artifact: Artifact }) {
       )}
     </div>
   );
+}
+
+function EvidenceInterpretation({
+  evidence,
+}: {
+  evidence: ReturnType<typeof evidenceMetadata>;
+}) {
+  if (evidence === null) {
+    return (
+      <p className="evidence-limitation">
+        이 아티팩트에는 형식화된 관측 메타데이터가 없습니다. 단독으로 인과관계를 확정하는 근거로 사용하지 마세요.
+      </p>
+    );
+  }
+  return (
+    <section className="evidence-interpretation" aria-label="Evidence interpretation">
+      <div className="evidence-interpretation-head">
+        <strong>증거 해석</strong>
+        <span className={evidence.typed ? 'evidence-typed' : 'evidence-untyped'}>
+          {evidence.typed ? '형식화된 관측' : '불완전한 메타데이터'}
+        </span>
+      </div>
+      <dl>
+        <div>
+          <dt>판정</dt>
+          <dd>{evidencePolarityLabel(evidence.polarity)}</dd>
+        </div>
+        <div>
+          <dt>범위</dt>
+          <dd>{evidenceCoverageLabel(evidence.coverage)}</dd>
+        </div>
+        {evidence.entity && (
+          <div className="evidence-interpretation-wide">
+            <dt>관측 대상</dt>
+            <dd>{evidence.entity}</dd>
+          </div>
+        )}
+        {evidence.evidenceWindow && (
+          <div className="evidence-interpretation-wide">
+            <dt>신호 발생 시점</dt>
+            <dd>{formatEvidenceWindow(evidence.evidenceWindow)}</dd>
+          </div>
+        )}
+        {evidence.observationWindow && (
+          <div className="evidence-interpretation-wide">
+            <dt>조회 범위</dt>
+            <dd>{formatEvidenceWindow(evidence.observationWindow)}</dd>
+          </div>
+        )}
+      </dl>
+      {!evidence.typed && (
+        <p className="evidence-limitation">
+          불완전한 관측 메타데이터는 진단 맥락일 뿐, 단독 인과 근거가 아닙니다.
+        </p>
+      )}
+    </section>
+  );
+}
+
+function formatEvidenceWindow(window: EvidenceWindow) {
+  const start = formatTime(window.start);
+  const end = formatTime(window.end);
+  return start === end ? start : `${start} – ${end}`;
+}
+
+function evidencePolarityLabel(value: EvidenceMetadata['polarity']) {
+  return {
+    present: '신호 확인됨',
+    absent: '신호 없음',
+    unavailable: '조회 불가',
+    unknown: '판정 불가',
+  }[value || 'unknown'];
+}
+
+function evidenceCoverageLabel(value: EvidenceMetadata['coverage']) {
+  return {
+    scoped: '대상·시간 범위 확인됨',
+    partial: '부분 범위',
+    unknown: '범위 미확인',
+  }[value || 'unknown'];
 }
 
 function QueryResultList({ items, highlights }: { items: QueryDisplayItem[]; highlights?: string[] }) {
