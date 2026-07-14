@@ -245,6 +245,11 @@ def test_k8s_describe_uses_mcp_full_pod_and_filters_its_events(monkeypatch) -> N
     assert calls[0] == "resources_get"
     assert "events_list" in calls or "resources_list" in calls
     assert result["object"]["spec"]["containers"][0]["env"][0]["value"] == "[MASKED]"
+    assert result["observed_entity"] == {
+        "kind": "pod",
+        "name": "worker-0",
+        "namespace": "team-a",
+    }
     assert [event["reason"] for event in result["events"]] == ["OOMKilled"]
 
 

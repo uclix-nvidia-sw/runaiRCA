@@ -104,6 +104,11 @@ async def test_k8s_exec_streams_an_allowlisted_command(monkeypatch) -> None:
 
     assert result["error"] is None
     assert result["output"] == "GPU 0\n"
+    assert result["observed_entity"] == {
+        "kind": "pod",
+        "name": "trainer-0",
+        "namespace": "runai",
+    }
     assert calls == [
         {
             "namespace": "runai",
@@ -113,6 +118,18 @@ async def test_k8s_exec_streams_an_allowlisted_command(monkeypatch) -> None:
             "token": "service-account-token",
         }
     ]
+
+
+def test_exec_probe_aggregate_requires_one_verified_pod_identity() -> None:
+    from app.collectors.kubernetes import _exec_probes_observed_entity
+
+    entity = {"kind": "pod", "name": "trainer-0", "namespace": "runai"}
+    assert _exec_probes_observed_entity(
+        [{"observed_entity": entity}, {"observed_entity": dict(entity)}]
+    ) == entity
+    assert _exec_probes_observed_entity(
+        [{"observed_entity": entity}, {"observed_entity": {"kind": "pod", "name": "other"}}]
+    ) is None
 
 
 def test_exec_frame_demux_routes_channels() -> None:

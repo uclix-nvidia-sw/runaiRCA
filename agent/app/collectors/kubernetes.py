@@ -520,6 +520,9 @@ async def k8s_describe(
         expected_uid=str(metadata.get("uid") or ""),
         time_range=time_range,
     )
+    observed_entity = _described_resource_entity(
+        expected_kind, namespace, name, object_data
+    )
     return {
         "kind": resolved,
         "namespace": namespace,
@@ -528,8 +531,27 @@ async def k8s_describe(
         "status_code": obj.get("status_code"),
         "error": obj.get("error"),
         "events": events,
+        **({"observed_entity": observed_entity} if observed_entity else {}),
         **({"mcp_fallback": obj["mcp_fallback"]} if obj.get("mcp_fallback") else {}),
     }
+
+
+def _described_resource_entity(
+    expected_kind: str, namespace: str, name: str, object_data: object
+) -> dict[str, str] | None:
+    """Return named-resource provenance only when the returned object proves it."""
+    if not isinstance(object_data, dict):
+        return None
+    metadata = object_data.get("metadata")
+    if not isinstance(metadata, dict) or str(metadata.get("name") or "") != name:
+        return None
+    observed_namespace = str(metadata.get("namespace") or "")
+    if namespace and observed_namespace != namespace:
+        return None
+    entity = {"kind": expected_kind.casefold(), "name": name}
+    if namespace:
+        entity["namespace"] = namespace
+    return entity
 
 
 async def _describe_events(
@@ -677,6 +699,10 @@ async def k8s_exec(
         "status_code": 200,
         "error": status_err or None,
         "output": (stdout or "")[-4000:],
+        # The websocket is opened against this exact namespaced Pod path. It
+        # proves current resource identity, but its untimestamped output still
+        # remains snapshot/context evidence rather than historical causality.
+        "observed_entity": _pod_log_entity(namespace, pod),
     }
     if stderr.strip():
         result["stderr"] = stderr[-1000:]
@@ -1438,6 +1464,20 @@ class KubernetesCollector:
             describe_error = target_pod_describe.get("error")
             describe_events = target_pod_describe.get("events")
             event_count = len(describe_events) if isinstance(describe_events, list) else 0
+            snapshot_observation: dict[str, object] = {
+                "kind": "kubernetes_pod_snapshot",
+                "predicate": "kubernetes_pod_snapshot",
+                # YAML/describe is a live snapshot. Do not let the pipeline's
+                # broad incident window stand in for an occurrence time.
+                "polarity": "unknown",
+                "coverage": "partial",
+                "observation_window": {},
+            }
+            described_entity = _pod_log_observed_entity(
+                {"observed_entity": target_pod_describe.get("observed_entity")}
+            )
+            if described_entity:
+                snapshot_observation["observed_entity"] = described_entity
             artifacts.append(
                 artifact(
                     agent=self.name,
@@ -1463,17 +1503,24 @@ class KubernetesCollector:
                     # represented by the dedicated historical event artifact.
                     result={
                         **target_pod_describe,
-                        "observation": {
-                            "kind": "kubernetes_pod_snapshot",
-                            "predicate": "kubernetes_pod_snapshot",
-                            "polarity": "unknown",
-                            "coverage": "partial",
-                        },
+                        "observation": snapshot_observation,
                     },
                 )
             )
         if exec_probes:
             exec_errors = [str(probe.get("error")) for probe in exec_probes if probe.get("error")]
+            exec_observation: dict[str, object] = {
+                "kind": "kubernetes_live_exec",
+                "predicate": "kubernetes_live_exec",
+                # Exec output has exact Pod provenance but is sampled now; it
+                # cannot establish a condition during a past incident.
+                "polarity": "unknown",
+                "coverage": "partial",
+                "observation_window": {},
+            }
+            exec_entity = _exec_probes_observed_entity(exec_probes)
+            if exec_entity:
+                exec_observation["observed_entity"] = exec_entity
             artifacts.append(
                 artifact(
                     agent=self.name,
@@ -1499,12 +1546,7 @@ class KubernetesCollector:
                     ),
                     result={
                         "probes": exec_probes,
-                        "observation": {
-                            "kind": "kubernetes_live_exec",
-                            "predicate": "kubernetes_live_exec",
-                            "polarity": "unknown",
-                            "coverage": "partial",
-                        },
+                        "observation": exec_observation,
                     },
                 )
             )
@@ -2935,6 +2977,19 @@ async def _collect_exec_probes(
             }
         )
     return probes
+
+
+def _exec_probes_observed_entity(probes: list[dict[str, object]]) -> dict[str, str] | None:
+    """Keep an exec card's Pod provenance only when every probe agrees on it."""
+    if not probes:
+        return None
+    entities = [_pod_log_observed_entity(probe) for probe in probes]
+    if any(entity is None for entity in entities):
+        return None
+    first = entities[0]
+    if first is None or any(entity != first for entity in entities[1:]):
+        return None
+    return first
 
 
 async def _senior_insight(

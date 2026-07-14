@@ -391,6 +391,18 @@ async def test_kubernetes_collector_uses_mcp_before_service_account_token(
         "kubectl describe pod trainer-0 -n runai-vision"
     )
     assert inspection.result["object"]["spec"]["containers"][0]["name"] == "main"
+    assert inspection.result["observation"] == {
+        "kind": "kubernetes_pod_snapshot",
+        "predicate": "kubernetes_pod_snapshot",
+        "polarity": "unknown",
+        "coverage": "partial",
+        "observation_window": {},
+        "observed_entity": {
+            "kind": "pod",
+            "name": "trainer-0",
+            "namespace": "runai-vision",
+        },
+    }
     rendered = str(result.details["pod_logs"])
     assert "k8s-mcp-log-secret-12345" not in rendered
     assert "[MASKED]" in rendered
