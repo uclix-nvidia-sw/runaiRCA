@@ -171,7 +171,16 @@ def test_k8s_describe_uses_mcp_full_pod_and_filters_its_events(monkeypatch) -> N
                     {
                         "type": "Warning",
                         "reason": "OOMKilled",
-                        "involvedObject": {"name": "worker-0"},
+                        "involvedObject": {"kind": "Pod", "name": "worker-0"},
+                        "lastTimestamp": "2026-07-10T01:00:00Z",
+                    },
+                    {
+                        "type": "Warning",
+                        "reason": "SameNamePVC",
+                        "involvedObject": {
+                            "kind": "PersistentVolumeClaim",
+                            "name": "worker-0",
+                        },
                         "lastTimestamp": "2026-07-10T01:00:00Z",
                     },
                     {

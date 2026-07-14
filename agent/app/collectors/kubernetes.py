@@ -498,8 +498,13 @@ async def k8s_describe(
     obj = await k8s_read(
         settings, resolved, namespace=namespace, name=name, full_object=True
     )
+    expected_kind = _k8s_mcp_api_kinds(resolved)[0][1]
     events = await _describe_events(
-        settings, namespace=namespace, name=name, time_range=time_range
+        settings,
+        namespace=namespace,
+        name=name,
+        expected_kind=expected_kind,
+        time_range=time_range,
     )
     return {
         "kind": resolved,
@@ -518,6 +523,7 @@ async def _describe_events(
     *,
     namespace: str,
     name: str,
+    expected_kind: str,
     time_range: dict[str, str] | None = None,
 ) -> list:
     """Events for ONE object, preferring Kubernetes MCP with client-side filtering.
@@ -547,7 +553,10 @@ async def _describe_events(
                 item
                 for item in items
                 if isinstance(item, dict)
+                if isinstance(item.get("involvedObject"), dict)
                 if str((item.get("involvedObject") or {}).get("name") or "") == name
+                if str((item.get("involvedObject") or {}).get("kind") or "").casefold()
+                == expected_kind.casefold()
             ]
             filtered = _events_in_time_range(matching, time_range)
             return compact(filtered, limit=12) if filtered else []
@@ -568,14 +577,24 @@ async def _describe_events(
         path="/".join(parts),
         timeout_seconds=settings.kubernetes_timeout_seconds,
         params={
-            "fieldSelector": f"involvedObject.name={name}",
+            "fieldSelector": f"involvedObject.name={name},involvedObject.kind={expected_kind}",
             "limit": str(settings.kubernetes_list_limit),
         },
         headers={"Authorization": f"Bearer {token}"},
         verify=verify,
     )
     items = (response.data or {}).get("items") if isinstance(response.data, dict) else None
-    filtered = _events_in_time_range(items, time_range) if isinstance(items, list) else []
+    raw_items = items if isinstance(items, list) else []
+    filtered = [
+        item
+        for item in raw_items
+        if isinstance(item, dict)
+        and isinstance(item.get("involvedObject"), dict)
+        and str((item.get("involvedObject") or {}).get("name") or "") == name
+        and str((item.get("involvedObject") or {}).get("kind") or "").casefold()
+        == expected_kind.casefold()
+    ]
+    filtered = _events_in_time_range(filtered, time_range)
     return compact(filtered, limit=12) if filtered else []
 
 
