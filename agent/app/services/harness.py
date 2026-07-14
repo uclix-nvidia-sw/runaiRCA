@@ -452,7 +452,13 @@ def _usable_artifacts(results: list[CollectorResult]) -> list[object]:
 
 
 def _artifact_eligibility(artifacts: Iterable[object]) -> dict[str, object]:
-    """Evaluate links from the normalized fact semantics, not status prose."""
+    """Evaluate links from typed observation semantics, not status prose.
+
+    ``evaluate`` is also used by callers outside the PipelineState path, where
+    no precomputed Blackboard eligibility map is available.  Those callers
+    must not regain the legacy ``ok + summary => scoped support`` inference:
+    only a collector-declared observation may ground an evidence link.
+    """
     from app.services.evidence_blackboard import normalize_artifact
 
     eligible: dict[str, object] = {}
@@ -461,7 +467,9 @@ def _artifact_eligibility(artifacts: Iterable[object]) -> dict[str, object]:
         if not evidence_id:
             continue
         try:
-            eligible[evidence_id] = normalize_artifact(item).eligibility
+            eligible[evidence_id] = normalize_artifact(
+                item, require_typed_observation=True
+            ).eligibility
         except Exception:  # noqa: BLE001 - malformed evidence must not become proof
             continue
     return eligible

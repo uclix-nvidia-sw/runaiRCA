@@ -52,6 +52,10 @@ def _result(agent: str, summary: str = "NVRM Xid 79") -> CollectorResult:
 
 def test_trace_repair_uses_response_local_evidence_ids() -> None:
     results = [_result("loki"), _result("system")]
+    for result in results:
+        result.artifacts[0].result = {
+            "observation": {"polarity": "present", "coverage": "scoped"}
+        }
     assign_evidence_ids(results)
     response = _response()
     cause = RankedCause(
@@ -98,6 +102,9 @@ def test_trace_exposes_structured_evidence_verdicts() -> None:
 
 def test_legacy_agent_fallback_excludes_partial_evidence_from_support() -> None:
     scoped = _result("loki", "OOMKilled occurred during the incident")
+    scoped.artifacts[0].result = {
+        "observation": {"polarity": "present", "coverage": "scoped"}
+    }
     partial = _result("prometheus", "current memory usage is high")
     partial.artifacts[0].result = {
         "observation": {"polarity": "present", "coverage": "partial"}
@@ -162,6 +169,12 @@ def test_safety_guardrail_covers_a_long_report() -> None:
 
 def test_typed_evidence_links_preserve_contradicting_evidence() -> None:
     results = [_result("loki"), _result("system", "GPU remains healthy")]
+    results[0].artifacts[0].result = {
+        "observation": {"polarity": "present", "coverage": "scoped"}
+    }
+    results[1].artifacts[0].result = {
+        "observation": {"polarity": "absent", "coverage": "scoped"}
+    }
     assign_evidence_ids(results)
     response = _response("## Root Cause\n\nLikely Xid [E01] despite the counter-signal [E02].")
     verdict = evaluate(
@@ -219,6 +232,22 @@ def test_unavailable_or_unknown_artifacts_cannot_be_linked_as_support() -> None:
             {"evidence_id": "E01", "role": "support"},
             {"evidence_id": "E02", "role": "support"},
         ],
+    )
+
+    assert verdict.claims[0]["supporting_evidence"] == []
+    assert verdict.gates["invalid_evidence_links"] is True
+
+
+def test_text_only_success_cannot_bypass_typed_observation_link_gate() -> None:
+    """Standalone harness use must match Blackboard's context-only fallback."""
+    results = [_result("loki", "OOMKilled appeared in an untyped summary")]
+    assign_evidence_ids(results)
+
+    verdict = evaluate(
+        _response("## Root Cause\n\nOOMKilled [E01]."),
+        results,
+        [RankedCause("workload_runtime_error", "medium", 5)],
+        evidence_links=[{"evidence_id": "E01", "role": "support"}],
     )
 
     assert verdict.claims[0]["supporting_evidence"] == []
