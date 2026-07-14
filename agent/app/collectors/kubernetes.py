@@ -1531,7 +1531,7 @@ def _warning_event_observation(
         polarity, coverage = "unknown", "partial"
     else:
         polarity, coverage = "absent", "scoped"
-    return {
+    observation = {
         "kind": "kubernetes_warning_events",
         "predicate": "kubernetes_warning_events",
         "polarity": polarity,
@@ -1541,6 +1541,40 @@ def _warning_event_observation(
         "queries_complete": queries_complete,
         "observation_window": time_range or {},
     }
+    # Event list reads intentionally include the post-resolution collection
+    # epilogue.  Keep the returned Event occurrence span distinct from that
+    # query coverage so an Event first seen only after recovery cannot become
+    # causal support merely because it was in the same API response.
+    if polarity == "present":
+        evidence_window = _warning_event_evidence_window(warning_events, time_range)
+        if evidence_window:
+            observation["evidence_window"] = evidence_window
+    return observation
+
+
+def _warning_event_evidence_window(
+    warning_events: list[dict[str, object]], time_range: dict[str, str] | None
+) -> dict[str, str]:
+    """Return the actual timestamp span carried by filtered Warning Events."""
+    if not time_range:
+        return {}
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return {}
+    timestamps: list[tuple[object, str]] = []
+    for event in warning_events:
+        values = event.get("observedTimestamps")
+        if not isinstance(values, list):
+            values = [event.get("lastTimestamp")]
+        for raw in values:
+            parsed = parse_incident_time(raw)
+            if parsed is not None and start <= parsed <= end:
+                timestamps.append((parsed, str(raw)))
+    if not timestamps:
+        return {}
+    timestamps.sort(key=lambda item: item[0])
+    return {"start": timestamps[0][1], "end": timestamps[-1][1]}
 
 
 def _warning_event_queries_complete(responses: list[dict[str, object]]) -> bool:
@@ -3179,12 +3213,18 @@ def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
 
 def _event_summary(event: dict[str, object]) -> dict[str, object]:
     involved = event.get("involvedObject") if isinstance(event.get("involvedObject"), dict) else {}
+    timestamps = _event_timestamps(event)
     return {
         "type": event.get("type"),
         "reason": event.get("reason"),
         "message": event.get("message"),
         "count": event.get("count"),
-        "lastTimestamp": _event_timestamp(event),
+        "lastTimestamp": timestamps[-1][1] if timestamps else None,
+        # Preserve the event's full observed span.  A repeating Event can have
+        # an old first observation and a later last observation; retaining
+        # only the latter would misclassify a legitimate incident-time event
+        # as a recovery-only signal.
+        "observedTimestamps": [str(value) for _, value in timestamps],
         "object": involved.get("name"),
         "kind": involved.get("kind"),
     }

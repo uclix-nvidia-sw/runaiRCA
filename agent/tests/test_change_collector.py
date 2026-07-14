@@ -352,6 +352,47 @@ def test_live_change_window_remains_context_only() -> None:
     assert (observation["polarity"], observation["coverage"]) == ("present", "partial")
 
 
+def test_historical_change_requires_individual_occurrence_timestamp() -> None:
+    observation = change_mod._collector_change_observation(
+        changes=[
+            {
+                "kind": "Deployment",
+                "name": "trainer",
+                # A metadata list query may still surface a stale/malformed
+                # item. Its broad request range is not evidence that this
+                # rollout happened during the incident.
+                "timestamp": "not-a-rfc3339-time",
+            }
+        ],
+        time_range={"start": "2026-07-13T00:00:00Z", "end": "2026-07-13T01:00:00Z"},
+        historical_window=True,
+        warnings=[],
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert "evidence_window" not in observation
+
+
+def test_historical_change_uses_change_timestamp_not_query_window() -> None:
+    observation = change_mod._collector_change_observation(
+        changes=[
+            {
+                "kind": "PodDeleted",
+                "name": "trainer-0",
+                "timestamp": "2026-07-13T00:12:00Z",
+            }
+        ],
+        time_range={"start": "2026-07-13T00:00:00Z", "end": "2026-07-13T01:00:00Z"},
+        historical_window=True,
+        warnings=[],
+    )
+
+    assert observation["evidence_window"] == {
+        "start": "2026-07-13T00:12:00Z",
+        "end": "2026-07-13T00:12:00Z",
+    }
+
+
 @pytest.mark.asyncio
 async def test_query_failure_degrades(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")

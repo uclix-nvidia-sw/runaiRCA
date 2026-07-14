@@ -287,6 +287,13 @@ def _change_observation(
 ) -> dict:
     """Project only safe change metadata; never copy Event or Secret bodies."""
     safe_changes = [_safe_change_metadata(change, namespace) for change in changes]
+    # The request window only says what the API was asked to search.  It is not
+    # proof that a returned change actually occurred during the incident.  Keep
+    # an occurrence window only when the individual metadata timestamps are
+    # valid, timezone-aware instants inside that bounded query.
+    evidence_window = _change_evidence_window(safe_changes, observation_window)
+    timed_changes = bool(evidence_window)
+    invalid_timing = bool(safe_changes) and historical_window and not timed_changes
     return {
         "schema_version": "v1",
         "kind": "change_query",
@@ -304,19 +311,22 @@ def _change_observation(
         },
         "window": {"lookback_seconds": lookback_seconds},
         "observation_window": observation_window,
+        **({"evidence_window": evidence_window} if evidence_window else {}),
         # A live query is a useful operator hint, but cannot establish a
         # causal absence/presence for an alert without an incident timestamp.
         "polarity": (
             "present"
-            if safe_changes
+            if safe_changes and (not historical_window or timed_changes)
             else (
                 "unknown"
-                if warnings or not historical_window or context_changes
+                if warnings or not historical_window or context_changes or invalid_timing
                 else "absent"
             )
         ),
         "coverage": (
-            "partial" if warnings or not historical_window or context_changes else "scoped"
+            "partial"
+            if warnings or not historical_window or context_changes or invalid_timing
+            else "scoped"
         ),
         "lookback_seconds": lookback_seconds,
         "result_limit": limit,
@@ -976,6 +986,11 @@ def _collector_change_observation(
     warnings: list[str],
 ) -> dict[str, object]:
     """State whether target-scope change evidence is truly incident-bounded."""
+    # Do not let the broad collection range stand in for the time of an
+    # individual rollout/Event/Pod transition.  A malformed or untimed record
+    # remains useful operator context but cannot activate a lifecycle cause.
+    evidence_window = _change_evidence_window(changes, time_range)
+    timed_changes = bool(evidence_window)
     if not historical_window:
         # The live one-hour fallback helps an operator but cannot establish a
         # trigger for an alert with no timestamp.
@@ -984,8 +999,10 @@ def _collector_change_observation(
         # A failed resource class leaves the historical sweep incomplete; don't
         # make an empty/partial result refute a lifecycle-change hypothesis.
         polarity, coverage = ("present", "partial") if changes else ("unknown", "partial")
-    elif changes:
+    elif changes and timed_changes:
         polarity, coverage = "present", "scoped"
+    elif changes:
+        polarity, coverage = "unknown", "partial"
     elif context_changes:
         # A namespace sweep was not empty, but its lifecycle activity belongs
         # to another workload. It is operator context, never target evidence.
@@ -1000,6 +1017,37 @@ def _collector_change_observation(
         "change_count": len(changes),
         "context_change_count": len(context_changes or []),
         "observation_window": time_range,
+        **({"evidence_window": evidence_window} if evidence_window else {}),
+    }
+
+
+def _change_evidence_window(
+    changes: list[dict], query_window: dict[str, str]
+) -> dict[str, str] | None:
+    """Return the actual timestamp span of valid individual change records.
+
+    Kubernetes list responses may be stale, malformed, or contain a pending
+    rollout whose only usable timestamp predates this incident.  The response
+    must therefore carry at least one timestamped change inside the explicit
+    query bounds before an aggregate change artifact can be causal evidence.
+    """
+    start = parse_incident_time(query_window.get("start"))
+    end = parse_incident_time(query_window.get("end"))
+    if start is None or end is None or end < start:
+        return None
+    instants = [
+        instant
+        for change in changes
+        if isinstance(change, dict)
+        if (instant := parse_incident_time(change.get("timestamp"))) is not None
+        and start <= instant <= end
+    ]
+    if not instants:
+        return None
+    first, last = min(instants), max(instants)
+    return {
+        "start": first.isoformat().replace("+00:00", "Z"),
+        "end": last.isoformat().replace("+00:00", "Z"),
     }
 
 

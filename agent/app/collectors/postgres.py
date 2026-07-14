@@ -201,23 +201,28 @@ async def _postgres_result(
     pgvector = checks["pgvector_extension"]
     rca_tables = checks["rca_tables"]
     incident_history = checks.get("incident_history", {})
-    history_tables = (
-        incident_history.get("tables", []) if isinstance(incident_history, dict) else []
-    )
+    # An aggregate is only a count over the requested SQL range.  Do not let
+    # it become a causal occurrence until the returned target rows themselves
+    # prove an in-range timestamp and an allowlisted target identity.
+    history_artifacts = _postgres_history_artifacts(target, incident_history)
+    verified_history = [
+        artifact_item
+        for artifact_item in history_artifacts
+        if isinstance(getattr(artifact_item, "result", None), dict)
+        and isinstance(artifact_item.result.get("observation"), dict)
+        and artifact_item.result["observation"].get("polarity") == "present"
+        and artifact_item.result["observation"].get("coverage") == "scoped"
+    ]
     history_rows = sum(
-        int(item.get("target_matching_rows") or 0)
-        for item in history_tables
-        if isinstance(item, dict)
-        and item.get("target_correlation_available")
-        and item.get("target_aggregate_verified")
+        _history_match_count(artifact_item.result.get("target_matching_rows"))
+        for artifact_item in verified_history
     )
-    history_match_tables = sum(
-        1
-        for item in history_tables
-        if isinstance(item, dict)
-        and item.get("target_correlation_available")
-        and item.get("target_aggregate_verified")
-        and item.get("target_matching_rows")
+    history_match_tables = len(verified_history)
+    history_unverified = any(
+        isinstance(getattr(artifact_item, "result", None), dict)
+        and isinstance(artifact_item.result.get("observation"), dict)
+        and artifact_item.result["observation"].get("polarity") == "unknown"
+        for artifact_item in history_artifacts
     )
     missing_tables = [name for name, exists in rca_tables.items() if not exists]
     status = "ok"
@@ -233,7 +238,12 @@ async def _postgres_result(
             f" incident 시간창 audit/history 레코드 {history_rows}건 "
             f"({history_match_tables}개 테이블)을 조회했습니다."
             if history_rows
-            else " incident 시간창에 일치하는 audit/history 레코드는 없습니다."
+            else (
+                " incident 시간창 audit/history 응답 일부는 대상·시각을 검증할 수 없어 "
+                "RCA 근거에서 제외했습니다."
+                if history_unverified
+                else " incident 시간창에 일치하는 audit/history 레코드는 없습니다."
+            )
         )
         summary = ko_en(
             settings,
@@ -246,6 +256,12 @@ async def _postgres_result(
                 "table(s) in the incident window."
                 if history_rows
                 else " No audit/history records matched the incident window."
+                if not history_unverified
+                else (
+                    " Some incident-window audit/history responses could not be "
+                    "verified for target identity and occurrence time, so they were "
+                    "excluded from RCA evidence."
+                )
             ),
         )
     else:
@@ -309,7 +325,7 @@ async def _postgres_result(
                 },
             )
         ]
-        + _postgres_history_artifacts(target, incident_history),
+        + history_artifacts,
     )
 
 
@@ -1041,10 +1057,20 @@ def _postgres_history_artifacts(
             continue
         schema = str(table.get("schema") or "audit")
         name = str(table.get("table") or "history")
-        matches = int(table.get("target_matching_rows") or 0)
+        matches = _history_match_count(table.get("target_matching_rows"))
+        count_verified = _history_match_count_is_valid(table.get("target_matching_rows"))
         correlated = bool(table.get("target_correlation_available"))
         aggregate_verified = bool(table.get("target_aggregate_verified"))
-        if not time_range or not correlated or not aggregate_verified:
+        rows_verified, evidence_window, observed_entity = _verified_target_history_rows(
+            table, target, time_range, matches
+        )
+        if (
+            not time_range
+            or not correlated
+            or not aggregate_verified
+            or not count_verified
+            or not rows_verified
+        ):
             polarity, coverage = "unknown", "partial"
         elif matches:
             polarity, coverage = "present", "scoped"
@@ -1082,6 +1108,8 @@ def _postgres_history_artifacts(
                         "polarity": polarity,
                         "coverage": coverage,
                         "observation_window": time_range or {},
+                        **({"evidence_window": evidence_window} if evidence_window else {}),
+                        **({"observed_entity": observed_entity} if observed_entity else {}),
                     },
                     "target_matching_rows": matches,
                     "target_rows": table.get("target_rows") or [],
@@ -1091,3 +1119,159 @@ def _postgres_history_artifacts(
             )
         )
     return artifacts
+
+
+def _history_match_count(value: object) -> int:
+    """Decode an aggregate count without treating malformed data as evidence."""
+    try:
+        count = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return count if count >= 0 else 0
+
+
+def _history_match_count_is_valid(value: object) -> bool:
+    """Require an explicit non-negative aggregate count before inferring absence."""
+    if isinstance(value, bool) or value is None:
+        return False
+    try:
+        return int(value) >= 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _verified_target_history_rows(
+    table: dict[str, Any],
+    target: AnalysisTarget,
+    time_range: dict[str, str] | None,
+    matches: int,
+) -> tuple[bool, dict[str, str] | None, dict[str, str] | None]:
+    """Verify sampled audit rows before an aggregate may support an RCA claim.
+
+    The aggregate query is useful to find tables efficiently, but a malformed
+    MCP response (or a schema whose selected identity was lost) must not be
+    promoted merely because it says ``matching_rows > 0``.  Every sampled row
+    must carry a timezone-aware in-window event time and an identity that
+    matches the exact allowlisted predicate used for the query.  Aggregate
+    absence remains valid: there is intentionally no row to sample when count
+    is zero.
+    """
+    if not isinstance(time_range, dict):
+        return False, None, None
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return False, None, None
+    if matches == 0:
+        return True, None, _target_history_entity(target)
+    rows = table.get("target_rows")
+    if not isinstance(rows, list) or not rows:
+        return False, None, None
+    instants = []
+    entities: list[dict[str, str]] = []
+    for raw_row in rows:
+        if not isinstance(raw_row, dict):
+            return False, None, None
+        instant = parse_incident_time(raw_row.get("event_time"))
+        entity = _target_history_row_entity(raw_row, table, target)
+        if instant is None or not (start <= instant <= end) or entity is None:
+            return False, None, None
+        instants.append(instant)
+        entities.append(entity)
+    first, last = min(instants), max(instants)
+    # A target query can legitimately match by workload in one row and pod in
+    # another. Pick the most specific identity seen, while retaining the fact
+    # that it was observed in an actual returned row rather than inferred from
+    # the aggregate or broad namespace query.
+    observed_entity = next(
+        (entity for entity in entities if entity["kind"] in {"pod", "runai_workload_id"}),
+        entities[0],
+    )
+    return (
+        True,
+        {
+            "start": first.isoformat().replace("+00:00", "Z"),
+            "end": last.isoformat().replace("+00:00", "Z"),
+        },
+        observed_entity,
+    )
+
+
+def _target_history_row_entity(
+    row: dict[str, Any], table: dict[str, Any], target: AnalysisTarget
+) -> dict[str, str] | None:
+    """Return a row-proven target identity, never a fallback target label."""
+    expected = {
+        "workload": (target.workload_name, target.runai_workload_id),
+        "workload_name": (target.workload_name,),
+        "workload_id": (target.runai_workload_id,),
+        "pod": (target.pod,),
+        "pod_name": (target.pod,),
+        "project": (target.project,),
+        "project_name": (target.project,),
+        "queue": (target.queue,),
+        "queue_name": (target.queue,),
+        "namespace": (target.namespace,),
+        "resource_id": (target.workload_name, target.runai_workload_id),
+    }
+    strong_columns = {"workload", "workload_name", "workload_id", "pod", "pod_name", "resource_id"}
+    has_strong_target = any(
+        str(value).strip() for column in strong_columns for value in expected[column]
+    )
+    available = {str(column) for column in table.get("context_columns", [])}
+    allowed = strong_columns if has_strong_target else set(_HISTORY_TARGET_COLUMNS)
+    entity_fields = {
+        "workload": "workload_name",
+        "workload_name": "workload_name",
+        "workload_id": "runai_workload_id",
+        "pod": "pod",
+        "pod_name": "pod",
+        "project": "project",
+        "project_name": "project",
+        "queue": "queue",
+        "queue_name": "queue",
+        "namespace": "namespace",
+    }
+    match: tuple[str, str] | None = None
+    for column in _HISTORY_TARGET_COLUMNS:
+        if column not in allowed or column not in available:
+            continue
+        value = str(row.get(column) or "").strip()
+        values = {str(item).strip().casefold() for item in expected[column] if str(item).strip()}
+        if value and value.casefold() in values:
+            if column == "resource_id":
+                kind = "runai_workload_id" if value == str(target.runai_workload_id) else "workload_name"
+            else:
+                kind = entity_fields[column]
+            match = (kind, value)
+            break
+    if match is None:
+        return None
+    # When scope columns were available to the SQL predicate, a returned row
+    # must retain the same concrete values.  Missing or contradictory scope is
+    # not silently repaired from the alert target.
+    for column in ("namespace", "project", "project_name", "queue", "queue_name"):
+        if column not in available:
+            continue
+        expected_values = {str(item).strip().casefold() for item in expected[column] if str(item).strip()}
+        if not expected_values:
+            continue
+        value = str(row.get(column) or "").strip().casefold()
+        if value not in expected_values:
+            return None
+    return {"kind": match[0], "name": match[1]}
+
+
+def _target_history_entity(target: AnalysisTarget) -> dict[str, str] | None:
+    for field, kind in (
+        ("pod", "pod"),
+        ("runai_workload_id", "runai_workload_id"),
+        ("workload_name", "workload_name"),
+        ("project", "project"),
+        ("queue", "queue"),
+        ("namespace", "namespace"),
+    ):
+        value = str(getattr(target, field, "") or "").strip()
+        if value:
+            return {"kind": kind, "name": value}
+    return None

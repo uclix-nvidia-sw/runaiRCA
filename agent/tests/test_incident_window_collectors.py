@@ -622,7 +622,11 @@ async def test_loki_malformed_success_body_is_unavailable_not_historical_absence
 def test_runai_query_observation_requires_identity_scoped_coverage() -> None:
     target = make_target()
     present = runai._runai_query_observation(
-        {"name": "workloads", "status_code": 200, "data": {"workloads": [{"name": "trainer"}]}},
+        {
+            "name": "workloads",
+            "status_code": 200,
+            "data": {"workloads": [{"name": "trainer", "projectName": "vision", "queueName": "gpu-a"}]},
+        },
         target=target,
         used_mcp=True,
     )
@@ -649,6 +653,77 @@ def test_runai_query_observation_requires_identity_scoped_coverage() -> None:
         "unknown",
         "partial",
     )
+
+
+def test_runai_collection_404_cannot_prove_named_resource_absence() -> None:
+    target = make_target()
+    mcp_project_path_missing = runai._runai_query_observation(
+        {"name": "projects", "status_code": 404, "error": "HTTP 404", "data": None},
+        target=target,
+        used_mcp=True,
+    )
+    direct_workload_collection_missing = runai._runai_query_observation(
+        {"name": "workloads", "status_code": 404, "error": "HTTP 404", "data": None},
+        target=target,
+        used_mcp=False,
+    )
+    direct_project_missing = runai._runai_query_observation(
+        {"name": "project", "status_code": 404, "error": "HTTP 404", "data": None},
+        target=target,
+        used_mcp=False,
+    )
+
+    assert (mcp_project_path_missing["polarity"], mcp_project_path_missing["coverage"]) == (
+        "unavailable",
+        "unknown",
+    )
+    assert (
+        direct_workload_collection_missing["polarity"],
+        direct_workload_collection_missing["coverage"],
+    ) == ("unavailable", "unknown")
+    assert (direct_project_missing["polarity"], direct_project_missing["coverage"]) == (
+        "absent",
+        "scoped",
+    )
+
+
+def test_runai_same_named_workload_requires_non_conflicting_returned_scope() -> None:
+    target = make_target()
+    wrong_project = runai._runai_query_observation(
+        {
+            "name": "workloads",
+            "status_code": 200,
+            "data": {"workloads": [{"name": "trainer", "project": {"name": "other"}}]},
+        },
+        target=target,
+        used_mcp=False,
+    )
+    wrong_queue = runai._runai_query_observation(
+        {
+            "name": "workloads",
+            "status_code": 200,
+            "data": {"workloads": [{"name": "trainer", "project": "vision", "queue": "other"}]},
+        },
+        target=target,
+        used_mcp=False,
+    )
+    matching_scope = runai._runai_query_observation(
+        {
+            "name": "workloads",
+            "status_code": 200,
+            "data": {
+                "workloads": [
+                    {"name": "trainer", "projectName": "vision", "queueName": "gpu-a"}
+                ]
+            },
+        },
+        target=target,
+        used_mcp=False,
+    )
+
+    assert (wrong_project["polarity"], wrong_project["coverage"]) == ("unknown", "partial")
+    assert (wrong_queue["polarity"], wrong_queue["coverage"]) == ("unknown", "partial")
+    assert (matching_scope["polarity"], matching_scope["coverage"]) == ("present", "scoped")
 
 
 def test_runai_identity_does_not_match_nested_context_or_wrong_direct_resource() -> None:
@@ -1005,6 +1080,29 @@ def test_kubernetes_warning_event_observation_is_a_scoped_negative_only_in_windo
     assert (unscoped["polarity"], unscoped["coverage"]) == ("unknown", "partial")
     assert (incomplete["polarity"], incomplete["coverage"]) == ("unknown", "partial")
     assert (found_despite_gap["polarity"], found_despite_gap["coverage"]) == ("present", "scoped")
+
+
+def test_kubernetes_warning_event_observation_exposes_actual_event_span() -> None:
+    """A post-resolution Event must not inherit the broad query window as its time."""
+    time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    observation = _warning_event_observation(
+        [
+            {
+                "reason": "Evicted",
+                "observedTimestamps": [
+                    "2026-07-10T01:11:00Z",
+                    "2026-07-10T01:12:00Z",
+                ],
+            }
+        ],
+        time_range=time_range,
+        status="ok",
+    )
+
+    assert observation["evidence_window"] == {
+        "start": "2026-07-10T01:11:00Z",
+        "end": "2026-07-10T01:12:00Z",
+    }
 
 
 def test_kubernetes_warning_event_absence_requires_all_event_queries_to_succeed() -> None:
@@ -1425,3 +1523,93 @@ def test_postgres_history_malformed_target_aggregate_is_not_scoped_absence() -> 
 
     observation = artifacts[0].result["observation"]
     assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+
+
+def test_postgres_history_requires_timestamped_target_rows_for_presence() -> None:
+    target = replace(
+        make_target(), fired_at="2026-07-10T01:00:00Z", resolved_at="2026-07-10T01:10:00Z"
+    )
+    artifacts = _postgres_history_artifacts(
+        target,
+        {
+            "time_range": {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"},
+            "tables": [
+                {
+                    "schema": "audit",
+                    "table": "workload_history",
+                    "context_columns": ["workload_name", "action"],
+                    "target_correlation_available": True,
+                    "target_matching_rows": 3,
+                    "target_aggregate_verified": True,
+                    # Aggregate output alone cannot establish an occurrence.
+                    "target_rows": [{"event_time": "not-a-time", "workload_name": "trainer"}],
+                }
+            ],
+        },
+    )
+
+    observation = artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert "evidence_window" not in observation
+
+
+def test_postgres_history_malformed_count_cannot_prove_absence() -> None:
+    target = replace(
+        make_target(), fired_at="2026-07-10T01:00:00Z", resolved_at="2026-07-10T01:10:00Z"
+    )
+    artifacts = _postgres_history_artifacts(
+        target,
+        {
+            "time_range": {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"},
+            "tables": [
+                {
+                    "schema": "audit",
+                    "table": "workload_history",
+                    "context_columns": ["workload_name"],
+                    "target_correlation_available": True,
+                    "target_matching_rows": "not-a-count",
+                    "target_aggregate_verified": True,
+                    "target_rows": [],
+                }
+            ],
+        },
+    )
+
+    observation = artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+
+
+def test_postgres_history_uses_verified_row_time_and_identity_for_occurrence() -> None:
+    target = replace(
+        make_target(), fired_at="2026-07-10T01:00:00Z", resolved_at="2026-07-10T01:10:00Z"
+    )
+    artifacts = _postgres_history_artifacts(
+        target,
+        {
+            "time_range": {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"},
+            "tables": [
+                {
+                    "schema": "audit",
+                    "table": "workload_history",
+                    "context_columns": ["workload_name", "action"],
+                    "target_correlation_available": True,
+                    "target_matching_rows": 1,
+                    "target_aggregate_verified": True,
+                    "target_rows": [
+                        {
+                            "event_time": "2026-07-10T01:02:00Z",
+                            "workload_name": "trainer",
+                            "action": "evicted",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    observation = artifacts[0].result["observation"]
+    assert observation["evidence_window"] == {
+        "start": "2026-07-10T01:02:00Z",
+        "end": "2026-07-10T01:02:00Z",
+    }
+    assert observation["observed_entity"] == {"kind": "workload_name", "name": "trainer"}

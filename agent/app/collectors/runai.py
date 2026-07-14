@@ -578,13 +578,15 @@ def _runai_query_observation(
     expected = _runai_expected_identity(name, target)
     status_code = item.get("status_code")
     if item.get("error"):
-        if expected and status_code == 404:
+        if _runai_exact_resource_lookup(name, used_mcp=used_mcp) and status_code == 404:
             polarity, coverage = "absent", "scoped"
         else:
             polarity, coverage = "unavailable", "unknown"
     elif name == "version" or not expected:
         polarity, coverage = "unknown", "partial"
-    elif _runai_data_contains_identity(item.get("data"), expected, resource=name):
+    elif _runai_data_contains_identity(
+        item.get("data"), expected, resource=name, target=target
+    ):
         polarity, coverage = "present", "scoped"
     elif _runai_is_explicitly_empty(item.get("data")):
         # A successful but empty body can be an ignored filter, an API gateway
@@ -612,6 +614,17 @@ def _runai_query_observation(
     }
 
 
+def _runai_exact_resource_lookup(name: str, *, used_mcp: bool) -> bool:
+    """Whether a 404 names one requested resource rather than a collection.
+
+    Run:ai MCP calls use collection endpoints (``/projects``, ``/queues``, and
+    ``/workloads``).  A 404 there can mean an unsupported API path or a gateway
+    route, not that the alert's project/queue/workload is absent.  Only the
+    direct HTTP collector's per-resource paths can establish scoped absence.
+    """
+    return not used_mcp and name in {"workload_by_id", "project", "queue"}
+
+
 def _runai_expected_identity(name: str, target: AnalysisTarget) -> str:
     if name in {"workloads", "workload_by_id"}:
         return target.runai_workload_id or target.workload_name
@@ -622,7 +635,13 @@ def _runai_expected_identity(name: str, target: AnalysisTarget) -> str:
     return ""
 
 
-def _runai_data_contains_identity(data: object, expected: str, *, resource: str) -> bool:
+def _runai_data_contains_identity(
+    data: object,
+    expected: str,
+    *,
+    resource: str,
+    target: AnalysisTarget | None = None,
+) -> bool:
     """Match only the queried resource's own identity fields.
 
     A workload response can embed a Project/Queue object. Recursing through
@@ -645,8 +664,52 @@ def _runai_data_contains_identity(data: object, expected: str, *, resource: str)
         for key, value in item.items():
             normalized = str(key).replace("_", "").replace("-", "").casefold()
             if normalized in fields and str(value).strip().casefold() == wanted:
+                # A human-readable workload name is not globally unique. When
+                # the returned resource declares its project or queue, make
+                # sure those values agree with the alert instead of relabelling
+                # a same-named workload from another scope as the target.  An
+                # immutable workload id remains the authoritative identity and
+                # deliberately does not lose to stale auxiliary labels.
+                if (
+                    resource in {"workloads", "workload_by_id"}
+                    and target is not None
+                    and not target.runai_workload_id
+                    and not _runai_workload_scope_matches(item, target)
+                ):
+                    continue
                 return True
     return False
+
+
+def _runai_workload_scope_matches(item: dict[str, object], target: AnalysisTarget) -> bool:
+    """Reject a same-named workload when returned scope conflicts with alert.
+
+    Some Run:ai responses embed ``project``/``queue`` as objects while others
+    expose ``projectName``/``queueName``.  Absence of those fields is not a
+    conflict (the request may already have filtered it), but an explicit
+    different value must not be used as scoped target evidence.
+    """
+    return _runai_scope_matches(item, target.project, {"project", "projectname"}) and _runai_scope_matches(
+        item, target.queue, {"queue", "queuename"}
+    )
+
+
+def _runai_scope_matches(
+    item: dict[str, object], expected: str, aliases: set[str]
+) -> bool:
+    wanted = expected.strip().casefold()
+    if not wanted:
+        return True
+    observed: list[str] = []
+    for key, value in item.items():
+        normalized = str(key).replace("_", "").replace("-", "").casefold()
+        if normalized not in aliases:
+            continue
+        if isinstance(value, dict):
+            value = value.get("name") or value.get("displayName") or ""
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            observed.append(str(value).strip().casefold())
+    return not observed or wanted in observed
 
 
 def _runai_resource_items(data: object, resource: str) -> list[dict[str, object]]:
