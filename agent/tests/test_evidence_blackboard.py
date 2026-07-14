@@ -185,6 +185,27 @@ def test_integration_blackboard_seeds_collector_results_and_exposes_safe_api() -
     assert board.prompt_view(entity_hints=["trainer-0"])[0]["evidence_id"] == added[0].fact_id
 
 
+def test_blackboard_keeps_untyped_summary_as_context_only() -> None:
+    """A successful text-only legacy artifact cannot support an RCA hypothesis."""
+    item = _artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        summary="Pod trainer-0 is Evicted.",
+        result={"events": [{"reason": "Evicted"}]},
+    )
+    board = Blackboard()
+
+    [fact] = board.add_result(
+        "kubernetes",
+        CollectorResult(agent="kubernetes", status="ok", summary=item.summary or "", artifacts=[item]),
+        entity="pod:trainer-0",
+    )
+
+    assert (fact.polarity, fact.coverage) == ("unknown", "unknown")
+    assert not fact.eligibility.support
+    assert fact.eligibility.context
+
+
 def test_response_local_evidence_alias_does_not_change_fact_identity() -> None:
     item = _artifact(agent="kubernetes", source="kubernetes", summary="Pod trainer-0 is Evicted.")
     board = Blackboard()

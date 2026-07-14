@@ -90,8 +90,24 @@ def test_drilldown_blackboard_records_the_incident_window() -> None:
         _target(), fired_at="2026-07-10T01:00:00Z", resolved_at="2026-07-10T01:10:00Z"
     )
     board = Blackboard()
+    result = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="pod train-1-0 Pending; FailedScheduling",
+        artifacts=[
+            AlertAnalysisArtifact(
+                agent="kubernetes",
+                source="kubernetes",
+                type="k8s_read",
+                status="ok",
+                confidence="high",
+                summary="Pod train-1-0 remained Pending during the incident.",
+                result={"observation": {"polarity": "present", "coverage": "scoped"}},
+            )
+        ],
+    )
 
-    drilldown._record_blackboard(board, _k8s_result(), target)
+    drilldown._record_blackboard(board, result, target)
 
     fact = board.facts()[0]
     assert fact.observation_window == ("2026-07-10T01:00:00Z", "2026-07-10T01:10:00Z")

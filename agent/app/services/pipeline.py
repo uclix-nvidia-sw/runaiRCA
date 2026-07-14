@@ -1276,7 +1276,11 @@ def _blackboard_fact_groups(
             aliases.get(str(fact.fact_id), str(fact.fact_id)): str(fact.independence_group)
             for fact in facts()
             if getattr(fact, "fact_id", "")
-            and bool(getattr((eligibility_by_fact or {}).get(str(fact.fact_id)), "support", True))
+            # Open-world promotion is fail-closed: no eligibility verdict (for
+            # example because a malformed fact could not be normalized) is not
+            # evidence provenance.  Only an explicit scoped-positive verdict
+            # may contribute an independent source group.
+            and bool(getattr((eligibility_by_fact or {}).get(str(fact.fact_id)), "support", False))
         }
     except Exception:  # noqa: BLE001 - blackboard remains an optional enhancement
         return {}

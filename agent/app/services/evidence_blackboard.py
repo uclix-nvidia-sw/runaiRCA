@@ -383,6 +383,7 @@ class Blackboard(EvidenceBlackboard):
                 source_group=source_group,
                 run_id=run_id,
                 topology=topology,
+                require_typed_observation=True,
             )
             if self.add(fact):
                 added.append(fact)
@@ -436,7 +437,7 @@ class Blackboard(EvidenceBlackboard):
         **kwargs: Any,
     ) -> str:
         """Calculate the stable ID before adding the fact to the blackboard."""
-        return normalize_artifact(artifact, **kwargs).fact_id
+        return normalize_artifact(artifact, require_typed_observation=True, **kwargs).fact_id
 
 
 def normalize_artifact(
@@ -454,12 +455,16 @@ def normalize_artifact(
     run_id: str = "",
     topology: object = (),
     masker: Masker | None = None,
+    require_typed_observation: bool = False,
 ) -> EvidenceFact:
     """Turn a collector artifact into a stable fact without retaining its query.
 
     Callers may explicitly set polarity/coverage when a tool has richer result
     semantics. The inferred fallback only calls a clean successful no-evidence
-    response ``absent``; an unavailable source is never absence.
+    response ``absent``; an unavailable source is never absence.  The shared
+    Blackboard enables ``require_typed_observation`` because its facts can
+    promote an open-world hypothesis: a legacy summary alone must remain
+    operational context, not causal proof.
     """
     raw = _artifact_mapping(artifact)
     result = raw.get("result")
@@ -490,6 +495,11 @@ def normalize_artifact(
     # unavailable; reducing that to an "error" keyword would make every agent
     # reinforce the same false positive during synthesis.
     metadata_polarity = _normalise_token(_clean_text(metadata("polarity")))
+    metadata_coverage = _normalise_token(_clean_text(metadata("coverage")))
+    has_explicit_semantics = (
+        (polarity in _POLARITIES and coverage in _COVERAGE)
+        or (metadata_polarity in _POLARITIES and metadata_coverage in _COVERAGE)
+    )
     # Ontology probes evaluate a returned snapshot against declared tokens.
     # Their supports/refutes verdict is useful diagnostic context, but it does
     # not by itself establish that the snapshot covers a historical incident.
@@ -500,21 +510,29 @@ def normalize_artifact(
         _normalise_token(_clean_text(raw.get("type"))) == "ontology_probe"
         and metadata_polarity not in _POLARITIES
     )
-    resolved_polarity = (
-        polarity
-        or (metadata_polarity if metadata_polarity in _POLARITIES else None)
-        or ("unknown" if is_unscoped_ontology_probe else None)
-        or _infer_polarity(status, summary, highlights, result)
-    )
+    if require_typed_observation and not has_explicit_semantics:
+        # Preserve an explicit transport failure for diagnostics, but do not
+        # infer a positive historical observation from an arbitrary summary or
+        # successful HTTP status.  Such artifacts remain useful prompt context.
+        resolved_polarity = "unavailable" if status in {"unavailable", "error", "failed", "timeout"} else "unknown"
+    else:
+        resolved_polarity = (
+            polarity
+            or (metadata_polarity if metadata_polarity in _POLARITIES else None)
+            or ("unknown" if is_unscoped_ontology_probe else None)
+            or _infer_polarity(status, summary, highlights, result)
+        )
     if resolved_polarity not in _POLARITIES:
         raise ValueError(f"invalid polarity: {resolved_polarity}")
-    metadata_coverage = _normalise_token(_clean_text(metadata("coverage")))
-    resolved_coverage = (
-        coverage
-        or (metadata_coverage if metadata_coverage in _COVERAGE else None)
-        or ("partial" if is_unscoped_ontology_probe else None)
-        or _infer_coverage(status, resolved_polarity)
-    )
+    if require_typed_observation and not has_explicit_semantics:
+        resolved_coverage = "unknown"
+    else:
+        resolved_coverage = (
+            coverage
+            or (metadata_coverage if metadata_coverage in _COVERAGE else None)
+            or ("partial" if is_unscoped_ontology_probe else None)
+            or _infer_coverage(status, resolved_polarity)
+        )
     if resolved_coverage not in _COVERAGE:
         raise ValueError(f"invalid coverage: {resolved_coverage}")
     # Missing tool coverage must never masquerade as a verified negative.
