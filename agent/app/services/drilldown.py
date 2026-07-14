@@ -44,6 +44,7 @@ from app.collectors.base import (
     salient_markers,
     signals_line,
 )
+from app.collectors.change import change_query
 from app.collectors.http_json import get_json
 from app.collectors.kubernetes import (
     _EXEC_ALLOWLIST,
@@ -960,6 +961,15 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
                 ),
                 "call": _tool_k8s_describe,
             },
+            "k8s_change_timeline": {
+                "description": (
+                    "Read a bounded Kubernetes change timeline for controller/pod/event/helm "
+                    "metadata. USE THIS for deployment or rollout history; do not invent a "
+                    "deployment_history resource. args: source (all|controller|pod|event|helm), "
+                    "component?, lookback_seconds?"
+                ),
+                "call": _tool_k8s_change_timeline,
+            },
         }
     }
     if settings.enable_pod_exec:
@@ -1086,6 +1096,12 @@ async def _tool_k8s_read(settings: Settings, target: AnalysisTarget, args: dict)
         # loop surfaces this via collector warnings instead.
         **({"mcp_fallback": item["mcp_fallback"]} if item.get("mcp_fallback") else {}),
     }
+
+
+async def _tool_k8s_change_timeline(
+    settings: Settings, target: AnalysisTarget, args: dict
+) -> dict:
+    return await change_query(settings, target, args)
 
 
 async def _tool_k8s_logs(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
