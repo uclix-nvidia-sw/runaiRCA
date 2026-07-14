@@ -23,6 +23,7 @@ from app.collectors.base import (
     artifact,
     incident_time_range,
     ko_en,
+    parse_incident_time,
 )
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
@@ -77,14 +78,14 @@ async def system_log_query(settings: Settings, target: AnalysisTarget, args: dic
         return _query_error("the alert has no node scope", source=source)
     if requested_node and requested_node != node:
         return _query_error("node must match the alert node scope", source=source, node=node)
-    lookback = _bounded_int(
+    requested_lookback = _bounded_int(
         args.get("lookback_seconds", _QUERY_DEFAULT_LOOKBACK_SECONDS),
         minimum=60,
         maximum=_QUERY_MAX_LOOKBACK_SECONDS,
         label="lookback_seconds",
     )
-    if isinstance(lookback, str):
-        return _query_error(lookback, source=source, node=node)
+    if isinstance(requested_lookback, str):
+        return _query_error(requested_lookback, source=source, node=node)
     line_value = args.get("lines", args.get("limit", _QUERY_DEFAULT_LINES))
     lines = _bounded_int(
         line_value,
@@ -93,16 +94,34 @@ async def system_log_query(settings: Settings, target: AnalysisTarget, args: dic
         label="lines",
     )
     if isinstance(lines, str):
-        return _query_error(lines, source=source, node=node, lookback=lookback)
+        return _query_error(lines, source=source, node=node, lookback=requested_lookback)
     grep, grep_error = _safe_grep(args.get("grep"))
     if grep_error:
-        return _query_error(grep_error, source=source, node=node, lookback=lookback, limit=lines)
+        return _query_error(
+            grep_error, source=source, node=node, lookback=requested_lookback, limit=lines
+        )
     if not getattr(settings, "enable_system_agent", False) or not getattr(
         settings, "system_agent_url", ""
     ):
         return _query_error(
-            "system agent is not configured", source=source, node=node, lookback=lookback
+            "system agent is not configured",
+            source=source,
+            node=node,
+            lookback=requested_lookback,
         )
+
+    # Only journalctl accepts a trustworthy start/end predicate. For a past
+    # incident, use it rather than a current log tail; dmesg/syslog remain live
+    # context because their endpoints cannot safely reconstruct old state.
+    time_range = incident_time_range(target) if source == "journal" else None
+    if time_range:
+        start = parse_incident_time(time_range["start"])
+        end = parse_incident_time(time_range["end"])
+        lookback = max(1, int((end - start).total_seconds())) if start and end else requested_lookback
+        observation_window = time_range
+    else:
+        lookback = requested_lookback
+        observation_window = _observation_window(lookback)
 
     address = node
     if "{node}" in settings.system_agent_url:
@@ -124,6 +143,7 @@ async def system_log_query(settings: Settings, target: AnalysisTarget, args: dic
             "source": source,
             "lines": str(lines),
             **({"grep": grep} if grep else {}),
+            **({"since": time_range["start"], "until": time_range["end"]} if time_range else {}),
         },
         headers=headers,
     )
@@ -133,7 +153,6 @@ async def system_log_query(settings: Settings, target: AnalysisTarget, args: dic
         )
     raw_lines = _lines(response.data)[-lines:]
     matching = [line for line in raw_lines if _ERROR_PATTERNS.search(line)]
-    observation_window = _observation_window(lookback)
     observation = _system_log_observation(
         source=source,
         node=node,
@@ -142,9 +161,13 @@ async def system_log_query(settings: Settings, target: AnalysisTarget, args: dic
         scanned=len(raw_lines),
         matching=matching,
         observation_window=observation_window,
+        historical_scope=bool(time_range),
     )
     return {
-        "query": f"system logs source={source} node={node} lookback<={lookback}s lines<={lines}",
+        "query": (
+            f"system logs source={source} node={node} start={observation_window['start']} "
+            f"end={observation_window['end']} lines<={lines}"
+        ),
         "title": "Node system logs",
         "summary": (
             f"{observation['matching_line_count']} matching system-log line(s) in "
@@ -226,8 +249,10 @@ def _safe_grep(value: object) -> tuple[str, str]:
     return re.escape(literal), ""
 
 
-def _observation_window(lookback_seconds: int | None) -> dict[str, str]:
-    end = datetime.now(UTC)
+def _observation_window(
+    lookback_seconds: int | None, end: datetime | None = None
+) -> dict[str, str]:
+    end = end or datetime.now(UTC)
     start = end - timedelta(seconds=lookback_seconds or 0)
     return {"start": start.isoformat(), "end": end.isoformat()}
 
@@ -241,6 +266,7 @@ def _system_log_observation(
     scanned: int,
     matching: list[str],
     observation_window: dict[str, str],
+    historical_scope: bool,
 ) -> dict:
     """Summarise log matches without retaining raw lines or response bodies."""
     categories = {
@@ -264,9 +290,11 @@ def _system_log_observation(
         "observed_entity": {"kind": "node", "name": node},
         "window": {"lookback_seconds": lookback_seconds},
         "observation_window": observation_window,
-        "polarity": "present" if matching else "absent",
-        # A finite tail of node logs cannot prove a host-wide absence.
-        "coverage": "partial",
+        # A bounded journal query can prove a matching line was inside the
+        # incident window, but even that endpoint returns a finite tail: an
+        # empty response cannot prove host-wide absence.
+        "polarity": "present" if matching else "unknown",
+        "coverage": "scoped" if matching and historical_scope else "partial",
         "lookback_seconds": lookback_seconds,
         "result_limit": limit,
         "status": "ok",
@@ -274,6 +302,7 @@ def _system_log_observation(
         "matching_line_count": len(matching),
         "signal_types": signal_types,
         "body_included": False,
+        "historical_scope": historical_scope,
     }
 
 
@@ -410,19 +439,22 @@ class SystemCollector:
                 f"{sources_text}.",
             )
         elif incident_successful:
-            # Clean node is a POSITIVE finding only when the source covers the
-            # incident window. For historical incidents, that is journalctl.
-            status = "ok"
-            confidence = "medium"
+            # The endpoint returns a bounded journal tail. A clean tail is
+            # useful context, but cannot rule out a node signal elsewhere in
+            # the incident window.
+            status = "partial"
+            confidence = "low"
             deterministic = ko_en(
                 self._settings,
-                f"노드 {node}: incident 시간창의 journal에서 커널/GPU/하드웨어 "
-                "에러 시그니처가 없습니다. dmesg/syslog는 현재 상태 참고입니다."
+                f"노드 {node}: incident 시간창에서 가져온 journal 줄에는 커널/GPU/하드웨어 "
+                "에러 시그니처가 없습니다. 유한한 tail이므로 부재 증거는 아니며, "
+                "dmesg/syslog는 현재 상태 참고입니다."
                 if time_range
                 else f"노드 {node}: 시스템 에이전트 접속 정상, 최근 dmesg/journal/syslog에 "
                 "커널/GPU/하드웨어 에러 시그니처가 없습니다.",
-                f"Node {node}: no kernel/GPU/hardware error signatures in journal for "
-                "the incident window; dmesg/syslog are current-state context."
+                f"Node {node}: no kernel/GPU/hardware error signatures were found in the "
+                "retrieved journal lines for the incident window. The finite tail is not "
+                "absence evidence; dmesg/syslog are current-state context."
                 if time_range
                 else f"Node {node}: system agent reachable, no kernel/GPU/hardware "
                 "error signatures in recent dmesg/journal/syslog.",
@@ -499,7 +531,7 @@ def _system_observation(
         elif int(journal.get("error_count") or 0) > 0:
             polarity, coverage = "present", "scoped"
         else:
-            polarity, coverage = "absent", "scoped"
+            polarity, coverage = "unknown", "partial"
     else:
         successful = [item for item in source_results if not item.get("error")]
         if not successful:

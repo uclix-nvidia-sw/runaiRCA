@@ -132,8 +132,8 @@ async def test_reachable_but_clean(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(system_mod, "get_json", fake_get_json)
     result = await SystemCollector(_Settings()).collect(_target())
-    assert result.status == "ok"
-    assert result.confidence == "medium"
+    assert result.status == "partial"
+    assert result.confidence == "low"
     assert result.missing_data == []
 
 
@@ -169,15 +169,15 @@ async def test_historical_incident_scopes_journal_and_ignores_current_tails(
     assert all(
         "since" not in params for params in calls if params["source"] in {"dmesg", "syslog"}
     )
-    assert result.status == "ok"
-    assert result.confidence == "medium"
+    assert result.status == "partial"
+    assert result.confidence == "low"
     assert "journal" in result.summary
     assert result.details["time_range"] == {
         "start": "2026-01-02T02:55:00Z",
         "end": "2026-01-02T03:15:00Z",
     }
     observation = result.artifacts[0].result["observation"]
-    assert (observation["polarity"], observation["coverage"]) == ("absent", "scoped")
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
 
 
 @pytest.mark.asyncio
@@ -226,6 +226,52 @@ async def test_system_log_query_is_scoped_bounded_and_body_free(
     assert observation["body_included"] is False
     assert "raw-host-secret" not in str(query)
     assert "NVRM: Xid 79" not in str(query)
+
+
+@pytest.mark.asyncio
+async def test_system_log_query_scopes_historical_journal_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+
+    async def fake_get_json(**kwargs):
+        calls.append(kwargs)
+        return JsonResponse(
+            url="http://node/logs",
+            status_code=200,
+            data={"lines": ["NVRM: Xid 79"]},
+        )
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-07-13T21:43:47Z",
+        resolved_at="2026-07-13T21:45:47Z",
+    )
+
+    journal = await system_log_query(
+        _Settings(), target, {"source": "journal", "lookback_seconds": 60, "lines": 2}
+    )
+    dmesg = await system_log_query(
+        _Settings(), target, {"source": "dmesg", "lookback_seconds": 60, "lines": 2}
+    )
+
+    assert calls[0]["params"] == {
+        "source": "journal",
+        "lines": "2",
+        "since": "2026-07-13T21:38:47Z",
+        "until": "2026-07-13T21:50:47Z",
+    }
+    assert calls[1]["params"] == {"source": "dmesg", "lines": "2"}
+    assert journal["observation"]["historical_scope"] is True
+    assert journal["observation"]["observation_window"] == {
+        "start": "2026-07-13T21:38:47Z",
+        "end": "2026-07-13T21:50:47Z",
+    }
+    assert journal["observation"]["window"] == {"lookback_seconds": 720}
+    assert (journal["polarity"], journal["coverage"]) == ("present", "scoped")
+    assert dmesg["observation"]["historical_scope"] is False
+    assert dmesg["coverage"] == "partial"
 
 
 @pytest.mark.asyncio
