@@ -272,6 +272,24 @@ def test_eligibility_rejects_explicit_wrong_run_window_entity_or_topology() -> N
     assert not fact.eligibility.from_fact(fact, context={"topology": ["cluster:two"]}).support
 
 
+def test_eligibility_requires_an_observation_window_for_historical_support() -> None:
+    fact = normalize_artifact(
+        _artifact(source="kubernetes", summary="Pod was Evicted"), entity="pod:trainer-0"
+    )
+
+    eligibility = fact.eligibility.from_fact(
+        fact,
+        context={
+            "window_start": "2026-07-13T00:00:00Z",
+            "window_end": "2026-07-13T00:10:00Z",
+        },
+    )
+
+    assert not eligibility.support
+    assert eligibility.context
+    assert "window is missing" in eligibility.reason
+
+
 def test_precise_artifact_window_wins_and_is_classified_for_causal_review() -> None:
     fact = normalize_artifact(
         {

@@ -645,7 +645,19 @@ def _record_blackboard(blackboard: Any, result: CollectorResult, target: Analysi
             result,
             entity=entity,
             timestamp=str(getattr(target, "fired_at", "") or ""),
+            observed_window_start=str(getattr(target, "fired_at", "") or ""),
+            observed_window_end=str(
+                getattr(target, "resolved_at", "") or getattr(target, "fired_at", "") or ""
+            ),
         )
+    except TypeError:
+        # Compatibility with custom blackboards that only implement the
+        # original two-argument protocol. The built-in board always receives
+        # the historical window above.
+        try:
+            method(result.agent, result)
+        except Exception:  # noqa: BLE001 - shared reasoning is advisory
+            return
     except Exception:  # noqa: BLE001 - shared reasoning is advisory
         return
 

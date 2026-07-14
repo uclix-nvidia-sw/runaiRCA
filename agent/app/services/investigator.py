@@ -21,7 +21,13 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any
 
-from app.collectors.base import CollectorResult, artifact, salient_markers, signals_line
+from app.collectors.base import (
+    AnalysisTarget,
+    CollectorResult,
+    artifact,
+    salient_markers,
+    signals_line,
+)
 from app.collectors.kubernetes import (
     _READ_KINDS,
     k8s_describe,
@@ -446,7 +452,7 @@ async def investigate(
             lambda: _collect_safely(collector, target, _scoped_plan(plan, scope)),
         )
         evidence[name] = result
-        _record_blackboard(blackboard, name, result)
+        _record_blackboard(blackboard, name, result, target)
         if reporter:
             reporter.emit(
                 "investigation",
@@ -771,7 +777,7 @@ async def investigate(
                     warnings=[f"{name} failed unexpectedly: {type(exc).__name__}"],
                 )
             evidence[name] = result
-            _record_blackboard(blackboard, name, result)
+            _record_blackboard(blackboard, name, result, target)
         for task in pending:
             task.cancel()
         if pending:
@@ -826,7 +832,7 @@ async def investigate(
                     result=item,
                 )
             )
-        _record_blackboard(blackboard, "kubernetes", kubernetes_result)
+        _record_blackboard(blackboard, "kubernetes", kubernetes_result, target)
 
     results = list(evidence.values())
     context = {
@@ -932,16 +938,43 @@ def _build_user_prompt(
     )
 
 
-def _record_blackboard(blackboard: Any, agent: str, result: CollectorResult | None) -> None:
+def _record_blackboard(
+    blackboard: Any,
+    agent: str,
+    result: CollectorResult | None,
+    target: AnalysisTarget | None = None,
+) -> None:
     if blackboard is None or result is None:
         return
     for name in ("add_result", "add_collector_result"):
         method = getattr(blackboard, name, None)
         if callable(method):
             try:
-                method(agent, result)
+                kwargs: dict[str, str] = {}
+                if target is not None:
+                    kwargs = {
+                        "entity": next(
+                            (
+                                f"{field}:{value}"
+                                for field in ("pod", "node", "workload_name", "namespace")
+                                if (value := str(getattr(target, field, "") or "").strip())
+                            ),
+                            "",
+                        ),
+                        "timestamp": str(getattr(target, "fired_at", "") or ""),
+                        "observed_window_start": str(getattr(target, "fired_at", "") or ""),
+                        "observed_window_end": str(
+                            getattr(target, "resolved_at", "")
+                            or getattr(target, "fired_at", "")
+                            or ""
+                        ),
+                    }
+                method(agent, result, **kwargs)
             except TypeError:
-                method(result)
+                try:
+                    method(agent, result)
+                except TypeError:
+                    method(result)
             except Exception:  # noqa: BLE001 - blackboard is advisory
                 pass
             return

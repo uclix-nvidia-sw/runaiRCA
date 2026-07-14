@@ -174,13 +174,24 @@ class EvidenceEligibility:
         expected_run = _clean_text(context.get("run_id"))
         if expected_run and fact.run_id and expected_run != fact.run_id:
             return cls(False, False, False, "evidence belongs to a different run")
-        if not _window_compatible(
-            fact.observed_window_start,
-            fact.observed_window_end,
-            _clean_text(context.get("window_start")),
-            _clean_text(context.get("window_end")),
-        ):
-            return cls(False, False, False, "evidence is outside the incident window")
+        expected_window_start = _clean_text(context.get("window_start"))
+        expected_window_end = _clean_text(context.get("window_end"))
+        if expected_window_start or expected_window_end:
+            if not (fact.observed_window_start and fact.observed_window_end):
+                return cls(
+                    False,
+                    False,
+                    True,
+                    "evidence observation window is missing for this incident",
+                )
+        if expected_window_start or expected_window_end:
+            if not _window_compatible(
+                fact.observed_window_start,
+                fact.observed_window_end,
+                expected_window_start,
+                expected_window_end,
+            ):
+                return cls(False, False, False, "evidence is outside the incident window")
         expected_entities = _context_tokens(context.get("entities"))
         if expected_entities and fact.entity and not _tokens_overlap(
             _context_tokens((fact.entity,)), expected_entities
@@ -700,16 +711,16 @@ def _tokens_overlap(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
 def _window_compatible(
     observed_start: str, observed_end: str, incident_start: str, incident_end: str
 ) -> bool:
-    """Reject only explicit non-overlap; missing context remains compatible."""
+    """Return whether two complete observation windows overlap."""
     if not (observed_start and observed_end and incident_start and incident_end):
-        return True
+        return False
     try:
         start = _parse_time(observed_start)
         end = _parse_time(observed_end)
         incident_from = _parse_time(incident_start)
         incident_to = _parse_time(incident_end)
     except ValueError:
-        return True
+        return False
     return start <= incident_to and end >= incident_from
 
 

@@ -13,6 +13,7 @@ from app.plan import InvestigationPlan
 from app.schemas import AlertAnalysisArtifact
 from app.services import drilldown
 from app.services.drilldown import _tool_runai_get, run_drilldowns
+from app.services.evidence_blackboard import Blackboard
 from tests.test_orchestrator import make_settings
 
 
@@ -74,6 +75,25 @@ def test_disabled_flag_means_no_llm_calls(monkeypatch) -> None:
     asyncio.run(run_drilldowns(settings, [result], _target(), None))
     assert calls == []
     assert result.artifacts == []
+
+
+def test_drilldown_blackboard_records_the_incident_window() -> None:
+    target = replace(
+        _target(), fired_at="2026-07-10T01:00:00Z", resolved_at="2026-07-10T01:10:00Z"
+    )
+    board = Blackboard()
+
+    drilldown._record_blackboard(board, _k8s_result(), target)
+
+    fact = board.facts()[0]
+    assert fact.observation_window == ("2026-07-10T01:00:00Z", "2026-07-10T01:10:00Z")
+    assert fact.eligibility.from_fact(
+        fact,
+        context={
+            "window_start": "2026-07-10T01:00:00Z",
+            "window_end": "2026-07-10T01:10:00Z",
+        },
+    ).support
 
 
 def test_drilldown_appends_tagged_artifacts_and_stops_on_done(monkeypatch) -> None:
