@@ -893,6 +893,54 @@ async def test_evidence_stage_scopes_followup_target_to_the_plan(monkeypatch) ->
     )
 
 
+@pytest.mark.asyncio
+async def test_resolved_incident_keeps_alert_pod_for_followups(monkeypatch) -> None:
+    """A current replacement must not erase historical Event identity."""
+    from app.plan import InvestigationPlan
+    from app.progress import ProgressReporter
+
+    seen: dict[str, str] = {}
+
+    async def fake_k8s_followup(settings, k8s_result, target, **kwargs):
+        seen["k8s"] = target.pod
+        return []
+
+    async def fake_prom_followup(settings, prom_result, k8s_result, target, **kwargs):
+        seen["prom"] = target.pod
+        return []
+
+    monkeypatch.setattr("app.collectors.kubernetes.k8s_followup", fake_k8s_followup)
+    monkeypatch.setattr("app.collectors.prometheus.prometheus_followup", fake_prom_followup)
+    alert_target = replace(
+        make_target(),
+        pod="toolkit-dead1",
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    state = pipeline.PipelineState(
+        settings=make_settings(),
+        request=AlertAnalysisRequest(
+            alert=Alert(
+                status="resolved",
+                labels={},
+                annotations={},
+                startsAt=alert_target.fired_at,
+                endsAt=alert_target.resolved_at,
+            )
+        ),
+        target=alert_target,
+        progress=ProgressReporter(make_settings(), run_id=""),
+        masker=None,
+        collectors=[],
+        # Simulates the replacement Pod selected by a live plan lookup.
+        plan=InvestigationPlan(pod="toolkit-live2", namespaces=[alert_target.namespace]),
+    )
+
+    await pipeline.evidence_stage(state)
+
+    assert seen == {"k8s": "toolkit-dead1", "prom": "toolkit-dead1"}
+
+
 def test_blackboard_aliases_do_not_merge_same_summary_from_different_pods() -> None:
     fired = "2026-07-13T10:00:00Z"
     resolved = "2026-07-13T10:05:00Z"

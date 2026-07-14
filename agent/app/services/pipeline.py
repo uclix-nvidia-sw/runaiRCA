@@ -179,6 +179,16 @@ def _evidence_budget_exceeded(state: PipelineState) -> bool:
     return deadline is not None and time.monotonic() >= deadline
 
 
+def _is_resolved_reanalysis(request: AlertAnalysisRequest) -> bool:
+    """Whether this run must preserve the alert's historical resource identity.
+
+    A replacement Pod discovered *now* is useful for a firing alert, but it is
+    not the Pod that a resolved alert fired on.  Retargeting Event reads to it
+    can turn the old Pod's warning events into a false historical absence.
+    """
+    return str(getattr(request.alert, "status", "") or "").strip().casefold() == "resolved"
+
+
 def _aggregate_evidence(state: PipelineState) -> None:
     kg_warnings = getattr(state.kg_context, "warnings", []) if state.kg_context is not None else []
     state.capabilities = {result.agent: result.status for result in state.results}
@@ -229,12 +239,23 @@ async def plan_stage(state: PipelineState) -> PipelineState:
         list(state.request.similar_incidents),
         recent_changes,
     )
+    # For a resolved incident, retain the alert-declared Pod for all causal
+    # reads.  A planner/live lookup may identify a replacement that exists
+    # today, but it cannot substitute for the historical event identity.
+    if _is_resolved_reanalysis(state.request) and state.target.pod:
+        if state.plan.pod and state.plan.pod != state.target.pod:
+            _log.info(
+                "plan: preserving resolved alert pod %s instead of replacement %s",
+                state.target.pod,
+                state.plan.pod,
+            )
+        state.plan.pod = state.target.pod
     # Alert labels frequently name a pod the controller already replaced (grouped
     # CrashLoop occurrences) and carry no node label — so kubernetes GETs 404 and
     # the system agent skips node/kernel evidence entirely. Re-resolve a LIVE pod
     # and its node ONCE here; every collector then scopes off the plan.
     seed_pod = state.plan.pod or state.target.pod
-    if state.target.namespace and seed_pod:
+    if state.target.namespace and seed_pod and not _is_resolved_reanalysis(state.request):
         from app.collectors.kubernetes import resolve_live_pod_node
 
         live_pod, live_node = await resolve_live_pod_node(
@@ -278,6 +299,10 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
     settings = state.settings
     plan = state.plan
     assert plan is not None
+    # Keep this guard at the execution boundary too: callers/tests may provide
+    # a prebuilt plan without going through plan_stage.
+    if _is_resolved_reanalysis(state.request) and state.target.pod:
+        plan.pod = state.target.pod
     # The plan is authoritative after plan_stage — it may carry a re-resolved
     # LIVE pod/node for a stale alert pod. Scope the stage's working target ONCE
     # so the flowchart follow-ups, drill-down, and investigation loop query the
