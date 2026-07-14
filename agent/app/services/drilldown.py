@@ -86,6 +86,10 @@ _log = logging.getLogger(__name__)
 
 _RESULT_CHARS = 1500  # per-query result excerpt fed back into the loop
 _USER_PROMPT_CHARS = 6000
+# An adapter-owned sentinel cannot be supplied by a JSON/MCP response.  It
+# separates a collector-built observation envelope from arbitrary remote data
+# that happens to contain `observation`, `polarity`, or `coverage` fields.
+_VERIFIED_OBSERVATION = object()
 
 
 async def run_drilldowns(
@@ -303,10 +307,24 @@ async def _run_query(
     if not isinstance(outcome, dict):
         outcome = {"error": "tool returned no result"}
     error = outcome.get("error")
+    artifact_result = _typed_artifact_result(
+        outcome, error=error, tool=name, artifact_type=artifact_type
+    )
     probe = query.get("_ontology_probe")
     execution: dict[str, Any] = {}
     if artifact_type == "ontology_probe" and isinstance(probe, dict):
-        assessment = evaluate_probe(probe, outcome).as_dict()
+        # Evaluate against the final artifact envelope, not the raw tool
+        # response. A remote payload can repeat a signal token (and even
+        # top-level polarity/coverage fields) without being scoped evidence.
+        assessment_outcome = {
+            "status": "unavailable" if error else "ok",
+            "error": error,
+            "result": artifact_result,
+            "observation": artifact_result.get("observation"),
+        }
+        assessment = evaluate_probe(
+            probe, assessment_outcome, require_scoped_observation=True
+        ).as_dict()
         template_id = _template_id(probe)
         attempts = probe_attempts if probe_attempts is not None else {}
         attempt_index = attempts.get(template_id, 0) + 1
@@ -348,7 +366,6 @@ async def _run_query(
     summary = str(outcome.get("summary") or error or name)
     if markers:
         summary = f"{summary} — {signals_line(markers, getattr(settings, 'language', 'en'))}"
-    artifact_result = _typed_artifact_result(outcome, error=error, tool=name, artifact_type=artifact_type)
     result.artifacts.append(
         artifact(
             agent=result.agent,
@@ -392,7 +409,7 @@ def _typed_artifact_result(
     # let a remote response assert ``present/scoped`` without proving the
     # requested entity, value, or incident window. Only an adapter can opt in
     # to a typed verdict it constructed and validated itself.
-    verified_observation = outcome.get("_verified_observation") is True
+    verified_observation = outcome.get("_verified_observation") is _VERIFIED_OBSERVATION
     top_level_observation = outcome.get("observation")
     observation = (
         dict(top_level_observation)
@@ -1201,7 +1218,7 @@ async def _tool_k8s_change_timeline(
     # field in arbitrary remote JSON never gains causal authority.
     outcome = await change_query(settings, target, args)
     if isinstance(outcome, dict) and isinstance(outcome.get("observation"), dict):
-        outcome["_verified_observation"] = True
+        outcome["_verified_observation"] = _VERIFIED_OBSERVATION
     return outcome
 
 

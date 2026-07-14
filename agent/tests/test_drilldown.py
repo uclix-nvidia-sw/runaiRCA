@@ -478,7 +478,7 @@ def test_drilldown_runs_resolved_ontology_probe_before_llm_query(monkeypatch) ->
     assert [item.type for item in result.artifacts] == ["ontology_probe"]
 
 
-def test_ontology_probe_records_structured_support_verdict(monkeypatch) -> None:
+def test_ontology_probe_keeps_untyped_remote_signal_inconclusive(monkeypatch) -> None:
     async def fake_complete_json(settings, *, user, **_kwargs):
         return {"action": "done"}
 
@@ -513,8 +513,8 @@ def test_ontology_probe_records_structured_support_verdict(monkeypatch) -> None:
     assert assessment | {"executed_at": ""} == {
         "probe_id": "mount-check",
         "tool": "k8s_read",
-        "verdict": "supports",
-        "support_signals": ["FailedMount"],
+        "verdict": "inconclusive",
+        "support_signals": [],
         "refute_signals": [],
         "template_id": "mount-check",
         "attempt_index": 1,
@@ -524,6 +524,52 @@ def test_ontology_probe_records_structured_support_verdict(monkeypatch) -> None:
     assert assessment["executed_at"].endswith("Z")
     assert "execution_id" not in assessment
     assert "hypothesis_ids" not in assessment
+
+
+def test_ontology_probe_accepts_adapter_verified_scoped_observation(monkeypatch) -> None:
+    async def fake_complete_json(settings, *, user, **_kwargs):
+        return {"action": "done"}
+
+    async def fake_change_query(settings, target, args):
+        observation = {
+            "kind": "change_query",
+            "predicate": "change:event",
+            "polarity": "present",
+            "coverage": "scoped",
+            "observed_entity": {"kind": "namespace", "name": "runai-vision"},
+            "observation_window": {
+                "start": "2026-07-10T00:55:00Z",
+                "end": "2026-07-10T01:15:00Z",
+            },
+        }
+        return {
+            "summary": "one correlated FailedMount event",
+            "error": None,
+            "observation": observation,
+            "result": {"events": [{"reason": "FailedMount"}]},
+        }
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "change_query", fake_change_query)
+    plan = InvestigationPlan(
+        diagnostic_directive={
+            "probes": [
+                {
+                    "id": "mount-change-check",
+                    "tool": "k8s_change_timeline",
+                    "arguments_template": {"source": "event"},
+                    "support_signal_any": ["FailedMount"],
+                }
+            ]
+        }
+    )
+    result = _k8s_result()
+
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), plan))
+
+    assessment = result.details["ontology_probe_assessments"][0]
+    assert assessment["verdict"] == "supports"
+    assert assessment["support_signals"] == ["FailedMount"]
 
 
 def test_ontology_probe_execution_uses_exact_template_hypotheses_and_run(monkeypatch) -> None:

@@ -36,7 +36,12 @@ class ProbeAssessment:
         }
 
 
-def evaluate_probe(probe: dict[str, Any], outcome: dict[str, Any]) -> ProbeAssessment:
+def evaluate_probe(
+    probe: dict[str, Any],
+    outcome: dict[str, Any],
+    *,
+    require_scoped_observation: bool = False,
+) -> ProbeAssessment:
     """Evaluate explicit probe signals against returned observation text.
 
     Refutation wins when both sides match: a mixed result is a contradiction,
@@ -46,8 +51,19 @@ def evaluate_probe(probe: dict[str, Any], outcome: dict[str, Any]) -> ProbeAsses
     probe_id = str(probe.get("id") or probe.get("probe_id") or probe.get("tool") or "probe")
     tool = str(probe.get("tool") or "")
     status = str(outcome.get("status") or "").strip().lower()
-    polarity = str(outcome.get("polarity") or "").strip().lower()
-    coverage = str(outcome.get("coverage") or "").strip().lower()
+    observation = outcome.get("observation")
+    if require_scoped_observation:
+        # Drill-down adapters first project their remote response through the
+        # artifact observation contract.  Do not evaluate top-level fields or
+        # a similarly named object inside an arbitrary response body: neither
+        # proves identity, timing, or complete query coverage.
+        if not isinstance(observation, dict):
+            return ProbeAssessment(probe_id, tool, "inconclusive")
+        polarity = str(observation.get("polarity") or "").strip().lower()
+        coverage = str(observation.get("coverage") or "").strip().lower()
+    else:
+        polarity = str(outcome.get("polarity") or "").strip().lower()
+        coverage = str(outcome.get("coverage") or "").strip().lower()
     if (
         outcome.get("error")
         or status in {"unavailable", "error", "failed", "timeout"}
@@ -57,6 +73,11 @@ def evaluate_probe(probe: dict[str, Any], outcome: dict[str, Any]) -> ProbeAsses
     # An unknown result may describe a failed/partial retrieval in its summary.
     # It must never become support merely because that summary repeats a signal.
     if polarity == "unknown":
+        return ProbeAssessment(probe_id, tool, "inconclusive")
+    if require_scoped_observation and coverage != "scoped":
+        # A partial match may guide the next query, but it is not a verdict on
+        # the declared probe. In particular it must not be rendered as
+        # `supports` merely because the returned body repeats a token.
         return ProbeAssessment(probe_id, tool, "inconclusive")
     # Empty scope can be informative only when an authored probe explicitly
     # declares absence as a refuter. Existing probes do not do that, so retain
