@@ -303,6 +303,26 @@ def test_text_only_success_cannot_bypass_typed_observation_link_gate() -> None:
     assert verdict.gates["invalid_evidence_links"] is True
 
 
+def test_contextual_eligibility_map_missing_an_id_fails_closed() -> None:
+    """A blackboard alias miss cannot re-promote a raw scoped-positive card."""
+    results = [_result("loki", "unrelated workload OOMKilled")]
+    results[0].artifacts[0].result = {"observation": _scoped_observation()}
+    assign_evidence_ids(results)
+
+    verdict = evaluate(
+        _response("## Root Cause\n\nOOMKilled [E01]."),
+        results,
+        [RankedCause("workload_runtime_error", "medium", 5)],
+        evidence_links=[{"evidence_id": "E01", "role": "support"}],
+        # Production passes this map after contextual target/window matching.
+        # E01 being absent must mean it is unresolved/ineligible, not allowed.
+        evidence_eligibility={"E02": object()},
+    )
+
+    assert verdict.claims[0]["supporting_evidence"] == []
+    assert verdict.gates["invalid_evidence_links"] is True
+
+
 def test_analysis_hash_changes_when_the_approved_reasoning_changes() -> None:
     response = _response()
     response.context = {

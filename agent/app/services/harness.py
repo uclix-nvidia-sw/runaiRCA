@@ -118,7 +118,16 @@ def validate_evidence_links(
             continue
         eligibility = (eligibility_by_id or {}).get(link.fact_id)
         permits = getattr(eligibility, "permits", None)
-        if callable(permits) and not permits(link.role):
+        if not callable(permits):
+            # A pipeline-provided map is the context-aware target/window/run
+            # gate.  An ID missing from it is not a legacy success fallback:
+            # it was not resolved to an eligible blackboard fact, so cannot
+            # become support merely because a caller cited it explicitly.
+            errors.append(
+                f"link[{index}] has no eligibility verdict for {link.fact_id!r}"
+            )
+            continue
+        if not permits(link.role):
             reason = str(getattr(eligibility, "reason", "") or "ineligible observation")
             errors.append(
                 f"link[{index}] cannot use {link.fact_id!r} as {link.role}: {reason}"
@@ -168,7 +177,15 @@ def evaluate(
         for item in all_artifacts
         if getattr(item, "evidence_id", "")
     ]
-    eligibility_by_id = dict(evidence_eligibility or _artifact_eligibility(all_artifacts))
+    # ``None`` means this standalone harness caller has no blackboard context,
+    # so derive typed artifact eligibility locally.  An explicitly supplied
+    # (including empty) map is authoritative and must remain fail-closed for
+    # evidence IDs it does not contain.
+    eligibility_by_id = (
+        dict(_artifact_eligibility(all_artifacts))
+        if evidence_eligibility is None
+        else dict(evidence_eligibility)
+    )
     supplied_links = _supplied_evidence_links(response, top, evidence_links)
     links, link_errors = validate_evidence_links(
         supplied_links, all_ids, eligibility_by_id=eligibility_by_id
