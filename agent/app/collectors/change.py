@@ -175,14 +175,21 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
     if component:
         changes = [item for item in changes if str(item.get("name") or "") == component]
     changes.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+    correlated_changes, context_changes = _partition_target_changes(
+        changes,
+        target=target,
+        primary_namespace=namespace,
+        dependency_namespaces=[],
+    )
     observation = _change_observation(
         namespace=namespace,
         node=node,
         source=source,
         lookback_seconds=lookback,
         limit=limit,
-        changes=changes[:limit],
-        truncated=max(0, len(changes) - limit),
+        changes=correlated_changes[:limit],
+        context_changes=context_changes,
+        truncated=max(0, len(correlated_changes) - limit),
         warnings=warnings,
         component=component,
         observation_window=observation_window,
@@ -271,6 +278,7 @@ def _change_observation(
     lookback_seconds: int,
     limit: int,
     changes: list[dict],
+    context_changes: list[dict],
     truncated: int,
     warnings: list[str],
     component: str,
@@ -301,13 +309,20 @@ def _change_observation(
         "polarity": (
             "present"
             if safe_changes
-            else ("unknown" if warnings or not historical_window else "absent")
+            else (
+                "unknown"
+                if warnings or not historical_window or context_changes
+                else "absent"
+            )
         ),
-        "coverage": "partial" if warnings or not historical_window else "scoped",
+        "coverage": (
+            "partial" if warnings or not historical_window or context_changes else "scoped"
+        ),
         "lookback_seconds": lookback_seconds,
         "result_limit": limit,
         "status": "partial" if warnings else "ok",
         "changes": safe_changes,
+        "context_change_count": len(context_changes),
         "truncated_count": truncated,
         "body_included": False,
         "historical_window": historical_window,
@@ -990,6 +1005,7 @@ def _partition_target_changes(
     workload = str(target.workload_name or "").strip().casefold()
     pod = str(target.pod or "").strip().casefold()
     node = str(target.node or "").strip().casefold()
+    component = str(target.component or "").strip().casefold()
     dependency_set = {str(namespace).strip() for namespace in dependency_namespaces}
     for change in changes:
         name = str(change.get("name") or "").strip().casefold()
@@ -1006,8 +1022,9 @@ def _partition_target_changes(
         elif namespace == primary_namespace and (
             (pod and name == pod)
             or (workload and (name == workload or name.startswith(f"{workload}-")))
+            or (component and name == component)
         ):
-            relation = "target_workload"
+            relation = "target_component" if component and name == component else "target_workload"
         if relation:
             correlated.append({**change, "relation": relation})
         else:

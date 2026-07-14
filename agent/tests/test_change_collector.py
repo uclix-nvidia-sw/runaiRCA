@@ -450,6 +450,38 @@ async def test_change_query_uses_the_historical_incident_window(
 
 
 @pytest.mark.asyncio
+async def test_change_query_keeps_unrelated_namespace_history_as_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, path, **kwargs):
+        if path.endswith("/events"):
+            return JsonResponse(url="u", status_code=200, data={"items": [
+                {
+                    "type": "Warning",
+                    "reason": "BackOff",
+                    "lastTimestamp": "2026-07-13T21:44:00Z",
+                    "involvedObject": {"name": "unrelated-worker", "kind": "Pod"},
+                }
+            ]})
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-07-13T21:43:47Z",
+        resolved_at="2026-07-13T21:45:47Z",
+    )
+    query = await change_query(_Settings(), target, {"kind": "event"})
+
+    observation = query["observation"]
+    assert observation["changes"] == []
+    assert observation["context_change_count"] == 1
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+
+
+@pytest.mark.asyncio
 async def test_change_query_marks_paginated_history_as_partial(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
