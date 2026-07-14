@@ -1205,7 +1205,17 @@ def _evidence_context(state: PipelineState) -> dict[str, object]:
     target = state.target
     entities = tuple(
         f"{field}:{value}"
-        for field in ("pod", "node", "workload_name", "namespace", "storage_claim", "service")
+        for field in (
+            "pod",
+            "node",
+            "workload_name",
+            "runai_workload_id",
+            "project",
+            "queue",
+            "namespace",
+            "storage_claim",
+            "service",
+        )
         if (value := str(getattr(target, field, "") or "").strip())
     )
     topology = tuple(

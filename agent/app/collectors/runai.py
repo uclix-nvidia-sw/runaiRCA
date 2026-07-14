@@ -533,21 +533,13 @@ def _runai_query_observation(
             polarity, coverage = "unavailable", "unknown"
     elif name == "version" or not expected:
         polarity, coverage = "unknown", "partial"
-    elif _runai_data_contains_identity(item.get("data"), expected):
+    elif _runai_data_contains_identity(item.get("data"), expected, resource=name):
         polarity, coverage = "present", "scoped"
     elif _runai_is_explicitly_empty(item.get("data")):
-        # A direct lookup or the MCP workload query is identity-filtered. Broad
-        # MCP inventory calls can be paginated, so even an empty page is not a
-        # reliable statement that the target resource does not exist.
-        if not used_mcp or name == "workloads":
-            polarity, coverage = "absent", "scoped"
-        else:
-            polarity, coverage = "unknown", "partial"
-    elif not used_mcp and name in {"workload_by_id", "project", "queue"}:
-        # These direct endpoints are exact resource paths. A workloads response
-        # is a filtered list and must still contain the requested identity: API
-        # versions/proxies can silently ignore its filter parameters.
-        polarity, coverage = "present", "scoped"
+        # A successful but empty body can be an ignored filter, an API gateway
+        # envelope, or a truncated MCP response. Only an explicit 404 above
+        # proves current absence for an exact Run:ai resource.
+        polarity, coverage = "unknown", "partial"
     else:
         polarity, coverage = "unknown", "partial"
     # The Run:ai API exposes present resource state; unlike audit/event APIs it
@@ -563,6 +555,7 @@ def _runai_query_observation(
         "polarity": polarity,
         "coverage": coverage,
         "expected_identity": expected,
+        "observed_entity": _runai_observed_entity(name, target),
         "status_code": status_code,
         "observation_window": time_range or {},
     }
@@ -578,23 +571,67 @@ def _runai_expected_identity(name: str, target: AnalysisTarget) -> str:
     return ""
 
 
-def _runai_data_contains_identity(data: object, expected: str) -> bool:
-    """Look only at identity-shaped fields; do not keyword-match arbitrary text."""
+def _runai_data_contains_identity(data: object, expected: str, *, resource: str) -> bool:
+    """Match only the queried resource's own identity fields.
+
+    A workload response can embed a Project/Queue object. Recursing through
+    every nested ``name`` made such context look like a matching workload.
+    Traverse only known result envelopes, then inspect each resource item's
+    top-level identity fields.
+    """
     wanted = expected.strip().casefold()
     if not wanted:
         return False
-    if isinstance(data, dict):
-        for key, value in data.items():
-            key_name = str(key).replace("_", "").replace("-", "").casefold()
-            if key_name in {
-                "name", "id", "workload name", "workload id", "project name", "queue name"
-            } and str(value).strip().casefold() == wanted:
+    fields = {
+        "workloads": {"name", "id", "workloadname", "workloadid"},
+        "workload_by_id": {"name", "id", "workloadname", "workloadid"},
+        "project": {"name", "id", "project", "projectname"},
+        "projects": {"name", "id", "project", "projectname"},
+        "queue": {"name", "id", "queue", "queuename"},
+        "queues": {"name", "id", "queue", "queuename"},
+    }.get(resource, {"name", "id"})
+    for item in _runai_resource_items(data, resource):
+        for key, value in item.items():
+            normalized = str(key).replace("_", "").replace("-", "").casefold()
+            if normalized in fields and str(value).strip().casefold() == wanted:
                 return True
-            if _runai_data_contains_identity(value, expected):
-                return True
-    elif isinstance(data, list):
-        return any(_runai_data_contains_identity(value, expected) for value in data)
     return False
+
+
+def _runai_resource_items(data: object, resource: str) -> list[dict[str, object]]:
+    """Flatten only API collection/envelope layers, never nested resource context."""
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if isinstance(data, dict):
+        collection_keys = {
+            "workloads": ("workloads", "items", "data", "results"),
+            "workload_by_id": ("workloads", "items", "data", "results"),
+            "project": ("projects", "items", "data", "results"),
+            "projects": ("projects", "items", "data", "results"),
+            "queue": ("queues", "items", "data", "results"),
+            "queues": ("queues", "items", "data", "results"),
+        }.get(resource, ("items", "data", "results"))
+        items: list[dict[str, object]] = [data]
+        for key in collection_keys:
+            value = data.get(key)
+            if isinstance(value, list):
+                items.extend(item for item in value if isinstance(item, dict))
+            elif isinstance(value, dict):
+                items.append(value)
+        return items
+    return []
+
+
+def _runai_observed_entity(name: str, target: AnalysisTarget) -> dict[str, str]:
+    if name in {"workloads", "workload_by_id"}:
+        if target.runai_workload_id:
+            return {"kind": "runai_workload_id", "name": target.runai_workload_id}
+        return {"kind": "workload_name", "name": target.workload_name}
+    if name in {"project", "projects"}:
+        return {"kind": "project", "name": target.project}
+    if name in {"queue", "queues"}:
+        return {"kind": "queue", "name": target.queue}
+    return {}
 
 
 def _runai_is_explicitly_empty(data: object) -> bool:

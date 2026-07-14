@@ -483,6 +483,32 @@ def test_runai_query_observation_requires_identity_scoped_coverage() -> None:
     )
 
 
+def test_runai_identity_does_not_match_nested_context_or_wrong_direct_resource() -> None:
+    target = make_target()
+    nested = runai._runai_query_observation(
+        {
+            "name": "workloads",
+            "status_code": 200,
+            "data": {"workloads": [{"name": "other", "project": {"name": "trainer"}}]},
+        },
+        target=target,
+        used_mcp=False,
+    )
+    wrong_project = runai._runai_query_observation(
+        {"name": "project", "status_code": 200, "data": {"name": "other-project"}},
+        target=target,
+        used_mcp=False,
+    )
+    empty_project = runai._runai_query_observation(
+        {"name": "project", "status_code": 200, "data": {}}, target=target, used_mcp=False
+    )
+
+    assert (nested["polarity"], nested["coverage"]) == ("unknown", "partial")
+    assert (wrong_project["polarity"], wrong_project["coverage"]) == ("unknown", "partial")
+    assert (empty_project["polarity"], empty_project["coverage"]) == ("unknown", "partial")
+    assert nested["observed_entity"] == {"kind": "workload_name", "name": "trainer"}
+
+
 def test_runai_current_resource_state_is_context_for_historical_incident() -> None:
     target = replace(
         make_target(),
