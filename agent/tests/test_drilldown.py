@@ -12,7 +12,7 @@ from app.llm import begin_usage_tracking
 from app.plan import InvestigationPlan
 from app.schemas import AlertAnalysisArtifact
 from app.services import drilldown
-from app.services.drilldown import _tool_runai_get, run_drilldowns
+from app.services.drilldown import _tool_logql, _tool_promql, _tool_runai_get, run_drilldowns
 from app.services.evidence_blackboard import Blackboard
 from app.services.root_cause_ranking import _artifact_is_evidence
 from tests.test_orchestrator import make_settings
@@ -95,6 +95,43 @@ def test_drilldown_blackboard_records_the_incident_window() -> None:
             "window_end": "2026-07-10T01:10:00Z",
         },
     ).support
+
+
+@pytest.mark.asyncio
+async def test_metric_and_log_drilldowns_preserve_mcp_errors_and_incident_window(
+    monkeypatch,
+) -> None:
+    target = replace(
+        _target(), fired_at="2026-07-10T01:00:00Z", resolved_at="2026-07-10T01:10:00Z"
+    )
+    seen_prom_window: dict[str, str] | None = None
+    seen_loki_window: dict[str, str] | None = None
+
+    async def fake_prom_mcp(settings, name, query, *, time_range=None):
+        nonlocal seen_prom_window
+        seen_prom_window = time_range
+        return {"error": "Prometheus MCP response missing data.result"}
+
+    async def fake_loki_mcp(settings, name, query, *, time_range=None):
+        nonlocal seen_loki_window
+        seen_loki_window = time_range
+        return {"error": "Loki MCP response missing a recognized log result"}
+
+    monkeypatch.setattr(drilldown, "prom_mcp_query", fake_prom_mcp)
+    monkeypatch.setattr(drilldown, "loki_mcp_query", fake_loki_mcp)
+    settings = drill_settings(
+        prometheus_mcp_url="http://prom-mcp",
+        loki_mcp_url="http://loki-mcp",
+    )
+
+    prom = await _tool_promql(settings, target, {"query": "up"})
+    logs = await _tool_logql(settings, target, {"query": '{namespace="runai-vision"}'})
+
+    expected = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    assert seen_prom_window == expected
+    assert seen_loki_window == expected
+    assert prom["error"] == "Prometheus MCP response missing data.result"
+    assert logs["error"] == "Loki MCP response missing a recognized log result"
 
 
 def test_drilldown_appends_tagged_artifacts_and_stops_on_done(monkeypatch) -> None:

@@ -41,6 +41,7 @@ from app.collectors.base import (
     AnalysisTarget,
     CollectorResult,
     artifact,
+    incident_time_range,
     kubernetes_salient_markers,
     salient_markers,
     signals_line,
@@ -58,7 +59,13 @@ from app.collectors.kubernetes import (
     kubectl_repr,
     resolve_read_kind,
 )
-from app.collectors.loki import _loki_headers, _loki_streams, _sample_lines, loki_mcp_query
+from app.collectors.loki import (
+    _loki_headers,
+    _loki_native_response_complete,
+    _loki_streams,
+    _sample_lines,
+    loki_mcp_query,
+)
 from app.collectors.prometheus import prom_mcp_query, prom_query
 from app.collectors.runai_mcp import _tool_json, _tool_text
 from app.config import Settings
@@ -1244,14 +1251,21 @@ async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -
             "error": "empty PromQL query",
         }
     fallback = ""
+    time_range = incident_time_range(target)
     if settings.prometheus_mcp_url:
         try:
-            item = await prom_mcp_query(settings, "drilldown", promql)
+            item = await prom_mcp_query(
+                settings,
+                "drilldown",
+                promql,
+                time_range=time_range,
+            )
+            error = item.get("error")
             return {
                 "query": promql,
                 "title": title,
-                "summary": "MCP query_prometheus ok",
-                "error": None,
+                "summary": str(error) if error else "MCP query_prometheus ok",
+                "error": error,
                 "result": item,
             }
         except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
@@ -1260,7 +1274,7 @@ async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -
         fallback = f"{MCP_FALLBACK_WARNING}: PROMETHEUS_MCP_URL not configured"
     if not settings.prometheus_url:
         return {"query": promql, "title": title, "summary": fallback, "error": fallback}
-    item = await prom_query(settings, "drilldown", promql)
+    item = await prom_query(settings, "drilldown", promql, time_range=time_range)
     error = item.get("error")
     summary = str(error) if error else f"HTTP {item.get('status_code')}"
     return {
@@ -1284,14 +1298,21 @@ async def _tool_logql(settings: Settings, target: AnalysisTarget, args: dict) ->
             "error": "empty LogQL query",
         }
     fallback = ""
+    time_range = incident_time_range(target)
     if settings.loki_mcp_url:
         try:
-            item = await loki_mcp_query(settings, "drilldown", logql)
+            item = await loki_mcp_query(
+                settings,
+                "drilldown",
+                logql,
+                time_range=time_range,
+            )
+            error = item.get("error")
             return {
                 "query": logql,
                 "title": title,
-                "summary": f"{item.get('line_count', 0)} MCP log line(s)",
-                "error": None,
+                "summary": str(error) if error else f"{item.get('line_count', 0)} MCP log line(s)",
+                "error": error,
                 "result": item,
             }
         except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
@@ -1309,11 +1330,16 @@ async def _tool_logql(settings: Settings, target: AnalysisTarget, args: dict) ->
             "query": logql,
             "limit": str(settings.loki_query_limit),
             "direction": "BACKWARD",
+            **(time_range or {}),
         },
         headers=headers,
     )
-    if response.error or not response.ok:
-        error = response.error or f"HTTP {response.status_code}"
+    if response.error or not response.ok or not _loki_native_response_complete(response.data):
+        error = (
+            response.error
+            or (f"HTTP {response.status_code}" if not response.ok else "")
+            or "Loki response missing successful data.result"
+        )
         return {
             "query": logql,
             "title": title,

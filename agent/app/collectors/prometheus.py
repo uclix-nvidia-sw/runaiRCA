@@ -437,9 +437,21 @@ async def _collect_prometheus_mcp(
     ]
 
 
-async def prom_mcp_query(settings: Settings, name: str, promql: str) -> dict[str, object]:
+async def prom_mcp_query(
+    settings: Settings,
+    name: str,
+    promql: str,
+    *,
+    time_range: dict[str, str] | None = None,
+) -> dict[str, object]:
     datasource_uid = await _grafana_datasource_uid(settings.prometheus_mcp_url, "prometheus")
-    return await _mcp_query_prometheus(settings.prometheus_mcp_url, name, promql, datasource_uid)
+    return await _mcp_query_prometheus(
+        settings.prometheus_mcp_url,
+        name,
+        promql,
+        datasource_uid,
+        time_range=time_range,
+    )
 
 
 async def _mcp_query_prometheus(

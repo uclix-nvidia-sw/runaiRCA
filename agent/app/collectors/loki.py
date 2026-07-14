@@ -399,10 +399,21 @@ async def _collect_loki_mcp(
     ]
 
 
-async def loki_mcp_query(settings: Settings, name: str, logql: str) -> dict[str, object]:
+async def loki_mcp_query(
+    settings: Settings,
+    name: str,
+    logql: str,
+    *,
+    time_range: dict[str, str] | None = None,
+) -> dict[str, object]:
     datasource_uid = await _grafana_datasource_uid(settings.loki_mcp_url, "loki")
     return await _mcp_query_loki(
-        settings.loki_mcp_url, name, logql, settings.loki_query_limit, datasource_uid
+        settings.loki_mcp_url,
+        name,
+        logql,
+        settings.loki_query_limit,
+        datasource_uid,
+        time_range,
     )
 
 
