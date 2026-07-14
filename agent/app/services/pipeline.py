@@ -3155,7 +3155,39 @@ def _alert_text(request: AlertAnalysisRequest) -> str:
     (e.g. 'XID 79 ... GPU has fallen off the bus') even when every collector
     comes back empty."""
     alert = request.alert
-    parts = [str(v) for v in (alert.labels or {}).values()]
+    labels = alert.labels or {}
+    # Prometheus/Kubernetes alerts commonly encode a Boolean condition across
+    # two independent labels (for example condition=DiskPressure,status=false).
+    # Flattening mapping values preserves sender insertion order, so a false
+    # value before its condition could evade the keyword negation logic and turn
+    # a healthy condition into RCA support. Recompose that structured pair
+    # before adding ordinary label values.
+    normalized = {str(key).casefold(): str(value) for key, value in labels.items()}
+    condition_keys = [key for key in normalized if "condition" in key and normalized[key].strip()]
+    state_key = next(
+        (
+            key
+            for key in ("status", "value", "active", "state")
+            if normalized.get(key, "").strip()
+        ),
+        "",
+    )
+    paired = set(condition_keys)
+    if state_key and condition_keys:
+        paired.add(state_key)
+    parts = [
+        (
+            f"{normalized[key]} is {normalized[state_key]}"
+            if state_key
+            else normalized[key]
+        )
+        for key in condition_keys
+    ]
+    parts.extend(
+        str(value)
+        for key, value in labels.items()
+        if str(key).casefold() not in paired
+    )
     parts.extend(str(v) for v in (alert.annotations or {}).values())
     return " ".join(parts)
 

@@ -6,7 +6,7 @@ empty (the exact production case: system agent unreachable, loki failed)."""
 from __future__ import annotations
 
 from app.collectors.base import CollectorResult, artifact
-from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+from app.knowledge import _keyword_hits, load_failure_modes, match_failure_mode_symptoms
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services.pipeline import (
     _alert_text,
@@ -33,6 +33,30 @@ def _xid_request() -> AlertAnalysisRequest:
 def test_xid_code_extracted_from_alert_text_alone() -> None:
     # No collector evidence at all — the code must still come from the alert.
     assert _xid_codes_from_results([], _alert_text(_xid_request())) == [79]
+
+
+def test_alert_condition_false_is_not_dependent_on_label_order() -> None:
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            # State deliberately appears first: the old value-only flattening
+            # could miss that it negates the condition.
+            labels={
+                "status": "false",
+                "condition": "DiskPressure",
+                "alertname": "Node condition check",
+            },
+            annotations={},
+            fingerprint="fp-false-condition",
+        )
+    )
+
+    text = _alert_text(request)
+    hits, negated = _keyword_hits(text.lower(), ["diskpressure"])
+
+    assert "DiskPressure is false" in text
+    assert hits == []
+    assert negated is True
 
 
 def test_xid_code_extracted_from_drilldown_artifact() -> None:
