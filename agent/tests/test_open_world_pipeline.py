@@ -344,7 +344,9 @@ def test_reasoning_trace_v3_exposes_precise_observation_timing() -> None:
 
     fact = state.investigation_context["reasoning_trace_v3"]["evidence"][0]
     assert fact["source_group"] == "external_audit"
-    assert fact["temporal_relation"] == "precedes_incident"
+    # The five-minute causal prelude is part of the investigation window so a
+    # rollout immediately before an alert can be evaluated as its trigger.
+    assert fact["temporal_relation"] == "during_incident"
 
 
 def test_reasoning_trace_v3_uses_assessment_hypothesis_ids_without_family_inference() -> None:

@@ -81,6 +81,28 @@ def incident_time_range(target: AnalysisTarget) -> dict[str, str] | None:
     }
 
 
+def causal_evidence_time_range(target: AnalysisTarget) -> dict[str, str] | None:
+    """Return the bounded time span that may substantiate an incident cause.
+
+    Collection retains a short post-resolution epilogue so a collector can
+    establish recovery, but an observation that first appears only after the
+    alert resolved is not evidence of its cause.  The causal span therefore
+    keeps the collection prelude (which can contain the trigger) while ending
+    at resolution.  For a firing alert, :func:`incident_time_range` already
+    substitutes the bounded 15-minute duration for the unknown end.
+    """
+    window = incident_time_range(target)
+    if window is None:
+        return None
+    end = _parse_incident_time(window.get("end", ""))
+    if end is None:
+        return None
+    return {
+        "start": str(window.get("start") or ""),
+        "end": _format_incident_time(end - _INCIDENT_EPILOGUE),
+    }
+
+
 def parse_incident_time(value: object) -> datetime | None:
     """Parse a Kubernetes/Alertmanager timestamp without accepting local time."""
     return _parse_incident_time(str(value or ""))

@@ -110,11 +110,11 @@ def test_drilldown_blackboard_records_the_incident_window() -> None:
     drilldown._record_blackboard(board, result, target)
 
     fact = board.facts()[0]
-    assert fact.observation_window == ("2026-07-10T01:00:00Z", "2026-07-10T01:10:00Z")
+    assert fact.observation_window == ("2026-07-10T00:55:00Z", "2026-07-10T01:10:00Z")
     assert fact.eligibility.from_fact(
         fact,
         context={
-            "window_start": "2026-07-10T01:00:00Z",
+            "window_start": "2026-07-10T00:55:00Z",
             "window_end": "2026-07-10T01:10:00Z",
         },
     ).support

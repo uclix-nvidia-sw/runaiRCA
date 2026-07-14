@@ -17,6 +17,7 @@ from app.collectors.base import (
     NO_EVIDENCE,
     AnalysisTarget,
     CollectorResult,
+    causal_evidence_time_range,
     condition_observations,
     resolve_target,
 )
@@ -310,6 +311,7 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
     from app.collectors.kubernetes import _scope_target
 
     target = _scope_target(state.target, plan)
+    causal_window = causal_evidence_time_range(target) or {}
     state.investigation_context = {}
     from app.services.evidence_blackboard import Blackboard
 
@@ -370,8 +372,8 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
         state.results,
         entity=_blackboard_target_entity(target),
         timestamp=getattr(target, "fired_at", ""),
-        observed_window_start=getattr(target, "fired_at", ""),
-        observed_window_end=getattr(target, "resolved_at", "") or getattr(target, "fired_at", ""),
+        observed_window_start=str(causal_window.get("start") or ""),
+        observed_window_end=str(causal_window.get("end") or ""),
     )
     # Deterministic flowchart-driven follow-up: keep pulling k8s evidence based on
     # what was found (Pending -> events/quota/pvc -> storageclass; CrashLoop/
@@ -390,10 +392,8 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
             state.results,
             entity=_blackboard_target_entity(target),
             timestamp=getattr(target, "fired_at", ""),
-            observed_window_start=getattr(target, "fired_at", ""),
-            observed_window_end=(
-                getattr(target, "resolved_at", "") or getattr(target, "fired_at", "")
-            ),
+            observed_window_start=str(causal_window.get("start") or ""),
+            observed_window_end=str(causal_window.get("end") or ""),
         )
     except Exception:  # noqa: BLE001 - follow-up is best-effort, never fail analysis
         pass
@@ -593,9 +593,9 @@ def _blackboard_artifact_evidence_ids(state: PipelineState) -> dict[str, str]:
         "",
     )
     target_timestamp = str(getattr(target, "fired_at", "") or "")
-    target_window_end = str(
-        getattr(target, "resolved_at", "") or getattr(target, "fired_at", "") or ""
-    )
+    causal_window = causal_evidence_time_range(target) or {}
+    target_window_start = str(causal_window.get("start") or "")
+    target_window_end = str(causal_window.get("end") or "")
     facts_by_id = {str(getattr(fact, "fact_id", "")): fact for fact in facts}
     board_run_id = str(getattr(board, "_run_id", "") or "")
 
@@ -626,7 +626,7 @@ def _blackboard_artifact_evidence_ids(state: PipelineState) -> dict[str, str]:
                         artifact,
                         entity=target_entity,
                         timestamp=target_timestamp,
-                        observed_window_start=target_timestamp,
+                        observed_window_start=target_window_start,
                         observed_window_end=target_window_end,
                         source_group=source_group,
                         run_id=artifact_run_id or run_id or board_run_id,
@@ -1068,6 +1068,7 @@ async def rank_stage(state: PipelineState) -> PipelineState:
         "Ranking root-cause candidates",
         hypothesis_ledger=state.investigation_context.get("hypothesis_ledger"),
     )
+    eligible_support_ids = _eligible_support_ids_for_output(state)
     state.root_cause_candidates = rank_root_cause_candidates(
         state.target,
         state.results,
@@ -1078,6 +1079,7 @@ async def rank_stage(state: PipelineState) -> PipelineState:
         component=comp_name,
         depends_on_chain=comp_chain,
         lifecycle=lifecycle,
+        eligible_evidence_ids=eligible_support_ids,
     )
     # Signature-first headline: the keyword ranker only decides when NOTHING
     # specific matched. A specific signature — an NVIDIA XID (dispositive), a
@@ -1085,8 +1087,14 @@ async def rank_stage(state: PipelineState) -> PipelineState:
     # family directly; the ranker chronically mis-headlined these (e.g.
     # node_kubelet_pressure winning on "DiskPressure"/"kubelet" words present in
     # the k8s node-conditions text even when every condition is False).
-    state.observed = _observed_text(state.results, request)
-    state.xid_codes = _xid_codes_from_results(state.results, _alert_text(request))
+    state.observed = _observed_text(
+        state.results, request, eligible_support_ids=eligible_support_ids
+    )
+    state.xid_codes = _xid_codes_from_results(
+        state.results,
+        _alert_text(request),
+        eligible_support_ids=eligible_support_ids,
+    )
     # TypeDB is the runtime source of truth. The version-controlled YAML matcher
     # remains only for deployments where the graph is disabled/unavailable.
     state.failure_modes = (
@@ -1130,6 +1138,7 @@ async def rank_stage(state: PipelineState) -> PipelineState:
             depends_on_chain=comp_chain,
             lifecycle=lifecycle,
             graph_candidate_counts=graph_counts,
+            eligible_evidence_ids=eligible_support_ids,
         )
         if isinstance(getattr(state.kg_context, "reasoning", None), dict):
             state.kg_context.reasoning["candidate_families"] = graph_counts
@@ -1300,12 +1309,18 @@ def _evidence_context(state: PipelineState) -> dict[str, object]:
         for field in ("cluster", "project", "queue", "namespace", "node", "component")
         if (value := str(getattr(target, field, "") or "").strip())
     )
+    # Collection deliberately includes a five-minute prelude (to catch the
+    # trigger that led to the alert) and, for firing alerts, a bounded 15-minute
+    # forward interval.  The post-resolution collection epilogue is useful for
+    # confirming recovery, but it must not establish the cause of an incident
+    # that has already ended.  Keep the causal eligibility window aligned with
+    # that policy instead of collapsing every firing alert to its exact fired
+    # instant, which discarded all bounded post-fire observations.
+    causal_window = causal_evidence_time_range(target) or {}
     return {
         "run_id": str(state.request.incident_id or ""),
-        "window_start": str(getattr(target, "fired_at", "") or ""),
-        "window_end": str(
-            getattr(target, "resolved_at", "") or getattr(target, "fired_at", "") or ""
-        ),
+        "window_start": str(causal_window.get("start") or ""),
+        "window_end": str(causal_window.get("end") or ""),
         "entities": entities,
         "topology": topology,
     }
@@ -1430,6 +1445,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         gpu_model=_gpu_model_from(state.target, state.results),
     )
     _aggregate_evidence(state)
+    eligible_support_ids = _eligible_support_ids_for_output(state)
     state.warnings = sorted(set(state.warnings) | set(state.graph_fixes.warnings))
     # Optional change/timeline capability — added to the synthesis context.
     try:
@@ -1442,7 +1458,10 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         getattr(state.kg_context, "diagnostic_tree", {}), settings.failure_modes_file
     )
     state.troubleshooting_path = walk_tree(
-        diagnostic_tree, _observed_text(state.results, request)
+        diagnostic_tree,
+        _observed_text(
+            state.results, request, eligible_support_ids=eligible_support_ids
+        ),
     )
     if state.troubleshooting_path.get("path"):
         state.troubleshooting_path["source"] = diagnostic_source
@@ -1519,7 +1538,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         known_issues=state.known_issues,
         components=load_architecture(settings.architecture_file),
         masker=state.masker,
-        eligible_support_ids=_eligible_support_ids_for_output(state),
+        eligible_support_ids=eligible_support_ids,
     )
     # Korean LLM synthesis (preferred when language == "ko" and LLM configured):
     # rewrite summary + detail grounded STRICTLY in the evidence just gathered.
@@ -1904,6 +1923,7 @@ def _next_reanalysis_target(
         kg_blast = getattr(state.kg_context, "blast_radius_workloads", 0)
         comp_family, comp_name, comp_chain = _component_identity(state.settings, state.plan)
         lifecycle = _lifecycle_signal(state.results, comp_name, comp_chain)
+        eligible_support_ids = _eligible_support_ids_for_output(state)
         for candidate in rank_root_cause_candidates(
             state.target,
             state.results,
@@ -1915,6 +1935,7 @@ def _next_reanalysis_target(
             component=comp_name,
             depends_on_chain=comp_chain,
             lifecycle=lifecycle,
+            eligible_evidence_ids=eligible_support_ids,
         ):
             if candidate.family not in excluded:
                 return _ReanalysisTarget(
@@ -2032,6 +2053,31 @@ async def _reanalyze_once(
             merged[result.agent] = result
         merged_results = list(merged.values())
 
+        # Re-analysis returns fresh artifacts after the initial evidence-stage
+        # aggregation.  Give them response-local IDs and normalize them onto
+        # the same board before re-ranking; otherwise an out-of-window fresh
+        # card could influence this one path only because its eligibility map
+        # did not exist yet.
+        from app.services.harness import assign_evidence_ids
+
+        assign_evidence_ids(merged_results)
+        seed = getattr(state.blackboard, "seed_results", None)
+        if callable(seed):
+            causal_window = causal_evidence_time_range(state.target) or {}
+            seed(
+                merged_results,
+                entity=_blackboard_target_entity(state.target),
+                timestamp=str(getattr(state.target, "fired_at", "") or ""),
+                observed_window_start=str(causal_window.get("start") or ""),
+                observed_window_end=str(causal_window.get("end") or ""),
+            )
+        previous_results = state.results
+        state.results = merged_results
+        try:
+            eligible_support_ids = _eligible_support_ids_for_output(state)
+        finally:
+            state.results = previous_results
+
         lifecycle = _lifecycle_signal(merged_results, comp_name, comp_chain)
         candidates = rank_root_cause_candidates(
             state.target,
@@ -2043,15 +2089,24 @@ async def _reanalyze_once(
             component=comp_name,
             depends_on_chain=comp_chain,
             lifecycle=lifecycle,
+            eligible_evidence_ids=eligible_support_ids,
         )
         # The signature-first rule applies to the RE-rank too. Without it the
         # raw keyword ranker decided alone here — the 2026-07-08 re-analysis
         # "concluded" node_kubelet_pressure on a healthy node while the loki
         # reconcile errors still carried the real (signature-backed) cause.
-        observed = _observed_text(merged_results, state.request)
+        observed = _observed_text(
+            merged_results,
+            state.request,
+            eligible_support_ids=eligible_support_ids,
+        )
         candidates = _promote_signature_cause(
             candidates,
-            _xid_codes_from_results(merged_results, _alert_text(state.request)),
+            _xid_codes_from_results(
+                merged_results,
+                _alert_text(state.request),
+                eligible_support_ids=eligible_support_ids,
+            ),
             match_runai_known_issues(state.known_issues, observed),
             _gate_lifecycle_symptoms(
                 match_failure_mode_symptoms(state.failure_modes, observed), lifecycle
@@ -2138,7 +2193,19 @@ async def _synthesize_korean(
     """
     from app.collectors.http_json import compact
 
-    observed_text = _observed_text(results, request)
+    eligible_support_ids = (
+        {
+            evidence_id
+            for evidence_id, eligibility in (evidence_eligibility or {}).items()
+            if callable(getattr(eligibility, "permits", None))
+            and eligibility.permits("support")
+        }
+        if evidence_eligibility is not None
+        else None
+    )
+    observed_text = _observed_text(
+        results, request, eligible_support_ids=eligible_support_ids
+    )
     # The deterministic report receives the response-local eligibility set.  Do
     # the equivalent check before exposing graph fixes to the free-form Korean
     # synthesizer: graph edges and approved historical resolutions are useful
@@ -4100,13 +4167,18 @@ async def _sharpen_operator_questions(
 _XID_PATTERN = re.compile(r"\bxid\s*(?:\([^)]*\))?\s*[:=]?\s*(\d{1,4})", re.IGNORECASE)
 
 
-def _xid_codes_from_results(results: list[CollectorResult], alert_text: str = "") -> list[int]:
+def _xid_codes_from_results(
+    results: list[CollectorResult],
+    alert_text: str = "",
+    *,
+    eligible_support_ids: set[str] | None = None,
+) -> list[int]:
     """Distinct NVIDIA Xid codes in the alert's own text + loki/system/kubernetes
     evidence. The alert text matters: an NVRM Xid alert names its code even when
     every collector comes back empty."""
     texts = [alert_text] if alert_text else []
     texts.extend(
-        _stringify_result(result)
+        _stringify_result(result, eligible_support_ids=eligible_support_ids)
         for result in results
         if result.agent in ("loki", "system", "kubernetes") and _collector_is_evidence(result)
     )
@@ -4131,7 +4203,9 @@ def _gpu_model_from(target: AnalysisTarget, results: list[CollectorResult]) -> s
     return ""
 
 
-def _stringify_result(result: CollectorResult) -> str:
+def _stringify_result(
+    result: CollectorResult, *, eligible_support_ids: set[str] | None = None
+) -> str:
     """Render only causally usable text for signature-specific extractors.
 
     Structured collectors distinguish an observation's polarity and temporal
@@ -4143,7 +4217,13 @@ def _stringify_result(result: CollectorResult) -> str:
     artifacts = getattr(result, "artifacts", []) or []
     structured = any(_artifact_observation(art) is not None for art in artifacts)
     if structured:
-        artifacts = [art for art in artifacts if _artifact_is_scoped_support(art)]
+        artifacts = [
+            art
+            for art in artifacts
+            if _artifact_is_scoped_support(
+                art, eligible_support_ids=eligible_support_ids
+            )
+        ]
 
     parts = [] if structured else [result.summary or ""]
     parts.extend(art.summary or "" for art in artifacts if _artifact_is_evidence(art))

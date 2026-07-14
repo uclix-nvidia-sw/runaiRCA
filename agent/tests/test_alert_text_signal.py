@@ -139,6 +139,27 @@ def test_xid_code_uses_structured_scoped_positive_observation() -> None:
     assert _xid_codes_from_results([result]) == [79]
 
 
+def test_xid_code_ignores_contextually_ineligible_scoped_artifact() -> None:
+    """The signature path must honor the same E-id gate as catalog ranking."""
+    result = CollectorResult(agent="system", status="ok", summary="checked incident journal")
+    card = artifact(
+        agent="system",
+        source="system",
+        type="node_logs",
+        status="ok",
+        confidence="high",
+        summary="recovery-time journal contains Xid 79",
+        result={
+            "lines": ["NVRM: Xid 79 GPU has fallen off the bus"],
+            "observation": {"polarity": "present", "coverage": "scoped"},
+        },
+    )
+    card.evidence_id = "E01"
+    result.artifacts.append(card)
+
+    assert _xid_codes_from_results([result], eligible_support_ids=set()) == []
+
+
 def test_unavailable_artifact_xid_is_not_evidence() -> None:
     result = CollectorResult(agent="system", status="ok", summary="dcgm query failed")
     result.artifacts.append(

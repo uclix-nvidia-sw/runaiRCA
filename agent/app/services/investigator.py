@@ -25,6 +25,7 @@ from app.collectors.base import (
     AnalysisTarget,
     CollectorResult,
     artifact,
+    causal_evidence_time_range,
     incident_time_range,
     kubernetes_salient_markers,
     signals_line,
@@ -1104,6 +1105,7 @@ def _record_blackboard(
             try:
                 kwargs: dict[str, str] = {}
                 if target is not None:
+                    causal_window = causal_evidence_time_range(target) or {}
                     kwargs = {
                         "entity": next(
                             (
@@ -1114,12 +1116,8 @@ def _record_blackboard(
                             "",
                         ),
                         "timestamp": str(getattr(target, "fired_at", "") or ""),
-                        "observed_window_start": str(getattr(target, "fired_at", "") or ""),
-                        "observed_window_end": str(
-                            getattr(target, "resolved_at", "")
-                            or getattr(target, "fired_at", "")
-                            or ""
-                        ),
+                        "observed_window_start": str(causal_window.get("start") or ""),
+                        "observed_window_end": str(causal_window.get("end") or ""),
                     }
                 method(agent, result, **kwargs)
             except TypeError:

@@ -41,6 +41,7 @@ from app.collectors.base import (
     AnalysisTarget,
     CollectorResult,
     artifact,
+    causal_evidence_time_range,
     incident_time_range,
     kubernetes_salient_markers,
     salient_markers,
@@ -720,16 +721,15 @@ def _record_blackboard(blackboard: Any, result: CollectorResult, target: Analysi
         ),
         "",
     )
+    causal_window = causal_evidence_time_range(target) or {}
     try:
         method(
             result.agent,
             result,
             entity=entity,
             timestamp=str(getattr(target, "fired_at", "") or ""),
-            observed_window_start=str(getattr(target, "fired_at", "") or ""),
-            observed_window_end=str(
-                getattr(target, "resolved_at", "") or getattr(target, "fired_at", "") or ""
-            ),
+            observed_window_start=str(causal_window.get("start") or ""),
+            observed_window_end=str(causal_window.get("end") or ""),
         )
     except TypeError:
         # Compatibility with custom blackboards that only implement the
