@@ -689,6 +689,48 @@ def test_namespace_events_require_the_alert_resource_identity() -> None:
     assert [item["object"] for item in control_plane_filtered["items"]] == ["runai-scheduler-0"]
 
 
+def test_namespace_events_reject_cross_namespace_target_name() -> None:
+    target = replace(make_target(), fired_at="2026-07-10T01:00:00Z", namespace="team-a")
+    matching_elsewhere = {
+        "metadata": {"namespace": "team-b"},
+        "involvedObject": {"kind": "Pod", "name": "trainer-0", "namespace": "team-b"},
+        "eventTime": "2026-07-10T01:02:00Z",
+        "type": "Warning",
+    }
+    matching_target = {
+        "metadata": {"namespace": "team-a"},
+        "involvedObject": {"kind": "Pod", "name": "trainer-0", "namespace": "team-a"},
+        "eventTime": "2026-07-10T01:02:00Z",
+        "type": "Warning",
+    }
+
+    filtered = _filter_kubernetes_data(
+        "namespace_events", {"items": [matching_elsewhere, matching_target]}, target
+    )
+
+    assert [item["object"] for item in filtered["items"]] == ["trainer-0"]
+
+
+def test_workload_events_require_the_expected_controller_or_child_pod_kind() -> None:
+    target = replace(make_target(), pod="", workload_name="trainer", workload_type="Deployment")
+    config_map = {"involvedObject": {"kind": "ConfigMap", "name": "trainer"}}
+    deployment = {"involvedObject": {"kind": "Deployment", "name": "trainer"}}
+    child_pod = {"involvedObject": {"kind": "Pod", "name": "trainer-6d8f7"}}
+
+    assert _event_matches_target(config_map, target) is False
+    assert _event_matches_target(deployment, target) is True
+    assert _event_matches_target(child_pod, target) is True
+
+
+def test_event_project_text_is_not_a_fallback_for_a_concrete_target() -> None:
+    target = make_target()
+    other_workload = {"message": "project vision failed to schedule workload batch-9"}
+    project_only = replace(target, pod="", workload_name="", runai_workload_id="")
+
+    assert _event_matches_target(other_workload, target) is False
+    assert _event_matches_target(other_workload, project_only) is True
+
+
 def test_kubernetes_warning_event_observation_is_a_scoped_negative_only_in_window() -> None:
     time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
 

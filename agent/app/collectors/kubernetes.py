@@ -2825,13 +2825,25 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
                 and str((item.get("involvedObject") or {}).get("name") or "") == target.pod
                 and _event_matches_namespace(item, target.namespace)
             ]
-        elif name == "namespace_events" or name.startswith("runai_control_plane_events:"):
-            # Namespace event lists are otherwise unrelated workload noise.
-            # Control-plane Events may live in a different namespace from the
-            # workload, so namespace is deliberately NOT an identity check:
-            # require a concrete Pod/controller/Node name or an explicit target
-            # workload/project/Run:ai ID in the event instead.
-            items = [item for item in items if _event_matches_target(item, target)]
+        elif name == "namespace_events":
+            # MCP tools can ignore their namespace argument; an event matching
+            # only by name from another tenant must not become alert evidence.
+            items = [
+                item
+                for item in items
+                if _event_matches_namespace(item, target.namespace)
+                and _event_matches_target(item, target)
+            ]
+        elif name.startswith("runai_control_plane_events:"):
+            # Control-plane Events intentionally live outside the workload
+            # namespace, but still must originate from the control-plane
+            # namespace requested from the MCP tool.
+            items = [
+                item
+                for item in items
+                if _event_matches_namespace(item, _response_namespace(name) or "")
+                and _event_matches_target(item, target)
+            ]
         events = [
             _event_summary(item)
             for item in items
@@ -2863,8 +2875,15 @@ def _event_matches_target(event: dict[str, object], target: AnalysisTarget) -> b
     if target.node and kind == "node" and name == target.node:
         return True
     workload = target.workload_name.strip()
-    if workload and (name == workload or name.startswith(f"{workload}-")):
-        return True
+    if workload:
+        expected_kind = target.workload_type.strip().casefold()
+        if expected_kind and kind == expected_kind and name == workload:
+            return True
+        # Controllers commonly emit Events on a child Pod.  Do not accept a
+        # same-named ConfigMap/Secret/etc. simply because its name resembles
+        # the workload identity.
+        if kind == "pod" and name.startswith(f"{workload}-"):
+            return True
     # A Run:ai scheduler/backend Event commonly involves its own controller
     # Pod, not the user workload Pod. Accept it only when the event message
     # explicitly names an alert identity — never based on error vocabulary.
@@ -2893,12 +2912,15 @@ def _event_matches_namespace(event: dict[str, object], namespace: str) -> bool:
 
 def _event_message_mentions_target(message: str, target: AnalysisTarget) -> bool:
     text = message.casefold()
-    identifiers = (
+    identifiers = [
         target.pod,
         target.workload_name,
         target.runai_workload_id,
-        target.project,
-    )
+    ]
+    # Project is shared by many workloads. It is only a usable message-level
+    # identity when the alert supplied no concrete Pod/workload/Run:ai ID.
+    if not any(value.strip() for value in identifiers):
+        identifiers.append(target.project)
     for value in identifiers:
         normalized = value.strip().casefold()
         if len(normalized) < 3:
