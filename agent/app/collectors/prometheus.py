@@ -119,7 +119,9 @@ class PrometheusCollector:
                 self._settings, queries, warnings, time_range=time_range
             )
 
-        _annotate_capacity_gap_coverage(query_results, time_range=time_range)
+        _annotate_capacity_gap_coverage(
+            query_results, target=target, time_range=time_range
+        )
 
         successful = [item for item in query_results if not item["error"]]
         populated = [
@@ -529,7 +531,7 @@ def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
         if not isinstance(item, dict):
             continue
         metric = item.get("metric") if isinstance(item.get("metric"), dict) else {}
-        for key in ("namespace", "pod", "node", "project", "queue"):
+        for key in ("namespace", "pod", "node", "project", "queue", "phase"):
             value = metric.get(key)
             if isinstance(value, (str, int, float)) and str(value).strip():
                 observed_label_values.setdefault(key, set()).add(str(value).strip())
@@ -621,6 +623,7 @@ def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
                 "zero_sample_count": sum(value == 0 for value in all_values),
                 "nonzero_sample_count": sum(value != 0 for value in all_values),
                 "all_zero": all(value == 0 for value in all_values),
+                "all_values_boolean": all(value in {0.0, 1.0} for value in all_values),
                 "series_with_multiple_samples": sum(
                     int(item.get("numeric_sample_count") or 0) >= 2 for item in all_series
                 ),
@@ -672,9 +675,12 @@ def _prometheus_query_artifact(
 
 
 def _annotate_capacity_gap_coverage(
-    query_results: list[dict[str, object]], *, time_range: dict[str, str] | None = None
+    query_results: list[dict[str, object]],
+    *,
+    target: AnalysisTarget | None = None,
+    time_range: dict[str, str] | None = None,
 ) -> None:
-    """Allow a capacity-gap absence only when both operands were observed."""
+    """Allow a capacity-gap absence only when both target operands were observed."""
     by_name = {str(item.get("name") or ""): item for item in query_results}
     for scope in ("queue", "project"):
         gap = by_name.get(f"runai_{scope}_capacity_gap")
@@ -683,13 +689,16 @@ def _annotate_capacity_gap_coverage(
         if gap is None:
             continue
         gap["capacity_sources_available"] = all(
-            _has_prometheus_samples(item, time_range=time_range)
+            _has_prometheus_samples(item, target=target, time_range=time_range)
             for item in (requested, allocated)
         )
 
 
 def _has_prometheus_samples(
-    item: object, *, time_range: dict[str, str] | None = None
+    item: object,
+    *,
+    target: AnalysisTarget | None = None,
+    time_range: dict[str, str] | None = None,
 ) -> bool:
     if not isinstance(item, dict) or item.get("error"):
         return False
@@ -700,8 +709,19 @@ def _has_prometheus_samples(
         return False
     verified = _prometheus_samples_in_window(summary, time_range)
     if summary.get("sample_timestamp_verification_required") is True:
-        return verified is True
-    return verified is not False
+        if verified is not True:
+            return False
+    elif verified is False:
+        return False
+    if target is None:
+        return True
+    _, target_scope_verified = _prometheus_target_scope(
+        str(item.get("name") or ""),
+        summary,
+        target,
+        has_series=True,
+    )
+    return target_scope_verified is True
 
 
 def _prometheus_query_observation(
@@ -730,7 +750,16 @@ def _prometheus_query_observation(
             polarity, coverage = "unknown", "partial"
         elif name.endswith("capacity_gap"):
             if series_count and numeric_count:
-                polarity, coverage = "present", "scoped"
+                # A PromQL comparison without ``bool`` filters out false
+                # matches and retains the positive left-hand value.  A zero
+                # or negative sample therefore means a proxy rewrote the
+                # expression (or returned a different metric), not that the
+                # requested-vs-allocated gap was proven.
+                minimum = summary.get("min")
+                if not isinstance(minimum, (int, float)) or minimum <= 0:
+                    polarity, coverage = "unknown", "partial"
+                else:
+                    polarity, coverage = "present", "scoped"
             elif series_count:
                 polarity, coverage = "unknown", "partial"
             elif item.get("capacity_sources_available") is True:
@@ -752,6 +781,22 @@ def _prometheus_query_observation(
             polarity, coverage = "unknown", "partial"
         elif numeric_count == 0:
             polarity, coverage = "unknown", "partial"
+        elif name == "namespace_pending_pods":
+            # ``kube_pod_status_phase`` is a 0/1 gauge and this fixed query
+            # explicitly requests phase="Pending".  Do not let a proxy's
+            # Running/Unknown phase (or non-boolean value) become a pending
+            # RCA signal merely because the namespace label matched.
+            minimum, maximum = summary.get("min"), summary.get("max")
+            if (
+                not isinstance(minimum, (int, float))
+                or not isinstance(maximum, (int, float))
+                or summary.get("all_values_boolean") is not True
+            ):
+                polarity, coverage = "unknown", "partial"
+            elif all_zero is True:
+                polarity, coverage = "absent", "scoped"
+            else:
+                polarity, coverage = "present", "scoped"
         elif name == "prometheus_up":
             # The base query is intentionally global (``up`` has no target
             # selector), so a down scrape says something about telemetry
@@ -840,6 +885,8 @@ def _prometheus_target_scope(
         if not target.namespace:
             return None, False
         requirements = (("namespace", target.namespace),)
+        if name == "namespace_pending_pods":
+            requirements += (("phase", "Pending"),)
         entity = {"kind": "namespace", "name": target.namespace}
     elif name.startswith("runai_queue_"):
         if not target.queue:

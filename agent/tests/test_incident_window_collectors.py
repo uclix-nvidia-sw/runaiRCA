@@ -22,6 +22,7 @@ from app.collectors.postgres import (
     _history_target_aggregate_query,
     _postgres_history_artifacts,
     _postgres_result,
+    _verified_target_aggregate,
 )
 from tests.test_orchestrator import make_settings, make_target
 
@@ -591,7 +592,7 @@ def test_capacity_gap_absence_requires_both_operands_to_be_observed() -> None:
         {
             "name": "runai_queue_capacity_gap",
             "series_count": 1,
-            "value_summary": {"numeric_sample_count": 2, "all_zero": False},
+            "value_summary": {"numeric_sample_count": 2, "all_zero": False, "min": 4.0},
         },
         time_range=window,
     )
@@ -599,6 +600,102 @@ def test_capacity_gap_absence_requires_both_operands_to_be_observed() -> None:
     assert (no_gap["polarity"], no_gap["coverage"]) == ("absent", "scoped")
     assert (unknown["polarity"], unknown["coverage"]) == ("unknown", "partial")
     assert (positive["polarity"], positive["coverage"]) == ("present", "scoped")
+
+
+def test_prometheus_fixed_templates_require_true_values_and_fixed_labels() -> None:
+    window = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    target = make_target()
+
+    wrong_phase = prometheus._prometheus_value_summary(
+        [
+            {
+                "metric": {"namespace": "runai-vision", "phase": "Running"},
+                "values": [["2026-07-10T01:02:00Z", "1"]],
+            }
+        ]
+    )
+    non_boolean_pending = prometheus._prometheus_value_summary(
+        [
+            {
+                "metric": {"namespace": "runai-vision", "phase": "Pending"},
+                "values": [["2026-07-10T01:02:00Z", "0.5"]],
+            }
+        ]
+    )
+    false_gap = prometheus._prometheus_value_summary(
+        [
+            {
+                "metric": {"queue": "gpu-a"},
+                "values": [["2026-07-10T01:02:00Z", "0"]],
+            }
+        ]
+    )
+
+    wrong_phase_observation = prometheus._prometheus_query_observation(
+        {"name": "namespace_pending_pods", "series_count": 1, "value_summary": wrong_phase},
+        target=target,
+        time_range=window,
+    )
+    non_boolean_observation = prometheus._prometheus_query_observation(
+        {
+            "name": "namespace_pending_pods",
+            "series_count": 1,
+            "value_summary": non_boolean_pending,
+        },
+        target=target,
+        time_range=window,
+    )
+    false_gap_observation = prometheus._prometheus_query_observation(
+        {"name": "runai_queue_capacity_gap", "series_count": 1, "value_summary": false_gap},
+        target=target,
+        time_range=window,
+    )
+
+    for observation in (
+        wrong_phase_observation,
+        non_boolean_observation,
+        false_gap_observation,
+    ):
+        assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+
+
+def test_capacity_gap_absence_requires_target_scoped_operand_samples() -> None:
+    window = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    wrong_queue_summary = prometheus._prometheus_value_summary(
+        [
+            {
+                "metric": {"queue": "other-queue"},
+                "values": [["2026-07-10T01:02:00Z", "4"]],
+            }
+        ]
+    )
+    query_results = [
+        {
+            "name": "runai_queue_requested_gpus",
+            "series_count": 1,
+            "value_summary": wrong_queue_summary,
+        },
+        {
+            "name": "runai_queue_allocated_gpus",
+            "series_count": 1,
+            "value_summary": wrong_queue_summary,
+        },
+        {
+            "name": "runai_queue_capacity_gap",
+            "series_count": 0,
+            "value_summary": {"numeric_sample_count": 0},
+        },
+    ]
+
+    prometheus._annotate_capacity_gap_coverage(
+        query_results, target=make_target(), time_range=window
+    )
+    observation = prometheus._prometheus_query_observation(
+        query_results[-1], target=make_target(), time_range=window
+    )
+
+    assert query_results[-1]["capacity_sources_available"] is False
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
 
 
 def test_prometheus_unbounded_empty_result_is_not_a_scoped_absence() -> None:
@@ -1800,6 +1897,47 @@ def test_postgres_history_malformed_count_cannot_prove_absence() -> None:
                     "context_columns": ["workload_name"],
                     "target_correlation_available": True,
                     "target_matching_rows": "not-a-count",
+                    "target_aggregate_verified": True,
+                    "target_rows": [],
+                }
+            ],
+        },
+    )
+
+    observation = artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+
+
+@pytest.mark.parametrize("count", [True, False, 1.5])
+def test_postgres_target_aggregate_rejects_non_integer_count_shapes(count: object) -> None:
+    matches, verified = _verified_target_aggregate(
+        {
+            "matching_rows": count,
+            "first_event_at": "2026-07-10T01:02:00Z",
+            "last_event_at": "2026-07-10T01:02:00Z",
+        },
+        {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"},
+    )
+
+    assert (matches, verified) == (0, False)
+
+
+@pytest.mark.parametrize("count", [True, False, 1.5])
+def test_postgres_history_non_integer_count_cannot_prove_absence_or_presence(count: object) -> None:
+    target = replace(
+        make_target(), fired_at="2026-07-10T01:00:00Z", resolved_at="2026-07-10T01:10:00Z"
+    )
+    artifacts = _postgres_history_artifacts(
+        target,
+        {
+            "time_range": {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"},
+            "tables": [
+                {
+                    "schema": "audit",
+                    "table": "workload_history",
+                    "context_columns": ["workload_name"],
+                    "target_correlation_available": True,
+                    "target_matching_rows": count,
                     "target_aggregate_verified": True,
                     "target_rows": [],
                 }

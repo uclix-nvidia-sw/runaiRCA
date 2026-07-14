@@ -766,12 +766,8 @@ def _verified_target_aggregate(
     """Decode a target aggregate without converting malformed data to absence."""
     if not isinstance(aggregate, dict) or not time_range:
         return 0, False
-    raw_count = aggregate.get("matching_rows")
-    try:
-        count = int(raw_count)
-    except (TypeError, ValueError):
-        return 0, False
-    if count < 0:
+    count = _parse_history_match_count(aggregate.get("matching_rows"))
+    if count is None:
         return 0, False
     if count == 0:
         return 0, True
@@ -1123,21 +1119,25 @@ def _postgres_history_artifacts(
 
 def _history_match_count(value: object) -> int:
     """Decode an aggregate count without treating malformed data as evidence."""
-    try:
-        count = int(value or 0)
-    except (TypeError, ValueError):
-        return 0
-    return count if count >= 0 else 0
+    return _parse_history_match_count(value) or 0
 
 
 def _history_match_count_is_valid(value: object) -> bool:
     """Require an explicit non-negative aggregate count before inferring absence."""
+    return _parse_history_match_count(value) is not None
+
+
+def _parse_history_match_count(value: object) -> int | None:
+    """Accept only the integer count shape emitted by a SQL ``count(*)`` query."""
     if isinstance(value, bool) or value is None:
-        return False
-    try:
-        return int(value) >= 0
-    except (TypeError, ValueError):
-        return False
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str):
+        normalized = value.strip()
+        if re.fullmatch(r"[0-9]+", normalized):
+            return int(normalized)
+    return None
 
 
 def _verified_target_history_rows(
