@@ -75,7 +75,7 @@ def test_trace_repair_uses_response_local_evidence_ids() -> None:
 def test_trace_exposes_structured_evidence_verdicts() -> None:
     results = [_result("prometheus", "restart counter did not change")]
     results[0].artifacts[0].result = {
-        "observation": {"polarity": "absent", "coverage": "scoped"}
+        "observation": {"polarity": "present", "coverage": "scoped"}
     }
     assign_evidence_ids(results)
     response = _response()
@@ -87,13 +87,32 @@ def test_trace_exposes_structured_evidence_verdicts() -> None:
             "evidence_id": "E01",
             "source": "prometheus",
             "summary": "restart counter did not change",
-            "polarity": "absent",
+            "polarity": "present",
             "coverage": "scoped",
         }
     ]
 
     assert apply_trace(response, verdict) is True
-    assert "not observed · scoped" in response.analysis_detail
+    assert "observed · scoped" in response.analysis_detail
+
+
+def test_legacy_agent_fallback_excludes_partial_evidence_from_support() -> None:
+    scoped = _result("loki", "OOMKilled occurred during the incident")
+    partial = _result("prometheus", "current memory usage is high")
+    partial.artifacts[0].result = {
+        "observation": {"polarity": "present", "coverage": "partial"}
+    }
+    results = [scoped, partial]
+    assign_evidence_ids(results)
+
+    verdict = evaluate(
+        _response("## Root Cause\n\nOOMKilled was observed [E01]."),
+        results,
+        [RankedCause("workload_runtime_error", "medium", 5, evidence_agents=["loki", "prometheus"])],
+    )
+
+    assert verdict.claims[0]["supporting_evidence"] == ["E01"]
+    assert [item["evidence_id"] for item in verdict.trace] == ["E01"]
 
 
 def test_high_confidence_needs_two_live_agents_or_signature() -> None:

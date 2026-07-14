@@ -177,7 +177,19 @@ def evaluate(
     # callers provide explicit support/contradiction links and get exact claim
     # grounding instead of an agent-name approximation.
     if supplied_links is None:
-        supporting = agent_supporting
+        # An agent may return useful context alongside a scoped positive
+        # observation. The legacy agent-name fallback must not turn every one
+        # of those artifacts into root-cause support.
+        supporting = [
+            item
+            for item in agent_supporting
+            if (
+                (eligibility := eligibility_by_id.get(str(getattr(item, "evidence_id", ""))))
+                is not None
+                and callable(getattr(eligibility, "permits", None))
+                and eligibility.permits("support")
+            )
+        ]
         claim_links = [
             EvidenceLink(str(getattr(item, "evidence_id", "")), "support")
             for item in supporting
