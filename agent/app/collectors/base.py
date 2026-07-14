@@ -294,6 +294,75 @@ def salient_markers(value: Any, *, limit: int = 6) -> list[str]:
     return found
 
 
+def kubernetes_salient_markers(value: Any, *, limit: int = 6) -> list[str]:
+    """Extract K8s highlights only from observed status/Event structures.
+
+    A full Pod YAML contains configuration such as
+    ``spec.preemptionPolicy=PreemptLowerPriority``.  That is not evidence that
+    preemption occurred.  Keep highlights constrained to Warning Events, active
+    Node conditions, and container runtime states (terminated/waiting), rather
+    than keyword-scanning arbitrary spec/metadata leaf values.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def add_text(text: object) -> None:
+        for marker in salient_markers(str(text or ""), limit=limit):
+            key = marker.casefold()
+            if key not in seen and len(found) < limit:
+                seen.add(key)
+                found.append(marker)
+
+    def walk(node: Any) -> None:
+        if len(found) >= limit:
+            return
+        if isinstance(node, list):
+            for child in node:
+                walk(child)
+            return
+        if not isinstance(node, dict):
+            return
+        condition_type = str(node.get("type") or "")
+        if condition_type.casefold() in _BOOLEAN_CONDITION_TYPES and "status" in node:
+            if _truthy_status(node.get("status")):
+                add_text(condition_type)
+            return
+        # A Kubernetes Event's reason/message is an observation, but only a
+        # Warning is relevant for failure highlights.
+        if str(node.get("type") or "") == "Warning" and "involvedObject" in node:
+            add_text(node.get("reason"))
+            add_text(node.get("message"))
+        # Container runtime states carry actual observed reasons. Pod spec,
+        # labels, annotations, environment values and policy fields do not.
+        for state_key in ("terminated", "waiting"):
+            state = node.get(state_key)
+            if isinstance(state, dict):
+                add_text(state.get("reason"))
+                add_text(state.get("message"))
+        for key in (
+            "status",
+            "state",
+            "lastState",
+            "conditions",
+            "containerStatuses",
+            "initContainerStatuses",
+            "ephemeralContainerStatuses",
+            "events",
+            "items",
+            # Kubernetes MCP response envelopes retain the raw object below
+            # these keys. They are not arbitrary user data; recurse so the
+            # same status-only rule applies to direct and MCP-backed reads.
+            "data",
+            "object",
+        ):
+            child = node.get(key)
+            if child is not None:
+                walk(child)
+
+    walk(value)
+    return found
+
+
 def signals_line(markers: list[str], language: str = "en") -> str:
     """A finding-first 'signals' line with each marker bolded in the text itself.
 

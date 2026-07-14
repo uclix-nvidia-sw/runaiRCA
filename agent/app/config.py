@@ -326,7 +326,10 @@ def load_settings() -> Settings:
         # Per-collector autonomous drill-down: each evidence agent gets its own LLM
         # loop with ONLY its domain's read-only tools (see services/drilldown.py).
         # LLM-gated and best-effort like the investigation loop.
-        enable_agent_drilldown=_bool_env("ENABLE_AGENT_DRILLDOWN", False),
+        enable_agent_drilldown=_bool_env(
+            "ENABLE_AGENT_DRILLDOWN",
+            _bool_env("ENABLE_INVESTIGATION_LOOP", False),
+        ),
         # Overall hard cap on one analysis: agents get generous per-step time above,
         # but the whole run always finishes within this budget. (0 = no overall cap.)
         # Owner priority is accuracy over latency; the backend's

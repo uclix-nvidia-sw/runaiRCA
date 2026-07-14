@@ -14,6 +14,7 @@ from app.services.investigator import (
     _evidence_summary,
     _merge_collector_results,
     _prioritize_probes,
+    _valid_adhoc_kubernetes_query,
     investigate,
 )
 from tests.test_orchestrator import make_settings, make_target
@@ -75,6 +76,15 @@ def test_unavailable_evidence_summary_does_not_expose_stale_signal_text() -> Non
             "warnings": ["api unreachable"],
         }
     ]
+
+
+@pytest.mark.parametrize("kind", ["pod_logs", "deployment_history", "promql", "logql"])
+def test_adhoc_queries_reject_collector_specific_pseudo_kinds(kind: str) -> None:
+    assert not _valid_adhoc_kubernetes_query({"kind": kind})
+
+
+def test_adhoc_queries_allow_read_only_kubernetes_resources() -> None:
+    assert _valid_adhoc_kubernetes_query({"kind": "pods"})
 
 
 def test_repeated_collector_probes_retain_both_artifact_sets() -> None:

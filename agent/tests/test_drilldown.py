@@ -975,6 +975,22 @@ def test_salient_markers_require_active_structured_conditions() -> None:
     assert condition_observations(failing)[0]["active"] is True
 
 
+def test_kubernetes_markers_ignore_pod_spec_keyword_values() -> None:
+    from app.collectors.base import kubernetes_salient_markers
+
+    pod = {
+        "spec": {"preemptionPolicy": "PreemptLowerPriority"},
+        "metadata": {"annotations": {"example": "OOMKilled documentation"}},
+        "status": {
+            "containerStatuses": [
+                {"state": {"running": {}}, "lastState": {"terminated": {"reason": "OOMKilled"}}}
+            ]
+        },
+    }
+
+    assert kubernetes_salient_markers(pod) == ["OOMKilled"]
+
+
 def test_salient_markers_require_positive_prometheus_condition_sample() -> None:
     from app.collectors.base import condition_observations, salient_markers
 
@@ -1056,7 +1072,7 @@ def test_k8s_tool_reports_kubectl_command_title_and_highlights(monkeypatch) -> N
             "kind": "pods",
             "status_code": 200,
             "error": None,
-            "data": {"status": {"reason": "OOMKilled"}},
+            "data": {"status": {"containerStatuses": [{"state": {"terminated": {"reason": "OOMKilled"}}}]}},
         }
 
     monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)

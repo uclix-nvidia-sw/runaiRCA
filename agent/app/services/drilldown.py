@@ -41,6 +41,7 @@ from app.collectors.base import (
     AnalysisTarget,
     CollectorResult,
     artifact,
+    kubernetes_salient_markers,
     salient_markers,
     signals_line,
 )
@@ -316,7 +317,11 @@ async def _run_query(
     note = str(outcome.get("mcp_fallback") or "")
     if note and note not in result.warnings:
         result.warnings.append(note)
-    markers = [] if error else salient_markers(outcome.get("result"))
+    markers = [] if error else (
+        kubernetes_salient_markers(outcome.get("result"))
+        if result.agent == "kubernetes"
+        else salient_markers(outcome.get("result"))
+    )
     summary = str(outcome.get("summary") or error or name)
     if markers:
         summary = f"{summary} — {signals_line(markers, getattr(settings, 'language', 'en'))}"

@@ -25,7 +25,7 @@ from app.collectors.base import (
     AnalysisTarget,
     CollectorResult,
     artifact,
-    salient_markers,
+    kubernetes_salient_markers,
     signals_line,
 )
 from app.collectors.kubernetes import (
@@ -154,6 +154,17 @@ def _collector_name(collector: object) -> str:
         name = name[: -len("Collector")]
     normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
     return normalized.replace("_a_i", "ai") or "collector"
+
+
+def _valid_adhoc_kubernetes_query(query: object) -> bool:
+    """Accept only read-only Kubernetes resource queries from the shared loop.
+
+    Collector-specific operations such as PromQL, Pod logs, and deployment
+    history have their own typed drill-down tools. Treating their names as
+    Kubernetes kinds generated misleading kubectl artifacts and allowlist
+    failures instead of running the correct collector.
+    """
+    return isinstance(query, dict) and resolve_read_kind(str(query.get("kind") or "")) is not None
 
 
 async def _collect_safely(collector: object, target: object, plan: object) -> CollectorResult:
@@ -546,8 +557,10 @@ async def investigate(
                         "values (F-...) in evidence_for/evidence_against; do not invent IDs. "
                         "When diagnostic_directive.probes names a tool you can reach through a collector, "
                         "use it as a discriminator and honor its supports_when/refutes_when conditions. You can ALSO "
-                        "run kubectl-style READ-ONLY Kubernetes queries (get/list of an "
-                        "allowlisted kind, see adhoc_query_kinds). When the alert names a pod, "
+                        "run kubectl-style READ-ONLY Kubernetes resource queries only "
+                        "(get/list of an allowlisted kind, see adhoc_query_kinds). Never put "
+                        "promql, pod_logs, logql, or deployment_history in queries: use the "
+                        "corresponding collector probe instead. When the alert names a pod, "
                         "request that named pod before broad project/namespace reads: it is "
                         "automatically promoted to full YAML + describe/events evidence. Batch all independent "
                         "discriminating queries for this step instead of spending another "
@@ -641,7 +654,14 @@ async def investigate(
             )
             wanted = []
             for query in queries if isinstance(queries, list) else []:
-                if not isinstance(query, dict) or not str(query.get("kind") or "").strip():
+                if not _valid_adhoc_kubernetes_query(query):
+                    if reporter and isinstance(query, dict):
+                        reporter.emit(
+                            "investigation",
+                            "Rejected non-Kubernetes ad-hoc query kind",
+                            step=step,
+                            kind=str(query.get("kind") or ""),
+                        )
                     continue
                 fingerprint = json.dumps(query, sort_keys=True, default=str)
                 if fingerprint in seen_queries:
@@ -789,7 +809,13 @@ async def investigate(
                 )
                 wanted = []
                 for query in verification.get("queries") or []:
-                    if not isinstance(query, dict) or not str(query.get("kind") or "").strip():
+                    if not _valid_adhoc_kubernetes_query(query):
+                        if reporter and isinstance(query, dict):
+                            reporter.emit(
+                                "investigation",
+                                "Rejected non-Kubernetes ad-hoc query kind",
+                                kind=str(query.get("kind") or ""),
+                            )
                         continue
                     fingerprint = json.dumps(query, sort_keys=True, default=str)
                     if fingerprint not in seen_queries:
@@ -870,7 +896,7 @@ async def investigate(
             error = item.get("error")
             # Finding-first summary: name the problem signals in the data, not
             # the transport ("HTTP 200" tells the operator nothing).
-            markers = [] if error else salient_markers(item.get("data"))
+            markers = [] if error else kubernetes_salient_markers(item.get("data"))
             if error:
                 summary = str(error)
             elif markers:
