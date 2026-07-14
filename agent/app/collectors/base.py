@@ -92,7 +92,10 @@ def _parse_incident_time(value: str) -> datetime | None:
     except (TypeError, ValueError):
         return None
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
+        # Alertmanager timestamps are RFC3339 instants. A timezone-less value
+        # is ambiguous, so do not silently manufacture a historical evidence
+        # window from the Alertmanager host's local time.
+        return None
     return parsed.astimezone(UTC)
 
 
@@ -113,9 +116,17 @@ class CollectorResult:
 
 
 def value_from(labels: dict[str, str], annotations: dict[str, str], *keys: str) -> str:
-    for key in keys:
-        value = labels.get(key) or annotations.get(key)
-        if value:
+    """Return normalized alert metadata, preferring labels to annotations."""
+    for metadata in (labels, annotations):
+        for key in keys:
+            raw = metadata.get(key)
+            if raw is None:
+                continue
+            value = str(raw).strip()
+            if not value or "{{" in value or "}}" in value:
+                continue
+            if any(ord(char) < 32 or ord(char) == 127 for char in value):
+                continue
             return value
     return ""
 
@@ -435,6 +446,24 @@ def _workload_kind_identity(labels: dict[str, str], annotations: dict[str, str])
     return "", ""
 
 
+def _is_kube_state_metrics_exporter(
+    labels: dict[str, str], annotations: dict[str, str]
+) -> bool:
+    """Whether a pod label identifies KSM rather than the alert subject.
+
+    A controller-kind label alone is not enough: direct application alerts
+    commonly carry both deployment and the real pod. Only the
+    kube-state-metrics exporter convention makes that pod label a scrape
+    exporter rather than the Kubernetes object being alerted on.
+    """
+    for metadata in (labels, annotations):
+        for key in ("job", "container", "pod", "pod_name", "kubernetes_pod_name"):
+            value = str(metadata.get(key) or "").casefold()
+            if "kube-state-metrics" in value:
+                return True
+    return False
+
+
 def resolve_target(
     labels: dict[str, str],
     annotations: dict[str, str],
@@ -444,18 +473,16 @@ def resolve_target(
 ) -> AnalysisTarget:
     namespace = value_from(labels, annotations, "namespace", "kubernetes_namespace")
     project = value_from(labels, annotations, "project", "runai_project", "runai.io/project")
-    # If a workload-kind label named the subject, the `pod` label is the KSM
-    # exporter — drop it so collectors discover the real workload's pods by name
-    # instead of investigating the (healthy) metrics pod.
+    # KSM alerts name the subject in a controller-kind label and put the
+    # exporter in the pod label. A controller label on its own is also common
+    # in direct alerts, where pod remains the actual subject.
     workload_kind_name, inferred_workload_type = _workload_kind_identity(labels, annotations)
     explicit_workload_name = value_from(
         labels, annotations, "workload", "workload_name", "runai_workload_name"
     )
-    pod = (
-        ""
-        if workload_kind_name
-        else value_from(labels, annotations, "pod", "pod_name", "kubernetes_pod_name")
-    )
+    pod = value_from(labels, annotations, "pod", "pod_name", "kubernetes_pod_name")
+    if workload_kind_name and _is_kube_state_metrics_exporter(labels, annotations):
+        pod = ""
     return AnalysisTarget(
         cluster=value_from(labels, annotations, "cluster", "runai_cluster", "runai.io/cluster"),
         project=normalize_project_name(project) if project else project_from_namespace(namespace),

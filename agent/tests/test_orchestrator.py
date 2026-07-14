@@ -5,7 +5,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.collectors.base import AnalysisTarget, CollectorResult, artifact, resolve_target
+from app.collectors.base import (
+    AnalysisTarget,
+    CollectorResult,
+    artifact,
+    incident_time_range,
+    parse_incident_time,
+    resolve_target,
+)
 from app.collectors.loki import LokiCollector, _loki_headers
 from app.collectors.runai import RunAICollector, _runai_headers
 from app.config import Settings
@@ -207,6 +214,47 @@ def test_resolve_target_explicit_workload_label_wins_over_workload_kind() -> Non
 
     assert target.workload_name == "my-training-job"
     assert target.pod == ""  # workload-kind label present → exporter pod dropped
+
+
+def test_resolve_target_prefers_any_label_alias_over_annotation_alias() -> None:
+    target = resolve_target(
+        {
+            "kubernetes_namespace": "actual-team",
+            "kubernetes_pod_name": "actual-pod",
+            "kubernetes_node": "actual-node",
+        },
+        {
+            "namespace": "wrong-team",
+            "pod": "wrong-pod",
+            "node": "wrong-node",
+        },
+    )
+
+    assert target.namespace == "actual-team"
+    assert target.pod == "actual-pod"
+    assert target.node == "actual-node"
+
+
+def test_resolve_target_keeps_direct_pod_when_controller_label_is_present() -> None:
+    target = resolve_target(
+        {
+            "namespace": "team-a",
+            "deployment": "trainer",
+            "pod": "trainer-5b6f7d9c8d-x7k2p",
+        },
+        {},
+    )
+
+    assert target.workload_name == "trainer"
+    assert target.workload_type == "Deployment"
+    assert target.pod == "trainer-5b6f7d9c8d-x7k2p"
+
+
+def test_incident_window_rejects_timezone_less_timestamp() -> None:
+    target = replace(make_target(), fired_at="2026-07-13T09:00:00")
+
+    assert parse_incident_time(target.fired_at) is None
+    assert incident_time_range(target) is None
 
 
 def test_resolve_target_reads_optional_probe_resource_identifiers() -> None:
