@@ -1026,7 +1026,8 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
                 "description": (
                     "Read a pod's container logs (tail). USE THIS to inspect what a pod "
                     "actually logged. args: pod, namespace, container? (defaults to the "
-                    "pod's main container), tail? (line count)"
+                    "pod's main container), tail? (line count), previous? (true for the "
+                    "prior terminated container instance)."
                 ),
                 "call": _tool_k8s_logs,
             },
@@ -1186,18 +1187,28 @@ async def _tool_k8s_logs(settings: Settings, target: AnalysisTarget, args: dict)
     pod = str(args.get("pod") or args.get("name") or target.pod or "")
     namespace = str(args.get("namespace") or target.namespace or "")
     container = str(args.get("container") or "")
+    previous = args.get("previous") is True or str(args.get("previous") or "").lower() == "true"
     try:
         tail = int(args.get("tail") or 0)
     except (TypeError, ValueError):
         tail = 0
-    item = await k8s_logs(settings, namespace, pod, container=container, tail=tail)
+    time_range = incident_time_range(target)
+    item = await k8s_logs(
+        settings,
+        namespace,
+        pod,
+        container=container,
+        tail=tail,
+        previous=previous,
+        since_time=str((time_range or {}).get("start") or ""),
+    )
     error = item.get("error")
     lines = item.get("lines") or []
     ns_flag = f" -n {namespace}" if namespace else ""
     c_flag = f" -c {container}" if container else ""
     return {
-        "query": f"kubectl logs {pod}{ns_flag}{c_flag}",
-        "title": _title(settings, "Pod 로그", "Pod logs"),
+        "query": f"kubectl logs {pod}{ns_flag}{c_flag}" + (" --previous" if previous else ""),
+        "title": _title(settings, "이전 컨테이너 로그" if previous else "Pod 로그", "Previous container logs" if previous else "Pod logs"),
         "summary": str(error) if error else f"{len(lines)} log line(s)",
         "error": error,
         "result": item,
@@ -1209,7 +1220,13 @@ async def _tool_k8s_describe(settings: Settings, target: AnalysisTarget, args: d
     kind = str(args.get("kind") or "")
     namespace = str(args.get("namespace") or target.namespace or "")
     name = str(args.get("name") or "")
-    item = await k8s_describe(settings, kind, namespace=namespace, name=name)
+    item = await k8s_describe(
+        settings,
+        kind,
+        namespace=namespace,
+        name=name,
+        time_range=incident_time_range(target),
+    )
     error = item.get("error")
     events = item.get("events") or []
     ns_flag = f" -n {namespace}" if namespace else ""

@@ -12,7 +12,14 @@ from app.llm import begin_usage_tracking
 from app.plan import InvestigationPlan
 from app.schemas import AlertAnalysisArtifact
 from app.services import drilldown
-from app.services.drilldown import _tool_logql, _tool_promql, _tool_runai_get, run_drilldowns
+from app.services.drilldown import (
+    _tool_k8s_describe,
+    _tool_k8s_logs,
+    _tool_logql,
+    _tool_promql,
+    _tool_runai_get,
+    run_drilldowns,
+)
 from app.services.evidence_blackboard import Blackboard
 from app.services.root_cause_ranking import _artifact_is_evidence
 from tests.test_orchestrator import make_settings
@@ -132,6 +139,42 @@ async def test_metric_and_log_drilldowns_preserve_mcp_errors_and_incident_window
     assert seen_loki_window == expected
     assert prom["error"] == "Prometheus MCP response missing data.result"
     assert logs["error"] == "Loki MCP response missing a recognized log result"
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_log_and_describe_drilldowns_use_incident_scope(monkeypatch) -> None:
+    target = replace(
+        _target(),
+        pod="trainer-0",
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    log_call: dict[str, object] = {}
+    describe_call: dict[str, object] = {}
+
+    async def fake_logs(settings, namespace, pod, **kwargs):
+        log_call.update({"namespace": namespace, "pod": pod, **kwargs})
+        return {"error": None, "lines": ["2026-07-10T01:01:00Z prior failure"]}
+
+    async def fake_describe(settings, kind, **kwargs):
+        describe_call.update({"kind": kind, **kwargs})
+        return {"error": None, "events": []}
+
+    monkeypatch.setattr(drilldown, "k8s_logs", fake_logs)
+    monkeypatch.setattr(drilldown, "k8s_describe", fake_describe)
+
+    logs = await _tool_k8s_logs(
+        drill_settings(), target, {"pod": "trainer-0", "previous": True}
+    )
+    await _tool_k8s_describe(
+        drill_settings(), target, {"kind": "pods", "name": "trainer-0"}
+    )
+
+    expected = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    assert log_call["previous"] is True
+    assert log_call["since_time"] == expected["start"]
+    assert "--previous" in logs["query"]
+    assert describe_call["time_range"] == expected
 
 
 def test_drilldown_appends_tagged_artifacts_and_stops_on_done(monkeypatch) -> None:
@@ -459,7 +502,7 @@ def test_ontology_probe_resolves_explicit_resource_identifiers(monkeypatch) -> N
     async def fake_complete_json(settings, *, user, **_kwargs):
         return {"action": "done"}
 
-    async def fake_k8s_describe(settings, kind, *, namespace="", name=""):
+    async def fake_k8s_describe(settings, kind, *, namespace="", name="", time_range=None):
         seen_args.append({"kind": kind, "namespace": namespace, "name": name})
         return {"kind": kind, "status_code": 200, "error": None, "events": []}
 
