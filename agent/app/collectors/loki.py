@@ -573,7 +573,7 @@ def _loki_query_observation(
         polarity, coverage = "unknown", "partial"
     else:
         polarity, coverage = "present", "scoped"
-    return {
+    observation = {
         "kind": "loki_query",
         "predicate": f"log:{name}",
         "polarity": polarity,
@@ -583,6 +583,33 @@ def _loki_query_observation(
         "observation_window": time_range or {},
         "log_window_verified": window_verified,
     }
+    if polarity == "present":
+        evidence_window = _loki_evidence_window(item.get("sample_entries"), time_range)
+        if evidence_window:
+            observation["evidence_window"] = evidence_window
+    return observation
+
+
+def _loki_evidence_window(
+    entries: object, time_range: dict[str, str] | None
+) -> dict[str, str]:
+    """Return the actual timestamp span of retained in-range log evidence."""
+    if not time_range:
+        return {}
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return {}
+    timestamps: list[tuple[datetime, str]] = []
+    for entry in entries if isinstance(entries, list) else []:
+        raw = entry.get("timestamp") if isinstance(entry, dict) else None
+        parsed = parse_incident_time(raw)
+        if parsed is not None and start <= parsed <= end:
+            timestamps.append((parsed, str(raw)))
+    if not timestamps:
+        return {}
+    timestamps.sort(key=lambda item: item[0])
+    return {"start": timestamps[0][1], "end": timestamps[-1][1]}
 
 
 def _loki_entries_in_window(

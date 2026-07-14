@@ -747,7 +747,7 @@ def _prometheus_query_observation(
             polarity, coverage = "absent", "scoped"
         else:
             polarity, coverage = "present", "scoped"
-    return {
+    observation = {
         "kind": "prometheus_query",
         "predicate": f"metric:{name}",
         "polarity": polarity,
@@ -761,6 +761,44 @@ def _prometheus_query_observation(
         "observation_window": time_range or {},
         "sample_window_verified": sample_window_verified,
     }
+    if polarity == "present":
+        evidence_window = _prometheus_evidence_window(summary, time_range)
+        if evidence_window:
+            observation["evidence_window"] = evidence_window
+    return observation
+
+
+def _prometheus_evidence_window(
+    value_summary: dict[str, object], time_range: dict[str, str] | None
+) -> dict[str, str]:
+    """Return the actual timestamp span of returned, in-range metric samples."""
+    if not time_range:
+        return {}
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return {}
+    timestamps: list[tuple[datetime, str]] = []
+    series = value_summary.get("sample_windows")
+    if not isinstance(series, list):
+        series = value_summary.get("series")
+    for item in series if isinstance(series, list) else []:
+        if not isinstance(item, dict):
+            continue
+        values = item.get("sample_timestamps")
+        candidates = (
+            values
+            if isinstance(values, list)
+            else [item.get("first_timestamp"), item.get("last_timestamp")]
+        )
+        for raw in candidates:
+            parsed = _parse_prometheus_timestamp(raw)
+            if parsed is not None and start <= parsed <= end:
+                timestamps.append((parsed, str(raw)))
+    if not timestamps:
+        return {}
+    timestamps.sort(key=lambda item: item[0])
+    return {"start": timestamps[0][1], "end": timestamps[-1][1]}
 
 
 def _prometheus_samples_in_window(

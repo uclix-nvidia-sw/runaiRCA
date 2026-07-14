@@ -497,15 +497,55 @@ def normalize_artifact(
     def metadata(key: str) -> object:
         return raw.get(key) or result_metadata.get(key) or observation_metadata.get(key)
 
+    def declared_metadata(*keys: str) -> tuple[bool, object]:
+        """Read declared scope without replacing malformed values with defaults."""
+        for container in (observation_metadata, result_metadata, raw):
+            for key in keys:
+                if key in container:
+                    return True, container[key]
+        return False, None
+
     # A collector-provided observation window is more precise than the broad
-    # incident window supplied by the pipeline.  Preserve it for causal/timing
-    # review rather than overwriting it with the alert's lifetime.
-    raw_window = metadata("observation_window") or metadata("observed_window")
-    if isinstance(raw_window, Mapping):
-        observed_window_start = _clean_text(raw_window.get("start")) or observed_window_start
-        observed_window_end = _clean_text(raw_window.get("end")) or observed_window_end
-    observed_window_start = _clean_text(metadata("observed_window_start")) or observed_window_start
-    observed_window_end = _clean_text(metadata("observed_window_end")) or observed_window_end
+    # incident window supplied by the pipeline.  For a positive result, an
+    # evidence-occurrence window is more precise still: a bounded query may
+    # intentionally include a post-resolution epilogue, while a returned log
+    # line or metric sample can prove exactly when the signal occurred.  Keep
+    # the query window for coverage metadata, but use the occurrence window
+    # for causal/timing eligibility so recovery-time observations cannot be
+    # promoted merely because their query overlapped the alert.
+    invalid_declared_scope = False
+    evidence_window_declared, evidence_window = declared_metadata("evidence_window")
+    window_declared, raw_window = declared_metadata("observation_window", "observed_window")
+    start_declared, declared_start = declared_metadata("observed_window_start")
+    end_declared, declared_end = declared_metadata("observed_window_end")
+    if evidence_window_declared:
+        candidate = evidence_window
+    elif window_declared:
+        candidate = raw_window
+    elif start_declared or end_declared:
+        candidate = {"start": declared_start, "end": declared_end}
+    else:
+        candidate = None
+    if candidate is not None:
+        if isinstance(candidate, Mapping):
+            candidate_start = _clean_text(candidate.get("start"))
+            candidate_end = _clean_text(candidate.get("end"))
+            if _valid_observation_window(candidate_start, candidate_end):
+                observed_window_start, observed_window_end = candidate_start, candidate_end
+            else:
+                # An explicitly declared but malformed scope must not fall
+                # through to the broad incident window supplied by pipeline.
+                observed_window_start, observed_window_end = "", ""
+                invalid_declared_scope = True
+        else:
+            observed_window_start, observed_window_end = "", ""
+            invalid_declared_scope = True
+    elif observed_window_start or observed_window_end:
+        observed_window_start = _clean_text(observed_window_start)
+        observed_window_end = _clean_text(observed_window_end)
+        if not _valid_observation_window(observed_window_start, observed_window_end):
+            observed_window_start, observed_window_end = "", ""
+            invalid_declared_scope = True
     source = _clean_text(raw.get("source")) or "unknown"
     status = _normalise_token(_clean_text(raw.get("status")))
     summary = _clean_text(raw.get("summary"))
@@ -520,7 +560,13 @@ def normalize_artifact(
     metadata_coverage = _normalise_token(_clean_text(metadata("coverage")))
     has_explicit_semantics = (
         (polarity in _POLARITIES and coverage in _COVERAGE)
-        or (metadata_polarity in _POLARITIES and metadata_coverage in _COVERAGE)
+        # A typed artifact requires an explicit observation envelope. Result
+        # keys with these names may be an MCP body, not a verified verdict.
+        or (
+            isinstance(observation, Mapping)
+            and metadata_polarity in _POLARITIES
+            and metadata_coverage in _COVERAGE
+        )
     )
     # Ontology probes evaluate a returned snapshot against declared tokens.
     # Their supports/refutes verdict is useful diagnostic context, but it does
@@ -557,6 +603,8 @@ def normalize_artifact(
         )
     if resolved_coverage not in _COVERAGE:
         raise ValueError(f"invalid coverage: {resolved_coverage}")
+    if invalid_declared_scope and resolved_coverage == "scoped":
+        resolved_polarity, resolved_coverage = "unknown", "partial"
     # Missing tool coverage must never masquerade as a verified negative.
     if resolved_polarity == "absent" and resolved_coverage != "scoped":
         resolved_polarity = "unknown"
@@ -568,7 +616,16 @@ def normalize_artifact(
     # identity instead of relabelling every artifact as the alert target during
     # blackboard seeding; otherwise an unrelated namespace observation can
     # pass the later entity-compatibility gate as target evidence.
-    resolved_entity = _observed_entity(metadata("observed_entity") or metadata("entity")) or entity
+    entity_declared, raw_entity = declared_metadata("observed_entity", "entity")
+    if entity_declared:
+        resolved_entity = _observed_entity(raw_entity)
+        if not resolved_entity:
+            # An explicit malformed entity is not a license to relabel this
+            # observation as the alert target.
+            if resolved_coverage == "scoped":
+                resolved_polarity, resolved_coverage = "unknown", "partial"
+    else:
+        resolved_entity = entity
     safe_entity = active_masker.mask_text(resolved_entity)
     safe_value = _finding_value(safe_summary, safe_highlights, resolved_polarity)
     # Legacy artifacts did not name their predicate. Use structured probe
@@ -739,7 +796,9 @@ def _observed_entity(value: object) -> str:
         if kind and name:
             return f"{kind.casefold()}:{name}"
         return ""
-    return _clean_text(value)
+    if isinstance(value, str):
+        return _clean_text(value)
+    return ""
 
 
 def _relevance(fact: EvidenceFact, hints: tuple[str, ...]) -> int:
@@ -791,6 +850,16 @@ def _window_compatible(
     except ValueError:
         return False
     return start <= incident_to and end >= incident_from
+
+
+def _valid_observation_window(start: str, end: str) -> bool:
+    """Return whether one collector-declared observation window is usable."""
+    if not (start and end):
+        return False
+    try:
+        return _parse_time(start) <= _parse_time(end)
+    except ValueError:
+        return False
 
 
 def temporal_relation_to_incident(

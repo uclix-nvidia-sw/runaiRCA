@@ -206,6 +206,65 @@ def test_blackboard_keeps_untyped_summary_as_context_only() -> None:
     assert fact.eligibility.context
 
 
+def test_blackboard_requires_a_nested_observation_envelope() -> None:
+    """Loose result keys cannot impersonate a collector typed verdict."""
+    item = _artifact(
+        source="kubernetes",
+        result={"polarity": "present", "coverage": "scoped"},
+    )
+    board = Blackboard()
+
+    [fact] = board.add_result(
+        "kubernetes",
+        CollectorResult(agent="kubernetes", status="ok", summary=item.summary or "", artifacts=[item]),
+        entity="pod:trainer-0",
+    )
+
+    assert (fact.polarity, fact.coverage) == ("unknown", "unknown")
+    assert not fact.eligibility.support
+
+
+def test_malformed_declared_scope_is_not_relabelled_as_alert_target() -> None:
+    """An incomplete collector scope must not inherit a valid incident scope."""
+    item = _artifact(
+        source="kubernetes",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "Pod"},
+                "observation_window": {
+                    "start": "",
+                    "end": "2026-07-13T00:10:00Z",
+                },
+            }
+        },
+    )
+    board = Blackboard(run_id="run-a")
+
+    [fact] = board.add_result(
+        "kubernetes",
+        CollectorResult(agent="kubernetes", status="ok", summary=item.summary or "", artifacts=[item]),
+        entity="pod:trainer-0",
+        observed_window_start="2026-07-13T00:00:00Z",
+        observed_window_end="2026-07-13T00:10:00Z",
+    )
+
+    assert fact.entity == ""
+    assert fact.observation_window == ("", "")
+    assert (fact.polarity, fact.coverage) == ("unknown", "partial")
+    eligibility = fact.eligibility.from_fact(
+        fact,
+        context={
+            "run_id": "run-a",
+            "window_start": "2026-07-13T00:00:00Z",
+            "window_end": "2026-07-13T00:10:00Z",
+            "entities": ["pod:trainer-0"],
+        },
+    )
+    assert not eligibility.support
+
+
 def test_response_local_evidence_alias_does_not_change_fact_identity() -> None:
     item = _artifact(agent="kubernetes", source="kubernetes", summary="Pod trainer-0 is Evicted.")
     board = Blackboard()
@@ -431,6 +490,45 @@ def test_precise_artifact_window_wins_and_is_classified_for_causal_review() -> N
     assert temporal_relation_to_incident(
         *fact.observation_window, "2026-07-13T00:05:00Z", "2026-07-13T00:10:00Z"
     ) == "precedes_incident"
+
+
+def test_evidence_occurrence_window_blocks_post_resolution_recovery_signal() -> None:
+    """A query can overlap an incident even when its only signal is recovery-time."""
+    fact = normalize_artifact(
+        _artifact(
+            source="loki",
+            result={
+                "observation": {
+                    "polarity": "present",
+                    "coverage": "scoped",
+                    # The range deliberately includes a post-resolution
+                    # epilogue for collection completeness.
+                    "observation_window": {
+                        "start": "2026-07-13T00:55:00Z",
+                        "end": "2026-07-13T01:15:00Z",
+                    },
+                    # But this error was observed only after resolution.
+                    "evidence_window": {
+                        "start": "2026-07-13T01:11:00Z",
+                        "end": "2026-07-13T01:12:00Z",
+                    },
+                }
+            },
+        ),
+        entity="pod:trainer-0",
+    )
+
+    eligibility = fact.eligibility.from_fact(
+        fact,
+        context={
+            "window_start": "2026-07-13T01:00:00Z",
+            "window_end": "2026-07-13T01:10:00Z",
+        },
+    )
+
+    assert fact.observation_window == ("2026-07-13T01:11:00Z", "2026-07-13T01:12:00Z")
+    assert not eligibility.support
+    assert "outside the incident window" in eligibility.reason
 
 
 def test_timezone_less_windows_are_context_not_comparison_errors() -> None:

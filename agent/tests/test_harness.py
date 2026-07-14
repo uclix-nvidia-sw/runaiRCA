@@ -4,6 +4,7 @@ from app.collectors.base import CollectorResult, artifact
 from app.schemas import AlertAnalysisResponse
 from app.services.harness import (
     EvidenceLink,
+    _trace_item,
     analysis_hash,
     apply_safety_guardrail,
     apply_trace,
@@ -98,6 +99,16 @@ def test_trace_exposes_structured_evidence_verdicts() -> None:
 
     assert apply_trace(response, verdict) is True
     assert "observed · scoped" in response.analysis_detail
+
+
+def test_trace_does_not_promote_loose_result_fields_to_scoped_evidence() -> None:
+    item = _result("loki", "remote body says OOMKilled")
+    item.artifacts[0].evidence_id = "E01"
+    item.artifacts[0].result = {"polarity": "present", "coverage": "scoped"}
+
+    trace = _trace_item(item.artifacts[0])
+
+    assert (trace["polarity"], trace["coverage"]) == ("unknown", "unknown")
 
 
 def test_legacy_agent_fallback_excludes_partial_evidence_from_support() -> None:

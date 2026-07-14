@@ -526,12 +526,41 @@ def test_loki_query_observation_only_refutes_with_a_bounded_incident_window() ->
     assert absent["coverage"] == "scoped"
     assert present["polarity"] == "present"
     assert present["log_window_verified"] is True
+    assert present["evidence_window"] == {
+        "start": "2026-07-10T01:00:00Z",
+        "end": "2026-07-10T01:00:00Z",
+    }
     assert (timestamp_missing["polarity"], timestamp_missing["coverage"]) == ("unknown", "partial")
     assert timestamp_missing["log_window_verified"] is None
     assert (out_of_window["polarity"], out_of_window["coverage"]) == ("unknown", "partial")
     assert out_of_window["log_window_verified"] is False
     assert live_empty["polarity"] == "unknown"
     assert live_empty["coverage"] == "partial"
+
+
+def test_prometheus_positive_observation_exposes_actual_sample_window() -> None:
+    time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    summary = prometheus._prometheus_value_summary(
+        [
+            {
+                "metric": {"pod": "trainer-0"},
+                "values": [
+                    ["2026-07-10T01:11:00Z", "1"],
+                    ["2026-07-10T01:12:00Z", "1"],
+                ],
+            }
+        ]
+    )
+
+    observation = prometheus._prometheus_query_observation(
+        {"name": "node_memory_pressure", "series_count": 1, "value_summary": summary},
+        time_range=time_range,
+    )
+
+    assert observation["evidence_window"] == {
+        "start": "2026-07-10T01:11:00Z",
+        "end": "2026-07-10T01:12:00Z",
+    }
 
 
 def test_generic_control_plane_loki_errors_are_context_not_target_support() -> None:
@@ -705,6 +734,7 @@ def test_kubernetes_pod_log_evidence_uses_only_timestamped_incident_lines() -> N
             "previous": True,
             "lines": [
                 "2026-07-10T00:54:59Z before incident",
+                "2026-07-10T01:10:00Z later OOMKilled",
                 "2026-07-10T01:02:00Z OOMKilled",
                 "2026-07-10T01:15:01Z after incident",
             ],
@@ -717,7 +747,14 @@ def test_kubernetes_pod_log_evidence_uses_only_timestamped_incident_lines() -> N
 
     assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
     assert observation["previous"] is True
-    assert entries == [{"timestamp": "2026-07-10T01:02:00Z", "line": "OOMKilled"}]
+    assert entries == [
+        {"timestamp": "2026-07-10T01:02:00Z", "line": "OOMKilled"},
+        {"timestamp": "2026-07-10T01:10:00Z", "line": "later OOMKilled"},
+    ]
+    assert observation["evidence_window"] == {
+        "start": "2026-07-10T01:02:00Z",
+        "end": "2026-07-10T01:10:00Z",
+    }
     assert (unknown["polarity"], unknown["coverage"]) == ("unknown", "partial")
     assert no_entries == []
 

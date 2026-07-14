@@ -306,7 +306,10 @@ def _trace_item(item: object) -> dict[str, str]:
     try:
         from app.services.evidence_blackboard import normalize_artifact
 
-        fact = normalize_artifact(item)
+        # Match the evidence-link boundary: a result body that merely happens
+        # to contain a success summary or loose polarity fields is context,
+        # not a scoped verdict in the operator-visible trace.
+        fact = normalize_artifact(item, require_typed_observation=True)
         polarity = str(fact.polarity)
         coverage = str(fact.coverage)
     except Exception:  # noqa: BLE001 - trace rendering must not block the RCA.

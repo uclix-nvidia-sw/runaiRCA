@@ -1619,18 +1619,21 @@ def _pod_log_observation(
         )
     container = str(log.get("container") or "default")
     predicate = f"kubernetes_pod_log:{'previous:' if log.get('previous') else ''}{container}"
-    return (
-        {
-            "kind": "kubernetes_pod_log",
-            "predicate": predicate,
-            "polarity": polarity,
-            "coverage": coverage,
-            "previous": bool(log.get("previous")),
-            "source_verified": log.get("source_verified") is not False,
-            "observation_window": time_range or {},
-        },
-        entries,
-    )
+    observation = {
+        "kind": "kubernetes_pod_log",
+        "predicate": predicate,
+        "polarity": polarity,
+        "coverage": coverage,
+        "previous": bool(log.get("previous")),
+        "source_verified": log.get("source_verified") is not False,
+        "observation_window": time_range or {},
+    }
+    if polarity == "present" and entries:
+        observation["evidence_window"] = {
+            "start": entries[0]["timestamp"],
+            "end": entries[-1]["timestamp"],
+        }
+    return observation, entries
 
 
 def _log_entries_in_window(
@@ -1648,6 +1651,10 @@ def _log_entries_in_window(
         if observed_at is None or not (start <= observed_at <= end):
             continue
         entries.append({"timestamp": timestamp, "line": message or line})
+    # MCP implementations are not required to return log lines in timestamp
+    # order.  The evidence window must describe the actual earliest/latest
+    # retained line, not transport order.
+    entries.sort(key=lambda entry: parse_incident_time(entry["timestamp"]) or start)
     return entries
 
 
