@@ -12,6 +12,7 @@ from app.services.evidence_blackboard import Blackboard
 from app.services.investigator import (
     _build_user_prompt,
     _evidence_summary,
+    _merge_collector_results,
     _prioritize_probes,
     investigate,
 )
@@ -74,6 +75,28 @@ def test_unavailable_evidence_summary_does_not_expose_stale_signal_text() -> Non
             "warnings": ["api unreachable"],
         }
     ]
+
+
+def test_repeated_collector_probes_retain_both_artifact_sets() -> None:
+    first = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="pod trainer-0 CrashLoopBackOff",
+        artifacts=[{"scope": "pod", "summary": "CrashLoopBackOff"}],
+    )
+    second = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="node gpu-01 is Ready",
+        artifacts=[{"scope": "node", "summary": "Ready"}],
+    )
+
+    merged = _merge_collector_results(first, second)
+
+    assert "CrashLoopBackOff" in merged.summary
+    assert "Ready" in merged.summary
+    assert merged.artifacts == [*first.artifacts, *second.artifacts]
+    assert merged.details["probe_results"][-1]["summary"] == "node gpu-01 is Ready"
 
 
 def test_failed_adhoc_result_is_not_replayed_as_prompt_evidence() -> None:

@@ -489,7 +489,7 @@ async def investigate(
             deadline_monotonic,
             lambda: _collect_safely(collector, target, _scoped_plan(plan, scope)),
         )
-        evidence[name] = result
+        evidence[name] = _merge_collector_results(evidence.get(name), result)
         _record_blackboard(blackboard, name, result, target)
         if reporter:
             reporter.emit(
@@ -845,7 +845,7 @@ async def investigate(
                     missing_data=[f"{name}.collector_exception"],
                     warnings=[f"{name} failed unexpectedly: {type(exc).__name__}"],
                 )
-            evidence[name] = result
+            evidence[name] = _merge_collector_results(evidence.get(name), result)
             _record_blackboard(blackboard, name, result, target)
         for task in pending:
             task.cancel()
@@ -1051,6 +1051,44 @@ def _record_blackboard(
             except Exception:  # noqa: BLE001 - blackboard is advisory
                 pass
             return
+
+
+def _merge_collector_results(
+    previous: CollectorResult | None, current: CollectorResult
+) -> CollectorResult:
+    """Retain evidence from repeated collector probes with distinct scopes."""
+    if previous is None:
+        return current
+    statuses = {previous.status, current.status}
+    status = "ok" if "ok" in statuses else "partial" if "partial" in statuses else "unavailable"
+    summaries: list[str] = []
+    for candidate in (previous.summary, current.summary):
+        if candidate and candidate not in summaries:
+            summaries.append(candidate)
+    summary = " | ".join(summaries[-4:])[:1600]
+    probe_history = previous.details.get("probe_results") if isinstance(previous.details, dict) else []
+    history = list(probe_history) if isinstance(probe_history, list) else []
+    history.append(
+        {
+            "agent": current.agent,
+            "status": current.status,
+            "summary": (current.summary or "")[:500],
+        }
+    )
+    return CollectorResult(
+        agent=current.agent or previous.agent,
+        status=status,
+        summary=summary,
+        confidence="high" if "high" in {previous.confidence, current.confidence} else "medium",
+        details={
+            **(previous.details if isinstance(previous.details, dict) else {}),
+            **(current.details if isinstance(current.details, dict) else {}),
+            "probe_results": history[-8:],
+        },
+        missing_data=list(dict.fromkeys([*previous.missing_data, *current.missing_data])),
+        warnings=list(dict.fromkeys([*previous.warnings, *current.warnings])),
+        artifacts=[*previous.artifacts, *current.artifacts],
+    )
 
 
 def _blackboard_prompt_view(blackboard: Any, *, limit: int) -> list[dict[str, Any]]:
