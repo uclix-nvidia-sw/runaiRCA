@@ -293,6 +293,62 @@ def test_eligibility_rejects_explicit_wrong_run_window_entity_or_topology() -> N
     assert not fact.eligibility.from_fact(fact, context={"topology": ["cluster:two"]}).support
 
 
+def test_run_context_fails_closed_when_fact_identity_is_missing() -> None:
+    fact = normalize_artifact(
+        _artifact(
+            source="kubernetes",
+            result={"observation": {"polarity": "present", "coverage": "scoped"}},
+        ),
+        observed_window_start="2026-07-13T00:00:00Z",
+        observed_window_end="2026-07-13T00:10:00Z",
+    )
+
+    missing_run = fact.eligibility.from_fact(fact, context={"run_id": "run-a"})
+    assert not missing_run.support
+    assert missing_run.context
+    assert "run identity is missing" in missing_run.reason
+
+
+def test_blackboard_stamps_its_run_but_preserves_declared_cross_run_identity() -> None:
+    board = Blackboard(run_id="run-a")
+    result = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="Pod trainer-0 was Evicted",
+        artifacts=[
+            _artifact(
+                source="kubernetes",
+                result={"observation": {"polarity": "present", "coverage": "scoped"}},
+            ),
+            _artifact(
+                source="kubernetes",
+                result={
+                    "run_id": "run-b",
+                    "observation": {"polarity": "present", "coverage": "scoped"},
+                },
+            ),
+        ],
+    )
+
+    current, stale = board.add_result(
+        "kubernetes",
+        result,
+        entity="pod:trainer-0",
+        observed_window_start="2026-07-13T00:00:00Z",
+        observed_window_end="2026-07-13T00:10:00Z",
+    )
+
+    assert current.run_id == "run-a"
+    assert board.evidence_id_for(
+        result.artifacts[0],
+        entity="pod:trainer-0",
+        observed_window_start="2026-07-13T00:00:00Z",
+        observed_window_end="2026-07-13T00:10:00Z",
+    ) == current.fact_id
+    assert stale.run_id == "run-b"
+    assert not stale.eligibility.from_fact(stale, context={"run_id": "run-a"}).support
+
+
 def test_eligibility_requires_an_observation_window_for_historical_support() -> None:
     fact = normalize_artifact(
         _artifact(source="kubernetes", summary="Pod was Evicted"), entity="pod:trainer-0"
@@ -375,3 +431,12 @@ def test_precise_artifact_window_wins_and_is_classified_for_causal_review() -> N
     assert temporal_relation_to_incident(
         *fact.observation_window, "2026-07-13T00:05:00Z", "2026-07-13T00:10:00Z"
     ) == "precedes_incident"
+
+
+def test_timezone_less_windows_are_context_not_comparison_errors() -> None:
+    assert temporal_relation_to_incident(
+        "2026-07-13T00:00:00",
+        "2026-07-13T00:01:00",
+        "2026-07-13T00:00:00Z",
+        "2026-07-13T00:10:00Z",
+    ) == "unknown"

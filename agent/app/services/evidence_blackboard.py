@@ -13,7 +13,7 @@ import json
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from app.collectors.base import NO_EVIDENCE, CollectorResult
@@ -172,8 +172,11 @@ class EvidenceEligibility:
         if not context:
             return base
         expected_run = _clean_text(context.get("run_id"))
-        if expected_run and fact.run_id and expected_run != fact.run_id:
-            return cls(False, False, False, "evidence belongs to a different run")
+        if expected_run:
+            if not fact.run_id:
+                return cls(False, False, True, "evidence run identity is missing")
+            if expected_run != fact.run_id:
+                return cls(False, False, False, "evidence belongs to a different run")
         expected_window_start = _clean_text(context.get("window_start"))
         expected_window_end = _clean_text(context.get("window_end"))
         if expected_window_start or expected_window_end:
@@ -341,6 +344,13 @@ class Blackboard(EvidenceBlackboard):
     protocol.  It never stores an artifact's query or raw result.
     """
 
+    def __init__(self, facts: Iterable[EvidenceFact] = (), *, run_id: str = "") -> None:
+        super().__init__(facts)
+        # A board is owned by one analysis execution.  Collector artifacts do
+        # not all repeat that ID, so retain it at the boundary rather than
+        # allowing an unlabelled fact to be reused as support by another run.
+        self._run_id = _clean_text(run_id)
+
     def add_result(
         self,
         agent: str,
@@ -354,7 +364,7 @@ class Blackboard(EvidenceBlackboard):
         """Normalize every artifact in a collector result and add new facts."""
         details = result.details if isinstance(result.details, Mapping) else {}
         source_group = _clean_text(details.get("source_group"))
-        run_id = _clean_text(details.get("run_id") or details.get("incident_run_id"))
+        result_run_id = _clean_text(details.get("run_id") or details.get("incident_run_id"))
         topology = details.get("topology") or details.get("target_topology")
         artifacts = result.artifacts or [
             make_artifact(
@@ -374,6 +384,7 @@ class Blackboard(EvidenceBlackboard):
         for item in artifacts:
             raw = _artifact_mapping(item)
             raw = {**raw, "agent": agent or _clean_text(raw.get("agent"))}
+            artifact_run_id = _declared_run_id(raw)
             fact = normalize_artifact(
                 raw,
                 entity=entity,
@@ -381,7 +392,10 @@ class Blackboard(EvidenceBlackboard):
                 observed_window_start=observed_window_start,
                 observed_window_end=observed_window_end,
                 source_group=source_group,
-                run_id=run_id,
+                # A declared artifact ID remains authoritative: replacing a
+                # stale/cross-run ID with the board's current run would turn
+                # that mismatch into valid causal support.
+                run_id=artifact_run_id or result_run_id or self._run_id,
                 topology=topology,
                 require_typed_observation=True,
             )
@@ -437,7 +451,15 @@ class Blackboard(EvidenceBlackboard):
         **kwargs: Any,
     ) -> str:
         """Calculate the stable ID before adding the fact to the blackboard."""
-        return normalize_artifact(artifact, require_typed_observation=True, **kwargs).fact_id
+        raw = _artifact_mapping(artifact)
+        declared_run_id = _declared_run_id(raw)
+        supplied_run_id = _clean_text(kwargs.pop("run_id", ""))
+        return normalize_artifact(
+            artifact,
+            require_typed_observation=True,
+            run_id=declared_run_id or supplied_run_id or self._run_id,
+            **kwargs,
+        ).fact_id
 
 
 def normalize_artifact(
@@ -696,6 +718,19 @@ def _artifact_identity(raw: Mapping[str, Any]) -> str:
     return stable_fact_id(identity)
 
 
+def _declared_run_id(raw: Mapping[str, Any]) -> str:
+    """Read a run identity without treating unrelated result text as one."""
+    result = raw.get("result")
+    result_metadata = result if isinstance(result, Mapping) else {}
+    observation = result_metadata.get("observation")
+    observation_metadata = observation if isinstance(observation, Mapping) else {}
+    for metadata in (raw, result_metadata, observation_metadata):
+        value = _clean_text(metadata.get("run_id") or metadata.get("incident_run_id"))
+        if value:
+            return value
+    return ""
+
+
 def _observed_entity(value: object) -> str:
     """Canonicalize a collector-declared resource identity for fact matching."""
     if isinstance(value, Mapping):
@@ -786,4 +821,11 @@ def temporal_relation_to_incident(
 
 
 def _parse_time(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    """Parse only timezone-aware instants used for causal-window comparison."""
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("timezone-less timestamp")
+    return parsed.astimezone(UTC)

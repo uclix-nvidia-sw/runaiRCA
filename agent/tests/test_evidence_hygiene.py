@@ -12,6 +12,7 @@ from app.collectors.kubernetes import best_matching_pod, pod_name_stem
 from app.collectors.postgres import _postgres_result
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services import pipeline
+from app.services.evidence_blackboard import Blackboard
 from app.services.root_cause_ranking import RankedCause
 from tests.test_orchestrator import make_settings, make_target
 
@@ -849,3 +850,69 @@ async def test_evidence_stage_scopes_followup_target_to_the_plan(monkeypatch) ->
     assert seen == {"k8s": "toolkit-live2", "prom": "toolkit-live2"}, (
         "follow-ups must query the plan's re-resolved live pod"
     )
+
+
+def test_blackboard_aliases_do_not_merge_same_summary_from_different_pods() -> None:
+    fired = "2026-07-13T10:00:00Z"
+    resolved = "2026-07-13T10:05:00Z"
+    target = replace(make_target(), fired_at=fired, resolved_at=resolved)
+    observed_window = {"start": fired, "end": resolved}
+
+    def pod_artifact(pod: str):
+        return artifact(
+            agent="kubernetes",
+            source="kubernetes",
+            type="pod_condition",
+            status="ok",
+            confidence="high",
+            # Deliberately identical: the observed resource must keep these
+            # facts separate, not a display-summary coincidence.
+            summary="Pod reported a condition during the incident.",
+            highlights=["condition observed"],
+            result={
+                "observation": {
+                    "polarity": "present",
+                    "coverage": "scoped",
+                    "observed_entity": f"pod:{pod}",
+                    "observation_window": observed_window,
+                }
+            },
+        )
+
+    result = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="pod conditions collected",
+        artifacts=[pod_artifact("unrelated-0"), pod_artifact(target.pod)],
+    )
+    board = Blackboard(run_id="INC-current")
+    board.add_result(
+        "kubernetes",
+        result,
+        entity=f"pod:{target.pod}",
+        timestamp=fired,
+        observed_window_start=fired,
+        observed_window_end=resolved,
+    )
+    state = pipeline.PipelineState(
+        settings=make_settings(),
+        request=AlertAnalysisRequest(
+            alert=Alert(labels={}, annotations={}), incident_id="INC-current"
+        ),
+        target=target,
+        progress=pipeline.ProgressReporter(make_settings(), run_id=""),
+        masker=None,
+        collectors=[],
+        results=[result],
+        blackboard=board,
+    )
+    pipeline._aggregate_evidence(state)
+
+    aliases = pipeline._blackboard_artifact_evidence_ids(state)
+    facts_by_entity = {fact.entity: fact.fact_id for fact in board.facts()}
+    assert aliases[facts_by_entity["pod:unrelated-0"]] == "E01"
+    assert aliases[facts_by_entity[f"pod:{target.pod}"]] == "E02"
+
+    eligibility = pipeline._public_evidence_eligibility(state)
+    assert eligibility["E01"].support is False
+    assert eligibility["E02"].support is True

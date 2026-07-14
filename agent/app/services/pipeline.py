@@ -288,7 +288,7 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
     state.investigation_context = {}
     from app.services.evidence_blackboard import Blackboard
 
-    state.blackboard = Blackboard()
+    state.blackboard = Blackboard(run_id=str(state.request.incident_id or ""))
 
     # Synthesis MUST see EVERY collector's result. Await the full gather over ALL
     # collectors here, before any ranking/synthesis, and never synthesize from a
@@ -558,21 +558,73 @@ def _blackboard_artifact_evidence_ids(state: PipelineState) -> dict[str, str]:
         facts = ()
     from app.services.evidence_blackboard import normalize_artifact
 
+    target = state.target
+    target_entity = next(
+        (
+            f"{field}:{value}"
+            for field in ("pod", "node", "workload_name", "namespace")
+            if (value := str(getattr(target, field, "") or "").strip())
+        ),
+        "",
+    )
+    target_timestamp = str(getattr(target, "fired_at", "") or "")
+    target_window_end = str(
+        getattr(target, "resolved_at", "") or getattr(target, "fired_at", "") or ""
+    )
+    facts_by_id = {str(getattr(fact, "fact_id", "")): fact for fact in facts}
+    board_run_id = str(getattr(board, "_run_id", "") or "")
+
     for result in state.results:
+        details = result.details if isinstance(result.details, dict) else {}
+        source_group = str(details.get("source_group") or "")
+        run_id = str(details.get("run_id") or details.get("incident_run_id") or "")
+        topology = details.get("topology") or details.get("target_topology") or ()
         for artifact in result.artifacts:
             evidence_id = str(getattr(artifact, "evidence_id", "") or "")
             if not evidence_id:
                 continue
             try:
                 aliases[str(identify(artifact))] = evidence_id
-                # The investigator may have recorded the same artifact before
-                # the pipeline adds the resolved target/window metadata. All
-                # those normalized variants still represent this one public
-                # artifact and must receive the same E-id.
+                # Reproduce the investigator's target/window normalization to
+                # link the public artifact to its exact blackboard fact.  Do
+                # not alias every fact with the same summary/type: a collector
+                # can observe identically worded conditions for two Pods or
+                # incident windows, and letting the last E-id win would cite
+                # one target's artifact as evidence for another.
+                # Blackboard gives an artifact-declared run ID precedence over
+                # result- and board-level defaults. Mirror that precedence so
+                # a stale declared ID cannot be silently relabelled as this
+                # incident while resolving the public alias.
+                artifact_run_id = str(normalize_artifact(artifact).run_id or "")
+                contextual_fact_id = str(
+                    normalize_artifact(
+                        artifact,
+                        entity=target_entity,
+                        timestamp=target_timestamp,
+                        observed_window_start=target_timestamp,
+                        observed_window_end=target_window_end,
+                        source_group=source_group,
+                        run_id=artifact_run_id or run_id or board_run_id,
+                        topology=topology,
+                        require_typed_observation=True,
+                    ).fact_id
+                )
+                if contextual_fact_id in facts_by_id:
+                    aliases[contextual_fact_id] = evidence_id
+                    continue
+
+                # Older blackboard integrations may not have received the
+                # resolved incident context.  Retain that compatibility path
+                # only when the artifact identity resolves to exactly one fact;
+                # ambiguity is unsafe and must remain uncitable.
                 artifact_identity = normalize_artifact(artifact).artifact_id
-                for fact in facts:
-                    if str(getattr(fact, "artifact_id", "")) == artifact_identity:
-                        aliases[str(getattr(fact, "fact_id", ""))] = evidence_id
+                matches = [
+                    fact
+                    for fact in facts
+                    if str(getattr(fact, "artifact_id", "")) == artifact_identity
+                ]
+                if len(matches) == 1:
+                    aliases[str(getattr(matches[0], "fact_id", ""))] = evidence_id
             except Exception:  # noqa: BLE001 - a missing alias is harmless
                 continue
     return aliases
