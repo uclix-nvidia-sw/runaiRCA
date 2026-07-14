@@ -429,6 +429,19 @@ _HISTORY_CONTEXT_COLUMNS = (
     "namespace",
     "status",
 )
+_HISTORY_IDENTITY_SCOPE_COLUMNS = (
+    "resource_id",
+    "workload_id",
+    "workload_name",
+    "workload",
+    "pod_name",
+    "pod",
+    "namespace",
+    "project_name",
+    "project",
+    "queue_name",
+    "queue",
+)
 
 
 def _empty_incident_history(target: AnalysisTarget) -> dict[str, Any]:
@@ -485,7 +498,17 @@ def _history_tables(column_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         timestamp_column = next(
             (column for column in _HISTORY_TIME_COLUMNS if column in timestamps), timestamps[0]
         )
-        context = [column for column in _HISTORY_CONTEXT_COLUMNS if column in entry["context"]]
+        discovered = set(entry["context"])
+        # Keep correlation columns before generic audit display fields.  The
+        # bounded projection otherwise commonly retained id/action/status and
+        # silently dropped the pod/workload identity needed for safe evidence.
+        context = list(
+            dict.fromkeys(
+                column
+                for column in (*_HISTORY_IDENTITY_SCOPE_COLUMNS, *_HISTORY_CONTEXT_COLUMNS)
+                if column in discovered
+            )
+        )
         candidates.append(
             {
                 "schema": entry["schema"],
@@ -572,6 +595,7 @@ def _history_target_clause(
         "project_name": (target.project,),
         "queue": (target.queue,),
         "queue_name": (target.queue,),
+        "namespace": (target.namespace,),
         "resource_id": (target.workload_name, target.runai_workload_id),
     }
     available = {str(column) for column in table.get("context_columns", [])}
@@ -589,7 +613,8 @@ def _history_target_clause(
     # itself identifies. ``id`` is intentionally excluded because generic
     # audit primary keys are not workload identities.
     allowed_columns = strong_columns if has_strong_alert_identity else _HISTORY_TARGET_COLUMNS
-    predicates: list[str] = []
+    identity_predicates: list[str] = []
+    scope_predicates: list[str] = []
     parameters: list[list[str]] = []
     parameter_number = 3
     for column in _HISTORY_TARGET_COLUMNS:
@@ -604,14 +629,35 @@ def _history_target_clause(
         normalized = f"lower(coalesce({quoted}::text, ''))"
         if mcp:
             expressions = ", ".join(_sql_text_expression(value) for value in values)
-            predicates.append(f"{normalized} IN ({expressions})")
+            identity_predicates.append(f"{normalized} IN ({expressions})")
         else:
-            predicates.append(f"{normalized} = ANY(${parameter_number}::text[])")
+            identity_predicates.append(f"{normalized} = ANY(${parameter_number}::text[])")
             parameters.append(values)
             parameter_number += 1
-    if not predicates:
+    if not identity_predicates:
         return None
-    return " AND (" + " OR ".join(predicates) + ")", parameters
+    # A concrete pod/workload name is not globally unique. When an audit table
+    # records namespace/project/queue too, require every declared scope that is
+    # available in that table instead of treating it as an alternate identity.
+    scope_columns = ("namespace", "project", "project_name", "queue", "queue_name")
+    for column in scope_columns if has_strong_alert_identity else ():
+        values = sorted(
+            {str(value).strip().casefold() for value in expected[column] if str(value).strip()}
+        )
+        if column not in available or not values:
+            continue
+        quoted = _quoted_identifier(column)
+        normalized = f"lower(coalesce({quoted}::text, ''))"
+        if mcp:
+            expressions = ", ".join(_sql_text_expression(value) for value in values)
+            scope_predicates.append(f"{normalized} IN ({expressions})")
+        else:
+            scope_predicates.append(f"{normalized} = ANY(${parameter_number}::text[])")
+            parameters.append(values)
+            parameter_number += 1
+    return " AND (" + " OR ".join(identity_predicates) + ")" + "".join(
+        f" AND {predicate}" for predicate in scope_predicates
+    ), parameters
 
 
 def _sql_text_expression(value: str) -> str:

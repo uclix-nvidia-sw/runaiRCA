@@ -992,7 +992,7 @@ async def test_postgres_reads_only_timestamped_audit_history_in_incident_window(
             "schema": "audit",
             "table": "workload_history",
             "timestamp_column": "created_at",
-            "context_columns": ["action", "workload_name"],
+                "context_columns": ["workload_name", "action"],
             "matching_rows": 1,
             "first_event_at": "2026-07-10T01:02:00Z",
             "last_event_at": "2026-07-10T01:02:00Z",
@@ -1133,9 +1133,29 @@ def test_postgres_workload_history_does_not_fall_back_to_project_or_generic_id()
     assert generic_id_only is None
     assert strong_and_project is not None
     assert '"workload_name"' in strong_and_project[0]
-    assert '"project"' not in strong_and_project[0]
+    assert '"project"' in strong_and_project[0]
+    assert strong_and_project[1] == [["trainer"], ["vision"]]
     assert project_scoped is not None
     assert project_scoped[1] == [["vision"]]
+
+
+def test_postgres_target_history_requires_available_namespace_scope() -> None:
+    target = replace(make_target(), namespace="runai-vision", pod="trainer-0")
+    table = {
+        "schema": "audit",
+        "table": "pod_history",
+        "timestamp_column": "created_at",
+        "context_columns": ["pod_name", "namespace"],
+    }
+    time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+
+    direct = _history_target_aggregate_query(table, target, mcp=False, time_range=time_range)
+    mcp = _history_target_aggregate_query(table, target, mcp=True, time_range=time_range)
+
+    assert direct is not None and mcp is not None
+    assert '"pod_name"' in direct[0] and '"namespace"' in direct[0]
+    assert direct[1] == [["trainer-0"], ["runai-vision"]]
+    assert '"pod_name"' in mcp[0] and '"namespace"' in mcp[0]
 
 
 @pytest.mark.asyncio
