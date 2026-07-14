@@ -170,6 +170,45 @@ async def test_historical_incident_uses_its_own_change_window(
     assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
 
 
+@pytest.mark.asyncio
+async def test_historical_unrelated_namespace_change_is_context_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, path, **_kwargs):
+        if path.endswith("/events"):
+            return JsonResponse(
+                url="u",
+                status_code=200,
+                data={
+                    "items": [
+                        {
+                            "type": "Warning",
+                            "reason": "OOMKilled",
+                            "lastTimestamp": "2026-01-02T03:04:00Z",
+                            "involvedObject": {"kind": "Pod", "name": "other-worker-0"},
+                        }
+                    ]
+                },
+            )
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-01-02T03:00:00Z",
+        resolved_at="2026-01-02T03:10:00Z",
+    )
+    result = await ChangeCollector(_Settings()).collect(target)
+
+    observation = result.artifacts[0].result["observation"]
+    assert result.status == "partial"
+    assert result.details["changes"] == []
+    assert result.details["context_changes"][0]["name"] == "other-worker-0"
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+
+
 def test_live_change_window_remains_context_only() -> None:
     observation = change_mod._collector_change_observation(
         changes=[{"kind": "PodCreated"}],
@@ -246,7 +285,7 @@ async def test_helm_release_detected(monkeypatch: pytest.MonkeyPatch) -> None:
                 {"metadata": {"name": "sh.helm.release.v1.gpu-operator.v3",
                               "namespace": "gpu-operator",
                               "creationTimestamp": _iso(-60),
-                              "labels": {"owner": "helm", "name": "gpu-operator",
+                              "labels": {"owner": "helm", "name": "trainer",
                                          "version": "3", "status": "pending-upgrade"}}},
                 {"metadata": {"name": "sh.helm.release.v1.gpu-operator.v2",
                               "namespace": "gpu-operator",

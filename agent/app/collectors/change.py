@@ -472,6 +472,12 @@ class ChangeCollector:
                 window_seconds=window_seconds,
             )
         changes.sort(key=lambda c: c.get("timestamp") or "", reverse=True)
+        correlated_changes, context_changes = _partition_target_changes(
+            changes,
+            target=target,
+            primary_namespace=namespace,
+            dependency_namespaces=dep_namespaces,
+        )
 
         if not changes:
             observation = _collector_change_observation(
@@ -502,8 +508,37 @@ class ChangeCollector:
             self._cache[cache_key] = result
             return result
 
-        summary = _deterministic_summary(changes, namespace)
-        insight = await _senior_insight(self._settings, changes)
+        observation = _collector_change_observation(
+            changes=correlated_changes,
+            context_changes=context_changes,
+            time_range=time_range,
+            historical_window=historical_window,
+            warnings=warnings,
+        )
+        if not correlated_changes:
+            details = {
+                "namespace": namespace,
+                "node": node,
+                "dependency_namespaces": dep_namespaces,
+                "time_range": time_range,
+                "historical_window": historical_window,
+                "window_seconds": window_seconds,
+                "changes": [],
+                "context_changes": context_changes,
+            }
+            result = self._empty(
+                "Namespace changes were observed, but none matched the incident target or "
+                "its declared dependency chain.",
+                missing=[],
+                warnings=warnings,
+                details=details,
+                observation=observation,
+            )
+            self._cache[cache_key] = result
+            return result
+
+        summary = _deterministic_summary(correlated_changes, namespace)
+        insight = await _senior_insight(self._settings, correlated_changes)
         if insight:
             summary = f"{summary} {insight}"
 
@@ -514,14 +549,15 @@ class ChangeCollector:
             "time_range": time_range,
             "historical_window": historical_window,
             "window_seconds": window_seconds,
-            "changes": changes,
+            "changes": correlated_changes,
+            "context_changes": context_changes,
             "insight": insight,
         }
         result = CollectorResult(
             agent=self.name,
             status="ok",
             summary=summary,
-            confidence="high" if len(changes) >= 2 else "medium",
+            confidence="high" if len(correlated_changes) >= 2 else "medium",
             details=details,
             missing_data=[],
             warnings=warnings,
@@ -539,12 +575,7 @@ class ChangeCollector:
                     summary=summary,
                     result={
                         **details,
-                        "observation": _collector_change_observation(
-                            changes=changes,
-                            time_range=time_range,
-                            historical_window=historical_window,
-                            warnings=warnings,
-                        ),
+                        "observation": observation,
                     },
                 )
             ],
@@ -790,6 +821,7 @@ class ChangeCollector:
                         "timestamp": deleted,
                         "kind": "PodDeleted",
                         "name": name,
+                        "namespace": meta.get("namespace"),
                         "summary": f"Pod {name} is terminating (deletionTimestamp set).",
                     }
                 )
@@ -799,6 +831,7 @@ class ChangeCollector:
                         "timestamp": created,
                         "kind": "PodCreated",
                         "name": name,
+                        "namespace": meta.get("namespace"),
                         "summary": f"Pod {name} was created recently.",
                     }
                 )
@@ -867,6 +900,7 @@ class ChangeCollector:
         events = []
         for item in _items(data):
             item = _dict(item)
+            meta = _dict(item.get("metadata"))
             ts = item.get("lastTimestamp") or item.get("eventTime")
             if not _within_window(ts, now, window_seconds=window_seconds):
                 continue
@@ -876,6 +910,7 @@ class ChangeCollector:
                     "timestamp": ts,
                     "kind": f"Event/{item.get('type', 'Normal')}",
                     "name": involved.get("name"),
+                    "namespace": meta.get("namespace"),
                     "reason": item.get("reason"),
                     "object_kind": involved.get("kind"),
                     "summary": f"{item.get('reason')}: {item.get('message')}",
@@ -893,6 +928,7 @@ class ChangeCollector:
 def _collector_change_observation(
     *,
     changes: list[dict],
+    context_changes: list[dict] | None = None,
     time_range: dict[str, str],
     historical_window: bool,
     warnings: list[str],
@@ -908,6 +944,10 @@ def _collector_change_observation(
         polarity, coverage = ("present", "partial") if changes else ("unknown", "partial")
     elif changes:
         polarity, coverage = "present", "scoped"
+    elif context_changes:
+        # A namespace sweep was not empty, but its lifecycle activity belongs
+        # to another workload. It is operator context, never target evidence.
+        polarity, coverage = "unknown", "partial"
     else:
         polarity, coverage = "absent", "scoped"
     return {
@@ -916,8 +956,44 @@ def _collector_change_observation(
         "polarity": polarity,
         "coverage": coverage,
         "change_count": len(changes),
+        "context_change_count": len(context_changes or []),
         "observation_window": time_range,
     }
+
+
+def _partition_target_changes(
+    changes: list[dict],
+    *,
+    target: AnalysisTarget,
+    primary_namespace: str,
+    dependency_namespaces: list[str],
+) -> tuple[list[dict], list[dict]]:
+    """Separate target/dependency lifecycle evidence from namespace churn."""
+    correlated: list[dict] = []
+    context: list[dict] = []
+    workload = str(target.workload_name or "").strip().casefold()
+    pod = str(target.pod or "").strip().casefold()
+    node = str(target.node or "").strip().casefold()
+    dependency_set = {str(namespace).strip() for namespace in dependency_namespaces}
+    for change in changes:
+        name = str(change.get("name") or "").strip().casefold()
+        namespace = str(change.get("namespace") or primary_namespace).strip()
+        kind = str(change.get("kind") or "")
+        relation = ""
+        if namespace in dependency_set:
+            relation = "declared_dependency"
+        elif kind == "NodeCondition" and node and name == node:
+            relation = "target_node"
+        elif namespace == primary_namespace and (
+            (pod and name == pod)
+            or (workload and (name == workload or name.startswith(f"{workload}-")))
+        ):
+            relation = "target_workload"
+        if relation:
+            correlated.append({**change, "relation": relation})
+        else:
+            context.append({**change, "relation": "namespace_context"})
+    return correlated, context
 
 
 def _deterministic_summary(changes: list[dict], namespace: str) -> str:
