@@ -60,6 +60,38 @@ def test_verify_matches_generic_symptom_and_xid(monkeypatch) -> None:
     assert out == {"OOMKilled", "XID 45"}
 
 
+def test_match_verification_receives_declared_alert_signature(monkeypatch) -> None:
+    prompts: list[tuple[str, str]] = []
+
+    async def _fake(_settings, *, system, user, **_kwargs):
+        prompts.append((system, user))
+        return {"refuted": []}
+
+    monkeypatch.setattr(self_check, "complete_json", _fake)
+    candidates = [{"name": "XID 79", "detail": "GPU fallen off bus"}]
+
+    out = asyncio.run(
+        self_check.verify_matches(
+            _llm_settings(),
+            candidates,
+            [],
+            subject="GPU signature",
+            declared_alert=(
+                "NVRM: Xid 79, GPU has fallen off the bus; "
+                "token=declared-alert-secret-12345"
+            ),
+        )
+    )
+
+    assert out == set()
+    system, user = prompts[0]
+    assert "Declared alert payload" in user
+    assert "NVRM: Xid 79, GPU has fallen off the bus" in user
+    assert "declared-alert-secret-12345" not in user
+    assert "[MASKED]" in user
+    assert "false, normal, recovered, or negated values do not" in system
+
+
 def test_known_issue_verification_uses_artifact_result(monkeypatch) -> None:
     prompts: list[str] = []
 

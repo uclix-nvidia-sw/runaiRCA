@@ -19,7 +19,10 @@ from app.collectors.base import (
     CollectorResult,
     causal_evidence_time_range,
     condition_observations,
+    kubernetes_salient_markers,
+    parse_incident_time,
     resolve_target,
+    salient_markers,
 )
 from app.collectors.registry import build_collectors
 from app.config import Settings
@@ -62,6 +65,56 @@ TModel = TypeVar("TModel", bound=BaseModel)
 Stage = Callable[["PipelineState"], Awaitable["PipelineState"]]
 _SYNTHESIS_ARTIFACT_RESULT_CHARS = 1200
 _SYNTHESIS_USER_CHARS = 12000
+
+# Raw Kubernetes objects contain failure vocabulary even when the observed
+# value is healthy or merely declarative configuration.  Those fields remain
+# available in the response artifact for operators, but the free-form
+# synthesizer receives a status-aware projection instead.
+_K8S_SYNTHESIS_CONTEXT_DROP_KEYS = frozenset(
+    {
+        "args",
+        "arguments",
+        "command",
+        "managedfields",
+        "metadata",
+        "path",
+        "preemptionpolicy",
+        "priorityclassname",
+        "queries",
+        "query",
+        "request",
+        "request_body",
+        "spec",
+        "url",
+    }
+)
+_K8S_CONDITION_TYPES = frozenset(
+    {
+        "containersready",
+        "diskpressure",
+        "disruptiontarget",
+        "memorypressure",
+        "networkunavailable",
+        "pidpressure",
+        "podscheduled",
+        "ready",
+    }
+)
+_SYNTHESIS_ASSERTION_NEGATED = re.compile(
+    r"\b(?:false|inactive|no|not|none|without|zero|cleared|resolved|healthy|normal)\b|"
+    r"(?:없(?:음|다|었)|아님|아니|미감지|미발생|비활성|정상|해소|복구|반박|"
+    r"감지되지|발생하지|확인되지|관찰되지)",
+    re.IGNORECASE,
+)
+_SYNTHESIS_ASSERTION_CONDITIONAL = re.compile(
+    r"\b(?:check|verify|whether|hypothesis|possible|possibly|could|may|might|candidate)\b|"
+    r"(?:확인\s*(?:필요|대상|예정)|확인(?:하|해|해야)|점검|검증|여부|가설|가능성|의심|후보)",
+    re.IGNORECASE,
+)
+_SYNTHESIS_PRIVATE_FACT_CITATION = re.compile(
+    r"(?<![A-Za-z0-9_-])F-[0-9a-f]{8,64}(?![A-Za-z0-9_-])", re.IGNORECASE
+)
+_SYNTHESIS_PUBLIC_EVIDENCE_CITATION = re.compile(r"\[(E\d+)\]")
 
 
 @dataclass
@@ -181,6 +234,26 @@ def _evidence_budget_exceeded(state: PipelineState) -> bool:
     return deadline is not None and time.monotonic() >= deadline
 
 
+def _record_evidence_budget_stop(state: PipelineState, phase: str) -> None:
+    """Record the expected safety stop in trace/logs, not operator warnings.
+
+    The evidence deadline intentionally reserves time for synthesis and the
+    output harness. Reaching it after base evidence is complete is normal and
+    should not look like a telemetry failure in the final report.
+    """
+    _log.info("evidence budget reached; skipped optional %s", phase)
+    trace = state.investigation_context.get("reasoning_trace_v2")
+    if isinstance(trace, dict):
+        trace["stop_reason"] = "analysis_budget_exhausted"
+    reporter = getattr(state, "progress", None)
+    if reporter is not None:
+        reporter.emit(
+            "investigation",
+            "Evidence budget reached; moving to synthesis",
+            stopped_phase=phase,
+        )
+
+
 def _is_resolved_reanalysis(request: AlertAnalysisRequest) -> bool:
     """Whether this run must preserve the alert's historical resource identity.
 
@@ -188,7 +261,60 @@ def _is_resolved_reanalysis(request: AlertAnalysisRequest) -> bool:
     not the Pod that a resolved alert fired on.  Retargeting Event reads to it
     can turn the old Pod's warning events into a false historical absence.
     """
-    return str(getattr(request.alert, "status", "") or "").strip().casefold() == "resolved"
+    if str(getattr(request.alert, "status", "") or "").strip().casefold() == "resolved":
+        return True
+    # Stored/manual re-analysis can carry the authoritative historical end while
+    # an older alert row still says firing. Treat only a valid end at/after the
+    # start as resolved; Alertmanager's zero/placeholder endsAt must not freeze a
+    # genuinely firing alert onto stale Pod identities.
+    ends_at = parse_incident_time(getattr(request.alert, "endsAt", None))
+    starts_at = parse_incident_time(getattr(request.alert, "startsAt", None))
+    return ends_at is not None and (starts_at is None or ends_at >= starts_at)
+
+
+def _pin_resolved_target_identity(state: PipelineState) -> None:
+    """Keep resolved RCA reads on identities that existed during the alert.
+
+    The planner may suggest a currently visible replacement Pod, node, workload,
+    or even put another namespace first. Those are useful for a firing alert but
+    cannot replace immutable historical identities. A single grouped occurrence
+    Pod is also a concrete historical identity when the selected alert row did
+    not retain a Pod label; multiple occurrence Pods remain a set and are not
+    collapsed to an arbitrary member.
+    """
+    if not _is_resolved_reanalysis(state.request) or state.plan is None:
+        return
+
+    target = state.target
+    plan = state.plan
+    if target.namespace:
+        plan.namespaces = [
+            target.namespace,
+            *(namespace for namespace in plan.namespaces if namespace != target.namespace),
+        ]
+
+    occurrence_pods = list(
+        dict.fromkeys(
+            pod.strip()
+            for pod in state.request.occurrence_pods
+            if isinstance(pod, str) and pod.strip()
+        )
+    )
+    historical_pod = target.pod or (
+        occurrence_pods[0] if len(occurrence_pods) == 1 else ""
+    )
+    if plan.pod and plan.pod != historical_pod:
+        _log.info(
+            "plan: dropping live/guessed pod %s for resolved target %s",
+            plan.pod,
+            historical_pod or "<no-single-pod>",
+        )
+    plan.pod = historical_pod
+
+    # An absent historical node/workload is an evidence gap, not permission to
+    # substitute a planner guess derived from today's cluster state.
+    plan.node = target.node
+    plan.workload = target.workload_name
 
 
 def _aggregate_evidence(state: PipelineState) -> None:
@@ -241,17 +367,9 @@ async def plan_stage(state: PipelineState) -> PipelineState:
         list(state.request.similar_incidents),
         recent_changes,
     )
-    # For a resolved incident, retain the alert-declared Pod for all causal
-    # reads.  A planner/live lookup may identify a replacement that exists
-    # today, but it cannot substitute for the historical event identity.
-    if _is_resolved_reanalysis(state.request) and state.target.pod:
-        if state.plan.pod and state.plan.pod != state.target.pod:
-            _log.info(
-                "plan: preserving resolved alert pod %s instead of replacement %s",
-                state.target.pod,
-                state.plan.pod,
-            )
-        state.plan.pod = state.target.pod
+    # A planner/live lookup may identify resources that exist today. Pin every
+    # concrete identity carried by a resolved alert before any collector uses it.
+    _pin_resolved_target_identity(state)
     # Alert labels frequently name a pod the controller already replaced (grouped
     # CrashLoop occurrences) and carry no node label — so kubernetes GETs 404 and
     # the system agent skips node/kernel evidence entirely. Re-resolve a LIVE pod
@@ -265,13 +383,18 @@ async def plan_stage(state: PipelineState) -> PipelineState:
             state.target.namespace,
             seed_pod,
             list(state.request.occurrence_pods),
+            state.target.workload_name or state.plan.workload,
         )
         if live_pod and live_pod != seed_pod:
             _log.info("plan: stale pod %s re-resolved to live pod %s", seed_pod, live_pod)
         if live_pod:
             state.plan.pod = live_pod
-        # Never override an explicit node label from the alert itself.
-        state.plan.node = state.plan.node or live_node
+        # Resource identity beats planner prose: retain an explicit alert node,
+        # otherwise the live Pod's spec.nodeName overrides a guessed plan node.
+        if state.target.node:
+            state.plan.node = state.target.node
+        elif live_node:
+            state.plan.node = live_node
     state.progress.emit(
         "planning",
         "Investigation plan built",
@@ -303,8 +426,7 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
     assert plan is not None
     # Keep this guard at the execution boundary too: callers/tests may provide
     # a prebuilt plan without going through plan_stage.
-    if _is_resolved_reanalysis(state.request) and state.target.pod:
-        plan.pod = state.target.pod
+    _pin_resolved_target_identity(state)
     # The plan is authoritative after plan_stage — it may carry a re-resolved
     # LIVE pod/node for a stale alert pod. Scope the stage's working target ONCE
     # so the flowchart follow-ups, drill-down, and investigation loop query the
@@ -666,7 +788,9 @@ def _public_reasoning_trace(trace: object, state: PipelineState) -> dict[str, An
         output["referenced_facts"] = [
             {
                 **fact,
-                "evidence_id": aliases.get(str(fact.get("evidence_id") or ""), fact.get("evidence_id")),
+                "evidence_id": aliases.get(
+                    str(fact.get("evidence_id") or ""), fact.get("evidence_id")
+                ),
             }
             for fact in facts
             if isinstance(fact, dict)
@@ -1486,7 +1610,15 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             state.known_issues, state.observed, fuzzy_query=state.alert_fuzzy
         )
         if ki_matches:
-            refuted = await verify_known_issues(settings, ki_matches, state.results)
+            verify_known_kwargs: dict[str, object] = {}
+            if _accepts_keyword(verify_known_issues, "declared_alert"):
+                verify_known_kwargs["declared_alert"] = _alert_text(request)
+            refuted = await verify_known_issues(
+                settings,
+                ki_matches,
+                state.results,
+                **verify_known_kwargs,
+            )
             if refuted:
                 state.root_cause_candidates = _drop_refuted_signature_candidates(
                     state.root_cause_candidates, refuted
@@ -1509,8 +1641,16 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             for code in state.graph_fixes.xid_fixes
         ]
         if ev_candidates:
+            verify_match_kwargs: dict[str, object] = {
+                "subject": "matched symptom or GPU XID"
+            }
+            if _accepts_keyword(verify_matches, "declared_alert"):
+                verify_match_kwargs["declared_alert"] = _alert_text(request)
             refuted = await verify_matches(
-                settings, ev_candidates, state.results, subject="matched symptom or GPU XID"
+                settings,
+                ev_candidates,
+                state.results,
+                **verify_match_kwargs,
             )
             if refuted:
                 state.root_cause_candidates = _drop_refuted_signature_candidates(
@@ -1564,7 +1704,10 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                 fallback_detail=state.detail,
                 timeline=state.timeline,
                 troubleshooting_path=state.troubleshooting_path,
-                reasoning_trace=state.investigation_context.get("reasoning_trace_v2"),
+                # v2 retains the investigator's free-form F-* ledger for
+                # compatibility.  Synthesis must use the eligibility-filtered,
+                # response-local E-id graph only.
+                reasoning_trace=state.investigation_context.get("reasoning_trace_v3"),
                 evidence_eligibility=_public_evidence_eligibility(state),
             )
         if synth:
@@ -1760,7 +1903,12 @@ async def harness_stage(state: PipelineState) -> PipelineState:
 
     status = "pass"
     if verdict.failed_gates:
-        abstain(response, state.root_cause_candidates, verdict)
+        abstain(
+            response,
+            state.root_cause_candidates,
+            verdict,
+            historical_reanalysis=_is_resolved_reanalysis(state.request),
+        )
         verdict = evaluate(
             response,
             state.results,
@@ -1771,7 +1919,9 @@ async def harness_stage(state: PipelineState) -> PipelineState:
         status = "abstained"
     elif verdict.score < state.settings.rca_harness_pass_score:
         response.analysis_quality = "degraded"
-        response.warnings = sorted(set(response.warnings) | {"RCA harness quality score below threshold"})
+        response.warnings = sorted(
+            set(response.warnings) | {"RCA harness quality score below threshold"}
+        )
         status = "degraded"
 
     top = state.root_cause_candidates[0] if state.root_cause_candidates else None
@@ -1847,9 +1997,26 @@ async def run_pipeline(
 
     await _investigate_until_settled(state)
 
+    state.progress.emit("synthesize", "Synthesizing final RCA")
     state = await stages.get("synthesize", synthesize_stage)(state)
+    state.progress.emit("synthesize", "Synthesis complete")
+    state.progress.emit("harness", "Validating synthesized RCA")
     state = await stages.get("harness", harness_stage)(state)
     assert state.response is not None
+    harness = state.response.context.get("harness")
+    harness_status = (
+        str(harness.get("status") or "complete")
+        if isinstance(harness, dict)
+        else "complete"
+    )
+    state.progress.emit(
+        "harness",
+        "Validation complete",
+        status=harness_status,
+    )
+    flush = getattr(state.progress, "flush", None)
+    if callable(flush):
+        await flush()
     return state.response
 
 
@@ -1869,15 +2036,20 @@ async def _investigate_until_settled(state: PipelineState) -> None:
         if not _needs_more_investigation(state):
             break
         if _evidence_budget_exceeded(state):
-            state.extra_warnings.append(
-                "shared evidence budget reached; skipped additional investigation iterations"
-            )
+            _record_evidence_budget_stop(state, "additional investigation iterations")
             _aggregate_evidence(state)
             break
 
         target = _next_reanalysis_target(state, attempted)
         if target is None:
             break
+        state.progress.emit(
+            "investigation",
+            "Running targeted follow-up before synthesis",
+            step=_round + 1,
+            selected_hypothesis=target.family,
+            reason=target.reason,
+        )
         before_evidence = _evidence_signature(state.results)
         before_family = state.root_cause_candidates[0].family if state.root_cause_candidates else ""
         attempted.add(target.family)
@@ -2058,7 +2230,7 @@ async def _reanalyze_once(
             if isinstance(h, dict) and h.get("family") != target.family
         ]
         replan = replace(plan, hypotheses=[lead, *rest])
-        investigation_kwargs: dict[str, Any] = {}
+        investigation_kwargs: dict[str, Any] = {"reporter": state.progress}
         if (
             getattr(state.settings, "open_world_rca_mode", "off") != "off"
             and _accepts_keyword(investigate, "blackboard")
@@ -2141,9 +2313,7 @@ async def _reanalyze_once(
             ),
         )
         if _evidence_budget_exceeded(state):
-            state.extra_warnings.append(
-                "shared evidence budget reached; skipped additional investigation iterations"
-            )
+            _record_evidence_budget_stop(state, "post-reanalysis self-check")
             return None
         caveat = ""
         refuted = False
@@ -2289,7 +2459,12 @@ async def _synthesize_korean(
         # Past-incident re-analysis signal: a resolved alert means the live state is
         # likely healthy again, so live collectors can legitimately be thin.
         **(
-            {"incident_state": "resolved — alert no longer firing; live state likely normal, so live evidence may be limited (past-incident re-analysis)"}
+            {
+                "incident_state": (
+                    "resolved — alert no longer firing; live state likely normal, so live "
+                    "evidence may be limited (past-incident re-analysis)"
+                )
+            }
             if str(getattr(request.alert, "status", "")).lower() == "resolved"
             else {}
         ),
@@ -2304,7 +2479,12 @@ async def _synthesize_korean(
         ),
         "plan": _synthesis_plan_context(plan, allow_remediation=has_scoped_support),
         "ranked_root_cause_candidates": [c.as_dict() for c in root_cause_candidates],
-        **({"reasoning_trace_v2": reasoning_trace} if isinstance(reasoning_trace, dict) else {}),
+        **(
+            {"reasoning_trace_v3": reasoning_trace}
+            if isinstance(reasoning_trace, dict)
+            and reasoning_trace.get("schema_version") == 3
+            else {}
+        ),
         "knowledge_graph": {
             "blast_radius_workloads": kg_context.get("blast_radius_workloads"),
             "prior_incidents": kg_context.get("prior_incidents") if has_scoped_support else [],
@@ -2343,13 +2523,19 @@ async def _synthesize_korean(
         "- collector_findings의 supporting_artifacts만 원인을 지지하는 직접 근거입니다. "
         "contradicting_artifacts는 결론을 반박하는 직접 근거이고, context_artifacts 및 "
         "collection_summary는 운영 맥락일 뿐 원인·반증 근거가 아닙니다.\n"
+        "- collector_findings에 status=ok인 read-only 진단 결과가 이미 있으면 권장 조치에서 "
+        "그 조회나 같은 명령을 다시 실행하라고 하지 마세요. 이미 확인된 결과를 요약하고, "
+        "그 결과가 요구할 때에만 조건부 후속 조치를 제시하세요. context_artifact라는 이유만으로 "
+        "완료된 조회를 미수행 점검으로 되돌리지 마세요.\n"
         "- MemoryPressure/DiskPressure/PIDPressure/NetworkUnavailable 같은 condition 이름은 "
         "존재 자체가 장애 증거가 아닙니다. artifact의 evidence_role=support 안의 "
         "condition_checks.active=true만 지지 증거이며, evidence_role=contradict 안의 "
         "active=false만 명시적 반대 증거입니다. 원문 result의 키워드만 보고 상태를 "
         "추정하지 마세요.\n"
-        "- reasoning_trace_v2의 evidence_id는 현재 인시던트 관측입니다. 원인·반증 주장을 "
-        "쓸 때 해당 ID를 [E01] 형식으로 인용하고, historical prior는 현재 증거로 쓰지 마세요.\n"
+        "- reasoning_trace_v3의 evidence는 상태·범위 검증을 통과한 공개 관측입니다. 원인·반증 "
+        "주장을 쓸 때 해당 E-ID만 [E01] 형식으로 인용하세요. F-* 내부 ID를 출력하거나 "
+        "rejected_evidence_links의 항목을 근거로 사용하지 마세요. historical prior는 현재 "
+        "증거로 쓰지 마세요.\n"
         "- historical_case_cards는 승인된 과거 사례의 prior이며 현재 evidence가 아닙니다. "
         "유사 사례가 있어도 현재 관측으로 별도 확인될 때만 원인으로 사용하세요.\n"
         "- graph_remediation은 현재 support observation이 있을 때에만 조치 후보입니다. "
@@ -2362,7 +2548,8 @@ async def _synthesize_korean(
         "- 증거에 incident_state가 resolved(과거 인시던트 재분석)면, 현재 상태가 정상이라 "
         "라이브 증거가 제한적일 수 있습니다. 증거가 얇으면 억지로 원인을 단정하지 말고 '현재는 "
         "정상 상태로 회복되어 라이브 수집·분석이 제한적입니다'를 명시한 뒤, 남은 흔적·과거 기록·"
-        "타임라인 기반으로 신중히 설명하세요.\n"
+        "타임라인 기반으로 신중히 설명하세요. ranked 후보가 있으면 관찰 사실과 분리하여 낮은 "
+        "확신도의 잠정 가설로 제시할 수 있지만, 확정 원인이나 원인별 조치 근거로 승격하지 마세요.\n"
         "- timeline(시간순 이벤트)은 evidence_role을 반드시 지키세요. support인 항목만 원인·조치의 "
         "직접 근거가 될 수 있습니다. context 항목은 시간 순서 설명과 다음 점검 후보일 뿐이며, "
         "그 자체로 최근 변경·오류를 근본 원인이나 관찰 사실로 쓰면 안 됩니다. support timeline에 "
@@ -2381,10 +2568,12 @@ async def _synthesize_korean(
         "  ## 2. 원인 (Root Cause) — 운영자가 AI 판단을 검증할 수 있게 다음 항목을 "
         "굵은 라벨로 명확히 구분해 쓰세요:\n"
         "    - **결론**: 한 문장 (근본 원인).\n"
-        "    - **확신도**: 높음/중간/낮음 (analysis_quality와 근거의 양·일관성 기준) + 한 줄 이유.\n"
+        "    - **확신도**: 높음/중간/낮음 (analysis_quality와 근거의 양·일관성 기준) "
+        "+ 한 줄 이유.\n"
         "    - **근거(Evidence)**: 직접 '관찰된 사실'만 2~4개 (수집기별: 무엇을 관찰, 언제부터). "
         "추론이 아니라 사실만.\n"
-        "    - **추론(Inference)**: 위 근거가 왜 그 결론으로 이어지는지 논리 (시간 순서 인과 포함). "
+        "    - **추론(Inference)**: 위 근거가 왜 그 결론으로 이어지는지 논리 "
+        "(시간 순서 인과 포함). "
         "XID 인과 사슬이 있으면 명시 (예: 'XID 74(NVLink) → XID 45 앱 크래시 — 뿌리는 NVLink').\n"
         "    - **반대 증거·한계(Contradicting evidence)**: 결론과 상충하거나 확인하지 못한 것, "
         "self-check가 반박한 내용 (없으면 '특이사항 없음').\n"
@@ -2408,6 +2597,16 @@ async def _synthesize_korean(
         return None
     if not isinstance(detail, str) or not detail.strip():
         detail = fallback_detail
+    conflict = _synthesis_semantic_conflict(
+        summary,
+        detail,
+        request=request,
+        results=results,
+        evidence_eligibility=evidence_eligibility,
+    )
+    if conflict:
+        _log.warning("korean synthesis rejected by semantic evidence guard: %s", conflict)
+        return None
     return _short_sentence(summary, limit=280), detail.strip()
 
 
@@ -2590,6 +2789,12 @@ def _synthesis_artifact_payload(
         role = "contradict"
     else:
         role = "context"
+    agent = str(getattr(artifact, "agent", "") or "")
+    prompt_result = (
+        _sanitize_kubernetes_context_result(result)
+        if agent == "kubernetes" and role == "context"
+        else result
+    )
     return {
         "type": str(getattr(artifact, "type", "")),
         "title": str(getattr(artifact, "title", "")),
@@ -2600,8 +2805,70 @@ def _synthesis_artifact_payload(
         "evidence_role": role,
         "observation": {"polarity": polarity, "coverage": coverage},
         "condition_checks": condition_observations(result),
-        "result": _compact_synthesis_value(result, limit=_SYNTHESIS_ARTIFACT_RESULT_CHARS),
+        "result": _compact_synthesis_value(
+            prompt_result, limit=_SYNTHESIS_ARTIFACT_RESULT_CHARS
+        ),
     }
+
+
+_SYNTHESIS_OMIT = object()
+
+
+def _sanitize_kubernetes_context_result(value: object) -> object:
+    """Project live Kubernetes context without failure-looking configuration.
+
+    The response artifact still retains the full YAML/JSON for the operator.
+    This copy is only for the synthesis prompt, where raw ``spec`` fields such
+    as ``preemptionPolicy=PreemptLowerPriority`` and healthy condition reason
+    strings repeatedly became fabricated observations.
+    """
+
+    def walk(node: object, key: str = "") -> object:
+        if key.casefold() in _K8S_SYNTHESIS_CONTEXT_DROP_KEYS:
+            return _SYNTHESIS_OMIT
+        if isinstance(node, dict):
+            condition_type = str(node.get("type") or "").strip()
+            if (
+                condition_type.casefold() in _K8S_CONDITION_TYPES
+                and "status" in node
+            ):
+                checks = condition_observations(
+                    {"type": condition_type, "status": node.get("status")}, limit=1
+                )
+                if not checks:
+                    return {"active": "unknown", "status": str(node.get("status") or "")}
+                check = checks[0]
+                # Inactive conditions are already represented, with their
+                # exact names, in the sibling condition_checks projection. Do
+                # not repeat failure vocabulary inside raw result text.
+                if not check.get("active"):
+                    return {"active": False, "status": str(node.get("status") or "")}
+                projected: dict[str, object] = {
+                    "condition": condition_type,
+                    "active": True,
+                    "status": str(node.get("status") or ""),
+                }
+                for field in ("reason", "message", "lastTransitionTime"):
+                    if node.get(field) not in (None, ""):
+                        projected[field] = node[field]
+                return projected
+            projected_dict: dict[str, object] = {}
+            for child_key, child in node.items():
+                projected = walk(child, str(child_key))
+                if projected is not _SYNTHESIS_OMIT:
+                    projected_dict[str(child_key)] = projected
+            return projected_dict
+        if isinstance(node, (list, tuple)):
+            projected_list = []
+            for child in node:
+                projected = walk(child, key)
+                if projected is not _SYNTHESIS_OMIT:
+                    projected_list.append(projected)
+            return projected_list
+        return node
+
+    projected = walk(value)
+    return {} if projected is _SYNTHESIS_OMIT else projected
 
 
 def _compact_synthesis_value(value: object, *, limit: int) -> str:
@@ -2615,6 +2882,120 @@ def _compact_synthesis_value(value: object, *, limit: int) -> str:
         except (TypeError, ValueError):
             text = str(value)
     return " ".join(text.split())[:limit]
+
+
+_SYNTHESIS_SIGNAL_TERMS: dict[str, tuple[str, ...]] = {
+    "networkunavailable": ("networkunavailable",),
+    "memorypressure": ("memorypressure",),
+    "diskpressure": ("diskpressure",),
+    "pidpressure": ("pidpressure",),
+    "preemption": ("preempt", "preemption", "선점", "프리엠션"),
+    "oomkilled": ("oomkill", "out of memory"),
+    "restart_loop": (
+        "crashloopbackoff",
+        "restart loop",
+        "restarting loop",
+        "재시작 루프",
+    ),
+    "unschedulable": ("unschedulable", "failedscheduling", "스케줄링 불가"),
+}
+
+
+def _synthesis_supported_signal_groups(
+    request: AlertAnalysisRequest,
+    results: list[CollectorResult],
+    evidence_eligibility: Mapping[str, object] | None,
+) -> set[str]:
+    """Return problem-signal groups backed by alert/support observations."""
+    markers = list(salient_markers(_alert_text(request), limit=20))
+    for result in results:
+        for artifact in result.artifacts:
+            payload = _synthesis_artifact_payload(
+                artifact, evidence_eligibility=evidence_eligibility
+            )
+            if payload.get("evidence_role") != "support":
+                continue
+            for check in payload.get("condition_checks") or []:
+                if isinstance(check, dict) and check.get("active") is True:
+                    markers.append(str(check.get("condition") or ""))
+            raw_result = getattr(artifact, "result", None)
+            extractor = (
+                kubernetes_salient_markers
+                if str(getattr(artifact, "agent", "") or "") == "kubernetes"
+                else salient_markers
+            )
+            markers.extend(extractor(raw_result, limit=20))
+
+    normalized = " ".join(markers).casefold()
+    supported: set[str] = set()
+    for group, terms in _SYNTHESIS_SIGNAL_TERMS.items():
+        if any(term.casefold() in normalized for term in terms):
+            supported.add(group)
+    return supported
+
+
+def _synthesis_claim_fragments(text: str) -> list[str]:
+    return [
+        fragment.strip()
+        for fragment in re.split(r"(?<=[.!?。！？])|[\r\n]+", text or "")
+        if fragment.strip()
+    ]
+
+
+def _synthesis_fragment_asserts_signal(fragment: str) -> bool:
+    """Whether a signal mention is asserted, rather than negated or proposed as a check."""
+    if _SYNTHESIS_ASSERTION_NEGATED.search(fragment):
+        return False
+    if _SYNTHESIS_ASSERTION_CONDITIONAL.search(fragment):
+        return False
+    return True
+
+
+def _synthesis_semantic_conflict(
+    summary: str,
+    detail: str,
+    *,
+    request: AlertAnalysisRequest,
+    results: list[CollectorResult],
+    evidence_eligibility: Mapping[str, object] | None,
+) -> str:
+    """Reject free-form prose that reverses typed evidence truth.
+
+    This is deliberately a rejection guard, not a prose rewriter.  On conflict
+    the pipeline keeps its deterministic report rather than trying to repair a
+    causal statement with another unconstrained model call.
+    """
+    text = f"{summary}\n{detail}"
+    if _SYNTHESIS_PRIVATE_FACT_CITATION.search(text):
+        return "private F-* evidence citation escaped into the report"
+
+    known_evidence_ids = {
+        str(getattr(artifact, "evidence_id", "") or "")
+        for result in results
+        for artifact in result.artifacts
+        if str(getattr(artifact, "evidence_id", "") or "")
+    }
+    unknown_citations = sorted(
+        {
+            match.group(1)
+            for match in _SYNTHESIS_PUBLIC_EVIDENCE_CITATION.finditer(text)
+            if match.group(1) not in known_evidence_ids
+        }
+    )
+    if unknown_citations:
+        return f"unknown evidence citation(s): {', '.join(unknown_citations)}"
+
+    supported = _synthesis_supported_signal_groups(
+        request, results, evidence_eligibility
+    )
+    for fragment in _synthesis_claim_fragments(text):
+        lowered = fragment.casefold()
+        for group, terms in _SYNTHESIS_SIGNAL_TERMS.items():
+            if group in supported or not any(term.casefold() in lowered for term in terms):
+                continue
+            if _synthesis_fragment_asserts_signal(fragment):
+                return f"unsupported positive {group} claim: {fragment[:180]}"
+    return ""
 
 
 def _quality_from(results: list[CollectorResult]) -> str:
@@ -3599,7 +3980,7 @@ def _observed_text(
 
 
 def _evidence_leaf_text(
-    value: Any, *, limit: int = 2000, drop_keys: "frozenset[str] | set[str] | None" = None
+    value: Any, *, limit: int = 2000, drop_keys: frozenset[str] | set[str] | None = None
 ) -> str:
     """Evidence matching should see RETURNED values — not JSON key names, and not
     the probe text we sent (queries/paths/urls/name listings; see

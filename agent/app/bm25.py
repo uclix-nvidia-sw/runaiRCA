@@ -1,7 +1,7 @@
 """Tiny BM25 index with Run:ai-domain synonym expansion. Stdlib only.
 
 Recall layer for the signature matchers in app.knowledge (idea borrowed from
-sejongjeong/runai-mcp's API-spec search): the curated substring keywords stay
+the former API-spec search): the curated substring keywords stay
 the precision entry point, and BM25 runs only when they matched NOTHING, so
 existing behaviour never changes. It bridges vocabulary drift the substring
 layer cannot ("job was preempted" vs the curated "preempted by higher

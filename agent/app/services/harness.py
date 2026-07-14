@@ -15,7 +15,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from app.collectors.base import NO_EVIDENCE, CollectorResult
@@ -374,19 +374,81 @@ def apply_confidence_downgrade(candidates: list[RankedCause]) -> bool:
     return True
 
 
-def abstain(response: AlertAnalysisResponse, candidates: list[RankedCause], verdict: HarnessVerdict) -> None:
-    """Return an honest unresolved RCA when a hard gate cannot be repaired."""
-    candidates[:] = [RankedCause("insufficient_evidence", "low", 0.0)]
+def abstain(
+    response: AlertAnalysisResponse,
+    candidates: list[RankedCause],
+    verdict: HarnessVerdict,
+    *,
+    historical_reanalysis: bool = False,
+) -> None:
+    """Return an unresolved RCA without discarding a useful working hypothesis.
+
+    A hard-gate failure means that a family cannot be presented as confirmed.
+    It does not mean that all inference is worthless, especially when a past
+    incident no longer has complete telemetry.  Preserve the previous leader
+    as an explicitly low-confidence hypothesis behind ``insufficient_evidence``
+    so operators and Top-N evaluation can still inspect it without mistaking it
+    for verified evidence or remediation authority.
+    """
+    previous_top = next(
+        (candidate for candidate in candidates if candidate.family != "insufficient_evidence"),
+        None,
+    )
+    provisional: RankedCause | None = None
+    if previous_top is not None:
+        claim = verdict.claims[0] if verdict.claims else {}
+        provisional = replace(
+            previous_top,
+            confidence="low",
+            support_evidence_ids=list(claim.get("supporting_evidence") or []),
+            contradiction_evidence_ids=list(claim.get("contradicting_evidence") or []),
+        )
+
+    candidates[:] = [
+        RankedCause("insufficient_evidence", "low", 0.0),
+        *([provisional] if provisional is not None else []),
+    ]
     response.root_cause_family = "insufficient_evidence"
     response.analysis_quality = "degraded"
-    response.analysis_summary = "Root cause is not confirmed by the collected evidence."
+    if provisional is not None:
+        response.context["provisional_root_cause"] = provisional.as_dict()
+        response.analysis_summary = (
+            f"Root cause is unconfirmed; {provisional.family} remains a low-confidence "
+            "working hypothesis."
+        )
+        historical_note = (
+            "Because this is a historical re-analysis, incomplete telemetry is expected. "
+            if historical_reanalysis
+            else ""
+        )
+        hypothesis_note = (
+            f"{historical_note}The leading family `{provisional.family}` is retained as a "
+            "low-confidence inference from the remaining signals. It is not a verified cause "
+            "or justification for cause-specific remediation."
+        )
+        verification_check = (
+            "- Verify the leading hypothesis with a read-only query before any disruptive action.\n"
+        )
+    else:
+        response.context.pop("provisional_root_cause", None)
+        response.analysis_summary = "Root cause is not confirmed by the collected evidence."
+        hypothesis_note = (
+            "The available signals do not support even a specific working hypothesis yet."
+        )
+        verification_check = (
+            "- Collect at least one target- and incident-window-scoped signal "
+            "before selecting a family.\n"
+        )
     response.analysis_detail = (
         "## Assessment\n\n"
-        "The collected evidence does not support a safe, high-confidence root-cause conclusion. "
-        "The agent is withholding a root-cause family rather than guessing.\n\n"
+        "The collected evidence does not support confirming a root-cause family. "
+        + hypothesis_note
+        + "\n\n"
         "## Required Next Checks\n\n"
-        "- Re-run the unavailable or empty evidence source for the affected workload and incident window.\n"
-        "- Verify the leading hypothesis with a read-only query before any disruptive action.\n\n"
+        "- Re-run the unavailable or empty evidence source for the affected workload "
+        "and incident window.\n"
+        + verification_check
+        + "\n"
         "## Harness Findings\n\n"
         + "\n".join(f"- {name}" for name in verdict.failed_gates)
     )

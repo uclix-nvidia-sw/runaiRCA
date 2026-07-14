@@ -659,7 +659,8 @@ async def test_korean_synthesis_exposes_condition_polarity(monkeypatch) -> None:
     )
 
     payload = json.loads(captured[0].removeprefix("증거(JSON):\n"))
-    checks = payload["collector_findings"][0]["context_artifacts"][0]["condition_checks"]
+    context = payload["collector_findings"][0]["context_artifacts"][0]
+    checks = context["condition_checks"]
     assert checks == [
         {
             "condition": "MemoryPressure",
@@ -674,6 +675,270 @@ async def test_korean_synthesis_exposes_condition_polarity(monkeypatch) -> None:
             "status": "True",
         },
     ]
+    # The canonical checks retain both polarities. The raw prompt projection
+    # must not repeat a healthy condition's failure-looking type/reason.
+    assert "MemoryPressure" not in context["result"]
+    assert "DiskPressure" in context["result"]
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_rejects_all_false_conditions_promoted_as_active(
+    monkeypatch,
+) -> None:
+    settings = replace(make_settings(), language="ko")
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        return {
+            "summary": "네 가지 노드 압박 조건이 동시에 감지되었습니다.",
+            "detail": (
+                "MemoryPressure, DiskPressure, PIDPressure, NetworkUnavailable가 "
+                "동시에 감지되어 플랫폼 가용성에 영향을 주었습니다 [E16]."
+            ),
+        }
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    finding = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="adhoc_query",
+        status="ok",
+        confidence="medium",
+        summary="특이 신호 없음 (HTTP 200)",
+        result={
+            "data": {
+                "name": "k8s-lb-02",
+                "conditions": [
+                    {"type": "NetworkUnavailable", "status": "False", "reason": "CalicoIsUp"},
+                    {"type": "MemoryPressure", "status": "False"},
+                    {"type": "DiskPressure", "status": "False"},
+                    {"type": "PIDPressure", "status": "False"},
+                    {"truncated": 1},
+                ],
+            },
+            "observation": {"polarity": "unknown", "coverage": "partial"},
+        },
+    )
+    finding.evidence_id = "E16"
+    result = CollectorResult(
+        agent="kubernetes", status="ok", summary="node checked", artifacts=[finding]
+    )
+
+    synthesized = await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "GenericNodeAlert"})
+        ),
+        results=[result],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="node_kubelet_pressure", confidence="medium", score=5.0)
+        ],
+        kg_context={},
+        graph_fixes=GraphRemediation(),
+        fallback_detail="fallback",
+    )
+
+    assert synthesized is None
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_allows_active_supported_condition(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko")
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        return {
+            "summary": "노드에서 DiskPressure가 감지되었습니다.",
+            "detail": "DiskPressure=True가 관찰되었습니다 [E01].",
+        }
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    finding = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_node_condition",
+        status="ok",
+        confidence="high",
+        summary="DiskPressure=True",
+        result={
+            "conditions": [{"type": "DiskPressure", "status": "True"}],
+            "observation": {"polarity": "present", "coverage": "scoped"},
+        },
+    )
+    finding.evidence_id = "E01"
+    result = CollectorResult(
+        agent="kubernetes", status="ok", summary="pressure observed", artifacts=[finding]
+    )
+
+    synthesized = await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "GenericNodeAlert"})
+        ),
+        results=[result],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="node_kubelet_pressure", confidence="high", score=8.0)
+        ],
+        kg_context={},
+        graph_fixes=GraphRemediation(),
+        fallback_detail="fallback",
+    )
+
+    assert synthesized == (
+        "노드에서 DiskPressure가 감지되었습니다.",
+        "DiskPressure=True가 관찰되었습니다 [E01].",
+    )
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_drops_preemption_policy_and_rejects_preempt_claim(
+    monkeypatch,
+) -> None:
+    settings = replace(make_settings(), language="ko")
+    captured: list[str] = []
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        captured.append(user)
+        return {
+            "summary": "파드 선점이 발생했습니다.",
+            "detail": "Preempt가 실제로 확인되었습니다 [E31].",
+        }
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    finding = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="adhoc_query",
+        status="ok",
+        confidence="medium",
+        summary="특이 신호 없음 (HTTP 200)",
+        result={
+            "data": {
+                "spec": {"preemptionPolicy": "PreemptLowerPriority"},
+                "status": {"phase": "Running"},
+            },
+            "observation": {"polarity": "unknown", "coverage": "partial"},
+        },
+    )
+    finding.evidence_id = "E31"
+    result = CollectorResult(
+        agent="kubernetes", status="ok", summary="pod checked", artifacts=[finding]
+    )
+
+    synthesized = await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "GenericPodAlert"})
+        ),
+        results=[result],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="k8s_scheduling_error", confidence="medium", score=4.0)
+        ],
+        kg_context={},
+        graph_fixes=GraphRemediation(),
+        fallback_detail="fallback",
+    )
+
+    assert synthesized is None
+    assert "PreemptLowerPriority" not in captured[0]
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_rejects_private_fact_citation(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko")
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        return {"summary": "일반 요약", "detail": "내부 관측을 인용합니다 [F-143f004a83de2a40]."}
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+
+    synthesized = await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "GenericAlert"})
+        ),
+        results=[],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="insufficient_evidence", confidence="low", score=0.0)
+        ],
+        kg_context={},
+        graph_fixes=GraphRemediation(),
+        fallback_detail="fallback",
+    )
+
+    assert synthesized is None
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_does_not_recommend_completed_readonly_checks(
+    monkeypatch,
+) -> None:
+    settings = replace(make_settings(), language="ko")
+    captured: dict[str, str] = {}
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        captured["system"] = system
+        captured["user"] = user
+        return {"summary": "요약", "detail": "본문"}
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    result = CollectorResult(agent="kubernetes", status="ok", summary="node GPU checked")
+    result.artifacts.append(
+        artifact(
+            agent="kubernetes",
+            source="kubernetes",
+            type="node_gpu_inventory",
+            status="ok",
+            confidence="medium",
+            summary="dgx02 GPU capacity and pod requests were collected",
+            result={
+                "nodes": [
+                    {
+                        "name": "dgx02",
+                        "capacity": 8,
+                        "allocatable": 8,
+                        "requested": 8,
+                    }
+                ],
+                "observation": {"polarity": "unknown", "coverage": "partial"},
+                "snapshot_role": "current_context",
+            },
+        )
+    )
+
+    await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "PendingGPUWorkload"})
+        ),
+        results=[result],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="k8s_scheduling_error", confidence="medium", score=5.0)
+        ],
+        kg_context={},
+        graph_fixes=GraphRemediation(),
+        fallback_detail="fallback",
+    )
+
+    payload = json.loads(captured["user"].removeprefix("증거(JSON):\n"))
+    context = payload["collector_findings"][0]["context_artifacts"][0]
+    assert context["status"] == "ok"
+    assert "dgx02" in context["result"]
+    assert "같은 명령을 다시 실행하라고 하지 마세요" in captured["system"]
+    assert "context_artifact라는 이유만으로 완료된 조회" in captured["system"]
 
 
 @pytest.mark.asyncio

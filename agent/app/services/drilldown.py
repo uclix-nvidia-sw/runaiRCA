@@ -9,13 +9,14 @@ collector's artifacts, where the existing pipeline (masking, signature matching,
 the verify pass, synthesis) consumes them with zero changes.
 
 Best-effort like the central investigation loop: flag off (ENABLE_AGENT_DRILLDOWN),
-no LLM, or ANY failure -> the base evidence stands. There is no fixed query or
-step limit: a loop ends on `done`, a repeated query, or the analysis-wide
-deadline. Read-only by construction:
-the k8s tool is the allowlisted `k8s_read`, Run:ai calls are locked to GET under
-/api/, PromQL/LogQL only hit query endpoints, and SQL is a single SELECT inside
-a READ ONLY transaction (RUNAI_DB_DSN lets the postgres agent query the Run:ai
-control-plane DB itself, not just health-check the RCA store). Untrusted
+no LLM, or ANY failure -> the base evidence stands. A loop runs at most
+MAX_INVESTIGATION_STEPS reasoning rounds (three by default) and can end earlier
+on `done`, a repeated query, or the analysis-wide deadline. Read-only by
+construction: the k8s tool is the allowlisted `k8s_read`, Run:ai calls use only
+the NVIDIA MCP server's focused read-only tools, PromQL/LogQL only hit query
+endpoints, and SQL is a single SELECT inside a READ ONLY transaction
+(RUNAI_DB_DSN lets the postgres agent query the Run:ai control-plane DB itself,
+not just health-check the RCA store). Untrusted
 log/event text feeds these loops, so the PROMPT_INJECTION_GUARD in app.llm rides
 on every decision.
 
@@ -35,7 +36,6 @@ import time
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any
-from urllib.parse import unquote, urlencode
 
 from app.collectors.base import (
     AnalysisTarget,
@@ -58,6 +58,7 @@ from app.collectors.kubernetes import (
     k8s_read,
     kind_lookup_title,
     kubectl_repr,
+    pod_inspection_repr,
     resolve_read_kind,
 )
 from app.collectors.loki import (
@@ -68,7 +69,8 @@ from app.collectors.loki import (
     loki_mcp_query,
 )
 from app.collectors.prometheus import prom_mcp_query, prom_query
-from app.collectors.runai_mcp import _tool_json, _tool_text
+from app.collectors.runai_mcp import _tool_json, valid_official_workload_id
+from app.collectors.system import system_log_query
 from app.config import Settings
 from app.llm import complete_json, llm_configured
 from app.masking import build_masker
@@ -90,6 +92,15 @@ _USER_PROMPT_CHARS = 6000
 # separates a collector-built observation envelope from arbitrary remote data
 # that happens to contain `observation`, `polarity`, or `coverage` fields.
 _VERIFIED_OBSERVATION = object()
+_RECOVERY_URL_RE = re.compile(r"\b(?:https?|wss?)://\S+", re.IGNORECASE)
+_RECOVERY_DIAGNOSTIC_RE = re.compile(
+    r"\b(?:HTTP\s*(?:400|401|403|404|405|409|422|429|5\d\d)|bad\s+request|"
+    r"forbidden|unauthori[sz]ed|permission|rbac|not\s+found|notfound|invalid|"
+    r"syntax|parse|required|allowlist|unknown\s+(?:tool|kind|resource)|container|"
+    r"timeout|timed\s+out|certificate|self[- ]signed|tls|ssl|connect(?:ion)?|"
+    r"dns|name\s+resolution|datasource|service\s+account|token\s+unavailable)\b",
+    re.IGNORECASE,
+)
 
 
 async def run_drilldowns(
@@ -123,7 +134,13 @@ async def run_drilldowns(
             ),
         )
         for result in results
-        if result.agent in registry and result.status != "unavailable"
+        # An unavailable first-pass collector is exactly where a bounded
+        # domain agent can still add value: it may repair an over-broad or
+        # malformed query, choose another read-only tool, or explain that the
+        # failure is transport/configuration-wide.  Skipping it here used to
+        # make a single base-query failure permanently disable that domain's
+        # LLM even though its registry was configured.
+        if result.agent in registry
     ]
     if not task_results:
         return
@@ -135,10 +152,11 @@ async def run_drilldowns(
     )
     for task in pending:
         task.cancel()
-        tasks[task].warnings.append(
-            f"{tasks[task].agent} drill-down stopped: shared evidence budget exhausted"
-        )
     if pending:
+        _log.info(
+            "shared evidence budget reached; cancelled %d optional drill-down(s)",
+            len(pending),
+        )
         await asyncio.gather(*pending, return_exceptions=True)
     # Consume completed task exceptions: _drill_one is best-effort, but an
     # unexpected BaseException must not leak out of the coordinator.
@@ -186,11 +204,13 @@ async def _drill_one(
                 probe_attempts=probe_attempts,
             )
         step = 0
+        invalid_query_repair_used = False
         decision_round_limit = settings.max_investigation_steps or 3
         while step < decision_round_limit:
             if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-                result.warnings.append(
-                    f"{result.agent} drill-down stopped: shared evidence budget exhausted"
+                _log.info(
+                    "shared evidence budget reached; stopped optional %s drill-down",
+                    result.agent,
                 )
                 break
             step += 1
@@ -220,21 +240,40 @@ async def _drill_one(
                 )
                 break
             queries = []
+            rejected: list[dict[str, Any]] = []
             for q in decision.get("queries") or []:
-                if not isinstance(q, dict) or str(q.get("tool") or "") not in tools:
+                if not isinstance(q, dict):
+                    rejected.append(_rejected_query_feedback(q, tools))
+                    continue
+                if str(q.get("tool") or "") not in tools:
+                    rejected.append(_rejected_query_feedback(q, tools))
                     continue
                 if not _valid_domain_query(q):
                     # Do not turn a PromQL/LogQL name hallucinated as a
                     # Kubernetes kind into an unavailable evidence card. The
                     # tool descriptions already name the valid kinds; keeping
                     # this out of the history also prevents repeated noise.
+                    rejected.append(_rejected_query_feedback(q, tools))
                     continue
                 key = _query_fingerprint(q)
                 if key in seen_queries:
                     continue
                 seen_queries.add(key)
                 queries.append(q)
+            if rejected:
+                history.extend(rejected)
             if not queries:
+                # Give one malformed/unknown-tool decision a correction round.
+                # This remains bounded by both this one-shot allowance and the
+                # normal reasoning-round/deadline limits.  Duplicate valid
+                # queries still stop immediately instead of looping.
+                if (
+                    rejected
+                    and not invalid_query_repair_used
+                    and step < decision_round_limit
+                ):
+                    invalid_query_repair_used = True
+                    continue
                 result.warnings.append(
                     f"{result.agent} drill-down stopped at step {step}: "
                     "no new allowed read-only query was returned"
@@ -281,6 +320,158 @@ async def _call_tool_safely(
         return outcome if isinstance(outcome, dict) else {"error": "tool returned no result"}
     except Exception as exc:  # noqa: BLE001 - a failing query is an observation
         return {"error": f"{exc.__class__.__name__}: {exc}"}
+
+
+def _rejected_query_feedback(value: object, tools: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Machine-readable repair hint for a model-generated query we did not run.
+
+    This object is prompt-only operational feedback.  It never becomes an
+    artifact or a blackboard fact, so a hallucinated kind cannot become RCA
+    evidence merely by appearing in a rejected request.
+    """
+    query = value if isinstance(value, dict) else {}
+    tool = str(query.get("tool") or "")[:80]
+    args = query.get("args") if isinstance(query.get("args"), dict) else {}
+    requested_kind = str(args.get("kind") or "")[:80]
+    reason = "query must be a JSON object"
+    if isinstance(value, dict) and tool not in tools:
+        reason = "tool is not available in this evidence domain"
+    elif tool == "k8s_read" and resolve_read_kind(requested_kind) is None:
+        reason = "kind is not an allowlisted Kubernetes resource"
+    elif isinstance(value, dict):
+        reason = "arguments are malformed or outside the read-only contract"
+    feedback: dict[str, Any] = {
+        "status": "rejected",
+        "reason": reason,
+        "allowed_tools": sorted(tools),
+        "instruction": (
+            "Operational feedback only, not incident evidence. Correct the tool/arguments "
+            "and return a new narrow read-only query."
+        ),
+    }
+    if tool:
+        feedback["requested_tool"] = tool
+    if requested_kind:
+        feedback["requested_kind"] = requested_kind
+    if tool == "k8s_read":
+        feedback["allowed_kinds"] = sorted(_READ_KINDS)
+    return feedback
+
+
+def _query_failure_feedback(outcome: dict[str, Any], error: object) -> dict[str, Any]:
+    """Expose just enough failed-call detail for the next LLM round to recover.
+
+    Failed response bodies remain excluded: they can contain stale incident
+    keywords and are not evidence.  Adapter-owned status/error-code metadata and
+    recognized operational diagnostics are safe to use as query-repair input.
+    """
+    raw = " ".join(str(error or "query failed").split())
+    nested = outcome.get("result") if isinstance(outcome.get("result"), dict) else {}
+    metadata = {
+        key: outcome.get(key) if outcome.get(key) not in (None, "") else nested.get(key)
+        for key in ("error_code", "status_code", "transport_error", "retryable")
+    }
+    if metadata.get("status_code") in (None, ""):
+        status_match = re.search(r"\bHTTP\s*(\d{3})\b", raw, re.IGNORECASE)
+        if status_match:
+            metadata["status_code"] = int(status_match.group(1))
+    # Full websocket/HTTP request URLs add noise and may carry query parameters.
+    scrubbed = _RECOVERY_URL_RE.sub("[endpoint]", raw)[:500]
+    recognized = bool(_RECOVERY_DIAGNOSTIC_RE.search(scrubbed))
+    category = _query_failure_category(metadata, scrubbed if recognized else "query failed")
+    diagnostic = _safe_recovery_diagnostic(scrubbed, category) if recognized else "query failed"
+    retryable = metadata.get("retryable")
+    if category == "authorization":
+        guidance = "Do not retry the same call; use another allowed read-only tool if possible."
+    elif category == "target_not_found":
+        guidance = (
+            "Discover the current target identity, then retry with that exact name and scope."
+        )
+    elif category in {"invalid_request", "container_selection"}:
+        guidance = "Correct the query syntax/arguments or container selection before retrying."
+    elif retryable is False:
+        guidance = "Do not repeat this call unchanged; choose another allowed discriminator."
+    else:
+        guidance = "Change the scope/query/tool or make at most one justified retry."
+    feedback: dict[str, Any] = {
+        "status": "failed",
+        "error_category": category,
+        "diagnostic": diagnostic,
+        "instruction": f"Operational feedback only, not incident evidence. {guidance}",
+    }
+    for key in ("error_code", "status_code", "transport_error", "retryable"):
+        value = metadata.get(key)
+        if value not in (None, ""):
+            feedback[key] = value
+    return feedback
+
+
+def _safe_recovery_diagnostic(raw: str, category: str) -> str:
+    """Canonicalize an error without replaying an arbitrary failed response body."""
+    status_match = re.search(r"\bHTTP\s*(\d{3})\b", raw, re.IGNORECASE)
+    prefix = f"HTTP {status_match.group(1)}: " if status_match else ""
+    lowered = raw.lower()
+    if category == "authorization":
+        detail = "authorization/RBAC denied the read-only query"
+    elif category == "target_not_found":
+        detail = "the requested target was not found"
+    elif category == "container_selection":
+        detail = "container selection is missing or invalid"
+    elif category == "configuration":
+        if "datasource" in lowered:
+            detail = "Grafana datasource UID is missing, invalid, or inaccessible"
+        elif "token" in lowered or "service account" in lowered:
+            detail = "service-account credential is unavailable"
+        else:
+            detail = "collector configuration is unavailable or invalid"
+    elif category == "invalid_request":
+        detail = "query syntax or arguments are invalid"
+    elif category == "rate_limited":
+        detail = "backend rate limit reached"
+    elif category == "transport":
+        if "certificate" in lowered or "self-signed" in lowered or "tls" in lowered:
+            detail = "TLS certificate validation failed"
+        elif "timeout" in lowered or "timed out" in lowered:
+            detail = "transport timed out"
+        else:
+            detail = "transport connection failed"
+    elif category == "backend_failure":
+        detail = "backend returned a server error"
+    else:
+        detail = "query execution failed"
+    return f"{prefix}{detail}"[:300]
+
+
+def _query_failure_category(outcome: dict[str, Any], diagnostic: str) -> str:
+    code = str(outcome.get("error_code") or "").lower()
+    lowered = diagnostic.lower()
+    status = outcome.get("status_code")
+    if status in {401, 403} or any(
+        marker in f"{code} {lowered}"
+        for marker in ("forbidden", "unauthorized", "permission", "rbac")
+    ):
+        return "authorization"
+    if status == 404 or "not found" in lowered or "notfound" in lowered:
+        return "target_not_found"
+    if "container" in lowered:
+        return "container_selection"
+    if "datasource" in lowered or "service account" in lowered or "token unavailable" in lowered:
+        return "configuration"
+    if status in {400, 405, 409, 422} or any(
+        marker in lowered
+        for marker in ("bad request", "invalid", "syntax", "parse", "required", "allowlist")
+    ):
+        return "invalid_request"
+    if status == 429:
+        return "rate_limited"
+    if outcome.get("transport_error") or any(
+        marker in lowered
+        for marker in ("timeout", "timed out", "certificate", "self-signed", "tls", "ssl", "dns")
+    ):
+        return "transport"
+    if isinstance(status, int) and status >= 500:
+        return "backend_failure"
+    return "execution"
 
 
 async def _run_query(
@@ -345,7 +536,7 @@ async def _run_query(
         assessments = result.details.setdefault("ontology_probe_assessments", [])
         if isinstance(assessments, list):
             assessments.append(assessment)
-    history_outcome = {"error": "query failed"} if error else outcome
+    history_outcome = _query_failure_feedback(outcome, error) if error else outcome
     history.append(
         {
             "tool": name,
@@ -623,6 +814,15 @@ _DOMAIN_FOCUS = {
         "quota, scheduling decisions, and audit / authorization entries around the "
         "incident time"
     ),
+    "system": (
+        "node-scoped kernel, NVIDIA driver, NVLink, hardware, filesystem and OOM "
+        "signals; use historical journal scope for a past incident and treat live "
+        "dmesg/syslog tails only as current context"
+    ),
+    "change": (
+        "the first target-scoped controller, Pod, node-condition, Event or Helm "
+        "metadata change inside the incident window that could precede the symptom"
+    ),
 }
 
 
@@ -645,6 +845,9 @@ def _system_prompt(agent: str, tools: dict[str, dict[str, Any]]) -> str:
         "tighter time filter or regex) to pin it down.\n"
         "- A condition name or metric label alone is not a failure. Verify its status and "
         "sample value; False or zero is refuting evidence, not a positive signal.\n"
+        "- Kubernetes spec/configuration expresses intent, not an observed failure. In "
+        "particular, spec.preemptionPolicy=PreemptLowerPriority does NOT prove that "
+        "preemption happened; require an active condition or target-scoped Warning Event.\n"
         "- For a named alert pod, inspect full Pod YAML and describe-level status/events before "
         "broad namespace/project reads. If a container is waiting, terminated, or restarted, "
         "inspect that container's logs (including the prior instance when available).\n"
@@ -657,6 +860,12 @@ def _system_prompt(agent: str, tools: dict[str, dict[str, Any]]) -> str:
         "a downstream symptom). Do NOT stop at the first plausible-looking line. Answer "
         "action=done ONLY when your own domain is thoroughly covered and further queries "
         "would be redundant.\n"
+        "- drilldown_so_far entries with status=failed/rejected and "
+        "base_collection.execution_diagnostics are OPERATIONAL FEEDBACK, never incident "
+        "evidence. Use them to repair a malformed selector/argument, discover the correct "
+        "target/container, or switch to another allowed read-only tool. Do not blindly repeat "
+        "an authorization/configuration-wide failure, and do not stop while a safe alternative "
+        "discriminator remains.\n"
         "- If ontology_guidance is supplied, turn its questions and checks into narrow "
         "queries using only your tools. Its candidate family is a hypothesis, not evidence: "
         "actively look for the listed disconfirmations too. Respect its avoid guidance and use "
@@ -709,7 +918,12 @@ def _user_prompt(
         # "thinking material" that used to reach only the playbook renderer.
         stable["platform_architecture"] = architecture
     variable = {
-        "my_summary": (result.summary or "")[:1200],
+        "my_summary": (
+            (result.summary or "")[:1200]
+            if result.status in {"ok", "partial"}
+            else "Base collection unavailable; use base_collection operational feedback."
+        ),
+        "base_collection": _base_collection_feedback(result),
         "my_artifacts": [
             _artifact_prompt_item(art)
             for art in result.artifacts[-8:]
@@ -724,6 +938,30 @@ def _user_prompt(
         max_chars=_USER_PROMPT_CHARS,
         trim_keys=("drilldown_so_far", "my_artifacts", "shared_observations"),
     )
+
+
+def _base_collection_feedback(result: CollectorResult) -> dict[str, Any]:
+    """Prompt-only status explaining why the first pass had no usable data."""
+    feedback: dict[str, Any] = {
+        "status": result.status,
+        "confidence": result.confidence,
+    }
+    if result.missing_data:
+        feedback["missing_data"] = [str(value)[:120] for value in result.missing_data[:5]]
+    diagnostics = []
+    candidates = [
+        *([result.summary] if result.status == "unavailable" and result.summary else []),
+        *result.warnings[:4],
+    ]
+    for warning in candidates:
+        item = _query_failure_feedback({}, warning)
+        # Generic warnings do not help repair a query and could contain stale
+        # incident text. Keep only recognized operational diagnostics.
+        if item.get("diagnostic") != "query failed":
+            diagnostics.append(item)
+    if diagnostics:
+        feedback["execution_diagnostics"] = diagnostics
+    return feedback
 
 
 def _record_blackboard(blackboard: Any, result: CollectorResult, target: AnalysisTarget) -> None:
@@ -1026,31 +1264,26 @@ def _component_mentioned_as_evidence(text: str, component: str) -> bool:
 # Valid metric-name reference, spliced into the metric-querying tool descriptions
 # (rendered into both the drilldown and chat LLM system prompts) so the model uses
 # real names instead of inventing ones that 400. PromQL series are the ones this
-# agent already queries (known-present in this deployment); Run:ai metricType enums
-# are from the Run:ai supported-metrics/telemetry docs, GPU-profiling omitted:
-# https://run-ai-docs.nvidia.com/saas/platform-management/monitor-performance/metrics
+# agent already queries (known-present in this deployment).
 _KNOWN_PROMQL_SERIES = (
     "runai_queue_allocated_gpus, runai_queue_requested_gpus, "
     "runai_project_allocated_gpus, runai_project_requested_gpus, "
     "kube_pod_status_phase, kube_pod_container_status_restarts_total, "
     "container_memory_working_set_bytes, container_cpu_usage_seconds_total"
 )
-_RUNAI_METRIC_TYPES = (
-    "GPU_UTILIZATION, GPU_MEMORY_USAGE_BYTES, GPU_MEMORY_UTILIZATION, ALLOCATED_GPU, "
-    "TOTAL_GPU, CPU_UTILIZATION, CPU_MEMORY_USAGE_BYTES, POD_COUNT, RUNNING_POD_COUNT, "
-    "AVG_WORKLOAD_WAIT_TIME, ALLOCATED_GPUS, FREE_GPUS, IDLE_ALLOCATED_GPUS"
-)
-
-
 def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
     """Per-agent tool registries — THE scoping boundary between domains."""
+    change_sources = "all|controller|pod|event"
+    if getattr(settings, "enable_helm_change_detection", False):
+        change_sources += "|helm"
     registry: dict[str, dict[str, dict[str, Any]]] = {
         "kubernetes": {
             "k8s_read": {
                 "description": (
                     "Read-only get/list of one Kubernetes kind. args: "
                     f"kind (one of: {', '.join(sorted(_READ_KINDS))}), "
-                    "namespace?, name?, label_selector?"
+                    "namespace?, name?, label_selector?. A named Pod is always "
+                    "promoted to full YAML + describe/events automatically."
                 ),
                 "call": _tool_k8s_read,
             },
@@ -1074,14 +1307,38 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
             },
             "k8s_change_timeline": {
                 "description": (
-                    "Read a bounded Kubernetes change timeline for controller/pod/event/helm "
+                    "Read a bounded Kubernetes change timeline for controller/pod/event "
                     "metadata. USE THIS for deployment or rollout history; do not invent a "
-                    "deployment_history resource. args: source (all|controller|pod|event|helm), "
+                    f"deployment_history resource. args: source ({change_sources}), "
                     "component?, lookback_seconds?"
                 ),
                 "call": _tool_k8s_change_timeline,
             },
-        }
+        },
+        "system": {
+            "system_log_query": {
+                "description": (
+                    "Read one bounded, metadata-only host log observation for the alert node. "
+                    "No raw log body is returned. args: source (dmesg|journal|syslog), "
+                    "node? (must equal the resolved alert node), lookback_seconds? "
+                    "(60..86400), lines? (1..1000), grep? (bounded literal). For a past "
+                    "incident prefer journal, which is queried with the incident start/end."
+                ),
+                "call": _tool_system_log_query,
+            }
+        },
+        "change": {
+            "change_query": {
+                "description": (
+                    "Read one bounded, body-free change timeline inside the resolved alert "
+                    "namespace/node and incident window. args: source "
+                    "(all|controller|pod|node_condition|event"
+                    + ("|helm" if getattr(settings, "enable_helm_change_detection", False) else "")
+                    + "), component?, lookback_seconds? (60..86400), limit? (1..20)."
+                ),
+                "call": _tool_change_query,
+            }
+        },
     }
     if settings.enable_pod_exec:
         _allow = "; ".join(" ".join(cmd) for cmd in _EXEC_ALLOWLIST)
@@ -1118,22 +1375,75 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
         }
     if settings.runai_mcp_url:
         registry["runai"] = {
-            "runai_api_search": {
+            "runai_workload_summary": {
                 "description": (
-                    "Find Run:ai REST API operations by keyword (BM25 over the full "
-                    "OpenAPI spec, 426 operations). args: query (keywords, e.g. "
-                    "'workload events history')"
+                    "Read the official Run:ai MCP workload summary, scoped to the alert's "
+                    "project when present. No arguments."
                 ),
-                "call": _tool_runai_search,
+                "call": _tool_runai_workload_summary,
             },
-            "runai_api_get": {
+            "runai_workload_status": {
                 "description": (
-                    "Call one Run:ai REST API operation — GET ONLY, path must start "
-                    "with /api/. args: path (e.g. '/api/v1/workloads'), query? "
-                    "(param map, e.g. {'name': 'job-1'}). "
-                    f"For metrics endpoints, valid metricType values include: {_RUNAI_METRIC_TYPES}."
+                    "Read the official Run:ai MCP status for the alert's immutable Run:ai "
+                    "workload ID. No arguments; unavailable when the alert has no ID."
                 ),
-                "call": _tool_runai_get,
+                "call": _tool_runai_workload_status,
+            },
+            "runai_workload_history": {
+                "description": (
+                    "Read the official Run:ai MCP lifecycle history and recent events "
+                    "for the alert's immutable workload ID. No arguments."
+                ),
+                "call": _tool_runai_workload_history,
+            },
+            "runai_workload_pods": {
+                "description": (
+                    "Read the official Run:ai MCP pod placement and allocation view for "
+                    "the alert's immutable workload ID. No arguments."
+                ),
+                "call": _tool_runai_workload_pods,
+            },
+            "runai_workload_spec": {
+                "description": (
+                    "Read the official Run:ai MCP submitted spec, allocated resources, "
+                    "placement, and pending messages for the alert workload. No arguments."
+                ),
+                "call": _tool_runai_workload_spec,
+            },
+            "runai_workload_metrics": {
+                "description": (
+                    "Read official Run:ai MCP workload metrics over the incident window "
+                    "for the alert's immutable workload ID. No arguments."
+                ),
+                "call": _tool_runai_workload_metrics,
+            },
+            "runai_project_resources": {
+                "description": (
+                    "Read the official Run:ai MCP resource/quota view for the alert's "
+                    "project. No arguments; unavailable when the alert has no project."
+                ),
+                "call": _tool_runai_project_resources,
+            },
+            "runai_project_metrics": {
+                "description": (
+                    "Read official Run:ai MCP allocation/utilization metrics over the "
+                    "incident window for the alert's project. No arguments."
+                ),
+                "call": _tool_runai_project_metrics,
+            },
+            "runai_node_pools": {
+                "description": (
+                    "List Run:ai node pools available to the configured identity. "
+                    "No arguments."
+                ),
+                "call": _tool_runai_node_pools,
+            },
+            "runai_node_pods": {
+                "description": (
+                    "Read official Run:ai MCP pods and workload allocations on the alert's "
+                    "node. No arguments; unavailable when the alert has no node."
+                ),
+                "call": _tool_runai_node_pods,
             },
         }
     sql_dsn = settings.runai_db_dsn or settings.postgres_dsn
@@ -1187,6 +1497,29 @@ async def _tool_k8s_read(settings: Settings, target: AnalysisTarget, args: dict)
     namespace = str(args.get("namespace") or "")
     name = str(args.get("name") or "")
     label_selector = str(args.get("label_selector") or "")
+    # A named Pod read must not depend on the model remembering to pick the
+    # separate describe tool.  Promote it deterministically to the same full
+    # YAML + filtered Events inspection used by the base collector and shared
+    # investigator.  This closes the last path that still emitted a compact
+    # ``kubectl get pods <name>`` artifact with lifecycle fields truncated.
+    if resolve_read_kind(kind) == "pods" and name:
+        item = await k8s_describe(
+            settings,
+            "pods",
+            namespace=namespace,
+            name=name,
+            time_range=incident_time_range(target),
+        )
+        error = item.get("error")
+        events = item.get("events") or []
+        return {
+            "query": pod_inspection_repr(namespace, name),
+            "title": _title(settings, "Pod YAML + 상세 점검", "Pod YAML + describe"),
+            "summary": str(error) if error else f"pods/{name}, {len(events)} event(s)",
+            "error": error,
+            "result": item,
+            **({"mcp_fallback": item["mcp_fallback"]} if item.get("mcp_fallback") else {}),
+        }
     # k8s_read is MCP-first with direct fallback — transport policy lives THERE,
     # so every k8s read path (followup / investigation / drill-down) shares it.
     item = await k8s_read(
@@ -1212,11 +1545,29 @@ async def _tool_k8s_read(settings: Settings, target: AnalysisTarget, args: dict)
 async def _tool_k8s_change_timeline(
     settings: Settings, target: AnalysisTarget, args: dict
 ) -> dict:
+    return await _tool_change_query(settings, target, args)
+
+
+async def _tool_change_query(
+    settings: Settings, target: AnalysisTarget, args: dict
+) -> dict:
     # ``change_query`` constructs and bounds its own observation contract:
     # target correlation and the incident window are verified by the collector.
     # Mark that *adapter-produced* envelope explicitly, so a similarly named
     # field in arbitrary remote JSON never gains causal authority.
     outcome = await change_query(settings, target, args)
+    if isinstance(outcome, dict) and isinstance(outcome.get("observation"), dict):
+        outcome["_verified_observation"] = _VERIFIED_OBSERVATION
+    return outcome
+
+
+async def _tool_system_log_query(
+    settings: Settings, target: AnalysisTarget, args: dict
+) -> dict:
+    # The system adapter returns metadata counts/signal categories only; raw
+    # host log bodies never reach this loop. Mark only its adapter-built scope
+    # and incident-window verdict as trusted evidence semantics.
+    outcome = await system_log_query(settings, target, args)
     if isinstance(outcome, dict) and isinstance(outcome.get("observation"), dict):
         outcome["_verified_observation"] = _VERIFIED_OBSERVATION
     return outcome
@@ -1245,9 +1596,14 @@ async def _tool_k8s_logs(settings: Settings, target: AnalysisTarget, args: dict)
     lines = item.get("lines") or []
     ns_flag = f" -n {namespace}" if namespace else ""
     c_flag = f" -c {container}" if container else ""
+    title = _title(
+        settings,
+        "이전 컨테이너 로그" if previous else "Pod 로그",
+        "Previous container logs" if previous else "Pod logs",
+    )
     return {
         "query": f"kubectl logs {pod}{ns_flag}{c_flag}" + (" --previous" if previous else ""),
-        "title": _title(settings, "이전 컨테이너 로그" if previous else "Pod 로그", "Previous container logs" if previous else "Pod logs"),
+        "title": title,
         "summary": str(error) if error else f"{len(lines)} log line(s)",
         "error": error,
         "result": item,
@@ -1567,75 +1923,247 @@ async def _tool_sql_select(settings: Settings, target: AnalysisTarget, args: dic
     }
 
 
-async def _mcp_call(settings: Settings, tool: str, arguments: dict, url: str = "") -> Any:
-    return await mcp_call(url or settings.runai_mcp_url, tool, arguments)
+async def _mcp_call(
+    settings: Settings, tool: str, arguments: dict, url: str = ""
+) -> Any:
+    # NVIDIA's official HTTP MCP is an OAuth-protected resource. Reuse exactly
+    # the Run:ai token source used by the direct collector, rather than making
+    # an unauthenticated in-cluster call just because the service is ClusterIP.
+    from app.collectors.runai import _runai_headers
+
+    headers, _warnings = await _runai_headers(settings)
+    if not headers.get("Authorization"):
+        raise RuntimeError(
+            "Run:ai MCP authentication is unavailable; configure RUNAI_BEARER_TOKEN "
+            "or RUNAI_CLIENT_ID and RUNAI_CLIENT_SECRET"
+        )
+    return await mcp_call(url or settings.runai_mcp_url, tool, arguments, headers=headers)
 
 
-async def _tool_runai_search(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
-    query = " ".join(str(args.get("query") or "").split())[:200]
-    title = _title(settings, "Run:ai API 검색", "Run:ai API spec search")
-    if not query:
-        return {
-            "query": "",
-            "title": title,
-            "summary": "empty search query",
-            "error": "empty search query",
-        }
-    result = await _mcp_call(settings, "search_runai_api_spec", {"query": query})
-    text = _safe_text(_tool_text(result), limit=_RESULT_CHARS)
-    if getattr(result, "isError", False):
-        error = mcp_error(result)
-        return {
-            "query": query,
-            "title": title,
-            "summary": error,
-            "error": error,
-        }
-    return {
-        "query": f"search_runai_api_spec {query!r}",
-        "title": title,
-        "summary": "spec search ok",
-        "error": None,
-        "result": text,
-    }
-
-
-async def _tool_runai_get(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
-    path = str(args.get("path") or "").strip()
-    title = _title(settings, "Run:ai API 조회 (GET)", "Run:ai API call (GET)")
-    # GET-only under /api/ regardless of what the LLM asks for — the drill-down
-    # must never mutate Run:ai state or reach non-API routes.
-    decoded_path = unquote(path)
-    path_parts = decoded_path.split("/")
-    raw_path_parts = path.split("/")
-    if (
-        not path.startswith("/api/")
-        or "%" in path
-        or len(path_parts) != len(raw_path_parts)
-        or any(part in (".", "..") for part in path_parts)
-        or any(char in decoded_path for char in ("\\", "?", "#"))
-        or any(char.isspace() for char in decoded_path)
-    ):
-        error = "only GET requests under /api/ are allowed"
-        return {"query": path, "title": title, "summary": error, "error": error}
-    raw_params = args.get("query") if isinstance(args.get("query"), dict) else {}
-    params = {str(k)[:60]: str(v)[:120] for k, v in list(raw_params.items())[:8] if str(k).strip()}
-    arguments: dict[str, Any] = {"method": "GET", "path": path[:300]}
-    if params:
-        arguments["query"] = params
-    result = await _mcp_call(settings, "call_runai_api", arguments)
-    # The real request an operator could replay with curl.
-    query = f"GET {path}" + ("?" + urlencode(params) if params else "")
+async def _official_runai_tool(
+    settings: Settings,
+    *,
+    tool: str,
+    arguments: dict[str, str],
+    title_ko: str,
+    title_en: str,
+) -> dict:
+    title = _title(settings, title_ko, title_en)
+    query = f"MCP {tool}" + (f" {arguments}" if arguments else "")
+    try:
+        result = await _mcp_call(settings, tool, arguments)
+    except Exception as exc:  # noqa: BLE001 - drill-down failure stays an artifact
+        error = _safe_text(str(exc), limit=_RESULT_CHARS)
+        return {"query": query, "title": title, "summary": error, "error": error}
     if getattr(result, "isError", False):
         error = mcp_error(result)
         return {"query": query, "title": title, "summary": error, "error": error}
     return {
         "query": query,
         "title": title,
-        "summary": f"GET {path} ok",
+        "summary": f"{tool} ok",
         "error": None,
         "result": _tool_json(result),
     }
+
+
+async def _tool_runai_workload_summary(
+    settings: Settings, target: AnalysisTarget, _args: dict
+) -> dict:
+    arguments = (
+        {"orgType": "project", "orgName": target.project}
+        if target.project
+        else {}
+    )
+    return await _official_runai_tool(
+        settings,
+        tool="get_workloads_summary",
+        arguments=arguments,
+        title_ko="Run:ai 워크로드 요약",
+        title_en="Run:ai workload summary",
+    )
+
+
+async def _tool_runai_workload_status(
+    settings: Settings, target: AnalysisTarget, _args: dict
+) -> dict:
+    return await _official_workload_tool(
+        settings,
+        target,
+        tool="get_workload_status",
+        title_ko="Run:ai 워크로드 상태",
+        title_en="Run:ai workload status",
+    )
+
+
+async def _tool_runai_workload_history(
+    settings: Settings, target: AnalysisTarget, _args: dict
+) -> dict:
+    return await _official_workload_tool(
+        settings,
+        target,
+        tool="get_workload_history",
+        title_ko="Run:ai 워크로드 이력",
+        title_en="Run:ai workload history",
+    )
+
+
+async def _tool_runai_workload_pods(
+    settings: Settings, target: AnalysisTarget, _args: dict
+) -> dict:
+    return await _official_workload_tool(
+        settings,
+        target,
+        tool="get_workload_pods",
+        title_ko="Run:ai 워크로드 파드",
+        title_en="Run:ai workload pods",
+    )
+
+
+async def _tool_runai_workload_spec(
+    settings: Settings, target: AnalysisTarget, _args: dict
+) -> dict:
+    return await _official_workload_tool(
+        settings,
+        target,
+        tool="get_workload_spec",
+        title_ko="Run:ai 워크로드 명세",
+        title_en="Run:ai workload spec",
+    )
+
+
+async def _tool_runai_workload_metrics(
+    settings: Settings, target: AnalysisTarget, _args: dict
+) -> dict:
+    arguments: dict[str, str] = {}
+    time_range = incident_time_range(target) or {}
+    if time_range.get("start") and time_range.get("end"):
+        arguments.update(
+            {"start": str(time_range["start"]), "end": str(time_range["end"])}
+        )
+    return await _official_workload_tool(
+        settings,
+        target,
+        tool="get_workload_metrics",
+        title_ko="Run:ai 워크로드 메트릭",
+        title_en="Run:ai workload metrics",
+        extra_arguments=arguments,
+    )
+
+
+async def _official_workload_tool(
+    settings: Settings,
+    target: AnalysisTarget,
+    *,
+    tool: str,
+    title_ko: str,
+    title_en: str,
+    extra_arguments: dict[str, str] | None = None,
+) -> dict:
+    title = _title(settings, title_ko, title_en)
+    workload_id = target.runai_workload_id
+    if not workload_id:
+        error = "alert has no immutable Run:ai workload ID"
+        return {
+            "query": f"MCP {tool}",
+            "title": title,
+            "summary": error,
+            "error": error,
+        }
+    if not valid_official_workload_id(workload_id):
+        error = "alert Run:ai workload ID is not a UUID accepted by the official MCP"
+        return {
+            "query": f"MCP {tool}",
+            "title": title,
+            "summary": error,
+            "error": error,
+        }
+    arguments = {"workloadId": workload_id, **(extra_arguments or {})}
+    return await _official_runai_tool(
+        settings,
+        tool=tool,
+        arguments=arguments,
+        title_ko=title_ko,
+        title_en=title_en,
+    )
+
+
+async def _tool_runai_project_resources(
+    settings: Settings, target: AnalysisTarget, _args: dict
+) -> dict:
+    if not target.project:
+        error = "alert has no Run:ai project"
+        return {
+            "query": "MCP list_project_resources",
+            "title": _title(settings, "Run:ai 프로젝트 리소스", "Run:ai project resources"),
+            "summary": error,
+            "error": error,
+        }
+    return await _official_runai_tool(
+        settings,
+        tool="list_project_resources",
+        arguments={"projectName": target.project},
+        title_ko="Run:ai 프로젝트 리소스",
+        title_en="Run:ai project resources",
+    )
+
+
+async def _tool_runai_project_metrics(
+    settings: Settings, target: AnalysisTarget, _args: dict
+) -> dict:
+    if not target.project:
+        error = "alert has no Run:ai project"
+        return {
+            "query": "MCP get_org_unit_metrics",
+            "title": _title(settings, "Run:ai 프로젝트 메트릭", "Run:ai project metrics"),
+            "summary": error,
+            "error": error,
+        }
+    arguments = {"orgType": "project", "orgName": target.project}
+    time_range = incident_time_range(target) or {}
+    if time_range.get("start") and time_range.get("end"):
+        arguments.update(
+            {"start": str(time_range["start"]), "end": str(time_range["end"])}
+        )
+    return await _official_runai_tool(
+        settings,
+        tool="get_org_unit_metrics",
+        arguments=arguments,
+        title_ko="Run:ai 프로젝트 메트릭",
+        title_en="Run:ai project metrics",
+    )
+
+
+async def _tool_runai_node_pools(
+    settings: Settings, _target: AnalysisTarget, _args: dict
+) -> dict:
+    return await _official_runai_tool(
+        settings,
+        tool="list_node_pools",
+        arguments={},
+        title_ko="Run:ai 노드 풀",
+        title_en="Run:ai node pools",
+    )
+
+
+async def _tool_runai_node_pods(
+    settings: Settings, target: AnalysisTarget, _args: dict
+) -> dict:
+    if not target.node:
+        error = "alert has no node"
+        return {
+            "query": "MCP get_node_pods",
+            "title": _title(settings, "Run:ai 노드 파드", "Run:ai node pods"),
+            "summary": error,
+            "error": error,
+        }
+    return await _official_runai_tool(
+        settings,
+        tool="get_node_pods",
+        arguments={"nodeName": target.node},
+        title_ko="Run:ai 노드 파드",
+        title_en="Run:ai node pods",
+    )
 
 
 def _safe_text(value: str, *, limit: int) -> str:

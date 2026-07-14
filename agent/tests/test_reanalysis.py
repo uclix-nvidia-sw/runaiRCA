@@ -241,6 +241,66 @@ async def test_refuted_top_cause_triggers_exactly_one_reanalysis(monkeypatch) ->
 
 
 @pytest.mark.asyncio
+async def test_progress_does_not_look_stuck_after_self_check(monkeypatch) -> None:
+    _stub_llm_http(monkeypatch)
+    investigate_calls: list[int] = []
+    refute_calls: list[str] = []
+    _install_stubs(
+        monkeypatch,
+        verdicts=[
+            {
+                "confidence": "low",
+                "caveat": "A targeted follow-up is required.",
+                "refuted": True,
+                "next_check": "Check the scheduler queue directly.",
+            },
+            {"confidence": "medium", "caveat": "", "refuted": False, "next_check": ""},
+        ],
+        investigate_calls=investigate_calls,
+        refute_calls=refute_calls,
+    )
+    events: list[tuple[str, str]] = []
+    flushed_at: list[int] = []
+
+    class RecordingProgress:
+        def emit(self, phase, message, **_fields):
+            events.append((phase, message))
+
+        async def flush(self):
+            flushed_at.append(len(events))
+
+    def fake_from_alert(_cls, *_args, **_kwargs):
+        return RecordingProgress()
+
+    monkeypatch.setattr(
+        pipeline.ProgressReporter,
+        "from_alert",
+        classmethod(fake_from_alert),
+    )
+
+    orchestrator = AnalysisOrchestrator(llm_settings())
+    await orchestrator.analyze(_request())
+
+    self_check_index = events.index(("self_check", "Self-check complete"))
+    follow_up_index = events.index(
+        ("investigation", "Running targeted follow-up before synthesis")
+    )
+    synthesis_index = events.index(("synthesize", "Synthesizing final RCA"))
+    synthesis_complete_index = events.index(("synthesize", "Synthesis complete"))
+    harness_start_index = events.index(("harness", "Validating synthesized RCA"))
+    harness_complete_index = events.index(("harness", "Validation complete"))
+    assert (
+        self_check_index
+        < follow_up_index
+        < synthesis_index
+        < synthesis_complete_index
+        < harness_start_index
+        < harness_complete_index
+    )
+    assert flushed_at == [len(events)]
+
+
+@pytest.mark.asyncio
 async def test_cap_zero_uses_semantic_completion_instead_of_disabling_reanalysis(monkeypatch) -> None:
     _stub_llm_http(monkeypatch)
     investigate_calls: list[int] = []

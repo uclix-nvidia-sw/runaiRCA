@@ -5,6 +5,7 @@ from app.schemas import AlertAnalysisResponse
 from app.services.harness import (
     EvidenceLink,
     _trace_item,
+    abstain,
     analysis_hash,
     apply_safety_guardrail,
     apply_trace,
@@ -334,3 +335,44 @@ def test_analysis_hash_changes_when_the_approved_reasoning_changes() -> None:
     response.context["reasoning_trace_v2"] = {"hypothesis_id": "H-2", "support": ["E02"]}
 
     assert analysis_hash(response) != first
+
+
+def test_abstain_preserves_leading_family_as_a_low_confidence_hypothesis() -> None:
+    response = _response()
+    candidates = [
+        RankedCause(
+            "gpu_hardware_error",
+            "medium",
+            5,
+            evidence_agents=["loki"],
+            support_evidence_ids=["made-up-id"],
+        )
+    ]
+    verdict = evaluate(response, [], candidates)
+
+    abstain(response, candidates, verdict, historical_reanalysis=True)
+
+    assert response.root_cause_family == "insufficient_evidence"
+    assert [candidate.family for candidate in candidates] == [
+        "insufficient_evidence",
+        "gpu_hardware_error",
+    ]
+    assert candidates[1].confidence == "low"
+    assert candidates[1].support_evidence_ids == []
+    assert response.context["provisional_root_cause"]["family"] == "gpu_hardware_error"
+    assert "historical re-analysis" in response.analysis_detail
+    assert "low-confidence inference" in response.analysis_detail
+    assert "rather than guessing" not in response.analysis_detail
+
+
+def test_abstain_without_a_candidate_does_not_invent_a_family() -> None:
+    response = _response()
+    candidates = [RankedCause("insufficient_evidence", "low", 0.0)]
+    verdict = evaluate(response, [], candidates)
+
+    abstain(response, candidates, verdict, historical_reanalysis=True)
+
+    assert [candidate.family for candidate in candidates] == ["insufficient_evidence"]
+    assert "provisional_root_cause" not in response.context
+    assert "do not support even a specific working hypothesis" in response.analysis_detail
+    assert "before selecting a family" in response.analysis_detail

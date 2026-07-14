@@ -10,6 +10,7 @@ from app import llm
 from app.services.pipeline import (
     _evidence_deadline_monotonic,
     _finalization_reserve_seconds,
+    _record_evidence_budget_stop,
 )
 from tests.test_orchestrator import make_settings
 
@@ -20,6 +21,20 @@ def test_default_deadline_reserves_finalization_after_shared_evidence_budget() -
 
     assert _finalization_reserve_seconds(1500) == 300.0
     assert _evidence_deadline_monotonic(state) == 1300.0
+
+
+def test_optional_budget_stop_is_trace_metadata_not_operator_warning() -> None:
+    state = SimpleNamespace(
+        investigation_context={"reasoning_trace_v2": {}},
+        extra_warnings=[],
+    )
+
+    _record_evidence_budget_stop(state, "additional investigation iterations")
+
+    assert state.investigation_context["reasoning_trace_v2"]["stop_reason"] == (
+        "analysis_budget_exhausted"
+    )
+    assert state.extra_warnings == []
 
 
 @pytest.mark.asyncio

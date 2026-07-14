@@ -729,8 +729,8 @@ def _insufficient(
     unavailable = sorted(a for a, st in status_by_agent.items() if st == "unavailable")
     ok = sorted(a for a, st in status_by_agent.items() if st == "ok")
     rationale = [
-        "No failure family cleared the evidence floor from a corroborating source; "
-        "naming a root cause would be a guess (R6).",
+        "No failure family cleared the confirmation threshold from a corroborating "
+        "source. Lower-confidence candidates remain working hypotheses for follow-up (R6).",
     ]
     if unavailable:
         rationale.append(f"Evidence gaps: {', '.join(unavailable)} unavailable.")
@@ -776,6 +776,13 @@ _KUBERNETES_NON_CAUSAL_SIGNAL_RE = re.compile(
     r"recovery|recovering|recovered|resolved|cleared|fixed|remediated|success|"
     r"succeeded)\b|(?:없음|정상|복구|해결|미발생|아님)"
 )
+_PODGROUP_GPU_SHORTAGE_RE = re.compile(
+    r"\bnvidia\.com/(?:gpu|mig-[a-z0-9.-]+)\b|"
+    r"\binsufficient\s+(?:available\s+)?gpus?\b|"
+    r"\b(?:did(?:\s+not|n't)|does(?:\s+not|n't))\s+have\s+enough\s+"
+    r"resources?\s*:\s*gpus?\b",
+    re.IGNORECASE,
+)
 
 
 def _kubernetes_signal_is_positive(value: object) -> bool:
@@ -816,7 +823,47 @@ def _kubernetes_semantic_artifact_text(art: object) -> str:
             message = event.get("message")
             if _kubernetes_signal_is_positive(message):
                 parts.append(str(message))
+            # PodGroup is a structured Run:ai scheduling identity, not a word
+            # found in a query. When that exact target Event also states a GPU
+            # shortage, expose the typed meaning so Run:ai quota/scheduler can
+            # rank alongside (and ahead of) generic kube-scheduler placement.
+            if (
+                event.get("target_identity_verified") is True
+                and str(event.get("kind") or "").casefold() == "podgroup"
+                and _PODGROUP_GPU_SHORTAGE_RE.search(str(message or ""))
+            ):
+                parts.append("podgroup requested gpus")
     return " ".join(parts)
+
+
+def _prometheus_semantic_artifact_text(art: object) -> str:
+    """Map verified typed capacity predicates to their scheduling meaning.
+
+    Query names and JSON keys are normally excluded from ranking on purpose.
+    A positive, scoped ``runai_*_capacity_gap`` observation is different: the
+    collector has already verified target labels, sample timestamps and a
+    strictly positive requested-minus-allocated value.  Expose that typed
+    truth as canonical value text without reopening generic metric-name or
+    query-string keyword matching.
+    """
+    payload = getattr(art, "result", None)
+    if not isinstance(payload, Mapping):
+        return ""
+    observation = payload.get("observation")
+    if not isinstance(observation, Mapping):
+        return ""
+    if (
+        str(observation.get("polarity") or "") != "present"
+        or str(observation.get("coverage") or "") != "scoped"
+    ):
+        return ""
+    predicate = str(observation.get("predicate") or "").strip().casefold()
+    if predicate in {
+        "metric:runai_queue_capacity_gap",
+        "metric:runai_project_capacity_gap",
+    }:
+        return "runai quota over quota requested gpus capacity gap"
+    return _leaf_text(payload)
 
 
 def _artifact_ranking_value_text(
@@ -827,6 +874,11 @@ def _artifact_ranking_value_text(
         "kubernetes_warning_events",
     }:
         return _kubernetes_semantic_artifact_text(art)
+    if (
+        str(getattr(art, "source", "")).casefold() == "prometheus"
+        and str(getattr(art, "type", "")) == "promql_signal"
+    ):
+        return _prometheus_semantic_artifact_text(art)
     result = getattr(art, "result", None)
     return _leaf_text(result, drop_keys) if result is not None else ""
 

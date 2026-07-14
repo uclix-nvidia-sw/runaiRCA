@@ -323,6 +323,7 @@ async def verify_matches(
     results: list[CollectorResult],
     *,
     subject: str = "candidate finding",
+    declared_alert: str = "",
 ) -> set[str]:
     """Names of signature/keyword-matched candidates the evidence does NOT support.
 
@@ -340,7 +341,13 @@ async def verify_matches(
         names.discard("")
         if not names or not llm_configured(settings, settings.llm_model_self_check):
             return set()
-        verdict = await _llm_verify_matches(settings, candidates, results, subject)
+        verdict = await _llm_verify_matches(
+            settings,
+            candidates,
+            results,
+            subject,
+            declared_alert=declared_alert,
+        )
         refuted = (verdict or {}).get("refuted")
         if not isinstance(refuted, list):
             return set()
@@ -350,14 +357,24 @@ async def verify_matches(
 
 
 async def verify_known_issues(
-    settings: Settings, issues: list[dict], results: list[CollectorResult]
+    settings: Settings,
+    issues: list[dict],
+    results: list[CollectorResult],
+    *,
+    declared_alert: str = "",
 ) -> set[str]:
     """Suppress keyword-matched known issues the evidence doesn't support (see verify_matches)."""
     candidates = [
         {"name": str(i.get("issue") or "").strip(), "detail": str(i.get("reason") or "")}
         for i in issues
     ]
-    return await verify_matches(settings, candidates, results, subject="known Run:ai issue")
+    return await verify_matches(
+        settings,
+        candidates,
+        results,
+        subject="known Run:ai issue",
+        declared_alert=declared_alert,
+    )
 
 
 async def _llm_verify_matches(
@@ -365,6 +382,8 @@ async def _llm_verify_matches(
     candidates: list[dict],
     results: list[CollectorResult],
     subject: str,
+    *,
+    declared_alert: str = "",
 ) -> dict | None:
     masker = _self_check_masker(settings)
     evidence = _evidence_digest(results, masker)
@@ -378,10 +397,17 @@ async def _llm_verify_matches(
         "evidence by keyword or signature. Matches can be superficial, so decide which "
         "the gathered evidence does NOT actually support. Use ONLY the evidence; do not "
         "invent any. Be conservative: refute a match only when the evidence clearly does "
-        'not fit — when unsure, keep it. Respond with a JSON object: {"refuted": [exact '
+        "not fit — when unsure, keep it. The declared alert payload is a source "
+        "observation, not a collector result: an explicit positive signature there may "
+        "support a match even when collectors no longer retain the event, but false, "
+        'normal, recovered, or negated values do not. Respond with a JSON object: {"refuted": [exact '
         'names that are NOT supported by the evidence]}.'
     )
-    user = f"Candidates:\n{cand}\n\nGathered evidence:\n{evidence}"
+    safe_alert = masker.mask_text(" ".join(str(declared_alert or "").split()))
+    user = (
+        f"Candidates:\n{cand}\n\nDeclared alert payload:\n"
+        f"{safe_alert or '(not supplied)'}\n\nGathered collector evidence:\n{evidence}"
+    )
     return await complete_json(
         settings,
         system=system,
