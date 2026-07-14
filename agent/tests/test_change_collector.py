@@ -167,7 +167,11 @@ async def test_historical_incident_uses_its_own_change_window(
     assert [change["reason"] for change in result.details["changes"]] == ["DuringIncident"]
     assert "start=2026-01-02T02:55:00Z" in result.artifacts[0].query
     observation = result.artifacts[0].result["observation"]
-    assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
+    # An Event on a similarly-named Pod is useful context, but this alert did
+    # not name that Pod and the event does not identify a verified controller.
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert observation["target_scope_verified"] is False
+    assert "observed_entity" not in observation
 
 
 @pytest.mark.asyncio
@@ -391,6 +395,48 @@ def test_historical_change_uses_change_timestamp_not_query_window() -> None:
         "start": "2026-07-13T00:12:00Z",
         "end": "2026-07-13T00:12:00Z",
     }
+
+
+def test_historical_change_keeps_exact_target_pod_provenance() -> None:
+    target = replace(_target(), pod="trainer-0")
+    observation = change_mod._collector_change_observation(
+        changes=[
+            {
+                "kind": "PodDeleted",
+                "name": "trainer-0",
+                "namespace": "runai",
+                "timestamp": "2026-07-13T00:12:00Z",
+            }
+        ],
+        time_range={"start": "2026-07-13T00:00:00Z", "end": "2026-07-13T01:00:00Z"},
+        historical_window=True,
+        warnings=[],
+        target=target,
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
+    assert observation["observed_entity"] == {"kind": "pod", "name": "trainer-0"}
+    assert observation["target_scope_verified"] is True
+
+
+def test_historical_change_does_not_promote_workload_prefix_match() -> None:
+    observation = change_mod._collector_change_observation(
+        changes=[
+            {
+                "kind": "PodCreated",
+                "name": "trainer-worker-7f8d",
+                "timestamp": "2026-07-13T00:12:00Z",
+            }
+        ],
+        time_range={"start": "2026-07-13T00:00:00Z", "end": "2026-07-13T01:00:00Z"},
+        historical_window=True,
+        warnings=[],
+        target=_target(),
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert observation["target_scope_verified"] is False
+    assert "observed_entity" not in observation
 
 
 @pytest.mark.asyncio

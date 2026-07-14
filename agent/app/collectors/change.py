@@ -529,6 +529,7 @@ class ChangeCollector:
                 time_range=time_range,
                 historical_window=historical_window,
                 warnings=warnings,
+                target=target,
             )
             result = self._empty(
                 f"{NO_EVIDENCE} "
@@ -558,6 +559,7 @@ class ChangeCollector:
             time_range=time_range,
             historical_window=historical_window,
             warnings=warnings,
+            target=target,
         )
         if not correlated_changes:
             details = {
@@ -984,6 +986,7 @@ def _collector_change_observation(
     time_range: dict[str, str],
     historical_window: bool,
     warnings: list[str],
+    target: AnalysisTarget | None = None,
 ) -> dict[str, object]:
     """State whether target-scope change evidence is truly incident-bounded."""
     # Do not let the broad collection range stand in for the time of an
@@ -991,6 +994,11 @@ def _collector_change_observation(
     # remains useful operator context but cannot activate a lifecycle cause.
     evidence_window = _change_evidence_window(changes, time_range)
     timed_changes = bool(evidence_window)
+    observed_entity: dict[str, str] | None = None
+    target_scope_verified: bool | None = None
+    if target is not None and historical_window:
+        observed_entity, target_scope_verified = _collector_change_target_scope(changes, target)
+
     if not historical_window:
         # The live one-hour fallback helps an operator but cannot establish a
         # trigger for an alert with no timestamp.
@@ -999,6 +1007,12 @@ def _collector_change_observation(
         # A failed resource class leaves the historical sweep incomplete; don't
         # make an empty/partial result refute a lifecycle-change hypothesis.
         polarity, coverage = ("present", "partial") if changes else ("unknown", "partial")
+    elif target is not None and target_scope_verified is not True:
+        # Correlation by namespace, a workload-name prefix, or a declared
+        # dependency namespace is useful investigation context, but it does
+        # not prove that this historical change belongs to the alert target.
+        # Do not let the blackboard inherit the pipeline target for it.
+        polarity, coverage = "unknown", "partial"
     elif changes and timed_changes:
         polarity, coverage = "present", "scoped"
     elif changes:
@@ -1009,7 +1023,7 @@ def _collector_change_observation(
         polarity, coverage = "unknown", "partial"
     else:
         polarity, coverage = "absent", "scoped"
-    return {
+    observation: dict[str, object] = {
         "kind": "kubernetes_change_window",
         "predicate": "kubernetes_change_window",
         "polarity": polarity,
@@ -1019,6 +1033,91 @@ def _collector_change_observation(
         "observation_window": time_range,
         **({"evidence_window": evidence_window} if evidence_window else {}),
     }
+    if observed_entity:
+        observation["observed_entity"] = observed_entity
+    if target_scope_verified is not None:
+        observation["target_scope_verified"] = target_scope_verified
+    return observation
+
+
+def _collector_change_target_scope(
+    changes: list[dict], target: AnalysisTarget
+) -> tuple[dict[str, str] | None, bool]:
+    """Prove that every correlated change names the alert resource itself.
+
+    ``_partition_target_changes`` deliberately keeps useful near matches (for
+    example a Pod whose name merely starts with a workload name) and every
+    rollout in a declared dependency namespace.  Those are not enough to own
+    a scoped historical verdict.  This narrower gate accepts only an exact
+    target Pod/Node or an exact, known controller for the target workload.
+    """
+    pod = str(target.pod or "").strip()
+    node = str(target.node or "").strip()
+    workload = str(target.workload_name or "").strip()
+
+    if not changes:
+        # An empty, completed historical sweep can only refute changes for an
+        # entity the alert named explicitly; namespace-only emptiness remains
+        # an open-world result.
+        if pod:
+            return {"kind": "pod", "name": pod}, True
+        if node:
+            return {"kind": "node", "name": node}, True
+        if workload:
+            return {"kind": "workload_name", "name": workload}, True
+        return None, False
+
+    pod_folded = pod.casefold()
+    node_folded = node.casefold()
+    workload_folded = workload.casefold()
+
+    def name_of(change: dict) -> str:
+        return str(change.get("name") or "").strip().casefold()
+
+    def is_exact_pod(change: dict) -> bool:
+        kind = str(change.get("kind") or "")
+        object_kind = str(change.get("object_kind") or "")
+        return (
+            bool(target.namespace)
+            and str(change.get("namespace") or "").strip() == target.namespace
+            and bool(pod_folded)
+            and name_of(change) == pod_folded
+            and (
+            kind.startswith("Pod") or (kind.startswith("Event/") and object_kind == "Pod")
+            )
+        )
+
+    def is_exact_node(change: dict) -> bool:
+        return (
+            bool(node_folded)
+            and str(change.get("kind") or "") == "NodeCondition"
+            and name_of(change) == node_folded
+        )
+
+    def is_verified_controller(change: dict) -> bool:
+        kind = str(change.get("kind") or "")
+        object_kind = str(change.get("object_kind") or "")
+        return (
+            bool(target.namespace)
+            and str(change.get("namespace") or "").strip() == target.namespace
+            and bool(workload_folded)
+            and name_of(change) == workload_folded
+            and (
+            kind in {"Deployment", "StatefulSet", "DaemonSet", "HelmRelease"}
+            or (
+                kind.startswith("Event/")
+                and object_kind in {"Deployment", "StatefulSet", "DaemonSet"}
+            )
+            )
+        )
+
+    if all(is_exact_pod(change) for change in changes):
+        return {"kind": "pod", "name": pod}, True
+    if all(is_exact_node(change) for change in changes):
+        return {"kind": "node", "name": node}, True
+    if workload and all(is_verified_controller(change) or is_exact_pod(change) for change in changes):
+        return {"kind": "workload_name", "name": workload}, True
+    return None, False
 
 
 def _change_evidence_window(
@@ -1069,6 +1168,7 @@ def _partition_target_changes(
     for change in changes:
         name = str(change.get("name") or "").strip().casefold()
         namespace = str(change.get("namespace") or primary_namespace).strip()
+        change = {**change, "namespace": namespace}
         kind = str(change.get("kind") or "")
         relation = ""
         if change.get("time_window_verified") is False:
