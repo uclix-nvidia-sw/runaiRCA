@@ -230,7 +230,9 @@ async def test_investigator_runs_queries_and_attaches_artifacts(monkeypatch) -> 
                 "probes": [{"collector": "kubernetes"}],
                 "queries": [
                     {"kind": "pvc", "namespace": "team-a"},
-                    {"kind": "secrets"},  # refused by k8s_read, still an observation
+                    # Unsupported pseudo/resource kinds are rejected before
+                    # transport; they must not render a noisy failed artifact.
+                    {"kind": "secrets"},
                 ],
             },
             {"action": "conclude"},
@@ -257,16 +259,14 @@ async def test_investigator_runs_queries_and_attaches_artifacts(monkeypatch) -> 
         settings, object(), [KubernetesCollector()], InvestigationPlan(), {}, max_steps=4
     )
 
-    assert seen == ["pvc", "secrets"]
+    assert seen == ["pvc"]
     k8s_result = next(r for r in results if r.agent == "kubernetes")
     adhoc = [a for a in k8s_result.artifacts if a.type == "adhoc_query"]
-    assert len(adhoc) == 2
-    ok = next(a for a in adhoc if a.status == "ok")
+    assert len(adhoc) == 1
+    ok = adhoc[0]
     # The real command, alias resolved to the canonical kind, kubectl-prefixed.
     assert ok.query == "kubectl get persistentvolumeclaims -n team-a"
     assert ok.title  # human card title ("PVC 조회" / "persistentvolumeclaims lookup")
-    refused = next(a for a in adhoc if a.status == "unavailable")
-    assert "allowlist" in refused.summary
 
 
 @pytest.mark.asyncio
