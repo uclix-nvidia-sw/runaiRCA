@@ -171,6 +171,96 @@ async def test_historical_incident_uses_its_own_change_window(
 
 
 @pytest.mark.asyncio
+async def test_historical_incident_excludes_pod_deleted_outside_its_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, path, **_kwargs):
+        if path.endswith("/pods"):
+            return JsonResponse(
+                url="u",
+                status_code=200,
+                data={
+                    "items": [
+                        {
+                            "metadata": {
+                                "name": "trainer-old",
+                                "namespace": "runai",
+                                "creationTimestamp": "2025-12-01T00:00:00Z",
+                                # A stale termination must not become evidence
+                                # for the January incident just because the Pod
+                                # still has a deletion timestamp in this read.
+                                "deletionTimestamp": "2026-01-03T00:00:00Z",
+                            }
+                        }
+                    ]
+                },
+            )
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-01-02T03:00:00Z",
+        resolved_at="2026-01-02T03:10:00Z",
+    )
+    result = await ChangeCollector(_Settings()).collect(target)
+
+    assert result.status == "partial"
+    assert result.details["time_range"] == {
+        "start": "2026-01-02T02:55:00Z",
+        "end": "2026-01-02T03:15:00Z",
+    }
+    assert result.details.get("changes", []) == []
+    observation = result.artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == ("absent", "scoped")
+
+
+@pytest.mark.asyncio
+async def test_change_cache_does_not_reuse_another_workloads_scoped_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, path, **_kwargs):
+        if path.endswith("/events"):
+            return JsonResponse(
+                url="u",
+                status_code=200,
+                data={
+                    "items": [
+                        {
+                            "type": "Warning",
+                            "reason": "BackOff",
+                            "lastTimestamp": "2026-01-02T03:04:00Z",
+                            "involvedObject": {"kind": "Pod", "name": "trainer-0"},
+                        }
+                    ]
+                },
+            )
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    collector = ChangeCollector(_Settings())
+    incident = {
+        "fired_at": "2026-01-02T03:00:00Z",
+        "resolved_at": "2026-01-02T03:10:00Z",
+    }
+    trainer = await collector.collect(replace(_target(), **incident))
+    other = await collector.collect(
+        replace(_target(), workload_name="other", pod="other-0", **incident)
+    )
+
+    assert trainer.details["changes"][0]["name"] == "trainer-0"
+    assert other is not trainer
+    assert other.details["changes"] == []
+    assert other.details["context_changes"][0]["name"] == "trainer-0"
+    observation = other.artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+
+
+@pytest.mark.asyncio
 async def test_historical_unrelated_namespace_change_is_context_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

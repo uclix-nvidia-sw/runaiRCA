@@ -407,9 +407,20 @@ class ChangeCollector:
         # an upstream operator/Helm upgrade is the usual root cause of a stuck
         # downstream DaemonSet, so scan those too (P2b).
         dep_namespaces = self._dependency_namespaces(plan, namespace)
+        # Correlation happens after the shared namespace sweep.  Cache entries
+        # must therefore retain the exact alert identity too: two workloads on
+        # the same node can have the same incident window but entirely
+        # different target-correlated changes.
+        target_identity = (
+            str(target.workload_name or ""),
+            str(target.runai_workload_id or ""),
+            str(target.pod or ""),
+            str(getattr(plan, "component", "") or target.component or ""),
+        )
         cache_key = (
             namespace or "",
             node or "",
+            target_identity,
             tuple(dep_namespaces),
             (time_range["start"], time_range["end"])
             if historical_window
@@ -846,7 +857,7 @@ class ChangeCollector:
             name = meta.get("name")
             created = meta.get("creationTimestamp")
             deleted = meta.get("deletionTimestamp")
-            if deleted:
+            if deleted and _within_window(deleted, now, window_seconds=window_seconds):
                 out.append(
                     {
                         "timestamp": deleted,
