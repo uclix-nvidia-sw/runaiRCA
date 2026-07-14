@@ -556,6 +556,73 @@ func TestIncidentAnalysisTargetPrefersFiringAlert(t *testing.T) {
 	}
 }
 
+func TestResolvedIncidentAnalysisTargetIgnoresStaleFiringAlert(t *testing.T) {
+	store := NewStore()
+	base := time.Date(2026, 6, 30, 10, 0, 0, 0, time.UTC)
+	incident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "resolved-target-stale-firing"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Stale firing row"},
+		Fingerprint: "fp-stale-firing",
+		StartsAt:    base.Add(time.Hour).Format(time.RFC3339),
+	})
+	resolvedAt := base.Add(30 * time.Minute)
+	store.mu.Lock()
+	store.alerts["ALR-resolved-target"] = &AlertRecord{
+		AlertID:     "ALR-resolved-target",
+		IncidentID:  incident.IncidentID,
+		AlarmTitle:  "Resolved historical alert",
+		Severity:    "warning",
+		Status:      "resolved",
+		FiredAt:     base,
+		ResolvedAt:  &resolvedAt,
+		Fingerprint: "fp-resolved-target",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "pod": "trainer-dead"},
+		Annotations: map[string]string{"summary": "Queue recovered"},
+	}
+	store.incidents[incident.IncidentID].Status = "resolved"
+	store.incidents[incident.IncidentID].ResolvedAt = &resolvedAt
+	store.mu.Unlock()
+
+	alert, _, alertID, _, _, ok := store.AnalysisTarget("incident", incident.IncidentID)
+	if !ok || alertID != "ALR-resolved-target" || status(alert.Status) != "resolved" {
+		t.Fatalf("expected resolved historical target, got ok=%t alertID=%s alert=%+v", ok, alertID, alert)
+	}
+	if alert.EndsAt != resolvedAt.Format(time.RFC3339Nano) {
+		t.Fatalf("expected resolved target window, got endsAt=%q", alert.EndsAt)
+	}
+}
+
+func TestAnalysisTargetRestoresStoredHistoricalWindow(t *testing.T) {
+	store := NewStore()
+	firedAt := time.Date(2026, 6, 30, 10, 0, 0, 123456789, time.FixedZone("KST", 9*60*60))
+	resolvedAt := firedAt.Add(37 * time.Minute)
+	incident, record := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "analysis-target-window"}, Alert{
+		Status:      "resolved",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue recovered"},
+		Fingerprint: "fp-analysis-target-window",
+		StartsAt:    firedAt.Format(time.RFC3339Nano),
+		EndsAt:      resolvedAt.Format(time.RFC3339Nano),
+	})
+
+	for targetType, targetID := range map[string]string{
+		"alert":    record.AlertID,
+		"incident": incident.IncidentID,
+	} {
+		alert, _, _, _, _, ok := store.AnalysisTarget(targetType, targetID)
+		if !ok {
+			t.Fatalf("expected %s analysis target", targetType)
+		}
+		if alert.StartsAt != firedAt.UTC().Format(time.RFC3339Nano) {
+			t.Fatalf("expected stored fired_at for %s target, got %q", targetType, alert.StartsAt)
+		}
+		if alert.EndsAt != resolvedAt.UTC().Format(time.RFC3339Nano) {
+			t.Fatalf("expected stored resolved_at for %s target, got %q", targetType, alert.EndsAt)
+		}
+	}
+}
+
 func TestIncidentSeverityNormalizesCaseBeforeRanking(t *testing.T) {
 	store := NewStore()
 	webhook := AlertmanagerWebhook{GroupKey: "severity-case"}

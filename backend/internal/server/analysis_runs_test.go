@@ -116,6 +116,53 @@ func TestAnalysisRunSuccessAppliesRCA(t *testing.T) {
 	}
 }
 
+func TestResolvedAnalysisRequestCarriesStoredHistoricalWindow(t *testing.T) {
+	received := make(chan AgentAnalysisRequest, 1)
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		var request AgentAnalysisRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err == nil {
+			received <- request
+		}
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Historical window inspected.",
+			AnalysisDetail:  "## Root Cause\n\nHistorical evidence retained.",
+			AnalysisQuality: "high",
+		})
+	})
+	firedAt := time.Date(2026, 7, 10, 1, 0, 0, 123456789, time.UTC)
+	resolvedAt := firedAt.Add(10 * time.Minute)
+	incident, record := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "resolved-window"}, Alert{
+		Status:      "resolved",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue recovered"},
+		Fingerprint: "fp-resolved-window",
+		StartsAt:    firedAt.Format(time.RFC3339Nano),
+		EndsAt:      resolvedAt.Format(time.RFC3339Nano),
+	})
+
+	run, ok := server.startAnalysisRun("incident", incident.IncidentID, "manual", "reanalyze")
+	if !ok {
+		t.Fatal("expected resolved manual analysis to start")
+	}
+	waitForRunIDStatus(t, server, run.RunID, "complete")
+
+	select {
+	case request := <-received:
+		if request.Alert.Fingerprint != record.Fingerprint {
+			t.Fatalf("expected selected stored alert, got %+v", request.Alert)
+		}
+		if request.Alert.StartsAt != firedAt.Format(time.RFC3339Nano) {
+			t.Fatalf("expected historical startsAt, got %q", request.Alert.StartsAt)
+		}
+		if request.Alert.EndsAt != resolvedAt.Format(time.RFC3339Nano) {
+			t.Fatalf("expected historical endsAt, got %q", request.Alert.EndsAt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("agent request was not captured")
+	}
+}
+
 func TestAnalysisRunStoresLLMUsageMetadataAndClearsOnReanalysis(t *testing.T) {
 	store := NewStore()
 	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "usage"}, Alert{

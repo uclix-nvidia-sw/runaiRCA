@@ -1025,10 +1025,20 @@ func cloneComment(in *CommentRecord) *CommentRecord {
 }
 
 func alertFromRecord(record AlertRecord) Alert {
+	startsAt := ""
+	if !record.FiredAt.IsZero() {
+		startsAt = record.FiredAt.UTC().Format(time.RFC3339Nano)
+	}
+	endsAt := ""
+	if record.ResolvedAt != nil && !record.ResolvedAt.IsZero() {
+		endsAt = record.ResolvedAt.UTC().Format(time.RFC3339Nano)
+	}
 	return Alert{
 		Status:      record.Status,
 		Labels:      cloneMap(record.Labels),
 		Annotations: cloneMap(record.Annotations),
+		StartsAt:    startsAt,
+		EndsAt:      endsAt,
 		Fingerprint: record.Fingerprint,
 	}
 }
