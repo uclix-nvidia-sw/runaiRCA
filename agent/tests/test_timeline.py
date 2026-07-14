@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.collectors.base import CollectorResult
+from app.collectors.base import CollectorResult, artifact
 from app.services.timeline import build_timeline, to_markdown
 
 
@@ -214,6 +214,45 @@ def test_partial_raw_timeline_is_context_not_causal_support() -> None:
     [entry] = build_timeline([result])
 
     assert entry["evidence_role"] == "context"
+
+
+def test_scoped_query_does_not_promote_sibling_raw_timeline_entries() -> None:
+    result = CollectorResult(
+        agent="loki",
+        status="ok",
+        summary="",
+        details={
+            "queries": [
+                {
+                    "name": "verified",
+                    "sample_entries": [
+                        {"timestamp": "2026-07-02T10:00:00Z", "line": "verified entry"}
+                    ],
+                },
+                {
+                    "name": "unverified",
+                    "sample_entries": [
+                        {"timestamp": "2026-07-02T10:01:00Z", "line": "partial entry"}
+                    ],
+                },
+            ]
+        },
+        artifacts=[
+            artifact(
+                agent="loki",
+                source="loki",
+                type="logql_signal",
+                status="ok",
+                confidence="high",
+                summary="verified query",
+                result={"observation": {"polarity": "present", "coverage": "scoped"}},
+            )
+        ],
+    )
+
+    timeline = build_timeline([result])
+
+    assert [entry["evidence_role"] for entry in timeline] == ["context", "context"]
 
 
 def test_timeline_masks_sensitive_messages_at_capture() -> None:

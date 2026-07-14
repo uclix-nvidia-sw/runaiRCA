@@ -92,19 +92,13 @@ def _from_result(result: CollectorResult) -> list[dict]:
 def _timeline_evidence_role(result: CollectorResult) -> str:
     """Keep untyped or incomplete raw details from becoming causal evidence.
 
-    Timeline projections are derived from collector ``details`` rather than a
-    fact ID, so they must remain context unless that same collector completed
-    and emitted at least one typed, scoped-positive observation.  The synthesis
-    prompt enforces this role as well; carrying it in data prevents timeline
-    text from becoming a side channel around the evidence blackboard.
+    Timeline projections are derived from aggregate collector ``details`` and
+    do not retain a one-to-one artifact/fact ID.  A completed collector may mix
+    a scoped-positive query with a partial query, so collector-level promotion
+    would make the latter a causal side channel.  Until every timeline entry
+    carries exact typed-artifact provenance, use it only as chronology and keep
+    direct support in the evidence blackboard.
     """
-    if result.status != "ok":
-        return "context"
-    for item in result.artifacts or []:
-        raw = item.result if isinstance(item.result, dict) else {}
-        observation = raw.get("observation") if isinstance(raw.get("observation"), dict) else {}
-        if observation.get("polarity") == "present" and observation.get("coverage") == "scoped":
-            return "support"
     return "context"
 
 
