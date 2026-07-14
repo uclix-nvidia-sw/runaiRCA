@@ -534,6 +534,10 @@ def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
         if samples:
             summary["first_timestamp"] = samples[0][0]
             summary["last_timestamp"] = samples[-1][0]
+            # Keep every raw timestamp for verification.  A proxy is allowed
+            # to return an unsorted vector, so first/last alone cannot prove
+            # that no interior sample came from outside the incident window.
+            summary["sample_timestamps"] = [timestamp for timestamp, _ in samples]
         if numeric:
             summary.update(
                 {
@@ -583,7 +587,7 @@ def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
         "sample_windows": [
             {
                 key: summary[key]
-                for key in ("first_timestamp", "last_timestamp")
+                for key in ("first_timestamp", "last_timestamp", "sample_timestamps")
                 if key in summary
             }
             for summary in all_series
@@ -784,10 +788,19 @@ def _prometheus_samples_in_window(
     for item in series if isinstance(series, list) else []:
         if not isinstance(item, dict):
             continue
-        for key in ("first_timestamp", "last_timestamp"):
-            parsed = _parse_prometheus_timestamp(item.get(key))
-            if parsed is not None:
-                timestamps.append(parsed)
+        raw_timestamps = item.get("sample_timestamps")
+        candidates = (
+            raw_timestamps
+            if isinstance(raw_timestamps, list)
+            else [item.get("first_timestamp"), item.get("last_timestamp")]
+        )
+        for value in candidates:
+            parsed = _parse_prometheus_timestamp(value)
+            if parsed is None:
+                # A non-empty sample with no parseable instant cannot prove
+                # historical scope.  Do not silently ignore it.
+                return None
+            timestamps.append(parsed)
     if not timestamps:
         return None
     return all(start <= timestamp <= end for timestamp in timestamps)

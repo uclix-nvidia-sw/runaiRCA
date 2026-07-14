@@ -1183,6 +1183,24 @@ def test_salient_markers_require_active_structured_conditions() -> None:
     assert condition_observations(failing)[0]["active"] is True
 
 
+def test_condition_observations_do_not_turn_unknown_into_refutation() -> None:
+    from app.collectors.base import condition_observations
+
+    kubernetes_unknown = {"type": "MemoryPressure", "status": "Unknown"}
+    prometheus_unknown = {
+        "metric": {"condition": "MemoryPressure", "status": "unknown"},
+        "value": [1720000000, "1"],
+    }
+    false_zero = {
+        "metric": {"condition": "MemoryPressure", "status": "false"},
+        "value": [1720000000, "0"],
+    }
+
+    assert condition_observations(kubernetes_unknown) == []
+    assert condition_observations(prometheus_unknown) == []
+    assert condition_observations(false_zero) == []
+
+
 def test_kubernetes_markers_ignore_pod_spec_keyword_values() -> None:
     from app.collectors.base import kubernetes_salient_markers
 

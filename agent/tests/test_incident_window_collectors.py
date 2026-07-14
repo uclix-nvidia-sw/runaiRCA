@@ -264,6 +264,29 @@ def test_prometheus_mixed_window_samples_are_not_incident_evidence() -> None:
     assert observation["sample_window_verified"] is False
 
 
+def test_prometheus_unsorted_interior_out_of_window_sample_is_not_evidence() -> None:
+    window = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    summary = prometheus._prometheus_value_summary(
+        [
+            {
+                "metric": {"pod": "trainer-0"},
+                "values": [
+                    ["2026-07-10T01:00:00Z", "1"],
+                    ["2026-07-13T09:26:12Z", "1"],
+                    ["2026-07-10T01:01:00Z", "1"],
+                ],
+            }
+        ]
+    )
+    observation = prometheus._prometheus_query_observation(
+        {"name": "node_memory_pressure", "series_count": 1, "value_summary": summary},
+        time_range=window,
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert observation["sample_window_verified"] is False
+
+
 def test_prometheus_verdict_uses_all_series_not_only_display_samples() -> None:
     summary = prometheus._prometheus_value_summary(
         [

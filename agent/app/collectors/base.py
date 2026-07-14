@@ -183,6 +183,21 @@ def _truthy_status(value: Any) -> bool:
     return value is True or str(value).strip().lower() in {"true", "1", "yes", "active", "firing"}
 
 
+def _boolean_condition_status(value: Any) -> bool | None:
+    """Decode an explicitly known condition state without treating Unknown as false."""
+    if _truthy_status(value):
+        return True
+    if value is False or str(value).strip().lower() in {
+        "false",
+        "0",
+        "no",
+        "inactive",
+        "resolved",
+    }:
+        return False
+    return None
+
+
 def _sample_values(value: Any) -> list[float]:
     values: list[float] = []
 
@@ -221,8 +236,14 @@ def condition_observations(value: Any, *, limit: int = 20) -> list[dict[str, Any
         if isinstance(node, dict):
             condition_type = str(node.get("type") or "").strip()
             if condition_type.lower() in _BOOLEAN_CONDITION_TYPES and "status" in node:
-                status = str(node.get("status") or "")
-                add(condition_type, _truthy_status(status), "kubernetes_condition", status=status)
+                status = _boolean_condition_status(node.get("status"))
+                if status is not None:
+                    add(
+                        condition_type,
+                        status,
+                        "kubernetes_condition",
+                        status=str(node.get("status") or ""),
+                    )
                 return
 
             metric = node.get("metric")
@@ -231,14 +252,20 @@ def condition_observations(value: Any, *, limit: int = 20) -> list[dict[str, Any
                 condition = str(metric.get("condition") or metric.get("type") or "").strip()
                 if condition.lower() in _BOOLEAN_CONDITION_TYPES:
                     metric_status = str(metric.get("status") or "").strip()
-                    active = _truthy_status(metric_status) and any(sample > 0 for sample in samples)
-                    add(
-                        condition,
-                        active,
-                        "prometheus_condition",
-                        metric_status=metric_status,
-                        sample=max(samples),
-                    )
+                    status = _boolean_condition_status(metric_status)
+                    active_sample = any(sample > 0 for sample in samples)
+                    # kube-state-metrics exposes one series per status.  A
+                    # positive true series supports the condition; a zero true
+                    # series (or positive false series) refutes it.  Unknown
+                    # status is neither and must not become active=false.
+                    if status is True or (status is False and active_sample):
+                        add(
+                            condition,
+                            bool(status and active_sample),
+                            "prometheus_condition",
+                            metric_status=metric_status,
+                            sample=max(samples),
+                        )
                     return
             for child in node.values():
                 walk(child)
