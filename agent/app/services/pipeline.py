@@ -1403,11 +1403,17 @@ async def self_check_stage(state: PipelineState) -> PipelineState:
     else:
         if state.root_cause_candidates:
             state.progress.emit("self_check", "Checking whether the top cause can be refuted")
+            self_check_kwargs: dict[str, object] = {"plan": state.investigation_context}
+            # Keep optional integrations/test doubles that predate the
+            # blackboard contract working while the production implementation
+            # receives the strict target/window verdicts.
+            if _accepts_keyword(refute_top_cause, "evidence_eligibility"):
+                self_check_kwargs["evidence_eligibility"] = _public_evidence_eligibility(state)
             check = await refute_top_cause(
                 state.settings,
                 state.root_cause_candidates[0],
                 state.results,
-                plan=state.investigation_context,
+                **self_check_kwargs,
             )
             if isinstance(check, dict):
                 calibrated = check.get("confidence")
@@ -2075,6 +2081,7 @@ async def _reanalyze_once(
         state.results = merged_results
         try:
             eligible_support_ids = _eligible_support_ids_for_output(state)
+            evidence_eligibility = _public_evidence_eligibility(state)
         finally:
             state.results = previous_results
 
@@ -2121,11 +2128,14 @@ async def _reanalyze_once(
         refuted = False
         next_check = ""
         if candidates:
+            self_check_kwargs: dict[str, object] = {"plan": re_context}
+            if _accepts_keyword(refute_top_cause, "evidence_eligibility"):
+                self_check_kwargs["evidence_eligibility"] = evidence_eligibility
             check = await refute_top_cause(
                 state.settings,
                 candidates[0],
                 merged_results,
-                plan=re_context,
+                **self_check_kwargs,
             )
             if isinstance(check, dict):
                 calibrated = check.get("confidence")

@@ -5,6 +5,7 @@ from dataclasses import replace
 
 from app.collectors.base import NO_EVIDENCE, CollectorResult
 from app.schemas import AlertAnalysisArtifact
+from app.services.evidence_blackboard import EvidenceEligibility
 from app.services.root_cause_ranking import RankedCause
 from app.services.self_check import refute_top_cause, verify_matches
 from tests.test_orchestrator import make_settings
@@ -103,6 +104,43 @@ def test_no_llm_keeps_confidence_when_canonical_artifact_has_evidence():
 
     assert out["confidence"] == "high"
     assert out["caveat"] == ""
+
+
+def test_no_llm_downgrades_when_canonical_artifact_is_ineligible_for_incident():
+    """A typed observation for another target/window is context, not self-check support."""
+    finding = AlertAnalysisArtifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="drilldown_query",
+        status="ok",
+        summary="DiskPressure=True on a replacement Pod after resolution",
+        result={"observation": {"polarity": "present", "coverage": "scoped"}},
+    )
+    finding.evidence_id = "E01"
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary=NO_EVIDENCE,
+            artifacts=[finding],
+        )
+    ]
+
+    out = _run(
+        refute_top_cause(
+            make_settings(),
+            _top(confidence="high"),
+            results,
+            evidence_eligibility={
+                "E01": EvidenceEligibility(
+                    False, False, False, "evidence targets a different entity"
+                )
+            },
+        )
+    )
+
+    assert out["confidence"] == "medium"
+    assert out["caveat"]
 
 
 def test_no_llm_downgrades_when_canonical_summary_is_only_partial_context():

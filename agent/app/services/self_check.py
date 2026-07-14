@@ -54,7 +54,12 @@ def _downgrade(confidence: str) -> str:
         return "low"
 
 
-def _canonical_has_evidence(family: str, results: list[CollectorResult]) -> bool:
+def _canonical_has_evidence(
+    family: str,
+    results: list[CollectorResult],
+    *,
+    evidence_eligibility: Mapping[str, object] | None = None,
+) -> bool:
     """True only when the canonical collector has scoped positive evidence.
 
     The ranker already rejects context-only observations. The deterministic
@@ -71,17 +76,34 @@ def _canonical_has_evidence(family: str, results: list[CollectorResult]) -> bool
             continue
         if r.status == "unavailable":
             return False
-        return any(_artifact_has_evidence(art) for art in getattr(r, "artifacts", []) or [])
+        return any(
+            _artifact_has_evidence(art, evidence_eligibility=evidence_eligibility)
+            for art in getattr(r, "artifacts", []) or []
+        )
     return False  # canonical collector did not even run
 
 
-def _artifact_has_evidence(art: object) -> bool:
+def _artifact_has_evidence(
+    art: object, *, evidence_eligibility: Mapping[str, object] | None = None
+) -> bool:
     """Accept only an explicit scoped positive collector verdict.
 
     Keyword-bearing summaries are deliberately excluded: a condition's name,
     an HTTP success line, or a current snapshot is not a verified occurrence in
     the incident window.
     """
+    # Pipeline callers have already normalized target, topology, run identity,
+    # and incident window on the blackboard.  A raw artifact's local
+    # ``present/scoped`` declaration is not enough here: otherwise an
+    # observation from another Pod or a recovery-time query can preserve the
+    # top RCA's confidence after ranking correctly excluded it.  Direct/unit
+    # callers without a board retain the narrow artifact-local fallback.
+    if evidence_eligibility is not None:
+        evidence_id = str(getattr(art, "evidence_id", "") or "")
+        eligibility = evidence_eligibility.get(evidence_id)
+        permits = getattr(eligibility, "permits", None)
+        return bool(callable(permits) and permits("support"))
+
     result = getattr(art, "result", None)
     if not isinstance(result, Mapping):
         return False
@@ -99,6 +121,8 @@ async def refute_top_cause(
     top_candidate: RankedCause,
     results: list[CollectorResult],
     plan: object = None,
+    *,
+    evidence_eligibility: Mapping[str, object] | None = None,
 ) -> dict:
     """Try to refute the top cause; return {confidence, caveat, refuted}."""
     try:
@@ -108,9 +132,9 @@ async def refute_top_cause(
         if not family or family == "insufficient_evidence":
             return _default(confidence)
 
-        has_evidence = _canonical_has_evidence(family, results) or _has_signature_evidence(
-            top_candidate
-        )
+        has_evidence = _canonical_has_evidence(
+            family, results, evidence_eligibility=evidence_eligibility
+        ) or _has_signature_evidence(top_candidate)
 
         if not llm_configured(settings, settings.llm_model_self_check):
             # ponytail: deterministic gate — the only signal we have without an LLM
