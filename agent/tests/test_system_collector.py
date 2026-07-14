@@ -249,7 +249,7 @@ async def test_system_log_query_scopes_historical_journal_only(
                 "source": params["source"],
                 "since": params.get("since"),
                 "until": params.get("until"),
-                "lines": ["NVRM: Xid 79"],
+                "lines": ["2026-07-13T21:44:00Z kernel: NVRM: Xid 79"],
             },
         )
 
@@ -281,8 +281,51 @@ async def test_system_log_query_scopes_historical_journal_only(
     }
     assert journal["observation"]["window"] == {"lookback_seconds": 720}
     assert (journal["polarity"], journal["coverage"]) == ("present", "scoped")
+    assert journal["observation"]["evidence_window"] == {
+        "start": "2026-07-13T21:44:00Z",
+        "end": "2026-07-13T21:44:00Z",
+    }
     assert dmesg["observation"]["historical_scope"] is False
     assert dmesg["coverage"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_historical_journal_uses_matching_line_time_not_query_epilogue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-resolution log match must retain its own occurrence instant."""
+    async def fake_get_json(**kwargs):
+        params = kwargs["params"]
+        return JsonResponse(
+            url="http://node/logs",
+            status_code=200,
+            data={
+                "source": "journal",
+                "since": params["since"],
+                "until": params["until"],
+                # Resolution is 21:45:47; this belongs only to recovery context.
+                "lines": ["2026-07-13T21:48:00Z kernel: NVRM: Xid 79"],
+            },
+        )
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-07-13T21:43:47Z",
+        resolved_at="2026-07-13T21:45:47Z",
+    )
+
+    query = await system_log_query(_Settings(), target, {"source": "journal"})
+
+    assert (query["polarity"], query["coverage"]) == ("present", "scoped")
+    assert query["observation"]["observation_window"] == {
+        "start": "2026-07-13T21:38:47Z",
+        "end": "2026-07-13T21:50:47Z",
+    }
+    assert query["observation"]["evidence_window"] == {
+        "start": "2026-07-13T21:48:00Z",
+        "end": "2026-07-13T21:48:00Z",
+    }
 
 
 @pytest.mark.asyncio
@@ -302,7 +345,7 @@ async def test_shared_system_agent_receives_target_node(monkeypatch: pytest.Monk
                 "source": params["source"],
                 "since": params.get("since"),
                 "until": params.get("until"),
-                "lines": ["NVRM: Xid 79"],
+                "lines": ["2026-07-13T21:44:00Z kernel: NVRM: Xid 79"],
             },
         )
 
@@ -337,7 +380,7 @@ async def test_historical_malformed_journal_is_context_only(
 
     assert (query["polarity"], query["coverage"]) == ("present", "partial")
     observation = result.artifacts[0].result["observation"]
-    assert (observation["polarity"], observation["coverage"]) == ("present", "partial")
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
     assert result.status == "partial"
     assert any("historical journal window" in warning for warning in result.warnings)
 
@@ -351,7 +394,11 @@ async def test_live_pod_node_fallback_runs_but_historical_evidence_stays_partial
 
     async def fake_get_json(*, params, **_kwargs):
         source = params["source"]
-        data = {"lines": ["NVRM: Xid 79"] if source == "journal" else []}
+        data = {
+            "lines": ["2026-07-13T21:44:00Z kernel: NVRM: Xid 79"]
+            if source == "journal"
+            else []
+        }
         if source == "journal":
             data.update({"source": source, "since": params["since"], "until": params["until"]})
         return JsonResponse(url="http://node/logs", status_code=200, data=data)
@@ -381,7 +428,11 @@ async def test_pipeline_plan_node_provenance_stays_contextual_for_historical_log
 ) -> None:
     async def fake_get_json(*, params, **_kwargs):
         source = params["source"]
-        data = {"lines": ["NVRM: Xid 79"] if source == "journal" else []}
+        data = {
+            "lines": ["2026-07-13T21:44:00Z kernel: NVRM: Xid 79"]
+            if source == "journal"
+            else []
+        }
         if source == "journal":
             data.update({"source": source, "since": params["since"], "until": params["until"]})
         return JsonResponse(url="http://node/logs", status_code=200, data=data)

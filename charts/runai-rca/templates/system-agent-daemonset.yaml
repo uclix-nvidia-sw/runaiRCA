@@ -50,7 +50,10 @@ data:
     NSENTER = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"]
     SOURCES = {
         "dmesg": NSENTER + ["dmesg", "-T"],
-        "journal": NSENTER + ["journalctl", "-k", "--no-pager"],
+        # ``short-iso`` puts an RFC3339-compatible instant first on every
+        # journal line.  The RCA collector uses it to distinguish an event in
+        # the alert interval from one in the post-resolution recovery tail.
+        "journal": NSENTER + ["journalctl", "-k", "--no-pager", "--output=short-iso"],
         # syslog/kern.log are bind-mounted read-only at /host/var/log.
         "syslog": None,
     }

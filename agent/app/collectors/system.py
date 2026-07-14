@@ -162,6 +162,9 @@ async def system_log_query(settings: Settings, target: AnalysisTarget, args: dic
     historical_window_verified = bool(
         time_range and _historical_journal_response_verified(response.data, time_range)
     )
+    matching_timestamps = _journal_matching_timestamps(
+        matching, time_range if historical_window_verified else None
+    )
     observation = _system_log_observation(
         source=source,
         node=node,
@@ -169,6 +172,7 @@ async def system_log_query(settings: Settings, target: AnalysisTarget, args: dic
         limit=lines,
         scanned=len(raw_lines),
         matching=matching,
+        matching_timestamps=matching_timestamps,
         observation_window=observation_window,
         historical_scope=historical_window_verified,
     )
@@ -274,6 +278,7 @@ def _system_log_observation(
     limit: int,
     scanned: int,
     matching: list[str],
+    matching_timestamps: list[str] | None,
     observation_window: dict[str, str],
     historical_scope: bool,
 ) -> dict:
@@ -290,7 +295,17 @@ def _system_log_observation(
         for name, pattern in categories.items()
         if any(re.search(pattern, line) for line in matching)
     ]
-    return {
+    matching_timestamps = matching_timestamps or []
+    # The historical journal request deliberately includes a short recovery
+    # epilogue.  A source/window echo alone therefore cannot prove that a
+    # matching line happened before resolution: a post-resolution XID/OOM is
+    # useful context, but not evidence of the incident's cause.  Require the
+    # line's own RFC3339 instant before giving a historical positive scoped
+    # semantics.  Current dmesg/syslog tails remain operator context.
+    historical_time_missing = historical_scope and bool(matching) and not matching_timestamps
+    polarity = "present" if matching and not historical_time_missing else "unknown"
+    coverage = "scoped" if matching and historical_scope and not historical_time_missing else "partial"
+    observation = {
         "schema_version": "v1",
         "kind": "system_log_query",
         "source_group": _SYSTEM_LOG_SOURCE_GROUP,
@@ -302,8 +317,8 @@ def _system_log_observation(
         # A bounded journal query can prove a matching line was inside the
         # incident window, but even that endpoint returns a finite tail: an
         # empty response cannot prove host-wide absence.
-        "polarity": "present" if matching else "unknown",
-        "coverage": "scoped" if matching and historical_scope else "partial",
+        "polarity": polarity,
+        "coverage": coverage,
         "lookback_seconds": lookback_seconds,
         "result_limit": limit,
         "status": "ok",
@@ -313,6 +328,38 @@ def _system_log_observation(
         "body_included": False,
         "historical_scope": historical_scope,
     }
+    if matching_timestamps:
+        observation["evidence_window"] = {
+            "start": matching_timestamps[0],
+            "end": matching_timestamps[-1],
+        }
+    return observation
+
+
+def _journal_matching_timestamps(
+    lines: list[str], time_range: dict[str, str] | None
+) -> list[str]:
+    """Return actual, in-range instants from ``journalctl --output=short-iso``.
+
+    The per-node agent emits an ISO timestamp as the first token for journal
+    lines.  Do not derive an occurrence time from the query range: it contains
+    the collection epilogue after a resolved alert, where an unrelated recovery
+    event could otherwise be promoted into causal support.
+    """
+    if not time_range:
+        return []
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return []
+    timestamps: list[tuple[datetime, str]] = []
+    for line in lines:
+        token = str(line).strip().split(maxsplit=1)[0] if str(line).strip() else ""
+        parsed = parse_incident_time(token)
+        if parsed is not None and start <= parsed <= end:
+            timestamps.append((parsed, token))
+    timestamps.sort(key=lambda item: item[0])
+    return [raw for _, raw in timestamps]
 
 
 def _historical_journal_response_verified(
@@ -461,6 +508,9 @@ class SystemCollector:
                 and time_range
                 and _historical_journal_response_verified(response.data, time_range)
             )
+            matching_timestamps = _journal_matching_timestamps(
+                matches, time_range if historical_window_verified else None
+            )
             source_results.append(
                 {
                     "source": source,
@@ -473,6 +523,7 @@ class SystemCollector:
                     "time_range": time_range if source == "journal" and time_range else None,
                     "historical_scope": bool(source == "journal" and time_range),
                     "historical_window_verified": historical_window_verified,
+                    "matching_timestamps": matching_timestamps,
                 }
             )
             if response.error:
@@ -641,12 +692,19 @@ def _system_observation(
         if not isinstance(journal, dict) or journal.get("error"):
             polarity, coverage = "unavailable", "unknown"
         elif int(journal.get("error_count") or 0) > 0:
-            polarity = "present"
-            coverage = (
-                "scoped"
-                if journal.get("historical_window_verified") and historical_node_scope_verified
-                else "partial"
-            )
+            # ``incident_time_range`` includes an epilogue after resolution.
+            # A source/window echo is not sufficient to classify a matching
+            # journal line as causal; it needs its own timestamp.
+            timestamps = journal.get("matching_timestamps")
+            if not isinstance(timestamps, list) or not timestamps:
+                polarity, coverage = "unknown", "partial"
+            else:
+                polarity = "present"
+                coverage = (
+                    "scoped"
+                    if journal.get("historical_window_verified") and historical_node_scope_verified
+                    else "partial"
+                )
         else:
             polarity, coverage = "unknown", "partial"
     else:
@@ -659,7 +717,7 @@ def _system_observation(
             polarity, coverage = "present", "partial"
         else:
             polarity, coverage = "unknown", "partial"
-    return {
+    observation = {
         "kind": "system_node_logs",
         "predicate": "system_node_logs",
         "source_group": _SYSTEM_LOG_SOURCE_GROUP,
@@ -670,6 +728,14 @@ def _system_observation(
         "coverage": coverage,
         "observation_window": time_range or {},
     }
+    if time_range and isinstance(journal, dict):
+        timestamps = journal.get("matching_timestamps")
+        if isinstance(timestamps, list) and timestamps:
+            observation["evidence_window"] = {
+                "start": str(timestamps[0]),
+                "end": str(timestamps[-1]),
+            }
+    return observation
 
 
 async def _llm_insight(settings: Settings, node: str, error_lines: list[str]) -> str | None:
