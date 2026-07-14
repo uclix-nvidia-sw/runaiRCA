@@ -238,7 +238,7 @@ class LokiCollector:
         ]
         artifacts.extend(
             _loki_query_artifact(
-                self.name, item, time_range=time_range
+                self.name, item, target=target, plan=plan, time_range=time_range
             )
             for item in query_results
         )
@@ -370,6 +370,8 @@ async def _collect_loki_direct(
                 "line_count": line_count,
                 "sample_lines": _sample_lines(streams),
                 "sample_entries": _sample_entries(streams),
+                "stream_labels": _stream_label_sets(streams),
+                "stream_labels_complete": _stream_labels_complete(streams),
                 "sample": compact(streams, limit=3),
                 "error": error,
                 **({"time_range": time_range} if time_range else {}),
@@ -467,6 +469,8 @@ async def _mcp_query_loki(
             "line_count": 0,
             "sample_lines": [],
             "sample_entries": [],
+            "stream_labels": [],
+            "stream_labels_complete": False,
             "sample": compact(data, limit=3),
             "error": "Loki MCP response missing a recognized log result",
             **({"time_range": time_range} if time_range else {}),
@@ -502,6 +506,12 @@ async def _mcp_query_loki(
         "line_count": line_count,
         "sample_lines": lines[:8],
         "sample_entries": entries[:8],
+        # A native Loki result exposes one complete label set per stream.  The
+        # Grafana MCP flat-entry shape does not promise that it returned every
+        # stream, even when individual entries happen to include labels, so it
+        # deliberately remains unverifiable for target-scoped RCA evidence.
+        "stream_labels": _stream_label_sets(streams),
+        "stream_labels_complete": bool(streams) and _stream_labels_complete(streams),
         "sample": compact(streams or data, limit=3),
         "error": None,
         **({"time_range": time_range} if time_range else {}),
@@ -514,10 +524,17 @@ def _incident_time_range(target: AnalysisTarget) -> dict[str, str] | None:
 
 
 def _loki_query_artifact(
-    agent: str, item: dict[str, object], *, time_range: dict[str, str] | None
+    agent: str,
+    item: dict[str, object],
+    *,
+    target: AnalysisTarget,
+    plan: object | None,
+    time_range: dict[str, str] | None,
 ):
     """Expose one LogQL query's scoped verdict as RCA-safe evidence."""
-    observation = _loki_query_observation(item, time_range=time_range)
+    observation = _loki_query_observation(
+        item, target=target, plan=plan, time_range=time_range
+    )
     name = str(item.get("name") or "logs")
     polarity = str(observation["polarity"])
     status = "unavailable" if polarity == "unavailable" else "ok"
@@ -548,7 +565,11 @@ def _loki_query_artifact(
 
 
 def _loki_query_observation(
-    item: dict[str, object], *, time_range: dict[str, str] | None
+    item: dict[str, object],
+    *,
+    time_range: dict[str, str] | None,
+    target: AnalysisTarget | None = None,
+    plan: object | None = None,
 ) -> dict[str, object]:
     """Classify a LogQL result without making unbounded empty searches refute RCA."""
     name = str(item.get("name") or "logs")
@@ -573,6 +594,18 @@ def _loki_query_observation(
         polarity, coverage = "unknown", "partial"
     else:
         polarity, coverage = "present", "scoped"
+    observed_entity: dict[str, str] | None = None
+    target_scope_verified: bool | None = None
+    if target is not None and polarity in {"present", "absent"}:
+        observed_entity, target_scope_verified = _loki_target_scope(
+            name, item, target=target, plan=plan
+        )
+        if target_scope_verified is not True:
+            # A LogQL selector is request intent, not returned-data
+            # provenance.  A proxy may ignore a matcher, and flat MCP results
+            # do not establish that labels cover every returned stream.  Do
+            # not let either shape inherit the pipeline target as RCA support.
+            polarity, coverage = "unknown", "partial"
     observation = {
         "kind": "loki_query",
         "predicate": f"log:{name}",
@@ -583,11 +616,83 @@ def _loki_query_observation(
         "observation_window": time_range or {},
         "log_window_verified": window_verified,
     }
+    if observed_entity:
+        observation["observed_entity"] = observed_entity
+    if target_scope_verified is not None:
+        observation["target_scope_verified"] = target_scope_verified
     if polarity == "present":
         evidence_window = _loki_evidence_window(item.get("sample_entries"), time_range)
         if evidence_window:
             observation["evidence_window"] = evidence_window
     return observation
+
+
+def _loki_target_scope(
+    name: str,
+    item: dict[str, object],
+    *,
+    target: AnalysisTarget,
+    plan: object | None,
+) -> tuple[dict[str, str] | None, bool]:
+    """Validate native Loki stream labels against the selector's target scope.
+
+    ``workload_history_logs`` and the Run:ai control-plane correlation query
+    intentionally match text inside broader streams.  Their labels cannot
+    prove the alert workload identity, so they stay context-only.  Primary
+    target stream queries require every returned stream to name the requested
+    namespace and either the exact Pod or an exact workload label.
+    """
+    if name not in {"error_logs", "recent_logs"}:
+        return None, False
+    labels = item.get("stream_labels")
+    if item.get("stream_labels_complete") is not True or not isinstance(labels, list) or not labels:
+        return None, False
+
+    namespace = target.namespace
+    pod = target.pod
+    workload = target.workload_name
+    if plan is not None:
+        namespaces = getattr(plan, "namespaces", ())
+        if isinstance(namespaces, (list, tuple)) and namespaces and str(namespaces[0]).strip():
+            namespace = str(namespaces[0]).strip()
+        pod = str(getattr(plan, "pod", "") or pod).strip()
+        workload = str(getattr(plan, "workload", "") or workload).strip()
+
+    if not namespace:
+        return None, False
+    required: tuple[tuple[str, str], ...]
+    entity: dict[str, str]
+    if pod:
+        required = (("namespace", namespace), ("pod", pod))
+        entity = {"kind": "pod", "name": pod}
+    elif workload:
+        required = (("namespace", namespace),)
+        entity = {"kind": "workload_name", "name": workload}
+    else:
+        required = (("namespace", namespace),)
+        entity = {"kind": "namespace", "name": namespace}
+
+    for raw_labels in labels:
+        if not isinstance(raw_labels, dict):
+            return None, False
+        normalized = {
+            str(key).strip().casefold(): str(value).strip()
+            for key, value in raw_labels.items()
+            if isinstance(value, (str, int, float)) and str(value).strip()
+        }
+        if any(normalized.get(label) != expected for label, expected in required):
+            return None, False
+        if not pod and workload:
+            workload_labels = (
+                normalized.get("workload"),
+                normalized.get("workload_name"),
+                normalized.get("app"),
+                normalized.get("app_kubernetes_io_name"),
+                normalized.get("runai_workload_id"),
+            )
+            if workload not in workload_labels:
+                return None, False
+    return entity, True
 
 
 def _loki_evidence_window(
@@ -925,43 +1030,48 @@ def _sample_lines(streams: list[dict[str, object]], limit: int = 8) -> list[str]
     return lines
 
 
-def _sample_entries(streams: list[dict[str, object]], limit: int = 8) -> list[dict[str, str]]:
+def _sample_entries(
+    streams: list[dict[str, object]], limit: int = 8
+) -> list[dict[str, object]]:
     """Bounded timestamped entries preserving the incident's log order."""
-    entries: list[dict[str, str]] = []
+    entries: list[dict[str, object]] = []
     for stream in streams:
         values = stream.get("values")
         if not isinstance(values, list):
             continue
+        labels = _stream_labels(stream)
         for pair in values:
             if not isinstance(pair, list) or len(pair) < 2:
                 continue
             line = " ".join(str(pair[1]).split())
             if not line:
                 continue
-            entries.append(
-                {"timestamp": _log_timestamp(pair[0]), "line": line[:240]}
-            )
+            entry: dict[str, object] = {"timestamp": _log_timestamp(pair[0]), "line": line[:240]}
+            if labels:
+                entry["labels"] = labels
+            entries.append(entry)
             if len(entries) >= limit:
                 return entries
     return entries
 
 
-def _log_entries_from_mcp_data(data: object, limit: int = 8) -> list[dict[str, str]]:
+def _log_entries_from_mcp_data(data: object, limit: int = 8) -> list[dict[str, object]]:
     """Extract timestamped Grafana MCP entries ({timestamp, line, labels})."""
     if isinstance(data, list):
-        entries: list[dict[str, str]] = []
+        entries: list[dict[str, object]] = []
         for item in data:
             if not isinstance(item, dict):
                 continue
             line = item.get("line") or item.get("message") or item.get("body")
             if not isinstance(line, str) or not line.strip():
                 continue
-            entries.append(
-                {
-                    "timestamp": _log_timestamp(item.get("timestamp") or ""),
-                    "line": " ".join(line.split())[:240],
-                }
-            )
+            entry: dict[str, object] = {
+                "timestamp": _log_timestamp(item.get("timestamp") or ""),
+                "line": " ".join(line.split())[:240],
+            }
+            if labels := _label_mapping(item.get("labels")):
+                entry["labels"] = labels
+            entries.append(entry)
             if len(entries) >= limit:
                 break
         return entries
@@ -971,6 +1081,30 @@ def _log_entries_from_mcp_data(data: object, limit: int = 8) -> list[dict[str, s
             if entries:
                 return entries
     return []
+
+
+def _stream_label_sets(streams: list[dict[str, object]]) -> list[dict[str, str]]:
+    """Retain the native label set for every returned stream, never samples only."""
+    return [_stream_labels(stream) for stream in streams]
+
+
+def _stream_labels_complete(streams: list[dict[str, object]]) -> bool:
+    """Whether every returned native stream carries a usable label map."""
+    return bool(streams) and all(bool(_stream_labels(stream)) for stream in streams)
+
+
+def _stream_labels(stream: dict[str, object]) -> dict[str, str]:
+    return _label_mapping(stream.get("stream"))
+
+
+def _label_mapping(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key).strip(): str(item).strip()
+        for key, item in value.items()
+        if str(key).strip() and isinstance(item, (str, int, float)) and str(item).strip()
+    }
 
 
 def _log_timestamp(value: object) -> str:

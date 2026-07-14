@@ -421,6 +421,7 @@ async def k8s_logs(
             )
             raw = mcp_tool_json(result)
             lines = _log_lines(mcp_tool_text(result) or raw)
+            observed_entity = _mcp_pod_log_observed_entity(raw, namespace, pod)
             return {
                 "namespace": namespace,
                 "pod": pod,
@@ -431,7 +432,8 @@ async def k8s_logs(
                 # useful operator context, but must not become scoped causal
                 # evidence for the requested Pod unless the response itself
                 # proves which Pod/namespace produced it.
-                "source_verified": _mcp_pod_log_source_verified(raw, namespace, pod),
+                "source_verified": observed_entity is not None,
+                **({"observed_entity": observed_entity} if observed_entity else {}),
                 "status_code": 200,
                 "error": None,
                 "lines": lines,
@@ -473,6 +475,7 @@ async def k8s_logs(
         "since_time": since_time or None,
         # The direct API path is an exact /namespaces/{ns}/pods/{pod}/log URL.
         "source_verified": True,
+        "observed_entity": _pod_log_entity(namespace, pod),
         "status_code": response.status_code,
         "error": response.error,
         "lines": _log_lines(response.data),
@@ -876,8 +879,10 @@ def _mcp_named_resource_matches(
     return True
 
 
-def _mcp_pod_log_source_verified(data: object, namespace: str, pod: str) -> bool:
-    """Whether an MCP log reply itself names the requested Pod.
+def _mcp_pod_log_observed_entity(
+    data: object, namespace: str, pod: str
+) -> dict[str, str] | None:
+    """Return provenance only when an MCP log reply names the requested Pod.
 
     pods_log commonly returns raw log text.  Call arguments alone are not
     evidence that the server honored them, so raw text is intentionally not a
@@ -886,13 +891,25 @@ def _mcp_pod_log_source_verified(data: object, namespace: str, pod: str) -> bool
     """
     payload = _normalize_k8s_payload(data)
     if not isinstance(payload, dict):
-        return False
+        return None
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
     observed_name = str(
         metadata.get("name") or payload.get("pod") or payload.get("name") or ""
     )
     observed_namespace = str(metadata.get("namespace") or payload.get("namespace") or "")
-    return observed_name == pod and observed_namespace == namespace
+    if observed_name != pod or observed_namespace != namespace:
+        return None
+    return _pod_log_entity(observed_namespace, observed_name)
+
+
+def _mcp_pod_log_source_verified(data: object, namespace: str, pod: str) -> bool:
+    """Compatibility predicate for callers that only need source verification."""
+    return _mcp_pod_log_observed_entity(data, namespace, pod) is not None
+
+
+def _pod_log_entity(namespace: str, pod: str) -> dict[str, str]:
+    """The concrete namespaced Pod provenance required for log causality."""
+    return {"kind": "pod", "name": pod, "namespace": namespace}
 
 
 def _apply_label_selector(data: object, selector: str) -> object:
@@ -1369,6 +1386,7 @@ class KubernetesCollector:
             status=status,
             target_scoped=_warning_events_are_target_scoped(target),
             queries_complete=_warning_event_queries_complete(responses),
+            target=target,
         )
         artifacts.append(
             artifact(
@@ -1510,11 +1528,18 @@ def _warning_event_observation(
     status: str,
     target_scoped: bool = True,
     queries_complete: bool = True,
+    target: AnalysisTarget | None = None,
 ) -> dict[str, object]:
     """Make filtered event presence/absence a typed historical predicate."""
+    observed_entity = _event_target_entity(target) if target is not None else None
+    verified_events = bool(warning_events) and all(
+        event.get("target_identity_verified") is True
+        and event.get("observed_entity") == observed_entity
+        for event in warning_events
+    )
     if status == "unavailable":
         polarity, coverage = "unavailable", "unknown"
-    elif not target_scoped:
+    elif not target_scoped or (target is not None and observed_entity is None):
         # A namespace-only event list says nothing about this alert's resource.
         # Do not turn its emptiness into a false negative for the incident.
         polarity, coverage = "unknown", "partial"
@@ -1522,7 +1547,11 @@ def _warning_event_observation(
         # One returned, target-correlated event is a fact even if another Event
         # source failed. Query completeness is required only to turn EMPTY into
         # an absence claim.
-        polarity, coverage = ("present", "scoped") if time_range else ("present", "partial")
+        polarity, coverage = (
+            ("present", "scoped")
+            if time_range and (target is None or verified_events)
+            else ("present", "partial")
+        )
     elif not queries_complete:
         polarity, coverage = "unknown", "partial"
     elif not time_range:
@@ -1538,9 +1567,12 @@ def _warning_event_observation(
         "coverage": coverage,
         "event_count": len(warning_events),
         "target_scoped": target_scoped,
+        "target_identity_verified": verified_events,
         "queries_complete": queries_complete,
         "observation_window": time_range or {},
     }
+    if observed_entity:
+        observation["observed_entity"] = observed_entity
     # Event list reads intentionally include the post-resolution collection
     # epilogue.  Keep the returned Event occurrence span distinct from that
     # query coverage so an Event first seen only after recovery cannot become
@@ -1636,9 +1668,10 @@ def _pod_log_observation(
     log: dict[str, object], *, time_range: dict[str, str] | None
 ) -> tuple[dict[str, object], list[dict[str, str]]]:
     """Return only time-bounded log lines; logs API tails never prove absence."""
+    source_verified = log.get("source_verified") is True
     if log.get("error"):
         polarity, coverage, entries = "unavailable", "unknown", []
-    elif log.get("source_verified") is False:
+    elif not source_verified:
         # An MCP text response that does not identify its Pod may contain a
         # real failure line, but cannot be attributed to this incident's
         # entity. Keep it visible as context, never scoped causal support.
@@ -1651,6 +1684,12 @@ def _pod_log_observation(
         polarity, coverage = (
             ("present", "scoped") if entries else ("unknown", "partial")
         )
+    observed_entity = _pod_log_observed_entity(log) if source_verified else None
+    if polarity in {"present", "absent"} and observed_entity is None:
+        # The direct API URL or structured MCP response must name both the
+        # namespace and Pod. Requested arguments alone are not evidence that
+        # an MCP adapter actually returned that resource.
+        polarity, coverage = "unknown", "partial"
     container = str(log.get("container") or "default")
     predicate = f"kubernetes_pod_log:{'previous:' if log.get('previous') else ''}{container}"
     observation = {
@@ -1659,15 +1698,30 @@ def _pod_log_observation(
         "polarity": polarity,
         "coverage": coverage,
         "previous": bool(log.get("previous")),
-        "source_verified": log.get("source_verified") is not False,
+        "source_verified": source_verified,
         "observation_window": time_range or {},
     }
+    if observed_entity:
+        observation["observed_entity"] = observed_entity
     if polarity == "present" and entries:
         observation["evidence_window"] = {
             "start": entries[0]["timestamp"],
             "end": entries[-1]["timestamp"],
         }
     return observation, entries
+
+
+def _pod_log_observed_entity(log: dict[str, object]) -> dict[str, str] | None:
+    """Validate the namespaced Pod provenance attached by the log transport."""
+    candidate = log.get("observed_entity")
+    if not isinstance(candidate, dict):
+        return None
+    kind = str(candidate.get("kind") or candidate.get("type") or "").strip().lower()
+    name = str(candidate.get("name") or candidate.get("id") or "").strip()
+    namespace = str(candidate.get("namespace") or "").strip()
+    if kind not in {"pod", "pods"} or not name or not namespace:
+        return None
+    return _pod_log_entity(namespace, name)
 
 
 def _log_entries_in_window(
@@ -2390,10 +2444,17 @@ async def _collect_resolved_pod_logs(
             )
             logs.append(
                 {
+                    "namespace": item.get("namespace") or target.namespace,
+                    "pod": item.get("pod") or target.pod,
                     "container": container,
                     "previous": previous,
                     "since_time": since_time or None,
                     "source_verified": item.get("source_verified") is True,
+                    **(
+                        {"observed_entity": item["observed_entity"]}
+                        if isinstance(item.get("observed_entity"), dict)
+                        else {}
+                    ),
                     "status_code": item.get("status_code"),
                     "error": item.get("error"),
                     "lines": item.get("lines") or [],
@@ -2737,10 +2798,13 @@ async def _collect_pod_logs(
             )
             logs.append(
                 {
+                    "namespace": target.namespace,
+                    "pod": target.pod,
                     "container": container,
                     "previous": previous,
                     "since_time": since_time or None,
                     "source_verified": True,
+                    "observed_entity": _pod_log_entity(target.namespace, target.pod),
                     "status_code": response.status_code,
                     "error": response.error,
                     "lines": _log_lines(response.data),
@@ -2795,14 +2859,18 @@ async def _collect_pod_logs_via_mcp(
             text = mcp_tool_text(result)
             data = mcp_tool_json(result)
             lines = _log_lines(text or data)
+            observed_entity = _mcp_pod_log_observed_entity(
+                data, target.namespace, target.pod
+            )
             logs.append(
                 {
+                    "namespace": target.namespace,
+                    "pod": target.pod,
                     "container": container,
                     "previous": previous,
                     "since_time": since_time or None,
-                    "source_verified": _mcp_pod_log_source_verified(
-                        data, target.namespace, target.pod
-                    ),
+                    "source_verified": observed_entity is not None,
+                    **({"observed_entity": observed_entity} if observed_entity else {}),
                     "status_code": 200,
                     "error": None,
                     "lines": lines,
@@ -3029,7 +3097,7 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
                 and _event_matches_target(item, target)
             ]
         events = [
-            _event_summary(item)
+            _event_summary(item, target=target)
             for item in items
             if isinstance(item, dict) and item.get("type") == "Warning"
         ]
@@ -3094,13 +3162,57 @@ def _event_time_range_complete(name: str, data: object, target: AnalysisTarget) 
 
 
 def _warning_events_are_target_scoped(target: AnalysisTarget) -> bool:
-    return bool(
-        target.pod
-        or target.workload_name
-        or target.node
-        or target.project
-        or target.runai_workload_id
-    )
+    return _event_target_entity(target) is not None
+
+
+def _event_target_entity(target: AnalysisTarget | None) -> dict[str, str] | None:
+    """Return the concrete resource an Events query can safely speak for."""
+    if target is None:
+        return None
+    if target.pod and target.namespace:
+        return {"kind": "pod", "name": target.pod, "namespace": target.namespace}
+    if target.node:
+        return {"kind": "node", "name": target.node}
+    if target.workload_name and target.workload_type and target.namespace:
+        return {
+            "kind": "workload_name",
+            "name": target.workload_name,
+            "namespace": target.namespace,
+        }
+    return None
+
+
+def _event_target_identity(event: dict[str, object], target: AnalysisTarget) -> dict[str, str] | None:
+    """Verify that an Event's involved object is the concrete alert resource.
+
+    Message text is retained for operator context and may select a useful
+    control-plane Event, but it cannot establish causal target provenance.
+    """
+    involved = event.get("involvedObject")
+    involved = involved if isinstance(involved, dict) else {}
+    name = str(involved.get("name") or "")
+    kind = str(involved.get("kind") or "").casefold()
+    entity = _event_target_entity(target)
+    if entity is None:
+        return None
+    if entity["kind"] == "pod":
+        if (
+            kind == "pod"
+            and name == entity["name"]
+            and _event_matches_namespace(event, entity["namespace"])
+            and _event_matches_uid(event, target.pod_uid)
+        ):
+            return entity
+    elif entity["kind"] == "node":
+        if kind == "node" and name == entity["name"]:
+            return entity
+    elif (
+        kind == target.workload_type.casefold()
+        and name == entity["name"]
+        and _event_matches_namespace(event, entity["namespace"])
+    ):
+        return entity
+    return None
 
 
 def _event_matches_target(event: dict[str, object], target: AnalysisTarget) -> bool:
@@ -3211,10 +3323,13 @@ def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _event_summary(event: dict[str, object]) -> dict[str, object]:
+def _event_summary(
+    event: dict[str, object], *, target: AnalysisTarget | None = None
+) -> dict[str, object]:
     involved = event.get("involvedObject") if isinstance(event.get("involvedObject"), dict) else {}
     timestamps = _event_timestamps(event)
-    return {
+    observed_entity = _event_target_identity(event, target) if target is not None else None
+    summary = {
         "type": event.get("type"),
         "reason": event.get("reason"),
         "message": event.get("message"),
@@ -3227,7 +3342,16 @@ def _event_summary(event: dict[str, object]) -> dict[str, object]:
         "observedTimestamps": [str(value) for _, value in timestamps],
         "object": involved.get("name"),
         "kind": involved.get("kind"),
+        "namespace": involved.get("namespace")
+        or (event.get("metadata") or {}).get("namespace")
+        if isinstance(event.get("metadata"), dict)
+        else involved.get("namespace"),
+        "uid": involved.get("uid"),
+        "target_identity_verified": observed_entity is not None,
     }
+    if observed_entity:
+        summary["observed_entity"] = observed_entity
+    return summary
 
 
 def _event_timestamp(event: dict[str, object]) -> object:

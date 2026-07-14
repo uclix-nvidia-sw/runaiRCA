@@ -111,7 +111,7 @@ async def test_prometheus_malformed_success_payload_is_not_a_scoped_absence(monk
 
 
 @pytest.mark.asyncio
-async def test_loki_emits_a_scoped_artifact_for_each_incident_query(monkeypatch) -> None:
+async def test_loki_emits_target_evidence_only_for_verified_native_stream_labels(monkeypatch) -> None:
     async def fake_get_json(**_kwargs):
         return JsonResponse(
             url="http://loki/loki/api/v1/query_range",
@@ -120,7 +120,10 @@ async def test_loki_emits_a_scoped_artifact_for_each_incident_query(monkeypatch)
                 "status": "success",
                 "data": {
                     "result": [
-                        {"values": [["2026-07-10T01:00:00Z", "failed scheduling trainer"]]}
+                        {
+                            "stream": {"namespace": "runai-vision", "pod": "trainer-0"},
+                            "values": [["2026-07-10T01:00:00Z", "failed scheduling trainer"]],
+                        }
                     ]
                 },
             },
@@ -141,18 +144,75 @@ async def test_loki_emits_a_scoped_artifact_for_each_incident_query(monkeypatch)
     observations = {
         artifact.result["observation"]["predicate"]: artifact.result["observation"] for artifact in signals
     }
-    assert observations["log:runai_control_plane_errors"]["polarity"] == "unknown"
-    assert observations["log:runai_control_plane_errors"]["coverage"] == "partial"
+    for predicate in ("log:error_logs", "log:recent_logs"):
+        assert (observations[predicate]["polarity"], observations[predicate]["coverage"]) == (
+            "present",
+            "scoped",
+        )
+        assert observations[predicate]["target_scope_verified"] is True
+        assert observations[predicate]["observed_entity"] == {
+            "kind": "pod",
+            "name": "trainer-0",
+        }
     assert all(
-        observation["polarity"] == "present"
-        for predicate, observation in observations.items()
-        if predicate != "log:runai_control_plane_errors"
+        (observations[predicate]["polarity"], observations[predicate]["coverage"])
+        == ("unknown", "partial")
+        for predicate in (
+            "log:workload_history_logs",
+            "log:runai_control_plane_errors",
+            "log:runai_control_plane_for_workload",
+        )
     )
     assert all(
         artifact.result["observation"]["observation_window"]
         == {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
         for artifact in signals
     )
+
+
+def test_loki_rejects_mismatched_or_flat_mcp_labels_as_target_provenance() -> None:
+    target = make_target()
+    window = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    base = {
+        "name": "error_logs",
+        "line_count": 1,
+        "stream_count": 1,
+        "sample_entries": [
+            {"timestamp": "2026-07-10T01:00:00Z", "line": "failed scheduling"}
+        ],
+    }
+    mismatched = loki._loki_query_observation(
+        {
+            **base,
+            "stream_labels": [{"namespace": "other", "pod": "other-pod"}],
+            "stream_labels_complete": True,
+        },
+        target=target,
+        time_range=window,
+    )
+    flat_mcp = loki._loki_query_observation(
+        {
+            **base,
+            # Flat Grafana MCP entries can expose one label map, but do not
+            # prove that every returned stream carried those labels.
+            "stream_labels": [],
+            "stream_labels_complete": False,
+            "sample_entries": [
+                {
+                    "timestamp": "2026-07-10T01:00:00Z",
+                    "line": "failed scheduling",
+                    "labels": {"namespace": "runai-vision", "pod": "trainer-0"},
+                }
+            ],
+        },
+        target=target,
+        time_range=window,
+    )
+
+    for observation in (mismatched, flat_mcp):
+        assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+        assert observation["target_scope_verified"] is False
+        assert "observed_entity" not in observation
 
 
 @pytest.mark.asyncio
@@ -871,6 +931,11 @@ async def test_kubernetes_logs_use_incident_since_time_and_previous_restart_log(
     assert all(call["params"]["sinceTime"] == "2026-07-10T00:55:00Z" for call in calls)
     assert [call["params"].get("previous") for call in calls] == [None, "true"]
     assert all(log["source_verified"] is True for log in logs)
+    assert all(
+        log["observed_entity"]
+        == {"kind": "pod", "name": "trainer-0", "namespace": "runai-vision"}
+        for log in logs
+    )
 
 
 def test_kubernetes_pod_log_evidence_uses_only_timestamped_incident_lines() -> None:
@@ -879,6 +944,12 @@ def test_kubernetes_pod_log_evidence_uses_only_timestamped_incident_lines() -> N
         {
             "container": "main",
             "previous": True,
+            "source_verified": True,
+            "observed_entity": {
+                "kind": "pod",
+                "name": "trainer-0",
+                "namespace": "runai-vision",
+            },
             "lines": [
                 "2026-07-10T00:54:59Z before incident",
                 "2026-07-10T01:10:00Z later OOMKilled",
@@ -894,6 +965,11 @@ def test_kubernetes_pod_log_evidence_uses_only_timestamped_incident_lines() -> N
 
     assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
     assert observation["previous"] is True
+    assert observation["observed_entity"] == {
+        "kind": "pod",
+        "name": "trainer-0",
+        "namespace": "runai-vision",
+    }
     assert entries == [
         {"timestamp": "2026-07-10T01:02:00Z", "line": "OOMKilled"},
         {"timestamp": "2026-07-10T01:10:00Z", "line": "later OOMKilled"},
@@ -923,6 +999,39 @@ def test_unverified_mcp_pod_logs_are_context_not_scoped_evidence() -> None:
     assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
     assert observation["source_verified"] is False
     assert entries == [{"timestamp": "2026-07-10T01:02:00Z", "line": "OOMKilled"}]
+
+
+def test_mcp_pod_log_provenance_requires_returned_namespaced_pod() -> None:
+    assert kubernetes._mcp_pod_log_observed_entity(
+        {"metadata": {"name": "trainer-0", "namespace": "runai-vision"}},
+        "runai-vision",
+        "trainer-0",
+    ) == {"kind": "pod", "name": "trainer-0", "namespace": "runai-vision"}
+    assert (
+        kubernetes._mcp_pod_log_observed_entity(
+            {"metadata": {"name": "other-pod", "namespace": "runai-vision"}},
+            "runai-vision",
+            "trainer-0",
+        )
+        is None
+    )
+
+
+def test_pod_log_without_transport_provenance_is_context_only() -> None:
+    observation, _ = _pod_log_observation(
+        {
+            "container": "main",
+            "lines": ["2026-07-10T01:02:00Z OOMKilled"],
+            # Requested Pod arguments are not returned-resource provenance.
+            "pod": "trainer-0",
+            "namespace": "runai-vision",
+        },
+        time_range={"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"},
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert observation["source_verified"] is False
+    assert "observed_entity" not in observation
 
 
 def test_kubernetes_events_are_filtered_to_the_incident_window() -> None:
@@ -1174,6 +1283,57 @@ def test_kubernetes_warning_event_observation_exposes_actual_event_span() -> Non
     assert observation["evidence_window"] == {
         "start": "2026-07-10T01:11:00Z",
         "end": "2026-07-10T01:12:00Z",
+    }
+
+
+def test_kubernetes_warning_events_require_involved_object_identity_for_support() -> None:
+    target = replace(
+        make_target(),
+        fired_at="2026-07-10T00:55:00Z",
+        resolved_at="2026-07-10T01:15:00Z",
+    )
+    time_range = {"start": target.fired_at, "end": target.resolved_at}
+    message_only = {
+        "metadata": {"namespace": target.namespace},
+        "involvedObject": {"kind": "Pod", "name": "runai-scheduler-0"},
+        "eventTime": "2026-07-10T01:02:00Z",
+        "type": "Warning",
+        "message": f"failed to schedule {target.pod}",
+    }
+    exact_pod = {
+        "metadata": {"namespace": target.namespace},
+        "involvedObject": {"kind": "Pod", "name": target.pod},
+        "eventTime": "2026-07-10T01:03:00Z",
+        "type": "Warning",
+    }
+
+    message_summary = _filter_kubernetes_data(
+        "namespace_events", {"items": [message_only]}, target
+    )["items"]
+    exact_summary = _filter_kubernetes_data(
+        "namespace_events", {"items": [exact_pod]}, target
+    )["items"]
+
+    message_observation = _warning_event_observation(
+        message_summary, time_range=time_range, status="ok", target=target
+    )
+    exact_observation = _warning_event_observation(
+        exact_summary, time_range=time_range, status="ok", target=target
+    )
+
+    assert (message_observation["polarity"], message_observation["coverage"]) == (
+        "present",
+        "partial",
+    )
+    assert "observed_entity" not in message_summary[0]
+    assert (exact_observation["polarity"], exact_observation["coverage"]) == (
+        "present",
+        "scoped",
+    )
+    assert exact_observation["observed_entity"] == {
+        "kind": "pod",
+        "name": target.pod,
+        "namespace": target.namespace,
     }
 
 
