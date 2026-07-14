@@ -894,6 +894,44 @@ def test_postgres_target_history_query_binds_identity_or_encodes_mcp_value() -> 
     assert namespace_only is None
 
 
+def test_postgres_workload_history_does_not_fall_back_to_project_or_generic_id() -> None:
+    target = make_target()
+    time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    base = {
+        "schema": "audit",
+        "table": "history",
+        "timestamp_column": "created_at",
+    }
+
+    project_only = _history_target_aggregate_query(
+        {**base, "context_columns": ["project"]}, target, mcp=False, time_range=time_range
+    )
+    generic_id_only = _history_target_aggregate_query(
+        {**base, "context_columns": ["id"]}, target, mcp=False, time_range=time_range
+    )
+    strong_and_project = _history_target_aggregate_query(
+        {**base, "context_columns": ["workload_name", "project"]},
+        target,
+        mcp=False,
+        time_range=time_range,
+    )
+    project_scoped_target = replace(target, workload_name="", pod="", runai_workload_id="")
+    project_scoped = _history_target_aggregate_query(
+        {**base, "context_columns": ["project"]},
+        project_scoped_target,
+        mcp=False,
+        time_range=time_range,
+    )
+
+    assert project_only is None
+    assert generic_id_only is None
+    assert strong_and_project is not None
+    assert '"workload_name"' in strong_and_project[0]
+    assert '"project"' not in strong_and_project[0]
+    assert project_scoped is not None
+    assert project_scoped[1] == [["vision"]]
+
+
 @pytest.mark.asyncio
 async def test_postgres_history_evidence_requires_target_identity() -> None:
     target = replace(

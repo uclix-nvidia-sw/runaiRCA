@@ -573,13 +573,28 @@ def _history_target_clause(
         "queue": (target.queue,),
         "queue_name": (target.queue,),
         "resource_id": (target.workload_name, target.runai_workload_id),
-        "id": (target.runai_workload_id,),
     }
     available = {str(column) for column in table.get("context_columns", [])}
+    strong_columns = frozenset(
+        {"workload", "workload_name", "workload_id", "pod", "pod_name", "resource_id"}
+    )
+    has_strong_alert_identity = any(
+        str(value).strip()
+        for column in strong_columns
+        for value in expected[column]
+    )
+    # A workload/pod incident must not use a project/queue-only audit row as
+    # proof: another workload in the same project is a common occurrence.
+    # Project/queue correlation remains available when that is all the alert
+    # itself identifies. ``id`` is intentionally excluded because generic
+    # audit primary keys are not workload identities.
+    allowed_columns = strong_columns if has_strong_alert_identity else _HISTORY_TARGET_COLUMNS
     predicates: list[str] = []
     parameters: list[list[str]] = []
     parameter_number = 3
     for column in _HISTORY_TARGET_COLUMNS:
+        if column not in allowed_columns:
+            continue
         values = sorted(
             {str(value).strip().casefold() for value in expected[column] if str(value).strip()}
         )
@@ -908,7 +923,6 @@ _HISTORY_TARGET_COLUMNS = frozenset(
         "queue",
         "queue_name",
         "resource_id",
-        "id",
     }
 )
 
