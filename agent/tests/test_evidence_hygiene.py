@@ -10,8 +10,11 @@ import pytest
 from app.collectors.base import NO_EVIDENCE, CollectorResult, artifact
 from app.collectors.kubernetes import best_matching_pod, pod_name_stem
 from app.collectors.postgres import _postgres_result
-from app.schemas import Alert, AlertAnalysisRequest
+from app.plan import InvestigationPlan
+from app.schemas import Alert, AlertAnalysisRequest, SimilarIncidentContext
 from app.services import pipeline
+from app.services.evidence_blackboard import Blackboard
+from app.services.kg_enrichment import GraphRemediation
 from app.services.root_cause_ranking import RankedCause
 from tests.test_orchestrator import make_settings, make_target
 
@@ -64,6 +67,41 @@ def test_best_matching_pod_all_healthy_needs_unambiguous_match() -> None:
 
 
 # --- healthy Postgres healthcheck is not evidence -------------------------------
+
+
+def test_insufficient_evidence_gets_a_separate_general_guidance_section() -> None:
+    detail = pipeline._detail_from(
+        AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={"alertname": "GenericAlert"},
+                annotations={"summary": "OOMKilled was reported by an operator"},
+            )
+        ),
+        [],
+        [],
+        failure_modes={
+            "workload_startup_error": [
+                {
+                    "symptom": "OOMKilled",
+                    "keywords": ["oomkilled"],
+                    "actions": ["GENERAL-GUIDANCE raise the memory limit after validation."],
+                }
+            ]
+        },
+        root_cause_candidates=[
+            RankedCause(family="insufficient_evidence", confidence="low", score=0.0)
+        ],
+        eligible_support_ids=set(),
+    )
+
+    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## 4. Appendix", 1)[0]
+    guidance = detail.split("## General Troubleshooting Guidance", 1)[1].split(
+        "## 4. Appendix", 1
+    )[0]
+    assert "GENERAL-GUIDANCE" not in actions
+    assert "not a diagnosis" in guidance
+    assert "GENERAL-GUIDANCE" in guidance
 
 
 @pytest.mark.asyncio
@@ -217,7 +255,10 @@ def test_root_cause_supporting_evidence_uses_drilldown_after_no_evidence_base() 
             status="ok",
             confidence="medium",
             summary="1 row(s)",
-            result={"rows": [{"message": "scheduler panic at reclaim/reclaim.go:91"}]},
+            result={
+                "rows": [{"message": "scheduler panic at reclaim/reclaim.go:91"}],
+                "observation": {"polarity": "present", "coverage": "scoped"},
+            },
         )
     )
     detail = pipeline._detail_from(
@@ -231,6 +272,228 @@ def test_root_cause_supporting_evidence_uses_drilldown_after_no_evidence_base() 
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
     assert "scheduler panic at reclaim/reclaim.go:91" in root_cause
+
+
+def test_context_only_artifact_stays_out_of_root_cause_evidence() -> None:
+    result = CollectorResult(agent="prometheus", status="ok", summary="metrics queried")
+    result.artifacts.append(
+        artifact(
+            agent="prometheus",
+            source="prometheus",
+            type="promql_signal",
+            status="ok",
+            confidence="low",
+            summary="container memory was observed",
+            result={
+                "observation": {"polarity": "unknown", "coverage": "partial"},
+            },
+        )
+    )
+
+    detail = pipeline._detail_from(
+        AlertAnalysisRequest(alert=Alert(status="firing", labels={"alertname": "MemoryAlert"})),
+        [result],
+        [],
+        root_cause_candidates=[
+            RankedCause(family="node_kubelet_pressure", confidence="medium", score=7.0)
+        ],
+    )
+
+    root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
+    evidence = detail.split("### Evidence", 1)[1].split("###", 1)[0]
+    assert "container memory was observed" not in root_cause
+    assert "container memory was observed" in evidence
+
+
+def test_contextual_eligibility_blocks_scoped_artifact_from_root_cause() -> None:
+    """A scoped result for another entity/window is appendix context, not proof."""
+    result = CollectorResult(agent="loki", status="ok", summary="logs queried")
+    finding = artifact(
+        agent="loki",
+        source="loki",
+        type="logql_signal",
+        status="ok",
+        confidence="high",
+        summary="OOMKilled occurred on unrelated-pod",
+        result={"observation": {"polarity": "present", "coverage": "scoped"}},
+    )
+    finding.evidence_id = "E01"
+    result.artifacts.append(finding)
+
+    detail = pipeline._detail_from(
+        AlertAnalysisRequest(alert=Alert(status="firing", labels={"alertname": "MemoryAlert"})),
+        [result],
+        [],
+        root_cause_candidates=[
+            RankedCause(family="workload_runtime_error", confidence="medium", score=7.0)
+        ],
+        # The blackboard rejected E01 because it belongs to a different target
+        # or incident window.  It may remain visible in the appendix only.
+        eligible_support_ids=set(),
+    )
+
+    root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
+    appendix = detail.split("### Evidence", 1)[1].split("###", 1)[0]
+    assert "OOMKilled occurred on unrelated-pod" not in root_cause
+    assert "OOMKilled occurred on unrelated-pod" in appendix
+
+
+def test_context_only_artifact_cannot_emit_graph_remediation_actions() -> None:
+    """Historical graph fixes need a current scoped observation before actioning."""
+    result = CollectorResult(agent="system", status="ok", summary="live node snapshot")
+    result.artifacts.append(
+        artifact(
+            agent="system",
+            source="system",
+            type="node_logs",
+            status="ok",
+            confidence="medium",
+            summary="old Xid 79 appears in an unbounded current log snapshot",
+            result={
+                "lines": ["NVRM: Xid 79"],
+                "observation": {"polarity": "unknown", "coverage": "partial"},
+            },
+        )
+    )
+    detail = pipeline._detail_from(
+        AlertAnalysisRequest(alert=Alert(status="firing", labels={"alertname": "GenericAlert"})),
+        [result],
+        [],
+        root_cause_candidates=[
+            RankedCause(family="gpu_hardware_error", confidence="medium", score=7.0)
+        ],
+        graph_fixes=GraphRemediation(
+            family_fixes=["Reset the implicated GPU."],
+            xid_fixes={79: ["Replace the GPU after hardware validation."]},
+            root_xids={79: [48]},
+        ),
+        # The blackboard rejected every artifact as context/out-of-scope.
+        eligible_support_ids=set(),
+    )
+
+    root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
+    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## 4.", 1)[0]
+    assert "Fix the root XID first" not in root_cause
+    assert "Reset the implicated GPU" not in actions
+    assert "Replace the GPU" not in actions
+
+
+def test_context_only_artifacts_cannot_emit_catalog_or_historical_actions() -> None:
+    """Every cause-specific action path needs current scoped support, not just graph fixes."""
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "NodeDiskPressure"},
+            annotations={"summary": "DiskPressure was named by a stale dashboard card"},
+        ),
+        similar_incidents=[
+            SimilarIncidentContext(
+                incident_id="old-pressure",
+                similarity=0.99,
+                analysis_summary="HISTORICAL-REMEDY drain the old node",
+            )
+        ],
+    )
+    plan = InvestigationPlan(
+        matched_alert={
+            "family": "node_kubelet_pressure",
+            "actions": ["CATALOG-REMEDY cordon the node"],
+        },
+        component="component-a",
+    )
+    modes = {
+        "node_kubelet_pressure": [
+            {
+                "symptom": "Node Disk Pressure",
+                "keywords": ["diskpressure"],
+                "actions": ["PLAYBOOK-REMEDY inspect and drain the node"],
+            }
+        ]
+    }
+    detail = pipeline._detail_from(
+        request,
+        [CollectorResult(agent="kubernetes", status="ok", summary="current snapshot")],
+        [],
+        failure_modes=modes,
+        root_cause_candidates=[
+            RankedCause(family="node_kubelet_pressure", confidence="medium", score=7.0)
+        ],
+        kg_context={"enabled": True, "available": True, "knowledge": modes},
+        plan=plan,
+        graph_fixes=GraphRemediation(family_fixes=["GRAPH-REMEDY reset the node"]),
+        components={"component-a": {"checks": ["COMPONENT-REMEDY restart it"]}},
+        # A typed artifact existed but was another target/window, so this is an
+        # explicit production-style no-support verdict rather than a legacy call.
+        eligible_support_ids=set(),
+    )
+
+    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## 4.", 1)[0]
+    assert "Not enough evidence for concrete actions" in actions
+    for forbidden in (
+        "CATALOG-REMEDY",
+        "COMPONENT-REMEDY",
+        "PLAYBOOK-REMEDY",
+        "GRAPH-REMEDY",
+        "HISTORICAL-REMEDY",
+    ):
+        assert forbidden not in actions
+    assert "Knowledge-base remediation is withheld" in detail
+    assert "Specific playbook remediation is withheld" in detail
+
+
+def test_synthesis_input_separates_support_contradiction_and_context() -> None:
+    result = CollectorResult(agent="prometheus", status="ok", summary="all metrics queried")
+    for name, polarity, coverage in (
+        ("capacity gap", "present", "scoped"),
+        ("restart unchanged", "absent", "scoped"),
+        ("memory snapshot", "unknown", "partial"),
+    ):
+        result.artifacts.append(
+            artifact(
+                agent="prometheus",
+                source="prometheus",
+                type="promql_signal",
+                status="ok",
+                confidence="medium",
+                summary=name,
+                result={"observation": {"polarity": polarity, "coverage": coverage}},
+            )
+        )
+
+    finding = pipeline._synthesis_collector_findings([result])[0]
+
+    assert finding["collection_summary"] == "all metrics queried"
+    assert [item["summary"] for item in finding["supporting_artifacts"]] == ["capacity gap"]
+    assert [item["summary"] for item in finding["contradicting_artifacts"]] == [
+        "restart unchanged"
+    ]
+    assert [item["summary"] for item in finding["context_artifacts"]] == ["memory snapshot"]
+    assert finding["context_artifacts"][0]["evidence_role"] == "context"
+
+
+def test_synthesis_input_uses_contextual_eligibility_over_raw_scoped_role() -> None:
+    result = CollectorResult(agent="loki", status="ok", summary="logs queried")
+    finding = artifact(
+        agent="loki",
+        source="loki",
+        type="logql_signal",
+        status="ok",
+        confidence="high",
+        summary="unrelated workload OOMKilled",
+        result={"observation": {"polarity": "present", "coverage": "scoped"}},
+    )
+    finding.evidence_id = "E01"
+    result.artifacts.append(finding)
+
+    projected = pipeline._synthesis_collector_findings(
+        [result], evidence_eligibility={"E01": object()}
+    )[0]
+
+    assert projected["supporting_artifacts"] == []
+    assert projected["contradicting_artifacts"] == []
+    assert [item["summary"] for item in projected["context_artifacts"]] == [
+        "unrelated workload OOMKilled"
+    ]
 
 
 def test_unavailable_drilldown_artifact_is_appendix_context_not_supporting_evidence() -> None:
@@ -727,3 +990,143 @@ async def test_evidence_stage_scopes_followup_target_to_the_plan(monkeypatch) ->
     assert seen == {"k8s": "toolkit-live2", "prom": "toolkit-live2"}, (
         "follow-ups must query the plan's re-resolved live pod"
     )
+
+
+@pytest.mark.asyncio
+async def test_resolved_incident_keeps_alert_pod_for_followups(monkeypatch) -> None:
+    """A current replacement must not erase historical Event identity."""
+    from app.plan import InvestigationPlan
+    from app.progress import ProgressReporter
+
+    seen: dict[str, str] = {}
+
+    async def fake_k8s_followup(settings, k8s_result, target, **kwargs):
+        seen["k8s"] = target.pod
+        return []
+
+    async def fake_prom_followup(settings, prom_result, k8s_result, target, **kwargs):
+        seen["prom"] = target.pod
+        return []
+
+    monkeypatch.setattr("app.collectors.kubernetes.k8s_followup", fake_k8s_followup)
+    monkeypatch.setattr("app.collectors.prometheus.prometheus_followup", fake_prom_followup)
+    alert_target = replace(
+        make_target(),
+        pod="toolkit-dead1",
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    state = pipeline.PipelineState(
+        settings=make_settings(),
+        request=AlertAnalysisRequest(
+            alert=Alert(
+                status="resolved",
+                labels={},
+                annotations={},
+                startsAt=alert_target.fired_at,
+                endsAt=alert_target.resolved_at,
+            )
+        ),
+        target=alert_target,
+        progress=ProgressReporter(make_settings(), run_id=""),
+        masker=None,
+        collectors=[],
+        # Simulates the replacement Pod selected by a live plan lookup.
+        plan=InvestigationPlan(pod="toolkit-live2", namespaces=[alert_target.namespace]),
+    )
+
+    await pipeline.evidence_stage(state)
+
+    assert seen == {"k8s": "toolkit-dead1", "prom": "toolkit-dead1"}
+
+
+def test_blackboard_aliases_do_not_merge_same_summary_from_different_pods() -> None:
+    fired = "2026-07-13T10:00:00Z"
+    resolved = "2026-07-13T10:05:00Z"
+    target = replace(make_target(), fired_at=fired, resolved_at=resolved)
+    observed_window = {"start": fired, "end": resolved}
+
+    def pod_artifact(pod: str):
+        return artifact(
+            agent="kubernetes",
+            source="kubernetes",
+            type="pod_condition",
+            status="ok",
+            confidence="high",
+            # Deliberately identical: the observed resource must keep these
+            # facts separate, not a display-summary coincidence.
+            summary="Pod reported a condition during the incident.",
+            highlights=["condition observed"],
+            result={
+                "observation": {
+                    "polarity": "present",
+                    "coverage": "scoped",
+                    "observed_entity": f"pod:{pod}",
+                    "observation_window": observed_window,
+                }
+            },
+        )
+
+    result = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="pod conditions collected",
+        artifacts=[pod_artifact("unrelated-0"), pod_artifact(target.pod)],
+    )
+    board = Blackboard(run_id="INC-current")
+    board.add_result(
+        "kubernetes",
+        result,
+        entity=f"pod:{target.pod}",
+        timestamp=fired,
+        observed_window_start=fired,
+        observed_window_end=resolved,
+    )
+    state = pipeline.PipelineState(
+        settings=make_settings(),
+        request=AlertAnalysisRequest(
+            alert=Alert(labels={}, annotations={}), incident_id="INC-current"
+        ),
+        target=target,
+        progress=pipeline.ProgressReporter(make_settings(), run_id=""),
+        masker=None,
+        collectors=[],
+        results=[result],
+        blackboard=board,
+    )
+    pipeline._aggregate_evidence(state)
+
+    aliases = pipeline._blackboard_artifact_evidence_ids(state)
+    facts_by_entity = {fact.entity: fact.fact_id for fact in board.facts()}
+    assert aliases[facts_by_entity["pod:unrelated-0"]] == "E01"
+    assert aliases[facts_by_entity[f"pod:{target.pod}"]] == "E02"
+
+    eligibility = pipeline._public_evidence_eligibility(state)
+    assert eligibility["E01"].support is False
+    assert eligibility["E02"].support is True
+
+
+def test_causal_evidence_context_keeps_prelude_and_bounds_firing_alert() -> None:
+    """Causal eligibility includes the trigger prelude, not recovery epilogue.
+
+    The collectors inspect five minutes before firing and a bounded fifteen
+    minutes after a firing alert.  Treating a firing alert as a zero-width
+    instant discarded all later samples; including the collection epilogue for
+    resolved alerts would instead let recovery-only signals become a cause.
+    """
+    from app.progress import ProgressReporter
+
+    target = replace(make_target(), fired_at="2026-07-10T01:00:00Z", resolved_at="")
+    state = pipeline.PipelineState(
+        settings=make_settings(),
+        request=AlertAnalysisRequest(alert=Alert(labels={}, annotations={}), incident_id="INC-now"),
+        target=target,
+        progress=ProgressReporter(make_settings(), run_id=""),
+        masker=None,
+        collectors=[],
+    )
+    assert pipeline._evidence_context(state)["window_start"] == "2026-07-10T00:55:00Z"
+    assert pipeline._evidence_context(state)["window_end"] == "2026-07-10T01:15:00Z"
+
+    state.target = replace(target, resolved_at="2026-07-10T01:10:00Z")
+    assert pipeline._evidence_context(state)["window_end"] == "2026-07-10T01:10:00Z"

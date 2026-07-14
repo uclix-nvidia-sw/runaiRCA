@@ -5,7 +5,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.collectors.base import AnalysisTarget, CollectorResult, artifact, resolve_target
+from app.collectors.base import (
+    AnalysisTarget,
+    CollectorResult,
+    artifact,
+    incident_time_range,
+    parse_incident_time,
+    resolve_target,
+)
 from app.collectors.loki import LokiCollector, _loki_headers
 from app.collectors.runai import RunAICollector, _runai_headers
 from app.config import Settings
@@ -145,6 +152,15 @@ def test_resolve_target_derives_project_from_runai_namespace() -> None:
     assert target.namespace == "runai-vision"
 
 
+def test_resolve_target_preserves_explicit_pod_uid_only() -> None:
+    target = resolve_target(
+        {"namespace": "runai-vision", "pod": "trainer-0", "kubernetes_pod_uid": "uid-new"},
+        {"uid": "not-a-pod-identity"},
+    )
+
+    assert target.pod_uid == "uid-new"
+
+
 def test_resolve_target_reads_workload_from_kube_state_metrics_daemonset_label() -> None:
     # A kube-state-metrics-exported alert (e.g. RunaiDaemonSetUnavailableOnNodes)
     # names the REAL failing object in the `daemonset` label; the `pod` label is
@@ -198,6 +214,47 @@ def test_resolve_target_explicit_workload_label_wins_over_workload_kind() -> Non
 
     assert target.workload_name == "my-training-job"
     assert target.pod == ""  # workload-kind label present → exporter pod dropped
+
+
+def test_resolve_target_prefers_any_label_alias_over_annotation_alias() -> None:
+    target = resolve_target(
+        {
+            "kubernetes_namespace": "actual-team",
+            "kubernetes_pod_name": "actual-pod",
+            "kubernetes_node": "actual-node",
+        },
+        {
+            "namespace": "wrong-team",
+            "pod": "wrong-pod",
+            "node": "wrong-node",
+        },
+    )
+
+    assert target.namespace == "actual-team"
+    assert target.pod == "actual-pod"
+    assert target.node == "actual-node"
+
+
+def test_resolve_target_keeps_direct_pod_when_controller_label_is_present() -> None:
+    target = resolve_target(
+        {
+            "namespace": "team-a",
+            "deployment": "trainer",
+            "pod": "trainer-5b6f7d9c8d-x7k2p",
+        },
+        {},
+    )
+
+    assert target.workload_name == "trainer"
+    assert target.workload_type == "Deployment"
+    assert target.pod == "trainer-5b6f7d9c8d-x7k2p"
+
+
+def test_incident_window_rejects_timezone_less_timestamp() -> None:
+    target = replace(make_target(), fired_at="2026-07-13T09:00:00")
+
+    assert parse_incident_time(target.fired_at) is None
+    assert incident_time_range(target) is None
 
 
 def test_resolve_target_reads_optional_probe_resource_identifiers() -> None:
@@ -626,7 +683,7 @@ async def test_analyze_excludes_low_similarity_incidents() -> None:
 
 
 @pytest.mark.asyncio
-async def test_analyze_weaves_similar_incident_fix_into_actions() -> None:
+async def test_analyze_withholds_similar_incident_fix_without_scoped_support() -> None:
     orchestrator = AnalysisOrchestrator(make_settings())
     response = await orchestrator.analyze(
         AlertAnalysisRequest(
@@ -649,8 +706,9 @@ async def test_analyze_weaves_similar_incident_fix_into_actions() -> None:
 
     recommended = response.analysis_detail.split("## 3. Recommended Actions", 1)[1]
     actions_block = recommended.split("##", 1)[0]
-    assert "INC-HIGH" in actions_block
-    assert "Raised queue gpu-a quota" in actions_block
+    assert "Not enough evidence for concrete actions yet" in actions_block
+    assert "INC-HIGH" not in actions_block
+    assert "Raised queue gpu-a quota" not in actions_block
 
 
 @pytest.mark.asyncio
@@ -1118,6 +1176,42 @@ async def test_loki_correlates_control_plane_logs_to_dying_workload(monkeypatch)
     assert any("reconcile" in q for q in seen_queries), joined
 
 
+@pytest.mark.asyncio
+async def test_loki_queries_workload_history_when_alerted_pod_can_be_replaced(monkeypatch) -> None:
+    # Exact Pod labels are useful, but Pod names change after an eviction or
+    # rollout. The namespace/body query preserves historical Loki evidence via
+    # stable workload identifiers.
+    from types import SimpleNamespace
+
+    seen_queries: list[str] = []
+
+    async def fake_get_json(**kwargs) -> SimpleNamespace:
+        seen_queries.append(kwargs["params"]["query"])
+        return SimpleNamespace(
+            url="http://loki/x",
+            status_code=200,
+            error=None,
+            data={"status": "success", "data": {"result": []}},
+        )
+
+    monkeypatch.setattr("app.collectors.loki.get_json", fake_get_json)
+    target = replace(
+        make_target(),
+        namespace="runai-vision",
+        pod="trainer-old-abc",
+        workload_name="trainer",
+        runai_workload_id="workload-42",
+    )
+    await LokiCollector(replace(make_settings(), loki_url="http://loki.example")).collect(target)
+
+    assert any(
+        'namespace="runai-vision"' in query
+        and "trainer" in query
+        and r"workload\-42" in query
+        for query in seen_queries
+    )
+
+
 def test_correlation_term_skips_too_short_identifiers() -> None:
     from app.collectors.base import AnalysisTarget
     from app.collectors.loki import _control_plane_correlation_term
@@ -1227,6 +1321,11 @@ async def test_runai_collector_uses_mcp_results_when_configured(monkeypatch) -> 
     result = await RunAICollector(settings).collect(make_target())
     assert result.details["runai_version"] == "2.23.60"
     assert any("runai-mcp server" in w for w in result.warnings)
+    workload_signal = next(
+        artifact for artifact in result.artifacts if artifact.type == "runai_api_signal"
+        and artifact.result["observation"]["predicate"] == "runai:workloads"
+    )
+    assert workload_signal.result["observation"]["polarity"] == "present"
 
 
 @pytest.mark.asyncio
@@ -1256,6 +1355,94 @@ async def test_runai_collector_falls_back_to_curl_when_mcp_unavailable(monkeypat
     assert called["curl"] is True
 
 
+@pytest.mark.asyncio
+async def test_runai_collector_falls_back_from_unparseable_mcp_payload(monkeypatch) -> None:
+    """A 200 MCP gateway error page is not a successful Run:ai observation."""
+    from app.collectors import runai as runai_mod
+
+    async def fake_mcp(_settings, _target):
+        return [
+            {
+                "name": "workloads",
+                "query": "MCP call_runai_api GET /api/v1/workloads",
+                "status_code": 200,
+                "error": None,
+                "data": {"raw": "<html>gateway temporarily unavailable</html>"},
+            }
+        ]
+
+    called = {"direct": False}
+
+    async def fake_direct(_settings, _target, _headers):
+        called["direct"] = True
+        return [
+            {
+                "name": "workloads",
+                "path": "/api/v1/workloads",
+                "status_code": 200,
+                "error": None,
+                "data": {"workloads": [{"name": "trainer"}]},
+            }
+        ]
+
+    async def fake_headers(_settings, prefer_oauth=False):
+        return ({"Authorization": "Bearer x"}, [])
+
+    monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", fake_mcp)
+    monkeypatch.setattr(runai_mod, "_collect_runai_responses", fake_direct)
+    monkeypatch.setattr(runai_mod, "_runai_headers", fake_headers)
+    monkeypatch.setattr(runai_mod, "_fetch_runai_version", lambda *a, **k: _async_empty())
+    result = await RunAICollector(
+        replace(
+            make_settings(),
+            runai_base_url="https://runai.example",
+            runai_mcp_url="http://runai-mcp/mcp",
+        )
+    ).collect(make_target())
+
+    assert called["direct"] is True
+    assert any("no usable structured response" in warning for warning in result.warnings)
+    assert not any("gathered via the runai-mcp" in warning for warning in result.warnings)
+    assert result.status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_runai_collector_rejects_non_json_direct_payload(monkeypatch) -> None:
+    """HTTP 200 with an HTML/text body must stay unavailable, not become evidence."""
+    from app.collectors import runai as runai_mod
+
+    async def mcp_none(_settings, _target):
+        return None
+
+    async def fake_direct(_settings, _target, _headers):
+        return [
+            {
+                "name": "workloads",
+                "path": "/api/v1/workloads",
+                "status_code": 200,
+                "error": None,
+                "data": {"body": "<html>upstream error</html>"},
+            }
+        ]
+
+    async def fake_headers(_settings, prefer_oauth=False):
+        return ({"Authorization": "Bearer x"}, [])
+
+    monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", mcp_none)
+    monkeypatch.setattr(runai_mod, "_collect_runai_responses", fake_direct)
+    monkeypatch.setattr(runai_mod, "_runai_headers", fake_headers)
+    monkeypatch.setattr(runai_mod, "_fetch_runai_version", lambda *a, **k: _async_empty())
+    result = await RunAICollector(
+        replace(make_settings(), runai_base_url="https://runai.example")
+    ).collect(make_target())
+
+    assert result.status == "unavailable"
+    assert result.details["queries"][0]["error"] == "Run:ai API response was not JSON"
+    signals = [artifact for artifact in result.artifacts if artifact.type == "runai_api_signal"]
+    assert signals
+    assert all(artifact.result["observation"]["polarity"] == "unavailable" for artifact in signals)
+
+
 async def _async_empty():
     return ""
 
@@ -1269,8 +1456,9 @@ async def test_prometheus_followup_derives_promql_from_k8s_oom(monkeypatch) -> N
 
     fired: list[str] = []
 
-    async def fake_prom_query(settings, name, promql):
+    async def fake_prom_query(settings, name, promql, *, time_range=None):
         fired.append(name)
+        assert time_range
         return {"name": name, "query": promql, "status_code": 200, "error": None, "data": {}}
 
     monkeypatch.setattr(prom_mod, "prom_query", fake_prom_query)
@@ -1285,13 +1473,20 @@ async def test_prometheus_followup_derives_promql_from_k8s_oom(monkeypatch) -> N
         },
     )
     prom = CollectorResult(agent="prometheus", status="ok", summary="p", confidence="medium")
-    target = replace(make_target(), namespace="team-a", pod="trainer-0")
+    target = replace(
+        make_target(),
+        namespace="team-a",
+        pod="trainer-0",
+        fired_at="2026-07-13T09:00:00Z",
+        resolved_at="2026-07-13T09:10:00Z",
+    )
     await prom_mod.prometheus_followup(make_settings(), prom, k8s, target)
 
     assert "oom_working_set_vs_limit" in fired
     assert "oom_growth_shape" in fired
     assert "active_restart_rate" in fired
-    assert any(a.type == "followup_query" for a in prom.artifacts)
+    artifact = next(a for a in prom.artifacts if a.type == "followup_query")
+    assert artifact.result["observation"]["coverage"] == "partial"
 
 
 @pytest.mark.asyncio

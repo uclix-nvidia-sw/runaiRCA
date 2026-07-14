@@ -3,6 +3,9 @@ from __future__ import annotations
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.services.root_cause_ranking import (
     RankedCause,
+    _confidence,
+    _result_text,
+    _Score,
     merge_open_world_candidates,
     novel_family_slug,
     rank_root_cause_candidates,
@@ -76,7 +79,58 @@ def test_open_world_candidate_requires_known_independence_provenance() -> None:
     assert any(candidate.novelty == "open_world" for candidate in verified)
 
 
-def test_r1_node_pressure_wins_with_blast_radius() -> None:
+def test_open_world_query_replicas_cannot_inflate_score() -> None:
+    """Many cards from one telemetry plane are not stronger corroboration."""
+    known = [RankedCause("insufficient_evidence", "low", 0.0)]
+    ledger = [
+        {
+            "id": "H-replicas",
+            "mechanism": "Repeated Loki query cards report one mount failure",
+            "status": "supported",
+            # Include an exact duplicate too: an LLM retry must not create a
+            # second supporting observation just by repeating an E-id.
+            "support_evidence_ids": ["E01", "E01", "E02", "E03", "E04"],
+        },
+    ]
+
+    merged = merge_open_world_candidates(
+        known,
+        ledger,
+        fact_groups={
+            "E01": "loki",
+            "E02": "loki",
+            "E03": "loki",
+            "E04": "prometheus",
+        },
+        enabled=True,
+    )
+    candidate = next(item for item in merged if item.novelty == "open_world")
+
+    assert candidate.support_evidence_ids == ["E01", "E02", "E03", "E04"]
+    assert candidate.score == 6.0
+    assert candidate.confidence == "medium"
+
+
+def test_catalog_high_confidence_collapses_change_and_kubernetes_source_group() -> None:
+    """Two readers of the Kubernetes API are not independent corroboration."""
+    score = _Score(
+        points=6.0,
+        agents={"kubernetes", "change"},
+    )
+
+    assert _confidence("workload_startup_error", score, {}) == "medium"
+
+
+def test_catalog_high_confidence_does_not_count_graph_context_as_observer() -> None:
+    score = _Score(
+        points=6.0,
+        agents={"kubernetes", "typedb"},
+    )
+
+    assert _confidence("workload_startup_error", score, {}) == "medium"
+
+
+def test_r1_historical_graph_blast_radius_cannot_force_high() -> None:
     results = [
         _r("kubernetes", summary="Node gpu-node-17 condition DiskPressure=True; pods evicted"),
         _r("typedb", summary="kg lookup", details={"blast_radius_workloads": 3}),
@@ -84,7 +138,18 @@ def test_r1_node_pressure_wins_with_blast_radius() -> None:
     ]
     ranked = rank_root_cause_candidates(_target(), results, occurrence_count=5)
     assert ranked[0].family == "node_kubelet_pressure"
-    assert ranked[0].confidence == "high"
+    assert ranked[0].confidence == "medium"
+
+
+def test_synthesis_time_graph_blast_argument_cannot_force_high() -> None:
+    ranked = rank_root_cause_candidates(
+        _target(),
+        [_r("kubernetes", summary="Node gpu-node-17 condition DiskPressure=True; pods evicted")],
+        kg_blast_radius=8,
+    )
+
+    assert ranked[0].family == "node_kubelet_pressure"
+    assert ranked[0].confidence == "medium"
 
 
 def test_r1_soft_tokens_only_do_not_force_high_without_node_condition() -> None:
@@ -113,8 +178,8 @@ def test_r1_soft_tokens_only_do_not_force_high_without_node_condition() -> None:
         assert not any("blast radius" in r for r in node.rationale)
 
 
-def test_r1_prometheus_node_condition_still_force_highs() -> None:
-    # The hard node-condition signal may come from prometheus (not just kubernetes).
+def test_r1_prometheus_condition_and_graph_blast_remain_medium() -> None:
+    # The graph's topology snapshot is not a second incident-window observer.
     results = [
         _r("prometheus", summary="kube_node_status_condition MemoryPressure=true on gpu-node-17"),
         _r("kubernetes", summary="kubelet evicting pods on gpu-node-17"),
@@ -122,7 +187,7 @@ def test_r1_prometheus_node_condition_still_force_highs() -> None:
     ]
     ranked = rank_root_cause_candidates(_target(), results, occurrence_count=5)
     assert ranked[0].family == "node_kubelet_pressure"
-    assert ranked[0].confidence == "high"
+    assert ranked[0].confidence == "medium"
 
 
 def test_healthy_node_object_in_queries_does_not_score_node_pressure() -> None:
@@ -178,6 +243,297 @@ def test_healthy_node_object_in_queries_does_not_score_node_pressure() -> None:
     assert "node_kubelet_pressure" not in families
 
 
+def test_structured_partial_artifacts_do_not_feed_keyword_ranker() -> None:
+    partial = artifact(
+        agent="system",
+        source="system",
+        type="system_log",
+        status="ok",
+        confidence="medium",
+        summary="OOMKilled seen in a finite node log tail",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "partial",
+            },
+            "lines": ["OOMKilled"],
+        },
+    )
+    result = _r(
+        "system",
+        summary="OOMKilled in a current log tail",
+        details={"errors": ["OOMKilled"]},
+        artifacts=[partial],
+    )
+
+    assert _result_text(result) == ""
+
+
+def test_structured_scoped_artifact_remains_available_to_keyword_ranker() -> None:
+    scoped = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="warning_event",
+        status="ok",
+        confidence="high",
+        summary="Evicted workload in incident window",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+            },
+            "events": [{"reason": "Evicted"}],
+        },
+    )
+
+    assert "evicted" in _result_text(_r("kubernetes", artifacts=[scoped]))
+
+
+def test_kubernetes_raw_recovery_or_healthy_tokens_do_not_support_ranking() -> None:
+    """A log line's existence is not proof that its historic failure is active."""
+    pod_log = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_pod_log",
+        status="ok",
+        confidence="high",
+        summary="Kubernetes Pod log: matching incident-window line was present.",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "pod", "name": "trainer-abc-x1"},
+            },
+            "sample_entries": [
+                {"line": "healthy OOMKilled condition is false"},
+                {"line": "OOMKilled recovery complete; pod normal"},
+            ],
+        },
+    )
+    recovery_event = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_warning_events",
+        status="ok",
+        confidence="high",
+        summary="Kubernetes Warning events: recovery record was returned.",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "pod", "name": "trainer-abc-x1"},
+            },
+            "events": [
+                {
+                    "type": "Warning",
+                    "reason": "RecoveryComplete",
+                    "message": "OOMKilled recovered; pod healthy",
+                },
+                {"type": "Normal", "reason": "OOMKilled", "message": "normal"},
+            ],
+        },
+    )
+    result = _r("kubernetes", artifacts=[pod_log, recovery_event])
+
+    text = _result_text(result)
+
+    assert "oomkilled" not in text
+    assert rank_root_cause_candidates(_target(), [result])[0].family == "insufficient_evidence"
+
+
+def test_kubernetes_positive_event_reason_and_log_line_remain_rankable() -> None:
+    pod_log = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_pod_log",
+        status="ok",
+        confidence="high",
+        summary="Kubernetes Pod log: matching incident-window line was present.",
+        result={
+            "observation": {"polarity": "present", "coverage": "scoped"},
+            "sample_entries": [{"line": "container OOMKilled exit code 137"}],
+        },
+    )
+    warning_event = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_warning_events",
+        status="ok",
+        confidence="high",
+        summary="Kubernetes Warning events: one incident event was returned.",
+        result={
+            "observation": {"polarity": "present", "coverage": "scoped"},
+            "events": [{"type": "Warning", "reason": "OOMKilled"}],
+        },
+    )
+
+    text = _result_text(_r("kubernetes", artifacts=[pod_log, warning_event]))
+
+    assert "oomkilled" in text
+
+
+def test_context_ineligible_typed_artifact_cannot_reenter_catalog_ranking() -> None:
+    """A scoped query result can still be outside this alert's causal window.
+
+    The pipeline supplies the blackboard's response-local eligibility set after
+    target/time/run validation.  The ranker must honor that set instead of
+    treating the raw card's scoped query coverage as causal permission.
+    """
+    stale = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="warning_event",
+        status="ok",
+        confidence="high",
+        summary="Evicted workload after the resolved incident.",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "evidence_window": {
+                    "start": "2026-07-10T02:00:00Z",
+                    "end": "2026-07-10T02:01:00Z",
+                },
+            },
+            "events": [{"reason": "Evicted"}],
+        },
+    )
+    stale.evidence_id = "E01"
+    result = _r("kubernetes", artifacts=[stale])
+
+    assert "evicted" in _result_text(result)
+    assert _result_text(result, eligible_evidence_ids=set()) == ""
+    ranked = rank_root_cause_candidates(
+        _target(), [result], eligible_evidence_ids=set()
+    )
+    assert ranked[0].family == "insufficient_evidence"
+
+
+def test_feedback_prior_requires_typed_current_incident_observation() -> None:
+    # Feedback is constructed from a *prior* incident.  A legacy free-text
+    # result can still be useful operator context, but it must not receive a
+    # score boost unless this incident has a typed, scoped observation.
+    legacy = _r("kubernetes", summary="runai-backend reconcile failed")
+    baseline = rank_root_cause_candidates(
+        _target(), [legacy], priors={"runai_control_plane_error": 1.5}
+    )
+    legacy_control = next(
+        cause for cause in baseline if cause.family == "runai_control_plane_error"
+    )
+    assert legacy_control.score == 2.0
+    assert not any("feedback prior" in reason for reason in legacy_control.rationale)
+
+    target = _target(
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    current = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="warning_event",
+        status="ok",
+        confidence="high",
+        summary="runai-backend reconcile failed in incident window",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "pod", "name": target.pod},
+                "observation_window": {
+                    "start": "2026-07-10T00:55:00Z",
+                    "end": "2026-07-10T01:15:00Z",
+                },
+                "evidence_window": {
+                    "start": "2026-07-10T01:04:00Z",
+                    "end": "2026-07-10T01:04:00Z",
+                },
+            }
+        },
+    )
+    typed = _r("kubernetes", artifacts=[current])
+    grounded = rank_root_cause_candidates(
+        target, [typed], priors={"runai_control_plane_error": 1.5}
+    )
+    grounded_control = next(
+        cause for cause in grounded if cause.family == "runai_control_plane_error"
+    )
+    assert grounded_control.score == 3.0
+    assert any("feedback prior" in reason for reason in grounded_control.rationale)
+
+
+def test_feedback_prior_rejects_other_entity_or_out_of_incident_observation() -> None:
+    """Typed metadata alone cannot make feedback corroborate this incident."""
+    target = _target(
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+
+    def scoped_artifact(*, pod: str, at: str):
+        return artifact(
+            agent="kubernetes",
+            source="kubernetes",
+            type="warning_event",
+            status="ok",
+            confidence="high",
+            summary="runai-backend reconcile failed",
+            result={
+                "observation": {
+                    "polarity": "present",
+                    "coverage": "scoped",
+                    "observed_entity": {"kind": "pod", "name": pod},
+                    "observation_window": {
+                        "start": "2026-07-10T00:55:00Z",
+                        "end": "2026-07-10T01:15:00Z",
+                    },
+                    "evidence_window": {"start": at, "end": at},
+                }
+            },
+        )
+
+    for item in (
+        scoped_artifact(pod="other-pod", at="2026-07-10T01:04:00Z"),
+        scoped_artifact(pod=target.pod, at="2026-07-10T01:14:00Z"),
+    ):
+        ranked = rank_root_cause_candidates(
+            target,
+            [_r("kubernetes", artifacts=[item])],
+            priors={"runai_control_plane_error": 1.5},
+        )
+        control = next(cause for cause in ranked if cause.family == "runai_control_plane_error")
+        assert control.score == 2.0
+        assert not any("feedback prior" in reason for reason in control.rationale)
+
+
+def test_postgres_prior_history_cannot_create_current_catalog_cause() -> None:
+    # A target-correlated audit row is retained for the incident timeline, but
+    # the Postgres history reader is not an owner of any catalog failure family.
+    # In particular, text from a prior/audit record must not manufacture a
+    # current control-plane cause, even when feedback favors that family.
+    history = artifact(
+        agent="postgres",
+        source="postgres",
+        type="postgres_incident_history",
+        status="ok",
+        confidence="high",
+        summary="prior audit row: runai-backend reconcile failed",
+        result={
+            "historical_prior": True,
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+            },
+            "target_rows": [{"action": "runai-backend reconcile failed"}],
+        },
+    )
+    ranked = rank_root_cause_candidates(
+        _target(),
+        [_r("postgres", artifacts=[history])],
+        priors={"runai_control_plane_error": 1.5},
+    )
+
+    assert ranked[0].family == "insufficient_evidence"
+
+
 def test_real_node_pressure_still_scores_after_queries_drop() -> None:
     # Guard the fix above from over-correcting: when a condition is genuinely
     # abnormal (DiskPressure=True), it surfaces in the structured node_conditions
@@ -195,7 +551,31 @@ def test_real_node_pressure_still_scores_after_queries_drop() -> None:
         ],
         "queries": [{"name": "node", "path": "/api/v1/nodes/dgx01", "status_code": 200, "data": {}}],
     }
-    k8s = _r("kubernetes", summary="Node dgx01 reports DiskPressure=True.", details=details)
+    k8s = _r(
+        "kubernetes",
+        summary="Node dgx01 reports DiskPressure=True.",
+        details=details,
+        artifacts=[
+            artifact(
+                agent="kubernetes",
+                source="kubernetes",
+                type="cluster_api",
+                status="ok",
+                confidence="low",
+                summary="current node snapshot",
+                result={"observation": {"polarity": "unknown", "coverage": "partial"}},
+            ),
+            artifact(
+                agent="kubernetes",
+                source="kubernetes",
+                type="kubernetes_warning_events",
+                status="ok",
+                confidence="high",
+                summary="EvictionThresholdMet in incident window",
+                result={"observation": {"polarity": "present", "coverage": "scoped"}},
+            ),
+        ],
+    )
     ranked = rank_root_cause_candidates(
         _target(node="dgx01", alert_name="KubeNodeDiskPressure"), [k8s]
     )
@@ -345,9 +725,10 @@ def test_r1_healthy_node_object_in_details_does_not_force_high() -> None:
         assert not any("blast radius" in r for r in node.rationale)
 
 
-def test_r1_abnormal_node_condition_in_details_force_highs() -> None:
+def test_r1_abnormal_node_condition_and_graph_blast_remain_medium() -> None:
     # The structured, abnormal-only node_conditions signal (DiskPressure status
-    # True) IS a genuine node condition and must still force-high with a blast.
+    # True) is genuine evidence, but a graph topology snapshot cannot supply
+    # the independent incident-window corroboration needed for HIGH.
     pressured_node = {
         "node_conditions": [
             {"type": "DiskPressure", "status": "True", "reason": "KubeletHasDiskPressure",
@@ -355,12 +736,69 @@ def test_r1_abnormal_node_condition_in_details_force_highs() -> None:
         ],
     }
     results = [
-        _r("kubernetes", summary="node under pressure; pods being removed", details=pressured_node),
+        _r(
+            "kubernetes",
+            summary="node under pressure; pods being removed",
+            details=pressured_node,
+            artifacts=[
+                artifact(
+                    agent="kubernetes",
+                    source="kubernetes",
+                    type="cluster_api",
+                    status="ok",
+                    confidence="low",
+                    summary="current node snapshot",
+                    result={"observation": {"polarity": "unknown", "coverage": "partial"}},
+                ),
+                artifact(
+                    agent="kubernetes",
+                    source="kubernetes",
+                    type="kubernetes_warning_events",
+                    status="ok",
+                    confidence="high",
+                    summary="EvictionThresholdMet in incident window",
+                    result={"observation": {"polarity": "present", "coverage": "scoped"}},
+                ),
+            ],
+        ),
         _r("typedb", summary="kg lookup", details={"blast_radius_workloads": 3}),
     ]
     ranked = rank_root_cause_candidates(_target(), results, occurrence_count=5)
     assert ranked[0].family == "node_kubelet_pressure"
-    assert ranked[0].confidence == "high"
+    assert ranked[0].confidence == "medium"
+
+
+def test_r1_current_node_snapshot_cannot_force_high_for_historical_incident() -> None:
+    results = [
+        _r(
+            "kubernetes",
+            summary="Node currently reports DiskPressure=True",
+            details={
+                "node_conditions": [
+                    {"type": "DiskPressure", "status": "True", "reason": "KubeletHasDiskPressure"}
+                ]
+            },
+            artifacts=[
+                artifact(
+                    agent="kubernetes",
+                    source="kubernetes",
+                    type="cluster_api",
+                    status="ok",
+                    confidence="low",
+                    summary="current node snapshot",
+                    result={"observation": {"polarity": "unknown", "coverage": "partial"}},
+                )
+            ],
+        ),
+        _r("typedb", summary="kg lookup", details={"blast_radius_workloads": 3}),
+    ]
+
+    ranked = rank_root_cause_candidates(_target(), results, occurrence_count=5)
+    by_family = {candidate.family: candidate for candidate in ranked}
+
+    if candidate := by_family.get("node_kubelet_pressure"):
+        assert candidate.confidence != "high"
+        assert not any("blast radius" in rationale for rationale in candidate.rationale)
 
 
 def test_r2_quota_exhaustion_wins() -> None:
@@ -558,8 +996,9 @@ def test_component_identity_leads_over_incidental_node_pressure() -> None:
             "gpu-operator",
         ],
     )
-    assert ranked[0].family == "gpu_hardware_error"
-    assert any("depends_on" in r for r in ranked[0].rationale)
+    assert ranked[0].family == "insufficient_evidence"
+    component_candidate = next(c for c in ranked if c.family == "gpu_hardware_error")
+    assert any("depends_on" in rationale for rationale in component_candidate.rationale)
 
 
 def test_component_identity_disables_node_force_high_from_blast() -> None:
@@ -580,14 +1019,13 @@ def test_component_identity_disables_node_force_high_from_blast() -> None:
     )
     by_family = {c.family: c for c in ranked}
     # node pressure may still appear, but never as a forced-HIGH top cause here.
-    assert ranked[0].family == "gpu_hardware_error"
+    assert ranked[0].family == "insufficient_evidence"
+    assert "gpu_hardware_error" in by_family
     if "node_kubelet_pressure" in by_family:
         assert by_family["node_kubelet_pressure"].confidence != "high"
 
 
-def test_component_identity_absent_keeps_legacy_behavior() -> None:
-    # Regression guard: with no component identity passed, ranking is unchanged
-    # (R1 still force-highs node pressure with blast radius).
+def test_component_identity_absent_does_not_restore_graph_blast_promotion() -> None:
     results = [
         _r("kubernetes", summary="Node gpu-node-17 condition DiskPressure=True; pods evicted"),
         _r("typedb", summary="kg lookup", details={"blast_radius_workloads": 3}),
@@ -595,7 +1033,7 @@ def test_component_identity_absent_keeps_legacy_behavior() -> None:
     ]
     ranked = rank_root_cause_candidates(_target(), results, occurrence_count=5)
     assert ranked[0].family == "node_kubelet_pressure"
-    assert ranked[0].confidence == "high"
+    assert ranked[0].confidence == "medium"
 
 
 def test_component_identity_single_weak_hit_not_high_confidence() -> None:
@@ -616,6 +1054,43 @@ def test_component_identity_single_weak_hit_not_high_confidence() -> None:
     top = ranked[0]
     assert top.family == "gpu_hardware_error"
     assert top.confidence != "high"
+
+
+def test_component_identity_cannot_bypass_evidence_gate_on_its_own() -> None:
+    ranked = rank_root_cause_candidates(
+        _target(alert_name="KubeDaemonSetRolloutStuck", pod="runai-container-toolkit-vttmr"),
+        [_r("loki", summary="all logs nominal")],
+        component_family="gpu_hardware_error",
+        component="runai-container-toolkit",
+        depends_on_chain=["runai-container-toolkit", "gpu-operator"],
+    )
+
+    assert ranked[0].family == "insufficient_evidence"
+    candidate = next(c for c in ranked if c.family == "gpu_hardware_error")
+    assert candidate.evidence_agents == ["topology"]
+
+
+def test_ontology_bonus_cannot_create_candidate_without_live_collector_signal() -> None:
+    ranked = rank_root_cause_candidates(
+        _target(alert_name="GenericAlert"),
+        [_r("loki", summary="all logs nominal")],
+        graph_candidate_counts={"gpu_hardware_error": 2},
+    )
+
+    assert ranked[0].family == "insufficient_evidence"
+    assert "gpu_hardware_error" not in {candidate.family for candidate in ranked}
+
+
+def test_ontology_bonus_can_corrobate_existing_live_collector_signal() -> None:
+    ranked = rank_root_cause_candidates(
+        _target(alert_name="GpuAlert"),
+        [_r("system", summary="NVRM: Xid 79 GPU has fallen off the bus")],
+        graph_candidate_counts={"gpu_hardware_error": 2},
+    )
+
+    top = ranked[0]
+    assert top.family == "gpu_hardware_error"
+    assert any("ontology matched" in rationale for rationale in top.rationale)
 
 
 def _change_result(changes, summary="recent changes"):
@@ -666,8 +1141,7 @@ def test_lifecycle_gate_leads_when_target_component_mid_rollout() -> None:
         assert by_family["node_kubelet_pressure"].confidence != "high"
 
 
-def test_lifecycle_gate_absent_keeps_legacy_behavior() -> None:
-    # No lifecycle signal => ranking is 100% unchanged (R1 still force-highs node).
+def test_lifecycle_gate_absent_does_not_restore_graph_blast_promotion() -> None:
     results = [
         _r("kubernetes", summary="Node gpu-node-17 condition DiskPressure=True; pods evicted"),
         _r("typedb", summary="kg lookup", details={"blast_radius_workloads": 3}),
@@ -675,7 +1149,7 @@ def test_lifecycle_gate_absent_keeps_legacy_behavior() -> None:
     ]
     ranked = rank_root_cause_candidates(_target(), results, occurrence_count=5)
     assert ranked[0].family == "node_kubelet_pressure"
-    assert ranked[0].confidence == "high"
+    assert ranked[0].confidence == "medium"
 
 
 def test_lifecycle_upstream_rollout_is_medium_not_forced_high() -> None:

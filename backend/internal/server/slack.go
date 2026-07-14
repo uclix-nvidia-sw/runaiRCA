@@ -6,6 +6,8 @@
 //     threading survives restarts.
 //   - Later completed operator-driven re-analyses (manual/comment/feedback/chat)
 //     reply into that thread ("2nd Analysis", "3rd Analysis", ...).
+//   - Alertmanager firing -> resolved transitions reply into the initial
+//     analysis thread instead of creating another channel-level message.
 //   - Follow-up auto/backfill completions and failed runs never reach Slack:
 //     raw alert notifications already arrive via other channels, and the
 //     dashboard keeps the full per-alert history.
@@ -53,6 +55,9 @@ type SlackNotifier struct {
 	// ponytail: one global mutex serializes deliveries so the root message is
 	// created exactly once per incident; per-incident locks if volume matters.
 	mu sync.Mutex
+	// lastResolvedNotification deduplicates the race between a resolved webhook
+	// and a still-finishing initial analysis. Access is protected by mu.
+	lastResolvedNotification map[string]string
 
 	stateMu             sync.Mutex
 	lastOKAt            time.Time
@@ -220,7 +225,53 @@ func (s *Server) deliverSlackAnalysis(run AnalysisRun, incidentID string) {
 	}
 	if threadTS == "" {
 		s.store.SetIncidentSlackThread(incidentID, ts)
+		detail.SlackThreadTS = ts
+		// Short-lived alerts may resolve before their initial analysis finishes.
+		// Once the root exists, catch up the pending resolved state in its thread.
+		if detail.Status == "resolved" {
+			s.deliverSlackResolutionLocked(detail)
+		}
 	}
+}
+
+// notifySlackResolution posts only the transition detected by Store. It is
+// intentionally fire-and-forget, matching analysis notification delivery.
+func (s *Server) notifySlackResolution(incidentID string) {
+	if !s.slack.IsConfigured() || incidentID == "" {
+		return
+	}
+	go s.deliverSlackResolution(incidentID)
+}
+
+func (s *Server) deliverSlackResolution(incidentID string) {
+	s.slack.mu.Lock()
+	defer s.slack.mu.Unlock()
+	detail, ok := s.store.IncidentDetail(incidentID)
+	if !ok {
+		return
+	}
+	s.deliverSlackResolutionLocked(detail)
+}
+
+func (s *Server) deliverSlackResolutionLocked(detail *IncidentDetail) {
+	if detail.Status != "resolved" || detail.SlackThreadTS == "" {
+		return
+	}
+	resolvedKey := "unknown"
+	if detail.ResolvedAt != nil {
+		resolvedKey = detail.ResolvedAt.UTC().Format(time.RFC3339Nano)
+	}
+	if s.slack.lastResolvedNotification[detail.IncidentID] == resolvedKey {
+		return
+	}
+	if _, err := s.slack.post(s.slack.buildResolutionMessage(detail)); err != nil {
+		log.Printf("slack resolved notify failed for incident %s: %v", detail.IncidentID, err)
+		return
+	}
+	if s.slack.lastResolvedNotification == nil {
+		s.slack.lastResolvedNotification = make(map[string]string)
+	}
+	s.slack.lastResolvedNotification[detail.IncidentID] = resolvedKey
 }
 
 func (n *SlackNotifier) post(msg map[string]any) (string, error) {
@@ -368,6 +419,30 @@ func (n *SlackNotifier) buildAnalysisMessage(detail *IncidentDetail, run Analysi
 		slackContext(contextLine),
 	}
 	return msg
+}
+
+func (n *SlackNotifier) buildResolutionMessage(detail *IncidentDetail) map[string]any {
+	resolvedAt := time.Now().UTC()
+	if detail.ResolvedAt != nil {
+		resolvedAt = detail.ResolvedAt.UTC()
+	}
+	contextLine := fmt.Sprintf("`%s` · resolved at %s", detail.IncidentID, resolvedAt.Format("2006-01-02 15:04 UTC"))
+	if elapsed := resolvedAt.Sub(detail.FiredAt); elapsed >= 0 {
+		contextLine += " · active for " + elapsed.Round(time.Second).String()
+	}
+	return map[string]any{
+		"channel":      n.channelID,
+		"thread_ts":    detail.SlackThreadTS,
+		"text":         fmt.Sprintf("✅ %s — Resolved", detail.Title),
+		"unfurl_links": false,
+		"attachments": []any{map[string]any{
+			"color": "#2eb886",
+			"blocks": []any{
+				slackSection("*✅ Incident Resolved*"),
+				slackContext(contextLine),
+			},
+		}},
+	}
 }
 
 // actionButtons builds the root-message buttons: Re-analyze needs Socket Mode

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -44,6 +45,7 @@ async def test_no_token_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.status == "unavailable"
     assert result.missing_data == ["change.unconfigured"]
     assert result.summary.startswith("증거를 찾기 어렵습니다.")
+    assert result.artifacts[0].result["observation"]["polarity"] == "unavailable"
 
 
 @pytest.mark.asyncio
@@ -121,6 +123,323 @@ async def test_detects_rollout_new_pod_node_and_event(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
+async def test_historical_incident_uses_its_own_change_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, path, **_kwargs):
+        if path.endswith("/events"):
+            return JsonResponse(
+                url="u",
+                status_code=200,
+                data={
+                    "items": [
+                        {
+                            "type": "Warning",
+                            "reason": "DuringIncident",
+                            "lastTimestamp": "2026-01-02T03:04:00Z",
+                            "involvedObject": {"name": "trainer"},
+                        },
+                        {
+                            "type": "Warning",
+                            "reason": "MuchLater",
+                            "lastTimestamp": "2026-07-13T09:00:00Z",
+                            "involvedObject": {"name": "trainer"},
+                        },
+                    ]
+                },
+            )
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-01-02T03:00:00Z",
+        resolved_at="2026-01-02T03:10:00Z",
+    )
+    result = await ChangeCollector(_Settings()).collect(target)
+
+    assert result.details["time_range"] == {
+        "start": "2026-01-02T02:55:00Z",
+        "end": "2026-01-02T03:15:00Z",
+    }
+    assert [change["reason"] for change in result.details["changes"]] == ["DuringIncident"]
+    assert "start=2026-01-02T02:55:00Z" in result.artifacts[0].query
+    observation = result.artifacts[0].result["observation"]
+    # An Event on a similarly-named Pod is useful context, but this alert did
+    # not name that Pod and the event does not identify a verified controller.
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert observation["target_scope_verified"] is False
+    assert "observed_entity" not in observation
+
+
+@pytest.mark.asyncio
+async def test_historical_incident_excludes_pod_deleted_outside_its_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, path, **_kwargs):
+        if path.endswith("/pods"):
+            return JsonResponse(
+                url="u",
+                status_code=200,
+                data={
+                    "items": [
+                        {
+                            "metadata": {
+                                "name": "trainer-old",
+                                "namespace": "runai",
+                                "creationTimestamp": "2025-12-01T00:00:00Z",
+                                # A stale termination must not become evidence
+                                # for the January incident just because the Pod
+                                # still has a deletion timestamp in this read.
+                                "deletionTimestamp": "2026-01-03T00:00:00Z",
+                            }
+                        }
+                    ]
+                },
+            )
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-01-02T03:00:00Z",
+        resolved_at="2026-01-02T03:10:00Z",
+    )
+    result = await ChangeCollector(_Settings()).collect(target)
+
+    assert result.status == "partial"
+    assert result.details["time_range"] == {
+        "start": "2026-01-02T02:55:00Z",
+        "end": "2026-01-02T03:15:00Z",
+    }
+    assert result.details.get("changes", []) == []
+    observation = result.artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == ("absent", "scoped")
+
+
+@pytest.mark.asyncio
+async def test_change_cache_does_not_reuse_another_workloads_scoped_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, path, **_kwargs):
+        if path.endswith("/events"):
+            return JsonResponse(
+                url="u",
+                status_code=200,
+                data={
+                    "items": [
+                        {
+                            "type": "Warning",
+                            "reason": "BackOff",
+                            "lastTimestamp": "2026-01-02T03:04:00Z",
+                            "involvedObject": {"kind": "Pod", "name": "trainer-0"},
+                        }
+                    ]
+                },
+            )
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    collector = ChangeCollector(_Settings())
+    incident = {
+        "fired_at": "2026-01-02T03:00:00Z",
+        "resolved_at": "2026-01-02T03:10:00Z",
+    }
+    trainer = await collector.collect(replace(_target(), **incident))
+    other = await collector.collect(
+        replace(_target(), workload_name="other", pod="other-0", **incident)
+    )
+
+    assert trainer.details["changes"][0]["name"] == "trainer-0"
+    assert other is not trainer
+    assert other.details["changes"] == []
+    assert other.details["context_changes"][0]["name"] == "trainer-0"
+    observation = other.artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+
+
+@pytest.mark.asyncio
+async def test_historical_unrelated_namespace_change_is_context_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, path, **_kwargs):
+        if path.endswith("/events"):
+            return JsonResponse(
+                url="u",
+                status_code=200,
+                data={
+                    "items": [
+                        {
+                            "type": "Warning",
+                            "reason": "OOMKilled",
+                            "lastTimestamp": "2026-01-02T03:04:00Z",
+                            "involvedObject": {"kind": "Pod", "name": "other-worker-0"},
+                        }
+                    ]
+                },
+            )
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-01-02T03:00:00Z",
+        resolved_at="2026-01-02T03:10:00Z",
+    )
+    result = await ChangeCollector(_Settings()).collect(target)
+
+    observation = result.artifacts[0].result["observation"]
+    assert result.status == "partial"
+    assert result.details["changes"] == []
+    assert result.details["context_changes"][0]["name"] == "other-worker-0"
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+
+
+@pytest.mark.asyncio
+async def test_historical_stale_target_rollout_is_context_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, path, **_kwargs):
+        if path.endswith("/deployments"):
+            return JsonResponse(
+                url="u",
+                status_code=200,
+                data={
+                    "items": [
+                        {
+                            "metadata": {
+                                "name": "trainer",
+                                "namespace": "runai",
+                                "generation": 5,
+                                "creationTimestamp": "2025-12-01T00:00:00Z",
+                            },
+                            "status": {"observedGeneration": 4, "conditions": []},
+                        }
+                    ]
+                },
+            )
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-01-02T03:00:00Z",
+        resolved_at="2026-01-02T03:10:00Z",
+    )
+    result = await ChangeCollector(_Settings()).collect(target)
+
+    observation = result.artifacts[0].result["observation"]
+    assert result.status == "partial"
+    assert result.details["changes"] == []
+    assert result.details["context_changes"][0]["relation"] == "stale_or_untimed_context"
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+
+
+def test_live_change_window_remains_context_only() -> None:
+    observation = change_mod._collector_change_observation(
+        changes=[{"kind": "PodCreated"}],
+        time_range={"start": "2026-07-13T00:00:00Z", "end": "2026-07-13T01:00:00Z"},
+        historical_window=False,
+        warnings=[],
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("present", "partial")
+
+
+def test_historical_change_requires_individual_occurrence_timestamp() -> None:
+    observation = change_mod._collector_change_observation(
+        changes=[
+            {
+                "kind": "Deployment",
+                "name": "trainer",
+                # A metadata list query may still surface a stale/malformed
+                # item. Its broad request range is not evidence that this
+                # rollout happened during the incident.
+                "timestamp": "not-a-rfc3339-time",
+            }
+        ],
+        time_range={"start": "2026-07-13T00:00:00Z", "end": "2026-07-13T01:00:00Z"},
+        historical_window=True,
+        warnings=[],
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert "evidence_window" not in observation
+
+
+def test_historical_change_uses_change_timestamp_not_query_window() -> None:
+    observation = change_mod._collector_change_observation(
+        changes=[
+            {
+                "kind": "PodDeleted",
+                "name": "trainer-0",
+                "timestamp": "2026-07-13T00:12:00Z",
+            }
+        ],
+        time_range={"start": "2026-07-13T00:00:00Z", "end": "2026-07-13T01:00:00Z"},
+        historical_window=True,
+        warnings=[],
+    )
+
+    assert observation["evidence_window"] == {
+        "start": "2026-07-13T00:12:00Z",
+        "end": "2026-07-13T00:12:00Z",
+    }
+
+
+def test_historical_change_keeps_exact_target_pod_provenance() -> None:
+    target = replace(_target(), pod="trainer-0")
+    observation = change_mod._collector_change_observation(
+        changes=[
+            {
+                "kind": "PodDeleted",
+                "name": "trainer-0",
+                "namespace": "runai",
+                "timestamp": "2026-07-13T00:12:00Z",
+            }
+        ],
+        time_range={"start": "2026-07-13T00:00:00Z", "end": "2026-07-13T01:00:00Z"},
+        historical_window=True,
+        warnings=[],
+        target=target,
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
+    assert observation["observed_entity"] == {"kind": "pod", "name": "trainer-0"}
+    assert observation["target_scope_verified"] is True
+
+
+def test_historical_change_does_not_promote_workload_prefix_match() -> None:
+    observation = change_mod._collector_change_observation(
+        changes=[
+            {
+                "kind": "PodCreated",
+                "name": "trainer-worker-7f8d",
+                "timestamp": "2026-07-13T00:12:00Z",
+            }
+        ],
+        time_range={"start": "2026-07-13T00:00:00Z", "end": "2026-07-13T01:00:00Z"},
+        historical_window=True,
+        warnings=[],
+        target=_target(),
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert observation["target_scope_verified"] is False
+    assert "observed_entity" not in observation
+
+
+@pytest.mark.asyncio
 async def test_query_failure_degrades(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
 
@@ -185,7 +504,7 @@ async def test_helm_release_detected(monkeypatch: pytest.MonkeyPatch) -> None:
                 {"metadata": {"name": "sh.helm.release.v1.gpu-operator.v3",
                               "namespace": "gpu-operator",
                               "creationTimestamp": _iso(-60),
-                              "labels": {"owner": "helm", "name": "gpu-operator",
+                              "labels": {"owner": "helm", "name": "trainer",
                                          "version": "3", "status": "pending-upgrade"}}},
                 {"metadata": {"name": "sh.helm.release.v1.gpu-operator.v2",
                               "namespace": "gpu-operator",
@@ -254,13 +573,115 @@ async def test_change_query_is_bounded_scoped_and_never_returns_bodies(
     assert observation["observed_entity"] == {"kind": "component", "name": "trainer"}
     assert observation["window"] == {"lookback_seconds": 120}
     assert observation["polarity"] == "present"
-    assert observation["coverage"] == "scoped"
+    assert observation["coverage"] == "partial"
     assert set(observation["observation_window"]) == {"start", "end"}
     assert observation["body_included"] is False
     assert len(observation["changes"]) == 1
     assert "event-body-secret" not in str(query)
     assert "helm-secret-body" not in str(query)
     assert "summary" not in observation["changes"][0]
+
+
+@pytest.mark.asyncio
+async def test_change_query_uses_the_historical_incident_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, path, **kwargs):
+        if path.endswith("/events"):
+            return JsonResponse(url="u", status_code=200, data={"items": [
+                {
+                    "type": "Warning",
+                    "reason": "BackOff",
+                    "lastTimestamp": "2026-07-13T21:44:00Z",
+                    "involvedObject": {"name": "trainer", "kind": "Pod"},
+                },
+                {
+                    "type": "Warning",
+                    "reason": "UnrelatedCurrentEvent",
+                    "lastTimestamp": "2026-07-14T09:00:00Z",
+                    "involvedObject": {"name": "trainer", "kind": "Pod"},
+                },
+            ]})
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-07-13T21:43:47Z",
+        resolved_at="2026-07-13T21:45:47Z",
+    )
+    query = await change_query(_Settings(), target, {"kind": "event", "lookback_seconds": 60})
+
+    observation = query["observation"]
+    assert observation["historical_window"] is True
+    assert observation["observation_window"] == {
+        "start": "2026-07-13T21:38:47Z",
+        "end": "2026-07-13T21:50:47Z",
+    }
+    assert observation["window"] == {"lookback_seconds": 720}
+    assert [change["reason"] for change in observation["changes"]] == ["BackOff"]
+    assert observation["coverage"] == "scoped"
+    assert "start=2026-07-13T21:38:47Z" in query["query"]
+
+
+@pytest.mark.asyncio
+async def test_change_query_keeps_unrelated_namespace_history_as_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, path, **kwargs):
+        if path.endswith("/events"):
+            return JsonResponse(url="u", status_code=200, data={"items": [
+                {
+                    "type": "Warning",
+                    "reason": "BackOff",
+                    "lastTimestamp": "2026-07-13T21:44:00Z",
+                    "involvedObject": {"name": "unrelated-worker", "kind": "Pod"},
+                }
+            ]})
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-07-13T21:43:47Z",
+        resolved_at="2026-07-13T21:45:47Z",
+    )
+    query = await change_query(_Settings(), target, {"kind": "event"})
+
+    observation = query["observation"]
+    assert observation["changes"] == []
+    assert observation["context_change_count"] == 1
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+
+
+@pytest.mark.asyncio
+async def test_change_query_marks_paginated_history_as_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(**kwargs):
+        return JsonResponse(
+            url="u",
+            status_code=200,
+            data={"items": [], "metadata": {"continue": "next-page-token"}},
+        )
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-07-13T21:43:47Z",
+        resolved_at="2026-07-13T21:45:47Z",
+    )
+    query = await change_query(_Settings(), target, {"kind": "event"})
+
+    assert query["observation"]["polarity"] == "unknown"
+    assert query["observation"]["coverage"] == "partial"
+    assert "truncated by Kubernetes pagination" in query["summary"]
 
 
 @pytest.mark.asyncio
@@ -290,8 +711,8 @@ async def test_change_query_accepts_plan_kinds_with_bounded_lookback(
     query = await change_query(_Settings(), _target(), {"kind": kind, "lookback_seconds": 86400})
 
     assert query["error"] is None
-    assert query["observation"]["polarity"] == "absent"
-    assert query["observation"]["coverage"] == "scoped"
+    assert query["observation"]["polarity"] == "unknown"
+    assert query["observation"]["coverage"] == "partial"
 
 
 @pytest.mark.asyncio

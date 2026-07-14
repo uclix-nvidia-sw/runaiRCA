@@ -3,12 +3,21 @@ from __future__ import annotations
 import base64
 import json
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
+from app.collectors.base import (
+    NO_EVIDENCE,
+    AnalysisTarget,
+    CollectorResult,
+    artifact,
+    incident_time_range,
+    ko_en,
+    parse_incident_time,
+)
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
+from app.knowledge import _keyword_negated
 from app.llm import cached_insight, complete, insight_cache_key, llm_configured
 from app.masking import build_masker
 from app.mcp_client import (
@@ -17,6 +26,19 @@ from app.mcp_client import (
     mcp_error,
     mcp_fallback_warning,
     mcp_tool_json,
+)
+
+_LOKI_FAILURE_TOKEN_RE = re.compile(
+    r"\b(?:error|fail(?:ed|ure)?|oom(?:killed)?|evict(?:ed|ion)?|"
+    r"crash(?:ed|loop)?|pending|unschedul(?:able|ed)?|back-?off)\b",
+    re.IGNORECASE,
+)
+_LOKI_NON_CAUSAL_LINE_RE = re.compile(
+    r"\b(?:healthy|normal|nominal|ready|recovered|recovery|resolved|cleared|"
+    r"fixed|remediated|succeed(?:ed|ing|s)?|success(?:ful(?:ly)?)?|no\s+(?:error|fail|"
+    r"oom|evict|crash|pending|issue)|without\s+(?:error|fail|oom|evict|crash|pending))\b"
+    r"|(?:정상|복구|해결|오류\s*없|실패\s*없|문제\s*없)",
+    re.IGNORECASE,
 )
 
 
@@ -48,6 +70,7 @@ class LokiCollector:
                 ],
             )
 
+        time_range = _incident_time_range(target)
         selector = _selector_for(target, plan)
         skipped_target_scope = ""
         # Loki rejects an empty stream selector `{}` with HTTP 400. When the alert has
@@ -64,6 +87,12 @@ class LokiCollector:
                 f'{selector} |~ "(?i)(error|fail|oom|evict|crash|pending|unschedul|back-off)"'
             )
             queries = [("error_logs", error_query), ("recent_logs", selector)]
+            # Pod names are ephemeral. A restarted/replaced Pod can no longer
+            # match the alert's exact {pod="…"} stream label even though Loki
+            # still retains its incident-window lines. Add a narrowly scoped
+            # namespace/body correlation using stable workload identity.
+            if history_query := _workload_history_query(target, plan):
+                queries.append(("workload_history_logs", history_query))
         # Control-plane sweep only when the plan says this alert implicates Run:ai —
         # otherwise every alert scraped runai/runai-backend and skewed ranking.
         control_plane_in_scope = plan.check_control_plane if plan is not None else True
@@ -109,7 +138,7 @@ class LokiCollector:
         if self._settings.loki_mcp_url:
             try:
                 query_results = await _collect_loki_mcp(
-                    self._settings, queries, _incident_time_range(target)
+                    self._settings, queries, time_range
                 )
                 used_mcp = True
             except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
@@ -141,11 +170,18 @@ class LokiCollector:
                     ],
                 )
             query_results = await _collect_loki_direct(
-                self._settings, queries, warnings, _incident_time_range(target)
+                self._settings, queries, warnings, time_range
             )
 
         successful = [item for item in query_results if not item["error"]]
-        populated = [item for item in successful if item["line_count"]]
+        populated = [
+            item
+            for item in successful
+            # A positive line count without retained timestamps is useful
+            # operator context, not verified historical incident evidence.
+            if item["line_count"]
+            and _loki_entries_in_window(item.get("sample_entries"), time_range) is True
+        ]
         auth_failed = any(item["status_code"] == 401 for item in query_results)
         if populated:
             status = "ok"
@@ -184,11 +220,42 @@ class LokiCollector:
             "loki_url": self._settings.loki_url,
             "loki_mcp_url": self._settings.loki_mcp_url,
             "used_mcp": used_mcp,
+            "time_range": time_range,
             "queries": query_results,
         }
         missing_data = [] if successful else ["loki.query"]
         if auth_failed:
             missing_data.append("loki.auth")
+        # The aggregate card is useful context for an operator, but a matching
+        # line in one broad query must not be treated as proof for every log
+        # hypothesis.  Each query below has its own predicate, polarity and
+        # incident window so synthesis can distinguish e.g. "no OOM line" from
+        # "scheduler line present" instead of keyword-counting the whole blob.
+        collector_observation = {
+            "kind": "loki_collector_summary",
+            "predicate": "loki_collector_summary",
+            "polarity": "unknown",
+            "coverage": "partial",
+            "observation_window": time_range or {},
+        }
+        artifacts = [
+            artifact(
+                agent=self.name,
+                source="loki",
+                type="logql",
+                status=status,
+                confidence=confidence,
+                query="; ".join(item["query"] for item in query_results),
+                summary=summary,
+                result={**result, "observation": collector_observation},
+            )
+        ]
+        artifacts.extend(
+            _loki_query_artifact(
+                self.name, item, target=target, plan=plan, time_range=time_range
+            )
+            for item in query_results
+        )
         return CollectorResult(
             agent=self.name,
             status=status,
@@ -197,18 +264,7 @@ class LokiCollector:
             details=result,
             missing_data=missing_data,
             warnings=warnings,
-            artifacts=[
-                artifact(
-                    agent=self.name,
-                    source="loki",
-                    type="logql",
-                    status=status,
-                    confidence=confidence,
-                    query="; ".join(item["query"] for item in query_results),
-                    summary=summary,
-                    result=result,
-                )
-            ],
+            artifacts=artifacts,
         )
 
 
@@ -314,6 +370,9 @@ async def _collect_loki_direct(
         )
         streams = _loki_streams(response.data)
         line_count = sum(len(stream.get("values", [])) for stream in streams)
+        error = response.error
+        if error is None and not _loki_native_response_complete(response.data):
+            error = "Loki response missing successful data.result"
         query_results.append(
             {
                 "name": name,
@@ -324,13 +383,16 @@ async def _collect_loki_direct(
                 "stream_count": len(streams),
                 "line_count": line_count,
                 "sample_lines": _sample_lines(streams),
+                "sample_entries": _sample_entries(streams),
+                "stream_labels": _stream_label_sets(streams),
+                "stream_labels_complete": _stream_labels_complete(streams),
                 "sample": compact(streams, limit=3),
-                "error": response.error,
+                "error": error,
                 **({"time_range": time_range} if time_range else {}),
             }
         )
-        if response.error:
-            warnings.append(f"Loki query failed for {name}: {response.error}")
+        if error:
+            warnings.append(f"Loki query failed for {name}: {error}")
             if response.status_code == 401:
                 warnings.append(_loki_unauthorized_warning(settings))
     return query_results
@@ -353,10 +415,21 @@ async def _collect_loki_mcp(
     ]
 
 
-async def loki_mcp_query(settings: Settings, name: str, logql: str) -> dict[str, object]:
+async def loki_mcp_query(
+    settings: Settings,
+    name: str,
+    logql: str,
+    *,
+    time_range: dict[str, str] | None = None,
+) -> dict[str, object]:
     datasource_uid = await _grafana_datasource_uid(settings.loki_mcp_url, "loki")
     return await _mcp_query_loki(
-        settings.loki_mcp_url, name, logql, settings.loki_query_limit, datasource_uid
+        settings.loki_mcp_url,
+        name,
+        logql,
+        settings.loki_query_limit,
+        datasource_uid,
+        time_range,
     )
 
 
@@ -378,21 +451,57 @@ async def _mcp_query_loki(
             "grafana datasource uid unresolved for loki — set "
             "secrets.grafanaServiceAccountToken so grafana-mcp can list datasources"
         )
-    base_args: dict[str, object] = {"limit": limit, "direction": "BACKWARD"}
+    # Match mcp-grafana's query_loki_logs schema exactly. The previous compatibility
+    # retries mixed old argument names (`query`, `datasource_uid`, `startTime`) with
+    # the current schema. When those retries failed, the last error came from a call
+    # with no recognized datasourceUid and misleadingly reported "id is invalid".
+    args: dict[str, object] = {
+        "datasourceUid": datasource_uid,
+        "logql": logql,
+        "limit": limit,
+        "direction": "backward",
+        "queryType": "range",
+    }
     if time_range:
-        # grafana-mcp expects RFC3339 startTime/endTime, while Loki's direct API
-        # calls them start/end. Keep the conversion at this boundary.
-        base_args.update({"startTime": time_range["start"], "endTime": time_range["end"]})
-    args_list: list[dict[str, object]] = [
-        {"datasourceUid": datasource_uid, "query": logql, **base_args},
-        {"datasourceUid": datasource_uid, "logql": logql, **base_args},
-        {"datasource_uid": datasource_uid, "query": logql, **base_args},
-    ]
-    data = await _call_mcp_json(url, "query_loki_logs", args_list)
+        # mcp-grafana expects RFC3339 startRfc3339/endRfc3339, while Loki's
+        # direct API calls them start/end. Keep the conversion at this boundary.
+        args.update(
+            {
+                "startRfc3339": time_range["start"],
+                "endRfc3339": time_range["end"],
+            }
+        )
+    data = await _call_mcp_json(url, "query_loki_logs", [args])
+    if not _loki_mcp_response_complete(data):
+        return {
+            "name": name,
+            "query": logql,
+            "url": f"{url}#query_loki_logs",
+            "status_code": 200,
+            "status": _loki_status(data),
+            "stream_count": 0,
+            "line_count": 0,
+            "sample_lines": [],
+            "sample_entries": [],
+            "stream_labels": [],
+            "stream_labels_complete": False,
+            "sample": compact(data, limit=3),
+            "error": "Loki MCP response missing a recognized log result",
+            **({"time_range": time_range} if time_range else {}),
+        }
     streams = _loki_streams(data)
-    lines = _sample_lines(streams)
-    if not lines:
-        lines = _log_lines_from_mcp_data(data)
+    entries = _sample_entries(streams)
+    if not entries:
+        entries = _log_entries_from_mcp_data(data)
+    if not entries:
+        # Keep compatibility with MCP implementations that return plain text
+        # rather than timestamped entries. Lack of a timestamp is explicit,
+        # but the useful log line is not silently discarded.
+        entries = [
+            {"timestamp": "", "line": line}
+            for line in _log_lines_from_mcp_data(data)
+        ]
+    lines = [entry["line"] for entry in entries]
     line_count = sum(len(stream.get("values", [])) for stream in streams) or _mcp_line_count(data)
     if not line_count:
         line_count = len(lines)
@@ -410,48 +519,344 @@ async def _mcp_query_loki(
         "stream_count": len(streams),
         "line_count": line_count,
         "sample_lines": lines[:8],
+        "sample_entries": entries[:8],
+        # A native Loki result exposes one complete label set per stream.  The
+        # Grafana MCP flat-entry shape does not promise that it returned every
+        # stream, even when individual entries happen to include labels, so it
+        # deliberately remains unverifiable for target-scoped RCA evidence.
+        "stream_labels": _stream_label_sets(streams),
+        "stream_labels_complete": bool(streams) and _stream_labels_complete(streams),
         "sample": compact(streams or data, limit=3),
         "error": None,
         **({"time_range": time_range} if time_range else {}),
     }
 
 
-_INCIDENT_PRELUDE = timedelta(minutes=5)
-_INCIDENT_EPILOGUE = timedelta(minutes=5)
-_FIRING_INCIDENT_DURATION = timedelta(minutes=15)
-
-
 def _incident_time_range(target: AnalysisTarget) -> dict[str, str] | None:
-    """Return a bounded Loki window centered on the alert occurrence.
+    """Compatibility wrapper for callers/tests that imported Loki's helper."""
+    return incident_time_range(target)
 
-    Without an Alertmanager start time, leave Loki's normal recent-window default
-    untouched. A firing alert has no trustworthy end time, so cap it at 15 minutes
-    after it began rather than querying from an old firing timestamp through now.
-    """
-    fired = _parse_alert_time(target.fired_at)
-    if fired is None:
-        return None
-    resolved = _parse_alert_time(target.resolved_at)
-    if resolved is None or resolved < fired:
-        resolved = fired + _FIRING_INCIDENT_DURATION
-    return {
-        "start": _format_loki_time(fired - _INCIDENT_PRELUDE),
-        "end": _format_loki_time(resolved + _INCIDENT_EPILOGUE),
+
+def _loki_query_artifact(
+    agent: str,
+    item: dict[str, object],
+    *,
+    target: AnalysisTarget,
+    plan: object | None,
+    time_range: dict[str, str] | None,
+):
+    """Expose one LogQL query's scoped verdict as RCA-safe evidence."""
+    observation = _loki_query_observation(
+        item, target=target, plan=plan, time_range=time_range
+    )
+    name = str(item.get("name") or "logs")
+    polarity = str(observation["polarity"])
+    status = "unavailable" if polarity == "unavailable" else "ok"
+    confidence = "high" if polarity in {"present", "absent"} else "low"
+    if polarity == "present":
+        summary = f"Loki {name}: matching log lines were present in the incident window."
+    elif polarity == "absent":
+        summary = f"{NO_EVIDENCE} Loki {name}: no matching log lines in the incident window."
+    else:
+        summary = f"Loki {name}: query result was unavailable or outside an incident window."
+    return artifact(
+        agent=agent,
+        source="loki",
+        type="logql_signal",
+        status=status,
+        confidence=confidence,
+        title=f"Loki · {name}",
+        query=str(item.get("query") or ""),
+        summary=summary,
+        result={
+            "observation": observation,
+            "line_count": int(item.get("line_count") or 0),
+            "stream_count": int(item.get("stream_count") or 0),
+            "sample_entries": item.get("sample_entries") or [],
+            "time_range": time_range,
+        },
+    )
+
+
+def _loki_query_observation(
+    item: dict[str, object],
+    *,
+    time_range: dict[str, str] | None,
+    target: AnalysisTarget | None = None,
+    plan: object | None = None,
+) -> dict[str, object]:
+    """Classify a LogQL result without making unbounded empty searches refute RCA."""
+    name = str(item.get("name") or "logs")
+    window_verified = _loki_entries_in_window(item.get("sample_entries"), time_range)
+    affirmative_lines = _loki_affirmative_lines(item.get("sample_entries"), time_range)
+    if item.get("error"):
+        polarity, coverage = "unavailable", "unknown"
+    elif name == "runai_control_plane_errors":
+        # This is intentionally a broad health sweep across Run:ai namespaces.
+        # It can explain why to inspect the control plane, but it has no
+        # workload/project identity and therefore cannot prove the alert's RCA.
+        polarity, coverage = "unknown", "partial"
+    elif not time_range:
+        # A current/live query can help an operator, but it cannot confirm that
+        # the same condition was absent at the historical incident time.
+        polarity, coverage = "unknown", "partial"
+    elif name == "recent_logs":
+        # This is an intentionally unfiltered tail.  A normal lifecycle line
+        # can mention a failure token (or merely contain application prose),
+        # so its presence cannot ground a causal hypothesis.  The targeted
+        # error query below may still produce a typed signal.
+        polarity, coverage = "unknown", "partial"
+    elif int(item.get("line_count") or 0) == 0:
+        polarity, coverage = "absent", "scoped"
+    elif window_verified is not True:
+        # A proxy/MCP can return current logs despite a range-shaped request,
+        # and some MCP responses omit timestamps entirely. Historical support
+        # requires a retained log timestamp inside the incident window.
+        polarity, coverage = "unknown", "partial"
+    elif name == "error_logs" and not affirmative_lines:
+        # The broad LogQL token matcher also returns e.g. "no OOM", "crash
+        # recovered" and "OOMKilled=false".  Retain those lines for the
+        # operator, but do not let a negated/healthy/recovery sentence become
+        # causal support just because it contains a scary word.
+        polarity, coverage = "unknown", "partial"
+    else:
+        polarity, coverage = "present", "scoped"
+    observed_entity: dict[str, str] | None = None
+    target_scope_verified: bool | None = None
+    if target is not None and polarity in {"present", "absent"}:
+        observed_entity, target_scope_verified = _loki_target_scope(
+            name, item, target=target, plan=plan
+        )
+        if target_scope_verified is not True:
+            # A LogQL selector is request intent, not returned-data
+            # provenance.  A proxy may ignore a matcher, and flat MCP results
+            # do not establish that labels cover every returned stream.  Do
+            # not let either shape inherit the pipeline target as RCA support.
+            polarity, coverage = "unknown", "partial"
+    observation = {
+        "kind": "loki_query",
+        "predicate": f"log:{name}",
+        "polarity": polarity,
+        "coverage": coverage,
+        "line_count": int(item.get("line_count") or 0),
+        "stream_count": int(item.get("stream_count") or 0),
+        "affirmative_line_count": len(affirmative_lines),
+        "observation_window": time_range or {},
+        "log_window_verified": window_verified,
     }
+    if observed_entity:
+        observation["observed_entity"] = observed_entity
+    if target_scope_verified is not None:
+        observation["target_scope_verified"] = target_scope_verified
+    if polarity == "present":
+        evidence_window = _loki_evidence_window(item.get("sample_entries"), time_range)
+        if evidence_window:
+            observation["evidence_window"] = evidence_window
+    return observation
 
 
-def _parse_alert_time(value: str) -> datetime | None:
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (TypeError, ValueError):
+def _loki_affirmative_lines(
+    entries: object, time_range: dict[str, str] | None
+) -> list[str]:
+    """Return in-window log lines that affirm, rather than negate, a failure.
+
+    This deliberately analyzes only the error-token query.  It is not an NLP
+    classifier: any ambiguity is excluded from causal support and remains on
+    the evidence card as context.
+    """
+    if not time_range:
+        return []
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return []
+    affirmative: list[str] = []
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        timestamp = parse_incident_time(entry.get("timestamp"))
+        line = entry.get("line")
+        if timestamp is None or not (start <= timestamp <= end) or not isinstance(line, str):
+            continue
+        if _loki_line_affirms_failure(line):
+            affirmative.append(line)
+    return affirmative
+
+
+def _loki_line_affirms_failure(line: str) -> bool:
+    lowered = line.casefold()
+    # A recovery/healthy assertion can share a sentence with the earlier error
+    # token ("failed then recovered").  Favor a false negative over claiming a
+    # resolved status line is the incident's cause.
+    if _LOKI_NON_CAUSAL_LINE_RE.search(lowered):
+        return False
+    return any(
+        not _keyword_negated(lowered, match.start(), match.end())
+        for match in _LOKI_FAILURE_TOKEN_RE.finditer(lowered)
+    )
+
+
+def _loki_target_scope(
+    name: str,
+    item: dict[str, object],
+    *,
+    target: AnalysisTarget,
+    plan: object | None,
+) -> tuple[dict[str, str] | None, bool]:
+    """Validate native Loki stream labels against the selector's target scope.
+
+    ``workload_history_logs`` and the Run:ai control-plane correlation query
+    intentionally match text inside broader streams.  Their labels cannot
+    prove the alert workload identity, so they stay context-only.  Primary
+    target stream queries require every returned stream to name the requested
+    namespace and either the exact Pod or an exact workload label.
+    """
+    if name not in {"error_logs", "recent_logs"}:
+        return None, False
+    labels = item.get("stream_labels")
+    if item.get("stream_labels_complete") is not True or not isinstance(labels, list) or not labels:
+        return None, False
+
+    namespace = target.namespace
+    pod = target.pod
+    workload = target.workload_name
+    if plan is not None:
+        namespaces = getattr(plan, "namespaces", ())
+        if isinstance(namespaces, (list, tuple)) and namespaces and str(namespaces[0]).strip():
+            namespace = str(namespaces[0]).strip()
+        pod = str(getattr(plan, "pod", "") or pod).strip()
+        workload = str(getattr(plan, "workload", "") or workload).strip()
+
+    if not namespace:
+        return None, False
+    required: tuple[tuple[str, str], ...]
+    entity: dict[str, str]
+    if pod:
+        required = (("namespace", namespace), ("pod", pod))
+        entity = {"kind": "pod", "name": pod}
+    elif workload:
+        required = (("namespace", namespace),)
+        entity = {"kind": "workload_name", "name": workload}
+    else:
+        required = (("namespace", namespace),)
+        entity = {"kind": "namespace", "name": namespace}
+
+    for raw_labels in labels:
+        if not isinstance(raw_labels, dict):
+            return None, False
+        normalized = {
+            str(key).strip().casefold(): str(value).strip()
+            for key, value in raw_labels.items()
+            if isinstance(value, (str, int, float)) and str(value).strip()
+        }
+        if any(normalized.get(label) != expected for label, expected in required):
+            return None, False
+        if not pod and workload:
+            workload_labels = (
+                normalized.get("workload"),
+                normalized.get("workload_name"),
+                normalized.get("app"),
+                normalized.get("app_kubernetes_io_name"),
+                normalized.get("runai_workload_id"),
+            )
+            if workload not in workload_labels:
+                return None, False
+    return entity, True
+
+
+def _loki_evidence_window(
+    entries: object, time_range: dict[str, str] | None
+) -> dict[str, str]:
+    """Return the actual timestamp span of retained in-range log evidence."""
+    if not time_range:
+        return {}
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return {}
+    timestamps: list[tuple[datetime, str]] = []
+    for entry in entries if isinstance(entries, list) else []:
+        raw = entry.get("timestamp") if isinstance(entry, dict) else None
+        parsed = parse_incident_time(raw)
+        if parsed is not None and start <= parsed <= end:
+            timestamps.append((parsed, str(raw)))
+    if not timestamps:
+        return {}
+    timestamps.sort(key=lambda item: item[0])
+    return {"start": timestamps[0][1], "end": timestamps[-1][1]}
+
+
+def _loki_entries_in_window(
+    entries: object, time_range: dict[str, str] | None
+) -> bool | None:
+    """Return whether retained log entry timestamps intersect an incident window."""
+    if not time_range:
         return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return None
+    timestamps = []
+    for entry in entries if isinstance(entries, list) else []:
+        timestamp = entry.get("timestamp") if isinstance(entry, dict) else None
+        parsed = parse_incident_time(timestamp)
+        if parsed is not None:
+            timestamps.append(parsed)
+    if not timestamps:
+        return None
+    return any(start <= timestamp <= end for timestamp in timestamps)
 
 
-def _format_loki_time(value: datetime) -> str:
-    return value.isoformat(timespec="seconds").replace("+00:00", "Z")
+def _loki_native_response_complete(data: object) -> bool:
+    """Whether a direct Loki response is an explicit successful stream result."""
+    if not (
+        isinstance(data, dict)
+        and str(data.get("status") or "").lower() == "success"
+        and isinstance(data.get("data"), dict)
+        and isinstance(data["data"].get("result"), list)
+    ):
+        return False
+    streams = data["data"]["result"]
+    return not streams or any(
+        isinstance(stream, dict) and isinstance(stream.get("values"), list)
+        for stream in streams
+    )
+
+
+def _loki_mcp_response_complete(data: object) -> bool:
+    """Recognize native Loki and Grafana MCP log result envelopes.
+
+    An HTTP/MCP success transport with an unrecognized empty body must not be
+    interpreted as an empty historical search. Grafana MCP may return either
+    native Loki streams or a flat list under one of these documented keys.
+    """
+    if _loki_native_response_complete(data):
+        return True
+    if not isinstance(data, dict):
+        return False
+    return any(
+        _loki_flat_log_result_complete(data.get(key))
+        for key in ("data", "lines", "logs", "entries")
+    )
+
+
+def _loki_flat_log_result_complete(value: object) -> bool:
+    """Whether a Grafana MCP flat log response is recognizable."""
+    if not isinstance(value, list):
+        return False
+    if not value:
+        return True
+    return any(
+        (isinstance(item, str) and bool(item.strip()))
+        or (
+            isinstance(item, dict)
+            and any(
+                isinstance(item.get(key), str) and bool(item.get(key).strip())
+                for key in ("line", "message", "body")
+            )
+        )
+        for item in value
+    )
 
 
 # Grafana datasource uids are ^[a-zA-Z0-9\-_]{1,40}$; a numeric row id or a
@@ -600,6 +1005,39 @@ def _selector_for(target: AnalysisTarget, plan=None) -> str:
     return "{" + ",".join(selector_parts) + "}" if selector_parts else "{}"
 
 
+def _workload_history_query(target: AnalysisTarget, plan=None) -> str:
+    """Find retained logs for replaced Pods through a stable workload identifier.
+
+    Kubernetes Pod UID/name labels are intentionally not assumed: Loki label
+    sets differ by deployment. Namespace plus an escaped workload name or
+    Run:AI workload ID is portable and remains bounded to this incident.
+    """
+    namespace = target.namespace
+    workload = target.workload_name
+    if plan is not None:
+        if plan.namespaces:
+            namespace = plan.namespaces[0]
+        workload = plan.workload or workload
+    if not namespace:
+        return ""
+    terms = _workload_history_terms(workload, target.runai_workload_id)
+    if not terms:
+        return ""
+    return f'{{namespace="{namespace}"}} |~ "(?i)({"|".join(terms)})"'
+
+
+def _workload_history_terms(*values: str) -> list[str]:
+    terms: list[str] = []
+    for value in values:
+        normalized = str(value or "").strip()
+        if len(normalized) < 3:
+            continue
+        escaped = re.escape(normalized).replace('"', r'\"')
+        if escaped not in terms:
+            terms.append(escaped)
+    return terms
+
+
 def _control_plane_correlation_term(target: AnalysisTarget, plan=None) -> str:
     """Regex alternation of the identifiers the control plane logs THIS workload by
     (workload name, then project). Empty when nothing specific enough to correlate —
@@ -659,3 +1097,94 @@ def _sample_lines(streams: list[dict[str, object]], limit: int = 8) -> list[str]
             if len(lines) >= limit:
                 return lines
     return lines
+
+
+def _sample_entries(
+    streams: list[dict[str, object]], limit: int = 8
+) -> list[dict[str, object]]:
+    """Bounded timestamped entries preserving the incident's log order."""
+    entries: list[dict[str, object]] = []
+    for stream in streams:
+        values = stream.get("values")
+        if not isinstance(values, list):
+            continue
+        labels = _stream_labels(stream)
+        for pair in values:
+            if not isinstance(pair, list) or len(pair) < 2:
+                continue
+            line = " ".join(str(pair[1]).split())
+            if not line:
+                continue
+            entry: dict[str, object] = {"timestamp": _log_timestamp(pair[0]), "line": line[:240]}
+            if labels:
+                entry["labels"] = labels
+            entries.append(entry)
+            if len(entries) >= limit:
+                return entries
+    return entries
+
+
+def _log_entries_from_mcp_data(data: object, limit: int = 8) -> list[dict[str, object]]:
+    """Extract timestamped Grafana MCP entries ({timestamp, line, labels})."""
+    if isinstance(data, list):
+        entries: list[dict[str, object]] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            line = item.get("line") or item.get("message") or item.get("body")
+            if not isinstance(line, str) or not line.strip():
+                continue
+            entry: dict[str, object] = {
+                "timestamp": _log_timestamp(item.get("timestamp") or ""),
+                "line": " ".join(line.split())[:240],
+            }
+            if labels := _label_mapping(item.get("labels")):
+                entry["labels"] = labels
+            entries.append(entry)
+            if len(entries) >= limit:
+                break
+        return entries
+    if isinstance(data, dict):
+        for key in ("lines", "logs", "entries", "data"):
+            entries = _log_entries_from_mcp_data(data.get(key), limit)
+            if entries:
+                return entries
+    return []
+
+
+def _stream_label_sets(streams: list[dict[str, object]]) -> list[dict[str, str]]:
+    """Retain the native label set for every returned stream, never samples only."""
+    return [_stream_labels(stream) for stream in streams]
+
+
+def _stream_labels_complete(streams: list[dict[str, object]]) -> bool:
+    """Whether every returned native stream carries a usable label map."""
+    return bool(streams) and all(bool(_stream_labels(stream)) for stream in streams)
+
+
+def _stream_labels(stream: dict[str, object]) -> dict[str, str]:
+    return _label_mapping(stream.get("stream"))
+
+
+def _label_mapping(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key).strip(): str(item).strip()
+        for key, item in value.items()
+        if str(key).strip() and isinstance(item, (str, int, float)) and str(item).strip()
+    }
+
+
+def _log_timestamp(value: object) -> str:
+    """Render Loki nanoseconds as UTC RFC3339 while retaining unknown formats."""
+    raw = str(value).strip().strip('"')
+    try:
+        numeric = int(raw)
+        if numeric >= 10**15:  # Loki normally sends nanoseconds since epoch.
+            return datetime.fromtimestamp(numeric / 1_000_000_000, UTC).isoformat().replace(
+                "+00:00", "Z"
+            )
+    except (TypeError, ValueError, OverflowError, OSError):
+        pass
+    return raw

@@ -98,10 +98,18 @@ receivers:
     slack_configs:
       - api_url: <slack-webhook-url>
         channel: <channel>
+        send_resolved: false
     webhook_configs:
       - url: http://<release-name>-runai-rca-backend.<namespace>.svc.cluster.local:8080/webhook/alertmanager
         send_resolved: true
 ```
+
+Keep `send_resolved: false` on the direct Slack receiver and `send_resolved:
+true` on the RCA webhook. The direct receiver continues to post firing alerts;
+the Backend posts the resolved transition as a reply under the incident's
+initial-analysis message. Enabling resolved delivery on both receivers creates
+the extra channel-level resolved message that the threaded flow is designed to
+avoid.
 
 When keeping separate receivers, make sure the Slack route does not stop
 matching before RCA. One common pattern is `continue: true` on the Slack route:

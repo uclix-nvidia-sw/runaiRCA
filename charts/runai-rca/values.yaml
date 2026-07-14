@@ -386,15 +386,14 @@ agent:
     enablePodExec: true
     enableNatRuntime: true
     natConfigFile: /app/configs/runai_rca_engine.yml
-    # Human-like iterative investigation: the orchestrator plans, probes the most
-    # relevant agent, observes, and re-plans.  0 means semantic completion;
-    # ANALYSIS_DEADLINE_SECONDS remains the execution safety boundary.
+    # Human-like iterative investigation: cap LLM reasoning rounds at 3. Each
+    # round can batch many independent read-only queries.
     # instead of gathering everything once. Only active when an LLM is configured
     # (no-op otherwise); each step is an extra LLM call, so it costs more per RCA.
     enableInvestigationLoop: true
-    maxInvestigationSteps: 0
+    maxInvestigationSteps: 3
     # Re-analysis (after a refuted top cause) gets its own investigation budget.
-    maxReanalysisSteps: 0
+    maxReanalysisSteps: 3
     # off | shadow | assist | authoritative. Shadow is the safe default: it
     # records evidence-gated novel hypotheses but never changes the headline.
     openWorldRcaMode: "shadow"

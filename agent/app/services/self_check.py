@@ -21,8 +21,9 @@ verbatim.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 
-from app.collectors.base import NO_EVIDENCE, CollectorResult
+from app.collectors.base import NO_EVIDENCE, CollectorResult, condition_observations
 from app.config import Settings
 from app.llm import complete_json, llm_configured
 from app.masking import build_masker
@@ -53,8 +54,19 @@ def _downgrade(confidence: str) -> str:
         return "low"
 
 
-def _canonical_has_evidence(family: str, results: list[CollectorResult]) -> bool:
-    """True when the family's canonical collector returned usable evidence."""
+def _canonical_has_evidence(
+    family: str,
+    results: list[CollectorResult],
+    *,
+    evidence_eligibility: Mapping[str, object] | None = None,
+) -> bool:
+    """True only when the canonical collector has scoped positive evidence.
+
+    The ranker already rejects context-only observations. The deterministic
+    self-check must use the same bar: otherwise a broad collector summary (or
+    a raw usage metric) can preserve confidence after the ranker correctly
+    refused to treat it as proof.
+    """
     rule = _FAMILY_RULES.get(family)
     if not rule:
         return True  # unknown family (e.g. insufficient_evidence) — nothing to refute
@@ -64,21 +76,43 @@ def _canonical_has_evidence(family: str, results: list[CollectorResult]) -> bool
             continue
         if r.status == "unavailable":
             return False
-        summary = (r.summary or "").strip()
-        if summary and summary != NO_EVIDENCE:
-            return True
-        return any(_artifact_has_evidence(art) for art in getattr(r, "artifacts", []) or [])
+        return any(
+            _artifact_has_evidence(art, evidence_eligibility=evidence_eligibility)
+            for art in getattr(r, "artifacts", []) or []
+        )
     return False  # canonical collector did not even run
 
 
-def _artifact_has_evidence(art: object) -> bool:
-    if getattr(art, "status", "") not in ("ok", "partial"):
+def _artifact_has_evidence(
+    art: object, *, evidence_eligibility: Mapping[str, object] | None = None
+) -> bool:
+    """Accept only an explicit scoped positive collector verdict.
+
+    Keyword-bearing summaries are deliberately excluded: a condition's name,
+    an HTTP success line, or a current snapshot is not a verified occurrence in
+    the incident window.
+    """
+    # Pipeline callers have already normalized target, topology, run identity,
+    # and incident window on the blackboard.  A raw artifact's local
+    # ``present/scoped`` declaration is not enough here: otherwise an
+    # observation from another Pod or a recovery-time query can preserve the
+    # top RCA's confidence after ranking correctly excluded it.  Direct/unit
+    # callers without a board retain the narrow artifact-local fallback.
+    if evidence_eligibility is not None:
+        evidence_id = str(getattr(art, "evidence_id", "") or "")
+        eligibility = evidence_eligibility.get(evidence_id)
+        permits = getattr(eligibility, "permits", None)
+        return bool(callable(permits) and permits("support"))
+
+    result = getattr(art, "result", None)
+    if not isinstance(result, Mapping):
         return False
-    summary = str(getattr(art, "summary", "") or "").strip()
-    return bool(
-        (summary and summary != NO_EVIDENCE)
-        or getattr(art, "result", None) is not None
-        or getattr(art, "highlights", None)
+    observation = result.get("observation")
+    if not isinstance(observation, Mapping):
+        return False
+    return (
+        str(observation.get("polarity") or "").strip().lower() == "present"
+        and str(observation.get("coverage") or "").strip().lower() == "scoped"
     )
 
 
@@ -87,6 +121,8 @@ async def refute_top_cause(
     top_candidate: RankedCause,
     results: list[CollectorResult],
     plan: object = None,
+    *,
+    evidence_eligibility: Mapping[str, object] | None = None,
 ) -> dict:
     """Try to refute the top cause; return {confidence, caveat, refuted}."""
     try:
@@ -96,9 +132,9 @@ async def refute_top_cause(
         if not family or family == "insufficient_evidence":
             return _default(confidence)
 
-        has_evidence = _canonical_has_evidence(family, results) or _has_signature_evidence(
-            top_candidate
-        )
+        has_evidence = _canonical_has_evidence(
+            family, results, evidence_eligibility=evidence_eligibility
+        ) or _has_signature_evidence(top_candidate)
 
         if not llm_configured(settings, settings.llm_model_self_check):
             # ponytail: deterministic gate — the only signal we have without an LLM
@@ -123,12 +159,19 @@ async def refute_top_cause(
                 )
             return _default(confidence)
 
-        supported = bool(verdict.get("supported", True))
+        # The model may use context to explain/refute a hypothesis, but it must
+        # never turn that context into support.  ``has_evidence`` is computed
+        # deterministically from a scoped positive canonical observation (or a
+        # direct alert signature), so it is the upper bound on the verdict.
+        supported = bool(verdict.get("supported", True)) and has_evidence
         masker = _self_check_masker(settings)
         caveat = _one_line(masker.mask_text(str(verdict.get("caveat") or "")), limit=360)
         next_check = _one_line(
             masker.mask_text(str(verdict.get("next_check") or "")), limit=240
         )
+        if not has_evidence:
+            caveat = caveat or _caveat_missing_evidence(family, settings)
+            next_check = next_check or _next_check_missing_evidence(family, settings)
         new_conf = confidence if supported else _downgrade(confidence)
         # Also honour an explicit weaker confidence from the model, never a stronger one.
         model_conf = str(verdict.get("confidence") or "").strip().lower()
@@ -209,6 +252,9 @@ def _evidence_digest(results: list[CollectorResult], masker) -> str:
             if art.highlights:
                 parts.append(f"highlights={', '.join(map(str, art.highlights[:6]))}")
             if art.result is not None:
+                checks = condition_observations(art.result)
+                if checks:
+                    parts.append(f"condition_checks={_compact_evidence_value(checks)}")
                 parts.append(f"result={_compact_evidence_value(art.result)}")
             lines.append(f"  artifact: {masker.mask_text(' | '.join(parts))}")
     return "\n".join(lines)
@@ -231,7 +277,13 @@ async def _llm_refute(
         "evidence below. Ask: what evidence would we expect if this cause were true, is "
         "it actually present, does a competing cause fit the evidence better, and what "
         "single check would settle it. Do not invent evidence. Be conservative: if the "
-        "evidence does not clearly support the cause, mark it unsupported.\n"
+        "evidence does not clearly support the cause, mark it unsupported. A condition "
+        "name alone is metadata: only condition_checks active=true supports it, while "
+        "active=false is contradicting evidence. A collector summary and an artifact "
+        "whose observation is unknown/partial are context only: they can refute or "
+        "suggest a next check, but can never support the proposed cause. The \"Specific "
+        "or canonical evidence present\" flag is authoritative; when false, you MUST "
+        "return supported=false.\n"
         f"Write the caveat and next_check in {caveat_lang}. Respond with a JSON object: "
         '{"supported": bool, "confidence": "low|medium|high", "caveat": str, '
         '"next_check": str}. '

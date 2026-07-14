@@ -12,7 +12,16 @@ from app.llm import begin_usage_tracking
 from app.plan import InvestigationPlan
 from app.schemas import AlertAnalysisArtifact
 from app.services import drilldown
-from app.services.drilldown import _tool_runai_get, run_drilldowns
+from app.services.drilldown import (
+    _tool_k8s_describe,
+    _tool_k8s_logs,
+    _tool_logql,
+    _tool_promql,
+    _tool_runai_get,
+    run_drilldowns,
+)
+from app.services.evidence_blackboard import Blackboard
+from app.services.root_cause_ranking import _artifact_is_evidence
 from tests.test_orchestrator import make_settings
 
 
@@ -24,6 +33,18 @@ def drill_settings(**overrides):
         llm_model="m",
         llm_api_key="k",
         **overrides,
+    )
+
+
+def test_kubernetes_read_rejects_non_resource_kind_before_execution() -> None:
+    assert not drilldown._valid_domain_query(
+        {"tool": "k8s_read", "args": {"kind": "promql"}}
+    )
+    assert not drilldown._valid_domain_query(
+        {"tool": "k8s_read", "args": {"kind": "deployment_history"}}
+    )
+    assert drilldown._valid_domain_query(
+        {"tool": "k8s_read", "args": {"kind": "deployments"}}
     )
 
 
@@ -64,6 +85,120 @@ def test_disabled_flag_means_no_llm_calls(monkeypatch) -> None:
     assert result.artifacts == []
 
 
+def test_drilldown_blackboard_records_the_incident_window() -> None:
+    target = replace(
+        _target(), fired_at="2026-07-10T01:00:00Z", resolved_at="2026-07-10T01:10:00Z"
+    )
+    board = Blackboard()
+    result = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="pod train-1-0 Pending; FailedScheduling",
+        artifacts=[
+            AlertAnalysisArtifact(
+                agent="kubernetes",
+                source="kubernetes",
+                type="k8s_read",
+                status="ok",
+                confidence="high",
+                summary="Pod train-1-0 remained Pending during the incident.",
+                    result={
+                        "observation": {
+                            "polarity": "present",
+                            "coverage": "scoped",
+                            "observed_entity": {"kind": "workload_name", "name": "train-1"},
+                        }
+                    },
+            )
+        ],
+    )
+
+    drilldown._record_blackboard(board, result, target)
+
+    fact = board.facts()[0]
+    assert fact.observation_window == ("2026-07-10T00:55:00Z", "2026-07-10T01:10:00Z")
+    assert fact.eligibility.from_fact(
+        fact,
+        context={
+            "window_start": "2026-07-10T00:55:00Z",
+            "window_end": "2026-07-10T01:10:00Z",
+        },
+    ).support
+
+
+@pytest.mark.asyncio
+async def test_metric_and_log_drilldowns_preserve_mcp_errors_and_incident_window(
+    monkeypatch,
+) -> None:
+    target = replace(
+        _target(), fired_at="2026-07-10T01:00:00Z", resolved_at="2026-07-10T01:10:00Z"
+    )
+    seen_prom_window: dict[str, str] | None = None
+    seen_loki_window: dict[str, str] | None = None
+
+    async def fake_prom_mcp(settings, name, query, *, time_range=None):
+        nonlocal seen_prom_window
+        seen_prom_window = time_range
+        return {"error": "Prometheus MCP response missing data.result"}
+
+    async def fake_loki_mcp(settings, name, query, *, time_range=None):
+        nonlocal seen_loki_window
+        seen_loki_window = time_range
+        return {"error": "Loki MCP response missing a recognized log result"}
+
+    monkeypatch.setattr(drilldown, "prom_mcp_query", fake_prom_mcp)
+    monkeypatch.setattr(drilldown, "loki_mcp_query", fake_loki_mcp)
+    settings = drill_settings(
+        prometheus_mcp_url="http://prom-mcp",
+        loki_mcp_url="http://loki-mcp",
+    )
+
+    prom = await _tool_promql(settings, target, {"query": "up"})
+    logs = await _tool_logql(settings, target, {"query": '{namespace="runai-vision"}'})
+
+    expected = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    assert seen_prom_window == expected
+    assert seen_loki_window == expected
+    assert prom["error"] == "Prometheus MCP response missing data.result"
+    assert logs["error"] == "Loki MCP response missing a recognized log result"
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_log_and_describe_drilldowns_use_incident_scope(monkeypatch) -> None:
+    target = replace(
+        _target(),
+        pod="trainer-0",
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    log_call: dict[str, object] = {}
+    describe_call: dict[str, object] = {}
+
+    async def fake_logs(settings, namespace, pod, **kwargs):
+        log_call.update({"namespace": namespace, "pod": pod, **kwargs})
+        return {"error": None, "lines": ["2026-07-10T01:01:00Z prior failure"]}
+
+    async def fake_describe(settings, kind, **kwargs):
+        describe_call.update({"kind": kind, **kwargs})
+        return {"error": None, "events": []}
+
+    monkeypatch.setattr(drilldown, "k8s_logs", fake_logs)
+    monkeypatch.setattr(drilldown, "k8s_describe", fake_describe)
+
+    logs = await _tool_k8s_logs(
+        drill_settings(), target, {"pod": "trainer-0", "previous": True}
+    )
+    await _tool_k8s_describe(
+        drill_settings(), target, {"kind": "pods", "name": "trainer-0"}
+    )
+
+    expected = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    assert log_call["previous"] is True
+    assert log_call["since_time"] == expected["start"]
+    assert "--previous" in logs["query"]
+    assert describe_call["time_range"] == expected
+
+
 def test_drilldown_appends_tagged_artifacts_and_stops_on_done(monkeypatch) -> None:
     decisions = iter(
         [
@@ -93,6 +228,120 @@ def test_drilldown_appends_tagged_artifacts_and_stops_on_done(monkeypatch) -> No
     assert seen_args == [{"kind": "events", "namespace": "runai-vision"}]
     assert [a.type for a in result.artifacts] == ["drilldown_query"]
     assert result.artifacts[0].status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_partial_drilldown_result_cannot_be_promoted_by_failure_keywords() -> None:
+    async def partial_tool(settings, target, args):
+        return {
+            "summary": "FailedMount appeared in a current event tail",
+            "polarity": "present",
+            "coverage": "partial",
+            "result": {"events": [{"reason": "FailedMount"}]},
+        }
+
+    result = _k8s_result()
+    await drilldown._run_query(
+        drill_settings(),
+        result,
+        {"partial_tool": {"call": partial_tool}},
+        _target(),
+        None,
+        {"tool": "partial_tool", "args": {}},
+        [],
+        drilldown._drilldown_masker(drill_settings()),
+    )
+
+    artifact = result.artifacts[0]
+    assert artifact.result["observation"] == {
+        "kind": "drilldown_query",
+        "predicate": "partial_tool",
+        "polarity": "present",
+        "coverage": "partial",
+    }
+    assert not _artifact_is_evidence(artifact)
+
+
+@pytest.mark.asyncio
+async def test_raw_tool_response_observation_cannot_claim_scoped_support() -> None:
+    """A successful API body is not allowed to author our evidence verdict."""
+
+    async def raw_api_tool(settings, target, args):
+        return {
+            "summary": "HTTP 200",
+            # An adapter that merely mirrors these fields from an HTTP/LLM
+            # response has not proven them either.
+            "polarity": "present",
+            "coverage": "scoped",
+            "result": {
+                # This is remote response data, not an adapter-produced result.
+                "observation": {
+                    "polarity": "present",
+                    "coverage": "scoped",
+                    "observed_entity": {"kind": "pod", "name": "other-pod"},
+                    "observation_window": {
+                        "start": "2026-07-01T00:00:00Z",
+                        "end": "2026-07-01T00:01:00Z",
+                    },
+                }
+            },
+        }
+
+    result = _k8s_result()
+    await drilldown._run_query(
+        drill_settings(),
+        result,
+        {"raw_api_tool": {"call": raw_api_tool}},
+        _target(),
+        None,
+        {"tool": "raw_api_tool", "args": {}},
+        [],
+        drilldown._drilldown_masker(drill_settings()),
+    )
+
+    observation = result.artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert not _artifact_is_evidence(result.artifacts[0])
+
+
+@pytest.mark.asyncio
+async def test_change_timeline_keeps_only_adapter_verified_scoped_observation(monkeypatch) -> None:
+    observation = {
+        "kind": "change_query",
+        "predicate": "change:event",
+        "polarity": "present",
+        "coverage": "scoped",
+        "observed_entity": {"kind": "workload", "name": "train-1"},
+        "observation_window": {
+            "start": "2026-07-10T00:55:00Z",
+            "end": "2026-07-10T01:15:00Z",
+        },
+    }
+
+    async def fake_change_query(settings, target, args):
+        return {
+            "query": "bounded timeline",
+            "summary": "one correlated change",
+            "error": None,
+            "observation": observation,
+            "result": {"changes": [{"name": "train-1"}]},
+        }
+
+    monkeypatch.setattr(drilldown, "change_query", fake_change_query)
+    result = _k8s_result()
+    await drilldown._run_query(
+        drill_settings(),
+        result,
+        {"k8s_change_timeline": {"call": drilldown._tool_k8s_change_timeline}},
+        _target(),
+        None,
+        {"tool": "k8s_change_timeline", "args": {"source": "event"}},
+        [],
+        drilldown._drilldown_masker(drill_settings()),
+    )
+
+    assert result.artifacts[0].result["observation"] == observation
+    assert _artifact_is_evidence(result.artifacts[0])
 
 
 def test_drilldown_prompts_redact_sensitive_evidence(monkeypatch) -> None:
@@ -235,7 +484,7 @@ def test_drilldown_runs_resolved_ontology_probe_before_llm_query(monkeypatch) ->
     assert [item.type for item in result.artifacts] == ["ontology_probe"]
 
 
-def test_ontology_probe_records_structured_support_verdict(monkeypatch) -> None:
+def test_ontology_probe_keeps_untyped_remote_signal_inconclusive(monkeypatch) -> None:
     async def fake_complete_json(settings, *, user, **_kwargs):
         return {"action": "done"}
 
@@ -270,8 +519,8 @@ def test_ontology_probe_records_structured_support_verdict(monkeypatch) -> None:
     assert assessment | {"executed_at": ""} == {
         "probe_id": "mount-check",
         "tool": "k8s_read",
-        "verdict": "supports",
-        "support_signals": ["FailedMount"],
+        "verdict": "inconclusive",
+        "support_signals": [],
         "refute_signals": [],
         "template_id": "mount-check",
         "attempt_index": 1,
@@ -281,6 +530,52 @@ def test_ontology_probe_records_structured_support_verdict(monkeypatch) -> None:
     assert assessment["executed_at"].endswith("Z")
     assert "execution_id" not in assessment
     assert "hypothesis_ids" not in assessment
+
+
+def test_ontology_probe_accepts_adapter_verified_scoped_observation(monkeypatch) -> None:
+    async def fake_complete_json(settings, *, user, **_kwargs):
+        return {"action": "done"}
+
+    async def fake_change_query(settings, target, args):
+        observation = {
+            "kind": "change_query",
+            "predicate": "change:event",
+            "polarity": "present",
+            "coverage": "scoped",
+            "observed_entity": {"kind": "namespace", "name": "runai-vision"},
+            "observation_window": {
+                "start": "2026-07-10T00:55:00Z",
+                "end": "2026-07-10T01:15:00Z",
+            },
+        }
+        return {
+            "summary": "one correlated FailedMount event",
+            "error": None,
+            "observation": observation,
+            "result": {"events": [{"reason": "FailedMount"}]},
+        }
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "change_query", fake_change_query)
+    plan = InvestigationPlan(
+        diagnostic_directive={
+            "probes": [
+                {
+                    "id": "mount-change-check",
+                    "tool": "k8s_change_timeline",
+                    "arguments_template": {"source": "event"},
+                    "support_signal_any": ["FailedMount"],
+                }
+            ]
+        }
+    )
+    result = _k8s_result()
+
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), plan))
+
+    assessment = result.details["ontology_probe_assessments"][0]
+    assert assessment["verdict"] == "supports"
+    assert assessment["support_signals"] == ["FailedMount"]
 
 
 def test_ontology_probe_execution_uses_exact_template_hypotheses_and_run(monkeypatch) -> None:
@@ -357,7 +652,7 @@ def test_ontology_probe_resolves_explicit_resource_identifiers(monkeypatch) -> N
     async def fake_complete_json(settings, *, user, **_kwargs):
         return {"action": "done"}
 
-    async def fake_k8s_describe(settings, kind, *, namespace="", name=""):
+    async def fake_k8s_describe(settings, kind, *, namespace="", name="", time_range=None):
         seen_args.append({"kind": kind, "namespace": namespace, "name": name})
         return {"kind": kind, "status_code": 200, "error": None, "events": []}
 
@@ -509,7 +804,7 @@ def test_drilldown_runs_all_new_allowed_queries(monkeypatch) -> None:
     assert tool_calls[0] == 9
 
 
-def test_drilldown_continues_past_the_former_step_cap(monkeypatch) -> None:
+def test_drilldown_stops_at_configured_reasoning_round_cap(monkeypatch) -> None:
     decisions = iter(
         [
             {
@@ -537,10 +832,11 @@ def test_drilldown_continues_past_the_former_step_cap(monkeypatch) -> None:
     monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
     monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
     result = _k8s_result()
-    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
+    settings = replace(drill_settings(), max_investigation_steps=3)
+    asyncio.run(run_drilldowns(settings, [result], _target(), None))
 
-    assert calls[0] == 8
-    assert len(result.artifacts) == 7
+    assert calls[0] == 3
+    assert len(result.artifacts) == 3
 
 
 def test_unlimited_drilldown_stops_when_a_query_repeats(monkeypatch) -> None:
@@ -567,6 +863,36 @@ def test_unlimited_drilldown_stops_when_a_query_repeats(monkeypatch) -> None:
     assert calls[0] == 2
     assert len(result.artifacts) == 1
     assert any("no new allowed read-only query" in warning for warning in result.warnings)
+
+
+def test_drilldown_runs_independent_query_batch_concurrently(monkeypatch) -> None:
+    started: list[str] = []
+    both_started = asyncio.Event()
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
+        return {
+            "action": "query",
+            "queries": [
+                {"tool": "k8s_read", "args": {"kind": "pods"}},
+                {"tool": "k8s_read", "args": {"kind": "events"}},
+            ],
+        }
+
+    async def fake_k8s_read(settings, kind, **kwargs):
+        started.append(kind)
+        if len(started) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=0.1)
+        return {"kind": kind, "status_code": 200, "error": None}
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
+    result = _k8s_result()
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
+
+    assert set(started) == {"pods", "events"}
+    assert len(result.artifacts) == 2
+    assert all(artifact.status == "ok" for artifact in result.artifacts)
 
 
 def test_drilldown_does_not_stop_for_high_usage(monkeypatch) -> None:
@@ -884,6 +1210,122 @@ def test_salient_markers_ignore_negated_signals() -> None:
     ]
 
 
+def test_salient_markers_require_active_structured_conditions() -> None:
+    from app.collectors.base import condition_observations, salient_markers
+
+    healthy = {
+        "conditions": [
+            {"type": "DiskPressure", "status": "False", "reason": "KubeletHasNoDiskPressure"},
+            {"type": "MemoryPressure", "status": "False"},
+            {"type": "PIDPressure", "status": "False"},
+            {"type": "NetworkUnavailable", "status": "False"},
+        ]
+    }
+    assert salient_markers(healthy) == []
+    assert {item["condition"] for item in condition_observations(healthy)} == {
+        "DiskPressure",
+        "MemoryPressure",
+        "PIDPressure",
+        "NetworkUnavailable",
+    }
+    assert all(item["active"] is False for item in condition_observations(healthy))
+
+    failing = {"type": "MemoryPressure", "status": "True"}
+    assert salient_markers(failing) == ["MemoryPressure"]
+    assert condition_observations(failing)[0]["active"] is True
+
+
+def test_condition_observations_do_not_turn_unknown_into_refutation() -> None:
+    from app.collectors.base import condition_observations
+
+    kubernetes_unknown = {"type": "MemoryPressure", "status": "Unknown"}
+    prometheus_unknown = {
+        "metric": {"condition": "MemoryPressure", "status": "unknown"},
+        "value": [1720000000, "1"],
+    }
+    false_zero = {
+        "metric": {"condition": "MemoryPressure", "status": "false"},
+        "value": [1720000000, "0"],
+    }
+
+    assert condition_observations(kubernetes_unknown) == []
+    assert condition_observations(prometheus_unknown) == []
+    assert condition_observations(false_zero) == []
+
+
+def test_kubernetes_markers_ignore_pod_spec_keyword_values() -> None:
+    from app.collectors.base import kubernetes_salient_markers
+
+    pod = {
+        "spec": {"preemptionPolicy": "PreemptLowerPriority"},
+        "metadata": {"annotations": {"example": "OOMKilled documentation"}},
+        "status": {
+            "containerStatuses": [
+                {"state": {"running": {}}, "lastState": {"terminated": {"reason": "OOMKilled"}}}
+            ]
+        },
+    }
+
+    assert kubernetes_salient_markers(pod) == ["OOMKilled"]
+
+
+def test_salient_markers_require_positive_prometheus_condition_sample() -> None:
+    from app.collectors.base import condition_observations, salient_markers
+
+    inactive = {
+        "metric": {"condition": "DiskPressure", "status": "true", "node": "gpu-1"},
+        "value": [1720000000, "0"],
+    }
+    active = {
+        "metric": {"condition": "DiskPressure", "status": "true", "node": "gpu-1"},
+        "value": [1720000000, "1"],
+    }
+    false_series = {
+        "metric": {"condition": "DiskPressure", "status": "false", "node": "gpu-1"},
+        "value": [1720000000, "1"],
+    }
+    assert salient_markers(inactive) == []
+    assert salient_markers(false_series) == []
+    assert salient_markers(active) == ["DiskPressure"]
+    assert condition_observations(inactive)[0]["active"] is False
+    assert condition_observations(active)[0]["active"] is True
+
+
+def test_drilldown_caps_reasoning_rounds_but_batches_queries(monkeypatch) -> None:
+    decision_calls = 0
+    query_calls: list[str] = []
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
+        nonlocal decision_calls
+        decision_calls += 1
+        return {
+            "action": "query",
+            "queries": [
+                {
+                    "tool": "k8s_read",
+                    "args": {
+                        "kind": "events",
+                        "namespace": "runai-vision",
+                        "label_selector": f"round={decision_calls},query={index}",
+                    },
+                }
+                for index in range(5)
+            ],
+        }
+
+    async def fake_k8s_read(settings, kind, *, namespace="", name="", label_selector=""):
+        query_calls.append(label_selector)
+        return {"kind": kind, "status_code": 200, "error": None, "items": []}
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
+    settings = replace(drill_settings(), max_investigation_steps=3)
+    asyncio.run(run_drilldowns(settings, [_k8s_result()], _target(), None))
+
+    assert decision_calls == 3
+    assert len(query_calls) == 15
+
+
 def test_k8s_tool_reports_kubectl_command_title_and_highlights(monkeypatch) -> None:
     decisions = iter(
         [
@@ -908,7 +1350,7 @@ def test_k8s_tool_reports_kubectl_command_title_and_highlights(monkeypatch) -> N
             "kind": "pods",
             "status_code": 200,
             "error": None,
-            "data": {"status": {"reason": "OOMKilled"}},
+            "data": {"status": {"containerStatuses": [{"state": {"terminated": {"reason": "OOMKilled"}}}]}},
         }
 
     monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)

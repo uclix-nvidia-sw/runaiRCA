@@ -219,6 +219,149 @@ func TestSlackRootThenReplyFlow(t *testing.T) {
 	}
 }
 
+func TestSlackResolvedWebhookRepliesInInitialAnalysisThreadOnce(t *testing.T) {
+	var mu sync.Mutex
+	var payloads []map[string]any
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var msg map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&msg)
+		mu.Lock()
+		payloads = append(payloads, msg)
+		count := len(payloads)
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ts": fmt.Sprintf("1710000000.%06d", count)})
+	}))
+	defer stub.Close()
+
+	server := &Server{
+		store: NewStore(),
+		hub:   NewHub(),
+		slack: &SlackNotifier{botToken: "xoxb-test", channelID: "C1", apiURL: stub.URL, client: stub.Client()},
+	}
+	fingerprint := "fp-slack-resolved"
+	incident, record := seedAlert(t, server, fingerprint)
+	server.deliverSlackAnalysis(AnalysisRun{
+		RunID: "ANL-resolved-root", Source: "auto", Status: "complete",
+		IncidentID: incident.IncidentID, AlertID: record.AlertID,
+		AnalysisSummary: "Queue quota blocked scheduling.", AnalysisQuality: "high",
+	}, incident.IncidentID)
+	detail, _ := server.store.IncidentDetail(incident.IncidentID)
+	rootTS := detail.SlackThreadTS
+
+	resolvedAt := time.Now().UTC().Truncate(time.Second)
+	webhook := AlertmanagerWebhook{GroupKey: fingerprint, Alerts: []Alert{{
+		Status:      "resolved",
+		Labels:      record.Labels,
+		Annotations: map[string]string{"summary": "Queue recovered"},
+		Fingerprint: fingerprint,
+		StartsAt:    record.FiredAt.Format(time.RFC3339),
+		EndsAt:      resolvedAt.Format(time.RFC3339),
+	}}}
+	postWebhook := func() {
+		body, _ := json.Marshal(webhook)
+		rec := httptest.NewRecorder()
+		server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", bytes.NewReader(body)))
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("resolved webhook status = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+	postWebhook()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		count := len(payloads)
+		mu.Unlock()
+		if count >= 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	payloadCount := len(payloads)
+	if payloadCount != 2 {
+		mu.Unlock()
+		t.Fatalf("expected analysis root + resolved reply, got %d", payloadCount)
+	}
+	resolved := payloads[1]
+	mu.Unlock()
+	if resolved["thread_ts"] != rootTS {
+		t.Fatalf("resolved message should reply under initial analysis %q: %+v", rootTS, resolved)
+	}
+	if text, _ := resolved["text"].(string); !strings.Contains(text, "Resolved") {
+		t.Fatalf("resolved reply fallback text missing state: %+v", resolved)
+	}
+
+	// Alertmanager retries must not create repeated resolved comments.
+	postWebhook()
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(payloads) != 2 {
+		t.Fatalf("duplicate resolved webhook should be silent, got %d payloads", len(payloads))
+	}
+}
+
+func TestSlackResolutionWaitsForSlowInitialAnalysis(t *testing.T) {
+	var mu sync.Mutex
+	var payloads []map[string]any
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var msg map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&msg)
+		mu.Lock()
+		payloads = append(payloads, msg)
+		count := len(payloads)
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ts": fmt.Sprintf("1720000000.%06d", count)})
+	}))
+	defer stub.Close()
+
+	server := &Server{
+		store: NewStore(),
+		hub:   NewHub(),
+		slack: &SlackNotifier{botToken: "xoxb-test", channelID: "C1", apiURL: stub.URL, client: stub.Client()},
+	}
+	fingerprint := "fp-resolved-before-analysis"
+	incident, record := seedAlert(t, server, fingerprint)
+	result := server.store.UpsertAlertResult(AlertmanagerWebhook{GroupKey: fingerprint}, Alert{
+		Status: "resolved", Labels: record.Labels, Annotations: record.Annotations,
+		Fingerprint: fingerprint, StartsAt: record.FiredAt.Format(time.RFC3339),
+		EndsAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	if !result.IncidentResolved {
+		t.Fatal("expected firing to resolved transition")
+	}
+
+	// Race the resolved delivery against completion of the initial analysis.
+	// Whichever takes the Slack lock first, the result must be one root and one
+	// threaded resolved reply.
+	server.notifySlackResolution(incident.IncidentID)
+	server.deliverSlackAnalysis(AnalysisRun{
+		RunID: "ANL-slow-root", Source: "auto", Status: "complete",
+		IncidentID: incident.IncidentID, AlertID: record.AlertID,
+		AnalysisSummary: "Analysis finished after recovery.", AnalysisQuality: "medium",
+	}, incident.IncidentID)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		count := len(payloads)
+		mu.Unlock()
+		if count >= 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(payloads) != 2 {
+		t.Fatalf("expected one root and one caught-up resolved reply, got %d: %+v", len(payloads), payloads)
+	}
+	if payloads[0]["thread_ts"] != nil || payloads[1]["thread_ts"] != "1720000000.000001" {
+		t.Fatalf("expected resolved reply under delayed root: %+v", payloads)
+	}
+}
+
 func TestSlackHealthReflectsFailedAndRecoveredPosts(t *testing.T) {
 	calls := 0
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

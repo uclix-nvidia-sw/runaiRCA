@@ -18,15 +18,17 @@ detail parsing (or an LLM judge) only if the eval hit-rate stalls.
 
 from __future__ import annotations
 
-import os
 import hashlib
+import os
 import re
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 from app.collectors.base import AnalysisTarget, CollectorResult
 from app.knowledge import _keyword_hits, load_family_catalog
+from app.services.evidence_blackboard import source_independence_group
 
 _FAMILY_CATALOG = load_family_catalog(os.getenv("FAMILIES_FILE", "knowledge/families.yaml"))
 FAMILIES = _FAMILY_CATALOG.families
@@ -148,7 +150,9 @@ _NODE_CONDITION_TOKENS = (
 )
 
 
-def _node_condition_present(results: list[CollectorResult]) -> bool:
+def _node_condition_present(
+    results: list[CollectorResult], *, eligible_evidence_ids: set[str] | None = None
+) -> bool:
     """True when a real node-condition/eviction signal is present.
 
     P3: the R1 blast force-high must be backed by an ACTUAL node condition, not
@@ -157,36 +161,24 @@ def _node_condition_present(results: list[CollectorResult]) -> bool:
     is defeated because the kubernetes collector embeds the RAW node object in
     ``details["queries"]``, and a HEALTHY node object still literally contains
     "DiskPressure"/"MemoryPressure" types and "kubelet has no disk pressure"
-    messages. So instead we:
-      1. Trust the kubernetes collector's ALREADY-FILTERED structured signal
-         (``details["node_conditions"]`` is abnormal-only; a healthy node
-         collapses to a ``node_conditions_healthy`` marker), and
-      2. fall back to a NEGATION-AWARE keyword scan over a SCOPED text (summary +
-         warning events for kubernetes, full text for prometheus) that excludes
-         the raw ``queries`` payload — so healthy-node vocabulary can't misfire.
+    messages. Rank only the collector's scoped artifacts instead. A
+    ``node_conditions`` detail is a useful current-state snapshot, but cannot
+    establish that a resolved historical incident was caused by pressure that
+    happens to exist now. Incident-window Warning events and bounded Prometheus
+    predicates keep this force-high gate on the same temporal contract as every
+    other RCA support link.
     """
     for r in results:
         if not _collector_is_evidence(r):
             continue
         agent = getattr(r, "agent", "")
-        details = r.details if isinstance(r.details, dict) else {}
         if agent == "kubernetes":
-            # Primary: the collector already dropped healthy conditions; a real
-            # abnormal condition entry is a genuine pressure/NotReady signal.
-            conds = details.get("node_conditions")
-            if isinstance(conds, list) and any(
-                isinstance(c, dict) and c.get("type") and not c.get("node_conditions_healthy")
-                for c in conds
-            ):
-                return True
-            # Secondary: an actual eviction (kubelet acting under pressure). Scope
-            # to summary + warning_events so the raw node object in
-            # details["queries"] (healthy "DiskPressure"/"no disk pressure" text)
-            # cannot produce a false positive.
-            scoped = " ".join(
-                [r.summary or "", _leaf_text(details.get("warning_events"))]
-            ).lower()
-            if _keyword_hits(scoped, list(_NODE_CONDITION_TOKENS))[0]:
+            # ``_result_text`` excludes broad current Node snapshots once the
+            # collector publishes structured observations.
+            if _keyword_hits(
+                _result_text(r, eligible_evidence_ids=eligible_evidence_ids),
+                list(_NODE_CONDITION_TOKENS),
+            )[0]:
                 return True
         elif agent == "prometheus":
             # Prometheus carries no raw node object. Its metric-LABEL identity is
@@ -195,7 +187,10 @@ def _node_condition_present(results: list[CollectorResult]) -> bool:
             # literals are pruned from _result_text (METADATA_VALUE_KEYS subtree
             # drop). A hit here therefore comes from the collector's own SUMMARY
             # (e.g. "MemoryPressure=true"), which is a real, negation-aware signal.
-            if _keyword_hits(_result_text(r), list(_NODE_CONDITION_TOKENS))[0]:
+            if _keyword_hits(
+                _result_text(r, eligible_evidence_ids=eligible_evidence_ids),
+                list(_NODE_CONDITION_TOKENS),
+            )[0]:
                 return True
     return False
 
@@ -297,7 +292,15 @@ def merge_open_world_candidates(
         if family in FAMILIES:
             continue
         mechanism = str(item.get("mechanism") or item.get("statement") or "").strip()
-        support = _fact_ids(item.get("support_evidence_ids") or item.get("evidence_for"))
+        # An investigator can cite the same response-local E-id more than once
+        # while revising a hypothesis.  Citations are references, not separate
+        # observations, so preserve their first occurrence only.  More
+        # importantly, several different query cards can expose the same
+        # underlying telemetry plane; their number must not improve an
+        # open-world candidate's rank over independently observed evidence.
+        support = list(
+            dict.fromkeys(_fact_ids(item.get("support_evidence_ids") or item.get("evidence_for")))
+        )
         contradict = _fact_ids(
             item.get("contradiction_evidence_ids") or item.get("evidence_against")
         )
@@ -318,7 +321,12 @@ def merge_open_world_candidates(
             RankedCause(
                 family=slug,
                 confidence=confidence,
-                score=float(len(independent) * 3 + len(support)),
+                # Corroboration strength is the number of independent
+                # telemetry planes, not the number of query replicas from one
+                # plane.  Keeping ``len(support)`` in this score let an LLM
+                # promote a candidate merely by repeatedly citing Loki (or
+                # several views of the Kubernetes API).
+                score=float(len(independent) * 3),
                 rationale=[mechanism],
                 evidence_agents=sorted(independent),
                 mechanism=mechanism,
@@ -330,7 +338,7 @@ def merge_open_world_candidates(
                 contradiction_evidence_ids=contradict,
                 rank_basis=[
                     f"{len(independent)} independent source groups",
-                    f"{len(support)} supporting observations",
+                    f"{len(support)} distinct supporting evidence IDs",
                     "discriminating hypothesis marked supported",
                 ],
             )
@@ -379,6 +387,7 @@ def rank_root_cause_candidates(
     depends_on_chain: list[str] | None = None,
     lifecycle: dict[str, Any] | None = None,
     graph_candidate_counts: dict[str, int] | None = None,
+    eligible_evidence_ids: set[str] | None = None,
 ) -> list[RankedCause]:
     """Rank failure families for THIS incident from collector evidence.
 
@@ -397,13 +406,18 @@ def rank_root_cause_candidates(
     ``lifecycle`` leaves ranking unchanged (backward compatible).
     """
     top_n = max(1, top_n)
-    text_by_agent = {r.agent: _result_text(r) for r in results}
+    text_by_agent = {
+        r.agent: _result_text(r, eligible_evidence_ids=eligible_evidence_ids)
+        for r in results
+    }
     status_by_agent = {r.agent: r.status for r in results}
     blast, blast_agents = _kg_blast_radius(results)
-    # Blast radius now comes from synthesis-time KG enrichment, not a collector.
-    if kg_blast_radius > blast:
-        blast = kg_blast_radius
-        blast_agents = blast_agents | {"knowledge-graph"}
+    # TypeDB topology is a current/reference graph, not an incident-window
+    # observation.  It can guide collection and explain possible scope, but
+    # must not turn a single live condition into a HIGH historical RCA.  Keep
+    # the argument for API compatibility while deliberately not promoting it
+    # into the causal ranking path.
+    _ = kg_blast_radius
 
     scores = {fam: _Score() for fam in FAMILIES}
     for fam, (canonical, agents, keywords) in _FAMILY_RULES.items():
@@ -428,7 +442,9 @@ def rank_root_cause_candidates(
         occurrence_count,
         component_family,
         lifecycle_active=bool(lifecycle and lifecycle.get("active")),
-        node_condition=_node_condition_present(results),
+        node_condition=_node_condition_present(
+            results, eligible_evidence_ids=eligible_evidence_ids
+        ),
     )
 
     # Topology identity: the alert TARGET itself IS a known platform component.
@@ -442,12 +458,19 @@ def rank_root_cause_candidates(
     # above the (already boosted) subsystem-fault family.
     _apply_lifecycle_gate(scores, lifecycle)
 
-    # Optional feedback-derived priors nudge a family that already has a signal
-    # (multiplier on its score). Priors never create a candidate from nothing.
+    # Optional feedback-derived priors nudge a family only after this incident
+    # has a typed, scoped observation for that family's own collector.  A
+    # similar incident's vote must not amplify a legacy prose summary (or a
+    # historical memory card) into a current causal claim.  Priors still never
+    # create a candidate from nothing.
     if priors:
         for fam, s in scores.items():
             factor = priors.get(fam)
-            if factor is not None and s.points > 0:
+            if (
+                factor is not None
+                and s.points > 0
+                and _has_typed_incident_observation(target, results, s.agents)
+            ):
                 s.points *= factor
                 s.rationale.append(f"feedback prior adjusted score x{factor:.2f}")
 
@@ -456,7 +479,10 @@ def rank_root_cause_candidates(
     # A cap keeps a broad catalog from drowning out live collector evidence.
     for family, count in (graph_candidate_counts or {}).items():
         score = scores.get(family)
-        if score is None or count <= 0:
+        # The graph corroborates an observation that this run already matched;
+        # it is not an observation source itself and must never materialize a
+        # candidate from historical/ontology context alone.
+        if score is None or count <= 0 or score.points <= 0:
             continue
         bonus = min(2.0, float(count))
         score.points += bonus
@@ -483,8 +509,14 @@ def rank_root_cause_candidates(
                 c.trigger = trigger
     ranked.sort(key=lambda c: c.score, reverse=True)
 
-    # R6 evidence gate: no family clears the floor / has no corroboration.
-    if not ranked or ranked[0].score < _FLOOR or not ranked[0].evidence_agents:
+    # R6 evidence gate: topology/KG identity can focus investigation but cannot
+    # establish a root cause by itself. A final family needs at least one real
+    # collector observer; synthetic agents remain visible on the candidate for
+    # follow-up planning without allowing it to bypass insufficient-evidence.
+    top_has_live_observer = bool(
+        ranked and (set(ranked[0].evidence_agents) - _SYNTHETIC_AGENTS)
+    )
+    if not ranked or ranked[0].score < _FLOOR or not top_has_live_observer:
         gate = _insufficient(results, status_by_agent)
         return [gate, *ranked][:top_n]
     return ranked[:top_n]
@@ -557,7 +589,26 @@ _COMPONENT_IDENTITY_WEIGHT = 4.0
 # Synthetic agents are topology/KG facts injected by the ranker itself; they do
 # not independently OBSERVE a failure, so they must not count as one of the
 # corroborating evidence sources required for HIGH confidence.
-_SYNTHETIC_AGENTS = {"topology", "knowledge-graph"}
+# typedb is the concrete graph adapter name used by older/result-level
+# integrations; it carries topology/blast context, not a live fault observation.
+_SYNTHETIC_AGENTS = {"topology", "knowledge-graph", "typedb"}
+
+
+def _independent_observer_groups(agents: set[str]) -> set[str]:
+    """Collapse collectors that read the same telemetry plane.
+
+    The deterministic catalog ranker predates the fact-level blackboard and
+    historically used collector names as corroboration units. That let the
+    change collector and the Kubernetes collector satisfy a two-observer HIGH
+    gate even though both read the Kubernetes API. Keep agent names in
+    operator-facing candidate output, but use the fact-level source-group
+    contract for confidence and corroboration.
+    """
+    return {
+        source_independence_group(agent)
+        for agent in agents
+        if agent not in _SYNTHETIC_AGENTS
+    }
 
 
 def _apply_component_identity(
@@ -588,7 +639,7 @@ def _apply_component_identity(
         (
             other.points
             for fam, other in scores.items()
-            if fam != family and len(other.agents - _SYNTHETIC_AGENTS) < 2
+            if fam != family and len(_independent_observer_groups(other.agents)) < 2
         ),
         default=0.0,
     )
@@ -632,7 +683,7 @@ def _apply_lifecycle_gate(scores: dict[str, _Score], lifecycle: dict[str, Any] |
         (
             other.points
             for f, other in scores.items()
-            if f != fam and len(other.agents - _SYNTHETIC_AGENTS) < 2
+            if f != fam and len(_independent_observer_groups(other.agents)) < 2
         ),
         default=0.0,
     )
@@ -655,10 +706,11 @@ def _apply_lifecycle_gate(scores: dict[str, _Score], lifecycle: dict[str, Any] |
 
 
 def _confidence(fam: str, s: _Score, status_by_agent: dict[str, str]) -> str:
-    # HIGH requires >=2 agents that genuinely OBSERVED the failure; the synthetic
-    # topology/KG signals can floor a score but cannot, alone, unlock HIGH.
-    real_agents = len(s.agents - _SYNTHETIC_AGENTS)
-    if s.force_high or (s.points >= _HIGH and real_agents >= 2):
+    # HIGH requires >=2 independent telemetry groups that genuinely observed
+    # the failure. Synthetic topology/KG context can floor a score but cannot
+    # unlock HIGH, and two collectors reading the Kubernetes API count once.
+    real_source_groups = len(_independent_observer_groups(s.agents))
+    if s.force_high or (s.points >= _HIGH and real_source_groups >= 2):
         level = 2  # high
     elif s.points >= _MED or s.agents:
         level = 1  # medium
@@ -711,19 +763,111 @@ COLLECTOR_TEXT_DROP_KEYS: dict[str, frozenset[str]] = {
 }
 _RANKING_TEXT_DROP_KEYS = COLLECTOR_TEXT_DROP_KEYS  # backward-compatible alias
 
+# A timestamped Pod-log line proves the line existed, not that every failure
+# token inside it is an active condition. Kubernetes commonly logs recovery
+# status alongside a historic reason ("healthy after OOMKilled") and probes
+# often emit negative checks ("OOMKilled=false"). The generic keyword
+# negation helper intentionally permits nuanced prose; at this evidence
+# boundary be conservative instead: a normal/recovery-valued raw line cannot
+# substantiate a root-cause family. Structured Event reasons remain available
+# below when Kubernetes itself reports the positive reason.
+_KUBERNETES_NON_CAUSAL_SIGNAL_RE = re.compile(
+    r"\b(?:no|not|without|none|zero|false|healthy|normal|nominal|stable|ready|"
+    r"recovery|recovering|recovered|resolved|cleared|fixed|remediated|success|"
+    r"succeeded)\b|(?:없음|정상|복구|해결|미발생|아님)"
+)
 
-def _result_text(result: CollectorResult) -> str:
+
+def _kubernetes_signal_is_positive(value: object) -> bool:
+    """Whether a raw Kubernetes value can carry a live failure signal."""
+    text = " ".join(str(value or "").split())
+    return bool(text) and _KUBERNETES_NON_CAUSAL_SIGNAL_RE.search(text.casefold()) is None
+
+
+def _kubernetes_semantic_artifact_text(art: object) -> str:
+    """Keep only value-aware positive signals from Pod logs and Warning Events."""
+    payload = getattr(art, "result", None)
+    if not isinstance(payload, Mapping):
+        return ""
+    artifact_type = str(getattr(art, "type", ""))
+    parts: list[str] = []
+    if artifact_type == "kubernetes_pod_log":
+        entries = payload.get("sample_entries")
+        if not isinstance(entries, list):
+            entries = payload.get("lines") if isinstance(payload.get("lines"), list) else []
+        for entry in entries:
+            line = entry.get("line") if isinstance(entry, Mapping) else entry
+            if _kubernetes_signal_is_positive(line):
+                parts.append(str(line))
+    elif artifact_type == "kubernetes_warning_events":
+        events = payload.get("events")
+        for event in events if isinstance(events, list) else []:
+            if not isinstance(event, Mapping):
+                continue
+            # A Normal Event is never a failure signal. The collector normally
+            # removes these earlier, but keep ranking fail-closed for adapters
+            # and test fixtures that hand us an unfiltered response.
+            event_type = str(event.get("type") or "").strip().casefold()
+            if event_type and event_type != "warning":
+                continue
+            reason = event.get("reason")
+            if _kubernetes_signal_is_positive(reason):
+                parts.append(str(reason))
+            message = event.get("message")
+            if _kubernetes_signal_is_positive(message):
+                parts.append(str(message))
+    return " ".join(parts)
+
+
+def _artifact_ranking_value_text(
+    art: object, drop_keys: "frozenset[str] | set[str] | None"
+) -> str:
+    if str(getattr(art, "type", "")) in {
+        "kubernetes_pod_log",
+        "kubernetes_warning_events",
+    }:
+        return _kubernetes_semantic_artifact_text(art)
+    result = getattr(art, "result", None)
+    return _leaf_text(result, drop_keys) if result is not None else ""
+
+
+def _result_text(
+    result: CollectorResult, *, eligible_evidence_ids: set[str] | None = None
+) -> str:
     if not _collector_is_evidence(result):
         return ""
     drop_keys = _RANKING_TEXT_DROP_KEYS.get(getattr(result, "agent", ""))
+    artifacts = list(result.artifacts)
+    # New collectors publish explicit polarity/coverage observations. Once a
+    # collector has that contract, never fall back to its broad summary/details
+    # blob: it can contain current snapshots, query text or tail-limited logs.
+    # Only a positive, fully scoped card is eligible for deterministic family
+    # ranking. Legacy collectors keep the prior compatibility path until they
+    # publish structured observations.
+    structured = [art for art in artifacts if _artifact_observation(art) is not None]
+    if structured:
+        parts: list[str] = []
+        for art in structured:
+            if not _artifact_is_evidence(art, eligible_evidence_ids=eligible_evidence_ids):
+                continue
+            semantic_kubernetes_card = str(getattr(art, "type", "")) in {
+                "kubernetes_pod_log",
+                "kubernetes_warning_events",
+            }
+            if art.summary and (
+                not semantic_kubernetes_card or _kubernetes_signal_is_positive(art.summary)
+            ):
+                parts.append(art.summary)
+            parts.append(_artifact_ranking_value_text(art, drop_keys))
+        return " ".join(parts).lower()
+
     parts = [result.summary or ""]
-    for art in result.artifacts:
+    for art in artifacts:
         if not _artifact_is_evidence(art):
             continue
         if art.summary:
             parts.append(art.summary)
-        if art.result is not None:
-            parts.append(_leaf_text(art.result, drop_keys))
+        parts.append(_artifact_ranking_value_text(art, drop_keys))
     if result.details:
         parts.append(_leaf_text(result.details, drop_keys))
     return " ".join(parts).lower()
@@ -733,8 +877,122 @@ def _collector_is_evidence(result: CollectorResult) -> bool:
     return result.status in ("ok", "partial")
 
 
-def _artifact_is_evidence(art: object) -> bool:
-    return getattr(art, "status", "") in ("ok", "partial")
+def _artifact_is_evidence(
+    art: object, *, eligible_evidence_ids: set[str] | None = None
+) -> bool:
+    if getattr(art, "status", "") not in ("ok", "partial"):
+        return False
+    observation = _artifact_observation(art)
+    if observation is None:
+        return True
+    scoped_positive = (
+        str(observation.get("polarity") or "") == "present"
+        and str(observation.get("coverage") or "") == "scoped"
+    )
+    if not scoped_positive:
+        return False
+    # The pipeline calculates a stricter target/time/run eligibility verdict
+    # after normalizing artifacts onto the blackboard.  A typed card can be
+    # scoped for its own query yet still belong to a different entity or a
+    # post-resolution epilogue.  Once that verdict is available, the catalog
+    # ranker must not reintroduce the card through its raw text scan.
+    return eligible_evidence_ids is None or str(getattr(art, "evidence_id", "")) in eligible_evidence_ids
+
+
+def _artifact_observation(art: object) -> dict[str, object] | None:
+    result = getattr(art, "result", None)
+    if not isinstance(result, dict):
+        return None
+    observation = result.get("observation")
+    return observation if isinstance(observation, dict) else None
+
+
+def _has_typed_incident_observation(
+    target: AnalysisTarget,
+    results: list[CollectorResult],
+    candidate_agents: set[str],
+) -> bool:
+    """Whether feedback has a scoped observation from this incident to nudge.
+
+    The feedback channel is derived from prior incident votes/comments.  It can
+    shape the ranking of a verified observation, but neither a compatibility
+    summary nor a card explicitly marked as a historical prior is enough to
+    make that feedback relevant to the current incident.
+    """
+    # A prior is deliberately weaker than live telemetry.  It may only adjust
+    # a score when a typed observation names this incident's resource and
+    # actually occurred inside the alert interval.  Checking just the nested
+    # polarity/coverage envelope let a stale query result (or another Pod's
+    # result returned by a broad query) amplify the current candidate.
+    fired_at = str(target.fired_at or "").strip()
+    resolved_at = str(target.resolved_at or "").strip()
+    entities = _target_entity_tokens(target)
+    if not (fired_at and resolved_at and entities):
+        return False
+
+    from app.services.evidence_blackboard import EvidenceEligibility, normalize_artifact
+
+    context = {
+        "window_start": fired_at,
+        "window_end": resolved_at,
+        "entities": entities,
+    }
+    for result in results:
+        if result.agent not in candidate_agents:
+            continue
+        for card in result.artifacts:
+            observation = _artifact_observation(card)
+            if observation is None:
+                continue
+            payload = getattr(card, "result", None)
+            if (
+                observation.get("historical_prior") is True
+                or isinstance(payload, dict)
+                and payload.get("historical_prior") is True
+            ):
+                continue
+            # Do not inherit the pipeline target for a feedback gate. A
+            # collector must identify the observed entity itself; otherwise a
+            # broad namespace/live result can be relabelled as this Pod.
+            if not _declares_observed_entity(observation):
+                continue
+            try:
+                fact = normalize_artifact(card, require_typed_observation=True)
+            except Exception:  # noqa: BLE001 - malformed evidence cannot ground a prior
+                continue
+            if EvidenceEligibility.from_fact(fact, context=context).support:
+                return True
+    return False
+
+
+def _declares_observed_entity(observation: Mapping[str, object]) -> bool:
+    """Whether a typed observation owns its resource identity explicitly."""
+    entity = observation.get("observed_entity", observation.get("entity"))
+    if isinstance(entity, Mapping):
+        return bool(
+            str(entity.get("kind") or entity.get("type") or "").strip()
+            and str(entity.get("name") or entity.get("id") or "").strip()
+        )
+    return isinstance(entity, str) and bool(entity.strip())
+
+
+def _target_entity_tokens(target: AnalysisTarget) -> list[str]:
+    """Return the concrete alert identities allowed to ground a prior boost."""
+    return [
+        f"{field}:{value}"
+        for field in (
+            "pod",
+            "node",
+            "workload_name",
+            "runai_workload_id",
+            "project",
+            "queue",
+            "namespace",
+            "storage_claim",
+            "service",
+        )
+        if (value := str(getattr(target, field, "") or "").strip())
+    ]
 
 
 def _leaf_text(value: Any, drop_keys: "frozenset[str] | set[str] | None" = None) -> str:
@@ -781,6 +1039,8 @@ def _kg_blast_radius(results: list[CollectorResult]) -> tuple[int, set[str]]:
     best = 0
     agents: set[str] = set()
     for r in results:
+        if r.agent in _SYNTHETIC_AGENTS:
+            continue
         if not _collector_is_evidence(r):
             continue
         raw = r.details.get("blast_radius_workloads") or r.details.get("kg_blast_radius")

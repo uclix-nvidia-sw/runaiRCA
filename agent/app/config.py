@@ -319,15 +319,17 @@ def load_settings() -> Settings:
         typedb_timeout_seconds=_int_env("TYPEDB_TIMEOUT_SECONDS", 60),
         enable_typedb=_bool_env("ENABLE_TYPEDB", False),
         enable_investigation_loop=_bool_env("ENABLE_INVESTIGATION_LOOP", False),
-        # 0 means semantic completion: the outer analysis deadline, exhausted
-        # evidence, or duplicate probes stop work.  Positive values remain a
-        # legacy compatibility override, never the default quality boundary.
-        max_investigation_steps=_nonnegative_int_env("MAX_INVESTIGATION_STEPS", 0),
-        max_reanalysis_steps=_nonnegative_int_env("MAX_REANALYSIS_STEPS", 0),
+        # Bound expensive reasoning rounds; each round may batch many independent
+        # read-only queries, so evidence breadth does not need more LLM loops.
+        max_investigation_steps=_nonnegative_int_env("MAX_INVESTIGATION_STEPS", 3),
+        max_reanalysis_steps=_nonnegative_int_env("MAX_REANALYSIS_STEPS", 3),
         # Per-collector autonomous drill-down: each evidence agent gets its own LLM
         # loop with ONLY its domain's read-only tools (see services/drilldown.py).
         # LLM-gated and best-effort like the investigation loop.
-        enable_agent_drilldown=_bool_env("ENABLE_AGENT_DRILLDOWN", False),
+        enable_agent_drilldown=_bool_env(
+            "ENABLE_AGENT_DRILLDOWN",
+            _bool_env("ENABLE_INVESTIGATION_LOOP", False),
+        ),
         # Overall hard cap on one analysis: agents get generous per-step time above,
         # but the whole run always finishes within this budget. (0 = no overall cap.)
         # Owner priority is accuracy over latency; the backend's

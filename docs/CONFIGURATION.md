@@ -36,7 +36,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `KUBERNETES_LIST_LIMIT` | Kubernetes pod/event list page size for evidence collection, default `50` |
 | `KUBERNETES_NAMESPACES` | Optional comma-separated namespace allowlist for Kubernetes direct collection |
 | `KUBERNETES_CLUSTER_SCOPE_ENABLED` | Enables cluster-scoped Kubernetes calls such as node lookups; Helm follows `agent.rbac.clusterWide` |
-| `KUBERNETES_MCP_URL` | Kubernetes MCP shared-service URL. When set, Kubernetes collection and drill-down call MCP first and fall back to direct Kubernetes API reads on failure |
+| `KUBERNETES_MCP_URL` | Kubernetes MCP shared-service URL. When set, Kubernetes get/list/log collection and drill-down call MCP first and fall back to direct Kubernetes API reads on failure. The separately gated, allowlisted `pods/exec` diagnostics use the agent ServiceAccount because the MCP service intentionally has no exec permission. |
 | `RUNAI_BASE_URL` | Run:ai control plane URL. No chart default; required as `agent.env.runaiBaseUrl` when `runaiMcp.enabled=true` |
 | `RUNAI_BEARER_TOKEN` | Optional Run:ai bearer token secret |
 | `GRAFANA_SERVICE_ACCOUNT_TOKEN` | Grafana service-account token used by the managed `grafanaMcp` service for Prometheus/Loki datasource read/query access |
@@ -58,7 +58,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `LOKI_QUERY_LIMIT` | Maximum log lines requested per Loki query group, default `20` |
 | `LOKI_MCP_URL` | Grafana MCP URL for Loki tools. Helm sets this to the same managed `grafanaMcp` ClusterIP service when enabled; fallback uses `LOKI_URL` |
 | `ENABLE_SYSTEM_AGENT` | Enable the node-infra System collector (dmesg/journalctl/syslog via a per-node DaemonSet), default `true`; degrades to `unavailable` when `SYSTEM_AGENT_URL` is unset |
-| `SYSTEM_AGENT_URL` | Per-node System-agent DaemonSet endpoint (`GET /logs?source=dmesg\|journal\|syslog`) |
+| `SYSTEM_AGENT_URL` | Per-node System-agent DaemonSet endpoint (`GET /logs?source=dmesg\|journal\|syslog`). Historical incident collection passes its exact RFC3339 time window to `journal`; dmesg/syslog remain current-state tails. |
 | `SYSTEM_AGENT_TOKEN` | Optional bearer token for the System-agent endpoint |
 | `SYSTEM_AGENT_TIMEOUT_SECONDS` | System-agent request timeout, default `120` |
 | `ENABLE_POD_EXEC` | Allow the Kubernetes collector read-only pod-exec (allowlisted commands: `nvidia-smi`, …), default `true` |

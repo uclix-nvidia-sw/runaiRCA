@@ -1,8 +1,9 @@
 """Merge timestamped signals across collectors into one time-ordered list.
 
 Lets the synthesis narrate "T0 …, T0+2m …": we pull the events that carry a
-timestamp out of each collector's details (kubernetes warning events, loki log
-lines, system node log lines, change-detection events) and sort them by time.
+timestamp out of each collector's details (kubernetes warning events, Loki log
+lines, Prometheus samples, Postgres audit rows, system node log lines, and
+change-detection events) and sort them by time.
 
 Defensive by design — collectors vary in shape and timestamp format, and the
 no-LLM test suite feeds sample CollectorResults, so every accessor tolerates
@@ -29,9 +30,11 @@ _SYSLOG_PREFIX = re.compile(r"^\s*([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})"
 def build_timeline(results: list[CollectorResult]) -> list[dict]:
     """Return timestamped signals across all collectors, oldest first.
 
-    Each entry: {"timestamp": iso-or-raw str, "source": collector, "kind": str,
-    "message": str}. Entries whose timestamp we cannot parse are kept but sort
-    last (stable) so nothing is silently dropped.
+    Each entry also carries ``evidence_role``. Raw collector details are useful
+    chronological context, but only an ``ok`` collector with an explicit
+    scoped-positive artifact may label its timeline as support. Entries whose
+    timestamp we cannot parse are kept but sort last (stable) so nothing is
+    silently dropped.
     """
     entries: list[dict] = []
     masker = build_masker(())
@@ -39,7 +42,11 @@ def build_timeline(results: list[CollectorResult]) -> list[dict]:
         if result.status not in ("ok", "partial"):
             continue
         try:
-            entries.extend(_sanitize_entry(entry, masker) for entry in _from_result(result))
+            role = _timeline_evidence_role(result)
+            entries.extend(
+                _sanitize_entry({**entry, "evidence_role": role}, masker)
+                for entry in _from_result(result)
+            )
         except Exception:  # noqa: BLE001 - a bad collector shape never breaks the timeline
             continue
     entries.sort(key=lambda e: (_sort_key(e.get("timestamp")), e.get("source", "")))
@@ -55,7 +62,8 @@ def to_markdown(timeline: list[dict], *, limit: int = 30) -> str:
         ts = _clean_timestamp(entry.get("timestamp") or "unknown-time", masker)
         lines.append(
             f"- `{ts}` **{_clean(entry.get('source', '?'), masker, limit=80)}** "
-            f"({_clean(entry.get('kind', 'event'), masker, limit=120)}): "
+            f"({_clean(entry.get('kind', 'event'), masker, limit=120)}, "
+            f"{_clean(entry.get('evidence_role', 'context'), masker, limit=16)}): "
             f"{_clean(entry.get('message', ''), masker, limit=300)}"
         )
     if len(timeline) > limit:
@@ -72,9 +80,26 @@ def _from_result(result: CollectorResult) -> list[dict]:
         return _from_kubernetes(details)
     if agent == "loki":
         return _from_loki(details)
+    if agent == "prometheus":
+        return _from_prometheus(details)
+    if agent == "postgres":
+        return _from_postgres(details)
     if agent == "system":
         return _from_system(details)
     return []
+
+
+def _timeline_evidence_role(result: CollectorResult) -> str:
+    """Keep untyped or incomplete raw details from becoming causal evidence.
+
+    Timeline projections are derived from aggregate collector ``details`` and
+    do not retain a one-to-one artifact/fact ID.  A completed collector may mix
+    a scoped-positive query with a partial query, so collector-level promotion
+    would make the latter a causal side channel.  Until every timeline entry
+    carries exact typed-artifact provenance, use it only as chronology and keep
+    direct support in the evidence blackboard.
+    """
+    return "context"
 
 
 def _from_change(details: dict) -> list[dict]:
@@ -116,6 +141,23 @@ def _from_loki(details: dict) -> list[dict]:
     for query in _list(details.get("queries")):
         query = _dict(query)
         name = query.get("name") or "loki"
+        # Native Loki responses retain streams/values. grafana-mcp instead
+        # commonly returns a flat [{timestamp, line, labels}] list; keep both
+        # contracts on the causal timeline instead of treating successful MCP
+        # log collection as timestamp-less context.
+        for entry in _list(query.get("sample_entries")):
+            entry = _dict(entry)
+            line = _str(entry.get("line") or entry.get("message"))
+            if not line:
+                continue
+            out.append(
+                {
+                    "timestamp": _timestamp_to_iso(entry.get("timestamp")),
+                    "source": "loki",
+                    "kind": str(name),
+                    "message": line[:300],
+                }
+            )
         for stream in _list(query.get("sample")):
             for pair in _list(_dict(stream).get("values")):
                 if not isinstance(pair, list) or len(pair) < 2:
@@ -128,6 +170,67 @@ def _from_loki(details: dict) -> list[dict]:
                         "message": _str(pair[1])[:300],
                     }
                 )
+    return out
+
+
+def _from_prometheus(details: dict) -> list[dict]:
+    """Project bounded metric samples into causal evidence.
+
+    Prometheus range results are already compacted by the collector. Keeping
+    returned samples makes an explicit zero/false visible beside events and
+    logs, rather than leaving synthesis to infer it from extrema alone.
+    """
+    out = []
+    for query in _list(details.get("queries")):
+        query = _dict(query)
+        name = str(query.get("name") or "prometheus")
+        for series in _list(query.get("sample")):
+            series = _dict(series)
+            labels = _prometheus_labels(series.get("metric"))
+            suffix = f" {{{labels}}}" if labels else ""
+            for timestamp, value in _prometheus_pairs(series):
+                out.append(
+                    {
+                        "timestamp": _timestamp_to_iso(timestamp),
+                        "source": "prometheus",
+                        "kind": name,
+                        "message": f"{name}{suffix} = {value}",
+                    }
+                )
+    return out
+
+
+def _from_postgres(details: dict) -> list[dict]:
+    """Add incident-window audit rows without exposing SQL or arbitrary schema."""
+    out = []
+    history = _dict(details.get("incident_history"))
+    for table in _list(history.get("tables")):
+        table = _dict(table)
+        schema = _str(table.get("schema"))
+        name = _str(table.get("table"))
+        kind = f"audit.{schema + '.' if schema else ''}{name or 'history'}"
+        # New collectors retain all time-window rows for diagnostics but only
+        # project target-correlated rows into causal evidence. Keep ``rows`` as
+        # a compatibility fallback for older stored analysis results.
+        rows = table.get("target_rows") if "target_rows" in table else table.get("rows")
+        for row in _list(rows):
+            row = _dict(row)
+            timestamp = row.get("event_time")
+            if not timestamp:
+                continue
+            fields = [
+                f"{key}={_str(value)}"
+                for key, value in sorted(row.items())
+                if key != "event_time" and value not in (None, "")
+            ]
+            out.append(
+                {
+                    "timestamp": _timestamp_to_iso(timestamp),
+                    "source": "postgres",
+                    "kind": kind,
+                    "message": "; ".join(fields)[:300] or "audit history record",
+                }
+            )
     return out
 
 
@@ -158,6 +261,39 @@ def _loki_ns_to_iso(value: object) -> str:
         return _str(value)
 
 
+def _timestamp_to_iso(value: object) -> str:
+    """Normalize Prometheus seconds and Loki nanoseconds while retaining RFC3339."""
+    text = _str(value)
+    try:
+        numeric = float(text)
+    except (TypeError, ValueError):
+        return text
+    # Loki uses nanoseconds, while Prometheus range samples use seconds.
+    seconds = numeric / 1e9 if abs(numeric) >= 1e12 else numeric
+    try:
+        return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
+    except (ValueError, OSError, OverflowError):
+        return text
+
+
+def _prometheus_pairs(series: dict) -> list[tuple[object, object]]:
+    values = series.get("values")
+    if not isinstance(values, list):
+        value = series.get("value")
+        values = [value] if isinstance(value, list) else []
+    return [
+        (pair[0], pair[1])
+        for pair in values
+        if isinstance(pair, list) and len(pair) >= 2
+    ]
+
+
+def _prometheus_labels(raw: object) -> str:
+    labels = _dict(raw)
+    allowed = ("namespace", "pod", "container", "node", "condition", "phase", "project", "queue")
+    return ", ".join(f"{key}={_str(labels[key])}" for key in allowed if labels.get(key))
+
+
 def _timestamp_from_line(line: str) -> str:
     match = _ISO_PREFIX.match(line) or _SYSLOG_PREFIX.match(line)
     return match.group(1) if match else ""
@@ -180,6 +316,9 @@ def _sanitize_entry(entry: dict, masker: Masker) -> dict:
         "source": _clean(entry.get("source"), masker, limit=80),
         "kind": _clean(entry.get("kind"), masker, limit=120),
         "message": _clean(entry.get("message"), masker, limit=300),
+        "evidence_role": (
+            "support" if str(entry.get("evidence_role") or "").casefold() == "support" else "context"
+        ),
     }
 
 

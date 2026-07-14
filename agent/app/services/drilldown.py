@@ -41,9 +41,13 @@ from app.collectors.base import (
     AnalysisTarget,
     CollectorResult,
     artifact,
+    causal_evidence_time_range,
+    incident_time_range,
+    kubernetes_salient_markers,
     salient_markers,
     signals_line,
 )
+from app.collectors.change import change_query
 from app.collectors.http_json import get_json
 from app.collectors.kubernetes import (
     _EXEC_ALLOWLIST,
@@ -54,8 +58,15 @@ from app.collectors.kubernetes import (
     k8s_read,
     kind_lookup_title,
     kubectl_repr,
+    resolve_read_kind,
 )
-from app.collectors.loki import _loki_headers, _loki_streams, _sample_lines, loki_mcp_query
+from app.collectors.loki import (
+    _loki_headers,
+    _loki_native_response_complete,
+    _loki_streams,
+    _sample_lines,
+    loki_mcp_query,
+)
 from app.collectors.prometheus import prom_mcp_query, prom_query
 from app.collectors.runai_mcp import _tool_json, _tool_text
 from app.config import Settings
@@ -75,6 +86,10 @@ _log = logging.getLogger(__name__)
 
 _RESULT_CHARS = 1500  # per-query result excerpt fed back into the loop
 _USER_PROMPT_CHARS = 6000
+# An adapter-owned sentinel cannot be supplied by a JSON/MCP response.  It
+# separates a collector-built observation envelope from arbitrary remote data
+# that happens to contain `observation`, `polarity`, or `coverage` fields.
+_VERIFIED_OBSERVATION = object()
 
 
 async def run_drilldowns(
@@ -171,7 +186,8 @@ async def _drill_one(
                 probe_attempts=probe_attempts,
             )
         step = 0
-        while True:
+        decision_round_limit = settings.max_investigation_steps or 3
+        while step < decision_round_limit:
             if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
                 result.warnings.append(
                     f"{result.agent} drill-down stopped: shared evidence budget exhausted"
@@ -207,6 +223,12 @@ async def _drill_one(
             for q in decision.get("queries") or []:
                 if not isinstance(q, dict) or str(q.get("tool") or "") not in tools:
                     continue
+                if not _valid_domain_query(q):
+                    # Do not turn a PromQL/LogQL name hallucinated as a
+                    # Kubernetes kind into an unavailable evidence card. The
+                    # tool descriptions already name the valid kinds; keeping
+                    # this out of the history also prevents repeated noise.
+                    continue
                 key = _query_fingerprint(q)
                 if key in seen_queries:
                     continue
@@ -224,10 +246,25 @@ async def _drill_one(
                 step + 1,
                 len(queries),
             )
-            for q in queries:
-                await _run_query(
-                    settings, result, tools, target, plan, q, history, masker, blackboard=blackboard
+            # The model batches independent read-only discriminators in one
+            # reasoning round. Run that batch concurrently: the round limit is
+            # deliberately small (three), while evidence breadth is not.
+            await asyncio.gather(
+                *(
+                    _run_query(
+                        settings,
+                        result,
+                        tools,
+                        target,
+                        plan,
+                        q,
+                        history,
+                        masker,
+                        blackboard=blackboard,
+                    )
+                    for q in queries
                 )
+            )
     except Exception as exc:  # noqa: BLE001 - drill-down is best-effort; base evidence stands
         result.warnings.append(
             f"{result.agent} drill-down aborted: "
@@ -262,7 +299,7 @@ async def _run_query(
 ) -> None:
     """Execute one registry-validated query and preserve its observation."""
     name = str(query.get("tool") or "")
-    if name not in tools:
+    if name not in tools or not _valid_domain_query(query):
         return
     args = query.get("args") if isinstance(query.get("args"), dict) else {}
     outcome = await _call_tool_safely(tools[name]["call"], settings, target, args)
@@ -270,10 +307,24 @@ async def _run_query(
     if not isinstance(outcome, dict):
         outcome = {"error": "tool returned no result"}
     error = outcome.get("error")
+    artifact_result = _typed_artifact_result(
+        outcome, error=error, tool=name, artifact_type=artifact_type
+    )
     probe = query.get("_ontology_probe")
     execution: dict[str, Any] = {}
     if artifact_type == "ontology_probe" and isinstance(probe, dict):
-        assessment = evaluate_probe(probe, outcome).as_dict()
+        # Evaluate against the final artifact envelope, not the raw tool
+        # response. A remote payload can repeat a signal token (and even
+        # top-level polarity/coverage fields) without being scoped evidence.
+        assessment_outcome = {
+            "status": "unavailable" if error else "ok",
+            "error": error,
+            "result": artifact_result,
+            "observation": artifact_result.get("observation"),
+        }
+        assessment = evaluate_probe(
+            probe, assessment_outcome, require_scoped_observation=True
+        ).as_dict()
         template_id = _template_id(probe)
         attempts = probe_attempts if probe_attempts is not None else {}
         attempt_index = attempts.get(template_id, 0) + 1
@@ -307,7 +358,11 @@ async def _run_query(
     note = str(outcome.get("mcp_fallback") or "")
     if note and note not in result.warnings:
         result.warnings.append(note)
-    markers = [] if error else salient_markers(outcome.get("result"))
+    markers = [] if error else (
+        kubernetes_salient_markers(outcome.get("result"))
+        if result.agent == "kubernetes"
+        else salient_markers(outcome.get("result"))
+    )
     summary = str(outcome.get("summary") or error or name)
     if markers:
         summary = f"{summary} — {signals_line(markers, getattr(settings, 'language', 'en'))}"
@@ -322,7 +377,7 @@ async def _run_query(
             title=outcome.get("title"),
             highlights=markers or None,
             summary=summary,
-            result=outcome.get("result"),
+            result=artifact_result,
         )
     )
     if artifact_type == "ontology_probe" and isinstance(probe, dict):
@@ -333,6 +388,59 @@ async def _run_query(
             if evidence_id := str(getattr(stored_artifact, "evidence_id", "") or ""):
                 assessments[-1]["evidence_ids"] = [evidence_id]
     _record_blackboard(blackboard, result, target)
+
+
+def _typed_artifact_result(
+    outcome: dict[str, Any], *, error: object, tool: str, artifact_type: str
+) -> dict[str, Any]:
+    """Keep a drilldown tool's verdict attached to its displayed result.
+
+    Tool adapters sometimes put ``polarity``/``coverage`` beside ``result``.
+    Dropping that envelope makes a partial current-state observation look like
+    an unstructured successful artifact, which legacy ranking treats as proof.
+    Unknown is the safe default for adapters that have not yet declared a
+    bounded observation contract.
+    """
+    raw_result = outcome.get("result")
+    payload = dict(raw_result) if isinstance(raw_result, dict) else {"data": raw_result}
+    # A response body is untrusted data, even when its HTTP request succeeded.
+    # In particular, a Run:ai/Kubernetes API object is free to contain a field
+    # named ``observation``; treating that field as our evidence envelope would
+    # let a remote response assert ``present/scoped`` without proving the
+    # requested entity, value, or incident window. Only an adapter can opt in
+    # to a typed verdict it constructed and validated itself.
+    verified_observation = outcome.get("_verified_observation") is _VERIFIED_OBSERVATION
+    top_level_observation = outcome.get("observation")
+    observation = (
+        dict(top_level_observation)
+        if verified_observation and isinstance(top_level_observation, dict)
+        else {}
+    )
+    polarity = str(observation.get("polarity") or outcome.get("polarity") or "").lower()
+    coverage = str(observation.get("coverage") or outcome.get("coverage") or "").lower()
+    if polarity not in {"present", "absent", "unknown", "unavailable"}:
+        polarity = "unavailable" if error else "unknown"
+    if coverage not in {"scoped", "partial", "unknown"}:
+        coverage = "unknown" if polarity == "unavailable" else "partial"
+    # The convenience top-level ``polarity``/``coverage`` fields remain useful
+    # for partial operational context, but must not by themselves promote a
+    # successful transport into causal support. Scoped positive/negative
+    # semantics are reserved for a tool adapter that set the marker above.
+    if not verified_observation and polarity in {"present", "absent"} and coverage == "scoped":
+        polarity, coverage = "unknown", "partial"
+    observation = {
+        **observation,
+        "kind": str(observation.get("kind") or artifact_type),
+        "predicate": str(observation.get("predicate") or outcome.get("predicate") or tool),
+        "polarity": polarity,
+        "coverage": coverage,
+    }
+    if "observation_window" not in observation and isinstance(
+        outcome.get("observation_window"), dict
+    ):
+        observation["observation_window"] = outcome["observation_window"]
+    payload["observation"] = observation
+    return payload
 
 
 _PROBE_PLACEHOLDER = re.compile(r"{{([a-zA-Z_][a-zA-Z0-9_]*)}}")
@@ -439,6 +547,14 @@ def _query_fingerprint(query: dict[str, Any]) -> str:
     )
 
 
+def _valid_domain_query(query: dict[str, Any]) -> bool:
+    """Reject malformed per-domain arguments before invoking a transport."""
+    if str(query.get("tool") or "") != "k8s_read":
+        return True
+    args = query.get("args")
+    return isinstance(args, dict) and resolve_read_kind(str(args.get("kind") or "")) is not None
+
+
 def _resolve_probe_template(value: Any, values: dict[str, str]) -> Any | None:
     if isinstance(value, dict):
         resolved = {str(key): _resolve_probe_template(item, values) for key, item in value.items()}
@@ -527,6 +643,11 @@ def _system_prompt(agent: str, tools: dict[str, dict[str, Any]]) -> str:
         "follow-up queries that would confirm or refute it. When a lead is ambiguous, "
         "re-query with a NARROWER scope (one pod, one namespace, one metric series, a "
         "tighter time filter or regex) to pin it down.\n"
+        "- A condition name or metric label alone is not a failure. Verify its status and "
+        "sample value; False or zero is refuting evidence, not a positive signal.\n"
+        "- For a named alert pod, inspect full Pod YAML and describe-level status/events before "
+        "broad namespace/project reads. If a container is waiting, terminated, or restarted, "
+        "inspect that container's logs (including the prior instance when available).\n"
         "- Fetch data RELATED to the incident — the workload's controller, its "
         "project/queue, the Run:ai control-plane component involved, correlated "
         "namespaces and time windows — never your own datasource's health (the base "
@@ -543,7 +664,9 @@ def _system_prompt(agent: str, tools: dict[str, dict[str, Any]]) -> str:
         "command. If it includes structured probes, use only probes whose tool is in your "
         "registry and resolve their placeholders from the incident scope.\n"
         "- Stay strictly read-only and inside your tools, and avoid blind sweeps — every "
-        "query must test a specific idea.\n"
+        "query must test a specific idea. Batch all independent checks you can run now "
+        "into the same queries array; query count is not the scarce resource, reasoning "
+        "rounds are.\n"
         f"Tools available to you (your only tools; there are no others):\n{tool_lines}\n"
         'Respond with ONLY JSON: {"action":"query"|"done","reason":str,'
         '"queries":[{"tool":str,"args":{...}}]}.'
@@ -615,13 +738,24 @@ def _record_blackboard(blackboard: Any, result: CollectorResult, target: Analysi
         ),
         "",
     )
+    causal_window = causal_evidence_time_range(target) or {}
     try:
         method(
             result.agent,
             result,
             entity=entity,
             timestamp=str(getattr(target, "fired_at", "") or ""),
+            observed_window_start=str(causal_window.get("start") or ""),
+            observed_window_end=str(causal_window.get("end") or ""),
         )
+    except TypeError:
+        # Compatibility with custom blackboards that only implement the
+        # original two-argument protocol. The built-in board always receives
+        # the historical window above.
+        try:
+            method(result.agent, result)
+        except Exception:  # noqa: BLE001 - shared reasoning is advisory
+            return
     except Exception:  # noqa: BLE001 - shared reasoning is advisory
         return
 
@@ -924,7 +1058,8 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
                 "description": (
                     "Read a pod's container logs (tail). USE THIS to inspect what a pod "
                     "actually logged. args: pod, namespace, container? (defaults to the "
-                    "pod's main container), tail? (line count)"
+                    "pod's main container), tail? (line count), previous? (true for the "
+                    "prior terminated container instance)."
                 ),
                 "call": _tool_k8s_logs,
             },
@@ -936,6 +1071,15 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
                     "kind, name, namespace?"
                 ),
                 "call": _tool_k8s_describe,
+            },
+            "k8s_change_timeline": {
+                "description": (
+                    "Read a bounded Kubernetes change timeline for controller/pod/event/helm "
+                    "metadata. USE THIS for deployment or rollout history; do not invent a "
+                    "deployment_history resource. args: source (all|controller|pod|event|helm), "
+                    "component?, lookback_seconds?"
+                ),
+                "call": _tool_k8s_change_timeline,
             },
         }
     }
@@ -1065,22 +1209,45 @@ async def _tool_k8s_read(settings: Settings, target: AnalysisTarget, args: dict)
     }
 
 
+async def _tool_k8s_change_timeline(
+    settings: Settings, target: AnalysisTarget, args: dict
+) -> dict:
+    # ``change_query`` constructs and bounds its own observation contract:
+    # target correlation and the incident window are verified by the collector.
+    # Mark that *adapter-produced* envelope explicitly, so a similarly named
+    # field in arbitrary remote JSON never gains causal authority.
+    outcome = await change_query(settings, target, args)
+    if isinstance(outcome, dict) and isinstance(outcome.get("observation"), dict):
+        outcome["_verified_observation"] = _VERIFIED_OBSERVATION
+    return outcome
+
+
 async def _tool_k8s_logs(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
     pod = str(args.get("pod") or args.get("name") or target.pod or "")
     namespace = str(args.get("namespace") or target.namespace or "")
     container = str(args.get("container") or "")
+    previous = args.get("previous") is True or str(args.get("previous") or "").lower() == "true"
     try:
         tail = int(args.get("tail") or 0)
     except (TypeError, ValueError):
         tail = 0
-    item = await k8s_logs(settings, namespace, pod, container=container, tail=tail)
+    time_range = incident_time_range(target)
+    item = await k8s_logs(
+        settings,
+        namespace,
+        pod,
+        container=container,
+        tail=tail,
+        previous=previous,
+        since_time=str((time_range or {}).get("start") or ""),
+    )
     error = item.get("error")
     lines = item.get("lines") or []
     ns_flag = f" -n {namespace}" if namespace else ""
     c_flag = f" -c {container}" if container else ""
     return {
-        "query": f"kubectl logs {pod}{ns_flag}{c_flag}",
-        "title": _title(settings, "Pod 로그", "Pod logs"),
+        "query": f"kubectl logs {pod}{ns_flag}{c_flag}" + (" --previous" if previous else ""),
+        "title": _title(settings, "이전 컨테이너 로그" if previous else "Pod 로그", "Previous container logs" if previous else "Pod logs"),
         "summary": str(error) if error else f"{len(lines)} log line(s)",
         "error": error,
         "result": item,
@@ -1092,7 +1259,13 @@ async def _tool_k8s_describe(settings: Settings, target: AnalysisTarget, args: d
     kind = str(args.get("kind") or "")
     namespace = str(args.get("namespace") or target.namespace or "")
     name = str(args.get("name") or "")
-    item = await k8s_describe(settings, kind, namespace=namespace, name=name)
+    item = await k8s_describe(
+        settings,
+        kind,
+        namespace=namespace,
+        name=name,
+        time_range=incident_time_range(target),
+    )
     error = item.get("error")
     events = item.get("events") or []
     ns_flag = f" -n {namespace}" if namespace else ""
@@ -1134,14 +1307,21 @@ async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -
             "error": "empty PromQL query",
         }
     fallback = ""
+    time_range = incident_time_range(target)
     if settings.prometheus_mcp_url:
         try:
-            item = await prom_mcp_query(settings, "drilldown", promql)
+            item = await prom_mcp_query(
+                settings,
+                "drilldown",
+                promql,
+                time_range=time_range,
+            )
+            error = item.get("error")
             return {
                 "query": promql,
                 "title": title,
-                "summary": "MCP query_prometheus ok",
-                "error": None,
+                "summary": str(error) if error else "MCP query_prometheus ok",
+                "error": error,
                 "result": item,
             }
         except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
@@ -1150,7 +1330,7 @@ async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -
         fallback = f"{MCP_FALLBACK_WARNING}: PROMETHEUS_MCP_URL not configured"
     if not settings.prometheus_url:
         return {"query": promql, "title": title, "summary": fallback, "error": fallback}
-    item = await prom_query(settings, "drilldown", promql)
+    item = await prom_query(settings, "drilldown", promql, time_range=time_range)
     error = item.get("error")
     summary = str(error) if error else f"HTTP {item.get('status_code')}"
     return {
@@ -1174,14 +1354,21 @@ async def _tool_logql(settings: Settings, target: AnalysisTarget, args: dict) ->
             "error": "empty LogQL query",
         }
     fallback = ""
+    time_range = incident_time_range(target)
     if settings.loki_mcp_url:
         try:
-            item = await loki_mcp_query(settings, "drilldown", logql)
+            item = await loki_mcp_query(
+                settings,
+                "drilldown",
+                logql,
+                time_range=time_range,
+            )
+            error = item.get("error")
             return {
                 "query": logql,
                 "title": title,
-                "summary": f"{item.get('line_count', 0)} MCP log line(s)",
-                "error": None,
+                "summary": str(error) if error else f"{item.get('line_count', 0)} MCP log line(s)",
+                "error": error,
                 "result": item,
             }
         except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
@@ -1199,11 +1386,16 @@ async def _tool_logql(settings: Settings, target: AnalysisTarget, args: dict) ->
             "query": logql,
             "limit": str(settings.loki_query_limit),
             "direction": "BACKWARD",
+            **(time_range or {}),
         },
         headers=headers,
     )
-    if response.error or not response.ok:
-        error = response.error or f"HTTP {response.status_code}"
+    if response.error or not response.ok or not _loki_native_response_complete(response.data):
+        error = (
+            response.error
+            or (f"HTTP {response.status_code}" if not response.ok else "")
+            or "Loki response missing successful data.result"
+        )
         return {
             "query": logql,
             "title": title,
@@ -1311,6 +1503,8 @@ async def _run_select(dsn: str, sql: str, timeout: int) -> list[dict]:
 
 
 async def _run_select_mcp(settings: Settings, sql: str) -> list[dict]:
+    from app.collectors.postgres import _mcp_postgres_rows
+
     result = await mcp_call(settings.postgres_mcp_url, "query", {"sql": sql})
     error = mcp_error(result)
     if error:
@@ -1318,7 +1512,10 @@ async def _run_select_mcp(settings: Settings, sql: str) -> list[dict]:
     data = mcp_tool_json(result)
     if isinstance(data, dict) and "raw" in data:
         raise RuntimeError("MCP result was not JSON")
-    return [row for row in _postgres_rows(data)[:50] if isinstance(row, dict)]
+    rows = _mcp_postgres_rows(data)
+    if rows is None:
+        raise RuntimeError("Postgres MCP response missing a recognized row result")
+    return [row for row in rows[:50] if isinstance(row, dict)]
 
 
 def _postgres_rows(data: Any) -> list[Any]:

@@ -117,7 +117,8 @@ records which path supplied evidence.
 For an Alertmanager alert with `startsAt`, Loki queries use the incident window:
 five minutes before the alert through five minutes after `endsAt`. A firing
 alert without an end time is capped at 20 minutes after it started. The direct
-Loki API receives `start`/`end`; Grafana MCP receives `startTime`/`endTime`.
+Loki API receives `start`/`end`; Grafana MCP receives
+`startRfc3339`/`endRfc3339`.
 Alerts without a parseable start time retain the datasource's normal recent
 window.
 
@@ -174,6 +175,9 @@ not an incoming webhook (`chat.postMessage` returns the `ts` needed to thread).
   incident (root message) and later **operator-driven** re-analyses
   (`manual`/`comment`/`feedback`/`chat`, as thread replies) post. Auto/backfill
   follow-ups and failed runs are intentionally silent.
+- **Resolved messages appear separately.** Set `send_resolved: false` on the
+  direct Alertmanager Slack receiver and keep it `true` on the RCA webhook.
+  The Backend then posts the resolved transition in the initial-analysis thread.
 - The **Open Incident** button needs `DASHBOARD_URL` set. The **Re-analyze**
   button needs `SLACK_APP_TOKEN` (Socket Mode + Interactivity enabled in the app).
 

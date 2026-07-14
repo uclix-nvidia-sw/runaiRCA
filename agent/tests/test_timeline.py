@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.collectors.base import CollectorResult
+from app.collectors.base import CollectorResult, artifact
 from app.services.timeline import build_timeline, to_markdown
 
 
@@ -49,6 +49,73 @@ def test_merges_and_orders_across_collectors() -> None:
         ("system", "dmesg"),
     ]
     assert timeline[1]["timestamp"].startswith("2026-07-02T10:01:00")  # loki ns -> iso
+
+
+def test_merges_prometheus_postgres_and_flat_loki_mcp_entries() -> None:
+    results = [
+        CollectorResult(
+            agent="prometheus",
+            status="ok",
+            summary="",
+            details={
+                "queries": [
+                    {
+                        "name": "memory_pressure",
+                        "sample": [
+                            {
+                                "metric": {"node": "gpu-01", "condition": "MemoryPressure"},
+                                "values": [["1782986400", "0"], ["1782986520", "1"]],
+                            }
+                        ],
+                    }
+                ]
+            },
+        ),
+        CollectorResult(
+            agent="postgres",
+            status="ok",
+            summary="",
+            details={
+                "incident_history": {
+                    "tables": [
+                        {
+                            "schema": "audit",
+                            "table": "workload_history",
+                            "rows": [
+                                {"event_time": "2026-07-02T10:01:30Z", "action": "suspended"}
+                            ],
+                        }
+                    ]
+                }
+            },
+        ),
+        CollectorResult(
+            agent="loki",
+            status="ok",
+            summary="",
+            details={
+                "queries": [
+                    {
+                        "name": "scheduler_errors",
+                        "sample_entries": [
+                            {"timestamp": "2026-07-02T10:01:00Z", "line": "preemption denied"}
+                        ],
+                    }
+                ]
+            },
+        ),
+    ]
+
+    timeline = build_timeline(results)
+
+    assert [(entry["source"], entry["kind"]) for entry in timeline] == [
+        ("prometheus", "memory_pressure"),
+        ("loki", "scheduler_errors"),
+        ("postgres", "audit.audit.workload_history"),
+        ("prometheus", "memory_pressure"),
+    ]
+    assert timeline[0]["message"] == "memory_pressure {node=gpu-01, condition=MemoryPressure} = 0"
+    assert timeline[2]["message"] == "action=suspended"
 
 
 def test_unparseable_timestamps_sort_last_not_dropped() -> None:
@@ -126,6 +193,66 @@ def test_unavailable_collector_details_are_not_timeline_evidence() -> None:
         ),
     ]
     assert build_timeline(results) == []
+
+
+def test_partial_raw_timeline_is_context_not_causal_support() -> None:
+    result = CollectorResult(
+        agent="change",
+        status="partial",
+        summary="response was truncated",
+        details={
+            "changes": [
+                {
+                    "timestamp": "2026-07-02T10:00:00Z",
+                    "kind": "Deployment",
+                    "summary": "rollout near the incident",
+                }
+            ]
+        },
+    )
+
+    [entry] = build_timeline([result])
+
+    assert entry["evidence_role"] == "context"
+
+
+def test_scoped_query_does_not_promote_sibling_raw_timeline_entries() -> None:
+    result = CollectorResult(
+        agent="loki",
+        status="ok",
+        summary="",
+        details={
+            "queries": [
+                {
+                    "name": "verified",
+                    "sample_entries": [
+                        {"timestamp": "2026-07-02T10:00:00Z", "line": "verified entry"}
+                    ],
+                },
+                {
+                    "name": "unverified",
+                    "sample_entries": [
+                        {"timestamp": "2026-07-02T10:01:00Z", "line": "partial entry"}
+                    ],
+                },
+            ]
+        },
+        artifacts=[
+            artifact(
+                agent="loki",
+                source="loki",
+                type="logql_signal",
+                status="ok",
+                confidence="high",
+                summary="verified query",
+                result={"observation": {"polarity": "present", "coverage": "scoped"}},
+            )
+        ],
+    )
+
+    timeline = build_timeline([result])
+
+    assert [entry["evidence_role"] for entry in timeline] == ["context", "context"]
 
 
 def test_timeline_masks_sensitive_messages_at_capture() -> None:

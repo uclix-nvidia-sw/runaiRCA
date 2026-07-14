@@ -22,6 +22,7 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 	autoAnalyses := 0
 	autoAlertIDs := map[string]struct{}{}
 	autoAlertOrder := []string{}
+	resolvedIncidentIDs := map[string]struct{}{}
 	for _, alert := range webhook.Alerts {
 		if ignoredAlert(alert) {
 			ignored++
@@ -33,12 +34,21 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 		if result.Changed {
 			s.hub.Broadcast(alertCreatedEvent(incident, record))
 		}
+		if result.IncidentResolved {
+			resolvedIncidentIDs[incident.IncidentID] = struct{}{}
+		}
 		if status(alert.Status) != "resolved" && s.autoAnalyzeAllowed(alert) {
 			if _, queued := autoAlertIDs[record.AlertID]; !queued {
 				autoAlertIDs[record.AlertID] = struct{}{}
 				autoAlertOrder = append(autoAlertOrder, record.AlertID)
 			}
 		}
+	}
+	// Resolve notifications are emitted after the whole Alertmanager batch is
+	// applied. A resolved-then-firing pair in one payload therefore cannot leave
+	// a stale "Resolved" reply on an incident that is firing again.
+	for incidentID := range resolvedIncidentIDs {
+		s.notifySlackResolution(incidentID)
 	}
 	for _, alertID := range autoAlertOrder {
 		if autoAnalyses >= s.autoFanoutLimit() {

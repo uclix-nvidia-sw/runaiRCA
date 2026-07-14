@@ -6,7 +6,7 @@ empty (the exact production case: system agent unreachable, loki failed)."""
 from __future__ import annotations
 
 from app.collectors.base import CollectorResult, artifact
-from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+from app.knowledge import _keyword_hits, load_failure_modes, match_failure_mode_symptoms
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services.pipeline import (
     _alert_text,
@@ -33,6 +33,30 @@ def _xid_request() -> AlertAnalysisRequest:
 def test_xid_code_extracted_from_alert_text_alone() -> None:
     # No collector evidence at all — the code must still come from the alert.
     assert _xid_codes_from_results([], _alert_text(_xid_request())) == [79]
+
+
+def test_alert_condition_false_is_not_dependent_on_label_order() -> None:
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            # State deliberately appears first: the old value-only flattening
+            # could miss that it negates the condition.
+            labels={
+                "status": "false",
+                "condition": "DiskPressure",
+                "alertname": "Node condition check",
+            },
+            annotations={},
+            fingerprint="fp-false-condition",
+        )
+    )
+
+    text = _alert_text(request)
+    hits, negated = _keyword_hits(text.lower(), ["diskpressure"])
+
+    assert "DiskPressure is false" in text
+    assert hits == []
+    assert negated is True
 
 
 def test_xid_code_extracted_from_drilldown_artifact() -> None:
@@ -67,6 +91,73 @@ def test_xid_code_extracted_from_structured_artifact_value() -> None:
         )
     )
     assert _xid_codes_from_results([result]) == [79]
+
+
+def test_xid_code_ignores_structured_context_only_text() -> None:
+    # A current/live snapshot can mention an old Xid in its summary, payload, or
+    # details.  Once a collector emits observations, only a present+scoped one
+    # may promote the GPU root cause.
+    result = CollectorResult(
+        agent="system",
+        status="ok",
+        summary="current dmesg still contains Xid 79",
+        details={"last_dmesg_line": "NVRM: Xid 79 GPU has fallen off the bus"},
+    )
+    result.artifacts.append(
+        artifact(
+            agent="system",
+            source="system",
+            type="node_logs",
+            status="ok",
+            confidence="low",
+            summary="current log snapshot mentions Xid 79",
+            result={
+                "lines": ["NVRM: Xid 79 GPU has fallen off the bus"],
+                "observation": {"polarity": "unknown", "coverage": "partial"},
+            },
+        )
+    )
+    assert _xid_codes_from_results([result]) == []
+
+
+def test_xid_code_uses_structured_scoped_positive_observation() -> None:
+    result = CollectorResult(agent="system", status="ok", summary="checked incident journal")
+    result.artifacts.append(
+        artifact(
+            agent="system",
+            source="system",
+            type="node_logs",
+            status="ok",
+            confidence="high",
+            summary="incident journal contains Xid 79",
+            result={
+                "lines": ["NVRM: Xid 79 GPU has fallen off the bus"],
+                "observation": {"polarity": "present", "coverage": "scoped"},
+            },
+        )
+    )
+    assert _xid_codes_from_results([result]) == [79]
+
+
+def test_xid_code_ignores_contextually_ineligible_scoped_artifact() -> None:
+    """The signature path must honor the same E-id gate as catalog ranking."""
+    result = CollectorResult(agent="system", status="ok", summary="checked incident journal")
+    card = artifact(
+        agent="system",
+        source="system",
+        type="node_logs",
+        status="ok",
+        confidence="high",
+        summary="recovery-time journal contains Xid 79",
+        result={
+            "lines": ["NVRM: Xid 79 GPU has fallen off the bus"],
+            "observation": {"polarity": "present", "coverage": "scoped"},
+        },
+    )
+    card.evidence_id = "E01"
+    result.artifacts.append(card)
+
+    assert _xid_codes_from_results([result], eligible_support_ids=set()) == []
 
 
 def test_unavailable_artifact_xid_is_not_evidence() -> None:

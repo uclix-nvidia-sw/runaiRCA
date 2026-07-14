@@ -118,7 +118,16 @@ def validate_evidence_links(
             continue
         eligibility = (eligibility_by_id or {}).get(link.fact_id)
         permits = getattr(eligibility, "permits", None)
-        if callable(permits) and not permits(link.role):
+        if not callable(permits):
+            # A pipeline-provided map is the context-aware target/window/run
+            # gate.  An ID missing from it is not a legacy success fallback:
+            # it was not resolved to an eligible blackboard fact, so cannot
+            # become support merely because a caller cited it explicitly.
+            errors.append(
+                f"link[{index}] has no eligibility verdict for {link.fact_id!r}"
+            )
+            continue
+        if not permits(link.role):
             reason = str(getattr(eligibility, "reason", "") or "ineligible observation")
             errors.append(
                 f"link[{index}] cannot use {link.fact_id!r} as {link.role}: {reason}"
@@ -168,7 +177,15 @@ def evaluate(
         for item in all_artifacts
         if getattr(item, "evidence_id", "")
     ]
-    eligibility_by_id = dict(evidence_eligibility or _artifact_eligibility(all_artifacts))
+    # ``None`` means this standalone harness caller has no blackboard context,
+    # so derive typed artifact eligibility locally.  An explicitly supplied
+    # (including empty) map is authoritative and must remain fail-closed for
+    # evidence IDs it does not contain.
+    eligibility_by_id = (
+        dict(_artifact_eligibility(all_artifacts))
+        if evidence_eligibility is None
+        else dict(evidence_eligibility)
+    )
     supplied_links = _supplied_evidence_links(response, top, evidence_links)
     links, link_errors = validate_evidence_links(
         supplied_links, all_ids, eligibility_by_id=eligibility_by_id
@@ -177,7 +194,19 @@ def evaluate(
     # callers provide explicit support/contradiction links and get exact claim
     # grounding instead of an agent-name approximation.
     if supplied_links is None:
-        supporting = agent_supporting
+        # An agent may return useful context alongside a scoped positive
+        # observation. The legacy agent-name fallback must not turn every one
+        # of those artifacts into root-cause support.
+        supporting = [
+            item
+            for item in agent_supporting
+            if (
+                (eligibility := eligibility_by_id.get(str(getattr(item, "evidence_id", ""))))
+                is not None
+                and callable(getattr(eligibility, "permits", None))
+                and eligibility.permits("support")
+            )
+        ]
         claim_links = [
             EvidenceLink(str(getattr(item, "evidence_id", "")), "support")
             for item in supporting
@@ -195,6 +224,7 @@ def evaluate(
     support_ids = [link.fact_id for link in claim_links if link.role == "support"]
     contradiction_ids = [link.fact_id for link in claim_links if link.role == "contradict"]
     traced_ids = [*support_ids, *contradiction_ids]
+    support_source_groups = {_independence_key(item) for item in supporting}
     signature = _signature_support(top)
     confidence = str(getattr(top, "confidence", "low") or "low")
     insufficient = not family or family == "insufficient_evidence"
@@ -203,7 +233,7 @@ def evaluate(
         "unsupported_high_confidence": bool(
             not insufficient
             and confidence == "high"
-            and len({_independence_key(item) for item in supporting}) < 2
+            and len(support_source_groups) < 2
             and not signature
         ),
         "missing_evidence_trace": bool(
@@ -242,11 +272,7 @@ def evaluate(
         "evidence_link_errors": link_errors,
     }
     trace = [
-        {
-            "evidence_id": str(getattr(item, "evidence_id", "")),
-            "source": str(getattr(item, "source", "")),
-            "summary": _single_line(getattr(item, "summary", ""), 220),
-        }
+        _trace_item(item)
         for item in _unique_artifacts(
             [
                 item
@@ -262,6 +288,7 @@ def evaluate(
         response,
         candidates,
         support_ids,
+        support_source_groups,
         next_check=next_check,
         unsafe=gates["unsafe_action_without_guardrail"],
     )
@@ -276,10 +303,55 @@ def apply_trace(response: AlertAnalysisResponse, verdict: HarnessVerdict) -> boo
     lines = ["## Evidence Trace", ""]
     for item in verdict.trace:
         summary = item["summary"] or "Collected evidence"
-        lines.append(f"- [{item['evidence_id']}] {item['source']}: {summary}")
+        lines.append(
+            f"- [{item['evidence_id']}] {item['source']} · "
+            f"{_trace_verdict_label(item)}: {summary}"
+        )
     response.analysis_detail = response.analysis_detail.rstrip() + "\n\n" + "\n".join(lines)
     response.analysis = response.analysis_detail
     return True
+
+
+def _trace_item(item: object) -> dict[str, str]:
+    """Render the normalized truth state alongside every cited artifact.
+
+    The final report previously carried only a prose summary. That made a
+    scoped absence (useful contradiction) visually indistinguishable from a
+    positive observation, and hid partial/current-context observations. Reuse
+    the same normalizer that the evidence-link gate trusts so the display never
+    invents a stronger verdict than the RCA engine accepted.
+    """
+    polarity, coverage = "unknown", "partial"
+    try:
+        from app.services.evidence_blackboard import normalize_artifact
+
+        # Match the evidence-link boundary: a result body that merely happens
+        # to contain a success summary or loose polarity fields is context,
+        # not a scoped verdict in the operator-visible trace.
+        fact = normalize_artifact(item, require_typed_observation=True)
+        polarity = str(fact.polarity)
+        coverage = str(fact.coverage)
+    except Exception:  # noqa: BLE001 - trace rendering must not block the RCA.
+        pass
+    return {
+        "evidence_id": str(getattr(item, "evidence_id", "")),
+        "source": str(getattr(item, "source", "")),
+        "summary": _single_line(getattr(item, "summary", ""), 220),
+        "polarity": polarity,
+        "coverage": coverage,
+    }
+
+
+def _trace_verdict_label(item: Mapping[str, str]) -> str:
+    polarity = item.get("polarity", "unknown")
+    coverage = item.get("coverage", "partial")
+    if polarity == "present" and coverage == "scoped":
+        return "observed · scoped"
+    if polarity == "absent" and coverage == "scoped":
+        return "not observed · scoped"
+    if polarity == "unavailable":
+        return "source unavailable"
+    return "context only · partial"
 
 
 def apply_safety_guardrail(response: AlertAnalysisResponse) -> bool:
@@ -402,7 +474,13 @@ def _usable_artifacts(results: list[CollectorResult]) -> list[object]:
 
 
 def _artifact_eligibility(artifacts: Iterable[object]) -> dict[str, object]:
-    """Evaluate links from the normalized fact semantics, not status prose."""
+    """Evaluate links from typed observation semantics, not status prose.
+
+    ``evaluate`` is also used by callers outside the PipelineState path, where
+    no precomputed Blackboard eligibility map is available.  Those callers
+    must not regain the legacy ``ok + summary => scoped support`` inference:
+    only a collector-declared observation may ground an evidence link.
+    """
     from app.services.evidence_blackboard import normalize_artifact
 
     eligible: dict[str, object] = {}
@@ -411,7 +489,9 @@ def _artifact_eligibility(artifacts: Iterable[object]) -> dict[str, object]:
         if not evidence_id:
             continue
         try:
-            eligible[evidence_id] = normalize_artifact(item).eligibility
+            eligible[evidence_id] = normalize_artifact(
+                item, require_typed_observation=True
+            ).eligibility
         except Exception:  # noqa: BLE001 - malformed evidence must not become proof
             continue
     return eligible
@@ -467,6 +547,7 @@ def _dimension_scores(
     response: AlertAnalysisResponse,
     candidates: list[RankedCause],
     support_ids: list[str],
+    support_source_groups: set[str],
     *,
     next_check: str,
     unsafe: bool,
@@ -478,7 +559,12 @@ def _dimension_scores(
         "evidence_grounding": 5 if support_ids else 0,
         "diagnostic_reasoning": 4 if len(candidates) > 1 else 2,
         "investigation_plan": 5 if next_check else (3 if "check" in detail or "확인" in detail else 1),
-        "uncertainty_calibration": 5 if confidence != "high" or len(support_ids) >= 2 else 2,
+        # Repeating an observation from the same collector is useful trace
+        # detail, but it does not corroborate a high-confidence conclusion.
+        # This rubric must agree with the high-confidence gate above instead
+        # of awarding a perfect calibration score for two Loki/Kubernetes
+        # query replicas.
+        "uncertainty_calibration": 5 if confidence != "high" or len(support_source_groups) >= 2 else 2,
         "operational_usefulness": 4 if "action" in detail or "조치" in detail else 2,
         "safety": 0 if unsafe else 5,
     }

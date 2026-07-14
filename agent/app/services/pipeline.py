@@ -7,13 +7,20 @@ import logging
 import re
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, resolve_target
+from app.collectors.base import (
+    NO_EVIDENCE,
+    AnalysisTarget,
+    CollectorResult,
+    causal_evidence_time_range,
+    condition_observations,
+    resolve_target,
+)
 from app.collectors.registry import build_collectors
 from app.config import Settings
 from app.knowledge import (
@@ -40,6 +47,7 @@ from app.progress import ProgressReporter
 from app.prompts import load_agent_souls
 from app.schemas import AlertAnalysisRequest, AlertAnalysisResponse
 from app.services.decision_tree import resolve_tree, walk_tree
+from app.services.general_guidance import general_guidance_lines
 from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
 from app.services.planner import plan_investigation
 from app.services.root_cause_ranking import (
@@ -173,6 +181,16 @@ def _evidence_budget_exceeded(state: PipelineState) -> bool:
     return deadline is not None and time.monotonic() >= deadline
 
 
+def _is_resolved_reanalysis(request: AlertAnalysisRequest) -> bool:
+    """Whether this run must preserve the alert's historical resource identity.
+
+    A replacement Pod discovered *now* is useful for a firing alert, but it is
+    not the Pod that a resolved alert fired on.  Retargeting Event reads to it
+    can turn the old Pod's warning events into a false historical absence.
+    """
+    return str(getattr(request.alert, "status", "") or "").strip().casefold() == "resolved"
+
+
 def _aggregate_evidence(state: PipelineState) -> None:
     kg_warnings = getattr(state.kg_context, "warnings", []) if state.kg_context is not None else []
     state.capabilities = {result.agent: result.status for result in state.results}
@@ -223,12 +241,23 @@ async def plan_stage(state: PipelineState) -> PipelineState:
         list(state.request.similar_incidents),
         recent_changes,
     )
+    # For a resolved incident, retain the alert-declared Pod for all causal
+    # reads.  A planner/live lookup may identify a replacement that exists
+    # today, but it cannot substitute for the historical event identity.
+    if _is_resolved_reanalysis(state.request) and state.target.pod:
+        if state.plan.pod and state.plan.pod != state.target.pod:
+            _log.info(
+                "plan: preserving resolved alert pod %s instead of replacement %s",
+                state.target.pod,
+                state.plan.pod,
+            )
+        state.plan.pod = state.target.pod
     # Alert labels frequently name a pod the controller already replaced (grouped
     # CrashLoop occurrences) and carry no node label — so kubernetes GETs 404 and
     # the system agent skips node/kernel evidence entirely. Re-resolve a LIVE pod
     # and its node ONCE here; every collector then scopes off the plan.
     seed_pod = state.plan.pod or state.target.pod
-    if state.target.namespace and seed_pod:
+    if state.target.namespace and seed_pod and not _is_resolved_reanalysis(state.request):
         from app.collectors.kubernetes import resolve_live_pod_node
 
         live_pod, live_node = await resolve_live_pod_node(
@@ -272,6 +301,10 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
     settings = state.settings
     plan = state.plan
     assert plan is not None
+    # Keep this guard at the execution boundary too: callers/tests may provide
+    # a prebuilt plan without going through plan_stage.
+    if _is_resolved_reanalysis(state.request) and state.target.pod:
+        plan.pod = state.target.pod
     # The plan is authoritative after plan_stage — it may carry a re-resolved
     # LIVE pod/node for a stale alert pod. Scope the stage's working target ONCE
     # so the flowchart follow-ups, drill-down, and investigation loop query the
@@ -279,10 +312,11 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
     from app.collectors.kubernetes import _scope_target
 
     target = _scope_target(state.target, plan)
+    causal_window = causal_evidence_time_range(target) or {}
     state.investigation_context = {}
     from app.services.evidence_blackboard import Blackboard
 
-    state.blackboard = Blackboard()
+    state.blackboard = Blackboard(run_id=str(state.request.incident_id or ""))
 
     # Synthesis MUST see EVERY collector's result. Await the full gather over ALL
     # collectors here, before any ranking/synthesis, and never synthesize from a
@@ -339,8 +373,8 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
         state.results,
         entity=_blackboard_target_entity(target),
         timestamp=getattr(target, "fired_at", ""),
-        observed_window_start=getattr(target, "fired_at", ""),
-        observed_window_end=getattr(target, "resolved_at", "") or getattr(target, "fired_at", ""),
+        observed_window_start=str(causal_window.get("start") or ""),
+        observed_window_end=str(causal_window.get("end") or ""),
     )
     # Deterministic flowchart-driven follow-up: keep pulling k8s evidence based on
     # what was found (Pending -> events/quota/pvc -> storageclass; CrashLoop/
@@ -359,10 +393,8 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
             state.results,
             entity=_blackboard_target_entity(target),
             timestamp=getattr(target, "fired_at", ""),
-            observed_window_start=getattr(target, "fired_at", ""),
-            observed_window_end=(
-                getattr(target, "resolved_at", "") or getattr(target, "fired_at", "")
-            ),
+            observed_window_start=str(causal_window.get("start") or ""),
+            observed_window_end=str(causal_window.get("end") or ""),
         )
     except Exception:  # noqa: BLE001 - follow-up is best-effort, never fail analysis
         pass
@@ -552,21 +584,73 @@ def _blackboard_artifact_evidence_ids(state: PipelineState) -> dict[str, str]:
         facts = ()
     from app.services.evidence_blackboard import normalize_artifact
 
+    target = state.target
+    target_entity = next(
+        (
+            f"{field}:{value}"
+            for field in ("pod", "node", "workload_name", "namespace")
+            if (value := str(getattr(target, field, "") or "").strip())
+        ),
+        "",
+    )
+    target_timestamp = str(getattr(target, "fired_at", "") or "")
+    causal_window = causal_evidence_time_range(target) or {}
+    target_window_start = str(causal_window.get("start") or "")
+    target_window_end = str(causal_window.get("end") or "")
+    facts_by_id = {str(getattr(fact, "fact_id", "")): fact for fact in facts}
+    board_run_id = str(getattr(board, "_run_id", "") or "")
+
     for result in state.results:
+        details = result.details if isinstance(result.details, dict) else {}
+        source_group = str(details.get("source_group") or "")
+        run_id = str(details.get("run_id") or details.get("incident_run_id") or "")
+        topology = details.get("topology") or details.get("target_topology") or ()
         for artifact in result.artifacts:
             evidence_id = str(getattr(artifact, "evidence_id", "") or "")
             if not evidence_id:
                 continue
             try:
                 aliases[str(identify(artifact))] = evidence_id
-                # The investigator may have recorded the same artifact before
-                # the pipeline adds the resolved target/window metadata. All
-                # those normalized variants still represent this one public
-                # artifact and must receive the same E-id.
+                # Reproduce the investigator's target/window normalization to
+                # link the public artifact to its exact blackboard fact.  Do
+                # not alias every fact with the same summary/type: a collector
+                # can observe identically worded conditions for two Pods or
+                # incident windows, and letting the last E-id win would cite
+                # one target's artifact as evidence for another.
+                # Blackboard gives an artifact-declared run ID precedence over
+                # result- and board-level defaults. Mirror that precedence so
+                # a stale declared ID cannot be silently relabelled as this
+                # incident while resolving the public alias.
+                artifact_run_id = str(normalize_artifact(artifact).run_id or "")
+                contextual_fact_id = str(
+                    normalize_artifact(
+                        artifact,
+                        entity=target_entity,
+                        timestamp=target_timestamp,
+                        observed_window_start=target_window_start,
+                        observed_window_end=target_window_end,
+                        source_group=source_group,
+                        run_id=artifact_run_id or run_id or board_run_id,
+                        topology=topology,
+                        require_typed_observation=True,
+                    ).fact_id
+                )
+                if contextual_fact_id in facts_by_id:
+                    aliases[contextual_fact_id] = evidence_id
+                    continue
+
+                # Older blackboard integrations may not have received the
+                # resolved incident context.  Retain that compatibility path
+                # only when the artifact identity resolves to exactly one fact;
+                # ambiguity is unsafe and must remain uncitable.
                 artifact_identity = normalize_artifact(artifact).artifact_id
-                for fact in facts:
-                    if str(getattr(fact, "artifact_id", "")) == artifact_identity:
-                        aliases[str(getattr(fact, "fact_id", ""))] = evidence_id
+                matches = [
+                    fact
+                    for fact in facts
+                    if str(getattr(fact, "artifact_id", "")) == artifact_identity
+                ]
+                if len(matches) == 1:
+                    aliases[str(getattr(matches[0], "fact_id", ""))] = evidence_id
             except Exception:  # noqa: BLE001 - a missing alias is harmless
                 continue
     return aliases
@@ -897,6 +981,8 @@ def _lifecycle_signal(
     change = next((r for r in results if getattr(r, "agent", "") == "change"), None)
     if change is None or getattr(change, "status", "") not in ("ok", "partial"):
         return {}
+    if not _has_scoped_change_observation(change):
+        return {}
     details = change.details if isinstance(change.details, dict) else {}
     changes = details.get("changes") if isinstance(details.get("changes"), list) else []
     rolling = {
@@ -927,6 +1013,23 @@ def _lifecycle_signal(
     if helm:
         signal["helm"] = helm
     return signal
+
+
+def _has_scoped_change_observation(change: CollectorResult) -> bool:
+    """Require a bounded change artifact before using rollout as an RCA trigger."""
+    for artifact in change.artifacts:
+        if getattr(artifact, "type", "") != "change_detection":
+            continue
+        result = getattr(artifact, "result", None)
+        observation = result.get("observation") if isinstance(result, dict) else None
+        if not isinstance(observation, dict):
+            continue
+        if (
+            str(observation.get("polarity") or "").lower() == "present"
+            and str(observation.get("coverage") or "").lower() == "scoped"
+        ):
+            return True
+    return False
 
 
 _LIFECYCLE_FAMILY = "platform_lifecycle_change"
@@ -966,6 +1069,7 @@ async def rank_stage(state: PipelineState) -> PipelineState:
         "Ranking root-cause candidates",
         hypothesis_ledger=state.investigation_context.get("hypothesis_ledger"),
     )
+    eligible_support_ids = _eligible_support_ids_for_output(state)
     state.root_cause_candidates = rank_root_cause_candidates(
         state.target,
         state.results,
@@ -976,6 +1080,7 @@ async def rank_stage(state: PipelineState) -> PipelineState:
         component=comp_name,
         depends_on_chain=comp_chain,
         lifecycle=lifecycle,
+        eligible_evidence_ids=eligible_support_ids,
     )
     # Signature-first headline: the keyword ranker only decides when NOTHING
     # specific matched. A specific signature — an NVIDIA XID (dispositive), a
@@ -983,8 +1088,14 @@ async def rank_stage(state: PipelineState) -> PipelineState:
     # family directly; the ranker chronically mis-headlined these (e.g.
     # node_kubelet_pressure winning on "DiskPressure"/"kubelet" words present in
     # the k8s node-conditions text even when every condition is False).
-    state.observed = _observed_text(state.results, request)
-    state.xid_codes = _xid_codes_from_results(state.results, _alert_text(request))
+    state.observed = _observed_text(
+        state.results, request, eligible_support_ids=eligible_support_ids
+    )
+    state.xid_codes = _xid_codes_from_results(
+        state.results,
+        _alert_text(request),
+        eligible_support_ids=eligible_support_ids,
+    )
     # TypeDB is the runtime source of truth. The version-controlled YAML matcher
     # remains only for deployments where the graph is disabled/unavailable.
     state.failure_modes = (
@@ -1028,6 +1139,7 @@ async def rank_stage(state: PipelineState) -> PipelineState:
             depends_on_chain=comp_chain,
             lifecycle=lifecycle,
             graph_candidate_counts=graph_counts,
+            eligible_evidence_ids=eligible_support_ids,
         )
         if isinstance(getattr(state.kg_context, "reasoning", None), dict):
             state.kg_context.reasoning["candidate_families"] = graph_counts
@@ -1180,7 +1292,17 @@ def _evidence_context(state: PipelineState) -> dict[str, object]:
     target = state.target
     entities = tuple(
         f"{field}:{value}"
-        for field in ("pod", "node", "workload_name", "namespace", "storage_claim", "service")
+        for field in (
+            "pod",
+            "node",
+            "workload_name",
+            "runai_workload_id",
+            "project",
+            "queue",
+            "namespace",
+            "storage_claim",
+            "service",
+        )
         if (value := str(getattr(target, field, "") or "").strip())
     )
     topology = tuple(
@@ -1188,12 +1310,18 @@ def _evidence_context(state: PipelineState) -> dict[str, object]:
         for field in ("cluster", "project", "queue", "namespace", "node", "component")
         if (value := str(getattr(target, field, "") or "").strip())
     )
+    # Collection deliberately includes a five-minute prelude (to catch the
+    # trigger that led to the alert) and, for firing alerts, a bounded 15-minute
+    # forward interval.  The post-resolution collection epilogue is useful for
+    # confirming recovery, but it must not establish the cause of an incident
+    # that has already ended.  Keep the causal eligibility window aligned with
+    # that policy instead of collapsing every firing alert to its exact fired
+    # instant, which discarded all bounded post-fire observations.
+    causal_window = causal_evidence_time_range(target) or {}
     return {
         "run_id": str(state.request.incident_id or ""),
-        "window_start": str(getattr(target, "fired_at", "") or ""),
-        "window_end": str(
-            getattr(target, "resolved_at", "") or getattr(target, "fired_at", "") or ""
-        ),
+        "window_start": str(causal_window.get("start") or ""),
+        "window_end": str(causal_window.get("end") or ""),
         "entities": entities,
         "topology": topology,
     }
@@ -1226,6 +1354,21 @@ def _public_evidence_eligibility(state: PipelineState) -> dict[str, object]:
     }
 
 
+def _eligible_support_ids_for_output(state: PipelineState) -> set[str]:
+    """Return only response artifacts that may substantiate the final report.
+
+    The deterministic report and the Korean synthesis must share the exact
+    target/window gate used by the harness.  Otherwise a typed but unrelated
+    artifact can appear under the report's root-cause evidence even though it
+    cannot be cited by the approved RCA claim.
+    """
+    return {
+        evidence_id
+        for evidence_id, eligibility in _public_evidence_eligibility(state).items()
+        if callable(getattr(eligibility, "permits", None)) and eligibility.permits("support")
+    }
+
+
 def _blackboard_fact_groups(
     blackboard: Any,
     aliases: dict[str, str] | None = None,
@@ -1241,7 +1384,11 @@ def _blackboard_fact_groups(
             aliases.get(str(fact.fact_id), str(fact.fact_id)): str(fact.independence_group)
             for fact in facts()
             if getattr(fact, "fact_id", "")
-            and bool(getattr((eligibility_by_fact or {}).get(str(fact.fact_id)), "support", True))
+            # Open-world promotion is fail-closed: no eligibility verdict (for
+            # example because a malformed fact could not be normalized) is not
+            # evidence provenance.  Only an explicit scoped-positive verdict
+            # may contribute an independent source group.
+            and bool(getattr((eligibility_by_fact or {}).get(str(fact.fact_id)), "support", False))
         }
     except Exception:  # noqa: BLE001 - blackboard remains an optional enhancement
         return {}
@@ -1257,11 +1404,17 @@ async def self_check_stage(state: PipelineState) -> PipelineState:
     else:
         if state.root_cause_candidates:
             state.progress.emit("self_check", "Checking whether the top cause can be refuted")
+            self_check_kwargs: dict[str, object] = {"plan": state.investigation_context}
+            # Keep optional integrations/test doubles that predate the
+            # blackboard contract working while the production implementation
+            # receives the strict target/window verdicts.
+            if _accepts_keyword(refute_top_cause, "evidence_eligibility"):
+                self_check_kwargs["evidence_eligibility"] = _public_evidence_eligibility(state)
             check = await refute_top_cause(
                 state.settings,
                 state.root_cause_candidates[0],
                 state.results,
-                plan=state.investigation_context,
+                **self_check_kwargs,
             )
             if isinstance(check, dict):
                 calibrated = check.get("confidence")
@@ -1299,6 +1452,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         gpu_model=_gpu_model_from(state.target, state.results),
     )
     _aggregate_evidence(state)
+    eligible_support_ids = _eligible_support_ids_for_output(state)
     state.warnings = sorted(set(state.warnings) | set(state.graph_fixes.warnings))
     # Optional change/timeline capability — added to the synthesis context.
     try:
@@ -1311,7 +1465,10 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         getattr(state.kg_context, "diagnostic_tree", {}), settings.failure_modes_file
     )
     state.troubleshooting_path = walk_tree(
-        diagnostic_tree, _observed_text(state.results, request)
+        diagnostic_tree,
+        _observed_text(
+            state.results, request, eligible_support_ids=eligible_support_ids
+        ),
     )
     if state.troubleshooting_path.get("path"):
         state.troubleshooting_path["source"] = diagnostic_source
@@ -1388,6 +1545,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         known_issues=state.known_issues,
         components=load_architecture(settings.architecture_file),
         masker=state.masker,
+        eligible_support_ids=eligible_support_ids,
     )
     # Korean LLM synthesis (preferred when language == "ko" and LLM configured):
     # rewrite summary + detail grounded STRICTLY in the evidence just gathered.
@@ -1407,6 +1565,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                 timeline=state.timeline,
                 troubleshooting_path=state.troubleshooting_path,
                 reasoning_trace=state.investigation_context.get("reasoning_trace_v2"),
+                evidence_eligibility=_public_evidence_eligibility(state),
             )
         if synth:
             state.summary, state.detail = synth
@@ -1415,6 +1574,26 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             # curated KB playbook in verbatim ENGLISH — translate that one
             # section so the operator guidance still reads in their language.
             state.detail = await _translate_playbook_ko(settings, state.detail)
+
+    # A Korean synthesis can replace the deterministic detail wholesale. Restore
+    # the explicitly non-diagnostic guide when the RCA had no supported action.
+    if _needs_general_guidance(state.root_cause_candidates, eligible_support_ids):
+        heading = _general_guidance_heading(getattr(settings, "language", "en"))
+        if heading not in state.detail:
+            block = "\n".join(
+                [
+                    heading,
+                    "",
+                    *general_guidance_lines(
+                        _alert_text(request),
+                        state.failure_modes,
+                        state.known_issues,
+                        language=getattr(settings, "language", "en"),
+                        masker=state.masker,
+                    ),
+                ]
+            )
+            state.detail = _append_general_guidance(state.detail, block)
 
     # Self-check caveat (optional hook) + re-analysis note — inserted BEFORE the
     # appendix so the document reads problem -> cause -> actions -> checks -> appendix.
@@ -1682,10 +1861,11 @@ async def _investigate_until_settled(state: PipelineState) -> None:
     ):
         return
     attempted: set[str] = set()
-    # Completion is semantic: stop only after the candidate is settled, every
-    # candidate has been tried, no new evidence arrives, or the outer deadline
-    # cancels the analysis.  Query/agent-step counters are not quality gates.
-    while True:
+    # Re-analysis gets at most three reasoning passes by default. Each pass can
+    # batch many read-only queries, so this bounds repeated candidate churn
+    # without narrowing evidence collection.
+    reanalysis_round_limit = state.settings.max_reanalysis_steps or 3
+    for _round in range(reanalysis_round_limit):
         if not _needs_more_investigation(state):
             break
         if _evidence_budget_exceeded(state):
@@ -1729,6 +1909,11 @@ async def _investigate_until_settled(state: PipelineState) -> None:
         after_family = state.root_cause_candidates[0].family if state.root_cause_candidates else ""
         if after_family == before_family and _evidence_signature(state.results) == before_evidence:
             break
+    else:
+        if _needs_more_investigation(state):
+            state.extra_warnings.append(
+                f"re-analysis stopped after {reanalysis_round_limit} reasoning rounds"
+            )
 
 
 def _needs_more_investigation(state: PipelineState) -> bool:
@@ -1765,6 +1950,7 @@ def _next_reanalysis_target(
         kg_blast = getattr(state.kg_context, "blast_radius_workloads", 0)
         comp_family, comp_name, comp_chain = _component_identity(state.settings, state.plan)
         lifecycle = _lifecycle_signal(state.results, comp_name, comp_chain)
+        eligible_support_ids = _eligible_support_ids_for_output(state)
         for candidate in rank_root_cause_candidates(
             state.target,
             state.results,
@@ -1776,6 +1962,7 @@ def _next_reanalysis_target(
             component=comp_name,
             depends_on_chain=comp_chain,
             lifecycle=lifecycle,
+            eligible_evidence_ids=eligible_support_ids,
         ):
             if candidate.family not in excluded:
                 return _ReanalysisTarget(
@@ -1893,6 +2080,32 @@ async def _reanalyze_once(
             merged[result.agent] = result
         merged_results = list(merged.values())
 
+        # Re-analysis returns fresh artifacts after the initial evidence-stage
+        # aggregation.  Give them response-local IDs and normalize them onto
+        # the same board before re-ranking; otherwise an out-of-window fresh
+        # card could influence this one path only because its eligibility map
+        # did not exist yet.
+        from app.services.harness import assign_evidence_ids
+
+        assign_evidence_ids(merged_results)
+        seed = getattr(state.blackboard, "seed_results", None)
+        if callable(seed):
+            causal_window = causal_evidence_time_range(state.target) or {}
+            seed(
+                merged_results,
+                entity=_blackboard_target_entity(state.target),
+                timestamp=str(getattr(state.target, "fired_at", "") or ""),
+                observed_window_start=str(causal_window.get("start") or ""),
+                observed_window_end=str(causal_window.get("end") or ""),
+            )
+        previous_results = state.results
+        state.results = merged_results
+        try:
+            eligible_support_ids = _eligible_support_ids_for_output(state)
+            evidence_eligibility = _public_evidence_eligibility(state)
+        finally:
+            state.results = previous_results
+
         lifecycle = _lifecycle_signal(merged_results, comp_name, comp_chain)
         candidates = rank_root_cause_candidates(
             state.target,
@@ -1904,15 +2117,24 @@ async def _reanalyze_once(
             component=comp_name,
             depends_on_chain=comp_chain,
             lifecycle=lifecycle,
+            eligible_evidence_ids=eligible_support_ids,
         )
         # The signature-first rule applies to the RE-rank too. Without it the
         # raw keyword ranker decided alone here — the 2026-07-08 re-analysis
         # "concluded" node_kubelet_pressure on a healthy node while the loki
         # reconcile errors still carried the real (signature-backed) cause.
-        observed = _observed_text(merged_results, state.request)
+        observed = _observed_text(
+            merged_results,
+            state.request,
+            eligible_support_ids=eligible_support_ids,
+        )
         candidates = _promote_signature_cause(
             candidates,
-            _xid_codes_from_results(merged_results, _alert_text(state.request)),
+            _xid_codes_from_results(
+                merged_results,
+                _alert_text(state.request),
+                eligible_support_ids=eligible_support_ids,
+            ),
             match_runai_known_issues(state.known_issues, observed),
             _gate_lifecycle_symptoms(
                 match_failure_mode_symptoms(state.failure_modes, observed), lifecycle
@@ -1927,11 +2149,14 @@ async def _reanalyze_once(
         refuted = False
         next_check = ""
         if candidates:
+            self_check_kwargs: dict[str, object] = {"plan": re_context}
+            if _accepts_keyword(refute_top_cause, "evidence_eligibility"):
+                self_check_kwargs["evidence_eligibility"] = evidence_eligibility
             check = await refute_top_cause(
                 state.settings,
                 candidates[0],
                 merged_results,
-                plan=re_context,
+                **self_check_kwargs,
             )
             if isinstance(check, dict):
                 calibrated = check.get("confidence")
@@ -1990,6 +2215,7 @@ async def _synthesize_korean(
     timeline: list[dict] | None = None,
     troubleshooting_path: dict[str, Any] | None = None,
     reasoning_trace: object | None = None,
+    evidence_eligibility: Mapping[str, object] | None = None,
 ) -> tuple[str, str] | None:
     """LLM synthesis of the RCA report in Korean, grounded STRICTLY in the evidence.
 
@@ -1998,7 +2224,40 @@ async def _synthesize_korean(
     """
     from app.collectors.http_json import compact
 
-    observed_text = _observed_text(results, request)
+    eligible_support_ids = (
+        {
+            evidence_id
+            for evidence_id, eligibility in (evidence_eligibility or {}).items()
+            if callable(getattr(eligibility, "permits", None))
+            and eligibility.permits("support")
+        }
+        if evidence_eligibility is not None
+        else None
+    )
+    observed_text = _observed_text(
+        results, request, eligible_support_ids=eligible_support_ids
+    )
+    has_scoped_support = _synthesis_has_scoped_support(evidence_eligibility)
+    # The deterministic report receives the response-local eligibility set.  Do
+    # the equivalent check before exposing graph fixes to the free-form Korean
+    # synthesizer: graph edges and approved historical resolutions are useful
+    # guidance, but cannot substantiate a remediation for this incident when
+    # all current observations are context-only, unavailable, or out of scope.
+    graph_remediation_context = (
+        graph_fixes.as_dict()
+        if has_scoped_support
+        else {
+            "family_fixes": [],
+            "xid_fixes": {},
+            "model_xids": {},
+            "root_xids": {},
+            "verified_actions": [],
+            "warnings": [
+                "Current incident has no target/window-scoped supporting observation; "
+                "graph remediation is withheld until it is verified."
+            ],
+        }
+    )
     similar_incidents = (
         [
             {
@@ -2009,7 +2268,7 @@ async def _synthesize_korean(
             for i in request.similar_incidents
             if (i.similarity or 0) >= _SIMILARITY_FLOOR
         ]
-        if _similar_incident_relevant(request, observed_text)
+        if has_scoped_support and _similar_incident_relevant(request, observed_text)
         else []
     )
     # Key ORDER matters: the final JSON is hard-capped at _SYNTHESIS_USER_CHARS,
@@ -2040,46 +2299,35 @@ async def _synthesize_korean(
         **({"timeline": (timeline or [])[-40:]} if timeline else {}),
         **(
             {"troubleshooting_path": troubleshooting_path}
-            if troubleshooting_path and troubleshooting_path.get("path")
+            if has_scoped_support and troubleshooting_path and troubleshooting_path.get("path")
             else {}
         ),
-        "plan": plan.as_dict(),
+        "plan": _synthesis_plan_context(plan, allow_remediation=has_scoped_support),
         "ranked_root_cause_candidates": [c.as_dict() for c in root_cause_candidates],
         **({"reasoning_trace_v2": reasoning_trace} if isinstance(reasoning_trace, dict) else {}),
         "knowledge_graph": {
             "blast_radius_workloads": kg_context.get("blast_radius_workloads"),
-            "prior_incidents": kg_context.get("prior_incidents"),
-            "historical_case_cards": kg_context.get("case_cards") or [],
-            "knowledge": kg_context.get("knowledge"),
+            "prior_incidents": kg_context.get("prior_incidents") if has_scoped_support else [],
+            "historical_case_cards": (kg_context.get("case_cards") or [])
+            if has_scoped_support
+            else [],
+            "knowledge": kg_context.get("knowledge") if has_scoped_support else {},
         },
-        "graph_remediation": graph_fixes.as_dict(),
-        "matched_alert": plan.matched_alert,
+        "graph_remediation": graph_remediation_context,
+        "matched_alert": plan.matched_alert if has_scoped_support else None,
         "similar_incidents": similar_incidents,
+        "remediation_evidence": {
+            "scoped_support": has_scoped_support,
+            "rule": (
+                "Cause-specific remediation is allowed only with a current "
+                "target/window-scoped supporting observation."
+            ),
+        },
         # Bulky — kept LAST so the char cap trims raw collector result tails
         # rather than the reasoning inputs above.
-        "collector_findings": [
-            {
-                "agent": r.agent,
-                "status": r.status,
-                "confidence": r.confidence,
-                "summary": r.summary if _collector_is_evidence(r) else NO_EVIDENCE,
-                "artifacts": [
-                    {
-                        "type": art.type,
-                        "title": art.title,
-                        "status": art.status,
-                        "query": art.query,
-                        "summary": art.summary,
-                        "highlights": art.highlights,
-                        "result": _compact_synthesis_value(
-                            art.result, limit=_SYNTHESIS_ARTIFACT_RESULT_CHARS
-                        ),
-                    }
-                    for art in [a for a in r.artifacts if _artifact_is_evidence(a)][-3:]
-                ],
-            }
-            for r in results
-        ],
+        "collector_findings": _synthesis_collector_findings(
+            results, evidence_eligibility=evidence_eligibility
+        ),
     }
     system = (
         "당신은 NVIDIA Run:ai GPU 플랫폼을 담당하는 시니어 SRE입니다. 제공된 증거(수집기별 "
@@ -2092,19 +2340,34 @@ async def _synthesize_korean(
         "- 반드시 한국어로, 비전문가도 이해할 수 있게 작성합니다 (전문용어는 풀어서).\n"
         "- 길게 쓰지 마세요. 아래 1~3 섹션 합쳐서 A4 한 페이지 이내가 목표입니다.\n"
         "- 증거에 없는 사실을 절대 만들어내지 마세요.\n"
+        "- collector_findings의 supporting_artifacts만 원인을 지지하는 직접 근거입니다. "
+        "contradicting_artifacts는 결론을 반박하는 직접 근거이고, context_artifacts 및 "
+        "collection_summary는 운영 맥락일 뿐 원인·반증 근거가 아닙니다.\n"
+        "- MemoryPressure/DiskPressure/PIDPressure/NetworkUnavailable 같은 condition 이름은 "
+        "존재 자체가 장애 증거가 아닙니다. artifact의 evidence_role=support 안의 "
+        "condition_checks.active=true만 지지 증거이며, evidence_role=contradict 안의 "
+        "active=false만 명시적 반대 증거입니다. 원문 result의 키워드만 보고 상태를 "
+        "추정하지 마세요.\n"
         "- reasoning_trace_v2의 evidence_id는 현재 인시던트 관측입니다. 원인·반증 주장을 "
         "쓸 때 해당 ID를 [E01] 형식으로 인용하고, historical prior는 현재 증거로 쓰지 마세요.\n"
         "- historical_case_cards는 승인된 과거 사례의 prior이며 현재 evidence가 아닙니다. "
         "유사 사례가 있어도 현재 관측으로 별도 확인될 때만 원인으로 사용하세요.\n"
+        "- graph_remediation은 현재 support observation이 있을 때에만 조치 후보입니다. "
+        "warnings에 현재 범위의 support가 없다고 표시되면 graph/과거 사례의 조치를 실행하라고 "
+        "권고하지 말고, 먼저 대상·시간 범위에서 확인할 진단 단계만 제시하세요.\n"
+        "- remediation_evidence.scoped_support=false이면 내장 alert, component, knowledge base, "
+        "과거 사례, troubleshooting_path의 원인별 조치를 권고하지 마세요. 현재 범위에서 확인할 "
+        "진단 단계와 누락된 증거만 제시하세요.\n"
         "- 특정 수집기가 아무것도 찾지 못했으면 '증거를 찾기 어렵습니다.'라고 명시하세요.\n"
         "- 증거에 incident_state가 resolved(과거 인시던트 재분석)면, 현재 상태가 정상이라 "
         "라이브 증거가 제한적일 수 있습니다. 증거가 얇으면 억지로 원인을 단정하지 말고 '현재는 "
         "정상 상태로 회복되어 라이브 수집·분석이 제한적입니다'를 명시한 뒤, 남은 흔적·과거 기록·"
         "타임라인 기반으로 신중히 설명하세요.\n"
-        "- 증거에 timeline(시간순 이벤트)이 있으면, 알림 직전의 '최근 변경'을 근본 원인으로 "
-        "최우선 검토하세요: 배포/rollout(generation 변경), 노드 리부트·컨디션 변화, 파드 삭제/"
-        "드레인, MIG/설정 변경 등. 스케줄러·증상성 경고(예: PodGroup Warning)보다 '무엇이 바뀌어 "
-        "이 알림이 촉발됐는가'를 먼저 의심하고, 시간 순서(변경 → 결과 → 알림)로 인과를 설명하세요.\n"
+        "- timeline(시간순 이벤트)은 evidence_role을 반드시 지키세요. support인 항목만 원인·조치의 "
+        "직접 근거가 될 수 있습니다. context 항목은 시간 순서 설명과 다음 점검 후보일 뿐이며, "
+        "그 자체로 최근 변경·오류를 근본 원인이나 관찰 사실로 쓰면 안 됩니다. support timeline에 "
+        "배포/rollout(generation 변경), 노드 리부트·컨디션 변화, 파드 삭제/드레인, MIG/설정 변경이 "
+        "있을 때만 변경 → 결과 → 알림의 인과를 우선 검토하세요.\n"
         "- 증거에 troubleshooting_path가 있으면 그 steps를 사용해 진단 흐름을 단계별로 설명하세요. "
         "steps 안의 alternatives는 동시에 성립한 경쟁 가설이므로, 선택한 경로와 함께 무엇을 추가로 "
         "확인하면 반증되는지 설명하세요. principles와 conclusion.disconfirm이 있으면 성급한 확정을 "
@@ -2146,6 +2409,43 @@ async def _synthesize_korean(
     if not isinstance(detail, str) or not detail.strip():
         detail = fallback_detail
     return _short_sentence(summary, limit=280), detail.strip()
+
+
+def _synthesis_has_scoped_support(evidence_eligibility: Mapping[str, object] | None) -> bool:
+    """Whether the Korean synthesizer may receive graph remediation actions.
+
+    ``None`` preserves direct/unit callers that do not have a blackboard.  In a
+    pipeline run an empty/non-permitting map is an explicit safety verdict, not
+    a reason to fall back to broad collector text or historical knowledge.
+    """
+    if evidence_eligibility is None:
+        return True
+    return any(
+        callable(getattr(eligibility, "permits", None)) and eligibility.permits("support")
+        for eligibility in evidence_eligibility.values()
+    )
+
+
+def _synthesis_plan_context(
+    plan: InvestigationPlan, *, allow_remediation: bool
+) -> dict[str, object]:
+    """Project the plan for free-form synthesis without leaking dormant fixes.
+
+    A plan can carry catalog actions and historical case cards so collectors know
+    what to verify.  When every current artifact is context-only or out of
+    scope, those fields must not become an indirect recommendation channel for
+    the synthesis model.
+    """
+    context = plan.as_dict()
+    if allow_remediation:
+        return context
+    matched = context.get("matched_alert")
+    if isinstance(matched, dict):
+        context["matched_alert"] = {
+            key: value for key, value in matched.items() if key != "actions"
+        }
+    context["case_cards"] = []
+    return context
 
 
 async def _complete_synthesis_json(settings: Settings, *, system: str, user: str) -> dict | None:
@@ -2207,6 +2507,101 @@ def _synthesis_evidence_json(evidence: dict, max_chars: int) -> str:
         evidence = {**evidence, "collector_findings": findings}
         text = json.dumps(evidence, ensure_ascii=False, default=str)
     return text
+
+
+def _synthesis_collector_findings(
+    results: list[CollectorResult],
+    *,
+    evidence_eligibility: Mapping[str, object] | None = None,
+) -> list[dict[str, object]]:
+    """Project artifacts into evidence roles before giving them to synthesis.
+
+    This is intentionally stricter than a transport-success check. The LLM may
+    see useful context, but it receives a machine-readable boundary that only
+    a scoped observation can support or contradict the RCA.
+    """
+    findings: list[dict[str, object]] = []
+    for result in results:
+        grouped: dict[str, list[dict[str, object]]] = {
+            "supporting_artifacts": [],
+            "contradicting_artifacts": [],
+            "context_artifacts": [],
+        }
+        for artifact in result.artifacts:
+            if not _artifact_is_evidence(artifact):
+                continue
+            payload = _synthesis_artifact_payload(
+                artifact, evidence_eligibility=evidence_eligibility
+            )
+            role = str(payload["evidence_role"])
+            key = {
+                "support": "supporting_artifacts",
+                "contradict": "contradicting_artifacts",
+            }.get(role, "context_artifacts")
+            grouped[key].append(payload)
+        findings.append(
+            {
+                "agent": result.agent,
+                "status": result.status,
+                "confidence": result.confidence,
+                # A collector headline is operational context, never a direct
+                # observation. Retain it without inviting the model to cite it.
+                "collection_summary": (
+                    result.summary if _collector_is_evidence(result) else NO_EVIDENCE
+                ),
+                **{key: artifacts[-3:] for key, artifacts in grouped.items()},
+            }
+        )
+    return findings
+
+
+def _synthesis_artifact_payload(
+    artifact: object, *, evidence_eligibility: Mapping[str, object] | None = None
+) -> dict[str, object]:
+    result = getattr(artifact, "result", None)
+    observation = result.get("observation") if isinstance(result, dict) else None
+    polarity = "unknown"
+    coverage = "partial"
+    if isinstance(observation, dict):
+        candidate_polarity = str(observation.get("polarity") or "").strip().lower()
+        candidate_coverage = str(observation.get("coverage") or "").strip().lower()
+        if candidate_polarity in {"present", "absent", "unknown", "unavailable"}:
+            polarity = candidate_polarity
+        if candidate_coverage in {"scoped", "partial", "unknown"}:
+            coverage = candidate_coverage
+    if evidence_eligibility is not None:
+        # The blackboard has already checked run, target entity, topology and
+        # incident-window compatibility.  A raw artifact can claim to be a
+        # scoped observation while still belonging to another workload or a
+        # different time window, so never let the synthesis model re-promote
+        # it from its local polarity alone.
+        evidence_id = str(getattr(artifact, "evidence_id", "") or "")
+        eligibility = evidence_eligibility.get(evidence_id)
+        permits = getattr(eligibility, "permits", None)
+        if callable(permits) and permits("support"):
+            role = "support"
+        elif callable(permits) and permits("contradict"):
+            role = "contradict"
+        else:
+            role = "context"
+    elif polarity == "present" and coverage == "scoped":
+        role = "support"
+    elif polarity == "absent" and coverage == "scoped":
+        role = "contradict"
+    else:
+        role = "context"
+    return {
+        "type": str(getattr(artifact, "type", "")),
+        "title": str(getattr(artifact, "title", "")),
+        "status": str(getattr(artifact, "status", "")),
+        "query": str(getattr(artifact, "query", "")),
+        "summary": str(getattr(artifact, "summary", "")),
+        "highlights": list(getattr(artifact, "highlights", []) or []),
+        "evidence_role": role,
+        "observation": {"polarity": polarity, "coverage": coverage},
+        "condition_checks": condition_observations(result),
+        "result": _compact_synthesis_value(result, limit=_SYNTHESIS_ARTIFACT_RESULT_CHARS),
+    }
 
 
 def _compact_synthesis_value(value: object, *, limit: int) -> str:
@@ -2340,6 +2735,7 @@ def _detail_from(
     known_issues: list[dict] | None = None,
     components: dict[str, dict] | None = None,
     masker: Masker | None = None,
+    eligible_support_ids: set[str] | None = None,
 ) -> str:
     """Problem -> Root Cause -> Recommended Actions, then everything else in an
     appendix. Sections 1-3 are the ~1-page report an operator (or a Word export)
@@ -2385,16 +2781,30 @@ def _detail_from(
             lines.append(facets)
     # Ground the coarse family in the most specific signature match when one exists:
     # a recognised known issue (with its affected/fixed version) is far more precise.
+    observed_text = _observed_text(
+        results, request, eligible_support_ids=eligible_support_ids
+    )
     lines.extend(
         _known_issue_cause_lines(
-            known_issues, _observed_text(results, request), language, _alert_text(request)
+            known_issues, observed_text, language, _alert_text(request)
         )
     )
-    supporting = _supporting_evidence(results)
+    supporting = _supporting_evidence(results, eligible_support_ids=eligible_support_ids)
     if supporting:
         lines.append("")
         lines.extend(f"- **{agent}**: {finding}" for agent, finding in supporting)
-    causal = _causal_chain_line(graph_fixes, language)
+    # A graph/XID chain is useful remediation knowledge, but it is not a
+    # current incident observation by itself.  Keep it out of the headline
+    # causal narrative when every collected artifact was demoted to context or
+    # rejected for a different target/window.  Otherwise "fix root XID first"
+    # can look like a current, grounded instruction despite having no eligible
+    # observation in this run.
+    # Curated alert/component/playbook/graph actions are *guidance*, not a
+    # current-incident observation.  They all need the same target/window gate:
+    # otherwise an all-context run could withhold graph fixes yet still tell an
+    # operator to execute a documented-alert fix or repeat a historical remedy.
+    allow_cause_specific_actions = eligible_support_ids is None or bool(eligible_support_ids)
+    causal = _causal_chain_line(graph_fixes, language) if allow_cause_specific_actions else ""
     if causal:
         lines.extend(["", causal])
 
@@ -2404,12 +2814,13 @@ def _detail_from(
         plan,
         graph_fixes,
         root_cause_candidates,
-        _observed_text(results, request),
+        observed_text,
         failure_modes or {},
         missing,
         request,
         known_issues or [],
         components=components,
+        allow_cause_specific_actions=allow_cause_specific_actions,
     )
     if numbered:
         lines.extend(numbered)
@@ -2432,9 +2843,10 @@ def _detail_from(
         _knowledge_base_lines(
             kg_context,
             root_cause_candidates,
-            _observed_text(results, request),
+            observed_text,
             _alert_text(request),
             masker,
+            allow_remediation=allow_cause_specific_actions,
         )
     )
     operator_prompt = annotations.get("operator_prompt")
@@ -2458,7 +2870,7 @@ def _detail_from(
     lines.extend(
         _playbook_lines(
             root_cause_candidates,
-            _observed_text(results, request),
+            observed_text,
             failure_modes or {},
             troubleshooting_cases,
             known_issues or [],
@@ -2466,6 +2878,7 @@ def _detail_from(
             components,
             masker,
             component=getattr(plan, "component", "") if plan is not None else "",
+            allow_remediation=allow_cause_specific_actions,
         )
     )
     lines.extend(_similar_incident_lines(request))
@@ -2480,7 +2893,38 @@ def _detail_from(
             "```",
         ]
     )
+    if _needs_general_guidance(root_cause_candidates, eligible_support_ids):
+        lines.extend(
+            [
+                "",
+                _general_guidance_heading(language),
+                "",
+                *general_guidance_lines(
+                    _alert_text(request),
+                    failure_modes or {},
+                    known_issues or [],
+                    language=language,
+                    masker=masker,
+                ),
+            ]
+        )
     return "\n".join(lines)
+
+
+def _needs_general_guidance(
+    candidates: list[RankedCause] | None, eligible_support_ids: set[str] | None
+) -> bool:
+    """Show non-diagnostic help only when the RCA cannot support an action."""
+    top_family = candidates[0].family if candidates else ""
+    return top_family in ("", "insufficient_evidence") or eligible_support_ids == set()
+
+
+def _general_guidance_heading(language: str) -> str:
+    return (
+        "## 일반 점검 가이드 (현재 RCA 결론 아님)"
+        if language == "ko"
+        else "## General Troubleshooting Guidance (Not a Current RCA Conclusion)"
+    )
 
 
 async def _translate_playbook_ko(settings: Settings, detail: str) -> str:
@@ -2536,14 +2980,26 @@ def _insert_before_appendix(detail: str, block: str) -> str:
     return f"{detail}\n\n{block}"
 
 
-def _supporting_evidence(results: list[CollectorResult]) -> list[tuple[str, str]]:
-    """Up to 4 (agent, finding) pairs with a REAL finding — no no-evidence lines."""
+def _append_general_guidance(detail: str, block: str) -> str:
+    """Keep non-diagnostic guidance outside the RCA conclusion and action sections."""
+    return f"{detail.rstrip()}\n\n{block}"
+
+
+def _supporting_evidence(
+    results: list[CollectorResult], *, eligible_support_ids: set[str] | None = None
+) -> list[tuple[str, str]]:
+    """Up to four scoped positive findings for the Root Cause section.
+
+    The Appendix can retain partial/current context for an operator, but this
+    headline section must agree with the ranker and self-check: a successful
+    query alone is not proof that its signal was present during the incident.
+    """
     picked: list[tuple[str, str]] = []
     for result in results:
         if result.status not in ("ok", "partial"):
             continue
-        line = _best_evidence_line(result)
-        if line.startswith(NO_EVIDENCE):
+        line = _artifact_evidence_line(result, eligible_support_ids=eligible_support_ids)
+        if not line:
             continue
         picked.append((result.agent, line))
         if len(picked) >= 4:
@@ -2805,37 +3261,50 @@ def _numbered_actions(
     request: AlertAnalysisRequest,
     known_issues: list[dict] | None = None,
     components: dict[str, dict] | None = None,
+    *,
+    allow_graph_remediation: bool = True,
+    allow_cause_specific_actions: bool | None = None,
 ) -> list[str]:
     """One deduped, numbered priority list — documented-alert fixes first, then
     the alert target's own component checks, then recognised known-issue fixes,
     graph-derived and curated family fixes, then infra-restore steps."""
+    # ``allow_graph_remediation`` predates the broader action gate and remains
+    # for callers outside the pipeline. In a real report, every remedy that
+    # depends on a candidate (catalog, component, prior, graph, playbook) must
+    # obey the same evidence boundary as graph remediation.
+    if allow_cause_specific_actions is None:
+        allow_cause_specific_actions = allow_graph_remediation
     ordered: list[str] = []
     specific_actions = 0
     fuzzy = _alert_text(request)
     top_family = candidates[0].family if candidates else ""
     filter_to_top = _top_family_settled(candidates)
-    if plan is not None and plan.matched_alert:
+    if allow_cause_specific_actions and plan is not None and plan.matched_alert:
         alert_family = str(plan.matched_alert.get("family") or "")
         if (not top_family or alert_family == top_family) and top_family != "insufficient_evidence":
             ordered.extend(str(a) for a in plan.matched_alert.get("actions", []))
     # Component identity: the alert target IS this platform component, so its
     # own checks + dependency chain (e.g. runai-container-toolkit → the NVIDIA
     # GPU Operator stack) come before any keyword-matched guidance.
-    if plan is not None and getattr(plan, "component", ""):
+    if allow_cause_specific_actions and plan is not None and getattr(plan, "component", ""):
         component_actions = component_action_lines(components or {}, plan.component)
         specific_actions += len(component_actions)
         ordered.extend(component_actions)
     # Known operator cases recognised by their signature keywords in the evidence
     # (ranking-independent): version-regression / observability / expected-behavior
     # fixes surface even when the coarse family ranking points elsewhere.
-    if top_family != "insufficient_evidence":
+    if allow_cause_specific_actions and top_family != "insufficient_evidence":
         for issue in match_runai_known_issues(known_issues or [], observed_text, fuzzy_query=fuzzy):
             if filter_to_top and str(issue.get("family") or "") != top_family:
                 continue
             actions = [str(a) for a in issue.get("actions", [])]
             specific_actions += len(actions)
             ordered.extend(actions)
-    if graph_fixes is not None:
+    # Knowledge-graph/XID fixes are recommendations, not evidence.  The
+    # production report passes False when its artifact eligibility gate found
+    # no target/window-scoped support, preventing an unavailable or unrelated
+    # observation from turning a historical graph edge into an instruction.
+    if graph_fixes is not None and allow_cause_specific_actions:
         specific_actions += len(graph_fixes.family_fixes)
         ordered.extend(graph_fixes.family_fixes)
         root_codes = {r for roots in graph_fixes.root_xids.values() for r in roots}
@@ -2848,7 +3317,7 @@ def _numbered_actions(
     # Curated failure-mode fixes for the settled top family only. The promotion
     # step already used cross-family signatures to choose that family; repeating
     # every side-match here pollutes actions with stale/context text.
-    if top_family != "insufficient_evidence":
+    if allow_cause_specific_actions and top_family != "insufficient_evidence":
         for family, symptom in match_failure_mode_symptoms(
             failure_modes, observed_text, top_family, fuzzy_query=fuzzy
         ):
@@ -2863,7 +3332,8 @@ def _numbered_actions(
             missing,
             request,
             include_similar=(
-                specific_actions == 0 or _similar_incident_relevant(request, fuzzy)
+                allow_cause_specific_actions
+                and (specific_actions == 0 or _similar_incident_relevant(request, fuzzy))
             ),
         )
     )
@@ -3050,13 +3520,48 @@ def _alert_text(request: AlertAnalysisRequest) -> str:
     (e.g. 'XID 79 ... GPU has fallen off the bus') even when every collector
     comes back empty."""
     alert = request.alert
-    parts = [str(v) for v in (alert.labels or {}).values()]
+    labels = alert.labels or {}
+    # Prometheus/Kubernetes alerts commonly encode a Boolean condition across
+    # two independent labels (for example condition=DiskPressure,status=false).
+    # Flattening mapping values preserves sender insertion order, so a false
+    # value before its condition could evade the keyword negation logic and turn
+    # a healthy condition into RCA support. Recompose that structured pair
+    # before adding ordinary label values.
+    normalized = {str(key).casefold(): str(value) for key, value in labels.items()}
+    condition_keys = [key for key in normalized if "condition" in key and normalized[key].strip()]
+    state_key = next(
+        (
+            key
+            for key in ("status", "value", "active", "state")
+            if normalized.get(key, "").strip()
+        ),
+        "",
+    )
+    paired = set(condition_keys)
+    if state_key and condition_keys:
+        paired.add(state_key)
+    parts = [
+        (
+            f"{normalized[key]} is {normalized[state_key]}"
+            if state_key
+            else normalized[key]
+        )
+        for key in condition_keys
+    ]
+    parts.extend(
+        str(value)
+        for key, value in labels.items()
+        if str(key).casefold() not in paired
+    )
     parts.extend(str(v) for v in (alert.annotations or {}).values())
     return " ".join(parts)
 
 
 def _observed_text(
-    results: list[CollectorResult], request: AlertAnalysisRequest | None = None
+    results: list[CollectorResult],
+    request: AlertAnalysisRequest | None = None,
+    *,
+    eligible_support_ids: set[str] | None = None,
 ) -> str:
     from app.services.root_cause_ranking import COLLECTOR_TEXT_DROP_KEYS
 
@@ -3070,9 +3575,20 @@ def _observed_text(
         if not _collector_is_evidence(result):
             continue
         drop_keys = COLLECTOR_TEXT_DROP_KEYS.get(getattr(result, "agent", ""))
-        if result.summary:
+        artifacts = list(result.artifacts)
+        # Once a collector publishes typed observations, do not let its broad
+        # summary/current snapshot re-enter signature promotion by keyword. The
+        # alert's own text above remains a separate direct observation, while
+        # legacy collectors retain their compatibility path until upgraded.
+        if any(_artifact_observation(art) is not None for art in artifacts):
+            artifacts = [
+                art
+                for art in artifacts
+                if _artifact_is_scoped_support(art, eligible_support_ids=eligible_support_ids)
+            ]
+        elif result.summary:
             parts.append(result.summary)
-        for art in result.artifacts:
+        for art in artifacts:
             if not _artifact_is_evidence(art):
                 continue
             if art.summary:
@@ -3139,6 +3655,8 @@ def _knowledge_base_lines(
     observed_text: str = "",
     fuzzy_query: str = "",
     masker: Masker | None = None,
+    *,
+    allow_remediation: bool = True,
 ) -> list[str]:
     if not kg_context or not kg_context.get("enabled"):
         return []
@@ -3169,11 +3687,17 @@ def _knowledge_base_lines(
                 limit=320,
             )
             body.append(f"  - {incident_id}: {summary}")
-    body.extend(
-        _kb_remediation_lines(
-            kg_context, candidates, observed_text, fuzzy_query, active_masker
+    if allow_remediation:
+        body.extend(
+            _kb_remediation_lines(
+                kg_context, candidates, observed_text, fuzzy_query, active_masker
+            )
         )
-    )
+    elif kg_context.get("knowledge"):
+        body.append(
+            "- Knowledge-base remediation is withheld until a current "
+            "target/window-scoped observation is available."
+        )
     if not body:
         body.append("- No related knowledge-graph facts were found for this entity yet.")
     return ["", "### Knowledge Base (Ontology)", "", *body]
@@ -3226,6 +3750,8 @@ def _playbook_lines(
     components: dict[str, dict] | None = None,
     masker: Masker | None = None,
     component: str = "",
+    *,
+    allow_remediation: bool = True,
 ) -> list[str]:
     """Root-cause-relevant remediation, most specific first.
 
@@ -3235,6 +3761,11 @@ def _playbook_lines(
     already been used to pick that top family; unrelated side text should not
     become playbook guidance.
     """
+    if not allow_remediation:
+        return [
+            "- Specific playbook remediation is withheld until a current "
+            "target/window-scoped observation is available."
+        ]
     lines: list[str] = []
     active_masker = masker or build_masker(())
     top_family = candidates[0].family if candidates else ""
@@ -3396,6 +3927,9 @@ def _appendix_evidence_line(result: CollectorResult) -> str:
     artifact_line = _artifact_evidence_line(result)
     if artifact_line:
         return artifact_line
+    context_line = _artifact_evidence_line(result, include_context=True)
+    if context_line:
+        return context_line
     unavailable_line = _artifact_evidence_line(result, include_unavailable=True)
     return unavailable_line or _best_evidence_line(result)
 
@@ -3407,10 +3941,19 @@ _GENERIC_ARTIFACT_SUMMARY_RE = re.compile(
 
 
 def _artifact_evidence_line(
-    result: CollectorResult, *, include_unavailable: bool = False
+    result: CollectorResult,
+    *,
+    include_unavailable: bool = False,
+    include_context: bool = False,
+    eligible_support_ids: set[str] | None = None,
 ) -> str:
     for art in reversed(getattr(result, "artifacts", []) or []):
-        if not _artifact_is_evidence(art) and not include_unavailable:
+        is_context = getattr(art, "status", "") in ("ok", "partial")
+        if (
+            not _artifact_is_scoped_support(art, eligible_support_ids=eligible_support_ids)
+            and not (include_context and is_context)
+            and not include_unavailable
+        ):
             continue
         summary = " ".join(str(art.summary or "").split())
         result_text = _evidence_leaf_text(art.result, limit=500) if art.result is not None else ""
@@ -3431,7 +3974,36 @@ def _artifact_evidence_line(
 
 
 def _artifact_is_evidence(art: object) -> bool:
+    """Whether an artifact is usable investigation input in any capacity."""
     return getattr(art, "status", "") in ("ok", "partial")
+
+
+def _artifact_is_scoped_support(
+    art: object, *, eligible_support_ids: set[str] | None = None
+) -> bool:
+    """Whether an artifact may be printed as Root Cause supporting evidence."""
+    observation = _artifact_observation(art)
+    if observation is None:
+        return False
+    raw_support = (
+        str(observation.get("polarity") or "").strip().lower() == "present"
+        and str(observation.get("coverage") or "").strip().lower() == "scoped"
+    )
+    if not raw_support:
+        return False
+    if eligible_support_ids is None:
+        return True
+    # Once the pipeline has a contextual eligibility map, an E-id missing from
+    # it is not merely "legacy" evidence: it is not approved for this report.
+    return str(getattr(art, "evidence_id", "") or "") in eligible_support_ids
+
+
+def _artifact_observation(art: object) -> dict[str, object] | None:
+    result = getattr(art, "result", None)
+    if not isinstance(result, dict):
+        return None
+    observation = result.get("observation")
+    return observation if isinstance(observation, dict) else None
 
 
 def _collector_is_evidence(result: object) -> bool:
@@ -3726,13 +4298,18 @@ async def _sharpen_operator_questions(
 _XID_PATTERN = re.compile(r"\bxid\s*(?:\([^)]*\))?\s*[:=]?\s*(\d{1,4})", re.IGNORECASE)
 
 
-def _xid_codes_from_results(results: list[CollectorResult], alert_text: str = "") -> list[int]:
+def _xid_codes_from_results(
+    results: list[CollectorResult],
+    alert_text: str = "",
+    *,
+    eligible_support_ids: set[str] | None = None,
+) -> list[int]:
     """Distinct NVIDIA Xid codes in the alert's own text + loki/system/kubernetes
     evidence. The alert text matters: an NVRM Xid alert names its code even when
     every collector comes back empty."""
     texts = [alert_text] if alert_text else []
     texts.extend(
-        _stringify_result(result)
+        _stringify_result(result, eligible_support_ids=eligible_support_ids)
         for result in results
         if result.agent in ("loki", "system", "kubernetes") and _collector_is_evidence(result)
     )
@@ -3757,9 +4334,29 @@ def _gpu_model_from(target: AnalysisTarget, results: list[CollectorResult]) -> s
     return ""
 
 
-def _stringify_result(result: CollectorResult) -> str:
-    parts = [result.summary or ""]
+def _stringify_result(
+    result: CollectorResult, *, eligible_support_ids: set[str] | None = None
+) -> str:
+    """Render only causally usable text for signature-specific extractors.
+
+    Structured collectors distinguish an observation's polarity and temporal
+    coverage.  Their broad summaries/details are often live topology or query
+    metadata, so letting those strings back into an extractor (such as Xid)
+    would bypass the scoped-evidence rule used by ``_observed_text``.  Legacy
+    collectors retain their existing text path until they publish observations.
+    """
     artifacts = getattr(result, "artifacts", []) or []
+    structured = any(_artifact_observation(art) is not None for art in artifacts)
+    if structured:
+        artifacts = [
+            art
+            for art in artifacts
+            if _artifact_is_scoped_support(
+                art, eligible_support_ids=eligible_support_ids
+            )
+        ]
+
+    parts = [] if structured else [result.summary or ""]
     parts.extend(art.summary or "" for art in artifacts if _artifact_is_evidence(art))
     parts.extend(
         _evidence_leaf_text(art.result)
@@ -3767,7 +4364,7 @@ def _stringify_result(result: CollectorResult) -> str:
         if _artifact_is_evidence(art) and art.result
     )
     details = getattr(result, "details", {})
-    if details:
+    if details and not structured:
         parts.append(_evidence_leaf_text(details))
     return " ".join(parts)
 

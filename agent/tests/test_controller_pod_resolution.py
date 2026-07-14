@@ -122,7 +122,9 @@ async def test_job_without_selector_uses_standard_job_label(monkeypatch) -> None
 async def test_resolved_controller_pod_logs_are_collected(monkeypatch) -> None:
     calls: list[tuple[str, str]] = []
 
-    async def fake_k8s_logs(settings, namespace, pod, container="", tail=0):
+    async def fake_k8s_logs(
+        settings, namespace, pod, container="", tail=0, previous=False, since_time=""
+    ):
         calls.append((pod, container))
         return {"status_code": 200, "error": None, "lines": ["Traceback: boom"]}
 
@@ -154,7 +156,7 @@ async def test_collector_drills_controller_alert_down_to_pod_logs(monkeypatch) -
     async def fake_resolution(settings, target):
         return {"selected_pod": "api-failed", "selector": "app=api"}
 
-    async def fake_describe(settings, kind, namespace="", name=""):
+    async def fake_describe(settings, kind, namespace="", name="", **_kwargs):
         return {
             "object": {
                 "metadata": {"name": name, "namespace": namespace},
@@ -167,7 +169,7 @@ async def test_collector_drills_controller_alert_down_to_pod_logs(monkeypatch) -
             "events": [{"type": "Warning", "reason": "BackoffLimitExceeded"}],
         }
 
-    async def fake_resolved_logs(settings, target, containers):
+    async def fake_resolved_logs(settings, target, containers, **_kwargs):
         assert target.pod == "api-failed"
         assert containers == ["api"]
         return [

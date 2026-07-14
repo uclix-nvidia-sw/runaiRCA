@@ -5,6 +5,7 @@ from dataclasses import replace
 
 from app.collectors.base import NO_EVIDENCE, CollectorResult
 from app.schemas import AlertAnalysisArtifact
+from app.services.evidence_blackboard import EvidenceEligibility
 from app.services.root_cause_ranking import RankedCause
 from app.services.self_check import refute_top_cause, verify_matches
 from tests.test_orchestrator import make_settings
@@ -48,11 +49,25 @@ def test_no_llm_downgrades_when_canonical_reports_no_evidence():
     assert out["confidence"] == "low"
 
 
-def test_no_llm_keeps_confidence_when_canonical_evidence_present():
+def test_no_llm_keeps_confidence_when_canonical_evidence_is_scoped_and_present():
     settings = make_settings()
     results = [
         CollectorResult(
-            agent="kubernetes", status="ok", summary="Node condition DiskPressure=True; evictions"
+            agent="kubernetes",
+            status="ok",
+            summary="Node condition DiskPressure=True; evictions",
+            artifacts=[
+                AlertAnalysisArtifact(
+                    agent="kubernetes",
+                    source="kubernetes",
+                    type="warning_events",
+                    status="ok",
+                    summary="DiskPressure active during incident window",
+                    result={
+                        "observation": {"polarity": "present", "coverage": "scoped"}
+                    },
+                )
+            ],
         ),
         CollectorResult(agent="prometheus", status="ok", summary="disk saturated"),
     ]
@@ -76,7 +91,10 @@ def test_no_llm_keeps_confidence_when_canonical_artifact_has_evidence():
                     type="drilldown_query",
                     status="ok",
                     summary="1 row(s)",
-                    result={"message": "DiskPressure=True from node condition"},
+                    result={
+                        "message": "DiskPressure=True from node condition",
+                        "observation": {"polarity": "present", "coverage": "scoped"},
+                    },
                 )
             ],
         )
@@ -86,6 +104,71 @@ def test_no_llm_keeps_confidence_when_canonical_artifact_has_evidence():
 
     assert out["confidence"] == "high"
     assert out["caveat"] == ""
+
+
+def test_no_llm_downgrades_when_canonical_artifact_is_ineligible_for_incident():
+    """A typed observation for another target/window is context, not self-check support."""
+    finding = AlertAnalysisArtifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="drilldown_query",
+        status="ok",
+        summary="DiskPressure=True on a replacement Pod after resolution",
+        result={"observation": {"polarity": "present", "coverage": "scoped"}},
+    )
+    finding.evidence_id = "E01"
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary=NO_EVIDENCE,
+            artifacts=[finding],
+        )
+    ]
+
+    out = _run(
+        refute_top_cause(
+            make_settings(),
+            _top(confidence="high"),
+            results,
+            evidence_eligibility={
+                "E01": EvidenceEligibility(
+                    False, False, False, "evidence targets a different entity"
+                )
+            },
+        )
+    )
+
+    assert out["confidence"] == "medium"
+    assert out["caveat"]
+
+
+def test_no_llm_downgrades_when_canonical_summary_is_only_partial_context():
+    settings = make_settings()
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary="DiskPressure appears in a current snapshot",
+            artifacts=[
+                AlertAnalysisArtifact(
+                    agent="kubernetes",
+                    source="kubernetes",
+                    type="cluster_api",
+                    status="ok",
+                    summary="current Kubernetes context",
+                    result={
+                        "observation": {"polarity": "unknown", "coverage": "partial"}
+                    },
+                )
+            ],
+        )
+    ]
+
+    out = _run(refute_top_cause(settings, _top(confidence="high"), results))
+
+    assert out["confidence"] == "medium"
+    assert out["caveat"]
 
 
 def test_no_llm_ignores_unavailable_canonical_artifact_as_evidence():
@@ -185,6 +268,46 @@ def test_llm_unsupported_downgrades_and_marks_refuted():
     assert out["refuted"] is True
     assert out["confidence"] == "low"
     assert out["caveat"] == "Competing cause fits better."
+
+
+def test_llm_cannot_keep_confidence_from_context_only_evidence(monkeypatch):
+    settings = replace(make_settings(), llm_model_self_check="m")
+
+    async def fake_complete_json(*_a, **_k):
+        # This is exactly the unsafe response we must not trust: it treats a
+        # current context snapshot as proof of a historical incident cause.
+        return {
+            "supported": True,
+            "confidence": "high",
+            "caveat": "Current snapshot looks bad.",
+        }
+
+    monkeypatch.setattr("app.services.self_check.llm_configured", lambda *_a, **_k: True)
+    monkeypatch.setattr("app.services.self_check.complete_json", fake_complete_json)
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary="current DiskPressure context",
+            artifacts=[
+                AlertAnalysisArtifact(
+                    agent="kubernetes",
+                    source="kubernetes",
+                    type="cluster_api",
+                    status="ok",
+                    result={
+                        "observation": {"polarity": "unknown", "coverage": "partial"}
+                    },
+                )
+            ],
+        )
+    ]
+
+    out = _run(refute_top_cause(settings, _top(confidence="high"), results))
+
+    assert out["confidence"] == "medium"
+    assert out["refuted"] is True
+    assert out["next_check"]
 
 
 def test_llm_caveat_and_next_check_are_single_line(monkeypatch):

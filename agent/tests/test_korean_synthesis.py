@@ -462,6 +462,118 @@ async def test_korean_synthesis_skips_unavailable_artifacts(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
+async def test_korean_synthesis_withholds_graph_actions_without_scoped_support(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko")
+    captured: list[str] = []
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        captured.append(user)
+        return {"summary": "요약", "detail": "본문"}
+
+    class RejectedEligibility:
+        def permits(self, _role: str) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "GenericAlert"})
+        ),
+        results=[CollectorResult(agent="system", status="ok", summary="current snapshot only")],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="gpu_hardware_error", confidence="medium", score=7.0)
+        ],
+        kg_context={},
+        graph_fixes=GraphRemediation(
+            family_fixes=["Reset the implicated GPU."],
+            xid_fixes={79: ["Replace the GPU after hardware validation."]},
+        ),
+        fallback_detail="fallback",
+        evidence_eligibility={"E01": RejectedEligibility()},
+    )
+
+    payload = json.loads(captured[0].removeprefix("증거(JSON):\n"))
+    graph = payload["graph_remediation"]
+    assert graph["family_fixes"] == []
+    assert graph["xid_fixes"] == {}
+    assert "no target/window-scoped supporting observation" in graph["warnings"][0]
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_withholds_all_remediation_context_without_scoped_support(
+    monkeypatch,
+) -> None:
+    """Catalog/prior/playbook inputs must not bypass the graph-only gate."""
+    settings = replace(make_settings(), language="ko")
+    captured: list[str] = []
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        captured.append(user)
+        return {"summary": "요약", "detail": "본문"}
+
+    class RejectedEligibility:
+        def permits(self, _role: str) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "GenericAlert"}),
+            similar_incidents=[
+                SimilarIncidentContext(
+                    incident_id="old",
+                    similarity=0.99,
+                    analysis_summary="UNSCOPED-PAST-REMEDY",
+                )
+            ],
+        ),
+        results=[CollectorResult(agent="system", status="ok", summary="context only")],
+        plan=InvestigationPlan(
+            matched_alert={"actions": ["UNSCOPED-CATALOG-REMEDY"]},
+            case_cards=[{"action": "UNSCOPED-CASE-CARD"}],
+        ),
+        root_cause_candidates=[
+            RankedCause(family="gpu_hardware_error", confidence="medium", score=7.0)
+        ],
+        kg_context={
+            "knowledge": {"gpu_hardware_error": [{"actions": ["UNSCOPED-KB-REMEDY"]}]},
+            "prior_incidents": [{"analysis_summary": "UNSCOPED-PRIOR-REMEDY"}],
+            "case_cards": [{"action": "UNSCOPED-KG-CASE"}],
+        },
+        graph_fixes=GraphRemediation(family_fixes=["UNSCOPED-GRAPH-REMEDY"]),
+        fallback_detail="fallback",
+        troubleshooting_path={"path": ["UNSCOPED-PATH-REMEDY"]},
+        evidence_eligibility={"E01": RejectedEligibility()},
+    )
+
+    payload = json.loads(captured[0].removeprefix("증거(JSON):\n"))
+    assert payload["remediation_evidence"]["scoped_support"] is False
+    assert payload["matched_alert"] is None
+    assert payload["similar_incidents"] == []
+    assert "troubleshooting_path" not in payload
+    assert payload["knowledge_graph"]["knowledge"] == {}
+    assert payload["plan"]["case_cards"] == []
+    for forbidden in (
+        "UNSCOPED-CATALOG-REMEDY",
+        "UNSCOPED-CASE-CARD",
+        "UNSCOPED-KB-REMEDY",
+        "UNSCOPED-PRIOR-REMEDY",
+        "UNSCOPED-KG-CASE",
+        "UNSCOPED-GRAPH-REMEDY",
+        "UNSCOPED-PAST-REMEDY",
+        "UNSCOPED-PATH-REMEDY",
+    ):
+        assert forbidden not in captured[0]
+
+
+@pytest.mark.asyncio
 async def test_korean_synthesis_sanitizes_unavailable_collector_summary(monkeypatch) -> None:
     settings = replace(make_settings(), language="ko")
     captured: list[str] = []
@@ -499,6 +611,69 @@ async def test_korean_synthesis_sanitizes_unavailable_collector_summary(monkeypa
     assert "DiskPressure" not in joined
     assert "evicted pods" not in joined
     assert NO_EVIDENCE in joined
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_exposes_condition_polarity(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko")
+    captured: list[str] = []
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        captured.append(user)
+        return {"summary": "요약", "detail": "본문"}
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    result = CollectorResult(agent="kubernetes", status="ok", summary="node checked")
+    result.artifacts.append(
+        artifact(
+            agent="kubernetes",
+            source="kubernetes",
+            type="cluster_api",
+            status="ok",
+            confidence="high",
+            summary="node conditions checked",
+            result={
+                "conditions": [
+                    {"type": "MemoryPressure", "status": "False"},
+                    {"type": "DiskPressure", "status": "True"},
+                ]
+            },
+        )
+    )
+
+    await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "NodeCondition"})
+        ),
+        results=[result],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="node_kubelet_pressure", confidence="medium", score=5.0)
+        ],
+        kg_context={},
+        graph_fixes=GraphRemediation(),
+        fallback_detail="fallback",
+    )
+
+    payload = json.loads(captured[0].removeprefix("증거(JSON):\n"))
+    checks = payload["collector_findings"][0]["context_artifacts"][0]["condition_checks"]
+    assert checks == [
+        {
+            "condition": "MemoryPressure",
+            "active": False,
+            "source": "kubernetes_condition",
+            "status": "False",
+        },
+        {
+            "condition": "DiskPressure",
+            "active": True,
+            "source": "kubernetes_condition",
+            "status": "True",
+        },
+    ]
 
 
 @pytest.mark.asyncio

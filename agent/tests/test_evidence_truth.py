@@ -19,14 +19,16 @@ from app.collectors.base import CollectorResult, artifact
 from app.collectors.kubernetes import (
     _collect_kubernetes_responses_via_mcp,
     _k8s_yaml_payload,
+    _pod_lifecycle_artifact,
     _target_pod_missing,
     k8s_read,
 )
 from app.knowledge import component_action_lines, component_for_target, load_architecture
+from app.schemas import Alert, AlertAnalysisRequest
 from app.services import pipeline
 from app.services.planner import plan_investigation
-from app.services.root_cause_ranking import rank_root_cause_candidates
-from app.schemas import Alert, AlertAnalysisRequest
+from app.services.root_cause_ranking import RankedCause, rank_root_cause_candidates
+from app.services.self_check import refute_top_cause
 from tests.test_orchestrator import make_settings, make_target
 
 COMPONENTS = load_architecture("knowledge/runai_architecture.yaml")
@@ -164,6 +166,80 @@ def test_observed_text_excludes_probe_query_values() -> None:
     # The probe strings must not become matchable "evidence".
     assert "cluster-sync" not in observed
     assert "authorization" not in observed
+
+
+@pytest.mark.asyncio
+async def test_context_only_artifacts_never_become_cross_layer_root_cause_support() -> None:
+    """Pin the shared contract across rank, signature text, and self-check.
+
+    Each collector's operational summary deliberately carries a scary keyword,
+    mimicking normal API/log output. None was observed in the incident window,
+    so all layers must keep it as context rather than mutually reinforcing a
+    false root cause.
+    """
+    context = {"observation": {"polarity": "unknown", "coverage": "partial"}}
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary="current node snapshot says DiskPressure=True",
+            artifacts=[
+                artifact(
+                    agent="kubernetes",
+                    source="kubernetes",
+                    type="cluster_api",
+                    status="ok",
+                    confidence="low",
+                    summary="current node snapshot says DiskPressure=True",
+                    result=context,
+                )
+            ],
+        ),
+        CollectorResult(
+            agent="prometheus",
+            status="ok",
+            summary="current metric sample suggests GPU quota exhausted",
+            artifacts=[
+                artifact(
+                    agent="prometheus",
+                    source="prometheus",
+                    type="promql_signal",
+                    status="ok",
+                    confidence="low",
+                    summary="current metric sample suggests GPU quota exhausted",
+                    result=context,
+                )
+            ],
+        ),
+        CollectorResult(
+            agent="change",
+            status="ok",
+            summary="live rollout context mentions controller panic",
+            artifacts=[
+                artifact(
+                    agent="change",
+                    source="kubernetes",
+                    type="change_detection",
+                    status="ok",
+                    confidence="low",
+                    summary="live rollout context mentions controller panic",
+                    result=context,
+                )
+            ],
+        ),
+    ]
+
+    observed = pipeline._observed_text(results)
+    ranked = rank_root_cause_candidates(_toolkit_target(), results)
+    self_check = await refute_top_cause(
+        make_settings(),
+        RankedCause("node_kubelet_pressure", "high", 8.0, evidence_agents=["kubernetes"]),
+        results,
+    )
+
+    assert all(token not in observed for token in ("diskpressure", "quota", "panic"))
+    assert ranked[0].family == "insufficient_evidence"
+    assert self_check["confidence"] == "medium"
     assert "runai-backend" not in observed
 
 
@@ -304,7 +380,8 @@ async def test_empty_datasource_uid_fails_fast_not_400(monkeypatch) -> None:
     # WITHOUT calling the MCP at all.
     import pytest as _pytest
 
-    from app.collectors import loki, prometheus as prom
+    from app.collectors import loki
+    from app.collectors import prometheus as prom
 
     async def boom(*args, **kwargs):  # must never be reached
         raise AssertionError("MCP was called with an empty datasource uid")
@@ -343,6 +420,25 @@ def test_target_pod_missing_detection() -> None:
     assert _target_pod_missing(target, gone_mcp) is True
     assert _target_pod_missing(target, rbac) is False
     assert _target_pod_missing(replace(target, pod=""), gone_direct) is False
+
+
+def test_target_pod_lifecycle_is_current_context_not_historical_cause() -> None:
+    target = make_target()
+    missing = _pod_lifecycle_artifact(
+        "kubernetes", target, [{"name": "pod", "status_code": 404, "error": "HTTP 404"}]
+    )
+    live = _pod_lifecycle_artifact(
+        "kubernetes", target, [{"name": "pod", "status_code": 200, "error": None, "data": {}}]
+    )
+
+    missing_observation = missing.result["observation"]
+    live_observation = live.result["observation"]
+    assert (missing_observation["state"], missing_observation["polarity"]) == (
+        "missing_now", "present"
+    )
+    assert (live_observation["state"], live_observation["coverage"]) == (
+        "live_now", "partial"
+    )
 
 
 @pytest.mark.asyncio

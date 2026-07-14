@@ -607,6 +607,52 @@ def _case_card_projection(run: Any, case_id: str) -> dict[str, Any]:
     return card
 
 
+_PRIOR_CONTEXT_TARGET_FIELDS = {
+    "cluster": "cluster",
+    "namespace": "namespace",
+    "project": "project",
+    "queue": "queue",
+    "workload": "workload_name",
+    "workload_type": "workload_type",
+    "pod": "pod",
+    "component": "component",
+}
+
+
+def _prior_is_context_compatible(item: dict[str, Any], target: AnalysisTarget) -> bool:
+    """Reject a historical CaseCard that explicitly names another entity.
+
+    The same Alertmanager rule can fire in many clusters, namespaces and
+    workloads.  TypeDB's same-alert lookup is intentionally broad for recall,
+    but an approved card's explicit context is a stronger identity claim than
+    the alert name.  Such a mismatch is historical *context*, not a prior for
+    this target, and must not steer the planner or enter few-shot summaries.
+
+    Sparse legacy cards remain usable: absence is unknown, not a mismatch.
+    """
+    card = item.get("case_card")
+    context = card.get("context") if isinstance(card, dict) else None
+    if not isinstance(context, dict):
+        return True
+    for context_key, target_key in _PRIOR_CONTEXT_TARGET_FIELDS.items():
+        historical = _card_text(context.get(context_key), 160)
+        current = _card_text(getattr(target, target_key, ""), 160)
+        if historical and current and historical.casefold() != current.casefold():
+            return False
+    # A planned/live-inferred node is not alert provenance.  Only an alert
+    # declared node may disqualify a historical card by node identity.
+    historical_node = _card_text(context.get("node"), 160)
+    current_node = _card_text(getattr(target, "node", ""), 160)
+    if (
+        historical_node
+        and current_node
+        and str(getattr(target, "node_source", "") or "") in {"", "alert"}
+        and historical_node.casefold() != current_node.casefold()
+    ):
+        return False
+    return True
+
+
 def _query_kg(
     client: TypeDBClient,
     target: AnalysisTarget,
@@ -713,6 +759,13 @@ def _query_kg(
             }
         )
 
+    # A same-alert match is only a retrieval candidate.  Do not admit an
+    # approved historical card that explicitly belongs to another entity:
+    # otherwise an alert rule shared across tenants can silently make a
+    # cross-namespace prior look like evidence for this incident.
+    prior = [
+        item for item in prior if _prior_is_context_compatible(item, target)
+    ]
     prior = _rrf_case_priors(prior, similar_incidents or [])
     case_cards = _select_case_cards(prior, target)
     return {

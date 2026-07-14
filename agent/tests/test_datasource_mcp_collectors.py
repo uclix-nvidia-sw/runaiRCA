@@ -21,11 +21,13 @@ class _McpResult:
 @pytest.mark.asyncio
 async def test_prometheus_collector_uses_mcp_before_direct_http(monkeypatch) -> None:
     calls: list[str] = []
+    query_args: list[dict] = []
 
     async def fake_mcp_call(url, tool, arguments):
         calls.append(tool)
         if tool == "list_datasources":
             return _McpResult([{"type": "prometheus", "uid": "prom"}])
+        query_args.append(arguments)
         return _McpResult(
             {"status": "success", "data": {"result": [{"metric": {}, "value": [1, "1"]}]}}
         )
@@ -41,10 +43,23 @@ async def test_prometheus_collector_uses_mcp_before_direct_http(monkeypatch) -> 
             prometheus_url="http://prometheus",
             prometheus_mcp_url="http://grafana-mcp/mcp",
         )
-    ).collect(make_target())
+    ).collect(
+        replace(
+            make_target(),
+            fired_at="2026-07-10T01:00:00Z",
+            resolved_at="2026-07-10T01:10:00Z",
+        )
+    )
 
     assert result.details["used_mcp"] is True
     assert "query_prometheus" in calls
+    assert query_args
+    assert all(args["datasourceUid"] == "prom" for args in query_args)
+    assert all(args["queryType"] == "range" for args in query_args)
+    assert all(args["startTime"] == "2026-07-10T00:55:00Z" for args in query_args)
+    assert all(args["endTime"] == "2026-07-10T01:15:00Z" for args in query_args)
+    assert all(args["stepSeconds"] == 60 and "expr" in args for args in query_args)
+    assert all("query" not in args and "datasource_uid" not in args for args in query_args)
 
 
 @pytest.mark.asyncio
@@ -78,6 +93,58 @@ async def test_prometheus_collector_falls_back_to_direct_http_on_mcp_failure(
     assert result.details["used_mcp"] is False
     assert direct_calls > 0
     assert any("MCP unavailable; used direct API fallback" in w for w in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_prometheus_mcp_error_payload_is_not_a_scoped_absence(monkeypatch) -> None:
+    async def fake_mcp_call(url, tool, arguments):
+        if tool == "list_datasources":
+            return _McpResult([{"type": "prometheus", "uid": "prom"}])
+        return _McpResult(
+            {
+                "status": "error",
+                "errorType": "bad_data",
+                "error": "invalid parameter query",
+            }
+        )
+
+    monkeypatch.setattr(prometheus, "mcp_call", fake_mcp_call)
+    result = await prometheus.PrometheusCollector(
+        replace(make_settings(), prometheus_mcp_url="http://grafana-mcp/mcp")
+    ).collect(
+        replace(
+            make_target(),
+            fired_at="2026-07-10T01:00:00Z",
+            resolved_at="2026-07-10T01:10:00Z",
+        )
+    )
+
+    assert result.status == "unavailable"
+    assert all(query["error"] for query in result.details["queries"])
+    signals = [artifact for artifact in result.artifacts if artifact.type == "promql_signal"]
+    assert all(artifact.result["observation"]["polarity"] == "unavailable" for artifact in signals)
+
+
+@pytest.mark.asyncio
+async def test_prometheus_mcp_misrouted_list_is_not_metric_evidence(monkeypatch) -> None:
+    async def fake_mcp_call(url, tool, arguments):
+        if tool == "list_datasources":
+            return _McpResult([{"type": "prometheus", "uid": "prom"}])
+        return _McpResult({"datasources": [{"uid": "loki", "type": "loki"}]})
+
+    monkeypatch.setattr(prometheus, "mcp_call", fake_mcp_call)
+    result = await prometheus.PrometheusCollector(
+        replace(make_settings(), prometheus_mcp_url="http://grafana-mcp/mcp")
+    ).collect(
+        replace(
+            make_target(),
+            fired_at="2026-07-10T01:00:00Z",
+            resolved_at="2026-07-10T01:10:00Z",
+        )
+    )
+
+    assert result.status == "unavailable"
+    assert all("recognized metric result" in str(item["error"]) for item in result.details["queries"])
 
 
 @pytest.mark.asyncio
@@ -137,6 +204,40 @@ async def test_loki_mcp_parses_grafana_log_entries(monkeypatch) -> None:
     assert result["status"] == "success"
     assert result["line_count"] == 20
     assert result["sample_lines"] == ["scheduler reconciled workload"]
+    assert result["sample_entries"][0]["timestamp"].endswith("Z")
+    assert result["sample_entries"][0]["line"] == "scheduler reconciled workload"
+    assert result["sample_entries"][0]["labels"] == {"namespace": "runai"}
+    assert result["stream_labels_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_loki_mcp_malformed_success_body_is_not_an_empty_log_search(
+    monkeypatch,
+) -> None:
+    async def fake_mcp_call(url, tool, arguments):
+        return _McpResult({"status": "success", "data": {}})
+
+    monkeypatch.setattr(loki, "mcp_call", fake_mcp_call)
+    result = await loki._mcp_query_loki(
+        "http://grafana-mcp/mcp", "smoke", '{namespace="runai"}', 20, "loki"
+    )
+
+    assert result["line_count"] == 0
+    assert result["error"] == "Loki MCP response missing a recognized log result"
+
+
+@pytest.mark.asyncio
+async def test_loki_mcp_unrelated_list_is_not_an_empty_log_search(monkeypatch) -> None:
+    async def fake_mcp_call(url, tool, arguments):
+        return _McpResult({"data": [{"uid": "prom", "type": "prometheus"}]})
+
+    monkeypatch.setattr(loki, "mcp_call", fake_mcp_call)
+    result = await loki._mcp_query_loki(
+        "http://grafana-mcp/mcp", "smoke", '{namespace="runai"}', 20, "loki"
+    )
+
+    assert result["line_count"] == 0
+    assert result["error"] == "Loki MCP response missing a recognized log result"
 
 
 @pytest.mark.asyncio
@@ -160,8 +261,14 @@ async def test_loki_mcp_queries_the_alert_time_window(monkeypatch) -> None:
     ).collect(target)
 
     assert query_args
-    assert all(args["startTime"] == "2026-07-10T00:55:00Z" for args in query_args)
-    assert all(args["endTime"] == "2026-07-10T01:15:00Z" for args in query_args)
+    assert all(args["datasourceUid"] == "loki" for args in query_args)
+    assert all(args["direction"] == "backward" for args in query_args)
+    assert all(args["queryType"] == "range" for args in query_args)
+    assert all(args["startRfc3339"] == "2026-07-10T00:55:00Z" for args in query_args)
+    assert all(args["endRfc3339"] == "2026-07-10T01:15:00Z" for args in query_args)
+    assert all("logql" in args for args in query_args)
+    assert all("query" not in args and "datasource_uid" not in args for args in query_args)
+    assert all("startTime" not in args and "endTime" not in args for args in query_args)
 
 
 @pytest.mark.asyncio
@@ -220,6 +327,20 @@ async def test_postgres_collector_uses_mcp_before_asyncpg(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_postgres_mcp_malformed_success_is_unavailable(monkeypatch) -> None:
+    async def fake_mcp_call(url, tool, arguments):
+        return _McpResult({"status": "success"})
+
+    monkeypatch.setattr(postgres, "mcp_call", fake_mcp_call)
+    result = await postgres.PostgresCollector(
+        replace(make_settings(), postgres_mcp_url="http://postgres-mcp/mcp")
+    ).collect(make_target())
+
+    assert result.status == "unavailable"
+    assert any("recognized row result" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
 async def test_kubernetes_collector_uses_mcp_before_service_account_token(
     monkeypatch,
 ) -> None:
@@ -227,7 +348,7 @@ async def test_kubernetes_collector_uses_mcp_before_service_account_token(
 
     async def fake_mcp_call(url, tool, arguments):
         calls.append(tool)
-        if tool == "pods_get":
+        if tool in {"pods_get", "resources_get"}:
             return _McpResult(
                 {
                     "metadata": {"name": "trainer-0", "namespace": "runai-vision"},
@@ -253,12 +374,35 @@ async def test_kubernetes_collector_uses_mcp_before_service_account_token(
     monkeypatch.setattr(kubernetes, "mcp_call", fake_mcp_call)
     monkeypatch.setattr(kubernetes, "_read_file", token_should_not_be_read)
     result = await kubernetes.KubernetesCollector(
-        replace(make_settings(), kubernetes_mcp_url="http://kubernetes-mcp/mcp")
+        replace(
+            make_settings(),
+            kubernetes_mcp_url="http://kubernetes-mcp/mcp",
+            enable_pod_exec=False,
+        )
     ).collect(make_target())
 
     assert result.details["used_mcp"] is True
     assert "pods_get" in calls
     assert "pods_log" in calls
+    assert "events_list" in calls or "resources_list" in calls
+    inspection = next(a for a in result.artifacts if a.type == "pod_inspection")
+    assert inspection.query == (
+        "kubectl get pod trainer-0 -n runai-vision -o yaml; "
+        "kubectl describe pod trainer-0 -n runai-vision"
+    )
+    assert inspection.result["object"]["spec"]["containers"][0]["name"] == "main"
+    assert inspection.result["observation"] == {
+        "kind": "kubernetes_pod_snapshot",
+        "predicate": "kubernetes_pod_snapshot",
+        "polarity": "unknown",
+        "coverage": "partial",
+        "observation_window": {},
+        "observed_entity": {
+            "kind": "pod",
+            "name": "trainer-0",
+            "namespace": "runai-vision",
+        },
+    }
     rendered = str(result.details["pod_logs"])
     assert "k8s-mcp-log-secret-12345" not in rendered
     assert "[MASKED]" in rendered

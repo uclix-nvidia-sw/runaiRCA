@@ -82,12 +82,13 @@ def _fake_datasource_mcp() -> FastMCP:
 
     @mcp.tool()
     def query_loki_logs(
-        query: str = "",
-        logql: str = "",
-        datasourceUid: str = "",
-        datasource_uid: str = "",
+        datasourceUid: str,
+        logql: str,
         limit: int = 20,
-        direction: str = "BACKWARD",
+        direction: str = "backward",
+        queryType: str = "range",
+        startRfc3339: str = "",
+        endRfc3339: str = "",
     ) -> dict:
         return {"status": "success", "data": {"result": [{"values": [["1", "failed"]]}]}}
 

@@ -20,7 +20,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
+from app.collectors.base import (
+    NO_EVIDENCE,
+    AnalysisTarget,
+    CollectorResult,
+    artifact,
+    incident_time_range,
+    ko_en,
+    parse_incident_time,
+)
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.knowledge import dependency_path, load_architecture
@@ -78,14 +86,14 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
     component = str(args.get("component") or "").strip()
     if component and not _COMPONENT_RE.fullmatch(component):
         return _query_error("component must be a bounded resource identifier", source=source)
-    lookback = _bounded_int(
+    requested_lookback = _bounded_int(
         args.get("lookback_seconds", _QUERY_DEFAULT_LOOKBACK_SECONDS),
         minimum=_QUERY_MIN_LOOKBACK_SECONDS,
         maximum=_QUERY_MAX_LOOKBACK_SECONDS,
         label="lookback_seconds",
     )
-    if isinstance(lookback, str):
-        return _query_error(lookback, source=source, namespace=namespace, node=node)
+    if isinstance(requested_lookback, str):
+        return _query_error(requested_lookback, source=source, namespace=namespace, node=node)
     limit = _bounded_int(
         args.get("limit", _QUERY_MAX_RESULTS),
         minimum=1,
@@ -94,7 +102,7 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
     )
     if isinstance(limit, str):
         return _query_error(
-            limit, source=source, namespace=namespace, node=node, lookback=lookback
+            limit, source=source, namespace=namespace, node=node, lookback=requested_lookback
         )
     token = _read_file(settings.kubernetes_token_path)
     if not token:
@@ -103,7 +111,7 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
             source=source,
             namespace=namespace,
             node=node,
-            lookback=lookback,
+            lookback=requested_lookback,
             limit=limit,
         )
 
@@ -111,7 +119,20 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
     verify: bool | str = (
         settings.kubernetes_ca_path if Path(settings.kubernetes_ca_path).exists() else True
     )
-    now = datetime.now(UTC)
+    # A historical alert must use its bounded incident window. A moving
+    # "last N seconds" window would otherwise return changes from the present
+    # and make them look causal for an already-resolved incident.
+    window_start, window_end, incident_window = _collection_window(target)
+    historical_window = incident_time_range(target) is not None
+    now = window_end if historical_window else datetime.now(UTC)
+    lookback = (
+        max(1, int((window_end - window_start).total_seconds()))
+        if historical_window
+        else requested_lookback
+    )
+    observation_window = (
+        incident_window if historical_window else _observation_window(lookback, now)
+    )
     collector = ChangeCollector(settings)
     warnings: list[str] = []
     ns = quote(namespace, safe="")
@@ -154,26 +175,37 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
     if component:
         changes = [item for item in changes if str(item.get("name") or "") == component]
     changes.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
-    observation_window = _observation_window(lookback, now)
+    correlated_changes, context_changes = _partition_target_changes(
+        changes,
+        target=target,
+        primary_namespace=namespace,
+        dependency_namespaces=[],
+    )
     observation = _change_observation(
         namespace=namespace,
         node=node,
         source=source,
         lookback_seconds=lookback,
         limit=limit,
-        changes=changes[:limit],
-        truncated=max(0, len(changes) - limit),
+        changes=correlated_changes[:limit],
+        context_changes=context_changes,
+        truncated=max(0, len(correlated_changes) - limit),
         warnings=warnings,
         component=component,
         observation_window=observation_window,
+        historical_window=historical_window,
     )
     return {
         "query": (
             f"kubernetes changes source={source} namespace={namespace} "
-            f"node={node or 'n/a'} lookback<={lookback}s results<={limit}"
+            f"node={node or 'n/a'} start={observation_window['start']} "
+            f"end={observation_window['end']} results<={limit}"
         ),
         "title": "Kubernetes change timeline",
-        "summary": f"{len(observation['changes'])} recent change observation(s) (metadata only)",
+        "summary": (
+            f"{len(observation['changes'])} change observation(s) (metadata only)"
+            + (f"; {'; '.join(warnings)}" if warnings else "")
+        ),
         "error": None,
         "source_group": _CHANGE_SOURCE_GROUP,
         "independence_group": _CHANGE_SOURCE_GROUP,
@@ -183,6 +215,7 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
         "coverage": observation["coverage"],
         "observation": observation,
         "result": observation,
+        "warnings": warnings,
     }
 
 
@@ -245,13 +278,22 @@ def _change_observation(
     lookback_seconds: int,
     limit: int,
     changes: list[dict],
+    context_changes: list[dict],
     truncated: int,
     warnings: list[str],
     component: str,
     observation_window: dict[str, str],
+    historical_window: bool,
 ) -> dict:
     """Project only safe change metadata; never copy Event or Secret bodies."""
     safe_changes = [_safe_change_metadata(change, namespace) for change in changes]
+    # The request window only says what the API was asked to search.  It is not
+    # proof that a returned change actually occurred during the incident.  Keep
+    # an occurrence window only when the individual metadata timestamps are
+    # valid, timezone-aware instants inside that bounded query.
+    evidence_window = _change_evidence_window(safe_changes, observation_window)
+    timed_changes = bool(evidence_window)
+    invalid_timing = bool(safe_changes) and historical_window and not timed_changes
     return {
         "schema_version": "v1",
         "kind": "change_query",
@@ -269,14 +311,31 @@ def _change_observation(
         },
         "window": {"lookback_seconds": lookback_seconds},
         "observation_window": observation_window,
-        "polarity": "present" if safe_changes else ("unknown" if warnings else "absent"),
-        "coverage": "partial" if warnings else "scoped",
+        **({"evidence_window": evidence_window} if evidence_window else {}),
+        # A live query is a useful operator hint, but cannot establish a
+        # causal absence/presence for an alert without an incident timestamp.
+        "polarity": (
+            "present"
+            if safe_changes and (not historical_window or timed_changes)
+            else (
+                "unknown"
+                if warnings or not historical_window or context_changes or invalid_timing
+                else "absent"
+            )
+        ),
+        "coverage": (
+            "partial"
+            if warnings or not historical_window or context_changes or invalid_timing
+            else "scoped"
+        ),
         "lookback_seconds": lookback_seconds,
         "result_limit": limit,
         "status": "partial" if warnings else "ok",
         "changes": safe_changes,
+        "context_change_count": len(context_changes),
         "truncated_count": truncated,
         "body_included": False,
+        "historical_window": historical_window,
     }
 
 
@@ -313,6 +372,33 @@ def _observation_window(
     return {"start": start.isoformat(), "end": end.isoformat()}
 
 
+def _collection_window(
+    target: AnalysisTarget,
+) -> tuple[datetime, datetime, dict[str, str]]:
+    """Use the incident's historical window, not a moving 'last hour'.
+
+    Change evidence is causal only when it is adjacent to the alert. A past
+    incident therefore cannot safely use the collector's current wall clock.
+    Alerts without a timestamp retain the bounded one-hour live fallback.
+    """
+    time_range = incident_time_range(target)
+    if time_range:
+        start = parse_incident_time(time_range.get("start"))
+        end = parse_incident_time(time_range.get("end"))
+        if start is not None and end is not None and end >= start:
+            return start, end, time_range
+    end = datetime.now(UTC)
+    start = end - timedelta(seconds=_RECENT_WINDOW_SECONDS)
+    return (
+        start,
+        end,
+        {
+            "start": start.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "end": end.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        },
+    )
+
+
 class ChangeCollector:
     name = "change"
 
@@ -324,15 +410,31 @@ class ChangeCollector:
     async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:  # noqa: ANN001
         namespace = _first_namespace(plan) or target.namespace
         node = getattr(plan, "node", "") or target.node
+        window_start, window_end, time_range = _collection_window(target)
+        window_seconds = max(1, int((window_end - window_start).total_seconds()))
+        historical_window = incident_time_range(target) is not None
         # depends_on namespaces (e.g. gpu-operator) the alert's component sits on:
         # an upstream operator/Helm upgrade is the usual root cause of a stuck
         # downstream DaemonSet, so scan those too (P2b).
         dep_namespaces = self._dependency_namespaces(plan, namespace)
+        # Correlation happens after the shared namespace sweep.  Cache entries
+        # must therefore retain the exact alert identity too: two workloads on
+        # the same node can have the same incident window but entirely
+        # different target-correlated changes.
+        target_identity = (
+            str(target.workload_name or ""),
+            str(target.runai_workload_id or ""),
+            str(target.pod or ""),
+            str(getattr(plan, "component", "") or target.component or ""),
+        )
         cache_key = (
             namespace or "",
             node or "",
+            target_identity,
             tuple(dep_namespaces),
-            _RECENT_WINDOW_SECONDS,
+            (time_range["start"], time_range["end"])
+            if historical_window
+            else ("live", _RECENT_WINDOW_SECONDS),
         )
         if cache_key in self._cache:
             return self._cache[cache_key]
@@ -354,17 +456,38 @@ class ChangeCollector:
             if Path(self._settings.kubernetes_ca_path).exists()
             else True
         )
-        now = datetime.now(UTC)
         ns = quote(namespace, safe="")
         limit = str(self._settings.kubernetes_list_limit)
         warnings: list[str] = []
 
-        controllers = await self._recent_controllers(ns, node, headers, verify, now, warnings)
-        pods = await self._recent_pods(ns, headers, verify, now, warnings)
-        node_changes = await self._node_conditions(node, headers, verify, now, warnings)
-        events = await self._recent_events(ns, limit, headers, verify, now, warnings)
+        controllers = await self._recent_controllers(
+            ns,
+            node,
+            headers,
+            verify,
+            window_end,
+            warnings,
+            window_seconds=window_seconds,
+            historical_window=historical_window,
+        )
+        pods = await self._recent_pods(
+            ns, headers, verify, window_end, warnings, window_seconds=window_seconds
+        )
+        node_changes = await self._node_conditions(
+            node, headers, verify, window_end, warnings, window_seconds=window_seconds
+        )
+        events = await self._recent_events(
+            ns, limit, headers, verify, window_end, warnings, window_seconds=window_seconds
+        )
         helm = await self._recent_helm_releases(
-            namespace, ns, limit, headers, verify, now, warnings
+            namespace,
+            ns,
+            limit,
+            headers,
+            verify,
+            window_end,
+            warnings,
+            window_seconds=window_seconds,
         )
 
         changes = controllers + pods + node_changes + events + helm
@@ -373,33 +496,95 @@ class ChangeCollector:
         for dep_ns in dep_namespaces:
             dep_q = quote(dep_ns, safe="")
             changes += await self._recent_controllers(
-                dep_q, "", headers, verify, now, warnings
+                dep_q,
+                "",
+                headers,
+                verify,
+                window_end,
+                warnings,
+                window_seconds=window_seconds,
+                historical_window=historical_window,
             )
             changes += await self._recent_helm_releases(
-                dep_ns, dep_q, limit, headers, verify, now, warnings
+                dep_ns,
+                dep_q,
+                limit,
+                headers,
+                verify,
+                window_end,
+                warnings,
+                window_seconds=window_seconds,
             )
         changes.sort(key=lambda c: c.get("timestamp") or "", reverse=True)
+        correlated_changes, context_changes = _partition_target_changes(
+            changes,
+            target=target,
+            primary_namespace=namespace,
+            dependency_namespaces=dep_namespaces,
+        )
 
         if not changes:
+            observation = _collector_change_observation(
+                changes=[],
+                time_range=time_range,
+                historical_window=historical_window,
+                warnings=warnings,
+                target=target,
+            )
             result = self._empty(
                 f"{NO_EVIDENCE} "
                 + ko_en(
                     self._settings,
-                    f"최근 {_RECENT_WINDOW_SECONDS // 60}분 내 네임스페이스 {namespace}에서 "
+                    f"incident 시간창 내 네임스페이스 {namespace}에서 "
                     "변경된 워크로드/파드/노드/이벤트가 없습니다.",
-                    "No recently-changed workloads, pods, nodes, or events "
-                    f"found in namespace {namespace} within the last "
-                    f"{_RECENT_WINDOW_SECONDS // 60}m.",
+                    "No changed workloads, pods, nodes, or events were found in "
+                    f"namespace {namespace} inside the incident time window.",
                 ),
                 missing=[],
                 warnings=warnings,
-                details={"namespace": namespace, "node": node},
+                details={
+                    "namespace": namespace,
+                    "node": node,
+                    "time_range": time_range,
+                    "historical_window": historical_window,
+                },
+                observation=observation,
             )
             self._cache[cache_key] = result
             return result
 
-        summary = _deterministic_summary(changes, namespace)
-        insight = await _senior_insight(self._settings, changes)
+        observation = _collector_change_observation(
+            changes=correlated_changes,
+            context_changes=context_changes,
+            time_range=time_range,
+            historical_window=historical_window,
+            warnings=warnings,
+            target=target,
+        )
+        if not correlated_changes:
+            details = {
+                "namespace": namespace,
+                "node": node,
+                "dependency_namespaces": dep_namespaces,
+                "time_range": time_range,
+                "historical_window": historical_window,
+                "window_seconds": window_seconds,
+                "changes": [],
+                "context_changes": context_changes,
+            }
+            result = self._empty(
+                "Namespace changes were observed, but none matched the incident target or "
+                "its declared dependency chain.",
+                missing=[],
+                warnings=warnings,
+                details=details,
+                observation=observation,
+            )
+            self._cache[cache_key] = result
+            return result
+
+        summary = _deterministic_summary(correlated_changes, namespace)
+        insight = await _senior_insight(self._settings, correlated_changes)
         if insight:
             summary = f"{summary} {insight}"
 
@@ -407,15 +592,18 @@ class ChangeCollector:
             "namespace": namespace,
             "node": node,
             "dependency_namespaces": dep_namespaces,
-            "window_seconds": _RECENT_WINDOW_SECONDS,
-            "changes": changes,
+            "time_range": time_range,
+            "historical_window": historical_window,
+            "window_seconds": window_seconds,
+            "changes": correlated_changes,
+            "context_changes": context_changes,
             "insight": insight,
         }
         result = CollectorResult(
             agent=self.name,
             status="ok",
             summary=summary,
-            confidence="high" if len(changes) >= 2 else "medium",
+            confidence="high" if len(correlated_changes) >= 2 else "medium",
             details=details,
             missing_data=[],
             warnings=warnings,
@@ -426,9 +614,15 @@ class ChangeCollector:
                     type="change_detection",
                     status="ok",
                     confidence="high",
-                    query=f"namespace={namespace} node={node or 'n/a'}",
+                    query=(
+                        f"namespace={namespace} node={node or 'n/a'} "
+                        f"start={time_range['start']} end={time_range['end']}"
+                    ),
                     summary=summary,
-                    result=details,
+                    result={
+                        **details,
+                        "observation": observation,
+                    },
                 )
             ],
         )
@@ -442,7 +636,17 @@ class ChangeCollector:
         missing: list[str],
         warnings: list[str] | None = None,
         details: dict | None = None,
+        observation: dict | None = None,
     ) -> CollectorResult:
+        # Even an unconfigured collector must publish a typed verdict. Without
+        # it this otherwise-structured collector falls back to legacy summary
+        # parsing in downstream consumers.
+        observation = observation or {
+            "kind": "change_detection",
+            "predicate": "change_detection",
+            "polarity": "unavailable" if missing else "unknown",
+            "coverage": "unknown" if missing else "partial",
+        }
         return CollectorResult(
             agent=self.name,
             status="unavailable" if missing else "partial",
@@ -459,7 +663,10 @@ class ChangeCollector:
                     status="unavailable" if missing else "partial",
                     confidence="low",
                     summary=summary,
-                    result=details or {},
+                    result={
+                        **(details or {}),
+                        "observation": observation,
+                    },
                 )
             ],
         )
@@ -476,7 +683,14 @@ class ChangeCollector:
         if response.error:
             warnings.append(f"change {label} query failed: {response.error}")
             return None
-        return response.data
+        data = response.data
+        # A bounded list can be paginated by the API server. Without consuming
+        # the continuation token, an empty page cannot safely mean that no
+        # incident-adjacent change exists elsewhere in the resource list.
+        metadata = _dict(data.get("metadata")) if isinstance(data, dict) else {}
+        if metadata.get("continue"):
+            warnings.append(f"change {label} query was truncated by Kubernetes pagination")
+        return data
 
     async def _recent_controllers(
         self,
@@ -489,6 +703,7 @@ class ChangeCollector:
         *,
         window_seconds: int = _RECENT_WINDOW_SECONDS,
         limit: int | None = None,
+        historical_window: bool = False,
     ) -> list[dict]:  # noqa: ANN001
         out: list[dict] = []
         params = {"limit": str(limit or self._settings.kubernetes_list_limit)}
@@ -523,6 +738,13 @@ class ChangeCollector:
                         "name": meta.get("name"),
                         "namespace": meta.get("namespace"),
                         "rollout": bool(rollout),
+                        # A currently pending generation can predate the
+                        # incident by days. Keep it for operator context, but
+                        # require a creation/condition timestamp in a closed
+                        # incident window before it becomes support.
+                        "time_window_verified": bool(changed_recently)
+                        if historical_window
+                        else True,
                         "summary": (
                             f"{kind} {meta.get('name')} "
                             + (
@@ -647,12 +869,13 @@ class ChangeCollector:
             name = meta.get("name")
             created = meta.get("creationTimestamp")
             deleted = meta.get("deletionTimestamp")
-            if deleted:
+            if deleted and _within_window(deleted, now, window_seconds=window_seconds):
                 out.append(
                     {
                         "timestamp": deleted,
                         "kind": "PodDeleted",
                         "name": name,
+                        "namespace": meta.get("namespace"),
                         "summary": f"Pod {name} is terminating (deletionTimestamp set).",
                     }
                 )
@@ -662,6 +885,7 @@ class ChangeCollector:
                         "timestamp": created,
                         "kind": "PodCreated",
                         "name": name,
+                        "namespace": meta.get("namespace"),
                         "summary": f"Pod {name} was created recently.",
                     }
                 )
@@ -730,6 +954,7 @@ class ChangeCollector:
         events = []
         for item in _items(data):
             item = _dict(item)
+            meta = _dict(item.get("metadata"))
             ts = item.get("lastTimestamp") or item.get("eventTime")
             if not _within_window(ts, now, window_seconds=window_seconds):
                 continue
@@ -739,6 +964,7 @@ class ChangeCollector:
                     "timestamp": ts,
                     "kind": f"Event/{item.get('type', 'Normal')}",
                     "name": involved.get("name"),
+                    "namespace": meta.get("namespace"),
                     "reason": item.get("reason"),
                     "object_kind": involved.get("kind"),
                     "summary": f"{item.get('reason')}: {item.get('message')}",
@@ -751,6 +977,218 @@ class ChangeCollector:
             reverse=True,
         )
         return events[:10]
+
+
+def _collector_change_observation(
+    *,
+    changes: list[dict],
+    context_changes: list[dict] | None = None,
+    time_range: dict[str, str],
+    historical_window: bool,
+    warnings: list[str],
+    target: AnalysisTarget | None = None,
+) -> dict[str, object]:
+    """State whether target-scope change evidence is truly incident-bounded."""
+    # Do not let the broad collection range stand in for the time of an
+    # individual rollout/Event/Pod transition.  A malformed or untimed record
+    # remains useful operator context but cannot activate a lifecycle cause.
+    evidence_window = _change_evidence_window(changes, time_range)
+    timed_changes = bool(evidence_window)
+    observed_entity: dict[str, str] | None = None
+    target_scope_verified: bool | None = None
+    if target is not None and historical_window:
+        observed_entity, target_scope_verified = _collector_change_target_scope(changes, target)
+
+    if not historical_window:
+        # The live one-hour fallback helps an operator but cannot establish a
+        # trigger for an alert with no timestamp.
+        polarity, coverage = ("present", "partial") if changes else ("unknown", "partial")
+    elif warnings:
+        # A failed resource class leaves the historical sweep incomplete; don't
+        # make an empty/partial result refute a lifecycle-change hypothesis.
+        polarity, coverage = ("present", "partial") if changes else ("unknown", "partial")
+    elif target is not None and target_scope_verified is not True:
+        # Correlation by namespace, a workload-name prefix, or a declared
+        # dependency namespace is useful investigation context, but it does
+        # not prove that this historical change belongs to the alert target.
+        # Do not let the blackboard inherit the pipeline target for it.
+        polarity, coverage = "unknown", "partial"
+    elif changes and timed_changes:
+        polarity, coverage = "present", "scoped"
+    elif changes:
+        polarity, coverage = "unknown", "partial"
+    elif context_changes:
+        # A namespace sweep was not empty, but its lifecycle activity belongs
+        # to another workload. It is operator context, never target evidence.
+        polarity, coverage = "unknown", "partial"
+    else:
+        polarity, coverage = "absent", "scoped"
+    observation: dict[str, object] = {
+        "kind": "kubernetes_change_window",
+        "predicate": "kubernetes_change_window",
+        "polarity": polarity,
+        "coverage": coverage,
+        "change_count": len(changes),
+        "context_change_count": len(context_changes or []),
+        "observation_window": time_range,
+        **({"evidence_window": evidence_window} if evidence_window else {}),
+    }
+    if observed_entity:
+        observation["observed_entity"] = observed_entity
+    if target_scope_verified is not None:
+        observation["target_scope_verified"] = target_scope_verified
+    return observation
+
+
+def _collector_change_target_scope(
+    changes: list[dict], target: AnalysisTarget
+) -> tuple[dict[str, str] | None, bool]:
+    """Prove that every correlated change names the alert resource itself.
+
+    ``_partition_target_changes`` deliberately keeps useful near matches (for
+    example a Pod whose name merely starts with a workload name) and every
+    rollout in a declared dependency namespace.  Those are not enough to own
+    a scoped historical verdict.  This narrower gate accepts only an exact
+    target Pod/Node or an exact, known controller for the target workload.
+    """
+    pod = str(target.pod or "").strip()
+    node = str(target.node or "").strip()
+    workload = str(target.workload_name or "").strip()
+
+    if not changes:
+        # An empty, completed historical sweep can only refute changes for an
+        # entity the alert named explicitly; namespace-only emptiness remains
+        # an open-world result.
+        if pod:
+            return {"kind": "pod", "name": pod}, True
+        if node:
+            return {"kind": "node", "name": node}, True
+        if workload:
+            return {"kind": "workload_name", "name": workload}, True
+        return None, False
+
+    pod_folded = pod.casefold()
+    node_folded = node.casefold()
+    workload_folded = workload.casefold()
+
+    def name_of(change: dict) -> str:
+        return str(change.get("name") or "").strip().casefold()
+
+    def is_exact_pod(change: dict) -> bool:
+        kind = str(change.get("kind") or "")
+        object_kind = str(change.get("object_kind") or "")
+        return (
+            bool(target.namespace)
+            and str(change.get("namespace") or "").strip() == target.namespace
+            and bool(pod_folded)
+            and name_of(change) == pod_folded
+            and (
+            kind.startswith("Pod") or (kind.startswith("Event/") and object_kind == "Pod")
+            )
+        )
+
+    def is_exact_node(change: dict) -> bool:
+        return (
+            bool(node_folded)
+            and str(change.get("kind") or "") == "NodeCondition"
+            and name_of(change) == node_folded
+        )
+
+    def is_verified_controller(change: dict) -> bool:
+        kind = str(change.get("kind") or "")
+        object_kind = str(change.get("object_kind") or "")
+        return (
+            bool(target.namespace)
+            and str(change.get("namespace") or "").strip() == target.namespace
+            and bool(workload_folded)
+            and name_of(change) == workload_folded
+            and (
+            kind in {"Deployment", "StatefulSet", "DaemonSet", "HelmRelease"}
+            or (
+                kind.startswith("Event/")
+                and object_kind in {"Deployment", "StatefulSet", "DaemonSet"}
+            )
+            )
+        )
+
+    if all(is_exact_pod(change) for change in changes):
+        return {"kind": "pod", "name": pod}, True
+    if all(is_exact_node(change) for change in changes):
+        return {"kind": "node", "name": node}, True
+    if workload and all(is_verified_controller(change) or is_exact_pod(change) for change in changes):
+        return {"kind": "workload_name", "name": workload}, True
+    return None, False
+
+
+def _change_evidence_window(
+    changes: list[dict], query_window: dict[str, str]
+) -> dict[str, str] | None:
+    """Return the actual timestamp span of valid individual change records.
+
+    Kubernetes list responses may be stale, malformed, or contain a pending
+    rollout whose only usable timestamp predates this incident.  The response
+    must therefore carry at least one timestamped change inside the explicit
+    query bounds before an aggregate change artifact can be causal evidence.
+    """
+    start = parse_incident_time(query_window.get("start"))
+    end = parse_incident_time(query_window.get("end"))
+    if start is None or end is None or end < start:
+        return None
+    instants = [
+        instant
+        for change in changes
+        if isinstance(change, dict)
+        if (instant := parse_incident_time(change.get("timestamp"))) is not None
+        and start <= instant <= end
+    ]
+    if not instants:
+        return None
+    first, last = min(instants), max(instants)
+    return {
+        "start": first.isoformat().replace("+00:00", "Z"),
+        "end": last.isoformat().replace("+00:00", "Z"),
+    }
+
+
+def _partition_target_changes(
+    changes: list[dict],
+    *,
+    target: AnalysisTarget,
+    primary_namespace: str,
+    dependency_namespaces: list[str],
+) -> tuple[list[dict], list[dict]]:
+    """Separate target/dependency lifecycle evidence from namespace churn."""
+    correlated: list[dict] = []
+    context: list[dict] = []
+    workload = str(target.workload_name or "").strip().casefold()
+    pod = str(target.pod or "").strip().casefold()
+    node = str(target.node or "").strip().casefold()
+    component = str(target.component or "").strip().casefold()
+    dependency_set = {str(namespace).strip() for namespace in dependency_namespaces}
+    for change in changes:
+        name = str(change.get("name") or "").strip().casefold()
+        namespace = str(change.get("namespace") or primary_namespace).strip()
+        change = {**change, "namespace": namespace}
+        kind = str(change.get("kind") or "")
+        relation = ""
+        if change.get("time_window_verified") is False:
+            context.append({**change, "relation": "stale_or_untimed_context"})
+            continue
+        if namespace in dependency_set:
+            relation = "declared_dependency"
+        elif kind == "NodeCondition" and node and name == node:
+            relation = "target_node"
+        elif namespace == primary_namespace and (
+            (pod and name == pod)
+            or (workload and (name == workload or name.startswith(f"{workload}-")))
+            or (component and name == component)
+        ):
+            relation = "target_component" if component and name == component else "target_workload"
+        if relation:
+            correlated.append({**change, "relation": relation})
+        else:
+            context.append({**change, "relation": "namespace_context"})
+    return correlated, context
 
 
 def _deterministic_summary(changes: list[dict], namespace: str) -> str:

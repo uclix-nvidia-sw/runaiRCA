@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.schemas import AlertAnalysisArtifact
@@ -46,6 +47,82 @@ class AnalysisTarget:
     component: str = ""
     storage_claim: str = ""
     volume: str = ""
+    # Immutable identity supplied explicitly by alert metadata. It is not
+    # inferred from a generic ``uid`` field or from resource text.
+    pod_uid: str = ""
+    # Provenance for ``node``. The pipeline can enrich it from a live Pod; old
+    # node logs from that inferred location are useful context, not proof about
+    # a historical alert unless Alertmanager named the node itself.
+    node_source: str = ""
+
+
+_INCIDENT_PRELUDE = timedelta(minutes=5)
+_INCIDENT_EPILOGUE = timedelta(minutes=5)
+_FIRING_INCIDENT_DURATION = timedelta(minutes=15)
+
+
+def incident_time_range(target: AnalysisTarget) -> dict[str, str] | None:
+    """Return the bounded evidence window for an alert, in UTC RFC3339.
+
+    Every historical collector must use the same range: five minutes before the
+    alert through five minutes after resolution. A firing alert has no reliable
+    end, so it is deliberately capped instead of querying from its start through
+    the present (which would mix unrelated current-state evidence into the RCA).
+    """
+    fired = _parse_incident_time(target.fired_at)
+    if fired is None:
+        return None
+    resolved = _parse_incident_time(target.resolved_at)
+    if resolved is None or resolved < fired:
+        resolved = fired + _FIRING_INCIDENT_DURATION
+    return {
+        "start": _format_incident_time(fired - _INCIDENT_PRELUDE),
+        "end": _format_incident_time(resolved + _INCIDENT_EPILOGUE),
+    }
+
+
+def causal_evidence_time_range(target: AnalysisTarget) -> dict[str, str] | None:
+    """Return the bounded time span that may substantiate an incident cause.
+
+    Collection retains a short post-resolution epilogue so a collector can
+    establish recovery, but an observation that first appears only after the
+    alert resolved is not evidence of its cause.  The causal span therefore
+    keeps the collection prelude (which can contain the trigger) while ending
+    at resolution.  For a firing alert, :func:`incident_time_range` already
+    substitutes the bounded 15-minute duration for the unknown end.
+    """
+    window = incident_time_range(target)
+    if window is None:
+        return None
+    end = _parse_incident_time(window.get("end", ""))
+    if end is None:
+        return None
+    return {
+        "start": str(window.get("start") or ""),
+        "end": _format_incident_time(end - _INCIDENT_EPILOGUE),
+    }
+
+
+def parse_incident_time(value: object) -> datetime | None:
+    """Parse a Kubernetes/Alertmanager timestamp without accepting local time."""
+    return _parse_incident_time(str(value or ""))
+
+
+def _parse_incident_time(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        # Alertmanager timestamps are RFC3339 instants. A timezone-less value
+        # is ambiguous, so do not silently manufacture a historical evidence
+        # window from the Alertmanager host's local time.
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _format_incident_time(value: datetime) -> str:
+    return value.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 @dataclass
@@ -61,9 +138,17 @@ class CollectorResult:
 
 
 def value_from(labels: dict[str, str], annotations: dict[str, str], *keys: str) -> str:
-    for key in keys:
-        value = labels.get(key) or annotations.get(key)
-        if value:
+    """Return normalized alert metadata, preferring labels to annotations."""
+    for metadata in (labels, annotations):
+        for key in keys:
+            raw = metadata.get(key)
+            if raw is None:
+                continue
+            value = str(raw).strip()
+            if not value or "{{" in value or "}}" in value:
+                continue
+            if any(ord(char) < 32 or ord(char) == 127 for char in value):
+                continue
             return value
     return ""
 
@@ -111,6 +196,108 @@ SALIENT_PATTERN = re.compile(
     r"context canceled|exit code \d+|Terminated|CUDA(?:_ERROR)?[ _][A-Za-z_]+)"
 )
 
+_BOOLEAN_CONDITION_TYPES = frozenset(
+    {"diskpressure", "memorypressure", "pidpressure", "networkunavailable"}
+)
+
+
+def _truthy_status(value: Any) -> bool:
+    return value is True or str(value).strip().lower() in {"true", "1", "yes", "active", "firing"}
+
+
+def _boolean_condition_status(value: Any) -> bool | None:
+    """Decode an explicitly known condition state without treating Unknown as false."""
+    if _truthy_status(value):
+        return True
+    if value is False or str(value).strip().lower() in {
+        "false",
+        "0",
+        "no",
+        "inactive",
+        "resolved",
+    }:
+        return False
+    return None
+
+
+def _sample_values(value: Any) -> list[float]:
+    values: list[float] = []
+
+    def collect(node: Any) -> None:
+        if isinstance(node, (list, tuple)):
+            if len(node) == 2 and not isinstance(node[1], (list, tuple, dict)):
+                try:
+                    values.append(float(node[1]))
+                except (TypeError, ValueError):
+                    pass
+                return
+            for child in node:
+                collect(child)
+
+    collect(value)
+    return values
+
+
+def condition_observations(value: Any, *, limit: int = 20) -> list[dict[str, Any]]:
+    """Extract explicit condition polarity from Kubernetes and Prometheus evidence."""
+    observations: list[dict[str, Any]] = []
+    seen: set[tuple[str, bool, str]] = set()
+
+    def add(condition: str, active: bool, source: str, **extra: Any) -> None:
+        key = (condition.lower(), active, source)
+        if key in seen or len(observations) >= limit:
+            return
+        seen.add(key)
+        observations.append(
+            {"condition": condition, "active": active, "source": source, **extra}
+        )
+
+    def walk(node: Any) -> None:
+        if len(observations) >= limit:
+            return
+        if isinstance(node, dict):
+            condition_type = str(node.get("type") or "").strip()
+            if condition_type.lower() in _BOOLEAN_CONDITION_TYPES and "status" in node:
+                status = _boolean_condition_status(node.get("status"))
+                if status is not None:
+                    add(
+                        condition_type,
+                        status,
+                        "kubernetes_condition",
+                        status=str(node.get("status") or ""),
+                    )
+                return
+
+            metric = node.get("metric")
+            samples = _sample_values(node.get("value") or node.get("values"))
+            if isinstance(metric, dict) and samples:
+                condition = str(metric.get("condition") or metric.get("type") or "").strip()
+                if condition.lower() in _BOOLEAN_CONDITION_TYPES:
+                    metric_status = str(metric.get("status") or "").strip()
+                    status = _boolean_condition_status(metric_status)
+                    active_sample = any(sample > 0 for sample in samples)
+                    # kube-state-metrics exposes one series per status.  A
+                    # positive true series supports the condition; a zero true
+                    # series (or positive false series) refutes it.  Unknown
+                    # status is neither and must not become active=false.
+                    if status is True or (status is False and active_sample):
+                        add(
+                            condition,
+                            bool(status and active_sample),
+                            "prometheus_condition",
+                            metric_status=metric_status,
+                            sample=max(samples),
+                        )
+                    return
+            for child in node.values():
+                walk(child)
+        elif isinstance(node, (list, tuple)):
+            for child in node:
+                walk(child)
+
+    walk(value)
+    return observations
+
 
 def salient_markers(value: Any, *, limit: int = 6) -> list[str]:
     """Distinct problem signals found in the STRING LEAVES of raw evidence.
@@ -140,6 +327,27 @@ def salient_markers(value: Any, *, limit: int = 6) -> list[str]:
                     if len(found) >= limit:
                         return
         elif isinstance(node, dict):
+            condition_type = str(node.get("type") or "").strip()
+            if condition_type.lower() in _BOOLEAN_CONDITION_TYPES and "status" in node:
+                if _truthy_status(node.get("status")):
+                    _scan(condition_type)
+                return
+
+            metric = node.get("metric")
+            samples = _sample_values(node.get("value") or node.get("values"))
+            if isinstance(metric, dict) and samples:
+                condition = str(metric.get("condition") or metric.get("type") or "").strip()
+                metric_status = str(metric.get("status") or "").strip()
+                active_sample = any(sample > 0 for sample in samples)
+                if condition.lower() in _BOOLEAN_CONDITION_TYPES:
+                    if _truthy_status(metric_status) and active_sample:
+                        _scan(condition)
+                elif active_sample:
+                    _scan(metric)
+                for key, child in node.items():
+                    if key not in {"metric", "value", "values"}:
+                        _scan(child)
+                return
             for child in node.values():
                 _scan(child)
         elif isinstance(node, (list, tuple)):
@@ -147,6 +355,75 @@ def salient_markers(value: Any, *, limit: int = 6) -> list[str]:
                 _scan(child)
 
     _scan(value)
+    return found
+
+
+def kubernetes_salient_markers(value: Any, *, limit: int = 6) -> list[str]:
+    """Extract K8s highlights only from observed status/Event structures.
+
+    A full Pod YAML contains configuration such as
+    ``spec.preemptionPolicy=PreemptLowerPriority``.  That is not evidence that
+    preemption occurred.  Keep highlights constrained to Warning Events, active
+    Node conditions, and container runtime states (terminated/waiting), rather
+    than keyword-scanning arbitrary spec/metadata leaf values.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def add_text(text: object) -> None:
+        for marker in salient_markers(str(text or ""), limit=limit):
+            key = marker.casefold()
+            if key not in seen and len(found) < limit:
+                seen.add(key)
+                found.append(marker)
+
+    def walk(node: Any) -> None:
+        if len(found) >= limit:
+            return
+        if isinstance(node, list):
+            for child in node:
+                walk(child)
+            return
+        if not isinstance(node, dict):
+            return
+        condition_type = str(node.get("type") or "")
+        if condition_type.casefold() in _BOOLEAN_CONDITION_TYPES and "status" in node:
+            if _truthy_status(node.get("status")):
+                add_text(condition_type)
+            return
+        # A Kubernetes Event's reason/message is an observation, but only a
+        # Warning is relevant for failure highlights.
+        if str(node.get("type") or "") == "Warning" and "involvedObject" in node:
+            add_text(node.get("reason"))
+            add_text(node.get("message"))
+        # Container runtime states carry actual observed reasons. Pod spec,
+        # labels, annotations, environment values and policy fields do not.
+        for state_key in ("terminated", "waiting"):
+            state = node.get(state_key)
+            if isinstance(state, dict):
+                add_text(state.get("reason"))
+                add_text(state.get("message"))
+        for key in (
+            "status",
+            "state",
+            "lastState",
+            "conditions",
+            "containerStatuses",
+            "initContainerStatuses",
+            "ephemeralContainerStatuses",
+            "events",
+            "items",
+            # Kubernetes MCP response envelopes retain the raw object below
+            # these keys. They are not arbitrary user data; recurse so the
+            # same status-only rule applies to direct and MCP-backed reads.
+            "data",
+            "object",
+        ):
+            child = node.get(key)
+            if child is not None:
+                walk(child)
+
+    walk(value)
     return found
 
 
@@ -218,6 +495,24 @@ def _workload_kind_identity(labels: dict[str, str], annotations: dict[str, str])
     return "", ""
 
 
+def _is_kube_state_metrics_exporter(
+    labels: dict[str, str], annotations: dict[str, str]
+) -> bool:
+    """Whether a pod label identifies KSM rather than the alert subject.
+
+    A controller-kind label alone is not enough: direct application alerts
+    commonly carry both deployment and the real pod. Only the
+    kube-state-metrics exporter convention makes that pod label a scrape
+    exporter rather than the Kubernetes object being alerted on.
+    """
+    for metadata in (labels, annotations):
+        for key in ("job", "container", "pod", "pod_name", "kubernetes_pod_name"):
+            value = str(metadata.get(key) or "").casefold()
+            if "kube-state-metrics" in value:
+                return True
+    return False
+
+
 def resolve_target(
     labels: dict[str, str],
     annotations: dict[str, str],
@@ -227,18 +522,16 @@ def resolve_target(
 ) -> AnalysisTarget:
     namespace = value_from(labels, annotations, "namespace", "kubernetes_namespace")
     project = value_from(labels, annotations, "project", "runai_project", "runai.io/project")
-    # If a workload-kind label named the subject, the `pod` label is the KSM
-    # exporter — drop it so collectors discover the real workload's pods by name
-    # instead of investigating the (healthy) metrics pod.
+    # KSM alerts name the subject in a controller-kind label and put the
+    # exporter in the pod label. A controller label on its own is also common
+    # in direct alerts, where pod remains the actual subject.
     workload_kind_name, inferred_workload_type = _workload_kind_identity(labels, annotations)
     explicit_workload_name = value_from(
         labels, annotations, "workload", "workload_name", "runai_workload_name"
     )
-    pod = (
-        ""
-        if workload_kind_name
-        else value_from(labels, annotations, "pod", "pod_name", "kubernetes_pod_name")
-    )
+    pod = value_from(labels, annotations, "pod", "pod_name", "kubernetes_pod_name")
+    if workload_kind_name and _is_kube_state_metrics_exporter(labels, annotations):
+        pod = ""
     return AnalysisTarget(
         cluster=value_from(labels, annotations, "cluster", "runai_cluster", "runai.io/cluster"),
         project=normalize_project_name(project) if project else project_from_namespace(namespace),
@@ -262,6 +555,11 @@ def resolve_target(
         alert_name=value_from(labels, annotations, "alertname", "alert_name") or "RunAIAlert",
         fired_at=fired_at,
         resolved_at=resolved_at,
+        node_source=(
+            "alert"
+            if value_from(labels, annotations, "node", "node_name", "kubernetes_node")
+            else ""
+        ),
         # These are explicit alert metadata only.  In particular, do not guess
         # a Service/PVC from a workload or from free-form annotation prose.
         service=target_identifier_from(
@@ -297,6 +595,14 @@ def resolve_target(
             "pv",
             "volume_name",
             "volume",
+        ),
+        pod_uid=target_identifier_from(
+            labels,
+            annotations,
+            "pod_uid",
+            "podUid",
+            "kubernetes_pod_uid",
+            "k8s_pod_uid",
         ),
     )
 

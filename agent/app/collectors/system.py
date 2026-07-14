@@ -16,7 +16,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact, ko_en
+from app.collectors.base import (
+    NO_EVIDENCE,
+    AnalysisTarget,
+    CollectorResult,
+    artifact,
+    incident_time_range,
+    ko_en,
+    parse_incident_time,
+)
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import complete, llm_configured
@@ -70,14 +78,14 @@ async def system_log_query(settings: Settings, target: AnalysisTarget, args: dic
         return _query_error("the alert has no node scope", source=source)
     if requested_node and requested_node != node:
         return _query_error("node must match the alert node scope", source=source, node=node)
-    lookback = _bounded_int(
+    requested_lookback = _bounded_int(
         args.get("lookback_seconds", _QUERY_DEFAULT_LOOKBACK_SECONDS),
         minimum=60,
         maximum=_QUERY_MAX_LOOKBACK_SECONDS,
         label="lookback_seconds",
     )
-    if isinstance(lookback, str):
-        return _query_error(lookback, source=source, node=node)
+    if isinstance(requested_lookback, str):
+        return _query_error(requested_lookback, source=source, node=node)
     line_value = args.get("lines", args.get("limit", _QUERY_DEFAULT_LINES))
     lines = _bounded_int(
         line_value,
@@ -86,16 +94,34 @@ async def system_log_query(settings: Settings, target: AnalysisTarget, args: dic
         label="lines",
     )
     if isinstance(lines, str):
-        return _query_error(lines, source=source, node=node, lookback=lookback)
+        return _query_error(lines, source=source, node=node, lookback=requested_lookback)
     grep, grep_error = _safe_grep(args.get("grep"))
     if grep_error:
-        return _query_error(grep_error, source=source, node=node, lookback=lookback, limit=lines)
+        return _query_error(
+            grep_error, source=source, node=node, lookback=requested_lookback, limit=lines
+        )
     if not getattr(settings, "enable_system_agent", False) or not getattr(
         settings, "system_agent_url", ""
     ):
         return _query_error(
-            "system agent is not configured", source=source, node=node, lookback=lookback
+            "system agent is not configured",
+            source=source,
+            node=node,
+            lookback=requested_lookback,
         )
+
+    # Only journalctl accepts a trustworthy start/end predicate. For a past
+    # incident, use it rather than a current log tail; dmesg/syslog remain live
+    # context because their endpoints cannot safely reconstruct old state.
+    time_range = incident_time_range(target) if source == "journal" else None
+    if time_range:
+        start = parse_incident_time(time_range["start"])
+        end = parse_incident_time(time_range["end"])
+        lookback = max(1, int((end - start).total_seconds())) if start and end else requested_lookback
+        observation_window = time_range
+    else:
+        lookback = requested_lookback
+        observation_window = _observation_window(lookback)
 
     address = node
     if "{node}" in settings.system_agent_url:
@@ -107,17 +133,24 @@ async def system_log_query(settings: Settings, target: AnalysisTarget, args: dic
         if getattr(settings, "system_agent_token", "")
         else None
     )
+    params = {
+        "source": source,
+        "lines": str(lines),
+        **({"grep": grep} if grep else {}),
+        **({"since": time_range["start"], "until": time_range["end"]} if time_range else {}),
+    }
+    # A URL without ``{node}`` is a shared endpoint.  Its router needs the
+    # explicit node parameter; otherwise a healthy response may belong to an
+    # arbitrary/default node and be mislabeled as the alert node.
+    if "{node}" not in settings.system_agent_url:
+        params["node"] = node
     response = await get_json(
         base_url=_base_url_for_node(settings.system_agent_url, address),
         path="/logs",
         timeout_seconds=settings.system_agent_timeout_seconds,
         # `lines` is enforced by the system agent. `grep` is a literal escaped
         # here before being sent to the agent's regex endpoint.
-        params={
-            "source": source,
-            "lines": str(lines),
-            **({"grep": grep} if grep else {}),
-        },
+        params=params,
         headers=headers,
     )
     if response.error:
@@ -126,7 +159,12 @@ async def system_log_query(settings: Settings, target: AnalysisTarget, args: dic
         )
     raw_lines = _lines(response.data)[-lines:]
     matching = [line for line in raw_lines if _ERROR_PATTERNS.search(line)]
-    observation_window = _observation_window(lookback)
+    historical_window_verified = bool(
+        time_range and _historical_journal_response_verified(response.data, time_range)
+    )
+    matching_timestamps = _journal_matching_timestamps(
+        matching, time_range if historical_window_verified else None
+    )
     observation = _system_log_observation(
         source=source,
         node=node,
@@ -134,10 +172,15 @@ async def system_log_query(settings: Settings, target: AnalysisTarget, args: dic
         limit=lines,
         scanned=len(raw_lines),
         matching=matching,
+        matching_timestamps=matching_timestamps,
         observation_window=observation_window,
+        historical_scope=historical_window_verified,
     )
     return {
-        "query": f"system logs source={source} node={node} lookback<={lookback}s lines<={lines}",
+        "query": (
+            f"system logs source={source} node={node} start={observation_window['start']} "
+            f"end={observation_window['end']} lines<={lines}"
+        ),
         "title": "Node system logs",
         "summary": (
             f"{observation['matching_line_count']} matching system-log line(s) in "
@@ -219,8 +262,10 @@ def _safe_grep(value: object) -> tuple[str, str]:
     return re.escape(literal), ""
 
 
-def _observation_window(lookback_seconds: int | None) -> dict[str, str]:
-    end = datetime.now(UTC)
+def _observation_window(
+    lookback_seconds: int | None, end: datetime | None = None
+) -> dict[str, str]:
+    end = end or datetime.now(UTC)
     start = end - timedelta(seconds=lookback_seconds or 0)
     return {"start": start.isoformat(), "end": end.isoformat()}
 
@@ -233,7 +278,9 @@ def _system_log_observation(
     limit: int,
     scanned: int,
     matching: list[str],
+    matching_timestamps: list[str] | None,
     observation_window: dict[str, str],
+    historical_scope: bool,
 ) -> dict:
     """Summarise log matches without retaining raw lines or response bodies."""
     categories = {
@@ -248,7 +295,17 @@ def _system_log_observation(
         for name, pattern in categories.items()
         if any(re.search(pattern, line) for line in matching)
     ]
-    return {
+    matching_timestamps = matching_timestamps or []
+    # The historical journal request deliberately includes a short recovery
+    # epilogue.  A source/window echo alone therefore cannot prove that a
+    # matching line happened before resolution: a post-resolution XID/OOM is
+    # useful context, but not evidence of the incident's cause.  Require the
+    # line's own RFC3339 instant before giving a historical positive scoped
+    # semantics.  Current dmesg/syslog tails remain operator context.
+    historical_time_missing = historical_scope and bool(matching) and not matching_timestamps
+    polarity = "present" if matching and not historical_time_missing else "unknown"
+    coverage = "scoped" if matching and historical_scope and not historical_time_missing else "partial"
+    observation = {
         "schema_version": "v1",
         "kind": "system_log_query",
         "source_group": _SYSTEM_LOG_SOURCE_GROUP,
@@ -257,9 +314,11 @@ def _system_log_observation(
         "observed_entity": {"kind": "node", "name": node},
         "window": {"lookback_seconds": lookback_seconds},
         "observation_window": observation_window,
-        "polarity": "present" if matching else "absent",
-        # A finite tail of node logs cannot prove a host-wide absence.
-        "coverage": "partial",
+        # A bounded journal query can prove a matching line was inside the
+        # incident window, but even that endpoint returns a finite tail: an
+        # empty response cannot prove host-wide absence.
+        "polarity": polarity,
+        "coverage": coverage,
         "lookback_seconds": lookback_seconds,
         "result_limit": limit,
         "status": "ok",
@@ -267,7 +326,59 @@ def _system_log_observation(
         "matching_line_count": len(matching),
         "signal_types": signal_types,
         "body_included": False,
+        "historical_scope": historical_scope,
     }
+    if matching_timestamps:
+        observation["evidence_window"] = {
+            "start": matching_timestamps[0],
+            "end": matching_timestamps[-1],
+        }
+    return observation
+
+
+def _journal_matching_timestamps(
+    lines: list[str], time_range: dict[str, str] | None
+) -> list[str]:
+    """Return actual, in-range instants from ``journalctl --output=short-iso``.
+
+    The per-node agent emits an ISO timestamp as the first token for journal
+    lines.  Do not derive an occurrence time from the query range: it contains
+    the collection epilogue after a resolved alert, where an unrelated recovery
+    event could otherwise be promoted into causal support.
+    """
+    if not time_range:
+        return []
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return []
+    timestamps: list[tuple[datetime, str]] = []
+    for line in lines:
+        token = str(line).strip().split(maxsplit=1)[0] if str(line).strip() else ""
+        parsed = parse_incident_time(token)
+        if parsed is not None and start <= parsed <= end:
+            timestamps.append((parsed, token))
+    timestamps.sort(key=lambda item: item[0])
+    return [raw for _, raw in timestamps]
+
+
+def _historical_journal_response_verified(
+    data: object, time_range: dict[str, str]
+) -> bool:
+    """Whether the endpoint confirms it returned the requested journal window.
+
+    A bounded request alone is not evidence: a proxy or an incompatible system
+    agent can return HTTP 200 with a bare body/list, another source, or a
+    different time range.  The chart-owned endpoint echoes this small envelope,
+    so require it before a historical log line can become scoped support.
+    """
+    return (
+        isinstance(data, dict)
+        and str(data.get("source") or "").strip().lower() == "journal"
+        and str(data.get("since") or "") == time_range["start"]
+        and str(data.get("until") or "") == time_range["end"]
+        and isinstance(data.get("lines"), list)
+    )
 
 
 class SystemCollector:
@@ -301,7 +412,24 @@ class SystemCollector:
                 ],
             )
 
-        node = (getattr(plan, "node", "") or target.node or "").strip()
+        target_node = str(target.node or "").strip()
+        node_source = str(getattr(target, "node_source", "") or "").strip()
+        # Most unit/direct callers construct AnalysisTarget themselves; absent
+        # provenance remains backward-compatible and treats their node as an
+        # alert node. Pipeline-scoped targets explicitly label plan-derived
+        # live nodes as ``plan``.
+        alert_node = target_node if node_source in {"", "alert"} else ""
+        planned_node = str(getattr(plan, "node", "") or "").strip()
+        # The alert is authoritative when it names a node.  A plan may enrich
+        # a missing node from a live replacement Pod, but it must not override
+        # the resource identity the alert supplied.
+        node = alert_node or planned_node or target_node
+        node_origin = "alert" if alert_node else (node_source or ("plan" if planned_node else ""))
+        resolved_pod = ""
+        if not node:
+            node, resolved_pod = await _node_from_target_pod(self._settings, target, plan)
+            if node:
+                node_origin = "live_pod"
         if not node:
             summary = f"{NO_EVIDENCE} " + ko_en(
                 self._settings,
@@ -347,17 +475,42 @@ class SystemCollector:
         base_url = _base_url_for_node(self._settings.system_agent_url, address)
         token = self._settings.system_agent_token
         headers = {"Authorization": f"Bearer {token}"} if token else None
+        time_range = incident_time_range(target)
+        # A node discovered from a current Pod is useful to inspect, but cannot
+        # prove that a historical incident occurred on that node.  Only an
+        # alert-supplied node identity can scope old journal evidence.
+        historical_node_scope_verified = bool(
+            time_range and alert_node and node == alert_node
+        )
         source_results = []
+        raw_matches: dict[str, list[str]] = {}
         for source in _SOURCES:
+            params = {"source": source, "lines": "500"}
+            # Only journalctl has a trustworthy historical time predicate. A
+            # dmesg/syslog tail is retained as *current-state* context but must
+            # not be treated as proof about a past incident.
+            if source == "journal" and time_range:
+                params.update({"since": time_range["start"], "until": time_range["end"]})
+            if "{node}" not in self._settings.system_agent_url:
+                params["node"] = node
             response = await get_json(
                 base_url=base_url,
                 path="/logs",
                 timeout_seconds=self._settings.system_agent_timeout_seconds,
-                params={"source": source, "lines": "500"},
+                params=params,
                 headers=headers,
             )
             lines = _lines(response.data)
             matches = [line for line in lines if _ERROR_PATTERNS.search(line)]
+            raw_matches[source] = matches
+            historical_window_verified = bool(
+                source == "journal"
+                and time_range
+                and _historical_journal_response_verified(response.data, time_range)
+            )
+            matching_timestamps = _journal_matching_timestamps(
+                matches, time_range if historical_window_verified else None
+            )
             source_results.append(
                 {
                     "source": source,
@@ -367,16 +520,66 @@ class SystemCollector:
                     "error_count": len(matches),
                     "errors": compact(matches, limit=8),
                     "error": response.error,
+                    "time_range": time_range if source == "journal" and time_range else None,
+                    "historical_scope": bool(source == "journal" and time_range),
+                    "historical_window_verified": historical_window_verified,
+                    "matching_timestamps": matching_timestamps,
                 }
             )
             if response.error:
                 warnings.append(f"System agent query failed for {source}: {response.error}")
 
         successful = [item for item in source_results if not item["error"]]
-        with_errors = [item for item in successful if item["error_count"]]
-        error_lines = [line for item in with_errors for line in item["errors"]]
+        incident_sources = (
+            [item for item in source_results if item["source"] == "journal"]
+            if time_range
+            else source_results
+        )
+        incident_successful = [
+            item
+            for item in incident_sources
+            if not item["error"]
+            and (not time_range or bool(item.get("historical_window_verified")))
+        ]
+        with_errors = [item for item in incident_successful if item["error_count"]]
+        error_lines = [
+            line
+            for item in with_errors
+            for line in raw_matches.get(str(item["source"]), [])
+        ]
+        journal = next((item for item in source_results if item["source"] == "journal"), None)
+        historical_response_verified = bool(
+            isinstance(journal, dict) and journal.get("historical_window_verified")
+        )
+        if time_range and isinstance(journal, dict) and not journal.get("error") and not historical_response_verified:
+            warnings.append(
+                "System agent did not confirm the requested historical journal window; "
+                "its log lines are context only."
+            )
 
-        if with_errors:
+        if time_range and not historical_response_verified:
+            status = "partial"
+            confidence = "low"
+            deterministic = f"{NO_EVIDENCE} " + ko_en(
+                self._settings,
+                f"노드 {node}: system agent가 요청한 incident 시간창의 journal 응답을 확인하지 "
+                "못했습니다. 반환된 로그는 참고용이며 과거 incident 증거로 사용하지 않습니다.",
+                f"Node {node}: the system agent did not confirm the requested incident-window "
+                "journal response. Returned logs are context only, not historical evidence.",
+            )
+        elif with_errors and time_range and not historical_node_scope_verified:
+            status = "partial"
+            confidence = "low"
+            deterministic = f"{NO_EVIDENCE} " + ko_en(
+                self._settings,
+                f"노드 {node}: 현재 pod에서 추론한 노드의 incident 시간창 journal에 "
+                f"커널/하드웨어 에러 라인 {len(error_lines)}건이 있지만, alert가 노드를 "
+                "명시하지 않아 참고용으로만 사용합니다.",
+                f"Node {node}: its incident-window journal has {len(error_lines)} kernel/hardware "
+                "error line(s), but the node was inferred from a current Pod rather than the alert; "
+                "this is context only.",
+            )
+        elif with_errors:
             status = "ok"
             confidence = "high"
             sources_text = ", ".join(sorted({item["source"] for item in with_errors}))
@@ -387,16 +590,36 @@ class SystemCollector:
                 f"Node {node}: {len(error_lines)} kernel/hardware error line(s) found in "
                 f"{sources_text}.",
             )
-        elif successful:
-            # Clean node is a POSITIVE finding (status ok) — NOT a "no evidence" case.
-            status = "ok"
-            confidence = "medium"
+        elif incident_successful:
+            # The endpoint returns a bounded journal tail. A clean tail is
+            # useful context, but cannot rule out a node signal elsewhere in
+            # the incident window.
+            status = "partial"
+            confidence = "low"
             deterministic = ko_en(
                 self._settings,
-                f"노드 {node}: 시스템 에이전트 접속 정상, 최근 dmesg/journal/syslog에 "
+                f"노드 {node}: incident 시간창에서 가져온 journal 줄에는 커널/GPU/하드웨어 "
+                "에러 시그니처가 없습니다. 유한한 tail이므로 부재 증거는 아니며, "
+                "dmesg/syslog는 현재 상태 참고입니다."
+                if time_range
+                else f"노드 {node}: 시스템 에이전트 접속 정상, 최근 dmesg/journal/syslog에 "
                 "커널/GPU/하드웨어 에러 시그니처가 없습니다.",
-                f"Node {node}: system agent reachable, no kernel/GPU/hardware "
+                f"Node {node}: no kernel/GPU/hardware error signatures were found in the "
+                "retrieved journal lines for the incident window. The finite tail is not "
+                "absence evidence; dmesg/syslog are current-state context."
+                if time_range
+                else f"Node {node}: system agent reachable, no kernel/GPU/hardware "
                 "error signatures in recent dmesg/journal/syslog.",
+            )
+        elif successful and time_range:
+            status = "partial"
+            confidence = "low"
+            deterministic = f"{NO_EVIDENCE} " + ko_en(
+                self._settings,
+                f"노드 {node}: incident 시간창 journal 조회에 실패했습니다. "
+                "dmesg/syslog는 현재 상태만 보여 과거 incident 반증으로 사용할 수 없습니다.",
+                f"Node {node}: the incident-window journal query failed. Current dmesg/syslog "
+                "tails cannot disprove a past incident.",
             )
         else:
             status = "unavailable"
@@ -408,7 +631,7 @@ class SystemCollector:
             )
 
         summary = deterministic
-        if with_errors and llm_configured(self._settings):
+        if with_errors and (not time_range or historical_node_scope_verified) and llm_configured(self._settings):
             insight = await _llm_insight(self._settings, node, error_lines)
             if insight:
                 summary = insight
@@ -417,9 +640,20 @@ class SystemCollector:
             "node": node,
             "node_address": address,
             "base_url": base_url,
+            "time_range": time_range,
+            "node_origin": node_origin,
+            "resolved_pod": resolved_pod,
             "sources": source_results,
         }
+        observation = _system_observation(
+            source_results,
+            time_range=time_range,
+            node=node,
+            historical_node_scope_verified=historical_node_scope_verified,
+        )
         missing_data = [] if successful else ["system_agent.query"]
+        if time_range and not incident_successful:
+            missing_data.append("system_agent.journal_time_window")
         return CollectorResult(
             agent=self.name,
             status=status,
@@ -437,10 +671,71 @@ class SystemCollector:
                     confidence=confidence,
                     query=f"node={node} sources={','.join(_SOURCES)}",
                     summary=summary,
-                    result=result,
+                    result={**result, "observation": observation},
                 )
             ],
         )
+
+
+def _system_observation(
+    source_results: list[dict[str, object]],
+    *,
+    time_range: dict[str, str] | None,
+    node: str,
+    historical_node_scope_verified: bool,
+) -> dict[str, object]:
+    """Classify only the source that actually covers the incident window."""
+    if time_range:
+        journal = next(
+            (item for item in source_results if item.get("source") == "journal"), None
+        )
+        if not isinstance(journal, dict) or journal.get("error"):
+            polarity, coverage = "unavailable", "unknown"
+        elif int(journal.get("error_count") or 0) > 0:
+            # ``incident_time_range`` includes an epilogue after resolution.
+            # A source/window echo is not sufficient to classify a matching
+            # journal line as causal; it needs its own timestamp.
+            timestamps = journal.get("matching_timestamps")
+            if not isinstance(timestamps, list) or not timestamps:
+                polarity, coverage = "unknown", "partial"
+            else:
+                polarity = "present"
+                coverage = (
+                    "scoped"
+                    if journal.get("historical_window_verified") and historical_node_scope_verified
+                    else "partial"
+                )
+        else:
+            polarity, coverage = "unknown", "partial"
+    else:
+        successful = [item for item in source_results if not item.get("error")]
+        if not successful:
+            polarity, coverage = "unavailable", "unknown"
+        elif any(int(item.get("error_count") or 0) > 0 for item in successful):
+            # dmesg/syslog tails can be useful to an operator but do not prove
+            # timing for an alert with no bounded incident window.
+            polarity, coverage = "present", "partial"
+        else:
+            polarity, coverage = "unknown", "partial"
+    observation = {
+        "kind": "system_node_logs",
+        "predicate": "system_node_logs",
+        "source_group": _SYSTEM_LOG_SOURCE_GROUP,
+        "independence_group": _SYSTEM_LOG_SOURCE_GROUP,
+        "scope": {"node": node},
+        "observed_entity": {"kind": "node", "name": node},
+        "polarity": polarity,
+        "coverage": coverage,
+        "observation_window": time_range or {},
+    }
+    if time_range and isinstance(journal, dict):
+        timestamps = journal.get("matching_timestamps")
+        if isinstance(timestamps, list) and timestamps:
+            observation["evidence_window"] = {
+                "start": str(timestamps[0]),
+                "end": str(timestamps[-1]),
+            }
+    return observation
 
 
 async def _llm_insight(settings: Settings, node: str, error_lines: list[str]) -> str | None:
@@ -459,6 +754,29 @@ async def _llm_insight(settings: Settings, node: str, error_lines: list[str]) ->
     )
     text = await complete(settings, system=system, user=user, max_tokens=160) or ""
     return _collector_masker(settings).mask_text(text)
+
+
+async def _node_from_target_pod(
+    settings: Settings, target: AnalysisTarget, plan: object | None
+) -> tuple[str, str]:
+    """Best-effort node resolution from the target Pod's ``spec.nodeName``.
+
+    ``resolve_live_pod_node`` first GETs the target Pod and then uses a bounded
+    same-namespace list/event fallback for a replacement.  Keep this collector
+    self-sufficient: direct collector use must not depend on pipeline planning
+    having run first.
+    """
+    namespace = str(target.namespace or "").strip()
+    pod = str(getattr(plan, "pod", "") or target.pod or "").strip()
+    if not namespace or not pod:
+        return "", ""
+    try:
+        from app.collectors.kubernetes import resolve_live_pod_node
+
+        resolved_pod, node = await resolve_live_pod_node(settings, namespace, pod)
+        return str(node or "").strip(), str(resolved_pod or "").strip()
+    except Exception:  # noqa: BLE001 - system evidence remains optional
+        return "", ""
 
 
 def _collector_masker(settings: Settings):

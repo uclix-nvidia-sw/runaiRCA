@@ -34,6 +34,13 @@ def test_open_world_ledger_maps_private_facts_to_response_evidence_ids() -> None
         confidence="high",
         summary="PVC attach repeatedly conflicts on node gpu-01.",
         highlights=["attach conflict"],
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "namespace", "name": "runai"},
+            }
+        },
     )
     second = artifact(
         agent="loki",
@@ -43,6 +50,13 @@ def test_open_world_ledger_maps_private_facts_to_response_evidence_ids() -> None
         confidence="high",
         summary="CSI controller reports a stale attach operation.",
         highlights=["stale attach"],
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "namespace", "name": "runai"},
+            }
+        },
     )
     state.results = [
         CollectorResult(
@@ -84,6 +98,59 @@ def test_open_world_ledger_maps_private_facts_to_response_evidence_ids() -> None
         ]
         in public_ids
     )
+
+
+def test_open_world_candidate_rejects_text_only_artifacts() -> None:
+    """Two scary summaries are context, not independently verified support."""
+    request = AlertAnalysisRequest(
+        alert=Alert(labels={"alertname": "PodPending", "namespace": "runai"})
+    )
+    state = new_state(
+        replace(make_settings(), open_world_rca_mode="authoritative"), request, collectors=[]
+    )
+    k8s = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="event",
+        status="ok",
+        confidence="high",
+        summary="PVC attach repeatedly conflicts on node gpu-01.",
+    )
+    loki = artifact(
+        agent="loki",
+        source="loki",
+        type="log",
+        status="ok",
+        confidence="high",
+        summary="CSI controller reports a stale attach operation.",
+    )
+    state.results = [
+        CollectorResult(agent="kubernetes", status="ok", summary=k8s.summary or "", artifacts=[k8s]),
+        CollectorResult(agent="loki", status="ok", summary=loki.summary or "", artifacts=[loki]),
+    ]
+    state.blackboard = Blackboard()
+    state.blackboard.seed_results({result.agent: result for result in state.results})
+    state.investigation_context = {
+        "hypothesis_ledger": [
+            {
+                "id": "H-text-only",
+                "mechanism": "CSI attach controller races a stale volume operation",
+                "status": "supported",
+                "evidence_for": [
+                    state.blackboard.evidence_id_for(k8s),
+                    state.blackboard.evidence_id_for(loki),
+                ],
+            }
+        ]
+    }
+
+    _aggregate_evidence(state)
+    _refresh_public_reasoning_trace(state)
+    merged = _merge_open_world_candidates(
+        state, [RankedCause("insufficient_evidence", "low", 0.0)]
+    )
+
+    assert all(candidate.novelty != "open_world" for candidate in merged)
 
 
 def test_probe_verdict_links_only_explicit_hypothesis_without_promoting_it() -> None:
@@ -128,7 +195,7 @@ def test_probe_verdict_links_only_explicit_hypothesis_without_promoting_it() -> 
 
     hypothesis = state.investigation_context["hypothesis_ledger"][0]
     assert hypothesis["status"] == "testing"
-    assert hypothesis["evidence_for"] == [probe_artifact.evidence_id]
+    assert "evidence_for" not in hypothesis
 
 
 def test_probe_verdict_never_falls_back_to_same_family_hypotheses() -> None:
@@ -173,7 +240,7 @@ def test_probe_verdict_never_falls_back_to_same_family_hypotheses() -> None:
     _link_probe_assessments_to_ledger(state)
 
     target, same_family = state.investigation_context["hypothesis_ledger"]
-    assert target["evidence_against"] == [probe_artifact.evidence_id]
+    assert "evidence_against" not in target
     assert "evidence_against" not in same_family
 
 
@@ -187,6 +254,13 @@ def test_reasoning_trace_v3_contains_only_public_eligible_evidence_links() -> No
         status="ok",
         confidence="high",
         summary="FailedMount for claim data",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "pod", "name": "trainer-0"},
+            }
+        },
     )
     unavailable = artifact(
         agent="loki",
@@ -288,7 +362,9 @@ def test_reasoning_trace_v3_exposes_precise_observation_timing() -> None:
 
     fact = state.investigation_context["reasoning_trace_v3"]["evidence"][0]
     assert fact["source_group"] == "external_audit"
-    assert fact["temporal_relation"] == "precedes_incident"
+    # The five-minute causal prelude is part of the investigation window so a
+    # rollout immediately before an alert can be evaluated as its trigger.
+    assert fact["temporal_relation"] == "during_incident"
 
 
 def test_reasoning_trace_v3_uses_assessment_hypothesis_ids_without_family_inference() -> None:
@@ -345,7 +421,7 @@ def test_reasoning_trace_v3_uses_assessment_hypothesis_ids_without_family_infere
         "verdict": "supports",
         "executed_at": "2026-07-13T00:01:00Z",
         "hypothesis_ids": ["H-exact"],
-        "evidence_ids": ["E01"],
+        "evidence_ids": [],
     }
 
     state.root_cause_candidates = [
