@@ -858,10 +858,11 @@ def _mcp_named_resource_matches(
 ) -> bool:
     """Whether a named MCP get proves it returned the requested object.
 
-    A list wrapper, an object without metadata, or omitted namespace metadata
-    for a namespaced request is deliberately unverified.  The direct API
-    fallback has endpoint-level identity, so rejecting weak MCP replies loses
-    no safe diagnostic path.
+    A list wrapper, an object without metadata, or an explicit name/namespace
+    mismatch is rejected. Some Kubernetes MCP YAML views omit metadata.namespace
+    even for a correctly namespace-scoped get; that omission remains partial
+    context in downstream evidence handling, rather than forcing an avoidable
+    direct fallback.
     """
     payload = _normalize_k8s_payload(data)
     if not isinstance(payload, dict) or isinstance(payload.get("items"), list):
@@ -869,7 +870,8 @@ def _mcp_named_resource_matches(
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict) or str(metadata.get("name") or "") != expected_name:
         return False
-    if expected_namespace and str(metadata.get("namespace") or "") != expected_namespace:
+    observed_namespace = str(metadata.get("namespace") or "")
+    if expected_namespace and observed_namespace and observed_namespace != expected_namespace:
         return False
     return True
 
