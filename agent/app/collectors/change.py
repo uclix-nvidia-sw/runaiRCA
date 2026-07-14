@@ -425,7 +425,14 @@ class ChangeCollector:
         warnings: list[str] = []
 
         controllers = await self._recent_controllers(
-            ns, node, headers, verify, window_end, warnings, window_seconds=window_seconds
+            ns,
+            node,
+            headers,
+            verify,
+            window_end,
+            warnings,
+            window_seconds=window_seconds,
+            historical_window=historical_window,
         )
         pods = await self._recent_pods(
             ns, headers, verify, window_end, warnings, window_seconds=window_seconds
@@ -460,6 +467,7 @@ class ChangeCollector:
                 window_end,
                 warnings,
                 window_seconds=window_seconds,
+                historical_window=historical_window,
             )
             changes += await self._recent_helm_releases(
                 dep_ns,
@@ -657,6 +665,7 @@ class ChangeCollector:
         *,
         window_seconds: int = _RECENT_WINDOW_SECONDS,
         limit: int | None = None,
+        historical_window: bool = False,
     ) -> list[dict]:  # noqa: ANN001
         out: list[dict] = []
         params = {"limit": str(limit or self._settings.kubernetes_list_limit)}
@@ -691,6 +700,13 @@ class ChangeCollector:
                         "name": meta.get("name"),
                         "namespace": meta.get("namespace"),
                         "rollout": bool(rollout),
+                        # A currently pending generation can predate the
+                        # incident by days. Keep it for operator context, but
+                        # require a creation/condition timestamp in a closed
+                        # incident window before it becomes support.
+                        "time_window_verified": bool(changed_recently)
+                        if historical_window
+                        else True,
                         "summary": (
                             f"{kind} {meta.get('name')} "
                             + (
@@ -980,6 +996,9 @@ def _partition_target_changes(
         namespace = str(change.get("namespace") or primary_namespace).strip()
         kind = str(change.get("kind") or "")
         relation = ""
+        if change.get("time_window_verified") is False:
+            context.append({**change, "relation": "stale_or_untimed_context"})
+            continue
         if namespace in dependency_set:
             relation = "declared_dependency"
         elif kind == "NodeCondition" and node and name == node:

@@ -209,6 +209,48 @@ async def test_historical_unrelated_namespace_change_is_context_only(
     assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
 
 
+@pytest.mark.asyncio
+async def test_historical_stale_target_rollout_is_context_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, path, **_kwargs):
+        if path.endswith("/deployments"):
+            return JsonResponse(
+                url="u",
+                status_code=200,
+                data={
+                    "items": [
+                        {
+                            "metadata": {
+                                "name": "trainer",
+                                "namespace": "runai",
+                                "generation": 5,
+                                "creationTimestamp": "2025-12-01T00:00:00Z",
+                            },
+                            "status": {"observedGeneration": 4, "conditions": []},
+                        }
+                    ]
+                },
+            )
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-01-02T03:00:00Z",
+        resolved_at="2026-01-02T03:10:00Z",
+    )
+    result = await ChangeCollector(_Settings()).collect(target)
+
+    observation = result.artifacts[0].result["observation"]
+    assert result.status == "partial"
+    assert result.details["changes"] == []
+    assert result.details["context_changes"][0]["relation"] == "stale_or_untimed_context"
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+
+
 def test_live_change_window_remains_context_only() -> None:
     observation = change_mod._collector_change_observation(
         changes=[{"kind": "PodCreated"}],
