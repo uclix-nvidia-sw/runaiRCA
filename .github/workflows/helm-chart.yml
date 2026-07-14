@@ -60,7 +60,22 @@ jobs:
           echo "appVersion=${app}" >> "$GITHUB_OUTPUT"
 
       - name: Lint chart
-        run: helm lint "$CHART_PATH"
+        run: >-
+          helm lint "$CHART_PATH"
+          --set agent.env.runaiBaseUrl=https://runai.example.com
+
+      - name: Render official Run:ai MCP deployment
+        run: >-
+          helm template runai-rca "$CHART_PATH"
+          --set agent.env.runaiBaseUrl=https://runai.example.com
+          --set 'runaiMcp.imagePullSecrets[0].name=ngc-regcred'
+          > /dev/null
+
+      - name: Render direct Run:ai API fallback deployment
+        run: >-
+          helm template runai-rca "$CHART_PATH"
+          --set runaiMcp.enabled=false
+          > /dev/null
 
       - name: Package chart
         run: helm package "$CHART_PATH" --destination dist --version "${{ steps.chartver.outputs.version }}" --app-version "${{ steps.chartver.outputs.appVersion }}"

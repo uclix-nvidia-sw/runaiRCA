@@ -1,5 +1,6 @@
 {{- if .Values.runaiMcp.enabled }}
-{{- $runaiBaseUrl := required "agent.env.runaiBaseUrl is required when runaiMcp.enabled=true (sets RUNAI_API_BASE_URL for runai-mcp)" .Values.agent.env.runaiBaseUrl }}
+{{- $runaiBaseUrl := required "agent.env.runaiBaseUrl is required when runaiMcp.enabled=true (sets RUNAI_BASE_URL for the official NVIDIA Run:ai MCP)" .Values.agent.env.runaiBaseUrl }}
+{{- $runaiMcpPullSecrets := default .Values.imagePullSecrets .Values.runaiMcp.imagePullSecrets }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -20,7 +21,7 @@ spec:
         app.kubernetes.io/component: runai-mcp
     spec:
       automountServiceAccountToken: false
-      {{- with .Values.imagePullSecrets }}
+      {{- with $runaiMcpPullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -36,36 +37,64 @@ spec:
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- with .Values.runaiMcp.command }}
-          command:
+          {{- with .Values.runaiMcp.args }}
+          args:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           ports:
             - name: mcp
               containerPort: {{ .Values.runaiMcp.port }}
+            - name: metrics
+              containerPort: {{ .Values.runaiMcp.metricsPort }}
           env:
-            - name: RUNAI_API_BASE_URL
+            - name: RUNAI_BASE_URL
               value: {{ $runaiBaseUrl | quote }}
-            - name: RUNAI_CLIENT_ID
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "runai-rca.secretName" . }}
-                  key: {{ .Values.secrets.keys.runaiClientId | quote }}
-                  optional: true
-            - name: RUNAI_CLIENT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "runai-rca.secretName" . }}
-                  key: {{ .Values.secrets.keys.runaiClientSecret | quote }}
-                  optional: true
-            - name: RUNAI_API_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "runai-rca.secretName" . }}
-                  key: {{ .Values.secrets.keys.runaiBearerToken | quote }}
-                  optional: true
+            - name: RUNAI_MCP_LISTEN_PORT
+              value: {{ .Values.runaiMcp.port | quote }}
+            - name: RUNAI_MCP_METRICS_PORT
+              value: {{ .Values.runaiMcp.metricsPort | quote }}
+            {{- if .Values.runaiTls.caBundleSecretName }}
+            - name: SSL_CERT_FILE
+              value: /etc/runai/tls/ca-bundle.pem
+            {{- end }}
+            {{- with .Values.runaiMcp.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if or .Values.runaiTls.caBundleSecretName .Values.runaiMcp.extraVolumeMounts }}
+          volumeMounts:
+            {{- if .Values.runaiTls.caBundleSecretName }}
+            - name: runai-ca-bundle
+              mountPath: /etc/runai/tls
+              readOnly: true
+            {{- end }}
+            {{- with .Values.runaiMcp.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          {{- with .Values.runaiMcp.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.runaiMcp.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           resources:
             {{- toYaml .Values.runaiMcp.resources | nindent 12 }}
+      {{- if or .Values.runaiTls.caBundleSecretName .Values.runaiMcp.extraVolumes }}
+      volumes:
+        {{- if .Values.runaiTls.caBundleSecretName }}
+        - name: runai-ca-bundle
+          secret:
+            secretName: {{ .Values.runaiTls.caBundleSecretName | quote }}
+            items:
+              - key: {{ .Values.runaiTls.caBundleSecretKey | quote }}
+                path: ca-bundle.pem
+        {{- end }}
+        {{- with .Values.runaiMcp.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -84,6 +113,9 @@ spec:
     - name: mcp
       port: {{ .Values.runaiMcp.port }}
       targetPort: mcp
+    - name: metrics
+      port: {{ .Values.runaiMcp.metricsPort }}
+      targetPort: metrics
   selector:
     {{- include "runai-rca.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: runai-mcp
@@ -150,15 +182,9 @@ spec:
             - :{{ .Values.grafanaMcp.service.port }}
             - --endpoint-path
             - /mcp
+            - --enabled-tools
+            - datasource,prometheus,loki
             - --disable-write
-            - --disable-admin
-            - --disable-alerting
-            - --disable-incident
-            - --disable-oncall
-            - --disable-sift
-            - --disable-snapshot
-            - --disable-rendering
-            - --disable-provisioning
             {{- end }}
           ports:
             - name: mcp

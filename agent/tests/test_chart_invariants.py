@@ -20,14 +20,12 @@ MCP_TEMPLATE = (
     Path(__file__).parents[2] / "charts" / "runai-rca" / "templates" / "mcp-services.yaml"
 )
 AGENT_TEMPLATE = Path(__file__).parents[2] / "charts" / "runai-rca" / "templates" / "agent.yaml"
-RUNAI_MCP_DOCKERFILE = Path(__file__).parents[2] / "runai-mcp" / "Dockerfile"
 # Images we build and publish to the org registry — the ONLY repositories allowed
 # to be short (unqualified), because global.imageRegistry is meant to prefix them.
 OWN_IMAGES = {
     "runai-rca-agent",
     "runai-rca-backend",
     "runai-rca-frontend",
-    "runai-rca-mcp",
     "runai-rca-postgres-mcp",
 }
 
@@ -101,25 +99,74 @@ def test_managed_mcp_values_keep_expected_secret_and_images() -> None:
     assert values["secrets"]["keys"]["grafanaServiceAccountToken"] == (
         "GRAFANA_SERVICE_ACCOUNT_TOKEN"
     )
-    assert values["runaiMcp"]["image"]["repository"] == "runai-rca-mcp"
+    assert values["runaiMcp"]["image"]["repository"] == (
+        "nvcr.io/nvidia/runai/runai-mcp-server"
+    )
+    assert values["runaiMcp"]["image"]["tag"] == "2.26.13"
     assert values["grafanaMcp"]["image"]["repository"] == "docker.io/grafana/mcp-grafana"
+    assert values["grafanaMcp"]["image"]["tag"] == "0.14.0"
     assert values["kubernetesMcp"]["image"]["repository"] == (
         "quay.io/containers/kubernetes_mcp_server"
     )
+    assert values["kubernetesMcp"]["image"]["tag"] == "v0.0.62"
+    assert values["kubernetesMcp"]["image"]["pullPolicy"] == "IfNotPresent"
     assert values["postgresMcp"]["image"]["repository"] == "runai-rca-postgres-mcp"
 
 
 def test_runai_mcp_requires_explicit_runai_api_url() -> None:
     template = MCP_TEMPLATE.read_text(encoding="utf-8")
     assert "agent.env.runaiBaseUrl is required when runaiMcp.enabled=true" in template
-    assert "RUNAI_API_BASE_URL" in template
+    assert "RUNAI_BASE_URL" in template
+    assert "RUNAI_API_BASE_URL" not in template
+    assert "RUNAI_API_TOKEN" not in template
 
 
-def test_runai_mcp_proxy_passes_auth_env_to_stdio_child() -> None:
-    dockerfile = RUNAI_MCP_DOCKERFILE.read_text(encoding="utf-8")
-    assert "-- env RUNAI_API_BASE_URL=" in dockerfile
-    assert "RUNAI_CLIENT_ID=" in dockerfile
-    assert "RUNAI_CLIENT_SECRET=" in dockerfile
+def test_runai_mcp_uses_official_http_transport_and_scoped_pull_secret() -> None:
+    values = _values()["runaiMcp"]
+    template = MCP_TEMPLATE.read_text(encoding="utf-8")
+    assert values["port"] == 8080
+    assert values["metricsPort"] == 9090
+    assert values["args"] == ["serve", "--transport", "http"]
+    assert "runaiMcp.imagePullSecrets" in template
+    assert "containerPort: {{ .Values.runaiMcp.metricsPort }}" in template
+    assert "RUNAI_MCP_LISTEN_PORT" in template
+    assert "RUNAI_MCP_METRICS_PORT" in template
+    assert "runaiClientId" not in template
+    assert "runaiClientSecret" not in template
+    assert values["readinessProbe"]["tcpSocket"]["port"] == "mcp"
+    assert values["extraEnv"] == []
+    assert values["extraVolumeMounts"] == []
+    assert values["extraVolumes"] == []
+    assert ".Values.runaiMcp.extraEnv" in template
+    assert ".Values.runaiMcp.extraVolumeMounts" in template
+    assert ".Values.runaiMcp.extraVolumes" in template
+
+
+def test_runai_private_ca_bundle_is_shared_without_application_credentials() -> None:
+    values = _values()
+    tls = values["runaiTls"]
+    agent = AGENT_TEMPLATE.read_text(encoding="utf-8")
+    mcp = MCP_TEMPLATE.read_text(encoding="utf-8")
+
+    assert tls == {"caBundleSecretName": "", "caBundleSecretKey": "ca.crt"}
+    for template in (agent, mcp):
+        assert ".Values.runaiTls.caBundleSecretName" in template
+        assert ".Values.runaiTls.caBundleSecretKey" in template
+        assert "SSL_CERT_FILE" in template
+        assert "/etc/runai/tls/ca-bundle.pem" in template
+        assert "name: runai-ca-bundle" in template
+    # The official MCP receives only a CA-only Secret mount; runtime Run:ai
+    # credentials continue to be forwarded as per-request bearer headers.
+    assert "runaiClientId" not in mcp
+    assert "runaiClientSecret" not in mcp
+    assert "runaiBearerToken" not in mcp
+
+
+def test_helm_secret_change_scan_is_opt_in_and_not_granted_by_chart_rbac() -> None:
+    values = _values()
+    agent = AGENT_TEMPLATE.read_text(encoding="utf-8")
+    assert values["agent"]["env"]["enableHelmChangeDetection"] is False
+    assert "ENABLE_HELM_CHANGE_DETECTION" in agent
 
 
 def test_agent_env_uses_shared_mcp_service_urls_when_managed_enabled() -> None:
@@ -130,15 +177,28 @@ def test_agent_env_uses_shared_mcp_service_urls_when_managed_enabled() -> None:
     assert "runai-rca.runaiMcp.fullname" in MCP_TEMPLATE.read_text(encoding="utf-8")
     assert "PROMETHEUS_MCP_URL" in text and "runai-rca.grafanaMcp.fullname" in text
     assert "LOKI_MCP_URL" in text and "runai-rca.grafanaMcp.fullname" in text
+    assert "PROMETHEUS_DATASOURCE_UID" in text
+    assert "grafanaMcp.prometheusDatasourceUid" in text
+    assert "LOKI_DATASOURCE_UID" in text
+    assert "grafanaMcp.lokiDatasourceUid" in text
     assert "KUBERNETES_MCP_URL" in text and "runai-rca.kubernetesMcp.fullname" in text
     assert "POSTGRES_MCP_URL" in text and "runai-rca.postgresMcp.fullname" in text
+    values = _values()["agent"]
+    assert values["extraVolumeMounts"] == []
+    assert values["extraVolumes"] == []
+    assert ".Values.agent.extraVolumeMounts" in text
+    assert ".Values.agent.extraVolumes" in text
 
 
 def test_grafana_mcp_args_match_current_image_flags() -> None:
     text = MCP_TEMPLATE.read_text(encoding="utf-8")
     assert "--allowed-hosts" not in text
     assert "--endpoint-path" in text
+    assert "--enabled-tools" in text
+    assert "datasource,prometheus,loki" in text
     assert "--disable-write" in text
+    assert "--disable-snapshot" not in text
+    assert "--disable-provisioning" not in text
 
 
 def test_kubernetes_mcp_rbac_is_read_only_and_excludes_sensitive_subresources() -> None:
@@ -152,6 +212,16 @@ def test_kubernetes_mcp_rbac_is_read_only_and_excludes_sensitive_subresources() 
     assert "verbs: [\"delete\"" not in text
     assert "verbs: [\"get\", \"list\", \"watch\"]" in text
     assert "resources: [\"pods/log\"]" in text
+
+
+def test_agent_pod_exec_rbac_allows_websocket_get_and_post_create() -> None:
+    # The agent uses aiohttp.ws_connect, whose WebSocket handshake is an HTTP
+    # GET. Kubernetes therefore checks `get` on pods/exec. Keep `create` too for
+    # the POST connect method used by conventional Kubernetes exec clients.
+    text = (AGENT_TEMPLATE.parent / "agent-rbac.yaml").read_text(encoding="utf-8")
+    assert text.count('resources: ["pods/exec"]') == 2
+    assert text.count('verbs: ["get", "create"]') == 2
+    assert text.count(".Values.agent.env.enablePodExec") == 2
 
 
 def test_system_agent_supports_time_bounded_journal_reads() -> None:
@@ -189,7 +259,7 @@ def test_runai_crd_rbac_matches_the_k8s_read_allowlist_exactly() -> None:
             blocks = text.split(f'- apiGroups: ["{group}"]')[1:]
             assert len(blocks) == 2, (template.name, group, len(blocks))
             expected_per_block = [all_by_group[group], namespaced_by_group.get(group, set())]
-            for block, expected in zip(blocks, expected_per_block):
+            for block, expected in zip(blocks, expected_per_block, strict=True):
                 resources_block = block.split("verbs:")[0]
                 granted = {
                     line.strip().removeprefix("- ")
