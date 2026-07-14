@@ -86,14 +86,14 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
     component = str(args.get("component") or "").strip()
     if component and not _COMPONENT_RE.fullmatch(component):
         return _query_error("component must be a bounded resource identifier", source=source)
-    lookback = _bounded_int(
+    requested_lookback = _bounded_int(
         args.get("lookback_seconds", _QUERY_DEFAULT_LOOKBACK_SECONDS),
         minimum=_QUERY_MIN_LOOKBACK_SECONDS,
         maximum=_QUERY_MAX_LOOKBACK_SECONDS,
         label="lookback_seconds",
     )
-    if isinstance(lookback, str):
-        return _query_error(lookback, source=source, namespace=namespace, node=node)
+    if isinstance(requested_lookback, str):
+        return _query_error(requested_lookback, source=source, namespace=namespace, node=node)
     limit = _bounded_int(
         args.get("limit", _QUERY_MAX_RESULTS),
         minimum=1,
@@ -102,7 +102,7 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
     )
     if isinstance(limit, str):
         return _query_error(
-            limit, source=source, namespace=namespace, node=node, lookback=lookback
+            limit, source=source, namespace=namespace, node=node, lookback=requested_lookback
         )
     token = _read_file(settings.kubernetes_token_path)
     if not token:
@@ -111,7 +111,7 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
             source=source,
             namespace=namespace,
             node=node,
-            lookback=lookback,
+            lookback=requested_lookback,
             limit=limit,
         )
 
@@ -119,7 +119,20 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
     verify: bool | str = (
         settings.kubernetes_ca_path if Path(settings.kubernetes_ca_path).exists() else True
     )
-    now = datetime.now(UTC)
+    # A historical alert must use its bounded incident window. A moving
+    # "last N seconds" window would otherwise return changes from the present
+    # and make them look causal for an already-resolved incident.
+    window_start, window_end, incident_window = _collection_window(target)
+    historical_window = incident_time_range(target) is not None
+    now = window_end if historical_window else datetime.now(UTC)
+    lookback = (
+        max(1, int((window_end - window_start).total_seconds()))
+        if historical_window
+        else requested_lookback
+    )
+    observation_window = (
+        incident_window if historical_window else _observation_window(lookback, now)
+    )
     collector = ChangeCollector(settings)
     warnings: list[str] = []
     ns = quote(namespace, safe="")
@@ -162,7 +175,6 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
     if component:
         changes = [item for item in changes if str(item.get("name") or "") == component]
     changes.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
-    observation_window = _observation_window(lookback, now)
     observation = _change_observation(
         namespace=namespace,
         node=node,
@@ -174,14 +186,16 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
         warnings=warnings,
         component=component,
         observation_window=observation_window,
+        historical_window=historical_window,
     )
     return {
         "query": (
             f"kubernetes changes source={source} namespace={namespace} "
-            f"node={node or 'n/a'} lookback<={lookback}s results<={limit}"
+            f"node={node or 'n/a'} start={observation_window['start']} "
+            f"end={observation_window['end']} results<={limit}"
         ),
         "title": "Kubernetes change timeline",
-        "summary": f"{len(observation['changes'])} recent change observation(s) (metadata only)",
+        "summary": f"{len(observation['changes'])} change observation(s) (metadata only)",
         "error": None,
         "source_group": _CHANGE_SOURCE_GROUP,
         "independence_group": _CHANGE_SOURCE_GROUP,
@@ -257,6 +271,7 @@ def _change_observation(
     warnings: list[str],
     component: str,
     observation_window: dict[str, str],
+    historical_window: bool,
 ) -> dict:
     """Project only safe change metadata; never copy Event or Secret bodies."""
     safe_changes = [_safe_change_metadata(change, namespace) for change in changes]
@@ -277,14 +292,21 @@ def _change_observation(
         },
         "window": {"lookback_seconds": lookback_seconds},
         "observation_window": observation_window,
-        "polarity": "present" if safe_changes else ("unknown" if warnings else "absent"),
-        "coverage": "partial" if warnings else "scoped",
+        # A live query is a useful operator hint, but cannot establish a
+        # causal absence/presence for an alert without an incident timestamp.
+        "polarity": (
+            "present"
+            if safe_changes
+            else ("unknown" if warnings or not historical_window else "absent")
+        ),
+        "coverage": "partial" if warnings or not historical_window else "scoped",
         "lookback_seconds": lookback_seconds,
         "result_limit": limit,
         "status": "partial" if warnings else "ok",
         "changes": safe_changes,
         "truncated_count": truncated,
         "body_included": False,
+        "historical_window": historical_window,
     }
 
 

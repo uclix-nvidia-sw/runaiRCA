@@ -315,13 +315,57 @@ async def test_change_query_is_bounded_scoped_and_never_returns_bodies(
     assert observation["observed_entity"] == {"kind": "component", "name": "trainer"}
     assert observation["window"] == {"lookback_seconds": 120}
     assert observation["polarity"] == "present"
-    assert observation["coverage"] == "scoped"
+    assert observation["coverage"] == "partial"
     assert set(observation["observation_window"]) == {"start", "end"}
     assert observation["body_included"] is False
     assert len(observation["changes"]) == 1
     assert "event-body-secret" not in str(query)
     assert "helm-secret-body" not in str(query)
     assert "summary" not in observation["changes"][0]
+
+
+@pytest.mark.asyncio
+async def test_change_query_uses_the_historical_incident_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, path, **kwargs):
+        if path.endswith("/events"):
+            return JsonResponse(url="u", status_code=200, data={"items": [
+                {
+                    "type": "Warning",
+                    "reason": "BackOff",
+                    "lastTimestamp": "2026-07-13T21:44:00Z",
+                    "involvedObject": {"name": "trainer", "kind": "Pod"},
+                },
+                {
+                    "type": "Warning",
+                    "reason": "UnrelatedCurrentEvent",
+                    "lastTimestamp": "2026-07-14T09:00:00Z",
+                    "involvedObject": {"name": "trainer", "kind": "Pod"},
+                },
+            ]})
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-07-13T21:43:47Z",
+        resolved_at="2026-07-13T21:45:47Z",
+    )
+    query = await change_query(_Settings(), target, {"kind": "event", "lookback_seconds": 60})
+
+    observation = query["observation"]
+    assert observation["historical_window"] is True
+    assert observation["observation_window"] == {
+        "start": "2026-07-13T21:38:47Z",
+        "end": "2026-07-13T21:50:47Z",
+    }
+    assert observation["window"] == {"lookback_seconds": 720}
+    assert [change["reason"] for change in observation["changes"]] == ["BackOff"]
+    assert observation["coverage"] == "scoped"
+    assert "start=2026-07-13T21:38:47Z" in query["query"]
 
 
 @pytest.mark.asyncio
@@ -351,8 +395,8 @@ async def test_change_query_accepts_plan_kinds_with_bounded_lookback(
     query = await change_query(_Settings(), _target(), {"kind": kind, "lookback_seconds": 86400})
 
     assert query["error"] is None
-    assert query["observation"]["polarity"] == "absent"
-    assert query["observation"]["coverage"] == "scoped"
+    assert query["observation"]["polarity"] == "unknown"
+    assert query["observation"]["coverage"] == "partial"
 
 
 @pytest.mark.asyncio
