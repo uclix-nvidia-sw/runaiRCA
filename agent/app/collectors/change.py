@@ -195,7 +195,10 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
             f"end={observation_window['end']} results<={limit}"
         ),
         "title": "Kubernetes change timeline",
-        "summary": f"{len(observation['changes'])} change observation(s) (metadata only)",
+        "summary": (
+            f"{len(observation['changes'])} change observation(s) (metadata only)"
+            + (f"; {'; '.join(warnings)}" if warnings else "")
+        ),
         "error": None,
         "source_group": _CHANGE_SOURCE_GROUP,
         "independence_group": _CHANGE_SOURCE_GROUP,
@@ -205,6 +208,7 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
         "coverage": observation["coverage"],
         "observation": observation,
         "result": observation,
+        "warnings": warnings,
     }
 
 
@@ -602,7 +606,14 @@ class ChangeCollector:
         if response.error:
             warnings.append(f"change {label} query failed: {response.error}")
             return None
-        return response.data
+        data = response.data
+        # A bounded list can be paginated by the API server. Without consuming
+        # the continuation token, an empty page cannot safely mean that no
+        # incident-adjacent change exists elsewhere in the resource list.
+        metadata = _dict(data.get("metadata")) if isinstance(data, dict) else {}
+        if metadata.get("continue"):
+            warnings.append(f"change {label} query was truncated by Kubernetes pagination")
+        return data
 
     async def _recent_controllers(
         self,

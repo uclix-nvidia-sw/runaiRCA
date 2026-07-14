@@ -369,6 +369,32 @@ async def test_change_query_uses_the_historical_incident_window(
 
 
 @pytest.mark.asyncio
+async def test_change_query_marks_paginated_history_as_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(**kwargs):
+        return JsonResponse(
+            url="u",
+            status_code=200,
+            data={"items": [], "metadata": {"continue": "next-page-token"}},
+        )
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-07-13T21:43:47Z",
+        resolved_at="2026-07-13T21:45:47Z",
+    )
+    query = await change_query(_Settings(), target, {"kind": "event"})
+
+    assert query["observation"]["polarity"] == "unknown"
+    assert query["observation"]["coverage"] == "partial"
+    assert "truncated by Kubernetes pagination" in query["summary"]
+
+
+@pytest.mark.asyncio
 async def test_change_query_refuses_namespace_or_limit_expansion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
