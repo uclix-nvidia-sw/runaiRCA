@@ -1549,8 +1549,31 @@ func (s *Store) persistKnowledgeApprovalLocked(candidate *KnowledgeCandidate, pk
 			return false
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO knowledge_packages (package_id, candidate_id, case_id, status, payload, published_at, retired_at, retired_by, retirement_note, mirror_status, mirror_last_error, mirror_updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`, pkg.PackageID, pkg.CandidateID, pkg.CaseID, pkg.Status, mustJSON(pkg.Payload), pkg.PublishedAt, pkg.RetiredAt, pkg.RetiredBy, pkg.RetirementNote, pkg.MirrorStatus, pkg.MirrorLastError, pkg.MirrorUpdatedAt); err != nil {
+	result, err = tx.ExecContext(ctx, `INSERT INTO knowledge_packages (package_id, candidate_id, case_id, status, payload, published_at, retired_at, retired_by, retirement_note, mirror_status, mirror_last_error, mirror_updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		ON CONFLICT (package_id) DO UPDATE SET
+			candidate_id = EXCLUDED.candidate_id,
+			case_id = EXCLUDED.case_id,
+			status = EXCLUDED.status,
+			payload = EXCLUDED.payload,
+			published_at = EXCLUDED.published_at,
+			retired_at = EXCLUDED.retired_at,
+			retired_by = EXCLUDED.retired_by,
+			retirement_note = EXCLUDED.retirement_note,
+			mirror_status = EXCLUDED.mirror_status,
+			mirror_last_error = EXCLUDED.mirror_last_error,
+			mirror_updated_at = EXCLUDED.mirror_updated_at
+		WHERE knowledge_packages.candidate_id = EXCLUDED.candidate_id
+			AND knowledge_packages.status = 'retired'`,
+		pkg.PackageID, pkg.CandidateID, pkg.CaseID, pkg.Status, mustJSON(pkg.Payload),
+		pkg.PublishedAt, pkg.RetiredAt, pkg.RetiredBy, pkg.RetirementNote,
+		pkg.MirrorStatus, pkg.MirrorLastError, pkg.MirrorUpdatedAt)
+	if err != nil {
 		log.Printf("Failed to publish knowledge package %s: %v", pkg.PackageID, err)
+		return false
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		log.Printf("Knowledge package %s could not be published from its current state", pkg.PackageID)
 		return false
 	}
 	if !persistKnowledgeEventTx(ctx, tx, event) {
@@ -1656,6 +1679,109 @@ func (s *Store) persistKnowledgeShadowRejectionLocked(candidate *KnowledgeCandid
 	}
 	if err := tx.Commit(); err != nil {
 		log.Printf("Failed to commit knowledge shadow rejection transaction: %v", err)
+		return false
+	}
+	committed = true
+	return true
+}
+
+func (s *Store) persistKnowledgeReviewInvalidationLocked(candidate *KnowledgeCandidate, pkg *KnowledgePackage, event *KnowledgeEvent) bool {
+	if s.db == nil || !s.dbReady {
+		return true
+	}
+	if candidate == nil || event == nil {
+		return false
+	}
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("Failed to start knowledge review invalidation transaction: %v", err)
+		return false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates
+		SET status = $1, validation_error = $2, payload = $3, decided_at = $4,
+		    decided_by = $5, decision_note = $6, updated_at = $7
+		WHERE candidate_id = $8`, candidate.Status, candidate.ValidationError,
+		mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy,
+		candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID)
+	if err != nil {
+		log.Printf("Failed to invalidate knowledge candidate %s: %v", candidate.CandidateID, err)
+		return false
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return false
+	}
+	if pkg != nil {
+		result, err = tx.ExecContext(ctx, `UPDATE knowledge_packages
+			SET status = $1, payload = $2, retired_at = $3, retired_by = $4,
+			    retirement_note = $5
+			WHERE package_id = $6`, pkg.Status, mustJSON(pkg.Payload), pkg.RetiredAt,
+			pkg.RetiredBy, pkg.RetirementNote, pkg.PackageID)
+		if err != nil {
+			log.Printf("Failed to retire invalidated knowledge package %s: %v", pkg.PackageID, err)
+			return false
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return false
+		}
+	}
+	if !persistKnowledgeEventTx(ctx, tx, event) {
+		return false
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit knowledge review invalidation: %v", err)
+		return false
+	}
+	committed = true
+	return true
+}
+
+func (s *Store) persistKnowledgeReviewRevalidationLocked(candidate *KnowledgeCandidate, event *KnowledgeEvent) bool {
+	if s.db == nil || !s.dbReady {
+		return true
+	}
+	if candidate == nil || event == nil {
+		return false
+	}
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("Failed to start knowledge review revalidation transaction: %v", err)
+		return false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates
+		SET status = $1, package_id = '', validation_error = '', trace = $2,
+		    payload = $3, decided_at = NULL, decided_by = '', decision_note = '',
+		    updated_at = $4
+		WHERE candidate_id = $5 AND status = 'validation_failed'`,
+		candidate.Status, mustJSON(candidate.Trace), mustJSON(candidate.Payload),
+		candidate.UpdatedAt, candidate.CandidateID)
+	if err != nil {
+		log.Printf("Failed to revalidate knowledge candidate %s: %v", candidate.CandidateID, err)
+		return false
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return false
+	}
+	if !persistKnowledgeEventTx(ctx, tx, event) {
+		return false
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit knowledge review revalidation transaction: %v", err)
 		return false
 	}
 	committed = true
@@ -1921,6 +2047,43 @@ func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) bool {
 	)
 	if err != nil {
 		log.Printf("Failed to persist analysis run %s: %v", run.RunID, err)
+		return false
+	}
+	return true
+}
+
+// persistSlackAnalysisDeliveryLocked commits the outbox acknowledgement and
+// the incident's thread/sequence state together. Without this transaction a
+// crash between two independent writes can either duplicate a reply or lose
+// the thread parent after restart.
+func (s *Store) persistSlackAnalysisDeliveryLocked(run *AnalysisRun, incident *Incident) bool {
+	if s.db == nil || !s.dbReady || run == nil || incident == nil {
+		return true
+	}
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("Failed to begin Slack delivery transaction for %s: %v", run.RunID, err)
+		return false
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err = tx.ExecContext(ctx,
+		`UPDATE analysis_runs SET metadata = $2 WHERE run_id = $1`,
+		run.RunID, mustJSON(firstAnyMap(run.Metadata)),
+	); err != nil {
+		log.Printf("Failed to persist Slack outbox acknowledgement for %s: %v", run.RunID, err)
+		return false
+	}
+	if _, err = tx.ExecContext(ctx,
+		`UPDATE incidents SET analysis_seq = $2, slack_thread_ts = $3, updated_at = now() WHERE incident_id = $1`,
+		incident.IncidentID, incident.AnalysisSeq, incident.SlackThreadTS,
+	); err != nil {
+		log.Printf("Failed to persist Slack thread state for %s: %v", incident.IncidentID, err)
+		return false
+	}
+	if err = tx.Commit(); err != nil {
+		log.Printf("Failed to commit Slack delivery transaction for %s: %v", run.RunID, err)
 		return false
 	}
 	return true

@@ -22,6 +22,7 @@ const (
 	knowledgePackageActive             = "active"
 	knowledgePackageShadow             = "shadow"
 	knowledgePackageRetired            = "retired"
+	knowledgeReviewInvalidationError   = "operator evaluation no longer qualifies this analysis for runtime knowledge"
 )
 
 // KnowledgeCandidate is a reviewable, incident-derived proposal. It can only
@@ -791,12 +792,25 @@ func (s *Store) ListKnowledgePackages(includeRetired bool) []KnowledgePackage {
 	defer s.mu.RUnlock()
 	items := make([]KnowledgePackage, 0, len(s.knowledgePackages))
 	for _, pkg := range s.knowledgePackages {
-		if includeRetired || pkg.Status == knowledgePackageActive {
+		if includeRetired || (pkg.Status == knowledgePackageActive && s.knowledgePackageValidatedLocked(pkg)) {
 			items = append(items, cloneKnowledgePackage(pkg))
 		}
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].PublishedAt.After(items[j].PublishedAt) })
 	return items
+}
+
+func (s *Store) knowledgePackageValidatedLocked(pkg *KnowledgePackage) bool {
+	if pkg == nil {
+		return false
+	}
+	candidate := s.knowledgeCandidates[pkg.CandidateID]
+	if candidate == nil || candidate.Status != knowledgeCandidateActive {
+		return false
+	}
+	snapshot := s.caseSnapshots[pkg.CaseID]
+	validated := s.knowledgeCandidateForSnapshotLocked(snapshot)
+	return validated != nil && validated.Status == knowledgeCandidateReady && validated.ContentHash == candidate.ContentHash
 }
 
 func (s *Store) KnowledgePackage(id string) (KnowledgePackage, bool) {
@@ -927,7 +941,7 @@ func (s *Store) ApproveKnowledgeCandidate(id string, request KnowledgeDecisionRe
 		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate is not ready for review")
 	}
 	snapshot := s.caseSnapshots[candidate.CaseID]
-	validated := knowledgeCandidateForSnapshot(snapshot)
+	validated := s.knowledgeCandidateForSnapshotLocked(snapshot)
 	if validated == nil || validated.Status != knowledgeCandidateReady || validated.ContentHash != candidate.ContentHash {
 		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate failed content-hash revalidation")
 	}
@@ -983,7 +997,7 @@ func (s *Store) ShadowKnowledgeCandidate(id string, request KnowledgeDecisionReq
 	if candidate.Status != knowledgeCandidateReady {
 		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate is not ready for review")
 	}
-	validated := knowledgeCandidateForSnapshot(s.caseSnapshots[candidate.CaseID])
+	validated := s.knowledgeCandidateForSnapshotLocked(s.caseSnapshots[candidate.CaseID])
 	if validated == nil || validated.Status != knowledgeCandidateReady || validated.ContentHash != candidate.ContentHash {
 		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate failed content-hash revalidation")
 	}
@@ -1022,6 +1036,10 @@ func (s *Store) ActivateShadowKnowledgeCandidate(id string, request KnowledgeDec
 	pkg := s.knowledgePackages[candidate.PackageID]
 	if pkg == nil || pkg.Status != knowledgePackageShadow {
 		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge shadow package not found")
+	}
+	validated := s.knowledgeCandidateForSnapshotLocked(s.caseSnapshots[candidate.CaseID])
+	if validated == nil || validated.Status != knowledgeCandidateReady || validated.ContentHash != candidate.ContentHash {
+		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate failed content-hash revalidation")
 	}
 	now := time.Now().UTC()
 	actor, note := knowledgeActor(request.Actor), strings.TrimSpace(request.Note)

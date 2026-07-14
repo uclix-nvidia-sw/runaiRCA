@@ -6,17 +6,18 @@ knowledge base instead of being hand-maintained. No LLM: every row is derived
 deterministically, so re-running is idempotent (stable ids + sorted output).
 
 Three stores, with a strict invariant — the MEASURED set only ever gains rows via
-a human ("manual" hand rows) or an explicit operator approve
-(`incidents.user_approved_at`); synthetic rows never auto-enter measurement:
+a human ("manual" hand rows) or an explicit operator family evaluation plus
+incident approval; synthetic rows and model-selected families never auto-enter
+measurement:
 
     eval/nat_dataset.jsonl            MEASURED. Hand rows (preserved verbatim) +
                                       approve-promoted confirmed incidents
                                       (materialized from the store via --export-curated).
     eval/nat_dataset.synthetic.jsonl  Regression-only. 100% generator-owned,
                                       fully regenerated from knowledge/*.yaml.
-    rca_dataset (Postgres table)      Durable accumulation of confirmed/pending
+    rca_dataset (Postgres table)      Durable accumulation of operator-labeled
                                       incident rows; the 3h ingest cron upserts
-                                      here and approve flips pending -> approved.
+                                      here and approval flips pending -> approved.
 
 Row shape (backward-compatible with the existing hand rows; the extra `meta`
 block is ignored by the rca_family evaluator, which reads question/answer only):
@@ -71,6 +72,7 @@ CREATE TABLE IF NOT EXISTS {DATASET_TABLE} (
     incident_id TEXT NOT NULL DEFAULT '',
     alertname TEXT NOT NULL DEFAULT '',
     expected_family TEXT NOT NULL DEFAULT '',
+    label_source TEXT NOT NULL DEFAULT '',
     question JSONB NOT NULL,
     approved BOOLEAN NOT NULL DEFAULT false,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -78,19 +80,78 @@ CREATE TABLE IF NOT EXISTS {DATASET_TABLE} (
 )
 """
 
+_DATASET_MIGRATIONS = (
+    f"ALTER TABLE {DATASET_TABLE} ADD COLUMN IF NOT EXISTS label_source TEXT NOT NULL DEFAULT ''",
+)
+
 _DATASET_UPSERT = f"""
 INSERT INTO {DATASET_TABLE}
-    (dataset_id, source, origin, incident_id, alertname, expected_family, question, approved, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, now())
+    (dataset_id, source, origin, incident_id, alertname, expected_family, label_source, question, approved, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, now())
 ON CONFLICT (dataset_id) DO UPDATE SET
     source = EXCLUDED.source,
     origin = EXCLUDED.origin,
     incident_id = EXCLUDED.incident_id,
     alertname = EXCLUDED.alertname,
     expected_family = EXCLUDED.expected_family,
+    label_source = EXCLUDED.label_source,
     question = EXCLUDED.question,
     approved = EXCLUDED.approved,
     updated_at = now()
+"""
+
+_DATASET_RECONCILE = f"""
+WITH row_state AS (
+    SELECT d.dataset_id,
+           EXISTS (
+               SELECT 1
+                 FROM rca_case_snapshots cs
+                WHERE cs.incident_id = d.incident_id
+                  AND cs.approval_state = 'active'
+                  AND EXISTS (
+                      SELECT 1
+                        FROM rca_eval_reviews er
+                       WHERE er.run_id = cs.run_id
+                         AND er.analysis_hash = cs.analysis_hash
+                         AND er.case_type IN ('known', 'compositional', 'tool_degraded')
+                         AND er.expected_family = d.expected_family
+                         AND er.expected_family <> ''
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                        FROM rca_eval_reviews er
+                       WHERE er.run_id = cs.run_id
+                         AND er.analysis_hash = cs.analysis_hash
+                         AND (
+                             er.case_type NOT IN ('known', 'compositional', 'tool_degraded')
+                             OR (
+                                 er.expected_family <> ''
+                                 AND er.expected_family <> d.expected_family
+                             )
+                         )
+                  )
+           ) AS label_valid,
+           EXISTS (
+               SELECT 1
+                 FROM incidents i
+                WHERE i.incident_id = d.incident_id
+                  AND i.status = 'resolved'
+                  AND i.resolved_at IS NOT NULL
+                  AND i.resolved_at < now() - make_interval(hours => $1::int)
+                  AND i.user_approved_at IS NOT NULL
+           ) AS incident_approved
+      FROM {DATASET_TABLE} d
+     WHERE d.source = 'confirmed'
+)
+UPDATE {DATASET_TABLE} d
+   SET label_source = CASE
+                          WHEN state.label_valid THEN 'operator_evaluation'
+                          ELSE ''
+                      END,
+       approved = state.label_valid AND state.incident_approved,
+       updated_at = now()
+  FROM row_state state
+ WHERE d.dataset_id = state.dataset_id
 """
 
 # --- family -> plausible alertname / topology --------------------------------
@@ -295,11 +356,55 @@ def build_synthetic(
 
 # --- confirmed generation (from incidents) -----------------------------------
 
+_LABELED_CASE_TYPES = {"known", "compositional", "tool_degraded"}
+
+
+def _review_list(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, str) and value.strip():
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _operator_family_label(row: dict[str, Any]) -> tuple[str, list[str]] | None:
+    """Return a non-conflicting operator answer key for the active analysis.
+
+    ``evaluation_reviews`` is already hash-scoped by the backend ingest query.
+    Novel reviews deliberately have no catalog-family answer. Empty optional
+    labels are abstentions, while two distinct explicit labels (or a novel/known
+    disagreement) fail closed instead of choosing a reviewer.
+    """
+    families: set[str] = set()
+    case_types: set[str] = set()
+    saw_novel = False
+    for review in _review_list(row.get("evaluation_reviews")):
+        case_type = str(review.get("case_type") or "").strip()
+        expected = str(review.get("expected_family") or "").strip()
+        if case_type == "novel":
+            saw_novel = True
+            continue
+        if case_type not in _LABELED_CASE_TYPES:
+            return None
+        if not expected:
+            # Scoring-only reviews make no answer-key claim.
+            continue
+        families.add(expected)
+        case_types.add(case_type)
+    if saw_novel or len(families) != 1:
+        return None
+    return next(iter(families)), sorted(case_types)
+
+
 def build_confirmed(db_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split confirmed incidents into (approved -> curated, pending -> pending).
 
-    Uses the backend-persisted root_cause_family and the real incident
-    labels/annotations. Approved = incidents.user_approved_at is set.
+    Uses the operator-confirmed expected_family and the real incident
+    labels/annotations. The model's root_cause_family is retained only as
+    diagnostic metadata. Approved = incidents.user_approved_at is set.
     """
     from app.collectors.base import resolve_target
     from ontology import ingest
@@ -307,9 +412,10 @@ def build_confirmed(db_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
     approved: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = []
     for r in db_rows:
-        family = str(r.get("root_cause_family") or "").strip()
-        if not family or family == "insufficient_evidence":
-            continue  # only promote confident, actionable families
+        operator_label = _operator_family_label(r)
+        if operator_label is None:
+            continue
+        family, case_types = operator_label
         labels = ingest._json(r.get("labels"))
         annotations = ingest._json(r.get("annotations"))
         target = resolve_target(labels, annotations)
@@ -330,7 +436,12 @@ def build_confirmed(db_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
             source="confirmed",
             origin=f"incident:{incident_id}",
             fingerprint=fingerprint,
-            extra_meta={"approved": is_approved},
+            extra_meta={
+                "approved": is_approved,
+                "label_source": "operator_evaluation",
+                "case_types": case_types,
+                "predicted_family": str(r.get("root_cause_family") or "").strip(),
+            },
             labels_override=labels,
         )
         (approved if is_approved else pending).append(row)
@@ -376,7 +487,7 @@ def merge_curated(existing: list[dict[str, Any]], approved_confirmed: list[dict[
 
 # --- durable dataset store (Postgres) ----------------------------------------
 
-def _dataset_params(row: dict[str, Any]) -> tuple[str, str, str, str, str, str, str, bool]:
+def _dataset_params(row: dict[str, Any]) -> tuple[str, str, str, str, str, str, str, str, bool]:
     """Flatten a generated row into rca_dataset upsert params (pure/testable)."""
     meta = row.get("meta", {})
     alert = row["question"]["alert"]
@@ -389,6 +500,7 @@ def _dataset_params(row: dict[str, Any]) -> tuple[str, str, str, str, str, str, 
         incident_id,
         str(alert.get("labels", {}).get("alertname", "")),
         str(row["answer"]["expected_family"]),
+        str(meta.get("label_source", "")),
         json.dumps(row["question"], ensure_ascii=False),
         bool(meta.get("approved", False)),
     )
@@ -407,12 +519,20 @@ def _row_from_db(rec: dict[str, Any]) -> dict[str, Any]:
             "source": str(rec.get("source", "")),
             "origin": str(rec.get("origin", "")),
             "approved": bool(rec.get("approved", False)),
+            "label_source": str(rec.get("label_source", "")),
         },
     }
 
 
-async def _upsert_dataset(rows: list[dict[str, Any]]) -> int:
-    """Create the table if needed and upsert every row by dataset_id."""
+async def _upsert_dataset(
+    rows: list[dict[str, Any]], resolved_grace_hours: int = 0
+) -> int:
+    """Globally reconcile durable labels, then upsert the current incident page.
+
+    Reconciliation is intentionally independent from the fetch limit: a reopened
+    historical incident or a corrected old evaluation must retract its measured
+    label even when it is no longer in the newest incident page.
+    """
     import asyncpg
 
     from app.config import load_settings
@@ -424,14 +544,20 @@ async def _upsert_dataset(rows: list[dict[str, Any]]) -> int:
     conn = await asyncpg.connect(settings.postgres_dsn)
     try:
         await conn.execute(_DATASET_DDL)
+        for migration in _DATASET_MIGRATIONS:
+            await conn.execute(migration)
+        await conn.execute(_DATASET_RECONCILE, max(0, resolved_grace_hours))
         params = [_dataset_params(r) for r in rows]
-        await conn.executemany(_DATASET_UPSERT, params)
+        if params:
+            await conn.executemany(_DATASET_UPSERT, params)
     finally:
         await conn.close()
     return len(rows)
 
 
-async def _fetch_approved_dataset() -> list[dict[str, Any]]:
+async def _fetch_approved_dataset(
+    resolved_grace_hours: int = 0,
+) -> list[dict[str, Any]]:
     """Read approved confirmed rows from the durable store for curated export."""
     import asyncpg
 
@@ -444,9 +570,13 @@ async def _fetch_approved_dataset() -> list[dict[str, Any]]:
     conn = await asyncpg.connect(settings.postgres_dsn)
     try:
         await conn.execute(_DATASET_DDL)
+        for migration in _DATASET_MIGRATIONS:
+            await conn.execute(migration)
+        await conn.execute(_DATASET_RECONCILE, max(0, resolved_grace_hours))
         recs = await conn.fetch(
-            f"SELECT dataset_id, source, origin, expected_family, question, approved "
-            f"FROM {DATASET_TABLE} WHERE approved = true ORDER BY dataset_id"
+            f"SELECT dataset_id, source, origin, expected_family, label_source, question, approved "
+            f"FROM {DATASET_TABLE} WHERE approved = true "
+            f"AND label_source = 'operator_evaluation' ORDER BY dataset_id"
         )
     finally:
         await conn.close()
@@ -513,12 +643,16 @@ def run(
         counts["confirmed_approved"] = len(approved)
         counts["confirmed_pending"] = len(pending)
         if not dry_run:
-            # Durable accumulation: both approved and pending live in rca_dataset;
-            # the approved flag (from user_approved_at) drives curated export.
-            counts["dataset_upserted"] = asyncio.run(_upsert_dataset(approved + pending))
+            # Durable accumulation: both approved and pending operator-labeled
+            # rows live in rca_dataset; approval drives curated export.
+            counts["dataset_upserted"] = asyncio.run(
+                _upsert_dataset(approved + pending, resolved_grace_hours)
+            )
 
     if export_curated:
-        approved_rows = asyncio.run(_fetch_approved_dataset())
+        approved_rows = asyncio.run(
+            _fetch_approved_dataset(resolved_grace_hours)
+        )
         existing = _read_jsonl(eval_dir / CURATED_FILE)
         merged = merge_curated(existing, approved_rows)
         counts["curated"] = len(merged)
@@ -531,7 +665,7 @@ def run(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Generate the RCA family-classification dataset.")
     parser.add_argument("--from-ontology", action="store_true", help="regenerate the synthetic regression file from knowledge/*.yaml")
-    parser.add_argument("--from-incidents", action="store_true", help="accumulate confirmed/pending incident rows into the rca_dataset store (approved flag from user_approved_at)")
+    parser.add_argument("--from-incidents", action="store_true", help="accumulate operator-labeled incident rows into the rca_dataset store")
     parser.add_argument("--export-curated", action="store_true", help="materialize approved rows from rca_dataset into the curated nat_dataset.jsonl (preserving hand rows)")
     parser.add_argument("--knowledge-dir", default=str(_KNOWLEDGE_DIR), help="directory holding the knowledge *.yaml catalogs")
     parser.add_argument("--eval-dir", default=str(_EVAL_DIR), help="directory holding the dataset *.jsonl files")
