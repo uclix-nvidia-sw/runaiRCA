@@ -163,7 +163,10 @@ class LokiCollector:
         populated = [
             item
             for item in successful
-            if item["line_count"] and _loki_entries_in_window(item.get("sample_entries"), time_range) is not False
+            # A positive line count without retained timestamps is useful
+            # operator context, not verified historical incident evidence.
+            if item["line_count"]
+            and _loki_entries_in_window(item.get("sample_entries"), time_range) is True
         ]
         auth_failed = any(item["status_code"] == 401 for item in query_results)
         if populated:
@@ -353,6 +356,9 @@ async def _collect_loki_direct(
         )
         streams = _loki_streams(response.data)
         line_count = sum(len(stream.get("values", [])) for stream in streams)
+        error = response.error
+        if error is None and not _loki_native_response_complete(response.data):
+            error = "Loki response missing successful data.result"
         query_results.append(
             {
                 "name": name,
@@ -365,12 +371,12 @@ async def _collect_loki_direct(
                 "sample_lines": _sample_lines(streams),
                 "sample_entries": _sample_entries(streams),
                 "sample": compact(streams, limit=3),
-                "error": response.error,
+                "error": error,
                 **({"time_range": time_range} if time_range else {}),
             }
         )
-        if response.error:
-            warnings.append(f"Loki query failed for {name}: {response.error}")
+        if error:
+            warnings.append(f"Loki query failed for {name}: {error}")
             if response.status_code == 401:
                 warnings.append(_loki_unauthorized_warning(settings))
     return query_results
@@ -439,6 +445,21 @@ async def _mcp_query_loki(
             }
         )
     data = await _call_mcp_json(url, "query_loki_logs", [args])
+    if not _loki_mcp_response_complete(data):
+        return {
+            "name": name,
+            "query": logql,
+            "url": f"{url}#query_loki_logs",
+            "status_code": 200,
+            "status": _loki_status(data),
+            "stream_count": 0,
+            "line_count": 0,
+            "sample_lines": [],
+            "sample_entries": [],
+            "sample": compact(data, limit=3),
+            "error": "Loki MCP response missing a recognized log result",
+            **({"time_range": time_range} if time_range else {}),
+        }
     streams = _loki_streams(data)
     entries = _sample_entries(streams)
     if not entries:
@@ -523,6 +544,11 @@ def _loki_query_observation(
     window_verified = _loki_entries_in_window(item.get("sample_entries"), time_range)
     if item.get("error"):
         polarity, coverage = "unavailable", "unknown"
+    elif name == "runai_control_plane_errors":
+        # This is intentionally a broad health sweep across Run:ai namespaces.
+        # It can explain why to inspect the control plane, but it has no
+        # workload/project identity and therefore cannot prove the alert's RCA.
+        polarity, coverage = "unknown", "partial"
     elif not time_range:
         # A current/live query can help an operator, but it cannot confirm that
         # the same condition was absent at the historical incident time.
@@ -567,6 +593,30 @@ def _loki_entries_in_window(
     if not timestamps:
         return None
     return any(start <= timestamp <= end for timestamp in timestamps)
+
+
+def _loki_native_response_complete(data: object) -> bool:
+    """Whether a direct Loki response is an explicit successful stream result."""
+    return (
+        isinstance(data, dict)
+        and str(data.get("status") or "").lower() == "success"
+        and isinstance(data.get("data"), dict)
+        and isinstance(data["data"].get("result"), list)
+    )
+
+
+def _loki_mcp_response_complete(data: object) -> bool:
+    """Recognize native Loki and Grafana MCP log result envelopes.
+
+    An HTTP/MCP success transport with an unrecognized empty body must not be
+    interpreted as an empty historical search. Grafana MCP may return either
+    native Loki streams or a flat list under one of these documented keys.
+    """
+    if _loki_native_response_complete(data):
+        return True
+    if not isinstance(data, dict):
+        return False
+    return any(isinstance(data.get(key), list) for key in ("data", "lines", "logs", "entries"))
 
 
 # Grafana datasource uids are ^[a-zA-Z0-9\-_]{1,40}$; a numeric row id or a

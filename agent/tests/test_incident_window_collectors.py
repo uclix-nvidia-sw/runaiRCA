@@ -138,7 +138,16 @@ async def test_loki_emits_a_scoped_artifact_for_each_incident_query(monkeypatch)
 
     signals = [artifact for artifact in result.artifacts if artifact.type == "logql_signal"]
     assert signals
-    assert all(artifact.result["observation"]["polarity"] == "present" for artifact in signals)
+    observations = {
+        artifact.result["observation"]["predicate"]: artifact.result["observation"] for artifact in signals
+    }
+    assert observations["log:runai_control_plane_errors"]["polarity"] == "unknown"
+    assert observations["log:runai_control_plane_errors"]["coverage"] == "partial"
+    assert all(
+        observation["polarity"] == "present"
+        for predicate, observation in observations.items()
+        if predicate != "log:runai_control_plane_errors"
+    )
     assert all(
         artifact.result["observation"]["observation_window"]
         == {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
@@ -500,6 +509,62 @@ def test_loki_query_observation_only_refutes_with_a_bounded_incident_window() ->
     assert out_of_window["log_window_verified"] is False
     assert live_empty["polarity"] == "unknown"
     assert live_empty["coverage"] == "partial"
+
+
+def test_generic_control_plane_loki_errors_are_context_not_target_support() -> None:
+    time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    generic = loki._loki_query_observation(
+        {
+            "name": "runai_control_plane_errors",
+            "line_count": 1,
+            "stream_count": 1,
+            "sample_entries": [
+                {"timestamp": "2026-07-10T01:00:00Z", "line": "scheduler reconcile failed"}
+            ],
+        },
+        time_range=time_range,
+    )
+    correlated = loki._loki_query_observation(
+        {
+            "name": "runai_control_plane_for_workload",
+            "line_count": 1,
+            "stream_count": 1,
+            "sample_entries": [
+                {"timestamp": "2026-07-10T01:00:00Z", "line": "trainer scheduler failed"}
+            ],
+        },
+        time_range=time_range,
+    )
+
+    assert (generic["polarity"], generic["coverage"]) == ("unknown", "partial")
+    assert (correlated["polarity"], correlated["coverage"]) == ("present", "scoped")
+
+
+@pytest.mark.asyncio
+async def test_loki_malformed_success_body_is_unavailable_not_historical_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_get_json(**_kwargs):
+        return JsonResponse(
+            url="http://loki/loki/api/v1/query_range",
+            status_code=200,
+            data={"status": "success", "data": {}},
+        )
+
+    monkeypatch.setattr(loki, "get_json", fake_get_json)
+    target = replace(
+        make_target(),
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    result = await loki.LokiCollector(
+        replace(make_settings(), loki_url="http://loki")
+    ).collect(target)
+
+    assert result.status == "unavailable"
+    assert all(query["error"] == "Loki response missing successful data.result" for query in result.details["queries"])
+    signals = [artifact for artifact in result.artifacts if artifact.type == "logql_signal"]
+    assert all(artifact.result["observation"]["polarity"] == "unavailable" for artifact in signals)
 
 
 def test_runai_query_observation_requires_identity_scoped_coverage() -> None:

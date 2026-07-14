@@ -187,6 +187,22 @@ async def test_loki_mcp_parses_grafana_log_entries(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_loki_mcp_malformed_success_body_is_not_an_empty_log_search(
+    monkeypatch,
+) -> None:
+    async def fake_mcp_call(url, tool, arguments):
+        return _McpResult({"status": "success", "data": {}})
+
+    monkeypatch.setattr(loki, "mcp_call", fake_mcp_call)
+    result = await loki._mcp_query_loki(
+        "http://grafana-mcp/mcp", "smoke", '{namespace="runai"}', 20, "loki"
+    )
+
+    assert result["line_count"] == 0
+    assert result["error"] == "Loki MCP response missing a recognized log result"
+
+
+@pytest.mark.asyncio
 async def test_loki_mcp_queries_the_alert_time_window(monkeypatch) -> None:
     query_args: list[dict] = []
 
