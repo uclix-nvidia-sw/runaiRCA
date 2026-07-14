@@ -247,13 +247,12 @@ async def test_nat_and_direct_keep_generic_noise_insufficient() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("alertname", "summary", "expected", "expected_action", "forbidden_actions"),
+    ("alertname", "summary", "expected", "forbidden_actions"),
     [
         (
             "NVIDIA Run:ai Agent Cluster Info Push Rate Low",
             "Traceback torch.cuda.OutOfMemoryError: CUDA out of memory while allocating tensor",
             "workload_runtime_error",
-            "Reduce batch size",
             ("cluster-sync", "network connectivity between cluster and control plane"),
         ),
         (
@@ -261,16 +260,14 @@ async def test_nat_and_direct_keep_generic_noise_insufficient() -> None:
             "ErrImagePull: dial tcp: lookup registry.airgap.local: no such host "
             "while pulling image",
             "image_pull_error",
-            "NODE can't resolve the registry hostname",
             ("project-controller", "kubectl get project"),
         ),
     ],
 )
-async def test_misleading_alert_catalog_actions_do_not_lead_recommendations(
+async def test_misleading_alert_catalog_actions_are_withheld_without_scoped_evidence(
     alertname: str,
     summary: str,
     expected: str,
-    expected_action: str,
     forbidden_actions: tuple[str, ...],
 ) -> None:
     direct = AnalysisOrchestrator(replace(make_settings(), enable_nat_runtime=False))
@@ -282,7 +279,7 @@ async def test_misleading_alert_catalog_actions_do_not_lead_recommendations(
         for response in (await direct.analyze(request), await nat.analyze(request)):
             actions = _actions_section(response)
             assert _top_family(response) == expected
-            assert expected_action in actions
+            assert "Not enough evidence for concrete actions yet" in actions
             for forbidden in forbidden_actions:
                 assert forbidden not in actions
     finally:
@@ -318,7 +315,7 @@ async def test_precise_signature_actions_do_not_include_unrelated_similar_fix() 
 
     actions = _actions_section(response)
     assert _top_family(response) == "workload_runtime_error"
-    assert "Reduce batch size" in actions
+    assert "Not enough evidence for concrete actions yet" in actions
     assert "INC-OLD" not in actions
     assert "cluster-sync" not in actions
     assert "INC-OLD" in response.analysis_detail
@@ -396,7 +393,7 @@ async def test_insufficient_evidence_does_not_dump_full_troubleshooting_library(
         for response in (await direct.analyze(request), await nat.analyze(request)):
             playbook = _playbook_section(response)
             assert _top_family(response) == "insufficient_evidence"
-            assert "No troubleshooting playbook matched" in playbook
+            assert "Specific playbook remediation is withheld" in playbook
             assert "Run:ai RCA Troubleshooting Cases" not in playbook
             assert "Queue Or Project GPU Saturation" not in playbook
     finally:
@@ -458,7 +455,7 @@ async def test_admission_webhook_x509_is_not_registry_tls() -> None:
         for response in (await direct.analyze(request), await nat.analyze(request)):
             actions = _actions_section(response)
             assert _top_family(response) == "k8s_control_plane_error"
-            assert "caBundle" in actions
+            assert "Not enough evidence for concrete actions yet" in actions
             assert "registry's TLS certificate" not in actions
     finally:
         await direct.close_engine()
@@ -690,5 +687,6 @@ async def test_refuting_one_xid_keeps_other_supported_xids(monkeypatch) -> None:
     )
 
     assert _top_family(response) == "gpu_hardware_error"
-    assert "reset the NVLink fabric" in response.analysis_detail
+    assert "Not enough evidence for concrete actions yet" in response.analysis_detail
+    assert "reset the NVLink fabric" not in response.analysis_detail
     assert "do not use app-crash fix" not in response.analysis_detail

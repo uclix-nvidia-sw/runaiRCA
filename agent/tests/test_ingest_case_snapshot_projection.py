@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -197,3 +198,11 @@ def test_trace_v3_keyset_backfill_is_snapshot_scoped_and_resumable() -> None:
     incident = OntologyIncident(incident_id="INC", run_id="ANL")
     assert ingest._trace_key(incident, "H-1") == "ANL:H-1"
     assert ingest._trace_key(incident, "ANL:H-1") == "ANL:H-1"
+
+
+def test_trace_v3_keyset_cursor_is_bound_as_an_aware_datetime() -> None:
+    cursor = ingest._trace_v3_cursor_datetime("2026-07-14 13:37:37.440061+09")
+
+    assert isinstance(cursor, datetime)
+    assert cursor.utcoffset() == timedelta(hours=9)
+    assert ingest._trace_v3_cursor_datetime("") is None

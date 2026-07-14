@@ -25,6 +25,7 @@ import asyncio
 import json
 import re
 import sys
+from datetime import datetime
 from typing import Any
 
 from app.collectors.base import resolve_target
@@ -340,6 +341,25 @@ LIMIT $3
 """
 
 
+def _trace_v3_cursor_datetime(value: str) -> datetime | None:
+    """Parse a durable keyset cursor into the type asyncpg expects.
+
+    The cursor table intentionally stores the value as text so operators can
+    inspect and resume it.  asyncpg does not coerce that text for a
+    ``timestamptz`` bind parameter, however, so preserve its offset while
+    converting it back to an aware ``datetime`` before querying.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"invalid trace-v3 cursor timestamp: {value!r}") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("trace-v3 cursor timestamp must include a timezone offset")
+    return parsed
+
+
 async def _fetch_trace_v3_page(
     after_approved_at: str = "", after_case_id: str = "", limit: int = 200
 ) -> list[dict[str, Any]]:
@@ -354,7 +374,7 @@ async def _fetch_trace_v3_page(
     try:
         rows = await conn.fetch(
             _SELECT_TRACE_V3_PAGE,
-            after_approved_at or None,
+            _trace_v3_cursor_datetime(after_approved_at),
             after_case_id,
             max(1, limit),
         )
