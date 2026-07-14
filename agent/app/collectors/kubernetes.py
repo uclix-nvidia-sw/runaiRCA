@@ -369,6 +369,7 @@ async def k8s_read(
         headers={"Authorization": f"Bearer {token}"},
         verify=verify,
     )
+    safe_data = _collector_masker(settings).mask_object(response.data)
     result = {
         "kind": resolved,
         "namespace": namespace,
@@ -381,7 +382,7 @@ async def k8s_read(
         # Keep its full spec/status so the operator can inspect exactly what a
         # `kubectl get pod -o yaml` would expose. This remains one named,
         # read-only object rather than broadening the collector's data scope.
-        "data": response.data if full_object else compact(response.data, limit=8),
+        "data": safe_data if full_object else compact(safe_data, limit=8),
     }
     if mcp_note:
         result["mcp_fallback"] = mcp_note
@@ -783,6 +784,7 @@ async def _k8s_read_via_mcp(
         # Belt and suspenders: an MCP server may ACCEPT labelSelector and still
         # ignore it — enforce equality selectors client-side.
         data = _apply_label_selector(data, label_selector)
+    safe_data = _collector_masker(settings).mask_object(data)
     return {
         "kind": resolved,
         "namespace": namespace,
@@ -791,7 +793,7 @@ async def _k8s_read_via_mcp(
         "url": f"{settings.kubernetes_mcp_url}#read_{resolved}",
         "status_code": 200,
         "error": None,
-        "data": data if full_object else compact(data, limit=8),
+        "data": safe_data if full_object else compact(safe_data, limit=8),
     }
 
 

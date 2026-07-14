@@ -61,6 +61,41 @@ def test_k8s_read_builds_get_list_paths(monkeypatch) -> None:
     assert calls[-1]["path"] == "/apis/storage.k8s.io/v1/storageclasses"
 
 
+def test_full_pod_inspection_masks_direct_api_environment_values(monkeypatch) -> None:
+    async def fake_get_json(**kwargs):
+        return JsonResponse(
+            url=kwargs["path"],
+            status_code=200,
+            data={
+                "metadata": {"name": "trainer-0"},
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "trainer",
+                            "image": "registry/trainer:v1",
+                            "env": [{"name": "API_TOKEN", "value": "direct-api-secret"}],
+                            "resources": {"limits": {"memory": "8Gi"}},
+                        }
+                    ]
+                },
+                "status": {"phase": "Running"},
+            },
+        )
+
+    monkeypatch.setattr(k8s, "get_json", fake_get_json)
+    monkeypatch.setattr(k8s, "_read_file", lambda _path: "token")
+    result = asyncio.run(
+        k8s.k8s_read(
+            make_settings(), "pods", namespace="runai", name="trainer-0", full_object=True
+        )
+    )
+
+    assert result["data"]["status"]["phase"] == "Running"
+    assert result["data"]["spec"]["containers"][0]["resources"]["limits"]["memory"] == "8Gi"
+    assert result["data"]["spec"]["containers"][0]["env"][0]["value"] == "[MASKED]"
+    assert "direct-api-secret" not in str(result)
+
+
 def test_resolve_live_pod_node_encodes_path_segments(monkeypatch) -> None:
     calls: list[str] = []
 
