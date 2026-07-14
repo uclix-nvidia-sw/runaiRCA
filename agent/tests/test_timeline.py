@@ -195,6 +195,27 @@ def test_unavailable_collector_details_are_not_timeline_evidence() -> None:
     assert build_timeline(results) == []
 
 
+def test_partial_raw_timeline_is_context_not_causal_support() -> None:
+    result = CollectorResult(
+        agent="change",
+        status="partial",
+        summary="response was truncated",
+        details={
+            "changes": [
+                {
+                    "timestamp": "2026-07-02T10:00:00Z",
+                    "kind": "Deployment",
+                    "summary": "rollout near the incident",
+                }
+            ]
+        },
+    )
+
+    [entry] = build_timeline([result])
+
+    assert entry["evidence_role"] == "context"
+
+
 def test_timeline_masks_sensitive_messages_at_capture() -> None:
     results = [
         CollectorResult(

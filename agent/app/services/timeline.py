@@ -30,9 +30,11 @@ _SYSLOG_PREFIX = re.compile(r"^\s*([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})"
 def build_timeline(results: list[CollectorResult]) -> list[dict]:
     """Return timestamped signals across all collectors, oldest first.
 
-    Each entry: {"timestamp": iso-or-raw str, "source": collector, "kind": str,
-    "message": str}. Entries whose timestamp we cannot parse are kept but sort
-    last (stable) so nothing is silently dropped.
+    Each entry also carries ``evidence_role``. Raw collector details are useful
+    chronological context, but only an ``ok`` collector with an explicit
+    scoped-positive artifact may label its timeline as support. Entries whose
+    timestamp we cannot parse are kept but sort last (stable) so nothing is
+    silently dropped.
     """
     entries: list[dict] = []
     masker = build_masker(())
@@ -40,7 +42,11 @@ def build_timeline(results: list[CollectorResult]) -> list[dict]:
         if result.status not in ("ok", "partial"):
             continue
         try:
-            entries.extend(_sanitize_entry(entry, masker) for entry in _from_result(result))
+            role = _timeline_evidence_role(result)
+            entries.extend(
+                _sanitize_entry({**entry, "evidence_role": role}, masker)
+                for entry in _from_result(result)
+            )
         except Exception:  # noqa: BLE001 - a bad collector shape never breaks the timeline
             continue
     entries.sort(key=lambda e: (_sort_key(e.get("timestamp")), e.get("source", "")))
@@ -56,7 +62,8 @@ def to_markdown(timeline: list[dict], *, limit: int = 30) -> str:
         ts = _clean_timestamp(entry.get("timestamp") or "unknown-time", masker)
         lines.append(
             f"- `{ts}` **{_clean(entry.get('source', '?'), masker, limit=80)}** "
-            f"({_clean(entry.get('kind', 'event'), masker, limit=120)}): "
+            f"({_clean(entry.get('kind', 'event'), masker, limit=120)}, "
+            f"{_clean(entry.get('evidence_role', 'context'), masker, limit=16)}): "
             f"{_clean(entry.get('message', ''), masker, limit=300)}"
         )
     if len(timeline) > limit:
@@ -80,6 +87,25 @@ def _from_result(result: CollectorResult) -> list[dict]:
     if agent == "system":
         return _from_system(details)
     return []
+
+
+def _timeline_evidence_role(result: CollectorResult) -> str:
+    """Keep untyped or incomplete raw details from becoming causal evidence.
+
+    Timeline projections are derived from collector ``details`` rather than a
+    fact ID, so they must remain context unless that same collector completed
+    and emitted at least one typed, scoped-positive observation.  The synthesis
+    prompt enforces this role as well; carrying it in data prevents timeline
+    text from becoming a side channel around the evidence blackboard.
+    """
+    if result.status != "ok":
+        return "context"
+    for item in result.artifacts or []:
+        raw = item.result if isinstance(item.result, dict) else {}
+        observation = raw.get("observation") if isinstance(raw.get("observation"), dict) else {}
+        if observation.get("polarity") == "present" and observation.get("coverage") == "scoped":
+            return "support"
+    return "context"
 
 
 def _from_change(details: dict) -> list[dict]:
@@ -296,6 +322,9 @@ def _sanitize_entry(entry: dict, masker: Masker) -> dict:
         "source": _clean(entry.get("source"), masker, limit=80),
         "kind": _clean(entry.get("kind"), masker, limit=120),
         "message": _clean(entry.get("message"), masker, limit=300),
+        "evidence_role": (
+            "support" if str(entry.get("evidence_role") or "").casefold() == "support" else "context"
+        ),
     }
 
 
