@@ -267,6 +267,39 @@ def test_context_only_artifact_stays_out_of_root_cause_evidence() -> None:
     assert "container memory was observed" in evidence
 
 
+def test_contextual_eligibility_blocks_scoped_artifact_from_root_cause() -> None:
+    """A scoped result for another entity/window is appendix context, not proof."""
+    result = CollectorResult(agent="loki", status="ok", summary="logs queried")
+    finding = artifact(
+        agent="loki",
+        source="loki",
+        type="logql_signal",
+        status="ok",
+        confidence="high",
+        summary="OOMKilled occurred on unrelated-pod",
+        result={"observation": {"polarity": "present", "coverage": "scoped"}},
+    )
+    finding.evidence_id = "E01"
+    result.artifacts.append(finding)
+
+    detail = pipeline._detail_from(
+        AlertAnalysisRequest(alert=Alert(status="firing", labels={"alertname": "MemoryAlert"})),
+        [result],
+        [],
+        root_cause_candidates=[
+            RankedCause(family="workload_runtime_error", confidence="medium", score=7.0)
+        ],
+        # The blackboard rejected E01 because it belongs to a different target
+        # or incident window.  It may remain visible in the appendix only.
+        eligible_support_ids=set(),
+    )
+
+    root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
+    appendix = detail.split("### Evidence", 1)[1].split("###", 1)[0]
+    assert "OOMKilled occurred on unrelated-pod" not in root_cause
+    assert "OOMKilled occurred on unrelated-pod" in appendix
+
+
 def test_synthesis_input_separates_support_contradiction_and_context() -> None:
     result = CollectorResult(agent="prometheus", status="ok", summary="all metrics queried")
     for name, polarity, coverage in (
@@ -295,6 +328,31 @@ def test_synthesis_input_separates_support_contradiction_and_context() -> None:
     ]
     assert [item["summary"] for item in finding["context_artifacts"]] == ["memory snapshot"]
     assert finding["context_artifacts"][0]["evidence_role"] == "context"
+
+
+def test_synthesis_input_uses_contextual_eligibility_over_raw_scoped_role() -> None:
+    result = CollectorResult(agent="loki", status="ok", summary="logs queried")
+    finding = artifact(
+        agent="loki",
+        source="loki",
+        type="logql_signal",
+        status="ok",
+        confidence="high",
+        summary="unrelated workload OOMKilled",
+        result={"observation": {"polarity": "present", "coverage": "scoped"}},
+    )
+    finding.evidence_id = "E01"
+    result.artifacts.append(finding)
+
+    projected = pipeline._synthesis_collector_findings(
+        [result], evidence_eligibility={"E01": object()}
+    )[0]
+
+    assert projected["supporting_artifacts"] == []
+    assert projected["contradicting_artifacts"] == []
+    assert [item["summary"] for item in projected["context_artifacts"]] == [
+        "unrelated workload OOMKilled"
+    ]
 
 
 def test_unavailable_drilldown_artifact_is_appendix_context_not_supporting_evidence() -> None:

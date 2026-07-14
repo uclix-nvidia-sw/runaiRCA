@@ -7,7 +7,7 @@ import logging
 import re
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, TypeVar
 
@@ -1261,6 +1261,21 @@ def _public_evidence_eligibility(state: PipelineState) -> dict[str, object]:
     }
 
 
+def _eligible_support_ids_for_output(state: PipelineState) -> set[str]:
+    """Return only response artifacts that may substantiate the final report.
+
+    The deterministic report and the Korean synthesis must share the exact
+    target/window gate used by the harness.  Otherwise a typed but unrelated
+    artifact can appear under the report's root-cause evidence even though it
+    cannot be cited by the approved RCA claim.
+    """
+    return {
+        evidence_id
+        for evidence_id, eligibility in _public_evidence_eligibility(state).items()
+        if callable(getattr(eligibility, "permits", None)) and eligibility.permits("support")
+    }
+
+
 def _blackboard_fact_groups(
     blackboard: Any,
     aliases: dict[str, str] | None = None,
@@ -1427,6 +1442,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         known_issues=state.known_issues,
         components=load_architecture(settings.architecture_file),
         masker=state.masker,
+        eligible_support_ids=_eligible_support_ids_for_output(state),
     )
     # Korean LLM synthesis (preferred when language == "ko" and LLM configured):
     # rewrite summary + detail grounded STRICTLY in the evidence just gathered.
@@ -1446,6 +1462,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                 timeline=state.timeline,
                 troubleshooting_path=state.troubleshooting_path,
                 reasoning_trace=state.investigation_context.get("reasoning_trace_v2"),
+                evidence_eligibility=_public_evidence_eligibility(state),
             )
         if synth:
             state.summary, state.detail = synth
@@ -2035,6 +2052,7 @@ async def _synthesize_korean(
     timeline: list[dict] | None = None,
     troubleshooting_path: dict[str, Any] | None = None,
     reasoning_trace: object | None = None,
+    evidence_eligibility: Mapping[str, object] | None = None,
 ) -> tuple[str, str] | None:
     """LLM synthesis of the RCA report in Korean, grounded STRICTLY in the evidence.
 
@@ -2102,7 +2120,9 @@ async def _synthesize_korean(
         "similar_incidents": similar_incidents,
         # Bulky — kept LAST so the char cap trims raw collector result tails
         # rather than the reasoning inputs above.
-        "collector_findings": _synthesis_collector_findings(results),
+        "collector_findings": _synthesis_collector_findings(
+            results, evidence_eligibility=evidence_eligibility
+        ),
     }
     system = (
         "당신은 NVIDIA Run:ai GPU 플랫폼을 담당하는 시니어 SRE입니다. 제공된 증거(수집기별 "
@@ -2241,7 +2261,11 @@ def _synthesis_evidence_json(evidence: dict, max_chars: int) -> str:
     return text
 
 
-def _synthesis_collector_findings(results: list[CollectorResult]) -> list[dict[str, object]]:
+def _synthesis_collector_findings(
+    results: list[CollectorResult],
+    *,
+    evidence_eligibility: Mapping[str, object] | None = None,
+) -> list[dict[str, object]]:
     """Project artifacts into evidence roles before giving them to synthesis.
 
     This is intentionally stricter than a transport-success check. The LLM may
@@ -2258,7 +2282,9 @@ def _synthesis_collector_findings(results: list[CollectorResult]) -> list[dict[s
         for artifact in result.artifacts:
             if not _artifact_is_evidence(artifact):
                 continue
-            payload = _synthesis_artifact_payload(artifact)
+            payload = _synthesis_artifact_payload(
+                artifact, evidence_eligibility=evidence_eligibility
+            )
             role = str(payload["evidence_role"])
             key = {
                 "support": "supporting_artifacts",
@@ -2281,7 +2307,9 @@ def _synthesis_collector_findings(results: list[CollectorResult]) -> list[dict[s
     return findings
 
 
-def _synthesis_artifact_payload(artifact: object) -> dict[str, object]:
+def _synthesis_artifact_payload(
+    artifact: object, *, evidence_eligibility: Mapping[str, object] | None = None
+) -> dict[str, object]:
     result = getattr(artifact, "result", None)
     observation = result.get("observation") if isinstance(result, dict) else None
     polarity = "unknown"
@@ -2293,7 +2321,22 @@ def _synthesis_artifact_payload(artifact: object) -> dict[str, object]:
             polarity = candidate_polarity
         if candidate_coverage in {"scoped", "partial", "unknown"}:
             coverage = candidate_coverage
-    if polarity == "present" and coverage == "scoped":
+    if evidence_eligibility is not None:
+        # The blackboard has already checked run, target entity, topology and
+        # incident-window compatibility.  A raw artifact can claim to be a
+        # scoped observation while still belonging to another workload or a
+        # different time window, so never let the synthesis model re-promote
+        # it from its local polarity alone.
+        evidence_id = str(getattr(artifact, "evidence_id", "") or "")
+        eligibility = evidence_eligibility.get(evidence_id)
+        permits = getattr(eligibility, "permits", None)
+        if callable(permits) and permits("support"):
+            role = "support"
+        elif callable(permits) and permits("contradict"):
+            role = "contradict"
+        else:
+            role = "context"
+    elif polarity == "present" and coverage == "scoped":
         role = "support"
     elif polarity == "absent" and coverage == "scoped":
         role = "contradict"
@@ -2444,6 +2487,7 @@ def _detail_from(
     known_issues: list[dict] | None = None,
     components: dict[str, dict] | None = None,
     masker: Masker | None = None,
+    eligible_support_ids: set[str] | None = None,
 ) -> str:
     """Problem -> Root Cause -> Recommended Actions, then everything else in an
     appendix. Sections 1-3 are the ~1-page report an operator (or a Word export)
@@ -2489,12 +2533,15 @@ def _detail_from(
             lines.append(facets)
     # Ground the coarse family in the most specific signature match when one exists:
     # a recognised known issue (with its affected/fixed version) is far more precise.
+    observed_text = _observed_text(
+        results, request, eligible_support_ids=eligible_support_ids
+    )
     lines.extend(
         _known_issue_cause_lines(
-            known_issues, _observed_text(results, request), language, _alert_text(request)
+            known_issues, observed_text, language, _alert_text(request)
         )
     )
-    supporting = _supporting_evidence(results)
+    supporting = _supporting_evidence(results, eligible_support_ids=eligible_support_ids)
     if supporting:
         lines.append("")
         lines.extend(f"- **{agent}**: {finding}" for agent, finding in supporting)
@@ -2508,7 +2555,7 @@ def _detail_from(
         plan,
         graph_fixes,
         root_cause_candidates,
-        _observed_text(results, request),
+        observed_text,
         failure_modes or {},
         missing,
         request,
@@ -2536,7 +2583,7 @@ def _detail_from(
         _knowledge_base_lines(
             kg_context,
             root_cause_candidates,
-            _observed_text(results, request),
+            observed_text,
             _alert_text(request),
             masker,
         )
@@ -2562,7 +2609,7 @@ def _detail_from(
     lines.extend(
         _playbook_lines(
             root_cause_candidates,
-            _observed_text(results, request),
+            observed_text,
             failure_modes or {},
             troubleshooting_cases,
             known_issues or [],
@@ -2640,7 +2687,9 @@ def _insert_before_appendix(detail: str, block: str) -> str:
     return f"{detail}\n\n{block}"
 
 
-def _supporting_evidence(results: list[CollectorResult]) -> list[tuple[str, str]]:
+def _supporting_evidence(
+    results: list[CollectorResult], *, eligible_support_ids: set[str] | None = None
+) -> list[tuple[str, str]]:
     """Up to four scoped positive findings for the Root Cause section.
 
     The Appendix can retain partial/current context for an operator, but this
@@ -2651,7 +2700,7 @@ def _supporting_evidence(results: list[CollectorResult]) -> list[tuple[str, str]
     for result in results:
         if result.status not in ("ok", "partial"):
             continue
-        line = _artifact_evidence_line(result)
+        line = _artifact_evidence_line(result, eligible_support_ids=eligible_support_ids)
         if not line:
             continue
         picked.append((result.agent, line))
@@ -3197,7 +3246,10 @@ def _alert_text(request: AlertAnalysisRequest) -> str:
 
 
 def _observed_text(
-    results: list[CollectorResult], request: AlertAnalysisRequest | None = None
+    results: list[CollectorResult],
+    request: AlertAnalysisRequest | None = None,
+    *,
+    eligible_support_ids: set[str] | None = None,
 ) -> str:
     from app.services.root_cause_ranking import COLLECTOR_TEXT_DROP_KEYS
 
@@ -3217,7 +3269,11 @@ def _observed_text(
         # alert's own text above remains a separate direct observation, while
         # legacy collectors retain their compatibility path until upgraded.
         if any(_artifact_observation(art) is not None for art in artifacts):
-            artifacts = [art for art in artifacts if _artifact_is_scoped_support(art)]
+            artifacts = [
+                art
+                for art in artifacts
+                if _artifact_is_scoped_support(art, eligible_support_ids=eligible_support_ids)
+            ]
         elif result.summary:
             parts.append(result.summary)
         for art in artifacts:
@@ -3558,12 +3614,16 @@ _GENERIC_ARTIFACT_SUMMARY_RE = re.compile(
 
 
 def _artifact_evidence_line(
-    result: CollectorResult, *, include_unavailable: bool = False, include_context: bool = False
+    result: CollectorResult,
+    *,
+    include_unavailable: bool = False,
+    include_context: bool = False,
+    eligible_support_ids: set[str] | None = None,
 ) -> str:
     for art in reversed(getattr(result, "artifacts", []) or []):
         is_context = getattr(art, "status", "") in ("ok", "partial")
         if (
-            not _artifact_is_scoped_support(art)
+            not _artifact_is_scoped_support(art, eligible_support_ids=eligible_support_ids)
             and not (include_context and is_context)
             and not include_unavailable
         ):
@@ -3591,15 +3651,24 @@ def _artifact_is_evidence(art: object) -> bool:
     return getattr(art, "status", "") in ("ok", "partial")
 
 
-def _artifact_is_scoped_support(art: object) -> bool:
+def _artifact_is_scoped_support(
+    art: object, *, eligible_support_ids: set[str] | None = None
+) -> bool:
     """Whether an artifact may be printed as Root Cause supporting evidence."""
     observation = _artifact_observation(art)
     if observation is None:
         return False
-    return (
+    raw_support = (
         str(observation.get("polarity") or "").strip().lower() == "present"
         and str(observation.get("coverage") or "").strip().lower() == "scoped"
     )
+    if not raw_support:
+        return False
+    if eligible_support_ids is None:
+        return True
+    # Once the pipeline has a contextual eligibility map, an E-id missing from
+    # it is not merely "legacy" evidence: it is not approved for this report.
+    return str(getattr(art, "evidence_id", "") or "") in eligible_support_ids
 
 
 def _artifact_observation(art: object) -> dict[str, object] | None:
