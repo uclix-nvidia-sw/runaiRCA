@@ -234,10 +234,25 @@ async def _drill_one(
                 step + 1,
                 len(queries),
             )
-            for q in queries:
-                await _run_query(
-                    settings, result, tools, target, plan, q, history, masker, blackboard=blackboard
+            # The model batches independent read-only discriminators in one
+            # reasoning round. Run that batch concurrently: the round limit is
+            # deliberately small (three), while evidence breadth is not.
+            await asyncio.gather(
+                *(
+                    _run_query(
+                        settings,
+                        result,
+                        tools,
+                        target,
+                        plan,
+                        q,
+                        history,
+                        masker,
+                        blackboard=blackboard,
+                    )
+                    for q in queries
                 )
+            )
     except Exception as exc:  # noqa: BLE001 - drill-down is best-effort; base evidence stands
         result.warnings.append(
             f"{result.agent} drill-down aborted: "

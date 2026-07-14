@@ -635,6 +635,36 @@ def test_unlimited_drilldown_stops_when_a_query_repeats(monkeypatch) -> None:
     assert any("no new allowed read-only query" in warning for warning in result.warnings)
 
 
+def test_drilldown_runs_independent_query_batch_concurrently(monkeypatch) -> None:
+    started: list[str] = []
+    both_started = asyncio.Event()
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
+        return {
+            "action": "query",
+            "queries": [
+                {"tool": "k8s_read", "args": {"kind": "pods"}},
+                {"tool": "k8s_read", "args": {"kind": "events"}},
+            ],
+        }
+
+    async def fake_k8s_read(settings, kind, **kwargs):
+        started.append(kind)
+        if len(started) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=0.1)
+        return {"kind": kind, "status_code": 200, "error": None}
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
+    result = _k8s_result()
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
+
+    assert set(started) == {"pods", "events"}
+    assert len(result.artifacts) == 2
+    assert all(artifact.status == "ok" for artifact in result.artifacts)
+
+
 def test_drilldown_does_not_stop_for_high_usage(monkeypatch) -> None:
     usage = begin_usage_tracking()
     usage["total_tokens"] = 10
