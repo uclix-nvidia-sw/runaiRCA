@@ -733,13 +733,19 @@ async def investigate(
                         step=step,
                         query=_adhoc_query_repr(q),
                     )
-                adhoc.append(
+            if wanted:
+                adhoc.extend(
                     await _within_budget(
                         deadline_monotonic,
-                        lambda q=q: _run_adhoc_kubernetes_query(
-                            settings,
-                            q,
-                            time_range=_incident_window_for_target(target),
+                        lambda wanted=wanted: asyncio.gather(
+                            *(
+                                _run_adhoc_kubernetes_query(
+                                    settings,
+                                    q,
+                                    time_range=_incident_window_for_target(target),
+                                )
+                                for q in wanted
+                            )
                         ),
                     )
                 )
@@ -858,14 +864,19 @@ async def investigate(
                             )
                         ),
                     )
-                for query in wanted:
-                    adhoc.append(
+                if wanted:
+                    adhoc.extend(
                         await _within_budget(
                             deadline_monotonic,
-                            lambda query=query: _run_adhoc_kubernetes_query(
-                                settings,
-                                query,
-                                time_range=_incident_window_for_target(target),
+                            lambda wanted=wanted: asyncio.gather(
+                                *(
+                                    _run_adhoc_kubernetes_query(
+                                        settings,
+                                        query,
+                                        time_range=_incident_window_for_target(target),
+                                    )
+                                    for query in wanted
+                                )
                             ),
                         )
                     )

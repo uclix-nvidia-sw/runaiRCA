@@ -211,6 +211,46 @@ async def test_no_llm_falls_back_to_full_gather() -> None:
 
 
 @pytest.mark.asyncio
+async def test_investigator_runs_independent_adhoc_queries_concurrently(monkeypatch) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.example/v1",
+        llm_model="m",
+        llm_api_key="k",
+    )
+    started: set[str] = set()
+    both_started = asyncio.Event()
+
+    async def fake_complete_json(settings, *, system, user, **_kwargs):
+        if "final skeptical reflection" in system:
+            return {"hypothesis_updates": [], "new_hypotheses": []}
+        return {
+            "action": "probe",
+            "queries": [
+                {"kind": "pods", "namespace": "runai"},
+                {"kind": "events", "namespace": "runai"},
+            ],
+        }
+
+    async def fake_k8s_read(settings, kind, **_kwargs):
+        started.add(kind)
+        if len(started) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=0.1)
+        return {"kind": kind, "status_code": 200, "error": None, "data": {}}
+
+    monkeypatch.setattr("app.services.investigator.complete_json", fake_complete_json)
+    monkeypatch.setattr("app.services.investigator.k8s_read", fake_k8s_read)
+
+    _, context = await investigate(
+        settings, make_target(), [], InvestigationPlan(), {}, max_steps=1
+    )
+
+    assert started == {"pods", "events"}
+    assert context["adhoc_query_count"] == 2
+
+
+@pytest.mark.asyncio
 async def test_each_collector_receives_an_ontology_scoped_role() -> None:
     collector = KubernetesCollector()
     plan = InvestigationPlan(
