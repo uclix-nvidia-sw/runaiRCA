@@ -13,6 +13,7 @@ from app.collectors.base import (
     artifact,
     incident_time_range,
     ko_en,
+    parse_incident_time,
 )
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
@@ -159,7 +160,11 @@ class LokiCollector:
             )
 
         successful = [item for item in query_results if not item["error"]]
-        populated = [item for item in successful if item["line_count"]]
+        populated = [
+            item
+            for item in successful
+            if item["line_count"] and _loki_entries_in_window(item.get("sample_entries"), time_range) is not False
+        ]
         auth_failed = any(item["status_code"] == 401 for item in query_results)
         if populated:
             status = "ok"
@@ -523,6 +528,10 @@ def _loki_query_observation(
         polarity, coverage = "unknown", "partial"
     elif int(item.get("line_count") or 0) == 0:
         polarity, coverage = "absent", "scoped"
+    elif _loki_entries_in_window(item.get("sample_entries"), time_range) is False:
+        # A proxy/MCP can return current logs despite a range-shaped request.
+        # Known timestamps outside the incident must stay operator context.
+        polarity, coverage = "unknown", "partial"
     else:
         polarity, coverage = "present", "scoped"
     return {
@@ -533,7 +542,29 @@ def _loki_query_observation(
         "line_count": int(item.get("line_count") or 0),
         "stream_count": int(item.get("stream_count") or 0),
         "observation_window": time_range or {},
+        "log_window_verified": _loki_entries_in_window(item.get("sample_entries"), time_range),
     }
+
+
+def _loki_entries_in_window(
+    entries: object, time_range: dict[str, str] | None
+) -> bool | None:
+    """Return whether retained log entry timestamps intersect an incident window."""
+    if not time_range:
+        return None
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return None
+    timestamps = []
+    for entry in entries if isinstance(entries, list) else []:
+        timestamp = entry.get("timestamp") if isinstance(entry, dict) else None
+        parsed = parse_incident_time(timestamp)
+        if parsed is not None:
+            timestamps.append(parsed)
+    if not timestamps:
+        return None
+    return any(start <= timestamp <= end for timestamp in timestamps)
 
 
 # Grafana datasource uids are ^[a-zA-Z0-9\-_]{1,40}$; a numeric row id or a

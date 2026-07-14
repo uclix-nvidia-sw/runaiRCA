@@ -361,6 +361,17 @@ def test_loki_query_observation_only_refutes_with_a_bounded_incident_window() ->
     present = loki._loki_query_observation(
         {"name": "error_logs", "line_count": 2, "stream_count": 1}, time_range=time_range
     )
+    out_of_window = loki._loki_query_observation(
+        {
+            "name": "error_logs",
+            "line_count": 1,
+            "stream_count": 1,
+            "sample_entries": [
+                {"timestamp": "2026-07-13T09:26:12Z", "line": "current error"}
+            ],
+        },
+        time_range=time_range,
+    )
     live_empty = loki._loki_query_observation(
         {"name": "error_logs", "line_count": 0, "stream_count": 0}, time_range=None
     )
@@ -368,6 +379,8 @@ def test_loki_query_observation_only_refutes_with_a_bounded_incident_window() ->
     assert absent["polarity"] == "absent"
     assert absent["coverage"] == "scoped"
     assert present["polarity"] == "present"
+    assert (out_of_window["polarity"], out_of_window["coverage"]) == ("unknown", "partial")
+    assert out_of_window["log_window_verified"] is False
     assert live_empty["polarity"] == "unknown"
     assert live_empty["coverage"] == "partial"
 
