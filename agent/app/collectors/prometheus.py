@@ -230,7 +230,11 @@ def _queries_for(
     pod_selector = ",".join(selectors)
 
     queries: list[tuple[str, str]] = [("prometheus_up", "up")]
-    if pod_selector:
+    # A Pod name is namespaced.  Querying only ``pod="name"`` can return a
+    # same-named workload from a different namespace and then get relabelled as
+    # the alert target by downstream evidence consumers.  Do not manufacture a
+    # pod-scoped verdict until both halves of that identity are known.
+    if namespace and pod:
         queries.extend(
             [
                 ("container_memory", f"container_memory_working_set_bytes{{{pod_selector}}}"),
@@ -341,6 +345,21 @@ def _prometheus_result(data: object) -> list[object]:
     return result if isinstance(result, list) else []
 
 
+def _prometheus_result_complete(data: object) -> bool:
+    """Return whether a native Prometheus response explicitly contains a vector.
+
+    ``status: success`` alone does not prove that the query was answered.  In
+    particular, a proxy can return a truncated JSON object such as
+    ``{status: success, data: {}}``.  That must not become a scoped absence just
+    because the permissive result parser represents both malformed and explicit
+    empty vectors as ``[]``.
+    """
+    if not isinstance(data, dict):
+        return False
+    payload = data.get("data")
+    return isinstance(payload, dict) and isinstance(payload.get("result"), list)
+
+
 async def _collect_prometheus_direct(
     settings: Settings,
     queries: list[tuple[str, str]],
@@ -364,6 +383,8 @@ async def _collect_prometheus_direct(
             response.data, status, require_success_status=True
         )
         result_data = _prometheus_result(response.data)
+        if error is None and not _prometheus_result_complete(response.data):
+            error = "Prometheus response missing data.result"
         query_results.append(
             {
                 "name": name,
@@ -456,6 +477,12 @@ async def _mcp_query_prometheus(
     result_data = _prometheus_result(data)
     if not result_data:
         result_data = _first_result_list(data)
+    error = _prometheus_api_error(data, status)
+    # Grafana MCP has historically wrapped a non-empty result list in a few
+    # different response envelopes, hence the bounded non-empty fallback above.
+    # But an empty/unrecognised success body cannot establish absence.
+    if error is None and not result_data and not _prometheus_result_complete(data):
+        error = "Prometheus MCP response missing data.result"
     return {
         "name": name,
         "query": promql,
@@ -465,7 +492,7 @@ async def _mcp_query_prometheus(
         "series_count": len(result_data),
         "sample": compact(result_data, limit=3),
         "value_summary": _prometheus_value_summary(result_data),
-        "error": _prometheus_api_error(data, status),
+        "error": error,
         "time_range": query_window,
     }
 
@@ -686,17 +713,11 @@ def _prometheus_query_observation(
         elif numeric_count == 0:
             polarity, coverage = "unknown", "partial"
         elif name == "prometheus_up":
-            # The up metric is inverted: ANY zero is an observed scrape
-            # failure. A mixed vector (some targets up, one target down) must
-            # not be misclassified as healthy just because it is not all-zero.
-            zero_count = summary.get("zero_sample_count")
-            try:
-                has_zero = int(zero_count) > 0
-            except (TypeError, ValueError):
-                # Backward compatibility for previously stored summaries.
-                has_zero = all_zero is True or summary.get("min") == 0
-            polarity = "present" if has_zero else "absent"
-            coverage = "scoped"
+            # The base query is intentionally global (``up`` has no target
+            # selector), so a down scrape says something about telemetry
+            # availability but not about this incident's resource.  Do not let
+            # the blackboard relabel it as target-scoped RCA support.
+            polarity, coverage = "unknown", "partial"
         elif name.endswith("restarts"):
             # Restart metrics are monotonically increasing counters. A
             # non-zero value can have been accumulated long before the alert;
@@ -731,11 +752,14 @@ def _prometheus_query_observation(
 def _prometheus_samples_in_window(
     value_summary: dict[str, object], time_range: dict[str, str] | None
 ) -> bool | None:
-    """Return whether reported sample timestamps intersect the requested window.
+    """Return whether every reported sample boundary is in the requested window.
 
     ``None`` preserves compatibility with legacy/stub responses that do not
-    expose timestamps. A definite out-of-window timestamp is enough to reject
-    a supposedly historical query, which catches instant-query fallbacks.
+    expose timestamps.  A single in-window point is insufficient: verdicts
+    aggregate every returned sample, so one out-of-window point could otherwise
+    create or erase an incident signal.  A definite out-of-window boundary is
+    enough to reject a supposedly historical query, which catches instant-query
+    fallbacks and mixed range responses.
     """
     if not time_range:
         return None
@@ -756,7 +780,7 @@ def _prometheus_samples_in_window(
                 timestamps.append(parsed)
     if not timestamps:
         return None
-    return any(start <= timestamp <= end for timestamp in timestamps)
+    return all(start <= timestamp <= end for timestamp in timestamps)
 
 
 def _parse_prometheus_timestamp(value: object) -> datetime | None:
@@ -879,6 +903,8 @@ async def prom_query(
     status = _prometheus_status(resp.data)
     error = resp.error or _prometheus_api_error(resp.data, status, require_success_status=True)
     result_data = _prometheus_result(resp.data)
+    if error is None and not _prometheus_result_complete(resp.data):
+        error = "Prometheus response missing data.result"
     return {
         "name": name,
         "query": promql,

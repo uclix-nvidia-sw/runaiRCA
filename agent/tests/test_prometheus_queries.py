@@ -30,3 +30,25 @@ def test_control_plane_promql_has_no_illegal_string_escape():
         promql = queries[name]
         assert "\\" not in promql, f"{name} has an illegal backslash: {promql!r}"
         assert 'namespace=~"runai|runai-backend"' in promql
+
+
+def test_pod_metric_queries_require_a_namespace_for_a_unique_identity():
+    target = AnalysisTarget(
+        cluster="",
+        project="",
+        queue="",
+        namespace="",
+        workload_name="",
+        workload_type="",
+        runai_workload_id="",
+        node="",
+        pod="same-name-in-another-namespace",
+        severity="warning",
+        alert_name="TestAlert",
+    )
+
+    names = {name for name, _query in _queries_for(target)}
+
+    assert "container_memory" not in names
+    assert "container_cpu" not in names
+    assert "container_restarts" not in names

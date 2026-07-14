@@ -86,6 +86,31 @@ async def test_prometheus_api_error_payload_is_not_treated_as_missing_metrics(mo
 
 
 @pytest.mark.asyncio
+async def test_prometheus_malformed_success_payload_is_not_a_scoped_absence(monkeypatch) -> None:
+    async def fake_get_json(**_kwargs):
+        return JsonResponse(
+            url="http://prometheus/api/v1/query_range",
+            status_code=200,
+            data={"status": "success", "data": {}},
+        )
+
+    monkeypatch.setattr(prometheus, "get_json", fake_get_json)
+    target = replace(
+        make_target(),
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    result = await prometheus.PrometheusCollector(
+        replace(make_settings(), prometheus_url="http://prometheus")
+    ).collect(target)
+
+    assert result.status == "unavailable"
+    assert all(query["error"] == "Prometheus response missing data.result" for query in result.details["queries"])
+    signals = [artifact for artifact in result.artifacts if artifact.type == "promql_signal"]
+    assert all(artifact.result["observation"]["polarity"] == "unavailable" for artifact in signals)
+
+
+@pytest.mark.asyncio
 async def test_loki_emits_a_scoped_artifact_for_each_incident_query(monkeypatch) -> None:
     async def fake_get_json(**_kwargs):
         return JsonResponse(
@@ -205,6 +230,31 @@ def test_prometheus_out_of_window_sample_is_not_incident_evidence() -> None:
     assert observation["sample_window_verified"] is False
 
 
+def test_prometheus_mixed_window_samples_are_not_incident_evidence() -> None:
+    window = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    observation = prometheus._prometheus_query_observation(
+        {
+            "name": "node_memory_pressure",
+            "series_count": 1,
+            "value_summary": {
+                "numeric_sample_count": 2,
+                "all_zero": False,
+                "sample_timestamp_verification_required": True,
+                "sample_windows": [
+                    {
+                        "first_timestamp": "2026-07-10T01:00:00Z",
+                        "last_timestamp": "2026-07-13T09:26:12Z",
+                    }
+                ],
+            },
+        },
+        time_range=window,
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert observation["sample_window_verified"] is False
+
+
 def test_prometheus_verdict_uses_all_series_not_only_display_samples() -> None:
     summary = prometheus._prometheus_value_summary(
         [
@@ -229,7 +279,7 @@ def test_prometheus_verdict_uses_all_series_not_only_display_samples() -> None:
     assert len(summary["series"]) == 3
     assert summary["series_count_observed"] == 4
     assert summary["zero_sample_count"] == 1
-    assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
 
 
 def test_prometheus_timestamp_less_historical_sample_is_context_only() -> None:
@@ -245,7 +295,7 @@ def test_prometheus_timestamp_less_historical_sample_is_context_only() -> None:
     assert observation["sample_window_verified"] is None
 
 
-def test_prometheus_up_marks_a_mixed_vector_with_any_down_target_present() -> None:
+def test_global_prometheus_up_stays_telemetry_context_not_target_rca_evidence() -> None:
     up_failure = prometheus._prometheus_query_observation(
         {
             "name": "prometheus_up",
@@ -273,8 +323,8 @@ def test_prometheus_up_marks_a_mixed_vector_with_any_down_target_present() -> No
         time_range={"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"},
     )
 
-    assert up_failure["polarity"] == "present"
-    assert healthy["polarity"] == "absent"
+    assert (up_failure["polarity"], up_failure["coverage"]) == ("unknown", "partial")
+    assert (healthy["polarity"], healthy["coverage"]) == ("unknown", "partial")
 
 
 def test_restart_counter_requires_change_during_incident_window() -> None:
