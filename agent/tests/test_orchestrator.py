@@ -683,7 +683,7 @@ async def test_analyze_excludes_low_similarity_incidents() -> None:
 
 
 @pytest.mark.asyncio
-async def test_analyze_weaves_similar_incident_fix_into_actions() -> None:
+async def test_analyze_withholds_similar_incident_fix_without_scoped_support() -> None:
     orchestrator = AnalysisOrchestrator(make_settings())
     response = await orchestrator.analyze(
         AlertAnalysisRequest(
@@ -706,8 +706,9 @@ async def test_analyze_weaves_similar_incident_fix_into_actions() -> None:
 
     recommended = response.analysis_detail.split("## 3. Recommended Actions", 1)[1]
     actions_block = recommended.split("##", 1)[0]
-    assert "INC-HIGH" in actions_block
-    assert "Raised queue gpu-a quota" in actions_block
+    assert "Not enough evidence for concrete actions yet" in actions_block
+    assert "INC-HIGH" not in actions_block
+    assert "Raised queue gpu-a quota" not in actions_block
 
 
 @pytest.mark.asyncio
