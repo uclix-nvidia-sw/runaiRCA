@@ -1967,10 +1967,13 @@ async def _k8s_mcp_json(
             # the block structure — and the "raw" preview is truncated); the
             # parsed object is masked afterward.
             try:
-                return _k8s_yaml_payload(mcp_tool_raw_text(result))
+                data = _k8s_yaml_payload(mcp_tool_raw_text(result))
             except RuntimeError as exc:
                 last_error = f"{tool}: {exc}"
                 continue
+        if not _k8s_mcp_payload_recognized(data, tool=tool):
+            last_error = f"{tool}: MCP response missing a Kubernetes object/list payload"
+            continue
         return data
     raise RuntimeError(last_error or "Kubernetes MCP tool failed")
 
@@ -1992,6 +1995,21 @@ def _k8s_yaml_payload(text: str) -> object:
         return build_masker(()).mask_object(parsed)
     # A bare string means table/plain-text output — not machine-readable.
     raise RuntimeError("MCP result was not JSON or YAML (set --list-output=yaml)")
+
+
+def _k8s_mcp_payload_recognized(data: object, *, tool: str) -> bool:
+    """Require an actual Kubernetes object or List after an MCP success."""
+    payload = _normalize_k8s_payload(data)
+    if not isinstance(payload, dict):
+        return False
+    if tool in {
+        "events_list",
+        "pods_list",
+        "pods_list_in_namespace",
+        "resources_list",
+    }:
+        return isinstance(payload.get("items"), list)
+    return isinstance(payload.get("metadata"), dict)
 
 
 async def _k8s_mcp_result(settings: Settings, candidates: list[tuple[str, dict[str, object]]]):

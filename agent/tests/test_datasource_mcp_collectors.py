@@ -126,6 +126,28 @@ async def test_prometheus_mcp_error_payload_is_not_a_scoped_absence(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_prometheus_mcp_misrouted_list_is_not_metric_evidence(monkeypatch) -> None:
+    async def fake_mcp_call(url, tool, arguments):
+        if tool == "list_datasources":
+            return _McpResult([{"type": "prometheus", "uid": "prom"}])
+        return _McpResult({"datasources": [{"uid": "loki", "type": "loki"}]})
+
+    monkeypatch.setattr(prometheus, "mcp_call", fake_mcp_call)
+    result = await prometheus.PrometheusCollector(
+        replace(make_settings(), prometheus_mcp_url="http://grafana-mcp/mcp")
+    ).collect(
+        replace(
+            make_target(),
+            fired_at="2026-07-10T01:00:00Z",
+            resolved_at="2026-07-10T01:10:00Z",
+        )
+    )
+
+    assert result.status == "unavailable"
+    assert all("recognized metric result" in str(item["error"]) for item in result.details["queries"])
+
+
+@pytest.mark.asyncio
 async def test_loki_collector_uses_only_loki_mcp_tools(monkeypatch) -> None:
     calls: list[str] = []
 
@@ -192,6 +214,20 @@ async def test_loki_mcp_malformed_success_body_is_not_an_empty_log_search(
 ) -> None:
     async def fake_mcp_call(url, tool, arguments):
         return _McpResult({"status": "success", "data": {}})
+
+    monkeypatch.setattr(loki, "mcp_call", fake_mcp_call)
+    result = await loki._mcp_query_loki(
+        "http://grafana-mcp/mcp", "smoke", '{namespace="runai"}', 20, "loki"
+    )
+
+    assert result["line_count"] == 0
+    assert result["error"] == "Loki MCP response missing a recognized log result"
+
+
+@pytest.mark.asyncio
+async def test_loki_mcp_unrelated_list_is_not_an_empty_log_search(monkeypatch) -> None:
+    async def fake_mcp_call(url, tool, arguments):
+        return _McpResult({"data": [{"uid": "prom", "type": "prometheus"}]})
 
     monkeypatch.setattr(loki, "mcp_call", fake_mcp_call)
     result = await loki._mcp_query_loki(
@@ -286,6 +322,20 @@ async def test_postgres_collector_uses_mcp_before_asyncpg(monkeypatch) -> None:
 
     assert result.details["connected"] is True
     assert result.artifacts[0].result["used_mcp"] is True
+
+
+@pytest.mark.asyncio
+async def test_postgres_mcp_malformed_success_is_unavailable(monkeypatch) -> None:
+    async def fake_mcp_call(url, tool, arguments):
+        return _McpResult({"status": "success"})
+
+    monkeypatch.setattr(postgres, "mcp_call", fake_mcp_call)
+    result = await postgres.PostgresCollector(
+        replace(make_settings(), postgres_mcp_url="http://postgres-mcp/mcp")
+    ).collect(make_target())
+
+    assert result.status == "unavailable"
+    assert any("recognized row result" in warning for warning in result.warnings)
 
 
 @pytest.mark.asyncio

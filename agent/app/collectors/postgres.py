@@ -969,7 +969,9 @@ async def _mcp_fetch(settings: Settings, sql: str) -> list[dict[str, Any]]:
     data = mcp_tool_json(result)
     if isinstance(data, dict) and "raw" in data:
         raise RuntimeError("MCP result was not JSON")
-    rows = _postgres_rows(data)
+    rows = _mcp_postgres_rows(data)
+    if rows is None:
+        raise RuntimeError("Postgres MCP response missing a recognized row result")
     return [row for row in rows if isinstance(row, dict)]
 
 
@@ -992,6 +994,23 @@ def _postgres_rows(data: Any) -> list[Any]:
         if all(not isinstance(value, (list, dict)) for value in data.values()):
             return [data]
     return []
+
+
+def _mcp_postgres_rows(data: Any) -> list[Any] | None:
+    """Return a recognized SQL-row envelope, or None for malformed success.
+
+    A successful MCP transport can still contain an empty object or an
+    unrelated gateway payload. Treating that as an empty SELECT makes database
+    health checks look successful without a verifiable database read.
+    """
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("rows", "result", "data"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+    return None
 
 
 _HISTORY_TARGET_COLUMNS = frozenset(

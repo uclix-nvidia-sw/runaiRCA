@@ -608,11 +608,17 @@ def _loki_entries_in_window(
 
 def _loki_native_response_complete(data: object) -> bool:
     """Whether a direct Loki response is an explicit successful stream result."""
-    return (
+    if not (
         isinstance(data, dict)
         and str(data.get("status") or "").lower() == "success"
         and isinstance(data.get("data"), dict)
         and isinstance(data["data"].get("result"), list)
+    ):
+        return False
+    streams = data["data"]["result"]
+    return not streams or any(
+        isinstance(stream, dict) and isinstance(stream.get("values"), list)
+        for stream in streams
     )
 
 
@@ -627,7 +633,29 @@ def _loki_mcp_response_complete(data: object) -> bool:
         return True
     if not isinstance(data, dict):
         return False
-    return any(isinstance(data.get(key), list) for key in ("data", "lines", "logs", "entries"))
+    return any(
+        _loki_flat_log_result_complete(data.get(key))
+        for key in ("data", "lines", "logs", "entries")
+    )
+
+
+def _loki_flat_log_result_complete(value: object) -> bool:
+    """Whether a Grafana MCP flat log response is recognizable."""
+    if not isinstance(value, list):
+        return False
+    if not value:
+        return True
+    return any(
+        (isinstance(item, str) and bool(item.strip()))
+        or (
+            isinstance(item, dict)
+            and any(
+                isinstance(item.get(key), str) and bool(item.get(key).strip())
+                for key in ("line", "message", "body")
+            )
+        )
+        for item in value
+    )
 
 
 # Grafana datasource uids are ^[a-zA-Z0-9\-_]{1,40}$; a numeric row id or a

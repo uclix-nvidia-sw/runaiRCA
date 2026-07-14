@@ -486,15 +486,13 @@ async def _mcp_query_prometheus(
     }
     data = await _call_mcp_json(url, "query_prometheus", [args])
     status = _prometheus_status(data)
-    result_data = _prometheus_result(data)
-    if not result_data:
-        result_data = _first_result_list(data)
+    result_data = _prometheus_mcp_result(data)
     error = _prometheus_api_error(data, status)
-    # Grafana MCP has historically wrapped a non-empty result list in a few
-    # different response envelopes, hence the bounded non-empty fallback above.
-    # But an empty/unrecognised success body cannot establish absence.
-    if error is None and not result_data and not _prometheus_result_complete(data):
-        error = "Prometheus MCP response missing data.result"
+    # Grafana MCP can wrap a range vector in a flat data or result list.
+    # Do not recursively accept arbitrary lists: a misrouted datasource
+    # response used to look like non-empty metric series.
+    if error is None and not _prometheus_mcp_response_complete(data):
+        error = "Prometheus MCP response missing a recognized metric result"
     return {
         "name": name,
         "query": promql,
@@ -894,6 +892,45 @@ def _first_result_list(data: object) -> list[object]:
         if found:
             return found
     return []
+
+
+def _prometheus_mcp_result(data: object) -> list[object]:
+    """Return only documented/native MCP metric-vector envelopes."""
+    native = _prometheus_result(data)
+    if _prometheus_result_complete(data):
+        return native
+    if not isinstance(data, dict):
+        return []
+    for key in ("result", "data"):
+        value = data.get(key)
+        if isinstance(value, list) and _prometheus_mcp_flat_result_complete(value):
+            return value
+    return []
+
+
+def _prometheus_mcp_response_complete(data: object) -> bool:
+    if _prometheus_result_complete(data):
+        return True
+    if not isinstance(data, dict):
+        return False
+    return any(
+        isinstance(data.get(key), list) and _prometheus_mcp_flat_result_complete(data[key])
+        for key in ("result", "data")
+    )
+
+
+def _prometheus_mcp_flat_result_complete(value: list[object]) -> bool:
+    """Whether a Grafana MCP flat result is explicitly a metric vector."""
+    if not value:
+        return True
+    return all(
+        isinstance(item, dict)
+        and (
+            isinstance(item.get("value"), list)
+            or isinstance(item.get("values"), list)
+        )
+        for item in value
+    )
 
 
 # --- Cross-collector deterministic follow-up -----------------------------------

@@ -157,6 +157,24 @@ async def test_mcp_named_read_rejects_a_different_resource(monkeypatch) -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_mcp_list_read_rejects_empty_success_payload(monkeypatch) -> None:
+    class Result:
+        isError = False
+        content: list = []
+        structuredContent: dict = {}
+
+    async def fake_mcp_call(_url, _tool, _arguments):
+        return Result()
+
+    monkeypatch.setattr(k8s, "mcp_call", fake_mcp_call)
+    with pytest.raises(RuntimeError, match="Kubernetes object/list payload"):
+        await k8s._k8s_mcp_json(
+            replace(make_settings(), kubernetes_mcp_url="http://kubernetes-mcp/mcp"),
+            [("pods_list", {"namespace": "team-a"})],
+        )
+
+
 def test_k8s_describe_uses_mcp_full_pod_and_filters_its_events(monkeypatch) -> None:
     calls: list[str] = []
 
