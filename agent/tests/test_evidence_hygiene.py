@@ -69,6 +69,41 @@ def test_best_matching_pod_all_healthy_needs_unambiguous_match() -> None:
 # --- healthy Postgres healthcheck is not evidence -------------------------------
 
 
+def test_insufficient_evidence_gets_a_separate_general_guidance_section() -> None:
+    detail = pipeline._detail_from(
+        AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={"alertname": "GenericAlert"},
+                annotations={"summary": "OOMKilled was reported by an operator"},
+            )
+        ),
+        [],
+        [],
+        failure_modes={
+            "workload_startup_error": [
+                {
+                    "symptom": "OOMKilled",
+                    "keywords": ["oomkilled"],
+                    "actions": ["GENERAL-GUIDANCE raise the memory limit after validation."],
+                }
+            ]
+        },
+        root_cause_candidates=[
+            RankedCause(family="insufficient_evidence", confidence="low", score=0.0)
+        ],
+        eligible_support_ids=set(),
+    )
+
+    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## 4. Appendix", 1)[0]
+    guidance = detail.split("## General Troubleshooting Guidance", 1)[1].split(
+        "## 4. Appendix", 1
+    )[0]
+    assert "GENERAL-GUIDANCE" not in actions
+    assert "not a diagnosis" in guidance
+    assert "GENERAL-GUIDANCE" in guidance
+
+
 @pytest.mark.asyncio
 async def test_healthy_postgres_check_is_not_evidence() -> None:
     checks = {

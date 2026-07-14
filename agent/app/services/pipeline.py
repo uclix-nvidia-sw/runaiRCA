@@ -47,6 +47,7 @@ from app.progress import ProgressReporter
 from app.prompts import load_agent_souls
 from app.schemas import AlertAnalysisRequest, AlertAnalysisResponse
 from app.services.decision_tree import resolve_tree, walk_tree
+from app.services.general_guidance import general_guidance_lines
 from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
 from app.services.planner import plan_investigation
 from app.services.root_cause_ranking import (
@@ -1574,6 +1575,26 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             # section so the operator guidance still reads in their language.
             state.detail = await _translate_playbook_ko(settings, state.detail)
 
+    # A Korean synthesis can replace the deterministic detail wholesale. Restore
+    # the explicitly non-diagnostic guide when the RCA had no supported action.
+    if _needs_general_guidance(state.root_cause_candidates, eligible_support_ids):
+        heading = _general_guidance_heading(getattr(settings, "language", "en"))
+        if heading not in state.detail:
+            block = "\n".join(
+                [
+                    heading,
+                    "",
+                    *general_guidance_lines(
+                        _alert_text(request),
+                        state.failure_modes,
+                        state.known_issues,
+                        language=getattr(settings, "language", "en"),
+                        masker=state.masker,
+                    ),
+                ]
+            )
+            state.detail = _append_general_guidance(state.detail, block)
+
     # Self-check caveat (optional hook) + re-analysis note — inserted BEFORE the
     # appendix so the document reads problem -> cause -> actions -> checks -> appendix.
     self_check_lines = [text for text in (state.self_check_caveat, state.reanalysis_note) if text]
@@ -2872,7 +2893,38 @@ def _detail_from(
             "```",
         ]
     )
+    if _needs_general_guidance(root_cause_candidates, eligible_support_ids):
+        lines.extend(
+            [
+                "",
+                _general_guidance_heading(language),
+                "",
+                *general_guidance_lines(
+                    _alert_text(request),
+                    failure_modes or {},
+                    known_issues or [],
+                    language=language,
+                    masker=masker,
+                ),
+            ]
+        )
     return "\n".join(lines)
+
+
+def _needs_general_guidance(
+    candidates: list[RankedCause] | None, eligible_support_ids: set[str] | None
+) -> bool:
+    """Show non-diagnostic help only when the RCA cannot support an action."""
+    top_family = candidates[0].family if candidates else ""
+    return top_family in ("", "insufficient_evidence") or eligible_support_ids == set()
+
+
+def _general_guidance_heading(language: str) -> str:
+    return (
+        "## 일반 점검 가이드 (현재 RCA 결론 아님)"
+        if language == "ko"
+        else "## General Troubleshooting Guidance (Not a Current RCA Conclusion)"
+    )
 
 
 async def _translate_playbook_ko(settings: Settings, detail: str) -> str:
@@ -2926,6 +2978,11 @@ def _insert_before_appendix(detail: str, block: str) -> str:
         if idx >= 0:
             return f"{detail[:idx]}\n{block}\n{detail[idx:]}"
     return f"{detail}\n\n{block}"
+
+
+def _append_general_guidance(detail: str, block: str) -> str:
+    """Keep non-diagnostic guidance outside the RCA conclusion and action sections."""
+    return f"{detail.rstrip()}\n\n{block}"
 
 
 def _supporting_evidence(

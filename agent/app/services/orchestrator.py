@@ -9,6 +9,7 @@ from uuid import uuid4
 from app.collectors.base import resolve_target
 from app.collectors.registry import build_collectors
 from app.config import Settings
+from app.knowledge import load_failure_modes, load_runai_known_issues
 from app.llm import (
     begin_usage_tracking,
     complete_with_error,
@@ -27,6 +28,7 @@ from app.schemas import (
     IncidentSummaryResponse,
 )
 from app.services import pipeline
+from app.services.general_guidance import general_guidance_lines
 from app.services.pipeline import (
     _build_settings_masker,
     _mask_model,
@@ -314,7 +316,13 @@ class AnalysisOrchestrator:
         )
         language = getattr(self._settings, "language", "en")
         grounding = _chat_answer_from_context(
-            request, context, str(entity), self._masker, language=language
+            request,
+            context,
+            str(entity),
+            self._masker,
+            language=language,
+            failure_modes=load_failure_modes(self._settings.failure_modes_file),
+            known_issues=load_runai_known_issues(self._settings.runai_known_issues_file),
         )
         answer = grounding
         if chat_llm_configured:
@@ -416,6 +424,7 @@ _CHAT_STRINGS = {
         "missing": "## Missing Data",
         "warnings": "## Warnings",
         "next": "## Next Step",
+        "general": "## General Troubleshooting Guidance",
         "next_body": (
             "Use the RCA detail and Agent Evidence Trail to confirm this against Run:AI, "
             "Kubernetes, Prometheus, Loki, and Postgres evidence before taking action."
@@ -440,6 +449,7 @@ _CHAT_STRINGS = {
         "missing": "## 누락된 데이터",
         "warnings": "## 경고",
         "next": "## 다음 단계",
+        "general": "## 일반 점검 가이드",
         "next_body": (
             "조치 전에 RCA 상세와 Agent Evidence Trail에서 Run:AI, Kubernetes, "
             "Prometheus, Loki, Postgres 증거로 이 내용을 확인하세요."
@@ -454,6 +464,8 @@ def _chat_answer_from_context(
     entity: str,
     masker: Masker,
     language: str = "en",
+    failure_modes: dict[str, list[dict[str, object]]] | None = None,
+    known_issues: list[dict[str, object]] | None = None,
 ) -> str:
     text = _CHAT_STRINGS.get(language, _CHAT_STRINGS["en"])
     question = masker.mask_text(request.message.strip())
@@ -489,6 +501,16 @@ def _chat_answer_from_context(
                 text["answer"],
                 "",
                 text["no_detail"] if runtime_lines else text["no_state"],
+                "",
+                text["general"],
+                "",
+                *general_guidance_lines(
+                    question,
+                    failure_modes or {},
+                    known_issues or [],
+                    language=language,
+                    masker=masker,
+                ),
                 "",
             ]
         )

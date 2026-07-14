@@ -45,6 +45,16 @@ def test_deterministic_scaffold_stays_english_by_default() -> None:
     assert "## Grounded Answer" in response.answer
 
 
+def test_context_free_chat_offers_conditional_general_guidance() -> None:
+    orchestrator = _orchestrator(language="ko")
+    response = asyncio.run(orchestrator.chat(ChatRequest(message="OOMKilled는 어떻게 해결해?")))
+
+    assert "## 일반 점검 가이드" in response.answer
+    assert "일반 점검 가이드" in response.answer
+    assert "원인이나 해결을 확인한 결론이 아닙니다" in response.answer
+    assert "OOMKilled" in response.answer
+
+
 def test_llm_answer_wins_and_is_returned_verbatim(monkeypatch) -> None:
     async def ok_post_json(*, url, timeout_seconds, json_body, headers):
         assert "반드시 한국어로" in json_body["messages"][0]["content"]

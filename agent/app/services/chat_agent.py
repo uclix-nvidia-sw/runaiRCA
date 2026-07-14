@@ -186,7 +186,10 @@ async def _final_answer(
         "question DIRECTLY and concisely using the grounded context and the tool/analysis "
         "results gathered below. Lead with the answer. Cite the concrete evidence you found "
         "(the actual kubectl/PromQL/LogQL query or the analysis verdict). If nothing "
-        f"answered it, say so and suggest the next diagnostic step. {language_rule}"
+        "answered it, say so and suggest the next diagnostic step. When there is no current "
+        "incident evidence, you may give general troubleshooting guidance, but clearly label "
+        "it as conditional and do not state that a cause is present or a fix succeeded. "
+        f"{language_rule}"
     )
     safe_history = masker.mask_object(history)
     tool_dump = (
@@ -239,6 +242,8 @@ def _system_prompt(tools: dict[str, dict], settings: Settings) -> str:
         f"Read-only tools:\n{tool_lines}\n"
         "Prefer answering from context or a couple of targeted queries; only use analyze "
         "when a real investigation is asked for. Stop as soon as you can answer.\n"
+        "When no live incident evidence is available, label any guidance as general and "
+        "conditional; never claim a cause is present or a remediation succeeded.\n"
         'Respond with ONLY JSON, one of:\n'
         '{"action":"answer","answer":str}\n'
         '{"action":"query","reason":str,"queries":[{"tool":str,"args":{...}}]}'
