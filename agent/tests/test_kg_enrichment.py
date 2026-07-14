@@ -9,6 +9,7 @@ from app.config import load_settings
 from app.services.kg_enrichment import (
     KGContext,
     _case_card_projection,
+    _prior_is_context_compatible,
     _query_kg,
     _query_remediation,
     _rrf_case_priors,
@@ -338,6 +339,26 @@ def test_case_cards_mark_component_matched_vector_case_as_bridge() -> None:
     )
 
     assert [card["kind"] for card in cards] == ["analog", "counterexample", "bridge"]
+
+
+def test_prior_with_explicit_other_namespace_is_not_target_compatible() -> None:
+    target = replace(_target(), cluster="prod-a", namespace="team-a", workload_name="trainer-a")
+    prior = {
+        "case_card": {
+            "context": {
+                "cluster": "prod-a",
+                "namespace": "team-b",
+                "workload": "trainer-b",
+            }
+        }
+    }
+
+    assert _prior_is_context_compatible(prior, target) is False
+
+
+def test_sparse_legacy_prior_remains_compatible() -> None:
+    # Missing context means unknown, not a fabricated mismatch.
+    assert _prior_is_context_compatible({"case_card": {}}, _target()) is True
 
 
 def test_case_card_projection_keeps_graph_links_and_strips_untrusted_fields() -> None:

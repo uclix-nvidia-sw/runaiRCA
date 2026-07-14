@@ -386,10 +386,12 @@ def rank_root_cause_candidates(
     text_by_agent = {r.agent: _result_text(r) for r in results}
     status_by_agent = {r.agent: r.status for r in results}
     blast, blast_agents = _kg_blast_radius(results)
-    # Blast radius now comes from synthesis-time KG enrichment, not a collector.
-    if kg_blast_radius > blast:
-        blast = kg_blast_radius
-        blast_agents = blast_agents | {"knowledge-graph"}
+    # TypeDB topology is a current/reference graph, not an incident-window
+    # observation.  It can guide collection and explain possible scope, but
+    # must not turn a single live condition into a HIGH historical RCA.  Keep
+    # the argument for API compatibility while deliberately not promoting it
+    # into the causal ranking path.
+    _ = kg_blast_radius
 
     scores = {fam: _Score() for fam in FAMILIES}
     for fam, (canonical, agents, keywords) in _FAMILY_RULES.items():
@@ -428,12 +430,19 @@ def rank_root_cause_candidates(
     # above the (already boosted) subsystem-fault family.
     _apply_lifecycle_gate(scores, lifecycle)
 
-    # Optional feedback-derived priors nudge a family that already has a signal
-    # (multiplier on its score). Priors never create a candidate from nothing.
+    # Optional feedback-derived priors nudge a family only after this incident
+    # has a typed, scoped observation for that family's own collector.  A
+    # similar incident's vote must not amplify a legacy prose summary (or a
+    # historical memory card) into a current causal claim.  Priors still never
+    # create a candidate from nothing.
     if priors:
         for fam, s in scores.items():
             factor = priors.get(fam)
-            if factor is not None and s.points > 0:
+            if (
+                factor is not None
+                and s.points > 0
+                and _has_typed_incident_observation(results, s.agents)
+            ):
                 s.points *= factor
                 s.rationale.append(f"feedback prior adjusted score x{factor:.2f}")
 
@@ -787,6 +796,38 @@ def _artifact_observation(art: object) -> dict[str, object] | None:
     return observation if isinstance(observation, dict) else None
 
 
+def _has_typed_incident_observation(
+    results: list[CollectorResult], candidate_agents: set[str]
+) -> bool:
+    """Whether feedback has a scoped observation from this incident to nudge.
+
+    The feedback channel is derived from prior incident votes/comments.  It can
+    shape the ranking of a verified observation, but neither a compatibility
+    summary nor a card explicitly marked as a historical prior is enough to
+    make that feedback relevant to the current incident.
+    """
+    for result in results:
+        if result.agent not in candidate_agents:
+            continue
+        for card in result.artifacts:
+            observation = _artifact_observation(card)
+            if observation is None:
+                continue
+            payload = getattr(card, "result", None)
+            if (
+                observation.get("historical_prior") is True
+                or isinstance(payload, dict)
+                and payload.get("historical_prior") is True
+            ):
+                continue
+            if (
+                str(observation.get("polarity") or "") == "present"
+                and str(observation.get("coverage") or "") == "scoped"
+            ):
+                return True
+    return False
+
+
 def _leaf_text(value: Any, drop_keys: "frozenset[str] | set[str] | None" = None) -> str:
     """Match evidence values, not JSON schema/key names.
 
@@ -831,6 +872,8 @@ def _kg_blast_radius(results: list[CollectorResult]) -> tuple[int, set[str]]:
     best = 0
     agents: set[str] = set()
     for r in results:
+        if r.agent in _SYNTHETIC_AGENTS:
+            continue
         if not _collector_is_evidence(r):
             continue
         raw = r.details.get("blast_radius_workloads") or r.details.get("kg_blast_radius")
