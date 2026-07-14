@@ -553,20 +553,66 @@ def test_kubernetes_events_are_filtered_to_the_incident_window() -> None:
     )
     data = {
         "items": [
-            {"type": "Warning", "reason": "TooEarly", "eventTime": "2026-07-10T00:54:59Z"},
-            {"type": "Warning", "reason": "Inside", "eventTime": "2026-07-10T01:00:00Z"},
+            {
+                "type": "Warning",
+                "reason": "TooEarly",
+                "eventTime": "2026-07-10T00:54:59Z",
+                "involvedObject": {"kind": "Pod", "name": "trainer-0"},
+            },
+            {
+                "type": "Warning",
+                "reason": "Inside",
+                "eventTime": "2026-07-10T01:00:00Z",
+                "involvedObject": {"kind": "Pod", "name": "trainer-0"},
+            },
             {
                 "type": "Warning",
                 "reason": "SeriesInside",
                 "series": {"lastObservedTime": "2026-07-10T01:14:59Z"},
+                "involvedObject": {"kind": "Pod", "name": "trainer-0"},
             },
-            {"type": "Warning", "reason": "TooLate", "eventTime": "2026-07-10T01:15:01Z"},
+            {
+                "type": "Warning",
+                "reason": "TooLate",
+                "eventTime": "2026-07-10T01:15:01Z",
+                "involvedObject": {"kind": "Pod", "name": "trainer-0"},
+            },
         ]
     }
 
     filtered = _filter_kubernetes_data("pod_events", data, target)
 
     assert [item["reason"] for item in filtered["items"]] == ["Inside", "SeriesInside"]
+
+
+def test_kubernetes_warning_events_exclude_normal_and_non_pod_targets() -> None:
+    target = replace(make_target(), fired_at="2026-07-10T01:00:00Z")
+    data = {
+        "items": [
+            {
+                "type": "Normal",
+                "reason": "Scheduled",
+                "eventTime": "2026-07-10T01:02:00Z",
+                "involvedObject": {"kind": "Pod", "name": "trainer-0"},
+            },
+            {
+                "type": "Warning",
+                "reason": "SameNameJob",
+                "eventTime": "2026-07-10T01:02:00Z",
+                "involvedObject": {"kind": "Job", "name": "trainer-0"},
+            },
+            {
+                "type": "Warning",
+                "reason": "OOMKilled",
+                "eventTime": "2026-07-10T01:02:00Z",
+                "involvedObject": {"kind": "Pod", "name": "trainer-0"},
+            },
+        ]
+    }
+
+    filtered = _filter_kubernetes_data("pod_events", data, target)
+
+    assert [item["reason"] for item in filtered["items"]] == ["OOMKilled"]
 
 
 def test_namespace_events_require_the_alert_resource_identity() -> None:

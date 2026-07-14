@@ -2781,10 +2781,9 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
                 item
                 for item in items
                 if isinstance(item, dict)
-                and (
-                    not isinstance(item.get("involvedObject"), dict)
-                    or str((item.get("involvedObject") or {}).get("name") or "") == target.pod
-                )
+                and isinstance(item.get("involvedObject"), dict)
+                and str((item.get("involvedObject") or {}).get("kind") or "").casefold() == "pod"
+                and str((item.get("involvedObject") or {}).get("name") or "") == target.pod
             ]
         elif name == "namespace_events" or name.startswith("runai_control_plane_events:"):
             # Namespace event lists are otherwise unrelated workload noise.
@@ -2796,10 +2795,9 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
         events = [
             _event_summary(item)
             for item in items
-            if isinstance(item, dict) and item.get("type") in {"Warning", "Normal"}
+            if isinstance(item, dict) and item.get("type") == "Warning"
         ]
-        warnings = [event for event in events if event.get("type") == "Warning"]
-        return {"namespace": _response_namespace(name), "items": (warnings or events)[-10:]}
+        return {"namespace": _response_namespace(name), "items": events[-10:]}
     if name == "node":
         return _node_summary(data)
     return data
@@ -2820,7 +2818,7 @@ def _event_matches_target(event: dict[str, object], target: AnalysisTarget) -> b
     involved = involved if isinstance(involved, dict) else {}
     name = str(involved.get("name") or "")
     kind = str(involved.get("kind") or "").casefold()
-    if target.pod and name == target.pod:
+    if target.pod and kind == "pod" and name == target.pod:
         return True
     if target.node and kind == "node" and name == target.node:
         return True
@@ -2965,7 +2963,11 @@ def _warning_events(responses: list[dict[str, object]]) -> list[object]:
             continue
         data = response.get("data")
         if isinstance(data, dict) and isinstance(data.get("items"), list):
-            events.extend(item for item in data["items"] if isinstance(item, dict))
+            events.extend(
+                item
+                for item in data["items"]
+                if isinstance(item, dict) and item.get("type") == "Warning"
+            )
     return events
 
 
