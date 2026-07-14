@@ -47,6 +47,9 @@ class AnalysisTarget:
     component: str = ""
     storage_claim: str = ""
     volume: str = ""
+    # Immutable identity supplied explicitly by alert metadata. It is not
+    # inferred from a generic ``uid`` field or from resource text.
+    pod_uid: str = ""
 
 
 _INCIDENT_PRELUDE = timedelta(minutes=5)
@@ -438,6 +441,14 @@ def resolve_target(
             "pv",
             "volume_name",
             "volume",
+        ),
+        pod_uid=target_identifier_from(
+            labels,
+            annotations,
+            "pod_uid",
+            "podUid",
+            "kubernetes_pod_uid",
+            "k8s_pod_uid",
         ),
     )
 

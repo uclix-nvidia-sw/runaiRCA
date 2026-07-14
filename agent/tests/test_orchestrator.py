@@ -145,6 +145,15 @@ def test_resolve_target_derives_project_from_runai_namespace() -> None:
     assert target.namespace == "runai-vision"
 
 
+def test_resolve_target_preserves_explicit_pod_uid_only() -> None:
+    target = resolve_target(
+        {"namespace": "runai-vision", "pod": "trainer-0", "kubernetes_pod_uid": "uid-new"},
+        {"uid": "not-a-pod-identity"},
+    )
+
+    assert target.pod_uid == "uid-new"
+
+
 def test_resolve_target_reads_workload_from_kube_state_metrics_daemonset_label() -> None:
     # A kube-state-metrics-exported alert (e.g. RunaiDaemonSetUnavailableOnNodes)
     # names the REAL failing object in the `daemonset` label; the `pod` label is

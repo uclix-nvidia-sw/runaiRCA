@@ -652,6 +652,34 @@ def test_kubernetes_pod_events_reject_explicitly_cross_namespace_matches() -> No
     assert [item["object"] for item in filtered["items"]] == ["trainer-0"]
 
 
+def test_kubernetes_pod_events_require_alert_uid_when_supplied() -> None:
+    target = replace(
+        make_target(), fired_at="2026-07-10T01:00:00Z", namespace="team-a", pod_uid="uid-new"
+    )
+    data = {
+        "items": [
+            {
+                "metadata": {"namespace": "team-a"},
+                "type": "Warning",
+                "reason": "OldPod",
+                "eventTime": "2026-07-10T01:02:00Z",
+                "involvedObject": {"kind": "Pod", "name": "trainer-0", "uid": "uid-old"},
+            },
+            {
+                "metadata": {"namespace": "team-a"},
+                "type": "Warning",
+                "reason": "NewPod",
+                "eventTime": "2026-07-10T01:02:00Z",
+                "involvedObject": {"kind": "Pod", "name": "trainer-0", "uid": "uid-new"},
+            },
+        ]
+    }
+
+    filtered = _filter_kubernetes_data("pod_events", data, target)
+
+    assert [item["reason"] for item in filtered["items"]] == ["NewPod"]
+
+
 def test_namespace_events_require_the_alert_resource_identity() -> None:
     target = replace(
         make_target(), pod="", workload_name="trainer", fired_at="2026-07-10T01:00:00Z"

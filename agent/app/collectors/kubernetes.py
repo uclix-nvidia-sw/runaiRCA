@@ -499,11 +499,14 @@ async def k8s_describe(
         settings, resolved, namespace=namespace, name=name, full_object=True
     )
     expected_kind = _k8s_mcp_api_kinds(resolved)[0][1]
+    object_data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+    metadata = object_data.get("metadata") if isinstance(object_data.get("metadata"), dict) else {}
     events = await _describe_events(
         settings,
         namespace=namespace,
         name=name,
         expected_kind=expected_kind,
+        expected_uid=str(metadata.get("uid") or ""),
         time_range=time_range,
     )
     return {
@@ -524,6 +527,7 @@ async def _describe_events(
     namespace: str,
     name: str,
     expected_kind: str,
+    expected_uid: str = "",
     time_range: dict[str, str] | None = None,
 ) -> list:
     """Events for ONE object, preferring Kubernetes MCP with client-side filtering.
@@ -558,6 +562,7 @@ async def _describe_events(
                 if str((item.get("involvedObject") or {}).get("kind") or "").casefold()
                 == expected_kind.casefold()
                 if _event_matches_namespace(item, namespace)
+                if _event_matches_uid(item, expected_uid)
             ]
             filtered = _events_in_time_range(matching, time_range)
             return compact(filtered, limit=12) if filtered else []
@@ -578,7 +583,15 @@ async def _describe_events(
         path="/".join(parts),
         timeout_seconds=settings.kubernetes_timeout_seconds,
         params={
-            "fieldSelector": f"involvedObject.name={name},involvedObject.kind={expected_kind}",
+            "fieldSelector": ",".join(
+                value
+                for value in (
+                    f"involvedObject.name={name}",
+                    f"involvedObject.kind={expected_kind}",
+                    f"involvedObject.uid={expected_uid}" if expected_uid else "",
+                )
+                if value
+            ),
             "limit": str(settings.kubernetes_list_limit),
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -595,6 +608,7 @@ async def _describe_events(
         and str((item.get("involvedObject") or {}).get("kind") or "").casefold()
         == expected_kind.casefold()
         and _event_matches_namespace(item, namespace)
+        and _event_matches_uid(item, expected_uid)
     ]
     filtered = _events_in_time_range(filtered, time_range)
     return compact(filtered, limit=12) if filtered else []
@@ -958,6 +972,10 @@ class KubernetesCollector:
 
         warnings: list[str] = []
         used_mcp = False
+        responses: list[dict[str, object]] = []
+        pod_summary_data: dict[str, object] | None = None
+        logs: list[dict[str, object]] = []
+        exec_probes: list[dict[str, object]] = []
         control_plane_in_scope = plan.check_control_plane if plan is not None else True
         if self._settings.kubernetes_mcp_url:
             try:
@@ -967,23 +985,29 @@ class KubernetesCollector:
                     control_plane_in_scope=control_plane_in_scope,
                 )
                 pod_summary_data = _target_pod_summary(responses)
-                containers = _container_names(pod_summary_data)
-                logs = await _collect_pod_logs_via_mcp(
-                    settings=self._settings,
-                    target=target,
-                    containers=containers,
-                    previous_containers=_restarted_container_names(pod_summary_data),
-                    since_time=since_time,
-                )
-                # pods/exec is intentionally outside the read-only Kubernetes
-                # MCP ServiceAccount. Run the same tightly allowlisted probes
-                # through the agent's own ServiceAccount; this does not turn
-                # ordinary Kubernetes reads into direct API calls.
-                exec_probes = await _collect_exec_probes(
-                    settings=self._settings,
-                    target=target,
-                    containers=containers,
-                )
+                if _pod_matches_target_uid(pod_summary_data, target):
+                    containers = _container_names(pod_summary_data)
+                    logs = await _collect_pod_logs_via_mcp(
+                        settings=self._settings,
+                        target=target,
+                        containers=containers,
+                        previous_containers=_restarted_container_names(pod_summary_data),
+                        since_time=since_time,
+                    )
+                    # pods/exec is intentionally outside the read-only Kubernetes
+                    # MCP ServiceAccount. Run the same tightly allowlisted probes
+                    # through the agent's own ServiceAccount; this does not turn
+                    # ordinary Kubernetes reads into direct API calls.
+                    exec_probes = await _collect_exec_probes(
+                        settings=self._settings,
+                        target=target,
+                        containers=containers,
+                    )
+                elif target.pod_uid:
+                    warnings.append(
+                        "current Pod UID does not match the alert Pod UID; skipped logs and exec"
+                    )
+                    pod_summary_data = None
                 used_mcp = True
             except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
                 warnings.append(mcp_fallback_warning(exc))
@@ -1030,21 +1054,27 @@ class KubernetesCollector:
                 control_plane_in_scope=control_plane_in_scope,
             )
             pod_summary_data = _target_pod_summary(responses)
-            containers = _container_names(pod_summary_data)
-            logs = await _collect_pod_logs(
-                settings=self._settings,
-                target=target,
-                containers=containers,
-                headers=headers,
-                verify=verify,
-                previous_containers=_restarted_container_names(pod_summary_data),
-                since_time=since_time,
-            )
-            exec_probes = await _collect_exec_probes(
-                settings=self._settings,
-                target=target,
-                containers=containers,
-            )
+            if _pod_matches_target_uid(pod_summary_data, target):
+                containers = _container_names(pod_summary_data)
+                logs = await _collect_pod_logs(
+                    settings=self._settings,
+                    target=target,
+                    containers=containers,
+                    headers=headers,
+                    verify=verify,
+                    previous_containers=_restarted_container_names(pod_summary_data),
+                    since_time=since_time,
+                )
+                exec_probes = await _collect_exec_probes(
+                    settings=self._settings,
+                    target=target,
+                    containers=containers,
+                )
+            elif target.pod_uid:
+                warnings.append(
+                    "current Pod UID does not match the alert Pod UID; skipped logs and exec"
+                )
+                pod_summary_data = None
 
         # The initial sweep's `pods_get` is deliberately compact so broad RCA
         # evidence stays readable. A named alert pod is different: preserve one
@@ -1062,7 +1092,14 @@ class KubernetesCollector:
             )
             described_object = target_pod_describe.get("object")
             if isinstance(described_object, dict):
-                pod_summary_data = _pod_summary(described_object)
+                described_summary = _pod_summary(described_object)
+                if _pod_matches_target_uid(described_summary, target):
+                    pod_summary_data = described_summary
+                elif target.pod_uid:
+                    target_pod_describe["identity_mismatch"] = True
+                    warnings.append(
+                        "described Pod UID does not match the alert Pod UID; ignored replacement Pod"
+                    )
 
         # Controller-level alerts (Deployment/StatefulSet/DaemonSet/ReplicaSet/
         # Job/CronJob) commonly carry only the controller label. Resolve its pod
@@ -1103,7 +1140,9 @@ class KubernetesCollector:
         successful = [item for item in responses if not item.get("error")]
         pod_statuses = _pod_statuses(responses)
         warning_events = _warning_events(responses)
-        target_described_events = target_pod_describe.get("events")
+        target_described_events = (
+            None if target_pod_describe.get("identity_mismatch") else target_pod_describe.get("events")
+        )
         if isinstance(target_described_events, list):
             warning_events.extend(
                 event
@@ -1917,18 +1956,16 @@ def _scope_target(target: AnalysisTarget, plan) -> AnalysisTarget:  # noqa: ANN0
         target.namespace,
     ):
         return target
-    return AnalysisTarget(
-        cluster=target.cluster,
-        project=target.project,
-        queue=target.queue,
+    # Keep immutable alert identities and its incident window while applying
+    # only the planner's allowed narrowing fields.
+    return replace(
+        target,
         namespace=namespace,
         workload_name=workload,
-        workload_type=target.workload_type,
-        runai_workload_id=target.runai_workload_id,
         node=node,
         pod=pod,
-        severity=target.severity,
-        alert_name=target.alert_name,
+        # A plan-selected different Pod cannot inherit the alert Pod's UID.
+        pod_uid=target.pod_uid if pod == target.pod else "",
     )
 
 
@@ -2828,6 +2865,7 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
                 and str((item.get("involvedObject") or {}).get("kind") or "").casefold() == "pod"
                 and str((item.get("involvedObject") or {}).get("name") or "") == target.pod
                 and _event_matches_namespace(item, target.namespace)
+                and _event_matches_uid(item, target.pod_uid)
             ]
         elif name == "namespace_events":
             # MCP tools can ignore their namespace argument; an event matching
@@ -2887,6 +2925,7 @@ def _event_time_range_complete(name: str, data: object, target: AnalysisTarget) 
             and str((item.get("involvedObject") or {}).get("kind") or "").casefold() == "pod"
             and str((item.get("involvedObject") or {}).get("name") or "") == target.pod
             and _event_matches_namespace(item, target.namespace)
+            and _event_matches_uid(item, target.pod_uid)
         ]
     elif name == "namespace_events":
         candidates = [
@@ -2927,7 +2966,7 @@ def _event_matches_target(event: dict[str, object], target: AnalysisTarget) -> b
     involved = involved if isinstance(involved, dict) else {}
     name = str(involved.get("name") or "")
     kind = str(involved.get("kind") or "").casefold()
-    if target.pod and kind == "pod" and name == target.pod:
+    if target.pod and kind == "pod" and name == target.pod and _event_matches_uid(event, target.pod_uid):
         return True
     if target.node and kind == "node" and name == target.node:
         return True
@@ -2967,6 +3006,23 @@ def _event_matches_namespace(event: dict[str, object], namespace: str) -> bool:
     )
 
 
+def _event_matches_uid(event: dict[str, object], expected_uid: str) -> bool:
+    """Require the immutable Pod UID only when the alert declared one."""
+    if not expected_uid:
+        return True
+    involved = event.get("involvedObject") if isinstance(event.get("involvedObject"), dict) else {}
+    return str(involved.get("uid") or "") == expected_uid
+
+
+def _pod_matches_target_uid(pod: dict[str, object] | None, target: AnalysisTarget) -> bool:
+    """A same-name current Pod is usable only when an explicit alert UID agrees."""
+    if not target.pod_uid:
+        return True
+    if not isinstance(pod, dict):
+        return False
+    return str(pod.get("uid") or "") == target.pod_uid
+
+
 def _event_message_mentions_target(message: str, target: AnalysisTarget) -> bool:
     text = message.casefold()
     identifiers = [
@@ -3002,6 +3058,7 @@ def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
             resources[container["name"]] = container.get("resources") or {}
     return {
         "name": metadata.get("name"),
+        "uid": metadata.get("uid"),
         "namespace": metadata.get("namespace"),
         "phase": status.get("phase"),
         "nodeName": spec.get("nodeName"),
