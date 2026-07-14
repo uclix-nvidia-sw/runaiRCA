@@ -1306,6 +1306,94 @@ async def test_runai_collector_falls_back_to_curl_when_mcp_unavailable(monkeypat
     assert called["curl"] is True
 
 
+@pytest.mark.asyncio
+async def test_runai_collector_falls_back_from_unparseable_mcp_payload(monkeypatch) -> None:
+    """A 200 MCP gateway error page is not a successful Run:ai observation."""
+    from app.collectors import runai as runai_mod
+
+    async def fake_mcp(_settings, _target):
+        return [
+            {
+                "name": "workloads",
+                "query": "MCP call_runai_api GET /api/v1/workloads",
+                "status_code": 200,
+                "error": None,
+                "data": {"raw": "<html>gateway temporarily unavailable</html>"},
+            }
+        ]
+
+    called = {"direct": False}
+
+    async def fake_direct(_settings, _target, _headers):
+        called["direct"] = True
+        return [
+            {
+                "name": "workloads",
+                "path": "/api/v1/workloads",
+                "status_code": 200,
+                "error": None,
+                "data": {"workloads": [{"name": "trainer"}]},
+            }
+        ]
+
+    async def fake_headers(_settings, prefer_oauth=False):
+        return ({"Authorization": "Bearer x"}, [])
+
+    monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", fake_mcp)
+    monkeypatch.setattr(runai_mod, "_collect_runai_responses", fake_direct)
+    monkeypatch.setattr(runai_mod, "_runai_headers", fake_headers)
+    monkeypatch.setattr(runai_mod, "_fetch_runai_version", lambda *a, **k: _async_empty())
+    result = await RunAICollector(
+        replace(
+            make_settings(),
+            runai_base_url="https://runai.example",
+            runai_mcp_url="http://runai-mcp/mcp",
+        )
+    ).collect(make_target())
+
+    assert called["direct"] is True
+    assert any("no usable structured response" in warning for warning in result.warnings)
+    assert not any("gathered via the runai-mcp" in warning for warning in result.warnings)
+    assert result.status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_runai_collector_rejects_non_json_direct_payload(monkeypatch) -> None:
+    """HTTP 200 with an HTML/text body must stay unavailable, not become evidence."""
+    from app.collectors import runai as runai_mod
+
+    async def mcp_none(_settings, _target):
+        return None
+
+    async def fake_direct(_settings, _target, _headers):
+        return [
+            {
+                "name": "workloads",
+                "path": "/api/v1/workloads",
+                "status_code": 200,
+                "error": None,
+                "data": {"body": "<html>upstream error</html>"},
+            }
+        ]
+
+    async def fake_headers(_settings, prefer_oauth=False):
+        return ({"Authorization": "Bearer x"}, [])
+
+    monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", mcp_none)
+    monkeypatch.setattr(runai_mod, "_collect_runai_responses", fake_direct)
+    monkeypatch.setattr(runai_mod, "_runai_headers", fake_headers)
+    monkeypatch.setattr(runai_mod, "_fetch_runai_version", lambda *a, **k: _async_empty())
+    result = await RunAICollector(
+        replace(make_settings(), runai_base_url="https://runai.example")
+    ).collect(make_target())
+
+    assert result.status == "unavailable"
+    assert result.details["queries"][0]["error"] == "Run:ai API response was not JSON"
+    signals = [artifact for artifact in result.artifacts if artifact.type == "runai_api_signal"]
+    assert signals
+    assert all(artifact.result["observation"]["polarity"] == "unavailable" for artifact in signals)
+
+
 async def _async_empty():
     return ""
 

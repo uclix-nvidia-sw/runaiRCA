@@ -140,9 +140,25 @@ class RunAICollector:
             # Prefer the runai-mcp server when configured (richer, spec-aware,
             # auto-authed by the managed service); fall back to direct HTTP on any MCP issue.
             query_results = await gather_runai_via_mcp(self._settings, target)
-            used_mcp = query_results is not None
+            if query_results is not None:
+                query_results = _validated_runai_query_results(query_results)
+            # A streamable MCP call can technically succeed while its tool body
+            # is a gateway error page or an otherwise unparseable text payload.
+            # That is not usable Run:ai evidence and must not turn into a
+            # reassuring "queries completed" headline. Fall back to the
+            # authenticated direct API only when *none* of the MCP responses
+            # yielded a structured payload.
+            used_mcp = bool(
+                query_results and any(not item.get("error") for item in query_results)
+            )
             if not used_mcp:
-                query_results = await _collect_runai_responses(self._settings, target, headers)
+                if query_results:
+                    auth_warnings.append(
+                        "Run:ai MCP returned no usable structured response; used direct API fallback."
+                    )
+                query_results = _validated_runai_query_results(
+                    await _collect_runai_responses(self._settings, target, headers)
+                )
             if used_mcp:
                 auth_warnings.append("Run:ai queries gathered via the runai-mcp server.")
             auth_failed = any(item.get("status_code") == 401 for item in query_results)
@@ -155,8 +171,10 @@ class RunAICollector:
                         "Run:ai returned HTTP 401; refreshed OAuth token and retried once."
                     )
                     auth_warnings.extend(retry_warnings)
-                    query_results = await _collect_runai_responses(
-                        self._settings, target, retry_headers
+                    query_results = _validated_runai_query_results(
+                        await _collect_runai_responses(
+                            self._settings, target, retry_headers
+                        )
                     )
                     auth_failed = any(item.get("status_code") == 401 for item in query_results)
             successful = [item for item in query_results if not item.get("error")]
@@ -475,6 +493,39 @@ async def _collect_runai_responses(
 
 def _query_params(values: dict[str, str]) -> dict[str, str]:
     return {key: value for key, value in values.items() if value}
+
+
+def _validated_runai_query_results(
+    query_results: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Reject successful transports whose payload was not structured JSON.
+
+    ``mcp_tool_json`` represents non-JSON tool text as ``{"raw": ...}``;
+    the direct HTTP helper similarly preserves a non-JSON body as
+    ``{"body": ...}``. Neither shape can establish the returned Run:ai
+    resource state. Keep the payload visible to the operator, but surface it
+    as an unavailable query rather than treating its HTTP/MCP round trip as a
+    successful evidence collection.
+    """
+    validated: list[dict[str, object]] = []
+    for raw_item in query_results:
+        item = dict(raw_item)
+        if not item.get("error"):
+            payload_error = _runai_payload_error(item.get("data"))
+            if payload_error:
+                item["error"] = payload_error
+        validated.append(item)
+    return validated
+
+
+def _runai_payload_error(data: object) -> str:
+    if data is None:
+        return "Run:ai response did not contain JSON data"
+    if isinstance(data, dict) and set(data) == {"raw"}:
+        return "Run:ai MCP response was not JSON"
+    if isinstance(data, dict) and set(data) == {"body"}:
+        return "Run:ai API response was not JSON"
+    return ""
 
 
 def _runai_query_artifact(
