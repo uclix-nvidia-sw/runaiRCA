@@ -419,7 +419,13 @@ _HISTORY_CONTEXT_COLUMNS = (
     "resource_id",
     "workload",
     "workload_name",
+    "workload_id",
+    "pod",
+    "pod_name",
     "project",
+    "project_name",
+    "queue",
+    "queue_name",
     "namespace",
     "status",
 )
@@ -545,6 +551,132 @@ def _history_aggregate_query(
     """
 
 
+def _history_target_clause(
+    table: dict[str, Any], target: AnalysisTarget, *, mcp: bool
+) -> tuple[str, list[list[str]]] | None:
+    """Build an exact, allowlisted identity predicate for audit history.
+
+    Sampling the newest audit rows and matching them in Python makes an older
+    target event look absent whenever unrelated newer events fill the limit.
+    Keep the predicate restricted to discovered context columns and bind every
+    direct-DB value; MCP has no parameter channel, so encode its values as
+    hexadecimal UTF-8 SQL expressions after constraining the column identifier.
+    """
+    expected = {
+        "workload": (target.workload_name, target.runai_workload_id),
+        "workload_name": (target.workload_name,),
+        "workload_id": (target.runai_workload_id,),
+        "pod": (target.pod,),
+        "pod_name": (target.pod,),
+        "project": (target.project,),
+        "project_name": (target.project,),
+        "queue": (target.queue,),
+        "queue_name": (target.queue,),
+        "resource_id": (target.workload_name, target.runai_workload_id),
+        "id": (target.runai_workload_id,),
+    }
+    available = {str(column) for column in table.get("context_columns", [])}
+    predicates: list[str] = []
+    parameters: list[list[str]] = []
+    parameter_number = 3
+    for column in _HISTORY_TARGET_COLUMNS:
+        values = sorted(
+            {str(value).strip().casefold() for value in expected[column] if str(value).strip()}
+        )
+        if column not in available or not values:
+            continue
+        quoted = _quoted_identifier(column)
+        normalized = f"lower(coalesce({quoted}::text, ''))"
+        if mcp:
+            expressions = ", ".join(_sql_text_expression(value) for value in values)
+            predicates.append(f"{normalized} IN ({expressions})")
+        else:
+            predicates.append(f"{normalized} = ANY(${parameter_number}::text[])")
+            parameters.append(values)
+            parameter_number += 1
+    if not predicates:
+        return None
+    return " AND (" + " OR ".join(predicates) + ")", parameters
+
+
+def _sql_text_expression(value: str) -> str:
+    """Return a non-interpolating SQL text expression for MCP-only queries."""
+    encoded = value.encode("utf-8").hex()
+    return f"convert_from(decode('{encoded}', 'hex'), 'UTF8')"
+
+
+def _history_target_query(
+    table: dict[str, Any],
+    target: AnalysisTarget,
+    *,
+    mcp: bool,
+    time_range: dict[str, str] | None,
+) -> tuple[str, list[list[str]]] | None:
+    clause = _history_target_clause(table, target, mcp=mcp)
+    if clause is None:
+        return None
+    target_clause, parameters = clause
+    schema = _quoted_identifier(str(table["schema"]))
+    name = _quoted_identifier(str(table["table"]))
+    timestamp = _quoted_identifier(str(table["timestamp_column"]))
+    if mcp:
+        if not time_range:
+            raise ValueError("incident time range is required for audit/history queries")
+        start = f"'{time_range['start']}'::timestamptz"
+        end = f"'{time_range['end']}'::timestamptz"
+    else:
+        start, end = "$1::timestamptz", "$2::timestamptz"
+    columns = [f"{timestamp} AS event_time"]
+    for column in table.get("context_columns", []):
+        quoted = _quoted_identifier(str(column))
+        columns.append(f"left(coalesce({quoted}::text, ''), 240) AS {quoted}")
+    return (
+        f"""
+        SELECT {', '.join(columns)}
+        FROM {schema}.{name}
+        WHERE {timestamp} >= {start}
+          AND {timestamp} <= {end}{target_clause}
+        ORDER BY {timestamp} DESC
+        LIMIT 10
+        """,
+        parameters,
+    )
+
+
+def _history_target_aggregate_query(
+    table: dict[str, Any],
+    target: AnalysisTarget,
+    *,
+    mcp: bool,
+    time_range: dict[str, str] | None,
+) -> tuple[str, list[list[str]]] | None:
+    clause = _history_target_clause(table, target, mcp=mcp)
+    if clause is None:
+        return None
+    target_clause, parameters = clause
+    schema = _quoted_identifier(str(table["schema"]))
+    name = _quoted_identifier(str(table["table"]))
+    timestamp = _quoted_identifier(str(table["timestamp_column"]))
+    if mcp:
+        if not time_range:
+            raise ValueError("incident time range is required for audit/history queries")
+        start = f"'{time_range['start']}'::timestamptz"
+        end = f"'{time_range['end']}'::timestamptz"
+    else:
+        start, end = "$1::timestamptz", "$2::timestamptz"
+    return (
+        f"""
+        SELECT count(*) AS matching_rows,
+               min({timestamp}) AS first_event_at,
+               max({timestamp}) AS last_event_at
+        FROM {schema}.{name}
+        WHERE {timestamp} >= {start}
+          AND {timestamp} <= {end}{target_clause}
+        """,
+        parameters,
+    )
+
+
 async def _collect_incident_history_direct(conn: Any, target: AnalysisTarget) -> dict[str, Any]:
     history = _empty_incident_history(target)
     time_range = history["time_range"]
@@ -565,7 +697,23 @@ async def _collect_incident_history_direct(conn: Any, target: AnalysisTarget) ->
             time_range["end"],
         )
         row_dicts = [_record_to_dict(row) for row in rows]
-        target_rows = _history_target_rows(row_dicts, target, table.get("context_columns", []))
+        target_aggregate_query = _history_target_aggregate_query(
+            table, target, mcp=False, time_range=time_range
+        )
+        target_query = _history_target_query(table, target, mcp=False, time_range=time_range)
+        target_aggregate: dict[str, Any] = {}
+        target_rows: list[dict[str, Any]] = []
+        if target_aggregate_query is not None and target_query is not None:
+            query, parameters = target_aggregate_query
+            aggregate_rows = await conn.fetch(
+                query, time_range["start"], time_range["end"], *parameters
+            )
+            target_aggregate = _record_to_dict(aggregate_rows[0]) if aggregate_rows else {}
+            query, parameters = target_query
+            target_rows = [
+                _record_to_dict(row)
+                for row in await conn.fetch(query, time_range["start"], time_range["end"], *parameters)
+            ]
         tables.append(
             {
                 **table,
@@ -573,10 +721,10 @@ async def _collect_incident_history_direct(conn: Any, target: AnalysisTarget) ->
                 "first_event_at": aggregate.get("first_event_at"),
                 "last_event_at": aggregate.get("last_event_at"),
                 "rows": row_dicts,
-                "target_correlation_available": _history_correlation_available(
-                    table.get("context_columns", []), target
-                ),
-                "target_matching_rows": len(target_rows),
+                "target_correlation_available": target_aggregate_query is not None,
+                "target_matching_rows": int(target_aggregate.get("matching_rows") or 0),
+                "target_first_event_at": target_aggregate.get("first_event_at"),
+                "target_last_event_at": target_aggregate.get("last_event_at"),
                 "target_rows": target_rows,
             }
         )
@@ -599,7 +747,18 @@ async def _collect_incident_history_mcp(
         )
         aggregate = aggregate_rows[0] if aggregate_rows else {}
         rows = await _mcp_fetch(settings, _history_query(table, mcp=True, time_range=time_range))
-        target_rows = _history_target_rows(rows, target, table.get("context_columns", []))
+        target_aggregate_query = _history_target_aggregate_query(
+            table, target, mcp=True, time_range=time_range
+        )
+        target_query = _history_target_query(table, target, mcp=True, time_range=time_range)
+        target_aggregate: dict[str, Any] = {}
+        target_rows: list[dict[str, Any]] = []
+        if target_aggregate_query is not None and target_query is not None:
+            query, _ = target_aggregate_query
+            aggregate_rows = await _mcp_fetch(settings, query)
+            target_aggregate = aggregate_rows[0] if aggregate_rows else {}
+            query, _ = target_query
+            target_rows = await _mcp_fetch(settings, query)
         tables.append(
             {
                 **table,
@@ -607,10 +766,10 @@ async def _collect_incident_history_mcp(
                 "first_event_at": aggregate.get("first_event_at"),
                 "last_event_at": aggregate.get("last_event_at"),
                 "rows": rows,
-                "target_correlation_available": _history_correlation_available(
-                    table.get("context_columns", []), target
-                ),
-                "target_matching_rows": len(target_rows),
+                "target_correlation_available": target_aggregate_query is not None,
+                "target_matching_rows": int(target_aggregate.get("matching_rows") or 0),
+                "target_first_event_at": target_aggregate.get("first_event_at"),
+                "target_last_event_at": target_aggregate.get("last_event_at"),
                 "target_rows": target_rows,
             }
         )
@@ -742,56 +901,16 @@ _HISTORY_TARGET_COLUMNS = frozenset(
         "workload",
         "workload_name",
         "workload_id",
+        "pod",
+        "pod_name",
         "project",
         "project_name",
-        "namespace",
+        "queue",
+        "queue_name",
         "resource_id",
         "id",
     }
 )
-
-
-def _history_correlation_available(columns: object, target: AnalysisTarget) -> bool:
-    available = {str(column).strip().lower() for column in columns if str(column).strip()}
-    if not available.intersection(_HISTORY_TARGET_COLUMNS):
-        return False
-    return bool(
-        target.runai_workload_id
-        or target.workload_name
-        or target.project
-        or target.namespace
-    )
-
-
-def _history_target_rows(
-    rows: list[dict[str, Any]], target: AnalysisTarget, context_columns: object
-) -> list[dict[str, Any]]:
-    if not _history_correlation_available(context_columns, target):
-        return []
-    return [row for row in rows if _history_row_matches_target(row, target)]
-
-
-def _history_row_matches_target(row: dict[str, Any], target: AnalysisTarget) -> bool:
-    """Require an exact value in an identity field; never keyword-match audit text."""
-    expected = {
-        "workload": {target.workload_name, target.runai_workload_id},
-        "workload_name": {target.workload_name},
-        "workload_id": {target.runai_workload_id},
-        "project": {target.project},
-        "project_name": {target.project},
-        "namespace": {target.namespace},
-        "resource_id": {target.workload_name, target.runai_workload_id},
-        "id": {target.runai_workload_id},
-    }
-    for key, value in row.items():
-        candidates = {
-            item.strip().casefold()
-            for item in expected.get(str(key).lower(), set())
-            if item
-        }
-        if candidates and str(value).strip().casefold() in candidates:
-            return True
-    return False
 
 
 def _postgres_history_artifacts(

@@ -14,7 +14,11 @@ from app.collectors.kubernetes import (
     _warning_event_observation,
     _warning_event_queries_complete,
 )
-from app.collectors.postgres import _collect_postgres_checks, _postgres_result
+from app.collectors.postgres import (
+    _collect_postgres_checks,
+    _history_target_aggregate_query,
+    _postgres_result,
+)
 from tests.test_orchestrator import make_settings, make_target
 
 
@@ -575,7 +579,9 @@ class _HistoryConnection:
                 },
             ]
         if 'FROM "audit"."workload_history"' in query:
-            assert args == ("2026-07-10T00:55:00Z", "2026-07-10T01:15:00Z")
+            assert args[:2] == ("2026-07-10T00:55:00Z", "2026-07-10T01:15:00Z")
+            if "ANY($3::text[])" in query:
+                assert args[2:] == (["trainer"],)
             if "count(*) AS matching_rows" in query:
                 return [
                     {
@@ -630,6 +636,8 @@ async def test_postgres_reads_only_timestamped_audit_history_in_incident_window(
             ],
             "target_correlation_available": True,
             "target_matching_rows": 1,
+            "target_first_event_at": "2026-07-10T01:02:00Z",
+            "target_last_event_at": "2026-07-10T01:02:00Z",
             "target_rows": [
                 {
                     "event_time": "2026-07-10T01:02:00Z",
@@ -639,6 +647,88 @@ async def test_postgres_reads_only_timestamped_audit_history_in_incident_window(
             ],
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_postgres_history_queries_target_beyond_latest_generic_sample() -> None:
+    class TargetOlderThanGenericSample(_HistoryConnection):
+        async def fetch(self, query: str, *args):
+            if "information_schema.columns" in query:
+                return await super().fetch(query, *args)
+            if 'FROM "audit"."workload_history"' not in query:
+                return await super().fetch(query, *args)
+            assert args[:2] == ("2026-07-10T00:55:00Z", "2026-07-10T01:15:00Z")
+            targeted = "ANY($3::text[])" in query
+            if "count(*) AS matching_rows" in query:
+                return [{
+                    "matching_rows": 1 if targeted else 11,
+                    "first_event_at": "2026-07-10T01:01:00Z",
+                    "last_event_at": "2026-07-10T01:14:00Z",
+                }]
+            return [
+                {
+                    "event_time": "2026-07-10T01:01:00Z" if targeted else "2026-07-10T01:14:00Z",
+                    "action": "targeted" if targeted else "unrelated",
+                    "workload_name": "trainer" if targeted else "other-workload",
+                }
+            ]
+
+    target = replace(
+        make_target(),
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    checks = await _collect_postgres_checks(
+        TargetOlderThanGenericSample(), target, check_rca_tables=False
+    )
+    table = checks["incident_history"]["tables"][0]
+
+    assert table["matching_rows"] == 11
+    assert table["target_matching_rows"] == 1
+    assert table["target_rows"] == [{
+        "event_time": "2026-07-10T01:01:00Z",
+        "action": "targeted",
+        "workload_name": "trainer",
+    }]
+
+
+def test_postgres_target_history_query_binds_identity_or_encodes_mcp_value() -> None:
+    target = replace(make_target(), workload_name="trainer' OR true --")
+    table = {
+        "schema": "audit",
+        "table": "workload_history",
+        "timestamp_column": "created_at",
+        "context_columns": ["workload_name"],
+    }
+    time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+
+    direct = _history_target_aggregate_query(table, target, mcp=False, time_range=time_range)
+    mcp = _history_target_aggregate_query(table, target, mcp=True, time_range=time_range)
+
+    assert direct is not None and mcp is not None
+    assert "ANY($3::text[])" in direct[0]
+    assert direct[1] == [["trainer' or true --"]]
+    encoded = "trainer' or true --".encode("utf-8").hex()
+    assert f"IN (convert_from(decode('{encoded}', 'hex'), 'UTF8'))" in mcp[0]
+    assert mcp[1] == []
+
+    pod_only = _history_target_aggregate_query(
+        {**table, "context_columns": ["pod_name"]},
+        make_target(),
+        mcp=False,
+        time_range=time_range,
+    )
+    assert pod_only is not None
+    assert '"pod_name"' in pod_only[0]
+    assert pod_only[1] == [["trainer-0"]]
+
+    namespace_only = _history_target_aggregate_query(
+        {**table, "context_columns": ["namespace"]},
+        make_target(),
+        mcp=False,
+        time_range=time_range,
+    )
+    assert namespace_only is None
 
 
 @pytest.mark.asyncio
