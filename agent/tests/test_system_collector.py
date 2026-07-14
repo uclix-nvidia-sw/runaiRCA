@@ -7,7 +7,9 @@ import pytest
 from app.collectors import system as system_mod
 from app.collectors.base import AnalysisTarget
 from app.collectors.http_json import JsonResponse
+from app.collectors.kubernetes import _scope_target
 from app.collectors.system import SystemCollector, _base_url_for_node, _lines, system_log_query
+from app.plan import InvestigationPlan
 
 
 def _target(node: str = "gpu-node-1") -> AnalysisTarget:
@@ -149,7 +151,10 @@ async def test_historical_incident_scopes_journal_and_ignores_current_tails(
         # A current dmesg/syslog error is useful context, but cannot establish
         # a cause for a months-old incident. The time-bounded journal is clean.
         lines = ["NVRM: Xid 79"] if source in {"dmesg", "syslog"} else ["all good"]
-        return JsonResponse(url="http://node/logs", status_code=200, data={"lines": lines})
+        data = {"lines": lines}
+        if source == "journal":
+            data.update({"source": source, "since": params["since"], "until": params["until"]})
+        return JsonResponse(url="http://node/logs", status_code=200, data=data)
 
     monkeypatch.setattr(system_mod, "get_json", fake_get_json)
     target = replace(
@@ -236,10 +241,16 @@ async def test_system_log_query_scopes_historical_journal_only(
 
     async def fake_get_json(**kwargs):
         calls.append(kwargs)
+        params = kwargs["params"]
         return JsonResponse(
             url="http://node/logs",
             status_code=200,
-            data={"lines": ["NVRM: Xid 79"]},
+            data={
+                "source": params["source"],
+                "since": params.get("since"),
+                "until": params.get("until"),
+                "lines": ["NVRM: Xid 79"],
+            },
         )
 
     monkeypatch.setattr(system_mod, "get_json", fake_get_json)
@@ -272,6 +283,150 @@ async def test_system_log_query_scopes_historical_journal_only(
     assert (journal["polarity"], journal["coverage"]) == ("present", "scoped")
     assert dmesg["observation"]["historical_scope"] is False
     assert dmesg["coverage"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_shared_system_agent_receives_target_node(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict] = []
+
+    class SharedSettings(_Settings):
+        system_agent_url = "http://system-agent.runai-rca:9095"
+
+    async def fake_get_json(**kwargs):
+        calls.append(kwargs)
+        params = kwargs["params"]
+        return JsonResponse(
+            url="http://system-agent/logs",
+            status_code=200,
+            data={
+                "source": params["source"],
+                "since": params.get("since"),
+                "until": params.get("until"),
+                "lines": ["NVRM: Xid 79"],
+            },
+        )
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(), fired_at="2026-07-13T21:43:47Z", resolved_at="2026-07-13T21:45:47Z"
+    )
+    result = await SystemCollector(SharedSettings()).collect(target)
+    query = await system_log_query(SharedSettings(), target, {"source": "journal"})
+
+    assert all(call["params"]["node"] == "gpu-node-1" for call in calls)
+    assert result.artifacts[0].result["observation"]["coverage"] == "scoped"
+    assert query["coverage"] == "scoped"
+
+
+@pytest.mark.asyncio
+async def test_historical_malformed_journal_is_context_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_get_json(**kwargs):
+        # A proxy/old endpoint can still be 200 and carry a matching text, but
+        # without the chart envelope it does not prove source or time window.
+        return JsonResponse(url="http://node/logs", status_code=200, data=["NVRM: Xid 79"])
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(), fired_at="2026-07-13T21:43:47Z", resolved_at="2026-07-13T21:45:47Z"
+    )
+
+    query = await system_log_query(_Settings(), target, {"source": "journal"})
+    result = await SystemCollector(_Settings()).collect(target)
+
+    assert (query["polarity"], query["coverage"]) == ("present", "partial")
+    observation = result.artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == ("present", "partial")
+    assert result.status == "partial"
+    assert any("historical journal window" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_live_pod_node_fallback_runs_but_historical_evidence_stays_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_node_from_target_pod(*_args, **_kwargs):
+        return "gpu-node-live", "trainer-1"
+
+    async def fake_get_json(*, params, **_kwargs):
+        source = params["source"]
+        data = {"lines": ["NVRM: Xid 79"] if source == "journal" else []}
+        if source == "journal":
+            data.update({"source": source, "since": params["since"], "until": params["until"]})
+        return JsonResponse(url="http://node/logs", status_code=200, data=data)
+
+    monkeypatch.setattr(system_mod, "_node_from_target_pod", fake_node_from_target_pod)
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(node="",),
+        pod="trainer-0",
+        fired_at="2026-07-13T21:43:47Z",
+        resolved_at="2026-07-13T21:45:47Z",
+    )
+
+    result = await SystemCollector(_Settings()).collect(target)
+
+    assert result.details["node"] == "gpu-node-live"
+    assert result.details["resolved_pod"] == "trainer-1"
+    assert result.details["node_origin"] == "live_pod"
+    observation = result.artifacts[0].result["observation"]
+    assert observation["observed_entity"] == {"kind": "node", "name": "gpu-node-live"}
+    assert (observation["polarity"], observation["coverage"]) == ("present", "partial")
+
+
+@pytest.mark.asyncio
+async def test_pipeline_plan_node_provenance_stays_contextual_for_historical_logs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_get_json(*, params, **_kwargs):
+        source = params["source"]
+        data = {"lines": ["NVRM: Xid 79"] if source == "journal" else []}
+        if source == "journal":
+            data.update({"source": source, "since": params["since"], "until": params["until"]})
+        return JsonResponse(url="http://node/logs", status_code=200, data=data)
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+    alert_target = replace(
+        _target(node=""),
+        pod="trainer-0",
+        fired_at="2026-07-13T21:43:47Z",
+        resolved_at="2026-07-13T21:45:47Z",
+    )
+    plan = InvestigationPlan(node="gpu-node-live", pod="trainer-1")
+    scoped_target = _scope_target(alert_target, plan)
+
+    assert (scoped_target.node, scoped_target.node_source) == ("gpu-node-live", "plan")
+    result = await SystemCollector(_Settings()).collect(scoped_target, plan)
+
+    observation = result.artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == ("present", "partial")
+    assert result.status == "partial"
+
+
+@pytest.mark.asyncio
+async def test_many_log_matches_do_not_pass_compact_marker_to_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[str] = []
+
+    async def fake_get_json(*, params, **_kwargs):
+        lines = [f"NVRM: Xid {index}" for index in range(9)] if params["source"] == "dmesg" else []
+        return JsonResponse(url="http://node/logs", status_code=200, data={"lines": lines})
+
+    async def fake_insight(_settings, _node, error_lines):
+        seen.extend(error_lines)
+        return "nine matching lines"
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+    monkeypatch.setattr(system_mod, "llm_configured", lambda _settings: True)
+    monkeypatch.setattr(system_mod, "_llm_insight", fake_insight)
+
+    result = await SystemCollector(_Settings()).collect(_target())
+
+    assert len(seen) == 9
+    assert all(isinstance(line, str) for line in seen)
+    assert result.summary == "nine matching lines"
 
 
 @pytest.mark.asyncio

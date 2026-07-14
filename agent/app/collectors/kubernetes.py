@@ -1945,15 +1945,22 @@ def _scope_target(target: AnalysisTarget, plan) -> AnalysisTarget:  # noqa: ANN0
     if plan is None:
         return target
     pod = getattr(plan, "pod", "") or target.pod
-    node = getattr(plan, "node", "") or target.node
+    planned_node = getattr(plan, "node", "") or ""
+    node = planned_node or target.node
+    node_source = (
+        "plan"
+        if planned_node and planned_node != target.node
+        else (target.node_source or ("alert" if target.node else ""))
+    )
     workload = getattr(plan, "workload", "") or target.workload_name
     namespaces = getattr(plan, "namespaces", None) or []
     namespace = namespaces[0] if namespaces else target.namespace
-    if (pod, node, workload, namespace) == (
+    if (pod, node, workload, namespace, node_source) == (
         target.pod,
         target.node,
         target.workload_name,
         target.namespace,
+        target.node_source,
     ):
         return target
     # Keep immutable alert identities and its incident window while applying
@@ -1963,6 +1970,7 @@ def _scope_target(target: AnalysisTarget, plan) -> AnalysisTarget:  # noqa: ANN0
         namespace=namespace,
         workload_name=workload,
         node=node,
+        node_source=node_source,
         pod=pod,
         # A plan-selected different Pod cannot inherit the alert Pod's UID.
         pod_uid=target.pod_uid if pod == target.pod else "",

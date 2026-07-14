@@ -50,6 +50,10 @@ class AnalysisTarget:
     # Immutable identity supplied explicitly by alert metadata. It is not
     # inferred from a generic ``uid`` field or from resource text.
     pod_uid: str = ""
+    # Provenance for ``node``. The pipeline can enrich it from a live Pod; old
+    # node logs from that inferred location are useful context, not proof about
+    # a historical alert unless Alertmanager named the node itself.
+    node_source: str = ""
 
 
 _INCIDENT_PRELUDE = timedelta(minutes=5)
@@ -475,6 +479,11 @@ def resolve_target(
         alert_name=value_from(labels, annotations, "alertname", "alert_name") or "RunAIAlert",
         fired_at=fired_at,
         resolved_at=resolved_at,
+        node_source=(
+            "alert"
+            if value_from(labels, annotations, "node", "node_name", "kubernetes_node")
+            else ""
+        ),
         # These are explicit alert metadata only.  In particular, do not guess
         # a Service/PVC from a workload or from free-form annotation prose.
         service=target_identifier_from(
