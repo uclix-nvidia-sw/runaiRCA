@@ -1,7 +1,7 @@
 import { ClipboardCheck, Save } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
-import { fetchAnalysisEvaluation, saveAnalysisEvaluation } from '../../api';
+import { fetchAnalysisEvaluation, fetchRootCauseFamilies, saveAnalysisEvaluation } from '../../api';
 import { EvaluationReviewInput, EvaluationView } from '../../types';
 
 const DIMENSIONS = [
@@ -30,6 +30,8 @@ export function EvaluationPanel({
   const [view, setView] = useState<EvaluationView>();
   const [caseType, setCaseType] = useState<EvaluationReviewInput['case_type']>('known');
   const [expectedFamily, setExpectedFamily] = useState('');
+  const [expectedFamilies, setExpectedFamilies] = useState<string[]>([]);
+  const [catalogLoading, setCatalogLoading] = useState(false);
   const [scores, setScores] = useState<Record<string, number>>(EMPTY_SCORES);
   const [outcome, setOutcome] = useState<EvaluationReviewInput['resolution_outcome']>('unknown');
   const [effectiveAction, setEffectiveAction] = useState('');
@@ -39,17 +41,39 @@ export function EvaluationPanel({
 
   useEffect(() => {
     if (!runID || !analysisHash) return;
-    void fetchAnalysisEvaluation(runID).then((next) => {
+    let cancelled = false;
+    setCatalogLoading(true);
+    setError('');
+    void Promise.all([fetchAnalysisEvaluation(runID), fetchRootCauseFamilies()]).then(([next, families]) => {
+      if (cancelled) return;
       setView(next);
+      setExpectedFamilies(families);
       const review = next.my_review;
-      if (!review) return;
+      if (!review) {
+        setCaseType('known');
+        setExpectedFamily('');
+        setScores(EMPTY_SCORES);
+        setOutcome('unknown');
+        setEffectiveAction('');
+        setNotes('');
+        return;
+      }
       setCaseType(review.case_type);
-      setExpectedFamily(review.expected_family || '');
+      const savedFamily = review.expected_family || '';
+      setExpectedFamily(families.includes(savedFamily) ? savedFamily : '');
+      if (savedFamily && !families.includes(savedFamily)) {
+        setError(`Saved expected family "${savedFamily}" is no longer in the configured catalog.`);
+      }
       setScores({ ...EMPTY_SCORES, ...review.scores });
       setOutcome(review.resolution_outcome);
       setEffectiveAction(review.effective_action || '');
       setNotes(review.notes || '');
-    }).catch((err: unknown) => setError(err instanceof Error ? err.message : 'Failed to load evaluation.'));
+    }).catch((err: unknown) => {
+      if (!cancelled) setError(err instanceof Error ? err.message : 'Failed to load evaluation.');
+    }).finally(() => {
+      if (!cancelled) setCatalogLoading(false);
+    });
+    return () => { cancelled = true; };
   }, [runID, analysisHash]);
 
   if (!runID || !analysisHash) return null;
@@ -99,14 +123,23 @@ export function EvaluationPanel({
         <div className="evaluation-basics">
           <label className="evaluation-field">
             <span>Case type</span>
-            <select value={caseType} onChange={(event) => setCaseType(event.target.value as EvaluationReviewInput['case_type'])}>
+            <select value={caseType} onChange={(event) => {
+              const next = event.target.value as EvaluationReviewInput['case_type'];
+              setCaseType(next);
+              if (next === 'novel') setExpectedFamily('');
+            }}>
               <option value="known">Known</option><option value="compositional">Compositional</option><option value="novel">Novel</option><option value="tool_degraded">Tool degraded</option>
             </select>
           </label>
           {caseType !== 'novel' && (
             <label className="evaluation-field">
               <span>Expected family <small>Optional</small></span>
-              <input value={expectedFamily} onChange={(event) => setExpectedFamily(event.target.value)} placeholder="gpu_hardware_error" />
+              <select value={expectedFamily} onChange={(event) => setExpectedFamily(event.target.value)} disabled={catalogLoading}>
+                <option value="">{catalogLoading ? 'Loading families…' : 'Not specified'}</option>
+                {expectedFamilies.map((family) => (
+                  <option key={family} value={family}>{family.split('_').join(' ')}</option>
+                ))}
+              </select>
             </label>
           )}
         </div>

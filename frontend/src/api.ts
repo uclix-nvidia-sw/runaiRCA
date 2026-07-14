@@ -1,4 +1,4 @@
-import { AlertRecord, AnalysisRun, Envelope, EvaluationReview, EvaluationReviewInput, EvaluationView, FeedbackSummary, Incident, IncidentDetail, KPIStats, KnowledgeCandidate, KnowledgePackage, KnowledgeRuntimeSnapshot, LLMSpendStats, PageInfo, ProbeMetricsSnapshot, RecurrenceStats } from './types';
+import { AlertRecord, AnalysisRun, Envelope, EvaluationReview, EvaluationReviewInput, EvaluationView, FeedbackSummary, Incident, IncidentDetail, KPIStats, KnowledgeCandidate, KnowledgePackage, KnowledgeRuntimeSnapshot, LLMSpendStats, PageInfo, ProbeMetricsSnapshot, RecurrenceStats, RootCauseFamilyCatalog } from './types';
 
 const runtimeApiBase = window.__RUNAI_RCA_CONFIG__?.apiBaseUrl;
 const fallbackApiBase = import.meta.env.DEV ? 'http://localhost:8080' : '';
@@ -96,6 +96,10 @@ export async function saveAnalysisEvaluation(runID: string, input: EvaluationRev
     `/api/v1/analysis-runs/${encodeURIComponent(runID)}/evaluation?author=${encodeURIComponent(feedbackActorID())}`,
     { ...input, author: feedbackActorID() },
   )).data;
+}
+
+export async function fetchRootCauseFamilies(): Promise<string[]> {
+  return (await read<Envelope<RootCauseFamilyCatalog>>('/api/v1/knowledge/families')).data.families;
 }
 
 

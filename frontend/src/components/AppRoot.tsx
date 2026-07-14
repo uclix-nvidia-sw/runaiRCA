@@ -45,6 +45,7 @@ import { LearnedKnowledgeDashboard } from './dashboards/LearnedKnowledgeDashboar
 import { FeedbackPanel } from './workspace/FeedbackPanel';
 import { EvaluationPanel } from './workspace/EvaluationPanel';
 import { FloatingChat } from './workspace/FloatingChat';
+import { SimilarIncidentsPanel } from './workspace/SimilarIncidentsPanel';
 import { useRcaChat } from './workspace/chatSession';
 import { exportIncidentDocx } from '../exportDocx';
 import { useDashboardData } from '../hooks/useDashboardData';
@@ -67,8 +68,10 @@ import {
   type RouteState,
   type SynthesisSummary,
 } from '../models/appTypes';
-import { AlertRecord, AnalysisProgressEntry, AnalysisRun, Artifact, Incident, SimilarIncident } from '../types';
+import { AlertRecord, AnalysisProgressEntry, AnalysisRun, Artifact, Incident } from '../types';
 import { buildAnalysisRecords } from '../utils/analytics';
+import { collectorEvidencePresentation, shouldPresentRunArtifacts } from '../utils/analysisPresentation';
+import { artifactForPresentation } from '../utils/artifactPresentation';
 import { alertFiltersForAPI, incidentFiltersForAPI, incidentViewForMainView, matchesAlertFilters, matchesIncidentFilters } from '../utils/filters';
 import {
   FinalDecision,
@@ -398,7 +401,7 @@ function App() {
 
   const liveEvidenceItems = useMemo<EvidenceItem[]>(() => {
     // Evidence artifacts live on the analysis runs now (not per-alert columns).
-    return dashboardAnalysisRuns.flatMap((run) =>
+    return dashboardAnalysisRuns.filter((run) => shouldPresentRunArtifacts(run.status)).flatMap((run) =>
       (run.artifacts ?? [])
         .filter((artifact) => isCollectorAgent(artifact.agent))
         .map((artifact, index) => ({
@@ -832,6 +835,12 @@ function UnifiedWorkspace({
   const analysis = incident?.analysis_detail;
   const summary = incident?.analysis_summary;
   const isAnalyzing = Boolean(detail.data.is_analyzing);
+  const evidencePresentation = collectorEvidencePresentation({
+    isAnalyzing,
+    runStatus: analysisRun?.status,
+    firstCompletedAt: analysisRun?.first_completed_at,
+    artifactCount: artifacts.length,
+  });
   const similarIncidents = incident?.similar_incidents ?? [];
   const feedback = incident?.feedback ?? alert?.feedback;
   const targetType = detail.kind;
@@ -966,7 +975,11 @@ function UnifiedWorkspace({
         )}
 
         {incident && (
-          <SimilarIncidentsPanel items={similarIncidents} recentCount={incident.similar_recent_count ?? 0} />
+          <SimilarIncidentsPanel
+            items={similarIncidents}
+            recentCount={incident.similar_recent_count ?? 0}
+            onOpenIncident={onOpenIncident}
+          />
         )}
 
         <section className="rca-report">
@@ -984,17 +997,24 @@ function UnifiedWorkspace({
 
         <section className="agent-trail">
           <div className="section-title"><Bot size={18} /> Collector Evidence Trail</div>
-          <div className="agent-grid">
-            {AGENT_ORDER.map((agent) => (
-              <AgentEvidence
-                key={agent}
-                agent={agent}
-                status={capabilities[agent] || 'pending'}
-                artifacts={artifacts.filter((artifact) => artifact.agent === agent)}
-                reasons={agentReasons(agent, missingData, warnings)}
-              />
-            ))}
-          </div>
+          {evidencePresentation.hidden ? (
+            <p className="empty">{evidencePresentation.notice}</p>
+          ) : (
+            <>
+              {evidencePresentation.notice && <p className="empty">{evidencePresentation.notice}</p>}
+              <div className="agent-grid">
+                {AGENT_ORDER.map((agent) => (
+                  <AgentEvidence
+                    key={agent}
+                    agent={agent}
+                    status={capabilities[agent] || 'pending'}
+                    artifacts={artifacts.filter((artifact) => artifact.agent === agent)}
+                    reasons={agentReasons(agent, missingData, warnings)}
+                  />
+                ))}
+              </div>
+            </>
+          )}
         </section>
 
         {(missingData.length > 0 || warnings.length > 0 || tokenUsage) && (
@@ -1243,8 +1263,10 @@ const PHASE_LABELS: Record<string, string> = {
   collection: 'Evidence',
   rank: 'Ranking',
   ranking: 'Ranking',
+  investigation: 'Investigation',
   self_check: 'Self-check',
   synthesize: 'Synthesis',
+  harness: 'Validation',
   reflection: 'Synthesis',
 };
 
@@ -1320,50 +1342,6 @@ function DiagnosticGroup({
         </button>
       )}
     </div>
-  );
-}
-
-function SimilarIncidentsPanel({ items, recentCount }: { items: SimilarIncident[]; recentCount: number }) {
-  const visibleItems = useMemo(
-    () =>
-      [...items]
-        .sort((left, right) => {
-          if (right.similarity !== left.similarity) return right.similarity - left.similarity;
-          return right.created_at.localeCompare(left.created_at);
-        })
-        .slice(0, 3),
-    [items],
-  );
-  return (
-    <section className="similar-panel">
-      <div className="section-title">
-        <Search size={18} /> Similar Incidents
-        <span className="similar-recent-badge">Recent 7d {recentCount}</span>
-      </div>
-      {visibleItems.length === 0 ? (
-        <p className="empty">No similar incident memory yet.</p>
-      ) : (
-        <div className="similar-list">
-          {visibleItems.map((item) => (
-            <article className="similar-item" key={item.incident_id}>
-              <div className="similar-head">
-                <strong>{item.title || item.incident_id}</strong>
-                <span>{Math.round(item.similarity * 100)}%</span>
-              </div>
-              <div className="meta-line">
-                <span>{item.incident_id}</span>
-                <Severity value={item.severity} />
-                <Status value={item.status} />
-                <span>{item.positive_feedback} up</span>
-                <span>{item.negative_feedback} down</span>
-                <span>{item.comment_count} comments</span>
-              </div>
-              <p>{item.analysis_summary || 'No prior summary captured.'}</p>
-            </article>
-          ))}
-        </div>
-      )}
-    </section>
   );
 }
 
@@ -1443,8 +1421,9 @@ function AgentEvidence({
 
 function ArtifactResult({ artifact }: { artifact: Artifact }) {
   const [open, setOpen] = useState(false);
-  const queryItems = queryDisplayItems(artifact.result);
-  const resultText = artifact.result !== undefined ? formatArtifactValue(compactArtifactValue(artifact.result)) : '';
+  const presented = artifactForPresentation(artifact);
+  const queryItems = queryDisplayItems(presented.result);
+  const resultText = presented.result !== undefined ? formatArtifactValue(compactArtifactValue(presented.result)) : '';
   const evidence = evidenceMetadata(artifact.result);
   return (
     <div className="artifact">
@@ -1461,7 +1440,7 @@ function ArtifactResult({ artifact }: { artifact: Artifact }) {
               bold by the backend, so it also survives Word export / raw JSON — render
               it as markdown instead of overlaying a frontend-only red highlight. */}
           <div className="artifact-summary">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{artifact.summary ?? ''}</ReactMarkdown>
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{presented.summary ?? ''}</ReactMarkdown>
           </div>
           <EvidenceInterpretation evidence={evidence} />
           {queryItems.length > 0 ? (
@@ -1469,7 +1448,7 @@ function ArtifactResult({ artifact }: { artifact: Artifact }) {
           ) : (
             <>
               {artifact.query && <CopyableBlock title="Query" value={artifact.query} kind="code" />}
-              {artifact.result !== undefined && !isEmptyResult(artifact.result) && (
+              {presented.result !== undefined && !isEmptyResult(presented.result) && (
                 <CopyableBlock
                   title="Result summary"
                   value={resultText}
