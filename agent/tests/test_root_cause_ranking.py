@@ -3,7 +3,9 @@ from __future__ import annotations
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.services.root_cause_ranking import (
     RankedCause,
+    _confidence,
     _result_text,
+    _Score,
     merge_open_world_candidates,
     novel_family_slug,
     rank_root_cause_candidates,
@@ -75,6 +77,25 @@ def test_open_world_candidate_requires_known_independence_provenance() -> None:
 
     assert unprovenanced == known
     assert any(candidate.novelty == "open_world" for candidate in verified)
+
+
+def test_catalog_high_confidence_collapses_change_and_kubernetes_source_group() -> None:
+    """Two readers of the Kubernetes API are not independent corroboration."""
+    score = _Score(
+        points=6.0,
+        agents={"kubernetes", "change"},
+    )
+
+    assert _confidence("workload_startup_error", score, {}) == "medium"
+
+
+def test_catalog_high_confidence_does_not_count_graph_context_as_observer() -> None:
+    score = _Score(
+        points=6.0,
+        agents={"kubernetes", "typedb"},
+    )
+
+    assert _confidence("workload_startup_error", score, {}) == "medium"
 
 
 def test_r1_node_pressure_wins_with_blast_radius() -> None:

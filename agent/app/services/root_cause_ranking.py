@@ -18,8 +18,8 @@ detail parsing (or an LLM judge) only if the eval hit-rate stalls.
 
 from __future__ import annotations
 
-import os
 import hashlib
+import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -27,6 +27,7 @@ from typing import Any
 
 from app.collectors.base import AnalysisTarget, CollectorResult
 from app.knowledge import _keyword_hits, load_family_catalog
+from app.services.evidence_blackboard import source_independence_group
 
 _FAMILY_CATALOG = load_family_catalog(os.getenv("FAMILIES_FILE", "knowledge/families.yaml"))
 FAMILIES = _FAMILY_CATALOG.families
@@ -551,7 +552,26 @@ _COMPONENT_IDENTITY_WEIGHT = 4.0
 # Synthetic agents are topology/KG facts injected by the ranker itself; they do
 # not independently OBSERVE a failure, so they must not count as one of the
 # corroborating evidence sources required for HIGH confidence.
-_SYNTHETIC_AGENTS = {"topology", "knowledge-graph"}
+# typedb is the concrete graph adapter name used by older/result-level
+# integrations; it carries topology/blast context, not a live fault observation.
+_SYNTHETIC_AGENTS = {"topology", "knowledge-graph", "typedb"}
+
+
+def _independent_observer_groups(agents: set[str]) -> set[str]:
+    """Collapse collectors that read the same telemetry plane.
+
+    The deterministic catalog ranker predates the fact-level blackboard and
+    historically used collector names as corroboration units. That let the
+    change collector and the Kubernetes collector satisfy a two-observer HIGH
+    gate even though both read the Kubernetes API. Keep agent names in
+    operator-facing candidate output, but use the fact-level source-group
+    contract for confidence and corroboration.
+    """
+    return {
+        source_independence_group(agent)
+        for agent in agents
+        if agent not in _SYNTHETIC_AGENTS
+    }
 
 
 def _apply_component_identity(
@@ -582,7 +602,7 @@ def _apply_component_identity(
         (
             other.points
             for fam, other in scores.items()
-            if fam != family and len(other.agents - _SYNTHETIC_AGENTS) < 2
+            if fam != family and len(_independent_observer_groups(other.agents)) < 2
         ),
         default=0.0,
     )
@@ -626,7 +646,7 @@ def _apply_lifecycle_gate(scores: dict[str, _Score], lifecycle: dict[str, Any] |
         (
             other.points
             for f, other in scores.items()
-            if f != fam and len(other.agents - _SYNTHETIC_AGENTS) < 2
+            if f != fam and len(_independent_observer_groups(other.agents)) < 2
         ),
         default=0.0,
     )
@@ -649,10 +669,11 @@ def _apply_lifecycle_gate(scores: dict[str, _Score], lifecycle: dict[str, Any] |
 
 
 def _confidence(fam: str, s: _Score, status_by_agent: dict[str, str]) -> str:
-    # HIGH requires >=2 agents that genuinely OBSERVED the failure; the synthetic
-    # topology/KG signals can floor a score but cannot, alone, unlock HIGH.
-    real_agents = len(s.agents - _SYNTHETIC_AGENTS)
-    if s.force_high or (s.points >= _HIGH and real_agents >= 2):
+    # HIGH requires >=2 independent telemetry groups that genuinely observed
+    # the failure. Synthetic topology/KG context can floor a score but cannot
+    # unlock HIGH, and two collectors reading the Kubernetes API count once.
+    real_source_groups = len(_independent_observer_groups(s.agents))
+    if s.force_high or (s.points >= _HIGH and real_source_groups >= 2):
         level = 2  # high
     elif s.points >= _MED or s.agents:
         level = 1  # medium
