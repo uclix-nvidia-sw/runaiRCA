@@ -2114,6 +2114,26 @@ async def _synthesize_korean(
     from app.collectors.http_json import compact
 
     observed_text = _observed_text(results, request)
+    # The deterministic report receives the response-local eligibility set.  Do
+    # the equivalent check before exposing graph fixes to the free-form Korean
+    # synthesizer: graph edges and approved historical resolutions are useful
+    # guidance, but cannot substantiate a remediation for this incident when
+    # all current observations are context-only, unavailable, or out of scope.
+    graph_remediation_context = (
+        graph_fixes.as_dict()
+        if _synthesis_has_scoped_support(evidence_eligibility)
+        else {
+            "family_fixes": [],
+            "xid_fixes": {},
+            "model_xids": {},
+            "root_xids": {},
+            "verified_actions": [],
+            "warnings": [
+                "Current incident has no target/window-scoped supporting observation; "
+                "graph remediation is withheld until it is verified."
+            ],
+        }
+    )
     similar_incidents = (
         [
             {
@@ -2167,7 +2187,7 @@ async def _synthesize_korean(
             "historical_case_cards": kg_context.get("case_cards") or [],
             "knowledge": kg_context.get("knowledge"),
         },
-        "graph_remediation": graph_fixes.as_dict(),
+        "graph_remediation": graph_remediation_context,
         "matched_alert": plan.matched_alert,
         "similar_incidents": similar_incidents,
         # Bulky — kept LAST so the char cap trims raw collector result tails
@@ -2199,6 +2219,9 @@ async def _synthesize_korean(
         "쓸 때 해당 ID를 [E01] 형식으로 인용하고, historical prior는 현재 증거로 쓰지 마세요.\n"
         "- historical_case_cards는 승인된 과거 사례의 prior이며 현재 evidence가 아닙니다. "
         "유사 사례가 있어도 현재 관측으로 별도 확인될 때만 원인으로 사용하세요.\n"
+        "- graph_remediation은 현재 support observation이 있을 때에만 조치 후보입니다. "
+        "warnings에 현재 범위의 support가 없다고 표시되면 graph/과거 사례의 조치를 실행하라고 "
+        "권고하지 말고, 먼저 대상·시간 범위에서 확인할 진단 단계만 제시하세요.\n"
         "- 특정 수집기가 아무것도 찾지 못했으면 '증거를 찾기 어렵습니다.'라고 명시하세요.\n"
         "- 증거에 incident_state가 resolved(과거 인시던트 재분석)면, 현재 상태가 정상이라 "
         "라이브 증거가 제한적일 수 있습니다. 증거가 얇으면 억지로 원인을 단정하지 말고 '현재는 "
@@ -2250,6 +2273,21 @@ async def _synthesize_korean(
     if not isinstance(detail, str) or not detail.strip():
         detail = fallback_detail
     return _short_sentence(summary, limit=280), detail.strip()
+
+
+def _synthesis_has_scoped_support(evidence_eligibility: Mapping[str, object] | None) -> bool:
+    """Whether the Korean synthesizer may receive graph remediation actions.
+
+    ``None`` preserves direct/unit callers that do not have a blackboard.  In a
+    pipeline run an empty/non-permitting map is an explicit safety verdict, not
+    a reason to fall back to broad collector text or historical knowledge.
+    """
+    if evidence_eligibility is None:
+        return True
+    return any(
+        callable(getattr(eligibility, "permits", None)) and eligibility.permits("support")
+        for eligibility in evidence_eligibility.values()
+    )
 
 
 async def _complete_synthesis_json(settings: Settings, *, system: str, user: str) -> dict | None:
@@ -2597,7 +2635,14 @@ def _detail_from(
     if supporting:
         lines.append("")
         lines.extend(f"- **{agent}**: {finding}" for agent, finding in supporting)
-    causal = _causal_chain_line(graph_fixes, language)
+    # A graph/XID chain is useful remediation knowledge, but it is not a
+    # current incident observation by itself.  Keep it out of the headline
+    # causal narrative when every collected artifact was demoted to context or
+    # rejected for a different target/window.  Otherwise "fix root XID first"
+    # can look like a current, grounded instruction despite having no eligible
+    # observation in this run.
+    allow_graph_remediation = eligible_support_ids is None or bool(eligible_support_ids)
+    causal = _causal_chain_line(graph_fixes, language) if allow_graph_remediation else ""
     if causal:
         lines.extend(["", causal])
 
@@ -2613,6 +2658,7 @@ def _detail_from(
         request,
         known_issues or [],
         components=components,
+        allow_graph_remediation=allow_graph_remediation,
     )
     if numbered:
         lines.extend(numbered)
@@ -3015,6 +3061,8 @@ def _numbered_actions(
     request: AlertAnalysisRequest,
     known_issues: list[dict] | None = None,
     components: dict[str, dict] | None = None,
+    *,
+    allow_graph_remediation: bool = True,
 ) -> list[str]:
     """One deduped, numbered priority list — documented-alert fixes first, then
     the alert target's own component checks, then recognised known-issue fixes,
@@ -3045,7 +3093,11 @@ def _numbered_actions(
             actions = [str(a) for a in issue.get("actions", [])]
             specific_actions += len(actions)
             ordered.extend(actions)
-    if graph_fixes is not None:
+    # Knowledge-graph/XID fixes are recommendations, not evidence.  The
+    # production report passes False when its artifact eligibility gate found
+    # no target/window-scoped support, preventing an unavailable or unrelated
+    # observation from turning a historical graph edge into an instruction.
+    if graph_fixes is not None and allow_graph_remediation:
         specific_actions += len(graph_fixes.family_fixes)
         ordered.extend(graph_fixes.family_fixes)
         root_codes = {r for roots in graph_fixes.root_xids.values() for r in roots}

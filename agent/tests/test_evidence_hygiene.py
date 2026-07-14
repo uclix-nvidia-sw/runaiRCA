@@ -13,6 +13,7 @@ from app.collectors.postgres import _postgres_result
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services import pipeline
 from app.services.evidence_blackboard import Blackboard
+from app.services.kg_enrichment import GraphRemediation
 from app.services.root_cause_ranking import RankedCause
 from tests.test_orchestrator import make_settings, make_target
 
@@ -299,6 +300,46 @@ def test_contextual_eligibility_blocks_scoped_artifact_from_root_cause() -> None
     appendix = detail.split("### Evidence", 1)[1].split("###", 1)[0]
     assert "OOMKilled occurred on unrelated-pod" not in root_cause
     assert "OOMKilled occurred on unrelated-pod" in appendix
+
+
+def test_context_only_artifact_cannot_emit_graph_remediation_actions() -> None:
+    """Historical graph fixes need a current scoped observation before actioning."""
+    result = CollectorResult(agent="system", status="ok", summary="live node snapshot")
+    result.artifacts.append(
+        artifact(
+            agent="system",
+            source="system",
+            type="node_logs",
+            status="ok",
+            confidence="medium",
+            summary="old Xid 79 appears in an unbounded current log snapshot",
+            result={
+                "lines": ["NVRM: Xid 79"],
+                "observation": {"polarity": "unknown", "coverage": "partial"},
+            },
+        )
+    )
+    detail = pipeline._detail_from(
+        AlertAnalysisRequest(alert=Alert(status="firing", labels={"alertname": "GenericAlert"})),
+        [result],
+        [],
+        root_cause_candidates=[
+            RankedCause(family="gpu_hardware_error", confidence="medium", score=7.0)
+        ],
+        graph_fixes=GraphRemediation(
+            family_fixes=["Reset the implicated GPU."],
+            xid_fixes={79: ["Replace the GPU after hardware validation."]},
+            root_xids={79: [48]},
+        ),
+        # The blackboard rejected every artifact as context/out-of-scope.
+        eligible_support_ids=set(),
+    )
+
+    root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
+    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## 4.", 1)[0]
+    assert "Fix the root XID first" not in root_cause
+    assert "Reset the implicated GPU" not in actions
+    assert "Replace the GPU" not in actions
 
 
 def test_synthesis_input_separates_support_contradiction_and_context() -> None:

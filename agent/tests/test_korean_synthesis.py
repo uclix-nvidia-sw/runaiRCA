@@ -462,6 +462,48 @@ async def test_korean_synthesis_skips_unavailable_artifacts(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
+async def test_korean_synthesis_withholds_graph_actions_without_scoped_support(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko")
+    captured: list[str] = []
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        captured.append(user)
+        return {"summary": "요약", "detail": "본문"}
+
+    class RejectedEligibility:
+        def permits(self, _role: str) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "GenericAlert"})
+        ),
+        results=[CollectorResult(agent="system", status="ok", summary="current snapshot only")],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="gpu_hardware_error", confidence="medium", score=7.0)
+        ],
+        kg_context={},
+        graph_fixes=GraphRemediation(
+            family_fixes=["Reset the implicated GPU."],
+            xid_fixes={79: ["Replace the GPU after hardware validation."]},
+        ),
+        fallback_detail="fallback",
+        evidence_eligibility={"E01": RejectedEligibility()},
+    )
+
+    payload = json.loads(captured[0].removeprefix("증거(JSON):\n"))
+    graph = payload["graph_remediation"]
+    assert graph["family_fixes"] == []
+    assert graph["xid_fixes"] == {}
+    assert "no target/window-scoped supporting observation" in graph["warnings"][0]
+
+
+@pytest.mark.asyncio
 async def test_korean_synthesis_sanitizes_unavailable_collector_summary(monkeypatch) -> None:
     settings = replace(make_settings(), language="ko")
     captured: list[str] = []
