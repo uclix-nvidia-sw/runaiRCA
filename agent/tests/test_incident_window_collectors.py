@@ -90,7 +90,11 @@ async def test_loki_emits_a_scoped_artifact_for_each_incident_query(monkeypatch)
             status_code=200,
             data={
                 "status": "success",
-                "data": {"result": [{"values": [["1", "failed scheduling trainer"]]}]},
+                "data": {
+                    "result": [
+                        {"values": [["2026-07-10T01:00:00Z", "failed scheduling trainer"]]}
+                    ]
+                },
             },
         )
 
@@ -359,7 +363,24 @@ def test_loki_query_observation_only_refutes_with_a_bounded_incident_window() ->
         {"name": "error_logs", "line_count": 0, "stream_count": 0}, time_range=time_range
     )
     present = loki._loki_query_observation(
-        {"name": "error_logs", "line_count": 2, "stream_count": 1}, time_range=time_range
+        {
+            "name": "error_logs",
+            "line_count": 2,
+            "stream_count": 1,
+            "sample_entries": [
+                {"timestamp": "2026-07-10T01:00:00Z", "line": "incident error"}
+            ],
+        },
+        time_range=time_range,
+    )
+    timestamp_missing = loki._loki_query_observation(
+        {
+            "name": "error_logs",
+            "line_count": 1,
+            "stream_count": 1,
+            "sample_entries": [{"timestamp": "", "line": "unverified error"}],
+        },
+        time_range=time_range,
     )
     out_of_window = loki._loki_query_observation(
         {
@@ -379,6 +400,9 @@ def test_loki_query_observation_only_refutes_with_a_bounded_incident_window() ->
     assert absent["polarity"] == "absent"
     assert absent["coverage"] == "scoped"
     assert present["polarity"] == "present"
+    assert present["log_window_verified"] is True
+    assert (timestamp_missing["polarity"], timestamp_missing["coverage"]) == ("unknown", "partial")
+    assert timestamp_missing["log_window_verified"] is None
     assert (out_of_window["polarity"], out_of_window["coverage"]) == ("unknown", "partial")
     assert out_of_window["log_window_verified"] is False
     assert live_empty["polarity"] == "unknown"

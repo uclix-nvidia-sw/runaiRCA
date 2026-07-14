@@ -520,6 +520,7 @@ def _loki_query_observation(
 ) -> dict[str, object]:
     """Classify a LogQL result without making unbounded empty searches refute RCA."""
     name = str(item.get("name") or "logs")
+    window_verified = _loki_entries_in_window(item.get("sample_entries"), time_range)
     if item.get("error"):
         polarity, coverage = "unavailable", "unknown"
     elif not time_range:
@@ -528,9 +529,10 @@ def _loki_query_observation(
         polarity, coverage = "unknown", "partial"
     elif int(item.get("line_count") or 0) == 0:
         polarity, coverage = "absent", "scoped"
-    elif _loki_entries_in_window(item.get("sample_entries"), time_range) is False:
-        # A proxy/MCP can return current logs despite a range-shaped request.
-        # Known timestamps outside the incident must stay operator context.
+    elif window_verified is not True:
+        # A proxy/MCP can return current logs despite a range-shaped request,
+        # and some MCP responses omit timestamps entirely. Historical support
+        # requires a retained log timestamp inside the incident window.
         polarity, coverage = "unknown", "partial"
     else:
         polarity, coverage = "present", "scoped"
@@ -542,7 +544,7 @@ def _loki_query_observation(
         "line_count": int(item.get("line_count") or 0),
         "stream_count": int(item.get("stream_count") or 0),
         "observation_window": time_range or {},
-        "log_window_verified": _loki_entries_in_window(item.get("sample_entries"), time_range),
+        "log_window_verified": window_verified,
     }
 
 
