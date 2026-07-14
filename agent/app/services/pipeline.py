@@ -2216,6 +2216,7 @@ async def _synthesize_korean(
     observed_text = _observed_text(
         results, request, eligible_support_ids=eligible_support_ids
     )
+    has_scoped_support = _synthesis_has_scoped_support(evidence_eligibility)
     # The deterministic report receives the response-local eligibility set.  Do
     # the equivalent check before exposing graph fixes to the free-form Korean
     # synthesizer: graph edges and approved historical resolutions are useful
@@ -2223,7 +2224,7 @@ async def _synthesize_korean(
     # all current observations are context-only, unavailable, or out of scope.
     graph_remediation_context = (
         graph_fixes.as_dict()
-        if _synthesis_has_scoped_support(evidence_eligibility)
+        if has_scoped_support
         else {
             "family_fixes": [],
             "xid_fixes": {},
@@ -2246,7 +2247,7 @@ async def _synthesize_korean(
             for i in request.similar_incidents
             if (i.similarity or 0) >= _SIMILARITY_FLOOR
         ]
-        if _similar_incident_relevant(request, observed_text)
+        if has_scoped_support and _similar_incident_relevant(request, observed_text)
         else []
     )
     # Key ORDER matters: the final JSON is hard-capped at _SYNTHESIS_USER_CHARS,
@@ -2277,21 +2278,30 @@ async def _synthesize_korean(
         **({"timeline": (timeline or [])[-40:]} if timeline else {}),
         **(
             {"troubleshooting_path": troubleshooting_path}
-            if troubleshooting_path and troubleshooting_path.get("path")
+            if has_scoped_support and troubleshooting_path and troubleshooting_path.get("path")
             else {}
         ),
-        "plan": plan.as_dict(),
+        "plan": _synthesis_plan_context(plan, allow_remediation=has_scoped_support),
         "ranked_root_cause_candidates": [c.as_dict() for c in root_cause_candidates],
         **({"reasoning_trace_v2": reasoning_trace} if isinstance(reasoning_trace, dict) else {}),
         "knowledge_graph": {
             "blast_radius_workloads": kg_context.get("blast_radius_workloads"),
-            "prior_incidents": kg_context.get("prior_incidents"),
-            "historical_case_cards": kg_context.get("case_cards") or [],
-            "knowledge": kg_context.get("knowledge"),
+            "prior_incidents": kg_context.get("prior_incidents") if has_scoped_support else [],
+            "historical_case_cards": (kg_context.get("case_cards") or [])
+            if has_scoped_support
+            else [],
+            "knowledge": kg_context.get("knowledge") if has_scoped_support else {},
         },
         "graph_remediation": graph_remediation_context,
-        "matched_alert": plan.matched_alert,
+        "matched_alert": plan.matched_alert if has_scoped_support else None,
         "similar_incidents": similar_incidents,
+        "remediation_evidence": {
+            "scoped_support": has_scoped_support,
+            "rule": (
+                "Cause-specific remediation is allowed only with a current "
+                "target/window-scoped supporting observation."
+            ),
+        },
         # Bulky — kept LAST so the char cap trims raw collector result tails
         # rather than the reasoning inputs above.
         "collector_findings": _synthesis_collector_findings(
@@ -2324,6 +2334,9 @@ async def _synthesize_korean(
         "- graph_remediation은 현재 support observation이 있을 때에만 조치 후보입니다. "
         "warnings에 현재 범위의 support가 없다고 표시되면 graph/과거 사례의 조치를 실행하라고 "
         "권고하지 말고, 먼저 대상·시간 범위에서 확인할 진단 단계만 제시하세요.\n"
+        "- remediation_evidence.scoped_support=false이면 내장 alert, component, knowledge base, "
+        "과거 사례, troubleshooting_path의 원인별 조치를 권고하지 마세요. 현재 범위에서 확인할 "
+        "진단 단계와 누락된 증거만 제시하세요.\n"
         "- 특정 수집기가 아무것도 찾지 못했으면 '증거를 찾기 어렵습니다.'라고 명시하세요.\n"
         "- 증거에 incident_state가 resolved(과거 인시던트 재분석)면, 현재 상태가 정상이라 "
         "라이브 증거가 제한적일 수 있습니다. 증거가 얇으면 억지로 원인을 단정하지 말고 '현재는 "
@@ -2390,6 +2403,28 @@ def _synthesis_has_scoped_support(evidence_eligibility: Mapping[str, object] | N
         callable(getattr(eligibility, "permits", None)) and eligibility.permits("support")
         for eligibility in evidence_eligibility.values()
     )
+
+
+def _synthesis_plan_context(
+    plan: InvestigationPlan, *, allow_remediation: bool
+) -> dict[str, object]:
+    """Project the plan for free-form synthesis without leaking dormant fixes.
+
+    A plan can carry catalog actions and historical case cards so collectors know
+    what to verify.  When every current artifact is context-only or out of
+    scope, those fields must not become an indirect recommendation channel for
+    the synthesis model.
+    """
+    context = plan.as_dict()
+    if allow_remediation:
+        return context
+    matched = context.get("matched_alert")
+    if isinstance(matched, dict):
+        context["matched_alert"] = {
+            key: value for key, value in matched.items() if key != "actions"
+        }
+    context["case_cards"] = []
+    return context
 
 
 async def _complete_synthesis_json(settings: Settings, *, system: str, user: str) -> dict | None:
@@ -2743,8 +2778,12 @@ def _detail_from(
     # rejected for a different target/window.  Otherwise "fix root XID first"
     # can look like a current, grounded instruction despite having no eligible
     # observation in this run.
-    allow_graph_remediation = eligible_support_ids is None or bool(eligible_support_ids)
-    causal = _causal_chain_line(graph_fixes, language) if allow_graph_remediation else ""
+    # Curated alert/component/playbook/graph actions are *guidance*, not a
+    # current-incident observation.  They all need the same target/window gate:
+    # otherwise an all-context run could withhold graph fixes yet still tell an
+    # operator to execute a documented-alert fix or repeat a historical remedy.
+    allow_cause_specific_actions = eligible_support_ids is None or bool(eligible_support_ids)
+    causal = _causal_chain_line(graph_fixes, language) if allow_cause_specific_actions else ""
     if causal:
         lines.extend(["", causal])
 
@@ -2760,7 +2799,7 @@ def _detail_from(
         request,
         known_issues or [],
         components=components,
-        allow_graph_remediation=allow_graph_remediation,
+        allow_cause_specific_actions=allow_cause_specific_actions,
     )
     if numbered:
         lines.extend(numbered)
@@ -2786,6 +2825,7 @@ def _detail_from(
             observed_text,
             _alert_text(request),
             masker,
+            allow_remediation=allow_cause_specific_actions,
         )
     )
     operator_prompt = annotations.get("operator_prompt")
@@ -2817,6 +2857,7 @@ def _detail_from(
             components,
             masker,
             component=getattr(plan, "component", "") if plan is not None else "",
+            allow_remediation=allow_cause_specific_actions,
         )
     )
     lines.extend(_similar_incident_lines(request))
@@ -3165,30 +3206,37 @@ def _numbered_actions(
     components: dict[str, dict] | None = None,
     *,
     allow_graph_remediation: bool = True,
+    allow_cause_specific_actions: bool | None = None,
 ) -> list[str]:
     """One deduped, numbered priority list — documented-alert fixes first, then
     the alert target's own component checks, then recognised known-issue fixes,
     graph-derived and curated family fixes, then infra-restore steps."""
+    # ``allow_graph_remediation`` predates the broader action gate and remains
+    # for callers outside the pipeline. In a real report, every remedy that
+    # depends on a candidate (catalog, component, prior, graph, playbook) must
+    # obey the same evidence boundary as graph remediation.
+    if allow_cause_specific_actions is None:
+        allow_cause_specific_actions = allow_graph_remediation
     ordered: list[str] = []
     specific_actions = 0
     fuzzy = _alert_text(request)
     top_family = candidates[0].family if candidates else ""
     filter_to_top = _top_family_settled(candidates)
-    if plan is not None and plan.matched_alert:
+    if allow_cause_specific_actions and plan is not None and plan.matched_alert:
         alert_family = str(plan.matched_alert.get("family") or "")
         if (not top_family or alert_family == top_family) and top_family != "insufficient_evidence":
             ordered.extend(str(a) for a in plan.matched_alert.get("actions", []))
     # Component identity: the alert target IS this platform component, so its
     # own checks + dependency chain (e.g. runai-container-toolkit → the NVIDIA
     # GPU Operator stack) come before any keyword-matched guidance.
-    if plan is not None and getattr(plan, "component", ""):
+    if allow_cause_specific_actions and plan is not None and getattr(plan, "component", ""):
         component_actions = component_action_lines(components or {}, plan.component)
         specific_actions += len(component_actions)
         ordered.extend(component_actions)
     # Known operator cases recognised by their signature keywords in the evidence
     # (ranking-independent): version-regression / observability / expected-behavior
     # fixes surface even when the coarse family ranking points elsewhere.
-    if top_family != "insufficient_evidence":
+    if allow_cause_specific_actions and top_family != "insufficient_evidence":
         for issue in match_runai_known_issues(known_issues or [], observed_text, fuzzy_query=fuzzy):
             if filter_to_top and str(issue.get("family") or "") != top_family:
                 continue
@@ -3199,7 +3247,7 @@ def _numbered_actions(
     # production report passes False when its artifact eligibility gate found
     # no target/window-scoped support, preventing an unavailable or unrelated
     # observation from turning a historical graph edge into an instruction.
-    if graph_fixes is not None and allow_graph_remediation:
+    if graph_fixes is not None and allow_cause_specific_actions:
         specific_actions += len(graph_fixes.family_fixes)
         ordered.extend(graph_fixes.family_fixes)
         root_codes = {r for roots in graph_fixes.root_xids.values() for r in roots}
@@ -3212,7 +3260,7 @@ def _numbered_actions(
     # Curated failure-mode fixes for the settled top family only. The promotion
     # step already used cross-family signatures to choose that family; repeating
     # every side-match here pollutes actions with stale/context text.
-    if top_family != "insufficient_evidence":
+    if allow_cause_specific_actions and top_family != "insufficient_evidence":
         for family, symptom in match_failure_mode_symptoms(
             failure_modes, observed_text, top_family, fuzzy_query=fuzzy
         ):
@@ -3227,7 +3275,8 @@ def _numbered_actions(
             missing,
             request,
             include_similar=(
-                specific_actions == 0 or _similar_incident_relevant(request, fuzzy)
+                allow_cause_specific_actions
+                and (specific_actions == 0 or _similar_incident_relevant(request, fuzzy))
             ),
         )
     )
@@ -3549,6 +3598,8 @@ def _knowledge_base_lines(
     observed_text: str = "",
     fuzzy_query: str = "",
     masker: Masker | None = None,
+    *,
+    allow_remediation: bool = True,
 ) -> list[str]:
     if not kg_context or not kg_context.get("enabled"):
         return []
@@ -3579,11 +3630,17 @@ def _knowledge_base_lines(
                 limit=320,
             )
             body.append(f"  - {incident_id}: {summary}")
-    body.extend(
-        _kb_remediation_lines(
-            kg_context, candidates, observed_text, fuzzy_query, active_masker
+    if allow_remediation:
+        body.extend(
+            _kb_remediation_lines(
+                kg_context, candidates, observed_text, fuzzy_query, active_masker
+            )
         )
-    )
+    elif kg_context.get("knowledge"):
+        body.append(
+            "- Knowledge-base remediation is withheld until a current "
+            "target/window-scoped observation is available."
+        )
     if not body:
         body.append("- No related knowledge-graph facts were found for this entity yet.")
     return ["", "### Knowledge Base (Ontology)", "", *body]
@@ -3636,6 +3693,8 @@ def _playbook_lines(
     components: dict[str, dict] | None = None,
     masker: Masker | None = None,
     component: str = "",
+    *,
+    allow_remediation: bool = True,
 ) -> list[str]:
     """Root-cause-relevant remediation, most specific first.
 
@@ -3645,6 +3704,11 @@ def _playbook_lines(
     already been used to pick that top family; unrelated side text should not
     become playbook guidance.
     """
+    if not allow_remediation:
+        return [
+            "- Specific playbook remediation is withheld until a current "
+            "target/window-scoped observation is available."
+        ]
     lines: list[str] = []
     active_masker = masker or build_masker(())
     top_family = candidates[0].family if candidates else ""

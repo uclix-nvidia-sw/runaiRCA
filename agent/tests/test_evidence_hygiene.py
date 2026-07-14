@@ -10,7 +10,8 @@ import pytest
 from app.collectors.base import NO_EVIDENCE, CollectorResult, artifact
 from app.collectors.kubernetes import best_matching_pod, pod_name_stem
 from app.collectors.postgres import _postgres_result
-from app.schemas import Alert, AlertAnalysisRequest
+from app.plan import InvestigationPlan
+from app.schemas import Alert, AlertAnalysisRequest, SimilarIncidentContext
 from app.services import pipeline
 from app.services.evidence_blackboard import Blackboard
 from app.services.kg_enrichment import GraphRemediation
@@ -340,6 +341,69 @@ def test_context_only_artifact_cannot_emit_graph_remediation_actions() -> None:
     assert "Fix the root XID first" not in root_cause
     assert "Reset the implicated GPU" not in actions
     assert "Replace the GPU" not in actions
+
+
+def test_context_only_artifacts_cannot_emit_catalog_or_historical_actions() -> None:
+    """Every cause-specific action path needs current scoped support, not just graph fixes."""
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "NodeDiskPressure"},
+            annotations={"summary": "DiskPressure was named by a stale dashboard card"},
+        ),
+        similar_incidents=[
+            SimilarIncidentContext(
+                incident_id="old-pressure",
+                similarity=0.99,
+                analysis_summary="HISTORICAL-REMEDY drain the old node",
+            )
+        ],
+    )
+    plan = InvestigationPlan(
+        matched_alert={
+            "family": "node_kubelet_pressure",
+            "actions": ["CATALOG-REMEDY cordon the node"],
+        },
+        component="component-a",
+    )
+    modes = {
+        "node_kubelet_pressure": [
+            {
+                "symptom": "Node Disk Pressure",
+                "keywords": ["diskpressure"],
+                "actions": ["PLAYBOOK-REMEDY inspect and drain the node"],
+            }
+        ]
+    }
+    detail = pipeline._detail_from(
+        request,
+        [CollectorResult(agent="kubernetes", status="ok", summary="current snapshot")],
+        [],
+        failure_modes=modes,
+        root_cause_candidates=[
+            RankedCause(family="node_kubelet_pressure", confidence="medium", score=7.0)
+        ],
+        kg_context={"enabled": True, "available": True, "knowledge": modes},
+        plan=plan,
+        graph_fixes=GraphRemediation(family_fixes=["GRAPH-REMEDY reset the node"]),
+        components={"component-a": {"checks": ["COMPONENT-REMEDY restart it"]}},
+        # A typed artifact existed but was another target/window, so this is an
+        # explicit production-style no-support verdict rather than a legacy call.
+        eligible_support_ids=set(),
+    )
+
+    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## 4.", 1)[0]
+    assert "Not enough evidence for concrete actions" in actions
+    for forbidden in (
+        "CATALOG-REMEDY",
+        "COMPONENT-REMEDY",
+        "PLAYBOOK-REMEDY",
+        "GRAPH-REMEDY",
+        "HISTORICAL-REMEDY",
+    ):
+        assert forbidden not in actions
+    assert "Knowledge-base remediation is withheld" in detail
+    assert "Specific playbook remediation is withheld" in detail
 
 
 def test_synthesis_input_separates_support_contradiction_and_context() -> None:

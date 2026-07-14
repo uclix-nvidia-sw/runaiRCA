@@ -504,6 +504,76 @@ async def test_korean_synthesis_withholds_graph_actions_without_scoped_support(m
 
 
 @pytest.mark.asyncio
+async def test_korean_synthesis_withholds_all_remediation_context_without_scoped_support(
+    monkeypatch,
+) -> None:
+    """Catalog/prior/playbook inputs must not bypass the graph-only gate."""
+    settings = replace(make_settings(), language="ko")
+    captured: list[str] = []
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        captured.append(user)
+        return {"summary": "요약", "detail": "본문"}
+
+    class RejectedEligibility:
+        def permits(self, _role: str) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "GenericAlert"}),
+            similar_incidents=[
+                SimilarIncidentContext(
+                    incident_id="old",
+                    similarity=0.99,
+                    analysis_summary="UNSCOPED-PAST-REMEDY",
+                )
+            ],
+        ),
+        results=[CollectorResult(agent="system", status="ok", summary="context only")],
+        plan=InvestigationPlan(
+            matched_alert={"actions": ["UNSCOPED-CATALOG-REMEDY"]},
+            case_cards=[{"action": "UNSCOPED-CASE-CARD"}],
+        ),
+        root_cause_candidates=[
+            RankedCause(family="gpu_hardware_error", confidence="medium", score=7.0)
+        ],
+        kg_context={
+            "knowledge": {"gpu_hardware_error": [{"actions": ["UNSCOPED-KB-REMEDY"]}]},
+            "prior_incidents": [{"analysis_summary": "UNSCOPED-PRIOR-REMEDY"}],
+            "case_cards": [{"action": "UNSCOPED-KG-CASE"}],
+        },
+        graph_fixes=GraphRemediation(family_fixes=["UNSCOPED-GRAPH-REMEDY"]),
+        fallback_detail="fallback",
+        troubleshooting_path={"path": ["UNSCOPED-PATH-REMEDY"]},
+        evidence_eligibility={"E01": RejectedEligibility()},
+    )
+
+    payload = json.loads(captured[0].removeprefix("증거(JSON):\n"))
+    assert payload["remediation_evidence"]["scoped_support"] is False
+    assert payload["matched_alert"] is None
+    assert payload["similar_incidents"] == []
+    assert "troubleshooting_path" not in payload
+    assert payload["knowledge_graph"]["knowledge"] == {}
+    assert payload["plan"]["case_cards"] == []
+    for forbidden in (
+        "UNSCOPED-CATALOG-REMEDY",
+        "UNSCOPED-CASE-CARD",
+        "UNSCOPED-KB-REMEDY",
+        "UNSCOPED-PRIOR-REMEDY",
+        "UNSCOPED-KG-CASE",
+        "UNSCOPED-GRAPH-REMEDY",
+        "UNSCOPED-PAST-REMEDY",
+        "UNSCOPED-PATH-REMEDY",
+    ):
+        assert forbidden not in captured[0]
+
+
+@pytest.mark.asyncio
 async def test_korean_synthesis_sanitizes_unavailable_collector_summary(monkeypatch) -> None:
     settings = replace(make_settings(), language="ko")
     captured: list[str] = []
