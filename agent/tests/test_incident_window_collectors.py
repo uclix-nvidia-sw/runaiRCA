@@ -11,6 +11,7 @@ from app.collectors.kubernetes import (
     _event_matches_target,
     _filter_kubernetes_data,
     _kubernetes_list_complete,
+    _mcp_k8s_response,
     _pod_log_observation,
     _warning_event_observation,
     _warning_event_queries_complete,
@@ -624,6 +625,32 @@ def test_kubernetes_warning_events_exclude_normal_and_non_pod_targets() -> None:
     assert [item["reason"] for item in filtered["items"]] == ["OOMKilled"]
 
 
+def test_kubernetes_pod_events_reject_explicitly_cross_namespace_matches() -> None:
+    target = replace(make_target(), fired_at="2026-07-10T01:00:00Z", namespace="team-a")
+    data = {
+        "items": [
+            {
+                "metadata": {"namespace": "team-b"},
+                "type": "Warning",
+                "reason": "OOMKilled",
+                "eventTime": "2026-07-10T01:02:00Z",
+                "involvedObject": {"kind": "Pod", "name": "trainer-0", "namespace": "team-b"},
+            },
+            {
+                "metadata": {"namespace": "team-a"},
+                "type": "Warning",
+                "reason": "OOMKilled",
+                "eventTime": "2026-07-10T01:02:00Z",
+                "involvedObject": {"kind": "Pod", "name": "trainer-0", "namespace": "team-a"},
+            },
+        ]
+    }
+
+    filtered = _filter_kubernetes_data("pod_events", data, target)
+
+    assert [item["object"] for item in filtered["items"]] == ["trainer-0"]
+
+
 def test_namespace_events_require_the_alert_resource_identity() -> None:
     target = replace(
         make_target(), pod="", workload_name="trainer", fired_at="2026-07-10T01:00:00Z"
@@ -709,6 +736,35 @@ def test_kubernetes_warning_event_absence_requires_all_event_queries_to_succeed(
     assert paginated is False
     assert _kubernetes_list_complete({"items": [], "metadata": {"continue": "next"}}) is False
     assert _kubernetes_list_complete({"items": [], "metadata": {}}) is True
+
+    target = replace(make_target(), fired_at="2026-07-10T01:00:00Z")
+    assert _mcp_k8s_response("pod_events", "events_list", [], target)["list_complete"] is False
+    assert _mcp_k8s_response("pod_events", "events_list", {"items": []}, target)["list_complete"] is False
+    assert _mcp_k8s_response(
+        "pod_events", "events_list", {"items": [], "metadata": {}}, target
+    )["list_complete"] is True
+
+
+def test_kubernetes_zero_event_time_uses_legacy_timestamp_inside_window() -> None:
+    target = replace(make_target(), fired_at="2026-07-10T01:00:00Z")
+    filtered = _filter_kubernetes_data(
+        "pod_events",
+        {
+            "items": [
+                {
+                    "type": "Warning",
+                    "reason": "OOMKilled",
+                    "eventTime": "0001-01-01T00:00:00Z",
+                    "lastTimestamp": "2026-07-10T01:02:00Z",
+                    "involvedObject": {"kind": "Pod", "name": "trainer-0"},
+                }
+            ]
+        },
+        target,
+    )
+
+    assert [item["reason"] for item in filtered["items"]] == ["OOMKilled"]
+    assert filtered["items"][0]["lastTimestamp"] == "2026-07-10T01:02:00Z"
 
 
 class _HistoryConnection:

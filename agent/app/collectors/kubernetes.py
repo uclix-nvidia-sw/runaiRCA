@@ -557,6 +557,7 @@ async def _describe_events(
                 if str((item.get("involvedObject") or {}).get("name") or "") == name
                 if str((item.get("involvedObject") or {}).get("kind") or "").casefold()
                 == expected_kind.casefold()
+                if _event_matches_namespace(item, namespace)
             ]
             filtered = _events_in_time_range(matching, time_range)
             return compact(filtered, limit=12) if filtered else []
@@ -593,6 +594,7 @@ async def _describe_events(
         and str((item.get("involvedObject") or {}).get("name") or "") == name
         and str((item.get("involvedObject") or {}).get("kind") or "").casefold()
         == expected_kind.casefold()
+        and _event_matches_namespace(item, namespace)
     ]
     filtered = _events_in_time_range(filtered, time_range)
     return compact(filtered, limit=12) if filtered else []
@@ -1770,7 +1772,10 @@ def _mcp_k8s_response(
         "url": path,
         "status_code": 200,
         "error": None,
-        "list_complete": _kubernetes_list_complete(normalized),
+        # A bare MCP array (or an items-only wrapper) carries no Kubernetes
+        # List metadata.  It may be a server-side capped page, so it must not
+        # turn an empty historical Event result into a scoped absence claim.
+        "list_complete": _mcp_kubernetes_list_complete(normalized),
         "data": compact(_filter_kubernetes_data(name, normalized, target), limit=5),
     }
 
@@ -1805,6 +1810,21 @@ def _kubernetes_list_complete(data: object) -> bool:
         return True
     metadata = payload.get("metadata")
     return not (isinstance(metadata, dict) and bool(metadata.get("continue")))
+
+
+def _mcp_kubernetes_list_complete(data: object) -> bool:
+    """Whether an MCP list proves it returned the final Kubernetes page.
+
+    The direct Kubernetes API always supplies List metadata.  MCP tool
+    adapters, however, can flatten a response to ``items`` or a bare array;
+    without metadata there is no way to distinguish a complete empty list from
+    a truncated first page.
+    """
+    payload = _normalize_k8s_payload(data)
+    if not isinstance(payload, dict):
+        return False
+    metadata = payload.get("metadata")
+    return isinstance(metadata, dict) and not bool(metadata.get("continue"))
 
 
 async def _k8s_mcp_json(
@@ -2803,6 +2823,7 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
                 and isinstance(item.get("involvedObject"), dict)
                 and str((item.get("involvedObject") or {}).get("kind") or "").casefold() == "pod"
                 and str((item.get("involvedObject") or {}).get("name") or "") == target.pod
+                and _event_matches_namespace(item, target.namespace)
             ]
         elif name == "namespace_events" or name.startswith("runai_control_plane_events:"):
             # Namespace event lists are otherwise unrelated workload noise.
@@ -2849,6 +2870,25 @@ def _event_matches_target(event: dict[str, object], target: AnalysisTarget) -> b
     # explicitly names an alert identity — never based on error vocabulary.
     message = str(event.get("message") or "")
     return _event_message_mentions_target(message, target)
+
+
+def _event_matches_namespace(event: dict[str, object], namespace: str) -> bool:
+    """Reject an Event that explicitly belongs to another namespace.
+
+    Kubernetes MCP list tools may ignore their namespace argument.  Event
+    metadata is authoritative and ``involvedObject.namespace`` is an
+    additional consistency check when supplied.  Some API variants omit the
+    latter, so an absent field is not treated as a mismatch.
+    """
+    if not namespace:
+        return True
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    involved = event.get("involvedObject") if isinstance(event.get("involvedObject"), dict) else {}
+    event_namespace = str(metadata.get("namespace") or "")
+    involved_namespace = str(involved.get("namespace") or "")
+    return (not event_namespace or event_namespace == namespace) and (
+        not involved_namespace or involved_namespace == namespace
+    )
 
 
 def _event_message_mentions_target(message: str, target: AnalysisTarget) -> bool:
@@ -2909,12 +2949,18 @@ def _event_summary(event: dict[str, object]) -> dict[str, object]:
 def _event_timestamp(event: dict[str, object]) -> object:
     series = event.get("series") if isinstance(event.get("series"), dict) else {}
     metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
-    return (
-        event.get("eventTime")
-        or series.get("lastObservedTime")
-        or event.get("lastTimestamp")
-        or metadata.get("creationTimestamp")
-    )
+    for value in (
+        event.get("eventTime"),
+        series.get("lastObservedTime"),
+        event.get("lastTimestamp"),
+        metadata.get("creationTimestamp"),
+    ):
+        parsed = parse_incident_time(value)
+        # ``0001-01-01T00:00:00Z`` is Kubernetes' zero-value eventTime.  It is
+        # not an observed time and must not hide a usable legacy timestamp.
+        if parsed is not None and parsed.year > 1:
+            return value
+    return None
 
 
 def _events_in_time_range(
