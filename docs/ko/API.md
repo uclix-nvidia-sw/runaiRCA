@@ -182,4 +182,4 @@ Agent:
 - `POST /analyze`
 - `POST /summarize-incident`
 - `POST /chat` 현재 인시던트, 알림, 증거, 피드백, 유사 RCA 메모리에 기반한 컨텍스트 인지형(context-aware) RCA 채팅
-- `GET /healthz`
+- `GET /healthz`는 프로세스/런타임 상태와 `collectors: {active, unknown}`를 반환합니다. `unknown`은 `COLLECTORS`에 제공된 인식할 수 없는 이름이며, 수집기 상태가 아니라 구성 가시성 정보입니다.

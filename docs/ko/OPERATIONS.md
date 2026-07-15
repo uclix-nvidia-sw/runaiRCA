@@ -25,6 +25,8 @@ curl -s http://<agent>/healthz
 
 - UI의 수집기 카드는 **실행이 수집기 `artifacts`를 저장한 이후에만** `ok`로 바뀝니다 —
   `Running` 파드나 `200` 헬스 체크만으로는 충분하지 않습니다.
+- Agent 헬스 응답에는 `collectors.active`와 `collectors.unknown`도 포함됩니다. 알 수 없는
+  구성 이름은 해당 증거 평면이 없다는 뜻이며, 같은 상태가 모든 분석에 경고로 추가됩니다.
 - `ENABLE_NAT_RUNTIME=true`는 `/analyze` 합성에 영향을 줍니다. `/chat`은 결정론적 컨텍스트
   답변을 반환하며 LLM 경로를 직접 호출하지 않습니다.
 
@@ -110,10 +112,15 @@ datasource입니다. 따라서 Prometheus 쿼리가 성공해도 Loki datasource
 수집기 artifact에 실제 증거를 제공한 경로가 남습니다.
 
 Alertmanager alert에 `startsAt`이 있으면 Loki는 인시던트 시간 창을 조회합니다. 즉 알림 전
-5분부터 `endsAt` 후 5분까지이며, 종료 시각이 없는 firing alert은 시작 후 20분에서 끝냅니다.
+5분부터 `endsAt` 후 5분까지이며, 종료 시각이 없는 firing alert은 시작 후 15분에서 끝냅니다.
 직접 Loki API에는 `start`/`end`를, Grafana MCP에는
 `startRfc3339`/`endRfc3339`을 전달합니다.
 파싱 가능한 시작 시각이 없는 alert은 datasource의 일반 recent window를 그대로 사용합니다.
+
+직접 Prometheus/Loki 응답은 전송 경로 출처를 유지합니다. 비어 있는 native Prometheus vector는
+범위가 확인된 부재를 수립할 수 있지만, 비어 있는 MCP/proxy 결과는 문맥일 뿐입니다. Loki 검증은
+표시용 샘플이 아니라 전체 반환 라인을 검사하며, GPU 실패 쿼리는 OOM, killed process,
+NCCL WARN/ERROR, CUDA error, Xid, NVRM, panic, segfault 형식을 포함합니다.
 
 ```bash
 # Grafana MCP가 설정한 조직에서 두 datasource UID를 모두 보는지 확인합니다.

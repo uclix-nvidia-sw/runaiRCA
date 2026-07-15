@@ -194,4 +194,4 @@ Agent:
 - `POST /analyze`
 - `POST /summarize-incident`
 - `POST /chat` context-aware RCA chat grounded in current incidents, alerts, evidence, feedback, and similar RCA memory
-- `GET /healthz`
+- `GET /healthz` returns process/runtime health and `collectors: {active, unknown}`. `unknown` lists unrecognized names supplied through `COLLECTORS`; it is configuration visibility, not collector health.

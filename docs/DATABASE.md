@@ -130,6 +130,14 @@ TypeDB is off/unreachable. Inspect the graph with `python -m ontology.query`
 | `POSTGRES_DSN` | — | Backend Postgres (also read by agent collectors/ingestion) |
 | `RUNAI_DB_DSN` | — | Optional read-only DSN for the **Run:ai control-plane** Postgres; enables the postgres drill-down's `sql_select` over platform schemas (workloads/audit/…). Use a read-only role. |
 
+When `RUNAI_DB_DSN` is used for collection, audit/history reads run in a UTC
+session. A `timestamp without time zone` value is interpreted as Run:ai UTC and
+the resulting observation declares `naive_timestamps_assumed_utc: true`.
+Audit-table failures are isolated: successful tables remain available, while
+failed or discovery-capped tables are reported as partial/missing data. A failed
+Run:ai control-plane DB connection is likewise visible as unavailable context,
+not a healthy Postgres check or causal evidence.
+
 TypeDB deploys as a single-node `StatefulSet` + PVC
 (`charts/runai-rca/templates/typedb.yaml`). Community Edition is single-node;
 HA/clustering is the paid Enterprise tier.

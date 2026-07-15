@@ -26,6 +26,9 @@ curl -s http://<agent>/healthz
 
 - Collector cards in the UI turn **`ok` only after a run stores collector
   `artifacts`** — a `Running` pod or a `200` health check is not enough.
+- The Agent health payload also lists `collectors.active` and
+  `collectors.unknown`. An unknown configured name means that evidence plane is
+  absent; the same condition is added to each analysis as a warning.
 - `ENABLE_NAT_RUNTIME=true` affects `/analyze` synthesis; `/chat` returns a
   deterministic context answer and does not call the LLM path directly.
 
@@ -116,11 +119,17 @@ records which path supplied evidence.
 
 For an Alertmanager alert with `startsAt`, Loki queries use the incident window:
 five minutes before the alert through five minutes after `endsAt`. A firing
-alert without an end time is capped at 20 minutes after it started. The direct
+alert without an end time is capped at 15 minutes after it started. The direct
 Loki API receives `start`/`end`; Grafana MCP receives
 `startRfc3339`/`endRfc3339`.
 Alerts without a parseable start time retain the datasource's normal recent
 window.
+
+Direct Prometheus/Loki responses retain transport provenance: an empty native
+Prometheus vector can establish scoped absence, while an empty MCP/proxy result
+is context only. Loki verification examines the full returned lines (not the
+display sample); its GPU failure query includes OOM, killed-process, NCCL
+WARN/ERROR, CUDA error, Xid, NVRM, panic, and segfault forms.
 
 ```bash
 # Grafana MCP must see both datasource UIDs in the configured organization.

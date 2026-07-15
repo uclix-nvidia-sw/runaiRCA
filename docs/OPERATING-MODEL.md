@@ -71,6 +71,15 @@ chat-specific LLM readiness signal.
 Each evidence agent can additionally run its own bounded, read-only drill-down
 loop (`ENABLE_AGENT_DRILLDOWN`) scoped to its own domain's tools. The
 orchestration flow that ties these together is the [RCA Pipeline](RCA-PIPELINE.md).
+
+For timestamped alerts, collectors retain a collection window from five minutes
+before firing through five minutes after resolution (a firing alert is bounded
+to 15 minutes). A post-resolution epilogue remains visible as recovery context,
+but occurrence evidence in Postgres, Change, and System is promoted only inside
+the causal window ending at resolution. Change history starts one hour before
+the fired time; its drill-down `lookback_seconds` may widen that historical
+range from 60 to 86,400 seconds. Successful change results are cached for about
+120 seconds only within one analysis, so a later re-analysis recollects fresh.
 - Analysis Agent produces the KubeRCA-style dashboard RCA: root cause,
   confidence, impact, missing data, recommended manual actions, prevention, and
   evidence coverage.

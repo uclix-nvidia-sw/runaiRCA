@@ -129,6 +129,13 @@ GPU는 별도 엔티티가 아니라 `node`/`queue`/`project`의 속성(`gpu_all
 | `POSTGRES_DSN` | — | 백엔드 Postgres(에이전트 수집기/인제스트도 읽음) |
 | `RUNAI_DB_DSN` | — | **Run:ai 컨트롤 플레인** Postgres에 대한 선택적 읽기 전용 DSN; 플랫폼 스키마(workloads/audit/…)에 대한 postgres 드릴다운의 `sql_select`를 활성화합니다. 읽기 전용 롤을 사용하십시오. |
 
+수집에 `RUNAI_DB_DSN`을 사용하면 audit/history 읽기는 UTC 세션에서 실행됩니다.
+`timestamp without time zone` 값은 Run:ai UTC로 해석하고, 결과 관찰에는
+`naive_timestamps_assumed_utc: true`를 선언합니다. audit-table 실패는 격리되므로
+성공한 테이블은 계속 사용할 수 있고, 실패하거나 발견 제한으로 건너뛴 테이블은
+partial/missing data로 보고됩니다. Run:ai 컨트롤 플레인 DB 연결 실패도 정상 Postgres 점검이나
+인과 증거가 아니라 사용 불가 문맥으로 명시적으로 보입니다.
+
 TypeDB는 단일 노드 `StatefulSet` + PVC로 배포됩니다
 (`charts/runai-rca/templates/typedb.yaml`). Community Edition은 단일 노드이며,
 HA/클러스터링은 유료 Enterprise 등급입니다.
