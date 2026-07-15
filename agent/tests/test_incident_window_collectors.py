@@ -34,6 +34,51 @@ from app.services.root_cause_ranking import rank_root_cause_candidates
 from tests.test_orchestrator import make_settings, make_target
 
 
+def _eligible_support_ids_under_pipeline_gate(
+    result: CollectorResult, target, run_id: str
+) -> set[str]:
+    """Exercise the production blackboard target/window eligibility gate."""
+    window = causal_evidence_time_range(target)
+    assert window is not None
+    assert len(result.artifacts) == 1
+    result.artifacts[0].evidence_id = "E01"
+    board = Blackboard(run_id=run_id)
+    board.seed_results(
+        [result],
+        entity=pipeline._blackboard_target_entity(target),
+        timestamp=target.fired_at,
+        observed_window_start=window["start"],
+        observed_window_end=window["end"],
+    )
+    [fact] = board.facts()
+    entities = tuple(
+        dict.fromkeys(
+            f"{field}:{value}"
+            for field in (
+                "pod", "node", "workload_name", "runai_workload_id", "project", "queue",
+                "namespace", "storage_claim", "service",
+            )
+            if (value := str(getattr(target, field, "") or "").strip())
+        )
+    )
+    topology = tuple(
+        f"{field}:{value}"
+        for field in ("cluster", "project", "queue", "namespace", "node", "component")
+        if (value := str(getattr(target, field, "") or "").strip())
+    )
+    eligibility = EvidenceEligibility.from_fact(
+        fact,
+        context={
+            "run_id": run_id,
+            "window_start": window["start"],
+            "window_end": window["end"],
+            "entities": entities,
+            "topology": topology,
+        },
+    )
+    return {"E01"} if eligibility.support else set()
+
+
 @pytest.mark.asyncio
 async def test_prometheus_direct_uses_incident_query_range(monkeypatch) -> None:
     calls: list[dict] = []
@@ -2218,7 +2263,12 @@ def test_target_container_termination_in_causal_window_is_scoped_and_matchable()
             artifacts=[lifecycle],
         )
     ]
-    assert "oomkilled" in pipeline._observed_text(results)
+    eligible_support_ids = _eligible_support_ids_under_pipeline_gate(
+        results[0], target, "INC-container-lifecycle"
+    )
+    assert "oomkilled" in pipeline._observed_text(
+        results, eligible_support_ids=eligible_support_ids
+    )
 
     outside_window = kubernetes._container_lifecycle_artifact(
         "kubernetes",
@@ -2251,6 +2301,7 @@ def test_runai_crd_health_transition_is_scoped_and_matchable() -> None:
     finding = {
         "kind": "Workload",
         "name": "training-1",
+        "namespace": target.namespace,
         "reason": "Unschedulable",
         "message": "quota exhausted",
         "lastTransitionTime": "2026-07-10T01:04:00Z",
@@ -2262,13 +2313,43 @@ def test_runai_crd_health_transition_is_scoped_and_matchable() -> None:
     assert len(artifacts) == 1
     observation = artifacts[0].result["observation"]
     assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
-    assert "unschedulable" in pipeline._observed_text(
-        [
-            CollectorResult(
-                agent="kubernetes", status="ok", summary="", confidence="high", artifacts=artifacts
-            )
-        ]
+    result = CollectorResult(
+        agent="kubernetes", status="ok", summary="", confidence="high", artifacts=artifacts
     )
+    eligible_support_ids = _eligible_support_ids_under_pipeline_gate(
+        result, target, "INC-crd-health"
+    )
+    assert "unschedulable" in pipeline._observed_text(
+        [result], eligible_support_ids=eligible_support_ids
+    )
+
+    unrelated = kubernetes._runai_crd_health_artifacts(
+        "kubernetes",
+        make_settings(),
+        [{**finding, "namespace": "another-namespace"}],
+        time_range=causal_evidence_time_range(target),
+    )
+    unrelated_result = CollectorResult(
+        agent="kubernetes", status="ok", summary="", confidence="high", artifacts=unrelated
+    )
+    unrelated_support_ids = _eligible_support_ids_under_pipeline_gate(
+        unrelated_result, target, "INC-crd-health-unrelated"
+    )
+    assert unrelated_support_ids == set()
+    assert "unschedulable" not in pipeline._observed_text(
+        [unrelated_result], eligible_support_ids=unrelated_support_ids
+    )
+
+    cluster_scoped = kubernetes._runai_crd_health_artifacts(
+        "kubernetes",
+        make_settings(),
+        [{**finding, "namespace": ""}],
+        time_range=causal_evidence_time_range(target),
+    )[0]
+    assert (
+        cluster_scoped.result["observation"]["polarity"],
+        cluster_scoped.result["observation"]["coverage"],
+    ) == ("unknown", "partial")
 
     outside = kubernetes._runai_crd_health_artifacts(
         "kubernetes",

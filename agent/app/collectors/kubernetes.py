@@ -5226,6 +5226,7 @@ def _crd_not_ready(item: dict) -> dict[str, str] | None:
     metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
     status = item.get("status") if isinstance(item.get("status"), dict) else {}
     name = str(metadata.get("name") or "")
+    namespace = str(metadata.get("namespace") or "")
     conditions = status.get("conditions")
     for cond in conditions if isinstance(conditions, list) else []:
         if not isinstance(cond, dict):
@@ -5239,6 +5240,7 @@ def _crd_not_ready(item: dict) -> dict[str, str] | None:
             return {
                 "kind": str(item.get("kind") or ""),
                 "name": name,
+                "namespace": namespace,
                 "reason": str(cond.get("reason") or ctype),
                 "message": _clip(str(cond.get("message") or ""), 200),
                 "lastTransitionTime": str(cond.get("lastTransitionTime") or ""),
@@ -5248,6 +5250,7 @@ def _crd_not_ready(item: dict) -> dict[str, str] | None:
         return {
             "kind": str(item.get("kind") or ""),
             "name": name,
+            "namespace": namespace,
             "reason": phase,
             "message": _clip(str(status.get("message") or ""), 200),
             "lastTransitionTime": "",
@@ -5269,7 +5272,10 @@ def _runai_crd_health_artifacts(
     for finding in findings:
         transitioned_at = str(finding.get("lastTransitionTime") or "").strip()
         transition = parse_incident_time(transitioned_at)
-        scoped = bool(transition and start and end and start <= transition <= end)
+        namespace = str(finding.get("namespace") or "").strip()
+        # A cluster-scoped CRD cannot stand in for a namespaced incident target.
+        # Keep it as context even when its transition falls inside the window.
+        scoped = bool(namespace and transition and start and end and start <= transition <= end)
         polarity, coverage = ("present", "scoped") if scoped else ("unknown", "partial")
         kind = str(finding.get("kind") or "Run:ai resource")
         name = str(finding.get("name") or "unknown")
@@ -5281,7 +5287,7 @@ def _runai_crd_health_artifacts(
             "predicate": "runai_crd_health",
             "polarity": polarity,
             "coverage": coverage,
-            "observed_entity": {"kind": kind, "name": name},
+            "observed_entity": {"kind": kind, "name": name, "namespace": namespace},
             "observation_window": time_range if scoped else {},
         }
         if scoped:
