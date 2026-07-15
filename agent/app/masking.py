@@ -66,7 +66,7 @@ _TEXT_PATTERNS: tuple[Pattern[str], ...] = (
     ),
 )
 _LONG_BASE64_RE = re.compile(
-    r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{64,}={0,2}(?![A-Za-z0-9+/])"
+    r"(?<!sha256:)(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{64,}={0,2}(?![A-Za-z0-9+/])"
 )
 
 
@@ -122,30 +122,23 @@ class RedactingMasker:
             return text
 
         masked = text
-        for pattern in _TEXT_PATTERNS:
-            if pattern.groups >= 3:
-                masked = pattern.sub(
-                    lambda match: f"{match.group(1)}{self._replacement(match.group(2))}"
-                    f"{match.group(3)}",
-                    masked,
-                )
-            elif pattern.groups >= 2:
-                masked = pattern.sub(
-                    lambda match: f"{match.group(1)}{self._replacement(match.group(2))}",
-                    masked,
-                )
-            else:
-                masked = pattern.sub(
-                    lambda match: self._replacement(match.group(0)),
-                    masked,
-                )
+        for index, pattern in enumerate(_TEXT_PATTERNS):
+            def replacement(match):  # noqa: ANN001
+                value = match.group(2) if pattern.groups >= 2 else match.group(0)
+                if index in {4, 5} and not _looks_like_credential(value):
+                    return match.group(0)
+                if pattern.groups >= 3:
+                    return f"{match.group(1)}{self._replacement(match.group(2))}{match.group(3)}"
+                if pattern.groups >= 2:
+                    return f"{match.group(1)}{self._replacement(match.group(2))}"
+                return self._replacement(match.group(0))
+            masked = pattern.sub(replacement, masked)
         return _LONG_BASE64_RE.sub(
             lambda match: self._replacement(match.group(0))
             if _is_valid_base64(match.group(0))
             else match.group(0),
             masked,
         )
-
     def _redact_value(self, value: Any, *, parent_key: str) -> Any:
         if isinstance(value, str):
             return self._redact_text(value, parent_key=parent_key)
@@ -220,6 +213,7 @@ class RedactingMasker:
             return False
         return any(part in normalized_key for part in _DENIED_KEY_PARTS)
 
+
     def _apply_regex_to_object(self, value: Any) -> Any:
         if isinstance(value, str):
             masked = value
@@ -233,6 +227,15 @@ class RedactingMasker:
         if isinstance(value, dict):
             return {key: self._apply_regex_to_object(item) for key, item in value.items()}
         return value
+
+
+def _looks_like_credential(value: str) -> bool:
+    return (
+        any(char.isdigit() for char in value)
+        or (any(char.islower() for char in value) and any(char.isupper() for char in value))
+        or len(value) >= 16
+        or any(not char.isalnum() for char in value)
+    )
 
 
 def build_masker(

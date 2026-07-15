@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI
 
 from app.config import load_settings
+from app.collectors.registry import collector_names, unknown_collector_names
 from app.knowledge import (
     KnowledgeRegistry,
     load_family_catalog,
@@ -151,6 +152,10 @@ def healthz() -> dict[str, object]:
         "nemo_runtime": "enabled" if settings.enable_nat_runtime else "fallback",
         "nemo_engine": orchestrator.engine_health(),
         "runtime_knowledge": knowledge_registry.health(),
+        "collectors": {
+            "active": collector_names(settings),
+            "unknown": unknown_collector_names(settings),
+        },
     }
 
 

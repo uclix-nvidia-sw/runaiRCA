@@ -648,6 +648,10 @@ def test_parse_json_object_survives_prose_fences_and_trailing_junk() -> None:
     assert parse_json_object('{"nested": {"b": "brace } in string"}}') == {
         "nested": {"b": "brace } in string"}
     }
+    assert parse_json_object('{"decision": {"query": "up"},}') is None
+    assert parse_json_object('{"decision": {"query": "up"},} {"later": true}') == {
+        "later": True
+    }
     assert parse_json_object("no json here") is None
     assert parse_json_object("{truncated: ") is None
     assert parse_json_object("") is None

@@ -173,6 +173,20 @@ async def test_metric_and_log_drilldowns_preserve_mcp_errors_and_incident_window
 
 
 @pytest.mark.asyncio
+async def test_metric_and_log_queries_reject_overlong_input() -> None:
+    settings = drill_settings()
+    target = _target()
+
+    prom = await _tool_promql(settings, target, {"query": "a" * 601})
+    logs = await _tool_logql(settings, target, {"query": "a" * 601})
+
+    # "invalid" routes _query_failure_feedback to the invalid_request repair
+    # category, so the loop tells the model to correct the query, not retry it.
+    assert prom["error"] == "invalid query: exceeds 600 characters; shorten it"
+    assert logs["error"] == "invalid query: exceeds 600 characters; shorten it"
+
+
+@pytest.mark.asyncio
 async def test_kubernetes_log_and_describe_drilldowns_use_incident_scope(monkeypatch) -> None:
     target = replace(
         _target(),

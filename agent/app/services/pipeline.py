@@ -25,7 +25,7 @@ from app.collectors.base import (
     salient_markers,
 )
 from app.collectors.base import artifact as make_artifact
-from app.collectors.registry import build_collectors
+from app.collectors.registry import build_collectors, unknown_collector_names
 from app.config import Settings
 from app.knowledge import (
     _keyword_negated,
@@ -66,7 +66,7 @@ _log = logging.getLogger(__name__)
 TModel = TypeVar("TModel", bound=BaseModel)
 Stage = Callable[["PipelineState"], Awaitable["PipelineState"]]
 _SYNTHESIS_ARTIFACT_RESULT_CHARS = 1200
-_SYNTHESIS_USER_CHARS = 12000
+_SYNTHESIS_USER_CHARS = 24000
 
 # Raw Kubernetes objects contain failure vocabulary even when the observed
 # value is healthy or merely declarative configuration.  Those fields remain
@@ -202,19 +202,29 @@ def new_state(
         resolved_at=request.alert.endsAt or "",
     )
     masker = _build_settings_masker(settings)
-    return PipelineState(
+    active_collectors = collectors if collectors is not None else build_collectors(settings)
+    for collector in active_collectors:
+        clear_cache = getattr(collector, "clear_cache", None)
+        if callable(clear_cache):
+            clear_cache()
+    state = PipelineState(
         settings=settings,
         request=request,
         target=target,
         progress=ProgressReporter.from_alert(settings, request.alert, masker),
         masker=masker,
-        collectors=collectors if collectors is not None else build_collectors(settings),
+        collectors=active_collectors,
         declared_target=target,
         runtime_label=runtime_label,
         analysis_started_at=(
             analysis_started_at if analysis_started_at is not None else time.monotonic()
         ),
     )
+    state.extra_warnings.extend(
+        f"configured collector '{name}' is unknown; its evidence plane is missing"
+        for name in unknown_collector_names(settings)
+    )
+    return state
 
 
 def _finalization_reserve_seconds(total_seconds: int) -> float:
@@ -3063,7 +3073,23 @@ def _synthesis_collector_findings(
                 "collection_summary": (
                     result.summary if _collector_is_evidence(result) else NO_EVIDENCE
                 ),
-                **{key: artifacts[-3:] for key, artifacts in grouped.items()},
+                **{
+                    key: [
+                        artifact
+                        for _index, artifact in sorted(
+                            sorted(
+                                enumerate(artifacts),
+                                key=lambda item: (
+                                    bool(item[1].get("highlights")),
+                                    item[1].get("status") == "ok",
+                                    item[0],
+                                ),
+                                reverse=True,
+                            )[:6]
+                        )
+                    ]
+                    for key, artifacts in grouped.items()
+                },
             }
         )
     return findings

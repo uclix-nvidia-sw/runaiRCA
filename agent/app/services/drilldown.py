@@ -493,8 +493,14 @@ async def _run_query(
     if name not in tools or not _valid_domain_query(query):
         return
     args = query.get("args") if isinstance(query.get("args"), dict) else {}
-    outcome = await _call_tool_safely(tools[name]["call"], settings, target, args)
-    outcome = masker.mask_object(outcome)
+    raw_outcome = await _call_tool_safely(tools[name]["call"], settings, target, args)
+    raw_result = raw_outcome.get("result") if isinstance(raw_outcome, dict) else None
+    raw_markers = [] if not isinstance(raw_outcome, dict) or raw_outcome.get("error") else (
+        kubernetes_salient_markers(raw_result)
+        if result.agent == "kubernetes"
+        else salient_markers(raw_result)
+    )
+    outcome = masker.mask_object(raw_outcome)
     if not isinstance(outcome, dict):
         outcome = {"error": "tool returned no result"}
     error = outcome.get("error")
@@ -549,11 +555,7 @@ async def _run_query(
     note = str(outcome.get("mcp_fallback") or "")
     if note and note not in result.warnings:
         result.warnings.append(note)
-    markers = [] if error else (
-        kubernetes_salient_markers(outcome.get("result"))
-        if result.agent == "kubernetes"
-        else salient_markers(outcome.get("result"))
-    )
+    markers = [] if error else [masker.mask_text(str(marker)) for marker in raw_markers]
     summary = str(outcome.get("summary") or error or name)
     if markers:
         summary = f"{summary} — {signals_line(markers, getattr(settings, 'language', 'en'))}"
@@ -1310,7 +1312,7 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
                     "Read a bounded Kubernetes change timeline for controller/pod/event "
                     "metadata. USE THIS for deployment or rollout history; do not invent a "
                     f"deployment_history resource. args: source ({change_sources}), "
-                    "component?, lookback_seconds?"
+                    "component?, lookback_seconds? (60..86400; for historical alerts it widens backward from fired time)"
                 ),
                 "call": _tool_k8s_change_timeline,
             },
@@ -1334,7 +1336,7 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
                     "namespace/node and incident window. args: source "
                     "(all|controller|pod|node_condition|event"
                     + ("|helm" if getattr(settings, "enable_helm_change_detection", False) else "")
-                    + "), component?, lookback_seconds? (60..86400), limit? (1..20)."
+                    + "), component?, lookback_seconds? (60..86400; historical lookback is anchored to fired time), limit? (1..20)."
                 ),
                 "call": _tool_change_query,
             }
@@ -1653,7 +1655,7 @@ async def _tool_k8s_exec(settings: Settings, target: AnalysisTarget, args: dict)
 
 
 async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
-    promql = " ".join(str(args.get("query") or "").split())[:600]
+    promql = " ".join(str(args.get("query") or "").split())
     title = _title(settings, "메트릭 조회 (PromQL)", "Metric query (PromQL)")
     if not promql:
         return {
@@ -1661,6 +1663,13 @@ async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -
             "title": title,
             "summary": "empty PromQL query",
             "error": "empty PromQL query",
+        }
+    if len(promql) > 600:
+        return {
+            "query": "",
+            "title": title,
+            "summary": "invalid query: exceeds 600 characters; shorten it",
+            "error": "invalid query: exceeds 600 characters; shorten it",
         }
     fallback = ""
     time_range = incident_time_range(target)
@@ -1700,7 +1709,7 @@ async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -
 
 
 async def _tool_logql(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
-    logql = " ".join(str(args.get("query") or "").split())[:600]
+    logql = " ".join(str(args.get("query") or "").split())
     title = _title(settings, "로그 조회 (LogQL)", "Log query (LogQL)")
     if not logql:
         return {
@@ -1708,6 +1717,13 @@ async def _tool_logql(settings: Settings, target: AnalysisTarget, args: dict) ->
             "title": title,
             "summary": "empty LogQL query",
             "error": "empty LogQL query",
+        }
+    if len(logql) > 600:
+        return {
+            "query": "",
+            "title": title,
+            "summary": "invalid query: exceeds 600 characters; shorten it",
+            "error": "invalid query: exceeds 600 characters; shorten it",
         }
     fallback = ""
     time_range = incident_time_range(target)

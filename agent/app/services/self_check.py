@@ -280,9 +280,20 @@ def _evidence_digest(results: list[CollectorResult], masker) -> str:
     for r in results:
         summary = (r.summary or "").strip() or NO_EVIDENCE
         lines.append(f"- {r.agent} [{r.status}]: {masker.mask_text(summary)}")
-        for art in (getattr(r, "artifacts", []) or [])[-3:]:
-            if art.status not in ("ok", "partial"):
-                continue
+        selected = [
+            art for art in (getattr(r, "artifacts", []) or []) if art.status in ("ok", "partial")
+        ]
+        selected = [
+            art
+            for _index, art in sorted(
+                sorted(
+                    enumerate(selected),
+                    key=lambda item: (bool(item[1].highlights), item[1].status == "ok", item[0]),
+                    reverse=True,
+                )[:6]
+            )
+        ]
+        for art in selected:
             parts = [
                 str(art.title or art.type or "artifact").strip(),
                 f"status={art.status}",

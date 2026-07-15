@@ -1436,7 +1436,10 @@ def _merge_collector_results(
         agent=current.agent or previous.agent,
         status=status,
         summary=summary,
-        confidence="high" if "high" in {previous.confidence, current.confidence} else "medium",
+        confidence=max(
+            (previous.confidence, current.confidence),
+            key=lambda value: {"low": 0, "medium": 1, "high": 2}.get(value, 0),
+        ),
         details={
             **(previous.details if isinstance(previous.details, dict) else {}),
             **(current.details if isinstance(current.details, dict) else {}),
@@ -1653,8 +1656,58 @@ def _adhoc_prompt_results(adhoc: list[dict] | None) -> list[Any]:
                 }
             )
         else:
-            results.append(json.dumps(item, default=str)[:600])
+            results.append(_adhoc_prompt_result(item))
     return results
+
+
+def _adhoc_prompt_result(item: dict) -> str:
+    data = item.get("data") if isinstance(item.get("data"), dict) else {}
+    object_data = data.get("object") if isinstance(data.get("object"), dict) else data
+    status = object_data.get("status") if isinstance(object_data.get("status"), dict) else {}
+    conditions = status.get("conditions") if isinstance(status.get("conditions"), list) else []
+    containers = (
+        status.get("containerStatuses")
+        if isinstance(status.get("containerStatuses"), list)
+        else []
+    )
+    status_extract = {
+        "phase": status.get("phase"),
+        "reason": status.get("reason"),
+        "message": status.get("message"),
+        "conditions": [
+            {
+                key: condition.get(key)
+                for key in ("type", "status", "reason", "message")
+                if condition.get(key) is not None
+            }
+            for condition in conditions[:4]
+            if isinstance(condition, dict)
+        ],
+        "containerStatuses": [
+            {
+                "name": container.get("name"),
+                "restartCount": container.get("restartCount"),
+                "waiting": (
+                    container["state"].get("waiting")
+                    if isinstance(container.get("state"), dict)
+                    else None
+                ),
+                "terminated": (
+                    container["state"].get("terminated")
+                    if isinstance(container.get("state"), dict)
+                    else None
+                ),
+            }
+            for container in containers[:4]
+            if isinstance(container, dict)
+        ],
+    }
+    projection = {
+        "query": _adhoc_query_repr(item),
+        "signals": kubernetes_salient_markers(data),
+        "status": status_extract,
+    }
+    return json.dumps(projection, default=str)[:600]
 
 
 def _investigator_masker(settings: Settings):
