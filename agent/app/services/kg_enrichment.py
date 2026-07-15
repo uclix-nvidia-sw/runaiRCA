@@ -156,6 +156,18 @@ match
 select $sn, $reason_ko;
 """
 
+_KNOWLEDGE_COMPONENT_QUERY = """
+match
+  $sy isa symptom, has name $sn, has component $component;
+select $sn, $component;
+"""
+
+_KNOWLEDGE_NAME_KO_QUERY = """
+match
+  $sy isa symptom, has name $sn, has name_ko $name_ko;
+select $sn, $name_ko;
+"""
+
 _KNOWLEDGE_ACTIONS_KO_QUERY = """
 match
   $sy isa symptom, has name $sn, has statement_ko $statement_ko;
@@ -743,6 +755,8 @@ def _query_kg(
         knowledge_reason_rows = run(_KNOWLEDGE_REASON_QUERY)
         knowledge_exclusive_action_rows = run(_KNOWLEDGE_EXCLUSIVE_ACTIONS_QUERY)
         knowledge_reason_ko_rows = run(_KNOWLEDGE_REASON_KO_QUERY)
+        knowledge_component_rows = run(_KNOWLEDGE_COMPONENT_QUERY)
+        knowledge_name_ko_rows = run(_KNOWLEDGE_NAME_KO_QUERY)
         knowledge_actions_ko_rows = run(_KNOWLEDGE_ACTIONS_KO_QUERY)
         reasoning: dict[str, Any] = {}
         component = target.workload_name
@@ -781,6 +795,16 @@ def _query_kg(
         for row in knowledge_reason_ko_rows
         if row.get("sn") and row.get("reason_ko")
     }
+    components = {
+        str(row.get("sn") or ""): str(row.get("component") or "")
+        for row in knowledge_component_rows
+        if row.get("sn") and row.get("component")
+    }
+    names_ko = {
+        str(row.get("sn") or ""): str(row.get("name_ko") or "")
+        for row in knowledge_name_ko_rows
+        if row.get("sn") and row.get("name_ko")
+    }
     actions_ko: dict[str, set[str]] = {}
     for row in knowledge_actions_ko_rows:
         sname = str(row.get("sn") or "")
@@ -807,6 +831,8 @@ def _query_kg(
                 "actions": sorted(entry["actions"]),
                 "reason": reasons.get(sname, ""),
                 "exclusive_actions": sname in exclusive_actions,
+                "component": components.get(sname, ""),
+                "symptom_ko": names_ko.get(sname, ""),
                 "reason_ko": reasons_ko.get(sname, ""),
                 "actions_ko": sorted(actions_ko.get(sname, set())),
             }

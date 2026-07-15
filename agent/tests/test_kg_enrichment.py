@@ -16,7 +16,7 @@ from app.services.kg_enrichment import (
     _select_case_cards,
     enrich,
 )
-from app.services.pipeline import _knowledge_base_lines
+from app.services.pipeline import _knowledge_base_lines, _playbook_lines
 from app.services.root_cause_ranking import RankedCause
 
 
@@ -176,6 +176,10 @@ def test_query_kg_projects_typedb_symptom_metadata() -> None:
                     return [{"sn": "OOMKilled", "exclusive_actions": True}]
                 if "has reason_ko $reason_ko" in query:
                     return [{"sn": "OOMKilled", "reason_ko": "메모리 제한을 초과했습니다."}]
+                if "has component $component" in query:
+                    return [{"sn": "OOMKilled", "component": "cluster-sync"}]
+                if "has name_ko $name_ko" in query:
+                    return [{"sn": "OOMKilled", "name_ko": "메모리 부족 종료"}]
                 if "has statement_ko $statement_ko" in query:
                     return [
                         {"sn": "OOMKilled", "statement_ko": "메모리 제한을 높이세요."},
@@ -195,11 +199,49 @@ def test_query_kg_projects_typedb_symptom_metadata() -> None:
                 "actions": ["Raise the memory limit."],
                 "reason": "Memory limit exceeded.",
                 "exclusive_actions": True,
+                "component": "cluster-sync",
+                "symptom_ko": "메모리 부족 종료",
                 "reason_ko": "메모리 제한을 초과했습니다.",
                 "actions_ko": ["누수를 수정하세요.", "메모리 제한을 높이세요."],
             }
         ]
     }
+
+
+def test_typedb_symptom_component_preserves_yaml_playbook_checks() -> None:
+    typedb_symptom = {
+        "symptom": "Cluster Sync Unhealthy",
+        "keywords": ["cluster sync unhealthy"],
+        "actions": ["Inspect cluster-sync."],
+        "component": "cluster-sync",
+    }
+    components = {
+        "cluster-sync": {
+            "failure_effect": "Workload status stops syncing.",
+            "depends_on": ["runai-backend"],
+            "checks": ["kubectl logs -n runai deploy/cluster-sync"],
+        },
+        "runai-backend": {"depends_on": []},
+    }
+
+    typedb_lines = _playbook_lines(
+        None,
+        "cluster sync unhealthy",
+        {"runai_control_plane_error": [typedb_symptom]},
+        "",
+        components=components,
+    )
+    yaml_lines = _playbook_lines(
+        None,
+        "cluster sync unhealthy",
+        {"runai_control_plane_error": [{**typedb_symptom}]},
+        "",
+        components=components,
+    )
+
+    assert typedb_lines == yaml_lines
+    assert "Check order: cluster-sync → runai-backend" in "\n".join(typedb_lines)
+    assert "kubectl logs -n runai deploy/cluster-sync" in "\n".join(typedb_lines)
 
 
 def test_typedb_knowledge_exclusive_actions_suppress_generic_siblings() -> None:

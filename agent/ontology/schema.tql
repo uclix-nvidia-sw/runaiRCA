@@ -24,6 +24,8 @@ attribute fingerprint, value string;
 attribute occurrence_count, value integer;
 attribute reason, value string;
 attribute reason_ko, value string;
+attribute name_ko, value string;
+attribute component, value string;
 attribute condition_type, value string;
 attribute keyword, value string;
 attribute workload_type, value string;
@@ -224,6 +226,8 @@ entity symptom,
     owns name,
     owns reason,
     owns reason_ko @card(0..1),
+    owns name_ko @card(0..1),
+    owns component @card(0..1),
     owns exclusive_actions @card(0..1),
     owns condition_type,
     # A symptom matches on many keywords. TypeDB 3.x defaults ownership to

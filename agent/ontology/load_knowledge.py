@@ -71,6 +71,8 @@ def _ensure_symptom(
     reason_ko: str = "",
     exclusive_actions: bool = False,
     actions_ko: list[str] | None = None,
+    component: str = "",
+    name_ko: str = "",
 ) -> None:
     if not _exists(tx, f'$x isa symptom, has name "{esc(name)}";'):
         tx.query(f'insert $x isa symptom, has name "{esc(name)}";').resolve()
@@ -94,6 +96,20 @@ def _ensure_symptom(
         tx.query(
             f'match $s isa symptom, has name "{esc(name)}"; '
             f'insert $s has reason_ko "{esc(reason_ko)}";'
+        ).resolve()
+    if component and not _exists(
+        tx, f'$x isa symptom, has name "{esc(name)}", has component "{esc(component)}";'
+    ):
+        tx.query(
+            f'match $s isa symptom, has name "{esc(name)}"; '
+            f'insert $s has component "{esc(component)}";'
+        ).resolve()
+    if name_ko and not _exists(
+        tx, f'$x isa symptom, has name "{esc(name)}", has name_ko "{esc(name_ko)}";'
+    ):
+        tx.query(
+            f'match $s isa symptom, has name "{esc(name)}"; '
+            f'insert $s has name_ko "{esc(name_ko)}";'
         ).resolve()
     if exclusive_actions and not _exists(
         tx, f'$x isa symptom, has name "{esc(name)}", has exclusive_actions true;'
@@ -178,7 +194,13 @@ def main() -> int:
                         str(sym.get("reason", "")).strip(),
                         str(sym.get("reason_ko", "")).strip(),
                         sym.get("exclusive_actions") is True,
-                        [str(action).strip() for action in sym.get("actions_ko", []) if str(action).strip()],
+                        [
+                            str(action).strip()
+                            for action in sym.get("actions_ko", [])
+                            if str(action).strip()
+                        ],
+                        str(sym.get("component") or "").strip(),
+                        str(sym.get("name_ko") or "").strip(),
                     )
                     _relate_indicates(tx, name, family)
                     symptoms += 1
