@@ -1,6 +1,39 @@
 {{- if .Values.runaiMcp.enabled }}
 {{- $runaiBaseUrl := required "agent.env.runaiBaseUrl is required when runaiMcp.enabled=true (sets RUNAI_BASE_URL for the official NVIDIA Run:ai MCP)" .Values.agent.env.runaiBaseUrl }}
 {{- $runaiMcpPullSecrets := default .Values.imagePullSecrets .Values.runaiMcp.imagePullSecrets }}
+{{- $runaiMcpIssuerUrl := trimSuffix "/" .Values.runaiMcp.oidcIssuerUrl }}
+{{- $runaiMcpOidcProxyEnabled := ne $runaiMcpIssuerUrl "" }}
+{{- if $runaiMcpOidcProxyEnabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "runai-rca.runaiMcp.fullname" . }}-oidc-proxy
+  labels:
+    {{- include "runai-rca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: runai-mcp
+data:
+  default.conf: |
+    server {
+      listen {{ .Values.runaiMcp.oidcProxy.port }};
+      location = /.well-known/openid-configuration {
+        proxy_ssl_server_name on;
+        {{- if .Values.runaiTls.caBundleSecretName }}
+        proxy_ssl_trusted_certificate /etc/runai/tls/ca-bundle.pem;
+        proxy_ssl_verify on;
+        {{- end }}
+        proxy_pass {{ $runaiMcpIssuerUrl }}/.well-known/openid-configuration;
+      }
+      location / {
+        proxy_ssl_server_name on;
+        {{- if .Values.runaiTls.caBundleSecretName }}
+        proxy_ssl_trusted_certificate /etc/runai/tls/ca-bundle.pem;
+        proxy_ssl_verify on;
+        {{- end }}
+        proxy_pass {{ $runaiBaseUrl }};
+      }
+    }
+---
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -48,7 +81,7 @@ spec:
               containerPort: {{ .Values.runaiMcp.metricsPort }}
           env:
             - name: RUNAI_BASE_URL
-              value: {{ $runaiBaseUrl | quote }}
+              value: {{ if $runaiMcpOidcProxyEnabled }}{{ printf "http://127.0.0.1:%v" .Values.runaiMcp.oidcProxy.port | quote }}{{ else }}{{ $runaiBaseUrl | quote }}{{ end }}
             - name: RUNAI_MCP_LISTEN_PORT
               value: {{ .Values.runaiMcp.port | quote }}
             - name: RUNAI_MCP_METRICS_PORT
@@ -81,8 +114,33 @@ spec:
           {{- end }}
           resources:
             {{- toYaml .Values.runaiMcp.resources | nindent 12 }}
-      {{- if or .Values.runaiTls.caBundleSecretName .Values.runaiMcp.extraVolumes }}
+        {{- if $runaiMcpOidcProxyEnabled }}
+        - name: oidc-proxy
+          image: {{ include "runai-rca.image" (dict "root" . "image" .Values.runaiMcp.oidcProxy.image) | quote }}
+          imagePullPolicy: {{ .Values.runaiMcp.oidcProxy.image.pullPolicy }}
+          ports:
+            - name: oidc-proxy
+              containerPort: {{ .Values.runaiMcp.oidcProxy.port }}
+          volumeMounts:
+            - name: runai-mcp-oidc-proxy-config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+              readOnly: true
+            {{- if .Values.runaiTls.caBundleSecretName }}
+            - name: runai-ca-bundle
+              mountPath: /etc/runai/tls
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.runaiMcp.oidcProxy.resources | nindent 12 }}
+        {{- end }}
+      {{- if or .Values.runaiTls.caBundleSecretName .Values.runaiMcp.extraVolumes $runaiMcpOidcProxyEnabled }}
       volumes:
+        {{- if $runaiMcpOidcProxyEnabled }}
+        - name: runai-mcp-oidc-proxy-config
+          configMap:
+            name: {{ include "runai-rca.runaiMcp.fullname" . }}-oidc-proxy
+        {{- end }}
         {{- if .Values.runaiTls.caBundleSecretName }}
         - name: runai-ca-bundle
           secret:

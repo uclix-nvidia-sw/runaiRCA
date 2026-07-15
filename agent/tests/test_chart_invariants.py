@@ -103,6 +103,10 @@ def test_managed_mcp_values_keep_expected_secret_and_images() -> None:
         "nvcr.io/nvidia/runai/runai-mcp-server"
     )
     assert values["runaiMcp"]["image"]["tag"] == "2.26.13"
+    assert values["runaiMcp"]["oidcIssuerUrl"] == ""
+    assert values["runaiMcp"]["oidcProxy"]["image"]["repository"] == (
+        "docker.io/nginxinc/nginx-unprivileged"
+    )
     assert values["grafanaMcp"]["image"]["repository"] == "docker.io/grafana/mcp-grafana"
     assert values["grafanaMcp"]["image"]["tag"] == "0.14.0"
     assert values["kubernetesMcp"]["image"]["repository"] == (
@@ -140,6 +144,15 @@ def test_runai_mcp_uses_official_http_transport_and_scoped_pull_secret() -> None
     assert ".Values.runaiMcp.extraEnv" in template
     assert ".Values.runaiMcp.extraVolumeMounts" in template
     assert ".Values.runaiMcp.extraVolumes" in template
+
+
+def test_runai_mcp_can_proxy_only_oidc_discovery_to_the_token_issuer() -> None:
+    template = MCP_TEMPLATE.read_text(encoding="utf-8")
+    assert "runaiMcp.oidcIssuerUrl" in template
+    assert "runai-mcp-oidc-proxy-config" in template
+    assert "location = /.well-known/openid-configuration" in template
+    assert "proxy_pass {{ $runaiMcpIssuerUrl }}/.well-known/openid-configuration;" in template
+    assert "http://127.0.0.1:%v" in template
 
 
 def test_runai_private_ca_bundle_is_shared_without_application_credentials() -> None:

@@ -174,7 +174,8 @@ helm upgrade --install runai-rca charts/runai-rca \
 | `agent.serviceAccount.annotations` | 워크로드 아이덴티티 통합을 위한 ServiceAccount 어노테이션 |
 | `{backend,frontend,postgresql}.automountServiceAccountToken` | 클러스터 API 접근이 필요 없는 파드의 Kubernetes API 토큰 마운트를 비활성화합니다. 기본값 `false` |
 | `agent.automountServiceAccountToken` | 에이전트 Kubernetes API 토큰 마운트. 직접 Kubernetes 수집이 서비스 계정 토큰을 사용하므로 기본값은 `true` |
-| `agent.env.runaiBaseUrl` / `agent.env.runaiTokenUrl` | Run:ai API와 선택 사항인 OAuth 토큰 엔드포인트. `agent.env.runaiBaseUrl`에는 기본값이 없으며 `runaiMcp.enabled=true`일 때 반드시 지정해야 합니다. Run:ai HTTP 401을 방지하려면 `secrets.runaiBearerToken` 또는 클라이언트 자격 증명을 제공하세요 |
+| `agent.env.runaiBaseUrl` / `agent.env.runaiTokenUrl` | Run:ai API와 선택 사항인 OAuth 토큰 엔드포인트. `agent.env.runaiBaseUrl`에는 기본값이 없으며 `runaiMcp.enabled=true`일 때 반드시 지정해야 합니다. Run:ai HTTP 401을 방지하려면 `secrets.runaiBearerToken` 또는 클라이언트 자격 증명을 제공하세요. 클라이언트 자격 증명 토큰 엔드포인트(예: `/api/v1/token`)를 사용하고, 대화형 `/auth/token` 경로는 사용하지 마세요. |
+| `runaiMcp.oidcIssuerUrl` | 공식 Run:ai MCP의 토큰 `iss` URL(선택 사항)입니다. `<runaiBaseUrl>/.well-known/openid-configuration`이 HTML을 반환할 때 설정하면, 파드 내부 프록시가 discovery 요청만 `<issuer>/.well-known/openid-configuration`으로 전달하고 일반 Run:ai API 호출은 계속 `agent.env.runaiBaseUrl`을 사용합니다. |
 | `agent.env.runaiWorkloadsPath`, `runaiProjectsPath`, `runaiQueuesPath` | 서로 다른 Run:ai 버전을 위한 Run:ai API 경로 재정의 |
 | `agent.env.runaiLogNamespaces` | Run:ai 컨트롤 플레인/백엔드 로그의 네임스페이스. 기본값 `runai,runai-backend` |
 | `agent.env.prometheusUrl` | 클러스터 내부 Prometheus URL(예: `http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090`) |
