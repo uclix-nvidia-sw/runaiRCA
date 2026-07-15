@@ -57,6 +57,21 @@ def test_runai_mcp_oidc_discovery_is_curated_failure_mode_knowledge() -> None:
     assert any("runaiMcp.oidcIssuerUrl" in action for action in symptom["actions_ko"])
 
 
+def test_oomkilled_has_exclusive_pod_level_remediation() -> None:
+    modes = load_failure_modes(YAML)
+    symptom = next(
+        item
+        for item in modes["workload_startup_error"]
+        if item["symptom"] == "OOMKilled"
+    )
+
+    assert symptom["exclusive_actions"] is True
+    assert "memory limit" in symptom["reason"]
+    assert "메모리 제한" in symptom["reason_ko"]
+    assert any("resources.limits.memory" in action for action in symptom["actions"])
+    assert any("Node-level OOM" in action for action in symptom["actions_ko"])
+
+
 def test_specific_symptom_ordered_before_generic() -> None:
     """First keyword match wins in _kb_remediation_lines, so 'preempted by higher
     priority' must appear before the generic 'preempt' symptom."""

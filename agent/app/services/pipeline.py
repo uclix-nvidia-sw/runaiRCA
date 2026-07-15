@@ -102,12 +102,6 @@ _K8S_CONDITION_TYPES = frozenset(
         "ready",
     }
 )
-_SYNTHESIS_ASSERTION_NEGATED = re.compile(
-    r"\b(?:false|inactive|no|not|none|without|zero|cleared|resolved|healthy|normal)\b|"
-    r"(?:없(?:음|다|었)|아님|아니|미감지|미발생|비활성|정상|해소|복구|반박|"
-    r"감지되지|발생하지|확인되지|관찰되지)",
-    re.IGNORECASE,
-)
 _SYNTHESIS_ASSERTION_CONDITIONAL = re.compile(
     r"\b(?:check|verify|whether|hypothesis|possible|possibly|could|may|might|candidate)\b|"
     r"(?:확인\s*(?:필요|대상|예정)|확인(?:하|해|해야)|점검|검증|여부|가설|가능성|의심|후보)",
@@ -3331,11 +3325,48 @@ def _synthesis_claim_fragments(text: str) -> list[str]:
     ]
 
 
-def _synthesis_fragment_asserts_signal(fragment: str) -> bool:
-    """Whether a signal mention is asserted, rather than negated or proposed as a check."""
-    if _SYNTHESIS_ASSERTION_NEGATED.search(fragment):
+_SYNTHESIS_CLAUSE_BREAK = re.compile(
+    r"[.;!?。！？\r\n]+|\b(?:but|however|though|yet)\b|(?:하지만|반면|지만)",
+    re.IGNORECASE,
+)
+
+
+def _synthesis_signal_mentions(
+    fragment: str, terms: tuple[str, ...]
+) -> list[tuple[int, int]]:
+    """Return every case-insensitive signal span in a report fragment."""
+    lowered = fragment.casefold()
+    spans: list[tuple[int, int]] = []
+    for term in terms:
+        needle = term.casefold()
+        start = 0
+        while needle:
+            index = lowered.find(needle, start)
+            if index < 0:
+                break
+            end = index + len(needle)
+            spans.append((index, end))
+            start = end
+    return spans
+
+
+def _synthesis_fragment_asserts_signal(fragment: str, start: int, end: int) -> bool:
+    """Whether one signal mention is asserted rather than negated or conditional.
+
+    Polarity must be evaluated around the specific signal. A whole-fragment
+    check reverses Korean statements such as ``MemoryPressure가 아닌 ...`` and
+    can also let a different positive signal hide behind an unrelated negation.
+    """
+    lowered = fragment.casefold()
+    if _keyword_negated(lowered, start, end):
         return False
-    if _SYNTHESIS_ASSERTION_CONDITIONAL.search(fragment):
+
+    prefix = fragment[:start]
+    suffix = fragment[end:]
+    local_prefix = _SYNTHESIS_CLAUSE_BREAK.split(prefix)[-1]
+    local_suffix = _SYNTHESIS_CLAUSE_BREAK.split(suffix, maxsplit=1)[0]
+    local_clause = f"{local_prefix}{fragment[start:end]}{local_suffix}"
+    if _SYNTHESIS_ASSERTION_CONDITIONAL.search(local_clause):
         return False
     return True
 
@@ -3378,12 +3409,12 @@ def _synthesis_semantic_conflict(
         request, results, evidence_eligibility
     )
     for fragment in _synthesis_claim_fragments(text):
-        lowered = fragment.casefold()
         for group, terms in _SYNTHESIS_SIGNAL_TERMS.items():
-            if group in supported or not any(term.casefold() in lowered for term in terms):
+            if group in supported:
                 continue
-            if _synthesis_fragment_asserts_signal(fragment):
-                return f"unsupported positive {group} claim: {fragment[:180]}"
+            for start, end in _synthesis_signal_mentions(fragment, terms):
+                if _synthesis_fragment_asserts_signal(fragment, start, end):
+                    return f"unsupported positive {group} claim: {fragment[:180]}"
     return ""
 
 
@@ -3480,13 +3511,9 @@ def _failure_mode_root_cause_statement(
     language: str,
 ) -> str:
     """Prefer an exact, curated mechanism over a coarse ranked-family sentence."""
-    top_family = candidates[0].family if candidates else ""
-    filter_to_top = _top_family_settled(candidates)
-    for family, symptom in match_failure_mode_symptoms(
-        failure_modes, observed_text, top_family
+    for _family, symptom in _actionable_failure_mode_matches(
+        failure_modes, observed_text, candidates
     ):
-        if filter_to_top and family != top_family:
-            continue
         reason = str(
             symptom.get("reason_ko" if language == "ko" else "reason") or ""
         ).strip()

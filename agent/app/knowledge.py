@@ -96,6 +96,15 @@ _NEGATED_SUFFIX_RE = re.compile(
     r"|^\s*(?:[\w\"'-]+\s+){0,4}(?:은|는|이|가|도)?\s*"
     r"(?:아님|아니다|없음|없다|관찰되지\s*않음|발생하지\s*않음|"
     r"감지되지\s*않음|확인되지\s*않음|정상|성공|해결됨|복구됨|정상화)"
+    # Korean attributive/connective negation. A condition name commonly
+    # appears before a parenthetical qualifier, e.g. ``MemoryPressure 등이
+    # 아닌 순수 스케줄링 문제``. Treat these forms as local negation of the
+    # preceding keyword, not as a positive condition assertion.
+    r"|^\s*(?:\S+\s+){0,4}(?:은|는|이|가|도)?\s*"
+    r"(?:아닌|아니라|아니며|아니고|아니지만|아니었|아니었던)\b"
+    r"|^\s*(?:\S+\s+){0,4}(?:은|는|이|가|도)?\s*"
+    r"(?:감지되지|발생하지|확인되지|관찰되지)\s*"
+    r"(?:않(?:음|다|았|았음|았습니다|은|으며|고)|못(?:함|했다|했습니다))"
     r"|^\s*(?:[\w\"'-]+\s+){0,6}"
     r"(?:no\s+evidence|needs?\s+evidence|possible|examples?|during\s+triage|"
     r"before\s+blaming)\b"

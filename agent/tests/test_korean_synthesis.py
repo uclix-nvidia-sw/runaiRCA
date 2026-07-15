@@ -748,6 +748,95 @@ async def test_korean_synthesis_rejects_all_false_conditions_promoted_as_active(
 
 
 @pytest.mark.asyncio
+async def test_korean_synthesis_allows_real_incident_negative_memorypressure_claim(
+    monkeypatch,
+) -> None:
+    settings = replace(make_settings(), language="ko")
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        return {
+            "summary": "단일 노드에 가용 GPU가 부족해 파드가 스케줄링되지 않았습니다.",
+            "detail": (
+                "이는 노드 압박(MemoryPressure 등)이 아닌 순수 스케줄링 자원 부족"
+                "(단편화/과할당) 사례로, 단일 노드에 8 GPU를 배치할 수 없어 발생했습니다."
+            ),
+        }
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    finding = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_node_condition",
+        status="ok",
+        confidence="high",
+        summary="MemoryPressure=False",
+        result={
+            "conditions": [{"type": "MemoryPressure", "status": "False"}],
+            "observation": {"polarity": "absent", "coverage": "scoped"},
+        },
+    )
+    finding.evidence_id = "E01"
+
+    synthesized = await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "KubePodNotReady"})
+        ),
+        results=[
+            CollectorResult(
+                agent="kubernetes", status="ok", summary="node checked", artifacts=[finding]
+            )
+        ],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="k8s_scheduling_error", confidence="high", score=8.0)
+        ],
+        kg_context={},
+        graph_fixes=GraphRemediation(),
+        fallback_detail="fallback",
+    )
+
+    assert synthesized is not None
+    assert "MemoryPressure 등)이 아닌" in synthesized[1]
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_still_rejects_positive_signal_after_negative_signal(
+    monkeypatch,
+) -> None:
+    settings = replace(make_settings(), language="ko")
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        return {
+            "summary": "노드 상태를 확인했습니다.",
+            "detail": "MemoryPressure가 아니지만 DiskPressure가 발생했습니다.",
+        }
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+
+    synthesized = await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "GenericNodeAlert"})
+        ),
+        results=[CollectorResult(agent="kubernetes", status="ok", summary="node checked")],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="k8s_scheduling_error", confidence="medium", score=5.0)
+        ],
+        kg_context={},
+        graph_fixes=GraphRemediation(),
+        fallback_detail="fallback",
+    )
+
+    assert synthesized is None
+
+
+@pytest.mark.asyncio
 async def test_korean_synthesis_allows_active_supported_condition(monkeypatch) -> None:
     settings = replace(make_settings(), language="ko")
 
@@ -1121,6 +1210,54 @@ def test_jwks_discovery_failure_overrides_generic_crashloop_playbook_in_korean()
     assert "agent.env.runaiTokenUrl=https://<runai-host>/api/v1/token" in detail
     assert "OOM" not in detail
     assert "bad entrypoint" not in detail
+
+
+def test_oomkilled_overrides_generic_crashloop_actions_in_korean_fallback() -> None:
+    failure_modes = load_failure_modes("knowledge/failure_modes.yaml")
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={
+                "alertname": "KubePodCrashLooping",
+                "namespace": "default",
+                "pod": "memory-stress",
+                "container": "memory-stress",
+            },
+            annotations={"summary": "memory-stress CrashLoopBackOff"},
+            fingerprint="fp-memory-stress-oom",
+        )
+    )
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary=(
+                "target container memory-stress lastState terminated reason=OOMKilled "
+                "exit code 137; resources limits memory=256Mi; MemoryPressure=False"
+            ),
+        )
+    ]
+    candidates = [RankedCause("workload_startup_error", "high", 8.0)]
+
+    summary = _summary_from(
+        request, results, candidates, failure_modes, language="ko"
+    )
+    detail = _detail_from(
+        request,
+        results,
+        [],
+        failure_modes=failure_modes,
+        root_cause_candidates=candidates,
+        language="ko",
+    )
+
+    assert "메모리 제한을 초과해 OOMKilled" in summary
+    assert "resources.limits.memory" in detail
+    assert "작업 메모리 설정을 limit 아래로" in detail
+    assert "restart count 증가" in detail
+    assert "entrypoint" not in detail.lower()
+    assert "secretkeyref" not in detail.lower()
+    assert "errimageneverpull" not in detail.lower()
 
 
 @pytest.mark.asyncio
