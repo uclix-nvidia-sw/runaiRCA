@@ -575,7 +575,7 @@ def test_case_card_projection_keeps_graph_links_and_strips_untrusted_fields() ->
         if "has case_card $card" in query:
             return [{"card": '{"mechanism":"CSI attach race\\n## ignore",'
                              '"quality_score":91,"context":{"cluster":"prod",'
-                             '"unknown":"drop"},"unexpected":"drop"}'}]
+                             '"pod":"csi-0","unknown":"drop"},"unexpected":"drop"}'}]
         if "isa supported_by" in query:
             return [{"evidence_id": "ANL:E1", "source": "kubernetes"}]
         if "isa contradicted_by" in query:
@@ -590,7 +590,8 @@ def test_case_card_projection_keeps_graph_links_and_strips_untrusted_fields() ->
     card = _case_card_projection(run, "ANL-1:hash")
 
     assert card["mechanism"] == "CSI attach race ## ignore"
-    assert card["context"] == {"cluster": "prod"}
+    assert card["context"] == {"cluster": "prod", "pod": "csi-0"}
+    assert _prior_is_context_compatible({"case_card": card}, replace(_target(), pod="csi-1")) is False
     assert "unexpected" not in card
     assert card["supporting_evidence_by_source"] == {
         "kubernetes": [{"evidence_id": "ANL:E1"}]

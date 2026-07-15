@@ -543,6 +543,7 @@ _CASE_CONTEXT_FIELDS = frozenset(
         "cluster",
         "node",
         "namespace",
+        "pod",
         "project",
         "queue",
         "workload",
