@@ -530,14 +530,14 @@ nodes:
         terminated_reason: OOMKilled
     conclusion:
       family: workload_startup_error
-      summary: "The workload restarts because the container is being OOMKilled."
-      confidence: "high only when the terminated container reason is OOMKilled or the kernel confirms an incident-era OOM kill"
+      summary: "The workload restarts because the target container exceeded its memory limit and was OOMKilled; CrashLoopBackOff is downstream."
+      confidence: "high when the target container's terminated reason is OOMKilled; distinguish a node-wide OOM only with separate incident-era node evidence"
       disconfirm:
         - "The termination reason is different or an application exit, probe, or node eviction occurs first."
       next_steps:
-        - "Check whether memory spikes at startup or grows over time."
-        - "Raise the memory limit only if usage is expected; otherwise fix the leak or input size."
-        - "Compare limits and recent image or config changes with the last healthy revision."
+        - "Compare `resources.limits.memory` with the configured and observed working set; a configured target above the limit is a direct sizing error."
+        - "Raise the limit above legitimate usage with headroom, or reduce the working set and fix any leak; align the request with realistic steady usage for scheduling."
+        - "Roll out the change and verify OOMKilled, restart-count growth, and CrashLoopBackOff stop recurring."
 
   - id: crashloop_backoff
     question: "Is the pod repeatedly failing after process start?"

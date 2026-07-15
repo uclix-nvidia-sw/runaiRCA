@@ -15,8 +15,9 @@ from app.collectors.base import (
     incident_time_range,
     ko_en,
     parse_incident_time,
+    salient_markers,
 )
-from app.collectors.http_json import compact, get_json, post_oauth_token
+from app.collectors.http_json import _safe_text, compact, get_json, post_oauth_token
 from app.collectors.loki import _llm_insight
 from app.collectors.runai_mcp import (
     gather_runai_via_mcp,
@@ -385,6 +386,11 @@ class RunAICollector:
                     self.name, item, target=target, used_mcp=used_mcp
                 )
                 for item in query_results
+            )
+            artifacts.extend(
+                context
+                for item in query_results
+                if (context := _runai_error_context_artifact(self.name, item)) is not None
             )
             return CollectorResult(
                 agent=self.name,
@@ -755,6 +761,18 @@ def _runai_query_artifact(
         summary = f"Run:ai {name}: resource found (current state); not proven for the incident window."
     else:
         summary = f"Run:ai {name}: query was unavailable or did not prove target coverage."
+    status_reasons = (
+        _runai_workload_status_reasons(item.get("data"), name, target)
+        if polarity == "present" and observation.get("coverage") == "scoped"
+        else []
+    )
+    if status_reasons:
+        summary += " Status/reason: " + "; ".join(status_reasons)
+    highlights = status_reasons[:]
+    highlights.extend(
+        marker for marker in salient_markers(status_reasons)
+        if marker.casefold() not in {value.casefold() for value in highlights}
+    )
     return artifact(
         agent=agent,
         source="runai",
@@ -768,8 +786,96 @@ def _runai_query_artifact(
             "observation": observation,
             "status_code": item.get("status_code"),
             "data": item.get("data"),
+            "status_reasons": status_reasons,
+        },
+        highlights=highlights,
+    )
+
+
+def _runai_workload_status_reasons(
+    data: object, resource: str, target: AnalysisTarget
+) -> list[str]:
+    """Return bounded status/reason leaves from the identity-matched workload."""
+    if resource not in {"workloads", "workload_by_id", "workload_status"}:
+        return []
+    expected = _runai_expected_identity(resource, target)
+    values: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: object) -> None:
+        if not isinstance(value, str) or not value.strip() or len(values) >= 6:
+            return
+        text = _safe_text(value, limit=240)
+        if text and text.casefold() not in seen:
+            seen.add(text.casefold())
+            values.append(text)
+
+    def walk(value: object) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if str(key).replace("_", "").replace("-", "").casefold() in {
+                    "phase", "reason", "message", "status", "statusreason", "statusmessage"
+                }:
+                    add(child)
+                if isinstance(child, (dict, list)):
+                    walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    for item in _runai_resource_items(data, resource):
+        if _runai_data_contains_identity(
+            {"items": [item]}, expected, resource=resource, target=target
+        ):
+            walk(item)
+    return values
+
+
+def _runai_error_context_artifact(agent: str, item: dict[str, object]):
+    """Keep a masked HTTP error body as synthesis-only context."""
+    status_code = item.get("status_code")
+    message = _runai_error_body_message(item.get("data"))
+    if not item.get("error") or not isinstance(status_code, int) or status_code < 400 or not message:
+        return None
+    name = str(item.get("name") or "resource")
+    return artifact(
+        agent=agent,
+        source="runai",
+        type="runai_api_error_context",
+        status="partial",
+        confidence="low",
+        title=f"Run:ai · {name} error response",
+        query=str(item.get("path") or item.get("query") or ""),
+        summary=f"Run:ai {name} API error response context: {message}",
+        result={
+            "observation": {
+                "kind": "runai_api_error_context",
+                "predicate": f"runai:{name}:error_response",
+                "polarity": "unknown",
+                "coverage": "partial",
+            },
+            "status_code": status_code,
+            "message": message,
         },
     )
+
+
+def _runai_error_body_message(data: object) -> str:
+    if not isinstance(data, dict):
+        return ""
+    error = data.get("error")
+    message = data.get("message")
+    if isinstance(error, dict) and isinstance(error.get("message"), str):
+        return _safe_text(error["message"], limit=300)
+    if isinstance(message, str):
+        return _safe_text(message, limit=300)
+    if isinstance(error, str):
+        if set(data).issubset({"timestamp", "status", "error", "path", "code", "requestId", "traceId"}):
+            return ""
+        return _safe_text(error, limit=300)
+    if "error" in data or "message" in data:
+        return _safe_text(compact(data), limit=300)
+    return ""
 
 
 def _runai_query_observation(

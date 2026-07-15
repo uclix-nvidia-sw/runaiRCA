@@ -24,6 +24,7 @@ from app.collectors.base import (
     incident_time_range,
     ko_en,
     parse_incident_time,
+    salient_markers,
 )
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
@@ -1738,6 +1739,24 @@ class KubernetesCollector:
             )
         ]
         artifacts.append(_pod_lifecycle_artifact(self.name, target, responses))
+        artifacts.append(
+            _container_lifecycle_artifact(
+                self.name,
+                self._settings,
+                target,
+                pod_summary_data,
+                container_diagnostics,
+                time_range=causal_time_range,
+            )
+        )
+        artifacts.extend(
+            _runai_crd_health_artifacts(
+                self.name,
+                self._settings,
+                crd_findings,
+                time_range=causal_time_range,
+            )
+        )
         event_observation = _warning_event_observation(
             causal_target_warning_events,
             time_range=causal_time_range,
@@ -3472,6 +3491,165 @@ def _pod_lifecycle_artifact(
     )
 
 
+def _container_lifecycle_artifact(
+    agent: str,
+    settings: Settings,
+    target: AnalysisTarget,
+    pod_summary: dict[str, object] | None,
+    container_diagnostics: list[dict[str, object]],
+    *,
+    time_range: dict[str, str] | None,
+):
+    """Expose target-container lifecycle facts with their actual occurrence time.
+
+    Pod status is otherwise a current snapshot.  A previous termination has a
+    Kubernetes-provided ``finishedAt`` though, so it can be typed as causal
+    support only when that occurrence belongs to the exact alert Pod and falls
+    within the shared causal window.  A still-firing alert may also be observed
+    in a generic waiting/restart loop when Kubernetes has no termination time.
+    """
+    target_identity_verified = _container_lifecycle_target_verified(pod_summary, target)
+    terminated_times = _container_termination_times_in_range(
+        container_diagnostics, time_range
+    )
+    current_restart_loop = (
+        target_identity_verified
+        and bool(time_range)
+        and not target.resolved_at
+        and any(_container_is_waiting_with_restarts(item) for item in container_diagnostics)
+    )
+    if target_identity_verified and (terminated_times or current_restart_loop):
+        polarity, coverage = "present", "scoped"
+    else:
+        polarity, coverage = "unknown", "partial"
+
+    observation: dict[str, object] = {
+        "kind": "kubernetes_container_lifecycle",
+        "predicate": "kubernetes_target_container_lifecycle",
+        "polarity": polarity,
+        "coverage": coverage,
+        "target_identity_verified": target_identity_verified,
+        "observation_window": time_range or {},
+    }
+    if target_identity_verified:
+        observation["observed_entity"] = {
+            "kind": "pod",
+            "name": target.pod,
+            "namespace": target.namespace,
+        }
+    if terminated_times:
+        observation["evidence_window"] = {
+            "start": terminated_times[0][1],
+            "end": terminated_times[-1][1],
+        }
+    if current_restart_loop:
+        observation["current_restart_loop"] = True
+
+    summary = _container_lifecycle_summary(container_diagnostics)
+    return artifact(
+        agent=agent,
+        source="kubernetes",
+        type="kubernetes_container_lifecycle",
+        status="ok",
+        confidence="high" if polarity == "present" else "low",
+        title=ko_en(
+            settings,
+            "컨테이너 상태(재시작/종료)",
+            "Container lifecycle (restarts/termination)",
+        ),
+        query=(
+            f"kubectl get pod {target.pod} -n {target.namespace}"
+            if target.pod
+            else None
+        ),
+        summary=summary,
+        result={
+            "observation": observation,
+            "pod": target.pod,
+            "namespace": target.namespace,
+            "containers": container_diagnostics,
+        },
+        highlights=salient_markers(container_diagnostics),
+    )
+
+
+def _container_lifecycle_target_verified(
+    pod_summary: dict[str, object] | None, target: AnalysisTarget
+) -> bool:
+    """Require the named alert Pod (and UID when declared) for lifecycle evidence."""
+    return bool(
+        target.pod
+        and isinstance(pod_summary, dict)
+        and str(pod_summary.get("name") or "") == target.pod
+        and (
+            not target.namespace
+            or str(pod_summary.get("namespace") or "") == target.namespace
+        )
+        and _pod_matches_target_uid(pod_summary, target)
+    )
+
+
+def _container_termination_times_in_range(
+    container_diagnostics: list[dict[str, object]], time_range: dict[str, str] | None
+) -> list[tuple[object, str]]:
+    if not time_range:
+        return []
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return []
+    timestamps: list[tuple[object, str]] = []
+    for diagnostic in container_diagnostics:
+        last_terminated = diagnostic.get("lastTerminated")
+        if not isinstance(last_terminated, dict):
+            continue
+        finished_at = last_terminated.get("finishedAt")
+        parsed = parse_incident_time(finished_at)
+        if parsed is not None and start <= parsed <= end:
+            timestamps.append((parsed, str(finished_at)))
+    return sorted(timestamps, key=lambda item: item[0])
+
+
+def _container_is_waiting_with_restarts(diagnostic: dict[str, object]) -> bool:
+    state = diagnostic.get("state")
+    if not isinstance(state, dict) or str(state.get("phase") or "") != "waiting":
+        return False
+    last_terminated = diagnostic.get("lastTerminated")
+    if isinstance(last_terminated, dict) and last_terminated.get("finishedAt"):
+        return False
+    try:
+        return int(diagnostic.get("restartCount") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _container_lifecycle_summary(container_diagnostics: list[dict[str, object]]) -> str:
+    """Keep lifecycle leaf values in the card text as well as its result payload."""
+    if not container_diagnostics:
+        return "No container lifecycle status was returned for the target Pod."
+    containers: list[str] = []
+    for diagnostic in container_diagnostics:
+        name = str(diagnostic.get("name") or "unnamed")
+        fields = [f"restartCount={diagnostic.get('restartCount')}"]
+        state = diagnostic.get("state")
+        if isinstance(state, dict):
+            fields.append("current " + _container_state_text(state))
+        last_terminated = diagnostic.get("lastTerminated")
+        if isinstance(last_terminated, dict):
+            fields.append("lastTerminated " + _container_state_text(last_terminated))
+        containers.append(f"{name}: " + "; ".join(fields))
+    return "Target Pod container lifecycle: " + " | ".join(containers)
+
+
+def _container_state_text(state: dict[str, object]) -> str:
+    fields = [
+        f"{key}={state[key]}"
+        for key in ("phase", "reason", "exitCode", "finishedAt")
+        if state.get(key) is not None
+    ]
+    return ", ".join(fields) if fields else "state reported"
+
+
 def _target_pod_summary(responses: list[dict[str, object]]) -> dict[str, object] | None:
     for response in responses:
         if response.get("name") == "pod":
@@ -5040,7 +5218,7 @@ def _crd_items(read_result: dict) -> list[dict]:
 
 
 def _crd_not_ready(item: dict) -> dict[str, str] | None:
-    """A {kind,name,reason,message} finding when a Run:ai CRD object is NOT healthy.
+    """Report a not-healthy Run:ai CRD with its transition timestamp.
 
     Reads the standard K8s status.conditions (Ready/Succeeded != True is a
     problem; explicit Failed/Degraded == True is a problem) plus a top-level
@@ -5048,6 +5226,7 @@ def _crd_not_ready(item: dict) -> dict[str, str] | None:
     metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
     status = item.get("status") if isinstance(item.get("status"), dict) else {}
     name = str(metadata.get("name") or "")
+    namespace = str(metadata.get("namespace") or "")
     conditions = status.get("conditions")
     for cond in conditions if isinstance(conditions, list) else []:
         if not isinstance(cond, dict):
@@ -5061,18 +5240,72 @@ def _crd_not_ready(item: dict) -> dict[str, str] | None:
             return {
                 "kind": str(item.get("kind") or ""),
                 "name": name,
+                "namespace": namespace,
                 "reason": str(cond.get("reason") or ctype),
                 "message": _clip(str(cond.get("message") or ""), 200),
+                "lastTransitionTime": str(cond.get("lastTransitionTime") or ""),
             }
     phase = str(status.get("phase") or "")
     if phase and phase.lower() in ("failed", "error", "pending", "unschedulable"):
         return {
             "kind": str(item.get("kind") or ""),
             "name": name,
+            "namespace": namespace,
             "reason": phase,
             "message": _clip(str(status.get("message") or ""), 200),
+            "lastTransitionTime": "",
         }
     return None
+
+
+def _runai_crd_health_artifacts(
+    agent: str,
+    settings: Settings,
+    findings: list[dict[str, str]],
+    *,
+    time_range: dict[str, str] | None,
+):
+    """Publish each not-Ready Run:ai CRD as a timestamp-scoped health fact."""
+    start = parse_incident_time((time_range or {}).get("start"))
+    end = parse_incident_time((time_range or {}).get("end"))
+    artifacts = []
+    for finding in findings:
+        transitioned_at = str(finding.get("lastTransitionTime") or "").strip()
+        transition = parse_incident_time(transitioned_at)
+        namespace = str(finding.get("namespace") or "").strip()
+        # A cluster-scoped CRD cannot stand in for a namespaced incident target.
+        # Keep it as context even when its transition falls inside the window.
+        scoped = bool(namespace and transition and start and end and start <= transition <= end)
+        polarity, coverage = ("present", "scoped") if scoped else ("unknown", "partial")
+        kind = str(finding.get("kind") or "Run:ai resource")
+        name = str(finding.get("name") or "unknown")
+        reason = str(finding.get("reason") or "NotReady")
+        message = str(finding.get("message") or "")
+        summary = f"{kind}/{name} is not Ready: {reason}" + (f" — {message}" if message else ".")
+        observation: dict[str, object] = {
+            "kind": "runai_crd_health",
+            "predicate": "runai_crd_health",
+            "polarity": polarity,
+            "coverage": coverage,
+            "observed_entity": {"kind": kind, "name": name, "namespace": namespace},
+            "observation_window": time_range if scoped else {},
+        }
+        if scoped:
+            observation["evidence_window"] = {"start": transitioned_at, "end": transitioned_at}
+        artifacts.append(
+            artifact(
+                agent=agent,
+                source="kubernetes",
+                type="runai_crd_health",
+                status="ok",
+                confidence="high" if scoped else "low",
+                title=ko_en(settings, "Run:ai 리소스 상태", "Run:ai resource health"),
+                summary=summary,
+                result={"finding": finding, "observation": observation},
+                highlights=salient_markers(finding),
+            )
+        )
+    return artifacts
 
 
 def _clip(text: str, limit: int) -> str:

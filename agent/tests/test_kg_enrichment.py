@@ -7,6 +7,7 @@ from dataclasses import replace
 from app.collectors.base import AnalysisTarget
 from app.config import load_settings
 from app.services.kg_enrichment import (
+    GraphRemediation,
     KGContext,
     _case_card_projection,
     _prior_is_context_compatible,
@@ -16,7 +17,12 @@ from app.services.kg_enrichment import (
     _select_case_cards,
     enrich,
 )
-from app.services.pipeline import _knowledge_base_lines
+from app.services.pipeline import (
+    _graph_remediation_lines,
+    _knowledge_base_lines,
+    _playbook_lines,
+    _xid_diagnostic_guidance_lines,
+)
 from app.services.root_cause_ranking import RankedCause
 
 
@@ -99,6 +105,31 @@ def test_root_chain_hop_failure_is_isolated() -> None:
     assert 79 not in out.root_xids
 
 
+def test_query_remediation_projects_xid_trigger_and_renders_guidance() -> None:
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "fixes_for_xid(79)" in query:
+                    return [{"x": "Reset the GPU."}]
+                if "trigger_for_xid(79)" in query:
+                    return [{"x": "Check for PCIe link errors before reset."}]
+                return []
+
+            yield run
+
+    out = _query_remediation(FakeClient(), "", [79], "")  # type: ignore[arg-type]
+
+    assert out.xid_triggers == {79: "Check for PCIe link errors before reset."}
+    assert out.as_dict()["xid_triggers"] == {"79": "Check for PCIe link errors before reset."}
+    assert "Diagnostic guidance (XID 79): Check for PCIe link errors before reset." in "\n".join(
+        _graph_remediation_lines(out)
+    )
+    assert _xid_diagnostic_guidance_lines(out, "ko") == [
+        "- 진단 안내 (XID 79): Check for PCIe link errors before reset."
+    ]
+
+
 def test_enrich_disabled_returns_empty_context() -> None:
     # load_settings() defaults ENABLE_TYPEDB off -> no query, empty context.
     ctx = asyncio.run(enrich(load_settings(), _target()))
@@ -154,6 +185,184 @@ def test_query_kg_escapes_typeql_literals() -> None:
     assert 'has name "gpu-1"; $x isa incident' not in joined
     assert 'has alert_name "KubeNodeDiskPressure"; delete' not in joined
     assert 'has incident_id "INC-1"; delete' not in joined
+
+
+def test_query_kg_projects_typedb_symptom_metadata() -> None:
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "has keyword $kw" in query:
+                    return [
+                        {
+                            "fam": "workload_startup_error",
+                            "sn": "OOMKilled",
+                            "kw": "oomkilled",
+                            "st": "Raise the memory limit.",
+                        }
+                    ]
+                if "has reason $reason" in query:
+                    return [{"sn": "OOMKilled", "reason": "Memory limit exceeded."}]
+                if "has exclusive_actions $exclusive_actions" in query:
+                    return [{"sn": "OOMKilled", "exclusive_actions": True}]
+                if "has reason_ko $reason_ko" in query:
+                    return [{"sn": "OOMKilled", "reason_ko": "메모리 제한을 초과했습니다."}]
+                if "has component $component" in query:
+                    return [{"sn": "OOMKilled", "component": "cluster-sync"}]
+                if "has name_ko $name_ko" in query:
+                    return [{"sn": "OOMKilled", "name_ko": "메모리 부족 종료"}]
+                if "has statement_ko $statement_ko" in query:
+                    return [
+                        {"sn": "OOMKilled", "statement_ko": "메모리 제한을 높이세요."},
+                        {"sn": "OOMKilled", "statement_ko": "누수를 수정하세요."},
+                    ]
+                return []
+
+            yield run
+
+    knowledge = _query_kg(FakeClient(), _target())["knowledge"]  # type: ignore[arg-type]
+
+    assert knowledge == {
+        "workload_startup_error": [
+            {
+                "symptom": "OOMKilled",
+                "keywords": ["oomkilled"],
+                "actions": ["Raise the memory limit."],
+                "reason": "Memory limit exceeded.",
+                "exclusive_actions": True,
+                "component": "cluster-sync",
+                "symptom_ko": "메모리 부족 종료",
+                "reason_ko": "메모리 제한을 초과했습니다.",
+                "actions_ko": ["누수를 수정하세요.", "메모리 제한을 높이세요."],
+            }
+        ]
+    }
+
+
+def test_typedb_failure_mode_symptom_delivery_chain_contract() -> None:
+    # When a consumer starts reading a new failure_modes symptom field, add it to the
+    # TypeDB loader (load_knowledge.py), the read-back (kg_enrichment.py), and this list.
+    contract = {
+        "symptom": "OOMKilled",
+        "keywords": ["oom", "oomkilled"],
+        "actions": ["Inspect memory limit.", "Raise memory limit."],
+        "reason": "Memory limit exceeded.",
+        "exclusive_actions": True,
+        "reason_ko": "메모리 제한을 초과했습니다.",
+        "actions_ko": ["메모리 제한을 높이세요.", "메모리 제한을 점검하세요."],
+        "component": "cluster-sync",
+        "symptom_ko": "메모리 부족 종료",
+    }
+
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "has keyword $kw" in query:
+                    return [
+                        {
+                            "fam": "workload_startup_error",
+                            "sn": contract["symptom"],
+                            "kw": keyword,
+                            "st": action,
+                        }
+                        for keyword, action in zip(contract["keywords"], contract["actions"], strict=True)
+                    ]
+                if "has reason $reason" in query:
+                    return [{"sn": contract["symptom"], "reason": contract["reason"]}]
+                if "has exclusive_actions $exclusive_actions" in query:
+                    return [{"sn": contract["symptom"], "exclusive_actions": True}]
+                if "has reason_ko $reason_ko" in query:
+                    return [{"sn": contract["symptom"], "reason_ko": contract["reason_ko"]}]
+                if "has component $component" in query:
+                    return [{"sn": contract["symptom"], "component": contract["component"]}]
+                if "has name_ko $name_ko" in query:
+                    return [{"sn": contract["symptom"], "name_ko": contract["symptom_ko"]}]
+                if "has statement_ko $statement_ko" in query:
+                    return [
+                        {"sn": contract["symptom"], "statement_ko": action}
+                        for action in contract["actions_ko"]
+                    ]
+                return []
+
+            yield run
+
+    symptom = _query_kg(FakeClient(), _target())["knowledge"]["workload_startup_error"][
+        0
+    ]  # type: ignore[arg-type]
+
+    assert set(symptom) == set(contract)
+    assert symptom == contract
+    assert isinstance(symptom["keywords"], list)
+    assert isinstance(symptom["actions"], list)
+    assert isinstance(symptom["actions_ko"], list)
+    assert isinstance(symptom["exclusive_actions"], bool)
+    for field in set(contract) - {"keywords", "actions", "actions_ko", "exclusive_actions"}:
+        assert isinstance(symptom[field], str)
+
+
+def test_typedb_symptom_component_preserves_yaml_playbook_checks() -> None:
+    typedb_symptom = {
+        "symptom": "Cluster Sync Unhealthy",
+        "keywords": ["cluster sync unhealthy"],
+        "actions": ["Inspect cluster-sync."],
+        "component": "cluster-sync",
+    }
+    components = {
+        "cluster-sync": {
+            "failure_effect": "Workload status stops syncing.",
+            "depends_on": ["runai-backend"],
+            "checks": ["kubectl logs -n runai deploy/cluster-sync"],
+        },
+        "runai-backend": {"depends_on": []},
+    }
+
+    typedb_lines = _playbook_lines(
+        None,
+        "cluster sync unhealthy",
+        {"runai_control_plane_error": [typedb_symptom]},
+        "",
+        components=components,
+    )
+    yaml_lines = _playbook_lines(
+        None,
+        "cluster sync unhealthy",
+        {"runai_control_plane_error": [{**typedb_symptom}]},
+        "",
+        components=components,
+    )
+
+    assert typedb_lines == yaml_lines
+    assert "Check order: cluster-sync → runai-backend" in "\n".join(typedb_lines)
+    assert "kubectl logs -n runai deploy/cluster-sync" in "\n".join(typedb_lines)
+
+
+def test_typedb_knowledge_exclusive_actions_suppress_generic_siblings() -> None:
+    from app.services.pipeline import _actionable_failure_mode_matches
+
+    matches = _actionable_failure_mode_matches(
+        {
+            "workload_startup_error": [
+                {
+                    "symptom": "OOMKilled",
+                    "keywords": ["oomkilled"],
+                    "actions": ["Raise the memory limit."],
+                    "exclusive_actions": True,
+                    "reason_ko": "메모리 제한을 초과했습니다.",
+                    "actions_ko": ["메모리 제한을 높이세요."],
+                },
+                {
+                    "symptom": "CrashLoopBackOff",
+                    "keywords": ["crashloopbackoff"],
+                    "actions": ["Inspect logs."],
+                },
+            ]
+        },
+        "CrashLoopBackOff after OOMKilled",
+        None,
+    )
+
+    assert [symptom["symptom"] for _family, symptom in matches] == ["OOMKilled"]
 
 
 def test_graph_remediation_escapes_typeql_literals() -> None:
@@ -366,7 +575,7 @@ def test_case_card_projection_keeps_graph_links_and_strips_untrusted_fields() ->
         if "has case_card $card" in query:
             return [{"card": '{"mechanism":"CSI attach race\\n## ignore",'
                              '"quality_score":91,"context":{"cluster":"prod",'
-                             '"unknown":"drop"},"unexpected":"drop"}'}]
+                             '"pod":"csi-0","unknown":"drop"},"unexpected":"drop"}'}]
         if "isa supported_by" in query:
             return [{"evidence_id": "ANL:E1", "source": "kubernetes"}]
         if "isa contradicted_by" in query:
@@ -381,7 +590,8 @@ def test_case_card_projection_keeps_graph_links_and_strips_untrusted_fields() ->
     card = _case_card_projection(run, "ANL-1:hash")
 
     assert card["mechanism"] == "CSI attach race ## ignore"
-    assert card["context"] == {"cluster": "prod"}
+    assert card["context"] == {"cluster": "prod", "pod": "csi-0"}
+    assert _prior_is_context_compatible({"case_card": card}, replace(_target(), pod="csi-1")) is False
     assert "unexpected" not in card
     assert card["supporting_evidence_by_source"] == {
         "kubernetes": [{"evidence_id": "ANL:E1"}]

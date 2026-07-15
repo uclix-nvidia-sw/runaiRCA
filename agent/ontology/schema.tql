@@ -23,6 +23,9 @@ attribute alert_name, value string;
 attribute fingerprint, value string;
 attribute occurrence_count, value integer;
 attribute reason, value string;
+attribute reason_ko, value string;
+attribute name_ko, value string;
+attribute component, value string;
 attribute condition_type, value string;
 attribute keyword, value string;
 attribute workload_type, value string;
@@ -35,9 +38,12 @@ attribute confidence, value string;
 attribute blast_radius, value string;
 attribute subtype, value string;
 attribute statement, value string;
+attribute statement_ko, value string;
+attribute exclusive_actions, value boolean;
 attribute created_at, value datetime;
 # --- XID GPU-error catalog attributes ---
 attribute xid_code, value integer;
+attribute xid_trigger, value string;
 attribute mnemonic, value string;
 attribute description, value string;
 # --- platform-architecture attributes (control_plane_component) ---
@@ -220,11 +226,16 @@ entity analysis_run,
 entity symptom,
     owns name,
     owns reason,
+    owns reason_ko @card(0..1),
+    owns name_ko @card(0..1),
+    owns component @card(0..1),
+    owns exclusive_actions @card(0..1),
     owns condition_type,
     # A symptom matches on many keywords. TypeDB 3.x defaults ownership to
     # @card(0..1), so this MUST be explicit or multi-keyword insert fails at
     # commit ([CNT5] @card(0..1) violated).
     owns keyword @card(0..),
+    owns statement_ko @card(0..),
     # Version-linked known issues (knowledge/runai_known_issues.yaml). Optional:
     # most symptoms carry no version. @card(0..1) is the 3.x default, stated for
     # clarity alongside the multi-valued keyword above.
@@ -492,6 +503,7 @@ relation package_has_template, relates package, relates template, relates bindin
 # knowledge layer stays uniform — xid_error slots in wherever a symptom does.
 entity xid_error,
     owns xid_code @key,
+    owns xid_trigger @card(0..1),
     owns mnemonic,
     owns description,
     owns severity,

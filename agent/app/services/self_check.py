@@ -344,7 +344,14 @@ async def _llm_refute(
         "whose observation is unknown/partial are context only: they can refute or "
         "suggest a next check, but can never support the proposed cause. The \"Specific "
         "or canonical evidence present\" flag is authoritative; when false, you MUST "
-        "return supported=false.\n"
+        "return supported=false. Distinguish OOM scope using positive evidence: the "
+        "target container's lastState.terminated.reason=OOMKilled is direct evidence "
+        "of a container OOM. When that container has a memory limit and node-level "
+        "pressure is absent or contradicted, treat the cgroup limit as the primary "
+        "mechanism and CrashLoopBackOff as its consequence. A missing dmesg/journal "
+        "record is a coverage gap, not positive evidence of node-level OOM; only "
+        "separate incident-scoped kernel OOM, eviction, or active MemoryPressure "
+        "evidence establishes that competing scope.\n"
         f"Write the caveat and next_check in {caveat_lang}. Respond with a JSON object: "
         '{"supported": bool, "confidence": "low|medium|high", "caveat": str, '
         '"next_check": str}. '
@@ -461,7 +468,8 @@ async def _llm_verify_matches(
         "not fit — when unsure, keep it. The declared alert payload is a source "
         "observation, not a collector result: an explicit positive signature there may "
         "support a match even when collectors no longer retain the event, but false, "
-        'normal, recovered, or negated values do not. Respond with a JSON object: {"refuted": [exact '
+        "normal, recovered, or negated values do not. Respond with a JSON object: "
+        '{"refuted": [exact '
         'names that are NOT supported by the evidence]}.'
     )
     safe_alert = masker.mask_text(" ".join(str(declared_alert or "").split()))

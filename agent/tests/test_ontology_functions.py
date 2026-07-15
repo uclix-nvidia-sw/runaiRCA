@@ -14,6 +14,7 @@ def test_functions_tql_defines_the_expected_functions() -> None:
     assert "define" in text
     for name in (
         "fixes_for_xid",
+        "trigger_for_xid",
         "xids_for_gpu_model",
         "fixes_for_family",
         "root_xids_for",

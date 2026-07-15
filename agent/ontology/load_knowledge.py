@@ -63,7 +63,17 @@ def _ensure_cause(tx: Any, family: str) -> None:
         tx.query(f'insert $x isa {family}, has subtype "{esc(family)}";').resolve()
 
 
-def _ensure_symptom(tx: Any, name: str, keywords: list[str], reason: str = "") -> None:
+def _ensure_symptom(
+    tx: Any,
+    name: str,
+    keywords: list[str],
+    reason: str = "",
+    reason_ko: str = "",
+    exclusive_actions: bool = False,
+    actions_ko: list[str] | None = None,
+    component: str = "",
+    name_ko: str = "",
+) -> None:
     if not _exists(tx, f'$x isa symptom, has name "{esc(name)}";'):
         tx.query(f'insert $x isa symptom, has name "{esc(name)}";').resolve()
     for kw in keywords:
@@ -79,6 +89,44 @@ def _ensure_symptom(tx: Any, name: str, keywords: list[str], reason: str = "") -
         tx.query(
             f'match $s isa symptom, has name "{esc(name)}"; '
             f'insert $s has reason "{esc(reason)}";'
+        ).resolve()
+    if reason_ko and not _exists(
+        tx, f'$x isa symptom, has name "{esc(name)}", has reason_ko "{esc(reason_ko)}";'
+    ):
+        tx.query(
+            f'match $s isa symptom, has name "{esc(name)}"; '
+            f'insert $s has reason_ko "{esc(reason_ko)}";'
+        ).resolve()
+    if component and not _exists(
+        tx, f'$x isa symptom, has name "{esc(name)}", has component "{esc(component)}";'
+    ):
+        tx.query(
+            f'match $s isa symptom, has name "{esc(name)}"; '
+            f'insert $s has component "{esc(component)}";'
+        ).resolve()
+    if name_ko and not _exists(
+        tx, f'$x isa symptom, has name "{esc(name)}", has name_ko "{esc(name_ko)}";'
+    ):
+        tx.query(
+            f'match $s isa symptom, has name "{esc(name)}"; '
+            f'insert $s has name_ko "{esc(name_ko)}";'
+        ).resolve()
+    if exclusive_actions and not _exists(
+        tx, f'$x isa symptom, has name "{esc(name)}", has exclusive_actions true;'
+    ):
+        tx.query(
+            f'match $s isa symptom, has name "{esc(name)}"; '
+            "insert $s has exclusive_actions true;"
+        ).resolve()
+    for statement_ko in actions_ko or []:
+        if _exists(
+            tx,
+            f'$x isa symptom, has name "{esc(name)}", has statement_ko "{esc(statement_ko)}";',
+        ):
+            continue
+        tx.query(
+            f'match $s isa symptom, has name "{esc(name)}"; '
+            f'insert $s has statement_ko "{esc(statement_ko)}";'
         ).resolve()
 
 
@@ -144,6 +192,15 @@ def main() -> int:
                         name,
                         [str(k) for k in sym.get("keywords", [])],
                         str(sym.get("reason", "")).strip(),
+                        str(sym.get("reason_ko", "")).strip(),
+                        sym.get("exclusive_actions") is True,
+                        [
+                            str(action).strip()
+                            for action in sym.get("actions_ko", [])
+                            if str(action).strip()
+                        ],
+                        str(sym.get("component") or "").strip(),
+                        str(sym.get("name_ko") or "").strip(),
                     )
                     _relate_indicates(tx, name, family)
                     symptoms += 1

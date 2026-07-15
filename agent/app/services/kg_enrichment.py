@@ -89,6 +89,7 @@ select $statement, $outcome;
 # select $x;` call form is the validated 3.11.x syntax — do not "simplify" it.
 _FN_FIXES_FOR_FAMILY = 'match let $x in fixes_for_family("{family}"); select $x;'
 _FN_FIXES_FOR_XID = "match let $x in fixes_for_xid({code}); select $x;"
+_FN_TRIGGER_FOR_XID = "match let $x in trigger_for_xid({code}); select $x;"
 _FN_XIDS_FOR_GPU_MODEL = 'match let $x in xids_for_gpu_model("{model}"); select $x;'
 # Reverse leads_to: the root fault(s) that escalate INTO an observed XID.
 _FN_ROOT_XIDS_FOR = "match let $x in root_xids_for({code}); select $x;"
@@ -142,6 +143,36 @@ _KNOWLEDGE_REASON_QUERY = """
 match
   $sy isa symptom, has name $sn, has reason $reason;
 select $sn, $reason;
+"""
+
+_KNOWLEDGE_EXCLUSIVE_ACTIONS_QUERY = """
+match
+  $sy isa symptom, has name $sn, has exclusive_actions $exclusive_actions;
+select $sn, $exclusive_actions;
+"""
+
+_KNOWLEDGE_REASON_KO_QUERY = """
+match
+  $sy isa symptom, has name $sn, has reason_ko $reason_ko;
+select $sn, $reason_ko;
+"""
+
+_KNOWLEDGE_COMPONENT_QUERY = """
+match
+  $sy isa symptom, has name $sn, has component $component;
+select $sn, $component;
+"""
+
+_KNOWLEDGE_NAME_KO_QUERY = """
+match
+  $sy isa symptom, has name $sn, has name_ko $name_ko;
+select $sn, $name_ko;
+"""
+
+_KNOWLEDGE_ACTIONS_KO_QUERY = """
+match
+  $sy isa symptom, has name $sn, has statement_ko $statement_ko;
+select $sn, $statement_ko;
 """
 
 
@@ -242,6 +273,7 @@ class GraphRemediation:
 
     family_fixes: list[str] = field(default_factory=list)
     xid_fixes: dict[int, list[str]] = field(default_factory=dict)
+    xid_triggers: dict[int, str] = field(default_factory=dict)
     model_xids: dict[str, list[int]] = field(default_factory=dict)
     # observed XID -> root XID(s) that escalate into it, walked TRANSITIVELY back
     # along the leads_to chain (nearest hop first). E.g. observing 154 with chain
@@ -254,6 +286,7 @@ class GraphRemediation:
         return not (
             self.family_fixes
             or self.xid_fixes
+            or self.xid_triggers
             or self.model_xids
             or self.root_xids
             or self.verified_actions
@@ -263,6 +296,7 @@ class GraphRemediation:
         return {
             "family_fixes": self.family_fixes,
             "xid_fixes": {str(k): v for k, v in self.xid_fixes.items()},
+            "xid_triggers": {str(k): v for k, v in self.xid_triggers.items()},
             "model_xids": {k: v for k, v in self.model_xids.items()},
             "root_xids": {str(k): v for k, v in self.root_xids.items()},
             "verified_actions": self.verified_actions,
@@ -332,6 +366,9 @@ def _query_remediation(
             fixes = _statements(run(_FN_FIXES_FOR_XID.format(code=code)))
             if fixes:
                 out.xid_fixes[code] = fixes
+            triggers = _statements(run(_FN_TRIGGER_FOR_XID.format(code=code)))
+            if triggers:
+                out.xid_triggers[code] = triggers[0]
             # Drill to the ROOT of the leads_to causal chain: which fault(s)
             # escalate INTO this observed XID. root_xids_for is one hop back, so
             # we walk it TRANSITIVELY (bounded BFS) — a chain 144 → 48 → 154 must
@@ -352,6 +389,10 @@ def _query_remediation(
                         rfixes = _statements(run(_FN_FIXES_FOR_XID.format(code=root)))
                         if rfixes:
                             out.xid_fixes[root] = rfixes
+                    if root not in out.xid_triggers:
+                        triggers = _statements(run(_FN_TRIGGER_FOR_XID.format(code=root)))
+                        if triggers:
+                            out.xid_triggers[root] = triggers[0]
         if gpu_model:
             rows = run(_FN_XIDS_FOR_GPU_MODEL.format(model=escape_typeql(gpu_model)))
             xids = sorted({int(v) for v in _values(rows) if _is_int(v)})
@@ -502,6 +543,7 @@ _CASE_CONTEXT_FIELDS = frozenset(
         "cluster",
         "node",
         "namespace",
+        "pod",
         "project",
         "queue",
         "workload",
@@ -723,6 +765,11 @@ def _query_kg(
 
         knowledge_rows = run(_KNOWLEDGE_QUERY)
         knowledge_reason_rows = run(_KNOWLEDGE_REASON_QUERY)
+        knowledge_exclusive_action_rows = run(_KNOWLEDGE_EXCLUSIVE_ACTIONS_QUERY)
+        knowledge_reason_ko_rows = run(_KNOWLEDGE_REASON_KO_QUERY)
+        knowledge_component_rows = run(_KNOWLEDGE_COMPONENT_QUERY)
+        knowledge_name_ko_rows = run(_KNOWLEDGE_NAME_KO_QUERY)
+        knowledge_actions_ko_rows = run(_KNOWLEDGE_ACTIONS_KO_QUERY)
         reasoning: dict[str, Any] = {}
         component = target.workload_name
         if component:
@@ -750,6 +797,32 @@ def _query_kg(
         for row in knowledge_reason_rows
         if row.get("sn") and row.get("reason")
     }
+    exclusive_actions = {
+        str(row.get("sn") or "")
+        for row in knowledge_exclusive_action_rows
+        if row.get("sn") and str(row.get("exclusive_actions")).casefold() == "true"
+    }
+    reasons_ko = {
+        str(row.get("sn") or ""): str(row.get("reason_ko") or "")
+        for row in knowledge_reason_ko_rows
+        if row.get("sn") and row.get("reason_ko")
+    }
+    components = {
+        str(row.get("sn") or ""): str(row.get("component") or "")
+        for row in knowledge_component_rows
+        if row.get("sn") and row.get("component")
+    }
+    names_ko = {
+        str(row.get("sn") or ""): str(row.get("name_ko") or "")
+        for row in knowledge_name_ko_rows
+        if row.get("sn") and row.get("name_ko")
+    }
+    actions_ko: dict[str, set[str]] = {}
+    for row in knowledge_actions_ko_rows:
+        sname = str(row.get("sn") or "")
+        statement_ko = str(row.get("statement_ko") or "")
+        if sname and statement_ko:
+            actions_ko.setdefault(sname, set()).add(statement_ko)
     grouped: dict[tuple[str, str], dict[str, set[str]]] = {}
     for r in knowledge_rows:
         fam = str(r.get("fam") or "")
@@ -769,6 +842,11 @@ def _query_kg(
                 "keywords": sorted(entry["keywords"]),
                 "actions": sorted(entry["actions"]),
                 "reason": reasons.get(sname, ""),
+                "exclusive_actions": sname in exclusive_actions,
+                "component": components.get(sname, ""),
+                "symptom_ko": names_ko.get(sname, ""),
+                "reason_ko": reasons_ko.get(sname, ""),
+                "actions_ko": sorted(actions_ko.get(sname, set())),
             }
         )
 

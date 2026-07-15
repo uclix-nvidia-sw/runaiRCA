@@ -23,6 +23,12 @@ fun fixes_for_xid($code: integer) -> { statement }:
     $a has statement $s;
   return { $s };
 
+# NVIDIA diagnostic guidance authored for a specific XID code.
+fun trigger_for_xid($code: integer) -> { xid_trigger }:
+  match
+    $x isa xid_error, has xid_code $c, has xid_trigger $trigger; $c == $code;
+  return { $trigger };
+
 # XID codes that can occur on a given GPU model (xid_error -> applies_to -> gpu_model).
 fun xids_for_gpu_model($model: string) -> { xid_code }:
   match

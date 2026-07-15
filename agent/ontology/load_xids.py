@@ -71,6 +71,17 @@ def _ensure_xid(tx: Any, code: int, mnemonic: str, description: str, severity: s
     ).resolve()
 
 
+def _ensure_xid_trigger(tx: Any, code: int, trigger: str) -> None:
+    if not trigger or _exists(
+        tx, f'$x isa xid_error, has xid_code {code}, has xid_trigger "{esc(trigger)}";'
+    ):
+        return
+    tx.query(
+        f'match $x isa xid_error, has xid_code {code}; '
+        f'insert $x has xid_trigger "{esc(trigger)}";'
+    ).resolve()
+
+
 def _ensure_action(tx: Any, statement: str) -> None:
     if not _exists(tx, f'$x isa action, has statement "{esc(statement)}";'):
         tx.query(f'insert $x isa action, has statement "{esc(statement)}";').resolve()
@@ -169,6 +180,7 @@ def main() -> int:
                     str(entry.get("description", "")),
                     str(entry.get("severity", "")),
                 )
+                _ensure_xid_trigger(tx, code, str(entry.get("trigger", "")).strip())
                 _relate_indicates(tx, code)
                 n_xids += 1
                 for model in entry.get("gpu_models", []) or []:

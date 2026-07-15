@@ -403,6 +403,49 @@ def test_llm_cannot_keep_confidence_from_context_only_evidence(monkeypatch):
     assert out["next_check"]
 
 
+def test_llm_refute_distinguishes_container_oom_from_node_oom(monkeypatch):
+    settings = replace(
+        make_settings(), language="ko", llm_model_self_check="m"
+    )
+    prompts: list[str] = []
+
+    async def fake_complete_json(_settings, *, system, **_kwargs):
+        prompts.append(system)
+        return {
+            "supported": True,
+            "confidence": "high",
+            "caveat": "",
+            "next_check": "",
+        }
+
+    monkeypatch.setattr("app.services.self_check.llm_configured", lambda *_a, **_k: True)
+    monkeypatch.setattr("app.services.self_check.complete_json", fake_complete_json)
+    top = RankedCause(
+        family="workload_startup_error",
+        confidence="high",
+        score=8.0,
+        rationale=["target container terminated reason=OOMKilled"],
+        evidence_agents=["kubernetes"],
+    )
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary=(
+                "target container lastState.terminated.reason=OOMKilled; "
+                "resources.limits.memory=256Mi; MemoryPressure=False"
+            ),
+        )
+    ]
+
+    _run(refute_top_cause(settings, top, results))
+
+    assert prompts
+    assert "cgroup limit as the primary mechanism" in prompts[0]
+    assert "missing dmesg/journal record is a coverage gap" in prompts[0]
+    assert "separate incident-scoped kernel OOM" in prompts[0]
+
+
 def test_llm_caveat_and_next_check_are_single_line(monkeypatch):
     settings = replace(make_settings(), llm_model_self_check="m")
 
