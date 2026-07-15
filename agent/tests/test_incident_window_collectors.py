@@ -2242,6 +2242,46 @@ def test_target_container_termination_in_causal_window_is_scoped_and_matchable()
     ) == ("unknown", "partial")
 
 
+def test_runai_crd_health_transition_is_scoped_and_matchable() -> None:
+    target = replace(
+        make_target(),
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    finding = {
+        "kind": "Workload",
+        "name": "training-1",
+        "reason": "Unschedulable",
+        "message": "quota exhausted",
+        "lastTransitionTime": "2026-07-10T01:04:00Z",
+    }
+    artifacts = kubernetes._runai_crd_health_artifacts(
+        "kubernetes", make_settings(), [finding], time_range=causal_evidence_time_range(target)
+    )
+
+    assert len(artifacts) == 1
+    observation = artifacts[0].result["observation"]
+    assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
+    assert "unschedulable" in pipeline._observed_text(
+        [
+            CollectorResult(
+                agent="kubernetes", status="ok", summary="", confidence="high", artifacts=artifacts
+            )
+        ]
+    )
+
+    outside = kubernetes._runai_crd_health_artifacts(
+        "kubernetes",
+        make_settings(),
+        [{**finding, "lastTransitionTime": "2026-07-10T01:11:00Z"}],
+        time_range=causal_evidence_time_range(target),
+    )[0]
+    assert (
+        outside.result["observation"]["polarity"],
+        outside.result["observation"]["coverage"],
+    ) == ("unknown", "partial")
+
+
 def _node_condition_result(target, condition: dict[str, str]) -> CollectorResult:
     responses = [
         {

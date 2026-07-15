@@ -1749,6 +1749,14 @@ class KubernetesCollector:
                 time_range=causal_time_range,
             )
         )
+        artifacts.extend(
+            _runai_crd_health_artifacts(
+                self.name,
+                self._settings,
+                crd_findings,
+                time_range=causal_time_range,
+            )
+        )
         event_observation = _warning_event_observation(
             causal_target_warning_events,
             time_range=causal_time_range,
@@ -5210,7 +5218,7 @@ def _crd_items(read_result: dict) -> list[dict]:
 
 
 def _crd_not_ready(item: dict) -> dict[str, str] | None:
-    """A {kind,name,reason,message} finding when a Run:ai CRD object is NOT healthy.
+    """Report a not-healthy Run:ai CRD with its transition timestamp.
 
     Reads the standard K8s status.conditions (Ready/Succeeded != True is a
     problem; explicit Failed/Degraded == True is a problem) plus a top-level
@@ -5233,6 +5241,7 @@ def _crd_not_ready(item: dict) -> dict[str, str] | None:
                 "name": name,
                 "reason": str(cond.get("reason") or ctype),
                 "message": _clip(str(cond.get("message") or ""), 200),
+                "lastTransitionTime": str(cond.get("lastTransitionTime") or ""),
             }
     phase = str(status.get("phase") or "")
     if phase and phase.lower() in ("failed", "error", "pending", "unschedulable"):
@@ -5241,8 +5250,56 @@ def _crd_not_ready(item: dict) -> dict[str, str] | None:
             "name": name,
             "reason": phase,
             "message": _clip(str(status.get("message") or ""), 200),
+            "lastTransitionTime": "",
         }
     return None
+
+
+def _runai_crd_health_artifacts(
+    agent: str,
+    settings: Settings,
+    findings: list[dict[str, str]],
+    *,
+    time_range: dict[str, str] | None,
+):
+    """Publish each not-Ready Run:ai CRD as a timestamp-scoped health fact."""
+    start = parse_incident_time((time_range or {}).get("start"))
+    end = parse_incident_time((time_range or {}).get("end"))
+    artifacts = []
+    for finding in findings:
+        transitioned_at = str(finding.get("lastTransitionTime") or "").strip()
+        transition = parse_incident_time(transitioned_at)
+        scoped = bool(transition and start and end and start <= transition <= end)
+        polarity, coverage = ("present", "scoped") if scoped else ("unknown", "partial")
+        kind = str(finding.get("kind") or "Run:ai resource")
+        name = str(finding.get("name") or "unknown")
+        reason = str(finding.get("reason") or "NotReady")
+        message = str(finding.get("message") or "")
+        summary = f"{kind}/{name} is not Ready: {reason}" + (f" — {message}" if message else ".")
+        observation: dict[str, object] = {
+            "kind": "runai_crd_health",
+            "predicate": "runai_crd_health",
+            "polarity": polarity,
+            "coverage": coverage,
+            "observed_entity": {"kind": kind, "name": name},
+            "observation_window": time_range if scoped else {},
+        }
+        if scoped:
+            observation["evidence_window"] = {"start": transitioned_at, "end": transitioned_at}
+        artifacts.append(
+            artifact(
+                agent=agent,
+                source="kubernetes",
+                type="runai_crd_health",
+                status="ok",
+                confidence="high" if scoped else "low",
+                title=ko_en(settings, "Run:ai 리소스 상태", "Run:ai resource health"),
+                summary=summary,
+                result={"finding": finding, "observation": observation},
+                highlights=salient_markers(finding),
+            )
+        )
+    return artifacts
 
 
 def _clip(text: str, limit: int) -> str:
