@@ -24,6 +24,7 @@ from app.collectors.base import (
     incident_time_range,
     ko_en,
     parse_incident_time,
+    salient_markers,
 )
 from app.collectors.http_json import compact, get_json
 from app.config import Settings
@@ -1738,6 +1739,16 @@ class KubernetesCollector:
             )
         ]
         artifacts.append(_pod_lifecycle_artifact(self.name, target, responses))
+        artifacts.append(
+            _container_lifecycle_artifact(
+                self.name,
+                self._settings,
+                target,
+                pod_summary_data,
+                container_diagnostics,
+                time_range=causal_time_range,
+            )
+        )
         event_observation = _warning_event_observation(
             causal_target_warning_events,
             time_range=causal_time_range,
@@ -3470,6 +3481,165 @@ def _pod_lifecycle_artifact(
             ),
         },
     )
+
+
+def _container_lifecycle_artifact(
+    agent: str,
+    settings: Settings,
+    target: AnalysisTarget,
+    pod_summary: dict[str, object] | None,
+    container_diagnostics: list[dict[str, object]],
+    *,
+    time_range: dict[str, str] | None,
+):
+    """Expose target-container lifecycle facts with their actual occurrence time.
+
+    Pod status is otherwise a current snapshot.  A previous termination has a
+    Kubernetes-provided ``finishedAt`` though, so it can be typed as causal
+    support only when that occurrence belongs to the exact alert Pod and falls
+    within the shared causal window.  A still-firing alert may also be observed
+    in a generic waiting/restart loop when Kubernetes has no termination time.
+    """
+    target_identity_verified = _container_lifecycle_target_verified(pod_summary, target)
+    terminated_times = _container_termination_times_in_range(
+        container_diagnostics, time_range
+    )
+    current_restart_loop = (
+        target_identity_verified
+        and bool(time_range)
+        and not target.resolved_at
+        and any(_container_is_waiting_with_restarts(item) for item in container_diagnostics)
+    )
+    if target_identity_verified and (terminated_times or current_restart_loop):
+        polarity, coverage = "present", "scoped"
+    else:
+        polarity, coverage = "unknown", "partial"
+
+    observation: dict[str, object] = {
+        "kind": "kubernetes_container_lifecycle",
+        "predicate": "kubernetes_target_container_lifecycle",
+        "polarity": polarity,
+        "coverage": coverage,
+        "target_identity_verified": target_identity_verified,
+        "observation_window": time_range or {},
+    }
+    if target_identity_verified:
+        observation["observed_entity"] = {
+            "kind": "pod",
+            "name": target.pod,
+            "namespace": target.namespace,
+        }
+    if terminated_times:
+        observation["evidence_window"] = {
+            "start": terminated_times[0][1],
+            "end": terminated_times[-1][1],
+        }
+    if current_restart_loop:
+        observation["current_restart_loop"] = True
+
+    summary = _container_lifecycle_summary(container_diagnostics)
+    return artifact(
+        agent=agent,
+        source="kubernetes",
+        type="kubernetes_container_lifecycle",
+        status="ok",
+        confidence="high" if polarity == "present" else "low",
+        title=ko_en(
+            settings,
+            "컨테이너 상태(재시작/종료)",
+            "Container lifecycle (restarts/termination)",
+        ),
+        query=(
+            f"kubectl get pod {target.pod} -n {target.namespace}"
+            if target.pod
+            else None
+        ),
+        summary=summary,
+        result={
+            "observation": observation,
+            "pod": target.pod,
+            "namespace": target.namespace,
+            "containers": container_diagnostics,
+        },
+        highlights=salient_markers(container_diagnostics),
+    )
+
+
+def _container_lifecycle_target_verified(
+    pod_summary: dict[str, object] | None, target: AnalysisTarget
+) -> bool:
+    """Require the named alert Pod (and UID when declared) for lifecycle evidence."""
+    return bool(
+        target.pod
+        and isinstance(pod_summary, dict)
+        and str(pod_summary.get("name") or "") == target.pod
+        and (
+            not target.namespace
+            or str(pod_summary.get("namespace") or "") == target.namespace
+        )
+        and _pod_matches_target_uid(pod_summary, target)
+    )
+
+
+def _container_termination_times_in_range(
+    container_diagnostics: list[dict[str, object]], time_range: dict[str, str] | None
+) -> list[tuple[object, str]]:
+    if not time_range:
+        return []
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return []
+    timestamps: list[tuple[object, str]] = []
+    for diagnostic in container_diagnostics:
+        last_terminated = diagnostic.get("lastTerminated")
+        if not isinstance(last_terminated, dict):
+            continue
+        finished_at = last_terminated.get("finishedAt")
+        parsed = parse_incident_time(finished_at)
+        if parsed is not None and start <= parsed <= end:
+            timestamps.append((parsed, str(finished_at)))
+    return sorted(timestamps, key=lambda item: item[0])
+
+
+def _container_is_waiting_with_restarts(diagnostic: dict[str, object]) -> bool:
+    state = diagnostic.get("state")
+    if not isinstance(state, dict) or str(state.get("phase") or "") != "waiting":
+        return False
+    last_terminated = diagnostic.get("lastTerminated")
+    if isinstance(last_terminated, dict) and last_terminated.get("finishedAt"):
+        return False
+    try:
+        return int(diagnostic.get("restartCount") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _container_lifecycle_summary(container_diagnostics: list[dict[str, object]]) -> str:
+    """Keep lifecycle leaf values in the card text as well as its result payload."""
+    if not container_diagnostics:
+        return "No container lifecycle status was returned for the target Pod."
+    containers: list[str] = []
+    for diagnostic in container_diagnostics:
+        name = str(diagnostic.get("name") or "unnamed")
+        fields = [f"restartCount={diagnostic.get('restartCount')}"]
+        state = diagnostic.get("state")
+        if isinstance(state, dict):
+            fields.append("current " + _container_state_text(state))
+        last_terminated = diagnostic.get("lastTerminated")
+        if isinstance(last_terminated, dict):
+            fields.append("lastTerminated " + _container_state_text(last_terminated))
+        containers.append(f"{name}: " + "; ".join(fields))
+    return "Target Pod container lifecycle: " + " | ".join(containers)
+
+
+def _container_state_text(state: dict[str, object]) -> str:
+    fields = [
+        f"{key}={state[key]}"
+        for key in ("phase", "reason", "exitCode", "finishedAt")
+        if state.get(key) is not None
+    ]
+    return ", ".join(fields) if fields else "state reported"
 
 
 def _target_pod_summary(responses: list[dict[str, object]]) -> dict[str, object] | None:

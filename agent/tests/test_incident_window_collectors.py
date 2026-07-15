@@ -28,6 +28,7 @@ from app.collectors.postgres import (
     _postgres_result,
     _verified_target_aggregate,
 )
+from app.services import pipeline
 from app.services.evidence_blackboard import Blackboard, EvidenceEligibility
 from app.services.root_cause_ranking import rank_root_cause_candidates
 from tests.test_orchestrator import make_settings, make_target
@@ -2170,6 +2171,75 @@ def test_kubernetes_warning_event_observation_exposes_actual_event_span() -> Non
         "start": "2026-07-10T01:11:00Z",
         "end": "2026-07-10T01:12:00Z",
     }
+
+
+def test_target_container_termination_in_causal_window_is_scoped_and_matchable() -> None:
+    target = replace(
+        make_target(),
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    diagnostics = [
+        {
+            "name": "main",
+            "restartCount": 2,
+            "state": {"phase": "waiting", "reason": "CrashLoopBackOff"},
+            "lastTerminated": {
+                "phase": "terminated",
+                "reason": "OOMKilled",
+                "exitCode": 137,
+                "finishedAt": "2026-07-10T01:04:00Z",
+            },
+        }
+    ]
+    lifecycle = kubernetes._container_lifecycle_artifact(
+        "kubernetes",
+        make_settings(),
+        target,
+        {
+            "name": target.pod,
+            "namespace": target.namespace,
+            "containerStatuses": [],
+        },
+        diagnostics,
+        time_range=causal_evidence_time_range(target),
+    )
+
+    assert lifecycle.type == "kubernetes_container_lifecycle"
+    assert lifecycle.result["observation"]["polarity"] == "present"
+    assert lifecycle.result["observation"]["coverage"] == "scoped"
+    assert lifecycle.result["containers"] == diagnostics
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary="target container lifecycle collected",
+            confidence="high",
+            artifacts=[lifecycle],
+        )
+    ]
+    assert "oomkilled" in pipeline._observed_text(results)
+
+    outside_window = kubernetes._container_lifecycle_artifact(
+        "kubernetes",
+        make_settings(),
+        target,
+        {"name": target.pod, "namespace": target.namespace},
+        [
+            {
+                **diagnostics[0],
+                "lastTerminated": {
+                    **diagnostics[0]["lastTerminated"],
+                    "finishedAt": "2026-07-10T01:11:00Z",
+                },
+            }
+        ],
+        time_range=causal_evidence_time_range(target),
+    )
+    assert (
+        outside_window.result["observation"]["polarity"],
+        outside_window.result["observation"]["coverage"],
+    ) == ("unknown", "partial")
 
 
 def _node_condition_result(target, condition: dict[str, str]) -> CollectorResult:
