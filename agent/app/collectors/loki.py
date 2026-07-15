@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 
 from app.collectors.base import (
     NO_EVIDENCE,
+    _NON_PROJECT_NAMESPACES,
     AnalysisTarget,
     CollectorResult,
     artifact,
@@ -37,12 +38,14 @@ from app.mcp_client import (
 _LOKI_FAILURE_TOKEN_RE = re.compile(
     r"\b(?:error|fail(?:ed|ure)?|oom(?:killed)?|evict(?:ed|ion)?|"
     r"crash(?:ed|loop)?|pending|unschedul(?:able|ed)?|back-?off|"
+    r"preempt(?:ed|ion)?|reclaim(?:ed|ing)?|over[- ]?quota|gang|fair[- ]?share|insufficient|"
     r"out of memory|killed process|nvrm|panic|segfault|"
     r"nccl\s+(?:warn|error)|cuda\s+(?:error|out of memory)|\bxid\b)\b",
     re.IGNORECASE,
 )
 _LOKI_ERROR_FETCH_PATTERN = (
     r"(?i)(error|fail|oom|evict|crash|pending|unschedul|back-off|"
+    r"preempt(ed|ion)?|reclaim(ed|ing)?|over[- ]?quota|gang|fair[- ]?share|insufficient|"
     r"out of memory|killed process|nvrm|panic|segfault|nccl (warn|error)|"
     r"cuda (error|out of memory)|\bxid\b)"
 )
@@ -800,10 +803,17 @@ def _loki_query_observation(
     if item.get("error"):
         polarity, coverage = "unavailable", "unknown"
     elif name == "runai_control_plane_errors":
-        # This is intentionally a broad health sweep across Run:ai namespaces.
-        # It can explain why to inspect the control plane, but it has no
-        # workload/project identity and therefore cannot prove the alert's RCA.
-        polarity, coverage = "unknown", "partial"
+        # The broad sweep is target-scoped only for a platform-namespace alert;
+        # for user workloads it remains contextual control-plane health.
+        if (
+            target is not None
+            and target.namespace in _NON_PROJECT_NAMESPACES
+            and window_verified is True
+            and affirmative_lines
+        ):
+            polarity, coverage = "present", "scoped"
+        else:
+            polarity, coverage = "unknown", "partial"
     elif name in _LOKI_CORRELATED_QUERY_NAMES and target is None:
         # A correlation query name is not provenance.  Historical/control-plane
         # rows become causal support only after the immutable workload identity,
@@ -837,9 +847,13 @@ def _loki_query_observation(
     observed_entity: dict[str, str] | None = None
     target_scope_verified: bool | None = None
     if target is not None and polarity in {"present", "absent"}:
-        observed_entity, target_scope_verified = _loki_target_scope(
-            name, item, target=target, plan=plan, time_range=time_range
-        )
+        if name == "runai_control_plane_errors":
+            observed_entity = {"kind": "namespace", "name": target.namespace}
+            target_scope_verified = target.namespace in _NON_PROJECT_NAMESPACES
+        else:
+            observed_entity, target_scope_verified = _loki_target_scope(
+                name, item, target=target, plan=plan, time_range=time_range
+            )
         if target_scope_verified is not True:
             # A LogQL selector is request intent, not returned-data
             # provenance. A proxy may ignore a matcher, and an unlabeled or

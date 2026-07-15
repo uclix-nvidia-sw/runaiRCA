@@ -25,6 +25,85 @@ def test_loki_gpu_fetch_tokens_are_failure_shaped_and_affirmed() -> None:
     assert not fetch.search("NCCL INFO Bootstrap")
 
 
+def test_loki_scheduling_quota_tokens_are_fetched_and_affirmed() -> None:
+    fetch = re.compile(loki._LOKI_ERROR_FETCH_PATTERN)
+    for line in ("workload over-quota", "workload preempted"):
+        assert fetch.search(line)
+        assert loki._LOKI_FAILURE_TOKEN_RE.search(line)
+
+
+def test_platform_control_plane_error_is_scoped_only_for_platform_alerts() -> None:
+    window = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    item = {
+        "name": "runai_control_plane_errors",
+        "line_count": 1,
+        "sample_entries": [
+            {"timestamp": "2026-07-10T01:00:00Z", "line": "scheduler reconcile failed"}
+        ],
+    }
+    platform = loki._loki_query_observation(
+        item, target=_target(namespace="runai-backend"), time_range=window
+    )
+    user = loki._loki_query_observation(
+        item, target=_target(namespace="runai-vision"), time_range=window
+    )
+
+    assert (platform["polarity"], platform["coverage"]) == ("present", "scoped")
+    assert (user["polarity"], user["coverage"]) == ("unknown", "partial")
+
+
+def test_runai_scoped_workload_status_reasons_are_visible_to_matching() -> None:
+    target = _target()
+    item = {
+        "name": "workloads",
+        "identity_matched": True,
+        "status_code": 200,
+        "data": {"workloads": [{
+            "name": "trainer",
+            "status": {
+                "phase": "Pending",
+                "reason": "Preempted",
+                "message": "pending after preemption",
+                "statusTransitionTime": "2026-07-10T01:04:00Z",
+            },
+        }]},
+    }
+    signal = runai._runai_query_artifact("runai", item, target=target, used_mcp=False)
+    observed = pipeline._observed_text([
+        CollectorResult(agent="runai", status="ok", summary="", artifacts=[signal])
+    ])
+
+    assert "Preempted" in signal.summary
+    assert "Preempted" in signal.highlights
+    assert "preempted" in observed
+
+
+def test_runai_http_error_body_is_masked_context_not_scoped_support() -> None:
+    item = {
+        "name": "workloads",
+        "path": "/api/v1/workloads",
+        "status_code": 503,
+        "error": "HTTP 503",
+        "data": {"error": {"message": "quota service unavailable password=secret-123"}},
+    }
+    context = runai._runai_error_context_artifact("runai", item)
+    unavailable = runai._runai_query_artifact("runai", item, target=_target(), used_mcp=False)
+    observed = pipeline._observed_text([
+        CollectorResult(agent="runai", status="partial", summary="", artifacts=[unavailable, context])
+    ])
+
+    assert context is not None
+    assert context.result["observation"]["polarity"] == "unknown"
+    assert context.result["observation"]["coverage"] == "partial"
+    assert "secret-123" not in context.summary
+    assert MASK_TOKEN in context.summary
+    assert "quota service unavailable" not in observed
+    assert runai._runai_error_context_artifact("runai", {
+        "name": "workloads", "status_code": 503, "error": "HTTP 503",
+        "data": {"status": 503, "error": "Service Unavailable", "path": "/gateway"},
+    }) is None
+
+
 def test_postgres_history_keeps_causal_row_when_sample_has_epilogue() -> None:
     table = {
         "context_columns": ["workload_name"],
