@@ -64,6 +64,15 @@ def test_helm_defaults_run_analysis_through_nat() -> None:
     assert env["natConfigFile"] == "/app/configs/runai_rca_engine.yml"
 
 
+def test_collector_insight_budget_supports_reasoning_models() -> None:
+    env = _values()["agent"]["env"]
+    template = AGENT_TEMPLATE.read_text(encoding="utf-8")
+
+    assert int(env["llmInsightMaxTokens"]) >= 512
+    assert "LLM_INSIGHT_MAX_TOKENS" in template
+    assert ".Values.agent.env.llmInsightMaxTokens" in template
+
+
 def _image_repos(node: Any, path: str = "") -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     if isinstance(node, dict):

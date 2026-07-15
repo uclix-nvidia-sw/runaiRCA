@@ -943,10 +943,12 @@ def validate_runtime_knowledge(payload: Any) -> dict[str, Any]:
 
 
 def _load_failure_modes(path: str) -> dict[str, list[dict[str, Any]]]:
-    """Parse failure_modes.yaml into {family: [{symptom, keywords[], actions[]}]}.
+    """Parse the version-controlled failure-mode knowledge into runtime entries.
 
     Same shape the TypeDB knowledge layer returns, so the synthesis can render
-    root-cause-relevant remediation locally without a live knowledge graph.
+    root-cause-relevant remediation locally without a live knowledge graph. Optional
+    localized labels/reasons/actions remain knowledge data rather than report-code
+    conditionals.
     """
     if not path:
         return {}
@@ -967,8 +969,13 @@ def _load_failure_modes(path: str) -> dict[str, list[dict[str, Any]]]:
             knowledge.setdefault(family, []).append(
                 {
                     "symptom": symptom.get("name") or "",
+                    "symptom_ko": symptom.get("name_ko") or "",
                     "keywords": [str(k).lower() for k in symptom.get("keywords") or []],
                     "actions": list(symptom.get("actions") or []),
+                    "actions_ko": list(symptom.get("actions_ko") or []),
+                    "reason": str(symptom.get("reason") or ""),
+                    "reason_ko": str(symptom.get("reason_ko") or ""),
+                    "exclusive_actions": bool(symptom.get("exclusive_actions", False)),
                     # Optional link into runai_architecture.yaml: which platform
                     # component this symptom implicates (drives check paths).
                     "component": str(symptom.get("component") or ""),
@@ -1139,6 +1146,7 @@ def _validate_runtime_failure_modes(value: Any, package_id: str) -> dict[str, li
             name = symptom.get("name", symptom.get("symptom"))
             keywords = symptom.get("keywords")
             actions = symptom.get("actions", [])
+            actions_ko = symptom.get("actions_ko", [])
             if not isinstance(name, str) or not name.strip():
                 raise ValueError(f"package {package_id} symptom requires name")
             if not isinstance(keywords, list) or not keywords or not all(
@@ -1149,14 +1157,35 @@ def _validate_runtime_failure_modes(value: Any, package_id: str) -> dict[str, li
                 isinstance(action, str) for action in actions
             ):
                 raise ValueError(f"package {package_id} symptom actions must be strings")
+            if not isinstance(actions_ko, list) or not all(
+                isinstance(action, str) for action in actions_ko
+            ):
+                raise ValueError(f"package {package_id} symptom actions_ko must be strings")
+            localized_text = {
+                "symptom_ko": symptom.get("name_ko", symptom.get("symptom_ko", "")),
+                "reason": symptom.get("reason", ""),
+                "reason_ko": symptom.get("reason_ko", ""),
+            }
+            if any(not isinstance(text, str) for text in localized_text.values()):
+                raise ValueError(f"package {package_id} symptom localized fields must be strings")
+            exclusive_actions = symptom.get("exclusive_actions", False)
+            if not isinstance(exclusive_actions, bool):
+                raise ValueError(
+                    f"package {package_id} symptom exclusive_actions must be a boolean"
+                )
             component = symptom.get("component", "")
             if not isinstance(component, str):
                 raise ValueError(f"package {package_id} symptom component must be a string")
             out.setdefault(family.strip(), []).append(
                 {
                     "symptom": name.strip(),
+                    "symptom_ko": localized_text["symptom_ko"].strip(),
                     "keywords": [keyword.strip().lower() for keyword in keywords],
                     "actions": list(actions),
+                    "actions_ko": list(actions_ko),
+                    "reason": localized_text["reason"].strip(),
+                    "reason_ko": localized_text["reason_ko"].strip(),
+                    "exclusive_actions": exclusive_actions,
                     "component": component,
                 }
             )

@@ -20,14 +20,18 @@ from app.collectors.postgres import PostgresCollector
 from app.collectors.prometheus import PrometheusCollector
 from app.collectors.runai import RunAICollector
 from app.config import load_settings
+from app.knowledge import load_failure_modes
 from app.plan import InvestigationPlan
 from app.schemas import Alert, AlertAnalysisRequest, SimilarIncidentContext
 from app.services.kg_enrichment import GraphRemediation, graph_remediation
 from app.services.orchestrator import AnalysisOrchestrator
 from app.services.pipeline import (
     _SYNTHESIS_USER_CHARS,
+    _complete_synthesis_json,
+    _detail_from,
     _gpu_model_from,
     _graph_remediation_lines,
+    _summary_from,
     _synthesis_evidence_json,
     _synthesize_korean,
     _xid_codes_from_results,
@@ -1026,6 +1030,139 @@ async def test_korean_synthesis_falls_back_on_bad_json(monkeypatch) -> None:
     # Bad synthesis -> deterministic English report stands.
     assert "## 2. 원인" in response.analysis_detail
     assert "Agent Role Coverage" not in response.analysis_detail  # static boilerplate removed
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_rejects_summary_only_json(monkeypatch, caplog) -> None:
+    settings = replace(make_settings(), language="ko")
+
+    async def fake_complete_synthesis_json(*_args, **_kwargs):
+        return {"summary": "요약만 반환됨"}
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    result = await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "Test"}, annotations={})
+        ),
+        results=[],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[],
+        kg_context={},
+        graph_fixes=GraphRemediation(),
+        fallback_detail="fallback",
+    )
+
+    assert result is None
+    assert "omitted detail" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_retries_json_missing_detail(monkeypatch, caplog) -> None:
+    settings = replace(make_settings(), language="ko")
+    replies = [
+        '{"summary":"요약만 반환됨"}',
+        '{"summary":"정상 요약","detail":"정상 본문"}',
+    ]
+
+    async def fake_complete(*_args, **_kwargs):
+        return replies.pop(0)
+
+    monkeypatch.setattr("app.services.pipeline.complete", fake_complete)
+    result = await _complete_synthesis_json(settings, system="system", user="user")
+
+    assert result == {"summary": "정상 요약", "detail": "정상 본문"}
+    assert not replies
+    assert "omitted required field(s) detail (attempt 1); retrying" in caplog.text
+
+
+def test_jwks_discovery_failure_overrides_generic_crashloop_playbook_in_korean() -> None:
+    failure_modes = load_failure_modes("knowledge/failure_modes.yaml")
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={
+                "alertname": "KubePodCrashLooping",
+                "namespace": "runai-rca",
+                "pod": "runai-rca-runai-mcp-abc",
+            },
+            annotations={"summary": "runai-mcp CrashLoopBackOff"},
+            fingerprint="fp-jwks-discovery",
+        )
+    )
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary=(
+                "init jwks verifier: jwks verifier: decode discovery doc: "
+                "invalid character '<' looking for beginning of value"
+            ),
+        )
+    ]
+    candidates = [RankedCause("workload_startup_error", "medium", 4.0)]
+
+    summary = _summary_from(
+        request, results, candidates, failure_modes, language="ko"
+    )
+    detail = _detail_from(
+        request,
+        results,
+        [],
+        failure_modes=failure_modes,
+        root_cause_candidates=candidates,
+        language="ko",
+    )
+
+    assert "OIDC JSON 문서 대신 HTML" in summary
+    assert "runaiMcp.oidcIssuerUrl" in detail
+    assert "agent.env.runaiTokenUrl=https://<runai-host>/api/v1/token" in detail
+    assert "OOM" not in detail
+    assert "bad entrypoint" not in detail
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_receives_specific_self_check_findings(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko")
+    captured: dict[str, str] = {}
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        captured["system"] = system
+        captured["user"] = user
+        return {"summary": "요약", "detail": "본문"}
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "KubePodCrashLooping"})
+        ),
+        results=[],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[],
+        kg_context={},
+        graph_fixes=GraphRemediation(),
+        fallback_detail="fallback",
+        self_check_caveat=(
+            "JWKS verifier discovery 문서가 JSON이 아니라 HTML이라 파싱에 실패했습니다."
+        ),
+        self_check_refuted=True,
+        self_check_next="OIDC issuer 설정을 확인하세요.",
+        reanalysis_note="범용 startup 원인을 반증하고 재분석했습니다.",
+    )
+
+    payload = json.loads(captured["user"].removeprefix("증거(JSON):\n"))
+    assert payload["self_check"] == {
+        "refuted": True,
+        "caveat": "JWKS verifier discovery 문서가 JSON이 아니라 HTML이라 파싱에 실패했습니다.",
+        "next_check": "OIDC issuer 설정을 확인하세요.",
+        "reanalysis_note": "범용 startup 원인을 반증하고 재분석했습니다.",
+    }
+    assert "구체적인 로그 기반 오류" in captured["system"]
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,22 @@
 
 - family: workload_startup_error
   symptoms:
+    - name: Run:ai MCP OIDC Discovery Returns HTML Instead of JSON
+      name_ko: Run:ai MCP OIDC discovery가 JSON 대신 HTML을 반환
+      keywords:
+        - "jwks verifier: decode discovery doc: invalid character '<'"
+        - 'jwks verifier: decode discovery doc: invalid character "<"'
+      reason: "The official Run:ai MCP exits during JWKS verifier initialization because `RUNAI_BASE_URL/.well-known/openid-configuration` returns HTML instead of the required OIDC JSON document."
+      reason_ko: "공식 Run:ai MCP가 JWKS verifier를 초기화할 때 `RUNAI_BASE_URL/.well-known/openid-configuration`이 필요한 OIDC JSON 문서 대신 HTML을 반환해 즉시 종료됩니다."
+      exclusive_actions: true
+      actions:
+        - "Request the client-credentials token from `https://<runai-host>/api/v1/token`, decode its `iss` claim, and set `agent.env.runaiTokenUrl=https://<runai-host>/api/v1/token`."
+        - "Set `runaiMcp.oidcIssuerUrl=<token iss>` so the chart proxies only `/.well-known/openid-configuration` to `<iss>/.well-known/openid-configuration`; keep `agent.env.runaiBaseUrl` on the existing Run:ai control-plane URL."
+        - "Upgrade the release, wait for the runai-mcp Deployment rollout, and confirm its current/previous logs no longer contain the JWKS discovery JSON decode error."
+      actions_ko:
+        - "클라이언트 자격 증명 토큰을 `https://<runai-host>/api/v1/token`에서 발급하고 `iss` claim을 확인한 뒤, `agent.env.runaiTokenUrl=https://<runai-host>/api/v1/token`으로 설정하세요."
+        - "`runaiMcp.oidcIssuerUrl=<token iss>`를 설정해 chart가 `/.well-known/openid-configuration` 요청만 `<iss>/.well-known/openid-configuration`으로 프록시하게 하세요. `agent.env.runaiBaseUrl`은 기존 Run:ai control-plane URL로 유지합니다."
+        - "release를 upgrade하고 runai-mcp Deployment rollout을 기다린 뒤, 현재/이전 로그에서 JWKS discovery JSON decode 오류가 사라졌는지 확인하세요."
     - name: CrashLoopBackOff
       keywords: [crashloopbackoff, "back-off restarting"]
       actions:
