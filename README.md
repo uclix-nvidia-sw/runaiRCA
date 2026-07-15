@@ -67,7 +67,7 @@ helm upgrade --install runai-rca oci://ghcr.io/<owner>/charts/runai-rca \
   --set global.imageRegistry=ghcr.io/<owner> \
   --set secrets.existingSecret=runai-rca-secrets \
   --set agent.env.runaiBaseUrl=https://runai.example.com \
-  --set agent.env.runaiTokenUrl=https://runai.example.com/auth/token \
+  --set agent.env.runaiTokenUrl=https://runai.example.com/api/v1/token \
   --set agent.env.prometheusUrl=http://prometheus.monitoring.svc:9090 \
   --set agent.env.lokiUrl=http://loki-read.monitoring.svc.cluster.local:3100
 ```
@@ -109,7 +109,8 @@ Key values (full secret keys: `DATABASE_URL`, `POSTGRES_DSN`, `RUNAI_CLIENT_ID`,
 | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
 | `global.imageRegistry` / `imagePullSecrets`    | Registry prefix and pull secrets for all images                                                             |
 | `secrets.existingSecret`                       | Existing Secret with DB/Run:ai/NVIDIA/LLM credentials                                                       |
-| `agent.env.runaiBaseUrl` / `runaiTokenUrl`     | Run:ai API URL and OAuth token URL (token URL required for client\_id/secret)                               |
+| `agent.env.runaiBaseUrl` / `runaiTokenUrl`     | Run:ai API URL and client-credentials token URL (for example, `/api/v1/token`; required for client\_id/secret) |
+| `runaiMcp.oidcIssuerUrl`                       | Token `iss` URL for the official Run:ai MCP when the control-plane root OIDC discovery endpoint returns HTML |
 | `agent.env.prometheusUrl` / `lokiUrl`          | In-cluster Prometheus / Loki URLs. Loki defaults to the direct read service, not the authenticated gateway. |
 | `grafanaMcp.grafanaUrl` / `grafanaOrgId`       | Grafana endpoint and organization used by the shared MCP service; its service-account token is `GRAFANA_SERVICE_ACCOUNT_TOKEN`. |
 | `typedb.ingest.requireApproval`                | Ingest only Dashboard-approved (`user_approved_at`) resolved incidents. Defaults to `true`; `requireReview` is deprecated. |

@@ -271,6 +271,19 @@ runaiMcp:
   imagePullSecrets: []
   port: 8080
   metricsPort: 9090
+  # Some managed Run:ai ingress configurations serve the UI at
+  # `/.well-known/openid-configuration` instead of the JSON document required
+  # by the official MCP's JWKS verifier. Set this to the token `iss` URL to
+  # enable an in-pod proxy: only discovery is routed to the issuer, while API
+  # calls still use agent.env.runaiBaseUrl.
+  oidcIssuerUrl: ""
+  oidcProxy:
+    image:
+      repository: docker.io/nginxinc/nginx-unprivileged
+      tag: "1.27-alpine"
+      pullPolicy: IfNotPresent
+    port: 8081
+    resources: {}
   args:
     - serve
     - --transport
