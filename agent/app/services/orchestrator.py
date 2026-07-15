@@ -35,6 +35,10 @@ from app.services.pipeline import (
     _short_sentence,
     _unexpected_runtime_warning,
 )
+from app.services.response_budget import (
+    analysis_response_bytes,
+    enforce_analysis_response_budget,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -125,24 +129,39 @@ class AnalysisOrchestrator:
         )
         if not deadline or deadline <= 0:
             response = await self._analyze_impl(request, **impl_kwargs)
-            if isinstance(getattr(response, "context", None), dict):
-                response.context["llm_usage"] = self._usage_context(response, usage)
+        else:
+            # Stop LLM transports shortly before the public hard deadline so their
+            # deterministic fallbacks can assemble and return the evidence already
+            # collected instead of losing it to the outer wait_for cancellation.
+            completion_margin = min(20.0, max(2.0, deadline * 0.01))
+            token = set_analysis_deadline(started_at + deadline - completion_margin)
+            try:
+                response = await asyncio.wait_for(
+                    self._analyze_impl(request, **impl_kwargs), timeout=deadline
+                )
+            except TimeoutError:  # asyncio.TimeoutError is this builtin on 3.11+
+                _log.warning(
+                    "analysis exceeded the %ss deadline; returning degraded report", deadline
+                )
+                response = self._deadline_response(request, deadline)
+            finally:
+                reset_analysis_deadline(token)
+        # Preserve compatibility with injected/custom analyzers used by callers
+        # that return a sentinel instead of the public response model.
+        if not isinstance(response, AlertAnalysisResponse):
             return response
-        # Stop LLM transports shortly before the public hard deadline so their
-        # deterministic fallbacks can assemble and return the evidence already
-        # collected instead of losing it to the outer wait_for cancellation.
-        completion_margin = min(20.0, max(2.0, deadline * 0.01))
-        token = set_analysis_deadline(started_at + deadline - completion_margin)
-        try:
-            response = await asyncio.wait_for(
-                self._analyze_impl(request, **impl_kwargs), timeout=deadline
-            )
-        except TimeoutError:  # asyncio.TimeoutError is this builtin on 3.11+
-            _log.warning("analysis exceeded the %ss deadline; returning degraded report", deadline)
-            response = self._deadline_response(request, deadline)
-        finally:
-            reset_analysis_deadline(token)
         response.context["llm_usage"] = self._usage_context(response, usage)
+        if enforce_analysis_response_budget(
+            response,
+            self._settings.analysis_response_max_bytes,
+            language=self._settings.language,
+        ):
+            _log.warning(
+                "analysis response compacted from %s to %s bytes (limit=%s)",
+                response.context.get("response_budget", {}).get("original_bytes", "unknown"),
+                analysis_response_bytes(response),
+                self._settings.analysis_response_max_bytes,
+            )
         return response
 
     def _usage_context(self, response: AlertAnalysisResponse, usage: dict) -> dict:

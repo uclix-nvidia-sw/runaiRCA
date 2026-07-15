@@ -48,6 +48,22 @@ def test_backend_agent_call_outlives_agent_deadline() -> None:
     )
 
 
+def test_agent_response_budget_fits_backend_transport_limit() -> None:
+    values = _values()
+    agent_budget = int(values["agent"]["env"]["analysisResponseMaxBytes"])
+    backend_limit = int(values["backend"]["env"]["agentMaxResponseBodyBytes"])
+    agent_template = AGENT_TEMPLATE.read_text(encoding="utf-8")
+    backend_template = (
+        Path(__file__).parents[2] / "charts" / "runai-rca" / "templates" / "backend.yaml"
+    ).read_text(encoding="utf-8")
+
+    assert 0 < agent_budget < backend_limit
+    assert "ANALYSIS_RESPONSE_MAX_BYTES" in agent_template
+    assert ".Values.agent.env.analysisResponseMaxBytes" in agent_template
+    assert "AGENT_MAX_RESPONSE_BODY_BYTES" in backend_template
+    assert ".Values.backend.env.agentMaxResponseBodyBytes" in backend_template
+
+
 def test_agent_step_ceilings_fit_inside_the_deadline() -> None:
     env = _values()["agent"]["env"]
     deadline = int(env["analysisDeadlineSeconds"])

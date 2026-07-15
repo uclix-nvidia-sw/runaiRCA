@@ -109,6 +109,8 @@ spec:
               value: {{ .Values.agent.env.enableAgentDrilldown | quote }}
             - name: ANALYSIS_DEADLINE_SECONDS
               value: {{ .Values.agent.env.analysisDeadlineSeconds | quote }}
+            - name: ANALYSIS_RESPONSE_MAX_BYTES
+              value: {{ .Values.agent.env.analysisResponseMaxBytes | quote }}
             - name: ENABLE_RCA_OUTPUT_HARNESS
               value: {{ .Values.agent.env.enableRcaOutputHarness | quote }}
             - name: MAX_RCA_REPAIR_ATTEMPTS

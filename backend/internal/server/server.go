@@ -264,6 +264,7 @@ type Server struct {
 	language                  string
 	agentRequestTimeout       time.Duration
 	manualAgentRequestTimeout time.Duration
+	agentResponseMaxBytes     int64
 	client                    *http.Client
 	agentSlots                chan struct{}
 	autoAnalyzeMu             sync.Mutex
@@ -397,6 +398,10 @@ func NewServer() *Server {
 	if manualAgentRequestTimeout <= 0 {
 		manualAgentRequestTimeout = 1560 * time.Second
 	}
+	agentResponseMaxBytes := int64(getenvInt("AGENT_MAX_RESPONSE_BODY_BYTES", int(maxAgentResponseBodyBytes)))
+	if agentResponseMaxBytes <= 0 {
+		agentResponseMaxBytes = maxAgentResponseBodyBytes
+	}
 	store.ConnectDatabase(
 		first(os.Getenv("DATABASE_URL"), os.Getenv("POSTGRES_DSN")),
 		time.Duration(getenvInt("DATABASE_CONNECT_TIMEOUT_SECONDS", 5))*time.Second,
@@ -432,6 +437,7 @@ func NewServer() *Server {
 		language:                  getenv("LANGUAGE", "en"),
 		agentRequestTimeout:       agentRequestTimeout,
 		manualAgentRequestTimeout: manualAgentRequestTimeout,
+		agentResponseMaxBytes:     agentResponseMaxBytes,
 		client:                    &http.Client{},
 		agentSlots:                make(chan struct{}, concurrency),
 		autoAnalyzeFanout:         autoFanout,

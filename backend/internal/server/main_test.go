@@ -879,6 +879,15 @@ func TestAgentRequestTimeoutConfig(t *testing.T) {
 	}
 }
 
+func TestAgentResponseBodyLimitConfig(t *testing.T) {
+	t.Setenv("AGENT_MAX_RESPONSE_BODY_BYTES", "3145728")
+	server := NewServer()
+
+	if server.agentResponseBodyLimit() != 3145728 {
+		t.Fatalf("expected configured agent response limit, got %d", server.agentResponseBodyLimit())
+	}
+}
+
 func TestChatRejectsOversizedBody(t *testing.T) {
 	server := NewServer()
 	payload := []byte(`{"message":"` + strings.Repeat("x", int(maxJSONBodyBytes)+1) + `"}`)
