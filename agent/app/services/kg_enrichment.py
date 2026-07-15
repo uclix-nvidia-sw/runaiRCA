@@ -144,6 +144,24 @@ match
 select $sn, $reason;
 """
 
+_KNOWLEDGE_EXCLUSIVE_ACTIONS_QUERY = """
+match
+  $sy isa symptom, has name $sn, has exclusive_actions $exclusive_actions;
+select $sn, $exclusive_actions;
+"""
+
+_KNOWLEDGE_REASON_KO_QUERY = """
+match
+  $sy isa symptom, has name $sn, has reason_ko $reason_ko;
+select $sn, $reason_ko;
+"""
+
+_KNOWLEDGE_ACTIONS_KO_QUERY = """
+match
+  $sy isa symptom, has name $sn, has statement_ko $statement_ko;
+select $sn, $statement_ko;
+"""
+
 
 @dataclass
 class KGContext:
@@ -723,6 +741,9 @@ def _query_kg(
 
         knowledge_rows = run(_KNOWLEDGE_QUERY)
         knowledge_reason_rows = run(_KNOWLEDGE_REASON_QUERY)
+        knowledge_exclusive_action_rows = run(_KNOWLEDGE_EXCLUSIVE_ACTIONS_QUERY)
+        knowledge_reason_ko_rows = run(_KNOWLEDGE_REASON_KO_QUERY)
+        knowledge_actions_ko_rows = run(_KNOWLEDGE_ACTIONS_KO_QUERY)
         reasoning: dict[str, Any] = {}
         component = target.workload_name
         if component:
@@ -750,6 +771,22 @@ def _query_kg(
         for row in knowledge_reason_rows
         if row.get("sn") and row.get("reason")
     }
+    exclusive_actions = {
+        str(row.get("sn") or "")
+        for row in knowledge_exclusive_action_rows
+        if row.get("sn") and str(row.get("exclusive_actions")).casefold() == "true"
+    }
+    reasons_ko = {
+        str(row.get("sn") or ""): str(row.get("reason_ko") or "")
+        for row in knowledge_reason_ko_rows
+        if row.get("sn") and row.get("reason_ko")
+    }
+    actions_ko: dict[str, set[str]] = {}
+    for row in knowledge_actions_ko_rows:
+        sname = str(row.get("sn") or "")
+        statement_ko = str(row.get("statement_ko") or "")
+        if sname and statement_ko:
+            actions_ko.setdefault(sname, set()).add(statement_ko)
     grouped: dict[tuple[str, str], dict[str, set[str]]] = {}
     for r in knowledge_rows:
         fam = str(r.get("fam") or "")
@@ -769,6 +806,9 @@ def _query_kg(
                 "keywords": sorted(entry["keywords"]),
                 "actions": sorted(entry["actions"]),
                 "reason": reasons.get(sname, ""),
+                "exclusive_actions": sname in exclusive_actions,
+                "reason_ko": reasons_ko.get(sname, ""),
+                "actions_ko": sorted(actions_ko.get(sname, set())),
             }
         )
 

@@ -156,6 +156,80 @@ def test_query_kg_escapes_typeql_literals() -> None:
     assert 'has incident_id "INC-1"; delete' not in joined
 
 
+def test_query_kg_projects_typedb_symptom_metadata() -> None:
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "has keyword $kw" in query:
+                    return [
+                        {
+                            "fam": "workload_startup_error",
+                            "sn": "OOMKilled",
+                            "kw": "oomkilled",
+                            "st": "Raise the memory limit.",
+                        }
+                    ]
+                if "has reason $reason" in query:
+                    return [{"sn": "OOMKilled", "reason": "Memory limit exceeded."}]
+                if "has exclusive_actions $exclusive_actions" in query:
+                    return [{"sn": "OOMKilled", "exclusive_actions": True}]
+                if "has reason_ko $reason_ko" in query:
+                    return [{"sn": "OOMKilled", "reason_ko": "메모리 제한을 초과했습니다."}]
+                if "has statement_ko $statement_ko" in query:
+                    return [
+                        {"sn": "OOMKilled", "statement_ko": "메모리 제한을 높이세요."},
+                        {"sn": "OOMKilled", "statement_ko": "누수를 수정하세요."},
+                    ]
+                return []
+
+            yield run
+
+    knowledge = _query_kg(FakeClient(), _target())["knowledge"]  # type: ignore[arg-type]
+
+    assert knowledge == {
+        "workload_startup_error": [
+            {
+                "symptom": "OOMKilled",
+                "keywords": ["oomkilled"],
+                "actions": ["Raise the memory limit."],
+                "reason": "Memory limit exceeded.",
+                "exclusive_actions": True,
+                "reason_ko": "메모리 제한을 초과했습니다.",
+                "actions_ko": ["누수를 수정하세요.", "메모리 제한을 높이세요."],
+            }
+        ]
+    }
+
+
+def test_typedb_knowledge_exclusive_actions_suppress_generic_siblings() -> None:
+    from app.services.pipeline import _actionable_failure_mode_matches
+
+    matches = _actionable_failure_mode_matches(
+        {
+            "workload_startup_error": [
+                {
+                    "symptom": "OOMKilled",
+                    "keywords": ["oomkilled"],
+                    "actions": ["Raise the memory limit."],
+                    "exclusive_actions": True,
+                    "reason_ko": "메모리 제한을 초과했습니다.",
+                    "actions_ko": ["메모리 제한을 높이세요."],
+                },
+                {
+                    "symptom": "CrashLoopBackOff",
+                    "keywords": ["crashloopbackoff"],
+                    "actions": ["Inspect logs."],
+                },
+            ]
+        },
+        "CrashLoopBackOff after OOMKilled",
+        None,
+    )
+
+    assert [symptom["symptom"] for _family, symptom in matches] == ["OOMKilled"]
+
+
 def test_graph_remediation_escapes_typeql_literals() -> None:
     class FakeClient:
         def __init__(self) -> None:
