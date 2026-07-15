@@ -5,6 +5,24 @@
 
 Run:AI RCA is read-only by default.
 
+**A simple mental model:** the service is a case desk. It receives a signal,
+opens a case, asks read-only questions, lets an operator review the answer, and
+only then lets that reviewed case inform future investigations.
+
+```mermaid
+flowchart LR
+  A[Alert webhook] --> I[Incident intake]
+  I --> R[Analysis and evidence]
+  R --> O[Operator review]
+  O -->|feedback or re-analyze| R
+  O -->|approve| K[Approved learning/history]
+  K -. context for later cases .-> R
+```
+
+This is a workflow, not autonomous remediation. Feedback can ask for a fresh
+analysis. Approval is a separate human decision that controls learning; it never
+changes a cluster resource.
+
 ## Supported Signals
 
 - Alertmanager webhooks

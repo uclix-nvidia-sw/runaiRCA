@@ -6,6 +6,11 @@
 Run:AI RCA uses two stores with distinct roles. See [Architecture](ARCHITECTURE.md) for the
 runtime flow; this document is the data-structure reference.
 
+**Who this is for:** an operator who needs to know where a record lives, or a
+developer who needs to understand why two databases appear in one deployment.
+PostgreSQL is the working case file. TypeDB is an optional relationship index
+built from approved parts of that case file.
+
 | Store | Role | Owner | Required? |
 |---|---|---|---|
 | **PostgreSQL** | Operational source of truth: incidents, alerts, RCA results, operator feedback, similarity vectors | Go backend | Yes (in-memory fallback for local dev) |
@@ -32,6 +37,12 @@ graph during analysis. See [RCA Pipeline](RCA-PIPELINE.md) and
 ---
 
 ## 1. PostgreSQL (operational)
+
+### Find data by task
+
+Use PostgreSQL for the current incident, alerts, analysis runs, feedback, and
+similarity search. Use TypeDB only for optional topology and approved-history
+relationships; it is never a second operational source of truth.
 
 Tables are auto-created by the backend on startup (`backend/store_postgres.go`).
 

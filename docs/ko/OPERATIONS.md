@@ -9,6 +9,10 @@
 대한 것이 아닙니다. 분석 흐름은 [RCA 파이프라인](RCA-PIPELINE.md)을, 스토어는
 [데이터 스토어](DATABASE.md)를 참고하십시오.
 
+**이 문서는 누구를 위한가:** RCA 서비스 자체를 운영하는 온콜 담당자를 위한 문서입니다.
+먼저 “Is it actually working?”에서 alert 접수 경로를 따라가고, 그 뒤 실패한 의존성의
+하위 섹션만 보세요. 프로세스가 건강하다고 해서 evidence collection이 끝났다는 뜻은 아닙니다.
+
 ## Is it actually working?
 
 자동 RCA는 **Alertmanager가 Backend 웹훅에 POST한 이후**에만 시작됩니다 — Alertmanager의

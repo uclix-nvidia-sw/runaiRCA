@@ -13,6 +13,10 @@ Agent는 단일 프롬프트가 **아닙니다**. 단일 전체 데드라인(dea
 (`agent/configs/runai_rca_engine.yml`) 아래에서 NAT 함수로 실행됩니다. NAT 엔진이
 비활성화되었거나 실패하면, 동일한 단계가 실패 폴백으로 프로세스 안에서 직접 실행됩니다.
 
+**쉽게 기억하는 방법:** 이 파이프라인은 신중한 조사 체크리스트입니다. 먼저 알림의 범위를
+파악하고, 사실을 모은 뒤, 스스로의 결론을 반박해 보고, 마지막으로 RCA가 사실보다 더 많은
+말을 하지 않는지 확인합니다.
+
 ```mermaid
 flowchart TB
   REQ([/analyze 요청]) --> ORCH([오케스트레이터])
@@ -48,6 +52,30 @@ flowchart TB
 단계별 상한은 *의도적으로* 넉넉합니다(깊은 증거가 빠르지만 얕은 것보다 낫습니다). 전체 데드라인이
 실제 한계입니다. Backend의 `AGENT_REQUEST_TIMEOUT_SECONDS`(1560초)는 이보다 위에 유지되어야
 합니다.
+
+## 단계 안내: 무엇이 들어오고, 무엇이 나오며, 무엇이 멈추게 하는가
+
+| 단계 | 입력 → 출력 | 멈추거나 제한하는 조건 |
+| --- | --- | --- |
+| Enrich | alert target → 승인 이력/토폴로지 문맥 | TypeDB는 선택 사항이며, 그래프 부재는 중단이 아닌 경고 |
+| Plan | alert + 문맥 → 범위가 정해진 가설과 probe | 레이블이 부족하면 범위만 줄고 쓰기 권한이 생기지 않음 |
+| Evidence | plan → collector artifact | 출처별 실패는 partial/unavailable evidence가 됨 |
+| Rank | artifact → 순서가 있는 후보 | 시그니처도 live evidence의 뒷받침이 필요 |
+| Self-check | 선두 후보 → 주의 사항/재분석 필요 여부 | LLM은 선택 사항이며 deadline이 추가 작업을 제한 |
+| Synthesize | evidence → 운영자가 읽는 RCA | 24k evidence 예산, 사실을 만들지 않음 |
+| Harness | 초안 → 수정/신뢰도 하향/보류 응답 | hard evidence gate는 `insufficient_evidence`를 반환할 수 있음 |
+
+```mermaid
+flowchart LR
+  P[Plan] --> I[중앙 조사 루프\n다음 판별 질문 선택]
+  P --> D[Collector drill-down 루프\n각 collector의 도구만 사용]
+  I --> E[Evidence artifact]
+  D --> E
+  E --> R[Rank, self-check, synthesis]
+```
+
+중앙 루프는 증거 평면 사이에서 다음 질문을 고릅니다. collector drill-down은 한 평면 안에
+머뭅니다. 둘 다 읽기 전용이며, 조사가 끝났거나 같은 질문이 반복되거나 전체 deadline에 도달하면 멈춥니다.
 
 ---
 

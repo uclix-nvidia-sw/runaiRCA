@@ -5,6 +5,18 @@
 
 Run:AI RCA는 세 개의 서비스로 구성됩니다 — **Backend**(Go: Alertmanager 수집 + API), **Agent**(FastAPI: 증거 수집 + RCA 합성), **Frontend**(React 대시보드). 세 서비스 모두 외부 의존성 없이 로컬에서 실행됩니다. 자격 증명이 없으면 Backend는 인메모리 저장소로 폴백하고, Agent는 기본적으로 NAT 엔진을 실행합니다. LLM 자격 증명이 없으면 각 단계가 결정론적으로 저하되며, 엔진이 실패하면 동일한 파이프라인이 직접 실행됩니다.
 
+**이 문서는 누구를 위한가:** 프로젝트를 처음 보는 사람을 위한 문서입니다. 가장 빠른 경로는
+세 로컬 서비스를 시작하고, 샘플 alert 하나를 보낸 뒤, 인시던트 페이지를 여는 것입니다.
+외부 시스템은 증거를 풍부하게 하지만 이 흐름을 배우는 데 필수는 아닙니다.
+
+```mermaid
+flowchart LR
+  S[Agent, Backend, Frontend 시작] --> A[샘플 alert 전송]
+  A --> R[Backend가 분석 생성]
+  R --> U[RCA와 evidence trail 열기]
+  U --> D[준비되면 Helm으로 배포]
+```
+
 ## 사전 요구사항
 
 - 로컬 개발을 위한 Go, Python 3, Node.js.

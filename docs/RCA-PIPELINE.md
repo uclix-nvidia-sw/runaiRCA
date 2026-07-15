@@ -16,6 +16,10 @@ produces a report. The seven pipeline stages run as NAT functions under the
 which is built once at startup. If the NAT engine is disabled or fails, the same
 stages run directly in process as the failure fallback.
 
+**A simple mental model:** the pipeline is a careful investigation checklist.
+It first learns the alert's scope, then gathers facts, challenges its own
+conclusion, and checks that the written RCA says no more than the facts support.
+
 ```mermaid
 flowchart TB
   REQ([/analyze request]) --> ORCH([Orchestrator])
@@ -51,6 +55,31 @@ The whole run is wrapped in `asyncio.wait_for(analyze, ANALYSIS_DEADLINE_SECONDS
 never a hang. Per-step ceilings are generous *on purpose* (deep evidence beats
 fast-but-shallow); the overall deadline is the real bound. The backend's
 `AGENT_REQUEST_TIMEOUT_SECONDS` (1560s) must stay above it.
+
+## Stage guide: what enters, leaves, and can stop a stage
+
+| Stage | Input → output | What can stop or limit it |
+| --- | --- | --- |
+| Enrich | Alert target → approved history/topology context | TypeDB is optional; no graph is a warning, not a stop |
+| Plan | Alert + context → scoped hypotheses and probes | Missing labels reduce scope, never authorize broad writes |
+| Evidence | Plan → collector artifacts | Per-source failure becomes partial/unavailable evidence |
+| Rank | Artifacts → ordered candidates | Signatures still need supporting live evidence |
+| Self-check | Leading candidate → caveat/re-analysis need | LLM is optional; deadline bounds extra work |
+| Synthesize | Evidence → operator-readable RCA | 24k evidence budget; no invented facts |
+| Harness | Draft → repaired, downgraded, or abstained response | Hard evidence gate can return `insufficient_evidence` |
+
+```mermaid
+flowchart LR
+  P[Plan] --> I[Central investigation loop\nchoose next discriminating question]
+  P --> D[Collector drill-down loops\nonly each collector's own tools]
+  I --> E[Evidence artifacts]
+  D --> E
+  E --> R[Rank, self-check, synthesis]
+```
+
+The central loop chooses between evidence planes. A collector drill-down stays
+inside one plane. Both are read-only and stop on completion, duplicate work, or
+the overall deadline.
 
 ---
 

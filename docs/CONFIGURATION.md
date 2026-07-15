@@ -5,7 +5,26 @@
 
 All settings available for Run:AI RCA. README covers the common path; this is the full reference.
 
+**Who this is for:** the person installing or operating the service. Start by
+choosing where the Agent reads evidence, then set timeouts and access boundaries,
+then tune optional learning/LLM features. Helm values map those choices into the
+running containers; environment variables are the names the processes receive.
+
+```mermaid
+flowchart LR
+  V[Helm values or local env] --> E[Environment variables]
+  E --> B[Backend]
+  E --> A[Agent]
+  A --> S[Evidence sources and optional MCP services]
+```
+
 ## Environment Variables
+
+### Configure by job
+
+The table is long because it is a complete reference. Read the rows in groups:
+service wiring and timeouts first, evidence-source URLs and credentials next,
+then safety, knowledge, and optional LLM controls.
 
 Backend and agent read these at startup; Helm maps them from the values below.
 

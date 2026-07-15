@@ -9,6 +9,11 @@ This is about operating **Run:AI RCA**, not the incidents it analyzes. For the
 analysis flow see [RCA Pipeline](RCA-PIPELINE.md); for the stores see
 [Data Stores](DATABASE.md).
 
+**Who this is for:** the on-call person operating the RCA service itself. Start
+with “Is it actually working?” to trace alert intake, then use the subsystem
+sections only for the dependency that is failing. A healthy process is not the
+same thing as a completed evidence collection.
+
 ## Is it actually working?
 
 An automatic RCA only starts after **Alertmanager posts to the Backend

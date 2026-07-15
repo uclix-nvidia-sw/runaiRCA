@@ -3,6 +3,20 @@
 > **관점:** 레퍼런스 — HTTP 표면(surface).
 > **이 문서에서 다루는 것:** Backend 엔드포인트 · Agent 엔드포인트 · 웹훅 accept/ignore 시맨틱.
 
+**이 문서는 누구를 위한가:** 연동을 시험하는 운영자와 client를 만드는 개발자를 위한 문서입니다.
+엔드포인트는 요청을 받거나 기록을 돌려주는 하나의 HTTP 주소입니다. 알림 접수는 webhook,
+사건 조회는 incident, 진행 상태는 analysis run부터 보면 됩니다. 도구가 모든 필드를 알아야
+할 때는 OpenAPI를 사용하세요.
+
+```mermaid
+flowchart LR
+  W[Alertmanager webhook] --> I[Incident와 alert API]
+  I --> A[Analyze와 analysis-run API]
+  A --> E[Events/SSE와 dashboard]
+  K[Knowledge API] --> I
+  H[Agent health] --> A
+```
+
 ## OpenAPI 계약
 
 Backend는 GitBook 호환 **OpenAPI 3.0.3** 계약을
@@ -15,6 +29,12 @@ Knowledge operation은 요청 schema와 lifecycle 응답 코드를 상세히 정
 사용하지 않습니다.
 
 ## 엔드포인트
+
+### 작업에 따라 엔드포인트 고르기
+
+사건을 보려면 incident/alert 엔드포인트를 읽고, 새 조사를 요청하려면 analyze 엔드포인트를
+사용하며, 브라우저에 실시간 갱신이 필요하면 events 엔드포인트를 사용합니다. 아래의 상세
+목록은 계속해서 권위 있는 route 레퍼런스입니다.
 
 Backend:
 

@@ -9,6 +9,19 @@ run locally with no external dependencies: the Backend falls back to an in-memor
 Agent runs the NAT engine by default. Without LLM credentials, each stage
 degrades deterministically; if the engine fails, the same pipeline runs directly.
 
+**Who this is for:** someone seeing the project for the first time. The quickest
+path is: start the three local services, send one sample alert, then open the
+incident page. External systems improve evidence but are not required to learn
+the flow.
+
+```mermaid
+flowchart LR
+  S[Start Agent, Backend, Frontend] --> A[Send sample alert]
+  A --> R[Backend creates analysis]
+  R --> U[Open RCA and evidence trail]
+  U --> D[Deploy with Helm when ready]
+```
+
 ## Prerequisites
 
 - Go, Python 3, and Node.js for local development.

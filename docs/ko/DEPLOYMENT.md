@@ -3,7 +3,28 @@
 > **관점:** 어떻게 사용하는가 — 게시된 이미지에서 실행 중인 배포까지 진행합니다.
 > **이 문서에서 다루는 것:** 컨테이너/Helm 게시 · 설치 경로 · Alertmanager 웹훅 라우팅 · Postgres 및 pgvector 설정 · 읽기 전용 RBAC.
 
+**이 문서는 누구를 위한가:** 이미지를 실행 중인 클러스터 서비스로 만드는 사람을 위한 문서입니다.
+Helm은 설치 패키지입니다. 세 애플리케이션 서비스, 구성, Agent에 필요한 최소 권한 읽기 접근을
+만듭니다. 새 설치는 이 페이지 순서대로 읽고, 이후에는 운영 레퍼런스로 사용하세요.
+
+```mermaid
+flowchart TB
+  H[Helm release] --> B[Backend]
+  H --> A[Agent]
+  H --> F[Frontend]
+  H --> P[(Postgres)]
+  A --> K[Kubernetes/Run:ai/metrics/log 읽기]
+  AM[Alertmanager] --> B
+  F --> B
+```
+
 ## 컨테이너 및 Helm 배포
+
+### 네 가지 결정으로 설치하기
+
+이미지를 고르고, 시크릿과 데이터베이스를 제공하고, Agent의 읽기 범위를 정한 뒤,
+Alertmanager를 Backend로 라우팅하세요. 아래 명령은 이 네 결정을 구현하며 Agent에 쓰기
+권한을 주지 않습니다.
 
 리포지토리에는 세 개의 런타임 이미지를 빌드하고 GitHub Container Registry(GHCR)에
 게시하는 GitHub Actions 워크플로가 포함되어 있어, 운영자가 배포할 때마다 이미지를 로컬에서

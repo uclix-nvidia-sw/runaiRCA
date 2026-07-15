@@ -14,7 +14,49 @@ gives the service-level contract; the [RCA Pipeline](RCA-PIPELINE.md) doc walks
 every stage, and the [Knowledge Base](KNOWLEDGE-BASE.md) doc covers the catalogs
 and ontology it consults.
 
+**A simple mental model:** Alertmanager is the doorbell, Backend is the
+coordinator and record keeper, Agent is the investigator, and Frontend is the
+operator's case file. Databases preserve facts; MCP services are read-only
+adapters that let the investigator reach cluster systems safely.
+
+```mermaid
+flowchart LR
+  AM[Alertmanager] --> BE[Backend API]
+  BE --> AG[Agent]
+  AG --> C[Run:ai · Kubernetes · Prometheus · Loki · Postgres · System · Change collectors]
+  C --> MCP[Optional MCP services]
+  C --> DS[Run:ai, Kubernetes, metrics, logs, DB]
+  BE <--> PG[(Postgres)]
+  AG <--> T[(Optional TypeDB)]
+  BE --> UI[Frontend]
+  BE --> SL[Slack]
+```
+
+The Backend accepts alerts and owns the incident record. The Agent plans and
+collects evidence. MCP services are optional bridges, not additional decision
+makers. Postgres stores operational history; TypeDB adds approved topology and
+history context. The Frontend and Slack present the same completed investigation.
+
 ## Runtime Flow
+
+```mermaid
+sequenceDiagram
+  participant AM as Alertmanager
+  participant B as Backend
+  participant A as Agent
+  participant D as Data sources
+  participant O as Operator
+  AM->>B: webhook alert
+  B->>B: correlate and store incident
+  B->>A: /analyze
+  A->>D: read-only evidence collection
+  A-->>B: RCA + evidence trail
+  B-->>O: UI/SSE and Slack update
+```
+
+This journey is asynchronous: the webhook is accepted first, then the Agent has
+time to collect evidence under its deadline. A slow or unavailable source yields
+transparent partial evidence rather than blocking the whole case.
 
 1. Alertmanager sends `POST /webhook/alertmanager` to the Backend.
 2. Backend normalizes each alert and derives Run:ai context from labels and
