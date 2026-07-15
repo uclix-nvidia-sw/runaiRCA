@@ -7,6 +7,7 @@ from dataclasses import replace
 from app.collectors.base import AnalysisTarget
 from app.config import load_settings
 from app.services.kg_enrichment import (
+    GraphRemediation,
     KGContext,
     _case_card_projection,
     _prior_is_context_compatible,
@@ -16,7 +17,12 @@ from app.services.kg_enrichment import (
     _select_case_cards,
     enrich,
 )
-from app.services.pipeline import _knowledge_base_lines, _playbook_lines
+from app.services.pipeline import (
+    _graph_remediation_lines,
+    _knowledge_base_lines,
+    _playbook_lines,
+    _xid_diagnostic_guidance_lines,
+)
 from app.services.root_cause_ranking import RankedCause
 
 
@@ -97,6 +103,31 @@ def test_root_chain_hop_failure_is_isolated() -> None:
     out = _query_remediation(FakeClient(), "", [79], "")  # type: ignore[arg-type]
     assert out.xid_fixes[79] == ["reset the GPU"]
     assert 79 not in out.root_xids
+
+
+def test_query_remediation_projects_xid_trigger_and_renders_guidance() -> None:
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "fixes_for_xid(79)" in query:
+                    return [{"x": "Reset the GPU."}]
+                if "trigger_for_xid(79)" in query:
+                    return [{"x": "Check for PCIe link errors before reset."}]
+                return []
+
+            yield run
+
+    out = _query_remediation(FakeClient(), "", [79], "")  # type: ignore[arg-type]
+
+    assert out.xid_triggers == {79: "Check for PCIe link errors before reset."}
+    assert out.as_dict()["xid_triggers"] == {"79": "Check for PCIe link errors before reset."}
+    assert "Diagnostic guidance (XID 79): Check for PCIe link errors before reset." in "\n".join(
+        _graph_remediation_lines(out)
+    )
+    assert _xid_diagnostic_guidance_lines(out, "ko") == [
+        "- 진단 안내 (XID 79): Check for PCIe link errors before reset."
+    ]
 
 
 def test_enrich_disabled_returns_empty_context() -> None:
@@ -206,6 +237,68 @@ def test_query_kg_projects_typedb_symptom_metadata() -> None:
             }
         ]
     }
+
+
+def test_typedb_failure_mode_symptom_delivery_chain_contract() -> None:
+    # When a consumer starts reading a new failure_modes symptom field, add it to the
+    # TypeDB loader (load_knowledge.py), the read-back (kg_enrichment.py), and this list.
+    contract = {
+        "symptom": "OOMKilled",
+        "keywords": ["oom", "oomkilled"],
+        "actions": ["Inspect memory limit.", "Raise memory limit."],
+        "reason": "Memory limit exceeded.",
+        "exclusive_actions": True,
+        "reason_ko": "메모리 제한을 초과했습니다.",
+        "actions_ko": ["메모리 제한을 높이세요.", "메모리 제한을 점검하세요."],
+        "component": "cluster-sync",
+        "symptom_ko": "메모리 부족 종료",
+    }
+
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "has keyword $kw" in query:
+                    return [
+                        {
+                            "fam": "workload_startup_error",
+                            "sn": contract["symptom"],
+                            "kw": keyword,
+                            "st": action,
+                        }
+                        for keyword, action in zip(contract["keywords"], contract["actions"], strict=True)
+                    ]
+                if "has reason $reason" in query:
+                    return [{"sn": contract["symptom"], "reason": contract["reason"]}]
+                if "has exclusive_actions $exclusive_actions" in query:
+                    return [{"sn": contract["symptom"], "exclusive_actions": True}]
+                if "has reason_ko $reason_ko" in query:
+                    return [{"sn": contract["symptom"], "reason_ko": contract["reason_ko"]}]
+                if "has component $component" in query:
+                    return [{"sn": contract["symptom"], "component": contract["component"]}]
+                if "has name_ko $name_ko" in query:
+                    return [{"sn": contract["symptom"], "name_ko": contract["symptom_ko"]}]
+                if "has statement_ko $statement_ko" in query:
+                    return [
+                        {"sn": contract["symptom"], "statement_ko": action}
+                        for action in contract["actions_ko"]
+                    ]
+                return []
+
+            yield run
+
+    symptom = _query_kg(FakeClient(), _target())["knowledge"]["workload_startup_error"][
+        0
+    ]  # type: ignore[arg-type]
+
+    assert set(symptom) == set(contract)
+    assert symptom == contract
+    assert isinstance(symptom["keywords"], list)
+    assert isinstance(symptom["actions"], list)
+    assert isinstance(symptom["actions_ko"], list)
+    assert isinstance(symptom["exclusive_actions"], bool)
+    for field in set(contract) - {"keywords", "actions", "actions_ko", "exclusive_actions"}:
+        assert isinstance(symptom[field], str)
 
 
 def test_typedb_symptom_component_preserves_yaml_playbook_checks() -> None:

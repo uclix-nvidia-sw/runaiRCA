@@ -43,6 +43,7 @@ attribute exclusive_actions, value boolean;
 attribute created_at, value datetime;
 # --- XID GPU-error catalog attributes ---
 attribute xid_code, value integer;
+attribute xid_trigger, value string;
 attribute mnemonic, value string;
 attribute description, value string;
 # --- platform-architecture attributes (control_plane_component) ---
@@ -502,6 +503,7 @@ relation package_has_template, relates package, relates template, relates bindin
 # knowledge layer stays uniform — xid_error slots in wherever a symptom does.
 entity xid_error,
     owns xid_code @key,
+    owns xid_trigger @card(0..1),
     owns mnemonic,
     owns description,
     owns severity,
