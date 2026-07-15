@@ -290,7 +290,7 @@ async def test_system_log_query_scopes_historical_journal_only(
 
 
 @pytest.mark.asyncio
-async def test_historical_journal_uses_matching_line_time_not_query_epilogue(
+async def test_historical_journal_keeps_post_resolution_match_as_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A post-resolution log match must retain its own occurrence instant."""
@@ -317,15 +317,13 @@ async def test_historical_journal_uses_matching_line_time_not_query_epilogue(
 
     query = await system_log_query(_Settings(), target, {"source": "journal"})
 
-    assert (query["polarity"], query["coverage"]) == ("present", "scoped")
+    assert (query["polarity"], query["coverage"]) == ("unknown", "partial")
     assert query["observation"]["observation_window"] == {
         "start": "2026-07-13T21:38:47Z",
         "end": "2026-07-13T21:50:47Z",
     }
-    assert query["observation"]["evidence_window"] == {
-        "start": "2026-07-13T21:48:00Z",
-        "end": "2026-07-13T21:48:00Z",
-    }
+    assert "evidence_window" not in query["observation"]
+    assert query["observation"]["matching_line_count"] == 1
 
 
 @pytest.mark.asyncio

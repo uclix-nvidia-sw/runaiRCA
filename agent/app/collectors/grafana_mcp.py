@@ -137,7 +137,7 @@ def _select_datasource_uid(data: object, datasource_type: str) -> str:
     for datasource in _datasource_items(data):
         dtype = str(datasource.get("type") or "").strip().lower()
         name = str(datasource.get("name") or "").strip().lower()
-        if datasource_type not in dtype and datasource_type not in name:
+        if datasource_type not in dtype:
             continue
         uid = str(datasource.get("uid") or "").strip()
         if not _GRAFANA_UID.fullmatch(uid):

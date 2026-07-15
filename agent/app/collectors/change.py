@@ -16,6 +16,7 @@ via the LLM (Korean when settings.language == "ko").
 from __future__ import annotations
 
 import re
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -25,6 +26,8 @@ from app.collectors.base import (
     AnalysisTarget,
     CollectorResult,
     artifact,
+    _OBSERVED_NORMAL_EVENT_REASONS,
+    causal_evidence_time_range,
     incident_time_range,
     ko_en,
     parse_incident_time,
@@ -135,13 +138,22 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
     window_start, window_end, incident_window = _collection_window(target)
     historical_window = incident_time_range(target) is not None
     now = window_end if historical_window else datetime.now(UTC)
-    lookback = (
+    lookback = requested_lookback
+    if historical_window:
+        window_start = window_end - timedelta(seconds=lookback)
+        fired_at = parse_incident_time(target.fired_at)
+        if fired_at is not None:
+            window_start = fired_at - timedelta(seconds=lookback)
+        observation_window = {
+            "start": window_start.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "end": incident_window["end"],
+        }
+    else:
+        observation_window = _observation_window(lookback, now)
+    collection_lookback = (
         max(1, int((window_end - window_start).total_seconds()))
         if historical_window
-        else requested_lookback
-    )
-    observation_window = (
-        incident_window if historical_window else _observation_window(lookback, now)
+        else lookback
     )
     collector = ChangeCollector(settings)
     warnings: list[str] = []
@@ -150,19 +162,19 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
     changes: list[dict] = []
     if source in {"all", "controller"}:
         changes += await collector._recent_controllers(
-            ns, node, headers, verify, now, warnings, window_seconds=lookback, limit=query_limit
+            ns, node, headers, verify, now, warnings, window_seconds=collection_lookback, limit=query_limit
         )
     if source in {"all", "pod"}:
         changes += await collector._recent_pods(
-            ns, headers, verify, now, warnings, window_seconds=lookback, limit=query_limit
+            ns, headers, verify, now, warnings, window_seconds=collection_lookback, limit=query_limit
         )
     if source in {"all", "node_condition"} and node:
         changes += await collector._node_conditions(
-            node, headers, verify, now, warnings, window_seconds=lookback
+            node, headers, verify, now, warnings, window_seconds=collection_lookback
         )
     if source in {"all", "event"}:
         changes += await collector._recent_events(
-            ns, query_limit, headers, verify, now, warnings, window_seconds=lookback
+            ns, query_limit, headers, verify, now, warnings, window_seconds=collection_lookback
         )
     if source in {"all", "helm"} and _helm_change_detection_enabled(settings):
         changes += await collector._recent_helm_releases(
@@ -173,14 +185,18 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
             verify,
             now,
             warnings,
-            window_seconds=lookback,
+            window_seconds=collection_lookback,
         )
     # A stalled rollout can be older than the requested window. Do not smuggle
     # it into a short incident query merely because it remains mid-rollout.
     changes = [
         item
         for item in changes
-        if _within_window(item.get("timestamp"), now, window_seconds=lookback)
+        if (
+            window_start <= timestamp <= window_end
+            if historical_window and (timestamp := parse_incident_time(item.get("timestamp"))) is not None
+            else _within_window(item.get("timestamp"), now, window_seconds=lookback)
+        )
     ]
     if component:
         changes = [item for item in changes if str(item.get("name") or "") == component]
@@ -393,10 +409,14 @@ def _collection_window(
     """
     time_range = incident_time_range(target)
     if time_range:
-        start = parse_incident_time(time_range.get("start"))
+        fired = parse_incident_time(target.fired_at)
         end = parse_incident_time(time_range.get("end"))
-        if start is not None and end is not None and end >= start:
-            return start, end, time_range
+        if fired is not None and end is not None and end >= fired:
+            start = fired - timedelta(seconds=_RECENT_WINDOW_SECONDS)
+            return start, end, {
+                "start": start.isoformat(timespec="seconds").replace("+00:00", "Z"),
+                "end": time_range["end"],
+            }
     end = datetime.now(UTC)
     start = end - timedelta(seconds=_RECENT_WINDOW_SECONDS)
     return (
@@ -414,7 +434,7 @@ class ChangeCollector:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._cache: dict[tuple, CollectorResult] = {}
+        self._cache: dict[tuple, tuple[CollectorResult, float]] = {}
         self._components: dict[str, dict] | None = None
 
     async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:  # noqa: ANN001
@@ -446,8 +466,9 @@ class ChangeCollector:
             if historical_window
             else ("live", _RECENT_WINDOW_SECONDS),
         )
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        cached = self._cache.get(cache_key)
+        if cached and time.monotonic() - cached[1] <= 120:
+            return cached[0]
 
         token = _read_file(self._settings.kubernetes_token_path)
         if not token or not namespace or not _namespace_allowed(self._settings, namespace):
@@ -457,7 +478,7 @@ class ChangeCollector:
                 else "no in-scope namespace was resolved for change detection."
             )
             result = self._empty(f"{NO_EVIDENCE} {reason}", missing=["change.unconfigured"])
-            self._cache[cache_key] = result
+            self._cache_result(cache_key, result)
             return result
 
         headers = {"Authorization": f"Bearer {token}"}
@@ -469,6 +490,7 @@ class ChangeCollector:
         ns = quote(namespace, safe="")
         limit = str(self._settings.kubernetes_list_limit)
         warnings: list[str] = []
+        scope_missing: list[str] = []
 
         controllers = await self._recent_controllers(
             ns,
@@ -486,6 +508,9 @@ class ChangeCollector:
         node_changes = await self._node_conditions(
             node, headers, verify, window_end, warnings, window_seconds=window_seconds
         )
+        if node and not self._settings.kubernetes_cluster_scope_enabled:
+            warnings.append("NodeCondition collection skipped because cluster scope is disabled.")
+            scope_missing.append("change.node_condition_scope")
         events = await self._recent_events(
             ns, limit, headers, verify, window_end, warnings, window_seconds=window_seconds
         )
@@ -563,7 +588,7 @@ class ChangeCollector:
                 },
                 observation=observation,
             )
-            self._cache[cache_key] = result
+            self._cache_result(cache_key, result)
             return result
 
         observation = _collector_change_observation(
@@ -593,7 +618,7 @@ class ChangeCollector:
                 details=details,
                 observation=observation,
             )
-            self._cache[cache_key] = result
+            self._cache_result(cache_key, result)
             return result
 
         summary = _deterministic_summary(correlated_changes, namespace)
@@ -612,13 +637,14 @@ class ChangeCollector:
             "context_changes": context_changes,
             "insight": insight,
         }
+        confidence = "high" if len(correlated_changes) >= 2 else "medium"
         result = CollectorResult(
             agent=self.name,
             status="ok",
             summary=summary,
-            confidence="high" if len(correlated_changes) >= 2 else "medium",
+            confidence=confidence,
             details=details,
-            missing_data=[],
+            missing_data=scope_missing,
             warnings=warnings,
             artifacts=[
                 artifact(
@@ -626,7 +652,7 @@ class ChangeCollector:
                     source="kubernetes",
                     type="change_detection",
                     status="ok",
-                    confidence="high",
+                    confidence=confidence,
                     query=(
                         f"namespace={namespace} node={node or 'n/a'} "
                         f"start={time_range['start']} end={time_range['end']}"
@@ -639,8 +665,16 @@ class ChangeCollector:
                 )
             ],
         )
-        self._cache[cache_key] = result
+        self._cache_result(cache_key, result)
         return result
+
+    def _cache_result(self, key: tuple, result: CollectorResult) -> None:
+        if result.status == "ok":
+            self._cache[key] = (result, time.monotonic())
+
+    def clear_cache(self) -> None:
+        """Start each analysis with fresh change evidence."""
+        self._cache.clear()
 
     def _empty(
         self,
@@ -833,6 +867,7 @@ class ChangeCollector:
         )
         # Keep only the newest revision per release within the window.
         latest: dict[str, dict] = {}
+        revisions: dict[str, list[int]] = {}
         for item in _items(data):
             meta = _dict(item.get("metadata"))
             labels = _dict(meta.get("labels"))
@@ -844,6 +879,7 @@ class ChangeCollector:
                 version = int(labels.get("version") or 0)
             except (TypeError, ValueError):
                 version = 0
+            revisions.setdefault(release, []).append(version)
             prev = latest.get(release)
             if prev is None or version >= prev["_version"]:
                 status = str(labels.get("status") or "").strip()
@@ -865,7 +901,13 @@ class ChangeCollector:
                         f"{status or 'changed'} in {namespace}"
                     ),
                 }
-        out = [{k: v for k, v in e.items() if k != "_version"} for e in latest.values()]
+        out = []
+        for release, entry in latest.items():
+            item = {k: v for k, v in entry.items() if k != "_version"}
+            observed = sorted(set(revisions.get(release, [])), reverse=True)
+            item["revision_count"] = len(observed)
+            item["prior_revisions"] = [revision for revision in observed if revision != entry["revision"]]
+            out.append(item)
         return out
 
     async def _recent_pods(
@@ -992,12 +1034,24 @@ class ChangeCollector:
                     "_type": item.get("type"),
                 }
             )
-        # Warnings first, then by recency; keep the most relevant handful.
+        # Warnings first, but always retain decisive Normal lifecycle events.
         events.sort(
-            key=lambda e: (e.pop("_type", "") == "Warning", e.get("timestamp") or ""),
+            key=lambda e: (str(e.get("_type") or "") == "Warning", e.get("timestamp") or ""),
             reverse=True,
         )
-        return events[:10]
+        retained = events[:10]
+        retained_ids = {id(event) for event in retained}
+        retained.extend(
+            event for event in events[10:]
+            if str(event.get("_type") or "").casefold() == "normal"
+            and str(event.get("reason") or "").casefold() in _OBSERVED_NORMAL_EVENT_REASONS
+            and id(event) not in retained_ids
+        )
+        omitted = len(events) - len(retained)
+        if omitted:
+            for event in retained:
+                event["omitted_count"] = omitted
+        return sorted(retained, key=lambda event: event.get("timestamp") or "", reverse=True)
 
 
 def _collector_change_observation(
@@ -1013,7 +1067,8 @@ def _collector_change_observation(
     # Do not let the broad collection range stand in for the time of an
     # individual rollout/Event/Pod transition.  A malformed or untimed record
     # remains useful operator context but cannot activate a lifecycle cause.
-    evidence_window = _change_evidence_window(changes, time_range)
+    causal_time_range = causal_evidence_time_range(target) if target is not None else None
+    evidence_window = _change_evidence_window(changes, causal_time_range or time_range)
     timed_changes = bool(evidence_window)
     observed_entity: dict[str, str] | None = None
     target_scope_verified: bool | None = None
@@ -1027,7 +1082,9 @@ def _collector_change_observation(
     elif warnings:
         # A failed resource class leaves the historical sweep incomplete; don't
         # make an empty/partial result refute a lifecycle-change hypothesis.
-        polarity, coverage = ("present", "partial") if changes else ("unknown", "partial")
+        polarity, coverage = (
+            ("present", "partial") if changes and timed_changes else ("unknown", "partial")
+        )
     elif target is not None and target_scope_verified is not True:
         # Correlation by namespace, a workload-name prefix, or a declared
         # dependency namespace is useful investigation context, but it does

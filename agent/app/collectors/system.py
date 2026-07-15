@@ -21,6 +21,7 @@ from app.collectors.base import (
     AnalysisTarget,
     CollectorResult,
     artifact,
+    causal_evidence_time_range,
     incident_time_range,
     ko_en,
     parse_incident_time,
@@ -34,11 +35,11 @@ from app.masking import build_masker
 # ponytail: flat regex list, not a rule engine — add patterns here as they show up.
 _ERROR_PATTERNS = re.compile(
     r"(?i)("
-    r"xid|nvrm|nvlink|fell off the bus|"  # NVIDIA GPU driver / fabric
+    r"\bxid\b|nvrm|nvlink|fell off the bus|"  # NVIDIA GPU driver / fabric
     r"\boom\b|out of memory|oom-kill|"  # memory pressure
-    r"i/o error|ext4-fs error|ext4_|xfs|"  # filesystem / disk
+    r"i/o error|ext4-fs error|ext4_|\bxfs\b|"  # filesystem / disk
     r"mce:|machine check|hardware error|"  # CPU/hardware
-    r"call trace|kernel panic|bug:|segfault"  # kernel faults
+    r"call trace|kernel panic|\bbug:|segfault"  # kernel faults
     r")"
 )
 
@@ -163,7 +164,7 @@ async def system_log_query(settings: Settings, target: AnalysisTarget, args: dic
         time_range and _historical_journal_response_verified(response.data, time_range)
     )
     matching_timestamps = _journal_matching_timestamps(
-        matching, time_range if historical_window_verified else None
+        matching, causal_evidence_time_range(target) if historical_window_verified else None
     )
     observation = _system_log_observation(
         source=source,
@@ -483,6 +484,7 @@ class SystemCollector:
         token = self._settings.system_agent_token
         headers = {"Authorization": f"Bearer {token}"} if token else None
         time_range = incident_time_range(target)
+        causal_time_range = causal_evidence_time_range(target)
         # A node discovered from a current Pod is useful to inspect, but cannot
         # prove that a historical incident occurred on that node. An exact Pod
         # Event inside the incident window does establish historical placement.
@@ -520,7 +522,7 @@ class SystemCollector:
                 and _historical_journal_response_verified(response.data, time_range)
             )
             matching_timestamps = _journal_matching_timestamps(
-                matches, time_range if historical_window_verified else None
+                matches, causal_time_range if historical_window_verified else None
             )
             source_results.append(
                 {
@@ -553,9 +555,18 @@ class SystemCollector:
             and (not time_range or bool(item.get("historical_window_verified")))
         ]
         with_errors = [item for item in incident_successful if item["error_count"]]
+        causal_errors = (
+            with_errors
+            if not time_range
+            else [
+                item
+                for item in with_errors
+                if isinstance(item.get("matching_timestamps"), list) and item["matching_timestamps"]
+            ]
+        )
         error_lines = [
             line
-            for item in with_errors
+            for item in causal_errors
             for line in raw_matches.get(str(item["source"]), [])
         ]
         journal = next((item for item in source_results if item["source"] == "journal"), None)
@@ -578,7 +589,7 @@ class SystemCollector:
                 f"Node {node}: the system agent did not confirm the requested incident-window "
                 "journal response. Returned logs are context only, not historical evidence.",
             )
-        elif with_errors and time_range and not historical_node_scope_verified:
+        elif causal_errors and time_range and not historical_node_scope_verified:
             status = "partial"
             confidence = "low"
             deterministic = f"{NO_EVIDENCE} " + ko_en(
@@ -590,16 +601,26 @@ class SystemCollector:
                 "error line(s), but the node was inferred from a current Pod rather than the alert; "
                 "this is context only.",
             )
-        elif with_errors:
+        elif causal_errors:
             status = "ok"
             confidence = "high"
-            sources_text = ", ".join(sorted({item["source"] for item in with_errors}))
+            sources_text = ", ".join(sorted({item["source"] for item in causal_errors}))
             deterministic = ko_en(
                 self._settings,
                 f"노드 {node}: {sources_text}에서 커널/하드웨어 에러 라인 "
                 f"{len(error_lines)}건을 발견했습니다.",
                 f"Node {node}: {len(error_lines)} kernel/hardware error line(s) found in "
                 f"{sources_text}.",
+            )
+        elif with_errors:
+            status = "partial"
+            confidence = "low"
+            deterministic = f"{NO_EVIDENCE} " + ko_en(
+                self._settings,
+                f"노드 {node}: 커널/하드웨어 에러 라인이 incident 해결 후 recovery 구간에만 있어 "
+                "원인 증거가 아닌 참고용으로 유지합니다.",
+                f"Node {node}: kernel/hardware error lines occur only in the post-resolution "
+                "recovery window and remain context, not causal evidence.",
             )
         elif incident_successful:
             # The endpoint returns a bounded journal tail. A clean tail is
@@ -642,7 +663,7 @@ class SystemCollector:
             )
 
         summary = deterministic
-        if with_errors and (not time_range or historical_node_scope_verified) and llm_configured(self._settings):
+        if causal_errors and (not time_range or historical_node_scope_verified) and llm_configured(self._settings):
             insight = await _llm_insight(self._settings, node, error_lines)
             if insight:
                 summary = insight
@@ -792,13 +813,16 @@ async def _node_from_target_pod(
         # today. Resolve only the exact historical Pod's timestamped Events;
         # those can prove its old node even after the Pod object was deleted.
         if target.resolved_at:
-            events = await _describe_events(
+            event_result = await _describe_events(
                 settings,
                 namespace=namespace,
                 name=pod,
                 expected_kind="Pod",
                 expected_uid=target.pod_uid,
                 time_range=incident_time_range(target),
+            )
+            events = (
+                event_result.get("items", []) if isinstance(event_result, dict) else event_result
             )
             node = node_from_pod_events(
                 [event for event in events if isinstance(event, dict)]

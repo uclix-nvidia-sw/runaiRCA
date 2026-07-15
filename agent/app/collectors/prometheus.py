@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from datetime import UTC, datetime
 
 from app.collectors.base import (
@@ -134,6 +135,14 @@ class PrometheusCollector:
         _annotate_capacity_gap_coverage(
             query_results, target=target, time_range=time_range
         )
+        if time_range and any(
+            _prometheus_sample_timestamps_unparseable(item.get("value_summary"))
+            for item in query_results
+            if not item.get("error")
+        ):
+            warnings.append(
+                "metric sample timestamps unparseable; positive results kept as context"
+            )
 
         successful = [item for item in query_results if not item["error"]]
         required_names = {
@@ -285,9 +294,9 @@ def _queries_for(
         pod = plan.pod or pod
     selectors = []
     if namespace:
-        selectors.append(f'namespace="{namespace}"')
+        selectors.append(f'namespace="{_promql_string(namespace)}"')
     if pod:
-        selectors.append(f'pod="{pod}"')
+        selectors.append(f'pod="{_promql_string(pod)}"')
     pod_selector = ",".join(selectors)
 
     queries: list[tuple[str, str]] = [("prometheus_up", "up")]
@@ -307,7 +316,7 @@ def _queries_for(
             ]
         )
     elif namespace:
-        namespace_selector = f'namespace="{namespace}"'
+        namespace_selector = f'namespace="{_promql_string(namespace)}"'
         queries.extend(
             [
                 (
@@ -324,22 +333,22 @@ def _queries_for(
         queries.append(
             (
                 "runai_queue_allocated_gpus",
-                f'runai_queue_allocated_gpus{{queue="{target.queue}"}}',
+                f'runai_queue_allocated_gpus{{queue="{_promql_string(target.queue)}"}}',
             )
         )
         queries.append(
             (
                 "runai_queue_capacity_gap",
                 "max by (queue) "
-                f'(runai_queue_requested_gpus{{queue="{target.queue}"}}) '
+                f'(runai_queue_requested_gpus{{queue="{_promql_string(target.queue)}"}}) '
                 "> on(queue) max by (queue) "
-                f'(runai_queue_allocated_gpus{{queue="{target.queue}"}})',
+                f'(runai_queue_allocated_gpus{{queue="{_promql_string(target.queue)}"}})',
             )
         )
         queries.append(
             (
                 "runai_queue_requested_gpus",
-                f'runai_queue_requested_gpus{{queue="{target.queue}"}}',
+                f'runai_queue_requested_gpus{{queue="{_promql_string(target.queue)}"}}',
             )
         )
     if target.project:
@@ -347,18 +356,18 @@ def _queries_for(
             [
                 (
                     "runai_project_allocated_gpus",
-                    f'runai_project_allocated_gpus{{project="{target.project}"}}',
+                f'runai_project_allocated_gpus{{project="{_promql_string(target.project)}"}}',
                 ),
                 (
                     "runai_project_requested_gpus",
-                    f'runai_project_requested_gpus{{project="{target.project}"}}',
+                f'runai_project_requested_gpus{{project="{_promql_string(target.project)}"}}',
                 ),
                 (
                     "runai_project_capacity_gap",
                     "max by (project) "
-                    f'(runai_project_requested_gpus{{project="{target.project}"}}) '
+                f'(runai_project_requested_gpus{{project="{_promql_string(target.project)}"}}) '
                     "> on(project) max by (project) "
-                    f'(runai_project_allocated_gpus{{project="{target.project}"}})',
+                f'(runai_project_allocated_gpus{{project="{_promql_string(target.project)}"}})',
                 ),
             ]
         )
@@ -421,6 +430,16 @@ def _prometheus_result_complete(data: object) -> bool:
     return isinstance(payload, dict) and isinstance(payload.get("result"), list)
 
 
+def _prometheus_range_step(time_range: dict[str, str] | None) -> int:
+    if not time_range:
+        return 60
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return 60
+    return max(60, math.ceil((end - start).total_seconds() / 1000))
+
+
 async def _collect_prometheus_direct(
     settings: Settings,
     queries: list[tuple[str, str]],
@@ -434,7 +453,7 @@ async def _collect_prometheus_direct(
             path="/api/v1/query_range" if time_range else "/api/v1/query",
             timeout_seconds=settings.prometheus_timeout_seconds,
             params=(
-                {"query": query, **time_range, "step": "60"}
+                {"query": query, **time_range, "step": str(_prometheus_range_step(time_range))}
                 if time_range
                 else {"query": query}
             ),
@@ -457,6 +476,7 @@ async def _collect_prometheus_direct(
                 "sample": compact(result_data, limit=3),
                 "value_summary": _prometheus_value_summary(result_data),
                 "error": error,
+                "transport": "direct",
                 **({"time_range": time_range} if time_range else {}),
             }
         )
@@ -604,7 +624,7 @@ def _prometheus_mcp_args(
         "queryType": "range",
         "startTime": query_window["start"],
         "endTime": query_window["end"],
-        "stepSeconds": 60,
+        "stepSeconds": _prometheus_range_step(time_range),
     }
 
 
@@ -634,6 +654,7 @@ def _prometheus_mcp_item(
         "sample": compact(result_data, limit=3),
         "value_summary": _prometheus_value_summary(result_data),
         "error": error,
+        "transport": "mcp",
         "time_range": query_window,
     }
 
@@ -924,11 +945,13 @@ def _prometheus_query_observation(
                 polarity, coverage = "absent", "scoped"
             else:
                 polarity, coverage = "unknown", "partial"
-        elif series_count == 0:
+        elif series_count == 0 and item.get("transport") == "direct":
             # An empty range response has no sample timestamp to inspect, but
             # remains a direct answer to the bounded query. Keep its existing
             # absence semantics; non-empty replies must prove their timing.
             polarity, coverage = "absent", "scoped"
+        elif series_count == 0:
+            polarity, coverage = "unknown", "partial"
         elif sample_window_verified is False or (
             summary.get("sample_timestamp_verification_required") is True
             and sample_window_verified is not True
@@ -1153,13 +1176,35 @@ def _prometheus_samples_in_window(
     return all(start <= timestamp <= end for timestamp in timestamps)
 
 
+def _prometheus_sample_timestamps_unparseable(value_summary: object) -> bool:
+    if not isinstance(value_summary, dict):
+        return False
+    series = value_summary.get("sample_windows") or value_summary.get("series")
+    if not isinstance(series, list):
+        return False
+    for item in series:
+        if not isinstance(item, dict):
+            continue
+        candidates = item.get("sample_timestamps")
+        if not isinstance(candidates, list):
+            candidates = [item.get("first_timestamp"), item.get("last_timestamp")]
+        if any(value is not None and _parse_prometheus_timestamp(value) is None for value in candidates):
+            return True
+    return False
+
+
 def _parse_prometheus_timestamp(value: object) -> datetime | None:
     if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip()):
         try:
-            return datetime.fromtimestamp(float(value), tz=UTC)
+            numeric = float(value)
+            return datetime.fromtimestamp(numeric / 1000 if abs(numeric) > 1e12 else numeric, tz=UTC)
         except (OverflowError, TypeError, ValueError):
             pass
     return parse_incident_time(value)
+
+
+def _promql_string(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _prometheus_samples(item: dict[str, object]) -> list[tuple[str, float | None]]:
@@ -1289,7 +1334,11 @@ async def prom_query(
         base_url=settings.prometheus_url,
         path="/api/v1/query_range" if time_range else "/api/v1/query",
         timeout_seconds=settings.prometheus_timeout_seconds,
-        params={"query": promql, **time_range, "step": "60"} if time_range else {"query": promql},
+        params=(
+            {"query": promql, **time_range, "step": str(_prometheus_range_step(time_range))}
+            if time_range
+            else {"query": promql}
+        ),
     )
     status = _prometheus_status(resp.data)
     error = resp.error or _prometheus_api_error(resp.data, status, require_success_status=True)
@@ -1347,10 +1396,11 @@ def _prom_followup_queries(details: dict, target: AnalysisTarget) -> list[tuple[
             f'increase(kube_pod_container_status_restarts_total{{namespace="{ns}",pod="{pod}"}}[15m])',
         ))
     if pending and node:
+        node_pattern = _promql_string(f"^{re.escape(node)}(:\\d+)?$")
         out.append((
             "node_memory_headroom",
-            f'node_memory_MemAvailable_bytes{{instance=~"{node}.*"}} / '
-            f'node_memory_MemTotal_bytes{{instance=~"{node}.*"}}',
+            f'node_memory_MemAvailable_bytes{{instance=~"{node_pattern}"}} / '
+            f'node_memory_MemTotal_bytes{{instance=~"{node_pattern}"}}',
         ))
     return out
 

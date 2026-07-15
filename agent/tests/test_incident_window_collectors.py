@@ -62,6 +62,55 @@ async def test_prometheus_direct_uses_incident_query_range(monkeypatch) -> None:
     assert all(call["params"]["step"] == "60" for call in calls)
 
 
+def test_prometheus_range_step_bounds_long_incident_queries() -> None:
+    assert prometheus._prometheus_range_step(
+        {"start": "2026-01-01T00:00:00Z", "end": "2026-01-11T00:00:00Z"}
+    ) == 864
+
+
+def test_kubernetes_pod_list_prioritizes_failures_and_preserves_omission_count() -> None:
+    target = replace(make_target(), workload_name="")
+    pods = [
+        {
+            "metadata": {"name": f"healthy-{index}"},
+            "status": {"phase": "Running", "containerStatuses": []},
+        }
+        for index in range(6)
+    ]
+    pods.append(
+        {
+            "metadata": {"name": "runai-scheduler-default-z"},
+            "status": {
+                "phase": "Failed",
+                "reason": "Evicted",
+                "conditions": [
+                    {"type": "Ready", "status": "True"},
+                    {"type": "DisruptionTarget", "status": "True", "reason": "Preemption"},
+                ],
+                "containerStatuses": [],
+            },
+        }
+    )
+
+    filtered = _filter_kubernetes_data("namespace_pods", {"items": pods}, target)
+
+    assert filtered["items"][0]["name"] == "runai-scheduler-default-z"
+    assert filtered["items"][0]["reason"] == "Evicted"
+    assert filtered["items"][0]["conditions"][0]["type"] == "DisruptionTarget"
+    assert filtered["omitted_pods"] == 2
+
+
+def test_loki_sample_entries_round_robin_streams() -> None:
+    entries = loki._sample_entries(
+        [
+            {"stream": {"container": "first"}, "values": [["2", "first-2"], ["3", "first-3"]]},
+            {"stream": {"container": "second"}, "values": [["1", "second-1"]]},
+        ]
+    )
+
+    assert [entry["line"] for entry in entries] == ["first-2", "second-1", "first-3"]
+
+
 @pytest.mark.asyncio
 async def test_prometheus_api_error_payload_is_not_treated_as_missing_metrics(monkeypatch) -> None:
     async def fake_get_json(**_kwargs):
@@ -944,6 +993,20 @@ def test_prometheus_unbounded_empty_result_is_not_a_scoped_absence() -> None:
     assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
 
 
+def test_prometheus_empty_vector_requires_direct_native_transport() -> None:
+    window = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    base = {"name": "container_restarts", "series_count": 0, "value_summary": {}}
+    mcp = prometheus._prometheus_query_observation(
+        {**base, "transport": "mcp"}, target=make_target(), time_range=window
+    )
+    direct = prometheus._prometheus_query_observation(
+        {**base, "transport": "direct"}, target=make_target(), time_range=window
+    )
+
+    assert (mcp["polarity"], mcp["coverage"]) == ("unknown", "partial")
+    assert (direct["polarity"], direct["coverage"]) == ("absent", "scoped")
+
+
 def test_loki_query_observation_only_refutes_with_a_bounded_incident_window() -> None:
     time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
     absent = loki._loki_query_observation(
@@ -1144,6 +1207,40 @@ def test_loki_history_accepts_exact_immutable_workload_row_in_incident_window() 
     }
 
 
+def test_loki_history_verifies_identity_before_display_truncation() -> None:
+    workload_id = "550e8400-e29b-41d4-a716-446655440000"
+    target = replace(make_target(), runai_workload_id=workload_id)
+    time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    full_line = f"{'x' * 260} workload {workload_id} failed scheduling"
+    observation = loki._loki_query_observation(
+        {
+            "name": "workload_history_logs",
+            "query": loki._workload_history_query(target),
+            "transport": "direct",
+            "line_count": 1,
+            "stream_count": 1,
+            "sample_entries": [
+                {
+                    "timestamp": "2026-07-10T01:00:00Z",
+                    "line": full_line[:240],
+                    "labels": {"namespace": "runai-vision"},
+                }
+            ],
+            "_verification_entries": [
+                {
+                    "timestamp": "2026-07-10T01:00:00Z",
+                    "line": full_line,
+                    "labels": {"namespace": "runai-vision"},
+                }
+            ],
+        },
+        target=target,
+        time_range=time_range,
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
+
+
 @pytest.mark.parametrize(
     ("line", "labels"),
     [
@@ -1310,7 +1407,7 @@ def test_runai_query_observation_requires_identity_scoped_coverage() -> None:
     )
 
     assert (present["polarity"], present["coverage"]) == ("present", "scoped")
-    assert (missing["polarity"], missing["coverage"]) == ("absent", "scoped")
+    assert (missing["polarity"], missing["coverage"]) == ("unknown", "partial")
     assert (broad_nonmatch["polarity"], broad_nonmatch["coverage"]) == ("unknown", "partial")
     assert (direct_workload_nonmatch["polarity"], direct_workload_nonmatch["coverage"]) == (
         "unknown",
@@ -1345,8 +1442,8 @@ def test_runai_collection_404_cannot_prove_named_resource_absence() -> None:
         direct_workload_collection_missing["coverage"],
     ) == ("unavailable", "unknown")
     assert (direct_project_missing["polarity"], direct_project_missing["coverage"]) == (
-        "absent",
-        "scoped",
+        "unknown",
+        "partial",
     )
 
 
@@ -1435,6 +1532,61 @@ def test_runai_current_resource_state_is_context_for_historical_incident() -> No
     assert (present["polarity"], present["coverage"]) == ("unknown", "partial")
     assert (missing["polarity"], missing["coverage"]) == ("unknown", "partial")
     assert present["observation_window"]["start"] == "2026-07-10T00:55:00Z"
+
+
+def test_runai_historical_present_requires_an_in_window_transition() -> None:
+    target = replace(
+        make_target(),
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    current = runai._runai_query_observation(
+        {"name": "workloads", "status_code": 200, "data": {"workloads": [{"name": "trainer"}]}},
+        target=target,
+        used_mcp=True,
+    )
+    historical = runai._runai_query_observation(
+        {
+            "name": "workloads",
+            "status_code": 200,
+            "data": {"workloads": [{"name": "trainer", "statusTransitionTime": "2026-07-10T01:04:00Z"}]},
+        },
+        target=target,
+        used_mcp=True,
+    )
+
+    assert (current["polarity"], current["coverage"]) == ("unknown", "partial")
+    assert current["current_state_only"] is True
+    assert (historical["polarity"], historical["coverage"]) == ("present", "scoped")
+    assert historical["evidence_window"] == {
+        "start": "2026-07-10T01:04:00Z",
+        "end": "2026-07-10T01:04:00Z",
+    }
+
+
+def test_runai_firing_404_is_scoped_only_for_immutable_workload_id() -> None:
+    firing = replace(make_target(), fired_at="2026-07-10T01:00:00Z")
+    resolved = replace(firing, resolved_at="2026-07-10T01:10:00Z")
+    workload = replace(firing, runai_workload_id="550e8400-e29b-41d4-a716-446655440000")
+    item = {"name": "workload_by_id", "status_code": 404, "error": "HTTP 404", "data": None}
+
+    assert (
+        runai._runai_query_observation(item, target=workload, used_mcp=False)["polarity"],
+        runai._runai_query_observation(item, target=workload, used_mcp=False)["coverage"],
+    ) == ("absent", "scoped")
+    resolved_observation = runai._runai_query_observation(item, target=resolved, used_mcp=False)
+    assert (resolved_observation["polarity"], resolved_observation["coverage"]) == ("unknown", "partial")
+    artifact = runai._runai_query_artifact("runai", item, target=resolved, used_mcp=False)
+    assert artifact.status == "partial"
+    assert "absent (current state)" in artifact.summary
+
+    for name in ("project", "queue"):
+        observation = runai._runai_query_observation(
+            {"name": name, "status_code": 404, "error": "HTTP 404", "data": None},
+            target=firing,
+            used_mcp=False,
+        )
+        assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
 
 
 @pytest.mark.asyncio

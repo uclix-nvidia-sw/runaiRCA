@@ -53,7 +53,7 @@ async def get_json(
     url = _join_url(base_url, path)
     try:
         async with httpx.AsyncClient(
-            timeout=_client_timeout(timeout_seconds), verify=verify
+            timeout=_client_timeout(timeout_seconds), verify=verify, follow_redirects=True
         ) as client:
             response = await client.get(url, params=params, headers=headers)
     except Exception as exc:  # noqa: BLE001 - collectors report diagnostics, not failures.
@@ -95,7 +95,7 @@ async def post_form_json(
 
     try:
         async with httpx.AsyncClient(
-            timeout=_client_timeout(timeout_seconds), verify=verify
+            timeout=_client_timeout(timeout_seconds), verify=verify, follow_redirects=True
         ) as client:
             response = await client.post(url, data=data, headers=headers)
     except Exception as exc:  # noqa: BLE001 - collectors report diagnostics, not failures.
@@ -137,7 +137,7 @@ async def post_json(
 
     try:
         async with httpx.AsyncClient(
-            timeout=_client_timeout(timeout_seconds), verify=verify
+            timeout=_client_timeout(timeout_seconds), verify=verify, follow_redirects=True
         ) as client:
             response = await client.post(url, json=json_body, headers=headers)
     except Exception as exc:  # noqa: BLE001 - collectors report diagnostics, not failures.
@@ -194,7 +194,7 @@ async def post_oauth_token(
 
     try:
         async with httpx.AsyncClient(
-            timeout=_client_timeout(timeout_seconds), verify=verify
+            timeout=_client_timeout(timeout_seconds), verify=verify, follow_redirects=True
         ) as client:
             if json_body is not None:
                 response = await client.post(url, json=json_body, headers=headers)

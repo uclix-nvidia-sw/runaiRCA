@@ -165,11 +165,11 @@ async def test_historical_incident_uses_its_own_change_window(
     result = await ChangeCollector(_Settings()).collect(target)
 
     assert result.details["time_range"] == {
-        "start": "2026-01-02T02:55:00Z",
+        "start": "2026-01-02T02:00:00Z",
         "end": "2026-01-02T03:15:00Z",
     }
     assert [change["reason"] for change in result.details["changes"]] == ["DuringIncident"]
-    assert "start=2026-01-02T02:55:00Z" in result.artifacts[0].query
+    assert "start=2026-01-02T02:00:00Z" in result.artifacts[0].query
     observation = result.artifacts[0].result["observation"]
     # An Event on a similarly-named Pod is useful context, but this alert did
     # not name that Pod and the event does not identify a verified controller.
@@ -217,7 +217,7 @@ async def test_historical_incident_excludes_pod_deleted_outside_its_window(
 
     assert result.status == "partial"
     assert result.details["time_range"] == {
-        "start": "2026-01-02T02:55:00Z",
+        "start": "2026-01-02T02:00:00Z",
         "end": "2026-01-02T03:15:00Z",
     }
     assert result.details.get("changes", []) == []
@@ -671,13 +671,13 @@ async def test_change_query_uses_the_historical_incident_window(
     observation = query["observation"]
     assert observation["historical_window"] is True
     assert observation["observation_window"] == {
-        "start": "2026-07-13T21:38:47Z",
+        "start": "2026-07-13T21:42:47Z",
         "end": "2026-07-13T21:50:47Z",
     }
-    assert observation["window"] == {"lookback_seconds": 720}
+    assert observation["window"] == {"lookback_seconds": 60}
     assert [change["reason"] for change in observation["changes"]] == ["BackOff"]
     assert observation["coverage"] == "scoped"
-    assert "start=2026-07-13T21:38:47Z" in query["query"]
+    assert "start=2026-07-13T21:42:47Z" in query["query"]
 
 
 @pytest.mark.asyncio

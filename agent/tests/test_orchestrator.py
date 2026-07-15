@@ -1541,10 +1541,10 @@ async def test_runai_collector_falls_back_when_one_mcp_tool_fails(monkeypatch) -
     ).collect(target)
 
     assert called["direct"] is True
-    assert result.details["queries"][0]["transport"] == "direct"
-    assert any("incomplete or unusable" in warning for warning in result.warnings)
-    assert "direct API queries completed" in result.summary
-    assert "MCP queries completed" not in result.summary
+    assert result.details["queries"][0]["transport"] == "mcp"
+    assert any(item["transport"] == "direct" for item in result.details["queries"])
+    assert any("workload_status failed" in warning for warning in result.warnings)
+    assert result.status == "partial"
 
 
 @pytest.mark.asyncio
@@ -1603,6 +1603,58 @@ async def test_runai_direct_partial_result_does_not_claim_all_queries_completed(
 
 
 @pytest.mark.asyncio
+async def test_runai_mcp_snapshot_supplements_direct_queue_scope(monkeypatch) -> None:
+    from app.collectors import runai as runai_mod
+
+    workload_id = "550e8400-e29b-41d4-a716-446655440000"
+
+    async def fake_mcp(_settings, _target, *, headers):
+        return [{"name": "workloads", "transport": "mcp", "status_code": 200, "error": None,
+                 "data": {"workloads": [{"id": workload_id}]}}]
+
+    async def fake_direct(_settings, _target, _headers):
+        return [{"name": "queue", "path": "/api/v1/queues/gpu-a", "transport": "direct",
+                 "status_code": 200, "error": None, "data": {"name": "gpu-a"}}]
+
+    monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", fake_mcp)
+    monkeypatch.setattr(runai_mod, "_collect_runai_responses", fake_direct)
+    monkeypatch.setattr(runai_mod, "_fetch_runai_version", lambda *a, **k: _async_empty())
+    result = await RunAICollector(
+        replace(make_settings(), runai_base_url="https://runai.example", runai_bearer_token="token",
+                runai_mcp_url="http://runai-mcp/mcp")
+    ).collect(replace(make_target(), runai_workload_id=workload_id))
+
+    assert [(item["name"], item["transport"]) for item in result.details["queries"]] == [
+        ("workloads", "mcp"), ("queue", "direct")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runai_mcp_queue_gap_is_visible_when_direct_query_is_unavailable(monkeypatch) -> None:
+    from app.collectors import runai as runai_mod
+
+    workload_id = "550e8400-e29b-41d4-a716-446655440000"
+
+    async def fake_mcp(_settings, _target, *, headers):
+        return [{"name": "workloads", "transport": "mcp", "status_code": 200, "error": None,
+                 "data": {"workloads": [{"id": workload_id}]}}]
+
+    async def no_direct(_settings, _target, _headers):
+        return []
+
+    monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", fake_mcp)
+    monkeypatch.setattr(runai_mod, "_collect_runai_responses", no_direct)
+    monkeypatch.setattr(runai_mod, "_fetch_runai_version", lambda *a, **k: _async_empty())
+    result = await RunAICollector(
+        replace(make_settings(), runai_base_url="https://runai.example", runai_bearer_token="token",
+                runai_mcp_url="http://runai-mcp/mcp")
+    ).collect(replace(make_target(), runai_workload_id=workload_id))
+
+    assert "runai.queue_scope" in result.missing_data
+    assert any("queue scope was not collected" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
 async def test_runai_collector_uses_direct_lookup_without_official_uuid(
     monkeypatch,
 ) -> None:
@@ -1620,7 +1672,15 @@ async def test_runai_collector_uses_direct_lookup_without_official_uuid(
                 "status_code": 200,
                 "error": None,
                 "data": {"workloads": [{"name": "trainer"}]},
-            }
+            },
+            {
+                "name": "queue",
+                "path": "/api/v1/queues/gpu-a",
+                "transport": "direct",
+                "status_code": 200,
+                "error": None,
+                "data": {"name": "gpu-a"},
+            },
         ]
 
     monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", forbidden_mcp)
@@ -1695,7 +1755,15 @@ async def test_runai_collector_falls_back_from_unparseable_mcp_payload(monkeypat
                 "status_code": 200,
                 "error": None,
                 "data": {"workloads": [{"name": "trainer"}]},
-            }
+            },
+            {
+                "name": "queue",
+                "path": "/api/v1/queues/gpu-a",
+                "transport": "direct",
+                "status_code": 200,
+                "error": None,
+                "data": {"name": "gpu-a"},
+            },
         ]
 
     async def fake_headers(_settings, prefer_oauth=False):
@@ -1771,8 +1839,9 @@ async def test_runai_collector_falls_back_from_blank_mcp_payload_with_reason(
         )
     )
 
-    assert result.details["queries"][0]["transport"] == "direct"
-    assert any("contained no resource data" in warning for warning in result.warnings)
+    assert result.details["queries"][0]["transport"] == "mcp"
+    assert result.status == "partial"
+    assert "runai.queue_scope" in result.missing_data
 
 
 @pytest.mark.parametrize(
@@ -1783,13 +1852,10 @@ async def test_runai_collector_falls_back_from_blank_mcp_payload_with_reason(
         {"data": {"result": []}, "status": "success"},
     ],
 )
-def test_runai_nested_blank_mcp_envelopes_are_unusable(payload) -> None:
+def test_runai_nested_blank_mcp_envelopes_are_valid_empty_results(payload) -> None:
     from app.collectors.runai import _runai_payload_error
 
-    assert (
-        _runai_payload_error(payload, transport="mcp")
-        == "Run:ai MCP response contained no resource data"
-    )
+    assert _runai_payload_error(payload, transport="mcp") == ""
 
 
 def test_runai_empty_envelope_does_not_hide_meaningful_identity() -> None:

@@ -12,9 +12,13 @@ from urllib.parse import quote
 import yaml
 
 from app.collectors.base import (
+    _FALSE_IS_FAILURE_CONDITION_TYPES,
+    _OBSERVED_NORMAL_EVENT_REASONS,
+    _TRUE_IS_FAILURE_CONDITION_TYPES,
     NO_EVIDENCE,
     AnalysisTarget,
     CollectorResult,
+    _boolean_condition_status,
     artifact,
     causal_evidence_time_range,
     incident_time_range,
@@ -297,6 +301,7 @@ async def k8s_read(
     field_selector: str = "",
     *,
     full_object: bool = False,
+    continue_token: str = "",
 ) -> dict:
     """One read-only GET/LIST of a Kubernetes kind — MCP-first, direct fallback.
 
@@ -330,6 +335,8 @@ async def k8s_read(
             # reads; only the new node-assignment lookup needs this argument.
             if field_selector:
                 mcp_kwargs["field_selector"] = field_selector
+            if continue_token:
+                mcp_kwargs["continue_token"] = continue_token
             return await _k8s_read_via_mcp(settings, resolved, **mcp_kwargs)
         except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
             # "not found" is an ANSWER (the resource is gone), not a transport
@@ -377,6 +384,8 @@ async def k8s_read(
             params["labelSelector"] = label_selector
         if field_selector:
             params["fieldSelector"] = field_selector
+        if continue_token:
+            params["continue"] = continue_token
     verify: bool | str = (
         settings.kubernetes_ca_path if Path(settings.kubernetes_ca_path).exists() else True
     )
@@ -457,7 +466,7 @@ async def k8s_logs(
         try:
             result = await _k8s_mcp_result(settings, [("pods_log", args)])
             raw = mcp_tool_json(result)
-            lines = _log_lines(mcp_tool_text(result) or raw)
+            lines = _log_lines(mcp_tool_text(result) or raw, historical=bool(since_time))
             observed_entity = _mcp_pod_log_observed_entity(raw, namespace, pod)
             return {
                 "namespace": namespace,
@@ -549,7 +558,7 @@ async def _direct_pod_logs(
         "observed_entity": _pod_log_entity(namespace, pod),
         "status_code": response.status_code,
         "error": response.error,
-        "lines": _log_lines(response.data),
+        "lines": _log_lines(response.data, historical=bool(since_time)),
     }
     if mcp_note:
         result["mcp_fallback"] = mcp_note
@@ -583,7 +592,7 @@ async def k8s_describe(
     expected_kind = _k8s_mcp_api_kinds(resolved)[0][1]
     object_data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
     metadata = object_data.get("metadata") if isinstance(object_data.get("metadata"), dict) else {}
-    events = await _describe_events(
+    event_result = await _describe_events(
         settings,
         namespace=namespace,
         name=name,
@@ -591,6 +600,7 @@ async def k8s_describe(
         expected_uid=str(metadata.get("uid") or ""),
         time_range=time_range,
     )
+    events = event_result.get("items", []) if isinstance(event_result, dict) else event_result
     observed_entity = _described_resource_entity(
         expected_kind, namespace, name, object_data
     )
@@ -602,8 +612,27 @@ async def k8s_describe(
         "status_code": obj.get("status_code"),
         "error": obj.get("error"),
         "events": events,
+        **(
+            {"events_error": event_result["error"]}
+            if isinstance(event_result, dict) and event_result.get("error")
+            else {}
+        ),
         **({"observed_entity": observed_entity} if observed_entity else {}),
-        **({"mcp_fallback": obj["mcp_fallback"]} if obj.get("mcp_fallback") else {}),
+        **(
+            {
+                "mcp_fallback": " | ".join(
+                    str(note)
+                    for note in (
+                        obj.get("mcp_fallback"),
+                        event_result.get("mcp_fallback") if isinstance(event_result, dict) else "",
+                    )
+                    if note
+                )
+            }
+            if obj.get("mcp_fallback")
+            or (isinstance(event_result, dict) and event_result.get("mcp_fallback"))
+            else {}
+        ),
     }
 
 
@@ -633,7 +662,7 @@ async def _describe_events(
     expected_kind: str,
     expected_uid: str = "",
     time_range: dict[str, str] | None = None,
-) -> list:
+) -> dict[str, object]:
     """Events for ONE object, preferring Kubernetes MCP plus local verification.
 
     In v0.0.62 the generic ``resources_list`` tool exposes ``fieldSelector``;
@@ -643,7 +672,7 @@ async def _describe_events(
     ignore selectors.
     """
     if not name:
-        return []
+        return {"items": []}
     field_selector = ",".join(
         value
         for value in (
@@ -653,6 +682,7 @@ async def _describe_events(
         )
         if value
     )
+    mcp_note = ""
     if settings.kubernetes_mcp_url:
         try:
             data = await _k8s_mcp_json(
@@ -685,12 +715,16 @@ async def _describe_events(
                 if _event_matches_uid(item, expected_uid)
             ]
             filtered = _events_in_time_range(matching, time_range)
-            return compact(filtered, limit=12) if filtered else []
-        except Exception:  # noqa: BLE001 - direct API fallback is the behavior.
-            pass
+            return {"items": compact(filtered, limit=12) if filtered else []}
+        except Exception as exc:  # noqa: BLE001 - direct API fallback is the behavior.
+            mcp_note = mcp_fallback_warning(exc)
     token = _read_file(settings.kubernetes_token_path)
     if not token:
-        return []
+        return {
+            "items": [],
+            "error": "kubernetes service account token unavailable for events read",
+            **({"mcp_fallback": mcp_note} if mcp_note else {}),
+        }
     verify: bool | str = (
         settings.kubernetes_ca_path if Path(settings.kubernetes_ca_path).exists() else True
     )
@@ -723,7 +757,11 @@ async def _describe_events(
         and _event_matches_uid(item, expected_uid)
     ]
     filtered = _events_in_time_range(filtered, time_range)
-    return compact(filtered, limit=12) if filtered else []
+    return {
+        "items": compact(filtered, limit=12) if filtered else [],
+        **({"error": response.error} if response.error else {}),
+        **({"mcp_fallback": mcp_note} if mcp_note else {}),
+    }
 
 
 async def k8s_exec(
@@ -1434,9 +1472,14 @@ class KubernetesCollector:
         workload_resolution: dict[str, object] = {}
         resolved_pod_describe: dict[str, object] = {}
         if not target.pod:
-            workload_resolution = await _resolve_workload_pod(self._settings, target)
+            if target.namespace and not _namespace_allowed(self._settings, target.namespace):
+                if "kubernetes.namespace_scope" not in missing:
+                    missing.append("kubernetes.namespace_scope")
+                warnings.append("Resolved workload pod lookup skipped by namespace scope configuration.")
+            else:
+                workload_resolution = await _resolve_workload_pod(self._settings, target)
             resolved_pod = str(workload_resolution.get("selected_pod") or "")
-            if resolved_pod:
+            if resolved_pod and _namespace_allowed(self._settings, target.namespace):
                 resolved_target = replace(target, pod=resolved_pod)
                 resolved_pod_describe = await k8s_describe(
                     self._settings,
@@ -1544,6 +1587,13 @@ class KubernetesCollector:
             except Exception:  # noqa: BLE001 - enumeration is best-effort
                 pass
         crd_findings = runai_crds.get("findings") or []
+        warnings.extend(str(item) for item in runai_crds.get("warnings") or [])
+        if runai_crds.get("truncated"):
+            warnings.append(
+                "Run:ai CRD scan was truncated after five pages for "
+                + ", ".join(map(str, runai_crds["truncated"]))
+                + "."
+            )
 
         if required_completed and not required_failures and not missing:
             status = "ok"
@@ -1580,8 +1630,12 @@ class KubernetesCollector:
             confidence = "low"
             summary = f"{NO_EVIDENCE} " + ko_en(
                 self._settings,
-                "Kubernetes API 조회가 실패했습니다.",
-                "Kubernetes API direct queries failed.",
+                "네임스페이스가 범위 설정에서 제외되어 Kubernetes 조회를 건너뛰었습니다."
+                if target.namespace and not target.node and not _namespace_allowed(self._settings, target.namespace)
+                else "Kubernetes API 조회가 실패했습니다.",
+                "Kubernetes queries were skipped because the namespace is excluded by scope configuration."
+                if target.namespace and not target.node and not _namespace_allowed(self._settings, target.namespace)
+                else "Kubernetes API direct queries failed.",
             )
 
         # The alert names a pod that no longer exists (and left no live sibling
@@ -1654,6 +1708,8 @@ class KubernetesCollector:
             "runai_control_plane_warning_events": runai_control_plane_events,
             "runai_crd_findings": crd_findings,
             "runai_crds_checked": runai_crds.get("checked"),
+            "runai_crd_failed_kinds": runai_crds.get("failed_kinds"),
+            "runai_crd_truncated": runai_crds.get("truncated"),
             "insight": insight,
             "queries": responses,
         }
@@ -1757,6 +1813,7 @@ class KubernetesCollector:
         )
         if target_pod_describe:
             describe_error = target_pod_describe.get("error")
+            describe_events_error = target_pod_describe.get("events_error")
             describe_events = target_pod_describe.get("events")
             event_count = len(describe_events) if isinstance(describe_events, list) else 0
             snapshot_observation: dict[str, object] = {
@@ -1778,20 +1835,40 @@ class KubernetesCollector:
                     agent=self.name,
                     source="kubernetes",
                     type="pod_inspection",
-                    status="unavailable" if describe_error else "ok",
-                    confidence="high" if not describe_error else "low",
+                    # A failed events read must not discard the successfully
+                    # collected Pod YAML from the usable evidence set.
+                    status=(
+                        "unavailable"
+                        if describe_error
+                        else "partial"
+                        if describe_events_error
+                        else "ok"
+                    ),
+                    confidence=(
+                        "high" if not describe_error and not describe_events_error else "low"
+                    ),
                     title=ko_en(self._settings, "Pod YAML + 상세 점검", "Pod YAML + describe"),
                     query=pod_inspection_repr(target.namespace, target.pod),
                     summary=(
                         str(describe_error)
                         if describe_error
-                        else ko_en(
+                        else (
+                            ko_en(
+                                self._settings,
+                                "Pod 전체 YAML을 수집했지만 incident 시간창 이벤트 조회를 "
+                                f"완료하지 못했습니다: {describe_events_error}",
+                                "Collected full Pod YAML, but the incident-window events read was "
+                                f"unavailable: {describe_events_error}",
+                            )
+                            if describe_events_error
+                            else ko_en(
                             self._settings,
                             (
                                 "Pod 전체 YAML과 incident 시간창 이벤트 "
                                 f"{event_count}건을 확인했습니다."
                             ),
                             f"Collected full Pod YAML and {event_count} incident-window event(s).",
+                            )
                         )
                     ),
                     # YAML is a live inspection; its filtered events are
@@ -2815,17 +2892,28 @@ def _diagnostic_pod(items: list[dict], workload_name: str) -> dict | None:
             severity += 3
         return severity, str(metadata.get("creationTimestamp") or "")
 
+    stem = workload_name.casefold()
     candidates = [
         item
         for item in items
         if str((item.get("metadata") or {}).get("name") or "")
         and (
             not workload_name
-            or workload_name in str((item.get("metadata") or {}).get("name") or "")
-            or bool((item.get("metadata") or {}).get("labels"))
+            or stem in str((item.get("metadata") or {}).get("name") or "").casefold()
+            or any(stem in str(value).casefold() for value in ((item.get("metadata") or {}).get("labels") or {}).values())
+            or any(stem in str(owner.get("name") or "").casefold() for owner in ((item.get("metadata") or {}).get("ownerReferences") or []) if isinstance(owner, dict))
         )
     ]
-    return max(candidates, key=score) if candidates else None
+    # Preserve namespace-level diagnostic context when controller matching is
+    # inconclusive instead of silently dropping every unhealthy pod.
+    return max(candidates or items, key=score) if items else None
+
+
+def _generated_workload_pod_name(name: str, workload: str) -> bool:
+    if not name.startswith(f"{workload}-"):
+        return False
+    suffix = name[len(workload) + 1 :]
+    return bool(re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", suffix)) and "-" not in suffix or bool(re.fullmatch(r"[a-z0-9]+-[a-z0-9]+", suffix))
 
 
 def _diagnostic_job(items: list[dict], cronjob_name: str) -> dict | None:
@@ -2855,6 +2943,8 @@ async def _resolve_workload_pod(settings: Settings, target: AnalysisTarget) -> d
     kind = _WORKLOAD_READ_KINDS.get(str(target.workload_type or "").lower())
     if target.pod or not (kind and target.namespace and target.workload_name):
         return {}
+    if not _namespace_allowed(settings, target.namespace):
+        return {"namespace_scope_blocked": True}
 
     controller = await k8s_read(
         settings, kind, namespace=target.namespace, name=target.workload_name
@@ -2889,6 +2979,7 @@ async def _resolve_workload_pod(settings: Settings, target: AnalysisTarget) -> d
         "pods",
         namespace=target.namespace,
         label_selector=selector,
+        full_object=True,
     )
     items = _read_items(pods)
     if not selector:
@@ -2896,11 +2987,16 @@ async def _resolve_workload_pod(settings: Settings, target: AnalysisTarget) -> d
             item
             for item in items
             if _owned_by(item, target.workload_type, target.workload_name)
-            or str((item.get("metadata") or {}).get("name") or "").startswith(
-                f"{target.workload_name}-"
+            or _generated_workload_pod_name(
+                str((item.get("metadata") or {}).get("name") or ""), target.workload_name
             )
         ]
     selected = _diagnostic_pod(items, target.workload_name)
+    selected_metadata = selected.get("metadata") if isinstance(selected, dict) and isinstance(selected.get("metadata"), dict) else {}
+    selected_text = " ".join(
+        [str(selected_metadata.get("name") or ""), *map(str, (selected_metadata.get("labels") or {}).values())]
+        + [str(owner.get("name") or "") for owner in selected_metadata.get("ownerReferences") or [] if isinstance(owner, dict)]
+    ).casefold()
     resolution.update(
         {
             "selector": selector,
@@ -2910,6 +3006,9 @@ async def _resolve_workload_pod(settings: Settings, target: AnalysisTarget) -> d
             ],
             "selected_pod": (
                 str((selected.get("metadata") or {}).get("name") or "") if selected else ""
+            ),
+            "namespace_context_fallback": bool(
+                selected and target.workload_name and target.workload_name.casefold() not in selected_text
             ),
         }
     )
@@ -2924,6 +3023,8 @@ async def _collect_resolved_pod_logs(
     previous_containers: list[str] | None = None,
     since_time: str = "",
 ) -> list[dict[str, object]]:
+    if not _namespace_allowed(settings, target.namespace):
+        return []
     targets: list[str | None] = list(containers) if containers else [None]
     logs: list[dict[str, object]] = []
     for container in targets:
@@ -3268,11 +3369,14 @@ async def resolve_live_pod_node(
         event_node = ""
         event_pod = ""
         for name in names[:3]:
-            events = await _describe_events(
+            event_result = await _describe_events(
                 settings,
                 namespace=namespace,
                 name=name,
                 expected_kind="Pod",
+            )
+            events = (
+                event_result.get("items", []) if isinstance(event_result, dict) else event_result
             )
             event_node = node_from_pod_events(
                 [event for event in events if isinstance(event, dict)]
@@ -3521,7 +3625,7 @@ async def _collect_pod_logs(
                     "observed_entity": _pod_log_entity(target.namespace, target.pod),
                     "status_code": response.status_code,
                     "error": response.error,
-                    "lines": _log_lines(response.data),
+                    "lines": _log_lines(response.data, historical=bool(since_time)),
                 }
             )
     return logs
@@ -3580,7 +3684,7 @@ async def _collect_pod_logs_via_mcp(
     return logs
 
 
-def _log_lines(data: object) -> list[str]:
+def _log_lines(data: object, *, historical: bool = False) -> list[str]:
     # get_json wraps non-JSON text as {"body": <text>}; logs are plain text.
     text = ""
     if isinstance(data, dict) and isinstance(data.get("body"), str):
@@ -3590,7 +3694,7 @@ def _log_lines(data: object) -> list[str]:
     if not text:
         return []
     lines = [line for line in text.splitlines() if line.strip()]
-    return lines[-40:]
+    return lines[:40] if historical else lines[-40:]
 
 
 async def _collect_exec_probes(
@@ -3770,11 +3874,11 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
                 if isinstance(item, dict)
                 and target.workload_name in item.get("metadata", {}).get("name", "")
             ]
-        return {"items": [_pod_summary(item) for item in items[:10] if isinstance(item, dict)]}
+        return _prioritized_pod_list(items)
     if name.startswith("runai_control_plane_pods:") and isinstance(data.get("items"), list):
         return {
             "namespace": _response_namespace(name),
-            "items": [_pod_summary(item) for item in data["items"][:20] if isinstance(item, dict)],
+            **_prioritized_pod_list(data["items"]),
         }
     if name == "pod":
         return _pod_summary(data)
@@ -3817,11 +3921,27 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
                 and _event_matches_target(item, target)
             ]
         events = [
-            _event_summary(item, target=target)
+            item
             for item in items
-            if isinstance(item, dict) and item.get("type") == "Warning"
+            if isinstance(item, dict)
+            and (
+                str(item.get("type") or "").casefold() == "warning"
+                or (
+                    str(item.get("type") or "").casefold() == "normal"
+                    and str(item.get("reason") or "").casefold()
+                    in _OBSERVED_NORMAL_EVENT_REASONS
+                )
+            )
         ]
-        return {"namespace": _response_namespace(name), "items": events[-10:]}
+        events.sort(key=_event_sort_timestamp)
+        omitted_events = max(0, len(events) - 5)
+        filtered = {
+            "namespace": _response_namespace(name),
+            "items": [_event_summary(item, target=target) for item in events[-5:]],
+        }
+        if omitted_events:
+            filtered["omitted_events"] = omitted_events
+        return filtered
     if name == "node":
         return _node_summary(data)
     return data
@@ -4071,6 +4191,15 @@ def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
     for container in spec.get("containers", []) if isinstance(spec.get("containers"), list) else []:
         if isinstance(container, dict) and isinstance(container.get("name"), str):
             resources[container["name"]] = container.get("resources") or {}
+    conditions = [
+        condition for condition in status.get("conditions", []) if isinstance(condition, dict)
+    ]
+    conditions.sort(
+        key=lambda condition: (
+            not _condition_is_failure(condition),
+            str(condition.get("type") or ""),
+        )
+    )
     return {
         "name": metadata.get("name"),
         "uid": metadata.get("uid"),
@@ -4078,10 +4207,57 @@ def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
         "phase": status.get("phase"),
         "nodeName": spec.get("nodeName"),
         "podIP": status.get("podIP"),
-        "conditions": status.get("conditions", []),
+        "conditions": compact(conditions, limit=5),
         "containerStatuses": compact(containers, limit=5),
         "resources": resources,
+        **({"reason": status["reason"]} if status.get("reason") else {}),
+        **({"message": status["message"]} if status.get("message") else {}),
     }
+
+
+def _condition_is_failure(condition: dict[str, object]) -> bool:
+    condition_type = str(condition.get("type") or "").casefold()
+    status = _boolean_condition_status(condition.get("status"))
+    return status is not None and (
+        (condition_type in _FALSE_IS_FAILURE_CONDITION_TYPES and not status)
+        or (condition_type in _TRUE_IS_FAILURE_CONDITION_TYPES and status)
+    )
+
+
+def _pod_priority(pod: dict[str, object]) -> tuple[int, bool, int, str]:
+    metadata = pod.get("metadata") if isinstance(pod.get("metadata"), dict) else {}
+    status = pod.get("status") if isinstance(pod.get("status"), dict) else {}
+    phase = str(status.get("phase") or "").casefold()
+    phase_priority = {
+        "failed": 0,
+        "unknown": 1,
+        "pending": 2,
+        "running": 3,
+        "succeeded": 4,
+    }.get(phase, 5)
+    container_failure = False
+    restarts = 0
+    containers = status.get("containerStatuses", [])
+    for container in containers if isinstance(containers, list) else []:
+        if not isinstance(container, dict):
+            continue
+        restarts += int(container.get("restartCount") or 0)
+        state = container.get("state") if isinstance(container.get("state"), dict) else {}
+        for state_name in ("waiting", "terminated"):
+            detail = state.get(state_name) if isinstance(state.get(state_name), dict) else {}
+            if str(detail.get("reason") or "") not in {"", "Completed"}:
+                container_failure = True
+    return phase_priority, not container_failure, -restarts, str(metadata.get("name") or "")
+
+
+def _prioritized_pod_list(items: object) -> dict[str, object]:
+    pods = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+    pods.sort(key=_pod_priority)
+    omitted_pods = max(0, len(pods) - 5)
+    result: dict[str, object] = {"items": [_pod_summary(pod) for pod in pods[:5]]}
+    if omitted_pods:
+        result["omitted_pods"] = omitted_pods
+    return result
 
 
 def _event_summary(
@@ -4118,6 +4294,19 @@ def _event_summary(
 def _event_timestamp(event: dict[str, object]) -> object:
     timestamps = _event_timestamps(event)
     return timestamps[-1][1] if timestamps else None
+
+
+def _event_sort_timestamp(event: dict[str, object]) -> tuple[bool, str]:
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    series = event.get("series") if isinstance(event.get("series"), dict) else {}
+    timestamp = parse_incident_time(
+        event.get("lastTimestamp")
+        or event.get("eventTime")
+        or event.get("firstTimestamp")
+        or metadata.get("creationTimestamp")
+        or series.get("lastObservedTime")
+    )
+    return timestamp is not None, timestamp.isoformat() if timestamp is not None else ""
 
 
 def _event_timestamps(event: dict[str, object]) -> list[tuple[object, object]]:
@@ -4185,11 +4374,14 @@ def _events_in_time_range(
 def _node_summary(node: dict[str, object]) -> dict[str, object]:
     metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
     status = node.get("status") if isinstance(node.get("status"), dict) else {}
+    spec = node.get("spec") if isinstance(node.get("spec"), dict) else {}
     return {
         "name": metadata.get("name"),
         "conditions": status.get("conditions", []),
         "capacity": status.get("capacity", {}),
         "allocatable": status.get("allocatable", {}),
+        "unschedulable": bool(spec.get("unschedulable")),
+        "taints": spec.get("taints", []),
     }
 
 
@@ -4608,7 +4800,7 @@ def _warning_events(responses: list[dict[str, object]]) -> list[object]:
     for response in responses:
         name = response.get("name")
         if not isinstance(name, str) or (
-            name not in {"pod_events", "namespace_events"}
+            name not in {"pod_events", "workload_events", "namespace_events"}
             and not name.startswith("runai_control_plane_events:")
         ):
             continue
@@ -4617,7 +4809,15 @@ def _warning_events(responses: list[dict[str, object]]) -> list[object]:
             events.extend(
                 item
                 for item in data["items"]
-                if isinstance(item, dict) and item.get("type") == "Warning"
+                if isinstance(item, dict)
+                and (
+                    str(item.get("type") or "").casefold() == "warning"
+                    or (
+                        str(item.get("type") or "").casefold() == "normal"
+                        and str(item.get("reason") or "").casefold()
+                        in _OBSERVED_NORMAL_EVENT_REASONS
+                    )
+                )
             )
     return events
 
@@ -4900,20 +5100,43 @@ async def collect_runai_crd_findings(
     {checked, findings} with findings=[] on any failure, never raises."""
     findings: list[dict[str, str]] = []
     checked: list[str] = []
+    failed_kinds: list[str] = []
+    warnings: list[str] = []
+    truncated: list[str] = []
 
     async def scan(kind: str, namespace: str = "") -> None:
-        try:
-            result = await k8s_read(settings, kind, namespace=namespace)
-        except Exception:  # noqa: BLE001 - enumeration is best-effort evidence
-            return
-        if result.get("error"):
-            return
-        checked.append(f"{kind}{('/' + namespace) if namespace else ''}")
-        for item in _crd_items(result)[: settings.kubernetes_list_limit]:
-            finding = _crd_not_ready(item)
-            if finding:
-                finding["namespace"] = namespace
-                findings.append(finding)
+        token = ""
+        label = f"{kind}{('/' + namespace) if namespace else ''}"
+        for page in range(5):
+            try:
+                try:
+                    result = await k8s_read(
+                        settings, kind, namespace=namespace, continue_token=token
+                    )
+                except TypeError:
+                    # Preserve compatibility with older injected/read adapters.
+                    result = await k8s_read(settings, kind, namespace=namespace)
+            except Exception as exc:  # noqa: BLE001 - enumeration is best-effort evidence
+                failed_kinds.append(label)
+                warnings.append(f"Run:ai CRD {label} scan failed: {exc.__class__.__name__}.")
+                return
+            if result.get("error"):
+                failed_kinds.append(label)
+                warnings.append(f"Run:ai CRD {label} scan failed: {result['error']}.")
+                return
+            if not page:
+                checked.append(label)
+            for item in _crd_items(result)[: settings.kubernetes_list_limit]:
+                finding = _crd_not_ready(item)
+                if finding:
+                    finding["namespace"] = namespace
+                    findings.append(finding)
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            token = str((data.get("metadata") or {}).get("continue") or "")
+            if not token:
+                return
+        if token:
+            truncated.append(label)
 
     # Cluster-scoped org tree: which projects/queues/departments are unhealthy.
     for kind in ("projects", "queues", "departments"):
@@ -4923,7 +5146,13 @@ async def collect_runai_crd_findings(
     for namespace in scan_namespaces[:4]:
         for kind in (*_RUNAI_WORKLOAD_KINDS, "podgroups"):
             await scan(kind, namespace)
-    return {"checked": checked, "findings": findings[:20]}
+    return {
+        "checked": checked,
+        "findings": findings[:20],
+        "failed_kinds": failed_kinds,
+        "warnings": warnings,
+        "truncated": truncated,
+    }
 
 
 def _dedup_str(values: list[str]) -> list[str]:

@@ -170,6 +170,10 @@ async def mcp_call_many(
     extra = {"httpx_client_factory": factory} if factory else {}
 
     async def invoke():
+        # Retry resumes from the first unfinished call: completed results from
+        # attempt one survive a mid-batch transport failure.
+        results: list[Any | None] = [None] * len(calls)
+        remaining = list(range(len(calls)))
         for attempt in range(2):
             try:
                 async with streamablehttp_client(
@@ -177,10 +181,11 @@ async def mcp_call_many(
                 ) as (read, write, *_rest):
                     async with ClientSession(read, write) as session:
                         await session.initialize()
-                        return [
-                            await session.call_tool(tool, arguments)
-                            for tool, arguments in calls
-                        ]
+                        for index in remaining[:]:
+                            tool, arguments = calls[index]
+                            results[index] = await session.call_tool(tool, arguments)
+                            remaining.remove(index)
+                        return list(results)
             except Exception:
                 if attempt:
                     raise
