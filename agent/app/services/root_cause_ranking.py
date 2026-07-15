@@ -729,8 +729,8 @@ def _insufficient(
     unavailable = sorted(a for a, st in status_by_agent.items() if st == "unavailable")
     ok = sorted(a for a, st in status_by_agent.items() if st == "ok")
     rationale = [
-        "No failure family cleared the evidence floor from a corroborating source; "
-        "naming a root cause would be a guess (R6).",
+        "No failure family cleared the confirmation threshold from a corroborating "
+        "source. Lower-confidence candidates remain working hypotheses for follow-up (R6).",
     ]
     if unavailable:
         rationale.append(f"Evidence gaps: {', '.join(unavailable)} unavailable.")
@@ -776,6 +776,13 @@ _KUBERNETES_NON_CAUSAL_SIGNAL_RE = re.compile(
     r"recovery|recovering|recovered|resolved|cleared|fixed|remediated|success|"
     r"succeeded)\b|(?:없음|정상|복구|해결|미발생|아님)"
 )
+_PODGROUP_GPU_SHORTAGE_RE = re.compile(
+    r"\bnvidia\.com/(?:gpu|mig-[a-z0-9.-]+)\b|"
+    r"\binsufficient\s+(?:available\s+)?gpus?\b|"
+    r"\b(?:did(?:\s+not|n't)|does(?:\s+not|n't))\s+have\s+enough\s+"
+    r"resources?\s*:\s*gpus?\b",
+    re.IGNORECASE,
+)
 
 
 def _kubernetes_signal_is_positive(value: object) -> bool:
@@ -816,7 +823,47 @@ def _kubernetes_semantic_artifact_text(art: object) -> str:
             message = event.get("message")
             if _kubernetes_signal_is_positive(message):
                 parts.append(str(message))
+            # PodGroup is a structured Run:ai scheduling identity, not a word
+            # found in a query. When that exact target Event also states a GPU
+            # shortage, expose the typed meaning so Run:ai quota/scheduler can
+            # rank alongside (and ahead of) generic kube-scheduler placement.
+            if (
+                event.get("target_identity_verified") is True
+                and str(event.get("kind") or "").casefold() == "podgroup"
+                and _PODGROUP_GPU_SHORTAGE_RE.search(str(message or ""))
+            ):
+                parts.append("podgroup requested gpus")
     return " ".join(parts)
+
+
+def _prometheus_semantic_artifact_text(art: object) -> str:
+    """Map verified typed capacity predicates to their scheduling meaning.
+
+    Query names and JSON keys are normally excluded from ranking on purpose.
+    A positive, scoped ``runai_*_capacity_gap`` observation is different: the
+    collector has already verified target labels, sample timestamps and a
+    strictly positive requested-minus-allocated value.  Expose that typed
+    truth as canonical value text without reopening generic metric-name or
+    query-string keyword matching.
+    """
+    payload = getattr(art, "result", None)
+    if not isinstance(payload, Mapping):
+        return ""
+    observation = payload.get("observation")
+    if not isinstance(observation, Mapping):
+        return ""
+    if (
+        str(observation.get("polarity") or "") != "present"
+        or str(observation.get("coverage") or "") != "scoped"
+    ):
+        return ""
+    predicate = str(observation.get("predicate") or "").strip().casefold()
+    if predicate in {
+        "metric:runai_queue_capacity_gap",
+        "metric:runai_project_capacity_gap",
+    }:
+        return "runai quota over quota requested gpus capacity gap"
+    return _leaf_text(payload)
 
 
 def _artifact_ranking_value_text(
@@ -827,6 +874,11 @@ def _artifact_ranking_value_text(
         "kubernetes_warning_events",
     }:
         return _kubernetes_semantic_artifact_text(art)
+    if (
+        str(getattr(art, "source", "")).casefold() == "prometheus"
+        and str(getattr(art, "type", "")) == "promql_signal"
+    ):
+        return _prometheus_semantic_artifact_text(art)
     result = getattr(art, "result", None)
     return _leaf_text(result, drop_keys) if result is not None else ""
 
@@ -905,6 +957,114 @@ def _artifact_observation(art: object) -> dict[str, object] | None:
         return None
     observation = result.get("observation")
     return observation if isinstance(observation, dict) else None
+
+
+_ALERT_XID_EVIDENCE_RE = re.compile(r"\bxid\s*(?:\([^)]*\))?\s*[:=]?\s*\d{1,4}\b", re.I)
+
+
+def _artifact_family_semantics(art: object) -> tuple[str, str, str]:
+    """Return ``(agent, predicate, semantic_text)`` for claim-level gates."""
+    observation = _artifact_observation(art) or {}
+    agent = str(getattr(art, "agent", "") or "").strip().casefold()
+    predicate = str(observation.get("predicate") or "").strip().casefold()
+    summary = str(getattr(art, "summary", "") or "")
+    highlights = " ".join(
+        str(item) for item in (getattr(art, "highlights", None) or [])
+    )
+    drop_keys = _RANKING_TEXT_DROP_KEYS.get(agent)
+    semantic_value = _artifact_ranking_value_text(art, drop_keys)
+    return (
+        agent,
+        predicate,
+        " ".join((predicate, summary, highlights, semantic_value)).casefold(),
+    )
+
+
+def _artifact_is_relevant_to_family(family: str, art: object) -> bool:
+    """Whether the card's predicate/value is about ``family`` at all.
+
+    This deliberately ignores polarity.  Support and contradiction apply their
+    own polarity checks around this predicate-level relevance test.
+    """
+    rule = _FAMILY_RULES.get(family)
+    observation = _artifact_observation(art)
+    if rule is None or observation is None:
+        return False
+    agent, predicate, semantic_text = _artifact_family_semantics(art)
+    if agent == "alert":
+        if predicate == "alert_signature:nvidia_xid":
+            return (
+                family == "gpu_hardware_error"
+                and _ALERT_XID_EVIDENCE_RE.search(semantic_text) is not None
+            )
+        return predicate == f"alert_signature:{family}"
+
+    _canonical, allowed_agents, keywords = rule
+    if agent not in {str(item).casefold() for item in allowed_agents}:
+        return False
+    # A scoped absence naturally says "no/false" and therefore cannot use the
+    # normal negation-aware keyword matcher.  At this layer we only establish
+    # predicate relevance; the support path below still applies the stricter
+    # value-aware matcher before accepting a positive claim.
+    return any(str(keyword).casefold() in semantic_text for keyword in keywords)
+
+
+def artifact_supports_family(family: str, art: object) -> bool:
+    """Whether one typed positive artifact actually supports ``family``.
+
+    Target/time eligibility answers *where and when* an observation happened;
+    it does not answer *what proposition* the observation establishes.  Keep
+    this second gate beside the catalog ranker's value-aware text projection so
+    ranking, self-check, and the output harness share the same semantics.  In
+    particular, a Kubernetes ``OOMKilled`` observation must not support
+    ``k8s_scheduling_error`` merely because Kubernetes is that family's
+    canonical collector.
+
+    Alert payloads are admitted only through an explicit, auditable signature
+    predicate.  Today NVIDIA XID is the dispositive alert-only signature; broad
+    alert prose is intentionally not a generic bypass for catalog families.
+    """
+    observation = _artifact_observation(art)
+    if observation is None or not _artifact_is_relevant_to_family(family, art):
+        return False
+    if (
+        str(observation.get("polarity") or "").strip().casefold() != "present"
+        or str(observation.get("coverage") or "").strip().casefold() != "scoped"
+    ):
+        return False
+
+    rule = _FAMILY_RULES[family]
+    agent, predicate, semantic_text = _artifact_family_semantics(art)
+
+    if agent == "alert":
+        if predicate == "alert_signature:nvidia_xid":
+            return (
+                family == "gpu_hardware_error"
+                and _ALERT_XID_EVIDENCE_RE.search(semantic_text) is not None
+            )
+        if predicate != f"alert_signature:{family}":
+            return False
+        return bool(_keyword_hits(semantic_text, list(rule[2]))[0])
+
+    _canonical, allowed_agents, keywords = rule
+    if agent not in {str(item).casefold() for item in allowed_agents}:
+        return False
+    return bool(_keyword_hits(semantic_text, list(keywords))[0])
+
+
+def artifact_contradicts_family(family: str, art: object) -> bool:
+    """Accept only a scoped absence of a predicate relevant to ``family``.
+
+    A positive observation from another subsystem can coexist with the proposed
+    cause; it is not a falsifier merely because an LLM linked it as one.
+    """
+    observation = _artifact_observation(art)
+    return bool(
+        observation is not None
+        and str(observation.get("polarity") or "").strip().casefold() == "absent"
+        and str(observation.get("coverage") or "").strip().casefold() == "scoped"
+        and _artifact_is_relevant_to_family(family, art)
+    )
 
 
 def _has_typed_incident_observation(

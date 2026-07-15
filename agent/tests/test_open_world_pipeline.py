@@ -10,12 +10,32 @@ from app.services.pipeline import (
     _aggregate_evidence,
     _link_probe_assessments_to_ledger,
     _merge_open_world_candidates,
+    _public_v3_hypothesis,
     _record_selected_hypothesis_id,
     _refresh_public_reasoning_trace,
     new_state,
 )
 from app.services.root_cause_ranking import RankedCause
 from tests.test_orchestrator import make_settings
+
+
+def test_v3_hypothesis_restores_mechanism_from_compact_statement() -> None:
+    hypothesis = _public_v3_hypothesis(
+        {
+            "id": "ANL-run:H1",
+            "family": "runai_scheduling_quota",
+            "statement": "GPU 자원이 모두 할당되어 스케줄링이 실패한다",
+            "status": "open",
+            "confidence": 0.5,
+        },
+        evidence_for=[],
+        evidence_against=[],
+        facts_by_evidence={},
+    )
+
+    assert hypothesis["mechanism"] == "GPU 자원이 모두 할당되어 스케줄링이 실패한다"
+    assert hypothesis["status"] == "open"
+    assert hypothesis["confidence"] == 0.5
 
 
 def test_open_world_ledger_maps_private_facts_to_response_evidence_ids() -> None:
@@ -62,7 +82,9 @@ def test_open_world_ledger_maps_private_facts_to_response_evidence_ids() -> None
         CollectorResult(
             agent="kubernetes", status="ok", summary=first.summary or "", artifacts=[first]
         ),
-        CollectorResult(agent="loki", status="ok", summary=second.summary or "", artifacts=[second]),
+        CollectorResult(
+            agent="loki", status="ok", summary=second.summary or "", artifacts=[second]
+        ),
     ]
     state.blackboard = Blackboard()
     state.blackboard.seed_results({result.agent: result for result in state.results})
@@ -125,7 +147,9 @@ def test_open_world_candidate_rejects_text_only_artifacts() -> None:
         summary="CSI controller reports a stale attach operation.",
     )
     state.results = [
-        CollectorResult(agent="kubernetes", status="ok", summary=k8s.summary or "", artifacts=[k8s]),
+        CollectorResult(
+            agent="kubernetes", status="ok", summary=k8s.summary or "", artifacts=[k8s]
+        ),
         CollectorResult(agent="loki", status="ok", summary=loki.summary or "", artifacts=[loki]),
     ]
     state.blackboard = Blackboard()

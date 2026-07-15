@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from typing import Any
 from urllib.parse import quote
@@ -22,6 +23,13 @@ class ProgressReporter:
             builtin_enabled=settings.builtin_redaction_enabled,
             hash_mode=settings.builtin_redaction_hash_mode,
         )
+        # Progress used to be dispatched as unrelated fire-and-forget tasks.
+        # The backend can mark a run terminal as soon as the agent response
+        # arrives, so synthesis/harness updates racing behind that response were
+        # rejected with HTTP 409.  Chaining the sends keeps their order stable;
+        # ``flush`` below lets the pipeline drain the final update before return.
+        self._send_tail: asyncio.Task[None] | None = None
+        self._last_ledger_fingerprint: str | None = None
 
     @classmethod
     def from_alert(
@@ -46,9 +54,55 @@ class ProgressReporter:
             masked = self._masker.mask_object(payload)
             if not isinstance(masked, dict):
                 return
-            asyncio.create_task(self._post(masked))
+            ledger = masked.get("hypothesis_ledger")
+            if ledger is not None:
+                fingerprint = json.dumps(
+                    ledger,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                )
+                if fingerprint == self._last_ledger_fingerprint:
+                    # The timeline scans backwards for the latest event that
+                    # contains a ledger, so unchanged snapshots need not be
+                    # copied into every exchange payload.
+                    masked = dict(masked)
+                    masked.pop("hypothesis_ledger", None)
+                else:
+                    self._last_ledger_fingerprint = fingerprint
+            previous = self._send_tail
+            self._send_tail = asyncio.create_task(self._post_after(previous, masked))
         except Exception:  # noqa: BLE001 - progress must never affect analysis
             return
+
+    async def flush(self, timeout_seconds: float = 4.0) -> None:
+        """Best-effort drain of progress emitted immediately before completion."""
+        tail = self._send_tail
+        if tail is None:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(tail), timeout=max(0.0, timeout_seconds))
+        except TimeoutError:
+            # Telemetry must never hold the RCA response hostage when the
+            # backend is unavailable. The already-running task remains shielded
+            # and may still complete while the process stays alive.
+            return
+        finally:
+            if self._send_tail is tail and tail.done():
+                self._send_tail = None
+
+    async def _post_after(
+        self,
+        previous: asyncio.Task[None] | None,
+        payload: dict[str, Any],
+    ) -> None:
+        if previous is not None:
+            try:
+                await previous
+            except Exception:  # noqa: BLE001 - a prior telemetry failure is isolated
+                pass
+        await self._post(payload)
 
     async def _post(self, payload: dict[str, Any]) -> None:
         try:

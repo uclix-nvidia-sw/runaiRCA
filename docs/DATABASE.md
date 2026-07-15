@@ -6,6 +6,11 @@
 Run:AI RCA uses two stores with distinct roles. See [Architecture](ARCHITECTURE.md) for the
 runtime flow; this document is the data-structure reference.
 
+**Who this is for:** an operator who needs to know where a record lives, or a
+developer who needs to understand why two databases appear in one deployment.
+PostgreSQL is the working case file. TypeDB is an optional relationship index
+built from approved parts of that case file.
+
 | Store | Role | Owner | Required? |
 |---|---|---|---|
 | **PostgreSQL** | Operational source of truth: incidents, alerts, RCA results, operator feedback, similarity vectors | Go backend | Yes (in-memory fallback for local dev) |
@@ -32,6 +37,12 @@ graph during analysis. See [RCA Pipeline](RCA-PIPELINE.md) and
 ---
 
 ## 1. PostgreSQL (operational)
+
+### Find data by task
+
+Use PostgreSQL for the current incident, alerts, analysis runs, feedback, and
+similarity search. Use TypeDB only for optional topology and approved-history
+relationships; it is never a second operational source of truth.
 
 Tables are auto-created by the backend on startup (`backend/store_postgres.go`).
 
@@ -129,6 +140,14 @@ TypeDB is off/unreachable. Inspect the graph with `python -m ontology.query`
 | `TYPEDB_USERNAME` / `TYPEDB_PASSWORD` | `admin` / `password` | CE defaults — override beyond PoC |
 | `POSTGRES_DSN` | — | Backend Postgres (also read by agent collectors/ingestion) |
 | `RUNAI_DB_DSN` | — | Optional read-only DSN for the **Run:ai control-plane** Postgres; enables the postgres drill-down's `sql_select` over platform schemas (workloads/audit/…). Use a read-only role. |
+
+When `RUNAI_DB_DSN` is used for collection, audit/history reads run in a UTC
+session. A `timestamp without time zone` value is interpreted as Run:ai UTC and
+the resulting observation declares `naive_timestamps_assumed_utc: true`.
+Audit-table failures are isolated: successful tables remain available, while
+failed or discovery-capped tables are reported as partial/missing data. A failed
+Run:ai control-plane DB connection is likewise visible as unavailable context,
+not a healthy Postgres check or causal evidence.
 
 TypeDB deploys as a single-node `StatefulSet` + PVC
 (`charts/runai-rca/templates/typedb.yaml`). Community Edition is single-node;

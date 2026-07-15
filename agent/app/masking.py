@@ -42,31 +42,31 @@ _HEURISTIC_SKIP_KEYS = {
     "uid",
 }
 
-_TEXT_PATTERNS: tuple[Pattern[str], ...] = (
-    re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
-    re.compile(r"\b(?:Basic|Bearer|Digest|Token)\s+[A-Za-z0-9+/=_.~-]{8,}"),
-    re.compile(
+_TEXT_PATTERNS: tuple[tuple[Pattern[str], bool], ...] = (
+    (re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"), False),
+    (re.compile(r"\b(?:Basic|Bearer|Digest|Token)\s+[A-Za-z0-9+/=_.~-]{8,}"), False),
+    (re.compile(
         r"(?i)(postgres(?:ql)?://[^:\s/@]+:)([^@\s]+)(@)"
-    ),
-    re.compile(
+    ), False),
+    (re.compile(
         r"(?i)([?&](?:access_token|api_key|apikey|key|token)=)([^\s&]+)"
-    ),
-    re.compile(
+    ), False),
+    (re.compile(
         r"(?i)([\"']?(?:access[_-]?key|api[_-]?key|client[_-]?secret|"
         r"credential|password|secret|[a-z0-9_-]*token)[\"']?\s*:\s*[\"']?)"
         r"([^\"',\s}{]+)([\"']?)"
-    ),
-    re.compile(
+    ), True),
+    (re.compile(
         r"(?i)\b((?:access[_-]?key|api[_-]?key|client[_-]?secret|"
         r"credential|password|secret|[a-z0-9_-]*token)\s*[:=]\s*)([^\s,;]+)"
-    ),
-    re.compile(
+    ), True),
+    (re.compile(
         r"(?i)(--(?:access[_-]?key|api[_-]?key|client[_-]?secret|"
         r"credential|password|secret|[a-z0-9_-]*token)=)(\S+)"
-    ),
+    ), False),
 )
 _LONG_BASE64_RE = re.compile(
-    r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{64,}={0,2}(?![A-Za-z0-9+/])"
+    r"(?<!sha256:)(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{64,}={0,2}(?![A-Za-z0-9+/])"
 )
 
 
@@ -122,30 +122,27 @@ class RedactingMasker:
             return text
 
         masked = text
-        for pattern in _TEXT_PATTERNS:
-            if pattern.groups >= 3:
-                masked = pattern.sub(
-                    lambda match: f"{match.group(1)}{self._replacement(match.group(2))}"
-                    f"{match.group(3)}",
-                    masked,
-                )
-            elif pattern.groups >= 2:
-                masked = pattern.sub(
-                    lambda match: f"{match.group(1)}{self._replacement(match.group(2))}",
-                    masked,
-                )
-            else:
-                masked = pattern.sub(
-                    lambda match: self._replacement(match.group(0)),
-                    masked,
-                )
+        for pattern, relaxable in _TEXT_PATTERNS:
+            def replacement(match):  # noqa: ANN001
+                value = match.group(2) if pattern.groups >= 2 else match.group(0)
+                if (
+                    relaxable
+                    and _key_allows_credential_shape_relaxation(match.group(1))
+                    and not _looks_like_credential(value)
+                ):
+                    return match.group(0)
+                if pattern.groups >= 3:
+                    return f"{match.group(1)}{self._replacement(match.group(2))}{match.group(3)}"
+                if pattern.groups >= 2:
+                    return f"{match.group(1)}{self._replacement(match.group(2))}"
+                return self._replacement(match.group(0))
+            masked = pattern.sub(replacement, masked)
         return _LONG_BASE64_RE.sub(
             lambda match: self._replacement(match.group(0))
             if _is_valid_base64(match.group(0))
             else match.group(0),
             masked,
         )
-
     def _redact_value(self, value: Any, *, parent_key: str) -> Any:
         if isinstance(value, str):
             return self._redact_text(value, parent_key=parent_key)
@@ -220,6 +217,7 @@ class RedactingMasker:
             return False
         return any(part in normalized_key for part in _DENIED_KEY_PARTS)
 
+
     def _apply_regex_to_object(self, value: Any) -> Any:
         if isinstance(value, str):
             masked = value
@@ -233,6 +231,23 @@ class RedactingMasker:
         if isinstance(value, dict):
             return {key: self._apply_regex_to_object(item) for key, item in value.items()}
         return value
+
+
+def _looks_like_credential(value: str) -> bool:
+    return (
+        any(char.isdigit() for char in value)
+        or (any(char.islower() for char in value) and any(char.isupper() for char in value))
+        or len(value) >= 16
+        or any(not char.isalnum() for char in value)
+    )
+
+
+def _key_allows_credential_shape_relaxation(prefix: str) -> bool:
+    """Only generic token/secret prose gets the low-risk text relaxation."""
+    key = _normalize_key(prefix).strip("_'\" :=")
+    if any(part in key for part in ("password", "passwd", "credential", "access", "api_key", "apikey", "client_secret")):
+        return False
+    return "token" in key or "secret" in key
 
 
 def build_masker(

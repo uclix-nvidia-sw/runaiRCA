@@ -6,6 +6,11 @@ from types import SimpleNamespace
 import pytest
 
 from app.collectors import kubernetes, loki, postgres, prometheus
+from app.collectors.grafana_mcp import (
+    clear_grafana_datasource_cache,
+    mark_grafana_datasource_failure,
+    resolve_grafana_datasource_uid,
+)
 from app.collectors.http_json import JsonResponse
 from tests.test_orchestrator import make_settings, make_target
 
@@ -16,6 +21,171 @@ class _McpResult:
     def __init__(self, structured=None, text: str = "") -> None:
         self.structuredContent = structured
         self.content = [SimpleNamespace(text=text)] if text else []
+
+
+def _patch_mcp_calls(monkeypatch, module, call) -> None:
+    async def call_many(url, calls):
+        return [await call(url, tool, arguments) for tool, arguments in calls]
+
+    monkeypatch.setattr(module, "mcp_call", call)
+    monkeypatch.setattr(module, "mcp_call_many", call_many)
+
+
+@pytest.mark.asyncio
+async def test_datasource_discovery_filters_prefers_default_and_caches() -> None:
+    clear_grafana_datasource_cache()
+    calls: list[tuple[str, list[dict[str, object]]]] = []
+
+    async def call_json(_url, tool, args_list):
+        calls.append((tool, args_list))
+        return {
+            "datasources": [
+                {
+                    "type": "prometheus",
+                    "uid": "prom-secondary",
+                    "name": "Secondary",
+                },
+                {
+                    "type": "prometheus",
+                    "uid": "prom-default",
+                    "name": "Primary",
+                    "isDefault": True,
+                },
+            ]
+        }
+
+    first = await resolve_grafana_datasource_uid(
+        "http://grafana-mcp/discovery-test",
+        "prometheus",
+        "",
+        call_json=call_json,
+    )
+    second = await resolve_grafana_datasource_uid(
+        "http://grafana-mcp/discovery-test",
+        "prometheus",
+        "",
+        call_json=call_json,
+    )
+
+    assert first == second == "prom-default"
+    assert calls == [("list_datasources", [{"type": "prometheus"}])]
+
+
+@pytest.mark.asyncio
+async def test_datasource_discovery_rejects_ambiguous_same_type_without_default() -> None:
+    clear_grafana_datasource_cache()
+
+    async def call_json(_url, _tool, _args_list):
+        return {
+            "datasources": [
+                {"type": "loki", "uid": "loki-a", "name": "Loki A"},
+                {"type": "loki", "uid": "loki-b", "name": "Loki B"},
+            ]
+        }
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"multiple accessible loki Grafana datasources.*LOKI_DATASOURCE_UID",
+    ):
+        await resolve_grafana_datasource_uid(
+            "http://grafana-mcp/ambiguous-test",
+            "loki",
+            "",
+            call_json=call_json,
+        )
+
+
+@pytest.mark.asyncio
+async def test_missing_datasource_and_rejected_uid_are_circuit_broken() -> None:
+    clear_grafana_datasource_cache()
+    calls = 0
+
+    async def empty_call(_url, _tool, _args_list):
+        nonlocal calls
+        calls += 1
+        return {"datasources": []}
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="no accessible loki datasource"):
+            await resolve_grafana_datasource_uid(
+                "http://grafana-mcp/missing-test",
+                "loki",
+                "",
+                call_json=empty_call,
+            )
+    assert calls == 1
+
+    clear_grafana_datasource_cache()
+
+    async def discovered_call(_url, _tool, _args_list):
+        nonlocal calls
+        calls += 1
+        return {"datasources": [{"type": "loki", "uid": "loki-main"}]}
+
+    assert (
+        await resolve_grafana_datasource_uid(
+            "http://grafana-mcp/rejected-test",
+            "loki",
+            "",
+            call_json=discovered_call,
+        )
+        == "loki-main"
+    )
+    mark_grafana_datasource_failure(
+        "http://grafana-mcp/rejected-test",
+        "loki",
+        "",
+        RuntimeError("get datasource by uid : HTTP 400 id is invalid"),
+    )
+    with pytest.raises(RuntimeError, match="id is invalid"):
+        await resolve_grafana_datasource_uid(
+            "http://grafana-mcp/rejected-test",
+            "loki",
+            "",
+            call_json=discovered_call,
+        )
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_explicit_prometheus_uid_skips_discovery_and_batches_queries(
+    monkeypatch,
+) -> None:
+    clear_grafana_datasource_cache()
+    batches: list[list[tuple[str, dict]]] = []
+
+    async def discovery_must_not_run(*_args, **_kwargs):
+        raise AssertionError("explicit datasource UID must skip discovery")
+
+    async def fake_many(_url, calls):
+        batches.append(calls)
+        return [
+            _McpResult(
+                {
+                    "status": "success",
+                    "data": {"result": [{"metric": {}, "value": [1, "1"]}]},
+                }
+            )
+            for _ in calls
+        ]
+
+    monkeypatch.setattr(prometheus, "mcp_call", discovery_must_not_run)
+    monkeypatch.setattr(prometheus, "mcp_call_many", fake_many)
+    result = await prometheus.PrometheusCollector(
+        replace(
+            make_settings(),
+            prometheus_mcp_url="http://grafana-mcp/explicit-test",
+            prometheus_datasource_uid="prom-main",
+        )
+    ).collect(make_target())
+
+    assert result.details["used_mcp"] is True
+    assert len(batches) == 1
+    assert len(batches[0]) > 1
+    assert all(
+        arguments["datasourceUid"] == "prom-main"
+        for _tool, arguments in batches[0]
+    )
 
 
 @pytest.mark.asyncio
@@ -35,7 +205,7 @@ async def test_prometheus_collector_uses_mcp_before_direct_http(monkeypatch) -> 
     async def direct_should_not_run(**kwargs):
         raise AssertionError("direct Prometheus HTTP fallback should not run")
 
-    monkeypatch.setattr(prometheus, "mcp_call", fake_mcp_call)
+    _patch_mcp_calls(monkeypatch, prometheus, fake_mcp_call)
     monkeypatch.setattr(prometheus, "get_json", direct_should_not_run)
     result = await prometheus.PrometheusCollector(
         replace(
@@ -63,6 +233,47 @@ async def test_prometheus_collector_uses_mcp_before_direct_http(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_prometheus_required_query_failure_keeps_other_mcp_evidence_partial(
+    monkeypatch,
+) -> None:
+    async def fake_many(_url, calls):
+        results = []
+        for index, _call in enumerate(calls):
+            if index == 1:
+                failed = _McpResult(text="target metric query denied")
+                failed.isError = True
+                results.append(failed)
+            else:
+                results.append(
+                    _McpResult(
+                        {
+                            "status": "success",
+                            "data": {"result": [{"metric": {}, "value": [1, "1"]}]},
+                        }
+                    )
+                )
+        return results
+
+    monkeypatch.setattr(prometheus, "mcp_call_many", fake_many)
+    result = await prometheus.PrometheusCollector(
+        replace(
+            make_settings(),
+            prometheus_mcp_url="http://grafana-mcp/prom-partial",
+            prometheus_datasource_uid="prom-main",
+        )
+    ).collect(make_target())
+
+    assert result.status == "partial"
+    assert result.confidence == "medium"
+    assert "prometheus.query" in result.missing_data
+    assert any(item["error"] is None for item in result.details["queries"])
+    assert any(
+        "target metric query denied" in str(item["error"])
+        for item in result.details["queries"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_prometheus_collector_falls_back_to_direct_http_on_mcp_failure(
     monkeypatch,
 ) -> None:
@@ -80,7 +291,7 @@ async def test_prometheus_collector_falls_back_to_direct_http_on_mcp_failure(
             data={"status": "success", "data": {"result": []}},
         )
 
-    monkeypatch.setattr(prometheus, "mcp_call", broken_mcp_call)
+    _patch_mcp_calls(monkeypatch, prometheus, broken_mcp_call)
     monkeypatch.setattr(prometheus, "get_json", fake_get_json)
     result = await prometheus.PrometheusCollector(
         replace(
@@ -108,7 +319,7 @@ async def test_prometheus_mcp_error_payload_is_not_a_scoped_absence(monkeypatch)
             }
         )
 
-    monkeypatch.setattr(prometheus, "mcp_call", fake_mcp_call)
+    _patch_mcp_calls(monkeypatch, prometheus, fake_mcp_call)
     result = await prometheus.PrometheusCollector(
         replace(make_settings(), prometheus_mcp_url="http://grafana-mcp/mcp")
     ).collect(
@@ -132,7 +343,7 @@ async def test_prometheus_mcp_misrouted_list_is_not_metric_evidence(monkeypatch)
             return _McpResult([{"type": "prometheus", "uid": "prom"}])
         return _McpResult({"datasources": [{"uid": "loki", "type": "loki"}]})
 
-    monkeypatch.setattr(prometheus, "mcp_call", fake_mcp_call)
+    _patch_mcp_calls(monkeypatch, prometheus, fake_mcp_call)
     result = await prometheus.PrometheusCollector(
         replace(make_settings(), prometheus_mcp_url="http://grafana-mcp/mcp")
     ).collect(
@@ -144,7 +355,10 @@ async def test_prometheus_mcp_misrouted_list_is_not_metric_evidence(monkeypatch)
     )
 
     assert result.status == "unavailable"
-    assert all("recognized metric result" in str(item["error"]) for item in result.details["queries"])
+    assert all(
+        "recognized metric result" in str(item["error"])
+        for item in result.details["queries"]
+    )
 
 
 @pytest.mark.asyncio
@@ -165,7 +379,7 @@ async def test_loki_collector_uses_only_loki_mcp_tools(monkeypatch) -> None:
     async def direct_should_not_run(**kwargs):
         raise AssertionError("direct Loki HTTP fallback should not run")
 
-    monkeypatch.setattr(loki, "mcp_call", fake_mcp_call)
+    _patch_mcp_calls(monkeypatch, loki, fake_mcp_call)
     monkeypatch.setattr(loki, "get_json", direct_should_not_run)
     result = await loki.LokiCollector(
         replace(
@@ -178,6 +392,72 @@ async def test_loki_collector_uses_only_loki_mcp_tools(monkeypatch) -> None:
     assert result.details["used_mcp"] is True
     assert "query_loki_logs" in calls
     assert "query_prometheus" not in calls
+
+
+@pytest.mark.asyncio
+async def test_explicit_loki_uid_batches_all_queries_in_one_mcp_call(monkeypatch) -> None:
+    clear_grafana_datasource_cache()
+    batches: list[list[tuple[str, dict]]] = []
+
+    async def discovery_must_not_run(*_args, **_kwargs):
+        raise AssertionError("explicit datasource UID must skip discovery")
+
+    async def fake_many(_url, calls):
+        batches.append(calls)
+        return [_McpResult({"data": []}) for _ in calls]
+
+    monkeypatch.setattr(loki, "mcp_call", discovery_must_not_run)
+    monkeypatch.setattr(loki, "mcp_call_many", fake_many)
+    result = await loki.LokiCollector(
+        replace(
+            make_settings(),
+            loki_mcp_url="http://grafana-mcp/loki-batch-test",
+            loki_datasource_uid="loki-main",
+        )
+    ).collect(make_target())
+
+    assert result.details["used_mcp"] is True
+    assert len(batches) == 1
+    assert len(batches[0]) > 1
+    assert all(tool == "query_loki_logs" for tool, _arguments in batches[0])
+    assert all(
+        arguments["datasourceUid"] == "loki-main"
+        for _tool, arguments in batches[0]
+    )
+
+
+@pytest.mark.asyncio
+async def test_loki_required_query_failure_keeps_other_mcp_evidence_partial(
+    monkeypatch,
+) -> None:
+    async def fake_many(_url, calls):
+        results = []
+        for index, _call in enumerate(calls):
+            if index == 0:
+                failed = _McpResult(text="target LogQL query denied")
+                failed.isError = True
+                results.append(failed)
+            else:
+                results.append(_McpResult({"status": "success", "data": {"result": []}}))
+        return results
+
+    monkeypatch.setattr(loki, "mcp_call_many", fake_many)
+    result = await loki.LokiCollector(
+        replace(
+            make_settings(),
+            loki_mcp_url="http://grafana-mcp/loki-partial",
+            loki_datasource_uid="loki-main",
+        )
+    ).collect(make_target())
+
+    assert result.status == "partial"
+    assert result.confidence == "medium"
+    assert "loki.query" in result.missing_data
+    assert any(item["error"] is None for item in result.details["queries"])
+    assert any(
+        "target LogQL query denied" in str(item["error"])
+        for item in result.details["queries"]
+    )
 
 
 @pytest.mark.asyncio
@@ -250,7 +530,7 @@ async def test_loki_mcp_queries_the_alert_time_window(monkeypatch) -> None:
         query_args.append(arguments)
         return _McpResult({"status": "success", "data": {"result": []}})
 
-    monkeypatch.setattr(loki, "mcp_call", fake_mcp_call)
+    _patch_mcp_calls(monkeypatch, loki, fake_mcp_call)
     target = replace(
         make_target(),
         fired_at="2026-07-10T01:00:00Z",
@@ -345,6 +625,7 @@ async def test_kubernetes_collector_uses_mcp_before_service_account_token(
     monkeypatch,
 ) -> None:
     calls: list[str] = []
+    pod_log_arguments: list[dict] = []
 
     async def fake_mcp_call(url, tool, arguments):
         calls.append(tool)
@@ -360,6 +641,7 @@ async def test_kubernetes_collector_uses_mcp_before_service_account_token(
                 }
             )
         if tool == "pods_log":
+            pod_log_arguments.append(arguments)
             return _McpResult(
                 text=(
                     "2026-07-07T00:00:00Z training started\n"
@@ -384,6 +666,12 @@ async def test_kubernetes_collector_uses_mcp_before_service_account_token(
     assert result.details["used_mcp"] is True
     assert "pods_get" in calls
     assert "pods_log" in calls
+    assert pod_log_arguments
+    assert all(
+        args.get("tail") == make_settings().kubernetes_list_limit
+        for args in pod_log_arguments
+    )
+    assert all("tailLines" not in args and "sinceTime" not in args for args in pod_log_arguments)
     assert "events_list" in calls or "resources_list" in calls
     inspection = next(a for a in result.artifacts if a.type == "pod_inspection")
     assert inspection.query == (
@@ -406,3 +694,73 @@ async def test_kubernetes_collector_uses_mcp_before_service_account_token(
     rendered = str(result.details["pod_logs"])
     assert "k8s-mcp-log-secret-12345" not in rendered
     assert "[MASKED]" in rendered
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_required_query_failure_keeps_other_mcp_evidence_partial(
+    monkeypatch,
+) -> None:
+    async def fake_mcp_call(_url, tool, arguments):
+        requested_pod = (
+            tool == "pods_get"
+            or (
+                tool == "resources_get"
+                and str(arguments.get("kind") or "").casefold() in {"pod", "pods"}
+                and arguments.get("name") == "trainer-0"
+            )
+        )
+        if requested_pod:
+            raise RuntimeError("pods/get forbidden")
+        return _McpResult({"metadata": {}, "items": []})
+
+    monkeypatch.setattr(kubernetes, "mcp_call", fake_mcp_call)
+    result = await kubernetes.KubernetesCollector(
+        replace(
+            make_settings(),
+            kubernetes_mcp_url="http://kubernetes-mcp/partial",
+            enable_pod_exec=False,
+        )
+    ).collect(make_target())
+
+    assert result.status == "partial"
+    assert result.confidence == "medium"
+    assert "kubernetes.query" in result.missing_data
+    assert any(item["error"] is None for item in result.details["queries"])
+    assert any("pods/get forbidden" in str(item["error"]) for item in result.details["queries"])
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_shared_deadline_escapes_partial_mcp_sweep_for_fallback(
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    async def fake_mcp_call(_url, _tool, _arguments):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _McpResult(
+                {
+                    "metadata": {
+                        "name": "trainer-0",
+                        "namespace": "runai-vision",
+                    },
+                    "spec": {"containers": []},
+                    "status": {"phase": "Pending"},
+                }
+            )
+        raise TimeoutError("MCP collector budget exhausted before direct fallback")
+
+    monkeypatch.setattr(kubernetes, "mcp_call", fake_mcp_call)
+
+    with pytest.raises(TimeoutError, match="before direct fallback"):
+        await kubernetes._collect_kubernetes_responses_via_mcp(
+            settings=replace(
+                make_settings(),
+                kubernetes_mcp_url="http://kubernetes-mcp/deadline",
+            ),
+            target=make_target(),
+            control_plane_in_scope=False,
+        )
+
+    assert calls == 2

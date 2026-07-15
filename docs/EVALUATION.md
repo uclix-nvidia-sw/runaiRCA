@@ -6,6 +6,20 @@ This project evaluates RCA in two places:
 - **Offline evaluation**: measures regressions, novelty handling, and tool
   degradation with fixtures and operator reviews.
 
+**Who this is for:** people deciding whether an RCA is safe to show, and people
+changing the system without weakening its evidence standard. A runtime harness
+checks one real report; offline evaluation checks whether a code or knowledge
+change made the system worse across many cases.
+
+```mermaid
+flowchart LR
+  E[Collected evidence] --> H[Runtime harness]
+  H -->|passes| R[Operator-facing RCA]
+  H -->|repair/downgrade| R
+  F[Fixtures + reviewed cases] --> O[Offline evaluation]
+  O --> G[Release decision]
+```
+
 ## Runtime harness
 
 The pipeline runs `harness` after synthesis. It assigns `E01`, `E02`, … IDs to

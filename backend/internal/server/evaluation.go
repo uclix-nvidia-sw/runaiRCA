@@ -59,14 +59,15 @@ func evaluationKey(runID, hash, reviewer string) string {
 }
 
 func currentAnalysisHash(run *AnalysisRun) string {
-	if run == nil || run.Metadata == nil {
+	metadata := analysisResultMetadata(run)
+	if metadata == nil {
 		return ""
 	}
-	hash, _ := run.Metadata["analysis_hash"].(string)
+	hash, _ := metadata["analysis_hash"].(string)
 	return hash
 }
 
-func normalizeEvaluationRequest(req EvaluationReviewRequest) (EvaluationReviewRequest, error) {
+func normalizeEvaluationRequest(req EvaluationReviewRequest, allowedFamilies []string) (EvaluationReviewRequest, error) {
 	req.Author = feedbackActor(req.Author)
 	req.AnalysisHash = strings.TrimSpace(req.AnalysisHash)
 	req.CaseType = strings.TrimSpace(req.CaseType)
@@ -79,6 +80,17 @@ func normalizeEvaluationRequest(req EvaluationReviewRequest) (EvaluationReviewRe
 	}
 	if !mapContains([]string{"known", "compositional", "novel", "tool_degraded"}, req.CaseType) {
 		return req, errors.New("invalid case_type")
+	}
+	switch req.CaseType {
+	case "novel":
+		req.ExpectedFamily = ""
+	case "known", "compositional", "tool_degraded":
+		// A reviewer may score the analysis without claiming an answer key. When
+		// supplied, the family is catalog-bound and becomes a semantic gate; an
+		// empty value never confirms the model-selected family by implication.
+		if req.ExpectedFamily != "" && !mapContains(allowedFamilies, req.ExpectedFamily) {
+			return req, errors.New("expected_family must be selected from the root-cause family catalog")
+		}
 	}
 	if req.ResolutionOutcome == "" {
 		req.ResolutionOutcome = "unknown"
@@ -130,7 +142,7 @@ func (s *Store) EvaluationForRun(runID, author string) (EvaluationView, bool) {
 	}
 	hash := currentAnalysisHash(run)
 	view := EvaluationView{RunID: runID, AnalysisHash: hash, Reviews: []EvaluationReview{}}
-	if harness, ok := run.Metadata["harness"].(map[string]any); ok {
+	if harness, ok := analysisResultMetadata(run)["harness"].(map[string]any); ok {
 		view.Harness = cloneAnyMap(harness)
 	}
 	for _, review := range s.evaluationReviews {
@@ -151,8 +163,8 @@ func (s *Store) EvaluationForRun(runID, author string) (EvaluationView, bool) {
 	return view, true
 }
 
-func (s *Store) UpsertEvaluationReview(runID string, req EvaluationReviewRequest) (EvaluationReview, bool, error) {
-	req, err := normalizeEvaluationRequest(req)
+func (s *Store) UpsertEvaluationReview(runID string, req EvaluationReviewRequest, allowedFamilies []string) (EvaluationReview, bool, error) {
+	req, err := normalizeEvaluationRequest(req, allowedFamilies)
 	if err != nil {
 		return EvaluationReview{}, false, err
 	}
@@ -187,6 +199,10 @@ func (s *Store) UpsertEvaluationReview(runID string, req EvaluationReviewRequest
 	review.Notes = req.Notes
 	review.UpdatedAt = now
 	s.persistEvaluationReviewLocked(review)
+	// A review is mutable operator truth. If it no longer confirms the exact
+	// snapshot family/outcome, withdraw every candidate/package derived from
+	// that run/hash before the runtime catalog can serve it again.
+	s.invalidateKnowledgeForReviewLocked(review.RunID, review.AnalysisHash, now)
 	// A successful operator outcome is commonly recorded after the immutable
 	// CaseSnapshot was approved. Re-scan that exact run/hash now so eligible
 	// knowledge does not depend on review timing.
@@ -206,6 +222,40 @@ func (s *Store) generateKnowledgeCandidateForReviewedRunLocked(runID, analysisHa
 			continue
 		}
 		existing := s.knowledgeCandidates[candidate.CandidateID]
+		if existing != nil &&
+			existing.Status == knowledgeCandidateValidationFailed &&
+			existing.ValidationError == knowledgeReviewInvalidationError &&
+			candidate.Status == knowledgeCandidateReady {
+			if !s.knowledgeCandidateSupportsValidSnapshotsLocked(existing) {
+				continue
+			}
+			now := time.Now().UTC()
+			revalidated := cloneKnowledgeCandidate(existing)
+			revalidated.Status = knowledgeCandidateReady
+			revalidated.PackageID = ""
+			revalidated.ValidationError = ""
+			revalidated.Trace = cloneCaseSnapshotPayload(candidate.Trace)
+			revalidated.Payload = cloneCaseSnapshotPayload(candidate.Payload)
+			revalidated.DecidedAt = nil
+			revalidated.DecidedBy = ""
+			revalidated.DecisionNote = ""
+			revalidated.UpdatedAt = now
+			hydrateKnowledgeCandidate(&revalidated)
+			event := s.newKnowledgeEventLocked(
+				revalidated.CandidateID,
+				"",
+				"candidate_revalidated",
+				"system",
+				"operator evaluation again confirms this analysis; review required",
+				now,
+			)
+			if !s.persistKnowledgeReviewRevalidationLocked(&revalidated, event) {
+				continue
+			}
+			*existing = revalidated
+			s.knowledgeEvents[event.EventID] = event
+			continue
+		}
 		link := candidate
 		if existing != nil {
 			copy := cloneKnowledgeCandidate(existing)
@@ -226,6 +276,108 @@ func (s *Store) generateKnowledgeCandidateForReviewedRunLocked(runID, analysisHa
 		}
 		s.knowledgeEvents[event.EventID] = event
 	}
+}
+
+// A review correction may restore a withdrawn candidate only after every case
+// currently supporting that candidate independently passes the exact
+// hash/family gate again. The old package remains retired; an operator must
+// explicitly review and approve the restored candidate before runtime reuse.
+func (s *Store) knowledgeCandidateSupportsValidSnapshotsLocked(candidate *KnowledgeCandidate) bool {
+	if candidate == nil {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, caseID := range append([]string{candidate.CaseID}, candidate.SupportingCaseIDs...) {
+		if caseID == "" || seen[caseID] {
+			continue
+		}
+		seen[caseID] = true
+		validated := s.knowledgeCandidateForSnapshotLocked(s.caseSnapshots[caseID])
+		if validated == nil || validated.Status != knowledgeCandidateReady || validated.ContentHash != candidate.ContentHash {
+			return false
+		}
+	}
+	return len(seen) > 0
+}
+
+func (s *Store) invalidateKnowledgeForReviewLocked(runID, analysisHash string, now time.Time) {
+	invalidCases := map[string]bool{}
+	for _, snapshot := range s.caseSnapshots {
+		if snapshot == nil || snapshot.RunID != runID || snapshot.AnalysisHash != analysisHash {
+			continue
+		}
+		if s.knowledgeCandidateForSnapshotLocked(snapshot) == nil {
+			invalidCases[snapshot.CaseID] = true
+		}
+	}
+	if len(invalidCases) == 0 {
+		return
+	}
+	for _, candidate := range s.knowledgeCandidates {
+		if candidate == nil || !candidateSupportsAnyCase(candidate, invalidCases) {
+			continue
+		}
+		switch candidate.Status {
+		case knowledgeCandidateRejected, knowledgeCandidateSuperseded, knowledgeCandidateValidationFailed:
+			continue
+		}
+		updatedCandidate := cloneKnowledgeCandidate(candidate)
+		updatedCandidate.Status = knowledgeCandidateValidationFailed
+		updatedCandidate.ValidationError = knowledgeReviewInvalidationError
+		updatedCandidate.UpdatedAt = now
+		updatedCandidate.DecidedAt = &now
+		updatedCandidate.DecidedBy = "system"
+		updatedCandidate.DecisionNote = "operator evaluation changed or retracted"
+		if updatedCandidate.Payload == nil {
+			updatedCandidate.Payload = map[string]any{}
+		}
+		updatedCandidate.Payload["runtime_status"] = knowledgePackageRetired
+		hydrateKnowledgeCandidate(&updatedCandidate)
+
+		var updatedPackage *KnowledgePackage
+		if pkg := s.knowledgePackages[candidate.PackageID]; pkg != nil && (pkg.Status == knowledgePackageActive || pkg.Status == knowledgePackageShadow) {
+			copy := cloneKnowledgePackage(pkg)
+			copy.Status = knowledgePackageRetired
+			copy.RetiredAt, copy.RetiredBy, copy.RetirementNote = &now, "system", "operator evaluation changed or retracted"
+			if copy.Payload == nil {
+				copy.Payload = map[string]any{}
+			}
+			copy.Payload["runtime_status"] = knowledgePackageRetired
+			hydrateKnowledgePackage(&copy)
+			updatedPackage = &copy
+		}
+		event := s.newKnowledgeEventLocked(
+			candidate.CandidateID,
+			candidate.PackageID,
+			"candidate_invalidated",
+			"system",
+			"operator evaluation changed or retracted",
+			now,
+		)
+		if !s.persistKnowledgeReviewInvalidationLocked(&updatedCandidate, updatedPackage, event) {
+			continue
+		}
+		*candidate = updatedCandidate
+		if updatedPackage != nil {
+			*s.knowledgePackages[updatedPackage.PackageID] = *updatedPackage
+		}
+		s.knowledgeEvents[event.EventID] = event
+	}
+}
+
+func candidateSupportsAnyCase(candidate *KnowledgeCandidate, cases map[string]bool) bool {
+	if candidate == nil {
+		return false
+	}
+	if cases[candidate.CaseID] {
+		return true
+	}
+	for _, caseID := range candidate.SupportingCaseIDs {
+		if cases[caseID] {
+			return true
+		}
+	}
+	return false
 }
 
 func cloneEvaluationReview(review EvaluationReview) EvaluationReview {

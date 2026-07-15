@@ -13,7 +13,48 @@ Agent의 분석은 단일 프롬프트가 아니라 다단계 파이프라인(pi
 설명하고, [Knowledge Base](KNOWLEDGE-BASE.md) 문서가 파이프라인이 참조하는 카탈로그와
 온톨로지(ontology)를 다룹니다.
 
+**쉽게 기억하는 방법:** Alertmanager는 초인종, Backend는 조정자와 기록 담당자, Agent는
+조사자, Frontend는 운영자가 보는 사건 파일입니다. 데이터베이스는 사실을 보존하고, MCP
+서비스는 조사자가 클러스터 시스템을 안전하게 읽도록 돕는 읽기 전용 어댑터입니다.
+
+```mermaid
+flowchart LR
+  AM[Alertmanager] --> BE[Backend API]
+  BE --> AG[Agent]
+  AG --> C[Run:ai · Kubernetes · Prometheus · Loki · Postgres · System · Change collector]
+  C --> MCP[선택 사항 MCP 서비스]
+  C --> DS[Run:ai, Kubernetes, metrics, logs, DB]
+  BE <--> PG[(Postgres)]
+  AG <--> T[(선택 사항 TypeDB)]
+  BE --> UI[Frontend]
+  BE --> SL[Slack]
+```
+
+Backend는 알림을 받고 인시던트 기록을 관리합니다. Agent는 계획을 세우고 증거를 수집합니다.
+MCP 서비스는 선택적으로 쓰는 연결 다리일 뿐, 스스로 판단하는 주체가 아닙니다. Postgres는 운영 이력을
+저장하고 TypeDB는 승인된 토폴로지와 이력 문맥을 더합니다. Frontend와 Slack은 같은 조사 결과를
+각자의 화면으로 보여 줍니다.
+
 ## Runtime Flow
+
+```mermaid
+sequenceDiagram
+  participant AM as Alertmanager
+  participant B as Backend
+  participant A as Agent
+  participant D as Data sources
+  participant O as Operator
+  AM->>B: webhook alert
+  B->>B: 인시던트 상관 분석 및 저장
+  B->>A: /analyze
+  A->>D: 읽기 전용 증거 수집
+  A-->>B: RCA + evidence trail
+  B-->>O: UI/SSE와 Slack 업데이트
+```
+
+이 흐름은 비동기입니다. 웹훅을 먼저 받고, 그 뒤 Agent가 데드라인 안에서 증거를 수집합니다.
+일부 출처가 느리거나 응답하지 않아도 조사 전체가 멈추지 않고, 어떤 증거가 비었는지
+그대로 드러낸 채 부분 증거로 진행합니다.
 
 1. Alertmanager가 Backend로 `POST /webhook/alertmanager`를 전송합니다.
 2. Backend는 각 알림을 정규화하고 레이블과 어노테이션에서 Run:ai 컨텍스트를 도출합니다.

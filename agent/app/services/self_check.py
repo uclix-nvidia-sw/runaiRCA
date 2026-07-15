@@ -27,7 +27,11 @@ from app.collectors.base import NO_EVIDENCE, CollectorResult, condition_observat
 from app.config import Settings
 from app.llm import complete_json, llm_configured
 from app.masking import build_masker
-from app.services.root_cause_ranking import _FAMILY_RULES, RankedCause
+from app.services.root_cause_ranking import (
+    _FAMILY_RULES,
+    RankedCause,
+    artifact_supports_family,
+)
 
 _CONF_ORDER = ("low", "medium", "high")
 
@@ -77,14 +81,21 @@ def _canonical_has_evidence(
         if r.status == "unavailable":
             return False
         return any(
-            _artifact_has_evidence(art, evidence_eligibility=evidence_eligibility)
+            _artifact_has_evidence(
+                family,
+                art,
+                evidence_eligibility=evidence_eligibility,
+            )
             for art in getattr(r, "artifacts", []) or []
         )
     return False  # canonical collector did not even run
 
 
 def _artifact_has_evidence(
-    art: object, *, evidence_eligibility: Mapping[str, object] | None = None
+    family: str,
+    art: object,
+    *,
+    evidence_eligibility: Mapping[str, object] | None = None,
 ) -> bool:
     """Accept only an explicit scoped positive collector verdict.
 
@@ -102,7 +113,11 @@ def _artifact_has_evidence(
         evidence_id = str(getattr(art, "evidence_id", "") or "")
         eligibility = evidence_eligibility.get(evidence_id)
         permits = getattr(eligibility, "permits", None)
-        return bool(callable(permits) and permits("support"))
+        return bool(
+            callable(permits)
+            and permits("support")
+            and artifact_supports_family(family, art)
+        )
 
     result = getattr(art, "result", None)
     if not isinstance(result, Mapping):
@@ -110,9 +125,10 @@ def _artifact_has_evidence(
     observation = result.get("observation")
     if not isinstance(observation, Mapping):
         return False
-    return (
+    return bool(
         str(observation.get("polarity") or "").strip().lower() == "present"
         and str(observation.get("coverage") or "").strip().lower() == "scoped"
+        and artifact_supports_family(family, art)
     )
 
 
@@ -134,7 +150,11 @@ async def refute_top_cause(
 
         has_evidence = _canonical_has_evidence(
             family, results, evidence_eligibility=evidence_eligibility
-        ) or _has_signature_evidence(top_candidate)
+        ) or _has_signature_evidence(
+            top_candidate,
+            results,
+            evidence_eligibility=evidence_eligibility,
+        )
 
         if not llm_configured(settings, settings.llm_model_self_check):
             # ponytail: deterministic gate — the only signal we have without an LLM
@@ -209,10 +229,32 @@ def _next_check_missing_evidence(family: str, settings: Settings) -> str:
     return f"Check the canonical evidence source ({canonical}) directly for this cause."
 
 
-def _has_signature_evidence(top_candidate: RankedCause) -> bool:
+def _has_signature_evidence(
+    top_candidate: RankedCause,
+    results: list[CollectorResult],
+    *,
+    evidence_eligibility: Mapping[str, object] | None = None,
+) -> bool:
+    """Accept a signature bypass only when it resolves to auditable evidence.
+
+    Standalone legacy callers have no blackboard/ID map, so retain their narrow
+    rationale fallback.  Production pipeline callers always provide the map;
+    there a signature must be a typed, scoped artifact whose predicate supports
+    the selected family (for example the alert's NVIDIA XID card).
+    """
+    if evidence_eligibility is not None:
+        return any(
+            _artifact_has_evidence(
+                top_candidate.family,
+                art,
+                evidence_eligibility=evidence_eligibility,
+            )
+            for result in results
+            for art in (getattr(result, "artifacts", []) or [])
+        )
     agents = {str(a).lower() for a in getattr(top_candidate, "evidence_agents", [])}
     rationale = " ".join(getattr(top_candidate, "rationale", [])).lower()
-    return "signature" in agents and (
+    return ("signature" in agents or "alert" in agents) and (
         "matched known-issue signature" in rationale
         or "matched curated symptom" in rationale
         or "nvidia xid" in rationale
@@ -234,13 +276,24 @@ def _compact_evidence_value(value: object, *, limit: int = 1200) -> str:
 
 
 def _evidence_digest(results: list[CollectorResult], masker) -> str:
-    lines: list[str] = []
+    headlines: list[str] = []
+    artifact_lines: list[str] = []
     for r in results:
         summary = (r.summary or "").strip() or NO_EVIDENCE
-        lines.append(f"- {r.agent} [{r.status}]: {masker.mask_text(summary)}")
-        for art in (getattr(r, "artifacts", []) or [])[-3:]:
-            if art.status not in ("ok", "partial"):
-                continue
+        headlines.append(f"- {r.agent} [{r.status}]: {masker.mask_text(summary)}")
+        selected = [
+            art for art in (getattr(r, "artifacts", []) or []) if art.status in ("ok", "partial")
+        ]
+        selected = [
+            art for _index, art in sorted(
+                ([(len(selected) - 1, selected[-1])] if selected else []) + sorted(
+                    enumerate(selected[:-1]),
+                    key=lambda item: (bool(item[1].highlights), item[1].status == "ok", item[0]),
+                    reverse=True,
+                )[:5]
+            )
+        ]
+        for art in selected:
             parts = [
                 str(art.title or art.type or "artifact").strip(),
                 f"status={art.status}",
@@ -256,7 +309,15 @@ def _evidence_digest(results: list[CollectorResult], masker) -> str:
                 if checks:
                     parts.append(f"condition_checks={_compact_evidence_value(checks)}")
                 parts.append(f"result={_compact_evidence_value(art.result)}")
-            lines.append(f"  artifact: {masker.mask_text(' | '.join(parts))}")
+            artifact_lines.append(f"  artifact: {masker.mask_text(' | '.join(parts))}")
+    lines = list(headlines)
+    size = len("\n".join(lines))
+    for line in artifact_lines:
+        extra = len(line) + (1 if lines else 0)
+        if size + extra > 24_000:
+            break
+        lines.append(line)
+        size += extra
     return "\n".join(lines)
 
 
@@ -323,6 +384,7 @@ async def verify_matches(
     results: list[CollectorResult],
     *,
     subject: str = "candidate finding",
+    declared_alert: str = "",
 ) -> set[str]:
     """Names of signature/keyword-matched candidates the evidence does NOT support.
 
@@ -340,7 +402,13 @@ async def verify_matches(
         names.discard("")
         if not names or not llm_configured(settings, settings.llm_model_self_check):
             return set()
-        verdict = await _llm_verify_matches(settings, candidates, results, subject)
+        verdict = await _llm_verify_matches(
+            settings,
+            candidates,
+            results,
+            subject,
+            declared_alert=declared_alert,
+        )
         refuted = (verdict or {}).get("refuted")
         if not isinstance(refuted, list):
             return set()
@@ -350,14 +418,24 @@ async def verify_matches(
 
 
 async def verify_known_issues(
-    settings: Settings, issues: list[dict], results: list[CollectorResult]
+    settings: Settings,
+    issues: list[dict],
+    results: list[CollectorResult],
+    *,
+    declared_alert: str = "",
 ) -> set[str]:
     """Suppress keyword-matched known issues the evidence doesn't support (see verify_matches)."""
     candidates = [
         {"name": str(i.get("issue") or "").strip(), "detail": str(i.get("reason") or "")}
         for i in issues
     ]
-    return await verify_matches(settings, candidates, results, subject="known Run:ai issue")
+    return await verify_matches(
+        settings,
+        candidates,
+        results,
+        subject="known Run:ai issue",
+        declared_alert=declared_alert,
+    )
 
 
 async def _llm_verify_matches(
@@ -365,6 +443,8 @@ async def _llm_verify_matches(
     candidates: list[dict],
     results: list[CollectorResult],
     subject: str,
+    *,
+    declared_alert: str = "",
 ) -> dict | None:
     masker = _self_check_masker(settings)
     evidence = _evidence_digest(results, masker)
@@ -378,10 +458,17 @@ async def _llm_verify_matches(
         "evidence by keyword or signature. Matches can be superficial, so decide which "
         "the gathered evidence does NOT actually support. Use ONLY the evidence; do not "
         "invent any. Be conservative: refute a match only when the evidence clearly does "
-        'not fit — when unsure, keep it. Respond with a JSON object: {"refuted": [exact '
+        "not fit — when unsure, keep it. The declared alert payload is a source "
+        "observation, not a collector result: an explicit positive signature there may "
+        "support a match even when collectors no longer retain the event, but false, "
+        'normal, recovered, or negated values do not. Respond with a JSON object: {"refuted": [exact '
         'names that are NOT supported by the evidence]}.'
     )
-    user = f"Candidates:\n{cand}\n\nGathered evidence:\n{evidence}"
+    safe_alert = masker.mask_text(" ".join(str(declared_alert or "").split()))
+    user = (
+        f"Candidates:\n{cand}\n\nDeclared alert payload:\n"
+        f"{safe_alert or '(not supplied)'}\n\nGathered collector evidence:\n{evidence}"
+    )
     return await complete_json(
         settings,
         system=system,

@@ -3,7 +3,30 @@
 > **Lens:** How to use — take it from published images to a running deployment.
 > **In this doc:** container/Helm publishing · install paths · Alertmanager webhook routing · Postgres & pgvector setup · read-only RBAC.
 
+**Who this is for:** the person taking the service from images to a running
+cluster. Helm is the installation package: it creates the three application
+services, their configuration, and the least privilege read access the Agent
+needs. Read this page in order for a new install; use its later sections as an
+operations reference.
+
+```mermaid
+flowchart TB
+  H[Helm release] --> B[Backend]
+  H --> A[Agent]
+  H --> F[Frontend]
+  H --> P[(Postgres)]
+  A --> K[Kubernetes/Run:ai/metrics/log reads]
+  AM[Alertmanager] --> B
+  F --> B
+```
+
 ## Container and Helm Deployment
+
+### Install in four decisions
+
+Choose images, provide secrets and a database, decide the Agent's read scope,
+then route Alertmanager to the Backend. The commands below implement those four
+choices without granting the Agent write permissions.
 
 The repository includes a GitHub Actions workflow that builds the three runtime
 images and publishes them to GitHub Container Registry (GHCR), so operators do

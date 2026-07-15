@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from datetime import UTC, datetime
 from typing import Any
 
 from app.collectors.base import (
@@ -9,6 +10,7 @@ from app.collectors.base import (
     AnalysisTarget,
     CollectorResult,
     artifact,
+    causal_evidence_time_range,
     incident_time_range,
     ko_en,
     parse_incident_time,
@@ -17,6 +19,7 @@ from app.collectors.loki import _llm_insight
 from app.config import Settings
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
+    mcp_budget,
     mcp_call,
     mcp_error,
     mcp_fallback_warning,
@@ -66,9 +69,10 @@ class PostgresCollector:
         used_mcp = False
         if self._settings.postgres_mcp_url:
             try:
-                checks = await _collect_postgres_checks_mcp(
-                    self._settings, target, check_rca_tables=check_rca_tables
-                )
+                async with mcp_budget(self._settings.postgres_timeout_seconds):
+                    checks = await _collect_postgres_checks_mcp(
+                        self._settings, target, check_rca_tables=check_rca_tables
+                    )
                 used_mcp = True
             except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
                 warnings.append(mcp_fallback_warning(exc))
@@ -140,24 +144,27 @@ class PostgresCollector:
         timeout = self._settings.postgres_timeout_seconds
         try:
             conn = await asyncio.wait_for(
-                asyncpg.connect(direct_dsn, timeout=timeout),
+                asyncpg.connect(direct_dsn, timeout=timeout, server_settings={"timezone": "UTC"}),
                 timeout=timeout + 1,
             )
         except Exception as exc:  # noqa: BLE001 - collector reports diagnostics, not failures.
-            summary = f"{NO_EVIDENCE} Postgres connection failed: {exc.__class__.__name__}."
+            summary = (
+                f"{NO_EVIDENCE} Run:ai control-plane DB connection failed "
+                f"({exc.__class__.__name__}) — potentially relevant context for backend alerts."
+            )
             return CollectorResult(
                 agent=self.name,
-                status="partial",
+                status="unavailable",
                 summary=summary,
-                confidence="medium",
+                confidence="low",
                 warnings=warnings + [summary],
                 artifacts=[
                     artifact(
                         agent=self.name,
                         source="postgres",
                         type="database_connectivity",
-                        status="partial",
-                        confidence="medium",
+                        status="unavailable",
+                        confidence="low",
                         query="SELECT 1",
                         summary=summary,
                         result={
@@ -201,6 +208,9 @@ async def _postgres_result(
     pgvector = checks["pgvector_extension"]
     rca_tables = checks["rca_tables"]
     incident_history = checks.get("incident_history", {})
+    history_failures = incident_history.get("failed_tables", []) if isinstance(incident_history, dict) else []
+    history_skipped = incident_history.get("skipped_tables", []) if isinstance(incident_history, dict) else []
+    history_missing: list[str] = []
     # An aggregate is only a count over the requested SQL range.  Do not let
     # it become a causal occurrence until the returned target rows themselves
     # prove an in-range timestamp and an allowlisted target identity.
@@ -232,6 +242,17 @@ async def _postgres_result(
     if check_rca_tables and missing_tables:
         status = "partial"
         warnings.append(f"Missing RCA table(s): {', '.join(missing_tables)}.")
+    for failed in history_failures:
+        if isinstance(failed, dict) and failed.get("table"):
+            table_name = str(failed["table"])
+            history_missing.append(f"postgres.audit_table:{table_name}")
+            warnings.append(f"Postgres audit table {table_name} failed: {failed.get('error') or 'error'}.")
+            status = "partial"
+    if history_skipped:
+        examples = ", ".join(map(str, history_skipped[:3]))
+        history_missing.extend(f"postgres.audit_table:{name}" for name in history_skipped)
+        warnings.append(f"Postgres audit table discovery capped; skipped {len(history_skipped)} table(s): {examples}.")
+        status = "partial"
 
     if database_kind == "runai_control_plane":
         history_summary = (
@@ -295,6 +316,7 @@ async def _postgres_result(
         summary=summary,
         confidence=confidence,
         details={**checks, "used_mcp": used_mcp, "database_kind": database_kind},
+        missing_data=history_missing,
         warnings=warnings,
         artifacts=[
             artifact(
@@ -508,7 +530,7 @@ def _history_tables(column_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             (schema, table), {"schema": schema, "table": table, "timestamps": [], "context": []}
         )
         if data_type in _HISTORY_TIMESTAMP_TYPES:
-            entry["timestamps"].append(column)
+            entry["timestamps"].append((column, data_type))
         elif column in _HISTORY_CONTEXT_COLUMNS:
             entry["context"].append(column)
 
@@ -517,8 +539,9 @@ def _history_tables(column_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         timestamps = entry["timestamps"]
         if not timestamps:
             continue
-        timestamp_column = next(
-            (column for column in _HISTORY_TIME_COLUMNS if column in timestamps), timestamps[0]
+        timestamp_column, timestamp_type = next(
+            ((column, data_type) for column, data_type in timestamps if column in _HISTORY_TIME_COLUMNS),
+            timestamps[0],
         )
         discovered = set(entry["context"])
         # Keep correlation columns before generic audit display fields.  The
@@ -536,10 +559,18 @@ def _history_tables(column_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "schema": entry["schema"],
                 "table": entry["table"],
                 "timestamp_column": timestamp_column,
+                "timestamp_type": timestamp_type,
                 "context_columns": context[:5],
             }
         )
-    return candidates[:_HISTORY_TABLE_LIMIT]
+    return sorted(
+        candidates,
+        key=lambda table: (
+            not any(token in str(table["table"]).casefold() for token in ("history", "audit", "event")),
+            str(table["schema"]),
+            str(table["table"]),
+        ),
+    )
 
 
 def _quoted_identifier(value: str) -> str:
@@ -773,8 +804,8 @@ def _verified_target_aggregate(
         return 0, True
     start = parse_incident_time(time_range.get("start"))
     end = parse_incident_time(time_range.get("end"))
-    first = parse_incident_time(aggregate.get("first_event_at"))
-    last = parse_incident_time(aggregate.get("last_event_at"))
+    first = _postgres_event_time(aggregate.get("first_event_at"))
+    last = _postgres_event_time(aggregate.get("last_event_at"))
     if None in (start, end, first, last):
         return count, False
     assert start is not None and end is not None and first is not None and last is not None
@@ -788,53 +819,29 @@ async def _collect_incident_history_direct(conn: Any, target: AnalysisTarget) ->
         return history
     columns = await conn.fetch(_history_column_discovery_sql())
     tables: list[dict[str, Any]] = []
-    for table in _history_tables([_record_to_dict(row) for row in columns]):
-        aggregate_rows = await conn.fetch(
-            _history_aggregate_query(table, mcp=False, time_range=time_range),
-            time_range["start"],
-            time_range["end"],
-        )
-        aggregate = _record_to_dict(aggregate_rows[0]) if aggregate_rows else {}
-        rows = await conn.fetch(
-            _history_query(table, mcp=False, time_range=time_range),
-            time_range["start"],
-            time_range["end"],
-        )
-        row_dicts = [_record_to_dict(row) for row in rows]
-        target_aggregate_query = _history_target_aggregate_query(
-            table, target, mcp=False, time_range=time_range
-        )
-        target_query = _history_target_query(table, target, mcp=False, time_range=time_range)
-        target_aggregate: dict[str, Any] = {}
-        target_rows: list[dict[str, Any]] = []
-        if target_aggregate_query is not None and target_query is not None:
-            query, parameters = target_aggregate_query
-            aggregate_rows = await conn.fetch(
-                query, time_range["start"], time_range["end"], *parameters
-            )
-            target_aggregate = _record_to_dict(aggregate_rows[0]) if aggregate_rows else {}
-            query, parameters = target_query
-            target_rows = [
-                _record_to_dict(row)
-                for row in await conn.fetch(query, time_range["start"], time_range["end"], *parameters)
-            ]
-        target_matches, target_verified = _verified_target_aggregate(target_aggregate, time_range)
-        tables.append(
-            {
-                **table,
-                "matching_rows": int(aggregate.get("matching_rows") or 0),
-                "first_event_at": aggregate.get("first_event_at"),
-                "last_event_at": aggregate.get("last_event_at"),
-                "rows": row_dicts,
-                "target_correlation_available": target_aggregate_query is not None,
-                "target_matching_rows": target_matches,
-                "target_aggregate_verified": target_verified,
-                "target_first_event_at": target_aggregate.get("first_event_at"),
-                "target_last_event_at": target_aggregate.get("last_event_at"),
-                "target_rows": target_rows,
-                "target_rows_truncated": target_verified and target_matches > len(target_rows),
-            }
-        )
+    candidates = _history_tables([_record_to_dict(row) for row in columns])
+    selected, skipped = candidates[:_HISTORY_TABLE_LIMIT], candidates[_HISTORY_TABLE_LIMIT:]
+    history["skipped_tables"] = [f"{table['schema']}.{table['table']}" for table in skipped]
+    history["failed_tables"] = []
+    for table in selected:
+        table_name = f"{table['schema']}.{table['table']}"
+        try:
+            aggregate_rows = await conn.fetch(_history_aggregate_query(table, mcp=False, time_range=time_range), time_range["start"], time_range["end"])
+            aggregate = _record_to_dict(aggregate_rows[0]) if aggregate_rows else {}
+            rows = await conn.fetch(_history_query(table, mcp=False, time_range=time_range), time_range["start"], time_range["end"])
+            target_aggregate_query = _history_target_aggregate_query(table, target, mcp=False, time_range=time_range)
+            target_query = _history_target_query(table, target, mcp=False, time_range=time_range)
+            target_aggregate, target_rows = {}, []
+            if target_aggregate_query is not None and target_query is not None:
+                query, parameters = target_aggregate_query
+                aggregate_rows = await conn.fetch(query, time_range["start"], time_range["end"], *parameters)
+                target_aggregate = _record_to_dict(aggregate_rows[0]) if aggregate_rows else {}
+                query, parameters = target_query
+                target_rows = [_record_to_dict(row) for row in await conn.fetch(query, time_range["start"], time_range["end"], *parameters)]
+            target_matches, target_verified = _verified_target_aggregate(target_aggregate, time_range)
+            tables.append({**table, "matching_rows": int(aggregate.get("matching_rows") or 0), "first_event_at": aggregate.get("first_event_at"), "last_event_at": aggregate.get("last_event_at"), "rows": [_record_to_dict(row) for row in rows], "target_correlation_available": target_aggregate_query is not None, "target_matching_rows": target_matches, "target_aggregate_verified": target_verified, "target_first_event_at": target_aggregate.get("first_event_at"), "target_last_event_at": target_aggregate.get("last_event_at"), "target_rows": target_rows, "target_rows_truncated": target_verified and target_matches > len(target_rows)})
+        except Exception as exc:  # noqa: BLE001 - retain other audit planes
+            history["failed_tables"].append({"table": table_name, "error": exc.__class__.__name__})
     history["tables"] = tables
     return history
 
@@ -848,41 +855,29 @@ async def _collect_incident_history_mcp(
         return history
     columns = await _mcp_fetch(settings, _history_column_discovery_sql())
     tables: list[dict[str, Any]] = []
-    for table in _history_tables(columns):
-        aggregate_rows = await _mcp_fetch(
-            settings, _history_aggregate_query(table, mcp=True, time_range=time_range)
-        )
-        aggregate = aggregate_rows[0] if aggregate_rows else {}
-        rows = await _mcp_fetch(settings, _history_query(table, mcp=True, time_range=time_range))
-        target_aggregate_query = _history_target_aggregate_query(
-            table, target, mcp=True, time_range=time_range
-        )
-        target_query = _history_target_query(table, target, mcp=True, time_range=time_range)
-        target_aggregate: dict[str, Any] = {}
-        target_rows: list[dict[str, Any]] = []
-        if target_aggregate_query is not None and target_query is not None:
-            query, _ = target_aggregate_query
-            aggregate_rows = await _mcp_fetch(settings, query)
-            target_aggregate = aggregate_rows[0] if aggregate_rows else {}
-            query, _ = target_query
-            target_rows = await _mcp_fetch(settings, query)
-        target_matches, target_verified = _verified_target_aggregate(target_aggregate, time_range)
-        tables.append(
-            {
-                **table,
-                "matching_rows": int(aggregate.get("matching_rows") or 0),
-                "first_event_at": aggregate.get("first_event_at"),
-                "last_event_at": aggregate.get("last_event_at"),
-                "rows": rows,
-                "target_correlation_available": target_aggregate_query is not None,
-                "target_matching_rows": target_matches,
-                "target_aggregate_verified": target_verified,
-                "target_first_event_at": target_aggregate.get("first_event_at"),
-                "target_last_event_at": target_aggregate.get("last_event_at"),
-                "target_rows": target_rows,
-                "target_rows_truncated": target_verified and target_matches > len(target_rows),
-            }
-        )
+    candidates = _history_tables(columns)
+    selected, skipped = candidates[:_HISTORY_TABLE_LIMIT], candidates[_HISTORY_TABLE_LIMIT:]
+    history["skipped_tables"] = [f"{table['schema']}.{table['table']}" for table in skipped]
+    history["failed_tables"] = []
+    for table in selected:
+        table_name = f"{table['schema']}.{table['table']}"
+        try:
+            aggregate_rows = await _mcp_fetch(settings, _history_aggregate_query(table, mcp=True, time_range=time_range))
+            aggregate = aggregate_rows[0] if aggregate_rows else {}
+            rows = await _mcp_fetch(settings, _history_query(table, mcp=True, time_range=time_range))
+            target_aggregate_query = _history_target_aggregate_query(table, target, mcp=True, time_range=time_range)
+            target_query = _history_target_query(table, target, mcp=True, time_range=time_range)
+            target_aggregate, target_rows = {}, []
+            if target_aggregate_query is not None and target_query is not None:
+                query, _ = target_aggregate_query
+                aggregate_rows = await _mcp_fetch(settings, query)
+                target_aggregate = aggregate_rows[0] if aggregate_rows else {}
+                query, _ = target_query
+                target_rows = await _mcp_fetch(settings, query)
+            target_matches, target_verified = _verified_target_aggregate(target_aggregate, time_range)
+            tables.append({**table, "matching_rows": int(aggregate.get("matching_rows") or 0), "first_event_at": aggregate.get("first_event_at"), "last_event_at": aggregate.get("last_event_at"), "rows": rows, "target_correlation_available": target_aggregate_query is not None, "target_matching_rows": target_matches, "target_aggregate_verified": target_verified, "target_first_event_at": target_aggregate.get("first_event_at"), "target_last_event_at": target_aggregate.get("last_event_at"), "target_rows": target_rows, "target_rows_truncated": target_verified and target_matches > len(target_rows)})
+        except Exception as exc:  # noqa: BLE001 - retain other audit planes
+            history["failed_tables"].append({"table": table_name, "error": exc.__class__.__name__})
     history["tables"] = tables
     return history
 
@@ -1106,6 +1101,7 @@ def _postgres_history_artifacts(
                         "observation_window": time_range or {},
                         **({"evidence_window": evidence_window} if evidence_window else {}),
                         **({"observed_entity": observed_entity} if observed_entity else {}),
+                        **({"naive_timestamps_assumed_utc": True} if _history_rows_assume_utc(table) else {}),
                     },
                     "target_matching_rows": matches,
                     "target_rows": table.get("target_rows") or [],
@@ -1164,6 +1160,10 @@ def _verified_target_history_rows(
         return False, None, None
     if matches == 0:
         return True, None, _target_history_entity(target)
+    causal_time_range = causal_evidence_time_range(target)
+    causal_end = parse_incident_time(causal_time_range.get("end")) if causal_time_range else None
+    if causal_end is None:
+        return False, None, None
     rows = table.get("target_rows")
     if not isinstance(rows, list) or not rows:
         return False, None, None
@@ -1172,12 +1172,20 @@ def _verified_target_history_rows(
     for raw_row in rows:
         if not isinstance(raw_row, dict):
             return False, None, None
-        instant = parse_incident_time(raw_row.get("event_time"))
+        instant = _postgres_event_time(raw_row.get("event_time"))
+        if instant is None:
+            return False, None, None
+        if instant > causal_end:
+            continue
+        if instant < start:
+            return False, None, None
         entity = _target_history_row_entity(raw_row, table, target)
-        if instant is None or not (start <= instant <= end) or entity is None:
+        if entity is None:
             return False, None, None
         instants.append(instant)
         entities.append(entity)
+    if not instants:
+        return False, None, None
     first, last = min(instants), max(instants)
     # A target query can legitimately match by workload in one row and pod in
     # another. Pick the most specific identity seen, while retaining the fact
@@ -1194,6 +1202,34 @@ def _verified_target_history_rows(
             "end": last.isoformat().replace("+00:00", "Z"),
         },
         observed_entity,
+    )
+
+
+def _postgres_event_time(value: object) -> datetime | None:
+    """Parse Run:ai audit timestamps; naive schema values are stored as UTC."""
+    parsed = parse_incident_time(value)
+    if parsed is not None:
+        return parsed
+    if isinstance(value, datetime) and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+    return None
+
+
+def _history_rows_assume_utc(table: dict[str, Any]) -> bool:
+    if table.get("timestamp_type") == "timestamp without time zone":
+        return True
+    return any(
+        _postgres_event_time(row.get("event_time")) is not None
+        and parse_incident_time(row.get("event_time")) is None
+        for row in table.get("target_rows") or []
+        if isinstance(row, dict)
     )
 
 

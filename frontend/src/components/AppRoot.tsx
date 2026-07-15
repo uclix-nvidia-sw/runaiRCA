@@ -30,6 +30,7 @@ import {
   analyzeIncident,
   archiveIncident,
   deleteIncident,
+  fetchAnalysisRun,
   fetchIncident,
   resolveIncident,
   restoreIncident,
@@ -45,6 +46,7 @@ import { LearnedKnowledgeDashboard } from './dashboards/LearnedKnowledgeDashboar
 import { FeedbackPanel } from './workspace/FeedbackPanel';
 import { EvaluationPanel } from './workspace/EvaluationPanel';
 import { FloatingChat } from './workspace/FloatingChat';
+import { SimilarIncidentsPanel } from './workspace/SimilarIncidentsPanel';
 import { useRcaChat } from './workspace/chatSession';
 import { exportIncidentDocx } from '../exportDocx';
 import { useDashboardData } from '../hooks/useDashboardData';
@@ -67,8 +69,10 @@ import {
   type RouteState,
   type SynthesisSummary,
 } from '../models/appTypes';
-import { AlertRecord, AnalysisProgressEntry, AnalysisRun, Artifact, Incident, SimilarIncident } from '../types';
+import { AlertRecord, AnalysisProgressEntry, AnalysisRun, Artifact, Incident } from '../types';
 import { buildAnalysisRecords } from '../utils/analytics';
+import { collectorEvidencePresentation, shouldPresentRunArtifacts } from '../utils/analysisPresentation';
+import { artifactForPresentation } from '../utils/artifactPresentation';
 import { alertFiltersForAPI, incidentFiltersForAPI, incidentViewForMainView, matchesAlertFilters, matchesIncidentFilters } from '../utils/filters';
 import {
   FinalDecision,
@@ -88,6 +92,7 @@ import {
 import { RealtimeEventPayload } from '../utils/realtime';
 import { hashForDetail, hashForView, routeFromHash } from '../utils/routing';
 import { evidenceMetadata, type EvidenceMetadata, type EvidenceWindow } from '../utils/evidenceMetadata';
+import { analysisRunForDetail, selectedAnalysisRunID as selectedAnalysisRunIDForDetail } from '../utils/analysisRunSelection';
 
 function errorMessage(err: unknown, fallback: string) {
   return err instanceof Error ? err.message : fallback;
@@ -264,40 +269,14 @@ function realtimeEventMatchesDetail(detail: DetailState, payload: RealtimeEventP
   );
 }
 
-function analysisRunMatchesDetail(run: AnalysisRun, detail: DetailState) {
-  if (!detail) return false;
-  if (detail.kind === 'incident') {
-    const incidentID = detail.data.incident_id;
-    const alertIDs = new Set(detail.data.alerts.map((alert) => alert.alert_id));
-    return (
-      run.incident_id === incidentID ||
-      (run.target_type === 'incident' && run.target_id === incidentID) ||
-      (run.alert_id ? alertIDs.has(run.alert_id) : false) ||
-      (run.target_type === 'alert' && alertIDs.has(run.target_id))
-    );
-  }
-  const alertID = detail.data.alert_id;
-  return (
-    run.alert_id === alertID ||
-    (run.target_type === 'alert' && run.target_id === alertID) ||
-    run.incident_id === detail.data.incident_id ||
-    (run.target_type === 'incident' && run.target_id === detail.data.incident_id)
-  );
-}
-
-function latestAnalysisRunForDetail(detail: DetailState, runs: AnalysisRun[]) {
-  return [...runs]
-    .filter((run) => analysisRunMatchesDetail(run, detail))
-    .sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0];
-}
-
 function progressForRun(
   run: AnalysisRun | undefined,
   progressByRun: Record<string, AnalysisProgressEntry[]>,
 ) {
   if (!run) return [];
-  const live = progressByRun[run.run_id] ?? [];
-  if (live.length > 0) return live;
+  if (Object.prototype.hasOwnProperty.call(progressByRun, run.run_id)) {
+    return progressByRun[run.run_id] ?? [];
+  }
   return Array.isArray(run.metadata?.progress_log) ? run.metadata.progress_log : [];
 }
 
@@ -343,6 +322,7 @@ function App() {
   const [chatDocked, setChatDocked] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [knowledgeRefreshKey, setKnowledgeRefreshKey] = useState(0);
+  const [exactAnalysisRun, setExactAnalysisRun] = useState<AnalysisRun>();
   const detailVersionRef = useRef(0);
   const routeLoadVersionRef = useRef(0);
 
@@ -398,7 +378,7 @@ function App() {
 
   const liveEvidenceItems = useMemo<EvidenceItem[]>(() => {
     // Evidence artifacts live on the analysis runs now (not per-alert columns).
-    return dashboardAnalysisRuns.flatMap((run) =>
+    return dashboardAnalysisRuns.filter((run) => shouldPresentRunArtifacts(run.status)).flatMap((run) =>
       (run.artifacts ?? [])
         .filter((artifact) => isCollectorAgent(artifact.agent))
         .map((artifact, index) => ({
@@ -460,9 +440,37 @@ function App() {
     };
   }, [analysisRecords]);
 
+  const selectedAnalysisRunID = selectedAnalysisRunIDForDetail(detail);
+  const selectedAnalysisRunOnPage = dashboardAnalysisRuns.find((run) => run.run_id === selectedAnalysisRunID);
+  const selectedAnalysisAttemptVersion = detail?.kind === 'incident'
+    ? `${detail.data.active_analysis_run_id || ''}:${detail.data.is_analyzing}:${detail.data.analysis_hash || ''}`
+    : '';
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedAnalysisRunID) {
+      setExactAnalysisRun(undefined);
+      return undefined;
+    }
+    if (selectedAnalysisRunOnPage) {
+      setExactAnalysisRun(undefined);
+      return undefined;
+    }
+    setExactAnalysisRun((current) => current?.run_id === selectedAnalysisRunID ? current : undefined);
+    void fetchAnalysisRun(selectedAnalysisRunID)
+      .then((run) => {
+        if (!cancelled) setExactAnalysisRun(run);
+      })
+      .catch(() => {
+        if (!cancelled) setExactAnalysisRun(undefined);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedAnalysisAttemptVersion, selectedAnalysisRunID, selectedAnalysisRunOnPage]);
+
   const workspaceAnalysisRun = useMemo(
-    () => latestAnalysisRunForDetail(detail, dashboardAnalysisRuns),
-    [dashboardAnalysisRuns, detail],
+    () => analysisRunForDetail(detail, dashboardAnalysisRuns, exactAnalysisRun),
+    [dashboardAnalysisRuns, detail, exactAnalysisRun],
   );
   const workspaceProgress = useMemo(
     () => progressForRun(workspaceAnalysisRun, progressByRun),
@@ -581,7 +589,9 @@ function App() {
     activeView,
     incidents: dashboardIncidents,
     alerts: dashboardAlerts,
-    onAnalysisCreated: () => load({ silent: true }),
+    onAnalysisCreated: async () => {
+      await load({ silent: true });
+    },
   });
 
   // Refresh the open detail ONLY when a genuinely new realtime event arrives.
@@ -832,6 +842,12 @@ function UnifiedWorkspace({
   const analysis = incident?.analysis_detail;
   const summary = incident?.analysis_summary;
   const isAnalyzing = Boolean(detail.data.is_analyzing);
+  const evidencePresentation = collectorEvidencePresentation({
+    isAnalyzing,
+    runStatus: analysisRun?.status,
+    firstCompletedAt: analysisRun?.first_completed_at,
+    artifactCount: artifacts.length,
+  });
   const similarIncidents = incident?.similar_incidents ?? [];
   const feedback = incident?.feedback ?? alert?.feedback;
   const targetType = detail.kind;
@@ -942,10 +958,11 @@ function UnifiedWorkspace({
         <section className="rca-summary">
           <h3>RCA Summary</h3>
           <p>
-            {summary ||
-              (isAnalyzing
-                ? 'Analysis is running. New RCA content will appear when the agent finishes.'
-                : 'Analysis is pending. The Collector Evidence Trail will populate as collectors finish.')}
+            {isAnalyzing
+              ? summary
+                ? 'Re-analysis is running. The previous RCA is preserved and the new result will replace it when complete.'
+                : 'Analysis is running. New RCA content will appear when the agent finishes.'
+              : summary || 'Analysis is pending. The Collector Evidence Trail will populate as collectors finish.'}
           </p>
           <div className="rca-feedback-strip">
             <span><ThumbsUp size={15} /> {positiveFeedback}</span>
@@ -966,7 +983,11 @@ function UnifiedWorkspace({
         )}
 
         {incident && (
-          <SimilarIncidentsPanel items={similarIncidents} recentCount={incident.similar_recent_count ?? 0} />
+          <SimilarIncidentsPanel
+            items={similarIncidents}
+            recentCount={incident.similar_recent_count ?? 0}
+            onOpenIncident={onOpenIncident}
+          />
         )}
 
         <section className="rca-report">
@@ -984,17 +1005,24 @@ function UnifiedWorkspace({
 
         <section className="agent-trail">
           <div className="section-title"><Bot size={18} /> Collector Evidence Trail</div>
-          <div className="agent-grid">
-            {AGENT_ORDER.map((agent) => (
-              <AgentEvidence
-                key={agent}
-                agent={agent}
-                status={capabilities[agent] || 'pending'}
-                artifacts={artifacts.filter((artifact) => artifact.agent === agent)}
-                reasons={agentReasons(agent, missingData, warnings)}
-              />
-            ))}
-          </div>
+          {evidencePresentation.hidden ? (
+            <p className="empty">{evidencePresentation.notice}</p>
+          ) : (
+            <>
+              {evidencePresentation.notice && <p className="empty">{evidencePresentation.notice}</p>}
+              <div className="agent-grid">
+                {AGENT_ORDER.map((agent) => (
+                  <AgentEvidence
+                    key={agent}
+                    agent={agent}
+                    status={capabilities[agent] || 'pending'}
+                    artifacts={artifacts.filter((artifact) => artifact.agent === agent)}
+                    reasons={agentReasons(agent, missingData, warnings)}
+                  />
+                ))}
+              </div>
+            </>
+          )}
         </section>
 
         {(missingData.length > 0 || warnings.length > 0 || tokenUsage) && (
@@ -1243,8 +1271,10 @@ const PHASE_LABELS: Record<string, string> = {
   collection: 'Evidence',
   rank: 'Ranking',
   ranking: 'Ranking',
+  investigation: 'Investigation',
   self_check: 'Self-check',
   synthesize: 'Synthesis',
+  harness: 'Validation',
   reflection: 'Synthesis',
 };
 
@@ -1320,50 +1350,6 @@ function DiagnosticGroup({
         </button>
       )}
     </div>
-  );
-}
-
-function SimilarIncidentsPanel({ items, recentCount }: { items: SimilarIncident[]; recentCount: number }) {
-  const visibleItems = useMemo(
-    () =>
-      [...items]
-        .sort((left, right) => {
-          if (right.similarity !== left.similarity) return right.similarity - left.similarity;
-          return right.created_at.localeCompare(left.created_at);
-        })
-        .slice(0, 3),
-    [items],
-  );
-  return (
-    <section className="similar-panel">
-      <div className="section-title">
-        <Search size={18} /> Similar Incidents
-        <span className="similar-recent-badge">Recent 7d {recentCount}</span>
-      </div>
-      {visibleItems.length === 0 ? (
-        <p className="empty">No similar incident memory yet.</p>
-      ) : (
-        <div className="similar-list">
-          {visibleItems.map((item) => (
-            <article className="similar-item" key={item.incident_id}>
-              <div className="similar-head">
-                <strong>{item.title || item.incident_id}</strong>
-                <span>{Math.round(item.similarity * 100)}%</span>
-              </div>
-              <div className="meta-line">
-                <span>{item.incident_id}</span>
-                <Severity value={item.severity} />
-                <Status value={item.status} />
-                <span>{item.positive_feedback} up</span>
-                <span>{item.negative_feedback} down</span>
-                <span>{item.comment_count} comments</span>
-              </div>
-              <p>{item.analysis_summary || 'No prior summary captured.'}</p>
-            </article>
-          ))}
-        </div>
-      )}
-    </section>
   );
 }
 
@@ -1443,8 +1429,9 @@ function AgentEvidence({
 
 function ArtifactResult({ artifact }: { artifact: Artifact }) {
   const [open, setOpen] = useState(false);
-  const queryItems = queryDisplayItems(artifact.result);
-  const resultText = artifact.result !== undefined ? formatArtifactValue(compactArtifactValue(artifact.result)) : '';
+  const presented = artifactForPresentation(artifact);
+  const queryItems = queryDisplayItems(presented.result);
+  const resultText = presented.result !== undefined ? formatArtifactValue(compactArtifactValue(presented.result)) : '';
   const evidence = evidenceMetadata(artifact.result);
   return (
     <div className="artifact">
@@ -1461,7 +1448,7 @@ function ArtifactResult({ artifact }: { artifact: Artifact }) {
               bold by the backend, so it also survives Word export / raw JSON — render
               it as markdown instead of overlaying a frontend-only red highlight. */}
           <div className="artifact-summary">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{artifact.summary ?? ''}</ReactMarkdown>
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{presented.summary ?? ''}</ReactMarkdown>
           </div>
           <EvidenceInterpretation evidence={evidence} />
           {queryItems.length > 0 ? (
@@ -1469,7 +1456,7 @@ function ArtifactResult({ artifact }: { artifact: Artifact }) {
           ) : (
             <>
               {artifact.query && <CopyableBlock title="Query" value={artifact.query} kind="code" />}
-              {artifact.result !== undefined && !isEmptyResult(artifact.result) && (
+              {presented.result !== undefined && !isEmptyResult(presented.result) && (
                 <CopyableBlock
                   title="Result summary"
                   value={resultText}

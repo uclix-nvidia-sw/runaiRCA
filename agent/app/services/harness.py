@@ -15,12 +15,17 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from app.collectors.base import NO_EVIDENCE, CollectorResult
 from app.schemas import AlertAnalysisResponse
-from app.services.root_cause_ranking import RankedCause
+from app.services.root_cause_ranking import (
+    FAMILIES,
+    RankedCause,
+    artifact_contradicts_family,
+    artifact_supports_family,
+)
 
 _USABLE = {"ok", "partial"}
 _DANGEROUS_ACTION = re.compile(
@@ -170,6 +175,14 @@ def evaluate(
     family = str(getattr(top, "family", "") or "")
     agents = set(getattr(top, "evidence_agents", []) or []) if top else set()
     agent_supporting = [item for agent in agents for item in by_agent.get(agent, [])]
+    if _signature_support(top):
+        # Signature promotion is logical provenance, not a physical collector.
+        # XID and curated signatures can arrive from Alertmanager, Loki,
+        # Kubernetes, or the system agent.  Claim semantics below are the
+        # authoritative boundary, so consider every family-relevant card here.
+        agent_supporting.extend(
+            item for item in usable if artifact_supports_family(family, item)
+        )
     agent_supporting = _unique_artifacts(agent_supporting)
     all_artifacts = [item for result in results for item in result.artifacts]
     all_ids = [
@@ -177,6 +190,7 @@ def evaluate(
         for item in all_artifacts
         if getattr(item, "evidence_id", "")
     ]
+    by_id = {str(getattr(item, "evidence_id", "")): item for item in all_artifacts}
     # ``None`` means this standalone harness caller has no blackboard context,
     # so derive typed artifact eligibility locally.  An explicitly supplied
     # (including empty) map is authoritative and must remain fail-closed for
@@ -190,6 +204,27 @@ def evaluate(
     links, link_errors = validate_evidence_links(
         supplied_links, all_ids, eligibility_by_id=eligibility_by_id
     )
+    if family in FAMILIES:
+        semantically_valid: list[EvidenceLink] = []
+        for link in links:
+            artifact = by_id.get(link.fact_id)
+            if artifact is not None:
+                if link.role == "support" and not artifact_supports_family(
+                    family, artifact
+                ):
+                    link_errors.append(
+                        f"link to {link.fact_id!r} does not support root-cause family {family!r}"
+                    )
+                    continue
+                if link.role == "contradict" and not artifact_contradicts_family(
+                    family, artifact
+                ):
+                    link_errors.append(
+                        f"link to {link.fact_id!r} does not contradict root-cause family {family!r}"
+                    )
+                    continue
+            semantically_valid.append(link)
+        links = semantically_valid
     # Legacy callers derive support from the ranker's evidence agents.  New
     # callers provide explicit support/contradiction links and get exact claim
     # grounding instead of an agent-name approximation.
@@ -205,6 +240,7 @@ def evaluate(
                 is not None
                 and callable(getattr(eligibility, "permits", None))
                 and eligibility.permits("support")
+                and (family not in FAMILIES or artifact_supports_family(family, item))
             )
         ]
         claim_links = [
@@ -213,7 +249,6 @@ def evaluate(
             if getattr(item, "evidence_id", "")
         ]
     else:
-        by_id = {str(getattr(item, "evidence_id", "")): item for item in all_artifacts}
         supporting = [
             by_id[link.fact_id]
             for link in links
@@ -225,7 +260,7 @@ def evaluate(
     contradiction_ids = [link.fact_id for link in claim_links if link.role == "contradict"]
     traced_ids = [*support_ids, *contradiction_ids]
     support_source_groups = {_independence_key(item) for item in supporting}
-    signature = _signature_support(top)
+    signature = _signature_support(top) and bool(supporting)
     confidence = str(getattr(top, "confidence", "low") or "low")
     insufficient = not family or family == "insufficient_evidence"
 
@@ -374,19 +409,81 @@ def apply_confidence_downgrade(candidates: list[RankedCause]) -> bool:
     return True
 
 
-def abstain(response: AlertAnalysisResponse, candidates: list[RankedCause], verdict: HarnessVerdict) -> None:
-    """Return an honest unresolved RCA when a hard gate cannot be repaired."""
-    candidates[:] = [RankedCause("insufficient_evidence", "low", 0.0)]
+def abstain(
+    response: AlertAnalysisResponse,
+    candidates: list[RankedCause],
+    verdict: HarnessVerdict,
+    *,
+    historical_reanalysis: bool = False,
+) -> None:
+    """Return an unresolved RCA without discarding a useful working hypothesis.
+
+    A hard-gate failure means that a family cannot be presented as confirmed.
+    It does not mean that all inference is worthless, especially when a past
+    incident no longer has complete telemetry.  Preserve the previous leader
+    as an explicitly low-confidence hypothesis behind ``insufficient_evidence``
+    so operators and Top-N evaluation can still inspect it without mistaking it
+    for verified evidence or remediation authority.
+    """
+    previous_top = next(
+        (candidate for candidate in candidates if candidate.family != "insufficient_evidence"),
+        None,
+    )
+    provisional: RankedCause | None = None
+    if previous_top is not None:
+        claim = verdict.claims[0] if verdict.claims else {}
+        provisional = replace(
+            previous_top,
+            confidence="low",
+            support_evidence_ids=list(claim.get("supporting_evidence") or []),
+            contradiction_evidence_ids=list(claim.get("contradicting_evidence") or []),
+        )
+
+    candidates[:] = [
+        RankedCause("insufficient_evidence", "low", 0.0),
+        *([provisional] if provisional is not None else []),
+    ]
     response.root_cause_family = "insufficient_evidence"
     response.analysis_quality = "degraded"
-    response.analysis_summary = "Root cause is not confirmed by the collected evidence."
+    if provisional is not None:
+        response.context["provisional_root_cause"] = provisional.as_dict()
+        response.analysis_summary = (
+            f"Root cause is unconfirmed; {provisional.family} remains a low-confidence "
+            "working hypothesis."
+        )
+        historical_note = (
+            "Because this is a historical re-analysis, incomplete telemetry is expected. "
+            if historical_reanalysis
+            else ""
+        )
+        hypothesis_note = (
+            f"{historical_note}The leading family `{provisional.family}` is retained as a "
+            "low-confidence inference from the remaining signals. It is not a verified cause "
+            "or justification for cause-specific remediation."
+        )
+        verification_check = (
+            "- Verify the leading hypothesis with a read-only query before any disruptive action.\n"
+        )
+    else:
+        response.context.pop("provisional_root_cause", None)
+        response.analysis_summary = "Root cause is not confirmed by the collected evidence."
+        hypothesis_note = (
+            "The available signals do not support even a specific working hypothesis yet."
+        )
+        verification_check = (
+            "- Collect at least one target- and incident-window-scoped signal "
+            "before selecting a family.\n"
+        )
     response.analysis_detail = (
         "## Assessment\n\n"
-        "The collected evidence does not support a safe, high-confidence root-cause conclusion. "
-        "The agent is withholding a root-cause family rather than guessing.\n\n"
+        "The collected evidence does not support confirming a root-cause family. "
+        + hypothesis_note
+        + "\n\n"
         "## Required Next Checks\n\n"
-        "- Re-run the unavailable or empty evidence source for the affected workload and incident window.\n"
-        "- Verify the leading hypothesis with a read-only query before any disruptive action.\n\n"
+        "- Re-run the unavailable or empty evidence source for the affected workload "
+        "and incident window.\n"
+        + verification_check
+        + "\n"
         "## Harness Findings\n\n"
         + "\n".join(f"- {name}" for name in verdict.failed_gates)
     )

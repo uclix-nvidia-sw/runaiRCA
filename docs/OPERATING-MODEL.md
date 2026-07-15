@@ -5,6 +5,24 @@
 
 Run:AI RCA is read-only by default.
 
+**A simple mental model:** the service is a case desk. It receives a signal,
+opens a case, asks read-only questions, lets an operator review the answer, and
+only then lets that reviewed case inform future investigations.
+
+```mermaid
+flowchart LR
+  A[Alert webhook] --> I[Incident intake]
+  I --> R[Analysis and evidence]
+  R --> O[Operator review]
+  O -->|feedback or re-analyze| R
+  O -->|approve| K[Approved learning/history]
+  K -. context for later cases .-> R
+```
+
+This is a workflow, not autonomous remediation. Feedback can ask for a fresh
+analysis. Approval is a separate human decision that controls learning; it never
+changes a cluster resource.
+
 ## Supported Signals
 
 - Alertmanager webhooks
@@ -71,6 +89,15 @@ chat-specific LLM readiness signal.
 Each evidence agent can additionally run its own bounded, read-only drill-down
 loop (`ENABLE_AGENT_DRILLDOWN`) scoped to its own domain's tools. The
 orchestration flow that ties these together is the [RCA Pipeline](RCA-PIPELINE.md).
+
+For timestamped alerts, collectors retain a collection window from five minutes
+before firing through five minutes after resolution (a firing alert is bounded
+to 15 minutes). A post-resolution epilogue remains visible as recovery context,
+but occurrence evidence in Postgres, Change, and System is promoted only inside
+the causal window ending at resolution. Change history starts one hour before
+the fired time; its drill-down `lookback_seconds` may widen that historical
+range from 60 to 86,400 seconds. Successful change results are cached for about
+120 seconds only within one analysis, so a later re-analysis recollects fresh.
 - Analysis Agent produces the KubeRCA-style dashboard RCA: root cause,
   confidence, impact, missing data, recommended manual actions, prevention, and
   evidence coverage.

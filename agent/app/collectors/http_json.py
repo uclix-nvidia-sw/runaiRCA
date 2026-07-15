@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.masking import build_masker
@@ -16,6 +16,20 @@ class JsonResponse:
     @property
     def ok(self) -> bool:
         return self.error is None and 200 <= self.status_code < 300
+
+
+@dataclass(frozen=True)
+class OAuthTokenResponse:
+    """OAuth response that never exposes its bearer in repr/log payloads."""
+
+    url: str
+    status_code: int
+    token: str = field(default="", repr=False)
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.token) and self.error is None and 200 <= self.status_code < 300
 
 
 async def get_json(
@@ -39,7 +53,7 @@ async def get_json(
     url = _join_url(base_url, path)
     try:
         async with httpx.AsyncClient(
-            timeout=_client_timeout(timeout_seconds), verify=verify
+            timeout=_client_timeout(timeout_seconds), verify=verify, follow_redirects=True
         ) as client:
             response = await client.get(url, params=params, headers=headers)
     except Exception as exc:  # noqa: BLE001 - collectors report diagnostics, not failures.
@@ -81,7 +95,7 @@ async def post_form_json(
 
     try:
         async with httpx.AsyncClient(
-            timeout=_client_timeout(timeout_seconds), verify=verify
+            timeout=_client_timeout(timeout_seconds), verify=verify, follow_redirects=True
         ) as client:
             response = await client.post(url, data=data, headers=headers)
     except Exception as exc:  # noqa: BLE001 - collectors report diagnostics, not failures.
@@ -123,7 +137,7 @@ async def post_json(
 
     try:
         async with httpx.AsyncClient(
-            timeout=_client_timeout(timeout_seconds), verify=verify
+            timeout=_client_timeout(timeout_seconds), verify=verify, follow_redirects=True
         ) as client:
             response = await client.post(url, json=json_body, headers=headers)
     except Exception as exc:  # noqa: BLE001 - collectors report diagnostics, not failures.
@@ -142,6 +156,72 @@ async def post_json(
         url=_safe_text(str(response.url), limit=2000),
         status_code=response.status_code,
         data=payload,
+        error=error,
+    )
+
+
+async def post_oauth_token(
+    *,
+    url: str,
+    timeout_seconds: int,
+    json_body: dict[str, Any] | None = None,
+    form_data: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    verify: bool | str = True,
+) -> OAuthTokenResponse:
+    """Exchange credentials and return only the raw bearer token.
+
+    Normal collector responses are redacted before they leave this module. An
+    OAuth token cannot go through that path because redaction intentionally
+    turns it into ``[MASKED]``. This narrow helper extracts the token in memory,
+    discards the rest of the raw response, and marks the token field
+    ``repr=False`` so diagnostics cannot accidentally print it.
+    """
+    if (json_body is None) == (form_data is None):
+        return OAuthTokenResponse(
+            url=_safe_text(url, limit=2000),
+            status_code=0,
+            error="exactly one OAuth request body must be provided",
+        )
+    try:
+        import httpx
+    except ImportError:
+        return OAuthTokenResponse(
+            url=_safe_text(url, limit=2000),
+            status_code=0,
+            error="python.httpx is not installed",
+        )
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=_client_timeout(timeout_seconds), verify=verify, follow_redirects=True
+        ) as client:
+            if json_body is not None:
+                response = await client.post(url, json=json_body, headers=headers)
+            else:
+                response = await client.post(url, data=form_data, headers=headers)
+    except Exception as exc:  # noqa: BLE001 - auth failure is returned to caller.
+        return OAuthTokenResponse(
+            url=_safe_text(url, limit=2000),
+            status_code=0,
+            error=_safe_text(f"{exc.__class__.__name__}: {exc}", limit=1000),
+        )
+
+    token = ""
+    if response.status_code < 400:
+        try:
+            token = _oauth_token_from_payload(response.json())
+        except (TypeError, ValueError):
+            token = ""
+    error = None
+    if response.status_code >= 400:
+        error = f"HTTP {response.status_code}"
+    elif not token:
+        error = "missing access token"
+    return OAuthTokenResponse(
+        url=_safe_text(str(response.url), limit=2000),
+        status_code=response.status_code,
+        token=token,
         error=error,
     )
 
@@ -175,6 +255,16 @@ def _response_data(response: Any) -> Any:
         return build_masker(()).mask_object(response.json())
     except ValueError:
         return {"body": _safe_text(response.text, limit=1000)}
+
+
+def _oauth_token_from_payload(data: object) -> str:
+    if not isinstance(data, dict):
+        return ""
+    for key in ("accessToken", "access_token", "token", "id_token"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
 def _safe_text(value: str, *, limit: int) -> str:

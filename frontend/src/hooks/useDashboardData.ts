@@ -10,7 +10,14 @@ import {
   type IncidentView,
 } from '../api';
 import { AlertRecord, AnalysisProgressEntry, AnalysisRun, Incident, PageInfo } from '../types';
-import { appendProgress, parseRealtimeEvent, RealtimeEventPayload } from '../utils/realtime';
+import {
+  appendProgress,
+  clearProgress,
+  parseRealtimeEvent,
+  RealtimeEventPayload,
+  resetProgress,
+  updateCompletedProgressRuns,
+} from '../utils/realtime';
 import { emptyPage, pageRequest } from '../utils/pagination';
 
 export type DashboardPageIndexes = {
@@ -36,8 +43,10 @@ export function useDashboardData(
   const [error, setError] = useState('');
   const [realtimePayload, setRealtimePayload] = useState<RealtimeEventPayload>();
   const realtimeRefreshTimerRef = useRef<number | null>(null);
+  const completedProgressRunsRef = useRef(new Set<string>());
 
   const load = useCallback(async (options: { silent?: boolean } = {}) => {
+    let analysisLoaded = false;
     if (!options.silent) {
       setLoading(true);
     }
@@ -55,6 +64,7 @@ export function useDashboardData(
         const nextAnalysisRuns = await fetchAnalysisRuns(pageRequest(pageIndexes.analysis));
         setAnalysisRuns(nextAnalysisRuns.items);
         setAnalysisPage(nextAnalysisRuns.page);
+        analysisLoaded = true;
       } catch (err) {
         setAnalysisRuns([]);
         setAnalysisPage(emptyPage(pageIndexes.analysis));
@@ -75,6 +85,7 @@ export function useDashboardData(
         setLoading(false);
       }
     }
+    return analysisLoaded;
   }, [alertFilters, incidentFilters, incidentView, pageIndexes.alerts, pageIndexes.analysis, pageIndexes.incidents]);
 
   useEffect(() => {
@@ -96,20 +107,37 @@ export function useDashboardData(
       if (realtimeRefreshTimerRef.current !== null) {
         window.clearTimeout(realtimeRefreshTimerRef.current);
       }
-      realtimeRefreshTimerRef.current = window.setTimeout(() => {
+      realtimeRefreshTimerRef.current = window.setTimeout(async () => {
         realtimeRefreshTimerRef.current = null;
-        void load({ silent: true });
+        const analysisLoaded = await load({ silent: true });
+        if (!analysisLoaded) return;
+        const completedRunIDs = [...completedProgressRunsRef.current];
+        if (completedRunIDs.length > 0) {
+          setProgressByRun((current) => clearProgress(current, completedRunIDs));
+          completedProgressRunsRef.current.clear();
+        }
       }, 750);
     };
     const handleProgressEvent = (event: Event) => {
       const payload = parseRealtimeEvent(event);
       setProgressByRun((current) => appendProgress(current, payload));
     };
+    const handleStartedEvent = (event: Event) => {
+      const payload = parseRealtimeEvent(event);
+      completedProgressRunsRef.current = updateCompletedProgressRuns(completedProgressRunsRef.current, payload);
+      setProgressByRun((current) => resetProgress(current, payload));
+      handleRealtimeEvent(event);
+    };
+    const handleCompletedEvent = (event: Event) => {
+      const payload = parseRealtimeEvent(event);
+      completedProgressRunsRef.current = updateCompletedProgressRuns(completedProgressRunsRef.current, payload);
+      handleRealtimeEvent(event);
+    };
     source.onmessage = handleRealtimeEvent;
     source.addEventListener('alert.created', handleRealtimeEvent);
-    source.addEventListener('analysis.started', handleRealtimeEvent);
+    source.addEventListener('analysis.started', handleStartedEvent);
     source.addEventListener('analysis.progress', handleProgressEvent);
-    source.addEventListener('analysis.completed', handleRealtimeEvent);
+    source.addEventListener('analysis.completed', handleCompletedEvent);
     source.addEventListener('incident.resolved', handleRealtimeEvent);
     source.addEventListener('incident.updated', handleRealtimeEvent);
     source.addEventListener('feedback.updated', handleRealtimeEvent);

@@ -5,6 +5,7 @@ from app.schemas import AlertAnalysisResponse
 from app.services.harness import (
     EvidenceLink,
     _trace_item,
+    abstain,
     analysis_hash,
     apply_safety_guardrail,
     apply_trace,
@@ -87,20 +88,20 @@ def test_trace_repair_uses_response_local_evidence_ids() -> None:
 
 
 def test_trace_exposes_structured_evidence_verdicts() -> None:
-    results = [_result("prometheus", "restart counter did not change")]
+    results = [_result("kubernetes", "CrashLoopBackOff restart counter increased")]
     results[0].artifacts[0].result = {
         "observation": _scoped_observation()
     }
     assign_evidence_ids(results)
     response = _response()
-    cause = RankedCause("workload_startup_error", "medium", 5, evidence_agents=["prometheus"])
+    cause = RankedCause("workload_startup_error", "medium", 5, evidence_agents=["kubernetes"])
 
     verdict = evaluate(response, results, [cause])
     assert verdict.trace == [
         {
             "evidence_id": "E01",
-            "source": "prometheus",
-            "summary": "restart counter did not change",
+            "source": "kubernetes",
+            "summary": "CrashLoopBackOff restart counter increased",
             "polarity": "present",
             "coverage": "scoped",
         }
@@ -108,6 +109,64 @@ def test_trace_exposes_structured_evidence_verdicts() -> None:
 
     assert apply_trace(response, verdict) is True
     assert "observed · scoped" in response.analysis_detail
+
+
+def test_unrelated_oom_predicate_cannot_ground_scheduling_family() -> None:
+    result = _result("kubernetes", "OOMKilled in the workload container")
+    result.artifacts[0].type = "kubernetes_pod_log"
+    result.artifacts[0].result = {
+        "sample_entries": [{"line": "container was OOMKilled"}],
+        "observation": {
+            **_scoped_observation(),
+            "predicate": "kubernetes_pod_log:main",
+        },
+    }
+    assign_evidence_ids([result])
+
+    verdict = evaluate(
+        _response("## Root Cause\n\nScheduling failed [E01]."),
+        [result],
+        [
+            RankedCause(
+                "k8s_scheduling_error",
+                "medium",
+                5,
+                evidence_agents=["kubernetes"],
+            )
+        ],
+    )
+
+    assert verdict.claims[0]["supporting_evidence"] == []
+    assert verdict.gates["missing_evidence_trace"] is True
+
+
+def test_explicit_unrelated_support_link_is_rejected() -> None:
+    result = _result("kubernetes", "OOMKilled in the workload container")
+    result.artifacts[0].type = "kubernetes_pod_log"
+    result.artifacts[0].result = {
+        "sample_entries": [{"line": "container was OOMKilled"}],
+        "observation": {
+            **_scoped_observation(),
+            "predicate": "kubernetes_pod_log:main",
+        },
+    }
+    assign_evidence_ids([result])
+
+    verdict = evaluate(
+        _response("## Root Cause\n\nScheduling failed [E01]."),
+        [result],
+        [
+            RankedCause(
+                "k8s_scheduling_error",
+                "medium",
+                5,
+                support_evidence_ids=["E01"],
+            )
+        ],
+    )
+
+    assert verdict.claims[0]["supporting_evidence"] == []
+    assert verdict.gates["invalid_evidence_links"] is True
 
 
 def test_trace_does_not_promote_loose_result_fields_to_scoped_evidence() -> None:
@@ -135,7 +194,14 @@ def test_legacy_agent_fallback_excludes_partial_evidence_from_support() -> None:
     verdict = evaluate(
         _response("## Root Cause\n\nOOMKilled was observed [E01]."),
         results,
-        [RankedCause("workload_runtime_error", "medium", 5, evidence_agents=["loki", "prometheus"])],
+        [
+            RankedCause(
+                "workload_startup_error",
+                "medium",
+                5,
+                evidence_agents=["loki", "prometheus"],
+            )
+        ],
     )
 
     assert verdict.claims[0]["supporting_evidence"] == ["E01"]
@@ -217,12 +283,15 @@ def test_safety_guardrail_covers_a_long_report() -> None:
 
 
 def test_typed_evidence_links_preserve_contradicting_evidence() -> None:
-    results = [_result("loki"), _result("system", "GPU remains healthy")]
+    results = [_result("loki"), _result("system", "NVIDIA XID errors were absent")]
     results[0].artifacts[0].result = {
         "observation": _scoped_observation()
     }
     results[1].artifacts[0].result = {
-        "observation": _scoped_observation("absent")
+        "observation": {
+            **_scoped_observation("absent"),
+            "predicate": "node_log:nvidia_xid_errors",
+        }
     }
     assign_evidence_ids(results)
     response = _response("## Root Cause\n\nLikely Xid [E01] despite the counter-signal [E02].")
@@ -242,6 +311,34 @@ def test_typed_evidence_links_preserve_contradicting_evidence() -> None:
     assert verdict.gates["unresolved_contradiction"] is True
     assert "tool_efficiency" not in verdict.dimensions
     assert verdict.score <= 100
+
+
+def test_unrelated_positive_fact_cannot_be_linked_as_contradiction() -> None:
+    result = _result("kubernetes", "OOMKilled in the workload container")
+    result.artifacts[0].result = {
+        "sample_entries": [{"line": "container was OOMKilled"}],
+        "observation": {
+            **_scoped_observation("present"),
+            "predicate": "kubernetes_pod_log:main",
+        },
+    }
+    assign_evidence_ids([result])
+
+    verdict = evaluate(
+        _response("## Root Cause\n\nScheduling failed despite OOMKilled [E01]."),
+        [result],
+        [RankedCause("k8s_scheduling_error", "medium", 5)],
+        evidence_links=[
+            {
+                "evidence_id": "E01",
+                "role": "contradict",
+                "explanation": "an unrelated failure was observed",
+            }
+        ],
+    )
+
+    assert verdict.claims[0]["contradicting_evidence"] == []
+    assert verdict.gates["invalid_evidence_links"] is True
 
 
 def test_invalid_typed_evidence_link_is_a_hard_gate_not_an_exception() -> None:
@@ -334,3 +431,44 @@ def test_analysis_hash_changes_when_the_approved_reasoning_changes() -> None:
     response.context["reasoning_trace_v2"] = {"hypothesis_id": "H-2", "support": ["E02"]}
 
     assert analysis_hash(response) != first
+
+
+def test_abstain_preserves_leading_family_as_a_low_confidence_hypothesis() -> None:
+    response = _response()
+    candidates = [
+        RankedCause(
+            "gpu_hardware_error",
+            "medium",
+            5,
+            evidence_agents=["loki"],
+            support_evidence_ids=["made-up-id"],
+        )
+    ]
+    verdict = evaluate(response, [], candidates)
+
+    abstain(response, candidates, verdict, historical_reanalysis=True)
+
+    assert response.root_cause_family == "insufficient_evidence"
+    assert [candidate.family for candidate in candidates] == [
+        "insufficient_evidence",
+        "gpu_hardware_error",
+    ]
+    assert candidates[1].confidence == "low"
+    assert candidates[1].support_evidence_ids == []
+    assert response.context["provisional_root_cause"]["family"] == "gpu_hardware_error"
+    assert "historical re-analysis" in response.analysis_detail
+    assert "low-confidence inference" in response.analysis_detail
+    assert "rather than guessing" not in response.analysis_detail
+
+
+def test_abstain_without_a_candidate_does_not_invent_a_family() -> None:
+    response = _response()
+    candidates = [RankedCause("insufficient_evidence", "low", 0.0)]
+    verdict = evaluate(response, [], candidates)
+
+    abstain(response, candidates, verdict, historical_reanalysis=True)
+
+    assert [candidate.family for candidate in candidates] == ["insufficient_evidence"]
+    assert "provisional_root_cause" not in response.context
+    assert "do not support even a specific working hypothesis" in response.analysis_detail
+    assert "before selecting a family" in response.analysis_detail

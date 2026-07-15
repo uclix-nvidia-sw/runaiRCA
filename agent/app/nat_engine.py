@@ -239,6 +239,9 @@ class NatEngine:
                     subscription.unsubscribe()
         finally:
             _settings_var.reset(settings_token)
+        flush = getattr(reporter, "flush", None)
+        if callable(flush):
+            await flush()
         if isinstance(result, AlertAnalysisResponse):
             response = result
         else:

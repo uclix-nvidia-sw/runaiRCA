@@ -15,7 +15,7 @@ from app.collectors.kubernetes import KubernetesCollector
 from app.collectors.loki import LokiCollector
 from app.collectors.postgres import PostgresCollector
 from app.collectors.prometheus import PrometheusCollector
-from app.mcp_client import mcp_call, mcp_tool_json
+from app.mcp_client import mcp_call, mcp_call_many, mcp_reachability, mcp_tool_json
 from tests.test_orchestrator import make_settings, make_target
 
 
@@ -29,6 +29,14 @@ def _free_port() -> int:
         pytest.skip(f"local port bind is not permitted in this sandbox: {exc}")
     finally:
         sock.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_budget_is_shared_across_sequential_calls() -> None:
+    async with mcp_client.mcp_budget(0.04):
+        await mcp_client._within_mcp_budget(lambda: asyncio.sleep(0.025))
+        with pytest.raises(TimeoutError, match="before direct fallback"):
+            await mcp_client._within_mcp_budget(lambda: asyncio.sleep(0.025))
 
 
 @contextlib.asynccontextmanager
@@ -102,7 +110,7 @@ def _fake_datasource_mcp() -> FastMCP:
         }
 
     @mcp.tool()
-    def pods_log(namespace: str, name: str = "", pod: str = "", tailLines: int = 50) -> str:
+    def pods_log(namespace: str, name: str = "", tail: int = 50) -> str:
         return "2026-07-07T00:00:00Z fake log line"
 
     @mcp.tool()
@@ -114,7 +122,7 @@ def _fake_datasource_mcp() -> FastMCP:
         return {"items": []}
 
     @mcp.tool()
-    def events_list(namespace: str = "", fieldSelector: str = "") -> dict:
+    def events_list(namespace: str = "") -> dict:
         return {"items": []}
 
     @mcp.tool()
@@ -247,8 +255,103 @@ def test_mcp_client_factory_defaults_insecure_and_hardens_via_env(monkeypatch) -
 async def test_mcp_client_connects_to_real_streamable_http_server() -> None:
     async with _serve_mcp(_fake_datasource_mcp()) as url:
         result = await mcp_call(url, "echo", {"value": "ok"})
+        batch = await mcp_call_many(
+            url,
+            [("echo", {"value": "one"}), ("echo", {"value": "two"})],
+        )
+        report = await mcp_reachability({"fake": url}, timeout_seconds=2)
 
     assert mcp_tool_json(result) == {"value": "ok"}
+    assert [mcp_tool_json(item) for item in batch] == [
+        {"value": "one"},
+        {"value": "two"},
+    ]
+    assert report == {"fake": "ok (11 tools)"}
+
+
+@pytest.mark.asyncio
+async def test_mcp_reachability_checks_services_concurrently_with_deadlines(
+    monkeypatch,
+) -> None:
+    import mcp
+    from mcp.client import streamable_http
+
+    started: set[str] = set()
+
+    @contextlib.asynccontextmanager
+    async def fake_stream(url, **_kwargs):
+        yield url, object(), None
+
+    class FakeSession:
+        def __init__(self, read, _write) -> None:
+            self.url = read
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def initialize(self) -> None:
+            started.add(self.url)
+            if self.url == "slow":
+                await asyncio.sleep(1)
+
+        async def list_tools(self):
+            return type("Tools", (), {"tools": [object()]})()
+
+    monkeypatch.setattr(streamable_http, "streamablehttp_client", fake_stream)
+    monkeypatch.setattr(mcp, "ClientSession", FakeSession)
+
+    report = await mcp_reachability(
+        {"slow": "slow", "fast": "fast"}, timeout_seconds=0.02
+    )
+
+    assert started == {"slow", "fast"}
+    assert report["fast"] == "ok (1 tools)"
+    assert report["slow"].startswith("unreachable: TimeoutError")
+
+
+@pytest.mark.asyncio
+async def test_startup_mcp_self_check_retries_without_gating_readiness(
+    monkeypatch,
+) -> None:
+    from app import main
+    from app.collectors import runai as runai_mod
+
+    calls: list[dict[str, dict[str, str]]] = []
+
+    async def fake_headers(_settings):
+        return {"Authorization": "Bearer token"}, []
+
+    async def fake_reachability(_urls, *, headers_by_name, timeout_seconds=10.0):
+        calls.append(headers_by_name)
+        if len(calls) == 1:
+            return {"runai": "unreachable: ConnectError"}
+        return {"runai": "ok (16 tools)"}
+
+    monkeypatch.setattr(runai_mod, "_runai_headers", fake_headers)
+    monkeypatch.setattr(mcp_client, "mcp_reachability", fake_reachability)
+    monkeypatch.setattr(main, "_MCP_SELF_CHECK_RETRY_DELAYS", (0.0, 0.0))
+    monkeypatch.setattr(
+        main,
+        "settings",
+        replace(
+            main.settings,
+            runai_mcp_url="http://runai-mcp:8080/mcp",
+            kubernetes_mcp_url="",
+            prometheus_mcp_url="",
+            loki_mcp_url="",
+            postgres_mcp_url="",
+        ),
+    )
+
+    await main._log_mcp_reachability()
+
+    assert len(calls) == 2
+    assert all(
+        call["runai"]["Authorization"] == "Bearer token" for call in calls
+    )
 
 
 @pytest.mark.asyncio

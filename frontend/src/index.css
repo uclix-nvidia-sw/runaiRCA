@@ -3461,11 +3461,27 @@ code .evidence-mark {
 }
 
 .similar-item {
+  display: block;
   border: 1px solid var(--line);
   border-left: 4px solid #3b82f6;
   border-radius: 0.5rem;
   padding: 0.65rem;
   background: #f8fafc;
+  color: inherit;
+  cursor: pointer;
+  text-decoration: none;
+  transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+}
+
+.similar-item:hover {
+  border-color: #93c5fd;
+  box-shadow: 0 5px 14px rgb(15 23 42 / 9%);
+  transform: translateY(-1px);
+}
+
+.similar-item:focus-visible {
+  outline: 3px solid rgb(37 99 235 / 25%);
+  outline-offset: 2px;
 }
 
 .similar-head {

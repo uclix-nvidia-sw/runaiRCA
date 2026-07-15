@@ -372,6 +372,112 @@ def test_kubernetes_positive_event_reason_and_log_line_remain_rankable() -> None
     assert "oomkilled" in text
 
 
+def test_exact_podgroup_gpu_shortage_routes_to_runai_scheduling() -> None:
+    warning_event = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_warning_events",
+        status="ok",
+        confidence="high",
+        summary="One exact target Warning Event was observed in the incident window.",
+        result={
+            "observation": {
+                "predicate": "kubernetes_warning_events",
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {
+                    "kind": "pod",
+                    "name": "analysistest-01-0-0",
+                    "namespace": "runai-test-pro3",
+                },
+            },
+            "events": [
+                {
+                    "type": "Warning",
+                    "reason": "Unschedulable",
+                    "kind": "PodGroup",
+                    "target_identity_verified": True,
+                    "message": (
+                        "Node dgx02 didn't have enough resources: GPUs, "
+                        "requested: 1, used: 8, capacity: 8"
+                    ),
+                }
+            ],
+        },
+    )
+    target = _target(
+        namespace="runai-test-pro3",
+        workload_name="analysistest-01",
+        workload_type="",
+        pod="analysistest-01-0-0",
+        node="",
+        alert_name="RunAIWorkloadPending",
+    )
+
+    ranked = rank_root_cause_candidates(
+        target, [_r("kubernetes", artifacts=[warning_event])]
+    )
+
+    assert ranked[0].family == "runai_scheduling_quota"
+    assert ranked[0].score >= 2.0
+    assert any(candidate.family == "k8s_scheduling_error" for candidate in ranked)
+
+
+def test_verified_runai_capacity_gap_maps_to_runai_scheduling_quota() -> None:
+    gap = artifact(
+        agent="prometheus",
+        source="prometheus",
+        type="promql_signal",
+        status="ok",
+        confidence="high",
+        summary="Prometheus capacity comparison was positive in the incident window.",
+        result={
+            "observation": {
+                "predicate": "metric:runai_queue_capacity_gap",
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "queue", "name": "research-default"},
+            },
+            "value_summary": {"min": 4.0, "max": 4.0},
+        },
+    )
+    gap.evidence_id = "E01"
+
+    ranked = rank_root_cause_candidates(
+        _target(node=""),
+        [_r("prometheus", artifacts=[gap])],
+        eligible_evidence_ids={"E01"},
+    )
+
+    assert ranked[0].family == "runai_scheduling_quota"
+    assert ranked[0].score >= 2.0
+
+
+def test_unverified_runai_capacity_gap_does_not_map_to_a_family() -> None:
+    gap = artifact(
+        agent="prometheus",
+        source="prometheus",
+        type="promql_signal",
+        status="ok",
+        confidence="low",
+        summary="Prometheus capacity comparison was inconclusive.",
+        result={
+            "observation": {
+                "predicate": "metric:runai_queue_capacity_gap",
+                "polarity": "unknown",
+                "coverage": "partial",
+            },
+            "value_summary": {"min": 0.0, "max": 0.0},
+        },
+    )
+
+    ranked = rank_root_cause_candidates(
+        _target(node=""), [_r("prometheus", artifacts=[gap])]
+    )
+
+    assert ranked[0].family == "insufficient_evidence"
+
+
 def test_context_ineligible_typed_artifact_cannot_reenter_catalog_ranking() -> None:
     """A scoped query result can still be outside this alert's causal window.
 

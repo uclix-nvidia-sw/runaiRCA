@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import re
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -11,13 +14,23 @@ from app.collectors.base import (
     artifact,
     incident_time_range,
     ko_en,
+    parse_incident_time,
 )
-from app.collectors.http_json import compact, get_json, post_form_json, post_json
+from app.collectors.http_json import compact, get_json, post_oauth_token
 from app.collectors.loki import _llm_insight
-from app.collectors.runai_mcp import gather_runai_via_mcp
+from app.collectors.runai_mcp import (
+    gather_runai_via_mcp,
+    valid_official_workload_id,
+)
 from app.config import Settings
 
 _VERSION_RE = re.compile(r"\d+\.\d+(?:\.\d+)?")
+_RUNAI_TOKEN_CACHE_TTL_SECONDS = 30.0
+_RUNAI_TOKEN_CACHE: dict[tuple[str, str, str, str], tuple[str, float]] = {}
+_RUNAI_TOKEN_INFLIGHT: dict[
+    tuple[int, tuple[str, str, str, str]],
+    asyncio.Task[tuple[str, tuple[str, ...]]],
+] = {}
 
 
 def _version_from_results(query_results: list[dict[str, Any]]) -> str:
@@ -78,6 +91,7 @@ class RunAICollector:
 
     async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:
         missing: list[str] = []
+        configuration_warnings: list[str] = []
         if not target.project:
             missing.append("runai.project")
         if not target.queue:
@@ -86,19 +100,30 @@ class RunAICollector:
             missing.append("runai.workload")
 
         if not self._settings.runai_base_url:
+            if target.queue:
+                missing.append("runai.queue_scope")
+                configuration_warnings.append(
+                    "Run:ai queue scope was not collected because the direct API is not configured."
+                )
             summary = (
                 f"{NO_EVIDENCE} Run:ai API is not configured. Using alert labels and "
                 "annotations as scheduling context."
             )
-            status = "partial" if len(missing) < 3 else "unavailable"
+            identity_missing = [item for item in missing if item != "runai.queue_scope"]
+            status = "partial" if len(identity_missing) < 3 else "unavailable"
             confidence = "low"
         else:
             headers, auth_warnings = await _runai_headers(self._settings)
-            if not headers.get("Authorization") and not self._settings.runai_mcp_url:
+            if not headers.get("Authorization"):
                 if "runai.auth" not in missing:
                     missing.append("runai.auth")
                 if "runai.query" not in missing:
                     missing.append("runai.query")
+                if target.queue:
+                    missing.append("runai.queue_scope")
+                    auth_warnings.append(
+                        "Run:ai queue scope was not collected because Authorization is unavailable."
+                    )
                 summary = (
                     f"{NO_EVIDENCE} Run:ai API authentication is unavailable; direct "
                     "queries were skipped."
@@ -137,30 +162,98 @@ class RunAICollector:
                         )
                     ],
                 )
-            # Prefer the runai-mcp server when configured (richer, spec-aware,
-            # auto-authed by the managed service); fall back to direct HTTP on any MCP issue.
-            query_results = await gather_runai_via_mcp(self._settings, target)
+            # Prefer NVIDIA's official Run:ai MCP when configured. Its protected
+            # HTTP endpoint verifies the same Run:ai bearer token used by direct
+            # API reads; fall back to direct HTTP on any MCP issue.
+            mcp_target_supported = not (
+                target.workload_name or target.runai_workload_id
+            ) or valid_official_workload_id(target.runai_workload_id)
+            if self._settings.runai_mcp_url and not mcp_target_supported:
+                auth_warnings.append(
+                    "Official Run:ai MCP workload tools require an immutable UUID; "
+                    "used direct API fallback for this alert identity."
+                )
+                query_results = None
+            else:
+                query_results = await gather_runai_via_mcp(
+                    self._settings, target, headers=headers
+                )
             if query_results is not None:
                 query_results = _validated_runai_query_results(query_results)
-            # A streamable MCP call can technically succeed while its tool body
-            # is a gateway error page or an otherwise unparseable text payload.
-            # That is not usable Run:ai evidence and must not turn into a
-            # reassuring "queries completed" headline. Fall back to the
-            # authenticated direct API only when *none* of the MCP responses
-            # yielded a structured payload.
-            used_mcp = bool(
-                query_results and any(not item.get("error") for item in query_results)
+            # Keep usable MCP responses when another tool fails.  A partial
+            # snapshot is still evidence; direct reads only fill failed MCP
+            # workload/project-resource equivalents.
+            used_mcp = bool(query_results) and any(
+                not item.get("error") for item in query_results
             )
-            if not used_mcp:
-                if query_results:
-                    auth_warnings.append(
-                        "Run:ai MCP returned no usable structured response; used direct API fallback."
-                    )
+            direct_results: list[dict[str, object]] | None = None
+            if query_results is None:
                 query_results = _validated_runai_query_results(
                     await _collect_runai_responses(self._settings, target, headers)
                 )
+                direct_results = query_results
+                used_mcp = False
+            elif any(item.get("error") or item.get("explicitly_empty") for item in query_results):
+                failed_names = {
+                    str(item.get("name") or "")
+                    for item in query_results
+                    if item.get("error") or item.get("explicitly_empty")
+                }
+                for item in query_results:
+                    if item.get("error"):
+                        auth_warnings.append(
+                            "Run:ai MCP "
+                            f"{item.get('name') or 'tool'} failed: {str(item['error'])[:300]}"
+                        )
+                direct_results = _validated_runai_query_results(
+                    await _collect_runai_responses(self._settings, target, headers)
+                )
+                if not used_mcp:
+                    auth_warnings.append(
+                        "Run:ai MCP returned an incomplete or unusable response; used "
+                        "direct API fallback."
+                    )
+                    query_results = direct_results
+                else:
+                    equivalents = {
+                        "workloads": {"workloads", "workload_status"},
+                        "workload_by_id": {"workloads", "workload_status"},
+                        "project": {"project_resources"},
+                        "queue": {"queue"},
+                    }
+                    replaced_names: set[str] = set()
+                    for direct_item in direct_results:
+                        direct_name = str(direct_item.get("name") or "")
+                        if equivalents.get(direct_name, set()) & failed_names:
+                            query_results.append(direct_item)
+                            if not direct_item.get("error"):
+                                replaced_names.update(equivalents.get(direct_name, set()) & failed_names)
+                    if replaced_names:
+                        query_results = [
+                            item for item in query_results
+                            if not (item.get("error") and str(item.get("name") or "") in replaced_names)
+                        ]
+            if used_mcp and target.queue:
+                try:
+                    queue_item = _validated_runai_query_results(
+                        [await _collect_runai_queue_response(self._settings, target, headers)]
+                    )[0]
+                except Exception as exc:  # noqa: BLE001 - expose the missing plane
+                    queue_item = None
+                    auth_warnings.append(
+                        f"Run:ai queue scope direct lookup failed: {exc.__class__.__name__}."
+                    )
+                if queue_item is not None and not queue_item.get("error"):
+                    query_results.append(queue_item)
+                else:
+                    missing.append("runai.queue_scope")
+                    auth_warnings.append(
+                        "Run:ai queue scope was not collected because the direct lookup did not return queue state."
+                    )
             if used_mcp:
-                auth_warnings.append("Run:ai queries gathered via the runai-mcp server.")
+                auth_warnings.append(
+                    "Run:ai queries gathered via the official NVIDIA Run:ai MCP server."
+                )
             auth_failed = any(item.get("status_code") == 401 for item in query_results)
             if auth_failed and not used_mcp and _can_refresh_runai_token(self._settings):
                 retry_headers, retry_warnings = await _runai_headers(
@@ -178,28 +271,47 @@ class RunAICollector:
                     )
                     auth_failed = any(item.get("status_code") == 401 for item in query_results)
             successful = [item for item in query_results if not item.get("error")]
-            if successful and not missing:
-                summary = ko_en(
-                    self._settings,
-                    "Run:ai API에서 워크로드/프로젝트/큐 컨텍스트 조회를 완료했습니다.",
-                    "Run:ai API direct queries completed for workload, project, "
-                    "and queue context.",
-                )
+            failed = [item for item in query_results if item.get("error")]
+            if failed and "runai.query" not in missing:
+                missing.append("runai.query")
+            if auth_failed and "runai.auth" not in missing:
+                missing.append("runai.auth")
+            if successful and not failed and not missing:
+                if used_mcp:
+                    summary = ko_en(
+                        self._settings,
+                        "Run:ai MCP에서 워크로드/프로젝트 리소스/클러스터 "
+                        "컨텍스트 조회를 완료했습니다.",
+                        "Run:ai MCP queries completed for workload, project-resource, "
+                        "and cluster context.",
+                    )
+                else:
+                    summary = ko_en(
+                        self._settings,
+                        "Run:ai 직접 API에서 워크로드/프로젝트/큐 컨텍스트 "
+                        "조회를 완료했습니다.",
+                        "Run:ai direct API queries completed for workload, project, "
+                        "and queue context.",
+                    )
                 status = "ok"
                 confidence = "high"
             elif successful:
-                # We DID enumerate (projects/queues/departments/workloads) even
-                # without a workload label — say what came back, and let the
-                # kubernetes CRD enumeration surface which entities are not Ready.
                 retrieved = ", ".join(
                     sorted({str(item.get("name")) for item in successful if item.get("name")})
                 )
+                gaps = ", ".join(
+                    [
+                        *(str(item.get("name") or "query") for item in failed),
+                        *(item for item in missing if item != "runai.query"),
+                    ]
+                ) or "remaining context"
+                transport = "MCP" if used_mcp else "direct API"
                 summary = ko_en(
                     self._settings,
-                    f"알림에 워크로드 식별자는 없지만 Run:ai API로 {retrieved} 목록을 "
-                    "조회했습니다. 개별 리소스 상태는 Kubernetes CRD 조회를 참고하세요.",
-                    f"No workload identifier on the alert; queried Run:ai API for {retrieved}. "
-                    "See the Kubernetes CRD findings for which resources are not Ready.",
+                    f"Run:ai {transport}에서 {retrieved} 컨텍스트만 조회했습니다. "
+                    f"확인하지 못한 항목: {gaps}.",
+                    f"Run:ai {transport} returned partial context for {retrieved}; "
+                    f"unavailable: {gaps}.",
                 )
                 status = "partial"
                 confidence = "medium"
@@ -211,13 +323,12 @@ class RunAICollector:
                 )
                 status = "unavailable"
                 confidence = "low"
-                missing.append("runai.query")
-            if auth_failed and "runai.auth" not in missing:
-                missing.append("runai.auth")
-
-            # Version comes from the MCP "version" query when MCP was used, else a
-            # direct best-effort fetch (empty headers just yield "").
-            runai_version = _version_from_results(query_results) if used_mcp else ""
+                if "runai.query" not in missing:
+                    missing.append("runai.query")
+            # NVIDIA's focused MCP exposes no generic version endpoint. Retain
+            # version-aware known-issue suppression through a direct best-effort
+            # read using the same authorization header.
+            runai_version = ""
             if not runai_version:
                 runai_version = await _fetch_runai_version(self._settings, headers)
             details = {
@@ -242,7 +353,7 @@ class RunAICollector:
                 self._settings, "Run:ai API", summary, query_results
             )
             if insight:
-                summary = insight
+                summary = insight if status == "ok" else f"{summary} {insight}"
             # A successful API round trip is context, not proof that every
             # queried Run:ai resource was healthy or even present. Preserve the
             # aggregate for operators, then emit one constrained observation per
@@ -307,6 +418,7 @@ class RunAICollector:
             confidence=confidence,
             details=details,
             missing_data=missing,
+            warnings=configuration_warnings,
             artifacts=[
                 artifact(
                     agent=self.name,
@@ -324,7 +436,7 @@ class RunAICollector:
 
 def _can_refresh_runai_token(settings: Settings) -> bool:
     return bool(
-        settings.runai_token_url
+        (settings.runai_token_url or settings.runai_base_url)
         and settings.runai_client_id
         and settings.runai_client_secret
     )
@@ -341,7 +453,9 @@ async def _runai_headers(
         and settings.runai_client_secret
         and (settings.runai_token_url or settings.runai_base_url)
     ):
-        token = await _request_runai_token(settings, warnings)
+        token = await _cached_runai_token(
+            settings, warnings, force_refresh=prefer_oauth
+        )
     elif not token and (settings.runai_client_id or settings.runai_client_secret):
         warnings.append(
             "Run:ai client credential configuration is incomplete. "
@@ -355,16 +469,74 @@ async def _runai_headers(
     elif settings.runai_base_url:
         warnings.append(
             "Run:ai API URL is configured, but no Authorization header could be built. "
-            "Set RUNAI_BEARER_TOKEN or configure RUNAI_TOKEN_URL with RUNAI_CLIENT_ID "
-            "and RUNAI_CLIENT_SECRET."
+            "Set RUNAI_BEARER_TOKEN or configure RUNAI_CLIENT_ID and "
+            "RUNAI_CLIENT_SECRET; RUNAI_TOKEN_URL is an optional endpoint override."
         )
     return headers, warnings
+
+
+async def _cached_runai_token(
+    settings: Settings,
+    warnings: list[str],
+    *,
+    force_refresh: bool = False,
+) -> str:
+    """Share one short-lived OAuth exchange across concurrent MCP tool calls."""
+    key = _runai_token_cache_key(settings)
+    now = time.monotonic()
+    if force_refresh:
+        _RUNAI_TOKEN_CACHE.pop(key, None)
+    else:
+        cached = _RUNAI_TOKEN_CACHE.get(key)
+        if cached and cached[1] > now:
+            return cached[0]
+
+    loop = asyncio.get_running_loop()
+    inflight_key = (id(loop), key)
+    task = _RUNAI_TOKEN_INFLIGHT.get(inflight_key)
+    if task is None:
+
+        async def exchange() -> tuple[str, tuple[str, ...]]:
+            exchange_warnings: list[str] = []
+            token = await _request_runai_token(settings, exchange_warnings)
+            if token:
+                _RUNAI_TOKEN_CACHE[key] = (
+                    token,
+                    time.monotonic() + _RUNAI_TOKEN_CACHE_TTL_SECONDS,
+                )
+            return token, tuple(exchange_warnings)
+
+        task = asyncio.create_task(exchange())
+        _RUNAI_TOKEN_INFLIGHT[inflight_key] = task
+
+        def cleanup(done: asyncio.Task[tuple[str, tuple[str, ...]]]) -> None:
+            if _RUNAI_TOKEN_INFLIGHT.get(inflight_key) is done:
+                _RUNAI_TOKEN_INFLIGHT.pop(inflight_key, None)
+
+        task.add_done_callback(cleanup)
+    # One cancelled analysis/startup probe must not cancel the OAuth exchange
+    # shared by other concurrent MCP calls.
+    token, exchange_warnings = await asyncio.shield(task)
+    warnings.extend(exchange_warnings)
+    return token
+
+
+def _runai_token_cache_key(settings: Settings) -> tuple[str, str, str, str]:
+    secret_fingerprint = hashlib.sha256(
+        settings.runai_client_secret.encode("utf-8")
+    ).hexdigest()
+    return (
+        settings.runai_token_url,
+        settings.runai_base_url,
+        settings.runai_client_id,
+        secret_fingerprint,
+    )
 
 
 async def _request_runai_token(settings: Settings, warnings: list[str]) -> str:
     attempts: list[str] = []
     for url in _runai_token_urls(settings):
-        json_response = await post_json(
+        json_response = await post_oauth_token(
             url=url,
             timeout_seconds=settings.runai_timeout_seconds,
             json_body={
@@ -374,23 +546,21 @@ async def _request_runai_token(settings: Settings, warnings: list[str]) -> str:
             },
             headers={"Content-Type": "application/json"},
         )
-        token = _token_from_response(json_response.data)
-        if json_response.ok and token:
-            return token
+        if json_response.ok:
+            return json_response.token
         attempts.append(f"{url} json={json_response.error or 'missing access token'}")
 
-        form_response = await post_form_json(
+        form_response = await post_oauth_token(
             url=url,
             timeout_seconds=settings.runai_timeout_seconds,
-            data={
+            form_data={
                 "grant_type": "client_credentials",
                 "client_id": settings.runai_client_id,
                 "client_secret": settings.runai_client_secret,
             },
         )
-        token = _token_from_response(form_response.data)
-        if form_response.ok and token:
-            return token
+        if form_response.ok:
+            return form_response.token
         attempts.append(f"{url} form={form_response.error or 'missing access token'}")
 
     if attempts:
@@ -421,16 +591,6 @@ def _runai_token_urls(settings: Settings) -> list[str]:
         if url and url not in deduped:
             deduped.append(url)
     return deduped
-
-
-def _token_from_response(data: object) -> str:
-    if not isinstance(data, dict):
-        return ""
-    for key in ("accessToken", "access_token", "token", "id_token"):
-        value = data.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return ""
 
 
 def _bearer_header_value(token: str) -> str:
@@ -471,24 +631,61 @@ async def _collect_runai_responses(
 
     responses: list[dict[str, object]] = []
     for name, path, params in requests:
-        response = await get_json(
-            base_url=settings.runai_base_url,
-            path=path,
-            timeout_seconds=settings.runai_timeout_seconds,
-            params=params,
-            headers=headers,
-        )
-        responses.append(
-            {
-                "name": name,
-                "path": path,
-                "url": response.url,
-                "status_code": response.status_code,
-                "error": response.error,
-                "data": compact(response.data, limit=5),
-            }
-        )
+        responses.append(await _collect_runai_response(settings, target, headers, name, path, params))
     return responses
+
+
+async def _collect_runai_queue_response(
+    settings: Settings, target: AnalysisTarget, headers: dict[str, str]
+) -> dict[str, object]:
+    queue = quote(target.queue, safe="")
+    return await _collect_runai_response(
+        settings, target, headers, "queue", f"{settings.runai_queues_path.rstrip('/')}/{queue}", None
+    )
+
+
+async def _collect_runai_response(
+    settings: Settings,
+    target: AnalysisTarget,
+    headers: dict[str, str],
+    name: str,
+    path: str,
+    params: dict[str, str] | None,
+) -> dict[str, object]:
+    response = await get_json(
+        base_url=settings.runai_base_url,
+        path=path,
+        timeout_seconds=settings.runai_timeout_seconds,
+        params=params,
+        headers=headers,
+    )
+    time_range = incident_time_range(target)
+    expected = _runai_expected_identity(name, target)
+    evidence_window = (
+        _runai_evidence_window(response.data, name, target, time_range)
+        if time_range
+        else None
+    )
+    return {
+        "name": name,
+        "path": path,
+        "url": response.url,
+        "status_code": response.status_code,
+        "error": response.error,
+        # Match target identity and empty envelopes before compaction:
+        # servers may ignore filters and put the requested workload
+        # beyond the artifact's bounded preview.
+        "identity_matched": _runai_data_contains_identity(
+            response.data,
+            expected,
+            resource=name,
+            target=target,
+        ) if expected else False,
+        "explicitly_empty": _runai_is_explicitly_empty(response.data),
+        **({"evidence_window": evidence_window} if evidence_window else {}),
+        "data": compact(response.data, limit=5),
+        "transport": "direct",
+    }
 
 
 def _query_params(values: dict[str, str]) -> dict[str, str]:
@@ -510,15 +707,18 @@ def _validated_runai_query_results(
     validated: list[dict[str, object]] = []
     for raw_item in query_results:
         item = dict(raw_item)
+        item.setdefault("explicitly_empty", _runai_is_explicitly_empty(item.get("data")))
         if not item.get("error"):
-            payload_error = _runai_payload_error(item.get("data"))
+            payload_error = _runai_payload_error(
+                item.get("data"), transport=str(item.get("transport") or "")
+            )
             if payload_error:
                 item["error"] = payload_error
         validated.append(item)
     return validated
 
 
-def _runai_payload_error(data: object) -> str:
+def _runai_payload_error(data: object, *, transport: str = "") -> str:
     if data is None:
         return "Run:ai response did not contain JSON data"
     if isinstance(data, dict) and set(data) == {"raw"}:
@@ -536,15 +736,23 @@ def _runai_query_artifact(
     used_mcp: bool,
 ):
     """Turn one Run:ai API result into a narrowly scoped evidence fact."""
-    observation = _runai_query_observation(item, target=target, used_mcp=used_mcp)
+    observation = _runai_query_observation(
+        item, target=target, used_mcp=str(item.get("transport") or "") == "mcp"
+    )
     name = str(item.get("name") or "resource")
     polarity = str(observation["polarity"])
     status = "unavailable" if polarity == "unavailable" else "ok"
+    if item.get("error") and polarity == "unknown":
+        status = "partial"
     confidence = "high" if polarity in {"present", "absent"} else "low"
     if polarity == "present":
         summary = f"Run:ai {name}: queried target resource was present."
     elif polarity == "absent":
         summary = f"{NO_EVIDENCE} Run:ai {name}: queried target resource was absent."
+    elif polarity == "unknown" and observation.get("current_state_absent"):
+        summary = f"Run:ai {name}: resource absent (current state); not proven for the incident window."
+    elif polarity == "unknown" and observation.get("current_state_only"):
+        summary = f"Run:ai {name}: resource found (current state); not proven for the incident window."
     else:
         summary = f"Run:ai {name}: query was unavailable or did not prove target coverage."
     return artifact(
@@ -577,32 +785,29 @@ def _runai_query_observation(
     time_range = incident_time_range(target)
     expected = _runai_expected_identity(name, target)
     status_code = item.get("status_code")
+    name_keyed_404 = False
     if item.get("error"):
         if _runai_exact_resource_lookup(name, used_mcp=used_mcp) and status_code == 404:
             polarity, coverage = "absent", "scoped"
+        elif not used_mcp and name in {"project", "queue"} and status_code == 404:
+            polarity, coverage = "unknown", "partial"
+            name_keyed_404 = True
         else:
             polarity, coverage = "unavailable", "unknown"
     elif name == "version" or not expected:
         polarity, coverage = "unknown", "partial"
-    elif _runai_data_contains_identity(
+    elif item.get("identity_matched") or _runai_data_contains_identity(
         item.get("data"), expected, resource=name, target=target
     ):
         polarity, coverage = "present", "scoped"
-    elif _runai_is_explicitly_empty(item.get("data")):
+    elif item.get("explicitly_empty") or _runai_is_explicitly_empty(item.get("data")):
         # A successful but empty body can be an ignored filter, an API gateway
         # envelope, or a truncated MCP response. Only an explicit 404 above
         # proves current absence for an exact Run:ai resource.
         polarity, coverage = "unknown", "partial"
     else:
         polarity, coverage = "unknown", "partial"
-    # The Run:ai API exposes present resource state; unlike audit/event APIs it
-    # does not make this lookup historical merely because the alert has a past
-    # timestamp.  A current 404 or a currently-present workload is useful for
-    # recovery context, but cannot prove the resource's state during a closed
-    # incident window without a returned resource timestamp in that window.
-    if time_range and polarity in {"present", "absent"}:
-        polarity, coverage = "unknown", "partial"
-    return {
+    observation = {
         "kind": "runai_api_query",
         "predicate": f"runai:{name}",
         "polarity": polarity,
@@ -612,21 +817,75 @@ def _runai_query_observation(
         "status_code": status_code,
         "observation_window": time_range or {},
     }
+    if name_keyed_404 and time_range:
+        observation["current_state_absent"] = True
+    # A firing alert has no completed end. A direct 404 for its exact resource
+    # is decisive current absence; after resolution it is recovery context.
+    firing = _runai_alert_is_firing(target)
+    if time_range and polarity == "absent" and not firing:
+        polarity, coverage = "unknown", "partial"
+        observation["current_state_absent"] = True
+    if time_range and polarity == "present":
+        evidence_window = item.get("evidence_window") or _runai_evidence_window(item.get("data"), name, target, time_range)
+        if evidence_window:
+            observation["evidence_window"] = evidence_window
+        else:
+            polarity, coverage = "unknown", "partial"
+            observation["current_state_only"] = True
+    observation["polarity"] = polarity
+    observation["coverage"] = coverage
+    return observation
+
+
+def _runai_alert_is_firing(target: AnalysisTarget) -> bool:
+    start = parse_incident_time(target.fired_at)
+    end = parse_incident_time(target.resolved_at)
+    return start is not None and (end is None or end < start)
+
+
+def _runai_evidence_window(
+    data: object, resource: str, target: AnalysisTarget, time_range: dict[str, str]
+) -> dict[str, str] | None:
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None:
+        return None
+    instants: list[object] = []
+    for item in _runai_resource_items(data, resource):
+        if not _runai_data_contains_identity({"items": [item]}, _runai_expected_identity(resource, target), resource=resource, target=target):
+            continue
+        stack = [item]
+        while stack:
+            value = stack.pop()
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if "time" in str(key).casefold() or "date" in str(key).casefold():
+                        instant = parse_incident_time(child)
+                        if instant is not None and start <= instant <= end:
+                            instants.append(instant)
+                    if isinstance(child, (dict, list)):
+                        stack.append(child)
+            elif isinstance(value, list):
+                stack.extend(value)
+    if not instants:
+        return None
+    first, last = min(instants), max(instants)
+    return {"start": first.isoformat().replace("+00:00", "Z"), "end": last.isoformat().replace("+00:00", "Z")}
 
 
 def _runai_exact_resource_lookup(name: str, *, used_mcp: bool) -> bool:
     """Whether a 404 names one requested resource rather than a collection.
 
     Run:ai MCP calls use collection endpoints (``/projects``, ``/queues``, and
-    ``/workloads``).  A 404 there can mean an unsupported API path or a gateway
-    route, not that the alert's project/queue/workload is absent.  Only the
-    direct HTTP collector's per-resource paths can establish scoped absence.
+    ``/workloads``). A name-keyed direct project/queue path can likewise return
+    404 when that control plane requires a numeric or UUID key. Only the alert's
+    immutable workload UUID lookup can establish scoped absence.
     """
-    return not used_mcp and name in {"workload_by_id", "project", "queue"}
+    return not used_mcp and name == "workload_by_id"
 
 
 def _runai_expected_identity(name: str, target: AnalysisTarget) -> str:
-    if name in {"workloads", "workload_by_id"}:
+    if name in {"workloads", "workload_by_id", "workload_status"}:
         return target.runai_workload_id or target.workload_name
     if name in {"project", "projects"}:
         return target.project
@@ -655,6 +914,7 @@ def _runai_data_contains_identity(
     fields = {
         "workloads": {"name", "id", "workloadname", "workloadid"},
         "workload_by_id": {"name", "id", "workloadname", "workloadid"},
+        "workload_status": {"name", "id", "workloadname", "workloadid"},
         "project": {"name", "id", "project", "projectname"},
         "projects": {"name", "id", "project", "projectname"},
         "queue": {"name", "id", "queue", "queuename"},
@@ -671,7 +931,7 @@ def _runai_data_contains_identity(
                 # immutable workload id remains the authoritative identity and
                 # deliberately does not lose to stale auxiliary labels.
                 if (
-                    resource in {"workloads", "workload_by_id"}
+                    resource in {"workloads", "workload_by_id", "workload_status"}
                     and target is not None
                     and not target.runai_workload_id
                     and not _runai_workload_scope_matches(item, target)
@@ -689,9 +949,13 @@ def _runai_workload_scope_matches(item: dict[str, object], target: AnalysisTarge
     conflict (the request may already have filtered it), but an explicit
     different value must not be used as scoped target evidence.
     """
-    return _runai_scope_matches(item, target.project, {"project", "projectname"}) and _runai_scope_matches(
+    project_matches = _runai_scope_matches(
+        item, target.project, {"project", "projectname"}
+    )
+    queue_matches = _runai_scope_matches(
         item, target.queue, {"queue", "queuename"}
     )
+    return project_matches and queue_matches
 
 
 def _runai_scope_matches(
@@ -720,6 +984,7 @@ def _runai_resource_items(data: object, resource: str) -> list[dict[str, object]
         collection_keys = {
             "workloads": ("workloads", "items", "data", "results"),
             "workload_by_id": ("workloads", "items", "data", "results"),
+            "workload_status": ("workloads", "items", "data", "results"),
             "project": ("projects", "items", "data", "results"),
             "projects": ("projects", "items", "data", "results"),
             "queue": ("queues", "items", "data", "results"),
@@ -737,7 +1002,7 @@ def _runai_resource_items(data: object, resource: str) -> list[dict[str, object]
 
 
 def _runai_observed_entity(name: str, target: AnalysisTarget) -> dict[str, str]:
-    if name in {"workloads", "workload_by_id"}:
+    if name in {"workloads", "workload_by_id", "workload_status"}:
         if target.runai_workload_id:
             return {"kind": "runai_workload_id", "name": target.runai_workload_id}
         return {"kind": "workload_name", "name": target.workload_name}
@@ -749,11 +1014,42 @@ def _runai_observed_entity(name: str, target: AnalysisTarget) -> dict[str, str]:
 
 
 def _runai_is_explicitly_empty(data: object) -> bool:
-    if data is None or data == []:
+    if data in (None, "", [], {}):
         return True
+    if isinstance(data, list):
+        return False
     if not isinstance(data, dict):
         return False
-    for key in ("items", "workloads", "projects", "queues", "data", "results"):
-        if key in data and data[key] == []:
-            return True
-    return False
+    envelope_keys = {
+        "items",
+        "workloads",
+        "projects",
+        "queues",
+        "resources",
+        "data",
+        "result",
+        "results",
+    }
+    metadata_keys = {
+        "count",
+        "total",
+        "page",
+        "pageSize",
+        "page_size",
+        "nextPageToken",
+        "next_page_token",
+        "status",
+    }
+    envelopes = [value for key, value in data.items() if key in envelope_keys]
+    if not envelopes:
+        return bool(data) and all(key in metadata_keys for key in data)
+    if not all(_runai_is_explicitly_empty(value) for value in envelopes):
+        return False
+    # An empty resource envelope may carry pagination/status metadata. A real
+    # sibling identity or resource field makes the payload non-empty.
+    return all(
+        key in envelope_keys
+        or key in metadata_keys
+        or _runai_is_explicitly_empty(value)
+        for key, value in data.items()
+    )

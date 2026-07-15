@@ -40,7 +40,7 @@ def test_resolve_target_infers_controller_type(label: str, expected_type: str) -
 async def test_deployment_resolves_selector_to_most_unhealthy_pod(monkeypatch) -> None:
     calls: list[tuple[str, str, str]] = []
 
-    async def fake_k8s_read(settings, kind, namespace="", name="", label_selector=""):
+    async def fake_k8s_read(settings, kind, namespace="", name="", label_selector="", **_kwargs):
         calls.append((kind, name, label_selector))
         if kind == "deployments":
             return {
@@ -88,7 +88,7 @@ async def test_deployment_resolves_selector_to_most_unhealthy_pod(monkeypatch) -
 async def test_job_without_selector_uses_standard_job_label(monkeypatch) -> None:
     selectors: list[str] = []
 
-    async def fake_k8s_read(settings, kind, namespace="", name="", label_selector=""):
+    async def fake_k8s_read(settings, kind, namespace="", name="", label_selector="", **_kwargs):
         if kind == "jobs":
             return {"data": {"metadata": {"name": name}, "spec": {}}}
         selectors.append(label_selector)

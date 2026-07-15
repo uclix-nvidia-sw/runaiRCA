@@ -446,6 +446,7 @@ def parse_json_object(text: str) -> dict[str, Any] | None:
         return None
     start = text.find("{")
     while start != -1:
+        next_start = start + 1
         depth = 0
         in_string = False
         escaped = False
@@ -468,9 +469,10 @@ def parse_json_object(text: str) -> dict[str, Any] | None:
                     try:
                         parsed = json.loads(text[start : index + 1])
                     except (ValueError, TypeError):
-                        break  # unbalanced/invalid here — try the next '{'
+                        next_start = index + 1
+                        break  # invalid here — try after this balanced block
                     return parsed if isinstance(parsed, dict) else None
-        start = text.find("{", start + 1)
+        start = text.find("{", next_start)
     return None
 
 

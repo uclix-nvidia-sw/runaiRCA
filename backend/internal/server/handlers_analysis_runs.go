@@ -8,6 +8,15 @@ import (
 func (s *Server) handleAnalysisRunEvaluation(w http.ResponseWriter, r *http.Request) {
 	rest := pathPart(r.URL.Path, "/api/v1/analysis-runs/")
 	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	if r.Method == http.MethodGet && len(parts) == 1 && parts[0] != "" {
+		run, ok := s.store.AnalysisRun(parts[0])
+		if !ok {
+			writeError(w, http.StatusNotFound, "analysis run not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, envelope(run))
+		return
+	}
 	if len(parts) != 2 || parts[0] == "" || parts[1] != "evaluation" {
 		writeError(w, http.StatusNotFound, "unknown analysis run evaluation")
 		return
@@ -30,7 +39,16 @@ func (s *Server) handleAnalysisRunEvaluation(w http.ResponseWriter, r *http.Requ
 		if req.Author == "" {
 			req.Author = r.URL.Query().Get("author")
 		}
-		review, ok, err := s.store.UpsertEvaluationReview(runID, req)
+		var allowedFamilies []string
+		if strings.TrimSpace(req.ExpectedFamily) != "" && strings.TrimSpace(req.CaseType) != "novel" {
+			catalog, err := s.fetchRootCauseFamilyCatalog(r.Context())
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, "root-cause family catalog unavailable")
+				return
+			}
+			allowedFamilies = catalog.Families
+		}
+		review, ok, err := s.store.UpsertEvaluationReview(runID, req, allowedFamilies)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return

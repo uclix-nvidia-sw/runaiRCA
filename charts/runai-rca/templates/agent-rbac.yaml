@@ -52,7 +52,9 @@ rules:
   # Gated on enablePodExec so turning the feature off also drops the permission.
   - apiGroups: [""]
     resources: ["pods/exec"]
-    verbs: ["create"]
+    # aiohttp opens the WebSocket upgrade with HTTP GET. Kubernetes authorizes
+    # that connect endpoint as `get`; keep `create` for POST-based exec clients.
+    verbs: ["get", "create"]
   {{- end }}
   - apiGroups: ["apps"]
     resources:
@@ -140,7 +142,9 @@ rules:
   # Gated on enablePodExec so turning the feature off also drops the permission.
   - apiGroups: [""]
     resources: ["pods/exec"]
-    verbs: ["create"]
+    # aiohttp opens the WebSocket upgrade with HTTP GET. Kubernetes authorizes
+    # that connect endpoint as `get`; keep `create` for POST-based exec clients.
+    verbs: ["get", "create"]
   {{- end }}
   - apiGroups: ["apps"]
     resources:

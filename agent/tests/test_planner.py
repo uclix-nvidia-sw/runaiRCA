@@ -225,6 +225,65 @@ async def test_plan_stage_feeds_recent_changes_into_the_planner() -> None:
     assert state.plan.hypotheses[0]["family"] == "node_kubelet_pressure", state.plan.hypotheses
 
 
+@pytest.mark.asyncio
+async def test_plan_stage_prefers_live_pod_node_over_planner_guess(monkeypatch) -> None:
+    from app.collectors import kubernetes
+    from app.plan import InvestigationPlan
+    from app.progress import ProgressReporter
+    from app.schemas import AlertAnalysisRequest
+    from app.services import pipeline
+    from app.services.kg_enrichment import KGContext
+
+    target = _target(
+        alert_name="PodFailure",
+        namespace="team-a",
+        workload_name="trainer",
+        pod="trainer-old99",
+        node="",
+    )
+    settings = make_settings()
+    seen: dict[str, object] = {}
+
+    async def fake_plan(*_args, **_kwargs):
+        return InvestigationPlan(
+            namespaces=["team-a"],
+            pod="trainer-old99",
+            workload="trainer",
+            node="planner-guessed-node",
+        )
+
+    async def fake_resolve(_settings, namespace, pod, extra_pods, workload):
+        seen.update(
+            namespace=namespace,
+            pod=pod,
+            extra_pods=extra_pods,
+            workload=workload,
+        )
+        return "trainer-live88", "gpu-node-live"
+
+    monkeypatch.setattr(pipeline, "plan_investigation", fake_plan)
+    monkeypatch.setattr(kubernetes, "resolve_live_pod_node", fake_resolve)
+    state = pipeline.PipelineState(
+        settings=settings,
+        request=AlertAnalysisRequest(alert=Alert(labels={}, annotations={})),
+        target=target,
+        progress=ProgressReporter(settings, run_id=""),
+        masker=None,
+        collectors=[],
+        kg_context=KGContext(),
+    )
+
+    await pipeline.plan_stage(state)
+
+    assert (state.plan.pod, state.plan.node) == ("trainer-live88", "gpu-node-live")
+    assert seen == {
+        "namespace": "team-a",
+        "pod": "trainer-old99",
+        "extra_pods": [],
+        "workload": "trainer",
+    }
+
+
 def test_namespace_scope_classifies() -> None:
     from app.services.planner import _namespace_scope
 
@@ -235,6 +294,34 @@ def test_namespace_scope_classifies() -> None:
     assert _namespace_scope(_target(namespace="team-a", queue="gpu-a"), settings) == "workload"
     assert _namespace_scope(_target(namespace="monitoring"), settings) == "infra"
     assert _namespace_scope(_target(namespace=""), settings) == "infra"
+
+
+def test_historical_detection_accepts_valid_ends_at_but_rejects_zero_placeholder() -> None:
+    from app.schemas import AlertAnalysisRequest
+    from app.services.pipeline import _is_resolved_reanalysis
+
+    assert _is_resolved_reanalysis(
+        AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={},
+                annotations={},
+                startsAt="2026-07-10T01:00:00Z",
+                endsAt="2026-07-10T01:10:00Z",
+            )
+        )
+    )
+    assert not _is_resolved_reanalysis(
+        AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={},
+                annotations={},
+                startsAt="2026-07-10T01:00:00Z",
+                endsAt="0001-01-01T00:00:00Z",
+            )
+        )
+    )
 
 
 def test_generic_infra_component_is_infra_not_runai_workload() -> None:

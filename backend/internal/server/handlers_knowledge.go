@@ -4,12 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 )
 
 var errKnowledgeValidatorRejected = errors.New("knowledge validator rejected candidate")
+
+const maxRootCauseFamilyCatalogBytes = 64 << 10
+
+type RootCauseFamilyCatalog struct {
+	Families []string `json:"families"`
+}
 
 func (s *Server) handleKnowledge(w http.ResponseWriter, r *http.Request) {
 	prefix := ""
@@ -76,6 +83,62 @@ func (s *Server) handleKnowledgeRuntimeSnapshot(w http.ResponseWriter, r *http.R
 
 func (s *Server) handleProbeMetrics(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, envelope(s.store.ProbeMetrics()))
+}
+
+func (s *Server) handleRootCauseFamilies(w http.ResponseWriter, r *http.Request) {
+	catalog, err := s.fetchRootCauseFamilyCatalog(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "root-cause family catalog unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, envelope(catalog))
+}
+
+func (s *Server) fetchRootCauseFamilyCatalog(parent context.Context) (RootCauseFamilyCatalog, error) {
+	if strings.TrimSpace(s.agentURL) == "" || s.client == nil {
+		return RootCauseFamilyCatalog{}, errors.New("agent is not configured")
+	}
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(s.agentURL, "/")+"/knowledge/families", nil)
+	if err != nil {
+		return RootCauseFamilyCatalog{}, err
+	}
+	response, err := s.client.Do(req)
+	if err != nil {
+		return RootCauseFamilyCatalog{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return RootCauseFamilyCatalog{}, errors.New("agent rejected family catalog request")
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxRootCauseFamilyCatalogBytes+1))
+	if err != nil {
+		return RootCauseFamilyCatalog{}, err
+	}
+	if len(body) > maxRootCauseFamilyCatalogBytes {
+		return RootCauseFamilyCatalog{}, errors.New("family catalog response is too large")
+	}
+	var catalog RootCauseFamilyCatalog
+	if err := json.Unmarshal(body, &catalog); err != nil {
+		return RootCauseFamilyCatalog{}, err
+	}
+	seen := make(map[string]struct{}, len(catalog.Families))
+	for index, family := range catalog.Families {
+		family = strings.TrimSpace(family)
+		if family == "" {
+			return RootCauseFamilyCatalog{}, errors.New("family catalog contains an empty family")
+		}
+		if _, duplicate := seen[family]; duplicate {
+			return RootCauseFamilyCatalog{}, errors.New("family catalog contains duplicate families")
+		}
+		seen[family] = struct{}{}
+		catalog.Families[index] = family
+	}
+	if len(catalog.Families) == 0 {
+		return RootCauseFamilyCatalog{}, errors.New("family catalog is empty")
+	}
+	return catalog, nil
 }
 
 type knowledgeDecisionPayload struct {

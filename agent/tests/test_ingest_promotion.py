@@ -58,6 +58,14 @@ def _row(**overrides: Any) -> dict[str, Any]:
         "labels": {"alertname": "KubeNodeDiskPressure", "node": "gpu-node-1"},
         "annotations": {},
         "analysis_summary": "Likely cause: node kubelet pressure on gpu-node-1.",
+        "root_cause_family": "node_kubelet_pressure",
+        "evaluation_reviews": [
+            {
+                "case_type": "known",
+                "expected_family": "node_kubelet_pressure",
+                "resolution_outcome": "resolved",
+            }
+        ],
         "analysis_detail": (
             "## Root Cause\n\n- text\n\n## Recommended Actions\n\n"
             "- Free disk space on the node\n- Cordon and drain gpu-node-1\n"
@@ -67,29 +75,6 @@ def _row(**overrides: Any) -> dict[str, Any]:
     }
     base.update(overrides)
     return base
-
-
-# --- family derivation ---------------------------------------------------------
-
-
-def test_derive_family_label_is_decisive() -> None:
-    assert ingest._derive_family("Likely cause: node kubelet pressure.") == (
-        "node_kubelet_pressure"
-    )
-    assert ingest._derive_family("cause **workload startup/image failure** seen") == (
-        "workload_startup_error"
-    )
-
-
-def test_derive_family_keywords_need_two_hits_and_unique_winner() -> None:
-    assert ingest._derive_family("pod ImagePullBackOff then CrashLoopBackOff") == (
-        "workload_startup_error"
-    )
-    # one weak hit only -> ambiguous
-    assert ingest._derive_family("pod was oomkilled") == ""
-    # empty / unrelated text
-    assert ingest._derive_family("") == ""
-    assert ingest._derive_family("everything is fine") == ""
 
 
 # --- action extraction ----------------------------------------------------------
@@ -133,24 +118,73 @@ def test_promotion_from_row_happy_path() -> None:
     assert actions == []
 
 
-def test_promotion_uses_stored_family_over_text_inference() -> None:
-    # Backend-persisted family wins even when the analysis text would infer a
-    # different family (or none at all) — this is the fundamental fix that lets
-    # families like gpu_hardware_error (not in _FAMILY_MARKERS) be promoted.
-    row = _row(root_cause_family="gpu_hardware_error", analysis_summary="fine", analysis_detail="fine")
+def test_promotion_uses_operator_confirmed_stored_family() -> None:
+    # The operator answer key confirms the backend-persisted family without
+    # deriving a label from analysis prose.
+    row = _row(
+        root_cause_family="gpu_hardware_error",
+        evaluation_reviews=[
+            {
+                "case_type": "known",
+                "expected_family": "gpu_hardware_error",
+                "resolution_outcome": "resolved",
+            }
+        ],
+        analysis_summary="fine",
+        analysis_detail="fine",
+    )
     rec = ingest._promotion_from_row(row)
     assert rec is not None
     _, family, _ = rec
     assert family == "gpu_hardware_error"
 
 
-def test_promotion_falls_back_to_text_when_family_empty() -> None:
-    # Legacy rows (no stored family) still recover via text inference.
+def test_promotion_does_not_self_label_from_text_when_family_empty() -> None:
+    # Legacy model prose is not an operator-confirmed answer key.
     row = _row(root_cause_family="")
-    rec = ingest._promotion_from_row(row)
-    assert rec is not None
-    _, family, _ = rec
-    assert family == "node_kubelet_pressure"
+    assert ingest._promotion_from_row(row) is None
+
+
+def test_promotion_rejects_wrong_family_and_tool_degraded_reviews() -> None:
+    wrong = _row(
+        evaluation_reviews=[
+            {
+                "case_type": "known",
+                "expected_family": "gpu_hardware_error",
+                "resolution_outcome": "resolved",
+            }
+        ]
+    )
+    assert ingest._promotion_from_row(wrong) is None
+
+    degraded = _row(
+        evaluation_reviews=[
+            {
+                "case_type": "tool_degraded",
+                "expected_family": "node_kubelet_pressure",
+                "resolution_outcome": "resolved",
+            }
+        ]
+    )
+    assert ingest._promotion_from_row(degraded) is None
+
+
+def test_promotion_ignores_scoring_only_review_when_family_is_confirmed() -> None:
+    row = _row(
+        evaluation_reviews=[
+            {
+                "case_type": "known",
+                "expected_family": "",
+                "resolution_outcome": "resolved",
+            },
+            {
+                "case_type": "known",
+                "expected_family": "node_kubelet_pressure",
+                "resolution_outcome": "mitigated",
+            },
+        ]
+    )
+    assert ingest._promotion_from_row(row) is not None
 
 
 def test_promotion_from_row_skips_malformed_rows() -> None:
@@ -160,9 +194,9 @@ def test_promotion_from_row_skips_malformed_rows() -> None:
     assert ingest._promotion_from_row(_row(labels={}, annotations={})) is None
     # labels not valid JSON -> same fallback path, skipped, no raise
     assert ingest._promotion_from_row(_row(labels="{broken", annotations="")) is None
-    # no recoverable family
+    # no operator-confirmed family
     assert (
-        ingest._promotion_from_row(_row(analysis_summary="fine", analysis_detail="fine")) is None
+        ingest._promotion_from_row(_row(evaluation_reviews=[])) is None
     )
     # Feedback columns are not an approval substitute.
     assert ingest._promotion_from_row(_row(positive_feedback=9, negative_feedback=0, user_approved_at="")) is None

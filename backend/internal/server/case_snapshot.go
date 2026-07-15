@@ -151,7 +151,94 @@ func (s *Store) knowledgeCandidateForSnapshotLocked(snapshot *CaseSnapshot) *Kno
 	if snapshot == nil {
 		return nil
 	}
-	return knowledgeCandidateForSnapshotWithOutcome(snapshot, len(s.caseReviewOutcomesLocked(snapshot.RunID, snapshot.AnalysisHash)) > 0)
+	hasReviews, allowsPromotion := s.caseReviewAllowsKnowledgePromotionLocked(snapshot)
+	if !hasReviews || !allowsPromotion {
+		return nil
+	}
+	return knowledgeCandidateForSnapshotWithOutcome(snapshot, true)
+}
+
+// caseReviewAllowsKnowledgePromotionLocked binds operator judgment to the exact
+// analysis hash and family being promoted. The evidence/harness/trace gates are
+// still enforced by knowledgeCandidateForSnapshotWithOutcome; this only adds the
+// missing semantic gate between the review and the selected root-cause family.
+func (s *Store) caseReviewAllowsKnowledgePromotionLocked(snapshot *CaseSnapshot) (bool, bool) {
+	if snapshot == nil {
+		return false, false
+	}
+	family := strings.TrimSpace(snapshot.RootCauseFamily)
+	hasReviews, successfulConfirmation := false, false
+	for _, review := range s.evaluationReviews {
+		if review == nil || review.RunID != snapshot.RunID || review.AnalysisHash != snapshot.AnalysisHash {
+			continue
+		}
+		hasReviews = true
+		if !evaluationReviewPassesKnowledgeQuality(review) {
+			return true, false
+		}
+		expected := strings.TrimSpace(review.ExpectedFamily)
+		switch review.CaseType {
+		case "known", "compositional":
+			// An empty optional field is a scoring-only review, not an implicit
+			// confirmation. Explicit disagreement still fails closed. A
+			// compositional review's selected family is its primary family because
+			// the current review contract is singular.
+			if expected == "" {
+				if strings.HasPrefix(family, "novel_") {
+					return true, false
+				}
+				continue
+			}
+			if expected != family {
+				return true, false
+			}
+			if review.ResolutionOutcome == "resolved" || review.ResolutionOutcome == "mitigated" {
+				successfulConfirmation = true
+			}
+		case "novel":
+			if expected != "" || !strings.HasPrefix(family, "novel_") {
+				return true, false
+			}
+			if review.ResolutionOutcome == "resolved" || review.ResolutionOutcome == "mitigated" {
+				successfulConfirmation = true
+			}
+		case "tool_degraded":
+			// The optional expected family remains useful as an evaluation label,
+			// but degraded evidence is not safe runtime knowledge.
+			return true, false
+		default:
+			return true, false
+		}
+	}
+	return hasReviews, successfulConfirmation
+}
+
+// Operator labels remain useful for evaluation datasets even when a review is
+// not safe to promote into runtime knowledge. Promotion itself uses the same
+// 80/100 quality floor as the immutable harness: seven 0..5 dimensions must
+// total at least 28, any recorded hard-gate violation vetoes promotion, and an
+// explicitly ineffective outcome cannot be outweighed by another reviewer.
+func evaluationReviewPassesKnowledgeQuality(review *EvaluationReview) bool {
+	if review == nil || review.ResolutionOutcome == "ineffective" {
+		return false
+	}
+	total := 0
+	for _, dimension := range evaluationDimensions {
+		score, ok := review.Scores[dimension]
+		if !ok || score < 0 || score > 5 {
+			return false
+		}
+		total += score
+	}
+	if total*100 < len(evaluationDimensions)*5*80 {
+		return false
+	}
+	for _, violation := range review.HardGates {
+		if violation {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Store) knowledgeCandidateForCaseLocked(caseID string) *KnowledgeCandidate {

@@ -47,26 +47,36 @@ QUERY_CAPABILITIES = READ_ONLY_QUERY_CAPABILITIES
 
 
 def build_collectors(settings: Settings) -> list[Any]:
-    names = settings.collectors or DEFAULT_COLLECTORS
-    selected: list[Any] = []
-    seen: set[str] = set()
-    unknown: list[str] = []
-
-    for name in names:
-        key = str(name).strip().lower()
-        if not key or key in seen:
-            continue
-        cls = COLLECTORS.get(key)
-        if cls is None:
-            unknown.append(key)
-            continue
-        seen.add(key)
-        selected.append(cls(settings))
+    names, unknown = _collector_configuration(settings)
+    selected = [COLLECTORS[name](settings) for name in names]
 
     if unknown:
         _log.warning("ignoring unknown collectors from COLLECTORS: %s", ", ".join(unknown))
-    if selected:
-        return selected
+    configured = settings.collectors or DEFAULT_COLLECTORS
+    if settings.collectors and not any(
+        str(name).strip().lower() in COLLECTORS for name in configured
+    ):
+        _log.warning("COLLECTORS produced no valid collectors; falling back to default set")
+    return selected
 
-    _log.warning("COLLECTORS produced no valid collectors; falling back to default set")
-    return [COLLECTORS[name](settings) for name in DEFAULT_COLLECTORS]
+
+def unknown_collector_names(settings: Settings) -> list[str]:
+    """Return normalized configured collector names with no registered plane."""
+    return list(_collector_configuration(settings)[1])
+
+
+def collector_names(settings: Settings) -> list[str]:
+    return list(_collector_configuration(settings)[0])
+
+
+def _collector_configuration(settings: Settings) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    selected: list[str] = []
+    unknown: list[str] = []
+    seen: set[str] = set()
+    for name in settings.collectors or DEFAULT_COLLECTORS:
+        key = str(name).strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        (selected if key in COLLECTORS else unknown).append(key)
+    return (tuple(selected) or DEFAULT_COLLECTORS, tuple(unknown))

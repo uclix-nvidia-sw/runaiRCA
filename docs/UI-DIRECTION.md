@@ -5,6 +5,18 @@
 
 Run:AI RCA should feel like KubeRCA evolved for NVIDIA Run:ai operators.
 
+**Who this is for:** designers and engineers shaping the operator console. The
+screen should help someone answer three questions quickly: what happened, what
+evidence supports it, and what safe next check should they run.
+
+```mermaid
+flowchart TB
+  S[Incident list] --> D[Incident detail]
+  D --> R[Problem, cause, actions]
+  D --> E[Evidence trail and gaps]
+  D --> C[Comments, feedback, re-analyze]
+```
+
 ## Visual System
 
 - Base: white and near-white surfaces.

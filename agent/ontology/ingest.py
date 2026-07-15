@@ -86,6 +86,16 @@ SELECT i.incident_id, i.correlation_key, i.title, i.severity, i.status,
           WHERE er.run_id = r.run_id
             AND er.analysis_hash = r.case_analysis_hash
        ), '[]'::jsonb) AS evaluation_scores,
+       COALESCE((
+         SELECT jsonb_agg(jsonb_build_object(
+           'case_type', er.case_type,
+           'expected_family', er.expected_family,
+           'resolution_outcome', er.resolution_outcome
+         ) ORDER BY er.updated_at, er.review_id)
+           FROM rca_eval_reviews er
+          WHERE er.run_id = r.run_id
+            AND er.analysis_hash = r.case_analysis_hash
+       ), '[]'::jsonb) AS evaluation_reviews,
        (SELECT count(*) FROM rca_feedback f
          WHERE f.target_id IN (i.incident_id, a.alert_id)
            AND f.kind = 'vote'
@@ -1085,51 +1095,11 @@ def _write_incident(tx: Any, inc: OntologyIncident) -> None:
 # --- knowledge promotion (--promote-knowledge) --------------------------------
 # Promote approved RCAs into the knowledge layer the synthesis step consults:
 # symptom "confirmed:{alert_name}" -indicates-> family root_cause, with only
-# actions an operator marked resolved/mitigated. The backend does NOT persist
-# the agent's ranked_root_cause_candidates (the response `context` dict is
-# dropped by the Go store), so the top family is recovered from the stored
-# analysis text instead — a printed family label is decisive, otherwise >= 2
-# distinct keyword hits with a unique best family. Ambiguity -> skip.
-
-# family -> (decisive label markers, weak keywords). Labels mirror
-# orchestrator._family_label / _FAMILY_EXPLANATION output; keywords mirror
-# root_cause_ranking._FAMILY_RULES. insufficient_evidence is never promoted.
-_FAMILY_MARKERS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
-    "node_kubelet_pressure": (
-        ("node_kubelet_pressure", "node kubelet pressure", "node hosting this workload is under"),
-        ("diskpressure", "memorypressure", "pidpressure", "kubelet", "evict"),
-    ),
-    "runai_scheduling_quota": (
-        ("runai_scheduling_quota", "scheduling quota exhaustion", "queue capacity looks"),
-        ("failedscheduling", "unschedulable", "quota", "preempt", "insufficient gpu"),
-    ),
-    "runai_control_plane_error": (
-        ("runai_control_plane_error", "run:ai control-plane error"),
-        ("control plane", "control-plane", "admission", "reconcile", "runai-backend"),
-    ),
-    "workload_startup_error": (
-        ("workload_startup_error", "workload startup/image failure"),
-        ("imagepullbackoff", "errimagepull", "crashloopbackoff", "oomkilled", "back-off"),
-    ),
-}
+# actions an operator marked resolved/mitigated. The hash-bound evaluation must
+# explicitly confirm the persisted family; analysis prose is never a label.
 
 _ACTION_CAP = 3
 _ACTION_MAXLEN = 200
-
-
-def _derive_family(text: str) -> str:
-    """Best-effort family from stored analysis text; "" when ambiguous."""
-    t = (text or "").lower()
-    if not t:
-        return ""
-    for family, (labels, _) in _FAMILY_MARKERS.items():
-        if any(label in t for label in labels):
-            return family
-    scores = {fam: sum(1 for kw in kws if kw in t) for fam, (_, kws) in _FAMILY_MARKERS.items()}
-    top = max(scores.values())
-    if top < 2 or sum(1 for s in scores.values() if s == top) > 1:
-        return ""
-    return max(scores, key=lambda fam: scores[fam])
 
 
 def _extract_actions(detail: str) -> list[str]:
@@ -1168,12 +1138,53 @@ def _action_statements(value: Any) -> list[str]:
     return [" ".join(item.split())[:_ACTION_MAXLEN] for item in _list(value) if item.strip()]
 
 
+def _evaluation_review_rows(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, str) and value.strip():
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _operator_confirms_promoted_family(row: dict[str, Any], family: str) -> bool:
+    """Require an exact, successful review for the hash-scoped model family."""
+    reviews = _evaluation_review_rows(row.get("evaluation_reviews"))
+    if not reviews:
+        return False
+    successful = False
+    for review in reviews:
+        case_type = str(review.get("case_type") or "").strip()
+        expected = str(review.get("expected_family") or "").strip()
+        if case_type in {"known", "compositional"}:
+            if not expected:
+                if family.startswith("novel_"):
+                    return False
+                continue
+            if expected != family:
+                return False
+            if str(review.get("resolution_outcome") or "") in {"resolved", "mitigated"}:
+                successful = True
+        elif case_type == "novel":
+            if expected or not family.startswith("novel_"):
+                return False
+            if str(review.get("resolution_outcome") or "") in {"resolved", "mitigated"}:
+                successful = True
+        else:
+            # tool_degraded (including an optional label) and malformed legacy
+            # reviews are useful evaluation data, not promotable knowledge.
+            return False
+    return successful
+
+
 def _promotion_from_row(row: dict[str, Any]) -> tuple[str, str, list[str]] | None:
     """(alert_name, family, actions) when the row is promotable, else None.
 
-    Promotable = resolved + Dashboard approval + a non-abstained, recoverable
-    root-cause family + a real alertname label. Only evaluation-confirmed actions
-    are promoted as remedies.
+    Promotable = resolved + Dashboard approval + exact successful operator-family
+    confirmation + a non-abstained, evidence-gated analysis + a real alertname.
+    Only evaluation-confirmed actions are promoted as remedies.
     """
     if str(row.get("status") or "") != "resolved":
         return None
@@ -1186,15 +1197,8 @@ def _promotion_from_row(row: dict[str, Any]) -> tuple[str, str, list[str]] | Non
     alert_name = (target.alert_name or "").strip()
     if not alert_name or alert_name == "RunAIAlert":  # resolve_target's fallback, not a real name
         return None
-    summary = str(row.get("analysis_summary") or "")
-    detail = str(row.get("analysis_detail") or "")
-    # Prefer the family the backend persisted from the ranked root-cause
-    # candidate; fall back to text inference only for legacy rows written
-    # before root_cause_family was stored.
-    family = str(row.get("root_cause_family") or "").strip() or _derive_family(
-        f"{summary}\n{detail}"
-    )
-    if not family:
+    family = str(row.get("root_cause_family") or "").strip()
+    if not family or not _operator_confirms_promoted_family(row, family):
         return None
     return alert_name, family, _action_statements(row.get("verified_actions"))[:_ACTION_CAP]
 
@@ -1278,7 +1282,7 @@ def main() -> int:
     parser.add_argument(
         "--promote-knowledge",
         action="store_true",
-        help="also promote operator-confirmed RCAs (resolved + net-positive feedback) "
+        help="also promote resolved, operator-family-confirmed RCAs "
         "into the knowledge layer (symptom -> root_cause -> action); default off",
     )
     args = parser.parse_args()

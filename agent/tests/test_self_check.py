@@ -106,6 +106,46 @@ def test_no_llm_keeps_confidence_when_canonical_artifact_has_evidence():
     assert out["caveat"] == ""
 
 
+def test_canonical_collector_unrelated_predicate_does_not_support_family():
+    """A scoped OOM is not scheduler-placement evidence just because both are Kubernetes."""
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary="OOMKilled was observed",
+            artifacts=[
+                AlertAnalysisArtifact(
+                    agent="kubernetes",
+                    source="kubernetes",
+                    type="kubernetes_pod_log",
+                    status="ok",
+                    summary="OOMKilled in the workload container",
+                    result={
+                        "sample_entries": [{"line": "container was OOMKilled"}],
+                        "observation": {
+                            "predicate": "kubernetes_pod_log:main",
+                            "polarity": "present",
+                            "coverage": "scoped",
+                        },
+                    },
+                )
+            ],
+        )
+    ]
+    top = RankedCause(
+        family="k8s_scheduling_error",
+        confidence="high",
+        score=6.0,
+        rationale=["scheduler hypothesis"],
+        evidence_agents=["kubernetes"],
+    )
+
+    out = _run(refute_top_cause(make_settings(), top, results))
+
+    assert out["confidence"] == "medium"
+    assert out["caveat"]
+
+
 def test_no_llm_downgrades_when_canonical_artifact_is_ineligible_for_incident():
     """A typed observation for another target/window is context, not self-check support."""
     finding = AlertAnalysisArtifact(
@@ -210,6 +250,59 @@ def test_no_llm_keeps_confidence_when_exact_signature_is_evidence():
     out = _run(refute_top_cause(settings, top, results))
 
     assert out["confidence"] == "medium"
+    assert out["caveat"] == ""
+
+
+def test_scoped_loki_xid_can_supply_signature_evidence_with_production_gate():
+    finding = AlertAnalysisArtifact(
+        evidence_id="E17",
+        agent="loki",
+        source="loki",
+        type="logql_signal",
+        status="ok",
+        confidence="high",
+        summary="NVRM Xid 79 occurred during the incident",
+        result={
+            "lines": ["NVRM: Xid 79, GPU has fallen off the bus"],
+            "observation": {
+                "predicate": "logql:nvidia_xid",
+                "polarity": "present",
+                "coverage": "scoped",
+            },
+        },
+    )
+    results = [
+        CollectorResult(
+            agent="system",
+            status="unavailable",
+            summary="node system collector unavailable",
+        ),
+        CollectorResult(
+            agent="loki",
+            status="ok",
+            summary="driver log queried",
+            artifacts=[finding],
+        ),
+    ]
+    top = RankedCause(
+        family="gpu_hardware_error",
+        confidence="high",
+        score=9.0,
+        evidence_agents=["loki"],
+    )
+
+    out = _run(
+        refute_top_cause(
+            make_settings(),
+            top,
+            results,
+            evidence_eligibility={
+                "E17": EvidenceEligibility(True, True, True),
+            },
+        )
+    )
+
+    assert out["confidence"] == "high"
     assert out["caveat"] == ""
 
 

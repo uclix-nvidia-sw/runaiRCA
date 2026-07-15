@@ -66,6 +66,18 @@ def test_best_matching_pod_all_healthy_needs_unambiguous_match() -> None:
     assert best_matching_pod(many_healthy, [""]) is None
 
 
+def test_workload_prefix_node_resolution_rejects_multi_node_replicas() -> None:
+    from app.collectors.kubernetes import _best_live_target_pod
+
+    replicas = [
+        _pod("trainer-worker-a1b2c", "dgx01", "2026-07-01T00:00:00Z"),
+        _pod("trainer-worker-d3e4f", "dgx02", "2026-07-02T00:00:00Z"),
+    ]
+
+    assert _best_live_target_pod(replicas, ["trainer-deleted-z9y8x"], "trainer") is None
+    assert _best_live_target_pod(replicas[:1], ["trainer-deleted-z9y8x"], "train") is None
+
+
 # --- healthy Postgres healthcheck is not evidence -------------------------------
 
 
@@ -636,6 +648,10 @@ def test_parse_json_object_survives_prose_fences_and_trailing_junk() -> None:
     assert parse_json_object('{"nested": {"b": "brace } in string"}}') == {
         "nested": {"b": "brace } in string"}
     }
+    assert parse_json_object('{"decision": {"query": "up"},}') is None
+    assert parse_json_object('{"decision": {"query": "up"},} {"later": true}') == {
+        "later": True
+    }
     assert parse_json_object("no json here") is None
     assert parse_json_object("{truncated: ") is None
     assert parse_json_object("") is None
@@ -990,29 +1006,251 @@ async def test_evidence_stage_scopes_followup_target_to_the_plan(monkeypatch) ->
     assert seen == {"k8s": "toolkit-live2", "prom": "toolkit-live2"}, (
         "follow-ups must query the plan's re-resolved live pod"
     )
+    assert (state.target.pod, state.target.node) == ("toolkit-live2", stale_target.node)
 
 
 @pytest.mark.asyncio
-async def test_resolved_incident_keeps_alert_pod_for_followups(monkeypatch) -> None:
-    """A current replacement must not erase historical Event identity."""
-    from app.plan import InvestigationPlan
+async def test_re_resolved_live_target_drives_blackboard_eligibility(monkeypatch) -> None:
+    """A live replacement is collection scope and validation scope, not just a query hint."""
     from app.progress import ProgressReporter
 
     seen: dict[str, str] = {}
 
+    class KubernetesCollector:
+        async def collect(self, target, plan):  # noqa: ANN001
+            seen.update(pod=target.pod, node=target.node)
+            return CollectorResult(
+                agent="kubernetes",
+                status="ok",
+                summary="FailedScheduling on the resolved live Pod",
+                artifacts=[
+                    artifact(
+                        agent="kubernetes",
+                        source="kubernetes",
+                        type="kubernetes_warning_events",
+                        status="ok",
+                        confidence="high",
+                        summary="FailedScheduling on trainer-live2",
+                        result={
+                            "events": [
+                                {
+                                    "type": "Warning",
+                                    "reason": "FailedScheduling",
+                                    "message": "0/2 nodes are available",
+                                }
+                            ],
+                            "observation": {
+                                "predicate": "kubernetes_warning_events",
+                                "polarity": "present",
+                                "coverage": "scoped",
+                                "observed_entity": {
+                                    "kind": "pod",
+                                    "name": target.pod,
+                                    "namespace": target.namespace,
+                                },
+                            },
+                        },
+                    )
+                ],
+            )
+
+    async def no_followup(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr("app.collectors.kubernetes.k8s_followup", no_followup)
+    monkeypatch.setattr("app.collectors.prometheus.prometheus_followup", no_followup)
+    fired_at = "2026-07-14T01:00:00Z"
+    stale_target = replace(
+        make_target(),
+        pod="trainer-dead1",
+        node="",
+        fired_at=fired_at,
+    )
+    state = pipeline.PipelineState(
+        settings=make_settings(),
+        request=AlertAnalysisRequest(
+            incident_id="INC-live-target",
+            alert=Alert(
+                status="firing",
+                labels={},
+                annotations={},
+                startsAt=fired_at,
+            ),
+        ),
+        target=stale_target,
+        progress=ProgressReporter(make_settings(), run_id="INC-live-target"),
+        masker=None,
+        collectors=[KubernetesCollector()],
+        plan=InvestigationPlan(
+            pod="trainer-live2",
+            node="gpu-node-live",
+            workload="trainer",
+            namespaces=[stale_target.namespace],
+        ),
+    )
+
+    await pipeline.evidence_stage(state)
+
+    assert seen == {"pod": "trainer-live2", "node": "gpu-node-live"}
+    assert (state.target.pod, state.target.node) == ("trainer-live2", "gpu-node-live")
+    eligibility = pipeline._public_evidence_eligibility(state)
+    assert eligibility["E01"].support is True
+    assert "pod:trainer-live2" in pipeline._evidence_context(state)["entities"]
+    assert "pod:trainer-dead1" not in pipeline._evidence_context(state)["entities"]
+
+
+@pytest.mark.parametrize(
+    ("labels", "annotations"),
+    [
+        ({"condition": "OOMKilled", "status": "False"}, {}),
+        ({"status": "False", "condition": "OOMKilled"}, {}),
+        ({}, {"condition": "FailedScheduling", "value": "0"}),
+        ({}, {"value": "inactive", "reason": "ImagePullBackOff"}),
+    ],
+)
+def test_false_alert_condition_is_not_positive_signature(labels, annotations) -> None:
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "ConditionProbe", **labels},
+            annotations=annotations,
+            fingerprint="fp-false-condition",
+        )
+    )
+
+    assert pipeline._alert_signature_evidence_result(request, make_target()) is None
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "Check whether this pod is OOMKilled before changing limits.",
+        "Possible ImagePullBackOff; inspect registry credentials.",
+        "Runbook: grep for FailedScheduling in pod events.",
+        "Expected observation: Unschedulable if the queue is exhausted.",
+    ],
+)
+def test_conditional_alert_guidance_is_not_positive_signature(summary) -> None:
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "GenericAlert"},
+            annotations={"summary": summary},
+            fingerprint="fp-conditional",
+        )
+    )
+
+    assert pipeline._alert_signature_evidence_result(request, make_target()) is None
+
+
+def test_asserted_alert_signature_uses_alert_identity_not_live_target() -> None:
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "ContainerFailure"},
+            annotations={"summary": "Container terminated with OOMKilled"},
+            fingerprint="fp-stale-alert",
+        )
+    )
+    live_target = replace(make_target(), pod="replacement-pod", node="replacement-node")
+
+    result = pipeline._alert_signature_evidence_result(request, live_target)
+
+    assert result is not None
+    observation = result.artifacts[0].result["observation"]
+    assert observation["observed_entity"] == {
+        "kind": "alert",
+        "name": "fp-stale-alert",
+    }
+
+
+@pytest.mark.asyncio
+async def test_alert_only_xid_is_auditable_harness_support(monkeypatch) -> None:
+    """A dispositive alert signature gets a real E-link instead of a rationale bypass."""
+    from app.services.kg_enrichment import KGContext
+
+    async def no_followup(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr("app.collectors.kubernetes.k8s_followup", no_followup)
+    monkeypatch.setattr("app.collectors.prometheus.prometheus_followup", no_followup)
+    settings = replace(make_settings(), enable_rca_output_harness=True)
+    request = AlertAnalysisRequest(
+        incident_id="INC-xid-alert",
+        alert=Alert(
+            status="firing",
+            labels={
+                "alertname": "NVRMXidCritical",
+                "namespace": "runai-vision",
+                "node": "gpu-node-1",
+            },
+            annotations={"summary": "NVRM: Xid 79 detected by the GPU driver"},
+            startsAt="2026-07-14T01:00:00Z",
+        ),
+    )
+    state = pipeline.new_state(settings, request, collectors=[])
+    state.kg_context = KGContext()
+    state.plan = InvestigationPlan(
+        namespaces=[state.target.namespace],
+        node=state.target.node,
+        hypotheses=[{"family": "gpu_hardware_error", "reason": "alert XID"}],
+    )
+
+    await pipeline.evidence_stage(state)
+    await pipeline.rank_stage(state)
+    await pipeline.self_check_stage(state)
+    await pipeline.synthesize_stage(state)
+    await pipeline.harness_stage(state)
+
+    assert state.response is not None
+    assert state.response.root_cause_family == "gpu_hardware_error"
+    xid_cards = [card for card in state.response.artifacts if card.agent == "alert"]
+    assert len(xid_cards) == 1
+    assert xid_cards[0].result["observation"]["predicate"] == "alert_signature:nvidia_xid"
+    assert xid_cards[0].result["observation"]["observed_entity"] == {
+        "kind": "alert",
+        "name": "NVRMXidCritical",
+    }
+    assert "alert:NVRMXidCritical" in pipeline._evidence_context(state)["entities"]
+    claim = state.response.context["harness"]["claims"][0]
+    assert claim["supporting_evidence"] == [xid_cards[0].evidence_id]
+    assert state.response.context["harness"]["status"] == "pass"
+
+
+@pytest.mark.asyncio
+async def test_resolved_incident_keeps_alert_pod_for_followups(monkeypatch) -> None:
+    """A current replacement must not erase any historical target identity."""
+    from app.plan import InvestigationPlan
+    from app.progress import ProgressReporter
+
+    seen: dict[str, tuple[str, str, str, str]] = {}
+
     async def fake_k8s_followup(settings, k8s_result, target, **kwargs):
-        seen["k8s"] = target.pod
+        seen["k8s"] = (
+            target.namespace,
+            target.pod,
+            target.node,
+            target.workload_name,
+        )
         return []
 
     async def fake_prom_followup(settings, prom_result, k8s_result, target, **kwargs):
-        seen["prom"] = target.pod
+        seen["prom"] = (
+            target.namespace,
+            target.pod,
+            target.node,
+            target.workload_name,
+        )
         return []
 
     monkeypatch.setattr("app.collectors.kubernetes.k8s_followup", fake_k8s_followup)
     monkeypatch.setattr("app.collectors.prometheus.prometheus_followup", fake_prom_followup)
     alert_target = replace(
         make_target(),
+        namespace="historical-ns",
         pod="toolkit-dead1",
+        node="historical-node",
+        workload_name="historical-workload",
         fired_at="2026-07-10T01:00:00Z",
         resolved_at="2026-07-10T01:10:00Z",
     )
@@ -1020,7 +1258,9 @@ async def test_resolved_incident_keeps_alert_pod_for_followups(monkeypatch) -> N
         settings=make_settings(),
         request=AlertAnalysisRequest(
             alert=Alert(
-                status="resolved",
+                # A stored/manual historical run can retain a stale firing
+                # status while endsAt is the authoritative resolved boundary.
+                status="firing",
                 labels={},
                 annotations={},
                 startsAt=alert_target.fired_at,
@@ -1032,12 +1272,84 @@ async def test_resolved_incident_keeps_alert_pod_for_followups(monkeypatch) -> N
         masker=None,
         collectors=[],
         # Simulates the replacement Pod selected by a live plan lookup.
-        plan=InvestigationPlan(pod="toolkit-live2", namespaces=[alert_target.namespace]),
+        plan=InvestigationPlan(
+            pod="toolkit-live2",
+            node="current-node",
+            workload="current-workload",
+            namespaces=["current-ns", "runai"],
+        ),
     )
 
     await pipeline.evidence_stage(state)
 
-    assert seen == {"k8s": "toolkit-dead1", "prom": "toolkit-dead1"}
+    expected = (
+        "historical-ns",
+        "toolkit-dead1",
+        "historical-node",
+        "historical-workload",
+    )
+    assert seen == {"k8s": expected, "prom": expected}
+    assert state.plan.namespaces == ["historical-ns", "current-ns", "runai"]
+    assert (
+        state.target.namespace,
+        state.target.pod,
+        state.target.node,
+        state.target.workload_name,
+    ) == expected
+    assert state.declared_target == alert_target
+
+
+@pytest.mark.asyncio
+async def test_resolved_incident_uses_only_single_concrete_occurrence_pod(monkeypatch) -> None:
+    """Grouped Pod names are history; never replace them with a live planner guess."""
+    from app.plan import InvestigationPlan
+    from app.progress import ProgressReporter
+
+    seen: list[str] = []
+
+    async def fake_k8s_followup(settings, k8s_result, target, **kwargs):
+        seen.append(target.pod)
+        return []
+
+    async def fake_prom_followup(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr("app.collectors.kubernetes.k8s_followup", fake_k8s_followup)
+    monkeypatch.setattr("app.collectors.prometheus.prometheus_followup", fake_prom_followup)
+    target = replace(
+        make_target(),
+        pod="",
+        workload_name="trainer",
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    request = AlertAnalysisRequest(
+        alert=Alert(status="resolved", labels={}, annotations={}),
+        occurrence_pods=["trainer-dead-a"],
+    )
+    state = pipeline.PipelineState(
+        settings=make_settings(),
+        request=request,
+        target=target,
+        progress=ProgressReporter(make_settings(), run_id=""),
+        masker=None,
+        collectors=[],
+        plan=InvestigationPlan(pod="trainer-live-now", namespaces=[target.namespace]),
+    )
+
+    await pipeline.evidence_stage(state)
+
+    assert seen == ["trainer-dead-a"]
+    assert state.plan.pod == "trainer-dead-a"
+
+    # More than one occurrence is a set of affected Pods. Picking one would
+    # silently discard the others and can attach evidence to the wrong node.
+    state.request.occurrence_pods = ["trainer-dead-a", "trainer-dead-b"]
+    state.plan.pod = "trainer-live-now"
+    seen.clear()
+    await pipeline.evidence_stage(state)
+    assert seen == [""]
+    assert state.plan.pod == ""
 
 
 def test_blackboard_aliases_do_not_merge_same_summary_from_different_pods() -> None:

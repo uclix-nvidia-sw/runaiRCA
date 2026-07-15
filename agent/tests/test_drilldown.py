@@ -17,7 +17,9 @@ from app.services.drilldown import (
     _tool_k8s_logs,
     _tool_logql,
     _tool_promql,
-    _tool_runai_get,
+    _tool_runai_project_resources,
+    _tool_runai_workload_status,
+    _tool_runai_workload_summary,
     run_drilldowns,
 )
 from app.services.evidence_blackboard import Blackboard
@@ -46,6 +48,13 @@ def test_kubernetes_read_rejects_non_resource_kind_before_execution() -> None:
     assert drilldown._valid_domain_query(
         {"tool": "k8s_read", "args": {"kind": "deployments"}}
     )
+
+
+def test_kubernetes_prompt_refuses_configuration_as_observed_preemption() -> None:
+    prompt = drilldown._system_prompt("kubernetes", {})
+
+    assert "spec.preemptionPolicy=PreemptLowerPriority does NOT prove" in prompt
+    assert "require an active condition or target-scoped Warning Event" in prompt
 
 
 def _target() -> AnalysisTarget:
@@ -161,6 +170,20 @@ async def test_metric_and_log_drilldowns_preserve_mcp_errors_and_incident_window
     assert seen_loki_window == expected
     assert prom["error"] == "Prometheus MCP response missing data.result"
     assert logs["error"] == "Loki MCP response missing a recognized log result"
+
+
+@pytest.mark.asyncio
+async def test_metric_and_log_queries_reject_overlong_input() -> None:
+    settings = drill_settings()
+    target = _target()
+
+    prom = await _tool_promql(settings, target, {"query": "a" * 601})
+    logs = await _tool_logql(settings, target, {"query": "a" * 601})
+
+    # "invalid" routes _query_failure_feedback to the invalid_request repair
+    # category, so the loop tells the model to correct the query, not retry it.
+    assert prom["error"] == "invalid query: exceeds 600 characters; shorten it"
+    assert logs["error"] == "invalid query: exceeds 600 characters; shorten it"
 
 
 @pytest.mark.asyncio
@@ -768,6 +791,21 @@ def test_drilldown_prompt_skips_unavailable_artifact_result() -> None:
     assert "stale gang phase" not in prompt
 
 
+def test_unavailable_base_summary_is_only_operational_feedback() -> None:
+    result = CollectorResult(
+        agent="loki",
+        status="unavailable",
+        summary="HTTP 400; stale response mentioned DiskPressure and evicted pods",
+    )
+
+    prompt = drilldown._user_prompt(result, _target(), None, [], [])
+
+    assert "DiskPressure" not in prompt
+    assert "evicted pods" not in prompt
+    assert '"error_category": "invalid_request"' in prompt
+    assert "query syntax or arguments are invalid" in prompt
+
+
 def test_drilldown_runs_all_new_allowed_queries(monkeypatch) -> None:
     llm_calls = [0]
     tool_calls = [0]
@@ -934,6 +972,76 @@ def test_tool_scoping_is_structural(monkeypatch) -> None:
     assert drilled_agents == ["kubernetes"]
 
 
+def test_system_and_change_agents_adapt_with_their_own_safe_tools(monkeypatch) -> None:
+    rounds: dict[str, int] = {}
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
+        agent = system.split(" ")[3]
+        rounds[agent] = rounds.get(agent, 0) + 1
+        if rounds[agent] > 1:
+            return {"action": "done"}
+        if agent == "system":
+            return {
+                "action": "query",
+                "queries": [
+                    {"tool": "system_log_query", "args": {"source": "journal"}}
+                ],
+            }
+        return {
+            "action": "query",
+            "queries": [{"tool": "change_query", "args": {"source": "event"}}],
+        }
+
+    async def fake_system_log_query(settings, target, args):
+        observation = {
+            "kind": "system_log_query",
+            "predicate": "node_system:gpu_driver",
+            "polarity": "present",
+            "coverage": "scoped",
+            "observed_entity": {"kind": "node", "name": "gpu-1"},
+        }
+        return {
+            "query": "system logs source=journal node=gpu-1",
+            "summary": "one GPU driver signal",
+            "error": None,
+            "observation": observation,
+            "result": observation,
+        }
+
+    async def fake_change_query(settings, target, args):
+        observation = {
+            "kind": "change_query",
+            "predicate": "change:event",
+            "polarity": "present",
+            "coverage": "scoped",
+            "observed_entity": {"kind": "namespace", "name": "runai-vision"},
+        }
+        return {
+            "query": "bounded change timeline source=event",
+            "summary": "one target-scoped event change",
+            "error": None,
+            "observation": observation,
+            "result": observation,
+        }
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "system_log_query", fake_system_log_query)
+    monkeypatch.setattr(drilldown, "change_query", fake_change_query)
+    results = [
+        CollectorResult(agent="system", status="unavailable", summary="base host read failed"),
+        CollectorResult(agent="change", status="ok", summary="base change sweep was empty"),
+    ]
+    target = replace(_target(), node="gpu-1")
+
+    asyncio.run(run_drilldowns(drill_settings(), results, target, None))
+
+    assert rounds == {"system": 2, "change": 2}
+    assert [artifact.status for artifact in results[0].artifacts] == ["ok"]
+    assert [artifact.status for artifact in results[1].artifacts] == ["ok"]
+    assert results[0].artifacts[0].result["observation"]["coverage"] == "scoped"
+    assert results[1].artifacts[0].result["observation"]["coverage"] == "scoped"
+
+
 def test_cross_domain_drilldown_query_is_visible_in_warnings(monkeypatch) -> None:
     async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
         return {
@@ -948,17 +1056,133 @@ def test_cross_domain_drilldown_query_is_visible_in_warnings(monkeypatch) -> Non
     assert any("no new allowed read-only query" in warning for warning in result.warnings)
 
 
-def test_unavailable_collectors_are_skipped(monkeypatch) -> None:
-    calls = [0]
+def test_unavailable_collector_gets_a_bounded_recovery_round(monkeypatch) -> None:
+    prompts: list[str] = []
 
     async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
-        calls[0] += 1
+        prompts.append(user)
         return {"action": "done"}
 
     monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
-    result = CollectorResult(agent="kubernetes", status="unavailable", summary="no token")
+    result = CollectorResult(
+        agent="kubernetes",
+        status="unavailable",
+        summary="base Kubernetes read failed",
+        missing_data=["kubernetes.query"],
+        warnings=["HTTP 403: forbidden by RBAC"],
+    )
     asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
-    assert calls[0] == 0
+    assert len(prompts) == 1
+    assert '"status": "unavailable"' in prompts[0]
+    assert '"error_category": "authorization"' in prompts[0]
+    assert "not incident evidence" in prompts[0]
+
+
+def test_rejected_query_gets_one_correction_round(monkeypatch) -> None:
+    prompts: list[str] = []
+    decisions = iter(
+        [
+            {
+                "action": "query",
+                "queries": [
+                    {
+                        "tool": "kubectl_logs",
+                        "args": {"pod": "train-1-0", "namespace": "runai-vision"},
+                    }
+                ],
+            },
+            {
+                "action": "query",
+                "queries": [
+                    {
+                        "tool": "k8s_logs",
+                        "args": {"pod": "train-1-0", "namespace": "runai-vision"},
+                    }
+                ],
+            },
+            {"action": "done"},
+        ]
+    )
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
+        prompts.append(user)
+        return next(decisions)
+
+    async def fake_logs(settings, namespace, pod, **kwargs):
+        return {"error": None, "lines": ["healthy startup"]}
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "k8s_logs", fake_logs)
+    result = _k8s_result()
+
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
+
+    assert len(prompts) == 3
+    assert '"status": "rejected"' in prompts[1]
+    assert "kubectl_logs" in prompts[1]
+    assert "k8s_logs" in prompts[1]
+    assert len(result.artifacts) == 1
+    assert result.artifacts[0].status == "ok"
+
+
+def test_failed_log_query_exposes_safe_repair_detail_then_accepts_new_query(monkeypatch) -> None:
+    prompts: list[str] = []
+    decisions = iter(
+        [
+            {
+                "action": "query",
+                "queries": [
+                    {
+                        "tool": "k8s_logs",
+                        "args": {
+                            "pod": "train-1-0",
+                            "namespace": "runai-vision",
+                            "container": "wrong",
+                        },
+                    }
+                ],
+            },
+            {
+                "action": "query",
+                "queries": [
+                    {
+                        "tool": "k8s_describe",
+                        "args": {
+                            "kind": "pods",
+                            "name": "train-1-0",
+                            "namespace": "runai-vision",
+                        },
+                    }
+                ],
+            },
+            {"action": "done"},
+        ]
+    )
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
+        prompts.append(user)
+        return next(decisions)
+
+    async def fake_logs(settings, namespace, pod, **kwargs):
+        return {"error": "HTTP 400: container wrong is not valid for pod", "lines": []}
+
+    async def fake_describe(settings, kind, **kwargs):
+        return {"error": None, "events": [], "object": {"kind": "Pod"}}
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "k8s_logs", fake_logs)
+    monkeypatch.setattr(drilldown, "k8s_describe", fake_describe)
+    result = _k8s_result()
+
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
+
+    assert len(prompts) == 3
+    second_prompt = json.loads(prompts[1])
+    failure = json.loads(second_prompt["drilldown_so_far"][0]["outcome"])
+    assert failure["error_category"] == "container_selection"
+    assert failure["diagnostic"] == "HTTP 400: container selection is missing or invalid"
+    assert "container wrong" not in prompts[1]
+    assert [artifact.status for artifact in result.artifacts] == ["unavailable", "ok"]
 
 
 def test_tool_failure_becomes_observation_not_crash(monkeypatch) -> None:
@@ -1019,47 +1243,7 @@ def test_failed_tool_result_is_not_replayed_as_next_prompt_evidence(monkeypatch)
     assert not result.artifacts[0].highlights
 
 
-def test_runai_get_tool_refuses_non_api_paths(monkeypatch) -> None:
-    mcp_calls = [0]
-
-    async def fake_mcp_call(settings, tool, arguments):
-        mcp_calls[0] += 1
-        raise AssertionError("must not be reached")
-
-    monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
-    settings = drill_settings(runai_mcp_url="http://localhost:8809/mcp")
-    outcome = asyncio.run(_tool_runai_get(settings, _target(), {"path": "/auth/token"}))
-    assert outcome["error"] and "GET" in outcome["error"]
-    assert mcp_calls[0] == 0
-
-
-def test_runai_get_tool_refuses_path_traversal_and_inline_query(monkeypatch) -> None:
-    mcp_calls = [0]
-
-    async def fake_mcp_call(settings, tool, arguments):
-        mcp_calls[0] += 1
-        raise AssertionError("must not be reached")
-
-    monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
-    settings = drill_settings(runai_mcp_url="http://localhost:8809/mcp")
-    for path in (
-        "/api/../auth/token",
-        "/api/%2e%2e/auth/token",
-        "/api/v1/./workloads",
-        "/api/v1/workloads?x=y",
-        "/api/v1/workloads%0a/api/v1/projects",
-        "/api/v1/workloads%2Fsecret",
-        "/api/%252e%252e/auth/token",
-        "/api/%252Fsecret",
-        "/api/v1/%255csecret",
-        "/api/v1/workloads%250aGET",
-    ):
-        outcome = asyncio.run(_tool_runai_get(settings, _target(), {"path": path}))
-        assert outcome["error"] and "GET" in outcome["error"]
-    assert mcp_calls[0] == 0
-
-
-def test_runai_get_tool_locks_method_to_get(monkeypatch) -> None:
+def test_official_runai_tools_are_target_bound(monkeypatch) -> None:
     captured: dict = {}
 
     class _Result:
@@ -1072,50 +1256,99 @@ def test_runai_get_tool_locks_method_to_get(monkeypatch) -> None:
         return _Result()
 
     monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
-    settings = drill_settings(runai_mcp_url="http://localhost:8809/mcp")
+    settings = drill_settings(runai_mcp_url="http://localhost:8080/mcp")
+    workload_id = "550e8400-e29b-41d4-a716-446655440000"
+    target = replace(_target(), project="vision", runai_workload_id=workload_id)
     outcome = asyncio.run(
-        _tool_runai_get(
+        _tool_runai_workload_status(
             settings,
-            _target(),
-            # A hostile/hallucinated request cannot change the verb: method is not
-            # an accepted argument and the wrapper hardcodes GET.
-            {"path": "/api/v1/workloads", "method": "DELETE", "query": {"name": "x"}},
+            target,
+            {"workloadId": "attacker-selected", "method": "DELETE"},
         )
     )
-    assert captured["tool"] == "call_runai_api"
-    assert captured["arguments"]["method"] == "GET"
+    assert captured["tool"] == "get_workload_status"
+    assert captured["arguments"] == {"workloadId": workload_id}
     assert outcome["error"] is None
 
 
-def test_runai_get_tool_urlencodes_display_query(monkeypatch) -> None:
+def test_official_runai_tools_require_alert_identity(monkeypatch) -> None:
+    async def fake_mcp_call(settings, tool, arguments):
+        raise AssertionError("must not be reached")
+
+    monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
+    settings = drill_settings(runai_mcp_url="http://localhost:8080/mcp")
+    assert "no immutable" in asyncio.run(
+        _tool_runai_workload_status(settings, _target(), {})
+    )["error"]
+    assert "not a UUID" in asyncio.run(
+        _tool_runai_workload_status(
+            settings, replace(_target(), runai_workload_id="workload-42"), {}
+        )
+    )["error"]
+    assert "no Run:ai project" in asyncio.run(
+        _tool_runai_project_resources(settings, _target(), {})
+    )["error"]
+
+
+def test_official_runai_summary_uses_alert_project(monkeypatch) -> None:
+    captured: dict = {}
+
     class _Result:
         isError = False
         content = []
 
     async def fake_mcp_call(settings, tool, arguments):
+        captured["tool"] = tool
+        captured["arguments"] = arguments
         return _Result()
 
     monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
-    settings = drill_settings(runai_mcp_url="http://localhost:8809/mcp")
     outcome = asyncio.run(
-        _tool_runai_get(
-            settings,
-            _target(),
-            {
-                "path": "/api/v1/workloads",
-                "query": {
-                    "name": "trainer&includeSecrets=true",
-                    "newline": "ok\nGET /api/delete",
-                },
-            },
+        _tool_runai_workload_summary(
+            drill_settings(runai_mcp_url="http://localhost:8080/mcp"),
+            replace(_target(), project="vision"),
+            {"projectName": "attacker-selected"},
         )
     )
-    assert "includeSecrets=true" not in outcome["query"]
-    assert "\n" not in outcome["query"]
-    assert "trainer%26includeSecrets%3Dtrue" in outcome["query"]
+    assert captured == {
+        "tool": "get_workloads_summary",
+        "arguments": {"orgType": "project", "orgName": "vision"},
+    }
+    assert outcome["error"] is None
 
 
-def test_runai_search_tool_masks_text_result_and_error(monkeypatch) -> None:
+def test_official_runai_registry_exposes_target_bound_read_tools() -> None:
+    tools = drilldown._domain_tools(
+        drill_settings(runai_mcp_url="http://localhost:8080/mcp")
+    )["runai"]
+    assert {
+        "runai_workload_summary",
+        "runai_workload_status",
+        "runai_workload_history",
+        "runai_workload_pods",
+        "runai_workload_spec",
+        "runai_workload_metrics",
+        "runai_project_resources",
+        "runai_project_metrics",
+        "runai_node_pools",
+        "runai_node_pods",
+    } <= set(tools)
+
+
+def test_change_tool_does_not_advertise_secret_backed_helm_scan_by_default() -> None:
+    description = drilldown._domain_tools(drill_settings())["kubernetes"][
+        "k8s_change_timeline"
+    ]["description"]
+    assert "|helm" not in description
+
+    enabled = replace(drill_settings(), enable_helm_change_detection=True)
+    enabled_description = drilldown._domain_tools(enabled)["kubernetes"][
+        "k8s_change_timeline"
+    ]["description"]
+    assert "|helm" in enabled_description
+
+
+def test_official_runai_tool_masks_text_result_and_error(monkeypatch) -> None:
     class _Result:
         def __init__(self, text: str, *, is_error: bool = False) -> None:
             self.isError = is_error
@@ -1123,8 +1356,8 @@ def test_runai_search_tool_masks_text_result_and_error(monkeypatch) -> None:
 
     calls = iter(
         [
-            _Result("GET /api/v1/workloads api_key=search-secret-12345\n## injected"),
-            _Result("tool failed password=search-error-secret-12345\n## injected", is_error=True),
+            _Result('{"api_key":"summary-secret-12345"}'),
+            _Result("tool failed password=summary-error-secret-12345\n## injected", is_error=True),
         ]
     )
 
@@ -1132,19 +1365,19 @@ def test_runai_search_tool_masks_text_result_and_error(monkeypatch) -> None:
         return next(calls)
 
     monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
-    settings = drill_settings(runai_mcp_url="http://localhost:8809/mcp")
+    settings = drill_settings(runai_mcp_url="http://localhost:8080/mcp")
 
-    ok = asyncio.run(drilldown._tool_runai_search(settings, _target(), {"query": "workloads"}))
-    failed = asyncio.run(drilldown._tool_runai_search(settings, _target(), {"query": "workloads"}))
+    ok = asyncio.run(_tool_runai_workload_summary(settings, _target(), {}))
+    failed = asyncio.run(_tool_runai_workload_summary(settings, _target(), {}))
 
     rendered = str([ok, failed])
-    assert "search-secret-12345" not in rendered
-    assert "search-error-secret-12345" not in rendered
+    assert "summary-secret-12345" not in rendered
+    assert "summary-error-secret-12345" not in rendered
     assert "\n## injected" not in rendered
     assert "[MASKED]" in rendered
 
 
-def test_runai_get_tool_masks_text_json_result(monkeypatch) -> None:
+def test_official_runai_tool_masks_text_json_result(monkeypatch) -> None:
     class _Result:
         isError = False
         content = [
@@ -1162,9 +1395,9 @@ def test_runai_get_tool_masks_text_json_result(monkeypatch) -> None:
         return _Result()
 
     monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
-    settings = drill_settings(runai_mcp_url="http://localhost:8809/mcp")
+    settings = drill_settings(runai_mcp_url="http://localhost:8080/mcp")
 
-    outcome = asyncio.run(_tool_runai_get(settings, _target(), {"path": "/api/v1/workloads"}))
+    outcome = asyncio.run(_tool_runai_workload_summary(settings, _target(), {}))
 
     assert outcome["result"] == {
         "access_token": "[MASKED]",
@@ -1253,8 +1486,26 @@ def test_condition_observations_do_not_turn_unknown_into_refutation() -> None:
     assert condition_observations(false_zero) == []
 
 
+def test_node_conditions_ignore_compact_response_truncation_sentinel() -> None:
+    from app.collectors.kubernetes import _node_conditions
+
+    node = {
+        "conditions": [
+            {"type": "NetworkUnavailable", "status": "False"},
+            {"type": "MemoryPressure", "status": "False"},
+            {"type": "DiskPressure", "status": "False"},
+            {"type": "PIDPressure", "status": "False"},
+            {"truncated": 1},
+        ]
+    }
+
+    assert _node_conditions([{"name": "node", "data": node}]) == [
+        {"node_conditions_healthy": True, "checked": 4}
+    ]
+
+
 def test_kubernetes_markers_ignore_pod_spec_keyword_values() -> None:
-    from app.collectors.base import kubernetes_salient_markers
+    from app.collectors.base import kubernetes_salient_markers, salient_markers
 
     pod = {
         "spec": {"preemptionPolicy": "PreemptLowerPriority"},
@@ -1267,6 +1518,97 @@ def test_kubernetes_markers_ignore_pod_spec_keyword_values() -> None:
     }
 
     assert kubernetes_salient_markers(pod) == ["OOMKilled"]
+    assert salient_markers("PreemptLowerPriority") == []
+
+
+def test_kubernetes_markers_apply_condition_polarity_before_reason_keywords() -> None:
+    from app.collectors.base import condition_observations, kubernetes_salient_markers
+
+    refuted = {
+        "status": {
+            "conditions": [
+                # Deliberately inconsistent reason text proves that status is
+                # authoritative and keyword presence alone cannot pass.
+                {"type": "PodScheduled", "status": "True", "reason": "Unschedulable"},
+                {
+                    "type": "DisruptionTarget",
+                    "status": "False",
+                    "reason": "PreemptionByScheduler",
+                },
+                {"type": "MemoryPressure", "status": "False"},
+            ]
+        }
+    }
+    active = {
+        "status": {
+            "conditions": [
+                {"type": "PodScheduled", "status": "False", "reason": "Unschedulable"},
+                {
+                    "type": "DisruptionTarget",
+                    "status": "True",
+                    "reason": "PreemptionByScheduler",
+                },
+                {"type": "MemoryPressure", "status": "True"},
+            ]
+        }
+    }
+
+    assert kubernetes_salient_markers(refuted) == []
+    assert kubernetes_salient_markers(active) == [
+        "Unschedulable",
+        "PreemptionByScheduler",
+        "MemoryPressure",
+    ]
+    assert [
+        (item["condition"], item["active"])
+        for item in condition_observations(active)
+    ] == [
+        ("PodScheduled", True),
+        ("DisruptionTarget", True),
+        ("MemoryPressure", True),
+    ]
+    assert [
+        (item["condition"], item["active"])
+        for item in condition_observations(refuted)
+    ] == [
+        ("PodScheduled", False),
+        ("DisruptionTarget", False),
+        ("MemoryPressure", False),
+    ]
+
+
+def test_kubernetes_markers_require_warning_event_and_observed_object() -> None:
+    from app.collectors.base import kubernetes_salient_markers
+
+    events = {
+        "items": [
+            {
+                "type": "Normal",
+                "reason": "Preempting",
+                "message": "pod was Preempted",
+                "involvedObject": {"kind": "Pod", "name": "trainer-0"},
+            },
+            {
+                "type": "Normal",
+                "reason": "Preempted",
+                "message": "pod was selected as a scheduler victim",
+                "involvedObject": {"kind": "Pod", "name": "trainer-0"},
+            },
+            {"type": "Warning", "reason": "Unschedulable"},
+            {
+                "type": "Warning",
+                "reason": "FailedScheduling",
+                "message": "pod is Unschedulable",
+                "involvedObject": {"kind": "Pod", "name": "trainer-0"},
+            },
+        ]
+    }
+
+    assert kubernetes_salient_markers(events) == [
+        "Preempted",
+        "FailedScheduling",
+        "Unschedulable",
+    ]
 
 
 def test_salient_markers_require_positive_prometheus_condition_sample() -> None:
@@ -1326,7 +1668,7 @@ def test_drilldown_caps_reasoning_rounds_but_batches_queries(monkeypatch) -> Non
     assert len(query_calls) == 15
 
 
-def test_k8s_tool_reports_kubectl_command_title_and_highlights(monkeypatch) -> None:
+def test_named_pod_read_is_promoted_to_describe_and_reports_highlights(monkeypatch) -> None:
     decisions = iter(
         [
             {
@@ -1345,22 +1687,37 @@ def test_k8s_tool_reports_kubectl_command_title_and_highlights(monkeypatch) -> N
     async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
         return next(decisions)
 
-    async def fake_k8s_read(settings, kind, *, namespace="", name="", label_selector=""):
+    async def fake_k8s_describe(
+        settings, kind, *, namespace="", name="", time_range=None
+    ):
+        assert (kind, namespace, name) == ("pods", "runai", "t-0")
         return {
             "kind": "pods",
+            "namespace": namespace,
+            "name": name,
             "status_code": 200,
             "error": None,
-            "data": {"status": {"containerStatuses": [{"state": {"terminated": {"reason": "OOMKilled"}}}]}},
+            "object": {
+                "status": {
+                    "containerStatuses": [
+                        {"state": {"terminated": {"reason": "OOMKilled"}}}
+                    ]
+                }
+            },
+            "events": [],
         }
 
     monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
-    monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
+    monkeypatch.setattr(drilldown, "k8s_describe", fake_k8s_describe)
     result = _k8s_result()
     settings = replace(drill_settings(), language="ko")
     asyncio.run(run_drilldowns(settings, [result], _target(), None))
     art = result.artifacts[0]
-    assert art.query == "kubectl get pods t-0 -n runai"
-    assert art.title == "파드 조회"
+    assert art.query == (
+        "kubectl get pod t-0 -n runai -o yaml; "
+        "kubectl describe pod t-0 -n runai"
+    )
+    assert art.title == "Pod YAML + 상세 점검"
     assert art.highlights == ["OOMKilled"]
     assert "주요 신호" in (art.summary or "") and "OOMKilled" in (art.summary or "")
 
@@ -1514,4 +1871,4 @@ async def test_drilldowns_cancel_at_shared_evidence_deadline(monkeypatch) -> Non
     )
 
     assert started.is_set()
-    assert any("shared evidence budget exhausted" in warning for warning in result.warnings)
+    assert not any("evidence budget" in warning for warning in result.warnings)

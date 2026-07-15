@@ -129,6 +129,10 @@ spec:
               value: {{ .Values.agent.env.runaiVersionPath | quote }}
             - name: RUNAI_MCP_URL
               value: {{ if .Values.runaiMcp.enabled }}{{ printf "http://%s:%v/mcp" (include "runai-rca.runaiMcp.fullname" .) .Values.runaiMcp.port | quote }}{{ else }}""{{ end }}
+            {{- if .Values.runaiTls.caBundleSecretName }}
+            - name: SSL_CERT_FILE
+              value: /etc/runai/tls/ca-bundle.pem
+            {{- end }}
             - name: RUNAI_TIMEOUT_SECONDS
               value: {{ .Values.agent.env.runaiTimeoutSeconds | quote }}
             - name: RUNAI_LOG_NAMESPACES
@@ -153,6 +157,8 @@ spec:
               value: {{ .Values.agent.env.prometheusTimeoutSeconds | quote }}
             - name: PROMETHEUS_MCP_URL
               value: {{ if .Values.grafanaMcp.enabled }}{{ printf "http://%s:%v/mcp" (include "runai-rca.grafanaMcp.fullname" .) .Values.grafanaMcp.service.port | quote }}{{ else }}{{ .Values.agent.env.prometheusMcpUrl | quote }}{{ end }}
+            - name: PROMETHEUS_DATASOURCE_UID
+              value: {{ if .Values.grafanaMcp.enabled }}{{ .Values.grafanaMcp.prometheusDatasourceUid | quote }}{{ else }}{{ .Values.agent.env.prometheusDatasourceUid | quote }}{{ end }}
             - name: KUBERNETES_MCP_URL
               value: {{ if .Values.kubernetesMcp.enabled }}{{ printf "http://%s:%v/mcp" (include "runai-rca.kubernetesMcp.fullname" .) .Values.kubernetesMcp.service.port | quote }}{{ else }}{{ .Values.agent.env.kubernetesMcpUrl | quote }}{{ end }}
             - name: LOKI_URL
@@ -163,6 +169,8 @@ spec:
               value: {{ .Values.agent.env.lokiQueryLimit | quote }}
             - name: LOKI_MCP_URL
               value: {{ if .Values.grafanaMcp.enabled }}{{ printf "http://%s:%v/mcp" (include "runai-rca.grafanaMcp.fullname" .) .Values.grafanaMcp.service.port | quote }}{{ else }}{{ .Values.agent.env.lokiMcpUrl | quote }}{{ end }}
+            - name: LOKI_DATASOURCE_UID
+              value: {{ if .Values.grafanaMcp.enabled }}{{ .Values.grafanaMcp.lokiDatasourceUid | quote }}{{ else }}{{ .Values.agent.env.lokiDatasourceUid | quote }}{{ end }}
             - name: POSTGRES_MCP_URL
               value: {{ if .Values.postgresMcp.enabled }}{{ printf "http://%s:%v/mcp" (include "runai-rca.postgresMcp.fullname" .) .Values.postgresMcp.service.port | quote }}{{ else }}{{ .Values.agent.env.postgresMcpUrl | quote }}{{ end }}
             - name: POSTGRES_TIMEOUT_SECONDS
@@ -217,6 +225,8 @@ spec:
               value: {{ .Values.agent.env.typedbTimeoutSeconds | quote }}
             - name: ENABLE_POD_EXEC
               value: {{ .Values.agent.env.enablePodExec | quote }}
+            - name: ENABLE_HELM_CHANGE_DETECTION
+              value: {{ .Values.agent.env.enableHelmChangeDetection | quote }}
             {{- if .Values.systemAgent.enabled }}
             - name: ENABLE_SYSTEM_AGENT
               value: "true"
@@ -278,6 +288,17 @@ spec:
             {{- with .Values.agent.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          {{- if or .Values.runaiTls.caBundleSecretName .Values.agent.extraVolumeMounts }}
+          volumeMounts:
+            {{- if .Values.runaiTls.caBundleSecretName }}
+            - name: runai-ca-bundle
+              mountPath: /etc/runai/tls
+              readOnly: true
+            {{- end }}
+            {{- with .Values.agent.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
           {{- with .Values.agent.readinessProbe }}
           readinessProbe:
             {{- toYaml . | nindent 12 }}
@@ -288,6 +309,20 @@ spec:
           {{- end }}
           resources:
             {{- toYaml .Values.agent.resources | nindent 12 }}
+      {{- if or .Values.runaiTls.caBundleSecretName .Values.agent.extraVolumes }}
+      volumes:
+        {{- if .Values.runaiTls.caBundleSecretName }}
+        - name: runai-ca-bundle
+          secret:
+            secretName: {{ .Values.runaiTls.caBundleSecretName | quote }}
+            items:
+              - key: {{ .Values.runaiTls.caBundleSecretKey | quote }}
+                path: ca-bundle.pem
+        {{- end }}
+        {{- with .Values.agent.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
       {{- with $nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

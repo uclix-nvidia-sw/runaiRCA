@@ -15,9 +15,18 @@ type knowledgeRoundTripper func(*http.Request) (*http.Response, error)
 
 func (fn knowledgeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) { return fn(req) }
 
+func qualifyingKnowledgeReviewScores() map[string]int {
+	scores := map[string]int{}
+	for _, dimension := range evaluationDimensions {
+		scores[dimension] = 5
+	}
+	return scores
+}
+
 func eligibleKnowledgeSnapshot() *CaseSnapshot {
 	return &CaseSnapshot{
 		CaseID: "ANL-knowledge:hash", IncidentID: "INC-knowledge", RunID: "ANL-knowledge",
+		AnalysisHash:    "hash",
 		RootCauseFamily: "scheduler_capacity", ApprovedAt: time.Date(2026, 7, 13, 0, 0, 0, 0, time.UTC),
 		Snapshot: map[string]any{
 			"analysis_summary": "safe result summary", "analysis_detail": "safe result detail",
@@ -36,6 +45,186 @@ func eligibleKnowledgeSnapshot() *CaseSnapshot {
 				},
 			},
 		},
+	}
+}
+
+func confirmKnowledgeSnapshot(store *Store, snapshot *CaseSnapshot) {
+	store.evaluationReviews[evaluationKey(snapshot.RunID, snapshot.AnalysisHash, "operator")] = &EvaluationReview{
+		ReviewID:          "EVR-" + snapshot.RunID,
+		RunID:             snapshot.RunID,
+		AnalysisHash:      snapshot.AnalysisHash,
+		Reviewer:          "operator",
+		CaseType:          "known",
+		ExpectedFamily:    snapshot.RootCauseFamily,
+		Scores:            qualifyingKnowledgeReviewScores(),
+		ResolutionOutcome: "resolved",
+	}
+}
+
+func TestOperatorExpectedFamilyGatesKnowledgeGenerationAndPromotion(t *testing.T) {
+	store := NewStore()
+	snapshot := eligibleKnowledgeSnapshot()
+	store.caseSnapshots[snapshot.CaseID] = snapshot
+	review := &EvaluationReview{
+		ReviewID: "EVR-1", RunID: snapshot.RunID, AnalysisHash: snapshot.AnalysisHash,
+		Reviewer: "operator", CaseType: "known", ExpectedFamily: snapshot.RootCauseFamily,
+		Scores:            qualifyingKnowledgeReviewScores(),
+		ResolutionOutcome: "resolved",
+	}
+	store.evaluationReviews[evaluationKey(snapshot.RunID, snapshot.AnalysisHash, review.Reviewer)] = review
+	store.evaluationReviews[evaluationKey(snapshot.RunID, snapshot.AnalysisHash, "scorer")] = &EvaluationReview{
+		ReviewID: "EVR-2", RunID: snapshot.RunID, AnalysisHash: snapshot.AnalysisHash,
+		Reviewer: "scorer", CaseType: "known", Scores: qualifyingKnowledgeReviewScores(), ResolutionOutcome: "resolved",
+	}
+
+	candidate := store.knowledgeCandidateForSnapshotLocked(snapshot)
+	if candidate == nil || candidate.Status != knowledgeCandidateReady {
+		t.Fatalf("matching operator family should preserve existing safety-gated candidate: %+v", candidate)
+	}
+	store.knowledgeCandidates[candidate.CandidateID] = candidate
+
+	// A later correction on the same immutable analysis hash must both prevent
+	// new generation and block a previously generated candidate at promotion.
+	review.ExpectedFamily = "gpu_hardware_error"
+	if got := store.knowledgeCandidateForSnapshotLocked(snapshot); got != nil {
+		t.Fatalf("wrong-family review generated snapshot family candidate: %+v", got)
+	}
+	if _, _, err := store.ApproveKnowledgeCandidate(candidate.CandidateID, KnowledgeDecisionRequest{Actor: "operator"}); err == nil {
+		t.Fatal("wrong-family review did not block candidate promotion")
+	}
+}
+
+func TestOperatorReviewQualityVetoesKnowledgeGeneration(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*EvaluationReview)
+	}{
+		{
+			name: "score below 80 equivalent",
+			mutate: func(review *EvaluationReview) {
+				for _, dimension := range evaluationDimensions {
+					review.Scores[dimension] = 4
+				}
+				review.Scores["evidence_grounding"] = 3 // total 27/35, below 80%
+			},
+		},
+		{
+			name: "hard gate violation",
+			mutate: func(review *EvaluationReview) {
+				review.HardGates = map[string]bool{"invalid_evidence_links": true}
+			},
+		},
+		{
+			name: "ineffective outcome",
+			mutate: func(review *EvaluationReview) {
+				review.ResolutionOutcome = "ineffective"
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := NewStore()
+			snapshot := eligibleKnowledgeSnapshot()
+			review := &EvaluationReview{
+				ReviewID:          "EVR-quality",
+				RunID:             snapshot.RunID,
+				AnalysisHash:      snapshot.AnalysisHash,
+				Reviewer:          "operator",
+				CaseType:          "known",
+				ExpectedFamily:    snapshot.RootCauseFamily,
+				Scores:            qualifyingKnowledgeReviewScores(),
+				ResolutionOutcome: "resolved",
+			}
+			test.mutate(review)
+			store.evaluationReviews[evaluationKey(snapshot.RunID, snapshot.AnalysisHash, review.Reviewer)] = review
+			if got := store.knowledgeCandidateForSnapshotLocked(snapshot); got != nil {
+				t.Fatalf("unsafe operator review generated runtime knowledge: %+v", got)
+			}
+			if review.ExpectedFamily != snapshot.RootCauseFamily {
+				t.Fatalf("knowledge veto erased the independent evaluation label: %+v", review)
+			}
+		})
+	}
+}
+
+func TestOperatorReviewAt80EquivalentRemainsEligible(t *testing.T) {
+	store := NewStore()
+	snapshot := eligibleKnowledgeSnapshot()
+	scores := map[string]int{}
+	for _, dimension := range evaluationDimensions {
+		scores[dimension] = 4
+	}
+	store.evaluationReviews[evaluationKey(snapshot.RunID, snapshot.AnalysisHash, "operator")] = &EvaluationReview{
+		ReviewID:          "EVR-threshold",
+		RunID:             snapshot.RunID,
+		AnalysisHash:      snapshot.AnalysisHash,
+		Reviewer:          "operator",
+		CaseType:          "known",
+		ExpectedFamily:    snapshot.RootCauseFamily,
+		Scores:            scores,
+		ResolutionOutcome: "resolved",
+	}
+	if got := store.knowledgeCandidateForSnapshotLocked(snapshot); got == nil || got.Status != knowledgeCandidateReady {
+		t.Fatalf("80-equivalent operator review should meet the promotion floor: %+v", got)
+	}
+}
+
+func TestNoReviewCannotRevalidateAlreadyLinkedLegacyCandidate(t *testing.T) {
+	store := NewStore()
+	snapshot := eligibleKnowledgeSnapshot()
+	if got := store.knowledgeCandidateForSnapshotLocked(snapshot); got != nil {
+		t.Fatalf("no-review snapshot generated new model-family knowledge: %+v", got)
+	}
+
+	legacy := knowledgeCandidateForSnapshot(snapshot)
+	if legacy == nil || legacy.Status != knowledgeCandidateReady {
+		t.Fatalf("invalid legacy test fixture: %+v", legacy)
+	}
+	store.knowledgeCandidates[legacy.CandidateID] = legacy
+	if got := store.knowledgeCandidateForSnapshotLocked(snapshot); got != nil {
+		t.Fatalf("legacy candidate bypassed the operator family gate: %+v", got)
+	}
+	store.caseSnapshots[snapshot.CaseID] = snapshot
+	if _, _, err := store.ApproveKnowledgeCandidate(legacy.CandidateID, KnowledgeDecisionRequest{Actor: "operator"}); err == nil {
+		t.Fatal("legacy candidate without expected_family review was promoted")
+	}
+}
+
+func TestOperatorCaseTypeGatesKnowledgePromotion(t *testing.T) {
+	store := NewStore()
+	snapshot := eligibleKnowledgeSnapshot()
+	review := &EvaluationReview{
+		ReviewID: "EVR-1", RunID: snapshot.RunID, AnalysisHash: snapshot.AnalysisHash,
+		Reviewer: "operator", CaseType: "tool_degraded", ExpectedFamily: snapshot.RootCauseFamily,
+		Scores:            qualifyingKnowledgeReviewScores(),
+		ResolutionOutcome: "resolved",
+	}
+	store.evaluationReviews[evaluationKey(snapshot.RunID, snapshot.AnalysisHash, review.Reviewer)] = review
+	if got := store.knowledgeCandidateForSnapshotLocked(snapshot); got != nil {
+		t.Fatalf("tool-degraded evidence must not become runtime knowledge: %+v", got)
+	}
+
+	novel := cloneCaseSnapshot(snapshot)
+	novel.RootCauseFamily = "novel_scheduler_capacity_race_1234abcd"
+	knowledgeTraceForTest(&novel)["hypotheses"].([]any)[0].(map[string]any)["family"] = novel.RootCauseFamily
+	review.CaseType, review.ExpectedFamily = "novel", ""
+	if got := store.knowledgeCandidateForSnapshotLocked(&novel); got == nil || got.Status != knowledgeCandidateReady {
+		t.Fatalf("resolved novel review should confirm a novel-family snapshot: %+v", got)
+	}
+	conflictKey := evaluationKey(snapshot.RunID, snapshot.AnalysisHash, "known-reviewer")
+	store.evaluationReviews[conflictKey] = &EvaluationReview{
+		ReviewID: "EVR-2", RunID: snapshot.RunID, AnalysisHash: snapshot.AnalysisHash,
+		Reviewer: "known-reviewer", CaseType: "known", Scores: qualifyingKnowledgeReviewScores(), ResolutionOutcome: "resolved",
+	}
+	if got := store.knowledgeCandidateForSnapshotLocked(&novel); got != nil {
+		t.Fatalf("known/novel review disagreement must block promotion: %+v", got)
+	}
+	delete(store.evaluationReviews, conflictKey)
+
+	review.CaseType = "compositional"
+	review.ExpectedFamily = snapshot.RootCauseFamily
+	if got := store.knowledgeCandidateForSnapshotLocked(snapshot); got == nil || got.Status != knowledgeCandidateReady {
+		t.Fatalf("compositional primary-family match should remain eligible: %+v", got)
 	}
 }
 
@@ -163,6 +352,7 @@ func TestKnowledgePublicLifecycleAndRuntimeETag(t *testing.T) {
 	server.store.mu.Lock()
 	server.store.caseSnapshots[snapshot.CaseID] = snapshot
 	server.store.knowledgeCandidates[candidate.CandidateID] = candidate
+	confirmKnowledgeSnapshot(server.store, snapshot)
 	server.store.mu.Unlock()
 
 	decision, _ := json.Marshal(map[string]string{"action": "approve", "reason": "reviewed"})
@@ -327,6 +517,8 @@ func TestKnowledgeFingerprintCoalescesExactContentAndReplacesChangedContent(t *t
 	store := NewStore()
 	store.caseSnapshots[firstSnapshot.CaseID], store.caseSnapshots[replacementSnapshot.CaseID] = firstSnapshot, &replacementSnapshot
 	store.knowledgeCandidates[first.CandidateID], store.knowledgeCandidates[replacement.CandidateID] = first, replacement
+	confirmKnowledgeSnapshot(store, firstSnapshot)
+	confirmKnowledgeSnapshot(store, &replacementSnapshot)
 	if _, _, err := store.ApproveKnowledgeCandidate(first.CandidateID, KnowledgeDecisionRequest{Actor: "operator"}); err != nil {
 		t.Fatalf("approve first candidate: %v", err)
 	}
@@ -370,6 +562,7 @@ func TestKnowledgeShadowRequiresExplicitActivationAndStaysOutOfRuntime(t *testin
 	candidate := knowledgeCandidateForSnapshot(snapshot)
 	store.caseSnapshots[snapshot.CaseID] = snapshot
 	store.knowledgeCandidates[candidate.CandidateID] = candidate
+	confirmKnowledgeSnapshot(store, snapshot)
 
 	shadowed, shadow, err := store.ShadowKnowledgeCandidate(candidate.CandidateID, KnowledgeDecisionRequest{Actor: "operator", Note: "observe first"})
 	if err != nil || shadowed.Status != knowledgeCandidateShadow || shadow.Status != knowledgePackageShadow {
@@ -395,6 +588,7 @@ func TestKnowledgeShadowRequiresExplicitActivationAndStaysOutOfRuntime(t *testin
 	rejectedCandidate := knowledgeCandidateForSnapshot(rejectedSnapshot)
 	rejectedStore.caseSnapshots[rejectedSnapshot.CaseID] = rejectedSnapshot
 	rejectedStore.knowledgeCandidates[rejectedCandidate.CandidateID] = rejectedCandidate
+	confirmKnowledgeSnapshot(rejectedStore, rejectedSnapshot)
 	if _, _, err := rejectedStore.ShadowKnowledgeCandidate(rejectedCandidate.CandidateID, KnowledgeDecisionRequest{}); err != nil {
 		t.Fatalf("create rejectable shadow: %v", err)
 	}
@@ -414,6 +608,7 @@ func TestKnowledgeShadowAndActivateDecisionActions(t *testing.T) {
 	candidate := knowledgeCandidateForSnapshot(snapshot)
 	server.store.caseSnapshots[snapshot.CaseID] = snapshot
 	server.store.knowledgeCandidates[candidate.CandidateID] = candidate
+	confirmKnowledgeSnapshot(server.store, snapshot)
 
 	for _, action := range []string{"shadow", "activate"} {
 		body, _ := json.Marshal(map[string]string{"action": action, "actor": "operator"})

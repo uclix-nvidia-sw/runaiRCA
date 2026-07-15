@@ -85,7 +85,7 @@ def test_llm_failure_is_surfaced_not_silent(monkeypatch) -> None:
 
 def test_chat_context_reports_runai_mcp_and_drilldown_state() -> None:
     orchestrator = _orchestrator(
-        language="en", runai_mcp_url="http://localhost:8809/mcp", enable_agent_drilldown=True
+        language="en", runai_mcp_url="http://localhost:8080/mcp", enable_agent_drilldown=True
     )
     response = asyncio.run(orchestrator.chat(ChatRequest(message="can the agent use mcp?")))
     assert "runai_mcp=True" in response.answer

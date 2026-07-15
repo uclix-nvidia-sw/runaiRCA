@@ -3,6 +3,20 @@
 > **Lens:** Reference — the HTTP surface.
 > **In this doc:** Backend endpoints · Agent endpoints · webhook accept/ignore semantics.
 
+**Who this is for:** an operator testing an integration, or a developer building
+a client. An endpoint is simply one HTTP address that accepts a request or
+returns a record. Start with the webhook for alert intake, incidents for case
+views, and analysis runs for progress; use OpenAPI when a tool needs every field.
+
+```mermaid
+flowchart LR
+  W[Alertmanager webhook] --> I[Incident and alert APIs]
+  I --> A[Analyze and analysis-run APIs]
+  A --> E[Events/SSE and dashboard]
+  K[Knowledge APIs] --> I
+  H[Agent health] --> A
+```
+
 ## OpenAPI contract
 
 The Backend serves its GitBook-compatible **OpenAPI 3.0.3** contract at
@@ -16,6 +30,12 @@ loads the same-origin contract and can send requests directly with **Try it**;
 no Scalar account or hosted Scalar service is used.
 
 ## Endpoints
+
+### Choose an endpoint by task
+
+Read incident/alert endpoints to see a case, use analyze endpoints to request a
+fresh investigation, and use the events endpoint when a browser needs live
+updates. The detailed list below remains the authoritative route reference.
 
 Backend:
 
@@ -194,4 +214,4 @@ Agent:
 - `POST /analyze`
 - `POST /summarize-incident`
 - `POST /chat` context-aware RCA chat grounded in current incidents, alerts, evidence, feedback, and similar RCA memory
-- `GET /healthz`
+- `GET /healthz` returns process/runtime health and `collectors: {active, unknown}`. `unknown` lists unrecognized names supplied through `COLLECTORS`; it is configuration visibility, not collector health.

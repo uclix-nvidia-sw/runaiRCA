@@ -207,9 +207,6 @@ async function copyToClipboard(value: string) {
   document.body.removeChild(textarea);
 }
 
-const DEFAULT_HIGHLIGHT_PATTERN =
-  /CrashLoopBackOff|OOMKill(?:ed|ing)?|ImagePullBackOff|ErrImagePull(?:BackOff)?|ErrImageNeverPull|CreateContainerConfigError|CreateContainerError|RunContainerError|ContainerCannotRun|FailedScheduling|FailedMount|FailedAttachVolume|FailedCreate|Unschedulable|Evicted|Preempt(?:ed|ion|or)?|NotReady|DiskPressure|MemoryPressure|PIDPressure|NetworkUnavailable|Unhealthy|Back-?[Oo]ff restarting|startup probe failed|liveness probe failed|readiness probe failed|Xid\s*[:=]?\s*\d+|NVRM|NCCL\s+WARN|fell off the bus|no space left|read-?only file ?system|connection refused|permission denied|panic:|segfault|out of memory|deadline exceeded|exit code \d+/;
-
 function escapeRegExp(text: string) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -217,9 +214,14 @@ function escapeRegExp(text: string) {
 export function highlightSegments(text: string, extraTerms?: string[]) {
   if (!text) return [text];
   const extras = (extraTerms ?? []).map((term) => term.trim()).filter(Boolean).map(escapeRegExp);
-  const source = extras.length
-    ? `${DEFAULT_HIGHLIGHT_PATTERN.source}|${extras.join('|')}`
-    : DEFAULT_HIGHLIGHT_PATTERN.source;
+  // Rendering must not independently infer failures from raw YAML/JSON.  The
+  // backend emits `artifact.highlights` only after collector-specific polarity
+  // checks (for example PodScheduled=False).  With no verified highlights,
+  // preserve the result verbatim and show no red markers.
+  if (extras.length === 0) return [text];
+  // Match a complete marker, not a prefix inside a configuration value such as
+  // `PreemptLowerPriority`.
+  const source = `(?<![A-Za-z0-9_])(?:${extras.join('|')})(?![A-Za-z0-9_])`;
   let pattern: RegExp;
   try {
     pattern = new RegExp(source, 'gi');

@@ -17,6 +17,7 @@ from app.collectors.base import CollectorResult
 from app.collectors.http_json import JsonResponse
 from app.plan import InvestigationPlan
 from app.services import investigator
+from app.services.evidence_blackboard import normalize_artifact
 from tests.test_orchestrator import make_settings, make_target
 
 
@@ -59,6 +60,14 @@ def test_k8s_read_builds_get_list_paths(monkeypatch) -> None:
     # cluster-scoped kind ignores the namespace segment
     asyncio.run(k8s.k8s_read(settings, "storageclass"))
     assert calls[-1]["path"] == "/apis/storage.k8s.io/v1/storageclasses"
+
+    # cluster-wide Pod LIST pinned to one assigned node
+    out = asyncio.run(
+        k8s.k8s_read(settings, "pods", field_selector="spec.nodeName=gpu-node-a")
+    )
+    assert out["field_selector"] == "spec.nodeName=gpu-node-a"
+    assert calls[-1]["path"] == "/api/v1/pods"
+    assert calls[-1]["params"]["fieldSelector"] == "spec.nodeName=gpu-node-a"
 
 
 def test_full_pod_inspection_masks_direct_api_environment_values(monkeypatch) -> None:
@@ -116,9 +125,270 @@ def test_resolve_live_pod_node_encodes_path_segments(monkeypatch) -> None:
 
     assert calls == [
         "/api/v1/namespaces/runai%2F..%2F..%2Fapi/pods/pod%2F..%2F..%2Fnodes",
-        "/api/v1/namespaces/runai%2F..%2F..%2Fapi/events",
         "/api/v1/namespaces/runai%2F..%2F..%2Fapi/pods",
+        "/api/v1/namespaces/runai%2F..%2F..%2Fapi/events",
     ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_live_pod_node_uses_mcp_namespace_wide_list_without_direct_token(
+    monkeypatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def fake_mcp_read(
+        _settings,
+        _resolved,
+        namespace="",
+        name="",
+        label_selector="",
+        full_object=False,
+    ):
+        calls.append((namespace, name))
+        assert full_object is True
+        if name:
+            return {
+                "kind": "pods",
+                "namespace": namespace,
+                "name": name,
+                "status_code": 200,
+                "error": None,
+                "data": {
+                    "metadata": {"name": name, "namespace": namespace},
+                    "spec": {"nodeName": "gpu-node-7"},
+                    "status": {"phase": "Running"},
+                },
+            }
+        return {
+            "kind": "pods",
+            "namespace": namespace,
+            "name": "",
+            "status_code": 200,
+            "error": None,
+            "data": {
+                "metadata": {"continue": ""},
+                "items": [
+                    {
+                        "metadata": {"name": "trainer-0", "namespace": namespace},
+                        "spec": {"nodeName": "gpu-node-7"},
+                        "status": {"phase": "Running"},
+                    }
+                ],
+            },
+        }
+
+    def direct_token_should_not_be_read(_path: str) -> str:
+        raise AssertionError("MCP node discovery must not require the agent token")
+
+    monkeypatch.setattr(k8s, "_k8s_read_via_mcp", fake_mcp_read)
+    monkeypatch.setattr(k8s, "_read_file", direct_token_should_not_be_read)
+    settings = replace(make_settings(), kubernetes_mcp_url="http://kubernetes-mcp/mcp")
+
+    resolved = await k8s.resolve_live_pod_node(settings, "team-a", "trainer-0")
+
+    assert resolved == ("trainer-0", "gpu-node-7")
+    assert calls == [("team-a", "trainer-0"), ("team-a", "")]
+
+
+@pytest.mark.asyncio
+async def test_resolve_live_pod_node_uses_unambiguous_workload_prefix_for_stale_pod(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    async def fake_read(_settings, _kind, namespace="", name="", **_kwargs):
+        calls.append(name or "<wide-list>")
+        if name:
+            return {"status_code": 404, "error": "not found", "data": None}
+        return {
+            "status_code": 200,
+            "error": None,
+            "data": {
+                "metadata": {"continue": ""},
+                "items": [
+                    {
+                        "metadata": {
+                            "name": "slack-test1-worker-new99",
+                            "namespace": namespace,
+                            "creationTimestamp": "2026-07-14T06:00:00Z",
+                        },
+                        "spec": {"nodeName": "gpu-node-9"},
+                        "status": {
+                            "phase": "Failed",
+                            "containerStatuses": [],
+                        },
+                    },
+                    {
+                        "metadata": {
+                            "name": "different-workload-abcde",
+                            "namespace": namespace,
+                        },
+                        "spec": {"nodeName": "gpu-node-other"},
+                        "status": {"phase": "Running"},
+                    },
+                ],
+            },
+        }
+
+    async def no_events(*_args, **_kwargs):
+        raise AssertionError("a live workload match should resolve before historical events")
+
+    monkeypatch.setattr(k8s, "k8s_read", fake_read)
+    monkeypatch.setattr(k8s, "_describe_events", no_events)
+
+    resolved = await k8s.resolve_live_pod_node(
+        make_settings(),
+        "runai-test-pro3",
+        "slack-test1-deleted99",
+        workload="slack-test1",
+    )
+
+    assert resolved == ("slack-test1-worker-new99", "gpu-node-9")
+    assert calls == ["slack-test1-deleted99", "<wide-list>"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_live_pod_node_refuses_replacement_from_incomplete_list(
+    monkeypatch,
+) -> None:
+    async def fake_read(_settings, _kind, namespace="", name="", **_kwargs):
+        if name:
+            return {"status_code": 404, "error": "not found", "data": None}
+        return {
+            "status_code": 200,
+            "error": None,
+            "data": {
+                "metadata": {"continue": "next-page"},
+                "items": [
+                    {
+                        "metadata": {
+                            "name": "trainer-worker-a",
+                            "namespace": namespace,
+                        },
+                        "spec": {"nodeName": "gpu-node-1"},
+                        "status": {"phase": "Failed", "containerStatuses": []},
+                    }
+                ],
+            },
+        }
+
+    async def no_events(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(k8s, "k8s_read", fake_read)
+    monkeypatch.setattr(k8s, "_describe_events", no_events)
+    monkeypatch.setattr(k8s, "_read_file", lambda _path: "")
+
+    resolved = await k8s.resolve_live_pod_node(
+        make_settings(),
+        "team-a",
+        "trainer-deleted99",
+        workload="trainer",
+    )
+
+    assert resolved == ("", "")
+
+
+@pytest.mark.asyncio
+async def test_resolve_live_pod_node_paginates_past_50_before_replica_inference(
+    monkeypatch,
+) -> None:
+    calls: list[dict] = []
+
+    def pod(name: str, node: str) -> dict:
+        return {
+            "metadata": {"name": name, "namespace": "team-a"},
+            "spec": {"nodeName": node},
+            "status": {"phase": "Failed", "containerStatuses": []},
+        }
+
+    async def fake_get_json(**kwargs):
+        calls.append(kwargs)
+        path = kwargs["path"]
+        params = kwargs.get("params") or {}
+        if path.endswith("/pods/trainer-deleted99"):
+            return JsonResponse(
+                url=path,
+                status_code=404,
+                data={},
+                error="HTTP 404",
+            )
+        if path.endswith("/pods") and params.get("continue") == "page-2":
+            return JsonResponse(
+                url=path,
+                status_code=200,
+                data={
+                    "metadata": {"continue": ""},
+                    "items": [pod("trainer-worker-b", "gpu-node-2")],
+                },
+            )
+        if path.endswith("/pods"):
+            unrelated = [
+                pod(f"unrelated-{index:02d}", "gpu-node-other") for index in range(49)
+            ]
+            return JsonResponse(
+                url=path,
+                status_code=200,
+                data={
+                    "metadata": {"continue": "page-2"},
+                    "items": [pod("trainer-worker-a", "gpu-node-1"), *unrelated],
+                },
+            )
+        if path.endswith("/events"):
+            return JsonResponse(
+                url=path,
+                status_code=200,
+                data={"metadata": {"continue": ""}, "items": []},
+            )
+        raise AssertionError(f"unexpected Kubernetes path: {path}")
+
+    monkeypatch.setattr(k8s, "get_json", fake_get_json)
+    monkeypatch.setattr(k8s, "_read_file", lambda _path: "token")
+
+    resolved = await k8s.resolve_live_pod_node(
+        make_settings(),
+        "team-a",
+        "trainer-deleted99",
+        workload="trainer",
+    )
+
+    assert resolved == ("", "")
+    assert any((call.get("params") or {}).get("continue") == "page-2" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_resolve_live_pod_node_does_not_borrow_sibling_node_for_pending_exact_pod(
+    monkeypatch,
+) -> None:
+    pending = {
+        "metadata": {"name": "trainer-0", "namespace": "team-a"},
+        "spec": {"nodeName": ""},
+        "status": {"phase": "Pending"},
+    }
+
+    async def fake_read(_settings, _kind, namespace="", name="", **_kwargs):
+        if name:
+            return {"status_code": 200, "error": None, "data": pending}
+        return {
+            "status_code": 200,
+            "error": None,
+            "data": {
+                "items": [
+                    pending,
+                    {
+                        "metadata": {"name": "trainer-1", "namespace": namespace},
+                        "spec": {"nodeName": "gpu-node-2"},
+                        "status": {"phase": "Running"},
+                    },
+                ]
+            },
+        }
+
+    monkeypatch.setattr(k8s, "k8s_read", fake_read)
+
+    assert await k8s.resolve_live_pod_node(
+        make_settings(), "team-a", "trainer-0", workload="trainer"
+    ) == ("trainer-0", "")
 
 
 def test_kubectl_repr_quotes_multiline_values() -> None:
@@ -158,6 +428,266 @@ async def test_mcp_named_read_rejects_a_different_resource(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_mcp_field_selector_uses_generic_list_and_enforces_assignment(monkeypatch) -> None:
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_mcp_json(_settings, candidates):
+        captured.extend(candidates)
+        # Simulate a proxy accepting but ignoring fieldSelector.
+        return {
+            "apiVersion": "v1",
+            "kind": "PodList",
+            "metadata": {},
+            "items": [
+                {
+                    "metadata": {"name": "on-a", "namespace": "team-a"},
+                    "spec": {"nodeName": "gpu-node-a"},
+                },
+                {
+                    "metadata": {"name": "on-b", "namespace": "team-b"},
+                    "spec": {"nodeName": "gpu-node-b"},
+                },
+            ],
+        }
+
+    monkeypatch.setattr(k8s, "_k8s_mcp_json", fake_mcp_json)
+    result = await k8s._k8s_read_via_mcp(
+        replace(make_settings(), kubernetes_mcp_url="http://kubernetes-mcp/mcp"),
+        "pods",
+        field_selector="spec.nodeName=gpu-node-a",
+        full_object=True,
+    )
+
+    assert captured
+    assert all(tool == "resources_list" for tool, _args in captured)
+    assert captured[0][1]["fieldSelector"] == "spec.nodeName=gpu-node-a"
+    assert [pod["metadata"]["name"] for pod in result["data"]["items"]] == ["on-a"]
+
+
+@pytest.mark.asyncio
+async def test_gpu_scheduling_snapshot_collects_node_capacity_and_assigned_requests(
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_read(
+        _settings,
+        kind,
+        namespace="",
+        name="",
+        label_selector="",
+        field_selector="",
+        *,
+        full_object=False,
+    ):
+        calls.append(
+            {
+                "kind": kind,
+                "namespace": namespace,
+                "name": name,
+                "field_selector": field_selector,
+                "full_object": full_object,
+            }
+        )
+        if kind == "nodes":
+            return {
+                "url": f"https://kubernetes.default.svc/api/v1/nodes/{name}",
+                "status_code": 200,
+                "error": None,
+                "data": {
+                    "metadata": {"name": name},
+                    "status": {
+                        "capacity": {"nvidia.com/gpu": "8"},
+                        "allocatable": {"nvidia.com/gpu": "8"},
+                    },
+                },
+            }
+        return {
+            "url": "https://kubernetes.default.svc/api/v1/pods",
+            "status_code": 200,
+            "error": None,
+            "data": {
+                "apiVersion": "v1",
+                "kind": "PodList",
+                "metadata": {},
+                "items": [
+                    {
+                        "metadata": {"namespace": "team-a", "name": "train-a"},
+                        "spec": {
+                            "nodeName": "gpu-node-a",
+                            "containers": [
+                                {
+                                    "resources": {
+                                        "requests": {"nvidia.com/gpu": "2"}
+                                    }
+                                }
+                            ],
+                        },
+                        "status": {"phase": "Running"},
+                    },
+                    {
+                        "metadata": {"namespace": "team-b", "name": "train-b"},
+                        "spec": {
+                            "nodeName": "gpu-node-a",
+                            "containers": [
+                                {
+                                    # Extended resources may be limits-only.
+                                    "resources": {"limits": {"nvidia.com/gpu": "4"}}
+                                }
+                            ],
+                        },
+                        "status": {"phase": "Pending"},
+                    },
+                    {
+                        "metadata": {"namespace": "team-a", "name": "completed"},
+                        "spec": {
+                            "nodeName": "gpu-node-a",
+                            "containers": [
+                                {
+                                    "resources": {
+                                        "requests": {"nvidia.com/gpu": "8"}
+                                    }
+                                }
+                            ],
+                        },
+                        "status": {"phase": "Succeeded"},
+                    },
+                    {
+                        "metadata": {"namespace": "team-z", "name": "other-node"},
+                        "spec": {
+                            "nodeName": "gpu-node-z",
+                            "containers": [
+                                {
+                                    "resources": {
+                                        "requests": {"nvidia.com/gpu": "8"}
+                                    }
+                                }
+                            ],
+                        },
+                        "status": {"phase": "Running"},
+                    },
+                ],
+            },
+        }
+
+    monkeypatch.setattr(k8s, "k8s_read", fake_read)
+    target = replace(make_target(), node="", node_source="")
+    plan = InvestigationPlan(
+        hypotheses=[
+            {
+                "family": "k8s_scheduling_error",
+                "reason": "FailedScheduling: Insufficient nvidia.com/gpu",
+            }
+        ]
+    )
+    snapshots = await k8s._collect_gpu_node_resource_observations(
+        make_settings(),
+        target,
+        plan,
+        [
+            {
+                "reason": "FailedScheduling",
+                "message": (
+                    "Insufficient nvidia.com/gpu while evaluating capacity "
+                    "on node gpu-node-a"
+                ),
+                "target_identity_verified": True,
+            }
+        ],
+    )
+
+    assert len(snapshots) == 1
+    snapshot = snapshots[0]
+    assert snapshot["gpu_capacity"] == 8
+    assert snapshot["gpu_allocatable"] == 8
+    assert snapshot["gpu_requested"] == 6
+    assert snapshot["gpu_estimated_free"] == 2
+    assert snapshot["scheduled_non_terminal_pods"] == 2
+    assert snapshot["snapshot_role"] == "current_context"
+    assert snapshot["observation"] == {
+        "kind": "kubernetes_node_gpu_resources",
+        "predicate": "kubernetes_node_gpu_resources",
+        "polarity": "unknown",
+        "coverage": "partial",
+        "observation_window": {},
+        "snapshot_role": "current_context",
+        "observed_entity": {"kind": "node", "name": "gpu-node-a"},
+    }
+    assert {call["kind"] for call in calls} == {"nodes", "pods"}
+    pod_call = next(call for call in calls if call["kind"] == "pods")
+    assert pod_call["namespace"] == ""
+    assert pod_call["field_selector"] == "spec.nodeName=gpu-node-a"
+    assert pod_call["full_object"] is True
+
+    card = k8s._gpu_node_resource_artifact("kubernetes", make_settings(), snapshot)
+    assert card.type == "kubernetes_node_gpu_resources"
+    assert "kubectl get pods -A --field-selector spec.nodeName=gpu-node-a" in card.query
+    assert card.result["observation"]["polarity"] == "unknown"
+    fact = normalize_artifact(card, require_typed_observation=True)
+    assert fact.polarity == "unknown"
+    assert fact.coverage == "partial"
+    assert fact.eligibility.support is False
+    assert fact.eligibility.refutation is False
+    assert fact.eligibility.context is True
+
+
+@pytest.mark.asyncio
+async def test_gpu_snapshot_ignores_preemption_policy_and_generic_node_affinity(
+    monkeypatch,
+) -> None:
+    async def unexpected_read(*_args, **_kwargs):
+        raise AssertionError("non-shortage scheduling text must not trigger node reads")
+
+    monkeypatch.setattr(k8s, "k8s_read", unexpected_read)
+    plan = InvestigationPlan(
+        hypotheses=[
+            {
+                "family": "k8s_scheduling_error",
+                "reason": "preemptionPolicy=PreemptLowerPriority",
+            }
+        ]
+    )
+    target = replace(make_target(), node="")
+    events = [
+        {
+            "reason": "FailedScheduling",
+            "message": "placement failed on node affinity; preemption is not helpful",
+            "target_identity_verified": True,
+        }
+    ]
+
+    assert await k8s._collect_gpu_node_resource_observations(
+        make_settings(), target, plan, events
+    ) == []
+    assert k8s._gpu_snapshot_candidate_nodes(target, events) == []
+
+
+def test_gpu_snapshot_extracts_runai_angle_bracket_node() -> None:
+    target = replace(make_target(), node="")
+    events = [
+        {
+            "reason": "Unschedulable",
+            "message": (
+                "Unschedulable: <dgx02>: Node didn't have enough resources: "
+                "GPUs, requested: 1, used: 8, capacity: 8"
+            ),
+            "target_identity_verified": True,
+        }
+    ]
+
+    assert k8s._gpu_snapshot_candidate_nodes(target, events) == ["dgx02"]
+    plan = InvestigationPlan(
+        hypotheses=[
+            {
+                "family": "k8s_scheduling_error",
+                "reason": "verify the exact scheduler Warning",
+            }
+        ]
+    )
+    assert k8s._gpu_scheduling_snapshot_requested(plan, events) is True
+
+
+@pytest.mark.asyncio
 async def test_mcp_list_read_rejects_empty_success_payload(monkeypatch) -> None:
     class Result:
         isError = False
@@ -177,6 +707,7 @@ async def test_mcp_list_read_rejects_empty_success_payload(monkeypatch) -> None:
 
 def test_k8s_describe_uses_mcp_full_pod_and_filters_its_events(monkeypatch) -> None:
     calls: list[str] = []
+    event_selectors: list[str] = []
 
     class Result:
         isError = False
@@ -188,17 +719,22 @@ def test_k8s_describe_uses_mcp_full_pod_and_filters_its_events(monkeypatch) -> N
     async def fake_mcp_call(_url, tool, _arguments):
         calls.append(tool)
         if tool in {"pods_get", "resources_get"}:
-            return Result(
-                {
-                    "metadata": {"name": "worker-0", "namespace": "team-a"},
-                    "spec": {
-                        "containers": [
-                            {"name": "main", "env": [{"name": "MODE", "value": "train"}]}
-                        ]
-                    },
-                    "status": {"phase": "Failed"},
-                }
-            )
+            if _arguments.get("kind") == "Event":
+                event_selectors.append(str(_arguments.get("fieldSelector") or ""))
+            else:
+                return Result(
+                    {
+                        "metadata": {"name": "worker-0", "namespace": "team-a"},
+                        "spec": {
+                            "containers": [
+                                {"name": "main", "env": [{"name": "MODE", "value": "train"}]}
+                            ]
+                        },
+                        "status": {"phase": "Failed"},
+                    }
+                )
+        if tool == "resources_list" and _arguments.get("kind") == "Event":
+            event_selectors.append(str(_arguments.get("fieldSelector") or ""))
         return Result(
             {
                 "items": [
@@ -244,6 +780,7 @@ def test_k8s_describe_uses_mcp_full_pod_and_filters_its_events(monkeypatch) -> N
 
     assert calls[0] == "resources_get"
     assert "events_list" in calls or "resources_list" in calls
+    assert event_selectors == ["involvedObject.name=worker-0,involvedObject.kind=Pod"]
     assert result["object"]["spec"]["containers"][0]["env"][0]["value"] == "[MASKED]"
     assert result["observed_entity"] == {
         "kind": "pod",

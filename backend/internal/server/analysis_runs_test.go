@@ -116,7 +116,54 @@ func TestAnalysisRunSuccessAppliesRCA(t *testing.T) {
 	}
 }
 
-func TestAnalysisRunStoresLLMUsageMetadataAndClearsOnReanalysis(t *testing.T) {
+func TestResolvedAnalysisRequestCarriesStoredHistoricalWindow(t *testing.T) {
+	received := make(chan AgentAnalysisRequest, 1)
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		var request AgentAnalysisRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err == nil {
+			received <- request
+		}
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Historical window inspected.",
+			AnalysisDetail:  "## Root Cause\n\nHistorical evidence retained.",
+			AnalysisQuality: "high",
+		})
+	})
+	firedAt := time.Date(2026, 7, 10, 1, 0, 0, 123456789, time.UTC)
+	resolvedAt := firedAt.Add(10 * time.Minute)
+	incident, record := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "resolved-window"}, Alert{
+		Status:      "resolved",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue recovered"},
+		Fingerprint: "fp-resolved-window",
+		StartsAt:    firedAt.Format(time.RFC3339Nano),
+		EndsAt:      resolvedAt.Format(time.RFC3339Nano),
+	})
+
+	run, ok := server.startAnalysisRun("incident", incident.IncidentID, "manual", "reanalyze")
+	if !ok {
+		t.Fatal("expected resolved manual analysis to start")
+	}
+	waitForRunIDStatus(t, server, run.RunID, "complete")
+
+	select {
+	case request := <-received:
+		if request.Alert.Fingerprint != record.Fingerprint {
+			t.Fatalf("expected selected stored alert, got %+v", request.Alert)
+		}
+		if request.Alert.StartsAt != firedAt.Format(time.RFC3339Nano) {
+			t.Fatalf("expected historical startsAt, got %q", request.Alert.StartsAt)
+		}
+		if request.Alert.EndsAt != resolvedAt.Format(time.RFC3339Nano) {
+			t.Fatalf("expected historical endsAt, got %q", request.Alert.EndsAt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("agent request was not captured")
+	}
+}
+
+func TestAnalysisRunStoresUsageAndPreservesLastGoodMetadataOnReanalysis(t *testing.T) {
 	store := NewStore()
 	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "usage"}, Alert{
 		Status:      "firing",
@@ -157,8 +204,78 @@ func TestAnalysisRunStoresLLMUsageMetadataAndClearsOnReanalysis(t *testing.T) {
 	}
 
 	reused, created := store.CreateAnalysisRunIfAllowed("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Again", "")
-	if !created || reused.RunID != run.RunID || reused.Metadata != nil || reused.FirstCompletedAt == nil {
-		t.Fatalf("reanalysis should reuse row and clear metadata, created=%t run=%+v", created, reused)
+	lastGood := analysisResultMetadata(&reused)
+	if !created || reused.RunID != run.RunID || reused.FirstCompletedAt == nil ||
+		lastGood["llm_usage"] == nil || reused.Metadata["progress_log"] != nil {
+		t.Fatalf("reanalysis should reuse the row, retain last-good metadata, and clear attempt progress; created=%t run=%+v", created, reused)
+	}
+}
+
+func TestFailedReanalysisRestoresLastGoodMetadata(t *testing.T) {
+	store := NewStore()
+	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "metadata-restore"}, Alert{
+		Status: "firing", Labels: map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"}, Fingerprint: "fp-metadata-restore",
+	})
+	run := store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Initial", "")
+	run, _ = store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "trusted RCA",
+		Context: map[string]any{
+			"analysis_hash": "hash-good",
+			"harness":       map[string]any{"verdict": "pass"},
+			"llm_usage":     map[string]any{"total_tokens": float64(42)},
+		},
+	})
+	reused, created := store.CreateAnalysisRunIfAllowed(
+		"manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Retry", "",
+	)
+	if !created || currentAnalysisHash(&reused) != "hash-good" {
+		t.Fatalf("reanalysis did not expose its last-good metadata: created=%t run=%+v", created, reused)
+	}
+	if _, _, ok := store.AppendAnalysisProgress(reused.RunID, map[string]any{"phase": "investigation"}); !ok {
+		t.Fatal("failed to append retry progress")
+	}
+	failed, ok := store.FailAnalysisRun(reused.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "fallback must not replace the trusted RCA",
+		Context: map[string]any{
+			"analysis_hash": "hash-failed-attempt",
+			"harness":       map[string]any{"verdict": "failed"},
+		},
+	})
+	if !ok || currentAnalysisHash(&failed) != "hash-good" || failed.Metadata[previousSuccessMetadataKey] != nil {
+		t.Fatalf("failed retry did not restore last-good metadata: ok=%t run=%+v", ok, failed)
+	}
+	harness, _ := failed.Metadata["harness"].(map[string]any)
+	usage, _ := failed.Metadata["llm_usage"].(map[string]any)
+	progress, _ := failed.Metadata["progress_log"].([]any)
+	if harness["verdict"] != "pass" || usage["total_tokens"] != float64(42) || len(progress) != 1 {
+		t.Fatalf("restored metadata or failed-attempt progress is incomplete: %+v", failed.Metadata)
+	}
+	detail, _ := store.IncidentDetail(incident.IncidentID)
+	if detail.AnalysisHash != "hash-good" || detail.Harness["verdict"] != "pass" || detail.TokenUsage["total_tokens"] != float64(42) {
+		t.Fatalf("incident detail lost last-good verification metadata: %+v", detail)
+	}
+}
+
+func TestStaleReanalysisRestoresLastGoodMetadata(t *testing.T) {
+	store := NewStore()
+	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "metadata-reap"}, Alert{
+		Status: "firing", Labels: map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"}, Fingerprint: "fp-metadata-reap",
+	})
+	run := store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Initial", "")
+	store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "trusted RCA",
+		Context:         map[string]any{"analysis_hash": "hash-before-restart", "harness": map[string]any{"verdict": "pass"}},
+	})
+	store.CreateAnalysisRunIfAllowed("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Retry", "")
+
+	if reaped := store.ReapStaleAnalyzingRuns(0, 0); reaped != 1 {
+		t.Fatalf("expected one stale retry to be reaped, got %d", reaped)
+	}
+	after, _ := store.AnalysisRun(run.RunID)
+	if after.Status != "failed" || currentAnalysisHash(&after) != "hash-before-restart" || after.Metadata[previousSuccessMetadataKey] != nil {
+		t.Fatalf("stale retry lost its last-good metadata: %+v", after)
 	}
 }
 
@@ -243,6 +360,51 @@ func TestAnalysisProgressHandlerReturnsConflictForNonAnalyzingRun(t *testing.T) 
 		if rec.Code != http.StatusConflict {
 			t.Fatalf("expected 409 for %s, got %d: %s", path, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+func TestAnalysisRunGetReturnsExactRun(t *testing.T) {
+	server := NewServer()
+	incident, alert := seedAlert(t, server, "fp-run-get")
+	run := server.store.CreateAnalysisRun("manual", "alert", alert.AlertID, incident.IncidentID, alert.AlertID, "Manual", "")
+
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/analysis-runs/"+run.RunID, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("exact run status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Data AnalysisRun `json:"data"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil || body.Data.RunID != run.RunID {
+		t.Fatalf("exact run response mismatch err=%v body=%+v", err, body)
+	}
+
+	rec = httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/analysis-runs/ANL-missing", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing exact run status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestIncidentDetailSeparatesActiveRunFromLastGoodRCA(t *testing.T) {
+	store := NewStore()
+	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "active-vs-last-good"}, Alert{
+		Status: "firing", Labels: map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"}, Fingerprint: "fp-active-vs-last-good",
+	})
+	lastGood := store.CreateAnalysisRun("manual", "alert", alert.AlertID, incident.IncidentID, alert.AlertID, "Alert analysis", "")
+	lastGood, _ = store.CompleteAnalysisRun(lastGood.RunID, AgentAnalysisResponse{AnalysisSummary: "last good"})
+	active := store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Incident reanalysis", "")
+
+	detail, ok := store.IncidentDetail(incident.IncidentID)
+	if !ok || detail.AnalysisRunID != lastGood.RunID || detail.ActiveAnalysisRunID != active.RunID {
+		t.Fatalf("active and last-good runs were not separated: ok=%t detail=%+v", ok, detail)
+	}
+	store.CompleteAnalysisRun(active.RunID, AgentAnalysisResponse{AnalysisSummary: "new good"})
+	detail, _ = store.IncidentDetail(incident.IncidentID)
+	if detail.ActiveAnalysisRunID != "" || detail.AnalysisRunID != active.RunID || detail.AnalysisSummary != "new good" {
+		t.Fatalf("completed active run did not replace last-good RCA: %+v", detail)
 	}
 }
 
@@ -458,6 +620,97 @@ func TestAnalysisRunTimeoutFailsRun(t *testing.T) {
 	}
 	if hit.Load() == 0 {
 		t.Fatalf("agent was never called")
+	}
+}
+
+func TestAgentDeadlineTerminalResponseFailsFirstRunAndSurfacesDiagnosis(t *testing.T) {
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "failed",
+			TerminalReason:  "deadline_exceeded",
+			AnalysisSummary: "Analysis was stopped after exceeding the 1000s deadline.",
+			AnalysisDetail:  "Evidence gathering exceeded the hard deadline; retry the analysis.",
+			AnalysisQuality: "degraded",
+			Warnings:        []string{"analysis exceeded the 1000s deadline and was stopped"},
+		})
+	})
+	incident, record := seedAlert(t, server, "fp-agent-terminal-deadline")
+
+	server.startAnalysisRun("alert", record.AlertID, "manual", "")
+
+	run := waitForRunStatus(t, server, "manual", "failed")
+	if run.AnalysisQuality != "degraded" ||
+		!strings.Contains(run.AnalysisSummary, "1000s deadline") ||
+		!strings.Contains(run.AnalysisDetail, "hard deadline") {
+		t.Fatalf("first terminal attempt did not retain the degraded diagnosis: %+v", run)
+	}
+	detail, ok := server.store.IncidentDetail(incident.IncidentID)
+	if !ok || detail.AnalysisQuality != "degraded" ||
+		!strings.Contains(detail.AnalysisSummary, "1000s deadline") {
+		t.Fatalf("first terminal attempt was not exposed on the incident: ok=%t detail=%+v", ok, detail)
+	}
+}
+
+func TestAgentDeadlineTerminalResponsePreservesLastGoodRCAAndMetadata(t *testing.T) {
+	server, _ := analysisAgentStub(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "failed",
+			TerminalReason:  "deadline_exceeded",
+			AnalysisSummary: "deadline fallback must not replace trusted RCA",
+			AnalysisDetail:  "terminal attempt exceeded its deadline",
+			AnalysisQuality: "degraded",
+			Context: map[string]any{
+				"analysis_hash": "hash-deadline-attempt",
+				"harness":       map[string]any{"verdict": "failed"},
+			},
+		})
+	})
+	incident, record := seedAlert(t, server, "fp-agent-terminal-preserve")
+	prior := server.store.CreateAnalysisRun(
+		"manual",
+		"alert",
+		record.AlertID,
+		incident.IncidentID,
+		record.AlertID,
+		"Initial trusted analysis",
+		"",
+	)
+	prior, ok := server.store.CompleteAnalysisRun(prior.RunID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Trusted RCA: queue quota saturation.",
+		AnalysisDetail:  "## Root Cause\n\nQueue quota exhausted.",
+		AnalysisQuality: "high",
+		Context: map[string]any{
+			"analysis_hash": "hash-last-good",
+			"harness":       map[string]any{"verdict": "pass"},
+			"llm_usage":     map[string]any{"total_tokens": float64(42)},
+		},
+	})
+	if !ok {
+		t.Fatal("failed to seed last-good analysis")
+	}
+
+	reused, started := server.startAnalysisRun("alert", record.AlertID, "manual", "")
+	if !started || reused.RunID != prior.RunID {
+		t.Fatalf("expected terminal retry to reuse last-good row: started=%t run=%+v", started, reused)
+	}
+	failed := waitForRunIDStatus(t, server, prior.RunID, "failed")
+	if failed.AnalysisSummary != prior.AnalysisSummary ||
+		failed.AnalysisDetail != prior.AnalysisDetail ||
+		failed.AnalysisQuality != "high" ||
+		currentAnalysisHash(&failed) != "hash-last-good" {
+		t.Fatalf("terminal retry overwrote the last-good RCA or metadata: %+v", failed)
+	}
+	harness, _ := failed.Metadata["harness"].(map[string]any)
+	usage, _ := failed.Metadata["llm_usage"].(map[string]any)
+	if harness["verdict"] != "pass" || usage["total_tokens"] != float64(42) ||
+		failed.Metadata[previousSuccessMetadataKey] != nil {
+		t.Fatalf("terminal retry did not restore last-good metadata: %+v", failed.Metadata)
+	}
+	detail, ok := server.store.IncidentDetail(incident.IncidentID)
+	if !ok || detail.AnalysisSummary != prior.AnalysisSummary ||
+		detail.AnalysisHash != "hash-last-good" {
+		t.Fatalf("incident lost last-good RCA after terminal retry: ok=%t detail=%+v", ok, detail)
 	}
 }
 

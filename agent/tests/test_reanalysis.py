@@ -13,9 +13,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.collectors.base import AnalysisTarget, CollectorResult
+from app.collectors.base import AnalysisTarget, CollectorResult, artifact
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services import pipeline
+from app.services.evidence_blackboard import EvidenceEligibility
 from app.services.orchestrator import AnalysisOrchestrator
 from app.services.pipeline import _collector_name
 from tests.test_orchestrator import make_settings
@@ -241,6 +242,106 @@ async def test_refuted_top_cause_triggers_exactly_one_reanalysis(monkeypatch) ->
 
 
 @pytest.mark.asyncio
+async def test_completed_followup_is_preserved_when_evidence_budget_expires(
+    monkeypatch,
+) -> None:
+    _stub_llm_http(monkeypatch)
+    investigate_calls: list[int] = []
+    refute_calls: list[str] = []
+    _install_stubs(
+        monkeypatch,
+        verdicts=[
+            {
+                "confidence": "low",
+                "caveat": "Competing cause fits better.",
+                "refuted": True,
+                "next_check": "Check the scheduler queue directly.",
+            },
+        ],
+        investigate_calls=investigate_calls,
+        refute_calls=refute_calls,
+    )
+    budget_checks: list[int] = []
+
+    def budget_exceeded(_state) -> bool:
+        budget_checks.append(1)
+        # The first check admits the bounded follow-up. The deadline is reached
+        # only after that probe has returned, while the optional second
+        # self-check is about to start.
+        return len(budget_checks) > 1
+
+    monkeypatch.setattr(pipeline, "_evidence_budget_exceeded", budget_exceeded)
+
+    response = await AnalysisOrchestrator(llm_settings()).analyze(_request())
+
+    assert investigate_calls == [4, 2]
+    assert refute_calls == ["node_kubelet_pressure"]
+    top = response.context["root_cause_candidates"][0]
+    assert top["family"] == "runai_scheduling_quota"
+    assert "re-analysis pass was performed" in response.analysis_detail
+
+
+@pytest.mark.asyncio
+async def test_progress_does_not_look_stuck_after_self_check(monkeypatch) -> None:
+    _stub_llm_http(monkeypatch)
+    investigate_calls: list[int] = []
+    refute_calls: list[str] = []
+    _install_stubs(
+        monkeypatch,
+        verdicts=[
+            {
+                "confidence": "low",
+                "caveat": "A targeted follow-up is required.",
+                "refuted": True,
+                "next_check": "Check the scheduler queue directly.",
+            },
+            {"confidence": "medium", "caveat": "", "refuted": False, "next_check": ""},
+        ],
+        investigate_calls=investigate_calls,
+        refute_calls=refute_calls,
+    )
+    events: list[tuple[str, str]] = []
+    flushed_at: list[int] = []
+
+    class RecordingProgress:
+        def emit(self, phase, message, **_fields):
+            events.append((phase, message))
+
+        async def flush(self):
+            flushed_at.append(len(events))
+
+    def fake_from_alert(_cls, *_args, **_kwargs):
+        return RecordingProgress()
+
+    monkeypatch.setattr(
+        pipeline.ProgressReporter,
+        "from_alert",
+        classmethod(fake_from_alert),
+    )
+
+    orchestrator = AnalysisOrchestrator(llm_settings())
+    await orchestrator.analyze(_request())
+
+    self_check_index = events.index(("self_check", "Self-check complete"))
+    follow_up_index = events.index(
+        ("investigation", "Running targeted follow-up before synthesis")
+    )
+    synthesis_index = events.index(("synthesize", "Synthesizing final RCA"))
+    synthesis_complete_index = events.index(("synthesize", "Synthesis complete"))
+    harness_start_index = events.index(("harness", "Validating synthesized RCA"))
+    harness_complete_index = events.index(("harness", "Validation complete"))
+    assert (
+        self_check_index
+        < follow_up_index
+        < synthesis_index
+        < synthesis_complete_index
+        < harness_start_index
+        < harness_complete_index
+    )
+    assert flushed_at == [len(events)]
+
+
+@pytest.mark.asyncio
 async def test_cap_zero_uses_semantic_completion_instead_of_disabling_reanalysis(monkeypatch) -> None:
     _stub_llm_http(monkeypatch)
     investigate_calls: list[int] = []
@@ -290,6 +391,110 @@ async def test_not_refuted_means_no_reanalysis(monkeypatch) -> None:
     assert "re-analysis pass was performed" not in response.analysis_detail
     top = response.context["root_cause_candidates"][0]
     assert top["family"] == "node_kubelet_pressure"
+
+
+def test_settled_hypothesis_ignores_unrelated_collector_gap() -> None:
+    state = SimpleNamespace(
+        root_cause_candidates=[
+            SimpleNamespace(family="runai_scheduling_quota", confidence="medium")
+        ],
+        self_check_refuted=False,
+        missing=["loki.query", "change.helm"],
+    )
+
+    assert pipeline._needs_more_investigation(state) is False
+
+
+def test_low_confidence_hypothesis_still_requests_targeted_followup() -> None:
+    state = SimpleNamespace(
+        root_cause_candidates=[
+            SimpleNamespace(family="runai_scheduling_quota", confidence="low")
+        ],
+        self_check_refuted=False,
+        missing=[],
+    )
+
+    assert pipeline._needs_more_investigation(state) is True
+
+
+def test_medium_insufficient_evidence_still_requests_targeted_followup() -> None:
+    state = SimpleNamespace(
+        root_cause_candidates=[
+            SimpleNamespace(family="insufficient_evidence", confidence="medium")
+        ],
+        self_check_refuted=False,
+        missing=[],
+    )
+
+    assert pipeline._needs_more_investigation(state) is True
+
+
+def test_probe_history_bookkeeping_does_not_count_as_new_evidence() -> None:
+    previous = CollectorResult(
+        agent="loki",
+        status="ok",
+        summary="same bounded log result",
+        details={
+            "rows": [{"message": "NVRM Xid 79"}],
+            "probe_results": [
+                {"scope": {"pod": "trainer-0"}, "status": "ok"},
+            ],
+        },
+    )
+    repeated = CollectorResult(
+        agent="loki",
+        status="ok",
+        summary="same bounded log result",
+        details={
+            "rows": [{"message": "NVRM Xid 79"}],
+            "probe_results": [
+                {"scope": {"pod": "trainer-0"}, "status": "ok"},
+                {"scope": {"pod": "trainer-0"}, "status": "ok"},
+            ],
+        },
+    )
+
+    assert pipeline._evidence_signature([previous]) == pipeline._evidence_signature(
+        [repeated]
+    )
+
+
+def test_fresh_scoped_support_can_rehabilitate_a_refuted_family() -> None:
+    finding = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="warning_events",
+        status="ok",
+        confidence="high",
+        summary="FailedScheduling: pod is Unschedulable",
+        result={
+            "observation": {
+                "predicate": "kubernetes_event:FailedScheduling",
+                "polarity": "present",
+                "coverage": "scoped",
+            }
+        },
+    )
+    finding.evidence_id = "E23"
+    fresh = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary="scheduler event collected",
+            artifacts=[finding],
+        )
+    ]
+
+    assert pipeline._fresh_results_support_family(
+        "k8s_scheduling_error",
+        fresh,
+        {"E23": EvidenceEligibility(True, True, True)},
+    )
+    assert not pipeline._fresh_results_support_family(
+        "k8s_scheduling_error",
+        fresh,
+        {"E23": EvidenceEligibility(False, False, True, "wrong entity")},
+    )
 
 
 @pytest.mark.asyncio

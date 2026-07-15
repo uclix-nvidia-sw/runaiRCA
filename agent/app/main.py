@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 
 from app.config import load_settings
+from app.collectors.registry import collector_names, unknown_collector_names
 from app.knowledge import (
     KnowledgeRegistry,
+    load_family_catalog,
+    load_runai_known_issues,
     set_runtime_knowledge_registry,
     validate_runtime_knowledge,
 )
@@ -48,6 +52,56 @@ settings = load_settings()
 orchestrator = AnalysisOrchestrator(settings)
 knowledge_registry = KnowledgeRegistry.from_settings(settings)
 set_runtime_knowledge_registry(knowledge_registry)
+family_catalog = load_family_catalog(settings.families_file)
+evaluation_families = tuple(
+    dict.fromkeys(
+        (
+            *family_catalog.families,
+            *(
+                str(issue.get("family") or "").strip()
+                for issue in load_runai_known_issues(settings.runai_known_issues_file)
+                if str(issue.get("family") or "").strip()
+            ),
+            "insufficient_evidence",
+        )
+    )
+)
+
+_MCP_SELF_CHECK_RETRY_DELAYS = (2.0, 5.0)
+
+
+async def _log_mcp_reachability() -> None:
+    """Best-effort MCP self-check that never gates Agent readiness."""
+    try:
+        from app.collectors.runai import _runai_headers
+        from app.mcp_client import mcp_reachability
+
+        urls = {
+            "runai": settings.runai_mcp_url,
+            "kubernetes": settings.kubernetes_mcp_url,
+            "prometheus": settings.prometheus_mcp_url,
+            "loki": settings.loki_mcp_url,
+            "postgres": settings.postgres_mcp_url,
+        }
+        configured = {name for name, url in urls.items() if url}
+        if not configured:
+            return
+        for attempt in range(len(_MCP_SELF_CHECK_RETRY_DELAYS) + 1):
+            runai_headers: dict[str, str] = {}
+            if settings.runai_mcp_url:
+                runai_headers, _runai_auth_warnings = await _runai_headers(settings)
+            report = await mcp_reachability(
+                urls,
+                headers_by_name={"runai": runai_headers},
+            )
+            if all(str(report.get(name, "")).startswith("ok (") for name in configured):
+                return
+            if attempt < len(_MCP_SELF_CHECK_RETRY_DELAYS):
+                await asyncio.sleep(_MCP_SELF_CHECK_RETRY_DELAYS[attempt])
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - reachability report is best-effort
+        logging.getLogger(__name__).debug("mcp reachability check failed", exc_info=True)
 
 
 @asynccontextmanager
@@ -58,26 +112,17 @@ async def lifespan(_app: FastAPI):
             await orchestrator.start_engine()
         except Exception:  # noqa: BLE001 - startup is best-effort
             logging.getLogger(__name__).exception("failed to start NAT engine")
-    # Answer "are the agents actually on MCP?" in the FIRST lines of the pod log:
-    # one tools/list per configured MCP service; failures name the real error.
-    # Log-only (never gates startup) — services may still be coming up.
-    try:
-        from app.mcp_client import mcp_reachability
-
-        await mcp_reachability(
-            {
-                "runai": settings.runai_mcp_url,
-                "kubernetes": settings.kubernetes_mcp_url,
-                "prometheus": settings.prometheus_mcp_url,
-                "loki": settings.loki_mcp_url,
-                "postgres": settings.postgres_mcp_url,
-            }
-        )
-    except Exception:  # noqa: BLE001 - reachability report is best-effort
-        logging.getLogger(__name__).debug("mcp reachability check failed", exc_info=True)
+    # A tools/list per configured service answers "are the agents actually on
+    # MCP?" in pod logs. Run it after readiness is released and retry startup
+    # races briefly: OAuth discovery or a restarting service must never hold the
+    # Agent's lifespan startup.
+    mcp_check = asyncio.create_task(_log_mcp_reachability())
     try:
         yield
     finally:
+        mcp_check.cancel()
+        with suppress(asyncio.CancelledError):
+            await mcp_check
         await knowledge_registry.stop()
         await orchestrator.close_engine()
 
@@ -107,6 +152,10 @@ def healthz() -> dict[str, object]:
         "nemo_runtime": "enabled" if settings.enable_nat_runtime else "fallback",
         "nemo_engine": orchestrator.engine_health(),
         "runtime_knowledge": knowledge_registry.health(),
+        "collectors": {
+            "active": collector_names(settings),
+            "unknown": unknown_collector_names(settings),
+        },
     }
 
 
@@ -114,6 +163,12 @@ def healthz() -> dict[str, object]:
 def validate_knowledge(payload: dict[str, object]) -> dict[str, object]:
     """Internal, read-only contract check for compiled runtime knowledge."""
     return validate_runtime_knowledge(payload)
+
+
+@app.get("/knowledge/families")
+def root_cause_families() -> dict[str, list[str]]:
+    """Return the finite family catalog that evaluation labels may use."""
+    return {"families": list(evaluation_families)}
 
 
 @app.post("/analyze", response_model=AlertAnalysisResponse)

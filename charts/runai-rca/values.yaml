@@ -246,34 +246,62 @@ backend:
   extraEnv: []
   resources: {}
 
-# Run:ai MCP shared service. When enabled, the agent gathers Run:ai evidence through
-# the runai-mcp server (426 APIs, spec-aware) instead of the fixed curls, and the
-# runai drill-down agent gets its API search/GET tools. runai-mcp is stdio-only,
-# so this runs it behind mcp-proxy (streamable HTTP). The image (runai-rca-mcp)
-# is published by CI alongside the others, so
-# global.imageRegistry + the chart appVersion resolve it just like
-# backend/agent/frontend. Auth reuses the runai-rca secret's runaiClientId/
-# runaiClientSecret. ON by default; the agent falls back to direct HTTP when
-# disabled or when the service is unreachable — never breaks analysis.
+# Optional shared trust bundle for a Run:ai control plane that uses a private
+# CA. The referenced Secret must contain a combined PEM bundle so both the
+# Agent (OAuth/direct fallback) and official MCP server use the same trust.
+runaiTls:
+  caBundleSecretName: ""
+  caBundleSecretKey: ca.crt
+
+# NVIDIA's official Run:ai MCP server. It natively exposes authenticated
+# streamable HTTP on /mcp, so no stdio bridge or locally built image is needed.
+# The server stays read-only unless --allow-write-tools is explicitly added.
+# The agent forwards its Run:ai bearer/client-credential token to this protected
+# endpoint and falls back to direct HTTP if it is unavailable.
 runaiMcp:
   enabled: true
   image:
-    repository: runai-rca-mcp   # prefixed by global.imageRegistry, like the other first-party images
-    tag: ""                     # defaults to the chart appVersion
+    # Fully qualified: global.imageRegistry must NOT rewrite NGC's image path.
+    repository: nvcr.io/nvidia/runai/runai-mcp-server
+    tag: "2.26.13"
     pullPolicy: IfNotPresent
-  port: 8809
+  # Registry credentials are used by the kubelet before the container starts;
+  # put an nvcr.io docker-registry Secret name here, never NGC_API_KEY in the
+  # application Secret. Empty inherits the chart-wide imagePullSecrets.
+  imagePullSecrets: []
+  port: 8080
+  metricsPort: 9090
+  args:
+    - serve
+    - --transport
+    - http
+  # /mcp is OAuth protected and returns 401 to unauthenticated HTTP probes, so
+  # use TCP probes. Agent startup performs an authenticated tools/list check.
+  readinessProbe:
+    tcpSocket:
+      port: mcp
+    initialDelaySeconds: 2
+    periodSeconds: 5
+  livenessProbe:
+    tcpSocket:
+      port: mcp
+    initialDelaySeconds: 10
+    periodSeconds: 10
+  # Optional deployment-specific settings, for example a combined CA bundle
+  # mounted below and selected with SSL_CERT_FILE for a private Run:ai PKI.
+  extraEnv: []
+  extraVolumeMounts: []
+  extraVolumes: []
   service:
     annotations: {}
     type: ClusterIP
-  # Override if your mcp-proxy version needs different flags/endpoint.
-  command: []
   resources: {}
 
 grafanaMcp:
   enabled: true
   image:
     repository: docker.io/grafana/mcp-grafana
-    tag: latest
+    tag: "0.14.0"
     pullPolicy: IfNotPresent
   service:
     annotations: {}
@@ -284,6 +312,10 @@ grafanaMcp:
   # this empty makes mcp-grafana warn "No org ID found ... using default org"
   # on every request and can miss datasources on multi-org installs.
   grafanaOrgId: "1"
+  # Optional explicit UIDs avoid datasource discovery and disambiguate installs
+  # with several same-type datasources. Empty values use list_datasources.
+  prometheusDatasourceUid: ""
+  lokiDatasourceUid: ""
   command: []
   args: []
   podAnnotations: {}
@@ -302,7 +334,7 @@ kubernetesMcp:
   enabled: true
   image:
     repository: quay.io/containers/kubernetes_mcp_server
-    tag: latest
+    tag: "v0.0.62"
     pullPolicy: IfNotPresent
   service:
     annotations: {}
@@ -384,6 +416,10 @@ agent:
     # Allow the Kubernetes agent to run read-only diagnostic commands (nvidia-smi,
     # etc.) via the pod exec subresource. Requires pods/exec RBAC (agent-rbac.yaml).
     enablePodExec: true
+    # Helm v3 history lives in Secrets. Keep this off with the chart's default
+    # least-privilege RBAC; enable only for a ServiceAccount explicitly allowed
+    # to list Secrets in the investigated namespaces.
+    enableHelmChangeDetection: false
     enableNatRuntime: true
     natConfigFile: /app/configs/runai_rca_engine.yml
     # Human-like iterative investigation: cap LLM reasoning rounds at 3. Each
@@ -433,11 +469,13 @@ agent:
     prometheusUrl: http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
     prometheusTimeoutSeconds: 120
     prometheusMcpUrl: ""
+    prometheusDatasourceUid: ""
     kubernetesMcpUrl: ""
     lokiUrl: http://loki-read.monitoring.svc.cluster.local:3100
     lokiTimeoutSeconds: 120
     lokiQueryLimit: 20
     lokiMcpUrl: ""
+    lokiDatasourceUid: ""
     postgresMcpUrl: ""
     postgresTimeoutSeconds: 60
     typedbTimeoutSeconds: 60
@@ -479,6 +517,8 @@ agent:
       path: /healthz
       port: http
   extraEnv: []
+  extraVolumeMounts: []
+  extraVolumes: []
   resources: {}
 
 frontend:

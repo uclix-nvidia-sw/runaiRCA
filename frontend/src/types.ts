@@ -83,6 +83,10 @@ export type EvaluationView = {
   average_score: number;
 };
 
+export type RootCauseFamilyCatalog = {
+  families: string[];
+};
+
 export type EvaluationReviewInput = Omit<EvaluationReview, 'review_id' | 'run_id' | 'reviewer' | 'created_at' | 'updated_at'>;
 
 export type AnalysisProgressEntry = {
@@ -118,6 +122,7 @@ export type AnalysisRun = {
   metadata?: Record<string, unknown> & {
     progress_log?: AnalysisProgressEntry[];
   };
+  first_completed_at?: string;
   created_at: string;
   updated_at: string;
 };
@@ -158,6 +163,7 @@ export type AlertRecord = {
 
 export type IncidentDetail = Incident & {
   analysis_run_id?: string;
+  active_analysis_run_id?: string;
   analysis_hash?: string;
   analysis_summary: string;
   analysis_detail: string;

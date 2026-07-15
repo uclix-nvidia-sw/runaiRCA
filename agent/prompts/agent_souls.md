@@ -10,8 +10,10 @@ what each agent owns.
   queues, quotas, pods, nodes, secrets, or database records.
 - Prefer direct cluster-local service URLs and service-account credentials when
   deployed in the same cluster as Run:ai, Prometheus, Loki, and Kubernetes.
-- Treat every collector result as evidence, not proof. State confidence and
-  missing data instead of guessing.
+- Treat every collector result as evidence, not proof. Separate observations,
+  inferences, and confirmed conclusions. When historical evidence is incomplete,
+  a clearly labeled low-confidence working hypothesis is allowed, but it must not
+  be presented as a verified cause or as authority for cause-specific remediation.
 - Use similar incidents and operator feedback hints as memory, then verify them
   against live evidence before naming a root cause.
 - Mask tokens, credentials, internal user identifiers, connection strings,

@@ -16,6 +16,10 @@ produces a report. The seven pipeline stages run as NAT functions under the
 which is built once at startup. If the NAT engine is disabled or fails, the same
 stages run directly in process as the failure fallback.
 
+**A simple mental model:** the pipeline is a careful investigation checklist.
+It first learns the alert's scope, then gathers facts, challenges its own
+conclusion, and checks that the written RCA says no more than the facts support.
+
 ```mermaid
 flowchart TB
   REQ([/analyze request]) --> ORCH([Orchestrator])
@@ -52,6 +56,31 @@ never a hang. Per-step ceilings are generous *on purpose* (deep evidence beats
 fast-but-shallow); the overall deadline is the real bound. The backend's
 `AGENT_REQUEST_TIMEOUT_SECONDS` (1560s) must stay above it.
 
+## Stage guide: what enters, leaves, and can stop a stage
+
+| Stage | Input → output | What can stop or limit it |
+| --- | --- | --- |
+| Enrich | Alert target → approved history/topology context | TypeDB is optional; no graph is a warning, not a stop |
+| Plan | Alert + context → scoped hypotheses and probes | Missing labels reduce scope, never authorize broad writes |
+| Evidence | Plan → collector artifacts | Per-source failure becomes partial/unavailable evidence |
+| Rank | Artifacts → ordered candidates | Signatures still need supporting live evidence |
+| Self-check | Leading candidate → caveat/re-analysis need | LLM is optional; deadline bounds extra work |
+| Synthesize | Evidence → operator-readable RCA | 24k evidence budget; no invented facts |
+| Harness | Draft → repaired, downgraded, or abstained response | Hard evidence gate can return `insufficient_evidence` |
+
+```mermaid
+flowchart LR
+  P[Plan] --> I[Central investigation loop\nchoose next discriminating question]
+  P --> D[Collector drill-down loops\nonly each collector's own tools]
+  I --> E[Evidence artifacts]
+  D --> E
+  E --> R[Rank, self-check, synthesis]
+```
+
+The central loop chooses between evidence planes. A collector drill-down stays
+inside one plane. Both are read-only and stop on completion, duplicate work, or
+the overall deadline.
+
 ---
 
 ## 1. Planner — think first
@@ -87,6 +116,35 @@ Each collector owns one domain and returns a `CollectorResult` (summary +
 Collector ceilings are generous (120s each) so evidence is deep; a single slow
 collector still fails gracefully to `unavailable`. Sensitive values are masked
 (`agent/app/masking.py`) before any evidence leaves a collector.
+
+### Evidence time, scope, and transport rules
+
+- The collection window is fired minus five minutes through resolved plus five
+  minutes; a firing alert is capped at 15 minutes. The post-resolution epilogue
+  remains context, while causal promotion in Postgres, Change, and System ends
+  at resolution.
+- Kubernetes keeps five most unhealthy/time-relevant, time-sorted Pods and Events
+  with omitted counts, preserves Warning aggregation plus Normal `Preempted`
+  workload/PodGroup events, includes
+  node cordon/taint state, and follows Run:ai CRD pagination for up to three
+  pages while surfacing per-kind failures. Historical logs keep their oldest
+  lines only when the direct request actually honored `sinceTime`; MCP tails
+  keep their newest lines.
+- Loki verifies scope against full returned lines and samples multiple streams
+  round-robin from their newest entries. Prometheus scales range-query step to
+  the requested window (up to about 1,000 points), escapes label values, and
+  accepts RFC3339 plus epoch-second/millisecond sample timestamps. Empty native
+  Prometheus results can be scoped absence; MCP/proxy empties are context.
+- Run:ai current-state presence is not incident-time proof: `present/scoped`
+  requires an in-window payload timestamp. During a firing alert, only an
+  immutable workload-ID 404 establishes scoped absence; name-keyed project/queue
+  404s remain context. Partial MCP snapshots are retained and receive direct
+  supplements for failed or explicitly empty equivalents; queue-labelled alerts
+  also receive one direct queue lookup, with any gap exposed as `runai.queue_scope`.
+- Run:ai control-plane Postgres reads pin UTC and disclose the UTC assumption
+  for naive audit timestamps. Individual audit-table failures, discovery caps,
+  and named control-plane connection failures remain visible without erasing
+  other collected evidence.
 
 ## 3. Deterministic follow-up
 
@@ -203,6 +261,11 @@ export) reads. When `language=ko` and an LLM is configured, `_synthesize_korean`
 rewrites summary + detail grounded **strictly** in the evidence, falling back to
 the deterministic English report on any failure.
 
+Synthesis receives up to six artifacts per collector role, selected salience-first
+while always retaining the newest artifact, under a 24,000-character evidence
+budget. The skeptical self-check uses the same selection and a separate
+24,000-character whole-line digest cap.
+
 The **Troubleshooting Playbook** section appends, for any implicated platform
 component, its failure effect, its BFS **dependency check order** (e.g.
 `cluster-sync → status-updater → runai-backend-traefik`), and its ready-to-run
@@ -243,7 +306,10 @@ Every artifact is built for an operator to read at a glance:
   one deliberate instruction channel.
 - **Masking** (`agent/app/masking.py`): JWTs, bearer tokens, secrets, and custom
   `MASKING_REGEX_LIST_JSON` patterns are redacted before evidence leaves a
-  collector or reaches an LLM.
+  collector or reaches an LLM. Password/credential-style keys always mask;
+  token/secret prose masks only credential-shaped values, so diagnostics such as
+  `connection refused` survive. `sha256:` image digests are preserved, and
+  salient-signal extraction happens before stored evidence is masked.
 
 ## Run:ai MCP Service
 

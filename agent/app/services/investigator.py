@@ -234,28 +234,42 @@ async def _run_adhoc_kubernetes_query(
     kind = str(query.get("kind") or "")
     namespace = str(query.get("namespace") or "")
     name = str(query.get("name") or "")
-    if resolve_read_kind(kind) == "pods" and name:
-        described = await k8s_describe(
+    label_selector = str(query.get("label_selector") or "")
+    try:
+        if resolve_read_kind(kind) == "pods" and name:
+            described = await k8s_describe(
+                settings,
+                "pods",
+                namespace=namespace,
+                name=name,
+                time_range=time_range,
+            )
+            return {
+                **described,
+                "operation": "describe",
+                "data": {"object": described.get("object"), "events": described.get("events")},
+                **({"time_range": time_range} if time_range else {}),
+            }
+        read = await k8s_read(
             settings,
-            "pods",
+            kind,
             namespace=namespace,
             name=name,
-            time_range=time_range,
+            label_selector=label_selector,
         )
+        return {**read, **({"time_range": time_range} if time_range else {})}
+    except Exception as exc:  # noqa: BLE001 - failure feeds the bounded correction loop
+        # Preserve query identity but never replay exception text: an API error
+        # body can contain stale signals, secrets, or prompt-injection content.
         return {
-            **described,
-            "operation": "describe",
-            "data": {"object": described.get("object"), "events": described.get("events")},
+            "kind": kind,
+            "namespace": namespace,
+            "name": name,
+            "label_selector": label_selector,
+            "status_code": None,
+            "error": f"{type(exc).__name__}: query failed",
             **({"time_range": time_range} if time_range else {}),
         }
-    read = await k8s_read(
-        settings,
-        kind,
-        namespace=namespace,
-        name=name,
-        label_selector=str(query.get("label_selector") or ""),
-    )
-    return {**read, **({"time_range": time_range} if time_range else {})}
 
 
 def _evidence_summary(evidence: dict[str, CollectorResult]) -> list[dict]:
@@ -288,41 +302,110 @@ def _initial_ledger(plan: InvestigationPlan | None) -> list[dict[str, Any]]:
         reason = str(item.get("reason") or item.get("statement") or "").strip()
         if not family and not reason:
             continue
-        ledger.append(
-            {
-                "id": f"H{idx}",
-                "family": family,
-                "statement": reason or family.replace("_", " "),
-                "mechanism": str(item.get("mechanism") or reason or family.replace("_", " ")),
-                "confidence": 0.5,
-                "evidence_for": [],
-                "evidence_against": [],
-                "expected_observations": _texts(item.get("expected_observations")),
-                "falsifiers": _texts(item.get("falsifiers")),
-                "next_discriminating_test": str(item.get("next_discriminating_test") or ""),
-                "status": "open",
-            }
-        )
+        statement = reason or family.replace("_", " ")
+        mechanism = str(item.get("mechanism") or "").strip()
+        hypothesis_id = str(item.get("id") or f"H{idx}").strip() or f"H{idx}"
+        entry: dict[str, Any] = {
+            "id": hypothesis_id,
+            "family": family,
+            "statement": statement,
+            "confidence": 0.5,
+            "status": "open",
+        }
+        if mechanism and not _same_ledger_text(mechanism, statement):
+            entry["mechanism"] = mechanism
+        for key in ("expected_observations", "falsifiers"):
+            if values := _texts(item.get(key)):
+                entry[key] = values
+        if next_test := str(item.get("next_discriminating_test") or "").strip():
+            entry["next_discriminating_test"] = next_test
+        ledger.append(entry)
     return ledger
 
 
 def _ledger_summary(ledger: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
-            "id": item.get("id"),
-            "family": item.get("family"),
-            "statement": item.get("statement"),
-            "mechanism": item.get("mechanism") or item.get("statement"),
-            "confidence": item.get("confidence"),
-            "status": item.get("status"),
-            "evidence_for": item.get("evidence_for", [])[-3:],
-            "evidence_against": item.get("evidence_against", [])[-3:],
-            "expected_observations": item.get("expected_observations", [])[-3:],
-            "falsifiers": item.get("falsifiers", [])[-3:],
-            "next_discriminating_test": item.get("next_discriminating_test", ""),
-        }
-        for item in ledger
-    ]
+    return [_ledger_public_item(item) for item in ledger]
+
+
+def _ledger_public_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Canonical response/progress view; preserve semantic state, drop only noise."""
+    output: dict[str, Any] = {
+        "id": item.get("id"),
+        "family": item.get("family"),
+        "statement": item.get("statement"),
+        "confidence": item.get("confidence", 0.5),
+        "status": item.get("status") or "open",
+    }
+    statement = str(item.get("statement") or "")
+    mechanism = str(item.get("mechanism") or "").strip()
+    if mechanism and not _same_ledger_text(mechanism, statement):
+        output["mechanism"] = mechanism
+    for key in (
+        "evidence_for",
+        "evidence_against",
+        "expected_observations",
+        "falsifiers",
+    ):
+        if values := _texts(item.get(key))[-3:]:
+            output[key] = values
+    if next_test := str(item.get("next_discriminating_test") or "").strip():
+        output["next_discriminating_test"] = next_test
+    return output
+
+
+def _ledger_prompt_view(ledger: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Sparse bounded view used only inside repeated LLM decision prompts."""
+    return [_compact_ledger_item(item) for item in ledger]
+
+
+def _compact_ledger_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Prompt projection with defaults, empty fields, and duplicates removed."""
+    output: dict[str, Any] = {}
+    for key in ("id", "family", "statement"):
+        if value := _bounded_ledger_text(item.get(key), limit=320):
+            output[key] = value
+
+    statement = str(item.get("statement") or "")
+    mechanism = _bounded_ledger_text(item.get("mechanism"), limit=320)
+    if mechanism and not _same_ledger_text(mechanism, statement):
+        output["mechanism"] = mechanism
+
+    status = str(item.get("status") or "open").strip().lower()
+    confidence = item.get("confidence")
+    # open/0.5 is the seed default, not a calculated probability.  The UI and
+    # investigator already treat omitted status as open, so transmitting it on
+    # every round only bloats the prompt/progress payload.
+    if status != "open":
+        output["status"] = status
+    if confidence is not None and not (status == "open" and confidence == 0.5):
+        output["confidence"] = confidence
+
+    for key in (
+        "evidence_for",
+        "evidence_against",
+        "expected_observations",
+        "falsifiers",
+    ):
+        values = [
+            value
+            for raw in _texts(item.get(key))[-3:]
+            if (value := _bounded_ledger_text(raw, limit=240))
+        ]
+        if values:
+            output[key] = values
+    if next_test := _bounded_ledger_text(item.get("next_discriminating_test"), limit=320):
+        output["next_discriminating_test"] = next_test
+    return output
+
+
+def _bounded_ledger_text(value: object, *, limit: int) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _same_ledger_text(left: object, right: object) -> bool:
+    return " ".join(str(left or "").casefold().split()) == " ".join(
+        str(right or "").casefold().split()
+    )
 
 
 def _apply_ledger_updates(
@@ -346,7 +429,9 @@ def _apply_ledger_updates(
         allowed_evidence = _texts(update.get("evidence_for"))
         if eligible_support_ids is not None:
             allowed_evidence = [
-                evidence_id for evidence_id in allowed_evidence if evidence_id in eligible_support_ids
+                evidence_id
+                for evidence_id in allowed_evidence
+                if evidence_id in eligible_support_ids
             ]
         status = str(update.get("status") or "").strip().lower()
         can_support = bool(
@@ -384,29 +469,33 @@ def _add_reflected_hypotheses(
             continue
         family = str(candidate.get("family") or "").strip()
         statement = str(candidate.get("statement") or candidate.get("reason") or "").strip()
-        key = family or _normalise_hypothesis(statement)
-        if not key or key in existing:
+        hypothesis_key = family or _normalise_hypothesis(statement)
+        if not hypothesis_key or hypothesis_key in existing:
             continue
-        ledger.append(
-            {
-                "id": f"H{len(ledger) + 1}",
-                "family": family,
-                "statement": statement or family.replace("_", " "),
-                "mechanism": str(
-                    candidate.get("mechanism") or statement or family.replace("_", " ")
-                ),
-                "confidence": _clamp_confidence(candidate.get("confidence"), 0.4),
-                "evidence_for": _texts(candidate.get("evidence_for"))[:5],
-                "evidence_against": _texts(candidate.get("evidence_against"))[:5],
-                "expected_observations": _texts(candidate.get("expected_observations")),
-                "falsifiers": _texts(candidate.get("falsifiers")),
-                "next_discriminating_test": str(candidate.get("next_discriminating_test") or ""),
-                "status": str(candidate.get("status") or "open")
-                if str(candidate.get("status") or "open") in _LEDGER_STATUSES
-                else "open",
-            }
-        )
-        existing.add(key)
+        statement = statement or family.replace("_", " ")
+        mechanism = str(candidate.get("mechanism") or "").strip()
+        status = str(candidate.get("status") or "open")
+        entry: dict[str, Any] = {
+            "id": f"H{len(ledger) + 1}",
+            "family": family,
+            "statement": statement,
+            "confidence": _clamp_confidence(candidate.get("confidence"), 0.4),
+            "status": status if status in _LEDGER_STATUSES else "open",
+        }
+        if mechanism and not _same_ledger_text(mechanism, statement):
+            entry["mechanism"] = mechanism
+        for field in (
+            "evidence_for",
+            "evidence_against",
+            "expected_observations",
+            "falsifiers",
+        ):
+            if values := _texts(candidate.get(field))[:5]:
+                entry[field] = values
+        if next_test := str(candidate.get("next_discriminating_test") or "").strip():
+            entry["next_discriminating_test"] = next_test
+        ledger.append(entry)
+        existing.add(hypothesis_key)
     return ledger
 
 
@@ -501,10 +590,15 @@ async def investigate(
     by_name = {_collector_name(c): c for c in collectors}
     all_names = set(by_name)
     evidence: dict[str, CollectorResult] = {}
+    latest_probe_scopes: dict[str, dict[str, Any]] = {}
     ledger = _initial_ledger(plan)
     investigation_steps: list[dict[str, Any]] = []
     seen_probes: set[str] = set()
     seen_queries: set[str] = set()
+    failed_queries: set[str] = set()
+    # Validation/duplicate feedback is deliberately separate from ``adhoc``:
+    # rejected queries were never observations and must not become artifacts.
+    query_feedback: list[dict[str, Any]] = []
 
     async def run_probe(name: str, scope: dict) -> None:
         collector = by_name.get(name)
@@ -522,7 +616,13 @@ async def investigate(
             deadline_monotonic,
             lambda: _collect_safely(collector, target, _scoped_plan(plan, scope)),
         )
-        evidence[name] = _merge_collector_results(evidence.get(name), result)
+        evidence[name] = _merge_collector_results(
+            evidence.get(name),
+            result,
+            previous_scope=latest_probe_scopes.get(name),
+            current_scope=scope,
+        )
+        latest_probe_scopes[name] = dict(scope)
         _record_blackboard(blackboard, name, result, target)
         if reporter:
             reporter.emit(
@@ -569,23 +669,34 @@ async def investigate(
                         "You are a senior SRE investigating a Run:ai GPU-platform alert. "
                         "Given the plan, hypothesis ledger, evidence so far, and available "
                         "collectors, decide the next diagnostic step. Pick the hypothesis "
-                        "you are testing, probe collectors most likely to confirm/refute it, "
-                        "and use plan.diagnostic_directive as neutral ontology guidance: "
+                        "you are testing and probe collectors most likely to confirm/refute it. "
+                        "The compact ledger omits seed defaults: missing status means open, "
+                        "missing confidence means 0.5, and a missing mechanism means it is "
+                        "identical to statement. "
+                        "Use plan.diagnostic_directive as neutral ontology guidance: "
                         "follow its checks and disconfirmations, but never treat its "
                         "provisional_family as observed evidence. Update confidence using "
                         "only observed evidence. A condition name alone is metadata; verify "
                         "its status/value and treat False or a zero sample as refutation. "
                         "Cite shared_observations evidence_id "
                         "values (F-...) in evidence_for/evidence_against; do not invent IDs. "
-                        "When diagnostic_directive.probes names a tool you can reach through a collector, "
-                        "use it as a discriminator and honor its supports_when/refutes_when conditions. You can ALSO "
+                        "When diagnostic_directive.probes names a tool you can reach through "
+                        "a collector, use it as a discriminator and honor its supports_when/"
+                        "refutes_when conditions. You can ALSO "
                         "run kubectl-style READ-ONLY Kubernetes resource queries only "
                         "(get/list of an allowlisted kind, see adhoc_query_kinds). Never put "
                         "promql, pod_logs, logql, or deployment_history in queries: use the "
                         "corresponding collector probe instead. When the alert names a pod, "
                         "request that named pod before broad project/namespace reads: it is "
-                        "automatically promoted to full YAML + describe/events evidence. Batch all independent "
-                        "discriminating queries for this step instead of spending another "
+                        "automatically promoted to full YAML + describe/events evidence. "
+                        "If adhoc_results or query_feedback reports "
+                        "retryable_by_query_change=true, change the resource kind, target-bound "
+                        "name, or selector in the next bounded round; never repeat the exact "
+                        "failed "
+                        "query. Failure feedback is control metadata, not evidence. Authorization, "
+                        "TLS, datasource, and transport failures cannot be repaired by query "
+                        "changes. Batch all independent discriminating queries for this step "
+                        "instead of spending another "
                         "reasoning round on each query. Conclude once evidence is sufficient. "
                         "Respond with ONLY JSON: "
                         '{"action":"probe"|"conclude","reason":str,'
@@ -611,6 +722,7 @@ async def investigate(
                             by_name,
                             ledger,
                             adhoc,
+                            query_feedback=query_feedback,
                             blackboard=blackboard,
                         )
                     ),
@@ -654,6 +766,7 @@ async def investigate(
             selected_hypothesis = str(decision.get("selected_hypothesis") or "")
             probes = decision.get("probes")
             queries = decision.get("queries")
+            retryable_query_rejection = False
             fresh = []
             for probe in probes if isinstance(probes, list) else []:
                 if not isinstance(probe, dict) or probe.get("collector") not in all_names:
@@ -677,6 +790,9 @@ async def investigate(
             wanted = []
             for query in queries if isinstance(queries, list) else []:
                 if not _valid_adhoc_kubernetes_query(query):
+                    query_feedback.append(_rejected_adhoc_query_feedback(query))
+                    query_feedback[:] = query_feedback[-8:]
+                    retryable_query_rejection = True
                     if reporter and isinstance(query, dict):
                         reporter.emit(
                             "investigation",
@@ -687,6 +803,10 @@ async def investigate(
                     continue
                 fingerprint = json.dumps(query, sort_keys=True, default=str)
                 if fingerprint in seen_queries:
+                    if fingerprint in failed_queries:
+                        query_feedback.append(_duplicate_failed_query_feedback(query))
+                        query_feedback[:] = query_feedback[-8:]
+                        retryable_query_rejection = True
                     continue
                 seen_queries.add(fingerprint)
                 wanted.append(query)
@@ -714,6 +834,11 @@ async def investigate(
                     seen_probes.add(fingerprint)
                     fresh.append(fallback)
             if not fresh and not wanted:
+                if retryable_query_rejection and step < decision_round_limit:
+                    # The rejected/duplicate request is not evidence. Give the
+                    # LLM one of its remaining bounded rounds to change the
+                    # kind/name/selector instead of silently ending the loop.
+                    continue
                 if unverified_conclusion and step < decision_round_limit:
                     # Keep the remaining bounded rounds available for the
                     # model to reconsider the newly collected base evidence.
@@ -735,21 +860,23 @@ async def investigate(
                         query=_adhoc_query_repr(q),
                     )
             if wanted:
-                adhoc.extend(
-                    await _within_budget(
-                        deadline_monotonic,
-                        lambda wanted=wanted: asyncio.gather(
-                            *(
-                                _run_adhoc_kubernetes_query(
-                                    settings,
-                                    q,
-                                    time_range=_incident_window_for_target(target),
-                                )
-                                for q in wanted
+                query_results = await _within_budget(
+                    deadline_monotonic,
+                    lambda wanted=wanted: asyncio.gather(
+                        *(
+                            _run_adhoc_kubernetes_query(
+                                settings,
+                                q,
+                                time_range=_incident_window_for_target(target),
                             )
-                        ),
-                    )
+                            for q in wanted
+                        )
+                    ),
                 )
+                adhoc.extend(query_results)
+                for query, item in zip(wanted, query_results, strict=True):
+                    if item.get("error"):
+                        failed_queries.add(json.dumps(query, sort_keys=True, default=str))
             ran_queries_last_step = bool(wanted)
             # A bounded investigation may finish early only when the ledger
             # cites an actual scoped fact. Model prose or partial observations
@@ -773,25 +900,35 @@ async def investigate(
                     by_name,
                     ledger,
                     adhoc,
+                    query_feedback=query_feedback,
                     blackboard=blackboard,
                 ),
             )
         if _ledger_fingerprint(ledger) != before_reflection:
             # A reflection is useful only if its new/changed hypothesis is put
-            # back through a discriminating read-only probe.  Continue until
-            # the model concludes or it can offer no non-duplicate test.
-            while True:
+            # back through a discriminating read-only probe. Keep this phase
+            # bounded too: otherwise a model returning endless distinct reads
+            # can consume the entire shared evidence budget before synthesis.
+            verification_round = 0
+            verification_round_limit = max_steps if max_steps > 0 else 3
+            while verification_round < verification_round_limit:
                 remaining_budget = _budget_remaining(deadline_monotonic)
                 if remaining_budget is not None and remaining_budget <= 0:
                     break
+                verification_round += 1
                 verification = await _within_budget(
                     deadline_monotonic,
                     lambda ledger=ledger: complete_json(
                         settings,
                         system=(
-                            "You are verifying a hypothesis introduced or changed during RCA reflection. "
-                            "Do not promote a conclusion from reasoning alone. Select the strongest "
-                            "read-only falsifier or discriminator, probe it, and cite F- observation IDs. "
+                            "You are verifying a hypothesis introduced or changed during RCA "
+                            "reflection. Do not promote a conclusion from reasoning alone. Select "
+                            "the strongest read-only falsifier or discriminator, probe it, and "
+                            "cite F- observation IDs. "
+                            "When query feedback says retryable_by_query_change=true, correct the "
+                            "kind/name/selector instead of repeating the failed query. Treat "
+                            "failure "
+                            "feedback as control metadata, never evidence. "
                             "Respond with ONLY JSON: "
                             '{"action":"probe"|"conclude","probes":[{"collector":str,"scope":{}}],'
                             '"queries":[{"kind":str,"namespace"?:str,"name"?:str,"label_selector"?:str}],'
@@ -806,6 +943,7 @@ async def investigate(
                                 by_name,
                                 ledger,
                                 adhoc,
+                                query_feedback=query_feedback,
                                 blackboard=blackboard,
                             )
                         ),
@@ -821,6 +959,7 @@ async def investigate(
                 )
                 if verification.get("action") == "conclude":
                     break
+                retryable_query_rejection = False
                 fresh = []
                 for probe in verification.get("probes") or []:
                     if not isinstance(probe, dict) or probe.get("collector") not in all_names:
@@ -842,6 +981,9 @@ async def investigate(
                 wanted = []
                 for query in verification.get("queries") or []:
                     if not _valid_adhoc_kubernetes_query(query):
+                        query_feedback.append(_rejected_adhoc_query_feedback(query))
+                        query_feedback[:] = query_feedback[-8:]
+                        retryable_query_rejection = True
                         if reporter and isinstance(query, dict):
                             reporter.emit(
                                 "investigation",
@@ -850,10 +992,20 @@ async def investigate(
                             )
                         continue
                     fingerprint = json.dumps(query, sort_keys=True, default=str)
-                    if fingerprint not in seen_queries:
-                        seen_queries.add(fingerprint)
-                        wanted.append(query)
+                    if fingerprint in seen_queries:
+                        if fingerprint in failed_queries:
+                            query_feedback.append(_duplicate_failed_query_feedback(query))
+                            query_feedback[:] = query_feedback[-8:]
+                            retryable_query_rejection = True
+                        continue
+                    seen_queries.add(fingerprint)
+                    wanted.append(query)
                 if not fresh and not wanted:
+                    if (
+                        retryable_query_rejection
+                        and verification_round < verification_round_limit
+                    ):
+                        continue
                     break
                 if fresh:
                     await _within_budget(
@@ -866,21 +1018,25 @@ async def investigate(
                         ),
                     )
                 if wanted:
-                    adhoc.extend(
-                        await _within_budget(
-                            deadline_monotonic,
-                            lambda wanted=wanted: asyncio.gather(
-                                *(
-                                    _run_adhoc_kubernetes_query(
-                                        settings,
-                                        query,
-                                        time_range=_incident_window_for_target(target),
-                                    )
-                                    for query in wanted
+                    query_results = await _within_budget(
+                        deadline_monotonic,
+                        lambda wanted=wanted: asyncio.gather(
+                            *(
+                                _run_adhoc_kubernetes_query(
+                                    settings,
+                                    query,
+                                    time_range=_incident_window_for_target(target),
                                 )
-                            ),
-                        )
+                                for query in wanted
+                            )
+                        ),
                     )
+                    adhoc.extend(query_results)
+                    for query, item in zip(wanted, query_results, strict=True):
+                        if item.get("error"):
+                            failed_queries.add(
+                                json.dumps(query, sort_keys=True, default=str)
+                            )
         if reporter:
             reporter.emit(
                 "reflection",
@@ -1013,6 +1169,7 @@ async def _reflect_hypotheses(
     ledger: list[dict[str, Any]],
     adhoc: list[dict] | None = None,
     *,
+    query_feedback: list[dict[str, Any]] | None = None,
     blackboard: Any = None,
 ) -> list[dict[str, Any]]:
     reflection = await complete_json(
@@ -1032,7 +1189,14 @@ async def _reflect_hypotheses(
         ),
         user=_investigator_masker(settings).mask_text(
             _build_user_prompt(
-                plan, kg_context, evidence, by_name, ledger, adhoc, blackboard=blackboard
+                plan,
+                kg_context,
+                evidence,
+                by_name,
+                ledger,
+                adhoc,
+                query_feedback=query_feedback,
+                blackboard=blackboard,
             )
         ),
         model=settings.llm_model_investigation,
@@ -1055,10 +1219,18 @@ def _build_user_prompt(
     ledger: list[dict[str, Any]],
     adhoc: list[dict] | None = None,
     *,
+    query_feedback: list[dict[str, Any]] | None = None,
     blackboard: Any = None,
 ) -> str:
+    plan_view = plan.as_dict() if plan else {}
+    # The ledger is the canonical hypothesis list for repeated investigator
+    # turns. Planner hypotheses and case cards are already represented by the
+    # ledger and knowledge_graph respectively, so carrying both copies can
+    # consume almost the entire prompt before evidence is added.
+    plan_view.pop("hypotheses", None)
+    plan_view.pop("case_cards", None)
     stable = {
-        "plan": plan.as_dict() if plan else {},
+        "plan": plan_view,
         "knowledge_graph": {
             "blast_radius_workloads": kg_context.get("blast_radius_workloads"),
             "prior_incidents": kg_context.get("prior_incidents"),
@@ -1072,12 +1244,16 @@ def _build_user_prompt(
         ),
     }
     variable = {
-        "hypothesis_ledger": _ledger_summary(ledger),
+        "hypothesis_ledger": _ledger_prompt_view(ledger),
         "evidence_so_far": _evidence_summary(evidence),
         "not_yet_probed": [name for name in by_name if name not in evidence],
         # The last few ad-hoc reads, trimmed — enough for the LLM to chain
         # "PVC is Pending -> check the storageclass" style drill-downs.
         "adhoc_results": _adhoc_prompt_results(adhoc),
+        # Local validation failures are control feedback, never observations.
+        # They let the next bounded round repair a kind/name/selector without
+        # turning a rejected request into evidence or a report artifact.
+        "query_feedback": list(query_feedback or [])[-6:],
         # Other evidence agents' findings are supplied as facts, not raw
         # transport/query text.  A domain agent can therefore test a CSI clue
         # in Loki/system without inheriting an unsafe executable query.
@@ -1087,7 +1263,12 @@ def _build_user_prompt(
         stable,
         variable,
         max_chars=_USER_PROMPT_CHARS,
-        trim_keys=("evidence_so_far", "adhoc_results", "shared_observations"),
+        trim_keys=(
+            "evidence_so_far",
+            "adhoc_results",
+            "query_feedback",
+            "shared_observations",
+        ),
     )
 
 
@@ -1130,41 +1311,145 @@ def _record_blackboard(
             return
 
 
+def _probe_history_record(
+    result: CollectorResult, scope: dict[str, Any] | None
+) -> dict[str, Any]:
+    return {
+        "agent": result.agent,
+        "scope": dict(scope or {}),
+        "status": result.status,
+        "summary": (result.summary or "")[:500],
+        "missing_data": list(dict.fromkeys(result.missing_data)),
+    }
+
+
+def _artifact_merge_fingerprint(item: Any) -> str:
+    """Fingerprint semantic card content, not its response-local display ID."""
+    if isinstance(item, dict):
+        payload: Any = dict(item)
+    else:
+        dump = getattr(item, "model_dump", None)
+        if callable(dump):
+            payload = dump(mode="json")
+        else:
+            payload = dict(getattr(item, "__dict__", {})) or item
+    if isinstance(payload, dict):
+        payload.pop("evidence_id", None)
+    try:
+        return json.dumps(payload, sort_keys=True, default=str)
+    except TypeError:
+        return repr(payload)
+
+
 def _merge_collector_results(
-    previous: CollectorResult | None, current: CollectorResult
+    previous: CollectorResult | None,
+    current: CollectorResult,
+    *,
+    previous_scope: dict[str, Any] | None = None,
+    current_scope: dict[str, Any] | None = None,
 ) -> CollectorResult:
     """Retain evidence from repeated collector probes with distinct scopes."""
     if previous is None:
         return current
-    statuses = {previous.status, current.status}
-    status = "ok" if "ok" in statuses else "partial" if "partial" in statuses else "unavailable"
     summaries: list[str] = []
     for candidate in (previous.summary, current.summary):
         if candidate and candidate not in summaries:
             summaries.append(candidate)
     summary = " | ".join(summaries[-4:])[:1600]
-    probe_history = previous.details.get("probe_results") if isinstance(previous.details, dict) else []
-    history = list(probe_history) if isinstance(probe_history, list) else []
-    history.append(
-        {
-            "agent": current.agent,
-            "status": current.status,
-            "summary": (current.summary or "")[:500],
-        }
+    previous_history = (
+        previous.details.get("probe_results")
+        if isinstance(previous.details, dict)
+        else []
     )
+    history = list(previous_history) if isinstance(previous_history, list) else []
+    if not history:
+        history.append(_probe_history_record(previous, previous_scope))
+    current_history = (
+        current.details.get("probe_results")
+        if isinstance(current.details, dict)
+        else []
+    )
+    if isinstance(current_history, list) and current_history:
+        history.extend(current_history)
+    else:
+        history.append(_probe_history_record(current, current_scope))
+
+    scope_aware = previous_scope is not None or current_scope is not None
+    if scope_aware:
+        latest_by_scope: dict[str, dict[str, Any]] = {}
+        for record in history:
+            if not isinstance(record, dict):
+                continue
+            scope = record.get("scope")
+            scope_key = json.dumps(
+                scope if isinstance(scope, dict) else {},
+                sort_keys=True,
+                default=str,
+            )
+            latest_by_scope[scope_key] = record
+        latest_records = list(latest_by_scope.values())
+        missing_data = list(
+            dict.fromkeys(
+                str(item)
+                for record in latest_records
+                for item in (
+                    record.get("missing_data")
+                    if isinstance(record.get("missing_data"), list)
+                    else []
+                )
+                if str(item)
+            )
+        )
+        all_latest_ok = bool(latest_records) and all(
+            str(record.get("status") or "") == "ok" for record in latest_records
+        )
+        any_usable = any(
+            str(record.get("status") or "") in {"ok", "partial"}
+            for record in history
+            if isinstance(record, dict)
+        )
+        if all_latest_ok and not missing_data:
+            status = "ok"
+        elif any_usable:
+            status = "partial"
+        else:
+            status = "unavailable"
+    else:
+        # Non-scoped callers retain the historical latest-pass semantics.
+        if current.status == "ok":
+            status = "ok"
+        elif current.status == "partial" or previous.status in {"ok", "partial"}:
+            status = "partial"
+        else:
+            status = "unavailable"
+        missing_data = list(dict.fromkeys(current.missing_data))
+
+    artifacts: list[Any] = []
+    seen_artifacts: set[str] = set()
+    for item in (*previous.artifacts, *current.artifacts):
+        fingerprint = _artifact_merge_fingerprint(item)
+        if fingerprint in seen_artifacts:
+            continue
+        seen_artifacts.add(fingerprint)
+        artifacts.append(item)
     return CollectorResult(
         agent=current.agent or previous.agent,
         status=status,
         summary=summary,
-        confidence="high" if "high" in {previous.confidence, current.confidence} else "medium",
+        confidence=max(
+            (previous.confidence, current.confidence),
+            key=lambda value: {"low": 0, "medium": 1, "high": 2}.get(value, 0),
+        ),
         details={
             **(previous.details if isinstance(previous.details, dict) else {}),
             **(current.details if isinstance(current.details, dict) else {}),
             "probe_results": history[-8:],
         },
-        missing_data=list(dict.fromkeys([*previous.missing_data, *current.missing_data])),
+        # Scoped gaps clear only when that same scope succeeds. A successful
+        # node probe must not silently resolve a failed historical pod query.
+        missing_data=missing_data,
         warnings=list(dict.fromkeys([*previous.warnings, *current.warnings])),
-        artifacts=[*previous.artifacts, *current.artifacts],
+        artifacts=artifacts,
     )
 
 
@@ -1194,14 +1479,14 @@ def _capped_json_prompt(
         key: list(value) if isinstance(value, list) else value for key, value in variable.items()
     }
     payload = {**stable, **variable}
-    text = json.dumps(payload, default=str)
+    text = json.dumps(payload, ensure_ascii=False, default=str)
     while len(text) > max_chars:
         for key in trim_keys:
             value = variable.get(key)
             if isinstance(value, list) and len(value) > 1:
                 variable[key] = value[1:]
                 payload = {**stable, **variable}
-                text = json.dumps(payload, default=str)
+                text = json.dumps(payload, ensure_ascii=False, default=str)
                 break
         else:
             break
@@ -1213,16 +1498,216 @@ def _capped_json_prompt(
     return text[:head] + marker + text[-tail:]
 
 
-def _adhoc_prompt_results(adhoc: list[dict] | None) -> list[str]:
-    return [
-        json.dumps(
-            {"query": _adhoc_query_repr(item), "error": "query failed"}
-            if item.get("error")
-            else item,
-            default=str,
-        )[:600]
-        for item in (adhoc or [])[-6:]
-    ]
+def _adhoc_failure_feedback(item: dict[str, Any]) -> dict[str, Any]:
+    """Return query-correction metadata without replaying a failed response.
+
+    Kubernetes/API errors can include response bodies and stale resource text.
+    Feeding those strings back to the LLM made failed telemetry look like an
+    observed signal. Only adapter-owned status plus a fixed classification and
+    correction hint cross the prompt boundary here.
+    """
+    raw_status = item.get("status_code")
+    try:
+        status = int(raw_status)
+    except (TypeError, ValueError):
+        status = 0
+    error = " ".join(str(item.get("error") or "").lower().split())
+
+    category = "query_failure"
+    retryable = False
+    hint = "Choose another available evidence source; do not treat this failure as evidence."
+    if status in {401, 403} or any(
+        token in error for token in ("unauthorized", "forbidden", "permission denied")
+    ):
+        category = "authorization"
+        hint = "Query changes cannot repair authorization; use another configured evidence source."
+    elif any(
+        token in error
+        for token in (
+            "self-signed certificate",
+            "certificate verify failed",
+            "tls handshake",
+            "x509:",
+        )
+    ):
+        category = "tls_configuration"
+        hint = (
+            "Query changes cannot repair TLS configuration; use another configured "
+            "evidence source."
+        )
+    elif any(
+        token in error
+        for token in (
+            "datasource uid",
+            "datasourceuid",
+            "get datasource by uid",
+            "no accessible datasource",
+            "id is invalid",
+        )
+    ):
+        category = "datasource_configuration"
+        hint = "Query changes cannot repair datasource configuration; use another evidence source."
+    elif status == 404 or "not found" in error:
+        category = "target_not_found"
+        retryable = True
+        hint = (
+            "Use a target-bound identity already present in evidence, or list the same kind "
+            "inside the same namespace before retrying; do not broaden cluster scope."
+        )
+    elif status in {400, 422} or any(
+        token in error
+        for token in (
+            "bad request",
+            "invalid selector",
+            "invalid field selector",
+            "invalid resource",
+            "parse error",
+        )
+    ):
+        category = "invalid_request"
+        retryable = True
+        hint = (
+            "Correct the allowlisted resource kind, target-bound name, or selector and issue "
+            "a different read-only query."
+        )
+    elif status == 429:
+        category = "rate_limited"
+        hint = "Query mutation will not repair rate limiting; avoid immediate duplicate retries."
+    elif status >= 500 or any(
+        token in error
+        for token in (
+            "timed out",
+            "timeout",
+            "connection refused",
+            "no route to host",
+            "temporary failure",
+        )
+    ):
+        category = "transport_unavailable"
+        hint = "Query changes cannot repair this transport failure; use another evidence source."
+
+    feedback: dict[str, Any] = {
+        "message": "query failed",
+        "category": category,
+        "retryable_by_query_change": retryable,
+        "correction_hint": hint,
+        "evidence": False,
+    }
+    if 100 <= status <= 599:
+        feedback["http_status"] = status
+    return feedback
+
+
+def _feedback_query_identity(query: object) -> dict[str, str]:
+    if not isinstance(query, dict):
+        return {}
+    identity: dict[str, str] = {}
+    for key in ("kind", "namespace", "name"):
+        value = str(query.get(key) or "").strip()
+        # These fields are Kubernetes identifiers/resource aliases. Keep only
+        # their safe vocabulary when reflecting an LLM-generated rejection.
+        if value and re.fullmatch(r"[A-Za-z0-9._/-]{1,120}", value):
+            identity[key] = value
+    return identity
+
+
+def _rejected_adhoc_query_feedback(query: object) -> dict[str, Any]:
+    return {
+        "query": _feedback_query_identity(query),
+        "failure": {
+            "message": "query rejected",
+            "category": "invalid_resource_kind",
+            "retryable_by_query_change": True,
+            "correction_hint": (
+                "Use one of adhoc_query_kinds for Kubernetes get/list. Use the matching "
+                "collector probe for logs, metrics, or deployment history."
+            ),
+            "evidence": False,
+        },
+    }
+
+
+def _duplicate_failed_query_feedback(query: object) -> dict[str, Any]:
+    return {
+        "query": _feedback_query_identity(query),
+        "failure": {
+            "message": "failed query repeated",
+            "category": "duplicate_failed_query",
+            "retryable_by_query_change": True,
+            "correction_hint": (
+                "Do not repeat the exact failed query; change the target-bound name, kind, "
+                "or selector while staying in incident scope."
+            ),
+            "evidence": False,
+        },
+    }
+
+
+def _adhoc_prompt_results(adhoc: list[dict] | None) -> list[Any]:
+    results: list[Any] = []
+    for item in (adhoc or [])[-6:]:
+        if item.get("error"):
+            # Keep failure metadata structured so the next model round can
+            # reliably branch on retryability; no remote error/body is copied.
+            results.append(
+                {
+                    "query": _adhoc_query_repr(item),
+                    "failure": _adhoc_failure_feedback(item),
+                }
+            )
+        else:
+            results.append(_adhoc_prompt_result(item))
+    return results
+
+
+def _adhoc_prompt_result(item: dict) -> str:
+    data = item.get("data") if isinstance(item.get("data"), dict) else {}
+    object_data = data.get("object") if isinstance(data.get("object"), dict) else data
+    status = object_data.get("status") if isinstance(object_data.get("status"), dict) else {}
+    conditions = status.get("conditions") if isinstance(status.get("conditions"), list) else []
+    containers = (
+        status.get("containerStatuses")
+        if isinstance(status.get("containerStatuses"), list)
+        else []
+    )
+    status_extract = {
+        "phase": status.get("phase"),
+        "reason": status.get("reason"),
+        "message": status.get("message"),
+        "conditions": [
+            {
+                key: condition.get(key)
+                for key in ("type", "status", "reason", "message")
+                if condition.get(key) is not None
+            }
+            for condition in conditions[:4]
+            if isinstance(condition, dict)
+        ],
+        "containerStatuses": [
+            {
+                "name": container.get("name"),
+                "restartCount": container.get("restartCount"),
+                "waiting": (
+                    container["state"].get("waiting")
+                    if isinstance(container.get("state"), dict)
+                    else None
+                ),
+                "terminated": (
+                    container["state"].get("terminated")
+                    if isinstance(container.get("state"), dict)
+                    else None
+                ),
+            }
+            for container in containers[:4]
+            if isinstance(container, dict)
+        ],
+    }
+    projection = {
+        "query": _adhoc_query_repr(item),
+        "signals": kubernetes_salient_markers(data),
+        "status": status_extract,
+    }
+    return json.dumps(projection, default=str)[:600]
 
 
 def _investigator_masker(settings: Settings):

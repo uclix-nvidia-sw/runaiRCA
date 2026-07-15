@@ -1,19 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import shlex
 from dataclasses import replace
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import quote
 
 import yaml
 
 from app.collectors.base import (
+    _FALSE_IS_FAILURE_CONDITION_TYPES,
+    _OBSERVED_NORMAL_EVENT_REASONS,
+    _TRUE_IS_FAILURE_CONDITION_TYPES,
     NO_EVIDENCE,
     AnalysisTarget,
     CollectorResult,
+    _boolean_condition_status,
     artifact,
+    causal_evidence_time_range,
     incident_time_range,
     ko_en,
     parse_incident_time,
@@ -24,6 +31,7 @@ from app.llm import cached_insight, complete, insight_cache_key, llm_configured
 from app.masking import build_masker
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
+    mcp_budget,
     mcp_call,
     mcp_error,
     mcp_fallback_warning,
@@ -248,7 +256,13 @@ def kind_lookup_title(kind: str, language: str) -> str:
     return f"{resolved} lookup"
 
 
-def kubectl_repr(kind: str, namespace: str = "", name: str = "", label_selector: str = "") -> str:
+def kubectl_repr(
+    kind: str,
+    namespace: str = "",
+    name: str = "",
+    label_selector: str = "",
+    field_selector: str = "",
+) -> str:
     """The read as the kubectl command an operator would have typed — artifacts
     show the REAL query shape ("kubectl get pods -n runai train-0"), not an
     internal param dump."""
@@ -263,6 +277,8 @@ def kubectl_repr(kind: str, namespace: str = "", name: str = "", label_selector:
         parts.append(f"-n {quote_arg(namespace)}")
     if label_selector:
         parts.append(f"-l {quote_arg(label_selector)}")
+    if field_selector:
+        parts.append(f"--field-selector {quote_arg(field_selector)}")
     return " ".join(parts)
 
 
@@ -282,8 +298,10 @@ async def k8s_read(
     namespace: str = "",
     name: str = "",
     label_selector: str = "",
+    field_selector: str = "",
     *,
     full_object: bool = False,
+    continue_token: str = "",
 ) -> dict:
     """One read-only GET/LIST of a Kubernetes kind — MCP-first, direct fallback.
 
@@ -307,14 +325,17 @@ async def k8s_read(
     mcp_note = ""
     if settings.kubernetes_mcp_url:
         try:
-            return await _k8s_read_via_mcp(
-                settings,
-                resolved,
-                namespace=namespace,
-                name=name,
-                label_selector=label_selector,
-                full_object=full_object,
-            )
+            mcp_kwargs: dict[str, object] = {
+                "namespace": namespace,
+                "name": name,
+                "label_selector": label_selector,
+                "full_object": full_object,
+            }
+            # Keep compatibility with older injected adapters for ordinary
+            # reads; only the new node-assignment lookup needs this argument.
+            if field_selector:
+                mcp_kwargs["field_selector"] = field_selector
+            return await _k8s_read_via_mcp(settings, resolved, **mcp_kwargs)
         except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
             # "not found" is an ANSWER (the resource is gone), not a transport
             # failure — the direct API would only 404 the same question again.
@@ -324,6 +345,7 @@ async def k8s_read(
                     "namespace": namespace,
                     "name": name,
                     "label_selector": label_selector,
+                    "field_selector": field_selector,
                     "url": f"{settings.kubernetes_mcp_url}#read_{resolved}",
                     "status_code": 404,
                     "error": str(exc),
@@ -358,6 +380,10 @@ async def k8s_read(
         params["limit"] = str(settings.kubernetes_list_limit)
         if label_selector:
             params["labelSelector"] = label_selector
+        if field_selector:
+            params["fieldSelector"] = field_selector
+        if continue_token:
+            params["continue"] = continue_token
     verify: bool | str = (
         settings.kubernetes_ca_path if Path(settings.kubernetes_ca_path).exists() else True
     )
@@ -375,6 +401,7 @@ async def k8s_read(
         "namespace": namespace,
         "name": name,
         "label_selector": label_selector,
+        "field_selector": field_selector,
         "url": response.url,
         "status_code": response.status_code,
         "error": response.error,
@@ -398,27 +425,44 @@ async def k8s_logs(
     previous: bool = False,
     since_time: str = "",
 ) -> dict:
-    """One READ-ONLY pod-log fetch — MCP-first (pods_log), direct /pods/{}/log fallback.
+    """One READ-ONLY pod-log fetch with a verifiable historical path.
 
     The on-demand sibling of the base sweep's _collect_pod_logs*, exposed to the
     drill-down/chat LLM loops so "look at the pod's logs" is executable. NOT
-    namespace-gated (RBAC / the MCP server are the boundary). Never raises."""
+    namespace-gated (RBAC / the MCP server are the boundary).  The pinned MCP
+    server cannot request ``sinceTime`` or Kubernetes-generated timestamps, so
+    an incident-bounded request prefers the exact direct log subresource when
+    the agent ServiceAccount is available.  An MCP tail remains useful context,
+    but is explicitly marked as not time-scope-verified. Never raises."""
     if not (namespace and pod):
         return {"error": "namespace and pod are required", "lines": []}
     tail_lines = tail if tail > 0 else settings.kubernetes_list_limit
     mcp_note = ""
+    token = _read_file(settings.kubernetes_token_path) if since_time else ""
+    if token:
+        return await _direct_pod_logs(
+            settings,
+            namespace=namespace,
+            pod=pod,
+            container=container,
+            tail_lines=tail_lines,
+            previous=previous,
+            since_time=since_time,
+            token=token,
+        )
     if settings.kubernetes_mcp_url:
-        args: dict[str, object] = {"namespace": namespace, "name": pod, "tailLines": tail_lines}
+        # v0.0.62's actual tools/list schema calls this argument ``tail`` and
+        # does not expose the Kubernetes API's ``sinceTime`` option.  Keep the
+        # requested incident window on the result for timestamp filtering, but
+        # send only schema-valid fields so the whole MCP collector is not
+        # demoted to the direct API by an invalid-arguments error.
+        args: dict[str, object] = {"namespace": namespace, "name": pod, "tail": tail_lines}
         if container:
             args["container"] = container
         if previous:
             args["previous"] = True
-        if since_time:
-            args["sinceTime"] = since_time
         try:
-            result = await _k8s_mcp_result(
-                settings, [("pods_log", args), ("pods_log", {**args, "pod": pod})]
-            )
+            result = await _k8s_mcp_result(settings, [("pods_log", args)])
             raw = mcp_tool_json(result)
             lines = _log_lines(mcp_tool_text(result) or raw)
             observed_entity = _mcp_pod_log_observed_entity(raw, namespace, pod)
@@ -428,11 +472,16 @@ async def k8s_logs(
                 "container": container,
                 "previous": previous,
                 "since_time": since_time or None,
+                "transport": "mcp",
                 # A plain-text MCP reply has no object identity.  It is still
                 # useful operator context, but must not become scoped causal
                 # evidence for the requested Pod unless the response itself
                 # proves which Pod/namespace produced it.
                 "source_verified": observed_entity is not None,
+                # v0.0.62 cannot request Kubernetes timestamps or sinceTime.
+                # Even a structured response that names the Pod cannot prove
+                # that its text belongs to this historical incident window.
+                "time_scope_verified": not bool(since_time),
                 **({"observed_entity": observed_entity} if observed_entity else {}),
                 "status_code": 200,
                 "error": None,
@@ -440,7 +489,8 @@ async def k8s_logs(
             }
         except Exception as exc:  # noqa: BLE001 - direct fallback is the behavior.
             mcp_note = mcp_fallback_warning(exc)
-    token = _read_file(settings.kubernetes_token_path)
+    if not token:
+        token = _read_file(settings.kubernetes_token_path)
     if not token:
         return {
             "namespace": namespace,
@@ -448,6 +498,32 @@ async def k8s_logs(
             "error": "kubernetes service account token unavailable",
             "lines": [],
         }
+    return await _direct_pod_logs(
+        settings,
+        namespace=namespace,
+        pod=pod,
+        container=container,
+        tail_lines=tail_lines,
+        previous=previous,
+        since_time=since_time,
+        token=token,
+        mcp_note=mcp_note,
+    )
+
+
+async def _direct_pod_logs(
+    settings: Settings,
+    *,
+    namespace: str,
+    pod: str,
+    container: str,
+    tail_lines: int,
+    previous: bool,
+    since_time: str,
+    token: str,
+    mcp_note: str = "",
+) -> dict[str, object]:
+    """Fetch one exact Pod log stream with API-generated timestamps."""
     verify: bool | str = (
         settings.kubernetes_ca_path if Path(settings.kubernetes_ca_path).exists() else True
     )
@@ -473,12 +549,14 @@ async def k8s_logs(
         "container": container,
         "previous": previous,
         "since_time": since_time or None,
+        "transport": "direct",
         # The direct API path is an exact /namespaces/{ns}/pods/{pod}/log URL.
         "source_verified": True,
+        "time_scope_verified": True,
         "observed_entity": _pod_log_entity(namespace, pod),
         "status_code": response.status_code,
         "error": response.error,
-        "lines": _log_lines(response.data),
+        "lines": _log_lines(response.data, historical=bool(since_time)),
     }
     if mcp_note:
         result["mcp_fallback"] = mcp_note
@@ -512,7 +590,7 @@ async def k8s_describe(
     expected_kind = _k8s_mcp_api_kinds(resolved)[0][1]
     object_data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
     metadata = object_data.get("metadata") if isinstance(object_data.get("metadata"), dict) else {}
-    events = await _describe_events(
+    event_result = await _describe_events(
         settings,
         namespace=namespace,
         name=name,
@@ -520,6 +598,7 @@ async def k8s_describe(
         expected_uid=str(metadata.get("uid") or ""),
         time_range=time_range,
     )
+    events = event_result.get("items", []) if isinstance(event_result, dict) else event_result
     observed_entity = _described_resource_entity(
         expected_kind, namespace, name, object_data
     )
@@ -531,8 +610,27 @@ async def k8s_describe(
         "status_code": obj.get("status_code"),
         "error": obj.get("error"),
         "events": events,
+        **(
+            {"events_error": event_result["error"]}
+            if isinstance(event_result, dict) and event_result.get("error")
+            else {}
+        ),
         **({"observed_entity": observed_entity} if observed_entity else {}),
-        **({"mcp_fallback": obj["mcp_fallback"]} if obj.get("mcp_fallback") else {}),
+        **(
+            {
+                "mcp_fallback": " | ".join(
+                    str(note)
+                    for note in (
+                        obj.get("mcp_fallback"),
+                        event_result.get("mcp_fallback") if isinstance(event_result, dict) else "",
+                    )
+                    if note
+                )
+            }
+            if obj.get("mcp_fallback")
+            or (isinstance(event_result, dict) and event_result.get("mcp_fallback"))
+            else {}
+        ),
     }
 
 
@@ -562,25 +660,42 @@ async def _describe_events(
     expected_kind: str,
     expected_uid: str = "",
     time_range: dict[str, str] | None = None,
-) -> list:
-    """Events for ONE object, preferring Kubernetes MCP with client-side filtering.
+) -> dict[str, object]:
+    """Events for ONE object, preferring Kubernetes MCP plus local verification.
 
-    The MCP event-list tool does not expose an involvedObject field selector, so
-    fetch the namespace-scoped list through MCP and filter it locally. Direct API
-    is retained only as the fallback when MCP is unavailable.
+    In v0.0.62 the generic ``resources_list`` tool exposes ``fieldSelector``;
+    the ``events_list`` shortcut does not. Prefer the generic tool so a busy
+    namespace cannot truncate the target's Events out of the result. Retain
+    client-side identity filtering because alternate adapters may accept but
+    ignore selectors.
     """
     if not name:
-        return []
+        return {"items": []}
+    field_selector = ",".join(
+        value
+        for value in (
+            f"involvedObject.name={name}",
+            f"involvedObject.kind={expected_kind}",
+            f"involvedObject.uid={expected_uid}" if expected_uid else "",
+        )
+        if value
+    )
+    mcp_note = ""
     if settings.kubernetes_mcp_url:
         try:
             data = await _k8s_mcp_json(
                 settings,
                 [
-                    ("events_list", {"namespace": namespace}),
                     (
                         "resources_list",
-                        {"apiVersion": "v1", "kind": "Event", "namespace": namespace},
+                        {
+                            "apiVersion": "v1",
+                            "kind": "Event",
+                            "namespace": namespace,
+                            "fieldSelector": field_selector,
+                        },
                     ),
+                    ("events_list", {"namespace": namespace}),
                 ],
             )
             normalized = _normalize_k8s_payload(data)
@@ -598,12 +713,16 @@ async def _describe_events(
                 if _event_matches_uid(item, expected_uid)
             ]
             filtered = _events_in_time_range(matching, time_range)
-            return compact(filtered, limit=12) if filtered else []
-        except Exception:  # noqa: BLE001 - direct API fallback is the behavior.
-            pass
+            return {"items": compact(filtered, limit=12) if filtered else []}
+        except Exception as exc:  # noqa: BLE001 - direct API fallback is the behavior.
+            mcp_note = mcp_fallback_warning(exc)
     token = _read_file(settings.kubernetes_token_path)
     if not token:
-        return []
+        return {
+            "items": [],
+            "error": "kubernetes service account token unavailable for events read",
+            **({"mcp_fallback": mcp_note} if mcp_note else {}),
+        }
     verify: bool | str = (
         settings.kubernetes_ca_path if Path(settings.kubernetes_ca_path).exists() else True
     )
@@ -616,15 +735,7 @@ async def _describe_events(
         path="/".join(parts),
         timeout_seconds=settings.kubernetes_timeout_seconds,
         params={
-            "fieldSelector": ",".join(
-                value
-                for value in (
-                    f"involvedObject.name={name}",
-                    f"involvedObject.kind={expected_kind}",
-                    f"involvedObject.uid={expected_uid}" if expected_uid else "",
-                )
-                if value
-            ),
+            "fieldSelector": field_selector,
             "limit": str(settings.kubernetes_list_limit),
         },
         headers={"Authorization": f"Bearer {token}"},
@@ -644,7 +755,11 @@ async def _describe_events(
         and _event_matches_uid(item, expected_uid)
     ]
     filtered = _events_in_time_range(filtered, time_range)
-    return compact(filtered, limit=12) if filtered else []
+    return {
+        "items": compact(filtered, limit=12) if filtered else [],
+        **({"error": response.error} if response.error else {}),
+        **({"mcp_fallback": mcp_note} if mcp_note else {}),
+    }
 
 
 async def k8s_exec(
@@ -674,6 +789,9 @@ async def k8s_exec(
             "pod": pod,
             "command": command,
             "error": "kubernetes service account token unavailable",
+            "error_code": "kubernetes_token_unavailable",
+            "transport_error": True,
+            "retryable": False,
         }
     try:
         stdout, stderr, status_err = await _exec_via_websocket(
@@ -689,7 +807,7 @@ async def k8s_exec(
             "namespace": namespace,
             "pod": pod,
             "command": command,
-            "error": f"exec failed: {exc.__class__.__name__}: {exc}",
+            **_exec_transport_failure(settings, exc),
         }
     result: dict = {
         "namespace": namespace,
@@ -707,6 +825,74 @@ async def k8s_exec(
     if stderr.strip():
         result["stderr"] = stderr[-1000:]
     return result
+
+
+def _exec_transport_failure(settings: Settings, exc: Exception) -> dict[str, object]:
+    """Classify an exec transport failure without echoing its full request URL.
+
+    ``aiohttp.WSServerHandshakeError`` includes every command query parameter in
+    ``str(exc)``. Besides producing an unreadable artifact, repeating that text
+    for each base probe makes one missing ``pods/exec`` permission look like
+    three independent findings. A failed WebSocket handshake is transport-wide
+    for this Pod, so callers can stop the remaining probe batch safely.
+    """
+    raw_status = getattr(exc, "status", None)
+    status = raw_status if isinstance(raw_status, int) else None
+    if status in {401, 403}:
+        return {
+            "error": ko_en(
+                settings,
+                (
+                    f"Kubernetes API가 pod exec 접근을 거부했습니다(HTTP {status}). "
+                    "agent ServiceAccount에 pods/exec get/create 권한을 부여하거나 "
+                    "ENABLE_POD_EXEC=false로 비활성화하세요."
+                ),
+                (
+                    f"Kubernetes API denied pod exec access (HTTP {status}); grant the agent "
+                    "ServiceAccount get/create on pods/exec or set ENABLE_POD_EXEC=false."
+                ),
+            ),
+            "error_code": "kubernetes_exec_forbidden",
+            "transport_error": True,
+            "retryable": False,
+            "status_code": status,
+        }
+    if status == 404:
+        message = ko_en(
+            settings,
+            "Pod 또는 exec 하위 리소스를 찾을 수 없습니다(HTTP 404).",
+            "The Pod or exec subresource was not found (HTTP 404).",
+        )
+        code, retryable = "kubernetes_exec_not_found", False
+    elif status is not None:
+        message = ko_en(
+            settings,
+            f"Pod exec WebSocket 연결에 실패했습니다(HTTP {status}).",
+            f"Pod exec WebSocket handshake failed (HTTP {status}).",
+        )
+        code, retryable = "kubernetes_exec_handshake_failed", status >= 429
+    elif isinstance(exc, TimeoutError):
+        message = ko_en(
+            settings,
+            "Pod exec 연결 시간이 초과되었습니다.",
+            "Pod exec transport timed out.",
+        )
+        code, retryable = "kubernetes_exec_timeout", True
+    else:
+        error_type = exc.__class__.__name__
+        message = ko_en(
+            settings,
+            f"Pod exec 전송에 실패했습니다({error_type}).",
+            f"Pod exec transport failed ({error_type}).",
+        )
+        code, retryable = "kubernetes_exec_transport_failed", True
+    return {
+        "error": message,
+        "error_code": code,
+        "transport_error": True,
+        "retryable": retryable,
+        **({"status_code": status} if status is not None else {}),
+    }
 
 
 async def _exec_via_websocket(
@@ -784,6 +970,7 @@ async def _k8s_read_via_mcp(
     namespace: str = "",
     name: str = "",
     label_selector: str = "",
+    field_selector: str = "",
     full_object: bool = False,
 ) -> dict:
     """k8s_read over the Kubernetes MCP server; same result shape, raises to fall back."""
@@ -826,7 +1013,7 @@ async def _k8s_read_via_mcp(
         # A requested label selector must ride on EVERY candidate — a shortcut
         # tool called without it would "succeed" with the unfiltered namespace
         # and silently drop the filter the caller asked for.
-        if resolved == "pods":
+        if resolved == "pods" and not field_selector:
             pod_args: dict[str, object] = {"namespace": namespace}
             if label_selector:
                 pod_args["labelSelector"] = label_selector
@@ -836,7 +1023,7 @@ async def _k8s_read_via_mcp(
                     ("pods_list", dict(pod_args)),
                 ]
             )
-        elif resolved == "events" and not label_selector:
+        elif resolved == "events" and not label_selector and not field_selector:
             candidates.append(("events_list", {"namespace": namespace}))
         for api_version, mcp_kind in api_kinds:
             args: dict[str, object] = {
@@ -846,10 +1033,14 @@ async def _k8s_read_via_mcp(
             }
             if label_selector:
                 args["labelSelector"] = label_selector
+            if field_selector:
+                args["fieldSelector"] = field_selector
             candidates.append(("resources_list", args))
         fallback_args: dict[str, object] = {"kind": resolved, "namespace": namespace}
         if label_selector:
             fallback_args["labelSelector"] = label_selector
+        if field_selector:
+            fallback_args["fieldSelector"] = field_selector
         candidates.append(("resources_list", fallback_args))
     data = await _k8s_mcp_json(settings, candidates)
     if name and not _mcp_named_resource_matches(
@@ -869,12 +1060,18 @@ async def _k8s_read_via_mcp(
         # Belt and suspenders: an MCP server may ACCEPT labelSelector and still
         # ignore it — enforce equality selectors client-side.
         data = _apply_label_selector(data, label_selector)
+    if not name and field_selector:
+        # The official generic resources_list schema carries fieldSelector,
+        # but enforce the exact assignment locally as well in case a proxy
+        # accepts and then drops it.
+        data = _apply_field_selector(_normalize_k8s_payload(data), field_selector)
     safe_data = _collector_masker(settings).mask_object(data)
     return {
         "kind": resolved,
         "namespace": namespace,
         "name": name,
         "label_selector": label_selector,
+        "field_selector": field_selector,
         "url": f"{settings.kubernetes_mcp_url}#read_{resolved}",
         "status_code": 200,
         "error": None,
@@ -973,6 +1170,50 @@ def _apply_label_selector(data: object, selector: str) -> object:
     return filtered if isinstance(data, list) else {**data, "items": filtered}
 
 
+def _apply_field_selector(data: object, selector: str) -> object:
+    """Filter a Kubernetes list by pure-equality dotted field selectors.
+
+    The official MCP's generic ``resources_list`` accepts ``fieldSelector``,
+    but a proxy can accept an argument without forwarding it.  The scheduler
+    snapshot relies on an exact ``spec.nodeName=<node>`` assignment, so verify
+    that equality locally before summing Pod GPU requests.  Unsupported selector
+    operators are left to the server rather than approximated incorrectly.
+    """
+    terms: dict[str, str] = {}
+    for part in selector.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if any(op in part for op in ("!=", "!", "(", " in ", " notin ")) or "=" not in part:
+            return data
+        key, _, value = part.partition("==") if "==" in part else part.partition("=")
+        key = key.strip()
+        if not key:
+            return data
+        terms[key] = value.strip()
+    items = data if isinstance(data, list) else None
+    if items is None and isinstance(data, dict) and isinstance(data.get("items"), list):
+        items = data["items"]
+    if items is None or not terms:
+        return data
+
+    def field_value(item: dict[str, object], path: str) -> object:
+        value: object = item
+        for segment in path.split("."):
+            if not isinstance(value, dict):
+                return None
+            value = value.get(segment)
+        return value
+
+    filtered = [
+        item
+        for item in items
+        if isinstance(item, dict)
+        and all(str(field_value(item, key) or "") == value for key, value in terms.items())
+    ]
+    return filtered if isinstance(data, list) else {**data, "items": filtered}
+
+
 # group -> "/apis/{group}/{preferredVersion}" once discovered. Module-level on
 # purpose: the group's served version is a cluster property, not per-request.
 _API_GROUP_PREFIX_CACHE: dict[str, str] = {}
@@ -1058,6 +1299,14 @@ def _k8s_mcp_resource_kind(kind: str) -> tuple[str, str]:
     return mapping.get(kind, ("v1", kind))
 
 
+def _kubernetes_exact_absence(item: dict[str, object]) -> bool:
+    """Treat an exact named-resource 404 as a completed lookup, not outage."""
+    return item.get("status_code") == 404 and str(item.get("name") or "") in {
+        "pod",
+        "node",
+    }
+
+
 class KubernetesCollector:
     name = "kubernetes"
 
@@ -1067,6 +1316,7 @@ class KubernetesCollector:
     async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:  # noqa: ANN001
         target = _scope_target(target, plan)
         time_range = incident_time_range(target)
+        causal_time_range = causal_evidence_time_range(target)
         since_time = time_range["start"] if time_range else ""
         missing: list[str] = []
         if not target.namespace:
@@ -1085,36 +1335,40 @@ class KubernetesCollector:
         control_plane_in_scope = plan.check_control_plane if plan is not None else True
         if self._settings.kubernetes_mcp_url:
             try:
-                responses = await _collect_kubernetes_responses_via_mcp(
-                    settings=self._settings,
-                    target=target,
-                    control_plane_in_scope=control_plane_in_scope,
-                )
-                pod_summary_data = _target_pod_summary(responses)
-                if _pod_matches_target_uid(pod_summary_data, target):
-                    containers = _container_names(pod_summary_data)
-                    logs = await _collect_pod_logs_via_mcp(
+                async with mcp_budget(self._settings.kubernetes_timeout_seconds):
+                    responses = await _collect_kubernetes_responses_via_mcp(
                         settings=self._settings,
                         target=target,
-                        containers=containers,
-                        previous_containers=_restarted_container_names(pod_summary_data),
-                        since_time=since_time,
+                        control_plane_in_scope=control_plane_in_scope,
                     )
-                    # pods/exec is intentionally outside the read-only Kubernetes
-                    # MCP ServiceAccount. Run the same tightly allowlisted probes
-                    # through the agent's own ServiceAccount; this does not turn
-                    # ordinary Kubernetes reads into direct API calls.
-                    exec_probes = await _collect_exec_probes(
-                        settings=self._settings,
-                        target=target,
-                        containers=containers,
-                    )
-                elif target.pod_uid:
-                    warnings.append(
-                        "current Pod UID does not match the alert Pod UID; skipped logs and exec"
-                    )
-                    pod_summary_data = None
-                used_mcp = True
+                    pod_summary_data = _target_pod_summary(responses)
+                    if _pod_matches_target_uid(pod_summary_data, target):
+                        containers = _container_names(pod_summary_data)
+                        logs = await _collect_pod_logs_via_mcp(
+                            settings=self._settings,
+                            target=target,
+                            containers=containers,
+                            previous_containers=_restarted_container_names(
+                                pod_summary_data
+                            ),
+                            since_time=since_time,
+                        )
+                        # pods/exec is intentionally outside the read-only Kubernetes
+                        # MCP ServiceAccount. Run the same tightly allowlisted probes
+                        # through the agent's own ServiceAccount; this does not turn
+                        # ordinary Kubernetes reads into direct API calls.
+                        exec_probes = await _collect_exec_probes(
+                            settings=self._settings,
+                            target=target,
+                            containers=containers,
+                        )
+                    elif target.pod_uid:
+                        warnings.append(
+                            "current Pod UID does not match the alert Pod UID; "
+                            "skipped logs and exec"
+                        )
+                        pod_summary_data = None
+                    used_mcp = True
             except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
                 warnings.append(mcp_fallback_warning(exc))
         else:
@@ -1204,7 +1458,8 @@ class KubernetesCollector:
                 elif target.pod_uid:
                     target_pod_describe["identity_mismatch"] = True
                     warnings.append(
-                        "described Pod UID does not match the alert Pod UID; ignored replacement Pod"
+                        "described Pod UID does not match the alert Pod UID; "
+                        "ignored replacement Pod"
                     )
 
         # Controller-level alerts (Deployment/StatefulSet/DaemonSet/ReplicaSet/
@@ -1215,9 +1470,14 @@ class KubernetesCollector:
         workload_resolution: dict[str, object] = {}
         resolved_pod_describe: dict[str, object] = {}
         if not target.pod:
-            workload_resolution = await _resolve_workload_pod(self._settings, target)
+            if target.namespace and not _namespace_allowed(self._settings, target.namespace):
+                if "kubernetes.namespace_scope" not in missing:
+                    missing.append("kubernetes.namespace_scope")
+                warnings.append("Resolved workload pod lookup skipped by namespace scope configuration.")
+            else:
+                workload_resolution = await _resolve_workload_pod(self._settings, target)
             resolved_pod = str(workload_resolution.get("selected_pod") or "")
-            if resolved_pod:
+            if resolved_pod and _namespace_allowed(self._settings, target.namespace):
                 resolved_target = replace(target, pod=resolved_pod)
                 resolved_pod_describe = await k8s_describe(
                     self._settings,
@@ -1244,14 +1504,33 @@ class KubernetesCollector:
             if item.get("error")
         )
         successful = [item for item in responses if not item.get("error")]
+        required_responses = [
+            item
+            for item in responses
+            if not str(item.get("name") or "").startswith("runai_control_plane_")
+        ]
+        required_failures = [
+            item
+            for item in required_responses
+            if item.get("error") and not _kubernetes_exact_absence(item)
+        ]
+        required_completed = [
+            item
+            for item in required_responses
+            if not item.get("error") or _kubernetes_exact_absence(item)
+        ]
+        if required_failures and "kubernetes.query" not in missing:
+            missing.append("kubernetes.query")
         pod_statuses = _pod_statuses(responses)
         warning_events = _warning_events(responses)
         target_described_events = (
-            None if target_pod_describe.get("identity_mismatch") else target_pod_describe.get("events")
+            None
+            if target_pod_describe.get("identity_mismatch")
+            else target_pod_describe.get("events")
         )
         if isinstance(target_described_events, list):
             warning_events.extend(
-                event
+                _event_summary(event, target=target)
                 for event in target_described_events
                 if isinstance(event, dict) and event.get("type") == "Warning"
             )
@@ -1260,10 +1539,34 @@ class KubernetesCollector:
         described_events = resolved_pod_describe.get("events")
         if isinstance(described_events, list):
             warning_events.extend(
-                event
+                _event_summary(event, target=target)
                 for event in described_events
                 if isinstance(event, dict) and event.get("type") == "Warning"
             )
+        warning_events = _dedupe_warning_events(warning_events)
+        causal_warning_events = _warning_events_in_time_range(
+            warning_events, causal_time_range
+        )
+        # Namespace/control-plane Event messages remain useful context, but the
+        # causal Event card is allowed to support RCA only with an involved
+        # object that proves the concrete alert target. Mixing a message-only
+        # Event into the same aggregate used to demote (or contaminate) the
+        # otherwise exact target evidence.
+        causal_target_warning_events = (
+            [
+                event
+                for event in causal_warning_events
+                if event.get("target_identity_verified") is True
+            ]
+            if _warning_events_are_target_scoped(target)
+            else causal_warning_events
+        )
+        gpu_node_resource_observations = await _collect_gpu_node_resource_observations(
+            self._settings,
+            target,
+            plan,
+            causal_target_warning_events,
+        )
         node_conditions = _node_conditions(responses)
         runai_control_plane_pods = _runai_control_plane_pods(responses)
         runai_control_plane_events = _runai_control_plane_warning_events(responses)
@@ -1282,8 +1585,15 @@ class KubernetesCollector:
             except Exception:  # noqa: BLE001 - enumeration is best-effort
                 pass
         crd_findings = runai_crds.get("findings") or []
+        warnings.extend(str(item) for item in runai_crds.get("warnings") or [])
+        if runai_crds.get("truncated"):
+            warnings.append(
+                "Run:ai CRD scan was truncated after five pages for "
+                + ", ".join(map(str, runai_crds["truncated"]))
+                + "."
+            )
 
-        if successful and not missing:
+        if required_completed and not required_failures and not missing:
             status = "ok"
             confidence = "high"
             summary = ko_en(
@@ -1291,23 +1601,39 @@ class KubernetesCollector:
                 "알림 대상에 대한 Kubernetes 조회를 완료했습니다.",
                 "Kubernetes API queries completed for the resolved alert target.",
             )
-        elif successful:
+        elif successful or required_completed:
             status = "partial"
             confidence = "medium"
-            summary = ko_en(
-                self._settings,
-                "Kubernetes API에는 접속했지만 알림 대상 정보가 불완전합니다. "
-                "네임스페이스/파드/워크로드/노드 레이블이 없을 수 있습니다.",
-                "Kubernetes API is reachable, but the alert target is incomplete. "
-                "Namespace, pod, workload, or node labels may be missing.",
-            )
+            if required_failures:
+                failed_names = ", ".join(
+                    str(item.get("name") or "query") for item in required_failures
+                )
+                summary = ko_en(
+                    self._settings,
+                    "Kubernetes 대상 쿼리 일부가 실패했습니다. 성공한 쿼리 증거는 "
+                    f"유지했습니다. 실패: {failed_names}.",
+                    "Kubernetes target queries were incomplete; usable per-query "
+                    f"evidence was retained. Failed: {failed_names}.",
+                )
+            else:
+                summary = ko_en(
+                    self._settings,
+                    "Kubernetes API에는 접속했지만 알림 대상 정보가 불완전합니다. "
+                    "네임스페이스/파드/워크로드/노드 레이블이 없을 수 있습니다.",
+                    "Kubernetes API is reachable, but the alert target is incomplete. "
+                    "Namespace, pod, workload, or node labels may be missing.",
+                )
         else:
             status = "unavailable"
             confidence = "low"
             summary = f"{NO_EVIDENCE} " + ko_en(
                 self._settings,
-                "Kubernetes API 조회가 실패했습니다.",
-                "Kubernetes API direct queries failed.",
+                "네임스페이스가 범위 설정에서 제외되어 Kubernetes 조회를 건너뛰었습니다."
+                if target.namespace and not target.node and not _namespace_allowed(self._settings, target.namespace)
+                else "Kubernetes API 조회가 실패했습니다.",
+                "Kubernetes queries were skipped because the namespace is excluded by scope configuration."
+                if target.namespace and not target.node and not _namespace_allowed(self._settings, target.namespace)
+                else "Kubernetes API direct queries failed.",
             )
 
         # The alert names a pod that no longer exists (and left no live sibling
@@ -1337,16 +1663,18 @@ class KubernetesCollector:
                 f"Found {len(crd_findings)} Run:ai resource(s) not Ready: {named}.",
             )
             summary = f"{lead} {summary}"
-            if status != "ok":
+            if status != "ok" and not required_failures:
                 status, confidence = "ok", "high"
 
         insight = await _senior_insight(
             self._settings,
             summary=summary,
             container_diagnostics=container_diagnostics,
-            warning_events=warning_events,
-            logs=logs,
-            exec_probes=exec_probes,
+            warning_events=causal_target_warning_events,
+            logs=_verified_logs_in_time_range(logs, causal_time_range),
+            # A denied/unavailable exec capability is collection metadata, not
+            # a workload observation for the insight model to explain.
+            exec_probes=[probe for probe in exec_probes if not probe.get("error")],
         )
 
         details = {
@@ -1354,6 +1682,7 @@ class KubernetesCollector:
             "kubernetes_mcp_url": self._settings.kubernetes_mcp_url,
             "used_mcp": used_mcp,
             "time_range": time_range,
+            "causal_time_range": causal_time_range,
             "target_pod_missing": target_pod_missing,
             "kubernetes_namespaces": self._settings.kubernetes_namespaces,
             "kubernetes_cluster_scope_enabled": self._settings.kubernetes_cluster_scope_enabled,
@@ -1366,6 +1695,7 @@ class KubernetesCollector:
             "pod_statuses": pod_statuses,
             "container_diagnostics": container_diagnostics,
             "warning_events": warning_events,
+            "gpu_node_resource_observations": gpu_node_resource_observations,
             "node_conditions": node_conditions,
             "pod_logs": logs,
             "target_pod_describe": target_pod_describe,
@@ -1376,6 +1706,8 @@ class KubernetesCollector:
             "runai_control_plane_warning_events": runai_control_plane_events,
             "runai_crd_findings": crd_findings,
             "runai_crds_checked": runai_crds.get("checked"),
+            "runai_crd_failed_kinds": runai_crds.get("failed_kinds"),
+            "runai_crd_truncated": runai_crds.get("truncated"),
             "insight": insight,
             "queries": responses,
         }
@@ -1407,8 +1739,8 @@ class KubernetesCollector:
         ]
         artifacts.append(_pod_lifecycle_artifact(self.name, target, responses))
         event_observation = _warning_event_observation(
-            warning_events,
-            time_range=time_range,
+            causal_target_warning_events,
+            time_range=causal_time_range,
             status=status,
             target_scoped=_warning_events_are_target_scoped(target),
             queries_complete=_warning_event_queries_complete(responses),
@@ -1427,41 +1759,59 @@ class KubernetesCollector:
                 ),
                 title=ko_en(
                     self._settings,
-                    "인시던트 시간창 Warning 이벤트",
-                    "Incident-window Warning events",
+                    "원인 시간창 Warning 이벤트",
+                    "Causal-window Warning events",
                 ),
                 query=kubectl_repr("events", namespace=target.namespace),
                 summary=ko_en(
                     self._settings,
                     (
-                        f"인시던트 시간창 Warning 이벤트 {len(warning_events)}건을 확인했습니다."
-                        if warning_events
-                        else "인시던트 시간창에 일치하는 Warning 이벤트가 없습니다."
+                        "원인 시간창에서 대상이 확인된 Warning 이벤트 "
+                        f"{len(causal_target_warning_events)}건을 확인했습니다."
+                        if causal_target_warning_events
+                        else "원인 시간창에 대상이 확인된 Warning 이벤트가 없습니다."
                     ),
                     (
-                        f"Collected {len(warning_events)} Warning event(s) in the incident window."
-                        if warning_events
-                        else "No matching Warning events in the incident window."
+                        "Collected "
+                        f"{len(causal_target_warning_events)} target-verified Warning event(s) "
+                        "in the causal window."
+                        if causal_target_warning_events
+                        else "No target-verified Warning events in the causal window."
                     ),
                 ),
                 result={
                     "observation": event_observation,
-                    "events": warning_events,
-                    "time_range": time_range,
+                    "events": causal_target_warning_events,
+                    "time_range": causal_time_range,
+                    "collection_time_range": time_range,
                 },
             )
+        )
+        artifacts.extend(
+            _node_condition_artifacts(
+                self.name,
+                target,
+                responses,
+                time_range=causal_time_range,
+            )
+        )
+        artifacts.extend(
+            _gpu_node_resource_artifact(self.name, self._settings, snapshot)
+            for snapshot in gpu_node_resource_observations
         )
         # Container logs are collected with ``sinceTime`` and can include a
         # restarted container's ``previous`` instance. Keep them distinct from
         # live YAML/describe/exec state. A tail-limited logs endpoint cannot
-        # prove absence, but timestamped lines inside the incident window are
-        # precise positive evidence.
+        # prove absence, but API-timestamped lines inside the causal window are
+        # precise positive evidence. Recovery-epilogue lines stay in details,
+        # outside the card that semantic ranking can use as causal support.
         artifacts.extend(
-            _pod_log_artifact(self.name, log, time_range=time_range)
+            _pod_log_artifact(self.name, log, time_range=causal_time_range)
             for log in logs
         )
         if target_pod_describe:
             describe_error = target_pod_describe.get("error")
+            describe_events_error = target_pod_describe.get("events_error")
             describe_events = target_pod_describe.get("events")
             event_count = len(describe_events) if isinstance(describe_events, list) else 0
             snapshot_observation: dict[str, object] = {
@@ -1483,20 +1833,40 @@ class KubernetesCollector:
                     agent=self.name,
                     source="kubernetes",
                     type="pod_inspection",
-                    status="unavailable" if describe_error else "ok",
-                    confidence="high" if not describe_error else "low",
+                    # A failed events read must not discard the successfully
+                    # collected Pod YAML from the usable evidence set.
+                    status=(
+                        "unavailable"
+                        if describe_error
+                        else "partial"
+                        if describe_events_error
+                        else "ok"
+                    ),
+                    confidence=(
+                        "high" if not describe_error and not describe_events_error else "low"
+                    ),
                     title=ko_en(self._settings, "Pod YAML + 상세 점검", "Pod YAML + describe"),
                     query=pod_inspection_repr(target.namespace, target.pod),
                     summary=(
                         str(describe_error)
                         if describe_error
-                        else ko_en(
+                        else (
+                            ko_en(
+                                self._settings,
+                                "Pod 전체 YAML을 수집했지만 incident 시간창 이벤트 조회를 "
+                                f"완료하지 못했습니다: {describe_events_error}",
+                                "Collected full Pod YAML, but the incident-window events read was "
+                                f"unavailable: {describe_events_error}",
+                            )
+                            if describe_events_error
+                            else ko_en(
                             self._settings,
                             (
                                 "Pod 전체 YAML과 incident 시간창 이벤트 "
                                 f"{event_count}건을 확인했습니다."
                             ),
                             f"Collected full Pod YAML and {event_count} incident-window event(s).",
+                            )
                         )
                     ),
                     # YAML is a live inspection; its filtered events are
@@ -1509,13 +1879,15 @@ class KubernetesCollector:
             )
         if exec_probes:
             exec_errors = [str(probe.get("error")) for probe in exec_probes if probe.get("error")]
+            exec_successes = [probe for probe in exec_probes if not probe.get("error")]
+            exec_unavailable = not exec_successes
             exec_observation: dict[str, object] = {
                 "kind": "kubernetes_live_exec",
                 "predicate": "kubernetes_live_exec",
                 # Exec output has exact Pod provenance but is sampled now; it
                 # cannot establish a condition during a past incident.
-                "polarity": "unknown",
-                "coverage": "partial",
+                "polarity": "unavailable" if exec_unavailable else "unknown",
+                "coverage": "unknown" if exec_unavailable else "partial",
                 "observation_window": {},
             }
             exec_entity = _exec_probes_observed_entity(exec_probes)
@@ -1526,8 +1898,10 @@ class KubernetesCollector:
                     agent=self.name,
                     source="kubernetes",
                     type="pod_exec",
-                    status="partial" if exec_errors else "ok",
-                    confidence="high" if not exec_errors else "medium",
+                    status=(
+                        "unavailable" if exec_unavailable else "partial" if exec_errors else "ok"
+                    ),
+                    confidence=("low" if exec_unavailable else "medium" if exec_errors else "high"),
                     title=ko_en(
                         self._settings, "컨테이너 읽기 전용 exec", "Read-only container exec"
                     ),
@@ -1574,11 +1948,22 @@ def _warning_event_observation(
 ) -> dict[str, object]:
     """Make filtered event presence/absence a typed historical predicate."""
     observed_entity = _event_target_entity(target) if target is not None else None
+    event_uids = {
+        str(event.get("uid") or "")
+        for event in warning_events
+        if str(event.get("uid") or "")
+    }
+    identity_ambiguous = bool(
+        target is not None
+        and target.pod
+        and not target.pod_uid
+        and len(event_uids) > 1
+    )
     verified_events = bool(warning_events) and all(
         event.get("target_identity_verified") is True
         and event.get("observed_entity") == observed_entity
         for event in warning_events
-    )
+    ) and not identity_ambiguous
     if status == "unavailable":
         polarity, coverage = "unavailable", "unknown"
     elif not target_scoped or (target is not None and observed_entity is None):
@@ -1610,6 +1995,7 @@ def _warning_event_observation(
         "event_count": len(warning_events),
         "target_scoped": target_scoped,
         "target_identity_verified": verified_events,
+        "target_identity_ambiguous": identity_ambiguous,
         "queries_complete": queries_complete,
         "observation_window": time_range or {},
     }
@@ -1651,12 +2037,77 @@ def _warning_event_evidence_window(
     return {"start": timestamps[0][1], "end": timestamps[-1][1]}
 
 
+def _warning_events_in_time_range(
+    warning_events: list[dict[str, object]], time_range: dict[str, str] | None
+) -> list[dict[str, object]]:
+    """Project summarized Events onto one occurrence window.
+
+    Collection keeps a short recovery epilogue.  The causal artifact must not
+    aggregate a benign incident-time Event with a failure first observed after
+    resolution, because the aggregate span would overlap and make both texts
+    eligible. Repeating Events are retained when any observation is in range,
+    but their projected timestamp list is trimmed to that range.
+    """
+    if not time_range:
+        return [dict(event) for event in warning_events]
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return []
+    projected: list[dict[str, object]] = []
+    for event in warning_events:
+        values = event.get("observedTimestamps")
+        if not isinstance(values, list):
+            values = [event.get("lastTimestamp")]
+        retained: list[tuple[object, str]] = []
+        for raw in values:
+            observed_at = parse_incident_time(raw)
+            if observed_at is not None and start <= observed_at <= end:
+                retained.append((observed_at, str(raw)))
+        if not retained:
+            continue
+        retained.sort(key=lambda item: item[0])
+        item = dict(event)
+        item["observedTimestamps"] = [raw for _, raw in retained]
+        item["lastTimestamp"] = retained[-1][1]
+        projected.append(item)
+    return projected
+
+
+def _dedupe_warning_events(
+    warning_events: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Remove duplicate Event projections returned by sweep and describe."""
+    seen: set[tuple[object, ...]] = set()
+    deduped: list[dict[str, object]] = []
+    for event in warning_events:
+        timestamps = event.get("observedTimestamps")
+        key = (
+            event.get("type"),
+            event.get("reason"),
+            event.get("message"),
+            event.get("object"),
+            event.get("kind"),
+            event.get("namespace"),
+            event.get("uid"),
+            tuple(str(value) for value in timestamps)
+            if isinstance(timestamps, list)
+            else (str(event.get("lastTimestamp") or ""),),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(event)
+    return deduped
+
+
 def _warning_event_queries_complete(responses: list[dict[str, object]]) -> bool:
     """Whether every Event list completed without an omitted next page."""
     event_responses = [
         response
         for response in responses
-        if str(response.get("name") or "") in {"pod_events", "namespace_events"}
+        if str(response.get("name") or "")
+        in {"pod_events", "workload_events", "namespace_events"}
         or str(response.get("name") or "").startswith("runai_control_plane_events:")
     ]
     return bool(event_responses) and all(
@@ -1711,12 +2162,22 @@ def _pod_log_observation(
 ) -> tuple[dict[str, object], list[dict[str, str]]]:
     """Return only time-bounded log lines; logs API tails never prove absence."""
     source_verified = log.get("source_verified") is True
+    # Backward-compatible default for direct/fabricated observations. Current
+    # MCP paths explicitly set False when the server could not request an
+    # incident bound or Kubernetes-generated timestamps.
+    time_scope_verified = log.get("time_scope_verified") is not False
     if log.get("error"):
         polarity, coverage, entries = "unavailable", "unknown", []
     elif not source_verified:
         # An MCP text response that does not identify its Pod may contain a
         # real failure line, but cannot be attributed to this incident's
         # entity. Keep it visible as context, never scoped causal support.
+        polarity, coverage = "unknown", "partial"
+        entries = _log_entries_in_window(log.get("lines"), time_range or {})
+    elif not time_scope_verified:
+        # Application text can begin with something that looks like RFC3339,
+        # but an unbounded MCP tail cannot prove that it is a Kubernetes log
+        # timestamp or that it came from the historical Pod incarnation.
         polarity, coverage = "unknown", "partial"
         entries = _log_entries_in_window(log.get("lines"), time_range or {})
     elif not time_range:
@@ -1741,6 +2202,7 @@ def _pod_log_observation(
         "coverage": coverage,
         "previous": bool(log.get("previous")),
         "source_verified": source_verified,
+        "time_scope_verified": time_scope_verified,
         "observation_window": time_range or {},
     }
     if observed_entity:
@@ -1751,6 +2213,24 @@ def _pod_log_observation(
             "end": entries[-1]["timestamp"],
         }
     return observation, entries
+
+
+def _verified_logs_in_time_range(
+    logs: list[dict[str, object]], time_range: dict[str, str] | None
+) -> list[dict[str, object]]:
+    """Return only verified, in-window lines for the narrative insight helper."""
+    projected: list[dict[str, object]] = []
+    for log in logs:
+        observation, entries = _pod_log_observation(log, time_range=time_range)
+        if observation.get("polarity") != "present":
+            continue
+        projected.append(
+            {
+                **log,
+                "lines": [f"{entry['timestamp']} {entry['line']}" for entry in entries],
+            }
+        )
+    return projected
 
 
 def _pod_log_observed_entity(log: dict[str, object]) -> dict[str, str] | None:
@@ -1820,6 +2300,21 @@ async def _collect_kubernetes_responses(
                 _list_params(settings),
             )
         )
+    # A Run:ai scheduling Warning is commonly attached to PodGroup/workload,
+    # not to the concrete Pod named by the alert.  Query that exact declared
+    # identity even when a Pod is also present; otherwise a successful Pod-only
+    # read silently drops the strongest scheduling evidence.
+    if target.namespace and target_namespace_allowed and target.workload_name:
+        requests.append(
+            (
+                "workload_events",
+                f"/api/v1/namespaces/{namespace}/events",
+                _list_params(
+                    settings,
+                    {"fieldSelector": f"involvedObject.name={target.workload_name}"},
+                ),
+            )
+        )
     if target.node and settings.kubernetes_cluster_scope_enabled:
         node = quote(target.node, safe="")
         requests.append(("node", f"/api/v1/nodes/{node}", None))
@@ -1887,6 +2382,11 @@ async def _collect_kubernetes_responses_via_mcp(
         nonlocal ok_count
         try:
             data = await _k8s_mcp_json(settings, candidates)
+        except TimeoutError:
+            # The shared collector deadline is a transport-level stop, not a
+            # target query observation. Propagate it even after earlier MCP
+            # calls succeeded so collect() can still use the direct API.
+            raise
         except Exception as exc:  # noqa: BLE001 - a per-query miss is evidence
             responses.append(
                 {
@@ -1923,15 +2423,8 @@ async def _collect_kubernetes_responses_via_mcp(
         )
         await block(
             "pod_events",
-            "MCP events_list",
+            "MCP resources_list Event",
             [
-                (
-                    "events_list",
-                    {
-                        "namespace": target.namespace,
-                        "fieldSelector": f"involvedObject.name={target.pod}",
-                    },
-                ),
                 (
                     "resources_list",
                     {
@@ -1941,6 +2434,7 @@ async def _collect_kubernetes_responses_via_mcp(
                         "fieldSelector": f"involvedObject.name={target.pod}",
                     },
                 ),
+                ("events_list", {"namespace": target.namespace}),
             ],
         )
     elif target.namespace and target_namespace_allowed:
@@ -1965,6 +2459,25 @@ async def _collect_kubernetes_responses_via_mcp(
                     "resources_list",
                     {"apiVersion": "v1", "kind": "Event", "namespace": target.namespace},
                 ),
+            ],
+        )
+    if target.namespace and target_namespace_allowed and target.workload_name:
+        await block(
+            "workload_events",
+            "MCP resources_list Event for workload",
+            [
+                (
+                    "resources_list",
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Event",
+                        "namespace": target.namespace,
+                        "fieldSelector": (
+                            f"involvedObject.name={target.workload_name}"
+                        ),
+                    },
+                ),
+                ("events_list", {"namespace": target.namespace}),
             ],
         )
     if target.node and settings.kubernetes_cluster_scope_enabled:
@@ -2080,6 +2593,13 @@ def _mcp_kubernetes_list_complete(data: object) -> bool:
 async def _k8s_mcp_json(
     settings: Settings, candidates: list[tuple[str, dict[str, object]]]
 ) -> object:
+    async with mcp_budget(settings.kubernetes_timeout_seconds):
+        return await _k8s_mcp_json_within_budget(settings, candidates)
+
+
+async def _k8s_mcp_json_within_budget(
+    settings: Settings, candidates: list[tuple[str, dict[str, object]]]
+) -> object:
     # Walk candidates and return the first one that yields a machine-readable
     # payload. A candidate can "succeed" at the MCP protocol level yet answer with
     # a human table (kubernetes-mcp-server's events_list does) that _k8s_yaml_payload
@@ -2090,6 +2610,8 @@ async def _k8s_mcp_json(
     for tool, args in candidates:
         try:
             result = await mcp_call(settings.kubernetes_mcp_url, tool, args)
+        except TimeoutError:
+            raise
         except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
             last_error = f"{tool}: {exc.__class__.__name__}: {exc}"
             continue
@@ -2149,11 +2671,22 @@ def _k8s_mcp_payload_recognized(data: object, *, tool: str) -> bool:
     return isinstance(payload.get("metadata"), dict)
 
 
-async def _k8s_mcp_result(settings: Settings, candidates: list[tuple[str, dict[str, object]]]):
+async def _k8s_mcp_result(
+    settings: Settings, candidates: list[tuple[str, dict[str, object]]]
+):
+    async with mcp_budget(settings.kubernetes_timeout_seconds):
+        return await _k8s_mcp_result_within_budget(settings, candidates)
+
+
+async def _k8s_mcp_result_within_budget(
+    settings: Settings, candidates: list[tuple[str, dict[str, object]]]
+):
     last_error = ""
     for tool, args in candidates:
         try:
             result = await mcp_call(settings.kubernetes_mcp_url, tool, args)
+        except TimeoutError:
+            raise
         except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
             last_error = f"{tool}: {exc.__class__.__name__}: {exc}"
             continue
@@ -2357,17 +2890,28 @@ def _diagnostic_pod(items: list[dict], workload_name: str) -> dict | None:
             severity += 3
         return severity, str(metadata.get("creationTimestamp") or "")
 
+    stem = workload_name.casefold()
     candidates = [
         item
         for item in items
         if str((item.get("metadata") or {}).get("name") or "")
         and (
             not workload_name
-            or workload_name in str((item.get("metadata") or {}).get("name") or "")
-            or bool((item.get("metadata") or {}).get("labels"))
+            or stem in str((item.get("metadata") or {}).get("name") or "").casefold()
+            or any(stem in str(value).casefold() for value in ((item.get("metadata") or {}).get("labels") or {}).values())
+            or any(stem in str(owner.get("name") or "").casefold() for owner in ((item.get("metadata") or {}).get("ownerReferences") or []) if isinstance(owner, dict))
         )
     ]
-    return max(candidates, key=score) if candidates else None
+    # Preserve namespace-level diagnostic context when controller matching is
+    # inconclusive instead of silently dropping every unhealthy pod.
+    return max(candidates or items, key=score) if items else None
+
+
+def _generated_workload_pod_name(name: str, workload: str) -> bool:
+    if not name.startswith(f"{workload}-"):
+        return False
+    suffix = name[len(workload) + 1 :]
+    return bool(re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", suffix)) and "-" not in suffix or bool(re.fullmatch(r"[a-z0-9]+-[a-z0-9]+", suffix))
 
 
 def _diagnostic_job(items: list[dict], cronjob_name: str) -> dict | None:
@@ -2397,6 +2941,8 @@ async def _resolve_workload_pod(settings: Settings, target: AnalysisTarget) -> d
     kind = _WORKLOAD_READ_KINDS.get(str(target.workload_type or "").lower())
     if target.pod or not (kind and target.namespace and target.workload_name):
         return {}
+    if not _namespace_allowed(settings, target.namespace):
+        return {"namespace_scope_blocked": True}
 
     controller = await k8s_read(
         settings, kind, namespace=target.namespace, name=target.workload_name
@@ -2431,6 +2977,7 @@ async def _resolve_workload_pod(settings: Settings, target: AnalysisTarget) -> d
         "pods",
         namespace=target.namespace,
         label_selector=selector,
+        full_object=True,
     )
     items = _read_items(pods)
     if not selector:
@@ -2438,11 +2985,16 @@ async def _resolve_workload_pod(settings: Settings, target: AnalysisTarget) -> d
             item
             for item in items
             if _owned_by(item, target.workload_type, target.workload_name)
-            or str((item.get("metadata") or {}).get("name") or "").startswith(
-                f"{target.workload_name}-"
+            or _generated_workload_pod_name(
+                str((item.get("metadata") or {}).get("name") or ""), target.workload_name
             )
         ]
     selected = _diagnostic_pod(items, target.workload_name)
+    selected_metadata = selected.get("metadata") if isinstance(selected, dict) and isinstance(selected.get("metadata"), dict) else {}
+    selected_text = " ".join(
+        [str(selected_metadata.get("name") or ""), *map(str, (selected_metadata.get("labels") or {}).values())]
+        + [str(owner.get("name") or "") for owner in selected_metadata.get("ownerReferences") or [] if isinstance(owner, dict)]
+    ).casefold()
     resolution.update(
         {
             "selector": selector,
@@ -2452,6 +3004,9 @@ async def _resolve_workload_pod(settings: Settings, target: AnalysisTarget) -> d
             ],
             "selected_pod": (
                 str((selected.get("metadata") or {}).get("name") or "") if selected else ""
+            ),
+            "namespace_context_fallback": bool(
+                selected and target.workload_name and target.workload_name.casefold() not in selected_text
             ),
         }
     )
@@ -2466,6 +3021,8 @@ async def _collect_resolved_pod_logs(
     previous_containers: list[str] | None = None,
     since_time: str = "",
 ) -> list[dict[str, object]]:
+    if not _namespace_allowed(settings, target.namespace):
+        return []
     targets: list[str | None] = list(containers) if containers else [None]
     logs: list[dict[str, object]] = []
     for container in targets:
@@ -2491,7 +3048,9 @@ async def _collect_resolved_pod_logs(
                     "container": container,
                     "previous": previous,
                     "since_time": since_time or None,
+                    "transport": item.get("transport"),
                     "source_verified": item.get("source_verified") is True,
+                    "time_scope_verified": item.get("time_scope_verified") is not False,
                     **(
                         {"observed_entity": item["observed_entity"]}
                         if isinstance(item.get("observed_entity"), dict)
@@ -2522,11 +3081,61 @@ def best_matching_pod(items: list[dict], stems: list[str]) -> dict | None:
         if not name or not any(stem and name.startswith(stem) for stem in stems):
             continue
         matches.append((str(metadata.get("creationTimestamp") or ""), item))
+    return _best_unambiguous_pod(matches)
+
+
+def _best_unambiguous_pod(matches: list[tuple[str, dict]]) -> dict | None:
+    """Choose one live Pod without guessing between nodes.
+
+    Exact occurrence names, generated-name stems, and workload prefixes all use
+    the same safety rule: prefer unhealthy Pods, then require either one Pod or
+    one common node.  A multi-replica workload spread across nodes cannot tell
+    us which node belonged to a stale alert Pod.
+    """
     pool = [entry for entry in matches if _pod_unhealthy(entry[1])] or matches
     nodes = {str((entry[1].get("spec") or {}).get("nodeName") or "") for entry in pool}
     if pool and (len(pool) == 1 or len(nodes) == 1):
         return max(pool, key=lambda entry: entry[0])[1]
     return None
+
+
+def _best_live_target_pod(
+    items: list[dict], names: list[str], workload: str = ""
+) -> dict | None:
+    """Resolve a stale Pod from exact occurrences, generated stems, or workload.
+
+    The tiers are deliberately ordered.  An occurrence Pod is a concrete alert
+    identity; a controller-generated stem is narrower than a workload prefix;
+    and a workload prefix is accepted only on a Kubernetes name boundary.
+    """
+
+    def entries(predicate) -> list[tuple[str, dict]]:  # noqa: ANN001
+        matched: list[tuple[str, dict]] = []
+        for item in items:
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            name = str(metadata.get("name") or "")
+            if name and predicate(name):
+                matched.append((str(metadata.get("creationTimestamp") or ""), item))
+        return matched
+
+    exact_names = set(names)
+    match = _best_unambiguous_pod(entries(lambda name: name in exact_names))
+    if match is not None:
+        return match
+
+    stems = [stem for name in names if (stem := pod_name_stem(name))]
+    match = _best_unambiguous_pod(
+        entries(lambda name: any(name.startswith(stem) for stem in stems))
+    )
+    if match is not None:
+        return match
+
+    workload = workload.strip().rstrip("-")
+    if not workload:
+        return None
+    return _best_unambiguous_pod(
+        entries(lambda name: name == workload or name.startswith(f"{workload}-"))
+    )
 
 
 def node_from_pod_events(items: list[dict]) -> str:
@@ -2549,81 +3158,244 @@ def node_from_pod_events(items: list[dict]) -> str:
     return ""
 
 
+_NODE_RESOLUTION_MAX_LIST_PAGES = 10
+_NODE_RESOLUTION_MAX_LIST_ITEMS = 500
+
+
+async def _node_resolution_pod_items(
+    settings: Settings,
+    namespace: str,
+    listing: dict[str, object],
+) -> tuple[list[dict], bool]:
+    """Return bounded namespace Pods and whether the LIST reached its last page.
+
+    Exact named Pod rows remain usable from any page, but generated-name and
+    workload-prefix replacement inference is safe only after Kubernetes proves
+    the namespace LIST is complete. MCP-only adapters that omit List metadata,
+    an unavailable continuation credential, repeated tokens, page errors, and
+    the page/item ceilings all return ``complete=False``.
+    """
+    status_code = listing.get("status_code")
+    if listing.get("error") or (
+        isinstance(status_code, int) and not 200 <= status_code < 300
+    ):
+        return [], False
+    payload = _normalize_k8s_payload(listing.get("data"))
+    raw_items = payload.get("items") if isinstance(payload, dict) else None
+    items = [item for item in raw_items or [] if isinstance(item, dict)]
+    if len(items) > _NODE_RESOLUTION_MAX_LIST_ITEMS:
+        return items[:_NODE_RESOLUTION_MAX_LIST_ITEMS], False
+    metadata = payload.get("metadata") if isinstance(payload, dict) else None
+    if not isinstance(metadata, dict):
+        return items, False
+    continuation = str(metadata.get("continue") or "")
+    if not continuation:
+        return items, True
+
+    token = _read_file(settings.kubernetes_token_path)
+    if not token:
+        return items, False
+
+    async def paginate() -> tuple[list[dict], bool]:
+        pages = 1
+        seen_tokens: set[str] = set()
+        verify: bool | str = (
+            settings.kubernetes_ca_path
+            if Path(settings.kubernetes_ca_path).exists()
+            else True
+        )
+        path = f"/api/v1/namespaces/{quote(namespace, safe='')}/pods"
+        next_token = continuation
+        while next_token:
+            if (
+                pages >= _NODE_RESOLUTION_MAX_LIST_PAGES
+                or len(items) >= _NODE_RESOLUTION_MAX_LIST_ITEMS
+                or next_token in seen_tokens
+            ):
+                return items, False
+            seen_tokens.add(next_token)
+            response = await get_json(
+                base_url=settings.kubernetes_api_url,
+                path=path,
+                timeout_seconds=settings.kubernetes_timeout_seconds,
+                params={
+                    "limit": str(settings.kubernetes_list_limit),
+                    "continue": next_token,
+                },
+                headers={"Authorization": f"Bearer {token}"},
+                verify=verify,
+            )
+            if not response.ok:
+                return items, False
+            page = _normalize_k8s_payload(
+                _collector_masker(settings).mask_object(response.data)
+            )
+            page_items = page.get("items") if isinstance(page, dict) else None
+            page_metadata = page.get("metadata") if isinstance(page, dict) else None
+            if not isinstance(page_items, list) or not isinstance(page_metadata, dict):
+                return items, False
+            items.extend(item for item in page_items if isinstance(item, dict))
+            pages += 1
+            if len(items) > _NODE_RESOLUTION_MAX_LIST_ITEMS:
+                del items[_NODE_RESOLUTION_MAX_LIST_ITEMS:]
+                return items, False
+            next_token = str(page_metadata.get("continue") or "")
+        return items, True
+
+    try:
+        # One total continuation deadline prevents a large namespace from
+        # multiplying the ordinary per-request timeout across every page.
+        return await asyncio.wait_for(
+            paginate(), timeout=max(1, settings.kubernetes_timeout_seconds)
+        )
+    except TimeoutError:
+        return items, False
+
+
 async def resolve_live_pod_node(
-    settings: Settings, namespace: str, pod: str, extra_pods: list[str] | None = None
+    settings: Settings,
+    namespace: str,
+    pod: str,
+    extra_pods: list[str] | None = None,
+    workload: str = "",
 ) -> tuple[str, str]:
-    """(live_pod, node) for the alert's pod; re-resolves recreated pods by name stem.
+    """(live_pod, node) via the equivalent of ``get pods -n NS -o wide``.
 
     Alert labels frequently name a pod the controller has already replaced
-    (grouped CrashLoop occurrences) and carry no node label at all — so pod GETs
-    404 and the system agent has no node to read. Resolution tiers:
-    1. GET the named pod — exact.
-    2. The DEAD pod's own events (node_from_pod_events) — exact node attribution
-       even after deletion; beats any stem-match guess.
-    3. Stem-match live siblings (best_matching_pod) — the live pod for k8s/log
-       queries; its node only counts when unambiguous.
+    and carry no node label.  Use the normal MCP-first Kubernetes read path, so
+    node discovery does not silently disappear when only the Kubernetes MCP has
+    cluster credentials.  The namespace Pod list preserves ``spec.nodeName``
+    and ``status.phase`` (the API equivalent of ``kubectl ... -o wide``).
+
+    Resolution tiers:
+    1. GET/list the exact named Pod and read ``spec.nodeName``.
+    2. For a deleted Pod, select an unambiguous live occurrence/generated-name/
+       workload-prefix match from the namespace list.
+    3. If there is no live replacement, use the deleted Pod's own Event node.
+
+    A live replacement's node stays paired with that replacement; an Event node
+    for the deleted Pod is never attached to a different live Pod.
     Best-effort: ('', '') on any failure — callers keep their own fallbacks.
     """
     if not namespace or not pod:
         return "", ""
-    token = _read_file(settings.kubernetes_token_path)
-    if not token:
-        return "", ""
-    headers = {"Authorization": f"Bearer {token}"}
-    verify: bool | str = (
-        settings.kubernetes_ca_path if Path(settings.kubernetes_ca_path).exists() else True
-    )
     try:
-        encoded_namespace = quote(namespace, safe="")
-        encoded_pod = quote(pod, safe="")
-        response = await get_json(
-            base_url=settings.kubernetes_api_url,
-            path=f"/api/v1/namespaces/{encoded_namespace}/pods/{encoded_pod}",
-            timeout_seconds=settings.kubernetes_timeout_seconds,
-            headers=headers,
-            verify=verify,
+        exact = await k8s_read(
+            settings,
+            "pods",
+            namespace=namespace,
+            name=pod,
+            full_object=True,
         )
-        if response.ok and isinstance(response.data, dict):
-            spec = response.data.get("spec") or {}
-            return pod, str(spec.get("nodeName") or "")
-
         names = [name for name in dict.fromkeys([pod, *(extra_pods or [])]) if name]
-        event_node = ""
-        for name in names[:3]:
-            events = await get_json(
-                base_url=settings.kubernetes_api_url,
-                path=f"/api/v1/namespaces/{encoded_namespace}/events",
-                timeout_seconds=settings.kubernetes_timeout_seconds,
-                params=_list_params(settings, {"fieldSelector": f"involvedObject.name={name}"}),
-                headers=headers,
-                verify=verify,
-            )
-            if events.ok and isinstance(events.data, dict):
-                event_node = node_from_pod_events(
-                    [e for e in events.data.get("items") or [] if isinstance(e, dict)]
-                )
-                if event_node:
-                    break
+        exact_data = exact.get("data") if isinstance(exact.get("data"), dict) else None
+        exact_exists = _pod_object_matches(exact_data, namespace=namespace, name=pod)
+        exact_node = ""
+        if exact_exists and exact_data is not None:
+            exact_node = str((exact_data.get("spec") or {}).get("nodeName") or "")
 
-        listing = await get_json(
-            base_url=settings.kubernetes_api_url,
-            path=f"/api/v1/namespaces/{encoded_namespace}/pods",
-            timeout_seconds=settings.kubernetes_timeout_seconds,
-            params=_list_params(settings),
-            headers=headers,
-            verify=verify,
+        # Always perform the namespace-wide placement read when the alert had
+        # no node label. Besides finding stale replacements, this is the exact
+        # API payload behind `kubectl get pods -n <namespace> -o wide`.
+        listing = await k8s_read(
+            settings,
+            "pods",
+            namespace=namespace,
+            full_object=True,
         )
-        live_pod, live_node = "", ""
-        if listing.ok and isinstance(listing.data, dict):
-            items = [item for item in listing.data.get("items") or [] if isinstance(item, dict)]
-            match = best_matching_pod(items, [pod_name_stem(name) for name in names])
-            if match is not None:
-                live_pod = str((match.get("metadata") or {}).get("name") or "")
-                live_node = str((match.get("spec") or {}).get("nodeName") or "")
-        # The dead pod's OWN node (from events) outranks a sibling's node.
-        return live_pod, event_node or live_node
+
+        first_payload = _normalize_k8s_payload(listing.get("data"))
+        first_raw_items = (
+            first_payload.get("items") if isinstance(first_payload, dict) else None
+        )
+        first_items = [
+            item for item in first_raw_items or [] if isinstance(item, dict)
+        ]
+
+        # A named MCP shortcut can miss fields or race a namespace list.  Trust
+        # the exact first-page row before spending time on continuation pages.
+        listed_exact = next(
+            (
+                item
+                for item in first_items
+                if _pod_object_matches(item, namespace=namespace, name=pod)
+            ),
+            None,
+        )
+        if listed_exact is not None:
+            node = str((listed_exact.get("spec") or {}).get("nodeName") or "")
+            return pod, node
+
+        # A named GET can remain authoritative when a capped/broken MCP list
+        # omitted the exact row.
+        if exact_node:
+            return pod, exact_node
+
+        # An existing unscheduled Pod genuinely has no node.  A sibling's node
+        # is not a substitute, even though it appears in the same wide listing.
+        if exact_exists:
+            return pod, ""
+
+        items, listing_complete = await _node_resolution_pod_items(
+            settings,
+            namespace,
+            listing,
+        )
+        # The named GET and first page can race a replacement. A later exact
+        # row remains authoritative even if the bounded LIST ultimately stops
+        # before proving namespace completeness.
+        listed_exact = next(
+            (
+                item
+                for item in items
+                if _pod_object_matches(item, namespace=namespace, name=pod)
+            ),
+            None,
+        )
+        if listed_exact is not None:
+            node = str((listed_exact.get("spec") or {}).get("nodeName") or "")
+            return pod, node
+
+        match = (
+            _best_live_target_pod(items, names, workload) if listing_complete else None
+        )
+        if match is not None:
+            live_pod = str((match.get("metadata") or {}).get("name") or "")
+            live_node = str((match.get("spec") or {}).get("nodeName") or "")
+            return live_pod, live_node
+
+        event_node = ""
+        event_pod = ""
+        for name in names[:3]:
+            event_result = await _describe_events(
+                settings,
+                namespace=namespace,
+                name=name,
+                expected_kind="Pod",
+            )
+            events = (
+                event_result.get("items", []) if isinstance(event_result, dict) else event_result
+            )
+            event_node = node_from_pod_events(
+                [event for event in events if isinstance(event, dict)]
+            )
+            if event_node:
+                event_pod = name
+                break
+        return (event_pod, event_node) if event_node else ("", "")
     except Exception:  # noqa: BLE001 - resolution is best-effort enrichment
         return "", ""
+
+
+def _pod_object_matches(data: object, *, namespace: str, name: str) -> bool:
+    """Verify a Pod object returned by a GET/list before using its placement."""
+    if not isinstance(data, dict):
+        return False
+    metadata = data.get("metadata")
+    if not isinstance(metadata, dict) or str(metadata.get("name") or "") != name:
+        return False
+    observed_namespace = str(metadata.get("namespace") or "")
+    return not observed_namespace or observed_namespace == namespace
 
 
 def _target_pod_missing(target: AnalysisTarget, responses: list[dict[str, object]]) -> bool:
@@ -2845,11 +3617,13 @@ async def _collect_pod_logs(
                     "container": container,
                     "previous": previous,
                     "since_time": since_time or None,
+                    "transport": "direct",
                     "source_verified": True,
+                    "time_scope_verified": True,
                     "observed_entity": _pod_log_entity(target.namespace, target.pod),
                     "status_code": response.status_code,
                     "error": response.error,
-                    "lines": _log_lines(response.data),
+                    "lines": _log_lines(response.data, historical=bool(since_time)),
                 }
             )
     return logs
@@ -2863,7 +3637,7 @@ async def _collect_pod_logs_via_mcp(
     previous_containers: list[str] | None = None,
     since_time: str = "",
 ) -> list[dict[str, object]]:
-    """Fetch READ-ONLY container logs through the Kubernetes MCP server."""
+    """Fetch logs through MCP, preferring direct time-bounded API for history."""
     # See _collect_pod_logs: same KUBERNETES_NAMESPACES scope as the rest of the sweep.
     if not (target.namespace and target.pod and _namespace_allowed(settings, target.namespace)):
         return []
@@ -2876,52 +3650,39 @@ async def _collect_pod_logs_via_mcp(
         for previous in previous_requests:
             if previous and not container:
                 continue
-            args: dict[str, object] = {
-                "namespace": target.namespace,
-                "name": target.pod,
-                "tailLines": settings.kubernetes_list_limit,
-            }
-            if container:
-                args["container"] = container
-            if previous:
-                args["previous"] = True
-            if since_time:
-                args["sinceTime"] = since_time
-            candidates = [
-                ("pods_log", args),
-                (
-                    "pods_log",
-                    {
-                        **args,
-                        "pod": target.pod,
-                    },
-                ),
-            ]
-            result = await _k8s_mcp_result(settings, candidates)
-            text = mcp_tool_text(result)
-            data = mcp_tool_json(result)
-            lines = _log_lines(text or data)
-            observed_entity = _mcp_pod_log_observed_entity(
-                data, target.namespace, target.pod
+            item = await k8s_logs(
+                settings,
+                target.namespace,
+                target.pod,
+                container=container or "",
+                tail=settings.kubernetes_list_limit,
+                previous=previous,
+                since_time=since_time,
             )
             logs.append(
                 {
-                    "namespace": target.namespace,
-                    "pod": target.pod,
+                    "namespace": item.get("namespace") or target.namespace,
+                    "pod": item.get("pod") or target.pod,
                     "container": container,
                     "previous": previous,
                     "since_time": since_time or None,
-                    "source_verified": observed_entity is not None,
-                    **({"observed_entity": observed_entity} if observed_entity else {}),
-                    "status_code": 200,
-                    "error": None,
-                    "lines": lines,
+                    "transport": item.get("transport"),
+                    "source_verified": item.get("source_verified") is True,
+                    "time_scope_verified": item.get("time_scope_verified") is not False,
+                    **(
+                        {"observed_entity": item["observed_entity"]}
+                        if isinstance(item.get("observed_entity"), dict)
+                        else {}
+                    ),
+                    "status_code": item.get("status_code"),
+                    "error": item.get("error"),
+                    "lines": item.get("lines") or [],
                 }
             )
     return logs
 
 
-def _log_lines(data: object) -> list[str]:
+def _log_lines(data: object, *, historical: bool = False) -> list[str]:
     # get_json wraps non-JSON text as {"body": <text>}; logs are plain text.
     text = ""
     if isinstance(data, dict) and isinstance(data.get("body"), str):
@@ -2931,7 +3692,7 @@ def _log_lines(data: object) -> list[str]:
     if not text:
         return []
     lines = [line for line in text.splitlines() if line.strip()]
-    return lines[-40:]
+    return lines[:40] if historical else lines[-40:]
 
 
 async def _collect_exec_probes(
@@ -2976,6 +3737,11 @@ async def _collect_exec_probes(
                 "attempted": True,
             }
         )
+        # A transport/authorization failure applies to the exec subresource,
+        # not to this particular command. Do not repeat the same doomed
+        # WebSocket handshake for every probe in the bounded base set.
+        if result.get("transport_error") is True:
+            break
     return probes
 
 
@@ -3106,16 +3872,17 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
                 if isinstance(item, dict)
                 and target.workload_name in item.get("metadata", {}).get("name", "")
             ]
-        return {"items": [_pod_summary(item) for item in items[:10] if isinstance(item, dict)]}
+        return _prioritized_pod_list(items)
     if name.startswith("runai_control_plane_pods:") and isinstance(data.get("items"), list):
         return {
             "namespace": _response_namespace(name),
-            "items": [_pod_summary(item) for item in data["items"][:20] if isinstance(item, dict)],
+            **_prioritized_pod_list(data["items"]),
         }
     if name == "pod":
         return _pod_summary(data)
     if (
-        name in {"pod_events", "namespace_events"} or name.startswith("runai_control_plane_events:")
+        name in {"pod_events", "workload_events", "namespace_events"}
+        or name.startswith("runai_control_plane_events:")
     ) and isinstance(data.get("items"), list):
         items = _events_in_time_range(data["items"], incident_time_range(target))
         # Kubernetes MCP's events_list does not reliably honor fieldSelector.
@@ -3132,7 +3899,7 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
                 and _event_matches_namespace(item, target.namespace)
                 and _event_matches_uid(item, target.pod_uid)
             ]
-        elif name == "namespace_events":
+        elif name in {"workload_events", "namespace_events"}:
             # MCP tools can ignore their namespace argument; an event matching
             # only by name from another tenant must not become alert evidence.
             items = [
@@ -3152,11 +3919,27 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
                 and _event_matches_target(item, target)
             ]
         events = [
-            _event_summary(item, target=target)
+            item
             for item in items
-            if isinstance(item, dict) and item.get("type") == "Warning"
+            if isinstance(item, dict)
+            and (
+                str(item.get("type") or "").casefold() == "warning"
+                or (
+                    str(item.get("type") or "").casefold() == "normal"
+                    and str(item.get("reason") or "").casefold()
+                    in _OBSERVED_NORMAL_EVENT_REASONS
+                )
+            )
         ]
-        return {"namespace": _response_namespace(name), "items": events[-10:]}
+        events.sort(key=_event_sort_timestamp)
+        omitted_events = max(0, len(events) - 5)
+        filtered = {
+            "namespace": _response_namespace(name),
+            "items": [_event_summary(item, target=target) for item in events[-5:]],
+        }
+        if omitted_events:
+            filtered["omitted_events"] = omitted_events
+        return filtered
     if name == "node":
         return _node_summary(data)
     return data
@@ -3171,7 +3954,7 @@ def _event_time_range_complete(name: str, data: object, target: AnalysisTarget) 
     than becoming a false absence claim.
     """
     if not (
-        name in {"pod_events", "namespace_events"}
+        name in {"pod_events", "workload_events", "namespace_events"}
         or name.startswith("runai_control_plane_events:")
     ):
         return True
@@ -3192,7 +3975,7 @@ def _event_time_range_complete(name: str, data: object, target: AnalysisTarget) 
             and _event_matches_namespace(item, target.namespace)
             and _event_matches_uid(item, target.pod_uid)
         ]
-    elif name == "namespace_events":
+    elif name in {"workload_events", "namespace_events"}:
         candidates = [
             item
             for item in items
@@ -3220,24 +4003,66 @@ def _warning_events_are_target_scoped(target: AnalysisTarget) -> bool:
     return _event_target_entity(target) is not None
 
 
+_WORKLOAD_EVENT_KINDS = frozenset(
+    {
+        "deployment",
+        "statefulset",
+        "daemonset",
+        "replicaset",
+        "job",
+        "cronjob",
+        "podgroup",
+        "runaijob",
+        "trainingworkload",
+        "interactiveworkload",
+        "inferenceworkload",
+        "distributedworkload",
+        "distributedinferenceworkload",
+        "externalworkload",
+        "workloadrunner",
+    }
+)
+
+
 def _event_target_entity(target: AnalysisTarget | None) -> dict[str, str] | None:
     """Return the concrete resource an Events query can safely speak for."""
     if target is None:
         return None
     if target.pod and target.namespace:
         return {"kind": "pod", "name": target.pod, "namespace": target.namespace}
-    if target.node:
-        return {"kind": "node", "name": target.node}
-    if target.workload_name and target.workload_type and target.namespace:
+    if target.workload_name and target.namespace:
         return {
             "kind": "workload_name",
             "name": target.workload_name,
             "namespace": target.namespace,
         }
+    if target.node:
+        return {"kind": "node", "name": target.node}
     return None
 
 
-def _event_target_identity(event: dict[str, object], target: AnalysisTarget) -> dict[str, str] | None:
+def _event_matches_declared_workload(
+    event: dict[str, object], target: AnalysisTarget
+) -> bool:
+    """Match an exact workload identity without relying on message keywords."""
+    workload = target.workload_name.strip()
+    if not workload or not target.namespace:
+        return False
+    involved = event.get("involvedObject")
+    involved = involved if isinstance(involved, dict) else {}
+    name = str(involved.get("name") or "")
+    kind = str(involved.get("kind") or "").strip().casefold()
+    if name != workload or not _event_matches_namespace(event, target.namespace):
+        return False
+    expected_kind = target.workload_type.strip().casefold()
+    # When the alert omitted workload_type, accept only known workload or
+    # controller kinds. A same-named ConfigMap/Secret remains unverified.
+    return kind == expected_kind if expected_kind else kind in _WORKLOAD_EVENT_KINDS
+
+
+def _event_target_identity(
+    event: dict[str, object], target: AnalysisTarget
+) -> dict[str, str] | None:
     """Verify that an Event's involved object is the concrete alert resource.
 
     Message text is retained for operator context and may select a useful
@@ -3250,22 +4075,17 @@ def _event_target_identity(event: dict[str, object], target: AnalysisTarget) -> 
     entity = _event_target_entity(target)
     if entity is None:
         return None
-    if entity["kind"] == "pod":
-        if (
-            kind == "pod"
-            and name == entity["name"]
-            and _event_matches_namespace(event, entity["namespace"])
-            and _event_matches_uid(event, target.pod_uid)
-        ):
-            return entity
-    elif entity["kind"] == "node":
-        if kind == "node" and name == entity["name"]:
-            return entity
-    elif (
-        kind == target.workload_type.casefold()
-        and name == entity["name"]
-        and _event_matches_namespace(event, entity["namespace"])
+    if (
+        target.pod
+        and kind == "pod"
+        and name == target.pod
+        and _event_matches_namespace(event, target.namespace)
+        and _event_matches_uid(event, target.pod_uid)
     ):
+        return entity
+    if _event_matches_declared_workload(event, target):
+        return entity
+    if target.node and kind == "node" and name == target.node:
         return entity
     return None
 
@@ -3275,14 +4095,18 @@ def _event_matches_target(event: dict[str, object], target: AnalysisTarget) -> b
     involved = involved if isinstance(involved, dict) else {}
     name = str(involved.get("name") or "")
     kind = str(involved.get("kind") or "").casefold()
-    if target.pod and kind == "pod" and name == target.pod and _event_matches_uid(event, target.pod_uid):
+    if (
+        target.pod
+        and kind == "pod"
+        and name == target.pod
+        and _event_matches_uid(event, target.pod_uid)
+    ):
         return True
     if target.node and kind == "node" and name == target.node:
         return True
     workload = target.workload_name.strip()
     if workload:
-        expected_kind = target.workload_type.strip().casefold()
-        if expected_kind and kind == expected_kind and name == workload:
+        if _event_matches_declared_workload(event, target):
             return True
         # Controllers commonly emit Events on a child Pod.  Do not accept a
         # same-named ConfigMap/Secret/etc. simply because its name resembles
@@ -3365,6 +4189,15 @@ def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
     for container in spec.get("containers", []) if isinstance(spec.get("containers"), list) else []:
         if isinstance(container, dict) and isinstance(container.get("name"), str):
             resources[container["name"]] = container.get("resources") or {}
+    conditions = [
+        condition for condition in status.get("conditions", []) if isinstance(condition, dict)
+    ]
+    conditions.sort(
+        key=lambda condition: (
+            not _condition_is_failure(condition),
+            str(condition.get("type") or ""),
+        )
+    )
     return {
         "name": metadata.get("name"),
         "uid": metadata.get("uid"),
@@ -3372,10 +4205,57 @@ def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
         "phase": status.get("phase"),
         "nodeName": spec.get("nodeName"),
         "podIP": status.get("podIP"),
-        "conditions": status.get("conditions", []),
+        "conditions": compact(conditions, limit=5),
         "containerStatuses": compact(containers, limit=5),
         "resources": resources,
+        **({"reason": status["reason"]} if status.get("reason") else {}),
+        **({"message": status["message"]} if status.get("message") else {}),
     }
+
+
+def _condition_is_failure(condition: dict[str, object]) -> bool:
+    condition_type = str(condition.get("type") or "").casefold()
+    status = _boolean_condition_status(condition.get("status"))
+    return status is not None and (
+        (condition_type in _FALSE_IS_FAILURE_CONDITION_TYPES and not status)
+        or (condition_type in _TRUE_IS_FAILURE_CONDITION_TYPES and status)
+    )
+
+
+def _pod_priority(pod: dict[str, object]) -> tuple[int, bool, int, str]:
+    metadata = pod.get("metadata") if isinstance(pod.get("metadata"), dict) else {}
+    status = pod.get("status") if isinstance(pod.get("status"), dict) else {}
+    phase = str(status.get("phase") or "").casefold()
+    phase_priority = {
+        "failed": 0,
+        "unknown": 1,
+        "pending": 2,
+        "running": 3,
+        "succeeded": 4,
+    }.get(phase, 5)
+    container_failure = False
+    restarts = 0
+    containers = status.get("containerStatuses", [])
+    for container in containers if isinstance(containers, list) else []:
+        if not isinstance(container, dict):
+            continue
+        restarts += int(container.get("restartCount") or 0)
+        state = container.get("state") if isinstance(container.get("state"), dict) else {}
+        for state_name in ("waiting", "terminated"):
+            detail = state.get(state_name) if isinstance(state.get(state_name), dict) else {}
+            if str(detail.get("reason") or "") not in {"", "Completed"}:
+                container_failure = True
+    return phase_priority, not container_failure, -restarts, str(metadata.get("name") or "")
+
+
+def _prioritized_pod_list(items: object) -> dict[str, object]:
+    pods = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+    pods.sort(key=_pod_priority)
+    omitted_pods = max(0, len(pods) - 5)
+    result: dict[str, object] = {"items": [_pod_summary(pod) for pod in pods[:5]]}
+    if omitted_pods:
+        result["omitted_pods"] = omitted_pods
+    return result
 
 
 def _event_summary(
@@ -3414,6 +4294,12 @@ def _event_timestamp(event: dict[str, object]) -> object:
     return timestamps[-1][1] if timestamps else None
 
 
+def _event_sort_timestamp(event: dict[str, object]) -> tuple[bool, str]:
+    timestamps = _event_timestamps(event)
+    timestamp = timestamps[-1][0] if timestamps else None
+    return timestamp is not None, timestamp.isoformat() if timestamp is not None else ""
+
+
 def _event_timestamps(event: dict[str, object]) -> list[tuple[object, object]]:
     """All usable Event timestamps, ordered oldest to newest.
 
@@ -3439,7 +4325,9 @@ def _event_timestamps(event: dict[str, object]) -> list[tuple[object, object]]:
     return sorted(timestamps, key=lambda item: item[0])
 
 
-def _event_times_are_complete_for_window(event: dict[str, object], time_range: dict[str, str]) -> bool:
+def _event_times_are_complete_for_window(
+    event: dict[str, object], time_range: dict[str, str]
+) -> bool:
     """An Event spanning the window cannot establish a negative without a sample."""
     start = parse_incident_time(time_range.get("start"))
     end = parse_incident_time(time_range.get("end"))
@@ -3477,12 +4365,404 @@ def _events_in_time_range(
 def _node_summary(node: dict[str, object]) -> dict[str, object]:
     metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
     status = node.get("status") if isinstance(node.get("status"), dict) else {}
+    spec = node.get("spec") if isinstance(node.get("spec"), dict) else {}
     return {
         "name": metadata.get("name"),
         "conditions": status.get("conditions", []),
         "capacity": status.get("capacity", {}),
         "allocatable": status.get("allocatable", {}),
+        "unschedulable": bool(spec.get("unschedulable")),
+        "taints": spec.get("taints", []),
     }
+
+
+_GPU_RESOURCE = "nvidia.com/gpu"
+_GPU_SCHEDULING_FAMILIES = frozenset(
+    {"k8s_scheduling_error", "runai_scheduling_quota"}
+)
+_NODE_DNS_NAME = re.compile(
+    r"(?=.{1,253}\Z)[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?\Z"
+)
+_NODE_IN_EVENT_PATTERNS = (
+    re.compile(r"(?i)\bnode/([a-z0-9](?:[-a-z0-9.]*[a-z0-9])?)"),
+    re.compile(r"(?i)\bnode\s*[=:]\s*([a-z0-9](?:[-a-z0-9.]*[a-z0-9])?)"),
+    re.compile(r"(?i)\bnode\s+['\"]([a-z0-9](?:[-a-z0-9.]*[a-z0-9])?)['\"]"),
+    re.compile(r"(?i)\bon\s+node\s+([a-z0-9](?:[-a-z0-9.]*[a-z0-9])?)"),
+    # Run:ai scheduler Events commonly render the evaluated node as
+    # ``Unschedulable: <dgx02>: Node didn't have enough resources``.
+    re.compile(r"(?i)<([a-z0-9](?:[-a-z0-9.]*[a-z0-9])?)>"),
+)
+_NON_NODE_EVENT_WORDS = frozenset(
+    {
+        "affinity",
+        "selector",
+        "selectors",
+        "taint",
+        "taints",
+        "label",
+        "labels",
+        "condition",
+        "conditions",
+        "pressure",
+        "pool",
+        "pools",
+        "none",
+        "unknown",
+        "pending",
+    }
+)
+
+
+def _gpu_shortage_signal(text: object) -> bool:
+    value = str(text or "").casefold()
+    if not value:
+        return False
+    # An exact extended-resource name is already a scheduler capacity signal.
+    # A generic "gpu" token is not: image names and healthy specs contain it.
+    if re.search(r"\bnvidia\.com/(?:gpu|mig-[a-z0-9.-]+)\b", value):
+        return True
+    return bool(
+        re.search(
+            r"\binsufficient\s+(?:available\s+)?gpus?\b|"
+            r"\bnot\s+(?:have\s+)?enough\s+resources?\s*:\s*gpus?\b|"
+            r"\b(?:did(?:\s+not|n't)|does(?:\s+not|n't))\s+have\s+enough\s+"
+            r"resources?\s*:\s*gpus?\b|"
+            r"\b(?:gpu|gpus)\s+(?:capacity|shortage|exhausted|unavailable)\b|"
+            r"\b(?:no|zero|not enough)\s+(?:available\s+)?gpus?\b",
+            value,
+        )
+    )
+
+
+def _gpu_scheduling_snapshot_requested(plan: object, events: list[dict[str, object]]) -> bool:
+    """Gate the extra node reads on a real scheduling + GPU-shortage hypothesis."""
+    hypotheses = getattr(plan, "hypotheses", None) or []
+    active = [
+        item
+        for item in hypotheses
+        if isinstance(item, dict)
+        and str(item.get("family") or "") in _GPU_SCHEDULING_FAMILIES
+    ]
+    if not active:
+        return False
+    if any(_gpu_shortage_signal(item.get("reason")) for item in active):
+        return True
+    for event in events:
+        reason = str(event.get("reason") or "").casefold()
+        message = str(event.get("message") or "")
+        scheduling = (
+            reason in {"failedscheduling", "unschedulable"}
+            or "unschedulable" in message.casefold()
+            or "nodes are available" in message.casefold()
+        )
+        if scheduling and _gpu_shortage_signal(message):
+            return True
+    return False
+
+
+def _gpu_snapshot_candidate_nodes(
+    target: AnalysisTarget, events: list[dict[str, object]], *, limit: int = 4
+) -> list[str]:
+    """Exact node names from the scoped target or target-verified Events only."""
+    candidates: list[str] = []
+
+    def add(value: object) -> None:
+        name = str(value or "").strip().casefold()
+        if name and _NODE_DNS_NAME.fullmatch(name) and name not in candidates:
+            candidates.append(name)
+
+    add(target.node)
+    for event in events:
+        message = str(event.get("message") or "")
+        for pattern in _NODE_IN_EVENT_PATTERNS:
+            for match in pattern.finditer(message):
+                candidate = match.group(1).casefold()
+                # Phrases such as "on node affinity" name a scheduling rule,
+                # not a Node. Likewise do not truncate resource paths such as
+                # nvidia.com/gpu into a plausible-looking DNS name.
+                followed_by_slash = message[match.end(1) :].startswith("/")
+                if candidate in _NON_NODE_EVENT_WORDS or followed_by_slash:
+                    continue
+                add(candidate)
+                if len(candidates) >= limit:
+                    return candidates
+    return candidates[:limit]
+
+
+def _gpu_quantity(value: object) -> tuple[Decimal, bool]:
+    """Parse one scalar extended-resource quantity; missing means zero."""
+    if value in (None, ""):
+        return Decimal(0), True
+    if isinstance(value, bool):
+        return Decimal(0), False
+    try:
+        quantity = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        return Decimal(0), False
+    return (quantity, quantity >= 0)
+
+
+def _container_gpu_request(container: object) -> tuple[Decimal, int]:
+    if not isinstance(container, dict):
+        return Decimal(0), 0
+    resources = container.get("resources")
+    if not isinstance(resources, dict):
+        return Decimal(0), 0
+    requests = resources.get("requests")
+    limits = resources.get("limits")
+    requests = requests if isinstance(requests, dict) else {}
+    limits = limits if isinstance(limits, dict) else {}
+    # Extended resources permit limits-only declarations; Kubernetes treats
+    # that limit as the request. Mirror it when the requests map omits the key.
+    raw = requests[_GPU_RESOURCE] if _GPU_RESOURCE in requests else limits.get(_GPU_RESOURCE)
+    quantity, valid = _gpu_quantity(raw)
+    return quantity, 0 if valid else 1
+
+
+def _pod_gpu_request(pod: object) -> tuple[Decimal, int]:
+    """Approximate Kubernetes' effective Pod request for one scalar GPU resource."""
+    if not isinstance(pod, dict):
+        return Decimal(0), 0
+    spec = pod.get("spec")
+    if not isinstance(spec, dict):
+        return Decimal(0), 0
+    invalid = 0
+    regular = Decimal(0)
+    containers = spec.get("containers")
+    for container in containers if isinstance(containers, list) else []:
+        quantity, bad = _container_gpu_request(container)
+        regular += quantity
+        invalid += bad
+
+    # Restartable init containers (sidecars) remain resident. Non-restartable
+    # init containers contribute their peak alongside any earlier sidecars.
+    restartable_init = Decimal(0)
+    init_peak = Decimal(0)
+    init_containers = spec.get("initContainers")
+    for container in init_containers if isinstance(init_containers, list) else []:
+        quantity, bad = _container_gpu_request(container)
+        invalid += bad
+        if isinstance(container, dict) and container.get("restartPolicy") == "Always":
+            restartable_init += quantity
+            init_peak = max(init_peak, restartable_init)
+        else:
+            init_peak = max(init_peak, restartable_init + quantity)
+    effective = max(regular + restartable_init, init_peak)
+
+    pod_resources = spec.get("resources")
+    if isinstance(pod_resources, dict):
+        requests = pod_resources.get("requests")
+        if isinstance(requests, dict) and _GPU_RESOURCE in requests:
+            pod_level, valid = _gpu_quantity(requests.get(_GPU_RESOURCE))
+            effective = max(effective, pod_level)
+            invalid += 0 if valid else 1
+    overhead = spec.get("overhead")
+    if isinstance(overhead, dict) and _GPU_RESOURCE in overhead:
+        overhead_gpu, valid = _gpu_quantity(overhead.get(_GPU_RESOURCE))
+        effective += overhead_gpu
+        invalid += 0 if valid else 1
+    return effective, invalid
+
+
+def _display_gpu_quantity(value: Decimal | None) -> int | float | None:
+    if value is None:
+        return None
+    integral = value.to_integral_value()
+    return int(integral) if value == integral else float(value)
+
+
+def _node_gpu_value(node: dict[str, object], field: str) -> tuple[Decimal | None, bool]:
+    status = node.get("status")
+    values = status.get(field) if isinstance(status, dict) else None
+    if not isinstance(values, dict) or _GPU_RESOURCE not in values:
+        return None, True
+    value, valid = _gpu_quantity(values.get(_GPU_RESOURCE))
+    return (value if valid else None), valid
+
+
+async def _collect_gpu_node_resource_observations(
+    settings: Settings,
+    target: AnalysisTarget,
+    plan: object,
+    events: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Collect exact live Node + assigned-Pod resource snapshots before synthesis."""
+    if not settings.kubernetes_cluster_scope_enabled:
+        return []
+    if not _gpu_scheduling_snapshot_requested(plan, events):
+        return []
+    nodes = _gpu_snapshot_candidate_nodes(target, events)
+    if not nodes:
+        return []
+
+    async def collect_node(node: str) -> dict[str, object]:
+        selector = f"spec.nodeName={node}"
+        node_result, pods_result = await asyncio.gather(
+            k8s_read(settings, "nodes", name=node, full_object=True),
+            k8s_read(
+                settings,
+                "pods",
+                field_selector=selector,
+                full_object=True,
+            ),
+        )
+        node_payload = _normalize_k8s_payload(node_result.get("data"))
+        metadata = (
+            node_payload.get("metadata") if isinstance(node_payload, dict) else None
+        )
+        node_verified = (
+            isinstance(metadata, dict) and str(metadata.get("name") or "") == node
+        )
+        node_object = node_payload if node_verified and isinstance(node_payload, dict) else {}
+        capacity, capacity_valid = _node_gpu_value(node_object, "capacity")
+        allocatable, allocatable_valid = _node_gpu_value(node_object, "allocatable")
+
+        pods_payload = _normalize_k8s_payload(pods_result.get("data"))
+        raw_pod_items = pods_payload.get("items") if isinstance(pods_payload, dict) else None
+        pods_query_ok = not pods_result.get("error") and isinstance(raw_pod_items, list)
+        pod_items = raw_pod_items if isinstance(raw_pod_items, list) else []
+        from_mcp = bool(
+            settings.kubernetes_mcp_url
+            and str(pods_result.get("url") or "").startswith(settings.kubernetes_mcp_url)
+        )
+        pods_list_complete = (
+            _mcp_kubernetes_list_complete(pods_payload)
+            if from_mcp
+            else _kubernetes_list_complete(pods_payload)
+        )
+        assigned: list[dict[str, object]] = []
+        requested = Decimal(0)
+        invalid_quantities = 0
+        scheduled_pod_count = 0
+        if pods_query_ok:
+            for pod in pod_items:
+                if not isinstance(pod, dict):
+                    continue
+                spec = pod.get("spec") if isinstance(pod.get("spec"), dict) else {}
+                status = pod.get("status") if isinstance(pod.get("status"), dict) else {}
+                # Enforce the assignment a second time even after the MCP
+                # client-side selector; never charge another node's Pods.
+                if str(spec.get("nodeName") or "") != node:
+                    continue
+                if str(status.get("phase") or "") in {"Succeeded", "Failed"}:
+                    continue
+                scheduled_pod_count += 1
+                pod_request, invalid = _pod_gpu_request(pod)
+                requested += pod_request
+                invalid_quantities += invalid
+                if pod_request > 0 and len(assigned) < 20:
+                    pod_metadata = (
+                        pod.get("metadata") if isinstance(pod.get("metadata"), dict) else {}
+                    )
+                    assigned.append(
+                        {
+                            "namespace": pod_metadata.get("namespace"),
+                            "pod": pod_metadata.get("name"),
+                            "phase": status.get("phase"),
+                            "requested_gpu": _display_gpu_quantity(pod_request),
+                        }
+                    )
+        request_complete = pods_query_ok and pods_list_complete and not invalid_quantities
+        requested_value = requested if request_complete else None
+        estimated_free = (
+            allocatable - requested_value
+            if allocatable is not None and requested_value is not None
+            else None
+        )
+        node_error = str(node_result.get("error") or "")
+        if not node_error and not node_verified:
+            node_error = "node response did not match the requested node"
+        pods_error = str(pods_result.get("error") or "")
+        if not pods_error and not pods_query_ok:
+            pods_error = "assigned Pod list was not machine-readable"
+        observation: dict[str, object] = {
+            "kind": "kubernetes_node_gpu_resources",
+            "predicate": "kubernetes_node_gpu_resources",
+            # These values are sampled now. They explain current capacity but
+            # cannot prove that the same state caused a historical incident.
+            "polarity": "unknown" if node_verified else "unavailable",
+            "coverage": "partial",
+            "observation_window": {},
+            "snapshot_role": "current_context",
+        }
+        if node_verified:
+            observation["observed_entity"] = {"kind": "node", "name": node}
+        return {
+            "node": node,
+            "resource": _GPU_RESOURCE,
+            "gpu_capacity": _display_gpu_quantity(capacity),
+            "gpu_allocatable": _display_gpu_quantity(allocatable),
+            "gpu_requested": _display_gpu_quantity(requested_value),
+            "gpu_requested_in_returned_page": (
+                _display_gpu_quantity(requested) if pods_query_ok else None
+            ),
+            "gpu_estimated_free": _display_gpu_quantity(estimated_free),
+            "scheduled_non_terminal_pods": scheduled_pod_count if pods_query_ok else None,
+            "pod_gpu_requests": assigned,
+            "request_calculation_complete": request_complete,
+            "pods_list_complete": pods_list_complete if pods_query_ok else False,
+            "invalid_gpu_quantities": invalid_quantities,
+            "capacity_quantity_valid": capacity_valid,
+            "allocatable_quantity_valid": allocatable_valid,
+            "node_query_error": node_error or None,
+            "pods_query_error": pods_error or None,
+            "node_query_url": node_result.get("url"),
+            "node_query_status_code": node_result.get("status_code"),
+            "pods_query_url": pods_result.get("url"),
+            "pods_query_status_code": pods_result.get("status_code"),
+            "snapshot_role": "current_context",
+            "observation": observation,
+        }
+
+    return list(await asyncio.gather(*(collect_node(node) for node in nodes)))
+
+
+def _gpu_node_resource_artifact(
+    agent: str, settings: Settings, snapshot: dict[str, object]
+):
+    node = str(snapshot.get("node") or "")
+    node_error = str(snapshot.get("node_query_error") or "")
+    pods_error = str(snapshot.get("pods_query_error") or "")
+    partial = bool(node_error or pods_error or not snapshot.get("request_calculation_complete"))
+    if node_error:
+        summary = ko_en(
+            settings,
+            f"현재 노드 GPU 스냅샷을 수집하지 못했습니다: {node_error}",
+            f"Could not collect the current node GPU snapshot: {node_error}",
+        )
+    else:
+        requested = snapshot.get("gpu_requested")
+        requested_text = "unknown" if requested is None else str(requested)
+        summary = ko_en(
+            settings,
+            (
+                f"현재 스냅샷 기준 node/{node}: {_GPU_RESOURCE} capacity "
+                f"{snapshot.get('gpu_capacity')}, allocatable {snapshot.get('gpu_allocatable')}, "
+                f"실행 중 Pod requests {requested_text}, 추정 여유 "
+                f"{snapshot.get('gpu_estimated_free')}."
+            ),
+            (
+                f"Current snapshot for node/{node}: {_GPU_RESOURCE} capacity "
+                f"{snapshot.get('gpu_capacity')}, allocatable {snapshot.get('gpu_allocatable')}, "
+                f"non-terminal Pod requests {requested_text}, estimated free "
+                f"{snapshot.get('gpu_estimated_free')}."
+            ),
+        )
+    selector = shlex.quote(f"spec.nodeName={node}")
+    return artifact(
+        agent=agent,
+        source="kubernetes",
+        type="kubernetes_node_gpu_resources",
+        status="unavailable" if node_error else ("partial" if partial else "ok"),
+        confidence="low" if node_error else ("medium" if partial else "high"),
+        title=ko_en(settings, "노드 GPU 리소스 스냅샷", "Node GPU resource snapshot"),
+        query=(
+            f"{kubectl_repr('nodes', name=node)} -o json; "
+            f"kubectl get pods -A --field-selector {selector} -o json"
+        ),
+        summary=summary,
+        result=snapshot,
+    )
 
 
 def _response_namespace(name: str) -> str | None:
@@ -3511,7 +4791,7 @@ def _warning_events(responses: list[dict[str, object]]) -> list[object]:
     for response in responses:
         name = response.get("name")
         if not isinstance(name, str) or (
-            name not in {"pod_events", "namespace_events"}
+            name not in {"pod_events", "workload_events", "namespace_events"}
             and not name.startswith("runai_control_plane_events:")
         ):
             continue
@@ -3520,7 +4800,15 @@ def _warning_events(responses: list[dict[str, object]]) -> list[object]:
             events.extend(
                 item
                 for item in data["items"]
-                if isinstance(item, dict) and item.get("type") == "Warning"
+                if isinstance(item, dict)
+                and (
+                    str(item.get("type") or "").casefold() == "warning"
+                    or (
+                        str(item.get("type") or "").casefold() == "normal"
+                        and str(item.get("reason") or "").casefold()
+                        in _OBSERVED_NORMAL_EVENT_REASONS
+                    )
+                )
             )
     return events
 
@@ -3539,7 +4827,16 @@ def _node_conditions(responses: list[dict[str, object]]) -> list[object]:
             continue
         data = response.get("data")
         if isinstance(data, dict) and isinstance(data.get("conditions"), list):
-            conditions = [c for c in data["conditions"] if isinstance(c, dict)]
+            # Compact MCP responses can append transport sentinels such as
+            # {"truncated": 1}. They are not Kubernetes conditions and must
+            # not inflate the checked count or enter polarity evaluation.
+            conditions = [
+                c
+                for c in data["conditions"]
+                if isinstance(c, dict)
+                and str(c.get("type") or "").strip()
+                and "status" in c
+            ]
             abnormal = [
                 c
                 for c in conditions
@@ -3551,6 +4848,153 @@ def _node_conditions(responses: list[dict[str, object]]) -> list[object]:
             if conditions:
                 return [{"node_conditions_healthy": True, "checked": len(conditions)}]
     return []
+
+
+_CAUSE_BEARING_NODE_CONDITIONS = frozenset(
+    {"DiskPressure", "MemoryPressure", "PIDPressure", "NetworkUnavailable"}
+)
+_NODE_CONDITION_TIMESTAMP_FIELDS = ("lastTransitionTime", "lastHeartbeatTime")
+
+
+def _node_condition_artifacts(
+    agent: str,
+    target: AnalysisTarget,
+    responses: list[dict[str, object]],
+    *,
+    time_range: dict[str, str] | None,
+):
+    """Publish condition-value facts without backdating a live Node snapshot.
+
+    The broad Node response remains operator context. A pressure/network
+    condition gets a causal card only while the alert is still firing, or when
+    Kubernetes' own transition/heartbeat timestamp falls inside the incident
+    window. This keeps a condition that became true after a historical incident
+    from explaining that incident, while preserving an exact in-window signal
+    that Warning Events or Prometheus may not have captured.
+    """
+    artifacts = []
+    historical = bool(str(target.resolved_at or "").strip())
+    bounded_window = _valid_node_condition_window(time_range)
+    live_scoped = not historical and bounded_window
+    for response in responses:
+        if response.get("name") != "node" or response.get("error"):
+            continue
+        data = response.get("data")
+        if not isinstance(data, dict):
+            continue
+        node = str(data.get("name") or target.node or "").strip()
+        conditions = data.get("conditions")
+        if not node or not isinstance(conditions, list):
+            continue
+        for condition in conditions:
+            if not isinstance(condition, dict):
+                continue
+            condition_type = str(condition.get("type") or "").strip()
+            if condition_type not in _CAUSE_BEARING_NODE_CONDITIONS:
+                continue
+            raw_status = str(condition.get("status") or "").strip()
+            normalized_status = raw_status.casefold()
+            evidence_window, matched_timestamps = _node_condition_evidence_window(
+                condition, time_range
+            )
+            timestamp_scoped = bool(evidence_window)
+            semantically_known = normalized_status in {"true", "false"}
+            scoped = semantically_known and (live_scoped or timestamp_scoped)
+            if scoped:
+                polarity = "present" if normalized_status == "true" else "absent"
+                coverage = "scoped"
+            else:
+                # Unknown condition states and current snapshots taken while
+                # replaying a resolved incident remain visible, not causal.
+                polarity, coverage = "unknown", "partial"
+            if live_scoped:
+                snapshot_role = "live_incident"
+            elif timestamp_scoped:
+                snapshot_role = "incident_window"
+            else:
+                snapshot_role = "current_context"
+
+            observation: dict[str, object] = {
+                "kind": "kubernetes_node_condition",
+                "predicate": f"kubernetes_node_condition:{condition_type.casefold()}",
+                "polarity": polarity,
+                "coverage": coverage,
+                "observed_entity": {"kind": "node", "name": node},
+                "observation_window": time_range if scoped else {},
+                "snapshot_role": snapshot_role,
+            }
+            if evidence_window:
+                observation["evidence_window"] = evidence_window
+
+            timestamps = {
+                field: str(condition.get(field) or "")
+                for field in _NODE_CONDITION_TIMESTAMP_FIELDS
+                if str(condition.get(field) or "").strip()
+            }
+            matched_at = str(evidence_window.get("end") or "")
+            if scoped:
+                scope_note = (
+                    "live firing snapshot"
+                    if live_scoped and not matched_at
+                    else f"incident timestamp {matched_at}"
+                )
+            else:
+                scope_note = "current context; no condition timestamp overlaps the incident"
+            summary = f"node/{node} {condition_type}={raw_status or 'Unknown'} ({scope_note})."
+            artifacts.append(
+                artifact(
+                    agent=agent,
+                    source="kubernetes",
+                    type="kubernetes_node_condition",
+                    status="ok",
+                    confidence="high" if scoped else "low",
+                    title=f"Kubernetes · node/{node} · {condition_type}",
+                    query=f"{kubectl_repr('nodes', name=node)} -o json",
+                    summary=summary,
+                    result={
+                        "node": node,
+                        "condition": condition_type,
+                        "status": raw_status or "Unknown",
+                        "timestamp_provenance": timestamps,
+                        "matched_incident_timestamps": matched_timestamps,
+                        "observation": observation,
+                    },
+                )
+            )
+    return artifacts
+
+
+def _valid_node_condition_window(time_range: dict[str, str] | None) -> bool:
+    if not time_range:
+        return False
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    return start is not None and end is not None and start <= end
+
+
+def _node_condition_evidence_window(
+    condition: dict[str, object], time_range: dict[str, str] | None
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return exact Kubernetes condition timestamps that overlap the incident."""
+    if not _valid_node_condition_window(time_range):
+        return {}, {}
+    assert time_range is not None
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    assert start is not None and end is not None
+    matched: list[tuple[object, str, str]] = []
+    for field in _NODE_CONDITION_TIMESTAMP_FIELDS:
+        raw = str(condition.get(field) or "").strip()
+        observed_at = parse_incident_time(raw)
+        if observed_at is not None and observed_at.year > 1 and start <= observed_at <= end:
+            matched.append((observed_at, field, raw))
+    if not matched:
+        return {}, {}
+    matched.sort(key=lambda item: item[0])
+    return (
+        {"start": matched[0][2], "end": matched[-1][2]},
+        {field: raw for _, field, raw in matched},
+    )
 
 
 def _runai_control_plane_pods(responses: list[dict[str, object]]) -> dict[str, list[object]]:
@@ -3647,20 +5091,48 @@ async def collect_runai_crd_findings(
     {checked, findings} with findings=[] on any failure, never raises."""
     findings: list[dict[str, str]] = []
     checked: list[str] = []
+    failed_kinds: list[str] = []
+    warnings: list[str] = []
+    truncated: list[str] = []
 
     async def scan(kind: str, namespace: str = "") -> None:
-        try:
-            result = await k8s_read(settings, kind, namespace=namespace)
-        except Exception:  # noqa: BLE001 - enumeration is best-effort evidence
-            return
-        if result.get("error"):
-            return
-        checked.append(f"{kind}{('/' + namespace) if namespace else ''}")
-        for item in _crd_items(result)[: settings.kubernetes_list_limit]:
-            finding = _crd_not_ready(item)
-            if finding:
-                finding["namespace"] = namespace
-                findings.append(finding)
+        token = ""
+        label = f"{kind}{('/' + namespace) if namespace else ''}"
+        for page in range(3):
+            try:
+                try:
+                    result = await k8s_read(
+                        settings, kind, namespace=namespace, continue_token=token, full_object=True
+                    )
+                except TypeError:
+                    # Preserve compatibility with older injected/read adapters.
+                    result = await k8s_read(settings, kind, namespace=namespace)
+            except Exception as exc:  # noqa: BLE001 - enumeration is best-effort evidence
+                failed_kinds.append(label)
+                warnings.append(f"Run:ai CRD {label} scan failed: {exc.__class__.__name__}.")
+                return
+            if result.get("error"):
+                failed_kinds.append(label)
+                warnings.append(f"Run:ai CRD {label} scan failed: {result['error']}.")
+                return
+            if not page:
+                checked.append(label)
+            for item in _crd_items(result)[: settings.kubernetes_list_limit]:
+                finding = _crd_not_ready(item)
+                if finding:
+                    finding["namespace"] = namespace
+                    findings.append(finding)
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            token = str((data.get("metadata") or {}).get("continue") or "")
+            if not token:
+                return
+            if settings.kubernetes_mcp_url and str(result.get("url") or "").startswith(settings.kubernetes_mcp_url):
+                # The pinned MCP list schema has no continuation argument. Do
+                # not re-read page one under a token it cannot honor.
+                truncated.append(label)
+                return
+        if token:
+            truncated.append(label)
 
     # Cluster-scoped org tree: which projects/queues/departments are unhealthy.
     for kind in ("projects", "queues", "departments"):
@@ -3670,7 +5142,13 @@ async def collect_runai_crd_findings(
     for namespace in scan_namespaces[:4]:
         for kind in (*_RUNAI_WORKLOAD_KINDS, "podgroups"):
             await scan(kind, namespace)
-    return {"checked": checked, "findings": findings[:20]}
+    return {
+        "checked": checked,
+        "findings": findings[:20],
+        "failed_kinds": failed_kinds,
+        "warnings": warnings,
+        "truncated": truncated,
+    }
 
 
 def _dedup_str(values: list[str]) -> list[str]:

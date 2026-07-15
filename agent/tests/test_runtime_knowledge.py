@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from app.config import load_settings
-from app.knowledge import KnowledgeRegistry, validate_runtime_knowledge
+from app.knowledge import DEFAULT_FAMILIES, KnowledgeRegistry, validate_runtime_knowledge
 
 
 class _Response:
@@ -296,6 +296,21 @@ def test_internal_validation_route_uses_registry_validator() -> None:
 
     assert response["valid"] is True
     assert response["normalized"]["revision"] == "r1"
+
+
+def test_family_catalog_route_exposes_selectable_output_families() -> None:
+    from app.main import app
+
+    route = next(route for route in app.routes if route.path == "/knowledge/families")
+
+    assert route.endpoint() == {
+        "families": [
+            *DEFAULT_FAMILIES,
+            "platform_version_bug",
+            "expected_known_behavior",
+            "insufficient_evidence",
+        ]
+    }
 
 
 def test_validate_runtime_knowledge_returns_errors_without_mutating_registry() -> None:

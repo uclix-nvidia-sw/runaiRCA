@@ -5,7 +5,26 @@
 
 All settings available for Run:AI RCA. README covers the common path; this is the full reference.
 
+**Who this is for:** the person installing or operating the service. Start by
+choosing where the Agent reads evidence, then set timeouts and access boundaries,
+then tune optional learning/LLM features. Helm values map those choices into the
+running containers; environment variables are the names the processes receive.
+
+```mermaid
+flowchart LR
+  V[Helm values or local env] --> E[Environment variables]
+  E --> B[Backend]
+  E --> A[Agent]
+  A --> S[Evidence sources and optional MCP services]
+```
+
 ## Environment Variables
+
+### Configure by job
+
+The table is long because it is a complete reference. Read the rows in groups:
+service wiring and timeouts first, evidence-source URLs and credentials next,
+then safety, knowledge, and optional LLM controls.
 
 Backend and agent read these at startup; Helm maps them from the values below.
 
@@ -34,7 +53,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `KUBERNETES_CA_PATH` | Service account CA path for in-cluster Kubernetes collection |
 | `KUBERNETES_TIMEOUT_SECONDS` | Kubernetes API request timeout |
 | `KUBERNETES_LIST_LIMIT` | Kubernetes pod/event list page size for evidence collection, default `50` |
-| `KUBERNETES_NAMESPACES` | Optional comma-separated namespace allowlist for Kubernetes direct collection |
+| `KUBERNETES_NAMESPACES` | Optional comma-separated namespace allowlist for Kubernetes direct collection, including workload-resolved Pod reads and their describe/log follow-ups |
 | `KUBERNETES_CLUSTER_SCOPE_ENABLED` | Enables cluster-scoped Kubernetes calls such as node lookups; Helm follows `agent.rbac.clusterWide` |
 | `KUBERNETES_MCP_URL` | Kubernetes MCP shared-service URL. When set, Kubernetes get/list/log collection and drill-down call MCP first and fall back to direct Kubernetes API reads on failure. The separately gated, allowlisted `pods/exec` diagnostics use the agent ServiceAccount because the MCP service intentionally has no exec permission. |
 | `RUNAI_BASE_URL` | Run:ai control plane URL. No chart default; required as `agent.env.runaiBaseUrl` when `runaiMcp.enabled=true` |
@@ -73,7 +92,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `ARCHITECTURE_FILE` | Run:ai platform topology YAML (components, depends_on, DB schema ownership), default `knowledge/runai_architecture.yaml` — powers playbook check paths and postgres drill-down schema hints |
 | `AGENT_SOULS_FILE` | Agent role-contract prompt path, default `prompts/agent_souls.md` |
 | `FAMILIES_FILE` | Root-cause family catalog YAML path, default `knowledge/families.yaml`. Load failure falls back to the built-in catalog |
-| `COLLECTORS` | Comma-separated collector registry allowlist. Empty/default enables all built-in collectors |
+| `COLLECTORS` | Comma-separated collector registry allowlist. Empty/default enables all built-in collectors. Unknown names are ignored for activation but appear in every analysis warning and in Agent `/healthz` under `collectors.unknown` |
 | `EVAL_MIN_TOP1` | Eval gate minimum Top-1 accuracy used by CI/run scripts when no explicit `--min-top1` is passed |
 | `MASKING_REGEX_LIST_JSON` | Optional JSON array of custom redaction regexes |
 | `BUILTIN_REDACTION_ENABLED` | Enable built-in secret redaction, default `true` |
@@ -234,6 +253,16 @@ agent checks connectivity, active connections, long-running transactions,
 pgvector availability, and expected RCA table presence. If it is not configured,
 the agent marks Postgres evidence as unavailable without blocking the rest of the
 RCA.
+
+For the optional Run:ai control-plane database (`RUNAI_DB_DSN`), audit/history
+reads use UTC session time. Timestamp-without-time-zone audit values are treated
+as UTC and disclose `naive_timestamps_assumed_utc` in the observation. A failed
+audit table is reported as partial evidence without discarding successful table
+reads; discovery prioritizes history/audit/event names and reports tables skipped
+by its bounded scan.
+
+Agent HTTP clients follow redirects. MCP single calls retry once, and a retried
+MCP batch resumes only the calls that did not complete in its first session.
 
 Soft-deleted incidents remain queryable through the trash view until
 `TRASH_RETENTION_DAYS` elapses. During that period they are excluded from active

@@ -6,6 +6,10 @@
 Run:AI RCA는 서로 다른 역할을 가진 두 개의 저장소를 사용합니다. 런타임 흐름은
 [Architecture](ARCHITECTURE.md)를 참조하십시오. 이 문서는 데이터 구조 참조입니다.
 
+**이 문서는 누구를 위한가:** 기록이 어디에 있는지 알아야 하는 운영자와, 한 배포에 왜 두
+데이터베이스가 있는지 이해해야 하는 개발자를 위한 문서입니다. PostgreSQL은 작업 중인 사건
+파일이고, TypeDB는 그 파일의 승인된 부분으로 만든 선택 사항 관계 인덱스입니다.
+
 | 저장소 | 역할 | 소유자 | 필수 여부 |
 |---|---|---|---|
 | **PostgreSQL** | 운영 신뢰의 원천: 인시던트, 알림, RCA 결과, 운영자 피드백, 유사도 벡터 | Go 백엔드 | 예 (로컬 개발용 인메모리 폴백 제공) |
@@ -31,6 +35,11 @@ flowchart LR
 ---
 
 ## 1. PostgreSQL (운영)
+
+### 작업에 따라 데이터 찾기
+
+현재 인시던트, 알림, analysis run, 피드백, 유사도 검색은 PostgreSQL을 사용합니다. TypeDB는
+선택 사항인 토폴로지와 승인 이력 관계에만 사용하며, 두 번째 운영 신뢰 원천이 아닙니다.
 
 테이블은 시작 시 백엔드가 자동 생성합니다(`backend/store_postgres.go`).
 
@@ -128,6 +137,13 @@ GPU는 별도 엔티티가 아니라 `node`/`queue`/`project`의 속성(`gpu_all
 | `TYPEDB_USERNAME` / `TYPEDB_PASSWORD` | `admin` / `password` | CE 기본값 — PoC를 넘어서면 재정의 |
 | `POSTGRES_DSN` | — | 백엔드 Postgres(에이전트 수집기/인제스트도 읽음) |
 | `RUNAI_DB_DSN` | — | **Run:ai 컨트롤 플레인** Postgres에 대한 선택적 읽기 전용 DSN; 플랫폼 스키마(workloads/audit/…)에 대한 postgres 드릴다운의 `sql_select`를 활성화합니다. 읽기 전용 롤을 사용하십시오. |
+
+수집에 `RUNAI_DB_DSN`을 사용하면 audit/history 읽기는 UTC 세션에서 실행됩니다.
+`timestamp without time zone` 값은 Run:ai UTC로 해석하고, 결과 관찰에는
+`naive_timestamps_assumed_utc: true`를 선언합니다. audit-table 실패는 격리되므로
+성공한 테이블은 계속 사용할 수 있고, 실패하거나 발견 제한으로 건너뛴 테이블은
+partial/missing data로 보고됩니다. Run:ai 컨트롤 플레인 DB 연결 실패도 정상 Postgres 점검이나
+인과 증거가 아니라 사용 불가 문맥으로 명시적으로 보입니다.
 
 TypeDB는 단일 노드 `StatefulSet` + PVC로 배포됩니다
 (`charts/runai-rca/templates/typedb.yaml`). Community Edition은 단일 노드이며,

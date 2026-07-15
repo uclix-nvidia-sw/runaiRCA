@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -406,12 +407,14 @@ async def test_runai_headers_warn_when_auth_header_is_missing() -> None:
 async def test_runai_token_uses_json_client_credentials(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
-    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+    async def fake_post_oauth_token(
+        *, url, timeout_seconds, json_body=None, form_data=None, headers=None, verify=True
+    ):
         captured["url"] = url
         captured["json_body"] = json_body
-        return SimpleNamespace(ok=True, error=None, data={"accessToken": "tok-123"})
+        return SimpleNamespace(ok=True, error=None, token="tok-123")
 
-    monkeypatch.setattr("app.collectors.runai.post_json", fake_post_json)
+    monkeypatch.setattr("app.collectors.runai.post_oauth_token", fake_post_oauth_token)
     settings = replace(
         make_settings(),
         runai_base_url="https://runai.example",
@@ -434,18 +437,18 @@ async def test_runai_token_uses_json_client_credentials(monkeypatch) -> None:
 async def test_runai_token_falls_back_to_form_candidate_url(monkeypatch) -> None:
     calls: list[tuple[str, str]] = []
 
-    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
-        calls.append(("json", url))
-        return SimpleNamespace(ok=False, error="HTTP 404", data={"body": "not found"})
+    async def fake_post_oauth_token(
+        *, url, timeout_seconds, json_body=None, form_data=None, headers=None, verify=True
+    ):
+        kind = "json" if json_body is not None else "form"
+        calls.append((kind, url))
+        if kind == "form" and url.endswith(
+            "/auth/realms/runai/protocol/openid-connect/token"
+        ):
+            return SimpleNamespace(ok=True, error=None, token="form-token")
+        return SimpleNamespace(ok=False, error="HTTP 404", token="")
 
-    async def fake_post_form_json(*, url, timeout_seconds, data, headers=None, verify=True):
-        calls.append(("form", url))
-        if url.endswith("/auth/realms/runai/protocol/openid-connect/token"):
-            return SimpleNamespace(ok=True, error=None, data={"access_token": "form-token"})
-        return SimpleNamespace(ok=False, error="HTTP 404", data={"body": "not found"})
-
-    monkeypatch.setattr("app.collectors.runai.post_json", fake_post_json)
-    monkeypatch.setattr("app.collectors.runai.post_form_json", fake_post_form_json)
+    monkeypatch.setattr("app.collectors.runai.post_oauth_token", fake_post_oauth_token)
     settings = replace(
         make_settings(),
         runai_base_url="https://runai.example",
@@ -462,6 +465,120 @@ async def test_runai_token_falls_back_to_form_candidate_url(monkeypatch) -> None
         "form",
         "https://runai.example/auth/realms/runai/protocol/openid-connect/token",
     ) in calls
+
+
+@pytest.mark.asyncio
+async def test_runai_oauth_exchange_is_shared_across_concurrent_calls(
+    monkeypatch,
+) -> None:
+    from app.collectors import runai as runai_mod
+
+    calls = 0
+
+    async def fake_post_oauth_token(
+        *, url, timeout_seconds, json_body=None, form_data=None, headers=None, verify=True
+    ):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.01)
+        return SimpleNamespace(ok=True, error=None, token="shared-token")
+
+    monkeypatch.setattr(runai_mod, "post_oauth_token", fake_post_oauth_token)
+    runai_mod._RUNAI_TOKEN_CACHE.clear()
+    runai_mod._RUNAI_TOKEN_INFLIGHT.clear()
+    settings = replace(
+        make_settings(),
+        runai_base_url="https://runai-cache.example",
+        runai_token_url="https://runai-cache.example/api/v1/token",
+        runai_client_id="concurrent-client",
+        runai_client_secret="concurrent-secret",
+    )
+
+    results = await asyncio.gather(*(_runai_headers(settings) for _ in range(8)))
+
+    assert calls == 1
+    assert all(
+        headers["Authorization"] == "Bearer shared-token" and warnings == []
+        for headers, warnings in results
+    )
+
+
+@pytest.mark.asyncio
+async def test_runai_oauth_force_refresh_bypasses_cached_token(monkeypatch) -> None:
+    from app.collectors import runai as runai_mod
+
+    calls = 0
+
+    async def fake_post_oauth_token(
+        *, url, timeout_seconds, json_body=None, form_data=None, headers=None, verify=True
+    ):
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(ok=True, error=None, token=f"token-{calls}")
+
+    monkeypatch.setattr(runai_mod, "post_oauth_token", fake_post_oauth_token)
+    runai_mod._RUNAI_TOKEN_CACHE.clear()
+    runai_mod._RUNAI_TOKEN_INFLIGHT.clear()
+    settings = replace(
+        make_settings(),
+        runai_base_url="https://runai-refresh.example",
+        runai_token_url="https://runai-refresh.example/api/v1/token",
+        runai_client_id="refresh-client",
+        runai_client_secret="refresh-secret",
+    )
+
+    first, _ = await _runai_headers(settings)
+    cached, _ = await _runai_headers(settings)
+    refreshed, _ = await _runai_headers(settings, prefer_oauth=True)
+
+    assert first["Authorization"] == "Bearer token-1"
+    assert cached["Authorization"] == "Bearer token-1"
+    assert refreshed["Authorization"] == "Bearer token-2"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_runai_oauth_waiter_cancellation_does_not_cancel_shared_exchange(
+    monkeypatch,
+) -> None:
+    from app.collectors import runai as runai_mod
+
+    calls = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_post_oauth_token(
+        *, url, timeout_seconds, json_body=None, form_data=None, headers=None, verify=True
+    ):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return SimpleNamespace(ok=True, error=None, token="surviving-token")
+
+    monkeypatch.setattr(runai_mod, "post_oauth_token", fake_post_oauth_token)
+    runai_mod._RUNAI_TOKEN_CACHE.clear()
+    runai_mod._RUNAI_TOKEN_INFLIGHT.clear()
+    settings = replace(
+        make_settings(),
+        runai_base_url="https://runai-cancel.example",
+        runai_token_url="https://runai-cancel.example/api/v1/token",
+        runai_client_id="cancel-client",
+        runai_client_secret="cancel-secret",
+    )
+
+    cancelled_waiter = asyncio.create_task(_runai_headers(settings))
+    surviving_waiter = asyncio.create_task(_runai_headers(settings))
+    await started.wait()
+    cancelled_waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_waiter
+    release.set()
+    headers, warnings = await surviving_waiter
+
+    assert calls == 1
+    assert headers["Authorization"] == "Bearer surviving-token"
+    assert warnings == []
 
 
 @pytest.mark.asyncio
@@ -1204,10 +1321,13 @@ async def test_loki_queries_workload_history_when_alerted_pod_can_be_replaced(mo
     )
     await LokiCollector(replace(make_settings(), loki_url="http://loki.example")).collect(target)
 
+    # An immutable Run:ai workload ID supersedes the mutable workload name.
+    # Keep this historical query exact and failure-only; broad name/ID
+    # alternation can pull healthy rows from another Pod incarnation.
     assert any(
         'namespace="runai-vision"' in query
-        and "trainer" in query
-        and r"workload\-42" in query
+        and r"workload\\-42" in query
+        and "fail(ed|ure)?" in query
         for query in seen_queries
     )
 
@@ -1228,6 +1348,26 @@ def test_correlation_term_skips_too_short_identifiers() -> None:
     assert _control_plane_correlation_term(tgt(workload_name="job.v2")) == r"job\.v2"
     # too short → skipped (would match unrelated lines)
     assert _control_plane_correlation_term(tgt(workload_name="a", project="x")) == ""
+
+
+def test_loki_regex_terms_are_escaped_for_logql_quoted_strings() -> None:
+    from app.collectors.loki import (
+        _control_plane_correlation_term,
+        _logql_string,
+        _loki_response_error,
+    )
+
+    target = replace(make_target(), workload_name="job.v2-prod", project="")
+    term = _control_plane_correlation_term(target)
+
+    assert term == r"job\.v2\-prod"
+    # LogQL uses Go-style quoted strings: regex backslashes themselves must be
+    # escaped. A single `\-` or `\.` made Loki reject the query with HTTP 400.
+    assert _logql_string(f"(?i)({term})") == r'"(?i)(job\\.v2\\-prod)"'
+    assert _loki_response_error(
+        "HTTP 400",
+        {"error": "parse error: invalid char escape"},
+    ) == "HTTP 400: parse error: invalid char escape"
 
 
 def test_prometheus_widens_to_control_plane_health_when_implicated() -> None:
@@ -1302,37 +1442,276 @@ async def test_runai_collector_uses_mcp_results_when_configured(monkeypatch) -> 
     # With RUNAI_MCP_URL set, the collector gathers via the MCP and does NOT curl.
     from app.collectors import runai as runai_mod
 
-    async def fake_mcp(settings, target):
+    async def fake_mcp(settings, target, *, headers):
         return [
-            {"name": "workloads", "query": "MCP", "status_code": 200, "error": None,
-             "data": {"workloads": [{"name": "trainer"}]}},
-            {"name": "version", "query": "MCP", "status_code": 200, "error": None,
-             "data": {"version": "2.23.60"}},
+            {
+                "name": "workload_status",
+                "query": "MCP get_workload_status",
+                "transport": "mcp",
+                "status_code": 200,
+                "error": None,
+                "data": {"workloadId": "550e8400-e29b-41d4-a716-446655440000"},
+            },
         ]
 
     async def boom(*a, **k):  # the direct-HTTP path must not run
         raise AssertionError("must not fall back to curl when MCP returned results")
 
+    async def fake_version(*_args, **_kwargs):
+        return "2.23.60"
+
     monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", fake_mcp)
     monkeypatch.setattr(runai_mod, "_collect_runai_responses", boom)
+    monkeypatch.setattr(runai_mod, "_fetch_runai_version", fake_version)
     settings = replace(
-        make_settings(), runai_base_url="https://runai.example", runai_mcp_url="http://localhost:8809/mcp"
+        make_settings(),
+        runai_base_url="https://runai.example",
+        runai_bearer_token="token",
+        runai_mcp_url="http://localhost:8080/mcp",
     )
-    result = await RunAICollector(settings).collect(make_target())
+    target = replace(
+        make_target(),
+        runai_workload_id="550e8400-e29b-41d4-a716-446655440000",
+    )
+    result = await RunAICollector(settings).collect(target)
     assert result.details["runai_version"] == "2.23.60"
-    assert any("runai-mcp server" in w for w in result.warnings)
+    assert any("official NVIDIA Run:ai MCP" in w for w in result.warnings)
     workload_signal = next(
         artifact for artifact in result.artifacts if artifact.type == "runai_api_signal"
-        and artifact.result["observation"]["predicate"] == "runai:workloads"
+        and artifact.result["observation"]["predicate"] == "runai:workload_status"
     )
     assert workload_signal.result["observation"]["polarity"] == "present"
+
+
+@pytest.mark.asyncio
+async def test_runai_collector_falls_back_when_one_mcp_tool_fails(monkeypatch) -> None:
+    from app.collectors import runai as runai_mod
+
+    async def fake_mcp(_settings, _target, *, headers):
+        return [
+            {
+                "name": "identity",
+                "query": "MCP whoami",
+                "transport": "mcp",
+                "status_code": 200,
+                "error": None,
+                "data": {"subject": "test"},
+            },
+            {
+                "name": "workload_status",
+                "query": "MCP get_workload_status",
+                "transport": "mcp",
+                "status_code": None,
+                "error": "upstream unavailable",
+                "data": None,
+            },
+        ]
+
+    called = {"direct": False}
+
+    async def fake_direct(_settings, _target, _headers):
+        called["direct"] = True
+        return [
+            {
+                "name": "workload_by_id",
+                "path": "/api/v1/workloads/id",
+                "transport": "direct",
+                "status_code": 200,
+                "error": None,
+                "data": {
+                    "workloadId": "550e8400-e29b-41d4-a716-446655440000"
+                },
+            }
+        ]
+
+    monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", fake_mcp)
+    monkeypatch.setattr(runai_mod, "_collect_runai_responses", fake_direct)
+    monkeypatch.setattr(runai_mod, "_fetch_runai_version", lambda *a, **k: _async_empty())
+    target = replace(
+        make_target(),
+        runai_workload_id="550e8400-e29b-41d4-a716-446655440000",
+    )
+    result = await RunAICollector(
+        replace(
+                make_settings(),
+                runai_base_url="https://runai.example",
+                runai_bearer_token="token",
+                runai_mcp_url="http://runai-mcp:8080/mcp",
+        )
+    ).collect(target)
+
+    assert called["direct"] is True
+    assert result.details["queries"][0]["transport"] == "mcp"
+    assert any(item["transport"] == "direct" for item in result.details["queries"])
+    assert any("workload_status failed" in warning for warning in result.warnings)
+    assert result.status == "partial"
+
+
+@pytest.mark.asyncio
+async def test_runai_direct_partial_result_does_not_claim_all_queries_completed(
+    monkeypatch,
+) -> None:
+    from app.collectors import runai as runai_mod
+
+    async def fake_mcp(_settings, _target, *, headers):
+        return None
+
+    async def fake_direct(_settings, _target, _headers):
+        return [
+            {
+                "name": "workload_by_id",
+                "path": "/api/v1/workloads/id",
+                "transport": "direct",
+                "status_code": 200,
+                "error": None,
+                "data": {
+                    "workloadId": "550e8400-e29b-41d4-a716-446655440000"
+                },
+            },
+            {
+                "name": "queue",
+                "path": "/api/v1/queues/gpu-a",
+                "transport": "direct",
+                "status_code": 503,
+                "error": "HTTP 503",
+                "data": {},
+            },
+        ]
+
+    monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", fake_mcp)
+    monkeypatch.setattr(runai_mod, "_collect_runai_responses", fake_direct)
+    monkeypatch.setattr(runai_mod, "_fetch_runai_version", lambda *a, **k: _async_empty())
+    target = replace(
+        make_target(),
+        queue="",
+        runai_workload_id="550e8400-e29b-41d4-a716-446655440000",
+    )
+    result = await RunAICollector(
+        replace(
+            make_settings(),
+            runai_base_url="https://runai.example",
+            runai_bearer_token="token",
+        )
+    ).collect(target)
+
+    assert result.status == "partial"
+    assert result.confidence == "medium"
+    assert "partial context" in result.summary
+    assert "No workload identifier" not in result.summary
+    assert "queries completed" not in result.summary
+    assert {"runai.queue", "runai.query"}.issubset(result.missing_data)
+
+
+@pytest.mark.asyncio
+async def test_runai_mcp_snapshot_supplements_direct_queue_scope(monkeypatch) -> None:
+    from app.collectors import runai as runai_mod
+
+    workload_id = "550e8400-e29b-41d4-a716-446655440000"
+
+    async def fake_mcp(_settings, _target, *, headers):
+        return [{"name": "workloads", "transport": "mcp", "status_code": 200, "error": None,
+                 "data": {"workloads": [{"id": workload_id}]}}]
+
+    async def fake_direct(_settings, _target, _headers):
+        return [{"name": "queue", "path": "/api/v1/queues/gpu-a", "transport": "direct",
+                 "status_code": 200, "error": None, "data": {"name": "gpu-a"}}]
+
+    async def fake_queue(*args, **kwargs):
+        return (await fake_direct(*args, **kwargs))[0]
+
+    monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", fake_mcp)
+    monkeypatch.setattr(runai_mod, "_collect_runai_queue_response", fake_queue)
+    monkeypatch.setattr(runai_mod, "_fetch_runai_version", lambda *a, **k: _async_empty())
+    result = await RunAICollector(
+        replace(make_settings(), runai_base_url="https://runai.example", runai_bearer_token="token",
+                runai_mcp_url="http://runai-mcp/mcp")
+    ).collect(replace(make_target(), runai_workload_id=workload_id))
+
+    assert [(item["name"], item["transport"]) for item in result.details["queries"]] == [
+        ("workloads", "mcp"), ("queue", "direct")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runai_mcp_queue_gap_is_visible_when_direct_query_is_unavailable(monkeypatch) -> None:
+    from app.collectors import runai as runai_mod
+
+    workload_id = "550e8400-e29b-41d4-a716-446655440000"
+
+    async def fake_mcp(_settings, _target, *, headers):
+        return [{"name": "workloads", "transport": "mcp", "status_code": 200, "error": None,
+                 "data": {"workloads": [{"id": workload_id}]}}]
+
+    async def no_direct(_settings, _target, _headers):
+        return []
+
+    async def no_queue(*args, **kwargs):
+        return (await no_direct(*args, **kwargs))[0]
+
+    monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", fake_mcp)
+    monkeypatch.setattr(runai_mod, "_collect_runai_queue_response", no_queue)
+    monkeypatch.setattr(runai_mod, "_fetch_runai_version", lambda *a, **k: _async_empty())
+    result = await RunAICollector(
+        replace(make_settings(), runai_base_url="https://runai.example", runai_bearer_token="token",
+                runai_mcp_url="http://runai-mcp/mcp")
+    ).collect(replace(make_target(), runai_workload_id=workload_id))
+
+    assert "runai.queue_scope" in result.missing_data
+    assert any("queue scope was not collected" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_runai_collector_uses_direct_lookup_without_official_uuid(
+    monkeypatch,
+) -> None:
+    from app.collectors import runai as runai_mod
+
+    async def forbidden_mcp(*_args, **_kwargs):
+        raise AssertionError("MCP workload tools require a UUID")
+
+    async def fake_direct(_settings, _target, _headers):
+        return [
+            {
+                "name": "workloads",
+                "path": "/api/v1/workloads",
+                "transport": "direct",
+                "status_code": 200,
+                "error": None,
+                "data": {"workloads": [{"name": "trainer"}]},
+            },
+            {
+                "name": "queue",
+                "path": "/api/v1/queues/gpu-a",
+                "transport": "direct",
+                "status_code": 200,
+                "error": None,
+                "data": {"name": "gpu-a"},
+            },
+        ]
+
+    monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", forbidden_mcp)
+    monkeypatch.setattr(runai_mod, "_collect_runai_responses", fake_direct)
+    monkeypatch.setattr(runai_mod, "_fetch_runai_version", lambda *a, **k: _async_empty())
+    result = await RunAICollector(
+        replace(
+            make_settings(),
+            runai_base_url="https://runai.example",
+            runai_bearer_token="token",
+            runai_mcp_url="http://runai-mcp:8080/mcp",
+        )
+    ).collect(make_target())
+
+    assert result.details["queries"][0]["transport"] == "direct"
+    assert any("require an immutable UUID" in warning for warning in result.warnings)
+    assert "direct API queries completed" in result.summary
+    assert "MCP queries completed" not in result.summary
 
 
 @pytest.mark.asyncio
 async def test_runai_collector_falls_back_to_curl_when_mcp_unavailable(monkeypatch) -> None:
     from app.collectors import runai as runai_mod
 
-    async def mcp_none(settings, target):
+    async def mcp_none(settings, target, *, headers):
         return None  # MCP not configured / failed -> signal fallback
 
     called = {"curl": False}
@@ -1360,11 +1739,11 @@ async def test_runai_collector_falls_back_from_unparseable_mcp_payload(monkeypat
     """A 200 MCP gateway error page is not a successful Run:ai observation."""
     from app.collectors import runai as runai_mod
 
-    async def fake_mcp(_settings, _target):
+    async def fake_mcp(_settings, _target, *, headers):
         return [
             {
                 "name": "workloads",
-                "query": "MCP call_runai_api GET /api/v1/workloads",
+                "query": "MCP get_workloads_summary",
                 "status_code": 200,
                 "error": None,
                 "data": {"raw": "<html>gateway temporarily unavailable</html>"},
@@ -1382,7 +1761,15 @@ async def test_runai_collector_falls_back_from_unparseable_mcp_payload(monkeypat
                 "status_code": 200,
                 "error": None,
                 "data": {"workloads": [{"name": "trainer"}]},
-            }
+            },
+            {
+                "name": "queue",
+                "path": "/api/v1/queues/gpu-a",
+                "transport": "direct",
+                "status_code": 200,
+                "error": None,
+                "data": {"name": "gpu-a"},
+            },
         ]
 
     async def fake_headers(_settings, prefer_oauth=False):
@@ -1398,12 +1785,95 @@ async def test_runai_collector_falls_back_from_unparseable_mcp_payload(monkeypat
             runai_base_url="https://runai.example",
             runai_mcp_url="http://runai-mcp/mcp",
         )
-    ).collect(make_target())
+    ).collect(
+        replace(
+            make_target(),
+            runai_workload_id="550e8400-e29b-41d4-a716-446655440000",
+        )
+    )
 
     assert called["direct"] is True
-    assert any("no usable structured response" in warning for warning in result.warnings)
-    assert not any("gathered via the runai-mcp" in warning for warning in result.warnings)
+    assert any("incomplete or unusable" in warning for warning in result.warnings)
+    assert not any("official NVIDIA Run:ai MCP" in warning for warning in result.warnings)
     assert result.status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_runai_collector_falls_back_from_blank_mcp_payload_with_reason(
+    monkeypatch,
+) -> None:
+    from app.collectors import runai as runai_mod
+
+    async def fake_mcp(_settings, _target, *, headers):
+        return [
+            {
+                "name": "workloads",
+                "query": "MCP get_workloads_summary",
+                "transport": "mcp",
+                "status_code": 200,
+                "error": None,
+                "data": {},
+            }
+        ]
+
+    async def fake_direct(_settings, _target, _headers):
+        return [
+            {
+                "name": "workloads",
+                "path": "/api/v1/workloads",
+                "transport": "direct",
+                "status_code": 200,
+                "error": None,
+                "data": {"workloads": [{"name": "trainer"}]},
+            }
+        ]
+
+    monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", fake_mcp)
+    monkeypatch.setattr(runai_mod, "_collect_runai_responses", fake_direct)
+    monkeypatch.setattr(runai_mod, "_fetch_runai_version", lambda *a, **k: _async_empty())
+    result = await RunAICollector(
+        replace(
+            make_settings(),
+            runai_base_url="https://runai.example",
+            runai_bearer_token="token",
+            runai_mcp_url="http://runai-mcp/mcp",
+        )
+    ).collect(
+        replace(
+            make_target(),
+            runai_workload_id="550e8400-e29b-41d4-a716-446655440000",
+        )
+    )
+
+    assert result.details["queries"][0]["transport"] == "mcp"
+    assert result.status == "partial"
+    assert "runai.queue_scope" in result.missing_data
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"data": {}},
+        {"result": []},
+        {"data": {"result": []}, "status": "success"},
+    ],
+)
+def test_runai_nested_blank_mcp_envelopes_are_valid_empty_results(payload) -> None:
+    from app.collectors.runai import _runai_payload_error
+
+    assert _runai_payload_error(payload, transport="mcp") == ""
+
+
+def test_runai_empty_envelope_does_not_hide_meaningful_identity() -> None:
+    from app.collectors.runai import _runai_payload_error
+
+    assert (
+        _runai_payload_error(
+            {"data": {}, "identity": {"username": "operator"}},
+            transport="mcp",
+        )
+        == ""
+    )
 
 
 @pytest.mark.asyncio
@@ -1411,7 +1881,7 @@ async def test_runai_collector_rejects_non_json_direct_payload(monkeypatch) -> N
     """HTTP 200 with an HTML/text body must stay unavailable, not become evidence."""
     from app.collectors import runai as runai_mod
 
-    async def mcp_none(_settings, _target):
+    async def mcp_none(_settings, _target, *, headers):
         return None
 
     async def fake_direct(_settings, _target, _headers):

@@ -21,6 +21,7 @@ from app.collectors.base import (
     AnalysisTarget,
     CollectorResult,
     artifact,
+    causal_evidence_time_range,
     incident_time_range,
     ko_en,
     parse_incident_time,
@@ -34,11 +35,11 @@ from app.masking import build_masker
 # ponytail: flat regex list, not a rule engine — add patterns here as they show up.
 _ERROR_PATTERNS = re.compile(
     r"(?i)("
-    r"xid|nvrm|nvlink|fell off the bus|"  # NVIDIA GPU driver / fabric
+    r"\bxid\b|nvrm|nvlink|fell off the bus|"  # NVIDIA GPU driver / fabric
     r"\boom\b|out of memory|oom-kill|"  # memory pressure
-    r"i/o error|ext4-fs error|ext4_|xfs|"  # filesystem / disk
+    r"i/o error|ext4-fs error|ext4_|xfs_|\bxfs\b|"  # filesystem / disk
     r"mce:|machine check|hardware error|"  # CPU/hardware
-    r"call trace|kernel panic|bug:|segfault"  # kernel faults
+    r"call trace|kernel panic|\bbug:|segfault"  # kernel faults
     r")"
 )
 
@@ -163,7 +164,7 @@ async def system_log_query(settings: Settings, target: AnalysisTarget, args: dic
         time_range and _historical_journal_response_verified(response.data, time_range)
     )
     matching_timestamps = _journal_matching_timestamps(
-        matching, time_range if historical_window_verified else None
+        matching, causal_evidence_time_range(target) if historical_window_verified else None
     )
     observation = _system_log_observation(
         source=source,
@@ -427,9 +428,16 @@ class SystemCollector:
         node_origin = "alert" if alert_node else (node_source or ("plan" if planned_node else ""))
         resolved_pod = ""
         if not node:
-            node, resolved_pod = await _node_from_target_pod(self._settings, target, plan)
+            placement = await _node_from_target_pod(self._settings, target, plan)
+            # Keep compatibility with test/custom monkeypatches written against
+            # the old two-field helper while production returns provenance.
+            if len(placement) == 3:
+                node, resolved_pod, resolved_origin = placement
+            else:  # pragma: no cover - compatibility branch exercised by callers
+                node, resolved_pod = placement
+                resolved_origin = "live_pod"
             if node:
-                node_origin = "live_pod"
+                node_origin = resolved_origin
         if not node:
             summary = f"{NO_EVIDENCE} " + ko_en(
                 self._settings,
@@ -476,11 +484,16 @@ class SystemCollector:
         token = self._settings.system_agent_token
         headers = {"Authorization": f"Bearer {token}"} if token else None
         time_range = incident_time_range(target)
+        causal_time_range = causal_evidence_time_range(target)
         # A node discovered from a current Pod is useful to inspect, but cannot
-        # prove that a historical incident occurred on that node.  Only an
-        # alert-supplied node identity can scope old journal evidence.
+        # prove that a historical incident occurred on that node. An exact Pod
+        # Event inside the incident window does establish historical placement.
         historical_node_scope_verified = bool(
-            time_range and alert_node and node == alert_node
+            time_range
+            and (
+                (alert_node and node == alert_node)
+                or node_origin == "historical_pod_event"
+            )
         )
         source_results = []
         raw_matches: dict[str, list[str]] = {}
@@ -509,7 +522,7 @@ class SystemCollector:
                 and _historical_journal_response_verified(response.data, time_range)
             )
             matching_timestamps = _journal_matching_timestamps(
-                matches, time_range if historical_window_verified else None
+                matches, causal_time_range if historical_window_verified else None
             )
             source_results.append(
                 {
@@ -542,9 +555,18 @@ class SystemCollector:
             and (not time_range or bool(item.get("historical_window_verified")))
         ]
         with_errors = [item for item in incident_successful if item["error_count"]]
+        causal_errors = (
+            with_errors
+            if not time_range
+            else [
+                item
+                for item in with_errors
+                if isinstance(item.get("matching_timestamps"), list) and item["matching_timestamps"]
+            ]
+        )
         error_lines = [
             line
-            for item in with_errors
+            for item in causal_errors
             for line in raw_matches.get(str(item["source"]), [])
         ]
         journal = next((item for item in source_results if item["source"] == "journal"), None)
@@ -567,7 +589,7 @@ class SystemCollector:
                 f"Node {node}: the system agent did not confirm the requested incident-window "
                 "journal response. Returned logs are context only, not historical evidence.",
             )
-        elif with_errors and time_range and not historical_node_scope_verified:
+        elif causal_errors and time_range and not historical_node_scope_verified:
             status = "partial"
             confidence = "low"
             deterministic = f"{NO_EVIDENCE} " + ko_en(
@@ -579,16 +601,37 @@ class SystemCollector:
                 "error line(s), but the node was inferred from a current Pod rather than the alert; "
                 "this is context only.",
             )
-        elif with_errors:
+        elif causal_errors:
             status = "ok"
             confidence = "high"
-            sources_text = ", ".join(sorted({item["source"] for item in with_errors}))
+            sources_text = ", ".join(sorted({item["source"] for item in causal_errors}))
             deterministic = ko_en(
                 self._settings,
                 f"노드 {node}: {sources_text}에서 커널/하드웨어 에러 라인 "
                 f"{len(error_lines)}건을 발견했습니다.",
                 f"Node {node}: {len(error_lines)} kernel/hardware error line(s) found in "
                 f"{sources_text}.",
+            )
+        elif with_errors:
+            status = "partial"
+            confidence = "low"
+            resolved = bool(
+                parse_incident_time(target.resolved_at)
+                and parse_incident_time(target.fired_at)
+                and parse_incident_time(target.resolved_at) >= parse_incident_time(target.fired_at)
+            )
+            deterministic = f"{NO_EVIDENCE} " + ko_en(
+                self._settings,
+                (
+                    f"노드 {node}: 커널/하드웨어 에러 라인이 incident 해결 후 recovery 구간에만 있어 "
+                    "원인 증거가 아닌 참고용으로 유지합니다."
+                    if resolved else f"노드 {node}: 에러 라인을 인과 시간창 안에서 검증할 수 없어 참고용으로 유지합니다."
+                ),
+                (
+                    f"Node {node}: kernel/hardware error lines occur only in the post-resolution "
+                    "recovery window and remain context, not causal evidence."
+                    if resolved else f"Node {node}: error lines could not be verified inside the causal window; kept as context."
+                ),
             )
         elif incident_successful:
             # The endpoint returns a bounded journal tail. A clean tail is
@@ -631,7 +674,7 @@ class SystemCollector:
             )
 
         summary = deterministic
-        if with_errors and (not time_range or historical_node_scope_verified) and llm_configured(self._settings):
+        if causal_errors and (not time_range or historical_node_scope_verified) and llm_configured(self._settings):
             insight = await _llm_insight(self._settings, node, error_lines)
             if insight:
                 summary = insight
@@ -758,7 +801,7 @@ async def _llm_insight(settings: Settings, node: str, error_lines: list[str]) ->
 
 async def _node_from_target_pod(
     settings: Settings, target: AnalysisTarget, plan: object | None
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """Best-effort node resolution from the target Pod's ``spec.nodeName``.
 
     ``resolve_live_pod_node`` first GETs the target Pod and then uses a bounded
@@ -769,14 +812,49 @@ async def _node_from_target_pod(
     namespace = str(target.namespace or "").strip()
     pod = str(getattr(plan, "pod", "") or target.pod or "").strip()
     if not namespace or not pod:
-        return "", ""
+        return "", "", ""
     try:
-        from app.collectors.kubernetes import resolve_live_pod_node
+        from app.collectors.kubernetes import (
+            _describe_events,
+            node_from_pod_events,
+            resolve_live_pod_node,
+        )
 
-        resolved_pod, node = await resolve_live_pod_node(settings, namespace, pod)
-        return str(node or "").strip(), str(resolved_pod or "").strip()
+        # A resolved incident must never follow a same-prefix Pod that exists
+        # today. Resolve only the exact historical Pod's timestamped Events;
+        # those can prove its old node even after the Pod object was deleted.
+        if target.resolved_at:
+            event_result = await _describe_events(
+                settings,
+                namespace=namespace,
+                name=pod,
+                expected_kind="Pod",
+                expected_uid=target.pod_uid,
+                time_range=incident_time_range(target),
+            )
+            events = (
+                event_result.get("items", []) if isinstance(event_result, dict) else event_result
+            )
+            node = node_from_pod_events(
+                [event for event in events if isinstance(event, dict)]
+            )
+            return (
+                str(node or "").strip(),
+                pod if node else "",
+                "historical_pod_event" if node else "",
+            )
+
+        workload = str(target.workload_name or getattr(plan, "workload", "") or "").strip()
+        resolved_pod, node = await resolve_live_pod_node(
+            settings, namespace, pod, workload=workload
+        )
+        return (
+            str(node or "").strip(),
+            str(resolved_pod or "").strip(),
+            "live_pod" if node else "",
+        )
     except Exception:  # noqa: BLE001 - system evidence remains optional
-        return "", ""
+        return "", "", ""
 
 
 def _collector_masker(settings: Settings):
