@@ -106,6 +106,34 @@ async def test_insight_calls_use_stage_model_override(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_collector_insights_use_configured_token_budget(monkeypatch) -> None:
+    budgets: list[int | None] = []
+
+    async def fake_complete(_settings, *, max_tokens=None, **_kwargs):
+        budgets.append(max_tokens)
+        return "ok"
+
+    for module in (change, kubernetes, loki, system):
+        monkeypatch.setattr(module, "complete", fake_complete)
+
+    settings = replace(_settings(), llm_insight_max_tokens=640)
+    begin_usage_tracking()
+    await loki._llm_insight(settings, "source", "summary", [{"line": "evidence"}])
+    await kubernetes._senior_insight(
+        settings,
+        summary="summary",
+        container_diagnostics=[],
+        warning_events=[{"message": "FailedScheduling"}],
+        logs=[],
+        exec_probes=[],
+    )
+    await system._llm_insight(settings, "node-a", ["NVRM Xid 79"])
+    await change._senior_insight(settings, [{"summary": "deployment changed"}])
+
+    assert budgets == [640, 640, 640, 640]
+
+
+@pytest.mark.asyncio
 async def test_collector_llm_prompts_redact_sensitive_inputs(monkeypatch) -> None:
     prompts: list[str] = []
 

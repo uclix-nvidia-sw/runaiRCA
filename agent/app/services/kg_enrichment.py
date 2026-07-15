@@ -138,6 +138,12 @@ match
 select $fam, $sn, $kw, $st;
 """
 
+_KNOWLEDGE_REASON_QUERY = """
+match
+  $sy isa symptom, has name $sn, has reason $reason;
+select $sn, $reason;
+"""
+
 
 @dataclass
 class KGContext:
@@ -716,6 +722,7 @@ def _query_kg(
             )
 
         knowledge_rows = run(_KNOWLEDGE_QUERY)
+        knowledge_reason_rows = run(_KNOWLEDGE_REASON_QUERY)
         reasoning: dict[str, Any] = {}
         component = target.workload_name
         if component:
@@ -738,6 +745,11 @@ def _query_kg(
             _log.warning("TypeDB diagnostic runbook query failed; YAML fallback will be used")
             diagnostic_tree = {}
 
+    reasons = {
+        str(row.get("sn") or ""): str(row.get("reason") or "")
+        for row in knowledge_reason_rows
+        if row.get("sn") and row.get("reason")
+    }
     grouped: dict[tuple[str, str], dict[str, set[str]]] = {}
     for r in knowledge_rows:
         fam = str(r.get("fam") or "")
@@ -756,6 +768,7 @@ def _query_kg(
                 "symptom": sname,
                 "keywords": sorted(entry["keywords"]),
                 "actions": sorted(entry["actions"]),
+                "reason": reasons.get(sname, ""),
             }
         )
 

@@ -1944,7 +1944,13 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                             continue
                         state.graph_fixes.xid_fixes.pop(code, None)
                         state.graph_fixes.root_xids.pop(code, None)
-    state.summary = _summary_from(request, state.results, state.root_cause_candidates)
+    state.summary = _summary_from(
+        request,
+        state.results,
+        state.root_cause_candidates,
+        state.failure_modes,
+        language=getattr(settings, "language", "en"),
+    )
     playbook_fallback = load_troubleshooting_cases(settings.troubleshooting_cases_file)
     state.detail = _detail_from(
         request,
@@ -1980,6 +1986,10 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                 fallback_detail=state.detail,
                 timeline=state.timeline,
                 troubleshooting_path=state.troubleshooting_path,
+                self_check_caveat=state.self_check_caveat,
+                self_check_refuted=state.self_check_refuted,
+                self_check_next=state.self_check_next,
+                reanalysis_note=state.reanalysis_note,
                 # v2 retains the investigator's free-form F-* ledger for
                 # compatibility.  Synthesis must use the eligibility-filtered,
                 # response-local E-id graph only.
@@ -1989,6 +1999,10 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         if synth:
             state.summary, state.detail = synth
         elif llm_configured(settings, getattr(settings, "llm_model_insight", "")):
+            state.warnings.append(
+                "한국어 LLM 종합이 유효한 보고서를 반환하지 않아 "
+                "결정론적 fallback 보고서를 사용했습니다."
+            )
             # Synthesis fell back to the deterministic report, which splices the
             # curated KB playbook in verbatim ENGLISH — translate that one
             # section so the operator guidance still reads in their language.
@@ -2711,6 +2725,10 @@ async def _synthesize_korean(
     troubleshooting_path: dict[str, Any] | None = None,
     reasoning_trace: object | None = None,
     evidence_eligibility: Mapping[str, object] | None = None,
+    self_check_caveat: str = "",
+    self_check_refuted: bool = False,
+    self_check_next: str = "",
+    reanalysis_note: str = "",
 ) -> tuple[str, str] | None:
     """LLM synthesis of the RCA report in Korean, grounded STRICTLY in the evidence.
 
@@ -2805,6 +2823,18 @@ async def _synthesize_korean(
         "plan": _synthesis_plan_context(plan, allow_remediation=has_scoped_support),
         "ranked_root_cause_candidates": [c.as_dict() for c in root_cause_candidates],
         **(
+            {
+                "self_check": {
+                    "refuted": self_check_refuted,
+                    "caveat": self_check_caveat,
+                    "next_check": self_check_next,
+                    "reanalysis_note": reanalysis_note,
+                }
+            }
+            if any((self_check_caveat, self_check_next, reanalysis_note))
+            else {}
+        ),
+        **(
             {"reasoning_trace_v3": reasoning_trace}
             if isinstance(reasoning_trace, dict)
             and reasoning_trace.get("schema_version") == 3
@@ -2852,6 +2882,9 @@ async def _synthesize_korean(
         "그 조회나 같은 명령을 다시 실행하라고 하지 마세요. 이미 확인된 결과를 요약하고, "
         "그 결과가 요구할 때에만 조건부 후속 조치를 제시하세요. context_artifact라는 이유만으로 "
         "완료된 조회를 미수행 점검으로 되돌리지 마세요.\n"
+        "- self_check에 구체적인 로그 기반 오류가 있으면, 그 오류를 원인과 권장 조치의 첫 항목에 "
+        "반영하세요. 이미 반증된 넓은 분류의 범용 플레이북(OOM, entrypoint, secret, probe)을 "
+        "그 구체 오류보다 앞세우거나 나열하지 마세요.\n"
         "- MemoryPressure/DiskPressure/PIDPressure/NetworkUnavailable 같은 condition 이름은 "
         "존재 자체가 장애 증거가 아닙니다. artifact의 evidence_role=support 안의 "
         "condition_checks.active=true만 지지 증거이며, evidence_role=contradict 안의 "
@@ -2912,16 +2945,20 @@ async def _synthesize_korean(
     user = "증거(JSON):\n" + _synthesis_evidence_json(safe_evidence, _SYNTHESIS_USER_CHARS)
     try:
         data = await _complete_synthesis_json(settings, system=system, user=user)
-    except Exception:  # noqa: BLE001 - synthesis is best-effort; keep deterministic report
+    except Exception as exc:  # noqa: BLE001 - synthesis is best-effort
+        _log.warning("korean synthesis call failed: %s", _masked_exception_text(exc))
         return None
     if not data:
+        _log.warning("korean synthesis returned no valid JSON report; using deterministic fallback")
         return None
     summary = data.get("summary")
     detail = data.get("detail")
     if not isinstance(summary, str) or not summary.strip():
+        _log.warning("korean synthesis JSON omitted summary; using deterministic fallback")
         return None
     if not isinstance(detail, str) or not detail.strip():
-        detail = fallback_detail
+        _log.warning("korean synthesis JSON omitted detail; using deterministic fallback")
+        return None
     conflict = _synthesis_semantic_conflict(
         summary,
         detail,
@@ -2999,7 +3036,19 @@ async def _complete_synthesis_json(settings: Settings, *, system: str, user: str
         )
         parsed = parse_json_object(text or "")
         if parsed is not None:
-            return parsed
+            missing = [
+                field
+                for field in ("summary", "detail")
+                if not isinstance(parsed.get(field), str) or not parsed[field].strip()
+            ]
+            if not missing:
+                return parsed
+            _log.warning(
+                "korean synthesis JSON omitted required field(s) %s (attempt %d); retrying",
+                ", ".join(missing),
+                attempt + 1,
+            )
+            continue
         if text is None:
             _log.warning("korean synthesis call failed (attempt %d): no reply", attempt + 1)
         else:
@@ -3406,8 +3455,85 @@ def _summary_from(
     request: AlertAnalysisRequest,
     results: list[CollectorResult],
     root_cause_candidates: list[RankedCause],
+    failure_modes: dict[str, list[dict]] | None = None,
+    *,
+    language: str = "en",
 ) -> str:
-    return _short_sentence(_ranked_root_cause_statement(root_cause_candidates, request), limit=280)
+    observed = _observed_text(results, request)
+    return _short_sentence(
+        _failure_mode_root_cause_statement(
+            root_cause_candidates,
+            request,
+            observed,
+            failure_modes or {},
+            language,
+        ),
+        limit=280,
+    )
+
+
+def _failure_mode_root_cause_statement(
+    candidates: list[RankedCause],
+    request: AlertAnalysisRequest,
+    observed_text: str,
+    failure_modes: dict[str, list[dict]],
+    language: str,
+) -> str:
+    """Prefer an exact, curated mechanism over a coarse ranked-family sentence."""
+    top_family = candidates[0].family if candidates else ""
+    filter_to_top = _top_family_settled(candidates)
+    for family, symptom in match_failure_mode_symptoms(
+        failure_modes, observed_text, top_family
+    ):
+        if filter_to_top and family != top_family:
+            continue
+        reason = str(
+            symptom.get("reason_ko" if language == "ko" else "reason") or ""
+        ).strip()
+        if reason:
+            return reason
+    return _ranked_root_cause_statement(candidates, request)
+
+
+def _localized_failure_mode_name(symptom: dict, language: str) -> str:
+    if language == "ko" and symptom.get("symptom_ko"):
+        return str(symptom["symptom_ko"])
+    return str(symptom.get("symptom") or "")
+
+
+def _localized_failure_mode_actions(symptom: dict, language: str) -> list[str]:
+    localized = symptom.get("actions_ko") if language == "ko" else None
+    actions = localized or symptom.get("actions") or []
+    return [str(action) for action in actions if str(action).strip()]
+
+
+def _actionable_failure_mode_matches(
+    failure_modes: dict[str, list[dict]],
+    observed_text: str,
+    candidates: list[RankedCause] | None,
+    *,
+    fuzzy_query: str = "",
+) -> list[tuple[str, dict]]:
+    """Apply common knowledge metadata after signature matching.
+
+    An ``exclusive_actions`` entry is a curated assertion that its precise
+    remediation supersedes broad same-incident checklists such as the generic
+    CrashLoopBackOff runbook.
+    """
+    top_family = candidates[0].family if candidates else ""
+    filter_to_top = _top_family_settled(candidates)
+    matches = [
+        (family, symptom)
+        for family, symptom in match_failure_mode_symptoms(
+            failure_modes, observed_text, top_family, fuzzy_query=fuzzy_query
+        )
+        if not filter_to_top or family == top_family
+    ]
+    exclusive = next(
+        ((family, symptom) for family, symptom in matches if symptom.get("exclusive_actions")),
+        None,
+    )
+    return [exclusive] if exclusive else matches
 
 
 # Section headings for the report document (Word-export-clean markdown).
@@ -3492,8 +3618,19 @@ def _detail_from(
         lines.append(f"- {h['impact']}: {impact}")
 
     # --- 2. Root Cause --------------------------------------------------------
+    observed_text = _observed_text(
+        results, request, eligible_support_ids=eligible_support_ids
+    )
     lines.extend(["", h["cause"], ""])
-    lines.append(_ranked_root_cause_statement(root_cause_candidates or [], request))
+    lines.append(
+        _failure_mode_root_cause_statement(
+            root_cause_candidates or [],
+            request,
+            observed_text,
+            failure_modes or {},
+            language,
+        )
+    )
     # Multi-axis facets (Locus / Nature / Trigger) for the top cause — names the
     # subsystem, the KIND of cause, and (when known) what set it off.
     if root_cause_candidates:
@@ -3502,9 +3639,6 @@ def _detail_from(
             lines.append(facets)
     # Ground the coarse family in the most specific signature match when one exists:
     # a recognised known issue (with its affected/fixed version) is far more precise.
-    observed_text = _observed_text(
-        results, request, eligible_support_ids=eligible_support_ids
-    )
     lines.extend(
         _known_issue_cause_lines(
             known_issues, observed_text, language, _alert_text(request)
@@ -3542,6 +3676,7 @@ def _detail_from(
         known_issues or [],
         components=components,
         allow_cause_specific_actions=allow_cause_specific_actions,
+        language=language,
     )
     if numbered:
         lines.extend(numbered)
@@ -3600,6 +3735,7 @@ def _detail_from(
             masker,
             component=getattr(plan, "component", "") if plan is not None else "",
             allow_remediation=allow_cause_specific_actions,
+            language=language,
         )
     )
     lines.extend(_similar_incident_lines(request))
@@ -3985,6 +4121,7 @@ def _numbered_actions(
     *,
     allow_graph_remediation: bool = True,
     allow_cause_specific_actions: bool | None = None,
+    language: str = "en",
 ) -> list[str]:
     """One deduped, numbered priority list — documented-alert fixes first, then
     the alert target's own component checks, then recognised known-issue fixes,
@@ -4000,6 +4137,14 @@ def _numbered_actions(
     fuzzy = _alert_text(request)
     top_family = candidates[0].family if candidates else ""
     filter_to_top = _top_family_settled(candidates)
+    symptom_matches = _actionable_failure_mode_matches(
+        failure_modes, observed_text, candidates, fuzzy_query=fuzzy
+    )
+    if allow_cause_specific_actions and symptom_matches[0:1] and symptom_matches[0][1].get(
+        "exclusive_actions"
+    ):
+        actions = _localized_failure_mode_actions(symptom_matches[0][1], language)
+        return [f"{index}. {action}" for index, action in enumerate(actions, start=1)]
     if allow_cause_specific_actions and plan is not None and plan.matched_alert:
         alert_family = str(plan.matched_alert.get("family") or "")
         if (not top_family or alert_family == top_family) and top_family != "insufficient_evidence":
@@ -4039,12 +4184,8 @@ def _numbered_actions(
     # step already used cross-family signatures to choose that family; repeating
     # every side-match here pollutes actions with stale/context text.
     if allow_cause_specific_actions and top_family != "insufficient_evidence":
-        for family, symptom in match_failure_mode_symptoms(
-            failure_modes, observed_text, top_family, fuzzy_query=fuzzy
-        ):
-            if filter_to_top and family != top_family:
-                continue
-            actions = [str(a) for a in symptom.get("actions", [])]
+        for _family, symptom in symptom_matches:
+            actions = _localized_failure_mode_actions(symptom, language)
             specific_actions += len(actions)
             ordered.extend(actions)
     ordered.extend(
@@ -4473,6 +4614,7 @@ def _playbook_lines(
     component: str = "",
     *,
     allow_remediation: bool = True,
+    language: str = "en",
 ) -> list[str]:
     """Root-cause-relevant remediation, most specific first.
 
@@ -4510,16 +4652,21 @@ def _playbook_lines(
             f"  - {_safe_line(action, limit=360, masker=active_masker)}"
             for action in issue.get("actions", [])[:4]
         )
-    for family, symptom in match_failure_mode_symptoms(
-        failure_modes, observed_text, top_family, fuzzy_query=fuzzy_query
-    ):
-        if filter_to_top and family != top_family:
-            continue
-        symptom_name = _safe_line(symptom.get("symptom"), limit=180, masker=active_masker)
+    symptom_matches = _actionable_failure_mode_matches(
+        failure_modes, observed_text, candidates, fuzzy_query=fuzzy_query
+    )
+    if symptom_matches[0:1] and symptom_matches[0][1].get("exclusive_actions"):
+        lines = []
+    for family, symptom in symptom_matches:
+        symptom_name = _safe_line(
+            _localized_failure_mode_name(symptom, language),
+            limit=180,
+            masker=active_masker,
+        )
         lines.append(f"- **{symptom_name}** ({_family_label(family)})")
         lines.extend(
             f"  - {_safe_line(action, limit=360, masker=active_masker)}"
-            for action in symptom.get("actions", [])[:5]
+            for action in _localized_failure_mode_actions(symptom, language)[:5]
         )
         # Architecture layer: the implicated platform component's failure effect,
         # dependency check order, and ready-to-run checks (runai_architecture.yaml).

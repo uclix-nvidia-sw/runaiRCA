@@ -3821,7 +3821,7 @@ async def _senior_insight(
             settings,
             system=system,
             user=masked_user,
-            max_tokens=160,
+            max_tokens=getattr(settings, "llm_insight_max_tokens", 512),
             model=insight_model or None,
         )
 

@@ -159,6 +159,9 @@ class Settings:
     # spend it on reasoning tokens FIRST — if synthesis logs empty replies
     # (finish_reason=length), raise this rather than shrinking the prompt.
     llm_synthesis_max_tokens: int = 8192
+    # Short collector insights still need enough room for reasoning models to
+    # spend internal reasoning tokens and emit their requested 1-2 sentences.
+    llm_insight_max_tokens: int = 512
     llm_model_insight: str = ""
     # Deprecated no-op retained only for Settings(...) compatibility. The
     # re-analysis loop stops on semantic completion or the outer deadline.
@@ -316,6 +319,7 @@ def load_settings() -> Settings:
         # spend this on reasoning tokens FIRST — if synthesis logs empty replies
         # (finish_reason=length), raise this rather than shrinking the prompt.
         llm_synthesis_max_tokens=_int_env("LLM_SYNTHESIS_MAX_TOKENS", 8192),
+        llm_insight_max_tokens=_int_env("LLM_INSIGHT_MAX_TOKENS", 512),
         nat_config_file=os.getenv("NAT_CONFIG_FILE", "configs/runai_rca_engine.yml").strip(),
         # Run analysis through the in-process NAT engine.
         enable_nat_runtime=_bool_env("ENABLE_NAT_RUNTIME", True),

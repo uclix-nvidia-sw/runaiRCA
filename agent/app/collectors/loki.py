@@ -397,7 +397,7 @@ async def _llm_insight(
             settings,
             system=system,
             user=user,
-            max_tokens=160,
+            max_tokens=getattr(settings, "llm_insight_max_tokens", 512),
             model=insight_model or None,
         )
 

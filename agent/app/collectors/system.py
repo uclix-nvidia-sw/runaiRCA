@@ -795,7 +795,12 @@ async def _llm_insight(settings: Settings, node: str, error_lines: list[str]) ->
     user = _collector_masker(settings).mask_text(
         f"Node {node} recent kernel/host error lines:\n" + "\n".join(error_lines[:20])
     )
-    text = await complete(settings, system=system, user=user, max_tokens=160) or ""
+    text = await complete(
+        settings,
+        system=system,
+        user=user,
+        max_tokens=getattr(settings, "llm_insight_max_tokens", 512),
+    ) or ""
     return _collector_masker(settings).mask_text(text)
 
 

@@ -63,7 +63,7 @@ def _ensure_cause(tx: Any, family: str) -> None:
         tx.query(f'insert $x isa {family}, has subtype "{esc(family)}";').resolve()
 
 
-def _ensure_symptom(tx: Any, name: str, keywords: list[str]) -> None:
+def _ensure_symptom(tx: Any, name: str, keywords: list[str], reason: str = "") -> None:
     if not _exists(tx, f'$x isa symptom, has name "{esc(name)}";'):
         tx.query(f'insert $x isa symptom, has name "{esc(name)}";').resolve()
     for kw in keywords:
@@ -72,6 +72,13 @@ def _ensure_symptom(tx: Any, name: str, keywords: list[str]) -> None:
         tx.query(
             f'match $s isa symptom, has name "{esc(name)}"; '
             f'insert $s has keyword "{esc(kw)}";'
+        ).resolve()
+    if reason and not _exists(
+        tx, f'$x isa symptom, has name "{esc(name)}", has reason "{esc(reason)}";'
+    ):
+        tx.query(
+            f'match $s isa symptom, has name "{esc(name)}"; '
+            f'insert $s has reason "{esc(reason)}";'
         ).resolve()
 
 
@@ -132,7 +139,12 @@ def main() -> int:
                     name = str(sym.get("name", "")).strip()
                     if not name:
                         continue
-                    _ensure_symptom(tx, name, [str(k) for k in sym.get("keywords", [])])
+                    _ensure_symptom(
+                        tx,
+                        name,
+                        [str(k) for k in sym.get("keywords", [])],
+                        str(sym.get("reason", "")).strip(),
+                    )
                     _relate_indicates(tx, name, family)
                     symptoms += 1
                     for act in sym.get("actions", []):

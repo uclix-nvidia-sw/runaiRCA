@@ -508,6 +508,9 @@ agent:
     llmModelChat: ""
     llmModelInsight: ""
     llmModelCritic: ""
+    # Output budget for 1-2 sentence collector insights. Reasoning models may
+    # consume part of this internally before emitting visible content.
+    llmInsightMaxTokens: 512
     # JSON: {"model":{"prompt_per_mtok":0.15,"completion_per_mtok":0.60}}
     llmPricingJson: "{}"
     llmRequestTimeoutSeconds: 300
