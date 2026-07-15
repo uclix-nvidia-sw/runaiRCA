@@ -1616,8 +1616,11 @@ async def test_runai_mcp_snapshot_supplements_direct_queue_scope(monkeypatch) ->
         return [{"name": "queue", "path": "/api/v1/queues/gpu-a", "transport": "direct",
                  "status_code": 200, "error": None, "data": {"name": "gpu-a"}}]
 
+    async def fake_queue(*args, **kwargs):
+        return (await fake_direct(*args, **kwargs))[0]
+
     monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", fake_mcp)
-    monkeypatch.setattr(runai_mod, "_collect_runai_responses", fake_direct)
+    monkeypatch.setattr(runai_mod, "_collect_runai_queue_response", fake_queue)
     monkeypatch.setattr(runai_mod, "_fetch_runai_version", lambda *a, **k: _async_empty())
     result = await RunAICollector(
         replace(make_settings(), runai_base_url="https://runai.example", runai_bearer_token="token",
@@ -1642,8 +1645,11 @@ async def test_runai_mcp_queue_gap_is_visible_when_direct_query_is_unavailable(m
     async def no_direct(_settings, _target, _headers):
         return []
 
+    async def no_queue(*args, **kwargs):
+        return (await no_direct(*args, **kwargs))[0]
+
     monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", fake_mcp)
-    monkeypatch.setattr(runai_mod, "_collect_runai_responses", no_direct)
+    monkeypatch.setattr(runai_mod, "_collect_runai_queue_response", no_queue)
     monkeypatch.setattr(runai_mod, "_fetch_runai_version", lambda *a, **k: _async_empty())
     result = await RunAICollector(
         replace(make_settings(), runai_base_url="https://runai.example", runai_bearer_token="token",

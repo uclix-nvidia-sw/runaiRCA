@@ -109,7 +109,8 @@ class RunAICollector:
                 f"{NO_EVIDENCE} Run:ai API is not configured. Using alert labels and "
                 "annotations as scheduling context."
             )
-            status = "partial" if len(missing) < 3 else "unavailable"
+            identity_missing = [item for item in missing if item != "runai.queue_scope"]
+            status = "partial" if len(identity_missing) < 3 else "unavailable"
             confidence = "low"
         else:
             headers, auth_warnings = await _runai_headers(self._settings)
@@ -192,9 +193,11 @@ class RunAICollector:
                 )
                 direct_results = query_results
                 used_mcp = False
-            elif any(item.get("error") for item in query_results):
+            elif any(item.get("error") or item.get("explicitly_empty") for item in query_results):
                 failed_names = {
-                    str(item.get("name") or "") for item in query_results if item.get("error")
+                    str(item.get("name") or "")
+                    for item in query_results
+                    if item.get("error") or item.get("explicitly_empty")
                 }
                 for item in query_results:
                     if item.get("error"):
@@ -218,35 +221,34 @@ class RunAICollector:
                         "project": {"project_resources"},
                         "queue": {"queue"},
                     }
+                    replaced_names: set[str] = set()
                     for direct_item in direct_results:
                         direct_name = str(direct_item.get("name") or "")
                         if equivalents.get(direct_name, set()) & failed_names:
                             query_results.append(direct_item)
+                            if not direct_item.get("error"):
+                                replaced_names.update(equivalents.get(direct_name, set()) & failed_names)
+                    if replaced_names:
+                        query_results = [
+                            item for item in query_results
+                            if not (item.get("error") and str(item.get("name") or "") in replaced_names)
+                        ]
             if used_mcp and target.queue:
-                if direct_results is None:
-                    try:
-                        direct_results = _validated_runai_query_results(
-                            await _collect_runai_responses(self._settings, target, headers)
-                        )
-                    except Exception as exc:  # noqa: BLE001 - expose the missing plane
-                        direct_results = []
-                        auth_warnings.append(
-                            f"Run:ai queue scope direct lookup failed: {exc.__class__.__name__}."
-                        )
-                queue_item = next(
-                    (item for item in direct_results if item.get("name") == "queue"), None
-                )
-                if queue_item is not None:
+                try:
+                    queue_item = _validated_runai_query_results(
+                        [await _collect_runai_queue_response(self._settings, target, headers)]
+                    )[0]
+                except Exception as exc:  # noqa: BLE001 - expose the missing plane
+                    queue_item = None
+                    auth_warnings.append(
+                        f"Run:ai queue scope direct lookup failed: {exc.__class__.__name__}."
+                    )
+                if queue_item is not None and not queue_item.get("error"):
                     query_results.append(queue_item)
-                    if queue_item.get("error"):
-                        missing.append("runai.queue_scope")
-                        auth_warnings.append(
-                            "Run:ai queue scope direct lookup did not return queue state."
-                        )
                 else:
                     missing.append("runai.queue_scope")
                     auth_warnings.append(
-                        "Run:ai queue scope was not collected: neither MCP nor direct API returned a queue query."
+                        "Run:ai queue scope was not collected because the direct lookup did not return queue state."
                     )
             if used_mcp:
                 auth_warnings.append(
@@ -629,35 +631,61 @@ async def _collect_runai_responses(
 
     responses: list[dict[str, object]] = []
     for name, path, params in requests:
-        response = await get_json(
-            base_url=settings.runai_base_url,
-            path=path,
-            timeout_seconds=settings.runai_timeout_seconds,
-            params=params,
-            headers=headers,
-        )
-        responses.append(
-            {
-                "name": name,
-                "path": path,
-                "url": response.url,
-                "status_code": response.status_code,
-                "error": response.error,
-                # Match target identity and empty envelopes before compaction:
-                # servers may ignore filters and put the requested workload
-                # beyond the artifact's bounded preview.
-                "identity_matched": _runai_data_contains_identity(
-                    response.data,
-                    _runai_expected_identity(name, target),
-                    resource=name,
-                    target=target,
-                ) if _runai_expected_identity(name, target) else False,
-                "explicitly_empty": _runai_is_explicitly_empty(response.data),
-                "data": compact(response.data, limit=5),
-                "transport": "direct",
-            }
-        )
+        responses.append(await _collect_runai_response(settings, target, headers, name, path, params))
     return responses
+
+
+async def _collect_runai_queue_response(
+    settings: Settings, target: AnalysisTarget, headers: dict[str, str]
+) -> dict[str, object]:
+    queue = quote(target.queue, safe="")
+    return await _collect_runai_response(
+        settings, target, headers, "queue", f"{settings.runai_queues_path.rstrip('/')}/{queue}", None
+    )
+
+
+async def _collect_runai_response(
+    settings: Settings,
+    target: AnalysisTarget,
+    headers: dict[str, str],
+    name: str,
+    path: str,
+    params: dict[str, str] | None,
+) -> dict[str, object]:
+    response = await get_json(
+        base_url=settings.runai_base_url,
+        path=path,
+        timeout_seconds=settings.runai_timeout_seconds,
+        params=params,
+        headers=headers,
+    )
+    time_range = incident_time_range(target)
+    expected = _runai_expected_identity(name, target)
+    evidence_window = (
+        _runai_evidence_window(response.data, name, target, time_range)
+        if time_range
+        else None
+    )
+    return {
+        "name": name,
+        "path": path,
+        "url": response.url,
+        "status_code": response.status_code,
+        "error": response.error,
+        # Match target identity and empty envelopes before compaction:
+        # servers may ignore filters and put the requested workload
+        # beyond the artifact's bounded preview.
+        "identity_matched": _runai_data_contains_identity(
+            response.data,
+            expected,
+            resource=name,
+            target=target,
+        ) if expected else False,
+        "explicitly_empty": _runai_is_explicitly_empty(response.data),
+        **({"evidence_window": evidence_window} if evidence_window else {}),
+        "data": compact(response.data, limit=5),
+        "transport": "direct",
+    }
 
 
 def _query_params(values: dict[str, str]) -> dict[str, str]:
@@ -679,6 +707,7 @@ def _validated_runai_query_results(
     validated: list[dict[str, object]] = []
     for raw_item in query_results:
         item = dict(raw_item)
+        item.setdefault("explicitly_empty", _runai_is_explicitly_empty(item.get("data")))
         if not item.get("error"):
             payload_error = _runai_payload_error(
                 item.get("data"), transport=str(item.get("transport") or "")
@@ -797,7 +826,7 @@ def _runai_query_observation(
         polarity, coverage = "unknown", "partial"
         observation["current_state_absent"] = True
     if time_range and polarity == "present":
-        evidence_window = _runai_evidence_window(item.get("data"), name, target, time_range)
+        evidence_window = item.get("evidence_window") or _runai_evidence_window(item.get("data"), name, target, time_range)
         if evidence_window:
             observation["evidence_window"] = evidence_window
         else:

@@ -276,21 +276,21 @@ def _compact_evidence_value(value: object, *, limit: int = 1200) -> str:
 
 
 def _evidence_digest(results: list[CollectorResult], masker) -> str:
-    lines: list[str] = []
+    headlines: list[str] = []
+    artifact_lines: list[str] = []
     for r in results:
         summary = (r.summary or "").strip() or NO_EVIDENCE
-        lines.append(f"- {r.agent} [{r.status}]: {masker.mask_text(summary)}")
+        headlines.append(f"- {r.agent} [{r.status}]: {masker.mask_text(summary)}")
         selected = [
             art for art in (getattr(r, "artifacts", []) or []) if art.status in ("ok", "partial")
         ]
         selected = [
-            art
-            for _index, art in sorted(
-                sorted(
-                    enumerate(selected),
+            art for _index, art in sorted(
+                ([(len(selected) - 1, selected[-1])] if selected else []) + sorted(
+                    enumerate(selected[:-1]),
                     key=lambda item: (bool(item[1].highlights), item[1].status == "ok", item[0]),
                     reverse=True,
-                )[:6]
+                )[:5]
             )
         ]
         for art in selected:
@@ -309,7 +309,15 @@ def _evidence_digest(results: list[CollectorResult], masker) -> str:
                 if checks:
                     parts.append(f"condition_checks={_compact_evidence_value(checks)}")
                 parts.append(f"result={_compact_evidence_value(art.result)}")
-            lines.append(f"  artifact: {masker.mask_text(' | '.join(parts))}")
+            artifact_lines.append(f"  artifact: {masker.mask_text(' | '.join(parts))}")
+    lines = list(headlines)
+    size = len("\n".join(lines))
+    for line in artifact_lines:
+        extra = len(line) + (1 if lines else 0)
+        if size + extra > 24_000:
+            break
+        lines.append(line)
+        size += extra
     return "\n".join(lines)
 
 

@@ -37,7 +37,7 @@ _ERROR_PATTERNS = re.compile(
     r"(?i)("
     r"\bxid\b|nvrm|nvlink|fell off the bus|"  # NVIDIA GPU driver / fabric
     r"\boom\b|out of memory|oom-kill|"  # memory pressure
-    r"i/o error|ext4-fs error|ext4_|\bxfs\b|"  # filesystem / disk
+    r"i/o error|ext4-fs error|ext4_|xfs_|\bxfs\b|"  # filesystem / disk
     r"mce:|machine check|hardware error|"  # CPU/hardware
     r"call trace|kernel panic|\bbug:|segfault"  # kernel faults
     r")"
@@ -615,12 +615,23 @@ class SystemCollector:
         elif with_errors:
             status = "partial"
             confidence = "low"
+            resolved = bool(
+                parse_incident_time(target.resolved_at)
+                and parse_incident_time(target.fired_at)
+                and parse_incident_time(target.resolved_at) >= parse_incident_time(target.fired_at)
+            )
             deterministic = f"{NO_EVIDENCE} " + ko_en(
                 self._settings,
-                f"노드 {node}: 커널/하드웨어 에러 라인이 incident 해결 후 recovery 구간에만 있어 "
-                "원인 증거가 아닌 참고용으로 유지합니다.",
-                f"Node {node}: kernel/hardware error lines occur only in the post-resolution "
-                "recovery window and remain context, not causal evidence.",
+                (
+                    f"노드 {node}: 커널/하드웨어 에러 라인이 incident 해결 후 recovery 구간에만 있어 "
+                    "원인 증거가 아닌 참고용으로 유지합니다."
+                    if resolved else f"노드 {node}: 에러 라인을 인과 시간창 안에서 검증할 수 없어 참고용으로 유지합니다."
+                ),
+                (
+                    f"Node {node}: kernel/hardware error lines occur only in the post-resolution "
+                    "recovery window and remain context, not causal evidence."
+                    if resolved else f"Node {node}: error lines could not be verified inside the causal window; kept as context."
+                ),
             )
         elif incident_successful:
             # The endpoint returns a bounded journal tail. A clean tail is

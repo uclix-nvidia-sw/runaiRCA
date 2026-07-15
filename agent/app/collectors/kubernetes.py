@@ -335,8 +335,6 @@ async def k8s_read(
             # reads; only the new node-assignment lookup needs this argument.
             if field_selector:
                 mcp_kwargs["field_selector"] = field_selector
-            if continue_token:
-                mcp_kwargs["continue_token"] = continue_token
             return await _k8s_read_via_mcp(settings, resolved, **mcp_kwargs)
         except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
             # "not found" is an ANSWER (the resource is gone), not a transport
@@ -466,7 +464,7 @@ async def k8s_logs(
         try:
             result = await _k8s_mcp_result(settings, [("pods_log", args)])
             raw = mcp_tool_json(result)
-            lines = _log_lines(mcp_tool_text(result) or raw, historical=bool(since_time))
+            lines = _log_lines(mcp_tool_text(result) or raw)
             observed_entity = _mcp_pod_log_observed_entity(raw, namespace, pod)
             return {
                 "namespace": namespace,
@@ -4297,15 +4295,8 @@ def _event_timestamp(event: dict[str, object]) -> object:
 
 
 def _event_sort_timestamp(event: dict[str, object]) -> tuple[bool, str]:
-    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
-    series = event.get("series") if isinstance(event.get("series"), dict) else {}
-    timestamp = parse_incident_time(
-        event.get("lastTimestamp")
-        or event.get("eventTime")
-        or event.get("firstTimestamp")
-        or metadata.get("creationTimestamp")
-        or series.get("lastObservedTime")
-    )
+    timestamps = _event_timestamps(event)
+    timestamp = timestamps[-1][0] if timestamps else None
     return timestamp is not None, timestamp.isoformat() if timestamp is not None else ""
 
 
@@ -5107,11 +5098,11 @@ async def collect_runai_crd_findings(
     async def scan(kind: str, namespace: str = "") -> None:
         token = ""
         label = f"{kind}{('/' + namespace) if namespace else ''}"
-        for page in range(5):
+        for page in range(3):
             try:
                 try:
                     result = await k8s_read(
-                        settings, kind, namespace=namespace, continue_token=token
+                        settings, kind, namespace=namespace, continue_token=token, full_object=True
                     )
                 except TypeError:
                     # Preserve compatibility with older injected/read adapters.
@@ -5134,6 +5125,11 @@ async def collect_runai_crd_findings(
             data = result.get("data") if isinstance(result.get("data"), dict) else {}
             token = str((data.get("metadata") or {}).get("continue") or "")
             if not token:
+                return
+            if settings.kubernetes_mcp_url and str(result.get("url") or "").startswith(settings.kubernetes_mcp_url):
+                # The pinned MCP list schema has no continuation argument. Do
+                # not re-read page one under a token it cannot honor.
+                truncated.append(label)
                 return
         if token:
             truncated.append(label)

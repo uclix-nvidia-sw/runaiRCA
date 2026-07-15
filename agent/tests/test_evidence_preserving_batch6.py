@@ -19,7 +19,7 @@ def test_prometheus_escapes_selector_values_and_accepts_millisecond_epochs() -> 
 
 def test_prometheus_node_followup_uses_an_anchored_escaped_regex() -> None:
     query = dict(prometheus._prom_followup_queries({"pod_statuses": [{"phase": "Pending"}]}, _target(node="gpu.node-1")))["node_memory_headroom"]
-    assert "^gpu\\\\.node\\\\-1(:\\\\d+)?$" in query
+    assert "^gpu\\\\.node\\\\-1([.:].*)?$" in query
 
 
 def test_grafana_name_match_cannot_select_wrong_type() -> None:

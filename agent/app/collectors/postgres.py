@@ -530,7 +530,7 @@ def _history_tables(column_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             (schema, table), {"schema": schema, "table": table, "timestamps": [], "context": []}
         )
         if data_type in _HISTORY_TIMESTAMP_TYPES:
-            entry["timestamps"].append(column)
+            entry["timestamps"].append((column, data_type))
         elif column in _HISTORY_CONTEXT_COLUMNS:
             entry["context"].append(column)
 
@@ -539,8 +539,9 @@ def _history_tables(column_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         timestamps = entry["timestamps"]
         if not timestamps:
             continue
-        timestamp_column = next(
-            (column for column in _HISTORY_TIME_COLUMNS if column in timestamps), timestamps[0]
+        timestamp_column, timestamp_type = next(
+            ((column, data_type) for column, data_type in timestamps if column in _HISTORY_TIME_COLUMNS),
+            timestamps[0],
         )
         discovered = set(entry["context"])
         # Keep correlation columns before generic audit display fields.  The
@@ -558,6 +559,7 @@ def _history_tables(column_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "schema": entry["schema"],
                 "table": entry["table"],
                 "timestamp_column": timestamp_column,
+                "timestamp_type": timestamp_type,
                 "context_columns": context[:5],
             }
         )
@@ -1171,11 +1173,19 @@ def _verified_target_history_rows(
         if not isinstance(raw_row, dict):
             return False, None, None
         instant = _postgres_event_time(raw_row.get("event_time"))
+        if instant is None:
+            return False, None, None
+        if instant > causal_end:
+            continue
+        if instant < start:
+            return False, None, None
         entity = _target_history_row_entity(raw_row, table, target)
-        if instant is None or not (start <= instant <= causal_end) or entity is None:
+        if entity is None:
             return False, None, None
         instants.append(instant)
         entities.append(entity)
+    if not instants:
+        return False, None, None
     first, last = min(instants), max(instants)
     # A target query can legitimately match by workload in one row and pod in
     # another. Pick the most specific identity seen, while retaining the fact
@@ -1213,6 +1223,8 @@ def _postgres_event_time(value: object) -> datetime | None:
 
 
 def _history_rows_assume_utc(table: dict[str, Any]) -> bool:
+    if table.get("timestamp_type") == "timestamp without time zone":
+        return True
     return any(
         _postgres_event_time(row.get("event_time")) is not None
         and parse_incident_time(row.get("event_time")) is None

@@ -509,7 +509,6 @@ class ChangeCollector:
             node, headers, verify, window_end, warnings, window_seconds=window_seconds
         )
         if node and not self._settings.kubernetes_cluster_scope_enabled:
-            warnings.append("NodeCondition collection skipped because cluster scope is disabled.")
             scope_missing.append("change.node_condition_scope")
         events = await self._recent_events(
             ns, limit, headers, verify, window_end, warnings, window_seconds=window_seconds
@@ -1082,9 +1081,7 @@ def _collector_change_observation(
     elif warnings:
         # A failed resource class leaves the historical sweep incomplete; don't
         # make an empty/partial result refute a lifecycle-change hypothesis.
-        polarity, coverage = (
-            ("present", "partial") if changes and timed_changes else ("unknown", "partial")
-        )
+        polarity, coverage = ("present", "partial") if changes else ("unknown", "partial")
     elif target is not None and target_scope_verified is not True:
         # Correlation by namespace, a workload-name prefix, or a declared
         # dependency namespace is useful investigation context, but it does

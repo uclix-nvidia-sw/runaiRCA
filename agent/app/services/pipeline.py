@@ -3075,17 +3075,16 @@ def _synthesis_collector_findings(
                 ),
                 **{
                     key: [
-                        artifact
-                        for _index, artifact in sorted(
-                            sorted(
-                                enumerate(artifacts),
+                        artifact for _index, artifact in sorted(
+                            ([(len(artifacts) - 1, artifacts[-1])] if artifacts else []) + sorted(
+                                enumerate(artifacts[:-1]),
                                 key=lambda item: (
                                     bool(item[1].get("highlights")),
                                     item[1].get("status") == "ok",
                                     item[0],
                                 ),
                                 reverse=True,
-                            )[:6]
+                            )[:5]
                         )
                     ]
                     for key, artifacts in grouped.items()

@@ -36,8 +36,15 @@ from app.mcp_client import (
 
 _LOKI_FAILURE_TOKEN_RE = re.compile(
     r"\b(?:error|fail(?:ed|ure)?|oom(?:killed)?|evict(?:ed|ion)?|"
-    r"crash(?:ed|loop)?|pending|unschedul(?:able|ed)?|back-?off)\b",
+    r"crash(?:ed|loop)?|pending|unschedul(?:able|ed)?|back-?off|"
+    r"out of memory|killed process|nvrm|panic|segfault|"
+    r"nccl\s+(?:warn|error)|cuda\s+(?:error|out of memory)|\bxid\b)\b",
     re.IGNORECASE,
+)
+_LOKI_ERROR_FETCH_PATTERN = (
+    r"(?i)(error|fail|oom|evict|crash|pending|unschedul|back-off|"
+    r"out of memory|killed process|nvrm|panic|segfault|nccl (warn|error)|"
+    r"cuda (error|out of memory)|\bxid\b)"
 )
 _LOKI_NON_CAUSAL_LINE_RE = re.compile(
     r"\b(?:healthy|normal|nominal|ready|recovered|recovery|resolved|cleared|"
@@ -109,7 +116,7 @@ class LokiCollector:
             )
         else:
             error_query = (
-                f'{selector} |~ "(?i)(error|fail|oom|evict|crash|pending|unschedul|back-off|out of memory|killed process|nccl|xid|nvrm|cuda|panic|segfault)"'
+                f'{selector} |~ "{_LOKI_ERROR_FETCH_PATTERN}"'
             )
             queries = [("error_logs", error_query), ("recent_logs", selector)]
             # Pod names are ephemeral. A restarted/replaced Pod can no longer
@@ -464,7 +471,7 @@ async def _collect_loki_direct(
                 "line_count": line_count,
                 "sample_lines": _sample_lines(streams),
                 "sample_entries": _sample_entries(streams),
-                "_verification_entries": _sample_entries(streams, full_text=True),
+                "_verification_entries": _sample_entries(streams, limit=settings.loki_query_limit, full_text=True),
                 "stream_labels": _stream_label_sets(streams),
                 "stream_labels_complete": _stream_labels_complete(streams),
                 "sample": compact(streams, limit=3),
@@ -648,10 +655,10 @@ def _loki_mcp_item(
         }
     streams = _loki_streams(data)
     entries = _sample_entries(streams)
-    verification_entries = _sample_entries(streams, full_text=True)
+    verification_entries = _sample_entries(streams, limit=10_000, full_text=True)
     if not entries:
         entries = _log_entries_from_mcp_data(data)
-        verification_entries = _log_entries_from_mcp_data(data, full_text=True)
+        verification_entries = _log_entries_from_mcp_data(data, limit=10_000, full_text=True)
     if not entries:
         # Keep compatibility with MCP implementations that return plain text
         # rather than timestamped entries. Lack of a timestamp is explicit,
@@ -679,7 +686,7 @@ def _loki_mcp_item(
         "line_count": line_count,
         "sample_lines": lines[:8],
         "sample_entries": entries[:8],
-        "_verification_entries": verification_entries[:8],
+        "_verification_entries": verification_entries,
         # A native Loki result exposes one complete label set per stream.  The
         # Grafana MCP flat-entry shape does not promise that it returned every
         # stream.  It deliberately remains incomplete here; the observation
@@ -1566,20 +1573,20 @@ def _sample_entries(
         stream_entries.sort(key=lambda entry: str(entry["timestamp"]))
         if stream_entries:
             per_stream.append(stream_entries)
-    positions = [0] * len(per_stream)
+    positions = [len(stream_entries) - 1 for stream_entries in per_stream]
     while len(entries) < limit:
         added = False
         for index, stream_entries in enumerate(per_stream):
-            if positions[index] >= len(stream_entries):
+            if positions[index] < 0:
                 continue
             entries.append(stream_entries[positions[index]])
-            positions[index] += 1
+            positions[index] -= 1
             added = True
             if len(entries) >= limit:
                 break
         if not added:
             break
-    return entries
+    return sorted(entries, key=lambda entry: str(entry["timestamp"]))
 
 
 def _log_entries_from_mcp_data(

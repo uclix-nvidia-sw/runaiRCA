@@ -1396,7 +1396,7 @@ def _prom_followup_queries(details: dict, target: AnalysisTarget) -> list[tuple[
             f'increase(kube_pod_container_status_restarts_total{{namespace="{ns}",pod="{pod}"}}[15m])',
         ))
     if pending and node:
-        node_pattern = _promql_string(f"^{re.escape(node)}(:\\d+)?$")
+        node_pattern = _promql_string(f"^{re.escape(node)}([.:].*)?$")
         out.append((
             "node_memory_headroom",
             f'node_memory_MemAvailable_bytes{{instance=~"{node_pattern}"}} / '

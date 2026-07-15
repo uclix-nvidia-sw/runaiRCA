@@ -108,7 +108,7 @@ def test_loki_sample_entries_round_robin_streams() -> None:
         ]
     )
 
-    assert [entry["line"] for entry in entries] == ["first-2", "second-1", "first-3"]
+    assert [entry["line"] for entry in entries] == ["second-1", "first-2", "first-3"]
 
 
 @pytest.mark.asyncio
@@ -2643,6 +2643,7 @@ async def test_postgres_reads_only_timestamped_audit_history_in_incident_window(
             "schema": "audit",
             "table": "workload_history",
             "timestamp_column": "created_at",
+            "timestamp_type": "timestamp with time zone",
                 "context_columns": ["workload_name", "action"],
             "matching_rows": 1,
             "first_event_at": "2026-07-10T01:02:00Z",
