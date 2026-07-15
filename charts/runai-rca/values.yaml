@@ -187,6 +187,10 @@ backend:
     # up first, the report is lost and the alert gets a useless fallback instead.
     agentRequestTimeoutSeconds: 1560
     manualAgentRequestTimeoutSeconds: 1560
+    # Defense-in-depth ceiling for the Agent HTTP response. The Agent compacts
+    # responses to analysisResponseMaxBytes before sending them; this larger cap
+    # also provides headroom during rolling upgrades from older Agent images.
+    agentMaxResponseBodyBytes: 4194304
     # Max analyses started per webhook and per 1-minute window. Raise if bursts of
     # alerts get dropped without a report; ultimately bounded by the agent's capacity.
     maxAutoAnalyzeFanout: 50
@@ -454,6 +458,9 @@ agent:
     # Overall hard cap per analysis: generous per-step time, but the whole run always
     # finishes within this budget (default 25 min). 0 = no overall cap.
     analysisDeadlineSeconds: 1500
+    # Complete /analyze JSON budget. Oversized raw evidence and internal traces
+    # are compacted before the Korean RCA report text. Keep below the backend cap.
+    analysisResponseMaxBytes: 1572864
     # Final RCA output guard: cites collected evidence, calibrates confidence,
     # and converts an unsafe unresolved conclusion into an honest abstention.
     enableRcaOutputHarness: true

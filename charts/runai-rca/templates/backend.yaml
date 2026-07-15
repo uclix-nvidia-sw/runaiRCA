@@ -80,6 +80,8 @@ spec:
               value: {{ .Values.backend.env.agentRequestTimeoutSeconds | quote }}
             - name: MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS
               value: {{ .Values.backend.env.manualAgentRequestTimeoutSeconds | quote }}
+            - name: AGENT_MAX_RESPONSE_BODY_BYTES
+              value: {{ .Values.backend.env.agentMaxResponseBodyBytes | quote }}
             - name: MAX_AUTO_ANALYZE_FANOUT
               value: {{ .Values.backend.env.maxAutoAnalyzeFanout | quote }}
             - name: AUTO_ANALYZE_SEVERITIES

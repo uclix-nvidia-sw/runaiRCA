@@ -176,11 +176,12 @@ func (s *Server) postAgent(path string, payload any, timeout time.Duration) ([]b
 		return nil, classifyDoError(ctx, err)
 	}
 	defer resp.Body.Close()
-	body, truncated, readErr := readLimitedBody(resp.Body, maxAgentResponseBodyBytes)
+	responseLimit := s.agentResponseBodyLimit()
+	body, truncated, readErr := readLimitedBody(resp.Body, responseLimit)
 	if resp.StatusCode >= 300 {
 		detail := excerpt(string(body), 500)
 		if truncated {
-			detail = first(detail, "response body") + fmt.Sprintf(" (truncated at %d bytes)", maxAgentResponseBodyBytes)
+			detail = first(detail, "response body") + fmt.Sprintf(" (truncated at %d bytes)", responseLimit)
 		}
 		if detail == "" && readErr != nil {
 			detail = readErr.Error()
@@ -193,10 +194,17 @@ func (s *Server) postAgent(path string, payload any, timeout time.Duration) ([]b
 	if truncated {
 		return nil, &AgentError{
 			Kind: agentErrBodyTooBig,
-			Err:  fmt.Errorf("body exceeded %d bytes", maxAgentResponseBodyBytes),
+			Err:  fmt.Errorf("body exceeded %d bytes", responseLimit),
 		}
 	}
 	return body, nil
+}
+
+func (s *Server) agentResponseBodyLimit() int64 {
+	if s != nil && s.agentResponseMaxBytes > 0 {
+		return s.agentResponseMaxBytes
+	}
+	return maxAgentResponseBodyBytes
 }
 
 func readLimitedBody(body io.Reader, limit int64) ([]byte, bool, error) {

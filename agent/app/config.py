@@ -163,6 +163,9 @@ class Settings:
     # spend internal reasoning tokens and emit their requested 1-2 sentences.
     llm_insight_max_tokens: int = 512
     llm_model_insight: str = ""
+    # Keep the complete /analyze JSON below the backend transport ceiling. The
+    # response boundary compacts raw evidence before operator-facing RCA text.
+    analysis_response_max_bytes: int = 1572864
     # Deprecated no-op retained only for Settings(...) compatibility. The
     # re-analysis loop stops on semantic completion or the outer deadline.
     max_investigation_iterations: int = 0
@@ -320,6 +323,10 @@ def load_settings() -> Settings:
         # (finish_reason=length), raise this rather than shrinking the prompt.
         llm_synthesis_max_tokens=_int_env("LLM_SYNTHESIS_MAX_TOKENS", 8192),
         llm_insight_max_tokens=_int_env("LLM_INSIGHT_MAX_TOKENS", 512),
+        analysis_response_max_bytes=max(
+            64 << 10,
+            _int_env("ANALYSIS_RESPONSE_MAX_BYTES", 1572864),
+        ),
         nat_config_file=os.getenv("NAT_CONFIG_FILE", "configs/runai_rca_engine.yml").strip(),
         # Run analysis through the in-process NAT engine.
         enable_nat_runtime=_bool_env("ENABLE_NAT_RUNTIME", True),
