@@ -1,147 +1,127 @@
-# Knowledge Base
+# 지식 베이스
 
-> **관점:** 에이전트가 인시던트를 보기 *전에* 이미 아는 것 — 모든 RCA의 근거가 되는
-> 큐레이션된 카탈로그와 온톨로지 그래프입니다.
-> **이 문서에서 다루는 것:** 다섯 개의 큐레이션 카탈로그 · 플랫폼 아키텍처 토폴로지 ·
-> 파일 ↔ TypeDB 이중 로드 · 인제스트(적재) 및 지식 승격 · 그래프 질의.
+> **쉽게 말하면:** 지식 베이스는 팀의 시니어 엔지니어 노트입니다. AI가 인시던트를 보기 전에
+> 믿을 만한 맥락을 제공하지만, 지금 시스템에서 수집한 사실을 대신하지는 않습니다.
 
-큐레이션된 지식은 **이중 로드**됩니다: `agent/app/knowledge.py`의 파일 매처
-(**TypeDB 없이도** 동작 — 항상 사용 가능)와, 동일한 사실을 그래프로 미러링하는
-TypeDB 로더(`agent/ontology/load_*.py`)입니다. 불변 규칙은 다음과 같습니다: TypeDB가
-꺼진 상태에서도 RCA는 완전히 동작하며, TypeDB는 "켜면 더 똑똑해지는" 계층일 뿐 결코
-강한 의존성이 아닙니다.
+알림에는 “GPU 비정상”처럼 짧은 말만 있을 수 있습니다. 숙련된 운영자는 어떤 컴포넌트를 봐야
+하는지, 어떤 증상이 중요한지, 어떤 과거 조치를 참고할 수 있는지 압니다. 지식 베이스는 이
+공통 경험을 버전 관리되는 카드와 선택 사항인 TypeDB 관계 그래프로 담습니다. 현재 사실은
+언제나 live collector가 결정합니다.
 
-## 큐레이션 카탈로그
+## 1. 알림 전에 Agent가 아는 것
 
-모두 `agent/knowledge/` 아래에 있으며 에이전트 이미지에 함께 배포됩니다.
-
-| 카탈로그 | 파일 | 인식 기준 | 용도 |
-|---|---|---|---|
-| **Failure modes** | `failure_modes.yaml` | 증상 키워드(모든 패밀리 대상) | 증상별 정확한 조치 방안 |
-| **Run:ai known issues** | `runai_known_issues.yaml` | 시그니처 키워드, 버전 인식 | 특정 버그 + 영향/수정 버전을 헤드라인으로 표시 |
-| **Built-in alerts** | `runai_alerts_catalog.yaml` | 알림 이름 | 문서화된 Run:ai 알림과 그 수정 방안 인식 |
-| **NVIDIA XID catalog** | `xid_catalog.yaml` | XID 코드 | GPU 하드웨어 결함 경로 + 인과 체인 |
-| **Platform architecture** | `runai_architecture.yaml` | 컴포넌트 이름(증상의 `component:` 태그 경유) | 의존성 점검 경로 + DB 스키마 힌트 |
-| **Kubernetes 진단 runbook** | `k8s_troubleshooting_tree.yaml` | 순서가 있는 증거 조건 | 시니어 SRE 질문·경쟁 분기·반증·조치 |
-
-매칭은 부분 문자열 우선(정확)이며, 아무것도 매칭되지 않을 때 보수적인 **BM25 + 동의어**
-재현율 폴백(`agent/app/bm25.py`)이 동작합니다 —
-[RCA Pipeline](RCA-PIPELINE.md)을 참조하십시오.
-
-### 근본 원인 패밀리 (15개)
-
-이 분류 체계는 온톨로지의 척추이자 정직성 게이트입니다. 결정론적 랭커는 그 일부만
-점수화하며, **시그니처 승격**이 나머지를 헤드라인으로 표시합니다(따라서 랭커가 지목할 수
-없는 `gpu_hardware_error`와 known-issue 패밀리도 여전히 노출됩니다).
-
-`node_kubelet_pressure`, `runai_scheduling_quota`, `k8s_scheduling_error`,
-`runai_control_plane_error`, `k8s_control_plane_error`, `workload_startup_error`,
-`image_pull_error`, `gpu_hardware_error`, `network_fabric_error`,
-`cluster_network_error`, `k8s_storage_error`, `storage_backend_error`,
-`workload_runtime_error`, `observability_accuracy`, `platform_auth_error`
-(+ `insufficient_evidence`).
-
-패밀리 추가 = `schema.tql` 서브타입 + `failure_modes.yaml` 블록 + 두 로더의
-`FAMILIES` 집합 + 오케스트레이터의 `_family_label`/`_FAMILY_EXPLANATION`. 랭커는
-건드리지 않습니다. 가드레일 테스트가 스키마 ↔ 로더 동기화를 강제합니다.
-
-## 플랫폼 아키텍처 토폴로지
-
-`knowledge/runai_architecture.yaml`은 Run:ai 플랫폼/컨트롤 플레인 아키텍처 다이어그램에서
-큐레이션한 컴포넌트 맵이며, 이름은 **실제 self-hosted 클러스터에 맞춰 보정**되었습니다
-(`kubectl get deploy,ds,sts -n runai / -n runai-backend`). 클러스터 측과 `runai-backend`
-컨트롤 플레인에 걸쳐 약 35개 컴포넌트가 있습니다. 각 항목:
-
-| 필드 | 의미 |
-|---|---|
-| `layer` | `cluster` · `control_plane` · `external` |
-| `purpose` / `failure_effect` | 하는 일 / 다운되면 무엇이 깨지는지 |
-| `depends_on` | 필요로 하는 컴포넌트 — 트러블슈팅 순서 |
-| `owns_schema` | 소유하는 컨트롤 플레인 Postgres 스키마 |
-| `checks` | 즉시 실행 가능한 `kubectl` 명령 |
-
-세 개의 소비자(`agent/app/knowledge.py`):
-
-1. **점검 경로** — `failure_modes.yaml` 증상은 `component:`를 지닙니다. 플레이북은 해당
-   컴포넌트의 실패 영향, `dependency_path()` BFS 점검 순서, 그리고 그 점검들을
-   렌더링합니다.
-2. **DB 스키마 힌트** — postgres 드릴다운의 `sql_select` 설명이 스키마 소유권으로
-   보강됩니다(`workloads = runai-backend-workloads; audit =
-   runai-backend-audit-service; …`).
-3. **그래프 조인** — 향후 라이브 인시던트 사실과의 조인을 위해 TypeDB로 미러링됩니다
-   (`control_plane_component` + `depends_on`).
-
-## TypeDB 온톨로지
-
-선택적 TypeDB 3.x 지식 그래프(`typedb.enabled`, Helm 기본값 **on**)는 pgvector 유사도와
-레이블 중첩으로는 표현할 수 없는 관계형 추론을 오케스트레이터에 제공합니다. 스키마:
-`agent/ontology/schema.tql`. 이는 계획 전에 collector 지침을 만들 때와 합성 시점에
-**오케스트레이터에 의해** 참조됩니다 — 별도의 에이전트가 아니며, 병렬 수집기도 아닙니다.
-
-**계층**
-- *인프라 / 토폴로지* — `cluster`, `node`, `namespace`, `project`, `queue`,
-  `workload`, `pod`, `control_plane_component` (`depends_on` 포함).
-- *인시던트 / RCA* — `alert`, `incident`(이전 RCA를 질의할 수 있도록 `analysis_summary`를
-  소유), `analysis_run`.
-- *지식* — `symptom`(`keyword` 소유), `root_cause`, `action`, 그리고 `leads_to` 인과
-  체인을 가진 `xid_error` GPU 결함 카탈로그.
-- *실행형 진단* — `runbook`, `diagnostic_step`, 순서가 있는
-  `diagnostic_transition`, `diagnostic_outcome`, `diagnostic_recommendation`.
-
-**추론 함수**(`ontology/functions.tql`, TypeQL 3.11.x로 검증):
-`fixes_for_family`, `fixes_for_xid`, `xids_for_gpu_model`, `root_xids_for`와
-live symptom family 조회, component/XID 재귀 경로, 승인 이력의 verified action 조회가
-포함됩니다. 전체 모델과 Studio 쿼리는 [온톨로지 가이드](ONTOLOGY-GUIDE.md)를 참고하세요.
-
-수집 전에 planner는 매칭된 그래프 경로를 질문·점검·반증·경쟁 분기가 담긴 작은
-`diagnostic_directive`로 변환합니다. 모든 collector는 자신이 주 담당인지 보조 담당인지가
-표시된 사본을 받으며, 잠정 family는 지침일 뿐 관찰 증거로 취급되지 않습니다.
-
-같은 함수 집합에는 runbook entry, 다음 단계, outcome, action, 반증, family→step 역조회도
-포함됩니다. 런타임은 TypeDB runbook을 우선 읽고 TypeDB가 불가할 때만 YAML을
-fallback으로 사용합니다.
-
-### 데이터가 들어오는 방식
-
-| 경로 | 로더 | 소스 | 게이트 |
-|---|---|---|---|
-| Schema + functions | `load_schema` / `load_functions` | `schema.tql` / `functions.tql` | Helm post-install/upgrade 훅 |
-| Curated knowledge | `load_knowledge`, `load_troubleshooting`, `load_xids`, `load_alerts`, `load_known_issues`, `load_architecture` | 위의 카탈로그들 | 버전 관리되는 파일, 스키마 잡에서 실행 |
-| Incidents + topology | `ontology/ingest.py` (cron) | Postgres incident, run, artifact | Dashboard 승인 + `resolvedGraceHours` 경과; 기본 `requireApproval=true` |
-| Knowledge promotion | `ingest.py --promote-knowledge` | 승인된 non-abstained RCA | 운영자가 효과를 확인한 action만 verified remedy가 됨 |
-
-인제스트 **CronJob**(`typedb.ingest.schedule`, 기본 3시간마다)은 Dashboard에서 승인된
-resolved 인시던트를 그래프로 투영합니다. 유예 창은 늦은 피드백과 재분석이 안정되도록 하며,
-재발화된 인시던트는 `firing`으로 되돌아가 제외됩니다. `requireReview`는 deprecated이며
-`requireApproval`을 사용합니다.
-
-### 그래프 질의
-
-`ontology/query.py`는 읽기 전용 인트로스펙션 CLI입니다 — TypeQL을 직접 작성하지 않고도
-인제스트가 실제로 무엇을 투영했는지 확인합니다:
-
-```bash
-kubectl exec -n <ns> deploy/<release>-agent -- \
-  python -m ontology.query --incident INC-...-000023   # one incident
-kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --recent 20
-kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --count
+```mermaid
+flowchart TB
+  subgraph Curated[버전 관리되는 큐레이션 지식]
+    F[families.yaml\n공통 어휘]
+    M[failure_modes.yaml\n증상과 조치]
+    X[xid_catalog.yaml\nGPU 장애 시그니처]
+    K[known issue와 alert 카탈로그]
+    A[runai_architecture.yaml\n컴포넌트와 의존성]
+    R[진단 runbook]
+  end
+  Curated --> PY[파일 매처\n항상 사용 가능]
+  Curated --> T[선택 사항 TypeDB 그래프]
+  H[운영자 승인 인시던트 이력] --> T
+  PY --> P[플래너와 증거 에이전트]
+  T --> P
+  P --> L[Live collector가 사실 수립]
 ```
 
-또는 서버를 포트 포워딩하여(`kubectl port-forward svc/<release>-typedb 1729:1729
-8000:8000`) **TypeDB Studio**를 연결하고 `localhost:1729`(db `runai_rca`,
-`admin`/`password`, TLS off)에 접속하십시오. 예시 — 어떤 알림에 대한 이전 인시던트,
-`enrich()`가 실행하는 바로 그 질의:
+| 계층 | 쉬운 설명 | 주된 출처 | 도움되는 일 |
+| --- | --- | --- | --- |
+| 어휘 | 제품이 말할 수 있는 장애 종류의 이름 | `families.yaml` | 일관된 RCA 레이블 |
+| 시그니처 카드 | 구체적 단어, XID, 증상, 점검, 해결책 | `failure_modes.yaml`, XID/issue/alert 카탈로그 | 올바른 조사 경로 찾기 |
+| 토폴로지 | 플랫폼 컴포넌트의 의존 관계 | `runai_architecture.yaml` | 올바른 순서로 서비스 점검 |
+| 승인 이력 | 사람이 검토한 과거 사례 | Backend Postgres → TypeDB | 증명이 아닌 레이블된 문맥 제공 |
 
-```typeql
-match
-  $a isa alert, has alert_name "Memory major page faults ...";
-  (incident: $i, member: $a) isa grouped_into;
-  $i isa incident, has incident_id $iid, has analysis_summary $sum;
-select $iid, $sum;
+그림은 왼쪽에서 오른쪽으로 읽으면 됩니다. 큐레이션 파일은 TypeDB가 꺼져도 작동합니다.
+그래프는 “이 컴포넌트가 저 컴포넌트에 의존한다” 또는 “승인 사례가 이 패밀리였다” 같은
+관계를 더하지만, collector를 대체하지는 않습니다.
+
+### 어휘를 일관되게 유지하기
+
+`families.yaml`과 `failure_modes.yaml`은 하나의 failure-family 어휘를 공유합니다. 새 family를
+추가할 때는 두 파일 **모두**와 `agent/app/knowledge.py`의 builtin catalog mirror를 수정해야
+합니다. schema/loader 테스트가 이 일치를 검사합니다. family ranker는 지식을 검색하지 않고,
+정밀 매치가 발견된 뒤 후보 순서와 대략적인 원인 설명만 제공합니다.
+
+## 2. 지식이 시스템에 들어오는 방법
+
+```mermaid
+flowchart LR
+  C[엔지니어가 큐레이션 YAML 카드 수정] --> V[검토와 버전 관리]
+  V --> F[Agent 이미지의 파일 매처]
+  V --> G[스키마/지식 로드 작업]
+  G --> T[(TypeDB)]
+  I[완료된 인시던트] --> A{운영자가 승인했는가?}
+  A -->|아니오| N[감사용 실행 기록 유지\nprior로 사용하지 않음]
+  A -->|예| S{해결됨 및 grace\n조건 충족?}
+  S -->|예| P[마스킹된 CaseSnapshot + 승인 조치]
+  S -->|아니오| W[대기 또는 unresolved 문맥 유지]
+  P --> T
 ```
 
-## 함께 보기
+| 유입 경로 | 승인 필요? | 남기는 내용 |
+| --- | --- | --- |
+| 큐레이션 카탈로그 | 코드/콘텐츠 검토 | 통제된 시그니처, 점검, 토폴로지 |
+| 인시던트 메모리 | **예: `user_approved_at`** | 마스킹된 승인 스냅샷과 증거 참조 |
+| 지식 패키지 | 승인/활성화 워크플로 | 검증된 요약과 기존 probe-template ID |
 
-- [온톨로지 및 데이터 적재 가이드](ONTOLOGY-GUIDE.md) — 모든 엔티티, 관계, 속성과 적재 규칙.
-- [Data Stores](DATABASE.md) — 두 저장소에 대한 테이블 수준 참조.
-- [RCA Pipeline](RCA-PIPELINE.md) — 이 지식이 분석 중에 어떻게 소비되는지.
+이는 의도적으로 보수적입니다. 승인되지 않은 분석은 담당 운영자에게는 유용할 수 있어도
+유사 인시던트 prior가 되거나 지식으로 ingest되지 않습니다. 승인은 “이 사례에서 배워도
+안전하다”는 사람의 확인입니다. 원시 로그, 자격 증명, 임의 명령은 TypeDB로 복사하지 않습니다.
+
+## 3. 분석 중 지식이 사용되는 방법
+
+```mermaid
+flowchart LR
+  A[알림 + 로그 텍스트 + 대상 이름] --> S[정밀 시그니처 매치\n모든 family]
+  A --> C[컴포넌트 ID 매치\npod/workload → 토폴로지]
+  S --> D[지식 카드: 점검, 해결책, 반증]
+  C --> D
+  D --> P[플래너가 diagnostic directive 생성]
+  P --> E[증거 에이전트가 등록된\n읽기 전용 도구만 실행]
+  E --> B[증거 blackboard]
+  B --> V[Live evidence를 인용한 판정]
+  H[승인된 과거 사례] -. 레이블된 문맥만 .-> V
+```
+
+검색의 시작점은 **정밀 시그니처 매치**입니다. 큐레이션 증상, NVIDIA XID 코드, 알림 텍스트,
+known issue를 *모든* family에서 찾습니다. exact 매치가 우선이고 BM25/동의어 리콜은 보수적인
+폴백입니다. family ranker는 이후 순서만 돕기 때문에 다른 family의 정밀 카드를 숨길 수 없습니다.
+
+컴포넌트 이름도 별도 진입점입니다. 예를 들어 `nvidia-driver-daemonset-...` Pod 알림은 오류
+문자열이 없어도 GPU Operator 의존성 체인에 도달할 수 있습니다. directive에는 질문, 점검,
+반증, 선언형 probe template이 담깁니다. placeholder는 alert scope에서만 채워집니다. 이것은
+shell 명령이 아니며, 각 Agent의 읽기 전용 tool registry가 실제 권한 경계입니다.
+
+## 4. 전체 예시: NVIDIA Xid 79
+
+**상황:** 워크로드 알림에 `NVRM: Xid ... 79`, “GPU has fallen off the bus”가 나타납니다.
+
+| 단계 | 시스템이 하는 일 | 운영자가 보는 것 |
+| --- | --- | --- |
+| 1. 인식 | XID/시그니처 카드가 `79`를 `gpu_hardware_error`로 매핑 | 일반적인 “노드 문제”가 아닌 구체적 GPU 후보 |
+| 2. 안내 | 카드가 driver/GPU 점검을, 토폴로지가 NVIDIA driver/GPU Operator 경로를 제공 | 순서가 있는 읽기 전용 점검과 반증 조건 |
+| 3. 수집 | System, Kubernetes, Loki, Prometheus Agent가 각자 허용된 증거 평면을 조회 | 시간 있는 Xid 라인, 노드 상태, 메트릭 증거 카드 |
+| 4. 판정 | blackboard가 지지와 반증을 비교 | RCA evidence ID, 신뢰도, 다음 점검 또는 `insufficient_evidence` |
+
+카드는 GPU가 실패했다고 선언하지 않습니다. 그 주장을 믿을 만하게 만드는 조건과 반대 증거를
+알려 줍니다. live evidence가 없거나 모순되면 리포트는 신중하게 유지됩니다.
+
+## 5. 자세히 보기: 선택 사항 TypeDB 보강
+
+TypeDB는 큐레이션 토폴로지와 승인 이력을 미러링하여 오케스트레이터가 “이 컴포넌트에 무엇이
+의존하는가?”, “이 노드를 공유하는 워크로드는 무엇인가?”, “승인된 유사 사례가 있는가?”를
+묻게 합니다. 선택 사항이므로 사용할 수 없으면 Agent는 경고를 남기고 YAML/Python 경로로
+계속 동작합니다.
+
+큐레이션 사실은 이중으로 로드됩니다. `agent/app/knowledge.py`는 파일을 직접 사용하고,
+`agent/ontology/load_*.py`는 같은 사실을 TypeDB에 미러링합니다. 토폴로지 항목에는 layer,
+purpose, failure effect, `depends_on` 경로, `owns_schema`, 안전한 점검 텍스트도 들어갑니다.
+따라서 Postgres drill-down은 스키마 소유권을 설명할 수 있고, 런타임은 진단 runbook을
+TypeDB에서 먼저 로드한 뒤 그래프를 사용할 수 없을 때만 인접 YAML로 폴백합니다.
+
+승인 흐름은 [Learning and Ontology](LEARNING-AND-ONTOLOGY.md), 그래프 모델과 TypeDB 쿼리는
+[Ontology Guide](ONTOLOGY-GUIDE.md)를 참고하세요.

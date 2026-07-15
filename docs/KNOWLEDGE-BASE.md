@@ -1,152 +1,138 @@
 # Knowledge Base
 
-> **Lens:** What the Agent *knows* before it sees an incident — the curated
-> catalogs and the ontology graph that ground every RCA.
-> **In this doc:** the five curated catalogs · platform-architecture topology ·
-> file ↔ TypeDB dual-load · ingestion & knowledge promotion · querying the graph.
+> **In plain language:** this is the team's senior engineer's notebook. It gives
+> the Agent dependable context before an incident, but it never substitutes that
+> context for facts collected from the live system.
 
-Curated knowledge is **dual-loaded**: a file matcher in
-`agent/app/knowledge.py` (works with **no TypeDB** — always available) *and* a
-TypeDB loader (`agent/ontology/load_*.py`) that mirrors the same facts into the
-graph. The invariant: RCA is fully functional with TypeDB off; TypeDB is the
-"turn it on to get smarter" layer, never a hard dependency.
+The knowledge base solves a practical problem: an alert may say only “GPU
+unhealthy,” while an experienced operator knows which component to inspect,
+which symptom is meaningful, and which old fix is safe to consider. The Agent
+stores that shared experience in version-controlled cards and, optionally, in a
+TypeDB relationship graph. Live collectors still decide what is true now.
 
-## Curated catalogs
+## 1. What the Agent knows before an alert
 
-All live under `agent/knowledge/` and ship in the agent image.
-
-| Catalog | File | Recognised by | Used for |
-|---|---|---|---|
-| **Failure modes** | `failure_modes.yaml` | symptom keywords (across all families) | precise remediation actions per symptom |
-| **Run:ai known issues** | `runai_known_issues.yaml` | signature keywords, version-aware | headline the specific bug + affected/fixed version |
-| **Built-in alerts** | `runai_alerts_catalog.yaml` | alert name | recognise a documented Run:ai alert and its fix |
-| **NVIDIA XID catalog** | `xid_catalog.yaml` | XID code | GPU-hardware fault path + causal chains |
-| **Platform architecture** | `runai_architecture.yaml` | component name (via symptom `component:` tag) | dependency check paths + DB schema hints |
-| **Kubernetes diagnostic runbook** | `k8s_troubleshooting_tree.yaml` | ordered evidence conditions | senior-SRE questions, competing branches, disconfirmation, actions |
-
-Matching is substring-first (precise) with a conservative **BM25 + synonym**
-recall fallback (`agent/app/bm25.py`) when nothing matches — see the
-[RCA Pipeline](RCA-PIPELINE.md#5-signature-matching--bm25-recall--ranking).
-
-### Root-cause families (15)
-
-The taxonomy is the ontology spine and the honesty gate. The deterministic ranker
-scores a subset; **signature promotion** headlines the rest (so
-`gpu_hardware_error` and the known-issue families still surface even though the
-ranker cannot nominate them).
-
-`node_kubelet_pressure`, `runai_scheduling_quota`, `k8s_scheduling_error`,
-`runai_control_plane_error`, `k8s_control_plane_error`, `workload_startup_error`,
-`image_pull_error`, `gpu_hardware_error`, `network_fabric_error`,
-`cluster_network_error`, `k8s_storage_error`, `storage_backend_error`,
-`workload_runtime_error`, `observability_accuracy`, `platform_auth_error`
-(+ `insufficient_evidence`).
-
-Adding a family = `schema.tql` sub-type + `failure_modes.yaml` block + both loader
-`FAMILIES` sets + orchestrator `_family_label`/`_FAMILY_EXPLANATION`. The ranker is
-not touched. Guardrail tests enforce schema ↔ loader sync.
-
-## Platform architecture topology
-
-`knowledge/runai_architecture.yaml` is the component map curated from the Run:ai
-platform/control-plane architecture diagrams, with names **calibrated against a
-live self-hosted cluster** (`kubectl get deploy,ds,sts -n runai / -n
-runai-backend`). ~35 components across the cluster side and the `runai-backend`
-control plane. Each entry:
-
-| Field | Meaning |
-|---|---|
-| `layer` | `cluster` · `control_plane` · `external` |
-| `purpose` / `failure_effect` | what it does / what breaks when it's down |
-| `depends_on` | components it needs — the troubleshooting order |
-| `owns_schema` | the control-plane Postgres schema it owns |
-| `checks` | ready-to-run `kubectl` commands |
-
-Three consumers (`agent/app/knowledge.py`):
-
-1. **Check paths** — `failure_modes.yaml` symptoms carry `component:`; the
-   playbook renders that component's failure effect, its `dependency_path()` BFS
-   check order, and its checks.
-2. **DB schema hints** — the postgres drill-down's `sql_select` description is
-   enriched with schema ownership (`workloads = runai-backend-workloads; audit =
-   runai-backend-audit-service; …`).
-3. **Graph joins** — mirrored to TypeDB (`control_plane_component` + `depends_on`)
-   for future joins with live incident facts.
-
-## TypeDB ontology
-
-An optional TypeDB 3.x knowledge graph (`typedb.enabled`, Helm default **on**)
-gives the orchestrator relational reasoning that pgvector similarity and label
-overlap cannot express. Schema: `agent/ontology/schema.tql`. It is consulted
-**by the orchestrator** before planning (to inject neutral collector guidance)
-and again at synthesis — not by a separate agent or parallel collector.
-
-**Layers**
-- *Infra / topology* — `cluster`, `node`, `namespace`, `project`, `queue`,
-  `workload`, `pod`, `control_plane_component` (with `depends_on`).
-- *Incident / RCA* — `alert`, `incident` (owns `analysis_summary` so prior RCA is
-  queryable), `analysis_run`.
-- *Knowledge* — `symptom` (owns `keyword`), `root_cause`, `action`, plus the
-  `xid_error` GPU-fault catalog with `leads_to` causal chains.
-- *Executable diagnostics* — `runbook`, `diagnostic_step`, ordered
-  `diagnostic_transition`, `diagnostic_outcome`, and `diagnostic_recommendation`.
-
-**Reasoning functions** (`ontology/functions.tql`, validated TypeQL 3.11.x):
-`fixes_for_family`, `fixes_for_xid`, `xids_for_gpu_model`, `root_xids_for`,
-live-symptom family lookup, recursive component/XID paths, and approved-history
-verified-action lookup. The full model and Studio checks are in the
-[Ontology & Ingestion Guide](ONTOLOGY-GUIDE.md).
-
-Before collection, the planner converts the matched graph path into a compact
-`diagnostic_directive` (questions, checks, disconfirmation, competing branches).
-Every collector receives a source-specific copy marked as primary or supporting;
-the provisional family is guidance, never observed evidence.
-
-The same function set also provides runbook entry, next-step, outcome, action,
-disconfirmation, and family-to-step lookups. Runtime loads the runbook from
-TypeDB first; the adjacent YAML is used only when TypeDB is unavailable.
-
-### How data gets in
-
-| Path | Loader | Source | Gate |
-|---|---|---|---|
-| Schema + functions | `load_schema` / `load_functions` | `schema.tql` / `functions.tql` | Helm post-install/upgrade hook |
-| Curated knowledge | `load_knowledge`, `load_troubleshooting`, `load_xids`, `load_alerts`, `load_known_issues`, `load_architecture` | the catalogs above | version-controlled files, run in the schema job |
-| Incidents + topology | `ontology/ingest.py` (cron) | Postgres incidents, runs, artifacts | dashboard-approved + resolved ≥ `resolvedGraceHours`; `requireApproval=true` by default |
-| Knowledge promotion | `ingest.py --promote-knowledge` | approved non-abstained RCAs | only operator-confirmed effective actions become verified remedies |
-
-The ingest **CronJob** (`typedb.ingest.schedule`, default every 3h) projects
-dashboard-approved resolved incidents into the graph. The grace window lets
-late feedback and re-analysis settle; re-fired incidents flip back to `firing`
-and are excluded. `requireReview` is deprecated; use `requireApproval`.
-
-### Querying the graph
-
-`ontology/query.py` is a read-only introspection CLI — verify what the ingest
-actually projected without hand-writing TypeQL:
-
-```bash
-kubectl exec -n <ns> deploy/<release>-agent -- \
-  python -m ontology.query --incident INC-...-000023   # one incident
-kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --recent 20
-kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --count
+```mermaid
+flowchart TB
+  subgraph Curated[Curated, version-controlled knowledge]
+    F[families.yaml\ncommon vocabulary]
+    M[failure_modes.yaml\nsymptoms and actions]
+    X[xid_catalog.yaml\nGPU fault signatures]
+    K[known issues and alert catalog]
+    A[runai_architecture.yaml\ncomponents and dependencies]
+    R[diagnostic runbook]
+  end
+  Curated --> PY[File matcher\nalways available]
+  Curated --> T[Optional TypeDB graph]
+  H[Operator-approved incident history] --> T
+  PY --> P[Planner and evidence agents]
+  T --> P
+  P --> L[Live collectors establish facts]
 ```
 
-Or connect **TypeDB Studio** by port-forwarding the server
-(`kubectl port-forward svc/<release>-typedb 1729:1729 8000:8000`) and connecting
-to `localhost:1729` (db `runai_rca`, `admin`/`password`, TLS off). Example — prior
-incidents for an alert, the exact query `enrich()` runs:
+| Layer | Plain meaning | Main source | What it helps with |
+| --- | --- | --- | --- |
+| Vocabulary | Names for the kinds of failure the product can discuss | `families.yaml` | Consistent RCA labels |
+| Signature cards | Specific words, XID codes, symptoms, checks, and fixes | `failure_modes.yaml`, XID/issue/alert catalogs | Find the right investigation path |
+| Topology | What a platform component depends on | `runai_architecture.yaml` | Check the right service in the right order |
+| Approved history | Human-reviewed past cases | Backend Postgres → TypeDB | Offer labelled context, never proof |
 
-```typeql
-match
-  $a isa alert, has alert_name "Memory major page faults ...";
-  (incident: $i, member: $a) isa grouped_into;
-  $i isa incident, has incident_id $iid, has analysis_summary $sum;
-select $iid, $sum;
+Read the diagram left to right. Curated files work even when TypeDB is off. The
+graph adds relationships—such as “this component depends on that one” or “this
+approved case had this family”—but does not make a collector optional.
+
+### Keeping the vocabulary consistent
+
+`families.yaml` and `failure_modes.yaml` share one failure-family vocabulary.
+When adding a family, update both files **and** the built-in catalog mirror in
+`agent/app/knowledge.py`; schema/loader tests enforce that agreement. The family
+ranker does not retrieve knowledge. It merely orders candidates and provides a
+coarse cause narrative after precise matches have been found.
+
+## 2. How knowledge enters the system
+
+```mermaid
+flowchart LR
+  C[Engineer edits a curated YAML card] --> V[Review and version control]
+  V --> F[File matcher in agent image]
+  V --> G[Schema/knowledge load job]
+  G --> T[(TypeDB)]
+  I[Completed incident] --> A{Operator approved?}
+  A -->|No| N[Keep run for audit\nnever use as prior]
+  A -->|Yes| S{Eligible resolved case\nafter grace period?}
+  S -->|Yes| P[Masked CaseSnapshot + approved actions]
+  S -->|No| W[Wait or retain unresolved context]
+  P --> T
 ```
 
-## See also
+| Entry path | Approval needed? | What is retained |
+| --- | --- | --- |
+| Curated catalog | Code/content review | Controlled signatures, checks, topology |
+| Incident memory | **Yes: `user_approved_at`** | Masked approved snapshot and evidence references |
+| Knowledge package | Approval/activation workflow | Validated summaries and existing probe-template IDs |
 
-- [Ontology & Ingestion Guide](ONTOLOGY-GUIDE.md) — every entity, relation, attribute, and ingestion rule.
-- [Data Stores](DATABASE.md) — table-level reference for both stores.
-- [RCA Pipeline](RCA-PIPELINE.md) — how this knowledge is consumed during analysis.
+This is deliberately conservative. An unapproved analysis can be useful to its
+operator, but it never becomes a similar-incident prior and is never ingested as
+knowledge. Approval is the human statement: “this is safe to teach from.” Raw
+logs, credentials, and arbitrary commands are not copied into TypeDB.
+
+## 3. How knowledge is used during an analysis
+
+```mermaid
+flowchart LR
+  A[Alert + log text + target name] --> S[Fine-grained signature match\nall families]
+  A --> C[Component identity match\npod/workload → topology]
+  S --> D[Knowledge card: checks, fixes, disconfirmations]
+  C --> D
+  D --> P[Planner creates diagnostic directive]
+  P --> E[Evidence agents run only\nread-only registered tools]
+  E --> B[Evidence blackboard]
+  B --> V[Verdict cites live evidence]
+  H[Approved historical cases] -. labelled context only .-> V
+```
+
+The retrieval entry point is the **fine-grained signature match**. It searches
+curated symptoms, NVIDIA XID codes, alert text, and known issues across *all*
+families. Exact matches lead; BM25/synonym recall is only a conservative fallback.
+The family ranker then helps order the matches; it is not a gate and cannot hide
+a precise card from another family.
+
+A component name is another entry point. For example, an alert about a
+`nvidia-driver-daemonset-...` Pod can reach the GPU Operator dependency chain
+even if no error string arrives. The directive contains questions, checks,
+disconfirmations, and declarative probe templates. Placeholders are filled only
+from alert scope. It is guidance, not a shell command: each agent's read-only
+tool registry remains the enforcement boundary.
+
+## 4. Worked example: NVIDIA Xid 79
+
+**Situation:** a workload alert arrives with `NVRM: Xid ... 79` and “GPU has
+fallen off the bus.”
+
+| Step | What the system does | What the operator sees |
+| --- | --- | --- |
+| 1. Recognise | The XID/signature card matches `79` and maps to `gpu_hardware_error` | A specific GPU-hardware candidate, not a generic “node problem” |
+| 2. Guide | The card supplies driver/GPU checks and the topology points to the NVIDIA driver/GPU Operator path | A playbook section with ordered, read-only checks and disconfirmations |
+| 3. Collect | System, Kubernetes, Loki, and Prometheus agents query their own allowed evidence planes | Evidence cards such as a timestamped Xid line, node condition, or metric |
+| 4. Decide | The blackboard compares support and refutation; the verdict can cite only live evidence | RCA evidence IDs, confidence, and a next check—or `insufficient_evidence` |
+
+The card does not declare the GPU failed. It says what would make that claim
+credible and what would argue against it. If the live evidence is missing or
+contradictory, the report stays cautious.
+
+## 5. In depth: optional TypeDB enrichment
+
+TypeDB mirrors curated topology and approved history so the orchestrator can ask
+relationship questions: “what depends on this component?”, “which workloads
+share this node?”, or “which approved cases resemble this alert?” It is optional.
+When unavailable, the Agent warns and continues through the YAML/Python path.
+
+Curated facts are dual-loaded: `agent/app/knowledge.py` uses the files directly,
+and `agent/ontology/load_*.py` mirrors the same facts into TypeDB. A topology
+entry also carries its layer, purpose, failure effect, `depends_on` path,
+`owns_schema`, and safe check text. That lets the Postgres drill-down describe
+schema ownership and lets the runtime load the diagnostic runbook from TypeDB
+first, falling back to adjacent YAML only when the graph is unavailable.
+
+See [Learning and Ontology](LEARNING-AND-ONTOLOGY.md) for the approval story and
+[Ontology Guide](ONTOLOGY-GUIDE.md) for the graph model and TypeDB queries.
