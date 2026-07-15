@@ -334,7 +334,16 @@ func (s *Server) retryPendingSlackAnalysisDeliveries(now time.Time) {
 
 func slackAnalysisDeliveryID(run AnalysisRun) string {
 	attemptStarted := run.CreatedAt.UTC().Format(time.RFC3339Nano)
-	sum := sha256.Sum256([]byte("runai-rca/slack/" + run.RunID + "/" + attemptStarted))
+	// A manual re-analysis reuses its durable run row. CreatedAt usually
+	// distinguishes attempts, but coarse host clocks can assign two attempts the
+	// same timestamp. Include the immutable completed payload too, so an older
+	// automatic completion never aliases the later manual delivery in the outbox.
+	completedAt := run.UpdatedAt.UTC().Format(time.RFC3339Nano)
+	payload := strings.Join([]string{
+		"runai-rca/slack", run.RunID, attemptStarted, completedAt,
+		run.Source, run.Title, run.AnalysisSummary, run.AnalysisDetail,
+	}, "\x00")
+	sum := sha256.Sum256([]byte(payload))
 	// Slack accepts a client-generated UUID as client_msg_id. Make this a stable
 	// RFC 4122-shaped v5 identifier so a retry is deduplicated server-side.
 	sum[6] = (sum[6] & 0x0f) | 0x50
@@ -560,7 +569,11 @@ func (s *Store) SlackAnalysisDeliveryPredatesThread(incidentID string, threadTS 
 				continue
 			}
 			root := slackDeliveryFromEntry(entry, true).Run
-			return !root.CreatedAt.IsZero() && snapshot.CreatedAt.Before(root.CreatedAt)
+			// Analysis attempts can be created within the same clock tick. In that
+			// case the immutable completion snapshot is the only ordering signal
+			// available here, so keep it rather than silently losing a delayed
+			// automatic result behind the manual root.
+			return !root.CreatedAt.IsZero() && !snapshot.CreatedAt.After(root.CreatedAt)
 		}
 	}
 	// Legacy roots have no attempt provenance. Preserve the historical policy
