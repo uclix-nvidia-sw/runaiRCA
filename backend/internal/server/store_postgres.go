@@ -353,16 +353,6 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			UNIQUE (run_id, analysis_hash)
 		)`,
-		`CREATE TABLE IF NOT EXISTS novel_cause_registry (
-			mechanism_fingerprint TEXT PRIMARY KEY,
-			canonical_family TEXT NOT NULL,
-			mechanism TEXT NOT NULL DEFAULT '',
-			schema_version INTEGER NOT NULL DEFAULT 1,
-			aliases JSONB NOT NULL DEFAULT '[]'::jsonb,
-			merged_into TEXT NOT NULL DEFAULT '',
-			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-		)`,
 		`CREATE TABLE IF NOT EXISTS knowledge_candidates (
 			candidate_id TEXT PRIMARY KEY,
 			case_id TEXT NOT NULL,
@@ -1458,12 +1448,6 @@ func (s *Store) persistCaseSnapshotAndKnowledgeCandidateLocked(snapshot *CaseSna
 			_ = tx.Rollback()
 		}
 	}()
-	if strings.HasPrefix(snapshot.RootCauseFamily, "novel_") && snapshot.MechanismFingerprint != "" {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO novel_cause_registry (mechanism_fingerprint, canonical_family, mechanism, schema_version, aliases, merged_into) VALUES ($1, $2, $3, 1, '[]'::jsonb, '') ON CONFLICT (mechanism_fingerprint) DO NOTHING`, snapshot.MechanismFingerprint, snapshot.RootCauseFamily, snapshot.Mechanism); err != nil {
-			log.Printf("Failed to persist novel cause registry %s: %v", snapshot.MechanismFingerprint, err)
-			return false
-		}
-	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO rca_case_snapshots (case_id, incident_id, alert_id, run_id, analysis_hash, approval_state, root_cause_family, mechanism, mechanism_fingerprint, snapshot, approved_at, revoked_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (case_id) DO NOTHING`, snapshot.CaseID, snapshot.IncidentID, snapshot.AlertID, snapshot.RunID, snapshot.AnalysisHash, snapshot.ApprovalState, snapshot.RootCauseFamily, snapshot.Mechanism, snapshot.MechanismFingerprint, mustJSON(snapshot.Snapshot), snapshot.ApprovedAt, snapshot.RevokedAt); err != nil {
 		log.Printf("Failed to persist RCA case snapshot %s: %v", snapshot.CaseID, err)
 		return false
@@ -1966,24 +1950,6 @@ func (s *Store) persistCaseSnapshotLifecycleLocked(snapshot *CaseSnapshot) bool 
 	)
 	if err != nil {
 		log.Printf("Failed to update RCA case snapshot lifecycle %s: %v", snapshot.CaseID, err)
-		return false
-	}
-	return true
-}
-
-func (s *Store) persistNovelCauseRegistryLocked(snapshot *CaseSnapshot) bool {
-	if s.db == nil || !s.dbReady || snapshot == nil || snapshot.MechanismFingerprint == "" {
-		return true
-	}
-	_, err := s.execPostgres(
-		`INSERT INTO novel_cause_registry (
-			mechanism_fingerprint, canonical_family, mechanism, schema_version, aliases, merged_into
-		) VALUES ($1, $2, $3, 1, '[]'::jsonb, '')
-		ON CONFLICT (mechanism_fingerprint) DO NOTHING`,
-		snapshot.MechanismFingerprint, snapshot.RootCauseFamily, snapshot.Mechanism,
-	)
-	if err != nil {
-		log.Printf("Failed to persist novel cause registry %s: %v", snapshot.MechanismFingerprint, err)
 		return false
 	}
 	return true
