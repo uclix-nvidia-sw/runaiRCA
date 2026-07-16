@@ -1,0 +1,295 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:054f8fea402b
+  source_revision_hash: sha256:389ed288f999d09d22e70339b3d967f17b8b26dc69f32e83c262c65cbbcc4268
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_with_warnings
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+incident:
+  title: runai-go-operator-tls-secret ownership conflict during runai-cluster upgrade
+  masked_summary: A runai-cluster 2.24.65 to 2.24.67 Helm upgrade failed on a managed-by
+    label field-ownership conflict for an operator TLS Secret. Deleting the Secret
+    and retrying was followed by automatic recreation and successful upgrade completion.
+    Support described a known Helm-upgrade interaction and a future permanent-fix
+    effort, but no Engineering final RCA or fixed release was supplied.
+  status: mitigated
+  occurred_at: null
+  resolved_at: null
+  family: platform_lifecycle_change
+  family_confidence: high
+  observed_mechanism: Helm apply failed because helm-hooks-handler held ownership
+    of the app.kubernetes.io/managed-by label on runai-go-operator-tls-secret.
+  observed_mechanism_confidence: high
+  confirmed_mechanism: Support attributed the failure to an internal pre-upgrade process
+    and Helm contending for the same metadata label on the TLS Secret.
+  confirmed_mechanism_confidence: medium
+searchable_context:
+  normalized_symptoms:
+  - runai-cluster Helm upgrade failed on Kubernetes Secret field ownership conflict
+  - operator TLS Secret deletion followed by automatic recreation and successful upgrade
+    retry
+  metric_signatures: []
+  error_signatures:
+  - 'conflict occurred while applying object runai/runai-go-operator-tls-secret /v1,
+    Kind=Secret: Apply failed with 1 conflict: conflict with "helm-hooks-handler"
+    using v1: .metadata.labels.app.kubernetes.io/managed-by'
+  issue_references: []
+  canonical_component_tokens:
+  - runai-operator
+  version_tokens:
+  - runai-cluster:2.24.65
+  - runai-cluster:2.24.67
+  - helm:3.19.0
+  trigger_tokens:
+  - runai-cluster upgrade
+  - helm upgrade
+  - pre-upgrade process
+  retrieval_keywords:
+  - runai-go-operator-tls-secret
+  - helm-hooks-handler
+  - app.kubernetes.io/managed-by
+  - field ownership conflict
+  - runai-config-mutation
+  - TLS certificate recreation
+  - Helm upgrade 2.24.67
+evidence_refs:
+- evidence_id: E001
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: The upgrade from 2.24.65 to 2.24.67 failed while applying the runai-go-operator-tls-secret
+    Secret because of a field-manager conflict on the managed-by label.
+  supports:
+  - F001
+  - H001
+- evidence_id: E002
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: The customer deleted the secret, retried the upgrade, observed automatic
+    secret recreation, and reported successful upgrade completion.
+  supports:
+  - F002
+  - H001
+  - A001
+- evidence_id: E003
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: The customer raised the possibility that upgrading only runai-cluster
+    without runai-backend could have caused the conflict.
+  supports:
+  - H002
+- evidence_id: E004
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support stated that an internal pre-upgrade process updates the
+    secret metadata labels and that a known interaction with Helm causes ownership
+    conflict on app.kubernetes.io/managed-by.
+  supports:
+  - F003
+  - H001
+- evidence_id: E005
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support stated that deletion is a valid workaround, that Helm recreates
+    the TLS secret and updates the runai-config-mutation CA bundle, and that existing
+    running workloads are not affected; RunaiConfig mutations may be temporarily unavailable.
+  supports:
+  - F004
+- evidence_id: E006
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support described the behavior as a known Helm-upgrade issue, said
+    it had been escalated to Engineering for a future permanent fix, and recommended
+    deleting the secret and retrying as the interim workaround.
+  supports:
+  - F006
+- evidence_id: E007
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support stated that the cluster-only patch upgrade from 2.24.65
+    to 2.24.67 was not the cause and that the conflict was local to the cluster upgrade
+    path.
+  supports:
+  - H002
+- evidence_id: E008
+  source_message_ids:
+  - M005
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Quoted helm version output reported Helm v3.19.0, clean Git tree
+    state, and Go v1.24.7.
+  supports:
+  - A002
+- evidence_id: E009
+  source_message_ids:
+  - M006
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support relayed Engineering requests to determine whether --server-side
+    was used and to collect the full upgrade command and Helm release history.
+  supports:
+  - H003
+  - A003
+- evidence_id: E010
+  source_message_ids:
+  - M007
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: The customer supplied the 2.24.67 and 2.24.65 Helm upgrade commands
+    and stated that --server-side was not used.
+  supports:
+  - F005
+  - H003
+  - A003
+- evidence_id: E011
+  source_message_ids:
+  - M007
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Customer stated that a text file containing helm history was attached.
+  supports:
+  - A004
+- evidence_id: E012
+  source_message_ids:
+  - M008
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support relayed Engineering questions about CLI versus automation
+    and Helm environment overrides such as HELM_DRIVER or custom plugins.
+  supports:
+  - H004
+  - A005
+- evidence_id: E013
+  source_message_ids:
+  - M009
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Customer stated that Helm was run directly from the CLI, without
+    ArgoCD, Flux, CI/CD, wrapper tooling, or intentionally configured environment
+    overrides.
+  supports:
+  - F005
+  - H004
+  - A005
+- evidence_id: E014
+  source_message_ids:
+  - M009
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Quoted helm env output showed standard Helm paths, HELM_DEBUG=false,
+    HELM_NAMESPACE=default, and no HELM_DRIVER line in the quoted output.
+  supports:
+  - F005
+  - H004
+  - A005
+- evidence_id: E016
+  source_message_ids:
+  - M003
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: The customer accepted the Support explanation and requested that
+    the case be closed.
+  supports: []
+- evidence_id: E015
+  source_message_ids:
+  - M010
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support reiterated administrative closure without providing a final
+    Engineering analysis, issue identifier, permanent fix, or fixed release.
+  supports:
+  - F006
+historical_actions:
+- action_id: A001
+  normalized_action: Delete runai-go-operator-tls-secret and retry the runai-cluster
+    Helm upgrade during a controlled upgrade window.
+  outcome: mitigating
+  verified: true
+  evidence_ids:
+  - E002
+- action_id: A003
+  normalized_action: Capture the exact Helm upgrade command and verify whether --server-side
+    was used.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E009
+  - E010
+- action_id: A004
+  normalized_action: Capture helm history for the runai-cluster release.
+  outcome: diagnostic
+  verified: false
+  evidence_ids:
+  - E011
+knowledge_links:
+  known_issue_matches: []
+  failure_mode_matches:
+  - catalog_entry: Helm Release Recently Changed
+    catalog_family: platform_lifecycle_change
+    match_type: exact_symptom_only
+    confidence: high
+  family_candidates:
+  - family: platform_lifecycle_change
+    confidence: high
+  - family: runai_control_plane_error
+    confidence: low
+historical_use:
+  context_class: mitigated_context
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - action_reference
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: This case can guide investigation of similar Helm/Secret ownership
+    conflicts and controlled workaround planning, but it contains a workaround-based
+    mitigation rather than a supplied permanent fix or direct Engineering-confirmed
+    RCA.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false

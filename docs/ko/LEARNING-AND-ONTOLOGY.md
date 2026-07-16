@@ -116,5 +116,30 @@ Backend Postgres가 패키지 승인, 활성화, 은퇴의 권위자입니다. `
 `reject`/`retired`는 런타임 사용에서 제외합니다. TypeDB package-mirror CronJob은 그래프 질의를
 위해 요약과 승인된 template binding을 복사할 뿐 활성화 상태를 바꾸지 않습니다.
 
+## 6. 외부 지원 사례 prior
+
+어떤 교훈은 우리 클러스터 밖 — 큐레이션된 엔터프라이즈 지원 사례 — 에서 옵니다.
+마스킹된 v2.0 payload로 도착하며, **외부 참고 사례일 뿐 증거가 아닌 것**으로 다룹니다:
+
+- **커밋 전 비식별화.** 원본 번들에는 실제 지원 케이스 번호가 들어 있습니다.
+  `agent/knowledge/external_cases/sanitize.py`가 번호를 모든 곳(identity, manifest
+  파일명, 산문)에서 제거하고, 케이스 키를 불투명 해시로 바꾸고, 타임스탬프를 날짜로
+  뭉갭니다. 비식별화된 사본만 커밋됩니다 — known-issues 카탈로그와 같은
+  "기록이 아니라 교훈을 공개" 관행입니다. 번호가 남은 파일은 sanitizer가 출력을
+  거부합니다.
+- **승인은 명시적.** Helm 스키마 로드 Job은 운영자가 지정한 승인자
+  (`typedb.externalCases.approvedBy`)가 있을 때만 로더를 실행하고, 그 값을 모든 사례에
+  기록합니다 — 1절과 동일한 승인 게이트입니다.
+- **지식 계층 권위가 될 수 없음.** TypeDB에는 사례 로컬 symptom을 가진 라벨된 case
+  snapshot으로 들어가지만, 로더는 지식 계층이 요구하는 `indicates`/`resolved_by` 엣지를
+  구조적으로 절대 만들지 않으므로, 원인을 단정하는 카탈로그 규칙이 될 수 없습니다.
+- **에러 시그니처로 검색.** 이후 분석은 에러 시그니처(예: `ibv_modify_qp failed with 19
+  No such device`)가 그 실행의 관측 증거에 실제로 나타날 때만 사례를 표면화합니다. 그때
+  사용 등급(`evaluation_only`, `mitigated_context`, `unresolved_context`)이 붙은 과거
+  맥락으로 나타납니다. 시도된 조치 — **효과가 없었던** 것 포함 — 는 "과거 외부 사례에서
+  시도됨"으로만 표시되며, 현재 사건의 검증된 해결책으로는 절대 제시되지 않습니다.
+
+비식별화 계약과 사례 추가 방법은 `agent/knowledge/external_cases/README.md`를 참고하세요.
+
 카탈로그 지도는 [Knowledge Base](KNOWLEDGE-BASE.md), entity/relation 및 안전한 TypeDB Studio
 점검은 [Ontology Guide](ONTOLOGY-GUIDE.md)를 참고하세요.

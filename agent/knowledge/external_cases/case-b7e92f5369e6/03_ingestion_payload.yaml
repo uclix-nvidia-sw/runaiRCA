@@ -1,0 +1,229 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:b7e92f5369e6
+  source_revision_hash: sha256:9abff39f7d340e51e9e6bb0010acf2a536675cf07f9e03c93a3dfb2fbcc9fe22
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_with_warnings
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+incident:
+  title: DataVolume-backed workload blocked by NFS export access denial
+  masked_summary: A workload using a cloned DataVolume failed at the CSI/NFS mount
+    step with an access-denied response, while direct use of the source PVC reportedly
+    worked. Support attributed the difference to access rules on the newly provisioned
+    storage export. The case was closed without a verified fix because the feature
+    would not be used.
+  status: unresolved
+  occurred_at: '2026-03-16'
+  resolved_at: null
+  family: storage_backend_error
+  family_confidence: medium
+  observed_mechanism: A DataVolume-backed workload reached the Kubernetes/CSI NFS
+    mount step and the NFS server rejected the newly provisioned export with an access-denied
+    response, while direct use of the source PVC was reported to mount successfully.
+  observed_mechanism_confidence: medium
+  confirmed_mechanism: null
+  confirmed_mechanism_confidence: low
+searchable_context:
+  normalized_symptoms:
+  - DataVolume-backed workload does not reach Running because volume mount fails
+  - Direct source PVC mount succeeds but cloned DataVolume mount fails
+  - NFS server denies access to newly provisioned export during CSI mount
+  metric_signatures: []
+  error_signatures:
+  - 'MountVolume.SetUp failed for volume <volume>: mount failed: exit status 32'
+  - 'mount.nfs: access denied by server while mounting <nfs-server>:<export-path>'
+  issue_references: []
+  canonical_component_tokens: []
+  version_tokens: []
+  trigger_tokens:
+  - DataVolume clone of source PVC
+  - dynamic provisioning of a new PV and NFS export
+  retrieval_keywords:
+  - Run:ai DataVolume
+  - PVC clone
+  - CSI mount
+  - NFS export access denied
+  - Isilon
+  - PowerScale
+  - dynamic PV provisioning
+  - workload startup failure
+evidence_refs:
+- evidence_id: E001
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Direct PVC use reportedly worked while DataVolume-backed use failed
+    to mount and the workload did not start.
+  supports:
+  - F001
+  - H001
+- evidence_id: E002
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Quoted kubelet/CSI event shows mount exit status 32 and NFS server
+    access denied for the new export.
+  supports:
+  - F002
+  - H001
+- evidence_id: E003
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: PVC and DataVolume list screenshots were referenced but not supplied.
+  supports:
+  - F005
+- evidence_id: E004
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Workload events and pod description output were referenced but not
+    supplied.
+  supports:
+  - F005
+- evidence_id: E005
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support stated that DataVolume cloning produces a distinct PV and
+    NFS export through the storage driver.
+  supports:
+  - F003
+- evidence_id: E006
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support diagnosed incorrectly applied client permissions on the
+    newly created storage export.
+  supports:
+  - H001
+- evidence_id: E007
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support proposed export-rule, CSI configuration, RDMA, and working-versus-failing
+    export comparisons.
+  supports:
+  - H003
+  - A001
+  - A002
+  - A003
+  - A004
+- evidence_id: E008
+  source_message_ids:
+  - M003
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: The customer-side participant tentatively linked automatic PV provisioning
+    and stated the feature would not be used.
+  supports:
+  - H002
+  - F004
+  - A005
+- evidence_id: E009
+  source_message_ids:
+  - M004
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support closed the case without documenting a technical correction.
+  supports:
+  - F004
+  - A005
+historical_actions:
+- action_id: A001
+  normalized_action: Verify NFS export access rules on the storage backend.
+  outcome: diagnostic
+  verified: false
+  evidence_ids:
+  - E007
+- action_id: A002
+  normalized_action: Review storage driver configuration for dynamically created export
+    permissions.
+  outcome: diagnostic
+  verified: false
+  evidence_ids:
+  - E007
+- action_id: A003
+  normalized_action: Verify RDMA support for the NFS mount path.
+  outcome: diagnostic
+  verified: false
+  evidence_ids:
+  - E007
+- action_id: A004
+  normalized_action: Compare access settings between a working export and the failing
+    cloned export.
+  outcome: diagnostic
+  verified: false
+  evidence_ids:
+  - E007
+- action_id: A005
+  normalized_action: Stop using the DataVolume feature and close the case.
+  outcome: unknown_outcome
+  verified: true
+  evidence_ids:
+  - E008
+  - E009
+knowledge_links:
+  known_issue_matches: []
+  failure_mode_matches:
+  - catalog_entry: CSI Mount RPC Timeout / Driver Not Registered
+    catalog_family: k8s_storage_error
+    match_type: exact_symptom_only
+    confidence: medium
+  - catalog_entry: Volume Attach/Mount Failure
+    catalog_family: k8s_storage_error
+    match_type: partial
+    confidence: medium
+  family_candidates:
+  - family: storage_backend_error
+    confidence: medium
+  - family: k8s_storage_error
+    confidence: medium
+  - family: network_fabric_error
+    confidence: low
+historical_use:
+  context_class: unresolved_context
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - action_reference
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: The case contains a useful comparative symptom and a support diagnosis,
+    but no executed fix or post-fix validation. It may guide investigation only as
+    labelled unresolved historical context.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false

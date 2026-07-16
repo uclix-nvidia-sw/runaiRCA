@@ -1,0 +1,296 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:e38f69ff583a
+  source_revision_hash: sha256:9191b79ba370ed9af928df875b7bd5f162f9f76e4d64ebfb6f22a092f9e60bfc
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_with_warnings
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+incident:
+  title: Thanos Receive OOMKilled; stable after CPU resource increase
+  masked_summary: Run:ai Thanos Receive repeatedly exceeded a 64 GB memory limit under
+    a large reported metrics ingestion workload. Increasing CPU request/limit while
+    leaving memory unchanged was followed by reported stability, but the original
+    memory-growth trigger was not confirmed.
+  status: mitigated
+  occurred_at: null
+  resolved_at: null
+  family: observability_accuracy
+  family_confidence: high
+  observed_mechanism: Repeated Thanos Receive OOMKilled coexisted with a large ingestion
+    workload; additional CPU with unchanged memory was followed by stability, supporting
+    CPU-limited processing as a contributing mechanism.
+  observed_mechanism_confidence: medium
+  confirmed_mechanism: null
+  confirmed_mechanism_confidence: low
+searchable_context:
+  normalized_symptoms:
+  - thanos receive OOMKilled
+  - repeated metrics receive pod restart
+  - memory limit exceeded at 64 GB
+  - post-restart TSDB/WAL replay
+  metric_signatures:
+  - prometheus_tsdb_head_series≈3.6M
+  - remote_write≈151k_samples_per_second
+  - large scrape sources include kubelet/node-exporter/kube-state-metrics/DCGM/workload-exporter
+  error_signatures:
+  - OOMKilled
+  - out-of-sequence memory-mapped chunk (reported, raw log unavailable)
+  issue_references: []
+  canonical_component_tokens:
+  - runai-backend-thanos-receive
+  - prometheus-runai
+  - workload-exporter
+  version_tokens:
+  - runai-control-plane:2.23.31
+  - runai-cluster:2.23.31
+  trigger_tokens:
+  - large metrics ingestion workload
+  - possible CPU-limited ingestion processing
+  - unconfirmed cardinality growth
+  retrieval_keywords:
+  - Thanos Receive
+  - OOMKilled
+  - Prometheus remote write
+  - TSDB head series
+  - WAL replay
+  - CPU request limit
+  - memory pressure
+  - metric ingestion backlog
+  - mitigated context
+evidence_refs:
+- evidence_id: E001
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: The pod repeatedly restarted after exceeding a 64 GB memory limit
+    and being terminated as OOMKilled; memory had increased sharply.
+  supports:
+  - F001
+  - A001
+- evidence_id: E003
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: The customer stated that relevant logs were attached.
+  supports: []
+- evidence_id: E004
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support reported OOMKilled at 64 GB plus TSDB/WAL replay and an
+    out-of-sequence memory-mapped chunk after restart, while stating that the original
+    memory-spike trigger was not identified.
+  supports:
+  - F001
+  - F002
+  - F007
+- evidence_id: E005
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support proposed that recently added workloads, NIM/Knative services,
+    ServiceMonitors, or high-cardinality metrics could increase active series and
+    Thanos Receive memory.
+  supports:
+  - H001
+- evidence_id: E006
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support requested verification of whether an external Prometheus
+    or monitoring system also remote-wrote to the endpoint.
+  supports:
+  - H002
+- evidence_id: E007
+  source_message_ids:
+  - M003
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: The customer referenced a compressed archive containing Prometheus
+    query results.
+  supports:
+  - A002
+- evidence_id: E008
+  source_message_ids:
+  - M003
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: The customer referenced screenshots for head series, remote-write
+    samples, scrape samples, and series added.
+  supports:
+  - A002
+- evidence_id: E009
+  source_message_ids:
+  - M003
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: The checked configuration showed the Run:ai Prometheus remote-writing
+    to the masked Run:ai receive endpoint; no additional external Prometheus or monitoring
+    system was identified.
+  supports:
+  - F003
+  - H002
+  - A003
+- evidence_id: E010
+  source_message_ids:
+  - M004
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: CPU request/limit changed from 2/8 to 4/16; memory request remained
+    16G and memory limit remained 64G.
+  supports:
+  - F005
+  - H003
+  - A004
+- evidence_id: E011
+  source_message_ids:
+  - M004
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: not_applicable
+  masked_summary: After the CPU increase, the pod remained stable and was not OOMKilled
+    during the reported observation period.
+  supports:
+  - F006
+  - H003
+  - A004
+- evidence_id: E012
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support reported approximately 3.6M active head series, approximately
+    151k samples/sec, and large scrape sources including kubelet, node-exporter, kube-state-metrics,
+    DCGM exporter, and Run:ai workload-exporter.
+  supports:
+  - F004
+  - H001
+  - H003
+  - A002
+- evidence_id: E013
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support stated that insufficient CPU can indirectly increase memory
+    pressure when incoming samples, WAL work, TSDB head operations, or compaction
+    fall behind, but characterized the CPU change as stabilization rather than the
+    original root cause.
+  supports:
+  - F007
+  - H003
+  - A005
+- evidence_id: E014
+  source_message_ids:
+  - M006
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: not_applicable
+  masked_summary: The customer reported continued stability, planned ongoing monitoring,
+    and requested closure with reopen-on-recurrence.
+  supports:
+  - F006
+  - A005
+historical_actions:
+- action_id: A001
+  normalized_action: Increase Thanos Receive memory limit to 64 GB.
+  outcome: unknown_outcome
+  verified: false
+  evidence_ids:
+  - E001
+- action_id: A002
+  normalized_action: Collect Prometheus head-series, remote-write rate, scrape-sample,
+    and series-added diagnostics.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E007
+  - E008
+  - E012
+- action_id: A003
+  normalized_action: Check for additional external remote-write senders.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E009
+- action_id: A004
+  normalized_action: Increase CPU request/limit from 2/8 to 4/16 while leaving memory
+    limit at 64 GB.
+  outcome: mitigating
+  verified: true
+  evidence_ids:
+  - E010
+  - E011
+  - E014
+- action_id: A005
+  normalized_action: Continue monitoring memory usage, restart count, and ingestion
+    volume.
+  outcome: preventive
+  verified: false
+  evidence_ids:
+  - E013
+  - E014
+knowledge_links:
+  known_issue_matches: []
+  failure_mode_matches:
+  - catalog_entry: OOMKilled
+    catalog_family: workload_startup_error
+    match_type: exact_symptom_only
+    confidence: high
+  - catalog_entry: No Metrics — Thanos Down
+    catalog_family: observability_accuracy
+    match_type: partial
+    confidence: medium
+  family_candidates:
+  - family: observability_accuracy
+    confidence: high
+  - family: workload_startup_error
+    confidence: medium
+  - family: runai_control_plane_error
+    confidence: low
+historical_use:
+  context_class: mitigated_context
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - action_reference
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: The case provides useful symptom, diagnostic, and mitigation context,
+    but the original trigger was not confirmed and stability was observed only under
+    continued mitigation.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false

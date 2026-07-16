@@ -1,0 +1,264 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:173dd3098018
+  source_revision_hash: sha256:64d14f4b260c47c0c027ec1df8c325096d0fdb16a2089476d65ace6ad6807e2a
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_with_warnings
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+incident:
+  title: Scheduler consolidation reallocated a running distributed workload
+  masked_summary: Two scheduler consolidation events selected a lower-priority distributed
+    workload as the victim for incoming workloads from higher-priority projects. Support
+    attributed the behavior to priority hierarchy plus over-quota configuration, but
+    the diagnostic archive is unavailable and no corrective action or recurrence check
+    is documented.
+  status: unresolved
+  occurred_at: '2025-09-25'
+  resolved_at: null
+  family: runai_scheduling_quota
+  family_confidence: high
+  observed_mechanism: Scheduler consolidation entries listed the distributed workload
+    master and workers as reallocation victims, and the customer reported stop/restart
+    behavior.
+  observed_mechanism_confidence: high
+  confirmed_mechanism: Support attributed victim selection to project priority hierarchy
+    combined with over-quota configuration in a shared department queue.
+  confirmed_mechanism_confidence: medium
+searchable_context:
+  normalized_symptoms:
+  - running distributed workload stopped and restarted after scheduler consolidation
+  - scheduler selected running workload pods as reallocation victims
+  - cross-project scheduling interference despite reported free capacity
+  metric_signatures: []
+  error_signatures:
+  - consolidation/consolidation.go:107 successfully consolidated for job and about
+    to reallocate victims
+  issue_references: []
+  canonical_component_tokens:
+  - runai-scheduler-default
+  version_tokens: []
+  trigger_tokens:
+  - higher project priority
+  - over-quota configuration disparity
+  - shared department queue
+  - scheduler consolidation
+  retrieval_keywords:
+  - Run:ai scheduler consolidation
+  - reallocation victims
+  - priority preemption
+  - over-quota weight
+  - project quota
+  - distributed training restart
+evidence_refs:
+- evidence_id: E001
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Customer reported two stop/restart events and stated no OOM or hardware
+    cause had been identified.
+  supports:
+  - F001
+- evidence_id: E002
+  source_message_ids:
+  - M002
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: First quoted scheduler consolidation entry lists the distributed
+    workload pods as victims.
+  supports:
+  - F001
+  - F006
+  - H001
+- evidence_id: E003
+  source_message_ids:
+  - M002
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Second quoted scheduler consolidation entry again lists the same
+    distributed workload pods as victims.
+  supports:
+  - F001
+  - F006
+  - H001
+- evidence_id: E004
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Customer supplied qualitative project priority and over-quota labels.
+  supports:
+  - F007
+- evidence_id: E005
+  source_message_ids:
+  - M004
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support requested scheduler diagnostic collection.
+  supports:
+  - A001
+- evidence_id: E006
+  source_message_ids:
+  - M005
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Customer reported attaching the requested diagnostic archive, which
+    is absent from this bundle.
+  supports:
+  - F004
+  - A001
+- evidence_id: E007
+  source_message_ids:
+  - M006
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support reported numeric priority, quota, over-quota weight, and
+    usage values; the victim project was reported below quota.
+  supports:
+  - F002
+  - F003
+  - F007
+  - H001
+  - H002
+- evidence_id: E008
+  source_message_ids:
+  - M006
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support final diagnosis attributed consolidation to priority hierarchy
+    plus over-quota configuration.
+  supports:
+  - F004
+  - H001
+  - H002
+- evidence_id: E009
+  source_message_ids:
+  - M006
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support described lower priority, no over-quota permission, shared
+    queue, and resource limits as victim-selection factors.
+  supports:
+  - H001
+- evidence_id: E010
+  source_message_ids:
+  - M006
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support proposed quota, limit, priority, isolation, resilience,
+    and capacity-planning actions.
+  supports:
+  - F005
+  - A002
+  - A003
+  - A004
+- evidence_id: E011
+  source_message_ids:
+  - M008
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Customer accepted the explanation and requested closure.
+  supports:
+  - F005
+- evidence_id: E012
+  source_message_ids:
+  - M009
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support administratively closed the case.
+  supports:
+  - F005
+historical_actions:
+- action_id: A001
+  normalized_action: Collect scheduler manifests and configuration with scheduler_info_dump.
+  outcome: diagnostic
+  verified: false
+  evidence_ids:
+  - E005
+  - E006
+- action_id: A002
+  normalized_action: Enable controlled over-quota usage for the lower-priority project.
+  outcome: unknown_outcome
+  verified: false
+  evidence_ids:
+  - E010
+- action_id: A003
+  normalized_action: Raise the project resource limit above quota to permit controlled
+    over-quota use.
+  outcome: unknown_outcome
+  verified: false
+  evidence_ids:
+  - E010
+- action_id: A004
+  normalized_action: Review priorities, isolate critical node pools, and improve checkpoint/restart
+    resilience.
+  outcome: preventive
+  verified: false
+  evidence_ids:
+  - E010
+knowledge_links:
+  known_issue_matches: []
+  failure_mode_matches:
+  - catalog_entry: Preempted By Higher Priority
+    catalog_family: runai_scheduling_quota
+    match_type: partial
+    confidence: medium
+  - catalog_entry: Over-Quota Contention
+    catalog_family: runai_scheduling_quota
+    match_type: partial
+    confidence: low
+  - catalog_entry: Reclaimed To Rebalance Fairshare
+    catalog_family: runai_scheduling_quota
+    match_type: partial
+    confidence: low
+  - catalog_entry: Node Defragmentation
+    catalog_family: runai_scheduling_quota
+    match_type: partial
+    confidence: low
+  family_candidates:
+  - family: runai_scheduling_quota
+    confidence: high
+  - family: k8s_scheduling_error
+    confidence: low
+historical_use:
+  context_class: unresolved_context
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - action_reference
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: The case provides a useful evidence-linked example of scheduler
+    consolidation and a Support diagnosis, but the raw diagnostic archive is missing
+    and no mitigation or permanent resolution was verified.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false

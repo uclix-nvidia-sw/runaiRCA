@@ -1,0 +1,353 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:4d72cf55055e
+  source_revision_hash: sha256:f07ba14e24f7a973179bf97a79448de3658181f5034b0357338ffc0cbc3c1dc9
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_with_warnings
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+incident:
+  title: Workloads UI request burst and slow workloads_view queries exhausted PostgreSQL
+    connections
+  masked_summary: 여러 Workloads Web UI 검색/필터 refresh가 장시간 실행된 workloads_view queries와
+    겹쳐 backend PostgreSQL connections가 소진되었다. workloads service restart는 즉시 복구했지만
+    예방 변경의 적용과 재검증은 확인되지 않았다.
+  status: mitigated
+  occurred_at: '2026-05-06'
+  resolved_at: null
+  family: runai_control_plane_error
+  family_confidence: high
+  observed_mechanism: workloads_view full-text/sort queries waited on BufFileWrite
+    while connections remained held, and continued workload-list requests accumulated
+    until SQLSTATE 53300.
+  observed_mechanism_confidence: medium
+  confirmed_mechanism: Support final analysis correlated the burst to Workloads Web
+    UI search/filter refreshes, including one approximately one-second browser session;
+    slow disk-spilling queries caused connection accumulation and max_connections
+    exhaustion.
+  confirmed_mechanism_confidence: medium
+searchable_context:
+  normalized_symptoms:
+  - sudden backend PostgreSQL connection spike
+  - workload listing failures
+  - long-running workloads_view queries
+  - PostgreSQL connection slot exhaustion
+  - temporary-file and BufFileWrite activity
+  metric_signatures:
+  - backend_postgresql_connections_peak_approximately_460
+  - backend_postgresql_connections_post_restart_approximately_80
+  - workloads_view_query_duration_over_60_seconds
+  - browser_refresh_interval_approximately_1_second
+  - postgresql_temporary_file_usage_reported_554_GiB
+  error_signatures:
+  - SQLSTATE 53300
+  - remaining connection slots are reserved for roles with the SUPERUSER attribute
+  - wait_event_type=IO
+  - wait_event=BufFileWrite
+  - Failed to list workloads
+  issue_references: []
+  canonical_component_tokens:
+  - runai-backend-frontend
+  - runai-backend-workloads
+  - runai-backend-postgres
+  version_tokens:
+  - runai-2.23.31
+  trigger_tokens:
+  - workloads-page-search-filter-refresh
+  - concurrent-workloads-page-users
+  - approximately-one-second-browser-refresh
+  retrieval_keywords:
+  - workloads_view
+  - BufFileWrite
+  - work_mem
+  - max_connections
+  - SQLSTATE 53300
+  - Workloads page
+  - full-text search
+  - temporary files
+  - connection exhaustion
+evidence_refs:
+- evidence_id: E001
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: DB 연결 수가 약 460개로 급증했고 runai-backend-workloads pod 재시작 후 약 80개로 감소해
+    안정화되었다고 고객이 보고했다.
+  supports:
+  - F001
+  - F005
+  - H001
+  - A001
+- evidence_id: E002
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: 대부분의 active query가 workloads_view를 조회했고 wait_event_type=IO, wait_event=BufFileWrite였다고
+    고객이 보고했다.
+  supports:
+  - F002
+  - F004
+  - H002
+- evidence_id: E003
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: workload 목록 조회가 PostgreSQL 연결 슬롯 고갈로 실패한 오류가 transcript에 인용되었다.
+  supports:
+  - F001
+  - H001
+  - H002
+- evidence_id: E004
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: project, cluster 및 full-text search_vector 조건과 정렬을 포함하는 workloads_view
+    SELECT 예시가 제공되었다.
+  supports:
+  - F002
+  - H001
+- evidence_id: E005
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support는 대량 API 요청, 요청별 DB 연결, 60초 이상 지속된 workloads_view 쿼리와 연결
+    누적을 초기 분석으로 제시했다.
+  supports:
+  - F004
+  - H001
+  - A002
+  - A003
+- evidence_id: E006
+  source_message_ids:
+  - M003
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: 고객은 Run:ai version 2.23.31을 사용 중이라고 밝혔다.
+  supports: []
+- evidence_id: E007
+  source_message_ids:
+  - M003
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: 고객이 log collector 및 ingress 로그 ZIP/TAR.GZ 파일들을 첨부한 것으로 transcript에
+    기록되어 있다.
+  supports:
+  - A002
+  - A003
+- evidence_id: E008
+  source_message_ids:
+  - M004
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: 고객은 DB connection count, temporary file bytes, buffer write activity가
+    incident day에 증가했다고 설명했다.
+  supports:
+  - F004
+  - H002
+  - A004
+  - A009
+- evidence_id: E009
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support final diagnosis는 Workloads Web UI의 검색/필터 요청이 원인이며 내부 component
+    또는 외부 API automation은 아니었다고 진술했다. 한 브라우저 세션은 약 1초 간격으로 refresh한 것으로 분석되었다.
+  supports:
+  - F003
+  - H001
+  - H004
+  - A003
+  - A008
+- evidence_id: E010
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support는 60초 이상 지속된 BufFileWrite 쿼리를 disk-spilling sort와 부족한 work_mem으로
+    해석하고, 요청 도착률이 완료율을 초과해 연결이 약 100에서 약 500으로 누적되어 max_connections가 소진되었다고 진단했다.
+  supports:
+  - F004
+  - H001
+  - H002
+  - A004
+- evidence_id: E011
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support는 연결이 leak된 것이 아니라 장기 실행 query가 합법적으로 점유한 것이며 pod 재시작이 보유
+    연결을 종료했다고 진단했다.
+  supports:
+  - F005
+  - A001
+- evidence_id: E012
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support는 work_mem 64-128MB, viewRefreshRateMilli 30000, workloads
+    pod CPU 2/Memory 2Gi 및 shared_buffers 검토를 권고했고 현재 max_connections 약 500, pod limits
+    CPU 500m/Memory 512Mi라고 진술했다.
+  supports:
+  - F006
+  - A005
+  - A006
+  - A007
+  - A008
+  - A009
+- evidence_id: E013
+  source_message_ids:
+  - M006
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: 고객은 권고사항을 검토하고 후속 조치를 진행하겠다고 했지만 적용 결과를 제공하지 않은 채 closure를 요청했다.
+  supports:
+  - F006
+- evidence_id: E014
+  source_message_ids:
+  - M007
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support는 티켓 종료에 동의했으며 추가 기술 재검증을 기록하지 않았다.
+  supports:
+  - F006
+- evidence_id: E015
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: 고객은 pod 재시작이 connection pool을 비운 것인지, connection leak 또는 long-running
+    query를 조사해야 하는지 질문했다.
+  supports: []
+historical_actions:
+- action_id: A001
+  normalized_action: runai-backend-workloads pod를 재시작해 보유 DB 연결을 종료한다.
+  outcome: mitigating
+  verified: true
+  evidence_ids:
+  - E001
+  - E011
+- action_id: A002
+  normalized_action: cluster log collector를 실행하고 생성된 archive를 Support에 제공한다.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E005
+  - E007
+  - E009
+- action_id: A003
+  normalized_action: 15:45-15:50 KST ingress-nginx access logs를 수집해 요청 출처를 상관분석한다.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E005
+  - E007
+  - E009
+- action_id: A004
+  normalized_action: PostgreSQL connection count, temporary file bytes 및 buffer write
+    Grafana panels를 제공한다.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E008
+  - E010
+- action_id: A005
+  normalized_action: PostgreSQL work_mem을 64MB-128MB 범위로 늘리는 방안을 검토한다.
+  outcome: preventive
+  verified: false
+  evidence_ids:
+  - E012
+- action_id: A006
+  normalized_action: 'runai-backend Helm values에 workloads.config.viewRefreshRateMilli:
+    30000을 설정해 materialized view 사용을 검토한다.'
+  outcome: preventive
+  verified: false
+  evidence_ids:
+  - E012
+- action_id: A007
+  normalized_action: runai-backend-workloads resources를 최소 CPU 2 / Memory 2Gi로 늘리는
+    방안을 검토한다.
+  outcome: preventive
+  verified: false
+  evidence_ids:
+  - E012
+- action_id: A008
+  normalized_action: 약 1초 refresh 세션의 사용자에게 multiple tabs 또는 automation 여부를 확인한다.
+  outcome: diagnostic
+  verified: false
+  evidence_ids:
+  - E009
+  - E012
+- action_id: A009
+  normalized_action: PostgreSQL shared_buffers 설정과 기존 I/O pressure를 검토한다.
+  outcome: diagnostic
+  verified: false
+  evidence_ids:
+  - E008
+  - E012
+knowledge_links:
+  known_issue_matches: []
+  failure_mode_matches:
+  - catalog_entry: Control-Plane Postgres Failing (many services at once)
+    catalog_family: runai_control_plane_error
+    match_type: partial
+    confidence: medium
+  - catalog_entry: Scheduler Or Reconcile Error
+    catalog_family: runai_control_plane_error
+    match_type: partial
+    confidence: low
+  family_candidates:
+  - family: runai_control_plane_error
+    confidence: high
+  - family: storage_backend_error
+    confidence: low
+historical_use:
+  context_class: mitigated_context
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - action_reference
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: 이 케이스는 request/query/connection causal chain을 조사 context로 제공하지만
+    restart는 mitigation이고 권고 변경의 적용 및 post-fix verification이 없어 resolved positive
+    prior로 사용할 수 없다.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false

@@ -1,0 +1,426 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:1f328ed5fa18
+  source_revision_hash: sha256:9919e445865faf27da3ac1495fb64db4441ecc7bb803d3c36d2b485d3fb440c8
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_with_warnings
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+incident:
+  title: GPU utilization values above 100 percent displayed in native Analytics
+  masked_summary: A Run:ai 2.22.27 environment showed random, sub-minute GPU utilization
+    outliers above 100 percent in native Analytics. A custom Grafana clamp mitigated
+    display impact. Product planned a native UI cap in 2.26 without backporting, but
+    deployment was not validated before case closure.
+  status: mitigated
+  occurred_at: '2025-08-26'
+  resolved_at: null
+  family: observability_accuracy
+  family_confidence: high
+  observed_mechanism: Out-of-range DCGM_FI_DEV_GPU_UTIL samples were present in Prometheus
+    and appeared as extreme native Analytics spikes.
+  observed_mechanism_confidence: medium
+  confirmed_mechanism: Support concluded the out-of-range metric reached native dashboards,
+    Helm reconciliation prevented persistent manual rule edits, and the planned product
+    handling was a 100-percent UI cap in 2.26; the lower-level invalid-value source
+    remained unconfirmed.
+  confirmed_mechanism_confidence: medium
+searchable_context:
+  normalized_symptoms:
+  - GPU compute utilization above 100 percent
+  - extreme short-lived Analytics spikes
+  - overall/project/node utilization inaccurate
+  - manual managed PrometheusRule edit not persistent
+  metric_signatures:
+  - DCGM_FI_DEV_GPU_UTIL > 100
+  - max_over_time(DCGM_FI_DEV_GPU_UTIL[30d]) > 100
+  - runai_dcgm_gpu_utilization
+  - clamp_max(runai_dcgm_gpu_utilization, 100)
+  error_signatures: []
+  issue_references:
+  - NVIDIA/dcgm-exporter#418
+  - NVIDIA/DCGM#199
+  - RUN-36505
+  - RUN-39130
+  canonical_component_tokens:
+  - prometheus-runai
+  - runai-backend-grafana
+  version_tokens:
+  - runai-backend 2.22.27
+  - runai-cluster 2.22.27
+  - Run:ai 2.23.36
+  - Run:ai 2.26
+  - NVIDIA driver 550.90.07
+  - NVIDIA H200
+  trigger_tokens:
+  - random sub-minute metric outlier
+  - out-of-range GPU utilization sample
+  retrieval_keywords:
+  - GPU utilization spike
+  - above 100 percent
+  - DCGM_FI_DEV_GPU_UTIL
+  - Run:ai Analytics
+  - PrometheusRule
+  - Helm reconciliation
+  - Grafana clamp_max
+  - RUN-39130
+  curated_signature_tokens:
+  - DCGM_FI_DEV_GPU_UTIL
+  - RUN-39130
+  - clamp_max
+evidence_refs:
+- evidence_id: E001
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Native Analytics displayed a transition from a normal utilization
+    range to an extremely large percentage on an affected node.
+  supports:
+  - F002
+- evidence_id: E002
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Both runai-backend and runai-cluster were reported as version 2.22.27.
+  supports: []
+- evidence_id: E003
+  source_message_ids:
+  - M003
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: A 30-day Prometheus query was quoted with values above 100 for multiple
+    distinct H200 nodes and GPUs.
+  supports:
+  - F001
+  - H001
+  - A001
+- evidence_id: E004
+  source_message_ids:
+  - M003
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Customer reported 181 GPU nodes with 8 NVIDIA H200 GPUs per server.
+  supports:
+  - F001
+- evidence_id: E005
+  source_message_ids:
+  - M003
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer quoted the runai_dcgm_gpu_utilization rule and the attempted
+    clamp_max expression.
+  supports:
+  - F005
+  - A002
+- evidence_id: E006
+  source_message_ids:
+  - M003
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: not_applicable
+  masked_summary: The customer reported that the manual clamp change did not take
+    effect.
+  supports:
+  - F005
+  - H003
+  - A002
+- evidence_id: E007
+  source_message_ids:
+  - M009
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support described an approximately 25-million-percent screenshot
+    spike and preliminarily stated that out-of-range DCGM_FI_DEV_GPU_UTIL values flowed
+    into Analytics.
+  supports:
+  - F002
+  - H001
+- evidence_id: E008
+  source_message_ids:
+  - M010
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Customer suspected the collected DCGM metric values were incorrect
+    but explicitly could not determine whether aggregation was involved.
+  supports:
+  - H001
+- evidence_id: E009
+  source_message_ids:
+  - M010
+  source_actor: external
+  evidence_kind: external_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Customer cited NVIDIA dcgm-exporter issue 418 and DCGM issue 199
+    as potentially similar reports.
+  supports: []
+- evidence_id: E010
+  source_message_ids:
+  - M010
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Three native Analytics screenshots were referenced for overall,
+    per-project, and per-node incorrect values.
+  supports:
+  - F002
+  - F003
+- evidence_id: E011
+  source_message_ids:
+  - M010
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Comparison screenshots were referenced to demonstrate outlier filtering
+    in a custom dashboard.
+  supports:
+  - F003
+  - F004
+  - A003
+- evidence_id: E012
+  source_message_ids:
+  - M010
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: GPU Operator, Run:ai, backend, reservation, and Knative log archives
+    were referenced as attached.
+  supports:
+  - F003
+  - A005
+- evidence_id: E013
+  source_message_ids:
+  - M010
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Spikes were reported as random, lasting less than one minute, and
+    affecting overall, project, and node utilization views; actual performance impact
+    was unknown.
+  supports:
+  - F002
+- evidence_id: E014
+  source_message_ids:
+  - M010
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: not_applicable
+  masked_summary: The requested in-container curl validation could not be completed
+    because curl was not available in the exporter container.
+  supports:
+  - F003
+  - A004
+- evidence_id: E015
+  source_message_ids:
+  - M011
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support stated that the named DCGM metric was reporting above 100
+    and that the manual PrometheusRule edit did not persist because Helm reconciliation
+    managed the resource.
+  supports:
+  - F005
+  - H001
+  - H003
+  - A002
+- evidence_id: E016
+  source_message_ids:
+  - M011
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support described the side-by-side workaround result as 54.3 percent
+    versus 2037 percent and instructed the customer to continue using the custom dashboard.
+  supports:
+  - F004
+  - A003
+- evidence_id: E018
+  source_message_ids:
+  - M017
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support relayed a product-team decision to cap the UI dashboard
+    at 100 percent in the upcoming 2.26 release.
+  supports:
+  - F006
+  - H004
+  - A006
+- evidence_id: E019
+  source_message_ids:
+  - M019
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support stated that the UI-cap change would not be backported to
+    versions earlier than 2.26.
+  supports:
+  - F006
+  - H004
+  - A006
+- evidence_id: E020
+  source_message_ids:
+  - M020
+  source_actor: customer
+  evidence_kind: release_note
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer quoted RUN-36505 describing a rare race condition in metrics
+    that could cause average GPU utilization above 100 percent.
+  supports:
+  - F007
+  - H002
+- evidence_id: E021
+  source_message_ids:
+  - M021
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support stated RUN-36505 was related only in part and identified
+    RUN-39130 as the internal Engineering case planned for 2.26.
+  supports:
+  - F007
+  - H002
+  - H004
+  - A006
+- evidence_id: E022
+  source_message_ids:
+  - M022
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Customer requested closure after clarification and did not report
+    that the 2.26 change had been deployed or verified.
+  supports:
+  - F008
+- evidence_id: E023
+  source_message_ids:
+  - M023
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support administratively closed the case at the customer request.
+  supports:
+  - F008
+- evidence_id: E024
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support proposed the runai_log_collector utility to collect cluster
+    and backend diagnostic archives.
+  supports:
+  - A005
+- evidence_id: E025
+  source_message_ids:
+  - M009
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support proposed a kubectl exec metric scrape plus GPU Operator
+    and Run:ai log collection commands.
+  supports:
+  - A004
+  - A005
+historical_actions:
+- action_id: A001
+  normalized_action: Query Prometheus for DCGM_FI_DEV_GPU_UTIL samples above 100 over
+    a historical window.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E003
+- action_id: A002
+  normalized_action: Apply clamp_max directly to the managed Run:ai Prometheus recording
+    rule.
+  outcome: ineffective
+  verified: false
+  evidence_ids:
+  - E005
+  - E006
+  - E015
+- action_id: A003
+  normalized_action: Use clamp_max on runai_dcgm_gpu_utilization in a custom Grafana
+    dashboard.
+  outcome: mitigating
+  verified: false
+  evidence_ids:
+  - E011
+  - E016
+- action_id: A004
+  normalized_action: Capture the metric directly from the dcgm-exporter endpoint.
+  outcome: unknown_outcome
+  verified: false
+  evidence_ids:
+  - E014
+  - E025
+- action_id: A005
+  normalized_action: Collect GPU Operator and Run:ai diagnostic archives.
+  outcome: diagnostic
+  verified: false
+  evidence_ids:
+  - E012
+  - E024
+  - E025
+- action_id: A006
+  normalized_action: Implement a native 100-percent UI cap in Run:ai 2.26.
+  outcome: unknown_outcome
+  verified: false
+  evidence_ids:
+  - E018
+  - E019
+  - E021
+knowledge_links:
+  known_issue_matches:
+  - repository_entry: Dashboard Analytics GPU Utilization Mismatch
+    match_type: partial
+    confidence: medium
+    rationale: Analytics GPU-utilization inaccuracy overlaps, but mechanism and fixed
+      version differ from RUN-39130.
+  failure_mode_matches:
+  - repository_entry: Partial GPU Metrics — DCGM
+    match_type: partial
+    confidence: medium
+    rationale: DCGM metric path overlap, but existing entry covers missing/zero metrics
+      rather than >100 outliers.
+  family_candidates:
+  - family: observability_accuracy
+    confidence: high
+historical_use:
+  context_class: mitigated_context
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - action_reference
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: The case provides a useful symptom pattern, diagnostic query, workaround,
+    and product-tracking context, but does not prove the source defect or verify a
+    permanent resolution.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false

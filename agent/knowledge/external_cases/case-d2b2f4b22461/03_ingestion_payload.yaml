@@ -1,0 +1,367 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:d2b2f4b22461
+  source_revision_hash: sha256:87ac60b3f7c9fd639b0d67d33208fabb4d7f0d042ac7c68647a04196d9570a8b
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_with_warnings
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+incident:
+  title: NCCL NVLS invalid argument after Fabric Manager/GPU registration desynchronization
+  masked_summary: On an HGX H200 Kubernetes node, NCCL NVLS multicast initialization
+    failed persistently with CUDA invalid argument. Support diagnosed Fabric Manager
+    restart without GPU reset/reboot, leaving GPU registration handles out of sync.
+    The node was rebooted after evidence capture, but post-recovery NVLS validation
+    was deferred.
+  status: mitigated
+  occurred_at: '2026-05-28'
+  resolved_at: null
+  family: network_fabric_error
+  family_confidence: high
+  observed_mechanism: NVLS multicast setup failed with CUDA invalid argument while
+    the non-NVLS path remained usable; failure persisted until recovery.
+  observed_mechanism_confidence: high
+  confirmed_mechanism: Fabric Manager restarted while GPUs remained initialized; absent
+    GPU reset/reboot, GPUs did not re-register and multicast-team setup used handles
+    the new session did not recognize.
+  confirmed_mechanism_confidence: medium
+searchable_context:
+  normalized_symptoms:
+  - NCCL NVLS initialization fails with CUDA invalid argument
+  - failure persists across jobs until GPU reset or node reboot
+  - single-node multi-GPU and multi-node training affected
+  - NCCL_NVLS_ENABLE=0 allows the same workload to proceed
+  - multi-GPU all_reduce and barrier reproduce after onset
+  metric_signatures:
+  - DCGM_FI_DEV_FABRIC_HEALTH_SUMMARY
+  error_signatures:
+  - transport/nvls.cc:165 NCCL WARN CUDA failure 'invalid argument'
+  - failed to find the member GPU handle in the multicast team setup request
+  issue_references:
+  - NVIDIA/nccl#1562
+  - NVIDIA/nccl#1672
+  - NVIDIA Fabric Manager User Guide
+  - NVIDIA DCGM 4.6.0 fabric-health summary field
+  canonical_component_tokens:
+  - nccl
+  - nvls
+  - nvidia-fabricmanager
+  - nvswitch
+  - nvidia-persistenced
+  version_tokens:
+  - HGX H200
+  - NCCL 2.18.5
+  - NVIDIA driver 550.163.01
+  - Fabric Manager 550.163.01
+  - GPU Operator v25.3.1
+  - Kubernetes v1.32.5
+  trigger_tokens:
+  - Fabric Manager restart without GPU reset
+  - GPU/Fabric Manager registration desynchronization
+  - multicast GPU handle mismatch
+  retrieval_keywords:
+  - NCCL
+  - NVLS
+  - transport/nvls.cc
+  - CUDA invalid argument
+  - Fabric Manager restart
+  - GPU reset
+  - NVSwitch multicast
+  - member GPU handle
+  - NCCL_NVLS_ENABLE=0
+  - HGX H200
+evidence_refs:
+- evidence_id: E001
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Failure affected single-node multi-GPU and multi-node training and
+    persisted until recovery.
+  supports:
+  - F001
+  - H001
+- evidence_id: E002
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: 'Exact NCCL signature: transport/nvls.cc:165 CUDA invalid argument.'
+  supports:
+  - F001
+  - H001
+- evidence_id: E003
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: NVLS disablement allowed the same workload to proceed.
+  supports:
+  - F002
+  - H001
+  - A001
+- evidence_id: E004
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Simple multi-GPU collectives reproduced the failure after onset.
+  supports:
+  - F001
+  - H001
+- evidence_id: E009
+  source_message_ids:
+  - M007
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Three pre-recovery diagnostic attachments were referenced but not
+    supplied.
+  supports:
+  - F004
+  - A002
+- evidence_id: E010
+  source_message_ids:
+  - M008
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support confirmed receipt of the requested diagnostic set.
+  supports:
+  - F004
+  - A002
+- evidence_id: E011
+  source_message_ids:
+  - M009
+  source_actor: customer
+  evidence_kind: raw_command_output
+  artifact_availability: quoted_in_transcript
+  masked_summary: Affected node rebooted at approximately 2026-07-03 17:10 KST after
+    evidence collection.
+  supports:
+  - F005
+  - F006
+  - H001
+  - A003
+- evidence_id: E012
+  source_message_ids:
+  - M010
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support stated Fabric Manager restarted while the node remained
+    up and GPUs were not reset/rebooted.
+  supports:
+  - F006
+  - H001
+- evidence_id: E013
+  source_message_ids:
+  - M010
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support reported unrecognized GPU handles in multicast team setup
+    and no Xid/hardware errors.
+  supports:
+  - F007
+  - F008
+- evidence_id: E014
+  source_message_ids:
+  - M010
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support final diagnosis linked missing GPU re-registration to NVLS
+    multicast rejection and NCCL invalid argument.
+  supports:
+  - F007
+  - H001
+  - A003
+- evidence_id: E015
+  source_message_ids:
+  - M010
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support proposed GPU re-sync/reboot and NVLS-enabled nccl-tests
+    validation.
+  supports:
+  - A004
+  - A007
+- evidence_id: E016
+  source_message_ids:
+  - M011
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Post-reboot NVLS validation was deferred.
+  supports:
+  - F010
+  - A003
+  - A007
+- evidence_id: E017
+  source_message_ids:
+  - M012
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Exact Fabric Manager restart initiator remained unresolved; same-version
+    restart made a version-changing upgrade unlikely.
+  supports:
+  - F009
+  - A006
+- evidence_id: E019
+  source_message_ids:
+  - M013
+  - M014
+  source_actor: customer
+  evidence_kind: external_reference
+  artifact_availability: not_applicable
+  masked_summary: Customer identified DCGM/exporter version limitations for the fabric-health
+    summary field.
+  supports:
+  - F012
+- evidence_id: E020
+  source_message_ids:
+  - M015
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support recommended NVLS canary plus Fabric Manager restart alert
+    and qualified DCGM fields as general telemetry.
+  supports:
+  - F012
+  - A005
+  - A006
+  - A008
+- evidence_id: E022
+  source_message_ids:
+  - M018
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support reported public dcgm-exporter 4.6.0-4.8.3-distroless availability.
+  supports:
+  - F011
+  - A008
+- evidence_id: E023
+  source_message_ids:
+  - M019
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Customer requested closure without reporting completion of deferred
+    validation.
+  supports:
+  - F010
+historical_actions:
+- action_id: A001
+  normalized_action: Disable NVLS temporarily with NCCL_NVLS_ENABLE=0.
+  outcome: mitigating
+  verified: true
+  evidence_ids:
+  - E003
+- action_id: A002
+  normalized_action: Collect nvidia-bug-report, Fabric Manager log, and NCCL_DEBUG=INFO
+    job log before recovery.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E009
+  - E010
+- action_id: A003
+  normalized_action: Reboot the affected node after diagnostic capture.
+  outcome: mitigating
+  verified: false
+  evidence_ids:
+  - E011
+  - E014
+  - E016
+- action_id: A004
+  normalized_action: After unavoidable Fabric Manager restart, drain workloads and
+    re-sync GPUs with reset/restart sequence or reboot.
+  outcome: preventive
+  verified: false
+  evidence_ids:
+  - E015
+- action_id: A005
+  normalized_action: Deploy a functional NVLS all_reduce canary.
+  outcome: preventive
+  verified: false
+  evidence_ids:
+  - E020
+- action_id: A006
+  normalized_action: Alert on Fabric Manager restarts and retain persistent journal/orchestration
+    history.
+  outcome: preventive
+  verified: false
+  evidence_ids:
+  - E017
+  - E020
+- action_id: A007
+  normalized_action: Run NVLS-enabled nccl-tests validation after recovery.
+  outcome: diagnostic
+  verified: false
+  evidence_ids:
+  - E015
+  - E016
+- action_id: A008
+  normalized_action: Evaluate dcgm-exporter 4.6.0-4.8.3-distroless for supplemental
+    fabric-health telemetry.
+  outcome: preventive
+  verified: false
+  evidence_ids:
+  - E020
+  - E022
+knowledge_links:
+  known_issue_matches: []
+  failure_mode_matches:
+  - catalog_entry: NCCL NVLS Cuda Failure
+    catalog_family: network_fabric_error
+    match_type: exact_symptom_only
+    confidence: high
+  - catalog_entry: Fabric Manager Unhealthy
+    catalog_family: network_fabric_error
+    match_type: partial
+    confidence: medium
+  family_candidates:
+  - family: network_fabric_error
+    confidence: high
+  - family: workload_runtime_error
+    confidence: low
+  - family: platform_lifecycle_change
+    confidence: low
+historical_use:
+  context_class: mitigated_context
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - action_reference
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: The case provides strong symptom and Support-diagnosis context,
+    but raw diagnostic attachments were not supplied and the post-reboot NVLS validation
+    was deferred. It may guide investigation but must not be treated as verified resolution
+    or current-incident proof.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false

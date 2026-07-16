@@ -1,0 +1,320 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:052176a42016
+  source_revision_hash: sha256:ce429da6ac65e3714e14f827abc6d6020798dd784a4aec3ed77f76713a4aa44f
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_with_warnings
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+incident:
+  title: CreateContainer timeout followed by stale container-name reservation conflict
+    during workload startup
+  masked_summary: A new interactive workload on one GPU node had a roughly 120-second
+    CreateContainer timeout. Retries then failed because the container name remained
+    reserved until stale state was removed. NFS unresponsive/recovery signals and
+    directory-access stalls overlapped the event; Support favored node-level NFS/storage
+    instability over a Run:ai lifecycle defect, but no post-update validation was
+    supplied.
+  status: unresolved
+  occurred_at: '2026-06-02'
+  resolved_at: null
+  family: storage_backend_error
+  family_confidence: medium
+  observed_mechanism: NFS/storage access instability overlapped a main-container CreateContainer
+    timeout; the incomplete create retained the name reservation, causing retry conflicts
+    until stale state was removed.
+  observed_mechanism_confidence: medium
+  confirmed_mechanism: The repeated reservation conflicts were a downstream effect
+    of the timed-out/incomplete CreateContainer attempt retaining the name until stale-container
+    removal.
+  confirmed_mechanism_confidence: medium
+searchable_context:
+  normalized_symptoms:
+  - new workload CreateContainer timeout
+  - repeated container name reservation conflict
+  - workload startup delayed then Running
+  - NFS server temporarily unresponsive
+  - NFS directory listing hangs after successful directory change
+  metric_signatures: []
+  error_signatures:
+  - 'CreateContainerError: context deadline exceeded'
+  - 'rpc error: code = DeadlineExceeded desc = context deadline exceeded'
+  - failed to reserve container name
+  - 'nfs: server <address> not responding, still trying'
+  issue_references: []
+  canonical_component_tokens:
+  - kubelet
+  - containerd
+  - nfs-storage-backend
+  version_tokens:
+  - runai:2.23.31
+  trigger_tokens:
+  - nfs-unresponsive-window
+  - container-create-timeout
+  retrieval_keywords:
+  - createcontainer timeout
+  - container name reserved
+  - stale container state
+  - nfs not responding
+  - vast nfs
+  - hostpath nfs
+  - directory metadata hang
+  - node-specific workload startup delay
+evidence_refs:
+- evidence_id: E001
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: The first quoted failure was a CreateContainer deadline timeout,
+    followed immediately by repeated container-name reservation conflicts.
+  supports:
+  - F001
+  - H003
+- evidence_id: E005
+  source_message_ids:
+  - M004
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Run:ai cluster/workload logs and affected-node kubelet/containerd
+    diagnostics were reported as attached to the support case.
+  supports:
+  - A001
+- evidence_id: E007
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support stated that hostPath mounts completed at 12:28:04, sandbox/init
+    started at 12:28:05, main container creation timed out at 12:30:05, stale reservation
+    persisted until removal at 12:34:24, and the pod reached Running at 12:34:25.
+  supports:
+  - F001
+  - F002
+  - H003
+  - H004
+- evidence_id: E008
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support assessed the reservation conflict as a follow-on effect
+    of the initial incomplete/timed-out CreateContainer attempt, not a separate Run:ai
+    scheduling issue.
+  supports:
+  - F002
+  - H003
+- evidence_id: E009
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support found a normal Run:ai suspend/resume flow, no abnormal Run:ai-side
+    pod management, and similar CreateContainer timeouts for other workloads on the
+    same node that day.
+  supports:
+  - F005
+  - H001
+  - H004
+- evidence_id: E010
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support stated that volume mounting completed quickly, so there
+    was no direct evidence of a mount-phase failure, while later stat probes on the
+    NFS-backed user path timed out.
+  supports:
+  - F003
+  - F004
+  - H002
+- evidence_id: E011
+  source_message_ids:
+  - M006
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: The customer quoted repeated NFS server not-responding and recovery
+    messages around the incident window.
+  supports:
+  - F004
+  - H002
+- evidence_id: E012
+  source_message_ids:
+  - M006
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Changing into the mounted directory succeeded, but listing the directory
+    hung or failed to return.
+  supports:
+  - F004
+  - H002
+- evidence_id: E013
+  source_message_ids:
+  - M006
+  - M008
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: The customer described updating or planning to update the VAST driver
+    and continuing monitoring, but did not provide a post-update recurrence result.
+  supports:
+  - F006
+  - A004
+- evidence_id: E014
+  source_message_ids:
+  - M007
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support concluded that the symptoms were more consistent with node-level
+    NFS/VAST instability and that the CreateContainer timeout and reservation conflict
+    were downstream kubelet/containerd effects, not a Run:ai 2.23.31 issue.
+  supports:
+  - F002
+  - F005
+  - H001
+  - H002
+  - H003
+- evidence_id: E015
+  source_message_ids:
+  - M007
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support reported NFS not-responding messages during 12:28-12:34,
+    a burst of OK messages around 12:34:16, stale-container removal at 12:34:24, and
+    pod Running at 12:34:25.
+  supports:
+  - F004
+  - H002
+- evidence_id: E016
+  source_message_ids:
+  - M007
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support requested confirmation that NFS errors stopped, directory
+    listing normalized, and new workloads started without delay after the VAST driver
+    update.
+  supports:
+  - F006
+  - A004
+- evidence_id: E017
+  source_message_ids:
+  - M008
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: The customer requested closure for now and planned to open a new
+    case if the issue recurred.
+  supports:
+  - F006
+  - A004
+- evidence_id: E018
+  source_message_ids:
+  - M009
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support confirmed the ticket would be closed.
+  supports:
+  - F006
+- evidence_id: E019
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support recommended keeping the node cordoned, collecting earlier
+    containerd logs, comparing NFS access with a healthy node, and checking node/node-checker
+    state.
+  supports:
+  - A002
+  - A003
+historical_actions:
+- action_id: A001
+  normalized_action: Collect cluster, workload, kubelet, and containerd diagnostics
+    for the affected event window.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E005
+  - E007
+- action_id: A002
+  normalized_action: Cordon the affected node until the node-level storage/runtime
+    issue is understood.
+  outcome: preventive
+  verified: false
+  evidence_ids:
+  - E019
+- action_id: A003
+  normalized_action: Compare NFS access with a healthy node and collect pre-timeout
+    runtime and node-health evidence on recurrence.
+  outcome: diagnostic
+  verified: false
+  evidence_ids:
+  - E019
+- action_id: A004
+  normalized_action: Update the storage client driver and verify NFS stability, directory
+    access, and workload startup behavior.
+  outcome: unknown_outcome
+  verified: false
+  evidence_ids:
+  - E013
+  - E016
+  - E017
+knowledge_links:
+  known_issue_matches: []
+  failure_mode_matches:
+  - catalog_entry: NFS Unresponsive / Stale Handle
+    family: storage_backend_error
+    match_type: exact_mechanism
+    confidence: medium
+  - catalog_entry: CreateContainerError
+    family: workload_startup_error
+    match_type: exact_symptom_only
+    confidence: medium
+  family_candidates:
+  - family: storage_backend_error
+    confidence: medium
+  - family: workload_startup_error
+    confidence: medium
+  - family: k8s_storage_error
+    confidence: low
+historical_use:
+  context_class: unresolved_context
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - action_reference
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: Useful as a node-specific NFS/runtime startup investigation pattern,
+    but the upstream cause was not independently revalidated and the proposed driver
+    change has no verified outcome.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false

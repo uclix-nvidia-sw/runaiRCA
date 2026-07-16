@@ -7,13 +7,15 @@ from dataclasses import replace
 from app.collectors.base import AnalysisTarget
 from app.config import load_settings
 from app.services.kg_enrichment import (
-    GraphRemediation,
+    _EXTERNAL_CASE_QUERY,
     KGContext,
     _case_card_projection,
     _prior_is_context_compatible,
+    _query_external_cases,
     _query_kg,
     _query_remediation,
     _rrf_case_priors,
+    _safe_case_card,
     _select_case_cards,
     enrich,
 )
@@ -568,6 +570,96 @@ def test_prior_with_explicit_other_namespace_is_not_target_compatible() -> None:
 def test_sparse_legacy_prior_remains_compatible() -> None:
     # Missing context means unknown, not a fabricated mismatch.
     assert _prior_is_context_compatible({"case_card": {}}, _target()) is True
+
+
+def test_external_case_query_is_not_status_gated_and_requires_active_approval() -> None:
+    # Mitigated/unresolved external cases must still surface, but only approved ones.
+    assert 'status "resolved"' not in _EXTERNAL_CASE_QUERY
+    assert 'approval_state "active"' in _EXTERNAL_CASE_QUERY
+    assert "isa has_symptom" in _EXTERNAL_CASE_QUERY
+
+
+def _external_fake(recorded: list[str], *, resolution=True):
+    from contextlib import contextmanager
+
+    card_json = (
+        '{"case_origin":"enterprise_support","context_class":"evaluation_only",'
+        '"prohibited_uses":["positive_promotion"],"mechanism":"switch routing fix",'
+        '"context":{"incident_status_at_approval":"resolved"}}'
+    )
+
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                recorded.append(query)
+                if "isa has_symptom" in query:
+                    return [
+                        {"iid": "ext:sc-ab12cd34ef56", "sum": "RDMA connect failed",
+                         "sn": "ext:sc-ab12cd34ef56", "case_id": "enterprise_support:ab12cd34ef56",
+                         "family": "network_fabric_error",
+                         "kw": "ibv_modify_qp failed with 19 no such device"},
+                        {"iid": "ext:sc-ab12cd34ef56", "sum": "RDMA connect failed",
+                         "sn": "ext:sc-ab12cd34ef56", "case_id": "enterprise_support:ab12cd34ef56",
+                         "family": "network_fabric_error",
+                         "kw": "destination host unreachable"},
+                    ]
+                if "has case_card $card" in query:
+                    return [{"card": card_json}]
+                if "isa resolution" in query and resolution:
+                    return [{"statement": "Correct switch routing.", "outcome": "resolved"}]
+                return []
+
+            yield run
+
+    return FakeClient()
+
+
+def test_external_signature_match_projects_labeled_card() -> None:
+    recorded: list[str] = []
+    client = _external_fake(recorded)
+    # Real evidence text; "No such device" must NOT be treated as a negation.
+    observed = "worker logs show ibv_modify_qp failed with 19 No such device during RDMA setup"
+    cards = _query_external_cases(client, observed, 2)  # type: ignore[arg-type]
+
+    assert len(cards) == 1
+    card = cards[0]
+    assert card["kind"] == "external"
+    assert card["historical_prior"] is True
+    assert card["family"] == "network_fabric_error"
+    assert card["context_class"] == "evaluation_only"      # survives the allowlist
+    assert card["case_origin"] == "enterprise_support"
+    assert "prohibited_uses" not in card                    # still stripped
+    assert card["matched_error_signatures"]                 # provenance recorded
+    assert "ibv_modify_qp failed with 19 no such device" in card["matched_error_signatures"]
+    assert card["successful_actions"][0]["outcome"] == "resolved"
+
+
+def test_external_no_signature_match_returns_empty_and_skips_projection() -> None:
+    recorded: list[str] = []
+    client = _external_fake(recorded)
+    cards = _query_external_cases(client, "cluster nominal, no relevant errors", 2)  # type: ignore[arg-type]
+    assert cards == []
+    # The single has_symptom query runs, but no per-case card projection is issued.
+    assert not any("has case_card $card" in q for q in recorded)
+
+
+def test_safe_case_card_keeps_context_class_and_case_origin_but_strips_the_rest() -> None:
+    card = _safe_case_card({
+        "case_origin": "enterprise_support",
+        "context_class": "evaluation_only",
+        "prohibited_uses": ["positive_promotion"],
+        "searchable_context": {"error_signatures": ["x"]},
+        "mechanism": "switch routing",
+        "context": {"incident_status_at_approval": "resolved", "cluster": "prod", "drop": "x"},
+        "unexpected": "drop",
+    })
+    assert card["context_class"] == "evaluation_only"
+    assert card["case_origin"] == "enterprise_support"
+    assert card["mechanism"] == "switch routing"
+    assert card["context"] == {"incident_status_at_approval": "resolved", "cluster": "prod"}
+    for stripped in ("prohibited_uses", "searchable_context", "unexpected"):
+        assert stripped not in card
 
 
 def test_case_card_projection_keeps_graph_links_and_strips_untrusted_fields() -> None:

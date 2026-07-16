@@ -1,0 +1,288 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:5ac070e72078
+  source_revision_hash: sha256:7c16c4aa2ffbb2ba96583678eb4089c55b3ea0d5bb63120786ac846350ce0884
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_with_warnings
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+incident:
+  title: RoCE multi-node training failed on Kubernetes secondary network; later TCPStore
+    startup delay
+  masked_summary: In an RKE2 cluster, multi-node NCCL/RDMA connections failed on a
+    Multus MacVLAN secondary network. The original failure was reported resolved after
+    a switch routing correction. A later repeated 10-minute rendezvous timeout over
+    the control network eventually disappeared without a confirmed remediation.
+  status: resolved
+  occurred_at: '2026-03-05'
+  resolved_at: null
+  family: network_fabric_error
+  family_confidence: medium
+  observed_mechanism: Inter-node reachability on the pod secondary network failed
+    before RDMA QP establishment; a later phase showed repeated TCPStore waits on
+    the control path.
+  observed_mechanism_confidence: medium
+  confirmed_mechanism: Switch routing configuration blocked the MacVLAN secondary-network
+    path used for the original RoCE/RDMA communication.
+  confirmed_mechanism_confidence: medium
+searchable_context:
+  normalized_symptoms:
+  - Kubernetes NCCL QP setup failure
+  - RDMA connect failure across pods
+  - MacVLAN net1 host unreachable
+  - worker restart loop during distributed startup
+  - TCPStore rendezvous timeout before eventual success
+  metric_signatures: []
+  error_signatures:
+  - ibv_modify_qp failed with 19 No such device
+  - 'ncclIbRoceGetVersionNum: Invalid argument'
+  - Destination Host Unreachable
+  - Failed to modify QP to RTR
+  - TCPStore wait timeout after 600000ms
+  - 'gai error: Name or service not known'
+  issue_references: []
+  canonical_component_tokens:
+  - kubernetes_pod_network
+  - multus
+  - macvlan
+  - rdma_shared_device
+  - nccl
+  - roce_fabric
+  - pytorch_c10d_tcpstore
+  version_tokens:
+  - RKE2
+  - NVIDIA H200
+  - nvcr.io/nvidia/pytorch:25.02-py3
+  - IBext_v9
+  trigger_tokens:
+  - Kubernetes deployment of RoCE multi-node training
+  - MacVLAN secondary-network routing misconfiguration
+  - distributed worker startup
+  retrieval_keywords:
+  - NCCL RoCE Kubernetes
+  - ibv_modify_qp No such device
+  - MacVLAN net1 Destination Host Unreachable
+  - RDMA QP RTR failure
+  - switch L3 routing
+  - TCPStore 600000ms
+  - GLOO_SOCKET_IFNAME eth0
+  - NCCL_SOCKET_IFNAME net1
+evidence_refs:
+- evidence_id: E002
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: The transcript contains a QP transition failure on <hca:port> with
+    GID index 2.
+  supports:
+  - F001
+  - H002
+- evidence_id: E003
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: The test pod initially did not receive the expected additional network
+    interface.
+  supports:
+  - F002
+  - H001
+  - A001
+- evidence_id: E008
+  source_message_ids:
+  - M005
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: The customer reported that net1 was attached through MacVLAN, but
+    the training error persisted.
+  supports:
+  - F003
+  - H001
+  - A001
+- evidence_id: E011
+  source_message_ids:
+  - M008
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support reported that NCCL selected multiple HCAs and repeatedly
+    failed QP transition against peer RoCE GIDs.
+  supports:
+  - F003
+  - H002
+  - A002
+- evidence_id: E013
+  source_message_ids:
+  - M009
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: The customer constrained the RDMA plugin to <roce-nic> (<single-hca>),
+    placed pods on different servers, and still observed communication failure.
+  supports:
+  - F004
+  - H002
+  - H003
+  - A002
+  - A003
+- evidence_id: E015
+  source_message_ids:
+  - M011
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support reported Destination Host Unreachable from ping over net1
+    and inability of ib_write_bw to connect/transition QP to RTR.
+  supports:
+  - F004
+  - F005
+  - H003
+  - A003
+- evidence_id: E016
+  source_message_ids:
+  - M011
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support diagnosed a Layer-2/Layer-3 connectivity issue on the MacVLAN
+    data path before RDMA setup.
+  supports:
+  - F005
+  - H003
+- evidence_id: E018
+  source_message_ids:
+  - M012
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: The customer stated that the earlier connectivity issue was related
+    to switch L3 routing configuration and was resolved after correction.
+  supports:
+  - F006
+  - H003
+  - A004
+- evidence_id: E019
+  source_message_ids:
+  - M012
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: After the original network issue, master and worker communication
+    reportedly failed for about 30 minutes, with about three worker restarts, before
+    training started successfully.
+  supports:
+  - F007
+  - H004
+- evidence_id: E021
+  source_message_ids:
+  - M014
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support reported repeated 600000 ms TCPStore waits, a name-resolution
+    warning, and interface settings that put data traffic on net1 and control traffic
+    on eth0.
+  supports:
+  - F007
+  - H004
+  - A005
+- evidence_id: E024
+  source_message_ids:
+  - M015
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: The customer stated that the issue appeared resolved and requested
+    closure.
+  supports:
+  - F008
+historical_actions:
+- action_id: A001
+  normalized_action: Attach the MacVLAN secondary interface together with the RDMA
+    resource request.
+  outcome: partially_effective
+  verified: true
+  evidence_ids:
+  - E003
+  - E008
+- action_id: A002
+  normalized_action: Constrain the RDMA device and MacVLAN master to one intended
+    RoCE NIC.
+  outcome: ineffective
+  verified: true
+  evidence_ids:
+  - E011
+  - E013
+- action_id: A003
+  normalized_action: Run inter-node ping and ib_write_bw over the secondary interface.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E013
+  - E015
+- action_id: A004
+  normalized_action: Correct switch routing for the MacVLAN/RoCE secondary network.
+  outcome: resolving
+  verified: true
+  evidence_ids:
+  - E018
+- action_id: A005
+  normalized_action: Check service endpoint readiness, DNS, CNI reachability, and
+    control-port connectivity for TCPStore startup.
+  outcome: unknown_outcome
+  verified: false
+  evidence_ids:
+  - E021
+knowledge_links:
+  known_issue_matches: []
+  failure_mode_matches:
+  - catalog_entry: NCCL Communication Failure
+    catalog_family: network_fabric_error
+    match_type: exact_symptom_only
+  - catalog_entry: NicClusterPolicy Not Ready / RDMA Stack Missing
+    catalog_family: network_fabric_error
+    match_type: partial
+  - catalog_entry: Pod DNS Resolution Failure
+    catalog_family: cluster_network_error
+    match_type: partial
+  family_candidates:
+  - family: network_fabric_error
+    confidence: medium
+  - family: cluster_network_error
+    confidence: medium
+  - family: workload_startup_error
+    confidence: low
+historical_use:
+  context_class: evaluation_only
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - action_reference
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: The original routing mechanism is useful historical context, but
+    the same case includes a later unresolved rendezvous mechanism. Keep the combined
+    record labelled for retrieval and evaluation only until the phases are split or
+    independently verified.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false
