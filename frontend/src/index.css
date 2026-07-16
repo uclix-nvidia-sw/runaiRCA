@@ -4060,6 +4060,19 @@ code .evidence-mark {
   white-space: nowrap;
 }
 
+.full-chat-context-picker select {
+  min-width: 0;
+  max-width: 24rem;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: #fff;
+  color: inherit;
+  font: inherit;
+  font-size: 0.82rem;
+  padding: 0.25rem 0.45rem;
+  cursor: pointer;
+}
+
 .full-chat-compose-meta button {
   width: 2.15rem;
   height: 2.15rem;

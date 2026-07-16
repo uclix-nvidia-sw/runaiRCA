@@ -65,19 +65,29 @@ async def answer_chat(
     grounding = masker.mask_text(grounding)
     try:
         tools = _flat_tools(settings)
+        if "promql_query" not in tools:
+            # No live-metric tool in the registry, so metric questions (CPU
+            # throttling, saturation, memory pressure) can only get conditional
+            # guidance. Warn once so a missing Prometheus config is visible.
+            _log.warning("chat: promql_query tool not registered — Prometheus not configured for the agent?")
         target = resolve_target({}, {})  # tools read their params from args, not target
+        cluster_scope = _is_cluster_scope(request)
         history: list[dict] = []
-        for _ in range(_MAX_STEPS):
+        for step in range(_MAX_STEPS):
             safe_history = masker.mask_object(history)
             if not isinstance(safe_history, list):
                 safe_history = []
             decision = await complete_json(
                 settings,
-                system=_system_prompt(tools, settings),
+                system=_system_prompt(tools, settings, cluster_scope=cluster_scope),
                 user=_user_prompt(grounding, question, safe_history),
                 model=settings.llm_model_chat,
             )
             if not isinstance(decision, dict):
+                # The decision LLM returned nothing parseable as JSON (transport
+                # failure or a model that ignored the JSON-only instruction). No
+                # query fires; the loop degrades to the grounded final answer.
+                _log.warning("chat step %d: no parseable decision JSON from LLM — loop ended without querying", step)
                 break
             action = str(decision.get("action") or "")
             if action == "answer":
@@ -106,11 +116,14 @@ async def _run_queries(
     decision: dict,
     history: list[dict],
 ) -> None:
-    queries = [
-        q
-        for q in (decision.get("queries") or [])
-        if isinstance(q, dict) and str(q.get("tool") or "") in tools
-    ][:_MAX_QUERIES_PER_STEP]
+    requested = [q for q in (decision.get("queries") or []) if isinstance(q, dict)]
+    dropped = sorted({str(q.get("tool") or "?") for q in requested if str(q.get("tool") or "") not in tools})
+    if dropped:
+        # The model asked for tool names that aren't in the registry (hallucinated
+        # or a domain that isn't configured). Naming them makes "it ran nothing"
+        # legible instead of a silent no-op.
+        _log.warning("chat query: dropped %d unknown tool(s): %s", len(dropped), ", ".join(dropped)[:200])
+    queries = [q for q in requested if str(q.get("tool") or "") in tools][:_MAX_QUERIES_PER_STEP]
     for q in queries:
         name = str(q.get("tool"))
         args = q.get("args") if isinstance(q.get("args"), dict) else {}
@@ -119,6 +132,8 @@ async def _run_queries(
         if not isinstance(outcome, dict):
             outcome = {"error": "tool returned no result"}
         error = outcome.get("error")
+        if error:
+            _log.warning("chat query failed: tool=%s error=%s", name, error)
         history.append(
             {
                 "tool": name,
@@ -154,11 +169,13 @@ async def _run_analysis(
     try:
         response = await analyze_fn(request)
     except Exception as exc:  # noqa: BLE001 - a failed analysis is an observation
+        detail = masker.mask_text(f"{exc.__class__.__name__}: {exc}")
+        _log.warning("chat analyze failed: %s", detail)
         history.append(
             {
                 "tool": "analyze",
                 "target": masker.mask_object(spec),
-                "error": masker.mask_text(f"{exc.__class__.__name__}: {exc}"),
+                "error": detail,
             }
         )
         return
@@ -224,15 +241,39 @@ def _chat_masker(settings: Settings):
     )
 
 
-def _system_prompt(tools: dict[str, dict], settings: Settings) -> str:
+def _is_cluster_scope(request: ChatRequest) -> bool:
+    """True when the conversation has no incident/alert context — the operator is
+    deliberately asking about the whole live cluster (backend sets scope=cluster)."""
+    context = request.context if isinstance(request.context, dict) else {}
+    scope = str(context.get("scope") or "").strip().lower()
+    if scope:
+        return scope == "cluster"
+    return not (
+        request.incident_id
+        or request.alert_id
+        or context.get("incident")
+        or context.get("alert")
+    )
+
+
+def _system_prompt(tools: dict[str, dict], settings: Settings, *, cluster_scope: bool = False) -> str:
     tool_lines = "\n".join(f"- {name}: {spec['description']}" for name, spec in tools.items())
     language_rule = (
         "answer 필드는 반드시 한국어로 작성하세요."
         if getattr(settings, "language", "en") == "ko"
         else "Write the answer field in the operator's language."
     )
+    scope_rule = (
+        "NO incident/alert context is selected: the operator is asking about the live "
+        "cluster as a whole. The dashboard_state numbers in the grounded context are the "
+        "RCA backend's alert/analysis history, NOT live cluster inventory — never present "
+        "them as node/pod/workload state. Fetch any cluster fact with a query THIS turn.\n"
+        if cluster_scope
+        else ""
+    )
     return (
         f"{language_rule}\n"
+        f"{scope_rule}"
         "You are the RCA copilot for an NVIDIA Run:AI GPU platform. The operator can ask "
         "about ANYTHING on the cluster, not just a loaded incident. Each turn, choose ONE:\n"
         "- answer: you can already answer from the grounded context or prior tool results.\n"
@@ -240,10 +281,17 @@ def _system_prompt(tools: dict[str, dict], settings: Settings) -> str:
         "- analyze: run a full root-cause analysis for a target (heavier; use when the "
         "operator asks to investigate/analyze a namespace, node, or workload).\n"
         f"Read-only tools:\n{tool_lines}\n"
-        "Prefer answering from context or a couple of targeted queries; only use analyze "
-        "when a real investigation is asked for. Stop as soon as you can answer.\n"
-        "When no live incident evidence is available, label any guidance as general and "
-        "conditional; never claim a cause is present or a remediation succeeded.\n"
+        "For questions about the CURRENT state of the cluster — how many nodes/pods, "
+        "what is running, live metrics (CPU throttling, memory, GPU), what is failing "
+        "right now — you MUST fetch it with a query (or analyze) THIS turn before you "
+        "answer. NEVER assert a cluster fact (a node/pod count, a status, a metric "
+        "value) that a tool result this turn did not give you, and never hand the "
+        "operator a query you could run yourself. Answer directly only when the grounded "
+        "context or a prior tool result already contains the answer; use analyze for a "
+        "real root-cause investigation of a target.\n"
+        "When a tool genuinely returns no evidence, say what you ran and label any "
+        "remaining guidance as general and conditional; never claim a cause is present "
+        "or a remediation succeeded.\n"
         'Respond with ONLY JSON, one of:\n'
         '{"action":"answer","answer":str}\n'
         '{"action":"query","reason":str,"queries":[{"tool":str,"args":{...}}]}'
