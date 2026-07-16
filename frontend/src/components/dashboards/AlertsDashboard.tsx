@@ -79,7 +79,19 @@ export function AlertsDashboard({
             </thead>
             <tbody>
               {filteredAlerts.map((alert) => (
-                <tr key={alert.alert_id} onClick={() => void onOpenIncident(alert.incident_id)}>
+                <tr
+                  key={alert.alert_id}
+                  tabIndex={0}
+                  onClick={() => void onOpenIncident(alert.incident_id)}
+                  onKeyDown={(event) => {
+                    // ponytail: guard skips events bubbling up from the nested Incident button
+                    if (event.target !== event.currentTarget) return;
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      void onOpenIncident(alert.incident_id);
+                    }
+                  }}
+                >
                   <td>
                     <strong>{alert.alarm_title}</strong>
                     <span className="table-subline">
