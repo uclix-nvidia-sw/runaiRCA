@@ -346,6 +346,11 @@ func Run() {
 	port := getenv("PORT", "8080")
 	server := NewServer()
 
+	if os.Getenv("RCA_DEV_SEED") == "1" {
+		server.store.SeedDevFixtures()
+		log.Printf("RCA_DEV_SEED=1: injected dev knowledge-review fixtures (not for production)")
+	}
+
 	srv := &http.Server{
 		Addr:    ":" + port,
 		Handler: server.routes(),

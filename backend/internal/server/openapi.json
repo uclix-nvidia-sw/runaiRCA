@@ -3,7 +3,7 @@
   "info": {
     "title": "Run:ai RCA Backend API",
     "version": "0.1.56",
-    "description": "Versioned HTTP contract for the Run:ai RCA Backend. Responses use { data: ... } unless an operation states otherwise."
+    "description": "Versioned HTTP contract for the Run:ai RCA Backend. Unless an operation states otherwise, successful responses use the envelope { \"status\": \"ok\", \"data\": ... } and list endpoints add a \"pagination\" block."
   },
   "servers": [{ "url": "/" }],
   "tags": [
@@ -14,37 +14,650 @@
     { "name": "Operations" }
   ],
   "paths": {
-    "/healthz": { "get": { "tags": ["Operations"], "summary": "Read backend health", "responses": { "200": { "description": "Healthy" } } } },
-    "/webhook/alertmanager": { "post": { "tags": ["Alerts"], "summary": "Accept an Alertmanager webhook", "responses": { "202": { "description": "Accepted" }, "400": { "$ref": "#/components/responses/Error" } } } },
-    "/api/v1/incidents": { "get": { "tags": ["Incidents"], "summary": "List incidents", "parameters": [{ "$ref": "#/components/parameters/IncidentView" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
-    "/api/v1/incidents/{id}": { "get": { "tags": ["Incidents"], "summary": "Get an incident", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" }, "404": { "$ref": "#/components/responses/Error" } } }, "delete": { "tags": ["Incidents"], "summary": "Trash or permanently delete an incident", "parameters": [{ "$ref": "#/components/parameters/ID" }, { "name": "permanent", "in": "query", "schema": { "type": "boolean" } }], "responses": { "200": { "$ref": "#/components/responses/Envelope" }, "404": { "$ref": "#/components/responses/Error" } } } },
-    "/api/v1/incidents/{id}/analyze": { "post": { "tags": ["Analysis"], "summary": "Start an incident analysis", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "202": { "$ref": "#/components/responses/Envelope" }, "409": { "$ref": "#/components/responses/Error" } } } },
-    "/api/v1/incidents/{id}/resolve": { "post": { "tags": ["Incidents"], "summary": "Toggle operator RCA approval", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
-    "/api/v1/incidents/{id}/{action}": { "post": { "tags": ["Incidents"], "summary": "Archive, unarchive, restore, vote, or comment on an incident", "parameters": [{ "$ref": "#/components/parameters/ID" }, { "name": "action", "in": "path", "required": true, "schema": { "enum": ["archive", "unarchive", "restore", "vote", "comments", "feedback"] } }], "responses": { "200": { "$ref": "#/components/responses/Envelope" }, "404": { "$ref": "#/components/responses/Error" } } } },
-    "/api/v1/alerts": { "get": { "tags": ["Alerts"], "summary": "List alerts", "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
-    "/api/v1/alerts/{id}": { "get": { "tags": ["Alerts"], "summary": "Get an alert", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" }, "404": { "$ref": "#/components/responses/Error" } } } },
-    "/api/v1/alerts/{id}/{action}": { "post": { "tags": ["Alerts"], "summary": "Vote, comment, or give feedback on an alert", "parameters": [{ "$ref": "#/components/parameters/ID" }, { "name": "action", "in": "path", "required": true, "schema": { "enum": ["vote", "comments", "feedback"] } }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
-    "/api/v1/embeddings/search": { "post": { "tags": ["Analysis"], "summary": "Search similar RCA memory", "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
-    "/api/v1/analysis-runs": { "get": { "tags": ["Analysis"], "summary": "List analysis runs", "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
-    "/api/v1/analysis-runs/{id}": { "get": { "tags": ["Analysis"], "summary": "Get an analysis run", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
-    "/api/v1/analysis-runs/{id}/evaluation": { "get": { "tags": ["Analysis"], "summary": "Get an analysis evaluation", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } }, "put": { "tags": ["Analysis"], "summary": "Save an analysis evaluation", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
-    "/api/v1/analysis-runs/{id}/progress": { "post": { "tags": ["Analysis"], "summary": "Append analysis progress", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "202": { "$ref": "#/components/responses/Envelope" } } } },
-    "/api/v1/knowledge-candidates": { "get": { "tags": ["Knowledge"], "summary": "List knowledge candidates", "parameters": [{ "name": "status", "in": "query", "schema": { "type": "string" } }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
-    "/api/v1/knowledge-candidates/{id}": { "get": { "tags": ["Knowledge"], "summary": "Get a knowledge candidate", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" }, "404": { "$ref": "#/components/responses/Error" } } } },
-    "/api/v1/knowledge-candidates/{id}/decision": { "post": { "tags": ["Knowledge"], "summary": "Approve, shadow, activate, or reject a candidate", "parameters": [{ "$ref": "#/components/parameters/ID" }], "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/KnowledgeDecision" }, "example": { "action": "shadow", "actor": "on-call@example.com", "note": "Observe before activation." } } } }, "responses": { "200": { "$ref": "#/components/responses/Envelope" }, "400": { "$ref": "#/components/responses/Error" }, "409": { "$ref": "#/components/responses/Error" }, "422": { "$ref": "#/components/responses/Error" } } } },
-    "/api/v1/knowledge-packages": { "get": { "tags": ["Knowledge"], "summary": "List knowledge packages", "parameters": [{ "name": "include_retired", "in": "query", "schema": { "type": "boolean", "default": false } }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
-    "/api/v1/knowledge-packages/{id}": { "get": { "tags": ["Knowledge"], "summary": "Get a knowledge package", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" }, "404": { "$ref": "#/components/responses/Error" } } } },
-    "/api/v1/knowledge-packages/{id}/retire": { "post": { "tags": ["Knowledge"], "summary": "Retire a knowledge package", "parameters": [{ "$ref": "#/components/parameters/ID" }], "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuditNote" } } } }, "responses": { "200": { "$ref": "#/components/responses/Envelope" }, "409": { "$ref": "#/components/responses/Error" } } } },
-    "/api/v1/knowledge/runtime-snapshot": { "get": { "tags": ["Knowledge"], "summary": "Read the active runtime knowledge snapshot", "responses": { "200": { "$ref": "#/components/responses/KnowledgeRuntimeSnapshot" }, "304": { "description": "Not modified" } } } },
-    "/api/v1/knowledge/probe-metrics": { "get": { "tags": ["Knowledge"], "summary": "Read aggregated trace-v3 probe metrics", "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
-    "/api/v1/knowledge/families": { "get": { "tags": ["Knowledge"], "summary": "List configured root-cause families", "responses": { "200": { "$ref": "#/components/responses/Envelope" }, "503": { "$ref": "#/components/responses/Error" } } } },
-    "/api/v1/stats/recurrence": { "get": { "tags": ["Operations"], "summary": "Read recurrence statistics", "parameters": [{ "$ref": "#/components/parameters/Days" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
-    "/api/v1/stats/llm-spend": { "get": { "tags": ["Operations"], "summary": "Read LLM spend statistics", "parameters": [{ "$ref": "#/components/parameters/Days" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
-    "/api/v1/stats/kpi": { "get": { "tags": ["Operations"], "summary": "Read RCA KPI statistics", "parameters": [{ "$ref": "#/components/parameters/Days" }], "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
-    "/api/v1/events": { "get": { "tags": ["Operations"], "summary": "Open the server-sent events stream", "responses": { "200": { "description": "text/event-stream" } } } },
-    "/api/v1/chat": { "post": { "tags": ["Analysis"], "summary": "Chat with the RCA assistant", "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
-    "/api/v1/chat/conversations": { "get": { "tags": ["Analysis"], "summary": "List chat conversations", "responses": { "200": { "$ref": "#/components/responses/Envelope" } } } },
-    "/api/v1/chat/conversations/{id}": { "delete": { "tags": ["Analysis"], "summary": "Delete a chat conversation", "parameters": [{ "$ref": "#/components/parameters/ID" }], "responses": { "204": { "description": "Deleted" } } } }
+    "/healthz": {
+      "get": {
+        "tags": ["Operations"],
+        "summary": "Read backend health",
+        "responses": {
+          "200": {
+            "description": "Healthy",
+            "content": { "application/json": { "example": { "status": "ok" } } }
+          }
+        }
+      }
+    },
+    "/webhook/alertmanager": {
+      "post": {
+        "tags": ["Alerts"],
+        "summary": "Accept an Alertmanager webhook",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "example": {
+                "version": "4",
+                "status": "firing",
+                "receiver": "runai-rca",
+                "groupLabels": { "alertname": "KubePodCrashLooping" },
+                "commonLabels": { "alertname": "KubePodCrashLooping", "namespace": "runai", "severity": "critical" },
+                "alerts": [
+                  {
+                    "status": "firing",
+                    "labels": { "alertname": "KubePodCrashLooping", "namespace": "runai", "pod": "gpu-operator-5b9c7d8f6-r2k4n", "severity": "critical" },
+                    "annotations": { "summary": "Pod runai/gpu-operator is crash looping", "description": "Container has restarted 7 times in the last 10m" },
+                    "startsAt": "2026-07-16T09:12:00Z",
+                    "fingerprint": "a1b2c3d4e5f6a7b8"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted for correlation and analysis",
+            "content": { "application/json": { "example": { "status": "accepted", "incident_id": "inc_5f3a9c2b", "alert_id": "alr_9b1e4d7a" } } }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/incidents": {
+      "get": {
+        "tags": ["Incidents"],
+        "summary": "List incidents",
+        "parameters": [{ "$ref": "#/components/parameters/IncidentView" }],
+        "responses": {
+          "200": {
+            "description": "Paginated list of incidents",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Envelope" },
+                "examples": { "incidents": { "$ref": "#/components/examples/IncidentListEnvelope" } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/incidents/{id}": {
+      "get": {
+        "tags": ["Incidents"],
+        "summary": "Get an incident",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "responses": {
+          "200": {
+            "description": "Incident detail with the latest RCA",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Envelope" },
+                "examples": { "detail": { "$ref": "#/components/examples/IncidentDetailEnvelope" } }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "delete": {
+        "tags": ["Incidents"],
+        "summary": "Trash or permanently delete an incident",
+        "parameters": [
+          { "$ref": "#/components/parameters/ID" },
+          { "name": "permanent", "in": "query", "description": "When true, hard-delete instead of moving to trash.", "schema": { "type": "boolean", "default": false } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Incident trashed or deleted",
+            "content": { "application/json": { "example": { "status": "ok", "data": { "incident_id": "inc_5f3a9c2b", "deleted_at": "2026-07-16T10:30:00Z" } } } }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/incidents/{id}/analyze": {
+      "post": {
+        "tags": ["Analysis"],
+        "summary": "Start an incident analysis",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "responses": {
+          "202": {
+            "description": "Analysis run accepted",
+            "content": { "application/json": { "example": { "status": "ok", "data": { "run_id": "run_7c2d1a", "status": "running", "incident_id": "inc_5f3a9c2b" } } } }
+          },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/incidents/{id}/resolve": {
+      "post": {
+        "tags": ["Incidents"],
+        "summary": "Toggle operator RCA approval",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "responses": {
+          "200": {
+            "description": "Approval toggled",
+            "content": { "application/json": { "example": { "status": "ok", "data": { "incident_id": "inc_5f3a9c2b", "user_approved_at": "2026-07-16T10:45:00Z" } } } }
+          }
+        }
+      }
+    },
+    "/api/v1/incidents/{id}/{action}": {
+      "post": {
+        "tags": ["Incidents"],
+        "summary": "Archive, unarchive, restore, vote, comment, or give feedback on an incident",
+        "parameters": [
+          { "$ref": "#/components/parameters/ID" },
+          { "name": "action", "in": "path", "required": true, "schema": { "type": "string", "enum": ["archive", "unarchive", "restore", "vote", "comments", "feedback"] } }
+        ],
+        "requestBody": {
+          "description": "Body depends on the action. Lifecycle actions (archive/unarchive/restore) take no body.",
+          "content": {
+            "application/json": {
+              "examples": {
+                "vote": { "summary": "vote", "value": { "vote": "up", "author": "on-call@example.com" } },
+                "comments": { "summary": "comments", "value": { "body": "Confirmed GPU node NotReady; draining.", "author": "on-call@example.com" } },
+                "feedback": { "summary": "feedback", "value": { "vote": "down", "comment": "Root cause was the CNI, not the scheduler.", "author": "on-call@example.com" } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Feedback summary after applying the action",
+            "content": { "application/json": { "examples": { "feedback": { "$ref": "#/components/examples/FeedbackSummaryEnvelope" } } } }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/alerts": {
+      "get": {
+        "tags": ["Alerts"],
+        "summary": "List alerts",
+        "responses": {
+          "200": {
+            "description": "Paginated list of alerts",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Envelope" },
+                "examples": { "alerts": { "$ref": "#/components/examples/AlertListEnvelope" } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/alerts/{id}": {
+      "get": {
+        "tags": ["Alerts"],
+        "summary": "Get an alert",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "responses": {
+          "200": {
+            "description": "Alert detail",
+            "content": { "application/json": { "examples": { "alert": { "$ref": "#/components/examples/AlertEnvelope" } } } }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/alerts/{id}/{action}": {
+      "post": {
+        "tags": ["Alerts"],
+        "summary": "Vote, comment, or give feedback on an alert",
+        "parameters": [
+          { "$ref": "#/components/parameters/ID" },
+          { "name": "action", "in": "path", "required": true, "schema": { "type": "string", "enum": ["vote", "comments", "feedback"] } }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "vote": { "summary": "vote", "value": { "vote": "up", "author": "on-call@example.com" } },
+                "comments": { "summary": "comments", "value": { "body": "Same fingerprint fired 5x in 10m.", "author": "on-call@example.com" } },
+                "feedback": { "summary": "feedback", "value": { "vote": "down", "comment": "Noisy alert; threshold too low.", "author": "on-call@example.com" } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Feedback summary after applying the action",
+            "content": { "application/json": { "examples": { "feedback": { "$ref": "#/components/examples/FeedbackSummaryEnvelope" } } } }
+          }
+        }
+      }
+    },
+    "/api/v1/embeddings/search": {
+      "post": {
+        "tags": ["Analysis"],
+        "summary": "Search similar RCA memory",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/EmbeddingSearchRequest" },
+              "example": { "query": "gpu node NotReady after driver upgrade", "limit": 5 }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Ranked similar incidents",
+            "content": {
+              "application/json": {
+                "example": {
+                  "status": "ok",
+                  "data": {
+                    "model": "local-term-frequency",
+                    "results": [
+                      {
+                        "incident_id": "inc_1a2b3c",
+                        "title": "GPU node NotReady on driver mismatch",
+                        "severity": "critical",
+                        "status": "resolved",
+                        "similarity": 0.82,
+                        "analysis_summary": "nvidia-driver DaemonSet crashed after a kernel bump; node went NotReady.",
+                        "positive_feedback": 3,
+                        "negative_feedback": 0,
+                        "comment_count": 2,
+                        "created_at": "2026-07-02T14:03:00Z"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/analysis-runs": {
+      "get": {
+        "tags": ["Analysis"],
+        "summary": "List analysis runs",
+        "responses": {
+          "200": {
+            "description": "Paginated list of analysis runs",
+            "content": { "application/json": { "examples": { "runs": { "$ref": "#/components/examples/AnalysisRunListEnvelope" } } } }
+          }
+        }
+      }
+    },
+    "/api/v1/analysis-runs/{id}": {
+      "get": {
+        "tags": ["Analysis"],
+        "summary": "Get an analysis run",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "responses": {
+          "200": {
+            "description": "Analysis run detail",
+            "content": { "application/json": { "examples": { "run": { "$ref": "#/components/examples/AnalysisRunEnvelope" } } } }
+          }
+        }
+      }
+    },
+    "/api/v1/analysis-runs/{id}/evaluation": {
+      "get": {
+        "tags": ["Analysis"],
+        "summary": "Get an analysis evaluation",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "responses": {
+          "200": {
+            "description": "Evaluation view",
+            "content": { "application/json": { "examples": { "evaluation": { "$ref": "#/components/examples/EvaluationEnvelope" } } } }
+          }
+        }
+      },
+      "put": {
+        "tags": ["Analysis"],
+        "summary": "Save an analysis evaluation",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/EvaluationReviewInput" },
+              "example": {
+                "analysis_hash": "sha256:9f2c…",
+                "reviewer": "sre@example.com",
+                "case_type": "known",
+                "expected_family": "gpu_hardware_error",
+                "scores": { "accuracy": 4, "actionability": 5 },
+                "hard_gates": { "cited_evidence": true, "no_hallucinated_pods": true },
+                "resolution_outcome": "resolved",
+                "effective_action": "Cordoned node and replaced the GPU.",
+                "notes": "Matched XID 79 signature."
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved review",
+            "content": { "application/json": { "examples": { "review": { "$ref": "#/components/examples/EvaluationReviewEnvelope" } } } }
+          }
+        }
+      }
+    },
+    "/api/v1/analysis-runs/{id}/progress": {
+      "post": {
+        "tags": ["Analysis"],
+        "summary": "Append analysis progress",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "example": { "phase": "collect", "collector": "kubernetes", "status": "running", "message": "Describing pod runai/gpu-operator…" }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Progress appended",
+            "content": { "application/json": { "example": { "status": "ok", "data": { "seq": 12, "phase": "collect", "collector": "kubernetes", "status": "running", "message": "Describing pod runai/gpu-operator…", "timestamp": "2026-07-16T09:14:03Z" } } } }
+          }
+        }
+      }
+    },
+    "/api/v1/knowledge-candidates": {
+      "get": {
+        "tags": ["Knowledge"],
+        "summary": "List knowledge candidates",
+        "parameters": [{ "name": "status", "in": "query", "description": "Filter by lifecycle status (e.g. ready_for_review).", "schema": { "type": "string" } }],
+        "responses": {
+          "200": {
+            "description": "Incident-derived knowledge candidates",
+            "content": { "application/json": { "examples": { "candidates": { "$ref": "#/components/examples/KnowledgeCandidateListEnvelope" } } } }
+          }
+        }
+      }
+    },
+    "/api/v1/knowledge-candidates/{id}": {
+      "get": {
+        "tags": ["Knowledge"],
+        "summary": "Get a knowledge candidate",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "responses": {
+          "200": {
+            "description": "Candidate detail",
+            "content": { "application/json": { "examples": { "candidate": { "$ref": "#/components/examples/KnowledgeCandidateEnvelope" } } } }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/knowledge-candidates/{id}/decision": {
+      "post": {
+        "tags": ["Knowledge"],
+        "summary": "Approve, shadow, activate, or reject a candidate",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/KnowledgeDecision" },
+              "example": { "action": "shadow", "actor": "on-call@example.com", "note": "Observe before activation." }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Candidate after the decision",
+            "content": { "application/json": { "example": { "status": "ok", "data": { "candidate_id": "kc_44ab19", "status": "shadow", "decided_by": "on-call@example.com", "decided_at": "2026-07-16T11:02:00Z" } } } }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "422": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/knowledge-packages": {
+      "get": {
+        "tags": ["Knowledge"],
+        "summary": "List knowledge packages",
+        "parameters": [{ "name": "include_retired", "in": "query", "schema": { "type": "boolean", "default": false } }],
+        "responses": {
+          "200": {
+            "description": "Active (and optionally retired) packages",
+            "content": { "application/json": { "examples": { "packages": { "$ref": "#/components/examples/KnowledgePackageListEnvelope" } } } }
+          }
+        }
+      }
+    },
+    "/api/v1/knowledge-packages/{id}": {
+      "get": {
+        "tags": ["Knowledge"],
+        "summary": "Get a knowledge package",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "responses": {
+          "200": {
+            "description": "Package detail",
+            "content": { "application/json": { "examples": { "package": { "$ref": "#/components/examples/KnowledgePackageEnvelope" } } } }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/knowledge-packages/{id}/retire": {
+      "post": {
+        "tags": ["Knowledge"],
+        "summary": "Retire a knowledge package",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AuditNote" },
+              "example": { "actor": "sre@example.com", "note": "Superseded by kp_77de02." }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Retired package",
+            "content": { "application/json": { "example": { "status": "ok", "data": { "package_id": "kp_12ab34", "status": "retired", "retired_at": "2026-07-16T11:20:00Z" } } } }
+          },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/knowledge/runtime-snapshot": {
+      "get": {
+        "tags": ["Knowledge"],
+        "summary": "Read the active runtime knowledge snapshot",
+        "responses": {
+          "200": {
+            "description": "Active runtime snapshot",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/KnowledgeRuntimeSnapshot" },
+                "example": { "revision": "rev_2026071601", "packages": [{ "package_id": "kp_12ab34", "root_cause_family": "gpu_hardware_error", "runtime_status": "active", "mirror_status": "synced" }] }
+              }
+            }
+          },
+          "304": { "description": "Not modified" }
+        }
+      }
+    },
+    "/api/v1/knowledge/probe-metrics": {
+      "get": {
+        "tags": ["Knowledge"],
+        "summary": "Read aggregated trace-v3 probe metrics",
+        "responses": {
+          "200": {
+            "description": "Probe utility metrics across approved cases",
+            "content": {
+              "application/json": {
+                "example": {
+                  "status": "ok",
+                  "data": {
+                    "case_count": 37,
+                    "metrics": [
+                      { "template_id": "probe.gpu.xid", "case_count": 12, "executions": 40, "supports": 28, "refutes": 6, "inconclusive": 6, "linked_evidence_count": 22, "linked_hypothesis_count": 10, "final_diagnosis_tests": 12, "final_diagnosis_supported": 11 }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/knowledge/families": {
+      "get": {
+        "tags": ["Knowledge"],
+        "summary": "List configured root-cause families",
+        "responses": {
+          "200": {
+            "description": "Root-cause family catalog",
+            "content": { "application/json": { "example": { "status": "ok", "data": { "families": ["gpu_hardware_error", "scheduler_preemption", "storage_csi_attach", "network_cni", "oom_kill"] } } } }
+          },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/stats/recurrence": {
+      "get": {
+        "tags": ["Operations"],
+        "summary": "Read recurrence statistics",
+        "parameters": [{ "$ref": "#/components/parameters/Days" }],
+        "responses": {
+          "200": {
+            "description": "Recurrence rate over the window",
+            "content": {
+              "application/json": {
+                "example": {
+                  "status": "ok",
+                  "data": {
+                    "days": 7, "rate": 0.31, "total": 42, "recurred": 13,
+                    "daily": [{ "date": "2026-07-16", "total": 6, "recurred": 2, "rate": 0.33 }]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stats/llm-spend": {
+      "get": {
+        "tags": ["Operations"],
+        "summary": "Read LLM spend statistics",
+        "parameters": [{ "$ref": "#/components/parameters/Days" }],
+        "responses": {
+          "200": {
+            "description": "LLM spend over the window",
+            "content": {
+              "application/json": {
+                "example": {
+                  "status": "ok",
+                  "data": {
+                    "days": 7, "calls": 318, "calls_without_usage": 4, "failed_calls": 2,
+                    "prompt_tokens": 1204553, "completion_tokens": 210338, "total_tokens": 1414891, "cost_usd": 12.47,
+                    "by_model": { "claude-opus-4-8": { "calls": 200, "calls_without_usage": 1, "failed_calls": 1, "prompt_tokens": 900000, "completion_tokens": 160000, "total_tokens": 1060000, "cost_usd": 10.10 } },
+                    "daily": [{ "date": "2026-07-16", "calls": 45, "calls_without_usage": 0, "failed_calls": 0, "prompt_tokens": 170000, "completion_tokens": 30000, "total_tokens": 200000, "cost_usd": 1.80 }]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stats/kpi": {
+      "get": {
+        "tags": ["Operations"],
+        "summary": "Read RCA KPI statistics",
+        "parameters": [{ "$ref": "#/components/parameters/Days" }],
+        "responses": {
+          "200": {
+            "description": "Time-to-RCA and time-to-resolve KPIs",
+            "content": {
+              "application/json": {
+                "example": {
+                  "status": "ok",
+                  "data": {
+                    "days": 7,
+                    "time_to_rca": { "count": 40, "avg_minutes": 6.2, "p50_minutes": 4.0, "p90_minutes": 12.0 },
+                    "time_to_resolve": { "count": 33, "avg_minutes": 74.5, "p50_minutes": 55.0, "p90_minutes": 180.0 },
+                    "daily": [{ "date": "2026-07-16", "time_to_rca": { "count": 6, "avg_minutes": 5.1, "p50_minutes": 4.0, "p90_minutes": 9.0 }, "time_to_resolve": { "count": 5, "avg_minutes": 60.0, "p50_minutes": 45.0, "p90_minutes": 120.0 } }]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "tags": ["Operations"],
+        "summary": "Open the server-sent events stream",
+        "responses": {
+          "200": {
+            "description": "text/event-stream of live incident, alert, and analysis updates",
+            "content": { "text/event-stream": { "example": "event: connected\ndata: {\"status\":\"ok\"}\n\nevent: analysis_progress\ndata: {\"run_id\":\"run_7c2d1a\",\"phase\":\"collect\",\"status\":\"running\"}\n\n" } }
+          }
+        }
+      }
+    },
+    "/api/v1/chat": {
+      "post": {
+        "tags": ["Analysis"],
+        "summary": "Chat with the RCA assistant",
+        "description": "Returns the chat answer directly (not wrapped in the { status, data } envelope).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ChatRequest" },
+              "example": { "message": "Why did inc_5f3a9c2b happen?", "conversation_id": "conv_88fe", "language": "ko", "incident_id": "inc_5f3a9c2b" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Chat answer, optionally carrying a freshly created analysis run",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ChatResponse" },
+                "example": { "status": "ok", "answer": "GPU 노드가 드라이버 업그레이드 후 NotReady 상태가 되어 파드가 크래시 루프에 빠졌습니다.", "conversation_id": "conv_88fe" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/chat/conversations": {
+      "get": {
+        "tags": ["Analysis"],
+        "summary": "List chat conversations",
+        "responses": {
+          "200": {
+            "description": "Paginated conversations",
+            "content": {
+              "application/json": {
+                "example": {
+                  "status": "ok",
+                  "data": [{ "id": "conv_88fe", "title": "inc_5f3a9c2b RCA", "context_label": "Incident", "incident_id": "inc_5f3a9c2b", "messages": [], "created_at": "2026-07-16T09:20:00Z", "updated_at": "2026-07-16T09:31:00Z" }],
+                  "pagination": { "total": 3, "limit": 20, "offset": 0, "has_more": false }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/chat/conversations/{id}": {
+      "delete": {
+        "tags": ["Analysis"],
+        "summary": "Delete a chat conversation",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "responses": { "204": { "description": "Deleted" } }
+      }
+    }
   },
   "components": {
     "parameters": {
@@ -55,14 +668,205 @@
     "schemas": {
       "AuditNote": { "type": "object", "properties": { "actor": { "type": "string" }, "note": { "type": "string" } } },
       "KnowledgeDecision": { "allOf": [{ "$ref": "#/components/schemas/AuditNote" }, { "type": "object", "required": ["action"], "properties": { "action": { "type": "string", "enum": ["approve", "shadow", "activate", "reject"] } } }] },
-      "Envelope": { "type": "object", "required": ["data"], "properties": { "data": {} } },
+      "EmbeddingSearchRequest": { "type": "object", "required": ["query"], "properties": { "query": { "type": "string" }, "limit": { "type": "integer", "minimum": 1 } } },
+      "EvaluationReviewInput": {
+        "type": "object",
+        "required": ["case_type", "scores", "hard_gates", "resolution_outcome"],
+        "properties": {
+          "analysis_hash": { "type": "string" },
+          "reviewer": { "type": "string" },
+          "case_type": { "type": "string", "enum": ["known", "compositional", "novel", "tool_degraded"] },
+          "expected_family": { "type": "string" },
+          "scores": { "type": "object", "additionalProperties": { "type": "number" } },
+          "hard_gates": { "type": "object", "additionalProperties": { "type": "boolean" } },
+          "resolution_outcome": { "type": "string", "enum": ["resolved", "mitigated", "ineffective", "unknown"] },
+          "effective_action": { "type": "string" },
+          "notes": { "type": "string" }
+        }
+      },
+      "ChatRequest": {
+        "type": "object",
+        "required": ["message"],
+        "properties": {
+          "message": { "type": "string" },
+          "conversation_id": { "type": "string" },
+          "language": { "type": "string" },
+          "page": { "type": "string" },
+          "auto": { "type": "boolean" },
+          "incident_id": { "type": "string" },
+          "alert_id": { "type": "string" }
+        }
+      },
+      "ChatResponse": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string" },
+          "answer": { "type": "string" },
+          "conversation_id": { "type": "string" },
+          "analysis_run": { "type": "object" }
+        }
+      },
+      "PageInfo": { "type": "object", "properties": { "total": { "type": "integer" }, "limit": { "type": "integer" }, "offset": { "type": "integer" }, "has_more": { "type": "boolean" } } },
+      "Envelope": {
+        "type": "object",
+        "required": ["status", "data"],
+        "properties": {
+          "status": { "type": "string", "example": "ok" },
+          "data": { "description": "Operation payload; shape varies by endpoint." },
+          "pagination": { "$ref": "#/components/schemas/PageInfo" }
+        }
+      },
       "Error": { "type": "object", "properties": { "error": { "type": "string" } } },
       "KnowledgeRuntimeSnapshot": { "type": "object", "required": ["revision", "packages"], "properties": { "revision": { "type": "string" }, "packages": { "type": "array", "items": { "type": "object" } } } }
     },
+    "examples": {
+      "IncidentListEnvelope": {
+        "value": {
+          "status": "ok",
+          "data": [{
+            "incident_id": "inc_5f3a9c2b", "correlation_key": "KubePodCrashLooping/gpu-operator", "title": "KubePodCrashLooping in runai gpu-operator",
+            "severity": "critical", "status": "analyzed", "fired_at": "2026-07-16T09:12:00Z", "resolved_at": null,
+            "user_approved_at": null, "archived_at": null, "deleted_at": null, "alert_count": 3, "is_analyzing": false
+          }],
+          "pagination": { "total": 42, "limit": 20, "offset": 0, "has_more": true }
+        }
+      },
+      "IncidentDetailEnvelope": {
+        "value": {
+          "status": "ok",
+          "data": {
+            "incident_id": "inc_5f3a9c2b", "correlation_key": "KubePodCrashLooping/gpu-operator", "title": "KubePodCrashLooping in runai gpu-operator",
+            "severity": "critical", "status": "analyzed", "fired_at": "2026-07-16T09:12:00Z", "resolved_at": null, "alert_count": 3, "is_analyzing": false,
+            "analysis_run_id": "run_7c2d1a", "analysis_hash": "sha256:9f2c…", "analysis_quality": "high",
+            "analysis_summary": "GPU node NotReady after driver upgrade caused gpu-operator to crash loop.",
+            "analysis_detail": "The nvidia-driver DaemonSet failed to reconcile after a kernel update; kubelet reported the node NotReady and the operator restarted repeatedly.",
+            "capabilities": { "kubernetes": "ok", "runai": "ok", "loki": "degraded" },
+            "missing_data": ["dcgm-exporter metrics"],
+            "warnings": ["Loki token expired mid-collection"],
+            "artifacts": [{ "evidence_id": "E1", "agent": "kubernetes", "source": "kubernetes", "type": "pod_describe", "status": "collected", "confidence": "high", "summary": "gpu-operator restarted 7x; last state CrashLoopBackOff", "highlights": ["CrashLoopBackOff", "node NotReady"] }],
+            "similar_incidents": [], "similar_recent_count": 1,
+            "feedback": { "target_type": "incident", "target_id": "inc_5f3a9c2b", "positive": 2, "negative": 0, "comments": [] },
+            "alerts": []
+          }
+        }
+      },
+      "AlertEnvelope": {
+        "value": {
+          "status": "ok",
+          "data": {
+            "alert_id": "alr_9b1e4d7a", "incident_id": "inc_5f3a9c2b", "alarm_title": "KubePodCrashLooping", "severity": "critical", "status": "firing",
+            "fired_at": "2026-07-16T09:12:00Z", "resolved_at": null, "fingerprint": "a1b2c3d4e5f6a7b8", "occurrence_count": 5,
+            "occurrence_pods": ["gpu-operator-5b9c7d8f6-r2k4n"], "thread_ts": "",
+            "labels": { "alertname": "KubePodCrashLooping", "namespace": "runai", "pod": "gpu-operator-5b9c7d8f6-r2k4n", "severity": "critical" },
+            "annotations": { "summary": "Pod runai/gpu-operator is crash looping" },
+            "similar_incidents": [],
+            "feedback": { "target_type": "alert", "target_id": "alr_9b1e4d7a", "positive": 0, "negative": 0, "comments": [] },
+            "is_analyzing": false
+          }
+        }
+      },
+      "AlertListEnvelope": {
+        "value": {
+          "status": "ok",
+          "data": [{
+            "alert_id": "alr_9b1e4d7a", "incident_id": "inc_5f3a9c2b", "alarm_title": "KubePodCrashLooping", "severity": "critical", "status": "firing",
+            "fired_at": "2026-07-16T09:12:00Z", "fingerprint": "a1b2c3d4e5f6a7b8", "occurrence_count": 5, "thread_ts": "",
+            "labels": { "alertname": "KubePodCrashLooping", "namespace": "runai" }, "annotations": {},
+            "similar_incidents": [], "feedback": { "target_type": "alert", "target_id": "alr_9b1e4d7a", "positive": 0, "negative": 0, "comments": [] }, "is_analyzing": false
+          }],
+          "pagination": { "total": 128, "limit": 20, "offset": 0, "has_more": true }
+        }
+      },
+      "AnalysisRunEnvelope": {
+        "value": {
+          "status": "ok",
+          "data": {
+            "run_id": "run_7c2d1a", "source": "webhook", "status": "complete", "target_type": "incident", "target_id": "inc_5f3a9c2b",
+            "incident_id": "inc_5f3a9c2b", "title": "KubePodCrashLooping in runai gpu-operator",
+            "analysis_summary": "GPU node NotReady after driver upgrade caused gpu-operator to crash loop.",
+            "analysis_detail": "The nvidia-driver DaemonSet failed to reconcile after a kernel update.",
+            "analysis_quality": "high", "capabilities": { "kubernetes": "ok", "runai": "ok" }, "missing_data": [], "warnings": [],
+            "artifacts": [{ "evidence_id": "E1", "agent": "kubernetes", "source": "kubernetes", "type": "pod_describe", "status": "collected", "confidence": "high", "summary": "gpu-operator restarted 7x" }],
+            "first_completed_at": "2026-07-16T09:18:00Z", "created_at": "2026-07-16T09:12:30Z", "updated_at": "2026-07-16T09:18:00Z"
+          }
+        }
+      },
+      "AnalysisRunListEnvelope": {
+        "value": {
+          "status": "ok",
+          "data": [{ "run_id": "run_7c2d1a", "source": "webhook", "status": "complete", "target_type": "incident", "target_id": "inc_5f3a9c2b", "incident_id": "inc_5f3a9c2b", "title": "KubePodCrashLooping in runai gpu-operator", "analysis_quality": "high", "created_at": "2026-07-16T09:12:30Z", "updated_at": "2026-07-16T09:18:00Z" }],
+          "pagination": { "total": 64, "limit": 20, "offset": 0, "has_more": true }
+        }
+      },
+      "EvaluationEnvelope": {
+        "value": {
+          "status": "ok",
+          "data": {
+            "run_id": "run_7c2d1a", "analysis_hash": "sha256:9f2c…", "average_score": 4.5,
+            "reviews": [{ "review_id": "rev_01", "run_id": "run_7c2d1a", "analysis_hash": "sha256:9f2c…", "reviewer": "sre@example.com", "case_type": "known", "expected_family": "gpu_hardware_error", "scores": { "accuracy": 4, "actionability": 5 }, "hard_gates": { "cited_evidence": true }, "resolution_outcome": "resolved", "created_at": "2026-07-16T10:00:00Z", "updated_at": "2026-07-16T10:00:00Z" }]
+          }
+        }
+      },
+      "EvaluationReviewEnvelope": {
+        "value": {
+          "status": "ok",
+          "data": { "review_id": "rev_01", "run_id": "run_7c2d1a", "analysis_hash": "sha256:9f2c…", "reviewer": "sre@example.com", "case_type": "known", "expected_family": "gpu_hardware_error", "scores": { "accuracy": 4, "actionability": 5 }, "hard_gates": { "cited_evidence": true, "no_hallucinated_pods": true }, "resolution_outcome": "resolved", "effective_action": "Cordoned node and replaced the GPU.", "created_at": "2026-07-16T10:00:00Z", "updated_at": "2026-07-16T11:05:00Z" }
+        }
+      },
+      "FeedbackSummaryEnvelope": {
+        "value": {
+          "status": "ok",
+          "data": {
+            "target_type": "incident", "target_id": "inc_5f3a9c2b", "positive": 3, "negative": 0, "my_vote": "up",
+            "comments": [{ "comment_id": "cmt_01", "target_type": "incident", "target_id": "inc_5f3a9c2b", "incident_id": "inc_5f3a9c2b", "body": "Confirmed GPU node NotReady; draining.", "author": "on-call@example.com", "created_at": "2026-07-16T09:40:00Z" }]
+          }
+        }
+      },
+      "KnowledgeCandidateEnvelope": {
+        "value": {
+          "status": "ok",
+          "data": {
+            "candidate_id": "kc_44ab19", "status": "ready_for_review", "title": "GPU node NotReady after driver upgrade",
+            "summary": "Driver DaemonSet crash after kernel bump drives the node NotReady and crash-loops gpu-operator.",
+            "root_cause_family": "gpu_hardware_error", "kind": "signature", "confidence": 0.86,
+            "incident_id": "inc_5f3a9c2b", "supporting_case_count": 3, "analysis_run_id": "run_7c2d1a", "analysis_hash": "sha256:9f2c…",
+            "evidence_summaries": [{ "evidence_id": "E1", "entity": "node/gpu-01", "source": "kubernetes", "source_group": "k8s", "predicate": "node_condition", "polarity": "problem", "coverage": "direct", "quality": "high" }],
+            "probe_template_ids": ["probe.gpu.xid"], "created_at": "2026-07-16T09:19:00Z"
+          }
+        }
+      },
+      "KnowledgeCandidateListEnvelope": {
+        "value": {
+          "status": "ok",
+          "data": [{ "candidate_id": "kc_44ab19", "status": "ready_for_review", "title": "GPU node NotReady after driver upgrade", "root_cause_family": "gpu_hardware_error", "kind": "signature", "confidence": 0.86, "incident_id": "inc_5f3a9c2b", "supporting_case_count": 3, "created_at": "2026-07-16T09:19:00Z" }],
+          "pagination": { "total": 9, "limit": 20, "offset": 0, "has_more": false }
+        }
+      },
+      "KnowledgePackageEnvelope": {
+        "value": {
+          "status": "ok",
+          "data": {
+            "package_id": "kp_12ab34", "status": "active", "title": "GPU node NotReady after driver upgrade",
+            "root_cause_family": "gpu_hardware_error", "candidate_id": "kc_44ab19", "confidence": 0.86,
+            "evidence_summaries": [{ "evidence_id": "E1", "entity": "node/gpu-01", "source": "kubernetes", "predicate": "node_condition", "polarity": "problem" }],
+            "probe_template_ids": ["probe.gpu.xid"], "published_at": "2026-07-16T10:05:00Z",
+            "mirror_status": "synced", "runtime_status": "active", "mirror_updated_at": "2026-07-16T10:06:00Z"
+          }
+        }
+      },
+      "KnowledgePackageListEnvelope": {
+        "value": {
+          "status": "ok",
+          "data": [{ "package_id": "kp_12ab34", "status": "active", "title": "GPU node NotReady after driver upgrade", "root_cause_family": "gpu_hardware_error", "candidate_id": "kc_44ab19", "confidence": 0.86, "published_at": "2026-07-16T10:05:00Z", "mirror_status": "synced", "runtime_status": "active" }],
+          "pagination": { "total": 5, "limit": 20, "offset": 0, "has_more": false }
+        }
+      }
+    },
     "responses": {
-      "Envelope": { "description": "Successful envelope response", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Envelope" } } } },
-      "Error": { "description": "Error response", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
-      "KnowledgeRuntimeSnapshot": { "description": "Active runtime snapshot", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/KnowledgeRuntimeSnapshot" } } } }
+      "Error": {
+        "description": "Error response",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" }, "example": { "error": "incident not found" } } }
+      }
     }
   }
 }

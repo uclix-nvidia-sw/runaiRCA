@@ -70,8 +70,18 @@ export type EvaluationReview = {
   resolution_outcome: 'resolved' | 'mitigated' | 'ineffective' | 'unknown';
   effective_action?: string;
   notes?: string;
+  operator_confirmed?: boolean;
   created_at: string;
   updated_at: string;
+};
+
+export type KnowledgePromotionPreview = {
+  outcome: 'ready' | 'validation_failed' | 'blocked' | 'not_approved';
+  reason?: string;
+  family?: string;
+  evidence_count: number;
+  probe_count: number;
+  candidate_id?: string;
 };
 
 export type EvaluationView = {
@@ -81,6 +91,7 @@ export type EvaluationView = {
   my_review?: EvaluationReview;
   reviews: EvaluationReview[];
   average_score: number;
+  knowledge_preview?: KnowledgePromotionPreview;
 };
 
 export type RootCauseFamilyCatalog = {

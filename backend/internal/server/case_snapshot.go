@@ -155,7 +155,32 @@ func (s *Store) knowledgeCandidateForSnapshotLocked(snapshot *CaseSnapshot) *Kno
 	if !hasReviews || !allowsPromotion {
 		return nil
 	}
-	return knowledgeCandidateForSnapshotWithOutcome(snapshot, true)
+	return knowledgeCandidateForSnapshotWithOutcome(snapshot, true, s.operatorConfirmedForSnapshotLocked(snapshot))
+}
+
+// operatorConfirmedForSnapshotLocked reports whether an operator explicitly
+// confirmed this exact analysis's root-cause family for a non-reproducible
+// incident. It requires the confirming review to also name the snapshot family
+// and clear the same quality floor as any promotion, so confirmation cannot
+// smuggle a low-quality review past the gate — it only relaxes the trace-v3
+// status/confidence requirement (see readyTraceV3Hypothesis).
+func (s *Store) operatorConfirmedForSnapshotLocked(snapshot *CaseSnapshot) bool {
+	if snapshot == nil {
+		return false
+	}
+	family := strings.TrimSpace(snapshot.RootCauseFamily)
+	if family == "" {
+		return false
+	}
+	for _, review := range s.evaluationReviews {
+		if review == nil || review.RunID != snapshot.RunID || review.AnalysisHash != snapshot.AnalysisHash {
+			continue
+		}
+		if review.OperatorConfirmed && strings.TrimSpace(review.ExpectedFamily) == family && evaluationReviewPassesKnowledgeQuality(review) {
+			return true
+		}
+	}
+	return false
 }
 
 // caseReviewAllowsKnowledgePromotionLocked binds operator judgment to the exact

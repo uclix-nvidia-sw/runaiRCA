@@ -94,6 +94,148 @@ func TestOperatorExpectedFamilyGatesKnowledgeGenerationAndPromotion(t *testing.T
 	}
 }
 
+func TestKnowledgePromotionPreviewSurfacesIngestionOutcome(t *testing.T) {
+	store := NewStore()
+	snapshot := eligibleKnowledgeSnapshot()
+	snapshot.ApprovalState = "active"
+	store.caseSnapshots[snapshot.CaseID] = snapshot
+
+	// No approved snapshot for that run/hash: the RCA has not been approved yet.
+	if got := store.knowledgePromotionPreviewLocked("ANL-missing", "hash"); got.Outcome != "not_approved" {
+		t.Fatalf("unknown run should be not_approved, got %+v", got)
+	}
+	// Approved but not yet evaluated: blocked pending a review.
+	if got := store.knowledgePromotionPreviewLocked(snapshot.RunID, snapshot.AnalysisHash); got.Outcome != "blocked" {
+		t.Fatalf("missing review should block, got %+v", got)
+	}
+	// A qualifying, family-matching review makes it ready with a concrete family/evidence/probe.
+	confirmKnowledgeSnapshot(store, snapshot)
+	ready := store.knowledgePromotionPreviewLocked(snapshot.RunID, snapshot.AnalysisHash)
+	if ready.Outcome != "ready" || ready.Family != snapshot.RootCauseFamily || ready.EvidenceCount == 0 || ready.ProbeCount == 0 {
+		t.Fatalf("qualifying review should preview ready with detail: %+v", ready)
+	}
+	// A family-mismatched review fails closed exactly like the real promotion gate.
+	store.evaluationReviews[evaluationKey(snapshot.RunID, snapshot.AnalysisHash, "operator")].ExpectedFamily = "gpu_hardware_error"
+	if got := store.knowledgePromotionPreviewLocked(snapshot.RunID, snapshot.AnalysisHash); got.Outcome != "blocked" {
+		t.Fatalf("family mismatch should block, got %+v", got)
+	}
+}
+
+func TestValidationFailedCandidateStaysIdentifiable(t *testing.T) {
+	snapshot := eligibleKnowledgeSnapshot()
+	// Break the v3 trace so no supported hypothesis matches the final root cause.
+	trace := snapshot.Snapshot["metadata"].(map[string]any)["reasoning_trace_v3"].(map[string]any)
+	trace["hypotheses"] = []any{}
+
+	candidate := knowledgeCandidateForSnapshotWithOutcome(snapshot, true, false)
+	if candidate == nil || candidate.Status != knowledgeCandidateValidationFailed {
+		t.Fatalf("expected a validation_failed candidate, got %+v", candidate)
+	}
+	if candidate.ValidationError == "" {
+		t.Fatal("failed candidate must carry the validation reason")
+	}
+	// The reviewer must still be able to tell which incident/family/analysis failed.
+	if candidate.RootCauseFamily != snapshot.RootCauseFamily || candidate.Title == "" ||
+		candidate.AnalysisRunID != snapshot.RunID || candidate.AnalysisHash != snapshot.AnalysisHash {
+		t.Fatalf("failed candidate lost its incident identity: %+v", candidate)
+	}
+	// It must never look promotable: no compiled failure modes / probes.
+	if len(candidate.ProbeTemplateIDs) != 0 || candidate.Kind != "" {
+		t.Fatalf("failed candidate must not carry compiled knowledge: %+v", candidate)
+	}
+}
+
+func TestOperatorConfirmationOverridesUnsupportedHypothesis(t *testing.T) {
+	// A non-reproducible incident: the sole family-matching hypothesis never reached
+	// "supported" (probes stayed inconclusive) but is still evidence-backed.
+	base := func() *CaseSnapshot {
+		snap := eligibleKnowledgeSnapshot()
+		snap.ApprovalState = "active"
+		hyp := snap.Snapshot["metadata"].(map[string]any)["reasoning_trace_v3"].(map[string]any)["hypotheses"].([]any)[0].(map[string]any)
+		hyp["status"] = "uncertain"
+		hyp["confidence"] = 0.4
+		return snap
+	}
+
+	// Without confirmation it fails closed exactly as today.
+	if c := knowledgeCandidateForSnapshotWithOutcome(base(), true, false); c == nil || c.Status != knowledgeCandidateValidationFailed {
+		t.Fatalf("unconfirmed unsupported hypothesis must fail: %+v", c)
+	}
+	// With confirmation it promotes — it still carries real evidence + a linked probe.
+	if c := knowledgeCandidateForSnapshotWithOutcome(base(), true, true); c == nil || c.Status != knowledgeCandidateReady {
+		t.Fatalf("operator confirmation should promote an evidence-backed hypothesis: %+v", c)
+	}
+	// The evidence floor is NOT relaxed: strip supporting evidence and confirmation cannot save it.
+	noEvidence := base()
+	noEvidence.Snapshot["metadata"].(map[string]any)["reasoning_trace_v3"].(map[string]any)["hypotheses"].([]any)[0].(map[string]any)["evidence_for"] = []any{}
+	if c := knowledgeCandidateForSnapshotWithOutcome(noEvidence, true, true); c == nil || c.Status != knowledgeCandidateValidationFailed {
+		t.Fatalf("confirmation must not fabricate evidence-free knowledge: %+v", c)
+	}
+
+	// Store gate: an operator_confirmed review flips the full gated path to ready,
+	// but only when it names the snapshot family and clears the quality floor.
+	store := NewStore()
+	snap := base()
+	store.caseSnapshots[snap.CaseID] = snap
+	review := &EvaluationReview{
+		ReviewID: "EVR-c", RunID: snap.RunID, AnalysisHash: snap.AnalysisHash, Reviewer: "operator",
+		CaseType: "known", ExpectedFamily: snap.RootCauseFamily, Scores: qualifyingKnowledgeReviewScores(),
+		ResolutionOutcome: "resolved", Notes: "reproduced manually offline", OperatorConfirmed: true,
+	}
+	store.evaluationReviews[evaluationKey(snap.RunID, snap.AnalysisHash, "operator")] = review
+	if c := store.knowledgeCandidateForSnapshotLocked(snap); c == nil || c.Status != knowledgeCandidateReady {
+		t.Fatalf("confirmed review should promote through the full gate: %+v", c)
+	}
+	review.ExpectedFamily = "gpu_hardware_error"
+	if store.operatorConfirmedForSnapshotLocked(snap) {
+		t.Fatal("confirmation must match the snapshot family, not an arbitrary one")
+	}
+}
+
+func TestOperatorConfirmSupersedesFailedCandidateThroughReview(t *testing.T) {
+	s := NewStore()
+	s.SeedDevFixtures()
+	scores := map[string]int{}
+	for _, d := range evaluationDimensions {
+		scores[d] = 5
+	}
+	base := EvaluationReviewRequest{
+		Author: "op", AnalysisHash: "devhash01", CaseType: "known",
+		ExpectedFamily: "workload_startup_error", Scores: scores, ResolutionOutcome: "resolved",
+	}
+	allowed := []string{"workload_startup_error"}
+
+	// A plain review yields one validation_failed candidate that still names its incident.
+	if _, _, err := s.UpsertEvaluationReview("ANL-DEV-000001", base, allowed); err != nil {
+		t.Fatal(err)
+	}
+	failed := s.ListKnowledgeCandidates("")
+	if len(failed) != 1 || failed[0].Status != knowledgeCandidateValidationFailed ||
+		failed[0].RootCauseFamily != "workload_startup_error" || failed[0].Title == "" {
+		t.Fatalf("expected one identifiable validation_failed candidate, got %+v", failed)
+	}
+
+	// Operator confirmation promotes it; the stale failed candidate is superseded, not duplicated.
+	confirmed := base
+	confirmed.OperatorConfirmed = true
+	confirmed.Notes = "reproduced offline"
+	if _, _, err := s.UpsertEvaluationReview("ANL-DEV-000001", confirmed, allowed); err != nil {
+		t.Fatal(err)
+	}
+	var ready, superseded int
+	for _, c := range s.ListKnowledgeCandidates("") {
+		switch c.Status {
+		case knowledgeCandidateReady:
+			ready++
+		case knowledgeCandidateSuperseded:
+			superseded++
+		}
+	}
+	if ready != 1 || superseded != 1 {
+		t.Fatalf("confirmation should leave 1 ready + 1 superseded, got ready=%d superseded=%d", ready, superseded)
+	}
+}
+
 func TestOperatorReviewQualityVetoesKnowledgeGeneration(t *testing.T) {
 	tests := []struct {
 		name   string

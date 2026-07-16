@@ -186,10 +186,10 @@ func cloneKnowledgePackage(in *KnowledgePackage) KnowledgePackage {
 }
 
 func knowledgeCandidateForSnapshot(snapshot *CaseSnapshot) *KnowledgeCandidate {
-	return knowledgeCandidateForSnapshotWithOutcome(snapshot, false)
+	return knowledgeCandidateForSnapshotWithOutcome(snapshot, false, false)
 }
 
-func knowledgeCandidateForSnapshotWithOutcome(snapshot *CaseSnapshot, operatorOutcome bool) *KnowledgeCandidate {
+func knowledgeCandidateForSnapshotWithOutcome(snapshot *CaseSnapshot, operatorOutcome, operatorConfirmed bool) *KnowledgeCandidate {
 	if snapshot == nil {
 		return nil
 	}
@@ -202,9 +202,19 @@ func knowledgeCandidateForSnapshotWithOutcome(snapshot *CaseSnapshot, operatorOu
 	if !operatorOutcome && !caseSnapshotHasOperatorOutcome(snapshot) {
 		return nil
 	}
-	payload, validationError := compiledKnowledgePayload(snapshot, trace)
+	payload, validationError := compiledKnowledgePayload(snapshot, trace, operatorConfirmed)
 	fingerprint := knowledgeFingerprint(payload)
 	contentHash := knowledgeContentHash(trace, payload)
+	if validationError != "" {
+		// A failed candidate has no compiled payload, so its display would be
+		// "Untitled / Unclassified family / not reported" even though the incident,
+		// family, and analysis are all known. Attach an identity-only payload so the
+		// reviewer can tell which incident failed and why. This never makes it
+		// promotable — promotion re-validates from the immutable trace, not this
+		// payload — and identity (fingerprint/contentHash) was computed above from the
+		// real payload and is deliberately left unchanged.
+		payload = knowledgeFailedIdentityPayload(snapshot)
+	}
 	candidate := &KnowledgeCandidate{
 		CandidateID: "KNC-" + fingerprint[:16] + "-" + contentHash[:16], KnowledgeFingerprint: fingerprint,
 		CaseID: snapshot.CaseID, SupportingCaseIDs: []string{snapshot.CaseID}, SupportingCaseCount: 1, IncidentID: snapshot.IncidentID, RunID: snapshot.RunID,
@@ -218,6 +228,25 @@ func knowledgeCandidateForSnapshotWithOutcome(snapshot *CaseSnapshot, operatorOu
 	}
 	hydrateKnowledgeCandidate(candidate)
 	return candidate
+}
+
+// knowledgeFailedIdentityPayload is a minimal, non-promotable payload for a
+// validation-failed candidate: enough for the review UI to name the incident,
+// family, and analysis. It deliberately carries no compiled failure_modes/probes,
+// so it can never be mistaken for runtime knowledge.
+func knowledgeFailedIdentityPayload(snapshot *CaseSnapshot) map[string]any {
+	title := strings.TrimSpace(stringValue(snapshot.Snapshot["analysis_summary"]))
+	if title == "" {
+		title = strings.TrimSpace(snapshot.RootCauseFamily)
+	}
+	return map[string]any{
+		"root_cause_family": snapshot.RootCauseFamily,
+		"family":            snapshot.RootCauseFamily,
+		"title":             title,
+		"analysis_run_id":   snapshot.RunID,
+		"analysis_hash":     snapshot.AnalysisHash,
+		"runtime_status":    "not_published",
+	}
 }
 
 func caseSnapshotHasOperatorOutcome(snapshot *CaseSnapshot) bool {
@@ -342,7 +371,7 @@ func sanitizeObservationWindow(window map[string]any) map[string]any {
 
 // compiledKnowledgePayload is intentionally a narrow public representation.
 // It excludes analysis prose, artifacts, raw evidence, tool queries, and logs.
-func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any) (map[string]any, string) {
+func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, operatorConfirmed bool) (map[string]any, string) {
 	if snapshot == nil {
 		return nil, "missing source case snapshot"
 	}
@@ -359,7 +388,7 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any) (map
 	if !harnessHardGatesPassed(harness) {
 		return nil, "all non-empty harness hard gates must pass"
 	}
-	hypothesis, support, contradiction, err := readyTraceV3Hypothesis(trace, snapshot.RootCauseFamily, snapshot.Mechanism)
+	hypothesis, support, contradiction, err := readyTraceV3Hypothesis(trace, snapshot.RootCauseFamily, snapshot.Mechanism, operatorConfirmed)
 	if err != "" {
 		return nil, err
 	}
@@ -636,7 +665,7 @@ func knowledgeEvidenceSummaries(raw any) []KnowledgeEvidenceSummary {
 	return out
 }
 
-func readyTraceV3Hypothesis(trace map[string]any, finalFamily, finalMechanism string) (map[string]any, map[string]bool, map[string]bool, string) {
+func readyTraceV3Hypothesis(trace map[string]any, finalFamily, finalMechanism string, operatorConfirmed bool) (map[string]any, map[string]bool, map[string]bool, string) {
 	hypotheses, _ := trace["hypotheses"].([]any)
 	evidence, _ := trace["evidence"].([]any)
 	knownEvidence := map[string]bool{}
@@ -645,11 +674,15 @@ func readyTraceV3Hypothesis(trace map[string]any, finalFamily, finalMechanism st
 			knownEvidence[stringValue(item["evidence_id"])] = true
 		}
 	}
+	// status == "" matches any status; used only for the operator-confirmed override.
 	selectMatching := func(status string) []map[string]any {
 		matches := []map[string]any{}
 		for _, raw := range hypotheses {
 			hypothesis, ok := raw.(map[string]any)
-			if !ok || strings.ToLower(stringValue(hypothesis["status"])) != status {
+			if !ok {
+				continue
+			}
+			if status != "" && strings.ToLower(stringValue(hypothesis["status"])) != status {
 				continue
 			}
 			family, mechanism := strings.TrimSpace(stringValue(hypothesis["family"])), strings.TrimSpace(stringValue(hypothesis["mechanism"]))
@@ -668,7 +701,18 @@ func readyTraceV3Hypothesis(trace map[string]any, finalFamily, finalMechanism st
 		selected = selectMatching("supported")
 	}
 	if len(selected) != 1 {
-		return nil, nil, nil, "expected exactly one supported trace-v3 hypothesis matching final root cause"
+		if !operatorConfirmed {
+			return nil, nil, nil, "expected exactly one supported trace-v3 hypothesis matching final root cause"
+		}
+		// Operator override for non-reproducible incidents: accept a family-matching
+		// hypothesis in ANY status when the operator has explicitly confirmed the
+		// diagnosis. This relaxes the status/confidence requirement ONLY — the
+		// evidence, contradiction, and probe-linkage gates below are unchanged, so
+		// promoted knowledge still carries at least one real supporting observation.
+		selected = selectMatching("")
+		if len(selected) != 1 {
+			return nil, nil, nil, "operator confirmation needs exactly one trace-v3 hypothesis matching the confirmed root cause"
+		}
 	}
 	for _, hypothesis := range selected {
 		id, family, mechanism := strings.TrimSpace(stringValue(hypothesis["hypothesis_id"])), strings.TrimSpace(stringValue(hypothesis["family"])), strings.TrimSpace(stringValue(hypothesis["mechanism"]))
@@ -676,7 +720,7 @@ func readyTraceV3Hypothesis(trace map[string]any, finalFamily, finalMechanism st
 			return nil, nil, nil, "selected trace hypothesis is incomplete"
 		}
 		confidence, ok := numberToFloat(hypothesis["confidence"])
-		if !ok || confidence < 0.7 {
+		if !operatorConfirmed && (!ok || confidence < 0.7) {
 			return nil, nil, nil, "selected trace hypothesis confidence must be at least 0.7"
 		}
 		support, against := map[string]bool{}, map[string]bool{}
