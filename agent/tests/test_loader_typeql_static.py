@@ -58,5 +58,7 @@ def test_every_exists_match_binds_dollar_x(path: Path) -> None:
     if path.name.startswith("load_") and path.name not in (
         "load_schema.py",
         "load_functions.py",
+        # Delegates all TypeQL to ingest / load_knowledge helpers; owns no _exists() calls.
+        "load_external_cases.py",
     ):
         assert checked > 0, f"{path.name}: expected _exists() calls to check"

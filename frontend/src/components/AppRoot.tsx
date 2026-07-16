@@ -23,7 +23,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
@@ -658,14 +658,14 @@ function App() {
         <nav className="utility-nav" aria-label="Incident lifecycle views">
           <a
             className="nav-item icon-only-nav-item"
-            href="/api-docs"
+            href="https://uclix.gitbook.io/run-ai-rca-docs"
             target="_blank"
             rel="noreferrer"
-            aria-label="API Docs"
-            title="API Docs"
+            aria-label="Documentation"
+            title="Documentation"
           >
             <BookOpen size={18} />
-            <span className="sr-only">API Docs</span>
+            <span className="sr-only">Documentation</span>
           </a>
           <button
             className={`nav-item icon-only-nav-item ${activeView === 'archived' ? 'active' : ''}`}
@@ -815,6 +815,10 @@ function UnifiedWorkspace({
   onResolve: (id: string) => Promise<void>;
 }) {
   const [busyAction, setBusyAction] = useState('');
+  const [closing, setClosing] = useState(false);
+  const [justApproved, setJustApproved] = useState(false);
+  const closeTimerRef = useRef<number | null>(null);
+  const approveTimerRef = useRef<number | null>(null);
   const runWorkspaceAction = useCallback(async (action: string, work: () => Promise<void>) => {
     if (busyAction) return;
     setBusyAction(action);
@@ -824,6 +828,65 @@ function UnifiedWorkspace({
       setBusyAction('');
     }
   }, [busyAction]);
+
+  const detailKey = detail
+    ? detail.kind === 'incident'
+      ? detail.data.incident_id
+      : detail.data.alert_id
+    : null;
+
+  // Opening a different target (or reopening) cancels any in-flight close, so the
+  // new detail shows immediately instead of finishing the previous exit animation.
+  useEffect(() => {
+    setClosing(false);
+    if (closeTimerRef.current !== null) {
+      window.clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
+  }, [detailKey]);
+
+  useEffect(() => () => {
+    if (closeTimerRef.current !== null) window.clearTimeout(closeTimerRef.current);
+    if (approveTimerRef.current !== null) window.clearTimeout(approveTimerRef.current);
+  }, []);
+
+  // Play the exit animation, then let the parent unmount. Timer-based (not
+  // animationend) so it still closes under prefers-reduced-motion.
+  const handleClose = useCallback(() => {
+    if (closeTimerRef.current !== null) return;
+    setClosing(true);
+    closeTimerRef.current = window.setTimeout(() => {
+      closeTimerRef.current = null;
+      onClose();
+    }, 220);
+  }, [onClose]);
+
+  const flashApproved = useCallback(() => {
+    setJustApproved(true);
+    if (approveTimerRef.current !== null) window.clearTimeout(approveTimerRef.current);
+    approveTimerRef.current = window.setTimeout(() => {
+      approveTimerRef.current = null;
+      setJustApproved(false);
+    }, 1400);
+  }, []);
+
+  const sectionRef = useRef<HTMLElement | null>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
+
+  // Dialog focus management: remember what opened the workspace (the table row
+  // activated by Enter/click), move focus into the dialog so Tab starts on its
+  // actions instead of the covered list, and hand focus back on close.
+  // useLayoutEffect, not useEffect: the same commit that mounts the dialog also
+  // hides `.main` (visibility), and the browser blurs the row during the style
+  // recalc that follows — a passive effect would only ever see <body> focused.
+  useLayoutEffect(() => {
+    if (!detailKey) return undefined;
+    openerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    sectionRef.current?.focus();
+    return () => {
+      openerRef.current?.focus();
+    };
+  }, [detailKey]);
 
   if (!detail) return null;
   const incident = detail.kind === 'incident' ? detail.data : null;
@@ -859,7 +922,23 @@ function UnifiedWorkspace({
   };
 
   return (
-    <section className="workspace">
+    <section
+      className={`workspace ${closing ? 'is-closing' : ''}`}
+      ref={sectionRef}
+      tabIndex={-1}
+      role="dialog"
+      aria-modal="true"
+      aria-label={title || `${detail.kind} detail`}
+      onKeyDown={(event) => {
+        if (event.key !== 'Escape') return;
+        // Don't steal Escape from form fields (evaluation notes, comments) —
+        // closing the whole dialog mid-edit would discard the operator's text.
+        const target = event.target as HTMLElement;
+        if (target.closest('input, textarea, select, [contenteditable="true"]')) return;
+        event.stopPropagation();
+        handleClose();
+      }}
+    >
       <div className="workspace-header">
         <div>
           <p className="eyebrow">{detail.kind} detail</p>
@@ -888,7 +967,7 @@ function UnifiedWorkspace({
           <AffectedPods pods={affectedPods} />
         </div>
         <div className="workspace-actions">
-          <button className="ghost-button" onClick={onClose} type="button"><ArrowLeft size={16} /> Back</button>
+          <button className="ghost-button" onClick={handleClose} type="button"><ArrowLeft size={16} /> Back</button>
           <button
             className={`ghost-button ${busyAction === 'refresh' ? 'is-busy is-spinning' : ''}`}
             disabled={Boolean(busyAction)}
@@ -916,9 +995,12 @@ function UnifiedWorkspace({
                 <Download size={16} /> {busyAction === 'export' ? 'Exporting...' : 'Export'}
               </button>
               <button
-                className={`primary-button ${busyAction === 'resolve' ? 'is-busy' : ''}`}
+                className={`primary-button ${busyAction === 'resolve' ? 'is-busy' : ''} ${justApproved ? 'just-approved' : ''}`}
                 disabled={Boolean(busyAction)}
-                onClick={() => void runWorkspaceAction('resolve', () => onResolve(incident.incident_id))}
+                onClick={() => void runWorkspaceAction('resolve', async () => {
+                  await onResolve(incident.incident_id);
+                  flashApproved();
+                })}
                 type="button"
               >
                 <CheckCircle2 size={16} /> {busyAction === 'resolve' ? 'Updating...' : incident.user_approved_at ? 'Unapprove' : 'Approve'}
@@ -997,7 +1079,11 @@ function UnifiedWorkspace({
             // confused operators into reading the old RCA as the new result.
             <p className="empty">Analyzing… a new RCA report is being generated. The previous report will be replaced when it completes.</p>
           ) : analysis ? (
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{analysis}</ReactMarkdown>
+            // Wrapped so the report fades in when it replaces the "Analyzing…"
+            // placeholder (or arrives on open) instead of teleporting in.
+            <div className="rca-report-body">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{analysis}</ReactMarkdown>
+            </div>
           ) : (
             <p className="empty">No RCA report yet.</p>
           )}

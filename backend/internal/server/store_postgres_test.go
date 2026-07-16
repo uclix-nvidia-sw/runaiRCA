@@ -39,7 +39,6 @@ func TestPostgresConnectReportsPGVectorEnabledAndLoadsState(t *testing.T) {
 		t.Fatalf("expected chat history schema statements, got %+v", state.Execs())
 	}
 	if !state.Executed("CREATE TABLE IF NOT EXISTS rca_case_snapshots") ||
-		!state.Executed("CREATE TABLE IF NOT EXISTS novel_cause_registry") ||
 		!state.Executed("idx_rca_case_snapshots_active_incident") {
 		t.Fatalf("expected immutable case snapshot schema statements, got %+v", state.Execs())
 	}

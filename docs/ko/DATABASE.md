@@ -38,25 +38,89 @@ flowchart LR
 
 ### 작업에 따라 데이터 찾기
 
-현재 인시던트, 알림, analysis run, 피드백, 유사도 검색은 PostgreSQL을 사용합니다. TypeDB는
-선택 사항인 토폴로지와 승인 이력 관계에만 사용하며, 두 번째 운영 신뢰 원천이 아닙니다.
+현재 인시던트와 그 알림, analysis run, 운영자 피드백, 유사도 검색, 그리고 승인 지식 학습
+파이프라인은 PostgreSQL을 사용합니다. TypeDB는 선택 사항인 토폴로지와 승인 이력 관계에만
+사용하며, 두 번째 운영 신뢰 원천이 아닙니다.
 
-테이블은 시작 시 백엔드가 자동 생성합니다(`backend/store_postgres.go`).
+테이블은 시작 시 백엔드가 자동 생성합니다(`backend/store_postgres.go`). 총 14개이며,
+역할별로 묶으면 다음과 같습니다.
+
+**수집 & 분석**
 
 | 테이블 | 목적 | 주요 컬럼 |
 |---|---|---|
-| `incidents` | 상관된 알림 그룹 | `incident_id` (PK), `correlation_key`, `title`, `severity`, `status`, `fired_at`, `resolved_at`, `alert_count` |
-| `alerts` | 개별 알림 + 해당 RCA | `alert_id` (PK), `incident_id` (FK), `fingerprint`, `occurrence_count`, `occurrence_pods` (JSONB), `labels`/`annotations` (JSONB), `analysis_summary`/`analysis_detail`, `analysis_quality`, `capabilities`/`missing_data`/`warnings`/`artifacts` (JSONB) |
-| `incident_embeddings` | 유사도 메모리 | `incident_id` (PK), `alert_id`, `analysis_summary`/`analysis_detail`, `labels` (JSONB), `vector_json` (JSONB), `embedding vector(384)` + HNSW cosine index |
-| `rca_feedback` | 운영자 투표 | `feedback_id` (PK), `target_type`, `target_id`, `vote` (`up`/`down`), `author`, `created_at` |
-| `rca_comments` | 운영자 메모 | `comment_id` (PK), `target_type`, `target_id`, `body`, `author`, `created_at` |
-| `analysis_runs` | RCA 실행 이력 | `run_id` (PK), `source` (`auto`/`manual`/`chat`/`feedback`), `status`, `target_type`, `target_id`, `analysis_*`, `created_at` |
+| `incidents` | 상관된 알림 그룹 — RCA와 Slack 스레드의 단위 | `incident_id` (PK), `correlation_key`, `status`, `fired_at`, `resolved_at`, `alert_count`, `analysis_seq`, `user_approved_at` |
+| `alerts` | 개별 알림. 같은 알림의 재발은 여기 누적 | `alert_id` (PK), `incident_id`, `fingerprint`, `occurrence_count`, `occurrence_pods` (JSONB), `labels`/`annotations` (JSONB), `thread_ts` |
+| `analysis_runs` | **RCA 신뢰의 원천** — 매 분석 실행의 전체 산출물 | `run_id` (PK), `source` (`auto`/`manual`/`chat`/`feedback`), `status`, `target_type`/`target_id`, `analysis_summary`/`analysis_detail`, `analysis_quality`, `root_cause_family`, `capabilities`/`missing_data`/`warnings`/`artifacts` (JSONB) |
+| `incident_embeddings` | 유사도 메모리 — 과거의 닮은 인시던트 검색 | `incident_id`, `alert_id`, `analysis_summary`/`analysis_detail`, `vector_json` (JSONB), `embedding vector(384)` + HNSW cosine index |
+
+> `alerts`의 알림별 RCA 컬럼(`analysis_*`, `capabilities`, …)은 **제거되었습니다** — RCA는
+> `analysis_runs`에 있습니다. 백엔드는 더 이상 이 컬럼들을 생성하거나 읽지 않으며, 기존
+> DB에 남은 컬럼은 수동으로 DROP하십시오(`store_postgres.go`에 명시).
+
+**운영자 피드백 & 평가**
+
+| 테이블 | 목적 | 주요 컬럼 |
+|---|---|---|
+| `rca_feedback` | 운영자 투표 **및** 코멘트(대상은 다형성) | `feedback_id` (PK), `kind` (`vote`/`comment`), `target_type`/`target_id`, `vote`, `body`, `author` |
+| `rca_eval_reviews` | 정량 품질 리뷰 — 점수·하드 게이트·실제 해결 결과. 지식 학습의 **게이트** | `review_id` (PK), `run_id`, `analysis_hash`, `reviewer`, `scores`/`hard_gates` (JSONB), `resolution_outcome`, `effective_action`, `expected_family` |
+
+> `rca_comments`는 **폐기 예정**입니다 — 존재할 경우에만 읽어서 기존 행을 `rca_feedback`로
+> 이관하고, 이후 수동 DROP 가능합니다. 새 코멘트는 `kind='comment'`인 `rca_feedback` 행입니다.
+
+**승인 지식 학습 파이프라인** — 아래 [학습 파이프라인](#학습-파이프라인-인시던트가-지식이-되기까지) 참조.
+
+| 테이블 | 목적 | 주요 컬럼 |
+|---|---|---|
+| `rca_case_snapshots` | **운영자가 승인한** RCA의 불변 스냅샷 — 학습과 온톨로지의 입력 | `case_id` (PK = `run_id:hash`), `incident_id`, `run_id`, `analysis_hash`, `approval_state` (`active`/`revoked`/`superseded`), `mechanism_fingerprint`, `snapshot` (JSONB) |
+| `knowledge_candidates` | 스냅샷에서 뽑은 지식 후보. 리뷰 상태머신을 따라 이동 | `candidate_id` (PK), `case_id`, `knowledge_fingerprint`, `supporting_case_count`, `status` (`ready_for_review`→`active` / `validation_failed` / `rejected` / `superseded`), `content_hash`, `payload` (JSONB) |
+| `knowledge_candidate_cases` | M:N 링크 — 한 후보를 뒷받침하는 승인 케이스들(교차 인시던트 dedup) | `candidate_id` + `case_id` (복합 PK), `linked_at` |
+| `knowledge_packages` | 발행된 지식. TypeDB로 미러 | `package_id` (PK = `KPK-<case>`), `candidate_id`, `status` (`active`/`shadow`/`retired`), `payload` (JSONB), `mirror_status` |
+| `knowledge_events` | 모든 수명주기 전이의 append-only 감사 로그 | `event_id` (PK), `candidate_id`, `package_id`, `event_type`, `actor`, `note`, `created_at` |
+
+**챗봇 & 오프라인**
+
+| 테이블 | 목적 | 주요 컬럼 |
+|---|---|---|
+| `chat_conversations` | 챗봇 대화 스레드. 인시던트/알림 컨텍스트에 연결 | `conversation_id` (PK), `incident_id`, `alert_id`, `messages` (JSONB), `context_label` |
+| `rca_dataset` | 오프라인 eval 데이터셋 — CronJob이 라벨된 인시던트를 누적, curated 세트로 export | `dataset_id` (PK), `incident_id`, `alertname`, `expected_family`, `approved`, `question` (JSONB) |
+| `ontology_backfill_cursors` | 일회성 백필 북킵(스냅샷 → TypeDB) | `cursor_name` (PK), `approved_at`, `case_id` |
 
 **유사도 검색**: `incident_embeddings.embedding`(pgvector, HNSW cosine)이 기본 경로이며,
 pgvector를 사용할 수 없을 때 JSONB 희소 벡터 코사인 폴백이 동작합니다. 384차원 벡터는 RCA
 텍스트의 결정론적 피처 해시입니다(모델 의존성 없음) — `backend/memory.go`를 참조하십시오.
 `labels`/`annotations` JSONB는 인제스트가 소비하는 가장 풍부한 엔티티
 소스입니다(cluster/node/queue/etc.).
+
+### 학습 파이프라인: 인시던트가 지식이 되기까지
+
+승인된 RCA는 게이트가 걸린 단계들을 거쳐 재사용 가능한 지식이 됩니다. **두 개의 사람 게이트가
+품질을 지킵니다** — 무엇도 자동으로 라이브되지 않습니다.
+
+```mermaid
+flowchart TD
+  A["인시던트 분석 · analysis_runs"] -->|"운영자가 인시던트 승인"| B{"이 run+hash에 대한<br/>통과된 eval review?"}
+  B -->|없음| S["rca_case_snapshots<br/>스냅샷만 — 후보 없음"]
+  B -->|있음| C["rca_case_snapshots +<br/>knowledge_candidates<br/>(ready_for_review)"]
+  C -->|"동일 fingerprint 기존재"| L["knowledge_candidate_cases<br/>케이스 링크 · supporting_case_count++"]
+  C -->|"운영자가 후보 승인<br/>content-hash 재검증"| P["knowledge_packages<br/>active · mirror_status: pending"]
+  P -->|"CronJob · mirror_packages.py"| T[("TypeDB 온톨로지")]
+  C -.->|"모든 전이"| E["knowledge_events"]
+  P -.-> E
+```
+
+| 단계 | 트리거(언제) | 쓰기 | 게이트 |
+|---|---|---|---|
+| **스냅샷** | 운영자가 인시던트 승인(`user_approved_at`) | `rca_case_snapshots` (불변, `case_id = run_id:hash`) | 최신 analysis run이 `complete`이고 hash가 바인딩되어 있어야 함 |
+| **후보** | 같은 승인, 단일 트랜잭션 | `knowledge_candidates` (`ready_for_review` / `validation_failed`) + `knowledge_events` (`candidate_generated`) | 그 run+hash에 바인딩된 **통과한 `rca_eval_reviews`**, family 일치, evidence/harness 게이트 — 아니면 스냅샷만 |
+| **링크** | 동일 `knowledge_fingerprint` 후보가 이미 존재 | `knowledge_candidate_cases`, `supporting_case_count` 증가 | 교차 인시던트 dedup — 중복 후보 생성 안 함 |
+| **발행** | 운영자가 후보 승인(`POST /api/v1/knowledge-candidates/…`) | `knowledge_packages` (`active`, `mirror_status=pending`); 동일 fingerprint의 이전 package → `retired` | content-hash **재검증** — 후보가 여전히 `ready_for_review`이고 hash가 안정적이어야 함 |
+| **미러** | `typedb-package-mirror-job` CronJob(`ontology/mirror_packages.py`) | TypeDB upsert; `knowledge_packages.mirror_status` → `current`/`failed` | **Advisory** — 미러 실패는 활성화를 막지 않음 |
+| **감사** | 위 모든 전이 | `knowledge_events` (append-only) | — |
+
+**shadow** 발행(`ShadowKnowledgeCandidate`)은 패키지를 리뷰용으로 스테이징하되 활성 런타임
+스냅샷에는 노출하지 않습니다. 승인이 실수로 RCA 랭킹을 바꾸지 못하게 하려는 것이며, 이후
+명시적 활성화로 승격됩니다.
 
 ---
 

@@ -357,3 +357,55 @@ async def test_legacy_llm_chat_prompt_redacts_sensitive_inputs(monkeypatch) -> N
     assert "operator-secret-12345" not in captured["user"]
     assert "context-secret-12345" not in captured["user"]
     assert "[MASKED]" in captured["user"]
+
+
+@pytest.mark.asyncio
+async def test_cluster_scope_prompt_when_no_context(monkeypatch) -> None:
+    """No incident/alert context (backend scope=cluster) → the decision prompt must
+    forbid presenting dashboard stats as live cluster inventory."""
+    captured: list[str] = []
+
+    async def fake_complete_json(settings, *, system, user, model=None, **kw):
+        captured.append(system)
+        return {"action": "answer", "answer": "ok"}
+
+    monkeypatch.setattr(chat_agent, "complete_json", fake_complete_json)
+
+    async def analyze_fn(_request):
+        raise AssertionError("analyze should not run")
+
+    request = ChatRequest(message="how many nodes?", context={"scope": "cluster"})
+    text, error = await chat_agent.answer_chat(_settings(), request, "ctx", analyze_fn=analyze_fn)
+    assert error is None and text == "ok"
+    assert "NO incident/alert context is selected" in captured[0]
+    assert "NOT live cluster inventory" in captured[0]
+
+
+@pytest.mark.asyncio
+async def test_incident_scope_prompt_omits_cluster_rule(monkeypatch) -> None:
+    captured: list[str] = []
+
+    async def fake_complete_json(settings, *, system, user, model=None, **kw):
+        captured.append(system)
+        return {"action": "answer", "answer": "ok"}
+
+    monkeypatch.setattr(chat_agent, "complete_json", fake_complete_json)
+
+    async def analyze_fn(_request):
+        raise AssertionError("analyze should not run")
+
+    request = ChatRequest(
+        message="what happened?", incident_id="INC-1", context={"scope": "incident"}
+    )
+    await chat_agent.answer_chat(_settings(), request, "ctx", analyze_fn=analyze_fn)
+    assert "NO incident/alert context is selected" not in captured[0]
+
+
+def test_is_cluster_scope_fallback_without_backend_scope() -> None:
+    """Older backends send no scope key — fall back to the id/context presence."""
+    assert chat_agent._is_cluster_scope(ChatRequest(message="q")) is True
+    assert chat_agent._is_cluster_scope(ChatRequest(message="q", incident_id="INC-1")) is False
+    assert (
+        chat_agent._is_cluster_scope(ChatRequest(message="q", context={"alert": {"id": "A"}}))
+        is False
+    )

@@ -1527,6 +1527,22 @@ async def rank_stage(state: PipelineState) -> PipelineState:
         )
         if isinstance(getattr(state.kg_context, "reasoning", None), dict):
             state.kg_context.reasoning["candidate_families"] = graph_counts
+    # External support-case priors: exact error-signature match against the run's
+    # observed evidence (available only post-collection, so this cannot run at plan
+    # time). Labelled historical context for synthesis only — never a ranking input
+    # and never presented as a verified resolution (see synthesis prompt rule).
+    try:
+        from app.services.kg_enrichment import external_case_cards
+
+        ext_cards, ext_warnings = await external_case_cards(settings, state.observed)
+    except Exception:  # noqa: BLE001 - external prior is optional
+        ext_cards, ext_warnings = [], []
+    state.extra_warnings.extend(ext_warnings)
+    if ext_cards and state.kg_context is not None:
+        seen = {str(c.get("case_id") or "") for c in state.kg_context.case_cards}
+        state.kg_context.case_cards.extend(
+            c for c in ext_cards if str(c.get("case_id") or "") not in seen
+        )
     # Fuzzy recall (BM25+synonyms, app.bm25) queries the alert's OWN text only:
     # collector summaries would feed pipeline boilerplate to the matcher. And it
     # informs, never headlines: promotion below stays exact-signature-only (a
@@ -2892,6 +2908,10 @@ async def _synthesize_korean(
         "증거로 쓰지 마세요.\n"
         "- historical_case_cards는 승인된 과거 사례의 prior이며 현재 evidence가 아닙니다. "
         "유사 사례가 있어도 현재 관측으로 별도 확인될 때만 원인으로 사용하세요.\n"
+        "- kind=external 또는 context_class(evaluation_only/mitigated_context/"
+        "unresolved_context)가 붙은 카드는 외부 지원 사례입니다. 그 successful/failed_actions를 "
+        "현재 사건의 검증된 해결책으로 제시하지 말고 '과거 외부 사례에서 시도된 조치'로만 "
+        "인용하세요.\n"
         "- graph_remediation은 현재 support observation이 있을 때에만 조치 후보입니다. "
         "warnings에 현재 범위의 support가 없다고 표시되면 graph/과거 사례의 조치를 실행하라고 "
         "권고하지 말고, 먼저 대상·시간 범위에서 확인할 진단 단계만 제시하세요.\n"

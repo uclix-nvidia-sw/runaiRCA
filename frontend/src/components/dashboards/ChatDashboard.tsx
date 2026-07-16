@@ -99,7 +99,35 @@ export function ChatDashboard({
             placeholder="Ask about incidents, alerts, evidence, or start a new analysis"
           />
           <div className="full-chat-compose-meta">
-            <span><Bot size={15} /> {chat.chatContext.label}</span>
+            <span className="full-chat-context-picker">
+              <Bot size={15} />
+              <select
+                aria-label="Chat context"
+                value={chat.contextChoice}
+                onChange={(event) => chat.setContextChoice(event.target.value as typeof chat.contextChoice)}
+              >
+                <option value="auto">Auto ({chat.chatContext.label})</option>
+                <option value="cluster">Whole cluster (live)</option>
+                {chat.incidents.length > 0 && (
+                  <optgroup label="Incidents">
+                    {chat.incidents.slice(0, 25).map((incident) => (
+                      <option key={incident.incident_id} value={`incident:${incident.incident_id}`}>
+                        {incident.incident_id} · {incident.title.slice(0, 48)}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                {chat.alerts.length > 0 && (
+                  <optgroup label="Alerts">
+                    {chat.alerts.slice(0, 25).map((alert) => (
+                      <option key={alert.alert_id} value={`alert:${alert.alert_id}`}>
+                        {alert.alert_id} · {alert.alarm_title.slice(0, 48)}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+              </select>
+            </span>
             {chat.activeConversation && (
               <button
                 type="button"

@@ -31,6 +31,7 @@ type EvaluationPanelState = {
   outcome: EvaluationReviewInput['resolution_outcome'];
   effectiveAction: string;
   notes: string;
+  operatorConfirmed: boolean;
 };
 
 type EvaluationPanelAction =
@@ -45,6 +46,7 @@ type EvaluationPanelAction =
   | { type: 'outcome_changed'; value: EvaluationReviewInput['resolution_outcome'] }
   | { type: 'effective_action_changed'; value: string }
   | { type: 'notes_changed'; value: string }
+  | { type: 'operator_confirmed_changed'; value: boolean }
   | { type: 'review_saved'; review: NonNullable<EvaluationView['my_review']> };
 
 export function initialEvaluationPanelState(): EvaluationPanelState {
@@ -62,6 +64,7 @@ export function initialEvaluationPanelState(): EvaluationPanelState {
     outcome: 'unknown',
     effectiveAction: '',
     notes: '',
+    operatorConfirmed: false,
   };
 }
 
@@ -96,6 +99,7 @@ export function evaluationPanelReducer(
         outcome: review?.resolution_outcome || 'unknown',
         effectiveAction: review?.effective_action || '',
         notes: review?.notes || '',
+        operatorConfirmed: review?.operator_confirmed || false,
         catalogError: savedFamilyMissing ? missingSavedFamilyMessage(savedFamily) : state.catalogError,
       };
     }
@@ -120,6 +124,8 @@ export function evaluationPanelReducer(
         ...state,
         caseType: action.value,
         expectedFamily: action.value === 'novel' ? '' : state.expectedFamily,
+        // Operator confirmation is only valid for known/compositional cases.
+        operatorConfirmed: action.value === 'known' || action.value === 'compositional' ? state.operatorConfirmed : false,
       };
     case 'expected_family_changed':
       return { ...state, expectedFamily: action.value };
@@ -131,6 +137,8 @@ export function evaluationPanelReducer(
       return { ...state, effectiveAction: action.value };
     case 'notes_changed':
       return { ...state, notes: action.value };
+    case 'operator_confirmed_changed':
+      return { ...state, operatorConfirmed: action.value };
     case 'review_saved':
       return { ...state, view: state.view ? { ...state.view, my_review: action.review } : state.view };
   }
@@ -176,6 +184,7 @@ export function EvaluationPanel({
     outcome,
     effectiveAction,
     notes,
+    operatorConfirmed,
   } = state;
 
   useEffect(() => {
@@ -214,8 +223,13 @@ export function EvaluationPanel({
     ? [expectedFamily, ...expectedFamilies]
     : expectedFamilies;
   const hardGates = harness?.hard_gates as Record<string, boolean> | undefined;
+  const preview = view?.knowledge_preview;
+  const confirmAvailable = Boolean(preview) && preview!.outcome !== 'ready' && preview!.outcome !== 'not_approved' &&
+    (caseType === 'known' || caseType === 'compositional') && Boolean(expectedFamily);
+  const confirmActive = confirmAvailable && operatorConfirmed;
+  const confirmNeedsNote = confirmActive && !notes.trim();
   const save = async () => {
-    if (!evaluationReady) return;
+    if (!evaluationReady || confirmNeedsNote) return;
     setBusy(true);
     setSaveError('');
     try {
@@ -228,8 +242,12 @@ export function EvaluationPanel({
         resolution_outcome: outcome,
         effective_action: effectiveAction,
         notes,
+        operator_confirmed: confirmActive,
       });
       dispatch({ type: 'review_saved', review });
+      // Refresh the view so the knowledge-ingestion preview reflects the saved review.
+      const refreshed = await fetchAnalysisEvaluation(runID);
+      dispatch({ type: 'evaluation_loaded', view: refreshed });
       await onSaved();
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : 'Failed to save evaluation.');
@@ -255,6 +273,21 @@ export function EvaluationPanel({
           </p>
         )}
       </div>
+      {view?.knowledge_preview && (
+        <div
+          className={`knowledge-preview knowledge-preview-${view.knowledge_preview.outcome}`}
+          aria-label="Knowledge ingestion preview"
+        >
+          <strong>Knowledge ingestion</strong>
+          {view.knowledge_preview.outcome === 'ready' ? (
+            <span>
+              Will be ingested — {view.knowledge_preview.family || 'family n/a'} · {view.knowledge_preview.evidence_count} evidence · {view.knowledge_preview.probe_count} probe(s)
+            </span>
+          ) : (
+            <span>Not ingested — {view.knowledge_preview.reason || 'not eligible for runtime knowledge'}</span>
+          )}
+        </div>
+      )}
       {evaluationError && <p className="feedback-error">{evaluationError}</p>}
       {catalogError && <p className="feedback-error">{catalogError}</p>}
       {saveError && <p className="feedback-error">{saveError}</p>}
@@ -331,8 +364,25 @@ export function EvaluationPanel({
           </label>
         </div>
 
+        {confirmAvailable && (
+          <label className="evaluation-field evaluation-confirm">
+            <span className="evaluation-confirm-row">
+              <input
+                type="checkbox"
+                checked={operatorConfirmed}
+                onChange={(event) => dispatch({ type: 'operator_confirmed_changed', value: event.target.checked })}
+                disabled={!evaluationReady || busy}
+              />
+              <span>Operator-confirm this diagnosis (non-reproducible incident)</span>
+            </span>
+            <small>
+              Promotes an evidence-backed hypothesis that never reached “supported” (e.g. probes stayed inconclusive). Requires a rationale in Notes below. Cases with no supporting evidence are still refused.
+            </small>
+          </label>
+        )}
+
         <label className="evaluation-field evaluation-notes">
-          <span>Notes</span>
+          <span>Notes{confirmActive ? ' — required: confirmation rationale' : ''}</span>
           <textarea
             value={notes}
             onChange={(event) => dispatch({ type: 'notes_changed', value: event.target.value })}
@@ -341,7 +391,7 @@ export function EvaluationPanel({
           />
         </label>
         <div className="evaluation-actions">
-          <button className="primary-button evaluation-save" disabled={!evaluationReady || busy} type="submit">
+          <button className="primary-button evaluation-save" disabled={!evaluationReady || busy || confirmNeedsNote} type="submit">
             <Save size={16} /> {busy ? 'Saving…' : evaluationStatus === 'loading' ? 'Loading evaluation…' : 'Save evaluation'}
           </button>
         </div>

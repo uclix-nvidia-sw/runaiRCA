@@ -13,9 +13,24 @@ export function FloatingChat({
   onDockedChange: (docked: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [mounted, setMounted] = useState(false);
   const [docked, setDocked] = useState(false);
   const [showContext, setShowContext] = useState(false);
   const listRef = useRef<HTMLDivElement | null>(null);
+
+  // Keep the panel mounted through its close animation, then unmount. Keyed on
+  // `open` only: opening mounts immediately; closing arms a timer that a rapid
+  // reopen cancels via cleanup. Timer-based (not animationend) so it still
+  // unmounts under prefers-reduced-motion, where the exit animation — and its
+  // animationend event — never fire.
+  useEffect(() => {
+    if (open) {
+      setMounted(true);
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setMounted(false), 220);
+    return () => window.clearTimeout(timer);
+  }, [open]);
 
   useEffect(() => {
     if (!open || !listRef.current) return;
@@ -35,8 +50,8 @@ export function FloatingChat({
 
   return (
     <>
-      {open && (
-        <section className={`chat-panel ${docked ? 'docked' : ''}`}>
+      {mounted && (
+        <section className={`chat-panel ${docked ? 'docked' : ''} ${open ? '' : 'is-closing'}`}>
           <header className="chat-header">
             <div>
               <span className="chat-title"><Bot size={17} /> RCA Chat</span>

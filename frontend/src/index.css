@@ -16,8 +16,20 @@
   --pressed: #e8eee0;
   --pressed-soft: #eef2e8;
   --shadow: 0 18px 38px rgba(16, 24, 40, 0.06);
+  --shadow-lift: 0 14px 30px rgba(16, 24, 40, 0.1);
   --danger: #dc2626;
   --warning: #b7791f;
+  /* Motion system — strong (not the weak built-in) curves so movement reads as
+     intentional. ease-out drives every enter/exit; ease-in-out is reserved for
+     on-screen morphs. Durations stay < 300ms (Emil). */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-1: 130ms;
+  --dur-2: 190ms;
+  --dur-3: 280ms;
+  --ring: rgba(118, 185, 0, 0.55);
+  --glass: rgba(255, 255, 255, 0.72);
+  font-optical-sizing: auto;
   line-height: 1.55;
 }
 
@@ -59,10 +71,11 @@ tbody tr td,
 .comment-menu button,
 .editor-menu button {
   transition:
-    background-color 120ms ease,
-    border-color 120ms ease,
-    color 120ms ease,
-    transform 80ms ease;
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-2) var(--ease-out),
+    transform var(--dur-1) var(--ease-out);
 }
 
 button:not(:disabled):active,
@@ -1192,7 +1205,7 @@ td span.occurrence-pill {
   inset: auto 0 0;
   height: 0.2rem;
   background: linear-gradient(90deg, transparent, var(--nvidia), transparent);
-  animation: loading-sweep 1.15s ease-in-out infinite;
+  animation: loading-sweep 1.15s linear infinite;
 }
 
 .loading-strip span,
@@ -2476,6 +2489,68 @@ td span.occurrence-pill {
   text-transform: uppercase;
 }
 
+.knowledge-preview {
+  display: grid;
+  gap: 0.2rem;
+  margin: 0 0 1rem;
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: 0.5rem;
+  padding: 0.6rem 0.8rem;
+  background: #fafbf8;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.knowledge-preview strong {
+  color: #344054;
+  font-size: 0.74rem;
+  font-weight: 850;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.knowledge-preview-ready {
+  border-left-color: #15803d;
+  background: #f2fbf5;
+}
+
+.knowledge-preview-validation_failed {
+  border-left-color: var(--warning);
+  background: #fdfaf1;
+}
+
+.knowledge-preview-blocked,
+.knowledge-preview-not_approved {
+  border-left-color: var(--muted);
+}
+
+.evaluation-confirm {
+  border: 1px solid var(--warning);
+  border-radius: 0.5rem;
+  padding: 0.6rem 0.8rem;
+  background: #fdfaf1;
+}
+
+.evaluation-confirm .evaluation-confirm-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 650;
+}
+
+.evaluation-confirm input[type='checkbox'] {
+  width: auto;
+  margin: 0;
+}
+
+.evaluation-confirm small {
+  display: block;
+  margin-top: 0.3rem;
+  color: var(--muted);
+  font-weight: 400;
+}
+
 .evaluation-form {
   display: grid;
   gap: 1rem;
@@ -2522,7 +2597,9 @@ td span.occurrence-pill {
   font: inherit;
   font-size: 0.84rem;
   outline: none;
-  transition: border-color 120ms ease, box-shadow 120ms ease;
+  transition:
+    border-color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-1) var(--ease-out);
 }
 
 .evaluation-panel input,
@@ -3470,13 +3547,15 @@ code .evidence-mark {
   color: inherit;
   cursor: pointer;
   text-decoration: none;
-  transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+  transition:
+    border-color var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-2) var(--ease-out),
+    transform var(--dur-2) var(--ease-out);
 }
 
 .similar-item:hover {
   border-color: #93c5fd;
   box-shadow: 0 5px 14px rgb(15 23 42 / 9%);
-  transform: translateY(-1px);
 }
 
 .similar-item:focus-visible {
@@ -4060,6 +4139,19 @@ code .evidence-mark {
   white-space: nowrap;
 }
 
+.full-chat-context-picker select {
+  min-width: 0;
+  max-width: 24rem;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: #fff;
+  color: inherit;
+  font: inherit;
+  font-size: 0.82rem;
+  padding: 0.25rem 0.45rem;
+  cursor: pointer;
+}
+
 .full-chat-compose-meta button {
   width: 2.15rem;
   height: 2.15rem;
@@ -4621,5 +4713,334 @@ code .evidence-mark {
 
   .full-chat-compose-meta span {
     flex-basis: 100%;
+  }
+}
+
+/* =====================================================================
+   Fluid motion & material layer
+   Additive polish on top of the visual system above: entrances that start
+   from the current value, origin-aware popovers, press feedback, hover
+   lift, focus rings, translucent chrome, and calibrated reduced-motion /
+   transparency / contrast fallbacks. Motion only — no layout changes.
+   ===================================================================== */
+
+/* ---- Typography: size-specific tracking (tighten large text) ---- */
+h1 {
+  letter-spacing: -0.015em;
+}
+
+h2,
+.workspace-header h2,
+.full-chat-empty h3,
+.full-chat-history-head strong {
+  letter-spacing: -0.02em;
+}
+
+.metric-copy strong,
+.analysis-stat-card strong b,
+.analysis-stat-card strong,
+.llm-spend-summary strong,
+.recurrence-row b {
+  letter-spacing: -0.02em;
+  font-feature-settings: "tnum" 1;
+}
+
+/* ---- Press feedback: prominent buttons scale under the finger ---- */
+.primary-button:not(:disabled):active,
+.ghost-button:not(:disabled):active,
+.icon-button:not(:disabled):active,
+.compact-button:not(:disabled):active,
+.full-chat-history-head button:not(:disabled):active,
+.full-chat-compose-meta button:not(:disabled):active,
+.chat-actions button:not(:disabled):active {
+  transform: scale(0.97);
+}
+
+/* ---- Hover lift: only genuinely interactive cards, and never mid-press
+   (:not(:active)) so it can't fight the press-down feedback). Pointer-gated
+   so a tap on touch doesn't leave a stuck hover state. ---- */
+@media (hover: hover) and (pointer: fine) {
+  .analysis-card,
+  .knowledge-candidate,
+  .query-result-card,
+  .full-chat-history-item {
+    transition:
+      background-color var(--dur-1) var(--ease-out),
+      border-color var(--dur-1) var(--ease-out),
+      box-shadow var(--dur-2) var(--ease-out),
+      transform var(--dur-2) var(--ease-out);
+  }
+
+  .analysis-card:hover:not(:active),
+  .query-result-card:hover:not(:active) {
+    transform: translateY(-1px);
+    box-shadow: var(--shadow-lift);
+  }
+
+  .knowledge-candidate:hover:not(:active) {
+    transform: translateY(-1px);
+  }
+
+  .similar-item:hover:not(:active) {
+    transform: translateY(-1px);
+  }
+
+  .chat-fab:hover {
+    transform: translateY(-2px) scale(1.03);
+    box-shadow: 0 22px 42px rgba(76, 127, 0, 0.32);
+  }
+}
+
+.chat-fab {
+  transition:
+    transform var(--dur-2) var(--ease-out),
+    box-shadow var(--dur-2) var(--ease-out);
+  animation: pop-br var(--dur-3) var(--ease-out) both;
+}
+
+.chat-fab:not(:disabled):active {
+  transform: scale(0.93);
+}
+
+/* The row-action trigger is a <summary>, not a <button>, so it misses the
+   button press rules above — give it the same tactile press. */
+.row-action-menu summary:active {
+  transform: scale(0.97);
+}
+
+/* ---- Approve delight: a rare, satisfying commit — a one-shot confirming pop
+   on success (set transiently in UnifiedWorkspace). ---- */
+.primary-button.just-approved {
+  animation: approve-pop 620ms var(--ease-out);
+}
+
+/* ---- Focus-visible: a consistent keyboard ring. Placed last so it beats the
+   many `outline: 0` resets; specific enough to win over each of them. ---- */
+button:focus-visible,
+a:focus-visible,
+summary:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+.nav-item:focus-visible,
+.row-action-menu summary:focus-visible,
+tbody tr:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+/* The column-filter <select> is intentionally invisible (opacity: 0 overlay),
+   so its own focus ring can never show — without this, keyboard focus silently
+   "disappears" for three Tab stops between the toolbar and the first row. Ring
+   the visible wrapper instead. */
+.column-filter:focus-within {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+/* ---- Translucent chrome: floating layers read as real material over the
+   content/gradient behind them (Apple §12). ---- */
+.sidebar {
+  background: var(--glass);
+  backdrop-filter: blur(16px) saturate(180%);
+  -webkit-backdrop-filter: blur(16px) saturate(180%);
+}
+
+.row-action-popover,
+.editor-menu,
+.comment-menu {
+  background: rgba(255, 255, 255, 0.82);
+  backdrop-filter: blur(14px) saturate(180%);
+  -webkit-backdrop-filter: blur(14px) saturate(180%);
+}
+
+/* ---- View entrance: dashboards remount on nav change. Nav switching is a
+   frequent action, so this stays a single quick fade+rise (no stagger) — enough
+   to signal the new screen arrived without taxing something done all day
+   (topbar is stable chrome and stays put). ---- */
+.main > *:not(.topbar) {
+  animation: view-enter var(--dur-2) var(--ease-out) both;
+}
+
+/* ---- Workspace: the detail overlay materializes forward from the list, and
+   settles back on close (.is-closing, driven by a delayed unmount in
+   UnifiedWorkspace) instead of teleporting away. ---- */
+.workspace {
+  animation: workspace-in var(--dur-3) var(--ease-out) both;
+}
+
+.workspace.is-closing {
+  animation: workspace-out var(--dur-2) var(--ease-out) forwards;
+  pointer-events: none;
+}
+
+/* While the detail dialog is up, the content it covers drops out of the tab
+   order and the accessibility tree (keyboard focus can't wander into the
+   hidden list). During .is-closing it comes back, so the exit fade reveals a
+   live, focusable list. The sidebar stays interactive — it isn't covered. */
+.app-shell:has(.workspace:not(.is-closing)) .main {
+  visibility: hidden;
+}
+
+/* ---- RCA report: fades in when it replaces the "Analyzing…" placeholder (or
+   arrives on open) rather than snapping in. ---- */
+.rca-report-body {
+  animation: rca-reveal var(--dur-3) var(--ease-out) both;
+}
+
+/* ---- Floating chat: grows out of the FAB it came from (spatial consistency)
+   and shrinks back the same way on close (.is-closing, driven by a delayed
+   unmount in FloatingChat.tsx). Docking is a deliberate mode switch, not a
+   re-entrance, so it must NOT replay the open animation. ---- */
+.chat-panel {
+  transform-origin: bottom right;
+  animation: pop-br var(--dur-2) var(--ease-out) both;
+}
+
+.chat-panel.is-closing {
+  animation: pop-out var(--dur-2) var(--ease-out) forwards;
+  pointer-events: none;
+}
+
+/* ---- Popovers/menus: scale in from their trigger corner, not their centre. ---- */
+.row-action-popover {
+  transform-origin: top right;
+}
+
+.row-action-menu[open] .row-action-popover {
+  animation: pop-tr var(--dur-1) var(--ease-out) both;
+}
+
+.editor-menu,
+.comment-menu {
+  transform-origin: top right;
+  animation: pop-tr var(--dur-1) var(--ease-out) both;
+}
+
+@keyframes view-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+@keyframes workspace-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.99);
+  }
+}
+
+@keyframes pop-br {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.96);
+  }
+}
+
+@keyframes pop-tr {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.96);
+  }
+}
+
+@keyframes pop-out {
+  to {
+    opacity: 0;
+    transform: translateY(10px) scale(0.97);
+  }
+}
+
+@keyframes workspace-out {
+  to {
+    opacity: 0;
+    transform: translateY(8px) scale(0.99);
+  }
+}
+
+@keyframes rca-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+@keyframes approve-pop {
+  40% {
+    transform: scale(1.05);
+    box-shadow: 0 0 0 5px rgba(118, 185, 0, 0.22);
+  }
+}
+
+/* ---- Reduced motion: keep comprehension (fades, status spinners) but drop
+   travel and overshoot. ---- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 1ms !important;
+    animation-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .main > *:not(.topbar),
+  .workspace,
+  .chat-panel,
+  .chat-panel.docked,
+  .chat-fab,
+  .rca-report-body,
+  .row-action-menu[open] .row-action-popover,
+  .editor-menu,
+  .comment-menu {
+    animation: none !important;
+    transform: none !important;
+  }
+
+  .primary-button.just-approved {
+    animation: none !important;
+  }
+
+  .analysis-card:hover:not(:active),
+  .query-result-card:hover:not(:active),
+  .knowledge-candidate:hover:not(:active),
+  .similar-item:hover:not(:active),
+  .chat-fab:hover {
+    transform: none !important;
+  }
+
+  /* Loaders convey status — keep them turning. */
+  .is-spinning svg,
+  .loading-strip span,
+  .workspace-progress span {
+    animation: spin 900ms linear infinite !important;
+  }
+
+  .loading-strip::before,
+  .workspace-progress::before {
+    animation: loading-sweep 1.15s linear infinite !important;
+  }
+}
+
+/* ---- Reduced transparency: frost the material into a solid surface. ---- */
+@media (prefers-reduced-transparency: reduce) {
+  .sidebar,
+  .row-action-popover,
+  .editor-menu,
+  .comment-menu {
+    background: #ffffff;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+
+/* ---- Higher contrast: firm up the hairline borders. ---- */
+@media (prefers-contrast: more) {
+  :root {
+    --line: #aeb8c4;
+  }
+
+  .nav-item.active {
+    outline: 1px solid var(--nvidia-dark);
   }
 }

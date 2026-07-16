@@ -249,6 +249,17 @@ func (s *Server) enrichChatRequest(req ChatRequest) ChatRequest {
 		req.Context["feedback_hints"] = s.store.FeedbackHintsForAlert(*contextAlert, contextIncidentID, similarIncidentLimit)
 	}
 
+	// Explicit conversation scope for the agent: with no incident/alert selected
+	// the operator is deliberately asking about the whole live cluster, and the
+	// agent must not present dashboard alert-history stats as cluster inventory.
+	scope := "cluster"
+	if req.AlertID != "" {
+		scope = "alert"
+	} else if req.IncidentID != "" {
+		scope = "incident"
+	}
+	req.Context["scope"] = scope
+
 	memoryQuery := strings.Join(
 		[]string{req.Message, req.IncidentTitle, req.AlertTitle, req.IncidentContent, req.AlertContent},
 		"\n",
@@ -353,15 +364,26 @@ func wantsAnalysisRun(message string) bool {
 		strings.Contains(lowered, "reanalyze") ||
 		strings.Contains(lowered, "run analysis") ||
 		strings.Contains(lowered, "start analysis") ||
-		strings.Contains(lowered, "create analysis") {
+		strings.Contains(lowered, "create analysis") ||
+		strings.Contains(lowered, "new analysis") {
+		return true
+	}
+	// Verb "analyze" + "again" = re-run ("analyze this again"); the noun form
+	// ("show the analysis again") is a replay and does not contain "analyze".
+	if strings.Contains(lowered, "analyze") && strings.Contains(lowered, "again") {
 		return true
 	}
 	if strings.Contains(lowered, "analyze") && strings.Contains(lowered, "rca") {
 		return true
 	}
+	if strings.Contains(message, "재분석") {
+		return true
+	}
 	if !strings.Contains(message, "분석") {
 		return false
 	}
+	// "다시" alone is NOT a token: "분석 결과 다시 보여줘" is a replay request,
+	// not a re-analysis ("다시 분석해줘" already matches via 해줘/돌려).
 	for _, token := range []string{"해줘", "돌려", "진행", "요청", "새로", "시작", "만들"} {
 		if strings.Contains(message, token) {
 			return true

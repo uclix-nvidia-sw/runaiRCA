@@ -1,0 +1,238 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:4f211c4d1ebb
+  source_revision_hash: sha256:ca3bc0d4690532fac4a51c0e3874a601403358e573dcca6bb90d30d1e265b8b5
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_with_warnings
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+incident:
+  title: Run:ai v2.23.31 all-blocked storage policy selector fallback
+  masked_summary: An all-blocked storage policy on v2.23.31 was reported to expose
+    all storage options in the workload form. Differential testing did not reproduce
+    the behavior on v2.24.74. Engineering planned a fix for v2.23.71, but no affected-environment
+    post-fix validation was supplied.
+  status: unresolved
+  occurred_at: '2026-06-09'
+  resolved_at: null
+  family: runai_control_plane_error
+  family_confidence: medium
+  observed_mechanism: An all-blocked storage configuration was reported to trigger
+    a v2.23.x workload-form empty-state fallback that displayed all storage options.
+  observed_mechanism_confidence: medium
+  confirmed_mechanism: null
+  confirmed_mechanism_confidence: low
+searchable_context:
+  normalized_symptoms:
+  - all storage options visible despite canAdd false policy
+  - storage restriction works when one of NFS PVC or S3 is omitted
+  - same policy does not reproduce on Run:ai 2.24.74
+  metric_signatures: []
+  error_signatures: []
+  issue_references: []
+  canonical_component_tokens:
+  - runai-backend-frontend
+  version_tokens:
+  - runai:2.23.31
+  - runai:2.24.74
+  - runai:2.23.71
+  trigger_tokens:
+  - all_storage_types_blocked
+  - nfs_pvc_s3_blocked_together
+  - canAdd_false
+  retrieval_keywords:
+  - storage policy
+  - canAdd false
+  - workload creation form
+  - storage selector
+  - empty-state fallback
+  - Git
+  - Host Path
+  - NFS
+  - PVC
+  - S3
+  - Run:ai 2.23.x
+  - 2.23.71 fix
+  curated_signature_tokens:
+  - canAdd false
+  - 2.23.71 fix
+  - Run:ai 2.23.x
+evidence_refs:
+- evidence_id: E001
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: With Git, Host Path, NFS, PVC, and S3 configured with canAdd false,
+    all storage options appeared available.
+  supports:
+  - F001
+  - H001
+  - H002
+  - A001
+- evidence_id: E002
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: quoted_in_transcript
+  masked_summary: Removing one of NFS, PVC, or S3 made the remaining restrictions
+    work, and the same all-blocked policy worked on v2.24.74.
+  supports:
+  - F002
+  - F003
+  - H001
+  - H002
+  - A002
+  - A003
+- evidence_id: E005
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support described a v2.23.x-specific empty-state fallback when all
+    storage types were blocked and stated that v2.24.x changes prevented it.
+  supports:
+  - F004
+  - H001
+  - H002
+- evidence_id: E006
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support initially stated that no v2.23.x patch resolved the issue
+    and recommended v2.24.x.
+  supports:
+  - H003
+  - A004
+- evidence_id: E007
+  source_message_ids:
+  - M003
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: A Kubernetes-version constraint prevented an immediate upgrade to
+    Run:ai v2.24.
+  supports:
+  - A004
+- evidence_id: E009
+  source_message_ids:
+  - M007
+  - M009
+  source_actor: engineering
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Engineering confirmed, as relayed by Support, that the fix would
+    be included in v2.23.71.
+  supports:
+  - F005
+  - H001
+  - H003
+  - A005
+- evidence_id: E011
+  source_message_ids:
+  - M010
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: The customer requested that the case be closed.
+  supports:
+  - F006
+  - A006
+- evidence_id: E012
+  source_message_ids:
+  - M011
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support closed the ticket.
+  supports:
+  - F006
+  - A006
+historical_actions:
+- action_id: A001
+  normalized_action: Apply canAdd false to all reported storage types on v2.23.31
+    and observe the workload form.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E001
+- action_id: A002
+  normalized_action: Remove one of NFS, PVC, or S3 from the blocked set.
+  outcome: partially_effective
+  verified: true
+  evidence_ids:
+  - E002
+- action_id: A003
+  normalized_action: Test the same policy on v2.24.74.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E002
+- action_id: A004
+  normalized_action: Upgrade to v2.24.x and re-test.
+  outcome: resolving
+  verified: false
+  evidence_ids:
+  - E006
+  - E007
+- action_id: A005
+  normalized_action: Upgrade to v2.23.71 when available and re-test.
+  outcome: resolving
+  verified: false
+  evidence_ids:
+  - E009
+- action_id: A006
+  normalized_action: Close the support ticket after receiving the fix plan and lifecycle
+    clarification.
+  outcome: unknown_outcome
+  verified: true
+  evidence_ids:
+  - E011
+  - E012
+knowledge_links:
+  known_issue_matches:
+  - status: none
+    candidate_classification: platform_version_bug
+    candidate_name: Storage Policy All-Blocked Selector Fallback In v2.23.x
+    confidence: high
+    rationale: Engineering assigned a v2.23.71 fix, but the current repository catalog
+      has no exact entry.
+  failure_mode_matches: []
+  family_candidates:
+  - family: runai_control_plane_error
+    confidence: medium
+  - family: insufficient_evidence
+    confidence: low
+historical_use:
+  context_class: unresolved_context
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: The case is useful for recognizing a version-specific storage-policy
+    UI pattern and planning version comparison, but the planned fix was not revalidated
+    in the affected environment.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false

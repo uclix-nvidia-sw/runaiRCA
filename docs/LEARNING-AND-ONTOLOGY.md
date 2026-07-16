@@ -126,5 +126,35 @@ enables it; `approve` validates and activates it; `reject`/`retired` keep it out
 of runtime use. The TypeDB package-mirror CronJob copies summaries and approved
 template bindings for graph queries; it never changes activation.
 
+## 6. External support-case priors
+
+Some lessons come from outside our own clusters — curated enterprise support
+cases. They arrive as masked v2.0 payloads and are treated as **external
+reference cases, never proof**:
+
+- **De-identified before commit.** Raw bundles carry a real support-case number;
+  `agent/knowledge/external_cases/sanitize.py` strips it everywhere (identity,
+  manifest filenames, prose), replaces the case key with an opaque hash, and
+  coarsens timestamps to dates. Only the de-identified copies are committed —
+  the same publish-the-lesson-not-the-record practice as the known-issues
+  catalog. The sanitizer refuses to emit a file that still contains the number.
+- **Approval is explicit.** The Helm schema-load job runs the loader only with an
+  operator-set approver (`typedb.externalCases.approvedBy`), recorded on every
+  case — the same approval gate as section 1.
+- **Never knowledge-layer authority.** They enter TypeDB as labelled case
+  snapshots with a case-local symptom, but the loader structurally never writes
+  the `indicates`/`resolved_by` edges the knowledge layer requires, so they can
+  never become a catalog rule that names a cause.
+- **Retrieved by error signature.** A future analysis surfaces one only when an
+  error signature (e.g. `ibv_modify_qp failed with 19 No such device`) actually
+  appears in that run's observed evidence. It then appears as historical context,
+  labelled with its use-class (`evaluation_only`, `mitigated_context`,
+  `unresolved_context`). Actions it tried — including the ones that did **not**
+  work — are shown as "attempted in a past external case," never as a verified
+  fix for the current incident.
+
+For the de-identification contract and how to add a case, see
+`agent/knowledge/external_cases/README.md`.
+
 For the catalog map, see [Knowledge Base](KNOWLEDGE-BASE.md). For entities,
 relations, and safe TypeDB Studio checks, see [Ontology Guide](ONTOLOGY-GUIDE.md).

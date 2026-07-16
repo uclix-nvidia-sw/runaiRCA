@@ -29,6 +29,7 @@ type EvaluationReview struct {
 	ResolutionOutcome string          `json:"resolution_outcome"`
 	EffectiveAction   string          `json:"effective_action,omitempty"`
 	Notes             string          `json:"notes,omitempty"`
+	OperatorConfirmed bool            `json:"operator_confirmed,omitempty"`
 	CreatedAt         time.Time       `json:"created_at"`
 	UpdatedAt         time.Time       `json:"updated_at"`
 }
@@ -43,15 +44,73 @@ type EvaluationReviewRequest struct {
 	ResolutionOutcome string          `json:"resolution_outcome"`
 	EffectiveAction   string          `json:"effective_action"`
 	Notes             string          `json:"notes"`
+	OperatorConfirmed bool            `json:"operator_confirmed"`
 }
 
 type EvaluationView struct {
-	RunID        string             `json:"run_id"`
-	AnalysisHash string             `json:"analysis_hash"`
-	Harness      map[string]any     `json:"harness,omitempty"`
-	MyReview     *EvaluationReview  `json:"my_review,omitempty"`
-	Reviews      []EvaluationReview `json:"reviews"`
-	AverageScore float64            `json:"average_score"`
+	RunID            string                    `json:"run_id"`
+	AnalysisHash     string                    `json:"analysis_hash"`
+	Harness          map[string]any            `json:"harness,omitempty"`
+	MyReview         *EvaluationReview         `json:"my_review,omitempty"`
+	Reviews          []EvaluationReview        `json:"reviews"`
+	AverageScore     float64                   `json:"average_score"`
+	KnowledgePreview KnowledgePromotionPreview `json:"knowledge_preview"`
+}
+
+// KnowledgePromotionPreview is a non-persisted dry-run of whether this run's
+// approved snapshot would become a knowledge candidate. It reuses the exact
+// promotion gates so operators see the ingestion outcome (and the precise block
+// reason) at evaluation time instead of discovering it later in the Knowledge queue.
+type KnowledgePromotionPreview struct {
+	Outcome       string `json:"outcome"` // ready | validation_failed | blocked | not_approved
+	Reason        string `json:"reason,omitempty"`
+	Family        string `json:"family,omitempty"`
+	EvidenceCount int    `json:"evidence_count"`
+	ProbeCount    int    `json:"probe_count"`
+	CandidateID   string `json:"candidate_id,omitempty"`
+}
+
+// knowledgePromotionPreviewLocked dry-runs promotion for a run/hash. Callers must
+// already hold s.mu (read lock is sufficient); it only reads store state and pure
+// functions and never persists.
+func (s *Store) knowledgePromotionPreviewLocked(runID, hash string) KnowledgePromotionPreview {
+	if strings.TrimSpace(hash) == "" {
+		return KnowledgePromotionPreview{Outcome: "blocked", Reason: "analysis has no result hash yet"}
+	}
+	var snapshot *CaseSnapshot
+	for _, snap := range s.caseSnapshots {
+		if snap != nil && snap.ApprovalState == "active" && snap.RunID == runID && snap.AnalysisHash == hash {
+			snapshot = snap
+			break
+		}
+	}
+	if snapshot == nil {
+		return KnowledgePromotionPreview{Outcome: "not_approved", Reason: "approve the RCA to evaluate whether it becomes runtime knowledge"}
+	}
+	hasReviews, allows := s.caseReviewAllowsKnowledgePromotionLocked(snapshot)
+	if !hasReviews {
+		return KnowledgePromotionPreview{Outcome: "blocked", Reason: "save an evaluation review for this analysis first"}
+	}
+	if !allows {
+		return KnowledgePromotionPreview{Outcome: "blocked", Reason: "evaluation must confirm the analysis root-cause family with a resolved or mitigated outcome and pass the quality floor"}
+	}
+	candidate := knowledgeCandidateForSnapshotWithOutcome(snapshot, true, s.operatorConfirmedForSnapshotLocked(snapshot))
+	if candidate == nil {
+		return KnowledgePromotionPreview{Outcome: "blocked", Reason: "analysis has no v3 reasoning trace to promote"}
+	}
+	preview := KnowledgePromotionPreview{
+		Family:        first(candidate.RootCauseFamily, snapshot.RootCauseFamily),
+		EvidenceCount: len(candidate.EvidenceSummaries),
+		ProbeCount:    len(candidate.ProbeTemplateIDs),
+		CandidateID:   candidate.CandidateID,
+	}
+	if candidate.Status == knowledgeCandidateValidationFailed {
+		preview.Outcome = "validation_failed"
+		preview.Reason = candidate.ValidationError
+	} else {
+		preview.Outcome = "ready"
+	}
+	return preview
 }
 
 func evaluationKey(runID, hash, reviewer string) string {
@@ -97,6 +156,24 @@ func normalizeEvaluationRequest(req EvaluationReviewRequest, allowedFamilies []s
 	}
 	if !mapContains([]string{"resolved", "mitigated", "ineffective", "unknown"}, req.ResolutionOutcome) {
 		return req, errors.New("invalid resolution_outcome")
+	}
+	if req.OperatorConfirmed {
+		// Confirming a diagnosis for a non-reproducible incident is a deliberate,
+		// accountable override: it must name the family, record a rationale, and
+		// assert a successful outcome. The evidence floor is still enforced later by
+		// the promotion validator, so this cannot fabricate evidence-free knowledge.
+		if !mapContains([]string{"known", "compositional"}, req.CaseType) {
+			return req, errors.New("operator confirmation requires a known or compositional case type")
+		}
+		if req.ExpectedFamily == "" {
+			return req, errors.New("operator confirmation requires the confirmed root-cause family")
+		}
+		if !mapContains([]string{"resolved", "mitigated"}, req.ResolutionOutcome) {
+			return req, errors.New("operator confirmation requires a resolved or mitigated outcome")
+		}
+		if req.Notes == "" {
+			return req, errors.New("operator confirmation requires a rationale in notes")
+		}
 	}
 	if len(req.Notes) > maxStoredCommentBodyBytes || len(req.EffectiveAction) > 1000 {
 		return req, errors.New("evaluation text is too long")
@@ -160,6 +237,7 @@ func (s *Store) EvaluationForRun(runID, author string) (EvaluationView, bool) {
 	if len(view.Reviews) > 0 {
 		view.AverageScore /= float64(len(view.Reviews))
 	}
+	view.KnowledgePreview = s.knowledgePromotionPreviewLocked(runID, hash)
 	return view, true
 }
 
@@ -197,6 +275,7 @@ func (s *Store) UpsertEvaluationReview(runID string, req EvaluationReviewRequest
 	review.ResolutionOutcome = req.ResolutionOutcome
 	review.EffectiveAction = req.EffectiveAction
 	review.Notes = req.Notes
+	review.OperatorConfirmed = req.OperatorConfirmed
 	review.UpdatedAt = now
 	s.persistEvaluationReviewLocked(review)
 	// A review is mutable operator truth. If it no longer confirms the exact
@@ -221,6 +300,12 @@ func (s *Store) generateKnowledgeCandidateForReviewedRunLocked(runID, analysisHa
 		if candidate == nil {
 			continue
 		}
+		// A candidate's ID is content-derived, so a failed→ready transition (e.g. an
+		// operator confirmation makes a previously unpromotable analysis eligible)
+		// mints a NEW id and would otherwise leave the stale failed candidate behind
+		// as a confusing duplicate. Supersede any other non-decided candidate for the
+		// same case before recording the fresh one.
+		s.supersedeStaleCaseCandidatesLocked(snapshot.CaseID, candidate.CandidateID, time.Now().UTC())
 		existing := s.knowledgeCandidates[candidate.CandidateID]
 		if existing != nil &&
 			existing.Status == knowledgeCandidateValidationFailed &&
@@ -361,6 +446,36 @@ func (s *Store) invalidateKnowledgeForReviewLocked(runID, analysisHash string, n
 		if updatedPackage != nil {
 			*s.knowledgePackages[updatedPackage.PackageID] = *updatedPackage
 		}
+		s.knowledgeEvents[event.EventID] = event
+	}
+}
+
+// supersedeStaleCaseCandidatesLocked marks every non-decided candidate for a case
+// (other than keepID) as superseded. Used when a newer content-derived candidate
+// replaces an older one for the same analysis, so the review queue never shows a
+// stale failed candidate next to its promoted successor.
+func (s *Store) supersedeStaleCaseCandidatesLocked(caseID, keepID string, now time.Time) {
+	for _, candidate := range s.knowledgeCandidates {
+		if candidate == nil || candidate.CandidateID == keepID {
+			continue
+		}
+		if candidate.CaseID != caseID && !containsString(candidate.SupportingCaseIDs, caseID) {
+			continue
+		}
+		if candidate.Status != knowledgeCandidateGenerated && candidate.Status != knowledgeCandidateValidationFailed {
+			continue
+		}
+		updated := cloneKnowledgeCandidate(candidate)
+		updated.Status = knowledgeCandidateSuperseded
+		updated.UpdatedAt = now
+		updated.DecidedAt = &now
+		updated.DecidedBy = "system"
+		updated.DecisionNote = "superseded by a newer candidate for the same analysis"
+		event := s.newKnowledgeEventLocked(candidate.CandidateID, "", "candidate_superseded", "system", "superseded by a newer candidate for the same analysis", now)
+		if !s.persistKnowledgeReviewInvalidationLocked(&updated, nil, event) {
+			continue
+		}
+		*candidate = updated
 		s.knowledgeEvents[event.EventID] = event
 	}
 }

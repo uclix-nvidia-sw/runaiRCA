@@ -1431,6 +1431,10 @@ func TestWantsAnalysisRunDoesNotTreatReplayAsReanalysis(t *testing.T) {
 		"이 RCA 분석 다시 돌려줘",
 		"지금 알람 분석해줘",
 		"분석 새로 시작해줘",
+		"재분석 부탁해",
+		"이 인시던트 재분석",
+		"analyze this again please",
+		"start a new analysis for the runai namespace",
 	} {
 		if !wantsAnalysisRun(message) {
 			t.Fatalf("expected analysis request for %q", message)

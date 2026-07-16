@@ -105,7 +105,19 @@ export function IncidentsDashboard({
             </thead>
             <tbody>
               {filteredIncidents.map((incident) => (
-                <tr key={incident.incident_id} onClick={() => void onOpenIncident(incident.incident_id)}>
+                <tr
+                  key={incident.incident_id}
+                  tabIndex={0}
+                  onClick={() => void onOpenIncident(incident.incident_id)}
+                  onKeyDown={(event) => {
+                    // ponytail: guard skips events bubbling up from the nested action menu
+                    if (event.target !== event.currentTarget) return;
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      void onOpenIncident(incident.incident_id);
+                    }
+                  }}
+                >
                   <td>
                     <strong>{incident.title}</strong>
                     <span>{incident.incident_id}</span>

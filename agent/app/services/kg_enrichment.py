@@ -24,6 +24,7 @@ from typing import Any
 
 from app.collectors.base import AnalysisTarget
 from app.config import Settings
+from app.knowledge import _keyword_hits
 from app.ontology.typedb_client import TypeDBClient, escape_typeql
 
 _log = logging.getLogger(__name__)
@@ -571,6 +572,10 @@ def _safe_case_card(raw: Any) -> dict[str, Any]:
         ("mechanism_fingerprint", 160),
         ("approval_analysis_hash", 160),
         ("quality_source", 64),
+        # External support-case priors carry an origin + a use-class label so the
+        # synthesis prompt can present them as external reference cases, not proof.
+        ("context_class", 40),
+        ("case_origin", 64),
     ):
         if value := _card_text(raw.get(key), limit):
             card[key] = value
@@ -917,6 +922,106 @@ def _rrf_case_priors(prior: list[dict[str, Any]], similar_incidents: list[Any]) 
             str(item.get("incident_id") or ""),
         ),
     )
+
+
+# External support-case priors. Unlike _PRIOR_QUERY (same-alert, resolved-only),
+# these are retrieved by ERROR-SIGNATURE match on a case-local symptom's keywords
+# and are deliberately NOT status-gated: mitigated/unresolved external cases are
+# still useful labelled context. The approval gate is `approval_state "active"`,
+# which only --approved-by ingestion sets. Only proven TypeQL constructs are used.
+_EXTERNAL_CASE_QUERY = """
+match
+  $i isa incident, has incident_id $iid, has analysis_summary $sum;
+  (incident: $i, symptom: $sy) isa has_symptom;
+  $sy isa symptom, has name $sn, has keyword $kw;
+  $case isa case_snapshot, has approval_state "active", has case_id $case_id;
+  $diagnosis isa diagnosis, links (incident: $i, cause: $cause);
+  (case: $case, finding: $diagnosis) isa case_projection;
+  $cause has subtype $family;
+select $iid, $sum, $sn, $kw, $case_id, $family;
+"""
+
+
+async def external_case_cards(
+    settings: Settings, observed_text: str, *, limit: int = 2
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Labelled external support-case priors whose error signature hits the run's
+    observed evidence. Empty (never an exception) when the graph ships no external
+    cases or nothing matches — a missing prior is safer than a failed RCA."""
+    if not observed_text or not settings.enable_typedb or not settings.typedb_address:
+        return [], []
+    try:
+        import typedb.driver  # noqa: F401
+    except ImportError:
+        return [], ["typedb-driver is not installed; external-case retrieval skipped."]
+    client = TypeDBClient(settings)
+    try:
+        cards = await asyncio.wait_for(
+            asyncio.to_thread(_query_external_cases, client, observed_text, limit),
+            timeout=settings.typedb_timeout_seconds + 1,
+        )
+        return cards, []
+    except Exception as exc:  # noqa: BLE001 - no external prior is safer than a failed RCA
+        _log.warning("external-case retrieval failed: %s", exc, exc_info=True)
+        return [], [f"external-case retrieval unavailable: {type(exc).__name__}"]
+
+
+def _query_external_cases(
+    client: TypeDBClient, observed_text: str, limit: int
+) -> list[dict[str, Any]]:
+    text = (observed_text or "").lower()
+    if not text:
+        return []
+    with client.open_reader() as run:
+        cases: dict[str, dict[str, Any]] = {}
+        for row in run(_EXTERNAL_CASE_QUERY):
+            case_id = str(row.get("case_id") or "")
+            name = str(row.get("sn") or "")
+            if not case_id or not name.startswith("ext:"):  # only case-local symptoms
+                continue
+            info = cases.setdefault(
+                case_id,
+                {
+                    "incident_id": str(row.get("iid") or ""),
+                    "family": str(row.get("family") or ""),
+                    "analysis_summary": str(row.get("sum") or ""),
+                    "keywords": set(),
+                },
+            )
+            kw = str(row.get("kw") or "").strip().lower()
+            if kw:
+                info["keywords"].add(kw)
+        matched: list[tuple[str, dict[str, Any], list[str]]] = []
+        for case_id, info in cases.items():
+            hits, _negated = _keyword_hits(text, sorted(info["keywords"]))
+            if hits:
+                matched.append((case_id, info, hits))
+        # Most signature hits first, then case_id — deterministic, no run() calls
+        # for non-matching cases (early return before per-case projection).
+        matched.sort(key=lambda m: (-len(m[2]), m[0]))
+        cards: list[dict[str, Any]] = []
+        for case_id, info, hits in matched[:limit]:
+            projection = _case_card_projection(run, case_id)
+            built = _case_card(
+                {
+                    "case_id": case_id,
+                    "incident_id": info["incident_id"],
+                    "family": info["family"],
+                    "analysis_summary": info["analysis_summary"],
+                    "case_card": projection,
+                },
+                "external",
+            )
+            built["matched_error_signatures"] = hits[:3]
+            # The shared allowlist (_safe_case_card) strips actions; re-attach them
+            # for external cards only — "what was tried, incl. what did NOT work" is
+            # the whole value of an external prior. Labelled kind=external, so the
+            # synthesis prompt rule forbids presenting them as verified resolutions.
+            for key in ("successful_actions", "failed_actions"):
+                if projection.get(key):
+                    built[key] = projection[key]
+            cards.append(built)
+        return cards
 
 
 async def candidate_families_for_symptoms(

@@ -41,6 +41,10 @@ export type ChatContextValue = {
   context: Record<string, unknown>;
 };
 
+// 'auto' follows the open page; 'cluster' forces whole-cluster (no context);
+// 'incident:<id>' / 'alert:<id>' pin the conversation to that target.
+export type ChatContextChoice = 'auto' | 'cluster' | `incident:${string}` | `alert:${string}`;
+
 const MAX_CONVERSATIONS = 30;
 
 export function useRcaChat({
@@ -60,6 +64,10 @@ export function useRcaChat({
   const [activeConversationID, setActiveConversationID] = useState('');
   const [manualIncidentID, setManualIncidentID] = useState('');
   const [manualAlertID, setManualAlertID] = useState('');
+  // Explicit context choice from the chat-dashboard picker. 'auto' follows the
+  // open page / manual IDs (existing behavior); 'cluster' deliberately sends no
+  // incident/alert so the agent answers from the live cluster.
+  const [contextChoice, setContextChoice] = useState<ChatContextChoice>('auto');
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
 
@@ -116,13 +124,28 @@ export function useRcaChat({
 
     const now = new Date().toISOString();
     const conversationID = activeConversation?.id || randomID('chat');
-    const incidentID = manualIncidentID.trim() || chatContext.incidentID;
-    const alertID = manualAlertID.trim() || chatContext.alertID;
+    // Explicit picker choice wins; 'auto' keeps the page-follow / manual-ID behavior.
+    let incidentID = manualIncidentID.trim() || chatContext.incidentID;
+    let alertID = manualAlertID.trim() || chatContext.alertID;
+    let contextLabel = chatContext.label;
+    if (contextChoice === 'cluster') {
+      incidentID = '';
+      alertID = '';
+      contextLabel = 'Whole cluster';
+    } else if (contextChoice.startsWith('incident:')) {
+      incidentID = contextChoice.slice('incident:'.length);
+      alertID = '';
+      contextLabel = `Incident ${incidentID}`;
+    } else if (contextChoice.startsWith('alert:')) {
+      alertID = contextChoice.slice('alert:'.length);
+      incidentID = '';
+      contextLabel = `Alert ${alertID}`;
+    }
     const userMessage = makeChatMessage('user', message);
     const baseConversation: ChatConversation = activeConversation ?? {
       id: conversationID,
       title: titleFromMessage(message),
-      contextLabel: chatContext.label,
+      contextLabel,
       incidentID,
       alertID,
       messages: [],
@@ -131,7 +154,7 @@ export function useRcaChat({
     };
     const nextConversation: ChatConversation = {
       ...baseConversation,
-      contextLabel: chatContext.label,
+      contextLabel,
       incidentID,
       alertID,
       messages: [...baseConversation.messages, userMessage],
@@ -198,6 +221,7 @@ export function useRcaChat({
   }, [
     activeConversation,
     chatContext,
+    contextChoice,
     input,
     manualAlertID,
     manualIncidentID,
@@ -208,9 +232,12 @@ export function useRcaChat({
   return {
     activeConversation,
     activeConversationID,
+    alerts,
     chatContext,
+    contextChoice,
     conversations,
     deleteConversation,
+    incidents,
     input,
     manualAlertID,
     manualIncidentID,
@@ -218,6 +245,7 @@ export function useRcaChat({
     selectConversation,
     send,
     sending,
+    setContextChoice,
     setInput,
     setManualAlertID,
     setManualIncidentID,

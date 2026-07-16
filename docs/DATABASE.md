@@ -40,26 +40,87 @@ graph during analysis. See [RCA Pipeline](RCA-PIPELINE.md) and
 
 ### Find data by task
 
-Use PostgreSQL for the current incident, alerts, analysis runs, feedback, and
-similarity search. Use TypeDB only for optional topology and approved-history
-relationships; it is never a second operational source of truth.
+Use PostgreSQL for the current incident, its alerts, analysis runs, operator
+feedback, similarity search, and the approved-knowledge learning pipeline. Use
+TypeDB only for optional topology and approved-history relationships; it is never
+a second operational source of truth.
 
 Tables are auto-created by the backend on startup (`backend/store_postgres.go`).
+Fourteen tables, grouped by what they serve.
+
+**Ingestion & analysis**
 
 | Table | Purpose | Key columns |
 |---|---|---|
-| `incidents` | Correlated alert groups | `incident_id` (PK), `correlation_key`, `title`, `severity`, `status`, `fired_at`, `resolved_at`, `alert_count` |
-| `alerts` | Individual alerts + their RCA | `alert_id` (PK), `incident_id` (FK), `fingerprint`, `occurrence_count`, `occurrence_pods` (JSONB), `labels`/`annotations` (JSONB), `analysis_summary`/`analysis_detail`, `analysis_quality`, `capabilities`/`missing_data`/`warnings`/`artifacts` (JSONB) |
-| `incident_embeddings` | Similarity memory | `incident_id` (PK), `alert_id`, `analysis_summary`/`analysis_detail`, `labels` (JSONB), `vector_json` (JSONB), `embedding vector(384)` + HNSW cosine index |
-| `rca_feedback` | Operator votes | `feedback_id` (PK), `target_type`, `target_id`, `vote` (`up`/`down`), `author`, `created_at` |
-| `rca_comments` | Operator notes | `comment_id` (PK), `target_type`, `target_id`, `body`, `author`, `created_at` |
-| `analysis_runs` | RCA execution history | `run_id` (PK), `source` (`auto`/`manual`/`chat`/`feedback`), `status`, `target_type`, `target_id`, `analysis_*`, `created_at` |
+| `incidents` | Correlated alert groups — the unit of RCA and the Slack thread | `incident_id` (PK), `correlation_key`, `status`, `fired_at`, `resolved_at`, `alert_count`, `analysis_seq`, `user_approved_at` |
+| `alerts` | Individual alerts; a re-firing alert accrues here | `alert_id` (PK), `incident_id`, `fingerprint`, `occurrence_count`, `occurrence_pods` (JSONB), `labels`/`annotations` (JSONB), `thread_ts` |
+| `analysis_runs` | **RCA source of truth** — the full output of every analysis run | `run_id` (PK), `source` (`auto`/`manual`/`chat`/`feedback`), `status`, `target_type`/`target_id`, `analysis_summary`/`analysis_detail`, `analysis_quality`, `root_cause_family`, `capabilities`/`missing_data`/`warnings`/`artifacts` (JSONB) |
+| `incident_embeddings` | Similarity memory — find past look-alike incidents | `incident_id`, `alert_id`, `analysis_summary`/`analysis_detail`, `vector_json` (JSONB), `embedding vector(384)` + HNSW cosine index |
+
+> The per-alert RCA columns (`analysis_*`, `capabilities`, …) have been **removed** from `alerts` — the RCA lives on `analysis_runs`. The backend no longer creates or reads them; drop any leftover columns from existing DBs manually (documented in `store_postgres.go`).
+
+**Operator feedback & evaluation**
+
+| Table | Purpose | Key columns |
+|---|---|---|
+| `rca_feedback` | Operator votes **and** comments (polymorphic target) | `feedback_id` (PK), `kind` (`vote`/`comment`), `target_type`/`target_id`, `vote`, `body`, `author` |
+| `rca_eval_reviews` | Structured quality review — scores, hard gates, real-world outcome. **Gates** knowledge learning | `review_id` (PK), `run_id`, `analysis_hash`, `reviewer`, `scores`/`hard_gates` (JSONB), `resolution_outcome`, `effective_action`, `expected_family` |
+
+> `rca_comments` is **deprecated** — read only (if it still exists) to migrate old rows into `rca_feedback`, then droppable. New comments are `rca_feedback` rows with `kind='comment'`.
+
+**Approved-knowledge learning pipeline** — see [the learning pipeline](#the-learning-pipeline-how-an-incident-becomes-knowledge) below.
+
+| Table | Purpose | Key columns |
+|---|---|---|
+| `rca_case_snapshots` | Immutable snapshot of an **operator-approved** RCA — the input to learning + ontology | `case_id` (PK = `run_id:hash`), `incident_id`, `run_id`, `analysis_hash`, `approval_state` (`active`/`revoked`/`superseded`), `mechanism_fingerprint`, `snapshot` (JSONB) |
+| `knowledge_candidates` | Knowledge drawn from a snapshot, moving through a review state machine | `candidate_id` (PK), `case_id`, `knowledge_fingerprint`, `supporting_case_count`, `status` (`ready_for_review`→`active` / `validation_failed` / `rejected` / `superseded`), `content_hash`, `payload` (JSONB) |
+| `knowledge_candidate_cases` | M:N link — which approved cases support one candidate (cross-incident dedup) | `candidate_id` + `case_id` (composite PK), `linked_at` |
+| `knowledge_packages` | Published knowledge; mirrored to TypeDB | `package_id` (PK = `KPK-<case>`), `candidate_id`, `status` (`active`/`shadow`/`retired`), `payload` (JSONB), `mirror_status` |
+| `knowledge_events` | Append-only audit log of every lifecycle transition | `event_id` (PK), `candidate_id`, `package_id`, `event_type`, `actor`, `note`, `created_at` |
+
+**Chat & offline**
+
+| Table | Purpose | Key columns |
+|---|---|---|
+| `chat_conversations` | Chatbot threads, linked to incident/alert context | `conversation_id` (PK), `incident_id`, `alert_id`, `messages` (JSONB), `context_label` |
+| `rca_dataset` | Offline eval dataset — a CronJob accumulates operator-labeled incidents, exported to the curated set | `dataset_id` (PK), `incident_id`, `alertname`, `expected_family`, `approved`, `question` (JSONB) |
+| `ontology_backfill_cursors` | One-time backfill bookkeeping (snapshots → TypeDB) | `cursor_name` (PK), `approved_at`, `case_id` |
 
 **Similarity search**: `incident_embeddings.embedding` (pgvector, HNSW cosine) is
 the primary path; a JSONB sparse-vector cosine fallback runs when pgvector is
 unavailable. The 384-dim vector is a deterministic feature-hash of the RCA text
 (no model dependency) — see `backend/memory.go`. `labels`/`annotations` JSONB are
 the richest entity source consumed by ingestion (cluster/node/queue/etc.).
+
+### The learning pipeline: how an incident becomes knowledge
+
+An approved RCA becomes reusable knowledge through gated steps. **Two human gates
+keep it honest** — nothing goes live automatically.
+
+```mermaid
+flowchart TD
+  A["Incident analyzed · analysis_runs"] -->|"operator approves incident"| B{"passing eval review<br/>for this run+hash?"}
+  B -->|no| S["rca_case_snapshots<br/>snapshot only — no candidate"]
+  B -->|yes| C["rca_case_snapshots +<br/>knowledge_candidates<br/>(ready_for_review)"]
+  C -->|"same fingerprint already exists"| L["knowledge_candidate_cases<br/>link case · supporting_case_count++"]
+  C -->|"operator approves candidate<br/>content-hash revalidated"| P["knowledge_packages<br/>active · mirror_status: pending"]
+  P -->|"CronJob · mirror_packages.py"| T[("TypeDB ontology")]
+  C -.->|"every transition"| E["knowledge_events"]
+  P -.-> E
+```
+
+| Step | Trigger (when) | Writes | Gate |
+|---|---|---|---|
+| **Snapshot** | Operator approves the incident (`user_approved_at`) | `rca_case_snapshots` (immutable, `case_id = run_id:hash`) | Latest analysis run must be `complete` with a bound hash |
+| **Candidate** | Same approval, one transaction | `knowledge_candidates` (`ready_for_review` / `validation_failed`) + `knowledge_events` (`candidate_generated`) | A **passing `rca_eval_reviews`** bound to that exact run+hash, family match, evidence/harness gates — otherwise snapshot only |
+| **Link** | A candidate with the same `knowledge_fingerprint` already exists | `knowledge_candidate_cases`, bump `supporting_case_count` | Cross-incident dedup — no duplicate candidate |
+| **Publish** | Operator approves the candidate (`POST /api/v1/knowledge-candidates/…`) | `knowledge_packages` (`active`, `mirror_status=pending`); prior same-fingerprint package → `retired` | Content-hash **revalidation** — candidate must still be `ready_for_review` and hash-stable |
+| **Mirror** | `typedb-package-mirror-job` CronJob (`ontology/mirror_packages.py`) | TypeDB upsert; `knowledge_packages.mirror_status` → `current`/`failed` | **Advisory** — a failed mirror never blocks activation |
+| **Audit** | Every transition above | `knowledge_events` (append-only) | — |
+
+A **shadow** publish (`ShadowKnowledgeCandidate`) stages a package for review
+*without* exposing it to the active runtime snapshot, so an approval can't
+silently shift RCA ranking; a later explicit activation promotes it.
 
 ---
 

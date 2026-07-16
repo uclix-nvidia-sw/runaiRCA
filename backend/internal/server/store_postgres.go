@@ -332,10 +332,12 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			resolution_outcome TEXT NOT NULL DEFAULT 'unknown',
 			effective_action TEXT NOT NULL DEFAULT '',
 			notes TEXT NOT NULL DEFAULT '',
+			operator_confirmed BOOLEAN NOT NULL DEFAULT false,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			UNIQUE (run_id, analysis_hash, reviewer)
 		)`,
+		`ALTER TABLE rca_eval_reviews ADD COLUMN IF NOT EXISTS operator_confirmed BOOLEAN NOT NULL DEFAULT false`,
 		`CREATE TABLE IF NOT EXISTS rca_case_snapshots (
 			case_id TEXT PRIMARY KEY,
 			incident_id TEXT NOT NULL,
@@ -352,16 +354,6 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			UNIQUE (run_id, analysis_hash)
-		)`,
-		`CREATE TABLE IF NOT EXISTS novel_cause_registry (
-			mechanism_fingerprint TEXT PRIMARY KEY,
-			canonical_family TEXT NOT NULL,
-			mechanism TEXT NOT NULL DEFAULT '',
-			schema_version INTEGER NOT NULL DEFAULT 1,
-			aliases JSONB NOT NULL DEFAULT '[]'::jsonb,
-			merged_into TEXT NOT NULL DEFAULT '',
-			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE TABLE IF NOT EXISTS knowledge_candidates (
 			candidate_id TEXT PRIMARY KEY,
@@ -906,7 +898,7 @@ func (s *Store) loadEvaluationReviews(ctx context.Context) {
 	rows, err := s.db.QueryContext(
 		ctx,
 		`SELECT review_id, run_id, analysis_hash, reviewer, case_type, expected_family,
-		        scores, hard_gates, resolution_outcome, effective_action, notes, created_at, updated_at
+		        scores, hard_gates, resolution_outcome, effective_action, notes, operator_confirmed, created_at, updated_at
 		   FROM rca_eval_reviews`,
 	)
 	if err != nil {
@@ -922,7 +914,7 @@ func (s *Store) loadEvaluationReviews(ctx context.Context) {
 		if err := rows.Scan(
 			&review.ReviewID, &review.RunID, &review.AnalysisHash, &review.Reviewer,
 			&review.CaseType, &review.ExpectedFamily, &scoresRaw, &gatesRaw,
-			&review.ResolutionOutcome, &review.EffectiveAction, &review.Notes,
+			&review.ResolutionOutcome, &review.EffectiveAction, &review.Notes, &review.OperatorConfirmed,
 			&review.CreatedAt, &review.UpdatedAt,
 		); err != nil {
 			log.Printf("Failed to scan evaluation review: %v", err)
@@ -1458,12 +1450,6 @@ func (s *Store) persistCaseSnapshotAndKnowledgeCandidateLocked(snapshot *CaseSna
 			_ = tx.Rollback()
 		}
 	}()
-	if strings.HasPrefix(snapshot.RootCauseFamily, "novel_") && snapshot.MechanismFingerprint != "" {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO novel_cause_registry (mechanism_fingerprint, canonical_family, mechanism, schema_version, aliases, merged_into) VALUES ($1, $2, $3, 1, '[]'::jsonb, '') ON CONFLICT (mechanism_fingerprint) DO NOTHING`, snapshot.MechanismFingerprint, snapshot.RootCauseFamily, snapshot.Mechanism); err != nil {
-			log.Printf("Failed to persist novel cause registry %s: %v", snapshot.MechanismFingerprint, err)
-			return false
-		}
-	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO rca_case_snapshots (case_id, incident_id, alert_id, run_id, analysis_hash, approval_state, root_cause_family, mechanism, mechanism_fingerprint, snapshot, approved_at, revoked_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (case_id) DO NOTHING`, snapshot.CaseID, snapshot.IncidentID, snapshot.AlertID, snapshot.RunID, snapshot.AnalysisHash, snapshot.ApprovalState, snapshot.RootCauseFamily, snapshot.Mechanism, snapshot.MechanismFingerprint, mustJSON(snapshot.Snapshot), snapshot.ApprovedAt, snapshot.RevokedAt); err != nil {
 		log.Printf("Failed to persist RCA case snapshot %s: %v", snapshot.CaseID, err)
 		return false
@@ -1971,24 +1957,6 @@ func (s *Store) persistCaseSnapshotLifecycleLocked(snapshot *CaseSnapshot) bool 
 	return true
 }
 
-func (s *Store) persistNovelCauseRegistryLocked(snapshot *CaseSnapshot) bool {
-	if s.db == nil || !s.dbReady || snapshot == nil || snapshot.MechanismFingerprint == "" {
-		return true
-	}
-	_, err := s.execPostgres(
-		`INSERT INTO novel_cause_registry (
-			mechanism_fingerprint, canonical_family, mechanism, schema_version, aliases, merged_into
-		) VALUES ($1, $2, $3, 1, '[]'::jsonb, '')
-		ON CONFLICT (mechanism_fingerprint) DO NOTHING`,
-		snapshot.MechanismFingerprint, snapshot.RootCauseFamily, snapshot.Mechanism,
-	)
-	if err != nil {
-		log.Printf("Failed to persist novel cause registry %s: %v", snapshot.MechanismFingerprint, err)
-		return false
-	}
-	return true
-}
-
 func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) bool {
 	if s.db == nil || !s.dbReady || run == nil {
 		return true
@@ -2096,8 +2064,8 @@ func (s *Store) persistEvaluationReviewLocked(review *EvaluationReview) {
 	_, err := s.execPostgres(
 		`INSERT INTO rca_eval_reviews (
 			review_id, run_id, analysis_hash, reviewer, case_type, expected_family,
-			scores, hard_gates, resolution_outcome, effective_action, notes, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			scores, hard_gates, resolution_outcome, effective_action, notes, operator_confirmed, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		ON CONFLICT (run_id, analysis_hash, reviewer) DO UPDATE SET
 			case_type = EXCLUDED.case_type,
 			expected_family = EXCLUDED.expected_family,
@@ -2106,10 +2074,11 @@ func (s *Store) persistEvaluationReviewLocked(review *EvaluationReview) {
 			resolution_outcome = EXCLUDED.resolution_outcome,
 			effective_action = EXCLUDED.effective_action,
 			notes = EXCLUDED.notes,
+			operator_confirmed = EXCLUDED.operator_confirmed,
 			updated_at = EXCLUDED.updated_at`,
 		review.ReviewID, review.RunID, review.AnalysisHash, review.Reviewer,
 		review.CaseType, review.ExpectedFamily, mustJSON(review.Scores), mustJSON(review.HardGates),
-		review.ResolutionOutcome, review.EffectiveAction, review.Notes, review.CreatedAt, review.UpdatedAt,
+		review.ResolutionOutcome, review.EffectiveAction, review.Notes, review.OperatorConfirmed, review.CreatedAt, review.UpdatedAt,
 	)
 	if err != nil {
 		log.Printf("Failed to persist evaluation review %s: %v", review.ReviewID, err)

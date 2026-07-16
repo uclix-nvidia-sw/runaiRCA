@@ -101,6 +101,15 @@ typedb:
   # Auto-load the ontology schema (ontology/schema.tql) into TypeDB via a
   # post-install/upgrade Helm hook Job so the graph is queryable immediately.
   loadSchema: true
+  # Load curated EXTERNAL support-case payloads (de-identified, committed under
+  # agent/knowledge/external_cases/ and baked into the agent image) as labelled
+  # historical priors, chained onto the same schema-load hook. No-ops when the
+  # image ships no payloads. `approvedBy` binds the operator accountable for
+  # these priors and is REQUIRED when enabled — the load records it on each case
+  # and refuses to run unset (approval is an explicit act).
+  externalCases:
+    enabled: false
+    approvedBy: ""
   # Periodically project resolved incidents into the KG (the "facts" layer).
   ingest:
     enabled: true

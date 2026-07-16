@@ -63,7 +63,10 @@ spec:
           command:
             - sh
             - -c
-            - python -m ontology.load_schema && python -m ontology.load_functions && python -m ontology.load_knowledge && python -m ontology.load_troubleshooting && python -m ontology.load_xids && python -m ontology.load_alerts && python -m ontology.load_known_issues && python -m ontology.load_architecture
+            # External support-case priors are chained last so a load failure can't
+            # block the schema/knowledge load. --approved-by binds the operator
+            # accountable for these priors; `required` makes approval an explicit act.
+            - python -m ontology.load_schema && python -m ontology.load_functions && python -m ontology.load_knowledge && python -m ontology.load_troubleshooting && python -m ontology.load_xids && python -m ontology.load_alerts && python -m ontology.load_known_issues && python -m ontology.load_architecture{{ if .Values.typedb.externalCases.enabled }} && python -m ontology.load_external_cases --approved-by {{ required "typedb.externalCases.approvedBy is required when typedb.externalCases.enabled=true" .Values.typedb.externalCases.approvedBy | quote }}{{ end }}
           env:
             - name: ENABLE_TYPEDB
               value: "true"
