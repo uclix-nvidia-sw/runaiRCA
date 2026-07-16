@@ -23,7 +23,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
@@ -870,6 +870,24 @@ function UnifiedWorkspace({
     }, 1400);
   }, []);
 
+  const sectionRef = useRef<HTMLElement | null>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
+
+  // Dialog focus management: remember what opened the workspace (the table row
+  // activated by Enter/click), move focus into the dialog so Tab starts on its
+  // actions instead of the covered list, and hand focus back on close.
+  // useLayoutEffect, not useEffect: the same commit that mounts the dialog also
+  // hides `.main` (visibility), and the browser blurs the row during the style
+  // recalc that follows — a passive effect would only ever see <body> focused.
+  useLayoutEffect(() => {
+    if (!detailKey) return undefined;
+    openerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    sectionRef.current?.focus();
+    return () => {
+      openerRef.current?.focus();
+    };
+  }, [detailKey]);
+
   if (!detail) return null;
   const incident = detail.kind === 'incident' ? detail.data : null;
   const alert = detail.kind === 'alert' ? detail.data : null;
@@ -904,7 +922,23 @@ function UnifiedWorkspace({
   };
 
   return (
-    <section className={`workspace ${closing ? 'is-closing' : ''}`}>
+    <section
+      className={`workspace ${closing ? 'is-closing' : ''}`}
+      ref={sectionRef}
+      tabIndex={-1}
+      role="dialog"
+      aria-modal="true"
+      aria-label={title || `${detail.kind} detail`}
+      onKeyDown={(event) => {
+        if (event.key !== 'Escape') return;
+        // Don't steal Escape from form fields (evaluation notes, comments) —
+        // closing the whole dialog mid-edit would discard the operator's text.
+        const target = event.target as HTMLElement;
+        if (target.closest('input, textarea, select, [contenteditable="true"]')) return;
+        event.stopPropagation();
+        handleClose();
+      }}
+    >
       <div className="workspace-header">
         <div>
           <p className="eyebrow">{detail.kind} detail</p>

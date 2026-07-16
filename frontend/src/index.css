@@ -4865,6 +4865,14 @@ tbody tr:focus-visible {
   pointer-events: none;
 }
 
+/* While the detail dialog is up, the content it covers drops out of the tab
+   order and the accessibility tree (keyboard focus can't wander into the
+   hidden list). During .is-closing it comes back, so the exit fade reveals a
+   live, focusable list. The sidebar stays interactive — it isn't covered. */
+.app-shell:has(.workspace:not(.is-closing)) .main {
+  visibility: hidden;
+}
+
 /* ---- RCA report: fades in when it replaces the "Analyzing…" placeholder (or
    arrives on open) rather than snapping in. ---- */
 .rca-report-body {
