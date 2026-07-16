@@ -4829,6 +4829,15 @@ tbody tr:focus-visible {
   outline-offset: 2px;
 }
 
+/* The column-filter <select> is intentionally invisible (opacity: 0 overlay),
+   so its own focus ring can never show — without this, keyboard focus silently
+   "disappears" for three Tab stops between the toolbar and the first row. Ring
+   the visible wrapper instead. */
+.column-filter:focus-within {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
 /* ---- Translucent chrome: floating layers read as real material over the
    content/gradient behind them (Apple §12). ---- */
 .sidebar {
