@@ -108,7 +108,7 @@ typedb:
   # these priors and is REQUIRED when enabled — the load records it on each case
   # and refuses to run unset (approval is an explicit act).
   externalCases:
-    enabled: true
+    enabled: false
     approvedBy: ""
   # Periodically project resolved incidents into the KG (the "facts" layer).
   ingest:
