@@ -451,6 +451,7 @@ async def k8s_logs(
     mcp_note = ""
     token = _read_file(settings.kubernetes_token_path) if since_time else ""
     if token:
+        # Intentional: MCP v0.0.62 cannot request sinceTime for this bounded read.
         return await _direct_pod_logs(
             settings,
             namespace=namespace,
@@ -1097,14 +1098,24 @@ def _mcp_named_resource_matches(
 ) -> bool:
     """Whether a named MCP get proves it returned the requested object.
 
-    A list wrapper, an object without metadata, or an explicit name/namespace
-    mismatch is rejected. Some Kubernetes MCP YAML views omit metadata.namespace
-    even for a correctly namespace-scoped get; that omission remains partial
-    context in downstream evidence handling, rather than forcing an avoidable
-    direct fallback.
+    An object without metadata or an explicit name/namespace mismatch is
+    rejected. Some Kubernetes MCP YAML views omit metadata.namespace even for a
+    correctly namespace-scoped get; that omission remains partial context in
+    downstream evidence handling, rather than forcing an avoidable direct
+    fallback. A single-item list or single top-level object wrapper is accepted
+    only when its contained object's identity matches exactly.
     """
     payload = _normalize_k8s_payload(data)
-    if not isinstance(payload, dict) or isinstance(payload.get("items"), list):
+    if isinstance(payload, dict) and isinstance(payload.get("items"), list):
+        items = payload["items"]
+        if len(items) != 1:
+            return False
+        payload = items[0]
+    elif isinstance(payload, dict) and not isinstance(payload.get("metadata"), dict):
+        wrapped = [value for value in payload.values() if isinstance(value, dict)]
+        if len(payload) == 1 and len(wrapped) == 1:
+            payload = wrapped[0]
+    if not isinstance(payload, dict):
         return False
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict) or str(metadata.get("name") or "") != expected_name:

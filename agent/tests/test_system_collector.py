@@ -33,6 +33,7 @@ class _Settings:
     system_agent_url = "http://{node}:9095"
     system_agent_token = ""
     system_agent_timeout_seconds = 6
+    system_agent_max_nodes = 12
     # llm_configured() reads these; unset -> deterministic path.
     llm_base_url = ""
     llm_model = ""
@@ -92,6 +93,62 @@ async def test_no_node_is_unavailable() -> None:
     result = await SystemCollector(_Settings()).collect(_target(node=""))
     assert result.status == "unavailable"
     assert result.missing_data == ["system_agent.node"]
+
+
+@pytest.mark.asyncio
+async def test_no_node_scans_all_cluster_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.collectors import kubernetes as k8s
+
+    async def no_target_node(*_args, **_kwargs):
+        return "", "", ""
+
+    async def fake_k8s_read(*_args, **_kwargs):
+        return {
+            "error": None,
+            "data": {"items": [{"metadata": {"name": node}} for node in ("n1", "n2", "n3")]},
+        }
+
+    async def fake_internal_ip(_settings, node):
+        return node
+
+    async def fake_get_json(*, base_url, **_kwargs):
+        return JsonResponse(url=base_url, status_code=200, data={"lines": ["all good"]})
+
+    monkeypatch.setattr(system_mod, "_node_from_target_pod", no_target_node)
+    monkeypatch.setattr(k8s, "k8s_read", fake_k8s_read)
+    monkeypatch.setattr(system_mod, "_node_internal_ip", fake_internal_ip)
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+
+    result = await SystemCollector(_Settings()).collect(_target(node=""))
+
+    assert result.missing_data == []
+    assert len(result.artifacts) == 3
+    assert {item.result["node"] for item in result.artifacts} == {"n1", "n2", "n3"}
+    assert result.details["node_origin"] == "cluster_scan"
+    assert all(
+        item.result["observation"]["coverage"] == "partial" for item in result.artifacts
+    )
+
+
+@pytest.mark.asyncio
+async def test_node_scoped_target_scans_only_its_node(monkeypatch: pytest.MonkeyPatch) -> None:
+    scanned: set[str] = set()
+
+    async def fake_internal_ip(_settings, node):
+        return node
+
+    async def fake_get_json(*, base_url, **_kwargs):
+        scanned.add(base_url.removeprefix("http://").removesuffix(":9095"))
+        return JsonResponse(url=base_url, status_code=200, data={"lines": ["all good"]})
+
+    monkeypatch.setattr(system_mod, "_node_internal_ip", fake_internal_ip)
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+
+    result = await SystemCollector(_Settings()).collect(_target(node="gpu-node-1"))
+
+    assert scanned == {"gpu-node-1"}
+    assert len(result.artifacts) == 1
+    assert result.details["node"] == "gpu-node-1"
 
 
 @pytest.mark.asyncio

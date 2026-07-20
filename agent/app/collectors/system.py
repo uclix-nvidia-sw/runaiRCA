@@ -12,6 +12,7 @@ Degrades gracefully exactly like loki.py: unconfigured -> status='unavailable'.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -469,6 +470,39 @@ class SystemCollector:
             if node:
                 node_origin = resolved_origin
         if not node:
+            return await self._scan_all_nodes(target, plan)
+
+        return await self._scan_node(
+            target,
+            plan,
+            node=node,
+            node_origin=node_origin,
+            alert_node=alert_node,
+            resolved_pod=resolved_pod,
+        )
+
+    async def _scan_all_nodes(self, target: AnalysisTarget, plan) -> CollectorResult:
+        try:
+            from app.collectors.kubernetes import k8s_read
+
+            node_list = await k8s_read(self._settings, "nodes", full_object=True)
+            data = (
+                node_list.get("data")
+                if isinstance(node_list, dict) and not node_list.get("error")
+                else None
+            )
+            items = data.get("items") if isinstance(data, dict) else data
+            if isinstance(items, list):
+                nodes = [
+                    str(item.get("metadata", {}).get("name") or "").strip()
+                    for item in items
+                    if isinstance(item, dict) and isinstance(item.get("metadata"), dict)
+                ]
+            else:
+                nodes = []
+        except Exception:  # noqa: BLE001 - keep system evidence optional
+            nodes = []
+        if not nodes:
             summary = f"{NO_EVIDENCE} " + ko_en(
                 self._settings,
                 "이 알림에서 노드를 특정할 수 없어 노드/커널 증거 수집을 건너뛰었습니다 "
@@ -495,6 +529,73 @@ class SystemCollector:
                 ],
             )
 
+        limit = max(1, int(getattr(self._settings, "system_agent_max_nodes", 12)))
+        selected_nodes = nodes[:limit]
+        warnings = (
+            [f"System agent node scan capped at {limit}; {len(nodes) - limit} nodes were skipped."]
+            if len(nodes) > limit
+            else []
+        )
+        semaphore = asyncio.Semaphore(5)
+
+        async def scan(node: str) -> CollectorResult:
+            async with semaphore:
+                return await self._scan_node(
+                    target,
+                    plan,
+                    node=node,
+                    node_origin="cluster_scan",
+                    alert_node="",
+                    resolved_pod="",
+                )
+
+        results = await asyncio.gather(*(scan(node) for node in selected_nodes))
+        artifacts = [artifact for result in results for artifact in result.artifacts]
+        warnings.extend(warning for result in results for warning in result.warnings)
+        error_nodes = [
+            str(result.details.get("node") or "")
+            for result in results
+            if any(
+                isinstance(source, dict) and int(source.get("error_count") or 0) > 0
+                for source in result.details.get("sources", [])
+            )
+        ]
+        clean_nodes = [
+            result.details.get("node", "")
+            for result in results
+            if result.status != "unavailable" and result.details.get("node", "") not in error_nodes
+        ]
+        status = "ok" if any(result.status == "ok" for result in results) else (
+            "partial" if any(result.status == "partial" for result in results) else "unavailable"
+        )
+        confidence = "high" if status == "ok" else "low"
+        summary = (
+            f"System agent scanned {len(selected_nodes)} cluster node(s). "
+            f"Kernel/hardware error lines: {', '.join(error_nodes) or 'none'}; "
+            f"clean/current-context nodes: {', '.join(clean_nodes) or 'none'}."
+        )
+        missing_data = sorted({item for result in results for item in result.missing_data})
+        return CollectorResult(
+            agent=self.name,
+            status=status,
+            summary=summary,
+            confidence=confidence,
+            details={"nodes": [result.details for result in results], "node_origin": "cluster_scan"},
+            missing_data=missing_data,
+            warnings=warnings,
+            artifacts=artifacts,
+        )
+
+    async def _scan_node(
+        self,
+        target: AnalysisTarget,
+        plan,
+        *,
+        node: str,
+        node_origin: str,
+        alert_node: str,
+        resolved_pod: str,
+    ) -> CollectorResult:
         # Pod DNS usually cannot resolve bare node hostnames (http://dgx01:9095 ->
         # "Name or service not known"), so resolve the node's InternalIP from the
         # Kubernetes API and address the hostNetwork DaemonSet by IP. Falls back to
