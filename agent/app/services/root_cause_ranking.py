@@ -1,6 +1,6 @@
 """Deterministic root-cause *candidate* ranking.
 
-Ranks EVERY family in knowledge/families.yaml (the same 15-family universe the
+Ranks EVERY family in knowledge/families.yaml (the same 16-family universe the
 curated failure modes use — the ranked categories and the ontology knowledge
 finally speak one vocabulary) for the CURRENT incident from the evidence the
 collectors already gathered. This is NOT incident similarity — pgvector /
