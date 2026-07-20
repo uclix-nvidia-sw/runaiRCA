@@ -73,7 +73,7 @@ from app.collectors.prometheus import prom_mcp_query, prom_query
 from app.collectors.runai_mcp import _tool_json, valid_official_workload_id
 from app.collectors.system import system_log_query
 from app.config import Settings
-from app.llm import complete_json, llm_configured
+from app.llm import complete_json, complete_with_error, llm_configured
 from app.masking import build_masker
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
@@ -218,19 +218,29 @@ async def _drill_one(
             user_prompt = masker.mask_text(
                 _user_prompt(result, target, plan, history, architecture, blackboard=blackboard)
             )
+            decision_system = _system_prompt(result.agent, tools)
             decision = await complete_json(
                 settings,
-                system=_system_prompt(result.agent, tools),
+                system=decision_system,
                 user=user_prompt,
                 model=settings.llm_model_drilldown,
             )
             if decision is None:
                 # An LLM transport/parse failure must be distinguishable from a
                 # legitimate "done" — otherwise a dead LLM looks like a satisfied
-                # agent and nobody notices drill-down never ran (the litellm
-                # provider incident). Surface it in the report warnings.
+                # agent and nobody notices drill-down never ran. Re-ask once via
+                # complete_with_error to surface the REASON, so a persistent config
+                # error (HTTP 400 — the litellm-provider incident) or an empty body
+                # is distinguishable from a transient blip that recovered.
+                _text, decision_error = await complete_with_error(
+                    settings,
+                    system=decision_system,
+                    user=user_prompt,
+                    model=settings.llm_model_drilldown,
+                )
+                detail = f": {decision_error}" if decision_error else ""
                 result.warnings.append(
-                    f"{result.agent} drill-down stopped at step {step}: LLM decision call failed"
+                    f"{result.agent} drill-down stopped at step {step}: LLM decision call failed{detail}"
                 )
                 break
             if not isinstance(decision, dict) or decision.get("action") != "query":

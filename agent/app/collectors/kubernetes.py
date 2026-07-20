@@ -145,6 +145,10 @@ _RUNAI_CRD_KINDS: dict[str, tuple[str, str, bool]] = {
 # The Run:ai workload CRD kinds (namespaced), most-specific first — enumerated
 # when an alert lands in a Run:ai namespace but names no workload, so the RCA
 # still finds which workloads are unhealthy from their own status.conditions.
+_CRD_SCAN_SKIP_NAMESPACES: frozenset[str] = frozenset(
+    {"kube-system", "kube-public", "kube-node-lease"}
+)
+
 _RUNAI_WORKLOAD_KINDS: tuple[str, ...] = (
     "trainingworkloads",
     "interactiveworkloads",
@@ -5510,8 +5514,15 @@ async def collect_runai_crd_findings(
                 warnings.append(f"Run:ai CRD {label} scan failed: {exc.__class__.__name__}.")
                 return
             if result.get("error"):
-                failed_kinds.append(label)
-                warnings.append(f"Run:ai CRD {label} scan failed: {result['error']}.")
+                # A 404 means this CRD kind is not served at the group's discovered
+                # version (or is not installed) — the same "no such workloads here"
+                # signal as an empty namespace, not a scan failure. Record it quietly
+                # and warn only on real failures (auth, timeout, 5xx).
+                if result.get("status_code") == 404 or "404" in str(result.get("error") or ""):
+                    checked.append(label)
+                else:
+                    failed_kinds.append(label)
+                    warnings.append(f"Run:ai CRD {label} scan failed: {result['error']}.")
                 return
             if not page:
                 checked.append(label)
@@ -5536,7 +5547,11 @@ async def collect_runai_crd_findings(
     for kind in ("projects", "queues", "departments"):
         await scan(kind)
     # Namespaced workloads + their pod-groups in the alert's own namespaces.
-    scan_namespaces = _dedup_str([n for n in namespaces if n])
+    # Run:ai workloads never live in cluster system namespaces, so scanning them
+    # for Run:ai CRDs only produces 404/empty noise (e.g. a kube-system alert).
+    scan_namespaces = _dedup_str(
+        [n for n in namespaces if n and n not in _CRD_SCAN_SKIP_NAMESPACES]
+    )
     for namespace in scan_namespaces[:4]:
         for kind in (*_RUNAI_WORKLOAD_KINDS, "podgroups"):
             await scan(kind, namespace)

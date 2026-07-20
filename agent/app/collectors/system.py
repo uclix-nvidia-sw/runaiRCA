@@ -382,6 +382,17 @@ def _journal_matching_timestamps(
     return [raw for _, raw in timestamps]
 
 
+def _same_instant(echoed: object, requested: str) -> bool:
+    """Timestamps match if the strings are identical OR parse to the same instant
+    — tolerate an agent that echoes `Z` vs `+00:00` or otherwise reformats, so a
+    correctly-windowed response isn't false-negatived into 'context only'."""
+    if str(echoed or "") == str(requested or ""):
+        return True
+    parsed_echoed = parse_incident_time(str(echoed or ""))
+    parsed_requested = parse_incident_time(str(requested or ""))
+    return parsed_echoed is not None and parsed_echoed == parsed_requested
+
+
 def _historical_journal_response_verified(
     data: object, time_range: dict[str, str], source: str = "journal"
 ) -> bool:
@@ -395,8 +406,8 @@ def _historical_journal_response_verified(
     return (
         isinstance(data, dict)
         and str(data.get("source") or "").strip().lower() == source
-        and str(data.get("since") or "") == time_range["start"]
-        and str(data.get("until") or "") == time_range["end"]
+        and _same_instant(data.get("since"), time_range["start"])
+        and _same_instant(data.get("until"), time_range["end"])
         and isinstance(data.get("lines"), list)
     )
 

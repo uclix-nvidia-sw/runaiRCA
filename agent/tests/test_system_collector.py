@@ -687,3 +687,14 @@ def test_fabric_manager_evidence_reaches_the_knowledge_matcher() -> None:
     assert chain("fmActivateFabricPartition failed: FM_ST_IN_USE")  # partition life-cycle
     # Fabric Manager init failure signal is at least captured (was dropped before).
     assert _ERROR_PATTERNS.search("nvidia-fabricmanager: GPU system not yet initialized")
+
+
+def test_same_instant_tolerates_timestamp_reformatting() -> None:
+    """A correctly-windowed journalctl response must not be false-negatived into
+    'context only' just because the agent echoes Z vs +00:00 or reformats."""
+    from app.collectors.system import _same_instant
+
+    assert _same_instant("2026-07-14T01:00:00Z", "2026-07-14T01:00:00Z")
+    assert _same_instant("2026-07-14T01:00:00+00:00", "2026-07-14T01:00:00Z")
+    assert not _same_instant("2026-07-14T01:00:00Z", "2026-07-14T02:00:00Z")
+    assert not _same_instant("", "2026-07-14T01:00:00Z")
