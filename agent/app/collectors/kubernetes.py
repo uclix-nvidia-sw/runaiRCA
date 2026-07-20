@@ -5186,6 +5186,7 @@ def _node_cordon_artifact(
     """Publish a cordon snapshot without backdating its current-state value."""
     artifacts = []
     historical = bool(str(target.resolved_at or "").strip())
+    causal = not historical and _incident_shows_unschedulable(target, responses)
     for response in responses:
         if response.get("name") != "node" or response.get("error"):
             continue
@@ -5198,14 +5199,16 @@ def _node_cordon_artifact(
             continue
 
         polarity, coverage, confidence, snapshot_role = (
-            ("unknown", "partial", "low", "current_context")
-            if historical
-            else ("present", "scoped", "high", "live_incident")
+            ("present", "scoped", "high", "live_incident")
+            if causal
+            else ("unknown", "partial", "low", "current_context")
         )
         scope_note = (
             "current context; a resolved incident is not explained by a current cordon"
             if historical
-            else "live firing snapshot"
+            else "current context; no unschedulable/pending symptom in this incident"
+            if not causal
+            else "live firing snapshot; incident shows an unschedulable/pending symptom"
         )
         observation = {
             "kind": "kubernetes_node_cordon",
@@ -5213,7 +5216,7 @@ def _node_cordon_artifact(
             "polarity": polarity,
             "coverage": coverage,
             "observed_entity": {"kind": "node", "name": node},
-            "observation_window": time_range if not historical else {},
+            "observation_window": time_range if causal else {},
             "snapshot_role": snapshot_role,
         }
         artifacts.append(
@@ -5239,6 +5242,69 @@ def _node_cordon_artifact(
             )
         )
     return artifacts
+
+
+_UNSCHEDULABLE_ALERT_MARKERS = ("unschedulable", "pending", "failedscheduling")
+_UNSCHEDULABLE_EVENT_REASONS = frozenset({"failedscheduling", "unschedulable"})
+_UNSCHEDULABLE_EVENT_MESSAGE_MARKERS = (
+    "unschedulable",
+    "were unschedulable",
+    "nodes are available",
+)
+
+
+def _incident_shows_unschedulable(
+    target: AnalysisTarget, responses: list[dict[str, object]]
+) -> bool:
+    """Whether alert metadata or collected Kubernetes objects show scheduling failure."""
+    target_text = [str(target.alert_name or "")]
+    # AnalysisTarget normally keeps alert_name only. Accept optional summary/
+    # annotation attributes as well so callers with richer target objects get
+    # the same safe scheduling gate without changing the target schema.
+    for field in ("annotation", "annotations", "summary", "description"):
+        value = getattr(target, field, "")
+        if isinstance(value, dict):
+            target_text.extend(str(item or "") for item in value.values())
+        elif isinstance(value, (str, int, float)):
+            target_text.append(str(value))
+    if any(
+        marker in text.casefold()
+        for text in target_text
+        for marker in _UNSCHEDULABLE_ALERT_MARKERS
+    ):
+        return True
+
+    for response in responses:
+        if not isinstance(response, dict) or response.get("error"):
+            continue
+        for item in _response_dicts(response.get("data")):
+            reason = str(item.get("reason") or "").casefold()
+            message = str(item.get("message") or "").casefold()
+            if (
+                reason in _UNSCHEDULABLE_EVENT_REASONS
+                or any(marker in message for marker in _UNSCHEDULABLE_EVENT_MESSAGE_MARKERS)
+            ):
+                return True
+            status = item.get("status")
+            phase = (
+                status.get("phase")
+                if isinstance(status, dict)
+                else item.get("phase")
+            )
+            if str(phase or "").casefold() == "pending":
+                return True
+    return False
+
+
+def _response_dicts(value: object):
+    """Yield every structured object in a compacted Kubernetes response."""
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _response_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _response_dicts(child)
 
 
 def _valid_node_condition_window(time_range: dict[str, str] | None) -> bool:

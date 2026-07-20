@@ -2536,6 +2536,7 @@ def test_node_cordon_artifact_scopes_current_state_without_backdating() -> None:
     firing_target = replace(
         make_target(),
         node="node1",
+        alert_name="BondingInterfaceDegraded",
         fired_at="2026-07-14T01:00:00Z",
         resolved_at="",
     )
@@ -2547,10 +2548,26 @@ def test_node_cordon_artifact_scopes_current_state_without_backdating() -> None:
             "data": {"name": "node1", "unschedulable": True},
         }
     ]
+    scheduling_responses = [
+        *cordoned_response,
+        {
+            "name": "pod_events",
+            "status_code": 200,
+            "error": None,
+            "data": {
+                "items": [
+                    {
+                        "reason": "FailedScheduling",
+                        "message": "0/3 nodes are available: 3 node(s) were unschedulable",
+                    }
+                ]
+            },
+        },
+    ]
     firing = _node_cordon_artifact(
         "kubernetes",
         firing_target,
-        cordoned_response,
+        scheduling_responses,
         time_range=causal_evidence_time_range(firing_target),
     )
 
@@ -2560,11 +2577,20 @@ def test_node_cordon_artifact_scopes_current_state_without_backdating() -> None:
     assert firing[0].confidence == "high"
     assert firing[0].result["observation"]["polarity"] == "present"
 
+    nonscheduling = _node_cordon_artifact(
+        "kubernetes",
+        firing_target,
+        cordoned_response,
+        time_range=causal_evidence_time_range(firing_target),
+    )
+    assert nonscheduling[0].confidence == "low"
+    assert nonscheduling[0].result["observation"]["polarity"] == "unknown"
+
     resolved_target = replace(firing_target, resolved_at="2026-07-14T01:10:00Z")
     resolved = _node_cordon_artifact(
         "kubernetes",
         resolved_target,
-        cordoned_response,
+        scheduling_responses,
         time_range=causal_evidence_time_range(resolved_target),
     )
     assert resolved[0].confidence == "low"
