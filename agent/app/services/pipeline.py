@@ -103,8 +103,8 @@ _K8S_CONDITION_TYPES = frozenset(
     }
 )
 _SYNTHESIS_ASSERTION_CONDITIONAL = re.compile(
-    r"\b(?:check|verify|whether|hypothesis|possible|possibly|could|may|might|candidate)\b|"
-    r"(?:확인\s*(?:필요|대상|예정)|확인(?:하|해|해야)|점검|검증|여부|가설|가능성|의심|후보)",
+    r"\b(?:check|verify|whether|hypothesis|possible|possibly|could|may|might|candidate|inconclusive)\b|"
+    r"(?:확인\s*(?:필요|대상|예정)|확인(?:하|해|해야)|점검|검증|검토|조사|미확보|미확인|불확실|여부|가설|가능성|의심|후보)",
     re.IGNORECASE,
 )
 _SYNTHESIS_PRIVATE_FACT_CITATION = re.compile(
@@ -3372,15 +3372,59 @@ def _synthesis_signal_mentions(
     return spans
 
 
+_SYNTHESIS_ENUM_LEFT = frozenset("/,、(")
+_SYNTHESIS_ENUM_RIGHT = frozenset("/,、)")
+_SYNTHESIS_ENUM_SEPARATOR = frozenset("/,、")
+
+
+def _synthesis_mention_in_enumeration(fragment: str, start: int, end: int) -> bool:
+    """Whether the signal term is one item of a slash/comma enumeration.
+
+    A condition named inside a list to inspect — ``(MemoryPressure/DiskPressure/
+    NetworkUnavailable)`` or ``(quota/gang/preempt/reclaim)`` — is not an
+    assertion that the condition occurred, so it must not reject the synthesis.
+    """
+    left = start - 1
+    while left >= 0 and fragment[left].isspace():
+        left -= 1
+    right = end
+    length = len(fragment)
+    while right < length and fragment[right].isspace():
+        right += 1
+    left_char = fragment[left] if left >= 0 else ""
+    right_char = fragment[right] if right < length else ""
+    if left_char in _SYNTHESIS_ENUM_LEFT and right_char in _SYNTHESIS_ENUM_RIGHT:
+        return (
+            left_char in _SYNTHESIS_ENUM_SEPARATOR
+            or right_char in _SYNTHESIS_ENUM_SEPARATOR
+        )
+    return False
+
+
+def _synthesis_mention_in_code_span(fragment: str, start: int) -> bool:
+    """Whether the mention falls inside a backtick-delimited command/code span.
+
+    A signal word inside a suggested probe (``kubectl ... preempt``) is a thing
+    to look for, not a claim that it happened.
+    """
+    return fragment.count("`", 0, start) % 2 == 1
+
+
 def _synthesis_fragment_asserts_signal(fragment: str, start: int, end: int) -> bool:
     """Whether one signal mention is asserted rather than negated or conditional.
 
     Polarity must be evaluated around the specific signal. A whole-fragment
     check reverses Korean statements such as ``MemoryPressure가 아닌 ...`` and
     can also let a different positive signal hide behind an unrelated negation.
+    An enumeration item, or a token inside a probe command, names a thing to
+    inspect rather than a condition claimed to have occurred.
     """
     lowered = fragment.casefold()
     if _keyword_negated(lowered, start, end):
+        return False
+    if _synthesis_mention_in_enumeration(fragment, start, end):
+        return False
+    if _synthesis_mention_in_code_span(fragment, start):
         return False
 
     prefix = fragment[:start]
