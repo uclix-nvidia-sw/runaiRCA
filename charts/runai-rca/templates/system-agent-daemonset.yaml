@@ -32,9 +32,10 @@ metadata:
     app.kubernetes.io/component: system-agent
 data:
   # Tiny read-only log endpoint. stdlib only, no deps.
-  # GET /logs?source=dmesg|journal|syslog&lines=N&grep=REGEX&since=RFC3339&until=RFC3339
-  # -> {"lines": [...]}. since/until are applied only to journalctl; dmesg and
-  # syslog are current-state tails and must not be presented as past-time evidence.
+  # GET /logs?source=dmesg|journal|syslog|fabricmanager|nvidia-smi|nvlink&lines=N&grep=REGEX&since=RFC3339&until=RFC3339
+  # -> {"lines": [...]}. since/until are applied only to journalctl sources; dmesg,
+  # syslog, nvidia-smi, and nvlink are current-state snapshots and must not be
+  # presented as past-time evidence.
   # ponytail: stdlib http.server is enough for a per-node read endpoint; no framework.
   server.py: |
     import os, re, subprocess
@@ -54,8 +55,12 @@ data:
         # journal line.  The RCA collector uses it to distinguish an event in
         # the alert interval from one in the post-resolution recovery tail.
         "journal": NSENTER + ["journalctl", "-k", "--no-pager", "--output=short-iso"],
+        "fabricmanager": NSENTER + ["journalctl", "-u", "nvidia-fabricmanager", "--no-pager", "--output=short-iso"],
         # syslog/kern.log are bind-mounted read-only at /host/var/log.
         "syslog": None,
+        # NVIDIA status commands are current-state snapshots, not past-time evidence.
+        "nvidia-smi": NSENTER + ["nvidia-smi", "-q"],
+        "nvlink": NSENTER + ["nvidia-smi", "nvlink", "--status", "--errorcounters"],
     }
 
     def read_syslog(lines):
@@ -66,6 +71,13 @@ data:
                     out = fh.read().splitlines()
                 break
         return out[-lines:]
+
+    def read_fabricmanager(lines):
+        path = "/host/var/log/fabricmanager.log"
+        if not os.path.exists(path):
+            return []
+        with open(path, errors="replace") as fh:
+            return fh.read().splitlines()[-lines:]
 
     def rfc3339(value):
         if not value or len(value) > 40:
@@ -80,7 +92,7 @@ data:
         if source == "syslog":
             return read_syslog(lines)
         cmd = list(SOURCES[source])
-        if source == "journal":
+        if source in ("journal", "fabricmanager"):
             if since:
                 cmd += ["--since", since]
             if until:
@@ -90,6 +102,8 @@ data:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         except Exception as exc:
             return ["system-agent error: %s" % exc]
+        if source == "fabricmanager" and not res.stdout.strip():
+            return read_fabricmanager(lines)
         return res.stdout.splitlines()[-lines:]
 
     class Handler(BaseHTTPRequestHandler):

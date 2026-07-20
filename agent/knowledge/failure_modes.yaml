@@ -288,8 +288,62 @@
       keywords: ["fabric manager", nvswitch, "nv-fabricmanager", fabricmanager, "system not yet initialized"]
       actions:
         - "NVSwitch systems need a healthy Fabric Manager for GPU-to-GPU traffic. Check `systemctl status nvidia-fabricmanager` and its log on the node."
-        - "GPU Operator validator pods crashing with 'error code system not yet initialized' mean exactly this on DGX/HGX: the fabric is not configured yet. Verify with `nvidia-smi -q` (Fabric State) and read /var/log/fabricmanager.log; ensure nvidia-fabricmanager is installed on NVSwitch systems."
+        - "GPU Operator validator pods crashing with 'error code system not yet initialized' mean exactly this on DGX/HGX: the fabric is not configured yet. Verify with `nvidia-smi -q` (Fabric State) and read /var/log/fabricmanager.log; ensure nvidia-fabricmanager is installed on NVSwitch systems. The RCA system agent can pull `fabricmanager` (nvidia-fabricmanager journal), `nvidia-smi`, and `nvlink` sources for this node."
         - "Restart order matters: stop CUDA apps -> restart Fabric Manager -> (if needed) `nvidia-smi -r` -> restart apps."
+        - "For deep NVSwitch/NVLink hardware faults that node logs do not resolve, use the vendor BMC-level `nvdebug -i <BMC_IP> -u <user> -p <pass> -t <platform> -v` tool plus `ipmitool ... chassis status` to collect full platform diagnostics for escalation; this is not a node-agent command."
+    - name: NVSwitch SXid Access And Trunk Link Failure
+      name_ko: NVSwitch SXid 액세스 및 트렁크 링크 장애
+      keywords: [sxid, "nvswitch sxid", "access link", "trunk link", nvswitch]
+      actions:
+        - "A non-fatal SXid is informational: the system stays operational and jobs may see brief stalls or performance degradation, so no action is required."
+        - "A fatal SXid on an ACCESS link (GPU-to-NVSwitch) affects one GPU's peer-to-peer path. Fabric Manager logs the GPU index and PCI bus: reset that GPU with `nvidia-smi -r -i <gpu>`; if it persists, reboot or power-cycle the node."
+        - "A fatal SXid on a TRUNK link (NVSwitch-to-NVSwitch, between baseboards) affects all GPUs system-wide. Stop all CUDA apps and GPU services (keep nvidia-persistenced), stop Fabric Manager, reset all GPUs/NVSwitches with `nvidia-smi -r` (without `-i`), then restart Fabric Manager; reboot if unresolved."
+        - "The RCA system agent can pull `fabricmanager` (nvidia-fabricmanager journal), `nvidia-smi`, and `nvlink` sources for this node."
+      actions_ko:
+        - "치명적이지 않은 SXid는 정보성 이벤트입니다. 시스템은 계속 동작하며 작업에 짧은 멈춤이나 성능 저하가 있을 수 있으나 조치는 필요하지 않습니다."
+        - "ACCESS 링크(GPU-대-NVSwitch)의 치명적 SXid는 한 GPU의 peer-to-peer 경로에 영향을 줍니다. Fabric Manager 로그의 GPU 인덱스와 PCI 버스를 확인하고 `nvidia-smi -r -i <gpu>`로 해당 GPU를 재설정합니다. 지속되면 노드를 재부팅하거나 전원 재인가합니다."
+        - "TRUNK 링크(NVSwitch-대-NVSwitch, 베이스보드 간)의 치명적 SXid는 시스템 전체 GPU에 영향을 줍니다. 모든 CUDA 앱과 GPU 서비스를 중지하되 nvidia-persistenced는 유지하고, Fabric Manager를 중지한 뒤 `nvidia-smi -r`( `-i` 없음)로 모든 GPU/NVSwitch를 재설정하고 Fabric Manager를 다시 시작합니다. 해결되지 않으면 재부팅합니다."
+        - "RCA 시스템 에이전트는 이 노드에서 `fabricmanager`(nvidia-fabricmanager journal), `nvidia-smi`, `nvlink` 소스를 수집할 수 있습니다."
+    - name: Fabric Manager Initialization Failure Or Degraded
+      name_ko: Fabric Manager 초기화 실패 또는 성능 저하
+      keywords: ["fabric manager", initialization, "fm_stay_resident", "not yet initialized", degraded]
+      actions:
+        - "Fabric Manager terminates on configuration or hardware initialization failure by default. `FM_STAY_RESIDENT_ON_FAILURES=1` keeps it resident, but the system remains UNINITIALIZED and CUDA fails."
+        - "Check `journalctl -u nvidia-fabricmanager` or `/var/log/fabricmanager.log`, verify driver compatibility (minimum R450 on older systems and R570+ for B200/B300), then run `systemctl restart nvidia-fabricmanager`."
+        - "The RCA system agent can pull `fabricmanager` (nvidia-fabricmanager journal), `nvidia-smi`, and `nvlink` sources for this node."
+      actions_ko:
+        - "Fabric Manager는 기본적으로 구성 또는 하드웨어 초기화에 실패하면 종료합니다. `FM_STAY_RESIDENT_ON_FAILURES=1`은 프로세스를 상주시켜도 시스템은 UNINITIALIZED 상태로 남아 CUDA가 실패합니다."
+        - "`journalctl -u nvidia-fabricmanager` 또는 `/var/log/fabricmanager.log`를 확인하고 드라이버 호환성(구형 시스템 최소 R450, B200/B300은 R570 이상)을 검증한 뒤 `systemctl restart nvidia-fabricmanager`를 실행합니다."
+        - "RCA 시스템 에이전트는 이 노드에서 `fabricmanager`(nvidia-fabricmanager journal), `nvidia-smi`, `nvlink` 소스를 수집할 수 있습니다."
+    - name: GPU Fabric Registration Incomplete
+      name_ko: GPU 패브릭 등록 미완료
+      keywords: [cudaerrorsystemnotready, "system not yet initialized", "fabric state", registration]
+      actions:
+        - "On H100/NVSwitch systems, a CUDA launch before Fabric Manager finishes registration fails with cudaErrorSystemNotReady."
+        - "Run `nvidia-smi -q -i <gpu> | grep -A2 Fabric` and wait for `State: Completed` and `Status: Success`; `In Progress` means registration is still running. Restart Fabric Manager if it is hung."
+        - "The RCA system agent can pull `fabricmanager` (nvidia-fabricmanager journal), `nvidia-smi`, and `nvlink` sources for this node."
+      actions_ko:
+        - "H100/NVSwitch 시스템에서는 Fabric Manager가 등록을 끝내기 전에 CUDA를 실행하면 cudaErrorSystemNotReady로 실패합니다."
+        - "`nvidia-smi -q -i <gpu> | grep -A2 Fabric`를 실행해 `State: Completed`와 `Status: Success`가 될 때까지 기다립니다. `In Progress`는 아직 등록 중이라는 뜻이며 멈췄다면 Fabric Manager를 재시작합니다."
+        - "RCA 시스템 에이전트는 이 노드에서 `fabricmanager`(nvidia-fabricmanager journal), `nvidia-smi`, `nvlink` 소스를 수집할 수 있습니다."
+    - name: NVLink High Availability Failure Modes
+      name_ko: NVLink 고가용성 장애 모드
+      keywords: [access_link_failure_mode, trunk_link_failure_mode, nvswitch_failure_mode, "high availability", "failure mode"]
+      actions:
+        - "Fabric Manager HA configuration in `/usr/share/nvidia/nvswitch/fabricmanager.cfg` (`ACCESS_LINK_FAILURE_MODE`, `TRUNK_LINK_FAILURE_MODE`, and `NVSWITCH_FAILURE_MODE`) decides whether a degraded link or switch excludes affected GPUs, aborts jobs, or runs degraded."
+        - "Check the configured failure mode to explain why GPUs were excluded or jobs were aborted. The RCA system agent can pull `fabricmanager` (nvidia-fabricmanager journal), `nvidia-smi`, and `nvlink` sources for this node."
+      actions_ko:
+        - "`/usr/share/nvidia/nvswitch/fabricmanager.cfg`의 Fabric Manager HA 설정(`ACCESS_LINK_FAILURE_MODE`, `TRUNK_LINK_FAILURE_MODE`, `NVSWITCH_FAILURE_MODE`)은 성능 저하 링크/스위치에서 영향 GPU를 제외할지, 작업을 중단할지, 저하 상태로 실행할지를 결정합니다."
+        - "GPU가 제외되었거나 작업이 중단된 이유를 설명하려면 설정된 장애 모드를 확인합니다. RCA 시스템 에이전트는 이 노드에서 `fabricmanager`(nvidia-fabricmanager journal), `nvidia-smi`, `nvlink` 소스를 수집할 수 있습니다."
+    - name: MIG Mode Disables NVLink
+      name_ko: MIG 모드가 NVLink를 비활성화함
+      keywords: [mig, "mig mode", nvlink, "peer-to-peer"]
+      actions:
+        - "Enabling MIG on a GPU disables its NVLinks and drops peer-to-peer connectivity. If multi-GPU NVLink workloads fail, check `nvidia-smi` for MIG mode."
+        - "Disable MIG so Fabric Manager can retrain the NVLinks; Fabric Manager must be running. The RCA system agent can pull `fabricmanager` (nvidia-fabricmanager journal), `nvidia-smi`, and `nvlink` sources for this node."
+      actions_ko:
+        - "GPU에서 MIG를 활성화하면 해당 GPU의 NVLink가 비활성화되고 peer-to-peer 연결이 사라집니다. 다중 GPU NVLink 작업이 실패하면 `nvidia-smi`로 MIG 모드를 확인합니다."
+        - "Fabric Manager가 실행 중인 상태에서 MIG를 비활성화하여 NVLink를 다시 훈련시킵니다. RCA 시스템 에이전트는 이 노드에서 `fabricmanager`(nvidia-fabricmanager journal), `nvidia-smi`, `nvlink` 소스를 수집할 수 있습니다."
     # --- added from the NVIDIA Network Operator troubleshooting guide ---
     # docs.nvidia.com/dgx-superpod/dgx-explained/network-operator/latest/common-issues-troubleshooting.html
     - name: NicClusterPolicy Not Ready / RDMA Stack Missing

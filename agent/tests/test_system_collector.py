@@ -103,6 +103,9 @@ async def test_detects_kernel_errors(monkeypatch: pytest.MonkeyPatch) -> None:
         ],
         "journal": ["systemd: started thing"],
         "syslog": ["kernel: EXT4-fs error (device sda1): bad block"],
+        "fabricmanager": ["Fabric Manager healthy"],
+        "nvidia-smi": ["GPU 0: healthy"],
+        "nvlink": ["GPU 0: NVLink status active"],
     }
 
     async def fake_get_json(*, base_url, path, timeout_seconds, params, **kwargs):
@@ -123,6 +126,9 @@ async def test_detects_kernel_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     assert detail_sources["dmesg"]["error_count"] == 1
     assert detail_sources["journal"]["error_count"] == 0
     assert detail_sources["syslog"]["error_count"] == 1
+    assert detail_sources["fabricmanager"]["error_count"] == 0
+    assert detail_sources["nvidia-smi"]["error_count"] == 0
+    assert detail_sources["nvlink"]["error_count"] == 0
     observation = result.artifacts[0].result["observation"]
     assert (observation["polarity"], observation["coverage"]) == ("present", "partial")
 
@@ -172,8 +178,17 @@ async def test_historical_incident_scopes_journal_and_ignores_current_tails(
         "until": "2026-01-02T03:15:00Z",
     }
     assert all(
-        "since" not in params for params in calls if params["source"] in {"dmesg", "syslog"}
+        "since" not in params
+        for params in calls
+        if params["source"] in {"dmesg", "syslog", "nvidia-smi", "nvlink"}
     )
+    fabricmanager_params = next(params for params in calls if params["source"] == "fabricmanager")
+    assert fabricmanager_params == {
+        "source": "fabricmanager",
+        "lines": "500",
+        "since": "2026-01-02T02:55:00Z",
+        "until": "2026-01-02T03:15:00Z",
+    }
     assert result.status == "partial"
     assert result.confidence == "low"
     assert "journal" in result.summary
@@ -234,7 +249,7 @@ async def test_system_log_query_is_scoped_bounded_and_body_free(
 
 
 @pytest.mark.asyncio
-async def test_system_log_query_scopes_historical_journal_only(
+async def test_system_log_query_scopes_historical_journalctl_sources_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict] = []
@@ -266,6 +281,9 @@ async def test_system_log_query_scopes_historical_journal_only(
     dmesg = await system_log_query(
         _Settings(), target, {"source": "dmesg", "lookback_seconds": 60, "lines": 2}
     )
+    fabricmanager = await system_log_query(
+        _Settings(), target, {"source": "fabricmanager", "lookback_seconds": 60, "lines": 2}
+    )
 
     assert calls[0]["params"] == {
         "source": "journal",
@@ -274,6 +292,12 @@ async def test_system_log_query_scopes_historical_journal_only(
         "until": "2026-07-13T21:50:47Z",
     }
     assert calls[1]["params"] == {"source": "dmesg", "lines": "2"}
+    assert calls[2]["params"] == {
+        "source": "fabricmanager",
+        "lines": "2",
+        "since": "2026-07-13T21:38:47Z",
+        "until": "2026-07-13T21:50:47Z",
+    }
     assert journal["observation"]["historical_scope"] is True
     assert journal["observation"]["observation_window"] == {
         "start": "2026-07-13T21:38:47Z",
@@ -287,6 +311,30 @@ async def test_system_log_query_scopes_historical_journal_only(
     }
     assert dmesg["observation"]["historical_scope"] is False
     assert dmesg["coverage"] == "partial"
+    assert fabricmanager["observation"]["historical_scope"] is True
+    assert fabricmanager["coverage"] == "scoped"
+
+
+@pytest.mark.asyncio
+async def test_system_log_query_accepts_new_sources_and_rejects_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    async def fake_get_json(**kwargs):
+        calls.append(kwargs["params"]["source"])
+        return JsonResponse(url="http://node/logs", status_code=200, data={"lines": []})
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+    for source in ("fabricmanager", "nvidia-smi", "nvlink"):
+        query = await system_log_query(_Settings(), _target(), {"source": source})
+        assert query["error"] is None
+    unknown = await system_log_query(_Settings(), _target(), {"source": "not-a-source"})
+
+    assert calls == ["fabricmanager", "nvidia-smi", "nvlink"]
+    assert unknown["error"] == (
+        "source must be one of: dmesg, journal, syslog, fabricmanager, nvidia-smi, nvlink"
+    )
 
 
 @pytest.mark.asyncio
@@ -380,7 +428,7 @@ async def test_historical_malformed_journal_is_context_only(
     observation = result.artifacts[0].result["observation"]
     assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
     assert result.status == "partial"
-    assert any("historical journal window" in warning for warning in result.warnings)
+    assert any("historical journalctl window" in warning for warning in result.warnings)
 
 
 @pytest.mark.asyncio
