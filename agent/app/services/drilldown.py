@@ -50,7 +50,6 @@ from app.collectors.base import (
 from app.collectors.change import change_query
 from app.collectors.http_json import get_json
 from app.collectors.kubernetes import (
-    _EXEC_ALLOWLIST,
     _READ_KINDS,
     k8s_describe,
     k8s_exec,
@@ -1343,12 +1342,15 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
         },
     }
     if settings.enable_pod_exec:
-        _allow = "; ".join(" ".join(cmd) for cmd in _EXEC_ALLOWLIST)
         registry["kubernetes"]["k8s_exec"] = {
             "description": (
-                "Run ONE read-only inspection command inside a container (no shell, no "
-                "writes). args: pod, namespace, command (argv list, EXACTLY one of the "
-                f"allowlisted commands), container?. Allowed: {_allow}"
+                "Run ONE read-only diagnostic command inside a container via the alert "
+                "pod's exec — a single argv, NO shell (so no pipe `|`, redirect `>`, or "
+                "`&&`). Inspect live state as the situation needs: nvidia-smi, ping, "
+                "cat /proc/meminfo, ps, ss, ip addr, dig, curl, df -h, free -h, … args: "
+                "pod, namespace, command (argv list), container?. Destructive/mutating "
+                "commands (rm, kill, mv, dd, chmod, mount, systemctl, …) and shells/"
+                "interpreters are refused."
             ),
             "call": _tool_k8s_exec,
         }

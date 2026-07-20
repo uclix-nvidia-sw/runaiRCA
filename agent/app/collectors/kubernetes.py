@@ -41,71 +41,77 @@ from app.mcp_client import (
     mcp_tool_text,
 )
 
-# READ-ONLY diagnostic commands allowed inside a container via pods/exec.
-# Strictly non-mutating: viewing GPU/driver/env state only. Anything not here is refused.
-# ponytail: allowlist of exact argv prefixes, extend here if new read-only probes are needed.
-# Exact read-only commands only (not an argv[0] allowlist) — every argument is
-# pinned, so there's no room to pass a path/flag that reads secrets or writes.
-# Deliberately NO `env`/`printenv` (leak secrets) and NO `ps aux` (cmdlines leak
-# tokens). To broaden, add an exact tuple here — keep it inspection-only.
-_EXEC_ALLOWLIST: tuple[tuple[str, ...], ...] = (
-    ("nvidia-smi",),
-    ("nvidia-smi", "-q"),
-    ("nvidia-smi", "-L"),
-    ("nvidia-smi", "--query-gpu=name,memory.total,memory.used,utilization.gpu", "--format=csv"),
-    ("nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv"),
-    ("cat", "/proc/driver/nvidia/version"),
-    ("cat", "/proc/meminfo"),
-    ("cat", "/proc/loadavg"),
-    ("cat", "/proc/uptime"),
-    ("cat", "/sys/fs/cgroup/memory.max"),
-    ("cat", "/sys/fs/cgroup/memory.current"),
-    ("cat", "/etc/resolv.conf"),
-    ("free", "-m"),
-    ("free", "-h"),
-    ("df", "-h"),
-    ("mount",),
-    ("uname", "-a"),
-    ("nproc",),
-    ("uptime",),
-)
-# Never allow these regardless of the allowlist (defence in depth against a bad edit above).
-_EXEC_FORBIDDEN_TOKENS: frozenset[str] = frozenset(
+# pods/exec policy: DENYLIST. The drill-down runs read-only diagnostics of its
+# own choosing — nvidia-smi, ping, cat /proc/*, ps, ss, ip addr, dig, curl, df,
+# free, … — and only destructive or state-mutating commands are refused. One
+# command per exec: no shell, so there is no pipe/redirect/`&&`/wrapper to smuggle
+# a denied command through. To tighten or loosen, edit the sets below.
+#
+# Destructive: deletes, overwrites, wipes, kills, or mutates host/kernel/network
+# state. Matched on the command's basename (so `/bin/rm` is caught too).
+_EXEC_DENY_COMMANDS: frozenset[str] = frozenset(
     {
-        ";",
-        "&&",
-        "||",
-        "|",
-        ">",
-        ">>",
-        "<",
-        "`",
-        "$(",
-        "rm",
-        "kill",
-        "mv",
-        "cp",
-        "dd",
-        "chmod",
-        "chown",
-        "reboot",
-        "shutdown",
-        "mkfs",
-        "delete",
-        "sh",
-        "bash",
-        "-c",
+        # file / disk destruction (delete, overwrite, wipe)
+        "rm", "rmdir", "unlink", "shred", "truncate", "fallocate", "mv", "cp",
+        "dd", "mkfs", "wipefs", "fdisk", "parted", "mkswap", "tee",
+        # process / host lifecycle
+        "kill", "pkill", "killall", "skill", "fuser",
+        "reboot", "shutdown", "halt", "poweroff", "init", "telinit", "systemctl", "service",
+        # permission / mount / kernel / network / module mutation
+        "chmod", "chown", "chattr", "setfacl", "mount", "umount", "sysctl",
+        "iptables", "ip6tables", "nft", "modprobe", "insmod", "rmmod",
+        # cluster / container control (can delete pods, kill containers, mutate state)
+        "kubectl", "oc", "helm", "crictl", "docker", "podman", "ctr", "nerdctl",
     }
+)
+# Shells, interpreters, and command-wrappers all run *another* command inline —
+# an open door around the denylist above — so the runner itself is refused.
+_EXEC_DENY_RUNNERS: frozenset[str] = frozenset(
+    {
+        "sh", "bash", "zsh", "ash", "dash", "ksh", "csh", "tcsh", "fish",
+        "python", "python2", "python3", "perl", "ruby", "node", "nodejs",
+        "php", "lua", "tclsh", "expect", "awk", "gawk",
+        "env", "xargs", "timeout", "nice", "ionice", "nohup", "setsid", "watch",
+        "nsenter", "chroot", "unshare", "script", "stdbuf", "taskset", "flock",
+        "sudo", "su", "runuser",
+        # multiplexers (busybox rm / busybox sh) and editors/pagers with a shell escape
+        "busybox", "toybox", "vi", "vim", "view", "ex", "nano", "ed", "emacs",
+        "less", "more", "man",
+    }
+)
+# find -delete/-exec erase or run other commands; redirection & chaining are shell
+# smuggling — refused as standalone argv tokens.
+_EXEC_DENY_TOKENS: frozenset[str] = frozenset(
+    {"-delete", "-exec", "-execdir", "-fdelete", ";", "&&", "||", "|", "&", ">", ">>", "`", "$("}
 )
 
 
 def exec_command_allowed(argv: list[str]) -> bool:
-    """True only for exact read-only allowlisted commands. Refuse everything else."""
+    """Denylist gate for pods/exec: allow any read-only diagnostic command;
+    refuse deletion, kill, host/kernel/network mutation, and any shell/interpreter/
+    wrapper that could run a denied command past this check."""
     if not argv:
         return False
-    if any(tok in _EXEC_FORBIDDEN_TOKENS for tok in argv):
+    command = argv[0].rsplit("/", 1)[-1]
+    if command in _EXEC_DENY_COMMANDS or command in _EXEC_DENY_RUNNERS:
         return False
-    return tuple(argv) in _EXEC_ALLOWLIST
+    return not any(tok in _EXEC_DENY_TOKENS for tok in argv)
+
+
+# An exec probe that could not START (binary absent from the image, or the exec
+# subresource itself failed) is not a diagnostic finding — keep "command not
+# found" out of the evidence signal instead of minting it as a medium result.
+_EXEC_UNUSABLE_MARKERS: tuple[str, ...] = (
+    "executable file not found",
+    "oci runtime exec failed",
+    "container not found",
+    "cannot exec",
+)
+
+
+def _exec_probe_unusable(error: str) -> bool:
+    low = error.lower()
+    return any(marker in low for marker in _EXEC_UNUSABLE_MARKERS)
 
 
 # "kubectl for the agent": read-only ad-hoc queries the investigation loop can run.
@@ -766,22 +772,24 @@ async def _describe_events(
 async def k8s_exec(
     settings: Settings, namespace: str, pod: str, command: list[str], container: str = ""
 ) -> dict:
-    """Actually run ONE read-only allowlisted command in a container.
+    """Actually run ONE read-only diagnostic command in a container.
 
     Uses the agent's OWN ServiceAccount over the Kubernetes exec subresource
     (WebSocket, v4.channel.k8s.io) — deliberately NOT the MCP, which the chart pins
-    to a hard read-only boundary (no pods/exec). Gate = the same enable_pod_exec +
-    exec_command_allowed the base sweep uses (exact allowlist + forbidden-token
-    defense, so env/shells/writes are refused). Never raises; returns an observation.
-    This is the path the base _collect_exec_probes deliberately leaves unattempted."""
+    to a hard read-only boundary (no pods/exec). Gate = enable_pod_exec +
+    exec_command_allowed (a denylist: any command runs except destructive/mutating
+    ones and shells/interpreters — see _EXEC_DENY_*). Never raises; returns an
+    observation. This is the path the base _collect_exec_probes uses too."""
     if not settings.enable_pod_exec:
         return {"error": "pod exec is disabled (set ENABLE_POD_EXEC=true + grant pods/exec RBAC)"}
     if not (namespace and pod and command):
         return {"error": "namespace, pod and command (argv list) are required"}
     if not exec_command_allowed(command):
         return {
-            "error": f"command not on the read-only allowlist: {command}",
-            "allowed": [list(cmd) for cmd in _EXEC_ALLOWLIST],
+            "error": (
+                "command refused: destructive/mutating commands (rm, kill, mv, dd, chmod, "
+                f"mount, systemctl, …) and shells/interpreters are not permitted: {command}"
+            ),
         }
     token = _read_file(settings.kubernetes_token_path)
     if not token:
@@ -1897,9 +1905,19 @@ class KubernetesCollector:
                 )
             )
         if exec_probes:
-            exec_errors = [str(probe.get("error")) for probe in exec_probes if probe.get("error")]
             exec_successes = [probe for probe in exec_probes if not probe.get("error")]
-            exec_unavailable = not exec_successes
+            # A probe that couldn't START (binary absent, exec subresource down) is
+            # not a finding — exclude it so "command not found" never becomes a
+            # medium card (owner rule: a probe that can't run is not evidence).
+            real_errors = [
+                str(probe.get("error"))
+                for probe in exec_probes
+                if probe.get("error")
+                and not probe.get("transport_error")
+                and not _exec_probe_unusable(str(probe.get("error")))
+            ]
+            # Nothing usable ran: no successful probe and no real error to report.
+            exec_unavailable = not exec_successes and not real_errors
             exec_observation: dict[str, object] = {
                 "kind": "kubernetes_live_exec",
                 "predicate": "kubernetes_live_exec",
@@ -1912,15 +1930,31 @@ class KubernetesCollector:
             exec_entity = _exec_probes_observed_entity(exec_probes)
             if exec_entity:
                 exec_observation["observed_entity"] = exec_entity
+            if exec_unavailable:
+                # Probes couldn't run (e.g. the binaries aren't in a minimal image);
+                # mark no-evidence so the trail hides it instead of showing errors.
+                exec_summary = f"{NO_EVIDENCE} " + ko_en(
+                    self._settings,
+                    "컨테이너에서 진단 명령을 실행할 수 없었습니다 (해당 바이너리 없음 또는 exec 불가).",
+                    "Diagnostic commands could not run in the container (binaries absent or exec unavailable).",
+                )
+            elif real_errors:
+                exec_summary = "; ".join(real_errors)
+            else:
+                exec_summary = ko_en(
+                    self._settings,
+                    f"읽기 전용 진단 명령 {len(exec_successes)}개를 실행했습니다.",
+                    f"Executed {len(exec_successes)} read-only diagnostic command(s).",
+                )
             artifacts.append(
                 artifact(
                     agent=self.name,
                     source="kubernetes",
                     type="pod_exec",
                     status=(
-                        "unavailable" if exec_unavailable else "partial" if exec_errors else "ok"
+                        "unavailable" if exec_unavailable else "partial" if real_errors else "ok"
                     ),
-                    confidence=("low" if exec_unavailable else "medium" if exec_errors else "high"),
+                    confidence=("low" if exec_unavailable else "medium" if real_errors else "high"),
                     title=ko_en(
                         self._settings, "컨테이너 읽기 전용 exec", "Read-only container exec"
                     ),
@@ -1928,15 +1962,7 @@ class KubernetesCollector:
                         f"kubectl exec {target.pod} -n {target.namespace} -- {probe['command']}"
                         for probe in exec_probes
                     ),
-                    summary=(
-                        "; ".join(exec_errors)
-                        if exec_errors
-                        else ko_en(
-                            self._settings,
-                            f"읽기 전용 진단 명령 {len(exec_probes)}개를 실행했습니다.",
-                            f"Executed {len(exec_probes)} read-only diagnostic command(s).",
-                        )
-                    ),
+                    summary=exec_summary,
                     result={
                         "probes": exec_probes,
                         "observation": exec_observation,
