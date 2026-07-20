@@ -106,7 +106,7 @@ Each collector owns one domain and returns a `CollectorResult` (summary +
 | Collector | Owns |
 |---|---|
 | **runai** | Run:ai API workload/project/queue/quota/version context (optionally via the [runai-mcp service](#run-ai-mcp-service), 426 APIs) |
-| **kubernetes** | Workload pods/events, Run:ai control-plane pod health, node conditions, scheduling blockers; optional read-only pod-exec (allowlisted: `nvidia-smi`, …) |
+| **kubernetes** | Workload pods/events, Run:ai control-plane pod health, node conditions, scheduling blockers; optional denylist-gated read-only pod-exec |
 | **prometheus** | Queue/project GPU metrics, pending/restart/resource signals |
 | **loki** | Workload logs + `runai`/`runai-backend` control-plane logs |
 | **postgres** | RCA-store health: pgvector, embeddings, feedback, persistence |
@@ -130,6 +130,9 @@ collector still fails gracefully to `unavailable`. Sensitive values are masked
   pages while surfacing per-kind failures. Historical logs keep their oldest
   lines only when the direct request actually honored `sinceTime`; MCP tails
   keep their newest lines.
+  Cordoned (`SchedulingDisabled`) nodes are collected as scoped cordon artifacts
+  and can be promoted to a root cause of unschedulable Pods only when a live
+  unschedulable symptom is present; after it resolves, they remain low confidence.
 - Loki verifies scope against full returned lines and samples multiple streams
   round-robin from their newest entries. Prometheus scales range-query step to
   the requested window (up to about 1,000 points), escapes label values, and
@@ -295,11 +298,16 @@ Every artifact is built for an operator to read at a glance:
   string leaves only, never JSON keys). The frontend marks these in red so the
   finding reads before the boilerplate.
 
+Cards that would only show the agent's own noise — a failed probe or a malformed
+drill-down query — are hidden from the evidence trail.
+
 ## Safety envelope
 
 - **Read-only by construction**: collectors and drill-down tools only read;
-  Kubernetes reads are a kind allowlist; pod-exec is an exact-argv allowlist;
-  Run:ai is GET-only under `/api/`; SQL is `SELECT` in a READ ONLY transaction.
+  Kubernetes reads are a kind allowlist; pod-exec is denylist-gated, blocking
+  mutating commands, shells/interpreters, and shell metacharacters, with one argv
+  and no shell; Run:ai is GET-only under `/api/`; SQL is `SELECT` in a READ ONLY
+  transaction.
 - **Prompt-injection guard** (`agent/app/llm.py`): collected text (logs, events,
   alert annotations) is cluster-writable, so a guard is appended to **every** LLM
   system prompt declaring embedded instructions as data. `operator_prompt` is the

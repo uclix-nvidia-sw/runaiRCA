@@ -47,6 +47,16 @@ target incident or alert, Backend selects the latest non-resolved alert if one
 exists. The Analysis Dashboard is backed by `/api/v1/analysis-runs`; if that
 list is empty, no analysis trigger has reached the Backend yet.
 
+When an already analyzed alert auto-refires within
+`AUTO_REANALYZE_COOLDOWN_MINUTES` (default `360`), Backend returns its existing
+run unchanged. After the cooldown, it re-analyzes that run in place, so each
+incident keeps a single RCA run that evolves over time. The last-good RCA
+content and any not-yet-delivered Slack notifications are kept while the
+re-analysis runs and if it fails; only a new success replaces the report.
+Setting `0` or less disables auto re-analysis, so the existing run is always
+reused. Re-activated incidents move to the top of the incident list by recent
+activity.
+
 ## Runtime Status Semantics
 
 Kubernetes `Running` and Agent `/healthz` confirm that processes are alive, but
@@ -101,14 +111,16 @@ range from 60 to 86,400 seconds. Successful change results are cached for about
 - Analysis Agent produces the KubeRCA-style dashboard RCA: root cause,
   confidence, impact, missing data, recommended manual actions, prevention, and
   evidence coverage.
-- Chat Agent answers operator follow-up questions from the active RCA, alert
-  analysis, evidence trail, feedback, and similar incident memory. In the
-  current implementation, `/chat` is deterministic and context-grounded; it does
-  not directly call the NeMo/LLM runtime. `ENABLE_NAT_RUNTIME=true` affects
-  `/analyze` synthesis. If chat is opened from a dashboard page without attached
-  incident or alert RCA content, Backend attaches dashboard and analysis-run
-  state so Chat can report current alert counts, latest run state, agent
-  timeout/failure warnings, database state, and runtime mode.
+- Chat Agent runs an agentic loop over read-only cross-domain drill-down tools
+  and can trigger an on-demand RCA. It is grounded in the same TypeDB knowledge
+  graph as the pipeline, including prior cases, per-family knowledge, and blast
+  radius. Drill-down defaults to the loaded incident/alert target; a frontend
+  context picker provides an explicit cluster scope. The deterministic,
+  context-grounded answer is the fallback only when no chat LLM is configured.
+  If chat is opened from a dashboard page without attached incident or alert RCA
+  content, Backend attaches dashboard and analysis-run state so Chat can report
+  current alert counts, latest run state, agent timeout/failure warnings,
+  database state, and runtime mode.
 
 ## RCA Boundaries
 

@@ -48,7 +48,7 @@ flowchart LR
 | `KUBERNETES_LIST_LIMIT` | 증거 수집을 위한 Kubernetes 파드/이벤트 목록 페이지 크기. 기본값 `50` |
 | `KUBERNETES_NAMESPACES` | 워크로드로 해석된 Pod 읽기와 그 describe/log 후속 점검을 포함한 Kubernetes 직접 수집용 선택 사항인 쉼표 구분 네임스페이스 허용 목록 |
 | `KUBERNETES_CLUSTER_SCOPE_ENABLED` | 노드 조회와 같은 클러스터 범위 Kubernetes 호출을 활성화합니다. Helm은 `agent.rbac.clusterWide`를 따릅니다 |
-| `KUBERNETES_MCP_URL` | Kubernetes MCP shared service URL. 설정하면 Kubernetes get/list/log 수집과 드릴다운이 MCP를 먼저 호출하고, 실패 시 기존 Kubernetes API 직접 읽기로 폴백합니다. 별도 게이트된 allowlist `pods/exec` 진단은 MCP 서비스에 exec 권한을 주지 않기 위해 agent ServiceAccount로 실행합니다. |
+| `KUBERNETES_MCP_URL` | Kubernetes MCP shared service URL. 설정하면 Kubernetes get/list/log 수집과 드릴다운이 MCP를 먼저 호출하고, 실패 시 기존 Kubernetes API 직접 읽기로 폴백합니다. 별도로 게이트된 `pods/exec` 진단은 거부 목록(denylist) 기반이며, MCP 서비스에 exec 권한을 주지 않기 위해 Kubernetes WebSocket exec subresource를 통해 agent ServiceAccount로 실행합니다. |
 | `RUNAI_BASE_URL` | Run:ai 컨트롤 플레인 URL. 차트 기본값은 없으며, `runaiMcp.enabled=true`일 때 `agent.env.runaiBaseUrl`로 반드시 지정해야 합니다 |
 | `RUNAI_BEARER_TOKEN` | 선택 사항인 Run:ai bearer 토큰 시크릿 |
 | `GRAFANA_SERVICE_ACCOUNT_TOKEN` | managed `grafanaMcp` 서비스가 Prometheus/Loki datasource read/query에 사용하는 Grafana service account token |
@@ -73,7 +73,7 @@ flowchart LR
 | `SYSTEM_AGENT_URL` | 노드별 System 에이전트 DaemonSet 엔드포인트(`GET /logs?source=dmesg\|journal\|syslog`). 과거 incident 수집에서는 정확한 RFC3339 시간창을 `journal`에 전달하며, dmesg/syslog는 현재 상태 tail로만 취급합니다. |
 | `SYSTEM_AGENT_TOKEN` | System 에이전트 엔드포인트용 선택 사항인 bearer 토큰 |
 | `SYSTEM_AGENT_TIMEOUT_SECONDS` | System 에이전트 요청 타임아웃. 기본값 `120` |
-| `ENABLE_POD_EXEC` | Kubernetes 수집기가 읽기 전용 pod-exec를 수행하도록 허용합니다(허용 목록 명령: `nvidia-smi`, …). 기본값 `true` |
+| `ENABLE_POD_EXEC` | Kubernetes 수집기의 거부 목록(denylist) 기반 읽기 전용 pod-exec를 허용합니다. 상태를 바꾸는 명령, shell/인터프리터, shell 메타문자를 차단하고 shell 없이 단일 argv만 실행합니다. 기본값 `true` |
 | `POD_EXEC_TIMEOUT_SECONDS` | pod-exec 타임아웃. 기본값 `120` |
 | `DATABASE_URL` | 인시던트, 알림, 임베딩, 피드백, 코멘트, 분석 실행을 저장하는 백엔드 Postgres 저장소 DSN |
 | `DATABASE_CONNECT_TIMEOUT_SECONDS` | 백엔드 Postgres 시작 연결 타임아웃. 기본값 `5` |
@@ -111,6 +111,7 @@ flowchart LR
 | `MAX_AUTO_ANALYZE_FANOUT` | 백엔드: 웹훅당 시작되는 최대 분석 수. 기본값 `50` |
 | `MAX_CONCURRENT_AGENT_RUNS` | 백엔드: 에이전트에 대해 동시에 실행되는 최대 분석 수. 기본값 `50` |
 | `FLAPPING_GROUP_WINDOW_MINUTES` | 백엔드: 반복되는 알림이 또 다른 발생이 아니라 NEW 인시던트가 되기 전의 정적 구간. 코드 기본값 `120`(Helm은 `360`으로 설정) |
+| `AUTO_REANALYZE_COOLDOWN_MINUTES` | 백엔드: 자동 재발 알림이 기존 실행을 제자리에서 재분석하기 전의 쿨다운. 기본값 `360`; `0` 이하는 자동 재분석을 비활성화합니다. env 전용(Helm 값으로 노출되지 않음)이므로 env override로 설정합니다. |
 | `ANALYSIS_BACKFILL_INTERVAL_SECONDS` | 백엔드: RCA를 완료하지 못한 채 남은 알림을 다시 처리하는 주기. 기본값 `300`(`0`은 비활성화) |
 | `ANALYSIS_BACKFILL_BATCH` | 백엔드: 백필 틱당 다시 처리하는 알림 수. 기본값 `10` |
 | `ANALYSIS_BACKFILL_RETRY_COOLDOWN_SECONDS` | 백엔드: 실패한 알림을 재시도하기 전의 쿨다운. 기본값 `900` |

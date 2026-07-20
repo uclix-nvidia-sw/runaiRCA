@@ -145,12 +145,13 @@ GPU는 별도 엔티티가 아니라 `node`/`queue`/`project`의 속성(`gpu_all
 다섯 개의 로더가 공급합니다 — [How data gets in](#3-how-data-gets-in)과
 [Knowledge Base](KNOWLEDGE-BASE.md) 문서를 참조하십시오.
 
-### 근본 원인 분류 체계 (15개 패밀리, `sub root_cause`)
+### 근본 원인 분류 체계 (16개 패밀리, `sub root_cause`)
 `node_kubelet_pressure`, `runai_scheduling_quota`, `k8s_scheduling_error`,
 `runai_control_plane_error`, `k8s_control_plane_error`, `workload_startup_error`,
 `image_pull_error`, `gpu_hardware_error`, `network_fabric_error`,
 `cluster_network_error`, `k8s_storage_error`, `storage_backend_error`,
-`workload_runtime_error`, `observability_accuracy`, `platform_auth_error`
+`workload_runtime_error`, `observability_accuracy`, `platform_auth_error`,
+`platform_lifecycle_change`
 (+ `insufficient_evidence`). 로더의 `FAMILIES` 집합 및
 `agent/app/services/root_cause_ranking.py`와 동기화 상태를 유지해야 하며, 가드레일
 테스트가 이를 강제합니다.

@@ -123,7 +123,7 @@ It owns:
 - KubeRCA-style `/api/v1/embeddings/search` similar-incident API
 - SSE event fanout
 - Slack notification on analysis completion — incident summary + Recommended Action + Open-Incident link, threaded per incident (see [Slack Notifications](#slack-notifications))
-- Chat proxy
+- Chat proxy for the knowledge-graph-grounded copilot
 - Unified API response shape for the frontend
 
 ### Frontend
@@ -135,7 +135,7 @@ The key interaction is the Unified RCA Workspace:
 
 - Summary and recommended action at the top
 - Similar incidents, operator votes/comments, impact, missing data, and prevention in the middle
-- Agent Evidence Trail at the bottom of the same page
+- A single evidence-trail panel with collector tabs at the bottom of the same page
 
 ## Feedback And Memory Loop
 
@@ -166,7 +166,7 @@ separate agent. Full detail: [Knowledge Base](KNOWLEDGE-BASE.md).
   workload, project, queue, namespace, alert, incident, symptom, root cause,
   `control_plane_component`, `xid_error`, ...) and relations (`runs_on`,
   `submitted_to`, `grouped_into`, `indicates`, `depends_on`, `leads_to`, ...),
-  with 15 root-cause families modeled as `sub` types.
+  with 16 root-cause families modeled as `sub` types.
 - **Ingestion** (`agent/ontology/ingest.py`, CronJob): a deterministic projection
   of Dashboard-approved, resolved `incidents`/`alerts` into the graph after a grace
   window (`requireApproval=true` by default). It can promote operator-confirmed RCAs

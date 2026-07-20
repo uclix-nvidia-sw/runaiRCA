@@ -35,8 +35,8 @@ detail pages must contain:
 - RCA summary: concise final answer.
 - RCA body: root cause, impact, evidence, action items, missing data,
   prevention.
-- Agent Evidence Trail: Run:ai, Kubernetes, Postgres, Prometheus, Loki sections
-  in the same page.
+- RCA report: a structured, scannable report view.
+- Agent Evidence Trail: collector tabs in a single panel on the same page.
 - Raw artifact viewer: collapsed by default.
 - Chat panel: context-aware and tied to the current route.
 
