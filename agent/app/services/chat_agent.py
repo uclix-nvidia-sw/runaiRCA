@@ -45,6 +45,21 @@ def _flat_tools(settings: Settings) -> dict[str, dict]:
     return flat
 
 
+def _chat_target(request: ChatRequest) -> AnalysisTarget:
+    """Default drill-down scope = the loaded incident/alert's target (forwarded by
+    the backend as context['target']). So a `query` the LLM fires without repeating
+    pod/namespace/node still lands on the incident's own resources instead of an
+    empty target. Empty (cluster-wide) when no alert target is in scope."""
+    ctx = request.context or {}
+    tgt = ctx.get("target") if isinstance(ctx.get("target"), dict) else {}
+    labels = tgt.get("labels") if isinstance(tgt.get("labels"), dict) else {}
+    annotations = tgt.get("annotations") if isinstance(tgt.get("annotations"), dict) else {}
+    return resolve_target(
+        {str(k): str(v) for k, v in labels.items() if v is not None},
+        {str(k): str(v) for k, v in (annotations or {}).items() if v is not None},
+    )
+
+
 async def answer_chat(
     settings: Settings,
     request: ChatRequest,
@@ -70,7 +85,10 @@ async def answer_chat(
             # throttling, saturation, memory pressure) can only get conditional
             # guidance. Warn once so a missing Prometheus config is visible.
             _log.warning("chat: promql_query tool not registered — Prometheus not configured for the agent?")
-        target = resolve_target({}, {})  # tools read their params from args, not target
+        # Default drill-down scope = the loaded incident's target, so the copilot's
+        # own queries reach the incident's pod/namespace/node without the LLM having
+        # to restate them (they were empty before, so scoped queries silently missed).
+        target = _chat_target(request)
         cluster_scope = _is_cluster_scope(request)
         history: list[dict] = []
         for step in range(_MAX_STEPS):
@@ -79,7 +97,7 @@ async def answer_chat(
                 safe_history = []
             decision = await complete_json(
                 settings,
-                system=_system_prompt(tools, settings, cluster_scope=cluster_scope),
+                system=_system_prompt(tools, settings, cluster_scope=cluster_scope, target=target),
                 user=_user_prompt(grounding, question, safe_history),
                 model=settings.llm_model_chat,
             )
@@ -256,7 +274,13 @@ def _is_cluster_scope(request: ChatRequest) -> bool:
     )
 
 
-def _system_prompt(tools: dict[str, dict], settings: Settings, *, cluster_scope: bool = False) -> str:
+def _system_prompt(
+    tools: dict[str, dict],
+    settings: Settings,
+    *,
+    cluster_scope: bool = False,
+    target: AnalysisTarget | None = None,
+) -> str:
     tool_lines = "\n".join(f"- {name}: {spec['description']}" for name, spec in tools.items())
     language_rule = (
         "answer 필드는 반드시 한국어로 작성하세요."
@@ -271,9 +295,28 @@ def _system_prompt(tools: dict[str, dict], settings: Settings, *, cluster_scope:
         if cluster_scope
         else ""
     )
+    target_rule = ""
+    if target is not None and not cluster_scope:
+        scope_bits = [
+            f"{key}={value}"
+            for key, value in (
+                ("namespace", target.namespace),
+                ("pod", target.pod),
+                ("node", target.node),
+                ("workload", target.workload_name),
+            )
+            if value
+        ]
+        if scope_bits:
+            target_rule = (
+                "The loaded incident's target is " + ", ".join(scope_bits) + ". Read-only "
+                "queries and analyze default to this scope when you omit those args — pass "
+                "them only to investigate something else.\n"
+            )
     return (
         f"{language_rule}\n"
         f"{scope_rule}"
+        f"{target_rule}"
         "You are the RCA copilot for an NVIDIA Run:AI GPU platform. The operator can ask "
         "about ANYTHING on the cluster, not just a loaded incident. Each turn, choose ONE:\n"
         "- answer: you can already answer from the grounded context or prior tool results.\n"
