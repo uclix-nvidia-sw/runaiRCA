@@ -168,6 +168,46 @@ async def test_query_history_is_masked_at_capture(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_query_defaults_to_incident_target(monkeypatch) -> None:
+    seen_targets: list = []
+    systems: list[str] = []
+
+    async def fake_tool(settings, target, args):
+        seen_targets.append(target)
+        return {"query": "kubectl get pods", "summary": "ok", "result": {}}
+
+    async def fake_complete_json(settings, *, system, user, model=None, **kw):
+        systems.append(system)
+        return {"action": "query", "queries": [{"tool": "k8s_read", "args": {"kind": "pods"}}]}
+
+    async def fake_complete_with_error(settings, *, system, user, model=None, **kw):
+        return "done", None
+
+    monkeypatch.setattr(
+        chat_agent, "_flat_tools", lambda settings: {"k8s_read": {"description": "d", "call": fake_tool}}
+    )
+    monkeypatch.setattr(chat_agent, "complete_json", fake_complete_json)
+    monkeypatch.setattr(chat_agent, "complete_with_error", fake_complete_with_error)
+
+    await chat_agent.answer_chat(
+        _settings(),
+        ChatRequest(
+            message="원인이 뭐야",
+            incident_id="INC-1",
+            context={"target": {"labels": {"namespace": "runai", "pod": "trainer-0"}}},
+        ),
+        "ctx",
+        analyze_fn=lambda _request: None,  # type: ignore[arg-type]
+    )
+
+    # A query that omits pod/namespace now defaults to the incident's target,
+    # and the LLM is told that default scope.
+    assert seen_targets and seen_targets[0].namespace == "runai"
+    assert seen_targets[0].pod == "trainer-0"
+    assert any("namespace=runai" in s and "pod=trainer-0" in s for s in systems)
+
+
+@pytest.mark.asyncio
 async def test_final_llm_answer_is_masked_before_return(monkeypatch) -> None:
     async def fake_complete_json(settings, *, system, user, model=None, **kw):
         return {"action": "wait"}

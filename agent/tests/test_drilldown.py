@@ -328,6 +328,38 @@ async def test_raw_tool_response_observation_cannot_claim_scoped_support() -> No
 
 
 @pytest.mark.asyncio
+async def test_malformed_query_hidden_but_real_error_stays_visible() -> None:
+    from app.collectors.base import NO_EVIDENCE
+
+    async def bad_query_tool(settings, target, args):
+        # The agent wrote a query the backend rejected — not a finding.
+        return {
+            "error": "loki API returned status code 400: parse error: unexpected IDENTIFIER",
+            "status_code": 400,
+        }
+
+    async def forbidden_tool(settings, target, args):
+        # A real failure (auth) must stay visible.
+        return {"error": "HTTP 403 forbidden", "status_code": 403}
+
+    bad = _k8s_result()
+    await drilldown._run_query(
+        drill_settings(), bad, {"bad_query_tool": {"call": bad_query_tool}},
+        _target(), None, {"tool": "bad_query_tool", "args": {}}, [],
+        drilldown._drilldown_masker(drill_settings()),
+    )
+    assert bad.artifacts[0].summary.startswith(NO_EVIDENCE)
+
+    real = _k8s_result()
+    await drilldown._run_query(
+        drill_settings(), real, {"forbidden_tool": {"call": forbidden_tool}},
+        _target(), None, {"tool": "forbidden_tool", "args": {}}, [],
+        drilldown._drilldown_masker(drill_settings()),
+    )
+    assert not real.artifacts[0].summary.startswith(NO_EVIDENCE)
+
+
+@pytest.mark.asyncio
 async def test_change_timeline_keeps_only_adapter_verified_scoped_observation(monkeypatch) -> None:
     observation = {
         "kind": "change_query",

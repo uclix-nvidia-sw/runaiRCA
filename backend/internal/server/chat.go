@@ -247,6 +247,14 @@ func (s *Server) enrichChatRequest(req ChatRequest) ChatRequest {
 	if contextAlert != nil {
 		req.Context["similar_incidents"] = compactSimilarIncidentContext(s.store.SimilarIncidentsForAlert(*contextAlert, contextIncidentID, similarIncidentLimit))
 		req.Context["feedback_hints"] = s.store.FeedbackHintsForAlert(*contextAlert, contextIncidentID, similarIncidentLimit)
+		// Forward the representative alert's labels so the agent can resolve the
+		// same AnalysisTarget the incident pipeline uses and query the knowledge
+		// graph (alert_name / node / workload) — at incident scope these labels
+		// are otherwise not sent.
+		req.Context["target"] = map[string]any{
+			"labels":      contextAlert.Labels,
+			"annotations": contextAlert.Annotations,
+		}
 	}
 
 	// Explicit conversation scope for the agent: with no incident/alert selected

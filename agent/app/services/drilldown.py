@@ -38,11 +38,13 @@ from hashlib import sha256
 from typing import Any
 
 from app.collectors.base import (
+    NO_EVIDENCE,
     AnalysisTarget,
     CollectorResult,
     artifact,
     causal_evidence_time_range,
     incident_time_range,
+    ko_en,
     kubernetes_salient_markers,
     salient_markers,
     signals_line,
@@ -50,7 +52,6 @@ from app.collectors.base import (
 from app.collectors.change import change_query
 from app.collectors.http_json import get_json
 from app.collectors.kubernetes import (
-    _EXEC_ALLOWLIST,
     _READ_KINDS,
     k8s_describe,
     k8s_exec,
@@ -559,6 +560,16 @@ async def _run_query(
     summary = str(outcome.get("summary") or error or name)
     if markers:
         summary = f"{summary} — {signals_line(markers, getattr(settings, 'language', 'en'))}"
+    # A query the agent wrote itself that came back malformed (400 / parse /
+    # syntax) is not a finding — mark it no-evidence so the trail hides it,
+    # exactly like a failed exec probe. Real failures (auth, 404, timeout,
+    # backend 5xx) keep their error summary and stay visible.
+    if error and _query_failure_category(outcome, str(error)) == "invalid_request":
+        summary = f"{NO_EVIDENCE} " + ko_en(
+            settings,
+            "질의 구문이 잘못되어 실행되지 않았습니다.",
+            "The query was malformed and did not run.",
+        )
     result.artifacts.append(
         artifact(
             agent=result.agent,
@@ -1343,12 +1354,15 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
         },
     }
     if settings.enable_pod_exec:
-        _allow = "; ".join(" ".join(cmd) for cmd in _EXEC_ALLOWLIST)
         registry["kubernetes"]["k8s_exec"] = {
             "description": (
-                "Run ONE read-only inspection command inside a container (no shell, no "
-                "writes). args: pod, namespace, command (argv list, EXACTLY one of the "
-                f"allowlisted commands), container?. Allowed: {_allow}"
+                "Run ONE read-only diagnostic command inside a container via the alert "
+                "pod's exec — a single argv, NO shell (so no pipe `|`, redirect `>`, or "
+                "`&&`). Inspect live state as the situation needs: nvidia-smi, ping, "
+                "cat /proc/meminfo, ps, ss, ip addr, dig, curl, df -h, free -h, … args: "
+                "pod, namespace, command (argv list), container?. Destructive/mutating "
+                "commands (rm, kill, mv, dd, chmod, mount, systemctl, …) and shells/"
+                "interpreters are refused."
             ),
             "call": _tool_k8s_exec,
         }

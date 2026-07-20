@@ -662,6 +662,13 @@
       actions:
         - "Confirm the queue/project GPU quota against the requested GPU count."
         - "Check higher-priority workloads consuming the allocation (preemption)."
+    - name: Node Cordon Excludes It From Scheduling
+      name_ko: 노드 Cordon으로 인한 스케줄링 제외
+      keywords: [cordon, schedulingdisabled, "were unschedulable", "node.kubernetes.io/unschedulable"]
+      actions:
+        - "A cordoned node (spec.unschedulable=true / SchedulingDisabled) is excluded from scheduling, so Pending pods reporting 'N node(s) were unschedulable' may be blocked by an intentional or forgotten cordon. Check `kubectl get nodes` for SchedulingDisabled; run `kubectl uncordon <node>` if it is unintended leftover from maintenance/drain. If maintenance is intentionally in progress, the Pending state is expected."
+      actions_ko:
+        - "Cordon된 노드(spec.unschedulable=true / SchedulingDisabled)는 스케줄링에서 제외되므로, 'N node(s) were unschedulable'을 보고하는 Pending Pod는 의도했거나 잊힌 cordon 때문에 막혔을 수 있습니다. `kubectl get nodes`에서 SchedulingDisabled를 확인하고, 유지보수/drain 후 남은 의도치 않은 cordon이면 `kubectl uncordon <node>`를 실행하세요. 유지보수가 의도적으로 진행 중이면 Pending 상태는 예상된 동작입니다."
     # ALWAYS disambiguate which scheduler before diagnosing a scheduling failure:
     # Run:ai has its OWN scheduler; the Kubernetes default-scheduler is a different
     # component that does not understand GPU quota / pod-groups.

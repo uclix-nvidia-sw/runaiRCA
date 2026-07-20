@@ -82,7 +82,9 @@ type Store struct {
 	pgvectorReady        bool
 	pgvectorDetail       string
 	embedder             *embedder
-	flappingWindow       time.Duration
+
+	flappingWindow        time.Duration
+	autoReanalyzeCooldown time.Duration
 }
 
 type AlertUpsertResult struct {
@@ -136,6 +138,8 @@ func NewStore() *Store {
 		// was too tight — real alerts recur over hours, so each firing spawned its
 		// own row. Default 2h; tune per environment.
 		flappingWindow: time.Duration(getenvInt("FLAPPING_GROUP_WINDOW_MINUTES", 120)) * time.Minute,
+		// Automatic re-analysis cooldown; <= 0 preserves once-ever behavior.
+		autoReanalyzeCooldown: time.Duration(getenvInt("AUTO_REANALYZE_COOLDOWN_MINUTES", 360)) * time.Minute,
 	}
 }
 
@@ -597,6 +601,13 @@ func (s *Store) ListIncidentsPage(limit, offset int, views ...string) ([]Inciden
 	return s.ListIncidentsPageFiltered(limit, offset, view, IncidentListFilter{})
 }
 
+func incidentActivityAt(inc *Incident) time.Time {
+	if inc.LatestActivityAt.After(inc.FiredAt) {
+		return inc.LatestActivityAt
+	}
+	return inc.FiredAt
+}
+
 func (s *Store) ListIncidentsPageFiltered(limit, offset int, view string, filter IncidentListFilter) ([]Incident, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -620,7 +631,7 @@ func (s *Store) ListIncidentsPageFiltered(limit, offset int, view string, filter
 		}
 		ordered = append(ordered, incident)
 	}
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].FiredAt.After(ordered[j].FiredAt) })
+	sort.Slice(ordered, func(i, j int) bool { return incidentActivityAt(ordered[i]).After(incidentActivityAt(ordered[j])) })
 	start, end := pageRange(len(ordered), limit, offset)
 	items := make([]Incident, 0, end-start)
 	for _, incident := range ordered[start:end] {
@@ -1636,51 +1647,63 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 	if existing := s.analyzingAnalysisRunLocked(targetType, targetID, alertID); existing != nil {
 		return cloneAnalysisRun(existing), false
 	}
+	reuseInPlace := source != "auto"
 	if source == "auto" {
 		if existing := s.latestAutoAnalysisRunLocked(alertID); existing != nil {
-			return cloneAnalysisRun(existing), false
-		}
-	} else if existing := s.latestReusableAnalysisRunLocked(targetType, targetID); existing != nil {
-		before := cloneAnalysisRun(existing)
-		// Re-analysis updates the existing run in place instead of appending a
-		// new row, so an incident keeps a single evolving RCA run.
-		// Clear previous result fields so stale content is not surfaced while
-		// the new analysis is in progress.
-		existing.Status = "analyzing"
-		existing.Source = source
-		existing.Title = run.Title
-		existing.Prompt = run.Prompt
-		// Keep the last-good RCA content on the run while the re-analysis is in
-		// progress (so the incident keeps showing it) and preserved if this attempt
-		// fails; only a new SUCCESS (CompleteAnalysisRun) replaces it. This makes the
-		// run the durable RCA store, so the alert analysis columns are redundant.
-		// Reset per-attempt analysis metadata, but keep the durable Slack outbox:
-		// a fast follow-up must not erase a still-pending delivery from the prior
-		// attempt just because this row is intentionally reused.
-		outbox := slackOutboxEntries(existing.Metadata)
-		lastGoodMetadata := lastGoodMetadataSnapshot(existing.Metadata)
-		existing.Metadata = nil
-		if len(outbox) > 0 {
-			existing.Metadata = metadataWithSlackOutbox(nil, outbox)
-		}
-		if existing.FirstCompletedAt != nil && len(lastGoodMetadata) > 0 {
-			if existing.Metadata == nil {
-				existing.Metadata = map[string]any{}
+			if s.autoReanalyzeCooldown <= 0 || now.Sub(existing.UpdatedAt) < s.autoReanalyzeCooldown {
+				return cloneAnalysisRun(existing), false
 			}
-			existing.Metadata[previousSuccessMetadataKey] = lastGoodMetadata
+			reuseInPlace = true
 		}
-		// This IS a new analysis occupying the old row, so it must also become the
-		// NEWEST run: isLatestAnalysisRunForAlert compares CreatedAt, and with the
-		// old timestamp any run created later (e.g. a comment reanalysis) stayed
-		// permanently newer — every re-analysis of this alert then completed only
-		// to be rejected as stale ("alert RCA persistence failed"), forever.
-		existing.CreatedAt = now
-		existing.UpdatedAt = now
-		if !s.persistAnalysisRunLocked(existing) {
-			*existing = before
-			return AnalysisRun{}, false
+	}
+	if reuseInPlace {
+		if existing := s.latestReusableAnalysisRunLocked(targetType, targetID); existing != nil {
+			before := cloneAnalysisRun(existing)
+			// Re-analysis updates the existing run in place instead of appending a
+			// new row, so an incident keeps a single evolving RCA run.
+			// Clear previous result fields so stale content is not surfaced while
+			// the new analysis is in progress.
+			existing.Status = "analyzing"
+			existing.Source = source
+			existing.Title = run.Title
+			existing.Prompt = run.Prompt
+			// Keep the last-good RCA content on the run while the re-analysis is in
+			// progress (so the incident keeps showing it) and preserved if this attempt
+			// fails; only a new SUCCESS (CompleteAnalysisRun) replaces it. This makes the
+			// run the durable RCA store, so the alert analysis columns are redundant.
+			// Reset per-attempt analysis metadata, but keep the durable Slack outbox:
+			// a fast follow-up must not erase a still-pending delivery from the prior
+			// attempt just because this row is intentionally reused.
+			outbox := slackOutboxEntries(existing.Metadata)
+			lastGoodMetadata := lastGoodMetadataSnapshot(existing.Metadata)
+			existing.Metadata = nil
+			if len(outbox) > 0 {
+				existing.Metadata = metadataWithSlackOutbox(nil, outbox)
+			}
+			if existing.FirstCompletedAt != nil && len(lastGoodMetadata) > 0 {
+				if existing.Metadata == nil {
+					existing.Metadata = map[string]any{}
+				}
+				existing.Metadata[previousSuccessMetadataKey] = lastGoodMetadata
+			}
+			// This IS a new analysis occupying the old row, so it must also become the
+			// NEWEST run: isLatestAnalysisRunForAlert compares CreatedAt, and with the
+			// old timestamp any run created later (e.g. a comment reanalysis) stayed
+			// permanently newer — every re-analysis of this alert then completed only
+			// to be rejected as stale ("alert RCA persistence failed"), forever.
+			existing.CreatedAt = now
+			existing.UpdatedAt = now
+			if !s.persistAnalysisRunLocked(existing) {
+				*existing = before
+				return AnalysisRun{}, false
+			}
+			if incidentID != "" {
+				if incident := s.incidents[incidentID]; incident != nil && now.After(incident.LatestActivityAt) {
+					incident.LatestActivityAt = now
+				}
+			}
+			return cloneAnalysisRun(existing), true
 		}
-		return cloneAnalysisRun(existing), true
 	}
 	s.analysisRuns[run.RunID] = run
 	if !s.persistAnalysisRunLocked(run) {

@@ -26,21 +26,47 @@ def _target() -> AnalysisTarget:
 
 
 def test_readonly_command_allowed() -> None:
+    # Denylist policy: any read-only diagnostic the drill-down picks is allowed.
     assert exec_command_allowed(["nvidia-smi"]) is True
     assert exec_command_allowed(["cat", "/proc/driver/nvidia/version"]) is True
-    assert exec_command_allowed(["env"]) is False  # environment variables often carry secrets
+    assert exec_command_allowed(["ping", "-c", "3", "10.0.0.1"]) is True
+    assert exec_command_allowed(["ps", "-ef"]) is True
+    assert exec_command_allowed(["ss", "-tnp"]) is True
+    assert exec_command_allowed(["/usr/bin/df", "-h"]) is True  # basename is matched
 
 
 def test_mutating_command_rejected() -> None:
-    # Not on the allowlist at all.
+    # Destructive / data-loss commands.
     assert exec_command_allowed(["rm", "-rf", "/data"]) is False
+    assert exec_command_allowed(["kill", "-9", "1"]) is False
+    assert exec_command_allowed(["mv", "/a", "/b"]) is False
+    assert exec_command_allowed(["dd", "if=/dev/zero", "of=/data"]) is False
+    assert exec_command_allowed(["chmod", "777", "/etc"]) is False
+    assert exec_command_allowed(["/bin/rm", "x"]) is False  # basename is matched
+    # Cluster/container control can delete pods or kill containers.
     assert exec_command_allowed(["kubectl", "delete", "pod", "trainer-0"]) is False
     # Empty argv.
     assert exec_command_allowed([]) is False
-    # Shell-injection / chaining tokens are refused even if a prefix looks benign.
+    # Shells / interpreters / wrappers smuggle arbitrary code past the denylist.
+    assert exec_command_allowed(["sh", "-c", "nvidia-smi"]) is False
+    assert exec_command_allowed(["python3", "-c", "import os"]) is False
+    assert exec_command_allowed(["env", "rm", "-rf", "/"]) is False
+    # Chaining / redirection / destructive flags refused as standalone tokens.
     assert exec_command_allowed(["nvidia-smi", ";", "rm", "-rf", "/"]) is False
     assert exec_command_allowed(["cat", "/etc/passwd", "&&", "reboot"]) is False
-    assert exec_command_allowed(["sh", "-c", "nvidia-smi"]) is False
+    assert exec_command_allowed(["cat", "/proc/meminfo", ">", "/tmp/x"]) is False
+    assert exec_command_allowed(["find", "/", "-delete"]) is False
+
+
+def test_exec_probe_unusable_flags_binary_absent_not_findings() -> None:
+    from app.collectors.kubernetes import _exec_probe_unusable
+
+    # "command not found" means the probe couldn't run — never a diagnostic finding.
+    assert _exec_probe_unusable('exec: "free": executable file not found in $PATH') is True
+    assert _exec_probe_unusable("OCI runtime exec failed: exec failed: ...") is True
+    # A real error (permission denied, an actual signal) IS a finding.
+    assert _exec_probe_unusable("permission denied") is False
+    assert _exec_probe_unusable("cgroup memory limit exceeded") is False
 
 
 @pytest.mark.asyncio
@@ -66,7 +92,7 @@ async def test_exec_probes_skipped_when_pod_exec_disabled() -> None:
 
 
 @pytest.mark.asyncio
-async def test_k8s_exec_gate_and_allowlist() -> None:
+async def test_k8s_exec_gate_and_denylist() -> None:
     from app.collectors.kubernetes import k8s_exec
 
     # Disabled -> refuses regardless of command.
@@ -74,12 +100,12 @@ async def test_k8s_exec_gate_and_allowlist() -> None:
     r = await k8s_exec(off, "runai", "trainer-0", ["nvidia-smi"])
     assert "disabled" in (r.get("error") or "")
 
-    # Enabled but a non-allowlisted command is refused before any transport call.
+    # Enabled but a destructive command is refused before any transport call.
     on = replace(load_settings(), enable_pod_exec=True, kubernetes_mcp_url="http://mcp")
-    r = await k8s_exec(on, "runai", "trainer-0", ["env"])  # env leaks secrets -> not allowlisted
-    assert "allowlist" in (r.get("error") or "")
-    r = await k8s_exec(on, "runai", "trainer-0", ["cat", "/etc/shadow"])
-    assert "allowlist" in (r.get("error") or "")
+    r = await k8s_exec(on, "runai", "trainer-0", ["rm", "-rf", "/data"])
+    assert "refused" in (r.get("error") or "")
+    r = await k8s_exec(on, "runai", "trainer-0", ["sh", "-c", "rm -rf /"])
+    assert "refused" in (r.get("error") or "")
 
 
 @pytest.mark.asyncio

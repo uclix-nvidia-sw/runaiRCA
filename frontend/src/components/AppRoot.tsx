@@ -52,7 +52,6 @@ import { exportIncidentDocx } from '../exportDocx';
 import { useDashboardData } from '../hooks/useDashboardData';
 import { useEditorHistory } from '../hooks/useEditorHistory';
 import {
-  AGENT_ORDER,
   ANALYSIS_AGENT_ID,
   COMPONENT_AGENT_ORDER,
   DEFAULT_ALERT_FILTERS,
@@ -74,6 +73,8 @@ import { buildAnalysisRecords } from '../utils/analytics';
 import { collectorEvidencePresentation, shouldPresentRunArtifacts } from '../utils/analysisPresentation';
 import { artifactForPresentation } from '../utils/artifactPresentation';
 import { alertFiltersForAPI, incidentFiltersForAPI, incidentViewForMainView, matchesAlertFilters, matchesIncidentFilters } from '../utils/filters';
+import { agentTabs, isNoEvidenceArtifact } from '../utils/agentTrail';
+import { formatEvidenceQueries, splitRcaReport } from '../utils/rcaSections';
 import {
   FinalDecision,
   Severity,
@@ -1082,7 +1083,43 @@ function UnifiedWorkspace({
             // Wrapped so the report fades in when it replaces the "Analyzing…"
             // placeholder (or arrives on open) instead of teleporting in.
             <div className="rca-report-body">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{analysis}</ReactMarkdown>
+              {(() => {
+                const formatted = formatEvidenceQueries(analysis);
+                const { preamble, sections } = splitRcaReport(formatted);
+                if (sections.length === 0) {
+                  // ponytail: heading-less report (old runs) renders as before.
+                  return <ReactMarkdown remarkPlugins={[remarkGfm]}>{formatted}</ReactMarkdown>;
+                }
+                return (
+                  <>
+                    {preamble.trim() && (
+                      <div className="rca-preamble">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{preamble}</ReactMarkdown>
+                      </div>
+                    )}
+                    {sections.map((section, i) =>
+                      // Core sections (Problem/Root Cause/Actions) read at a glance —
+                      // plain heading + content, no box, no toggle. The rest collapse.
+                      section.pinned ? (
+                        <section key={i} className="rca-pinned">
+                          <h2 className="rca-pinned-heading">{section.heading}</h2>
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{section.body}</ReactMarkdown>
+                        </section>
+                      ) : (
+                        <details key={i} className="rca-section" open={section.defaultOpen}>
+                          <summary>
+                            <span>{section.heading}</span>
+                            <ChevronDown size={16} className="rca-section-chevron" aria-hidden />
+                          </summary>
+                          <div className="rca-section-body">
+                            <ReactMarkdown remarkPlugins={[remarkGfm]}>{section.body}</ReactMarkdown>
+                          </div>
+                        </details>
+                      ),
+                    )}
+                  </>
+                );
+              })()}
             </div>
           ) : (
             <p className="empty">No RCA report yet.</p>
@@ -1096,17 +1133,13 @@ function UnifiedWorkspace({
           ) : (
             <>
               {evidencePresentation.notice && <p className="empty">{evidencePresentation.notice}</p>}
-              <div className="agent-grid">
-                {AGENT_ORDER.map((agent) => (
-                  <AgentEvidence
-                    key={agent}
-                    agent={agent}
-                    status={capabilities[agent] || 'pending'}
-                    artifacts={artifacts.filter((artifact) => artifact.agent === agent)}
-                    reasons={agentReasons(agent, missingData, warnings)}
-                  />
-                ))}
-              </div>
+              <AgentTrail
+                key={id}
+                artifacts={artifacts}
+                capabilities={capabilities}
+                missingData={missingData}
+                warnings={warnings}
+              />
             </>
           )}
         </section>
@@ -1455,60 +1488,81 @@ function agentReasons(agent: string, missingData: string[], warnings: string[]):
   return Array.from(new Set([...fromMissing, ...fromWarnings]));
 }
 
-// Owner rule: a no-evidence check (e.g. a PASSING DB healthcheck) is not worth
-// a card — show only artifacts that actually helped, with the rest behind a
-// count the operator can expand.
-const NO_EVIDENCE_PREFIX = '증거를 찾기 어렵습니다.';
-
-function isNoEvidenceArtifact(artifact: Artifact) {
-  return String(artifact.summary || '').trim().startsWith(NO_EVIDENCE_PREFIX);
+// Evidence trail: a collector tab strip (icon + label + helpful count + capability
+// dot) over ONE full-width panel showing just the selected collector's artifacts.
+// One card open at a time keeps the section scannable even at 100+ artifacts.
+function AgentTrail({
+  artifacts,
+  capabilities,
+  missingData,
+  warnings,
+}: {
+  artifacts: Artifact[];
+  capabilities: Record<string, string>;
+  missingData: string[];
+  warnings: string[];
+}) {
+  const { tabs, defaultAgent } = agentTabs(artifacts, capabilities);
+  // Lazy selection: until the user picks, follow the data-driven default so
+  // artifacts arriving mid-analysis land on a useful tab.
+  const [picked, setPicked] = useState<string | null>(null);
+  const selected = picked !== null && tabs.some((tab) => tab.agent === picked) ? picked : defaultAgent;
+  return (
+    <>
+      <div className="agent-tabs">
+        {tabs.map((tab) => (
+          <button
+            key={tab.agent}
+            className={`agent-tab ${tab.agent === selected ? 'active' : ''}`}
+            onClick={() => setPicked(tab.agent)}
+            type="button"
+          >
+            {agentIcon(tab.agent)}
+            <strong>{agentLabel(tab.agent)}</strong>
+            {tab.helpful > 0 && <span className="agent-tab-count">{tab.helpful}</span>}
+            <span className={`agent-tab-dot capability-${tab.capability}`} aria-hidden />
+          </button>
+        ))}
+      </div>
+      <AgentEvidence
+        key={selected}
+        artifacts={artifacts.filter((artifact) => artifact.agent === selected)}
+        reasons={agentReasons(selected, missingData, warnings)}
+      />
+    </>
+  );
 }
 
-function AgentEvidence({
-  agent,
-  status,
-  artifacts,
-  reasons = [],
-}: {
-  agent: string;
-  status: string;
-  artifacts: Artifact[];
-  reasons?: string[];
-}) {
-  const [open, setOpen] = useState(false);
+function AgentEvidence({ artifacts, reasons = [] }: { artifacts: Artifact[]; reasons?: string[] }) {
   const [showAll, setShowAll] = useState(false);
-  const icon = agentIcon(agent);
+  const [expanded, setExpanded] = useState(false);
   const emptyText = reasons.length > 0 ? reasons.join(' ') : 'No evidence yet.';
   const helpful = artifacts.filter((artifact) => !isNoEvidenceArtifact(artifact));
   const hidden = artifacts.length - helpful.length;
-  const visible = showAll ? artifacts : helpful;
+  const pool = showAll ? artifacts : helpful;
+  const visible = expanded ? pool : pool.slice(0, 8);
+  const more = pool.length - visible.length;
   return (
     <article className="agent-evidence">
-      <button className="agent-toggle" onClick={() => setOpen((value) => !value)} type="button">
-        <span>{icon}</span>
-        <strong>{agentLabel(agent)}</strong>
-        <Status value={status} />
-        <ChevronDown size={16} />
-      </button>
-      {open && (
-        <div className="agent-content">
-          {visible.length === 0 ? (
-            <p className="empty">{emptyText}</p>
-          ) : (
-            visible.map((artifact, index) => (
-              <ArtifactResult
-                artifact={artifact}
-                key={`${artifact.agent}-${artifact.type}-${index}`}
-              />
-            ))
-          )}
-          {hidden > 0 && (
-            <button className="artifact-toggle compact-artifact-toggle" onClick={() => setShowAll((value) => !value)} type="button">
-              {showAll ? `Hide ${hidden} no-evidence item(s)` : `Show ${hidden} no-evidence item(s)`}
-            </button>
-          )}
-        </div>
-      )}
+      <div className="agent-content">
+        {visible.length === 0 ? (
+          <p className="empty">{emptyText}</p>
+        ) : (
+          visible.map((artifact, index) => (
+            <ArtifactResult artifact={artifact} key={`${artifact.agent}-${artifact.type}-${index}`} />
+          ))
+        )}
+        {more > 0 && (
+          <button className="ghost-button compact-button artifact-more" onClick={() => setExpanded(true)} type="button">
+            <ChevronDown size={14} /> Show {more} more
+          </button>
+        )}
+        {hidden > 0 && (
+          <button className="artifact-toggle compact-artifact-toggle" onClick={() => setShowAll((value) => !value)} type="button">
+            {showAll ? `Hide ${hidden} no-evidence item(s)` : `Show ${hidden} no-evidence item(s)`}
+          </button>
+        )}
+      </div>
     </article>
   );
 }
@@ -1519,11 +1573,14 @@ function ArtifactResult({ artifact }: { artifact: Artifact }) {
   const queryItems = queryDisplayItems(presented.result);
   const resultText = presented.result !== undefined ? formatArtifactValue(compactArtifactValue(presented.result)) : '';
   const evidence = evidenceMetadata(artifact.result);
+  // One-line summary so a collapsed row is scannable without expanding it.
+  const preview = String(artifact.summary || '').split('\n')[0].replace(/[*`_#]/g, '').trim();
   return (
     <div className="artifact">
       <button className="artifact-toggle compact-artifact-toggle" onClick={() => setOpen((value) => !value)} type="button">
         <div className="artifact-head">
           <strong>{artifact.evidence_id ? `[${artifact.evidence_id}] ` : ''}{artifact.title || artifact.type}</strong>
+          {!open && preview && <span className="artifact-preview">{preview}</span>}
           <span>{artifact.confidence}</span>
         </div>
         <ChevronDown size={16} />
