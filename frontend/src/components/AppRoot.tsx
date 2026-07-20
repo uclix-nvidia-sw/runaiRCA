@@ -904,6 +904,13 @@ function UnifiedWorkspace({
   const missingData = incident?.missing_data ?? [];
   const warnings = incident?.warnings ?? [];
   const tokenUsage = incident?.token_usage;
+  const analysisDuration = formatDuration(
+    (analysisRun?.first_completed_at
+      ? Date.parse(analysisRun.first_completed_at)
+      : analysisRun?.status === 'complete' || analysisRun?.status === 'completed'
+        ? Date.parse(analysisRun.updated_at)
+        : Number.NaN) - (analysisRun ? Date.parse(analysisRun.created_at) : Number.NaN),
+  );
   const analysis = incident?.analysis_detail;
   const summary = incident?.analysis_summary;
   const isAnalyzing = Boolean(detail.data.is_analyzing);
@@ -1145,8 +1152,8 @@ function UnifiedWorkspace({
           )}
         </section>
 
-        {(missingData.length > 0 || warnings.length > 0 || tokenUsage) && (
-          <DiagnosticsPanel missingData={missingData} warnings={warnings} tokenUsage={tokenUsage} />
+        {(missingData.length > 0 || warnings.length > 0 || tokenUsage || analysisDuration) && (
+          <DiagnosticsPanel missingData={missingData} warnings={warnings} tokenUsage={tokenUsage} analysisDuration={analysisDuration} />
         )}
 
         <EvaluationPanel
@@ -1211,19 +1218,11 @@ function ProgressTimeline({
   };
 
   const ledger = latestProgressLedger(events);
-  const startedAt = run ? Date.parse(run.created_at) : Number.NaN;
-  const completedAt = run?.first_completed_at
-    ? Date.parse(run.first_completed_at)
-    : run?.status === 'complete' || run?.status === 'completed'
-      ? Date.parse(run.updated_at)
-      : Number.NaN;
-  const duration = formatDuration(completedAt - startedAt);
   return (
     <section className={`progress-timeline ${live ? 'is-live' : ''}`}>
       <button className="progress-timeline-head" onClick={() => setOpen((value) => !value)} type="button">
         <span>
           <ListChecks size={18} /> Thought Process
-          {duration && <span className="thought-duration">· {duration}</span>}
         </span>
         <span className="progress-timeline-meta">
           {live ? 'live' : run?.updated_at ? formatTime(run.updated_at) : 'complete'} · {events.length}
@@ -1439,9 +1438,10 @@ function AffectedPods({ pods }: { pods: string[] }) {
 }
 
 
-function DiagnosticsPanel({ missingData, warnings, tokenUsage }: { missingData: string[]; warnings: string[]; tokenUsage?: Record<string, unknown> }) {
+function DiagnosticsPanel({ missingData, warnings, tokenUsage, analysisDuration }: { missingData: string[]; warnings: string[]; tokenUsage?: Record<string, unknown>; analysisDuration?: string }) {
   return (
     <section className="diagnostics">
+      {analysisDuration && <div className="token-usage">Analysis time: {analysisDuration}</div>}
       {tokenUsage && <div className="token-usage">LLM tokens: {formatTokenUsage(tokenUsage)}</div>}
       {missingData.length > 0 && <DiagnosticGroup title="Missing Data" items={missingData} tone="missing" />}
       {warnings.length > 0 && <DiagnosticGroup title="Warnings" items={warnings} tone="warning" />}

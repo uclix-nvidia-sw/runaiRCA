@@ -55,7 +55,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `KUBERNETES_LIST_LIMIT` | Kubernetes pod/event list page size for evidence collection, default `50` |
 | `KUBERNETES_NAMESPACES` | Optional comma-separated namespace allowlist for Kubernetes direct collection, including workload-resolved Pod reads and their describe/log follow-ups |
 | `KUBERNETES_CLUSTER_SCOPE_ENABLED` | Enables cluster-scoped Kubernetes calls such as node lookups; Helm follows `agent.rbac.clusterWide` |
-| `KUBERNETES_MCP_URL` | Kubernetes MCP shared-service URL. When set, Kubernetes get/list/log collection and drill-down call MCP first and fall back to direct Kubernetes API reads on failure. The separately gated, allowlisted `pods/exec` diagnostics use the agent ServiceAccount because the MCP service intentionally has no exec permission. |
+| `KUBERNETES_MCP_URL` | Kubernetes MCP shared-service URL. When set, Kubernetes get/list/log collection and drill-down call MCP first and fall back to direct Kubernetes API reads on failure. The separately gated `pods/exec` diagnostics are denylist-gated and use the agent ServiceAccount over the Kubernetes WebSocket exec subresource because the MCP service intentionally has no exec permission. |
 | `RUNAI_BASE_URL` | Run:ai control plane URL. No chart default; required as `agent.env.runaiBaseUrl` when `runaiMcp.enabled=true` |
 | `RUNAI_BEARER_TOKEN` | Optional Run:ai bearer token secret |
 | `GRAFANA_SERVICE_ACCOUNT_TOKEN` | Grafana service-account token used by the managed `grafanaMcp` service for Prometheus/Loki datasource read/query access |
@@ -80,7 +80,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `SYSTEM_AGENT_URL` | Per-node System-agent DaemonSet endpoint (`GET /logs?source=dmesg\|journal\|syslog`). Historical incident collection passes its exact RFC3339 time window to `journal`; dmesg/syslog remain current-state tails. |
 | `SYSTEM_AGENT_TOKEN` | Optional bearer token for the System-agent endpoint |
 | `SYSTEM_AGENT_TIMEOUT_SECONDS` | System-agent request timeout, default `120` |
-| `ENABLE_POD_EXEC` | Allow the Kubernetes collector read-only pod-exec (allowlisted commands: `nvidia-smi`, …), default `true` |
+| `ENABLE_POD_EXEC` | Allow the Kubernetes collector's denylist-gated read-only pod-exec: it blocks mutating commands, shells/interpreters, and shell metacharacters, and runs a single argv with no shell. Default `true` |
 | `POD_EXEC_TIMEOUT_SECONDS` | Pod-exec timeout, default `120` |
 | `DATABASE_URL` | Backend Postgres store DSN for incidents, alerts, embeddings, feedback, comments, and analysis runs |
 | `DATABASE_CONNECT_TIMEOUT_SECONDS` | Backend Postgres startup connection timeout, default `5` |
@@ -118,6 +118,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `MAX_AUTO_ANALYZE_FANOUT` | Backend: max analyses started per webhook, default `50` |
 | `MAX_CONCURRENT_AGENT_RUNS` | Backend: max analyses running against the Agent concurrently, default `50` |
 | `FLAPPING_GROUP_WINDOW_MINUTES` | Backend: quiet window before a recurring alert becomes a NEW incident vs another occurrence, code default `120` (Helm sets `360`) |
+| `AUTO_REANALYZE_COOLDOWN_MINUTES` | Backend: cooldown before an auto-refired alert re-analyzes its existing run in place, default `360`; `0` or less disables auto re-analysis. Env-only (not a Helm value); set through an env override. |
 | `ANALYSIS_BACKFILL_INTERVAL_SECONDS` | Backend: how often to re-drive alerts left without a completed RCA, default `300` (`0` disables) |
 | `ANALYSIS_BACKFILL_BATCH` | Backend: alerts re-driven per backfill tick, default `10` |
 | `ANALYSIS_BACKFILL_RETRY_COOLDOWN_SECONDS` | Backend: cooldown before retrying a failed alert, default `900` |

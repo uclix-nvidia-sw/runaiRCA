@@ -47,10 +47,12 @@ curl -s http://<agent>/healthz
    `MAX_CONCURRENT_AGENT_RUNS`를 초과했습니다. 백필 루프
    (`ANALYSIS_BACKFILL_INTERVAL_SECONDS`)가 누락된 알림을 다시 구동합니다 — 한 사이클을
    기다리거나 제한을 올리십시오.
-4. **에이전트가 끝나기 전에 Backend가 연결을 끊었습니다.** `AGENT_REQUEST_TIMEOUT_SECONDS`
+4. **자동 재분석 쿨다운.** 알림이 재발했는데 새 실행이 나타나지 않았다면, 아직 자동 재분석
+   쿨다운(기본 360분) 이내여서 기존 실행이 재사용되었을 수 있습니다.
+5. **에이전트가 끝나기 전에 Backend가 연결을 끊었습니다.** `AGENT_REQUEST_TIMEOUT_SECONDS`
    (1560)가 에이전트의 `ANALYSIS_DEADLINE_SECONDS`(1500)보다 낮게 설정되면, 백엔드가 분석
    도중에 취소하고 저하된 리포트가 유실됩니다. 백엔드 > 에이전트를 유지하십시오.
-5. **Persist 실패는 의도된 조기 반환입니다.** 백엔드는 실행을 영속화할 수 없으면 조기
+6. **Persist 실패는 의도된 조기 반환입니다.** 백엔드는 실행을 영속화할 수 없으면 조기
    반환합니다. 이것은 설계상 의도된 것이며(테스트도 되어 있음) 버그가 아닙니다. 백엔드 로그와
    Postgres 상태를 확인하십시오.
 
