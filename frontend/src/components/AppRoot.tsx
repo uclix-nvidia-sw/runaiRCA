@@ -74,6 +74,7 @@ import { buildAnalysisRecords } from '../utils/analytics';
 import { collectorEvidencePresentation, shouldPresentRunArtifacts } from '../utils/analysisPresentation';
 import { artifactForPresentation } from '../utils/artifactPresentation';
 import { alertFiltersForAPI, incidentFiltersForAPI, incidentViewForMainView, matchesAlertFilters, matchesIncidentFilters } from '../utils/filters';
+import { formatEvidenceQueries, splitRcaReport } from '../utils/rcaSections';
 import {
   FinalDecision,
   Severity,
@@ -1082,7 +1083,43 @@ function UnifiedWorkspace({
             // Wrapped so the report fades in when it replaces the "Analyzing…"
             // placeholder (or arrives on open) instead of teleporting in.
             <div className="rca-report-body">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{analysis}</ReactMarkdown>
+              {(() => {
+                const formatted = formatEvidenceQueries(analysis);
+                const { preamble, sections } = splitRcaReport(formatted);
+                if (sections.length === 0) {
+                  // ponytail: heading-less report (old runs) renders as before.
+                  return <ReactMarkdown remarkPlugins={[remarkGfm]}>{formatted}</ReactMarkdown>;
+                }
+                return (
+                  <>
+                    {preamble.trim() && (
+                      <div className="rca-preamble">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{preamble}</ReactMarkdown>
+                      </div>
+                    )}
+                    {sections.map((section, i) =>
+                      // Core sections (Problem/Root Cause/Actions) read at a glance —
+                      // plain heading + content, no box, no toggle. The rest collapse.
+                      section.pinned ? (
+                        <section key={i} className="rca-pinned">
+                          <h2 className="rca-pinned-heading">{section.heading}</h2>
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{section.body}</ReactMarkdown>
+                        </section>
+                      ) : (
+                        <details key={i} className="rca-section" open={section.defaultOpen}>
+                          <summary>
+                            <span>{section.heading}</span>
+                            <ChevronDown size={16} className="rca-section-chevron" aria-hidden />
+                          </summary>
+                          <div className="rca-section-body">
+                            <ReactMarkdown remarkPlugins={[remarkGfm]}>{section.body}</ReactMarkdown>
+                          </div>
+                        </details>
+                      ),
+                    )}
+                  </>
+                );
+              })()}
             </div>
           ) : (
             <p className="empty">No RCA report yet.</p>
