@@ -14,6 +14,7 @@ from app.collectors.kubernetes import (
     _filter_kubernetes_data,
     _kubernetes_list_complete,
     _mcp_k8s_response,
+    _node_cordon_artifact,
     _node_condition_artifacts,
     _pod_log_observation,
     _warning_event_observation,
@@ -2529,6 +2530,53 @@ def test_firing_node_pressure_snapshot_is_scoped_even_with_old_condition_timesta
     assert observation["snapshot_role"] == "live_incident"
     assert "evidence_window" not in observation
     assert rank_root_cause_candidates(target, [result])[0].family == "node_kubelet_pressure"
+
+
+def test_node_cordon_artifact_scopes_current_state_without_backdating() -> None:
+    firing_target = replace(
+        make_target(),
+        node="node1",
+        fired_at="2026-07-14T01:00:00Z",
+        resolved_at="",
+    )
+    cordoned_response = [
+        {
+            "name": "node",
+            "status_code": 200,
+            "error": None,
+            "data": {"name": "node1", "unschedulable": True},
+        }
+    ]
+    firing = _node_cordon_artifact(
+        "kubernetes",
+        firing_target,
+        cordoned_response,
+        time_range=causal_evidence_time_range(firing_target),
+    )
+
+    assert len(firing) == 1
+    assert "cordon" in firing[0].summary
+    assert "SchedulingDisabled" in firing[0].summary
+    assert firing[0].confidence == "high"
+    assert firing[0].result["observation"]["polarity"] == "present"
+
+    resolved_target = replace(firing_target, resolved_at="2026-07-14T01:10:00Z")
+    resolved = _node_cordon_artifact(
+        "kubernetes",
+        resolved_target,
+        cordoned_response,
+        time_range=causal_evidence_time_range(resolved_target),
+    )
+    assert resolved[0].confidence == "low"
+    assert resolved[0].result["observation"]["polarity"] == "unknown"
+
+    schedulable = _node_cordon_artifact(
+        "kubernetes",
+        firing_target,
+        [{**cordoned_response[0], "data": {"name": "node1", "unschedulable": False}}],
+        time_range=causal_evidence_time_range(firing_target),
+    )
+    assert schedulable == []
 
 
 def test_kubernetes_warning_event_projection_excludes_recovery_only_failures() -> None:

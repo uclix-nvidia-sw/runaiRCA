@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.knowledge import load_failure_modes
+from app.knowledge import load_failure_modes, match_failure_mode_symptoms
 from ontology.load_knowledge import FAMILIES
 
 YAML = "knowledge/failure_modes.yaml"
@@ -40,6 +40,22 @@ def test_spot_checks() -> None:
     assert "imagepullbackoff" in img_kws
     # kube-scheduler predicate failures live in k8s_scheduling_error.
     assert any(s["symptom"] == "Unschedulable GPU" for s in modes["k8s_scheduling_error"])
+
+
+def test_node_cordon_summary_matches_k8s_scheduling_symptom() -> None:
+    modes = load_failure_modes(YAML)
+    summary = (
+        "node/node1 is cordoned (SchedulingDisabled — spec.unschedulable=true), "
+        "so it is excluded from scheduling and pending pods may report "
+        "'node(s) were unschedulable'. (live firing snapshot)"
+    )
+
+    hits = match_failure_mode_symptoms(modes, summary, "")
+    assert any(
+        family == "k8s_scheduling_error"
+        and symptom["symptom"] == "Node Cordon Excludes It From Scheduling"
+        for family, symptom in hits
+    )
 
 
 def test_runai_mcp_oidc_discovery_is_curated_failure_mode_knowledge() -> None:

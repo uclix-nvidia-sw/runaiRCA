@@ -1823,6 +1823,14 @@ class KubernetesCollector:
             )
         )
         artifacts.extend(
+            _node_cordon_artifact(
+                self.name,
+                target,
+                responses,
+                time_range=causal_time_range,
+            )
+        )
+        artifacts.extend(
             _gpu_node_resource_artifact(self.name, self._settings, snapshot)
             for snapshot in gpu_node_resource_observations
         )
@@ -5165,6 +5173,71 @@ def _node_condition_artifacts(
                     },
                 )
             )
+    return artifacts
+
+
+def _node_cordon_artifact(
+    agent: str,
+    target: AnalysisTarget,
+    responses: list[dict[str, object]],
+    *,
+    time_range: dict[str, str] | None,
+):
+    """Publish a cordon snapshot without backdating its current-state value."""
+    artifacts = []
+    historical = bool(str(target.resolved_at or "").strip())
+    for response in responses:
+        if response.get("name") != "node" or response.get("error"):
+            continue
+        data = response.get("data")
+        if not isinstance(data, dict):
+            continue
+        node = str(data.get("name") or target.node or "").strip()
+        unschedulable = bool(data.get("unschedulable"))
+        if not node or not unschedulable:
+            continue
+
+        polarity, coverage, confidence, snapshot_role = (
+            ("unknown", "partial", "low", "current_context")
+            if historical
+            else ("present", "scoped", "high", "live_incident")
+        )
+        scope_note = (
+            "current context; a resolved incident is not explained by a current cordon"
+            if historical
+            else "live firing snapshot"
+        )
+        observation = {
+            "kind": "kubernetes_node_cordon",
+            "predicate": "kubernetes_node_cordon",
+            "polarity": polarity,
+            "coverage": coverage,
+            "observed_entity": {"kind": "node", "name": node},
+            "observation_window": time_range if not historical else {},
+            "snapshot_role": snapshot_role,
+        }
+        artifacts.append(
+            artifact(
+                agent=agent,
+                source="kubernetes",
+                type="kubernetes_node_cordon",
+                status="ok",
+                confidence=confidence,
+                title=f"Kubernetes · node/{node} · Cordoned",
+                query=f"{kubectl_repr('nodes', name=node)} -o json",
+                summary=(
+                    f"node/{node} is cordoned (SchedulingDisabled — "
+                    "spec.unschedulable=true), so it is excluded from scheduling and "
+                    "pending pods may report 'node(s) were unschedulable'. "
+                    f"({scope_note})"
+                ),
+                result={
+                    "node": node,
+                    "unschedulable": True,
+                    "observation": observation,
+                },
+            )
+        )
     return artifacts
 
 
