@@ -3107,10 +3107,65 @@ td span.occurrence-pill {
   border-bottom: 1px solid var(--line);
 }
 
-.agent-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.8rem;
+.agent-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.8rem;
+}
+
+.agent-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  border: 1px solid var(--line);
+  border-radius: 2rem;
+  background: #ffffff;
+  padding: 0.35rem 0.75rem;
+  font-size: 0.82rem;
+  color: var(--ink);
+  transition: background var(--dur-1) var(--ease-out);
+}
+
+.agent-tab:hover {
+  background: var(--surface-soft);
+}
+
+.agent-tab.active {
+  background: var(--surface-soft);
+  border-color: var(--nvidia-dark);
+  color: var(--nvidia-dark);
+}
+
+.agent-tab-count {
+  min-width: 1.2rem;
+  border-radius: 1rem;
+  background: var(--pressed);
+  padding: 0 0.3rem;
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-align: center;
+}
+
+.agent-tab-dot {
+  flex: none;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: #d0d5dd;
+}
+
+.agent-tab-dot.capability-ok {
+  background: var(--nvidia);
+}
+
+.agent-tab-dot.capability-partial {
+  background: var(--warning);
+}
+
+.agent-tab-dot.capability-unavailable,
+.agent-tab-dot.capability-error {
+  background: var(--danger);
 }
 
 .agent-evidence {
@@ -3118,19 +3173,6 @@ td span.occurrence-pill {
   border-radius: 0.5rem;
   overflow: hidden;
   background: #ffffff;
-}
-
-.agent-toggle {
-  width: 100%;
-  border: 0;
-  border-bottom: 1px solid var(--line);
-  background: #fafbf8;
-  padding: 0.7rem;
-  display: grid;
-  grid-template-columns: auto 1fr auto auto;
-  align-items: center;
-  gap: 0.5rem;
-  text-align: left;
 }
 
 .agent-content {
@@ -3172,8 +3214,24 @@ td span.occurrence-pill {
   font-weight: 800;
 }
 
+.artifact-head .artifact-preview {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 400;
+  text-align: left;
+}
+
 .artifact-body {
   margin-top: 0.65rem;
+}
+
+.artifact-more {
+  margin-bottom: 0.65rem;
 }
 
 /* Markdown-rendered artifact summary: keep it tight like the old <p>, and let the
@@ -4621,7 +4679,6 @@ code .evidence-mark {
   .analysis-focus-grid,
   .coverage-strip,
   .analysis-grid,
-  .agent-grid,
   .diagnostics,
   .similar-list,
   .agent-registry {

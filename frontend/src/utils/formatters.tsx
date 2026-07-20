@@ -7,6 +7,7 @@ import {
   FileText,
   LineChart,
   ListChecks,
+  RefreshCw,
   Server,
 } from 'lucide-react';
 
@@ -358,7 +359,7 @@ export function agentLabel(agent: string) {
     loki: 'Loki',
     system: 'System',
   };
-  return labels[agent] || agent;
+  return labels[agent] || (agent ? agent.charAt(0).toUpperCase() + agent.slice(1) : agent);
 }
 
 export function agentIcon(agent: string) {
@@ -369,5 +370,6 @@ export function agentIcon(agent: string) {
   if (agent === 'prometheus') return <LineChart size={18} />;
   if (agent === 'loki') return <FileText size={18} />;
   if (agent === 'system') return <Cpu size={18} />;
+  if (agent === 'change') return <RefreshCw size={18} />;
   return <AlertTriangle size={18} />;
 }
