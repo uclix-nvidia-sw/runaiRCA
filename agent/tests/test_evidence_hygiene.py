@@ -583,7 +583,13 @@ async def test_drilldown_llm_failure_is_visible_in_warnings(monkeypatch) -> None
     async def no_decision(*args, **kwargs):
         return None  # transport/parse failure
 
+    async def why(*args, **kwargs):
+        # The follow-up diagnostic call surfaces the actual reason (e.g. the
+        # litellm-provider config error) rather than a bare "failed".
+        return None, "HTTP 400 provider not found"
+
     monkeypatch.setattr(drilldown, "complete_json", no_decision)
+    monkeypatch.setattr(drilldown, "complete_with_error", why)
     settings = replace(
         make_settings(),
         enable_agent_drilldown=True,
@@ -593,7 +599,9 @@ async def test_drilldown_llm_failure_is_visible_in_warnings(monkeypatch) -> None
     )
     result = CollectorResult(agent="kubernetes", status="ok", summary="pod Pending")
     await drilldown.run_drilldowns(settings, [result], make_target(), None)
+    # The failure is visible AND diagnosable (the reason is surfaced, not just "failed").
     assert any("LLM decision call failed" in w for w in result.warnings)
+    assert any("provider not found" in w for w in result.warnings)
 
 
 # --- wrong-node protection (Codex review) -----------------------------------------

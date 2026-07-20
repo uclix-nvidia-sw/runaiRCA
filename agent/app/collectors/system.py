@@ -1,7 +1,8 @@
 """Node-level infrastructure collector (below Kubernetes).
 
 The agent pod can't read host logs, so a privileged DaemonSet runs on every node
-and exposes a read-only HTTP endpoint (GET /logs?source=dmesg|journal|syslog).
+and exposes a read-only HTTP endpoint
+(GET /logs?source=dmesg|journal|syslog|fabricmanager|nvidia-smi|nvlink).
 This collector queries that endpoint for the alert's node and surfaces
 kernel/GPU/hardware errors (NVIDIA XID, NVRM, OOM, MCE, I/O errors, ext4, NVLink,
 "fell off the bus") that RCA would otherwise never see.
@@ -11,6 +12,7 @@ Degrades gracefully exactly like loki.py: unconfigured -> status='unavailable'.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -35,7 +37,10 @@ from app.masking import build_masker
 # ponytail: flat regex list, not a rule engine — add patterns here as they show up.
 _ERROR_PATTERNS = re.compile(
     r"(?i)("
-    r"\bxid\b|nvrm|nvlink|fell off the bus|"  # NVIDIA GPU driver / fabric
+    r"\bxid\b|\bsxid\b|nvrm|nvlink|nvswitch|fell off the bus|"  # NVIDIA GPU / NVSwitch / NVLink
+    # Fabric Manager fault signals so fabricmanager-source SXid/init/partition lines
+    # reach the failure_modes signature matcher (network_fabric_error knowledge).
+    r"not yet initialized|cudaerrorsystemnotready|\bfm_st_|"  # Fabric Manager init / partition
     r"\boom\b|out of memory|oom-kill|"  # memory pressure
     r"i/o error|ext4-fs error|ext4_|xfs_|\bxfs\b|"  # filesystem / disk
     r"mce:|machine check|hardware error|"  # CPU/hardware
@@ -43,8 +48,18 @@ _ERROR_PATTERNS = re.compile(
     r")"
 )
 
-# Sources the DaemonSet endpoint understands.
-_SOURCES = ("dmesg", "journal", "syslog")
+# ``nvidia-smi -q`` and ``nvidia-smi nvlink --errorcounters`` normally print
+# words such as "NVLink" and "Error Counter" even when healthy. Do not promote
+# those labels into faults; only explicit unhealthy snapshot states count.
+_SNAPSHOT_ERROR_PATTERNS = re.compile(
+    r"(?i)(\bxid\b|nvrm|fell off the bus|uncorrectable|fatal|critical|"
+    r"\b(?:down|inactive|failed)\b|(?:error(?: count| counter)?\s*[:=]\s*[1-9]\d*))"
+)
+
+# Sources the DaemonSet endpoint understands. Only journalctl-backed sources
+# can be verified against a historical incident window; the rest are snapshots.
+_SOURCES = ("dmesg", "journal", "syslog", "fabricmanager", "nvidia-smi", "nvlink")
+_TIME_WINDOWABLE_SOURCES = ("journal", "fabricmanager")
 
 # The ad-hoc capability remains bounded. It is an incident discriminator, not
 # a way to export host logs.
@@ -53,6 +68,11 @@ _QUERY_DEFAULT_LOOKBACK_SECONDS = 900
 _QUERY_MAX_LINES = 1000
 _QUERY_DEFAULT_LINES = 100
 _SYSTEM_LOG_SOURCE_GROUP = "node_system"
+
+
+def _matching_lines(source: str, lines: list[str]) -> list[str]:
+    patterns = _SNAPSHOT_ERROR_PATTERNS if source in {"nvidia-smi", "nvlink"} else _ERROR_PATTERNS
+    return [line for line in lines if patterns.search(line)]
 
 
 async def system_log_query(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
@@ -111,10 +131,10 @@ async def system_log_query(settings: Settings, target: AnalysisTarget, args: dic
             lookback=requested_lookback,
         )
 
-    # Only journalctl accepts a trustworthy start/end predicate. For a past
-    # incident, use it rather than a current log tail; dmesg/syslog remain live
-    # context because their endpoints cannot safely reconstruct old state.
-    time_range = incident_time_range(target) if source == "journal" else None
+    # Only journalctl-backed sources accept a trustworthy start/end predicate.
+    # For a past incident, use them rather than current log tails; dmesg,
+    # syslog, nvidia-smi, and nvlink remain live context.
+    time_range = incident_time_range(target) if source in _TIME_WINDOWABLE_SOURCES else None
     if time_range:
         start = parse_incident_time(time_range["start"])
         end = parse_incident_time(time_range["end"])
@@ -159,9 +179,9 @@ async def system_log_query(settings: Settings, target: AnalysisTarget, args: dic
             response.error, source=source, node=node, lookback=lookback, limit=lines
         )
     raw_lines = _lines(response.data)[-lines:]
-    matching = [line for line in raw_lines if _ERROR_PATTERNS.search(line)]
+    matching = _matching_lines(source, raw_lines)
     historical_window_verified = bool(
-        time_range and _historical_journal_response_verified(response.data, time_range)
+        time_range and _historical_journal_response_verified(response.data, time_range, source)
     )
     matching_timestamps = _journal_matching_timestamps(
         matching, causal_evidence_time_range(target) if historical_window_verified else None
@@ -302,7 +322,7 @@ def _system_log_observation(
     # matching line happened before resolution: a post-resolution XID/OOM is
     # useful context, but not evidence of the incident's cause.  Require the
     # line's own RFC3339 instant before giving a historical positive scoped
-    # semantics.  Current dmesg/syslog tails remain operator context.
+    # semantics. Current dmesg/syslog/nvidia-smi/nvlink snapshots remain operator context.
     historical_time_missing = historical_scope and bool(matching) and not matching_timestamps
     polarity = "present" if matching and not historical_time_missing else "unknown"
     coverage = "scoped" if matching and historical_scope and not historical_time_missing else "partial"
@@ -363,10 +383,21 @@ def _journal_matching_timestamps(
     return [raw for _, raw in timestamps]
 
 
+def _same_instant(echoed: object, requested: str) -> bool:
+    """Timestamps match if the strings are identical OR parse to the same instant
+    — tolerate an agent that echoes `Z` vs `+00:00` or otherwise reformats, so a
+    correctly-windowed response isn't false-negatived into 'context only'."""
+    if str(echoed or "") == str(requested or ""):
+        return True
+    parsed_echoed = parse_incident_time(str(echoed or ""))
+    parsed_requested = parse_incident_time(str(requested or ""))
+    return parsed_echoed is not None and parsed_echoed == parsed_requested
+
+
 def _historical_journal_response_verified(
-    data: object, time_range: dict[str, str]
+    data: object, time_range: dict[str, str], source: str = "journal"
 ) -> bool:
-    """Whether the endpoint confirms it returned the requested journal window.
+    """Whether the endpoint confirms it returned the requested journalctl window.
 
     A bounded request alone is not evidence: a proxy or an incompatible system
     agent can return HTTP 200 with a bare body/list, another source, or a
@@ -375,9 +406,9 @@ def _historical_journal_response_verified(
     """
     return (
         isinstance(data, dict)
-        and str(data.get("source") or "").strip().lower() == "journal"
-        and str(data.get("since") or "") == time_range["start"]
-        and str(data.get("until") or "") == time_range["end"]
+        and str(data.get("source") or "").strip().lower() == source
+        and _same_instant(data.get("since"), time_range["start"])
+        and _same_instant(data.get("until"), time_range["end"])
         and isinstance(data.get("lines"), list)
     )
 
@@ -439,6 +470,39 @@ class SystemCollector:
             if node:
                 node_origin = resolved_origin
         if not node:
+            return await self._scan_all_nodes(target, plan)
+
+        return await self._scan_node(
+            target,
+            plan,
+            node=node,
+            node_origin=node_origin,
+            alert_node=alert_node,
+            resolved_pod=resolved_pod,
+        )
+
+    async def _scan_all_nodes(self, target: AnalysisTarget, plan) -> CollectorResult:
+        try:
+            from app.collectors.kubernetes import k8s_read
+
+            node_list = await k8s_read(self._settings, "nodes", full_object=True)
+            data = (
+                node_list.get("data")
+                if isinstance(node_list, dict) and not node_list.get("error")
+                else None
+            )
+            items = data.get("items") if isinstance(data, dict) else data
+            if isinstance(items, list):
+                nodes = [
+                    str(item.get("metadata", {}).get("name") or "").strip()
+                    for item in items
+                    if isinstance(item, dict) and isinstance(item.get("metadata"), dict)
+                ]
+            else:
+                nodes = []
+        except Exception:  # noqa: BLE001 - keep system evidence optional
+            nodes = []
+        if not nodes:
             summary = f"{NO_EVIDENCE} " + ko_en(
                 self._settings,
                 "이 알림에서 노드를 특정할 수 없어 노드/커널 증거 수집을 건너뛰었습니다 "
@@ -465,6 +529,73 @@ class SystemCollector:
                 ],
             )
 
+        limit = max(1, int(getattr(self._settings, "system_agent_max_nodes", 12)))
+        selected_nodes = nodes[:limit]
+        warnings = (
+            [f"System agent node scan capped at {limit}; {len(nodes) - limit} nodes were skipped."]
+            if len(nodes) > limit
+            else []
+        )
+        semaphore = asyncio.Semaphore(5)
+
+        async def scan(node: str) -> CollectorResult:
+            async with semaphore:
+                return await self._scan_node(
+                    target,
+                    plan,
+                    node=node,
+                    node_origin="cluster_scan",
+                    alert_node="",
+                    resolved_pod="",
+                )
+
+        results = await asyncio.gather(*(scan(node) for node in selected_nodes))
+        artifacts = [artifact for result in results for artifact in result.artifacts]
+        warnings.extend(warning for result in results for warning in result.warnings)
+        error_nodes = [
+            str(result.details.get("node") or "")
+            for result in results
+            if any(
+                isinstance(source, dict) and int(source.get("error_count") or 0) > 0
+                for source in result.details.get("sources", [])
+            )
+        ]
+        clean_nodes = [
+            result.details.get("node", "")
+            for result in results
+            if result.status != "unavailable" and result.details.get("node", "") not in error_nodes
+        ]
+        status = "ok" if any(result.status == "ok" for result in results) else (
+            "partial" if any(result.status == "partial" for result in results) else "unavailable"
+        )
+        confidence = "high" if status == "ok" else "low"
+        summary = (
+            f"System agent scanned {len(selected_nodes)} cluster node(s). "
+            f"Kernel/hardware error lines: {', '.join(error_nodes) or 'none'}; "
+            f"clean/current-context nodes: {', '.join(clean_nodes) or 'none'}."
+        )
+        missing_data = sorted({item for result in results for item in result.missing_data})
+        return CollectorResult(
+            agent=self.name,
+            status=status,
+            summary=summary,
+            confidence=confidence,
+            details={"nodes": [result.details for result in results], "node_origin": "cluster_scan"},
+            missing_data=missing_data,
+            warnings=warnings,
+            artifacts=artifacts,
+        )
+
+    async def _scan_node(
+        self,
+        target: AnalysisTarget,
+        plan,
+        *,
+        node: str,
+        node_origin: str,
+        alert_node: str,
+        resolved_pod: str,
+    ) -> CollectorResult:
         # Pod DNS usually cannot resolve bare node hostnames (http://dgx01:9095 ->
         # "Name or service not known"), so resolve the node's InternalIP from the
         # Kubernetes API and address the hostNetwork DaemonSet by IP. Falls back to
@@ -499,10 +630,10 @@ class SystemCollector:
         raw_matches: dict[str, list[str]] = {}
         for source in _SOURCES:
             params = {"source": source, "lines": "500"}
-            # Only journalctl has a trustworthy historical time predicate. A
-            # dmesg/syslog tail is retained as *current-state* context but must
-            # not be treated as proof about a past incident.
-            if source == "journal" and time_range:
+            # Only journalctl sources have a trustworthy historical time
+            # predicate. Snapshot sources are current-state context, not proof
+            # about a past incident.
+            if source in _TIME_WINDOWABLE_SOURCES and time_range:
                 params.update({"since": time_range["start"], "until": time_range["end"]})
             if "{node}" not in self._settings.system_agent_url:
                 params["node"] = node
@@ -514,12 +645,12 @@ class SystemCollector:
                 headers=headers,
             )
             lines = _lines(response.data)
-            matches = [line for line in lines if _ERROR_PATTERNS.search(line)]
+            matches = _matching_lines(source, lines)
             raw_matches[source] = matches
             historical_window_verified = bool(
-                source == "journal"
+                source in _TIME_WINDOWABLE_SOURCES
                 and time_range
-                and _historical_journal_response_verified(response.data, time_range)
+                and _historical_journal_response_verified(response.data, time_range, source)
             )
             matching_timestamps = _journal_matching_timestamps(
                 matches, causal_time_range if historical_window_verified else None
@@ -533,8 +664,10 @@ class SystemCollector:
                     "error_count": len(matches),
                     "errors": compact(matches, limit=8),
                     "error": response.error,
-                    "time_range": time_range if source == "journal" and time_range else None,
-                    "historical_scope": bool(source == "journal" and time_range),
+                    "time_range": (
+                        time_range if source in _TIME_WINDOWABLE_SOURCES and time_range else None
+                    ),
+                    "historical_scope": bool(source in _TIME_WINDOWABLE_SOURCES and time_range),
                     "historical_window_verified": historical_window_verified,
                     "matching_timestamps": matching_timestamps,
                 }
@@ -544,7 +677,7 @@ class SystemCollector:
 
         successful = [item for item in source_results if not item["error"]]
         incident_sources = (
-            [item for item in source_results if item["source"] == "journal"]
+            [item for item in source_results if item["source"] in _TIME_WINDOWABLE_SOURCES]
             if time_range
             else source_results
         )
@@ -569,13 +702,19 @@ class SystemCollector:
             for item in causal_errors
             for line in raw_matches.get(str(item["source"]), [])
         ]
-        journal = next((item for item in source_results if item["source"] == "journal"), None)
-        historical_response_verified = bool(
-            isinstance(journal, dict) and journal.get("historical_window_verified")
+        historical_sources = [
+            item for item in source_results if item["source"] in _TIME_WINDOWABLE_SOURCES
+        ]
+        historical_response_verified = any(
+            isinstance(item, dict) and item.get("historical_window_verified")
+            for item in historical_sources
         )
-        if time_range and isinstance(journal, dict) and not journal.get("error") and not historical_response_verified:
+        if time_range and any(
+            not item.get("error") and not item.get("historical_window_verified")
+            for item in historical_sources
+        ):
             warnings.append(
-                "System agent did not confirm the requested historical journal window; "
+                "System agent did not confirm a requested historical journalctl window; "
                 "its log lines are context only."
             )
 
@@ -584,21 +723,22 @@ class SystemCollector:
             confidence = "low"
             deterministic = f"{NO_EVIDENCE} " + ko_en(
                 self._settings,
-                f"노드 {node}: system agent가 요청한 incident 시간창의 journal 응답을 확인하지 "
+                f"노드 {node}: system agent가 요청한 incident 시간창의 journalctl 응답을 확인하지 "
                 "못했습니다. 반환된 로그는 참고용이며 과거 incident 증거로 사용하지 않습니다.",
-                f"Node {node}: the system agent did not confirm the requested incident-window "
-                "journal response. Returned logs are context only, not historical evidence.",
+                f"Node {node}: the system agent did not confirm a requested incident-window "
+                "journalctl response. Returned logs are context only, not historical evidence.",
             )
         elif causal_errors and time_range and not historical_node_scope_verified:
             status = "partial"
             confidence = "low"
             deterministic = f"{NO_EVIDENCE} " + ko_en(
                 self._settings,
-                f"노드 {node}: 현재 pod에서 추론한 노드의 incident 시간창 journal에 "
+                f"노드 {node}: 현재 pod에서 추론한 노드의 incident 시간창 journalctl에 "
                 f"커널/하드웨어 에러 라인 {len(error_lines)}건이 있지만, alert가 노드를 "
                 "명시하지 않아 참고용으로만 사용합니다.",
-                f"Node {node}: its incident-window journal has {len(error_lines)} kernel/hardware "
-                "error line(s), but the node was inferred from a current Pod rather than the alert; "
+                f"Node {node}: its incident-window journalctl logs have {len(error_lines)} "
+                "kernel/hardware error line(s), but the node was inferred from a current Pod "
+                "rather than the alert; "
                 "this is context only.",
             )
         elif causal_errors:
@@ -641,27 +781,29 @@ class SystemCollector:
             confidence = "low"
             deterministic = ko_en(
                 self._settings,
-                f"노드 {node}: incident 시간창에서 가져온 journal 줄에는 커널/GPU/하드웨어 "
+                f"노드 {node}: incident 시간창에서 가져온 journalctl 줄에는 커널/GPU/하드웨어 "
                 "에러 시그니처가 없습니다. 유한한 tail이므로 부재 증거는 아니며, "
-                "dmesg/syslog는 현재 상태 참고입니다."
+                "dmesg/syslog/nvidia-smi/nvlink는 현재 상태 참고입니다."
                 if time_range
-                else f"노드 {node}: 시스템 에이전트 접속 정상, 최근 dmesg/journal/syslog에 "
+                else f"노드 {node}: 시스템 에이전트 접속 정상, 최근 "
+                "dmesg/journal/syslog/fabricmanager/nvidia-smi/nvlink에 "
                 "커널/GPU/하드웨어 에러 시그니처가 없습니다.",
                 f"Node {node}: no kernel/GPU/hardware error signatures were found in the "
-                "retrieved journal lines for the incident window. The finite tail is not "
-                "absence evidence; dmesg/syslog are current-state context."
+                "retrieved journalctl lines for the incident window. The finite tail is not "
+                "absence evidence; dmesg/syslog/nvidia-smi/nvlink are current-state context."
                 if time_range
                 else f"Node {node}: system agent reachable, no kernel/GPU/hardware "
-                "error signatures in recent dmesg/journal/syslog.",
+                "error signatures in recent dmesg/journal/syslog/fabricmanager/nvidia-smi/nvlink.",
             )
         elif successful and time_range:
             status = "partial"
             confidence = "low"
             deterministic = f"{NO_EVIDENCE} " + ko_en(
                 self._settings,
-                f"노드 {node}: incident 시간창 journal 조회에 실패했습니다. "
-                "dmesg/syslog는 현재 상태만 보여 과거 incident 반증으로 사용할 수 없습니다.",
-                f"Node {node}: the incident-window journal query failed. Current dmesg/syslog "
+                f"노드 {node}: incident 시간창 journalctl 조회에 실패했습니다. "
+                "dmesg/syslog/nvidia-smi/nvlink는 현재 상태만 보여 "
+                "과거 incident 반증으로 사용할 수 없습니다.",
+                f"Node {node}: the incident-window journalctl queries failed. Current dmesg/syslog "
                 "tails cannot disprove a past incident.",
             )
         else:
@@ -727,17 +869,21 @@ def _system_observation(
     node: str,
     historical_node_scope_verified: bool,
 ) -> dict[str, object]:
-    """Classify only the source that actually covers the incident window."""
+    """Classify only journalctl sources that actually cover the incident window."""
     if time_range:
+        historical_sources = [
+            item for item in source_results if item.get("source") in _TIME_WINDOWABLE_SOURCES
+        ]
         journal = next(
-            (item for item in source_results if item.get("source") == "journal"), None
+            (item for item in historical_sources if int(item.get("error_count") or 0) > 0),
+            historical_sources[0] if historical_sources else None,
         )
         if not isinstance(journal, dict) or journal.get("error"):
             polarity, coverage = "unavailable", "unknown"
         elif int(journal.get("error_count") or 0) > 0:
             # ``incident_time_range`` includes an epilogue after resolution.
             # A source/window echo is not sufficient to classify a matching
-            # journal line as causal; it needs its own timestamp.
+            # journalctl line as causal; it needs its own timestamp.
             timestamps = journal.get("matching_timestamps")
             if not isinstance(timestamps, list) or not timestamps:
                 polarity, coverage = "unknown", "partial"
@@ -755,7 +901,7 @@ def _system_observation(
         if not successful:
             polarity, coverage = "unavailable", "unknown"
         elif any(int(item.get("error_count") or 0) > 0 for item in successful):
-            # dmesg/syslog tails can be useful to an operator but do not prove
+            # Snapshot sources can be useful to an operator but do not prove
             # timing for an alert with no bounded incident window.
             polarity, coverage = "present", "partial"
         else:

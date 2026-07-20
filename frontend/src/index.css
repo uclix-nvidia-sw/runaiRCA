@@ -2739,6 +2739,12 @@ td span.occurrence-pill {
   gap: 0.45rem;
 }
 
+.thought-duration {
+  color: #667085;
+  font-size: 0.8rem;
+  font-weight: 650;
+}
+
 .progress-timeline-meta {
   color: #667085;
   font-size: 0.76rem;

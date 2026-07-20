@@ -644,6 +644,29 @@ async def test_collect_runai_crd_findings_enumerates_and_flags_not_ready(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_crd_scan_404_is_quiet_and_system_namespaces_skipped(monkeypatch) -> None:
+    """A 404 (CRD kind not served at the group's version) is a 'none here' signal,
+    not a scan-failure warning; and Run:ai CRDs are never scanned in kube-system."""
+    from app.collectors import kubernetes as k8s
+
+    seen_namespaces: set[str] = set()
+
+    async def fake_k8s_read(settings, kind, namespace="", name="", label_selector=""):
+        seen_namespaces.add(namespace)
+        return {"kind": kind, "error": "HTTP 404: not found", "status_code": 404, "data": {}}
+
+    monkeypatch.setattr(k8s, "k8s_read", fake_k8s_read)
+    result = await k8s.collect_runai_crd_findings(
+        make_settings(), _toolkit_target(), ["kube-system"]
+    )
+    # kube-system is skipped entirely (Run:ai workloads never live there).
+    assert "kube-system" not in seen_namespaces
+    # 404s are recorded quietly, not surfaced as scan-failure warnings.
+    assert not any("scan failed" in w for w in result["warnings"])
+    assert result["failed_kinds"] == []
+
+
+@pytest.mark.asyncio
 async def test_official_runai_mcp_uses_project_resources_tool(monkeypatch) -> None:
     from app.collectors import runai_mcp
 

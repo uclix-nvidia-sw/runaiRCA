@@ -118,6 +118,7 @@ class Settings:
     system_agent_url: str
     system_agent_token: str
     system_agent_timeout_seconds: int
+    system_agent_max_nodes: int
     enable_pod_exec: bool
     pod_exec_timeout_seconds: int
     agent_souls_file: str
@@ -296,6 +297,7 @@ def load_settings() -> Settings:
         system_agent_url=os.getenv("SYSTEM_AGENT_URL", "").strip().rstrip("/"),
         system_agent_token=os.getenv("SYSTEM_AGENT_TOKEN", "").strip(),
         system_agent_timeout_seconds=_int_env("SYSTEM_AGENT_TIMEOUT_SECONDS", 120),
+        system_agent_max_nodes=max(1, _int_env("SYSTEM_AGENT_MAX_NODES", 12)),
         # Read-only pod exec for the Kubernetes agent (view container state/logs; no mutations).
         enable_pod_exec=_bool_env("ENABLE_POD_EXEC", True),
         pod_exec_timeout_seconds=_int_env("POD_EXEC_TIMEOUT_SECONDS", 120),

@@ -82,6 +82,7 @@ def make_settings() -> Settings:
         system_agent_url="",
         system_agent_token="",
         system_agent_timeout_seconds=6,
+        system_agent_max_nodes=12,
         enable_pod_exec=False,
         pod_exec_timeout_seconds=10,
         agent_souls_file="prompts/agent_souls.md",

@@ -81,6 +81,7 @@ import {
   Status,
   agentIcon,
   agentLabel,
+  formatDuration,
   formatOccurrenceCount,
   formatTime,
   formatTokenUsage,
@@ -1210,10 +1211,20 @@ function ProgressTimeline({
   };
 
   const ledger = latestProgressLedger(events);
+  const startedAt = run ? Date.parse(run.created_at) : Number.NaN;
+  const completedAt = run?.first_completed_at
+    ? Date.parse(run.first_completed_at)
+    : run?.status === 'complete' || run?.status === 'completed'
+      ? Date.parse(run.updated_at)
+      : Number.NaN;
+  const duration = formatDuration(completedAt - startedAt);
   return (
     <section className={`progress-timeline ${live ? 'is-live' : ''}`}>
       <button className="progress-timeline-head" onClick={() => setOpen((value) => !value)} type="button">
-        <span><ListChecks size={18} /> Thought Process</span>
+        <span>
+          <ListChecks size={18} /> Thought Process
+          {duration && <span className="thought-duration">· {duration}</span>}
+        </span>
         <span className="progress-timeline-meta">
           {live ? 'live' : run?.updated_at ? formatTime(run.updated_at) : 'complete'} · {events.length}
           <ChevronDown size={15} />

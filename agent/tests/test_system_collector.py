@@ -33,6 +33,7 @@ class _Settings:
     system_agent_url = "http://{node}:9095"
     system_agent_token = ""
     system_agent_timeout_seconds = 6
+    system_agent_max_nodes = 12
     # llm_configured() reads these; unset -> deterministic path.
     llm_base_url = ""
     llm_model = ""
@@ -95,6 +96,62 @@ async def test_no_node_is_unavailable() -> None:
 
 
 @pytest.mark.asyncio
+async def test_no_node_scans_all_cluster_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.collectors import kubernetes as k8s
+
+    async def no_target_node(*_args, **_kwargs):
+        return "", "", ""
+
+    async def fake_k8s_read(*_args, **_kwargs):
+        return {
+            "error": None,
+            "data": {"items": [{"metadata": {"name": node}} for node in ("n1", "n2", "n3")]},
+        }
+
+    async def fake_internal_ip(_settings, node):
+        return node
+
+    async def fake_get_json(*, base_url, **_kwargs):
+        return JsonResponse(url=base_url, status_code=200, data={"lines": ["all good"]})
+
+    monkeypatch.setattr(system_mod, "_node_from_target_pod", no_target_node)
+    monkeypatch.setattr(k8s, "k8s_read", fake_k8s_read)
+    monkeypatch.setattr(system_mod, "_node_internal_ip", fake_internal_ip)
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+
+    result = await SystemCollector(_Settings()).collect(_target(node=""))
+
+    assert result.missing_data == []
+    assert len(result.artifacts) == 3
+    assert {item.result["node"] for item in result.artifacts} == {"n1", "n2", "n3"}
+    assert result.details["node_origin"] == "cluster_scan"
+    assert all(
+        item.result["observation"]["coverage"] == "partial" for item in result.artifacts
+    )
+
+
+@pytest.mark.asyncio
+async def test_node_scoped_target_scans_only_its_node(monkeypatch: pytest.MonkeyPatch) -> None:
+    scanned: set[str] = set()
+
+    async def fake_internal_ip(_settings, node):
+        return node
+
+    async def fake_get_json(*, base_url, **_kwargs):
+        scanned.add(base_url.removeprefix("http://").removesuffix(":9095"))
+        return JsonResponse(url=base_url, status_code=200, data={"lines": ["all good"]})
+
+    monkeypatch.setattr(system_mod, "_node_internal_ip", fake_internal_ip)
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+
+    result = await SystemCollector(_Settings()).collect(_target(node="gpu-node-1"))
+
+    assert scanned == {"gpu-node-1"}
+    assert len(result.artifacts) == 1
+    assert result.details["node"] == "gpu-node-1"
+
+
+@pytest.mark.asyncio
 async def test_detects_kernel_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     payloads = {
         "dmesg": [
@@ -103,6 +160,9 @@ async def test_detects_kernel_errors(monkeypatch: pytest.MonkeyPatch) -> None:
         ],
         "journal": ["systemd: started thing"],
         "syslog": ["kernel: EXT4-fs error (device sda1): bad block"],
+        "fabricmanager": ["Fabric Manager healthy"],
+        "nvidia-smi": ["GPU 0: healthy"],
+        "nvlink": ["GPU 0: NVLink status active"],
     }
 
     async def fake_get_json(*, base_url, path, timeout_seconds, params, **kwargs):
@@ -123,6 +183,9 @@ async def test_detects_kernel_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     assert detail_sources["dmesg"]["error_count"] == 1
     assert detail_sources["journal"]["error_count"] == 0
     assert detail_sources["syslog"]["error_count"] == 1
+    assert detail_sources["fabricmanager"]["error_count"] == 0
+    assert detail_sources["nvidia-smi"]["error_count"] == 0
+    assert detail_sources["nvlink"]["error_count"] == 0
     observation = result.artifacts[0].result["observation"]
     assert (observation["polarity"], observation["coverage"]) == ("present", "partial")
 
@@ -172,8 +235,17 @@ async def test_historical_incident_scopes_journal_and_ignores_current_tails(
         "until": "2026-01-02T03:15:00Z",
     }
     assert all(
-        "since" not in params for params in calls if params["source"] in {"dmesg", "syslog"}
+        "since" not in params
+        for params in calls
+        if params["source"] in {"dmesg", "syslog", "nvidia-smi", "nvlink"}
     )
+    fabricmanager_params = next(params for params in calls if params["source"] == "fabricmanager")
+    assert fabricmanager_params == {
+        "source": "fabricmanager",
+        "lines": "500",
+        "since": "2026-01-02T02:55:00Z",
+        "until": "2026-01-02T03:15:00Z",
+    }
     assert result.status == "partial"
     assert result.confidence == "low"
     assert "journal" in result.summary
@@ -234,7 +306,7 @@ async def test_system_log_query_is_scoped_bounded_and_body_free(
 
 
 @pytest.mark.asyncio
-async def test_system_log_query_scopes_historical_journal_only(
+async def test_system_log_query_scopes_historical_journalctl_sources_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict] = []
@@ -266,6 +338,9 @@ async def test_system_log_query_scopes_historical_journal_only(
     dmesg = await system_log_query(
         _Settings(), target, {"source": "dmesg", "lookback_seconds": 60, "lines": 2}
     )
+    fabricmanager = await system_log_query(
+        _Settings(), target, {"source": "fabricmanager", "lookback_seconds": 60, "lines": 2}
+    )
 
     assert calls[0]["params"] == {
         "source": "journal",
@@ -274,6 +349,12 @@ async def test_system_log_query_scopes_historical_journal_only(
         "until": "2026-07-13T21:50:47Z",
     }
     assert calls[1]["params"] == {"source": "dmesg", "lines": "2"}
+    assert calls[2]["params"] == {
+        "source": "fabricmanager",
+        "lines": "2",
+        "since": "2026-07-13T21:38:47Z",
+        "until": "2026-07-13T21:50:47Z",
+    }
     assert journal["observation"]["historical_scope"] is True
     assert journal["observation"]["observation_window"] == {
         "start": "2026-07-13T21:38:47Z",
@@ -287,6 +368,30 @@ async def test_system_log_query_scopes_historical_journal_only(
     }
     assert dmesg["observation"]["historical_scope"] is False
     assert dmesg["coverage"] == "partial"
+    assert fabricmanager["observation"]["historical_scope"] is True
+    assert fabricmanager["coverage"] == "scoped"
+
+
+@pytest.mark.asyncio
+async def test_system_log_query_accepts_new_sources_and_rejects_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    async def fake_get_json(**kwargs):
+        calls.append(kwargs["params"]["source"])
+        return JsonResponse(url="http://node/logs", status_code=200, data={"lines": []})
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+    for source in ("fabricmanager", "nvidia-smi", "nvlink"):
+        query = await system_log_query(_Settings(), _target(), {"source": source})
+        assert query["error"] is None
+    unknown = await system_log_query(_Settings(), _target(), {"source": "not-a-source"})
+
+    assert calls == ["fabricmanager", "nvidia-smi", "nvlink"]
+    assert unknown["error"] == (
+        "source must be one of: dmesg, journal, syslog, fabricmanager, nvidia-smi, nvlink"
+    )
 
 
 @pytest.mark.asyncio
@@ -380,7 +485,7 @@ async def test_historical_malformed_journal_is_context_only(
     observation = result.artifacts[0].result["observation"]
     assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
     assert result.status == "partial"
-    assert any("historical journal window" in warning for warning in result.warnings)
+    assert any("historical journalctl window" in warning for warning in result.warnings)
 
 
 @pytest.mark.asyncio
@@ -615,3 +720,38 @@ async def test_system_log_query_refuses_unsafe_grep_and_line_limit(
 
     assert too_many["error"] == "lines must be between 1 and 1000"
     assert unsafe["error"] == "grep must not contain control characters"
+
+
+def test_fabric_manager_evidence_reaches_the_knowledge_matcher() -> None:
+    """End-to-end delivery chain for Fabric Manager incidents: a fabricmanager
+    log line the system agent gathers must be (A) surfaced by the error filter
+    (not dropped) AND (B) matched by the loaded network_fabric_error knowledge,
+    so the RCA actually references the FM/SXid troubleshooting knowledge."""
+    from app.collectors.system import _ERROR_PATTERNS
+    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+
+    modes = load_failure_modes("knowledge/failure_modes.yaml")
+
+    def chain(line: str) -> bool:
+        return bool(_ERROR_PATTERNS.search(line)) and any(
+            family == "network_fabric_error"
+            for family, _ in match_failure_mode_symptoms(modes, line, "")
+        )
+
+    # SXid codes flow capture -> matcher -> the correct severity symptom.
+    assert chain("nvswitch: SXid 23001 egress DST-VC credit overflow")  # always-fatal
+    assert chain("SXid 20034 LTSSM Fault Up; GPU reported Xid 74")  # fatal
+    assert chain("fmActivateFabricPartition failed: FM_ST_IN_USE")  # partition life-cycle
+    # Fabric Manager init failure signal is at least captured (was dropped before).
+    assert _ERROR_PATTERNS.search("nvidia-fabricmanager: GPU system not yet initialized")
+
+
+def test_same_instant_tolerates_timestamp_reformatting() -> None:
+    """A correctly-windowed journalctl response must not be false-negatived into
+    'context only' just because the agent echoes Z vs +00:00 or reformats."""
+    from app.collectors.system import _same_instant
+
+    assert _same_instant("2026-07-14T01:00:00Z", "2026-07-14T01:00:00Z")
+    assert _same_instant("2026-07-14T01:00:00+00:00", "2026-07-14T01:00:00Z")
+    assert not _same_instant("2026-07-14T01:00:00Z", "2026-07-14T02:00:00Z")
+    assert not _same_instant("", "2026-07-14T01:00:00Z")

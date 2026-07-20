@@ -122,6 +122,47 @@ def test_layer_families_have_signatures() -> None:
         assert all(s["keywords"] and s["actions"] for s in symptoms)
 
 
+def test_fabric_manager_failure_mode_distinctions_match() -> None:
+    modes = load_failure_modes(YAML)
+
+    def symptoms_for(text: str) -> set[str]:
+        return {
+            symptom["symptom"]
+            for family, symptom in match_failure_mode_symptoms(modes, text, "")
+            if family == "network_fabric_error"
+        }
+
+    assert "NVSwitch SXid Access And Trunk Link Failure" in symptoms_for(
+        "NVSwitch SXid fatal on a trunk link"
+    )
+    assert "GPU Fabric Registration Incomplete" in symptoms_for(
+        "GPU fabric State: In Progress / cudaErrorSystemNotReady"
+    )
+    assert "MIG Mode Disables NVLink" in symptoms_for("MIG mode disables NVLink peer-to-peer")
+
+
+def test_fabric_manager_sxid_and_partition_lifecycle_match_specific_symptoms() -> None:
+    modes = load_failure_modes(YAML)
+
+    def symptoms_for(text: str) -> set[str]:
+        return {
+            symptom["symptom"]
+            for family, symptom in match_failure_mode_symptoms(modes, text, "")
+            if family == "network_fabric_error"
+        }
+
+    assert "NVSwitch SXid — Always Fatal" in symptoms_for("NVSwitch SXid 23001 fatal")
+    assert "NVSwitch SXid Access And Trunk Link Failure" in symptoms_for(
+        "SXid 20034 LTSSM Fault, GPU Xid 74"
+    )
+    assert "Fabric Partition Life-Cycle Errors" in symptoms_for(
+        "FM_ST_IN_USE partition already activated"
+    )
+    assert "NVSwitch SXid — Other Notable" in symptoms_for(
+        "Host_thermal_event_start single lane"
+    )
+
+
 def test_runai_scheduler_reclaim_and_gang_surface_with_scheduler_pod_pointer() -> None:
     # Run:ai's own scheduler (separate from kube-scheduler): a reclaimed or gang-stuck
     # workload must match a symptom whose action points at runai-scheduler-default.

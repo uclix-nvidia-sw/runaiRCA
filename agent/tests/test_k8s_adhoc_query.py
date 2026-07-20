@@ -428,6 +428,50 @@ async def test_mcp_named_read_rejects_a_different_resource(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_mcp_yaml_named_read_does_not_fall_back_to_direct_api(monkeypatch) -> None:
+    class Result:
+        isError = False
+        structuredContent = None
+        content = [
+            type(
+                "Text",
+                (),
+                {
+                    "text": (
+                        "apiVersion: v1\nkind: Pod\nmetadata:\n"
+                        "  name: worker-0\n  namespace: team-a\nspec:\n"
+                        "  nodeName: gpu-node-1\n"
+                    )
+                },
+            )()
+        ]
+
+    async def fake_mcp_call(_url, tool, _arguments):
+        if tool == "resources_get":
+            return Result()
+        raise RuntimeError("shortcut tool unavailable")
+
+    async def direct_api_must_not_run(**_kwargs):
+        raise AssertionError("direct Kubernetes API must not run after an MCP YAML success")
+
+    monkeypatch.setattr(k8s, "mcp_call", fake_mcp_call)
+    monkeypatch.setattr(k8s, "get_json", direct_api_must_not_run)
+
+    result = await k8s.k8s_read(
+        replace(make_settings(), kubernetes_mcp_url="http://kubernetes-mcp/mcp"),
+        "pods",
+        namespace="team-a",
+        name="worker-0",
+        full_object=True,
+    )
+
+    assert result["error"] is None
+    assert result["url"].endswith("#read_pods")
+    assert result["data"]["metadata"] == {"name": "worker-0", "namespace": "team-a"}
+    assert "mcp_fallback" not in result
+
+
+@pytest.mark.asyncio
 async def test_mcp_field_selector_uses_generic_list_and_enforces_assignment(monkeypatch) -> None:
     captured: list[tuple[str, dict[str, object]]] = []
 

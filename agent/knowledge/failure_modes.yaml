@@ -288,8 +288,119 @@
       keywords: ["fabric manager", nvswitch, "nv-fabricmanager", fabricmanager, "system not yet initialized"]
       actions:
         - "NVSwitch systems need a healthy Fabric Manager for GPU-to-GPU traffic. Check `systemctl status nvidia-fabricmanager` and its log on the node."
-        - "GPU Operator validator pods crashing with 'error code system not yet initialized' mean exactly this on DGX/HGX: the fabric is not configured yet. Verify with `nvidia-smi -q` (Fabric State) and read /var/log/fabricmanager.log; ensure nvidia-fabricmanager is installed on NVSwitch systems."
+        - "GPU Operator validator pods crashing with 'error code system not yet initialized' mean exactly this on DGX/HGX: the fabric is not configured yet. Verify with `nvidia-smi -q` (Fabric State) and read /var/log/fabricmanager.log; ensure nvidia-fabricmanager is installed on NVSwitch systems. The RCA system agent can pull `fabricmanager` (nvidia-fabricmanager journal), `nvidia-smi`, and `nvlink` sources for this node."
         - "Restart order matters: stop CUDA apps -> restart Fabric Manager -> (if needed) `nvidia-smi -r` -> restart apps."
+        - "For deep NVSwitch/NVLink hardware faults that node logs do not resolve, use the vendor BMC-level `nvdebug -i <BMC_IP> -u <user> -p <pass> -t <platform> -v` tool plus `ipmitool ... chassis status` to collect full platform diagnostics for escalation; this is not a node-agent command."
+    - name: NVSwitch SXid — Non-Fatal
+      name_ko: NVSwitch SXid — 비치명적
+      keywords: [sxid, "non-fatal sxid", "11004", "11012", "11021", "11022", "11023", "12021", "12023", "15008", "15011", "19049", "19055", "19057", "19059", "19062", "19065", "19068", "19071", "20001", "20012", "12028", "19084", "22013", "24001", "24002", "24003", "single bit ecc", "single-bit ecc"]
+      actions:
+        - "Non-fatal NVSwitch SXids are informational; Fabric Manager does not abort CUDA jobs."
+        - "11004 (ingress invalid ACL) is caused only by an incorrect Fabric Manager partition configuration: GPU NVLink traffic stalls and the GPU driver aborts CUDA with Xid 45. Validate routing with the NVSwitch-audit tool and restart the guest VM."
+        - "Single-bit ECC errors (11012, 11021-11023, 12021, 12023, 15008, 15011, 19049, 19055, 19057, 19059, 19062, 19065, 19068, 19071, 24001-24003) are auto-corrected by hardware and have no impact. 20001 (TX Replay) affects NVLink throughput."
+        - "12028 (egress non-posted PRIV) stalls GPUs and causes Xid 45; restart the guest VM. 19084 (AN1 Heartbeat Timeout) usually accompanies a fatal SXid; reset all GPUs and NVSwitches. 22013 (Minion Link DLREQ) can be safely ignored. 20012 indicates a broken/inconsistent link or uncoordinated shutdown; check link mechanical connections."
+      actions_ko:
+        - "비치명적 NVSwitch SXid는 정보성 이벤트이며 Fabric Manager는 CUDA 작업을 중단하지 않습니다."
+        - "11004(ingress invalid ACL)는 잘못된 Fabric Manager 파티션 구성에서만 발생합니다. GPU NVLink 트래픽이 멈추고 GPU 드라이버가 Xid 45로 CUDA를 중단하므로 NVSwitch-audit 도구로 라우팅을 검증하고 guest VM을 재시작하세요."
+        - "단일 비트 ECC 오류(11012, 11021-11023, 12021, 12023, 15008, 15011, 19049, 19055, 19057, 19059, 19062, 19065, 19068, 19071, 24001-24003)는 하드웨어가 자동 보정하므로 영향이 없습니다. 20001(TX Replay)은 NVLink 처리량에 영향을 줍니다."
+        - "12028(egress non-posted PRIV)은 GPU를 멈추게 하고 Xid 45를 발생시키므로 guest VM을 재시작하세요. 19084(AN1 Heartbeat Timeout)는 보통 치명적 SXid와 동반되므로 모든 GPU와 NVSwitch를 재설정합니다. 22013(Minion Link DLREQ)은 안전하게 무시할 수 있습니다. 20012는 손상되었거나 일관되지 않은 링크 또는 조정되지 않은 종료를 뜻하므로 링크의 기계적 연결을 점검하세요."
+    - name: NVSwitch SXid Access And Trunk Link Failure
+      name_ko: NVSwitch SXid 액세스 및 트렁크 링크 장애
+      keywords: [sxid, "fatal sxid", "xid 74", "11001", "11009", "11013", "11018", "11019", "11020", "12001", "12002", "12022", "12024", "12025", "12026", "12027", "12030", "12031", "12032", "14017", "15001", "15006", "15009", "15010", "15012", "15013", "19047", "19048", "19054", "19056", "19058", "19060", "19061", "19063", "19064", "19066", "19067", "19069", "19070", "20034", "ltssm fault", "access port", "trunk port"]
+      actions:
+        - "A fatal NVSwitch SXid propagates to the GPU as Xid 74 and aborts the affected CUDA jobs. Determine the source port. On an ACCESS port (GPU↔NVSwitch), impact is limited to that guest VM; shut it down to recover. On a TRUNK port (NVSwitch↔NVSwitch between baseboards), shut down the partitions that cross the trunk (the 16-GPU partition and the 8-GPU 4-per-baseboard partitions), then recreate them."
+        - "Fatal codes are 11001, 11009, 11013, 11018-11020, 12001, 12002, 12022, 12024-12027, 12030-12032, 14017, 15001, 15006, 15009, 15010, 15012, 15013, 19047, 19048, 19054, 19056, 19058, 19060, 19061, 19063, 19064, 19066, 19067, 19069, 19070, and 20034."
+        - "20034 (LTSSM Fault Up) means a link went down from active: on A100 restart the VM; on H100 reset the GPU. Reset the GPU with `nvidia-smi -r`; reboot or power-cycle if it persists."
+        - "On 4th-generation NVSwitch systems (DGX/HGX B200/B300), this Fabric Manager fatal/non-fatal SXid error-reporting model does not apply: DCGM interfaces with the NVIDIA Switch Device Manager (NVSDM) instead."
+      actions_ko:
+        - "치명적 NVSwitch SXid는 GPU에 Xid 74로 전파되어 영향받은 CUDA 작업을 중단합니다. 발생 포트를 확인하세요. ACCESS 포트(GPU↔NVSwitch)에서는 해당 guest VM에만 영향이 있으므로 복구를 위해 VM을 종료합니다. TRUNK 포트(베이스보드 사이 NVSwitch↔NVSwitch)에서는 트렁크를 지나는 파티션(16-GPU 파티션 및 베이스보드당 4개씩인 8-GPU 파티션)을 종료한 후 다시 생성합니다."
+        - "치명적 코드는 11001, 11009, 11013, 11018-11020, 12001, 12002, 12022, 12024-12027, 12030-12032, 14017, 15001, 15006, 15009, 15010, 15012, 15013, 19047, 19048, 19054, 19056, 19058, 19060, 19061, 19063, 19064, 19066, 19067, 19069, 19070, 20034입니다."
+        - "20034(LTSSM Fault Up)은 활성 상태였던 링크가 내려갔음을 뜻합니다. A100에서는 VM을 재시작하고 H100에서는 GPU를 재설정하세요. `nvidia-smi -r`로 GPU를 재설정하고 지속되면 재부팅하거나 전원 재인가합니다."
+        - "4세대 NVSwitch 시스템(DGX/HGX B200/B300)에는 이 Fabric Manager 치명적/비치명적 SXid 오류 보고 모델이 적용되지 않습니다. 대신 DCGM이 NVIDIA Switch Device Manager(NVSDM)와 연동합니다."
+    - name: NVSwitch SXid — Always Fatal
+      name_ko: NVSwitch SXid — 항상 치명적
+      keywords: [sxid, "always fatal", "12020", "22003", "22011", "23001", "23002", "23003", "23004", "23005", "23006", "23007", "23008", "23009", "23010", "23011", "23012", "23013", "23014", "23015", "23016", "23017", "minion halt", sbr]
+      actions:
+        - "Always-fatal NVSwitch SXids take down the entire fabric/system. Shut down all guest VM partitions, then either restart the host, or SBR (secondary-bus reset) the NVSwitches and GPUs and restart the service VM."
+        - "Codes are 12020 (egress sequence ID error), 22003 (Minion Halt), 22011 (Minion exterror), and 23001-23017 (ingress/egress SRC-VC/DST-VC buffer over/underflow, packet burst/sticky/invalid-dst/parity, and credit parity)."
+      actions_ko:
+        - "항상 치명적인 NVSwitch SXid는 전체 패브릭/시스템을 중단시킵니다. 모든 guest VM 파티션을 종료한 뒤 호스트를 재시작하거나, NVSwitch와 GPU를 SBR(secondary-bus reset)하고 service VM을 재시작하세요."
+        - "코드는 12020(egress sequence ID error), 22003(Minion Halt), 22011(Minion exterror), 23001-23017(ingress/egress SRC-VC/DST-VC 버퍼 over/underflow, packet burst/sticky/invalid-dst/parity, credit parity)입니다."
+    - name: NVSwitch SXid — Other Notable
+      name_ko: NVSwitch SXid — 기타 주요 이벤트
+      keywords: [sxid, "10001", "10002", "10003", "10004", "10005", host_priv_error, host_unhandled_interrupt, "thermal event", "single lane"]
+      actions:
+        - "10001 (Host_priv_error) and 10002 (Host_priv_timeout) are not fatal but may precede fatal events. 10003 (Host_unhandled_interrupt) is never expected and is fatal to the fabric; reset all GPUs and NVSwitches."
+        - "10004 (Host_thermal_event_start) indicates insufficient cooling and forces NVSwitch links into single-lane (power-saving) mode, reducing NVLink throughput; check node cooling and thermals. 10005 is Host_thermal_event_end. The full SXid list is in NVIDIA/open-gpu-kernel-modules."
+      actions_ko:
+        - "10001(Host_priv_error)과 10002(Host_priv_timeout)는 치명적이지 않지만 치명적 이벤트에 선행할 수 있습니다. 10003(Host_unhandled_interrupt)는 절대 예상되지 않으며 패브릭에 치명적이므로 모든 GPU와 NVSwitch를 재설정하세요."
+        - "10004(Host_thermal_event_start)는 냉각 부족을 뜻하며 NVSwitch 링크를 단일 레인(절전) 모드로 강제해 NVLink 처리량을 낮춥니다. 노드 냉각과 열 상태를 점검하세요. 10005는 Host_thermal_event_end입니다. 전체 SXid 목록은 NVIDIA/open-gpu-kernel-modules에 있습니다."
+    - name: Fabric Partition Life-Cycle Errors
+      name_ko: Fabric 파티션 수명 주기 오류
+      keywords: [fm_st_, shared_fabric_mode, partition, fm_st_badparam, fm_st_not_supported, fm_st_not_configured, fm_st_uninitialized, fm_st_in_use, fm_st_generic_error, fm_st_version_mismatch, fm_st_timeout]
+      actions:
+        - "Fabric Manager SDK partition APIs for Shared NVSwitch/vGPU multitenancy return FM_ST_BADPARAM for an invalid partition ID or parameters; use IDs from `fmGetSupportedFabricPartitions()`. FM_ST_NOT_SUPPORTED means Fabric Manager was not started with the required mode: set `SHARED_FABRIC_MODE=1` for Shared NVSwitch or `=2` for vGPU, then restart Fabric Manager."
+        - "FM_ST_NOT_CONFIGURED means APIs were called before Fabric Manager completed initialization; wait. FM_ST_UNINITIALIZED means `fmLibInit()` was not called or the partition is already deactivated. FM_ST_IN_USE means the partition is already active or its GPUs are used by another active partition."
+        - "For FM_ST_GENERIC_ERROR or FM_ST_TIMEOUT, check syslog for detail. FM_ST_VERSION_MISMATCH means the client was built against a different Fabric Manager package than the service VM runs; match the Fabric Manager versions."
+      actions_ko:
+        - "Shared NVSwitch/vGPU 멀티테넌시용 Fabric Manager SDK 파티션 API에서 FM_ST_BADPARAM은 잘못된 파티션 ID 또는 매개변수를 뜻하므로 `fmGetSupportedFabricPartitions()`의 ID를 사용하세요. FM_ST_NOT_SUPPORTED는 필요한 모드로 Fabric Manager를 시작하지 않았음을 뜻합니다. Shared NVSwitch는 `SHARED_FABRIC_MODE=1`, vGPU는 `=2`로 설정한 후 Fabric Manager를 재시작하세요."
+        - "FM_ST_NOT_CONFIGURED는 Fabric Manager 초기화가 끝나기 전에 API를 호출했음을 뜻하므로 기다리세요. FM_ST_UNINITIALIZED는 `fmLibInit()`를 호출하지 않았거나 파티션이 이미 비활성화되었음을 뜻합니다. FM_ST_IN_USE는 파티션이 이미 활성 상태이거나 해당 GPU가 다른 활성 파티션에서 사용 중임을 뜻합니다."
+        - "FM_ST_GENERIC_ERROR 또는 FM_ST_TIMEOUT이면 syslog에서 세부 내용을 확인하세요. FM_ST_VERSION_MISMATCH는 클라이언트가 service VM에서 실행 중인 것과 다른 Fabric Manager 패키지로 빌드됐음을 뜻하므로 Fabric Manager 버전을 일치시키세요."
+    - name: GPU/NVSwitch Reset Capabilities And Limitations
+      name_ko: GPU/NVSwitch 재설정 기능 및 제한
+      keywords: [reset, "nvidia-smi -r", "gpu reset", passthrough, "service vm", sbr]
+      actions:
+        - "Reset support depends on deployment. On bare metal, reset one GPU individually or reset all GPUs together as root. In full-passthrough virtualization (all GPUs in one VM), individual GPU reset is not supported; restart the VM. Stop CUDA, X, and other `nvidia-smi` applications before any reset."
+        - "On Ampere+NVSwitch with Fabric Manager running, reset a GPU individually and Fabric Manager automatically resets the NVSwitch links. With Fabric Manager not running, individual reset is not possible; reset all GPUs and NVSwitches."
+        - "On Hopper+NVSwitch, bare-metal individual GPU reset works. In a VM it depends on hypervisor permissions; restarting the VM restarts the GPUs."
+      actions_ko:
+        - "재설정 지원은 배포 방식에 따라 다릅니다. 베어메탈에서는 root로 GPU 하나를 개별 재설정하거나 모든 GPU를 함께 재설정할 수 있습니다. 전체 passthrough 가상화(한 VM에 모든 GPU)에서는 개별 GPU 재설정이 지원되지 않으므로 VM을 재시작해야 합니다. 어떤 재설정 전에도 CUDA, X 및 다른 `nvidia-smi` 애플리케이션을 중지하세요."
+        - "Fabric Manager가 실행 중인 Ampere+NVSwitch에서는 GPU를 개별 재설정하면 Fabric Manager가 NVSwitch 링크를 자동 재설정합니다. Fabric Manager가 실행 중이 아니면 개별 재설정은 불가능하며 모든 GPU와 NVSwitch를 재설정해야 합니다."
+        - "Hopper+NVSwitch에서는 베어메탈 개별 GPU 재설정이 동작합니다. VM에서는 hypervisor 권한에 따라 다르며 VM을 재시작하면 GPU도 재시작됩니다."
+    - name: Fabric Manager Initialization Failure Or Degraded
+      name_ko: Fabric Manager 초기화 실패 또는 성능 저하
+      keywords: ["fabric manager", initialization, "fm_stay_resident", "not yet initialized", degraded]
+      actions:
+        - "Fabric Manager terminates on configuration or hardware initialization failure by default. `FM_STAY_RESIDENT_ON_FAILURES=1` keeps it resident, but the system remains UNINITIALIZED and CUDA fails."
+        - "Check `journalctl -u nvidia-fabricmanager` or `/var/log/fabricmanager.log`, verify driver compatibility (minimum R450 on older systems and R570+ for B200/B300), then run `systemctl restart nvidia-fabricmanager`."
+        - "The RCA system agent can pull `fabricmanager` (nvidia-fabricmanager journal), `nvidia-smi`, and `nvlink` sources for this node."
+      actions_ko:
+        - "Fabric Manager는 기본적으로 구성 또는 하드웨어 초기화에 실패하면 종료합니다. `FM_STAY_RESIDENT_ON_FAILURES=1`은 프로세스를 상주시켜도 시스템은 UNINITIALIZED 상태로 남아 CUDA가 실패합니다."
+        - "`journalctl -u nvidia-fabricmanager` 또는 `/var/log/fabricmanager.log`를 확인하고 드라이버 호환성(구형 시스템 최소 R450, B200/B300은 R570 이상)을 검증한 뒤 `systemctl restart nvidia-fabricmanager`를 실행합니다."
+        - "RCA 시스템 에이전트는 이 노드에서 `fabricmanager`(nvidia-fabricmanager journal), `nvidia-smi`, `nvlink` 소스를 수집할 수 있습니다."
+    - name: GPU Fabric Registration Incomplete
+      name_ko: GPU 패브릭 등록 미완료
+      keywords: [cudaerrorsystemnotready, "system not yet initialized", "fabric state", registration]
+      actions:
+        - "On H100/NVSwitch systems, a CUDA launch before Fabric Manager finishes registration fails with cudaErrorSystemNotReady."
+        - "Run `nvidia-smi -q -i <gpu> | grep -A2 Fabric` and wait for `State: Completed` and `Status: Success`; `In Progress` means registration is still running. Restart Fabric Manager if it is hung."
+        - "The RCA system agent can pull `fabricmanager` (nvidia-fabricmanager journal), `nvidia-smi`, and `nvlink` sources for this node."
+      actions_ko:
+        - "H100/NVSwitch 시스템에서는 Fabric Manager가 등록을 끝내기 전에 CUDA를 실행하면 cudaErrorSystemNotReady로 실패합니다."
+        - "`nvidia-smi -q -i <gpu> | grep -A2 Fabric`를 실행해 `State: Completed`와 `Status: Success`가 될 때까지 기다립니다. `In Progress`는 아직 등록 중이라는 뜻이며 멈췄다면 Fabric Manager를 재시작합니다."
+        - "RCA 시스템 에이전트는 이 노드에서 `fabricmanager`(nvidia-fabricmanager journal), `nvidia-smi`, `nvlink` 소스를 수집할 수 있습니다."
+    - name: NVLink High Availability Failure Modes
+      name_ko: NVLink 고가용성 장애 모드
+      keywords: [fm_stay_resident_on_failures, access_link_failure_mode, trunk_link_failure_mode, nvswitch_failure_mode, abort_cuda_jobs_on_fm_exit, "high availability", "failure mode"]
+      actions:
+        - "Fabric Manager HA configuration defaults in `/usr/share/nvidia/nvswitch/fabricmanager.cfg` are `FM_STAY_RESIDENT_ON_FAILURES=0`, `ACCESS_LINK_FAILURE_MODE=0`, `TRUNK_LINK_FAILURE_MODE=0`, `NVSWITCH_FAILURE_MODE=0`, and `ABORT_CUDA_JOBS_ON_FM_EXIT=1`."
+        - "A100 bare metal/passthrough: TRUNK 0 exits Fabric Manager leaving NVLinks uninitialized; TRUNK 1 disables the NVSwitch and its peer, reducing P2P bandwidth. NVSWITCH 0 aborts Fabric Manager; NVSWITCH 1 disables the switch and peer. ACCESS 0 removes the failed GPU from NVLink P2P; ACCESS 1 disables the switch and peer. `ABORT_CUDA_JOBS_ON_FM_EXIT=0` does not abort running jobs (new launches fail), while `=1` aborts all jobs."
+        - "A100 Shared NVSwitch/vGPU: TRUNK 0 removes partitions using the trunk; TRUNK 1 disables the switch and peer, leaving all partitions available with reduced bandwidth. ACCESS 0 disables partitions using the failed GPU; ACCESS 1 disables the switch and peer."
+        - "H100 ignores TRUNK/NVSWITCH/ACCESS mode settings: H100 has no NVLink trunk links; if a switch is unavailable, GPUs fail fabric registration and CUDA launch fails; after an access-link failure, `nvidia-smi` shows an inactive NVLink. `ABORT_CUDA_JOBS_ON_FM_EXIT` is not effective on H100/HGX H100+ (bare metal and full passthrough only)."
+      actions_ko:
+        - "`/usr/share/nvidia/nvswitch/fabricmanager.cfg`의 Fabric Manager HA 기본 설정은 `FM_STAY_RESIDENT_ON_FAILURES=0`, `ACCESS_LINK_FAILURE_MODE=0`, `TRUNK_LINK_FAILURE_MODE=0`, `NVSWITCH_FAILURE_MODE=0`, `ABORT_CUDA_JOBS_ON_FM_EXIT=1`입니다."
+        - "A100 베어메탈/passthrough: TRUNK 0은 NVLink를 초기화하지 않은 채 Fabric Manager를 종료하고, TRUNK 1은 NVSwitch와 peer를 비활성화하여 P2P 대역폭을 줄입니다. NVSWITCH 0은 Fabric Manager를 중단하고, NVSWITCH 1은 스위치와 peer를 비활성화합니다. ACCESS 0은 실패한 GPU를 NVLink P2P에서 제거하고, ACCESS 1은 스위치와 peer를 비활성화합니다. `ABORT_CUDA_JOBS_ON_FM_EXIT=0`은 실행 중인 작업을 중단하지 않지만 새 실행은 실패하며, `=1`은 모든 작업을 중단합니다."
+        - "A100 Shared NVSwitch/vGPU: TRUNK 0은 트렁크를 사용하는 파티션을 제거하고, TRUNK 1은 스위치와 peer를 비활성화하지만 모든 파티션은 줄어든 대역폭으로 사용할 수 있습니다. ACCESS 0은 실패한 GPU를 사용하는 파티션을 비활성화하고, ACCESS 1은 스위치와 peer를 비활성화합니다."
+        - "H100은 TRUNK/NVSWITCH/ACCESS 모드 설정을 무시합니다. H100에는 NVLink 트렁크 링크가 없으며, 스위치를 사용할 수 없으면 GPU의 fabric 등록이 실패하고 CUDA 실행도 실패합니다. ACCESS 링크 장애 뒤에는 `nvidia-smi`가 비활성 NVLink를 표시합니다. `ABORT_CUDA_JOBS_ON_FM_EXIT`는 H100/HGX H100+에서 효과가 없으며(베어메탈 및 전체 passthrough에만 해당) 적용되지 않습니다."
+    - name: MIG Mode Disables NVLink
+      name_ko: MIG 모드가 NVLink를 비활성화함
+      keywords: [mig, "mig mode", nvlink, "peer-to-peer"]
+      actions:
+        - "Enabling MIG on a GPU disables its NVLinks and drops peer-to-peer connectivity. If multi-GPU NVLink workloads fail, check `nvidia-smi` for MIG mode."
+        - "Disable MIG so Fabric Manager can retrain the NVLinks; Fabric Manager must be running. The RCA system agent can pull `fabricmanager` (nvidia-fabricmanager journal), `nvidia-smi`, and `nvlink` sources for this node."
+      actions_ko:
+        - "GPU에서 MIG를 활성화하면 해당 GPU의 NVLink가 비활성화되고 peer-to-peer 연결이 사라집니다. 다중 GPU NVLink 작업이 실패하면 `nvidia-smi`로 MIG 모드를 확인합니다."
+        - "Fabric Manager가 실행 중인 상태에서 MIG를 비활성화하여 NVLink를 다시 훈련시킵니다. RCA 시스템 에이전트는 이 노드에서 `fabricmanager`(nvidia-fabricmanager journal), `nvidia-smi`, `nvlink` 소스를 수집할 수 있습니다."
     # --- added from the NVIDIA Network Operator troubleshooting guide ---
     # docs.nvidia.com/dgx-superpod/dgx-explained/network-operator/latest/common-issues-troubleshooting.html
     - name: NicClusterPolicy Not Ready / RDMA Stack Missing
