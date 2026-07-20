@@ -976,6 +976,58 @@ async def test_chat_without_detail_reports_runtime_state() -> None:
     assert "No specific incident or alert RCA content is attached yet" not in response.answer
 
 
+def test_kg_grounding_lines_formats_and_gates() -> None:
+    from app.services.kg_enrichment import KGContext
+    from app.services.orchestrator import _kg_grounding_lines
+
+    # Unavailable graph, or an available one with no facts → nothing appended.
+    assert _kg_grounding_lines(KGContext(enabled=True, available=False), "en") == []
+    assert _kg_grounding_lines(KGContext(enabled=True, available=True), "en") == []
+
+    kg = KGContext(
+        enabled=True,
+        available=True,
+        blast_radius_workloads=2,
+        blast_radius_workload_names=["w1"],
+        knowledge={"gpu_hardware_error": [{"symptom": "Xid 79", "actions": ["drain", "RMA"]}]},
+        prior_incidents=[{"family": "gpu_hardware_error", "analysis_summary": "prior fell-off-bus"}],
+    )
+    text = "\n".join(_kg_grounding_lines(kg, "en"))
+    assert "Blast radius: 2" in text
+    assert "Xid 79" in text and "drain" in text
+    assert "Prior case [gpu_hardware_error]" in text
+
+
+@pytest.mark.anyio
+async def test_chat_folds_in_knowledge_graph(monkeypatch) -> None:
+    from app.services import orchestrator as orch_mod
+    from app.services.kg_enrichment import KGContext
+
+    async def fake_enrich(settings, target, similar=None):
+        assert target.alert_name == "RunaiContainerMemoryUsageWarning"
+        return KGContext(
+            enabled=True,
+            available=True,
+            knowledge={"workload_oom": [{"symptom": "container OOMKilled", "actions": ["raise memory limit"]}]},
+            prior_incidents=[{"family": "workload_oom", "analysis_summary": "prior OOM on same workload"}],
+        )
+
+    monkeypatch.setattr(orch_mod, "enrich", fake_enrich)
+    orchestrator = AnalysisOrchestrator(make_settings())
+    response = await orchestrator.chat(
+        ChatRequest(
+            message="원인이 뭐야",
+            incident_id="INC-1",
+            context={
+                "target": {"labels": {"alertname": "RunaiContainerMemoryUsageWarning", "namespace": "runai"}}
+            },
+        )
+    )
+    assert "container OOMKilled" in response.answer
+    assert "raise memory limit" in response.answer
+    assert "workload_oom" in response.answer
+
+
 @pytest.mark.anyio
 async def test_chat_uses_llm_when_configured(monkeypatch) -> None:
     settings = replace(

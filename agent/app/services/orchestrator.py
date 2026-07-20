@@ -29,6 +29,7 @@ from app.schemas import (
 )
 from app.services import pipeline
 from app.services.general_guidance import general_guidance_lines
+from app.services.kg_enrichment import KGContext, enrich
 from app.services.pipeline import (
     _build_settings_masker,
     _mask_model,
@@ -344,6 +345,11 @@ class AnalysisOrchestrator:
             failure_modes=load_failure_modes(self._settings.failure_modes_file),
             known_issues=load_runai_known_issues(self._settings.runai_known_issues_file),
         )
+        # Ground chat in the SAME TypeDB knowledge graph the incident pipeline
+        # uses (prior cases + curated per-family knowledge for this alert), so the
+        # copilot answers from the ontology, not just the loaded report text. This
+        # single string flows into both the deterministic answer and the LLM loop.
+        grounding = await self._append_kg_grounding(context, grounding, language)
         answer = grounding
         if chat_llm_configured:
             try:
@@ -380,6 +386,31 @@ class AnalysisOrchestrator:
             conversation_id=request.conversation_id or f"chat-{uuid4().hex[:10]}",
         )
         return _mask_model(response, ChatResponse, self._masker)
+
+    async def _append_kg_grounding(
+        self, context: dict[str, object], grounding: str, language: str
+    ) -> str:
+        """Query the knowledge graph for this alert and fold its facts into the
+        chat grounding. Best-effort: a no-op when TypeDB is off (enrich returns
+        disabled) or no alert target was forwarded (general cluster chat)."""
+        target_ctx = context.get("target")
+        labels = target_ctx.get("labels") if isinstance(target_ctx, dict) else None
+        if not isinstance(labels, dict) or not labels:
+            return grounding
+        annotations = target_ctx.get("annotations") if isinstance(target_ctx, dict) else {}
+        try:
+            target = resolve_target(
+                {str(k): str(v) for k, v in labels.items() if v is not None},
+                {str(k): str(v) for k, v in (annotations or {}).items() if v is not None},
+            )
+            kg = await enrich(self._settings, target, context.get("similar_incidents"))
+            kg_lines = _kg_grounding_lines(kg, language)
+        except Exception as exc:  # noqa: BLE001 - grounding enrichment is best-effort
+            _log.warning("chat knowledge-graph grounding skipped: %s", exc)
+            return grounding
+        if kg_lines:
+            return grounding + "\n\n" + "\n".join(kg_lines)
+        return grounding
 
     async def _llm_chat_answer(
         self, request: ChatRequest, grounding: str
@@ -476,6 +507,41 @@ _CHAT_STRINGS = {
         ),
     },
 }
+
+
+def _kg_grounding_lines(kg: KGContext, language: str) -> list[str]:
+    """Compact, readable knowledge-graph facts for the chat grounding: prior cases
+    and curated per-family knowledge the ontology holds for this alert. Empty when
+    the graph is unavailable or has nothing for this alert."""
+    if not getattr(kg, "available", False):
+        return []
+    lines: list[str] = []
+    if kg.blast_radius_workloads:
+        names = ", ".join(kg.blast_radius_workload_names[:5])
+        label = "영향 범위" if language == "ko" else "Blast radius"
+        extent = (
+            f"{kg.blast_radius_workloads}개 워크로드 (같은 노드)"
+            if language == "ko"
+            else f"{kg.blast_radius_workloads} workload(s) on the same node"
+        )
+        lines.append(f"- {label}: {extent}" + (f" ({names})" if names else ""))
+    for family, items in list((kg.knowledge or {}).items())[:4]:
+        for item in (items or [])[:2]:
+            symptom = str(item.get("symptom") or "").strip()
+            actions = "; ".join(str(a) for a in (item.get("actions") or [])[:3])
+            if not (symptom or actions):
+                continue
+            lines.append(f"- [{family}] {symptom or family}" + (f" → {actions}" if actions else ""))
+    prior_label = "유사 사례" if language == "ko" else "Prior case"
+    for prior in (kg.prior_incidents or [])[:3]:
+        family = str(prior.get("family") or "").strip()
+        summary = " ".join(str(prior.get("analysis_summary") or "").split())[:160]
+        if summary:
+            lines.append(f"- {prior_label}" + (f" [{family}]" if family else "") + f": {summary}")
+    if not lines:
+        return []
+    header = "지식 그래프 (온톨로지)" if language == "ko" else "Knowledge graph (ontology)"
+    return [f"## {header}", ""] + lines
 
 
 def _chat_answer_from_context(
