@@ -36,7 +36,10 @@ from app.masking import build_masker
 # ponytail: flat regex list, not a rule engine — add patterns here as they show up.
 _ERROR_PATTERNS = re.compile(
     r"(?i)("
-    r"\bxid\b|nvrm|nvlink|fell off the bus|"  # NVIDIA GPU driver / fabric
+    r"\bxid\b|\bsxid\b|nvrm|nvlink|nvswitch|fell off the bus|"  # NVIDIA GPU / NVSwitch / NVLink
+    # Fabric Manager fault signals so fabricmanager-source SXid/init/partition lines
+    # reach the failure_modes signature matcher (network_fabric_error knowledge).
+    r"not yet initialized|cudaerrorsystemnotready|\bfm_st_|"  # Fabric Manager init / partition
     r"\boom\b|out of memory|oom-kill|"  # memory pressure
     r"i/o error|ext4-fs error|ext4_|xfs_|\bxfs\b|"  # filesystem / disk
     r"mce:|machine check|hardware error|"  # CPU/hardware

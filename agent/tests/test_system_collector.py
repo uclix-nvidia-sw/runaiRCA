@@ -663,3 +663,27 @@ async def test_system_log_query_refuses_unsafe_grep_and_line_limit(
 
     assert too_many["error"] == "lines must be between 1 and 1000"
     assert unsafe["error"] == "grep must not contain control characters"
+
+
+def test_fabric_manager_evidence_reaches_the_knowledge_matcher() -> None:
+    """End-to-end delivery chain for Fabric Manager incidents: a fabricmanager
+    log line the system agent gathers must be (A) surfaced by the error filter
+    (not dropped) AND (B) matched by the loaded network_fabric_error knowledge,
+    so the RCA actually references the FM/SXid troubleshooting knowledge."""
+    from app.collectors.system import _ERROR_PATTERNS
+    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+
+    modes = load_failure_modes("knowledge/failure_modes.yaml")
+
+    def chain(line: str) -> bool:
+        return bool(_ERROR_PATTERNS.search(line)) and any(
+            family == "network_fabric_error"
+            for family, _ in match_failure_mode_symptoms(modes, line, "")
+        )
+
+    # SXid codes flow capture -> matcher -> the correct severity symptom.
+    assert chain("nvswitch: SXid 23001 egress DST-VC credit overflow")  # always-fatal
+    assert chain("SXid 20034 LTSSM Fault Up; GPU reported Xid 74")  # fatal
+    assert chain("fmActivateFabricPartition failed: FM_ST_IN_USE")  # partition life-cycle
+    # Fabric Manager init failure signal is at least captured (was dropped before).
+    assert _ERROR_PATTERNS.search("nvidia-fabricmanager: GPU system not yet initialized")
