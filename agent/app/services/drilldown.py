@@ -38,11 +38,13 @@ from hashlib import sha256
 from typing import Any
 
 from app.collectors.base import (
+    NO_EVIDENCE,
     AnalysisTarget,
     CollectorResult,
     artifact,
     causal_evidence_time_range,
     incident_time_range,
+    ko_en,
     kubernetes_salient_markers,
     salient_markers,
     signals_line,
@@ -558,6 +560,16 @@ async def _run_query(
     summary = str(outcome.get("summary") or error or name)
     if markers:
         summary = f"{summary} — {signals_line(markers, getattr(settings, 'language', 'en'))}"
+    # A query the agent wrote itself that came back malformed (400 / parse /
+    # syntax) is not a finding — mark it no-evidence so the trail hides it,
+    # exactly like a failed exec probe. Real failures (auth, 404, timeout,
+    # backend 5xx) keep their error summary and stay visible.
+    if error and _query_failure_category(outcome, str(error)) == "invalid_request":
+        summary = f"{NO_EVIDENCE} " + ko_en(
+            settings,
+            "질의 구문이 잘못되어 실행되지 않았습니다.",
+            "The query was malformed and did not run.",
+        )
     result.artifacts.append(
         artifact(
             agent=result.agent,
