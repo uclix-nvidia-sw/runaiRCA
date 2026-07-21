@@ -1459,6 +1459,43 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
                 ),
                 "call": _tool_runai_project_metrics,
             },
+            "runai_workload_effective_policy": {
+                "description": (
+                    "Read official Run:ai MCP effective policy rules and defaults for "
+                    "workload types in the alert's project. No arguments; unavailable "
+                    "when the alert has no project."
+                ),
+                "call": _tool_runai_workload_effective_policy,
+            },
+            "runai_department_resources": {
+                "description": (
+                    "Read official Run:ai MCP department quota by node pool. No "
+                    "arguments; reads all departments when the alert has no department "
+                    "label."
+                ),
+                "call": _tool_runai_department_resources,
+            },
+            "runai_cluster_physical_inventory": {
+                "description": (
+                    "Read official Run:ai MCP GPU-node/model physical inventory and "
+                    "total, allocatable, allocated, and free GPUs. No arguments."
+                ),
+                "call": _tool_runai_cluster_physical_inventory,
+            },
+            "runai_cluster_infrastructure_health": {
+                "description": (
+                    "Read official Run:ai MCP degraded nodes and their Kubernetes "
+                    "conditions and taints. No arguments."
+                ),
+                "call": _tool_runai_cluster_infrastructure_health,
+            },
+            "runai_cluster_metrics": {
+                "description": (
+                    "Read official Run:ai MCP GPU/CPU capacity and utilization trends "
+                    "over the incident window. No arguments."
+                ),
+                "call": _tool_runai_cluster_metrics,
+            },
             "runai_node_pools": {
                 "description": (
                     "List Run:ai node pools available to the configured identity. "
@@ -2173,6 +2210,83 @@ async def _tool_runai_project_metrics(
         arguments=arguments,
         title_ko="Run:ai 프로젝트 메트릭",
         title_en="Run:ai project metrics",
+    )
+
+
+async def _tool_runai_workload_effective_policy(
+    settings: Settings, target: AnalysisTarget, _args: dict
+) -> dict:
+    if not target.project:
+        error = "alert has no Run:ai project"
+        return {
+            "query": "MCP get_workload_effective_policy",
+            "title": _title(
+                settings, "Run:ai 워크로드 유효 정책", "Run:ai workload effective policy"
+            ),
+            "summary": error,
+            "error": error,
+        }
+    return await _official_runai_tool(
+        settings,
+        tool="get_workload_effective_policy",
+        arguments={"projectName": target.project},
+        title_ko="Run:ai 워크로드 유효 정책",
+        title_en="Run:ai workload effective policy",
+    )
+
+
+async def _tool_runai_department_resources(
+    settings: Settings, target: AnalysisTarget, _args: dict
+) -> dict:
+    arguments = {"departmentName": target.department} if target.department else {}
+    return await _official_runai_tool(
+        settings,
+        tool="list_department_resources",
+        arguments=arguments,
+        title_ko="Run:ai 부서 리소스",
+        title_en="Run:ai department resources",
+    )
+
+
+async def _tool_runai_cluster_physical_inventory(
+    settings: Settings, _target: AnalysisTarget, _args: dict
+) -> dict:
+    return await _official_runai_tool(
+        settings,
+        tool="get_cluster_physical_inventory",
+        arguments={},
+        title_ko="Run:ai 클러스터 물리 인벤토리",
+        title_en="Run:ai cluster physical inventory",
+    )
+
+
+async def _tool_runai_cluster_infrastructure_health(
+    settings: Settings, _target: AnalysisTarget, _args: dict
+) -> dict:
+    return await _official_runai_tool(
+        settings,
+        tool="get_cluster_infrastructure_health",
+        arguments={},
+        title_ko="Run:ai 클러스터 인프라 상태",
+        title_en="Run:ai cluster infrastructure health",
+    )
+
+
+async def _tool_runai_cluster_metrics(
+    settings: Settings, target: AnalysisTarget, _args: dict
+) -> dict:
+    arguments: dict[str, str] = {}
+    time_range = incident_time_range(target) or {}
+    if time_range.get("start") and time_range.get("end"):
+        arguments.update(
+            {"start": str(time_range["start"]), "end": str(time_range["end"])}
+        )
+    return await _official_runai_tool(
+        settings,
+        tool="get_cluster_metrics",
+        arguments=arguments,
+        title_ko="Run:ai 클러스터 메트릭",
+        title_en="Run:ai cluster metrics",
     )
 
 

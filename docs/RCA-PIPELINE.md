@@ -105,7 +105,7 @@ Each collector owns one domain and returns a `CollectorResult` (summary +
 
 | Collector | Owns |
 |---|---|
-| **runai** | Run:ai API workload/project/queue/quota/version context (optionally via the [runai-mcp service](#run-ai-mcp-service), 426 APIs) |
+| **runai** | Run:ai workload/project/queue/quota/version context (optionally via the [official Run:ai MCP service](#run-ai-mcp-service), focused read-only set of 16 tools) |
 | **kubernetes** | Workload pods/events, Run:ai control-plane pod health, node conditions, scheduling blockers; optional denylist-gated read-only pod-exec |
 | **prometheus** | Queue/project GPU metrics, pending/restart/resource signals |
 | **loki** | Workload logs + `runai`/`runai-backend` control-plane logs |
@@ -322,11 +322,11 @@ drill-down query — are hidden from the evidence trail.
 ## Run:ai MCP Service
 
 When `RUNAI_MCP_URL` is set, the runai collector and the runai drill-down agent
-reach the [runai-mcp](https://github.com/sejongjeong/runai-mcp) server (deployed
-as a ClusterIP service behind mcp-proxy) for spec-aware access to the 426 Run:ai APIs. The
-Helm chart runs the service and sets the URL by default (`runaiMcp.enabled:
-true`). Any failure falls back to the fixed-endpoint direct-HTTP collector —
-strictly additive, never breaks analysis.
+use NVIDIA's official Run:ai MCP server: a focused, read-only set of 16 tools
+over OIDC-protected streamable HTTP at `/mcp`. The Helm chart deploys it as a
+shared ClusterIP service and sets the URL by default (`runaiMcp.enabled: true`).
+Any MCP failure falls back to direct Run:ai HTTP reads — strictly additive, never
+breaks analysis.
 
 ## Configuration
 

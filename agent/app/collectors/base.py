@@ -54,6 +54,10 @@ class AnalysisTarget:
     # node logs from that inferred location are useful context, not proof about
     # a historical alert unless Alertmanager named the node itself.
     node_source: str = ""
+    # Department is an optional Run:ai organization boundary. Keep it distinct
+    # from the project so department-scoped reads can deliberately remain
+    # unscoped when alert metadata does not supply one.
+    department: str = ""
 
 
 _INCIDENT_PRELUDE = timedelta(minutes=5)
@@ -638,6 +642,9 @@ def resolve_target(
             "alert"
             if value_from(labels, annotations, "node", "node_name", "kubernetes_node")
             else ""
+        ),
+        department=value_from(
+            labels, annotations, "department", "runai_department", "runai.io/department"
         ),
         # These are explicit alert metadata only.  In particular, do not guess
         # a Service/PVC from a workload or from free-form annotation prose.

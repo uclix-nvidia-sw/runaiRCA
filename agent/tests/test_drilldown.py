@@ -17,7 +17,12 @@ from app.services.drilldown import (
     _tool_k8s_logs,
     _tool_logql,
     _tool_promql,
+    _tool_runai_cluster_infrastructure_health,
+    _tool_runai_cluster_metrics,
+    _tool_runai_cluster_physical_inventory,
+    _tool_runai_department_resources,
     _tool_runai_project_resources,
+    _tool_runai_workload_effective_policy,
     _tool_runai_workload_status,
     _tool_runai_workload_summary,
     run_drilldowns,
@@ -1362,9 +1367,161 @@ def test_official_runai_registry_exposes_target_bound_read_tools() -> None:
         "runai_workload_metrics",
         "runai_project_resources",
         "runai_project_metrics",
+        "runai_workload_effective_policy",
+        "runai_department_resources",
+        "runai_cluster_physical_inventory",
+        "runai_cluster_infrastructure_health",
+        "runai_cluster_metrics",
         "runai_node_pools",
         "runai_node_pods",
     } <= set(tools)
+
+
+def test_runai_cluster_physical_inventory_returns_success_and_error_artifacts(monkeypatch) -> None:
+    class _Result:
+        isError = False
+        content = []
+
+    calls = iter([_Result(), RuntimeError("physical inventory unavailable")])
+
+    async def fake_mcp_call(settings, tool, arguments):
+        outcome = next(calls)
+        if isinstance(outcome, Exception):
+            raise outcome
+        assert tool == "get_cluster_physical_inventory"
+        assert arguments == {}
+        return outcome
+
+    monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
+    settings = drill_settings(runai_mcp_url="http://localhost:8080/mcp")
+
+    success = asyncio.run(_tool_runai_cluster_physical_inventory(settings, _target(), {}))
+    assert success["error"] is None
+    failed = asyncio.run(_tool_runai_cluster_physical_inventory(settings, _target(), {}))
+    assert "physical inventory unavailable" in failed["error"]
+
+
+def test_runai_cluster_infrastructure_health_returns_success_and_error_artifacts(
+    monkeypatch,
+) -> None:
+    class _Result:
+        isError = False
+        content = []
+
+    calls = iter([_Result(), RuntimeError("infrastructure health unavailable")])
+
+    async def fake_mcp_call(settings, tool, arguments):
+        outcome = next(calls)
+        if isinstance(outcome, Exception):
+            raise outcome
+        assert tool == "get_cluster_infrastructure_health"
+        assert arguments == {}
+        return outcome
+
+    monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
+    settings = drill_settings(runai_mcp_url="http://localhost:8080/mcp")
+
+    success = asyncio.run(
+        _tool_runai_cluster_infrastructure_health(settings, _target(), {})
+    )
+    assert success["error"] is None
+    failed = asyncio.run(_tool_runai_cluster_infrastructure_health(settings, _target(), {}))
+    assert "infrastructure health unavailable" in failed["error"]
+
+
+def test_runai_cluster_metrics_uses_incident_window_and_returns_error_artifact(monkeypatch) -> None:
+    class _Result:
+        isError = False
+        content = []
+
+    calls = iter([_Result(), RuntimeError("cluster metrics unavailable")])
+    captured: list[dict] = []
+
+    async def fake_mcp_call(settings, tool, arguments):
+        captured.append({"tool": tool, "arguments": arguments})
+        outcome = next(calls)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
+    settings = drill_settings(runai_mcp_url="http://localhost:8080/mcp")
+    target = replace(
+        _target(), fired_at="2025-01-01T00:00:00Z", resolved_at="2025-01-01T00:10:00Z"
+    )
+
+    assert asyncio.run(_tool_runai_cluster_metrics(settings, target, {}))["error"] is None
+    failed = asyncio.run(_tool_runai_cluster_metrics(settings, target, {}))
+    assert captured == [
+        {
+            "tool": "get_cluster_metrics",
+            "arguments": {"start": "2024-12-31T23:55:00Z", "end": "2025-01-01T00:15:00Z"},
+        },
+        {
+            "tool": "get_cluster_metrics",
+            "arguments": {"start": "2024-12-31T23:55:00Z", "end": "2025-01-01T00:15:00Z"},
+        },
+    ]
+    assert "cluster metrics unavailable" in failed["error"]
+
+
+def test_runai_department_resources_scopes_when_labeled_and_returns_error_artifact(
+    monkeypatch,
+) -> None:
+    class _Result:
+        isError = False
+        content = []
+
+    calls = iter([_Result(), _Result(), RuntimeError("department resources unavailable")])
+    captured: list[dict] = []
+
+    async def fake_mcp_call(settings, tool, arguments):
+        captured.append({"tool": tool, "arguments": arguments})
+        outcome = next(calls)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
+    settings = drill_settings(runai_mcp_url="http://localhost:8080/mcp")
+
+    assert asyncio.run(
+        _tool_runai_department_resources(settings, replace(_target(), department="research"), {})
+    )["error"] is None
+    assert asyncio.run(_tool_runai_department_resources(settings, _target(), {}))["error"] is None
+    failed = asyncio.run(_tool_runai_department_resources(settings, _target(), {}))
+    assert captured == [
+        {"tool": "list_department_resources", "arguments": {"departmentName": "research"}},
+        {"tool": "list_department_resources", "arguments": {}},
+        {"tool": "list_department_resources", "arguments": {}},
+    ]
+    assert "department resources unavailable" in failed["error"]
+
+
+def test_runai_workload_effective_policy_requires_project_and_returns_success(monkeypatch) -> None:
+    class _Result:
+        isError = False
+        content = []
+
+    captured: dict = {}
+
+    async def fake_mcp_call(settings, tool, arguments):
+        captured["tool"] = tool
+        captured["arguments"] = arguments
+        return _Result()
+
+    monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
+    settings = drill_settings(runai_mcp_url="http://localhost:8080/mcp")
+
+    assert asyncio.run(
+        _tool_runai_workload_effective_policy(settings, replace(_target(), project="vision"), {})
+    )["error"] is None
+    failed = asyncio.run(_tool_runai_workload_effective_policy(settings, _target(), {}))
+    assert captured == {
+        "tool": "get_workload_effective_policy",
+        "arguments": {"projectName": "vision"},
+    }
+    assert "no Run:ai project" in failed["error"]
 
 
 def test_change_tool_does_not_advertise_secret_backed_helm_scan_by_default() -> None:
