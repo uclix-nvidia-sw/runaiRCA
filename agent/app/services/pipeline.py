@@ -33,8 +33,8 @@ from app.knowledge import (
     component_check_lines,
     dependency_path,
     load_architecture,
-    load_family_catalog,
     load_failure_modes,
+    load_family_catalog,
     load_runai_known_issues,
     load_troubleshooting_cases,
     match_failure_mode_symptoms,
@@ -830,7 +830,7 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
         if _accepts_keyword(run_drilldowns, "deadline_monotonic"):
             drilldown_kwargs["deadline_monotonic"] = evidence_deadline
         if _accepts_keyword(run_drilldowns, "external_case_hints"):
-            observed_text = _observed_text(state.results, request)
+            observed_text = _observed_text(state.results, state.request)
             try:
                 if evidence_deadline is not None:
                     remaining = max(0.0, evidence_deadline - time.monotonic())
@@ -2590,14 +2590,14 @@ def _merge_reanalysis_context(
             ledger.append(item)
             by_family[family] = item
             continue
-        for field in ("evidence_for", "evidence_against"):
+        for field_name in ("evidence_for", "evidence_against"):
             values = [
                 value
-                for source in (prior.get(field), item.get(field))
+                for source in (prior.get(field_name), item.get(field_name))
                 for value in _ledger_evidence_values(source)
             ]
             if values:
-                item[field] = list(dict.fromkeys(values))
+                item[field_name] = list(dict.fromkeys(values))
     merged["hypothesis_ledger"] = ledger
     return merged
 
