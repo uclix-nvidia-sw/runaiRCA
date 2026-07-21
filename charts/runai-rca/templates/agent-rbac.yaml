@@ -36,6 +36,17 @@ rules:
       - resourcequotas
       - services
     verbs: ["get", "list", "watch"]
+  {{- if .Values.agent.env.enableHelmChangeDetection }}
+  # Helm change detection reads Helm v3 release Secrets (sh.helm.release.v1.*,
+  # owner=helm) to detect rollouts and diff release values. Kubernetes RBAC cannot
+  # scope a secrets LIST by label or name, so this grants broad Secret read within
+  # scope — gated on the opt-in flag (default false) so disabling the feature also
+  # drops the permission. SECURITY: enabling this lets the agent read every Secret
+  # it can reach; grant it only when Helm change detection is deliberately wanted.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+  {{- end }}
   # Ad-hoc read-only queries from the investigation loop (k8s_read kind allowlist).
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses"]
@@ -130,6 +141,16 @@ rules:
       - resourcequotas
       - services
     verbs: ["get", "list", "watch"]
+  {{- if $.Values.agent.env.enableHelmChangeDetection }}
+  # Helm change detection reads Helm v3 release Secrets (owner=helm) to detect
+  # rollouts and diff release values. Kubernetes RBAC cannot scope a secrets LIST
+  # by label or name, so this grants Secret read in the RBAC namespace(s) — gated
+  # on the opt-in flag (default false) so disabling the feature drops it.
+  # SECURITY: enabling this lets the agent read every Secret in scope.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+  {{- end }}
   # Read-only container log inspection (pods/log subresource).
   - apiGroups: [""]
     resources: ["pods/log"]

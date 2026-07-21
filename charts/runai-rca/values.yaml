@@ -442,9 +442,11 @@ agent:
     # Allow the Kubernetes agent to run read-only diagnostic commands (nvidia-smi,
     # etc.) via the pod exec subresource. Requires pods/exec RBAC (agent-rbac.yaml).
     enablePodExec: true
-    # Helm v3 history lives in Secrets. Keep this off with the chart's default
-    # least-privilege RBAC; enable only for a ServiceAccount explicitly allowed
-    # to list Secrets in the investigated namespaces.
+    # Helm v3 history lives in Secrets. Enabling this ALSO grants the agent
+    # ServiceAccount get/list on Secrets (agent-rbac.yaml, gated on this flag).
+    # RBAC cannot scope a secrets LIST to just Helm releases, so this is BROAD
+    # Secret read within the agent's RBAC scope. Keep off (least privilege)
+    # unless Helm rollout / value-diff evidence is deliberately wanted.
     enableHelmChangeDetection: false
     enableNatRuntime: true
     natConfigFile: /app/configs/runai_rca_engine.yml
