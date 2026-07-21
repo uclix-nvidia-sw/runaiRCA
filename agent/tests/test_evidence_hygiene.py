@@ -1426,13 +1426,12 @@ def test_blackboard_aliases_do_not_merge_same_summary_from_different_pods() -> N
     assert eligibility["E02"].support is True
 
 
-def test_causal_evidence_context_keeps_prelude_and_bounds_firing_alert() -> None:
+def test_causal_evidence_context_keeps_prelude_and_opens_firing_alert() -> None:
     """Causal eligibility includes the trigger prelude, not recovery epilogue.
 
-    The collectors inspect five minutes before firing and a bounded fifteen
-    minutes after a firing alert.  Treating a firing alert as a zero-width
-    instant discarded all later samples; including the collection epilogue for
-    resolved alerts would instead let recovery-only signals become a cause.
+    Historical collectors retain a bounded fifteen-minute firing query, while
+    causal eligibility admits target-scoped evidence observed while the alert
+    is still firing. Resolved alerts still exclude the recovery epilogue.
     """
     from app.progress import ProgressReporter
 
@@ -1446,7 +1445,7 @@ def test_causal_evidence_context_keeps_prelude_and_bounds_firing_alert() -> None
         collectors=[],
     )
     assert pipeline._evidence_context(state)["window_start"] == "2026-07-10T00:55:00Z"
-    assert pipeline._evidence_context(state)["window_end"] == "2026-07-10T01:15:00Z"
+    assert pipeline._evidence_context(state)["window_end"] != "2026-07-10T01:15:00Z"
 
     state.target = replace(target, resolved_at="2026-07-10T01:10:00Z")
     assert pipeline._evidence_context(state)["window_end"] == "2026-07-10T01:10:00Z"

@@ -85,25 +85,36 @@ def incident_time_range(target: AnalysisTarget) -> dict[str, str] | None:
     }
 
 
-def causal_evidence_time_range(target: AnalysisTarget) -> dict[str, str] | None:
+def causal_evidence_time_range(
+    target: AnalysisTarget, now: datetime | None = None
+) -> dict[str, str] | None:
     """Return the bounded time span that may substantiate an incident cause.
 
     Collection retains a short post-resolution epilogue so a collector can
     establish recovery, but an observation that first appears only after the
     alert resolved is not evidence of its cause.  The causal span therefore
     keeps the collection prelude (which can contain the trigger) while ending
-    at resolution.  For a firing alert, :func:`incident_time_range` already
-    substitutes the bounded 15-minute duration for the unknown end.
+    at resolution. For an unresolved alert, the failure remains active, so
+    target-scoped evidence observed at collection time is admissible even
+    though historical collectors retain their separately bounded query span.
     """
     window = incident_time_range(target)
     if window is None:
         return None
-    end = _parse_incident_time(window.get("end", ""))
-    if end is None:
+    fired = _parse_incident_time(target.fired_at)
+    if fired is None:
         return None
+    resolved = _parse_incident_time(target.resolved_at)
+    if resolved is None or resolved < fired:
+        end = now if now is not None else datetime.now(UTC)
+    else:
+        # Keep resolved-alert causality byte-for-byte aligned with the prior
+        # incident-window-derived result: recovery epilogue is query coverage,
+        # never causal support.
+        end = resolved
     return {
         "start": str(window.get("start") or ""),
-        "end": _format_incident_time(end - _INCIDENT_EPILOGUE),
+        "end": _format_incident_time(end),
     }
 
 

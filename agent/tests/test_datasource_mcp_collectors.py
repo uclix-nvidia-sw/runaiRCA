@@ -697,6 +697,67 @@ async def test_kubernetes_collector_uses_mcp_before_service_account_token(
 
 
 @pytest.mark.asyncio
+async def test_firing_alert_current_warning_is_scoped_support_and_snapshot_stays_unknown(
+    monkeypatch,
+) -> None:
+    async def fake_mcp_call(url, tool, arguments):
+        if tool == "resources_list" and arguments.get("kind") == "Event":
+            return _McpResult(
+                {
+                    "items": [
+                        {
+                            "metadata": {"namespace": "runai-vision"},
+                            "involvedObject": {"kind": "Pod", "name": "trainer-0"},
+                            "type": "Warning",
+                            "reason": "Failed",
+                            "message": "Error: ImagePullBackOff",
+                            "eventTime": "2026-07-20T23:51:40Z",
+                        }
+                    ]
+                }
+            )
+        if tool in {"pods_get", "resources_get"}:
+            return _McpResult(
+                {
+                    "metadata": {"name": "trainer-0", "namespace": "runai-vision"},
+                    "spec": {"containers": [{"name": "main", "resources": {}}]},
+                    "status": {
+                        "phase": "Running",
+                        "containerStatuses": [{"name": "main", "ready": True}],
+                    },
+                }
+            )
+        return _McpResult({"items": []})
+
+    def unavailable_token(path: str) -> str:
+        # A firing alert probes whether a bounded direct log read is available;
+        # an empty token keeps this test on the MCP path. The strict
+        # no-token-read invariant stays covered by the non-firing test above.
+        return ""
+
+    monkeypatch.setattr(kubernetes, "mcp_call", fake_mcp_call)
+    monkeypatch.setattr(kubernetes, "_read_file", unavailable_token)
+    firing_target = replace(make_target(), fired_at="2026-07-20T08:00:00Z", resolved_at="")
+    result = await kubernetes.KubernetesCollector(
+        replace(
+            make_settings(),
+            kubernetes_mcp_url="http://kubernetes-mcp/mcp",
+            enable_pod_exec=False,
+        )
+    ).collect(firing_target)
+
+    assert result.details["used_mcp"] is True
+    warning_events = next(a for a in result.artifacts if a.type == "kubernetes_warning_events")
+    assert warning_events.result["observation"]["polarity"] == "present"
+    assert warning_events.result["observation"]["coverage"] == "scoped"
+    # The live Pod snapshot must stay non-causal even while the alert fires:
+    # only the target-verified Warning event carries the scoped observation.
+    inspection = next(a for a in result.artifacts if a.type == "pod_inspection")
+    assert inspection.result["observation"]["polarity"] == "unknown"
+    assert inspection.result["observation"]["coverage"] == "partial"
+
+
+@pytest.mark.asyncio
 async def test_kubernetes_required_query_failure_keeps_other_mcp_evidence_partial(
     monkeypatch,
 ) -> None:

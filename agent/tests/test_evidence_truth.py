@@ -15,7 +15,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.collectors.base import CollectorResult, artifact
+from app.collectors import kubernetes as k8s
+from app.collectors.base import CollectorResult, artifact, salient_markers
 from app.collectors.kubernetes import (
     _collect_kubernetes_responses_via_mcp,
     _k8s_yaml_payload,
@@ -328,6 +329,32 @@ def test_k8s_yaml_payload_survives_secret_shaped_fields_and_masks_values() -> No
     assert parsed["status"]["phase"] == "Running"
     # Secrets are still masked — on the parsed object, not the serialized text.
     assert "abcdefghijklmnop" not in str(parsed)
+
+
+def test_k8s_mcp_parser_normalizes_go_cased_warning_event_for_signal_extraction() -> None:
+    class Result:
+        structuredContent = {
+            "InvolvedObject": {
+                "Kind": "Pod",
+                "Name": "permission-manager-67466b4f94-rj5d2",
+                "apiVersion": "v1",
+            },
+            "Message": "Error: ImagePullBackOff",
+            "Namespace": "permission-manager",
+            "Reason": "Failed",
+            "Timestamp": "2026-07-20 23:51:40 +0000 UTC",
+            "Type": "Warning",
+        }
+
+    parsed = k8s._k8s_mcp_payload(Result())
+
+    assert parsed["involvedObject"] == {
+        "kind": "Pod",
+        "name": "permission-manager-67466b4f94-rj5d2",
+        "apiVersion": "v1",
+    }
+    assert parsed["lastTimestamp"] == "2026-07-20 23:51:40 +0000 UTC"
+    assert salient_markers(parsed) == ["ImagePullBackOff"]
 
 
 @pytest.mark.asyncio
