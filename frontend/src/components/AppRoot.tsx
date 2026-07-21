@@ -841,6 +841,8 @@ function UnifiedWorkspace({
   const [operatorPinnedOverride, setOperatorPinnedOverride] = useState<boolean>();
   const closeTimerRef = useRef<number | null>(null);
   const approveTimerRef = useRef<number | null>(null);
+  const correctionTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const correctionFamilyRef = useRef<HTMLSelectElement | null>(null);
   const runWorkspaceAction = useCallback(async (action: string, work: () => Promise<void>) => {
     if (busyAction) return;
     setBusyAction(action);
@@ -887,6 +889,22 @@ function UnifiedWorkspace({
       setCorrectionError(`Root-cause family catalog unavailable: ${errorMessage(err, 'Failed to load catalog.')}`);
     });
     return () => { cancelled = true; };
+  }, [correctionOpen]);
+
+  useEffect(() => {
+    if (!correctionOpen) return undefined;
+    correctionFamilyRef.current?.focus();
+
+    const handleCorrectionKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      setCorrectionOpen(false);
+      correctionTriggerRef.current?.focus();
+    };
+
+    document.addEventListener('keydown', handleCorrectionKeyDown, true);
+    return () => document.removeEventListener('keydown', handleCorrectionKeyDown, true);
   }, [correctionOpen]);
 
   useEffect(() => {
@@ -1090,6 +1108,7 @@ function UnifiedWorkspace({
                 className="ghost-button"
                 disabled={Boolean(busyAction)}
                 onClick={() => setCorrectionOpen((open) => !open)}
+                ref={correctionTriggerRef}
                 type="button"
               >
                 <FileText size={16} /> RCA 수정
@@ -1173,6 +1192,7 @@ function UnifiedWorkspace({
               <label className="evaluation-field">
                 <span>Root-cause family</span>
                 <select
+                  ref={correctionFamilyRef}
                   value={correctionFamily}
                   onChange={(event) => setCorrectionFamily(event.target.value)}
                   disabled={correctionCatalogStatus !== 'ready' || Boolean(busyAction)}
