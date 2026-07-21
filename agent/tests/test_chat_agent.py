@@ -449,3 +449,24 @@ def test_is_cluster_scope_fallback_without_backend_scope() -> None:
         chat_agent._is_cluster_scope(ChatRequest(message="q", context={"alert": {"id": "A"}}))
         is False
     )
+
+
+def test_strip_tool_echo_drops_leading_history_blocks() -> None:
+    # 2026-07-21 incident: the model pasted gathered_so_far-format JSON ahead of
+    # its real answer after its <think> transcript was stripped by the transport.
+    echoed = (
+        '[{"tool": "k8s_read", "query": "kubectl get events -n runai-backend", '
+        '"summary": "HTTP 200", "result": "{}"}, '
+        '{"tool": "promql_query", "query": "up", "summary": "HTTP 200", "result": "{}"}]\n'
+        "\n### 답변\nthanos receive 파드는 1개뿐입니다."
+    )
+    assert chat_agent._strip_tool_echo(echoed) == "### 답변\nthanos receive 파드는 1개뿐입니다."
+
+
+def test_strip_tool_echo_keeps_inline_and_plain_answers() -> None:
+    plain = "파드 수는 `[{\"tool\": ...}]` 형식과 무관합니다."
+    assert chat_agent._strip_tool_echo(plain) == plain
+    # A list that is NOT tool-history shape stays (e.g. an answer starting with a
+    # legitimate JSON list the operator asked for).
+    listy = '[{"pod": "a"}, {"pod": "b"}] 두 파드가 실행 중입니다.'
+    assert chat_agent._strip_tool_echo(listy) == listy
