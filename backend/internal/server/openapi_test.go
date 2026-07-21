@@ -37,6 +37,9 @@ func TestOpenAPIContractIsServedAndContainsKnowledgeLifecycle(t *testing.T) {
 		"/api/v1/knowledge/runtime-snapshot",
 		"/api/v1/knowledge/probe-metrics",
 		"/api/v1/knowledge/families",
+		"/api/v1/incidents/{id}/rca-correction",
+		"/api/v1/incidents/{id}/rca-pin",
+		"/api/v1/incidents/{id}/reverify",
 	} {
 		if _, ok := spec.Paths[path]; !ok {
 			t.Fatalf("OpenAPI contract missing %s", path)

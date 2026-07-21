@@ -510,6 +510,7 @@ async def plan_investigation(
     kg_context: dict | None,
     similar_incidents: list | None,
     recent_changes: list[dict] | None = None,
+    seed_family: str = "",
 ) -> InvestigationPlan:
     kg_context = kg_context or {}
     similar_incidents = similar_incidents or []
@@ -524,6 +525,13 @@ async def plan_investigation(
                 namespaces.append(ns)
 
     family_catalog = load_family_catalog(settings.families_file)
+    seed_family = str(seed_family or "").strip()
+    plan_warnings: list[str] = []
+    seed_valid = seed_family in family_catalog.families
+    if seed_family and not seed_valid:
+        plan_warnings.append(
+            f"operator seed_family '{seed_family}' is not in the root-cause family catalog and was ignored"
+        )
     diagnostic_directive = _diagnostic_directive(
         settings, kg_context, alert_text, family_catalog
     )
@@ -585,6 +593,11 @@ async def plan_investigation(
         hypotheses = [{"family": str(component_entry["family"]), "reason": reason}] + [
             h for h in hypotheses if h["family"] != component_entry["family"]
         ]
+    if seed_valid:
+        seed_reason = "operator RCA correction; collect supporting and refuting evidence"
+        hypotheses = [{"family": seed_family, "reason": seed_reason}] + [
+            h for h in hypotheses if h["family"] != seed_family
+        ]
     best_similar = _best_similar(similar_incidents, alert_text)
     used_similarity = best_similar is not None
     used_ontology = _ontology_match(kg_context, alert_text)
@@ -604,6 +617,7 @@ async def plan_investigation(
         or bool(change_lead)
         or scope in _SCOPE_LEAD
         or node_focused
+        or seed_valid
     )
     where = target.workload_name or target.pod or target.namespace or "the cluster"
     if not leader_earned:
@@ -691,6 +705,11 @@ async def plan_investigation(
             f"({component_entry.get('failure_effect') or component_entry.get('purpose')}). "
             "Check that component and its depends_on chain first. " + narrative
         )
+    if seed_valid:
+        narrative = (
+            f"An operator RCA correction selected {seed_family} as the leading hypothesis. "
+            "Collect evidence that could confirm or refute it. " + narrative
+        )
 
     annotations = getattr(alert, "annotations", None) or {}
     run_id = str(annotations.get("analysis_run_id") or "").strip()
@@ -711,6 +730,7 @@ async def plan_investigation(
         component=component,
         diagnostic_directive=diagnostic_directive,
         case_cards=list(kg_context.get("case_cards") or [])[:3],
+        warnings=plan_warnings,
     )
 
     # Operator guidance (the prompt an operator attached to this Analyze request /
@@ -727,6 +747,12 @@ async def plan_investigation(
         except Exception:  # noqa: BLE001 - planning is best-effort; keep deterministic plan
             _log.warning("LLM plan refinement failed; using deterministic plan", exc_info=True)
 
+    if seed_valid:
+        seed_reason = "operator RCA correction; collect supporting and refuting evidence"
+        plan.hypotheses = [{"family": seed_family, "reason": seed_reason}] + [
+            h for h in plan.hypotheses if h.get("family") != seed_family
+        ]
+    plan.warnings = list(dict.fromkeys([*plan.warnings, *plan_warnings]))
     plan.hypotheses = _assign_hypothesis_ids(plan.hypotheses, run_id)
     plan.diagnostic_directive = _bind_probe_hypotheses(
         plan.diagnostic_directive,

@@ -1232,6 +1232,37 @@ async def test_alert_only_xid_is_auditable_harness_support(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_rank_stage_applies_operator_seed_as_a_bounded_prior() -> None:
+    from app.services.kg_enrichment import KGContext
+
+    state = pipeline.new_state(
+        make_settings(),
+        AlertAnalysisRequest(
+            seed_family="gpu_hardware_error",
+            alert=Alert(status="firing", labels={"alertname": "GenericAlert"}),
+        ),
+        collectors=[],
+    )
+    state.kg_context = KGContext()
+    state.plan = InvestigationPlan()
+    state.results = [
+        CollectorResult(
+            agent="runai",
+            status="ok",
+            summary="workload is pending because GPU quota capacity is exhausted",
+        )
+    ]
+
+    await pipeline.rank_stage(state)
+
+    assert state.priors is not None
+    assert state.priors["gpu_hardware_error"] == 1.75
+    # A seed is not a forced conclusion: strong current evidence for another
+    # family can still win when there is no current GPU observation to support it.
+    assert state.root_cause_candidates[0].family == "runai_scheduling_quota"
+
+
+@pytest.mark.asyncio
 async def test_resolved_incident_keeps_alert_pod_for_followups(monkeypatch) -> None:
     """A current replacement must not erase any historical target identity."""
     from app.plan import InvestigationPlan

@@ -765,6 +765,32 @@ async def test_memory_alert_is_workload_runtime_not_control_plane() -> None:
 
 
 @pytest.mark.asyncio
+async def test_operator_seed_family_leads_the_plan_after_other_promotions() -> None:
+    settings = make_settings()
+    target = _target(
+        alert_name="PrometheusMissingRuleEvaluations",
+        namespace="monitoring",
+        pod="prometheus-prometheus-kube-prometheus-prometheus-0",
+    )
+    plan = await plan_investigation(
+        settings, target, None, {}, [], seed_family="gpu_hardware_error"
+    )
+
+    assert plan.hypotheses[0]["family"] == "gpu_hardware_error"
+    assert "supporting and refuting evidence" in plan.hypotheses[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_operator_seed_family_is_ignored_with_plan_warning() -> None:
+    plan = await plan_investigation(
+        make_settings(), _target(), None, {}, [], seed_family="not_a_real_family"
+    )
+
+    assert all(item["family"] != "not_a_real_family" for item in plan.hypotheses)
+    assert any("not_a_real_family" in warning for warning in plan.warnings)
+
+
+@pytest.mark.asyncio
 async def test_llm_can_widen_scope_to_control_plane(monkeypatch) -> None:
     # LLM re-reasons the cause toward the platform → it may turn control-plane
     # reading ON, and the runai control-plane namespaces get added.

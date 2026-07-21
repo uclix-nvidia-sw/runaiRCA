@@ -1,10 +1,21 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
 )
+
+type rcaCorrectionRequest struct {
+	RootCauseFamily string   `json:"root_cause_family"`
+	Summary         string   `json:"summary"`
+	Actions         []string `json:"actions"`
+}
+
+type rcaPinRequest struct {
+	Pinned *bool `json:"pinned"`
+}
 
 func (s *Server) handleIncident(w http.ResponseWriter, r *http.Request) {
 	rest := pathPart(r.URL.Path, "/api/v1/incidents/")
@@ -81,6 +92,98 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 	}
 	id, action := parts[0], parts[1]
 	switch action {
+	case "rca-correction":
+		if len(parts) != 2 || r.Method != http.MethodPost {
+			writeError(w, http.StatusNotFound, "unknown incident action")
+			return
+		}
+		detail, ok := s.store.IncidentDetail(id)
+		if !ok {
+			writeError(w, http.StatusNotFound, "incident not found")
+			return
+		}
+		var req rcaCorrectionRequest
+		if status, err := decodeJSONBody(w, r, &req, maxJSONBodyBytes); err != nil {
+			writeError(w, status, err.Error())
+			return
+		}
+		req.RootCauseFamily = strings.TrimSpace(req.RootCauseFamily)
+		req.Summary = strings.TrimSpace(req.Summary)
+		if req.Summary == "" {
+			writeError(w, http.StatusBadRequest, "summary is required")
+			return
+		}
+		catalog, err := s.fetchRootCauseFamilyCatalog(r.Context())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "root-cause family catalog unavailable")
+			return
+		}
+		if !mapContains(catalog.Families, req.RootCauseFamily) {
+			writeError(w, http.StatusBadRequest, "root_cause_family must be selected from the root-cause family catalog")
+			return
+		}
+		actions := compactCorrectionActions(req.Actions)
+		detailMarkdown := renderOperatorCorrectionDetail(req.RootCauseFamily, req.Summary, actions, detail.AnalysisRunID)
+		alertID := ""
+		if len(detail.Alerts) > 0 {
+			alertID = detail.Alerts[0].AlertID
+		}
+		run, created := s.store.CreateOperatorRun(id, alertID, detail.AnalysisRunID, req.RootCauseFamily, req.Summary, detailMarkdown)
+		if !created {
+			writeError(w, http.StatusInternalServerError, "could not persist operator RCA correction")
+			return
+		}
+		s.broadcastAnalysisRunCompleted(run, id, alertID)
+		writeJSON(w, http.StatusCreated, envelope(run))
+	case "rca-pin":
+		if len(parts) != 2 || r.Method != http.MethodPost {
+			writeError(w, http.StatusNotFound, "unknown incident action")
+			return
+		}
+		if _, ok := s.store.IncidentDetail(id); !ok {
+			writeError(w, http.StatusNotFound, "incident not found")
+			return
+		}
+		var req rcaPinRequest
+		if status, err := decodeJSONBody(w, r, &req, maxJSONBodyBytes); err != nil {
+			writeError(w, status, err.Error())
+			return
+		}
+		if req.Pinned == nil {
+			writeError(w, http.StatusBadRequest, "pinned is required")
+			return
+		}
+		run, ok := s.store.SetLatestOperatorRunPinned(id, *req.Pinned)
+		if !ok {
+			writeError(w, http.StatusNotFound, "operator RCA correction not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, envelope(run))
+	case "reverify":
+		if len(parts) != 2 || r.Method != http.MethodPost {
+			writeError(w, http.StatusNotFound, "unknown incident action")
+			return
+		}
+		operatorRun, ok := s.store.PinnedOperatorRun(id)
+		if !ok {
+			writeError(w, http.StatusNotFound, "pinned operator RCA correction not found")
+			return
+		}
+		prompt := fmt.Sprintf(
+			"Re-verify the operator RCA correction. Treat %q as the leading hypothesis, collect supporting and refuting evidence, and do not force the conclusion. Operator summary: %s",
+			operatorRun.RootCauseFamily,
+			operatorRun.AnalysisSummary,
+		)
+		run, started := s.startAnalysisRun("incident", id, "reverify", prompt)
+		if !started {
+			if run != nil && run.Status == "analyzing" {
+				writeJSON(w, http.StatusAccepted, map[string]any{"status": "analysis_already_running"})
+				return
+			}
+			writeError(w, http.StatusConflict, "incident has no analyzable alerts")
+			return
+		}
+		writeJSON(w, http.StatusAccepted, envelope(run))
 	case "analyze":
 		if len(parts) != 2 || r.Method != http.MethodPost {
 			writeError(w, http.StatusNotFound, "unknown incident action")
@@ -195,4 +298,41 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, "unknown incident action")
 	}
+}
+
+func compactCorrectionActions(actions []string) []string {
+	compact := make([]string, 0, len(actions))
+	for _, action := range actions {
+		if action = strings.TrimSpace(action); action != "" {
+			compact = append(compact, action)
+		}
+	}
+	return compact
+}
+
+func renderOperatorCorrectionDetail(family, summary string, actions []string, baseRunID string) string {
+	lines := []string{
+		"## 1. 문제",
+		"",
+		summary,
+		"",
+		"## 2. 원인",
+		"",
+		fmt.Sprintf("- Root cause family: `%s`", family),
+		fmt.Sprintf("- Operator conclusion: %s", summary),
+		"",
+		"## 3. 권장 조치",
+		"",
+	}
+	if len(actions) == 0 {
+		lines = append(lines, "- No recommended actions provided.")
+	} else {
+		for index, action := range actions {
+			lines = append(lines, fmt.Sprintf("%d. %s", index+1, action))
+		}
+	}
+	if baseRunID != "" {
+		lines = append(lines, "", fmt.Sprintf("Base analysis run: `%s`", baseRunID))
+	}
+	return strings.Join(lines, "\n")
 }

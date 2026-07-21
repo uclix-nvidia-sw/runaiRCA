@@ -124,6 +124,9 @@ func (s *Server) requestAnalysisRun(
 		SimilarIncidents: compactAgentSimilarIncidents(s.store.SimilarIncidentsForAlert(alert, incidentID, similarIncidentLimit)),
 		FeedbackHints:    s.store.FeedbackHintsForAlert(alert, incidentID, similarIncidentLimit),
 	}
+	if source == "reverify" {
+		req.SeedFamily = s.store.PinnedOperatorFamily(incidentID)
+	}
 
 	analysis, err := s.callAnalyze(req, s.analysisRequestTimeout(source))
 	if err != nil {
@@ -390,6 +393,10 @@ func sourceTitle(source string) string {
 		return "Comment reanalysis"
 	case "feedback":
 		return "Feedback reanalysis"
+	case "reverify":
+		return "Operator re-verification"
+	case "operator":
+		return "Operator RCA correction"
 	case "backfill":
 		return "Backfill analysis"
 	case "chat":

@@ -1,7 +1,9 @@
 package server
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1614,6 +1616,53 @@ func (s *Store) CreateAnalysisRun(
 	return run
 }
 
+// CreateOperatorRun appends a completed, pinned operator correction. It must
+// never use CreateAnalysisRunIfAllowed: non-auto runs are normally reused in
+// place, while corrections are immutable audit records.
+func (s *Store) CreateOperatorRun(incidentID, alertID, baseRunID, family, summary, detail string) (AnalysisRun, bool) {
+	now := time.Now().UTC()
+	hash := sha256.Sum256([]byte(family + "\x00" + summary + "\x00" + detail))
+	run := &AnalysisRun{
+		RunID:           nextID("ANL", s.analysisRunSeq.Add(1)),
+		Source:          "operator",
+		Status:          "complete",
+		TargetType:      "incident",
+		TargetID:        incidentID,
+		IncidentID:      incidentID,
+		AlertID:         alertID,
+		Title:           "Operator RCA correction",
+		AnalysisSummary: summary,
+		AnalysisDetail:  detail,
+		AnalysisQuality: "operator",
+		RootCauseFamily: family,
+		Capabilities:    map[string]string{},
+		MissingData:     []string{},
+		Warnings:        []string{},
+		Artifacts:       []Artifact{},
+		Metadata: map[string]any{
+			"pinned": true,
+			"operator_correction": map[string]any{
+				"base_run_id": baseRunID,
+			},
+			"analysis_hash": hex.EncodeToString(hash[:]),
+		},
+		FirstCompletedAt: &now,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.incidents[incidentID] == nil {
+		return AnalysisRun{}, false
+	}
+	s.analysisRuns[run.RunID] = run
+	if !s.persistAnalysisRunLocked(run) {
+		delete(s.analysisRuns, run.RunID)
+		return AnalysisRun{}, false
+	}
+	return cloneAnalysisRun(run), true
+}
+
 func (s *Store) CreateAnalysisRunIfAllowed(
 	source string,
 	targetType string,
@@ -1756,15 +1805,87 @@ func (s *Store) latestAutoAnalysisRunLocked(alertID string) *AnalysisRun {
 
 // latestReusableAnalysisRunLocked returns the most recent non-analyzing run for
 // the exact target so a re-analysis updates it in place instead of creating a
-// new row. Matched by target_type+target_id only: an alert-scoped run and an
-// incident-scoped run for the same alert are distinct and must stay separate.
+// new row. A pinned correction disables in-place reuse for the target entirely:
+// subsequent AI attempts append rather than rewriting either the correction or
+// an older AI row beneath it. Matched by target_type+target_id only: an
+// alert-scoped run and an incident-scoped run for the same alert are distinct.
 func (s *Store) latestReusableAnalysisRunLocked(targetType string, targetID string) *AnalysisRun {
+	for _, run := range s.analysisRuns {
+		if run != nil && run.TargetType == targetType && run.TargetID == targetID && analysisRunPinned(run) {
+			return nil
+		}
+	}
 	var selected *AnalysisRun
 	for _, run := range s.analysisRuns {
 		if run == nil || run.Status == "analyzing" {
 			continue
 		}
 		if run.TargetType != targetType || run.TargetID != targetID {
+			continue
+		}
+		if selected == nil || run.UpdatedAt.After(selected.UpdatedAt) {
+			selected = run
+		}
+	}
+	return selected
+}
+
+func analysisRunPinned(run *AnalysisRun) bool {
+	if run == nil || run.Metadata == nil {
+		return false
+	}
+	pinned, _ := run.Metadata["pinned"].(bool)
+	return pinned
+}
+
+// PinnedOperatorFamily returns the newest pinned incident correction. It is
+// deliberately scoped to operator runs so ordinary metadata cannot seed RCA.
+func (s *Store) PinnedOperatorFamily(incidentID string) string {
+	run, ok := s.PinnedOperatorRun(incidentID)
+	if !ok {
+		return ""
+	}
+	return run.RootCauseFamily
+}
+
+func (s *Store) PinnedOperatorRun(incidentID string) (AnalysisRun, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	run := s.latestOperatorRunLocked(incidentID, true)
+	if run == nil {
+		return AnalysisRun{}, false
+	}
+	return cloneAnalysisRun(run), true
+}
+
+// SetLatestOperatorRunPinned toggles the newest operator correction for an
+// incident. A correction remains a historical run after unpinning.
+func (s *Store) SetLatestOperatorRunPinned(incidentID string, pinned bool) (AnalysisRun, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run := s.latestOperatorRunLocked(incidentID, false)
+	if run == nil {
+		return AnalysisRun{}, false
+	}
+	before := cloneAnalysisRun(run)
+	if run.Metadata == nil {
+		run.Metadata = map[string]any{}
+	}
+	run.Metadata["pinned"] = pinned
+	if !s.persistAnalysisRunLocked(run) {
+		*run = before
+		return AnalysisRun{}, false
+	}
+	return cloneAnalysisRun(run), true
+}
+
+func (s *Store) latestOperatorRunLocked(incidentID string, pinnedOnly bool) *AnalysisRun {
+	var selected *AnalysisRun
+	for _, run := range s.analysisRuns {
+		if run == nil || run.Source != "operator" || run.IncidentID != incidentID {
+			continue
+		}
+		if pinnedOnly && !analysisRunPinned(run) {
 			continue
 		}
 		if selected == nil || run.UpdatedAt.After(selected.UpdatedAt) {
@@ -2196,8 +2317,15 @@ func (s *Store) latestAnalyzingRunForAlertIDsLocked(incidentID string, alertIDs 
 	return selected
 }
 
-// betterAnalysisRun ranks a completed run above a non-completed one, then by recency.
+// betterAnalysisRun ranks pinned runs above non-pinned runs, then completed runs,
+// then by recency. Pinned operator corrections stay visible until explicitly
+// unpinned even after later AI runs complete.
 func betterAnalysisRun(candidate, current *AnalysisRun) bool {
+	candidatePinned := analysisRunPinned(candidate)
+	currentPinned := analysisRunPinned(current)
+	if candidatePinned != currentPinned {
+		return candidatePinned
+	}
 	candidateComplete := candidate.Status == "complete"
 	currentComplete := current.Status == "complete"
 	if candidateComplete != currentComplete {

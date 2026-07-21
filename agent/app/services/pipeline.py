@@ -33,6 +33,7 @@ from app.knowledge import (
     component_check_lines,
     dependency_path,
     load_architecture,
+    load_family_catalog,
     load_failure_modes,
     load_runai_known_issues,
     load_troubleshooting_cases,
@@ -639,7 +640,9 @@ async def plan_stage(state: PipelineState) -> PipelineState:
         state.kg_context.as_dict(),
         list(state.request.similar_incidents),
         recent_changes,
+        state.request.seed_family,
     )
+    state.extra_warnings.extend(state.plan.warnings)
     # A planner/live lookup may identify resources that exist today. Pin every
     # concrete identity carried by a resolved alert before any collector uses it.
     _pin_resolved_target_identity(state)
@@ -1463,6 +1466,12 @@ async def rank_stage(state: PipelineState) -> PipelineState:
         pass
     else:
         state.priors = derive_priors(request.feedback_hints)
+    seed_family = str(request.seed_family or "").strip()
+    if seed_family in load_family_catalog(settings.families_file).families:
+        state.priors = dict(state.priors or {})
+        # A correction changes investigation order, not the evidence gate: the
+        # ranker applies this only to a family with typed current evidence.
+        state.priors[seed_family] = max(state.priors.get(seed_family, 1.0), 1.75)
     state.progress.emit(
         "ranking",
         "Ranking root-cause candidates",
@@ -2108,6 +2117,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             "nemo_runtime": "enabled" if state.runtime_label == "enabled" else "fallback",
             "occurrence_count": request.occurrence_count,
             "occurrence_pods": request.occurrence_pods,
+            "seed_family": request.seed_family,
             "affected_pods": affected_pods,
             "similar_incidents": [
                 item.model_dump(mode="json") for item in request.similar_incidents
