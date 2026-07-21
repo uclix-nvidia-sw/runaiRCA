@@ -854,7 +854,15 @@ class SystemCollector:
                     type="node_logs",
                     status=status,
                     confidence=confidence,
-                    query=f"node={node} sources={','.join(_SOURCES)}",
+                    query=(
+                        f"GET {result.get('base_url') or ''}/logs node={node} "
+                        f"sources={','.join(_SOURCES)} "
+                        + (
+                            f"window={time_range['start']}..{time_range['end']}"
+                            if time_range
+                            else "window=current-tail"
+                        )
+                    ),
                     summary=summary,
                     result={**result, "observation": observation},
                 )
