@@ -204,12 +204,8 @@ entity incident,
     owns approved_at,
     plays grouped_into:incident,
     plays has_symptom:incident,
-    plays has_cause:incident,
     plays analyzed_by:incident,
-    plays similar_to:this,
-    plays similar_to:other,
     plays diagnosis:incident,
-    plays observed_symptom:incident,
     plays hypothesis_for:incident;
 
 entity analysis_run,
@@ -220,7 +216,6 @@ entity analysis_run,
     owns trace_stop_reason,
     plays analyzed_by:run,
     plays diagnosis:run,
-    plays observed_symptom:run,
     plays hypothesis_for:run;
 
 entity symptom,
@@ -245,17 +240,14 @@ entity symptom,
     plays indicates:symptom,
     plays resolved_by:symptom,
     plays supported_by:claim,
-    plays emits:signal,
-    plays observed_symptom:symptom;
+    plays emits:signal;
 
 entity root_cause,
     owns subtype,
     owns confidence,
     owns blast_radius,
     owns statement,
-    plays has_cause:cause,
     plays indicates:cause,
-    plays fixed_by:cause,
     plays supported_by:claim,
     plays diagnosis:cause,
     plays diagnostic_outcome:cause;
@@ -312,7 +304,6 @@ entity platform_lifecycle_change sub root_cause;
 
 entity action,
     owns statement,
-    plays fixed_by:remedy,
     plays resolved_by:remedy,
     plays resolution:remedy,
     plays diagnostic_recommendation:remedy;
@@ -338,7 +329,6 @@ entity evidence,
     owns quality,
     plays supported_by:proof,
     plays emits:signal,
-    plays observed_symptom:proof,
     plays contradicted_by:proof,
     plays probe_execution_evidence:proof,
     plays rejected_evidence_link:proof;
@@ -436,13 +426,10 @@ relation contains, relates space, relates occupant;       # namespace contains p
 relation grouped_into, relates incident, relates member;  # incident <- alert
 relation has_symptom, relates incident, relates symptom;
 relation indicates, relates symptom, relates cause;       # symptom indicates root_cause
-relation has_cause, relates incident, relates cause;
-relation fixed_by, relates cause, relates remedy;         # root_cause fixed_by action (family-level)
 relation resolved_by, relates symptom, relates remedy;    # symptom resolved_by action (precise)
 relation supported_by, relates claim, relates proof;      # (symptom|root_cause) <- evidence
 relation contradicted_by, relates claim, relates proof;   # run-local diagnosis <- conflicting evidence
 relation analyzed_by, relates incident, relates run;
-relation similar_to, relates this, relates other;
 relation emits, relates emitter, relates signal;          # component emits evidence/symptom
 relation depends_on, relates dependent, relates dependency;  # component needs component (check order)
 relation diagnosis,
@@ -458,7 +445,6 @@ relation diagnosis,
     plays contradicted_by:claim,
     plays case_projection:finding,
     plays resolution:finding;
-relation observed_symptom, relates run, relates incident, relates symptom, relates proof;
 relation resolution, relates finding, relates remedy, owns outcome;
 relation case_projection, relates case, relates finding;
 
