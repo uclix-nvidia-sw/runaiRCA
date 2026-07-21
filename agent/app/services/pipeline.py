@@ -56,6 +56,7 @@ from app.services.general_guidance import general_guidance_lines
 from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
 from app.services.planner import plan_investigation
 from app.services.root_cause_ranking import (
+    FAMILIES,
     RankedCause,
     artifact_supports_family,
     merge_open_world_candidates,
@@ -148,6 +149,9 @@ class PipelineState:
     self_check_refuted: bool = False
     self_check_next: str = ""
     reanalysis_note: str = ""
+    # Eligible semantic matches returned by the most recent re-analysis pass.
+    # This is intentionally transient: it only changes the next probe order.
+    reanalysis_fresh_support_families: tuple[str, ...] = ()
     graph_fixes: GraphRemediation | None = None
     timeline: object | None = None
     troubleshooting_path: dict[str, Any] | None = None
@@ -180,6 +184,7 @@ class _ReanalysisOutcome:
     note: str
     refuted: bool
     next_check: str
+    fresh_support_families: tuple[str, ...]
 
 
 def new_state(
@@ -2389,11 +2394,13 @@ async def _investigate_until_settled(state: PipelineState) -> None:
             break
 
         state.results = outcome.results
-        # Keep the latest hypothesis/evidence ledger.  Previously re-analysis
-        # ranked its fresh evidence but discarded the ledger that explained it,
-        # so a valid open-world hypothesis could neither cite evidence nor
-        # participate in the final headline.
-        state.investigation_context = outcome.investigation_context
+        # Each investigator pass starts a fresh ledger. Carry prior evidence by
+        # family so a reused local ID (for example, H1) cannot erase evidence
+        # gathered for a different family in an earlier pass.
+        state.investigation_context = _merge_reanalysis_context(
+            state.investigation_context, outcome.investigation_context
+        )
+        state.reanalysis_fresh_support_families = outcome.fresh_support_families
         state.root_cause_candidates = outcome.candidates
         state.self_check_caveat = outcome.caveat
         state.reanalysis_note = _append_reanalysis_note(state.reanalysis_note, outcome.note)
@@ -2438,6 +2445,15 @@ def _next_reanalysis_target(
         for family in (*attempted, refuted_family, "insufficient_evidence")
         if family
     }
+
+    for family in state.reanalysis_fresh_support_families:
+        if family not in excluded:
+            return _ReanalysisTarget(
+                family,
+                "targeted follow-up for newly collected eligible evidence",
+                refuted_family,
+                not state.reanalysis_note,
+            )
 
     if state.self_check_refuted:
         for candidate in state.root_cause_candidates[1:]:
@@ -2497,6 +2513,91 @@ def _next_reanalysis_target(
             refuted_family,
         )
     return None
+
+
+def _merge_reanalysis_context(
+    previous: Mapping[str, object], current: Mapping[str, object]
+) -> dict[str, Any]:
+    """Carry typed ledger links across fresh investigator contexts by family.
+
+    Investigator-local hypothesis IDs restart on each bounded invocation. The
+    family is therefore the stable identity for cross-round evidence carry-over;
+    deduplicating IDs preserves the ledger without inflating support counts.
+    """
+    merged = dict(current)
+    previous_ledger = previous.get("hypothesis_ledger")
+    current_ledger = current.get("hypothesis_ledger")
+    if not isinstance(previous_ledger, list):
+        return merged
+    if not isinstance(current_ledger, list):
+        merged["hypothesis_ledger"] = [
+            dict(item) for item in previous_ledger if isinstance(item, dict)
+        ]
+        return merged
+
+    ledger = [dict(item) for item in current_ledger if isinstance(item, dict)]
+    by_family = {
+        str(item.get("family") or "").strip(): item
+        for item in ledger
+        if str(item.get("family") or "").strip()
+    }
+    used_ids = {str(item.get("id") or "").strip() for item in ledger}
+    for prior in previous_ledger:
+        if not isinstance(prior, dict):
+            continue
+        family = str(prior.get("family") or "").strip()
+        if not family:
+            continue
+        item = by_family.get(family)
+        if item is None:
+            item = dict(prior)
+            hypothesis_id = str(item.get("id") or "").strip()
+            if hypothesis_id in used_ids:
+                item["id"] = f"{hypothesis_id}:{family}"
+            used_ids.add(str(item.get("id") or "").strip())
+            ledger.append(item)
+            by_family[family] = item
+            continue
+        for field in ("evidence_for", "evidence_against"):
+            values = [
+                value
+                for source in (prior.get(field), item.get(field))
+                for value in _ledger_evidence_values(source)
+            ]
+            if values:
+                item[field] = list(dict.fromkeys(values))
+    merged["hypothesis_ledger"] = ledger
+    return merged
+
+
+def _ledger_evidence_values(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _fresh_eligible_support_families(
+    fresh_results: list[CollectorResult], evidence_eligibility: Mapping[str, object]
+) -> tuple[str, ...]:
+    """Map newly collected, eligible artifacts to catalog families.
+
+    ``artifact_supports_family`` is the ranker's own typed semantic matcher, so
+    unknown or partially scoped artifacts cannot influence investigation order.
+    """
+    families: list[str] = []
+    for result in fresh_results:
+        for artifact in result.artifacts:
+            evidence_id = str(getattr(artifact, "evidence_id", "") or "")
+            eligibility = evidence_eligibility.get(evidence_id)
+            permits = getattr(eligibility, "permits", None)
+            if not callable(permits) or not permits("support"):
+                continue
+            for family in FAMILIES:
+                if family not in families and artifact_supports_family(family, artifact):
+                    families.append(family)
+    return tuple(families)
 
 
 def _evidence_signature(results: list[CollectorResult]) -> tuple[tuple[object, ...], ...]:
@@ -2642,6 +2743,9 @@ async def _reanalyze_once(
         try:
             eligible_support_ids = _eligible_support_ids_for_output(state)
             evidence_eligibility = _public_evidence_eligibility(state)
+            fresh_support_families = _fresh_eligible_support_families(
+                fresh, evidence_eligibility
+            )
         finally:
             state.results = previous_results
 
@@ -2749,6 +2853,7 @@ async def _reanalyze_once(
             note,
             refuted,
             next_check,
+            fresh_support_families,
         )
     except Exception:  # noqa: BLE001 - re-analysis is best-effort; keep 1st result
         return None
