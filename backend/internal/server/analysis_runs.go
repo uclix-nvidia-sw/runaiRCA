@@ -301,6 +301,7 @@ func compactAgentStringMap(in map[string]string) map[string]string {
 func compactAgentSimilarIncidents(items []SimilarIncident) []SimilarIncident {
 	out := make([]SimilarIncident, 0, len(items))
 	for _, item := range items {
+		// Keep RCA provenance (including approval) while removing sensitive detail.
 		item.Title = excerpt(item.Title, 120)
 		item.AnalysisSummary = excerpt(item.AnalysisSummary, 800)
 		item.AnalysisDetail = ""

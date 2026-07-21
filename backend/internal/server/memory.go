@@ -557,7 +557,11 @@ func (s *Store) similarIncidentsLocked(
 	queryVector := textVector(alertSearchText(alert))
 	results := make([]SimilarIncident, 0, len(s.memories))
 	for _, memory := range s.memories {
-		if memory == nil || !incidentUserApproved(s.incidents[memory.IncidentID]) || memory.IncidentID == currentIncidentID || incidentDeleted(s.incidents[memory.IncidentID]) {
+		if memory == nil {
+			continue
+		}
+		incident := s.incidents[memory.IncidentID]
+		if !incidentUserApproved(incident) || memory.IncidentID == currentIncidentID || incidentDeleted(incident) {
 			continue
 		}
 		score := cosineSimilarity(queryVector, memory.Vector)
@@ -569,6 +573,10 @@ func (s *Store) similarIncidentsLocked(
 			score = 1
 		}
 		summary := s.feedbackSummaryLocked("incident", memory.IncidentID)
+		rootCauseFamily := ""
+		if run := s.latestAnalysisRunForIncidentLocked(memory.IncidentID); run != nil {
+			rootCauseFamily = run.RootCauseFamily
+		}
 		results = append(results, SimilarIncident{
 			IncidentID:       memory.IncidentID,
 			AlertID:          memory.AlertID,
@@ -578,6 +586,8 @@ func (s *Store) similarIncidentsLocked(
 			Similarity:       math.Round(score*1000) / 1000,
 			AnalysisSummary:  memory.AnalysisSummary,
 			AnalysisDetail:   excerpt(memory.AnalysisDetail, 900),
+			RootCauseFamily:  rootCauseFamily,
+			Approved:         incident.UserApprovedAt != nil,
 			PositiveFeedback: summary.Positive,
 			NegativeFeedback: summary.Negative,
 			CommentCount:     len(summary.Comments),

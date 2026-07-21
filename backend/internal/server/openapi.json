@@ -148,7 +148,8 @@
         "responses": {
           "201": { "description": "Pinned operator analysis run created" },
           "400": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "404": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
         }
       }
     },

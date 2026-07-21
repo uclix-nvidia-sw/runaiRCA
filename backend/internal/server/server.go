@@ -68,6 +68,8 @@ type SimilarIncident struct {
 	Similarity       float64           `json:"similarity"`
 	AnalysisSummary  string            `json:"analysis_summary"`
 	AnalysisDetail   string            `json:"analysis_detail,omitempty"`
+	RootCauseFamily  string            `json:"root_cause_family,omitempty"`
+	Approved         bool              `json:"approved,omitempty"`
 	PositiveFeedback int               `json:"positive_feedback"`
 	NegativeFeedback int               `json:"negative_feedback"`
 	CommentCount     int               `json:"comment_count"`

@@ -1640,6 +1640,84 @@ func TestIncidentMemoryIsOnePerIncidentFromLatestRun(t *testing.T) {
 	}
 }
 
+func TestSimilarIncidentsUseDisplayedApprovedRCAFamily(t *testing.T) {
+	store := NewStore()
+	priorAlert := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning", "queue": "gpu-a"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-similar-provenance-prior",
+	}
+	priorIncident, priorRecord := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "similar-provenance-prior"}, priorAlert)
+	store.ApplyAnalysis(priorRecord.AlertID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Initial AI RCA.",
+		AnalysisDetail:  "Initial AI detail.",
+		RootCauseFamily: "runai_scheduling_quota",
+	})
+	correction, ok := store.CreateOperatorRun(priorIncident.IncidentID, priorRecord.AlertID, "RUN-"+priorRecord.AlertID, "gpu_hardware_error", "Operator RCA.", "Operator detail.")
+	if !ok {
+		t.Fatal("expected pinned operator correction")
+	}
+	later, created := store.CreateAnalysisRunIfAllowed("auto", "incident", priorIncident.IncidentID, priorIncident.IncidentID, priorRecord.AlertID, "Later AI RCA", "")
+	if !created {
+		t.Fatal("expected later AI run")
+	}
+	if _, ok := store.CompleteAnalysisRun(later.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "Later AI RCA.",
+		AnalysisDetail:  "Later AI detail.",
+		RootCauseFamily: "runai_scheduling_quota",
+	}); !ok {
+		t.Fatal("expected later AI run to complete")
+	}
+	approveIncidentForTest(t, store, priorIncident.IncidentID)
+
+	currentAlert := priorAlert
+	currentAlert.Fingerprint = "fp-similar-provenance-current"
+	currentIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "similar-provenance-current"}, currentAlert)
+	similar := store.SimilarIncidentsForAlert(currentAlert, currentIncident.IncidentID, 5)
+	if len(similar) != 1 {
+		t.Fatalf("expected one approved similar incident, got %+v", similar)
+	}
+	if similar[0].IncidentID != priorIncident.IncidentID || !similar[0].Approved || similar[0].RootCauseFamily != correction.RootCauseFamily {
+		t.Fatalf("similar incident should use the displayed pinned RCA family and approval: %+v", similar[0])
+	}
+}
+
+func TestSimilarIncidentsExcludeUnapprovedPrior(t *testing.T) {
+	store := NewStore()
+	alert := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning", "queue": "gpu-a"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-similar-unapproved-prior",
+	}
+	priorIncident, priorRecord := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "similar-unapproved-prior"}, alert)
+	store.ApplyAnalysis(priorRecord.AlertID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Unapproved AI RCA.",
+		AnalysisDetail:  "Unapproved AI detail.",
+		RootCauseFamily: "runai_scheduling_quota",
+	})
+	store.memories[priorIncident.IncidentID] = &IncidentMemory{
+		IncidentID:      priorIncident.IncidentID,
+		Title:           priorIncident.Title,
+		Severity:        priorIncident.Severity,
+		Status:          priorIncident.Status,
+		AnalysisSummary: "Unapproved AI RCA.",
+		Labels:          cloneMap(alert.Labels),
+		CreatedAt:       time.Now().UTC(),
+		Vector:          textVector(alertSearchText(alert)),
+	}
+
+	currentAlert := alert
+	currentAlert.Fingerprint = "fp-similar-unapproved-current"
+	currentIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "similar-unapproved-current"}, currentAlert)
+	if similar := store.SimilarIncidentsForAlert(currentAlert, currentIncident.IncidentID, 5); len(similar) != 0 {
+		t.Fatalf("unapproved prior must remain excluded by the approval gate, got %+v", similar)
+	}
+}
+
 func TestSimilarIncidentsLimitAndLatestTieBreak(t *testing.T) {
 	store := NewStore()
 	alert := Alert{
