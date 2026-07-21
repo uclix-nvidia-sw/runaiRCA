@@ -56,6 +56,24 @@ def test_kubernetes_read_rejects_non_resource_kind_before_execution() -> None:
     )
 
 
+def test_metric_domain_queries_reject_sql_syntax_and_normalize_double_escaped_logql() -> None:
+    assert not drilldown._valid_domain_query(
+        {"tool": "logql_query", "args": {"query": '{namespace="runai"} | sort by timestamp asc | limit 1'}}
+    )
+    assert not drilldown._valid_domain_query(
+        {"tool": "promql_query", "args": {"query": "up sort by instance"}}
+    )
+    assert drilldown._valid_domain_query(
+        {"tool": "logql_query", "args": {"query": r'{namespace=\"runai\"} |~ \"error\"'}}
+    )
+    assert drilldown._valid_domain_query(
+        {"tool": "logql_query", "args": {"query": '{namespace="runai"} |~ "sort by"'}}
+    )
+    assert drilldown._valid_domain_query(
+        {"tool": "promql_query", "args": {"query": 'sum by (namespace) (up)'}}
+    )
+
+
 def test_kubernetes_prompt_refuses_configuration_as_observed_preemption() -> None:
     prompt = drilldown._system_prompt("kubernetes", {})
 
@@ -205,6 +223,67 @@ async def test_metric_and_log_queries_reject_overlong_input() -> None:
     # category, so the loop tells the model to correct the query, not retry it.
     assert prom["error"] == "invalid query: exceeds 600 characters; shorten it"
     assert logs["error"] == "invalid query: exceeds 600 characters; shorten it"
+
+
+@pytest.mark.asyncio
+async def test_logql_drilldown_rejects_pipeline_sort_limit_and_unescapes_llm_query(monkeypatch) -> None:
+    seen: list[str] = []
+
+    async def fake_loki_mcp(_settings, _name, query, *, time_range=None):
+        seen.append(query)
+        return {"error": None, "line_count": 0}
+
+    monkeypatch.setattr(drilldown, "loki_mcp_query", fake_loki_mcp)
+    settings = drill_settings(loki_mcp_url="http://loki-mcp")
+
+    rejected = await _tool_logql(
+        settings, _target(), {"query": '{namespace="runai"} | sort by timestamp asc | limit 1'}
+    )
+    sanitized = await _tool_logql(
+        settings, _target(), {"query": r'{namespace=\"runai\"} |~ \"error\"'}
+    )
+
+    assert "unsupported sort/limit" in str(rejected["error"])
+    assert sanitized["error"] is None
+    assert seen == ['{namespace="runai"} |~ "error"']
+
+
+def test_drilldown_prompt_explicitly_excludes_logql_sort_and_limit() -> None:
+    assert "LogQL has NO sort/limit pipeline stages" in drilldown._system_prompt("loki", {})
+
+
+def test_drilldown_allows_only_one_llm_repair_after_query_parser_rejection(monkeypatch) -> None:
+    decisions = iter(
+        [
+            {"action": "query", "queries": [{"tool": "promql_query", "args": {"query": "up"}}]},
+            {"action": "query", "queries": [{"tool": "promql_query", "args": {"query": "up{job=\"api\"}"}}]},
+        ]
+    )
+    prompts: list[str] = []
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
+        prompts.append(user)
+        return next(decisions)
+
+    async def fake_prom_mcp(settings, name, query, *, time_range=None):
+        return {"error": "HTTP 400: parse error: unexpected by"}
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "prom_mcp_query", fake_prom_mcp)
+    result = CollectorResult(agent="prometheus", status="ok", summary="base metrics")
+
+    asyncio.run(
+        run_drilldowns(
+            drill_settings(prometheus_mcp_url="http://prom-mcp", max_investigation_steps=3),
+            [result],
+            _target(),
+            None,
+        )
+    )
+
+    assert len(prompts) == 2
+    assert "parser_error" in prompts[1]
+    assert any("one query-syntax repair attempt" in w for w in result.warnings)
 
 
 @pytest.mark.asyncio

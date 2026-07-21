@@ -237,6 +237,9 @@ async def test_workload_firing_warning_uses_resolved_pod_identity_anchor(
             "namespace": namespace,
             "uid": "permission-manager-pod-uid",
             "labels": {"app": "permission-manager"},
+            "ownerReferences": [
+                {"kind": "ReplicaSet", "name": "permission-manager-67466b4f94", "uid": "pm-rs-uid"}
+            ],
         },
         "spec": {"containers": [{"name": "manager"}]},
         "status": {
@@ -263,8 +266,25 @@ async def test_workload_firing_warning_uses_resolved_pod_identity_anchor(
         if tool == "resources_get" and kind in {"deployment", "deployments"}:
             return _McpResult(
                 {
-                    "metadata": {"name": "permission-manager", "namespace": namespace},
+                    "metadata": {
+                        "name": "permission-manager",
+                        "namespace": namespace,
+                        "uid": "pm-deploy-uid",
+                    },
                     "spec": {"selector": {"matchLabels": {"app": "permission-manager"}}},
+                }
+            )
+        if tool == "resources_get" and kind in {"replicaset", "replicasets"}:
+            return _McpResult(
+                {
+                    "metadata": {
+                        "name": "permission-manager-67466b4f94",
+                        "namespace": namespace,
+                        "uid": "pm-rs-uid",
+                        "ownerReferences": [
+                            {"kind": "Deployment", "name": "permission-manager", "uid": "pm-deploy-uid"}
+                        ],
+                    }
                 }
             )
         if tool in {"pods_list_in_namespace", "pods_list"} or (

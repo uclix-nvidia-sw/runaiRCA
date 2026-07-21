@@ -32,6 +32,7 @@ from app.mcp_client import (
     mcp_call_many,
     mcp_error,
     mcp_fallback_warning,
+    mcp_tls_verify,
     mcp_tool_json,
 )
 
@@ -187,7 +188,7 @@ class LokiCollector:
                 )
                 used_mcp = True
             except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
-                warnings.append(mcp_fallback_warning(exc))
+                warnings.append(mcp_fallback_warning(exc, source="Loki"))
         else:
             warnings.append(f"{MCP_FALLBACK_WARNING}: LOKI_MCP_URL not configured")
 
@@ -457,6 +458,7 @@ async def _collect_loki_direct(
                 **(time_range or {}),
             },
             headers=headers,
+            verify=mcp_tls_verify(),
         )
         streams = _loki_streams(response.data)
         line_count = sum(len(stream.get("values", [])) for stream in streams)

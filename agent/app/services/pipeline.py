@@ -823,10 +823,25 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
     # evidence (services/drilldown.py). Best-effort, never fails analysis.
     try:
         from app.services.drilldown import run_drilldowns
+        from app.services.kg_enrichment import external_case_hints
 
         drilldown_kwargs: dict[str, Any] = {"blackboard": state.blackboard}
+        evidence_deadline = _evidence_deadline_monotonic(state)
         if _accepts_keyword(run_drilldowns, "deadline_monotonic"):
-            drilldown_kwargs["deadline_monotonic"] = _evidence_deadline_monotonic(state)
+            drilldown_kwargs["deadline_monotonic"] = evidence_deadline
+        if _accepts_keyword(run_drilldowns, "external_case_hints"):
+            observed_text = _observed_text(state.results, request)
+            try:
+                if evidence_deadline is not None:
+                    remaining = max(0.0, evidence_deadline - time.monotonic())
+                    hints = await asyncio.wait_for(
+                        external_case_hints(settings, observed_text), timeout=remaining
+                    )
+                else:
+                    hints = await external_case_hints(settings, observed_text)
+            except Exception:  # noqa: BLE001 - optional hints must not skip drill-down
+                hints = []
+            drilldown_kwargs["external_case_hints"] = hints
         await run_drilldowns(settings, state.results, target, plan, **drilldown_kwargs)
     except Exception:  # noqa: BLE001 - drill-down is best-effort
         pass

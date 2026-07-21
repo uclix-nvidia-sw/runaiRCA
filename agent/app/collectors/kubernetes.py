@@ -362,7 +362,7 @@ async def k8s_read(
                     "error": str(exc),
                     "data": None,
                 }
-            mcp_note = mcp_fallback_warning(exc)
+            mcp_note = mcp_fallback_warning(exc, source="Kubernetes")
     token = _read_file(settings.kubernetes_token_path)
     if not token:
         return {"kind": resolved, "error": "kubernetes service account token unavailable"}
@@ -500,7 +500,7 @@ async def k8s_logs(
                 "lines": lines,
             }
         except Exception as exc:  # noqa: BLE001 - direct fallback is the behavior.
-            mcp_note = mcp_fallback_warning(exc)
+            mcp_note = mcp_fallback_warning(exc, source="Kubernetes")
     if not token:
         token = _read_file(settings.kubernetes_token_path)
     if not token:
@@ -727,7 +727,7 @@ async def _describe_events(
             filtered = _events_in_time_range(matching, time_range)
             return {"items": compact(filtered, limit=12) if filtered else []}
         except Exception as exc:  # noqa: BLE001 - direct API fallback is the behavior.
-            mcp_note = mcp_fallback_warning(exc)
+            mcp_note = mcp_fallback_warning(exc, source="Kubernetes")
     token = _read_file(settings.kubernetes_token_path)
     if not token:
         return {
@@ -1375,6 +1375,7 @@ class KubernetesCollector:
                     target,
                     pod=resolved_pod,
                     pod_uid=str(workload_resolution.get("selected_pod_uid") or ""),
+                    ownership_verified=bool(workload_resolution.get("ownership_verified")),
                 )
         if self._settings.kubernetes_mcp_url:
             try:
@@ -1414,7 +1415,7 @@ class KubernetesCollector:
                         pod_summary_data = None
                     used_mcp = True
             except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
-                warnings.append(mcp_fallback_warning(exc))
+                warnings.append(mcp_fallback_warning(exc, source="Kubernetes"))
         else:
             warnings.append(f"{MCP_FALLBACK_WARNING}: KUBERNETES_MCP_URL not configured")
 
@@ -1794,6 +1795,7 @@ class KubernetesCollector:
                 pod_summary_data,
                 container_diagnostics,
                 time_range=causal_time_range,
+                resolved_pod_anchor=resolved_pod_anchor,
             )
         )
         artifacts.extend(
@@ -2053,21 +2055,23 @@ def _warning_event_observation(
         and not target.pod_uid
         and len(event_uids) > 1
     )
+    # target is None for a namespace-only observation: no pod attribute to read.
+    target_pod = "" if target is None else (target.pod or "")
     verified_events = bool(warning_events) and all(
-        event.get("target_identity_verified") is True
-        and event.get("observed_entity") == observed_entity
+        (
+            not target_pod
+            and str(event.get("kind") or "").casefold() == "pod"
+            and resolved_pod_anchor is not None
+            and resolved_pod_anchor.ownership_verified
+            and event.get("target_identity_anchor_verified") is True
+        )
+        or (
+            (target_pod or str(event.get("kind") or "").casefold() != "pod")
+            and event.get("target_identity_verified") is True
+            and event.get("observed_entity") == observed_entity
+        )
         for event in warning_events
     ) and not identity_ambiguous
-    # A workload-only alert can retain controller Events, but a returned child
-    # Pod Event must also carry the exact live-Pod verification that admitted it
-    # through the response filter.
-    if resolved_pod_anchor and any(
-        str(event.get("kind") or "").casefold() == "pod" for event in warning_events
-    ):
-        verified_events = verified_events and any(
-            event.get("target_identity_anchor_verified") is True
-            for event in warning_events
-        )
     if status == "unavailable":
         polarity, coverage = "unavailable", "unknown"
     elif not target_scoped or (target is not None and observed_entity is None):
@@ -3070,12 +3074,16 @@ def _selector_from_controller(controller: object) -> str:
     return ",".join(parts)
 
 
-def _owned_by(item: dict, kind: str, name: str) -> bool:
+def _owned_by(item: dict, kind: str, name: str, uid: str = "") -> bool:
     metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
     for owner in metadata.get("ownerReferences") or []:
         if not isinstance(owner, dict):
             continue
-        if str(owner.get("kind") or "").lower() == kind.lower() and owner.get("name") == name:
+        if (
+            str(owner.get("kind") or "").lower() == kind.lower()
+            and owner.get("name") == name
+            and (not uid or str(owner.get("uid") or "") == uid)
+        ):
             return True
     return False
 
@@ -3155,6 +3163,7 @@ async def _resolve_workload_pod(settings: Settings, target: AnalysisTarget) -> d
         "workload_kind": kind,
         "workload_name": target.workload_name,
         "controller": _controller_observation(controller),
+        "ownership_verified": False,
     }
 
     if kind == "cronjobs":
@@ -3172,6 +3181,7 @@ async def _resolve_workload_pod(settings: Settings, target: AnalysisTarget) -> d
         resolution["job_resolution"] = nested
         resolution["selected_pod"] = nested.get("selected_pod", "")
         resolution["selected_pod_uid"] = nested.get("selected_pod_uid", "")
+        resolution["ownership_verified"] = bool(nested.get("ownership_verified"))
         return resolution
 
     selector = _selector_from_controller(controller)
@@ -3194,7 +3204,51 @@ async def _resolve_workload_pod(settings: Settings, target: AnalysisTarget) -> d
                 str((item.get("metadata") or {}).get("name") or ""), target.workload_name
             )
         ]
-    selected = _diagnostic_pod(items, target.workload_name)
+    controller_data = controller.get("data") if isinstance(controller, dict) else {}
+    controller_metadata = (
+        controller_data.get("metadata")
+        if isinstance(controller_data, dict) and isinstance(controller_data.get("metadata"), dict)
+        else {}
+    )
+    controller_uid = str(controller_metadata.get("uid") or "")
+    owned_items = items
+    if controller_uid:
+        if kind == "deployments":
+            owned_items = []
+            for item in items:
+                owner = next(
+                    (
+                        owner
+                        for owner in (item.get("metadata") or {}).get("ownerReferences", [])
+                        if isinstance(owner, dict)
+                        and str(owner.get("kind") or "").casefold() == "replicaset"
+                    ),
+                    None,
+                )
+                rs_name = str(owner.get("name") or "") if owner else ""
+                if not rs_name:
+                    continue
+                # A Deployment's Pod ownership is a two-hop UID chain. Exact
+                # ReplicaSet reads avoid a broad secondary list operation.
+                replica_set = await k8s_read(
+                    settings, "replicasets", namespace=target.namespace, name=rs_name
+                )
+                rs_data = replica_set.get("data") if isinstance(replica_set, dict) else None
+                if (
+                    isinstance(rs_data, dict)
+                    and _owned_by(rs_data, "Deployment", target.workload_name, controller_uid)
+                    and str((rs_data.get("metadata") or {}).get("uid") or "")
+                    and _owned_by(item, "ReplicaSet", rs_name, str((rs_data.get("metadata") or {}).get("uid")))
+                ):
+                    owned_items.append(item)
+        else:
+            owned_items = [
+                item
+                for item in items
+                if _owned_by(item, target.workload_type, target.workload_name, controller_uid)
+            ]
+    selected = _diagnostic_pod(owned_items, target.workload_name) or _diagnostic_pod(items, target.workload_name)
+    ownership_verified = bool(selected and selected in owned_items and controller_uid)
     selected_metadata = selected.get("metadata") if isinstance(selected, dict) and isinstance(selected.get("metadata"), dict) else {}
     selected_text = " ".join(
         [str(selected_metadata.get("name") or ""), *map(str, (selected_metadata.get("labels") or {}).values())]
@@ -3216,6 +3270,7 @@ async def _resolve_workload_pod(settings: Settings, target: AnalysisTarget) -> d
             "namespace_context_fallback": bool(
                 selected and target.workload_name and target.workload_name.casefold() not in selected_text
             ),
+            "ownership_verified": ownership_verified,
         }
     )
     return resolution
@@ -3688,6 +3743,7 @@ def _container_lifecycle_artifact(
     container_diagnostics: list[dict[str, object]],
     *,
     time_range: dict[str, str] | None,
+    resolved_pod_anchor: AnalysisTarget | None = None,
 ):
     """Expose target-container lifecycle facts with their actual occurrence time.
 
@@ -3697,7 +3753,9 @@ def _container_lifecycle_artifact(
     within the shared causal window.  A still-firing alert may also be observed
     in a generic waiting/restart loop when Kubernetes has no termination time.
     """
-    target_identity_verified = _container_lifecycle_target_verified(pod_summary, target)
+    target_identity_verified = _container_lifecycle_target_verified(
+        pod_summary, target, resolved_pod_anchor=resolved_pod_anchor
+    )
     terminated_times = _container_termination_times_in_range(
         container_diagnostics, time_range
     )
@@ -3763,9 +3821,22 @@ def _container_lifecycle_artifact(
 
 
 def _container_lifecycle_target_verified(
-    pod_summary: dict[str, object] | None, target: AnalysisTarget
+    pod_summary: dict[str, object] | None,
+    target: AnalysisTarget,
+    *,
+    resolved_pod_anchor: AnalysisTarget | None = None,
 ) -> bool:
     """Require the named alert Pod (and UID when declared) for lifecycle evidence."""
+    if not target.pod and resolved_pod_anchor and resolved_pod_anchor.ownership_verified:
+        return bool(
+            isinstance(pod_summary, dict)
+            and str(pod_summary.get("name") or "") == resolved_pod_anchor.pod
+            and (
+                not target.namespace
+                or str(pod_summary.get("namespace") or "") == target.namespace
+            )
+            and _pod_matches_target_uid(pod_summary, resolved_pod_anchor)
+        )
     return bool(
         target.pod
         and isinstance(pod_summary, dict)
@@ -4544,6 +4615,10 @@ def _event_matches_resolved_pod(
     that disagrees with the selected Pod rejects even a same-name replacement;
     matching UID also permits API variants that omit or alter the name.
     """
+    # Admission (collect the resolved Pod's Events as context) is name/UID-based;
+    # ownership_verified gates only PROMOTION to scoped/verified, not collection —
+    # otherwise a selector-resolved Pod's evidence vanishes instead of degrading
+    # to partial coverage.
     if resolved_pod_anchor is None or not resolved_pod_anchor.pod:
         return False
     involved = event.get("involvedObject")

@@ -2947,7 +2947,10 @@ class _HistoryConnection:
                 },
             ]
         if 'FROM "audit"."workload_history"' in query:
-            assert args[:2] == ("2026-07-10T00:55:00Z", "2026-07-10T01:15:00Z")
+            assert args[:2] == (
+                datetime(2026, 7, 10, 0, 55, tzinfo=UTC),
+                datetime(2026, 7, 10, 1, 15, tzinfo=UTC),
+            )
             if "ANY($3::text[])" in query:
                 assert args[2:] == (["trainer"],)
             if "count(*) AS matching_rows" in query:
@@ -3021,6 +3024,39 @@ async def test_postgres_reads_only_timestamped_audit_history_in_incident_window(
 
 
 @pytest.mark.asyncio
+async def test_loki_and_prometheus_direct_fallback_disable_internal_tls_verify(monkeypatch) -> None:
+    seen: list[bool | str] = []
+    monkeypatch.delenv("MCP_TLS_VERIFY", raising=False)
+
+    async def fake_get_json(*, base_url, path, timeout_seconds, params=None, headers=None, verify=True):
+        seen.append(verify)
+        if "loki" in path:
+            return JsonResponse(
+                url=f"{base_url}{path}",
+                status_code=200,
+                data={"status": "success", "data": {"resultType": "streams", "result": []}},
+            )
+        return JsonResponse(
+            url=f"{base_url}{path}",
+            status_code=200,
+            data={"status": "success", "data": {"resultType": "vector", "result": []}},
+        )
+
+    monkeypatch.setattr(loki, "get_json", fake_get_json)
+    monkeypatch.setattr(prometheus, "get_json", fake_get_json)
+    settings = replace(make_settings(), loki_url="https://loki.internal", prometheus_url="https://prom.internal")
+
+    await loki._collect_loki_direct(settings, [("logs", '{namespace="runai"}')], [])
+    await prometheus._collect_prometheus_direct(settings, [("up", "up")], [])
+    assert seen == [False, False]
+
+    monkeypatch.setenv("MCP_TLS_VERIFY", "true")
+    await loki._collect_loki_direct(settings, [("logs", '{namespace="runai"}')], [])
+    await prometheus._collect_prometheus_direct(settings, [("up", "up")], [])
+    assert seen == [False, False, True, True]
+
+
+@pytest.mark.asyncio
 async def test_postgres_history_queries_target_beyond_latest_generic_sample() -> None:
     class TargetOlderThanGenericSample(_HistoryConnection):
         async def fetch(self, query: str, *args):
@@ -3028,7 +3064,10 @@ async def test_postgres_history_queries_target_beyond_latest_generic_sample() ->
                 return await super().fetch(query, *args)
             if 'FROM "audit"."workload_history"' not in query:
                 return await super().fetch(query, *args)
-            assert args[:2] == ("2026-07-10T00:55:00Z", "2026-07-10T01:15:00Z")
+            assert args[:2] == (
+                datetime(2026, 7, 10, 0, 55, tzinfo=UTC),
+                datetime(2026, 7, 10, 1, 15, tzinfo=UTC),
+            )
             targeted = "ANY($3::text[])" in query
             if "count(*) AS matching_rows" in query:
                 return [{

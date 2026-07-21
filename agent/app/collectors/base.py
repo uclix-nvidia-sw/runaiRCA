@@ -58,6 +58,8 @@ class AnalysisTarget:
     # from the project so department-scoped reads can deliberately remain
     # unscoped when alert metadata does not supply one.
     department: str = ""
+    # UID-grounded controller-to-Pod ownership proof for controller alerts.
+    ownership_verified: bool = False
 
 
 _INCIDENT_PRELUDE = timedelta(minutes=5)

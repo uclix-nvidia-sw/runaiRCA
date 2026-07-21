@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -17,6 +18,11 @@ _log = logging.getLogger(__name__)
 
 MCP_FALLBACK_WARNING = "MCP unavailable; used direct API fallback"
 _mcp_deadline: ContextVar[float | None] = ContextVar("mcp_deadline", default=None)
+_QUERY_REJECTION_RE = re.compile(
+    r"\b(?:HTTP|status(?:\s+code)?)\s*400\b|\b(?:parse error|invalid query|"
+    r"invalid char escape|syntax error|unexpected (?:by|identifier|character))\b",
+    re.IGNORECASE,
+)
 
 
 @asynccontextmanager
@@ -64,6 +70,11 @@ async def _within_mcp_budget(factory):
         raise TimeoutError("MCP collector budget exhausted before direct fallback") from exc
 
 
+def mcp_tls_verify() -> bool:
+    """Use the MCP TLS escape hatch for direct internal datasource calls too."""
+    return os.getenv("MCP_TLS_VERIFY", "").strip().lower() in ("1", "true", "yes")
+
+
 def _mcp_client_factory():
     """httpx client factory for MCP streamable-HTTP calls.
 
@@ -74,7 +85,7 @@ def _mcp_client_factory():
     present a trusted cert to restore verification.
     ponytail: insecure-by-default MCP TLS; flip MCP_TLS_VERIFY=true to harden.
     """
-    if os.getenv("MCP_TLS_VERIFY", "").strip().lower() in ("1", "true", "yes"):
+    if mcp_tls_verify():
         return None  # None → SDK's default client (system trust store)
 
     def factory(
@@ -95,13 +106,17 @@ def _mcp_client_factory():
     return factory
 
 
-def mcp_fallback_warning(exc: Exception) -> str:
+def mcp_fallback_warning(exc: Exception, *, source: str = "MCP") -> str:
     """Fallback warning that names the ACTUAL failure, not just the class.
 
-    'MCP unavailable: RuntimeError' is undiagnosable from a report; keep the
-    message (truncated) so the operator can see WHY MCP fell back to direct API.
+    Query rejections are application-level answers, not transport outages. Keep
+    their parser detail separate so a malformed query cannot impersonate an
+    unavailable MCP service.
     """
     detail = _safe_text(str(exc), limit=160)
+    if _QUERY_REJECTION_RE.search(detail):
+        label = f"{source} query rejected"
+        return f"{label}: {detail}" if detail else label
     label = f"{MCP_FALLBACK_WARNING}: {type(exc).__name__}"
     return f"{label}: {detail}" if detail else label
 

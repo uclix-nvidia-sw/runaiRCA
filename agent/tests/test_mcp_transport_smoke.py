@@ -190,6 +190,16 @@ def test_mcp_error_and_fallback_messages_are_masked_and_folded() -> None:
     assert "[MASKED]" in joined
 
 
+def test_query_rejection_warning_is_not_labeled_mcp_unavailable() -> None:
+    warning = mcp_client.mcp_fallback_warning(
+        RuntimeError("loki API returned status code 400: parse error: unexpected by"),
+        source="Loki",
+    )
+
+    assert warning.startswith("Loki query rejected:")
+    assert "MCP unavailable" not in warning
+
+
 def test_mcp_tool_json_masks_structured_and_raw_text() -> None:
     structured = mcp_client.mcp_tool_json(
         _Result(structured={"message": "ok", "api_key": "mcp-structured-secret-12345"})
@@ -249,6 +259,13 @@ def test_mcp_client_factory_defaults_insecure_and_hardens_via_env(monkeypatch) -
     assert mcp_client._mcp_client_factory() is not None
     monkeypatch.setenv("MCP_TLS_VERIFY", "true")
     assert mcp_client._mcp_client_factory() is None
+
+
+def test_direct_datasource_tls_uses_the_mcp_tls_escape_hatch(monkeypatch) -> None:
+    monkeypatch.delenv("MCP_TLS_VERIFY", raising=False)
+    assert mcp_client.mcp_tls_verify() is False
+    monkeypatch.setenv("MCP_TLS_VERIFY", "yes")
+    assert mcp_client.mcp_tls_verify() is True
 
 
 @pytest.mark.asyncio

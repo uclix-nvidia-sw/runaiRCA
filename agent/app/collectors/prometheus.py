@@ -28,6 +28,7 @@ from app.mcp_client import (
     mcp_call_many,
     mcp_error,
     mcp_fallback_warning,
+    mcp_tls_verify,
     mcp_tool_json,
 )
 
@@ -94,7 +95,7 @@ class PrometheusCollector:
                 )
                 used_mcp = True
             except Exception as exc:  # noqa: BLE001 - fallback is the behavior.
-                warnings.append(mcp_fallback_warning(exc))
+                warnings.append(mcp_fallback_warning(exc, source="Prometheus"))
         else:
             warnings.append(f"{MCP_FALLBACK_WARNING}: PROMETHEUS_MCP_URL not configured")
 
@@ -460,6 +461,7 @@ async def _collect_prometheus_direct(
                 if time_range
                 else {"query": query}
             ),
+            verify=mcp_tls_verify(),
         )
         status = _prometheus_status(response.data)
         error = response.error or _prometheus_api_error(
