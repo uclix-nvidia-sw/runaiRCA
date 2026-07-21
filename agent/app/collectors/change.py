@@ -15,8 +15,13 @@ via the LLM (Korean when settings.language == "ko").
 
 from __future__ import annotations
 
+import base64
+import gzip
+import json
+import logging
 import re
 import time
+import zlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -57,6 +62,9 @@ _QUERY_KIND_ALIASES = {
 }
 _CHANGE_SOURCE_GROUP = "kubernetes_api"
 _COMPONENT_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?")
+_log = logging.getLogger(__name__)
+_HELM_DIFF_MAX_KEYS = 25
+_HELM_VALUE_MAX_LENGTH = 256
 
 
 def _helm_change_detection_enabled(settings: Settings) -> bool:
@@ -867,17 +875,24 @@ class ChangeCollector:
         # Keep only the newest revision per release within the window.
         latest: dict[str, dict] = {}
         revisions: dict[str, list[int]] = {}
+        revision_items: dict[str, dict[int, dict]] = {}
         for item in _items(data):
             meta = _dict(item.get("metadata"))
             labels = _dict(meta.get("labels"))
             release = str(labels.get("name") or "").strip()
-            created = meta.get("creationTimestamp")
-            if not release or not _within_window(created, now, window_seconds=window_seconds):
+            if not release:
                 continue
             try:
                 version = int(labels.get("version") or 0)
             except (TypeError, ValueError):
                 version = 0
+            # Retain EVERY revision's Secret for the value-diff — the prior
+            # revision is normally OLDER than the window, so window-filtering it
+            # out here would make the diff impossible.
+            revision_items.setdefault(release, {})[version] = item
+            created = meta.get("creationTimestamp")
+            if not _within_window(created, now, window_seconds=window_seconds):
+                continue
             revisions.setdefault(release, []).append(version)
             prev = latest.get(release)
             if prev is None or version >= prev["_version"]:
@@ -906,6 +921,11 @@ class ChangeCollector:
             observed = sorted(set(revisions.get(release, [])), reverse=True)
             item["revision_count"] = len(observed)
             item["prior_revisions"] = [revision for revision in observed if revision != entry["revision"]]
+            all_revisions = sorted(revision_items.get(release, {}))
+            prior = max((r for r in all_revisions if r < entry["revision"]), default=None)
+            current_secret = revision_items.get(release, {}).get(entry["revision"])
+            prior_secret = revision_items.get(release, {}).get(prior) if prior is not None else None
+            _add_helm_payload_diff(item, current_secret, prior_secret, self._settings)
             out.append(item)
         return out
 
@@ -1307,10 +1327,126 @@ async def _senior_insight(settings: Settings, changes: list[dict]) -> str:
 
 def _collector_masker(settings: Settings):
     return build_masker(
-        settings.masking_regex_list,
-        builtin_enabled=settings.builtin_redaction_enabled,
-        hash_mode=settings.builtin_redaction_hash_mode,
+        getattr(settings, "masking_regex_list", ()),
+        builtin_enabled=getattr(settings, "builtin_redaction_enabled", True),
+        hash_mode=getattr(settings, "builtin_redaction_hash_mode", False),
     )
+
+
+def _add_helm_payload_diff(
+    item: dict, current_secret: object, prior_secret: object, settings: Settings
+) -> None:
+    """Best-effort Helm payload evidence; labels remain the fallback on any failure."""
+    current = _decode_helm_release(current_secret)
+    prior = _decode_helm_release(prior_secret)
+    if current is None or prior is None:
+        return
+
+    current_chart = _dict(current.get("chart"))
+    prior_chart = _dict(prior.get("chart"))
+    current_metadata = _dict(current_chart.get("metadata"))
+    prior_metadata = _dict(prior_chart.get("metadata"))
+    current_version = current_metadata.get("version")
+    prior_version = prior_metadata.get("version")
+    current_app_version = current_metadata.get("appVersion")
+    prior_app_version = prior_metadata.get("appVersion")
+    if current_version != prior_version:
+        item["chart_version_change"] = {"from": prior_version, "to": current_version}
+    if current_app_version != prior_app_version:
+        item["chart_app_version_change"] = {"from": prior_app_version, "to": current_app_version}
+    current_values = _helm_effective_values(current)
+    prior_values = _helm_effective_values(prior)
+    diff = _helm_values_diff(current_values, prior_values, _collector_masker(settings))
+    if diff:
+        item["helm_values_changed"] = diff
+
+
+def _decode_helm_release(secret: object) -> dict | None:
+    if not isinstance(secret, dict):
+        return None
+    encoded = _dict(secret.get("data")).get("release")
+    if not isinstance(encoded, str) or not encoded:
+        return None
+    try:
+        payload = base64.b64decode(encoded, validate=True)
+        # Kubernetes JSON uses one base64 layer around Helm's base64 payload.
+        text = payload.strip()
+        if text and len(text) % 4 == 0 and re.fullmatch(rb"[A-Za-z0-9+/]*={0,2}", text):
+            payload = base64.b64decode(text, validate=True)
+        try:
+            payload = gzip.decompress(payload)
+        except (OSError, EOFError):
+            payload = zlib.decompress(payload)
+        decoded = json.loads(payload.decode("utf-8"))
+    except (
+        ValueError,
+        TypeError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        OSError,
+        EOFError,
+        zlib.error,
+    ):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _helm_effective_values(release: dict) -> dict:
+    config = _dict(release.get("config"))
+    chart = _dict(release.get("chart"))
+    chart_values = _dict(chart.get("values"))
+    return _merge_helm_values(chart_values, config)
+
+
+def _merge_helm_values(base: dict, overrides: dict) -> dict:
+    merged = dict(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_helm_values(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _flatten_helm_values(value: object, prefix: str = "") -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {prefix: value}
+    flattened: dict[str, object] = {}
+    for key, child in value.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(child, dict) and child:
+            flattened.update(_flatten_helm_values(child, path))
+        else:
+            flattened[path] = child
+    return flattened
+
+
+def _helm_values_diff(current: dict, prior: dict, masker) -> list[dict]:  # noqa: ANN001
+    current_flat = _flatten_helm_values(current)
+    prior_flat = _flatten_helm_values(prior)
+    changes = []
+    for key in sorted(set(current_flat) | set(prior_flat)):
+        if key in current_flat and key in prior_flat and current_flat[key] == prior_flat[key]:
+            continue
+        changes.append({
+            "key": key,
+            "from": _mask_and_truncate_helm_value(masker, key, prior_flat.get(key)),
+            "to": _mask_and_truncate_helm_value(masker, key, current_flat.get(key)),
+        })
+    dropped = max(0, len(changes) - _HELM_DIFF_MAX_KEYS)
+    if dropped:
+        _log.warning("helm values diff capped; dropped %d keys", dropped)
+    return changes[:_HELM_DIFF_MAX_KEYS]
+
+
+def _mask_and_truncate_helm_value(masker, key: str, value: object) -> object:  # noqa: ANN001
+    leaf = key.rsplit(".", 1)[-1]
+    masked = masker.mask_object({leaf: value}).get(leaf)
+    if isinstance(masked, (dict, list, tuple)):
+        masked = json.dumps(masked, sort_keys=True, default=str)
+    if isinstance(masked, str) and len(masked) > _HELM_VALUE_MAX_LENGTH:
+        return masked[:_HELM_VALUE_MAX_LENGTH] + "…"
+    return masked
 
 
 def _first_namespace(plan) -> str:  # noqa: ANN001
