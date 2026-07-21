@@ -109,7 +109,7 @@ async def answer_chat(
                 break
             action = str(decision.get("action") or "")
             if action == "answer":
-                text = str(decision.get("answer") or "").strip()
+                text = _strip_tool_echo(str(decision.get("answer") or ""))
                 if text:
                     return masker.mask_text(text), None
                 break
@@ -247,8 +247,36 @@ async def _final_answer(
         model=settings.llm_model_chat,
     )
     if text and text.strip():
-        return masker.mask_text(text.strip()), None
+        cleaned = _strip_tool_echo(text)
+        if cleaned:
+            return masker.mask_text(cleaned), None
     return None, masker.mask_text(error or "the chat agent produced no answer")
+
+
+def _strip_tool_echo(text: str) -> str:
+    """Drop leading gathered_so_far-style JSON blocks from an answer.
+
+    A derailed model pastes the tool-history format from its prompt (
+    ``[{"tool": ..., "query": ..., "result": ...}]``) ahead of its real answer;
+    those blocks are prompt artifacts, never operator content (2026-07-21 chat
+    incident). Only leading blocks are dropped — a legit answer quoting a tool
+    result inline stays intact."""
+    decoder = json.JSONDecoder()
+    while True:
+        candidate = text.lstrip()
+        if not candidate.startswith("["):
+            return text.strip()
+        try:
+            block, end = decoder.raw_decode(candidate)
+        except ValueError:
+            return text.strip()
+        if not (
+            isinstance(block, list)
+            and block
+            and all(isinstance(entry, dict) and "tool" in entry for entry in block)
+        ):
+            return text.strip()
+        text = candidate[end:]
 
 
 def _chat_masker(settings: Settings):
