@@ -59,6 +59,7 @@ _SNAPSHOT_ERROR_PATTERNS = re.compile(
 # Sources the DaemonSet endpoint understands. Only journalctl-backed sources
 # can be verified against a historical incident window; the rest are snapshots.
 _SOURCES = ("dmesg", "journal", "syslog", "fabricmanager", "nvidia-smi", "nvlink")
+_GPU_ONLY_SOURCES = {"fabricmanager", "nvidia-smi", "nvlink"}
 _TIME_WINDOWABLE_SOURCES = ("journal", "fabricmanager")
 
 # The ad-hoc capability remains bounded. It is an incident discriminator, not
@@ -479,6 +480,7 @@ class SystemCollector:
             node_origin=node_origin,
             alert_node=alert_node,
             resolved_pod=resolved_pod,
+            gpu_node=None,
         )
 
     async def _scan_all_nodes(self, target: AnalysisTarget, plan) -> CollectorResult:
@@ -493,11 +495,30 @@ class SystemCollector:
             )
             items = data.get("items") if isinstance(data, dict) else data
             if isinstance(items, list):
-                nodes = [
-                    str(item.get("metadata", {}).get("name") or "").strip()
-                    for item in items
-                    if isinstance(item, dict) and isinstance(item.get("metadata"), dict)
-                ]
+                nodes = []
+                for item in items:
+                    if not isinstance(item, dict) or not isinstance(item.get("metadata"), dict):
+                        continue
+                    metadata = item["metadata"]
+                    status = item.get("status") if isinstance(item.get("status"), dict) else {}
+                    capacity = status.get("capacity")
+                    if isinstance(capacity, dict) and "nvidia.com/gpu" in capacity:
+                        gpu_node = str(capacity.get("nvidia.com/gpu") or "").strip() not in {
+                            "",
+                            "0",
+                            "0.0",
+                        }
+                    else:
+                        labels = (
+                            metadata.get("labels")
+                            if isinstance(metadata.get("labels"), dict)
+                            else {}
+                        )
+                        gpu_node = (
+                            labels.get("nvidia.com/gpu.present") == "true"
+                            or labels.get("feature.node.kubernetes.io/pci-10de.present") == "true"
+                        )
+                    nodes.append((str(metadata.get("name") or "").strip(), gpu_node))
             else:
                 nodes = []
         except Exception:  # noqa: BLE001 - keep system evidence optional
@@ -538,8 +559,9 @@ class SystemCollector:
         )
         semaphore = asyncio.Semaphore(5)
 
-        async def scan(node: str) -> CollectorResult:
+        async def scan(node_info: tuple[str, bool]) -> CollectorResult:
             async with semaphore:
+                node, gpu_node = node_info
                 return await self._scan_node(
                     target,
                     plan,
@@ -547,6 +569,7 @@ class SystemCollector:
                     node_origin="cluster_scan",
                     alert_node="",
                     resolved_pod="",
+                    gpu_node=gpu_node,
                 )
 
         results = await asyncio.gather(*(scan(node) for node in selected_nodes))
@@ -595,6 +618,7 @@ class SystemCollector:
         node_origin: str,
         alert_node: str,
         resolved_pod: str,
+        gpu_node: bool | None,
     ) -> CollectorResult:
         # Pod DNS usually cannot resolve bare node hostnames (http://dgx01:9095 ->
         # "Name or service not known"), so resolve the node's InternalIP from the
@@ -628,7 +652,11 @@ class SystemCollector:
         )
         source_results = []
         raw_matches: dict[str, list[str]] = {}
-        for source in _SOURCES:
+        sources_skipped = [
+            source for source in _SOURCES if gpu_node is False and source in _GPU_ONLY_SOURCES
+        ]
+        sources_to_scan = [source for source in _SOURCES if source not in sources_skipped]
+        for source in sources_to_scan:
             params = {"source": source, "lines": "500"}
             # Only journalctl sources have a trustworthy historical time
             # predicate. Snapshot sources are current-state context, not proof
@@ -830,6 +858,37 @@ class SystemCollector:
             "resolved_pod": resolved_pod,
             "sources": source_results,
         }
+        sources_scanned = [
+            {
+                "source": item["source"],
+                "status_code": item["status_code"],
+                "line_count": item["line_count"],
+                "error_count": item["error_count"],
+                "windowed": bool(item.get("historical_scope")),
+                "window_verified": bool(item.get("historical_window_verified")),
+            }
+            for item in source_results
+        ]
+        query_sources = ",".join(item["source"] for item in source_results)
+        current_tail_sources = ",".join(
+            item["source"]
+            for item in source_results
+            if item["source"] not in _TIME_WINDOWABLE_SOURCES
+        )
+        request_endpoint = f"{base_url}/logs?source=<...>&lines=500"
+        if "{node}" not in self._settings.system_agent_url:
+            request_endpoint += f"&node={node}"
+        query = (
+            f"{node}: {len(source_results)} per-source GET {request_endpoint}"
+            + (
+                f" window={time_range['start']}..{time_range['end']}"
+                if time_range and any(item["source"] == "journal" for item in source_results)
+                else ""
+            )
+            + f" current-tail=[{current_tail_sources}]"
+            + f" ran=[{query_sources}]"
+            + (f" skipped(non-GPU)=[{','.join(sources_skipped)}]" if sources_skipped else "")
+        )
         observation = _system_observation(
             source_results,
             time_range=time_range,
@@ -854,17 +913,14 @@ class SystemCollector:
                     type="node_logs",
                     status=status,
                     confidence=confidence,
-                    query=(
-                        f"GET {result.get('base_url') or ''}/logs node={node} "
-                        f"sources={','.join(_SOURCES)} "
-                        + (
-                            f"window={time_range['start']}..{time_range['end']}"
-                            if time_range
-                            else "window=current-tail"
-                        )
-                    ),
+                    query=query,
                     summary=summary,
-                    result={**result, "observation": observation},
+                    result={
+                        **result,
+                        "observation": observation,
+                        "sources_scanned": sources_scanned,
+                        "sources_skipped": sources_skipped,
+                    },
                 )
             ],
         )

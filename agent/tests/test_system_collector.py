@@ -131,6 +131,108 @@ async def test_no_node_scans_all_cluster_nodes(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.asyncio
+async def test_non_gpu_cluster_node_skips_gpu_sources_and_reports_breakdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.collectors import kubernetes as k8s
+
+    calls: list[str] = []
+
+    async def no_target_node(*_args, **_kwargs):
+        return "", "", ""
+
+    async def fake_k8s_read(*_args, **_kwargs):
+        return {"error": None, "data": {"items": [{"metadata": {"name": "cpu-node"}}]}}
+
+    async def fake_internal_ip(_settings, node):
+        return node
+
+    async def fake_get_json(*, base_url, path, timeout_seconds, params, **kwargs):
+        calls.append(params["source"])
+        return JsonResponse(url=f"{base_url}{path}", status_code=200, data={"lines": []})
+
+    monkeypatch.setattr(system_mod, "_node_from_target_pod", no_target_node)
+    monkeypatch.setattr(k8s, "k8s_read", fake_k8s_read)
+    monkeypatch.setattr(system_mod, "_node_internal_ip", fake_internal_ip)
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+
+    result = await SystemCollector(_Settings()).collect(_target(node=""))
+    artifact_result = result.artifacts[0].result
+
+    assert calls == ["dmesg", "journal", "syslog"]
+    assert result.status == "partial"
+    assert artifact_result["sources_skipped"] == ["fabricmanager", "nvidia-smi", "nvlink"]
+    assert {item["source"] for item in artifact_result["sources_scanned"]} == {
+        "dmesg",
+        "journal",
+        "syslog",
+    }
+    assert all(item["status_code"] == 200 for item in artifact_result["sources_scanned"])
+    assert all(
+        item["line_count"] == 0 and item["error_count"] == 0
+        for item in artifact_result["sources_scanned"]
+    )
+    assert "ran=[dmesg,journal,syslog]" in result.artifacts[0].query
+    assert "skipped(non-GPU)=[fabricmanager,nvidia-smi,nvlink]" in result.artifacts[0].query
+
+
+@pytest.mark.asyncio
+async def test_gpu_cluster_node_scans_all_sources(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.collectors import kubernetes as k8s
+
+    calls: list[str] = []
+
+    async def no_target_node(*_args, **_kwargs):
+        return "", "", ""
+
+    async def fake_k8s_read(*_args, **_kwargs):
+        return {
+            "error": None,
+            "data": {
+                "items": [
+                    {
+                        "metadata": {"name": "gpu-node", "labels": {}},
+                        "status": {"capacity": {"nvidia.com/gpu": "1"}},
+                    }
+                ]
+            },
+        }
+
+    async def fake_internal_ip(_settings, node):
+        return node
+
+    async def fake_get_json(*, params, **kwargs):
+        calls.append(params["source"])
+        return JsonResponse(url="http://node/logs", status_code=200, data={"lines": []})
+
+    monkeypatch.setattr(system_mod, "_node_from_target_pod", no_target_node)
+    monkeypatch.setattr(k8s, "k8s_read", fake_k8s_read)
+    monkeypatch.setattr(system_mod, "_node_internal_ip", fake_internal_ip)
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+
+    await SystemCollector(_Settings()).collect(_target(node=""))
+
+    assert calls == list(system_mod._SOURCES)
+
+
+@pytest.mark.asyncio
+async def test_alert_node_with_unknown_gpu_status_scans_all_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    async def fake_get_json(*, params, **kwargs):
+        calls.append(params["source"])
+        return JsonResponse(url="http://node/logs", status_code=200, data={"lines": []})
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+
+    await SystemCollector(_Settings()).collect(_target())
+
+    assert calls == list(system_mod._SOURCES)
+
+
+@pytest.mark.asyncio
 async def test_node_scoped_target_scans_only_its_node(monkeypatch: pytest.MonkeyPatch) -> None:
     scanned: set[str] = set()
 
