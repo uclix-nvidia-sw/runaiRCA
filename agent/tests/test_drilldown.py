@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,7 +18,12 @@ from app.services.drilldown import (
     _tool_k8s_logs,
     _tool_logql,
     _tool_promql,
+    _tool_runai_cluster_infrastructure_health,
+    _tool_runai_cluster_metrics,
+    _tool_runai_cluster_physical_inventory,
+    _tool_runai_department_resources,
     _tool_runai_project_resources,
+    _tool_runai_workload_effective_policy,
     _tool_runai_workload_status,
     _tool_runai_workload_summary,
     run_drilldowns,
@@ -1362,9 +1368,285 @@ def test_official_runai_registry_exposes_target_bound_read_tools() -> None:
         "runai_workload_metrics",
         "runai_project_resources",
         "runai_project_metrics",
+        "runai_workload_effective_policy",
+        "runai_department_resources",
+        "runai_cluster_physical_inventory",
+        "runai_cluster_infrastructure_health",
+        "runai_cluster_metrics",
         "runai_node_pools",
         "runai_node_pods",
     } <= set(tools)
+
+
+def test_runai_cluster_physical_inventory_returns_success_and_error_artifacts(monkeypatch) -> None:
+    class _Result:
+        isError = False
+        content = []
+
+    calls = iter([_Result(), RuntimeError("physical inventory unavailable")])
+
+    async def fake_mcp_call(settings, tool, arguments):
+        outcome = next(calls)
+        if isinstance(outcome, Exception):
+            raise outcome
+        assert tool == "get_cluster_physical_inventory"
+        assert arguments == {"clusterId": "cluster-id"}
+        return outcome
+
+    async def fake_cluster_id(settings, target):
+        return "cluster-id"
+
+    monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
+    monkeypatch.setattr(drilldown, "_resolve_runai_cluster_id", fake_cluster_id)
+    settings = drill_settings(runai_mcp_url="http://localhost:8080/mcp")
+
+    success = asyncio.run(_tool_runai_cluster_physical_inventory(settings, _target(), {}))
+    assert success["error"] is None
+    failed = asyncio.run(_tool_runai_cluster_physical_inventory(settings, _target(), {}))
+    assert "physical inventory unavailable" in failed["error"]
+
+    async def missing_cluster_id(settings, target):
+        raise RuntimeError("could not resolve Run:ai cluster ID")
+
+    monkeypatch.setattr(drilldown, "_resolve_runai_cluster_id", missing_cluster_id)
+    unresolved = asyncio.run(_tool_runai_cluster_physical_inventory(settings, _target(), {}))
+    assert "could not resolve Run:ai cluster ID" in unresolved["error"]
+
+
+def test_runai_cluster_infrastructure_health_returns_success_and_error_artifacts(
+    monkeypatch,
+) -> None:
+    class _Result:
+        isError = False
+        content = []
+
+    calls = iter([_Result(), RuntimeError("infrastructure health unavailable")])
+
+    async def fake_mcp_call(settings, tool, arguments):
+        outcome = next(calls)
+        if isinstance(outcome, Exception):
+            raise outcome
+        assert tool == "get_cluster_infrastructure_health"
+        assert arguments == {"clusterId": "cluster-id"}
+        return outcome
+
+    async def fake_cluster_id(settings, target):
+        return "cluster-id"
+
+    monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
+    monkeypatch.setattr(drilldown, "_resolve_runai_cluster_id", fake_cluster_id)
+    settings = drill_settings(runai_mcp_url="http://localhost:8080/mcp")
+
+    success = asyncio.run(
+        _tool_runai_cluster_infrastructure_health(settings, _target(), {})
+    )
+    assert success["error"] is None
+    failed = asyncio.run(_tool_runai_cluster_infrastructure_health(settings, _target(), {}))
+    assert "infrastructure health unavailable" in failed["error"]
+
+
+def test_runai_cluster_metrics_uses_incident_window_and_returns_error_artifact(monkeypatch) -> None:
+    class _Result:
+        isError = False
+        content = []
+
+    calls = iter([_Result(), RuntimeError("cluster metrics unavailable")])
+    captured: list[dict] = []
+
+    async def fake_mcp_call(settings, tool, arguments):
+        captured.append({"tool": tool, "arguments": arguments})
+        outcome = next(calls)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    async def fake_cluster_id(settings, target):
+        return "cluster-id"
+
+    monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
+    monkeypatch.setattr(drilldown, "_resolve_runai_cluster_id", fake_cluster_id)
+    settings = drill_settings(runai_mcp_url="http://localhost:8080/mcp")
+    target = replace(
+        _target(), fired_at="2025-01-01T00:00:00Z", resolved_at="2025-01-01T00:10:00Z"
+    )
+
+    assert asyncio.run(_tool_runai_cluster_metrics(settings, target, {}))["error"] is None
+    failed = asyncio.run(_tool_runai_cluster_metrics(settings, target, {}))
+    assert captured == [
+        {
+            "tool": "get_cluster_metrics",
+            "arguments": {
+                "clusterId": "cluster-id",
+                "start": "2024-12-31T23:55:00Z",
+                "end": "2025-01-01T00:15:00Z",
+            },
+        },
+        {
+            "tool": "get_cluster_metrics",
+            "arguments": {
+                "clusterId": "cluster-id",
+                "start": "2024-12-31T23:55:00Z",
+                "end": "2025-01-01T00:15:00Z",
+            },
+        },
+    ]
+    assert "cluster metrics unavailable" in failed["error"]
+
+
+def test_runai_department_resources_scopes_when_labeled_and_returns_error_artifact(
+    monkeypatch,
+) -> None:
+    class _Result:
+        isError = False
+        content = []
+
+    calls = iter([_Result(), _Result(), RuntimeError("department resources unavailable")])
+    captured: list[dict] = []
+
+    async def fake_mcp_call(settings, tool, arguments):
+        captured.append({"tool": tool, "arguments": arguments})
+        outcome = next(calls)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
+    settings = drill_settings(runai_mcp_url="http://localhost:8080/mcp")
+
+    assert asyncio.run(
+        _tool_runai_department_resources(settings, replace(_target(), department="research"), {})
+    )["error"] is None
+    assert asyncio.run(_tool_runai_department_resources(settings, _target(), {}))["error"] is None
+    failed = asyncio.run(_tool_runai_department_resources(settings, _target(), {}))
+    assert captured == [
+        {"tool": "list_department_resources", "arguments": {"departmentName": "research"}},
+        {"tool": "list_department_resources", "arguments": {}},
+        {"tool": "list_department_resources", "arguments": {}},
+    ]
+    assert "department resources unavailable" in failed["error"]
+
+
+def test_runai_workload_effective_policy_requires_project_kind_and_returns_success(
+    monkeypatch,
+) -> None:
+    class _Result:
+        isError = False
+        content = []
+
+    captured: dict = {}
+
+    async def fake_mcp_call(settings, tool, arguments):
+        captured["tool"] = tool
+        captured["arguments"] = arguments
+        return _Result()
+
+    async def fake_project_id(settings, target):
+        return "project-id"
+
+    monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
+    monkeypatch.setattr(drilldown, "_resolve_runai_project_id", fake_project_id)
+    settings = drill_settings(runai_mcp_url="http://localhost:8080/mcp")
+
+    assert asyncio.run(
+        _tool_runai_workload_effective_policy(
+            settings, replace(_target(), project="vision", workload_type="training"), {}
+        )
+    )["error"] is None
+    failed = asyncio.run(_tool_runai_workload_effective_policy(settings, _target(), {}))
+    assert captured == {
+        "tool": "get_workload_effective_policy",
+        "arguments": {"projectId": "project-id", "kind": "Training"},
+    }
+    assert "no Run:ai project" in failed["error"]
+
+    invalid_kind = asyncio.run(
+        _tool_runai_workload_effective_policy(
+            settings, replace(_target(), project="vision", workload_type="batch"), {}
+        )
+    )
+    assert "unusable" in invalid_kind["error"]
+
+    async def missing_project_id(settings, target):
+        raise RuntimeError("could not resolve Run:ai project ID")
+
+    monkeypatch.setattr(drilldown, "_resolve_runai_project_id", missing_project_id)
+    unresolved = asyncio.run(
+        _tool_runai_workload_effective_policy(
+            settings, replace(_target(), project="vision", workload_type="Inference"), {}
+        )
+    )
+    assert "could not resolve Run:ai project ID" in unresolved["error"]
+
+
+def test_runai_cluster_id_discovery_matches_name_uses_single_cluster_and_errors(
+    monkeypatch,
+) -> None:
+    drilldown._RUNAI_CLUSTER_ID_CACHE.clear()
+    responses = iter(
+        [
+            {"clusters": [{"name": "uclick-runai", "uuid": "named-cluster-id"}]},
+            [{"name": "only-cluster", "id": "single-cluster-id"}],
+            {"clusters": [{"name": "one", "uuid": "one-id"}, {"name": "two", "uuid": "two-id"}]},
+        ]
+    )
+    calls: list[dict] = []
+
+    async def fake_get_json(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(ok=True, data=next(responses))
+
+    monkeypatch.setattr(drilldown, "get_json", fake_get_json)
+    settings = drill_settings(
+        runai_base_url="https://runai.example", runai_bearer_token="test-token"
+    )
+
+    named = replace(_target(), cluster="uclick-runai")
+    assert asyncio.run(drilldown._resolve_runai_cluster_id(settings, named)) == "named-cluster-id"
+    assert asyncio.run(drilldown._resolve_runai_cluster_id(settings, named)) == "named-cluster-id"
+    assert asyncio.run(
+        drilldown._resolve_runai_cluster_id(settings, replace(_target(), cluster="alert-name"))
+    ) == "single-cluster-id"
+    with pytest.raises(RuntimeError, match="could not resolve Run:ai cluster ID"):
+        asyncio.run(
+            drilldown._resolve_runai_cluster_id(settings, replace(_target(), cluster="missing"))
+        )
+    assert [call["path"] for call in calls] == [
+        "/api/v1/clusters",
+        "/api/v1/clusters",
+        "/api/v1/clusters",
+    ]
+
+
+def test_runai_project_id_discovery_caches_name_matches_and_errors(monkeypatch) -> None:
+    drilldown._RUNAI_PROJECT_ID_CACHE.clear()
+    responses = iter(
+        [
+            {"projects": [{"name": "vision", "id": "vision-id"}]},
+            [{"name": "other", "id": "other-id"}],
+        ]
+    )
+    calls: list[dict] = []
+
+    async def fake_get_json(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(ok=True, data=next(responses))
+
+    monkeypatch.setattr(drilldown, "get_json", fake_get_json)
+    settings = drill_settings(
+        runai_base_url="https://runai.example", runai_bearer_token="test-token"
+    )
+    target = replace(_target(), project="vision")
+
+    assert asyncio.run(drilldown._resolve_runai_project_id(settings, target)) == "vision-id"
+    assert asyncio.run(drilldown._resolve_runai_project_id(settings, target)) == "vision-id"
+    with pytest.raises(RuntimeError, match="could not resolve Run:ai project ID"):
+        asyncio.run(
+            drilldown._resolve_runai_project_id(settings, replace(_target(), project="missing"))
+        )
+    assert [call["path"] for call in calls] == [
+        "/api/v1/org-unit/projects",
+        "/api/v1/org-unit/projects",
+    ]
 
 
 def test_change_tool_does_not_advertise_secret_backed_helm_scan_by_default() -> None:

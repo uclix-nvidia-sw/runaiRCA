@@ -60,7 +60,7 @@ flowchart LR
 | `RUNAI_QUEUES_PATH` | Run:ai 큐 API 경로. 기본값 `/api/v1/queues` |
 | `RUNAI_VERSION_PATH` | Run:ai 컨트롤 플레인 버전 API 경로. 기본값 `/api/v1/version` — 이미 수정된 알려진 이슈를 버전 기반으로 억제할 수 있게 합니다 |
 | `RUNAI_TIMEOUT_SECONDS` | Run:ai API 요청 타임아웃. 기본값 `120` |
-| `RUNAI_MCP_URL` | runai-mcp shared service URL(stdio→HTTP 브리지, 예: `http://runai-rca-runai-mcp:8809/mcp`). 설정하면 runai 수집기와 드릴다운이 426개 Run:ai API를 스펙 인식 방식으로 접근합니다. 실패 시에는 고정 엔드포인트 수집기로 폴백합니다. Helm은 기본적으로 ClusterIP 서비스를 실행하고 이 값을 설정합니다(`runaiMcp.enabled: true`) |
+| `RUNAI_MCP_URL` | 공식 NVIDIA Run:ai MCP shared service URL(스트리머블 HTTP `/mcp`, 예: `http://runai-rca-runai-mcp:8080/mcp`). 설정하면 runai 수집기와 드릴다운이 집중된 읽기 전용 16개 도구 세트를 사용합니다. 엔드포인트는 OIDC로 보호되며, Helm은 이를 공유 ClusterIP 서비스로 배포하고 기본적으로 이 URL을 설정합니다(`runaiMcp.enabled: true`). 어떤 실패든 Run:ai 직접 HTTP 읽기로 폴백합니다. |
 | `RUNAI_LOG_NAMESPACES` | 쉼표로 구분된 Run:ai 컨트롤 플레인 로그 네임스페이스. 기본값 `runai,runai-backend` |
 | `PROMETHEUS_URL` | Prometheus 기본 URL |
 | `PROMETHEUS_TIMEOUT_SECONDS` | Prometheus 쿼리 타임아웃 |
