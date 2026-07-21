@@ -178,7 +178,7 @@ class Settings:
     # Approved incident-derived knowledge is fetched read-only from the backend.
     # These defaults preserve existing Settings(...) callers and keep a rollout
     # reversible without changing the version-controlled baseline catalogs.
-    dynamic_knowledge_mode: str = "shadow"  # off | shadow | assist | authoritative
+    dynamic_knowledge_mode: str = "assist"  # off | shadow | assist | authoritative
     runtime_knowledge_url: str = ""
     runtime_knowledge_token: str = ""
     runtime_knowledge_refresh_seconds: int = 30
@@ -380,5 +380,5 @@ def _open_world_mode_env() -> str:
 
 
 def _dynamic_knowledge_mode_env() -> str:
-    mode = os.getenv("DYNAMIC_KNOWLEDGE_MODE", "shadow").strip().lower()
-    return mode if mode in {"off", "shadow", "assist", "authoritative"} else "shadow"
+    mode = os.getenv("DYNAMIC_KNOWLEDGE_MODE", "assist").strip().lower()
+    return mode if mode in {"off", "shadow", "assist", "authoritative"} else "assist"

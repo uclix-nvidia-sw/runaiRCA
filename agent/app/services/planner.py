@@ -275,6 +275,7 @@ def _diagnostic_directive(
     kg_context: dict,
     alert_text: str,
     family_catalog: FamilyCatalog,
+    seed_family: str = "",
 ) -> dict:
     tree, source = resolve_tree(
         kg_context.get("diagnostic_tree"), settings.failure_modes_file
@@ -311,11 +312,21 @@ def _diagnostic_directive(
         if len(probes) == 8:
             break
     known_template_ids = {str(probe.get("template_id") or "") for probe in probes}
-    for probe in _registered_tree_probes(tree, _runtime_probe_template_ids(family)):
-        if probe["template_id"] in known_template_ids:
-            continue
-        probes.append(probe)
-        known_template_ids.add(probe["template_id"])
+    registered_families = [family]
+    if seed_family and seed_family != family:
+        registered_families.append(seed_family)
+    for registered_family in registered_families:
+        for probe in _registered_tree_probes(
+            tree, _runtime_probe_template_ids(registered_family)
+        ):
+            if probe["template_id"] in known_template_ids:
+                continue
+            if registered_family != family:
+                probe["hypothesis_family"] = registered_family
+            probes.append(probe)
+            known_template_ids.add(probe["template_id"])
+            if len(probes) == 8:
+                break
         if len(probes) == 8:
             break
     return {
@@ -420,12 +431,17 @@ def _bind_probe_hypotheses(
     for probe in directive.get("probes") or []:
         if not isinstance(probe, dict):
             continue
-        bound_probe = {key: value for key, value in probe.items() if key != "hypothesis_ids"}
+        bound_probe = {
+            key: value
+            for key, value in probe.items()
+            if key not in {"hypothesis_ids", "hypothesis_family"}
+        }
+        probe_family = str(probe.get("hypothesis_family") or family)
         if run_id:
             bound_probe["hypothesis_ids"] = [
                 str(hypothesis.get("id") or "")
                 for hypothesis in hypotheses
-                if str(hypothesis.get("family") or "") == family
+                if str(hypothesis.get("family") or "") == probe_family
                 and str(hypothesis.get("id") or "")
             ]
         bound["probes"].append(bound_probe)
@@ -533,7 +549,7 @@ async def plan_investigation(
             f"operator seed_family '{seed_family}' is not in the root-cause family catalog and was ignored"
         )
     diagnostic_directive = _diagnostic_directive(
-        settings, kg_context, alert_text, family_catalog
+        settings, kg_context, alert_text, family_catalog, seed_family if seed_valid else ""
     )
     hypotheses, keyword_signal = _ordered_hypotheses(target, family_catalog)
     # Namespace decides the emphasis: a Run:ai platform namespace (runai/runai-backend)
@@ -594,7 +610,7 @@ async def plan_investigation(
             h for h in hypotheses if h["family"] != component_entry["family"]
         ]
     if seed_valid:
-        seed_reason = "operator RCA correction; collect supporting and refuting evidence"
+        seed_reason = "seeded root-cause family; collect supporting and refuting evidence"
         hypotheses = [{"family": seed_family, "reason": seed_reason}] + [
             h for h in hypotheses if h["family"] != seed_family
         ]
@@ -707,7 +723,7 @@ async def plan_investigation(
         )
     if seed_valid:
         narrative = (
-            f"An operator RCA correction selected {seed_family} as the leading hypothesis. "
+            f"A seeded root-cause family selected {seed_family} as the leading hypothesis. "
             "Collect evidence that could confirm or refute it. " + narrative
         )
 
@@ -748,7 +764,7 @@ async def plan_investigation(
             _log.warning("LLM plan refinement failed; using deterministic plan", exc_info=True)
 
     if seed_valid:
-        seed_reason = "operator RCA correction; collect supporting and refuting evidence"
+        seed_reason = "seeded root-cause family; collect supporting and refuting evidence"
         plan.hypotheses = [{"family": seed_family, "reason": seed_reason}] + [
             h for h in plan.hypotheses if h.get("family") != seed_family
         ]

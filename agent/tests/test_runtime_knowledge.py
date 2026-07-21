@@ -274,6 +274,12 @@ def test_settings_default_runtime_snapshot_url_and_mode(monkeypatch) -> None:
     assert settings.dynamic_knowledge_mode == "authoritative"
 
 
+def test_settings_default_dynamic_knowledge_mode_is_assist(monkeypatch) -> None:
+    monkeypatch.delenv("DYNAMIC_KNOWLEDGE_MODE", raising=False)
+
+    assert load_settings().dynamic_knowledge_mode == "assist"
+
+
 def test_validate_runtime_knowledge_normalizes_active_compiled_package() -> None:
     package = _snapshot()["packages"][0]
 

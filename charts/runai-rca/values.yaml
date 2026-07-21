@@ -490,7 +490,10 @@ agent:
     # Approved incident-derived knowledge is read-only at runtime. Empty
     # runtimeKnowledgeUrl derives the backend runtime-snapshot endpoint from
     # backendUrl; leave the token empty unless that endpoint is protected.
-    dynamicKnowledgeMode: shadow
+    # assist: approved-case confirming probes are injected into matching
+    # incidents (bounded, evidence-gated — never forces a conclusion). Inert
+    # until the first case is approved. Set to shadow to keep replay off.
+    dynamicKnowledgeMode: assist
     runtimeKnowledgeUrl: ""
     runtimeKnowledgeToken: ""
     runtimeKnowledgeRefreshSeconds: 30

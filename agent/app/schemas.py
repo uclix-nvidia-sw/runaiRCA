@@ -61,6 +61,8 @@ class SimilarIncidentContext(BaseModel):
     positive_feedback: int = 0
     negative_feedback: int = 0
     comment_count: int = 0
+    root_cause_family: str = ""
+    approved: bool = False
 
 
 class FeedbackHintContext(BaseModel):

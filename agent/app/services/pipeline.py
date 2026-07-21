@@ -138,6 +138,8 @@ class PipelineState:
     # approval path.
     blackboard: Any = None
     priors: dict[str, float] | None = None
+    effective_seed_family: str = ""
+    effective_seed_provenance: str = ""
     observed: str = ""
     alert_fuzzy: str = ""
     xid_codes: list[int] = field(default_factory=list)
@@ -636,6 +638,19 @@ async def enrich_stage(state: PipelineState) -> PipelineState:
 
 async def plan_stage(state: PipelineState) -> PipelineState:
     recent_changes = await _preplan_recent_changes(state)
+    explicit_seed = str(state.request.seed_family or "").strip()
+    approved_seed = approved_similar_seed(
+        state.request.similar_incidents,
+        load_family_catalog(state.settings.families_file),
+    )
+    state.effective_seed_family = explicit_seed or approved_seed
+    state.effective_seed_provenance = (
+        "operator_reverify"
+        if explicit_seed
+        else "approved_prior_match"
+        if approved_seed
+        else ""
+    )
     # Plan first (senior-SRE "think before you dig"): scope every collector to
     # what THIS alert needs instead of always scraping the control plane.
     state.plan = await plan_investigation(
@@ -645,7 +660,7 @@ async def plan_stage(state: PipelineState) -> PipelineState:
         state.kg_context.as_dict(),
         list(state.request.similar_incidents),
         recent_changes,
-        state.request.seed_family,
+        state.effective_seed_family,
     )
     state.extra_warnings.extend(state.plan.warnings)
     # A planner/live lookup may identify resources that exist today. Pin every
@@ -1471,7 +1486,7 @@ async def rank_stage(state: PipelineState) -> PipelineState:
         pass
     else:
         state.priors = derive_priors(request.feedback_hints)
-    seed_family = str(request.seed_family or "").strip()
+    seed_family = state.effective_seed_family
     if seed_family in load_family_catalog(settings.families_file).families:
         state.priors = dict(state.priors or {})
         # A correction changes investigation order, not the evidence gate: the
@@ -2123,6 +2138,8 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             "occurrence_count": request.occurrence_count,
             "occurrence_pods": request.occurrence_pods,
             "seed_family": request.seed_family,
+            "effective_seed_family": state.effective_seed_family,
+            "effective_seed_provenance": state.effective_seed_provenance,
             "affected_pods": affected_pods,
             "similar_incidents": [
                 item.model_dump(mode="json") for item in request.similar_incidents
@@ -5247,6 +5264,28 @@ def _runai_highlights(details: dict[str, object]) -> list[str]:
 
 
 _SIMILARITY_FLOOR = 0.80
+
+
+def approved_similar_seed(similar_incidents: list[object], families_catalog: object) -> str:
+    """Return the unambiguous approved prior family trusted for recurrence replay."""
+    catalog_families = set(getattr(families_catalog, "families", ()))
+    qualified = [
+        incident
+        for incident in similar_incidents
+        if bool(getattr(incident, "approved", False))
+        and (getattr(incident, "similarity", 0) or 0) >= _SIMILARITY_FLOOR
+        and (family := str(getattr(incident, "root_cause_family", "") or "").strip())
+        and family in catalog_families
+    ]
+    if not qualified:
+        return ""
+    highest_similarity = max((incident.similarity or 0) for incident in qualified)
+    best = [
+        incident for incident in qualified if (incident.similarity or 0) == highest_similarity
+    ]
+    if len(best) != 1:
+        return ""
+    return str(best[0].root_cause_family).strip()
 
 
 def _recommended_action_lines(
