@@ -3248,7 +3248,15 @@ async def _resolve_workload_pod(settings: Settings, target: AnalysisTarget) -> d
                 if _owned_by(item, target.workload_type, target.workload_name, controller_uid)
             ]
     selected = _diagnostic_pod(owned_items, target.workload_name) or _diagnostic_pod(items, target.workload_name)
-    ownership_verified = bool(selected and selected in owned_items and controller_uid)
+    # A single selector-matched Pod is unambiguously the controller's Pod (the
+    # label selector is authoritative for membership), so promote it even when the
+    # UID chain is unavailable (ReplicaSet read failed / controller has no uid).
+    # Ambiguity — more than one candidate, e.g. an in-progress rollout with two
+    # ReplicaSets — still requires the UID chain to avoid mis-attribution.
+    unambiguous_single = bool(selector) and len(items) == 1 and selected is not None
+    ownership_verified = bool(
+        (selected and selected in owned_items and controller_uid) or unambiguous_single
+    )
     selected_metadata = selected.get("metadata") if isinstance(selected, dict) and isinstance(selected.get("metadata"), dict) else {}
     selected_text = " ".join(
         [str(selected_metadata.get("name") or ""), *map(str, (selected_metadata.get("labels") or {}).values())]

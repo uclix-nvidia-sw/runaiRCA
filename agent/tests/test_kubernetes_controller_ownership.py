@@ -95,3 +95,43 @@ async def test_deployment_rollout_only_selects_uid_owned_replica_set_pod(monkeyp
     )
     assert resolution["selected_pod"] == "api-new"
     assert resolution["ownership_verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_single_selector_pod_promotes_without_uid_chain(monkeypatch) -> None:
+    # No controller uid + exactly one selector-matched Pod -> unambiguous -> promote.
+    deployment = {"metadata": {}, "spec": {"selector": {"matchLabels": {"app": "api"}}}}
+    pods = [{"metadata": {"name": "api-only", "uid": "pod-only"}}]
+
+    async def fake_read(_settings, resource, *, namespace, name="", label_selector="", full_object=False):
+        if resource == "deployments":
+            return {"data": deployment}
+        return {"data": {"items": pods}}
+
+    monkeypatch.setattr(kubernetes, "k8s_read", fake_read)
+    resolution = await kubernetes._resolve_workload_pod(
+        SimpleNamespace(kubernetes_namespaces=()), target()
+    )
+    assert resolution["selected_pod"] == "api-only"
+    assert resolution["ownership_verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_multiple_selector_pods_without_uid_chain_stay_unverified(monkeypatch) -> None:
+    # Two selector-matched Pods and no UID chain -> ambiguous -> NOT promoted.
+    deployment = {"metadata": {}, "spec": {"selector": {"matchLabels": {"app": "api"}}}}
+    pods = [
+        {"metadata": {"name": "api-a", "uid": "pod-a"}},
+        {"metadata": {"name": "api-b", "uid": "pod-b"}},
+    ]
+
+    async def fake_read(_settings, resource, *, namespace, name="", label_selector="", full_object=False):
+        if resource == "deployments":
+            return {"data": deployment}
+        return {"data": {"items": pods}}
+
+    monkeypatch.setattr(kubernetes, "k8s_read", fake_read)
+    resolution = await kubernetes._resolve_workload_pod(
+        SimpleNamespace(kubernetes_namespaces=()), target()
+    )
+    assert resolution["ownership_verified"] is False
