@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -8,6 +9,14 @@ from app.collectors import kubernetes
 from app.collectors.base import resolve_target
 from app.collectors.kubernetes import _collect_resolved_pod_logs, _resolve_workload_pod
 from tests.test_orchestrator import make_settings, make_target
+
+
+class _McpResult:
+    isError = False
+
+    def __init__(self, structured: object) -> None:
+        self.structuredContent = structured
+        self.content: list[object] = []
 
 
 @pytest.mark.parametrize(
@@ -204,3 +213,117 @@ async def test_collector_drills_controller_alert_down_to_pod_logs(monkeypatch) -
     assert result.details["resolved_pod"] == "api-failed"
     assert result.details["pod_logs"][0]["lines"] == ["Traceback: application failed"]
     assert result.details["pod_statuses"][-1]["phase"] == "Failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_pod", "expected_count", "expected_verified"),
+    [
+        ("permission-manager-67466b4f94-rj5d2", 1, True),
+        ("other-app-12345-abcde", 0, False),
+    ],
+)
+async def test_workload_firing_warning_uses_resolved_pod_identity_anchor(
+    monkeypatch, event_pod, expected_count, expected_verified
+) -> None:
+    """Deployment alerts verify only Events for their resolved live Pod."""
+    namespace = "permission-manager"
+    pod_name = "permission-manager-67466b4f94-rj5d2"
+    now = datetime.now(UTC).replace(microsecond=0)
+    pod = {
+        "metadata": {
+            "name": pod_name,
+            "namespace": namespace,
+            "uid": "permission-manager-pod-uid",
+            "labels": {"app": "permission-manager"},
+            "ownerReferences": [
+                {"kind": "ReplicaSet", "name": "permission-manager-67466b4f94", "uid": "pm-rs-uid"}
+            ],
+        },
+        "spec": {"containers": [{"name": "manager"}]},
+        "status": {
+            "phase": "Pending",
+            "containerStatuses": [
+                {
+                    "name": "manager",
+                    "state": {"waiting": {"reason": "ImagePullBackOff"}},
+                }
+            ],
+        },
+    }
+    event = {
+        "metadata": {"namespace": namespace},
+        "involvedObject": {"kind": "Pod", "name": event_pod, "namespace": namespace},
+        "type": "Warning",
+        "reason": "Failed",
+        "message": "Error: ImagePullBackOff",
+        "eventTime": now.isoformat().replace("+00:00", "Z"),
+    }
+
+    async def fake_mcp_call(_url, tool, arguments):
+        kind = str(arguments.get("kind") or "").casefold()
+        if tool == "resources_get" and kind in {"deployment", "deployments"}:
+            return _McpResult(
+                {
+                    "metadata": {
+                        "name": "permission-manager",
+                        "namespace": namespace,
+                        "uid": "pm-deploy-uid",
+                    },
+                    "spec": {"selector": {"matchLabels": {"app": "permission-manager"}}},
+                }
+            )
+        if tool == "resources_get" and kind in {"replicaset", "replicasets"}:
+            return _McpResult(
+                {
+                    "metadata": {
+                        "name": "permission-manager-67466b4f94",
+                        "namespace": namespace,
+                        "uid": "pm-rs-uid",
+                        "ownerReferences": [
+                            {"kind": "Deployment", "name": "permission-manager", "uid": "pm-deploy-uid"}
+                        ],
+                    }
+                }
+            )
+        if tool in {"pods_list_in_namespace", "pods_list"} or (
+            tool == "resources_list" and kind in {"pod", "pods"}
+        ):
+            return _McpResult({"items": [pod]})
+        if tool in {"pods_get", "resources_get"} and (
+            tool == "pods_get" or kind in {"pod", "pods"}
+        ):
+            return _McpResult(pod)
+        if tool in {"events_list", "resources_list"}:
+            return _McpResult({"items": [event]})
+        return _McpResult({"items": []})
+
+    monkeypatch.setattr(kubernetes, "mcp_call", fake_mcp_call)
+    monkeypatch.setattr(kubernetes, "_read_file", lambda _path: "")
+    target = replace(
+        make_target(),
+        namespace=namespace,
+        workload_name="permission-manager",
+        workload_type="Deployment",
+        pod="",
+        fired_at=(now - timedelta(hours=2)).isoformat().replace("+00:00", "Z"),
+        resolved_at="",
+    )
+
+    result = await kubernetes.KubernetesCollector(
+        replace(make_settings(), kubernetes_mcp_url="http://kubernetes-mcp/mcp")
+    ).collect(target)
+
+    warning_events = next(a for a in result.artifacts if a.type == "kubernetes_warning_events")
+    observation = warning_events.result["observation"]
+    assert result.details["resolved_pod"] == pod_name
+    assert observation["event_count"] >= expected_count
+    assert observation["target_identity_verified"] is expected_verified
+    if expected_verified:
+        # A bare MCP Event list has no pagination metadata, so it deliberately
+        # remains incomplete. Positive, target-verified evidence is still
+        # scoped; completeness only gates absence claims.
+        assert observation["queries_complete"] is False
+        assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
+    else:
+        assert observation["event_count"] == 0

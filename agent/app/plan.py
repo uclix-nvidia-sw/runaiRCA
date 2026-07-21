@@ -47,6 +47,8 @@ class InvestigationPlan:
     # Approved historical cases are priors only; collectors receive them to
     # choose discriminating tests, never as current-incident evidence.
     case_cards: list[dict[str, Any]] = field(default_factory=list)
+    # Non-fatal planning anomalies (for example an unknown operator seed).
+    warnings: list[str] = field(default_factory=list)
 
     def for_collector(self, name: str) -> InvestigationPlan:
         """Give one collector the shared directive plus its neutral role."""
@@ -84,4 +86,5 @@ class InvestigationPlan:
             "component": self.component,
             "diagnostic_directive": self.diagnostic_directive,
             "case_cards": self.case_cards,
+            "warnings": self.warnings,
         }

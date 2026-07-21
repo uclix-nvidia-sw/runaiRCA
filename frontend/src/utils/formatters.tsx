@@ -51,13 +51,15 @@ export function sourceLabel(source: string) {
       return 'Feedback';
     case 'chat':
       return 'Chat';
+    case 'operator':
+      return 'Operator';
     default:
       return 'RCA';
   }
 }
 
 export function normalizeAnalysisSource(source: string) {
-  if (['auto', 'manual', 'comment', 'feedback', 'chat'].includes(source)) {
+  if (['auto', 'manual', 'comment', 'feedback', 'chat', 'operator'].includes(source)) {
     return source;
   }
   return 'manual';

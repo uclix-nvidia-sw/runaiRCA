@@ -966,39 +966,130 @@ async def external_case_cards(
         return [], [f"external-case retrieval unavailable: {type(exc).__name__}"]
 
 
-def _query_external_cases(
-    client: TypeDBClient, observed_text: str, limit: int
+async def external_case_hints(
+    settings: Settings, observed_text: str, *, limit: int = 2
 ) -> list[dict[str, Any]]:
+    """Return bounded, unverified diagnostic leads from matching external cases.
+
+    This deliberately reads the immutable CaseCard JSON rather than resolution
+    relations: diagnostic/preventive historical actions are investigation leads,
+    not known causes or fixes. A missing lead must never fail an RCA.
+    """
+    if not observed_text or not settings.enable_typedb or not settings.typedb_address:
+        return []
+    try:
+        import typedb.driver  # noqa: F401
+    except ImportError:
+        _log.warning("external-case hints skipped: typedb-driver is not installed")
+        return []
+    try:
+        client = TypeDBClient(settings)
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                _query_external_case_hints, client, observed_text, min(max(limit, 1), 2)
+            ),
+            timeout=settings.typedb_timeout_seconds + 1,
+        )
+    except Exception as exc:  # noqa: BLE001 - a missing hint is safer than a failed RCA
+        _log.warning("external-case hint retrieval failed: %s", exc, exc_info=True)
+        return []
+
+
+def _matched_external_cases(
+    run: Any, observed_text: str
+) -> list[tuple[str, dict[str, Any], list[str]]]:
+    """Use the shared external error-signature matcher before card projection."""
     text = (observed_text or "").lower()
     if not text:
         return []
-    with client.open_reader() as run:
-        cases: dict[str, dict[str, Any]] = {}
-        for row in run(_EXTERNAL_CASE_QUERY):
-            case_id = str(row.get("case_id") or "")
-            name = str(row.get("sn") or "")
-            if not case_id or not name.startswith("ext:"):  # only case-local symptoms
-                continue
-            info = cases.setdefault(
-                case_id,
+    cases: dict[str, dict[str, Any]] = {}
+    for row in run(_EXTERNAL_CASE_QUERY):
+        case_id = str(row.get("case_id") or "")
+        name = str(row.get("sn") or "")
+        if not case_id or not name.startswith("ext:"):  # only case-local symptoms
+            continue
+        info = cases.setdefault(
+            case_id,
+            {
+                "incident_id": str(row.get("iid") or ""),
+                "family": str(row.get("family") or ""),
+                "analysis_summary": str(row.get("sum") or ""),
+                "keywords": set(),
+            },
+        )
+        kw = str(row.get("kw") or "").strip().lower()
+        if kw:
+            info["keywords"].add(kw)
+    matched: list[tuple[str, dict[str, Any], list[str]]] = []
+    for case_id, info in cases.items():
+        hits, _negated = _keyword_hits(text, sorted(info["keywords"]))
+        if hits:
+            matched.append((case_id, info, hits))
+    return sorted(matched, key=lambda match: (-len(match[2]), match[0]))
+
+
+def _external_case_hint_projection(run: Any, case_id: str) -> list[dict[str, Any]]:
+    """Extract only diagnostic/preventive CaseCard actions for drill-down."""
+    if not case_id:
+        return []
+    try:
+        rows = run(_CASE_CARD_QUERY.format(case_id=escape_typeql(case_id)))
+        raw = next((row.get("card") for row in rows if row.get("card")), "")
+        card = json.loads(raw) if isinstance(raw, str) else {}
+    except Exception:  # noqa: BLE001 - external hints are strictly best-effort
+        return []
+    if not isinstance(card, dict):
+        return []
+    searchable_context = card.get("searchable_context")
+    raw_tokens = (
+        searchable_context.get("canonical_component_tokens")
+        if isinstance(searchable_context, dict)
+        else []
+    )
+    tokens = [
+        " ".join(str(token).split()).lower()[:80]
+        for token in raw_tokens
+        if str(token).strip()
+    ][:12] if isinstance(raw_tokens, list) else []
+    hints: list[dict[str, Any]] = []
+    for action in card.get("historical_actions") or []:
+        if not isinstance(action, dict):
+            continue
+        if str(action.get("outcome") or "").strip().lower() not in {
+            "diagnostic",
+            "preventive",
+        }:
+            continue
+        normalized_action = " ".join(str(action.get("normalized_action") or "").split())[:500]
+        if normalized_action:
+            hints.append(
                 {
-                    "incident_id": str(row.get("iid") or ""),
-                    "family": str(row.get("family") or ""),
-                    "analysis_summary": str(row.get("sum") or ""),
-                    "keywords": set(),
-                },
+                    "case_id": case_id,
+                    "normalized_action": normalized_action,
+                    "canonical_component_tokens": tokens,
+                }
             )
-            kw = str(row.get("kw") or "").strip().lower()
-            if kw:
-                info["keywords"].add(kw)
-        matched: list[tuple[str, dict[str, Any], list[str]]] = []
-        for case_id, info in cases.items():
-            hits, _negated = _keyword_hits(text, sorted(info["keywords"]))
-            if hits:
-                matched.append((case_id, info, hits))
+    return hints[:4]
+
+
+def _query_external_case_hints(
+    client: TypeDBClient, observed_text: str, limit: int
+) -> list[dict[str, Any]]:
+    with client.open_reader() as run:
+        hints: list[dict[str, Any]] = []
+        case_limit = min(max(limit, 1), 2)
+        for case_id, _info, _hits in _matched_external_cases(run, observed_text)[:case_limit]:
+            hints.extend(_external_case_hint_projection(run, case_id))
+        return hints
+
+
+def _query_external_cases(
+    client: TypeDBClient, observed_text: str, limit: int
+) -> list[dict[str, Any]]:
+    with client.open_reader() as run:
+        matched = _matched_external_cases(run, observed_text)
         # Most signature hits first, then case_id — deterministic, no run() calls
         # for non-matching cases (early return before per-case projection).
-        matched.sort(key=lambda m: (-len(m[2]), m[0]))
         cards: list[dict[str, Any]] = []
         for case_id, info, hits in matched[:limit]:
             projection = _case_card_projection(run, case_id)

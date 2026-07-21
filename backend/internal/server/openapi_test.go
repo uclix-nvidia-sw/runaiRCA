@@ -37,10 +37,25 @@ func TestOpenAPIContractIsServedAndContainsKnowledgeLifecycle(t *testing.T) {
 		"/api/v1/knowledge/runtime-snapshot",
 		"/api/v1/knowledge/probe-metrics",
 		"/api/v1/knowledge/families",
+		"/api/v1/incidents/{id}/rca-correction",
+		"/api/v1/incidents/{id}/rca-pin",
+		"/api/v1/incidents/{id}/reverify",
 	} {
 		if _, ok := spec.Paths[path]; !ok {
 			t.Fatalf("OpenAPI contract missing %s", path)
 		}
+	}
+	correction := spec.Paths["/api/v1/incidents/{id}/rca-correction"]
+	post, ok := correction["post"].(map[string]any)
+	if !ok {
+		t.Fatalf("RCA correction OpenAPI operation missing post definition: %+v", correction)
+	}
+	responses, ok := post["responses"].(map[string]any)
+	if !ok {
+		t.Fatalf("RCA correction OpenAPI operation missing responses: %+v", post)
+	}
+	if _, ok := responses["503"]; !ok {
+		t.Fatalf("RCA correction OpenAPI operation must document catalog-unavailable 503: %+v", responses)
 	}
 }
 

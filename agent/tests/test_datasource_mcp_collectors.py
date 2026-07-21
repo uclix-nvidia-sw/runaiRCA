@@ -6,12 +6,14 @@ from types import SimpleNamespace
 import pytest
 
 from app.collectors import kubernetes, loki, postgres, prometheus
+from app.collectors.base import NO_EVIDENCE
 from app.collectors.grafana_mcp import (
     clear_grafana_datasource_cache,
     mark_grafana_datasource_failure,
     resolve_grafana_datasource_uid,
 )
 from app.collectors.http_json import JsonResponse
+from app.plan import InvestigationPlan
 from tests.test_orchestrator import make_settings, make_target
 
 
@@ -230,6 +232,38 @@ async def test_prometheus_collector_uses_mcp_before_direct_http(monkeypatch) -> 
     assert all(args["endTime"] == "2026-07-10T01:15:00Z" for args in query_args)
     assert all(args["stepSeconds"] == 60 and "expr" in args for args in query_args)
     assert all("query" not in args and "datasource_uid" not in args for args in query_args)
+
+
+@pytest.mark.asyncio
+async def test_prometheus_insight_excludes_global_connectivity_probe(monkeypatch) -> None:
+    captured: list[list[dict[str, object]]] = []
+
+    async def fake_many(_url, calls):
+        return [
+            _McpResult(
+                {"status": "success", "data": {"result": [{"metric": {}, "value": [1, "1"]}]}}
+            )
+            for _ in calls
+        ]
+
+    async def fake_insight(_settings, _source, _summary, evidence):
+        captured.append(evidence)
+        return None
+
+    monkeypatch.setattr(prometheus, "mcp_call_many", fake_many)
+    monkeypatch.setattr(prometheus, "_llm_insight", fake_insight)
+    result = await prometheus.PrometheusCollector(
+        replace(
+            make_settings(),
+            prometheus_mcp_url="http://grafana-mcp/insight-test",
+            prometheus_datasource_uid="prom-main",
+        )
+    ).collect(make_target())
+
+    assert captured
+    assert all(item["name"] != "prometheus_up" for item in captured[0])
+    assert any(item["name"] == "prometheus_up" for item in result.details["queries"])
+    assert any(item["name"] != "prometheus_up" for item in captured[0])
 
 
 @pytest.mark.asyncio
@@ -697,6 +731,104 @@ async def test_kubernetes_collector_uses_mcp_before_service_account_token(
 
 
 @pytest.mark.asyncio
+async def test_firing_alert_current_warning_is_scoped_support_and_snapshot_stays_unknown(
+    monkeypatch,
+) -> None:
+    async def fake_mcp_call(url, tool, arguments):
+        if tool == "resources_list" and arguments.get("kind") == "Event":
+            return _McpResult(
+                {
+                    "items": [
+                        {
+                            "metadata": {"namespace": "runai-vision"},
+                            "involvedObject": {"kind": "Pod", "name": "trainer-0"},
+                            "type": "Warning",
+                            "reason": "Failed",
+                            "message": "Error: ImagePullBackOff",
+                            "eventTime": "2026-07-20T23:51:40Z",
+                        }
+                    ]
+                }
+            )
+        if tool in {"pods_get", "resources_get"}:
+            return _McpResult(
+                {
+                    "metadata": {"name": "trainer-0", "namespace": "runai-vision"},
+                    "spec": {"containers": [{"name": "main", "resources": {}}]},
+                    "status": {
+                        "phase": "Running",
+                        "containerStatuses": [{"name": "main", "ready": True}],
+                    },
+                }
+            )
+        return _McpResult({"items": []})
+
+    def unavailable_token(path: str) -> str:
+        # A firing alert probes whether a bounded direct log read is available;
+        # an empty token keeps this test on the MCP path. The strict
+        # no-token-read invariant stays covered by the non-firing test above.
+        return ""
+
+    monkeypatch.setattr(kubernetes, "mcp_call", fake_mcp_call)
+    monkeypatch.setattr(kubernetes, "_read_file", unavailable_token)
+    firing_target = replace(make_target(), fired_at="2026-07-20T08:00:00Z", resolved_at="")
+    result = await kubernetes.KubernetesCollector(
+        replace(
+            make_settings(),
+            kubernetes_mcp_url="http://kubernetes-mcp/mcp",
+            enable_pod_exec=False,
+        )
+    ).collect(firing_target)
+
+    assert result.details["used_mcp"] is True
+    warning_events = next(a for a in result.artifacts if a.type == "kubernetes_warning_events")
+    assert warning_events.result["observation"]["polarity"] == "present"
+    assert warning_events.result["observation"]["coverage"] == "scoped"
+    # The live Pod snapshot must stay non-causal even while the alert fires:
+    # only the target-verified Warning event carries the scoped observation.
+    inspection = next(a for a in result.artifacts if a.type == "pod_inspection")
+    assert inspection.result["observation"]["polarity"] == "unknown"
+    assert inspection.result["observation"]["coverage"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_empty_pod_event_scope_is_no_evidence(monkeypatch) -> None:
+    async def empty_scope(**_kwargs):
+        return [
+            {
+                "name": "namespace_pods",
+                "path": "MCP pods_list runai",
+                "error": None,
+                "data": {"items": []},
+            },
+            {
+                "name": "namespace_events",
+                "path": "MCP events_list runai",
+                "error": None,
+                "data": {"items": []},
+            },
+        ]
+
+    async def no_workload_pod(*_args, **_kwargs):
+        return {}
+
+    monkeypatch.setattr(kubernetes, "_collect_kubernetes_responses_via_mcp", empty_scope)
+    monkeypatch.setattr(kubernetes, "_resolve_workload_pod", no_workload_pod)
+    result = await kubernetes.KubernetesCollector(
+        replace(make_settings(), kubernetes_mcp_url="http://kubernetes-mcp/mcp")
+    ).collect(
+        replace(make_target(), namespace="runai", pod="", workload_name=""),
+        InvestigationPlan(check_control_plane=False),
+    )
+
+    assert result.summary.startswith(NO_EVIDENCE)
+    assert result.confidence == "low"
+    assert result.details["insight"] == ""
+    assert "healthy" not in result.summary.lower()
+    assert "running" not in result.summary.lower()
+
+
+@pytest.mark.asyncio
 async def test_kubernetes_required_query_failure_keeps_other_mcp_evidence_partial(
     monkeypatch,
 ) -> None:
@@ -723,7 +855,7 @@ async def test_kubernetes_required_query_failure_keeps_other_mcp_evidence_partia
     ).collect(make_target())
 
     assert result.status == "partial"
-    assert result.confidence == "medium"
+    assert result.confidence == "low"
     assert "kubernetes.query" in result.missing_data
     assert any(item["error"] is None for item in result.details["queries"])
     assert any("pods/get forbidden" in str(item["error"]) for item in result.details["queries"])

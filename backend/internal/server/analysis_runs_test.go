@@ -540,6 +540,7 @@ func TestAnalysisRunCompactsSimilarIncidentsForAgent(t *testing.T) {
 		Status:          "ok",
 		AnalysisSummary: strings.Repeat("summary ", 200),
 		AnalysisDetail:  strings.Repeat("detail ", 500),
+		RootCauseFamily: "runai_scheduling_quota",
 	})
 	approveIncidentForTest(t, server.store, priorIncident.IncidentID)
 	_, record := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "compact-current"}, Alert{
@@ -558,6 +559,9 @@ func TestAnalysisRunCompactsSimilarIncidentsForAgent(t *testing.T) {
 	similar := agentReq.SimilarIncidents[0]
 	if similar.AnalysisDetail != "" || similar.Labels != nil {
 		t.Fatalf("similar incident detail/labels should not be sent to agent: %+v", similar)
+	}
+	if similar.RootCauseFamily != "runai_scheduling_quota" || !similar.Approved {
+		t.Fatalf("similar incident provenance should be preserved for the agent: %+v", similar)
 	}
 	if len(similar.AnalysisSummary) > 803 || !strings.HasSuffix(similar.AnalysisSummary, "...") {
 		t.Fatalf("similar incident summary should be capped, got len=%d", len(similar.AnalysisSummary))

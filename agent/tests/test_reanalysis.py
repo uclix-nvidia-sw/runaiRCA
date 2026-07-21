@@ -19,6 +19,8 @@ from app.services import pipeline
 from app.services.evidence_blackboard import EvidenceEligibility
 from app.services.orchestrator import AnalysisOrchestrator
 from app.services.pipeline import _collector_name
+from app.services.root_cause_ranking import RankedCause
+from app.plan import InvestigationPlan
 from tests.test_orchestrator import make_settings
 
 
@@ -459,6 +461,47 @@ def test_probe_history_bookkeeping_does_not_count_as_new_evidence() -> None:
     )
 
 
+def test_aggregate_evidence_deduplicates_identical_round_artifacts() -> None:
+    state = pipeline.new_state(make_settings(), _request(), collectors=[])
+    first = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="cluster_api",
+        status="ok",
+        confidence="high",
+        query="GET /api/v1/namespaces/runai/pods",
+        summary="empty sweep",
+        result={"items": []},
+    )
+    repeated = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="cluster_api",
+        status="ok",
+        confidence="high",
+        query="GET /api/v1/namespaces/runai/pods",
+        summary="empty sweep from a later round",
+        result={"items": []},
+    )
+    state.results = [
+        CollectorResult(
+            agent="kubernetes", status="ok", summary="same collector", artifacts=[first, repeated]
+        )
+    ]
+
+    pipeline._aggregate_evidence(state)
+    first_signature = pipeline._evidence_signature(state.results)
+    pipeline._aggregate_evidence(state)
+
+    assert state.results[0].artifacts == [first]
+    assert pipeline._evidence_signature(state.results) == first_signature
+
+
+def test_reanalysis_note_is_not_appended_twice() -> None:
+    note = "The previous conclusion was refuted."
+    assert pipeline._append_reanalysis_note(note, note) == note
+
+
 def test_fresh_scoped_support_can_rehabilitate_a_refuted_family() -> None:
     finding = artifact(
         agent="kubernetes",
@@ -495,6 +538,140 @@ def test_fresh_scoped_support_can_rehabilitate_a_refuted_family() -> None:
         fresh,
         {"E23": EvidenceEligibility(False, False, True, "wrong entity")},
     )
+
+
+def test_reanalysis_prefers_newly_eligible_family_over_next_ranked_candidate() -> None:
+    state = pipeline.new_state(make_settings(), _request(), collectors=[])
+    state.plan = InvestigationPlan(
+        hypotheses=[
+            {"family": "platform_lifecycle_change", "reason": "original plan first"},
+            {"family": "k8s_control_plane_error", "reason": "original plan second"},
+        ]
+    )
+    state.root_cause_candidates = [
+        RankedCause("platform_lifecycle_change", "low", 3.0),
+        RankedCause("k8s_control_plane_error", "low", 2.5),
+    ]
+    state.self_check_refuted = True
+    finding = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="warning_event",
+        status="ok",
+        confidence="high",
+        summary="ImagePullBackOff for the affected pod",
+        result={
+            "observation": {
+                "predicate": "kubernetes_event:ImagePullBackOff",
+                "polarity": "present",
+                "coverage": "scoped",
+            }
+        },
+    )
+    finding.evidence_id = "E-image-pull"
+    state.reanalysis_fresh_support_families = pipeline._fresh_eligible_support_families(
+        [CollectorResult(agent="kubernetes", status="ok", summary="", artifacts=[finding])],
+        {"E-image-pull": EvidenceEligibility(True, True, True)},
+    )
+
+    target = pipeline._next_reanalysis_target(state, {"platform_lifecycle_change"})
+
+    assert target is not None
+    assert target.family == "image_pull_error"
+
+
+def test_reanalysis_ledger_carries_evidence_by_family_across_reused_ids() -> None:
+    merged = pipeline._merge_reanalysis_context(
+        {
+            "hypothesis_ledger": [
+                {
+                    "id": "H1",
+                    "family": "image_pull_error",
+                    "evidence_for": ["E-image", "E-image"],
+                    "evidence_against": ["E-registry"],
+                }
+            ]
+        },
+        {
+            "hypothesis_ledger": [
+                {"id": "H1", "family": "platform_lifecycle_change"},
+                {
+                    "id": "H2",
+                    "family": "image_pull_error",
+                    "evidence_for": ["E-pod"],
+                },
+            ]
+        },
+    )
+
+    ledger = merged["hypothesis_ledger"]
+    image_pull = next(item for item in ledger if item["family"] == "image_pull_error")
+    assert image_pull["evidence_for"] == ["E-image", "E-pod"]
+    assert image_pull["evidence_against"] == ["E-registry"]
+    assert len({item["id"] for item in ledger}) == len(ledger)
+
+
+def test_ineligible_fresh_artifact_cannot_change_reanalysis_primary() -> None:
+    state = pipeline.new_state(make_settings(), _request(), collectors=[])
+    state.root_cause_candidates = [
+        RankedCause("platform_lifecycle_change", "low", 3.0),
+        RankedCause("k8s_control_plane_error", "low", 2.5),
+    ]
+    state.self_check_refuted = True
+    unknown = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="warning_event",
+        status="ok",
+        confidence="medium",
+        summary="ImagePullBackOff may be present",
+        result={
+            "observation": {
+                "predicate": "kubernetes_event:ImagePullBackOff",
+                "polarity": "unknown",
+                "coverage": "unknown",
+            }
+        },
+    )
+    unknown.evidence_id = "E-unknown"
+    state.reanalysis_fresh_support_families = pipeline._fresh_eligible_support_families(
+        [CollectorResult(agent="kubernetes", status="ok", summary="", artifacts=[unknown])],
+        {"E-unknown": EvidenceEligibility(False, False, True, "observation is unknown")},
+    )
+
+    target = pipeline._next_reanalysis_target(state, {"platform_lifecycle_change"})
+
+    assert state.reanalysis_fresh_support_families == ()
+    assert target is not None
+    assert target.family == "k8s_control_plane_error"
+
+
+@pytest.mark.asyncio
+async def test_reanalysis_stops_when_a_followup_adds_no_evidence(monkeypatch) -> None:
+    state = pipeline.new_state(llm_settings(), _request(), collectors=[])
+    state.plan = InvestigationPlan(hypotheses=[{"family": "image_pull_error"}])
+    state.root_cause_candidates = [RankedCause("image_pull_error", "low", 2.5)]
+    calls = 0
+
+    async def same_evidence(_state, *, target):
+        nonlocal calls
+        calls += 1
+        return pipeline._ReanalysisOutcome(
+            results=list(_state.results),
+            candidates=[RankedCause(target.family, "low", 2.5)],
+            investigation_context={"hypothesis_ledger": []},
+            caveat="",
+            note="",
+            refuted=False,
+            next_check="",
+            fresh_support_families=(),
+        )
+
+    monkeypatch.setattr(pipeline, "_reanalyze_once", same_evidence)
+
+    await pipeline._investigate_until_settled(state)
+
+    assert calls == 1
 
 
 @pytest.mark.asyncio
@@ -575,6 +752,29 @@ async def test_llm_sharpened_operator_questions_are_single_line(monkeypatch) -> 
     assert questions[0].endswith("…")
     assert "question-secret-12345" not in "\n".join(questions)
     assert "[MASKED]" in "\n".join(questions)
+
+
+@pytest.mark.asyncio
+async def test_operator_question_prompt_includes_already_executed_queries(monkeypatch) -> None:
+    captured: dict[str, str] = {}
+
+    async def fake_complete_json(*_args, system, user, **_kwargs):
+        captured["system"] = system
+        captured["user"] = user
+        return {"questions": ["Which remaining pod event is missing?", "Which queue state is missing?"]}
+
+    monkeypatch.setattr(pipeline, "complete_json", fake_complete_json)
+    await pipeline._operator_questions(
+        llm_settings(),
+        ["kubernetes.events"],
+        None,
+        AnalysisTarget("", "", "", "", "", "", "", "", "", "warning", "X"),
+        "Check the remaining evidence gap.",
+        ["kubectl rollout status deployment/permission-manager -n permission-manager"],
+    )
+
+    assert "Do not ask the operator to run checks equivalent" in captured["system"]
+    assert "kubectl rollout status deployment/permission-manager -n permission-manager" in captured["user"]
 
 
 @pytest.mark.asyncio

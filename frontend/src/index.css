@@ -2167,6 +2167,13 @@ td span.occurrence-pill {
   border-color: #fde68a;
 }
 
+.quality-operator {
+  color: #365314;
+  background: #f7fee7;
+  border-color: #bef264;
+  text-transform: none;
+}
+
 .coverage-strip {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr));
@@ -2423,6 +2430,42 @@ td span.occurrence-pill {
 .rca-summary h3,
 .rca-summary p {
   margin-bottom: 0.35rem;
+}
+
+.rca-summary-heading,
+.rca-operator-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.rca-summary-heading h3 {
+  margin: 0;
+}
+
+.rca-operator-pin {
+  color: #365314;
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.rca-correction-panel {
+  margin-bottom: 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 0.55rem;
+  background: var(--surface-soft);
+  padding: 0.85rem 0.95rem;
+}
+
+.rca-correction-panel .section-title {
+  margin-bottom: 0.8rem;
+}
+
+.rca-correction-panel .feedback-error,
+.rca-summary .feedback-error {
+  width: auto;
+  margin: 0 0 0.8rem;
 }
 
 .rca-feedback-strip {

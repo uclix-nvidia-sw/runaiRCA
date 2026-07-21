@@ -113,6 +113,30 @@ export async function analyzeIncident(id: string): Promise<void> {
   await write(`/api/v1/incidents/${encodeURIComponent(id)}/analyze`);
 }
 
+export type RCACorrectionInput = {
+  root_cause_family: string;
+  summary: string;
+  actions: string[];
+};
+
+export async function rcaCorrection(id: string, input: RCACorrectionInput): Promise<AnalysisRun> {
+  return (await write<Envelope<AnalysisRun>>(
+    `/api/v1/incidents/${encodeURIComponent(id)}/rca-correction`,
+    input,
+  )).data;
+}
+
+export async function rcaPin(id: string, pinned: boolean): Promise<AnalysisRun> {
+  return (await write<Envelope<AnalysisRun>>(
+    `/api/v1/incidents/${encodeURIComponent(id)}/rca-pin`,
+    { pinned },
+  )).data;
+}
+
+export async function reverifyIncident(id: string): Promise<void> {
+  await write(`/api/v1/incidents/${encodeURIComponent(id)}/reverify`);
+}
+
 export async function resolveIncident(id: string): Promise<void> {
   await write(`/api/v1/incidents/${encodeURIComponent(id)}/resolve`);
 }

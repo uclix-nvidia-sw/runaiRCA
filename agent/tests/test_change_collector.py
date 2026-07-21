@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import gzip
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -40,6 +43,11 @@ class _HelmEnabledSettings(_Settings):
 
 def _iso(delta_seconds: int) -> str:
     return (datetime.now(UTC) + timedelta(seconds=delta_seconds)).isoformat()
+
+
+def _helm_release_blob(release: dict) -> str:
+    payload = gzip.compress(json.dumps(release).encode())
+    return base64.b64encode(base64.b64encode(payload)).decode()
 
 
 @pytest.mark.asyncio
@@ -579,6 +587,80 @@ async def test_helm_release_detected(monkeypatch: pytest.MonkeyPatch) -> None:
     assert helm[0]["revision"] == 3
     assert helm[0]["rollout"] is True
     assert helm[0]["helm_status"] == "pending-upgrade"
+
+
+@pytest.mark.asyncio
+async def test_helm_release_value_diff_is_decoded_and_masked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+    prior = {
+        "chart": {"metadata": {"version": "1.0.0", "appVersion": "1.0"}},
+        "config": {"image": {"tag": "old"}, "password": "old-secret"},
+    }
+    current = {
+        "chart": {"metadata": {"version": "1.1.0", "appVersion": "1.1"}},
+        "config": {"image": {"tag": "new"}, "password": "new-secret"},
+    }
+
+    async def fake_get_json(*, base_url, path, timeout_seconds, params, headers, verify):
+        if path.endswith("/secrets"):
+            data = {"items": [
+                {"metadata": {"name": "sh.helm.release.v1.trainer.v2", "namespace": "runai",
+                               "creationTimestamp": _iso(-60),
+                               "labels": {"owner": "helm", "name": "trainer", "version": "2",
+                                           "status": "deployed"}},
+                 "data": {"release": _helm_release_blob(current)}},
+                {"metadata": {"name": "sh.helm.release.v1.trainer.v1", "namespace": "runai",
+                               "creationTimestamp": _iso(-100000),
+                               "labels": {"owner": "helm", "name": "trainer", "version": "1",
+                                           "status": "superseded"}},
+                 "data": {"release": _helm_release_blob(prior)}},
+            ]}
+        else:
+            data = {"items": []}
+        return JsonResponse(url=f"{base_url}{path}", status_code=200, data=data)
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    result = await ChangeCollector(_HelmEnabledSettings()).collect(_target())
+    helm = [c for c in result.details["changes"] if c.get("kind") == "HelmRelease"]
+    assert helm[0]["helm_values_changed"] == [
+        {"key": "image.tag", "from": "old", "to": "new"},
+        {"key": "password", "from": "[MASKED]", "to": "[MASKED]"},
+    ]
+    assert helm[0]["chart_version_change"] == {"from": "1.0.0", "to": "1.1.0"}
+
+
+@pytest.mark.asyncio
+async def test_malformed_helm_payload_keeps_label_only_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, base_url, path, timeout_seconds, params, headers, verify):
+        if path.endswith("/secrets"):
+            data = {"items": [
+                {"metadata": {"name": "sh.helm.release.v1.trainer.v2", "namespace": "runai",
+                               "creationTimestamp": _iso(-60),
+                               "labels": {"owner": "helm", "name": "trainer", "version": "2",
+                                           "status": "failed"}},
+                 "data": {"release": "not-a-release"}},
+                {"metadata": {"name": "sh.helm.release.v1.trainer.v1", "namespace": "runai",
+                               "creationTimestamp": _iso(-100000),
+                               "labels": {"owner": "helm", "name": "trainer", "version": "1",
+                                           "status": "superseded"}},
+                 "data": {"release": "also-not-a-release"}},
+            ]}
+        else:
+            data = {"items": []}
+        return JsonResponse(url=f"{base_url}{path}", status_code=200, data=data)
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    result = await ChangeCollector(_HelmEnabledSettings()).collect(_target())
+    helm = [c for c in result.details["changes"] if c.get("kind") == "HelmRelease"]
+    assert helm[0]["revision"] == 2
+    assert "helm_values_changed" not in helm[0]
+    assert "chart_version_change" not in helm[0]
 
 
 @pytest.mark.asyncio

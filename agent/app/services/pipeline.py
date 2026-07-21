@@ -34,6 +34,7 @@ from app.knowledge import (
     dependency_path,
     load_architecture,
     load_failure_modes,
+    load_family_catalog,
     load_runai_known_issues,
     load_troubleshooting_cases,
     match_failure_mode_symptoms,
@@ -55,6 +56,7 @@ from app.services.general_guidance import general_guidance_lines
 from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
 from app.services.planner import plan_investigation
 from app.services.root_cause_ranking import (
+    FAMILIES,
     RankedCause,
     artifact_supports_family,
     merge_open_world_candidates,
@@ -136,6 +138,8 @@ class PipelineState:
     # approval path.
     blackboard: Any = None
     priors: dict[str, float] | None = None
+    effective_seed_family: str = ""
+    effective_seed_provenance: str = ""
     observed: str = ""
     alert_fuzzy: str = ""
     xid_codes: list[int] = field(default_factory=list)
@@ -147,6 +151,9 @@ class PipelineState:
     self_check_refuted: bool = False
     self_check_next: str = ""
     reanalysis_note: str = ""
+    # Eligible semantic matches returned by the most recent re-analysis pass.
+    # This is intentionally transient: it only changes the next probe order.
+    reanalysis_fresh_support_families: tuple[str, ...] = ()
     graph_fixes: GraphRemediation | None = None
     timeline: object | None = None
     troubleshooting_path: dict[str, Any] | None = None
@@ -179,6 +186,7 @@ class _ReanalysisOutcome:
     note: str
     refuted: bool
     next_check: str
+    fresh_support_families: tuple[str, ...]
 
 
 def new_state(
@@ -577,6 +585,21 @@ def _alert_signature_evidence_result(
 
 def _aggregate_evidence(state: PipelineState) -> None:
     kg_warnings = getattr(state.kg_context, "warnings", []) if state.kg_context is not None else []
+    seen_artifacts: set[tuple[str, str, str, str]] = set()
+    for result in state.results:
+        retained = []
+        for item in result.artifacts:
+            key = (
+                str(getattr(item, "agent", "")),
+                str(getattr(item, "type", "")),
+                str(getattr(item, "query", "")),
+                _json_fingerprint(getattr(item, "result", None)),
+            )
+            if key in seen_artifacts:
+                continue
+            seen_artifacts.add(key)
+            retained.append(item)
+        result.artifacts = retained
     state.capabilities = {result.agent: result.status for result in state.results}
     # Evidence IDs are assigned after every collector has completed. They are
     # response-local, deterministic, and become run-qualified during TypeDB ingest.
@@ -615,6 +638,19 @@ async def enrich_stage(state: PipelineState) -> PipelineState:
 
 async def plan_stage(state: PipelineState) -> PipelineState:
     recent_changes = await _preplan_recent_changes(state)
+    explicit_seed = str(state.request.seed_family or "").strip()
+    approved_seed = approved_similar_seed(
+        state.request.similar_incidents,
+        load_family_catalog(state.settings.families_file),
+    )
+    state.effective_seed_family = explicit_seed or approved_seed
+    state.effective_seed_provenance = (
+        "operator_reverify"
+        if explicit_seed
+        else "approved_prior_match"
+        if approved_seed
+        else ""
+    )
     # Plan first (senior-SRE "think before you dig"): scope every collector to
     # what THIS alert needs instead of always scraping the control plane.
     state.plan = await plan_investigation(
@@ -624,7 +660,9 @@ async def plan_stage(state: PipelineState) -> PipelineState:
         state.kg_context.as_dict(),
         list(state.request.similar_incidents),
         recent_changes,
+        state.effective_seed_family,
     )
+    state.extra_warnings.extend(state.plan.warnings)
     # A planner/live lookup may identify resources that exist today. Pin every
     # concrete identity carried by a resolved alert before any collector uses it.
     _pin_resolved_target_identity(state)
@@ -785,10 +823,25 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
     # evidence (services/drilldown.py). Best-effort, never fails analysis.
     try:
         from app.services.drilldown import run_drilldowns
+        from app.services.kg_enrichment import external_case_hints
 
         drilldown_kwargs: dict[str, Any] = {"blackboard": state.blackboard}
+        evidence_deadline = _evidence_deadline_monotonic(state)
         if _accepts_keyword(run_drilldowns, "deadline_monotonic"):
-            drilldown_kwargs["deadline_monotonic"] = _evidence_deadline_monotonic(state)
+            drilldown_kwargs["deadline_monotonic"] = evidence_deadline
+        if _accepts_keyword(run_drilldowns, "external_case_hints"):
+            observed_text = _observed_text(state.results, state.request)
+            try:
+                if evidence_deadline is not None:
+                    remaining = max(0.0, evidence_deadline - time.monotonic())
+                    hints = await asyncio.wait_for(
+                        external_case_hints(settings, observed_text), timeout=remaining
+                    )
+                else:
+                    hints = await external_case_hints(settings, observed_text)
+            except Exception:  # noqa: BLE001 - optional hints must not skip drill-down
+                hints = []
+            drilldown_kwargs["external_case_hints"] = hints
         await run_drilldowns(settings, state.results, target, plan, **drilldown_kwargs)
     except Exception:  # noqa: BLE001 - drill-down is best-effort
         pass
@@ -1448,6 +1501,12 @@ async def rank_stage(state: PipelineState) -> PipelineState:
         pass
     else:
         state.priors = derive_priors(request.feedback_hints)
+    seed_family = state.effective_seed_family
+    if seed_family in load_family_catalog(settings.families_file).families:
+        state.priors = dict(state.priors or {})
+        # A correction changes investigation order, not the evidence gate: the
+        # ranker applies this only to a family with typed current evidence.
+        state.priors[seed_family] = max(state.priors.get(seed_family, 1.0), 1.75)
     state.progress.emit(
         "ranking",
         "Ranking root-cause candidates",
@@ -2053,7 +2112,12 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
     if top_family in ("", "insufficient_evidence") or state.self_check_refuted:
         try:
             questions = await _operator_questions(
-                settings, state.missing, plan, state.target, state.self_check_next
+                settings,
+                state.missing,
+                plan,
+                state.target,
+                state.self_check_next,
+                _executed_evidence_queries(state.artifacts),
             )
         except Exception:  # noqa: BLE001 - questions are best-effort
             questions = []
@@ -2088,6 +2152,9 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             "nemo_runtime": "enabled" if state.runtime_label == "enabled" else "fallback",
             "occurrence_count": request.occurrence_count,
             "occurrence_pods": request.occurrence_pods,
+            "seed_family": request.seed_family,
+            "effective_seed_family": state.effective_seed_family,
+            "effective_seed_provenance": state.effective_seed_provenance,
             "affected_pods": affected_pods,
             "similar_incidents": [
                 item.model_dump(mode="json") for item in request.similar_incidents
@@ -2359,16 +2426,16 @@ async def _investigate_until_settled(state: PipelineState) -> None:
             break
 
         state.results = outcome.results
-        # Keep the latest hypothesis/evidence ledger.  Previously re-analysis
-        # ranked its fresh evidence but discarded the ledger that explained it,
-        # so a valid open-world hypothesis could neither cite evidence nor
-        # participate in the final headline.
-        state.investigation_context = outcome.investigation_context
+        # Each investigator pass starts a fresh ledger. Carry prior evidence by
+        # family so a reused local ID (for example, H1) cannot erase evidence
+        # gathered for a different family in an earlier pass.
+        state.investigation_context = _merge_reanalysis_context(
+            state.investigation_context, outcome.investigation_context
+        )
+        state.reanalysis_fresh_support_families = outcome.fresh_support_families
         state.root_cause_candidates = outcome.candidates
         state.self_check_caveat = outcome.caveat
-        state.reanalysis_note = "\n\n".join(
-            note for note in (state.reanalysis_note, outcome.note) if note
-        )
+        state.reanalysis_note = _append_reanalysis_note(state.reanalysis_note, outcome.note)
         state.self_check_refuted = outcome.refuted
         state.self_check_next = outcome.next_check
         _aggregate_evidence(state)
@@ -2410,6 +2477,15 @@ def _next_reanalysis_target(
         for family in (*attempted, refuted_family, "insufficient_evidence")
         if family
     }
+
+    for family in state.reanalysis_fresh_support_families:
+        if family not in excluded:
+            return _ReanalysisTarget(
+                family,
+                "targeted follow-up for newly collected eligible evidence",
+                refuted_family,
+                not state.reanalysis_note,
+            )
 
     if state.self_check_refuted:
         for candidate in state.root_cause_candidates[1:]:
@@ -2471,6 +2547,91 @@ def _next_reanalysis_target(
     return None
 
 
+def _merge_reanalysis_context(
+    previous: Mapping[str, object], current: Mapping[str, object]
+) -> dict[str, Any]:
+    """Carry typed ledger links across fresh investigator contexts by family.
+
+    Investigator-local hypothesis IDs restart on each bounded invocation. The
+    family is therefore the stable identity for cross-round evidence carry-over;
+    deduplicating IDs preserves the ledger without inflating support counts.
+    """
+    merged = dict(current)
+    previous_ledger = previous.get("hypothesis_ledger")
+    current_ledger = current.get("hypothesis_ledger")
+    if not isinstance(previous_ledger, list):
+        return merged
+    if not isinstance(current_ledger, list):
+        merged["hypothesis_ledger"] = [
+            dict(item) for item in previous_ledger if isinstance(item, dict)
+        ]
+        return merged
+
+    ledger = [dict(item) for item in current_ledger if isinstance(item, dict)]
+    by_family = {
+        str(item.get("family") or "").strip(): item
+        for item in ledger
+        if str(item.get("family") or "").strip()
+    }
+    used_ids = {str(item.get("id") or "").strip() for item in ledger}
+    for prior in previous_ledger:
+        if not isinstance(prior, dict):
+            continue
+        family = str(prior.get("family") or "").strip()
+        if not family:
+            continue
+        item = by_family.get(family)
+        if item is None:
+            item = dict(prior)
+            hypothesis_id = str(item.get("id") or "").strip()
+            if hypothesis_id in used_ids:
+                item["id"] = f"{hypothesis_id}:{family}"
+            used_ids.add(str(item.get("id") or "").strip())
+            ledger.append(item)
+            by_family[family] = item
+            continue
+        for field_name in ("evidence_for", "evidence_against"):
+            values = [
+                value
+                for source in (prior.get(field_name), item.get(field_name))
+                for value in _ledger_evidence_values(source)
+            ]
+            if values:
+                item[field_name] = list(dict.fromkeys(values))
+    merged["hypothesis_ledger"] = ledger
+    return merged
+
+
+def _ledger_evidence_values(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _fresh_eligible_support_families(
+    fresh_results: list[CollectorResult], evidence_eligibility: Mapping[str, object]
+) -> tuple[str, ...]:
+    """Map newly collected, eligible artifacts to catalog families.
+
+    ``artifact_supports_family`` is the ranker's own typed semantic matcher, so
+    unknown or partially scoped artifacts cannot influence investigation order.
+    """
+    families: list[str] = []
+    for result in fresh_results:
+        for artifact in result.artifacts:
+            evidence_id = str(getattr(artifact, "evidence_id", "") or "")
+            eligibility = evidence_eligibility.get(evidence_id)
+            permits = getattr(eligibility, "permits", None)
+            if not callable(permits) or not permits("support"):
+                continue
+            for family in FAMILIES:
+                if family not in families and artifact_supports_family(family, artifact):
+                    families.append(family)
+    return tuple(families)
+
+
 def _evidence_signature(results: list[CollectorResult]) -> tuple[tuple[object, ...], ...]:
     return tuple(
         sorted(
@@ -2495,6 +2656,10 @@ def _evidence_signature(results: list[CollectorResult]) -> tuple[tuple[object, .
             for result in results
         )
     )
+
+
+def _append_reanalysis_note(existing: str, note: str) -> str:
+    return existing if not note or note in existing.split("\n\n") else "\n\n".join((existing, note)).strip()
 
 
 def _artifact_signature(artifact: object) -> tuple[object, ...]:
@@ -2610,6 +2775,9 @@ async def _reanalyze_once(
         try:
             eligible_support_ids = _eligible_support_ids_for_output(state)
             evidence_eligibility = _public_evidence_eligibility(state)
+            fresh_support_families = _fresh_eligible_support_families(
+                fresh, evidence_eligibility
+            )
         finally:
             state.results = previous_results
 
@@ -2717,6 +2885,7 @@ async def _reanalyze_once(
             note,
             refuted,
             next_check,
+            fresh_support_families,
         )
     except Exception:  # noqa: BLE001 - re-analysis is best-effort; keep 1st result
         return None
@@ -2953,7 +3122,7 @@ async def _synthesize_korean(
         "self-check가 반박한 내용 (없으면 '특이사항 없음').\n"
         "  ## 3. 권장 조치 (Recommended Actions) — 번호 목록, 즉시/후속/예방 순서, "
         "구체적 명령·확인 포함, 중복 금지.\n"
-        "  ## 4. 부록 (Appendix) — 수집기별 증거 한 줄씩, 조사 계획 요약.\n"
+        "  ## 부록 (Appendix) — 수집기별 증거 한 줄씩, 조사 계획 요약.\n"
         '- 반드시 JSON 객체 하나로만 응답하세요: {"summary": <한국어 한 문장: 문제+원인 요약>, '
         '"detail": <위 구조의 한국어 마크다운 본문>}'
     )
@@ -3636,7 +3805,7 @@ _HEADINGS = {
         "problem": "## 1. Problem",
         "cause": "## 2. Root Cause",
         "actions": "## 3. Recommended Actions",
-        "appendix": "## 4. Appendix",
+        "appendix": "## Appendix",
         "fired": "Fired",
         "severity": "Severity",
         "target": "Target",
@@ -3649,7 +3818,7 @@ _HEADINGS = {
         "problem": "## 1. 문제 (Problem)",
         "cause": "## 2. 원인 (Root Cause)",
         "actions": "## 3. 권장 조치 (Recommended Actions)",
-        "appendix": "## 4. 부록 (Appendix)",
+        "appendix": "## 부록 (Appendix)",
         "fired": "발생",
         "severity": "심각도",
         "target": "대상",
@@ -3925,7 +4094,7 @@ def _insert_before_appendix(detail: str, block: str) -> str:
     Falls back to appending at the end when no appendix heading exists (e.g. an
     LLM-synthesized or NAT-produced detail with a different shape).
     """
-    for heading in ("\n## 4. 부록", "\n## 4. Appendix"):
+    for heading in ("\n## 부록", "\n## Appendix", "\n## 4. 부록", "\n## 4. Appendix"):
         idx = detail.find(heading)
         if idx >= 0:
             return f"{detail[:idx]}\n{block}\n{detail[idx:]}"
@@ -5112,6 +5281,28 @@ def _runai_highlights(details: dict[str, object]) -> list[str]:
 _SIMILARITY_FLOOR = 0.80
 
 
+def approved_similar_seed(similar_incidents: list[object], families_catalog: object) -> str:
+    """Return the unambiguous approved prior family trusted for recurrence replay."""
+    catalog_families = set(getattr(families_catalog, "families", ()))
+    qualified = [
+        incident
+        for incident in similar_incidents
+        if bool(getattr(incident, "approved", False))
+        and (getattr(incident, "similarity", 0) or 0) >= _SIMILARITY_FLOOR
+        and (family := str(getattr(incident, "root_cause_family", "") or "").strip())
+        and family in catalog_families
+    ]
+    if not qualified:
+        return ""
+    highest_similarity = max((incident.similarity or 0) for incident in qualified)
+    best = [
+        incident for incident in qualified if (incident.similarity or 0) == highest_similarity
+    ]
+    if len(best) != 1:
+        return ""
+    return str(best[0].root_cause_family).strip()
+
+
 def _recommended_action_lines(
     missing: list[str],
     request: AlertAnalysisRequest | None = None,
@@ -5155,6 +5346,7 @@ async def _operator_questions(
     plan: InvestigationPlan | None,
     target: AnalysisTarget,
     next_check: str,
+    executed_queries: list[str] | None = None,
 ) -> list[str]:
     """2-4 concrete follow-up questions when the RCA could not settle.
 
@@ -5216,7 +5408,9 @@ async def _operator_questions(
 
     if llm_configured(settings, getattr(settings, "llm_model_insight", "")):
         try:
-            sharpened = await _sharpen_operator_questions(settings, questions, missing, plan)
+            sharpened = await _sharpen_operator_questions(
+                settings, questions, missing, plan, executed_queries or []
+            )
         except Exception:  # noqa: BLE001 - sharpening is best-effort
             sharpened = None
         if sharpened:
@@ -5224,11 +5418,29 @@ async def _operator_questions(
     return [_short_sentence(question, limit=240) for question in questions]
 
 
+def _executed_evidence_queries(artifacts: list[object], limit: int = 12) -> list[str]:
+    queries: list[str] = []
+    seen: set[str] = set()
+    for item in artifacts:
+        query = getattr(item, "query", None)
+        if not isinstance(query, str):
+            continue
+        compact = " ".join(query.split())
+        if not compact or compact in seen:
+            continue
+        seen.add(compact)
+        queries.append(compact)
+        if len(queries) == limit:
+            break
+    return queries
+
+
 async def _sharpen_operator_questions(
     settings: Settings,
     questions: list[str],
     missing: list[str],
     plan: InvestigationPlan | None,
+    executed_queries: list[str] | None = None,
 ) -> list[str] | None:
     """LLM-sharpened operator questions; None keeps the deterministic list."""
     ko = getattr(settings, "language", "en") == "ko"
@@ -5236,7 +5448,9 @@ async def _sharpen_operator_questions(
         "You review operator-facing follow-up questions for an RCA that could not "
         "settle on a root cause. Rewrite the draft questions to be sharper and more "
         "specific to the missing data and investigation plan. Do not invent facts, "
-        "do not add generic filler. "
+        "do not add generic filler. Do not ask the operator to run checks equivalent "
+        "to any query in the already-executed evidence list; target only genuinely "
+        "missing evidence. "
         + ("반드시 한국어로 작성하세요. " if ko else "Write in English. ")
         + 'Respond with ONLY JSON: {"questions": [str, ...]} containing 2 to 4 questions.'
     )
@@ -5245,6 +5459,7 @@ async def _sharpen_operator_questions(
             "draft_questions": questions,
             "missing_data": missing,
             "plan": plan.as_dict() if plan else {},
+            "already_executed_evidence_queries": executed_queries or [],
         },
         ensure_ascii=False,
         default=str,

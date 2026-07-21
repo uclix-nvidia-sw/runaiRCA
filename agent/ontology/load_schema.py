@@ -31,6 +31,25 @@ SCHEMA_MIGRATIONS = [
     # Older schemas had a placeholder runbook with a non-key name. Diagnostic
     # loading needs one stable runbook identity for replace-in-place semantics.
     "redefine runbook owns name @key;",
+    # Cosmetic: drop the 4 relations removed from schema.tql (fixed_by, has_cause,
+    # observed_symptom, similar_to). `define` cannot delete a type, so an already-
+    # loaded DB keeps them as harmless orphans. Undefine the plays capabilities
+    # first, then the relations. Non-fatal per the loop below: a fresh DB has
+    # nothing to undefine and an already-cleaned DB rejects the no-op.
+    "undefine plays fixed_by:cause from root_cause;",
+    "undefine plays fixed_by:remedy from action;",
+    "undefine plays has_cause:incident from incident;",
+    "undefine plays has_cause:cause from root_cause;",
+    "undefine plays observed_symptom:incident from incident;",
+    "undefine plays observed_symptom:run from analysis_run;",
+    "undefine plays observed_symptom:symptom from symptom;",
+    "undefine plays observed_symptom:proof from evidence;",
+    "undefine plays similar_to:this from incident;",
+    "undefine plays similar_to:other from incident;",
+    "undefine relation fixed_by;",
+    "undefine relation has_cause;",
+    "undefine relation observed_symptom;",
+    "undefine relation similar_to;",
 ]
 
 

@@ -6,6 +6,7 @@ import pytest
 
 from app.collectors.base import AnalysisTarget
 from app.schemas import Alert, SimilarIncidentContext
+from app.services import pipeline
 from app.services.decision_tree import load_tree
 from app.services.planner import plan_investigation
 from tests.test_orchestrator import make_settings
@@ -762,6 +763,196 @@ async def test_memory_alert_is_workload_runtime_not_control_plane() -> None:
     )
     plan = await plan_investigation(settings, target, None, {}, [])
     assert plan.hypotheses[0]["family"] == "workload_runtime_error"
+
+
+@pytest.mark.asyncio
+async def test_operator_seed_family_leads_the_plan_after_other_promotions() -> None:
+    settings = make_settings()
+    target = _target(
+        alert_name="PrometheusMissingRuleEvaluations",
+        namespace="monitoring",
+        pod="prometheus-prometheus-kube-prometheus-prometheus-0",
+    )
+    plan = await plan_investigation(
+        settings, target, None, {}, [], seed_family="gpu_hardware_error"
+    )
+
+    assert plan.hypotheses[0]["family"] == "gpu_hardware_error"
+    assert "supporting and refuting evidence" in plan.hypotheses[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_operator_seed_family_is_ignored_with_plan_warning() -> None:
+    plan = await plan_investigation(
+        make_settings(), _target(), None, {}, [], seed_family="not_a_real_family"
+    )
+
+    assert all(item["family"] != "not_a_real_family" for item in plan.hypotheses)
+    assert any("not_a_real_family" in warning for warning in plan.warnings)
+
+
+@pytest.mark.parametrize(
+    "incidents, expected",
+    [
+        (
+            [
+                SimilarIncidentContext(
+                    incident_id="INC-approved",
+                    similarity=0.91,
+                    approved=True,
+                    root_cause_family="gpu_hardware_error",
+                )
+            ],
+            "gpu_hardware_error",
+        ),
+        (
+            [
+                SimilarIncidentContext(
+                    incident_id="INC-unapproved",
+                    similarity=0.91,
+                    root_cause_family="gpu_hardware_error",
+                )
+            ],
+            "",
+        ),
+        (
+            [
+                SimilarIncidentContext(
+                    incident_id="INC-low-similarity",
+                    similarity=0.79,
+                    approved=True,
+                    root_cause_family="gpu_hardware_error",
+                )
+            ],
+            "",
+        ),
+        (
+            [
+                SimilarIncidentContext(
+                    incident_id="INC-empty-family", similarity=0.91, approved=True
+                )
+            ],
+            "",
+        ),
+        (
+            [
+                SimilarIncidentContext(
+                    incident_id="INC-unknown-family",
+                    similarity=0.91,
+                    approved=True,
+                    root_cause_family="not_a_catalog_family",
+                )
+            ],
+            "",
+        ),
+    ],
+)
+def test_approved_similar_seed_requires_an_approved_trusted_catalog_match(incidents, expected) -> None:
+    catalog = pipeline.load_family_catalog(make_settings().families_file)
+
+    assert pipeline.approved_similar_seed(incidents, catalog) == expected
+
+
+def test_approved_similar_seed_rejects_an_ambiguous_best_match() -> None:
+    catalog = pipeline.load_family_catalog(make_settings().families_file)
+    incidents = [
+        SimilarIncidentContext(
+            incident_id="INC-gpu",
+            similarity=0.91,
+            approved=True,
+            root_cause_family="gpu_hardware_error",
+        ),
+        SimilarIncidentContext(
+            incident_id="INC-quota",
+            similarity=0.91,
+            approved=True,
+            root_cause_family="runai_scheduling_quota",
+        ),
+    ]
+
+    assert pipeline.approved_similar_seed(incidents, catalog) == ""
+
+
+@pytest.mark.asyncio
+async def test_plan_stage_explicit_seed_takes_precedence_over_approved_match(monkeypatch) -> None:
+    from app.plan import InvestigationPlan
+    from app.services.kg_enrichment import KGContext
+
+    captured: dict[str, str] = {}
+
+    async def fake_plan(*args):
+        captured["seed_family"] = args[-1]
+        return InvestigationPlan()
+
+    monkeypatch.setattr(pipeline, "plan_investigation", fake_plan)
+    state = pipeline.new_state(
+        make_settings(),
+        pipeline.AlertAnalysisRequest(
+            seed_family="gpu_hardware_error",
+            alert=Alert(labels={}),
+            similar_incidents=[
+                SimilarIncidentContext(
+                    incident_id="INC-approved",
+                    similarity=0.91,
+                    approved=True,
+                    root_cause_family="runai_scheduling_quota",
+                )
+            ],
+        ),
+        collectors=[],
+    )
+    state.kg_context = KGContext()
+
+    await pipeline.plan_stage(state)
+
+    assert captured["seed_family"] == "gpu_hardware_error"
+    assert state.effective_seed_family == "gpu_hardware_error"
+    assert state.effective_seed_provenance == "operator_reverify"
+
+
+@pytest.mark.asyncio
+async def test_seeded_family_runtime_probes_are_injected_outside_the_tree_walk(monkeypatch) -> None:
+    from app import knowledge
+
+    class _Registry:
+        mode = "assist"
+
+        def probe_template_ids_for_family(self, family: str) -> tuple[str, ...]:
+            return ("seeded-probe",) if family == "gpu_hardware_error" else ()
+
+    monkeypatch.setattr(knowledge, "_runtime_knowledge_registry", _Registry())
+    tree = {
+        "root": "scope",
+        "nodes": {
+            "scope": {
+                "id": "scope",
+                "question": "Scope the incident.",
+                "match": {"always": True},
+                "conclusion": {"family": "runai_scheduling_quota"},
+                "probes": [{"id": "path-probe", "tool": "k8s_read"}],
+            },
+            "seeded": {
+                "id": "seeded",
+                "probes": [{"id": "seeded-probe", "tool": "k8s_describe"}],
+            },
+        },
+    }
+
+    plan = await plan_investigation(
+        make_settings(),
+        _target(alert_name="PodPending", namespace="team-a"),
+        Alert(),
+        {"diagnostic_tree": tree},
+        [],
+        seed_family="gpu_hardware_error",
+    )
+
+    assert plan.hypotheses[0]["family"] == "gpu_hardware_error"
+    assert plan.diagnostic_directive["provisional_family"] == "runai_scheduling_quota"
+    assert [probe["template_id"] for probe in plan.diagnostic_directive["probes"]] == [
+        "path-probe",
+        "seeded-probe",
+    ]
 
 
 @pytest.mark.asyncio

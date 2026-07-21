@@ -190,3 +190,88 @@ async def test_no_nat_client_uses_http(monkeypatch) -> None:
 
     assert data == {"http": True}
     assert captured["url"] == "https://llm.local/v1/chat/completions"
+
+
+# 2026-07-21 chat incident: a reasoning model served with a template-injected
+# <think> leaked its whole thinking transcript (fake kubectl/tool JSON, a
+# fabricated pods=20 quota) into message.content; the raw 51KB trace became the
+# operator's chat answer. The transport must strip reasoning in BOTH paths.
+
+
+def test_strip_reasoning_paired_block() -> None:
+    assert llm.strip_reasoning("<think>궁리...</think>답변") == "답변"
+    assert llm.strip_reasoning("A<think>r1</think>B<think>r2</think>C") == "ABC"
+
+
+def test_strip_reasoning_bare_close_keeps_only_final_answer() -> None:
+    # Template opened <think> inside the prompt: content has closes but no opens,
+    # and everything before the LAST close is reasoning (the incident shape).
+    leaked = (
+        '[{"tool": "k8s_read", "query": "kubectl get quota -n runai-backend", '
+        '"summary": "HTTP 200", "result": "used: pods=18, limited: pods=20"}]\n'
+        "Let me check the quota.</think>\n"
+        '[{"tool": "promql_query", "query": "up", "summary": "HTTP 200"}]\n'
+        "Now I understand.</think>\n최종 답변: thanos receive 파드는 1개입니다."
+    )
+    assert llm.strip_reasoning(leaked) == "최종 답변: thanos receive 파드는 1개입니다."
+
+
+def test_strip_reasoning_unclosed_open_yields_empty() -> None:
+    assert llm.strip_reasoning("<think>끝나지 않는 궁리") == ""
+
+
+def test_strip_reasoning_plain_text_untouched() -> None:
+    text = "정상 답변 (think 태그 없음)"
+    assert llm.strip_reasoning(text) is text
+
+
+@pytest.mark.asyncio
+async def test_http_reply_with_think_leak_returns_only_answer(monkeypatch) -> None:
+    settings = _settings()
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        return SimpleNamespace(
+            ok=True,
+            data={
+                "choices": [{"message": {"content": "가짜 툴 결과들...</think>진짜 답변"}}],
+                "usage": {},
+            },
+        )
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    text, error = await llm.complete_with_error(settings, system="system", user="user")
+
+    assert text == "진짜 답변"
+    assert error is None
+
+
+@pytest.mark.asyncio
+async def test_nat_reasoning_only_reply_falls_back_to_http(monkeypatch) -> None:
+    settings = _settings()
+
+    class ReasoningOnlyClient:
+        def bind(self, **kwargs):
+            return self
+
+        async def ainvoke(self, messages):
+            return SimpleNamespace(
+                content="<think>reasoning that never produced an answer",
+                usage_metadata={"input_tokens": 9000, "output_tokens": 4096},
+                response_metadata={"finish_reason": "length"},
+            )
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        return SimpleNamespace(
+            ok=True,
+            data={"choices": [{"message": {"content": "HTTP 폴백 답변"}}], "usage": {}},
+        )
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    token = llm.set_nat_client(ReasoningOnlyClient())
+    try:
+        text, error = await llm.complete_with_error(settings, system="system", user="user")
+    finally:
+        llm.reset_nat_client(token)
+
+    assert text == "HTTP 폴백 답변"
+    assert error is None

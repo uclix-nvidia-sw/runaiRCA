@@ -18,6 +18,7 @@ type AgentAnalysisRequest struct {
 	ThreadTS         string            `json:"thread_ts"`
 	IncidentID       string            `json:"incident_id,omitempty"`
 	AnalysisType     string            `json:"analysis_type,omitempty"`
+	SeedFamily       string            `json:"seed_family,omitempty"`
 	Language         string            `json:"language,omitempty"`
 	OccurrenceCount  int               `json:"occurrence_count,omitempty"`
 	OccurrencePods   []string          `json:"occurrence_pods,omitempty"`

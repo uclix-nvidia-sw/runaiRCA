@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import random
+import re
 import time
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar, Token
@@ -32,6 +33,35 @@ _RETRY_STATUSES = {0, 429, 500, 502, 503, 504}
 
 def llm_configured(settings: Settings, model: str | None = None) -> bool:
     return bool(settings.llm_base_url and (model or settings.llm_model) and settings.llm_api_key)
+
+
+_THINK_BLOCK_RE = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
+_THINK_CLOSE_RE = re.compile(r"</think(?:ing)?>", re.IGNORECASE)
+_THINK_OPEN_RE = re.compile(r"<think(?:ing)?>", re.IGNORECASE)
+
+
+def strip_reasoning(text: str) -> str:
+    """Drop a reasoning model's inline think block(s) from a completion.
+
+    Serving stacks that don't split reasoning into `reasoning_content` leak it
+    into `message.content` in three shapes: paired <think>...</think> blocks; a
+    bare trailing </think> when the chat template opens the tag inside the
+    prompt (everything before the LAST close is reasoning — the 2026-07-21 chat
+    incident, where a fabricated tool transcript became the operator answer);
+    and an unclosed <think> when the model spent the whole budget reasoning.
+    Empty result = the reply had no answer outside its reasoning.
+    """
+    low = text.lower()
+    if "<think" not in low and "</think" not in low:
+        return text
+    text = _THINK_BLOCK_RE.sub("", text)
+    parts = _THINK_CLOSE_RE.split(text)
+    if len(parts) > 1:
+        text = parts[-1]
+    match = _THINK_OPEN_RE.search(text)
+    if match:
+        text = text[: match.start()]
+    return text.strip()
 
 
 def begin_usage_tracking() -> dict[str, Any]:
@@ -277,7 +307,10 @@ async def complete_with_error(
         if isinstance(message, dict):
             content = message.get("content")
             if isinstance(content, str) and content.strip():
-                return content.strip(), None
+                cleaned = strip_reasoning(content)
+                if cleaned:
+                    return cleaned, None
+                return None, "reasoning-only reply (no content outside <think>)"
     return None, "unexpected response shape from the LLM endpoint"
 
 
@@ -346,7 +379,7 @@ def _langchain_text(response: Any) -> str:
     """The text of a langchain reply — plain str, or joined text content blocks."""
     content = getattr(response, "content", response)
     if isinstance(content, str):
-        return content.strip()
+        return strip_reasoning(content)
     if isinstance(content, list):
         parts: list[str] = []
         for block in content:
@@ -356,7 +389,9 @@ def _langchain_text(response: Any) -> str:
                 value = block.get("text") or block.get("content")
                 if isinstance(value, str):
                     parts.append(value)
-        return "\n".join(part.strip() for part in parts if part.strip()).strip()
+        return strip_reasoning(
+            "\n".join(part.strip() for part in parts if part.strip()).strip()
+        )
     return ""
 
 

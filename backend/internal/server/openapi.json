@@ -128,6 +128,59 @@
         }
       }
     },
+    "/api/v1/incidents/{id}/rca-correction": {
+      "post": {
+        "tags": ["Incidents"],
+        "summary": "Record a pinned operator RCA correction",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "example": {
+                "root_cause_family": "gpu_hardware_error",
+                "summary": "NVIDIA XID evidence identifies a failing GPU.",
+                "actions": ["Drain the node", "Replace the GPU"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Pinned operator analysis run created" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/incidents/{id}/rca-pin": {
+      "post": {
+        "tags": ["Incidents"],
+        "summary": "Pin or unpin the latest operator RCA correction",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "example": { "pinned": false } } }
+        },
+        "responses": {
+          "200": { "description": "Operator correction pin state updated" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/incidents/{id}/reverify": {
+      "post": {
+        "tags": ["Analysis"],
+        "summary": "Re-analyze using the pinned operator family as a leading hypothesis",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "responses": {
+          "202": { "description": "Seeded re-verification analysis accepted" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/api/v1/incidents/{id}/resolve": {
       "post": {
         "tags": ["Incidents"],

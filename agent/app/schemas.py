@@ -61,6 +61,8 @@ class SimilarIncidentContext(BaseModel):
     positive_feedback: int = 0
     negative_feedback: int = 0
     comment_count: int = 0
+    root_cause_family: str = ""
+    approved: bool = False
 
 
 class FeedbackHintContext(BaseModel):
@@ -76,6 +78,7 @@ class AlertAnalysisRequest(BaseModel):
     thread_ts: str = ""
     incident_id: str | None = None
     analysis_type: str | None = None
+    seed_family: str = ""
     occurrence_count: int = 0
     occurrence_pods: list[str] = Field(default_factory=list)
     previous_analysis: PreviousAnalysisContext | None = None

@@ -107,13 +107,19 @@ def test_insufficient_evidence_gets_a_separate_general_guidance_section() -> Non
         eligible_support_ids=set(),
     )
 
-    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## 4. Appendix", 1)[0]
+    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## Appendix", 1)[0]
     guidance = detail.split("## General Troubleshooting Guidance", 1)[1].split(
-        "## 4. Appendix", 1
+        "## Appendix", 1
     )[0]
     assert "GENERAL-GUIDANCE" not in actions
     assert "not a diagnosis" in guidance
     assert "GENERAL-GUIDANCE" in guidance
+
+
+def test_insert_before_appendix_supports_current_and_legacy_headings() -> None:
+    for heading in ("## Appendix", "## 4. Appendix", "## 부록 (Appendix)", "## 4. 부록 (Appendix)"):
+        detail = pipeline._insert_before_appendix(f"before\n{heading}\nafter", "## Self-Check")
+        assert detail.index("## Self-Check") < detail.index(heading)
 
 
 @pytest.mark.asyncio
@@ -384,7 +390,7 @@ def test_context_only_artifact_cannot_emit_graph_remediation_actions() -> None:
     )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
-    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## 4.", 1)[0]
+    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## Appendix", 1)[0]
     assert "Fix the root XID first" not in root_cause
     assert "Reset the implicated GPU" not in actions
     assert "Replace the GPU" not in actions
@@ -439,7 +445,7 @@ def test_context_only_artifacts_cannot_emit_catalog_or_historical_actions() -> N
         eligible_support_ids=set(),
     )
 
-    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## 4.", 1)[0]
+    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## Appendix", 1)[0]
     assert "Not enough evidence for concrete actions" in actions
     for forbidden in (
         "CATALOG-REMEDY",
@@ -1226,6 +1232,77 @@ async def test_alert_only_xid_is_auditable_harness_support(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_rank_stage_applies_operator_seed_as_a_bounded_prior() -> None:
+    from app.services.kg_enrichment import KGContext
+
+    state = pipeline.new_state(
+        make_settings(),
+        AlertAnalysisRequest(
+            seed_family="gpu_hardware_error",
+            alert=Alert(status="firing", labels={"alertname": "GenericAlert"}),
+        ),
+        collectors=[],
+    )
+    state.kg_context = KGContext()
+    state.plan = InvestigationPlan()
+    state.effective_seed_family = "gpu_hardware_error"
+    state.results = [
+        CollectorResult(
+            agent="runai",
+            status="ok",
+            summary="workload is pending because GPU quota capacity is exhausted",
+        )
+    ]
+
+    await pipeline.rank_stage(state)
+
+    assert state.priors is not None
+    assert state.priors["gpu_hardware_error"] == 1.75
+    # A seed is not a forced conclusion: strong current evidence for another
+    # family can still win when there is no current GPU observation to support it.
+    assert state.root_cause_candidates[0].family == "runai_scheduling_quota"
+
+
+@pytest.mark.asyncio
+async def test_rank_stage_approved_match_seed_without_current_evidence_is_not_forced() -> None:
+    from app.services.kg_enrichment import KGContext
+
+    state = pipeline.new_state(
+        make_settings(),
+        AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "GenericAlert"}),
+            similar_incidents=[
+                SimilarIncidentContext(
+                    incident_id="INC-approved",
+                    similarity=0.91,
+                    approved=True,
+                    root_cause_family="gpu_hardware_error",
+                )
+            ],
+        ),
+        collectors=[],
+    )
+    state.kg_context = KGContext()
+
+    await pipeline.plan_stage(state)
+    state.results = [
+        CollectorResult(
+            agent="runai",
+            status="ok",
+            summary="workload is pending because GPU quota capacity is exhausted",
+        )
+    ]
+
+    await pipeline.rank_stage(state)
+
+    assert state.effective_seed_family == "gpu_hardware_error"
+    assert state.effective_seed_provenance == "approved_prior_match"
+    assert state.priors is not None
+    assert state.priors["gpu_hardware_error"] == 1.75
+    assert state.root_cause_candidates[0].family == "runai_scheduling_quota"
+
+
+@pytest.mark.asyncio
 async def test_resolved_incident_keeps_alert_pod_for_followups(monkeypatch) -> None:
     """A current replacement must not erase any historical target identity."""
     from app.plan import InvestigationPlan
@@ -1426,13 +1503,12 @@ def test_blackboard_aliases_do_not_merge_same_summary_from_different_pods() -> N
     assert eligibility["E02"].support is True
 
 
-def test_causal_evidence_context_keeps_prelude_and_bounds_firing_alert() -> None:
+def test_causal_evidence_context_keeps_prelude_and_opens_firing_alert() -> None:
     """Causal eligibility includes the trigger prelude, not recovery epilogue.
 
-    The collectors inspect five minutes before firing and a bounded fifteen
-    minutes after a firing alert.  Treating a firing alert as a zero-width
-    instant discarded all later samples; including the collection epilogue for
-    resolved alerts would instead let recovery-only signals become a cause.
+    Historical collectors retain a bounded fifteen-minute firing query, while
+    causal eligibility admits target-scoped evidence observed while the alert
+    is still firing. Resolved alerts still exclude the recovery epilogue.
     """
     from app.progress import ProgressReporter
 
@@ -1446,7 +1522,7 @@ def test_causal_evidence_context_keeps_prelude_and_bounds_firing_alert() -> None
         collectors=[],
     )
     assert pipeline._evidence_context(state)["window_start"] == "2026-07-10T00:55:00Z"
-    assert pipeline._evidence_context(state)["window_end"] == "2026-07-10T01:15:00Z"
+    assert pipeline._evidence_context(state)["window_end"] != "2026-07-10T01:15:00Z"
 
     state.target = replace(target, resolved_at="2026-07-10T01:10:00Z")
     assert pipeline._evidence_context(state)["window_end"] == "2026-07-10T01:10:00Z"
