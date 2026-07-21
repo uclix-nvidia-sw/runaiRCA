@@ -180,10 +180,13 @@ async def _drill_one(
     """One agent's adaptive think->query->observe loop over its own evidence."""
     masker = _drilldown_masker(settings)
     try:
+        if _system_node_scope_unavailable(result, target):
+            return
         architecture = _implicated_architecture(settings, result, target)
         history: list[dict[str, Any]] = []
         seen_queries: set[str] = set()
         probe_attempts: dict[str, int] = {}
+        system_no_node_query_attempted = False
         # A TypeDB/YAML probe is executable only through this agent's existing
         # read-only registry.  Run it before asking the LLM to improvise a
         # query: the declarative probe is the durable operational knowledge,
@@ -191,6 +194,14 @@ async def _drill_one(
         for query in _declared_probe_queries(plan, tools, target):
             if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
                 return
+            if (
+                result.agent == "system"
+                and not target.node
+                and str(query.get("tool") or "") == "system_log_query"
+            ):
+                if system_no_node_query_attempted:
+                    continue
+                system_no_node_query_attempted = True
             key = _query_fingerprint(query)
             seen_queries.add(key)
             await _run_query(
@@ -268,6 +279,14 @@ async def _drill_one(
                     # this out of the history also prevents repeated noise.
                     rejected.append(_rejected_query_feedback(q, tools))
                     continue
+                if (
+                    result.agent == "system"
+                    and not target.node
+                    and str(q.get("tool") or "") == "system_log_query"
+                ):
+                    if system_no_node_query_attempted:
+                        continue
+                    system_no_node_query_attempted = True
                 key = _query_fingerprint(q)
                 if key in seen_queries:
                     continue
@@ -317,6 +336,8 @@ async def _drill_one(
                     for q in queries
                 )
             )
+            if _system_node_scope_unavailable(result, target):
+                break
     except Exception as exc:  # noqa: BLE001 - drill-down is best-effort; base evidence stands
         result.warnings.append(
             f"{result.agent} drill-down aborted: "
@@ -760,6 +781,16 @@ def _query_fingerprint(query: dict[str, Any]) -> str:
         {key: value for key, value in query.items() if not str(key).startswith("_")},
         sort_keys=True,
         default=str,
+    )
+
+
+def _system_node_scope_unavailable(result: CollectorResult, target: AnalysisTarget) -> bool:
+    if result.agent != "system" or target.node:
+        return False
+    return any(
+        getattr(item, "type", "") in {"drilldown_query", "ontology_probe"}
+        and "the alert has no node scope" in str(getattr(item, "summary", ""))
+        for item in result.artifacts
     )
 
 
@@ -1747,10 +1778,19 @@ async def _tool_promql(settings: Settings, target: AnalysisTarget, args: dict) -
                 time_range=time_range,
             )
             error = item.get("error")
+            summary = str(error) if error else (
+                ko_en(
+                    settings,
+                    "MCP query_prometheus 결과 0개 시리즈 — 메트릭 이름/레이블 매처를 확인하세요.",
+                    "MCP query_prometheus returned 0 series — verify metric name/label matchers.",
+                )
+                if int(item.get("series_count") or 0) == 0
+                else "MCP query_prometheus ok"
+            )
             return {
                 "query": promql,
                 "title": title,
-                "summary": str(error) if error else "MCP query_prometheus ok",
+                "summary": summary,
                 "error": error,
                 "result": item,
             }

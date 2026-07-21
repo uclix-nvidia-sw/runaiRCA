@@ -459,6 +459,47 @@ def test_probe_history_bookkeeping_does_not_count_as_new_evidence() -> None:
     )
 
 
+def test_aggregate_evidence_deduplicates_identical_round_artifacts() -> None:
+    state = pipeline.new_state(make_settings(), _request(), collectors=[])
+    first = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="cluster_api",
+        status="ok",
+        confidence="high",
+        query="GET /api/v1/namespaces/runai/pods",
+        summary="empty sweep",
+        result={"items": []},
+    )
+    repeated = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="cluster_api",
+        status="ok",
+        confidence="high",
+        query="GET /api/v1/namespaces/runai/pods",
+        summary="empty sweep from a later round",
+        result={"items": []},
+    )
+    state.results = [
+        CollectorResult(
+            agent="kubernetes", status="ok", summary="same collector", artifacts=[first, repeated]
+        )
+    ]
+
+    pipeline._aggregate_evidence(state)
+    first_signature = pipeline._evidence_signature(state.results)
+    pipeline._aggregate_evidence(state)
+
+    assert state.results[0].artifacts == [first]
+    assert pipeline._evidence_signature(state.results) == first_signature
+
+
+def test_reanalysis_note_is_not_appended_twice() -> None:
+    note = "The previous conclusion was refuted."
+    assert pipeline._append_reanalysis_note(note, note) == note
+
+
 def test_fresh_scoped_support_can_rehabilitate_a_refuted_family() -> None:
     finding = artifact(
         agent="kubernetes",
@@ -575,6 +616,29 @@ async def test_llm_sharpened_operator_questions_are_single_line(monkeypatch) -> 
     assert questions[0].endswith("…")
     assert "question-secret-12345" not in "\n".join(questions)
     assert "[MASKED]" in "\n".join(questions)
+
+
+@pytest.mark.asyncio
+async def test_operator_question_prompt_includes_already_executed_queries(monkeypatch) -> None:
+    captured: dict[str, str] = {}
+
+    async def fake_complete_json(*_args, system, user, **_kwargs):
+        captured["system"] = system
+        captured["user"] = user
+        return {"questions": ["Which remaining pod event is missing?", "Which queue state is missing?"]}
+
+    monkeypatch.setattr(pipeline, "complete_json", fake_complete_json)
+    await pipeline._operator_questions(
+        llm_settings(),
+        ["kubernetes.events"],
+        None,
+        AnalysisTarget("", "", "", "", "", "", "", "", "", "warning", "X"),
+        "Check the remaining evidence gap.",
+        ["kubectl rollout status deployment/permission-manager -n permission-manager"],
+    )
+
+    assert "Do not ask the operator to run checks equivalent" in captured["system"]
+    assert "kubectl rollout status deployment/permission-manager -n permission-manager" in captured["user"]
 
 
 @pytest.mark.asyncio

@@ -211,7 +211,10 @@ class PrometheusCollector:
             )
 
         insight = await _llm_insight(
-            self._settings, "Prometheus metrics", summary, query_results
+            self._settings,
+            "Prometheus metrics",
+            summary,
+            [item for item in query_results if item.get("name") != "prometheus_up"],
         )
         if insight:
             summary = insight

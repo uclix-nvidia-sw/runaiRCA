@@ -648,7 +648,7 @@ async def test_analyze_returns_unified_artifacts() -> None:
         detail.find("## 1. Problem"),
         detail.find("## 2. Root Cause"),
         detail.find("## 3. Recommended Actions"),
-        detail.find("## 4. Appendix"),
+        detail.find("## Appendix"),
     ]
     assert all(idx >= 0 for idx in order), f"missing report section: {order}"
     assert order == sorted(order), f"report sections out of order: {order}"

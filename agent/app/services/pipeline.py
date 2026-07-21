@@ -577,6 +577,21 @@ def _alert_signature_evidence_result(
 
 def _aggregate_evidence(state: PipelineState) -> None:
     kg_warnings = getattr(state.kg_context, "warnings", []) if state.kg_context is not None else []
+    seen_artifacts: set[tuple[str, str, str, str]] = set()
+    for result in state.results:
+        retained = []
+        for item in result.artifacts:
+            key = (
+                str(getattr(item, "agent", "")),
+                str(getattr(item, "type", "")),
+                str(getattr(item, "query", "")),
+                _json_fingerprint(getattr(item, "result", None)),
+            )
+            if key in seen_artifacts:
+                continue
+            seen_artifacts.add(key)
+            retained.append(item)
+        result.artifacts = retained
     state.capabilities = {result.agent: result.status for result in state.results}
     # Evidence IDs are assigned after every collector has completed. They are
     # response-local, deterministic, and become run-qualified during TypeDB ingest.
@@ -2053,7 +2068,12 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
     if top_family in ("", "insufficient_evidence") or state.self_check_refuted:
         try:
             questions = await _operator_questions(
-                settings, state.missing, plan, state.target, state.self_check_next
+                settings,
+                state.missing,
+                plan,
+                state.target,
+                state.self_check_next,
+                _executed_evidence_queries(state.artifacts),
             )
         except Exception:  # noqa: BLE001 - questions are best-effort
             questions = []
@@ -2366,9 +2386,7 @@ async def _investigate_until_settled(state: PipelineState) -> None:
         state.investigation_context = outcome.investigation_context
         state.root_cause_candidates = outcome.candidates
         state.self_check_caveat = outcome.caveat
-        state.reanalysis_note = "\n\n".join(
-            note for note in (state.reanalysis_note, outcome.note) if note
-        )
+        state.reanalysis_note = _append_reanalysis_note(state.reanalysis_note, outcome.note)
         state.self_check_refuted = outcome.refuted
         state.self_check_next = outcome.next_check
         _aggregate_evidence(state)
@@ -2495,6 +2513,10 @@ def _evidence_signature(results: list[CollectorResult]) -> tuple[tuple[object, .
             for result in results
         )
     )
+
+
+def _append_reanalysis_note(existing: str, note: str) -> str:
+    return existing if not note or note in existing.split("\n\n") else "\n\n".join((existing, note)).strip()
 
 
 def _artifact_signature(artifact: object) -> tuple[object, ...]:
@@ -2953,7 +2975,7 @@ async def _synthesize_korean(
         "self-check가 반박한 내용 (없으면 '특이사항 없음').\n"
         "  ## 3. 권장 조치 (Recommended Actions) — 번호 목록, 즉시/후속/예방 순서, "
         "구체적 명령·확인 포함, 중복 금지.\n"
-        "  ## 4. 부록 (Appendix) — 수집기별 증거 한 줄씩, 조사 계획 요약.\n"
+        "  ## 부록 (Appendix) — 수집기별 증거 한 줄씩, 조사 계획 요약.\n"
         '- 반드시 JSON 객체 하나로만 응답하세요: {"summary": <한국어 한 문장: 문제+원인 요약>, '
         '"detail": <위 구조의 한국어 마크다운 본문>}'
     )
@@ -3636,7 +3658,7 @@ _HEADINGS = {
         "problem": "## 1. Problem",
         "cause": "## 2. Root Cause",
         "actions": "## 3. Recommended Actions",
-        "appendix": "## 4. Appendix",
+        "appendix": "## Appendix",
         "fired": "Fired",
         "severity": "Severity",
         "target": "Target",
@@ -3649,7 +3671,7 @@ _HEADINGS = {
         "problem": "## 1. 문제 (Problem)",
         "cause": "## 2. 원인 (Root Cause)",
         "actions": "## 3. 권장 조치 (Recommended Actions)",
-        "appendix": "## 4. 부록 (Appendix)",
+        "appendix": "## 부록 (Appendix)",
         "fired": "발생",
         "severity": "심각도",
         "target": "대상",
@@ -3925,7 +3947,7 @@ def _insert_before_appendix(detail: str, block: str) -> str:
     Falls back to appending at the end when no appendix heading exists (e.g. an
     LLM-synthesized or NAT-produced detail with a different shape).
     """
-    for heading in ("\n## 4. 부록", "\n## 4. Appendix"):
+    for heading in ("\n## 부록", "\n## Appendix", "\n## 4. 부록", "\n## 4. Appendix"):
         idx = detail.find(heading)
         if idx >= 0:
             return f"{detail[:idx]}\n{block}\n{detail[idx:]}"
@@ -5155,6 +5177,7 @@ async def _operator_questions(
     plan: InvestigationPlan | None,
     target: AnalysisTarget,
     next_check: str,
+    executed_queries: list[str] | None = None,
 ) -> list[str]:
     """2-4 concrete follow-up questions when the RCA could not settle.
 
@@ -5216,7 +5239,9 @@ async def _operator_questions(
 
     if llm_configured(settings, getattr(settings, "llm_model_insight", "")):
         try:
-            sharpened = await _sharpen_operator_questions(settings, questions, missing, plan)
+            sharpened = await _sharpen_operator_questions(
+                settings, questions, missing, plan, executed_queries or []
+            )
         except Exception:  # noqa: BLE001 - sharpening is best-effort
             sharpened = None
         if sharpened:
@@ -5224,11 +5249,29 @@ async def _operator_questions(
     return [_short_sentence(question, limit=240) for question in questions]
 
 
+def _executed_evidence_queries(artifacts: list[object], limit: int = 12) -> list[str]:
+    queries: list[str] = []
+    seen: set[str] = set()
+    for item in artifacts:
+        query = getattr(item, "query", None)
+        if not isinstance(query, str):
+            continue
+        compact = " ".join(query.split())
+        if not compact or compact in seen:
+            continue
+        seen.add(compact)
+        queries.append(compact)
+        if len(queries) == limit:
+            break
+    return queries
+
+
 async def _sharpen_operator_questions(
     settings: Settings,
     questions: list[str],
     missing: list[str],
     plan: InvestigationPlan | None,
+    executed_queries: list[str] | None = None,
 ) -> list[str] | None:
     """LLM-sharpened operator questions; None keeps the deterministic list."""
     ko = getattr(settings, "language", "en") == "ko"
@@ -5236,7 +5279,9 @@ async def _sharpen_operator_questions(
         "You review operator-facing follow-up questions for an RCA that could not "
         "settle on a root cause. Rewrite the draft questions to be sharper and more "
         "specific to the missing data and investigation plan. Do not invent facts, "
-        "do not add generic filler. "
+        "do not add generic filler. Do not ask the operator to run checks equivalent "
+        "to any query in the already-executed evidence list; target only genuinely "
+        "missing evidence. "
         + ("반드시 한국어로 작성하세요. " if ko else "Write in English. ")
         + 'Respond with ONLY JSON: {"questions": [str, ...]} containing 2 to 4 questions.'
     )
@@ -5245,6 +5290,7 @@ async def _sharpen_operator_questions(
             "draft_questions": questions,
             "missing_data": missing,
             "plan": plan.as_dict() if plan else {},
+            "already_executed_evidence_queries": executed_queries or [],
         },
         ensure_ascii=False,
         default=str,

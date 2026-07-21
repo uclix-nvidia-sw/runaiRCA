@@ -19,6 +19,10 @@ _log = logging.getLogger(__name__)
 
 _FUZZY_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_-]{2,}")
 _PROBE_TEMPLATE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+# Alert-name concatenations (for example, KubePodImagePullBackOff) must retain
+# suffix matching, so lexical boundary rules cannot distinguish same-suffix
+# collisions. Extend this set only when a new collision is verified.
+_ATOMIC_OBSERVATION_TOKENS = frozenset({"progressdeadlineexceeded"})
 _BUNDLED_TROUBLESHOOTING_TREE = (
     Path(__file__).resolve().parent.parent / "knowledge" / "k8s_troubleshooting_tree.yaml"
 )
@@ -1475,6 +1479,20 @@ def _keyword_hits(text: str, keywords: list[str]) -> tuple[list[str], bool]:
             if idx < 0:
                 break
             end = idx + len(keyword)
+            token_start = idx
+            while token_start > 0 and text[token_start - 1].isascii() and text[
+                token_start - 1
+            ].isalnum():
+                token_start -= 1
+            token_end = end
+            while token_end < len(text) and text[token_end].isascii() and text[
+                token_end
+            ].isalnum():
+                token_end += 1
+            token = text[token_start:token_end]
+            if token != keyword and token in _ATOMIC_OBSERVATION_TOKENS:
+                start = end
+                continue
             if any(span_start <= idx and end <= span_end for span_start, span_end in negated_spans):
                 start = end
                 continue

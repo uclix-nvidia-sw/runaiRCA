@@ -59,6 +59,29 @@ def test_alert_condition_false_is_not_dependent_on_label_order() -> None:
     assert negated is True
 
 
+def test_atomic_observation_tokens_do_not_decompose_keyword_hits() -> None:
+    assert _keyword_hits("progressdeadlineexceeded", ["deadlineexceeded"])[0] == []
+    assert _keyword_hits("reason=DeadlineExceeded".lower(), ["deadlineexceeded"])[0] == [
+        "deadlineexceeded"
+    ]
+    assert _keyword_hits("kubepodimagepullbackoff", ["imagepullbackoff"])[0] == [
+        "imagepullbackoff"
+    ]
+    assert _keyword_hits("nodediskpressure", ["diskpressure"])[0] == [
+        "diskpressure"
+    ]
+    assert _keyword_hits("runai reclaimed over-quota gpus", ["reclaim"])[0] == [
+        "reclaim"
+    ]
+    assert _keyword_hits("pod was preempted by scheduler", ["preempt"])[0] == [
+        "preempt"
+    ]
+    assert _keyword_hits(
+        "job has reached the specified backoff limit",
+        ["job has reached the specified backoff limit"],
+    )[0] == ["job has reached the specified backoff limit"]
+
+
 def test_xid_code_extracted_from_drilldown_artifact() -> None:
     # Drill-down can be the first place a GPU fault appears; it must still feed
     # XID promotion and graph remediation, not just the appendix evidence card.
