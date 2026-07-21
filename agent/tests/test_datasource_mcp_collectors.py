@@ -6,12 +6,14 @@ from types import SimpleNamespace
 import pytest
 
 from app.collectors import kubernetes, loki, postgres, prometheus
+from app.collectors.base import NO_EVIDENCE
 from app.collectors.grafana_mcp import (
     clear_grafana_datasource_cache,
     mark_grafana_datasource_failure,
     resolve_grafana_datasource_uid,
 )
 from app.collectors.http_json import JsonResponse
+from app.plan import InvestigationPlan
 from tests.test_orchestrator import make_settings, make_target
 
 
@@ -230,6 +232,38 @@ async def test_prometheus_collector_uses_mcp_before_direct_http(monkeypatch) -> 
     assert all(args["endTime"] == "2026-07-10T01:15:00Z" for args in query_args)
     assert all(args["stepSeconds"] == 60 and "expr" in args for args in query_args)
     assert all("query" not in args and "datasource_uid" not in args for args in query_args)
+
+
+@pytest.mark.asyncio
+async def test_prometheus_insight_excludes_global_connectivity_probe(monkeypatch) -> None:
+    captured: list[list[dict[str, object]]] = []
+
+    async def fake_many(_url, calls):
+        return [
+            _McpResult(
+                {"status": "success", "data": {"result": [{"metric": {}, "value": [1, "1"]}]}}
+            )
+            for _ in calls
+        ]
+
+    async def fake_insight(_settings, _source, _summary, evidence):
+        captured.append(evidence)
+        return None
+
+    monkeypatch.setattr(prometheus, "mcp_call_many", fake_many)
+    monkeypatch.setattr(prometheus, "_llm_insight", fake_insight)
+    result = await prometheus.PrometheusCollector(
+        replace(
+            make_settings(),
+            prometheus_mcp_url="http://grafana-mcp/insight-test",
+            prometheus_datasource_uid="prom-main",
+        )
+    ).collect(make_target())
+
+    assert captured
+    assert all(item["name"] != "prometheus_up" for item in captured[0])
+    assert any(item["name"] == "prometheus_up" for item in result.details["queries"])
+    assert any(item["name"] != "prometheus_up" for item in captured[0])
 
 
 @pytest.mark.asyncio
@@ -697,6 +731,43 @@ async def test_kubernetes_collector_uses_mcp_before_service_account_token(
 
 
 @pytest.mark.asyncio
+async def test_kubernetes_empty_pod_event_scope_is_no_evidence(monkeypatch) -> None:
+    async def empty_scope(**_kwargs):
+        return [
+            {
+                "name": "namespace_pods",
+                "path": "MCP pods_list runai",
+                "error": None,
+                "data": {"items": []},
+            },
+            {
+                "name": "namespace_events",
+                "path": "MCP events_list runai",
+                "error": None,
+                "data": {"items": []},
+            },
+        ]
+
+    async def no_workload_pod(*_args, **_kwargs):
+        return {}
+
+    monkeypatch.setattr(kubernetes, "_collect_kubernetes_responses_via_mcp", empty_scope)
+    monkeypatch.setattr(kubernetes, "_resolve_workload_pod", no_workload_pod)
+    result = await kubernetes.KubernetesCollector(
+        replace(make_settings(), kubernetes_mcp_url="http://kubernetes-mcp/mcp")
+    ).collect(
+        replace(make_target(), namespace="runai", pod="", workload_name=""),
+        InvestigationPlan(check_control_plane=False),
+    )
+
+    assert result.summary.startswith(NO_EVIDENCE)
+    assert result.confidence == "low"
+    assert result.details["insight"] == ""
+    assert "healthy" not in result.summary.lower()
+    assert "running" not in result.summary.lower()
+
+
+@pytest.mark.asyncio
 async def test_kubernetes_required_query_failure_keeps_other_mcp_evidence_partial(
     monkeypatch,
 ) -> None:
@@ -723,7 +794,7 @@ async def test_kubernetes_required_query_failure_keeps_other_mcp_evidence_partia
     ).collect(make_target())
 
     assert result.status == "partial"
-    assert result.confidence == "medium"
+    assert result.confidence == "low"
     assert "kubernetes.query" in result.missing_data
     assert any(item["error"] is None for item in result.details["queries"])
     assert any("pods/get forbidden" in str(item["error"]) for item in result.details["queries"])

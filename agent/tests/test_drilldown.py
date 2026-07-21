@@ -173,6 +173,21 @@ async def test_metric_and_log_drilldowns_preserve_mcp_errors_and_incident_window
 
 
 @pytest.mark.asyncio
+async def test_promql_drilldown_reports_zero_series_from_successful_mcp_query(monkeypatch) -> None:
+    async def fake_prom_mcp(_settings, _name, query, *, time_range=None):
+        return {"error": None, "series_count": 0 if query == "empty_metric" else 1}
+
+    monkeypatch.setattr(drilldown, "prom_mcp_query", fake_prom_mcp)
+    settings = drill_settings(prometheus_mcp_url="http://prom-mcp")
+
+    empty = await _tool_promql(settings, _target(), {"query": "empty_metric"})
+    populated = await _tool_promql(settings, _target(), {"query": "present_metric"})
+
+    assert "0 series" in empty["summary"]
+    assert "ok" in populated["summary"]
+
+
+@pytest.mark.asyncio
 async def test_metric_and_log_queries_reject_overlong_input() -> None:
     settings = drill_settings()
     target = _target()
@@ -1072,6 +1087,40 @@ def test_system_and_change_agents_adapt_with_their_own_safe_tools(monkeypatch) -
     assert [artifact.status for artifact in results[1].artifacts] == ["ok"]
     assert results[0].artifacts[0].result["observation"]["coverage"] == "scoped"
     assert results[1].artifacts[0].result["observation"]["coverage"] == "scoped"
+
+
+def test_system_no_node_scope_is_recorded_once_per_run(monkeypatch) -> None:
+    calls = 0
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
+        return {
+            "action": "query",
+            "queries": [
+                {"tool": "system_log_query", "args": {"source": "journal"}},
+                {"tool": "system_log_query", "args": {"source": "syslog"}},
+            ],
+        }
+
+    async def fake_system_log_query(settings, target, args):
+        nonlocal calls
+        calls += 1
+        return {
+            "query": "system logs (bounded)",
+            "summary": "the alert has no node scope",
+            "error": "the alert has no node scope",
+            "result": {},
+        }
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "system_log_query", fake_system_log_query)
+    result = CollectorResult(agent="system", status="unavailable", summary="no node")
+
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
+
+    assert calls == 1
+    assert len(result.artifacts) == 1
+    assert result.artifacts[0].summary == "the alert has no node scope"
 
 
 def test_cross_domain_drilldown_query_is_visible_in_warnings(monkeypatch) -> None:

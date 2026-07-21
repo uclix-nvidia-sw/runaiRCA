@@ -42,7 +42,7 @@ def _actions_section(response) -> str:
     start = response.analysis_detail.find("## 3. Recommended Actions")
     if start < 0:
         return ""
-    end = response.analysis_detail.find("\n## 4.", start)
+    end = response.analysis_detail.find("\n## Appendix", start)
     return response.analysis_detail[start : end if end >= 0 else len(response.analysis_detail)]
 
 

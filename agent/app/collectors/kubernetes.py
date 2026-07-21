@@ -1690,6 +1690,14 @@ class KubernetesCollector:
             if status != "ok" and not required_failures:
                 status, confidence = "ok", "high"
 
+        if _pod_event_scope_empty(responses):
+            summary = f"{NO_EVIDENCE} " + ko_en(
+                self._settings,
+                "조회한 범위에서 파드 또는 이벤트가 관찰되지 않았습니다.",
+                "No pods or events were observed for the queried scope.",
+            )
+            confidence = "low"
+
         insight = await _senior_insight(
             self._settings,
             summary=summary,
@@ -5038,6 +5046,39 @@ def _warning_events(responses: list[dict[str, object]]) -> list[object]:
                 )
             )
     return events
+
+
+def _pod_event_scope_empty(responses: list[dict[str, object]]) -> bool:
+    if any(
+        response.get("name") == "pod"
+        and not response.get("error")
+        and isinstance(response.get("data"), dict)
+        and response["data"]
+        for response in responses
+    ):
+        return False
+    scoped_lists = [
+        response
+        for response in responses
+        if str(response.get("name") or "")
+        in {
+            "namespace_pods",
+            "pod_events",
+            "workload_events",
+            "namespace_events",
+        }
+        or str(response.get("name") or "").startswith(
+            ("runai_control_plane_pods:", "runai_control_plane_events:")
+        )
+    ]
+    if not scoped_lists or any(response.get("error") for response in scoped_lists):
+        return False
+    return all(
+        isinstance(response.get("data"), dict)
+        and isinstance(response["data"].get("items"), list)
+        and not response["data"]["items"]
+        for response in scoped_lists
+    )
 
 
 def _node_conditions(responses: list[dict[str, object]]) -> list[object]:

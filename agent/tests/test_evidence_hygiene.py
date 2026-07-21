@@ -107,13 +107,19 @@ def test_insufficient_evidence_gets_a_separate_general_guidance_section() -> Non
         eligible_support_ids=set(),
     )
 
-    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## 4. Appendix", 1)[0]
+    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## Appendix", 1)[0]
     guidance = detail.split("## General Troubleshooting Guidance", 1)[1].split(
-        "## 4. Appendix", 1
+        "## Appendix", 1
     )[0]
     assert "GENERAL-GUIDANCE" not in actions
     assert "not a diagnosis" in guidance
     assert "GENERAL-GUIDANCE" in guidance
+
+
+def test_insert_before_appendix_supports_current_and_legacy_headings() -> None:
+    for heading in ("## Appendix", "## 4. Appendix", "## 부록 (Appendix)", "## 4. 부록 (Appendix)"):
+        detail = pipeline._insert_before_appendix(f"before\n{heading}\nafter", "## Self-Check")
+        assert detail.index("## Self-Check") < detail.index(heading)
 
 
 @pytest.mark.asyncio
@@ -384,7 +390,7 @@ def test_context_only_artifact_cannot_emit_graph_remediation_actions() -> None:
     )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
-    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## 4.", 1)[0]
+    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## Appendix", 1)[0]
     assert "Fix the root XID first" not in root_cause
     assert "Reset the implicated GPU" not in actions
     assert "Replace the GPU" not in actions
@@ -439,7 +445,7 @@ def test_context_only_artifacts_cannot_emit_catalog_or_historical_actions() -> N
         eligible_support_ids=set(),
     )
 
-    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## 4.", 1)[0]
+    actions = detail.split("## 3. Recommended Actions", 1)[1].split("## Appendix", 1)[0]
     assert "Not enough evidence for concrete actions" in actions
     for forbidden in (
         "CATALOG-REMEDY",
