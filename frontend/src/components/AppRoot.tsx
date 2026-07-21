@@ -32,6 +32,10 @@ import {
   deleteIncident,
   fetchAnalysisRun,
   fetchIncident,
+  fetchRootCauseFamilies,
+  rcaCorrection,
+  rcaPin,
+  reverifyIncident,
   resolveIncident,
   restoreIncident,
   unarchiveIncident,
@@ -95,6 +99,7 @@ import { RealtimeEventPayload } from '../utils/realtime';
 import { hashForDetail, hashForView, routeFromHash } from '../utils/routing';
 import { evidenceMetadata, type EvidenceMetadata, type EvidenceWindow } from '../utils/evidenceMetadata';
 import { analysisRunForDetail, selectedAnalysisRunID as selectedAnalysisRunIDForDetail } from '../utils/analysisRunSelection';
+import { parseCorrectionActions } from '../utils/operatorCorrection';
 
 function errorMessage(err: unknown, fallback: string) {
   return err instanceof Error ? err.message : fallback;
@@ -781,6 +786,10 @@ function App() {
           await analyzeIncident(id);
           await refreshCurrentView();
         }}
+        onReverify={async (id) => {
+          await reverifyIncident(id);
+          await refreshCurrentView();
+        }}
         onOpenIncident={openIncident}
         onResolve={async (id) => {
           await resolveIncident(id);
@@ -804,6 +813,7 @@ function UnifiedWorkspace({
   onClose,
   onRefresh,
   onAnalyze,
+  onReverify,
   onOpenIncident,
   onResolve,
 }: {
@@ -813,12 +823,22 @@ function UnifiedWorkspace({
   onClose: () => void;
   onRefresh: () => Promise<void>;
   onAnalyze: (id: string) => Promise<void>;
+  onReverify: (id: string) => Promise<void>;
   onOpenIncident: (id: string) => Promise<void>;
   onResolve: (id: string) => Promise<void>;
 }) {
   const [busyAction, setBusyAction] = useState('');
   const [closing, setClosing] = useState(false);
   const [justApproved, setJustApproved] = useState(false);
+  const [correctionOpen, setCorrectionOpen] = useState(false);
+  const [correctionFamily, setCorrectionFamily] = useState('');
+  const [correctionSummary, setCorrectionSummary] = useState('');
+  const [correctionActions, setCorrectionActions] = useState('');
+  const [correctionCatalogStatus, setCorrectionCatalogStatus] = useState<'loading' | 'ready' | 'failed'>('ready');
+  const [correctionFamilies, setCorrectionFamilies] = useState<string[]>([]);
+  const [correctionError, setCorrectionError] = useState('');
+  const [operatorActionError, setOperatorActionError] = useState('');
+  const [operatorPinnedOverride, setOperatorPinnedOverride] = useState<boolean>();
   const closeTimerRef = useRef<number | null>(null);
   const approveTimerRef = useRef<number | null>(null);
   const runWorkspaceAction = useCallback(async (action: string, work: () => Promise<void>) => {
@@ -851,6 +871,27 @@ function UnifiedWorkspace({
     if (closeTimerRef.current !== null) window.clearTimeout(closeTimerRef.current);
     if (approveTimerRef.current !== null) window.clearTimeout(approveTimerRef.current);
   }, []);
+
+  useEffect(() => {
+    if (!correctionOpen) return undefined;
+    let cancelled = false;
+    setCorrectionCatalogStatus('loading');
+    setCorrectionError('');
+    void fetchRootCauseFamilies().then((families) => {
+      if (cancelled) return;
+      setCorrectionFamilies(families);
+      setCorrectionCatalogStatus('ready');
+    }).catch((err: unknown) => {
+      if (cancelled) return;
+      setCorrectionCatalogStatus('failed');
+      setCorrectionError(`Root-cause family catalog unavailable: ${errorMessage(err, 'Failed to load catalog.')}`);
+    });
+    return () => { cancelled = true; };
+  }, [correctionOpen]);
+
+  useEffect(() => {
+    setOperatorPinnedOverride(undefined);
+  }, [analysisRun?.run_id]);
 
   // Play the exit animation, then let the parent unmount. Timer-based (not
   // animationend) so it still closes under prefers-reduced-motion.
@@ -914,6 +955,9 @@ function UnifiedWorkspace({
   const analysis = incident?.analysis_detail;
   const summary = incident?.analysis_summary;
   const isAnalyzing = Boolean(detail.data.is_analyzing);
+  const isOperatorCorrection = analysisRun?.source === 'operator';
+  const operatorCorrectionPinned = isOperatorCorrection &&
+    (operatorPinnedOverride ?? analysisRun?.metadata?.pinned === true);
   const evidencePresentation = collectorEvidencePresentation({
     isAnalyzing,
     runStatus: analysisRun?.status,
@@ -928,6 +972,53 @@ function UnifiedWorkspace({
   const commentCount = feedback?.comments?.length ?? 0;
   const scrollToFeedback = () => {
     document.getElementById('operator-feedback')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+  const saveCorrection = async () => {
+    if (!incident || busyAction || correctionCatalogStatus !== 'ready' || !correctionFamily || !correctionSummary.trim()) return;
+    setBusyAction('rca-correction');
+    setCorrectionError('');
+    try {
+      await rcaCorrection(incident.incident_id, {
+        root_cause_family: correctionFamily,
+        summary: correctionSummary.trim(),
+        actions: parseCorrectionActions(correctionActions),
+      });
+      await onRefresh();
+      setCorrectionOpen(false);
+      setCorrectionFamily('');
+      setCorrectionSummary('');
+      setCorrectionActions('');
+    } catch (err) {
+      setCorrectionError(errorMessage(err, 'Failed to save RCA correction.'));
+    } finally {
+      setBusyAction('');
+    }
+  };
+  const updateOperatorPin = async () => {
+    if (!incident || !isOperatorCorrection || busyAction) return;
+    setBusyAction('rca-pin');
+    setOperatorActionError('');
+    try {
+      const run = await rcaPin(incident.incident_id, !operatorCorrectionPinned);
+      setOperatorPinnedOverride(run.metadata?.pinned === true);
+      await onRefresh();
+    } catch (err) {
+      setOperatorActionError(errorMessage(err, 'Failed to update RCA correction pin.'));
+    } finally {
+      setBusyAction('');
+    }
+  };
+  const reverifyCorrection = async () => {
+    if (!incident || !operatorCorrectionPinned || busyAction) return;
+    setBusyAction('reverify');
+    setOperatorActionError('');
+    try {
+      await onReverify(incident.incident_id);
+    } catch (err) {
+      setOperatorActionError(errorMessage(err, 'Failed to start re-verification.'));
+    } finally {
+      setBusyAction('');
+    }
   };
 
   return (
@@ -996,6 +1087,34 @@ function UnifiedWorkspace({
                 <Bot size={16} /> {busyAction === 'analyze' ? 'Analyzing...' : 'Analyze'}
               </button>
               <button
+                className="ghost-button"
+                disabled={Boolean(busyAction)}
+                onClick={() => setCorrectionOpen((open) => !open)}
+                type="button"
+              >
+                <FileText size={16} /> RCA 수정
+              </button>
+              {isOperatorCorrection && (
+                <button
+                  className={`ghost-button compact-button ${busyAction === 'rca-pin' ? 'is-busy' : ''}`}
+                  disabled={Boolean(busyAction)}
+                  onClick={() => void updateOperatorPin()}
+                  type="button"
+                >
+                  {busyAction === 'rca-pin' ? 'Updating...' : operatorCorrectionPinned ? '고정 해제' : '고정'}
+                </button>
+              )}
+              {operatorCorrectionPinned && (
+                <button
+                  className={`ghost-button compact-button ${busyAction === 'reverify' ? 'is-busy' : ''}`}
+                  disabled={Boolean(busyAction)}
+                  onClick={() => void reverifyCorrection()}
+                  type="button"
+                >
+                  <RefreshCw size={14} /> {busyAction === 'reverify' ? 'Analyzing...' : '수정 결론으로 재검증'}
+                </button>
+              )}
+              <button
                 className={`ghost-button ${busyAction === 'export' ? 'is-busy' : ''}`}
                 disabled={Boolean(busyAction)}
                 onClick={() => void runWorkspaceAction('export', () => exportIncidentDocx(incident))}
@@ -1046,8 +1165,78 @@ function UnifiedWorkspace({
       )}
 
       <div className="workspace-body">
+        {incident && correctionOpen && (
+          <section className="rca-correction-panel evaluation-panel" aria-label="RCA correction">
+            <div className="section-title"><FileText size={18} /> RCA 수정</div>
+            {correctionError && <p className="feedback-error">{correctionError}</p>}
+            <form className="evaluation-form" onSubmit={(event) => { event.preventDefault(); void saveCorrection(); }}>
+              <label className="evaluation-field">
+                <span>Root-cause family</span>
+                <select
+                  value={correctionFamily}
+                  onChange={(event) => setCorrectionFamily(event.target.value)}
+                  disabled={correctionCatalogStatus !== 'ready' || Boolean(busyAction)}
+                  required
+                >
+                  <option value="">
+                    {correctionCatalogStatus === 'loading'
+                      ? 'Loading families…'
+                      : correctionCatalogStatus === 'failed'
+                        ? 'Family catalog unavailable'
+                        : 'Select family'}
+                  </option>
+                  {correctionFamilies.map((family) => (
+                    <option key={family} value={family}>{family.split('_').join(' ')}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="evaluation-field">
+                <span>RCA summary</span>
+                <textarea
+                  value={correctionSummary}
+                  onChange={(event) => setCorrectionSummary(event.target.value)}
+                  disabled={Boolean(busyAction)}
+                  required
+                />
+              </label>
+              <label className="evaluation-field">
+                <span>Actions <small>One action per line</small></span>
+                <textarea
+                  value={correctionActions}
+                  onChange={(event) => setCorrectionActions(event.target.value)}
+                  disabled={Boolean(busyAction)}
+                />
+              </label>
+              <div className="evaluation-actions">
+                <button
+                  className="ghost-button"
+                  disabled={Boolean(busyAction)}
+                  onClick={() => setCorrectionOpen(false)}
+                  type="button"
+                >
+                  Cancel
+                </button>
+                <button
+                  className={`primary-button evaluation-save ${busyAction === 'rca-correction' ? 'is-busy' : ''}`}
+                  disabled={Boolean(busyAction) || correctionCatalogStatus !== 'ready' || !correctionFamily || !correctionSummary.trim()}
+                  type="submit"
+                >
+                  {busyAction === 'rca-correction' ? 'Saving...' : 'Save'}
+                </button>
+              </div>
+            </form>
+          </section>
+        )}
         <section className="rca-summary">
-          <h3>RCA Summary</h3>
+          <div className="rca-summary-heading">
+            <h3>RCA Summary</h3>
+            {isOperatorCorrection && (
+              <div className="rca-operator-meta">
+                <span className="quality quality-operator">운영자 수정</span>
+                <span className="rca-operator-pin">{operatorCorrectionPinned ? '고정됨' : '고정 해제됨'}</span>
+              </div>
+            )}
+          </div>
           <p>
             {isAnalyzing
               ? summary
@@ -1063,6 +1252,7 @@ function UnifiedWorkspace({
               <MessageSquare size={14} /> Feedback
             </button>
           </div>
+          {operatorActionError && <p className="feedback-error">{operatorActionError}</p>}
         </section>
 
         {(isAnalyzing || progressEvents.length > 0) && (

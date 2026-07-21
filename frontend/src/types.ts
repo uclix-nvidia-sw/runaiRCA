@@ -132,6 +132,10 @@ export type AnalysisRun = {
   artifacts: Artifact[];
   metadata?: Record<string, unknown> & {
     progress_log?: AnalysisProgressEntry[];
+    pinned?: boolean;
+    operator_correction?: {
+      base_run_id?: string;
+    };
   };
   first_completed_at?: string;
   created_at: string;
