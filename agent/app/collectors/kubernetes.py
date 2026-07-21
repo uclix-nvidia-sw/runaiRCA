@@ -1341,6 +1341,7 @@ class KubernetesCollector:
         target = _scope_target(target, plan)
         time_range = incident_time_range(target)
         causal_time_range = causal_evidence_time_range(target)
+        event_time_range = _event_collection_time_range(target)
         since_time = time_range["start"] if time_range else ""
         missing: list[str] = []
         if not target.namespace:
@@ -1357,6 +1358,24 @@ class KubernetesCollector:
         logs: list[dict[str, object]] = []
         exec_probes: list[dict[str, object]] = []
         control_plane_in_scope = plan.check_control_plane if plan is not None else True
+        # A controller-only alert does not name its concrete Pod. Resolve it
+        # before the broad Event sweep so every Event layer can use the same
+        # exact Pod identity, while retaining the declared workload as the
+        # alert entity reported by the artifact.
+        workload_resolution: dict[str, object] = {}
+        resolved_pod_anchor: AnalysisTarget | None = None
+        if not target.pod:
+            if target.namespace and not _namespace_allowed(self._settings, target.namespace):
+                warnings.append("Resolved workload pod lookup skipped by namespace scope configuration.")
+            else:
+                workload_resolution = await _resolve_workload_pod(self._settings, target)
+            resolved_pod = str(workload_resolution.get("selected_pod") or "")
+            if resolved_pod:
+                resolved_pod_anchor = replace(
+                    target,
+                    pod=resolved_pod,
+                    pod_uid=str(workload_resolution.get("selected_pod_uid") or ""),
+                )
         if self._settings.kubernetes_mcp_url:
             try:
                 async with mcp_budget(self._settings.kubernetes_timeout_seconds):
@@ -1364,6 +1383,7 @@ class KubernetesCollector:
                         settings=self._settings,
                         target=target,
                         control_plane_in_scope=control_plane_in_scope,
+                        resolved_pod_anchor=resolved_pod_anchor,
                     )
                     pod_summary_data = _target_pod_summary(responses)
                     if _pod_matches_target_uid(pod_summary_data, target):
@@ -1436,6 +1456,7 @@ class KubernetesCollector:
                 headers=headers,
                 verify=verify,
                 control_plane_in_scope=control_plane_in_scope,
+                resolved_pod_anchor=resolved_pod_anchor,
             )
             pod_summary_data = _target_pod_summary(responses)
             if _pod_matches_target_uid(pod_summary_data, target):
@@ -1472,7 +1493,7 @@ class KubernetesCollector:
                 "pods",
                 namespace=target.namespace,
                 name=target.pod,
-                time_range=time_range,
+                time_range=event_time_range,
             )
             described_object = target_pod_describe.get("object")
             if isinstance(described_object, dict):
@@ -1491,15 +1512,8 @@ class KubernetesCollector:
         # selector deterministically, choose the most unhealthy pod, then collect
         # the same describe/log evidence as a pod-level alert. This must not be
         # left to the optional LLM drill-down loop.
-        workload_resolution: dict[str, object] = {}
         resolved_pod_describe: dict[str, object] = {}
         if not target.pod:
-            if target.namespace and not _namespace_allowed(self._settings, target.namespace):
-                if "kubernetes.namespace_scope" not in missing:
-                    missing.append("kubernetes.namespace_scope")
-                warnings.append("Resolved workload pod lookup skipped by namespace scope configuration.")
-            else:
-                workload_resolution = await _resolve_workload_pod(self._settings, target)
             resolved_pod = str(workload_resolution.get("selected_pod") or "")
             if resolved_pod and _namespace_allowed(self._settings, target.namespace):
                 resolved_target = replace(target, pod=resolved_pod)
@@ -1508,7 +1522,7 @@ class KubernetesCollector:
                     "pods",
                     namespace=target.namespace,
                     name=resolved_pod,
-                    time_range=time_range,
+                    time_range=event_time_range,
                 )
                 described_object = resolved_pod_describe.get("object")
                 if isinstance(described_object, dict):
@@ -1563,7 +1577,9 @@ class KubernetesCollector:
         described_events = resolved_pod_describe.get("events")
         if isinstance(described_events, list):
             warning_events.extend(
-                _event_summary(event, target=target)
+                _event_summary(
+                    event, target=target, resolved_pod_anchor=resolved_pod_anchor
+                )
                 for event in described_events
                 if isinstance(event, dict) and event.get("type") == "Warning"
             )
@@ -1787,6 +1803,7 @@ class KubernetesCollector:
             target_scoped=_warning_events_are_target_scoped(target),
             queries_complete=_warning_event_queries_complete(responses),
             target=target,
+            resolved_pod_anchor=resolved_pod_anchor,
         )
         artifacts.append(
             artifact(
@@ -2013,6 +2030,7 @@ def _warning_event_observation(
     target_scoped: bool = True,
     queries_complete: bool = True,
     target: AnalysisTarget | None = None,
+    resolved_pod_anchor: AnalysisTarget | None = None,
 ) -> dict[str, object]:
     """Make filtered event presence/absence a typed historical predicate."""
     observed_entity = _event_target_entity(target) if target is not None else None
@@ -2032,6 +2050,16 @@ def _warning_event_observation(
         and event.get("observed_entity") == observed_entity
         for event in warning_events
     ) and not identity_ambiguous
+    # A workload-only alert can retain controller Events, but a returned child
+    # Pod Event must also carry the exact live-Pod verification that admitted it
+    # through the response filter.
+    if resolved_pod_anchor and any(
+        str(event.get("kind") or "").casefold() == "pod" for event in warning_events
+    ):
+        verified_events = verified_events and any(
+            event.get("target_identity_anchor_verified") is True
+            for event in warning_events
+        )
     if status == "unavailable":
         polarity, coverage = "unavailable", "unknown"
     elif not target_scoped or (target is not None and observed_entity is None):
@@ -2343,6 +2371,7 @@ async def _collect_kubernetes_responses(
     headers: dict[str, str],
     verify: bool | str,
     control_plane_in_scope: bool = True,
+    resolved_pod_anchor: AnalysisTarget | None = None,
 ) -> list[dict[str, object]]:
     requests: list[tuple[str, str, dict[str, str] | None]] = []
     namespace = quote(target.namespace, safe="")
@@ -2423,8 +2452,15 @@ async def _collect_kubernetes_responses(
                 "status_code": response.status_code,
                 "error": response.error,
                 "list_complete": _kubernetes_list_complete(response.data),
-                "event_time_complete": _event_time_range_complete(name, response.data, target),
-                "data": compact(_filter_kubernetes_data(name, response.data, target), limit=5),
+                "event_time_complete": _event_time_range_complete(
+                    name, response.data, target, resolved_pod_anchor=resolved_pod_anchor
+                ),
+                "data": compact(
+                    _filter_kubernetes_data(
+                        name, response.data, target, resolved_pod_anchor=resolved_pod_anchor
+                    ),
+                    limit=5,
+                ),
             }
         )
     return responses
@@ -2435,6 +2471,7 @@ async def _collect_kubernetes_responses_via_mcp(
     settings: Settings,
     target: AnalysisTarget,
     control_plane_in_scope: bool = True,
+    resolved_pod_anchor: AnalysisTarget | None = None,
 ) -> list[dict[str, object]]:
     """The base sweep over the Kubernetes MCP service.
 
@@ -2468,7 +2505,11 @@ async def _collect_kubernetes_responses_via_mcp(
             )
             return
         ok_count += 1
-        responses.append(_mcp_k8s_response(name, label, data, target))
+        responses.append(
+            _mcp_k8s_response(
+                name, label, data, target, resolved_pod_anchor=resolved_pod_anchor
+            )
+        )
 
     target_namespace_allowed = _namespace_allowed(settings, target.namespace)
     if target.namespace and target_namespace_allowed and target.pod:
@@ -2593,7 +2634,12 @@ async def _collect_kubernetes_responses_via_mcp(
 
 
 def _mcp_k8s_response(
-    name: str, path: str, data: object, target: AnalysisTarget
+    name: str,
+    path: str,
+    data: object,
+    target: AnalysisTarget,
+    *,
+    resolved_pod_anchor: AnalysisTarget | None = None,
 ) -> dict[str, object]:
     normalized = _normalize_k8s_payload(data)
     return {
@@ -2606,8 +2652,15 @@ def _mcp_k8s_response(
         # List metadata.  It may be a server-side capped page, so it must not
         # turn an empty historical Event result into a scoped absence claim.
         "list_complete": _mcp_kubernetes_list_complete(normalized),
-        "event_time_complete": _event_time_range_complete(name, normalized, target),
-        "data": compact(_filter_kubernetes_data(name, normalized, target), limit=5),
+        "event_time_complete": _event_time_range_complete(
+            name, normalized, target, resolved_pod_anchor=resolved_pod_anchor
+        ),
+        "data": compact(
+            _filter_kubernetes_data(
+                name, normalized, target, resolved_pod_anchor=resolved_pod_anchor
+            ),
+            limit=5,
+        ),
     }
 
 
@@ -2687,17 +2740,11 @@ async def _k8s_mcp_json_within_budget(
         if error:
             last_error = f"{tool}: {error}"
             continue
-        data = mcp_tool_json(result)
-        if isinstance(data, dict) and "raw" in data:
-            # kubernetes-mcp-server answers in YAML, not JSON. Parse the RAW text
-            # (masking first corrupted the YAML — base64 certs → "[MASKED]" broke
-            # the block structure — and the "raw" preview is truncated); the
-            # parsed object is masked afterward.
-            try:
-                data = _k8s_yaml_payload(mcp_tool_raw_text(result))
-            except RuntimeError as exc:
-                last_error = f"{tool}: {exc}"
-                continue
+        try:
+            data = _k8s_mcp_payload(result)
+        except RuntimeError as exc:
+            last_error = f"{tool}: {exc}"
+            continue
         if not _k8s_mcp_payload_recognized(data, tool=tool):
             last_error = f"{tool}: MCP response missing a Kubernetes object/list payload"
             continue
@@ -2705,8 +2752,90 @@ async def _k8s_mcp_json_within_budget(
     raise RuntimeError(last_error or "Kubernetes MCP tool failed")
 
 
+_KUBERNETES_GO_KEY_ALIASES = {
+    "APIVersion": "apiVersion",
+    "EventTime": "eventTime",
+    "FirstTimestamp": "firstTimestamp",
+    "InvolvedObject": "involvedObject",
+    "Items": "items",
+    "Kind": "kind",
+    "LastTimestamp": "lastTimestamp",
+    "Message": "message",
+    "Metadata": "metadata",
+    "Name": "name",
+    "Namespace": "namespace",
+    "Reason": "reason",
+    "Series": "series",
+    "Spec": "spec",
+    "Status": "status",
+    # Some kubectl-get-events-style adapters expose the legacy Event time as
+    # Timestamp. Preserve it as the canonical legacy Event occurrence field.
+    "Timestamp": "lastTimestamp",
+    "Type": "type",
+    "UID": "uid",
+}
+_KUBERNETES_METADATA_VALUE_KEYS = frozenset({"annotations", "data", "labels"})
+
+
+def _canonicalize_kubernetes_payload(value: object, *, metadata_values: bool = False) -> object:
+    """Normalize MCP Go-field payloads before masking and evidence projection."""
+    if isinstance(value, list):
+        return [
+            _canonicalize_kubernetes_payload(item, metadata_values=metadata_values)
+            for item in value
+        ]
+    if not isinstance(value, dict):
+        return value
+    normalized: dict[object, object] = {}
+    for key, item in value.items():
+        canonical_key = (
+            _KUBERNETES_GO_KEY_ALIASES.get(key, key)
+            if isinstance(key, str) and not metadata_values
+            else key
+        )
+        normalized[canonical_key] = _canonicalize_kubernetes_payload(
+            item,
+            metadata_values=canonical_key in _KUBERNETES_METADATA_VALUE_KEYS,
+        )
+    return normalized
+
+
+def _k8s_mcp_payload(result: object) -> object:
+    """Parse, normalize, then mask one Kubernetes MCP reply.
+
+    MCP responses may serialize Kubernetes Go struct fields rather than the
+    JSON field names consumed by the collector. Normalization belongs at this
+    transport boundary so all downstream identity, time, and signal code sees
+    one canonical schema without altering arbitrary metadata values.
+    """
+    structured = getattr(result, "structuredContent", None)
+    if structured is None:
+        structured = getattr(result, "structured_content", None)
+    if structured is not None:
+        parsed = structured
+    else:
+        text = mcp_tool_raw_text(result)
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            parsed = _parse_k8s_yaml_payload(text)
+    if not isinstance(parsed, (dict, list)):
+        raise RuntimeError("MCP result was not JSON or YAML (set --list-output=yaml)")
+    return build_masker(()).mask_object(_canonicalize_kubernetes_payload(parsed))
+
+
 def _k8s_yaml_payload(text: str) -> object:
-    """A MASKED dict/list from a YAML (or JSON) MCP tool reply.
+    """Return a masked Kubernetes YAML reply for compatibility callers.
+
+    Parsing occurs before masking so secret-shaped values cannot corrupt YAML
+    syntax. The MCP transport uses the same parser, then normalizes Go-field
+    keys before applying this mask.
+    """
+    return build_masker(()).mask_object(_parse_k8s_yaml_payload(text))
+
+
+def _parse_k8s_yaml_payload(text: str) -> object:
+    """Parse a Kubernetes YAML reply without masking it first.
 
     Raises on table/plain text so the caller records an observation."""
     try:
@@ -2718,8 +2847,7 @@ def _k8s_yaml_payload(text: str) -> object:
             raise RuntimeError(f"MCP result was not JSON or YAML: {exc}") from exc
         parsed = docs[0] if len(docs) == 1 else {"items": docs}
     if isinstance(parsed, (dict, list)):
-        # Mask AFTER parsing: same secret protection, intact structure.
-        return build_masker(()).mask_object(parsed)
+        return parsed
     # A bare string means table/plain-text output — not machine-readable.
     raise RuntimeError("MCP result was not JSON or YAML (set --list-output=yaml)")
 
@@ -3035,6 +3163,7 @@ async def _resolve_workload_pod(settings: Settings, target: AnalysisTarget) -> d
         )
         resolution["job_resolution"] = nested
         resolution["selected_pod"] = nested.get("selected_pod", "")
+        resolution["selected_pod_uid"] = nested.get("selected_pod_uid", "")
         return resolution
 
     selector = _selector_from_controller(controller)
@@ -3072,6 +3201,9 @@ async def _resolve_workload_pod(settings: Settings, target: AnalysisTarget) -> d
             ],
             "selected_pod": (
                 str((selected.get("metadata") or {}).get("name") or "") if selected else ""
+            ),
+            "selected_pod_uid": (
+                str((selected.get("metadata") or {}).get("uid") or "") if selected else ""
             ),
             "namespace_context_fallback": bool(
                 selected and target.workload_name and target.workload_name.casefold() not in selected_text
@@ -4087,7 +4219,22 @@ def _read_file(path: str) -> str:
         return ""
 
 
-def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> object:
+def _event_collection_time_range(target: AnalysisTarget) -> dict[str, str] | None:
+    """Keep resolved-event collection coverage while admitting firing evidence now."""
+    fired = parse_incident_time(target.fired_at)
+    resolved = parse_incident_time(target.resolved_at)
+    if resolved is None or (fired is not None and resolved < fired):
+        return causal_evidence_time_range(target)
+    return incident_time_range(target)
+
+
+def _filter_kubernetes_data(
+    name: str,
+    data: object,
+    target: AnalysisTarget,
+    *,
+    resolved_pod_anchor: AnalysisTarget | None = None,
+) -> object:
     if not isinstance(data, dict):
         return data
     if name == "namespace_pods" and isinstance(data.get("items"), list):
@@ -4111,7 +4258,7 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
         name in {"pod_events", "workload_events", "namespace_events"}
         or name.startswith("runai_control_plane_events:")
     ) and isinstance(data.get("items"), list):
-        items = _events_in_time_range(data["items"], incident_time_range(target))
+        items = _events_in_time_range(data["items"], _event_collection_time_range(target))
         # Kubernetes MCP's events_list does not reliably honor fieldSelector.
         # The named-pod sweep must never promote another object's warning as
         # evidence for this alert, so apply the selector locally as well.
@@ -4133,7 +4280,9 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
                 item
                 for item in items
                 if _event_matches_namespace(item, target.namespace)
-                and _event_matches_target(item, target)
+                and _event_matches_target(
+                    item, target, resolved_pod_anchor=resolved_pod_anchor
+                )
             ]
         elif name.startswith("runai_control_plane_events:"):
             # Control-plane Events intentionally live outside the workload
@@ -4143,7 +4292,9 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
                 item
                 for item in items
                 if _event_matches_namespace(item, _response_namespace(name) or "")
-                and _event_matches_target(item, target)
+                and _event_matches_target(
+                    item, target, resolved_pod_anchor=resolved_pod_anchor
+                )
             ]
         events = [
             item
@@ -4162,7 +4313,12 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
         omitted_events = max(0, len(events) - 5)
         filtered = {
             "namespace": _response_namespace(name),
-            "items": [_event_summary(item, target=target) for item in events[-5:]],
+            "items": [
+                _event_summary(
+                    item, target=target, resolved_pod_anchor=resolved_pod_anchor
+                )
+                for item in events[-5:]
+            ],
         }
         if omitted_events:
             filtered["omitted_events"] = omitted_events
@@ -4172,7 +4328,13 @@ def _filter_kubernetes_data(name: str, data: object, target: AnalysisTarget) -> 
     return data
 
 
-def _event_time_range_complete(name: str, data: object, target: AnalysisTarget) -> bool:
+def _event_time_range_complete(
+    name: str,
+    data: object,
+    target: AnalysisTarget,
+    *,
+    resolved_pod_anchor: AnalysisTarget | None = None,
+) -> bool:
     """Whether target-correlated Warning Events have usable historical times.
 
     An Event without a usable time cannot be placed inside or outside an
@@ -4185,7 +4347,7 @@ def _event_time_range_complete(name: str, data: object, target: AnalysisTarget) 
         or name.startswith("runai_control_plane_events:")
     ):
         return True
-    if not incident_time_range(target):
+    if not _event_collection_time_range(target):
         return True
     payload = _normalize_k8s_payload(data)
     items = payload.get("items") if isinstance(payload, dict) else None
@@ -4208,7 +4370,9 @@ def _event_time_range_complete(name: str, data: object, target: AnalysisTarget) 
             for item in items
             if isinstance(item, dict)
             and _event_matches_namespace(item, target.namespace)
-            and _event_matches_target(item, target)
+            and _event_matches_target(
+                item, target, resolved_pod_anchor=resolved_pod_anchor
+            )
         ]
     else:
         candidates = [
@@ -4216,9 +4380,11 @@ def _event_time_range_complete(name: str, data: object, target: AnalysisTarget) 
             for item in items
             if isinstance(item, dict)
             and _event_matches_namespace(item, _response_namespace(name) or "")
-            and _event_matches_target(item, target)
+            and _event_matches_target(
+                item, target, resolved_pod_anchor=resolved_pod_anchor
+            )
         ]
-    window = incident_time_range(target) or {}
+    window = _event_collection_time_range(target) or {}
     return all(
         _event_times_are_complete_for_window(item, window)
         for item in candidates
@@ -4288,7 +4454,10 @@ def _event_matches_declared_workload(
 
 
 def _event_target_identity(
-    event: dict[str, object], target: AnalysisTarget
+    event: dict[str, object],
+    target: AnalysisTarget,
+    *,
+    resolved_pod_anchor: AnalysisTarget | None = None,
 ) -> dict[str, str] | None:
     """Verify that an Event's involved object is the concrete alert resource.
 
@@ -4302,6 +4471,8 @@ def _event_target_identity(
     entity = _event_target_entity(target)
     if entity is None:
         return None
+    if _event_matches_resolved_pod(event, resolved_pod_anchor):
+        return entity
     if (
         target.pod
         and kind == "pod"
@@ -4317,11 +4488,18 @@ def _event_target_identity(
     return None
 
 
-def _event_matches_target(event: dict[str, object], target: AnalysisTarget) -> bool:
+def _event_matches_target(
+    event: dict[str, object],
+    target: AnalysisTarget,
+    *,
+    resolved_pod_anchor: AnalysisTarget | None = None,
+) -> bool:
     involved = event.get("involvedObject")
     involved = involved if isinstance(involved, dict) else {}
     name = str(involved.get("name") or "")
     kind = str(involved.get("kind") or "").casefold()
+    if _event_matches_resolved_pod(event, resolved_pod_anchor):
+        return True
     if (
         target.pod
         and kind == "pod"
@@ -4345,6 +4523,34 @@ def _event_matches_target(event: dict[str, object], target: AnalysisTarget) -> b
     # explicitly names an alert identity — never based on error vocabulary.
     message = str(event.get("message") or "")
     return _event_message_mentions_target(message, target)
+
+
+def _event_matches_resolved_pod(
+    event: dict[str, object], resolved_pod_anchor: AnalysisTarget | None
+) -> bool:
+    """Match an Event to the live Pod selected for a controller alert.
+
+    A controller's declared workload remains the artifact's observed entity.
+    The selected Pod is solely an exact identity anchor for child-Pod Events:
+    another Pod in the namespace cannot pass this check. A supplied Event UID
+    that disagrees with the selected Pod rejects even a same-name replacement;
+    matching UID also permits API variants that omit or alter the name.
+    """
+    if resolved_pod_anchor is None or not resolved_pod_anchor.pod:
+        return False
+    involved = event.get("involvedObject")
+    involved = involved if isinstance(involved, dict) else {}
+    if (
+        str(involved.get("kind") or "").casefold() != "pod"
+        or not _event_matches_namespace(event, resolved_pod_anchor.namespace)
+    ):
+        return False
+    name = str(involved.get("name") or "")
+    event_uid = str(involved.get("uid") or "")
+    anchor_uid = resolved_pod_anchor.pod_uid
+    if anchor_uid and event_uid and event_uid != anchor_uid:
+        return False
+    return name == resolved_pod_anchor.pod or bool(anchor_uid and event_uid == anchor_uid)
 
 
 def _event_matches_namespace(event: dict[str, object], namespace: str) -> bool:
@@ -4486,11 +4692,20 @@ def _prioritized_pod_list(items: object) -> dict[str, object]:
 
 
 def _event_summary(
-    event: dict[str, object], *, target: AnalysisTarget | None = None
+    event: dict[str, object],
+    *,
+    target: AnalysisTarget | None = None,
+    resolved_pod_anchor: AnalysisTarget | None = None,
 ) -> dict[str, object]:
     involved = event.get("involvedObject") if isinstance(event.get("involvedObject"), dict) else {}
     timestamps = _event_timestamps(event)
-    observed_entity = _event_target_identity(event, target) if target is not None else None
+    observed_entity = (
+        _event_target_identity(
+            event, target, resolved_pod_anchor=resolved_pod_anchor
+        )
+        if target is not None
+        else None
+    )
     summary = {
         "type": event.get("type"),
         "reason": event.get("reason"),
@@ -4511,6 +4726,10 @@ def _event_summary(
         "uid": involved.get("uid"),
         "target_identity_verified": observed_entity is not None,
     }
+    if resolved_pod_anchor is not None:
+        summary["target_identity_anchor_verified"] = _event_matches_resolved_pod(
+            event, resolved_pod_anchor
+        )
     if observed_entity:
         summary["observed_entity"] = observed_entity
     return summary

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
 
 import pytest
 
 from app.collectors import kubernetes, loki, prometheus, runai
-from app.collectors.base import CollectorResult, causal_evidence_time_range
+from app.collectors.base import (
+    CollectorResult,
+    causal_evidence_time_range,
+    incident_time_range,
+)
 from app.collectors.http_json import JsonResponse
 from app.collectors.kubernetes import (
     _collect_pod_logs,
@@ -2635,6 +2640,84 @@ def test_kubernetes_warning_event_projection_excludes_recovery_only_failures() -
     assert [event["reason"] for event in projected] == ["Scheduled", "Repeating"]
     assert projected[1]["observedTimestamps"] == ["2026-07-10T01:03:00Z"]
     assert projected[1]["lastTimestamp"] == "2026-07-10T01:03:00Z"
+
+
+def test_firing_target_warning_observed_now_is_scoped_causal_support() -> None:
+    target = replace(
+        make_target(),
+        fired_at="2026-07-20T08:00:00Z",
+        resolved_at="",
+    )
+    observed_now = datetime(2026, 7, 20, 23, 51, 40, tzinfo=UTC)
+    causal_window = causal_evidence_time_range(target, now=observed_now)
+    assert causal_window is not None
+    event = kubernetes._event_summary(
+        {
+            "metadata": {"namespace": target.namespace},
+            "involvedObject": {"kind": "Pod", "name": target.pod},
+            "type": "Warning",
+            "reason": "Failed",
+            "message": "Error: ImagePullBackOff",
+            "eventTime": "2026-07-20T23:51:40Z",
+        },
+        target=target,
+    )
+    warning_events = _warning_events_in_time_range([event], causal_window)
+    observation = _warning_event_observation(
+        warning_events,
+        time_range=causal_window,
+        status="ok",
+        target=target,
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
+
+
+def test_resolved_target_excludes_warning_after_resolution_epilogue() -> None:
+    target = replace(
+        make_target(),
+        fired_at="2026-07-20T08:00:00Z",
+        resolved_at="2026-07-20T08:10:00Z",
+    )
+    causal_window = causal_evidence_time_range(target)
+    assert causal_window == {
+        "start": "2026-07-20T07:55:00Z",
+        "end": "2026-07-20T08:10:00Z",
+    }
+    projected = _warning_events_in_time_range(
+        [
+            {
+                "reason": "ImagePullBackOff",
+                "observedTimestamps": ["2026-07-20T08:15:01Z"],
+            }
+        ],
+        causal_window,
+    )
+
+    assert projected == []
+
+
+def test_causal_evidence_window_uses_now_only_for_firing_alerts() -> None:
+    firing = replace(
+        make_target(), fired_at="2026-07-20T08:00:00Z", resolved_at=""
+    )
+    resolved = replace(
+        firing, resolved_at="2026-07-20T08:10:00Z"
+    )
+    injected_now = datetime(2026, 7, 20, 23, 51, 40, tzinfo=UTC)
+
+    assert incident_time_range(firing) == {
+        "start": "2026-07-20T07:55:00Z",
+        "end": "2026-07-20T08:20:00Z",
+    }
+    assert causal_evidence_time_range(firing, now=injected_now) == {
+        "start": "2026-07-20T07:55:00Z",
+        "end": "2026-07-20T23:51:40Z",
+    }
+    assert causal_evidence_time_range(resolved, now=injected_now) == {
+        "start": "2026-07-20T07:55:00Z",
+        "end": "2026-07-20T08:10:00Z",
+    }
 
 
 def test_kubernetes_warning_events_with_multiple_pod_uids_are_identity_ambiguous() -> None:
