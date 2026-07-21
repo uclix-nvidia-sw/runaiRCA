@@ -88,6 +88,8 @@ from app.services.probe_evaluation import evaluate_probe
 _log = logging.getLogger(__name__)
 
 _RESULT_CHARS = 1500  # per-query result excerpt fed back into the loop
+_RUNAI_CLUSTER_ID_CACHE: dict[tuple[str, str], str] = {}
+_RUNAI_PROJECT_ID_CACHE: dict[tuple[str, str], str] = {}
 _USER_PROMPT_CHARS = 6000
 # An adapter-owned sentinel cannot be supplied by a JSON/MCP response.  It
 # separates a collector-built observation envelope from arbitrary remote data
@@ -2019,6 +2021,95 @@ async def _mcp_call(
     return await mcp_call(url or settings.runai_mcp_url, tool, arguments, headers=headers)
 
 
+async def _resolve_runai_cluster_id(settings: Settings, target: AnalysisTarget) -> str:
+    """Resolve an alert's cluster name to the UUID required by official MCP tools."""
+    if valid_official_workload_id(target.cluster):
+        return target.cluster
+    if not settings.runai_base_url:
+        raise RuntimeError("Run:ai base URL is not configured; cannot resolve cluster ID")
+    cache_key = (settings.runai_base_url, target.cluster)
+    if cached := _RUNAI_CLUSTER_ID_CACHE.get(cache_key):
+        return cached
+    from app.collectors.runai import _runai_headers
+
+    headers, _warnings = await _runai_headers(settings)
+    if not headers.get("Authorization"):
+        raise RuntimeError("Run:ai API authentication is unavailable; cannot resolve cluster ID")
+    response = await get_json(
+        base_url=settings.runai_base_url,
+        path="/api/v1/clusters",
+        timeout_seconds=settings.runai_timeout_seconds,
+        headers=headers,
+    )
+    if not response.ok:
+        raise RuntimeError(response.error or f"HTTP {response.status_code} resolving cluster ID")
+    data = response.data
+    rows = (
+        data
+        if isinstance(data, list)
+        else data.get("clusters")
+        if isinstance(data, dict)
+        else None
+    )
+    clusters = [row for row in (rows or []) if isinstance(row, dict)]
+    matches = [row for row in clusters if str(row.get("name") or "") == target.cluster]
+    candidates = matches or (clusters if len(clusters) == 1 else [])
+    if not candidates:
+        raise RuntimeError(
+            f"could not resolve Run:ai cluster ID for alert cluster {target.cluster!r}"
+        )
+    cluster_id = str(candidates[0].get("uuid") or candidates[0].get("id") or "")
+    if not cluster_id:
+        raise RuntimeError(
+            f"Run:ai cluster {str(candidates[0].get('name') or target.cluster)!r} has no UUID"
+        )
+    _RUNAI_CLUSTER_ID_CACHE[cache_key] = cluster_id
+    return cluster_id
+
+
+async def _resolve_runai_project_id(settings: Settings, target: AnalysisTarget) -> str:
+    """Resolve an alert's project name to the ID required by policy lookup."""
+    if not target.project:
+        raise RuntimeError("alert has no Run:ai project")
+    if not settings.runai_base_url:
+        raise RuntimeError("Run:ai base URL is not configured; cannot resolve project ID")
+    cache_key = (settings.runai_base_url, target.project)
+    if cached := _RUNAI_PROJECT_ID_CACHE.get(cache_key):
+        return cached
+    from app.collectors.runai import _runai_headers
+
+    headers, _warnings = await _runai_headers(settings)
+    if not headers.get("Authorization"):
+        raise RuntimeError("Run:ai API authentication is unavailable; cannot resolve project ID")
+    response = await get_json(
+        base_url=settings.runai_base_url,
+        path="/api/v1/org-unit/projects",
+        timeout_seconds=settings.runai_timeout_seconds,
+        headers=headers,
+    )
+    if not response.ok:
+        raise RuntimeError(response.error or f"HTTP {response.status_code} resolving project ID")
+    data = response.data
+    rows = (
+        data
+        if isinstance(data, list)
+        else data.get("projects")
+        if isinstance(data, dict)
+        else None
+    )
+    projects = [row for row in (rows or []) if isinstance(row, dict)]
+    match = next((row for row in projects if str(row.get("name") or "") == target.project), None)
+    if match is None:
+        raise RuntimeError(
+            f"could not resolve Run:ai project ID for alert project {target.project!r}"
+        )
+    project_id = str(match.get("id") or "")
+    if not project_id:
+        raise RuntimeError(f"Run:ai project {target.project!r} has no ID")
+    _RUNAI_PROJECT_ID_CACHE[cache_key] = project_id
+    return project_id
+
+
 async def _official_runai_tool(
     settings: Settings,
     *,
@@ -2226,10 +2317,39 @@ async def _tool_runai_workload_effective_policy(
             "summary": error,
             "error": error,
         }
+    kinds = {
+        "training": "Training",
+        "interactive": "Interactive",
+        "inference": "Inference",
+        "distributed": "Distributed",
+    }
+    kind = kinds.get(target.workload_type.casefold())
+    if not kind:
+        error = f"alert workload type is unusable for effective policy: {target.workload_type!r}"
+        return {
+            "query": "MCP get_workload_effective_policy",
+            "title": _title(
+                settings, "Run:ai 워크로드 유효 정책", "Run:ai workload effective policy"
+            ),
+            "summary": error,
+            "error": error,
+        }
+    try:
+        project_id = await _resolve_runai_project_id(settings, target)
+    except Exception as exc:  # noqa: BLE001 - drill-down failure stays an artifact
+        error = _safe_text(str(exc), limit=_RESULT_CHARS)
+        return {
+            "query": "MCP get_workload_effective_policy",
+            "title": _title(
+                settings, "Run:ai 워크로드 유효 정책", "Run:ai workload effective policy"
+            ),
+            "summary": error,
+            "error": error,
+        }
     return await _official_runai_tool(
         settings,
         tool="get_workload_effective_policy",
-        arguments={"projectName": target.project},
+        arguments={"projectId": project_id, "kind": kind},
         title_ko="Run:ai 워크로드 유효 정책",
         title_en="Run:ai workload effective policy",
     )
@@ -2249,33 +2369,69 @@ async def _tool_runai_department_resources(
 
 
 async def _tool_runai_cluster_physical_inventory(
-    settings: Settings, _target: AnalysisTarget, _args: dict
+    settings: Settings, target: AnalysisTarget, _args: dict
 ) -> dict:
+    title_ko = "Run:ai 클러스터 물리 인벤토리"
+    title_en = "Run:ai cluster physical inventory"
+    try:
+        cluster_id = await _resolve_runai_cluster_id(settings, target)
+    except Exception as exc:  # noqa: BLE001 - drill-down failure stays an artifact
+        error = _safe_text(str(exc), limit=_RESULT_CHARS)
+        return {
+            "query": "MCP get_cluster_physical_inventory",
+            "title": _title(settings, title_ko, title_en),
+            "summary": error,
+            "error": error,
+        }
     return await _official_runai_tool(
         settings,
         tool="get_cluster_physical_inventory",
-        arguments={},
-        title_ko="Run:ai 클러스터 물리 인벤토리",
-        title_en="Run:ai cluster physical inventory",
+        arguments={"clusterId": cluster_id},
+        title_ko=title_ko,
+        title_en=title_en,
     )
 
 
 async def _tool_runai_cluster_infrastructure_health(
-    settings: Settings, _target: AnalysisTarget, _args: dict
+    settings: Settings, target: AnalysisTarget, _args: dict
 ) -> dict:
+    title_ko = "Run:ai 클러스터 인프라 상태"
+    title_en = "Run:ai cluster infrastructure health"
+    try:
+        cluster_id = await _resolve_runai_cluster_id(settings, target)
+    except Exception as exc:  # noqa: BLE001 - drill-down failure stays an artifact
+        error = _safe_text(str(exc), limit=_RESULT_CHARS)
+        return {
+            "query": "MCP get_cluster_infrastructure_health",
+            "title": _title(settings, title_ko, title_en),
+            "summary": error,
+            "error": error,
+        }
     return await _official_runai_tool(
         settings,
         tool="get_cluster_infrastructure_health",
-        arguments={},
-        title_ko="Run:ai 클러스터 인프라 상태",
-        title_en="Run:ai cluster infrastructure health",
+        arguments={"clusterId": cluster_id},
+        title_ko=title_ko,
+        title_en=title_en,
     )
 
 
 async def _tool_runai_cluster_metrics(
     settings: Settings, target: AnalysisTarget, _args: dict
 ) -> dict:
-    arguments: dict[str, str] = {}
+    title_ko = "Run:ai 클러스터 메트릭"
+    title_en = "Run:ai cluster metrics"
+    try:
+        cluster_id = await _resolve_runai_cluster_id(settings, target)
+    except Exception as exc:  # noqa: BLE001 - drill-down failure stays an artifact
+        error = _safe_text(str(exc), limit=_RESULT_CHARS)
+        return {
+            "query": "MCP get_cluster_metrics",
+            "title": _title(settings, title_ko, title_en),
+            "summary": error,
+            "error": error,
+        }
+    arguments: dict[str, str] = {"clusterId": cluster_id}
     time_range = incident_time_range(target) or {}
     if time_range.get("start") and time_range.get("end"):
         arguments.update(
@@ -2285,8 +2441,8 @@ async def _tool_runai_cluster_metrics(
         settings,
         tool="get_cluster_metrics",
         arguments=arguments,
-        title_ko="Run:ai 클러스터 메트릭",
-        title_en="Run:ai cluster metrics",
+        title_ko=title_ko,
+        title_en=title_en,
     )
 
 
