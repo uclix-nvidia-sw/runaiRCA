@@ -219,6 +219,29 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			"analysis_runs": 1,
 			"alert_count":   len(detail.Alerts),
 		})
+	case "cancel":
+		if len(parts) != 2 || r.Method != http.MethodPost {
+			writeError(w, http.StatusNotFound, "unknown incident action")
+			return
+		}
+		detail, ok := s.store.IncidentDetail(id)
+		if !ok {
+			writeError(w, http.StatusNotFound, "incident not found")
+			return
+		}
+		runID := strings.TrimSpace(detail.ActiveAnalysisRunID)
+		if runID == "" {
+			runID = strings.TrimSpace(detail.AnalysisRunID)
+		}
+		if !detail.IsAnalyzing || runID == "" {
+			writeJSON(w, http.StatusOK, map[string]any{"status": "not_analyzing"})
+			return
+		}
+		// Stop the agent's in-flight pipeline. The existing analysis goroutine
+		// drives the run to a terminal state (clears is_analyzing + emits the SSE
+		// completion) when its now-cancelled agent call returns.
+		s.cancelAgentRun(runID)
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "cancel_requested", "run_id": runID})
 	case "resolve":
 		if len(parts) != 2 || r.Method != http.MethodPost {
 			writeError(w, http.StatusNotFound, "unknown incident action")
