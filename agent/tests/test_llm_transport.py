@@ -535,3 +535,67 @@ async def test_nat_reasoning_only_reply_falls_back_to_http(monkeypatch) -> None:
 
     assert text == "HTTP 폴백 답변"
     assert error is None
+
+
+# --- reasoning_content salvage (answer routed into the reasoning channel) -----
+
+
+@pytest.mark.asyncio
+async def test_http_salvages_json_answer_from_reasoning_content(monkeypatch) -> None:
+    # finish_reason=stop with empty content but the full answer (JSON last) in
+    # reasoning_content — the serving stack routed everything into the
+    # reasoning channel. The LAST JSON object is the conclusion.
+    settings = _settings()
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        return SimpleNamespace(
+            ok=True,
+            data={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": "",
+                            "reasoning_content": (
+                                'Let me check {"draft": 1}. Actually the final '
+                                'answer is {"ok": true, "family": "image_pull_error"}'
+                            ),
+                        },
+                    }
+                ],
+                "usage": {},
+            },
+        )
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    data = await llm.complete_json(settings, system="system", user="user", model="stage-model")
+    assert data == {"ok": True, "family": "image_pull_error"}
+
+
+@pytest.mark.asyncio
+async def test_nat_salvages_json_answer_from_reasoning_content() -> None:
+    settings = _settings()
+
+    class ReasoningOnlyClient(FakeLangchainClient):
+        async def ainvoke(self, messages):
+            return SimpleNamespace(
+                content="",
+                usage_metadata={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+                response_metadata={"finish_reason": "stop"},
+                additional_kwargs={"reasoning_content": 'thinking... {"ok": true}'},
+            )
+
+    token = llm.set_nat_client(ReasoningOnlyClient())
+    try:
+        data = await llm.complete_json(settings, system="system", user="user")
+    finally:
+        llm.reset_nat_client(token)
+    assert data == {"ok": True}
+
+
+def test_salvage_refuses_truncated_reasoning_and_prose() -> None:
+    # A length-cut trace is untrustworthy, and prose without JSON must never be
+    # returned (think-leak guard).
+    assert llm._salvage_reasoning_answer('{"ok": true}', "length") is None
+    assert llm._salvage_reasoning_answer("plain chain of thought, no json", "stop") is None
+    assert llm._salvage_reasoning_answer('{"a": 1} then {"b": 2}', "stop") == '{"b": 2}'

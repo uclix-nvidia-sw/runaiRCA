@@ -352,19 +352,34 @@ async def complete_with_error(
                 payload["max_tokens"],
             )
             continue
+        message: dict[str, Any] | None = None
         choices = response.data.get("choices")
         if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-            message = choices[0].get("message")
-            if isinstance(message, dict):
-                content = message.get("content")
-                if isinstance(content, str) and content.strip():
-                    cleaned = strip_reasoning(content)
-                    if cleaned:
-                        return cleaned, None
-                    return None, _with_nat_failure(
-                        "reasoning-only reply (no content outside <think>)",
-                        nat_failure,
-                    )
+            raw_message = choices[0].get("message")
+            if isinstance(raw_message, dict):
+                message = raw_message
+        if message is not None:
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                cleaned = strip_reasoning(content)
+                if cleaned:
+                    return cleaned, None
+                return None, _with_nat_failure(
+                    "reasoning-only reply (no content outside <think>)",
+                    nat_failure,
+                )
+            salvaged = _salvage_reasoning_answer(
+                message.get("reasoning_content"),
+                _openai_finish_reason(response.data),
+            )
+            if salvaged:
+                _log.warning(
+                    "LLM content empty; salvaged JSON answer from reasoning_content "
+                    "(purpose=%s, model=%s)",
+                    purpose or "unspecified",
+                    selected_model,
+                )
+                return salvaged, None
         return None, _with_nat_failure(
             _openai_unusable_reply_error(response.data), nat_failure
         )
@@ -462,6 +477,16 @@ async def _complete_with_nat_client(
             f"reply truncated at max_tokens "
             f"(finish_reason=length, completion_tokens={completion})"
         )
+    salvaged = _salvage_reasoning_answer(
+        (getattr(response, "additional_kwargs", None) or {}).get("reasoning_content"),
+        finish,
+    )
+    if salvaged:
+        _log.warning(
+            "NAT LLM content empty; salvaged JSON answer from reasoning_content (model=%s)",
+            model,
+        )
+        return salvaged, None
     # Empty content with usage recorded = the model DID reply. The classic cause
     # is a reasoning model spending the whole completion budget on reasoning
     # tokens (finish_reason=length, content=""), so name it in the error.
@@ -564,6 +589,66 @@ def _usage_bucket(current: dict[str, Any], model: str) -> dict[str, int]:
         },
     )
     return bucket
+
+
+def _last_json_object(text: str) -> dict[str, Any] | None:
+    """The LAST complete JSON object in free text.
+
+    A reasoning trace ends with the model's conclusion, so when mining
+    reasoning_content for a salvaged answer, later objects supersede earlier
+    scratch work."""
+    last: dict[str, Any] | None = None
+    start = text.find("{")
+    while start != -1:
+        next_start = start + 1
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            ch = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(text[start : index + 1])
+                    except (ValueError, TypeError):
+                        pass
+                    else:
+                        if isinstance(parsed, dict):
+                            last = parsed
+                            next_start = index + 1
+                    break
+        start = text.find("{", next_start)
+    return last
+
+
+def _salvage_reasoning_answer(reasoning: object, finish_reason: object) -> str | None:
+    """Recover the answer when the serving stack routed it into reasoning_content.
+
+    This cluster's reasoning backend often returns finish_reason=stop with an
+    EMPTY content while the entire output — final answer included — sits in
+    reasoning_content. Discarding that reply killed every pipeline LLM stage
+    (2026-07-22: zero evidence links, synthesis fallback). Only a complete JSON
+    object is recovered; raw chain-of-thought prose must never reach callers
+    (think-leak guard). finish_reason=length means the trace was cut — nothing
+    trustworthy to mine."""
+    if finish_reason != "stop" or not isinstance(reasoning, str) or not reasoning.strip():
+        return None
+    parsed = _last_json_object(reasoning)
+    if parsed is None:
+        return None
+    return json.dumps(parsed, ensure_ascii=False)
 
 
 def parse_json_object(text: str) -> dict[str, Any] | None:
