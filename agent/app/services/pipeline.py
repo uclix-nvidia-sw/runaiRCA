@@ -2333,9 +2333,9 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         eligible_support_ids=eligible_support_ids,
         self_check_next=state.self_check_next,
     )
-    # Korean LLM synthesis (preferred when language == "ko" and LLM configured):
-    # rewrite summary + detail grounded STRICTLY in the evidence just gathered.
-    # Falls back to the deterministic English report on any failure.
+    # Korean localization (when language == "ko" and LLM configured): translate
+    # the deterministic report just built — the LLM never re-analyzes. Falls
+    # back to the deterministic (mixed-language) report on any failure.
     if getattr(settings, "language", "en") == "ko":
         synth = None
         synthesis_diagnostics: list[str] = []
@@ -2343,24 +2343,8 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             state.synthesis_status = "running"
             synth = await _synthesize_korean(
                 settings,
-                request=request,
-                results=state.results,
-                plan=plan,
-                root_cause_candidates=state.root_cause_candidates,
-                kg_context=state.kg_context.as_dict(),
-                graph_fixes=state.graph_fixes,
+                summary=state.summary,
                 fallback_detail=state.detail,
-                timeline=state.timeline,
-                troubleshooting_path=state.troubleshooting_path,
-                self_check_caveat=state.self_check_caveat,
-                self_check_refuted=state.self_check_refuted,
-                self_check_next=state.self_check_next,
-                reanalysis_note=state.reanalysis_note,
-                # v2 retains the investigator's free-form F-* ledger for
-                # compatibility.  Synthesis must use the eligibility-filtered,
-                # response-local E-id graph only.
-                reasoning_trace=state.investigation_context.get("reasoning_trace_v3"),
-                evidence_eligibility=_public_evidence_eligibility(state),
                 diagnostics=synthesis_diagnostics,
             )
         if synth:
@@ -3285,283 +3269,36 @@ def _synthesis_knowledge_projection(
 async def _synthesize_korean(
     settings: Settings,
     *,
-    request: AlertAnalysisRequest,
-    results: list[CollectorResult],
-    plan: InvestigationPlan,
-    root_cause_candidates: list[RankedCause],
-    kg_context: dict,
-    graph_fixes: GraphRemediation,
+    summary: str,
     fallback_detail: str,
-    timeline: list[dict] | None = None,
-    troubleshooting_path: dict[str, Any] | None = None,
-    reasoning_trace: object | None = None,
-    evidence_eligibility: Mapping[str, object] | None = None,
-    self_check_caveat: str = "",
-    self_check_refuted: bool = False,
-    self_check_next: str = "",
-    reanalysis_note: str = "",
     diagnostics: list[str] | None = None,
 ) -> tuple[str, str] | None:
-    """LLM synthesis of the RCA report in Korean, grounded STRICTLY in the evidence.
+    """Translate the deterministic report into natural Korean — nothing else.
 
-    Returns (analysis_summary, analysis_detail) in Korean, or None on any failure so
-    the caller keeps the deterministic localized report. Never raises into analyze().
+    Owner directive (2026-07-22): synthesis must NOT re-analyze, re-judge, or
+    re-write the RCA. The deterministic report already carries the analysis
+    (ranked causes, evidence, actions, appendix); the LLM's only job here is
+    localizing its English fragments. This keeps the prompt small (report text
+    only, no evidence JSON), the reasoning short, and removes the guard layer
+    that used to reject valid reports. Returns (summary, detail) in Korean, or
+    None so the caller keeps the deterministic report. Never raises into
+    analyze().
     """
-    from app.collectors.http_json import compact
-
-    eligible_support_ids = (
-        {
-            evidence_id
-            for evidence_id, eligibility in (evidence_eligibility or {}).items()
-            if callable(getattr(eligibility, "permits", None))
-            and eligibility.permits("support")
-        }
-        if evidence_eligibility is not None
-        else None
-    )
-    observed_text = _observed_text(
-        results, request, eligible_support_ids=eligible_support_ids
-    )
-    has_scoped_support = _synthesis_has_scoped_support(evidence_eligibility)
-    knowledge_projection, family_supplemental = _synthesis_knowledge_projection(
-        kg_context.get("knowledge") or {},
-        observed_text,
-        root_cause_candidates,
-        fuzzy_query=_alert_text(request),
-    )
-    # The deterministic report receives the response-local eligibility set.  Do
-    # the equivalent check before exposing graph fixes to the free-form Korean
-    # synthesizer: graph edges and approved historical resolutions are useful
-    # guidance, but cannot substantiate a remediation for this incident when
-    # all current observations are context-only, unavailable, or out of scope.
-    if has_scoped_support:
-        graph_remediation_context = graph_fixes.as_dict()
-        # A family edge joins every sibling symptom to every remediation in
-        # that family. It is useful ontology exploration, but it is not a
-        # current-incident action selector. Giving these broad lists to the LLM
-        # caused rate-limit and TLS fixes to appear for an auth/tag failure.
-        graph_remediation_context["family_fixes"] = []
-        graph_remediation_context["verified_actions"] = []
-        # Graph action/trigger attributes are currently English-only. Sending
-        # them to a Korean synthesizer encourages verbatim copying. Keep graph
-        # topology/codes, but expose executable prose only when the graph itself
-        # provides a Korean statement; localized failure-mode knowledge remains
-        # available separately in knowledge_graph.knowledge.
-        graph_remediation_context["xid_fixes"] = {
-            code: [fix for fix in fixes if re.search(r"[가-힣]", str(fix))]
-            for code, fixes in graph_remediation_context.get("xid_fixes", {}).items()
-            if any(re.search(r"[가-힣]", str(fix)) for fix in fixes)
-        }
-        graph_remediation_context["xid_triggers"] = {
-            code: trigger
-            for code, trigger in graph_remediation_context.get("xid_triggers", {}).items()
-            if re.search(r"[가-힣]", str(trigger))
-        }
-    else:
-        graph_remediation_context = {
-            "family_fixes": [],
-            "xid_fixes": {},
-            "xid_triggers": {},
-            "model_xids": {},
-            "root_xids": {},
-            "verified_actions": [],
-            "warnings": [
-                "Current incident has no target/window-scoped supporting observation; "
-                "graph remediation is withheld until it is verified."
-            ],
-        }
-    similar_incidents = (
-        [
-            {
-                "incident_id": i.incident_id,
-                "similarity": i.similarity,
-                "analysis_summary": i.analysis_summary or i.title,
-            }
-            for i in request.similar_incidents
-            if (i.similarity or 0) >= _SIMILARITY_FLOOR
-        ]
-        if has_scoped_support and _similar_incident_relevant(request, observed_text)
-        else []
-    )
-    # Key ORDER matters: the final JSON is hard-capped at _SYNTHESIS_USER_CHARS,
-    # which tail-truncates. Put the SMALL high-value inputs FIRST so a heavy
-    # collector_findings block (many artifacts with trimmed-but-still-bulky raw
-    # results) can only cost its OWN tail. operator_guidance leads: it is the
-    # human operator's direct instruction (highest priority per the system
-    # prompt) and must NEVER be truncated away.
-    guidance_raw = (request.alert.annotations or {}).get("operator_prompt", "")
-    operator_guidance = _short_sentence(str(guidance_raw), limit=500) if guidance_raw else ""
-    evidence = {
-        **({"operator_guidance": operator_guidance} if operator_guidance else {}),
-        "alert": {
-            "name": request.alert.labels.get("alertname"),
-            "labels": request.alert.labels,
-            "annotations": request.alert.annotations,
-        },
-        # Past-incident re-analysis signal: a resolved alert means the live state is
-        # likely healthy again, so live collectors can legitimately be thin.
-        **(
-            {
-                "incident_state": (
-                    "resolved — alert no longer firing; live state likely normal, so live "
-                    "evidence may be limited (past-incident re-analysis)"
-                )
-            }
-            if str(getattr(request.alert, "status", "")).lower() == "resolved"
-            else {}
-        ),
-        # Chronological event chain (oldest first): recent deploy/rollout, node
-        # reboot/condition, pod delete/create, warning events → the alert. Small +
-        # high-value, so it leads the reasoning inputs and the char cap won't trim it.
-        **({"timeline": (timeline or [])[-40:]} if timeline else {}),
-        **(
-            {"troubleshooting_path": troubleshooting_path}
-            if has_scoped_support and troubleshooting_path and troubleshooting_path.get("path")
-            else {}
-        ),
-        "plan": _synthesis_plan_context(plan, allow_remediation=has_scoped_support),
-        "ranked_root_cause_candidates": [c.as_dict() for c in root_cause_candidates],
-        **(
-            {
-                "self_check": {
-                    "refuted": self_check_refuted,
-                    "caveat": self_check_caveat,
-                    "next_check": self_check_next,
-                    "reanalysis_note": reanalysis_note,
-                }
-            }
-            if any((self_check_caveat, self_check_next, reanalysis_note))
-            else {}
-        ),
-        **(
-            {"reasoning_trace_v3": reasoning_trace}
-            if isinstance(reasoning_trace, dict)
-            and reasoning_trace.get("schema_version") == 3
-            else {}
-        ),
-        "knowledge_graph": {
-            "blast_radius_workloads": kg_context.get("blast_radius_workloads"),
-            "prior_incidents": kg_context.get("prior_incidents") if has_scoped_support else [],
-            "historical_case_cards": (kg_context.get("case_cards") or [])
-            if has_scoped_support
-            else [],
-            # Only the strongest evidence-matched symptom may drive section 3.
-            # Same-family siblings remain available as clearly-labelled,
-            # conditional follow-up context rather than confirmed remedies.
-            "knowledge": knowledge_projection if has_scoped_support else {},
-            "family_supplemental": family_supplemental if has_scoped_support else [],
-        },
-        "graph_remediation": graph_remediation_context,
-        "matched_alert": plan.matched_alert if has_scoped_support else None,
-        "similar_incidents": similar_incidents,
-        "remediation_evidence": {
-            "scoped_support": has_scoped_support,
-            "rule": (
-                "Cause-specific remediation is allowed only with a current "
-                "target/window-scoped supporting observation."
-            ),
-        },
-        # Bulky — kept LAST so the char cap trims raw collector result tails
-        # rather than the reasoning inputs above.
-        "collector_findings": _synthesis_collector_findings(
-            results, evidence_eligibility=evidence_eligibility
-        ),
-    }
     system = (
-        # Synthesis DOES reason: it writes the causal inference (근거→결론 논리), applies
-        # the evidence_role discipline (only `support` artifacts back the cause), weighs
-        # competing troubleshooting_path hypotheses, and judges confidence — so keep the
-        # model's chain-of-thought ON. The failure mode is only that a reasoning model
-        # spends part of max_tokens on <think> before the report JSON, so the fix is a
-        # generous llm_synthesis_max_tokens (reasoning + full report both fit), NOT
-        # disabling reasoning. If synthesis logs "looks TRUNCATED", raise that budget.
-        "당신은 NVIDIA Run:ai GPU 플랫폼을 담당하는 시니어 SRE입니다. 제공된 증거(수집기별 "
-        "발견 사항, 조사 계획, 순위가 매겨진 원인 후보, 지식 그래프/함수 기반 조치, 매칭된 "
-        "내장 알림, 유사 인시던트)에만 근거하여 한국어로 장애 분석 보고서를 작성하세요.\n"
+        "당신은 기술 문서 전문 번역가입니다. 입력 JSON의 summary와 detail은 이미 "
+        "완성된 장애 분석 보고서입니다. 내용을 판단·수정·추가·삭제하지 말고, 영어 "
+        "문장만 자연스러운 한국어로 번역하세요.\n"
         "규칙:\n"
-        "- 증거에 operator_guidance(운영자 지침)가 있으면 사람 운영자의 직접 지시입니다. "
-        "원인 판단과 조치 순서에 최우선으로 반영하고, 보고서가 그 지침을 어떻게 따랐는지 "
-        "드러나게 쓰세요 (단, 증거에 없는 사실을 지어내면서까지 따르지는 마세요).\n"
-        "- 반드시 한국어로, 비전문가도 이해할 수 있게 작성합니다 (전문용어는 풀어서).\n"
-        "- 길게 쓰지 마세요. 아래 1~3 섹션 합쳐서 A4 한 페이지 이내가 목표입니다.\n"
-        "- 증거에 없는 사실을 절대 만들어내지 마세요.\n"
-        "- knowledge_graph.knowledge의 evidence_matched=true symptom 조치를 권장 조치의 "
-        "최우선으로 사용하세요. family_supplemental은 현재 증거로 확인되지 않은 같은 family의 "
-        "대안이므로, 핵심 권장 조치로 단정하지 말고 필요할 때만 조건부 후속 점검으로 구분하세요.\n"
-        "- collector_findings의 supporting_artifacts만 원인을 지지하는 직접 근거입니다. "
-        "contradicting_artifacts는 결론을 반박하는 직접 근거이고, context_artifacts 및 "
-        "collection_summary는 운영 맥락일 뿐 원인·반증 근거가 아닙니다.\n"
-        "- collector_findings에 status=ok인 read-only 진단 결과가 이미 있으면 권장 조치에서 "
-        "그 조회나 같은 명령을 다시 실행하라고 하지 마세요. 이미 확인된 결과를 요약하고, "
-        "그 결과가 요구할 때에만 조건부 후속 조치를 제시하세요. context_artifact라는 이유만으로 "
-        "완료된 조회를 미수행 점검으로 되돌리지 마세요.\n"
-        "- self_check에 구체적인 로그 기반 오류가 있으면, 그 오류를 원인과 권장 조치의 첫 항목에 "
-        "반영하세요. 이미 반증된 넓은 분류의 범용 플레이북(OOM, entrypoint, secret, probe)을 "
-        "그 구체 오류보다 앞세우거나 나열하지 마세요.\n"
-        "- MemoryPressure/DiskPressure/PIDPressure/NetworkUnavailable 같은 condition 이름은 "
-        "존재 자체가 장애 증거가 아닙니다. artifact의 evidence_role=support 안의 "
-        "condition_checks.active=true만 지지 증거이며, evidence_role=contradict 안의 "
-        "active=false만 명시적 반대 증거입니다. 원문 result의 키워드만 보고 상태를 "
-        "추정하지 마세요.\n"
-        "- reasoning_trace_v3의 evidence는 상태·범위 검증을 통과한 공개 관측입니다. 원인·반증 "
-        "주장을 쓸 때 해당 E-ID만 [E01] 형식으로 인용하세요. F-* 내부 ID를 출력하거나 "
-        "rejected_evidence_links의 항목을 근거로 사용하지 마세요. historical prior는 현재 "
-        "증거로 쓰지 마세요.\n"
-        "- historical_case_cards는 승인된 과거 사례의 prior이며 현재 evidence가 아닙니다. "
-        "유사 사례가 있어도 현재 관측으로 별도 확인될 때만 원인으로 사용하세요.\n"
-        "- kind=external 또는 context_class(evaluation_only/mitigated_context/"
-        "unresolved_context)가 붙은 카드는 외부 지원 사례입니다. 그 successful/failed_actions를 "
-        "현재 사건의 검증된 해결책으로 제시하지 말고 '과거 외부 사례에서 시도된 조치'로만 "
-        "인용하세요.\n"
-        "- graph_remediation은 현재 support observation이 있을 때에만 조치 후보입니다. "
-        "warnings에 현재 범위의 support가 없다고 표시되면 graph/과거 사례의 조치를 실행하라고 "
-        "권고하지 말고, 먼저 대상·시간 범위에서 확인할 진단 단계만 제시하세요.\n"
-        "- remediation_evidence.scoped_support=false이면 내장 alert, component, knowledge base, "
-        "과거 사례, troubleshooting_path의 원인별 조치를 권고하지 마세요. 현재 범위에서 확인할 "
-        "진단 단계와 누락된 증거만 제시하세요.\n"
-        "- 특정 수집기가 아무것도 찾지 못했으면 '증거를 찾기 어렵습니다.'라고 명시하세요.\n"
-        "- 증거에 incident_state가 resolved(과거 인시던트 재분석)면, 현재 상태가 정상이라 "
-        "라이브 증거가 제한적일 수 있습니다. 증거가 얇으면 억지로 원인을 단정하지 말고 '현재는 "
-        "정상 상태로 회복되어 라이브 수집·분석이 제한적입니다'를 명시한 뒤, 남은 흔적·과거 기록·"
-        "타임라인 기반으로 신중히 설명하세요. ranked 후보가 있으면 관찰 사실과 분리하여 낮은 "
-        "확신도의 잠정 가설로 제시할 수 있지만, 확정 원인이나 원인별 조치 근거로 승격하지 마세요.\n"
-        "- timeline(시간순 이벤트)은 evidence_role을 반드시 지키세요. support인 항목만 원인·조치의 "
-        "직접 근거가 될 수 있습니다. context 항목은 시간 순서 설명과 다음 점검 후보일 뿐이며, "
-        "그 자체로 최근 변경·오류를 근본 원인이나 관찰 사실로 쓰면 안 됩니다. support timeline에 "
-        "배포/rollout(generation 변경), 노드 리부트·컨디션 변화, 파드 삭제/드레인, MIG/설정 변경이 "
-        "있을 때만 변경 → 결과 → 알림의 인과를 우선 검토하세요.\n"
-        "- 증거에 troubleshooting_path가 있으면 그 steps를 사용해 진단 흐름을 단계별로 설명하세요. "
-        "steps 안의 alternatives는 동시에 성립한 경쟁 가설이므로, 선택한 경로와 함께 무엇을 추가로 "
-        "확인하면 반증되는지 설명하세요. principles와 conclusion.disconfirm이 있으면 성급한 확정을 "
-        "막는 검증 규칙으로 적용하세요. "
-        "단, troubleshooting_path의 conclusion은 보강 근거일 뿐이며 XID/known-issue 같은 정밀 "
-        "signature 또는 ranked_root_cause_candidates의 1순위 원인을 절대 덮어쓰지 마세요.\n"
-        "- 반드시 이 문서 구조를 따르세요 (Word 제출용이므로 헤딩/번호목록만 사용, 표·HTML 금지):\n"
-        "  # 장애 분석 보고서 — {알림명}\n"
-        "  발생/심각도/대상 메타 한 줄\n"
-        "  ## 1. 문제 (Problem) — 무엇이/어디서/언제부터/어떤 영향, 3~4문장.\n"
-        "  ## 2. 원인 (Root Cause) — 운영자가 AI 판단을 검증할 수 있게 다음 항목을 "
-        "굵은 라벨로 명확히 구분해 쓰세요:\n"
-        "    - **결론**: 한 문장 (근본 원인).\n"
-        "    - **확신도**: 높음/중간/낮음 (analysis_quality와 근거의 양·일관성 기준) "
-        "+ 한 줄 이유.\n"
-        "    - **근거(Evidence)**: 직접 '관찰된 사실'만 2~4개 (수집기별: 무엇을 관찰, 언제부터). "
-        "추론이 아니라 사실만.\n"
-        "    - **추론(Inference)**: 위 근거가 왜 그 결론으로 이어지는지 논리 "
-        "(시간 순서 인과 포함). "
-        "XID 인과 사슬이 있으면 명시 (예: 'XID 74(NVLink) → XID 45 앱 크래시 — 뿌리는 NVLink').\n"
-        "    - **반대 증거·한계(Contradicting evidence)**: 결론과 상충하거나 확인하지 못한 것, "
-        "self-check가 반박한 내용 (없으면 '특이사항 없음').\n"
-        "  ## 3. 권장 조치 (Recommended Actions) — 번호 목록, 즉시/후속/예방 순서, "
-        "구체적 명령·확인 포함, 중복 금지.\n"
-        "  ## 부록 (Appendix) — 조사 계획·지식 베이스·트러블슈팅 참고자료만 요약. "
-        "Evidence 또는 수집기별 증거 목록을 다시 만들지 마세요. 인용 증거는 별도의 "
-        "Evidence Trace에서 제공됩니다.\n"
-        '- 반드시 JSON 객체 하나로만 응답하세요: {"summary": <한국어 한 문장: 문제+원인 요약>, '
-        '"detail": <위 구조의 한국어 마크다운 본문>}'
+        "- 이미 한국어인 부분은 그대로 유지하세요.\n"
+        "- 마크다운 구조(헤딩, 목록, 번호, 굵기)와 항목 개수·순서를 그대로 유지하세요.\n"
+        "- pod/네임스페이스/노드/알림 이름, 명령어, 에러 문자열, 코드, URL, 라벨 값 "
+        "같은 식별자는 번역하지 말고 원문 그대로 두세요.\n"
+        '- JSON 객체 하나로만 응답하세요: {"summary": <한국어 번역>, '
+        '"detail": <한국어 번역 마크다운>}'
     )
-    safe_evidence = _build_settings_masker(settings).mask_object(compact(evidence, limit=8))
-    user = "증거(JSON):\n" + _synthesis_evidence_json(safe_evidence, _SYNTHESIS_USER_CHARS)
+    user = json.dumps(
+        {"summary": summary, "detail": fallback_detail}, ensure_ascii=False
+    )
     try:
         completion_kwargs: dict[str, object] = {"system": system, "user": user}
         if _accepts_keyword(_complete_synthesis_json, "diagnostics"):
@@ -3576,39 +3313,11 @@ async def _synthesize_korean(
     if not data:
         if diagnostics is not None and not diagnostics:
             diagnostics.append("synthesis returned no valid JSON report")
-        _log.warning("korean synthesis returned no valid JSON report; using deterministic fallback")
+        _log.warning(
+            "korean synthesis returned no valid JSON report; using deterministic fallback"
+        )
         return None
-    summary = data.get("summary")
-    detail = data.get("detail")
-    if not isinstance(summary, str) or not summary.strip():
-        if diagnostics is not None:
-            diagnostics.append("synthesis JSON omitted summary")
-        _log.warning("korean synthesis JSON omitted summary; using deterministic fallback")
-        return None
-    if not isinstance(detail, str) or not detail.strip():
-        if diagnostics is not None:
-            diagnostics.append("synthesis JSON omitted detail")
-        _log.warning("korean synthesis JSON omitted detail; using deterministic fallback")
-        return None
-    language_conflict = _korean_report_language_conflict(summary, detail)
-    if language_conflict:
-        if diagnostics is not None:
-            diagnostics.append(f"Korean language guard rejected report: {language_conflict}")
-        _log.warning("korean synthesis rejected by language guard: %s", language_conflict)
-        return None
-    conflict = _synthesis_semantic_conflict(
-        summary,
-        detail,
-        request=request,
-        results=results,
-        evidence_eligibility=evidence_eligibility,
-    )
-    if conflict:
-        if diagnostics is not None:
-            diagnostics.append(f"semantic evidence guard rejected report: {conflict}")
-        _log.warning("korean synthesis rejected by semantic evidence guard: %s", conflict)
-        return None
-    return _short_sentence(summary, limit=280), _strip_appendix_evidence_section(detail)
+    return _short_sentence(data["summary"], limit=280), data["detail"]
 
 
 def _strip_appendix_evidence_section(detail: str) -> str:

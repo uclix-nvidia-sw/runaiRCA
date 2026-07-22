@@ -14,15 +14,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
+from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult
 from app.collectors.loki import LokiCollector
 from app.collectors.postgres import PostgresCollector
 from app.collectors.prometheus import PrometheusCollector
 from app.collectors.runai import RunAICollector
 from app.config import load_settings
 from app.knowledge import load_failure_modes
-from app.plan import InvestigationPlan
-from app.schemas import Alert, AlertAnalysisRequest, SimilarIncidentContext
+from app.schemas import Alert, AlertAnalysisRequest
 from app.services.kg_enrichment import GraphRemediation, graph_remediation
 from app.services.orchestrator import AnalysisOrchestrator
 from app.services.pipeline import (
@@ -227,869 +226,36 @@ async def test_korean_llm_synthesis_replaces_report(monkeypatch) -> None:
     assert response.analysis_detail == response.analysis
 
 
-@pytest.mark.asyncio
-async def test_korean_synthesis_prompt_redacts_sensitive_evidence(monkeypatch) -> None:
-    settings = replace(make_settings(), language="ko")
-    captured: list[str] = []
 
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        captured.append(user)
-        return {"summary": "요약", "detail": "본문"}
 
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-    request = AlertAnalysisRequest(
-        alert=Alert(
-            status="firing",
-            labels={"alertname": "SecretAlert", "namespace": "runai"},
-            annotations={
-                "summary": "token=alert-token-12345",
-                "operator_prompt": "api_key=operator-key-12345",
-            },
-            fingerprint="fp-ko-secret",
-        ),
-        similar_incidents=[
-            {
-                "incident_id": "INC-SECRET",
-                "similarity": 0.9,
-                "analysis_summary": "client_secret=similar-secret-12345",
-            }
-        ],
-    )
 
-    result = CollectorResult(
-        agent="kubernetes",
-        status="ok",
-        summary="DiskPressure=True password=collector-password-12345",
-    )
-    result.artifacts.append(
-        artifact(
-            agent="kubernetes",
-            source="kubernetes",
-            type="drilldown_query",
-            status="ok",
-            confidence="medium",
-            query="kubectl get events -n runai",
-            summary="NVRM: Xid 79 token=artifact-token-12345",
-            result={"lines": ["GPU has fallen off the bus api_key=artifact-key-12345"]},
-        )
-    )
 
-    await _synthesize_korean(
-        settings,
-        request=request,
-        results=[result],
-        plan=InvestigationPlan(focus="password=plan-secret-12345"),
-        root_cause_candidates=[
-            RankedCause(
-                family="node_kubelet_pressure",
-                confidence="high",
-                score=6.0,
-                rationale=["api_key=rank-key-12345"],
-            )
-        ],
-        kg_context={
-            "prior_incidents": [{"analysis_summary": "token=kg-token-12345"}],
-            "knowledge": {},
-        },
-        graph_fixes=GraphRemediation(),
-        fallback_detail="fallback",
-    )
 
-    joined = "\n".join(captured)
-    for secret in [
-        "alert-token-12345",
-        "operator-key-12345",
-        "similar-secret-12345",
-        "collector-password-12345",
-        "artifact-token-12345",
-        "artifact-key-12345",
-        "plan-secret-12345",
-        "rank-key-12345",
-        "kg-token-12345",
-    ]:
-        assert secret not in joined
-    assert "NVRM: Xid 79" in joined
-    assert "GPU has fallen off the bus" in joined
-    assert "[MASKED]" in joined
 
 
-@pytest.mark.asyncio
-async def test_korean_synthesis_caps_large_artifact_prompt(monkeypatch) -> None:
-    settings = replace(make_settings(), language="ko", llm_model_synthesis="m")
-    captured: list[str] = []
 
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        captured.append(user)
-        return {"summary": "요약", "detail": "본문"}
 
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-    result = CollectorResult(agent="loki", status="ok", summary="errors")
-    result.artifacts.append(
-        artifact(
-            agent="loki",
-            source="loki",
-            type="logs",
-            status="ok",
-            confidence="medium",
-            summary="error rows",
-            result={"lines": ["x" * 50_000]},
-        )
-    )
 
-    await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(status="firing", labels={"alertname": "RunAITest"}, annotations={})
-        ),
-        results=[result],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[
-            RankedCause(family="loki_errors", confidence="medium", score=1.0, rationale=[])
-        ],
-        kg_context={},
-        graph_fixes=GraphRemediation(),
-        fallback_detail="fallback",
-    )
 
-    assert len(captured[0]) <= _SYNTHESIS_USER_CHARS
-    assert "x" * 1300 not in captured[0]
 
 
-@pytest.mark.asyncio
-async def test_korean_synthesis_folds_operator_guidance_before_prompt(monkeypatch) -> None:
-    settings = replace(make_settings(), language="ko")
-    captured: list[str] = []
 
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        captured.append(user)
-        return {"summary": "요약", "detail": "본문"}
 
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
 
-    await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(
-                status="firing",
-                labels={"alertname": "RunAIPending", "namespace": "runai"},
-                annotations={
-                    "summary": "GPU quota pending",
-                    "operator_prompt": (
-                        "사람 지시: gpu-a quota부터 확인하세요.\n"
-                        "## Injected Heading\n"
-                        + ("x" * 700)
-                    ),
-                },
-            )
-        ),
-        results=[
-            CollectorResult(
-                agent="runai",
-                status="ok",
-                summary="queue gpu-a has no allocatable quota",
-            )
-        ],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[
-            RankedCause(family="queue_quota_exhausted", confidence="high", score=9.0)
-        ],
-        kg_context={},
-        graph_fixes=GraphRemediation(),
-        fallback_detail="fallback",
-    )
 
-    payload = json.loads(captured[0].removeprefix("증거(JSON):\n"))
-    guidance = payload["operator_guidance"]
-    assert "\n" not in guidance
-    assert len(guidance) <= 500
-    assert "## Injected Heading" in guidance
 
 
-@pytest.mark.asyncio
-async def test_korean_synthesis_skips_unavailable_artifacts(monkeypatch) -> None:
-    settings = replace(make_settings(), language="ko")
-    captured: list[str] = []
 
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        captured.append(user)
-        return {"summary": "요약", "detail": "본문"}
 
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-    result = CollectorResult(agent="postgres", status="ok", summary="base check complete")
-    result.artifacts.extend(
-        [
-            artifact(
-                agent="postgres",
-                source="postgres",
-                type="drilldown_query",
-                status="ok",
-                confidence="medium",
-                summary="1 row(s)",
-                result={"rows": [{"message": "scheduler panic at reclaim/reclaim.go:91"}]},
-            ),
-            artifact(
-                agent="postgres",
-                source="postgres",
-                type="drilldown_query",
-                status="unavailable",
-                confidence="low",
-                summary="failed query mentioned runtime/panic.go:785",
-                result={"error": "runtime/panic.go:785"},
-            ),
-        ]
-    )
 
-    await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(status="firing", labels={"alertname": "SchedulerCrash"})
-        ),
-        results=[result],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[
-            RankedCause(family="platform_version_bug", confidence="medium", score=7.0)
-        ],
-        kg_context={},
-        graph_fixes=GraphRemediation(),
-        fallback_detail="fallback",
-    )
 
-    joined = "\n".join(captured)
-    assert "scheduler panic at reclaim/reclaim.go:91" in joined
-    assert "runtime/panic.go:785" not in joined
-    assert "failed query mentioned" not in joined
 
 
-@pytest.mark.asyncio
-async def test_korean_synthesis_withholds_graph_actions_without_scoped_support(monkeypatch) -> None:
-    settings = replace(make_settings(), language="ko")
-    captured: list[str] = []
 
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        captured.append(user)
-        return {"summary": "요약", "detail": "본문"}
 
-    class RejectedEligibility:
-        def permits(self, _role: str) -> bool:
-            return False
 
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-    await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(status="firing", labels={"alertname": "GenericAlert"})
-        ),
-        results=[CollectorResult(agent="system", status="ok", summary="current snapshot only")],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[
-            RankedCause(family="gpu_hardware_error", confidence="medium", score=7.0)
-        ],
-        kg_context={},
-        graph_fixes=GraphRemediation(
-            family_fixes=["Reset the implicated GPU."],
-            xid_fixes={79: ["Replace the GPU after hardware validation."]},
-        ),
-        fallback_detail="fallback",
-        evidence_eligibility={"E01": RejectedEligibility()},
-    )
 
-    payload = json.loads(captured[0].removeprefix("증거(JSON):\n"))
-    graph = payload["graph_remediation"]
-    assert graph["family_fixes"] == []
-    assert graph["xid_fixes"] == {}
-    assert "no target/window-scoped supporting observation" in graph["warnings"][0]
 
-
-@pytest.mark.asyncio
-async def test_korean_synthesis_withholds_all_remediation_context_without_scoped_support(
-    monkeypatch,
-) -> None:
-    """Catalog/prior/playbook inputs must not bypass the graph-only gate."""
-    settings = replace(make_settings(), language="ko")
-    captured: list[str] = []
-
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        captured.append(user)
-        return {"summary": "요약", "detail": "본문"}
-
-    class RejectedEligibility:
-        def permits(self, _role: str) -> bool:
-            return False
-
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-    await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(status="firing", labels={"alertname": "GenericAlert"}),
-            similar_incidents=[
-                SimilarIncidentContext(
-                    incident_id="old",
-                    similarity=0.99,
-                    analysis_summary="UNSCOPED-PAST-REMEDY",
-                )
-            ],
-        ),
-        results=[CollectorResult(agent="system", status="ok", summary="context only")],
-        plan=InvestigationPlan(
-            matched_alert={"actions": ["UNSCOPED-CATALOG-REMEDY"]},
-            case_cards=[{"action": "UNSCOPED-CASE-CARD"}],
-        ),
-        root_cause_candidates=[
-            RankedCause(family="gpu_hardware_error", confidence="medium", score=7.0)
-        ],
-        kg_context={
-            "knowledge": {"gpu_hardware_error": [{"actions": ["UNSCOPED-KB-REMEDY"]}]},
-            "prior_incidents": [{"analysis_summary": "UNSCOPED-PRIOR-REMEDY"}],
-            "case_cards": [{"action": "UNSCOPED-KG-CASE"}],
-        },
-        graph_fixes=GraphRemediation(family_fixes=["UNSCOPED-GRAPH-REMEDY"]),
-        fallback_detail="fallback",
-        troubleshooting_path={"path": ["UNSCOPED-PATH-REMEDY"]},
-        evidence_eligibility={"E01": RejectedEligibility()},
-    )
-
-    payload = json.loads(captured[0].removeprefix("증거(JSON):\n"))
-    assert payload["remediation_evidence"]["scoped_support"] is False
-    assert payload["matched_alert"] is None
-    assert payload["similar_incidents"] == []
-    assert "troubleshooting_path" not in payload
-    assert payload["knowledge_graph"]["knowledge"] == {}
-    assert payload["plan"]["case_cards"] == []
-    for forbidden in (
-        "UNSCOPED-CATALOG-REMEDY",
-        "UNSCOPED-CASE-CARD",
-        "UNSCOPED-KB-REMEDY",
-        "UNSCOPED-PRIOR-REMEDY",
-        "UNSCOPED-KG-CASE",
-        "UNSCOPED-GRAPH-REMEDY",
-        "UNSCOPED-PAST-REMEDY",
-        "UNSCOPED-PATH-REMEDY",
-    ):
-        assert forbidden not in captured[0]
-
-
-@pytest.mark.asyncio
-async def test_korean_synthesis_sanitizes_unavailable_collector_summary(monkeypatch) -> None:
-    settings = replace(make_settings(), language="ko")
-    captured: list[str] = []
-
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        captured.append(user)
-        return {"summary": "요약", "detail": "본문"}
-
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-
-    await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(status="firing", labels={"alertname": "GenericAlert"})
-        ),
-        results=[
-            CollectorResult(
-                agent="kubernetes",
-                status="unavailable",
-                summary="kubectl failed; stale output mentioned DiskPressure and evicted pods",
-            )
-        ],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[
-            RankedCause(family="insufficient_evidence", confidence="low", score=0.0)
-        ],
-        kg_context={},
-        graph_fixes=GraphRemediation(),
-        fallback_detail="fallback",
-    )
-
-    joined = "\n".join(captured)
-    assert "DiskPressure" not in joined
-    assert "evicted pods" not in joined
-    assert NO_EVIDENCE in joined
-
-
-@pytest.mark.asyncio
-async def test_korean_synthesis_exposes_condition_polarity(monkeypatch) -> None:
-    settings = replace(make_settings(), language="ko")
-    captured: list[str] = []
-
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        captured.append(user)
-        return {"summary": "요약", "detail": "본문"}
-
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-    result = CollectorResult(agent="kubernetes", status="ok", summary="node checked")
-    result.artifacts.append(
-        artifact(
-            agent="kubernetes",
-            source="kubernetes",
-            type="cluster_api",
-            status="ok",
-            confidence="high",
-            summary="node conditions checked",
-            result={
-                "conditions": [
-                    {"type": "MemoryPressure", "status": "False"},
-                    {"type": "DiskPressure", "status": "True"},
-                ]
-            },
-        )
-    )
-
-    await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(status="firing", labels={"alertname": "NodeCondition"})
-        ),
-        results=[result],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[
-            RankedCause(family="node_kubelet_pressure", confidence="medium", score=5.0)
-        ],
-        kg_context={},
-        graph_fixes=GraphRemediation(),
-        fallback_detail="fallback",
-    )
-
-    payload = json.loads(captured[0].removeprefix("증거(JSON):\n"))
-    context = payload["collector_findings"][0]["context_artifacts"][0]
-    checks = context["condition_checks"]
-    assert checks == [
-        {
-            "condition": "MemoryPressure",
-            "active": False,
-            "source": "kubernetes_condition",
-            "status": "False",
-        },
-        {
-            "condition": "DiskPressure",
-            "active": True,
-            "source": "kubernetes_condition",
-            "status": "True",
-        },
-    ]
-    # The canonical checks retain both polarities. The raw prompt projection
-    # must not repeat a healthy condition's failure-looking type/reason.
-    assert "MemoryPressure" not in context["result"]
-    assert "DiskPressure" in context["result"]
-
-
-@pytest.mark.asyncio
-async def test_korean_synthesis_rejects_all_false_conditions_promoted_as_active(
-    monkeypatch,
-) -> None:
-    settings = replace(make_settings(), language="ko")
-
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        return {
-            "summary": "네 가지 노드 압박 조건이 동시에 감지되었습니다.",
-            "detail": (
-                "MemoryPressure, DiskPressure, PIDPressure, NetworkUnavailable가 "
-                "동시에 감지되어 플랫폼 가용성에 영향을 주었습니다 [E16]."
-            ),
-        }
-
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-    finding = artifact(
-        agent="kubernetes",
-        source="kubernetes",
-        type="adhoc_query",
-        status="ok",
-        confidence="medium",
-        summary="특이 신호 없음 (HTTP 200)",
-        result={
-            "data": {
-                "name": "k8s-lb-02",
-                "conditions": [
-                    {"type": "NetworkUnavailable", "status": "False", "reason": "CalicoIsUp"},
-                    {"type": "MemoryPressure", "status": "False"},
-                    {"type": "DiskPressure", "status": "False"},
-                    {"type": "PIDPressure", "status": "False"},
-                    {"truncated": 1},
-                ],
-            },
-            "observation": {"polarity": "unknown", "coverage": "partial"},
-        },
-    )
-    finding.evidence_id = "E16"
-    result = CollectorResult(
-        agent="kubernetes", status="ok", summary="node checked", artifacts=[finding]
-    )
-
-    synthesized = await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(status="firing", labels={"alertname": "GenericNodeAlert"})
-        ),
-        results=[result],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[
-            RankedCause(family="node_kubelet_pressure", confidence="medium", score=5.0)
-        ],
-        kg_context={},
-        graph_fixes=GraphRemediation(),
-        fallback_detail="fallback",
-    )
-
-    assert synthesized is None
-
-
-@pytest.mark.asyncio
-async def test_korean_synthesis_allows_real_incident_negative_memorypressure_claim(
-    monkeypatch,
-) -> None:
-    settings = replace(make_settings(), language="ko")
-
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        return {
-            "summary": "단일 노드에 가용 GPU가 부족해 파드가 스케줄링되지 않았습니다.",
-            "detail": (
-                "이는 노드 압박(MemoryPressure 등)이 아닌 순수 스케줄링 자원 부족"
-                "(단편화/과할당) 사례로, 단일 노드에 8 GPU를 배치할 수 없어 발생했습니다."
-            ),
-        }
-
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-    finding = artifact(
-        agent="kubernetes",
-        source="kubernetes",
-        type="kubernetes_node_condition",
-        status="ok",
-        confidence="high",
-        summary="MemoryPressure=False",
-        result={
-            "conditions": [{"type": "MemoryPressure", "status": "False"}],
-            "observation": {"polarity": "absent", "coverage": "scoped"},
-        },
-    )
-    finding.evidence_id = "E01"
-
-    synthesized = await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(status="firing", labels={"alertname": "KubePodNotReady"})
-        ),
-        results=[
-            CollectorResult(
-                agent="kubernetes", status="ok", summary="node checked", artifacts=[finding]
-            )
-        ],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[
-            RankedCause(family="k8s_scheduling_error", confidence="high", score=8.0)
-        ],
-        kg_context={},
-        graph_fixes=GraphRemediation(),
-        fallback_detail="fallback",
-    )
-
-    assert synthesized is not None
-    assert "MemoryPressure 등)이 아닌" in synthesized[1]
-
-
-@pytest.mark.asyncio
-async def test_korean_synthesis_still_rejects_positive_signal_after_negative_signal(
-    monkeypatch,
-) -> None:
-    settings = replace(make_settings(), language="ko")
-
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        return {
-            "summary": "노드 상태를 확인했습니다.",
-            "detail": "MemoryPressure가 아니지만 DiskPressure가 발생했습니다.",
-        }
-
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-
-    synthesized = await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(status="firing", labels={"alertname": "GenericNodeAlert"})
-        ),
-        results=[CollectorResult(agent="kubernetes", status="ok", summary="node checked")],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[
-            RankedCause(family="k8s_scheduling_error", confidence="medium", score=5.0)
-        ],
-        kg_context={},
-        graph_fixes=GraphRemediation(),
-        fallback_detail="fallback",
-    )
-
-    assert synthesized is None
-
-
-@pytest.mark.asyncio
-async def test_korean_synthesis_allows_active_supported_condition(monkeypatch) -> None:
-    settings = replace(make_settings(), language="ko")
-
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        return {
-            "summary": "노드에서 DiskPressure가 감지되었습니다.",
-            "detail": "DiskPressure=True가 관찰되었습니다 [E01].",
-        }
-
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-    finding = artifact(
-        agent="kubernetes",
-        source="kubernetes",
-        type="kubernetes_node_condition",
-        status="ok",
-        confidence="high",
-        summary="DiskPressure=True",
-        result={
-            "conditions": [{"type": "DiskPressure", "status": "True"}],
-            "observation": {"polarity": "present", "coverage": "scoped"},
-        },
-    )
-    finding.evidence_id = "E01"
-    result = CollectorResult(
-        agent="kubernetes", status="ok", summary="pressure observed", artifacts=[finding]
-    )
-
-    synthesized = await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(status="firing", labels={"alertname": "GenericNodeAlert"})
-        ),
-        results=[result],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[
-            RankedCause(family="node_kubelet_pressure", confidence="high", score=8.0)
-        ],
-        kg_context={},
-        graph_fixes=GraphRemediation(),
-        fallback_detail="fallback",
-    )
-
-    assert synthesized == (
-        "노드에서 DiskPressure가 감지되었습니다.",
-        "DiskPressure=True가 관찰되었습니다 [E01].",
-    )
-
-
-@pytest.mark.asyncio
-async def test_korean_synthesis_drops_preemption_policy_and_rejects_preempt_claim(
-    monkeypatch,
-) -> None:
-    settings = replace(make_settings(), language="ko")
-    captured: list[str] = []
-
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        captured.append(user)
-        return {
-            "summary": "파드 선점이 발생했습니다.",
-            "detail": "Preempt가 실제로 확인되었습니다 [E31].",
-        }
-
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-    finding = artifact(
-        agent="kubernetes",
-        source="kubernetes",
-        type="adhoc_query",
-        status="ok",
-        confidence="medium",
-        summary="특이 신호 없음 (HTTP 200)",
-        result={
-            "data": {
-                "spec": {"preemptionPolicy": "PreemptLowerPriority"},
-                "status": {"phase": "Running"},
-            },
-            "observation": {"polarity": "unknown", "coverage": "partial"},
-        },
-    )
-    finding.evidence_id = "E31"
-    result = CollectorResult(
-        agent="kubernetes", status="ok", summary="pod checked", artifacts=[finding]
-    )
-
-    synthesized = await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(status="firing", labels={"alertname": "GenericPodAlert"})
-        ),
-        results=[result],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[
-            RankedCause(family="k8s_scheduling_error", confidence="medium", score=4.0)
-        ],
-        kg_context={},
-        graph_fixes=GraphRemediation(),
-        fallback_detail="fallback",
-    )
-
-    assert synthesized is None
-    assert "PreemptLowerPriority" not in captured[0]
-
-
-@pytest.mark.asyncio
-async def test_korean_synthesis_rejects_private_fact_citation(monkeypatch) -> None:
-    settings = replace(make_settings(), language="ko")
-
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        return {"summary": "일반 요약", "detail": "내부 관측을 인용합니다 [F-143f004a83de2a40]."}
-
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-
-    synthesized = await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(status="firing", labels={"alertname": "GenericAlert"})
-        ),
-        results=[],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[
-            RankedCause(family="insufficient_evidence", confidence="low", score=0.0)
-        ],
-        kg_context={},
-        graph_fixes=GraphRemediation(),
-        fallback_detail="fallback",
-    )
-
-    assert synthesized is None
-
-
-@pytest.mark.asyncio
-async def test_korean_synthesis_does_not_recommend_completed_readonly_checks(
-    monkeypatch,
-) -> None:
-    settings = replace(make_settings(), language="ko")
-    captured: dict[str, str] = {}
-
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        captured["system"] = system
-        captured["user"] = user
-        return {"summary": "요약", "detail": "본문"}
-
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-    result = CollectorResult(agent="kubernetes", status="ok", summary="node GPU checked")
-    result.artifacts.append(
-        artifact(
-            agent="kubernetes",
-            source="kubernetes",
-            type="node_gpu_inventory",
-            status="ok",
-            confidence="medium",
-            summary="dgx02 GPU capacity and pod requests were collected",
-            result={
-                "nodes": [
-                    {
-                        "name": "dgx02",
-                        "capacity": 8,
-                        "allocatable": 8,
-                        "requested": 8,
-                    }
-                ],
-                "observation": {"polarity": "unknown", "coverage": "partial"},
-                "snapshot_role": "current_context",
-            },
-        )
-    )
-
-    await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(status="firing", labels={"alertname": "PendingGPUWorkload"})
-        ),
-        results=[result],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[
-            RankedCause(family="k8s_scheduling_error", confidence="medium", score=5.0)
-        ],
-        kg_context={},
-        graph_fixes=GraphRemediation(),
-        fallback_detail="fallback",
-    )
-
-    payload = json.loads(captured["user"].removeprefix("증거(JSON):\n"))
-    context = payload["collector_findings"][0]["context_artifacts"][0]
-    assert context["status"] == "ok"
-    assert "dgx02" in context["result"]
-    assert "같은 명령을 다시 실행하라고 하지 마세요" in captured["system"]
-    assert "context_artifact라는 이유만으로 완료된 조회" in captured["system"]
-
-
-@pytest.mark.asyncio
-async def test_korean_synthesis_skips_unrelated_similar_incident(monkeypatch) -> None:
-    settings = replace(make_settings(), language="ko")
-    captured: list[str] = []
-
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        captured.append(user)
-        return {"summary": "요약", "detail": "본문"}
-
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-
-    await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(
-                status="firing",
-                labels={"alertname": "NCCLTimeout", "namespace": "runai"},
-                annotations={
-                    "summary": "NCCL WARN socket timeout and ibv_poll_cq failed during allreduce"
-                },
-            ),
-            similar_incidents=[
-                SimilarIncidentContext(
-                    incident_id="INC-OLD",
-                    similarity=0.98,
-                    title="old Run:ai control-plane auth incident",
-                    analysis_summary="restart cluster-sync and rotate SAML credentials",
-                )
-            ],
-        ),
-        results=[
-            CollectorResult(
-                agent="loki",
-                status="ok",
-                summary="NCCL WARN socket timeout and ibv_poll_cq failed during allreduce",
-            )
-        ],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[
-            RankedCause(family="network_fabric_error", confidence="high", score=8.0)
-        ],
-        kg_context={},
-        graph_fixes=GraphRemediation(),
-        fallback_detail="fallback",
-    )
-
-    joined = "\n".join(captured)
-    assert "NCCL WARN" in joined
-    assert "INC-OLD" not in joined
-    assert "cluster-sync" not in joined
-    assert "SAML" not in joined
 
 
 @pytest.mark.asyncio
@@ -1130,31 +296,6 @@ async def test_korean_synthesis_falls_back_on_bad_json(monkeypatch) -> None:
     assert "Agent Role Coverage" not in response.analysis_detail  # static boilerplate removed
 
 
-@pytest.mark.asyncio
-async def test_korean_synthesis_rejects_summary_only_json(monkeypatch, caplog) -> None:
-    settings = replace(make_settings(), language="ko")
-
-    async def fake_complete_synthesis_json(*_args, **_kwargs):
-        return {"summary": "요약만 반환됨"}
-
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-    result = await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(status="firing", labels={"alertname": "Test"}, annotations={})
-        ),
-        results=[],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[],
-        kg_context={},
-        graph_fixes=GraphRemediation(),
-        fallback_detail="fallback",
-    )
-
-    assert result is None
-    assert "omitted detail" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1421,190 +562,12 @@ def test_korean_language_guard_rejects_english_recommended_actions() -> None:
     assert "English-only" in conflict
 
 
-@pytest.mark.asyncio
-async def test_korean_synthesis_falls_back_when_actions_are_english(monkeypatch) -> None:
-    settings = replace(make_settings(), language="ko")
-    diagnostics: list[str] = []
-
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        return {
-            "summary": "이미지 pull 실패 원인을 분석했습니다.",
-            "detail": """## 1. 문제 (Problem)
-이미지 pull이 실패했습니다.
-## 2. 원인 (Root Cause)
-레지스트리 응답을 확인해야 합니다.
-## 3. 권장 조치 (Recommended Actions)
-1. Retry after the rate-limit window resets.
-## 부록 (Appendix)
-수집 증거를 기록했습니다.
-""",
-        }
-
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-    result = await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(status="firing", labels={"alertname": "ImagePullBackOff"})
-        ),
-        results=[],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[
-            RankedCause(family="image_pull_error", confidence="medium", score=5.0)
-        ],
-        kg_context={},
-        graph_fixes=GraphRemediation(),
-        fallback_detail="deterministic fallback",
-        diagnostics=diagnostics,
-    )
-
-    assert result is None
-    assert any("language guard" in item for item in diagnostics)
 
 
-@pytest.mark.asyncio
-async def test_korean_synthesis_withholds_family_wide_graph_actions_with_support(
-    monkeypatch,
-) -> None:
-    settings = replace(make_settings(), language="ko")
-    captured: list[str] = []
-
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        captured.append(user)
-        return {"summary": "요약", "detail": "본문"}
-
-    class SupportedEligibility:
-        def permits(self, role: str) -> bool:
-            return role == "support"
-
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-    await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(status="firing", labels={"alertname": "ImagePullBackOff"})
-        ),
-        results=[],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[
-            RankedCause(family="image_pull_error", confidence="medium", score=7.0)
-        ],
-        kg_context={},
-        graph_fixes=GraphRemediation(
-            family_fixes=["RATE-LIMIT-SIBLING"],
-            verified_actions=["TLS-SIBLING"],
-            xid_fixes={79: ["XID-SPECIFIC", "GPU 연결 상태를 점검하세요."]},
-        ),
-        fallback_detail="fallback",
-        evidence_eligibility={"E01": SupportedEligibility()},
-    )
-
-    payload = json.loads(captured[0].removeprefix("증거(JSON):\n"))
-    graph_payload = payload["graph_remediation"]
-    assert graph_payload["family_fixes"] == []
-    assert graph_payload["verified_actions"] == []
-    assert graph_payload["xid_fixes"] == {"79": ["GPU 연결 상태를 점검하세요."]}
 
 
-@pytest.mark.asyncio
-async def test_korean_synthesis_prioritizes_matched_symptom_and_labels_family_siblings(
-    monkeypatch,
-) -> None:
-    settings = replace(make_settings(), language="ko")
-    captured: list[str] = []
-    failure_modes = load_failure_modes("knowledge/failure_modes.yaml")
-
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        captured.append(user)
-        return {"summary": "요약", "detail": "본문"}
-
-    class SupportedEligibility:
-        def permits(self, role: str) -> bool:
-            return role == "support"
-
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-    await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(status="firing", labels={"alertname": "ImagePullBackOff"})
-        ),
-        results=[
-            CollectorResult(
-                agent="kubernetes",
-                status="ok",
-                summary=(
-                    "ImagePullBackOff: pull access denied, repository does not exist "
-                    "or may require authorization"
-                ),
-            )
-        ],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[
-            RankedCause(family="image_pull_error", confidence="high", score=8.0)
-        ],
-        kg_context={"knowledge": failure_modes},
-        graph_fixes=GraphRemediation(),
-        fallback_detail="fallback",
-        evidence_eligibility={"E01": SupportedEligibility()},
-    )
-
-    payload = json.loads(captured[0].removeprefix("증거(JSON):\n"))
-    graph_knowledge = payload["knowledge_graph"]
-    selected = graph_knowledge["knowledge"]["image_pull_error"]
-    supplemental = graph_knowledge["family_supplemental"]
-    assert len(selected) == 1
-    assert selected[0]["symptom"] == "이미지 repository 존재 여부 또는 권한 불명확"
-    assert selected[0]["evidence_matched"] is True
-    assert all(item["evidence_matched"] is False for item in supplemental)
-    assert any("pull 요청 제한" in item["symptom"] for item in supplemental)
-    assert all("actions" not in item for item in supplemental)
-    assert all(item["distinguishing_signals"] for item in supplemental)
 
 
-@pytest.mark.asyncio
-async def test_korean_synthesis_receives_specific_self_check_findings(monkeypatch) -> None:
-    settings = replace(make_settings(), language="ko")
-    captured: dict[str, str] = {}
-
-    async def fake_complete_synthesis_json(settings, *, system, user):
-        captured["system"] = system
-        captured["user"] = user
-        return {"summary": "요약", "detail": "본문"}
-
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-    await _synthesize_korean(
-        settings,
-        request=AlertAnalysisRequest(
-            alert=Alert(status="firing", labels={"alertname": "KubePodCrashLooping"})
-        ),
-        results=[],
-        plan=InvestigationPlan(),
-        root_cause_candidates=[],
-        kg_context={},
-        graph_fixes=GraphRemediation(),
-        fallback_detail="fallback",
-        self_check_caveat=(
-            "JWKS verifier discovery 문서가 JSON이 아니라 HTML이라 파싱에 실패했습니다."
-        ),
-        self_check_refuted=True,
-        self_check_next="OIDC issuer 설정을 확인하세요.",
-        reanalysis_note="범용 startup 원인을 반증하고 재분석했습니다.",
-    )
-
-    payload = json.loads(captured["user"].removeprefix("증거(JSON):\n"))
-    assert payload["self_check"] == {
-        "refuted": True,
-        "caveat": "JWKS verifier discovery 문서가 JSON이 아니라 HTML이라 파싱에 실패했습니다.",
-        "next_check": "OIDC issuer 설정을 확인하세요.",
-        "reanalysis_note": "범용 startup 원인을 반증하고 재분석했습니다.",
-    }
-    assert "구체적인 로그 기반 오류" in captured["system"]
 
 
 @pytest.mark.asyncio
@@ -1673,3 +636,60 @@ def test_synthesis_evidence_json_keeps_everything_when_small() -> None:
     small = {"operator_guidance": "x", "collector_findings": [{"agent": "runai", "summary": "ok"}]}
     parsed = json.loads(_synthesis_evidence_json(small, _SYNTHESIS_USER_CHARS))
     assert len(parsed["collector_findings"]) == 1  # nothing dropped under the cap
+
+
+# --- translation-only synthesis (owner directive 2026-07-22) ------------------
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_translates_deterministic_report_verbatim(monkeypatch) -> None:
+    # Synthesis is a TRANSLATOR: the prompt must carry exactly the deterministic
+    # summary+detail (no evidence JSON, no re-analysis inputs) and return the
+    # localized pair.
+    settings = replace(make_settings(), language="ko")
+    captured = {}
+
+    async def fake_complete_synthesis_json(settings, *, system, user, diagnostics=None):
+        captured["system"] = system
+        captured["user"] = user
+        return {"summary": "한국어 요약", "detail": "# 한국어 본문"}
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    synth = await _synthesize_korean(
+        settings,
+        summary="Pod default/x is not ready. Likely cause: image pull failure.",
+        fallback_detail="# 장애 분석 보고서\n\n- image pull failure evidence",
+    )
+    assert synth == ("한국어 요약", "# 한국어 본문")
+    payload = json.loads(captured["user"])
+    assert payload == {
+        "summary": "Pod default/x is not ready. Likely cause: image pull failure.",
+        "detail": "# 장애 분석 보고서\n\n- image pull failure evidence",
+    }
+    assert "번역" in captured["system"]
+    # The translator prompt must not smuggle re-analysis material back in.
+    assert "ranked_root_cause_candidates" not in captured["user"]
+    assert "collector_findings" not in captured["user"]
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_failure_keeps_deterministic_report(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko")
+
+    async def fake_complete_synthesis_json(settings, *, system, user, diagnostics=None):
+        return None
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    diagnostics: list[str] = []
+    synth = await _synthesize_korean(
+        settings,
+        summary="summary",
+        fallback_detail="detail",
+        diagnostics=diagnostics,
+    )
+    assert synth is None
+    assert diagnostics == ["synthesis returned no valid JSON report"]
