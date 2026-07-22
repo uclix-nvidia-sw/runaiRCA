@@ -763,18 +763,29 @@ COLLECTOR_TEXT_DROP_KEYS: dict[str, frozenset[str]] = {
 }
 _RANKING_TEXT_DROP_KEYS = COLLECTOR_TEXT_DROP_KEYS  # backward-compatible alias
 
-# A timestamped Pod-log line proves the line existed, not that every failure
-# token inside it is an active condition. Kubernetes commonly logs recovery
-# status alongside a historic reason ("healthy after OOMKilled") and probes
-# often emit negative checks ("OOMKilled=false"). The generic keyword
-# negation helper intentionally permits nuanced prose; at this evidence
-# boundary be conservative instead: a normal/recovery-valued raw line cannot
-# substantiate a root-cause family. Structured Event reasons remain available
-# below when Kubernetes itself reports the positive reason.
-_KUBERNETES_NON_CAUSAL_SIGNAL_RE = re.compile(
-    r"\b(?:no|not|without|none|zero|false|healthy|normal|nominal|stable|ready|"
-    r"recovery|recovering|recovered|resolved|cleared|fixed|remediated|success|"
-    r"succeeded)\b|(?:없음|정상|복구|해결|미발생|아님)"
+# Pod-log lines, Event reasons/messages and their card summaries are FREE TEXT.
+# A genuine failure is routinely DESCRIBED with a grammatical negation
+# ("repository does not exist", "no such host", "image not found"), so the text
+# must NOT be discarded merely for containing "no"/"not". Exactly two things make
+# such text non-causal, and only these are vetoed here:
+#   1. recovery/resolution language — the problem is reported as GONE
+#      ("OOMKilled recovered", "healthy after OOMKilled"); and
+#   2. a condition explicitly VALUED negative — "OOMKilled=false",
+#      "MemoryPressure: False", "condition is false" (the value-blind healthy
+#      snapshot the old filter was really guarding).
+# Precise per-keyword negation ("no memory pressure") is handled downstream by
+# _keyword_negated (the ranker) and the family relevance gate; node-condition
+# snapshots never reach this function — only kubernetes_pod_log /
+# kubernetes_warning_events do. The prior bare-negation veto discarded real
+# ImagePull/registry/DNS failures: a 187-event ImagePullBackOff abstained because
+# "does not exist" tripped the "not", and "no such host" tripped the "no".
+_KUBERNETES_RECOVERY_SIGNAL_RE = re.compile(
+    r"\b(?:healthy|nominal|recovered|recovering|recovery|resolved|cleared|"
+    r"remediated|refreshed|succeeded)\b|(?:정상|복구|해결)"
+)
+_KUBERNETES_NEGATIVE_VALUE_RE = re.compile(
+    r"[=:]\s*(?:false|0|off|disabled|none|absent)\b|"
+    r"\b(?:is|are|was|were|remains?|status)\s+(?:false|off|disabled|absent|inactive)\b"
 )
 _PODGROUP_GPU_SHORTAGE_RE = re.compile(
     r"\bnvidia\.com/(?:gpu|mig-[a-z0-9.-]+)\b|"
@@ -785,32 +796,19 @@ _PODGROUP_GPU_SHORTAGE_RE = re.compile(
 )
 
 
-def _kubernetes_signal_is_positive(value: object) -> bool:
-    """Whether a raw Kubernetes value can carry a live failure signal."""
-    text = " ".join(str(value or "").split())
-    return bool(text) and _KUBERNETES_NON_CAUSAL_SIGNAL_RE.search(text.casefold()) is None
+def _kubernetes_signal_is_live_failure(value: object) -> bool:
+    """Whether pod-log / event / summary free text carries a LIVE failure signal.
 
-
-# A Kubernetes Warning event is a failure signal BY CONSTRUCTION: the API emits
-# type=Warning only for abnormal events, and recovery is reported as a separate
-# Normal event (already excluded in the warning branch). The value-blind
-# negation filter above exists to drop HEALTHY node-condition snapshots
-# ("MemoryPressure False") and benign pod-log lines; applied to a Warning
-# MESSAGE it wrongly vetoes genuine failures whose text merely contains a
-# grammatical negation — "repository does not exist", "no such host",
-# "not found". A real ImagePullBackOff (187 events, target-verified) was
-# discarded because "does not exist" tripped the bare "not". So a Warning
-# message/reason is admitted unless it actually reports recovery/resolution.
-_KUBERNETES_EVENT_RECOVERY_RE = re.compile(
-    r"\b(?:healthy|nominal|recovered|recovering|recovery|resolved|cleared|"
-    r"remediated|succeeded)\b|(?:정상|복구|해결)"
-)
-
-
-def _kubernetes_event_signal_is_failure(value: object) -> bool:
-    """A Warning event's text is a live failure signal unless it reports recovery."""
-    text = " ".join(str(value or "").split())
-    return bool(text) and _KUBERNETES_EVENT_RECOVERY_RE.search(text.casefold()) is None
+    True unless the text reports recovery ("OOMKilled recovered") or an explicitly
+    negative condition value ("MemoryPressure=false"). A grammatical negation inside
+    a genuine failure description ("repository does not exist", "no such host") is
+    KEPT — per-keyword negation is handled precisely downstream by _keyword_negated,
+    and an over-broad veto here silently discarded real ImagePull/registry failures."""
+    text = " ".join(str(value or "").split()).casefold()
+    return bool(text) and (
+        _KUBERNETES_RECOVERY_SIGNAL_RE.search(text) is None
+        and _KUBERNETES_NEGATIVE_VALUE_RE.search(text) is None
+    )
 
 
 def _kubernetes_semantic_artifact_text(art: object) -> str:
@@ -826,7 +824,7 @@ def _kubernetes_semantic_artifact_text(art: object) -> str:
             entries = payload.get("lines") if isinstance(payload.get("lines"), list) else []
         for entry in entries:
             line = entry.get("line") if isinstance(entry, Mapping) else entry
-            if _kubernetes_signal_is_positive(line):
+            if _kubernetes_signal_is_live_failure(line):
                 parts.append(str(line))
     elif artifact_type == "kubernetes_warning_events":
         events = payload.get("events")
@@ -840,10 +838,10 @@ def _kubernetes_semantic_artifact_text(art: object) -> str:
             if event_type and event_type != "warning":
                 continue
             reason = event.get("reason")
-            if _kubernetes_event_signal_is_failure(reason):
+            if _kubernetes_signal_is_live_failure(reason):
                 parts.append(str(reason))
             message = event.get("message")
-            if _kubernetes_event_signal_is_failure(message):
+            if _kubernetes_signal_is_live_failure(message):
                 parts.append(str(message))
             # PodGroup is a structured Run:ai scheduling identity, not a word
             # found in a query. When that exact target Event also states a GPU
@@ -929,7 +927,7 @@ def _result_text(
                 "kubernetes_warning_events",
             }
             if art.summary and (
-                not semantic_kubernetes_card or _kubernetes_signal_is_positive(art.summary)
+                not semantic_kubernetes_card or _kubernetes_signal_is_live_failure(art.summary)
             ):
                 parts.append(art.summary)
             parts.append(_artifact_ranking_value_text(art, drop_keys))

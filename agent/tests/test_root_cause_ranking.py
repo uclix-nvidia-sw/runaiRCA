@@ -414,6 +414,66 @@ def test_image_pull_warning_with_grammatical_negation_still_ranks() -> None:
     )
 
 
+def test_pod_log_dns_registry_failure_with_negation_still_ranks() -> None:
+    """The same class of bug beyond ImagePullBackOff: a workload log line that
+    DESCRIBES a failure with a grammatical negation ("no such host") must survive
+    the free-text filter and rank. Before the fix the bare "no" discarded it."""
+    pod_log = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_pod_log",
+        status="ok",
+        confidence="high",
+        summary="Kubernetes Pod log: matching incident-window line was present.",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "pod", "name": "trainer-abc-x1"},
+            },
+            "sample_entries": [
+                {"line": "dial tcp: lookup registry.internal: no such host"},
+            ],
+        },
+    )
+    result = _r("kubernetes", artifacts=[pod_log])
+
+    text = _result_text(result)
+    assert "no such host" in text
+    assert (
+        rank_root_cause_candidates(_target(alert_name="KubePodNotReady"), [result])[0].family
+        == "image_pull_error"
+    )
+
+
+def test_pod_log_negative_condition_value_stays_dropped() -> None:
+    """The value-blind healthy case the filter legitimately guards is preserved:
+    a condition explicitly VALUED negative ("MemoryPressure=false") must NOT score
+    node pressure, even though the relaxed filter now admits grammatical negation."""
+    pod_log = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_pod_log",
+        status="ok",
+        confidence="high",
+        summary="Kubernetes Pod log: matching incident-window line was present.",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "pod", "name": "trainer-abc-x1"},
+            },
+            "sample_entries": [
+                {"line": "node status MemoryPressure=false DiskPressure=false"},
+            ],
+        },
+    )
+    result = _r("kubernetes", artifacts=[pod_log])
+
+    assert "memorypressure" not in _result_text(result).casefold()
+    assert rank_root_cause_candidates(_target(), [result])[0].family == "insufficient_evidence"
+
+
 def test_exact_podgroup_gpu_shortage_routes_to_runai_scheduling() -> None:
     warning_event = artifact(
         agent="kubernetes",
