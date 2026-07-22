@@ -167,6 +167,46 @@ async def test_nat_length_truncation_falls_back_to_http(monkeypatch) -> None:
         llm.reset_nat_client(token)
     assert data == {"ok": True}
     assert captured["json_body"]["model"] == "default-model"
+    # NAT already proved the default cap feeds reasoning — the HTTP fallback
+    # must start DOUBLED instead of repeating the guaranteed-fail generation.
+    assert captured["json_body"]["max_tokens"] == settings.llm_default_max_tokens * 2
+
+
+@pytest.mark.asyncio
+async def test_nat_length_predouble_consumes_the_single_retry(monkeypatch) -> None:
+    # Worst chain per call site is bounded: NAT(C) + HTTP(2C). If 2C still
+    # truncates, give up — no third generation may eat the shared deadline.
+    settings = _settings()
+
+    class TruncatedClient(FakeLangchainClient):
+        async def ainvoke(self, messages):
+            return SimpleNamespace(
+                content="",
+                usage_metadata={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+                response_metadata={"finish_reason": "length"},
+            )
+
+    calls = []
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        calls.append(dict(json_body))
+        return SimpleNamespace(
+            ok=True,
+            data={
+                "choices": [{"finish_reason": "length", "message": {"content": ""}}],
+                "usage": {},
+            },
+        )
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    token = llm.set_nat_client(TruncatedClient())
+    try:
+        data = await llm.complete_json(settings, system="system", user="user")
+    finally:
+        llm.reset_nat_client(token)
+    assert data is None
+    assert len(calls) == 1
+    assert calls[0]["max_tokens"] == settings.llm_default_max_tokens * 2
 
 
 @pytest.mark.asyncio

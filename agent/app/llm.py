@@ -296,6 +296,14 @@ async def complete_with_error(
     # empty or truncated mid-JSON and the run silently degrades to the
     # deterministic fallback. One retry with a doubled cap turns that into a
     # slower success; the analysis deadline still bounds the total spend.
+    doubled = False
+    if nat_failure and "finish_reason=length" in nat_failure and payload.get("max_tokens"):
+        # NAT already proved this cap feeds the whole budget to reasoning —
+        # repeating the identical generation over HTTP is a guaranteed second
+        # failure that only burns the shared deadline. Start doubled instead;
+        # this consumes the one length retry.
+        payload["max_tokens"] = int(payload["max_tokens"]) * 2
+        doubled = True
     for budget_round in range(2):
         response = None
         for attempt in range(3):
@@ -330,7 +338,8 @@ async def complete_with_error(
             )
         _record_usage(selected_model, response.data)
         if (
-            budget_round == 0
+            not doubled
+            and budget_round == 0
             and _openai_finish_reason(response.data) == "length"
             and payload.get("max_tokens")
         ):
