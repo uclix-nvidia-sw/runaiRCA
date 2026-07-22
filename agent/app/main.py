@@ -4,10 +4,10 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager, suppress
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
-from app.config import load_settings
 from app.collectors.registry import collector_names, unknown_collector_names
+from app.config import load_settings
 from app.knowledge import (
     KnowledgeRegistry,
     load_family_catalog,
@@ -171,9 +171,45 @@ def root_cause_families() -> dict[str, list[str]]:
     return {"families": list(evaluation_families)}
 
 
+# run_id -> the in-flight analysis task, so POST /analyze/cancel can stop a
+# specific run mid-flight (asyncio cancellation propagates through the collector
+# and LLM awaits, so the pipeline actually stops rather than running to deadline).
+_running_analyses: dict[str, asyncio.Task[AlertAnalysisResponse]] = {}
+
+
 @app.post("/analyze", response_model=AlertAnalysisResponse)
 async def analyze(request: AlertAnalysisRequest) -> AlertAnalysisResponse:
-    return await orchestrator.analyze(request)
+    run_id = (request.run_id or "").strip()
+    if not run_id:
+        # No run id: not individually cancellable, run inline (back-compat).
+        return await orchestrator.analyze(request)
+    # A cancel of a re-used run_id must not stop an unrelated newer run.
+    existing = _running_analyses.get(run_id)
+    if existing is not None and not existing.done():
+        existing.cancel()
+    task: asyncio.Task[AlertAnalysisResponse] = asyncio.create_task(
+        orchestrator.analyze(request)
+    )
+    _running_analyses[run_id] = task
+    try:
+        return await task
+    except asyncio.CancelledError:
+        # Only the inner task was cancelled (via /analyze/cancel); the request
+        # handler itself is alive, so report the cancellation explicitly.
+        raise HTTPException(status_code=499, detail="analysis cancelled") from None
+    finally:
+        if _running_analyses.get(run_id) is task:
+            _running_analyses.pop(run_id, None)
+
+
+@app.post("/analyze/cancel")
+async def cancel_analysis(run_id: str) -> dict[str, str]:
+    """Cancel an in-flight /analyze by its backend run_id. Idempotent."""
+    task = _running_analyses.get((run_id or "").strip())
+    if task is None or task.done():
+        return {"status": "not_running", "run_id": run_id}
+    task.cancel()
+    return {"status": "cancelling", "run_id": run_id}
 
 
 @app.post("/summarize-incident", response_model=IncidentSummaryResponse)

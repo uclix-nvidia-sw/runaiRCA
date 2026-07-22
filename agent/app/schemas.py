@@ -77,6 +77,9 @@ class AlertAnalysisRequest(BaseModel):
     alert: Alert
     thread_ts: str = ""
     incident_id: str | None = None
+    # Backend-supplied run identifier. When set, the /analyze task is registered
+    # under it so POST /analyze/cancel can stop this specific run mid-flight.
+    run_id: str = ""
     analysis_type: str | None = None
     seed_family: str = ""
     occurrence_count: int = 0
