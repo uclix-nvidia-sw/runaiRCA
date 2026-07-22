@@ -169,6 +169,92 @@ def test_explicit_unrelated_support_link_is_rejected() -> None:
     assert verdict.gates["invalid_evidence_links"] is True
 
 
+def test_non_catalog_family_requires_signature_grounded_support() -> None:
+    result = _result("system", "generic evidence without the promoted signature")
+    result.artifacts[0].result = {"observation": _scoped_observation()}
+    assign_evidence_ids([result])
+    cause = RankedCause(
+        "expected_known_behavior",
+        "medium",
+        5,
+        rationale=[
+            "matched known-issue signature: Distributed Training Backoff And Restart Policy Semantics"
+        ],
+        support_evidence_ids=["E01"],
+    )
+
+    verdict = evaluate(
+        _response("## Root Cause\n\nKnown behavior [E01]."),
+        [result],
+        [cause],
+        known_issues=[
+            {
+                "issue": "Distributed Training Backoff And Restart Policy Semantics",
+                "keywords": ["master-restart-policy", "--backoff-limit"],
+            }
+        ],
+    )
+
+    assert verdict.claims[0]["supporting_evidence"] == []
+    assert verdict.gates["invalid_evidence_links"] is True
+
+
+def test_non_catalog_family_with_matching_artifact_passes() -> None:
+    result = _result("system", "master-restart-policy is configured")
+    result.artifacts[0].result = {"observation": _scoped_observation()}
+    assign_evidence_ids([result])
+    cause = RankedCause(
+        "expected_known_behavior",
+        "medium",
+        5,
+        rationale=[
+            "matched known-issue signature: Distributed Training Backoff And Restart Policy Semantics"
+        ],
+        support_evidence_ids=["E01"],
+    )
+
+    verdict = evaluate(
+        _response("## Root Cause\n\nKnown behavior [E01]."),
+        [result],
+        [cause],
+        known_issues=[
+            {
+                "issue": "Distributed Training Backoff And Restart Policy Semantics",
+                "keywords": ["master-restart-policy", "--backoff-limit"],
+            }
+        ],
+    )
+
+    assert verdict.claims[0]["supporting_evidence"] == ["E01"]
+    assert verdict.gates["invalid_evidence_links"] is False
+    assert verdict.gates["missing_evidence_trace"] is False
+
+
+def test_non_catalog_family_without_catalog_fails_closed() -> None:
+    result = _result("system", "master-restart-policy is configured")
+    result.artifacts[0].result = {"observation": _scoped_observation()}
+    assign_evidence_ids([result])
+    cause = RankedCause(
+        "expected_known_behavior",
+        "medium",
+        5,
+        rationale=[
+            "matched known-issue signature: Distributed Training Backoff And Restart Policy Semantics"
+        ],
+        support_evidence_ids=["E01"],
+    )
+
+    verdict = evaluate(
+        _response("## Root Cause\n\nKnown behavior [E01]."),
+        [result],
+        [cause],
+        known_issues=None,
+    )
+
+    assert verdict.claims[0]["supporting_evidence"] == []
+    assert verdict.gates["invalid_evidence_links"] is True
+
+
 def test_trace_does_not_promote_loose_result_fields_to_scoped_evidence() -> None:
     item = _result("loki", "remote body says OOMKilled")
     item.artifacts[0].evidence_id = "E01"

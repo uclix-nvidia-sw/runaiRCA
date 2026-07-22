@@ -2226,6 +2226,7 @@ async def harness_stage(state: PipelineState) -> PipelineState:
         state.root_cause_candidates,
         next_check=state.self_check_next,
         evidence_eligibility=_public_evidence_eligibility(state),
+        known_issues=state.known_issues,
     )
     for _ in range(state.settings.max_rca_repair_attempts):
         if not verdict.failed_gates and verdict.score >= state.settings.rca_harness_pass_score:
@@ -2246,6 +2247,7 @@ async def harness_stage(state: PipelineState) -> PipelineState:
             state.root_cause_candidates,
             next_check=state.self_check_next,
             evidence_eligibility=_public_evidence_eligibility(state),
+            known_issues=state.known_issues,
         )
 
     status = "pass"
@@ -2263,6 +2265,7 @@ async def harness_stage(state: PipelineState) -> PipelineState:
             state.root_cause_candidates,
             next_check=state.self_check_next,
             evidence_eligibility=_public_evidence_eligibility(state),
+            known_issues=state.known_issues,
         )
         status = "abstained"
     elif verdict.score < state.settings.rca_harness_pass_score:

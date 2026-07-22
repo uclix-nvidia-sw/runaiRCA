@@ -19,10 +19,12 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from app.collectors.base import NO_EVIDENCE, CollectorResult
+from app.knowledge import _keyword_hits
 from app.schemas import AlertAnalysisResponse
 from app.services.root_cause_ranking import (
     FAMILIES,
     RankedCause,
+    _artifact_family_semantics,
     artifact_contradicts_family,
     artifact_supports_family,
 )
@@ -157,6 +159,34 @@ def assign_evidence_ids(results: list[CollectorResult]) -> list[object]:
     return artifacts
 
 
+def _promoted_issue_keywords(
+    top: RankedCause | None, known_issues: list[dict] | None
+) -> tuple[str, ...] | None:
+    if top is None or known_issues is None:
+        return None
+    for rationale in getattr(top, "rationale", []) or []:
+        match = re.fullmatch(r"matched known-issue signature:\s*(.+)", str(rationale))
+        if not match:
+            continue
+        issue_name = match.group(1)
+        for entry in known_issues:
+            if not isinstance(entry, Mapping) or entry.get("issue") != issue_name:
+                continue
+            keywords = entry.get("keywords")
+            if not isinstance(keywords, (list, tuple)):
+                return None
+            return tuple(str(keyword).lower() for keyword in keywords)
+        return None
+    return None
+
+
+def _grounds_promoted_issue(artifact: object, issue_keywords: tuple[str, ...] | None) -> bool:
+    if not issue_keywords:
+        return False
+    _agent, _predicate, text = _artifact_family_semantics(artifact)
+    return bool(_keyword_hits(text, list(issue_keywords))[0])
+
+
 def evaluate(
     response: AlertAnalysisResponse,
     results: list[CollectorResult],
@@ -165,6 +195,7 @@ def evaluate(
     next_check: str = "",
     evidence_links: Iterable[EvidenceLink | Mapping[str, Any]] | None = None,
     evidence_eligibility: Mapping[str, object] | None = None,
+    known_issues: list[dict] | None = None,
 ) -> HarnessVerdict:
     top = candidates[0] if candidates else None
     usable = _usable_artifacts(results)
@@ -173,6 +204,9 @@ def evaluate(
         by_agent.setdefault(str(getattr(item, "agent", "")), []).append(item)
 
     family = str(getattr(top, "family", "") or "")
+    issue_keywords = (
+        _promoted_issue_keywords(top, known_issues) if family not in FAMILIES else None
+    )
     agents = set(getattr(top, "evidence_agents", []) or []) if top else set()
     agent_supporting = [item for agent in agents for item in by_agent.get(agent, [])]
     if _signature_support(top):
@@ -225,6 +259,19 @@ def evaluate(
                     continue
             semantically_valid.append(link)
         links = semantically_valid
+    else:
+        semantically_valid = []
+        for link in links:
+            artifact = by_id.get(link.fact_id)
+            if artifact is not None and link.role == "support" and not _grounds_promoted_issue(
+                artifact, issue_keywords
+            ):
+                link_errors.append(
+                    f"link to {link.fact_id!r} does not ground promoted known-issue family {family!r}"
+                )
+                continue
+            semantically_valid.append(link)
+        links = semantically_valid
     # Legacy callers derive support from the ranker's evidence agents.  New
     # callers provide explicit support/contradiction links and get exact claim
     # grounding instead of an agent-name approximation.
@@ -240,7 +287,11 @@ def evaluate(
                 is not None
                 and callable(getattr(eligibility, "permits", None))
                 and eligibility.permits("support")
-                and (family not in FAMILIES or artifact_supports_family(family, item))
+                and (
+                    artifact_supports_family(family, item)
+                    if family in FAMILIES
+                    else _grounds_promoted_issue(item, issue_keywords)
+                )
             )
         ]
         claim_links = [
