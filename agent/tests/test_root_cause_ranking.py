@@ -372,6 +372,48 @@ def test_kubernetes_positive_event_reason_and_log_line_remain_rankable() -> None
     assert "oomkilled" in text
 
 
+def test_image_pull_warning_with_grammatical_negation_still_ranks() -> None:
+    """A real ImagePullBackOff Warning ("repository does not exist", "no such
+    host") must not be vetoed by the value-blind negation filter — the "not"/"no"
+    is part of the failure, not a healthy-condition negation. Regression for a run
+    that abstained on an obvious 187-event image pull failure because "does not
+    exist" tripped the bare "not"."""
+    warning_event = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_warning_events",
+        status="ok",
+        confidence="high",
+        summary="Kubernetes Warning events: image pull failure was returned.",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "pod", "name": "trainer-abc-x1"},
+            },
+            "events": [
+                {
+                    "type": "Warning",
+                    "reason": "Failed",
+                    "message": (
+                        'Failed to pull image "ngink": pull access denied, '
+                        "repository does not exist or may require authorization"
+                    ),
+                }
+            ],
+        },
+    )
+    result = _r("kubernetes", artifacts=[warning_event])
+
+    text = _result_text(result)
+    # The failure message survived the filter (was dropped before the fix).
+    assert "pull access denied" in text
+    assert (
+        rank_root_cause_candidates(_target(alert_name="KubePodNotReady"), [result])[0].family
+        == "image_pull_error"
+    )
+
+
 def test_exact_podgroup_gpu_shortage_routes_to_runai_scheduling() -> None:
     warning_event = artifact(
         agent="kubernetes",

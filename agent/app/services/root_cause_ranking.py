@@ -791,6 +791,28 @@ def _kubernetes_signal_is_positive(value: object) -> bool:
     return bool(text) and _KUBERNETES_NON_CAUSAL_SIGNAL_RE.search(text.casefold()) is None
 
 
+# A Kubernetes Warning event is a failure signal BY CONSTRUCTION: the API emits
+# type=Warning only for abnormal events, and recovery is reported as a separate
+# Normal event (already excluded in the warning branch). The value-blind
+# negation filter above exists to drop HEALTHY node-condition snapshots
+# ("MemoryPressure False") and benign pod-log lines; applied to a Warning
+# MESSAGE it wrongly vetoes genuine failures whose text merely contains a
+# grammatical negation — "repository does not exist", "no such host",
+# "not found". A real ImagePullBackOff (187 events, target-verified) was
+# discarded because "does not exist" tripped the bare "not". So a Warning
+# message/reason is admitted unless it actually reports recovery/resolution.
+_KUBERNETES_EVENT_RECOVERY_RE = re.compile(
+    r"\b(?:healthy|nominal|recovered|recovering|recovery|resolved|cleared|"
+    r"remediated|succeeded)\b|(?:정상|복구|해결)"
+)
+
+
+def _kubernetes_event_signal_is_failure(value: object) -> bool:
+    """A Warning event's text is a live failure signal unless it reports recovery."""
+    text = " ".join(str(value or "").split())
+    return bool(text) and _KUBERNETES_EVENT_RECOVERY_RE.search(text.casefold()) is None
+
+
 def _kubernetes_semantic_artifact_text(art: object) -> str:
     """Keep only value-aware positive signals from Pod logs and Warning Events."""
     payload = getattr(art, "result", None)
@@ -818,10 +840,10 @@ def _kubernetes_semantic_artifact_text(art: object) -> str:
             if event_type and event_type != "warning":
                 continue
             reason = event.get("reason")
-            if _kubernetes_signal_is_positive(reason):
+            if _kubernetes_event_signal_is_failure(reason):
                 parts.append(str(reason))
             message = event.get("message")
-            if _kubernetes_signal_is_positive(message):
+            if _kubernetes_event_signal_is_failure(message):
                 parts.append(str(message))
             # PodGroup is a structured Run:ai scheduling identity, not a word
             # found in a query. When that exact target Event also states a GPU
