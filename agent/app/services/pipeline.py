@@ -43,8 +43,8 @@ from app.knowledge import (
 )
 from app.llm import (
     complete,
-    complete_with_error,
     complete_json,
+    complete_with_error,
     llm_configured,
     parse_json_object,
 )
