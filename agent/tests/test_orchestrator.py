@@ -823,7 +823,7 @@ async def test_analyze_withholds_similar_incident_fix_without_scoped_support() -
 
     recommended = response.analysis_detail.split("## 3. Recommended Actions", 1)[1]
     actions_block = recommended.split("##", 1)[0]
-    assert "Not enough evidence for concrete actions yet" in actions_block
+    assert "Check the canonical evidence source (prometheus) directly for this cause" in actions_block
     assert "INC-HIGH" not in actions_block
     assert "Raised queue gpu-a quota" not in actions_block
 
@@ -880,7 +880,9 @@ async def test_analyze_isolates_collector_exceptions() -> None:
     assert "exploding.collector_exception" in response.missing_data
     assert any("collector boom" in warning for warning in response.warnings)
     assert "collector-boom-secret-12345" not in response.model_dump_json()
-    assert "**exploding**:" in response.analysis_detail
+    # Collector failures remain available in structured diagnostics and warnings,
+    # but Appendix Evidence is intentionally not duplicated in the report body.
+    assert "**exploding**:" not in response.analysis_detail
 
 
 @pytest.mark.asyncio
