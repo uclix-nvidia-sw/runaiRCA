@@ -156,10 +156,13 @@ class Settings:
     max_rca_repair_attempts: int = 3
     rca_harness_pass_score: int = 70
     # Defaulted (keeps existing Settings(...) constructions source-compatible).
-    # Completion budget for the one-shot Korean report JSON: reasoning models
-    # spend it on reasoning tokens FIRST — if synthesis logs empty replies
-    # (finish_reason=length), raise this rather than shrinking the prompt.
-    llm_synthesis_max_tokens: int = 8192
+    # Completion budget for the one-shot Korean report JSON. The default model is a
+    # reasoning model and synthesis genuinely reasons (causal inference, evidence-role
+    # discipline, confidence judgement), so it spends tokens on <think> BEFORE the
+    # report — the budget must hold reasoning + the full report or the JSON truncates
+    # mid-`detail` and the run falls back to the deterministic report. Sized generously
+    # on purpose (accuracy > token cost); if synthesis logs "looks TRUNCATED", raise it.
+    llm_synthesis_max_tokens: int = 32768
     # Short collector insights still need enough room for reasoning models to
     # spend internal reasoning tokens and emit their requested 1-2 sentences.
     llm_insight_max_tokens: int = 512
@@ -323,7 +326,7 @@ def load_settings() -> Settings:
         # Completion budget for the one-shot Korean report JSON. Reasoning models
         # spend this on reasoning tokens FIRST — if synthesis logs empty replies
         # (finish_reason=length), raise this rather than shrinking the prompt.
-        llm_synthesis_max_tokens=_int_env("LLM_SYNTHESIS_MAX_TOKENS", 8192),
+        llm_synthesis_max_tokens=_int_env("LLM_SYNTHESIS_MAX_TOKENS", 32768),
         llm_insight_max_tokens=_int_env("LLM_INSIGHT_MAX_TOKENS", 512),
         analysis_response_max_bytes=max(
             64 << 10,

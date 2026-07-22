@@ -3046,6 +3046,13 @@ async def _synthesize_korean(
         ),
     }
     system = (
+        # Synthesis DOES reason: it writes the causal inference (근거→결론 논리), applies
+        # the evidence_role discipline (only `support` artifacts back the cause), weighs
+        # competing troubleshooting_path hypotheses, and judges confidence — so keep the
+        # model's chain-of-thought ON. The failure mode is only that a reasoning model
+        # spends part of max_tokens on <think> before the report JSON, so the fix is a
+        # generous llm_synthesis_max_tokens (reasoning + full report both fit), NOT
+        # disabling reasoning. If synthesis logs "looks TRUNCATED", raise that budget.
         "당신은 NVIDIA Run:ai GPU 플랫폼을 담당하는 시니어 SRE입니다. 제공된 증거(수집기별 "
         "발견 사항, 조사 계획, 순위가 매겨진 원인 후보, 지식 그래프/함수 기반 조치, 매칭된 "
         "내장 알림, 유사 인시던트)에만 근거하여 한국어로 장애 분석 보고서를 작성하세요.\n"
