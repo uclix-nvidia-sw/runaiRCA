@@ -166,6 +166,13 @@ class Settings:
     # spend internal reasoning tokens and emit their requested 1-2 sentences.
     llm_insight_max_tokens: int = 512
     llm_model_insight: str = ""
+    # Ceiling applied to LLM calls that pass no explicit max_tokens. With
+    # thinking ON, an uncapped call reasons unbounded until the 300s per-call
+    # timeout and burns the analysis deadline before synthesis (2026-07-22
+    # incident). 16384 completes in ~112s measured on the live endpoint. This
+    # bounds one call's wall-clock — it is NOT a latency optimization; 0 restores
+    # uncapped behaviour.
+    llm_default_max_tokens: int = 16384
     # Keep the complete /analyze JSON below the backend transport ceiling. The
     # response boundary compacts raw evidence before operator-facing RCA text.
     analysis_response_max_bytes: int = 1572864
@@ -321,6 +328,7 @@ def load_settings() -> Settings:
         # of a 15-minute run before emitting the JSON report.
         llm_synthesis_max_tokens=_int_env("LLM_SYNTHESIS_MAX_TOKENS", 16384),
         llm_insight_max_tokens=_int_env("LLM_INSIGHT_MAX_TOKENS", 512),
+        llm_default_max_tokens=_int_env("LLM_DEFAULT_MAX_TOKENS", 16384),
         analysis_response_max_bytes=max(
             64 << 10,
             _int_env("ANALYSIS_RESPONSE_MAX_BYTES", 1572864),
