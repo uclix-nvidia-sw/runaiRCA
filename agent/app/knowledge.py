@@ -1370,7 +1370,7 @@ def match_runai_known_issues(
     for entry in catalog:
         matched, _negated = _keyword_hits(text, entry["keywords"])
         if matched:
-            hits.append(entry)
+            hits.append({**entry, "matched_keywords": matched})
     return hits
 
 
@@ -1421,7 +1421,7 @@ def match_failure_mode_symptoms(
             for symptom in symptoms or []
         ]
         matched = [
-            (family, {**symptom, "matched_via": "bm25"})
+            (family, {**symptom, "matched_via": "bm25", "matched_keywords": []})
             for (family, symptom), _score in BM25Index(docs).search(
                 _redact_negated_keywords(fuzzy_query.lower(), all_keywords), top_k=3
             )
@@ -1442,7 +1442,7 @@ def match_failure_mode_symptoms(
             for stronger in kept_hits
         ):
             continue
-        kept.append((family, symptom))
+        kept.append((family, {**symptom, "matched_keywords": hits}))
         kept_hits.append(hits)
     return kept
 

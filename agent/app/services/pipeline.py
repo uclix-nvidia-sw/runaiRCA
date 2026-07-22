@@ -28,6 +28,7 @@ from app.collectors.base import artifact as make_artifact
 from app.collectors.registry import build_collectors, unknown_collector_names
 from app.config import Settings
 from app.knowledge import (
+    _keyword_hits,
     _keyword_negated,
     component_action_lines,
     component_check_lines,
@@ -1534,6 +1535,9 @@ async def rank_stage(state: PipelineState) -> PipelineState:
     state.observed = _observed_text(
         state.results, request, eligible_support_ids=eligible_support_ids
     )
+    evidence_observed = _observed_text(
+        state.results, None, eligible_support_ids=eligible_support_ids
+    )
     state.xid_codes = _xid_codes_from_results(
         state.results,
         _alert_text(request),
@@ -1617,6 +1621,7 @@ async def rank_stage(state: PipelineState) -> PipelineState:
         _gate_lifecycle_symptoms(
             match_failure_mode_symptoms(state.failure_modes, state.observed), lifecycle
         ),
+        evidence_text=evidence_observed,
     )
     open_world = _merge_open_world_candidates(state, state.root_cause_candidates)
     # Shadow and assist expose evidence-gated novel reasoning in context without
@@ -2734,6 +2739,9 @@ async def _reanalyze_once(
             state.request,
             eligible_support_ids=eligible_support_ids,
         )
+        evidence_observed = _observed_text(
+            merged_results, None, eligible_support_ids=eligible_support_ids
+        )
         candidates = _promote_signature_cause(
             candidates,
             _xid_codes_from_results(
@@ -2745,6 +2753,7 @@ async def _reanalyze_once(
             _gate_lifecycle_symptoms(
                 match_failure_mode_symptoms(state.failure_modes, observed), lifecycle
             ),
+            evidence_text=evidence_observed,
         )
         if target.refuted_family and not _fresh_results_support_family(
             target.refuted_family,
@@ -4114,11 +4123,25 @@ def _xid_diagnostic_guidance_lines(
     ]
 
 
+def _specific_keyword(kw: str) -> bool:
+    return len(kw) >= 8 or any(not ch.isalnum() for ch in kw)
+
+
+def _promotable(matched: list[str], family: str) -> bool:
+    if not matched:
+        return False
+    if family not in FAMILIES:
+        return len(matched) >= 2
+    return len(matched) >= 2 or any(_specific_keyword(k) for k in matched)
+
+
 def _promote_signature_cause(
     candidates: list[RankedCause],
     xid_codes: list[int],
     known_issue_matches: list[dict],
     symptom_matches: list[tuple[str, dict]],
+    *,
+    evidence_text: str = "",
 ) -> list[RankedCause]:
     """A specific signature names the headline family; the keyword ranker is only
     the no-signal fallback. Precedence: NVIDIA XID (dispositive) > known-issue
@@ -4138,6 +4161,11 @@ def _promote_signature_cause(
                 ),
                 *candidates[1:],
             ]
+        matched_keywords = entry.get("matched_keywords") or []
+        if not _promotable(matched_keywords, family):
+            continue
+        if family not in FAMILIES and not _keyword_hits(evidence_text, matched_keywords)[0]:
+            continue
         lead = RankedCause(
             family=family,
             confidence="medium",
@@ -4157,6 +4185,8 @@ def _promote_signature_cause(
                 ),
                 *candidates[1:],
             ]
+        if not _promotable(symptom.get("matched_keywords") or [], family):
+            continue
         lead = RankedCause(
             family=family,
             confidence="medium",

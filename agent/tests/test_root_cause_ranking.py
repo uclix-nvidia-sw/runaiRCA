@@ -872,7 +872,13 @@ def test_trigger_facet_survives_signature_promotion() -> None:
     lifecycle_cause = next(c for c in ranked if c.family == "platform_lifecycle_change")
     assert lifecycle_cause.trigger  # ranker set it
 
-    symptom = ("platform_lifecycle_change", {"symptom": "Controller Rollout In Progress"})
+    symptom = (
+        "platform_lifecycle_change",
+        {
+            "symptom": "Controller Rollout In Progress",
+            "matched_keywords": ["mid-rollout"],
+        },
+    )
 
     # Path A: lifecycle family is already the ranker's top → _with_signature_support.
     top_first = [lifecycle_cause, *[c for c in ranked if c.family != "platform_lifecycle_change"]]

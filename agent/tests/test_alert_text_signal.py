@@ -318,18 +318,28 @@ def test_signature_promotion_beats_ranker_and_respects_precedence() -> None:
 
     ranked = [RankedCause(family="node_kubelet_pressure", confidence="medium", score=3.0)]
     # known-issue signature beats the ranker
-    ki = [{"issue": "Scheduler Reclaim Panic On Large GPU Job", "family": "platform_version_bug"}]
-    out = _promote_signature_cause(ranked, [], ki, [])
+    ki = [{
+        "issue": "Scheduler Reclaim Panic On Large GPU Job",
+        "family": "platform_version_bug",
+        "matched_keywords": ["scheduler", "reclaim"],
+    }]
+    out = _promote_signature_cause(ranked, [], ki, [], evidence_text="scheduler reclaim")
     assert out[0].family == "platform_version_bug"
     # curated symptom beats the ranker when no known issue matched
-    sym = [("gpu_hardware_error", {"symptom": "GPU Fallen Off The Bus"})]
+    sym = [(
+        "gpu_hardware_error",
+        {"symptom": "GPU Fallen Off The Bus", "matched_keywords": ["fallen off the bus"]},
+    )]
     out = _promote_signature_cause(ranked, [], [], sym)
     assert out[0].family == "gpu_hardware_error"
     # XID outranks both
     out = _promote_signature_cause(ranked, [79], ki, sym)
     assert out[0].family == "gpu_hardware_error" and out[0].confidence == "high"
     # signature agreeing with the ranker keeps the ranked family and adds signature support
-    agree = [("node_kubelet_pressure", {"symptom": "Node Disk Pressure"})]
+    agree = [(
+        "node_kubelet_pressure",
+        {"symptom": "Node Disk Pressure", "matched_keywords": ["disk pressure"]},
+    )]
     out = _promote_signature_cause(ranked, [], [], agree)
     assert out[0].family == "node_kubelet_pressure"
     assert out[0].score == 7.0
@@ -347,7 +357,13 @@ def test_lifecycle_symptom_promotion_is_gated_by_active_signal() -> None:
     from app.services.pipeline import _gate_lifecycle_symptoms, _promote_signature_cause
 
     ranked = [RankedCause(family="node_kubelet_pressure", confidence="high", score=9.0)]
-    sym = [("platform_lifecycle_change", {"symptom": "Controller Rollout In Progress"})]
+    sym = [(
+        "platform_lifecycle_change",
+        {
+            "symptom": "Controller Rollout In Progress",
+            "matched_keywords": ["mid-rollout"],
+        },
+    )]
 
     # inactive (or absent) lifecycle -> lifecycle symptom is dropped, ranker stands
     gated = _gate_lifecycle_symptoms(sym, {"active": False})
@@ -356,7 +372,10 @@ def test_lifecycle_symptom_promotion_is_gated_by_active_signal() -> None:
     assert _gate_lifecycle_symptoms(sym, None) == []
 
     # a NON-lifecycle symptom is never gated
-    other = [("gpu_hardware_error", {"symptom": "GPU Fallen Off The Bus"})]
+    other = [(
+        "gpu_hardware_error",
+        {"symptom": "GPU Fallen Off The Bus", "matched_keywords": ["fallen off the bus"]},
+    )]
     assert _gate_lifecycle_symptoms(other, {"active": False}) == other
 
     # active lifecycle -> lifecycle symptom passes through and can promote
@@ -366,3 +385,73 @@ def test_lifecycle_symptom_promotion_is_gated_by_active_signal() -> None:
         _promote_signature_cause(ranked, [], [], passed)[0].family
         == "platform_lifecycle_change"
     )
+
+
+def test_promotion_requires_matched_keyword_provenance() -> None:
+    from app.services.pipeline import _promote_signature_cause
+
+    ranked = [RankedCause(family="workload_startup_error", confidence="high", score=9.0)]
+    known_issue = [{"issue": "Alert-only issue", "family": "platform_version_bug"}]
+    assert _promote_signature_cause(ranked, [], known_issue, [])[0].family == "workload_startup_error"
+
+
+def test_non_catalog_promotion_needs_two_hits() -> None:
+    from app.services.pipeline import _promote_signature_cause
+
+    ranked = [RankedCause(family="workload_startup_error", confidence="high", score=9.0)]
+    one = [{
+        "issue": "Expected behavior", "family": "expected_known_behavior",
+        "matched_keywords": ["--backoff-limit"],
+    }]
+    assert _promote_signature_cause(ranked, [], one, [], evidence_text="--backoff-limit")[0].family == "workload_startup_error"
+    two = [{**one[0], "matched_keywords": ["--backoff-limit", "master-restart-policy"]}]
+    promoted = _promote_signature_cause(
+        ranked, [], two, [], evidence_text="--backoff-limit master-restart-policy"
+    )
+    assert promoted[0].family == "expected_known_behavior"
+    assert promoted[0].score == 8.0
+
+
+def test_non_catalog_promotion_needs_evidence_grounding() -> None:
+    from app.services.pipeline import _promote_signature_cause
+
+    ranked = [RankedCause(family="workload_startup_error", confidence="high", score=9.0)]
+    known_issue = [{
+        "issue": "Alert-only issue", "family": "expected_known_behavior",
+        "matched_keywords": ["--backoff-limit", "master-restart-policy"],
+    }]
+    assert _promote_signature_cause(
+        ranked, [], known_issue, [], evidence_text="collector had no matching signature"
+    )[0].family == "workload_startup_error"
+
+
+def test_catalog_promotion_single_specific_keyword_ok() -> None:
+    from app.services.pipeline import _promote_signature_cause
+
+    ranked = [RankedCause(family="workload_startup_error", confidence="high", score=9.0)]
+    phrase = [{
+        "issue": "GPU issue", "family": "gpu_hardware_error",
+        "matched_keywords": ["fallen off the bus"],
+    }]
+    assert _promote_signature_cause(ranked, [], phrase, [])[0].family == "gpu_hardware_error"
+    short = [{**phrase[0], "matched_keywords": ["mig"]}]
+    assert _promote_signature_cause(ranked, [], short, [])[0].family == "workload_startup_error"
+
+
+def test_backofflimitexceeded_end_to_end_headline() -> None:
+    from app.services.pipeline import _promote_signature_cause
+
+    ranked = [RankedCause(family="workload_startup_error", confidence="medium", score=3.0)]
+    failure_modes = load_failure_modes("knowledge/failure_modes.yaml")
+    matches = match_failure_mode_symptoms(
+        failure_modes, "Job Failed: BackoffLimitExceeded"
+    )
+    assert any(
+        family == "workload_startup_error"
+        and symptom.get("matched_keywords") == ["backofflimitexceeded"]
+        for family, symptom in matches
+    )
+    promoted = _promote_signature_cause(ranked, [], [], matches)
+    assert promoted[0].family == "workload_startup_error"
+    assert promoted[0].score == 7.0
+    assert "signature" in promoted[0].evidence_agents
