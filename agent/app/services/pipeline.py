@@ -1428,12 +1428,33 @@ def _lifecycle_signal(
         for c in changes
         if isinstance(c, dict) and c.get("rollout") and c.get("name")
     }
+    helm_changed = {
+        str(c.get("name"))
+        for c in changes
+        if isinstance(c, dict)
+        and (c.get("kind") or c.get("type")) == "HelmRelease"
+        and c.get("name")
+    }
     if not rolling:
         return {}
     implicated = set(chain or ([component] if component else []))
     hit = sorted(rolling & implicated)
     if not hit:
         return {}
+    target_rollout = bool(
+        component
+        and component in rolling
+        and (
+            any(
+                str(c.get("name")) == component
+                and c.get("rollout")
+                and c.get("corroborated", True)
+                for c in changes
+                if isinstance(c, dict)
+            )
+            or component in helm_changed
+        )
+    )
     # Name the upstream Helm trigger (if any) among the matched components so the
     # ranker rationale can point at the real change instead of a downstream symptom.
     helm = [
@@ -1446,7 +1467,7 @@ def _lifecycle_signal(
     signal: dict[str, object] = {
         "active": True,
         "components": hit,
-        "target_rollout": bool(component and component in rolling),
+        "target_rollout": target_rollout,
     }
     if helm:
         signal["helm"] = helm

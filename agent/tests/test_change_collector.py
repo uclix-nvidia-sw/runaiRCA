@@ -94,7 +94,12 @@ async def test_detects_rollout_new_pod_node_and_event(monkeypatch: pytest.Monkey
             data = {"items": [{
                 "metadata": {"name": "trainer", "generation": 5,
                              "creationTimestamp": _iso(-100000)},
-                "status": {"observedGeneration": 4, "conditions": []},
+                "status": {"observedGeneration": 4,
+                            "conditions": [{"lastTransitionTime": _iso(-30)}]},
+            }, {
+                "metadata": {"name": "trainer-lag", "generation": 6,
+                             "creationTimestamp": _iso(-100000)},
+                "status": {"observedGeneration": 5, "conditions": []},
             }]}
         elif "/statefulsets" in path or "/daemonsets" in path:
             data = {"items": []}
@@ -126,6 +131,11 @@ async def test_detects_rollout_new_pod_node_and_event(monkeypatch: pytest.Monkey
     assert result.status == "ok"
     kinds = {c["kind"] for c in result.details["changes"]}
     assert "Deployment" in kinds  # generation != observedGeneration -> mid-rollout
+    deployments = {
+        c["name"]: c for c in result.details["changes"] if c["kind"] == "Deployment"
+    }
+    assert deployments["trainer"]["corroborated"] is True
+    assert deployments["trainer-lag"]["corroborated"] is False
     assert "PodCreated" in kinds
     assert "PodDeleted" in kinds
     assert "NodeCondition" in kinds
