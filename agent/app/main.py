@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, HTTPException
@@ -41,7 +42,9 @@ class _HealthzFilter(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(_HealthzFilter())
 # The RCA investigation narrates plan/collect/synthesis at INFO so the pod log
 # shows what the agents are doing instead of probe noise.
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "info").upper(), logging.INFO)
+)
 # The MCP SDK logs successful session negotiation and its optional standalone
 # GET/SSE reconnect lifecycle at INFO for every short-lived tool session. An RCA
 # can open hundreds of these sessions, drowning out actual analysis progress.

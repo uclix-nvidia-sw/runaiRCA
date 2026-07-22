@@ -344,7 +344,7 @@ async def test_progress_does_not_look_stuck_after_self_check(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
-async def test_cap_zero_uses_semantic_completion_instead_of_disabling_reanalysis(monkeypatch) -> None:
+async def test_semantic_completion_does_not_disable_reanalysis(monkeypatch) -> None:
     _stub_llm_http(monkeypatch)
     investigate_calls: list[int] = []
     refute_calls: list[str] = []
@@ -362,7 +362,7 @@ async def test_cap_zero_uses_semantic_completion_instead_of_disabling_reanalysis
         refute_calls=refute_calls,
     )
 
-    settings = replace(llm_settings(), max_investigation_iterations=0)
+    settings = llm_settings()
     orchestrator = AnalysisOrchestrator(settings)
     response = await orchestrator.analyze(_request())
 

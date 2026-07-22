@@ -2193,11 +2193,6 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
 
 async def harness_stage(state: PipelineState) -> PipelineState:
     """Validate the already-synthesized RCA and make bounded safe repairs."""
-    from app.services.critic import (
-        CriticResult,
-        apply_safe_patches,
-        critique_claims,
-    )
     from app.services.harness import (
         abstain,
         analysis_hash,
@@ -2227,27 +2222,6 @@ async def harness_stage(state: PipelineState) -> PipelineState:
         next_check=state.self_check_next,
         evidence_eligibility=_public_evidence_eligibility(state),
     )
-    evidence_ids = [
-        str(getattr(artifact, "evidence_id", ""))
-        for artifact in state.artifacts
-        if getattr(artifact, "evidence_id", "")
-    ]
-    critic = critique_claims(verdict.claims, available_evidence_ids=evidence_ids)
-    llm_critic = await _semantic_critic(
-        state.settings,
-        verdict.claims,
-        available_evidence_ids=evidence_ids,
-    )
-    if not llm_critic.is_noop:
-        critic = CriticResult(
-            issues=(*critic.issues, *llm_critic.issues),
-            patches=(*critic.patches, *llm_critic.patches),
-            status="issues",
-        )
-    patched_claims = apply_safe_patches(verdict.claims, critic)
-    for claim in patched_claims:
-        if claim.get("claim_id") == "C01" and claim.get("confidence") == "medium":
-            apply_confidence_downgrade(state.root_cause_candidates)
     for _ in range(state.settings.max_rca_repair_attempts):
         if not verdict.failed_gates and verdict.score >= state.settings.rca_harness_pass_score:
             break
@@ -2300,54 +2274,10 @@ async def harness_stage(state: PipelineState) -> PipelineState:
     ]
     response.context["top_root_cause"] = top.as_dict() if top else None
     response.context["harness"] = payload(verdict, status=status, repairs=repairs)
-    response.context["harness"]["critic"] = critic.as_dict()
     response.context["analysis_hash"] = analysis_hash(response)
     response.analysis = response.analysis_detail
     state.response = response
     return state
-
-
-async def _semantic_critic(
-    settings: Settings,
-    claims: list[dict[str, Any]],
-    *,
-    available_evidence_ids: list[str],
-):
-    """Ask an optional critic for whitelist-only claim patches.
-
-    The critic never sees raw credentials or tool output and its response is
-    parsed by ``parse_critic_result``; it can only downgrade confidence or mark
-    a claim inferred, never manufacture an RCA or remediation.
-    """
-    from app.services.critic import CriticResult, parse_critic_result
-
-    # Stage-model overrides conventionally fall back to LLM_MODEL. Leaving
-    # LLM_MODEL_CRITIC empty must not silently disable the semantic critic.
-    model = str(getattr(settings, "llm_model_critic", "") or "").strip() or settings.llm_model
-    if not llm_configured(settings, model):
-        return CriticResult()
-    try:
-        raw = await complete_json(
-            settings,
-            system=(
-                "You are a skeptical RCA claim critic. Inspect only evidence IDs and claim links. "
-                "Return JSON with optional issues and patches. Allowed patches are exclusively "
-                "downgrade_confidence to low/medium or mark_inferred to inferred. Never add "
-                "evidence, actions, mechanisms, or prose."
-            ),
-            user=json.dumps(
-                {"claims": claims, "available_evidence_ids": available_evidence_ids},
-                ensure_ascii=False,
-            ),
-            model=model,
-        )
-    except Exception:  # noqa: BLE001 - critic is advisory, hard gates remain local
-        return CriticResult()
-    return parse_critic_result(
-        raw,
-        claim_ids=[str(claim.get("claim_id") or "") for claim in claims],
-        available_evidence_ids=available_evidence_ids,
-    )
 
 
 async def run_pipeline(

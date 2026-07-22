@@ -432,7 +432,7 @@ agent:
     namespaces: []
   env:
     language: ko
-    logLevel: info
+    logLevel: warning
     kubernetesApiUrl: https://kubernetes.default.svc
     kubernetesTokenPath: /var/run/secrets/kubernetes.io/serviceaccount/token
     kubernetesCaPath: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
@@ -528,7 +528,6 @@ agent:
     llmModelSynthesis: ""
     llmModelChat: ""
     llmModelInsight: ""
-    llmModelCritic: ""
     # Output budget for 1-2 sentence collector insights. Reasoning models may
     # consume part of this internally before emitting visible content.
     llmInsightMaxTokens: 512
