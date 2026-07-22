@@ -621,7 +621,7 @@ def test_feedback_prior_requires_typed_current_incident_observation() -> None:
     # Feedback is constructed from a *prior* incident.  A legacy free-text
     # result can still be useful operator context, but it must not receive a
     # score boost unless this incident has a typed, scoped observation.
-    legacy = _r("kubernetes", summary="runai-backend reconcile failed")
+    legacy = _r("kubernetes", summary="runai-backend reconciler error")
     baseline = rank_root_cause_candidates(
         _target(), [legacy], priors={"runai_control_plane_error": 1.5}
     )
@@ -641,7 +641,7 @@ def test_feedback_prior_requires_typed_current_incident_observation() -> None:
         type="warning_event",
         status="ok",
         confidence="high",
-        summary="runai-backend reconcile failed in incident window",
+        summary="runai-backend failed to reconcile in incident window",
         result={
             "observation": {
                 "polarity": "present",
@@ -683,7 +683,7 @@ def test_feedback_prior_rejects_other_entity_or_out_of_incident_observation() ->
             type="warning_event",
             status="ok",
             confidence="high",
-            summary="runai-backend reconcile failed",
+            summary="runai-backend reconciler error",
             result={
                 "observation": {
                     "polarity": "present",

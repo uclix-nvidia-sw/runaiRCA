@@ -5,8 +5,18 @@ empty (the exact production case: system agent unreachable, loki failed)."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import yaml
+
 from app.collectors.base import CollectorResult, artifact
-from app.knowledge import _keyword_hits, load_failure_modes, match_failure_mode_symptoms
+from app.knowledge import (
+    _keyword_hits,
+    load_failure_modes,
+    load_runai_known_issues,
+    match_failure_mode_symptoms,
+    match_runai_known_issues,
+)
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services.pipeline import (
     _alert_text,
@@ -234,6 +244,51 @@ def test_symptom_matches_from_alert_text_alone() -> None:
 
 def test_observed_text_without_request_unchanged() -> None:
     assert _observed_text([]) == ""
+
+
+def test_generic_dns_text_does_not_match_image_pull() -> None:
+    fm = load_failure_modes("knowledge/failure_modes.yaml")
+    matches = match_failure_mode_symptoms(fm, "dial tcp: lookup my-internal-svc: no such host")
+    assert not any(
+        family == "image_pull_error" for family, _ in matches
+    )
+
+    families = yaml.safe_load(
+        Path("knowledge/families.yaml").read_text(encoding="utf-8")
+    )
+    image_pull = next(
+        family for family in families if family["family"] == "image_pull_error"
+    )
+    assert _keyword_hits(
+        "connection refused: no such host", image_pull["keywords"]
+    )[0] == []
+    assert _keyword_hits(
+        "failed to pull image: dial tcp: lookup registry-1.docker.io",
+        image_pull["keywords"],
+    )[0] == ["dial tcp: lookup"]
+
+
+def test_migration_text_does_not_match_mig_symptom() -> None:
+    fm = load_failure_modes("knowledge/failure_modes.yaml")
+    matches = match_failure_mode_symptoms(
+        fm, "runai upgrade running database migration job"
+    )
+    assert not any(
+        family == "network_fabric_error" and s.get("symptom") == "MIG Mode Disables NVLink"
+        for family, s in matches
+    )
+
+
+def test_job_backoff_failure_does_not_match_known_issue() -> None:
+    catalog = load_runai_known_issues("knowledge/runai_known_issues.yaml")
+    assert match_runai_known_issues(
+        catalog, "Job has reached the specified backoff limit: BackoffLimitExceeded"
+    ) == []
+
+
+def test_created_by_event_text_does_not_match_known_issue() -> None:
+    catalog = load_runai_known_issues("knowledge/runai_known_issues.yaml")
+    assert match_runai_known_issues(catalog, "workspace created by user bob") == []
 
 
 def test_xid_promotes_gpu_hardware_over_keyword_noise() -> None:

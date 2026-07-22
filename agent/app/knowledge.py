@@ -204,10 +204,10 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
         "loki",
         ("loki", "kubernetes"),
         (
-            "reconcile",
+            "reconciler error",
             "runai-backend",
             "cluster-sync",
-            "authorization",
+            "failed to reconcile",
             "database error",
         ),
     ),
@@ -254,8 +254,7 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "manifest for",
             "toomanyrequests",
             "pull access denied",
-            "no such host",
-            "registry",
+            "dial tcp: lookup",
         ),
     ),
     "gpu_hardware_error": (
@@ -1456,7 +1455,10 @@ _GENERIC_CONTEXT_HITS = {
 
 
 def _symptom_context_supported(family: str, symptom: dict[str, Any], text: str) -> bool:
-    if family != "image_pull_error" or symptom.get("symptom") != "Registry TLS Certificate Error":
+    if family != "image_pull_error" or symptom.get("symptom") not in {
+        "Registry TLS Certificate Error",
+        "Registry Server 5xx / DNS Lookup Failure On Pull",
+    }:
         return True
     return any(
         marker in text

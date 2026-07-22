@@ -114,7 +114,7 @@
         - "Verify the SUM of the group's pod requests fits one node pool's free + reclaimable capacity, and that topology/affinity/GPU-fraction constraints are not fragmenting placement."
         - "For distributed (leader/worker) workloads, confirm all sub-groups can be placed together."
     - name: Node Defragmentation
-      keywords: [defragment, defragmentation, "single node"]
+      keywords: [defragment, defragmentation]
       actions:
         - "GPUs are free in the node pool but not enough on ONE node — e.g. a 4-GPU workload can't fit a pool with 8 free GPUs spread as 4×(2/8). Check the Overview dashboard 'Free nodes by node pool' and the Nodes page ordered by 'Allocated GPU' for a node with enough contiguous GPUs."
         - "Multi-node workloads tend to allocate whole nodes' GPUs, so they suffer most from fragmentation — look for partially-full nodes (e.g. 4/8) blocking placement."
@@ -337,7 +337,7 @@
         - "10004(Host_thermal_event_start)는 냉각 부족을 뜻하며 NVSwitch 링크를 단일 레인(절전) 모드로 강제해 NVLink 처리량을 낮춥니다. 노드 냉각과 열 상태를 점검하세요. 10005는 Host_thermal_event_end입니다. 전체 SXid 목록은 NVIDIA/open-gpu-kernel-modules에 있습니다."
     - name: Fabric Partition Life-Cycle Errors
       name_ko: Fabric 파티션 수명 주기 오류
-      keywords: [fm_st_, shared_fabric_mode, partition, fm_st_badparam, fm_st_not_supported, fm_st_not_configured, fm_st_uninitialized, fm_st_in_use, fm_st_generic_error, fm_st_version_mismatch, fm_st_timeout]
+      keywords: [fm_st_, shared_fabric_mode, fm_st_badparam, fm_st_not_supported, fm_st_not_configured, fm_st_uninitialized, fm_st_in_use, fm_st_generic_error, fm_st_version_mismatch, fm_st_timeout]
       actions:
         - "Fabric Manager SDK partition APIs for Shared NVSwitch/vGPU multitenancy return FM_ST_BADPARAM for an invalid partition ID or parameters; use IDs from `fmGetSupportedFabricPartitions()`. FM_ST_NOT_SUPPORTED means Fabric Manager was not started with the required mode: set `SHARED_FABRIC_MODE=1` for Shared NVSwitch or `=2` for vGPU, then restart Fabric Manager."
         - "FM_ST_NOT_CONFIGURED means APIs were called before Fabric Manager completed initialization; wait. FM_ST_UNINITIALIZED means `fmLibInit()` was not called or the partition is already deactivated. FM_ST_IN_USE means the partition is already active or its GPUs are used by another active partition."
@@ -348,7 +348,7 @@
         - "FM_ST_GENERIC_ERROR 또는 FM_ST_TIMEOUT이면 syslog에서 세부 내용을 확인하세요. FM_ST_VERSION_MISMATCH는 클라이언트가 service VM에서 실행 중인 것과 다른 Fabric Manager 패키지로 빌드됐음을 뜻하므로 Fabric Manager 버전을 일치시키세요."
     - name: GPU/NVSwitch Reset Capabilities And Limitations
       name_ko: GPU/NVSwitch 재설정 기능 및 제한
-      keywords: [reset, "nvidia-smi -r", "gpu reset", passthrough, "service vm", sbr]
+      keywords: ["nvidia-smi -r", "gpu reset", "service vm", sbr]
       actions:
         - "Reset support depends on deployment. On bare metal, reset one GPU individually or reset all GPUs together as root. In full-passthrough virtualization (all GPUs in one VM), individual GPU reset is not supported; restart the VM. Stop CUDA, X, and other `nvidia-smi` applications before any reset."
         - "On Ampere+NVSwitch with Fabric Manager running, reset a GPU individually and Fabric Manager automatically resets the NVSwitch links. With Fabric Manager not running, individual reset is not possible; reset all GPUs and NVSwitches."
@@ -359,7 +359,7 @@
         - "Hopper+NVSwitch에서는 베어메탈 개별 GPU 재설정이 동작합니다. VM에서는 hypervisor 권한에 따라 다르며 VM을 재시작하면 GPU도 재시작됩니다."
     - name: Fabric Manager Initialization Failure Or Degraded
       name_ko: Fabric Manager 초기화 실패 또는 성능 저하
-      keywords: ["fabric manager", initialization, "fm_stay_resident", "not yet initialized", degraded]
+      keywords: ["fabric manager", "fm_stay_resident", "not yet initialized"]
       actions:
         - "Fabric Manager terminates on configuration or hardware initialization failure by default. `FM_STAY_RESIDENT_ON_FAILURES=1` keeps it resident, but the system remains UNINITIALIZED and CUDA fails."
         - "Check `journalctl -u nvidia-fabricmanager` or `/var/log/fabricmanager.log`, verify driver compatibility (minimum R450 on older systems and R570+ for B200/B300), then run `systemctl restart nvidia-fabricmanager`."
@@ -370,7 +370,7 @@
         - "RCA 시스템 에이전트는 이 노드에서 `fabricmanager`(nvidia-fabricmanager journal), `nvidia-smi`, `nvlink` 소스를 수집할 수 있습니다."
     - name: GPU Fabric Registration Incomplete
       name_ko: GPU 패브릭 등록 미완료
-      keywords: [cudaerrorsystemnotready, "system not yet initialized", "fabric state", registration]
+      keywords: [cudaerrorsystemnotready, "system not yet initialized", "fabric state"]
       actions:
         - "On H100/NVSwitch systems, a CUDA launch before Fabric Manager finishes registration fails with cudaErrorSystemNotReady."
         - "Run `nvidia-smi -q -i <gpu> | grep -A2 Fabric` and wait for `State: Completed` and `Status: Success`; `In Progress` means registration is still running. Restart Fabric Manager if it is hung."
@@ -381,7 +381,7 @@
         - "RCA 시스템 에이전트는 이 노드에서 `fabricmanager`(nvidia-fabricmanager journal), `nvidia-smi`, `nvlink` 소스를 수집할 수 있습니다."
     - name: NVLink High Availability Failure Modes
       name_ko: NVLink 고가용성 장애 모드
-      keywords: [fm_stay_resident_on_failures, access_link_failure_mode, trunk_link_failure_mode, nvswitch_failure_mode, abort_cuda_jobs_on_fm_exit, "high availability", "failure mode"]
+      keywords: [fm_stay_resident_on_failures, access_link_failure_mode, trunk_link_failure_mode, nvswitch_failure_mode, abort_cuda_jobs_on_fm_exit]
       actions:
         - "Fabric Manager HA configuration defaults in `/usr/share/nvidia/nvswitch/fabricmanager.cfg` are `FM_STAY_RESIDENT_ON_FAILURES=0`, `ACCESS_LINK_FAILURE_MODE=0`, `TRUNK_LINK_FAILURE_MODE=0`, `NVSWITCH_FAILURE_MODE=0`, and `ABORT_CUDA_JOBS_ON_FM_EXIT=1`."
         - "A100 bare metal/passthrough: TRUNK 0 exits Fabric Manager leaving NVLinks uninitialized; TRUNK 1 disables the NVSwitch and its peer, reducing P2P bandwidth. NVSWITCH 0 aborts Fabric Manager; NVSWITCH 1 disables the switch and peer. ACCESS 0 removes the failed GPU from NVLink P2P; ACCESS 1 disables the switch and peer. `ABORT_CUDA_JOBS_ON_FM_EXIT=0` does not abort running jobs (new launches fail), while `=1` aborts all jobs."
@@ -394,7 +394,7 @@
         - "H100은 TRUNK/NVSWITCH/ACCESS 모드 설정을 무시합니다. H100에는 NVLink 트렁크 링크가 없으며, 스위치를 사용할 수 없으면 GPU의 fabric 등록이 실패하고 CUDA 실행도 실패합니다. ACCESS 링크 장애 뒤에는 `nvidia-smi`가 비활성 NVLink를 표시합니다. `ABORT_CUDA_JOBS_ON_FM_EXIT`는 H100/HGX H100+에서 효과가 없으며(베어메탈 및 전체 passthrough에만 해당) 적용되지 않습니다."
     - name: MIG Mode Disables NVLink
       name_ko: MIG 모드가 NVLink를 비활성화함
-      keywords: [mig, "mig mode", nvlink, "peer-to-peer"]
+      keywords: ["mig mode", nvlink, "peer-to-peer"]
       actions:
         - "Enabling MIG on a GPU disables its NVLinks and drops peer-to-peer connectivity. If multi-GPU NVLink workloads fail, check `nvidia-smi` for MIG mode."
         - "Disable MIG so Fabric Manager can retrain the NVLinks; Fabric Manager must be running. The RCA system agent can pull `fabricmanager` (nvidia-fabricmanager journal), `nvidia-smi`, and `nvlink` sources for this node."
@@ -536,7 +536,7 @@
     # stream and falsely elevates control-plane for plain scheduling/kube-scheduler
     # events. Keep phrases that only appear when the control-plane service errors.
     - name: Scheduler Or Reconcile Error
-      keywords: ["scheduler panic", "scheduler error", reconcile, "database error", authorization]
+      keywords: ["scheduler panic", "scheduler error", "reconciler error", "failed to reconcile", "database error"]
       actions:
         - "Inspect runai/runai-backend logs around the alert window for scheduler/quota/db errors."
         - "Check whether several workloads in the same queue/project changed state together."
@@ -554,7 +554,7 @@
         - "An illegal/legacy workload (old-version, or a raw-YAML submission) can crash workload-controller and cluster-sync. The offending workload is usually named in the logs right before the crash — find it and delete it."
     - name: Cluster Disconnected
       component: cluster-sync
-      keywords: [disconnected, traefik, "token used before issued", "token expired", "clock sync"]
+      keywords: ["cluster disconnected", traefik, "token used before issued", "token expired", "clock sync"]
       actions:
         - "'Disconnected' means cluster-sync could not push updates to the control plane. Check cluster-sync for OOM / periodic crashes and read its logs for the specific error."
         - "Rule out network errors to the backend; check the runai-backend-traefik pod for token errors."
@@ -614,7 +614,7 @@
         - "Missing Project/Workload metrics: check the metrics-exporter pod in the runai namespace (get/describe). Port-forward Prometheus and check its metrics-exporter target — if down, colocate Prometheus and metrics-exporter on the same node; add memory if it was OOM-killed."
     - name: Metrics Slowness
       component: runai-backend-thanos-receive
-      keywords: ["metrics slow", "dashboard slow", "thanos slow"]
+      keywords: ["metrics slow", "metrics slowness", "dashboard slow", "thanos slow"]
       actions:
         - "Give thanos-receive and thanos-query more CPU/memory via the helm chart (e.g. thanos.receive 6G/1cpu, thanos.query 2G/1cpu)."
         - "Ensure Thanos runs on fast storage; if storage is slow, move thanos-receive off the slow node (cordon + delete the pod to reschedule)."
@@ -632,7 +632,7 @@
       actions:
         - "403 or partial project visibility means wrong user attributes/permissions. Verify the Access Rules page, decide which attribute is expected (email or SSO group), and check that attribute in the JWT token. If the token's attributes are wrong, fix the SAML/OIDC response from the IdP."
     - name: SAML Misconfiguration
-      keywords: [saml, assertion, "entity id", assertionconsumerservice, attributestatement]
+      keywords: [saml, assertion, assertionerror, "entity id", assertionconsumerservice, attributestatement]
       actions:
         - "SAML passes identity via an XML assertion. Capture the 'saml' network call (browser devtools → Network), decode+inflate the request, and confirm <saml:Issuer>=Entity ID and AssertionConsumerServiceURL=Redirect URI. On the response, decode and check <saml:AttributeStatement> — the email attribute is mandatory and every attribute must match the Run:ai settings."
     - name: OIDC Misconfiguration
@@ -757,7 +757,7 @@
         - "List the tags that actually exist: `crane ls <repo>` or `skopeo list-tags docker://<repo>`, then fix `spec.containers[].image`; pin an immutable digest (`<repo>@sha256:...`) so a deleted/re-pushed tag can't reintroduce it."
         - "For 'no matching manifest for linux/arm64...' the tag is valid but has no layer for this node's CPU arch — inspect platforms with `docker buildx imagetools inspect <image:tag>`, then publish a multi-arch image or pin the pod to matching nodes with a `kubernetes.io/arch` nodeSelector."
     - name: Registry Server 5xx / DNS Lookup Failure On Pull
-      keywords: ["received unexpected http status: 5", "unexpected status: 503", "dial tcp: lookup", "no such host", "server gave http response to https client"]
+      keywords: ["received unexpected http status:", "unexpected status: 503", "dial tcp: lookup", "server gave http response to https client"]
       actions:
         - "For 'received unexpected HTTP status: 5xx': the registry is reachable and auth passed but returned 500/503 serving the manifest/blob — the registry itself is unhealthy/overloaded. A shared-registry 5xx fails EVERY node's pull, so expect broad correlated ImagePull failures; retry `crictl pull <image>` on a node once it recovers, else escalate to the registry owner."
         - "For 'dial tcp: lookup <registry> ... no such host': the NODE can't resolve the registry hostname (distinct from in-cluster pod DNS). Test node-level resolution on the scheduled node: `nslookup <registry-host>` / `getent hosts <registry-host>` (uses the node's /etc/resolv.conf, not CoreDNS); fix the node's upstream DNS or airgap hosts entry."
@@ -802,7 +802,7 @@
         - "Check how many schedulable domains carry the topologyKey label (`kubectl get nodes -L <topologyKey>`) — anti-affinity/spread needs at least as many labelled domains as replicas; too few domains or missing labels makes it impossible."
         - "Relax it (raise maxSkew, set whenUnsatisfiable: ScheduleAnyway, or switch required→preferredDuringScheduling), widen the topologyKey, or add capacity in the under-filled domain."
     - name: DaemonSet Pods Not Scheduling On Some Nodes
-      keywords: [daemonset, "numberunavailable", "numbermisscheduled", "desirednumberscheduled"]
+      keywords: ["numberunavailable", "numbermisscheduled", "desirednumberscheduled"]
       actions:
         - "A DaemonSet should run one pod per (matching) node; when status.numberReady < desiredNumberScheduled, some nodes have no ready pod. This is usually a SCHEDULING problem, not a crash: the node is tainted and the DaemonSet lacks the matching toleration, or nodeSelector/affinity excludes it. Check `kubectl -n <ns> describe ds <name>` (Events) and `kubectl -n <ns> get pods -l <ds-selector> -o wide` to see WHICH nodes are missing a pod."
         - "Compare the DaemonSet's tolerations against the target nodes' taints (`kubectl get nodes -o json | jq '.items[].spec.taints'`). System DaemonSets (CNI, kube-proxy, nvidia-device-plugin, CSI node) typically need broad tolerations incl. NoSchedule; a GPU-only DaemonSet needs a nodeSelector like nvidia.com/gpu.present=true. Fix the toleration/selector so the intended nodes are covered."

@@ -88,10 +88,10 @@
     - loki
     - kubernetes
   keywords:
-    - reconcile
+    - reconciler error
     - runai-backend
     - cluster-sync
-    - authorization
+    - failed to reconcile
     - database error
   planner_keywords:
     - reconcile
@@ -162,8 +162,7 @@
     - manifest for
     - toomanyrequests
     - pull access denied
-    - no such host
-    - registry
+    - "dial tcp: lookup"
   planner_keywords:
     - imagepull
     - errimagepull
