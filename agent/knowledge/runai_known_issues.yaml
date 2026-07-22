@@ -107,7 +107,7 @@
 
 - issue: "Distributed Training Backoff And Restart Policy Semantics"
   family: expected_known_behavior
-  keywords: ["master-restart-policy", "--backoff-limit"]
+  keywords: ["master-restart-policy", "--backoff-limit", "backofflimit"]
   affected_version: ""
   fixed_version: ""
   reason: "In Distributed Training only the Worker backoffLimit is used (Master's is set-but-ignored); the restart count is Master+Worker pods summed. restartPolicy: Always is accepted but behaves like OnFailure because the workload is a completions=1 Kubernetes Job — it will not restart after a successful (exit 0) finish."

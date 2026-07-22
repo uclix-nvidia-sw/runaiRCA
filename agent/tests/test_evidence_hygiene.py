@@ -1435,6 +1435,28 @@ def test_asserted_alert_signature_uses_alert_identity_not_live_target() -> None:
     }
 
 
+def test_known_issue_runbook_text_is_not_materialized_as_alert_evidence() -> None:
+    settings = make_settings()
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "SchedulerRestarting"},
+            annotations={
+                "summary": "scheduler restarted for an unknown reason",
+                "runbook": "check reclaim.go and runtime/panic.go in scheduler logs",
+            },
+        )
+    )
+
+    result = pipeline._alert_signature_evidence_result(
+        request,
+        make_target(),
+        pipeline.load_runai_known_issues(settings.runai_known_issues_file),
+    )
+
+    assert result is None
+
+
 @pytest.mark.asyncio
 async def test_alert_only_xid_is_auditable_harness_support(monkeypatch) -> None:
     """A dispositive alert signature gets a real E-link instead of a rationale bypass."""
@@ -1485,6 +1507,55 @@ async def test_alert_only_xid_is_auditable_harness_support(monkeypatch) -> None:
     assert "alert:NVRMXidCritical" in pipeline._evidence_context(state)["entities"]
     claim = state.response.context["harness"]["claims"][0]
     assert claim["supporting_evidence"] == [xid_cards[0].evidence_id]
+    assert state.response.context["harness"]["status"] == "pass"
+
+
+@pytest.mark.asyncio
+async def test_alert_only_known_issue_is_auditable_harness_support(monkeypatch) -> None:
+    """An exact known-issue alert signature remains usable without collectors."""
+    from app.services.kg_enrichment import KGContext
+
+    async def no_followup(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr("app.collectors.kubernetes.k8s_followup", no_followup)
+    monkeypatch.setattr("app.collectors.prometheus.prometheus_followup", no_followup)
+    settings = replace(make_settings(), enable_rca_output_harness=True)
+    request = AlertAnalysisRequest(
+        incident_id="INC-known-issue-alert",
+        alert=Alert(
+            status="firing",
+            labels={
+                "alertname": "RunAISchedulerRestarting",
+                "namespace": "runai",
+            },
+            annotations={
+                "summary": (
+                    "runai-scheduler-default panic: reclaim.go runtime/panic.go "
+                    "reclaim] attempting to reclaim large GPU job"
+                )
+            },
+        ),
+    )
+    state = pipeline.new_state(settings, request, collectors=[])
+    state.kg_context = KGContext()
+    state.plan = InvestigationPlan(namespaces=[state.target.namespace])
+
+    await pipeline.evidence_stage(state)
+    await pipeline.rank_stage(state)
+    await pipeline.self_check_stage(state)
+    await pipeline.synthesize_stage(state)
+    await pipeline.harness_stage(state)
+
+    assert state.response is not None
+    assert state.response.root_cause_family == "platform_version_bug"
+    cards = [card for card in state.response.artifacts if card.agent == "alert"]
+    assert len(cards) == 1
+    assert cards[0].result["observation"]["predicate"] == (
+        "alert_signature:platform_version_bug"
+    )
+    claim = state.response.context["harness"]["claims"][0]
+    assert claim["supporting_evidence"] == [cards[0].evidence_id]
     assert state.response.context["harness"]["status"] == "pass"
 
 

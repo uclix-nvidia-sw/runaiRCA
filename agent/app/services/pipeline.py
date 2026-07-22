@@ -513,11 +513,32 @@ def _alert_evidence_identity(
 
 
 def _alert_signature_evidence_result(
-    request: AlertAnalysisRequest, target: AnalysisTarget
+    request: AlertAnalysisRequest,
+    target: AnalysisTarget,
+    known_issues: list[dict[str, Any]] | None = None,
 ) -> CollectorResult | None:
     """Materialize explicit alert failure signatures as typed, citable evidence."""
     codes, matched_by_family = _asserted_alert_signatures(request)
-    if not codes and not matched_by_family:
+    asserted_texts = _asserted_alert_texts(request)
+    asserted_known_issues: list[dict[str, Any]] = []
+    for entry in match_runai_known_issues(
+        known_issues or [], " ".join(asserted_texts)
+    ):
+        asserted_keywords = []
+        for keyword in entry.get("matched_keywords") or []:
+            for text in asserted_texts:
+                if any(
+                    _alert_signature_is_asserted(text, match.start(), match.end())
+                    for match in re.finditer(re.escape(str(keyword)), text, re.IGNORECASE)
+                ):
+                    asserted_keywords.append(str(keyword))
+                    break
+        family = str(entry.get("family") or "")
+        if family and _promotable(asserted_keywords, family):
+            asserted_known_issues.append(
+                {**entry, "matched_keywords": list(dict.fromkeys(asserted_keywords))}
+            )
+    if not codes and not matched_by_family and not asserted_known_issues:
         return None
 
     # The alert payload is an observation by Alertmanager.  Never attach it to
@@ -566,6 +587,36 @@ def _alert_signature_evidence_result(
                 summary=summary,
                 result={
                     "matched_signals": signals,
+                    "observation": {
+                        "predicate": f"alert_signature:{family}",
+                        "polarity": "present",
+                        "coverage": "scoped",
+                        "observed_entity": observed_entity,
+                    },
+                },
+                highlights=signals,
+            )
+        )
+    for entry in asserted_known_issues:
+        family = str(entry.get("family") or "")
+        issue = str(entry.get("issue") or "")
+        signals = list(dict.fromkeys(entry.get("matched_keywords") or []))
+        summary = (
+            f"Alert payload explicitly reported known-issue signature {issue}: "
+            + ", ".join(signals)
+            + "."
+        )
+        cards.append(
+            make_artifact(
+                agent="alert",
+                source="alertmanager",
+                type="alert_signature",
+                status="ok",
+                confidence="high",
+                summary=summary,
+                result={
+                    "matched_signals": signals,
+                    "matched_known_issue": issue,
                     "observation": {
                         "predicate": f"alert_signature:{family}",
                         "polarity": "present",
@@ -822,7 +873,11 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
             collectors=[result.agent for result in state.results],
         )
     evidence_sufficient = _investigation_evidence_sufficient(state)
-    alert_evidence = _alert_signature_evidence_result(state.request, target)
+    alert_evidence = _alert_signature_evidence_result(
+        state.request,
+        target,
+        load_runai_known_issues(state.settings.runai_known_issues_file),
+    )
     if alert_evidence is not None and not any(r.agent == "alert" for r in state.results):
         state.results.append(alert_evidence)
     # Facts and hashed query receipts are run-scoped memory for every evidence
@@ -1711,14 +1766,18 @@ async def rank_stage(state: PipelineState) -> PipelineState:
     # database-disk known issue), while the playbook/actions/verify surfaces
     # use fuzzy matches as candidates the LLM verify pass can still refute.
     state.alert_fuzzy = _alert_text(request)
+    known_issue_matches = match_runai_known_issues(state.known_issues, state.observed)
     state.root_cause_candidates = _promote_signature_cause(
         state.root_cause_candidates,
         state.xid_codes,
-        match_runai_known_issues(state.known_issues, state.observed),
+        known_issue_matches,
         _gate_lifecycle_symptoms(
             match_failure_mode_symptoms(state.failure_modes, state.observed), lifecycle
         ),
         evidence_text=evidence_observed,
+        known_issue_support=_known_issue_signature_support(
+            state.results, known_issue_matches, eligible_support_ids
+        ),
     )
     open_world = _merge_open_world_candidates(state, state.root_cause_candidates)
     # Shadow and assist expose evidence-gated novel reasoning in context without
@@ -2887,7 +2946,11 @@ def _evidence_signature(results: list[CollectorResult]) -> tuple[tuple[object, .
 
 
 def _append_reanalysis_note(existing: str, note: str) -> str:
-    return existing if not note or note in existing.split("\n\n") else "\n\n".join((existing, note)).strip()
+    return (
+        existing
+        if not note or note in existing.split("\n\n")
+        else "\n\n".join((existing, note)).strip()
+    )
 
 
 def _artifact_signature(artifact: object) -> tuple[object, ...]:
@@ -3080,6 +3143,7 @@ async def _reanalyze_once(
         evidence_observed = _observed_text(
             merged_results, None, eligible_support_ids=eligible_support_ids
         )
+        known_issue_matches = match_runai_known_issues(state.known_issues, observed)
         candidates = _promote_signature_cause(
             candidates,
             _xid_codes_from_results(
@@ -3087,11 +3151,14 @@ async def _reanalyze_once(
                 _alert_text(state.request),
                 eligible_support_ids=eligible_support_ids,
             ),
-            match_runai_known_issues(state.known_issues, observed),
+            known_issue_matches,
             _gate_lifecycle_symptoms(
                 match_failure_mode_symptoms(state.failure_modes, observed), lifecycle
             ),
             evidence_text=evidence_observed,
+            known_issue_support=_known_issue_signature_support(
+                merged_results, known_issue_matches, eligible_support_ids
+            ),
         )
         if target.refuted_family and not _fresh_results_support_family(
             target.refuted_family,
@@ -4704,6 +4771,60 @@ def _promotable(matched: list[str], family: str) -> bool:
     return len(matched) >= 2 or any(_specific_keyword(k) for k in matched)
 
 
+def _known_issue_signature_support(
+    results: list[CollectorResult],
+    matches: list[dict[str, Any]],
+    eligible_support_ids: set[str] | None,
+) -> dict[str, dict[str, list[str]]]:
+    """Resolve each promoted known issue to the exact scoped evidence cards."""
+    from app.services.evidence_blackboard import source_independence_group
+    from app.services.root_cause_ranking import COLLECTOR_TEXT_DROP_KEYS
+
+    support: dict[str, dict[str, list[str]]] = {}
+    for entry in matches:
+        issue = str(entry.get("issue") or "")
+        keywords = [str(item) for item in entry.get("matched_keywords") or []]
+        if not issue or not keywords:
+            continue
+        evidence_ids: list[str] = []
+        agents: list[str] = []
+        groups: list[str] = []
+        for result in results:
+            drop_keys = COLLECTOR_TEXT_DROP_KEYS.get(str(result.agent or ""))
+            for item in result.artifacts:
+                evidence_id = str(getattr(item, "evidence_id", "") or "")
+                if not evidence_id or not _artifact_is_scoped_support(
+                    item, eligible_support_ids=eligible_support_ids
+                ):
+                    continue
+                semantic_text = " ".join(
+                    part
+                    for part in (
+                        str(getattr(item, "summary", "") or ""),
+                        _evidence_leaf_text(
+                            getattr(item, "result", None),
+                            limit=2000,
+                            drop_keys=drop_keys,
+                        ),
+                    )
+                    if part
+                ).casefold()
+                if not _keyword_hits(semantic_text, keywords)[0]:
+                    continue
+                evidence_ids.append(evidence_id)
+                agent = str(getattr(item, "agent", "") or result.agent or "")
+                agents.append(agent)
+                source = str(getattr(item, "source", "") or agent)
+                groups.append(source_independence_group(source))
+        if evidence_ids:
+            support[issue] = {
+                "evidence_ids": list(dict.fromkeys(evidence_ids)),
+                "agents": list(dict.fromkeys(agents)),
+                "groups": list(dict.fromkeys(groups)),
+            }
+    return support
+
+
 def _promote_signature_cause(
     candidates: list[RankedCause],
     xid_codes: list[int],
@@ -4711,6 +4832,7 @@ def _promote_signature_cause(
     symptom_matches: list[tuple[str, dict]],
     *,
     evidence_text: str = "",
+    known_issue_support: Mapping[str, dict[str, list[str]]] | None = None,
 ) -> list[RankedCause]:
     """A specific signature names the headline family; the keyword ranker is only
     the no-signal fallback. Precedence: NVIDIA XID (dispositive) > known-issue
@@ -4723,10 +4845,20 @@ def _promote_signature_cause(
         family = str(entry.get("family") or "")
         if not family:
             continue
+        issue = str(entry.get("issue") or "")
+        support = (known_issue_support or {}).get(issue, {})
+        support_ids = support.get("evidence_ids") or []
+        support_agents = support.get("agents") or []
+        support_groups = support.get("groups") or []
         if family == top_family:
             return [
                 _with_signature_support(
-                    candidates[0], f"matched known-issue signature: {entry.get('issue')}", 8.0
+                    candidates[0],
+                    f"matched known-issue signature: {issue}",
+                    8.0,
+                    support_evidence_ids=support_ids,
+                    evidence_agents=support_agents,
+                    independent_source_groups=support_groups,
                 ),
                 *candidates[1:],
             ]
@@ -4735,18 +4867,27 @@ def _promote_signature_cause(
             continue
         if family not in FAMILIES and not _keyword_hits(evidence_text, matched_keywords)[0]:
             continue
-        rationale = f"matched known-issue signature: {entry.get('issue')}"
+        rationale = f"matched known-issue signature: {issue}"
         existing = next((candidate for candidate in candidates if candidate.family == family), None)
         lead = (
-            _with_signature_support(existing, rationale, 8.0)
+            _with_signature_support(
+                existing,
+                rationale,
+                8.0,
+                support_evidence_ids=support_ids,
+                evidence_agents=support_agents,
+                independent_source_groups=support_groups,
+            )
             if existing is not None
             else RankedCause(
                 family=family,
                 confidence="medium",
                 score=8.0,
                 rationale=[rationale],
-                evidence_agents=["signature"],
+                evidence_agents=sorted({"signature", *support_agents}),
                 trigger=_trigger_for_family(candidates, family),
+                support_evidence_ids=list(dict.fromkeys(support_ids)),
+                independent_source_groups=list(dict.fromkeys(support_groups)),
                 score_breakdown=[
                     {
                         "stage": "signature",
@@ -4811,7 +4952,13 @@ def _trigger_for_family(candidates: list[RankedCause], family: str) -> str:
 
 
 def _with_signature_support(
-    candidate: RankedCause, rationale: str, score_floor: float
+    candidate: RankedCause,
+    rationale: str,
+    score_floor: float,
+    *,
+    support_evidence_ids: list[str] | None = None,
+    evidence_agents: list[str] | None = None,
+    independent_source_groups: list[str] | None = None,
 ) -> RankedCause:
     rationale_items = [*candidate.rationale]
     if rationale not in rationale_items:
@@ -4839,7 +4986,20 @@ def _with_signature_support(
         ),
         score=score,
         rationale=rationale_items,
-        evidence_agents=sorted({*candidate.evidence_agents, "signature"}),
+        evidence_agents=sorted(
+            {*candidate.evidence_agents, "signature", *(evidence_agents or [])}
+        ),
+        support_evidence_ids=list(
+            dict.fromkeys([*candidate.support_evidence_ids, *(support_evidence_ids or [])])
+        ),
+        independent_source_groups=list(
+            dict.fromkeys(
+                [
+                    *candidate.independent_source_groups,
+                    *(independent_source_groups or []),
+                ]
+            )
+        ),
         score_breakdown=[
             *candidate.score_breakdown,
             {
