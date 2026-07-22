@@ -30,7 +30,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 
 | Variable | Purpose |
 | --- | --- |
-| `PORT` | Backend/Agent HTTP port; Helm maps this from the component service port |
+| `PORT` | Backend HTTP port; Helm maps this from the component service port. The agent's port is fixed by its container command |
 | `AGENT_URL` | Backend to Agent URL, default `http://localhost:8000` |
 | `KNOWLEDGE_VALIDATOR_URL` | Backend approval-time Agent validator base URL. The backend appends `/knowledge/validate`; Helm defaults this to the in-cluster Agent service. |
 | `BACKEND_URL` | Agent to Backend URL used for fire-and-forget analysis progress events. Empty disables progress POSTs; Helm points it at the backend service by default |
@@ -46,7 +46,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `SLACK_CHANNEL_ID` | Channel the backend posts incident-analysis summaries into. Chart secret key `slackChannelId` |
 | `SLACK_APP_TOKEN` | Optional app-level token (`xapp-`, `connections:write` scope). Enables the in-message Re-analyze button: clicks arrive over Socket Mode (outbound WebSocket), so no public endpoint is needed. This token is not valid for `chat.postMessage`; keep it separate from `SLACK_BOT_TOKEN`. Requires Socket Mode + Interactivity toggled on in the Slack app settings. Chart secret key `slackAppToken` |
 | `DASHBOARD_URL` | Optional external dashboard URL; when set, Slack messages add an "Open Incident" deep-link button (Helm value `backend.env.dashboardUrl`) |
-| `LOG_LEVEL` | Agent log level, default `info` |
+| `LOG_LEVEL` | Agent log level. Code default `info`; the Helm chart ships `warning` |
 | `LANGUAGE` | Backend/Agent response language, `en` or `ko` |
 | `KUBERNETES_API_URL` | In-cluster Kubernetes API URL, default `https://kubernetes.default.svc` |
 | `KUBERNETES_TOKEN_PATH` | Service account token path for in-cluster Kubernetes collection |
@@ -100,7 +100,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `NVIDIA_API_KEY` | NIM key for NeMo Agent Toolkit workflows |
 | `LLM_BASE_URL` | OpenAI-compatible base URL for the NAT-managed default LLM and the operator chat copilot |
 | `LLM_MODEL` | OpenAI-compatible model name, for example `auto-router` |
-| `LLM_MODEL_PLANNER` / `LLM_MODEL_INVESTIGATION` / `LLM_MODEL_DRILLDOWN` / `LLM_MODEL_SELF_CHECK` / `LLM_MODEL_SYNTHESIS` / `LLM_MODEL_CHAT` / `LLM_MODEL_INSIGHT` / `LLM_MODEL_CRITIC` | Optional stage-specific model overrides. Empty values fall back to `LLM_MODEL` |
+| `LLM_MODEL_PLANNER` / `LLM_MODEL_INVESTIGATION` / `LLM_MODEL_DRILLDOWN` / `LLM_MODEL_SELF_CHECK` / `LLM_MODEL_SYNTHESIS` / `LLM_MODEL_CHAT` / `LLM_MODEL_INSIGHT` | Optional stage-specific model overrides. Empty values fall back to `LLM_MODEL` |
 | `LLM_API_KEY` | OpenAI-compatible API key secret; enables conversational chat answers when all three LLM vars are set |
 | `LLM_REQUEST_TIMEOUT_SECONDS` | LLM request timeout per call (chat and direct fallback reasoning), default `300`, `0` = unlimited |
 | `LLM_PRICING_JSON` | Optional JSON map for estimated LLM cost, keyed by model with `prompt_per_mtok` and `completion_per_mtok` values |

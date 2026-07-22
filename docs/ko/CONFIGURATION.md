@@ -29,7 +29,7 @@ flowchart LR
 
 | Variable | Purpose |
 | --- | --- |
-| `PORT` | 백엔드/에이전트 HTTP 포트. Helm은 이를 컴포넌트 서비스 포트에서 매핑합니다 |
+| `PORT` | 백엔드 HTTP 포트. Helm은 이를 컴포넌트 서비스 포트에서 매핑합니다. 에이전트 포트는 컨테이너 커맨드에 고정돼 있습니다 |
 | `AGENT_URL` | 백엔드에서 에이전트로 접근하는 URL. 기본값 `http://localhost:8000` |
 | `BACKEND_URL` | 에이전트가 분석 진행 이벤트를 fire-and-forget 방식으로 백엔드에 보내기 위한 URL입니다. 비어 있으면 progress POST가 비활성화되며, Helm은 기본적으로 백엔드 서비스 주소로 설정합니다 |
 | `AGENT_REQUEST_TIMEOUT_SECONDS` | 에이전트 `/analyze` 및 `/chat` 요청에 대한 백엔드 타임아웃. 기본값 `1560`(에이전트의 `ANALYSIS_DEADLINE_SECONDS`보다 커야 합니다) |
@@ -39,7 +39,7 @@ flowchart LR
 | `SLACK_CHANNEL_ID` | 백엔드가 인시던트 분석 요약을 게시하는 채널. 차트 시크릿 키 `slackChannelId` |
 | `SLACK_APP_TOKEN` | 선택 사항인 앱 레벨 토큰(`xapp-`, `connections:write` 스코프). 메시지 내 Re-analyze 버튼을 활성화합니다. 클릭은 Socket Mode(아웃바운드 WebSocket)로 전달되므로 공개 엔드포인트가 필요 없습니다. 이 토큰은 `chat.postMessage`에 유효하지 않으므로 `SLACK_BOT_TOKEN`과 분리해 유지하십시오. Slack 앱 설정에서 Socket Mode와 Interactivity를 켜야 합니다. 차트 시크릿 키 `slackAppToken` |
 | `DASHBOARD_URL` | 선택 사항인 외부 대시보드 URL. 설정하면 Slack 메시지에 "Open Incident" 딥링크 버튼이 추가됩니다(Helm 값 `backend.env.dashboardUrl`) |
-| `LOG_LEVEL` | 에이전트 로그 레벨. 기본값 `info` |
+| `LOG_LEVEL` | 에이전트 로그 레벨. 코드 기본값 `info`, Helm 차트 기본값은 `warning` |
 | `LANGUAGE` | 백엔드/에이전트 응답 언어. `en` 또는 `ko` |
 | `KUBERNETES_API_URL` | 클러스터 내부 Kubernetes API URL. 기본값 `https://kubernetes.default.svc` |
 | `KUBERNETES_TOKEN_PATH` | 클러스터 내부 Kubernetes 수집을 위한 서비스 계정 토큰 경로 |
@@ -93,7 +93,7 @@ flowchart LR
 | `NVIDIA_API_KEY` | NeMo Agent Toolkit 워크플로용 NIM 키 |
 | `LLM_BASE_URL` | NAT가 관리하는 기본 LLM과 운영자 채팅 코파일럿용 OpenAI 호환 기본 URL |
 | `LLM_MODEL` | OpenAI 호환 모델 이름(예: `auto-router`) |
-| `LLM_MODEL_PLANNER` / `LLM_MODEL_INVESTIGATION` / `LLM_MODEL_DRILLDOWN` / `LLM_MODEL_SELF_CHECK` / `LLM_MODEL_SYNTHESIS` / `LLM_MODEL_CHAT` / `LLM_MODEL_INSIGHT` / `LLM_MODEL_CRITIC` | 단계별 모델 override. 비어 있으면 `LLM_MODEL`로 폴백합니다 |
+| `LLM_MODEL_PLANNER` / `LLM_MODEL_INVESTIGATION` / `LLM_MODEL_DRILLDOWN` / `LLM_MODEL_SELF_CHECK` / `LLM_MODEL_SYNTHESIS` / `LLM_MODEL_CHAT` / `LLM_MODEL_INSIGHT` | 단계별 모델 override. 비어 있으면 `LLM_MODEL`로 폴백합니다 |
 | `LLM_API_KEY` | OpenAI 호환 API 키 시크릿. 세 가지 LLM 변수가 모두 설정되면 대화형 채팅 응답이 활성화됩니다 |
 | `LLM_REQUEST_TIMEOUT_SECONDS` | 호출당 LLM 요청 타임아웃(채팅과 직접 폴백 추론). 기본값 `300`, `0` = 무제한 |
 | `LLM_PRICING_JSON` | 모델별 추정 LLM 비용을 위한 선택 사항 JSON map. 각 모델에 `prompt_per_mtok`, `completion_per_mtok` 값을 둡니다 |
