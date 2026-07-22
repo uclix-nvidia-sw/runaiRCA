@@ -58,6 +58,118 @@ async def test_complete_json_uses_nat_client_and_records_usage() -> None:
 
 
 @pytest.mark.asyncio
+async def test_uncapped_call_gets_default_max_tokens(monkeypatch) -> None:
+    # A reasoning model with no ceiling thinks until the per-call timeout and
+    # burns the analysis deadline — every uncapped call must inherit the cap.
+    settings = replace(_settings(), llm_default_max_tokens=16384)
+    captured = {}
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        captured["json_body"] = json_body
+        return SimpleNamespace(
+            ok=True, data={"choices": [{"message": {"content": '{"ok": true}'}}], "usage": {}}
+        )
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    await llm.complete_json(settings, system="system", user="user", model="stage-model")
+    assert captured["json_body"]["max_tokens"] == 16384
+
+    # NAT path inherits the same cap (applied before the transport branch).
+    client = FakeLangchainClient()
+    token = llm.set_nat_client(client)
+    try:
+        await llm.complete_json(settings, system="system", user="user")
+    finally:
+        llm.reset_nat_client(token)
+    assert client.bound["max_tokens"] == 16384
+
+    # 0 restores uncapped behaviour.
+    captured.clear()
+    await llm.complete_json(
+        replace(settings, llm_default_max_tokens=0),
+        system="system",
+        user="user",
+        model="stage-model",
+    )
+    assert "max_tokens" not in captured["json_body"]
+
+
+@pytest.mark.asyncio
+async def test_length_truncated_reply_retries_with_doubled_cap(monkeypatch) -> None:
+    # finish_reason=length (reasoning ate the cap / JSON cut mid-answer) must
+    # trigger ONE retry with a doubled max_tokens instead of silently returning
+    # a truncated reply that parses as nothing.
+    settings = _settings()
+    calls = []
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        calls.append(dict(json_body))
+        if len(calls) == 1:
+            return SimpleNamespace(
+                ok=True,
+                data={
+                    "choices": [
+                        {"finish_reason": "length", "message": {"content": '{"truncat'}}
+                    ],
+                    "usage": {},
+                },
+            )
+        return SimpleNamespace(
+            ok=True,
+            data={
+                "choices": [
+                    {"finish_reason": "stop", "message": {"content": '{"ok": true}'}}
+                ],
+                "usage": {},
+            },
+        )
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    data = await llm.complete_json(settings, system="system", user="user", model="stage-model")
+    assert data == {"ok": True}
+    assert len(calls) == 2
+    assert calls[1]["max_tokens"] == calls[0]["max_tokens"] * 2
+
+
+@pytest.mark.asyncio
+async def test_nat_length_truncation_falls_back_to_http(monkeypatch) -> None:
+    # A NAT reply cut by the cap is unusable — it must hand off to the direct
+    # HTTP path (which owns the doubled-cap retry), not return truncated text.
+    settings = _settings()
+
+    class TruncatedClient(FakeLangchainClient):
+        async def ainvoke(self, messages):
+            return SimpleNamespace(
+                content='{"truncat',
+                usage_metadata={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+                response_metadata={"finish_reason": "length"},
+            )
+
+    captured = {}
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        captured["json_body"] = json_body
+        return SimpleNamespace(
+            ok=True,
+            data={
+                "choices": [
+                    {"finish_reason": "stop", "message": {"content": '{"ok": true}'}}
+                ],
+                "usage": {},
+            },
+        )
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    token = llm.set_nat_client(TruncatedClient())
+    try:
+        data = await llm.complete_json(settings, system="system", user="user")
+    finally:
+        llm.reset_nat_client(token)
+    assert data == {"ok": True}
+    assert captured["json_body"]["model"] == "default-model"
+
+
+@pytest.mark.asyncio
 async def test_explicit_model_override_uses_http(monkeypatch) -> None:
     settings = _settings()
     client = FakeLangchainClient()

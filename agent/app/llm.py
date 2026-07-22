@@ -248,6 +248,11 @@ async def complete_with_error(
     remaining = _analysis_time_remaining()
     if remaining is not None and remaining <= 0:
         return None, "analysis deadline exhausted before LLM call"
+    default_cap = int(getattr(settings, "llm_default_max_tokens", 0) or 0)
+    if max_tokens is None and default_cap > 0:
+        # Bound uncapped calls: a reasoning model with no ceiling thinks until
+        # the per-call timeout and starves the rest of the analysis deadline.
+        max_tokens = default_cap
     # NAT owns only the default app model; explicit stage model overrides stay on HTTP.
     # A NAT reply with no usable text falls back to the direct HTTP path (owner
     # decision after the langchain validation run: one empty reply must not
@@ -286,51 +291,74 @@ async def complete_with_error(
     }
     if max_tokens:
         payload["max_tokens"] = max_tokens
-    response = None
-    for attempt in range(3):
-        timeout = _request_timeout(settings)
-        if timeout is None or timeout <= 0:
-            return None, "analysis deadline exhausted during LLM retries"
-        response = await post_json(
-            url=f"{settings.llm_base_url}/chat/completions",
-            timeout_seconds=timeout,
-            json_body=payload,
-            headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-        )
-        if response.ok or response.status_code not in _RETRY_STATUSES or attempt == 2:
-            break
-        delay = (0.25 * (2**attempt)) + random.uniform(0, 0.1)
-        remaining = _analysis_time_remaining()
-        if remaining is not None:
-            if remaining <= 0:
+    # finish_reason=length means the completion cap cut the reply: a reasoning
+    # model spends the cap on its chain-of-thought first, so the answer arrives
+    # empty or truncated mid-JSON and the run silently degrades to the
+    # deterministic fallback. One retry with a doubled cap turns that into a
+    # slower success; the analysis deadline still bounds the total spend.
+    for budget_round in range(2):
+        response = None
+        for attempt in range(3):
+            timeout = _request_timeout(settings)
+            if timeout is None or timeout <= 0:
                 return None, "analysis deadline exhausted during LLM retries"
-            delay = min(delay, remaining)
-        await asyncio.sleep(delay)
-    if not response.ok:
-        _record_failed_call(selected_model)
-        detail = " ".join(str(response.error or "").split())[:200]
+            response = await post_json(
+                url=f"{settings.llm_base_url}/chat/completions",
+                timeout_seconds=timeout,
+                json_body=payload,
+                headers={"Authorization": f"Bearer {settings.llm_api_key}"},
+            )
+            if response.ok or response.status_code not in _RETRY_STATUSES or attempt == 2:
+                break
+            delay = (0.25 * (2**attempt)) + random.uniform(0, 0.1)
+            remaining = _analysis_time_remaining()
+            if remaining is not None:
+                if remaining <= 0:
+                    return None, "analysis deadline exhausted during LLM retries"
+                delay = min(delay, remaining)
+            await asyncio.sleep(delay)
+        if not response.ok:
+            _record_failed_call(selected_model)
+            detail = " ".join(str(response.error or "").split())[:200]
+            return None, _with_nat_failure(
+                f"HTTP {response.status_code or '?'} {detail}".strip(), nat_failure
+            )
+        if not isinstance(response.data, dict):
+            _record_failed_call(selected_model)
+            return None, _with_nat_failure(
+                "unexpected response shape from the LLM endpoint", nat_failure
+            )
+        _record_usage(selected_model, response.data)
+        if (
+            budget_round == 0
+            and _openai_finish_reason(response.data) == "length"
+            and payload.get("max_tokens")
+        ):
+            payload["max_tokens"] = int(payload["max_tokens"]) * 2
+            _log.warning(
+                "LLM reply truncated at max_tokens "
+                "(purpose=%s, model=%s); retrying with max_tokens=%s",
+                purpose or "unspecified",
+                selected_model,
+                payload["max_tokens"],
+            )
+            continue
+        choices = response.data.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            message = choices[0].get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, str) and content.strip():
+                    cleaned = strip_reasoning(content)
+                    if cleaned:
+                        return cleaned, None
+                    return None, _with_nat_failure(
+                        "reasoning-only reply (no content outside <think>)",
+                        nat_failure,
+                    )
         return None, _with_nat_failure(
-            f"HTTP {response.status_code or '?'} {detail}".strip(), nat_failure
+            _openai_unusable_reply_error(response.data), nat_failure
         )
-    if not isinstance(response.data, dict):
-        _record_failed_call(selected_model)
-        return None, _with_nat_failure(
-            "unexpected response shape from the LLM endpoint", nat_failure
-        )
-    _record_usage(selected_model, response.data)
-    choices = response.data.get("choices")
-    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-        message = choices[0].get("message")
-        if isinstance(message, dict):
-            content = message.get("content")
-            if isinstance(content, str) and content.strip():
-                cleaned = strip_reasoning(content)
-                if cleaned:
-                    return cleaned, None
-                return None, _with_nat_failure(
-                    "reasoning-only reply (no content outside <think>)",
-                    nat_failure,
-                )
     return None, _with_nat_failure(
         _openai_unusable_reply_error(response.data), nat_failure
     )
@@ -342,12 +370,16 @@ def _with_nat_failure(direct_error: str, nat_failure: str) -> str:
     return f"nat: {nat_failure}; direct_http: {direct_error}"
 
 
+def _openai_finish_reason(data: dict[str, Any]) -> Any:
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        return choices[0].get("finish_reason")
+    return None
+
+
 def _openai_unusable_reply_error(data: dict[str, Any]) -> str:
     """Preserve provider finish/usage metadata when a successful HTTP reply has no text."""
-    choices = data.get("choices")
-    finish_reason = None
-    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-        finish_reason = choices[0].get("finish_reason")
+    finish_reason = _openai_finish_reason(data)
     usage = data.get("usage")
     completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
     return (
@@ -408,15 +440,22 @@ async def _complete_with_nat_client(
         return None, "NAT LLM client failed"
     usage = _langchain_usage(response)
     _record_usage(model, {"usage": usage} if usage else {})
-    text = _langchain_text(response)
-    if text:
-        return text, None
-    # Empty content with usage recorded = the model DID reply. The classic cause
-    # is a reasoning model spending the whole completion budget on reasoning
-    # tokens (finish_reason=length, content=""), so name it in the error.
     meta = getattr(response, "response_metadata", None)
     finish = meta.get("finish_reason") if isinstance(meta, dict) else None
     completion = (usage or {}).get("completion_tokens")
+    text = _langchain_text(response)
+    if text and finish != "length":
+        return text, None
+    if text:
+        # Truncated mid-answer by the completion cap. Report it as unusable so
+        # the direct HTTP fallback runs — that path retries with a doubled cap.
+        return None, (
+            f"reply truncated at max_tokens "
+            f"(finish_reason=length, completion_tokens={completion})"
+        )
+    # Empty content with usage recorded = the model DID reply. The classic cause
+    # is a reasoning model spending the whole completion budget on reasoning
+    # tokens (finish_reason=length, content=""), so name it in the error.
     return None, (
         f"empty content from the NAT LLM client "
         f"(finish_reason={finish}, completion_tokens={completion})"
