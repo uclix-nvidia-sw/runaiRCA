@@ -2276,6 +2276,7 @@ async def harness_stage(state: PipelineState) -> PipelineState:
             state.root_cause_candidates,
             verdict,
             historical_reanalysis=_is_resolved_reanalysis(state.request),
+            language=getattr(state.settings, "language", "en"),
         )
         verdict = evaluate(
             response,

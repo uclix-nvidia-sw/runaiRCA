@@ -461,6 +461,24 @@ def test_abstain_preserves_leading_family_as_a_low_confidence_hypothesis() -> No
     assert "rather than guessing" not in response.analysis_detail
 
 
+def test_abstain_renders_korean_when_language_ko() -> None:
+    response = _response()
+    candidates = [
+        RankedCause("gpu_hardware_error", "medium", 5, evidence_agents=["loki"])
+    ]
+    verdict = evaluate(response, [], candidates)
+
+    abstain(response, candidates, verdict, language="ko")
+
+    # Korean headings + note, and no English fallback strings leaking through.
+    assert "## 평가" in response.analysis_detail
+    assert "## 필요한 다음 점검" in response.analysis_detail
+    assert "낮은 확신도" in response.analysis_summary
+    assert "## Assessment" not in response.analysis_detail
+    # The abstain LOGIC is unchanged — still flips to insufficient_evidence.
+    assert response.root_cause_family == "insufficient_evidence"
+
+
 def test_abstain_without_a_candidate_does_not_invent_a_family() -> None:
     response = _response()
     candidates = [RankedCause("insufficient_evidence", "low", 0.0)]
