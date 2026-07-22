@@ -306,6 +306,99 @@ def test_scoped_loki_xid_can_supply_signature_evidence_with_production_gate():
     assert out["caveat"] == ""
 
 
+def test_noncanonical_family_fact_can_support_deterministic_self_check():
+    finding = AlertAnalysisArtifact(
+        evidence_id="E-quota-event",
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_warning_events",
+        status="ok",
+        summary="PodGroup preempted because requested GPUs exceed available quota",
+        result={
+            "events": [
+                {
+                    "type": "Warning",
+                    "reason": "PreemptLowerPriority",
+                    "message": "PodGroup requested GPUs exceed available quota",
+                }
+            ],
+            "observation": {
+                "predicate": "kubernetes_warning_events:podgroup",
+                "polarity": "present",
+                "coverage": "scoped",
+            },
+        },
+    )
+    top = RankedCause(
+        family="runai_scheduling_quota",
+        confidence="medium",
+        score=3.0,
+        evidence_agents=["kubernetes"],
+    )
+
+    out = _run(
+        refute_top_cause(
+            make_settings(),
+            top,
+            [
+                CollectorResult(
+                    agent="kubernetes",
+                    status="ok",
+                    summary="PodGroup scheduling warning",
+                    artifacts=[finding],
+                )
+            ],
+            evidence_eligibility={
+                "E-quota-event": EvidenceEligibility(True, True, True)
+            },
+        )
+    )
+
+    assert out["confidence"] == "medium"
+    assert out["refuted"] is False
+    assert out["caveat"] == ""
+
+
+def test_scoped_family_contradiction_refutes_without_llm():
+    finding = AlertAnalysisArtifact(
+        evidence_id="E-no-pressure",
+        agent="kubernetes",
+        source="kubernetes",
+        type="node_condition",
+        status="ok",
+        summary="DiskPressure=False throughout the incident window",
+        result={
+            "observation": {
+                "predicate": "node_condition:diskpressure",
+                "polarity": "absent",
+                "coverage": "scoped",
+            },
+        },
+    )
+
+    out = _run(
+        refute_top_cause(
+            make_settings(),
+            _top(confidence="high"),
+            [
+                CollectorResult(
+                    agent="kubernetes",
+                    status="ok",
+                    summary="Node pressure condition absent",
+                    artifacts=[finding],
+                )
+            ],
+            evidence_eligibility={
+                "E-no-pressure": EvidenceEligibility(False, True, True)
+            },
+        )
+    )
+
+    assert out["confidence"] == "medium"
+    assert out["refuted"] is True
+    assert out["caveat"]
+
+
 def test_insufficient_evidence_family_is_left_alone():
     settings = make_settings()
     top = _top(family="insufficient_evidence", confidence="medium")

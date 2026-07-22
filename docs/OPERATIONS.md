@@ -54,8 +54,8 @@ Work down this list — the usual causes, most common first:
    it may still be inside the auto re-analysis cooldown (default 360 minutes), so
    the existing run was reused instead.
 5. **Backend hung up before the agent finished.** If
-   `AGENT_REQUEST_TIMEOUT_SECONDS` (1560) is ever set below the agent's
-   `ANALYSIS_DEADLINE_SECONDS` (1500), the backend cancels mid-analysis and the
+   `AGENT_REQUEST_TIMEOUT_SECONDS` (960) is ever set below the agent's
+   `ANALYSIS_DEADLINE_SECONDS` (900), the backend cancels mid-analysis and the
    degraded report is lost. Keep backend > agent.
 6. **Persist failure is intentional early-return.** The backend early-returns if
    it cannot persist a run; this is by design (and tested), not a bug. Check the

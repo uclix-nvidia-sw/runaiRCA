@@ -159,9 +159,9 @@ class Settings:
     # reasoning model and synthesis genuinely reasons (causal inference, evidence-role
     # discipline, confidence judgement), so it spends tokens on <think> BEFORE the
     # report — the budget must hold reasoning + the full report or the JSON truncates
-    # mid-`detail` and the run falls back to the deterministic report. Sized generously
-    # on purpose (accuracy > token cost); if synthesis logs "looks TRUNCATED", raise it.
-    llm_synthesis_max_tokens: int = 32768
+    # mid-`detail` and the run falls back to the deterministic report. Keep this
+    # bounded so one generation cannot monopolize the 15-minute analysis deadline.
+    llm_synthesis_max_tokens: int = 16384
     # Short collector insights still need enough room for reasoning models to
     # spend internal reasoning tokens and emit their requested 1-2 sentences.
     llm_insight_max_tokens: int = 512
@@ -313,13 +313,13 @@ def load_settings() -> Settings:
         llm_model_insight=os.getenv("LLM_MODEL_INSIGHT", "").strip(),
         llm_pricing_json=os.getenv("LLM_PRICING_JSON", "{}").strip(),
         llm_api_key=os.getenv("LLM_API_KEY", "").strip(),
-        # Generous per-call ceiling so a reasoning agent is never cut off mid-thought;
-        # the overall analysis deadline below is the real bound. (0 = unlimited.)
+        # Per-call ceiling applies to NAT and direct HTTP alike. (0 = bounded only
+        # by the overall analysis deadline.)
         llm_request_timeout_seconds=_int_env("LLM_REQUEST_TIMEOUT_SECONDS", 300),
         # Completion budget for the one-shot Korean report JSON. Reasoning models
-        # spend this on reasoning tokens FIRST — if synthesis logs empty replies
-        # (finish_reason=length), raise this rather than shrinking the prompt.
-        llm_synthesis_max_tokens=_int_env("LLM_SYNTHESIS_MAX_TOKENS", 32768),
+        # spend this on reasoning tokens first, but a 32K ceiling can consume most
+        # of a 15-minute run before emitting the JSON report.
+        llm_synthesis_max_tokens=_int_env("LLM_SYNTHESIS_MAX_TOKENS", 16384),
         llm_insight_max_tokens=_int_env("LLM_INSIGHT_MAX_TOKENS", 512),
         analysis_response_max_bytes=max(
             64 << 10,
@@ -351,7 +351,7 @@ def load_settings() -> Settings:
         # but the whole run always finishes within this budget. (0 = no overall cap.)
         # Owner priority is accuracy over latency; the backend's
         # AGENT_REQUEST_TIMEOUT_SECONDS must stay above this (deadline + 60s).
-        analysis_deadline_seconds=max(0, _int_env("ANALYSIS_DEADLINE_SECONDS", 1500)),
+        analysis_deadline_seconds=max(0, _int_env("ANALYSIS_DEADLINE_SECONDS", 900)),
         enable_rca_output_harness=_bool_env("ENABLE_RCA_OUTPUT_HARNESS", True),
         max_rca_repair_attempts=_nonnegative_int_env("MAX_RCA_REPAIR_ATTEMPTS", 3),
         rca_harness_pass_score=max(0, min(100, _int_env("RCA_HARNESS_PASS_SCORE", 70))),

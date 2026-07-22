@@ -191,11 +191,11 @@ backend:
     knowledgeValidatorUrl: ""
     language: ko
     databaseConnectTimeoutSeconds: 5
-    # MUST exceed the agent's analysisDeadlineSeconds (1500): the agent works up to
+    # MUST exceed the agent's analysisDeadlineSeconds (900): the agent works up to
     # that budget and then returns a graceful degraded report — if the backend hangs
     # up first, the report is lost and the alert gets a useless fallback instead.
-    agentRequestTimeoutSeconds: 1560
-    manualAgentRequestTimeoutSeconds: 1560
+    agentRequestTimeoutSeconds: 960
+    manualAgentRequestTimeoutSeconds: 960
     # Defense-in-depth ceiling for the Agent HTTP response. The Agent compacts
     # responses to analysisResponseMaxBytes before sending them; this larger cap
     # also provides headroom during rolling upgrades from older Agent images.
@@ -466,9 +466,9 @@ agent:
     # domain's read-only tools to deepen its own evidence. Only active when an
     # LLM is configured; each step is extra LLM calls (accuracy over latency).
     enableAgentDrilldown: true
-    # Overall hard cap per analysis: generous per-step time, but the whole run always
-    # finishes within this budget (default 25 min). 0 = no overall cap.
-    analysisDeadlineSeconds: 1500
+    # Overall hard cap per analysis. Finalization time is reserved before optional
+    # drill-down so a slow synthesis cannot consume more than 15 minutes end-to-end.
+    analysisDeadlineSeconds: 900
     # Complete /analyze JSON budget. Oversized raw evidence and internal traces
     # are compacted before the Korean RCA report text. Keep below the backend cap.
     analysisResponseMaxBytes: 1572864
@@ -528,6 +528,9 @@ agent:
     llmModelSynthesis: ""
     llmModelChat: ""
     llmModelInsight: ""
+    # Final Korean JSON budget. 16K leaves room for reasoning plus a one-page
+    # report without allowing a 32K completion to monopolize the run deadline.
+    llmSynthesisMaxTokens: 16384
     # Output budget for 1-2 sentence collector insights. Reasoning models may
     # consume part of this internally before emitting visible content.
     llmInsightMaxTokens: 512

@@ -259,7 +259,7 @@ def evaluate(
                     continue
             semantically_valid.append(link)
         links = semantically_valid
-    else:
+    elif str(getattr(top, "novelty", "")) != "open_world":
         semantically_valid = []
         for link in links:
             artifact = by_id.get(link.fact_id)
@@ -333,9 +333,11 @@ def evaluate(
             )
         ),
         "invalid_evidence_links": bool(link_errors),
-        "unresolved_contradiction": bool(
-            not insufficient and confidence == "high" and contradiction_ids
-        ),
+        # A direct scoped contradiction is unresolved regardless of whether an
+        # earlier stage labelled the candidate medium or high.  Restricting this
+        # gate to high let contradicted medium conclusions retain remediation
+        # authority.
+        "unresolved_contradiction": bool(not insufficient and contradiction_ids),
         "unsafe_action_without_guardrail": _unsafe_action_without_guardrail(
             response.analysis_detail
         ),
@@ -467,6 +469,7 @@ def abstain(
     *,
     historical_reanalysis: bool = False,
     language: str = "en",
+    next_check: str = "",
 ) -> None:
     """Return an unresolved RCA without discarding a useful working hypothesis.
 
@@ -554,6 +557,7 @@ def abstain(
                 "before selecting a family.\n"
             )
     if ko:
+        specific_check = f"- Self-check 다음 확인: {next_check}\n" if next_check else ""
         response.analysis_detail = (
             "## 평가\n\n"
             "수집된 증거로는 근본 원인 family를 확정할 수 없습니다. "
@@ -562,12 +566,14 @@ def abstain(
             "## 필요한 다음 점검\n\n"
             "- 대상 워크로드와 인시던트 시간창에 대해 사용 불가였거나 비어 있던 증거 소스를 "
             "다시 수집하세요.\n"
+            + specific_check
             + verification_check
             + "\n"
             "## Harness 판정\n\n"
             + "\n".join(f"- {name}" for name in verdict.failed_gates)
         )
     else:
+        specific_check = f"- Self-check next check: {next_check}\n" if next_check else ""
         response.analysis_detail = (
             "## Assessment\n\n"
             "The collected evidence does not support confirming a root-cause family. "
@@ -576,6 +582,7 @@ def abstain(
             "## Required Next Checks\n\n"
             "- Re-run the unavailable or empty evidence source for the affected workload "
             "and incident window.\n"
+            + specific_check
             + verification_check
             + "\n"
             "## Harness Findings\n\n"

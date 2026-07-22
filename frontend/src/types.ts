@@ -183,6 +183,7 @@ export type IncidentDetail = Incident & {
   analysis_summary: string;
   analysis_detail: string;
   analysis_quality: string;
+  root_cause_family?: string;
   capabilities: Record<string, string>;
   missing_data: string[];
   warnings: string[];
@@ -191,6 +192,7 @@ export type IncidentDetail = Incident & {
   similar_recent_count: number;
   token_usage?: Record<string, unknown>;
   harness?: Record<string, unknown>;
+  confidence_diagnostics?: Record<string, unknown>;
   ontology_reasoning?: Record<string, unknown>;
   feedback: FeedbackSummary;
   alerts: AlertRecord[];

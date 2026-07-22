@@ -282,9 +282,10 @@ async def test_misleading_alert_catalog_does_not_override_observed_failure(
         for response in (await direct.analyze(request), await nat.analyze(request)):
             actions = _actions_section(response)
             assert _top_family(response) == expected
-            assert (
-                "Not enough evidence for concrete actions yet" not in actions
-            ) is has_typed_support
+            if has_typed_support:
+                assert "Check the canonical evidence source" not in actions
+            else:
+                assert "Check the canonical evidence source" in actions
             for forbidden in forbidden_actions:
                 assert forbidden not in actions
     finally:
@@ -320,7 +321,7 @@ async def test_precise_signature_actions_do_not_include_unrelated_similar_fix() 
 
     actions = _actions_section(response)
     assert _top_family(response) == "workload_runtime_error"
-    assert "Not enough evidence for concrete actions yet" in actions
+    assert "Check the canonical evidence source (loki) directly" in actions
     assert "INC-OLD" not in actions
     assert "cluster-sync" not in actions
     assert "INC-OLD" in response.analysis_detail
@@ -342,7 +343,7 @@ async def test_side_signal_from_other_family_does_not_pollute_image_pull_actions
             actions = _actions_section(response)
             playbook = _playbook_section(response)
             assert _top_family(response) == "image_pull_error"
-            assert "image tag" in response.analysis_detail
+            assert "TAG does not exist" in response.analysis_detail
             assert "Reduce batch size" not in actions
             assert "activation checkpointing" not in actions
             assert "CUDA Out Of Memory" not in playbook
@@ -460,7 +461,7 @@ async def test_admission_webhook_x509_is_not_registry_tls() -> None:
         for response in (await direct.analyze(request), await nat.analyze(request)):
             actions = _actions_section(response)
             assert _top_family(response) == "k8s_control_plane_error"
-            assert "Not enough evidence for concrete actions yet" in actions
+            assert "Check the canonical evidence source (kubernetes) directly" in actions
             assert "registry's TLS certificate" not in actions
     finally:
         await direct.close_engine()

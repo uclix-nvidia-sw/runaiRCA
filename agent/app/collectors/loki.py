@@ -14,6 +14,7 @@ from app.collectors.base import (
     incident_time_range,
     ko_en,
     parse_incident_time,
+    salient_markers,
 )
 from app.collectors.grafana_mcp import (
     mark_grafana_datasource_failure,
@@ -918,6 +919,12 @@ def _loki_line_affirms_failure(line: str) -> bool:
     # resolved status line is the incident's cause.
     if _LOKI_NON_CAUSAL_LINE_RE.search(lowered):
         return False
+    # Kubernetes runtime reasons are often concatenated CamelCase tokens
+    # (ImagePullBackOff, ErrImagePull), so the generic word-boundary regex
+    # below cannot see them. They are still affirmative when they occur in an
+    # actual returned log line and the recovery guard above did not match.
+    if salient_markers(line):
+        return True
     return any(
         not _keyword_negated(lowered, match.start(), match.end())
         for match in _LOKI_FAILURE_TOKEN_RE.finditer(lowered)

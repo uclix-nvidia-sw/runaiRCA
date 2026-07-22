@@ -40,6 +40,7 @@ from app.mcp_client import (
     mcp_tool_raw_text,
     mcp_tool_text,
 )
+from app.services.query_memory import domain_query_key
 
 # pods/exec policy: DENYLIST. The drill-down runs read-only diagnostics of its
 # own choosing — nvidia-smi, ping, cat /proc/*, ps, ss, ip addr, dig, curl, df,
@@ -298,8 +299,10 @@ def pod_inspection_repr(namespace: str, pod: str) -> str:
     ns = f" -n {shlex.quote(namespace)}" if namespace else ""
     quoted_pod = shlex.quote(pod)
     return (
-        f"kubectl get pod {quoted_pod}{ns} -o yaml; "
-        f"kubectl describe pod {quoted_pod}{ns}"
+        # Put the requested describe command first so narrow/truncated UI rows
+        # cannot make the execution look like another compact `kubectl get`.
+        f"kubectl describe pod {quoted_pod}{ns}; "
+        f"kubectl get pod {quoted_pod}{ns} -o yaml"
     )
 
 
@@ -5976,7 +5979,8 @@ def _followup_queries(details: dict, prior: list[dict], namespace: str) -> list[
 
 
 def _followup_key(q: dict) -> tuple:
-    return (q["kind"], q.get("namespace", ""), q.get("name", ""), q.get("label_selector", ""))
+    kind = resolve_read_kind(str(q.get("kind") or "")) or str(q.get("kind") or "")
+    return (kind, q.get("namespace", ""), q.get("name", ""), q.get("label_selector", ""))
 
 
 async def k8s_followup(
@@ -5985,6 +5989,7 @@ async def k8s_followup(
     target: AnalysisTarget,
     max_rounds: int = 3,
     max_reads: int = 8,
+    query_memory: object | None = None,
 ) -> list[dict]:
     """Iteratively pull follow-up k8s evidence per the debug flowchart and attach
     each read as a `followup_query` artifact on the kubernetes result. Best-effort,
@@ -5993,7 +5998,36 @@ async def k8s_followup(
         return []
     details = getattr(kubernetes_result, "details", {}) or {}
     namespace = getattr(target, "namespace", "") or ""
-    done: set = set()
+    # The base collector already reads target-scoped Warning Events.  Treat
+    # those and earlier ad-hoc/follow-up cards as completed flowchart steps so
+    # the deterministic branch does not immediately issue the same GET again.
+    done: set[tuple] = set()
+    for item in getattr(kubernetes_result, "artifacts", []) or []:
+        if str(getattr(item, "status", "") or "") != "ok":
+            continue
+        artifact_type = str(getattr(item, "type", "") or "")
+        if artifact_type == "kubernetes_warning_events" and namespace:
+            done.add(_followup_key({"kind": "events", "namespace": namespace}))
+            continue
+        payload = getattr(item, "result", None)
+        if artifact_type not in {
+            "adhoc_query",
+            "followup_query",
+            "ontology_probe",
+            "drilldown_query",
+        }:
+            continue
+        if isinstance(payload, dict) and payload.get("kind"):
+            done.add(
+                _followup_key(
+                    {
+                        "kind": str(payload.get("kind") or ""),
+                        "namespace": str(payload.get("namespace") or ""),
+                        "name": str(payload.get("name") or ""),
+                        "label_selector": str(payload.get("label_selector") or ""),
+                    }
+                )
+            )
     results: list[dict] = []
     for _ in range(max(1, max_rounds)):
         wanted = _followup_queries(details, results, namespace)
@@ -6002,15 +6036,28 @@ async def k8s_followup(
             break
         for q in fresh[: max_reads - len(results)]:
             done.add(_followup_key(q))
-            results.append(
-                await k8s_read(
+            memory_key = domain_query_key(
+                "kubernetes", {"tool": "k8s_read", "args": q}, target
+            )
+            claim = getattr(query_memory, "claim", None)
+            if callable(claim) and not claim(memory_key):
+                continue
+            complete = getattr(query_memory, "complete", None)
+            try:
+                item = await k8s_read(
                     settings,
                     q["kind"],
                     namespace=q.get("namespace", ""),
                     name=q.get("name", ""),
                     label_selector=q.get("label_selector", ""),
                 )
-            )
+            except BaseException:
+                if callable(complete):
+                    complete(memory_key, succeeded=False)
+                raise
+            if callable(complete):
+                complete(memory_key, succeeded=not bool(item.get("error")))
+            results.append(item)
     for res in results:
         err = res.get("error")
         kubernetes_result.artifacts.append(

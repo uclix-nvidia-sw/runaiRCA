@@ -2,6 +2,7 @@ import { unified } from 'unified';
 import remarkParse from 'remark-parse';
 import remarkGfm from 'remark-gfm';
 import { AlertRecord, Artifact, IncidentDetail, SimilarIncident } from './types';
+import { stripAppendixEvidence } from './utils/rcaSections';
 
 type MdNode = {
   type: string;
@@ -43,7 +44,7 @@ export async function exportIncidentDocx(incident: IncidentDetail): Promise<void
     new Paragraph({ text: 'Summary', heading: HeadingLevel.HEADING_1 }),
     new Paragraph(incident.analysis_summary || 'No summary captured.'),
     new Paragraph({ text: 'Report', heading: HeadingLevel.HEADING_1 }),
-    ...markdownToBlocks(incident.analysis_detail || '').map((block) => blockToParagraph(docx, block)),
+    ...markdownToBlocks(stripAppendixEvidence(incident.analysis_detail || '')).map((block) => blockToParagraph(docx, block)),
     new Paragraph({ text: 'Evidence', heading: HeadingLevel.HEADING_1 }),
     artifactTable(docx, incident.artifacts),
     new Paragraph({ text: 'Alerts', heading: HeadingLevel.HEADING_1 }),

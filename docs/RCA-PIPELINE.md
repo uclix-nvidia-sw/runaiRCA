@@ -51,10 +51,10 @@ flowchart TB
 ```
 
 The whole run is wrapped in `asyncio.wait_for(analyze, ANALYSIS_DEADLINE_SECONDS)`
-(default **1500s / 25 min**). On overrun it returns a graceful degraded report,
+(default **900s / 15 min**). On overrun it returns a graceful degraded report,
 never a hang. Per-step ceilings are generous *on purpose* (deep evidence beats
 fast-but-shallow); the overall deadline is the real bound. The backend's
-`AGENT_REQUEST_TIMEOUT_SECONDS` (1560s) must stay above it.
+`AGENT_REQUEST_TIMEOUT_SECONDS` (960s) must stay above it.
 
 ## Stage guide: what enters, leaves, and can stop a stage
 
@@ -222,17 +222,30 @@ When no curated substring matches, a conservative **BM25 + synonym** pass
 the verify pass can still refute. See
 [Knowledge Base](KNOWLEDGE-BASE.md) for the catalogs.
 
-**Ranking** (`root_cause_ranking.py`, rules R1–R6) is a deterministic keyword
-scorer that *orders* candidates and gates confidence — it is not the retrieval
-engine. `_promote_signature_cause` then overrides the headline with the most
-specific signature (XID > known-issue > symptom > ranker), so families the ranker
-cannot even nominate (e.g. `gpu_hardware_error`) still headline correctly.
+**Ranking** (`root_cause_ranking.py`, rules R1–R6) deterministically *orders*
+candidates and gates confidence — it is not the retrieval engine and its score is
+not a probability. Typed observations are scored once per unique evidence fact
+(canonical collector `+2`, corroborating collector `+1`, at most three facts per
+collector); repeated keywords inside one fact do not multiply its weight. Legacy
+untyped collector output keeps a capped keyword-compatibility path until it is
+migrated. Rule, topology, lifecycle, feedback-prior, and live-symptom ontology
+adjustments are recorded separately in `score_breakdown`.
+
+Candidate order prefers: no unresolved contradiction, calibrated confidence,
+independent telemetry groups, then numeric score. Medium starts at `2`; high
+requires score `5` plus two independent live source groups (or a dispositive
+`force_high` signature). A scoped contradiction holds the candidate at low, and
+an unavailable canonical source downgrades it one level. `_promote_signature_cause`
+then applies the most specific verified signature (XID > known-issue > symptom >
+ranker). Every promoted candidate retains its evidence IDs and score diagnostics.
 
 ## 6. Self-check → re-analysis → verify
 
-- **Refute** (`self_check.refute_top_cause`): a skeptical senior-SRE LLM tries to
-  refute the top cause using only the gathered evidence, calibrates its confidence,
-  and writes a one-line caveat + next check.
+- **Refute** (`self_check.refute_top_cause`): a skeptical senior-SRE pass tries to
+  refute the top cause using only eligible, family-relevant support and
+  contradiction facts, calibrates its confidence, and writes a one-line caveat +
+  next check. The self-check does not calculate or consume the ranker's numeric
+  score.
 - **Re-analysis**: if refuted or evidence remains insufficient, a targeted
   re-analysis pass follows the next discriminating hypothesis until semantic
   completion or the analysis deadline. `MAX_REANALYSIS_STEPS=0` is the default;
@@ -241,8 +254,10 @@ cannot even nominate (e.g. `gpu_hardware_error`) still headline correctly.
 - **Verify matches** (`verify_matches`): a skeptical pass drops keyword/signature
   matches (known issues, symptoms, XIDs) the evidence doesn't actually support.
 
-All three are LLM-gated and best-effort: no LLM → nothing suppressed, matches
-stand.
+If signature verification changes the headline, the replacement candidate is
+self-checked before synthesis. If the current leader is refuted and no already
+ranked alternative survives the same check, the pipeline emits
+`insufficient_evidence`; it does not synthesize the refuted cause.
 
 ## 7. Ontology enrichment
 
@@ -285,6 +300,11 @@ guardrail. The guard applies deterministic repairs up to
 `MAX_RCA_REPAIR_ATTEMPTS` (default 3). If a hard gate remains, the Agent returns
 `insufficient_evidence` rather than guessing. Historical TypeDB evidence is
 context only and cannot satisfy a live-evidence gate. See [Evaluation](EVALUATION.md).
+
+The harness's weighted 0–100 quality score is separate from the ranker's
+cause-ordering score. `confidence_diagnostics` preserves both views: ranker
+breakdown and source gates, confidence before/after self-check, and the harness
+score, hard gates, repair count, and confidence before/after harness repair.
 
 ## Evidence presentation
 

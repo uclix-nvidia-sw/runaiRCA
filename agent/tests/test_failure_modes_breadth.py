@@ -42,6 +42,39 @@ def test_spot_checks() -> None:
     assert any(s["symptom"] == "Unschedulable GPU" for s in modes["k8s_scheduling_error"])
 
 
+def test_image_pull_signatures_separate_auth_repository_ambiguity_and_tag() -> None:
+    modes = load_failure_modes(YAML)
+
+    def first_image_symptom(text: str) -> str:
+        matches = [
+            symptom["symptom"]
+            for family, symptom in match_failure_mode_symptoms(
+                modes, text, "image_pull_error"
+            )
+            if family == "image_pull_error"
+        ]
+        assert matches, text
+        return matches[0]
+
+    assert first_image_symptom(
+        "Failed to pull image: unauthorized: authentication required"
+    ) == "Registry Authentication Explicitly Rejected"
+    assert first_image_symptom(
+        "Failed to pull image: name unknown, repository not found"
+    ) == "Image Repository Or Name Not Found"
+    assert first_image_symptom(
+        "ImagePullBackOff: pull access denied, repository does not exist or may require authorization"
+    ) == "Repository Existence Or Authorization Ambiguous"
+    assert first_image_symptom(
+        "ErrImagePull: manifest for repo/app:v2 not found: manifest unknown"
+    ) == "Bad Image Tag — Manifest For Tag Not Found"
+
+    unrelated = match_failure_mode_symptoms(
+        modes, "Run:ai backend request was unauthorized", "runai_control_plane_error"
+    )
+    assert not any(family == "image_pull_error" for family, _symptom in unrelated)
+
+
 def test_node_cordon_summary_matches_k8s_scheduling_symptom() -> None:
     modes = load_failure_modes(YAML)
     summary = (
@@ -344,3 +377,30 @@ def test_subsystem_splits_stay_separate() -> None:
         for text in texts:
             fams = {f for f, _ in match_failure_mode_symptoms(modes, text, "")}
             assert fams == {family}, f"{text!r} -> {fams}, expected {{{family}}}"
+
+
+def test_concrete_image_pull_error_leads_generic_retry_state() -> None:
+    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+
+    matches = match_failure_mode_symptoms(
+        load_failure_modes("knowledge/failure_modes.yaml"),
+        "ErrImagePull: dial tcp: lookup registry.airgap.local: no such host while pulling image",
+    )
+
+    assert matches[0][0] == "image_pull_error"
+    assert matches[0][1]["symptom"] == "Registry Server 5xx / DNS Lookup Failure On Pull"
+    assert matches[-1][1]["symptom"] == "ImagePullBackOff"
+
+
+def test_historical_dashboard_side_signal_does_not_beat_live_manifest_error() -> None:
+    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+
+    matches = match_failure_mode_symptoms(
+        load_failure_modes("knowledge/failure_modes.yaml"),
+        "ErrImagePull: manifest unknown for trainer image; no container started, "
+        "later dashboard mentioned cuda out of memory from old run",
+    )
+
+    assert matches[0][0] == "image_pull_error"
+    assert matches[0][1]["symptom"] == "Bad Image Tag — Manifest For Tag Not Found"
+    assert all(family != "workload_runtime_error" for family, _symptom in matches)

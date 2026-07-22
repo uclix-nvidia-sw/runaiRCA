@@ -709,8 +709,8 @@ async def test_kubernetes_collector_uses_mcp_before_service_account_token(
     assert "events_list" in calls or "resources_list" in calls
     inspection = next(a for a in result.artifacts if a.type == "pod_inspection")
     assert inspection.query == (
-        "kubectl get pod trainer-0 -n runai-vision -o yaml; "
-        "kubectl describe pod trainer-0 -n runai-vision"
+        "kubectl describe pod trainer-0 -n runai-vision; "
+        "kubectl get pod trainer-0 -n runai-vision -o yaml"
     )
     assert inspection.result["object"]["spec"]["containers"][0]["name"] == "main"
     assert inspection.result["observation"] == {

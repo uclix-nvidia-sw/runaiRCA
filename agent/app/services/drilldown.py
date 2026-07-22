@@ -64,6 +64,7 @@ from app.collectors.kubernetes import (
 )
 from app.collectors.loki import (
     _loki_headers,
+    _loki_line_affirms_failure,
     _loki_native_response_complete,
     _loki_streams,
     _sample_lines,
@@ -84,7 +85,9 @@ from app.mcp_client import (
     mcp_tool_json,
 )
 from app.plan import InvestigationPlan
+from app.services.evidence_projection import observed_payload
 from app.services.probe_evaluation import evaluate_probe
+from app.services.query_memory import QueryMemory, domain_query_key
 
 _log = logging.getLogger(__name__)
 
@@ -123,15 +126,22 @@ async def run_drilldowns(
     plan: InvestigationPlan | None,
     *,
     blackboard: Any = None,
+    query_memory: QueryMemory | None = None,
+    evidence_sufficient: bool = False,
     deadline_monotonic: float | None = None,
     external_case_hints: list[dict[str, Any]] | None = None,
 ) -> None:
-    """Run every domain's drill-down loop concurrently. Never raises."""
+    """Run only the optional domain drill-downs still needed. Never raises."""
     if not settings.enable_agent_drilldown or not llm_configured(
         settings, settings.llm_model_drilldown
     ):
         return
     registry = _domain_tools(settings)
+    # One receipt ledger is shared by every domain agent in this analysis.
+    # Seed all collector results before tasks start so concurrently launched
+    # agents cannot repeat a base query or a cross-domain adapter alias.
+    memory = query_memory if query_memory is not None else QueryMemory()
+    memory.seed_results(results, target)
     task_results = [
         (
             result,
@@ -143,6 +153,8 @@ async def run_drilldowns(
                     target,
                     plan.for_collector(result.agent) if plan else None,
                     blackboard=blackboard,
+                    query_memory=memory,
+                    skip_optional=evidence_sufficient,
                     deadline_monotonic=deadline_monotonic,
                     external_case_hints=_external_case_hints_for_domain(
                         result.agent, external_case_hints
@@ -189,6 +201,8 @@ async def _drill_one(
     plan: InvestigationPlan | None,
     *,
     blackboard: Any = None,
+    query_memory: QueryMemory | None = None,
+    skip_optional: bool = False,
     deadline_monotonic: float | None = None,
     external_case_hints: list[dict[str, Any]] | None = None,
 ) -> None:
@@ -199,7 +213,12 @@ async def _drill_one(
             return
         architecture = _implicated_architecture(settings, result, target)
         history: list[dict[str, Any]] = []
-        seen_queries: set[str] = set()
+        # Keep the legacy local fingerprint for standalone callers, but use the
+        # run-scoped ledger for actual execution. It spans every evidence
+        # domain, not just Kubernetes.
+        seen_queries: set[str] = _existing_query_fingerprints(result, target)
+        memory = query_memory if query_memory is not None else QueryMemory()
+        memory.seed_result(result, target)
         probe_attempts: dict[str, int] = {}
         system_no_node_query_attempted = False
         # A TypeDB/YAML probe is executable only through this agent's existing
@@ -217,7 +236,12 @@ async def _drill_one(
                 if system_no_node_query_attempted:
                     continue
                 system_no_node_query_attempted = True
-            key = _query_fingerprint(query)
+            key = _query_fingerprint(query, target)
+            if key in seen_queries:
+                continue
+            execution_key = domain_query_key(result.agent, query, target)
+            if not memory.claim(execution_key):
+                continue
             seen_queries.add(key)
             await _run_query(
                 settings,
@@ -229,9 +253,22 @@ async def _drill_one(
                 history,
                 masker,
                 blackboard=blackboard,
+                query_memory=memory,
+                execution_key=execution_key,
                 artifact_type="ontology_probe",
                 probe_attempts=probe_attempts,
             )
+        assessments = result.details.get("ontology_probe_assessments", [])
+        declared_probes_settled = not assessments or all(
+            isinstance(item, dict) and item.get("verdict") == "supports"
+            for item in assessments
+        )
+        if skip_optional and declared_probes_settled:
+            _log.info(
+                "drilldown %s: required probes complete; optional rounds skipped",
+                result.agent,
+            )
+            return
         step = 0
         invalid_query_repair_used = False
         parser_repair_pending = False
@@ -292,7 +329,7 @@ async def _drill_one(
             if is_parser_repair:
                 parser_repair_pending = False
                 parser_repair_used = True
-            queries = []
+            queries: list[tuple[dict[str, Any], str]] = []
             rejected: list[dict[str, Any]] = []
             for q in decision.get("queries") or []:
                 if not isinstance(q, dict):
@@ -316,11 +353,14 @@ async def _drill_one(
                     if system_no_node_query_attempted:
                         continue
                     system_no_node_query_attempted = True
-                key = _query_fingerprint(q)
+                key = _query_fingerprint(q, target)
                 if key in seen_queries:
                     continue
+                execution_key = domain_query_key(result.agent, q, target)
+                if not memory.claim(execution_key):
+                    continue
                 seen_queries.add(key)
-                queries.append(q)
+                queries.append((q, execution_key))
             if rejected:
                 history.extend(rejected)
             if not queries:
@@ -361,8 +401,10 @@ async def _drill_one(
                         history,
                         masker,
                         blackboard=blackboard,
+                        query_memory=memory,
+                        execution_key=execution_key,
                     )
-                    for q in queries
+                    for q, execution_key in queries
                 )
             )
             if any(parser_rejections):
@@ -564,6 +606,8 @@ async def _run_query(
     masker: Any,
     *,
     blackboard: Any = None,
+    query_memory: QueryMemory | None = None,
+    execution_key: str = "",
     artifact_type: str = "drilldown_query",
     probe_attempts: dict[str, int] | None = None,
 ) -> bool:
@@ -573,11 +617,17 @@ async def _run_query(
         return False
     args = query.get("args") if isinstance(query.get("args"), dict) else {}
     raw_outcome = await _call_tool_safely(tools[name]["call"], settings, target, args)
+    if query_memory is not None and execution_key:
+        query_memory.complete(
+            execution_key,
+            succeeded=not bool(raw_outcome.get("error")),
+        )
     raw_result = raw_outcome.get("result") if isinstance(raw_outcome, dict) else None
-    raw_markers = [] if not isinstance(raw_outcome, dict) or raw_outcome.get("error") else (
-        kubernetes_salient_markers(raw_result)
-        if result.agent == "kubernetes"
-        else salient_markers(raw_result)
+    raw_markers = _drilldown_salient_markers(
+        result.agent,
+        name,
+        raw_outcome,
+        raw_result,
     )
     outcome = masker.mask_object(raw_outcome)
     if not isinstance(outcome, dict):
@@ -675,6 +725,49 @@ async def _run_query(
         and name in {"logql_query", "promql_query"}
         and _query_failure_category(outcome, str(error)) == "invalid_request"
     )
+
+
+def _drilldown_salient_markers(
+    agent: str,
+    tool: str,
+    outcome: object,
+    raw_result: object,
+) -> list[str]:
+    """Extract highlights only from returned observations, never query intent.
+
+    Grafana MCP result envelopes echo LogQL/PromQL and may include debug hints
+    such as ``possibleCauses`` even when no row/series matched. Scanning the
+    whole envelope therefore turns words we asked for into words we observed.
+    Unverified generic tools stay context-only; verified adapters may expose
+    highlights only for an explicit positive observation.
+    """
+    if not isinstance(outcome, dict) or outcome.get("error"):
+        return []
+    if agent == "kubernetes":
+        return kubernetes_salient_markers(raw_result)
+    if agent == "loki" and tool == "logql_query":
+        return salient_markers(_loki_returned_failure_lines(raw_result))
+    if outcome.get("_verified_observation") is not _VERIFIED_OBSERVATION:
+        return []
+    observation = outcome.get("observation")
+    if not isinstance(observation, dict) or observation.get("polarity") != "present":
+        return []
+    return salient_markers(raw_result)
+
+
+def _loki_returned_failure_lines(value: object) -> list[str]:
+    if not isinstance(value, dict) or int(value.get("line_count") or 0) <= 0:
+        return []
+    lines: list[str] = []
+    entries = value.get("sample_entries")
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, dict) and isinstance(entry.get("line"), str):
+            lines.append(str(entry["line"]))
+    if not lines:
+        candidates = value.get("sample_lines") or value.get("lines")
+        if isinstance(candidates, list):
+            lines.extend(str(line) for line in candidates)
+    return [line for line in lines if _loki_line_affirms_failure(line)]
 
 
 def _typed_artifact_result(
@@ -800,7 +893,7 @@ def _declared_probe_queries(
         probe = dict(raw_probe)
         probe["template_id"] = _template_id(probe)
         query = {"tool": tool, "args": args, "_ontology_probe": probe}
-        fingerprint = f"{probe['template_id']}:{_query_fingerprint(query)}"
+        fingerprint = f"{probe['template_id']}:{_query_fingerprint(query, target)}"
         if fingerprint not in seen:
             seen.add(fingerprint)
             queries.append(query)
@@ -825,13 +918,97 @@ def _template_id(probe: dict[str, Any]) -> str:
     return f"legacy-probe-{sha256(canonical).hexdigest()[:12]}"
 
 
-def _query_fingerprint(query: dict[str, Any]) -> str:
-    """Deduplicate execution identity, not internal ontology metadata."""
+def _query_fingerprint(
+    query: dict[str, Any], target: AnalysisTarget | None = None
+) -> str:
+    """Deduplicate execution identity, including Kubernetes tool aliases."""
+    tool = str(query.get("tool") or "")
+    args = query.get("args") if isinstance(query.get("args"), dict) else {}
+    if tool in {"k8s_read", "k8s_describe"}:
+        kind = resolve_read_kind(str(args.get("kind") or "")) or str(args.get("kind") or "")
+        # k8s_describe defaults to the alert namespace in its adapter;
+        # k8s_read does not. Preserve that execution distinction so an omitted
+        # namespace (cluster-wide list) is never deduped against a scoped read.
+        namespace = str(args.get("namespace") or "")
+        if tool == "k8s_describe" and not namespace and target is not None:
+            namespace = target.namespace
+        name = str(args.get("name") or "")
+        # A named Pod k8s_read is promoted to the same YAML + describe/events
+        # operation as k8s_describe, so those two model choices are one read.
+        operation = "describe" if kind == "pods" and name else tool
+        return json.dumps(
+            {
+                "operation": operation,
+                "kind": kind,
+                "namespace": namespace,
+                "name": name,
+                "label_selector": str(args.get("label_selector") or ""),
+            },
+            sort_keys=True,
+        )
     return json.dumps(
         {key: value for key, value in query.items() if not str(key).startswith("_")},
         sort_keys=True,
         default=str,
     )
+
+
+def _existing_query_fingerprints(
+    result: CollectorResult, target: AnalysisTarget
+) -> set[str]:
+    """Translate typed Kubernetes artifacts into drill-down execution IDs."""
+    if result.agent != "kubernetes":
+        return set()
+    seen: set[str] = set()
+    for item in result.artifacts:
+        status = str(getattr(item, "status", "") or "")
+        if status != "ok":
+            continue
+        artifact_type = str(getattr(item, "type", "") or "")
+        query: dict[str, Any] | None = None
+        if artifact_type == "kubernetes_warning_events" and target.namespace:
+            query = {
+                "tool": "k8s_read",
+                "args": {"kind": "events", "namespace": target.namespace},
+            }
+        elif artifact_type == "kubernetes_node_condition" and target.node:
+            query = {
+                "tool": "k8s_read",
+                "args": {"kind": "nodes", "name": target.node},
+            }
+        elif artifact_type == "pod_inspection" and target.pod:
+            query = {
+                "tool": "k8s_describe",
+                "args": {
+                    "kind": "pods",
+                    "namespace": target.namespace,
+                    "name": target.pod,
+                },
+            }
+        elif artifact_type in {
+            "adhoc_query",
+            "followup_query",
+            "ontology_probe",
+            "drilldown_query",
+        }:
+            payload = getattr(item, "result", None)
+            if isinstance(payload, dict) and payload.get("kind"):
+                query = {
+                    "tool": (
+                        "k8s_describe"
+                        if str(payload.get("operation") or "") == "describe"
+                        else "k8s_read"
+                    ),
+                    "args": {
+                        "kind": payload.get("kind"),
+                        "namespace": payload.get("namespace") or "",
+                        "name": payload.get("name") or "",
+                        "label_selector": payload.get("label_selector") or "",
+                    },
+                }
+        if query is not None:
+            seen.add(_query_fingerprint(query, target))
+    return seen
 
 
 def _system_node_scope_unavailable(result: CollectorResult, target: AnalysisTarget) -> bool:
@@ -1301,12 +1478,10 @@ def _artifact_prompt_item(art: Any) -> dict[str, Any]:
         "status": art.status,
         "summary": (art.summary or "")[:300],
     }
-    if art.query:
-        item["query"] = _compact_value(art.query, limit=300)
     if art.highlights:
         item["highlights"] = art.highlights[:6]
     if art.result is not None:
-        item["result"] = _compact_value(art.result, limit=900)
+        item["result"] = _compact_value(observed_payload(art.result), limit=900)
     return item
 
 
@@ -1340,7 +1515,7 @@ def _artifact_architecture_text(art: Any) -> str:
     if art.highlights:
         parts.append(" ".join(map(str, art.highlights[:6])))
     if art.result is not None:
-        parts.append(_string_leaf_text(art.result))
+        parts.append(_string_leaf_text(observed_payload(art.result)))
     return " ".join(part for part in parts if part)
 
 

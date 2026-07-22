@@ -103,8 +103,8 @@ Kubernetes, Postgres, Prometheus, Loki, or LLM credentials exist.
 Every LLM stage (planner refine, investigation loop, per-collector drill-down,
 self-check, Korean synthesis) is optional and best-effort: with no LLM, or on any
 failure, the orchestrator degrades to its deterministic path and still returns a
-report. The whole run is bounded by `ANALYSIS_DEADLINE_SECONDS` (default 1500s);
-the backend's `AGENT_REQUEST_TIMEOUT_SECONDS` (1560s) stays above it so a
+report. The whole run is bounded by `ANALYSIS_DEADLINE_SECONDS` (default 900s);
+the backend's `AGENT_REQUEST_TIMEOUT_SECONDS` (960s) stays above it so a
 graceful degraded report is never lost. See [RCA Pipeline](RCA-PIPELINE.md).
 
 ### Backend
@@ -176,8 +176,11 @@ separate agent. Full detail: [Knowledge Base](KNOWLEDGE-BASE.md).
   same-alert incidents with their stored RCA (`enrich`), and graph-derived
   family/XID remediation with root-cause chains (`graph_remediation`). Degrades to
   an empty context when TypeDB is disabled/unreachable; never raises.
-- **Ranking** (`agent/app/services/root_cause_ranking.py`) scores failure families
-  (rules R1-R6) and **signature promotion** headlines the most specific match.
+- **Ranking** (`agent/app/services/root_cause_ranking.py`) scores one unique typed
+  fact once, records rule/prior/topology adjustments and contradiction gates, and
+  orders failure families by evidence quality before raw score (rules R1-R6).
+  **Signature promotion** headlines the most specific verified match and triggers
+  a new self-check when it changes the leader.
   This ranks *causes*, not similarity — pgvector (owned by the backend) still owns
   "which past incidents are similar".
 

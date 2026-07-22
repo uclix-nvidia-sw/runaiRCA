@@ -160,8 +160,14 @@
     - errimagepull
     - errimageneverpull
     - manifest for
+    - manifest unknown
     - toomanyrequests
     - pull access denied
+    - authentication required
+    - no basic auth credentials
+    - insufficient_scope
+    - repository does not exist
+    - name unknown
     - "dial tcp: lookup"
   planner_keywords:
     - imagepull

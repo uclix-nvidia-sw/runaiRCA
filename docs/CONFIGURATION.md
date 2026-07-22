@@ -39,8 +39,8 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `RUNTIME_KNOWLEDGE_TOKEN` | Optional bearer token for the runtime knowledge snapshot endpoint. Empty is safe for the in-cluster default endpoint. |
 | `RUNTIME_KNOWLEDGE_REFRESH_SECONDS` | Runtime knowledge refresh interval, default `30` seconds (values below `30` are raised to `30`). |
 | `RUNTIME_KNOWLEDGE_TIMEOUT_SECONDS` | Runtime knowledge fetch timeout, default `10` seconds (minimum `1`). |
-| `AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for Agent `/analyze` and `/chat` requests, default `1560` (must exceed the agent's `ANALYSIS_DEADLINE_SECONDS`) |
-| `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for operator-triggered Agent `/analyze` requests, default `1560` |
+| `AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for Agent `/analyze` and `/chat` requests, default `960` (must exceed the agent's `ANALYSIS_DEADLINE_SECONDS`) |
+| `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for operator-triggered Agent `/analyze` requests, default `960` |
 | `TRASH_RETENTION_DAYS` | Backend soft-delete retention before trash incidents are purged, default `30` |
 | `SLACK_BOT_TOKEN` | Backend Slack bot token (`xoxb-`, `chat:write` scope, bot invited to the channel). Set together with `SLACK_CHANNEL_ID` to enable incident-analysis notifications. A bot token — not an incoming webhook and not the `xapp-` app token — is required because `chat.postMessage` returns the `ts` used to thread re-analyses. Reinstalling the Slack app invalidates the previous `xoxb-` token. Chart secret key `slackBotToken` |
 | `SLACK_CHANNEL_ID` | Channel the backend posts incident-analysis summaries into. Chart secret key `slackChannelId` |
@@ -111,7 +111,8 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `MAX_INVESTIGATION_STEPS` | Legacy compatibility limit; default `0` means semantic completion under the overall analysis deadline. |
 | `MAX_REANALYSIS_STEPS` | Legacy compatibility limit for a re-analysis pass; default `0` means semantic completion under the overall analysis deadline. |
 | `ENABLE_AGENT_DRILLDOWN` | Per-collector autonomous drill-down: each evidence agent (kubernetes/prometheus/loki/runai) continues through distinct read-only probes until it is done, repeats a query, or reaches the analysis deadline; default `false` (Helm sets `true`) |
-| `ANALYSIS_DEADLINE_SECONDS` | Overall hard cap per analysis (graceful degraded report on overrun), default `1500` (25 min), `0` = no cap. Keep the backend `AGENT_REQUEST_TIMEOUT_SECONDS` above this. |
+| `LLM_SYNTHESIS_MAX_TOKENS` | Completion budget for the final Korean JSON report, default `16384`. |
+| `ANALYSIS_DEADLINE_SECONDS` | Overall hard cap per analysis (graceful degraded report on overrun), default `900` (15 min), `0` = no cap. Keep the backend `AGENT_REQUEST_TIMEOUT_SECONDS` above this. |
 | `ENABLE_RCA_OUTPUT_HARNESS` | Validate the final RCA against live evidence and safety gates, default `true` |
 | `MAX_RCA_REPAIR_ATTEMPTS` | Maximum final-report repair passes after harness validation, default `3` |
 | `RCA_HARNESS_PASS_SCORE` | Non-fatal harness score threshold (0..100), default `70` |

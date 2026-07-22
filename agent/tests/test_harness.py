@@ -554,12 +554,19 @@ def test_abstain_renders_korean_when_language_ko() -> None:
     ]
     verdict = evaluate(response, [], candidates)
 
-    abstain(response, candidates, verdict, language="ko")
+    abstain(
+        response,
+        candidates,
+        verdict,
+        language="ko",
+        next_check="영향받은 노드에서 `crictl pull nginx:latest`를 실행하세요.",
+    )
 
     # Korean headings + note, and no English fallback strings leaking through.
     assert "## 평가" in response.analysis_detail
     assert "## 필요한 다음 점검" in response.analysis_detail
     assert "낮은 확신도" in response.analysis_summary
+    assert "crictl pull nginx:latest" in response.analysis_detail
     assert "## Assessment" not in response.analysis_detail
     # The abstain LOGIC is unchanged — still flips to insufficient_evidence.
     assert response.root_cause_family == "insufficient_evidence"

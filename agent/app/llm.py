@@ -216,6 +216,7 @@ async def complete(
     temperature: float = 0.2,
     max_tokens: int | None = None,
     model: str | None = None,
+    purpose: str = "",
 ) -> str | None:
     """Return the model's text answer, or None when unavailable/failed."""
     text, _error = await complete_with_error(
@@ -225,6 +226,7 @@ async def complete(
         temperature=temperature,
         max_tokens=max_tokens,
         model=model,
+        purpose=purpose,
     )
     return text
 
@@ -237,6 +239,7 @@ async def complete_with_error(
     temperature: float = 0.2,
     max_tokens: int | None = None,
     model: str | None = None,
+    purpose: str = "",
 ) -> tuple[str | None, str | None]:
     """Return (text, error_detail) so chat can surface LLM failures."""
     selected_model = (model or settings.llm_model).strip()
@@ -251,6 +254,7 @@ async def complete_with_error(
     # silently degrade the whole analysis to the deterministic English report).
     # The warning names WHY it was empty (finish_reason / shape) so the pod log
     # finally tells the truth instead of a blind "no reply".
+    nat_failure = ""
     if _nat_client.get() is not None and selected_model == settings.llm_model:
         text, nat_error = await _complete_with_nat_client(
             settings,
@@ -262,7 +266,16 @@ async def complete_with_error(
         )
         if text:
             return text, None
-        _log.warning("NAT LLM reply unusable (%s); retrying via direct HTTP", nat_error)
+        nat_failure = nat_error or "NAT returned no usable content without a diagnostic"
+        _log.warning(
+            "NAT LLM reply unusable "
+            "(purpose=%s, model=%s, requested_max_tokens=%s; %s); "
+            "retrying via direct HTTP",
+            purpose or "unspecified",
+            selected_model,
+            max_tokens if max_tokens is not None else "provider-default",
+            nat_error,
+        )
     payload: dict[str, Any] = {
         "model": selected_model,
         "messages": [
@@ -296,10 +309,14 @@ async def complete_with_error(
     if not response.ok:
         _record_failed_call(selected_model)
         detail = " ".join(str(response.error or "").split())[:200]
-        return None, f"HTTP {response.status_code or '?'} {detail}".strip()
+        return None, _with_nat_failure(
+            f"HTTP {response.status_code or '?'} {detail}".strip(), nat_failure
+        )
     if not isinstance(response.data, dict):
         _record_failed_call(selected_model)
-        return None, "unexpected response shape from the LLM endpoint"
+        return None, _with_nat_failure(
+            "unexpected response shape from the LLM endpoint", nat_failure
+        )
     _record_usage(selected_model, response.data)
     choices = response.data.get("choices")
     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
@@ -310,8 +327,33 @@ async def complete_with_error(
                 cleaned = strip_reasoning(content)
                 if cleaned:
                     return cleaned, None
-                return None, "reasoning-only reply (no content outside <think>)"
-    return None, "unexpected response shape from the LLM endpoint"
+                return None, _with_nat_failure(
+                    "reasoning-only reply (no content outside <think>)",
+                    nat_failure,
+                )
+    return None, _with_nat_failure(
+        _openai_unusable_reply_error(response.data), nat_failure
+    )
+
+
+def _with_nat_failure(direct_error: str, nat_failure: str) -> str:
+    if not nat_failure:
+        return direct_error
+    return f"nat: {nat_failure}; direct_http: {direct_error}"
+
+
+def _openai_unusable_reply_error(data: dict[str, Any]) -> str:
+    """Preserve provider finish/usage metadata when a successful HTTP reply has no text."""
+    choices = data.get("choices")
+    finish_reason = None
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        finish_reason = choices[0].get("finish_reason")
+    usage = data.get("usage")
+    completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+    return (
+        "empty or unusable content from the LLM endpoint "
+        f"(finish_reason={finish_reason}, completion_tokens={completion_tokens})"
+    )
 
 
 async def _complete_with_nat_client(
@@ -336,14 +378,20 @@ async def _complete_with_nat_client(
     call_client = client.bind(**kwargs) if hasattr(client, "bind") else client
     for attempt in range(3):
         try:
-            remaining = _analysis_time_remaining()
-            if remaining is not None:
-                if remaining <= 0:
-                    return None, "analysis deadline exhausted before NAT LLM call"
-                response = await asyncio.wait_for(call_client.ainvoke(messages), timeout=remaining)
-            else:
+            timeout = _request_timeout(settings)
+            if timeout is None:
                 response = await call_client.ainvoke(messages)
+            elif timeout <= 0:
+                return None, "analysis deadline exhausted before NAT LLM call"
+            else:
+                response = await asyncio.wait_for(call_client.ainvoke(messages), timeout=timeout)
             break
+        except TimeoutError:
+            # A timed-out generation already consumed the configured per-call
+            # budget. Retrying it inside NAT can spend the entire analysis
+            # deadline before the direct HTTP fallback or final harness runs.
+            _record_failed_call(model)
+            return None, f"NAT LLM request timed out after {timeout:.1f}s"
         except Exception as exc:  # noqa: BLE001 - preserve graceful LLM degradation
             if attempt == 2:
                 _record_failed_call(model)

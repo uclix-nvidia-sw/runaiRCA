@@ -127,9 +127,8 @@ def test_query_remediation_projects_xid_trigger_and_renders_guidance() -> None:
     assert "Diagnostic guidance (XID 79): Check for PCIe link errors before reset." in "\n".join(
         _graph_remediation_lines(out)
     )
-    assert _xid_diagnostic_guidance_lines(out, "ko") == [
-        "- 진단 안내 (XID 79): Check for PCIe link errors before reset."
-    ]
+    # English-only graph prose is not leaked into a Korean deterministic report.
+    assert _xid_diagnostic_guidance_lines(out, "ko") == []
 
 
 def test_enrich_disabled_returns_empty_context() -> None:
@@ -389,10 +388,34 @@ def test_graph_remediation_escapes_typeql_literals() -> None:
     )
 
     joined = "\n".join(client.queries)
-    assert 'gpu_hardware_error\\"; delete $x;\\\\' in joined
+    # Family alone is no longer an executable remediation lookup. Only the
+    # signature-specific XID/model query is sent to TypeDB.
+    assert "gpu_hardware_error" not in joined
     assert 'A100\\"; match $x isa incident;\\\\' in joined
     assert 'fixes_for_family("gpu_hardware_error"; delete' not in joined
     assert 'xids_for_gpu_model("A100"; match' not in joined
+
+
+def test_query_remediation_does_not_flatten_family_actions() -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                self.queries.append(query)
+                return [{"statement": "SHOULD-NOT-BE-FAMILY-ACTION"}]
+
+            yield run
+
+    client = FakeClient()
+    result = _query_remediation(
+        client, "image_pull_error", [], ""  # type: ignore[arg-type]
+    )
+
+    assert result.is_empty()
+    assert client.queries == []
 
 
 def test_knowledge_base_section_renders_when_available() -> None:

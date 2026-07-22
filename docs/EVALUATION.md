@@ -31,8 +31,7 @@ artifacts, creates a claim ledger, and checks the final report.
 | Diagnostic reasoning | 20 |
 | Investigation plan | 20 |
 | Uncertainty calibration | 15 |
-| Operational usefulness | 10 |
-| Tool efficiency | 5 |
+| Operational usefulness | 15 |
 | Safety | 5 |
 
 The initial pass score is 70/100. The three non-negotiable gates are:
@@ -51,6 +50,13 @@ failure remains visible as `degraded`.
 
 Historical TypeDB evidence is context, never a substitute for current evidence.
 
+The harness score above is a report-quality rubric, not the deterministic ranker
+score used to order root-cause candidates. Incident detail renders a confidence
+breakdown above the Evaluation form. It shows the ranker's additive adjustments,
+independent source groups and confidence gates, self-check calibration, and the
+separate harness score/repairs. Older incidents without
+`confidence_diagnostics` remain readable and show the fields that are available.
+
 ## Operator review
 
 Incident detail exposes the latest run's harness result and an RCA Evaluation
@@ -61,7 +67,8 @@ The form records:
 
 - case type: `known`, `compositional`, `novel`, or `tool_degraded`;
 - optional expected family;
-- the seven 0–5 rubric scores;
+- the operator review form's seven 0–5 scores (including tool efficiency),
+  which are separate from the six deterministic runtime-harness dimensions;
 - hard-gate assessment;
 - resolution outcome and an action that actually worked;
 - notes.

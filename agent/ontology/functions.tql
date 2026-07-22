@@ -37,9 +37,10 @@ fun xids_for_gpu_model($model: string) -> { xid_code }:
     $x has xid_code $code;
   return { $code };
 
-# Remediation statements for a root-cause family (root_cause[subtype] <- indicates <-
-# symptom -> resolved_by -> action). Works for any family: the curated failure modes,
-# the Run:ai built-in alerts, and the XID GPU faults all attach here.
+# Diagnostic aggregation of statements beneath a root-cause family. This loses
+# the symptom identity and therefore MUST NOT select executable incident actions;
+# production remediation uses the symptom -> resolved_by -> action relation.
+# Retained for ontology inspection/backward compatibility only.
 fun fixes_for_family($fam: string) -> { statement }:
   match
     $rc isa root_cause, has subtype $sub; $sub == $fam;
@@ -101,8 +102,10 @@ fun approved_case_card($case_id: string) -> { case_card }:
     $id == $case_id;
   return { $card };
 
-# Only operator-confirmed effective actions are returned here. Curated actions
-# remain available through fixes_for_family and are labelled as such by synthesis.
+# Historical diagnosis-level aggregation for ontology inspection only. It has no
+# symptom identity and MUST NOT select current-incident actions. Approved actions
+# become executable knowledge only after promotion creates confirmed:<alert_name>
+# as a symptom and links that symptom to the action via resolved_by.
 fun verified_actions_for_family($family: string) -> { statement }:
   match
     $case isa case_snapshot, has approval_state "active";

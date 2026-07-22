@@ -32,8 +32,8 @@ flowchart LR
 | `PORT` | 백엔드 HTTP 포트. Helm은 이를 컴포넌트 서비스 포트에서 매핑합니다. 에이전트 포트는 컨테이너 커맨드에 고정돼 있습니다 |
 | `AGENT_URL` | 백엔드에서 에이전트로 접근하는 URL. 기본값 `http://localhost:8000` |
 | `BACKEND_URL` | 에이전트가 분석 진행 이벤트를 fire-and-forget 방식으로 백엔드에 보내기 위한 URL입니다. 비어 있으면 progress POST가 비활성화되며, Helm은 기본적으로 백엔드 서비스 주소로 설정합니다 |
-| `AGENT_REQUEST_TIMEOUT_SECONDS` | 에이전트 `/analyze` 및 `/chat` 요청에 대한 백엔드 타임아웃. 기본값 `1560`(에이전트의 `ANALYSIS_DEADLINE_SECONDS`보다 커야 합니다) |
-| `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | 운영자가 직접 트리거한 에이전트 `/analyze` 요청에 대한 백엔드 타임아웃. 기본값 `1560` |
+| `AGENT_REQUEST_TIMEOUT_SECONDS` | 에이전트 `/analyze` 및 `/chat` 요청에 대한 백엔드 타임아웃. 기본값 `960`(에이전트의 `ANALYSIS_DEADLINE_SECONDS`보다 커야 합니다) |
+| `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | 운영자가 직접 트리거한 에이전트 `/analyze` 요청에 대한 백엔드 타임아웃. 기본값 `960` |
 | `TRASH_RETENTION_DAYS` | 휴지통 인시던트를 purge하기 전 백엔드 soft delete 보존 기간. 기본값 `30` |
 | `SLACK_BOT_TOKEN` | 백엔드 Slack 봇 토큰(`xoxb-`, `chat:write` 스코프, 채널에 초대된 봇). 인시던트 분석 알림을 활성화하려면 `SLACK_CHANNEL_ID`와 함께 설정합니다. incoming webhook이나 `xapp-` 앱 토큰이 아니라 봇 토큰이 필요한 이유는 `chat.postMessage`가 재분석 스레딩에 사용되는 `ts`를 반환하기 때문입니다. Slack 앱을 재설치하면 이전 `xoxb-` 토큰은 무효화됩니다. 차트 시크릿 키 `slackBotToken` |
 | `SLACK_CHANNEL_ID` | 백엔드가 인시던트 분석 요약을 게시하는 채널. 차트 시크릿 키 `slackChannelId` |
@@ -104,7 +104,8 @@ flowchart LR
 | `MAX_INVESTIGATION_STEPS` | 레거시 호환 제한입니다. 기본값 `0`은 전체 analysis deadline 안에서 의미적 완료까지 조사합니다. |
 | `MAX_REANALYSIS_STEPS` | 재분석 레거시 호환 제한입니다. 기본값 `0`은 전체 analysis deadline 안에서 의미적 완료까지 조사합니다. |
 | `ENABLE_AGENT_DRILLDOWN` | 수집기별 자율 드릴다운: 각 증거 에이전트(kubernetes/prometheus/loki/runai)가 자기 도메인의 서로 다른 읽기 전용 probe를 완료·반복 쿼리·분석 deadline까지 계속 수행합니다. 기본값 `false`(Helm은 `true`로 설정) |
-| `ANALYSIS_DEADLINE_SECONDS` | 분석당 전체 하드 상한(초과 시 우아하게 축소된 리포트). 기본값 `1500`(25분), `0` = 상한 없음. 백엔드 `AGENT_REQUEST_TIMEOUT_SECONDS`를 이 값보다 크게 유지하세요. |
+| `LLM_SYNTHESIS_MAX_TOKENS` | 최종 한국어 JSON 보고서의 completion 예산. 기본값 `16384`. |
+| `ANALYSIS_DEADLINE_SECONDS` | 분석당 전체 하드 상한(초과 시 우아하게 축소된 리포트). 기본값 `900`(15분), `0` = 상한 없음. 백엔드 `AGENT_REQUEST_TIMEOUT_SECONDS`를 이 값보다 크게 유지하세요. |
 | `ENABLE_RCA_OUTPUT_HARNESS` | 최종 RCA를 live evidence와 safety gate로 검증합니다. 기본값 `true` |
 | `MAX_RCA_REPAIR_ATTEMPTS` | harness 검증 뒤 최종 보고서를 수정하는 최대 횟수. 기본값 `3` |
 | `RCA_HARNESS_PASS_SCORE` | non-fatal RCA를 degraded로 표시하는 score 기준(0..100). 기본값 `70` |
