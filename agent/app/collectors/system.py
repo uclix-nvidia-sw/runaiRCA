@@ -53,7 +53,7 @@ _ERROR_PATTERNS = re.compile(
 # those labels into faults; only explicit unhealthy snapshot states count.
 _SNAPSHOT_ERROR_PATTERNS = re.compile(
     r"(?i)(\bxid\b|nvrm|fell off the bus|uncorrectable|fatal|critical|"
-    r"\b(?:down|inactive|failed)\b|(?:error(?: count| counter)?\s*[:=]\s*[1-9]\d*))"
+    r"\b(?:down|inactive|failed)\b|(?:(?<!replay\s)(?<!recovery\s)(?<!crc\s)error(?: count| counter)?\s*[:=]\s*[1-9]\d*))"
 )
 
 # Sources the DaemonSet endpoint understands. Only journalctl-backed sources
