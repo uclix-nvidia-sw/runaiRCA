@@ -82,6 +82,21 @@ def test_atomic_observation_tokens_do_not_decompose_keyword_hits() -> None:
     )[0] == ["job has reached the specified backoff limit"]
 
 
+def test_keyword_hits_require_right_token_boundary() -> None:
+    assert _keyword_hits("running database migration", ["mig"])[0] == []
+    assert _keyword_hits("backofflimitexceeded", ["backofflimit"])[0] == []
+    assert _keyword_hits("usbresetcontroller", ["reset"])[0] == []
+    assert _keyword_hits("KubePodImagePullBackOff".lower(), ["imagepullbackoff"])[0] == [
+        "imagepullbackoff"
+    ]
+    assert _keyword_hits("memory was reclaimed", ["reclaim"])[0] == ["reclaim"]
+    assert _keyword_hits("oomkilled", ["oomkill"])[0] == ["oomkill"]
+    assert _keyword_hits(
+        'traceback (most recent call last)file "x.py"',
+        ["traceback (most recent call last)"],
+    )[0] == ["traceback (most recent call last)"]
+
+
 def test_xid_code_extracted_from_drilldown_artifact() -> None:
     # Drill-down can be the first place a GPU fault appears; it must still feed
     # XID promotion and graph remediation, not just the appendix evidence card.

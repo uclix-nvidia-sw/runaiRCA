@@ -46,7 +46,7 @@
         - "스케줄링에 필요한 정상 작업량을 반영해 `resources.requests.memory`도 조정하되, request는 예약량이고 OOM을 막는 상한은 limit임을 구분하세요. 메모리가 비정상적으로 계속 증가한다면 limit만 높이지 말고 누수 또는 batch/input 크기를 수정하세요."
         - "수정한 워크로드를 rollout한 뒤 `lastState.terminated.reason=OOMKilled`, restart count 증가, CrashLoopBackOff가 재발하지 않는지 확인하세요. 인시던트 시간대의 커널 OOM 로그, eviction 이벤트, 활성 MemoryPressure 같은 별도 노드 증거가 있을 때만 Node-level OOM을 추가 조사하세요."
     - name: CrashLoopBackOff
-      keywords: [crashloopbackoff, "back-off restarting"]
+      keywords: [crashloopbackoff, crashloopbackoffhighrestarts, "back-off restarting"]
       actions:
         - "Read the container logs for the crash cause; compare with the last working revision."
         - "Check the entrypoint/command and the required config/env/secrets."

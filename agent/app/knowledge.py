@@ -23,6 +23,7 @@ _PROBE_TEMPLATE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 # suffix matching, so lexical boundary rules cannot distinguish same-suffix
 # collisions. Extend this set only when a new collision is verified.
 _ATOMIC_OBSERVATION_TOKENS = frozenset({"progressdeadlineexceeded"})
+_STEM_SUFFIXES = frozenset({"e", "s", "es", "d", "ed", "ing", "ion", "ions", "er", "ers", "or", "ors"})
 _BUNDLED_TROUBLESHOOTING_TREE = (
     Path(__file__).resolve().parent.parent / "knowledge" / "k8s_troubleshooting_tree.yaml"
 )
@@ -163,6 +164,7 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "pidpressure",
             "node pressure",
             "evict",
+            "evictionthresholdmet",
         ),
     ),
     "runai_scheduling_quota": (
@@ -170,6 +172,7 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
         ("prometheus", "kubernetes", "runai"),
         (
             "preempt",
+            "preemptlowerpriority",
             "reclaim",
             "pod group",
             "podgroup",
@@ -230,7 +233,10 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "crashloopbackoff",
             "oomkilled",
             "failedmount",
-            "createcontainer",
+            "createcontainererror",
+            "createcontainerconfigerror",
+            "backofflimitexceeded",
+            "job has reached the specified backoff limit",
             "back-off restarting",
             "startup probe",
             "runcontainererror",
@@ -282,6 +288,10 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "remote transport",
             "completion queue",
             "retry exhaustion",
+            "ncclinternalerror",
+            "ncclsystemerror",
+            "ncclunhandledcudaerror",
+            "nccltimeout",
         ),
     ),
     "cluster_network_error": (
@@ -292,6 +302,7 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "cni plugin",
             "name resolution failed",
             "networkplugin",
+            "networkpluginnotready",
             "no route to host",
         ),
     ),
@@ -318,6 +329,7 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "read-only file system",
             "nfs server",
             "ceph",
+            "cephfs",
             "input/output error",
         ),
     ),
@@ -1490,6 +1502,11 @@ def _keyword_hits(text: str, keywords: list[str]) -> tuple[list[str], bool]:
             ].isalnum():
                 token_end += 1
             token = text[token_start:token_end]
+            if keyword[-1].isalnum() and end < len(text) and text[end].isascii() and text[end].isalnum():
+                if text[end:token_end] not in _STEM_SUFFIXES:
+                    start = end
+                    continue
+            # Guards the left-lenient suffix path for known compound tokens.
             if token != keyword and token in _ATOMIC_OBSERVATION_TOKENS:
                 start = end
                 continue

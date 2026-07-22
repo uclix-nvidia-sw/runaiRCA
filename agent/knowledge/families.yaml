@@ -16,6 +16,7 @@
     - pidpressure
     - node pressure
     - evict
+    - evictionthresholdmet
   planner_keywords:
     - diskpressure
     - memorypressure
@@ -33,6 +34,7 @@
     - runai
   keywords:
     - preempt
+    - preemptlowerpriority
     - reclaim
     - pod group
     - podgroup
@@ -131,7 +133,10 @@
     - crashloopbackoff
     - oomkilled
     - failedmount
-    - createcontainer
+    - createcontainererror
+    - createcontainerconfigerror
+    - backofflimitexceeded
+    - job has reached the specified backoff limit
     - back-off restarting
     - startup probe
     - runcontainererror
@@ -216,6 +221,10 @@
     - "remote transport"
     - "completion queue"
     - "retry exhaustion"
+    - "ncclinternalerror"
+    - "ncclsystemerror"
+    - "ncclunhandledcudaerror"
+    - "nccltimeout"
   planner_keywords:
     - "nccl"
     - "infiniband"
@@ -234,6 +243,7 @@
     - "cni plugin"
     - "name resolution failed"
     - "networkplugin"
+    - "networkpluginnotready"
     - "no route to host"
   planner_keywords:
     - "dns"
@@ -275,6 +285,7 @@
     - "read-only file system"
     - "nfs server"
     - "ceph"
+    - "cephfs"
     - "input/output error"
   planner_keywords:
     - "nfs"
