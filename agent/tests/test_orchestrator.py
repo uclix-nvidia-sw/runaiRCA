@@ -32,7 +32,6 @@ from app.services.orchestrator import AnalysisOrchestrator
 
 def make_settings() -> Settings:
     return Settings(
-        port=8000,
         log_level="info",
         language="en",
         kubernetes_api_url="https://kubernetes.default.svc",

@@ -38,7 +38,7 @@ _FAMILY_KEYWORDS: dict[str, tuple[str, ...]] = {
         "runai-backend", "backend", "authorization", "database",
     ),
     "workload_startup_error": (
-        "crashloop", "oomkill", "startup", "container", "mount",
+        "crashloop", "crashloopbackoff", "oomkill", "startup", "container", "mount",
     ),
     "image_pull_error": (
         "image pull", "imagepull", "errimagepull", "imagepullbackoff",

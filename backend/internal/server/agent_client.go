@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -17,6 +18,7 @@ type AgentAnalysisRequest struct {
 	Alert            Alert             `json:"alert"`
 	ThreadTS         string            `json:"thread_ts"`
 	IncidentID       string            `json:"incident_id,omitempty"`
+	RunID            string            `json:"run_id,omitempty"`
 	AnalysisType     string            `json:"analysis_type,omitempty"`
 	SeedFamily       string            `json:"seed_family,omitempty"`
 	Language         string            `json:"language,omitempty"`
@@ -132,6 +134,27 @@ func (s *Server) callAnalyze(req AgentAnalysisRequest, timeout time.Duration) (A
 		return AgentAnalysisResponse{}, &AgentError{Kind: agentErrInvalidJSON, Err: err}
 	}
 	return analysis, nil
+}
+
+// cancelAgentRun asks the agent to stop the in-flight /analyze task for runID.
+// Best-effort: the agent cancels its pipeline task immediately; even if this call
+// fails, the run still terminates when the agent request returns or hits the
+// analysis deadline.
+func (s *Server) cancelAgentRun(runID string) {
+	if s.agentURL == "" || runID == "" || s.client == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, s.agentURL+"/analyze/cancel?run_id="+url.QueryEscape(runID), nil,
+	)
+	if err != nil {
+		return
+	}
+	if resp, err := s.client.Do(req); err == nil {
+		_ = resp.Body.Close()
+	}
 }
 
 // callChat posts a chat request to the agent and returns a structured response

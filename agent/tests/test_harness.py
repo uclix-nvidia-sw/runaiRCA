@@ -169,6 +169,92 @@ def test_explicit_unrelated_support_link_is_rejected() -> None:
     assert verdict.gates["invalid_evidence_links"] is True
 
 
+def test_non_catalog_family_requires_signature_grounded_support() -> None:
+    result = _result("system", "generic evidence without the promoted signature")
+    result.artifacts[0].result = {"observation": _scoped_observation()}
+    assign_evidence_ids([result])
+    cause = RankedCause(
+        "expected_known_behavior",
+        "medium",
+        5,
+        rationale=[
+            "matched known-issue signature: Distributed Training Backoff And Restart Policy Semantics"
+        ],
+        support_evidence_ids=["E01"],
+    )
+
+    verdict = evaluate(
+        _response("## Root Cause\n\nKnown behavior [E01]."),
+        [result],
+        [cause],
+        known_issues=[
+            {
+                "issue": "Distributed Training Backoff And Restart Policy Semantics",
+                "keywords": ["master-restart-policy", "--backoff-limit"],
+            }
+        ],
+    )
+
+    assert verdict.claims[0]["supporting_evidence"] == []
+    assert verdict.gates["invalid_evidence_links"] is True
+
+
+def test_non_catalog_family_with_matching_artifact_passes() -> None:
+    result = _result("system", "master-restart-policy is configured")
+    result.artifacts[0].result = {"observation": _scoped_observation()}
+    assign_evidence_ids([result])
+    cause = RankedCause(
+        "expected_known_behavior",
+        "medium",
+        5,
+        rationale=[
+            "matched known-issue signature: Distributed Training Backoff And Restart Policy Semantics"
+        ],
+        support_evidence_ids=["E01"],
+    )
+
+    verdict = evaluate(
+        _response("## Root Cause\n\nKnown behavior [E01]."),
+        [result],
+        [cause],
+        known_issues=[
+            {
+                "issue": "Distributed Training Backoff And Restart Policy Semantics",
+                "keywords": ["master-restart-policy", "--backoff-limit"],
+            }
+        ],
+    )
+
+    assert verdict.claims[0]["supporting_evidence"] == ["E01"]
+    assert verdict.gates["invalid_evidence_links"] is False
+    assert verdict.gates["missing_evidence_trace"] is False
+
+
+def test_non_catalog_family_without_catalog_fails_closed() -> None:
+    result = _result("system", "master-restart-policy is configured")
+    result.artifacts[0].result = {"observation": _scoped_observation()}
+    assign_evidence_ids([result])
+    cause = RankedCause(
+        "expected_known_behavior",
+        "medium",
+        5,
+        rationale=[
+            "matched known-issue signature: Distributed Training Backoff And Restart Policy Semantics"
+        ],
+        support_evidence_ids=["E01"],
+    )
+
+    verdict = evaluate(
+        _response("## Root Cause\n\nKnown behavior [E01]."),
+        [result],
+        [cause],
+        known_issues=None,
+    )
+
+    assert verdict.claims[0]["supporting_evidence"] == []
+    assert verdict.gates["invalid_evidence_links"] is True
+
+
 def test_trace_does_not_promote_loose_result_fields_to_scoped_evidence() -> None:
     item = _result("loki", "remote body says OOMKilled")
     item.artifacts[0].evidence_id = "E01"
@@ -459,6 +545,24 @@ def test_abstain_preserves_leading_family_as_a_low_confidence_hypothesis() -> No
     assert "historical re-analysis" in response.analysis_detail
     assert "low-confidence inference" in response.analysis_detail
     assert "rather than guessing" not in response.analysis_detail
+
+
+def test_abstain_renders_korean_when_language_ko() -> None:
+    response = _response()
+    candidates = [
+        RankedCause("gpu_hardware_error", "medium", 5, evidence_agents=["loki"])
+    ]
+    verdict = evaluate(response, [], candidates)
+
+    abstain(response, candidates, verdict, language="ko")
+
+    # Korean headings + note, and no English fallback strings leaking through.
+    assert "## 평가" in response.analysis_detail
+    assert "## 필요한 다음 점검" in response.analysis_detail
+    assert "낮은 확신도" in response.analysis_summary
+    assert "## Assessment" not in response.analysis_detail
+    # The abstain LOGIC is unchanged — still flips to insufficient_evidence.
+    assert response.root_cause_family == "insufficient_evidence"
 
 
 def test_abstain_without_a_candidate_does_not_invent_a_family() -> None:

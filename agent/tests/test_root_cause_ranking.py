@@ -372,6 +372,108 @@ def test_kubernetes_positive_event_reason_and_log_line_remain_rankable() -> None
     assert "oomkilled" in text
 
 
+def test_image_pull_warning_with_grammatical_negation_still_ranks() -> None:
+    """A real ImagePullBackOff Warning ("repository does not exist", "no such
+    host") must not be vetoed by the value-blind negation filter — the "not"/"no"
+    is part of the failure, not a healthy-condition negation. Regression for a run
+    that abstained on an obvious 187-event image pull failure because "does not
+    exist" tripped the bare "not"."""
+    warning_event = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_warning_events",
+        status="ok",
+        confidence="high",
+        summary="Kubernetes Warning events: image pull failure was returned.",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "pod", "name": "trainer-abc-x1"},
+            },
+            "events": [
+                {
+                    "type": "Warning",
+                    "reason": "Failed",
+                    "message": (
+                        'Failed to pull image "ngink": pull access denied, '
+                        "repository does not exist or may require authorization"
+                    ),
+                }
+            ],
+        },
+    )
+    result = _r("kubernetes", artifacts=[warning_event])
+
+    text = _result_text(result)
+    # The failure message survived the filter (was dropped before the fix).
+    assert "pull access denied" in text
+    assert (
+        rank_root_cause_candidates(_target(alert_name="KubePodNotReady"), [result])[0].family
+        == "image_pull_error"
+    )
+
+
+def test_pod_log_dns_registry_failure_with_negation_still_ranks() -> None:
+    """The same class of bug beyond ImagePullBackOff: a workload log line that
+    DESCRIBES a failure with a grammatical negation ("no such host") must survive
+    the free-text filter and rank. Before the fix the bare "no" discarded it."""
+    pod_log = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_pod_log",
+        status="ok",
+        confidence="high",
+        summary="Kubernetes Pod log: matching incident-window line was present.",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "pod", "name": "trainer-abc-x1"},
+            },
+            "sample_entries": [
+                {"line": "dial tcp: lookup registry.internal: no such host"},
+            ],
+        },
+    )
+    result = _r("kubernetes", artifacts=[pod_log])
+
+    text = _result_text(result)
+    assert "no such host" in text
+    assert (
+        rank_root_cause_candidates(_target(alert_name="KubePodNotReady"), [result])[0].family
+        == "image_pull_error"
+    )
+
+
+def test_pod_log_negative_condition_value_stays_dropped() -> None:
+    """The value-blind healthy case the filter legitimately guards is preserved:
+    a condition explicitly VALUED negative ("MemoryPressure=false") must NOT score
+    node pressure, even though the relaxed filter now admits grammatical negation."""
+    pod_log = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_pod_log",
+        status="ok",
+        confidence="high",
+        summary="Kubernetes Pod log: matching incident-window line was present.",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "pod", "name": "trainer-abc-x1"},
+            },
+            "sample_entries": [
+                {"line": "node status MemoryPressure=false DiskPressure=false"},
+            ],
+        },
+    )
+    result = _r("kubernetes", artifacts=[pod_log])
+
+    assert "memorypressure" not in _result_text(result).casefold()
+    assert rank_root_cause_candidates(_target(), [result])[0].family == "insufficient_evidence"
+
+
 def test_exact_podgroup_gpu_shortage_routes_to_runai_scheduling() -> None:
     warning_event = artifact(
         agent="kubernetes",
@@ -519,7 +621,7 @@ def test_feedback_prior_requires_typed_current_incident_observation() -> None:
     # Feedback is constructed from a *prior* incident.  A legacy free-text
     # result can still be useful operator context, but it must not receive a
     # score boost unless this incident has a typed, scoped observation.
-    legacy = _r("kubernetes", summary="runai-backend reconcile failed")
+    legacy = _r("kubernetes", summary="runai-backend reconciler error")
     baseline = rank_root_cause_candidates(
         _target(), [legacy], priors={"runai_control_plane_error": 1.5}
     )
@@ -539,7 +641,7 @@ def test_feedback_prior_requires_typed_current_incident_observation() -> None:
         type="warning_event",
         status="ok",
         confidence="high",
-        summary="runai-backend reconcile failed in incident window",
+        summary="runai-backend failed to reconcile in incident window",
         result={
             "observation": {
                 "polarity": "present",
@@ -581,7 +683,7 @@ def test_feedback_prior_rejects_other_entity_or_out_of_incident_observation() ->
             type="warning_event",
             status="ok",
             confidence="high",
-            summary="runai-backend reconcile failed",
+            summary="runai-backend reconciler error",
             result={
                 "observation": {
                     "polarity": "present",
@@ -770,7 +872,13 @@ def test_trigger_facet_survives_signature_promotion() -> None:
     lifecycle_cause = next(c for c in ranked if c.family == "platform_lifecycle_change")
     assert lifecycle_cause.trigger  # ranker set it
 
-    symptom = ("platform_lifecycle_change", {"symptom": "Controller Rollout In Progress"})
+    symptom = (
+        "platform_lifecycle_change",
+        {
+            "symptom": "Controller Rollout In Progress",
+            "matched_keywords": ["mid-rollout"],
+        },
+    )
 
     # Path A: lifecycle family is already the ranker's top → _with_signature_support.
     top_first = [lifecycle_cause, *[c for c in ranked if c.family != "platform_lifecycle_change"]]

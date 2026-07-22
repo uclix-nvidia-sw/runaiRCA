@@ -23,6 +23,7 @@ _PROBE_TEMPLATE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 # suffix matching, so lexical boundary rules cannot distinguish same-suffix
 # collisions. Extend this set only when a new collision is verified.
 _ATOMIC_OBSERVATION_TOKENS = frozenset({"progressdeadlineexceeded"})
+_STEM_SUFFIXES = frozenset({"e", "s", "es", "d", "ed", "ing", "ion", "ions", "er", "ers", "or", "ors"})
 _BUNDLED_TROUBLESHOOTING_TREE = (
     Path(__file__).resolve().parent.parent / "knowledge" / "k8s_troubleshooting_tree.yaml"
 )
@@ -163,6 +164,7 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "pidpressure",
             "node pressure",
             "evict",
+            "evictionthresholdmet",
         ),
     ),
     "runai_scheduling_quota": (
@@ -170,6 +172,7 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
         ("prometheus", "kubernetes", "runai"),
         (
             "preempt",
+            "preemptlowerpriority",
             "reclaim",
             "pod group",
             "podgroup",
@@ -201,10 +204,10 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
         "loki",
         ("loki", "kubernetes"),
         (
-            "reconcile",
+            "reconciler error",
             "runai-backend",
             "cluster-sync",
-            "authorization",
+            "failed to reconcile",
             "database error",
         ),
     ),
@@ -230,7 +233,10 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "crashloopbackoff",
             "oomkilled",
             "failedmount",
-            "createcontainer",
+            "createcontainererror",
+            "createcontainerconfigerror",
+            "backofflimitexceeded",
+            "job has reached the specified backoff limit",
             "back-off restarting",
             "startup probe",
             "runcontainererror",
@@ -248,8 +254,7 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "manifest for",
             "toomanyrequests",
             "pull access denied",
-            "no such host",
-            "registry",
+            "dial tcp: lookup",
         ),
     ),
     "gpu_hardware_error": (
@@ -282,6 +287,10 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "remote transport",
             "completion queue",
             "retry exhaustion",
+            "ncclinternalerror",
+            "ncclsystemerror",
+            "ncclunhandledcudaerror",
+            "nccltimeout",
         ),
     ),
     "cluster_network_error": (
@@ -292,6 +301,7 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "cni plugin",
             "name resolution failed",
             "networkplugin",
+            "networkpluginnotready",
             "no route to host",
         ),
     ),
@@ -318,6 +328,7 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
             "read-only file system",
             "nfs server",
             "ceph",
+            "cephfs",
             "input/output error",
         ),
     ),
@@ -1359,7 +1370,7 @@ def match_runai_known_issues(
     for entry in catalog:
         matched, _negated = _keyword_hits(text, entry["keywords"])
         if matched:
-            hits.append(entry)
+            hits.append({**entry, "matched_keywords": matched})
     return hits
 
 
@@ -1410,7 +1421,7 @@ def match_failure_mode_symptoms(
             for symptom in symptoms or []
         ]
         matched = [
-            (family, {**symptom, "matched_via": "bm25"})
+            (family, {**symptom, "matched_via": "bm25", "matched_keywords": []})
             for (family, symptom), _score in BM25Index(docs).search(
                 _redact_negated_keywords(fuzzy_query.lower(), all_keywords), top_k=3
             )
@@ -1431,7 +1442,7 @@ def match_failure_mode_symptoms(
             for stronger in kept_hits
         ):
             continue
-        kept.append((family, symptom))
+        kept.append((family, {**symptom, "matched_keywords": hits}))
         kept_hits.append(hits)
     return kept
 
@@ -1444,7 +1455,10 @@ _GENERIC_CONTEXT_HITS = {
 
 
 def _symptom_context_supported(family: str, symptom: dict[str, Any], text: str) -> bool:
-    if family != "image_pull_error" or symptom.get("symptom") != "Registry TLS Certificate Error":
+    if family != "image_pull_error" or symptom.get("symptom") not in {
+        "Registry TLS Certificate Error",
+        "Registry Server 5xx / DNS Lookup Failure On Pull",
+    }:
         return True
     return any(
         marker in text
@@ -1490,6 +1504,11 @@ def _keyword_hits(text: str, keywords: list[str]) -> tuple[list[str], bool]:
             ].isalnum():
                 token_end += 1
             token = text[token_start:token_end]
+            if keyword[-1].isalnum() and end < len(text) and text[end].isascii() and text[end].isalnum():
+                if text[end:token_end] not in _STEM_SUFFIXES:
+                    start = end
+                    continue
+            # Guards the left-lenient suffix path for known compound tokens.
             if token != keyword and token in _ATOMIC_OBSERVATION_TOKENS:
                 start = end
                 continue

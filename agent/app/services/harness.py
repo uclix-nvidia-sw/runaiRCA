@@ -19,10 +19,12 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from app.collectors.base import NO_EVIDENCE, CollectorResult
+from app.knowledge import _keyword_hits
 from app.schemas import AlertAnalysisResponse
 from app.services.root_cause_ranking import (
     FAMILIES,
     RankedCause,
+    _artifact_family_semantics,
     artifact_contradicts_family,
     artifact_supports_family,
 )
@@ -157,6 +159,34 @@ def assign_evidence_ids(results: list[CollectorResult]) -> list[object]:
     return artifacts
 
 
+def _promoted_issue_keywords(
+    top: RankedCause | None, known_issues: list[dict] | None
+) -> tuple[str, ...] | None:
+    if top is None or known_issues is None:
+        return None
+    for rationale in getattr(top, "rationale", []) or []:
+        match = re.fullmatch(r"matched known-issue signature:\s*(.+)", str(rationale))
+        if not match:
+            continue
+        issue_name = match.group(1)
+        for entry in known_issues:
+            if not isinstance(entry, Mapping) or entry.get("issue") != issue_name:
+                continue
+            keywords = entry.get("keywords")
+            if not isinstance(keywords, (list, tuple)):
+                return None
+            return tuple(str(keyword).lower() for keyword in keywords)
+        return None
+    return None
+
+
+def _grounds_promoted_issue(artifact: object, issue_keywords: tuple[str, ...] | None) -> bool:
+    if not issue_keywords:
+        return False
+    _agent, _predicate, text = _artifact_family_semantics(artifact)
+    return bool(_keyword_hits(text, list(issue_keywords))[0])
+
+
 def evaluate(
     response: AlertAnalysisResponse,
     results: list[CollectorResult],
@@ -165,6 +195,7 @@ def evaluate(
     next_check: str = "",
     evidence_links: Iterable[EvidenceLink | Mapping[str, Any]] | None = None,
     evidence_eligibility: Mapping[str, object] | None = None,
+    known_issues: list[dict] | None = None,
 ) -> HarnessVerdict:
     top = candidates[0] if candidates else None
     usable = _usable_artifacts(results)
@@ -173,6 +204,9 @@ def evaluate(
         by_agent.setdefault(str(getattr(item, "agent", "")), []).append(item)
 
     family = str(getattr(top, "family", "") or "")
+    issue_keywords = (
+        _promoted_issue_keywords(top, known_issues) if family not in FAMILIES else None
+    )
     agents = set(getattr(top, "evidence_agents", []) or []) if top else set()
     agent_supporting = [item for agent in agents for item in by_agent.get(agent, [])]
     if _signature_support(top):
@@ -225,6 +259,19 @@ def evaluate(
                     continue
             semantically_valid.append(link)
         links = semantically_valid
+    else:
+        semantically_valid = []
+        for link in links:
+            artifact = by_id.get(link.fact_id)
+            if artifact is not None and link.role == "support" and not _grounds_promoted_issue(
+                artifact, issue_keywords
+            ):
+                link_errors.append(
+                    f"link to {link.fact_id!r} does not ground promoted known-issue family {family!r}"
+                )
+                continue
+            semantically_valid.append(link)
+        links = semantically_valid
     # Legacy callers derive support from the ranker's evidence agents.  New
     # callers provide explicit support/contradiction links and get exact claim
     # grounding instead of an agent-name approximation.
@@ -240,7 +287,11 @@ def evaluate(
                 is not None
                 and callable(getattr(eligibility, "permits", None))
                 and eligibility.permits("support")
-                and (family not in FAMILIES or artifact_supports_family(family, item))
+                and (
+                    artifact_supports_family(family, item)
+                    if family in FAMILIES
+                    else _grounds_promoted_issue(item, issue_keywords)
+                )
             )
         ]
         claim_links = [
@@ -415,6 +466,7 @@ def abstain(
     verdict: HarnessVerdict,
     *,
     historical_reanalysis: bool = False,
+    language: str = "en",
 ) -> None:
     """Return an unresolved RCA without discarding a useful working hypothesis.
 
@@ -425,6 +477,7 @@ def abstain(
     so operators and Top-N evaluation can still inspect it without mistaking it
     for verified evidence or remediation authority.
     """
+    ko = language == "ko"
     previous_top = next(
         (candidate for candidate in candidates if candidate.family != "insufficient_evidence"),
         None,
@@ -447,46 +500,87 @@ def abstain(
     response.analysis_quality = "degraded"
     if provisional is not None:
         response.context["provisional_root_cause"] = provisional.as_dict()
-        response.analysis_summary = (
-            f"Root cause is unconfirmed; {provisional.family} remains a low-confidence "
-            "working hypothesis."
-        )
-        historical_note = (
-            "Because this is a historical re-analysis, incomplete telemetry is expected. "
-            if historical_reanalysis
-            else ""
-        )
-        hypothesis_note = (
-            f"{historical_note}The leading family `{provisional.family}` is retained as a "
-            "low-confidence inference from the remaining signals. It is not a verified cause "
-            "or justification for cause-specific remediation."
-        )
-        verification_check = (
-            "- Verify the leading hypothesis with a read-only query before any disruptive action.\n"
-        )
+        if ko:
+            response.analysis_summary = (
+                f"근본 원인은 미확정입니다. `{provisional.family}`이(가) 낮은 확신도의 "
+                "잠정 가설로 남아 있습니다."
+            )
+            historical_note = (
+                "과거 인시던트 재분석이라 텔레메트리 일부 누락은 예상됩니다. "
+                if historical_reanalysis
+                else ""
+            )
+            hypothesis_note = (
+                f"{historical_note}가장 유력한 family `{provisional.family}`은(는) 남은 신호로부터의 "
+                "낮은 확신도 추론으로 유지됩니다. 검증된 원인이나 원인별 조치의 근거가 아닙니다."
+            )
+            verification_check = (
+                "- 파괴적 조치를 취하기 전에 읽기 전용 쿼리로 유력 가설을 검증하세요.\n"
+            )
+        else:
+            response.analysis_summary = (
+                f"Root cause is unconfirmed; {provisional.family} remains a low-confidence "
+                "working hypothesis."
+            )
+            historical_note = (
+                "Because this is a historical re-analysis, incomplete telemetry is expected. "
+                if historical_reanalysis
+                else ""
+            )
+            hypothesis_note = (
+                f"{historical_note}The leading family `{provisional.family}` is retained as a "
+                "low-confidence inference from the remaining signals. It is not a verified cause "
+                "or justification for cause-specific remediation."
+            )
+            verification_check = (
+                "- Verify the leading hypothesis with a read-only query before any disruptive action.\n"
+            )
     else:
         response.context.pop("provisional_root_cause", None)
-        response.analysis_summary = "Root cause is not confirmed by the collected evidence."
-        hypothesis_note = (
-            "The available signals do not support even a specific working hypothesis yet."
+        if ko:
+            response.analysis_summary = "수집된 증거로는 근본 원인이 확정되지 않았습니다."
+            hypothesis_note = "현재 신호로는 특정 잠정 가설조차 세울 수 없습니다."
+            verification_check = (
+                "- family를 선택하기 전에 대상·인시던트 시간창으로 스코프된 신호를 "
+                "최소 1개 이상 수집하세요.\n"
+            )
+        else:
+            response.analysis_summary = "Root cause is not confirmed by the collected evidence."
+            hypothesis_note = (
+                "The available signals do not support even a specific working hypothesis yet."
+            )
+            verification_check = (
+                "- Collect at least one target- and incident-window-scoped signal "
+                "before selecting a family.\n"
+            )
+    if ko:
+        response.analysis_detail = (
+            "## 평가\n\n"
+            "수집된 증거로는 근본 원인 family를 확정할 수 없습니다. "
+            + hypothesis_note
+            + "\n\n"
+            "## 필요한 다음 점검\n\n"
+            "- 대상 워크로드와 인시던트 시간창에 대해 사용 불가였거나 비어 있던 증거 소스를 "
+            "다시 수집하세요.\n"
+            + verification_check
+            + "\n"
+            "## Harness 판정\n\n"
+            + "\n".join(f"- {name}" for name in verdict.failed_gates)
         )
-        verification_check = (
-            "- Collect at least one target- and incident-window-scoped signal "
-            "before selecting a family.\n"
+    else:
+        response.analysis_detail = (
+            "## Assessment\n\n"
+            "The collected evidence does not support confirming a root-cause family. "
+            + hypothesis_note
+            + "\n\n"
+            "## Required Next Checks\n\n"
+            "- Re-run the unavailable or empty evidence source for the affected workload "
+            "and incident window.\n"
+            + verification_check
+            + "\n"
+            "## Harness Findings\n\n"
+            + "\n".join(f"- {name}" for name in verdict.failed_gates)
         )
-    response.analysis_detail = (
-        "## Assessment\n\n"
-        "The collected evidence does not support confirming a root-cause family. "
-        + hypothesis_note
-        + "\n\n"
-        "## Required Next Checks\n\n"
-        "- Re-run the unavailable or empty evidence source for the affected workload "
-        "and incident window.\n"
-        + verification_check
-        + "\n"
-        "## Harness Findings\n\n"
-        + "\n".join(f"- {name}" for name in verdict.failed_gates)
-    )
     response.analysis = response.analysis_detail
 
 

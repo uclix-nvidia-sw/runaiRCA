@@ -78,6 +78,22 @@ def test_lines_tolerates_shapes() -> None:
     assert _lines("nope") == []
 
 
+@pytest.mark.parametrize(
+    ("line", "flagged"),
+    [
+        ("Replay Error Counter: 12", False),
+        ("Recovery Error Counter: 3", False),
+        ("CRC Error Counter: 7", False),
+        ("Error Count: 3", True),
+        ("uncorrectable error", True),
+    ],
+)
+def test_snapshot_error_patterns_filter_benign_nvlink_counters(
+    line: str, flagged: bool
+) -> None:
+    assert bool(system_mod._matching_lines("nvlink", [line])) is flagged
+
+
 @pytest.mark.asyncio
 async def test_unconfigured_is_unavailable() -> None:
     class Off(_Settings):

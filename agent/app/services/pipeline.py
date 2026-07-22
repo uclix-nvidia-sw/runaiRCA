@@ -28,6 +28,7 @@ from app.collectors.base import artifact as make_artifact
 from app.collectors.registry import build_collectors, unknown_collector_names
 from app.config import Settings
 from app.knowledge import (
+    _keyword_hits,
     _keyword_negated,
     component_action_lines,
     component_check_lines,
@@ -1427,12 +1428,33 @@ def _lifecycle_signal(
         for c in changes
         if isinstance(c, dict) and c.get("rollout") and c.get("name")
     }
+    helm_changed = {
+        str(c.get("name"))
+        for c in changes
+        if isinstance(c, dict)
+        and (c.get("kind") or c.get("type")) == "HelmRelease"
+        and c.get("name")
+    }
     if not rolling:
         return {}
     implicated = set(chain or ([component] if component else []))
     hit = sorted(rolling & implicated)
     if not hit:
         return {}
+    target_rollout = bool(
+        component
+        and component in rolling
+        and (
+            any(
+                str(c.get("name")) == component
+                and c.get("rollout")
+                and c.get("corroborated", True)
+                for c in changes
+                if isinstance(c, dict)
+            )
+            or component in helm_changed
+        )
+    )
     # Name the upstream Helm trigger (if any) among the matched components so the
     # ranker rationale can point at the real change instead of a downstream symptom.
     helm = [
@@ -1445,7 +1467,7 @@ def _lifecycle_signal(
     signal: dict[str, object] = {
         "active": True,
         "components": hit,
-        "target_rollout": bool(component and component in rolling),
+        "target_rollout": target_rollout,
     }
     if helm:
         signal["helm"] = helm
@@ -1534,6 +1556,9 @@ async def rank_stage(state: PipelineState) -> PipelineState:
     state.observed = _observed_text(
         state.results, request, eligible_support_ids=eligible_support_ids
     )
+    evidence_observed = _observed_text(
+        state.results, None, eligible_support_ids=eligible_support_ids
+    )
     state.xid_codes = _xid_codes_from_results(
         state.results,
         _alert_text(request),
@@ -1617,6 +1642,7 @@ async def rank_stage(state: PipelineState) -> PipelineState:
         _gate_lifecycle_symptoms(
             match_failure_mode_symptoms(state.failure_modes, state.observed), lifecycle
         ),
+        evidence_text=evidence_observed,
     )
     open_world = _merge_open_world_candidates(state, state.root_cause_candidates)
     # Shadow and assist expose evidence-gated novel reasoning in context without
@@ -2193,11 +2219,6 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
 
 async def harness_stage(state: PipelineState) -> PipelineState:
     """Validate the already-synthesized RCA and make bounded safe repairs."""
-    from app.services.critic import (
-        CriticResult,
-        apply_safe_patches,
-        critique_claims,
-    )
     from app.services.harness import (
         abstain,
         analysis_hash,
@@ -2226,28 +2247,8 @@ async def harness_stage(state: PipelineState) -> PipelineState:
         state.root_cause_candidates,
         next_check=state.self_check_next,
         evidence_eligibility=_public_evidence_eligibility(state),
+        known_issues=state.known_issues,
     )
-    evidence_ids = [
-        str(getattr(artifact, "evidence_id", ""))
-        for artifact in state.artifacts
-        if getattr(artifact, "evidence_id", "")
-    ]
-    critic = critique_claims(verdict.claims, available_evidence_ids=evidence_ids)
-    llm_critic = await _semantic_critic(
-        state.settings,
-        verdict.claims,
-        available_evidence_ids=evidence_ids,
-    )
-    if not llm_critic.is_noop:
-        critic = CriticResult(
-            issues=(*critic.issues, *llm_critic.issues),
-            patches=(*critic.patches, *llm_critic.patches),
-            status="issues",
-        )
-    patched_claims = apply_safe_patches(verdict.claims, critic)
-    for claim in patched_claims:
-        if claim.get("claim_id") == "C01" and claim.get("confidence") == "medium":
-            apply_confidence_downgrade(state.root_cause_candidates)
     for _ in range(state.settings.max_rca_repair_attempts):
         if not verdict.failed_gates and verdict.score >= state.settings.rca_harness_pass_score:
             break
@@ -2267,6 +2268,7 @@ async def harness_stage(state: PipelineState) -> PipelineState:
             state.root_cause_candidates,
             next_check=state.self_check_next,
             evidence_eligibility=_public_evidence_eligibility(state),
+            known_issues=state.known_issues,
         )
 
     status = "pass"
@@ -2276,6 +2278,7 @@ async def harness_stage(state: PipelineState) -> PipelineState:
             state.root_cause_candidates,
             verdict,
             historical_reanalysis=_is_resolved_reanalysis(state.request),
+            language=getattr(state.settings, "language", "en"),
         )
         verdict = evaluate(
             response,
@@ -2283,6 +2286,7 @@ async def harness_stage(state: PipelineState) -> PipelineState:
             state.root_cause_candidates,
             next_check=state.self_check_next,
             evidence_eligibility=_public_evidence_eligibility(state),
+            known_issues=state.known_issues,
         )
         status = "abstained"
     elif verdict.score < state.settings.rca_harness_pass_score:
@@ -2299,54 +2303,10 @@ async def harness_stage(state: PipelineState) -> PipelineState:
     ]
     response.context["top_root_cause"] = top.as_dict() if top else None
     response.context["harness"] = payload(verdict, status=status, repairs=repairs)
-    response.context["harness"]["critic"] = critic.as_dict()
     response.context["analysis_hash"] = analysis_hash(response)
     response.analysis = response.analysis_detail
     state.response = response
     return state
-
-
-async def _semantic_critic(
-    settings: Settings,
-    claims: list[dict[str, Any]],
-    *,
-    available_evidence_ids: list[str],
-):
-    """Ask an optional critic for whitelist-only claim patches.
-
-    The critic never sees raw credentials or tool output and its response is
-    parsed by ``parse_critic_result``; it can only downgrade confidence or mark
-    a claim inferred, never manufacture an RCA or remediation.
-    """
-    from app.services.critic import CriticResult, parse_critic_result
-
-    # Stage-model overrides conventionally fall back to LLM_MODEL. Leaving
-    # LLM_MODEL_CRITIC empty must not silently disable the semantic critic.
-    model = str(getattr(settings, "llm_model_critic", "") or "").strip() or settings.llm_model
-    if not llm_configured(settings, model):
-        return CriticResult()
-    try:
-        raw = await complete_json(
-            settings,
-            system=(
-                "You are a skeptical RCA claim critic. Inspect only evidence IDs and claim links. "
-                "Return JSON with optional issues and patches. Allowed patches are exclusively "
-                "downgrade_confidence to low/medium or mark_inferred to inferred. Never add "
-                "evidence, actions, mechanisms, or prose."
-            ),
-            user=json.dumps(
-                {"claims": claims, "available_evidence_ids": available_evidence_ids},
-                ensure_ascii=False,
-            ),
-            model=model,
-        )
-    except Exception:  # noqa: BLE001 - critic is advisory, hard gates remain local
-        return CriticResult()
-    return parse_critic_result(
-        raw,
-        claim_ids=[str(claim.get("claim_id") or "") for claim in claims],
-        available_evidence_ids=available_evidence_ids,
-    )
 
 
 async def run_pipeline(
@@ -2803,6 +2763,9 @@ async def _reanalyze_once(
             state.request,
             eligible_support_ids=eligible_support_ids,
         )
+        evidence_observed = _observed_text(
+            merged_results, None, eligible_support_ids=eligible_support_ids
+        )
         candidates = _promote_signature_cause(
             candidates,
             _xid_codes_from_results(
@@ -2814,6 +2777,7 @@ async def _reanalyze_once(
             _gate_lifecycle_symptoms(
                 match_failure_mode_symptoms(state.failure_modes, observed), lifecycle
             ),
+            evidence_text=evidence_observed,
         )
         if target.refuted_family and not _fresh_results_support_family(
             target.refuted_family,
@@ -3046,6 +3010,13 @@ async def _synthesize_korean(
         ),
     }
     system = (
+        # Synthesis DOES reason: it writes the causal inference (근거→결론 논리), applies
+        # the evidence_role discipline (only `support` artifacts back the cause), weighs
+        # competing troubleshooting_path hypotheses, and judges confidence — so keep the
+        # model's chain-of-thought ON. The failure mode is only that a reasoning model
+        # spends part of max_tokens on <think> before the report JSON, so the fix is a
+        # generous llm_synthesis_max_tokens (reasoning + full report both fit), NOT
+        # disabling reasoning. If synthesis logs "looks TRUNCATED", raise that budget.
         "당신은 NVIDIA Run:ai GPU 플랫폼을 담당하는 시니어 SRE입니다. 제공된 증거(수집기별 "
         "발견 사항, 조사 계획, 순위가 매겨진 원인 후보, 지식 그래프/함수 기반 조치, 매칭된 "
         "내장 알림, 유사 인시던트)에만 근거하여 한국어로 장애 분석 보고서를 작성하세요.\n"
@@ -4176,11 +4147,25 @@ def _xid_diagnostic_guidance_lines(
     ]
 
 
+def _specific_keyword(kw: str) -> bool:
+    return len(kw) >= 8 or any(not ch.isalnum() for ch in kw)
+
+
+def _promotable(matched: list[str], family: str) -> bool:
+    if not matched:
+        return False
+    if family not in FAMILIES:
+        return len(matched) >= 2
+    return len(matched) >= 2 or any(_specific_keyword(k) for k in matched)
+
+
 def _promote_signature_cause(
     candidates: list[RankedCause],
     xid_codes: list[int],
     known_issue_matches: list[dict],
     symptom_matches: list[tuple[str, dict]],
+    *,
+    evidence_text: str = "",
 ) -> list[RankedCause]:
     """A specific signature names the headline family; the keyword ranker is only
     the no-signal fallback. Precedence: NVIDIA XID (dispositive) > known-issue
@@ -4200,6 +4185,11 @@ def _promote_signature_cause(
                 ),
                 *candidates[1:],
             ]
+        matched_keywords = entry.get("matched_keywords") or []
+        if not _promotable(matched_keywords, family):
+            continue
+        if family not in FAMILIES and not _keyword_hits(evidence_text, matched_keywords)[0]:
+            continue
         lead = RankedCause(
             family=family,
             confidence="medium",
@@ -4219,6 +4209,8 @@ def _promote_signature_cause(
                 ),
                 *candidates[1:],
             ]
+        if not _promotable(symptom.get("matched_keywords") or [], family):
+            continue
         lead = RankedCause(
             family=family,
             confidence="medium",

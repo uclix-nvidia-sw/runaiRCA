@@ -113,6 +113,10 @@ export async function analyzeIncident(id: string): Promise<void> {
   await write(`/api/v1/incidents/${encodeURIComponent(id)}/analyze`);
 }
 
+export async function cancelIncidentAnalysis(id: string): Promise<void> {
+  await write(`/api/v1/incidents/${encodeURIComponent(id)}/cancel`);
+}
+
 export type RCACorrectionInput = {
   root_cause_family: string;
   summary: string;

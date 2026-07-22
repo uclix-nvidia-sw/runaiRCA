@@ -800,6 +800,7 @@ class ChangeCollector:
                         "name": meta.get("name"),
                         "namespace": meta.get("namespace"),
                         "rollout": bool(rollout),
+                        "corroborated": bool(changed_recently),
                         # A currently pending generation can predate the
                         # incident by days. Keep it for operator context, but
                         # require a creation/condition timestamp in a closed

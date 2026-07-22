@@ -68,7 +68,6 @@ def _json_string_list_env(name: str) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class Settings:
-    port: int
     log_level: str
     language: str
     kubernetes_api_url: str
@@ -156,10 +155,13 @@ class Settings:
     max_rca_repair_attempts: int = 3
     rca_harness_pass_score: int = 70
     # Defaulted (keeps existing Settings(...) constructions source-compatible).
-    # Completion budget for the one-shot Korean report JSON: reasoning models
-    # spend it on reasoning tokens FIRST — if synthesis logs empty replies
-    # (finish_reason=length), raise this rather than shrinking the prompt.
-    llm_synthesis_max_tokens: int = 8192
+    # Completion budget for the one-shot Korean report JSON. The default model is a
+    # reasoning model and synthesis genuinely reasons (causal inference, evidence-role
+    # discipline, confidence judgement), so it spends tokens on <think> BEFORE the
+    # report — the budget must hold reasoning + the full report or the JSON truncates
+    # mid-`detail` and the run falls back to the deterministic report. Sized generously
+    # on purpose (accuracy > token cost); if synthesis logs "looks TRUNCATED", raise it.
+    llm_synthesis_max_tokens: int = 32768
     # Short collector insights still need enough room for reasoning models to
     # spend internal reasoning tokens and emit their requested 1-2 sentences.
     llm_insight_max_tokens: int = 512
@@ -167,14 +169,10 @@ class Settings:
     # Keep the complete /analyze JSON below the backend transport ceiling. The
     # response boundary compacts raw evidence before operator-facing RCA text.
     analysis_response_max_bytes: int = 1572864
-    # Deprecated no-op retained only for Settings(...) compatibility. The
-    # re-analysis loop stops on semantic completion or the outer deadline.
-    max_investigation_iterations: int = 0
     # Open-world reasoning is introduced in shadow mode first.  Keeping this a
     # single mode rather than a cluster of booleans makes it possible to roll
     # back the whole behaviour without changing collector configuration.
     open_world_rca_mode: str = "shadow"  # off | shadow | assist | authoritative
-    llm_model_critic: str = ""
     # Approved incident-derived knowledge is fetched read-only from the backend.
     # These defaults preserve existing Settings(...) callers and keep a rollout
     # reversible without changing the version-controlled baseline catalogs.
@@ -201,7 +199,6 @@ def load_settings() -> Settings:
         runtime_knowledge_url = f"{backend_url}/api/v1/knowledge/runtime-snapshot"
 
     return Settings(
-        port=_int_env("PORT", 8000),
         log_level=os.getenv("LOG_LEVEL", "info"),
         language=language,
         kubernetes_api_url=os.getenv("KUBERNETES_API_URL", "https://kubernetes.default.svc")
@@ -314,7 +311,6 @@ def load_settings() -> Settings:
         llm_model_synthesis=os.getenv("LLM_MODEL_SYNTHESIS", "").strip(),
         llm_model_chat=os.getenv("LLM_MODEL_CHAT", "").strip(),
         llm_model_insight=os.getenv("LLM_MODEL_INSIGHT", "").strip(),
-        llm_model_critic=os.getenv("LLM_MODEL_CRITIC", "").strip(),
         llm_pricing_json=os.getenv("LLM_PRICING_JSON", "{}").strip(),
         llm_api_key=os.getenv("LLM_API_KEY", "").strip(),
         # Generous per-call ceiling so a reasoning agent is never cut off mid-thought;
@@ -323,7 +319,7 @@ def load_settings() -> Settings:
         # Completion budget for the one-shot Korean report JSON. Reasoning models
         # spend this on reasoning tokens FIRST — if synthesis logs empty replies
         # (finish_reason=length), raise this rather than shrinking the prompt.
-        llm_synthesis_max_tokens=_int_env("LLM_SYNTHESIS_MAX_TOKENS", 8192),
+        llm_synthesis_max_tokens=_int_env("LLM_SYNTHESIS_MAX_TOKENS", 32768),
         llm_insight_max_tokens=_int_env("LLM_INSIGHT_MAX_TOKENS", 512),
         analysis_response_max_bytes=max(
             64 << 10,
@@ -359,7 +355,6 @@ def load_settings() -> Settings:
         enable_rca_output_harness=_bool_env("ENABLE_RCA_OUTPUT_HARNESS", True),
         max_rca_repair_attempts=_nonnegative_int_env("MAX_RCA_REPAIR_ATTEMPTS", 3),
         rca_harness_pass_score=max(0, min(100, _int_env("RCA_HARNESS_PASS_SCORE", 70))),
-        max_investigation_iterations=_nonnegative_int_env("MAX_INVESTIGATION_ITERATIONS", 0),
         open_world_rca_mode=_open_world_mode_env(),
         dynamic_knowledge_mode=_dynamic_knowledge_mode_env(),
         runtime_knowledge_url=runtime_knowledge_url,

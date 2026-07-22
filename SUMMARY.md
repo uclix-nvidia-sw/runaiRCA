@@ -15,6 +15,7 @@
   * [Deployment](docs/DEPLOYMENT.md)
   * [API Reference](docs/API.md)
   * [Configuration Reference](docs/CONFIGURATION.md)
+  * [Glossary](docs/GLOSSARY.md)
   * [Agent (component)](agent/README.md)
   * [Backend (component)](backend/README.md)
   * [Frontend (component)](frontend/README.md)
@@ -34,3 +35,4 @@
   * [배포](docs/ko/DEPLOYMENT.md)
   * [API 레퍼런스](docs/ko/API.md)
   * [설정 레퍼런스](docs/ko/CONFIGURATION.md)
+  * [용어집](docs/ko/GLOSSARY.md)

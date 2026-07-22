@@ -27,6 +27,7 @@ from typing import Any
 import yaml
 
 from app.config import load_settings
+from app.ontology.typedb_client import _concept_value
 from app.ontology.typedb_client import escape_typeql as esc
 from app.ontology.typedb_client import open_driver
 
@@ -82,6 +83,30 @@ def _ensure_symptom(
         tx.query(
             f'match $s isa symptom, has name "{esc(name)}"; '
             f'insert $s has keyword "{esc(kw)}";'
+        ).resolve()
+    desired_keywords = {str(kw) for kw in keywords}
+    # Materialize the read stream before issuing deletes: every other loader in
+    # this package wraps as_concept_rows() in list(), because writing on the same
+    # transaction while a query stream is still open can invalidate it.
+    current_keywords = list(
+        tx.query(
+            f'match $s isa symptom, has name "{esc(name)}", has keyword $kw; '
+            "select $kw;"
+        ).resolve().as_concept_rows()
+    )
+    for row in current_keywords:
+        get = getattr(row, "get", None)
+        if not callable(get):
+            continue
+        concept = get("kw")
+        if concept is None:
+            continue
+        current = str(_concept_value(concept))
+        if current in desired_keywords:
+            continue
+        tx.query(
+            f'match $s isa symptom, has name "{esc(name)}", has keyword $kw; '
+            f'$kw == "{esc(current)}"; delete has $kw of $s;'
         ).resolve()
     if reason and not _exists(
         tx, f'$x isa symptom, has name "{esc(name)}", has reason "{esc(reason)}";'

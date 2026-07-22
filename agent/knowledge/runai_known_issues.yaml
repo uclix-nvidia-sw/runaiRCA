@@ -107,7 +107,7 @@
 
 - issue: "Distributed Training Backoff And Restart Policy Semantics"
   family: expected_known_behavior
-  keywords: ["backofflimit", "backoff limit", "master-restart-policy"]
+  keywords: ["master-restart-policy", "--backoff-limit"]
   affected_version: ""
   fixed_version: ""
   reason: "In Distributed Training only the Worker backoffLimit is used (Master's is set-but-ignored); the restart count is Master+Worker pods summed. restartPolicy: Always is accepted but behaves like OnFailure because the workload is a completions=1 Kubernetes Job — it will not restart after a successful (exit 0) finish."
@@ -140,7 +140,7 @@
 
 - issue: "Legacy Policy Created By Not Backfilled After Upgrade"
   family: expected_known_behavior
-  keywords: ["created_by", "created by"]
+  keywords: ["created_by"]
   affected_version: "2.23.31"
   fixed_version: ""
   reason: "The created_by fix (from v2.23.14) applies only to newly created Policies; existing Policy created_by is not back-patched. Templates similarly show created_by=test@run.ai after the 2.23 storage migration. This is metadata-only with no functional impact."

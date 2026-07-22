@@ -46,6 +46,49 @@ def test_lifecycle_signal_upstream_only_is_not_target_rollout() -> None:
     assert signal.get("target_rollout") is False
 
 
+def test_lifecycle_signal_uncorroborated_lag_is_not_target_rollout() -> None:
+    signal = _lifecycle_signal(
+        [_change([{"name": "trainer", "kind": "Deployment", "rollout": True,
+                   "corroborated": False}])],
+        component="trainer",
+        chain=["trainer"],
+    )
+    assert signal.get("active") is True
+    assert signal.get("target_rollout") is False
+
+
+def test_lifecycle_signal_corroborated_rollout_is_target_rollout() -> None:
+    signal = _lifecycle_signal(
+        [_change([{"name": "trainer", "kind": "Deployment", "rollout": True,
+                   "corroborated": True}])],
+        component="trainer",
+        chain=["trainer"],
+    )
+    assert signal.get("target_rollout") is True
+
+
+def test_lifecycle_signal_helm_corroborates_rollout() -> None:
+    signal = _lifecycle_signal(
+        [_change([
+            {"name": "trainer", "kind": "Deployment", "rollout": True,
+             "corroborated": False},
+            {"name": "trainer", "kind": "HelmRelease", "rollout": True},
+        ])],
+        component="trainer",
+        chain=["trainer"],
+    )
+    assert signal.get("target_rollout") is True
+
+
+def test_lifecycle_signal_missing_corroboration_is_legacy_target_rollout() -> None:
+    signal = _lifecycle_signal(
+        [_change([{"name": "trainer", "kind": "Deployment", "rollout": True}])],
+        component="trainer",
+        chain=["trainer"],
+    )
+    assert signal.get("target_rollout") is True
+
+
 def test_lifecycle_signal_surfaces_helm_note() -> None:
     results = [
         _change(

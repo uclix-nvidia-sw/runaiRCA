@@ -332,7 +332,10 @@ def test_duplicate_single_signatures_are_not_over_deduped() -> None:
     fm = load_failure_modes(FAILURE_MODES)
 
     dns_families = {
-        family for family, _sym in match_failure_mode_symptoms(fm, "no such host", "")
+        family
+        for family, _sym in match_failure_mode_symptoms(
+            fm, "dial tcp: lookup registry.internal: no such host", ""
+        )
     }
     assert {"cluster_network_error", "image_pull_error"} <= dns_families
 

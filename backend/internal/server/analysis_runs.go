@@ -117,6 +117,7 @@ func (s *Server) requestAnalysisRun(
 		Alert:            compactAgentAlert(alert),
 		ThreadTS:         threadTS,
 		IncidentID:       incidentID,
+		RunID:            runID,
 		AnalysisType:     first(source, status(alert.Status)),
 		Language:         s.language,
 		OccurrenceCount:  occurrenceCount,
