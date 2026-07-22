@@ -50,6 +50,7 @@ import { ChatDashboard } from './dashboards/ChatDashboard';
 import { IncidentsDashboard } from './dashboards/IncidentsDashboard';
 import { LearnedKnowledgeDashboard } from './dashboards/LearnedKnowledgeDashboard';
 import { FeedbackPanel } from './workspace/FeedbackPanel';
+import { ConfidenceBreakdownPanel } from './workspace/ConfidenceBreakdownPanel';
 import { EvaluationPanel } from './workspace/EvaluationPanel';
 import { FloatingChat } from './workspace/FloatingChat';
 import { SimilarIncidentsPanel } from './workspace/SimilarIncidentsPanel';
@@ -80,7 +81,7 @@ import { collectorEvidencePresentation, shouldPresentRunArtifacts } from '../uti
 import { artifactForPresentation } from '../utils/artifactPresentation';
 import { alertFiltersForAPI, incidentFiltersForAPI, incidentViewForMainView, matchesAlertFilters, matchesIncidentFilters } from '../utils/filters';
 import { agentTabs, isNoEvidenceArtifact } from '../utils/agentTrail';
-import { formatEvidenceQueries, splitRcaReport } from '../utils/rcaSections';
+import { formatEvidenceQueries, splitRcaReport, stripAppendixEvidence } from '../utils/rcaSections';
 import {
   FinalDecision,
   Severity,
@@ -1330,7 +1331,7 @@ function UnifiedWorkspace({
             // placeholder (or arrives on open) instead of teleporting in.
             <div className="rca-report-body">
               {(() => {
-                const formatted = formatEvidenceQueries(analysis);
+                const formatted = formatEvidenceQueries(stripAppendixEvidence(analysis));
                 const { preamble, sections } = splitRcaReport(formatted);
                 if (sections.length === 0) {
                   // ponytail: heading-less report (old runs) renders as before.
@@ -1393,6 +1394,12 @@ function UnifiedWorkspace({
         {(missingData.length > 0 || warnings.length > 0 || tokenUsage || analysisDuration) && (
           <DiagnosticsPanel missingData={missingData} warnings={warnings} tokenUsage={tokenUsage} analysisDuration={analysisDuration} />
         )}
+
+        <ConfidenceBreakdownPanel
+          diagnostics={incident?.confidence_diagnostics}
+          harness={incident?.harness}
+          rootCauseFamily={incident?.root_cause_family}
+        />
 
         <EvaluationPanel
           runID={incident?.analysis_run_id}

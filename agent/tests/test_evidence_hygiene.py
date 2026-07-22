@@ -3,6 +3,7 @@ healthcheck demoted to non-evidence, and Korean playbook translation splicing.""
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 import pytest
@@ -235,7 +236,7 @@ async def test_sharpen_operator_questions_uses_insight_model(monkeypatch) -> Non
 # --- drill-down observability -----------------------------------------------------
 
 
-def test_report_evidence_prefers_drilldown_artifact_result_over_generic_summary() -> None:
+def test_appendix_omits_drilldown_artifact_dump() -> None:
     result = CollectorResult(agent="postgres", status="ok", summary="db drilldown ok")
     result.artifacts.append(
         artifact(
@@ -258,9 +259,34 @@ def test_report_evidence_prefers_drilldown_artifact_result_over_generic_summary(
         ],
     )
 
-    evidence = detail.split("### Evidence", 1)[1].split("###", 1)[0]
-    assert "runtime/panic.go:785" in evidence
-    assert "1 row(s)" not in evidence
+    assert "### Evidence" not in detail
+    assert "runtime/panic.go:785" not in detail
+    assert "1 row(s)" not in detail
+
+
+def test_korean_synthesis_cleanup_preserves_evidence_trace() -> None:
+    detail = """## 부록 (Appendix)
+
+### Evidence
+
+- **kubernetes**: duplicated collector result
+
+### Investigation Plan
+
+- inspect the target pod
+
+## Evidence Trace
+
+- [E01] kubernetes: ImagePullBackOff
+"""
+
+    cleaned = pipeline._strip_appendix_evidence_section(detail)
+
+    assert "### Evidence" not in cleaned
+    assert "duplicated collector result" not in cleaned
+    assert "### Investigation Plan" in cleaned
+    assert "## Evidence Trace" in cleaned
+    assert "[E01] kubernetes: ImagePullBackOff" in cleaned
 
 
 def test_root_cause_supporting_evidence_uses_drilldown_after_no_evidence_base() -> None:
@@ -318,13 +344,13 @@ def test_context_only_artifact_stays_out_of_root_cause_evidence() -> None:
     )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
-    evidence = detail.split("### Evidence", 1)[1].split("###", 1)[0]
     assert "container memory was observed" not in root_cause
-    assert "container memory was observed" in evidence
+    assert "container memory was observed" not in detail
+    assert "### Evidence" not in detail
 
 
-def test_contextual_eligibility_blocks_scoped_artifact_from_root_cause() -> None:
-    """A scoped result for another entity/window is appendix context, not proof."""
+def test_contextual_eligibility_blocks_scoped_artifact_from_report() -> None:
+    """A scoped result for another entity/window is collector context, not report proof."""
     result = CollectorResult(agent="loki", status="ok", summary="logs queried")
     finding = artifact(
         agent="loki",
@@ -346,14 +372,14 @@ def test_contextual_eligibility_blocks_scoped_artifact_from_root_cause() -> None
             RankedCause(family="workload_runtime_error", confidence="medium", score=7.0)
         ],
         # The blackboard rejected E01 because it belongs to a different target
-        # or incident window.  It may remain visible in the appendix only.
+        # or incident window. It remains available in Collector Evidence Trail.
         eligible_support_ids=set(),
     )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
-    appendix = detail.split("### Evidence", 1)[1].split("###", 1)[0]
     assert "OOMKilled occurred on unrelated-pod" not in root_cause
-    assert "OOMKilled occurred on unrelated-pod" in appendix
+    assert "OOMKilled occurred on unrelated-pod" not in detail
+    assert "### Evidence" not in detail
 
 
 def test_context_only_artifact_cannot_emit_graph_remediation_actions() -> None:
@@ -514,7 +540,128 @@ def test_synthesis_input_uses_contextual_eligibility_over_raw_scoped_role() -> N
     ]
 
 
-def test_unavailable_drilldown_artifact_is_appendix_context_not_supporting_evidence() -> None:
+def test_synthesis_context_excludes_query_and_mcp_diagnostic_suggestions() -> None:
+    query = '{pod="imagepull-0"} |~ "ImagePullBackOff|ErrImagePull"'
+    result = CollectorResult(agent="loki", status="ok", summary="logs queried")
+    result.artifacts.append(
+        artifact(
+            agent="loki",
+            source="loki",
+            type="drilldown_query",
+            status="ok",
+            confidence="low",
+            summary="0 MCP log line(s)",
+            query=query,
+            result={
+                "query": query,
+                "line_count": 0,
+                "sample": {
+                    "data": [],
+                    "hints": {
+                        "debug": "ImagePullBackOff",
+                        "possibleCauses": ["ErrImagePull"],
+                    },
+                },
+                "observation": {"polarity": "unknown", "coverage": "partial"},
+            },
+        )
+    )
+
+    projected = pipeline._synthesis_collector_findings([result])[0]["context_artifacts"][0]
+    serialized = json.dumps(projected, ensure_ascii=False)
+
+    assert "query" not in projected
+    assert "ImagePullBackOff" not in serialized
+    assert "ErrImagePull" not in serialized
+    assert "possibleCauses" not in serialized
+
+
+def test_runai_raw_api_data_is_not_ranked_as_observed_failure_text() -> None:
+    result = CollectorResult(agent="runai", status="ok", summary="resource returned")
+    result.artifacts.append(
+        artifact(
+            agent="runai",
+            source="runai",
+            type="runai_api_signal",
+            status="ok",
+            confidence="high",
+            summary="workload resource present",
+            result={
+                "observation": {"polarity": "present", "coverage": "scoped"},
+                "status_reasons": [],
+                "data": {
+                    "hints": {"possibleCauses": ["ImagePullBackOff"]},
+                    "example": "CrashLoopBackOff",
+                },
+            },
+        )
+    )
+
+    from app.services import root_cause_ranking
+
+    assert "imagepullbackoff" not in root_cause_ranking._result_text(result)
+    assert "crashloopbackoff" not in root_cause_ranking._result_text(result)
+    assert "imagepullbackoff" not in pipeline._observed_text([result])
+
+
+def test_query_intent_is_excluded_from_drilldown_and_self_check_prompts() -> None:
+    from app.masking import build_masker
+    from app.services import drilldown, self_check
+
+    query = '{namespace="default"} |~ "ImagePullBackOff|ErrImagePull"'
+    observed = artifact(
+        agent="loki",
+        source="loki",
+        type="drilldown_query",
+        status="ok",
+        confidence="low",
+        summary="0 MCP log line(s)",
+        query=query,
+        result={
+            "query": query,
+            "line_count": 0,
+            "hints": {
+                "debug": "ImagePullBackOff",
+                "possibleCauses": ["ErrImagePull"],
+            },
+            "observation": {"polarity": "unknown", "coverage": "partial"},
+        },
+    )
+    result = CollectorResult(
+        agent="loki", status="ok", summary="logs queried", artifacts=[observed]
+    )
+
+    drilldown_item = json.dumps(
+        drilldown._artifact_prompt_item(observed), ensure_ascii=False
+    )
+    digest = self_check._evidence_digest([result], build_masker(()))
+
+    assert "ImagePullBackOff" not in drilldown_item
+    assert "ErrImagePull" not in drilldown_item
+    assert "ImagePullBackOff" not in digest
+    assert "ErrImagePull" not in digest
+
+
+def test_ontology_probe_ignores_debug_and_possible_cause_metadata() -> None:
+    from app.services import probe_evaluation
+
+    text = probe_evaluation._observed_text(
+        {
+            "query": "ImagePullBackOff",
+            "hints": {
+                "debug": "ErrImagePull",
+                "possibleCauses": ["CrashLoopBackOff"],
+            },
+            "line_count": 0,
+        }
+    )
+
+    assert "ImagePullBackOff" not in text
+    assert "ErrImagePull" not in text
+    assert "CrashLoopBackOff" not in text
+
+
+def test_unavailable_drilldown_artifact_is_not_report_evidence() -> None:
     result = CollectorResult(agent="postgres", status="ok", summary=NO_EVIDENCE)
     result.artifacts.append(
         artifact(
@@ -536,12 +683,12 @@ def test_unavailable_drilldown_artifact_is_appendix_context_not_supporting_evide
     )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
-    evidence = detail.split("### Evidence", 1)[1].split("###", 1)[0]
     assert "connection refused" not in root_cause
-    assert "connection refused" in evidence
+    assert "connection refused" not in detail
+    assert "### Evidence" not in detail
 
 
-def test_appendix_prefers_successful_artifact_over_later_failed_artifact() -> None:
+def test_appendix_omits_successful_and_failed_artifact_details() -> None:
     result = CollectorResult(agent="postgres", status="ok", summary=NO_EVIDENCE)
     result.artifacts.extend(
         [
@@ -573,9 +720,9 @@ def test_appendix_prefers_successful_artifact_over_later_failed_artifact() -> No
         ],
     )
 
-    evidence = detail.split("### Evidence", 1)[1].split("###", 1)[0]
-    assert "scheduler panic at reclaim/reclaim.go:91" in evidence
-    assert "connection refused" not in evidence
+    assert "### Evidence" not in detail
+    assert "scheduler panic at reclaim/reclaim.go:91" not in detail
+    assert "connection refused" not in detail
 
 
 @pytest.mark.asyncio
@@ -676,11 +823,11 @@ async def test_synthesis_retries_once_on_malformed_json(monkeypatch) -> None:
     replies = iter(["not json at all", '{"summary": "요약", "detail": "본문"}'])
     calls = {"n": 0}
 
-    async def fake_complete(settings, **kwargs):
+    async def fake_complete_with_error(settings, **kwargs):
         calls["n"] += 1
-        return next(replies)
+        return next(replies), None
 
-    monkeypatch.setattr(pipeline, "complete", fake_complete)
+    monkeypatch.setattr(pipeline, "complete_with_error", fake_complete_with_error)
     parsed = await pipeline._complete_synthesis_json(
         make_settings(), system="s", user="u"
     )
@@ -1024,6 +1171,116 @@ async def test_evidence_stage_scopes_followup_target_to_the_plan(monkeypatch) ->
 
 
 @pytest.mark.asyncio
+async def test_evidence_stage_accepts_sufficient_subset_and_skips_optional_work(
+    monkeypatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from app.plan import InvestigationPlan
+    from app.progress import ProgressReporter
+    from app.schemas import Alert, AlertAnalysisRequest
+
+    target = make_target()
+
+    def quota_result(agent: str) -> CollectorResult:
+        return CollectorResult(
+            agent=agent,
+            status="ok",
+            summary="quota evidence",
+            artifacts=[
+                artifact(
+                    agent=agent,
+                    source=agent,
+                    type="quota_signal",
+                    status="ok",
+                    confidence="high",
+                    summary="project quota exhausted",
+                    result={
+                        "value": "over quota",
+                        "observation": {
+                            "predicate": "project_quota",
+                            "polarity": "present",
+                            "coverage": "scoped",
+                            "observed_entity": f"pod:{target.pod}",
+                        },
+                    },
+                )
+            ],
+        )
+
+    async def fake_investigate(*_args, blackboard=None, **_kwargs):
+        results = [quota_result("runai"), quota_result("kubernetes")]
+        blackboard.seed_results(results, entity=f"pod:{target.pod}")
+        fact_ids = [fact.fact_id for fact in blackboard.facts()]
+        return results, {
+            "hypothesis_ledger": [
+                {
+                    "id": "H1",
+                    "family": "runai_scheduling_quota",
+                    "status": "supported",
+                    "confidence": 0.9,
+                    "evidence_for": fact_ids,
+                }
+            ],
+            "skipped_collectors": ["loki"],
+            "reasoning_trace_v2": {"stop_reason": "supported_hypothesis"},
+        }
+
+    async def optional_followup_must_not_run(*_args, **_kwargs):  # pragma: no cover
+        raise AssertionError("sufficient evidence must skip optional follow-up")
+
+    drilldown_calls: list[bool] = []
+
+    async def required_probe_only_drilldown(*_args, **kwargs):
+        drilldown_calls.append(bool(kwargs.get("evidence_sufficient")))
+
+    monkeypatch.setattr("app.services.investigator.investigate", fake_investigate)
+    monkeypatch.setattr(
+        "app.collectors.kubernetes.k8s_followup", optional_followup_must_not_run
+    )
+    monkeypatch.setattr(
+        "app.collectors.prometheus.prometheus_followup", optional_followup_must_not_run
+    )
+    monkeypatch.setattr(
+        "app.services.kg_enrichment.external_case_hints", optional_followup_must_not_run
+    )
+    monkeypatch.setattr(
+        "app.services.drilldown.run_drilldowns", required_probe_only_drilldown
+    )
+    settings = replace(
+        make_settings(),
+        enable_investigation_loop=True,
+        llm_base_url="https://llm.example/v1",
+        llm_model="m",
+        llm_api_key="k",
+    )
+    state = pipeline.PipelineState(
+        settings=settings,
+        request=AlertAnalysisRequest(alert=Alert(labels={}, annotations={})),
+        target=target,
+        progress=ProgressReporter(settings, run_id=""),
+        masker=None,
+        collectors=[object(), object(), object()],
+        plan=InvestigationPlan(
+            hypotheses=[
+                {
+                    "id": "H1",
+                    "family": "runai_scheduling_quota",
+                    "reason": "quota exhausted",
+                }
+            ]
+        ),
+        kg_context=SimpleNamespace(as_dict=lambda: {}, warnings=[]),
+    )
+
+    await pipeline.evidence_stage(state)
+
+    assert {result.agent for result in state.results} >= {"runai", "kubernetes"}
+    assert state.capabilities["loki"] == "skipped_sufficient_evidence"
+    assert drilldown_calls == [True]
+
+
+@pytest.mark.asyncio
 async def test_re_resolved_live_target_drives_blackboard_eligibility(monkeypatch) -> None:
     """A live replacement is collection scope and validation scope, not just a query hint."""
     from app.progress import ProgressReporter
@@ -1250,7 +1507,7 @@ async def test_rank_stage_applies_operator_seed_as_a_bounded_prior() -> None:
         CollectorResult(
             agent="runai",
             status="ok",
-            summary="workload is pending because GPU quota capacity is exhausted",
+                summary="workload requested gpus and is pending because GPU quota is exhausted",
         )
     ]
 
@@ -1289,7 +1546,7 @@ async def test_rank_stage_approved_match_seed_without_current_evidence_is_not_fo
         CollectorResult(
             agent="runai",
             status="ok",
-            summary="workload is pending because GPU quota capacity is exhausted",
+                summary="workload requested gpus and is pending because GPU quota is exhausted",
         )
     ]
 

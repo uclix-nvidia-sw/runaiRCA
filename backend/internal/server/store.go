@@ -1406,7 +1406,7 @@ func metadataFromAgentContext(context map[string]any) map[string]any {
 			out["llm_usage"] = usage
 		}
 	}
-	for _, key := range []string{"harness", "ontology_reasoning", "reasoning_trace_v2", "reasoning_trace_v3", "trace_v3"} {
+	for _, key := range []string{"harness", "confidence_diagnostics", "ontology_reasoning", "reasoning_trace_v2", "reasoning_trace_v3", "trace_v3"} {
 		if value, ok := context[key].(map[string]any); ok {
 			out[key] = cloneAnyMap(value)
 		}
@@ -2376,6 +2376,9 @@ func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 		}
 		if harness, ok := metadata["harness"].(map[string]any); ok {
 			detail.Harness = cloneAnyMap(harness)
+		}
+		if diagnostics, ok := metadata["confidence_diagnostics"].(map[string]any); ok {
+			detail.ConfidenceDiagnostics = cloneAnyMap(diagnostics)
 		}
 		if reasoning, ok := metadata["ontology_reasoning"].(map[string]any); ok {
 			detail.OntologyReasoning = cloneAnyMap(reasoning)

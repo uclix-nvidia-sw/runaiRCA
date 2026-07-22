@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -112,7 +113,35 @@ async def test_nat_client_failure_falls_back_to_http(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_nat_empty_reasoning_reply_falls_back_to_http(monkeypatch) -> None:
+async def test_nat_timeout_is_per_call_and_falls_back_to_http(monkeypatch) -> None:
+    settings = replace(_settings(), llm_request_timeout_seconds=1)
+
+    class SlowClient:
+        async def ainvoke(self, messages):
+            await asyncio.sleep(1)
+            return SimpleNamespace(content="too late")
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        assert 0 < timeout_seconds <= 0.02
+        return SimpleNamespace(
+            ok=True,
+            data={"choices": [{"message": {"content": "직접 경로 응답"}}], "usage": {}},
+        )
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    monkeypatch.setattr("app.llm._request_timeout", lambda _settings: 0.01)
+    token = llm.set_nat_client(SlowClient())
+    try:
+        text, error = await llm.complete_with_error(settings, system="system", user="user")
+    finally:
+        llm.reset_nat_client(token)
+
+    assert text == "직접 경로 응답"
+    assert error is None
+
+
+@pytest.mark.asyncio
+async def test_nat_empty_reasoning_reply_falls_back_to_http(monkeypatch, caplog) -> None:
     # The 2026-07-08 incident shape: the model DID reply (usage recorded) but
     # content was empty — a reasoning model spending the whole completion budget
     # on reasoning tokens. Must not surface as a blind "no reply".
@@ -138,12 +167,91 @@ async def test_nat_empty_reasoning_reply_falls_back_to_http(monkeypatch) -> None
     monkeypatch.setattr("app.llm.post_json", fake_post_json)
     token = llm.set_nat_client(EmptyReplyClient())
     try:
-        text, error = await llm.complete_with_error(settings, system="system", user="user")
+        text, error = await llm.complete_with_error(
+            settings,
+            system="system",
+            user="user",
+            max_tokens=512,
+            purpose="collector_insight",
+        )
     finally:
         llm.reset_nat_client(token)
 
     assert text == '{"summary": "요약"}'
     assert error is None
+    assert "purpose=collector_insight" in caplog.text
+    assert "requested_max_tokens=512" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_direct_http_empty_reply_preserves_finish_reason_and_usage(monkeypatch) -> None:
+    settings = _settings()
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        return SimpleNamespace(
+            ok=True,
+            data={
+                "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 9000, "completion_tokens": 512},
+            },
+        )
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    text, error = await llm.complete_with_error(
+        settings,
+        system="system",
+        user="user",
+        max_tokens=16384,
+        purpose="korean_synthesis",
+    )
+
+    assert text is None
+    assert error is not None
+    assert "finish_reason=length" in error
+    assert "completion_tokens=512" in error
+
+
+@pytest.mark.asyncio
+async def test_nat_and_direct_empty_replies_preserve_both_failures(monkeypatch) -> None:
+    settings = _settings()
+
+    class EmptyNatClient:
+        def bind(self, **kwargs):
+            return self
+
+        async def ainvoke(self, messages):
+            return SimpleNamespace(
+                content="",
+                usage_metadata={"input_tokens": 8000, "output_tokens": 512},
+                response_metadata={"finish_reason": "length"},
+            )
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        return SimpleNamespace(
+            ok=True,
+            data={
+                "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 8000, "completion_tokens": 1024},
+            },
+        )
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    token = llm.set_nat_client(EmptyNatClient())
+    try:
+        text, error = await llm.complete_with_error(
+            settings,
+            system="system",
+            user="user",
+            max_tokens=16384,
+            purpose="korean_synthesis",
+        )
+    finally:
+        llm.reset_nat_client(token)
+
+    assert text is None
+    assert error is not None
+    assert "nat:" in error and "completion_tokens=512" in error
+    assert "direct_http:" in error and "completion_tokens=1024" in error
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,7 @@ from app.plan import InvestigationPlan
 from app.services.evidence_blackboard import Blackboard
 from app.services.investigator import (
     _build_user_prompt,
+    _evidence_sufficiency,
     _evidence_summary,
     _initial_ledger,
     _ledger_prompt_view,
@@ -443,6 +444,87 @@ def test_probe_priority_prefers_probe_covering_unresolved_hypothesis() -> None:
     assert [probe["collector"] for probe in probes] == ["runai", "loki"]
 
 
+def test_evidence_sufficiency_requires_family_specific_independent_support() -> None:
+    def quota_result(agent: str, *, polarity: str = "present") -> CollectorResult:
+        return CollectorResult(
+            agent=agent,
+            status="ok",
+            summary="quota observation",
+            artifacts=[
+                artifact(
+                    agent=agent,
+                    source=agent,
+                    type="quota_signal",
+                    status="ok",
+                    confidence="high",
+                    summary=(
+                        "project quota exhausted"
+                        if polarity == "present"
+                        else "project quota has available capacity"
+                    ),
+                    result={
+                        "value": "over quota" if polarity == "present" else "quota available",
+                        "observation": {
+                            "predicate": "project_quota",
+                            "polarity": polarity,
+                            "coverage": "scoped",
+                            "observed_entity": "pod:trainer-0",
+                        },
+                    },
+                )
+            ],
+        )
+
+    board = Blackboard()
+    runai = quota_result("runai")
+    board.add_result("runai", runai, entity="pod:trainer-0")
+    runai_fact_ids = [fact.fact_id for fact in board.facts()]
+    ledger = [
+        {
+            "id": "H1",
+            "family": "runai_scheduling_quota",
+            "status": "supported",
+            "evidence_for": runai_fact_ids,
+        }
+    ]
+
+    assert not _evidence_sufficiency(ledger, [runai], board)["sufficient"]
+
+    kubernetes = quota_result("kubernetes")
+    board.add_result("kubernetes", kubernetes, entity="pod:trainer-0")
+    ledger[0]["evidence_for"] = [fact.fact_id for fact in board.facts()]
+    decision = _evidence_sufficiency(ledger, [runai, kubernetes], board)
+    assert decision["sufficient"]
+    assert set(decision["independence_groups"]) == {"kubernetes_api", "runai_api"}
+
+    contradiction = quota_result("prometheus", polarity="absent")
+    board.add_result("prometheus", contradiction, entity="pod:trainer-0")
+    assert not _evidence_sufficiency(
+        ledger, [runai, kubernetes, contradiction], board
+    )["sufficient"]
+
+    other_board = Blackboard()
+    other_runai = quota_result("runai")
+    other_kubernetes = quota_result("kubernetes")
+    for result in (other_runai, other_kubernetes):
+        result.artifacts[0].result["observation"]["observed_entity"] = "pod:other-0"
+        other_board.add_result(result.agent, result, entity="pod:other-0")
+    other_ledger = [
+        {
+            "id": "H1",
+            "family": "runai_scheduling_quota",
+            "status": "supported",
+            "evidence_for": [fact.fact_id for fact in other_board.facts()],
+        }
+    ]
+    assert not _evidence_sufficiency(
+        other_ledger,
+        [other_runai, other_kubernetes],
+        other_board,
+        make_target(),
+    )["sufficient"]
+
+
 @pytest.mark.asyncio
 async def test_no_llm_falls_back_to_full_gather() -> None:
     # No LLM configured -> complete_json returns None -> loop bails, full gather runs.
@@ -453,6 +535,254 @@ async def test_no_llm_falls_back_to_full_gather() -> None:
 
     assert {r.agent for r in results} == {"runai", "kubernetes", "loki"}
     assert all(c.calls == 1 for c in collectors)
+
+
+@pytest.mark.asyncio
+async def test_scoped_supported_hypothesis_stops_before_remaining_collectors(
+    monkeypatch,
+) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.example/v1",
+        llm_model="m",
+        llm_api_key="k",
+    )
+    board = Blackboard()
+    runai, kubernetes, loki = _collectors()
+    original_runai_collect = runai.collect
+    original_kubernetes_collect = kubernetes.collect
+
+    async def collect_scoped(target, plan=None):
+        result = await original_runai_collect(target, plan)
+        result.artifacts.append(
+            artifact(
+                agent="runai",
+                source="runai",
+                type="runai_workload_status",
+                status="ok",
+                confidence="high",
+                summary="workload rejected by scoped project quota",
+                result={
+                    "observation": {
+                        "kind": "runai_workload_status",
+                        "predicate": "project_quota_rejection",
+                        "polarity": "present",
+                        "coverage": "scoped",
+                        "observed_entity": "pod:trainer-0",
+                    }
+                },
+            )
+        )
+        return result
+
+    async def collect_kubernetes_scoped(target, plan=None):
+        result = await original_kubernetes_collect(target, plan)
+        result.artifacts.append(
+            artifact(
+                agent="kubernetes",
+                source="kubernetes",
+                type="kubernetes_warning_events",
+                status="ok",
+                confidence="high",
+                summary="FailedScheduling: project quota is exhausted",
+                result={
+                    "events": [{"reason": "FailedScheduling", "message": "over quota"}],
+                    "observation": {
+                        "kind": "kubernetes_warning_events",
+                        "predicate": "project_quota_rejection",
+                        "polarity": "present",
+                        "coverage": "scoped",
+                        "observed_entity": "pod:trainer-0",
+                    },
+                },
+            )
+        )
+        return result
+
+    runai.collect = collect_scoped
+    kubernetes.collect = collect_kubernetes_scoped
+    decision_calls = 0
+
+    async def fake_complete_json(_settings, *, system, **_kwargs):
+        nonlocal decision_calls
+        assert "final skeptical reflection" not in system
+        decision_calls += 1
+        if decision_calls == 1:
+            return {
+                "action": "probe",
+                "selected_hypothesis": "H1",
+                "probes": [
+                    {"collector": "runai", "scope": {}},
+                    {"collector": "kubernetes", "scope": {}},
+                ],
+            }
+        fact_ids = [fact.fact_id for fact in board.facts()]
+        return {
+            "action": "conclude",
+            "selected_hypothesis": "H1",
+            "hypothesis_updates": [
+                {
+                    "id": "H1",
+                    "status": "supported",
+                    "confidence": 0.9,
+                    "evidence_for": fact_ids,
+                }
+            ],
+        }
+
+    monkeypatch.setattr("app.services.investigator.complete_json", fake_complete_json)
+    results, context = await investigate(
+        settings,
+        make_target(),
+        [runai, kubernetes, loki],
+        InvestigationPlan(
+            hypotheses=[
+                {
+                    "id": "H1",
+                    "family": "runai_scheduling_quota",
+                    "reason": "project quota rejected the workload",
+                }
+            ]
+        ),
+        {},
+        max_steps=3,
+        blackboard=board,
+    )
+
+    assert {result.agent for result in results} == {"runai", "kubernetes"}
+    assert runai.calls == 1
+    assert kubernetes.calls == 1
+    assert loki.calls == 0
+    assert decision_calls == 2
+    assert context["reasoning_trace_v2"]["stop_reason"] == "supported_hypothesis"
+
+
+@pytest.mark.asyncio
+async def test_reanalysis_reuses_existing_kubernetes_scope_and_reads(monkeypatch) -> None:
+    collector = KubernetesCollector()
+    target = make_target()
+    initial = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="pod already inspected",
+        artifacts=[
+            artifact(
+                agent="kubernetes",
+                source="kubernetes",
+                type="kubernetes_warning_events",
+                status="ok",
+                confidence="high",
+                query="kubectl get events -n runai-vision",
+                summary="warning events collected",
+                result={},
+            ),
+            artifact(
+                agent="kubernetes",
+                source="kubernetes",
+                type="pod_inspection",
+                status="ok",
+                confidence="high",
+                query="kubectl describe pod trainer-0 -n runai-vision",
+                summary="pod described",
+                result={},
+            ),
+        ],
+    )
+
+    async def fake_complete_json(_settings, *, system, **_kwargs):
+        if "final skeptical reflection" in system:
+            return {"hypothesis_updates": [], "new_hypotheses": []}
+        return {
+            "action": "probe",
+            "probes": [
+                {"collector": "kubernetes", "scope": {"pod": "trainer-0"}}
+            ],
+            "queries": [
+                {"kind": "events", "namespace": "runai-vision"},
+                {
+                    "kind": "pods",
+                    "namespace": "runai-vision",
+                    "name": "trainer-0",
+                },
+            ],
+        }
+
+    async def duplicate_read(*_args, **_kwargs):  # pragma: no cover
+        raise AssertionError("existing Kubernetes observation must be reused")
+
+    monkeypatch.setattr("app.services.investigator.complete_json", fake_complete_json)
+    monkeypatch.setattr("app.services.investigator.k8s_read", duplicate_read)
+    monkeypatch.setattr("app.services.investigator.k8s_describe", duplicate_read)
+
+    results, _ = await investigate(
+        replace(
+            make_settings(),
+            llm_base_url="https://llm.example/v1",
+            llm_model="m",
+            llm_api_key="k",
+        ),
+        target,
+        [collector],
+        InvestigationPlan(
+            namespaces=[target.namespace], pod=target.pod, workload=target.workload_name
+        ),
+        {},
+        max_steps=1,
+        initial_evidence=[initial],
+    )
+
+    assert collector.calls == 0
+    assert len(results) == 1
+    assert len(results[0].artifacts) == 2
+
+
+@pytest.mark.asyncio
+async def test_reanalysis_does_not_replay_an_identical_partial_collector_scope(
+    monkeypatch,
+) -> None:
+    collector = LokiCollector()
+    target = make_target()
+    initial = CollectorResult(
+        agent="loki",
+        status="partial",
+        summary="one LogQL query succeeded and one failed",
+        details={
+            "queries": [
+                {"query": '{namespace="runai-vision"}', "status_code": 200},
+                {"query": '{pod="missing"}', "status_code": 500, "error": "failed"},
+            ]
+        },
+        missing_data=["loki.query"],
+    )
+
+    async def fake_complete_json(_settings, *, system, **_kwargs):
+        if "final skeptical reflection" in system:
+            return {"hypothesis_updates": [], "new_hypotheses": []}
+        return {
+            "action": "probe",
+            "probes": [{"collector": "loki", "scope": {}}],
+            "queries": [],
+        }
+
+    monkeypatch.setattr("app.services.investigator.complete_json", fake_complete_json)
+
+    results, _ = await investigate(
+        replace(
+            make_settings(),
+            llm_base_url="https://llm.example/v1",
+            llm_model="m",
+            llm_api_key="k",
+        ),
+        target,
+        [collector],
+        InvestigationPlan(namespaces=[target.namespace], pod=target.pod),
+        {},
+        max_steps=1,
+        initial_evidence=[initial],
+    )
+
+    assert collector.calls == 0
+    assert results[0].status == "partial"
 
 
 @pytest.mark.asyncio
@@ -851,7 +1181,12 @@ async def test_evidence_free_conclusion_collects_base_evidence_before_stopping(m
 
     assert len(decision_prompts) == 3
     assert "runai ok" not in decision_prompts[0]
-    assert "runai ok" in decision_prompts[1]
+    # An evidence-free conclusion now opens one strongest remaining plane per
+    # round instead of launching every collector at once.
+    assert sum(
+        marker in decision_prompts[1]
+        for marker in ("runai ok", "kubernetes ok", "loki ok")
+    ) == 1
     assert all(collector.calls == 1 for collector in collectors)
     assert len(context["investigation_steps"]) == 3
     assert {result.agent for result in results} == {"runai", "kubernetes", "loki"}

@@ -39,7 +39,9 @@ _NON_EVIDENCE_PREFIX_RE = re.compile(
     r"example\s+alert|sample\s+(?:payload|log\s+line)|alert\s+rule\s+name|"
     r"threshold|series\s+name|recording\s+rule\s+example|grafana\s+panel\s+query|"
     r"docs?\s+example|runbook\s+example|prometheus\s+rule\s+expression|"
-    r"alert\s+label|schema\s+field|columns?)\b|(?:환경변수|대시보드\s+필드)\b)"
+    r"alert\s+label|schema\s+field|columns?|(?:later\s+)?dashboard\s+"
+    r"(?:mentioned|showed|reported)|(?:historical|old|previous)\s+"
+    r"(?:run|incident|log))\b|(?:환경변수|대시보드\s+필드)\b)"
     r".{0,128}$"
 )
 _NEGATED_PREFIX_RE = re.compile(
@@ -1428,10 +1430,21 @@ def match_failure_mode_symptoms(
         ]
         matched.sort(key=lambda fs: fs[0] != top_family)
         return matched
-    # More matched keywords = more specific symptom. Use the ranked family only
-    # after that, so a broad shared phrase ("no such host", "sandbox runtime")
-    # cannot beat a richer operator signature.
-    matched.sort(key=lambda fs: (-len(fs[2]), -fs[3], fs[0] != top_family, fs[4]))
+    # A generic state marker (ImagePullBackOff, CrashLoopBackOff, FailedMount)
+    # names the retry/lifecycle state, not its mechanism. Any concrete error
+    # signature must lead it even when the alert name contributes two generic
+    # aliases (for example ImagePullBackOff + ErrImagePull versus one exact
+    # ``dial tcp: lookup`` result). Within the same disposition, richer/longer
+    # signatures still lead and the ranked family remains only a tie-breaker.
+    matched.sort(
+        key=lambda fs: (
+            _only_generic_state_hits(fs[2]),
+            -len(fs[2]),
+            -fs[3],
+            fs[0] != top_family,
+            fs[4],
+        )
+    )
     kept: list[tuple[str, dict[str, Any]]] = []
     kept_hits: list[list[str]] = []
     for family, symptom, hits, _length, _pos in matched:
@@ -1453,9 +1466,28 @@ _GENERIC_CONTEXT_HITS = {
     "out of memory",
 }
 
+_GENERIC_STATE_HITS = frozenset(
+    {
+        "imagepullbackoff",
+        "errimagepull",
+        "crashloopbackoff",
+        "failedscheduling",
+        "unschedulable",
+        "failedmount",
+        "failedattachvolume",
+    }
+)
+
+
+def _only_generic_state_hits(hits: list[str]) -> bool:
+    return bool(hits) and all(hit in _GENERIC_STATE_HITS for hit in hits)
+
 
 def _symptom_context_supported(family: str, symptom: dict[str, Any], text: str) -> bool:
     if family != "image_pull_error" or symptom.get("symptom") not in {
+        "Registry Authentication Explicitly Rejected",
+        "Image Repository Or Name Not Found",
+        "Repository Existence Or Authorization Ambiguous",
         "Registry TLS Certificate Error",
         "Registry Server 5xx / DNS Lookup Failure On Pull",
     }:

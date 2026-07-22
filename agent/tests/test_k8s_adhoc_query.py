@@ -13,7 +13,7 @@ from dataclasses import replace
 import pytest
 
 from app.collectors import kubernetes as k8s
-from app.collectors.base import CollectorResult
+from app.collectors.base import CollectorResult, artifact
 from app.collectors.http_json import JsonResponse
 from app.plan import InvestigationPlan
 from app.services import investigator
@@ -934,8 +934,8 @@ async def test_investigator_promotes_named_pod_query_to_describe(monkeypatch) ->
     artifact = next(item for item in result.artifacts if item.type == "adhoc_query")
     assert artifact.title == "Pod YAML + describe"
     assert artifact.query == (
-        "kubectl get pod worker-0 -n team-a -o yaml; "
-        "kubectl describe pod worker-0 -n team-a"
+        "kubectl describe pod worker-0 -n team-a; "
+        "kubectl get pod worker-0 -n team-a -o yaml"
     )
     assert artifact.result["observation"]["polarity"] == "unknown"
     assert artifact.result["observation"]["coverage"] == "partial"
@@ -994,6 +994,50 @@ def test_flowchart_followup_pending_pod_pulls_events_quota_pvc(monkeypatch) -> N
         "polarity": "unknown",
         "coverage": "partial",
     }
+
+
+def test_flowchart_followup_reuses_base_warning_events(monkeypatch) -> None:
+    reads: list[str] = []
+
+    async def fake_k8s_read(settings, kind, namespace="", name="", label_selector=""):
+        reads.append(kind)
+        return {
+            "kind": k8s.resolve_read_kind(kind),
+            "namespace": namespace,
+            "status_code": 200,
+            "error": None,
+            "data": {"items": []},
+        }
+
+    monkeypatch.setattr(k8s, "k8s_read", fake_k8s_read)
+    result = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="k8s",
+        confidence="medium",
+        details={"pod_statuses": [{"name": "p", "phase": "Pending"}]},
+        artifacts=[
+            artifact(
+                agent="kubernetes",
+                source="kubernetes",
+                type="kubernetes_warning_events",
+                status="ok",
+                confidence="high",
+                query="kubectl get events -n team-a",
+                summary="warning events collected",
+                result={},
+            )
+        ],
+    )
+
+    asyncio.run(
+        k8s.k8s_followup(
+            make_settings(), result, replace(make_target(), namespace="team-a"), max_rounds=1
+        )
+    )
+
+    assert "events" not in reads
+    assert {"resourcequotas", "persistentvolumeclaims"} <= set(reads)
 
 
 def test_flowchart_followup_artifact_query_quotes_namespace(monkeypatch) -> None:

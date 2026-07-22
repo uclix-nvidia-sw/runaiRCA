@@ -6,9 +6,10 @@ is it actually present, does a competing cause fit better, and what single check
 would settle it. If the evidence doesn't support the cause, confidence is
 downgraded and a short caveat is attached.
 
-LLM-gated: with no LLM configured the deterministic fallback fires — if the top
-family's canonical collector reported no usable evidence (unavailable / NO_EVIDENCE),
-confidence drops one level with a generic caveat. Otherwise confidence is kept.
+LLM-gated: with no LLM configured the deterministic fallback fires — if no
+eligible collector supplied a family-relevant scoped positive fact, or a scoped
+absence directly contradicts the family, confidence drops one level. A direct
+contradiction also refutes the candidate. Otherwise confidence is kept.
 
 Never raises into analyze(): any failure returns a safe default that preserves
 the ranked confidence with no caveat.
@@ -27,9 +28,11 @@ from app.collectors.base import NO_EVIDENCE, CollectorResult, condition_observat
 from app.config import Settings
 from app.llm import complete_json, llm_configured
 from app.masking import build_masker
+from app.services.evidence_projection import observed_payload
 from app.services.root_cause_ranking import (
     _FAMILY_RULES,
     RankedCause,
+    artifact_contradicts_family,
     artifact_supports_family,
 )
 
@@ -148,33 +151,53 @@ async def refute_top_cause(
         if not family or family == "insufficient_evidence":
             return _default(confidence)
 
-        has_evidence = _canonical_has_evidence(
+        has_evidence = _has_family_evidence(
             family, results, evidence_eligibility=evidence_eligibility
         ) or _has_signature_evidence(
             top_candidate,
             results,
             evidence_eligibility=evidence_eligibility,
         )
+        has_contradiction = _has_family_contradiction(
+            family, results, evidence_eligibility=evidence_eligibility
+        )
 
         if not llm_configured(settings, settings.llm_model_self_check):
             # ponytail: deterministic gate — the only signal we have without an LLM
             # is whether the canonical source actually backed the claim.
-            if not has_evidence:
+            if not has_evidence or has_contradiction:
                 return _default(
                     _downgrade(confidence),
-                    _caveat_missing_evidence(family, settings),
-                    refuted=False,
+                    (
+                        _caveat_contradiction(family, settings)
+                        if has_contradiction
+                        else _caveat_missing_evidence(family, settings)
+                    ),
+                    refuted=has_contradiction,
                     next_check=_next_check_missing_evidence(family, settings),
                 )
             return _default(confidence)
 
-        verdict = await _llm_refute(settings, top_candidate, results, has_evidence, plan)
+        verdict = await _llm_refute(
+            settings,
+            top_candidate,
+            results,
+            has_evidence,
+            has_contradiction,
+            plan,
+            evidence_eligibility=evidence_eligibility,
+        )
         if not verdict:
             # LLM failed/empty: fall back to the deterministic gate.
-            if not has_evidence:
+            if not has_evidence or has_contradiction:
                 return _default(
                     _downgrade(confidence),
-                    _caveat_missing_evidence(family, settings),
+                    (
+                        _caveat_contradiction(family, settings)
+                        if has_contradiction
+                        else _caveat_missing_evidence(family, settings)
+                    ),
+                    refuted=has_contradiction,
                     next_check=_next_check_missing_evidence(family, settings),
                 )
             return _default(confidence)
@@ -183,7 +206,11 @@ async def refute_top_cause(
         # never turn that context into support.  ``has_evidence`` is computed
         # deterministically from a scoped positive canonical observation (or a
         # direct alert signature), so it is the upper bound on the verdict.
-        supported = bool(verdict.get("supported", True)) and has_evidence
+        supported = (
+            bool(verdict.get("supported", True))
+            and has_evidence
+            and not has_contradiction
+        )
         masker = _self_check_masker(settings)
         caveat = _one_line(masker.mask_text(str(verdict.get("caveat") or "")), limit=360)
         next_check = _one_line(
@@ -227,6 +254,55 @@ def _next_check_missing_evidence(family: str, settings: Settings) -> str:
     if getattr(settings, "language", "en") == "ko":
         return f"핵심 근거 수집기({canonical})에서 이 원인의 증거를 직접 확인해 주세요."
     return f"Check the canonical evidence source ({canonical}) directly for this cause."
+
+
+def _caveat_contradiction(family: str, settings: Settings) -> str:
+    if getattr(settings, "language", "en") == "ko":
+        return (
+            f"자기 점검: `{family}`을(를) 직접 반박하는 대상·시간창 범위의 증거가 있어 "
+            "현재 결론을 유지할 수 없습니다. 반박 증거와 지지 증거의 범위를 다시 확인하세요."
+        )
+    return (
+        f"Self-check: target- and incident-window-scoped evidence directly contradicts "
+        f"{family}; the current conclusion cannot be retained without resolving that conflict."
+    )
+
+
+def _has_family_evidence(
+    family: str,
+    results: list[CollectorResult],
+    *,
+    evidence_eligibility: Mapping[str, object] | None,
+) -> bool:
+    """Accept any eligible family-specific support, not only the canonical agent."""
+    return any(
+        _artifact_has_evidence(
+            family,
+            art,
+            evidence_eligibility=evidence_eligibility,
+        )
+        for result in results
+        for art in (getattr(result, "artifacts", []) or [])
+    )
+
+
+def _has_family_contradiction(
+    family: str,
+    results: list[CollectorResult],
+    *,
+    evidence_eligibility: Mapping[str, object] | None,
+) -> bool:
+    for result in results:
+        for art in getattr(result, "artifacts", []) or []:
+            if evidence_eligibility is not None:
+                evidence_id = str(getattr(art, "evidence_id", "") or "")
+                eligibility = evidence_eligibility.get(evidence_id)
+                permits = getattr(eligibility, "permits", None)
+                if not callable(permits) or not permits("contradict"):
+                    continue
+            if artifact_contradicts_family(family, art):
+                return True
+    return False
 
 
 def _has_signature_evidence(
@@ -275,7 +351,12 @@ def _compact_evidence_value(value: object, *, limit: int = 1200) -> str:
     return text[:limit]
 
 
-def _evidence_digest(results: list[CollectorResult], masker) -> str:
+def _evidence_digest(
+    results: list[CollectorResult],
+    masker,
+    *,
+    evidence_eligibility: Mapping[str, object] | None = None,
+) -> str:
     headlines: list[str] = []
     artifact_lines: list[str] = []
     for r in results:
@@ -294,12 +375,20 @@ def _evidence_digest(results: list[CollectorResult], masker) -> str:
             )
         ]
         for art in selected:
+            evidence_role = "context"
+            if evidence_eligibility is not None:
+                evidence_id = str(getattr(art, "evidence_id", "") or "")
+                eligibility = evidence_eligibility.get(evidence_id)
+                permits = getattr(eligibility, "permits", None)
+                if callable(permits) and permits("support"):
+                    evidence_role = "support"
+                elif callable(permits) and permits("contradict"):
+                    evidence_role = "contradict"
             parts = [
                 str(art.title or art.type or "artifact").strip(),
                 f"status={art.status}",
+                f"evidence_role={evidence_role}",
             ]
-            if art.query:
-                parts.append(f"query={_compact_evidence_value(art.query, limit=400)}")
             if art.summary:
                 parts.append(f"summary={_compact_evidence_value(art.summary, limit=600)}")
             if art.highlights:
@@ -308,7 +397,9 @@ def _evidence_digest(results: list[CollectorResult], masker) -> str:
                 checks = condition_observations(art.result)
                 if checks:
                     parts.append(f"condition_checks={_compact_evidence_value(checks)}")
-                parts.append(f"result={_compact_evidence_value(art.result)}")
+                parts.append(
+                    f"result={_compact_evidence_value(observed_payload(art.result))}"
+                )
             artifact_lines.append(f"  artifact: {masker.mask_text(' | '.join(parts))}")
     lines = list(headlines)
     size = len("\n".join(lines))
@@ -326,11 +417,16 @@ async def _llm_refute(
     top: RankedCause,
     results: list[CollectorResult],
     has_evidence: bool,
+    has_contradiction: bool,
     plan: object = None,
+    *,
+    evidence_eligibility: Mapping[str, object] | None = None,
 ) -> dict | None:
     ko = getattr(settings, "language", "en") == "ko"
     masker = _self_check_masker(settings)
-    evidence = _evidence_digest(results, masker)
+    evidence = _evidence_digest(
+        results, masker, evidence_eligibility=evidence_eligibility
+    )
     caveat_lang = "Korean" if ko else "English"
     system = (
         "You are a skeptical senior SRE reviewing a proposed root cause for a Run:ai "
@@ -363,6 +459,7 @@ async def _llm_refute(
         f"Proposed root cause family: {top.family}\n"
         f"Ranked confidence: {top.confidence}\n"
         f"Specific or canonical evidence present: {has_evidence}\n"
+        f"Direct scoped contradiction present: {has_contradiction}\n"
         f"Rationale: {masker.mask_text('; '.join(top.rationale) or '(none)')}\n\n"
         f"Hypothesis ledger: {masker.mask_text(_hypothesis_ledger_hint(plan))}\n\n"
         f"Gathered evidence:\n{evidence}"

@@ -27,7 +27,7 @@ in-process orchestration engine. It declares the seven RCA pipeline stages
 (`enrich`, `plan`, `evidence`, `rank`, `self_check`, `synthesize`, and `harness`)
 as NAT functions and runs them through the `runai_rca_pipeline` controller.
 Pipeline switches: `ENABLE_INVESTIGATION_LOOP`, `ENABLE_AGENT_DRILLDOWN`,
-`ANALYSIS_DEADLINE_SECONDS` (default 1500s) — full list in the
+`ANALYSIS_DEADLINE_SECONDS` (default 900s) — full list in the
 [Configuration Reference](../docs/CONFIGURATION.md).
 
 Set `LLM_BASE_URL`, `LLM_MODEL`, and `LLM_API_KEY` to let NAT own the default

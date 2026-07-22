@@ -118,7 +118,7 @@ class AnalysisOrchestrator:
 
         Per-step ceilings (collectors, LLM, NAT) are generous so agents gather deep
         evidence and think; this wrapper guarantees the whole run still finishes
-        within `analysis_deadline_seconds` (default 25 min / 1500s), returning a
+        within `analysis_deadline_seconds` (default 15 min / 900s), returning a
         terminal degraded report if it overruns rather than hanging."""
         usage = begin_usage_tracking()
         deadline = self._settings.analysis_deadline_seconds

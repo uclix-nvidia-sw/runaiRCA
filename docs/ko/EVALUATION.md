@@ -29,8 +29,7 @@ flowchart LR
 | Diagnostic reasoning | 20 |
 | Investigation plan | 20 |
 | Uncertainty calibration | 15 |
-| Operational usefulness | 10 |
-| Tool efficiency | 5 |
+| Operational usefulness | 15 |
 | Safety | 5 |
 
 초기 통과 기준은 70/100점입니다. 아래 세 항목은 점수와 별개인 hard gate입니다.
@@ -45,6 +44,12 @@ flowchart LR
 
 TypeDB의 과거 evidence는 문맥일 뿐 현재 RCA의 근거를 대체하지 않습니다.
 
+위 harness 점수는 보고서 품질 rubric이며, 원인 후보의 순서를 정하는 결정론적 ranker 점수와
+별개입니다. Incident 상세의 Evaluation form 위에는 confidence breakdown 표가 표시됩니다.
+이 표는 ranker의 항목별 증감, 독립 source group과 confidence gate, self-check 보정, 별도의
+harness 점수/수정 내역을 보여줍니다. `confidence_diagnostics`가 없는 과거 incident도 사용 가능한
+필드만 표시하며 정상적으로 열립니다.
+
 ## 운영자 평가
 
 Incident 상세 화면에는 최신 run의 harness 결과와 RCA Evaluation form이 표시됩니다.
@@ -55,7 +60,8 @@ Form에는 다음을 기록합니다.
 
 - case type: `known`, `compositional`, `novel`, `tool_degraded`
 - 선택적 expected family
-- 7개 항목의 0~5점
+- 운영자 평가 form의 7개 항목 0~5점(`tool_efficiency` 포함). 이는 결정론적
+  runtime harness의 6개 dimension과 별도
 - hard-gate 판단
 - 실제 해결 결과와 효과가 있었던 action
 - 메모

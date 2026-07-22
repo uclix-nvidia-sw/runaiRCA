@@ -31,6 +31,7 @@ from app.services.pipeline import (
     _detail_from,
     _gpu_model_from,
     _graph_remediation_lines,
+    _korean_report_language_conflict,
     _summary_from,
     _synthesis_evidence_json,
     _synthesize_korean,
@@ -196,10 +197,12 @@ async def test_korean_llm_synthesis_replaces_report(monkeypatch) -> None:
                 "choices": [
                     {
                         "message": {
-                            "content": (
-                                '{"summary": "노드 디스크 압박이 근본 원인입니다.", '
-                                '"detail": "## Root Cause\\n\\n노드 디스크 압박."}'
-                            )
+                                "content": (
+                                    '{"summary": "노드 디스크 압박이 근본 원인입니다.", '
+                                    '"detail": "## 1. 문제\\n\\n노드 디스크 압박 알림이 발생했습니다.\\n\\n'
+                                    '## 2. 원인\\n\\n노드 디스크 압박입니다.\\n\\n'
+                                    '## 3. 권장 조치\\n\\n1. `kubectl describe node`로 압박 조건과 이벤트를 확인하세요."}'
+                                )
                         }
                     }
                 ]
@@ -1116,7 +1119,13 @@ async def test_korean_synthesis_falls_back_on_bad_json(monkeypatch) -> None:
             )
         )
     )
-    # Bad synthesis -> deterministic English report stands.
+    # A configured primary synthesis failure is a failed run, not a successful
+    # RCA disguised by the deterministic diagnostic payload.
+    assert response.status == "failed"
+    assert response.terminal_reason == "synthesis_failed"
+    assert response.analysis_quality == "degraded"
+    assert response.context["synthesis"]["status"] == "failed"
+    assert "invalid JSON" in response.context["synthesis"]["error"]
     assert "## 2. 원인" in response.analysis_detail
     assert "Agent Role Coverage" not in response.analysis_detail  # static boilerplate removed
 
@@ -1156,15 +1165,41 @@ async def test_korean_synthesis_retries_json_missing_detail(monkeypatch, caplog)
         '{"summary":"정상 요약","detail":"정상 본문"}',
     ]
 
-    async def fake_complete(*_args, **_kwargs):
-        return replies.pop(0)
+    async def fake_complete_with_error(*_args, **_kwargs):
+        return replies.pop(0), None
 
-    monkeypatch.setattr("app.services.pipeline.complete", fake_complete)
+    monkeypatch.setattr(
+        "app.services.pipeline.complete_with_error", fake_complete_with_error
+    )
     result = await _complete_synthesis_json(settings, system="system", user="user")
 
     assert result == {"summary": "정상 요약", "detail": "정상 본문"}
     assert not replies
     assert "omitted required field(s) detail (attempt 1); retrying" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_does_not_retry_transport_failure(monkeypatch, caplog) -> None:
+    settings = replace(make_settings(), language="ko")
+    calls = 0
+
+    async def fake_complete_with_error(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return None, "HTTP 504 gateway timeout"
+
+    monkeypatch.setattr(
+        "app.services.pipeline.complete_with_error", fake_complete_with_error
+    )
+    diagnostics: list[str] = []
+    result = await _complete_synthesis_json(
+        settings, system="system", user="user", diagnostics=diagnostics
+    )
+
+    assert result is None
+    assert calls == 1
+    assert "HTTP 504 gateway timeout" in caplog.text
+    assert diagnostics and "HTTP 504 gateway timeout" in diagnostics[0]
 
 
 def test_jwks_discovery_failure_overrides_generic_crashloop_playbook_in_korean() -> None:
@@ -1258,6 +1293,276 @@ def test_oomkilled_overrides_generic_crashloop_actions_in_korean_fallback() -> N
     assert "entrypoint" not in detail.lower()
     assert "secretkeyref" not in detail.lower()
     assert "errimageneverpull" not in detail.lower()
+
+
+def test_image_pull_deterministic_fallback_keeps_core_report_korean() -> None:
+    failure_modes = load_failure_modes("knowledge/failure_modes.yaml")
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={
+                "alertname": "KubePodNotReady",
+                "namespace": "default",
+                "pod": "imagepull-abc",
+            },
+            annotations={
+                "summary": "Pod default/imagepull-abc has been non-ready for 15 minutes."
+            },
+        )
+    )
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary=(
+                "ImagePullBackOff: pull access denied, repository does not exist or may "
+                "require authorization"
+            ),
+        )
+    ]
+    candidates = [RankedCause("image_pull_error", "high", 8.0)]
+
+    summary = _summary_from(request, results, candidates, failure_modes, language="ko")
+    detail = _detail_from(
+        request,
+        results,
+        [],
+        failure_modes=failure_modes,
+        root_cause_candidates=candidates,
+        language="ko",
+    )
+    core = detail.split("## 부록", 1)[0]
+
+    assert "구분할 수 없습니다" in summary
+    assert "대상 Pod가 15분 이상 Ready 상태가 되지 않아" in core
+    assert "kubectl describe pod" in core
+    assert "ImagePullSecret" in core
+    assert "Check that the ImagePullSecret" not in core
+
+
+def test_image_pull_actions_ignore_family_wide_graph_siblings() -> None:
+    failure_modes = load_failure_modes("knowledge/failure_modes.yaml")
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={
+                "alertname": "KubePodNotReady",
+                "namespace": "default",
+                "pod": "imagepull-abc",
+            },
+        )
+    )
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary=(
+                "ImagePullBackOff: pull access denied, repository does not exist or may "
+                "require authorization, insufficient_scope"
+            ),
+        )
+    ]
+    graph = GraphRemediation(
+        family_fixes=[
+            "RATE-LIMIT-SIBLING",
+            "TLS-SIBLING",
+            "AUTH-SIBLING",
+        ]
+    )
+
+    detail = _detail_from(
+        request,
+        results,
+        [],
+        failure_modes=failure_modes,
+        root_cause_candidates=[RankedCause("image_pull_error", "high", 8.0)],
+        graph_fixes=graph,
+        language="ko",
+        self_check_next=(
+            "해당 이미지가 레지스트리에 존재하고 현재 ServiceAccount에 pull 권한이 있는지 "
+            "영향받은 노드에서 `crictl pull`로 확인하세요."
+        ),
+    )
+    actions = detail.split("## 3. 권장 조치", 1)[1].split("## 부록", 1)[0]
+    appendix = detail.split("### Troubleshooting Playbook", 1)[1]
+
+    assert "RATE-LIMIT-SIBLING" not in actions
+    assert "TLS-SIBLING" not in actions
+    assert "AUTH-SIBLING" not in actions
+    assert actions.index("crictl pull") < actions.index("ImagePullSecret")
+    assert "ImagePullSecret" in actions
+    assert "rate-limit" not in actions
+    assert "TLS 인증서" not in actions
+    assert "같은 family의 대안 symptom" in appendix
+    assert "toomanyrequests" in appendix
+    assert "x509" in appendix
+    assert "ImagePullSecret을 추가하세요" not in appendix
+
+
+def test_korean_language_guard_rejects_english_recommended_actions() -> None:
+    detail = """## 1. 문제 (Problem)
+
+이미지 pull이 실패했습니다.
+
+## 2. 원인 (Root Cause)
+
+레지스트리 인증을 확인해야 합니다.
+
+## 3. 권장 조치 (Recommended Actions)
+
+1. The registry rejected the pull because the anonymous pull limit was hit.
+2. Add the registry CA certificate to every node.
+
+## 부록 (Appendix)
+"""
+
+    conflict = _korean_report_language_conflict("이미지 pull 실패", detail)
+
+    assert "English-only" in conflict
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_falls_back_when_actions_are_english(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko")
+    diagnostics: list[str] = []
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        return {
+            "summary": "이미지 pull 실패 원인을 분석했습니다.",
+            "detail": """## 1. 문제 (Problem)
+이미지 pull이 실패했습니다.
+## 2. 원인 (Root Cause)
+레지스트리 응답을 확인해야 합니다.
+## 3. 권장 조치 (Recommended Actions)
+1. Retry after the rate-limit window resets.
+## 부록 (Appendix)
+수집 증거를 기록했습니다.
+""",
+        }
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    result = await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "ImagePullBackOff"})
+        ),
+        results=[],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="image_pull_error", confidence="medium", score=5.0)
+        ],
+        kg_context={},
+        graph_fixes=GraphRemediation(),
+        fallback_detail="deterministic fallback",
+        diagnostics=diagnostics,
+    )
+
+    assert result is None
+    assert any("language guard" in item for item in diagnostics)
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_withholds_family_wide_graph_actions_with_support(
+    monkeypatch,
+) -> None:
+    settings = replace(make_settings(), language="ko")
+    captured: list[str] = []
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        captured.append(user)
+        return {"summary": "요약", "detail": "본문"}
+
+    class SupportedEligibility:
+        def permits(self, role: str) -> bool:
+            return role == "support"
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "ImagePullBackOff"})
+        ),
+        results=[],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="image_pull_error", confidence="medium", score=7.0)
+        ],
+        kg_context={},
+        graph_fixes=GraphRemediation(
+            family_fixes=["RATE-LIMIT-SIBLING"],
+            verified_actions=["TLS-SIBLING"],
+            xid_fixes={79: ["XID-SPECIFIC", "GPU 연결 상태를 점검하세요."]},
+        ),
+        fallback_detail="fallback",
+        evidence_eligibility={"E01": SupportedEligibility()},
+    )
+
+    payload = json.loads(captured[0].removeprefix("증거(JSON):\n"))
+    graph_payload = payload["graph_remediation"]
+    assert graph_payload["family_fixes"] == []
+    assert graph_payload["verified_actions"] == []
+    assert graph_payload["xid_fixes"] == {"79": ["GPU 연결 상태를 점검하세요."]}
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_prioritizes_matched_symptom_and_labels_family_siblings(
+    monkeypatch,
+) -> None:
+    settings = replace(make_settings(), language="ko")
+    captured: list[str] = []
+    failure_modes = load_failure_modes("knowledge/failure_modes.yaml")
+
+    async def fake_complete_synthesis_json(settings, *, system, user):
+        captured.append(user)
+        return {"summary": "요약", "detail": "본문"}
+
+    class SupportedEligibility:
+        def permits(self, role: str) -> bool:
+            return role == "support"
+
+    monkeypatch.setattr(
+        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+    )
+    await _synthesize_korean(
+        settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "ImagePullBackOff"})
+        ),
+        results=[
+            CollectorResult(
+                agent="kubernetes",
+                status="ok",
+                summary=(
+                    "ImagePullBackOff: pull access denied, repository does not exist "
+                    "or may require authorization"
+                ),
+            )
+        ],
+        plan=InvestigationPlan(),
+        root_cause_candidates=[
+            RankedCause(family="image_pull_error", confidence="high", score=8.0)
+        ],
+        kg_context={"knowledge": failure_modes},
+        graph_fixes=GraphRemediation(),
+        fallback_detail="fallback",
+        evidence_eligibility={"E01": SupportedEligibility()},
+    )
+
+    payload = json.loads(captured[0].removeprefix("증거(JSON):\n"))
+    graph_knowledge = payload["knowledge_graph"]
+    selected = graph_knowledge["knowledge"]["image_pull_error"]
+    supplemental = graph_knowledge["family_supplemental"]
+    assert len(selected) == 1
+    assert selected[0]["symptom"] == "이미지 repository 존재 여부 또는 권한 불명확"
+    assert selected[0]["evidence_matched"] is True
+    assert all(item["evidence_matched"] is False for item in supplemental)
+    assert any("pull 요청 제한" in item["symptom"] for item in supplemental)
+    assert all("actions" not in item for item in supplemental)
+    assert all(item["distinguishing_signals"] for item in supplemental)
 
 
 @pytest.mark.asyncio

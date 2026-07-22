@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { formatEvidenceQueries, splitRcaReport } from './rcaSections';
+import { formatEvidenceQueries, splitRcaReport, stripAppendixEvidence } from './rcaSections';
 
 describe('splitRcaReport', () => {
   it('splits on ## outside fences, keeps ### inside sections, flags pinned/open', () => {
@@ -39,5 +39,28 @@ describe('formatEvidenceQueries', () => {
     expect(formatEvidenceQueries('- **k8s**: reached via proxy. via kubectl get pods')).toBe(
       '- **k8s**: reached via proxy.  \n  `kubectl get pods`',
     );
+  });
+});
+
+describe('stripAppendixEvidence', () => {
+  it('removes only the appendix Evidence subsection and preserves Evidence Trace', () => {
+    const md = [
+      '## Appendix', '', '### Evidence', '', '- **kubernetes**: duplicated collector result',
+      '```', '### not a real heading', '```', '', '### Investigation Plan', '', '- inspect pod',
+      '', '## Evidence Trace', '', '- [E01] kubernetes: ImagePullBackOff',
+    ].join('\n');
+
+    const stripped = stripAppendixEvidence(md);
+
+    expect(stripped).not.toContain('### Evidence\n');
+    expect(stripped).not.toContain('duplicated collector result');
+    expect(stripped).toContain('### Investigation Plan');
+    expect(stripped).toContain('## Evidence Trace');
+    expect(stripped).toContain('[E01] kubernetes: ImagePullBackOff');
+  });
+
+  it('also removes the Korean appendix evidence heading', () => {
+    const md = '## 부록 (Appendix)\n\n### 증거 (Evidence)\n\n- 중복\n\n### 참고\n\n- 유지';
+    expect(stripAppendixEvidence(md)).toBe('## 부록 (Appendix)\n\n### 참고\n\n- 유지');
   });
 });

@@ -207,6 +207,8 @@ spec:
               value: {{ .Values.agent.env.llmModelChat | quote }}
             - name: LLM_MODEL_INSIGHT
               value: {{ .Values.agent.env.llmModelInsight | quote }}
+            - name: LLM_SYNTHESIS_MAX_TOKENS
+              value: {{ .Values.agent.env.llmSynthesisMaxTokens | quote }}
             - name: LLM_INSIGHT_MAX_TOKENS
               value: {{ .Values.agent.env.llmInsightMaxTokens | quote }}
             - name: LLM_PRICING_JSON

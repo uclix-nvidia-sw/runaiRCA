@@ -8,12 +8,9 @@ collectors already gathered. This is NOT incident similarity — pgvector /
 similar". Here we answer "which failure family does this incident's evidence
 point to, and how confidently", and cite the agents that back each candidate.
 
-Encodes rules R1-R6 from agent/knowledge/troubleshooting_cases.md. Keyword
-heuristics over collector text, not a model.
-
-ponytail: substring keyword scan over each collector's summary/artifacts/details,
-scoped per family to the agents that own that signal. Upgrade to structured
-detail parsing (or an LLM judge) only if the eval hit-rate stalls.
+Encodes rules R1-R6 from agent/knowledge/troubleshooting_cases.md. Typed
+observations are scored once per unique fact; legacy untyped collector output
+retains a capped keyword compatibility path. This is deterministic, not a model.
 """
 
 from __future__ import annotations
@@ -37,7 +34,7 @@ _FAMILY_RULES = _FAMILY_CATALOG.rules
 
 _FLOOR = 2.0          # min top score below which we fall back to insufficient_evidence
 _HIGH = 5.0           # score needed (with >=2 corroborating agents) for high confidence
-_MED = 2.5
+_MED = 2.0           # one canonical fact; non-canonical single facts remain low
 _CONF_ORDER = ("low", "medium", "high")
 # Values that describe what we ASKED or which objects EXIST, not what came back.
 # Matching keywords against them let a run with ZERO error evidence score
@@ -68,6 +65,17 @@ METADATA_VALUE_KEYS = {
     # lines live under "errors"/"lines"/"message" keys and stay matchable.
     "error",
     "mcp_fallback",
+    "args",
+    "arguments",
+    "debug",
+    "hints",
+    "metadata",
+    "possiblecause",
+    "possiblecauses",
+    "request",
+    "requestbody",
+    "suggestion",
+    "suggestions",
 }
 _METADATA_VALUE_KEYS = METADATA_VALUE_KEYS
 
@@ -222,6 +230,12 @@ class RankedCause:
     support_evidence_ids: list[str] = field(default_factory=list)
     contradiction_evidence_ids: list[str] = field(default_factory=list)
     rank_basis: list[str] = field(default_factory=list)
+    # Machine-readable scoring diagnostics.  ``score`` remains a deterministic
+    # ranking value (not a probability); these fields explain how it was built
+    # and which evidence-quality gates constrained the public confidence.
+    score_breakdown: list[dict[str, Any]] = field(default_factory=list)
+    independent_source_groups: list[str] = field(default_factory=list)
+    confidence_gate: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.subsystem or not self.nature:
@@ -247,6 +261,9 @@ class RankedCause:
             "supporting_evidence_ids": self.support_evidence_ids,
             "contradicting_evidence_ids": self.contradiction_evidence_ids,
             "rank_basis": self.rank_basis,
+            "score_breakdown": self.score_breakdown,
+            "independent_source_groups": self.independent_source_groups,
+            "confidence_gate": self.confidence_gate,
         }
 
 
@@ -370,9 +387,14 @@ def _fact_ids(value: object) -> list[str]:
 @dataclass
 class _Score:
     points: float = 0.0
+    evidence_points: float = 0.0
     rationale: list[str] = field(default_factory=list)
     agents: set[str] = field(default_factory=set)
     force_high: bool = False
+    support_evidence_ids: set[str] = field(default_factory=set)
+    contradiction_evidence_ids: set[str] = field(default_factory=set)
+    support_source_groups: set[str] = field(default_factory=set)
+    adjustments: list[dict[str, Any]] = field(default_factory=list)
 
 
 def rank_root_cause_candidates(
@@ -388,6 +410,7 @@ def rank_root_cause_candidates(
     lifecycle: dict[str, Any] | None = None,
     graph_candidate_counts: dict[str, int] | None = None,
     eligible_evidence_ids: set[str] | None = None,
+    evidence_eligibility: Mapping[str, object] | None = None,
 ) -> list[RankedCause]:
     """Rank failure families for THIS incident from collector evidence.
 
@@ -406,10 +429,6 @@ def rank_root_cause_candidates(
     ``lifecycle`` leaves ranking unchanged (backward compatible).
     """
     top_n = max(1, top_n)
-    text_by_agent = {
-        r.agent: _result_text(r, eligible_evidence_ids=eligible_evidence_ids)
-        for r in results
-    }
     status_by_agent = {r.agent: r.status for r in results}
     blast, blast_agents = _kg_blast_radius(results)
     # TypeDB topology is a current/reference graph, not an incident-window
@@ -422,18 +441,111 @@ def rank_root_cause_candidates(
     scores = {fam: _Score() for fam in FAMILIES}
     for fam, (canonical, agents, keywords) in _FAMILY_RULES.items():
         s = scores[fam]
-        for agent in agents:
-            text = text_by_agent.get(agent, "")
-            if not text:
-                continue
-            hits = sorted(set(_keyword_hits(text, list(keywords))[0]))
-            if not hits:
-                continue
+        # Explicit, asserted Alertmanager signatures are typed incident facts.
+        # They are not a catalog family's canonical telemetry source, but must
+        # remain available to signature promotion with their evidence IDs. The
+        # family relevance gate below admits only an auditable
+        # ``alert_signature:<family>`` predicate (or NVIDIA XID), never generic
+        # alert prose or alert-name similarity.
+        scoring_agents = tuple(dict.fromkeys((*agents, "alert")))
+        for agent in scoring_agents:
             weight = 2.0 if agent == canonical else 1.0
-            # cap per-agent contribution so one verbose log can't dominate
-            s.points += weight * min(len(hits), 3)
-            s.agents.add(agent)
-            s.rationale.append(f"{agent} evidence matched {', '.join(hits[:3])}")
+            matching_results = [result for result in results if result.agent == agent]
+            for result in matching_results:
+                structured = [
+                    art for art in result.artifacts if _artifact_observation(art) is not None
+                ]
+                if structured:
+                    supporting = [
+                        art
+                        for art in structured
+                        if _artifact_permits(
+                            art,
+                            "support",
+                            evidence_eligibility=evidence_eligibility,
+                            eligible_evidence_ids=eligible_evidence_ids,
+                        )
+                        and artifact_supports_family(fam, art)
+                    ]
+                    contradicting = [
+                        art
+                        for art in structured
+                        if _artifact_permits(
+                            art,
+                            "contradict",
+                            evidence_eligibility=evidence_eligibility,
+                            eligible_evidence_ids=eligible_evidence_ids,
+                        )
+                        and artifact_contradicts_family(fam, art)
+                    ]
+                    unique_support = _unique_artifacts_for_scoring(supporting)
+                    if unique_support:
+                        # A fact is one observation even when its message contains
+                        # ImagePullBackOff + ErrImagePull + pull access denied.  The
+                        # old keyword-density score counted those synonyms as three
+                        # independent facts and let one verbose card dominate.
+                        counted = unique_support[:3]
+                        fact_weights = [
+                            _structured_fact_weight(fam, agent, canonical, art, weight)
+                            for art in counted
+                        ]
+                        delta = sum(fact_weights)
+                        s.points += delta
+                        s.evidence_points += delta
+                        s.agents.add(agent)
+                        evidence_ids = [
+                            str(getattr(art, "evidence_id", "") or "") for art in counted
+                        ]
+                        s.support_evidence_ids.update(item for item in evidence_ids if item)
+                        groups = {
+                            source_independence_group(
+                                str(getattr(art, "source", "") or agent)
+                            )
+                            for art in counted
+                        }
+                        s.support_source_groups.update(groups)
+                        s.rationale.append(
+                            f"{agent} supplied {len(counted)} scoped supporting fact(s)"
+                        )
+                        s.adjustments.append(
+                            {
+                                "stage": "evidence",
+                                "kind": "canonical" if agent == canonical else "corroborating",
+                                "label": f"{agent} scoped supporting facts",
+                                "delta": delta,
+                                "evidence_ids": [item for item in evidence_ids if item],
+                                "source_groups": sorted(groups),
+                            }
+                        )
+                    for art in _unique_artifacts_for_scoring(contradicting):
+                        evidence_id = str(getattr(art, "evidence_id", "") or "")
+                        if evidence_id:
+                            s.contradiction_evidence_ids.add(evidence_id)
+                    continue
+
+                # Compatibility path for collectors that have not migrated to
+                # typed observations.  It remains keyword based, but cannot mix
+                # with typed fact scoring for the same result.
+                text = _result_text(result, eligible_evidence_ids=eligible_evidence_ids)
+                hits = sorted(set(_keyword_hits(text, list(keywords))[0])) if text else []
+                if not hits:
+                    continue
+                delta = weight * min(len(hits), 3)
+                s.points += delta
+                s.evidence_points += delta
+                s.agents.add(agent)
+                s.support_source_groups.add(source_independence_group(agent))
+                s.rationale.append(f"{agent} legacy evidence matched {', '.join(hits[:3])}")
+                s.adjustments.append(
+                    {
+                        "stage": "evidence",
+                        "kind": "legacy_keyword",
+                        "label": f"{agent} legacy keyword matches",
+                        "delta": delta,
+                        "matched_signals": hits[:3],
+                        "source_groups": [source_independence_group(agent)],
+                    }
+                )
 
     _apply_bonuses(
         scores,
@@ -468,11 +580,23 @@ def rank_root_cause_candidates(
             factor = priors.get(fam)
             if (
                 factor is not None
-                and s.points > 0
+                and s.evidence_points > 0
                 and _has_typed_incident_observation(target, results, s.agents)
             ):
-                s.points *= factor
+                before = s.evidence_points
+                adjusted = before * factor
+                s.evidence_points = adjusted
+                s.points += adjusted - before
                 s.rationale.append(f"feedback prior adjusted score x{factor:.2f}")
+                s.adjustments.append(
+                    {
+                        "stage": "prior",
+                        "kind": "feedback_prior",
+                        "label": "feedback/correction prior on evidence subtotal",
+                        "factor": factor,
+                        "delta": adjusted - before,
+                    }
+                )
 
     # The graph is allowed to corroborate a symptom that was already matched in
     # THIS run, never to create a high-confidence cause from historical memory.
@@ -487,6 +611,14 @@ def rank_root_cause_candidates(
         bonus = min(2.0, float(count))
         score.points += bonus
         score.rationale.append(f"ontology matched {int(bonus)} live symptom signal(s)")
+        score.adjustments.append(
+            {
+                "stage": "ontology",
+                "kind": "symptom_corroboration",
+                "label": "ontology live symptom corroboration",
+                "delta": bonus,
+            }
+        )
 
     ranked = [
         RankedCause(
@@ -495,6 +627,13 @@ def rank_root_cause_candidates(
             rationale=s.rationale,
             evidence_agents=sorted(s.agents),
             confidence=_confidence(fam, s, status_by_agent),
+            support_evidence_ids=sorted(s.support_evidence_ids),
+            contradiction_evidence_ids=sorted(s.contradiction_evidence_ids),
+            score_breakdown=list(s.adjustments),
+            independent_source_groups=sorted(
+                s.support_source_groups or _independent_observer_groups(s.agents)
+            ),
+            confidence_gate=_confidence_gate(fam, s, status_by_agent),
         )
         for fam, s in scores.items()
         if s.points > 0
@@ -507,19 +646,43 @@ def rank_root_cause_candidates(
         for c in ranked:
             if c.family == _LIFECYCLE_FAMILY:
                 c.trigger = trigger
-    ranked.sort(key=lambda c: c.score, reverse=True)
+    ranked.sort(key=_candidate_sort_key, reverse=True)
 
     # R6 evidence gate: topology/KG identity can focus investigation but cannot
     # establish a root cause by itself. A final family needs at least one real
     # collector observer; synthetic agents remain visible on the candidate for
     # follow-up planning without allowing it to bypass insufficient-evidence.
-    top_has_live_observer = bool(
-        ranked and (set(ranked[0].evidence_agents) - _SYNTHETIC_AGENTS)
+    live_ranked = [
+        candidate
+        for candidate in ranked
+        if candidate.score >= _FLOOR
+        and candidate.confidence in {"medium", "high"}
+        and bool(set(candidate.evidence_agents) - _SYNTHETIC_AGENTS)
+    ]
+    context_only = [candidate for candidate in ranked if candidate not in live_ranked]
+    context_leader = next(
+        (
+            candidate
+            for candidate in context_only
+            if set(candidate.evidence_agents) and not (
+                set(candidate.evidence_agents) - _SYNTHETIC_AGENTS
+            )
+        ),
+        None,
     )
-    if not ranked or ranked[0].score < _FLOOR or not top_has_live_observer:
+    weak_live_blocked_by_context = bool(
+        live_ranked
+        and context_leader is not None
+        and context_leader.score > live_ranked[0].score
+        and live_ranked[0].confidence != "high"
+        and len(live_ranked[0].independent_source_groups) < 2
+    )
+    if not live_ranked or weak_live_blocked_by_context:
         gate = _insufficient(results, status_by_agent)
         return [gate, *ranked][:top_n]
-    return ranked[:top_n]
+    # A topology-only hypothesis is useful context, but may not block a lower
+    # scored candidate that has actual incident-window evidence.
+    return [*live_ranked, *context_only][:top_n]
 
 
 def _apply_bonuses(
@@ -563,20 +726,53 @@ def _apply_bonuses(
         node.agents.update(blast_agents)
         node.force_high = True
         node.rationale.append(f"blast radius: {blast} workloads affected on the same node")
+        node.adjustments.append(
+            {
+                "stage": "rule_bonus",
+                "kind": "node_blast_radius",
+                "label": f"{blast} workloads affected with an active node condition",
+                "delta": 3.0,
+                "force_high": True,
+            }
+        )
     # R4: startup failure is more likely when the control plane is quiet.
     if startup.points > 0 and control.points == 0:
         startup.points += 1.0
         startup.rationale.append("control-plane logs quiet — points to a workload-local fault")
+        startup.adjustments.append(
+            {
+                "stage": "rule_bonus",
+                "kind": "workload_local",
+                "label": "control-plane evidence is quiet",
+                "delta": 1.0,
+            }
+        )
     # quota signal is stronger when a queue/project is actually in play (already
     # in the matched text); nudge so a lone keyword doesn't tie a real one.
     if quota.points > 0 and any(a in quota.agents for a in ("prometheus", "runai")):
         quota.points += 0.5
+        quota.adjustments.append(
+            {
+                "stage": "rule_bonus",
+                "kind": "quota_telemetry",
+                "label": "quota signal observed by Prometheus or Run:ai",
+                "delta": 0.5,
+            }
+        )
     # flapping favours cycling failure modes (node eviction / crashloop).
     if occurrence_count > 1:
         for s in (node, startup):
             if s.points > 0:
                 s.points += 0.5
                 s.rationale.append("alert is flapping (grouped occurrences) — cycling workload")
+                s.adjustments.append(
+                    {
+                        "stage": "rule_bonus",
+                        "kind": "flapping",
+                        "label": "grouped alert occurrences indicate cycling",
+                        "delta": 0.5,
+                    }
+                )
 
 
 # The alert TARGET being a known platform component is a topology fact, not a
@@ -620,9 +816,10 @@ def _apply_component_identity(
     """Elevate the family named by the alert target's component identity.
 
     ``family`` is ``component_entry['family']`` from runai_architecture.yaml
-    (already resolved by the planner). Adds a ``topology`` agent so the candidate
-    clears the evidence floor from a real, non-keyword source, and records the
-    depends_on check order so the report points at the right subsystem.
+    (already resolved by the planner). Adds a synthetic ``topology`` context
+    source and records the depends_on check order so the report points at the
+    right subsystem. Topology may prioritize investigation but cannot satisfy
+    the live-evidence conclusion gate by itself.
 
     Leadership rule: the identity must out-rank any family that is NOT
     corroborated by >=2 real evidence agents (a keyword-only node/workload guess),
@@ -643,6 +840,7 @@ def _apply_component_identity(
         ),
         default=0.0,
     )
+    before = s.points
     s.points = max(s.points + _COMPONENT_IDENTITY_WEIGHT, strongest_weak_rival + 1.0)
     where = f"alert target IS platform component {component}" if component else (
         "alert target is a known platform component"
@@ -650,6 +848,15 @@ def _apply_component_identity(
     if len(chain) > 1:
         where += f" → check depends_on: {' → '.join(chain)}"
     s.rationale.append(f"{where} ⇒ {family}")
+    s.adjustments.append(
+        {
+            "stage": "topology",
+            "kind": "component_identity",
+            "label": where,
+            "delta": s.points - before,
+            "causal_evidence": False,
+        }
+    )
 
 
 _LIFECYCLE_FAMILY = "platform_lifecycle_change"
@@ -687,6 +894,7 @@ def _apply_lifecycle_gate(scores: dict[str, _Score], lifecycle: dict[str, Any] |
         ),
         default=0.0,
     )
+    before = s.points
     s.points = max(s.points + _COMPONENT_IDENTITY_WEIGHT, strongest_weak_rival + 1.0)
     components = [c for c in (lifecycle.get("components") or []) if c]
     where = "rollout/upgrade in progress"
@@ -703,16 +911,29 @@ def _apply_lifecycle_gate(scores: dict[str, _Score], lifecycle: dict[str, Any] |
     # The alert's OWN component is the one rolling => the alert IS the rollout.
     if lifecycle.get("target_rollout"):
         s.force_high = True
+    s.adjustments.append(
+        {
+            "stage": "lifecycle",
+            "kind": "active_rollout",
+            "label": where,
+            "delta": s.points - before,
+            "force_high": bool(lifecycle.get("target_rollout")),
+        }
+    )
 
 
 def _confidence(fam: str, s: _Score, status_by_agent: dict[str, str]) -> str:
     # HIGH requires >=2 independent telemetry groups that genuinely observed
     # the failure. Synthetic topology/KG context can floor a score but cannot
     # unlock HIGH, and two collectors reading the Kubernetes API count once.
-    real_source_groups = len(_independent_observer_groups(s.agents))
-    if s.force_high or (s.points >= _HIGH and real_source_groups >= 2):
+    real_source_groups = len(
+        s.support_source_groups or _independent_observer_groups(s.agents)
+    )
+    if s.contradiction_evidence_ids:
+        level = 0  # unresolved direct contradiction keeps the hypothesis provisional
+    elif s.force_high or (s.points >= _HIGH and real_source_groups >= 2):
         level = 2  # high
-    elif s.points >= _MED or s.agents:
+    elif s.points >= _MED:
         level = 1  # medium
     else:
         level = 0  # low
@@ -721,6 +942,39 @@ def _confidence(fam: str, s: _Score, status_by_agent: dict[str, str]) -> str:
     if status_by_agent.get(canonical) == "unavailable":
         level = max(0, level - 1)
     return _CONF_ORDER[level]
+
+
+def _confidence_gate(
+    fam: str, s: _Score, status_by_agent: dict[str, str]
+) -> dict[str, Any]:
+    groups = sorted(s.support_source_groups or _independent_observer_groups(s.agents))
+    canonical = _FAMILY_RULES[fam][0]
+    return {
+        "score_floor": _FLOOR,
+        "score_floor_passed": s.points >= _FLOOR,
+        "medium_score_threshold": _MED,
+        "medium_score_passed": s.points >= _MED,
+        "high_score_threshold": _HIGH,
+        "high_score_passed": s.points >= _HIGH,
+        "required_independent_source_groups": 2,
+        "independent_source_groups": groups,
+        "independent_source_gate_passed": len(groups) >= 2,
+        "canonical_source": canonical,
+        "canonical_source_available": status_by_agent.get(canonical) != "unavailable",
+        "force_high": s.force_high,
+        "unresolved_contradiction": bool(s.contradiction_evidence_ids),
+    }
+
+
+def _candidate_sort_key(candidate: RankedCause) -> tuple[int, int, int, float]:
+    """Prefer adjudicated evidence quality before lexical score magnitude."""
+    confidence_rank = _CONF_ORDER.index(candidate.confidence) if candidate.confidence in _CONF_ORDER else 0
+    return (
+        0 if candidate.contradiction_evidence_ids else 1,
+        confidence_rank,
+        len(candidate.independent_source_groups),
+        candidate.score,
+    )
 
 
 def _insufficient(
@@ -734,10 +988,9 @@ def _insufficient(
     ]
     if unavailable:
         rationale.append(f"Evidence gaps: {', '.join(unavailable)} unavailable.")
-    confidence = "medium" if len(ok) >= 2 else "low"
     return RankedCause(
         family=INSUFFICIENT,
-        confidence=confidence,
+        confidence="low",
         score=0.0,
         rationale=rationale,
         evidence_agents=ok,
@@ -756,10 +1009,13 @@ def _insufficient(
 # ``pod_logs``, ``container_diagnostics``, …), so we drop the raw ``queries``
 # duplicate from EVERY keyword-scan text (both the family ranker here and the
 # signature/symptom matcher in pipeline._evidence_leaf_text — they must share one
-# policy or the leak reappears in whichever path is missed). loki/prometheus/runai
-# put their PRIMARY signal in ``queries``, so the drop is scoped to kubernetes.
+# policy or the leak reappears in whichever path is missed). Loki/Prometheus
+# put their primary normalized signals outside their retrieval metadata.
+# Run:ai keeps validated workload status reasons beside the raw API ``data``;
+# scan only those reasons so policy hints/example text cannot become a cause.
 COLLECTOR_TEXT_DROP_KEYS: dict[str, frozenset[str]] = {
     "kubernetes": frozenset({"queries"}),
+    "runai": frozenset({"data"}),
 }
 _RANKING_TEXT_DROP_KEYS = COLLECTOR_TEXT_DROP_KEYS  # backward-compatible alias
 
@@ -969,6 +1225,67 @@ def _artifact_is_evidence(
     # post-resolution epilogue.  Once that verdict is available, the catalog
     # ranker must not reintroduce the card through its raw text scan.
     return eligible_evidence_ids is None or str(getattr(art, "evidence_id", "")) in eligible_evidence_ids
+
+
+def _artifact_permits(
+    art: object,
+    role: str,
+    *,
+    evidence_eligibility: Mapping[str, object] | None,
+    eligible_evidence_ids: set[str] | None,
+) -> bool:
+    """Apply the pipeline's target/window/run verdict to ranker fact roles."""
+    if evidence_eligibility is not None:
+        evidence_id = str(getattr(art, "evidence_id", "") or "")
+        eligibility = evidence_eligibility.get(evidence_id)
+        permits = getattr(eligibility, "permits", None)
+        return bool(callable(permits) and permits(role))
+    evidence_id = str(getattr(art, "evidence_id", "") or "")
+    if eligible_evidence_ids is not None:
+        return role == "support" and evidence_id in eligible_evidence_ids
+    observation = _artifact_observation(art)
+    if observation is None:
+        return False
+    polarity = str(observation.get("polarity") or "").strip().casefold()
+    coverage = str(observation.get("coverage") or "").strip().casefold()
+    return bool(
+        coverage == "scoped"
+        and (
+            role == "support" and polarity == "present"
+            or role == "contradict" and polarity == "absent"
+        )
+    )
+
+
+def _structured_fact_weight(
+    family: str,
+    agent: str,
+    canonical: str,
+    art: object,
+    default: float,
+) -> float:
+    """Give typed discriminators their semantic weight without counting synonyms."""
+    if family == "runai_scheduling_quota" and agent == "kubernetes":
+        _agent, _predicate, text = _artifact_family_semantics(art)
+        if "podgroup requested gpus" in text:
+            # An exact, target-verified PodGroup GPU shortage is a Run:ai
+            # scheduler observation even though it arrived through Kubernetes.
+            return 3.0
+    return 2.0 if agent == canonical else default
+
+
+def _unique_artifacts_for_scoring(items: list[object]) -> list[object]:
+    """Deduplicate retries/cards without treating missing IDs as one fact."""
+    seen: set[str] = set()
+    unique: list[object] = []
+    for item in items:
+        evidence_id = str(getattr(item, "evidence_id", "") or "")
+        key = evidence_id or f"object:{id(item)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
 
 
 def _artifact_observation(art: object) -> dict[str, object] | None:

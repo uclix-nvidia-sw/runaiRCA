@@ -86,9 +86,8 @@ select $statement, $outcome;
 """
 
 # Validated TypeDB 3.x reasoning functions (ontology/functions.tql). Called after
-# ranking to pull graph-derived remediation. The `match let $x in <fn>(<arg>);
+# ranking to pull signature-specific graph remediation. The `match let $x in <fn>(<arg>);
 # select $x;` call form is the validated 3.11.x syntax — do not "simplify" it.
-_FN_FIXES_FOR_FAMILY = 'match let $x in fixes_for_family("{family}"); select $x;'
 _FN_FIXES_FOR_XID = "match let $x in fixes_for_xid({code}); select $x;"
 _FN_TRIGGER_FOR_XID = "match let $x in trigger_for_xid({code}); select $x;"
 _FN_XIDS_FOR_GPU_MODEL = 'match let $x in xids_for_gpu_model("{model}"); select $x;'
@@ -97,7 +96,6 @@ _FN_ROOT_XIDS_FOR = "match let $x in root_xids_for({code}); select $x;"
 _FN_CAUSES_FOR_SYMPTOM = 'match let $x in causes_for_symptom("{symptom}"); select $x;'
 _FN_DEPENDENCIES_FOR_COMPONENT = 'match let $x in dependencies_for_component("{component}"); select $x;'
 _FN_CHECKS_FOR_COMPONENT_PATH = 'match let $x, $y in checks_for_component_path("{component}"); select $x, $y;'
-_FN_VERIFIED_ACTIONS_FOR_FAMILY = 'match let $x in verified_actions_for_family("{family}"); select $x;'
 
 _DIAGNOSTIC_RUNBOOK = "k8s-senior-troubleshooting"
 _FN_DIAGNOSTIC_STEPS = (
@@ -272,6 +270,9 @@ async def enrich(
 class GraphRemediation:
     """Graph-derived remediation from the validated TypeDB reasoning functions."""
 
+    # Legacy response fields retained for compatibility. Production lookup no
+    # longer populates them: flattening symptom actions or historical outcomes
+    # by family destroys symptom->action provenance.
     family_fixes: list[str] = field(default_factory=list)
     xid_fixes: dict[int, list[str]] = field(default_factory=dict)
     xid_triggers: dict[int, str] = field(default_factory=dict)
@@ -314,15 +315,16 @@ async def graph_remediation(
 ) -> GraphRemediation:
     """Best-effort graph-derived remediation via the validated reasoning functions.
 
-    Runs AFTER ranking: fixes_for_family(top_family), fixes_for_xid(N) for any Xid
-    codes found in evidence, xids_for_gpu_model(M) when a model is derivable.
+    Runs AFTER ranking for fixes_for_xid(N) and xids_for_gpu_model(M). ``family``
+    remains API-compatible, but family-wide action queries are intentionally not
+    executed; callers use symptom-linked ``KGContext.knowledge`` instead.
     Degrades to an empty result (never raises) when TypeDB is disabled/unreachable,
     the driver is missing, or the functions are not defined in the schema.
     """
     xid_codes = xid_codes or []
     if not settings.enable_typedb or not settings.typedb_address:
         return GraphRemediation()
-    if not (family or xid_codes or gpu_model):
+    if not (xid_codes or gpu_model):
         return GraphRemediation()
     try:
         import typedb.driver  # noqa: F401 - presence check only
@@ -353,15 +355,6 @@ def _query_remediation(
 ) -> GraphRemediation:
     out = GraphRemediation()
     with client.open_reader() as run:
-        if family:
-            rows = run(_FN_FIXES_FOR_FAMILY.format(family=escape_typeql(family)))
-            out.family_fixes = _statements(rows)
-            try:
-                out.verified_actions = _statements(
-                    run(_FN_VERIFIED_ACTIONS_FOR_FAMILY.format(family=escape_typeql(family)))
-                )
-            except Exception:  # noqa: BLE001 - older graph function set remains usable
-                pass
         for raw_code in dict.fromkeys(xid_codes):  # de-dupe, preserve order
             code = int(raw_code)
             fixes = _statements(run(_FN_FIXES_FOR_XID.format(code=code)))

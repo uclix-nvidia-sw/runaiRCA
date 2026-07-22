@@ -14,6 +14,7 @@ from typing import Any, Literal
 
 from app.collectors.base import NO_EVIDENCE
 from app.knowledge import _keyword_negated
+from app.services.evidence_projection import observed_payload
 
 ProbeVerdict = Literal["supports", "refutes", "inconclusive", "unavailable"]
 
@@ -134,5 +135,5 @@ def _observed_text(value: Any) -> str:
             for child in item:
                 walk(child, key)
 
-    walk(value)
+    walk(observed_payload(value))
     return "\n".join(leaves)

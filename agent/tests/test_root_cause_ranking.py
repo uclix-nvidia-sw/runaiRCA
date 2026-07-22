@@ -4,6 +4,7 @@ from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, ar
 from app.services.root_cause_ranking import (
     RankedCause,
     _confidence,
+    _candidate_sort_key,
     _result_text,
     _Score,
     merge_open_world_candidates,
@@ -44,6 +45,38 @@ def _r(
         details=details or {},
         artifacts=artifacts or [],
     )
+
+
+def test_asserted_alert_signature_keeps_evidence_link_for_promotion() -> None:
+    card = artifact(
+        agent="alert",
+        source="alertmanager",
+        type="alert_signature",
+        status="ok",
+        confidence="high",
+        summary="Alert payload explicitly reported ErrImagePull.",
+        result={
+            "matched_signals": ["ErrImagePull"],
+            "observation": {
+                "predicate": "alert_signature:image_pull_error",
+                "polarity": "present",
+                "coverage": "scoped",
+            },
+        },
+    )
+    card.evidence_id = "E-alert-pull"
+
+    ranked = rank_root_cause_candidates(
+        _target(alert_name="KubePodImagePullBackOff"),
+        [_r("alert", summary=card.summary, artifacts=[card])],
+        top_n=3,
+    )
+
+    image = next(candidate for candidate in ranked if candidate.family == "image_pull_error")
+    assert image.score == 1.0
+    assert image.confidence == "low"
+    assert image.support_evidence_ids == ["E-alert-pull"]
+    assert image.independent_source_groups == ["alertmanager"]
 
 
 def test_novel_family_slug_keeps_distinct_unicode_mechanisms() -> None:
@@ -665,7 +698,10 @@ def test_feedback_prior_requires_typed_current_incident_observation() -> None:
     grounded_control = next(
         cause for cause in grounded if cause.family == "runai_control_plane_error"
     )
-    assert grounded_control.score == 3.0
+    # One typed fact is counted once even though its text contains both
+    # runai-backend and failed-to-reconcile synonyms. Kubernetes is a
+    # corroborating (non-canonical) source for this family, so 1.0 × 1.5.
+    assert grounded_control.score == 1.5
     assert any("feedback prior" in reason for reason in grounded_control.rationale)
 
 
@@ -708,8 +744,66 @@ def test_feedback_prior_rejects_other_entity_or_out_of_incident_observation() ->
             priors={"runai_control_plane_error": 1.5},
         )
         control = next(cause for cause in ranked if cause.family == "runai_control_plane_error")
-        assert control.score == 2.0
+        assert control.score == 1.0
         assert not any("feedback prior" in reason for reason in control.rationale)
+
+
+def test_confidence_tier_precedes_raw_score_in_candidate_order() -> None:
+    noisy = RankedCause(
+        "workload_startup_error",
+        "medium",
+        6.0,
+        independent_source_groups=["kubernetes_api"],
+    )
+    corroborated = RankedCause(
+        "image_pull_error",
+        "high",
+        5.0,
+        independent_source_groups=["kubernetes_api", "loki"],
+    )
+
+    ranked = sorted([noisy, corroborated], key=_candidate_sort_key, reverse=True)
+
+    assert ranked[0] is corroborated
+
+
+def test_typed_fact_counts_once_and_scoped_contradiction_blocks_conclusion() -> None:
+    support = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="warning_event",
+        status="ok",
+        confidence="high",
+        summary="ImagePullBackOff ErrImagePull pull access denied",
+        result={
+            "observation": {"polarity": "present", "coverage": "scoped"},
+        },
+    )
+    support.evidence_id = "E01"
+    contradiction = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="warning_event",
+        status="ok",
+        confidence="high",
+        summary="ImagePullBackOff was not observed for the target pod",
+        result={
+            "observation": {"polarity": "absent", "coverage": "scoped"},
+        },
+    )
+    contradiction.evidence_id = "E02"
+
+    ranked = rank_root_cause_candidates(
+        _target(alert_name="KubePodNotReady"),
+        [_r("kubernetes", artifacts=[support, contradiction])],
+    )
+    image = next(item for item in ranked if item.family == "image_pull_error")
+
+    assert image.score == 2.0
+    assert image.confidence == "low"
+    assert image.support_evidence_ids == ["E01"]
+    assert image.contradiction_evidence_ids == ["E02"]
+    assert ranked[0].family == "insufficient_evidence"
 
 
 def test_postgres_prior_history_cannot_create_current_catalog_cause() -> None:
@@ -893,6 +987,48 @@ def test_trigger_facet_survives_signature_promotion() -> None:
     promoted_b = _promote_signature_cause(top_other, [], [], [symptom])
     assert promoted_b[0].family == "platform_lifecycle_change"
     assert promoted_b[0].trigger == lifecycle_cause.trigger
+
+
+def test_signature_floor_refreshes_score_gates_without_overriding_contradiction() -> None:
+    from app.services.pipeline import _promote_signature_cause
+
+    contradicted = RankedCause(
+        family="image_pull_error",
+        confidence="low",
+        score=1.0,
+        contradiction_evidence_ids=["E-no-pull"],
+        confidence_gate={
+            "score_floor": 2.0,
+            "score_floor_passed": False,
+            "medium_score_threshold": 2.0,
+            "medium_score_passed": False,
+            "high_score_threshold": 5.0,
+            "high_score_passed": False,
+            "unresolved_contradiction": True,
+        },
+    )
+
+    promoted = _promote_signature_cause(
+        [contradicted],
+        [],
+        [],
+        [
+            (
+                "image_pull_error",
+                {
+                    "symptom": "ImagePullBackOff",
+                    "matched_keywords": ["imagepullbackoff"],
+                },
+            )
+        ],
+    )[0]
+
+    assert promoted.score == 7.0
+    assert promoted.confidence == "low"
+    assert promoted.confidence_gate["score_floor_passed"] is True
+    assert promoted.confidence_gate["medium_score_passed"] is True
+    assert promoted.confidence_gate["high_score_passed"] is True
+    assert promoted.confidence_gate["unresolved_contradiction"] is True
 
 
 def test_r1_healthy_node_object_in_details_does_not_force_high() -> None:

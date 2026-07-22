@@ -182,6 +182,10 @@ func TestAnalysisRunStoresUsageAndPreservesLastGoodMetadataOnReanalysis(t *testi
 		AnalysisSummary: "done",
 		Context: map[string]any{
 			"llm_usage": map[string]any{"prompt_tokens": float64(3), "completion_tokens": float64(5), "total_tokens": float64(8)},
+			"confidence_diagnostics": map[string]any{
+				"schema_version":    float64(1),
+				"ranking_candidate": map[string]any{"family": "runai_scheduling_quota", "score": float64(2.5)},
+			},
 		},
 	})
 	if !ok {
@@ -199,8 +203,9 @@ func TestAnalysisRunStoresUsageAndPreservesLastGoodMetadataOnReanalysis(t *testi
 		t.Fatalf("progress log missing after complete: %+v", completed.Metadata)
 	}
 	detail, ok := store.IncidentDetail(incident.IncidentID)
-	if !ok || detail.TokenUsage["total_tokens"] != float64(8) {
-		t.Fatalf("incident detail missing token usage: ok=%t detail=%+v", ok, detail)
+	if !ok || detail.TokenUsage["total_tokens"] != float64(8) ||
+		detail.ConfidenceDiagnostics["schema_version"] != float64(1) {
+		t.Fatalf("incident detail missing usage/confidence diagnostics: ok=%t detail=%+v", ok, detail)
 	}
 
 	reused, created := store.CreateAnalysisRunIfAllowed("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Again", "")
@@ -224,6 +229,10 @@ func TestFailedReanalysisRestoresLastGoodMetadata(t *testing.T) {
 			"analysis_hash": "hash-good",
 			"harness":       map[string]any{"verdict": "pass"},
 			"llm_usage":     map[string]any{"total_tokens": float64(42)},
+			"confidence_diagnostics": map[string]any{
+				"schema_version":  float64(1),
+				"final_candidate": map[string]any{"family": "runai_scheduling_quota"},
+			},
 		},
 	})
 	reused, created := store.CreateAnalysisRunIfAllowed(
@@ -252,7 +261,8 @@ func TestFailedReanalysisRestoresLastGoodMetadata(t *testing.T) {
 		t.Fatalf("restored metadata or failed-attempt progress is incomplete: %+v", failed.Metadata)
 	}
 	detail, _ := store.IncidentDetail(incident.IncidentID)
-	if detail.AnalysisHash != "hash-good" || detail.Harness["verdict"] != "pass" || detail.TokenUsage["total_tokens"] != float64(42) {
+	if detail.AnalysisHash != "hash-good" || detail.Harness["verdict"] != "pass" || detail.TokenUsage["total_tokens"] != float64(42) ||
+		detail.ConfidenceDiagnostics["schema_version"] != float64(1) {
 		t.Fatalf("incident detail lost last-good verification metadata: %+v", detail)
 	}
 }

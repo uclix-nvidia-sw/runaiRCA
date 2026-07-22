@@ -370,7 +370,9 @@ async def test_semantic_completion_does_not_disable_reanalysis(monkeypatch) -> N
     assert len(refute_calls) >= 1
     assert "re-analysis pass was performed" in response.analysis_detail
     top = response.context["root_cause_candidates"][0]
-    assert top["family"] in {"node_kubelet_pressure", "runai_scheduling_quota"}
+    # The sole stub verdict refutes every candidate. The pipeline now fails
+    # closed instead of allowing the last refuted family into synthesis.
+    assert top["family"] == "insufficient_evidence"
 
 
 @pytest.mark.asyncio
@@ -461,7 +463,7 @@ def test_probe_history_bookkeeping_does_not_count_as_new_evidence() -> None:
     )
 
 
-def test_aggregate_evidence_deduplicates_identical_round_artifacts() -> None:
+def test_aggregate_evidence_keeps_latest_semantic_round_artifact() -> None:
     state = pipeline.new_state(make_settings(), _request(), collectors=[])
     first = artifact(
         agent="kubernetes",
@@ -493,8 +495,116 @@ def test_aggregate_evidence_deduplicates_identical_round_artifacts() -> None:
     first_signature = pipeline._evidence_signature(state.results)
     pipeline._aggregate_evidence(state)
 
-    assert state.results[0].artifacts == [first]
+    assert state.results[0].artifacts == [repeated]
     assert pipeline._evidence_signature(state.results) == first_signature
+
+
+def test_aggregate_evidence_keeps_distinct_node_conditions_from_one_query() -> None:
+    state = pipeline.new_state(make_settings(), _request(), collectors=[])
+    conditions = [
+        artifact(
+            agent="kubernetes",
+            source="kubernetes",
+            type="kubernetes_node_condition",
+            status="ok",
+            confidence="high",
+            title=f"node/dgx01 · {condition}",
+            query="kubectl get nodes dgx01 -o json",
+            summary=f"{condition}=False",
+            result={"condition": condition, "status": "False"},
+        )
+        for condition in ("MemoryPressure", "DiskPressure", "PIDPressure")
+    ]
+    state.results = [
+        CollectorResult(
+            agent="kubernetes", status="ok", summary="node healthy", artifacts=conditions
+        )
+    ]
+
+    pipeline._aggregate_evidence(state)
+
+    assert state.results[0].artifacts == conditions
+
+
+def test_aggregate_evidence_keeps_same_query_from_distinct_windows() -> None:
+    state = pipeline.new_state(make_settings(), _request(), collectors=[])
+    cards = [
+        artifact(
+            agent="prometheus",
+            source="prometheus",
+            type="promql_signal",
+            status="ok",
+            confidence="high",
+            title="Prometheus · restarts",
+            query="increase(kube_pod_container_status_restarts_total[5m])",
+            summary=f"restart observation for {start}",
+            result={
+                "observation": {
+                    "kind": "prometheus_query",
+                    "predicate": "container_restarts",
+                    "polarity": "present",
+                    "coverage": "scoped",
+                    "observed_entity": {"pod": "trainer-0"},
+                    "observation_window": {
+                        "start": start,
+                        "end": end,
+                    },
+                }
+            },
+        )
+        for start, end in (
+            ("2026-07-22T01:00:00Z", "2026-07-22T01:05:00Z"),
+            ("2026-07-22T02:00:00Z", "2026-07-22T02:05:00Z"),
+        )
+    ]
+    state.results = [
+        CollectorResult(agent="prometheus", status="ok", summary="two windows", artifacts=cards)
+    ]
+
+    pipeline._aggregate_evidence(state)
+
+    assert state.results[0].artifacts == cards
+
+
+def test_continuation_reanalysis_marks_only_added_artifacts_as_fresh() -> None:
+    existing = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_warning_events",
+        status="ok",
+        confidence="high",
+        query="kubectl get events -n default",
+        summary="ImagePullBackOff",
+        result={"kind": "events", "count": 1},
+    )
+    added = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="adhoc_query",
+        status="ok",
+        confidence="medium",
+        query="kubectl get resourcequotas -n default",
+        summary="quota checked",
+        result={"kind": "resourcequotas", "count": 1},
+    )
+    previous = [
+        CollectorResult(
+            agent="kubernetes", status="ok", summary="initial", artifacts=[existing]
+        )
+    ]
+    continued = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary="continued",
+            artifacts=[existing, added],
+        )
+    ]
+
+    fresh = pipeline._fresh_collector_results(previous, continued)
+
+    assert len(fresh) == 1
+    assert fresh[0].artifacts == [added]
 
 
 def test_reanalysis_note_is_not_appended_twice() -> None:
@@ -659,6 +769,7 @@ async def test_reanalysis_stops_when_a_followup_adds_no_evidence(monkeypatch) ->
         return pipeline._ReanalysisOutcome(
             results=list(_state.results),
             candidates=[RankedCause(target.family, "low", 2.5)],
+            ranking_candidate=RankedCause(target.family, "low", 2.5),
             investigation_context={"hypothesis_ledger": []},
             caveat="",
             note="",
@@ -672,6 +783,29 @@ async def test_reanalysis_stops_when_a_followup_adds_no_evidence(monkeypatch) ->
     await pipeline._investigate_until_settled(state)
 
     assert calls == 1
+
+
+def test_confidence_diagnostics_keep_ranking_self_check_and_harness_stages_separate() -> None:
+    state = pipeline.new_state(make_settings(), _request(), collectors=[])
+    state.ranking_candidate_before_self_check = RankedCause(
+        "image_pull_error", "high", 6.0
+    )
+    state.root_cause_candidates = [RankedCause("image_pull_error", "low", 6.0)]
+    state.self_check_confidence_before = "high"
+    state.self_check_confidence_after = "medium"
+    before_harness = RankedCause("image_pull_error", "medium", 6.0)
+
+    diagnostics = pipeline._confidence_diagnostics(
+        state,
+        harness={"status": "abstained", "overall_score": 68},
+        candidate_before_harness=before_harness,
+    )
+
+    assert diagnostics["ranking_candidate"]["confidence"] == "high"
+    assert diagnostics["pre_harness_candidate"]["confidence"] == "medium"
+    assert diagnostics["final_candidate"]["confidence"] == "low"
+    assert diagnostics["self_check"]["confidence_after"] == "medium"
+    assert diagnostics["harness"]["overall_score"] == 68
 
 
 @pytest.mark.asyncio
@@ -697,11 +831,13 @@ async def test_reanalysis_failure_falls_back_to_first_result(monkeypatch) -> Non
     orchestrator = AnalysisOrchestrator(llm_settings())
     response = await orchestrator.analyze(_request())
 
-    # Re-analysis was attempted once, blew up, and the first result stands.
+    # Re-analysis was attempted once and blew up. The already-ranked alternative
+    # is self-checked as a bounded fallback; the same stub refutes it too, so the
+    # pipeline must abstain rather than restoring the first refuted family.
     assert len(investigate_calls) == 2
-    assert len(refute_calls) == 1  # second refutation never happened
+    assert len(refute_calls) == 2
     top = response.context["root_cause_candidates"][0]
-    assert top["family"] == "node_kubelet_pressure"
+    assert top["family"] == "insufficient_evidence"
     assert "First doubt stands." in response.analysis_detail
     assert "re-analysis pass was performed" not in response.analysis_detail
     # Still refuted -> the honest operator-questions section appears (en settings),

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.collectors.base import AnalysisTarget, CollectorResult
+from app.collectors.base import AnalysisTarget, CollectorResult, artifact
 from app.llm import begin_usage_tracking
 from app.plan import InvestigationPlan
 from app.schemas import AlertAnalysisArtifact
@@ -29,6 +29,7 @@ from app.services.drilldown import (
     run_drilldowns,
 )
 from app.services.evidence_blackboard import Blackboard
+from app.services.query_memory import QueryMemory
 from app.services.root_cause_ranking import _artifact_is_evidence
 from tests.test_orchestrator import make_settings
 
@@ -116,6 +117,377 @@ def test_disabled_flag_means_no_llm_calls(monkeypatch) -> None:
     asyncio.run(run_drilldowns(settings, [result], _target(), None))
     assert calls == []
     assert result.artifacts == []
+
+
+def test_single_scoped_positive_does_not_skip_optional_discriminator(monkeypatch) -> None:
+    calls = 0
+
+    async def conclude(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return {"action": "done"}
+
+    monkeypatch.setattr(drilldown, "complete_json", conclude)
+    result = CollectorResult(
+        agent="loki",
+        status="ok",
+        summary="target log failure observed",
+        artifacts=[
+            artifact(
+                agent="loki",
+                source="loki",
+                type="logql_signal",
+                status="ok",
+                confidence="high",
+                summary="ImagePullBackOff returned by the target log stream",
+                result={
+                    "observation": {
+                        "polarity": "present",
+                        "coverage": "scoped",
+                    }
+                },
+            )
+        ],
+    )
+
+    asyncio.run(
+        run_drilldowns(
+            drill_settings(loki_mcp_url="http://loki-mcp"),
+            [result],
+            _target(),
+            None,
+        )
+    )
+
+    assert len(result.artifacts) == 1
+    assert calls == 1
+
+
+def test_supported_investigation_skips_all_optional_drilldowns(monkeypatch) -> None:
+    async def must_not_decide(*_args, **_kwargs):  # pragma: no cover
+        raise AssertionError("supported investigation must skip drill-down")
+
+    monkeypatch.setattr(drilldown, "complete_json", must_not_decide)
+    result = CollectorResult(agent="loki", status="partial", summary="logs checked")
+
+    asyncio.run(
+        run_drilldowns(
+            drill_settings(),
+            [result],
+            _target(),
+            None,
+            evidence_sufficient=True,
+        )
+    )
+
+    assert result.artifacts == []
+
+
+def test_inconclusive_declared_probe_runs_before_and_prevents_optional_stop(
+    monkeypatch,
+) -> None:
+    seen: list[tuple[str, str]] = []
+    decisions = 0
+
+    async def conclude(*_args, **_kwargs):
+        nonlocal decisions
+        decisions += 1
+        return {"action": "done"}
+
+    async def fake_k8s_read(settings, kind, *, namespace="", **_kwargs):
+        seen.append((kind, namespace))
+        return {"kind": kind, "status_code": 200, "error": None, "items": []}
+
+    monkeypatch.setattr(drilldown, "complete_json", conclude)
+    monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
+    plan = InvestigationPlan(
+        diagnostic_directive={
+            "probes": [
+                {
+                    "tool": "k8s_read",
+                    "arguments_template": {
+                        "kind": "events",
+                        "namespace": "{{namespace}}",
+                    },
+                    "supports_signals": [],
+                    "refutes_signals": [],
+                }
+            ]
+        }
+    )
+    result = _k8s_result()
+
+    asyncio.run(
+        run_drilldowns(
+            drill_settings(),
+            [result],
+            _target(),
+            plan,
+            evidence_sufficient=True,
+        )
+    )
+
+    assert seen == [("events", "runai-vision")]
+    assert [item.type for item in result.artifacts] == ["ontology_probe"]
+    assert decisions == 1
+
+
+def test_kubernetes_drilldown_reuses_base_events_node_and_pod_inspection(monkeypatch) -> None:
+    target = replace(_target(), pod="train-1-0", node="dgx01")
+    result = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="base Kubernetes evidence",
+        artifacts=[
+            artifact(
+                agent="kubernetes",
+                source="kubernetes",
+                type="kubernetes_warning_events",
+                status="ok",
+                confidence="high",
+                query="kubectl get events -n runai-vision",
+                summary="warning events collected",
+                result={},
+            ),
+            artifact(
+                agent="kubernetes",
+                source="kubernetes",
+                type="kubernetes_node_condition",
+                status="ok",
+                confidence="high",
+                query="kubectl get nodes dgx01 -o json",
+                summary="node conditions collected",
+                result={},
+            ),
+            artifact(
+                agent="kubernetes",
+                source="kubernetes",
+                type="pod_inspection",
+                status="ok",
+                confidence="high",
+                query="kubectl describe pod train-1-0 -n runai-vision",
+                summary="pod described",
+                result={},
+            ),
+        ],
+    )
+    plan = InvestigationPlan(
+        diagnostic_directive={
+            "probes": [
+                {
+                    "tool": "k8s_read",
+                    "arguments_template": {
+                        "kind": "events",
+                        "namespace": "{{namespace}}",
+                    },
+                },
+                {
+                    "tool": "k8s_read",
+                    "arguments_template": {"kind": "nodes", "name": "{{node}}"},
+                },
+                {
+                    "tool": "k8s_describe",
+                    "arguments_template": {
+                        "kind": "pods",
+                        "namespace": "{{namespace}}",
+                        "name": "{{pod}}",
+                    },
+                },
+            ]
+        }
+    )
+
+    async def fake_complete_json(*_args, **_kwargs):
+        return {
+            "action": "query",
+            "queries": [
+                {
+                    "tool": "k8s_read",
+                    "args": {"kind": "events", "namespace": "runai-vision"},
+                },
+                {"tool": "k8s_read", "args": {"kind": "nodes", "name": "dgx01"}},
+                {
+                    "tool": "k8s_read",
+                    "args": {
+                        "kind": "pods",
+                        "namespace": "runai-vision",
+                        "name": "train-1-0",
+                    },
+                },
+            ],
+        }
+
+    async def duplicate_read(*_args, **_kwargs):  # pragma: no cover
+        raise AssertionError("base Kubernetes observation must be reused")
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "k8s_read", duplicate_read)
+    monkeypatch.setattr(drilldown, "k8s_describe", duplicate_read)
+
+    asyncio.run(run_drilldowns(drill_settings(), [result], target, plan))
+
+    assert len(result.artifacts) == 3
+
+
+def test_non_kubernetes_drilldown_reuses_successful_base_query(monkeypatch) -> None:
+    result = CollectorResult(
+        agent="prometheus",
+        status="partial",
+        summary="base query completed",
+        details={"queries": [{"query": "up", "status_code": 200}]},
+    )
+
+    async def fake_complete_json(*_args, **_kwargs):
+        return {
+            "action": "query",
+            "queries": [{"tool": "promql_query", "args": {"query": "up"}}],
+        }
+
+    async def duplicate_query(*_args, **_kwargs):  # pragma: no cover
+        raise AssertionError("successful PromQL base query must be reused")
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(
+        drilldown,
+        "_domain_tools",
+        lambda _settings: {
+            "prometheus": {
+                "promql_query": {"description": "PromQL", "call": duplicate_query}
+            }
+        },
+    )
+
+    asyncio.run(run_drilldowns(drill_settings(), [result], _target(), None))
+
+    assert result.artifacts == []
+
+
+def test_drilldown_agents_share_cross_domain_query_receipts(monkeypatch) -> None:
+    calls: list[str] = []
+    results = [
+        CollectorResult(agent="kubernetes", status="partial", summary="k8s"),
+        CollectorResult(agent="change", status="partial", summary="changes"),
+    ]
+
+    async def fake_complete_json(_settings, *, system, **_kwargs):
+        if "k8s_change_timeline" in system:
+            return {
+                "action": "query",
+                "queries": [
+                    {"tool": "k8s_change_timeline", "args": {"source": "events"}}
+                ],
+            }
+        return {
+            "action": "query",
+            "queries": [{"tool": "change_query", "args": {"kind": "event"}}],
+        }
+
+    async def shared_change_query(_settings, _target, _args):
+        calls.append("change")
+        return {
+            "query": "changes",
+            "title": "Change timeline",
+            "summary": "no changes",
+            "error": None,
+            "result": {"changes": []},
+        }
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(
+        drilldown,
+        "_domain_tools",
+        lambda _settings: {
+            "kubernetes": {
+                "k8s_change_timeline": {
+                    "description": "changes",
+                    "call": shared_change_query,
+                }
+            },
+            "change": {
+                "change_query": {"description": "changes", "call": shared_change_query}
+            },
+        },
+    )
+
+    asyncio.run(
+        run_drilldowns(
+            drill_settings(),
+            results,
+            _target(),
+            None,
+            query_memory=QueryMemory(),
+        )
+    )
+
+    assert calls == ["change"]
+    assert sum(len(result.artifacts) for result in results) == 1
+
+
+def test_partial_pod_inspection_does_not_block_describe_retry(monkeypatch) -> None:
+    target = replace(_target(), pod="train-1-0")
+    result = CollectorResult(
+        agent="kubernetes",
+        status="partial",
+        summary="Pod YAML succeeded but Events failed",
+        artifacts=[
+            artifact(
+                agent="kubernetes",
+                source="kubernetes",
+                type="pod_inspection",
+                status="partial",
+                confidence="low",
+                query="kubectl describe pod train-1-0 -n runai-vision",
+                summary="events unavailable",
+                result={},
+            )
+        ],
+    )
+    decisions = iter(
+        [
+            {
+                "action": "query",
+                "queries": [
+                    {
+                        "tool": "k8s_describe",
+                        "args": {"kind": "pods", "name": "train-1-0"},
+                    }
+                ],
+            },
+            {"action": "done"},
+        ]
+    )
+    calls: list[str] = []
+
+    async def fake_complete_json(*_args, **_kwargs):
+        return next(decisions)
+
+    async def fake_describe(_settings, kind, **_kwargs):
+        calls.append(kind)
+        return {"kind": kind, "error": None, "events": []}
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "k8s_describe", fake_describe)
+
+    asyncio.run(run_drilldowns(drill_settings(), [result], target, None))
+
+    assert calls == ["pods"]
+
+
+def test_k8s_read_fingerprint_preserves_omitted_namespace_scope() -> None:
+    target = replace(_target(), namespace="runai-vision")
+
+    cluster_wide = drilldown._query_fingerprint(
+        {"tool": "k8s_read", "args": {"kind": "events"}}, target
+    )
+    namespaced = drilldown._query_fingerprint(
+        {
+            "tool": "k8s_read",
+            "args": {"kind": "events", "namespace": "runai-vision"},
+        },
+        target,
+    )
+
+    assert cluster_wide != namespaced
 
 
 def test_drilldown_blackboard_records_the_incident_window() -> None:
@@ -383,6 +755,107 @@ async def test_partial_drilldown_result_cannot_be_promoted_by_failure_keywords()
         "coverage": "partial",
     }
     assert not _artifact_is_evidence(artifact)
+
+
+@pytest.mark.asyncio
+async def test_empty_loki_result_does_not_promote_query_or_mcp_hints_to_signals() -> None:
+    query = (
+        '{pod="imagepull-0",namespace="default"} '
+        '|~ "(?i)(error|fail|panic|ImagePullBackOff|ErrImagePull|CrashLoopBackOff)"'
+    )
+
+    async def empty_loki_tool(settings, target, args):
+        return {
+            "summary": "0 MCP log line(s)",
+            "error": None,
+            "result": {
+                "name": "drilldown",
+                "query": query,
+                "status": "unknown",
+                "line_count": 0,
+                "stream_count": 0,
+                "sample": {
+                    "data": [],
+                    "hints": {
+                        "debug": "ImagePullBackOff",
+                        "possibleCauses": ["ErrImagePull", "CrashLoopBackOff"],
+                    },
+                },
+            },
+        }
+
+    result = CollectorResult(agent="loki", status="ok", summary="logs queried")
+    await drilldown._run_query(
+        drill_settings(language="ko"),
+        result,
+        {"logql_query": {"call": empty_loki_tool}},
+        _target(),
+        None,
+        {"tool": "logql_query", "args": {"query": query}},
+        [],
+        drilldown._drilldown_masker(drill_settings()),
+    )
+
+    observed = result.artifacts[0]
+    assert not observed.highlights
+    assert observed.summary == "0 MCP log line(s)"
+    assert "주요 신호" not in observed.summary
+
+
+def test_loki_signals_come_only_from_returned_affirmative_log_lines() -> None:
+    payload = {
+        "query": '{pod="imagepull-0"} |~ "CrashLoopBackOff|ErrImagePull"',
+        "line_count": 1,
+        "sample_entries": [
+            {"line": "container runtime reported ImagePullBackOff for nginx:latest"}
+        ],
+        "hints": {"possibleCauses": ["CrashLoopBackOff", "ErrImagePull"]},
+    }
+
+    assert drilldown._drilldown_salient_markers(
+        "loki", "logql_query", {"error": None}, payload
+    ) == ["ImagePullBackOff"]
+
+
+@pytest.mark.parametrize(
+    ("agent", "tool", "payload"),
+    [
+        (
+            "prometheus",
+            "promql_query",
+            {"query": 'up{reason="DiskPressure"}', "series_count": 0, "hints": {"debug": "DiskPressure"}},
+        ),
+        (
+            "runai",
+            "workload_status",
+            {"args": {"name": "OOMKilled"}, "hints": {"possibleCauses": ["OOMKilled"]}},
+        ),
+        (
+            "postgres",
+            "sql_select",
+            {"rows": [], "debug": "CrashLoopBackOff", "possibleCauses": ["ErrImagePull"]},
+        ),
+    ],
+)
+def test_unverified_generic_agent_payloads_cannot_create_signals(
+    agent: str, tool: str, payload: dict,
+) -> None:
+    assert drilldown._drilldown_salient_markers(
+        agent, tool, {"error": None}, payload
+    ) == []
+
+
+def test_verified_adapter_requires_positive_observation_before_creating_signals() -> None:
+    payload = {"signal_types": ["DiskPressure"]}
+    absent = {
+        "error": None,
+        "_verified_observation": drilldown._VERIFIED_OBSERVATION,
+        "observation": {"polarity": "absent", "coverage": "scoped"},
+    }
+
+    assert drilldown._drilldown_salient_markers(
+        "system", "system_signal", absent, payload
+    ) == []
 
 
 @pytest.mark.asyncio
@@ -2156,8 +2629,8 @@ def test_named_pod_read_is_promoted_to_describe_and_reports_highlights(monkeypat
     asyncio.run(run_drilldowns(settings, [result], _target(), None))
     art = result.artifacts[0]
     assert art.query == (
-        "kubectl get pod t-0 -n runai -o yaml; "
-        "kubectl describe pod t-0 -n runai"
+        "kubectl describe pod t-0 -n runai; "
+        "kubectl get pod t-0 -n runai -o yaml"
     )
     assert art.title == "Pod YAML + 상세 점검"
     assert art.highlights == ["OOMKilled"]

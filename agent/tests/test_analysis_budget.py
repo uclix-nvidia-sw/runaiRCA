@@ -16,11 +16,11 @@ from tests.test_orchestrator import make_settings
 
 
 def test_default_deadline_reserves_finalization_after_shared_evidence_budget() -> None:
-    settings = replace(make_settings(), analysis_deadline_seconds=1500)
+    settings = replace(make_settings(), analysis_deadline_seconds=900)
     state = SimpleNamespace(settings=settings, analysis_started_at=100.0)
 
-    assert _finalization_reserve_seconds(1500) == 300.0
-    assert _evidence_deadline_monotonic(state) == 1300.0
+    assert _finalization_reserve_seconds(900) == 360.0
+    assert _evidence_deadline_monotonic(state) == 640.0
 
 
 def test_optional_budget_stop_is_trace_metadata_not_operator_warning() -> None:

@@ -793,6 +793,11 @@
             "analysis_run_id": "run_7c2d1a", "analysis_hash": "sha256:9f2c…", "analysis_quality": "high",
             "analysis_summary": "GPU node NotReady after driver upgrade caused gpu-operator to crash loop.",
             "analysis_detail": "The nvidia-driver DaemonSet failed to reconcile after a kernel update; kubelet reported the node NotReady and the operator restarted repeatedly.",
+            "confidence_diagnostics": {
+              "ranking_candidate": { "family": "node_kubelet_pressure", "score": 7, "confidence": "high", "independent_source_groups": ["kubernetes_api", "node_system"] },
+              "self_check": { "confidence_before": "high", "confidence_after": "high", "refuted": false },
+              "harness": { "status": "passed", "score": 90 }
+            },
             "capabilities": { "kubernetes": "ok", "runai": "ok", "loki": "degraded" },
             "missing_data": ["dcgm-exporter metrics"],
             "warnings": ["Loki token expired mid-collection"],

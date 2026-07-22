@@ -2029,3 +2029,62 @@ async def test_prometheus_followup_noop_when_healthy(monkeypatch) -> None:
         make_settings(), prom, k8s, replace(make_target(), namespace="team-a", pod="p")
     )
     assert out == []
+
+
+@pytest.mark.asyncio
+async def test_prometheus_followup_reuses_query_from_an_earlier_agent_path(monkeypatch) -> None:
+    from app.collectors import prometheus as prom_mod
+    from app.collectors.base import CollectorResult, incident_time_range
+    from app.services.query_memory import QueryMemory, domain_query_key
+
+    async def duplicate_query(*_args, **_kwargs):  # pragma: no cover
+        raise AssertionError("a successful run-scoped PromQL query must not execute twice")
+
+    monkeypatch.setattr(prom_mod, "prom_query", duplicate_query)
+    target = replace(
+        make_target(),
+        namespace="team-a",
+        pod="trainer-0",
+        fired_at="2026-07-13T09:00:00Z",
+        resolved_at="2026-07-13T09:10:00Z",
+    )
+    k8s = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="OOM",
+        details={
+            "pod_statuses": [{"name": "trainer-0", "phase": "Running"}],
+            "container_diagnostics": [
+                {
+                    "name": "app",
+                    "restartCount": 0,
+                    "lastTerminated": {"reason": "OOMKilled", "exitCode": 137},
+                }
+            ],
+        },
+    )
+    prom = CollectorResult(agent="prometheus", status="ok", summary="metrics")
+    derived = prom_mod._prom_followup_queries(k8s.details, target)
+    assert derived[0][0] == "oom_working_set_vs_limit"
+    memory = QueryMemory()
+    for _name, promql in derived:
+        memory.remember(
+            domain_query_key(
+                "prometheus",
+                {
+                    "tool": "promql_query",
+                    "args": {
+                        "query": promql,
+                        "time_range": incident_time_range(target),
+                    },
+                },
+                target,
+            )
+        )
+
+    result = await prom_mod.prometheus_followup(
+        make_settings(), prom, k8s, target, query_memory=memory
+    )
+
+    assert result == []
+    assert prom.artifacts == []

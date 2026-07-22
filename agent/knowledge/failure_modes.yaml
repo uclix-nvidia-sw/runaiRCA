@@ -722,46 +722,114 @@
   # distinct from the container's own startup/config/crash faults above.
   symptoms:
     - name: Registry Pull Rate Limit
+      name_ko: 레지스트리 pull 요청 제한 초과
       keywords: [toomanyrequests, "pull rate limit", "rate limit exceeded"]
+      reason_ko: "레지스트리의 익명 pull 요청 제한을 초과해 이미지 다운로드가 거부되었습니다."
       actions:
         - "The registry rejected the pull because the anonymous pull limit was hit (common with Docker Hub). Add an ImagePullSecret with a logged-in account to raise the limit."
         - "Mirror frequently-used images to an internal registry so nodes stop pulling from the internet."
         - "Retry after the rate-limit window resets if this is a one-off burst (e.g. many nodes pulling at once)."
+      actions_ko:
+        - "Docker Hub 등 레지스트리의 익명 pull 제한을 피하도록 인증된 계정의 ImagePullSecret을 추가하세요."
+        - "자주 사용하는 이미지는 내부 레지스트리에 mirror해 노드의 외부 pull을 줄이세요."
+        - "일시적인 대량 pull이라면 rate-limit 초기화 시간을 확인한 뒤 다시 시도하세요."
     - name: Registry TLS Certificate Error
+      name_ko: 레지스트리 TLS 인증서 오류
       keywords: [x509, "certificate signed by unknown authority", "certificate has expired", "tls handshake timeout"]
+      reason_ko: "노드의 container runtime이 레지스트리 TLS 인증서를 신뢰하지 못해 이미지 pull이 실패했습니다."
       actions:
         - "The node does not trust the registry's TLS certificate. Add the registry's CA certificate to the container runtime's trust store on every node."
         - "If the registry certificate expired, renew it on the registry side."
         - "Check for a corporate proxy/firewall intercepting TLS between the nodes and the registry."
-    - name: Registry Auth Failure
-      keywords: ["pull access denied", "authentication required", "repository does not exist or may require"]
+      actions_ko:
+        - "모든 노드의 container runtime trust store에 레지스트리 CA 인증서를 추가하세요."
+        - "레지스트리 인증서가 만료됐다면 레지스트리 측에서 갱신하세요."
+        - "노드와 레지스트리 사이에서 proxy 또는 firewall이 TLS를 가로채는지 확인하세요."
+    - name: Registry Authentication Explicitly Rejected
+      name_ko: 레지스트리 인증 또는 권한 명시적 거부
+      keywords: ["authentication required", unauthorized, "no basic auth credentials", insufficient_scope, "requested access to the resource is denied"]
+      reason: "The registry explicitly rejected the supplied or missing credentials for this repository."
+      reason_ko: "레지스트리가 누락되었거나 유효하지 않은 자격 증명 또는 저장소 read 권한을 명시적으로 거부했습니다."
       actions:
         - "Check that the ImagePullSecret exists in the workload's namespace and is referenced by the pod/serviceaccount."
         - "Verify the credentials still work: try `docker login` / `crane auth login` with the same user."
-        - "Confirm the account has read permission on that specific repository (private repos deny pulls silently)."
+        - "Confirm the authenticated account has read permission on that specific repository."
+      actions_ko:
+        - "워크로드 namespace에 ImagePullSecret이 존재하고 Pod 또는 ServiceAccount에서 참조하는지 확인하세요."
+        - "동일 계정으로 `docker login` 또는 `crane auth login`을 실행해 자격 증명이 유효한지 확인하세요."
+        - "해당 계정에 대상 private repository의 read 권한이 있는지 확인하세요."
+    - name: Image Repository Or Name Not Found
+      name_ko: 이미지 repository 또는 이름 없음
+      keywords: ["repository does not exist", "name unknown", "repository name not known to registry", "unknown repository", "repository not found"]
+      reason: "The registry reports that the requested image repository or image name does not exist."
+      reason_ko: "레지스트리에 요청한 image repository 또는 이미지 이름이 존재하지 않습니다."
+      actions:
+        - "Read the exact image reference from `kubectl describe pod <pod> -n <namespace>` and compare its registry host, organization/project, repository path, and letter case with the intended image."
+        - "Check that the repository exists with `crane manifest <image:tag>` or `skopeo inspect docker://<image:tag>` using an account allowed to list it."
+        - "Fix `spec.containers[].image` or publish/mirror the image at the expected repository path; prefer an immutable digest after verification."
+      actions_ko:
+        - "`kubectl describe pod <pod> -n <namespace>`에서 실제 image reference를 읽고 registry host, organization/project, repository 경로, 대소문자를 의도한 이미지와 비교하세요."
+        - "repository 조회 권한이 있는 계정으로 `crane manifest <image:tag>` 또는 `skopeo inspect docker://<image:tag>`를 실행해 repository와 이미지가 실제로 존재하는지 확인하세요."
+        - "`spec.containers[].image`의 오타·경로를 수정하거나 기대한 repository 경로에 이미지를 publish/mirror하고, 확인 후에는 immutable digest 사용을 고려하세요."
+    - name: Repository Existence Or Authorization Ambiguous
+      name_ko: 이미지 repository 존재 여부 또는 권한 불명확
+      keywords: ["pull access denied", "repository does not exist or may require authorization"]
+      reason: "The registry deliberately returned an ambiguous response that can mean either a wrong/nonexistent repository name or missing pull authorization; the evidence does not distinguish them yet."
+      reason_ko: "레지스트리 응답만으로는 이미지 repository 이름·경로가 틀렸거나 존재하지 않는 경우와 pull 권한이 없는 경우를 구분할 수 없습니다."
+      actions:
+        - "Run `kubectl describe pod <pod> -n <namespace>` and copy the exact image reference from the failed pull event; verify registry host, organization/project, repository path, tag, and letter case first."
+        - "With an account that should have access, check existence using `crane manifest <image:tag>` or `skopeo inspect docker://<image:tag>`; a confirmed missing repository means the image reference or publish destination must be fixed."
+        - "If the repository exists, verify that the namespace ImagePullSecret is referenced by the Pod/ServiceAccount and that the same identity can pull it from the affected node with `crictl pull <image:tag>`."
+      actions_ko:
+        - "`kubectl describe pod <pod> -n <namespace>`의 실패 이벤트에서 정확한 image reference를 복사한 뒤 registry host, organization/project, repository 경로, tag, 대소문자를 먼저 확인하세요."
+        - "접근 권한이 있어야 하는 계정으로 `crane manifest <image:tag>` 또는 `skopeo inspect docker://<image:tag>`를 실행해 이미지 존재 여부를 확인하세요. repository가 없으면 image reference 또는 publish 위치를 수정하세요."
+        - "repository가 존재하면 namespace의 ImagePullSecret이 Pod/ServiceAccount에서 참조되는지 확인하고, 동일 identity로 영향받은 노드에서 `crictl pull <image:tag>`을 실행해 pull 권한을 검증하세요."
     - name: Registry Unreachable
+      name_ko: 노드에서 레지스트리 연결 불가
       keywords: ["i/o timeout", "connection refused", "no route to host"]
+      reason_ko: "노드에서 레지스트리까지의 DNS·network·proxy 경로가 막혀 이미지 pull이 실패했습니다."
       actions:
         - "The node cannot reach the registry over the network. Check proxy/firewall rules and DNS from a node."
         - "Check that the registry service itself is up and responding."
         - "Try pulling the image manually from an affected node (e.g. `crictl pull <image>`) to confirm."
+      actions_ko:
+        - "노드에서 레지스트리까지의 DNS와 proxy/firewall 규칙을 확인하세요."
+        - "레지스트리 서비스가 정상적으로 응답하는지 확인하세요."
+        - "영향받은 노드에서 `crictl pull <image>`로 직접 pull해 연결 문제를 재현하세요."
     - name: ImagePullBackOff
-      keywords: [imagepullbackoff, errimagepull, "manifest unknown"]
+      name_ko: 이미지 pull 반복 실패(ImagePullBackOff)
+      keywords: [imagepullbackoff, errimagepull]
+      reason_ko: "노드가 컨테이너 이미지를 받지 못해 ImagePullBackOff 상태가 반복되고 있지만, 현재 상태명만으로는 repository·tag·인증·network 중 어느 원인인지 확정할 수 없습니다."
       actions:
-        - "Check the image tag/digest and the registry credentials (ImagePullSecret)."
-        - "Confirm the image exists and the node can reach the registry."
+        - "Read the exact pull error and image reference from `kubectl describe pod <pod> -n <namespace>` before choosing a repository, tag, authentication, TLS, DNS, or rate-limit fix."
+        - "Use the returned registry error to select one discriminating check; ImagePullBackOff is a retry state, not the root cause by itself."
+      actions_ko:
+        - "원인별 조치를 선택하기 전에 `kubectl describe pod <pod> -n <namespace>`에서 정확한 pull 오류와 image reference를 확인하세요."
+        - "반환된 registry 오류에 따라 repository·tag·인증·TLS·DNS·rate-limit 중 하나를 판별하세요. ImagePullBackOff는 근본 원인이 아니라 재시도 상태입니다."
     - name: Bad Image Tag — Manifest For Tag Not Found
-      keywords: ["manifest for", "not found: manifest", "no matching manifest for linux/"]
+      name_ko: 이미지 tag 또는 platform manifest 없음
+      keywords: ["manifest unknown", "manifest for", "not found: manifest", "no matching manifest for linux/"]
+      reason_ko: "이미지 저장소는 확인됐지만 요청한 tag 또는 노드 architecture에 맞는 manifest가 없어 pull이 실패했습니다."
       actions:
         - "The image NAME resolves but the TAG does not exist ('manifest for myrepo/app:v2 not found: manifest unknown') — a typo'd or never-pushed tag, distinct from a private-repo auth denial. Read the exact tag: `kubectl describe pod <pod>` Events tail."
         - "List the tags that actually exist: `crane ls <repo>` or `skopeo list-tags docker://<repo>`, then fix `spec.containers[].image`; pin an immutable digest (`<repo>@sha256:...`) so a deleted/re-pushed tag can't reintroduce it."
         - "For 'no matching manifest for linux/arm64...' the tag is valid but has no layer for this node's CPU arch — inspect platforms with `docker buildx imagetools inspect <image:tag>`, then publish a multi-arch image or pin the pod to matching nodes with a `kubernetes.io/arch` nodeSelector."
+      actions_ko:
+        - "`kubectl describe pod <pod>`의 Events에서 실패한 정확한 이미지 tag를 확인하세요."
+        - "`crane ls <repo>` 또는 `skopeo list-tags docker://<repo>`로 존재하는 tag를 확인하고 Pod spec을 수정하세요. 재발 방지를 위해 가능하면 immutable digest를 사용하세요."
+        - "`no matching manifest`라면 `docker buildx imagetools inspect <image:tag>`로 지원 architecture를 확인하고 multi-arch 이미지를 배포하거나 적합한 노드로 제한하세요."
     - name: Registry Server 5xx / DNS Lookup Failure On Pull
+      name_ko: 레지스트리 5xx 또는 노드 DNS 조회 실패
       keywords: ["received unexpected http status:", "unexpected status: 503", "dial tcp: lookup", "server gave http response to https client"]
+      reason_ko: "레지스트리 server 오류, 노드 DNS 실패 또는 HTTP/HTTPS 설정 불일치로 이미지 pull이 실패했습니다."
       actions:
         - "For 'received unexpected HTTP status: 5xx': the registry is reachable and auth passed but returned 500/503 serving the manifest/blob — the registry itself is unhealthy/overloaded. A shared-registry 5xx fails EVERY node's pull, so expect broad correlated ImagePull failures; retry `crictl pull <image>` on a node once it recovers, else escalate to the registry owner."
         - "For 'dial tcp: lookup <registry> ... no such host': the NODE can't resolve the registry hostname (distinct from in-cluster pod DNS). Test node-level resolution on the scheduled node: `nslookup <registry-host>` / `getent hosts <registry-host>` (uses the node's /etc/resolv.conf, not CoreDNS); fix the node's upstream DNS or airgap hosts entry."
         - "For 'server gave HTTP response to HTTPS client': the registry is HTTP-only but the runtime tried HTTPS — add it as insecure in `/etc/containerd/certs.d/<registry>/hosts.toml` and restart containerd on every node, or (preferred) put a real TLS cert on the registry."
+      actions_ko:
+        - "레지스트리가 500/503을 반환하면 레지스트리 상태와 부하를 복구한 뒤 노드에서 `crictl pull <image>`로 재확인하세요."
+        - "`dial tcp: lookup`이면 Pod DNS가 아니라 노드의 `/etc/resolv.conf` 경로에서 `nslookup <registry-host>` 또는 `getent hosts <registry-host>`로 확인하세요."
+        - "HTTP 레지스트리를 HTTPS로 호출했다면 containerd의 registry 설정을 수정하거나 레지스트리에 유효한 TLS 인증서를 적용하세요."
 
 - family: k8s_scheduling_error
   # Kubernetes kube-scheduler predicate failures (taint/affinity/selector/

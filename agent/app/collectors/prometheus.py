@@ -31,6 +31,7 @@ from app.mcp_client import (
     mcp_tls_verify,
     mcp_tool_json,
 )
+from app.services.query_memory import domain_query_key
 
 # These queries expose useful operating context, but a raw non-zero reading has
 # no failure semantics on its own. They need an explicit threshold or a derived
@@ -1416,6 +1417,7 @@ async def prometheus_followup(
     kubernetes_result: CollectorResult | None,
     target: AnalysisTarget,
     max_reads: int = 6,
+    query_memory: object | None = None,
 ) -> list[dict]:
     """Fire k8s->prometheus follow-up queries and attach them as followup_query
     artifacts on the prometheus result. Best-effort, read-only, bounded."""
@@ -1426,7 +1428,24 @@ async def prometheus_followup(
     results: list[dict] = []
     time_range = incident_time_range(target)
     for name, promql in queries:
-        results.append(await prom_query(settings, name, promql, time_range=time_range))
+        query = {
+            "tool": "promql_query",
+            "args": {"query": promql, **({"time_range": time_range} if time_range else {})},
+        }
+        memory_key = domain_query_key("prometheus", query, target)
+        claim = getattr(query_memory, "claim", None)
+        if callable(claim) and not claim(memory_key):
+            continue
+        complete = getattr(query_memory, "complete", None)
+        try:
+            item = await prom_query(settings, name, promql, time_range=time_range)
+        except BaseException:
+            if callable(complete):
+                complete(memory_key, succeeded=False)
+            raise
+        if callable(complete):
+            complete(memory_key, succeeded=not bool(item.get("error")))
+        results.append(item)
     for res in results:
         err = res.get("error")
         prometheus_result.artifacts.append(

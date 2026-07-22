@@ -89,6 +89,15 @@ def test_collector_insight_budget_supports_reasoning_models() -> None:
     assert ".Values.agent.env.llmInsightMaxTokens" in template
 
 
+def test_synthesis_budget_is_explicit_and_bounded() -> None:
+    env = _values()["agent"]["env"]
+    template = AGENT_TEMPLATE.read_text(encoding="utf-8")
+
+    assert 8192 <= int(env["llmSynthesisMaxTokens"]) <= 16384
+    assert "LLM_SYNTHESIS_MAX_TOKENS" in template
+    assert ".Values.agent.env.llmSynthesisMaxTokens" in template
+
+
 def _image_repos(node: Any, path: str = "") -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     if isinstance(node, dict):
