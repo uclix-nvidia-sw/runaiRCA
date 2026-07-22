@@ -7,6 +7,7 @@ import {
   BookOpen,
   CheckCircle2,
   ChevronDown,
+  CircleStop,
   Database,
   Download,
   FileText,
@@ -28,6 +29,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
   analyzeIncident,
+  cancelIncidentAnalysis,
   archiveIncident,
   deleteIncident,
   fetchAnalysisRun,
@@ -786,6 +788,10 @@ function App() {
           await analyzeIncident(id);
           await refreshCurrentView();
         }}
+        onCancel={async (id) => {
+          await cancelIncidentAnalysis(id);
+          await refreshCurrentView();
+        }}
         onReverify={async (id) => {
           await reverifyIncident(id);
           await refreshCurrentView();
@@ -813,6 +819,7 @@ function UnifiedWorkspace({
   onClose,
   onRefresh,
   onAnalyze,
+  onCancel,
   onReverify,
   onOpenIncident,
   onResolve,
@@ -823,6 +830,7 @@ function UnifiedWorkspace({
   onClose: () => void;
   onRefresh: () => Promise<void>;
   onAnalyze: (id: string) => Promise<void>;
+  onCancel: (id: string) => Promise<void>;
   onReverify: (id: string) => Promise<void>;
   onOpenIncident: (id: string) => Promise<void>;
   onResolve: (id: string) => Promise<void>;
@@ -1104,6 +1112,16 @@ function UnifiedWorkspace({
               >
                 <Bot size={16} /> {busyAction === 'analyze' ? 'Analyzing...' : 'Analyze'}
               </button>
+              {isAnalyzing && (
+                <button
+                  className={`ghost-button ${busyAction === 'cancel' ? 'is-busy' : ''}`}
+                  disabled={busyAction === 'cancel'}
+                  onClick={() => void runWorkspaceAction('cancel', () => onCancel(incident.incident_id))}
+                  type="button"
+                >
+                  <CircleStop size={16} /> {busyAction === 'cancel' ? 'Stopping...' : 'Stop'}
+                </button>
+              )}
               <button
                 className="ghost-button"
                 disabled={Boolean(busyAction)}
@@ -1172,6 +1190,16 @@ function UnifiedWorkspace({
               >
                 <Bot size={16} /> {busyAction === 'analyze' ? 'Analyzing...' : 'Analyze'}
               </button>
+              {isAnalyzing && (
+                <button
+                  className={`ghost-button ${busyAction === 'cancel' ? 'is-busy' : ''}`}
+                  disabled={busyAction === 'cancel'}
+                  onClick={() => void runWorkspaceAction('cancel', () => onCancel(alert.incident_id))}
+                  type="button"
+                >
+                  <CircleStop size={16} /> {busyAction === 'cancel' ? 'Stopping...' : 'Stop'}
+                </button>
+              )}
             </>
           )}
         </div>
