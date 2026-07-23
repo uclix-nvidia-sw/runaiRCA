@@ -457,6 +457,59 @@ func TestKnowledgeCandidateEligibilityFailsClosedOnPlanGates(t *testing.T) {
 	}
 }
 
+func TestHarnessClaimEvidenceFallbackCompilesKnowledge(t *testing.T) {
+	snapshot := eligibleKnowledgeSnapshot()
+	harness := snapshot.Snapshot["metadata"].(map[string]any)["harness"].(map[string]any)
+	harness["claims"] = []any{map[string]any{
+		"family":                 snapshot.RootCauseFamily,
+		"supporting_evidence":    []any{"E-1", "E-2"},
+		"contradicting_evidence": []any{},
+	}}
+	trace := knowledgeTraceForTest(snapshot)
+	trace["hypotheses"].([]any)[0].(map[string]any)["evidence_for"] = []any{}
+
+	candidate := knowledgeCandidateForSnapshot(snapshot)
+	if candidate == nil || candidate.Status != knowledgeCandidateReady {
+		t.Fatalf("harness claim support should compile when the trace ledger is empty: %+v", candidate)
+	}
+	if candidate.Payload["evidence_source"] != "harness_claim_fallback" {
+		t.Fatalf("fallback payload is missing audit marker: %+v", candidate.Payload)
+	}
+	if got := candidate.Payload["supporting_evidence_ids"].([]string); len(got) != 2 || got[0] != "E-1" || got[1] != "E-2" {
+		t.Fatalf("fallback support IDs were not preserved: %+v", got)
+	}
+}
+
+func TestHarnessClaimEvidenceFallbackFailsClosedWithoutCleanSupport(t *testing.T) {
+	tests := []struct {
+		name    string
+		family  string
+		support []any
+		against []any
+	}{
+		{name: "empty claim support", family: "scheduler_capacity", support: []any{}, against: []any{}},
+		{name: "claim contradiction", family: "scheduler_capacity", support: []any{"E-1"}, against: []any{"E-2"}},
+		{name: "family mismatch", family: "gpu_hardware_error", support: []any{"E-1", "E-2"}, against: []any{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := eligibleKnowledgeSnapshot()
+			harness := snapshot.Snapshot["metadata"].(map[string]any)["harness"].(map[string]any)
+			harness["claims"] = []any{map[string]any{
+				"family":                 test.family,
+				"supporting_evidence":    test.support,
+				"contradicting_evidence": test.against,
+			}}
+			knowledgeTraceForTest(snapshot)["hypotheses"].([]any)[0].(map[string]any)["evidence_for"] = []any{}
+
+			candidate := knowledgeCandidateForSnapshot(snapshot)
+			if candidate == nil || candidate.Status != knowledgeCandidateValidationFailed || candidate.ValidationError != "missing supporting evidence" {
+				t.Fatalf("unsafe harness fallback should fail closed: %+v", candidate)
+			}
+		})
+	}
+}
+
 func knowledgeTraceForTest(snapshot *CaseSnapshot) map[string]any {
 	return snapshot.Snapshot["metadata"].(map[string]any)["reasoning_trace_v3"].(map[string]any)
 }

@@ -29,9 +29,11 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
   analyzeIncident,
+  bulkIncidentAction,
   cancelIncidentAnalysis,
   archiveIncident,
   deleteIncident,
+  emptyIncidentTrash,
   fetchAnalysisRun,
   fetchIncident,
   fetchRootCauseFamilies,
@@ -594,6 +596,19 @@ function App() {
     await refreshCurrentView();
   }, [refreshCurrentView]);
 
+  const handleBulkIncidentAction = useCallback(async (
+    incidentIDs: string[],
+    action: 'archive' | 'unarchive' | 'restore' | 'trash' | 'delete_permanently',
+  ) => {
+    await bulkIncidentAction(incidentIDs, action);
+    await refreshCurrentView();
+  }, [refreshCurrentView]);
+
+  const handleEmptyIncidentTrash = useCallback(async () => {
+    await emptyIncidentTrash();
+    await refreshCurrentView();
+  }, [refreshCurrentView]);
+
   const chatSession = useRcaChat({
     detail,
     activeView,
@@ -748,6 +763,8 @@ function App() {
             onUnarchive={handleUnarchiveIncident}
             onRestore={handleRestoreIncident}
             onDelete={handleDeleteIncident}
+            onBulkAction={handleBulkIncidentAction}
+            onEmptyTrash={handleEmptyIncidentTrash}
           />
         )}
         {activeView === 'alerts' && (

@@ -1,7 +1,7 @@
-import { Archive, MoreHorizontal, RotateCcw, Trash2 } from 'lucide-react';
-import { type MouseEvent } from 'react';
+import { Archive, CheckSquare, MoreHorizontal, RotateCcw, Trash2, X } from 'lucide-react';
+import { type MouseEvent, useEffect, useMemo, useState } from 'react';
 
-import { type IncidentView } from '../../api';
+import { type BulkIncidentAction, type IncidentView } from '../../api';
 import {
   INCIDENT_DECISION_OPTIONS,
   INCIDENT_SEVERITY_OPTIONS,
@@ -32,6 +32,8 @@ export function IncidentsDashboard({
   onUnarchive,
   onRestore,
   onDelete,
+  onBulkAction,
+  onEmptyTrash,
 }: {
   view: IncidentView;
   incidents: Incident[];
@@ -46,7 +48,21 @@ export function IncidentsDashboard({
   onUnarchive: (id: string) => Promise<void>;
   onRestore: (id: string) => Promise<void>;
   onDelete: (id: string, permanent?: boolean) => Promise<void>;
+  onBulkAction: (ids: string[], action: BulkIncidentAction) => Promise<void>;
+  onEmptyTrash: () => Promise<void>;
 }) {
+  const [selectedIDs, setSelectedIDs] = useState<string[]>([]);
+  const [isApplyingBulkAction, setIsApplyingBulkAction] = useState(false);
+  const visibleIDs = useMemo(() => filteredIncidents.map((incident) => incident.incident_id), [filteredIncidents]);
+  const visibleIDKey = visibleIDs.join('\u0000');
+  const selectedIDSet = useMemo(() => new Set(selectedIDs), [selectedIDs]);
+  const allVisibleSelected = visibleIDs.length > 0 && visibleIDs.every((id) => selectedIDSet.has(id));
+
+  useEffect(() => {
+    const visible = new Set(visibleIDs);
+    setSelectedIDs((current) => current.filter((id) => visible.has(id)));
+  }, [visibleIDKey]);
+
   let openCount = 0;
   let resolvedCount = 0;
   let analyzingIncidentCount = 0;
@@ -57,6 +73,32 @@ export function IncidentsDashboard({
   }
   const updateFilter = <K extends keyof IncidentFilterState>(key: K, value: IncidentFilterState[K]) => {
     onFilterChange({ ...filters, [key]: value });
+  };
+  const toggleSelected = (id: string) => {
+    setSelectedIDs((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
+  };
+  const toggleAllVisible = () => {
+    setSelectedIDs(allVisibleSelected ? [] : visibleIDs);
+  };
+  const runBulkAction = async (action: BulkIncidentAction, confirmation?: string) => {
+    if (selectedIDs.length === 0 || (confirmation && !window.confirm(confirmation))) return;
+    setIsApplyingBulkAction(true);
+    try {
+      await onBulkAction(selectedIDs, action);
+      setSelectedIDs([]);
+    } finally {
+      setIsApplyingBulkAction(false);
+    }
+  };
+  const emptyTrash = async () => {
+    if (!window.confirm(`Permanently delete all ${page.total} incident${page.total === 1 ? '' : 's'} in trash? This cannot be undone.`)) return;
+    setIsApplyingBulkAction(true);
+    try {
+      await onEmptyTrash();
+      setSelectedIDs([]);
+    } finally {
+      setIsApplyingBulkAction(false);
+    }
   };
 
   return (
@@ -70,9 +112,27 @@ export function IncidentsDashboard({
 
       <section className="content-grid single-dashboard-grid">
         <div className="panel full-width-panel">
+          <BulkIncidentActions
+            view={view}
+            count={selectedIDs.length}
+            hasTrash={page.total > 0}
+            busy={isApplyingBulkAction || loading}
+            onClear={() => setSelectedIDs([])}
+            onAction={runBulkAction}
+            onEmptyTrash={emptyTrash}
+          />
           <table className="operations-table incidents-table">
             <thead>
               <tr>
+                <th className="selection-column">
+                  <input
+                    type="checkbox"
+                    checked={allVisibleSelected}
+                    onChange={toggleAllVisible}
+                    disabled={visibleIDs.length === 0 || isApplyingBulkAction}
+                    aria-label="Select all visible incidents"
+                  />
+                </th>
                 <th>Incident</th>
                 <th>
                   <ColumnFilter
@@ -107,6 +167,7 @@ export function IncidentsDashboard({
               {filteredIncidents.map((incident) => (
                 <tr
                   key={incident.incident_id}
+                  className={selectedIDSet.has(incident.incident_id) ? 'is-selected' : ''}
                   tabIndex={0}
                   onClick={() => void onOpenIncident(incident.incident_id)}
                   onKeyDown={(event) => {
@@ -118,6 +179,15 @@ export function IncidentsDashboard({
                     }
                   }}
                 >
+                  <td className="selection-column" onClick={(event) => event.stopPropagation()}>
+                    <input
+                      type="checkbox"
+                      checked={selectedIDSet.has(incident.incident_id)}
+                      onChange={() => toggleSelected(incident.incident_id)}
+                      disabled={isApplyingBulkAction}
+                      aria-label={`Select ${incident.title}`}
+                    />
+                  </td>
                   <td>
                     <strong>{incident.title}</strong>
                     <span>{incident.incident_id}</span>
@@ -147,6 +217,65 @@ export function IncidentsDashboard({
         </div>
       </section>
     </>
+  );
+}
+
+function BulkIncidentActions({
+  view,
+  count,
+  hasTrash,
+  busy,
+  onClear,
+  onAction,
+  onEmptyTrash,
+}: {
+  view: IncidentView;
+  count: number;
+  hasTrash: boolean;
+  busy: boolean;
+  onClear: () => void;
+  onAction: (action: BulkIncidentAction, confirmation?: string) => Promise<void>;
+  onEmptyTrash: () => Promise<void>;
+}) {
+  const primary = view === 'active'
+    ? { label: 'Archive selected', icon: <Archive size={15} />, action: 'archive' as const }
+    : view === 'archived'
+      ? { label: 'Unarchive selected', icon: <RotateCcw size={15} />, action: 'unarchive' as const }
+      : { label: 'Restore selected', icon: <RotateCcw size={15} />, action: 'restore' as const };
+  const destructiveAction: BulkIncidentAction = view === 'trash' ? 'delete_permanently' : 'trash';
+
+  return (
+    <div className="bulk-actions" aria-live="polite">
+      {count > 0 ? (
+        <>
+          <span className="bulk-selection-count"><CheckSquare size={16} />{count} selected</span>
+          <button className="ghost-button compact-button" type="button" disabled={busy} onClick={() => void onAction(primary.action)}>
+            {primary.icon}{primary.label}
+          </button>
+          <button
+            className="danger-button compact-button"
+            type="button"
+            disabled={busy}
+            onClick={() => void onAction(
+              destructiveAction,
+              `Are you sure you want to ${view === 'trash' ? 'permanently delete' : 'move to trash'} ${count} selected incident${count === 1 ? '' : 's'}?${view === 'trash' ? ' This cannot be undone.' : ''}`,
+            )}
+          >
+            <Trash2 size={15} />{view === 'trash' ? 'Delete forever' : 'Move to trash'}
+          </button>
+          <button className="bulk-clear-button" type="button" disabled={busy} onClick={onClear}>
+            <X size={15} />Clear
+          </button>
+        </>
+      ) : (
+        <span className="bulk-selection-hint">Select incidents to manage them together.</span>
+      )}
+      {view === 'trash' && hasTrash && (
+        <button className="danger-button compact-button bulk-empty-trash" type="button" disabled={busy} onClick={() => void onEmptyTrash()}>
+          <Trash2 size={15} />Empty trash
+        </button>
+      )}
+    </div>
   );
 }
 
