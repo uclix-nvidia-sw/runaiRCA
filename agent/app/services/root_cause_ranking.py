@@ -16,6 +16,7 @@ retains a capped keyword compatibility path. This is deterministic, not a model.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import unicodedata
@@ -27,10 +28,54 @@ from app.collectors.base import AnalysisTarget, CollectorResult
 from app.knowledge import _keyword_hits, load_family_catalog
 from app.services.evidence_blackboard import source_independence_group
 
+logger = logging.getLogger(__name__)
+
 _FAMILY_CATALOG = load_family_catalog(os.getenv("FAMILIES_FILE", "knowledge/families.yaml"))
 FAMILIES = _FAMILY_CATALOG.families
 INSUFFICIENT = "insufficient_evidence"
 _FAMILY_RULES = _FAMILY_CATALOG.rules
+
+# Kubernetes container waiting/terminated ``reason`` is a CLOSED kubelet
+# vocabulary (an enum), not free-form text.  A controlled vocabulary must be
+# matched by EXACT token membership against this authoritative table — never by
+# the substring-grep-with-negation keyword path below, which is what let a
+# genuine CreateContainerConfigError fall through the family keyword list and
+# made "not found" a negation landmine.  Adding a new kubelet reason is a
+# one-line entry here; an observed reason absent from the table is logged once
+# (see ``_artifact_is_relevant_to_family``) so a coverage gap is noticed instead
+# of silently missed.  Collectors hoist the raw reason into
+# ``observation["container_reason"]``; keep this the single source of truth for
+# reason -> family so ranking, self-check, and the harness agree.
+_K8S_CONTAINER_REASON_FAMILY: dict[str, str] = {
+    # Workload-local startup / config / crash faults (kubelet waiting reasons).
+    "crashloopbackoff": "workload_startup_error",
+    "createcontainerconfigerror": "workload_startup_error",
+    "createcontainererror": "workload_startup_error",
+    "runcontainererror": "workload_startup_error",
+    "containercannotrun": "workload_startup_error",
+    "starterror": "workload_startup_error",
+    "poststarthookerror": "workload_startup_error",
+    # Image acquisition faults.
+    "imagepullbackoff": "image_pull_error",
+    "errimagepull": "image_pull_error",
+    "errimageneverpull": "image_pull_error",
+    "invalidimagename": "image_pull_error",
+    "imageinspecterror": "image_pull_error",
+}
+_WARNED_UNMAPPED_REASONS: set[str] = set()
+
+
+def _structured_container_reason(art: object) -> str | None:
+    """The kubelet container reason hoisted into the observation, casefolded.
+
+    Returns ``None`` when the artifact is not a reason-bearing container
+    observation, so callers fall through to the normal keyword path.
+    """
+    observation = _artifact_observation(art)
+    if not observation:
+        return None
+    reason = str(observation.get("container_reason") or "").strip().casefold()
+    return reason or None
 
 _FLOOR = 2.0          # min top score below which we fall back to insufficient_evidence
 _HIGH = 5.0           # score needed (with >=2 corroborating agents) for high confidence
@@ -1331,6 +1376,20 @@ def _artifact_is_relevant_to_family(family: str, art: object) -> bool:
     observation = _artifact_observation(art)
     if rule is None or observation is None:
         return False
+    # Controlled-vocabulary short-circuit: a structured kubelet reason is matched
+    # by exact table membership, never by substring — so it cannot leak across
+    # families by incidental text and cannot be dropped by a negation heuristic.
+    reason = _structured_container_reason(art)
+    if reason is not None:
+        mapped = _K8S_CONTAINER_REASON_FAMILY.get(reason)
+        if mapped is None and reason not in _WARNED_UNMAPPED_REASONS:
+            _WARNED_UNMAPPED_REASONS.add(reason)
+            logger.warning(
+                "kubernetes container reason %r has no family mapping; "
+                "add it to _K8S_CONTAINER_REASON_FAMILY",
+                reason,
+            )
+        return mapped == family
     agent, predicate, semantic_text = _artifact_family_semantics(art)
     if agent == "alert":
         if predicate == "alert_signature:nvidia_xid":
@@ -1373,6 +1432,12 @@ def artifact_supports_family(family: str, art: object) -> bool:
         or str(observation.get("coverage") or "").strip().casefold() != "scoped"
     ):
         return False
+
+    # A structured, present, scoped kubelet reason is dispositive on its own:
+    # relevance already proved it maps to this family, so accept it without the
+    # keyword path (which is exactly what mis-dropped it before).
+    if _structured_container_reason(art) is not None:
+        return True
 
     rule = _FAMILY_RULES[family]
     agent, predicate, semantic_text = _artifact_family_semantics(art)
