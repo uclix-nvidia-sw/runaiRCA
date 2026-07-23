@@ -87,10 +87,14 @@ Fourteen tables, grouped by what they serve.
 | `ontology_backfill_cursors` | One-time backfill bookkeeping (snapshots → TypeDB) | `cursor_name` (PK), `approved_at`, `case_id` |
 
 **Similarity search**: `incident_embeddings.embedding` (pgvector, HNSW cosine) is
-the primary path; a JSONB sparse-vector cosine fallback runs when pgvector is
-unavailable. The 384-dim vector is a deterministic feature-hash of the RCA text
-(no model dependency) — see `backend/memory.go`. `labels`/`annotations` JSONB are
-the richest entity source consumed by ingestion (cluster/node/queue/etc.).
+the primary path when an OpenAI-compatible embedding endpoint is configured. The
+query and stored memory both include RCA summary/detail, and same-family and
+normalized workload-identity signals improve ranking. When the endpoint or dense
+search is unavailable, the Backend falls back to a deterministic 384-dim sparse
+feature-hash cosine search. Embedding basis/model/dimension changes trigger a
+rebuild of derived vectors; incident writes and searches remain available during
+embedding failures. `labels`/`annotations` JSONB are the richest entity source
+consumed by ingestion (cluster/node/queue/etc.).
 
 ### The learning pipeline: how an incident becomes knowledge
 
@@ -121,6 +125,20 @@ flowchart TD
 A **shadow** publish (`ShadowKnowledgeCandidate`) stages a package for review
 *without* exposing it to the active runtime snapshot, so an approval can't
 silently shift RCA ranking; a later explicit activation promotes it.
+
+### Promotion evidence paths
+
+Candidate compilation prefers the complete trace-v3 ledger path. It requires a
+family-matching selected/supported hypothesis, canonical supporting evidence from
+at least two source groups, and a probe execution linked to that hypothesis. A
+second, explicitly auditable `harness_claim` path is available when the ledger is
+incomplete but the output harness has a supported root-cause claim matching the
+snapshot family, with canonical non-contradictory supporting evidence. The
+`harness_claim` path does not require two source groups or a linked probe; it emits
+an empty `probe_template_ids` list and marks both `evidence_source` and
+`provenance.promotion_path` as `harness_claim`. Re-saving an evaluation refreshes
+the latest validation error for an ineligible candidate and can return it to
+`ready_for_review` when the gates pass.
 
 ---
 

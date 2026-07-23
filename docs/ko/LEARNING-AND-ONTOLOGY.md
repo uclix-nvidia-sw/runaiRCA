@@ -116,6 +116,13 @@ Backend Postgres가 패키지 승인, 활성화, 은퇴의 권위자입니다. `
 `reject`/`retired`는 런타임 사용에서 제외합니다. TypeDB package-mirror CronJob은 그래프 질의를
 위해 요약과 승인된 template binding을 복사할 뿐 활성화 상태를 바꾸지 않습니다.
 
+Candidate 생성은 완전한 trace-v3 ledger 경로를 우선합니다. Ledger가 불완전해도 approved
+snapshot과 family가 일치하고 supporting evidence가 canonical하며 반증이 없고 비어 있지
+않은 supported harness claim이면 두 번째 승격 경로를 사용할 수 있습니다. harness-claim
+경로는 두 source group이나 연계 probe 실행을 요구하지 않고 probe ID를 만들어 내지 않으며,
+감사를 위해 `evidence_source: "harness_claim"`으로 표시됩니다. 평가를 다시 저장하면 정확한
+run/hash를 기준으로 재검증하고, 부적격 candidate가 유지될 때 최신 실패 사유를 갱신합니다.
+
 ## 6. 외부 지원 사례 prior
 
 어떤 교훈은 우리 클러스터 밖 — 큐레이션된 엔터프라이즈 지원 사례 — 에서 옵니다.

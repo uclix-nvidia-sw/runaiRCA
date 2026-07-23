@@ -212,6 +212,12 @@ fact 하나당 한 번만 계산합니다(정식 collector `+2`, 보강 collecto
 observation으로 이행하지 않은 레거시 결과만 상한이 있는 키워드 호환 경로를 사용합니다. 규칙,
 토폴로지, lifecycle, feedback prior, live symptom ontology 보정은 `score_breakdown`에 별도로 남습니다.
 
+Kubernetes container waiting/terminated `reason`은 collector가 구조화된
+`observation.container_reason`으로 발행할 때 kubelet의 폐쇄된 vocabulary로 처리합니다.
+랭커는 자유 텍스트 negation heuristic을 우회하고, 유지 관리되는 reason-to-family 표에 따라
+토큰을 정확히 매칭합니다. 표에 없는 reason은 coverage warning으로 로그에 남습니다. 일반
+로그, 이벤트, annotation의 자유 텍스트는 기존 호환 keyword 경로를 계속 사용합니다.
+
 후보 정렬 순서는 **미해결 반증 없음 → 보정된 confidence → 독립 telemetry group 수 → 숫자 점수**입니다.
 medium은 `2`부터이고, high는 점수 `5`와 독립 live source group 2개가 필요합니다(또는 확정적
 `force_high` signature). scoped contradiction이 있으면 low로 제한하며, 정식 source가 unavailable이면

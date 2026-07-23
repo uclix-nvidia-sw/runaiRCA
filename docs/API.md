@@ -48,6 +48,8 @@ Backend:
 - `POST /api/v1/incidents/{id}/archive`
 - `POST /api/v1/incidents/{id}/unarchive`
 - `POST /api/v1/incidents/{id}/restore`
+- `POST /api/v1/incidents/bulk`
+- `DELETE /api/v1/incidents/trash`
 - `DELETE /api/v1/incidents/{id}`
 - `DELETE /api/v1/incidents/{id}?permanent=true`
 - `GET /api/v1/incidents/{id}/feedback`
@@ -144,6 +146,46 @@ and `shadow` invoke the Agent validator before the transition. A successful
 `package`; a successful pending-candidate `reject` response contains `candidate`.
 Invalid actions return 400, a validation rejection returns 422, and an invalid
 lifecycle transition returns 409.
+
+Candidate generation has two evidence paths. The primary path requires a complete
+trace-v3 ledger: one selected/supported family-matching hypothesis, canonical
+supporting evidence from at least two source groups, and a linked probe execution.
+If that ledger is incomplete, a candidate may use the `harness_claim` path only
+when the output harness is `supported`, its root-cause claim matches the snapshot
+family, all supporting evidence is canonical and contradiction-free, and the
+supporting evidence is non-empty. This path deliberately permits one source group
+and no linked probe execution; its compiled `probe_template_ids` value is `[]`,
+never `null`. Such payloads carry `evidence_source: "harness_claim"` and
+`provenance.promotion_path: "harness_claim"` for auditability.
+
+Saving an evaluation re-runs candidate validation for the exact run and analysis
+hash. A still-invalid candidate keeps `validation_failed` but refreshes its
+`validation_error` and `updated_at`; a candidate that becomes eligible returns to
+`ready_for_review` and still requires an explicit candidate decision before
+activation.
+
+## Bulk incident lifecycle actions
+
+To apply one lifecycle action to several incidents, send:
+
+```http
+POST /api/v1/incidents/bulk
+Content-Type: application/json
+```
+
+```json
+{
+  "incident_ids": ["INC-...", "INC-..."],
+  "action": "archive"
+}
+```
+
+`action` may be `archive`, `unarchive`, `restore`, `trash`, or
+`delete_permanently`. The response contains the IDs that were processed. To
+permanently delete every incident currently in the trash, call
+`DELETE /api/v1/incidents/trash`; the response contains `deleted_count`.
+
+## Package retirement
 
 To retire a package explicitly, send the same optional audit fields without an
 `action` field:

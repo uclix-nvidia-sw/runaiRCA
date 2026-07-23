@@ -76,6 +76,17 @@ The form records:
 Only `resolved` or `mitigated` actions become TypeDB verified actions. A report
 recommendation by itself is not proof that the action fixed an incident.
 
+When a passing review is used to generate incident-derived knowledge, the
+Backend first validates the complete trace-v3 ledger. If the ledger is incomplete,
+the review may still produce a candidate through the auditable `harness_claim`
+path: the harness diagnosis must be `supported`, the root-cause claim must match
+the snapshot family, supporting evidence must be canonical and contradiction-free,
+and at least one supporting evidence ID must exist. This fallback does not invent
+probe executions and may publish an empty `probe_template_ids` list. The candidate
+payload identifies the path with `evidence_source: "harness_claim"` and
+`provenance.promotion_path: "harness_claim"`; the normal ledger path remains the
+preferred path and retains its two-source-group and linked-probe gates.
+
 ## Offline cases
 
 | Case type | What is evaluated |

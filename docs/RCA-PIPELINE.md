@@ -236,6 +236,13 @@ untyped collector output keeps a capped keyword-compatibility path until it is
 migrated. Rule, topology, lifecycle, feedback-prior, and live-symptom ontology
 adjustments are recorded separately in `score_breakdown`.
 
+Kubernetes container waiting/terminated `reason` values are handled as a closed
+kubelet vocabulary when the collector publishes them as structured
+`observation.container_reason`. The ranker matches these tokens exactly against
+the maintained reason-to-family table, bypassing free-text negation heuristics;
+an unmapped reason is logged as a coverage warning. Free-text logs, events, and
+annotations continue to use the compatibility keyword path.
+
 Candidate order prefers: no unresolved contradiction, calibrated confidence,
 independent telemetry groups, then numeric score. Medium starts at `2`; high
 requires score `5` plus two independent live source groups (or a dispositive

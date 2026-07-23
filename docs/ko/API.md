@@ -47,6 +47,8 @@ Backend:
 - `POST /api/v1/incidents/{id}/archive`
 - `POST /api/v1/incidents/{id}/unarchive`
 - `POST /api/v1/incidents/{id}/restore`
+- `POST /api/v1/incidents/bulk`
+- `DELETE /api/v1/incidents/trash`
 - `DELETE /api/v1/incidents/{id}`
 - `DELETE /api/v1/incidents/{id}?permanent=true`
 - `GET /api/v1/incidents/{id}/feedback`
@@ -136,6 +138,43 @@ Content-Type: application/json
 Agent validator를 호출합니다. 성공한 `shadow`, `activate`, `approve` 응답에는 `candidate`와
 `package`가 함께 있고, pending candidate의 성공한 `reject` 응답에는 `candidate`가 있습니다.
 잘못된 action은 400, validator 거절은 422, 허용되지 않는 lifecycle 전환은 409를 반환합니다.
+
+Candidate 생성에는 두 가지 증거 경로가 있습니다. 기본 경로는 완전한 trace-v3 ledger를
+요구합니다. 즉, family가 일치하는 selected/supported 가설 1개, 최소 두 source group의
+canonical supporting evidence, 연계된 probe 실행이 필요합니다. Ledger가 불완전한 경우에는
+출력 harness가 `supported`이고, root-cause claim이 snapshot family와 일치하며, 모든 supporting
+evidence가 canonical이고 반증이 없고 supporting evidence가 비어 있지 않을 때만
+`harness_claim` 경로를 사용할 수 있습니다. 이 경로는 의도적으로 source group 1개와 probe
+실행 0개를 허용하며, compiled `probe_template_ids`는 `null`이 아닌 `[]`로 전달됩니다.
+감사를 위해 payload에 `evidence_source: "harness_claim"`과
+`provenance.promotion_path: "harness_claim"`이 기록됩니다.
+
+평가를 저장하면 해당 run과 analysis hash에 대해 candidate 검증이 다시 실행됩니다. 여전히
+유효하지 않은 candidate는 `validation_failed` 상태를 유지하지만 최신 `validation_error`와
+`updated_at`으로 갱신됩니다. 적격해진 candidate는 `ready_for_review`로 돌아오며, 활성화
+전에는 여전히 명시적인 candidate decision이 필요합니다.
+
+## Bulk incident lifecycle action
+
+여러 인시던트에 같은 lifecycle action을 적용하려면 다음을 호출합니다:
+
+```http
+POST /api/v1/incidents/bulk
+Content-Type: application/json
+```
+
+```json
+{
+  "incident_ids": ["INC-...", "INC-..."],
+  "action": "archive"
+}
+```
+
+`action`은 `archive`, `unarchive`, `restore`, `trash`, `delete_permanently` 중 하나입니다.
+응답에는 처리된 ID가 포함됩니다. 휴지통의 모든 인시던트를 영구 삭제하려면
+`DELETE /api/v1/incidents/trash`를 호출하며, 응답에는 `deleted_count`가 포함됩니다.
+
+## Package retire
 
 package를 명시적으로 retire할 때는 `action` 없이 같은 선택 감사 필드를 보냅니다.
 

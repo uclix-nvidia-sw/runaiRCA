@@ -126,6 +126,15 @@ enables it; `approve` validates and activates it; `reject`/`retired` keep it out
 of runtime use. The TypeDB package-mirror CronJob copies summaries and approved
 template bindings for graph queries; it never changes activation.
 
+Candidate compilation prefers the complete trace-v3 ledger path. A supported
+harness claim can provide a second promotion path when the ledger is incomplete,
+but only when its family matches the approved snapshot and its supporting
+evidence is canonical, non-contradictory, and non-empty. The harness-claim path
+does not require two source groups or a linked probe execution, does not invent
+probe IDs, and is marked with `evidence_source: "harness_claim"` for audit.
+Evaluation re-save revalidates the exact run/hash and refreshes the latest failure
+reason when the candidate remains ineligible.
+
 ## 6. External support-case priors
 
 Some lessons come from outside our own clusters — curated enterprise support

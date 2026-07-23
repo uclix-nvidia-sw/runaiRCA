@@ -69,6 +69,15 @@ Form에는 다음을 기록합니다.
 `resolved` 또는 `mitigated`로 확인된 action만 TypeDB의 verified action이 됩니다.
 보고서가 action을 추천했다는 사실만으로 해결 효과가 증명되지는 않습니다.
 
+통과한 review로 인시던트 기반 지식을 생성할 때 Backend는 먼저 완전한 trace-v3 ledger를
+검증합니다. Ledger가 불완전해도 다음 감사 가능한 `harness_claim` 경로를 사용할 수 있습니다:
+harness diagnosis가 `supported`이고, root-cause claim이 snapshot family와 일치하며,
+supporting evidence가 canonical이고 반증이 없어야 하고, supporting evidence ID가 최소 1개
+있어야 합니다. 이 폴백은 probe 실행을 만들어 내지 않으며 빈 `probe_template_ids` 목록을
+전달할 수 있습니다. Candidate payload에는 `evidence_source: "harness_claim"`과
+`provenance.promotion_path: "harness_claim"`이 기록됩니다. 일반 ledger 경로가 우선하며,
+두 source group과 연계 probe gate를 그대로 유지합니다.
+
 ## 오프라인 사례
 
 | 사례 | 평가 내용 |

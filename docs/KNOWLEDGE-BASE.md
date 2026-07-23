@@ -76,6 +76,17 @@ operator, but it never becomes a similar-incident prior and is never ingested as
 knowledge. Approval is the human statement: “this is safe to teach from.” Raw
 logs, credentials, and arbitrary commands are not copied into TypeDB.
 
+Incident-derived candidates normally come from a complete trace-v3 ledger with a
+family-matching selected/supported hypothesis, canonical evidence from at least
+two source groups, and a linked probe execution. When the ledger is incomplete,
+the Backend can use the separately audited `harness_claim` path only for a
+supported harness root-cause claim that matches the snapshot family, has
+canonical non-contradictory supporting evidence, and has at least one supporting
+evidence ID. This path does not invent probes or require two source groups; its
+payload records `evidence_source: "harness_claim"` and an empty
+`probe_template_ids` list. Re-saving an evaluation refreshes a failed candidate's
+latest validation reason and can make it reviewable again when all gates pass.
+
 ## 3. How knowledge is used during an analysis
 
 ```mermaid

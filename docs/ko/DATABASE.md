@@ -87,9 +87,12 @@ flowchart LR
 | `ontology_backfill_cursors` | 일회성 백필 북킵(스냅샷 → TypeDB) | `cursor_name` (PK), `approved_at`, `case_id` |
 
 **유사도 검색**: `incident_embeddings.embedding`(pgvector, HNSW cosine)이 기본 경로이며,
-pgvector를 사용할 수 없을 때 JSONB 희소 벡터 코사인 폴백이 동작합니다. 384차원 벡터는 RCA
-텍스트의 결정론적 피처 해시입니다(모델 의존성 없음) — `backend/memory.go`를 참조하십시오.
-`labels`/`annotations` JSONB는 인제스트가 소비하는 가장 풍부한 엔티티
+OpenAI 호환 embedding endpoint가 설정된 경우 기본 경로입니다. 질의와 저장된 메모리 모두
+RCA summary/detail을 포함하며, 같은 family와 정규화된 workload identity 신호가 랭킹을
+보강합니다. endpoint 또는 dense 검색을 사용할 수 없으면 Backend는 결정론적인 384차원
+희소 feature-hash cosine 검색으로 폴백합니다. embedding basis/model/dimension이 변경되면
+파생 벡터를 다시 생성하며, embedding 오류가 발생해도 인시던트 저장과 검색은 계속 사용할
+수 있습니다. `labels`/`annotations` JSONB는 인제스트가 소비하는 가장 풍부한 엔티티
 소스입니다(cluster/node/queue/etc.).
 
 ### 학습 파이프라인: 인시던트가 지식이 되기까지
@@ -121,6 +124,18 @@ flowchart TD
 **shadow** 발행(`ShadowKnowledgeCandidate`)은 패키지를 리뷰용으로 스테이징하되 활성 런타임
 스냅샷에는 노출하지 않습니다. 승인이 실수로 RCA 랭킹을 바꾸지 못하게 하려는 것이며, 이후
 명시적 활성화로 승격됩니다.
+
+### 승격 증거 경로
+
+Candidate 생성은 완전한 trace-v3 ledger 경로를 우선합니다. family가 일치하는
+selected/supported 가설, 최소 두 source group의 canonical supporting evidence, 해당 가설에
+연계된 probe 실행이 필요합니다. Ledger가 불완전하지만 snapshot family와 일치하는
+supported root-cause claim 및 반증 없는 canonical supporting evidence가 있으면, 감사 가능한
+두 번째 `harness_claim` 경로를 사용할 수 있습니다. `harness_claim` 경로는 두 source group과
+연계 probe를 요구하지 않으며, 빈 `probe_template_ids` 목록을 내보내고
+`evidence_source`와 `provenance.promotion_path`를 모두 `harness_claim`으로 표시합니다.
+평가를 다시 저장하면 부적격 candidate의 최신 validation error가 갱신되고, gate를 통과하면
+`ready_for_review`로 돌아올 수 있습니다.
 
 ---
 

@@ -72,6 +72,16 @@ flowchart LR
 유사 인시던트 prior가 되거나 지식으로 ingest되지 않습니다. 승인은 “이 사례에서 배워도
 안전하다”는 사람의 확인입니다. 원시 로그, 자격 증명, 임의 명령은 TypeDB로 복사하지 않습니다.
 
+인시던트 기반 candidate는 기본적으로 family가 일치하는 selected/supported 가설, 최소 두
+source group의 canonical evidence, 연계된 probe 실행을 가진 완전한 trace-v3 ledger에서
+생성됩니다. Ledger가 불완전하면 snapshot family와 일치하는 supported harness root-cause
+claim, canonical하고 반증이 없는 supporting evidence, 최소 하나의 supporting evidence ID가
+있는 경우에 한해 별도로 감사 가능한 `harness_claim` 경로를 사용할 수 있습니다. 이 경로는
+probe를 만들어 내지 않고 두 source group도 요구하지 않으며, payload에
+`evidence_source: "harness_claim"`과 빈 `probe_template_ids` 목록을 기록합니다. 평가를
+다시 저장하면 실패한 candidate의 최신 validation 사유가 갱신되고 모든 gate를 통과할 때
+다시 review 대상으로 돌아올 수 있습니다.
+
 ## 3. 분석 중 지식이 사용되는 방법
 
 ```mermaid
