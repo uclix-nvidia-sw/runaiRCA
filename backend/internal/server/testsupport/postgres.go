@@ -38,7 +38,6 @@ type PostgresState struct {
 	missingDataJSON          []byte
 	warningsJSON             []byte
 	artifactsJSON            []byte
-	memoryVectorJSON         []byte
 	emptyObjectJSON          []byte
 	emptyArrayJSON           []byte
 	execsNoDeadline          int
@@ -60,7 +59,6 @@ func NewPostgresState(failCreateVector bool) *PostgresState {
 		missingDataJSON:  []byte(`[]`),
 		warningsJSON:     []byte(`[]`),
 		artifactsJSON:    []byte(`[]`),
-		memoryVectorJSON: []byte(`{"gpu":2,"quota":2,"scheduling":1,"runai":1}`),
 		emptyObjectJSON:  []byte(`{}`),
 		emptyArrayJSON:   []byte(`[]`),
 	}
@@ -336,12 +334,12 @@ func (s *PostgresState) rowsFor(query string) driver.Rows {
 		return &fakeRows{
 			columns: []string{
 				"incident_id", "alert_id", "title", "severity", "status", "analysis_summary",
-				"analysis_detail", "labels", "vector_json", "created_at",
+				"analysis_detail", "labels", "created_at",
 			},
 			values: [][]driver.Value{{
 				"INC-db", "ALR-db", "Prior GPU quota saturation", "warning", "resolved",
 				"Run:AI queue gpu-a was saturated.", "GPU quota blocked scheduling.",
-				s.labelsJSON, s.memoryVectorJSON, s.now,
+				s.labelsJSON, s.now,
 			}},
 		}
 	case strings.Contains(lowered, "from rca_feedback") && strings.Contains(lowered, "kind = 'comment'"):

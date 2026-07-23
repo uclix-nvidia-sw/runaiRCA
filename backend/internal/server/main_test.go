@@ -1811,6 +1811,86 @@ func TestSimilarIncidentsDedupesAlertMemoriesByIncident(t *testing.T) {
 	}
 }
 
+func TestFamilyBonus(t *testing.T) {
+	if b := familyBonus("runai_scheduling_quota", "runai_scheduling_quota"); b != 0.15 {
+		t.Fatalf("same family should be rewarded, got %v", b)
+	}
+	if b := familyBonus("runai_scheduling_quota", "gpu_hardware_error"); b != 0 {
+		t.Fatalf("different family must not be rewarded, got %v", b)
+	}
+	if b := familyBonus("", ""); b != 0 {
+		t.Fatalf("empty family must not match empty (unknown != same cause), got %v", b)
+	}
+}
+
+func TestSimilarIncidentsSameWorkloadPodChangedScoresHigh(t *testing.T) {
+	store := NewStore()
+	// Prior resolved incident for the same deployment, with long analysis prose.
+	// That prose used to dominate the memory vector and crush the cosine to ~38%
+	// for an otherwise-identical deployment.
+	prior := IncidentMemory{
+		IncidentID:      "INC-prior",
+		Title:           "GPU quota exhausted for trainer",
+		Severity:        "warning",
+		Status:          "resolved",
+		AnalysisSummary: strings.Repeat("scheduler could not admit the workload because the project quota was consumed ", 8),
+		AnalysisDetail:  strings.Repeat("quota was expanded and the pod recovered after preemption of a lower priority job ", 8),
+		Labels: map[string]string{
+			"alertname": "RunAIWorkloadPending", "severity": "warning",
+			"cluster": "lab", "namespace": "runai", "workload": "trainer",
+			"pod": "trainer-6d4b9c7f8a-abc12",
+		},
+		CreatedAt: time.Date(2026, 6, 26, 9, 0, 0, 0, time.UTC),
+	}
+	prior.Vector = textVector(memorySignatureText(prior))
+	seedApprovedMemoryIncidentForTest(store, "INC-prior", prior.CreatedAt)
+	store.memories["INC-prior"] = &prior
+
+	// Current alert: same deployment, only the pod's random suffix changed.
+	current := Alert{
+		Status:      "firing",
+		Annotations: map[string]string{"summary": "GPU quota exhausted for trainer"},
+		Labels: map[string]string{
+			"alertname": "RunAIWorkloadPending", "severity": "warning",
+			"cluster": "lab", "namespace": "runai", "workload": "trainer",
+			"pod": "trainer-6d4b9c7f8a-xyz89",
+		},
+	}
+	similar := store.SimilarIncidentsForAlert(current, "INC-current", 5)
+	if len(similar) != 1 || similar[0].IncidentID != "INC-prior" {
+		t.Fatalf("expected the same-deployment prior to surface, got %+v", similar)
+	}
+	if similar[0].Similarity < 0.8 {
+		t.Fatalf("same deployment (pod changed) should score high, got %.3f", similar[0].Similarity)
+	}
+
+	// A genuinely different workload must score lower — guards against the fix
+	// collapsing every incident to ~1.0.
+	other := IncidentMemory{
+		IncidentID: "INC-other", Title: "GPU node went NotReady", Severity: "critical",
+		Status: "resolved",
+		Labels: map[string]string{
+			"alertname": "RunAINodeNotReady", "severity": "critical",
+			"cluster": "lab", "namespace": "kube-system", "workload": "gpu-operator",
+			"pod": "gpu-operator-5f9c8d-qq221",
+		},
+		CreatedAt: prior.CreatedAt,
+	}
+	other.Vector = textVector(memorySignatureText(other))
+	seedApprovedMemoryIncidentForTest(store, "INC-other", other.CreatedAt)
+	store.memories["INC-other"] = &other
+
+	ranked := store.SimilarIncidentsForAlert(current, "INC-current", 5)
+	if len(ranked) == 0 || ranked[0].IncidentID != "INC-prior" {
+		t.Fatalf("same deployment must rank first, got %+v", ranked)
+	}
+	for _, item := range ranked {
+		if item.IncidentID == "INC-other" && item.Similarity >= similar[0].Similarity {
+			t.Fatalf("different workload should score below same deployment, got %+v", ranked)
+		}
+	}
+}
+
 func TestFeedbackHintsCapsInvalidLimit(t *testing.T) {
 	store := NewStore()
 	alert := Alert{
