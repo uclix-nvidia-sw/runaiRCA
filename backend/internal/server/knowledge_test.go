@@ -34,8 +34,9 @@ func eligibleKnowledgeSnapshot() *CaseSnapshot {
 			"metadata": map[string]any{
 				"harness": map[string]any{"overall_score": 90, "hard_gates": map[string]any{"unsupported_high_confidence": false, "invalid_evidence_links": false}},
 				"reasoning_trace_v3": map[string]any{
-					"schema_version": 3,
-					"hypotheses":     []any{map[string]any{"hypothesis_id": "H-1", "family": "scheduler_capacity", "mechanism": "quota exhausted", "status": "selected", "confidence": 0.91, "evidence_for": []any{"E-1", "E-2"}, "evidence_against": []any{}}},
+					"schema_version":         3,
+					"selected_hypothesis_id": "H-1",
+					"hypotheses":             []any{map[string]any{"hypothesis_id": "H-1", "family": "scheduler_capacity", "mechanism": "quota exhausted", "mechanism_fingerprint": "quota-exhausted-a13f9c2d", "status": "selected", "confidence": 0.91, "evidence_for": []any{"E-1", "E-2"}, "evidence_against": []any{}}},
 					"evidence": []any{
 						map[string]any{"evidence_id": "E-1", "observation_window": map[string]any{"start": "2026-07-12T00:00:00Z", "end": "2026-07-12T00:05:00Z"}, "entity": "queue/gpu-a", "source": "runai", "source_group": "control-plane", "predicate": "quota_exhausted", "polarity": "present", "coverage": "scoped", "quality": "high", "raw_query": "must not survive"},
 						map[string]any{"evidence_id": "E-2", "observation_window": map[string]any{"start": "2026-07-12T00:01:00Z", "end": "2026-07-12T00:06:00Z"}, "entity": "scheduler/gpu-a", "source": "kubernetes", "source_group": "scheduler", "predicate": "insufficient_quota", "polarity": "present", "coverage": "scoped", "quality": "high"},
@@ -379,6 +380,21 @@ func TestKnowledgeCandidateRequiresEligibleTraceV3AndCompilesSafePayload(t *test
 	if candidate.Payload["hypothesis_id"] != "H-1" || candidate.Payload["mechanism"] != "quota exhausted" {
 		t.Fatalf("expected exact v3 hypothesis details, got %+v", candidate.Payload)
 	}
+	if candidate.Trace["selected_hypothesis_id"] != "H-1" {
+		t.Fatalf("candidate trace dropped selected hypothesis identity: %+v", candidate.Trace)
+	}
+	if _, ok := candidate.Trace["stop_reason"]; ok {
+		t.Fatalf("candidate trace retained retired stop_reason: %+v", candidate.Trace)
+	}
+	hypothesis := candidate.Trace["hypotheses"].([]any)[0].(map[string]any)
+	if hypothesis["mechanism_fingerprint"] != "quota-exhausted-a13f9c2d" {
+		t.Fatalf("candidate trace dropped mechanism fingerprint: %+v", hypothesis)
+	}
+	historical := cloneCaseSnapshot(snapshot)
+	delete(knowledgeTraceForTest(&historical), "selected_hypothesis_id")
+	if candidate := knowledgeCandidateForSnapshot(&historical); candidate == nil || candidate.Status != knowledgeCandidateReady {
+		t.Fatalf("historical v3 status fallback should remain eligible, got %+v", candidate)
+	}
 	if candidate.Kind != "failure_mode" || len(candidate.EvidenceSummaries) != 2 || candidate.EvidenceSummaries[0].SourceGroup == "" || candidate.EvidenceSummaries[0].Entity == "" || candidate.EvidenceSummaries[0].Coverage != "scoped" || len(candidate.ProbeTemplateIDs) != 1 || candidate.ProbeTemplateIDs[0] != "k8s_troubleshooting:scheduling_capacity:p01" || len(candidate.ProbeBindings) != 1 || candidate.ProbeBindings[0].CandidateProbeID != candidate.CandidateID+":"+candidate.ProbeBindings[0].ProbeLocalID || candidate.ProbeBindings[0].ActiveProbeID != "" {
 		t.Fatalf("candidate review DTO omitted sanitized corroboration details: %+v", candidate)
 	}
@@ -600,6 +616,7 @@ func TestValidationFailedCandidateRefreshesItsLatestReason(t *testing.T) {
 	snapshot.ApprovalState = "active"
 	trace := knowledgeTraceForTest(snapshot)
 	trace["hypotheses"] = []any{}
+	delete(trace, "selected_hypothesis_id")
 	delete(trace, "probe_executions")
 	latest := knowledgeCandidateForSnapshotWithOutcome(snapshot, true, false)
 	if latest == nil || latest.Status != knowledgeCandidateValidationFailed {
@@ -648,6 +665,7 @@ func harnessClaimSnapshotForTest() *CaseSnapshot {
 	}}
 	trace := knowledgeTraceForTest(snapshot)
 	trace["hypotheses"] = []any{}
+	delete(trace, "selected_hypothesis_id")
 	delete(trace, "probe_executions")
 	return snapshot
 }

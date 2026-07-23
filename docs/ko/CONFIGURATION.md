@@ -190,7 +190,7 @@ helm upgrade --install runai-rca charts/runai-rca \
 | `agent.env.*TimeoutSeconds` | Kubernetes, Run:ai, Prometheus, Loki, Postgres의 요청/런타임 타임아웃 |
 | `agent.env.enableRcaOutputHarness` / `maxRcaRepairAttempts` / `rcaHarnessPassScore` | 최종 RCA 하네스 스위치, 수정 횟수, 품질 기준 |
 | `typedb.ingest.requireApproval` | Dashboard 승인(`user_approved_at`) 인시던트만 적재. 기본 `true`; `requireReview`는 deprecated |
-| `typedb.traceV3Backfill.enabled` / `batchSize` / `maxBatches` | 승인된 trace-v3 조사 기록을 TypeDB에 멱등적으로 투영합니다. legacy v1/v2 기록은 변환하지 않습니다. `maxBatches=0`은 모든 페이지를 처리합니다. |
+| `typedb.traceV3Backfill.enabled` / `batchSize` / `maxBatches` | 승인된 trace-v3 조사 기록을 TypeDB에 멱등적으로 투영합니다. trace가 없거나 trace-v3 이전 형식인 기록은 변환하지 않습니다. `maxBatches=0`은 모든 페이지를 처리합니다. |
 | `typedb.packageMirror.enabled` / `schedule` / `limit` | Backend knowledge package를 TypeDB에 자문용으로 복사합니다. 기본 스케줄은 매시 정각(`0 * * * *`)이며, 승인·활성화의 기준은 여전히 Backend입니다. |
 | `agent.env.kubernetesListLimit` / `agent.env.lokiQueryLimit` | Kubernetes 목록 호출과 Loki 로그 쿼리 그룹의 증거 볼륨 제어 |
 | `agent.env.troubleshootingCasesFile` / `agent.env.agentSoulsFile` | 주입되는 문제 해결 메모리와 에이전트 역할 계약의 경로 |

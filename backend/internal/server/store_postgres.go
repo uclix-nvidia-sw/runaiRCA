@@ -471,10 +471,156 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			return pgvectorReady
 		}
 	}
+	if err := s.migrateLegacyReasoningTrace(ctx); err != nil {
+		log.Printf("Postgres legacy reasoning-trace migration failed: %v", err)
+		s.dbReady = false
+		return pgvectorReady
+	}
 	if pgvectorReady {
 		s.ensureVectorColumn(ctx)
 	}
 	return pgvectorReady
+}
+
+func (s *Store) migrateLegacyReasoningTrace(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	runResult, err := tx.ExecContext(ctx, `
+		UPDATE analysis_runs
+		SET metadata = metadata
+				#- '{reasoning_trace_v2}'
+				#- '{reasoning_trace_v3,stop_reason}'
+				#- '{trace_v3,stop_reason}',
+			updated_at = now()
+		WHERE metadata ? 'reasoning_trace_v2'
+			OR metadata #> '{reasoning_trace_v3,stop_reason}' IS NOT NULL
+			OR metadata #> '{trace_v3,stop_reason}' IS NOT NULL`)
+	if err != nil {
+		return fmt.Errorf("clean analysis_runs metadata: %w", err)
+	}
+	snapshotResult, err := tx.ExecContext(ctx, `
+		UPDATE rca_case_snapshots
+		SET snapshot = snapshot
+				#- '{metadata,reasoning_trace_v2}'
+				#- '{metadata,reasoning_trace_v3,stop_reason}'
+				#- '{metadata,trace_v3,stop_reason}',
+			updated_at = now()
+		WHERE snapshot #> '{metadata,reasoning_trace_v2}' IS NOT NULL
+			OR snapshot #> '{metadata,reasoning_trace_v3,stop_reason}' IS NOT NULL
+			OR snapshot #> '{metadata,trace_v3,stop_reason}' IS NOT NULL`)
+	if err != nil {
+		return fmt.Errorf("clean case snapshot metadata: %w", err)
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT candidate_id, knowledge_fingerprint, trace, payload
+		FROM knowledge_candidates
+		WHERE trace ? 'stop_reason'
+		FOR UPDATE`)
+	if err != nil {
+		return fmt.Errorf("load legacy knowledge candidate traces: %w", err)
+	}
+	type candidateUpdate struct {
+		id          string
+		fingerprint string
+		trace       map[string]any
+		contentHash string
+	}
+	updates := []candidateUpdate{}
+	for rows.Next() {
+		var id, fingerprint string
+		var traceRaw, payloadRaw []byte
+		if err := rows.Scan(&id, &fingerprint, &traceRaw, &payloadRaw); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan legacy knowledge candidate: %w", err)
+		}
+		trace, payload := map[string]any{}, map[string]any{}
+		if err := json.Unmarshal(traceRaw, &trace); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("decode candidate %s trace: %w", id, err)
+		}
+		if err := json.Unmarshal(payloadRaw, &payload); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("decode candidate %s payload: %w", id, err)
+		}
+		contentHash, changed := cleanLegacyKnowledgeCandidateTrace(trace, payload)
+		if !changed {
+			continue
+		}
+		updates = append(updates, candidateUpdate{
+			id:          id,
+			fingerprint: fingerprint,
+			trace:       trace,
+			contentHash: contentHash,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate legacy knowledge candidate traces: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close legacy knowledge candidate rows: %w", err)
+	}
+	for _, update := range updates {
+		var conflictingID string
+		err := tx.QueryRowContext(ctx, `
+			SELECT candidate_id
+			FROM knowledge_candidates
+			WHERE knowledge_fingerprint = $1
+				AND content_hash = $2
+				AND candidate_id <> $3
+			LIMIT 1`,
+			update.fingerprint, update.contentHash, update.id,
+		).Scan(&conflictingID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("check candidate %s content-hash collision: %w", update.id, err)
+		}
+		if conflictingID != "" {
+			return fmt.Errorf(
+				"candidate %s becomes duplicate of %s after removing stop_reason",
+				update.id, conflictingID,
+			)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE knowledge_candidates
+			SET trace = $1, content_hash = $2, updated_at = now()
+			WHERE candidate_id = $3`,
+			mustJSON(update.trace), update.contentHash, update.id,
+		); err != nil {
+			return fmt.Errorf("clean candidate %s trace: %w", update.id, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	runCount, _ := runResult.RowsAffected()
+	snapshotCount, _ := snapshotResult.RowsAffected()
+	log.Printf(
+		"Postgres legacy reasoning-trace migration: analysis_runs=%d case_snapshots=%d knowledge_candidates=%d",
+		runCount, snapshotCount, len(updates),
+	)
+	return nil
+}
+
+func cleanLegacyKnowledgeCandidateTrace(
+	trace, payload map[string]any,
+) (string, bool) {
+	if _, exists := trace["stop_reason"]; !exists {
+		return "", false
+	}
+	delete(trace, "stop_reason")
+	return knowledgeContentHash(trace, payload), true
 }
 
 // ensureVectorColumn adds the dense pgvector column and a cosine index used by

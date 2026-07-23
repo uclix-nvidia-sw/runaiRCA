@@ -47,6 +47,11 @@ flowchart TB
   HAR --> RESP([RCA + 증거 추적])
 ```
 
+`trace-v3`만 공개·영속 reasoning 계약으로 사용합니다. 최종 선택은 정확한
+`selected_hypothesis_id`로 기록하며, open-world 선택은 `mechanism_fingerprint`도
+포함합니다. 내부 hypothesis ledger는 일시적인 작업 데이터로만 유지하고, 운영 budget
+종료 정보는 trace가 아니라 로그와 progress event에 남깁니다.
+
 전체 실행은 `asyncio.wait_for(analyze, ANALYSIS_DEADLINE_SECONDS)`로 감싸집니다
 (기본값 **900초 / 15분**). 초과 시 멈춤(hang) 없이 우아하게 저하된 리포트를 반환합니다.
 단계별 상한은 *의도적으로* 넉넉합니다(깊은 증거가 빠르지만 얕은 것보다 낫습니다). 전체 데드라인이

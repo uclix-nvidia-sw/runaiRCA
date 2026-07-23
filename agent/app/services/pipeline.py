@@ -273,16 +273,13 @@ def _evidence_budget_exceeded(state: PipelineState) -> bool:
 
 
 def _record_evidence_budget_stop(state: PipelineState, phase: str) -> None:
-    """Record the expected safety stop in trace/logs, not operator warnings.
+    """Record the expected safety stop in logs/events, not durable reasoning.
 
     The evidence deadline intentionally reserves time for synthesis and the
     output harness. Reaching it after base evidence is complete is normal and
     should not look like a telemetry failure in the final report.
     """
     _log.info("evidence budget reached; skipped optional %s", phase)
-    trace = state.investigation_context.get("reasoning_trace_v2")
-    if isinstance(trace, dict):
-        trace["stop_reason"] = "analysis_budget_exhausted"
     reporter = getattr(state, "progress", None)
     if reporter is not None:
         reporter.emit(
@@ -985,25 +982,6 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
             if isinstance(name, str) and name:
                 state.capabilities[name] = "skipped_sufficient_evidence"
     _link_probe_assessments_to_ledger(state)
-    # The blackboard facts are an additive, compact trace for ranking/synthesis;
-    # raw artifacts remain the source for the existing response contract.
-    state.investigation_context.setdefault(
-        "reasoning_trace_v2",
-        {
-            "schema_version": 2,
-            "hypotheses": state.investigation_context.get("hypothesis_ledger", []),
-            "referenced_facts": state.blackboard.prompt_view(limit=30),
-            "stop_reason": "base_evidence_complete",
-        },
-    )
-    state.investigation_context["reasoning_trace_v2"] = _public_reasoning_trace(
-        state.investigation_context.get("reasoning_trace_v2"), state
-    )
-    assessments = _probe_assessments(state.results)
-    if assessments:
-        trace = state.investigation_context.get("reasoning_trace_v2")
-        if isinstance(trace, dict):
-            trace["probe_assessments"] = assessments
     state.investigation_context["reasoning_trace_v3"] = _public_reasoning_trace_v3(state)
     return state
 
@@ -1236,32 +1214,11 @@ def _blackboard_artifact_evidence_ids(state: PipelineState) -> dict[str, str]:
     return aliases
 
 
-def _public_reasoning_trace(trace: object, state: PipelineState) -> dict[str, Any]:
-    if not isinstance(trace, dict):
-        return {}
-    aliases = _blackboard_artifact_evidence_ids(state)
-    output = dict(trace)
-    facts = output.get("referenced_facts")
-    if isinstance(facts, list):
-        output["referenced_facts"] = [
-            {
-                **fact,
-                "evidence_id": aliases.get(
-                    str(fact.get("evidence_id") or ""), fact.get("evidence_id")
-                ),
-            }
-            for fact in facts
-            if isinstance(fact, dict)
-        ]
-    return output
-
-
 def _public_reasoning_trace_v3(state: PipelineState) -> dict[str, Any]:
     """Serialize a strict, public, fact-level reasoning graph.
 
-    v2 carries the legacy free-form ledger. v3 is deliberately narrower: every
-    evidence reference is a response-local E-id, and a link exists only when
-    the normalized observation is eligible for its reasoning role.
+    Every evidence reference is a response-local E-id, and a link exists only
+    when the normalized observation is eligible for its reasoning role.
     """
     aliases = _blackboard_artifact_evidence_ids(state)
     board = state.blackboard
@@ -1374,7 +1331,6 @@ def _public_reasoning_trace_v3(state: PipelineState) -> dict[str, Any]:
         "evidence": evidence,
         "probe_executions": _dedupe_v3_records(executions),
         "rejected_evidence_links": _dedupe_v3_records(rejected_links),
-        "stop_reason": _v3_stop_reason(state),
     }
 
 
@@ -1430,7 +1386,7 @@ def _public_v3_hypothesis(
             }
         )
 
-    return {
+    hypothesis = {
         "hypothesis_id": str(item.get("id") or ""),
         "family": str(item.get("family") or ""),
         "mechanism": str(item.get("mechanism") or item.get("statement") or ""),
@@ -1441,6 +1397,10 @@ def _public_v3_hypothesis(
         "supporting_source_groups": groups(evidence_for),
         "contradicting_source_groups": groups(evidence_against),
     }
+    fingerprint = str(item.get("mechanism_fingerprint") or "").strip()
+    if fingerprint:
+        hypothesis["mechanism_fingerprint"] = fingerprint
+    return hypothesis
 
 
 def _public_evidence_ids(
@@ -1472,13 +1432,6 @@ def _dedupe_v3_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for item in records:
         unique[json.dumps(item, sort_keys=True, separators=(",", ":"))] = item
     return list(unique.values())
-
-
-def _v3_stop_reason(state: PipelineState) -> str:
-    v2 = state.investigation_context.get("reasoning_trace_v2")
-    if not isinstance(v2, dict):
-        return "base_evidence_complete"
-    return str(v2.get("stop_reason") or "base_evidence_complete")
 
 
 def _component_identity(
@@ -1809,11 +1762,7 @@ async def rank_stage(state: PipelineState) -> PipelineState:
     if state.root_cause_candidates:
         top = state.root_cause_candidates[0]
         state.ranking_candidate_before_self_check = replace(top)
-        # A shadow/assist candidate is explicitly not the approved diagnosis.
-        # Persist a mechanism only when the final headline is itself the
-        # evidence-gated open-world candidate.
-        _record_selected_open_world_hypothesis(state)
-        _record_selected_hypothesis_id(state)
+        _record_selected_hypothesis(state)
         state.progress.emit(
             "ranking",
             f"Top candidate: {top.family}",
@@ -1854,35 +1803,12 @@ def _merge_open_world_candidates(
 
 
 def _refresh_public_reasoning_trace(state: PipelineState) -> None:
-    """Refresh v2 and v3 public traces after response-local IDs are assigned."""
-    trace = state.investigation_context.get("reasoning_trace_v2")
-    if isinstance(trace, dict):
-        state.investigation_context["reasoning_trace_v2"] = _public_reasoning_trace(
-            trace, state
-        )
+    """Refresh the public v3 trace after response-local IDs are assigned."""
     state.investigation_context["reasoning_trace_v3"] = _public_reasoning_trace_v3(state)
 
 
-def _record_selected_open_world_hypothesis(state: PipelineState) -> None:
-    """Persist a mechanism only if the open-world candidate is the headline."""
-    trace = state.investigation_context.get("reasoning_trace_v2")
-    if not state.root_cause_candidates or not isinstance(trace, dict):
-        return
-    top = state.root_cause_candidates[0]
-    if top.novelty != "open_world" or not top.mechanism:
-        return
-    trace["selected_hypothesis"] = {
-        "hypothesis_id": top.hypothesis_id,
-        "mechanism": top.mechanism,
-        "mechanism_fingerprint": top.mechanism_fingerprint,
-        "family": top.family,
-        "supporting_evidence_ids": top.support_evidence_ids,
-        "contradicting_evidence_ids": top.contradiction_evidence_ids,
-    }
-
-
-def _record_selected_hypothesis_id(state: PipelineState) -> None:
-    """Publish a final selection only from a candidate's exact hypothesis ID.
+def _record_selected_hypothesis(state: PipelineState) -> None:
+    """Publish the exact selected v3 hypothesis and its open-world identity.
 
     Catalog candidates normally have no hypothesis ID.  In that case—and when
     a stale candidate ID is not present in the public trace—we deliberately
@@ -1894,15 +1820,29 @@ def _record_selected_hypothesis_id(state: PipelineState) -> None:
     trace.pop("selected_hypothesis_id", None)
     if not state.root_cause_candidates:
         return
-    hypothesis_id = str(getattr(state.root_cause_candidates[0], "hypothesis_id", "") or "").strip()
+    top = state.root_cause_candidates[0]
+    hypothesis_id = str(getattr(top, "hypothesis_id", "") or "").strip()
     hypotheses = trace.get("hypotheses")
-    known = {
-        str(item.get("hypothesis_id") or "")
+    if not hypothesis_id or not isinstance(hypotheses, list):
+        return
+    matches = [
+        item
         for item in hypotheses
         if isinstance(item, dict)
-    } if isinstance(hypotheses, list) else set()
-    if hypothesis_id and hypothesis_id in known:
-        trace["selected_hypothesis_id"] = hypothesis_id
+        and str(item.get("hypothesis_id") or "").strip() == hypothesis_id
+    ]
+    if len(matches) != 1:
+        return
+    selected = matches[0]
+    if top.novelty == "open_world":
+        mechanism = str(top.mechanism or "").strip()
+        fingerprint = str(top.mechanism_fingerprint or "").strip()
+        if not mechanism or not fingerprint:
+            return
+        selected["family"] = str(top.family or "").strip()
+        selected["mechanism"] = mechanism
+        selected["mechanism_fingerprint"] = fingerprint
+    trace["selected_hypothesis_id"] = hypothesis_id
 
 
 def _prepare_open_world_ledger(state: PipelineState) -> None:
@@ -2494,7 +2434,6 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             "plan": plan.as_dict(),
             "hypothesis_ledger": state.investigation_context.get("hypothesis_ledger"),
             "investigation": state.investigation_context,
-            "reasoning_trace_v2": state.investigation_context.get("reasoning_trace_v2", {}),
             "reasoning_trace_v3": state.investigation_context.get("reasoning_trace_v3", {}),
             "open_world_candidates": [
                 candidate.as_dict() for candidate in state.open_world_candidates
@@ -2730,8 +2669,7 @@ async def _investigate_until_settled(state: PipelineState) -> None:
         open_world = _merge_open_world_candidates(state, state.root_cause_candidates)
         if getattr(state.settings, "open_world_rca_mode", "off") == "authoritative":
             state.root_cause_candidates = open_world
-        _record_selected_open_world_hypothesis(state)
-        _record_selected_hypothesis_id(state)
+        _record_selected_hypothesis(state)
 
         after_family = state.root_cause_candidates[0].family if state.root_cause_candidates else ""
         if after_family == before_family and _evidence_signature(state.results) == before_evidence:

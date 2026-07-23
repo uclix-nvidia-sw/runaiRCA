@@ -7,6 +7,57 @@ import (
 	"time"
 )
 
+func TestCaseMechanismUsesExactSelectedTraceV3Hypothesis(t *testing.T) {
+	metadata := map[string]any{
+		"reasoning_trace_v3": map[string]any{
+			"schema_version":         3,
+			"selected_hypothesis_id": "H-exact",
+			"hypotheses": []any{
+				map[string]any{"hypothesis_id": "H-other", "mechanism": "wrong"},
+				map[string]any{
+					"hypothesis_id":         "H-exact",
+					"mechanism":             "CSI attach race",
+					"mechanism_fingerprint": "a13f9c2d",
+				},
+			},
+		},
+		"reasoning_trace_v2": map[string]any{
+			"mechanism": "legacy mechanism",
+		},
+	}
+
+	mechanism, fingerprint := caseMechanismFromMetadata(metadata)
+	if mechanism != "CSI attach race" || fingerprint != "a13f9c2d" {
+		t.Fatalf("expected exact v3 selection, got mechanism=%q fingerprint=%q", mechanism, fingerprint)
+	}
+
+	metadata["reasoning_trace_v3"].(map[string]any)["selected_hypothesis_id"] = "H-missing"
+	mechanism, fingerprint = caseMechanismFromMetadata(metadata)
+	if mechanism != "" || fingerprint != "" {
+		t.Fatalf("v2 must not be a mechanism fallback, got mechanism=%q fingerprint=%q", mechanism, fingerprint)
+	}
+}
+
+func TestCaseMechanismFallsBackToHistoricalOntologyReasoning(t *testing.T) {
+	mechanism, fingerprint := caseMechanismFromMetadata(map[string]any{
+		"reasoning_trace_v3": map[string]any{
+			"schema_version":         3,
+			"selected_hypothesis_id": "H-duplicate",
+			"hypotheses": []any{
+				map[string]any{"hypothesis_id": "H-duplicate", "mechanism": "one"},
+				map[string]any{"hypothesis_id": "H-duplicate", "mechanism": "two"},
+			},
+		},
+		"ontology_reasoning": map[string]any{
+			"mechanism":             "historical mechanism",
+			"mechanism_fingerprint": "historical-fingerprint",
+		},
+	})
+	if mechanism != "historical mechanism" || fingerprint != "historical-fingerprint" {
+		t.Fatalf("expected ontology fallback, got mechanism=%q fingerprint=%q", mechanism, fingerprint)
+	}
+}
+
 func TestApprovalCreatesImmutableHashBoundCaseSnapshot(t *testing.T) {
 	server := NewServer()
 	incident, alert := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "case-snapshot"}, Alert{

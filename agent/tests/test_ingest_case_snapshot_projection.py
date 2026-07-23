@@ -130,6 +130,7 @@ def test_trace_v3_projects_only_explicit_ids_and_metadata(monkeypatch: Any) -> N
                     "hypothesis_id": "H-storage",
                     "family": "k8s_storage_error",
                     "mechanism": "CSI attachment stalled",
+                    "mechanism_fingerprint": "csi-stalled-a13f9c2d",
                     "status": "testing",
                     "confidence": "medium",
                     "evidence_for": ["E-mount"],
@@ -166,7 +167,6 @@ def test_trace_v3_projects_only_explicit_ids_and_metadata(monkeypatch: Any) -> N
             "rejected_evidence_links": [
                 {"hypothesis_id": "H-storage", "evidence_id": "E-mount", "reason": "stale"}
             ],
-            "stop_reason": "discriminating evidence collected",
         },
     )
 
@@ -177,6 +177,7 @@ def test_trace_v3_projects_only_explicit_ids_and_metadata(monkeypatch: Any) -> N
     assert 'has evidence_id "ANL-trace:E-mount"' in emitted
     assert 'has probe_execution_id "ANL-trace:PX-1"' in emitted
     assert 'has trace_local_id "H-storage"' in emitted
+    assert 'has mechanism_fingerprint "csi-stalled-a13f9c2d"' in emitted
     assert "isa hypothesis_for" in emitted
     assert "isa probe_execution_tests" in emitted
     assert "isa probe_execution_evidence" in emitted

@@ -538,25 +538,63 @@ func caseMechanismFromMetadata(metadata map[string]any) (string, string) {
 	if metadata == nil {
 		return "", ""
 	}
-	for _, key := range []string{"reasoning_trace_v3", "trace_v3", "reasoning_trace_v2", "ontology_reasoning"} {
+	for _, key := range []string{"reasoning_trace_v3", "trace_v3"} {
 		trace, ok := metadata[key].(map[string]any)
 		if !ok {
 			continue
 		}
-		mechanism, _ := trace["mechanism"].(string)
-		fingerprint, _ := trace["mechanism_fingerprint"].(string)
+		if version, ok := numberToInt(trace["schema_version"]); !ok || version != 3 {
+			continue
+		}
+		selectedID := strings.TrimSpace(stringValue(trace["selected_hypothesis_id"]))
+		if selectedID == "" {
+			continue
+		}
+		hypotheses := traceObjectSlice(trace["hypotheses"])
+		matches := make([]map[string]any, 0, 1)
+		for _, hypothesis := range hypotheses {
+			if strings.TrimSpace(stringValue(hypothesis["hypothesis_id"])) == selectedID {
+				matches = append(matches, hypothesis)
+			}
+		}
+		if len(matches) != 1 {
+			continue
+		}
+		mechanism := strings.TrimSpace(stringValue(matches[0]["mechanism"]))
+		fingerprint := strings.TrimSpace(stringValue(matches[0]["mechanism_fingerprint"]))
 		if mechanism != "" || fingerprint != "" {
-			return strings.TrimSpace(mechanism), strings.TrimSpace(fingerprint)
+			return mechanism, fingerprint
+		}
+	}
+	if trace, ok := metadata["ontology_reasoning"].(map[string]any); ok {
+		mechanism := strings.TrimSpace(stringValue(trace["mechanism"]))
+		fingerprint := strings.TrimSpace(stringValue(trace["mechanism_fingerprint"]))
+		if mechanism != "" || fingerprint != "" {
+			return mechanism, fingerprint
 		}
 		if selected, ok := trace["selected_hypothesis"].(map[string]any); ok {
-			mechanism, _ = selected["mechanism"].(string)
-			fingerprint, _ = selected["mechanism_fingerprint"].(string)
-			if mechanism != "" || fingerprint != "" {
-				return strings.TrimSpace(mechanism), strings.TrimSpace(fingerprint)
-			}
+			return strings.TrimSpace(stringValue(selected["mechanism"])),
+				strings.TrimSpace(stringValue(selected["mechanism_fingerprint"]))
 		}
 	}
 	return "", ""
+}
+
+func traceObjectSlice(raw any) []map[string]any {
+	switch values := raw.(type) {
+	case []map[string]any:
+		return values
+	case []any:
+		out := make([]map[string]any, 0, len(values))
+		for _, value := range values {
+			if item, ok := value.(map[string]any); ok {
+				out = append(out, item)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func formatOptionalTime(value *time.Time) string {

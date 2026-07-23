@@ -119,6 +119,17 @@ func (s *PostgresState) Executed(fragment string) bool {
 	return false
 }
 
+func (s *PostgresState) Queried(fragment string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, query := range s.queries {
+		if strings.Contains(query, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *PostgresState) ExecIndex(fragment string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()

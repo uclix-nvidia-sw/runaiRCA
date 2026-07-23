@@ -109,7 +109,6 @@ attribute observed_window_start, value string;
 attribute observed_window_end, value string;
 attribute quality, value string;
 attribute executed_at, value string;
-attribute trace_stop_reason, value string;
 attribute rejection_reason, value string;
 attribute package_id, value string;
 attribute package_status, value string;
@@ -213,7 +212,6 @@ entity analysis_run,
     owns source,
     owns status,
     owns confidence,
-    owns trace_stop_reason,
     plays analyzed_by:run,
     plays diagnosis:run,
     plays hypothesis_for:run;
