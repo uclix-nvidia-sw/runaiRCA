@@ -1696,10 +1696,16 @@ async def rank_stage(state: PipelineState) -> PipelineState:
     )
     # TypeDB is the runtime source of truth. The version-controlled YAML matcher
     # remains only for deployments where the graph is disabled/unavailable.
-    state.failure_modes = (
+    # The family universe is CLOSED (families.yaml == failure_modes == ranker
+    # vocabulary). An old approved-incident ingest wrote an LLM-authored family
+    # into the graph; consuming it as a curated symptom made an ungroundable
+    # name ('workload_startup_image_failure') the headline over the
+    # signature-clean catalog family image_pull_error and forced a harness
+    # abstain (2026-07-22 ImagePullBackOff incident). Names outside the catalog
+    # never reach the symptom matcher.
+    state.failure_modes = _catalog_only_knowledge(
         state.kg_context.knowledge
-        or load_failure_modes(settings.failure_modes_file)
-    )
+    ) or load_failure_modes(settings.failure_modes_file)
     state.known_issues = load_runai_known_issues(settings.runai_known_issues_file)
     # Version-aware precision: drop known issues already fixed in the cluster's
     # running Run:ai version so we don't attribute a symptom to a patched bug.
@@ -5226,6 +5232,26 @@ _FAMILY_EXPLANATION_KO = {
     "observability_accuracy": "워크로드가 아닌 메트릭·관측 정확도 문제",
     "expected_known_behavior": "제품의 알려진 정상 동작",
 }
+
+
+def _catalog_only_knowledge(
+    knowledge: dict[str, list[dict[str, Any]]] | None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Drop graph-supplied families outside the closed catalog vocabulary.
+
+    An LLM-authored family ingested into TypeDB must never be consumed as a
+    curated symptom: the symptom matcher would headline a name the harness
+    cannot ground, forcing an abstain over a signature-clean catalog family.
+    """
+    if not knowledge:
+        return {}
+    non_catalog = sorted(set(knowledge) - set(FAMILIES))
+    if not non_catalog:
+        return knowledge
+    _log.warning("dropping non-catalog families from graph knowledge: %s", non_catalog)
+    return {
+        family: symptoms for family, symptoms in knowledge.items() if family in FAMILIES
+    }
 
 
 def _alert_text(request: AlertAnalysisRequest) -> str:
