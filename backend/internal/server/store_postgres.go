@@ -1774,6 +1774,49 @@ func (s *Store) persistKnowledgeReviewRevalidationLocked(candidate *KnowledgeCan
 	return true
 }
 
+func (s *Store) persistKnowledgeCandidateValidationRefreshLocked(candidate *KnowledgeCandidate, event *KnowledgeEvent) bool {
+	if s.db == nil || !s.dbReady {
+		return true
+	}
+	if candidate == nil || event == nil {
+		return false
+	}
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("Failed to start knowledge candidate validation refresh transaction: %v", err)
+		return false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates
+		SET validation_error = $1, trace = $2, payload = $3, updated_at = $4
+		WHERE candidate_id = $5 AND status = 'validation_failed'`,
+		candidate.ValidationError, mustJSON(candidate.Trace), mustJSON(candidate.Payload),
+		candidate.UpdatedAt, candidate.CandidateID)
+	if err != nil {
+		log.Printf("Failed to refresh knowledge candidate validation %s: %v", candidate.CandidateID, err)
+		return false
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return false
+	}
+	if !persistKnowledgeEventTx(ctx, tx, event) {
+		return false
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit knowledge candidate validation refresh: %v", err)
+		return false
+	}
+	committed = true
+	return true
+}
+
 func (s *Store) persistKnowledgeMirrorLocked(pkg *KnowledgePackage) bool {
 	if s.db == nil || !s.dbReady {
 		return true

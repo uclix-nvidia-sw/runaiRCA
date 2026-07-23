@@ -307,6 +307,28 @@ func (s *Store) generateKnowledgeCandidateForReviewedRunLocked(runID, analysisHa
 		// same case before recording the fresh one.
 		s.supersedeStaleCaseCandidatesLocked(snapshot.CaseID, candidate.CandidateID, time.Now().UTC())
 		existing := s.knowledgeCandidates[candidate.CandidateID]
+		if existing != nil && existing.Status == knowledgeCandidateValidationFailed && candidate.Status == knowledgeCandidateValidationFailed {
+			now := time.Now().UTC()
+			refreshed := cloneKnowledgeCandidate(existing)
+			refreshed.ValidationError = candidate.ValidationError
+			refreshed.Trace = cloneCaseSnapshotPayload(candidate.Trace)
+			refreshed.Payload = cloneCaseSnapshotPayload(candidate.Payload)
+			refreshed.UpdatedAt = now
+			hydrateKnowledgeCandidate(&refreshed)
+			event := s.newKnowledgeEventLocked(
+				refreshed.CandidateID,
+				"",
+				"candidate_validation_refreshed",
+				"system",
+				"candidate validation reason refreshed after operator evaluation",
+				now,
+			)
+			if s.persistKnowledgeCandidateValidationRefreshLocked(&refreshed, event) {
+				*existing = refreshed
+				s.knowledgeEvents[event.EventID] = event
+			}
+			continue
+		}
 		if existing != nil &&
 			existing.Status == knowledgeCandidateValidationFailed &&
 			existing.ValidationError == knowledgeReviewInvalidationError &&
