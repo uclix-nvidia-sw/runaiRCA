@@ -317,6 +317,55 @@ func TestIncidentLifecycleActionContractsAndEvents(t *testing.T) {
 	}
 }
 
+func TestIncidentBulkActionsAndEmptyTrash(t *testing.T) {
+	server := NewServer()
+	first, _ := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "bulk-first"}, Alert{
+		Status: "firing", Labels: map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "First bulk incident"}, Fingerprint: "fp-bulk-first",
+	})
+	second, _ := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "bulk-second"}, Alert{
+		Status: "firing", Labels: map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Second bulk incident"}, Fingerprint: "fp-bulk-second",
+	})
+
+	bulk := func(action string, ids ...string) {
+		t.Helper()
+		body, err := json.Marshal(map[string]any{"incident_ids": ids, "action": action})
+		if err != nil {
+			t.Fatalf("marshal bulk request: %v", err)
+		}
+		rec := httptest.NewRecorder()
+		server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/incidents/bulk", bytes.NewReader(body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("bulk %s expected 200, got %d: %s", action, rec.Code, rec.Body.String())
+		}
+	}
+
+	bulk("archive", first.IncidentID, second.IncidentID, first.IncidentID)
+	if server.store.incidents[first.IncidentID].ArchivedAt == nil || server.store.incidents[second.IncidentID].ArchivedAt == nil {
+		t.Fatalf("bulk archive did not archive both incidents")
+	}
+	bulk("trash", first.IncidentID, second.IncidentID)
+	if server.store.incidents[first.IncidentID].DeletedAt == nil || server.store.incidents[second.IncidentID].DeletedAt == nil {
+		t.Fatalf("bulk trash did not move both incidents to trash")
+	}
+
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/incidents/trash", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("empty trash expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if server.store.incidents[first.IncidentID] != nil || server.store.incidents[second.IncidentID] != nil {
+		t.Fatalf("empty trash did not permanently delete all trashed incidents")
+	}
+
+	rec = httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/incidents/bulk", strings.NewReader(`{"action":"archive"}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bulk request without ids expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestAPIErrorShapeFor400And404(t *testing.T) {
 	server := NewServer()
 	tests := []struct {

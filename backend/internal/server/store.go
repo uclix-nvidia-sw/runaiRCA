@@ -1015,6 +1015,24 @@ func (s *Store) PurgeExpiredTrash(retention time.Duration, now time.Time) int {
 	return purged
 }
 
+func (s *Store) EmptyTrash() []string {
+	ids := []string{}
+	s.mu.RLock()
+	for id, incident := range s.incidents {
+		if incident != nil && incident.DeletedAt != nil {
+			ids = append(ids, id)
+		}
+	}
+	s.mu.RUnlock()
+	deleted := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if s.HardDeleteIncident(id) {
+			deleted = append(deleted, id)
+		}
+	}
+	return deleted
+}
+
 func (s *Store) removeIncidentIndexesLocked(incidentID string) {
 	incident := s.incidents[incidentID]
 	if incident != nil && s.incidentByKey[incident.CorrelationKey] == incidentID {

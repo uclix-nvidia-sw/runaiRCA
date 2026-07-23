@@ -488,6 +488,10 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleAlertmanager(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/incidents":
 		s.handleIncidentList(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/incidents/bulk":
+		s.handleIncidentBulkAction(w, r)
+	case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/incidents/trash":
+		s.handleEmptyIncidentTrash(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/incidents/"):
 		s.handleIncident(w, r)
 	case (r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete) &&

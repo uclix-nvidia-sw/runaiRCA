@@ -80,6 +80,41 @@
         }
       }
     },
+    "/api/v1/incidents/bulk": {
+      "post": {
+        "tags": ["Incidents"],
+        "summary": "Apply a lifecycle action to multiple incidents",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["incident_ids", "action"],
+                "properties": {
+                  "incident_ids": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+                  "action": { "type": "string", "enum": ["archive", "unarchive", "restore", "trash", "delete_permanently"] }
+                }
+              },
+              "example": { "incident_ids": ["inc_5f3a9c2b", "inc_8d7e6f5a"], "action": "archive" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Lifecycle action applied", "content": { "application/json": { "example": { "status": "ok", "data": { "processed_ids": ["inc_5f3a9c2b", "inc_8d7e6f5a"] } } } } },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/incidents/trash": {
+      "delete": {
+        "tags": ["Incidents"],
+        "summary": "Permanently empty the incident trash",
+        "responses": {
+          "200": { "description": "All trashed incidents permanently deleted", "content": { "application/json": { "example": { "status": "ok", "data": { "deleted_count": 2 } } } } }
+        }
+      }
+    },
     "/api/v1/incidents/{id}": {
       "get": {
         "tags": ["Incidents"],

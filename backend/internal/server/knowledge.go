@@ -392,6 +392,13 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 	if err != "" {
 		return nil, err
 	}
+	evidenceSource := ""
+	if len(support) == 0 {
+		if fallback := harnessClaimFallbackSupport(harness, snapshot.RootCauseFamily); len(fallback) > 0 {
+			support = fallback
+			evidenceSource = "harness_claim_fallback"
+		}
+	}
 	if len(support) == 0 {
 		return nil, "missing supporting evidence"
 	}
@@ -430,6 +437,9 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 			"probe_template_ids": map[string]any{family: probeTemplateIDs},
 		},
 	}
+	if evidenceSource != "" {
+		payload["evidence_source"] = evidenceSource
+	}
 	if context, ok := card["context"].(map[string]string); ok && len(context) > 0 {
 		payload["context"] = cloneMap(context)
 	}
@@ -437,6 +447,32 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 		payload["context"] = cloneCaseSnapshotPayload(context)
 	}
 	return payload, ""
+}
+
+// harnessClaimFallbackSupport preserves a validated harness claim when the
+// trace writer failed to copy its evidence_for links into the selected
+// hypothesis. The fallback is deliberately narrow: only the first claim,
+// only the final family, and only claims without any contradiction qualify.
+func harnessClaimFallbackSupport(harness map[string]any, finalFamily string) map[string]bool {
+	claims, _ := harness["claims"].([]any)
+	if len(claims) == 0 {
+		return nil
+	}
+	claim, ok := claims[0].(map[string]any)
+	if !ok || strings.TrimSpace(stringValue(claim["family"])) != strings.TrimSpace(finalFamily) {
+		return nil
+	}
+	supporting := sanitizeStringSlice(claim["supporting_evidence"])
+	contradicting := append([]string{}, sanitizeStringSlice(claim["contradicting_evidence"])...)
+	contradicting = append(contradicting, sanitizeStringSlice(claim["contradiction_evidence_ids"])...)
+	if len(supporting) == 0 || len(contradicting) > 0 {
+		return nil
+	}
+	support := make(map[string]bool, len(supporting))
+	for _, evidenceID := range supporting {
+		support[evidenceID] = true
+	}
+	return support
 }
 
 func harnessHardGatesPassed(harness map[string]any) bool {

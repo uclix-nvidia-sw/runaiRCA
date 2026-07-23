@@ -373,16 +373,16 @@ export function EvaluationPanel({
                 onChange={(event) => dispatch({ type: 'operator_confirmed_changed', value: event.target.checked })}
                 disabled={!evaluationReady || busy}
               />
-              <span>Operator-confirm this diagnosis (non-reproducible incident)</span>
+              <span>Operator-confirm diagnosis · 재현되지 않은 장애를 운영자가 확정</span>
             </span>
             <small>
-              Promotes an evidence-backed hypothesis that never reached “supported” (e.g. probes stayed inconclusive). Requires a rationale in Notes below. Cases with no supporting evidence are still refused.
+              프로브가 불확실해 “supported”에 도달하지 못한 근거 기반 가설을 운영자가 확정합니다. 아래 확정 근거를 입력해야 하며, 지지 증거가 전혀 없는 사건은 계속 거부됩니다.
             </small>
           </label>
         )}
 
         <label className="evaluation-field evaluation-notes">
-          <span>Notes{confirmActive ? ' — required: confirmation rationale' : ''}</span>
+          <span>Notes{confirmActive ? ' — 필수: 확정 근거 (운영자 확정 시)' : ''}</span>
           <textarea
             value={notes}
             onChange={(event) => dispatch({ type: 'notes_changed', value: event.target.value })}

@@ -11,6 +11,7 @@ export type FeedbackVote = 'up' | 'down' | 'none';
 export type PageRequest = { limit: number; offset: number };
 export type PageResult<T> = { items: T[]; page: PageInfo };
 export type IncidentView = 'active' | 'archived' | 'trash';
+export type BulkIncidentAction = 'archive' | 'unarchive' | 'restore' | 'trash' | 'delete_permanently';
 export type IncidentFilters = {
   status?: string;
   severity?: string;
@@ -160,6 +161,14 @@ export async function restoreIncident(id: string): Promise<void> {
 export async function deleteIncident(id: string, permanent = false): Promise<void> {
   const suffix = permanent ? '?permanent=true' : '';
   await mutate('DELETE', `/api/v1/incidents/${encodeURIComponent(id)}${suffix}`);
+}
+
+export async function bulkIncidentAction(incidentIDs: string[], action: BulkIncidentAction): Promise<void> {
+  await write('/api/v1/incidents/bulk', { incident_ids: incidentIDs, action });
+}
+
+export async function emptyIncidentTrash(): Promise<void> {
+  await mutate('DELETE', '/api/v1/incidents/trash');
 }
 
 export async function fetchRecurrenceStats(days = 7): Promise<RecurrenceStats> {

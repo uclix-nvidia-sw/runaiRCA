@@ -17,6 +17,74 @@ type rcaPinRequest struct {
 	Pinned *bool `json:"pinned"`
 }
 
+type incidentBulkActionRequest struct {
+	IncidentIDs []string `json:"incident_ids"`
+	Action      string   `json:"action"`
+}
+
+func (s *Server) handleIncidentBulkAction(w http.ResponseWriter, r *http.Request) {
+	var req incidentBulkActionRequest
+	if status, err := decodeJSONBody(w, r, &req, maxJSONBodyBytes); err != nil {
+		writeError(w, status, err.Error())
+		return
+	}
+	req.Action = strings.TrimSpace(req.Action)
+	seen := make(map[string]struct{}, len(req.IncidentIDs))
+	ids := make([]string, 0, len(req.IncidentIDs))
+	for _, id := range req.IncidentIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			if _, exists := seen[id]; !exists {
+				seen[id] = struct{}{}
+				ids = append(ids, id)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		writeError(w, http.StatusBadRequest, "incident_ids is required")
+		return
+	}
+	if req.Action != "archive" && req.Action != "unarchive" && req.Action != "restore" && req.Action != "trash" && req.Action != "delete_permanently" {
+		writeError(w, http.StatusBadRequest, "invalid bulk incident action")
+		return
+	}
+
+	processed := make([]string, 0, len(ids))
+	for _, id := range ids {
+		var incident *Incident
+		var ok bool
+		switch req.Action {
+		case "archive":
+			incident, ok = s.store.ArchiveIncident(id, true)
+		case "unarchive":
+			incident, ok = s.store.ArchiveIncident(id, false)
+		case "restore":
+			incident, ok = s.store.RestoreIncident(id)
+		case "trash":
+			incident, ok = s.store.SoftDeleteIncident(id)
+		case "delete_permanently":
+			ok = s.store.HardDeleteIncident(id)
+		}
+		if !ok {
+			continue
+		}
+		processed = append(processed, id)
+		if req.Action == "delete_permanently" {
+			s.hub.Broadcast(incidentUpdatedEvent(id, "delete_permanent", "", nil, nil))
+			continue
+		}
+		s.hub.Broadcast(incidentUpdatedEvent(id, req.Action, incident.Status, incident.ArchivedAt, incident.DeletedAt))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "processed_ids": processed})
+}
+
+func (s *Server) handleEmptyIncidentTrash(w http.ResponseWriter, _ *http.Request) {
+	ids := s.store.EmptyTrash()
+	for _, id := range ids {
+		s.hub.Broadcast(incidentUpdatedEvent(id, "delete_permanent", "", nil, nil))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "deleted_count": len(ids)})
+}
+
 func (s *Server) handleIncident(w http.ResponseWriter, r *http.Request) {
 	rest := pathPart(r.URL.Path, "/api/v1/incidents/")
 	parts := strings.Split(strings.Trim(rest, "/"), "/")

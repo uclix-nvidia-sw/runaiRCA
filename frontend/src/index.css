@@ -463,6 +463,21 @@ tbody tr:active td {
   background: #fbfdf8;
 }
 
+.operations-table tbody tr.is-selected td {
+  background: #f1f8e7;
+}
+
+.selection-column {
+  width: 2.75rem;
+  text-align: center !important;
+}
+
+.selection-column input {
+  width: 1rem;
+  height: 1rem;
+  accent-color: var(--nvidia-dark);
+}
+
 .operations-table tbody tr:active td {
   background: var(--pressed-soft);
 }
@@ -918,27 +933,31 @@ tbody tr:active td {
 }
 
 .incidents-table th:nth-child(1) {
-  width: 36%;
+  width: 4%;
 }
 
-.incidents-table th:nth-child(2),
-.incidents-table th:nth-child(3) {
+.incidents-table th:nth-child(2) {
+  width: 32%;
+}
+
+.incidents-table th:nth-child(3),
+.incidents-table th:nth-child(4) {
   width: 9%;
 }
 
-.incidents-table th:nth-child(4) {
+.incidents-table th:nth-child(5) {
   width: 12%;
 }
 
-.incidents-table th:nth-child(5) {
+.incidents-table th:nth-child(6) {
   width: 7%;
 }
 
-.incidents-table th:nth-child(6) {
+.incidents-table th:nth-child(7) {
   width: 18%;
 }
 
-.incidents-table th:nth-child(7) {
+.incidents-table th:nth-child(8) {
   width: 9%;
 }
 
@@ -1380,6 +1399,44 @@ td span.occurrence-pill {
   min-height: 1.25rem;
   min-width: 0;
   white-space: nowrap;
+}
+
+.bulk-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  min-height: 3.25rem;
+  border-bottom: 1px solid var(--line);
+  padding: 0.45rem 0.1rem 0.7rem;
+}
+
+.bulk-selection-count,
+.bulk-selection-hint,
+.bulk-clear-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 800;
+}
+
+.bulk-selection-count {
+  color: var(--ink);
+}
+
+.bulk-clear-button {
+  border: 0;
+  background: transparent;
+  padding: 0.3rem;
+}
+
+.bulk-clear-button:hover:not(:disabled) {
+  color: var(--ink);
+}
+
+.bulk-empty-trash {
+  margin-left: auto;
 }
 
 .pagination-bar {
@@ -2822,16 +2879,17 @@ td span.occurrence-pill {
 }
 
 .evaluation-confirm {
-  border: 1px solid var(--warning);
+  border: 1px solid #bfdbfe;
   border-radius: 0.5rem;
   padding: 0.6rem 0.8rem;
-  background: #fdfaf1;
+  background: #f5f9ff;
 }
 
 .evaluation-confirm .evaluation-confirm-row {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  color: #1d4ed8;
   font-weight: 650;
 }
 
