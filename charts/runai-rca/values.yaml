@@ -572,7 +572,7 @@ frontend:
     port: 80
     # Pin the NodePort (used only when type: NodePort) so upgrades keep the
     # same URL. A re-rolled port changes the browser origin, which used to
-    # reset the operator's evaluation identity and break bookmarks.
+    # reset the operator's evaluation identity and break existing bookmarks.
     nodePort: 30810
   config:
     apiBaseUrl: ""
