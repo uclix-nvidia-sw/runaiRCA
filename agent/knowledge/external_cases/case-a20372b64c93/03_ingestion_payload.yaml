@@ -1,0 +1,273 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:a20372b64c93
+  source_revision_hash: sha256:41b58e4611db5740a2bce33ec96a6f774f8ab9dc05b130919d5454932d7125c5
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_with_warnings
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+incident:
+  title: external-workload-integrator restarts after Run:ai 2.23.30 upgrade
+  masked_summary: After a production Run:ai control-plane and cluster upgrade from
+    2.23.17 to 2.23.30, external-workload-integrator repeatedly restarted. NVIDIA
+    Support diagnosed a known 2.23.30 nil pointer dereference bug and proposed 2.23.31
+    as the permanent fix. Upgrade execution and post-fix verification were not supplied.
+  status: unresolved
+  occurred_at: '2026-01-28'
+  resolved_at: null
+  family: runai_control_plane_error
+  family_confidence: medium
+  observed_mechanism: After the 2.23.30 upgrade, the external-workload-integrator
+    process was reported to panic and the pod restart count increased from 8 to 9.
+  observed_mechanism_confidence: medium
+  confirmed_mechanism: NVIDIA Support's final diagnosis attributed the crashes to
+    a known nil pointer dereference bug in Run:ai 2.23.30 and stated that it was fixed
+    in 2.23.31.
+  confirmed_mechanism_confidence: medium
+searchable_context:
+  normalized_symptoms:
+  - external-workload-integrator pod repeatedly restarts after Run:ai upgrade
+  - Go process panic reported in external-workload-integrator logs
+  - external workload tracking status sync interruption during each crash
+  metric_signatures: []
+  error_signatures:
+  - nil pointer dereference
+  issue_references: []
+  canonical_component_tokens:
+  - external-workload-integrator
+  version_tokens:
+  - runai-control-plane:2.23.30
+  - runai-cluster:2.23.30
+  - runai:2.23.31
+  trigger_tokens:
+  - upgrade from 2.23.17 to 2.23.30
+  - normal operations (Support-reported)
+  retrieval_keywords:
+  - external-workload-integrator
+  - nil pointer dereference
+  - Run:ai 2.23.30
+  - Run:ai 2.23.31
+  - repeated pod restart
+  - external workload tracking
+evidence_refs:
+- evidence_id: E001
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer reported upgrading production Run:ai control plane and
+    cluster from 2.23.17 to 2.23.30.
+  supports:
+  - F001
+- evidence_id: E002
+  source_message_ids:
+  - M001
+  source_actor: system
+  evidence_kind: raw_command_output
+  artifact_availability: quoted_in_transcript
+  masked_summary: Embedded Helm output showed both Run:ai releases deployed at 2.23.30.
+  supports:
+  - F001
+- evidence_id: E003
+  source_message_ids:
+  - M001
+  source_actor: system
+  evidence_kind: raw_command_output
+  artifact_availability: quoted_in_transcript
+  masked_summary: Masked embedded pod output showed external-workload-integrator Running
+    with restart count 8.
+  supports:
+  - F001
+- evidence_id: E004
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Customer reported that unavailable pod logs showed the Go process
+    panicking and causing restarts.
+  supports:
+  - F001
+- evidence_id: E005
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Customer referenced an attached runai-adm collect-logs archive that
+    is not supplied locally.
+  supports:
+  - A001
+- evidence_id: E006
+  source_message_ids:
+  - M002
+  source_actor: system
+  evidence_kind: raw_command_output
+  artifact_availability: quoted_in_transcript
+  masked_summary: Masked embedded kubectl output showed restart count 8 and no new
+    restart for about 60 minutes.
+  supports:
+  - F001
+  - F003
+  - H001
+- evidence_id: E007
+  source_message_ids:
+  - M002
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Customer asked whether an expected post-upgrade stabilization period
+    explained the temporary quiet interval.
+  supports: []
+- evidence_id: E008
+  source_message_ids:
+  - M003
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support preliminarily proposed a 2.23.30 nil pointer dereference
+    bug and said internal checking remained.
+  supports: []
+- evidence_id: E009
+  source_message_ids:
+  - M004
+  source_actor: system
+  evidence_kind: raw_command_output
+  artifact_availability: quoted_in_transcript
+  masked_summary: Masked embedded pod output later showed restart count 9 and a restart
+    about six minutes earlier.
+  supports:
+  - F001
+  - F003
+- evidence_id: E010
+  source_message_ids:
+  - M004
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Customer referenced newly shared dump logs that are not supplied
+    locally.
+  supports:
+  - A001
+- evidence_id: E011
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support finalized that a known 2.23.30 nil pointer dereference bug
+    caused the crashes and was fixed in 2.23.31.
+  supports:
+  - F002
+  - H002
+  - A001
+- evidence_id: E012
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support proposed upgrading to 2.23.31 as the only reliable fix;
+    no execution or outcome was reported.
+  supports:
+  - F005
+  - A002
+- evidence_id: E013
+  source_message_ids:
+  - M007
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support said submission and scheduling were not directly affected,
+    while external workload tracking paused for about 30 seconds per crash.
+  supports:
+  - F004
+- evidence_id: E014
+  source_message_ids:
+  - M007
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support said normal operations regularly triggered the bug.
+  supports:
+  - F004
+- evidence_id: E015
+  source_message_ids:
+  - M010
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Customer requested case closure without reporting the proposed upgrade
+    or post-fix verification.
+  supports:
+  - F005
+- evidence_id: E016
+  source_message_ids:
+  - M009
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support later repeated that 2.23.31 included the external-workload-integrator
+    nil-pointer crash fix; no release note is supplied.
+  supports:
+  - F002
+  - H002
+historical_actions:
+- action_id: A001
+  normalized_action: Collect and share runai-adm diagnostic logs and a later dump-log
+    set.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E005
+  - E010
+  - E011
+- action_id: A002
+  normalized_action: Upgrade Run:ai to 2.23.31, which Support proposed as the only
+    reliable permanent fix; execution and outcome require verification.
+  outcome: unknown_outcome
+  verified: false
+  evidence_ids:
+  - E012
+knowledge_links:
+  known_issue_matches: []
+  failure_mode_matches:
+  - catalog_entry: Scheduler Or Reconcile Error
+    catalog_family: runai_control_plane_error
+    match_type: partial
+    confidence: low
+  family_candidates:
+  - family: runai_control_plane_error
+    confidence: medium
+  - family: platform_lifecycle_change
+    confidence: low
+historical_use:
+  context_class: unresolved_context
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - action_reference
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: The case contains a Support final diagnosis and a proposed fixed
+    version, but no execution or post-fix verification; it may guide investigation
+    only as labelled unresolved historical context.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false

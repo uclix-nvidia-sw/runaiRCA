@@ -50,6 +50,11 @@ flowchart TB
   HAR --> RESP([RCA + evidence trail])
 ```
 
+`trace-v3` is the only public and persisted reasoning contract. It records the
+exact `selected_hypothesis_id`; an open-world selection also carries its
+`mechanism_fingerprint`. The internal hypothesis ledger remains transient, and
+operational budget stops remain in logs/progress events rather than the trace.
+
 The whole run is wrapped in `asyncio.wait_for(analyze, ANALYSIS_DEADLINE_SECONDS)`
 (default **900s / 15 min**). On overrun it returns a graceful degraded report,
 never a hang. Per-step ceilings are generous *on purpose* (deep evidence beats

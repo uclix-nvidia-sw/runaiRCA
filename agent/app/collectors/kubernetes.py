@@ -3776,7 +3776,21 @@ def _container_lifecycle_artifact(
         and not target.resolved_at
         and any(_container_is_waiting_with_restarts(item) for item in container_diagnostics)
     )
-    if target_identity_verified and (terminated_times or current_restart_loop):
+    # A container stuck in a terminal waiting reason (CreateContainerConfigError,
+    # ImagePullBackOff, ...) is a definite, present fault even with restartCount=0
+    # and no termination — the "pod stays stuck, does NOT crash-loop" shape the
+    # knowledge base already documents.  Without this it was typed unknown/partial
+    # and the ranker never saw a qualifying kubernetes fact.
+    waiting_reason = _target_waiting_fault_reason(container_diagnostics)
+    current_waiting_fault = (
+        target_identity_verified
+        and bool(time_range)
+        and not target.resolved_at
+        and bool(waiting_reason)
+    )
+    if target_identity_verified and (
+        terminated_times or current_restart_loop or current_waiting_fault
+    ):
         polarity, coverage = "present", "scoped"
     else:
         polarity, coverage = "unknown", "partial"
@@ -3789,6 +3803,10 @@ def _container_lifecycle_artifact(
         "target_identity_verified": target_identity_verified,
         "observation_window": time_range or {},
     }
+    # Hoist the raw kubelet reason so the ranker matches it as a structured
+    # token (closed enum), not by substring-grepping the summary text.
+    if waiting_reason:
+        observation["container_reason"] = waiting_reason
     if target_identity_verified:
         observation["observed_entity"] = {
             "kind": "pod",
@@ -3879,6 +3897,25 @@ def _container_termination_times_in_range(
         if parsed is not None and start <= parsed <= end:
             timestamps.append((parsed, str(finished_at)))
     return sorted(timestamps, key=lambda item: item[0])
+
+
+def _target_waiting_fault_reason(container_diagnostics: list[dict[str, object]]) -> str:
+    """The target container's current terminal waiting reason, casefolded, if any.
+
+    Only reasons in the closed ``_FOLLOWUP_WAITING`` fault set qualify — a benign
+    transient like ContainerCreating is never a fault.  Returned raw (not prose)
+    so the ranker classifies it by exact token against its reason->family table.
+    """
+    for diagnostic in container_diagnostics:
+        if not isinstance(diagnostic, dict):
+            continue
+        state = diagnostic.get("state")
+        if not isinstance(state, dict) or str(state.get("phase") or "") != "waiting":
+            continue
+        reason = str(state.get("reason") or "").strip().casefold()
+        if reason in _FOLLOWUP_WAITING:
+            return reason
+    return ""
 
 
 def _container_is_waiting_with_restarts(diagnostic: dict[str, object]) -> bool:

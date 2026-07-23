@@ -9,6 +9,7 @@ import (
 	"log"
 	"math"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -471,10 +472,157 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			return pgvectorReady
 		}
 	}
+	if err := s.migrateLegacyReasoningTrace(ctx); err != nil {
+		log.Printf("Postgres legacy reasoning-trace migration failed: %v", err)
+		s.dbReady = false
+		return pgvectorReady
+	}
 	if pgvectorReady {
 		s.ensureVectorColumn(ctx)
+		s.reembedOnEmbeddingConfigChange(ctx)
 	}
 	return pgvectorReady
+}
+
+func (s *Store) migrateLegacyReasoningTrace(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	runResult, err := tx.ExecContext(ctx, `
+		UPDATE analysis_runs
+		SET metadata = metadata
+				#- '{reasoning_trace_v2}'
+				#- '{reasoning_trace_v3,stop_reason}'
+				#- '{trace_v3,stop_reason}',
+			updated_at = now()
+		WHERE metadata ? 'reasoning_trace_v2'
+			OR metadata #> '{reasoning_trace_v3,stop_reason}' IS NOT NULL
+			OR metadata #> '{trace_v3,stop_reason}' IS NOT NULL`)
+	if err != nil {
+		return fmt.Errorf("clean analysis_runs metadata: %w", err)
+	}
+	snapshotResult, err := tx.ExecContext(ctx, `
+		UPDATE rca_case_snapshots
+		SET snapshot = snapshot
+				#- '{metadata,reasoning_trace_v2}'
+				#- '{metadata,reasoning_trace_v3,stop_reason}'
+				#- '{metadata,trace_v3,stop_reason}',
+			updated_at = now()
+		WHERE snapshot #> '{metadata,reasoning_trace_v2}' IS NOT NULL
+			OR snapshot #> '{metadata,reasoning_trace_v3,stop_reason}' IS NOT NULL
+			OR snapshot #> '{metadata,trace_v3,stop_reason}' IS NOT NULL`)
+	if err != nil {
+		return fmt.Errorf("clean case snapshot metadata: %w", err)
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT candidate_id, knowledge_fingerprint, trace, payload
+		FROM knowledge_candidates
+		WHERE trace ? 'stop_reason'
+		FOR UPDATE`)
+	if err != nil {
+		return fmt.Errorf("load legacy knowledge candidate traces: %w", err)
+	}
+	type candidateUpdate struct {
+		id          string
+		fingerprint string
+		trace       map[string]any
+		contentHash string
+	}
+	updates := []candidateUpdate{}
+	for rows.Next() {
+		var id, fingerprint string
+		var traceRaw, payloadRaw []byte
+		if err := rows.Scan(&id, &fingerprint, &traceRaw, &payloadRaw); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan legacy knowledge candidate: %w", err)
+		}
+		trace, payload := map[string]any{}, map[string]any{}
+		if err := json.Unmarshal(traceRaw, &trace); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("decode candidate %s trace: %w", id, err)
+		}
+		if err := json.Unmarshal(payloadRaw, &payload); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("decode candidate %s payload: %w", id, err)
+		}
+		contentHash, changed := cleanLegacyKnowledgeCandidateTrace(trace, payload)
+		if !changed {
+			continue
+		}
+		updates = append(updates, candidateUpdate{
+			id:          id,
+			fingerprint: fingerprint,
+			trace:       trace,
+			contentHash: contentHash,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate legacy knowledge candidate traces: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close legacy knowledge candidate rows: %w", err)
+	}
+	for _, update := range updates {
+		var conflictingID string
+		err := tx.QueryRowContext(ctx, `
+			SELECT candidate_id
+			FROM knowledge_candidates
+			WHERE knowledge_fingerprint = $1
+				AND content_hash = $2
+				AND candidate_id <> $3
+			LIMIT 1`,
+			update.fingerprint, update.contentHash, update.id,
+		).Scan(&conflictingID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("check candidate %s content-hash collision: %w", update.id, err)
+		}
+		if conflictingID != "" {
+			return fmt.Errorf(
+				"candidate %s becomes duplicate of %s after removing stop_reason",
+				update.id, conflictingID,
+			)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE knowledge_candidates
+			SET trace = $1, content_hash = $2, updated_at = now()
+			WHERE candidate_id = $3`,
+			mustJSON(update.trace), update.contentHash, update.id,
+		); err != nil {
+			return fmt.Errorf("clean candidate %s trace: %w", update.id, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	runCount, _ := runResult.RowsAffected()
+	snapshotCount, _ := snapshotResult.RowsAffected()
+	log.Printf(
+		"Postgres legacy reasoning-trace migration: analysis_runs=%d case_snapshots=%d knowledge_candidates=%d",
+		runCount, snapshotCount, len(updates),
+	)
+	return nil
+}
+
+func cleanLegacyKnowledgeCandidateTrace(
+	trace, payload map[string]any,
+) (string, bool) {
+	if _, exists := trace["stop_reason"]; !exists {
+		return "", false
+	}
+	delete(trace, "stop_reason")
+	return knowledgeContentHash(trace, payload), true
 }
 
 // ensureVectorColumn adds the dense pgvector column and a cosine index used by
@@ -649,7 +797,7 @@ func (s *Store) loadMemories(ctx context.Context) {
 	rows, err := s.db.QueryContext(
 		ctx,
 		`SELECT incident_id, alert_id, title, severity, status, analysis_summary,
-		        analysis_detail, labels, vector_json, created_at
+		        analysis_detail, labels, created_at
 		   FROM incident_embeddings`,
 	)
 	if err != nil {
@@ -661,7 +809,7 @@ func (s *Store) loadMemories(ctx context.Context) {
 	defer s.mu.Unlock()
 	for rows.Next() {
 		var memory IncidentMemory
-		var labelsRaw, vectorRaw []byte
+		var labelsRaw []byte
 		if err := rows.Scan(
 			&memory.IncidentID,
 			&memory.AlertID,
@@ -671,20 +819,19 @@ func (s *Store) loadMemories(ctx context.Context) {
 			&memory.AnalysisSummary,
 			&memory.AnalysisDetail,
 			&labelsRaw,
-			&vectorRaw,
 			&memory.CreatedAt,
 		); err != nil {
 			log.Printf("Failed to scan incident memory: %v", err)
 			continue
 		}
 		_ = json.Unmarshal(labelsRaw, &memory.Labels)
-		_ = json.Unmarshal(vectorRaw, &memory.Vector)
 		if memory.Labels == nil {
 			memory.Labels = map[string]string{}
 		}
-		if memory.Vector == nil {
-			memory.Vector = textVector(memoryText(memory))
-		}
+		// Recompute the sparse vector from current code rather than trusting the
+		// persisted vector_json, so similarity-basis changes take effect on
+		// restart without a re-embed migration.
+		memory.Vector = textVector(memorySignatureText(memory))
 		s.memories[first(memory.AlertID, memory.IncidentID)] = &memory
 	}
 }
@@ -769,6 +916,186 @@ func (s *Store) dbSearchMemory(query string, limit int) ([]SimilarIncident, bool
 	}
 	s.mu.RUnlock()
 	return dedupeSimilarByIncident(filtered, limit), true
+}
+
+// dbSearchSimilarIncidentsLocked powers the incident-detail "Similar Incidents"
+// panel with dense pgvector search over RCA content. It embeds the current
+// incident's analysis text (passed as queryText, built symmetric to memoryText),
+// finds nearest incident memories, and re-ranks by a hybrid of semantic distance
+// + shared root-cause family + workload-identity label overlap. Unlike
+// dbSearchMemory the caller already holds s.mu (this is a *Locked helper invoked
+// from IncidentDetail), so it must not lock again. Returns (nil,false) to fall
+// back to the in-process sparse identity-signature search.
+func (s *Store) dbSearchSimilarIncidentsLocked(
+	queryText, excludeIncidentID, queryFamily string,
+	queryLabels map[string]string,
+	limit int,
+) ([]SimilarIncident, bool) {
+	if s.db == nil || !s.dbReady || !s.pgvectorReady || strings.TrimSpace(queryText) == "" {
+		return nil, false
+	}
+	literal := embeddingLiteral(s.embed(queryText))
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	// Over-fetch so the family/label re-rank and approval filter have candidates
+	// to work with before we trim to limit.
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT incident_id, alert_id, title, severity, status, analysis_summary,
+		        analysis_detail, labels, created_at, (embedding <=> $1::vector) AS distance
+		   FROM incident_embeddings
+		  WHERE embedding IS NOT NULL AND incident_id <> $2
+		  ORDER BY embedding <=> $1::vector
+		  LIMIT $3`,
+		literal, excludeIncidentID, limit*4,
+	)
+	if err != nil {
+		log.Printf("pgvector similar-incident search failed, falling back to jsonb: %v", err)
+		return nil, false
+	}
+	defer rows.Close()
+	results := make([]SimilarIncident, 0, limit*4)
+	for rows.Next() {
+		var item SimilarIncident
+		var detail string
+		var labelsRaw []byte
+		var distance float64
+		if err := rows.Scan(
+			&item.IncidentID, &item.AlertID, &item.Title, &item.Severity, &item.Status,
+			&item.AnalysisSummary, &detail, &labelsRaw, &item.CreatedAt, &distance,
+		); err != nil {
+			log.Printf("Failed to scan pgvector similar-incident row: %v", err)
+			return nil, false
+		}
+		incident := s.incidents[item.IncidentID]
+		if !incidentUserApproved(incident) || incidentDeleted(incident) {
+			continue
+		}
+		_ = json.Unmarshal(labelsRaw, &item.Labels)
+		if item.Labels == nil {
+			item.Labels = map[string]string{}
+		}
+		family := ""
+		if run := s.latestAnalysisRunForIncidentLocked(item.IncidentID); run != nil {
+			family = run.RootCauseFamily
+		}
+		score := (1 - distance) + familyBonus(queryFamily, family) + labelSimilarityBonus(queryLabels, item.Labels)
+		if score <= 0.05 {
+			continue
+		}
+		if score > 1 {
+			score = 1
+		}
+		summary := s.feedbackSummaryLocked("incident", item.IncidentID)
+		item.Similarity = math.Round(score*1000) / 1000
+		item.AnalysisDetail = excerpt(detail, 900)
+		item.RootCauseFamily = family
+		item.Approved = incident.UserApprovedAt != nil
+		item.PositiveFeedback = summary.Positive
+		item.NegativeFeedback = summary.Negative
+		item.CommentCount = len(summary.Comments)
+		results = append(results, item)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("pgvector similar-incident iteration failed: %v", err)
+		return nil, false
+	}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Similarity == results[j].Similarity {
+			return results[i].CreatedAt.After(results[j].CreatedAt)
+		}
+		return results[i].Similarity > results[j].Similarity
+	})
+	return dedupeSimilarByIncident(results, limit), true
+}
+
+// reembedOnEmbeddingConfigChange rebuilds the dense embedding column whenever the
+// embedding basis changes (model swapped in via EMBEDDING_URL, dimension changed,
+// or memoryText's field set bumped). The `embedding` column is pure derived data
+// — every input field lives in the same row — so dropping and recomputing it is
+// safe and loses nothing. Without this, configuring a real model writes vectors
+// into a stale-basis/stale-dimension column and dense search returns garbage.
+// ponytail: re-embeds every row synchronously at startup; fine for one-row-per-
+// incident tables, batch/async if incident_embeddings ever grows large.
+func (s *Store) reembedOnEmbeddingConfigChange(_ context.Context) {
+	// Use a dedicated, generous context rather than the 5s connect/schema context:
+	// with a real embedding model the re-embed makes one HTTP call per row, which
+	// easily exceeds 5s. A partial re-embed under a short deadline would leave the
+	// column half-rebuilt and re-thrash every restart.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	if _, err := s.db.ExecContext(ctx,
+		`CREATE TABLE IF NOT EXISTS rca_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+	); err != nil {
+		log.Printf("WARNING: embedding re-embed skipped, rca_meta unavailable: %v", err)
+		return
+	}
+	want := s.embeddingSignature()
+	var have string
+	_ = s.db.QueryRowContext(ctx, `SELECT value FROM rca_meta WHERE key = 'embedding_sig'`).Scan(&have)
+	if have == want {
+		return
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE incident_embeddings DROP COLUMN IF EXISTS embedding`); err != nil {
+		log.Printf("WARNING: embedding re-embed failed (drop column): %v", err)
+		return
+	}
+	s.ensureVectorColumn(ctx) // re-adds the column + HNSW index at the current dim
+	if err := s.reembedAllMemories(ctx); err != nil {
+		log.Printf("WARNING: embedding re-embed failed: %v", err)
+		return
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO rca_meta (key, value) VALUES ('embedding_sig', $1)
+		 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, want,
+	); err != nil {
+		log.Printf("WARNING: embedding re-embed sig update failed: %v", err)
+	}
+}
+
+// reembedAllMemories recomputes the dense embedding for every stored memory from
+// its persisted text. Rows are read fully before any UPDATE (can't write on a
+// connection mid-iteration).
+func (s *Store) reembedAllMemories(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT incident_id, alert_id, title, severity, status, analysis_summary,
+		        analysis_detail, labels, created_at
+		   FROM incident_embeddings`)
+	if err != nil {
+		return err
+	}
+	type rec struct {
+		incidentID, alertID string
+		mem                 IncidentMemory
+	}
+	var recs []rec
+	for rows.Next() {
+		var r rec
+		var labelsRaw []byte
+		var createdAt time.Time
+		if err := rows.Scan(
+			&r.incidentID, &r.alertID, &r.mem.Title, &r.mem.Severity, &r.mem.Status,
+			&r.mem.AnalysisSummary, &r.mem.AnalysisDetail, &labelsRaw, &createdAt,
+		); err != nil {
+			rows.Close()
+			return err
+		}
+		_ = json.Unmarshal(labelsRaw, &r.mem.Labels)
+		recs = append(recs, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, r := range recs {
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE incident_embeddings SET embedding = $1 WHERE incident_id = $2 AND alert_id = $3`,
+			embeddingLiteral(s.embed(memoryText(r.mem))), r.incidentID, r.alertID,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) loadFeedback(ctx context.Context) {

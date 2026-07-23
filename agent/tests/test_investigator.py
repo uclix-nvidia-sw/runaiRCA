@@ -654,7 +654,8 @@ async def test_scoped_supported_hypothesis_stops_before_remaining_collectors(
     assert kubernetes.calls == 1
     assert loki.calls == 0
     assert decision_calls == 2
-    assert context["reasoning_trace_v2"]["stop_reason"] == "supported_hypothesis"
+    assert "reasoning_trace_v2" not in context
+    assert context["hypothesis_ledger"][0]["status"] == "supported"
 
 
 @pytest.mark.asyncio
@@ -1321,4 +1322,4 @@ async def test_expired_shared_budget_returns_placeholder_for_unfinished_collecto
     assert len(results) == 1
     assert results[0].status == "unavailable"
     assert results[0].missing_data == ["slow.analysis_budget"]
-    assert context["reasoning_trace_v2"]["stop_reason"] == "analysis_budget_exhausted"
+    assert "reasoning_trace_v2" not in context

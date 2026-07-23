@@ -84,6 +84,23 @@ func (s *Store) embeddingDim() int {
 	return s.embedder.dim
 }
 
+// embeddingBasisVersion bumps whenever the text fed to the embedder (memoryText)
+// changes shape, so stored dense vectors are rebuilt even if model+dim are the
+// same. Bump this when memoryText's field set changes.
+const embeddingBasisVersion = "v1"
+
+// embeddingSignature identifies what produced the stored dense vectors: basis
+// version + model + dimension. A change means every stored vector is stale and
+// must be re-embedded before dense search is trustworthy (see
+// reembedOnEmbeddingConfigChange). Hash mode has an empty model.
+func (s *Store) embeddingSignature() string {
+	model := ""
+	if s.embedder != nil {
+		model = s.embedder.model
+	}
+	return fmt.Sprintf("%s|%s|%d", embeddingBasisVersion, model, s.embeddingDim())
+}
+
 // embed returns an L2-normalized dense vector of length e.dim. It calls the
 // configured OpenAI-compatible endpoint when set, and falls back to the
 // hash embedding on any error so an incident write/search is never blocked.
@@ -520,7 +537,7 @@ func (s *Store) upsertMemoryLocked(incident *Incident, alert *AlertRecord) {
 		Labels:          cloneMap(alert.Labels),
 		CreatedAt:       time.Now().UTC(),
 	}
-	memory.Vector = textVector(memoryText(*memory))
+	memory.Vector = textVector(memorySignatureText(*memory))
 	s.memories[first(memory.AlertID, memory.IncidentID)] = memory
 	s.persistMemoryLocked(memory)
 	s.invalidateRecurrenceStatsLocked()
@@ -554,6 +571,31 @@ func (s *Store) similarIncidentsLocked(
 	limit int,
 ) []SimilarIncident {
 	limit = capSimilarIncidentLimit(limit)
+	// Prefer dense semantic matching over the incident's RCA *content* (its
+	// analysis text + root-cause family), so two incidents are "similar" because
+	// their root cause is similar — not merely because the same alert fired. The
+	// query is built symmetric to the stored memoryText so both sides carry the
+	// analysis prose. Falls back to the sparse identity signature below when
+	// pgvector/an embedding model is unavailable or finds nothing.
+	if run := s.latestAnalysisRunForIncidentLocked(currentIncidentID); run != nil {
+		query := IncidentMemory{
+			Title:           incidentTitle(alert),
+			Severity:        severity(alert),
+			AnalysisSummary: run.AnalysisSummary,
+			AnalysisDetail:  run.AnalysisDetail,
+			Labels:          alert.Labels,
+		}
+		if inc := s.incidents[currentIncidentID]; inc != nil {
+			query.Title = first(inc.Title, query.Title)
+			query.Severity = first(inc.Severity, query.Severity)
+			query.Status = inc.Status
+		}
+		if dense, ok := s.dbSearchSimilarIncidentsLocked(
+			memoryText(query), currentIncidentID, run.RootCauseFamily, alert.Labels, limit,
+		); ok && len(dense) > 0 {
+			return dense
+		}
+	}
 	queryVector := textVector(alertSearchText(alert))
 	results := make([]SimilarIncident, 0, len(s.memories))
 	for _, memory := range s.memories {
@@ -648,29 +690,39 @@ func dedupeSimilarByIncident(results []SimilarIncident, limit int) []SimilarInci
 	return deduped
 }
 
-func alertSearchText(alert Alert) string {
-	parts := []string{
-		incidentTitle(alert),
-		severity(alert),
-		alert.Annotations["summary"],
-		alert.Annotations["description"],
-	}
-	for _, key := range []string{
-		"alertname",
-		"cluster",
-		"project",
-		"queue",
-		"namespace",
-		"workload",
-		"workload_name",
-		"pod",
-		"node",
-	} {
-		if value := alert.Labels[key]; value != "" {
+// signatureLabelKeys are the stable identity/symptom labels that drive the
+// in-process sparse similarity vectors. Volatile per-instance labels (pod,
+// node, instance, uid) are deliberately excluded: controllers recreate pods
+// under randomized names, so keying similarity on them makes two runs of the
+// same workload look unrelated. Workload identity is folded in separately via
+// workloadIdentity, which normalizes those churny pod names to their prefix.
+var signatureLabelKeys = []string{"alertname", "cluster", "project", "queue", "namespace"}
+
+// signatureText builds the stable identity+symptom string behind the sparse
+// similarity vectors. It is intentionally symmetric across the query (live
+// alert) and stored (incident memory) sides — both use title + severity +
+// normalized workload identity + stable labels, and neither includes the long
+// analysis prose. That prose lives on only the memory side, so feeding it to a
+// bag-of-words cosine can only inflate the memory vector's magnitude and drag
+// an otherwise-identical incident's score down (this is why a same-deployment
+// match previously scored ~38%). Rich analysis-text matching stays available
+// through the dense embedding path (see memoryText / the /embeddings/search).
+func signatureText(title, severity string, labels map[string]string) string {
+	parts := []string{title, severity, workloadIdentity(Alert{Labels: labels})}
+	for _, key := range signatureLabelKeys {
+		if value := labels[key]; value != "" {
 			parts = append(parts, value)
 		}
 	}
 	return strings.Join(parts, " ")
+}
+
+func alertSearchText(alert Alert) string {
+	return signatureText(incidentTitle(alert), severity(alert), alert.Labels)
+}
+
+func memorySignatureText(memory IncidentMemory) string {
+	return signatureText(memory.Title, memory.Severity, memory.Labels)
 }
 
 func memoryText(memory IncidentMemory) string {
@@ -816,6 +868,17 @@ func cosineSimilarity(a, b map[string]float64) float64 {
 		return 0
 	}
 	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
+}
+
+// familyBonus rewards two incidents that share a root-cause family — a
+// structured, high-precision signal that they are the same *kind* of failure,
+// not just the same alert firing for unrelated reasons. Used to lift genuine
+// same-cause matches above coincidental symptom overlap in the dense ranker.
+func familyBonus(a, b string) float64 {
+	if a != "" && a == b {
+		return 0.15
+	}
+	return 0
 }
 
 func labelSimilarityBonus(alertLabels, memoryLabels map[string]string) float64 {

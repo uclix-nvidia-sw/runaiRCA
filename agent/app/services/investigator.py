@@ -1511,19 +1511,6 @@ async def investigate(
         "adhoc_query_count": len(adhoc),
         "evidence_sufficiency": sufficiency,
         "skipped_collectors": skipped_collectors if evidence_sufficient else [],
-        "reasoning_trace_v2": {
-            "schema_version": 2,
-            "hypotheses": _ledger_summary(ledger),
-            "referenced_facts": _blackboard_prompt_view(blackboard, limit=30),
-            "stop_reason": (
-                "analysis_budget_exhausted"
-                if (_budget_remaining(deadline_monotonic) is not None)
-                and (_budget_remaining(deadline_monotonic) or 0) <= 0
-                else "supported_hypothesis"
-                if evidence_sufficient
-                else "all_collectors_probed"
-            ),
-        },
     }
     safe_context = _investigator_masker(settings).mask_object(context)
     return results, safe_context if isinstance(safe_context, dict) else context

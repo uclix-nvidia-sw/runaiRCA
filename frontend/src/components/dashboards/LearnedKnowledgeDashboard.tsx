@@ -30,7 +30,9 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
   const [runtime, setRuntime] = useState<KnowledgeRuntimeSnapshot>(EMPTY_RUNTIME);
   const [probeMetrics, setProbeMetrics] = useState<ProbeMetricsSnapshot>(EMPTY_PROBE_METRICS);
   const [selectedID, setSelectedID] = useState('');
-  const [filter, setFilter] = useState<CandidateFilter>('all');
+  // Default to the actionable queue: superseded/failed generations are audit
+  // history and drowned the one candidate that actually needs a decision.
+  const [filter, setFilter] = useState<CandidateFilter>('ready_for_review');
   const [familyFilter, setFamilyFilter] = useState('all');
   const [kindFilter, setKindFilter] = useState('all');
   const [occurrenceFilter, setOccurrenceFilter] = useState<OccurrenceFilter>('all');

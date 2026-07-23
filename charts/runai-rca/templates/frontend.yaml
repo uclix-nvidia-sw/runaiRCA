@@ -115,6 +115,9 @@ spec:
     - name: http
       port: {{ .Values.frontend.service.port }}
       targetPort: http
+      {{- if and (eq .Values.frontend.service.type "NodePort") .Values.frontend.service.nodePort }}
+      nodePort: {{ .Values.frontend.service.nodePort }}
+      {{- end }}
   selector:
     {{- include "runai-rca.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: frontend

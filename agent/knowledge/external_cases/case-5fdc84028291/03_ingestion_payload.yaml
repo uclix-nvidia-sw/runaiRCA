@@ -1,0 +1,313 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:5fdc84028291
+  source_revision_hash: sha256:75d942d4bc9f17b2a6bd2abeafc2df1a904db36146f5d14ae290abbf04830d47
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_with_warnings
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+incident:
+  title: Workspace authentication proxy startup delayed by cluster DNS lookup timeouts
+  masked_summary: A workspace authentication proxy repeatedly restarted and delayed
+    notebook access while lookup of a cluster-local Redis Service name timed out.
+    An earlier DNS or host-resolution change only mitigated the issue because it recurred.
+    Support diagnosed cluster DNS instability and proposed CoreDNS, Cilium, and cross-subnet
+    checks. The customer later said the issue appeared resolved and was due to DNS
+    configuration, but did not identify the final action or demonstrate permanence.
+  status: resolved
+  occurred_at: '2026-03-13'
+  resolved_at: '2026-03-24'
+  family: cluster_network_error
+  family_confidence: high
+  observed_mechanism: The workspace proxy repeatedly initialized and delayed access
+    while a Redis session-clear path reported a cluster-Service DNS lookup I/O timeout;
+    access succeeded after several restarts, and the symptom later recurred after
+    an earlier DNS or host-resolution change.
+  observed_mechanism_confidence: high
+  confirmed_mechanism: DNS-resolution timeouts prevented the workspace proxy from
+    resolving the cluster-local Redis Service during startup, causing crashes or restarts
+    until DNS resolution recovered.
+  confirmed_mechanism_confidence: medium
+searchable_context:
+  normalized_symptoms:
+  - Workspace authentication proxy repeatedly initializes during startup
+  - Workspace remains inaccessible for a significant delay before eventual success
+  - Redis session clearing reports a cluster-Service DNS lookup I/O timeout
+  - Symptom recurs after an earlier DNS or host-resolution configuration change
+  - Access succeeds after DNS eventually resolves following several restarts
+  metric_signatures: []
+  error_signatures:
+  - 'Error removing session: error clearing the session from redis: dial tcp: lookup'
+  issue_references: []
+  canonical_component_tokens:
+  - runai-oauth2-proxy
+  - coredns
+  - cilium-cni
+  version_tokens: []
+  trigger_tokens:
+  - recent CoreDNS pod recreation
+  - frequent Cilium agent restarts on GPU workers
+  - cross-subnet path between GPU workers and Run:ai service nodes
+  - recurrence after a prior DNS or host-resolution configuration change
+  retrieval_keywords:
+  - Error removing session error clearing session redis dial tcp lookup
+  - oauth2 proxy startup DNS lookup i/o timeout
+  - workspace startup delay cluster Service name resolution
+  - CoreDNS Cilium GPU worker DNS instability
+evidence_refs:
+- evidence_id: E001
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer reported repeated proxy initialization, delayed Running
+    state, and delayed notebook web access before eventual success.
+  supports:
+  - F001
+  - H001
+  - H002
+- evidence_id: E002
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Customer referenced a companion proxy log that is not supplied locally.
+  supports:
+  - F002
+  - A001
+- evidence_id: E003
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support quoted duplicate Redis session-clear entries ending in a
+    masked cluster-Service DNS lookup I/O timeout.
+  supports:
+  - F003
+  - H002
+- evidence_id: E004
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support requested cluster-wide pod and Service outputs, but no execution
+    result is supplied.
+  supports:
+  - F002
+  - A002
+- evidence_id: E005
+  source_message_ids:
+  - M003
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer reported recurrence after a previous CoreDNS-related change
+    had appeared to resolve the issue.
+  supports:
+  - F001
+  - F004
+  - H002
+  - H003
+  - A003
+- evidence_id: E006
+  source_message_ids:
+  - M003
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Customer referenced follow-up logs and previously requested information
+    that are unavailable locally.
+  supports:
+  - F002
+  - A001
+- evidence_id: E007
+  source_message_ids:
+  - M004
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer reported that cluster host-file reconfiguration initially
+    solved the issue.
+  supports:
+  - F004
+  - H003
+  - A003
+- evidence_id: E008
+  source_message_ids:
+  - M006
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support diagnosed DNS lookup timeouts during proxy startup, stated
+    that Run:ai configuration and the Redis Service were healthy, and said access
+    succeeded after DNS recovered.
+  supports:
+  - F005
+  - H001
+  - H002
+  - A001
+- evidence_id: E009
+  source_message_ids:
+  - M006
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support stated that all CoreDNS pods had been recreated minutes
+    before diagnostic collection.
+  supports:
+  - F006
+  - H004
+  - A004
+- evidence_id: E010
+  source_message_ids:
+  - M006
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support stated that two affected workspaces shared a masked GPU
+    worker and that Cilium agents on GPU nodes restarted frequently.
+  supports:
+  - F006
+  - H004
+  - A005
+- evidence_id: E011
+  source_message_ids:
+  - M006
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support stated that masked GPU-worker and Run:ai-service nodes were
+    on different subnets.
+  supports:
+  - F006
+  - H004
+  - A006
+- evidence_id: E012
+  source_message_ids:
+  - M006
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support proposed CoreDNS health, Cilium stability, and cross-subnet
+    routing investigation.
+  supports:
+  - F007
+  - H004
+  - A004
+  - A005
+  - A006
+- evidence_id: E013
+  source_message_ids:
+  - M007
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer said the issue seemed due to DNS configuration and now
+    appeared resolved, without naming the final change.
+  supports:
+  - F008
+  - H002
+- evidence_id: E014
+  source_message_ids: []
+  source_actor: system
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: The structured export records the primary case as Closed with a
+    March 24 close date.
+  supports:
+  - F009
+historical_actions:
+- action_id: A001
+  normalized_action: Provide proxy logs and follow-up diagnostic information to Support.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E002
+  - E006
+  - E008
+- action_id: A002
+  normalized_action: Collect cluster-wide pod and Service inventories.
+  outcome: unknown_outcome
+  verified: false
+  evidence_ids:
+  - E004
+- action_id: A003
+  normalized_action: Apply the prior DNS or host-resolution configuration change described
+    inconsistently as host-file reconfiguration and CoreDNS modification.
+  outcome: mitigating
+  verified: true
+  evidence_ids:
+  - E005
+  - E007
+- action_id: A004
+  normalized_action: Investigate CoreDNS pod health, recent recreation, and autoscaler
+    behavior.
+  outcome: unknown_outcome
+  verified: false
+  evidence_ids:
+  - E009
+  - E012
+- action_id: A005
+  normalized_action: Investigate Cilium CNI agent stability on GPU worker nodes.
+  outcome: unknown_outcome
+  verified: false
+  evidence_ids:
+  - E010
+  - E012
+- action_id: A006
+  normalized_action: Investigate routing between masked GPU-worker and Run:ai-service
+    subnets.
+  outcome: unknown_outcome
+  verified: false
+  evidence_ids:
+  - E011
+  - E012
+knowledge_links:
+  known_issue_matches: []
+  failure_mode_matches:
+  - cluster_network_error / Pod DNS Resolution Failure (exact symptom only)
+  - cluster_network_error / CoreDNS Unhealthy (partial)
+  - cluster_network_error / CNI Agent Unhealthy (partial)
+  - cluster_network_error / NetworkPolicy / MTU / CoreDNS-Forward Timeout (partial)
+  family_candidates:
+  - family: cluster_network_error
+    confidence: high
+  - family: platform_auth_error
+    confidence: low
+  - family: runai_control_plane_error
+    confidence: low
+historical_use:
+  context_class: evaluation_only
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - action_reference
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: The case has a specific DNS lookup-timeout signature and a Support
+    diagnosis useful for distinguishing cluster networking from Run:ai authentication
+    or service failure. However, raw attachments, a precise final action, durability
+    evidence, and Engineering confirmation are absent, and the current loader has
+    no resolved-positive route.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false

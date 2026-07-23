@@ -1,0 +1,213 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:e3f22b03d0c5
+  source_revision_hash: sha256:1e49f5223b25820096a96ecd3c3762ac3de0a0fa631418e7e30314e3f0aa5918
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_with_warnings
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+incident:
+  title: Prometheus Operator discovery and Service namespace configuration mismatch
+  masked_summary: Support diagnosed a Prometheus Operator Deployment name that did
+    not match Run:ai's discovery pattern and a prometheus-operated Service outside
+    the default lookup namespace. Two configuration changes were proposed, but no
+    execution or technical result was reported before administrative closure.
+  status: unresolved
+  occurred_at: '2026-03-03'
+  resolved_at: null
+  family: observability_accuracy
+  family_confidence: medium
+  observed_mechanism: Customer reported a Prometheus integration issue; Support identified
+    a nonmatching operator Deployment name, a nondefault Prometheus Service namespace,
+    and the error phrase Prometheus Operator not found.
+  observed_mechanism_confidence: medium
+  confirmed_mechanism: Support diagnosed that the Deployment-name mismatch prevented
+    Prometheus Operator discovery and that the Service namespace mismatch prevented
+    use of Run:ai's default prometheus-operated address.
+  confirmed_mechanism_confidence: medium
+searchable_context:
+  normalized_symptoms:
+  - Prometheus and Run:ai integration does not work as intended
+  - Prometheus Operator not found
+  - Prometheus Operator Deployment name does not match Run:ai discovery pattern
+  - prometheus-operated Service is outside the default lookup namespace
+  metric_signatures: []
+  error_signatures:
+  - Prometheus Operator not found
+  issue_references: []
+  canonical_component_tokens:
+  - prometheus-operator
+  - prometheus-operated
+  - runaiconfig
+  version_tokens:
+  - Run:ai 2.24.52
+  - RKE2
+  trigger_tokens:
+  - operator Deployment name does not match (prometheus|rancher-monitoring).*operator
+  - prometheus-operated Service namespace differs from runai
+  retrieval_keywords:
+  - Prometheus Operator not found
+  - (prometheus|rancher-monitoring).*operator
+  - prometheus-operated Service namespace
+  - spec.global.prometheusService.address
+evidence_refs:
+- evidence_id: E001
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer reported a Prometheus-to-Run:ai integration issue on Run:ai
+    2.24.52 and RKE2.
+  supports:
+  - F001
+  - H001
+  - H002
+- evidence_id: E002
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Customer said a runai-public ConfigMap was shared for Support review;
+    the artifact is not supplied locally.
+  supports:
+  - F002
+- evidence_id: E003
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Customer said Helm list output and a Prometheus pod list were provided;
+    neither artifact is supplied locally.
+  supports:
+  - F002
+- evidence_id: E004
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support stated that the masked operator Deployment name did not
+    match Run:ai's (prometheus|rancher-monitoring).*operator discovery pattern.
+  supports:
+  - F003
+  - H001
+- evidence_id: E005
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support stated that the prometheus-operated Service was in a masked
+    namespace different from Run:ai's default lookup namespace.
+  supports:
+  - F004
+  - H001
+- evidence_id: E006
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support referred to the error phrase Prometheus Operator not found.
+  supports:
+  - F005
+  - H001
+- evidence_id: E007
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support proposed setting RunaiConfig prometheusService.address to
+    the existing Service's masked cluster-local address.
+  supports:
+  - F006
+  - A001
+- evidence_id: E008
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support proposed changing the monitoring release name so the generated
+    operator Deployment would match discovery.
+  supports:
+  - F006
+  - A002
+- evidence_id: E009
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support stated that it was not aware of additional RKE2-specific
+    integration requirements.
+  supports:
+  - H002
+- evidence_id: E010
+  source_message_ids:
+  - M004
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer said the case could be closed without reporting a technical
+    outcome.
+  supports:
+  - F006
+  - F007
+historical_actions:
+- action_id: A001
+  normalized_action: Set RunaiConfig spec.global.prometheusService.address to the
+    existing Prometheus Service's masked cluster-local address.
+  outcome: unknown_outcome
+  verified: false
+  evidence_ids:
+  - E007
+- action_id: A002
+  normalized_action: Change or reinstall the monitoring Helm release so the generated
+    operator Deployment name matches Run:ai's discovery pattern.
+  outcome: unknown_outcome
+  verified: false
+  evidence_ids:
+  - E008
+knowledge_links:
+  known_issue_matches: []
+  failure_mode_matches:
+  - runai_control_plane_error / Missing Prerequisites Or Service Issues (partial)
+  family_candidates:
+  - family: observability_accuracy
+    confidence: medium
+  - family: runai_control_plane_error
+    confidence: medium
+historical_use:
+  context_class: unresolved_context
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - action_reference
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: The configuration diagnosis and exact error phrase are useful investigation
+    context, but the proposed actions have no reported execution or result and administrative
+    closure is not technical resolution.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false

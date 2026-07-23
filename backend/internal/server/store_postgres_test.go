@@ -77,6 +77,72 @@ func TestPostgresConnectReportsPGVectorEnabledAndLoadsState(t *testing.T) {
 	}
 }
 
+func TestPostgresStartupScrubsLegacyReasoningTraceFields(t *testing.T) {
+	state := testsupport.NewPostgresState(false)
+	store := NewStore()
+
+	store.connectDatabaseWithDriver(testsupport.RegisterPostgresDriver(state), "fake://runai_rca", time.Second)
+	defer store.db.Close()
+
+	for _, fragment := range []string{
+		"#- '{reasoning_trace_v2}'",
+		"#- '{reasoning_trace_v3,stop_reason}'",
+		"#- '{metadata,reasoning_trace_v2}'",
+		"#- '{metadata,reasoning_trace_v3,stop_reason}'",
+	} {
+		if !state.Executed(fragment) {
+			t.Fatalf("expected legacy trace cleanup statement %q, got %+v", fragment, state.Execs())
+		}
+	}
+	if !state.Queried("FROM knowledge_candidates") || !state.Queried("trace ? 'stop_reason'") {
+		t.Fatal("expected historical knowledge candidate traces to be checked for stop_reason")
+	}
+}
+
+func TestMetadataFromAgentContextRejectsReasoningTraceV2(t *testing.T) {
+	metadata := metadataFromAgentContext(map[string]any{
+		"reasoning_trace_v2": map[string]any{"schema_version": 2},
+		"reasoning_trace_v3": map[string]any{"schema_version": 3},
+		"investigation":      map[string]any{"hypothesis_ledger": []any{}},
+	})
+
+	if _, ok := metadata["reasoning_trace_v2"]; ok {
+		t.Fatalf("legacy trace must not be persisted: %+v", metadata)
+	}
+	if _, ok := metadata["investigation"]; ok {
+		t.Fatalf("ephemeral investigation context must not be persisted: %+v", metadata)
+	}
+	if trace, ok := metadata["reasoning_trace_v3"].(map[string]any); !ok || trace["schema_version"] != 3 {
+		t.Fatalf("v3 trace should remain persisted: %+v", metadata)
+	}
+}
+
+func TestLegacyKnowledgeCandidateCleanupRemovesStopReasonAndRehashes(t *testing.T) {
+	trace := map[string]any{
+		"schema_version": 3,
+		"stop_reason":    "sufficient_evidence",
+		"hypotheses":     []any{map[string]any{"hypothesis_id": "H-1"}},
+	}
+	payload := map[string]any{
+		"compiled":  map[string]any{"failure_modes": []any{}},
+		"family":    "scheduler_capacity",
+		"mechanism": "quota exhausted",
+	}
+	before := knowledgeContentHash(trace, payload)
+
+	after, changed := cleanLegacyKnowledgeCandidateTrace(trace, payload)
+
+	if !changed || after == "" || after == before {
+		t.Fatalf("expected legacy candidate trace to be rehashed, before=%q after=%q", before, after)
+	}
+	if _, ok := trace["stop_reason"]; ok {
+		t.Fatalf("stop_reason was not removed: %+v", trace)
+	}
+	if secondHash, secondChanged := cleanLegacyKnowledgeCandidateTrace(trace, payload); secondChanged || secondHash != "" {
+		t.Fatalf("cleanup must be idempotent, changed=%t hash=%q", secondChanged, secondHash)
+	}
+}
+
 func TestPostgresConnectFallsBackToJSONBWhenPGVectorUnavailable(t *testing.T) {
 	state := testsupport.NewPostgresState(true)
 	store := NewStore()
