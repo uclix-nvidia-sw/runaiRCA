@@ -388,16 +388,20 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 	if !harnessHardGatesPassed(harness) {
 		return nil, "all non-empty harness hard gates must pass"
 	}
-	hypothesis, support, contradiction, err := readyTraceV3Hypothesis(trace, snapshot.RootCauseFamily, snapshot.Mechanism, operatorConfirmed)
-	if err != "" {
-		return nil, err
+	hypothesis, support, contradiction, ledgerErr := readyTraceV3Hypothesis(trace, snapshot.RootCauseFamily, snapshot.Mechanism, operatorConfirmed)
+	if ledgerErr == "" && len(support) == 0 {
+		ledgerErr = "missing supporting evidence"
 	}
 	evidenceSource := ""
-	if len(support) == 0 {
-		if fallback := harnessClaimFallbackSupport(harness, snapshot.RootCauseFamily); len(fallback) > 0 {
-			support = fallback
-			evidenceSource = "harness_claim_fallback"
+	minimumSourceGroups := 2
+	if ledgerErr != "" {
+		var ok bool
+		hypothesis, support, contradiction, ok = harnessClaimHypothesis(snapshot, harness, trace)
+		if !ok {
+			return nil, ledgerErr
 		}
+		evidenceSource = "harness_claim"
+		minimumSourceGroups = 1
 	}
 	if len(support) == 0 {
 		return nil, "missing supporting evidence"
@@ -405,12 +409,12 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 	if len(contradiction) > 0 {
 		return nil, "unresolved contradicting evidence"
 	}
-	if errorText := canonicalSupportingEvidenceError(trace, support); errorText != "" {
+	if errorText := canonicalSupportingEvidenceError(trace, support, minimumSourceGroups); errorText != "" {
 		return nil, errorText
 	}
 	hypothesisID := stringValue(hypothesis["hypothesis_id"])
 	probeTemplateIDs := traceV3LinkedProbeTemplateIDs(trace, hypothesisID, support)
-	if len(probeTemplateIDs) == 0 {
+	if evidenceSource == "" && len(probeTemplateIDs) == 0 {
 		return nil, "missing probe execution linked to hypothesis evidence"
 	}
 	if strings.TrimSpace(stringValue(snapshot.Snapshot["analysis_summary"])) == "" || strings.TrimSpace(stringValue(snapshot.Snapshot["analysis_detail"])) == "" {
@@ -439,6 +443,7 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 	}
 	if evidenceSource != "" {
 		payload["evidence_source"] = evidenceSource
+		payload["provenance"].(map[string]any)["promotion_path"] = evidenceSource
 	}
 	if context, ok := card["context"].(map[string]string); ok && len(context) > 0 {
 		payload["context"] = cloneMap(context)
@@ -449,30 +454,60 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 	return payload, ""
 }
 
-// harnessClaimFallbackSupport preserves a validated harness claim when the
-// trace writer failed to copy its evidence_for links into the selected
-// hypothesis. The fallback is deliberately narrow: only the first claim,
-// only the final family, and only claims without any contradiction qualify.
-func harnessClaimFallbackSupport(harness map[string]any, finalFamily string) map[string]bool {
+func harnessClaimHypothesis(snapshot *CaseSnapshot, harness, trace map[string]any) (map[string]any, map[string]bool, map[string]bool, bool) {
+	if snapshot == nil || stringValue(harness["diagnosis_state"]) != "supported" {
+		return nil, nil, nil, false
+	}
 	claims, _ := harness["claims"].([]any)
 	if len(claims) == 0 {
-		return nil
+		return nil, nil, nil, false
 	}
 	claim, ok := claims[0].(map[string]any)
-	if !ok || strings.TrimSpace(stringValue(claim["family"])) != strings.TrimSpace(finalFamily) {
-		return nil
+	if !ok || stringValue(claim["kind"]) != "root_cause" || strings.TrimSpace(stringValue(claim["family"])) != strings.TrimSpace(snapshot.RootCauseFamily) {
+		return nil, nil, nil, false
 	}
 	supporting := sanitizeStringSlice(claim["supporting_evidence"])
-	contradicting := append([]string{}, sanitizeStringSlice(claim["contradicting_evidence"])...)
-	contradicting = append(contradicting, sanitizeStringSlice(claim["contradiction_evidence_ids"])...)
+	contradicting := append(sanitizeStringSlice(claim["contradicting_evidence"]), sanitizeStringSlice(claim["contradiction_evidence_ids"])...)
 	if len(supporting) == 0 || len(contradicting) > 0 {
-		return nil
+		return nil, nil, nil, false
 	}
 	support := make(map[string]bool, len(supporting))
 	for _, evidenceID := range supporting {
 		support[evidenceID] = true
 	}
-	return support
+	if errorText := canonicalSupportingEvidenceError(trace, support, 1); errorText != "" {
+		return nil, nil, nil, false
+	}
+	claimID := strings.TrimSpace(stringValue(claim["claim_id"]))
+	if claimID == "" {
+		return nil, nil, nil, false
+	}
+	mechanism := strings.TrimSpace(snapshot.Mechanism)
+	if mechanism == "" {
+		mechanism = firstAnalysisSentence(stringValue(snapshot.Snapshot["analysis_summary"]))
+	}
+	if mechanism == "" {
+		return nil, nil, nil, false
+	}
+	confidence := map[string]float64{"high": 0.9, "medium": 0.7, "low": 0.4}[strings.ToLower(strings.TrimSpace(stringValue(claim["confidence"])))]
+	if confidence == 0 {
+		return nil, nil, nil, false
+	}
+	return map[string]any{
+		"hypothesis_id": "harness:" + claimID,
+		"family":        snapshot.RootCauseFamily,
+		"mechanism":     mechanism,
+		"confidence":    confidence,
+	}, support, map[string]bool{}, true
+}
+
+func firstAnalysisSentence(summary string) string {
+	for _, separator := range []string{".", "。", "\n"} {
+		if index := strings.Index(summary, separator); index >= 0 {
+			return strings.TrimSpace(summary[:index])
+		}
+	}
+	return strings.TrimSpace(summary)
 }
 
 func harnessHardGatesPassed(harness map[string]any) bool {
@@ -506,7 +541,7 @@ func harnessHardGatesPassed(harness map[string]any) bool {
 	return count > 0
 }
 
-func canonicalSupportingEvidenceError(trace map[string]any, support map[string]bool) string {
+func canonicalSupportingEvidenceError(trace map[string]any, support map[string]bool, minSourceGroups int) string {
 	evidence, _ := trace["evidence"].([]any)
 	byID := map[string]map[string]any{}
 	for _, raw := range evidence {
@@ -534,7 +569,7 @@ func canonicalSupportingEvidenceError(trace map[string]any, support map[string]b
 		}
 		sourceGroups[sourceGroup] = true
 	}
-	if len(sourceGroups) < 2 {
+	if minSourceGroups > 0 && len(sourceGroups) < minSourceGroups {
 		return "supporting evidence requires at least two source groups"
 	}
 	return ""

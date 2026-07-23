@@ -460,23 +460,35 @@ func TestKnowledgeCandidateEligibilityFailsClosedOnPlanGates(t *testing.T) {
 func TestHarnessClaimEvidenceFallbackCompilesKnowledge(t *testing.T) {
 	snapshot := eligibleKnowledgeSnapshot()
 	harness := snapshot.Snapshot["metadata"].(map[string]any)["harness"].(map[string]any)
+	harness["diagnosis_state"] = "supported"
 	harness["claims"] = []any{map[string]any{
 		"family":                 snapshot.RootCauseFamily,
-		"supporting_evidence":    []any{"E-1", "E-2"},
+		"kind":                   "root_cause",
+		"claim_id":               "C01",
+		"confidence":             "medium",
+		"supporting_evidence":    []any{"E-1"},
 		"contradicting_evidence": []any{},
 	}}
 	trace := knowledgeTraceForTest(snapshot)
 	trace["hypotheses"].([]any)[0].(map[string]any)["evidence_for"] = []any{}
+	delete(trace, "probe_executions")
 
 	candidate := knowledgeCandidateForSnapshot(snapshot)
 	if candidate == nil || candidate.Status != knowledgeCandidateReady {
 		t.Fatalf("harness claim support should compile when the trace ledger is empty: %+v", candidate)
 	}
-	if candidate.Payload["evidence_source"] != "harness_claim_fallback" {
+	if candidate.Payload["evidence_source"] != "harness_claim" {
 		t.Fatalf("fallback payload is missing audit marker: %+v", candidate.Payload)
 	}
-	if got := candidate.Payload["supporting_evidence_ids"].([]string); len(got) != 2 || got[0] != "E-1" || got[1] != "E-2" {
+	if got := candidate.Payload["supporting_evidence_ids"].([]string); len(got) != 1 || got[0] != "E-1" {
 		t.Fatalf("fallback support IDs were not preserved: %+v", got)
+	}
+	if got := candidate.Payload["compiled"].(map[string]any)["probe_template_ids"].(map[string]any)[snapshot.RootCauseFamily].([]string); len(got) != 0 {
+		t.Fatalf("harness claim path must not invent probes: %+v", got)
+	}
+	provenance := candidate.Payload["provenance"].(map[string]any)
+	if provenance["promotion_path"] != "harness_claim" {
+		t.Fatalf("harness claim path missing provenance marker: %+v", provenance)
 	}
 }
 
@@ -508,6 +520,130 @@ func TestHarnessClaimEvidenceFallbackFailsClosedWithoutCleanSupport(t *testing.T
 			}
 		})
 	}
+}
+
+func TestHarnessClaimPathRejectsUnsafeClaims(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*CaseSnapshot)
+	}{
+		{
+			name: "contradicting evidence",
+			mutate: func(snapshot *CaseSnapshot) {
+				harnessClaimForTest(snapshot)["contradicting_evidence"] = []any{"E-2"}
+			},
+		},
+		{
+			name: "family mismatch",
+			mutate: func(snapshot *CaseSnapshot) {
+				harnessClaimForTest(snapshot)["family"] = "gpu_hardware_error"
+			},
+		},
+		{
+			name: "unknown evidence ID",
+			mutate: func(snapshot *CaseSnapshot) {
+				harnessClaimForTest(snapshot)["supporting_evidence"] = []any{"E-unknown"}
+			},
+		},
+		{
+			name: "noncanonical evidence",
+			mutate: func(snapshot *CaseSnapshot) {
+				harnessClaimForTest(snapshot)["supporting_evidence"] = []any{"E-1"}
+				knowledgeTraceForTest(snapshot)["evidence"].([]any)[0].(map[string]any)["polarity"] = "absent"
+			},
+		},
+		{
+			name: "diagnosis not supported",
+			mutate: func(snapshot *CaseSnapshot) {
+				snapshot.Snapshot["metadata"].(map[string]any)["harness"].(map[string]any)["diagnosis_state"] = "provisional"
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := harnessClaimSnapshotForTest()
+			test.mutate(snapshot)
+			candidate := knowledgeCandidateForSnapshot(snapshot)
+			if candidate == nil || candidate.Status != knowledgeCandidateValidationFailed {
+				t.Fatalf("unsafe harness claim should fail closed: %+v", candidate)
+			}
+			if candidate.ValidationError != "expected exactly one supported trace-v3 hypothesis matching final root cause" {
+				t.Fatalf("path 1 error should be preserved, got %q", candidate.ValidationError)
+			}
+		})
+	}
+}
+
+func TestCompleteLedgerRemainsThePrimaryPromotionPath(t *testing.T) {
+	candidate := knowledgeCandidateForSnapshot(eligibleKnowledgeSnapshot())
+	if candidate == nil || candidate.Status != knowledgeCandidateReady {
+		t.Fatalf("complete ledger should remain eligible: %+v", candidate)
+	}
+	if _, ok := candidate.Payload["evidence_source"]; ok {
+		t.Fatalf("complete ledger must not be marked as harness claim: %+v", candidate.Payload)
+	}
+}
+
+func TestValidationFailedCandidateRefreshesItsLatestReason(t *testing.T) {
+	store := NewStore()
+	snapshot := eligibleKnowledgeSnapshot()
+	snapshot.ApprovalState = "active"
+	trace := knowledgeTraceForTest(snapshot)
+	trace["hypotheses"] = []any{}
+	delete(trace, "probe_executions")
+	latest := knowledgeCandidateForSnapshotWithOutcome(snapshot, true, false)
+	if latest == nil || latest.Status != knowledgeCandidateValidationFailed {
+		t.Fatalf("invalid fixture: %+v", latest)
+	}
+	stale := cloneKnowledgeCandidate(latest)
+	stale.ValidationError = "stale validation reason"
+	stale.UpdatedAt = time.Unix(1, 0).UTC()
+	oldUpdatedAt := stale.UpdatedAt
+	store.caseSnapshots[snapshot.CaseID] = snapshot
+	store.knowledgeCandidates[stale.CandidateID] = &stale
+	confirmKnowledgeSnapshot(store, snapshot)
+
+	store.generateKnowledgeCandidateForReviewedRunLocked(snapshot.RunID, snapshot.AnalysisHash)
+	refreshed := store.knowledgeCandidates[stale.CandidateID]
+	if refreshed == nil || refreshed.ValidationError != latest.ValidationError {
+		t.Fatalf("candidate validation reason was not refreshed: %+v", refreshed)
+	}
+	if !refreshed.UpdatedAt.After(oldUpdatedAt) {
+		t.Fatalf("candidate updated_at was not refreshed: old=%s new=%s", oldUpdatedAt, refreshed.UpdatedAt)
+	}
+	foundEvent := false
+	for _, event := range store.knowledgeEvents {
+		if event.CandidateID == stale.CandidateID && event.Type == "candidate_validation_refreshed" {
+			foundEvent = true
+			break
+		}
+	}
+	if !foundEvent {
+		t.Fatal("candidate validation refresh did not create an audit event")
+	}
+}
+
+func harnessClaimSnapshotForTest() *CaseSnapshot {
+	snapshot := eligibleKnowledgeSnapshot()
+	metadata := snapshot.Snapshot["metadata"].(map[string]any)
+	harness := metadata["harness"].(map[string]any)
+	harness["diagnosis_state"] = "supported"
+	harness["claims"] = []any{map[string]any{
+		"claim_id":               "C01",
+		"kind":                   "root_cause",
+		"family":                 snapshot.RootCauseFamily,
+		"confidence":             "medium",
+		"supporting_evidence":    []any{"E-1"},
+		"contradicting_evidence": []any{},
+	}}
+	trace := knowledgeTraceForTest(snapshot)
+	trace["hypotheses"] = []any{}
+	delete(trace, "probe_executions")
+	return snapshot
+}
+
+func harnessClaimForTest(snapshot *CaseSnapshot) map[string]any {
+	return snapshot.Snapshot["metadata"].(map[string]any)["harness"].(map[string]any)["claims"].([]any)[0].(map[string]any)
 }
 
 func knowledgeTraceForTest(snapshot *CaseSnapshot) map[string]any {
