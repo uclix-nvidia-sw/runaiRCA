@@ -486,6 +486,16 @@ func TestHarnessClaimEvidenceFallbackCompilesKnowledge(t *testing.T) {
 	if got := candidate.Payload["compiled"].(map[string]any)["probe_template_ids"].(map[string]any)[snapshot.RootCauseFamily].([]string); len(got) != 0 {
 		t.Fatalf("harness claim path must not invent probes: %+v", got)
 	}
+	// The agent-side package validator rejects JSON null probe lists at
+	// Activate time; a nil Go slice passes the type assertions above while
+	// still marshalling to null, so assert the WIRE shape, not the Go type.
+	encoded, err := json.Marshal(candidate.Payload["compiled"])
+	if err != nil {
+		t.Fatalf("compiled payload must marshal: %v", err)
+	}
+	if bytes.Contains(encoded, []byte("null")) {
+		t.Fatalf("compiled payload must not contain JSON null (agent validator contract): %s", encoded)
+	}
 	provenance := candidate.Payload["provenance"].(map[string]any)
 	if provenance["promotion_path"] != "harness_claim" {
 		t.Fatalf("harness claim path missing provenance marker: %+v", provenance)

@@ -417,6 +417,13 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 	if evidenceSource == "" && len(probeTemplateIDs) == 0 {
 		return nil, "missing probe execution linked to hypothesis evidence"
 	}
+	if probeTemplateIDs == nil {
+		// A nil slice marshals to JSON null, which the agent-side package
+		// validator rejects ("probe template IDs must be safe identifier
+		// strings") at Activate time — the harness-claim path legitimately has
+		// no linked probes and must ship an empty list instead.
+		probeTemplateIDs = []string{}
+	}
 	if strings.TrimSpace(stringValue(snapshot.Snapshot["analysis_summary"])) == "" || strings.TrimSpace(stringValue(snapshot.Snapshot["analysis_detail"])) == "" {
 		return nil, "missing analysis result"
 	}
