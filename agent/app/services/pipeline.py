@@ -109,6 +109,21 @@ _SYNTHESIS_PRIVATE_FACT_CITATION = re.compile(
 )
 _SYNTHESIS_PUBLIC_EVIDENCE_CITATION = re.compile(r"\[(E\d+)\]")
 
+_DISPOSITIVE_TYPED_REASONS: dict[str, frozenset[str]] = {
+    "image_pull_error": frozenset(
+        {"ImagePullBackOff", "ErrImagePull", "InvalidImageName", "ErrImageNeverPull"}
+    ),
+    "workload_startup_error": frozenset(
+        {
+            "CrashLoopBackOff",
+            "CreateContainerConfigError",
+            "CreateContainerError",
+            "RunContainerError",
+        }
+    ),
+    "workload_runtime_error": frozenset({"OOMKilled"}),
+}
+
 
 @dataclass
 class PipelineState:
@@ -1784,6 +1799,7 @@ async def rank_stage(state: PipelineState) -> PipelineState:
         known_issue_support=_known_issue_signature_support(
             state.results, known_issue_matches, eligible_support_ids
         ),
+        typed_state=_dispositive_typed_state(state.results, eligible_support_ids),
     )
     open_world = _merge_open_world_candidates(state, state.root_cause_candidates)
     # Shadow and assist expose evidence-gated novel reasoning in context without
@@ -3149,6 +3165,7 @@ async def _reanalyze_once(
             known_issue_support=_known_issue_signature_support(
                 merged_results, known_issue_matches, eligible_support_ids
             ),
+            typed_state=_dispositive_typed_state(merged_results, eligible_support_ids),
         )
         if target.refuted_family and not _fresh_results_support_family(
             target.refuted_family,
@@ -4548,6 +4565,7 @@ def _promote_signature_cause(
     *,
     evidence_text: str = "",
     known_issue_support: Mapping[str, dict[str, list[str]]] | None = None,
+    typed_state: tuple[str, str, list[str]] = ("", "", []),
 ) -> list[RankedCause]:
     """A specific signature names the headline family; the keyword ranker is only
     the no-signal fallback. Precedence: NVIDIA XID (dispositive) > known-issue
@@ -4555,6 +4573,8 @@ def _promote_signature_cause(
     the ranker's top family the richer ranked entry is kept as-is."""
     if xid_codes:
         return _promote_xid_cause(candidates, xid_codes)
+    if typed_state[0]:
+        return _promote_typed_state_cause(candidates, *typed_state)
     top_family = candidates[0].family if candidates else ""
     for entry in known_issue_matches:
         family = str(entry.get("family") or "")
@@ -4650,6 +4670,159 @@ def _promote_signature_cause(
         )
         return [lead] + [c for c in candidates if c.family != family]
     return candidates
+
+
+def _dispositive_typed_state(
+    results: list[CollectorResult],
+    eligible_support_ids: set[str] | None,
+) -> tuple[str, str, list[str]]:
+    """Find a verified Kubernetes machine-reported cause reason.
+
+    Free-form summaries are intentionally ignored. Only scoped, verified typed
+    lifecycle observations and repeated typed Warning Events can promote a
+    cause when they are eligible for the final evidence trace.
+    """
+    if not eligible_support_ids:
+        return "", "", []
+    for result in results:
+        for item in result.artifacts:
+            evidence_id = str(getattr(item, "evidence_id", "") or "")
+            if evidence_id not in eligible_support_ids:
+                continue
+            payload = getattr(item, "result", None)
+            if not isinstance(payload, dict):
+                continue
+            observation = payload.get("observation")
+            if not (
+                isinstance(observation, dict)
+                and observation.get("polarity") == "present"
+                and observation.get("coverage") == "scoped"
+                and observation.get("target_identity_verified") is True
+            ):
+                continue
+            if getattr(item, "type", "") == "kubernetes_container_lifecycle":
+                containers = payload.get("containers")
+                if not isinstance(containers, list):
+                    continue
+                for container in containers:
+                    if not isinstance(container, dict):
+                        continue
+                    for state_key in ("state", "lastTerminated"):
+                        state = container.get(state_key)
+                        if not isinstance(state, dict) or state.get("phase") not in {
+                            "waiting",
+                            "terminated",
+                        }:
+                            continue
+                        reason = str(state.get("reason") or "")
+                        family = _typed_reason_family(reason)
+                        if family:
+                            return (
+                                family,
+                                f"typed container state {reason} on the alert Pod "
+                                "(machine-reported, not keyword-matched)",
+                                [evidence_id],
+                            )
+            if getattr(item, "type", "") == "kubernetes_warning_events":
+                events = payload.get("events")
+                if not isinstance(events, list):
+                    continue
+                for event in events:
+                    if not isinstance(event, dict):
+                        continue
+                    if (
+                        str(event.get("type") or "") != "Warning"
+                        or event.get("target_identity_verified") is not True
+                    ):
+                        continue
+                    try:
+                        count = int(event.get("count") or 0)
+                    except (TypeError, ValueError):
+                        count = 0
+                    if count < 3:
+                        continue
+                    reason = str(event.get("reason") or "")
+                    family = _typed_reason_family(reason)
+                    if family:
+                        return (
+                            family,
+                            f"typed container state {reason} on the alert Pod "
+                            "(machine-reported, not keyword-matched)",
+                            [evidence_id],
+                        )
+    return "", "", []
+
+
+def _typed_reason_family(reason: str) -> str:
+    for family, reasons in _DISPOSITIVE_TYPED_REASONS.items():
+        if reason in reasons:
+            return family
+    return ""
+
+
+def _promote_typed_state_cause(
+    candidates: list[RankedCause], family: str, rationale: str, support_ids: list[str]
+) -> list[RankedCause]:
+    existing = next((candidate for candidate in candidates if candidate.family == family), None)
+    support_evidence_ids = list(
+        dict.fromkeys([*(existing.support_evidence_ids if existing else []), *support_ids])
+    )
+    if existing is not None:
+        promoted = replace(
+            existing,
+            confidence="high",
+            score=max(existing.score, 9.0),
+            rationale=[
+                *existing.rationale,
+                *([] if rationale in existing.rationale else [rationale]),
+            ],
+            evidence_agents=sorted({*existing.evidence_agents, "signature", "kubernetes"}),
+            support_evidence_ids=support_evidence_ids,
+            score_breakdown=[
+                *existing.score_breakdown,
+                {
+                    "stage": "signature",
+                    "kind": "typed_container_state",
+                    "label": rationale,
+                    "score_floor": 9.0,
+                    "force_high": True,
+                },
+            ],
+            confidence_gate={
+                **existing.confidence_gate,
+                "score_floor_passed": True,
+                "medium_score_passed": True,
+                "high_score_passed": True,
+                "force_high": True,
+                "signature_promoted": True,
+            },
+        )
+    else:
+        promoted = RankedCause(
+            family=family,
+            confidence="high",
+            score=9.0,
+            rationale=[rationale],
+            evidence_agents=["kubernetes", "signature"],
+            support_evidence_ids=support_evidence_ids,
+            score_breakdown=[
+                {
+                    "stage": "signature",
+                    "kind": "typed_container_state",
+                    "label": rationale,
+                    "score_floor": 9.0,
+                    "force_high": True,
+                }
+            ],
+            confidence_gate={
+                "score_floor_passed": True,
+                "medium_score_passed": True,
+                "high_score_passed": True,
+                "force_high": True,
+                "signature_promoted": True,
+            },
+        )
+    return [promoted] + [candidate for candidate in candidates if candidate.family != family]
 
 
 def _trigger_for_family(candidates: list[RankedCause], family: str) -> str:

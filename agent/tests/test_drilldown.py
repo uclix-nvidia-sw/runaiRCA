@@ -75,6 +75,38 @@ def test_metric_domain_queries_reject_sql_syntax_and_normalize_double_escaped_lo
     )
 
 
+def test_logql_sanitizer_rewrites_invalid_regex_escapes_to_raw_strings() -> None:
+    sanitized, error = drilldown._sanitize_metric_query(
+        r'{namespace="runai"} |~ "error\-code \d+"', "logql_query"
+    )
+
+    assert error is None
+    assert sanitized == '{namespace="runai"} |~ `error\\-code \\d+`'
+    assert drilldown._sanitize_metric_query(
+        '{namespace="runai"} |~ "error code"', "logql_query"
+    ) == ('{namespace="runai"} |~ "error code"', None)
+
+
+def test_logql_sanitizer_doubles_invalid_escapes_when_literal_contains_backtick() -> None:
+    sanitized, error = drilldown._sanitize_metric_query(
+        '{namespace="runai"} |~ "error\\d`code\\n"', "logql_query"
+    )
+
+    assert error is None
+    assert sanitized == '{namespace="runai"} |~ "error\\\\d`code\\n"'
+
+
+def test_logql_sanitizer_still_normalizes_double_serialized_queries() -> None:
+    assert drilldown._sanitize_metric_query(
+        r'{namespace=\"runai\"} |~ \"error\"', "logql_query"
+    ) == ('{namespace="runai"} |~ "error"', None)
+
+
+def test_promql_sanitizer_is_not_escape_hardened() -> None:
+    query = r'{namespace="runai"} |~ "error\d+"'
+    assert drilldown._sanitize_metric_query(query, "promql_query") == (query, None)
+
+
 def test_kubernetes_prompt_refuses_configuration_as_observed_preemption() -> None:
     prompt = drilldown._system_prompt("kubernetes", {})
 
@@ -622,6 +654,52 @@ async def test_logql_drilldown_rejects_pipeline_sort_limit_and_unescapes_llm_que
 
 def test_drilldown_prompt_explicitly_excludes_logql_sort_and_limit() -> None:
     assert "LogQL has NO sort/limit pipeline stages" in drilldown._system_prompt("loki", {})
+
+
+def test_logql_tool_description_lists_live_labels_and_pod_first_guidance() -> None:
+    grounded = drilldown._domain_tools(
+        drill_settings(loki_url="http://loki"),
+        {"namespace": ["runai"], "pod": [], "node": ["dgx01"]},
+    )["loki"]["logql_query"]["description"]
+    fallback = drilldown._domain_tools(drill_settings(loki_url="http://loki"))["loki"][
+        "logql_query"
+    ]["description"]
+
+    assert "ONLY these labels" in grounded
+    assert "namespace=runai" in grounded
+    assert "never started has no container logs" in grounded
+    assert "Existing stream labels" not in fallback
+
+
+@pytest.mark.asyncio
+async def test_run_drilldowns_fetches_label_catalog_once_and_only_for_loki(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+    original_domain_tools = drilldown._domain_tools
+
+    async def fake_catalog(_settings, time_range):
+        calls.append({"time_range": time_range})
+        return {"namespace": ["runai"]}
+
+    def domain_tools(settings, labels=None):
+        return original_domain_tools(settings, labels)
+
+    async def conclude(*_args, **_kwargs):
+        return {"action": "done"}
+
+    monkeypatch.setattr(drilldown, "loki_label_catalog", fake_catalog)
+    monkeypatch.setattr(drilldown, "_domain_tools", domain_tools)
+    monkeypatch.setattr(drilldown, "complete_json", conclude)
+    settings = drill_settings(loki_url="http://loki")
+    loki_result = CollectorResult(agent="loki", status="ok", summary="base logs")
+    await run_drilldowns(settings, [loki_result], _target(), None)
+    await run_drilldowns(
+        replace(settings, loki_url="http://loki", prometheus_url="http://prom"),
+        [CollectorResult(agent="prometheus", status="ok", summary="base metrics")],
+        _target(),
+        None,
+    )
+
+    assert len(calls) == 1
 
 
 def test_drilldown_allows_only_one_llm_repair_after_query_parser_rejection(monkeypatch) -> None:

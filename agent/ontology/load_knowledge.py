@@ -27,9 +27,8 @@ from typing import Any
 import yaml
 
 from app.config import load_settings
-from app.ontology.typedb_client import _concept_value
+from app.ontology.typedb_client import _concept_value, open_driver
 from app.ontology.typedb_client import escape_typeql as esc
-from app.ontology.typedb_client import open_driver
 
 KNOWLEDGE_FILE = Path(os.getenv("FAILURE_MODES_FILE", "knowledge/failure_modes.yaml"))
 
@@ -62,6 +61,47 @@ def _exists(tx: Any, match: str) -> bool:
 def _ensure_cause(tx: Any, family: str) -> None:
     if not _exists(tx, f'$x isa {family}, has subtype "{esc(family)}";'):
         tx.query(f'insert $x isa {family}, has subtype "{esc(family)}";').resolve()
+
+
+def _replace_attribute(
+    tx: Any, symptom_name: str, attribute: str, desired_values: list[str]
+) -> None:
+    """Reconcile a scalar or multi-valued symptom attribute with YAML."""
+    desired = {value for value in desired_values if value}
+    current_rows = list(
+        tx.query(
+            f'match $s isa symptom, has name "{esc(symptom_name)}", '
+            f'has {attribute} $value; select $value;'
+        ).resolve().as_concept_rows()
+    )
+    for row in current_rows:
+        get = getattr(row, "get", None)
+        if not callable(get):
+            continue
+        concept = get("value")
+        if concept is None:
+            continue
+        current = str(_concept_value(concept))
+        if current in desired:
+            continue
+        tx.query(
+            f'match $s isa symptom, has name "{esc(symptom_name)}", '
+            f'has {attribute} $value; $value == "{esc(current)}"; '
+            "delete has $value of $s;"
+        ).resolve()
+    for value in desired_values:
+        if not value:
+            continue
+        if _exists(
+            tx,
+            f'$x isa symptom, has name "{esc(symptom_name)}", '
+            f'has {attribute} "{esc(value)}";',
+        ):
+            continue
+        tx.query(
+            f'match $s isa symptom, has name "{esc(symptom_name)}"; '
+            f'insert $s has {attribute} "{esc(value)}";'
+        ).resolve()
 
 
 def _ensure_symptom(
@@ -108,34 +148,10 @@ def _ensure_symptom(
             f'match $s isa symptom, has name "{esc(name)}", has keyword $kw; '
             f'$kw == "{esc(current)}"; delete has $kw of $s;'
         ).resolve()
-    if reason and not _exists(
-        tx, f'$x isa symptom, has name "{esc(name)}", has reason "{esc(reason)}";'
-    ):
-        tx.query(
-            f'match $s isa symptom, has name "{esc(name)}"; '
-            f'insert $s has reason "{esc(reason)}";'
-        ).resolve()
-    if reason_ko and not _exists(
-        tx, f'$x isa symptom, has name "{esc(name)}", has reason_ko "{esc(reason_ko)}";'
-    ):
-        tx.query(
-            f'match $s isa symptom, has name "{esc(name)}"; '
-            f'insert $s has reason_ko "{esc(reason_ko)}";'
-        ).resolve()
-    if component and not _exists(
-        tx, f'$x isa symptom, has name "{esc(name)}", has component "{esc(component)}";'
-    ):
-        tx.query(
-            f'match $s isa symptom, has name "{esc(name)}"; '
-            f'insert $s has component "{esc(component)}";'
-        ).resolve()
-    if name_ko and not _exists(
-        tx, f'$x isa symptom, has name "{esc(name)}", has name_ko "{esc(name_ko)}";'
-    ):
-        tx.query(
-            f'match $s isa symptom, has name "{esc(name)}"; '
-            f'insert $s has name_ko "{esc(name_ko)}";'
-        ).resolve()
+    _replace_attribute(tx, name, "reason", [reason])
+    _replace_attribute(tx, name, "reason_ko", [reason_ko])
+    _replace_attribute(tx, name, "component", [component])
+    _replace_attribute(tx, name, "name_ko", [name_ko])
     if exclusive_actions and not _exists(
         tx, f'$x isa symptom, has name "{esc(name)}", has exclusive_actions true;'
     ):
@@ -143,16 +159,7 @@ def _ensure_symptom(
             f'match $s isa symptom, has name "{esc(name)}"; '
             "insert $s has exclusive_actions true;"
         ).resolve()
-    for statement_ko in actions_ko or []:
-        if _exists(
-            tx,
-            f'$x isa symptom, has name "{esc(name)}", has statement_ko "{esc(statement_ko)}";',
-        ):
-            continue
-        tx.query(
-            f'match $s isa symptom, has name "{esc(name)}"; '
-            f'insert $s has statement_ko "{esc(statement_ko)}";'
-        ).resolve()
+    _replace_attribute(tx, name, "statement_ko", actions_ko or [])
 
 
 def _ensure_action(tx: Any, statement: str) -> None:

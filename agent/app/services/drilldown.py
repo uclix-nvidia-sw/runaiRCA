@@ -68,6 +68,7 @@ from app.collectors.loki import (
     _loki_native_response_complete,
     _loki_streams,
     _sample_lines,
+    loki_label_catalog,
     loki_mcp_query,
 )
 from app.collectors.prometheus import prom_mcp_query, prom_query
@@ -117,6 +118,8 @@ _PROMQL_UNSUPPORTED_SYNTAX_RE = re.compile(
     re.IGNORECASE,
 )
 _QUERY_STRING_LITERAL_RE = re.compile(r'"(?:\\.|[^"\\])*"')
+# Go string unescaping rejects regex escapes such as ``\d`` and ``\-``.
+_LOGQL_INVALID_STRING_ESCAPE_RE = re.compile(r"\\([^abfnrtv\\'\"0-7xuU])")
 
 
 async def run_drilldowns(
@@ -136,7 +139,10 @@ async def run_drilldowns(
         settings, settings.llm_model_drilldown
     ):
         return
-    registry = _domain_tools(settings)
+    loki_labels: dict[str, list[str]] | None = None
+    if settings.loki_url and any(result.agent == "loki" for result in results):
+        loki_labels = await loki_label_catalog(settings, incident_time_range(target))
+    registry = _domain_tools(settings, loki_labels) if loki_labels else _domain_tools(settings)
     # One receipt ledger is shared by every domain agent in this analysis.
     # Seed all collector results before tasks start so concurrently launched
     # agents cannot repeat a base query or a cross-domain adapter alias.
@@ -1053,7 +1059,18 @@ def _sanitize_metric_query(query: str, tool: str) -> tuple[str, str | None]:
     if unsupported.search(syntax_view):
         language = "LogQL" if tool == "logql_query" else "PromQL"
         return "", f"invalid {language} query: unsupported sort/limit or SQL syntax"
+    if tool == "logql_query":
+        normalized = _QUERY_STRING_LITERAL_RE.sub(_harden_logql_string_literal, normalized)
     return normalized, None
+
+
+def _harden_logql_string_literal(match: re.Match[str]) -> str:
+    inner = match.group(0)[1:-1]
+    if "\\" not in inner:
+        return match.group(0)
+    if "`" not in inner:
+        return f"`{inner}`"
+    return '"' + _LOGQL_INVALID_STRING_ESCAPE_RE.sub(r"\\\\\1", inner) + '"'
 
 
 def _resolve_probe_template(value: Any, values: dict[str, str]) -> Any | None:
@@ -1647,7 +1664,17 @@ _KNOWN_PROMQL_SERIES = (
     "kube_pod_status_phase, kube_pod_container_status_restarts_total, "
     "container_memory_working_set_bytes, container_cpu_usage_seconds_total"
 )
-def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
+def _loki_label_reference(catalog: dict[str, list[str]]) -> str:
+    parts = []
+    for name in sorted(catalog)[:30]:
+        values = [str(value) for value in catalog[name][:20] if value]
+        parts.append(f"{name}={','.join(values)}" if values else name)
+    return "; ".join(parts)[:1500]
+
+
+def _domain_tools(
+    settings: Settings, loki_labels: dict[str, list[str]] | None = None
+) -> dict[str, dict[str, dict[str, Any]]]:
     """Per-agent tool registries — THE scoping boundary between domains."""
     change_sources = "all|controller|pod|event"
     if getattr(settings, "enable_helm_change_detection", False):
@@ -1745,13 +1772,26 @@ def _domain_tools(settings: Settings) -> dict[str, dict[str, dict[str, Any]]]:
             }
         }
     if settings.loki_mcp_url or settings.loki_url:
+        loki_description = (
+            "One MCP-first LogQL range query against Loki (recent window, backward). "
+            'args: query (LogQL, e.g. \'{namespace="runai"} |~ "(?i)(error|panic)"\'). '
+            "Never add sort/order by or | limit; the API controls those."
+        )
+        if loki_labels:
+            loki_description += (
+                " Existing stream labels in this Loki (label=sample values): "
+                f"{_loki_label_reference(loki_labels)}. ONLY these labels may appear "
+                "in a stream selector — any other label (an invented node/host/pod_name "
+                "label) matches zero streams. Anchor queries on the alert's pod/namespace "
+                "first; use node- or journal-level selectors ONLY when a matching label "
+                "exists in the list above. A container that never started has no container "
+                "logs, so an empty result for the alert pod's own selector is itself a "
+                "finding: record it and pivot (controller, namespace, control-plane) "
+                "instead of re-querying the same empty selector."
+            )
         registry["loki"] = {
             "logql_query": {
-                "description": (
-                    "One MCP-first LogQL range query against Loki (recent window, backward). "
-                    'args: query (LogQL, e.g. \'{namespace="runai"} |~ "(?i)(error|panic)"\'). '
-                    "Never add sort/order by or | limit; the API controls those."
-                ),
+                "description": loki_description,
                 "call": _tool_logql,
             }
         }
