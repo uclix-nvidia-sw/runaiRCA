@@ -25,6 +25,69 @@ class _McpResult:
         self.content = [SimpleNamespace(text=text)] if text else []
 
 
+@pytest.mark.asyncio
+async def test_loki_label_catalog_caps_labels_and_fetches_values_only_for_allowlist(
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def fake_get_json(**kwargs):
+        calls.append(kwargs)
+        path = kwargs["path"]
+        if path == "/loki/api/v1/labels":
+            return JsonResponse(
+                url="http://loki/loki/api/v1/labels",
+                status_code=200,
+                data={"status": "success", "data": ["namespace", "node", "pod", "filename"]},
+            )
+        label = str(path).split("/")[-2]
+        return JsonResponse(
+            url=str(path),
+            status_code=200,
+            data={"status": "success", "data": [f"{label}-value"]},
+        )
+
+    monkeypatch.setattr(loki, "get_json", fake_get_json)
+    time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+    catalog = await loki.loki_label_catalog(
+        replace(make_settings(), loki_url="http://loki", loki_timeout_seconds=120),
+        time_range,
+    )
+
+    assert catalog == {
+        "filename": [],
+        "namespace": ["namespace-value"],
+        "node": ["node-value"],
+        "pod": [],
+    }
+    assert calls[0]["path"] == "/loki/api/v1/labels"
+    assert all(call["params"] == time_range for call in calls)
+    assert all(call["timeout_seconds"] == 5 for call in calls)
+    assert {call["path"] for call in calls[1:]} == {
+        "/loki/api/v1/label/namespace/values",
+        "/loki/api/v1/label/node/values",
+    }
+
+
+@pytest.mark.asyncio
+async def test_loki_label_catalog_returns_empty_on_error_or_missing_url(monkeypatch) -> None:
+    calls = 0
+
+    async def fake_get_json(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return JsonResponse(url="http://loki/labels", status_code=500, error="HTTP 500")
+
+    monkeypatch.setattr(loki, "get_json", fake_get_json)
+    assert await loki.loki_label_catalog(replace(make_settings(), loki_url="")) == {}
+    assert calls == 0
+    assert (
+        await loki.loki_label_catalog(replace(make_settings(), loki_url="http://loki"))
+        == {}
+    )
+    assert calls == 1
+
+
 def _patch_mcp_calls(monkeypatch, module, call) -> None:
     async def call_many(url, calls):
         return [await call(url, tool, arguments) for tool, arguments in calls]

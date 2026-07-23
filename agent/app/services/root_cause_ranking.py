@@ -365,11 +365,15 @@ def merge_open_world_candidates(
     merged = [*known, *novel]
     merged.sort(
         key=lambda candidate: (
-            candidate.confidence == "high",
+            # A signature-grounded catalog family outranks ANY novel candidate,
+            # whatever the novel one's confidence: three corroborating groups
+            # give open-world 'high', and confidence-first let that displace a
+            # medium catalog candidate carrying a dispositive signature.
             candidate.novelty == "catalog" and any(
                 "signature" in str(reason).lower() or "xid" in str(reason).lower()
                 for reason in candidate.rationale
             ),
+            candidate.confidence == "high",
             not candidate.contradiction_evidence_ids,
             candidate.score,
         ),

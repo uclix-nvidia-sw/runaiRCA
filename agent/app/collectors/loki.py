@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import logging
 import re
 from datetime import UTC, datetime
 
 from app.collectors.base import (
-    NO_EVIDENCE,
     _NON_PROJECT_NAMESPACES,
+    NO_EVIDENCE,
     AnalysisTarget,
     CollectorResult,
     artifact,
@@ -36,6 +38,8 @@ from app.mcp_client import (
     mcp_tls_verify,
     mcp_tool_json,
 )
+
+_log = logging.getLogger(__name__)
 
 _LOKI_FAILURE_TOKEN_RE = re.compile(
     r"\b(?:error|fail(?:ed|ure)?|oom(?:killed)?|evict(?:ed|ion)?|"
@@ -436,6 +440,80 @@ def _loki_headers(settings: Settings) -> tuple[dict[str, str], list[str]]:
                 "LOKI_BASIC_USERNAME and LOKI_BASIC_PASSWORD must both be set for Loki basic auth."
             )
     return headers, warnings
+
+
+_LABEL_CATALOG_VALUE_LABELS = ("namespace", "app", "job", "node", "unit", "container")
+_LABEL_CATALOG_MAX_LABELS = 30
+_LABEL_CATALOG_MAX_VALUES = 20
+_LABEL_CATALOG_TIMEOUT_SECONDS = 5
+
+
+async def loki_label_catalog(
+    settings: Settings, time_range: dict[str, str] | None = None
+) -> dict[str, list[str]]:
+    """Return the incident-window Loki stream labels and selected sample values.
+
+    The Grafana MCP adapter cannot enumerate Loki labels, so the catalog is only
+    available when a direct ``loki_url`` is configured.
+    """
+    if not settings.loki_url:
+        return {}
+
+    headers, _ = _loki_headers(settings)
+    timeout = min(settings.loki_timeout_seconds, _LABEL_CATALOG_TIMEOUT_SECONDS)
+    params = time_range or None
+    try:
+        response = await get_json(
+            base_url=settings.loki_url,
+            path="/loki/api/v1/labels",
+            timeout_seconds=timeout,
+            params=params,
+            headers=headers,
+            verify=mcp_tls_verify(),
+        )
+    except Exception as exc:  # noqa: BLE001 - catalog is optional grounding
+        _log.warning("Loki label catalog failed: %s", exc.__class__.__name__)
+        return {}
+    if (
+        not response.ok
+        or not isinstance(response.data, dict)
+        or not isinstance(response.data.get("data"), list)
+        or any(not isinstance(label, str) for label in response.data["data"])
+    ):
+        _log.warning(
+            "Loki label catalog unavailable or malformed: %s",
+            response.error or response.status_code,
+        )
+        return {}
+
+    labels = sorted(set(response.data["data"]))[:_LABEL_CATALOG_MAX_LABELS]
+
+    async def values_for(label: str) -> tuple[str, list[str]]:
+        if label not in _LABEL_CATALOG_VALUE_LABELS:
+            return label, []
+        try:
+            value_response = await get_json(
+                base_url=settings.loki_url,
+                path=f"/loki/api/v1/label/{label}/values",
+                timeout_seconds=timeout,
+                params=params,
+                headers=headers,
+                verify=mcp_tls_verify(),
+            )
+        except Exception:  # noqa: BLE001 - one label must not break the catalog
+            return label, []
+        data = value_response.data
+        if (
+            not value_response.ok
+            or not isinstance(data, dict)
+            or not isinstance(data.get("data"), list)
+        ):
+            return label, []
+        values = [str(value) for value in data["data"] if value]
+        return label, values[:_LABEL_CATALOG_MAX_VALUES]
+
+    pairs = await asyncio.gather(*(values_for(label) for label in labels))
+    return dict(pairs)
 
 
 async def _collect_loki_direct(

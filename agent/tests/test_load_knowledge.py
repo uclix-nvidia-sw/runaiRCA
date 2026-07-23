@@ -56,3 +56,40 @@ def test_ensure_symptom_reconciles_removed_keywords() -> None:
     assert any('insert $s has keyword "C";' in query for query in tx.queries)
     assert any('$kw == "B"; delete has $kw of $s;' in query for query in tx.queries)
     assert not any('$kw == "A"; delete has $kw of $s;' in query for query in tx.queries)
+
+
+class _ValueRow:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def get(self, name: str) -> _Concept:
+        assert name == "value"
+        return _Concept(self.value)
+
+
+class _AttributeTx(_Tx):
+    def query(self, query: str) -> _Result:
+        self.queries.append(query)
+        if "select $value;" in query:
+            return _Result([_ValueRow("old reason")])
+        if "select $x;" in query:
+            return _Result([])
+        return _Result([])
+
+
+def test_ensure_symptom_replaces_old_reason_before_inserting_new_value() -> None:
+    tx = _AttributeTx()
+
+    _ensure_symptom(tx, "symptom-1", [], reason="new reason")
+
+    delete_index = next(
+        index
+        for index, query in enumerate(tx.queries)
+        if "delete has $value of $s;" in query
+    )
+    insert_index = next(
+        index
+        for index, query in enumerate(tx.queries)
+        if 'insert $s has reason "new reason";' in query
+    )
+    assert delete_index < insert_index

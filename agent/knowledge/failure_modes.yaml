@@ -799,7 +799,7 @@
     - name: ImagePullBackOff
       name_ko: 이미지 pull 반복 실패(ImagePullBackOff)
       keywords: [imagepullbackoff, errimagepull]
-      reason_ko: "노드가 컨테이너 이미지를 받지 못해 ImagePullBackOff 상태가 반복되고 있지만, 현재 상태명만으로는 repository·tag·인증·network 중 어느 원인인지 확정할 수 없습니다."
+      reason_ko: "Pod의 컨테이너 이미지를 노드의 kubelet이 레지스트리에서 받아오지 못해 ImagePullBackOff가 반복되고 있습니다. 상태명만으로는 repository·tag·인증·network 중 어느 원인인지 확정할 수 없습니다."
       actions:
         - "Read the exact pull error and image reference from `kubectl describe pod <pod> -n <namespace>` before choosing a repository, tag, authentication, TLS, DNS, or rate-limit fix."
         - "Use the returned registry error to select one discriminating check; ImagePullBackOff is a retry state, not the root cause by itself."

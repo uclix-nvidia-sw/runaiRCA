@@ -693,3 +693,26 @@ async def test_korean_synthesis_failure_keeps_deterministic_report(monkeypatch) 
     )
     assert synth is None
     assert diagnostics == ["synthesis returned no valid JSON report"]
+
+
+# --- closed family universe (graph knowledge cannot mint headline families) ---
+
+
+def test_catalog_only_knowledge_drops_llm_authored_graph_families(caplog) -> None:
+    # 2026-07-22: an old ingest wrote 'workload_startup_image_failure' into
+    # TypeDB; consumed as a curated symptom it displaced image_pull_error and
+    # forced a harness abstain over 64 ImagePullBackOff warnings.
+    from app.services.pipeline import _catalog_only_knowledge
+
+    knowledge = {
+        "image_pull_error": [{"symptom": "ImagePullBackOff", "keywords": ["imagepullbackoff"]}],
+        "workload_startup_image_failure": [{"symptom": "invented", "keywords": ["imagepull"]}],
+    }
+    with caplog.at_level("WARNING"):
+        kept = _catalog_only_knowledge(knowledge)
+    assert set(kept) == {"image_pull_error"}
+    assert "workload_startup_image_failure" in caplog.text
+
+    # Catalog-only input passes through untouched; empty graph falls back.
+    assert _catalog_only_knowledge({"image_pull_error": []}) == {"image_pull_error": []}
+    assert _catalog_only_knowledge(None) == {}
