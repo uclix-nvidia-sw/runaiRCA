@@ -92,9 +92,17 @@ export async function fetchAnalysisRun(id: string): Promise<AnalysisRun> {
 }
 
 export async function fetchAnalysisEvaluation(runID: string): Promise<EvaluationView> {
-  return (await read<Envelope<EvaluationView>>(
+  const view = (await read<Envelope<EvaluationView>>(
     `/api/v1/analysis-runs/${encodeURIComponent(runID)}/evaluation?author=${encodeURIComponent(feedbackActorID())}`,
   )).data;
+  // Reviews are keyed to the run, but "my review" was keyed to a per-origin
+  // browser actor: every NodePort re-roll minted a new actor and the form came
+  // back empty even though the review was safely stored. Prefill from the
+  // latest stored review whenever the actor lookup misses.
+  if (!view.my_review && view.reviews?.length) {
+    view.my_review = view.reviews[view.reviews.length - 1];
+  }
+  return view;
 }
 
 export async function saveAnalysisEvaluation(runID: string, input: EvaluationReviewInput): Promise<EvaluationReview> {
@@ -429,19 +437,18 @@ function stringField(value: unknown) {
 }
 
 function feedbackActorID() {
+  // Single-operator deployment: the actor must be stable across origins.
+  // Random per-origin browser-* ids meant every NodePort re-roll orphaned the
+  // saved evaluations and stacked a duplicate review row per run. A custom
+  // actor set in localStorage still wins; legacy browser-* ids are migrated.
   try {
     const existing = window.localStorage.getItem(FEEDBACK_ACTOR_KEY);
-    if (existing) {
+    if (existing && !existing.startsWith('browser-')) {
       return existing;
     }
-    const random =
-      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const actor = `browser-${random}`;
-    window.localStorage.setItem(FEEDBACK_ACTOR_KEY, actor);
-    return actor;
+    window.localStorage.setItem(FEEDBACK_ACTOR_KEY, 'operator');
   } catch {
-    return 'browser-anonymous';
+    // storage unavailable — fall through to the shared identity
   }
+  return 'operator';
 }
