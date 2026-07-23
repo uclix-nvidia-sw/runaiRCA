@@ -1,0 +1,233 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:4b088e60d163
+  source_revision_hash: sha256:07e87f0c8ae6a41c90c835cf24d25609255cba57db6e7821600de81fd46b24c5
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_with_warnings
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+incident:
+  title: PVC canAdd policy gates existing-PVC use without native lifecycle separation
+  masked_summary: A Run:ai 2.24.65 policy set storage.pvc.instances.canAdd to false
+    to block new PVC creation, and the customer reported that existing PVCs could
+    not be mounted. NVIDIA Support diagnosed designed policy behavior that gates PVC
+    workload entries without distinguishing new creation from existing use. Support
+    proposed an explicit defaults allow list, but no execution or result was supplied
+    and the native feature request remained open at administrative closure.
+  status: unresolved
+  occurred_at: '2026-04-12'
+  resolved_at: null
+  family: runai_control_plane_error
+  family_confidence: medium
+  observed_mechanism: With no PVC instances listed in policy defaults and storage.pvc.instances.canAdd
+    set to false, the customer reported that existing PVCs could not be mounted.
+  observed_mechanism_confidence: medium
+  confirmed_mechanism: NVIDIA Support diagnosed that canAdd gates addition of PVC
+    entries to a workload without natively distinguishing new-PVC creation from existing-PVC
+    use; Support stated that explicit default-listed PVC names are allowed while unlisted
+    names remain blocked.
+  confirmed_mechanism_confidence: medium
+searchable_context:
+  normalized_symptoms:
+  - existing PVC cannot be mounted after storage.pvc.instances.canAdd is set to false
+  - policy cannot natively separate new-PVC creation from existing-PVC use
+  - allowed existing PVCs must be explicitly listed in policy defaults
+  metric_signatures: []
+  error_signatures: []
+  issue_references: []
+  canonical_component_tokens:
+  - runai-policy-model
+  version_tokens:
+  - runai-control-plane:2.24.65
+  - runai-cluster:2.24.65
+  trigger_tokens:
+  - storage.pvc.instances.canAdd:false
+  - no-default-listed-pvc-instances
+  retrieval_keywords:
+  - storage.pvc.instances canAdd false
+  - existingPvc true
+  - claimName in policy defaults
+  - existing PVC allow list
+  - block new PVC creation while allowing existing PVC use
+  curated_signature_tokens:
+  - storage.pvc.instances canAdd false
+  - existingPvc true
+  - claimName in policy defaults
+evidence_refs:
+- evidence_id: E001
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer reported that existing PVCs could not be mounted after
+    applying a policy intended to block new PVC creation.
+  supports:
+  - F001
+  - H001
+  - A001
+- evidence_id: E002
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: raw_configuration
+  artifact_availability: quoted_in_transcript
+  masked_summary: The quoted policy has storage.pvc.instances.canAdd false and no
+    default-listed PVC instances; the environment-specific policy identifier is removed.
+  supports:
+  - F002
+  - H001
+  - A001
+- evidence_id: E003
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support diagnosed that canAdd controls adding PVC workload entries
+    and does not natively distinguish creating a PVC from using an existing one.
+  supports:
+  - F003
+  - H001
+  - A001
+- evidence_id: E004
+  source_message_ids:
+  - M003
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer requested product-team escalation and described the limitation
+    as operationally critical.
+  supports:
+  - A002
+- evidence_id: E005
+  source_message_ids:
+  - M004
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support classified the behavior as working as designed and the requested
+    separation as a feature request rather than a bug fix.
+  supports:
+  - F003
+  - F005
+  - H001
+  - A002
+- evidence_id: E006
+  source_message_ids:
+  - M005
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer reported Run:ai control-plane and cluster version 2.24.65.
+  supports: []
+- evidence_id: E007
+  source_message_ids:
+  - M006
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support stated that default-listed existing PVC names are allowed
+    under canAdd false while unlisted names are blocked; no customer result was supplied.
+  supports:
+  - F004
+  - H002
+  - A003
+- evidence_id: E008
+  source_message_ids:
+  - M006
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support said each allowed PVC must be listed by name and future
+    allowed PVCs require policy updates.
+  supports:
+  - F004
+  - A003
+- evidence_id: E009
+  source_message_ids:
+  - M006
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support stated that the native policy-separation feature request
+    remained open.
+  supports:
+  - F005
+  - F006
+  - A002
+- evidence_id: E010
+  source_message_ids:
+  - M007
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support administratively closed the case and referred the customer
+    to future release notes without reporting workaround success or feature delivery.
+  supports:
+  - F006
+historical_actions:
+- action_id: A001
+  normalized_action: Apply storage.pvc.instances.canAdd false without default-listed
+    PVC instances.
+  outcome: partially_effective
+  verified: true
+  evidence_ids:
+  - E001
+  - E002
+  - E003
+- action_id: A002
+  normalized_action: Escalate native separation of new-PVC creation and existing-PVC
+    use as a product feature request.
+  outcome: unknown_outcome
+  verified: true
+  evidence_ids:
+  - E004
+  - E005
+  - E009
+- action_id: A003
+  normalized_action: Pre-register each allowed existing PVC name in policy defaults
+    with existingPvc true, claimName, and path while retaining canAdd false.
+  outcome: unknown_outcome
+  verified: false
+  evidence_ids:
+  - E007
+  - E008
+knowledge_links:
+  known_issue_matches: []
+  failure_mode_matches: []
+  family_candidates:
+  - family: runai_control_plane_error
+    confidence: medium
+  - family: k8s_storage_error
+    confidence: low
+historical_use:
+  context_class: unresolved_context
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - action_reference
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: The case can provide labelled context for a policy-semantic pattern
+    and an unverified allow-list workaround, but it has no raw behavior evidence or
+    post-change result, the native feature remained open, and administrative closure
+    is not technical resolution.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false

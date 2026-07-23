@@ -1,0 +1,394 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:06cac3aa2bc2
+  source_revision_hash: sha256:6964fe069b9654b4ccdcd637bb0315ee2bf6072f0dece6adc307bf5eea1f895f
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_with_warnings
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+incident:
+  title: Run:ai v2.24 reports collector failed with the pre-v2.24 S3 Secret key name
+  masked_summary: Report jobs remained Pending because the backend reports collector
+    failed its startup bucket check with Access Denied. Other credential paths could
+    access the storage, but S3-side reporting indicated the backend request lacked
+    an Authorization header. Support relayed Engineering's v2.24 change from S3_ACCESS_KEY
+    to S3.ACCESS_KEY, and the customer confirmed successful report generation after
+    updating both backend Secrets in the internal reproduction context; later validation
+    in the original customer environment was not reported.
+  status: resolved
+  occurred_at: '2026-03-05'
+  resolved_at: '2026-04-01'
+  family: runai_control_plane_error
+  family_confidence: high
+  observed_mechanism: The backend reports collector stopped during its startup BucketExists
+    or HeadBucket check with Access Denied, so the reports processor did not start
+    and report jobs remained Pending; other credential paths could access the storage.
+  observed_mechanism_confidence: high
+  confirmed_mechanism: Run:ai v2.24 expected the S3 secret key name S3.ACCESS_KEY,
+    while the backend Secrets used S3_ACCESS_KEY; the credential was not applied to
+    report-storage requests, which lacked an Authorization header and failed the startup
+    bucket check until both Secrets were corrected.
+  confirmed_mechanism_confidence: medium
+searchable_context:
+  normalized_symptoms:
+  - Report generation remains Pending after Reports is enabled
+  - Backend reports processor does not start
+  - Reports collector startup bucket check returns Access Denied
+  - Storage access works through workload and AWS CLI paths but backend requests lack
+    Authorization
+  - Same configuration works on 2.23.60 and fails on 2.24.58
+  - Reports generate after S3_ACCESS_KEY is changed to S3.ACCESS_KEY
+  metric_signatures: []
+  error_signatures:
+  - 'failed to start processor: failed to create reports collector'
+  - 'bucket <report-bucket> does not exists. err: Access Denied'
+  - requests sent without an Authorization header
+  - the s3 url is wrong and cannot be processed
+  issue_references: []
+  canonical_component_tokens:
+  - runai-backend-metrics-service
+  - runai-backend-org-unit-service
+  - reports-processor
+  - s3-compatible-object-storage
+  version_tokens:
+  - Run:ai 2.24.52
+  - Run:ai 2.24.58
+  - Run:ai 2.23.60
+  trigger_tokens:
+  - v2.24 backend S3 Secret key-name change
+  - S3_ACCESS_KEY used where S3.ACCESS_KEY was expected
+  - report processor startup BucketExists or HeadBucket check
+  retrieval_keywords:
+  - failed to start processor failed to create reports collector
+  - bucket does not exists Access Denied
+  - report generation Pending metrics service
+  - requests without Authorization header
+  - S3_ACCESS_KEY S3.ACCESS_KEY v2.24
+  - runai backend metrics service reports
+evidence_refs:
+- evidence_id: E001
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer reported reports remaining Pending after enabling the feature
+    on control-plane 2.24.52.
+  supports:
+  - F001
+  - H001
+  - H002
+  - H003
+- evidence_id: E002
+  source_message_ids:
+  - M004
+  source_actor: nvidia_support
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support quoted the reports-collector startup failure ending in Access
+    Denied.
+  supports:
+  - F001
+  - F003
+  - H001
+  - H003
+- evidence_id: E003
+  source_message_ids:
+  - M005
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer reported successful access to the same storage from a workload
+    data source.
+  supports:
+  - F002
+  - H001
+  - H002
+  - H003
+- evidence_id: E004
+  source_message_ids:
+  - M006
+  - M010
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support distinguished backend report credentials and described the
+    startup BucketExists or HeadBucket check.
+  supports:
+  - F001
+  - F003
+  - H001
+  - H002
+  - H003
+- evidence_id: E005
+  source_message_ids:
+  - M007
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: quoted_in_transcript
+  masked_summary: Permission review and metrics-service restart did not eliminate
+    Access Denied.
+  supports:
+  - F004
+  - H001
+  - A002
+- evidence_id: E006
+  source_message_ids:
+  - M009
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: quoted_in_transcript
+  masked_summary: Adding the old S3_ACCESS_KEY name and restarting backend services
+    did not resolve the collector failure.
+  supports:
+  - F004
+  - H003
+  - A003
+- evidence_id: E007
+  source_message_ids:
+  - M009
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer quoted successful bucket and object listing from an AWS
+    CLI pod in the backend cluster.
+  supports:
+  - F002
+  - H001
+  - H002
+  - H003
+  - A005
+- evidence_id: E008
+  source_message_ids:
+  - M010
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support proposed endpoint style, endpoint format, or region as a
+    preliminary explanation.
+  supports:
+  - F003
+  - H002
+  - A004
+- evidence_id: E009
+  source_message_ids:
+  - M011
+  - M012
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: quoted_in_transcript
+  masked_summary: Endpoint and region variants were ineffective while AWS CLI HeadBucket
+    succeeded.
+  supports:
+  - F002
+  - F004
+  - H001
+  - H002
+  - H003
+  - A004
+  - A005
+- evidence_id: E010
+  source_message_ids:
+  - M015
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Customer relayed that S3-side logs showed backend requests without
+    an Authorization header and HTTP 403 rejection.
+  supports:
+  - F005
+  - H001
+  - H003
+  - A006
+- evidence_id: E011
+  source_message_ids:
+  - M017
+  - M019
+  - M020
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support reported Engineering escalation and review scheduling.
+  supports:
+  - A006
+- evidence_id: E012
+  source_message_ids:
+  - M018
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: quoted_in_transcript
+  masked_summary: Identical configuration reportedly generated reports on 2.23.60
+    and failed on 2.24.58 with the same collector error.
+  supports:
+  - F006
+  - H001
+  - H003
+  - A006
+- evidence_id: E013
+  source_message_ids:
+  - M021
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support relayed Engineering's v2.24 key-name change from S3_ACCESS_KEY
+    to S3.ACCESS_KEY and named the two Secrets to update.
+  supports:
+  - F007
+  - H001
+  - H002
+  - H003
+  - A006
+  - A007
+- evidence_id: E014
+  source_message_ids:
+  - M022
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: quoted_in_transcript
+  masked_summary: Following the internal reproduction, the customer confirmed successful
+    report generation after applying the dotted Secret key name; later validation
+    in the original customer environment was not reported.
+  supports:
+  - F008
+  - H001
+  - H002
+  - H003
+  - A007
+- evidence_id: E015
+  source_message_ids:
+  - M023
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support reported submitting a documentation update request for the
+    v2.24 Secret key and configuration format.
+  supports:
+  - A008
+- evidence_id: E016
+  source_message_ids:
+  - M024
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer requested closure after the successful report-generation
+    result.
+  supports: []
+- evidence_id: E017
+  source_message_ids:
+  - M003
+  - M009
+  - M015
+  - M022
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Customer referenced diagnostics, logs, ConfigMaps, Secrets, and
+    screenshots that are unavailable locally.
+  supports:
+  - F009
+  - A001
+- evidence_id: E018
+  source_message_ids: []
+  source_actor: system
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Portal close metadata predates the final resolution-confirmation
+    and closure messages.
+  supports:
+  - F009
+historical_actions:
+- action_id: A001
+  normalized_action: Collect and attach cluster and backend diagnostics.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E017
+- action_id: A002
+  normalized_action: Review report-storage permissions and restart metrics service.
+  outcome: ineffective
+  verified: true
+  evidence_ids:
+  - E005
+- action_id: A003
+  normalized_action: Add the old-style S3_ACCESS_KEY and restart backend services.
+  outcome: ineffective
+  verified: true
+  evidence_ids:
+  - E006
+- action_id: A004
+  normalized_action: Test full endpoint URL and AWS_REGION configuration variants.
+  outcome: ineffective
+  verified: true
+  evidence_ids:
+  - E008
+  - E009
+- action_id: A005
+  normalized_action: Test bucket listing and HeadBucket through an AWS CLI pod.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E007
+  - E009
+- action_id: A006
+  normalized_action: Escalate the cross-version reproduction and missing-Authorization
+    observation to Engineering.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E010
+  - E011
+  - E012
+  - E013
+- action_id: A007
+  normalized_action: Change S3_ACCESS_KEY to S3.ACCESS_KEY in both backend Secrets.
+  outcome: resolving
+  verified: true
+  evidence_ids:
+  - E013
+  - E014
+- action_id: A008
+  normalized_action: Submit documentation updates for the v2.24 Secret and YAML format.
+  outcome: preventive
+  verified: true
+  evidence_ids:
+  - E015
+knowledge_links:
+  known_issue_matches: []
+  failure_mode_matches: []
+  family_candidates:
+  - family: runai_control_plane_error
+    confidence: high
+  - family: storage_backend_error
+    confidence: low
+  - family: platform_lifecycle_change
+    confidence: low
+historical_use:
+  context_class: evaluation_only
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - action_reference
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: The case has a targeted Secret-key correction validated after an
+    internal cross-version reproduction, but original-customer-environment revalidation
+    is not stated, raw diagnostic and configuration artifacts are unavailable, Engineering
+    confirmation is relayed, and the current loader has no resolved-positive route.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false

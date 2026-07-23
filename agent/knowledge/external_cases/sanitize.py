@@ -49,6 +49,16 @@ _CURATED_TOKENS = {
     "1f328ed5fa18": ["DCGM_FI_DEV_GPU_UTIL", "RUN-39130", "clamp_max"],
     # all-blocked storage policy shows every storage option (runai_control_plane_error)
     "4f211c4d1ebb": ["canAdd false", "2.23.71 fix", "Run:ai 2.23.x"],
+    # existing-PVC-only storage policy: new PVC blocked, existing allowed
+    # (runai_control_plane_error)
+    "4b088e60d163": ["storage.pvc.instances canAdd false", "existingPvc true",
+                     "claimName in policy defaults"],
+    # negative CPU utilization from duplicate node-exporter scrape (observability_accuracy)
+    "83292dbb5fe3": ["negative CPU compute utilization", "duplicate node-exporter scrape",
+                     "ServiceMonitor PodMonitor duplicate collection"],
+    # fractional GPU metrics missing under CDI/device-plugin rename (observability_accuracy)
+    "f8cc6eda604d": ["runai_pod_gpu_info", "runai_gpu_utilization_per_fractional_pod",
+                     "k8s.device-plugin.nvidia.com/gpu="],
 }
 
 
