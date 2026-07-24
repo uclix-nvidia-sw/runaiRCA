@@ -75,7 +75,20 @@ type KnowledgePromotionPreview struct {
 // functions and never persists.
 func (s *Store) knowledgePromotionPreviewLocked(runID, hash string) KnowledgePromotionPreview {
 	if strings.TrimSpace(hash) == "" {
-		return KnowledgePromotionPreview{Outcome: "blocked", Reason: "analysis has no result hash yet"}
+		// One opaque string hid three distinct situations from operators
+		// (2026-07-24 audit: 7 blocked previews = 5 failed runs + 2 legacy
+		// pre-hash rows, zero actionable signal). Name the actual state.
+		reason := "analysis has no result hash yet"
+		switch run := s.analysisRuns[strings.TrimSpace(runID)]; {
+		case run == nil:
+		case run.Status == "analyzing":
+			reason = "analysis is still running; evaluate after it completes"
+		case run.Status == "failed":
+			reason = "analysis failed and produced no result to evaluate"
+		case run.Status == "complete":
+			reason = "this run predates result hashing; re-run the analysis to make it evaluable"
+		}
+		return KnowledgePromotionPreview{Outcome: "blocked", Reason: reason}
 	}
 	var snapshot *CaseSnapshot
 	for _, snap := range s.caseSnapshots {

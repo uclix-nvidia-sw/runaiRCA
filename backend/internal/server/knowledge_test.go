@@ -121,6 +121,30 @@ func TestKnowledgePromotionPreviewSurfacesIngestionOutcome(t *testing.T) {
 	}
 }
 
+func TestKnowledgePromotionPreviewNamesTheHashlessRunState(t *testing.T) {
+	store := NewStore()
+	cases := []struct {
+		status string
+		want   string
+	}{
+		{"analyzing", "analysis is still running; evaluate after it completes"},
+		{"failed", "analysis failed and produced no result to evaluate"},
+		{"complete", "this run predates result hashing; re-run the analysis to make it evaluable"},
+	}
+	for _, tc := range cases {
+		runID := "ANL-" + tc.status
+		store.analysisRuns[runID] = &AnalysisRun{RunID: runID, Status: tc.status}
+		got := store.knowledgePromotionPreviewLocked(runID, "")
+		if got.Outcome != "blocked" || got.Reason != tc.want {
+			t.Fatalf("status %q: got %+v", tc.status, got)
+		}
+	}
+	// Unknown run keeps the generic reason.
+	if got := store.knowledgePromotionPreviewLocked("ANL-unknown", ""); got.Reason != "analysis has no result hash yet" {
+		t.Fatalf("unknown run reason changed: %+v", got)
+	}
+}
+
 func TestValidationFailedCandidateStaysIdentifiable(t *testing.T) {
 	snapshot := eligibleKnowledgeSnapshot()
 	// Break the v3 trace so no supported hypothesis matches the final root cause.
