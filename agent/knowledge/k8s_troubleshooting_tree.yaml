@@ -374,7 +374,7 @@ nodes:
           any: ["KubeNodeNotReady", "NodeFilesystemSpaceFillingUp", "NodeMemoryPressure", "NodePIDPressure", "kube_node_status_condition"]
         next: node_not_ready
       - match:
-          any: ["runai-scheduler-default", "pod group", podgroup, "gang schedul", fairshare, "over-quota", "over quota", reclaimed, preemptor, "failed to bind"]
+          any: ["runai-scheduler-default", "pod group", podgroup, "gang schedul", fairshare, "over-quota", "over quota", reclaimed, preemptor, preemptlowerpriority, "failed to bind"]
         next: runai_scheduling_failure
       - match:
           any: [forbidden, unauthorized, "cannot list resource", "cannot create resource", saml, oidc, "invalid token", "certificate has expired"]
@@ -389,7 +389,7 @@ nodes:
           any: [failedmount, failedattachvolume, "unable to attach or mount volumes", "unbound immediate persistentvolumeclaims", volumebinding, provisioningfailed]
         next: storage_failure
       - match:
-          any: ["stale file handle", "read-only file system", "nfs server", cephfs, "ceph health", "input/output error", "mount access denied", "storage latency"]
+          any: ["stale file handle", "read-only file system", "nfs server", cephfs, "ceph health", "input/output error", "mount access denied", "access denied by server", "storage latency"]
         next: storage_backend_failure
       - match:
           any: ["failed to create pod sandbox", "failed to setup network for sandbox", "cni plugin", "network plugin", ipam]
@@ -398,7 +398,7 @@ nodes:
           any: [imagepullbackoff, errimagepull, "failed to pull image", "pull access denied", "manifest unknown", toomanyrequests]
         next: image_pull_failure
       - match:
-          any: [pending, failedscheduling, unschedulable]
+          any: [pending, failedscheduling, unschedulable, insufficient cpu, insufficient memory, insufficient nvidia.com/gpu, untolerated taint]
         next: pod_or_node_symptom
       - match:
           any: ["init:crashloopbackoff", "init:errimagepull", "init container", "initcontainer"]
@@ -432,6 +432,10 @@ nodes:
         - pending
         - failedscheduling
         - unschedulable
+        - insufficient cpu
+        - insufficient memory
+        - insufficient nvidia.com/gpu
+        - untolerated taint
         - schedulinggated
         - crashloopbackoff
         - back-off restarting
@@ -452,7 +456,7 @@ nodes:
         - failed to create pod sandbox
     branches:
       - match:
-          any: [pending, failedscheduling, unschedulable, schedulinggated]
+          any: [pending, failedscheduling, unschedulable, schedulinggated, insufficient cpu, insufficient memory, insufficient nvidia.com/gpu, untolerated taint]
           fields:
             pod_phase: Pending
         next: pod_pending
@@ -493,7 +497,7 @@ nodes:
         refutes_when: ["the pod is not Pending or has no scheduler/prerequisite event"]
         source_group: kubernetes_api
     match:
-      any: [pending, failedscheduling, unschedulable]
+      any: [pending, failedscheduling, unschedulable, insufficient cpu, insufficient memory, insufficient nvidia.com/gpu, untolerated taint]
       fields:
         pod_phase: Pending
     branches:
@@ -532,6 +536,8 @@ nodes:
         - failedscheduling
         - unschedulable
         - insufficient nvidia.com/gpu
+        - insufficient cpu
+        - insufficient memory
         - untolerated taint
         - node affinity
         - node selector
@@ -1761,10 +1767,10 @@ nodes:
         refutes_when: ["no relevant PodGroup exists and default-scheduler reports the first failure"]
         source_group: kubernetes_api
     match:
-      any: ["runai-scheduler-default", "pod group", podgroup, "gang schedul", fairshare, "over-quota", "over quota", reclaimed, preemptor, "failed to bind"]
+      any: ["runai-scheduler-default", "pod group", podgroup, "gang schedul", fairshare, "over-quota", "over quota", reclaimed, preemptor, preemptlowerpriority, "failed to bind"]
     branches:
       - match:
-          any: [reclaimed, reclaiming, preemptor, "preempted by higher priority", fairshare]
+          any: [reclaimed, reclaiming, preemptor, preemptlowerpriority, "preempted by higher priority", fairshare]
         next: runai_reclaim_or_preemption
       - match:
           any: ["pod group", podgroup, "gang schedul", minmembers, "sub-group"]
@@ -1783,7 +1789,7 @@ nodes:
     verify: "Compare victim and preemptor project/department, node pool, priority, preemptibility, and deserved/over-quota allocation at the decision timestamp."
     interpretation: "Priority preemption and fairness-based reclaim are expected but distinct scheduler decisions."
     match:
-      any: [reclaimed, reclaiming, preemptor, "preempted by higher priority", fairshare]
+      any: [reclaimed, reclaiming, preemptor, preemptlowerpriority, "preempted by higher priority", fairshare]
     conclusion:
       family: runai_scheduling_quota
       summary: "Run:ai preempted or reclaimed a preemptible workload according to priority or fairshare policy."
@@ -2090,7 +2096,7 @@ nodes:
     interpretation: "This router separates k8s_storage_error (PVC/PV/CSI object control path) from storage_backend_error (NFS/Ceph/filesystem server path)."
     avoid: "Do not turn a generic mount retry or a Bound PVC into proof of backend health without the affected node's exact error."
     match:
-      any: ["stale file handle", "read-only file system", "nfs server", cephfs, "ceph health", "input/output error", "mount access denied", "storage latency", provisioningfailed]
+      any: ["stale file handle", "read-only file system", "nfs server", cephfs, "ceph health", "input/output error", "mount access denied", "access denied by server", "storage latency", provisioningfailed]
     branches:
       - match:
           any: ["stale file handle", "nfs server not responding", "nfs server"]

@@ -5561,6 +5561,11 @@ _EXECUTABLE_TOKEN = re.compile(
     r'(?:exec:\s*)?["\']?([^\s:"\']+)["\']?:?\s*.*executable file not found in \$?PATH',
     re.IGNORECASE,
 )
+_IMAGE_REFERENCE = re.compile(
+    r'(?:failed to pull image|unpack image|container image|(?:image|image tag) name|image tag|image)'
+    r'\s+["\']([^"\']+)["\']',
+    re.IGNORECASE,
+)
 
 
 def _specific_cause_statement(
@@ -5604,7 +5609,13 @@ def _specific_cause_statement(
         detail = _config_error_detail([item[1] for item in observations], language)
         return detail or _config_error_generic(language)
     if reason in {"StartError", "RunContainerError", "ContainerCannotRun"}:
-        return _command_error_detail([item[1] for item in observations], language)
+        messages = [item[1] for item in observations]
+        if not any(messages):
+            return ""
+        detail = _command_error_detail(messages, language)
+        return detail or _command_error_generic(language)
+    if reason == "CreateContainerError":
+        return _container_create_detail([item[1] for item in observations], language)
     if reason == "OOMKilled":
         limit = _memory_limit(observations)
         if language == "ko":
@@ -5615,9 +5626,15 @@ def _specific_cause_statement(
             f" (limit: {limit})." if limit else "."
         )
     if reason in {"Unschedulable", "SchedulingGated"}:
-        return _scheduling_detail([item[1] for item in observations], language)
+        detail = _scheduling_detail([item[1] for item in observations], language)
+        return detail or _scheduling_error_generic(language)
     if reason in {"ImagePullBackOff", "ErrImagePull"}:
-        return _image_pull_detail([item[1] for item in observations], language)
+        detail = _image_pull_detail([item[1] for item in observations], language)
+        return detail or _image_pull_generic(language)
+    if reason == "InvalidImageName":
+        return _invalid_image_name_detail([item[1] for item in observations], language)
+    if reason == "ErrImageNeverPull":
+        return _never_pull_detail([item[1] for item in observations], language)
     return ""
 
 
@@ -5792,6 +5809,28 @@ def _command_error_detail(messages: list[str], language: str) -> str:
     return ""
 
 
+def _command_error_generic(language: str) -> str:
+    return (
+        "구체적으로는 컨테이너 command/entrypoint 또는 런타임 설정 때문에 시작하지 못했습니다."
+        if language == "ko"
+        else "Specifically, the container could not start because of its command, entrypoint, or runtime setup."
+    )
+
+
+def _container_create_detail(messages: list[str], language: str) -> str:
+    if any("context deadline exceeded" in message.casefold() for message in messages):
+        return (
+            "구체적으로는 컨테이너 런타임 생성이 시간 초과되었습니다 (context deadline exceeded)."
+            if language == "ko"
+            else "Specifically, container runtime creation timed out (context deadline exceeded)."
+        )
+    return (
+        "구체적으로는 컨테이너 런타임이 컨테이너를 생성하지 못했습니다."
+        if language == "ko"
+        else "Specifically, the container runtime could not create the container."
+    )
+
+
 def _restart_loop_detail(exit_code: object | None, language: str) -> str:
     suffix = f" (exit {exit_code})" if exit_code is not None else ""
     return (
@@ -5841,21 +5880,59 @@ def _scheduling_detail(messages: list[str], language: str) -> str:
     return ""
 
 
+def _scheduling_error_generic(language: str) -> str:
+    return (
+        "구체적으로는 scheduler가 Pod를 배치할 수 있는 노드를 찾지 못했습니다."
+        if language == "ko"
+        else "Specifically, the scheduler could not find a node for the Pod."
+    )
+
+
 def _image_pull_detail(messages: list[str], language: str) -> str:
     for message in messages:
+        image = _IMAGE_REFERENCE.search(message)
+        suffix = f" ('{image.group(1)}')" if image else ""
         if re.search(r"not found|manifest unknown", message, re.IGNORECASE):
             return (
-                "구체적으로는 이미지 또는 tag가 registry에 없습니다."
+                f"구체적으로는 이미지 또는 tag{suffix}가 registry에 없습니다."
                 if language == "ko"
-                else "Specifically, the image or tag does not exist in the registry."
+                else f"Specifically, image or tag{suffix} does not exist in the registry."
             )
-        if re.search(r"unauthorized|authentication required", message, re.IGNORECASE):
+        if re.search(r"unauthorized|authentication required|pull access denied", message, re.IGNORECASE):
             return (
-                "구체적으로는 registry 인증 실패로 이미지를 pull하지 못했습니다."
+                f"구체적으로는 registry 인증 실패로 이미지{suffix}를 pull하지 못했습니다."
                 if language == "ko"
-                else "Specifically, registry authentication failed, so the image cannot be pulled."
+                else f"Specifically, registry authentication failed, so image{suffix} cannot be pulled."
             )
     return ""
+
+
+def _image_pull_generic(language: str) -> str:
+    return (
+        "구체적으로는 registry에서 이미지를 pull하지 못했습니다."
+        if language == "ko"
+        else "Specifically, Kubernetes could not pull the image from the registry."
+    )
+
+
+def _invalid_image_name_detail(messages: list[str], language: str) -> str:
+    name = next((match.group(1) for message in messages if (match := _IMAGE_REFERENCE.search(message))), "")
+    suffix = f" '{name}'" if name else ""
+    return (
+        f"구체적으로는 이미지 참조{suffix} 형식이 올바르지 않습니다."
+        if language == "ko"
+        else f"Specifically, image reference{suffix} has an invalid format."
+    )
+
+
+def _never_pull_detail(messages: list[str], language: str) -> str:
+    name = next((match.group(1) for message in messages if (match := _IMAGE_REFERENCE.search(message))), "")
+    suffix = f" '{name}'" if name else ""
+    return (
+        f"구체적으로는 imagePullPolicy Never인데 이미지{suffix}가 노드에 없습니다."
+        if language == "ko"
+        else f"Specifically, imagePullPolicy Never is set but image{suffix} is absent from the node."
+    )
 
 
 # Nature axis labels for the operator-facing facets line.
