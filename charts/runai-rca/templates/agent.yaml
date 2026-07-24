@@ -121,6 +121,10 @@ spec:
               value: {{ .Values.agent.env.runaiBaseUrl | quote }}
             - name: RUNAI_TOKEN_URL
               value: {{ .Values.agent.env.runaiTokenUrl | quote }}
+            - name: MCP_TLS_CA_PATH
+              value: {{ .Values.agent.env.mcpTlsCaPath | quote }}
+            - name: MCP_TLS_INSECURE
+              value: {{ .Values.agent.env.mcpTlsInsecure | quote }}
             - name: RUNAI_WORKLOADS_PATH
               value: {{ .Values.agent.env.runaiWorkloadsPath | quote }}
             - name: RUNAI_PROJECTS_PATH

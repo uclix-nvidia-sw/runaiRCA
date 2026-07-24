@@ -479,6 +479,13 @@ agent:
     rcaHarnessPassScore: 70
     runaiBaseUrl: ""
     runaiTokenUrl: ""
+    # TLS policy for MCP transports, direct datasource fallbacks, and the
+    # Run:ai token exchange. Verification is ON by default; point
+    # mcpTlsCaPath at a mounted CA bundle for private CAs, or set
+    # mcpTlsInsecure=true ONLY on trusted internal networks whose endpoints
+    # use self-signed certificates (e.g. an internal Run:ai control plane).
+    mcpTlsCaPath: ""
+    mcpTlsInsecure: false
     runaiWorkloadsPath: /api/v1/workloads
     runaiProjectsPath: /api/v1/projects
     runaiQueuesPath: /api/v1/queues
