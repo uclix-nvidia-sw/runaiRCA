@@ -201,7 +201,7 @@ Frequently tuned Helm values:
 | `agent.env.*TimeoutSeconds` | Request/runtime timeouts for Kubernetes, Run:ai, Prometheus, Loki, and Postgres |
 | `agent.env.enableRcaOutputHarness` / `maxRcaRepairAttempts` / `rcaHarnessPassScore` | Final RCA harness switch, repair cap, and quality threshold |
 | `typedb.ingest.requireApproval` | Ingest only Dashboard-approved incidents (`user_approved_at`), default `true`; `requireReview` is deprecated |
-| `typedb.traceV3Backfill.enabled` / `batchSize` / `maxBatches` | Idempotently project approved trace-v3 investigation records into TypeDB. Trace-less or pre-v3 records are not converted; `maxBatches=0` drains all pages. |
+| `typedb.traceV3Backfill.enabled` / `batchSize` / `maxBatches` | Idempotently project approved trace-v3 investigation records into TypeDB. Legacy v1/v2 records are not converted; `maxBatches=0` drains all pages. |
 | `typedb.packageMirror.enabled` / `schedule` / `limit` | Advisory mirror of Backend knowledge packages into TypeDB. Default schedule is hourly (`0 * * * *`); Backend remains the approval and activation authority. |
 | `agent.env.kubernetesListLimit` / `agent.env.lokiQueryLimit` | Evidence volume controls for Kubernetes list calls and Loki log query groups |
 | `agent.env.troubleshootingCasesFile` / `agent.env.agentSoulsFile` | Paths for injected troubleshooting memory and agent role contracts |

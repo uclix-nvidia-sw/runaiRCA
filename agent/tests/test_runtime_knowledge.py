@@ -3,7 +3,15 @@ from __future__ import annotations
 import pytest
 
 from app.config import load_settings
-from app.knowledge import DEFAULT_FAMILIES, KnowledgeRegistry, validate_runtime_knowledge
+from app.schemas import Alert, AlertAnalysisRequest
+from app.services import pipeline
+from app.services.root_cause_ranking import RankedCause
+from app.knowledge import (
+    DEFAULT_FAMILIES,
+    KnowledgeRegistry,
+    match_failure_mode_symptoms,
+    validate_runtime_knowledge,
+)
 
 
 class _Response:
@@ -40,17 +48,24 @@ class _Client:
         return self.__class__.responses.pop(0)
 
 
-def _snapshot(*, revision: str = "r1", keyword: str = "runtime marker") -> dict[str, object]:
+def _snapshot(
+    *,
+    revision: str = "r1",
+    keyword: str = "runtime marker",
+    status: str = "active",
+    package_id: str = "pkg-1",
+    family: str = "runtime_family",
+) -> dict[str, object]:
     return {
         "revision": revision,
         "packages": [
             {
-                "package_id": "pkg-1",
-                "state": "active",
+                "package_id": package_id,
+                "state": status,
                 "compiled": {
                     "failure_modes": [
                         {
-                            "family": "runtime_family",
+                            "family": family,
                             "symptoms": [
                                 {
                                     "name": "Runtime symptom",
@@ -93,7 +108,7 @@ async def test_registry_refresh_uses_etag_and_keeps_last_valid_snapshot(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_registry_modes_merge_only_approved_snapshot(monkeypatch) -> None:
+async def test_registry_modes_apply_activation_ladder(monkeypatch) -> None:
     monkeypatch.setattr("app.knowledge.httpx.AsyncClient", _Client)
     _Client.responses = [_Response(200, _snapshot())]
     _Client.headers = []
@@ -104,36 +119,103 @@ async def test_registry_modes_merge_only_approved_snapshot(monkeypatch) -> None:
     }
     baseline_issues = [{"issue": "Runtime issue", "keywords": ["baseline marker"]}]
 
-    shadow = KnowledgeRegistry(mode="shadow", snapshot_url="http://backend/snapshot")
-    assert await shadow.refresh() is True
-    assert (
-        shadow.failure_modes(baseline_modes)["runtime_family"][0]["keywords"]
-        == ["baseline marker"]
-    )
-
     _Client.responses = [_Response(200, _snapshot())]
     assist = KnowledgeRegistry(mode="assist", snapshot_url="http://backend/snapshot")
     await assist.refresh()
     assert (
         assist.failure_modes(baseline_modes)["runtime_family"][0]["keywords"]
-        == ["baseline marker"]
+        == ["runtime marker"]
     )
-    assert assist.known_issues(baseline_issues)[0]["keywords"] == ["baseline marker"]
-    assert assist.failure_modes({}) == {}
-    assert assist.known_issues([]) == []
+    assert assist.known_issues(baseline_issues)[0]["keywords"] == ["runtime marker"]
+    assert match_failure_mode_symptoms(
+        assist.failure_modes(baseline_modes), "runtime marker"
+    )[0][1]["runtime_status"] == "active"
     assert assist.provisional_catalogs()["failure_modes"]["runtime_family"][0]["keywords"] == [
         "runtime marker"
     ]
     assert assist.health()["active_package_ids"] == ["pkg-1"]
 
-    _Client.responses = [_Response(200, _snapshot())]
+    _Client.responses = [
+        _Response(
+            200,
+            {
+                "revision": "r-shadow",
+                "packages": [
+                    _snapshot()["packages"][0],
+                    _snapshot(
+                        revision="r-shadow",
+                        keyword="shadow marker",
+                        status="shadow",
+                        package_id="pkg-shadow",
+                        family="shadow_family",
+                    )["packages"][0],
+                ],
+            },
+        )
+    ]
+    assist_with_shadow = KnowledgeRegistry(mode="assist", snapshot_url="http://backend/snapshot")
+    await assist_with_shadow.refresh()
+    assist_catalog = assist_with_shadow.failure_modes(baseline_modes)
+    assert "shadow_family" not in assist_catalog
+    assert assist_with_shadow.shadow_hints("shadow marker")[0][1]["runtime_status"] == "shadow"
+
+    _Client.responses = [
+        _Response(
+            200,
+            {
+                "revision": "r-shadow",
+                "packages": [
+                    _snapshot()["packages"][0],
+                    _snapshot(
+                        keyword="shadow marker",
+                        status="shadow",
+                        package_id="pkg-shadow",
+                        family="shadow_family",
+                    )["packages"][0],
+                ],
+            },
+        )
+    ]
     authoritative = KnowledgeRegistry(mode="authoritative", snapshot_url="http://backend/snapshot")
     await authoritative.refresh()
     assert (
         authoritative.failure_modes(baseline_modes)["runtime_family"][0]["keywords"]
         == ["runtime marker"]
     )
-    assert authoritative.known_issues(baseline_issues)[0]["keywords"] == ["runtime marker"]
+    assert {
+        symptom["runtime_status"]
+        for symptoms in authoritative.failure_modes({}).values()
+        for symptom in symptoms
+    } == {"active", "shadow"}
+    assert match_failure_mode_symptoms(
+        authoritative.failure_modes({}), "shadow marker"
+    )[0][0] == "shadow_family"
+
+    detail = pipeline._detail_from(
+        AlertAnalysisRequest(
+            alert=Alert(
+                labels={"alertname": "RuntimeKnowledgeAlert"},
+                annotations={"summary": "runtime marker and shadow marker"},
+            )
+        ),
+        [],
+        [],
+        failure_modes=assist_catalog,
+        root_cause_candidates=[
+            RankedCause(family="runtime_family", confidence="medium", score=7.0)
+        ],
+        runtime_knowledge_hints=assist_with_shadow.shadow_hints("shadow marker"),
+    )
+    assert "package pkg-1; family runtime_family; matched symptom Runtime symptom; status active" in detail
+    assert "### Learned Knowledge (Pending Activation)" in detail
+    assert "package pkg-shadow family shadow_family" in detail
+
+    _Client.responses = [_Response(200, {"revision": "empty", "packages": []})]
+    empty = KnowledgeRegistry(mode="assist", snapshot_url="http://backend/snapshot")
+    await empty.refresh()
+    assert empty.failure_modes(baseline_modes) == baseline_modes
+    assert empty.known_issues(baseline_issues) == baseline_issues
+    assert empty.shadow_hints("runtime marker") == []
 
 
 @pytest.mark.asyncio
@@ -220,7 +302,7 @@ async def test_assist_exposes_safe_probe_template_ids_without_changing_ranking(m
     registry = KnowledgeRegistry(mode="assist", snapshot_url="http://backend/snapshot")
 
     assert await registry.refresh() is True
-    assert registry.failure_modes({}) == {}
+    assert registry.failure_modes({})["runtime_family"][0]["keywords"] == ["runtime marker"]
     assert registry.probe_template_ids_for_family("runtime_family") == [
         "k8s_troubleshooting:scheduling_capacity:p01",
     ]

@@ -1223,6 +1223,7 @@ async def test_evidence_stage_accepts_sufficient_subset_and_skips_optional_work(
                 }
             ],
             "skipped_collectors": ["loki"],
+            "reasoning_trace_v2": {"stop_reason": "supported_hypothesis"},
         }
 
     async def optional_followup_must_not_run(*_args, **_kwargs):  # pragma: no cover

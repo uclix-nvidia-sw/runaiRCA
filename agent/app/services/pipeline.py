@@ -38,8 +38,10 @@ from app.knowledge import (
     load_family_catalog,
     load_runai_known_issues,
     load_troubleshooting_cases,
+    merge_runtime_failure_modes,
     match_failure_mode_symptoms,
     match_runai_known_issues,
+    runtime_shadow_hints,
 )
 from app.llm import (
     complete,
@@ -155,6 +157,7 @@ class PipelineState:
     alert_fuzzy: str = ""
     xid_codes: list[int] = field(default_factory=list)
     failure_modes: dict[str, list[dict]] = field(default_factory=dict)
+    runtime_knowledge_hints: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     known_issues: list[dict] = field(default_factory=list)
     root_cause_candidates: list[RankedCause] = field(default_factory=list)
     # Immutable-at-stage-boundary snapshot used to explain ranking separately
@@ -273,13 +276,16 @@ def _evidence_budget_exceeded(state: PipelineState) -> bool:
 
 
 def _record_evidence_budget_stop(state: PipelineState, phase: str) -> None:
-    """Record the expected safety stop in logs/events, not durable reasoning.
+    """Record the expected safety stop in trace/logs, not operator warnings.
 
     The evidence deadline intentionally reserves time for synthesis and the
     output harness. Reaching it after base evidence is complete is normal and
     should not look like a telemetry failure in the final report.
     """
     _log.info("evidence budget reached; skipped optional %s", phase)
+    trace = state.investigation_context.get("reasoning_trace_v2")
+    if isinstance(trace, dict):
+        trace["stop_reason"] = "analysis_budget_exhausted"
     reporter = getattr(state, "progress", None)
     if reporter is not None:
         reporter.emit(
@@ -982,6 +988,25 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
             if isinstance(name, str) and name:
                 state.capabilities[name] = "skipped_sufficient_evidence"
     _link_probe_assessments_to_ledger(state)
+    # The blackboard facts are an additive, compact trace for ranking/synthesis;
+    # raw artifacts remain the source for the existing response contract.
+    state.investigation_context.setdefault(
+        "reasoning_trace_v2",
+        {
+            "schema_version": 2,
+            "hypotheses": state.investigation_context.get("hypothesis_ledger", []),
+            "referenced_facts": state.blackboard.prompt_view(limit=30),
+            "stop_reason": "base_evidence_complete",
+        },
+    )
+    state.investigation_context["reasoning_trace_v2"] = _public_reasoning_trace(
+        state.investigation_context.get("reasoning_trace_v2"), state
+    )
+    assessments = _probe_assessments(state.results)
+    if assessments:
+        trace = state.investigation_context.get("reasoning_trace_v2")
+        if isinstance(trace, dict):
+            trace["probe_assessments"] = assessments
     state.investigation_context["reasoning_trace_v3"] = _public_reasoning_trace_v3(state)
     return state
 
@@ -1214,11 +1239,32 @@ def _blackboard_artifact_evidence_ids(state: PipelineState) -> dict[str, str]:
     return aliases
 
 
+def _public_reasoning_trace(trace: object, state: PipelineState) -> dict[str, Any]:
+    if not isinstance(trace, dict):
+        return {}
+    aliases = _blackboard_artifact_evidence_ids(state)
+    output = dict(trace)
+    facts = output.get("referenced_facts")
+    if isinstance(facts, list):
+        output["referenced_facts"] = [
+            {
+                **fact,
+                "evidence_id": aliases.get(
+                    str(fact.get("evidence_id") or ""), fact.get("evidence_id")
+                ),
+            }
+            for fact in facts
+            if isinstance(fact, dict)
+        ]
+    return output
+
+
 def _public_reasoning_trace_v3(state: PipelineState) -> dict[str, Any]:
     """Serialize a strict, public, fact-level reasoning graph.
 
-    Every evidence reference is a response-local E-id, and a link exists only
-    when the normalized observation is eligible for its reasoning role.
+    v2 carries the legacy free-form ledger. v3 is deliberately narrower: every
+    evidence reference is a response-local E-id, and a link exists only when
+    the normalized observation is eligible for its reasoning role.
     """
     aliases = _blackboard_artifact_evidence_ids(state)
     board = state.blackboard
@@ -1331,6 +1377,7 @@ def _public_reasoning_trace_v3(state: PipelineState) -> dict[str, Any]:
         "evidence": evidence,
         "probe_executions": _dedupe_v3_records(executions),
         "rejected_evidence_links": _dedupe_v3_records(rejected_links),
+        "stop_reason": _v3_stop_reason(state),
     }
 
 
@@ -1386,7 +1433,7 @@ def _public_v3_hypothesis(
             }
         )
 
-    hypothesis = {
+    return {
         "hypothesis_id": str(item.get("id") or ""),
         "family": str(item.get("family") or ""),
         "mechanism": str(item.get("mechanism") or item.get("statement") or ""),
@@ -1397,10 +1444,6 @@ def _public_v3_hypothesis(
         "supporting_source_groups": groups(evidence_for),
         "contradicting_source_groups": groups(evidence_against),
     }
-    fingerprint = str(item.get("mechanism_fingerprint") or "").strip()
-    if fingerprint:
-        hypothesis["mechanism_fingerprint"] = fingerprint
-    return hypothesis
 
 
 def _public_evidence_ids(
@@ -1432,6 +1475,13 @@ def _dedupe_v3_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for item in records:
         unique[json.dumps(item, sort_keys=True, separators=(",", ":"))] = item
     return list(unique.values())
+
+
+def _v3_stop_reason(state: PipelineState) -> str:
+    v2 = state.investigation_context.get("reasoning_trace_v2")
+    if not isinstance(v2, dict):
+        return "base_evidence_complete"
+    return str(v2.get("stop_reason") or "base_evidence_complete")
 
 
 def _component_identity(
@@ -1671,9 +1721,13 @@ async def rank_stage(state: PipelineState) -> PipelineState:
     # signature-clean catalog family image_pull_error and forced a harness
     # abstain (2026-07-22 ImagePullBackOff incident). Names outside the catalog
     # never reach the symptom matcher.
-    state.failure_modes = _catalog_only_knowledge(
-        state.kg_context.knowledge
-    ) or load_failure_modes(settings.failure_modes_file)
+    graph_knowledge = _catalog_only_knowledge(state.kg_context.knowledge)
+    state.failure_modes = (
+        merge_runtime_failure_modes(graph_knowledge)
+        if graph_knowledge
+        else load_failure_modes(settings.failure_modes_file)
+    )
+    state.runtime_knowledge_hints = runtime_shadow_hints(state.observed)
     state.known_issues = load_runai_known_issues(settings.runai_known_issues_file)
     # Version-aware precision: drop known issues already fixed in the cluster's
     # running Run:ai version so we don't attribute a symptom to a patched bug.
@@ -1762,7 +1816,11 @@ async def rank_stage(state: PipelineState) -> PipelineState:
     if state.root_cause_candidates:
         top = state.root_cause_candidates[0]
         state.ranking_candidate_before_self_check = replace(top)
-        _record_selected_hypothesis(state)
+        # A shadow/assist candidate is explicitly not the approved diagnosis.
+        # Persist a mechanism only when the final headline is itself the
+        # evidence-gated open-world candidate.
+        _record_selected_open_world_hypothesis(state)
+        _record_selected_hypothesis_id(state)
         state.progress.emit(
             "ranking",
             f"Top candidate: {top.family}",
@@ -1803,12 +1861,35 @@ def _merge_open_world_candidates(
 
 
 def _refresh_public_reasoning_trace(state: PipelineState) -> None:
-    """Refresh the public v3 trace after response-local IDs are assigned."""
+    """Refresh v2 and v3 public traces after response-local IDs are assigned."""
+    trace = state.investigation_context.get("reasoning_trace_v2")
+    if isinstance(trace, dict):
+        state.investigation_context["reasoning_trace_v2"] = _public_reasoning_trace(
+            trace, state
+        )
     state.investigation_context["reasoning_trace_v3"] = _public_reasoning_trace_v3(state)
 
 
-def _record_selected_hypothesis(state: PipelineState) -> None:
-    """Publish the exact selected v3 hypothesis and its open-world identity.
+def _record_selected_open_world_hypothesis(state: PipelineState) -> None:
+    """Persist a mechanism only if the open-world candidate is the headline."""
+    trace = state.investigation_context.get("reasoning_trace_v2")
+    if not state.root_cause_candidates or not isinstance(trace, dict):
+        return
+    top = state.root_cause_candidates[0]
+    if top.novelty != "open_world" or not top.mechanism:
+        return
+    trace["selected_hypothesis"] = {
+        "hypothesis_id": top.hypothesis_id,
+        "mechanism": top.mechanism,
+        "mechanism_fingerprint": top.mechanism_fingerprint,
+        "family": top.family,
+        "supporting_evidence_ids": top.support_evidence_ids,
+        "contradicting_evidence_ids": top.contradiction_evidence_ids,
+    }
+
+
+def _record_selected_hypothesis_id(state: PipelineState) -> None:
+    """Publish a final selection only from a candidate's exact hypothesis ID.
 
     Catalog candidates normally have no hypothesis ID.  In that case—and when
     a stale candidate ID is not present in the public trace—we deliberately
@@ -1820,29 +1901,15 @@ def _record_selected_hypothesis(state: PipelineState) -> None:
     trace.pop("selected_hypothesis_id", None)
     if not state.root_cause_candidates:
         return
-    top = state.root_cause_candidates[0]
-    hypothesis_id = str(getattr(top, "hypothesis_id", "") or "").strip()
+    hypothesis_id = str(getattr(state.root_cause_candidates[0], "hypothesis_id", "") or "").strip()
     hypotheses = trace.get("hypotheses")
-    if not hypothesis_id or not isinstance(hypotheses, list):
-        return
-    matches = [
-        item
+    known = {
+        str(item.get("hypothesis_id") or "")
         for item in hypotheses
         if isinstance(item, dict)
-        and str(item.get("hypothesis_id") or "").strip() == hypothesis_id
-    ]
-    if len(matches) != 1:
-        return
-    selected = matches[0]
-    if top.novelty == "open_world":
-        mechanism = str(top.mechanism or "").strip()
-        fingerprint = str(top.mechanism_fingerprint or "").strip()
-        if not mechanism or not fingerprint:
-            return
-        selected["family"] = str(top.family or "").strip()
-        selected["mechanism"] = mechanism
-        selected["mechanism_fingerprint"] = fingerprint
-    trace["selected_hypothesis_id"] = hypothesis_id
+    } if isinstance(hypotheses, list) else set()
+    if hypothesis_id and hypothesis_id in known:
+        trace["selected_hypothesis_id"] = hypothesis_id
 
 
 def _prepare_open_world_ledger(state: PipelineState) -> None:
@@ -2294,6 +2361,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         masker=state.masker,
         eligible_support_ids=eligible_support_ids,
         self_check_next=state.self_check_next,
+        runtime_knowledge_hints=state.runtime_knowledge_hints,
     )
     # Korean localization (when language == "ko" and LLM configured): translate
     # the deterministic report just built — the LLM never re-analyzes. Falls
@@ -2434,6 +2502,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             "plan": plan.as_dict(),
             "hypothesis_ledger": state.investigation_context.get("hypothesis_ledger"),
             "investigation": state.investigation_context,
+            "reasoning_trace_v2": state.investigation_context.get("reasoning_trace_v2", {}),
             "reasoning_trace_v3": state.investigation_context.get("reasoning_trace_v3", {}),
             "open_world_candidates": [
                 candidate.as_dict() for candidate in state.open_world_candidates
@@ -2669,7 +2738,8 @@ async def _investigate_until_settled(state: PipelineState) -> None:
         open_world = _merge_open_world_candidates(state, state.root_cause_candidates)
         if getattr(state.settings, "open_world_rca_mode", "off") == "authoritative":
             state.root_cause_candidates = open_world
-        _record_selected_hypothesis(state)
+        _record_selected_open_world_hypothesis(state)
+        _record_selected_hypothesis_id(state)
 
         after_family = state.root_cause_candidates[0].family if state.root_cause_candidates else ""
         if after_family == before_family and _evidence_signature(state.results) == before_evidence:
@@ -3998,15 +4068,39 @@ def _failure_mode_root_cause_statement(
     language: str,
 ) -> str:
     """Prefer an exact, curated mechanism over a coarse ranked-family sentence."""
-    for _family, symptom in _actionable_failure_mode_matches(
+    matches = _actionable_failure_mode_matches(
         failure_modes, observed_text, candidates
-    ):
+    )
+    for _family, symptom in matches:
         reason = str(
             symptom.get("reason_ko" if language == "ko" else "reason") or ""
         ).strip()
         if reason:
-            return reason
-    return _ranked_root_cause_statement(candidates, request, language=language)
+            statement = reason
+            break
+    else:
+        statement = _ranked_root_cause_statement(candidates, request, language=language)
+    provenance = _runtime_failure_mode_provenance(matches, candidates)
+    return f"{statement} ({provenance})" if provenance else statement
+
+
+def _runtime_failure_mode_provenance(
+    matches: list[tuple[str, dict]], candidates: list[RankedCause] | None
+) -> str:
+    """Describe the runtime symptom that supplied the selected conclusion."""
+    top_family = candidates[0].family if candidates else ""
+    for family, symptom in matches:
+        package_id = str(symptom.get("runtime_package_id") or "").strip()
+        if package_id and (not top_family or family == top_family):
+            symptom_name = str(symptom.get("symptom") or "").strip()
+            status = str(symptom.get("runtime_status") or "").strip()
+            if symptom_name and status:
+                return (
+                    "Runtime knowledge provenance: "
+                    f"package {package_id}; family {family}; matched symptom "
+                    f"{symptom_name}; status {status}"
+                )
+    return ""
 
 
 def _localized_failure_mode_name(symptom: dict, language: str) -> str:
@@ -4019,6 +4113,29 @@ def _localized_failure_mode_actions(symptom: dict, language: str) -> list[str]:
     localized = symptom.get("actions_ko") if language == "ko" else None
     actions = localized or symptom.get("actions") or []
     return [str(action) for action in actions if str(action).strip()]
+
+
+def _runtime_knowledge_hint_lines(
+    hints: list[tuple[str, dict]], masker: Masker | None = None
+) -> list[str]:
+    if not hints:
+        return []
+    active_masker = masker or build_masker(())
+    lines = ["", "### Learned Knowledge (Pending Activation)", ""]
+    for family, symptom in hints:
+        package_id = _safe_line(
+            symptom.get("runtime_package_id"), limit=120, masker=active_masker
+        )
+        name = _safe_line(symptom.get("symptom"), limit=180, masker=active_masker)
+        suggestion = symptom.get("reason") or (symptom.get("actions") or [""])[0]
+        suggestion = _safe_line(suggestion, limit=360, masker=active_masker) or name
+        if not package_id or not name:
+            continue
+        lines.append(
+            f"- package {package_id} family {family} matched symptom {name} "
+            f"— would suggest: {suggestion}"
+        )
+    return lines if len(lines) > 3 else []
 
 
 def _actionable_failure_mode_matches(
@@ -4098,6 +4215,7 @@ def _detail_from(
     masker: Masker | None = None,
     eligible_support_ids: set[str] | None = None,
     self_check_next: str = "",
+    runtime_knowledge_hints: list[tuple[str, dict[str, Any]]] | None = None,
 ) -> str:
     """Problem -> Root Cause -> Recommended Actions, then everything else in an
     appendix. Sections 1-3 are the ~1-page report an operator (or a Word export)
@@ -4221,6 +4339,7 @@ def _detail_from(
             allow_remediation=allow_cause_specific_actions,
         )
     )
+    lines.extend(_runtime_knowledge_hint_lines(runtime_knowledge_hints or [], masker))
     operator_prompt = annotations.get("operator_prompt")
     if operator_prompt:
         active_masker = masker or build_masker(())

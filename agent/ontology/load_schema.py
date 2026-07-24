@@ -13,12 +13,10 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any
 
 from app.config import load_settings
 
 SCHEMA_FILE = Path(__file__).resolve().parent / "schema.tql"
-REMOVED_TRACE_ATTRIBUTE = "trace_stop_reason"
 
 # One-off annotation changes for databases created by an older schema.tql.
 # `define` cannot alter an existing annotation, so each entry is applied with
@@ -55,46 +53,6 @@ SCHEMA_MIGRATIONS = [
 ]
 
 
-def _attribute_labels(driver: Any, database: str, transaction_type: Any) -> set[str]:
-    with driver.transaction(database, transaction_type.READ) as tx:
-        rows = tx.query("match attribute $a; select $a;").resolve().as_concept_rows()
-        return {str(row.get("a").get_label()) for row in rows}
-
-
-def _remove_trace_stop_reason(
-    driver: Any, database: str, transaction_type: Any
-) -> None:
-    """Remove the retired trace attribute in a strict, retry-safe order."""
-    if REMOVED_TRACE_ATTRIBUTE not in _attribute_labels(
-        driver, database, transaction_type
-    ):
-        print("schema migration already applied: trace_stop_reason absent")
-        return
-
-    with driver.transaction(database, transaction_type.WRITE) as tx:
-        tx.query(
-            "match $r isa analysis_run, has trace_stop_reason $reason; "
-            "delete has $reason of $r;"
-        ).resolve()
-        tx.query(
-            "match $reason isa trace_stop_reason; delete $reason;"
-        ).resolve()
-        tx.commit()
-
-    with driver.transaction(database, transaction_type.SCHEMA) as tx:
-        tx.query(
-            "undefine owns trace_stop_reason from analysis_run;"
-        ).resolve()
-        tx.query("undefine trace_stop_reason;").resolve()
-        tx.commit()
-
-    if REMOVED_TRACE_ATTRIBUTE in _attribute_labels(
-        driver, database, transaction_type
-    ):
-        raise RuntimeError("trace_stop_reason schema cleanup did not complete")
-    print("schema migration applied: removed trace_stop_reason data and type")
-
-
 def main() -> int:
     settings = load_settings()
     address = settings.typedb_address or "localhost:1729"
@@ -112,9 +70,6 @@ def main() -> int:
         if not driver.databases.contains(settings.typedb_database):
             driver.databases.create(settings.typedb_database)
             print(f"created database '{settings.typedb_database}'")
-        _remove_trace_stop_reason(
-            driver, settings.typedb_database, TransactionType
-        )
         for migration in SCHEMA_MIGRATIONS:
             try:
                 with driver.transaction(settings.typedb_database, TransactionType.SCHEMA) as tx:

@@ -29,12 +29,10 @@ func (s *Store) SeedDevFixtures() {
 		"hard_gates": map[string]any{"unsupported_high_confidence": false, "invalid_evidence_links": false},
 	}
 	traceV3 := map[string]any{
-		"schema_version":         3,
-		"selected_hypothesis_id": "H-1",
+		"schema_version": 3,
 		"hypotheses": []any{map[string]any{
 			"hypothesis_id": "H-1", "family": family, "mechanism": "container OOM on startup",
-			"mechanism_fingerprint": "dev-oom-startup",
-			"status":                "uncertain", "confidence": 0.45,
+			"status": "uncertain", "confidence": 0.45,
 			"evidence_for": []any{"E-1", "E-2"}, "evidence_against": []any{},
 		}},
 		"evidence": []any{
@@ -42,6 +40,7 @@ func (s *Store) SeedDevFixtures() {
 			map[string]any{"evidence_id": "E-2", "observation_window": map[string]any{"start": "2026-07-16T09:13:00Z", "end": "2026-07-16T09:18:00Z"}, "entity": "pod/memory-stress", "source": "prometheus", "source_group": "metrics", "predicate": "container_memory_at_limit", "polarity": "present", "coverage": "scoped", "quality": "high"},
 		},
 		"probe_executions": []any{map[string]any{"execution_id": "P-1", "template_id": "k8s_troubleshooting:pod_crashing:p01", "tool": "kubernetes", "verdict": "inconclusive", "executed_at": "2026-07-16T09:16:00Z", "hypothesis_ids": []any{"H-1"}, "evidence_ids": []any{"E-1", "E-2"}}},
+		"stop_reason":      "deadline",
 	}
 
 	s.incidents[incidentID] = &Incident{

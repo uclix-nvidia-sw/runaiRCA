@@ -510,37 +510,13 @@ def test_analysis_hash_changes_when_the_approved_reasoning_changes() -> None:
     response = _response()
     response.context = {
         "top_root_cause": {"mechanism": "CSI attach timeout"},
-        "reasoning_trace_v3": {
-            "schema_version": 3,
-            "selected_hypothesis_id": "H-1",
-            "hypotheses": [{"hypothesis_id": "H-1", "evidence_for": ["E01"]}],
-        },
+        "reasoning_trace_v2": {"hypothesis_id": "H-1", "support": ["E01"]},
     }
     first = analysis_hash(response)
 
-    response.context["reasoning_trace_v3"] = {
-        "schema_version": 3,
-        "selected_hypothesis_id": "H-2",
-        "hypotheses": [{"hypothesis_id": "H-2", "evidence_for": ["E02"]}],
-    }
+    response.context["reasoning_trace_v2"] = {"hypothesis_id": "H-2", "support": ["E02"]}
 
     assert analysis_hash(response) != first
-
-
-def test_analysis_hash_ignores_retired_reasoning_trace_v2() -> None:
-    response = _response()
-    response.context = {
-        "reasoning_trace_v3": {"schema_version": 3, "hypotheses": []},
-        "reasoning_trace_v2": {"schema_version": 2, "hypotheses": ["legacy"]},
-    }
-    first = analysis_hash(response)
-
-    response.context["reasoning_trace_v2"] = {
-        "schema_version": 2,
-        "hypotheses": ["different legacy value"],
-    }
-
-    assert analysis_hash(response) == first
 
 
 def test_abstain_preserves_leading_family_as_a_low_confidence_hypothesis() -> None:

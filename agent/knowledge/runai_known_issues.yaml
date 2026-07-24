@@ -1,4 +1,4 @@
-# Run:ai known-issues catalog — real operator cases (incl. enterprise support cases).
+# Run:ai known-issues catalog — real operator cases (incl. NVIDIA support cases).
 #
 # Each entry becomes a name-keyed symptom in the ontology, uniform with the
 # curated failure modes and the built-in alert catalog:
@@ -15,8 +15,6 @@
 #   observability_accuracy  — metrics/dashboard wrong while the cluster itself is fine
 #   expected_known_behavior — by-design behavior or product limitation, NOT a fault
 # keywords: lowercase substrings that must actually appear in evidence text.
-# refs: opaque source ids "case-<sha256(source key)[:12]>" (same scheme as
-# knowledge/external_cases/sanitize.py) — never write raw support-case numbers here.
 
 # ============================================================================
 # platform_version_bug — a known Run:ai regression; the real fix is an upgrade.
@@ -24,26 +22,25 @@
 
 - issue: "Scheduler Reclaim Panic On Large GPU Job"
   family: platform_version_bug
-  keywords: ["reclaim.go", "runtime/panic.go", "reclaim] attempting to reclaim", "reclaim] leaving reclaim", "getvictimresources"]
-  affected_version: "<=2.22.49"
-  fixed_version: "2.22.50"
-  reason: "Known Run:ai scheduler bug: runai-scheduler-default panics in the Reclaim phase when reclaiming for a large-GPU job (e.g. 64/128 GPUs) and restarts every ~5 min. Queue/Pending state is preserved and smaller jobs still schedule between restarts. Panic signature: slice-bounds panic in proportionPlugin.getVictimResources. Fix per support guidance is 2.22.50 (the 2.23 line also carries it); the fix version was support-stated, not field-validated in the source case."
+  keywords: ["reclaim.go", "runtime/panic.go", "reclaim] attempting to reclaim", "reclaim] leaving reclaim"]
+  affected_version: "<=2.22.43"
+  fixed_version: "2.23"
+  reason: "Known Run:ai scheduler bug: runai-scheduler-default panics in the Reclaim phase when reclaiming for a large-GPU job (e.g. 64 GPUs) and restarts every ~5 min. Queue/Pending state is preserved and smaller jobs still schedule between restarts."
   actions:
-    - "Confirm the running Run:ai version; if at/below 2.22.49, plan the upgrade to 2.22.50+ (or the 2.23 line) where this is fixed per support guidance."
+    - "Confirm the running Run:ai version; if at/below 2.22.43, plan the upgrade to 2.23+ where this is fixed."
     - "Interim recovery: stop the large-GPU job that triggers the reclaim — the scheduler returns to normal once it is removed."
-  refs: ["case-0f59cfd7d537"]
+  refs: []
 
 - issue: "Distributed Training Locked hostPath Policy Rejected In UI"
   family: platform_version_bug
   keywords: ["administrator prohibited modifying", "masterspec.storage.hostpath"]
   affected_version: "2.23.30-2.23.39"
   fixed_version: "2.23.60"
-  reason: "UI-side locked-field validation regression in the 2.23.x line: submitting a Distributed Training job with rules.master.storage.hostPath.instance.locked set fails from the Web UI (works from CLI). Reproduced on 2.23.30/31/39; fine on 2.22.27. A fix claimed in 2.23.39 did NOT resolve the UI scenario; 2.23.60 is the verified fix (support-reproduced; no Engineering root-cause record was supplied)."
+  reason: "UI-side locked-field validation regression in the 2.23.x line: submitting a Distributed Training job with rules.master.storage.hostPath.instance.locked set fails from the Web UI (works from CLI). Reproduced on 2.23.30/31/39; fine on 2.22.27."
   actions:
     - "Confirm the running Run:ai version; if in 2.23.30-2.23.39, upgrade to 2.23.60+ where this is fixed."
     - "Interim workaround: use a Template with 'Allow different setup for the master' disabled, or set defaults.master = defaults.worker (removing worker.cleanPodPolicy)."
-    - "API-path workaround: submit with masterSpecSameAsWorker=true and masterSpec omitted — the API/CLI path is unaffected by the UI-side validation."
-  refs: ["case-239ee9638d98"]
+  refs: ["NVIDIA Case 01074073"]
 
 - issue: "Email Notification Settings Missing After Upgrade"
   family: platform_version_bug
@@ -54,7 +51,7 @@
   actions:
     - "Delete the existing (corrupted) Slack notification config from the DB, then reconfigure Slack from scratch."
     - "Verify both Slack and Email notifications are present and firing after the reset."
-  refs: ["case-d70725118d24"]
+  refs: ["NVIDIA Case 01073314"]
 
 - issue: "Distributed Training Templates Converted To Standard After Upgrade"
   family: platform_version_bug
@@ -65,7 +62,7 @@
   actions:
     - "Recreate the affected templates as Distributed Training, using the Distributed template JSON recovered from the pre-upgrade backup DB as reference."
     - "Do not attempt a DB-column edit to flip Standard->Distributed; it does not work."
-  refs: ["case-4d836bf33c71"]
+  refs: ["NVIDIA Case 01073466"]
 
 # ============================================================================
 # observability_accuracy — metric/dashboard is wrong; the cluster itself is fine.
@@ -80,7 +77,7 @@
   actions:
     - "Delete the offending ContainerStatusUnknown pod(s); the recording rule recovers and the dashboard repopulates."
     - "If the pod keeps recreating (e.g. the workload is hitting Disk Full), fix the underlying workload so it stops regenerating the duplicate metric."
-  refs: ["case-b05cd40541fd"]
+  refs: ["NVIDIA Case 01070341"]
 
 - issue: "Dashboard Analytics GPU Utilization Mismatch"
   family: observability_accuracy
@@ -91,7 +88,7 @@
   actions:
     - "Upgrade to 2.23.60+ so the graph and table values match."
     - "Do not rely on Analytics allocation for mixed Training+Interactive workloads — the denominator is inflated and this will not be patched (Analytics deprecated in 2.25)."
-  refs: ["case-704210eee70b"]
+  refs: ["NVIDIA Case 01074057"]
 
 - issue: "Pending Time Differs Between DB And Thanos"
   family: observability_accuracy
@@ -117,7 +114,7 @@
   actions:
     - "Set backoffLimit on the Worker; use restartPolicy OnFailure or Never for Distributed Training (Always is misleading and not recommended)."
     - "If CLI backoff 'does not work', check the --backoff-limit flag position: placed after `--command` it is parsed as a command argument, not a Run:ai option."
-  refs: ["case-af36b792ca86", "case-0a5ecf6ee61c"]
+  refs: ["NVIDIA Case 01064819", "NVIDIA Case 01065900"]
 
 - issue: "Workload Create Delete Not In Audit Logs"
   family: expected_known_behavior
@@ -138,10 +135,8 @@
   reason: "On a graceful node shutdown the kubelet terminates pods as Succeeded. A Run:ai Workspace is a completions=1 Kubernetes Job, so a Succeeded pod marks the Job Completed and it is NOT rescheduled to another node (backoffLimit only retries Failed pods). This is cluster-level kubelet behavior, not configurable in Run:ai."
   actions:
     - "Before node maintenance, suspend the node's workspaces and resume them after the node recovers."
-    - "Save important workspace data to persistent storage before maintenance — a Completed workspace's pod does not come back."
-    - "Set workspace-policy backoffLimit > 0 only if retry after Failed/deleted pods is desired — it never retries a clean Succeeded exit."
-    - "Disabling Graceful Node Shutdown (shutdownGracePeriod=0) lets pods reschedule to another node (verified by a comparative test in the source case), but risks unclean termination and data corruption — not recommended."
-  refs: ["case-8990c2c52468"]
+    - "Disabling Graceful Node Shutdown (shutdownGracePeriod=0) would let pods reschedule elsewhere, but risks unclean termination and data corruption — not recommended."
+  refs: ["NVIDIA Case 1209746"]
 
 - issue: "Legacy Policy Created By Not Backfilled After Upgrade"
   family: expected_known_behavior
@@ -151,15 +146,15 @@
   reason: "The created_by fix (from v2.23.14) applies only to newly created Policies; existing Policy created_by is not back-patched. Templates similarly show created_by=test@run.ai after the 2.23 storage migration. This is metadata-only with no functional impact."
   actions:
     - "Expect legacy created_by to remain wrong (by design); recreate the Policy/Template if correct ownership metadata is required."
-  refs: ["case-4d836bf33c71"]
+  refs: ["NVIDIA Case 01073466"]
 
 - issue: "Workloads Manager Memory Grows To Cache Cap"
   family: expected_known_behavior
   keywords: ["workloads-manager", "cache_max_store_size_mb", "runai-backend-workloads-manager"]
   affected_version: ""
   fixed_version: ""
-  reason: "runai-backend-workloads-manager uses an in-memory cache that grows toward its configured CACHE_MAX_STORE_SIZE_MB — the steady climb is expected structural growth, not a leak. CAUTION: the Run:ai 2.23 chart default cap is 10 GiB, which can exceed the pod memory limit (e.g. 4 GiB), so the pod risks OOMKill before the cache ever reaches its cap; the cap must sit below the memory limit."
+  reason: "runai-backend-workloads-manager uses an in-memory cache that grows toward its configured CACHE_MAX_STORE_SIZE_MB (e.g. 10000MB). The steady climb is expected structural growth, not a leak."
   actions:
-    - "Set workloadsManager.config.cacheMaxStoreSizeMb below the pod memory limit via Helm (support advised 2000 MB against a 4 GiB limit) and keep the existing memory limit."
-    - "Do not adopt periodic restarts as the fix — support explicitly advised against it; plan the upgrade to Run:ai 2.24+ where cache behavior improves."
-  refs: ["case-1803d7f27118"]
+    - "Treat high memory as expected up to the cache cap; `kubectl rollout restart` the deployment to reset to baseline (run off-peak for minimal impact)."
+    - "Add a periodic restart policy only if the cap is too high for the node's memory budget."
+  refs: ["NVIDIA Case 01151501"]

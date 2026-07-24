@@ -19,11 +19,13 @@ class RuntimeKnowledgePackage(BaseModel):
     """Read-only approved knowledge package supplied by the backend snapshot API.
 
     This is deliberately a transport contract, not an authoring model.  A package
-    must have completed approval and activation before it can reach an agent.
+    must have completed validation before it can reach an agent.
     """
 
     package_id: str
-    state: Literal["active"] = Field(validation_alias=AliasChoices("state", "status"))
+    state: Literal["active", "shadow"] = Field(
+        validation_alias=AliasChoices("state", "status", "runtime_status")
+    )
     compiled: dict[str, Any] = Field(
         validation_alias=AliasChoices("compiled", "knowledge", "payload")
     )

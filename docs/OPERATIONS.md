@@ -95,21 +95,6 @@ kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --count
 - Re-run ingest on demand:
   `kubectl create job -n <ns> --from=cronjob/<release>-typedb-ingest manual-ingest-1`.
 
-### Reasoning-trace v3-only migration
-
-The v3-only upgrade irreversibly removes `reasoning_trace_v2` and `stop_reason`
-from Postgres metadata, CaseSnapshots, and stored Knowledge Candidate traces.
-Back up Postgres and TypeDB before upgrading. Pause new analyses and suspend the
-TypeDB ingest/backfill jobs until no analysis run is `analyzing`; an old writer
-cannot write `trace_stop_reason` after the schema type is removed.
-
-The Backend startup migration removes the retired JSON keys in one transaction,
-recomputes affected candidate content hashes, and logs affected row counts. The
-TypeDB schema Job then deletes attribute ownerships and instances before
-undefining the ownership and type. Both migrations are idempotent. Treat either
-migration failure as a failed rollout; legacy trace contents can be restored
-only from the pre-upgrade backup.
-
 ### Trace-v3 backfill and empty investigation traces
 
 The `typedb-trace-v3-backfill` Job runs as a Helm `post-install` / `post-upgrade`
@@ -118,16 +103,16 @@ normal. Check the release events or run the backfill command manually when you
 need an audit trail.
 
 ```bash
-# Run one bounded, idempotent page manually; it does not invent missing traces.
+# Run one bounded, idempotent page manually; it does not rewrite legacy traces.
 kubectl exec -n <ns> deploy/<release>-agent -- \
   python -m ontology.backfill_trace_v3 --batch-size 200 --max-batches 1
 ```
 
 `0 written` is not an error by itself. `hypothesis` and `probe_execution` are
 created only from an active, Dashboard-approved CaseSnapshot carrying an explicit
-`reasoning_trace_v3` (or `trace_v3`) record. Trace-less, pre-v3, and inactive
-snapshots remain intentionally unconverted. Re-analyze and approve the case to
-create an eligible trace-v3 snapshot, then run the backfill again.
+`reasoning_trace_v3` (or `trace_v3`) record. Legacy v1/v2 results and snapshots
+that are not active remain intentionally unconverted. Re-analyze and approve the
+case to create an eligible trace-v3 snapshot, then run the backfill again.
 
 See [Knowledge Base → Querying the graph](KNOWLEDGE-BASE.md#querying-the-graph)
 for TypeDB Studio access.

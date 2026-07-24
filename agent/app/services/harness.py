@@ -611,16 +611,17 @@ def analysis_hash(response: AlertAnalysisResponse) -> str:
 
     Snapshot identity must change when the selected mechanism, causal trace, or
     evidence links change even if an editor happens to produce the same Korean
-    summary/detail.  The rendered RCA fields remain inside the canonical
-    payload so review semantics are preserved for newly generated hashes.
+    summary/detail.  The v1 fields remain inside the canonical payload so old
+    review semantics are preserved for newly generated hashes.
     """
     context = response.context if isinstance(response.context, dict) else {}
     payload = {
-        "schema_version": 3,
+        "schema_version": 2,
         "summary": response.analysis_summary,
         "detail": response.analysis_detail,
         "root_cause_family": response.root_cause_family,
         "top_root_cause": context.get("top_root_cause"),
+        "reasoning_trace_v2": context.get("reasoning_trace_v2"),
         "reasoning_trace_v3": context.get("reasoning_trace_v3"),
         "evidence_links": context.get("evidence_links"),
     }

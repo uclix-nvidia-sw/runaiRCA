@@ -700,9 +700,6 @@ def _write_trace_v3_projection(tx: Any, inc: OntologyIncident) -> None:
             "trace_local_id": local_hypothesis_id,
             "hypothesis_family": _trace_text(item.get("family"), 160),
             "mechanism": _trace_text(item.get("mechanism"), 1200),
-            "mechanism_fingerprint": _trace_text(
-                item.get("mechanism_fingerprint"), 160
-            ),
             "hypothesis_status": _trace_text(item.get("status"), 80),
             "confidence": _trace_text(item.get("confidence"), 80),
         }.items():
@@ -784,6 +781,9 @@ def _write_trace_v3_projection(tx: Any, inc: OntologyIncident) -> None:
         if not list(tx.query(f"match {match} {edge}; select $x;").resolve().as_concept_rows()):
             suffix = f', has rejection_reason "{esc(reason)}"' if reason else ""
             tx.query(f"match {match} insert $x isa rejected_evidence_link, links (hypothesis: $h, proof: $e){suffix};").resolve()
+    stop_reason = _trace_text(trace.get("stop_reason"), 300)
+    if stop_reason:
+        _replace_attr(tx, "analysis_run", "run_id", inc.run_id, "trace_stop_reason", stop_reason)
 
 
 def _relate_diagnosis_evidence(

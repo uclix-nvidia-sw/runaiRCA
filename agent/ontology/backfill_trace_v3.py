@@ -2,7 +2,7 @@
 
 This deliberately reuses the normal incident writer only for approved incidents,
 then lets its strict v3 branch create hypothesis/probe edges. It does not turn
-trace-less or pre-v3 artifacts into trace-v3 facts.
+legacy artifacts, v1, or v2 reasoning traces into trace-v3 facts.
 """
 
 from __future__ import annotations
