@@ -1496,6 +1496,33 @@ async def investigate(
                 warnings=["shared investigation/drill-down budget exhausted"],
             )
 
+    # Typed-core floor: a run must not end with zero target-scoped kubernetes
+    # evidence just because LLM rounds and broad collectors consumed the shared
+    # window (2026-07-24 audit: 15/60 runs ended artifact-free, all carrying
+    # "shared evidence budget expired" skips). One bounded pass fits inside the
+    # backend's deadline slack. A deliberate early stop on a supported scoped
+    # hypothesis is respected — the floor only rescues starved runs.
+    # ponytail: fixed 25s floor; make it a setting if the deadline slack tightens.
+    floor_target = evidence.get("kubernetes")
+    budget_skipped = floor_target is not None and "kubernetes.analysis_budget" in (
+        floor_target.missing_data or []
+    )
+    if (
+        "kubernetes" in by_name
+        and not evidence_sufficient
+        and (floor_target is None or budget_skipped)
+    ):
+        try:
+            floor_result = await asyncio.wait_for(
+                _collect_safely(by_name["kubernetes"], target, plan), 25.0
+            )
+        except Exception:  # noqa: BLE001 - the floor pass is best-effort
+            floor_result = None
+        if floor_result is not None:
+            # The budget-skip stub carries no observations; replace it outright.
+            evidence["kubernetes"] = _merge_collector_results(None, floor_result)
+            _record_blackboard(blackboard, "kubernetes", floor_result, target)
+
     # Ad-hoc reads are evidence too: attach them to the kubernetes result so the
     # report's evidence trail (and signature matching) sees what was drilled into.
     kubernetes_result = evidence.get("kubernetes")

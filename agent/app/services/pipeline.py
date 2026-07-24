@@ -1754,6 +1754,9 @@ async def rank_stage(state: PipelineState) -> PipelineState:
         graph_counts, graph_warnings = {}, []
     if graph_warnings:
         state.extra_warnings.extend(graph_warnings)
+    graph_counts = _catalog_only_candidate_counts(
+        graph_counts, getattr(state.kg_context, "reasoning", None)
+    )
     if graph_counts:
         state.root_cause_candidates = rank_root_cause_candidates(
             state.target,
@@ -2521,6 +2524,22 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
     return state
 
 
+# Generic state alerts describe a shared symptom (pod not ready, container
+# waiting, replica mismatch), not a cause. Concluding a specific family for
+# them requires target-verified evidence — enforced by the harness gate
+# generic_alert_without_target_evidence.
+GENERIC_STATE_ALERTS = frozenset(
+    {
+        "KubePodNotReady",
+        "KubeContainerWaiting",
+        "KubeDeploymentReplicasMismatch",
+        "KubeDeploymentRolloutStuck",
+        "KubeDaemonSetRolloutStuck",
+        "RunaiDaemonSetRolloutStuck",
+    }
+)
+
+
 async def harness_stage(state: PipelineState) -> PipelineState:
     """Validate the already-synthesized RCA and make bounded safe repairs."""
     from app.services.harness import (
@@ -2560,6 +2579,7 @@ async def harness_stage(state: PipelineState) -> PipelineState:
         next_check=state.self_check_next,
         evidence_eligibility=_public_evidence_eligibility(state),
         known_issues=state.known_issues,
+        generic_state_alert=state.target.alert_name in GENERIC_STATE_ALERTS,
     )
     for _ in range(state.settings.max_rca_repair_attempts):
         if not verdict.failed_gates and verdict.score >= state.settings.rca_harness_pass_score:
@@ -2581,6 +2601,7 @@ async def harness_stage(state: PipelineState) -> PipelineState:
             next_check=state.self_check_next,
             evidence_eligibility=_public_evidence_eligibility(state),
             known_issues=state.known_issues,
+            generic_state_alert=state.target.alert_name in GENERIC_STATE_ALERTS,
         )
 
     status = "pass"
@@ -2600,6 +2621,7 @@ async def harness_stage(state: PipelineState) -> PipelineState:
             next_check=state.self_check_next,
             evidence_eligibility=_public_evidence_eligibility(state),
             known_issues=state.known_issues,
+            generic_state_alert=state.target.alert_name in GENERIC_STATE_ALERTS,
         )
         status = "abstained"
     elif verdict.score < state.settings.rca_harness_pass_score:
@@ -5523,6 +5545,24 @@ _FAMILY_EXPLANATION_KO = {
     "observability_accuracy": "워크로드가 아닌 메트릭·관측 정확도 문제",
     "expected_known_behavior": "제품의 알려진 정상 동작",
 }
+
+
+def _catalog_only_candidate_counts(
+    graph_counts: dict[str, int], reasoning: object
+) -> dict[str, int]:
+    """Apply the closed family vocabulary to graph candidate priors.
+
+    Legacy TypeDB rows still carry pre-catalog names; they must not leak into
+    ranking priors or per-run ontology metadata. Dropped names are recorded in
+    the reasoning metadata so the leak stays visible instead of silent.
+    """
+    dropped = sorted(set(graph_counts) - set(FAMILIES))
+    if not dropped:
+        return graph_counts
+    _log.warning("dropping non-catalog candidate families from graph prior: %s", dropped)
+    if isinstance(reasoning, dict):
+        reasoning["dropped_candidate_families"] = dropped
+    return {family: count for family, count in graph_counts.items() if family in FAMILIES}
 
 
 def _catalog_only_knowledge(

@@ -615,3 +615,38 @@ def test_abstain_without_a_candidate_does_not_invent_a_family() -> None:
     assert "provisional_root_cause" not in response.context
     assert "do not support even a specific working hypothesis" in response.analysis_detail
     assert "before selecting a family" in response.analysis_detail
+
+
+def test_generic_alert_without_target_evidence_gate_fires() -> None:
+    response = _response()
+    cause = RankedCause("image_pull_error", "medium", 5.0)
+
+    flagged = evaluate(response, [], [cause], generic_state_alert=True)
+    assert flagged.gates["generic_alert_without_target_evidence"] is True
+    assert "generic_alert_without_target_evidence" in flagged.failed_gates
+
+    unflagged = evaluate(response, [], [cause], generic_state_alert=False)
+    assert unflagged.gates["generic_alert_without_target_evidence"] is False
+
+
+def test_generic_alert_with_target_verified_support_passes_gate() -> None:
+    results = [_result("kubernetes", "container waiting ImagePullBackOff")]
+    results[0].artifacts[0].type = "kubernetes_container_lifecycle"
+    results[0].artifacts[0].result = {
+        "container_reason": "imagepullbackoff",
+        "observation": {
+            "kind": "kubernetes_container_lifecycle",
+            "predicate": "kubernetes_target_container_lifecycle",
+            "polarity": "present",
+            "coverage": "scoped",
+            "target_identity_verified": True,
+            "observed_entity": {"kind": "pod", "name": "trainer-0"},
+        },
+    }
+    assign_evidence_ids(results)
+    cause = RankedCause(
+        "image_pull_error", "medium", 5.0, evidence_agents=["kubernetes"]
+    )
+
+    verdict = evaluate(_response(), results, [cause], generic_state_alert=True)
+    assert verdict.gates["generic_alert_without_target_evidence"] is False

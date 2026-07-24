@@ -1361,3 +1361,34 @@ async def test_expired_shared_budget_returns_placeholder_for_unfinished_collecto
     assert results[0].status == "unavailable"
     assert results[0].missing_data == ["slow.analysis_budget"]
     assert context["reasoning_trace_v2"]["stop_reason"] == "analysis_budget_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_budget_starved_run_still_collects_typed_core_kubernetes() -> None:
+    # Slow stubs: with the shared window already exhausted the final gather
+    # times out and stamps budget skips — the regression this floor rescues.
+    class KubernetesCollector:
+        async def collect(self, target, plan=None) -> CollectorResult:
+            await asyncio.sleep(0.05)
+            return CollectorResult(agent="kubernetes", status="ok", summary="kubernetes ok")
+
+    class LokiCollector:
+        async def collect(self, target, plan=None) -> CollectorResult:
+            await asyncio.sleep(0.05)
+            return CollectorResult(agent="loki", status="ok", summary="loki ok")
+
+    results, _ = await investigate(
+        make_settings(),
+        make_target(),
+        [KubernetesCollector(), LokiCollector()],
+        InvestigationPlan(),
+        {},
+        max_steps=4,
+        deadline_monotonic=time.monotonic(),  # shared window already exhausted
+    )
+
+    by_agent = {result.agent: result for result in results}
+    # The typed-core floor rescues kubernetes; broad collectors stay skipped.
+    assert by_agent["kubernetes"].status == "ok"
+    assert by_agent["loki"].status == "unavailable"
+    assert "loki.analysis_budget" in by_agent["loki"].missing_data

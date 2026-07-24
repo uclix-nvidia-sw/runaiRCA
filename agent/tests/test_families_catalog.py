@@ -37,3 +37,20 @@ def test_oomkilled_is_runtime_not_startup_keyword() -> None:
     modes = _load_failure_modes("knowledge/failure_modes.yaml")
     assert any(item["symptom"] == "OOMKilled" for item in modes["workload_runtime_error"])
     assert not any(item["symptom"] == "OOMKilled" for item in modes["workload_startup_error"])
+
+
+def test_non_catalog_candidate_counts_dropped_and_recorded() -> None:
+    from app.services.pipeline import _catalog_only_candidate_counts
+    from app.services.root_cause_ranking import FAMILIES
+
+    catalog_family = next(iter(FAMILIES))
+    reasoning: dict[str, object] = {}
+    counts = {catalog_family: 3, "workload_startup_image_failure": 2}
+
+    filtered = _catalog_only_candidate_counts(counts, reasoning)
+
+    assert filtered == {catalog_family: 3}
+    assert reasoning["dropped_candidate_families"] == ["workload_startup_image_failure"]
+
+    clean = _catalog_only_candidate_counts({catalog_family: 1}, reasoning={})
+    assert clean == {catalog_family: 1}

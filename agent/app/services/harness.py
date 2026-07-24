@@ -196,6 +196,7 @@ def evaluate(
     evidence_links: Iterable[EvidenceLink | Mapping[str, Any]] | None = None,
     evidence_eligibility: Mapping[str, object] | None = None,
     known_issues: list[dict] | None = None,
+    generic_state_alert: bool = False,
 ) -> HarnessVerdict:
     top = candidates[0] if candidates else None
     usable = _usable_artifacts(results)
@@ -338,6 +339,16 @@ def evaluate(
         # gate to high let contradicted medium conclusions retain remediation
         # authority.
         "unresolved_contradiction": bool(not insufficient and contradiction_ids),
+        # Generic state alerts (non-ready / waiting / replicas-mismatch class)
+        # describe a symptom shared by many causes. Naming a specific family
+        # without a single target-verified supporting observation is a guess
+        # (2026-07-24 audit: 4/10 KubePodNotReady runs concluded families with
+        # zero target-scoped artifacts).
+        "generic_alert_without_target_evidence": bool(
+            not insufficient
+            and generic_state_alert
+            and not any(_target_verified_artifact(item) for item in supporting)
+        ),
         "unsafe_action_without_guardrail": _unsafe_action_without_guardrail(
             response.analysis_detail
         ),
@@ -398,6 +409,17 @@ def apply_trace(response: AlertAnalysisResponse, verdict: HarnessVerdict) -> boo
     response.analysis_detail = response.analysis_detail.rstrip() + "\n\n" + "\n".join(lines)
     response.analysis = response.analysis_detail
     return True
+
+
+def _target_verified_artifact(item: object) -> bool:
+    payload = getattr(item, "result", None)
+    if not isinstance(payload, dict):
+        return False
+    observation = payload.get("observation")
+    return (
+        isinstance(observation, dict)
+        and observation.get("target_identity_verified") is True
+    )
 
 
 def _trace_item(item: object) -> dict[str, str]:
