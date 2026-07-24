@@ -198,6 +198,12 @@ def _grounds_promoted_symptom(candidate: RankedCause | None, artifact: object) -
             continue
         keywords = [str(keyword) for keyword in item.get("matched_keywords") or []]
         _agent, _predicate, text = _artifact_family_semantics(artifact)
+        # Plain substring on purpose: the ranker's curated matcher already
+        # applied boundary/negation semantics when it recorded this match;
+        # this is only a re-check that the recorded keyword exists in THIS
+        # ranker-bound artifact. Re-applying _keyword_hits here falsely
+        # rejects legitimate negation-carrying symptoms ("PLEG Not Healthy",
+        # "no endpoints") — proven by the ontology sweep.
         if keywords and any(keyword.casefold() in text for keyword in keywords):
             return True
     return False
