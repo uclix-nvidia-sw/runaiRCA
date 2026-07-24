@@ -203,6 +203,12 @@ type IncidentListFilter struct {
 	Search string
 }
 
+type IncidentListCounts struct {
+	Open      int `json:"open"`
+	Resolved  int `json:"resolved"`
+	Analyzing int `json:"analyzing"`
+}
+
 type AlertListFilter struct {
 	Status   string
 	Severity string
@@ -611,6 +617,11 @@ func incidentActivityAt(inc *Incident) time.Time {
 }
 
 func (s *Store) ListIncidentsPageFiltered(limit, offset int, view string, filter IncidentListFilter) ([]Incident, int) {
+	items, total, _ := s.ListIncidentsPageFilteredWithCounts(limit, offset, view, filter)
+	return items, total
+}
+
+func (s *Store) ListIncidentsPageFilteredWithCounts(limit, offset int, view string, filter IncidentListFilter) ([]Incident, int, IncidentListCounts) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	needle := searchNeedle(filter.Search)
@@ -634,12 +645,23 @@ func (s *Store) ListIncidentsPageFiltered(limit, offset int, view string, filter
 		ordered = append(ordered, incident)
 	}
 	sort.Slice(ordered, func(i, j int) bool { return incidentActivityAt(ordered[i]).After(incidentActivityAt(ordered[j])) })
+	counts := IncidentListCounts{}
+	for _, incident := range ordered {
+		if incident.Status == "resolved" {
+			counts.Resolved++
+		} else {
+			counts.Open++
+		}
+		if incident.IsAnalyzing {
+			counts.Analyzing++
+		}
+	}
 	start, end := pageRange(len(ordered), limit, offset)
 	items := make([]Incident, 0, end-start)
 	for _, incident := range ordered[start:end] {
 		items = append(items, *cloneIncident(incident))
 	}
-	return items, len(ordered)
+	return items, len(ordered), counts
 }
 
 func (s *Store) ListAlerts() []AlertRecord {

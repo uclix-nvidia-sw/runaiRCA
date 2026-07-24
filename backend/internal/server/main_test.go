@@ -96,6 +96,20 @@ func TestListIncidentsPageFiltered(t *testing.T) {
 	if total != 2 || len(items) != 2 || items[0].IncidentID == approved.IncidentID || items[1].IncidentID == approved.IncidentID {
 		t.Fatalf("expected pending final decision incidents (%s, %s), total=%d items=%+v", pending.IncidentID, analyzing.IncidentID, total, items)
 	}
+	_, total, counts := store.ListIncidentsPageFilteredWithCounts(1, 1, incidentViewActive, IncidentListFilter{})
+	if total != 3 || counts != (IncidentListCounts{Open: 2, Resolved: 1, Analyzing: 1}) {
+		t.Fatalf("expected all filtered counts to ignore pagination, total=%d counts=%+v", total, counts)
+	}
+	store.ArchiveIncident(pending.IncidentID, true)
+	store.SoftDeleteIncident(analyzing.IncidentID)
+	_, total, counts = store.ListIncidentsPageFilteredWithCounts(1, 0, incidentViewArchived, IncidentListFilter{})
+	if total != 1 || counts != (IncidentListCounts{Open: 1}) {
+		t.Fatalf("expected archived-view counts, total=%d counts=%+v", total, counts)
+	}
+	_, total, counts = store.ListIncidentsPageFilteredWithCounts(1, 0, incidentViewTrash, IncidentListFilter{Status: "analyzing"})
+	if total != 1 || counts != (IncidentListCounts{Open: 1, Analyzing: 1}) {
+		t.Fatalf("expected trash filtered counts, total=%d counts=%+v", total, counts)
+	}
 }
 
 func TestListAlertsPageFiltered(t *testing.T) {

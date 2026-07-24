@@ -63,14 +63,6 @@ export function IncidentsDashboard({
     setSelectedIDs((current) => current.filter((id) => visible.has(id)));
   }, [visibleIDKey]);
 
-  let openCount = 0;
-  let resolvedCount = 0;
-  let analyzingIncidentCount = 0;
-  for (const i of incidents) {
-    if (i.status === 'resolved') resolvedCount++;
-    else openCount++;
-    if (i.is_analyzing) analyzingIncidentCount++;
-  }
   const updateFilter = <K extends keyof IncidentFilterState>(key: K, value: IncidentFilterState[K]) => {
     onFilterChange({ ...filters, [key]: value });
   };
@@ -104,10 +96,10 @@ export function IncidentsDashboard({
   return (
     <>
       <section className="metric-row">
-        <Metric label="Open incidents" value={openCount} />
+        <Metric label="Open incidents" value={page.counts?.open ?? 0} />
         <Metric label="Total incidents" value={page.total} />
-        <Metric label="Analyzing" value={analyzingIncidentCount} />
-        <Metric label="Resolved incidents" value={resolvedCount} />
+        <Metric label="Analyzing" value={page.counts?.analyzing ?? 0} />
+        <Metric label="Resolved incidents" value={page.counts?.resolved ?? 0} />
       </section>
 
       <section className="content-grid single-dashboard-grid">
