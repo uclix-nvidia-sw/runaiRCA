@@ -123,6 +123,10 @@ class AlertAnalysisResponse(BaseModel):
     analysis_type: str
     analysis_quality: str
     root_cause_family: str = ""
+    # Mechanism-level detail beneath the family headline (e.g. the exact missing
+    # ConfigMap or invalid entrypoint), derived only from typed machine-reported
+    # evidence in the final trace; empty when no closed-table reason matched.
+    specific_cause: str = ""
     missing_data: list[str]
     warnings: list[str]
     capabilities: dict[str, str]

@@ -1912,11 +1912,11 @@ def _record_selected_hypothesis_id(state: PipelineState) -> None:
         return
     hypothesis_id = str(getattr(state.root_cause_candidates[0], "hypothesis_id", "") or "").strip()
     hypotheses = trace.get("hypotheses")
-    known = {
-        str(item.get("hypothesis_id") or "")
-        for item in hypotheses
-        if isinstance(item, dict)
-    } if isinstance(hypotheses, list) else set()
+    known = (
+        {str(item.get("hypothesis_id") or "") for item in hypotheses if isinstance(item, dict)}
+        if isinstance(hypotheses, list)
+        else set()
+    )
     if hypothesis_id and hypothesis_id in known:
         trace["selected_hypothesis_id"] = hypothesis_id
 
@@ -2351,6 +2351,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         state.root_cause_candidates,
         state.failure_modes,
         language=getattr(settings, "language", "en"),
+        eligible_support_ids=eligible_support_ids,
     )
     playbook_fallback = load_troubleshooting_cases(settings.troubleshooting_cases_file)
     state.detail = _detail_from(
@@ -2424,11 +2425,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
     # appendix so the document reads problem -> cause -> actions -> checks -> appendix.
     self_check_lines = [text for text in (state.self_check_caveat, state.reanalysis_note) if text]
     if state.self_check_next and state.self_check_next not in state.detail:
-        next_label = (
-            "다음 확인"
-            if getattr(settings, "language", "en") == "ko"
-            else "Next check"
-        )
+        next_label = "다음 확인" if getattr(settings, "language", "en") == "ko" else "Next check"
         self_check_lines.append(f"- **{next_label}**: {state.self_check_next}")
     if self_check_lines:
         state.detail = _insert_before_appendix(
@@ -2460,6 +2457,12 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             state.detail = _insert_before_appendix(state.detail, f"{header}\n\n{body}")
 
     affected_pods = _affected_pods_from_results(state.results)
+    specific_cause = _specific_cause_statement(
+        state.root_cause_candidates[0] if state.root_cause_candidates else None,
+        state.results,
+        eligible_support_ids,
+        language=getattr(settings, "language", "en"),
+    )
 
     synthesis_failed = state.synthesis_status == "failed"
     state.response = AlertAnalysisResponse(
@@ -2474,6 +2477,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         root_cause_family=(
             state.root_cause_candidates[0].family if state.root_cause_candidates else ""
         ),
+        specific_cause=specific_cause,
         missing_data=state.missing,
         warnings=state.warnings,
         capabilities=state.capabilities,
@@ -2505,6 +2509,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             "top_root_cause": (
                 state.root_cause_candidates[0].as_dict() if state.root_cause_candidates else None
             ),
+            "specific_cause": specific_cause,
             "confidence_diagnostics": _confidence_diagnostics(state),
             "knowledge_base": state.kg_context.public_dict(),
             "ontology_reasoning": state.kg_context.as_dict().get("reasoning", {}),
@@ -2638,6 +2643,12 @@ async def harness_stage(state: PipelineState) -> PipelineState:
 
     top = state.root_cause_candidates[0] if state.root_cause_candidates else None
     response.root_cause_family = top.family if top else ""
+    response.specific_cause = _specific_cause_statement(
+        top,
+        state.results,
+        _eligible_support_ids_for_output(state),
+        language=getattr(state.settings, "language", "en"),
+    )
     # The harness is the final authority on the headline family.  Reconcile the
     # short summary after that decision so a demotion cannot leave a confident
     # mechanism sentence beside ``insufficient_evidence``.
@@ -2658,12 +2669,14 @@ async def harness_stage(state: PipelineState) -> PipelineState:
             state.root_cause_candidates,
             state.failure_modes,
             language=getattr(state.settings, "language", "en"),
+            eligible_support_ids=_eligible_support_ids_for_output(state),
         )
     state.summary = response.analysis_summary
     response.context["root_cause_candidates"] = [
         candidate.as_dict() for candidate in state.root_cause_candidates
     ]
     response.context["top_root_cause"] = top.as_dict() if top else None
+    response.context["specific_cause"] = response.specific_cause
     harness_payload = payload(verdict, status=status, repairs=repairs)
     response.context["harness"] = harness_payload
     response.context["confidence_diagnostics"] = _confidence_diagnostics(
@@ -3276,10 +3289,7 @@ async def _reanalyze_once(
                 f"targeted re-analysis pass was performed → revised conclusion: {new_family}."
             )
         elif getattr(state.settings, "language", "en") == "ko":
-            note = (
-                "낮은 확신/증거 공백 때문에 추가 조사를 수행했습니다 → "
-                f"결론: {new_family}"
-            )
+            note = f"낮은 확신/증거 공백 때문에 추가 조사를 수행했습니다 → 결론: {new_family}"
         else:
             note = (
                 "A targeted investigation pass was performed for low confidence "
@@ -3498,11 +3508,7 @@ def _korean_report_language_conflict(summary: str, detail: str) -> str:
         # required action section.
         return "required Recommended Actions section is missing" if "##" in detail else ""
     action_end = re.search(r"(?m)^##\s+", detail[action_heading.end() :])
-    block_end = (
-        action_heading.end() + action_end.start()
-        if action_end is not None
-        else len(detail)
-    )
+    block_end = action_heading.end() + action_end.start() if action_end is not None else len(detail)
     block = detail[action_heading.end() : block_end]
     for match in re.finditer(r"(?m)^\s*\d+[.)]\s+(.+?)\s*$", block):
         action = match.group(1).strip()
@@ -3804,10 +3810,7 @@ def _sanitize_kubernetes_context_result(value: object) -> object:
             return _SYNTHESIS_OMIT
         if isinstance(node, dict):
             condition_type = str(node.get("type") or "").strip()
-            if (
-                condition_type.casefold() in _K8S_CONDITION_TYPES
-                and "status" in node
-            ):
+            if condition_type.casefold() in _K8S_CONDITION_TYPES and "status" in node:
                 checks = condition_observations(
                     {"type": condition_type, "status": node.get("status")}, limit=1
                 )
@@ -3965,10 +3968,7 @@ def _synthesis_mention_in_enumeration(fragment: str, start: int, end: int) -> bo
     left_char = fragment[left] if left >= 0 else ""
     right_char = fragment[right] if right < length else ""
     if left_char in _SYNTHESIS_ENUM_LEFT and right_char in _SYNTHESIS_ENUM_RIGHT:
-        return (
-            left_char in _SYNTHESIS_ENUM_SEPARATOR
-            or right_char in _SYNTHESIS_ENUM_SEPARATOR
-        )
+        return left_char in _SYNTHESIS_ENUM_SEPARATOR or right_char in _SYNTHESIS_ENUM_SEPARATOR
     return False
 
 
@@ -4126,6 +4126,7 @@ def _summary_from(
     failure_modes: dict[str, list[dict]] | None = None,
     *,
     language: str = "en",
+    eligible_support_ids: set[str] | None = None,
 ) -> str:
     observed = _observed_text(results, request)
     return _short_sentence(
@@ -4135,8 +4136,10 @@ def _summary_from(
             observed,
             failure_modes or {},
             language,
+            results=results,
+            eligible_evidence_ids=eligible_support_ids,
         ),
-        limit=280,
+        limit=320,
     )
 
 
@@ -4146,25 +4149,39 @@ def _failure_mode_root_cause_statement(
     observed_text: str,
     failure_modes: dict[str, list[dict]],
     language: str,
+    *,
+    results: list[CollectorResult] | None = None,
+    eligible_evidence_ids: set[str] | None = None,
 ) -> str:
     """Prefer an exact, curated mechanism over a coarse ranked-family sentence."""
-    matches = _actionable_failure_mode_matches(
-        failure_modes, observed_text, candidates
-    )
+    matches = _actionable_failure_mode_matches(failure_modes, observed_text, candidates)
     top_family = candidates[0].family if candidates else ""
     if not _top_family_settled(candidates):
         matches = []
     for _family, symptom in matches:
         if top_family and _family != top_family:
             continue
-        reason = str(
-            symptom.get("reason_ko" if language == "ko" else "reason") or ""
-        ).strip()
+        reason = str(symptom.get("reason_ko" if language == "ko" else "reason") or "").strip()
         if reason:
             statement = reason
             break
     else:
-        statement = _ranked_root_cause_statement(candidates, request, language=language)
+        statement = _ranked_root_cause_statement(
+            candidates,
+            request,
+            results=results,
+            eligible_evidence_ids=eligible_evidence_ids,
+            language=language,
+        )
+    if matches:
+        detail = _specific_cause_statement(
+            candidates[0] if candidates else None,
+            results or [],
+            eligible_evidence_ids,
+            language=language,
+        )
+        if detail:
+            statement = f"{statement} {detail}"
     provenance = _runtime_failure_mode_provenance(matches, candidates)
     return f"{statement} ({provenance})" if provenance else statement
 
@@ -4347,6 +4364,8 @@ def _detail_from(
             observed_text,
             failure_modes or {},
             language,
+            results=results,
+            eligible_evidence_ids=eligible_support_ids,
         )
     )
     # Multi-axis facets (Locus / Nature / Trigger) for the top cause — names the
@@ -5004,6 +5023,7 @@ def _promote_typed_state_cause(
                 *([] if rationale in existing.rationale else [rationale]),
             ],
             evidence_agents=sorted({*existing.evidence_agents, "signature", "kubernetes"}),
+            mechanism=rationale,
             support_evidence_ids=support_evidence_ids,
             score_breakdown=[
                 *existing.score_breakdown,
@@ -5031,6 +5051,7 @@ def _promote_typed_state_cause(
             score=9.0,
             rationale=[rationale],
             evidence_agents=["kubernetes", "signature"],
+            mechanism=rationale,
             support_evidence_ids=support_evidence_ids,
             score_breakdown=[
                 {
@@ -5339,8 +5360,10 @@ def _numbered_actions(
     # disappear when Korean synthesis fails and the deterministic report wins.
     if self_check_next.strip():
         ordered.append(self_check_next)
-    if allow_cause_specific_actions and symptom_matches[0:1] and symptom_matches[0][1].get(
-        "exclusive_actions"
+    if (
+        allow_cause_specific_actions
+        and symptom_matches[0:1]
+        and symptom_matches[0][1].get("exclusive_actions")
     ):
         actions = [
             *ordered,
@@ -5460,13 +5483,16 @@ def _top_family_settled(candidates: list[RankedCause] | None) -> bool:
     if not candidates:
         return False
     top = candidates[0]
-    return top.family != "insufficient_evidence" and (
-        top.confidence != "low" or top.score >= 2.0
-    )
+    return top.family != "insufficient_evidence" and (top.confidence != "low" or top.score >= 2.0)
 
 
 def _ranked_root_cause_statement(
-    candidates: list[RankedCause], request: AlertAnalysisRequest, *, language: str = "en"
+    candidates: list[RankedCause],
+    request: AlertAnalysisRequest,
+    *,
+    results: list[CollectorResult] | None = None,
+    eligible_evidence_ids: set[str] | None = None,
+    language: str = "en",
 ) -> str:
     subject = _as_sentence(_root_cause_statement(request, language=language))
     if not candidates:
@@ -5485,9 +5511,311 @@ def _ranked_root_cause_statement(
         )
     if language == "ko":
         explanation = _FAMILY_EXPLANATION_KO.get(top.family) or _family_label(top.family)
-        return _short_sentence(f"{subject} 가장 가능성 높은 원인은 {explanation}입니다.", limit=320)
-    explanation = _FAMILY_EXPLANATION.get(top.family) or _family_label(top.family)
-    return _short_sentence(f"{subject} Likely cause: {explanation}.", limit=320)
+        statement = f"{subject} 가장 가능성 높은 원인은 {explanation}입니다."
+    else:
+        explanation = _FAMILY_EXPLANATION.get(top.family) or _family_label(top.family)
+        statement = f"{subject} Likely cause: {explanation}."
+    detail = _specific_cause_statement(top, results or [], eligible_evidence_ids, language=language)
+    return _short_sentence(f"{statement} {detail}" if detail else statement, limit=320)
+
+
+_TYPED_MECHANISM_REASON = re.compile(
+    r"^typed container state ([A-Za-z][A-Za-z0-9]*) on the alert Pod "
+    r"\(machine-reported, not keyword-matched\)$"
+)
+_CONFIGMAP_NOT_FOUND = re.compile(r'configmap "([^"]+)" not found', re.IGNORECASE)
+_SECRET_NOT_FOUND = re.compile(r'secret "([^"]+)" not found', re.IGNORECASE)
+_MISSING_KEY = re.compile(r"couldn't find key (\S+)", re.IGNORECASE)
+_EXECUTABLE_TOKEN = re.compile(
+    r'(?:exec:\s*)?["\']?([^\s:"\']+)["\']?:?\s*.*executable file not found in \$?PATH',
+    re.IGNORECASE,
+)
+
+
+def _specific_cause_statement(
+    top: RankedCause | None,
+    results: list[CollectorResult],
+    eligible_evidence_ids: set[str] | None,
+    *,
+    language: str,
+) -> str:
+    """Render a closed-vocabulary typed-state detail from eligible message fields only."""
+    if top is None or not eligible_evidence_ids:
+        return ""
+    matched = _TYPED_MECHANISM_REASON.match(str(top.mechanism or "").strip())
+    if not matched:
+        return ""
+    reason = matched.group(1)
+    observations = _typed_reason_observations(results, eligible_evidence_ids, reason)
+    if reason == "CrashLoopBackOff":
+        terminated = _typed_last_terminated_observations(results, eligible_evidence_ids)
+        deeper = next(
+            (
+                item
+                for item in terminated
+                if item[0]
+                in {
+                    "CreateContainerConfigError",
+                    "StartError",
+                    "RunContainerError",
+                    "ContainerCannotRun",
+                    "OOMKilled",
+                }
+            ),
+            None,
+        )
+        if deeper:
+            reason, observations = deeper[0], [deeper]
+        else:
+            exit_code = next((item[2] for item in terminated if item[2] is not None), None)
+            return _restart_loop_detail(exit_code, language)
+    if reason == "CreateContainerConfigError":
+        detail = _config_error_detail([item[1] for item in observations], language)
+        return detail or _config_error_generic(language)
+    if reason in {"StartError", "RunContainerError", "ContainerCannotRun"}:
+        return _command_error_detail([item[1] for item in observations], language)
+    if reason == "OOMKilled":
+        limit = _memory_limit(observations)
+        if language == "ko":
+            return "컨테이너가 메모리 limit을 초과해 커널이 OOM kill(exit 137) 했습니다" + (
+                f" (limit: {limit})." if limit else "."
+            )
+        return "The container exceeded its memory limit and the kernel OOM-killed it (exit 137)" + (
+            f" (limit: {limit})." if limit else "."
+        )
+    if reason in {"Unschedulable", "SchedulingGated"}:
+        return _scheduling_detail([item[1] for item in observations], language)
+    if reason in {"ImagePullBackOff", "ErrImagePull"}:
+        return _image_pull_detail([item[1] for item in observations], language)
+    return ""
+
+
+def _typed_reason_observations(
+    results: list[CollectorResult], eligible_evidence_ids: set[str], reason: str
+) -> list[tuple[str, str, object | None, dict[str, Any]]]:
+    found: list[tuple[str, str, object | None, dict[str, Any]]] = []
+    for result in results:
+        for item in result.artifacts:
+            if str(getattr(item, "evidence_id", "") or "") not in eligible_evidence_ids:
+                continue
+            payload = getattr(item, "result", None)
+            if not _typed_artifact_is_verified(payload):
+                continue
+            if getattr(item, "type", "") == "kubernetes_container_lifecycle":
+                for container in payload.get("containers", []):
+                    if not isinstance(container, dict):
+                        continue
+                    for key in ("state", "lastTerminated"):
+                        state = container.get(key)
+                        if not isinstance(state, dict) or str(state.get("reason") or "") != reason:
+                            continue
+                        if key == "state" and state.get("phase") not in {"waiting", "terminated"}:
+                            continue
+                        if key == "lastTerminated" and not (
+                            reason or state.get("exitCode") is not None
+                        ):
+                            continue
+                        if isinstance(state, dict):
+                            found.append(
+                                (
+                                    reason,
+                                    str(state.get("message") or ""),
+                                    state.get("exitCode"),
+                                    {"container": container, "payload": payload},
+                                )
+                            )
+            elif getattr(item, "type", "") == "kubernetes_warning_events":
+                for event in payload.get("events", []):
+                    if not (
+                        isinstance(event, dict)
+                        and str(event.get("type") or "") == "Warning"
+                        and event.get("target_identity_verified") is True
+                        and str(event.get("reason") or "") == reason
+                    ):
+                        continue
+                    try:
+                        count = int(event.get("count") or 0)
+                    except (TypeError, ValueError):
+                        count = 0
+                    if count >= 3:
+                        found.append(
+                            (
+                                reason,
+                                str(event.get("message") or ""),
+                                None,
+                                {"event": event, "payload": payload},
+                            )
+                        )
+    return found
+
+
+def _typed_last_terminated_observations(
+    results: list[CollectorResult], eligible_evidence_ids: set[str]
+) -> list[tuple[str, str, object | None, dict[str, Any]]]:
+    found: list[tuple[str, str, object | None, dict[str, Any]]] = []
+    for result in results:
+        for item in result.artifacts:
+            if str(getattr(item, "evidence_id", "") or "") not in eligible_evidence_ids:
+                continue
+            payload = getattr(item, "result", None)
+            if (
+                not _typed_artifact_is_verified(payload)
+                or getattr(item, "type", "") != "kubernetes_container_lifecycle"
+            ):
+                continue
+            for container in payload.get("containers", []):
+                state = container.get("lastTerminated") if isinstance(container, dict) else None
+                if isinstance(state, dict):
+                    found.append(
+                        (
+                            str(state.get("reason") or ""),
+                            str(state.get("message") or ""),
+                            state.get("exitCode"),
+                            {"container": container, "payload": payload},
+                        )
+                    )
+    return found
+
+
+def _typed_artifact_is_verified(payload: object) -> bool:
+    observation = payload.get("observation") if isinstance(payload, dict) else None
+    return bool(
+        isinstance(observation, dict)
+        and observation.get("polarity") == "present"
+        and observation.get("coverage") == "scoped"
+        and observation.get("target_identity_verified") is True
+    )
+
+
+def _config_error_detail(messages: list[str], language: str) -> str:
+    for message in messages:
+        if match := _CONFIGMAP_NOT_FOUND.search(message):
+            name = match.group(1)
+            return _missing_reference_detail("ConfigMap", name, language)
+        if match := _SECRET_NOT_FOUND.search(message):
+            name = match.group(1)
+            return _missing_reference_detail("Secret", name, language)
+        if match := _MISSING_KEY.search(message):
+            key = match.group(1)
+            return (
+                f"구체적으로는 Pod가 참조하는 ConfigMap/Secret 키 '{key}'을(를) 찾지 못해 "
+                "컨테이너를 생성하지 못했습니다 (configMapKeyRef/secretKeyRef의 이름·키를 확인)."
+                if language == "ko"
+                else (
+                    f"Specifically, Kubernetes could not find referenced ConfigMap/Secret key "
+                    f"'{key}', so it cannot create the container; check "
+                    "configMapKeyRef/secretKeyRef names and keys."
+                )
+            )
+    return ""
+
+
+def _missing_reference_detail(kind: str, name: str, language: str) -> str:
+    if language == "ko":
+        return (
+            f"구체적으로는 Pod가 참조하는 {kind} '{name}'이(가) 존재하지 않아 컨테이너를 "
+            "생성하지 못했습니다 (configMapKeyRef/secretKeyRef의 이름·키를 확인)."
+        )
+    return (
+        f"Specifically, {kind} '{name}' referenced by the Pod is missing, so Kubernetes "
+        "cannot create the container; check configMapKeyRef/secretKeyRef names and keys."
+    )
+
+
+def _config_error_generic(language: str) -> str:
+    return (
+        "참조된 ConfigMap/Secret이 없거나 키가 잘못되었습니다."
+        if language == "ko"
+        else "A referenced ConfigMap/Secret is missing or its key is invalid."
+    )
+
+
+def _command_error_detail(messages: list[str], language: str) -> str:
+    for message in messages:
+        if not re.search(
+            r"executable file not found in \$?PATH|no such file or directory|permission denied",
+            message,
+            re.IGNORECASE,
+        ):
+            continue
+        token = _EXECUTABLE_TOKEN.search(message)
+        name = f" '{token.group(1)}'" if token else ""
+        if language == "ko":
+            return (
+                "구체적으로는 컨테이너 command/entrypoint가 잘못되었습니다: 지정한 실행파일"
+                f"{name}이(가) 이미지 안에 없거나 실행할 수 없습니다."
+            )
+        return (
+            "Specifically, the container command/entrypoint is invalid: executable"
+            f"{name} is missing from the image or cannot run."
+        )
+    return ""
+
+
+def _restart_loop_detail(exit_code: object | None, language: str) -> str:
+    suffix = f" (exit {exit_code})" if exit_code is not None else ""
+    return (
+        f"컨테이너가 반복 재시작 중입니다{suffix}."
+        if language == "ko"
+        else f"The container is repeatedly restarting{suffix}."
+    )
+
+
+def _memory_limit(observations: list[tuple[str, str, object | None, dict[str, Any]]]) -> str:
+    for _, _, _, source in observations:
+        container = source.get("container", {})
+        resources = container.get("resources") if isinstance(container, dict) else None
+        if not isinstance(resources, dict):
+            resources = source.get("payload", {}).get("resources", {})
+        limits = resources.get("limits") if isinstance(resources, dict) else None
+        if isinstance(limits, dict) and limits.get("memory"):
+            return str(limits["memory"])
+    return ""
+
+
+def _scheduling_detail(messages: list[str], language: str) -> str:
+    for message in messages:
+        if "didn't match Pod's node affinity/selector" in message:
+            return (
+                "구체적으로는 Pod의 nodeSelector/affinity 불일치로 스케줄링할 수 없습니다."
+                if language == "ko"
+                else "Specifically, a nodeSelector/affinity mismatch prevents scheduling."
+            )
+        if match := re.search(r"Insufficient (\S+)", message, re.IGNORECASE):
+            return (
+                f"구체적으로는 스케줄 가능한 노드의 {match.group(1)} 리소스가 부족합니다."
+                if language == "ko"
+                else (
+                    f"Specifically, schedulable nodes have insufficient {match.group(1)} resources."
+                )
+            )
+        if re.search(r"untolerated taint", message, re.IGNORECASE):
+            return (
+                "구체적으로는 Pod가 노드 taint를 tolerate하지 않아 스케줄링할 수 없습니다."
+                if language == "ko"
+                else (
+                    "Specifically, the Pod does not tolerate a node taint, so it cannot be "
+                    "scheduled."
+                )
+            )
+    return ""
+
+
+def _image_pull_detail(messages: list[str], language: str) -> str:
+    for message in messages:
+        if re.search(r"not found|manifest unknown", message, re.IGNORECASE):
+            return (
+                "구체적으로는 이미지 또는 tag가 registry에 없습니다."
+                if language == "ko"
+                else "Specifically, the image or tag does not exist in the registry."
+            )
+        if re.search(r"unauthorized|authentication required", message, re.IGNORECASE):
+            return (
+                "구체적으로는 registry 인증 실패로 이미지를 pull하지 못했습니다."
+                if language == "ko"
+                else "Specifically, registry authentication failed, so the image cannot be pulled."
+            )
+    return ""
 
 
 # Nature axis labels for the operator-facing facets line.
@@ -6624,13 +6952,11 @@ def _graph_remediation_lines(graph_fixes: GraphRemediation | None) -> list[str]:
     for code, fixes in graph_fixes.xid_fixes.items():
         lines.append(f"  - NVIDIA Xid {code}:")
         lines.extend(
-            f"    - {_safe_line(statement, limit=360, masker=masker)}"
-            for statement in fixes[:5]
+            f"    - {_safe_line(statement, limit=360, masker=masker)}" for statement in fixes[:5]
         )
     for code, trigger in graph_fixes.xid_triggers.items():
         lines.append(
-            f"  - Diagnostic guidance (XID {code}): "
-            f"{_safe_line(trigger, limit=360, masker=masker)}"
+            f"  - Diagnostic guidance (XID {code}): {_safe_line(trigger, limit=360, masker=masker)}"
         )
     for model, xids in graph_fixes.model_xids.items():
         rendered = ", ".join(str(x) for x in xids)
@@ -6762,7 +7088,6 @@ def _feedback_hint_lines(request: AlertAnalysisRequest) -> list[str]:
         return [*lines, "- No operator feedback hints were provided."]
     for hint in request.feedback_hints[:5]:
         lines.append(
-            f"- {hint.sentiment} from {hint.source_id}: "
-            f"{_short_sentence(hint.text, limit=320)}"
+            f"- {hint.sentiment} from {hint.source_id}: {_short_sentence(hint.text, limit=320)}"
         )
     return lines
