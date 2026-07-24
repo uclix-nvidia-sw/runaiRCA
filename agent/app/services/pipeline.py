@@ -195,6 +195,7 @@ class _ReanalysisTarget:
     family: str
     reason: str
     refuted_family: str = ""
+    refuted_mechanism: str = ""
     initial_refutation: bool = False
 
 
@@ -2610,6 +2611,28 @@ async def harness_stage(state: PipelineState) -> PipelineState:
 
     top = state.root_cause_candidates[0] if state.root_cause_candidates else None
     response.root_cause_family = top.family if top else ""
+    # The harness is the final authority on the headline family.  Reconcile the
+    # short summary after that decision so a demotion cannot leave a confident
+    # mechanism sentence beside ``insufficient_evidence``.
+    final_family = response.root_cause_family
+    if final_family == "insufficient_evidence":
+        response.analysis_summary = _short_sentence(
+            _ranked_root_cause_statement(
+                [RankedCause("insufficient_evidence", "low", 0.0)],
+                state.request,
+                language=getattr(state.settings, "language", "en"),
+            ),
+            limit=280,
+        )
+    elif top is not None:
+        response.analysis_summary = _summary_from(
+            state.request,
+            state.results,
+            state.root_cause_candidates,
+            state.failure_modes,
+            language=getattr(state.settings, "language", "en"),
+        )
+    state.summary = response.analysis_summary
     response.context["root_cause_candidates"] = [
         candidate.as_dict() for candidate in state.root_cause_candidates
     ]
@@ -2772,6 +2795,7 @@ def _next_reanalysis_target(
 ) -> _ReanalysisTarget | None:
     top = state.root_cause_candidates[0] if state.root_cause_candidates else None
     refuted_family = top.family if top and state.self_check_refuted else ""
+    refuted_mechanism = top.mechanism if top and state.self_check_refuted else ""
     excluded = {
         family
         for family in (*attempted, refuted_family, "insufficient_evidence")
@@ -2784,6 +2808,7 @@ def _next_reanalysis_target(
                 family,
                 "targeted follow-up for newly collected eligible evidence",
                 refuted_family,
+                refuted_mechanism,
                 not state.reanalysis_note,
             )
 
@@ -2794,6 +2819,7 @@ def _next_reanalysis_target(
                     candidate.family,
                     "re-analysis after the previous conclusion was refuted",
                     refuted_family,
+                    refuted_mechanism,
                     not state.reanalysis_note,
                 )
         kg_blast = getattr(state.kg_context, "blast_radius_workloads", 0)
@@ -2819,6 +2845,7 @@ def _next_reanalysis_target(
                     candidate.family,
                     "re-analysis after the previous conclusion was refuted",
                     refuted_family,
+                    refuted_mechanism,
                     not state.reanalysis_note,
                 )
 
@@ -3175,18 +3202,7 @@ async def _reanalyze_once(
             ),
             typed_state=_dispositive_typed_state(merged_results, eligible_support_ids),
         )
-        if target.refuted_family and not _fresh_results_support_family(
-            target.refuted_family,
-            fresh,
-            evidence_eligibility,
-        ):
-            alternatives = [
-                candidate
-                for candidate in candidates
-                if candidate.family != target.refuted_family
-            ]
-            if alternatives:
-                candidates = alternatives
+        candidates = _exclude_refuted_reanalysis_candidates(candidates, target)
         skip_self_check = _evidence_budget_exceeded(state)
         if skip_self_check:
             # The targeted probes already completed and were normalized/ranked.
@@ -3251,6 +3267,39 @@ async def _reanalyze_once(
         )
     except Exception:  # noqa: BLE001 - re-analysis is best-effort; keep 1st result
         return None
+
+
+def _exclude_refuted_reanalysis_candidates(
+    candidates: list[RankedCause], target: _ReanalysisTarget
+) -> list[RankedCause]:
+    """Do not let an unchanged self-refuted family/mechanism win again."""
+    if not target.refuted_family:
+        return candidates
+    refuted_mechanism = " ".join(target.refuted_mechanism.casefold().split())
+    kept = [
+        candidate
+        for candidate in candidates
+        if not (
+            candidate.family == target.refuted_family
+            and (
+                not refuted_mechanism
+                or " ".join(candidate.mechanism.casefold().split()) == refuted_mechanism
+            )
+        )
+    ]
+    if kept:
+        return kept
+    return [
+        RankedCause(
+            family="insufficient_evidence",
+            confidence="low",
+            score=0.0,
+            rationale=[
+                "The re-analysis conclusion repeated a family/mechanism "
+                "that the self-check refuted."
+            ],
+        )
+    ]
 
 
 def _synthesis_knowledge_projection(
@@ -4071,7 +4120,12 @@ def _failure_mode_root_cause_statement(
     matches = _actionable_failure_mode_matches(
         failure_modes, observed_text, candidates
     )
+    top_family = candidates[0].family if candidates else ""
+    if not _top_family_settled(candidates):
+        matches = []
     for _family, symptom in matches:
+        if top_family and _family != top_family:
+            continue
         reason = str(
             symptom.get("reason_ko" if language == "ko" else "reason") or ""
         ).strip()
@@ -4766,12 +4820,19 @@ def _dispositive_typed_state(
                         continue
                     for state_key in ("state", "lastTerminated"):
                         state = container.get(state_key)
-                        if not isinstance(state, dict) or state.get("phase") not in {
+                        if not isinstance(state, dict):
+                            continue
+                        reason = str(state.get("reason") or "")
+                        if state_key == "state" and state.get("phase") not in {
                             "waiting",
                             "terminated",
                         }:
                             continue
-                        reason = str(state.get("reason") or "")
+                        exit_code = state.get("exitCode")
+                        if state_key == "lastTerminated" and not (
+                            reason or exit_code is not None
+                        ):
+                            continue
                         family = _typed_reason_family(reason)
                         if family:
                             return (

@@ -233,7 +233,6 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
         ("kubernetes", "loki"),
         (
             "crashloopbackoff",
-            "oomkilled",
             "failedmount",
             "createcontainererror",
             "createcontainerconfigerror",
@@ -344,6 +343,7 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
         "loki",
         ("loki", "kubernetes"),
         (
+            "oomkilled",
             "cuda out of memory",
             "torch.cuda",
             "traceback (most recent call last)",

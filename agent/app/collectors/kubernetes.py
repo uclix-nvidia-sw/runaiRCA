@@ -1006,9 +1006,6 @@ async def _k8s_read_via_mcp(
             )
             for api_version, mcp_kind in api_kinds
         ]
-        resource_get_candidates.append(
-            ("resources_get", {"kind": resolved, "namespace": namespace, "name": name})
-        )
         pod_get_candidates: list[tuple[str, dict[str, object]]] = []
         if resolved == "pods":
             pod_get_candidates.extend(
@@ -1053,12 +1050,6 @@ async def _k8s_read_via_mcp(
             if field_selector:
                 args["fieldSelector"] = field_selector
             candidates.append(("resources_list", args))
-        fallback_args: dict[str, object] = {"kind": resolved, "namespace": namespace}
-        if label_selector:
-            fallback_args["labelSelector"] = label_selector
-        if field_selector:
-            fallback_args["fieldSelector"] = field_selector
-        candidates.append(("resources_list", fallback_args))
     data = await _k8s_mcp_json(settings, candidates)
     if name and not _mcp_named_resource_matches(
         data,
@@ -2613,7 +2604,6 @@ async def _collect_kubernetes_responses_via_mcp(
                     "resources_get",
                     {"apiVersion": "v1", "kind": "Node", "name": target.node},
                 ),
-                ("resources_get", {"kind": "nodes", "name": target.node}),
             ],
         )
     for runai_namespace in settings.runai_log_namespaces if control_plane_in_scope else ():

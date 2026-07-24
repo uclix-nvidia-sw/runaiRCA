@@ -365,6 +365,11 @@ async def complete_with_error(
                         "reasoning-only reply (no content outside <think>)",
                         nat_failure,
                     )
+                reasoning_content = message.get("reasoning_content")
+                if isinstance(reasoning_content, str):
+                    salvaged = parse_last_json_object(reasoning_content)
+                    if salvaged is not None:
+                        return json.dumps(salvaged, ensure_ascii=False), None
         return None, _with_nat_failure(
             _openai_unusable_reply_error(response.data), nat_failure
         )
@@ -605,6 +610,46 @@ def parse_json_object(text: str) -> dict[str, Any] | None:
                     return parsed if isinstance(parsed, dict) else None
         start = text.find("{", next_start)
     return None
+
+
+def parse_last_json_object(text: str) -> dict[str, Any] | None:
+    """Return the last balanced JSON object in an LLM reply."""
+    if not text:
+        return None
+    candidate: dict[str, Any] | None = None
+    start = text.find("{")
+    while start != -1:
+        next_start = start + 1
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            ch = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(text[start : index + 1])
+                    except (ValueError, TypeError):
+                        next_start = index + 1
+                        break
+                    if isinstance(parsed, dict):
+                        candidate = parsed
+                    next_start = index + 1
+                    break
+        start = text.find("{", next_start)
+    return candidate
 
 
 async def complete_json(

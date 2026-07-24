@@ -413,7 +413,7 @@ def test_oomkilled_overrides_generic_crashloop_actions_in_korean_fallback() -> N
             ),
         )
     ]
-    candidates = [RankedCause("workload_startup_error", "high", 8.0)]
+    candidates = [RankedCause("workload_runtime_error", "high", 8.0)]
 
     summary = _summary_from(
         request, results, candidates, failure_modes, language="ko"

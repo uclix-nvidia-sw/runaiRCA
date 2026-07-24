@@ -11,6 +11,7 @@ from app.knowledge import (
     DEFAULT_FAMILY_RULES,
     family_catalog_from_entries,
     load_family_catalog,
+    _load_failure_modes,
 )
 
 FAMILIES = Path(__file__).parents[1] / "knowledge" / "families.yaml"
@@ -26,3 +27,13 @@ def test_families_yaml_matches_builtin_catalog() -> None:
     assert catalog.hints == DEFAULT_FAMILY_HINTS
     assert catalog.reasons == DEFAULT_FAMILY_REASONS
     assert load_family_catalog(str(FAMILIES)) == catalog
+
+
+def test_oomkilled_is_runtime_not_startup_keyword() -> None:
+    catalog = load_family_catalog(str(FAMILIES))
+
+    assert "oomkilled" not in catalog.rules["workload_startup_error"][2]
+    assert "oomkilled" in catalog.rules["workload_runtime_error"][2]
+    modes = _load_failure_modes("knowledge/failure_modes.yaml")
+    assert any(item["symptom"] == "OOMKilled" for item in modes["workload_runtime_error"])
+    assert not any(item["symptom"] == "OOMKilled" for item in modes["workload_startup_error"])

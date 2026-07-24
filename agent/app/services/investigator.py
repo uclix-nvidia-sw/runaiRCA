@@ -533,45 +533,89 @@ def _apply_ledger_updates(
     *,
     allow_supported: bool = True,
     eligible_support_ids: set[str] | None = None,
+    blackboard: Any = None,
+    artifacts: object = (),
 ) -> list[dict[str, Any]]:
-    if not isinstance(updates, list):
-        return ledger
-    by_id = {str(item.get("id")): item for item in ledger}
-    for update in updates:
-        if not isinstance(update, dict):
-            continue
-        item = by_id.get(str(update.get("id") or ""))
-        if item is None:
-            continue
-        if "confidence" in update:
-            item["confidence"] = _clamp_confidence(update.get("confidence"), item["confidence"])
-        allowed_evidence = _texts(update.get("evidence_for"))
-        if eligible_support_ids is not None:
-            allowed_evidence = [
-                evidence_id
-                for evidence_id in allowed_evidence
-                if evidence_id in eligible_support_ids
-            ]
-        status = str(update.get("status") or "").strip().lower()
-        can_support = bool(
-            set(_texts(item.get("evidence_for"))) | set(allowed_evidence)
-        )
-        if status == "supported" and (
-            not allow_supported
-            or (eligible_support_ids is not None and not can_support)
-        ):
-            status = "testing"
-        if status in _LEDGER_STATUSES:
-            item["status"] = status
-        _extend_text_list(item, "evidence_for", allowed_evidence)
-        _extend_text_list(item, "evidence_against", update.get("evidence_against"))
-        _extend_text_list(item, "expected_observations", update.get("expected_observations"))
-        _extend_text_list(item, "falsifiers", update.get("falsifiers"))
-        for key in ("mechanism", "next_discriminating_test"):
-            value = str(update.get(key) or "").strip()
-            if value:
-                item[key] = value
+    if isinstance(updates, list):
+        by_id = {str(item.get("id")): item for item in ledger}
+        for update in updates:
+            if not isinstance(update, dict):
+                continue
+            item = by_id.get(str(update.get("id") or ""))
+            if item is None:
+                continue
+            if "confidence" in update:
+                item["confidence"] = _clamp_confidence(update.get("confidence"), item["confidence"])
+            allowed_evidence = _texts(update.get("evidence_for"))
+            if eligible_support_ids is not None:
+                allowed_evidence = [
+                    evidence_id
+                    for evidence_id in allowed_evidence
+                    if evidence_id in eligible_support_ids
+                ]
+            status = str(update.get("status") or "").strip().lower()
+            can_support = bool(
+                set(_texts(item.get("evidence_for"))) | set(allowed_evidence)
+            )
+            if status == "supported" and (
+                not allow_supported
+                or (eligible_support_ids is not None and not can_support)
+            ):
+                status = "testing"
+            if status in _LEDGER_STATUSES:
+                item["status"] = status
+            _extend_text_list(item, "evidence_for", allowed_evidence)
+            _extend_text_list(item, "evidence_against", update.get("evidence_against"))
+            _extend_text_list(item, "expected_observations", update.get("expected_observations"))
+            _extend_text_list(item, "falsifiers", update.get("falsifiers"))
+            for key in ("mechanism", "next_discriminating_test"):
+                value = str(update.get(key) or "").strip()
+                if value:
+                    item[key] = value
+    _attach_typed_artifacts(
+        ledger,
+        artifacts,
+        blackboard=blackboard,
+        eligible_support_ids=eligible_support_ids,
+    )
     return ledger
+
+
+def _attach_typed_artifacts(
+    ledger: list[dict[str, Any]],
+    artifacts: object,
+    *,
+    blackboard: Any,
+    eligible_support_ids: set[str] | None,
+) -> None:
+    """Attach verified typed support the model omitted from its ledger links."""
+    if not ledger or not isinstance(artifacts, (list, tuple)):
+        return
+    evidence_id_for = getattr(blackboard, "evidence_id_for", None)
+    if not callable(evidence_id_for):
+        return
+    for candidate in artifacts:
+        result = getattr(candidate, "result", None)
+        observation = result.get("observation") if isinstance(result, dict) else None
+        if not (
+            isinstance(observation, dict)
+            and observation.get("polarity") == "present"
+            and observation.get("coverage") == "scoped"
+            and observation.get("target_identity_verified") is True
+        ):
+            continue
+        try:
+            fact_id = str(evidence_id_for(candidate) or "").strip()
+        except Exception:  # noqa: BLE001 - attachment is advisory
+            continue
+        if not fact_id or (
+            eligible_support_ids is not None and fact_id not in eligible_support_ids
+        ):
+            continue
+        for item in ledger:
+            family = str(item.get("family") or "").strip()
+            if family and artifact_supports_family(family, candidate):
+                _extend_text_list(item, "evidence_for", [fact_id])
 
 
 def _add_reflected_hypotheses(
@@ -1024,6 +1068,8 @@ async def investigate(
             ledger = _apply_ledger_updates(
                 ledger,
                 decision.get("hypothesis_updates"),
+                blackboard=blackboard,
+                artifacts=[item for result in evidence.values() for item in result.artifacts],
                 eligible_support_ids=eligible_support_ids,
             )
             ledger = _add_reflected_hypotheses(ledger, decision.get("new_hypotheses"))
@@ -1277,6 +1323,8 @@ async def investigate(
                 ledger = _apply_ledger_updates(
                     ledger,
                     verification.get("hypothesis_updates"),
+                    blackboard=blackboard,
+                    artifacts=[item for result in evidence.values() for item in result.artifacts],
                     eligible_support_ids=_eligible_support_ids(blackboard),
                 )
                 if _evidence_sufficiency(
@@ -1575,6 +1623,8 @@ async def _reflect_hypotheses(
     ledger = _apply_ledger_updates(
         ledger,
         reflection.get("hypothesis_updates"),
+        blackboard=blackboard,
+        artifacts=[item for result in evidence.values() for item in result.artifacts],
         eligible_support_ids=_eligible_support_ids(blackboard),
     )
     return _add_reflected_hypotheses(ledger, reflection.get("new_hypotheses"))

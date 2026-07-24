@@ -252,20 +252,29 @@ async def test_k8s_mcp_json_skips_unparseable_table_for_yaml_candidate(monkeypat
     assert isinstance(result, dict) and result.get("items"), result
 
 
-def test_mcp_client_factory_defaults_insecure_and_hardens_via_env(monkeypatch) -> None:
-    # Internal self-signed MCP endpoints: default to a custom (verify-off) factory;
-    # MCP_TLS_VERIFY=true restores the SDK default (system trust → None).
+def test_mcp_client_factory_uses_configured_ca_and_defaults_to_verification(
+    monkeypatch, tmp_path
+) -> None:
     monkeypatch.delenv("MCP_TLS_VERIFY", raising=False)
-    assert mcp_client._mcp_client_factory() is not None
-    monkeypatch.setenv("MCP_TLS_VERIFY", "true")
+    monkeypatch.delenv("MCP_TLS_INSECURE", raising=False)
+    monkeypatch.setenv("KUBERNETES_CA_PATH", str(tmp_path / "missing-ca"))
+    assert mcp_client.mcp_tls_verify() is True
     assert mcp_client._mcp_client_factory() is None
+
+    ca_path = tmp_path / "ca.crt"
+    ca_path.write_text("test CA")
+    monkeypatch.setenv("MCP_TLS_CA_PATH", str(ca_path))
+    assert mcp_client.mcp_tls_verify() == str(ca_path)
+    assert mcp_client._mcp_client_factory() is not None
 
 
 def test_direct_datasource_tls_uses_the_mcp_tls_escape_hatch(monkeypatch) -> None:
     monkeypatch.delenv("MCP_TLS_VERIFY", raising=False)
-    assert mcp_client.mcp_tls_verify() is False
-    monkeypatch.setenv("MCP_TLS_VERIFY", "yes")
+    monkeypatch.delenv("MCP_TLS_CA_PATH", raising=False)
+    monkeypatch.delenv("KUBERNETES_CA_PATH", raising=False)
     assert mcp_client.mcp_tls_verify() is True
+    monkeypatch.setenv("MCP_TLS_INSECURE", "yes")
+    assert mcp_client.mcp_tls_verify() is False
 
 
 @pytest.mark.asyncio

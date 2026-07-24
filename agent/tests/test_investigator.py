@@ -11,6 +11,7 @@ from app.collectors.base import CollectorResult, artifact
 from app.plan import InvestigationPlan
 from app.services.evidence_blackboard import Blackboard
 from app.services.investigator import (
+    _apply_ledger_updates,
     _build_user_prompt,
     _evidence_sufficiency,
     _evidence_summary,
@@ -57,6 +58,44 @@ class LokiCollector:
 
 def _collectors() -> list[object]:
     return [RunaiCollector(), KubernetesCollector(), LokiCollector()]
+
+
+def test_typed_target_verified_artifact_is_attached_to_matching_hypothesis() -> None:
+    lifecycle = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_container_lifecycle",
+        status="ok",
+        confidence="high",
+        summary="target container lastTerminated reason=OOMKilled",
+        result={
+            "observation": {
+                "predicate": "kubernetes_target_container_lifecycle",
+                "polarity": "present",
+                "coverage": "scoped",
+                "target_identity_verified": True,
+                "observed_entity": {"kind": "pod", "name": "trainer-0"},
+            },
+            "containers": [
+                {"name": "main", "lastTerminated": {"reason": "OOMKilled", "exitCode": 137}}
+            ],
+        },
+    )
+    result = CollectorResult(agent="kubernetes", status="ok", summary="OOM", artifacts=[lifecycle])
+    board = Blackboard()
+    board.add_result("kubernetes", result, entity="pod:trainer-0")
+    fact_id = board.evidence_id_for(lifecycle)
+    ledger = [{"id": "H1", "family": "workload_runtime_error", "status": "supported"}]
+
+    _apply_ledger_updates(
+        ledger,
+        [],
+        blackboard=board,
+        artifacts=[lifecycle],
+        eligible_support_ids={fact_id},
+    )
+
+    assert ledger[0]["evidence_for"] == [fact_id]
 
 
 def test_unavailable_evidence_summary_does_not_expose_stale_signal_text() -> None:

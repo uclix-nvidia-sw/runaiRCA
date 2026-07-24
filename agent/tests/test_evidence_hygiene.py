@@ -757,6 +757,46 @@ async def test_drilldown_llm_failure_is_visible_in_warnings(monkeypatch) -> None
     assert any("provider not found" in w for w in result.warnings)
 
 
+@pytest.mark.asyncio
+async def test_drilldown_uses_one_recoverable_decision_retry(monkeypatch) -> None:
+    from dataclasses import replace
+
+    from app.collectors.base import CollectorResult
+    from app.services import drilldown
+
+    calls = 0
+
+    async def first_decision(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return None
+
+    async def retry_decision(*args, **kwargs):
+        return ('{"action":"query","queries":[{"tool":"k8s_read","args":{"kind":"nodes"}}]}', None)
+
+    async def fake_k8s_read(*args, **kwargs):
+        return {"kind": "nodes", "status_code": 200, "error": None, "data": {"items": []}}
+
+    monkeypatch.setattr(drilldown, "complete_json", first_decision)
+    monkeypatch.setattr(drilldown, "complete_with_error", retry_decision)
+    monkeypatch.setattr(drilldown, "k8s_read", fake_k8s_read)
+    settings = replace(
+        make_settings(),
+        enable_agent_drilldown=True,
+        max_investigation_steps=1,
+        llm_base_url="https://llm.example/v1",
+        llm_model="m",
+        llm_api_key="k",
+    )
+    result = CollectorResult(agent="kubernetes", status="ok", summary="pod Pending")
+
+    await drilldown.run_drilldowns(settings, [result], make_target(), None)
+
+    assert calls == 1
+    assert len(result.artifacts) == 1
+    assert not any("LLM decision call failed" in w for w in result.warnings)
+
+
 # --- wrong-node protection (Codex review) -----------------------------------------
 
 

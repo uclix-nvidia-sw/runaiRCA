@@ -3024,9 +3024,10 @@ async def test_postgres_reads_only_timestamped_audit_history_in_incident_window(
 
 
 @pytest.mark.asyncio
-async def test_loki_and_prometheus_direct_fallback_disable_internal_tls_verify(monkeypatch) -> None:
+async def test_loki_and_prometheus_direct_fallback_honor_tls_verification(monkeypatch) -> None:
     seen: list[bool | str] = []
     monkeypatch.delenv("MCP_TLS_VERIFY", raising=False)
+    monkeypatch.delenv("MCP_TLS_INSECURE", raising=False)
 
     async def fake_get_json(*, base_url, path, timeout_seconds, params=None, headers=None, verify=True):
         seen.append(verify)
@@ -3048,12 +3049,12 @@ async def test_loki_and_prometheus_direct_fallback_disable_internal_tls_verify(m
 
     await loki._collect_loki_direct(settings, [("logs", '{namespace="runai"}')], [])
     await prometheus._collect_prometheus_direct(settings, [("up", "up")], [])
-    assert seen == [False, False]
+    assert seen == [True, True]
 
-    monkeypatch.setenv("MCP_TLS_VERIFY", "true")
+    monkeypatch.setenv("MCP_TLS_INSECURE", "true")
     await loki._collect_loki_direct(settings, [("logs", '{namespace="runai"}')], [])
     await prometheus._collect_prometheus_direct(settings, [("up", "up")], [])
-    assert seen == [False, False, True, True]
+    assert seen == [True, True, False, False]
 
 
 @pytest.mark.asyncio

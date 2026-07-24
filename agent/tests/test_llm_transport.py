@@ -58,6 +58,36 @@ async def test_complete_json_uses_nat_client_and_records_usage() -> None:
 
 
 @pytest.mark.asyncio
+async def test_complete_json_salvages_last_object_from_reasoning_content(monkeypatch) -> None:
+    settings = _settings()
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        return SimpleNamespace(
+            ok=True,
+            data={
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "reasoning_content": (
+                                'intermediate {"action":"done"} '
+                                'final {"action":"query","queries":[]}'
+                            ),
+                        }
+                    }
+                ],
+                "usage": {},
+            },
+        )
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    assert await llm.complete_json(settings, system="system", user="user") == {
+        "action": "query",
+        "queries": [],
+    }
+
+
+@pytest.mark.asyncio
 async def test_uncapped_call_gets_default_max_tokens(monkeypatch) -> None:
     # A reasoning model with no ceiling thinks until the per-call timeout and
     # burns the analysis deadline — every uncapped call must inherit the cap.

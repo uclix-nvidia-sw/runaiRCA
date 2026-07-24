@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
+import pytest
+
 from app.collectors.base import CollectorResult, artifact
-from app.schemas import AlertAnalysisResponse
+from app.schemas import Alert, AlertAnalysisRequest, AlertAnalysisResponse
+from app.services import pipeline
 from app.services.harness import (
     EvidenceLink,
     _trace_item,
@@ -14,6 +19,7 @@ from app.services.harness import (
     validate_evidence_links,
 )
 from app.services.root_cause_ranking import RankedCause
+from tests.test_orchestrator import make_settings
 
 
 def _response(detail: str = "## Root Cause\n\nA likely cause.") -> AlertAnalysisResponse:
@@ -32,6 +38,32 @@ def _response(detail: str = "## Root Cause\n\nA likely cause.") -> AlertAnalysis
         context={},
         artifacts=[],
     )
+
+
+@pytest.mark.asyncio
+async def test_harness_demotion_reconciles_confident_terminal_summary() -> None:
+    settings = replace(make_settings(), enable_rca_output_harness=True)
+    state = pipeline.new_state(
+        settings,
+        AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "KubePodCrashLooping"})
+        ),
+        collectors=[],
+    )
+    state.results = []
+    state.root_cause_candidates = [
+        RankedCause("workload_runtime_error", "high", 8.0)
+    ]
+    state.response = _response(
+        "## Root Cause\n\nThe target container was terminated as OOMKilled [E01]."
+    )
+    state.response.analysis_summary = "The target container was terminated as OOMKilled."
+
+    await pipeline.harness_stage(state)
+
+    assert state.response.root_cause_family == "insufficient_evidence"
+    assert "OOMKilled" not in state.response.analysis_summary
+    assert "Insufficient evidence" in state.response.analysis_summary
 
 
 def _result(agent: str, summary: str = "NVRM Xid 79") -> CollectorResult:
@@ -281,8 +313,8 @@ def test_legacy_agent_fallback_excludes_partial_evidence_from_support() -> None:
         _response("## Root Cause\n\nOOMKilled was observed [E01]."),
         results,
         [
-            RankedCause(
-                "workload_startup_error",
+                RankedCause(
+                    "workload_runtime_error",
                 "medium",
                 5,
                 evidence_agents=["loki", "prometheus"],
