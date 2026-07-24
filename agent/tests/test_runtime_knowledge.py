@@ -54,7 +54,7 @@ def _snapshot(
     keyword: str = "runtime marker",
     status: str = "active",
     package_id: str = "pkg-1",
-    family: str = "runtime_family",
+    family: str = "workload_runtime_error",
 ) -> dict[str, object]:
     return {
         "revision": revision,
@@ -113,7 +113,7 @@ async def test_registry_modes_apply_activation_ladder(monkeypatch) -> None:
     _Client.responses = [_Response(200, _snapshot())]
     _Client.headers = []
     baseline_modes = {
-        "runtime_family": [
+        "workload_runtime_error": [
             {"symptom": "Runtime symptom", "keywords": ["baseline marker"], "actions": []}
         ]
     }
@@ -123,14 +123,14 @@ async def test_registry_modes_apply_activation_ladder(monkeypatch) -> None:
     assist = KnowledgeRegistry(mode="assist", snapshot_url="http://backend/snapshot")
     await assist.refresh()
     assert (
-        assist.failure_modes(baseline_modes)["runtime_family"][0]["keywords"]
+        assist.failure_modes(baseline_modes)["workload_runtime_error"][0]["keywords"]
         == ["runtime marker"]
     )
     assert assist.known_issues(baseline_issues)[0]["keywords"] == ["runtime marker"]
     assert match_failure_mode_symptoms(
         assist.failure_modes(baseline_modes), "runtime marker"
     )[0][1]["runtime_status"] == "active"
-    assert assist.provisional_catalogs()["failure_modes"]["runtime_family"][0]["keywords"] == [
+    assert assist.provisional_catalogs()["failure_modes"]["workload_runtime_error"][0]["keywords"] == [
         "runtime marker"
     ]
     assert assist.health()["active_package_ids"] == ["pkg-1"]
@@ -147,7 +147,7 @@ async def test_registry_modes_apply_activation_ladder(monkeypatch) -> None:
                         keyword="shadow marker",
                         status="shadow",
                         package_id="pkg-shadow",
-                        family="shadow_family",
+                        family="gpu_hardware_error",
                     )["packages"][0],
                 ],
             },
@@ -156,7 +156,7 @@ async def test_registry_modes_apply_activation_ladder(monkeypatch) -> None:
     assist_with_shadow = KnowledgeRegistry(mode="assist", snapshot_url="http://backend/snapshot")
     await assist_with_shadow.refresh()
     assist_catalog = assist_with_shadow.failure_modes(baseline_modes)
-    assert "shadow_family" not in assist_catalog
+    assert "gpu_hardware_error" not in assist_catalog
     assert assist_with_shadow.shadow_hints("shadow marker")[0][1]["runtime_status"] == "shadow"
 
     _Client.responses = [
@@ -170,7 +170,7 @@ async def test_registry_modes_apply_activation_ladder(monkeypatch) -> None:
                         keyword="shadow marker",
                         status="shadow",
                         package_id="pkg-shadow",
-                        family="shadow_family",
+                        family="gpu_hardware_error",
                     )["packages"][0],
                 ],
             },
@@ -179,7 +179,7 @@ async def test_registry_modes_apply_activation_ladder(monkeypatch) -> None:
     authoritative = KnowledgeRegistry(mode="authoritative", snapshot_url="http://backend/snapshot")
     await authoritative.refresh()
     assert (
-        authoritative.failure_modes(baseline_modes)["runtime_family"][0]["keywords"]
+        authoritative.failure_modes(baseline_modes)["workload_runtime_error"][0]["keywords"]
         == ["runtime marker"]
     )
     assert {
@@ -189,7 +189,7 @@ async def test_registry_modes_apply_activation_ladder(monkeypatch) -> None:
     } == {"active", "shadow"}
     assert match_failure_mode_symptoms(
         authoritative.failure_modes({}), "shadow marker"
-    )[0][0] == "shadow_family"
+    )[0][0] == "gpu_hardware_error"
 
     detail = pipeline._detail_from(
         AlertAnalysisRequest(
@@ -202,13 +202,13 @@ async def test_registry_modes_apply_activation_ladder(monkeypatch) -> None:
         [],
         failure_modes=assist_catalog,
         root_cause_candidates=[
-            RankedCause(family="runtime_family", confidence="medium", score=7.0)
+            RankedCause(family="workload_runtime_error", confidence="medium", score=7.0)
         ],
         runtime_knowledge_hints=assist_with_shadow.shadow_hints("shadow marker"),
     )
-    assert "package pkg-1; family runtime_family; matched symptom Runtime symptom; status active" in detail
+    assert "package pkg-1; family workload_runtime_error; matched symptom Runtime symptom; status active" in detail
     assert "### Learned Knowledge (Pending Activation)" in detail
-    assert "package pkg-shadow family shadow_family" in detail
+    assert "package pkg-shadow family gpu_hardware_error" in detail
 
     _Client.responses = [_Response(200, {"revision": "empty", "packages": []})]
     empty = KnowledgeRegistry(mode="assist", snapshot_url="http://backend/snapshot")
@@ -262,7 +262,7 @@ async def test_registry_accepts_backend_active_payload_compiled_fixture(monkeypa
                             "compiled": {
                                 "failure_modes": [
                                     {
-                                        "family": "runtime_family",
+                                        "family": "workload_runtime_error",
                                         "symptoms": [
                                             {
                                                 "name": "Sanitized mechanism",
@@ -284,7 +284,7 @@ async def test_registry_accepts_backend_active_payload_compiled_fixture(monkeypa
 
     assert await registry.refresh() is True
     loaded = registry.provisional_catalogs()["failure_modes"]
-    assert loaded["runtime_family"][0]["keywords"] == ["sanitized predicate"]
+    assert loaded["workload_runtime_error"][0]["keywords"] == ["sanitized predicate"]
 
 
 @pytest.mark.asyncio
@@ -292,7 +292,7 @@ async def test_assist_exposes_safe_probe_template_ids_without_changing_ranking(m
     monkeypatch.setattr("app.knowledge.httpx.AsyncClient", _Client)
     payload = _snapshot()
     payload["packages"][0]["compiled"]["probe_template_ids"] = {
-        "runtime_family": [
+        "workload_runtime_error": [
             "k8s_troubleshooting:scheduling_capacity:p01",
             "k8s_troubleshooting:scheduling_capacity:p01",
         ]
@@ -302,17 +302,17 @@ async def test_assist_exposes_safe_probe_template_ids_without_changing_ranking(m
     registry = KnowledgeRegistry(mode="assist", snapshot_url="http://backend/snapshot")
 
     assert await registry.refresh() is True
-    assert registry.failure_modes({})["runtime_family"][0]["keywords"] == ["runtime marker"]
-    assert registry.probe_template_ids_for_family("runtime_family") == [
+    assert registry.failure_modes({})["workload_runtime_error"][0]["keywords"] == ["runtime marker"]
+    assert registry.probe_template_ids_for_family("workload_runtime_error") == [
         "k8s_troubleshooting:scheduling_capacity:p01",
     ]
-    assert registry.probe_template_ids_for_family("runtime_family", include_assist=False) == []
-    assert registry.health()["probe_template_families"] == ["runtime_family"]
+    assert registry.probe_template_ids_for_family("workload_runtime_error", include_assist=False) == []
+    assert registry.health()["probe_template_families"] == ["workload_runtime_error"]
 
     _Client.responses = [_Response(200, payload)]
     authoritative = KnowledgeRegistry(mode="authoritative", snapshot_url="http://backend/snapshot")
     assert await authoritative.refresh() is True
-    assert authoritative.probe_template_ids_for_family("runtime_family") == [
+    assert authoritative.probe_template_ids_for_family("workload_runtime_error") == [
         "k8s_troubleshooting:scheduling_capacity:p01",
     ]
 
@@ -322,7 +322,7 @@ async def test_registry_rejects_probe_template_args_or_queries(monkeypatch) -> N
     monkeypatch.setattr("app.knowledge.httpx.AsyncClient", _Client)
     payload = _snapshot()
     payload["packages"][0]["compiled"]["probe_template_ids"] = {
-        "runtime_family": ["k8s.pod.logs?namespace=runai"]
+        "workload_runtime_error": ["k8s.pod.logs?namespace=runai"]
     }
     _Client.responses = [_Response(200, payload)]
     _Client.headers = []
@@ -337,7 +337,7 @@ async def test_registry_rejects_unknown_probe_template_id(monkeypatch) -> None:
     monkeypatch.setattr("app.knowledge.httpx.AsyncClient", _Client)
     payload = _snapshot()
     payload["packages"][0]["compiled"]["probe_template_ids"] = {
-        "runtime_family": ["unknown-probe-template-01"]
+        "workload_runtime_error": ["unknown-probe-template-01"]
     }
     _Client.responses = [_Response(200, payload)]
     _Client.headers = []
@@ -371,7 +371,7 @@ def test_validate_runtime_knowledge_normalizes_active_compiled_package() -> None
     assert result["errors"] == []
     assert result["normalized"]["active_package_ids"] == ["pkg-1"]
     assert (
-        result["normalized"]["failure_modes"]["runtime_family"][0]["symptom"]
+        result["normalized"]["failure_modes"]["workload_runtime_error"][0]["symptom"]
         == "Runtime symptom"
     )
 
@@ -409,3 +409,14 @@ def test_validate_runtime_knowledge_returns_errors_without_mutating_registry() -
         "errors": ["package pkg-raw compiled content must be an object"],
         "normalized": None,
     }
+
+
+def test_non_catalog_family_package_fails_validation() -> None:
+    snapshot = _snapshot()
+    package = snapshot["packages"][0]
+    package["compiled"]["failure_modes"][0]["family"] = "workload_startup_image_failure"
+
+    result = validate_runtime_knowledge(package)
+
+    assert result["valid"] is False
+    assert any("closed catalog" in str(error) for error in result.get("errors", []))

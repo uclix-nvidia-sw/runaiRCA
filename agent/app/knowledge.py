@@ -1222,6 +1222,15 @@ def _normalized_snapshot(snapshot: _ApprovedKnowledgeSnapshot) -> dict[str, Any]
     }
 
 
+@lru_cache(maxsize=1)
+def _closed_family_set() -> frozenset[str]:
+    import os
+
+    return frozenset(
+        load_family_catalog(os.getenv("FAMILIES_FILE", "knowledge/families.yaml")).families
+    )
+
+
 def _validate_runtime_failure_modes(
     value: Any, package_id: str, runtime_status: str
 ) -> dict[str, list[dict[str, Any]]]:
@@ -1241,6 +1250,15 @@ def _validate_runtime_failure_modes(
         family = entry.get("family")
         if not isinstance(family, str) or not family.strip():
             raise ValueError(f"package {package_id} failure mode requires family")
+        # The family universe is closed (families.yaml == failure_modes ==
+        # ranker vocabulary). A legacy or LLM-authored name must fail the
+        # package here, not surface later as an ungroundable headline
+        # (2026-07-24 audit, static defect 4).
+        if family.strip() not in _closed_family_set():
+            raise ValueError(
+                f"package {package_id} failure mode family {family.strip()!r} "
+                "is outside the closed catalog"
+            )
         raw_symptoms = entry.get("symptoms")
         if raw_symptoms is None and "symptom" in entry:
             raw_symptoms = [entry]
