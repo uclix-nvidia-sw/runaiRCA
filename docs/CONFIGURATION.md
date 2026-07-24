@@ -41,6 +41,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `RUNTIME_KNOWLEDGE_TIMEOUT_SECONDS` | Runtime knowledge fetch timeout, default `10` seconds (minimum `1`). |
 | `AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for Agent `/analyze` and `/chat` requests, default `960` (must exceed the agent's `ANALYSIS_DEADLINE_SECONDS`) |
 | `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | Backend timeout for operator-triggered Agent `/analyze` requests, default `960` |
+| `AGENT_MAX_RESPONSE_BODY_BYTES` | Backend cap on the Agent response body it will read, default `4194304` (4 MiB) |
 | `TRASH_RETENTION_DAYS` | Backend soft-delete retention before trash incidents are purged, default `30` |
 | `SLACK_BOT_TOKEN` | Backend Slack bot token (`xoxb-`, `chat:write` scope, bot invited to the channel). Set together with `SLACK_CHANNEL_ID` to enable incident-analysis notifications. A bot token — not an incoming webhook and not the `xapp-` app token — is required because `chat.postMessage` returns the `ts` used to thread re-analyses. Reinstalling the Slack app invalidates the previous `xoxb-` token. Chart secret key `slackBotToken` |
 | `SLACK_CHANNEL_ID` | Channel the backend posts incident-analysis summaries into. Chart secret key `slackChannelId` |
@@ -59,6 +60,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `RUNAI_BASE_URL` | Run:ai control plane URL. No chart default; required as `agent.env.runaiBaseUrl` when `runaiMcp.enabled=true` |
 | `RUNAI_BEARER_TOKEN` | Optional Run:ai bearer token secret |
 | `GRAFANA_SERVICE_ACCOUNT_TOKEN` | Grafana service-account token used by the managed `grafanaMcp` service for Prometheus/Loki datasource read/query access |
+| `PROMETHEUS_DATASOURCE_UID` / `LOKI_DATASOURCE_UID` | Grafana datasource UIDs for the Prometheus/Loki MCP tools; empty by default (Helm keys `grafanaMcp.prometheusDatasourceUid` / `lokiDatasourceUid`) |
 | `RUNAI_CLIENT_ID` | Run:ai application client ID |
 | `RUNAI_CLIENT_SECRET` | Run:ai application client secret |
 | `RUNAI_TOKEN_URL` | Optional OAuth token URL for Run:ai client credentials |
@@ -93,7 +95,6 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `AGENT_SOULS_FILE` | Agent role-contract prompt path, default `prompts/agent_souls.md` |
 | `FAMILIES_FILE` | Root-cause family catalog YAML path, default `knowledge/families.yaml`. Load failure falls back to the built-in catalog |
 | `COLLECTORS` | Comma-separated collector registry allowlist. Empty/default enables all built-in collectors. Unknown names are ignored for activation but appear in every analysis warning and in Agent `/healthz` under `collectors.unknown` |
-| `EVAL_MIN_TOP1` | Eval gate minimum Top-1 accuracy used by CI/run scripts when no explicit `--min-top1` is passed |
 | `MASKING_REGEX_LIST_JSON` | Optional JSON array of custom redaction regexes |
 | `BUILTIN_REDACTION_ENABLED` | Enable built-in secret redaction, default `true` |
 | `BUILTIN_REDACTION_HASH_MODE` | Replace secrets with stable short hashes instead of `[MASKED]`, default `false` |
@@ -112,6 +113,8 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `MAX_REANALYSIS_STEPS` | Step limit for a re-analysis pass, default `3` (Helm also `3`); `0` means semantic completion under the overall analysis deadline. |
 | `ENABLE_AGENT_DRILLDOWN` | Per-collector autonomous drill-down: each evidence agent (kubernetes/prometheus/loki/runai) continues through distinct read-only probes until it is done, repeats a query, or reaches the analysis deadline; default `false` (Helm sets `true`) |
 | `LLM_SYNTHESIS_MAX_TOKENS` | Completion budget for the final Korean JSON report, default `16384`. |
+| `LLM_INSIGHT_MAX_TOKENS` | Completion budget for per-collector insight drill-downs, default `512`. |
+| `ANALYSIS_RESPONSE_MAX_BYTES` | Agent cap on its own analysis response payload before sending, default `1572864` (1.5 MiB). |
 | `ANALYSIS_DEADLINE_SECONDS` | Overall hard cap per analysis (graceful degraded report on overrun), default `900` (15 min), `0` = no cap. Keep the backend `AGENT_REQUEST_TIMEOUT_SECONDS` above this. |
 | `ENABLE_RCA_OUTPUT_HARNESS` | Validate the final RCA against live evidence and safety gates, default `true` |
 | `MAX_RCA_REPAIR_ATTEMPTS` | Maximum final-report repair passes after harness validation, default `3` |

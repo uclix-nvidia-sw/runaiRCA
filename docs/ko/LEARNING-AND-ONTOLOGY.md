@@ -116,6 +116,10 @@ Backend Postgres가 패키지 승인, 활성화, 은퇴의 권위자입니다. `
 `reject`/`retired`는 런타임 사용에서 제외합니다. TypeDB package-mirror CronJob은 그래프 질의를
 위해 요약과 승인된 template binding을 복사할 뿐 활성화 상태를 바꾸지 않습니다.
 
+active와 shadow 패키지가 실제로 실시간 분석에 어떻게 반영되는지는 런타임 활성화 사다리
+(`DYNAMIC_KNOWLEDGE_MODE`: off/shadow/assist/authoritative)가 결정합니다 —
+[지식 베이스](KNOWLEDGE-BASE.md#3-how-knowledge-is-used-during-an-analysis) 참조.
+
 Candidate 생성은 완전한 trace-v3 ledger 경로를 우선합니다. Ledger가 불완전해도 approved
 snapshot과 family가 일치하고 supporting evidence가 canonical하며 반증이 없고 비어 있지
 않은 supported harness claim이면 두 번째 승격 경로를 사용할 수 있습니다. harness-claim

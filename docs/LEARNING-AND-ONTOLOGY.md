@@ -126,6 +126,10 @@ enables it; `approve` validates and activates it; `reject`/`retired` keep it out
 of runtime use. The TypeDB package-mirror CronJob copies summaries and approved
 template bindings for graph queries; it never changes activation.
 
+How active and shadow packages actually feed a live analysis is governed by the
+runtime activation ladder (`DYNAMIC_KNOWLEDGE_MODE`: off/shadow/assist/
+authoritative) — see [Knowledge Base](KNOWLEDGE-BASE.md#3-how-knowledge-is-used-during-an-analysis).
+
 Candidate compilation prefers the complete trace-v3 ledger path. A supported
 harness claim can provide a second promotion path when the ledger is incomplete,
 but only when its family matches the approved snapshot and its supporting

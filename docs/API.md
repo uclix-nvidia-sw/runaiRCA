@@ -41,9 +41,13 @@ Backend:
 
 - `POST /webhook/alertmanager`
 - `GET /api/v1/openapi.json`
-- `GET /api/v1/incidents?view=active|archived|trash`
+- `GET /api/v1/incidents?view=active|archived|trash` (also filterable by `status`, `severity`, `final_decision`, `q`)
 - `GET /api/v1/incidents/{id}`
 - `POST /api/v1/incidents/{id}/analyze`
+- `POST /api/v1/incidents/{id}/cancel`
+- `POST /api/v1/incidents/{id}/rca-correction`
+- `POST /api/v1/incidents/{id}/rca-pin`
+- `POST /api/v1/incidents/{id}/reverify`
 - `POST /api/v1/incidents/{id}/resolve`
 - `POST /api/v1/incidents/{id}/archive`
 - `POST /api/v1/incidents/{id}/unarchive`
@@ -76,6 +80,7 @@ Backend:
 - `GET /api/v1/knowledge-packages?include_retired=true|false`
 - `GET /api/v1/knowledge-packages/{id}`
 - `POST /api/v1/knowledge-packages/{id}/retire`
+- `GET /api/v1/knowledge/families`
 - `GET /api/v1/knowledge/runtime-snapshot`
 - `GET /api/v1/knowledge/probe-metrics`
 - `POST /api/v1/analysis-runs/{id}/progress`
@@ -84,6 +89,8 @@ Backend:
 - `GET /api/v1/stats/kpi?days=7`
 - `GET /api/v1/events`
 - `POST /api/v1/chat`
+- `GET /api/v1/chat/conversations`
+- `DELETE /api/v1/chat/conversations/{id}`
 
 `POST /webhook/alertmanager` returns HTTP 202 with `status`, `alerts`,
 `accepted`, and `ignored` counts. Alerts with severity `info` or `information`
@@ -92,11 +99,23 @@ analysis runs.
 
 `GET /api/v1/incidents` returns the active incident view by default. Use
 `view=archived` for archived incidents and `view=trash` for soft-deleted
-incidents that are still inside the trash retention window. Invalid view values
-return HTTP 400. List pagination keeps `total` scoped to the selected view.
+incidents that are still inside the trash retention window. The list also
+accepts `status`, `severity`, `final_decision`, and `q` (free-text) filters.
+Invalid view values return HTTP 400. List pagination keeps `total` scoped to the
+selected view.
 
 Incident lifecycle actions:
 
+- `POST /api/v1/incidents/{id}/cancel` requests cancellation of an in-flight
+  analysis run — HTTP 202 `cancel_requested` with the `run_id`, or HTTP 200
+  `not_analyzing` when nothing is running.
+- `POST /api/v1/incidents/{id}/rca-correction` records an operator RCA
+  correction as a new analysis run — HTTP 201. Requires `summary` and a
+  `root_cause_family` from the catalog; optional `actions`.
+- `POST /api/v1/incidents/{id}/rca-pin` pins or unpins the latest operator
+  correction via a `pinned` boolean body — HTTP 200.
+- `POST /api/v1/incidents/{id}/reverify` re-verifies the pinned operator
+  correction against fresh evidence — HTTP 202.
 - `POST /api/v1/incidents/{id}/resolve` toggles the operator's final approval
   for the RCA. It sets or clears `user_approved_at` and does not change
   `status` or `resolved_at`; those remain the Alertmanager incident state.

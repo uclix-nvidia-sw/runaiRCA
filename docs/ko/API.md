@@ -40,9 +40,13 @@ Backend:
 
 - `POST /webhook/alertmanager`
 - `GET /api/v1/openapi.json`
-- `GET /api/v1/incidents?view=active|archived|trash`
+- `GET /api/v1/incidents?view=active|archived|trash` (`status`, `severity`, `final_decision`, `q`로도 필터 가능)
 - `GET /api/v1/incidents/{id}`
 - `POST /api/v1/incidents/{id}/analyze`
+- `POST /api/v1/incidents/{id}/cancel`
+- `POST /api/v1/incidents/{id}/rca-correction`
+- `POST /api/v1/incidents/{id}/rca-pin`
+- `POST /api/v1/incidents/{id}/reverify`
 - `POST /api/v1/incidents/{id}/resolve`
 - `POST /api/v1/incidents/{id}/archive`
 - `POST /api/v1/incidents/{id}/unarchive`
@@ -75,6 +79,7 @@ Backend:
 - `GET /api/v1/knowledge-packages?include_retired=true|false`
 - `GET /api/v1/knowledge-packages/{id}`
 - `POST /api/v1/knowledge-packages/{id}/retire`
+- `GET /api/v1/knowledge/families`
 - `GET /api/v1/knowledge/runtime-snapshot`
 - `GET /api/v1/knowledge/probe-metrics`
 - `POST /api/v1/analysis-runs/{id}/progress`
@@ -83,16 +88,29 @@ Backend:
 - `GET /api/v1/stats/kpi?days=7`
 - `GET /api/v1/events`
 - `POST /api/v1/chat`
+- `GET /api/v1/chat/conversations`
+- `DELETE /api/v1/chat/conversations/{id}`
 
 `POST /webhook/alertmanager`는 `status`, `alerts`, `accepted`, `ignored` 카운트와 함께 HTTP 202를 반환합니다. severity가 `info` 또는 `information`인 알림은 ignored로 집계되며, 인시던트, 알림, SSE 이벤트, 분석 실행(analysis run)을 생성하지 않습니다.
 
 `GET /api/v1/incidents`는 기본적으로 active 인시던트 뷰를 반환합니다. 보관된
 인시던트는 `view=archived`, 휴지통 보존 기간 안의 soft delete 인시던트는
-`view=trash`를 사용합니다. 유효하지 않은 view 값은 HTTP 400을 반환합니다. 목록
+`view=trash`를 사용합니다. 목록은 `status`, `severity`, `final_decision`, `q`(자유
+텍스트) 필터도 받습니다. 유효하지 않은 view 값은 HTTP 400을 반환합니다. 목록
 페이지네이션의 `total`은 선택한 view 기준으로 계산됩니다.
 
 인시던트 라이프사이클 액션:
 
+- `POST /api/v1/incidents/{id}/cancel`은 진행 중인 분석 실행의 취소를 요청합니다 —
+  실행 중이면 `run_id`와 함께 HTTP 202 `cancel_requested`, 아니면 HTTP 200
+  `not_analyzing`.
+- `POST /api/v1/incidents/{id}/rca-correction`은 운영자 RCA 정정을 새 분석 실행으로
+  기록합니다 — HTTP 201. `summary`와 카탈로그의 `root_cause_family`가 필요하며,
+  `actions`는 선택 사항입니다.
+- `POST /api/v1/incidents/{id}/rca-pin`은 `pinned` 불리언 바디로 최신 운영자 정정을
+  고정/해제합니다 — HTTP 200.
+- `POST /api/v1/incidents/{id}/reverify`는 고정된 운영자 정정을 새 증거로 재검증합니다 —
+  HTTP 202.
 - `POST /api/v1/incidents/{id}/resolve`는 RCA에 대한 운영자의 최종 승인을 토글합니다.
   `user_approved_at`을 설정하거나 비우며, `status`와 `resolved_at`은 변경하지 않습니다.
   이 둘은 Alertmanager 기준 인시던트 상태로 유지됩니다. 유사 인시던트 메모리는 이 승인 이후에만

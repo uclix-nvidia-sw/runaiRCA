@@ -40,6 +40,7 @@ flowchart LR
 | `RUNTIME_KNOWLEDGE_TIMEOUT_SECONDS` | 런타임 지식 fetch 타임아웃. 기본값 `10`초(최소 `1`). |
 | `AGENT_REQUEST_TIMEOUT_SECONDS` | 에이전트 `/analyze` 및 `/chat` 요청에 대한 백엔드 타임아웃. 기본값 `960`(에이전트의 `ANALYSIS_DEADLINE_SECONDS`보다 커야 합니다) |
 | `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | 운영자가 직접 트리거한 에이전트 `/analyze` 요청에 대한 백엔드 타임아웃. 기본값 `960` |
+| `AGENT_MAX_RESPONSE_BODY_BYTES` | 백엔드가 읽는 에이전트 응답 본문 상한. 기본값 `4194304`(4 MiB) |
 | `TRASH_RETENTION_DAYS` | 휴지통 인시던트를 purge하기 전 백엔드 soft delete 보존 기간. 기본값 `30` |
 | `SLACK_BOT_TOKEN` | 백엔드 Slack 봇 토큰(`xoxb-`, `chat:write` 스코프, 채널에 초대된 봇). 인시던트 분석 알림을 활성화하려면 `SLACK_CHANNEL_ID`와 함께 설정합니다. incoming webhook이나 `xapp-` 앱 토큰이 아니라 봇 토큰이 필요한 이유는 `chat.postMessage`가 재분석 스레딩에 사용되는 `ts`를 반환하기 때문입니다. Slack 앱을 재설치하면 이전 `xoxb-` 토큰은 무효화됩니다. 차트 시크릿 키 `slackBotToken` |
 | `SLACK_CHANNEL_ID` | 백엔드가 인시던트 분석 요약을 게시하는 채널. 차트 시크릿 키 `slackChannelId` |
@@ -58,6 +59,7 @@ flowchart LR
 | `RUNAI_BASE_URL` | Run:ai 컨트롤 플레인 URL. 차트 기본값은 없으며, `runaiMcp.enabled=true`일 때 `agent.env.runaiBaseUrl`로 반드시 지정해야 합니다 |
 | `RUNAI_BEARER_TOKEN` | 선택 사항인 Run:ai bearer 토큰 시크릿 |
 | `GRAFANA_SERVICE_ACCOUNT_TOKEN` | managed `grafanaMcp` 서비스가 Prometheus/Loki datasource read/query에 사용하는 Grafana service account token |
+| `PROMETHEUS_DATASOURCE_UID` / `LOKI_DATASOURCE_UID` | Prometheus/Loki MCP tool용 Grafana datasource UID. 기본값은 빈 값(Helm 키 `grafanaMcp.prometheusDatasourceUid` / `lokiDatasourceUid`) |
 | `RUNAI_CLIENT_ID` | Run:ai 애플리케이션 클라이언트 ID |
 | `RUNAI_CLIENT_SECRET` | Run:ai 애플리케이션 클라이언트 시크릿 |
 | `RUNAI_TOKEN_URL` | Run:ai 클라이언트 자격 증명을 위한 선택 사항인 OAuth 토큰 URL |
@@ -92,7 +94,6 @@ flowchart LR
 | `AGENT_SOULS_FILE` | 에이전트 역할 계약 프롬프트 경로. 기본값 `prompts/agent_souls.md` |
 | `FAMILIES_FILE` | root-cause family 카탈로그 YAML 경로. 기본값 `knowledge/families.yaml`. 로드 실패 시 내장 카탈로그로 폴백합니다 |
 | `COLLECTORS` | 쉼표로 구분된 수집기 레지스트리 allowlist. 비어 있거나 기본값이면 모든 내장 수집기를 활성화합니다. 알 수 없는 이름은 활성화에서 제외되지만 모든 분석 경고와 Agent `/healthz`의 `collectors.unknown`에 표시됩니다 |
-| `EVAL_MIN_TOP1` | 명시적인 `--min-top1`이 없을 때 CI/run script가 사용하는 eval gate 최소 Top-1 정확도 |
 | `MASKING_REGEX_LIST_JSON` | 사용자 정의 레닥션 정규식의 선택 사항인 JSON 배열 |
 | `BUILTIN_REDACTION_ENABLED` | 내장 시크릿 레닥션을 활성화합니다. 기본값 `true` |
 | `BUILTIN_REDACTION_HASH_MODE` | 시크릿을 `[MASKED]` 대신 안정적인 짧은 해시로 대체합니다. 기본값 `false` |
@@ -111,6 +112,8 @@ flowchart LR
 | `MAX_REANALYSIS_STEPS` | 재분석 패스 단계 제한. 기본값 `3`(Helm도 `3`); `0`은 전체 analysis deadline 안에서 의미적 완료까지 조사합니다. |
 | `ENABLE_AGENT_DRILLDOWN` | 수집기별 자율 드릴다운: 각 증거 에이전트(kubernetes/prometheus/loki/runai)가 자기 도메인의 서로 다른 읽기 전용 probe를 완료·반복 쿼리·분석 deadline까지 계속 수행합니다. 기본값 `false`(Helm은 `true`로 설정) |
 | `LLM_SYNTHESIS_MAX_TOKENS` | 최종 한국어 JSON 보고서의 completion 예산. 기본값 `16384`. |
+| `LLM_INSIGHT_MAX_TOKENS` | 수집기별 인사이트 드릴다운의 completion 예산. 기본값 `512`. |
+| `ANALYSIS_RESPONSE_MAX_BYTES` | 에이전트가 전송 전 자체 분석 응답 페이로드에 두는 상한. 기본값 `1572864`(1.5 MiB). |
 | `ANALYSIS_DEADLINE_SECONDS` | 분석당 전체 하드 상한(초과 시 우아하게 축소된 리포트). 기본값 `900`(15분), `0` = 상한 없음. 백엔드 `AGENT_REQUEST_TIMEOUT_SECONDS`를 이 값보다 크게 유지하세요. |
 | `ENABLE_RCA_OUTPUT_HARNESS` | 최종 RCA를 live evidence와 safety gate로 검증합니다. 기본값 `true` |
 | `MAX_RCA_REPAIR_ATTEMPTS` | harness 검증 뒤 최종 보고서를 수정하는 최대 횟수. 기본값 `3` |
