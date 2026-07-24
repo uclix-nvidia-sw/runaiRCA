@@ -121,6 +121,7 @@ _DISPOSITIVE_TYPED_REASONS: dict[str, frozenset[str]] = {
             "CreateContainerConfigError",
             "CreateContainerError",
             "RunContainerError",
+            "StartError",
         }
     ),
     "workload_runtime_error": frozenset({"OOMKilled"}),
@@ -1799,16 +1800,20 @@ async def rank_stage(state: PipelineState) -> PipelineState:
     # use fuzzy matches as candidates the LLM verify pass can still refute.
     state.alert_fuzzy = _alert_text(request)
     known_issue_matches = match_runai_known_issues(state.known_issues, state.observed)
+    symptom_matches = _gate_lifecycle_symptoms(
+        match_failure_mode_symptoms(state.failure_modes, state.observed), lifecycle
+    )
     state.root_cause_candidates = _promote_signature_cause(
         state.root_cause_candidates,
         state.xid_codes,
         known_issue_matches,
-        _gate_lifecycle_symptoms(
-            match_failure_mode_symptoms(state.failure_modes, state.observed), lifecycle
-        ),
+        symptom_matches,
         evidence_text=evidence_observed,
         known_issue_support=_known_issue_signature_support(
             state.results, known_issue_matches, eligible_support_ids
+        ),
+        symptom_support=_curated_symptom_signature_support(
+            state.results, symptom_matches, eligible_support_ids
         ),
         typed_state=_dispositive_typed_state(state.results, eligible_support_ids),
     )
@@ -3207,6 +3212,9 @@ async def _reanalyze_once(
             merged_results, None, eligible_support_ids=eligible_support_ids
         )
         known_issue_matches = match_runai_known_issues(state.known_issues, observed)
+        symptom_matches = _gate_lifecycle_symptoms(
+            match_failure_mode_symptoms(state.failure_modes, observed), lifecycle
+        )
         candidates = _promote_signature_cause(
             candidates,
             _xid_codes_from_results(
@@ -3215,12 +3223,13 @@ async def _reanalyze_once(
                 eligible_support_ids=eligible_support_ids,
             ),
             known_issue_matches,
-            _gate_lifecycle_symptoms(
-                match_failure_mode_symptoms(state.failure_modes, observed), lifecycle
-            ),
+            symptom_matches,
             evidence_text=evidence_observed,
             known_issue_support=_known_issue_signature_support(
                 merged_results, known_issue_matches, eligible_support_ids
+            ),
+            symptom_support=_curated_symptom_signature_support(
+                merged_results, symptom_matches, eligible_support_ids
             ),
             typed_state=_dispositive_typed_state(merged_results, eligible_support_ids),
         )
@@ -4690,6 +4699,57 @@ def _known_issue_signature_support(
     return support
 
 
+def _curated_symptom_signature_support(
+    results: list[CollectorResult],
+    matches: list[tuple[str, dict[str, Any]]],
+    eligible_support_ids: set[str] | None,
+) -> dict[str, dict[str, list[str]]]:
+    """Resolve a promoted curated symptom to its scoped evidence cards."""
+    from app.services.evidence_blackboard import source_independence_group
+    from app.services.root_cause_ranking import COLLECTOR_TEXT_DROP_KEYS
+
+    support: dict[str, dict[str, list[str]]] = {}
+    for family, symptom in matches:
+        name = str(symptom.get("symptom") or "")
+        keywords = [str(item) for item in symptom.get("matched_keywords") or []]
+        if not family or not name or not keywords:
+            continue
+        ids: list[str] = []
+        agents: list[str] = []
+        groups: list[str] = []
+        for result in results:
+            drop_keys = COLLECTOR_TEXT_DROP_KEYS.get(str(result.agent or ""))
+            for item in result.artifacts:
+                evidence_id = str(getattr(item, "evidence_id", "") or "")
+                if not evidence_id or not _artifact_is_scoped_support(
+                    item, eligible_support_ids=eligible_support_ids
+                ):
+                    continue
+                text = " ".join(
+                    part
+                    for part in (
+                        str(getattr(item, "summary", "") or ""),
+                        _evidence_leaf_text(
+                            getattr(item, "result", None), limit=2000, drop_keys=drop_keys
+                        ),
+                    )
+                    if part
+                ).casefold()
+                if not _keyword_hits(text, keywords)[0]:
+                    continue
+                ids.append(evidence_id)
+                agent = str(getattr(item, "agent", "") or result.agent or "")
+                agents.append(agent)
+                groups.append(source_independence_group(str(getattr(item, "source", "") or agent)))
+        if ids:
+            support[f"{family}\0{name}"] = {
+                "evidence_ids": list(dict.fromkeys(ids)),
+                "agents": list(dict.fromkeys(agents)),
+                "groups": list(dict.fromkeys(groups)),
+            }
+    return support
+
+
 def _promote_signature_cause(
     candidates: list[RankedCause],
     xid_codes: list[int],
@@ -4698,6 +4758,7 @@ def _promote_signature_cause(
     *,
     evidence_text: str = "",
     known_issue_support: Mapping[str, dict[str, list[str]]] | None = None,
+    symptom_support: Mapping[str, dict[str, list[str]]] | None = None,
     typed_state: tuple[str, str, list[str]] = ("", "", []),
 ) -> list[RankedCause]:
     """A specific signature names the headline family; the keyword ranker is only
@@ -4770,10 +4831,24 @@ def _promote_signature_cause(
     for family, symptom in symptom_matches:
         if not family:
             continue
+        support = (symptom_support or {}).get(
+            f"{family}\0{str(symptom.get('symptom') or '')}", {}
+        )
+        support_ids = support.get("evidence_ids") or []
+        support_agents = support.get("agents") or []
+        support_groups = support.get("groups") or []
+        matched_keywords = [str(item) for item in symptom.get("matched_keywords") or []]
         if family == top_family:
             return [
                 _with_signature_support(
-                    candidates[0], f"matched curated symptom: {symptom.get('symptom')}", 7.0
+                    candidates[0],
+                    f"matched curated symptom: {symptom.get('symptom')}",
+                    7.0,
+                    support_evidence_ids=support_ids,
+                    evidence_agents=support_agents,
+                    independent_source_groups=support_groups,
+                    signature_kind="curated_symptom",
+                    signature_keywords=matched_keywords,
                 ),
                 *candidates[1:],
             ]
@@ -4782,21 +4857,33 @@ def _promote_signature_cause(
         rationale = f"matched curated symptom: {symptom.get('symptom')}"
         existing = next((candidate for candidate in candidates if candidate.family == family), None)
         lead = (
-            _with_signature_support(existing, rationale, 7.0)
+            _with_signature_support(
+                existing,
+                rationale,
+                7.0,
+                support_evidence_ids=support_ids,
+                evidence_agents=support_agents,
+                independent_source_groups=support_groups,
+                signature_kind="curated_symptom",
+                signature_keywords=matched_keywords,
+            )
             if existing is not None
             else RankedCause(
                 family=family,
                 confidence="medium",
                 score=7.0,
                 rationale=[rationale],
-                evidence_agents=["signature"],
+                evidence_agents=sorted({"signature", *support_agents}),
                 trigger=_trigger_for_family(candidates, family),
+                support_evidence_ids=list(dict.fromkeys(support_ids)),
+                independent_source_groups=list(dict.fromkeys(support_groups)),
                 score_breakdown=[
                     {
                         "stage": "signature",
                         "kind": "curated_symptom",
                         "label": rationale,
                         "score_floor": 7.0,
+                        "matched_keywords": matched_keywords,
                     }
                 ],
             )
@@ -4987,6 +5074,8 @@ def _with_signature_support(
     support_evidence_ids: list[str] | None = None,
     evidence_agents: list[str] | None = None,
     independent_source_groups: list[str] | None = None,
+    signature_kind: str = "signature_floor",
+    signature_keywords: list[str] | None = None,
 ) -> RankedCause:
     rationale_items = [*candidate.rationale]
     if rationale not in rationale_items:
@@ -5032,10 +5121,11 @@ def _with_signature_support(
             *candidate.score_breakdown,
             {
                 "stage": "signature",
-                "kind": "signature_floor",
+                "kind": signature_kind,
                 "label": rationale,
                 "score_floor": score_floor,
                 "delta": score - candidate.score,
+                **({"matched_keywords": signature_keywords} if signature_keywords else {}),
             },
         ],
         confidence_gate=confidence_gate,

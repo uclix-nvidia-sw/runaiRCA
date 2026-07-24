@@ -32,6 +32,24 @@ FAMILIES = _FAMILY_CATALOG.families
 INSUFFICIENT = "insufficient_evidence"
 _FAMILY_RULES = _FAMILY_CATALOG.rules
 
+_K8S_CONTAINER_REASON_FAMILY: dict[str, str] = {
+    "crashloopbackoff": "workload_startup_error",
+    "createcontainerconfigerror": "workload_startup_error",
+    "createcontainererror": "workload_startup_error",
+    "runcontainererror": "workload_startup_error",
+    "containercannotrun": "workload_startup_error",
+    "starterror": "workload_startup_error",
+    "poststarthookerror": "workload_startup_error",
+    "imagepullbackoff": "image_pull_error",
+    "errimagepull": "image_pull_error",
+    "errimageneverpull": "image_pull_error",
+    "invalidimagename": "image_pull_error",
+    "imageinspecterror": "image_pull_error",
+    "oomkilled": "workload_runtime_error",
+    "unschedulable": "k8s_scheduling_error",
+    "schedulinggated": "k8s_scheduling_error",
+}
+
 _FLOOR = 2.0          # min top score below which we fall back to insufficient_evidence
 _HIGH = 5.0           # score needed (with >=2 corroborating agents) for high confidence
 _MED = 2.0           # one canonical fact; non-canonical single facts remain low
@@ -1340,6 +1358,14 @@ def _artifact_is_relevant_to_family(family: str, art: object) -> bool:
             )
         return predicate == f"alert_signature:{family}"
 
+    reason = str(
+        observation.get("container_reason")
+        or observation.get("scheduling_reason")
+        or ""
+    ).strip().casefold()
+    if reason:
+        return _K8S_CONTAINER_REASON_FAMILY.get(reason) == family
+
     _canonical, allowed_agents, keywords = rule
     if agent not in {str(item).casefold() for item in allowed_agents}:
         return False
@@ -1386,6 +1412,9 @@ def artifact_supports_family(family: str, art: object) -> bool:
         if predicate != f"alert_signature:{family}":
             return False
         return bool(_keyword_hits(semantic_text, list(rule[2]))[0])
+
+    if observation.get("container_reason") or observation.get("scheduling_reason"):
+        return True
 
     _canonical, allowed_agents, keywords = rule
     if agent not in {str(item).casefold() for item in allowed_agents}:
