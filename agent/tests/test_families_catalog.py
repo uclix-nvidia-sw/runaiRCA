@@ -9,9 +9,9 @@ from app.knowledge import (
     DEFAULT_FAMILY_HINTS,
     DEFAULT_FAMILY_REASONS,
     DEFAULT_FAMILY_RULES,
+    _load_failure_modes,
     family_catalog_from_entries,
     load_family_catalog,
-    _load_failure_modes,
 )
 
 FAMILIES = Path(__file__).parents[1] / "knowledge" / "families.yaml"

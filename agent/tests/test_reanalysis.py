@@ -14,13 +14,13 @@ from types import SimpleNamespace
 import pytest
 
 from app.collectors.base import AnalysisTarget, CollectorResult, artifact
+from app.plan import InvestigationPlan
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services import pipeline
 from app.services.evidence_blackboard import EvidenceEligibility
 from app.services.orchestrator import AnalysisOrchestrator
 from app.services.pipeline import _collector_name
 from app.services.root_cause_ranking import RankedCause
-from app.plan import InvestigationPlan
 from tests.test_orchestrator import make_settings
 
 

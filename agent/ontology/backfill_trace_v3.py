@@ -16,7 +16,6 @@ from pathlib import Path
 from app.config import load_settings
 from ontology.ingest import _fetch_trace_v3_page, _to_incident, _write
 
-
 _CURSOR_TABLE = """
 CREATE TABLE IF NOT EXISTS ontology_backfill_cursors (
     cursor_name TEXT PRIMARY KEY,

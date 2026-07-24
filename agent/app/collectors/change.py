@@ -27,11 +27,11 @@ from pathlib import Path
 from urllib.parse import quote
 
 from app.collectors.base import (
+    _OBSERVED_NORMAL_EVENT_REASONS,
     NO_EVIDENCE,
     AnalysisTarget,
     CollectorResult,
     artifact,
-    _OBSERVED_NORMAL_EVENT_REASONS,
     causal_evidence_time_range,
     incident_time_range,
     ko_en,

@@ -38,9 +38,9 @@ from app.knowledge import (
     load_family_catalog,
     load_runai_known_issues,
     load_troubleshooting_cases,
-    merge_runtime_failure_modes,
     match_failure_mode_symptoms,
     match_runai_known_issues,
+    merge_runtime_failure_modes,
     runtime_shadow_hints,
 )
 from app.llm import (

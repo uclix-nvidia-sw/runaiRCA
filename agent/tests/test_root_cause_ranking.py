@@ -3,8 +3,8 @@ from __future__ import annotations
 from app.collectors.base import NO_EVIDENCE, AnalysisTarget, CollectorResult, artifact
 from app.services.root_cause_ranking import (
     RankedCause,
-    _confidence,
     _candidate_sort_key,
+    _confidence,
     _result_text,
     _Score,
     merge_open_world_candidates,

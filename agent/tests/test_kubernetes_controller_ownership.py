@@ -3,8 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.collectors.base import AnalysisTarget
 from app.collectors import kubernetes
+from app.collectors.base import AnalysisTarget
 
 
 def target(*, pod: str = "", workload_type: str = "Deployment") -> AnalysisTarget:

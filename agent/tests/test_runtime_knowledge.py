@@ -3,15 +3,15 @@ from __future__ import annotations
 import pytest
 
 from app.config import load_settings
-from app.schemas import Alert, AlertAnalysisRequest
-from app.services import pipeline
-from app.services.root_cause_ranking import RankedCause
 from app.knowledge import (
     DEFAULT_FAMILIES,
     KnowledgeRegistry,
     match_failure_mode_symptoms,
     validate_runtime_knowledge,
 )
+from app.schemas import Alert, AlertAnalysisRequest
+from app.services import pipeline
+from app.services.root_cause_ranking import RankedCause
 
 
 class _Response:
