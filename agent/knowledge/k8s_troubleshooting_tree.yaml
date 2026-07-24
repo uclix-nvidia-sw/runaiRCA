@@ -7,6 +7,313 @@ sources:
   - "https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/troubleshooting.html"
   - "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting.html"
   - "https://run-ai-docs.nvidia.com/self-hosted/platform-management/runai-scheduler/scheduling/concepts-and-principles"
+diagnostic_defaults:
+  node_pressure: &node_pressure
+    verify: "Read the target Node conditions and the incident-era eviction events; a healthy node reports Ready with no MemoryPressure, DiskPressure, or PIDPressure condition. If a condition changed first, trace the evicted pod or kubelet threshold; otherwise return to the pod-local failure."
+    interpretation: "A pressure condition is causal only when it predates the affected pod's disruption on the same node; a rollout mentioning kubelet or device-plugin is not node-pressure evidence."
+    avoid: "Do not attribute a GPU Operator or DaemonSet rollout to node pressure without the target node's condition transition and eviction evidence."
+    probes:
+      - &probe_node_pressure
+        tool: k8s_read
+        arguments_template: {kind: nodes, name: "{{node}}"}
+        incident_time_window: incident
+        expected_result_shape: "target Node conditions and pressure transition timestamps"
+        supports_when: ["the target Node reports MemoryPressure, DiskPressure, or PIDPressure during the incident"]
+        refutes_when: ["the target Node remains Ready with all pressure conditions False"]
+        support_signal_any: ["MemoryPressure=True", "DiskPressure=True", "PIDPressure=True"]
+        refute_signal_any: ["MemoryPressure=False", "DiskPressure=False", "PIDPressure=False"]
+        source_group: kubernetes_api
+    alternatives:
+      - {family: workload_startup_error, reason: "A container can restart locally while the node stays healthy.", discriminator: "Compare the target node pressure transition with the container's terminated reason and previous logs."}
+      - {family: gpu_hardware_error, reason: "GPU driver faults can make GPU workloads fail on one otherwise healthy node.", discriminator: "Check node-scoped NVIDIA XID or runtime-handler evidence; it is absent in a resource-pressure eviction."}
+  runai_scheduling: &runai_scheduling
+    verify: "Read the Run:ai scheduler event and the workload/project allocation state at the incident time. Healthy placement has a bound workload with quota headroom; a policy decision names preemption, reclaim, gang, queue, or fair-share before the pod remains pending."
+    interpretation: "Run:ai policy is causal only when its scheduler/controller records the decision before Kubernetes placement or termination symptoms."
+    avoid: "Do not call every Pending GPU pod a Run:ai quota incident; default-scheduler predicates and Kubernetes ResourceQuota are separate controls."
+    probes:
+      - &probe_runai_scheduling
+        tool: k8s_describe
+        arguments_template: {kind: pods, name: "{{pod}}", namespace: "{{namespace}}"}
+        incident_time_window: incident
+        expected_result_shape: "pod events including scheduler name and preemption or binding reason"
+        supports_when: ["the event names runai-scheduler-default with a quota, gang, reclaim, or preemption reason"]
+        refutes_when: ["the event names default-scheduler or a Kubernetes-only predicate"]
+        support_signal_any: ["PreemptLowerPriority", "Reclaimed", "PodGroup", "runai-scheduler-default"]
+        refute_signal_any: ["FailedScheduling", "default-scheduler"]
+        source_group: kubernetes_api
+    alternatives:
+      - {family: k8s_scheduling_error, reason: "The same Pending state can be caused by Kubernetes taints, affinity, capacity, or ResourceQuota.", discriminator: "The pod event's scheduler name and first FailedScheduling predicate separate the two."}
+      - {family: platform_lifecycle_change, reason: "A scheduler rollout can temporarily interrupt otherwise valid placement.", discriminator: "Confirm a scheduler/controller revision change at the incident time before treating policy as a steady-state constraint."}
+  k8s_scheduling: &k8s_scheduling
+    verify: "Read the complete FailedScheduling event and compare it with pod constraints and eligible nodes. Healthy placement has at least one node satisfying every predicate; abnormal placement has one first, exact predicate that explains all excluded candidates."
+    interpretation: "Only the first scheduler predicate is the current blocker; total cluster capacity and later warning text do not override it."
+    avoid: "Do not change requests, taints, affinity, or quotas until the complete predicate breakdown identifies which constraint fails first."
+    probes:
+      - &probe_k8s_scheduling
+        tool: k8s_describe
+        arguments_template: {kind: pods, name: "{{pod}}", namespace: "{{namespace}}"}
+        incident_time_window: incident
+        expected_result_shape: "scheduler name, pod requests, and complete FailedScheduling event"
+        supports_when: ["a FailedScheduling event names the first unsatisfied predicate"]
+        refutes_when: ["the pod is scheduled or a non-scheduler event predates Pending"]
+        support_signal_any: ["FailedScheduling", "Unschedulable"]
+        refute_signal_any: ["PodScheduled=True"]
+        source_group: kubernetes_api
+    alternatives:
+      - {family: runai_scheduling_quota, reason: "Run:ai queue policy can produce an indistinguishable Pending workload.", discriminator: "Check whether runai-scheduler-default, rather than default-scheduler, emitted the first event."}
+      - {family: k8s_storage_error, reason: "Unbound PVCs also keep pods Pending before application startup.", discriminator: "A PVC Binding or ProvisioningFailed event separates storage binding from placement predicates."}
+  runai_control_plane: &runai_control_plane
+    verify: "Correlate the affected Run:ai controller error with cluster-sync and backend health during the incident. Healthy controllers reconcile the same resource without retrying; an abnormal control-plane fault has a scoped reconcile, dependency, or authorization error before workload symptoms."
+    interpretation: "A shared Run:ai control-plane error can fan out across workloads, while an isolated pod failure is usually downstream or unrelated."
+    avoid: "Do not infer a platform outage from one workload event without a controller-side error for the same incident window."
+    probes:
+      - &probe_runai_control_plane
+        tool: logql_query
+        arguments_template: {query: '{namespace="runai"} |~ "(?i)(reconcile|cluster-sync|runai-backend|database error)"'}
+        incident_time_window: incident
+        expected_result_shape: "timestamped Run:ai controller log entries"
+        supports_when: ["a Run:ai controller reports a reconcile or backend dependency failure during the incident"]
+        refutes_when: ["no scoped controller failure exists while Kubernetes reports the first failure"]
+        support_signal_any: ["reconcile failed", "cluster-sync", "database error"]
+        refute_signal_any: ["reconcile succeeded"]
+        source_group: loki
+    alternatives:
+      - {family: k8s_control_plane_error, reason: "API server or admission failures can make Run:ai reconciliation fail secondarily.", discriminator: "Check whether an apiserver, etcd, or webhook error predates the Run:ai retry."}
+      - {family: platform_auth_error, reason: "Expired platform credentials can surface as controller reconciliation errors.", discriminator: "An Unauthorized or certificate validation reason identifies identity failure instead of backend availability."}
+  k8s_control_plane: &k8s_control_plane
+    verify: "Inspect the incident-era API server, etcd, or admission evidence and compare blast radius. Healthy control-plane calls succeed for unrelated namespaces; a real failure has a specific API, quorum, or webhook reason before affected workload events."
+    interpretation: "Control-plane faults are shared dependencies, so timestamp and scope must establish them before labeling pod failures as cluster-wide."
+    avoid: "Do not treat a pod's generic timeout as API-server evidence without a matching control-plane error or failed request."
+    probes:
+      - &probe_k8s_control_plane
+        tool: k8s_read
+        arguments_template: {kind: events, namespace: "{{namespace}}"}
+        incident_time_window: incident
+        expected_result_shape: "timestamped API, admission, or controller events"
+        supports_when: ["a scoped event names apiserver, etcd, or admission webhook failure"]
+        refutes_when: ["API operations succeed and no control-plane event predates the symptom"]
+        support_signal_any: ["FailedCallingWebhookError", "EtcdMemberCommunicationError", "APIServerNotReady"]
+        refute_signal_any: ["PodScheduled=True"]
+        source_group: kubernetes_api
+    alternatives:
+      - {family: runai_control_plane_error, reason: "Run:ai controller outages can look like Kubernetes orchestration failures.", discriminator: "A Run:ai controller log failure without API/etcd evidence points to the platform control plane."}
+      - {family: platform_auth_error, reason: "Admission and API requests can fail because the caller is unauthorized rather than unavailable.", discriminator: "Forbidden or Unauthorized with a named subject distinguishes identity/RBAC from availability."}
+  workload_startup: &workload_startup
+    verify: "Read current and previous container states plus the earliest pod event. Healthy startup reaches Running with successful init and probe transitions; abnormal startup has a typed waiting or terminated reason before application readiness."
+    interpretation: "Startup evidence identifies kubelet, image, volume, init, probe, or process setup ownership before application runtime diagnosis."
+    avoid: "Do not call a restart an application bug until previous-container state and startup events rule out image, volume, and node-side setup failures."
+    probes:
+      - &probe_workload_startup
+        tool: k8s_describe
+        arguments_template: {kind: pods, name: "{{pod}}", namespace: "{{namespace}}"}
+        incident_time_window: incident
+        expected_result_shape: "container waiting/terminated reasons, restart count, and pod events"
+        supports_when: ["a typed container startup reason or startup event predates Running"]
+        refutes_when: ["the container reached Running and only later application logs fail"]
+        support_signal_any: ["CrashLoopBackOff", "ContainerCannotRun", "CreateContainerConfigError", "RunContainerError"]
+        refute_signal_any: ["Running"]
+        source_group: kubernetes_api
+    alternatives:
+      - {family: workload_runtime_error, reason: "A process can start successfully and fail later in its own code.", discriminator: "Running state followed by application traceback separates runtime from startup failure."}
+      - {family: k8s_storage_error, reason: "Mount and attach failures prevent startup before a container process exists.", discriminator: "FailedMount or FailedAttachVolume preceding container creation identifies the storage path."}
+  image_pull: &image_pull
+    verify: "Read the exact image pull event and image reference. Healthy nodes resolve and authenticate the requested digest; abnormal events distinguish registry authorization, manifest, rate limit, and DNS/transport errors before container creation."
+    interpretation: "ImagePullBackOff is a kubelet retry state, not a diagnosis; the original ErrImagePull text owns the next check."
+    avoid: "Do not rebuild or retag an image until the exact registry response distinguishes an absent image from credentials or network reachability."
+    probes:
+      - &probe_image_pull
+        tool: k8s_describe
+        arguments_template: {kind: pods, name: "{{pod}}", namespace: "{{namespace}}"}
+        incident_time_window: incident
+        expected_result_shape: "ErrImagePull or ImagePullBackOff event with registry response"
+        supports_when: ["the event names an image pull, manifest, authentication, or registry response"]
+        refutes_when: ["the image was pulled and a later startup event is first"]
+        support_signal_any: ["ImagePullBackOff", "ErrImagePull", "ErrImageNeverPull"]
+        refute_signal_any: ["Pulled"]
+        source_group: kubernetes_api
+    alternatives:
+      - {family: cluster_network_error, reason: "Registry DNS or transport failure can appear inside an ErrImagePull event.", discriminator: "A lookup, no-route, or timeout response separates network reachability from image metadata/auth."}
+      - {family: platform_auth_error, reason: "Registry credential rejection can look like an image availability problem.", discriminator: "No basic auth credentials, authentication required, or insufficient_scope identifies authorization."}
+  gpu_hardware: &gpu_hardware
+    verify: "Correlate the affected node's NVIDIA/XID evidence with pod and driver state. Healthy nodes advertise GPUs and have no incident-era XID; a hardware or driver fault has a typed NVIDIA signal before workload failure."
+    interpretation: "GPU symptoms are node-scoped only when the same node's driver, runtime, or XID evidence predates the workload failure."
+    avoid: "Do not blame GPU hardware for a healthy node merely because a GPU workload failed or a device-plugin rollout occurred."
+    probes:
+      - &probe_gpu_hardware
+        tool: logql_query
+        arguments_template: {query: '{namespace="gpu-operator"} |~ "(?i)(NVRM: Xid|driver/library version mismatch|no runtime for \\"nvidia\\")"'}
+        incident_time_window: incident
+        expected_result_shape: "timestamped NVIDIA driver or GPU Operator diagnostic entries"
+        supports_when: ["an XID or typed NVIDIA runtime/driver failure occurs on the affected node"]
+        refutes_when: ["no typed NVIDIA fault exists and Kubernetes reports a different first failure"]
+        support_signal_any: ["NVRM: Xid", "XidCriticalError", "DriverNotReady"]
+        refute_signal_any: ["NVIDIA driver initialized"]
+        source_group: loki
+    alternatives:
+      - {family: network_fabric_error, reason: "Distributed GPU jobs can fail because the fabric fails while each GPU remains healthy.", discriminator: "NCCL transport, IB, or NVLink errors without XID separate fabric from local GPU hardware."}
+      - {family: node_kubelet_pressure, reason: "Node pressure can evict GPU workloads without a GPU fault.", discriminator: "A MemoryPressure/DiskPressure transition or eviction event separates pressure from XID evidence."}
+  network_fabric: &network_fabric
+    verify: "Find the first failed rank and compare NCCL bootstrap, transport, and local GPU evidence. Healthy ranks establish the selected interface and complete collectives; abnormal fabric faults have an IB/RDMA/NVLink/NCCL transport signature before downstream timeout."
+    interpretation: "A collective timeout is downstream until a first rank, link, registration, or bootstrap error proves the fabric layer."
+    avoid: "Do not classify a generic NCCL timeout as fabric failure when an earlier rank exit or CUDA OOM explains the collective abort."
+    probes:
+      - &probe_network_fabric
+        tool: k8s_logs
+        arguments_template: {pod: "{{pod}}", namespace: "{{namespace}}", previous: true, tail: 300}
+        incident_time_window: incident
+        expected_result_shape: "previous container logs containing NCCL rank and transport diagnostics"
+        supports_when: ["logs identify NCCL transport, IB, RDMA, or NVLink failure before collective timeout"]
+        refutes_when: ["logs identify an earlier application exit, CUDA OOM, or bootstrap credential failure"]
+        support_signal_any: ["NCCL_SYSTEM_ERROR", "NCCL_INTERNAL_ERROR", "ibv_create_qp", "ibv_reg_mr"]
+        refute_signal_any: ["CUDA out of memory", "Traceback (most recent call last)"]
+        source_group: kubernetes_logs
+    alternatives:
+      - {family: workload_runtime_error, reason: "One crashed rank can make healthy peers report a collective timeout.", discriminator: "The first rank's traceback, exit code, or OOM before NCCL errors identifies runtime failure."}
+      - {family: cluster_network_error, reason: "Pod DNS/CNI or service reachability can block NCCL bootstrap.", discriminator: "Sandbox, DNS, or NetworkPolicy evidence before rank connection separates cluster networking from fabric transport."}
+  cluster_network: &cluster_network
+    verify: "Check whether the failure is sandbox/CNI, DNS, Service endpoints, or policy/route after the affected pod is identified. Healthy peers resolve the same name and reach ready endpoints; the first failed network control point decides the owner."
+    interpretation: "Network errors must be tied to the affected namespace, pod, and incident window; a generic timeout alone does not prove CNI or DNS failure."
+    avoid: "Do not use a healthy healthcheck or an unscoped ping as proof that the failing pod's DNS, endpoints, policy, and route are healthy."
+    probes:
+      - &probe_cluster_network
+        tool: k8s_describe
+        arguments_template: {kind: pods, name: "{{pod}}", namespace: "{{namespace}}"}
+        incident_time_window: incident
+        expected_result_shape: "pod sandbox events and network-related status"
+        supports_when: ["a sandbox, CNI, DNS, endpoint, or policy error is scoped to the pod"]
+        refutes_when: ["the pod network is ready and a non-network event predates the failure"]
+        support_signal_any: ["FailedCreatePodSandBox", "NetworkPluginNotReady", "NXDOMAIN"]
+        refute_signal_any: ["PodReadyToStartContainers=True"]
+        source_group: kubernetes_api
+    alternatives:
+      - {family: image_pull_error, reason: "Registry lookup failures look like cluster DNS failures but happen before the image is available.", discriminator: "ErrImagePull with a registry hostname separates image acquisition from running-pod connectivity."}
+      - {family: network_fabric_error, reason: "RDMA/NCCL transport can fail after ordinary pod networking is healthy.", discriminator: "NCCL IB/RDMA diagnostics with successful DNS/endpoints identify the fabric path."}
+  k8s_storage: &k8s_storage
+    verify: "Read PVC, PV, VolumeAttachment, and pod events in order. Healthy objects bind, attach, and mount before container startup; the first failed Kubernetes object transition distinguishes provisioner, attachment, and node-side mount ownership."
+    interpretation: "Kubernetes storage errors are object/control-path failures; backend health is only implicated when CSI or mount evidence names a server-side failure."
+    avoid: "Do not delete PVCs, force detach, or restart stateful workloads before the exact binding, attachment, or mount transition is captured."
+    probes:
+      - &probe_k8s_storage
+        tool: k8s_describe
+        arguments_template: {kind: persistentvolumeclaims, name: "{{storage_claim}}", namespace: "{{namespace}}"}
+        incident_time_window: incident
+        expected_result_shape: "PVC status and provisioning or binding events"
+        supports_when: ["PVC, provisioner, attachment, or mount events identify a Kubernetes storage object failure"]
+        refutes_when: ["PVC is Bound and a backend server error is the first storage signal"]
+        support_signal_any: ["ProvisioningFailed", "FailedAttachVolume", "FailedMount"]
+        refute_signal_any: ["Bound"]
+        source_group: kubernetes_api
+    alternatives:
+      - {family: storage_backend_error, reason: "An NFS, Ceph, or filesystem server can cause CSI/mount failures after objects are healthy.", discriminator: "A stale handle, read-only filesystem, server access denial, or backend latency signal separates backend from object state."}
+      - {family: k8s_scheduling_error, reason: "Unbound Immediate PVCs leave pods Pending alongside ordinary scheduler errors.", discriminator: "A PVC binding event, rather than FailedScheduling predicate, identifies storage as the first blocker."}
+  storage_backend: &storage_backend
+    verify: "Compare Kubernetes object state with the exact backend/server error from the affected node or CSI path. Healthy PVC/PV objects can still fail if NFS/Ceph/filesystem access is stale, denied, read-only, or slow; confirm the backend signal before changing Kubernetes objects."
+    interpretation: "This family is server-side storage health, not Kubernetes PVC/PV lifecycle: object failures are k8s_storage_error, while backend signatures explain failures after or beneath a valid object transition."
+    avoid: "Do not treat a Bound PVC as proof that the backend is healthy, and do not use generic pod timeout text as storage-backend evidence."
+    probes:
+      - &probe_storage_backend
+        tool: k8s_logs
+        arguments_template: {pod: "{{pod}}", namespace: "{{namespace}}", previous: true, tail: 300}
+        incident_time_window: incident
+        expected_result_shape: "CSI or workload log lines with exact backend filesystem/server error"
+        supports_when: ["logs contain a stale handle, read-only filesystem, server access denial, Ceph error, or I/O error"]
+        refutes_when: ["logs show a Kubernetes PVC/PV object transition without backend server error"]
+        support_signal_any: ["stale file handle", "read-only file system", "access denied", "Input/output error"]
+        refute_signal_any: ["ProvisioningFailed", "FailedAttachVolume"]
+        source_group: kubernetes_logs
+    alternatives:
+      - {family: k8s_storage_error, reason: "PVC binding, attachment, and CSI object errors can prevent the same pod from starting.", discriminator: "ProvisioningFailed, FailedAttachVolume, or FailedMount before backend error identifies the Kubernetes storage layer."}
+      - {family: workload_startup_error, reason: "An application can fail its own file initialization without shared storage failure.", discriminator: "A container startup reason or local traceback without a CSI/backend signature identifies workload startup."}
+  workload_runtime: &workload_runtime
+    verify: "Read the previous-container logs and termination state from the first failing replica. Healthy startup followed by stable Running shifts ownership to the application; abnormal runtime has a traceback, signal, CUDA OOM, or exit code before peer/downstream errors."
+    interpretation: "The first failing process/rank is causal; retries, CrashLoopBackOff, and peer timeouts are usually downstream observations."
+    avoid: "Do not treat a probe command string or a later healthy retry as evidence against the incident-era process failure."
+    probes:
+      - &probe_workload_runtime
+        tool: k8s_logs
+        arguments_template: {pod: "{{pod}}", namespace: "{{namespace}}", previous: true, tail: 300}
+        incident_time_window: incident
+        expected_result_shape: "previous container logs from the failing process"
+        supports_when: ["previous logs show a traceback, CUDA OOM, segmentation fault, or application exit before downstream errors"]
+        refutes_when: ["container state shows a pre-runtime image, mount, or sandbox failure"]
+        support_signal_any: ["Traceback (most recent call last)", "CUDA out of memory", "Segmentation fault"]
+        refute_signal_any: ["ImagePullBackOff", "FailedMount", "FailedCreatePodSandBox"]
+        source_group: kubernetes_logs
+    alternatives:
+      - {family: workload_startup_error, reason: "A container may never reach stable Running because setup fails first.", discriminator: "Typed kubelet startup events before application logs identify startup failure."}
+      - {family: gpu_hardware_error, reason: "Driver or XID faults can surface as CUDA errors in application logs.", discriminator: "A node-scoped XID or NVIDIA runtime failure before the CUDA exception identifies GPU hardware."}
+  observability: &observability
+    verify: "Compare the exact alert query and raw series with direct Kubernetes/GPU state at the same incident timestamp. Healthy measurement has fresh source samples and matching live state; a mismatch must identify the first scrape, transport, storage, query, or dashboard hop that diverges."
+    interpretation: "An observability incident is causal only when direct scoped state contradicts stale or missing derived telemetry; it does not prove a workload outage."
+    avoid: "Do not restart a healthy workload or accept an unrelated healthcheck as evidence while the alert target and timestamp remain unverified."
+    probes:
+      - &probe_observability
+        tool: promql_query
+        arguments_template: {query: 'kube_pod_status_phase{namespace="{{namespace}}",pod="{{pod}}"}'}
+        incident_time_window: incident
+        expected_result_shape: "timestamped pod phase series for the alert target"
+        supports_when: ["the target series is stale, missing, or contradicts direct target state"]
+        refutes_when: ["fresh raw series matches direct target state at the alert timestamp"]
+        support_signal_any: ["stale", "absent"]
+        refute_signal_any: ["Running"]
+        source_group: prometheus
+    alternatives:
+      - {family: platform_lifecycle_change, reason: "A rollout can create expected short telemetry gaps without a broken pipeline.", discriminator: "A controller/exporter revision change aligned with the gap separates lifecycle from persistent collection failure."}
+      - {family: node_kubelet_pressure, reason: "A true node outage can make both metrics and workload state unhealthy.", discriminator: "Direct Node Ready/pressure evidence matching the alert separates real infrastructure failure from measurement error."}
+  platform_auth: &platform_auth
+    verify: "Capture the exact API/authentication response, authenticated subject, target resource, and credential validity without exposing secrets. Healthy credentials authenticate and authorize the scoped request; abnormal evidence distinguishes Unauthorized/authentication from Forbidden/RBAC authorization."
+    interpretation: "Identity failures happen before authorization, while RBAC failures name an authenticated subject and denied verb/resource."
+    avoid: "Do not broaden permissions or rotate credentials until the exact response class and target subject are confirmed."
+    probes:
+      - &probe_platform_auth
+        tool: k8s_read
+        arguments_template: {kind: events, namespace: "{{namespace}}"}
+        incident_time_window: incident
+        expected_result_shape: "scoped API event with authorization or authentication reason"
+        supports_when: ["the same subject/request reports Forbidden, Unauthorized, token, or certificate validation failure"]
+        refutes_when: ["the request is authorized and a later control-plane or workload failure occurs"]
+        support_signal_any: ["Forbidden", "Unauthorized", "InvalidToken", "CertificateExpired"]
+        refute_signal_any: ["Authorized"]
+        source_group: kubernetes_api
+    alternatives:
+      - {family: k8s_control_plane_error, reason: "Unavailable API or admission services can fail requests before RBAC is evaluated.", discriminator: "A connection/quorum/webhook availability error instead of a named auth response identifies control-plane failure."}
+      - {family: runai_control_plane_error, reason: "Run:ai backend/controller failures can reject or time out platform operations.", discriminator: "A Run:ai reconcile/backend error without a credential response identifies platform control-plane failure."}
+  lifecycle: &lifecycle
+    verify: "Correlate the first workload symptom with deployment, DaemonSet, Helm, scheduler, or platform revision timestamps. Healthy rollouts progress within their declared availability budget; abnormal evidence is a revision-specific failure that persists after the transition settles."
+    interpretation: "A change is explanatory only when it precedes the symptom and matches its scope; coincidence with any recent rollout is not root cause evidence."
+    avoid: "Do not roll back or blame node pressure merely because a rollout is mentioned; verify target-specific state before remediation."
+    probes:
+      - &probe_lifecycle
+        tool: k8s_read
+        arguments_template: {kind: pods, name: "{{pod}}", namespace: "{{namespace}}"}
+        incident_time_window: incident
+        expected_result_shape: "pod owner revision, creation time, and state transitions"
+        supports_when: ["the affected pod revision changed immediately before the scoped symptom"]
+        refutes_when: ["no relevant revision/change predates the symptom"]
+        support_signal_any: ["ReplicaSetUpdated", "DaemonSetRollout"]
+        refute_signal_any: ["Available=True"]
+        source_group: kubernetes_api
+    alternatives:
+      - {family: workload_startup_error, reason: "A new revision can expose a real image, config, or process startup fault.", discriminator: "A typed startup event persisting after rollout stabilization identifies workload startup rather than expected lifecycle behavior."}
+      - {family: observability_accuracy, reason: "Exporter/dashboard rollouts can create a measurement-only incident.", discriminator: "Live target state remaining healthy while the revised telemetry path is stale identifies observability."}
+  insufficient: &insufficient
+    verify: "Preserve one scoped pod/node event, state transition, previous log, and change timeline before choosing a failure family. Healthy evidence has a timestamped first control point; if none exists, the correct result remains insufficient evidence rather than a keyword-based diagnosis."
+    interpretation: "Sparse or generic state alerts require target-verified evidence; probe command text, summaries, and unrelated healthy resources are not confirmation."
+    avoid: "Do not promote a generic alert title, probe command, or healthy peer into root-cause evidence without an incident-era signal for the affected target."
+    probes:
+      - &probe_insufficient
+        tool: k8s_describe
+        arguments_template: {kind: pods, name: "{{pod}}", namespace: "{{namespace}}"}
+        incident_time_window: incident
+        expected_result_shape: "pod state, events, and container history for the alert target"
+        supports_when: ["no incident-era typed event or state transition identifies a failure layer"]
+        refutes_when: ["a scoped typed event identifies the first failure layer"]
+        support_signal_any: ["Unknown"]
+        refute_signal_any: ["FailedScheduling", "OOMKilled", "ImagePullBackOff", "FailedMount"]
+        source_group: kubernetes_api
+    alternatives:
+      - {family: workload_startup_error, reason: "A missing describe/log history can conceal a local startup failure.", discriminator: "A typed container state or startup event identifies workload startup."}
+      - {family: node_kubelet_pressure, reason: "Generic availability alerts can hide node pressure or eviction.", discriminator: "A target Node pressure transition or eviction event identifies the node path."}
 principles:
   - "Preserve the oldest event, previous-container logs, and recent-change timeline before restarting anything."
   - "Use blast radius to choose the layer: one container, one pod, one node, one node pool, one namespace, or the whole cluster."
@@ -19,7 +326,7 @@ nodes:
   # Branch order is intentional: preserve cluster-wide / node-wide evidence
   # before treating a pod-local error as an application problem.
   - id: incident_scope
-    question: "What is the first failing Kubernetes control point?"
+    question: "What is the first failing control point in the incident timeline: scheduler, kubelet, storage, network, controller, or application? Healthy peers should not share the same first Warning event. Preserve the oldest scoped event, then follow the branch that owns it rather than the alert title."
     verify: "Build a short timeline: recent rollout/change, oldest Warning event, pod phase, node condition, and whether unrelated workloads share the failure."
     interpretation: "The same error text can be a pod-local failure or a cluster-wide symptom; blast radius decides which layer to investigate first."
     avoid: "Do not accept a component name in the alert title as the root cause without checking the event timeline."
@@ -41,8 +348,17 @@ nodes:
           any: [apiserver, kube-apiserver, etcd, etcdserver, webhook, "admission webhook", "failed calling webhook", leaderelection]
           literal_any: ["failed calling webhook"]
         next: control_plane_failure
+      # Alertmanager's node/control-plane/observability alerts often have no pod
+      # label. Keep their signatures explicit so they enter the right runbook
+      # branch instead of falling into a pod-only diagnosis.
+      - match:
+          any: ["KubeAPIDown", "KubeControllerManagerDown", "KubeSchedulerDown", "etcd quorum", "etcd member"]
+        next: control_plane_failure
       - match:
           any: [runai-backend, cluster-sync, "runai scheduler unavailable", "database error", "reconcile failed"]
+        next: runai_control_plane_failure
+      - match:
+          any: ["RunaiSchedulerDown", "RunaiBackendDown", "runai controller unavailable", "runai platform alert"]
         next: runai_control_plane_failure
       - match:
           any: ["nvrm: xid", "xidcriticalerror", "fallen off the bus", "failed to initialize nvml", "driver/library version mismatch", "no runtime for \"nvidia\"", "nvidia.com/gpu: 0", "system not yet initialized", clusterpolicy]
@@ -55,6 +371,9 @@ nodes:
           any: [diskpressure, memorypressure, pidpressure, notready, "node is not ready", "node_ready: false", "node ready=false"]
         next: node_not_ready
       - match:
+          any: ["KubeNodeNotReady", "NodeFilesystemSpaceFillingUp", "NodeMemoryPressure", "NodePIDPressure", "kube_node_status_condition"]
+        next: node_not_ready
+      - match:
           any: ["runai-scheduler-default", "pod group", podgroup, "gang schedul", fairshare, "over-quota", "over quota", reclaimed, preemptor, "failed to bind"]
         next: runai_scheduling_failure
       - match:
@@ -64,8 +383,14 @@ nodes:
           any: ["no metrics", "metrics missing", "stale metrics", "thanos-receive", "dcgm_fi_dev", "target down", "dashboard shows"]
         next: observability_failure
       - match:
+          any: ["PrometheusTargetMissing", "PrometheusTargetDown", "ThanosReceiveDown", "KubeStateMetricsDown", "DCGMExporterDown"]
+        next: observability_failure
+      - match:
           any: [failedmount, failedattachvolume, "unable to attach or mount volumes", "unbound immediate persistentvolumeclaims", volumebinding, provisioningfailed]
         next: storage_failure
+      - match:
+          any: ["stale file handle", "read-only file system", "nfs server", cephfs, "ceph health", "input/output error", "mount access denied", "storage latency"]
+        next: storage_backend_failure
       - match:
           any: ["failed to create pod sandbox", "failed to setup network for sandbox", "cni plugin", "network plugin", ipam]
         next: pod_network_failure
@@ -98,7 +423,7 @@ nodes:
         next: insufficient_k8s_evidence
 
   - id: pod_or_node_symptom
-    question: "Which Kubernetes symptom appears first?"
+    question: "Which typed Kubernetes symptom occurs first for the affected target: Pending, image pull, mount, sandbox, restart, probe, or node state? Healthy state has no earlier Warning for this pod or node. Use the first timestamped state transition to select the next branch."
     verify: "Start with the oldest Warning event and the pod/node state at that timestamp; do not treat the alert title as the cause."
     interpretation: "Classify the first failing control point before inspecting every subsystem."
     avoid: "Do not restart or reschedule the workload before preserving Events and previous-container logs."
@@ -144,7 +469,7 @@ nodes:
         next: pod_network_failure
 
   - id: pod_pending
-    question: "Why is the pod Pending?"
+    question: "Which prerequisite keeps this exact pod Pending: scheduler placement, PVC binding, image retrieval, or node readiness? A healthy Pending-to-Running transition has a successful scheduler and bound prerequisites. Read the first event and pursue its named owner rather than guessing from total cluster capacity."
     verify: "Read `kubectl describe pod` Events and identify the scheduler name plus the complete `0/N nodes are available` predicate breakdown."
     interpretation: "Pending is a placement or prerequisite problem; the first failed predicate is the next diagnostic branch."
     avoid: "Do not increase GPU quota until the event rules out taints, affinity, PVC binding, and topology constraints."
@@ -194,7 +519,7 @@ nodes:
         next: node_not_ready
 
   - id: pending_failed_scheduling
-    question: "Did kube-scheduler report a FailedScheduling reason?"
+    question: "Does the earliest Pending event contain a complete FailedScheduling predicate from kube-scheduler? Healthy placement either schedules or identifies no blocking predicate. If present, split capacity, taint, affinity, topology, quota, and unknown predicates; otherwise check PVC binding and other prerequisites."
     match:
       any:
         - failedscheduling
@@ -228,7 +553,8 @@ nodes:
         next: scheduling_unknown_predicate
 
   - id: scheduling_capacity
-    question: "Is a requested resource absent on otherwise eligible nodes?"
+    <<: *k8s_scheduling
+    question: "After taints, affinity, topology, and selectors are applied, does any eligible node lack the requested CPU, memory, or GPU? Healthy placement needs one node with allocatable headroom for the exact request. If capacity is available, return to the first non-capacity predicate instead of changing requests."
     verify: "Compare the pod's requests with allocatable and already-requested CPU, memory, and GPU only on nodes that pass selector, affinity, taint, and topology filters."
     interpretation: "This is real capacity pressure only after eligibility filters are applied; total cluster free capacity is not placement capacity."
     avoid: "Do not drain healthy nodes or lower requests blindly; confirm whether a matching node pool can ever satisfy the request."
@@ -242,6 +568,8 @@ nodes:
         expected_result_shape: "target node allocatable CPU, memory, and nvidia.com/gpu capacity"
         supports_when: ["the selected node lacks a requested allocatable resource"]
         refutes_when: ["the target node has capacity and the event identifies a different predicate"]
+        support_signal_any: ["Insufficient cpu", "Insufficient memory", "Insufficient nvidia.com/gpu"]
+        refute_signal_any: ["PodScheduled=True"]
         source_group: kubernetes_api
     match:
       any: ["insufficient cpu", "insufficient memory", "insufficient nvidia.com/gpu"]
@@ -257,7 +585,9 @@ nodes:
         - "Add matching capacity, release the blocking allocation, or resize the request only after validating the workload requirement."
 
   - id: scheduling_taint
-    question: "Is a node taint excluding the pod?"
+    <<: *k8s_scheduling
+    probes: [{<<: *probe_k8s_scheduling, id: k8s_troubleshooting:scheduling_taint:p01}]
+    question: "Does the first scheduler event name an untolerated taint on otherwise eligible nodes? Healthy placement has a matching toleration with the same key, value, and effect. If tolerations match, continue with the next predicate rather than removing a protective taint."
     verify: "Compare every taint on candidate nodes with the pod's tolerations, including effect (NoSchedule/NoExecute) and value."
     interpretation: "The scheduler found nodes, but policy deliberately excludes this pod."
     avoid: "Do not remove a taint cluster-wide; it often protects dedicated, unhealthy, or GPU-specialized nodes."
@@ -275,7 +605,9 @@ nodes:
         - "Otherwise change the selector/node pool or leave the taint intact."
 
   - id: scheduling_affinity
-    question: "Do selector or affinity rules eliminate all nodes?"
+    <<: *k8s_scheduling
+    probes: [{<<: *probe_k8s_scheduling, id: k8s_troubleshooting:scheduling_affinity:p01}]
+    question: "Do the pod's required selector, affinity, or anti-affinity rules leave zero eligible nodes? Healthy candidate nodes satisfy each required term, not merely total capacity. Identify the first zero-match rule; if one node matches, investigate the next scheduler predicate."
     verify: "List the pod's nodeSelector, required node/pod affinity, and anti-affinity; then count nodes satisfying each constraint one by one."
     interpretation: "The request may fit the cluster, but the declared placement contract leaves no eligible node."
     avoid: "Do not weaken anti-affinity without checking whether it protects availability or distributed-training topology."
@@ -293,7 +625,9 @@ nodes:
         - "Re-check placement after the change rather than assuming cluster capacity is sufficient."
 
   - id: scheduling_topology
-    question: "Does a topology spread constraint block placement?"
+    <<: *k8s_scheduling
+    probes: [{<<: *probe_k8s_scheduling, id: k8s_troubleshooting:scheduling_topology:p01}]
+    question: "Does current distribution violate this pod's topology key, maxSkew, or whenUnsatisfiable policy? Healthy placement can add the pod without exceeding the declared skew across labeled domains. If labels and skew are valid, continue to the next scheduler predicate."
     verify: "Inspect topology keys, maxSkew, whenUnsatisfiable, and the current pod distribution across domains."
     interpretation: "Capacity exists, but placement would violate the workload's requested failure-domain balance."
     avoid: "Do not change maxSkew before checking missing node labels or an empty topology domain."
@@ -311,7 +645,8 @@ nodes:
         - "Relax maxSkew/whenUnsatisfiable only if the workload can safely accept the weaker distribution."
 
   - id: scheduling_quota
-    question: "Does namespace ResourceQuota reject the request?"
+    <<: *k8s_scheduling
+    question: "Does the namespace ResourceQuota reject the exact requested CPU, memory, GPU, pod, or storage dimension? Healthy quota has headroom for that dimension at admission time. If it does, distinguish this Kubernetes quota from a Run:ai queue policy before changing either budget."
     verify: "Read the quota object and compare hard versus used CPU, memory, GPU, pod-count, and storage limits in the pod namespace."
     interpretation: "The request is valid for nodes but not permitted for this namespace's budget."
     avoid: "Do not confuse Kubernetes ResourceQuota with Run:ai project quota; they are enforced by different control paths."
@@ -325,6 +660,8 @@ nodes:
         expected_result_shape: "namespace ResourceQuota hard and used dimensions"
         supports_when: ["the event's resource dimension is exhausted in quota status.used"]
         refutes_when: ["no relevant ResourceQuota exists or the cited dimension has remaining headroom"]
+        support_signal_any: ["ExceededQuota"]
+        refute_signal_any: ["PodScheduled=True"]
         source_group: kubernetes_api
     match:
       any: ["exceeded quota", "resourcequota"]
@@ -340,7 +677,9 @@ nodes:
         - "If the event came from runai-scheduler rather than default-scheduler, continue on the Run:ai quota path instead."
 
   - id: scheduling_unknown_predicate
-    question: "Is the scheduler predicate incomplete or unfamiliar?"
+    <<: *k8s_scheduling
+    probes: [{<<: *probe_k8s_scheduling, id: k8s_troubleshooting:scheduling_unknown_predicate:p01}]
+    question: "Is the complete FailedScheduling predicate missing or outside the known branches? Healthy diagnosis preserves the scheduler name and full event before remediation. Capture that exact text, then decide whether it is a Kubernetes predicate, PVC prerequisite, or Run:ai policy rather than inferring from Pending alone."
     verify: "Preserve the full event message and scheduler name; inspect admission and scheduler logs only after the event is captured."
     interpretation: "The pod is unschedulable, but the current evidence does not justify selecting a specific predicate."
     match:
@@ -357,7 +696,8 @@ nodes:
         - "Fix the blocking predicate or add capacity in the matching node pool."
 
   - id: pending_volume_binding
-    question: "Is Pending caused by PVC or StorageClass binding?"
+    <<: *k8s_storage
+    question: "Did PVC binding or the StorageClass provisioner become the first prerequisite failure for this Pending pod? Healthy claims become Bound and provisioned before scheduling completes. If the claim is already Bound, return to scheduler, attachment, or mount evidence instead of treating storage as causal."
     probes:
       - id: k8s_troubleshooting:pending_volume_binding:p01
         tool: k8s_read
@@ -391,7 +731,7 @@ nodes:
         - "Check storage capacity and topology constraints for the requested volume."
 
   - id: storage_failure
-    question: "Does storage fail before the container can start?"
+    question: "Does the first storage event occur before any container process starts, and does it name binding, attachment, or mounting? Healthy storage progresses PVC to PV to attachment to mount in order. Follow that failed verb; backend/server symptoms need the separate storage-backend branch."
     verify: "Separate PVC binding (scheduler/provisioner), volume attach (controller/cloud), and mount (node CSI/kubelet) using the exact Event reason."
     interpretation: "Storage failures occur before application code executes; the failing verb identifies the owner to inspect."
     avoid: "Do not delete a PVC or restart a stateful workload before confirming attachment state and backend health."
@@ -423,7 +763,9 @@ nodes:
         next: volume_mount_failure
 
   - id: volume_attach_failure
-    question: "Did the volume attach fail before reaching the node?"
+    <<: *k8s_storage
+    probes: [{<<: *probe_k8s_storage, id: k8s_troubleshooting:volume_attach_failure:p01}]
+    question: "Did VolumeAttachment or CSI controller evidence fail before the volume reached the selected node? Healthy volumes attach once to the intended node and then proceed to mount. If attachment succeeds, inspect node-side mount or backend access rather than force-detaching."
     verify: "Check VolumeAttachment, the CSI controller log, the selected node/zone, and whether the volume remains attached elsewhere."
     interpretation: "Attach is a controller/backend operation, so kubelet logs alone cannot prove the cause."
     avoid: "Do not force-detach a volume until the prior node is confirmed unreachable or detached; that risks data corruption."
@@ -441,7 +783,9 @@ nodes:
         - "Validate CSI controller and backend health before re-scheduling the workload."
 
   - id: volume_mount_failure
-    question: "Did kubelet or the CSI node plugin fail to mount an attached volume?"
+    <<: *k8s_storage
+    probes: [{<<: *probe_k8s_storage, id: k8s_troubleshooting:volume_mount_failure:p01}]
+    question: "After the volume attaches, did kubelet or the CSI node plugin report the first mount failure for this node and volume? Healthy mounts expose the volume before container creation. Use the exact mount error to distinguish credentials, filesystem, NFS/Ceph backend access, and object lifecycle problems."
     verify: "Read the full mount error and inspect the CSI node pod plus node kernel logs for the target volume."
     interpretation: "The volume may be provisioned and attached correctly while node-side credentials, filesystem, or network access still prevent a mount."
     avoid: "Do not format or recreate a persistent volume to recover a mount error."
@@ -459,7 +803,7 @@ nodes:
         - "Retry only after the VolumeAttachment/PVC state is healthy."
 
   - id: pod_crashing
-    question: "Why is the container restarting?"
+    question: "What typed state ended the previous container instance before the restart: OOMKilled, exit, probe, image, mount, or creation failure? Healthy containers reach stable Running without an earlier terminated reason. Read previous state and logs first, then follow the cause that predates CrashLoopBackOff."
     probes:
       - id: k8s_troubleshooting:pod_crashing:p01
         tool: k8s_describe
@@ -493,7 +837,8 @@ nodes:
         next: crashloop_backoff
 
   - id: init_container_failure
-    question: "Is an init container blocking all application containers?"
+    <<: *workload_startup
+    question: "Is an init container the first component failing before every application container remains blocked? Healthy init containers complete sequentially and hand off to the app. Capture its previous state and logs; if init succeeds, continue with the application container's first failure."
     verify: "Inspect each init container's state, previous logs, and Events; identify the first one that did not complete."
     interpretation: "The main container has not started, so its logs and probes are downstream noise."
     avoid: "Do not debug the application container until every required init container completes."
@@ -508,6 +853,8 @@ nodes:
         expected_result_shape: "scoped pod log tail containing the first init-container error when retained"
         supports_when: ["an init failure appears before the main container starts"]
         refutes_when: ["all init containers completed and the first error is in the main container"]
+        support_signal_any: ["Init:CrashLoopBackOff", "Init:ErrImagePull"]
+        refute_signal_any: ["Initialized=True"]
         source_group: workload_logs
     match:
       any: ["init:crashloopbackoff", "init:errimagepull", "init container", initcontainer]
@@ -523,7 +870,9 @@ nodes:
         - "Verify the init container completes once before judging the main workload."
 
   - id: crash_oomkilled
-    question: "Was the previous container terminated by OOMKilled?"
+    <<: *workload_startup
+    probes: [{<<: *probe_workload_startup, id: k8s_troubleshooting:crash_oomkilled:p01}]
+    question: "Does the previous container state record OOMKilled before the restart, and was memory use near its cgroup limit? Healthy termination has a deliberate exit or no forced kill. If no typed OOM state exists, investigate the actual exit, probe, node pressure, or GPU/runtime error instead."
     match:
       any: [oomkilled, out of memory, exit code 137]
       fields:
@@ -540,7 +889,8 @@ nodes:
         - "Roll out the change and verify OOMKilled, restart-count growth, and CrashLoopBackOff stop recurring."
 
   - id: crashloop_backoff
-    question: "Is the pod repeatedly failing after process start?"
+    <<: *workload_startup
+    question: "Does the container reach process start and repeatedly exit with the same incident-era reason? Healthy startup remains Running after initialization. Compare previous logs and exit code with image, mount, probe, and node evidence; follow the earliest typed failure rather than the BackOff retry."
     probes:
       - id: k8s_troubleshooting:crashloop_backoff:p01
         tool: k8s_logs
@@ -552,6 +902,8 @@ nodes:
         expected_result_shape: "scoped application log tail around the restart"
         supports_when: ["an application error or explicit exit cause precedes BackOff"]
         refutes_when: ["logs contain no process failure and pod state identifies a platform-side failure first"]
+        support_signal_any: ["CrashLoopBackOff", "Back-off restarting failed container"]
+        refute_signal_any: ["ImagePullBackOff", "FailedMount"]
         source_group: workload_logs
     match:
       any: [crashloopbackoff, back-off restarting, backoff]
@@ -567,7 +919,9 @@ nodes:
         - "Fix the workload-level crash before changing platform scheduling."
 
   - id: container_start_error
-    question: "Could kubelet create the container process?"
+    <<: *workload_startup
+    probes: [{<<: *probe_workload_startup, id: k8s_troubleshooting:container_start_error:p01}]
+    question: "Did kubelet fail before the container process could execute, and what exact ContainerCannotRun or CreateContainer error was recorded? Healthy setup creates the process after image and mount success. If process creation succeeds, move to runtime logs rather than treating later exits as setup errors."
     match:
       any: [runcontainererror, containercannotrun, executable file not found]
     conclusion:
@@ -582,7 +936,8 @@ nodes:
         - "Fix the image, entrypoint, file mode, or securityContext."
 
   - id: image_pull_failure
-    question: "Did the node fail before the image was available?"
+    <<: *image_pull
+    question: "Did kubelet fail to resolve, authenticate, fetch, or validate the requested image before container creation? Healthy pulls resolve the exact digest and report Pulled. Use the original ErrImagePull response to separate manifest, credentials, rate limit, and registry DNS/transport causes."
     probes:
       - id: k8s_troubleshooting:image_pull_failure:p01
         tool: k8s_describe
@@ -617,7 +972,9 @@ nodes:
         - "Test a manual pull from the affected node or mirror the image to a reachable registry."
 
   - id: volume_failure
-    question: "Did volume attach or mount fail?"
+    <<: *k8s_storage
+    probes: [{<<: *probe_k8s_storage, id: k8s_troubleshooting:volume_failure:p01}]
+    question: "Did the earliest storage event name attachment or mounting after the PVC was selected for this pod? Healthy volumes attach and mount before process start. If neither event exists, return to binding, image, sandbox, or runtime evidence rather than assuming storage."
     match:
       any:
         - failedmount
@@ -637,7 +994,7 @@ nodes:
         - "Check backend storage health and volume topology before restarting the workload."
 
   - id: node_not_ready
-    question: "Is the target node NotReady or under pressure?"
+    question: "Did the target node become NotReady or enter MemoryPressure, DiskPressure, or PIDPressure before the affected workload failed? Healthy peer nodes retain Ready and false pressure conditions. Compare the transition time with pod events; if it follows them, continue with the pod-local path."
     probes:
       - id: k8s_troubleshooting:node_not_ready:p01
         tool: k8s_read
@@ -671,7 +1028,7 @@ nodes:
         next: node_condition_failure
 
   - id: control_plane_failure
-    question: "Is the Kubernetes control plane failing requests or admission?"
+    question: "Is there a scoped API server, etcd, controller, or admission failure that predates the affected request and affects comparable targets? Healthy control-plane calls succeed across unrelated namespaces. If evidence is isolated to one pod, keep tracing its first local event instead of declaring a cluster outage."
     verify: "Check whether the same API/admission error affects multiple namespaces and clients; then read apiserver and the named dependency's health."
     interpretation: "A shared API, etcd, or admission failure can make healthy workloads look like independent pod failures."
     avoid: "Do not restart workload pods to fix a cluster-wide API or webhook failure."
@@ -691,7 +1048,9 @@ nodes:
         next: api_server_failure
 
   - id: etcd_failure
-    question: "Is etcd availability or quorum the direct failure?"
+    <<: *k8s_control_plane
+    probes: [{<<: *probe_k8s_control_plane, id: k8s_troubleshooting:etcd_failure:p01}]
+    question: "Did etcd report quorum, member communication, latency, or availability failure before API operations degraded? Healthy members form quorum and API writes complete. If the error starts at a webhook or caller credential instead, follow that earlier control point."
     verify: "Confirm etcd endpoint health, leader/quorum status, latency, disk latency, and member logs before changing Kubernetes objects."
     interpretation: "etcd timeout or leader loss is a control-plane availability incident, not a workload configuration error."
     match:
@@ -708,7 +1067,9 @@ nodes:
         - "Avoid speculative member deletion or restore actions during a live quorum incident."
 
   - id: admission_webhook_failure
-    question: "Is an admission webhook rejecting or timing out pod creation?"
+    <<: *k8s_control_plane
+    probes: [{<<: *probe_k8s_control_plane, id: k8s_troubleshooting:admission_webhook_failure:p01}]
+    question: "Did the API response name an admission webhook denial, timeout, or TLS failure for this create/update? Healthy admission completes within the request and identifies no rejecting webhook. If the object was admitted, trace the next scheduler or kubelet event instead."
     verify: "Use the exact webhook service/name in the API error, then check its endpoints, certificate, timeout, and recent rollout."
     interpretation: "Admission happens before persistence/scheduling; a failing webhook can block every matching workload."
     match:
@@ -726,7 +1087,9 @@ nodes:
         - "Use an emergency bypass only under the platform's change-control procedure."
 
   - id: api_server_failure
-    question: "Is kube-apiserver availability or authentication failing?"
+    <<: *k8s_control_plane
+    probes: [{<<: *probe_k8s_control_plane, id: k8s_troubleshooting:api_server_failure:p01}]
+    question: "Did the first failed request show API server unavailability, timeout, TLS failure, or an authentication response? Healthy API calls succeed for the same scoped operation. Separate a named Unauthorized/Forbidden identity failure from an API availability failure before escalating control plane."
     verify: "Compare API health, latency, audit/auth errors, and load-balancer reachability from more than one client."
     interpretation: "If independent clients fail the same API operation, investigate the shared control plane before individual resources."
     match:
@@ -743,7 +1106,9 @@ nodes:
         - "Recover the implicated control-plane component before retrying workload operations."
 
   - id: node_pressure
-    question: "Which node pressure condition is active?"
+    <<: *node_pressure
+    probes: [{<<: *probe_node_pressure, id: k8s_troubleshooting:node_pressure:p01}]
+    question: "Which target-node condition changed first—MemoryPressure, DiskPressure, or PIDPressure—and did it precede eviction or workload disruption? Healthy nodes report each condition False. If no transition or eviction exists for this node, return to the workload's own termination reason."
     match:
       any: [diskpressure, memorypressure, pidpressure, evicted, low on resource]
     conclusion:
@@ -758,7 +1123,9 @@ nodes:
         - "Remove the pressure source before uncordoning."
 
   - id: node_condition_failure
-    question: "Did kubelet report the node as NotReady?"
+    <<: *node_pressure
+    probes: [{<<: *probe_node_pressure, id: k8s_troubleshooting:node_condition_failure:p01}]
+    question: "Did kubelet set the target node NotReady before this workload's event, and which Ready condition reason explains it? Healthy nodes stay Ready while peers continue scheduling. If NotReady follows the pod failure or affects no comparable workload, investigate the earlier local control point."
     match:
       any: [notready, node is not ready, ready=false]
       fields:
@@ -775,7 +1142,9 @@ nodes:
         - "Cordon or drain the node while recovering kubelet or the runtime."
 
   - id: probe_failure
-    question: "Are health probes keeping the pod unready or restarting it?"
+    <<: *workload_startup
+    probes: [{<<: *probe_workload_startup, id: k8s_troubleshooting:probe_failure:p01}]
+    question: "Did the actual probe result fail for this container before readiness loss or restart, and was the process otherwise running? Healthy probes succeed with the configured endpoint and timing. Inspect response/error evidence, not the probe command text; if probes are healthy, trace the real exit or dependency failure."
     match:
       any: [readiness probe failed, liveness probe failed, startup probe failed, unhealthy]
     conclusion:
@@ -790,7 +1159,7 @@ nodes:
         - "Fix the app endpoint or tune the probe only after confirming the app is otherwise healthy."
 
   - id: service_connectivity_failure
-    question: "Is a running workload unable to resolve or reach its dependency?"
+    question: "After the workload is Running, does the affected pod fail first at DNS, Service endpoints, or policy/route reachability? Healthy peers resolve the same name and reach ready endpoints in the incident window. Test the named control point next; a generic timeout alone is not network proof."
     verify: "Test DNS resolution, Service endpoints, NetworkPolicy, and TCP reachability from the affected pod and a known-good peer in that order."
     interpretation: "`connection refused`, `no endpoints`, and DNS errors have different owners; do not label all of them CNI failures."
     avoid: "Do not restart CoreDNS or relax NetworkPolicy until the failed hop is identified."
@@ -822,7 +1191,9 @@ nodes:
         next: traffic_policy_failure
 
   - id: dns_failure
-    question: "Does cluster DNS fail for the workload?"
+    <<: *cluster_network
+    probes: [{<<: *probe_cluster_network, id: k8s_troubleshooting:dns_failure:p01}]
+    question: "Does the affected pod receive NXDOMAIN, lookup failure, or timeout for the required name while a healthy peer uses the same resolver? Healthy DNS returns the expected Service or endpoint records. If name resolution succeeds, continue to endpoints, policy, or application protocol evidence."
     verify: "Resolve the exact Service FQDN from the affected pod, then inspect CoreDNS readiness/errors and the pod's resolv.conf."
     interpretation: "DNS failure is distinct from a service without endpoints and from an application refusing a connection."
     match:
@@ -839,7 +1210,9 @@ nodes:
         - "Repair the failed DNS layer before changing application retries."
 
   - id: service_endpoint_failure
-    question: "Does the Service select no ready backends?"
+    <<: *cluster_network
+    probes: [{<<: *probe_cluster_network, id: k8s_troubleshooting:service_endpoint_failure:p01}]
+    question: "Does the requested Service select zero ready endpoints at the incident timestamp, and why are its pods unready? Healthy Services expose endpoints matching their selector. If endpoints are ready, inspect DNS, NetworkPolicy, route, port, or application protocol rather than blaming selection."
     verify: "Compare Service selectors, EndpointSlice addresses, and readiness of the selected pods."
     interpretation: "Service discovery can work while the Service has zero usable endpoints."
     match:
@@ -856,7 +1229,9 @@ nodes:
         - "Retest the Service from the affected namespace after endpoints become ready."
 
   - id: traffic_policy_failure
-    question: "Does traffic fail after DNS and endpoints are healthy?"
+    <<: *cluster_network
+    probes: [{<<: *probe_cluster_network, id: k8s_troubleshooting:traffic_policy_failure:p01}]
+    question: "After DNS resolves and ready endpoints exist, does traffic still fail for the same source pod, destination, port, and time window? Healthy peers complete that exact path. Next inspect NetworkPolicy, route, MTU, TLS, or application listener evidence rather than inferring from a generic connection timeout."
     verify: "Test the target IP/port from both sides and inspect NetworkPolicy, CNI dataplane, kube-proxy, and MTU only for the failed hop."
     interpretation: "A timeout suggests a dropped path; refusal usually means the destination is reachable but not accepting the port."
     match:
@@ -873,7 +1248,8 @@ nodes:
         - "Inspect the CNI/kube-proxy path only when policy and application listener state do not explain it."
 
   - id: workload_runtime_failure
-    question: "Did application code fail after the container became Running?"
+    <<: *workload_runtime
+    question: "Did the container reach Running and then emit the first traceback, signal, CUDA OOM, or application exit? Healthy process logs remain stable after startup. Use previous logs from the first failing replica; if a kubelet/image/mount event came first, return to the startup path."
     verify: "Find the first error by timestamp across application logs, dependency errors, deployment revision, and resource signals."
     interpretation: "A running container with an application exception is not automatically a Kubernetes or node fault."
     avoid: "Do not raise resource limits or roll back blindly until the first error and recent change are correlated."
@@ -888,6 +1264,8 @@ nodes:
         expected_result_shape: "timestamped application exception or dependency error lines"
         supports_when: ["a scoped runtime exception is the earliest failure signal"]
         refutes_when: ["a Kubernetes, node, or dependency event precedes the application error"]
+        support_signal_any: ["Traceback (most recent call last)", "Segmentation fault", "CUDA out of memory"]
+        refute_signal_any: ["FailedMount", "FailedScheduling", "ImagePullBackOff"]
         source_group: workload_logs
     match:
       any: [traceback, "panic:", "segmentation fault", importerror, "permission denied", "exit code 1"]
@@ -903,7 +1281,8 @@ nodes:
         - "Fix or roll back the evidence-backed application/configuration change, then verify a stable runtime window."
 
   - id: rollout_or_lifecycle
-    question: "Is the observed disruption explained by an in-progress rollout or upgrade?"
+    <<: *lifecycle
+    question: "Did a deployment, DaemonSet, Helm, scheduler, or platform revision begin before the scoped symptom and match its blast radius? Healthy rollouts progress within their availability budget. If failure persists after the revision settles or affects unrelated targets, follow the typed workload or infrastructure evidence instead."
     verify: "Compare the alert start time with Deployment/DaemonSet/Helm revision changes and rollout completion status."
     interpretation: "Expected replacement churn during a healthy rollout is different from a rollout that is stuck because a new pod cannot become ready."
     avoid: "Do not call a transient rollout a node or scheduler incident without a persistent failed condition."
@@ -917,6 +1296,8 @@ nodes:
         expected_result_shape: "namespace Deployment generations and available/updated replica status"
         supports_when: ["a generation change and unavailable replacement replicas align with the alert"]
         refutes_when: ["no rollout changed near the alert or all replacements are available"]
+        support_signal_any: ["ProgressDeadlineExceeded", "ReplicaSetUpdated"]
+        refute_signal_any: ["Available=True"]
         source_group: kubernetes_api
     match:
       any: [rollout, rollingupdate, "helm upgrade", "revision change", "container creating"]
@@ -932,7 +1313,7 @@ nodes:
         - "Treat it as expected lifecycle behavior only after availability and completion are verified."
 
   - id: runai_control_plane_failure
-    question: "Is a shared NVIDIA Run:ai control-plane component failing reconciliation?"
+    question: "Did a shared Run:ai controller, backend, or cluster-sync component log the first reconcile/dependency failure for the incident? Healthy reconciliation converges the same resource without retry storms. If no controller-side error precedes the pod symptom, continue with Kubernetes or workload evidence."
     verify: "Scope whether the same failure affects multiple workloads or clusters, then follow the named component's dependency chain before inspecting individual pods."
     interpretation: "Run:ai backend and cluster-sync failures sit above workload scheduling and can create stale or inconsistent workload state."
     avoid: "Do not edit generated workload objects until the owning controller and backend state agree."
@@ -958,7 +1339,9 @@ nodes:
         next: runai_backend_failure
 
   - id: runai_cluster_sync_failure
-    question: "Can cluster-sync reconcile desired and observed cluster state?"
+    <<: *runai_control_plane
+    probes: [{<<: *probe_runai_control_plane, id: k8s_troubleshooting:runai_cluster_sync_failure:p01}]
+    question: "Did cluster-sync fail to reconcile the affected desired state with a typed API, backend, authorization, or dependency error? Healthy sync converges and records success. If it succeeds or the first failure is API server-side, route to Kubernetes control plane or identity instead."
     verify: "Correlate cluster-sync logs, connectivity/authentication to the control plane, and the last successfully synchronized resource version."
     interpretation: "Stale UI/workload state can be a synchronization failure even when Kubernetes objects continue running."
     match:
@@ -975,7 +1358,9 @@ nodes:
         - "Recover synchronization, then confirm the UI and Kubernetes object converge."
 
   - id: runai_backend_failure
-    question: "Is the Run:ai backend or its database dependency unavailable?"
+    <<: *runai_control_plane
+    probes: [{<<: *probe_runai_control_plane, id: k8s_troubleshooting:runai_backend_failure:p01}]
+    question: "Did Run:ai backend requests fail because the service or its database dependency was unavailable before workload state became stale? Healthy backend calls complete and controllers converge. If the response is Unauthorized or API-server failure, investigate identity or Kubernetes control plane first."
     verify: "Check backend readiness, request error rates, database connectivity/latency, and whether failures span independent clusters."
     interpretation: "A multi-cluster or API-wide failure points to shared backend state rather than a single Kubernetes cluster."
     match:
@@ -992,7 +1377,7 @@ nodes:
         - "Verify recovery from both the backend API and one affected cluster."
 
   - id: gpu_stack_failure
-    question: "Which layer of the NVIDIA GPU software/hardware stack failed first?"
+    question: "Which NVIDIA layer emitted the first typed signal on the affected node: XID, driver, runtime handler, device plugin, fabric manager, or Operator reconciliation? Healthy nodes advertise GPUs and initialize all operands. Follow the first node-scoped signal, not a downstream CUDA or scheduling symptom."
     verify: "Compare host `nvidia-smi`, allocatable `nvidia.com/gpu`, device-plugin logs, toolkit runtime handler, validator state, and kernel XID timestamps on the same node."
     interpretation: "Driver, runtime, device plugin, fabric initialization, and physical GPU faults produce different Kubernetes symptoms."
     avoid: "Do not restart every GPU Operator operand; preserve XID and driver evidence and isolate the failing layer first."
@@ -1032,7 +1417,8 @@ nodes:
         next: gpu_operator_reconciliation_failure
 
   - id: gpu_xid_failure
-    question: "Does a kernel XID identify the first GPU fault?"
+    <<: *gpu_hardware
+    question: "Did the affected node record a kernel NVRM XID before the workload's CUDA, scheduling, or device-plugin failure? Healthy GPU nodes have no incident-era XID. If no matching node XID exists, inspect runtime, fabric, application, or pressure evidence instead."
     verify: "Capture the first XID code, GPU UUID/PCI address, node, timestamp, preceding XIDs, and whether the device plugin marked that GPU unhealthy."
     interpretation: "The first XID in the chain is usually more causal than later CUDA/NCCL failures in every rank."
     avoid: "Do not reset or reboot before collecting dmesg/NVRM, device-plugin, DCGM, and topology evidence."
@@ -1046,6 +1432,7 @@ nodes:
         supports_when: ["the first XID precedes CUDA or NCCL symptoms"]
         refutes_when: ["no XID is present in the scoped log window and a different failure precedes it"]
         support_signal_any: ["NVRM", "Xid", "fallen off the bus", "GPU is lost"]
+        refute_signal_any: ["NVIDIA driver initialized"]
         source_group: loki
     match:
       any: ["nvrm: xid", xidcriticalerror, "fallen off the bus", "gpu is lost"]
@@ -1063,7 +1450,9 @@ nodes:
         - "Run the code-specific reset, hardware isolation, or support workflow after evidence capture."
 
   - id: gpu_runtime_handler_failure
-    question: "Is the NVIDIA container runtime handler missing from the active CRI configuration?"
+    <<: *gpu_hardware
+    probes: [{<<: *probe_gpu_hardware, id: k8s_troubleshooting:gpu_runtime_handler_failure:p01}]
+    question: "Did the target node's active CRI configuration lack or reject the NVIDIA runtime handler before container creation? Healthy GPU nodes accept the configured handler and create the container. If the handler works, investigate image, driver/device plugin, or workload runtime evidence next."
     verify: "Check toolkit daemonset logs and the active containerd/CRI-O configuration for the `nvidia` runtime handler on the affected node."
     interpretation: "The GPU and driver may be healthy while Kubernetes cannot create a GPU container sandbox."
     match:
@@ -1082,7 +1471,8 @@ nodes:
         - "Restart only the affected runtime/toolkit path and validate with one GPU pod."
 
   - id: gpu_device_plugin_failure
-    question: "Did Kubernetes stop advertising GPUs that the host still sees?"
+    <<: *gpu_hardware
+    question: "Does the host/driver still expose GPUs while Kubernetes allocatable GPU resources disappear or the device plugin fails on this node? Healthy node inventory and Kubernetes allocatable count agree. If both are absent, investigate driver/hardware; if both remain present, return to scheduling or workload evidence."
     verify: "Compare host `nvidia-smi -L`, node capacity/allocatable, and the device-plugin pod/log on that exact node."
     interpretation: "Host-visible GPUs plus zero allocatable GPUs isolates the failure above the driver and at device registration/health."
     probes:
@@ -1095,6 +1485,8 @@ nodes:
         expected_result_shape: "target node capacity and allocatable nvidia.com/gpu fields"
         supports_when: ["capacity/allocatable GPU fields are absent or zero on the affected node"]
         refutes_when: ["the node advertises expected allocatable GPUs during the incident"]
+        support_signal_any: ["nvidia.com/gpu: 0", "XidCriticalError"]
+        refute_signal_any: ["nvidia.com/gpu"]
         source_group: kubernetes_api
     match:
       any: ["nvidia.com/gpu: 0", "no devices found", nvidia-device-plugin]
@@ -1111,7 +1503,9 @@ nodes:
         - "Restart the node's device-plugin pod only after fixing its driver/runtime dependency."
 
   - id: gpu_driver_failure
-    question: "Is the loaded NVIDIA kernel driver incompatible, absent, or unhealthy?"
+    <<: *gpu_hardware
+    probes: [{<<: *probe_gpu_hardware, id: k8s_troubleshooting:gpu_driver_failure:p01}]
+    question: "Did the target node show an absent, incompatible, or unhealthy loaded NVIDIA driver before GPU workload failure? Healthy driver and userspace versions initialize together. If the driver is healthy, continue to runtime handler, device plugin, fabric, or application evidence."
     verify: "Compare loaded kernel module, userspace NVML library, driver daemonset state, kernel version, and the last driver rollout/reboot."
     interpretation: "An NVML mismatch often means userspace changed while the old kernel module stayed loaded."
     match:
@@ -1128,7 +1522,9 @@ nodes:
         - "Verify `nvidia-smi` and a CUDA validator before uncordoning."
 
   - id: gpu_fabric_initialization_failure
-    question: "Is NVSwitch/NVLink fabric initialization incomplete?"
+    <<: *network_fabric
+    probes: [{<<: *probe_network_fabric, id: k8s_troubleshooting:gpu_fabric_initialization_failure:p01}]
+    question: "Did fabric manager, NVSwitch, or NVLink initialization fail on the affected node before multi-GPU work began? Healthy fabric initialization completes before collective traffic. If it is healthy, inspect NCCL rank/bootstrap/transport evidence or a local GPU/runtime fault."
     verify: "Read `nvidia-smi -q` Fabric State, Fabric Manager status/logs, and validator output on the same HGX/DGX node."
     interpretation: "A healthy driver is insufficient on NVSwitch systems until Fabric Manager configures the memory fabric."
     match:
@@ -1145,7 +1541,8 @@ nodes:
         - "Retest GPU peer communication before returning the node to distributed jobs."
 
   - id: gpu_operator_reconciliation_failure
-    question: "Which GPU Operator operand or validation stage has not converged?"
+    <<: *gpu_hardware
+    question: "Which GPU Operator operand or validation stage failed to converge on the affected node, and did that failure predate the workload? Healthy operands report ready after a rollout settles. If the component is healthy or changed later, avoid attributing the incident to the Operator."
     verify: "Inspect ClusterPolicy state and find the first non-ready operand in dependency order: driver, toolkit, device plugin, GFD, DCGM, validators."
     interpretation: "Later operands often fail because an earlier node prerequisite did not become healthy."
     probes:
@@ -1158,6 +1555,8 @@ nodes:
         expected_result_shape: "GPU Operator operand pod phase and readiness in the scoped namespace"
         supports_when: ["a driver, toolkit, device-plugin, GFD, DCGM, or validator pod is not Ready first"]
         refutes_when: ["all scoped GPU Operator operands are Ready and a node/workload failure predates them"]
+        support_signal_any: ["CrashLoopBackOff", "ImagePullBackOff"]
+        refute_signal_any: ["Ready=True"]
         source_group: kubernetes_api
     match:
       any: [clusterpolicy, "operator validator", "driver-validation", "cuda-validation"]
@@ -1173,7 +1572,7 @@ nodes:
         - "Route the exact operand error back through driver, runtime, device-plugin, or fabric branches."
 
   - id: distributed_training_failure
-    question: "Is the distributed failure caused by a peer, bootstrap, memory registration, or physical fabric path?"
+    question: "Which rank or layer fails first: application peer exit, bootstrap interface, memory registration, or IB/RDMA/NVLink transport? Healthy ranks establish communication before collectives begin. Preserve the first rank's timestamp; peer timeout messages elsewhere are downstream until proven otherwise."
     verify: "Align per-rank logs by timestamp and identify the first rank/error before reviewing the later all-rank timeout storm."
     interpretation: "NCCL timeout is a distributed symptom; one application/GPU failure can make every healthy peer report a network timeout."
     avoid: "Do not tune NCCL environment variables before low-level GPU, interface, memory, and fabric checks pass."
@@ -1207,7 +1606,8 @@ nodes:
         next: nccl_unresolved_collective_failure
 
   - id: distributed_peer_failure
-    question: "Did one rank exit before the collective timed out elsewhere?"
+    <<: *workload_runtime
+    question: "Did one rank emit a traceback, OOM, signal, or nonzero exit before other ranks reported a collective timeout? Healthy ranks remain alive through the same collective. If no earlier rank exit exists, continue with bootstrap, registration, and fabric transport evidence."
     verify: "Find the minimum failure timestamp across ranks and inspect that rank's application, CUDA, OOM, and XID evidence."
     interpretation: "The surviving ranks are victims waiting at a collective, not independent root causes."
     probes:
@@ -1221,6 +1621,8 @@ nodes:
         expected_result_shape: "affected rank pod termination state, exit code, OOM, and node assignment"
         supports_when: ["the rank pod terminated or failed before the collective timeout"]
         refutes_when: ["the rank remained healthy until after the distributed timeout"]
+        support_signal_any: ["OOMKilled", "Error", "ExitCode"]
+        refute_signal_any: ["Running"]
         source_group: kubernetes_api
     match:
       any: ["one rank", "first rank", "rank crashed", "rank exited", "peer failure"]
@@ -1236,7 +1638,8 @@ nodes:
         - "Fix the initiating rank failure before changing fabric-wide NCCL settings."
 
   - id: nccl_memory_registration_failure
-    question: "Did NCCL fail to allocate shared or pinned memory resources?"
+    <<: *network_fabric
+    question: "Did the first NCCL error name shared-memory or pinned-memory registration/allocation failure before transport retries? Healthy ranks allocate required memory and proceed to connection setup. If an earlier application OOM or node pressure event exists, treat that as the primary cause instead."
     verify: "Check the exact ibv/shm error, pod `/dev/shm` size, memlock limit, and whether the same node pair passes outside the workload."
     interpretation: "Memory registration failure is a host/container limit issue even though NCCL reports it through the network transport."
     probes:
@@ -1250,6 +1653,8 @@ nodes:
         expected_result_shape: "pod memory limits, shared-memory mount, and termination state"
         supports_when: ["the pod spec or state shows a memory/shared-memory constraint consistent with the ibv error"]
         refutes_when: ["no memory constraint exists and a link/XID error occurs first"]
+        support_signal_any: ["ibv_reg_mr failed", "ibv_create_qp failed"]
+        refute_signal_any: ["NVRM: Xid", "NCCL_SYSTEM_ERROR"]
         source_group: kubernetes_api
     match:
       any: ["ibv_reg_mr failed", "ibv_create_qp failed", memlock, "/dev/shm", "shared memory"]
@@ -1265,7 +1670,9 @@ nodes:
         - "Re-run a focused NCCL test on the same nodes before the full job."
 
   - id: nccl_fabric_transport_failure
-    question: "Does a low-level IB/RoCE link or transport counter prove a fabric failure?"
+    <<: *network_fabric
+    probes: [{<<: *probe_network_fabric, id: k8s_troubleshooting:nccl_fabric_transport_failure:p01}]
+    question: "Does the affected node or rank show a typed IB/RoCE/NVLink transport failure before the collective timeout, rather than only a timeout string? Healthy links establish queues and complete transfers. If no low-level signal exists, return to the first rank exit or bootstrap failure."
     verify: "Check link state/rate, point-to-point bandwidth and latency, and counters for the exact rails and node pair used by the failed ranks."
     interpretation: "Growing retry/error counters or a degraded link localizes a collective failure below Kubernetes networking."
     match:
@@ -1282,7 +1689,8 @@ nodes:
         - "Isolate the node/rail and repair link, GID, lossless-network, or cabling evidence found."
 
   - id: nccl_bootstrap_failure
-    question: "Can NCCL ranks discover and connect through the selected bootstrap interface?"
+    <<: *network_fabric
+    question: "Can every rank resolve and connect through the selected bootstrap interface before the collective begins? Healthy ranks agree on reachable addresses and ports. If bootstrap succeeds, investigate transport/registration; if DNS or pod networking fails first, follow the cluster-network branch."
     verify: "Capture NCCL INIT/BOOTSTRAP/NET logs, chosen interface, DNS/IP reachability, and allowed TCP port range between ranks."
     interpretation: "Bootstrap fails before high-speed collectives and may use a different network path from RDMA data traffic."
     probes:
@@ -1294,6 +1702,8 @@ nodes:
         expected_result_shape: "timestamped NCCL INIT/BOOTSTRAP/NET lines"
         supports_when: ["bootstrap/interface selection or connection failure precedes collective setup"]
         refutes_when: ["bootstrap completes and a later RDMA or peer failure appears first"]
+        support_signal_any: ["NCCL WARN Bootstrap", "NCCL WARN NET/Socket"]
+        refute_signal_any: ["Bootstrap : Using"]
         source_group: loki
     match:
       any: [bootstrap, "socket ifname", "failed to initialize any net plugin", "connection timed out"]
@@ -1309,7 +1719,9 @@ nodes:
         - "Validate communicator initialization on the same node set."
 
   - id: nccl_unresolved_collective_failure
-    question: "Is a generic collective timeout still missing a first causal signal?"
+    <<: *insufficient
+    probes: [{<<: *probe_insufficient, id: k8s_troubleshooting:nccl_unresolved_collective_failure:p01}]
+    question: "Does the available collective timeout still lack a first rank, bootstrap, memory, link, or application failure signal? Healthy diagnosis identifies an earlier typed event. Preserve rank logs and node evidence; do not label the fabric until a discriminator is present."
     verify: "Collect timestamped logs for every rank plus node/GPU events and run a small nccl-tests reproduction on the same topology."
     interpretation: "A generic NCCL timeout alone cannot distinguish application, GPU, host limit, bootstrap, or fabric causes."
     match:
@@ -1326,7 +1738,7 @@ nodes:
         - "Do not promote a fabric root cause until a low-level test or counter supports it."
 
   - id: runai_scheduling_failure
-    question: "Is this Run:ai quota/fairness behavior, gang placement, or a binding failure?"
+    question: "Did the Run:ai scheduler first report quota/fair-share, preemption/reclaim, gang placement, or binder handoff behavior for this workload? Healthy allocation records a successful policy decision and bind. Use the exact scheduler event; default-scheduler predicates belong to the Kubernetes scheduling branch."
     verify: "Identify schedulerName, pod group, project/department node-pool queue, deserved versus over-quota use, priority/preemptibility, and scheduler decision logs."
     interpretation: "Run:ai scheduling policy and kube-scheduler predicates are separate control paths and require different evidence."
     avoid: "Do not call expected reclaim/preemption a platform outage."
@@ -1358,7 +1770,9 @@ nodes:
         next: runai_quota_constraint
 
   - id: runai_reclaim_or_preemption
-    question: "Was the workload preempted within a project or reclaimed across queues?"
+    <<: *runai_scheduling
+    probes: [{<<: *probe_runai_scheduling, id: k8s_troubleshooting:runai_reclaim_or_preemption:p01}]
+    question: "Did Run:ai record preemption or reclaim for this workload before its pods were terminated or rescheduled, and which policy/queue caused it? Healthy workload history has no matching policy action. If no action exists, inspect kubelet eviction, normal rollout, or scheduling evidence first."
     verify: "Compare victim and preemptor project/department, node pool, priority, preemptibility, and deserved/over-quota allocation at the decision timestamp."
     interpretation: "Priority preemption and fairness-based reclaim are expected but distinct scheduler decisions."
     match:
@@ -1375,7 +1789,9 @@ nodes:
         - "Adjust ranks, quota, or over-quota weights only after reviewing multi-tenant impact."
 
   - id: runai_gang_scheduling
-    question: "Can every required pod/sub-group be placed together?"
+    <<: *runai_scheduling
+    probes: [{<<: *probe_runai_scheduling, id: k8s_troubleshooting:runai_gang_scheduling:p01}]
+    question: "Can every required pod or sub-group satisfy gang placement simultaneously under the configured Run:ai policy? Healthy gang scheduling binds the complete group together. If individual pods fail a Kubernetes predicate first, follow capacity, taint, affinity, topology, or PVC evidence instead."
     verify: "Check pod-group hierarchy, min-members, aggregate requests, topology constraints, and the first member that cannot be placed."
     interpretation: "One impossible member keeps the entire distributed workload Pending by design."
     match:
@@ -1392,7 +1808,9 @@ nodes:
         - "Fix that predicate/capacity constraint; do not submit members independently."
 
   - id: runai_binding_failure
-    question: "Did placement succeed but the Run:ai binder fail the handoff?"
+    <<: *runai_scheduling
+    probes: [{<<: *probe_runai_scheduling, id: k8s_troubleshooting:runai_binding_failure:p01}]
+    question: "Did placement succeed but the Run:ai binder fail to hand off the chosen node to the workload, with a typed binder/controller event? Healthy placement ends in a bound pod. If binding never began, investigate quota/gang policy or default scheduler predicates first."
     verify: "Correlate scheduler decision, binder logs, pod binding event, and GPU-fraction/toolkit state on the selected node."
     interpretation: "A valid placement decision can still fail during resource reservation and Kubernetes binding."
     match:
@@ -1409,7 +1827,8 @@ nodes:
         - "Retry after the reservation/binding state is reconciled."
 
   - id: runai_quota_constraint
-    question: "Which Run:ai quota or queue limit prevents allocation?"
+    <<: *runai_scheduling
+    question: "Which Run:ai project, queue, fair-share, or resource limit blocks this allocation, and was it exhausted at the incident time? Healthy policy has headroom or an explicit successful allocation. If default-scheduler or Kubernetes ResourceQuota emitted the first event, use that separate path."
     verify: "Evaluate project and department deserved quota, over-quota eligibility, ranks/weights, resource limit, physical capacity, and over-subscription per node pool."
     interpretation: "Unused cluster GPUs do not guarantee this queue is entitled to or can place them."
     probes:
@@ -1422,6 +1841,8 @@ nodes:
         expected_result_shape: "target Run:ai project quota and allocation status"
         supports_when: ["project status shows the quota or entitlement dimension cited by the scheduler"]
         refutes_when: ["project quota has headroom and another predicate blocked placement first"]
+        support_signal_any: ["OverQuota", "PreemptLowerPriority"]
+        refute_signal_any: ["Allocated"]
         source_group: kubernetes_api
     match:
       any: ["over-quota", "over quota", "deserved quota", "max gpu device allocation", "project quota"]
@@ -1437,7 +1858,7 @@ nodes:
         - "Change quota/limit only with the intended tenant fairness impact documented."
 
   - id: authorization_failure
-    question: "Is access blocked by Kubernetes RBAC, platform identity, or an expired credential?"
+    question: "Did the exact request fail as Unauthorized/authentication or Forbidden/RBAC, and which subject, credential, verb, and resource were involved? Healthy scoped calls authenticate and authorize. Capture the response class first; API unavailability or webhook errors point to the control-plane branch instead."
     verify: "Identify the issuer, authenticated subject, exact API/resource/verb, namespace, and credential/certificate expiry from the rejection."
     interpretation: "Authentication establishes identity; authorization decides permission. Their remedies are different."
     avoid: "Do not grant cluster-admin to diagnose a missing narrow permission."
@@ -1464,7 +1885,9 @@ nodes:
         next: identity_or_credential_failure
 
   - id: kubernetes_rbac_failure
-    question: "Does Kubernetes RBAC deny a specific subject, verb, and resource?"
+    <<: *platform_auth
+    probes: [{<<: *probe_platform_auth, id: k8s_troubleshooting:kubernetes_rbac_failure:p01}]
+    question: "Does a Kubernetes API response name Forbidden for the same authenticated subject, verb, resource, and namespace that failed? Healthy RBAC allows that exact scoped operation. If credentials are invalid or the API is unavailable before authorization, route to identity or control plane instead."
     verify: "Use the rejection tuple and `kubectl auth can-i` impersonation for the exact service account/user and namespace."
     interpretation: "A precise Forbidden response proves the API is reachable and identity is known, but permission is absent."
     match:
@@ -1481,7 +1904,9 @@ nodes:
         - "Re-run `auth can-i` and the original operation after the least-privilege change."
 
   - id: identity_or_credential_failure
-    question: "Is platform identity or credential validation failing before authorization?"
+    <<: *platform_auth
+    probes: [{<<: *probe_platform_auth, id: k8s_troubleshooting:identity_or_credential_failure:p01}]
+    question: "Did token, OIDC, SAML, certificate, audience, issuer, or clock validation fail before RBAC evaluation? Healthy credentials validate for the requested endpoint and time. If a valid identity is then Forbidden, investigate least-privilege RBAC rather than rotating credentials blindly."
     verify: "Check issuer/discovery metadata, audience, clock, expiry/not-before, SAML attributes, and the component validating the token/certificate."
     interpretation: "A token can be structurally valid but rejected because issuer, audience, time, or required identity claims differ."
     match:
@@ -1498,7 +1923,7 @@ nodes:
         - "Rotate or correct the credential/configuration, then verify one scoped login/API request."
 
   - id: observability_failure
-    question: "Is the monitored state wrong, stale, or missing while the workload remains healthy?"
+    question: "Does direct scoped Kubernetes/GPU state remain healthy while the alert's raw or derived metric is stale, missing, or contradictory at the same timestamp? Healthy telemetry matches live target state. If direct state is unhealthy too, investigate the workload or node instead of the dashboard."
     verify: "Compare raw source metrics and Kubernetes state with exporter, scrape target, aggregation, query, and dashboard values at the same timestamp."
     interpretation: "A broken measurement path can produce an incident without a workload failure."
     avoid: "Do not restart a healthy workload to repair a dashboard or exporter."
@@ -1523,7 +1948,8 @@ nodes:
         next: observed_state_mismatch
 
   - id: metrics_pipeline_failure
-    question: "Which hop of the metrics pipeline stopped carrying fresh samples?"
+    <<: *observability
+    question: "Which hop first stopped carrying fresh samples: exporter, scrape target, remote write, receiver, storage, query, or dashboard? Healthy samples advance end-to-end for the alert target. Compare timestamps in sequence and remediate the first stale hop, not the last empty query."
     verify: "Walk source exporter → scrape target → remote-write/receiver → query → dashboard and compare last-sample timestamps."
     interpretation: "The first stale hop owns the observability failure; later empty queries are downstream symptoms."
     probes:
@@ -1535,6 +1961,8 @@ nodes:
         expected_result_shape: "raw target pod phase series and sample timestamp"
         supports_when: ["the raw series is absent or stale despite an existing target pod"]
         refutes_when: ["the raw series is current and only a derived dashboard query is wrong"]
+        support_signal_any: ["stale", "absent"]
+        refute_signal_any: ["Running"]
         source_group: prometheus
     match:
       any: ["thanos-receive", "target down", "scrape failed", "remote write", "metrics missing"]
@@ -1550,7 +1978,8 @@ nodes:
         - "Verify data freshness end-to-end after recovery."
 
   - id: observed_state_mismatch
-    question: "Does the dashboard disagree with direct Kubernetes/GPU state?"
+    <<: *observability
+    question: "Does the exact dashboard value/query disagree with a direct Kubernetes or GPU read for the same target and incident time? Healthy derived values match live state within expected scrape delay. If they agree, return to the real workload/node failure rather than opening an observability incident."
     verify: "Compare the exact dashboard query/window with live object state and raw exporter series, including labels and staleness."
     interpretation: "A healthy direct state plus stale/missing derived series is an accuracy incident, not resource loss."
     probes:
@@ -1564,6 +1993,8 @@ nodes:
         expected_result_shape: "live target pod phase and readiness state"
         supports_when: ["direct Kubernetes state disagrees with the alert/dashboard value"]
         refutes_when: ["direct Kubernetes state matches the reported unhealthy value"]
+        support_signal_any: ["Running", "Ready=True"]
+        refute_signal_any: ["Failed", "NotReady"]
         source_group: kubernetes_api
     match:
       any: ["dashboard shows", "stale metrics", "gpu number is 0", "dcgm_fi_dev"]
@@ -1579,7 +2010,8 @@ nodes:
         - "Correct the measurement path and close the alert without disrupting healthy workloads."
 
   - id: insufficient_k8s_evidence
-    question: "Is there enough evidence to choose a Kubernetes failure layer?"
+    <<: *insufficient
+    question: "Is there an incident-era, target-verified event, state transition, previous log, or change that identifies the first failure layer? Healthy diagnosis can name one. If evidence remains generic or unscoped, collect the minimum discriminator and keep the result insufficient rather than promoting keywords or probe text."
     verify: "Collect pod describe/events, current and previous logs, node name/conditions, and the nearest recent change before selecting an owner."
     interpretation: "An unfamiliar or sparse alert is not proof of a Kubernetes root cause."
     probes:
@@ -1593,6 +2025,8 @@ nodes:
         expected_result_shape: "target pod status, last state, and chronological Events"
         supports_when: ["a first failing control point appears in the pod status or Events"]
         refutes_when: ["the target does not exist or no incident-era signal is available"]
+        support_signal_any: ["FailedScheduling", "OOMKilled", "ImagePullBackOff", "FailedMount"]
+        refute_signal_any: ["Unknown"]
         source_group: kubernetes_api
     match:
       always: true
@@ -1608,7 +2042,8 @@ nodes:
         - "Re-enter the decision tree from the first observed failing control point."
 
   - id: pod_network_failure
-    question: "Did sandbox creation, CNI, or DNS fail?"
+    <<: *cluster_network
+    question: "Did the affected pod first fail sandbox creation, CNI setup, or DNS resolution before application startup? Healthy pods create a sandbox and resolve required names. Use the typed event to choose CNI, DNS, endpoints, or policy; if sandbox succeeds, do not blame CNI for a later application timeout."
     probes:
       - id: k8s_troubleshooting:pod_network_failure:p01
         tool: k8s_describe
@@ -1620,6 +2055,8 @@ nodes:
         expected_result_shape: "pod sandbox/CNI event reason and affected node"
         supports_when: ["a sandbox or CNI event occurs before the container starts"]
         refutes_when: ["the pod sandbox was created and a later DNS/service/application signal failed first"]
+        support_signal_any: ["FailedCreatePodSandBox", "NetworkPluginNotReady"]
+        refute_signal_any: ["PodReadyToStartContainers=True"]
         source_group: kubernetes_api
     match:
       any:
@@ -1639,3 +2076,76 @@ nodes:
         - "Check the CNI daemonset on the target node and recent sandbox events."
         - "If DNS is implicated, check CoreDNS pods and resolve kubernetes.default from a pod."
         - "Inspect NetworkPolicy, IPAM exhaustion, MTU, or kube-proxy only if the event points there."
+
+  - id: storage_backend_failure
+    question: "Does the first storage signal name a backend server or filesystem rather than a Kubernetes object transition? A healthy backend permits the affected node to use an already valid claim; stale handles, access denial, read-only filesystems, and I/O latency must be timestamped before pod retries. Follow the exact backend signature next."
+    verify: "Read the PVC/PV state alongside the exact CSI or workload error. Bound/attached objects do not clear NFS, Ceph, or filesystem health; distinguish object lifecycle events from server-side responses."
+    interpretation: "This router separates k8s_storage_error (PVC/PV/CSI object control path) from storage_backend_error (NFS/Ceph/filesystem server path)."
+    avoid: "Do not turn a generic mount retry or a Bound PVC into proof of backend health without the affected node's exact error."
+    match:
+      any: ["stale file handle", "read-only file system", "nfs server", cephfs, "ceph health", "input/output error", "mount access denied", "storage latency", provisioningfailed]
+    branches:
+      - match:
+          any: ["stale file handle", "nfs server not responding", "nfs server"]
+        next: backend_nfs_stale_handle
+      - match:
+          any: ["mount access denied", "access denied by server", "permission denied"]
+        next: backend_mount_access_denied
+      - match:
+          any: [provisioningfailed, "provisioner failed", "create volume failed", "ceph provision"]
+        next: backend_provisioner_failure
+      - match:
+          any: ["input/output error", "read-only file system", "storage latency", "ceph health"]
+        next: backend_latency_or_filesystem
+
+  - id: backend_nfs_stale_handle
+    <<: *storage_backend
+    probes: [{<<: *probe_storage_backend, id: k8s_troubleshooting:backend_nfs_stale_handle:p01}]
+    question: "Did the affected node receive an NFS stale-handle or server-not-responding error before the pod failed? Healthy mounts keep a valid file handle across the incident; if the exact NFS error is present, inspect export/server state, otherwise return to CSI/PVC object transitions."
+    match:
+      any: ["stale file handle", "nfs server not responding", "nfs server"]
+    conclusion:
+      family: storage_backend_error
+      summary: "The backing NFS server or export invalidated the affected node's file handle."
+      confidence: "high only when the incident-era mount/CSI/workload error names a stale handle or NFS server response"
+      disconfirm: ["PVC/PV object failure predates any NFS error, or the affected node has no matching NFS/server signature."]
+      next_steps: ["Capture the export, server, and affected-node error timestamps.", "Restore export/server availability or remount only under the storage recovery procedure.", "Confirm I/O from the affected node before retrying the workload."]
+
+  - id: backend_mount_access_denied
+    <<: *storage_backend
+    probes: [{<<: *probe_storage_backend, id: k8s_troubleshooting:backend_mount_access_denied:p01}]
+    question: "Did the backend deny mount access for the affected node, identity, export, or path? Healthy backend policy admits the exact node/path used by the PV; a server-side access-denied response requires export or credential investigation, while a Kubernetes admission denial follows the auth path instead."
+    match:
+      any: ["mount access denied", "access denied by server", "permission denied"]
+    conclusion:
+      family: storage_backend_error
+      summary: "The backing storage server denied the affected node or mount path."
+      confidence: "high only when CSI/kubelet/workload evidence records a backend mount access-denied response"
+      disconfirm: ["The denial is Kubernetes RBAC/admission, or no backend server response is present for the target mount."]
+      next_steps: ["Capture the exact server/export/path and client identity without exposing credentials.", "Correct the narrow backend export or credential policy.", "Verify the target node can access the intended path before restarting the workload."]
+
+  - id: backend_provisioner_failure
+    <<: *storage_backend
+    probes: [{<<: *probe_storage_backend, id: k8s_troubleshooting:backend_provisioner_failure:p01}]
+    question: "Did a PVC provisioner fail because its backing storage service rejected or could not create the requested volume? Healthy provisioner retries create a bound PV; inspect the provisioner error for NFS/Ceph/backend capacity or authorization before treating ProvisioningFailed as a Kubernetes object-only fault."
+    match:
+      any: [provisioningfailed, "provisioner failed", "create volume failed", "ceph provision"]
+    conclusion:
+      family: storage_backend_error
+      summary: "The PVC provisioner reached a backing-storage failure while creating the volume."
+      confidence: "high only when the provisioner event/log includes a backend server, capacity, authorization, or filesystem error"
+      disconfirm: ["The StorageClass/PVC configuration is invalid without a backend response, or binding succeeds before the incident."]
+      next_steps: ["Preserve the full provisioner error and StorageClass parameters.", "Check backing-store capacity, health, and provisioner credentials/server reachability.", "Retry provisioning only after the backend condition recovers."]
+
+  - id: backend_latency_or_filesystem
+    <<: *storage_backend
+    probes: [{<<: *probe_storage_backend, id: k8s_troubleshooting:backend_latency_or_filesystem:p01}]
+    question: "Did the backing store become read-only, return I/O errors, or exceed the incident's storage latency window for the affected path? Healthy storage completes the same operation on a peer; a backend signature must precede application timeout or mount retry before assigning server-side ownership."
+    match:
+      any: ["input/output error", "read-only file system", "storage latency", "ceph health"]
+    conclusion:
+      family: storage_backend_error
+      summary: "Backing-store filesystem health or latency prevents the target workload from using storage."
+      confidence: "high only when read-only, I/O, Ceph health, or latency evidence is scoped to the affected backend/path during the incident"
+      disconfirm: ["The backend is healthy for the same path and an earlier PVC, mount, network, or application signal explains the failure."]
+      next_steps: ["Capture backend health and latency for the affected pool/export/path.", "Resolve read-only, capacity, quorum, or latency condition through the storage owner.", "Verify bounded I/O on the target path before retrying the workload."]

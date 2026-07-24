@@ -91,6 +91,15 @@ def walk_tree(tree: dict[str, Any] | None, evidence_text: str) -> dict[str, Any]
             probes = node.get("probes")
             if isinstance(probes, list):
                 step["probes"] = [probe for probe in probes if isinstance(probe, dict)][:4]
+            authored_alternatives = node.get("alternatives")
+            if isinstance(authored_alternatives, list):
+                alternatives = [
+                    alternative
+                    for alternative in authored_alternatives
+                    if isinstance(alternative, dict)
+                ]
+                if alternatives:
+                    step["alternatives"] = alternatives[:3]
             steps.append(step)
             if not hits:
                 break
@@ -147,7 +156,7 @@ def walk_tree(tree: dict[str, Any] | None, evidence_text: str) -> dict[str, Any]
                     }
                 )
             if alternatives:
-                step["alternatives"] = alternatives
+                step["alternatives"] = [*step.get("alternatives", []), *alternatives]
             if not next_id or next_id not in nodes:
                 break
             node_id = next_id

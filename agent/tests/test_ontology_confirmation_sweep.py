@@ -210,3 +210,53 @@ def test_sweep_enumerates_the_closed_catalog() -> None:
     assert {case.family for case in CASES if case.kind == "signal"} == set(FAMILIES)
     assert {case.signal for case in CASES if case.kind == "xid"} == {f"NVRM: Xid {code}" for code in XID_CODES}
     assert all(f"symptom:{family}:{symptom['symptom']}" in labels for family, symptoms in FAILURE_MODES.items() for symptom in symptoms)
+
+
+def test_every_catalog_family_has_a_reachable_runbook_confirmation() -> None:
+    """Every ranked family needs an executable confirmation from the runbook entry."""
+    runbook = yaml.safe_load((ROOT / "knowledge/k8s_troubleshooting_tree.yaml").read_text())
+    nodes = {str(node["id"]): node for node in runbook["nodes"]}
+    reachable = {str(runbook["root"])}
+    pending = list(reachable)
+    while pending:
+        node = nodes[pending.pop()]
+        for branch in node.get("branches") or []:
+            next_id = str(branch.get("next") or "")
+            if next_id in nodes and next_id not in reachable:
+                reachable.add(next_id)
+                pending.append(next_id)
+    confirmed = {
+        str(nodes[node_id].get("conclusion", {}).get("family") or "")
+        for node_id in reachable
+    }
+    missing = sorted(set(FAMILIES) - confirmed)
+    assert not missing, f"unreachable diagnostic families: {', '.join(missing)}"
+
+
+def test_every_conclusion_has_executable_diagnostic_reasoning() -> None:
+    """Conclusion nodes must tell drill-down how to prove and disprove the diagnosis."""
+    runbook = yaml.safe_load((ROOT / "knowledge/k8s_troubleshooting_tree.yaml").read_text())
+    families = {entry["family"] for entry in FAMILY_ENTRIES}
+    allowed_tools = {"k8s_read", "k8s_describe", "k8s_logs", "logql_query", "promql_query"}
+    required_probe_fields = {
+        "tool", "arguments_template", "incident_time_window", "expected_result_shape",
+        "supports_when", "refutes_when", "support_signal_any", "refute_signal_any", "source_group",
+    }
+    conclusions = [node for node in runbook["nodes"] if node.get("conclusion")]
+    assert conclusions
+    for node in conclusions:
+        node_id = node["id"]
+        assert node.get("verify"), f"{node_id}: missing verify"
+        assert node.get("interpretation"), f"{node_id}: missing interpretation"
+        probes = node.get("probes") or []
+        assert probes, f"{node_id}: missing probe"
+        assert {probe.get("tool") for probe in probes} <= allowed_tools, f"{node_id}: unsupported probe tool"
+        assert all(required_probe_fields <= set(probe) for probe in probes), f"{node_id}: incomplete probe schema"
+        alternatives = node.get("alternatives") or []
+        assert len(alternatives) >= 2, f"{node_id}: fewer than two alternatives"
+        assert all(
+            alternative.get("family") in families
+            and alternative.get("reason")
+            and alternative.get("discriminator")
+            for alternative in alternatives
+        ), f"{node_id}: invalid alternative"
