@@ -1174,6 +1174,37 @@ def test_loki_negative_normal_and_recovery_lines_are_not_causal_support() -> Non
     assert (recent["polarity"], recent["coverage"]) == ("unknown", "partial")
 
 
+def test_loki_post_resolution_failure_line_is_not_causal_support() -> None:
+    target = replace(
+        make_target(),
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    collection_window = incident_time_range(target)
+    assert collection_window is not None
+
+    observation = loki._loki_query_observation(
+        {
+            "name": "error_logs",
+            "line_count": 1,
+            "stream_count": 1,
+            "stream_labels": [{"namespace": "runai-vision", "pod": "trainer-0"}],
+            "stream_labels_complete": True,
+            "sample_entries": [{
+                "timestamp": "2026-07-10T01:12:00Z",
+                "line": "error after recovery",
+                "labels": {"namespace": "runai-vision", "pod": "trainer-0"},
+            }],
+        },
+        target=target,
+        time_range=collection_window,
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert observation["affirmative_line_count"] == 0
+    assert observation["causal_window"]["end"] == "2026-07-10T01:10:00Z"
+
+
 def test_prometheus_positive_observation_exposes_actual_sample_window() -> None:
     time_range = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
     summary = prometheus._prometheus_value_summary(

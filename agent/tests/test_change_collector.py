@@ -773,6 +773,39 @@ async def test_change_query_uses_the_historical_incident_window(
 
 
 @pytest.mark.asyncio
+async def test_change_query_keeps_post_resolution_changes_out_of_causal_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, path, **_kwargs):
+        if path.endswith("/events"):
+            return JsonResponse(url="u", status_code=200, data={"items": [
+                {
+                    "type": "Warning",
+                    "reason": "RecoveryNoise",
+                    "lastTimestamp": "2026-07-13T21:49:00Z",
+                    "involvedObject": {"name": "trainer", "kind": "Pod"},
+                },
+            ]})
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-07-13T21:43:47Z",
+        resolved_at="2026-07-13T21:45:47Z",
+    )
+
+    query = await change_query(_Settings(), target, {"kind": "event", "lookback_seconds": 60})
+
+    observation = query["observation"]
+    assert observation["changes"][0]["reason"] == "RecoveryNoise"
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert "evidence_window" not in observation
+
+
+@pytest.mark.asyncio
 async def test_change_query_keeps_unrelated_namespace_history_as_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

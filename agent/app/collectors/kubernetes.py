@@ -728,6 +728,7 @@ async def _describe_events(
                 if _event_matches_uid(item, expected_uid)
             ]
             filtered = _events_in_time_range(matching, time_range)
+            filtered.sort(key=_event_sort_timestamp, reverse=True)
             return {"items": compact(filtered, limit=12) if filtered else []}
         except Exception as exc:  # noqa: BLE001 - direct API fallback is the behavior.
             mcp_note = mcp_fallback_warning(exc, source="Kubernetes")
@@ -770,6 +771,7 @@ async def _describe_events(
         and _event_matches_uid(item, expected_uid)
     ]
     filtered = _events_in_time_range(filtered, time_range)
+    filtered.sort(key=_event_sort_timestamp, reverse=True)
     return {
         "items": compact(filtered, limit=12) if filtered else [],
         **({"error": response.error} if response.error else {}),

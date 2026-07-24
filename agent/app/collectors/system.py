@@ -551,6 +551,7 @@ class SystemCollector:
             )
 
         limit = max(1, int(getattr(self._settings, "system_agent_max_nodes", 12)))
+        nodes.sort(key=lambda item: (not item[1], item[0]))
         selected_nodes = nodes[:limit]
         warnings = (
             [f"System agent node scan capped at {limit}; {len(nodes) - limit} nodes were skipped."]
