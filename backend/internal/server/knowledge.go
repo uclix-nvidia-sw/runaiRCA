@@ -84,8 +84,8 @@ type KnowledgeProbeBinding struct {
 }
 
 // KnowledgePackage is the immutable public runtime unit produced by approving
-// a candidate. Its lifecycle is active -> retired; there is deliberately no
-// create or update operation outside candidate approval.
+// or shadowing a candidate. Its lifecycle is shadow -> active -> retired; there
+// is deliberately no create or update operation outside candidate decisions.
 type KnowledgePackage struct {
 	PackageID         string                     `json:"package_id"`
 	CandidateID       string                     `json:"candidate_id"`
@@ -289,10 +289,7 @@ func knowledgeTraceV3(payload map[string]any) map[string]any {
 // raw tool output, and log excerpts are never knowledge-package data).
 func sanitizeTraceV3(trace map[string]any) map[string]any {
 	out := map[string]any{"schema_version": 3}
-	if selectedID := strings.TrimSpace(stringValue(trace["selected_hypothesis_id"])); selectedID != "" {
-		out["selected_hypothesis_id"] = selectedID
-	}
-	if hypotheses := sanitizeTraceObjects(trace["hypotheses"], []string{"hypothesis_id", "family", "mechanism", "mechanism_fingerprint", "status", "confidence"}, map[string][]string{"evidence_for": nil, "evidence_against": nil}); len(hypotheses) > 0 {
+	if hypotheses := sanitizeTraceObjects(trace["hypotheses"], []string{"hypothesis_id", "family", "mechanism", "status", "confidence"}, map[string][]string{"evidence_for": nil, "evidence_against": nil}); len(hypotheses) > 0 {
 		out["hypotheses"] = hypotheses
 	}
 	if evidence := sanitizeTraceObjects(trace["evidence"], []string{"evidence_id", "entity", "source", "source_group", "predicate", "polarity", "coverage", "quality"}, nil); len(evidence) > 0 {
@@ -312,6 +309,9 @@ func sanitizeTraceV3(trace map[string]any) map[string]any {
 	}
 	if links := sanitizeStringSlice(trace["rejected_evidence_links"]); len(links) > 0 {
 		out["rejected_evidence_links"] = links
+	}
+	if stop := strings.TrimSpace(stringValue(trace["stop_reason"])); stop != "" {
+		out["stop_reason"] = stop
 	}
 	return out
 }
@@ -416,13 +416,6 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 	probeTemplateIDs := traceV3LinkedProbeTemplateIDs(trace, hypothesisID, support)
 	if evidenceSource == "" && len(probeTemplateIDs) == 0 {
 		return nil, "missing probe execution linked to hypothesis evidence"
-	}
-	if probeTemplateIDs == nil {
-		// A nil slice marshals to JSON null, which the agent-side package
-		// validator rejects ("probe template IDs must be safe identifier
-		// strings") at Activate time — the harness-claim path legitimately has
-		// no linked probes and must ship an empty list instead.
-		probeTemplateIDs = []string{}
 	}
 	if strings.TrimSpace(stringValue(snapshot.Snapshot["analysis_summary"])) == "" || strings.TrimSpace(stringValue(snapshot.Snapshot["analysis_detail"])) == "" {
 		return nil, "missing analysis result"
@@ -771,49 +764,25 @@ func readyTraceV3Hypothesis(trace map[string]any, finalFamily, finalMechanism st
 		}
 		return matches
 	}
-	selected := []map[string]any{}
-	if selectedID := strings.TrimSpace(stringValue(trace["selected_hypothesis_id"])); selectedID != "" {
-		for _, raw := range hypotheses {
-			hypothesis, ok := raw.(map[string]any)
-			if ok && strings.TrimSpace(stringValue(hypothesis["hypothesis_id"])) == selectedID {
-				selected = append(selected, hypothesis)
-			}
+	selected := selectMatching("selected")
+	if len(selected) > 1 {
+		return nil, nil, nil, "multiple selected trace-v3 hypotheses match final root cause"
+	}
+	if len(selected) == 0 {
+		selected = selectMatching("supported")
+	}
+	if len(selected) != 1 {
+		if !operatorConfirmed {
+			return nil, nil, nil, "expected exactly one supported trace-v3 hypothesis matching final root cause"
 		}
+		// Operator override for non-reproducible incidents: accept a family-matching
+		// hypothesis in ANY status when the operator has explicitly confirmed the
+		// diagnosis. This relaxes the status/confidence requirement ONLY — the
+		// evidence, contradiction, and probe-linkage gates below are unchanged, so
+		// promoted knowledge still carries at least one real supporting observation.
+		selected = selectMatching("")
 		if len(selected) != 1 {
-			return nil, nil, nil, "selected_hypothesis_id must identify exactly one trace-v3 hypothesis"
-		}
-		hypothesis := selected[0]
-		family := strings.TrimSpace(stringValue(hypothesis["family"]))
-		mechanism := strings.TrimSpace(stringValue(hypothesis["mechanism"]))
-		if family != strings.TrimSpace(finalFamily) ||
-			(strings.TrimSpace(finalMechanism) != "" && mechanism != strings.TrimSpace(finalMechanism)) {
-			return nil, nil, nil, "selected trace-v3 hypothesis does not match final root cause"
-		}
-		status := strings.ToLower(strings.TrimSpace(stringValue(hypothesis["status"])))
-		if !operatorConfirmed && status != "selected" && status != "supported" {
-			return nil, nil, nil, "selected trace-v3 hypothesis must be selected or supported"
-		}
-	} else {
-		selected = selectMatching("selected")
-		if len(selected) > 1 {
-			return nil, nil, nil, "multiple selected trace-v3 hypotheses match final root cause"
-		}
-		if len(selected) == 0 {
-			selected = selectMatching("supported")
-		}
-		if len(selected) != 1 {
-			if !operatorConfirmed {
-				return nil, nil, nil, "expected exactly one supported trace-v3 hypothesis matching final root cause"
-			}
-			// Operator override for non-reproducible incidents: accept a family-matching
-			// hypothesis in ANY status when the operator has explicitly confirmed the
-			// diagnosis. This relaxes the status/confidence requirement ONLY — the
-			// evidence, contradiction, and probe-linkage gates below are unchanged, so
-			// promoted knowledge still carries at least one real supporting observation.
-			selected = selectMatching("")
-			if len(selected) != 1 {
-				return nil, nil, nil, "operator confirmation needs exactly one trace-v3 hypothesis matching the confirmed root cause"
-			}
+			return nil, nil, nil, "operator confirmation needs exactly one trace-v3 hypothesis matching the confirmed root cause"
 		}
 	}
 	for _, hypothesis := range selected {
@@ -938,7 +907,7 @@ func (s *Store) ListKnowledgePackages(includeRetired bool) []KnowledgePackage {
 	defer s.mu.RUnlock()
 	items := make([]KnowledgePackage, 0, len(s.knowledgePackages))
 	for _, pkg := range s.knowledgePackages {
-		if includeRetired || (pkg.Status == knowledgePackageActive && s.knowledgePackageValidatedLocked(pkg)) {
+		if includeRetired || ((pkg.Status == knowledgePackageActive || pkg.Status == knowledgePackageShadow) && s.knowledgePackageValidatedLocked(pkg)) {
 			items = append(items, cloneKnowledgePackage(pkg))
 		}
 	}
@@ -951,7 +920,7 @@ func (s *Store) knowledgePackageValidatedLocked(pkg *KnowledgePackage) bool {
 		return false
 	}
 	candidate := s.knowledgeCandidates[pkg.CandidateID]
-	if candidate == nil || candidate.Status != knowledgeCandidateActive {
+	if candidate == nil || (candidate.Status != knowledgeCandidateActive && candidate.Status != knowledgeCandidateShadow) {
 		return false
 	}
 	snapshot := s.caseSnapshots[pkg.CaseID]
@@ -972,7 +941,7 @@ func (s *Store) KnowledgePackage(id string) (KnowledgePackage, bool) {
 func (s *Store) KnowledgeRuntimeSnapshot() KnowledgeRuntimeSnapshot {
 	packages := s.ListKnowledgePackages(false)
 	// Revision is a stable content hash, suitable for the Agent's ETag cache.
-	// It intentionally includes only active package state, not request time.
+	// It intentionally includes only validated active/shadow package state, not request time.
 	payload := mustJSON(packages)
 	digest := sha256.Sum256(payload)
 	return KnowledgeRuntimeSnapshot{Revision: hex.EncodeToString(digest[:]), Packages: packages}

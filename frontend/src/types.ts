@@ -264,6 +264,13 @@ export type PageInfo = {
   limit: number;
   offset: number;
   has_more: boolean;
+  counts?: IncidentListCounts;
+};
+
+export type IncidentListCounts = {
+  open: number;
+  resolved: number;
+  analyzing: number;
 };
 
 // Learned knowledge is derived from completed incident analysis. These records

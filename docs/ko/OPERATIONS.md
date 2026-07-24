@@ -90,20 +90,6 @@ kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --count
 - 필요 시 인제스트를 다시 실행하십시오:
   `kubectl create job -n <ns> --from=cronjob/<release>-typedb-ingest manual-ingest-1`.
 
-### Reasoning trace를 v3로 단일화하는 migration
-
-v3 단일화 업그레이드는 Postgres metadata, CaseSnapshot, 저장된 Knowledge Candidate
-trace에서 `reasoning_trace_v2`와 `stop_reason`을 되돌릴 수 없게 삭제합니다. 업그레이드
-전에 Postgres와 TypeDB를 백업하십시오. 신규 분석을 중단하고 `analyzing` run이 0이 된
-뒤 TypeDB ingest/backfill Job을 일시 중단해야 합니다. 구형 writer는 schema type이
-삭제된 뒤 `trace_stop_reason`을 쓸 수 없습니다.
-
-Backend 시작 migration은 하나의 transaction에서 폐기된 JSON key를 제거하고 영향받은
-Candidate의 content hash를 다시 계산한 뒤 처리 row 수를 기록합니다. TypeDB schema
-Job은 attribute ownership과 instance를 먼저 지운 다음 ownership과 type을 undefine합니다.
-두 migration 모두 멱등적입니다. 어느 한쪽이라도 실패하면 배포 실패로 처리하며, 과거
-trace 내용은 업그레이드 전 백업으로만 복원할 수 있습니다.
-
 ### Trace-v3 backfill과 비어 있는 조사 trace
 
 `typedb-trace-v3-backfill` Job은 Helm `post-install` / `post-upgrade` hook으로
@@ -111,16 +97,15 @@ trace 내용은 업그레이드 전 백업으로만 복원할 수 있습니다.
 정상입니다. 감사 로그가 필요하면 release event를 확인하거나 backfill 명령을 직접 실행하세요.
 
 ```bash
-# 멱등적인 한 페이지를 수동 실행합니다. 없는 trace를 만들어 내지 않습니다.
+# 멱등적인 한 페이지를 수동 실행합니다. legacy trace는 변환하지 않습니다.
 kubectl exec -n <ns> deploy/<release>-agent -- \
   python -m ontology.backfill_trace_v3 --batch-size 200 --max-batches 1
 ```
 
 `0 written`만으로 오류를 뜻하지는 않습니다. `hypothesis`와 `probe_execution`은 명시적인
 `reasoning_trace_v3`(또는 `trace_v3`)를 가진, Dashboard 승인된 active CaseSnapshot에서만
-만들어집니다. trace가 없거나 trace-v3 이전 형식인 snapshot, active가 아닌 snapshot은
-의도적으로 변환하지 않습니다. 적격 trace-v3 snapshot을 만들려면 case를 재분석하고
-승인한 뒤 backfill을 다시 실행하세요.
+만들어집니다. legacy v1/v2 결과와 active가 아닌 snapshot은 의도적으로 변환하지 않습니다.
+적격 trace-v3 snapshot을 만들려면 case를 재분석하고 승인한 뒤 backfill을 다시 실행하세요.
 
 TypeDB Studio 접근은 [Knowledge Base → Querying the graph](KNOWLEDGE-BASE.md)를
 참고하십시오.

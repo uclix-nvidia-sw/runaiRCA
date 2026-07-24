@@ -147,6 +147,45 @@ async def test_no_node_scans_all_cluster_nodes(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.asyncio
+async def test_cluster_node_cap_prioritizes_gpu_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.collectors import kubernetes as k8s
+
+    async def no_target_node(*_args, **_kwargs):
+        return "", "", ""
+
+    cpu_items = [
+        {"metadata": {"name": f"cpu-{index:02d}"}}
+        for index in range(12)
+    ]
+    cpu_items.append(
+        {
+            "metadata": {"name": "gpu-node"},
+            "status": {"capacity": {"nvidia.com/gpu": "1"}},
+        }
+    )
+
+    async def fake_k8s_read(*_args, **_kwargs):
+        return {"error": None, "data": {"items": cpu_items}}
+
+    async def fake_internal_ip(_settings, node):
+        return node
+
+    async def fake_get_json(*, base_url, **_kwargs):
+        return JsonResponse(url=base_url, status_code=200, data={"lines": []})
+
+    monkeypatch.setattr(system_mod, "_node_from_target_pod", no_target_node)
+    monkeypatch.setattr(k8s, "k8s_read", fake_k8s_read)
+    monkeypatch.setattr(system_mod, "_node_internal_ip", fake_internal_ip)
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+
+    result = await SystemCollector(_Settings()).collect(_target(node=""))
+
+    scanned = {item.result["node"] for item in result.artifacts}
+    assert len(scanned) == 12
+    assert "gpu-node" in scanned
+
+
+@pytest.mark.asyncio
 async def test_non_gpu_cluster_node_skips_gpu_sources_and_reports_breakdown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -19,8 +19,8 @@ from app.collectors.kubernetes import (
     _filter_kubernetes_data,
     _kubernetes_list_complete,
     _mcp_k8s_response,
-    _node_cordon_artifact,
     _node_condition_artifacts,
+    _node_cordon_artifact,
     _pod_log_observation,
     _warning_event_observation,
     _warning_event_queries_complete,
@@ -1172,6 +1172,37 @@ def test_loki_negative_normal_and_recovery_lines_are_not_causal_support() -> Non
     assert affirmative["affirmative_line_count"] == 1
     assert affirmative["observed_entity"] == {"kind": "pod", "name": "trainer-0"}
     assert (recent["polarity"], recent["coverage"]) == ("unknown", "partial")
+
+
+def test_loki_post_resolution_failure_line_is_not_causal_support() -> None:
+    target = replace(
+        make_target(),
+        fired_at="2026-07-10T01:00:00Z",
+        resolved_at="2026-07-10T01:10:00Z",
+    )
+    collection_window = incident_time_range(target)
+    assert collection_window is not None
+
+    observation = loki._loki_query_observation(
+        {
+            "name": "error_logs",
+            "line_count": 1,
+            "stream_count": 1,
+            "stream_labels": [{"namespace": "runai-vision", "pod": "trainer-0"}],
+            "stream_labels_complete": True,
+            "sample_entries": [{
+                "timestamp": "2026-07-10T01:12:00Z",
+                "line": "error after recovery",
+                "labels": {"namespace": "runai-vision", "pod": "trainer-0"},
+            }],
+        },
+        target=target,
+        time_range=collection_window,
+    )
+
+    assert (observation["polarity"], observation["coverage"]) == ("unknown", "partial")
+    assert observation["affirmative_line_count"] == 0
+    assert observation["causal_window"]["end"] == "2026-07-10T01:10:00Z"
 
 
 def test_prometheus_positive_observation_exposes_actual_sample_window() -> None:
@@ -3024,9 +3055,10 @@ async def test_postgres_reads_only_timestamped_audit_history_in_incident_window(
 
 
 @pytest.mark.asyncio
-async def test_loki_and_prometheus_direct_fallback_disable_internal_tls_verify(monkeypatch) -> None:
+async def test_loki_and_prometheus_direct_fallback_honor_tls_verification(monkeypatch) -> None:
     seen: list[bool | str] = []
     monkeypatch.delenv("MCP_TLS_VERIFY", raising=False)
+    monkeypatch.delenv("MCP_TLS_INSECURE", raising=False)
 
     async def fake_get_json(*, base_url, path, timeout_seconds, params=None, headers=None, verify=True):
         seen.append(verify)
@@ -3048,12 +3080,12 @@ async def test_loki_and_prometheus_direct_fallback_disable_internal_tls_verify(m
 
     await loki._collect_loki_direct(settings, [("logs", '{namespace="runai"}')], [])
     await prometheus._collect_prometheus_direct(settings, [("up", "up")], [])
-    assert seen == [False, False]
+    assert seen == [True, True]
 
-    monkeypatch.setenv("MCP_TLS_VERIFY", "true")
+    monkeypatch.setenv("MCP_TLS_INSECURE", "true")
     await loki._collect_loki_direct(settings, [("logs", '{namespace="runai"}')], [])
     await prometheus._collect_prometheus_direct(settings, [("up", "up")], [])
-    assert seen == [False, False, True, True]
+    assert seen == [True, True, False, False]
 
 
 @pytest.mark.asyncio

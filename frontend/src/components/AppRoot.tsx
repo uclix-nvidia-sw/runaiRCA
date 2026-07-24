@@ -83,6 +83,7 @@ import { collectorEvidencePresentation, shouldPresentRunArtifacts } from '../uti
 import { artifactForPresentation } from '../utils/artifactPresentation';
 import { alertFiltersForAPI, incidentFiltersForAPI, incidentViewForMainView, matchesAlertFilters, matchesIncidentFilters } from '../utils/filters';
 import { agentTabs, isNoEvidenceArtifact } from '../utils/agentTrail';
+import { evidenceState } from '../utils/evidenceState';
 import { formatEvidenceQueries, splitRcaReport, stripAppendixEvidence } from '../utils/rcaSections';
 import {
   FinalDecision,
@@ -999,6 +1000,10 @@ function UnifiedWorkspace({
   const analysis = incident?.analysis_detail;
   const summary = incident?.analysis_summary;
   const isAnalyzing = Boolean(detail.data.is_analyzing);
+  const runEvidenceState = evidenceState(
+    incident?.missing_data,
+    incident?.artifacts?.length ?? 0,
+  );
   const isOperatorCorrection = analysisRun?.source === 'operator';
   const operatorCorrectionPinned = isOperatorCorrection &&
     (operatorPinnedOverride ?? analysisRun?.metadata?.pinned === true);
@@ -1296,6 +1301,22 @@ function UnifiedWorkspace({
         <section className="rca-summary">
           <div className="rca-summary-heading">
             <h3>RCA Summary</h3>
+            {!isAnalyzing && runEvidenceState === 'budget_exhausted' && (
+              <span
+                className="quality quality-low"
+                title="수집기들이 공유 증거 예산 소진으로 스킵되어 이 분석에는 수집된 증거가 없습니다. 재분석을 권장합니다."
+              >
+                증거 불완전 — 예산 소진
+              </span>
+            )}
+            {!isAnalyzing && runEvidenceState === 'partial' && (
+              <span
+                className="quality quality-medium"
+                title="일부 수집기가 공유 증거 예산 소진으로 스킵되었습니다. 증거가 부분적입니다."
+              >
+                증거 일부 누락
+              </span>
+            )}
             {isOperatorCorrection && (
               <div className="rca-operator-meta">
                 <span className="quality quality-operator">운영자 수정</span>

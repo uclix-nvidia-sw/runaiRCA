@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from app.collectors.base import CollectorResult, artifact
-from app.schemas import AlertAnalysisResponse
+from app.knowledge import _load_failure_modes
+from app.schemas import Alert, AlertAnalysisRequest, AlertAnalysisResponse
 from app.services import pipeline
 from app.services.harness import assign_evidence_ids, evaluate
 from app.services.root_cause_ranking import RankedCause
@@ -97,6 +98,71 @@ def test_repeated_typed_warning_event_qualifies_and_low_count_does_not() -> None
 
     assert pipeline._dispositive_typed_state([repeated], {"E01"})[0] == "image_pull_error"
     assert pipeline._dispositive_typed_state([single], {"E01"}) == ("", "", [])
+
+
+def test_last_terminated_without_phase_promotes_oom_runtime() -> None:
+    result = _lifecycle_result("OOMKilled")
+    result.artifacts[0].result["containers"][0] = {
+        "name": "main",
+        "lastTerminated": {"reason": "OOMKilled", "exitCode": 137},
+    }
+
+    typed = pipeline._dispositive_typed_state([result], {"E01"})
+
+    assert typed[0] == "workload_runtime_error"
+    assert typed[2] == ["E01"]
+
+
+def test_threshold_warning_and_legacy_tokens_do_not_author_terminal_summary() -> None:
+    result = _warning_result(1)
+    result.summary = "legacy OOMKilled CrashLoopBackOff token only"
+    result.artifacts[0].summary = result.summary
+    result.artifacts[0].result["events"][0]["reason"] = "OOMKilled"
+    result.artifacts[0].result["observation"]["polarity"] = "unknown"
+    result.artifacts[0].result["observation"]["coverage"] = "partial"
+    request = AlertAnalysisRequest(
+        alert=Alert(status="firing", labels={"alertname": "KubePodCrashLooping"})
+    )
+    candidate = RankedCause("workload_runtime_error", "low", 1.0)
+
+    assert pipeline._dispositive_typed_state([result], {"E01"}) == ("", "", [])
+    summary = pipeline._summary_from(
+        request,
+        [result],
+        [candidate],
+        _load_failure_modes("knowledge/failure_modes.yaml"),
+    )
+
+    assert "OOMKilled" not in summary
+    assert "CrashLoopBackOff" not in summary
+
+
+def test_typed_oom_family_and_summary_agree() -> None:
+    result = _lifecycle_result("OOMKilled")
+    result.artifacts[0].summary = "target lastTerminated reason=OOMKilled"
+    result.artifacts[0].result["containers"][0] = {
+        "name": "main",
+        "lastTerminated": {"reason": "OOMKilled", "exitCode": 137},
+    }
+    candidate = pipeline._promote_signature_cause(
+        [RankedCause("workload_runtime_error", "medium", 3.0)],
+        [],
+        [],
+        [],
+        typed_state=pipeline._dispositive_typed_state([result], {"E01"}),
+    )[0]
+    summary = pipeline._summary_from(
+        AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "KubePodCrashLooping"})
+        ),
+        [result],
+        [candidate],
+        _load_failure_modes("knowledge/failure_modes.yaml"),
+        language="ko",
+    )
+
+    assert candidate.family == "workload_runtime_error"
+    assert "메모리 제한을 초과해 OOMKilled" in summary
 
 
 def test_free_text_and_unverified_artifacts_never_promote() -> None:

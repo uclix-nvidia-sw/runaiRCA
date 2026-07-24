@@ -385,6 +385,7 @@ func Run() {
 
 	<-ctx.Done()
 	stop()
+	server.store.stopEmbeddingBackfill()
 	log.Printf("shutdown signal received, draining connections")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -568,8 +569,8 @@ func (s *Server) handleIncidentList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid incident final decision filter")
 		return
 	}
-	items, total := s.store.ListIncidentsPageFiltered(page.Limit, page.Offset, view, filter)
-	writeJSON(w, http.StatusOK, paginatedEnvelope(items, page, total))
+	items, total, counts := s.store.ListIncidentsPageFilteredWithCounts(page.Limit, page.Offset, view, filter)
+	writeJSON(w, http.StatusOK, paginatedEnvelope(items, page, total, &counts))
 }
 
 func (s *Server) handleAlertList(w http.ResponseWriter, r *http.Request) {
@@ -1125,13 +1126,14 @@ type paginationRequest struct {
 }
 
 type paginationInfo struct {
-	Total   int  `json:"total"`
-	Limit   int  `json:"limit"`
-	Offset  int  `json:"offset"`
-	HasMore bool `json:"has_more"`
+	Total   int                 `json:"total"`
+	Limit   int                 `json:"limit"`
+	Offset  int                 `json:"offset"`
+	HasMore bool                `json:"has_more"`
+	Counts  *IncidentListCounts `json:"counts,omitempty"`
 }
 
-func paginatedEnvelope(data any, page paginationRequest, total int) map[string]any {
+func paginatedEnvelope(data any, page paginationRequest, total int, counts ...*IncidentListCounts) map[string]any {
 	payload := envelope(data)
 	offset := page.Offset
 	if offset < 0 {
@@ -1149,6 +1151,11 @@ func paginatedEnvelope(data any, page paginationRequest, total int) map[string]a
 		Limit:   limit,
 		Offset:  offset,
 		HasMore: offset+limit < total,
+	}
+	if len(counts) > 0 && counts[0] != nil {
+		pageInfo := payload["pagination"].(paginationInfo)
+		pageInfo.Counts = counts[0]
+		payload["pagination"] = pageInfo
 	}
 	return payload
 }

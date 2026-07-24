@@ -233,7 +233,6 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
         ("kubernetes", "loki"),
         (
             "crashloopbackoff",
-            "oomkilled",
             "failedmount",
             "createcontainererror",
             "createcontainerconfigerror",
@@ -344,6 +343,7 @@ DEFAULT_FAMILY_RULES: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = 
         "loki",
         ("loki", "kubernetes"),
         (
+            "oomkilled",
             "cuda out of memory",
             "torch.cuda",
             "traceback (most recent call last)",
@@ -753,10 +753,15 @@ class _ApprovedKnowledgeSnapshot:
 
     revision: str
     failure_modes: dict[str, tuple[dict[str, Any], ...]]
+    active_failure_modes: dict[str, tuple[dict[str, Any], ...]]
+    shadow_failure_modes: dict[str, tuple[dict[str, Any], ...]]
     known_issues: tuple[dict[str, Any], ...]
+    active_known_issues: tuple[dict[str, Any], ...]
+    shadow_known_issues: tuple[dict[str, Any], ...]
     probe_template_ids: dict[str, dict[str, tuple[str, ...]]]
     package_count: int
-    package_ids: tuple[str, ...]
+    active_package_ids: tuple[str, ...]
+    shadow_package_ids: tuple[str, ...]
 
 
 class KnowledgeRegistry:
@@ -867,7 +872,8 @@ class KnowledgeRegistry:
             "configured": bool(self.snapshot_url),
             "loaded_revision": snapshot.revision if snapshot else None,
             "loaded_packages": snapshot.package_count if snapshot else 0,
-            "active_package_ids": list(snapshot.package_ids) if snapshot else [],
+            "active_package_ids": list(snapshot.active_package_ids) if snapshot else [],
+            "shadow_package_ids": list(snapshot.shadow_package_ids) if snapshot else [],
             "probe_template_families": sorted(snapshot.probe_template_ids) if snapshot else [],
             "last_sync_at": self._last_sync_at or None,
             "last_sync_error": self._last_sync_error or None,
@@ -877,25 +883,46 @@ class KnowledgeRegistry:
         self, baseline: dict[str, list[dict[str, Any]]]
     ) -> dict[str, list[dict[str, Any]]]:
         snapshot = self._snapshot
-        # The present pipeline feeds this catalog into ranking. Until it has a
-        # separate provisional candidate channel, only authoritative mode may
-        # change it; assist is deliberately observational.
-        if self.mode != "authoritative" or snapshot is None:
+        if snapshot is None or self.mode not in {"assist", "authoritative"}:
             return copy.deepcopy(baseline)
+        if self.mode == "assist":
+            runtime = {
+                family: list(symptoms)
+                for family, symptoms in snapshot.active_failure_modes.items()
+            }
+            return _merge_failure_modes(baseline, runtime, authoritative=True)
         runtime = {family: list(symptoms) for family, symptoms in snapshot.failure_modes.items()}
         return _merge_failure_modes(baseline, runtime, authoritative=True)
 
     def known_issues(self, baseline: list[dict[str, Any]]) -> list[dict[str, Any]]:
         snapshot = self._snapshot
-        if self.mode != "authoritative" or snapshot is None:
+        if snapshot is None or self.mode not in {"assist", "authoritative"}:
             return copy.deepcopy(baseline)
-        return _merge_known_issues(baseline, list(snapshot.known_issues), authoritative=True)
+        runtime = (
+            snapshot.known_issues
+            if self.mode == "authoritative"
+            else snapshot.active_known_issues
+        )
+        return _merge_known_issues(baseline, list(runtime), authoritative=True)
+
+    def shadow_hints(self, observed_text: str) -> list[tuple[str, dict[str, Any]]]:
+        """Return evidence-matched shadow guidance without affecting matching."""
+        snapshot = self._snapshot
+        if self.mode != "assist" or snapshot is None:
+            return []
+        return match_failure_mode_symptoms(
+            {
+                family: list(symptoms)
+                for family, symptoms in snapshot.shadow_failure_modes.items()
+            },
+            observed_text,
+        )
 
     def provisional_catalogs(self) -> dict[str, Any]:
         """Return a copy of loaded runtime guidance without changing RCA ranking.
 
         Assist consumers such as a future UI card or probe adviser can use this
-        method while ``load_failure_modes`` remains baseline-only.
+        method to inspect both active and shadow runtime guidance.
         """
         snapshot = self._snapshot
         if snapshot is None or self.mode == "off":
@@ -950,7 +977,7 @@ def set_runtime_knowledge_registry(registry: KnowledgeRegistry | None) -> None:
 
 
 def validate_runtime_knowledge(payload: Any) -> dict[str, Any]:
-    """Validate a read-only snapshot or one active compiled package.
+    """Validate a read-only snapshot or one active/shadow compiled package.
 
     This is the canonical agent-side validator used by the internal HTTP route.
     It never writes a package or installs it in the live registry.
@@ -1022,6 +1049,18 @@ def load_failure_modes(path: str) -> dict[str, list[dict[str, Any]]]:
     return registry.failure_modes(baseline) if registry else baseline
 
 
+def merge_runtime_failure_modes(
+    baseline: dict[str, list[dict[str, Any]]]
+) -> dict[str, list[dict[str, Any]]]:
+    registry = _runtime_knowledge_registry
+    return registry.failure_modes(baseline) if registry else copy.deepcopy(baseline)
+
+
+def runtime_shadow_hints(observed_text: str) -> list[tuple[str, dict[str, Any]]]:
+    registry = _runtime_knowledge_registry
+    return registry.shadow_hints(observed_text) if registry else []
+
+
 def _load_runai_known_issues(path: str) -> list[dict[str, Any]]:
     """Parse runai_known_issues.yaml into a list of known-issue entries.
 
@@ -1067,8 +1106,8 @@ def load_runai_known_issues(path: str) -> list[dict[str, Any]]:
 def _validate_approved_snapshot(payload: Any) -> _ApprovedKnowledgeSnapshot:
     """Validate the entire backend snapshot before it is eligible for a swap.
 
-    Snapshot packages are intentionally read-only and already active. Each
-    package uses ``package_id``, ``state: active``, and a ``compiled`` object
+    Snapshot packages are intentionally read-only and already validated. Each
+    package uses ``package_id``, ``state: active`` or ``state: shadow``, and a ``compiled`` object
     containing optional ``failure_modes`` / ``known_issues`` arrays. ``kind`` +
     ``entries`` is also accepted so a producer can send one knowledge type per
     package. Raw incident/case data is not a supported package shape.
@@ -1083,18 +1122,29 @@ def _validate_approved_snapshot(payload: Any) -> _ApprovedKnowledgeSnapshot:
         raise ValueError("snapshot packages must be an array")
 
     failure_modes: dict[str, list[dict[str, Any]]] = {}
+    active_failure_modes: dict[str, list[dict[str, Any]]] = {}
+    shadow_failure_modes: dict[str, list[dict[str, Any]]] = {}
     known_issues: list[dict[str, Any]] = []
+    active_known_issues: list[dict[str, Any]] = []
+    shadow_known_issues: list[dict[str, Any]] = []
     probe_template_ids: dict[str, dict[str, tuple[str, ...]]] = {}
-    package_ids: list[str] = []
+    active_package_ids: list[str] = []
+    shadow_package_ids: list[str] = []
     for index, package in enumerate(packages):
         if not isinstance(package, dict):
             raise ValueError(f"package {index} must be an object")
         package_id = package.get("package_id", package.get("id"))
         if not isinstance(package_id, str) or not package_id.strip():
             raise ValueError(f"package {index} requires package_id")
-        package_ids.append(package_id.strip())
-        if package.get("state", package.get("status")) != "active":
-            raise ValueError(f"package {package_id} is not active")
+        runtime_status = package.get(
+            "runtime_status", package.get("state", package.get("status"))
+        )
+        if runtime_status not in {"active", "shadow"}:
+            raise ValueError(f"package {package_id} has invalid runtime status")
+        if runtime_status == "active":
+            active_package_ids.append(package_id.strip())
+        else:
+            shadow_package_ids.append(package_id.strip())
         contents = package.get("compiled", package.get("knowledge", package.get("payload")))
         # The backend preserves package provenance in ``payload`` and places the
         # safe, compiled subset under payload.compiled. Never inspect the rest of
@@ -1115,10 +1165,23 @@ def _validate_approved_snapshot(payload: Any) -> _ApprovedKnowledgeSnapshot:
             raw_failure_modes = entries
         elif kind in {"known_issue", "known_issues"}:
             raw_known_issues = entries
-        validated_modes = _validate_runtime_failure_modes(raw_failure_modes, package_id)
+        validated_modes = _validate_runtime_failure_modes(
+            raw_failure_modes, package_id, runtime_status
+        )
         for family, symptoms in validated_modes.items():
             failure_modes.setdefault(family, []).extend(symptoms)
-        known_issues.extend(_validate_runtime_known_issues(raw_known_issues, package_id))
+            if runtime_status == "active":
+                active_failure_modes.setdefault(family, []).extend(symptoms)
+            else:
+                shadow_failure_modes.setdefault(family, []).extend(symptoms)
+        validated_issues = _validate_runtime_known_issues(
+            raw_known_issues, package_id, runtime_status
+        )
+        known_issues.extend(validated_issues)
+        if runtime_status == "active":
+            active_known_issues.extend(validated_issues)
+        else:
+            shadow_known_issues.extend(validated_issues)
         for family, ids in _validate_runtime_probe_template_ids(
             contents.get("probe_template_ids"), package_id
         ).items():
@@ -1127,17 +1190,26 @@ def _validate_approved_snapshot(payload: Any) -> _ApprovedKnowledgeSnapshot:
     return _ApprovedKnowledgeSnapshot(
         revision=revision.strip(),
         failure_modes={family: tuple(symptoms) for family, symptoms in failure_modes.items()},
+        active_failure_modes={
+            family: tuple(symptoms) for family, symptoms in active_failure_modes.items()
+        },
+        shadow_failure_modes={
+            family: tuple(symptoms) for family, symptoms in shadow_failure_modes.items()
+        },
         known_issues=tuple(known_issues),
+        active_known_issues=tuple(active_known_issues),
+        shadow_known_issues=tuple(shadow_known_issues),
         probe_template_ids=probe_template_ids,
         package_count=len(packages),
-        package_ids=tuple(package_ids),
+        active_package_ids=tuple(active_package_ids),
+        shadow_package_ids=tuple(shadow_package_ids),
     )
 
 
 def _normalized_snapshot(snapshot: _ApprovedKnowledgeSnapshot) -> dict[str, Any]:
     return {
         "revision": snapshot.revision,
-        "active_package_ids": list(snapshot.package_ids),
+        "active_package_ids": list(snapshot.active_package_ids),
         "failure_modes": {
             family: [copy.deepcopy(symptom) for symptom in symptoms]
             for family, symptoms in snapshot.failure_modes.items()
@@ -1150,7 +1222,18 @@ def _normalized_snapshot(snapshot: _ApprovedKnowledgeSnapshot) -> dict[str, Any]
     }
 
 
-def _validate_runtime_failure_modes(value: Any, package_id: str) -> dict[str, list[dict[str, Any]]]:
+@lru_cache(maxsize=1)
+def _closed_family_set() -> frozenset[str]:
+    import os
+
+    return frozenset(
+        load_family_catalog(os.getenv("FAMILIES_FILE", "knowledge/families.yaml")).families
+    )
+
+
+def _validate_runtime_failure_modes(
+    value: Any, package_id: str, runtime_status: str
+) -> dict[str, list[dict[str, Any]]]:
     if isinstance(value, dict):
         entries = [
             {"family": family, "symptoms": symptoms}
@@ -1167,6 +1250,15 @@ def _validate_runtime_failure_modes(value: Any, package_id: str) -> dict[str, li
         family = entry.get("family")
         if not isinstance(family, str) or not family.strip():
             raise ValueError(f"package {package_id} failure mode requires family")
+        # The family universe is closed (families.yaml == failure_modes ==
+        # ranker vocabulary). A legacy or LLM-authored name must fail the
+        # package here, not surface later as an ungroundable headline
+        # (2026-07-24 audit, static defect 4).
+        if family.strip() not in _closed_family_set():
+            raise ValueError(
+                f"package {package_id} failure mode family {family.strip()!r} "
+                "is outside the closed catalog"
+            )
         raw_symptoms = entry.get("symptoms")
         if raw_symptoms is None and "symptom" in entry:
             raw_symptoms = [entry]
@@ -1219,12 +1311,16 @@ def _validate_runtime_failure_modes(value: Any, package_id: str) -> dict[str, li
                     "reason_ko": localized_text["reason_ko"].strip(),
                     "exclusive_actions": exclusive_actions,
                     "component": component,
+                    "runtime_package_id": package_id,
+                    "runtime_status": runtime_status,
                 }
             )
     return out
 
 
-def _validate_runtime_known_issues(value: Any, package_id: str) -> list[dict[str, Any]]:
+def _validate_runtime_known_issues(
+    value: Any, package_id: str, runtime_status: str
+) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise ValueError(f"package {package_id} known_issues must be an array")
     out: list[dict[str, Any]] = []
@@ -1254,6 +1350,8 @@ def _validate_runtime_known_issues(value: Any, package_id: str) -> list[dict[str
                 "affected_version": entry.get("affected_version", ""),
                 "fixed_version": entry.get("fixed_version", ""),
                 "actions": list(actions),
+                "runtime_package_id": package_id,
+                "runtime_status": runtime_status,
             }
         )
     return out

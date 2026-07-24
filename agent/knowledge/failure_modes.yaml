@@ -31,20 +31,6 @@
         - "클라이언트 자격 증명 토큰을 `https://<runai-host>/api/v1/token`에서 발급하고 `iss` claim을 확인한 뒤, `agent.env.runaiTokenUrl=https://<runai-host>/api/v1/token`으로 설정하세요."
         - "`runaiMcp.oidcIssuerUrl=<token iss>`를 설정해 chart가 `/.well-known/openid-configuration` 요청만 `<iss>/.well-known/openid-configuration`으로 프록시하게 하세요. `agent.env.runaiBaseUrl`은 기존 Run:ai control-plane URL로 유지합니다."
         - "release를 upgrade하고 runai-mcp Deployment rollout을 기다린 뒤, 현재/이전 로그에서 JWKS discovery JSON decode 오류가 사라졌는지 확인하세요."
-    - name: OOMKilled
-      name_ko: 컨테이너 메모리 제한 초과(OOMKilled)
-      keywords: [oomkilled]
-      reason: "The target container was terminated as OOMKilled after exceeding its memory limit; CrashLoopBackOff is the resulting restart behavior, not the underlying cause."
-      reason_ko: "대상 컨테이너가 메모리 제한을 초과해 OOMKilled로 종료됐으며, CrashLoopBackOff는 그 결과로 발생한 재시작 상태입니다."
-      exclusive_actions: true
-      actions:
-        - "Compare the container's `resources.limits.memory` with its configured or observed working set (for example `stress --vm-bytes`). If the configured target exceeds the limit, raise the limit above that target with operating headroom or reduce the target below the limit."
-        - "Set `resources.requests.memory` to a realistic steady working set for scheduling, but do not mistake the request for protection from OOM: the memory limit is the enforced ceiling. If memory grows unexpectedly, fix the leak or reduce batch/input size instead of only raising the limit."
-        - "Roll out the corrected workload and verify that `lastState.terminated.reason=OOMKilled`, restart count growth, and CrashLoopBackOff no longer recur. Investigate node-level OOM only when separate node evidence exists, such as incident-scoped kernel OOM logs, eviction events, or active MemoryPressure."
-      actions_ko:
-        - "컨테이너의 `resources.limits.memory`와 설정 또는 관측된 실제 작업 메모리(예: `stress --vm-bytes`)를 비교하세요. 설정값이 limit보다 크면 작업 여유분을 포함해 limit을 설정값보다 높이거나, 작업 메모리 설정을 limit 아래로 낮추세요."
-        - "스케줄링에 필요한 정상 작업량을 반영해 `resources.requests.memory`도 조정하되, request는 예약량이고 OOM을 막는 상한은 limit임을 구분하세요. 메모리가 비정상적으로 계속 증가한다면 limit만 높이지 말고 누수 또는 batch/input 크기를 수정하세요."
-        - "수정한 워크로드를 rollout한 뒤 `lastState.terminated.reason=OOMKilled`, restart count 증가, CrashLoopBackOff가 재발하지 않는지 확인하세요. 인시던트 시간대의 커널 OOM 로그, eviction 이벤트, 활성 MemoryPressure 같은 별도 노드 증거가 있을 때만 Node-level OOM을 추가 조사하세요."
     - name: CrashLoopBackOff
       keywords: [crashloopbackoff, crashloopbackoffhighrestarts, "back-off restarting"]
       actions:
@@ -517,6 +503,20 @@
 
 - family: workload_runtime_error
   symptoms:
+    - name: OOMKilled
+      name_ko: 컨테이너 메모리 제한 초과(OOMKilled)
+      keywords: [oomkilled]
+      reason: "The target container was terminated as OOMKilled after exceeding its memory limit; CrashLoopBackOff is the resulting restart behavior, not the underlying cause."
+      reason_ko: "대상 컨테이너가 메모리 제한을 초과해 OOMKilled로 종료됐으며, CrashLoopBackOff는 그 결과로 발생한 재시작 상태입니다."
+      exclusive_actions: true
+      actions:
+        - "Compare the container's `resources.limits.memory` with its configured or observed working set (for example `stress --vm-bytes`). If the configured target exceeds the limit, raise the limit above that target with operating headroom or reduce the target below the limit."
+        - "Set `resources.requests.memory` to a realistic steady working set for scheduling, but do not mistake the request for protection from OOM: the memory limit is the enforced ceiling. If memory grows unexpectedly, fix the leak or reduce batch/input size instead of only raising the limit."
+        - "Roll out the corrected workload and verify that `lastState.terminated.reason=OOMKilled`, restart count growth, and CrashLoopBackOff no longer recur. Investigate node-level OOM only when separate node evidence exists, such as incident-scoped kernel OOM logs, eviction events, or active MemoryPressure."
+      actions_ko:
+        - "컨테이너의 `resources.limits.memory`와 설정 또는 관측된 실제 작업 메모리(예: `stress --vm-bytes`)를 비교하세요. 설정값이 limit보다 크면 작업 여유분을 포함해 limit을 설정값보다 높이거나, 작업 메모리 설정을 limit 아래로 낮추세요."
+        - "스케줄링에 필요한 정상 작업량을 반영해 `resources.requests.memory`도 조정하되, request는 예약량이고 OOM을 막는 상한은 limit임을 구분하세요. 메모리가 비정상적으로 계속 증가한다면 limit만 높이지 말고 누수 또는 batch/input 크기를 수정하세요."
+        - "수정한 워크로드를 rollout한 뒤 `lastState.terminated.reason=OOMKilled`, restart count 증가, CrashLoopBackOff가 재발하지 않는지 확인하세요. 인시던트 시간대의 커널 OOM 로그, eviction 이벤트, 활성 MemoryPressure 같은 별도 노드 증거가 있을 때만 Node-level OOM을 추가 조사하세요."
     - name: CUDA Out Of Memory
       keywords: ["cuda out of memory", "torch.cuda.outofmemoryerror", "cuda oom"]
       actions:

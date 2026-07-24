@@ -27,11 +27,11 @@ from pathlib import Path
 from urllib.parse import quote
 
 from app.collectors.base import (
+    _OBSERVED_NORMAL_EVENT_REASONS,
     NO_EVIDENCE,
     AnalysisTarget,
     CollectorResult,
     artifact,
-    _OBSERVED_NORMAL_EVENT_REASONS,
     causal_evidence_time_range,
     incident_time_range,
     ko_en,
@@ -228,6 +228,7 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
         component=component,
         observation_window=observation_window,
         historical_window=historical_window,
+        causal_window=causal_evidence_time_range(target) if historical_window else None,
     )
     return {
         "query": (
@@ -318,6 +319,7 @@ def _change_observation(
     component: str,
     observation_window: dict[str, str],
     historical_window: bool,
+    causal_window: dict[str, str] | None = None,
 ) -> dict:
     """Project only safe change metadata; never copy Event or Secret bodies."""
     safe_changes = [_safe_change_metadata(change, namespace) for change in changes]
@@ -325,7 +327,9 @@ def _change_observation(
     # proof that a returned change actually occurred during the incident.  Keep
     # an occurrence window only when the individual metadata timestamps are
     # valid, timezone-aware instants inside that bounded query.
-    evidence_window = _change_evidence_window(safe_changes, observation_window)
+    evidence_window = _change_evidence_window(
+        safe_changes, causal_window or observation_window
+    )
     timed_changes = bool(evidence_window)
     invalid_timing = bool(safe_changes) and historical_window and not timed_changes
     return {

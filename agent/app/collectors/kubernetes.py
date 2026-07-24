@@ -728,6 +728,7 @@ async def _describe_events(
                 if _event_matches_uid(item, expected_uid)
             ]
             filtered = _events_in_time_range(matching, time_range)
+            filtered.sort(key=_event_sort_timestamp, reverse=True)
             return {"items": compact(filtered, limit=12) if filtered else []}
         except Exception as exc:  # noqa: BLE001 - direct API fallback is the behavior.
             mcp_note = mcp_fallback_warning(exc, source="Kubernetes")
@@ -770,6 +771,7 @@ async def _describe_events(
         and _event_matches_uid(item, expected_uid)
     ]
     filtered = _events_in_time_range(filtered, time_range)
+    filtered.sort(key=_event_sort_timestamp, reverse=True)
     return {
         "items": compact(filtered, limit=12) if filtered else [],
         **({"error": response.error} if response.error else {}),
@@ -1006,9 +1008,6 @@ async def _k8s_read_via_mcp(
             )
             for api_version, mcp_kind in api_kinds
         ]
-        resource_get_candidates.append(
-            ("resources_get", {"kind": resolved, "namespace": namespace, "name": name})
-        )
         pod_get_candidates: list[tuple[str, dict[str, object]]] = []
         if resolved == "pods":
             pod_get_candidates.extend(
@@ -1053,12 +1052,6 @@ async def _k8s_read_via_mcp(
             if field_selector:
                 args["fieldSelector"] = field_selector
             candidates.append(("resources_list", args))
-        fallback_args: dict[str, object] = {"kind": resolved, "namespace": namespace}
-        if label_selector:
-            fallback_args["labelSelector"] = label_selector
-        if field_selector:
-            fallback_args["fieldSelector"] = field_selector
-        candidates.append(("resources_list", fallback_args))
     data = await _k8s_mcp_json(settings, candidates)
     if name and not _mcp_named_resource_matches(
         data,
@@ -2613,7 +2606,6 @@ async def _collect_kubernetes_responses_via_mcp(
                     "resources_get",
                     {"apiVersion": "v1", "kind": "Node", "name": target.node},
                 ),
-                ("resources_get", {"kind": "nodes", "name": target.node}),
             ],
         )
     for runai_namespace in settings.runai_log_namespaces if control_plane_in_scope else ():
@@ -3776,21 +3768,7 @@ def _container_lifecycle_artifact(
         and not target.resolved_at
         and any(_container_is_waiting_with_restarts(item) for item in container_diagnostics)
     )
-    # A container stuck in a terminal waiting reason (CreateContainerConfigError,
-    # ImagePullBackOff, ...) is a definite, present fault even with restartCount=0
-    # and no termination — the "pod stays stuck, does NOT crash-loop" shape the
-    # knowledge base already documents.  Without this it was typed unknown/partial
-    # and the ranker never saw a qualifying kubernetes fact.
-    waiting_reason = _target_waiting_fault_reason(container_diagnostics)
-    current_waiting_fault = (
-        target_identity_verified
-        and bool(time_range)
-        and not target.resolved_at
-        and bool(waiting_reason)
-    )
-    if target_identity_verified and (
-        terminated_times or current_restart_loop or current_waiting_fault
-    ):
+    if target_identity_verified and (terminated_times or current_restart_loop):
         polarity, coverage = "present", "scoped"
     else:
         polarity, coverage = "unknown", "partial"
@@ -3803,10 +3781,6 @@ def _container_lifecycle_artifact(
         "target_identity_verified": target_identity_verified,
         "observation_window": time_range or {},
     }
-    # Hoist the raw kubelet reason so the ranker matches it as a structured
-    # token (closed enum), not by substring-grepping the summary text.
-    if waiting_reason:
-        observation["container_reason"] = waiting_reason
     if target_identity_verified:
         observation["observed_entity"] = {
             "kind": "pod",
@@ -3897,25 +3871,6 @@ def _container_termination_times_in_range(
         if parsed is not None and start <= parsed <= end:
             timestamps.append((parsed, str(finished_at)))
     return sorted(timestamps, key=lambda item: item[0])
-
-
-def _target_waiting_fault_reason(container_diagnostics: list[dict[str, object]]) -> str:
-    """The target container's current terminal waiting reason, casefolded, if any.
-
-    Only reasons in the closed ``_FOLLOWUP_WAITING`` fault set qualify — a benign
-    transient like ContainerCreating is never a fault.  Returned raw (not prose)
-    so the ranker classifies it by exact token against its reason->family table.
-    """
-    for diagnostic in container_diagnostics:
-        if not isinstance(diagnostic, dict):
-            continue
-        state = diagnostic.get("state")
-        if not isinstance(state, dict) or str(state.get("phase") or "") != "waiting":
-            continue
-        reason = str(state.get("reason") or "").strip().casefold()
-        if reason in _FOLLOWUP_WAITING:
-            return reason
-    return ""
 
 
 def _container_is_waiting_with_restarts(diagnostic: dict[str, object]) -> bool:

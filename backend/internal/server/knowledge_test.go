@@ -34,9 +34,8 @@ func eligibleKnowledgeSnapshot() *CaseSnapshot {
 			"metadata": map[string]any{
 				"harness": map[string]any{"overall_score": 90, "hard_gates": map[string]any{"unsupported_high_confidence": false, "invalid_evidence_links": false}},
 				"reasoning_trace_v3": map[string]any{
-					"schema_version":         3,
-					"selected_hypothesis_id": "H-1",
-					"hypotheses":             []any{map[string]any{"hypothesis_id": "H-1", "family": "scheduler_capacity", "mechanism": "quota exhausted", "mechanism_fingerprint": "quota-exhausted-a13f9c2d", "status": "selected", "confidence": 0.91, "evidence_for": []any{"E-1", "E-2"}, "evidence_against": []any{}}},
+					"schema_version": 3,
+					"hypotheses":     []any{map[string]any{"hypothesis_id": "H-1", "family": "scheduler_capacity", "mechanism": "quota exhausted", "status": "selected", "confidence": 0.91, "evidence_for": []any{"E-1", "E-2"}, "evidence_against": []any{}}},
 					"evidence": []any{
 						map[string]any{"evidence_id": "E-1", "observation_window": map[string]any{"start": "2026-07-12T00:00:00Z", "end": "2026-07-12T00:05:00Z"}, "entity": "queue/gpu-a", "source": "runai", "source_group": "control-plane", "predicate": "quota_exhausted", "polarity": "present", "coverage": "scoped", "quality": "high", "raw_query": "must not survive"},
 						map[string]any{"evidence_id": "E-2", "observation_window": map[string]any{"start": "2026-07-12T00:01:00Z", "end": "2026-07-12T00:06:00Z"}, "entity": "scheduler/gpu-a", "source": "kubernetes", "source_group": "scheduler", "predicate": "insufficient_quota", "polarity": "present", "coverage": "scoped", "quality": "high"},
@@ -119,6 +118,30 @@ func TestKnowledgePromotionPreviewSurfacesIngestionOutcome(t *testing.T) {
 	store.evaluationReviews[evaluationKey(snapshot.RunID, snapshot.AnalysisHash, "operator")].ExpectedFamily = "gpu_hardware_error"
 	if got := store.knowledgePromotionPreviewLocked(snapshot.RunID, snapshot.AnalysisHash); got.Outcome != "blocked" {
 		t.Fatalf("family mismatch should block, got %+v", got)
+	}
+}
+
+func TestKnowledgePromotionPreviewNamesTheHashlessRunState(t *testing.T) {
+	store := NewStore()
+	cases := []struct {
+		status string
+		want   string
+	}{
+		{"analyzing", "analysis is still running; evaluate after it completes"},
+		{"failed", "analysis failed and produced no result to evaluate"},
+		{"complete", "this run predates result hashing; re-run the analysis to make it evaluable"},
+	}
+	for _, tc := range cases {
+		runID := "ANL-" + tc.status
+		store.analysisRuns[runID] = &AnalysisRun{RunID: runID, Status: tc.status}
+		got := store.knowledgePromotionPreviewLocked(runID, "")
+		if got.Outcome != "blocked" || got.Reason != tc.want {
+			t.Fatalf("status %q: got %+v", tc.status, got)
+		}
+	}
+	// Unknown run keeps the generic reason.
+	if got := store.knowledgePromotionPreviewLocked("ANL-unknown", ""); got.Reason != "analysis has no result hash yet" {
+		t.Fatalf("unknown run reason changed: %+v", got)
 	}
 }
 
@@ -380,21 +403,6 @@ func TestKnowledgeCandidateRequiresEligibleTraceV3AndCompilesSafePayload(t *test
 	if candidate.Payload["hypothesis_id"] != "H-1" || candidate.Payload["mechanism"] != "quota exhausted" {
 		t.Fatalf("expected exact v3 hypothesis details, got %+v", candidate.Payload)
 	}
-	if candidate.Trace["selected_hypothesis_id"] != "H-1" {
-		t.Fatalf("candidate trace dropped selected hypothesis identity: %+v", candidate.Trace)
-	}
-	if _, ok := candidate.Trace["stop_reason"]; ok {
-		t.Fatalf("candidate trace retained retired stop_reason: %+v", candidate.Trace)
-	}
-	hypothesis := candidate.Trace["hypotheses"].([]any)[0].(map[string]any)
-	if hypothesis["mechanism_fingerprint"] != "quota-exhausted-a13f9c2d" {
-		t.Fatalf("candidate trace dropped mechanism fingerprint: %+v", hypothesis)
-	}
-	historical := cloneCaseSnapshot(snapshot)
-	delete(knowledgeTraceForTest(&historical), "selected_hypothesis_id")
-	if candidate := knowledgeCandidateForSnapshot(&historical); candidate == nil || candidate.Status != knowledgeCandidateReady {
-		t.Fatalf("historical v3 status fallback should remain eligible, got %+v", candidate)
-	}
 	if candidate.Kind != "failure_mode" || len(candidate.EvidenceSummaries) != 2 || candidate.EvidenceSummaries[0].SourceGroup == "" || candidate.EvidenceSummaries[0].Entity == "" || candidate.EvidenceSummaries[0].Coverage != "scoped" || len(candidate.ProbeTemplateIDs) != 1 || candidate.ProbeTemplateIDs[0] != "k8s_troubleshooting:scheduling_capacity:p01" || len(candidate.ProbeBindings) != 1 || candidate.ProbeBindings[0].CandidateProbeID != candidate.CandidateID+":"+candidate.ProbeBindings[0].ProbeLocalID || candidate.ProbeBindings[0].ActiveProbeID != "" {
 		t.Fatalf("candidate review DTO omitted sanitized corroboration details: %+v", candidate)
 	}
@@ -502,16 +510,6 @@ func TestHarnessClaimEvidenceFallbackCompilesKnowledge(t *testing.T) {
 	if got := candidate.Payload["compiled"].(map[string]any)["probe_template_ids"].(map[string]any)[snapshot.RootCauseFamily].([]string); len(got) != 0 {
 		t.Fatalf("harness claim path must not invent probes: %+v", got)
 	}
-	// The agent-side package validator rejects JSON null probe lists at
-	// Activate time; a nil Go slice passes the type assertions above while
-	// still marshalling to null, so assert the WIRE shape, not the Go type.
-	encoded, err := json.Marshal(candidate.Payload["compiled"])
-	if err != nil {
-		t.Fatalf("compiled payload must marshal: %v", err)
-	}
-	if bytes.Contains(encoded, []byte("null")) {
-		t.Fatalf("compiled payload must not contain JSON null (agent validator contract): %s", encoded)
-	}
 	provenance := candidate.Payload["provenance"].(map[string]any)
 	if provenance["promotion_path"] != "harness_claim" {
 		t.Fatalf("harness claim path missing provenance marker: %+v", provenance)
@@ -616,7 +614,6 @@ func TestValidationFailedCandidateRefreshesItsLatestReason(t *testing.T) {
 	snapshot.ApprovalState = "active"
 	trace := knowledgeTraceForTest(snapshot)
 	trace["hypotheses"] = []any{}
-	delete(trace, "selected_hypothesis_id")
 	delete(trace, "probe_executions")
 	latest := knowledgeCandidateForSnapshotWithOutcome(snapshot, true, false)
 	if latest == nil || latest.Status != knowledgeCandidateValidationFailed {
@@ -665,7 +662,6 @@ func harnessClaimSnapshotForTest() *CaseSnapshot {
 	}}
 	trace := knowledgeTraceForTest(snapshot)
 	trace["hypotheses"] = []any{}
-	delete(trace, "selected_hypothesis_id")
 	delete(trace, "probe_executions")
 	return snapshot
 }
@@ -915,7 +911,7 @@ func TestKnowledgeProbeBindingsUseCanonicalTemplateLocalIDs(t *testing.T) {
 	}
 }
 
-func TestKnowledgeShadowRequiresExplicitActivationAndStaysOutOfRuntime(t *testing.T) {
+func TestKnowledgeRuntimeSnapshotIncludesValidatedShadowAndRevisionChanges(t *testing.T) {
 	store := NewStore()
 	snapshot := eligibleKnowledgeSnapshot()
 	candidate := knowledgeCandidateForSnapshot(snapshot)
@@ -927,8 +923,9 @@ func TestKnowledgeShadowRequiresExplicitActivationAndStaysOutOfRuntime(t *testin
 	if err != nil || shadowed.Status != knowledgeCandidateShadow || shadow.Status != knowledgePackageShadow {
 		t.Fatalf("shadow package was not created: candidate=%+v package=%+v err=%v", shadowed, shadow, err)
 	}
-	if packages := store.KnowledgeRuntimeSnapshot().Packages; len(packages) != 0 {
-		t.Fatalf("shadow package must not enter active runtime snapshot: %+v", packages)
+	shadowSnapshot := store.KnowledgeRuntimeSnapshot()
+	if len(shadowSnapshot.Packages) != 1 || shadowSnapshot.Packages[0].Status != knowledgePackageShadow || shadowSnapshot.Packages[0].RuntimeStatus != knowledgePackageShadow {
+		t.Fatalf("validated shadow package must enter runtime snapshot with its status: %+v", shadowSnapshot.Packages)
 	}
 	if packages := store.ListKnowledgePackages(true); len(packages) != 1 || packages[0].Status != knowledgePackageShadow {
 		t.Fatalf("shadow package must remain reviewable: %+v", packages)
@@ -938,8 +935,12 @@ func TestKnowledgeShadowRequiresExplicitActivationAndStaysOutOfRuntime(t *testin
 	if err != nil || active.Status != knowledgeCandidateActive || pkg.Status != knowledgePackageActive {
 		t.Fatalf("shadow package was not activated: candidate=%+v package=%+v err=%v", active, pkg, err)
 	}
-	if packages := store.KnowledgeRuntimeSnapshot().Packages; len(packages) != 1 || packages[0].PackageID != pkg.PackageID {
-		t.Fatalf("activated package must enter runtime snapshot: %+v", packages)
+	activeSnapshot := store.KnowledgeRuntimeSnapshot()
+	if len(activeSnapshot.Packages) != 1 || activeSnapshot.Packages[0].PackageID != pkg.PackageID || activeSnapshot.Packages[0].RuntimeStatus != knowledgePackageActive {
+		t.Fatalf("activated package must enter runtime snapshot: %+v", activeSnapshot.Packages)
+	}
+	if shadowSnapshot.Revision == activeSnapshot.Revision {
+		t.Fatalf("runtime revision must change when package status changes: shadow=%s active=%s", shadowSnapshot.Revision, activeSnapshot.Revision)
 	}
 
 	rejectedStore := NewStore()

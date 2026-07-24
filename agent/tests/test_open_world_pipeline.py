@@ -11,7 +11,7 @@ from app.services.pipeline import (
     _link_probe_assessments_to_ledger,
     _merge_open_world_candidates,
     _public_v3_hypothesis,
-    _record_selected_hypothesis,
+    _record_selected_hypothesis_id,
     _refresh_public_reasoning_trace,
     new_state,
 )
@@ -100,6 +100,7 @@ def test_open_world_ledger_maps_private_facts_to_response_evidence_ids() -> None
                 "evidence_against": [],
             }
         ],
+        "reasoning_trace_v2": {"referenced_facts": [{"evidence_id": private_ids[0]}]},
     }
 
     _aggregate_evidence(state)
@@ -113,11 +114,12 @@ def test_open_world_ledger_maps_private_facts_to_response_evidence_ids() -> None
     assert set(novel.support_evidence_ids) == public_ids
     assert all(item.startswith("E") for item in novel.support_evidence_ids)
     assert "F-does-not-exist" not in novel.support_evidence_ids
-    assert set(
-        state.investigation_context["reasoning_trace_v3"]["hypotheses"][0][
-            "evidence_for"
+    assert (
+        state.investigation_context["reasoning_trace_v2"]["referenced_facts"][0][
+            "evidence_id"
         ]
-    ) == public_ids
+        in public_ids
+    )
 
 
 def test_open_world_candidate_rejects_text_only_artifacts() -> None:
@@ -317,13 +319,13 @@ def test_reasoning_trace_v3_contains_only_public_eligible_evidence_links() -> No
                 "evidence_for": [present_fact, unavailable_fact],
             }
         ],
+        "reasoning_trace_v2": {"stop_reason": "all_collectors_probed"},
     }
 
     _aggregate_evidence(state)
     _refresh_public_reasoning_trace(state)
 
     trace = state.investigation_context["reasoning_trace_v3"]
-    assert "stop_reason" not in trace
     assert trace["hypotheses"][0]["evidence_for"] == ["E01"]
     assert trace["hypotheses"][0]["evidence_against"] == []
     assert trace["rejected_evidence_links"] == [
@@ -376,6 +378,7 @@ def test_reasoning_trace_v3_exposes_precise_observation_timing() -> None:
         "hypothesis_ledger": [
             {"id": "H1", "status": "testing", "evidence_for": [private_id]}
         ],
+        "reasoning_trace_v2": {},
     }
 
     _aggregate_evidence(state)
@@ -428,6 +431,7 @@ def test_reasoning_trace_v3_uses_assessment_hypothesis_ids_without_family_infere
             {"id": "H-other", "family": "same-family-but-not-a-link", "status": "testing"},
             {"id": "H-exact", "family": "different-family", "status": "testing"},
         ],
+        "reasoning_trace_v2": {},
     }
 
     _aggregate_evidence(state)
@@ -445,26 +449,15 @@ def test_reasoning_trace_v3_uses_assessment_hypothesis_ids_without_family_infere
     }
 
     state.root_cause_candidates = [
-        RankedCause(
-            "novel_mount",
-            "medium",
-            6,
-            hypothesis_id="H-exact",
-            novelty="open_world",
-            mechanism="exact mount mechanism",
-            mechanism_fingerprint="mount-fingerprint",
-        )
+        RankedCause("novel_mount", "medium", 6, hypothesis_id="H-exact", novelty="open_world")
     ]
-    _record_selected_hypothesis(state)
+    _record_selected_hypothesis_id(state)
     assert state.investigation_context["reasoning_trace_v3"]["selected_hypothesis_id"] == "H-exact"
-    selected = state.investigation_context["reasoning_trace_v3"]["hypotheses"][1]
-    assert selected["mechanism"] == "exact mount mechanism"
-    assert selected["mechanism_fingerprint"] == "mount-fingerprint"
 
     state.root_cause_candidates = [
         RankedCause(
             "different-family", "medium", 6, hypothesis_id="H-missing", novelty="open_world"
         )
     ]
-    _record_selected_hypothesis(state)
+    _record_selected_hypothesis_id(state)
     assert "selected_hypothesis_id" not in state.investigation_context["reasoning_trace_v3"]

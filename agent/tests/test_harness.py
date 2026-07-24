@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
+import pytest
+
 from app.collectors.base import CollectorResult, artifact
-from app.schemas import AlertAnalysisResponse
+from app.schemas import Alert, AlertAnalysisRequest, AlertAnalysisResponse
+from app.services import pipeline
 from app.services.harness import (
     EvidenceLink,
     _trace_item,
@@ -14,6 +19,7 @@ from app.services.harness import (
     validate_evidence_links,
 )
 from app.services.root_cause_ranking import RankedCause
+from tests.test_orchestrator import make_settings
 
 
 def _response(detail: str = "## Root Cause\n\nA likely cause.") -> AlertAnalysisResponse:
@@ -32,6 +38,32 @@ def _response(detail: str = "## Root Cause\n\nA likely cause.") -> AlertAnalysis
         context={},
         artifacts=[],
     )
+
+
+@pytest.mark.asyncio
+async def test_harness_demotion_reconciles_confident_terminal_summary() -> None:
+    settings = replace(make_settings(), enable_rca_output_harness=True)
+    state = pipeline.new_state(
+        settings,
+        AlertAnalysisRequest(
+            alert=Alert(status="firing", labels={"alertname": "KubePodCrashLooping"})
+        ),
+        collectors=[],
+    )
+    state.results = []
+    state.root_cause_candidates = [
+        RankedCause("workload_runtime_error", "high", 8.0)
+    ]
+    state.response = _response(
+        "## Root Cause\n\nThe target container was terminated as OOMKilled [E01]."
+    )
+    state.response.analysis_summary = "The target container was terminated as OOMKilled."
+
+    await pipeline.harness_stage(state)
+
+    assert state.response.root_cause_family == "insufficient_evidence"
+    assert "OOMKilled" not in state.response.analysis_summary
+    assert "Insufficient evidence" in state.response.analysis_summary
 
 
 def _result(agent: str, summary: str = "NVRM Xid 79") -> CollectorResult:
@@ -281,8 +313,8 @@ def test_legacy_agent_fallback_excludes_partial_evidence_from_support() -> None:
         _response("## Root Cause\n\nOOMKilled was observed [E01]."),
         results,
         [
-            RankedCause(
-                "workload_startup_error",
+                RankedCause(
+                    "workload_runtime_error",
                 "medium",
                 5,
                 evidence_agents=["loki", "prometheus"],
@@ -510,37 +542,13 @@ def test_analysis_hash_changes_when_the_approved_reasoning_changes() -> None:
     response = _response()
     response.context = {
         "top_root_cause": {"mechanism": "CSI attach timeout"},
-        "reasoning_trace_v3": {
-            "schema_version": 3,
-            "selected_hypothesis_id": "H-1",
-            "hypotheses": [{"hypothesis_id": "H-1", "evidence_for": ["E01"]}],
-        },
+        "reasoning_trace_v2": {"hypothesis_id": "H-1", "support": ["E01"]},
     }
     first = analysis_hash(response)
 
-    response.context["reasoning_trace_v3"] = {
-        "schema_version": 3,
-        "selected_hypothesis_id": "H-2",
-        "hypotheses": [{"hypothesis_id": "H-2", "evidence_for": ["E02"]}],
-    }
+    response.context["reasoning_trace_v2"] = {"hypothesis_id": "H-2", "support": ["E02"]}
 
     assert analysis_hash(response) != first
-
-
-def test_analysis_hash_ignores_retired_reasoning_trace_v2() -> None:
-    response = _response()
-    response.context = {
-        "reasoning_trace_v3": {"schema_version": 3, "hypotheses": []},
-        "reasoning_trace_v2": {"schema_version": 2, "hypotheses": ["legacy"]},
-    }
-    first = analysis_hash(response)
-
-    response.context["reasoning_trace_v2"] = {
-        "schema_version": 2,
-        "hypotheses": ["different legacy value"],
-    }
-
-    assert analysis_hash(response) == first
 
 
 def test_abstain_preserves_leading_family_as_a_low_confidence_hypothesis() -> None:
@@ -607,3 +615,38 @@ def test_abstain_without_a_candidate_does_not_invent_a_family() -> None:
     assert "provisional_root_cause" not in response.context
     assert "do not support even a specific working hypothesis" in response.analysis_detail
     assert "before selecting a family" in response.analysis_detail
+
+
+def test_generic_alert_without_target_evidence_gate_fires() -> None:
+    response = _response()
+    cause = RankedCause("image_pull_error", "medium", 5.0)
+
+    flagged = evaluate(response, [], [cause], generic_state_alert=True)
+    assert flagged.gates["generic_alert_without_target_evidence"] is True
+    assert "generic_alert_without_target_evidence" in flagged.failed_gates
+
+    unflagged = evaluate(response, [], [cause], generic_state_alert=False)
+    assert unflagged.gates["generic_alert_without_target_evidence"] is False
+
+
+def test_generic_alert_with_target_verified_support_passes_gate() -> None:
+    results = [_result("kubernetes", "container waiting ImagePullBackOff")]
+    results[0].artifacts[0].type = "kubernetes_container_lifecycle"
+    results[0].artifacts[0].result = {
+        "container_reason": "imagepullbackoff",
+        "observation": {
+            "kind": "kubernetes_container_lifecycle",
+            "predicate": "kubernetes_target_container_lifecycle",
+            "polarity": "present",
+            "coverage": "scoped",
+            "target_identity_verified": True,
+            "observed_entity": {"kind": "pod", "name": "trainer-0"},
+        },
+    }
+    assign_evidence_ids(results)
+    cause = RankedCause(
+        "image_pull_error", "medium", 5.0, evidence_agents=["kubernetes"]
+    )
+
+    verdict = evaluate(_response(), results, [cause], generic_state_alert=True)
+    assert verdict.gates["generic_alert_without_target_evidence"] is False

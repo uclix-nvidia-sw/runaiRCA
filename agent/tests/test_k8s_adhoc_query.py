@@ -70,6 +70,37 @@ def test_k8s_read_builds_get_list_paths(monkeypatch) -> None:
     assert calls[-1]["params"]["fieldSelector"] == "spec.nodeName=gpu-node-a"
 
 
+@pytest.mark.asyncio
+async def test_describe_events_caps_after_newest_sort(monkeypatch) -> None:
+    events = [
+        {
+            "type": "Warning",
+            "reason": "Oldest" if index == 0 else f"Event{index}",
+            "eventTime": f"2026-07-10T01:{index:02d}:00Z",
+            "metadata": {"namespace": "runai"},
+            "involvedObject": {"kind": "Pod", "name": "trainer-0"},
+        }
+        for index in range(13)
+    ]
+
+    async def fake_mcp_json(*_args, **_kwargs):
+        return {"items": events}
+
+    monkeypatch.setattr(k8s, "_k8s_mcp_json", fake_mcp_json)
+    settings = replace(make_settings(), kubernetes_mcp_url="http://kubernetes-mcp/mcp")
+
+    result = await k8s._describe_events(
+        settings,
+        namespace="runai",
+        name="trainer-0",
+        expected_kind="Pod",
+        time_range={"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"},
+    )
+
+    assert result["items"][0]["reason"] == "Event12"
+    assert all(item.get("reason") != "Oldest" for item in result["items"] if isinstance(item, dict))
+
+
 def test_full_pod_inspection_masks_direct_api_environment_values(monkeypatch) -> None:
     async def fake_get_json(**kwargs):
         return JsonResponse(
@@ -425,6 +456,48 @@ async def test_mcp_named_read_rejects_a_different_resource(monkeypatch) -> None:
             name="worker-0",
             full_object=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_mcp_resource_candidates_always_include_api_version(monkeypatch) -> None:
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_mcp_json(_settings, candidates):
+        captured.extend(candidates)
+        return {"metadata": {"name": "worker-0", "namespace": "team-a"}}
+
+    monkeypatch.setattr(k8s, "_k8s_mcp_json", fake_mcp_json)
+    await k8s._k8s_read_via_mcp(
+        replace(make_settings(), kubernetes_mcp_url="http://kubernetes-mcp/mcp"),
+        "pods",
+        namespace="team-a",
+        name="worker-0",
+        full_object=True,
+    )
+
+    resources_get = [args for tool, args in captured if tool == "resources_get"]
+    assert resources_get
+    assert all(args.get("apiVersion") == "v1" for args in resources_get)
+
+
+@pytest.mark.asyncio
+async def test_base_mcp_node_read_does_not_emit_unversioned_resources_get(monkeypatch) -> None:
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_mcp_json(_settings, candidates):
+        captured.extend(candidates)
+        return {"metadata": {"name": "gpu-node"}}
+
+    monkeypatch.setattr(k8s, "_k8s_mcp_json", fake_mcp_json)
+    target = replace(make_target(), namespace="", pod="", node="gpu-node")
+    await k8s._collect_kubernetes_responses_via_mcp(
+        settings=replace(make_settings(), kubernetes_mcp_url="http://kubernetes-mcp/mcp"),
+        target=target,
+        control_plane_in_scope=False,
+    )
+
+    resources_get = [args for tool, args in captured if tool == "resources_get"]
+    assert resources_get == [{"apiVersion": "v1", "kind": "Node", "name": "gpu-node"}]
 
 
 @pytest.mark.asyncio

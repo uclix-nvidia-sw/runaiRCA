@@ -38,6 +38,7 @@ type PostgresState struct {
 	missingDataJSON          []byte
 	warningsJSON             []byte
 	artifactsJSON            []byte
+	memoryVectorJSON         []byte
 	emptyObjectJSON          []byte
 	emptyArrayJSON           []byte
 	execsNoDeadline          int
@@ -59,6 +60,7 @@ func NewPostgresState(failCreateVector bool) *PostgresState {
 		missingDataJSON:  []byte(`[]`),
 		warningsJSON:     []byte(`[]`),
 		artifactsJSON:    []byte(`[]`),
+		memoryVectorJSON: []byte(`{"gpu":2,"quota":2,"scheduling":1,"runai":1}`),
 		emptyObjectJSON:  []byte(`{}`),
 		emptyArrayJSON:   []byte(`[]`),
 	}
@@ -111,17 +113,6 @@ func (s *PostgresState) Executed(fragment string) bool {
 	defer s.mu.Unlock()
 	for _, statement := range s.execs {
 		if strings.Contains(statement, fragment) {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *PostgresState) Queried(fragment string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, query := range s.queries {
-		if strings.Contains(query, fragment) {
 			return true
 		}
 	}
@@ -334,12 +325,12 @@ func (s *PostgresState) rowsFor(query string) driver.Rows {
 		return &fakeRows{
 			columns: []string{
 				"incident_id", "alert_id", "title", "severity", "status", "analysis_summary",
-				"analysis_detail", "labels", "created_at",
+				"analysis_detail", "labels", "vector_json", "created_at",
 			},
 			values: [][]driver.Value{{
 				"INC-db", "ALR-db", "Prior GPU quota saturation", "warning", "resolved",
 				"Run:AI queue gpu-a was saturated.", "GPU quota blocked scheduling.",
-				s.labelsJSON, s.now,
+				s.labelsJSON, s.memoryVectorJSON, s.now,
 			}},
 		}
 	case strings.Contains(lowered, "from rca_feedback") && strings.Contains(lowered, "kind = 'comment'"):

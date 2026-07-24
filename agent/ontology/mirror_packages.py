@@ -17,7 +17,6 @@ from app.ontology.typedb_client import escape_typeql as esc
 from app.ontology.typedb_client import open_driver
 from ontology.ingest import _ensure, _replace_attr
 
-
 _SELECT_PACKAGES = """
 SELECT p.package_id, p.case_id, p.status, p.payload, p.published_at::text AS published_at,
        COALESCE(p.retired_at::text, '') AS retired_at, c.trace

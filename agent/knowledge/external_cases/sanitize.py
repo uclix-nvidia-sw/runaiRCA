@@ -49,29 +49,6 @@ _CURATED_TOKENS = {
     "1f328ed5fa18": ["DCGM_FI_DEV_GPU_UTIL", "RUN-39130", "clamp_max"],
     # all-blocked storage policy shows every storage option (runai_control_plane_error)
     "4f211c4d1ebb": ["canAdd false", "2.23.71 fix", "Run:ai 2.23.x"],
-    # existing-PVC-only storage policy: new PVC blocked, existing allowed
-    # (runai_control_plane_error)
-    "4b088e60d163": ["storage.pvc.instances canAdd false", "existingPvc true",
-                     "claimName in policy defaults"],
-    # negative CPU utilization from duplicate node-exporter scrape (observability_accuracy)
-    "83292dbb5fe3": ["negative CPU compute utilization", "duplicate node-exporter scrape",
-                     "ServiceMonitor PodMonitor duplicate collection"],
-    # fractional GPU metrics missing under CDI/device-plugin rename (observability_accuracy)
-    "f8cc6eda604d": ["runai_pod_gpu_info", "runai_gpu_utilization_per_fractional_pod",
-                     "k8s.device-plugin.nvidia.com/gpu="],
-}
-
-# Cases whose curation_decision was needs_human_review, resolved by an explicit
-# human semantic-diff review against the known-issues catalog (2026-07-16, owner).
-# sanitize rewrites the decision with this audit trail so the loader's
-# approved_for_ingestion gate stays intact (no loader change, no weakened gate).
-_HUMAN_REVIEWED = {
-    "0f59cfd7d537": "semantic_diff_review vs 'Scheduler Reclaim Panic On Large GPU Job': "
-    "entry corrected (fix line 2.22.50, getVictimResources panic signature); "
-    "case kept as unresolved prior",
-    "239ee9638d98": "semantic_diff_review vs 'Distributed Training Locked hostPath Policy "
-    "Rejected In UI': entry enriched (2.23.39 claimed fix ineffective, API workaround); "
-    "case kept as resolved prior",
 }
 
 
@@ -109,12 +86,6 @@ def sanitize(payload: dict) -> tuple[dict, str, list[str]]:
     context = payload.get("searchable_context")
     if isinstance(context, dict) and hash12 in _CURATED_TOKENS:
         context["curated_signature_tokens"] = list(_CURATED_TOKENS[hash12])
-
-    if hash12 in _HUMAN_REVIEWED:
-        approval = payload.get("approval") or {}
-        approval["curation_decision"] = "approved_for_ingestion_after_human_review"
-        approval["human_review"] = _HUMAN_REVIEWED[hash12]
-        payload["approval"] = approval
 
     # Values that must not survive anywhere in the output text.
     secrets = [s for s in {original_key, number} if s]

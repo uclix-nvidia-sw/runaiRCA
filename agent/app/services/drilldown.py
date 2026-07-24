@@ -75,7 +75,7 @@ from app.collectors.prometheus import prom_mcp_query, prom_query
 from app.collectors.runai_mcp import _tool_json, valid_official_workload_id
 from app.collectors.system import system_log_query
 from app.config import Settings
-from app.llm import complete_json, complete_with_error, llm_configured
+from app.llm import complete_json, complete_with_error, llm_configured, parse_json_object
 from app.masking import build_masker
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
@@ -307,23 +307,24 @@ async def _drill_one(
                 model=settings.llm_model_drilldown,
             )
             if decision is None:
-                # An LLM transport/parse failure must be distinguishable from a
-                # legitimate "done" — otherwise a dead LLM looks like a satisfied
-                # agent and nobody notices drill-down never ran. Re-ask once via
-                # complete_with_error to surface the REASON, so a persistent config
-                # error (HTTP 400 — the litellm-provider incident) or an empty body
-                # is distinguishable from a transient blip that recovered.
-                _text, decision_error = await complete_with_error(
+                # A failed decision is recoverable when the bounded transport
+                # retry returns a usable JSON response. Keep the second call to
+                # one retry; a persistent failure still surfaces its diagnostic.
+                retry_text, decision_error = await complete_with_error(
                     settings,
                     system=decision_system,
                     user=user_prompt,
                     model=settings.llm_model_drilldown,
                 )
-                detail = f": {decision_error}" if decision_error else ""
-                result.warnings.append(
-                    f"{result.agent} drill-down stopped at step {step}: LLM decision call failed{detail}"
-                )
-                break
+                retry_decision = parse_json_object(retry_text or "")
+                if isinstance(retry_decision, dict):
+                    decision = retry_decision
+                else:
+                    detail = f": {decision_error}" if decision_error else ""
+                    result.warnings.append(
+                        f"{result.agent} drill-down stopped at step {step}: LLM decision call failed{detail}"
+                    )
+                    break
             if not isinstance(decision, dict) or decision.get("action") != "query":
                 _log.info(
                     "drilldown %s: done after %d follow-up quer(ies)",
@@ -1762,7 +1763,9 @@ def _domain_tools(
         registry["prometheus"] = {
             "promql_query": {
                 "description": (
-                    "One MCP-first PromQL instant query against cluster metrics. args: "
+                    "One MCP-first PromQL query against cluster metrics. Use an instant "
+                    "function such as rate() for trends; raw range-vector selectors "
+                    "are evaluated as instant queries. args: "
                     "query (PromQL, e.g. 'rate(kube_pod_container_status_restarts_"
                     'total{namespace="x"}[15m])\'). '
                     f"Prefer these known-present series: {_KNOWN_PROMQL_SERIES}. "
@@ -2450,6 +2453,7 @@ async def _resolve_runai_cluster_id(settings: Settings, target: AnalysisTarget) 
         path="/api/v1/clusters",
         timeout_seconds=settings.runai_timeout_seconds,
         headers=headers,
+        verify=mcp_tls_verify(),
     )
     if not response.ok:
         raise RuntimeError(response.error or f"HTTP {response.status_code} resolving cluster ID")
@@ -2496,6 +2500,7 @@ async def _resolve_runai_project_id(settings: Settings, target: AnalysisTarget) 
         path="/api/v1/org-unit/projects",
         timeout_seconds=settings.runai_timeout_seconds,
         headers=headers,
+        verify=mcp_tls_verify(),
     )
     if not response.ok:
         raise RuntimeError(response.error or f"HTTP {response.status_code} resolving project ID")

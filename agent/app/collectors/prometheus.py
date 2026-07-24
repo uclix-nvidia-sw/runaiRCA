@@ -445,6 +445,81 @@ def _prometheus_range_step(time_range: dict[str, str] | None) -> int:
     return max(60, math.ceil((end - start).total_seconds() / 1000))
 
 
+def _promql_returns_range_vector(query: str) -> bool:
+    """Detect a top-level range selector/subquery before choosing the API.
+
+    Selectors nested inside functions such as ``rate(metric[5m])`` return an
+    instant vector and remain valid for ``query_range``. A selector at the
+    expression's top level returns a range vector, which Prometheus rejects at
+    the range endpoint.
+    """
+    query = query.strip()
+    if query.startswith("("):
+        depth = 0
+        in_string = False
+        escaped = False
+        for index, char in enumerate(query):
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    if not query[index + 1 :].strip():
+                        return _promql_returns_range_vector(query[1:index])
+                    break
+
+    paren_depth = 0
+    brace_depth = 0
+    in_string = False
+    escaped = False
+    for char in query:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "(":
+            paren_depth += 1
+        elif char == ")":
+            paren_depth = max(0, paren_depth - 1)
+        elif char == "{":
+            brace_depth += 1
+        elif char == "}":
+            brace_depth = max(0, brace_depth - 1)
+        elif char == "[" and paren_depth == 0 and brace_depth == 0:
+            return True
+    return False
+
+
+def _prometheus_query_path_and_params(
+    query: str, time_range: dict[str, str] | None
+) -> tuple[str, dict[str, str]]:
+    if not time_range:
+        return "/api/v1/query", {"query": query}
+    if _promql_returns_range_vector(query):
+        return "/api/v1/query", {"query": query, "time": time_range["end"]}
+    return "/api/v1/query_range", {
+        "query": query,
+        **time_range,
+        "step": str(_prometheus_range_step(time_range)),
+    }
+
+
 async def _collect_prometheus_direct(
     settings: Settings,
     queries: list[tuple[str, str]],
@@ -453,15 +528,12 @@ async def _collect_prometheus_direct(
 ) -> list[dict[str, object]]:
     query_results: list[dict[str, object]] = []
     for name, query in queries:
+        path, params = _prometheus_query_path_and_params(query, time_range)
         response = await get_json(
             base_url=settings.prometheus_url,
-            path="/api/v1/query_range" if time_range else "/api/v1/query",
+            path=path,
             timeout_seconds=settings.prometheus_timeout_seconds,
-            params=(
-                {"query": query, **time_range, "step": str(_prometheus_range_step(time_range))}
-                if time_range
-                else {"query": query}
-            ),
+            params=params,
             verify=mcp_tls_verify(),
         )
         status = _prometheus_status(response.data)
@@ -624,6 +696,13 @@ def _prometheus_mcp_args(
     time_range: dict[str, str] | None,
 ) -> dict[str, object]:
     query_window = time_range or {"start": "now-15m", "end": "now"}
+    if _promql_returns_range_vector(promql):
+        return {
+            "datasourceUid": datasource_uid,
+            "expr": promql,
+            "queryType": "instant",
+            "time": query_window["end"],
+        }
     return {
         "datasourceUid": datasource_uid,
         "expr": promql,
@@ -1336,15 +1415,13 @@ async def prom_query(
     """One ad-hoc PromQL query, bounded to the incident window when available."""
     if not settings.prometheus_url:
         return {"name": name, "query": promql, "error": "prometheus not configured", "data": None}
+    path, params = _prometheus_query_path_and_params(promql, time_range)
     resp = await get_json(
         base_url=settings.prometheus_url,
-        path="/api/v1/query_range" if time_range else "/api/v1/query",
+        path=path,
         timeout_seconds=settings.prometheus_timeout_seconds,
-        params=(
-            {"query": promql, **time_range, "step": str(_prometheus_range_step(time_range))}
-            if time_range
-            else {"query": promql}
-        ),
+        params=params,
+        verify=mcp_tls_verify(),
     )
     status = _prometheus_status(resp.data)
     error = resp.error or _prometheus_api_error(resp.data, status, require_success_status=True)

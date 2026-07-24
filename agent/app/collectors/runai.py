@@ -24,6 +24,7 @@ from app.collectors.runai_mcp import (
     valid_official_workload_id,
 )
 from app.config import Settings
+from app.mcp_client import mcp_tls_verify
 
 _VERSION_RE = re.compile(r"\d+\.\d+(?:\.\d+)?")
 _RUNAI_TOKEN_CACHE_TTL_SECONDS = 30.0
@@ -80,6 +81,7 @@ async def _fetch_runai_version(settings: Settings, headers: dict[str, str]) -> s
         path=settings.runai_version_path,
         timeout_seconds=settings.runai_timeout_seconds,
         headers=headers,
+        verify=mcp_tls_verify(),
     )
     return _extract_version(resp.data) if resp.ok else ""
 
@@ -551,6 +553,7 @@ async def _request_runai_token(settings: Settings, warnings: list[str]) -> str:
                 "clientSecret": settings.runai_client_secret,
             },
             headers={"Content-Type": "application/json"},
+            verify=mcp_tls_verify(),
         )
         if json_response.ok:
             return json_response.token
@@ -564,6 +567,7 @@ async def _request_runai_token(settings: Settings, warnings: list[str]) -> str:
                 "client_id": settings.runai_client_id,
                 "client_secret": settings.runai_client_secret,
             },
+            verify=mcp_tls_verify(),
         )
         if form_response.ok:
             return form_response.token
@@ -664,6 +668,7 @@ async def _collect_runai_response(
         timeout_seconds=settings.runai_timeout_seconds,
         params=params,
         headers=headers,
+        verify=mcp_tls_verify(),
     )
     time_range = incident_time_range(target)
     expected = _runai_expected_identity(name, target)

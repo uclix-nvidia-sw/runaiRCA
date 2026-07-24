@@ -11,6 +11,7 @@ from app.collectors.base import CollectorResult, artifact
 from app.plan import InvestigationPlan
 from app.services.evidence_blackboard import Blackboard
 from app.services.investigator import (
+    _apply_ledger_updates,
     _build_user_prompt,
     _evidence_sufficiency,
     _evidence_summary,
@@ -57,6 +58,44 @@ class LokiCollector:
 
 def _collectors() -> list[object]:
     return [RunaiCollector(), KubernetesCollector(), LokiCollector()]
+
+
+def test_typed_target_verified_artifact_is_attached_to_matching_hypothesis() -> None:
+    lifecycle = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_container_lifecycle",
+        status="ok",
+        confidence="high",
+        summary="target container lastTerminated reason=OOMKilled",
+        result={
+            "observation": {
+                "predicate": "kubernetes_target_container_lifecycle",
+                "polarity": "present",
+                "coverage": "scoped",
+                "target_identity_verified": True,
+                "observed_entity": {"kind": "pod", "name": "trainer-0"},
+            },
+            "containers": [
+                {"name": "main", "lastTerminated": {"reason": "OOMKilled", "exitCode": 137}}
+            ],
+        },
+    )
+    result = CollectorResult(agent="kubernetes", status="ok", summary="OOM", artifacts=[lifecycle])
+    board = Blackboard()
+    board.add_result("kubernetes", result, entity="pod:trainer-0")
+    fact_id = board.evidence_id_for(lifecycle)
+    ledger = [{"id": "H1", "family": "workload_runtime_error", "status": "supported"}]
+
+    _apply_ledger_updates(
+        ledger,
+        [],
+        blackboard=board,
+        artifacts=[lifecycle],
+        eligible_support_ids={fact_id},
+    )
+
+    assert ledger[0]["evidence_for"] == [fact_id]
 
 
 def test_unavailable_evidence_summary_does_not_expose_stale_signal_text() -> None:
@@ -654,8 +693,7 @@ async def test_scoped_supported_hypothesis_stops_before_remaining_collectors(
     assert kubernetes.calls == 1
     assert loki.calls == 0
     assert decision_calls == 2
-    assert "reasoning_trace_v2" not in context
-    assert context["hypothesis_ledger"][0]["status"] == "supported"
+    assert context["reasoning_trace_v2"]["stop_reason"] == "supported_hypothesis"
 
 
 @pytest.mark.asyncio
@@ -1322,4 +1360,35 @@ async def test_expired_shared_budget_returns_placeholder_for_unfinished_collecto
     assert len(results) == 1
     assert results[0].status == "unavailable"
     assert results[0].missing_data == ["slow.analysis_budget"]
-    assert "reasoning_trace_v2" not in context
+    assert context["reasoning_trace_v2"]["stop_reason"] == "analysis_budget_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_budget_starved_run_still_collects_typed_core_kubernetes() -> None:
+    # Slow stubs: with the shared window already exhausted the final gather
+    # times out and stamps budget skips — the regression this floor rescues.
+    class KubernetesCollector:
+        async def collect(self, target, plan=None) -> CollectorResult:
+            await asyncio.sleep(0.05)
+            return CollectorResult(agent="kubernetes", status="ok", summary="kubernetes ok")
+
+    class LokiCollector:
+        async def collect(self, target, plan=None) -> CollectorResult:
+            await asyncio.sleep(0.05)
+            return CollectorResult(agent="loki", status="ok", summary="loki ok")
+
+    results, _ = await investigate(
+        make_settings(),
+        make_target(),
+        [KubernetesCollector(), LokiCollector()],
+        InvestigationPlan(),
+        {},
+        max_steps=4,
+        deadline_monotonic=time.monotonic(),  # shared window already exhausted
+    )
+
+    by_agent = {result.agent: result for result in results}
+    # The typed-core floor rescues kubernetes; broad collectors stay skipped.
+    assert by_agent["kubernetes"].status == "ok"
+    assert by_agent["loki"].status == "unavailable"
+    assert "loki.analysis_budget" in by_agent["loki"].missing_data

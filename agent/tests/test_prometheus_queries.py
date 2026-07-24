@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from app.collectors.base import AnalysisTarget
-from app.collectors.prometheus import _queries_for
+from app.collectors.prometheus import (
+    _prometheus_mcp_args,
+    _prometheus_query_path_and_params,
+    _queries_for,
+)
 
 
 def _target() -> AnalysisTarget:
@@ -52,3 +56,26 @@ def test_pod_metric_queries_require_a_namespace_for_a_unique_identity():
     assert "container_memory" not in names
     assert "container_cpu" not in names
     assert "container_restarts" not in names
+
+
+def test_range_vector_uses_instant_api_form() -> None:
+    window = {"start": "2026-07-10T00:55:00Z", "end": "2026-07-10T01:15:00Z"}
+
+    path, params = _prometheus_query_path_and_params("metric[5m]", window)
+    assert path == "/api/v1/query"
+    assert params == {"query": "metric[5m]", "time": window["end"]}
+
+    path, _params = _prometheus_query_path_and_params("(metric[5m])", window)
+    assert path == "/api/v1/query"
+
+    path, params = _prometheus_query_path_and_params("rate(metric[5m])", window)
+    assert path == "/api/v1/query_range"
+    assert params["step"] == "60"
+
+    args = _prometheus_mcp_args("metric[5m]", "prom", window)
+    assert args == {
+        "datasourceUid": "prom",
+        "expr": "metric[5m]",
+        "queryType": "instant",
+        "time": window["end"],
+    }

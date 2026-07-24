@@ -23,29 +23,18 @@ def test_default_deadline_reserves_finalization_after_shared_evidence_budget() -
     assert _evidence_deadline_monotonic(state) == 640.0
 
 
-def test_optional_budget_stop_is_observability_only() -> None:
-    events: list[tuple[str, str, dict[str, str]]] = []
+def test_optional_budget_stop_is_trace_metadata_not_operator_warning() -> None:
     state = SimpleNamespace(
-        investigation_context={"hypothesis_ledger": []},
+        investigation_context={"reasoning_trace_v2": {}},
         extra_warnings=[],
-        progress=SimpleNamespace(
-            emit=lambda stage, message, **payload: events.append(
-                (stage, message, payload)
-            )
-        ),
     )
 
     _record_evidence_budget_stop(state, "additional investigation iterations")
 
-    assert state.investigation_context == {"hypothesis_ledger": []}
+    assert state.investigation_context["reasoning_trace_v2"]["stop_reason"] == (
+        "analysis_budget_exhausted"
+    )
     assert state.extra_warnings == []
-    assert events == [
-        (
-            "investigation",
-            "Evidence budget reached; moving to synthesis",
-            {"stopped_phase": "additional investigation iterations"},
-        )
-    ]
 
 
 @pytest.mark.asyncio

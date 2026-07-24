@@ -14,13 +14,13 @@ from types import SimpleNamespace
 import pytest
 
 from app.collectors.base import AnalysisTarget, CollectorResult, artifact
+from app.plan import InvestigationPlan
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services import pipeline
 from app.services.evidence_blackboard import EvidenceEligibility
 from app.services.orchestrator import AnalysisOrchestrator
 from app.services.pipeline import _collector_name
 from app.services.root_cause_ranking import RankedCause
-from app.plan import InvestigationPlan
 from tests.test_orchestrator import make_settings
 
 
@@ -419,6 +419,24 @@ def test_low_confidence_hypothesis_still_requests_targeted_followup() -> None:
     )
 
     assert pipeline._needs_more_investigation(state) is True
+
+
+def test_reanalysis_cannot_reselect_the_self_refuted_family_on_same_mechanism() -> None:
+    target = pipeline._ReanalysisTarget(
+        "workload_runtime_error",
+        "re-analysis after refutation",
+        refuted_family="workload_runtime_error",
+    )
+    candidates = [
+        RankedCause("workload_runtime_error", "high", 9.0),
+        RankedCause("workload_startup_error", "medium", 3.0),
+    ]
+
+    filtered = pipeline._exclude_refuted_reanalysis_candidates(candidates, target)
+
+    assert [candidate.family for candidate in filtered] == ["workload_startup_error"]
+    only_refuted = pipeline._exclude_refuted_reanalysis_candidates(candidates[:1], target)
+    assert only_refuted[0].family == "insufficient_evidence"
 
 
 def test_medium_insufficient_evidence_still_requests_targeted_followup() -> None:

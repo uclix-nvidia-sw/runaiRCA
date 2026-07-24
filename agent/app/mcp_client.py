@@ -8,6 +8,7 @@ import re
 import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -70,22 +71,41 @@ async def _within_mcp_budget(factory):
         raise TimeoutError("MCP collector budget exhausted before direct fallback") from exc
 
 
-def mcp_tls_verify() -> bool:
-    """Use the MCP TLS escape hatch for direct internal datasource calls too."""
-    return os.getenv("MCP_TLS_VERIFY", "").strip().lower() in ("1", "true", "yes")
+def _env_true(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes")
+
+
+def _env_false(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("0", "false", "no")
+
+
+def _mcp_ca_path() -> str:
+    """Return the configured mounted CA bundle when it is present."""
+    configured = os.getenv("MCP_TLS_CA_PATH", "").strip()
+    if not configured:
+        configured = os.getenv("KUBERNETES_CA_PATH", "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt").strip()
+    return configured if configured and Path(configured).is_file() else ""
+
+
+def mcp_tls_verify() -> bool | str:
+    """Return the TLS verification policy for MCP and direct datasource calls.
+
+    Verification is enabled by default.  A mounted/configured CA bundle is used
+    when available; disabling verification requires an explicit opt-in.
+    """
+    if _env_true("MCP_TLS_INSECURE") or _env_false("MCP_TLS_VERIFY"):
+        return False
+    return _mcp_ca_path() or True
 
 
 def _mcp_client_factory():
     """httpx client factory for MCP streamable-HTTP calls.
 
-    MCP endpoints here are internal and served with self-signed certs, so default
-    to skipping TLS verification — otherwise every https MCP call fails the
-    handshake and demotes the whole collector to the noisier direct-API fallback.
-    This is an internal RCA tool; set MCP_TLS_VERIFY=true once the endpoints
-    present a trusted cert to restore verification.
-    ponytail: insecure-by-default MCP TLS; flip MCP_TLS_VERIFY=true to harden.
+    Use the pod's mounted/configured CA bundle when available.  The insecure
+    escape hatch is explicit and disabled by default.
     """
-    if mcp_tls_verify():
+    verify = mcp_tls_verify()
+    if verify is True:
         return None  # None → SDK's default client (system trust store)
 
     def factory(
@@ -93,9 +113,9 @@ def _mcp_client_factory():
         timeout: httpx.Timeout | None = None,
         auth: httpx.Auth | None = None,
     ) -> httpx.AsyncClient:
-        # Mirrors mcp.shared._httpx_utils.create_mcp_http_client (follow_redirects +
-        # 30s/300s default timeout) with TLS verification disabled.
-        kwargs: dict[str, Any] = {"follow_redirects": True, "verify": False}
+        # Mirrors mcp.shared._httpx_utils.create_mcp_http_client (follow_redirects
+        # + 30s/300s default timeout), while preserving the selected CA policy.
+        kwargs: dict[str, Any] = {"follow_redirects": True, "verify": verify}
         kwargs["timeout"] = timeout if timeout is not None else httpx.Timeout(30.0, read=300.0)
         if headers is not None:
             kwargs["headers"] = headers

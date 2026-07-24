@@ -15,12 +15,12 @@ FM = "knowledge/failure_modes.yaml"
 def test_symptom_from_non_top_family_still_matches() -> None:
     fm = load_failure_modes(FM)
     # Ranker says node pressure, but the evidence signature is an OOMKilled
-    # (workload_startup_error). The precise fix must still surface.
+    # (workload_runtime_error). The precise fix must still surface.
     matches = match_failure_mode_symptoms(
         fm, "the container was oomkilled", "node_kubelet_pressure"
     )
     fams = {f for f, _ in matches}
-    assert "workload_startup_error" in fams
+    assert "workload_runtime_error" in fams
 
 
 def test_gpu_hardware_error_symptom_is_reachable() -> None:

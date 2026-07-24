@@ -110,7 +110,7 @@ def test_oomkilled_has_exclusive_pod_level_remediation() -> None:
     modes = load_failure_modes(YAML)
     symptom = next(
         item
-        for item in modes["workload_startup_error"]
+        for item in modes["workload_runtime_error"]
         if item["symptom"] == "OOMKilled"
     )
 

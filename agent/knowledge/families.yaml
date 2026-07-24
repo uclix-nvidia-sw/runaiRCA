@@ -131,7 +131,6 @@
     - loki
   keywords:
     - crashloopbackoff
-    - oomkilled
     - failedmount
     - createcontainererror
     - createcontainerconfigerror
@@ -304,6 +303,7 @@
     - loki
     - kubernetes
   keywords:
+    - oomkilled
     - "cuda out of memory"
     - "torch.cuda"
     - "traceback (most recent call last)"

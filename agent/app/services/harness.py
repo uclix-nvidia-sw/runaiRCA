@@ -196,6 +196,7 @@ def evaluate(
     evidence_links: Iterable[EvidenceLink | Mapping[str, Any]] | None = None,
     evidence_eligibility: Mapping[str, object] | None = None,
     known_issues: list[dict] | None = None,
+    generic_state_alert: bool = False,
 ) -> HarnessVerdict:
     top = candidates[0] if candidates else None
     usable = _usable_artifacts(results)
@@ -338,6 +339,16 @@ def evaluate(
         # gate to high let contradicted medium conclusions retain remediation
         # authority.
         "unresolved_contradiction": bool(not insufficient and contradiction_ids),
+        # Generic state alerts (non-ready / waiting / replicas-mismatch class)
+        # describe a symptom shared by many causes. Naming a specific family
+        # without a single target-verified supporting observation is a guess
+        # (2026-07-24 audit: 4/10 KubePodNotReady runs concluded families with
+        # zero target-scoped artifacts).
+        "generic_alert_without_target_evidence": bool(
+            not insufficient
+            and generic_state_alert
+            and not any(_target_verified_artifact(item) for item in supporting)
+        ),
         "unsafe_action_without_guardrail": _unsafe_action_without_guardrail(
             response.analysis_detail
         ),
@@ -398,6 +409,17 @@ def apply_trace(response: AlertAnalysisResponse, verdict: HarnessVerdict) -> boo
     response.analysis_detail = response.analysis_detail.rstrip() + "\n\n" + "\n".join(lines)
     response.analysis = response.analysis_detail
     return True
+
+
+def _target_verified_artifact(item: object) -> bool:
+    payload = getattr(item, "result", None)
+    if not isinstance(payload, dict):
+        return False
+    observation = payload.get("observation")
+    return (
+        isinstance(observation, dict)
+        and observation.get("target_identity_verified") is True
+    )
 
 
 def _trace_item(item: object) -> dict[str, str]:
@@ -611,16 +633,17 @@ def analysis_hash(response: AlertAnalysisResponse) -> str:
 
     Snapshot identity must change when the selected mechanism, causal trace, or
     evidence links change even if an editor happens to produce the same Korean
-    summary/detail.  The rendered RCA fields remain inside the canonical
-    payload so review semantics are preserved for newly generated hashes.
+    summary/detail.  The v1 fields remain inside the canonical payload so old
+    review semantics are preserved for newly generated hashes.
     """
     context = response.context if isinstance(response.context, dict) else {}
     payload = {
-        "schema_version": 3,
+        "schema_version": 2,
         "summary": response.analysis_summary,
         "detail": response.analysis_detail,
         "root_cause_family": response.root_cause_family,
         "top_root_cause": context.get("top_root_cause"),
+        "reasoning_trace_v2": context.get("reasoning_trace_v2"),
         "reasoning_trace_v3": context.get("reasoning_trace_v3"),
         "evidence_links": context.get("evidence_links"),
     }

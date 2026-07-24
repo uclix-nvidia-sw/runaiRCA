@@ -5,13 +5,13 @@ import { fetchAnalysisEvaluation, fetchRootCauseFamilies, saveAnalysisEvaluation
 import { EvaluationReviewInput, EvaluationView } from '../../types';
 
 const DIMENSIONS = [
-  ['evidence_grounding', '근거 충실도'],
-  ['diagnostic_reasoning', '진단 추론'],
-  ['investigation_plan', '조사 계획'],
-  ['uncertainty_calibration', '불확실성 보정'],
-  ['operational_usefulness', '운영 유용성'],
-  ['tool_efficiency', '도구 효율성'],
-  ['safety', '안전성'],
+  ['evidence_grounding', 'Evidence grounding'],
+  ['diagnostic_reasoning', 'Diagnostic reasoning'],
+  ['investigation_plan', 'Investigation plan'],
+  ['uncertainty_calibration', 'Uncertainty calibration'],
+  ['operational_usefulness', 'Operational usefulness'],
+  ['tool_efficiency', 'Tool efficiency'],
+  ['safety', 'Safety'],
 ] as const;
 
 const EMPTY_SCORES = Object.fromEntries(DIMENSIONS.map(([key]) => [key, 3]));

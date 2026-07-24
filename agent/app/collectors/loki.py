@@ -13,6 +13,7 @@ from app.collectors.base import (
     AnalysisTarget,
     CollectorResult,
     artifact,
+    causal_evidence_time_range,
     incident_time_range,
     ko_en,
     parse_incident_time,
@@ -879,8 +880,15 @@ def _loki_query_observation(
 ) -> dict[str, object]:
     """Classify a LogQL result without making unbounded empty searches refute RCA."""
     name = str(item.get("name") or "logs")
+    causal_time_range = (
+        (causal_evidence_time_range(target) or time_range)
+        if target is not None and time_range
+        else time_range
+    )
     window_verified = _loki_entries_in_window(item.get("sample_entries"), time_range)
-    affirmative_lines = _loki_affirmative_lines(_verification_entries(item), time_range)
+    affirmative_lines = _loki_affirmative_lines(
+        _verification_entries(item), causal_time_range
+    )
     if item.get("error"):
         polarity, coverage = "unavailable", "unknown"
     elif name == "runai_control_plane_errors":
@@ -909,6 +917,10 @@ def _loki_query_observation(
         # can mention a failure token (or merely contain application prose),
         # so its presence cannot ground a causal hypothesis.  The targeted
         # error query below may still produce a typed signal.
+        polarity, coverage = "unknown", "partial"
+    elif name in _LOKI_CORRELATED_QUERY_NAMES and not affirmative_lines:
+        # Correlated rows outside the causal span remain investigation context;
+        # the collection epilogue must not promote them to a historical cause.
         polarity, coverage = "unknown", "partial"
     elif int(item.get("line_count") or 0) == 0:
         polarity, coverage = "absent", "scoped"
@@ -949,6 +961,7 @@ def _loki_query_observation(
         "stream_count": int(item.get("stream_count") or 0),
         "affirmative_line_count": len(affirmative_lines),
         "observation_window": time_range or {},
+        "causal_window": causal_time_range or {},
         "log_window_verified": window_verified,
     }
     if observed_entity:
@@ -956,7 +969,9 @@ def _loki_query_observation(
     if target_scope_verified is not None:
         observation["target_scope_verified"] = target_scope_verified
     if polarity == "present":
-        evidence_window = _loki_evidence_window(item.get("sample_entries"), time_range)
+        evidence_window = _loki_evidence_window(
+            item.get("sample_entries"), causal_time_range
+        )
         if evidence_window:
             observation["evidence_window"] = evidence_window
     return observation
