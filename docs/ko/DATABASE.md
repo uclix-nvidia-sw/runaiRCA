@@ -42,8 +42,9 @@ flowchart LR
 파이프라인은 PostgreSQL을 사용합니다. TypeDB는 선택 사항인 토폴로지와 승인 이력 관계에만
 사용하며, 두 번째 운영 신뢰 원천이 아닙니다.
 
-테이블은 시작 시 백엔드가 자동 생성합니다(`backend/store_postgres.go`). 총 14개이며,
-역할별로 묶으면 다음과 같습니다.
+테이블은 시작 시 백엔드가 자동 생성합니다(`backend/store_postgres.go`). 백엔드 소유 테이블은
+12개이며, 역할별로 묶으면 다음과 같습니다. 나머지 둘 — `rca_dataset`와
+`ontology_backfill_cursors` — 는 Go 백엔드가 아니라 에이전트의 Python 오프라인 잡이 생성합니다.
 
 **수집 & 분석**
 
@@ -52,7 +53,7 @@ flowchart LR
 | `incidents` | 상관된 알림 그룹 — RCA와 Slack 스레드의 단위 | `incident_id` (PK), `correlation_key`, `status`, `fired_at`, `resolved_at`, `alert_count`, `analysis_seq`, `user_approved_at` |
 | `alerts` | 개별 알림. 같은 알림의 재발은 여기 누적 | `alert_id` (PK), `incident_id`, `fingerprint`, `occurrence_count`, `occurrence_pods` (JSONB), `labels`/`annotations` (JSONB), `thread_ts` |
 | `analysis_runs` | **RCA 신뢰의 원천** — 매 분석 실행의 전체 산출물 | `run_id` (PK), `source` (`auto`/`manual`/`chat`/`feedback`), `status`, `target_type`/`target_id`, `analysis_summary`/`analysis_detail`, `analysis_quality`, `root_cause_family`, `capabilities`/`missing_data`/`warnings`/`artifacts` (JSONB) |
-| `incident_embeddings` | 유사도 메모리 — 과거의 닮은 인시던트 검색 | `incident_id`, `alert_id`, `analysis_summary`/`analysis_detail`, `vector_json` (JSONB), `embedding vector(384)` + HNSW cosine index |
+| `incident_embeddings` | 유사도 메모리 — 과거의 닮은 인시던트 검색. 승인된 인시던트당 한 행(`alert_id`는 유지되지만 항상 빈 값) | `incident_id`, `alert_id`(`''`), `analysis_summary`/`analysis_detail`, `vector_json` (JSONB), `embedding vector(N)`(N = `EMBEDDING_DIM`, 기본 384) + HNSW cosine index |
 
 > `alerts`의 알림별 RCA 컬럼(`analysis_*`, `capabilities`, …)은 **제거되었습니다** — RCA는
 > `analysis_runs`에 있습니다. 백엔드는 더 이상 이 컬럼들을 생성하거나 읽지 않으며, 기존
@@ -73,7 +74,7 @@ flowchart LR
 | 테이블 | 목적 | 주요 컬럼 |
 |---|---|---|
 | `rca_case_snapshots` | **운영자가 승인한** RCA의 불변 스냅샷 — 학습과 온톨로지의 입력 | `case_id` (PK = `run_id:hash`), `incident_id`, `run_id`, `analysis_hash`, `approval_state` (`active`/`revoked`/`superseded`), `mechanism_fingerprint`, `snapshot` (JSONB) |
-| `knowledge_candidates` | 스냅샷에서 뽑은 지식 후보. 리뷰 상태머신을 따라 이동 | `candidate_id` (PK), `case_id`, `knowledge_fingerprint`, `supporting_case_count`, `status` (`ready_for_review`→`active` / `validation_failed` / `rejected` / `superseded`), `content_hash`, `payload` (JSONB) |
+| `knowledge_candidates` | 스냅샷에서 뽑은 지식 후보. 리뷰 상태머신을 따라 이동 | `candidate_id` (PK), `case_id`, `knowledge_fingerprint`, `supporting_case_count`, `status` (`generated` → `ready_for_review`/`shadow` → `active` / `validation_failed` / `rejected` / `superseded`), `content_hash`, `payload` (JSONB) |
 | `knowledge_candidate_cases` | M:N 링크 — 한 후보를 뒷받침하는 승인 케이스들(교차 인시던트 dedup) | `candidate_id` + `case_id` (복합 PK), `linked_at` |
 | `knowledge_packages` | 발행된 지식. TypeDB로 미러 | `package_id` (PK = `KPK-<case>`), `candidate_id`, `status` (`active`/`shadow`/`retired`), `payload` (JSONB), `mirror_status` |
 | `knowledge_events` | 모든 수명주기 전이의 append-only 감사 로그 | `event_id` (PK), `candidate_id`, `package_id`, `event_type`, `actor`, `note`, `created_at` |
@@ -87,9 +88,10 @@ flowchart LR
 | `ontology_backfill_cursors` | 일회성 백필 북킵(스냅샷 → TypeDB) | `cursor_name` (PK), `approved_at`, `case_id` |
 
 **유사도 검색**: `incident_embeddings.embedding`(pgvector, HNSW cosine)이 기본 경로이며,
-OpenAI 호환 embedding endpoint가 설정된 경우 기본 경로입니다. 질의와 저장된 메모리 모두
-RCA summary/detail을 포함하며, 같은 family와 정규화된 workload identity 신호가 랭킹을
-보강합니다. endpoint 또는 dense 검색을 사용할 수 없으면 Backend는 결정론적인 384차원
+OpenAI 호환 embedding endpoint가 설정된 경우 기본 경로입니다. 저장된 메모리는 RCA
+summary/detail을 포함하지만, 질의는 유입 알림의 제목·심각도·annotation·label로 구성됩니다
+(발화 중인 알림에는 아직 RCA가 없습니다). 같은 family와 정규화된 workload identity 신호가
+랭킹을 보강합니다. endpoint 또는 dense 검색을 사용할 수 없으면 Backend는 결정론적인 384차원
 희소 feature-hash cosine 검색으로 폴백합니다. embedding basis/model/dimension이 변경되면
 파생 벡터를 다시 생성하며, embedding 오류가 발생해도 인시던트 저장과 검색은 계속 사용할
 수 있습니다. `labels`/`annotations` JSONB는 인제스트가 소비하는 가장 풍부한 엔티티

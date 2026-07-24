@@ -103,8 +103,8 @@ orchestration flow that ties these together is the [RCA Pipeline](RCA-PIPELINE.m
 For timestamped alerts, collectors retain a collection window from five minutes
 before firing through five minutes after resolution (a firing alert is bounded
 to 15 minutes). A post-resolution epilogue remains visible as recovery context,
-but occurrence evidence in Postgres, Change, and System is promoted only inside
-the causal window ending at resolution. Change history starts one hour before
+but occurrence evidence in Postgres, Change, System, and Loki is promoted only
+inside the causal window ending at resolution. Change history starts one hour before
 the fired time; its drill-down `lookback_seconds` may widen that historical
 range from 60 to 86,400 seconds. Successful change results are cached for about
 120 seconds only within one analysis, so a later re-analysis recollects fresh.

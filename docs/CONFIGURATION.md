@@ -34,7 +34,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `AGENT_URL` | Backend to Agent URL, default `http://localhost:8000` |
 | `KNOWLEDGE_VALIDATOR_URL` | Backend approval-time Agent validator base URL. The backend appends `/knowledge/validate`; Helm defaults this to the in-cluster Agent service. |
 | `BACKEND_URL` | Agent to Backend URL used for fire-and-forget analysis progress events. Empty disables progress POSTs; Helm points it at the backend service by default |
-| `DYNAMIC_KNOWLEDGE_MODE` | Runtime use of approved incident-derived knowledge: `off`, `shadow` (default), `assist`, or `authoritative`. `shadow` records observations without changing the headline RCA. |
+| `DYNAMIC_KNOWLEDGE_MODE` | Runtime use of approved incident-derived knowledge: `off`, `shadow`, `assist` (default), or `authoritative`. `shadow` records observations without changing the headline RCA; `assist` merges active packages and emits pending-activation hints without changing family selection; `authoritative` merges active and shadow packages with provenance markers. |
 | `RUNTIME_KNOWLEDGE_URL` | Read-only approved-knowledge snapshot URL. When empty, the Agent derives `${BACKEND_URL}/api/v1/knowledge/runtime-snapshot`; Helm exposes an explicit override. |
 | `RUNTIME_KNOWLEDGE_TOKEN` | Optional bearer token for the runtime knowledge snapshot endpoint. Empty is safe for the in-cluster default endpoint. |
 | `RUNTIME_KNOWLEDGE_REFRESH_SECONDS` | Runtime knowledge refresh interval, default `30` seconds (values below `30` are raised to `30`). |
@@ -108,14 +108,16 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `NAT_CONFIG_FILE` | Internal NeMo engine workflow config path, default `configs/runai_rca_engine.yml` |
 | `ENABLE_INVESTIGATION_LOOP` | Central LLM investigation loop: plan → probe the most relevant agents → observe → re-plan, default `false` (Helm sets `true`) |
 | `OPEN_WORLD_RCA_MODE` | `off`, `shadow`, `assist`, or `authoritative`; defaults to `shadow`. Shadow records open-world reasoning without changing the RCA headline. |
-| `MAX_INVESTIGATION_STEPS` | Legacy compatibility limit; default `0` means semantic completion under the overall analysis deadline. |
-| `MAX_REANALYSIS_STEPS` | Legacy compatibility limit for a re-analysis pass; default `0` means semantic completion under the overall analysis deadline. |
+| `MAX_INVESTIGATION_STEPS` | Investigation-loop step limit, default `3` (Helm also `3`); `0` means semantic completion under the overall analysis deadline. |
+| `MAX_REANALYSIS_STEPS` | Step limit for a re-analysis pass, default `3` (Helm also `3`); `0` means semantic completion under the overall analysis deadline. |
 | `ENABLE_AGENT_DRILLDOWN` | Per-collector autonomous drill-down: each evidence agent (kubernetes/prometheus/loki/runai) continues through distinct read-only probes until it is done, repeats a query, or reaches the analysis deadline; default `false` (Helm sets `true`) |
 | `LLM_SYNTHESIS_MAX_TOKENS` | Completion budget for the final Korean JSON report, default `16384`. |
 | `ANALYSIS_DEADLINE_SECONDS` | Overall hard cap per analysis (graceful degraded report on overrun), default `900` (15 min), `0` = no cap. Keep the backend `AGENT_REQUEST_TIMEOUT_SECONDS` above this. |
 | `ENABLE_RCA_OUTPUT_HARNESS` | Validate the final RCA against live evidence and safety gates, default `true` |
 | `MAX_RCA_REPAIR_ATTEMPTS` | Maximum final-report repair passes after harness validation, default `3` |
 | `RCA_HARNESS_PASS_SCORE` | Non-fatal harness score threshold (0..100), default `70` |
+| `AUTO_ANALYZE_SEVERITIES` | Backend: alert severities that trigger auto-analysis, default `warning,critical` |
+| `ENABLE_HELM_CHANGE_DETECTION` | Agent: enable Helm/ConfigMap change detection in the Change collector, default `false`. Enabling it grants the agent broad Secret read RBAC — keep off unless needed. |
 | `MAX_AUTO_ANALYZE_FANOUT` | Backend: max analyses started per webhook, default `50` |
 | `MAX_CONCURRENT_AGENT_RUNS` | Backend: max analyses running against the Agent concurrently, default `50` |
 | `FLAPPING_GROUP_WINDOW_MINUTES` | Backend: quiet window before a recurring alert becomes a NEW incident vs another occurrence, code default `120` (Helm sets `360`) |
@@ -182,7 +184,7 @@ Frequently tuned Helm values:
 | `agent.rbac.clusterWide` | Use a ClusterRole for Kubernetes evidence collection; default `true` |
 | `agent.rbac.namespaces` | Namespaces that receive Role/RoleBinding when `agent.rbac.clusterWide=false`; defaults to the release namespace |
 | `agent.env.kubernetesNamespaces` | Agent-side Kubernetes namespace allowlist; when empty and `clusterWide=false`, Helm derives it from `agent.rbac.namespaces` |
-| `agent.env.dynamicKnowledgeMode` / `runtimeKnowledgeUrl` / `runtimeKnowledgeRefreshSeconds` / `runtimeKnowledgeTimeoutSeconds` | Approved runtime-knowledge mode and snapshot client settings. Defaults are `shadow`, the derived backend snapshot URL, `30`, and `10`. |
+| `agent.env.dynamicKnowledgeMode` / `runtimeKnowledgeUrl` / `runtimeKnowledgeRefreshSeconds` / `runtimeKnowledgeTimeoutSeconds` | Approved runtime-knowledge mode and snapshot client settings. Defaults are `assist`, the derived backend snapshot URL, `30`, and `10`. |
 | `agent.env.runtimeKnowledgeToken` | Optional runtime snapshot bearer token; defaults to empty. Use a secret-managed values mechanism in production. |
 | `agent.serviceAccount.annotations` | ServiceAccount annotations for workload identity integrations |
 | `{backend,frontend,postgresql}.automountServiceAccountToken` | Disable Kubernetes API token mounts for pods that do not need cluster API access; default `false` |

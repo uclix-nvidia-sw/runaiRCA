@@ -121,7 +121,7 @@ flowchart LR
 ### 증거 시간, 범위, 전송 규칙
 
 - 수집 시간 창은 발생 5분 전부터 해결 5분 후까지이며 firing 알림은 15분으로 제한됩니다.
-  해결 후 에필로그는 문맥으로 남지만, Postgres, Change, System의 인과 승격은 해결 시각에 끝납니다.
+  해결 후 에필로그는 문맥으로 남지만, Postgres, Change, System, Loki의 인과 승격은 해결 시각에 끝납니다(모두 하나의 `causal_evidence_time_range`를 공유).
 - Kubernetes는 가장 비정상적이고 시간 관련성이 높으며 시간순으로 정렬된 Pod와 Event 5개를
   누락 수와 함께 유지하고, Warning 집계와 Normal `Preempted` workload/PodGroup 이벤트를
   보존하며, 노드 cordon/taint 상태를 포함합니다.

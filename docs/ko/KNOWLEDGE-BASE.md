@@ -106,6 +106,19 @@ known issue를 *모든* family에서 찾습니다. exact 매치가 우선이고 
 반증, 선언형 probe template이 담깁니다. placeholder는 alert scope에서만 채워집니다. 이것은
 shell 명령이 아니며, 각 Agent의 읽기 전용 tool registry가 실제 권한 경계입니다.
 
+**런타임 활성화 사다리.** 승인된 지식 패키지를 실시간 분석에 얼마나 적극적으로 반영할지는
+`DYNAMIC_KNOWLEDGE_MODE`(기본값 `assist`)로 제어합니다.
+
+- `off` — 승인된 패키지를 런타임에 참조하지 않습니다.
+- `shadow` — headline RCA를 바꾸지 않고 관찰만 기록합니다.
+- `assist` — **active** 패키지를 병합하고 shadow "활성화 대기" 보고 힌트를 내되, family 선택은
+  바꾸지 않습니다.
+- `authoritative` — **active와 shadow** 패키지를 기여한 패키지·family·symptom을 명시하는
+  provenance 마커와 함께 병합합니다.
+
+런타임 패키지의 family는 닫힌 `families.yaml` 카탈로그로 hard-validate되며, 카탈로그 밖의
+family를 지목하는 패키지는 거부됩니다.
+
 ## 4. 전체 예시: NVIDIA Xid 79
 
 **상황:** 워크로드 알림에 `NVRM: Xid ... 79`, “GPU has fallen off the bus”가 나타납니다.

@@ -126,8 +126,8 @@ collector still fails gracefully to `unavailable`. Sensitive values are masked
 
 - The collection window is fired minus five minutes through resolved plus five
   minutes; a firing alert is capped at 15 minutes. The post-resolution epilogue
-  remains context, while causal promotion in Postgres, Change, and System ends
-  at resolution.
+  remains context, while causal promotion in Postgres, Change, System, and Loki
+  ends at resolution (all share one `causal_evidence_time_range`).
 - Kubernetes keeps five most unhealthy/time-relevant, time-sorted Pods and Events
   with omitted counts, preserves Warning aggregation plus Normal `Preempted`
   workload/PodGroup events, includes

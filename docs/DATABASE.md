@@ -46,7 +46,9 @@ TypeDB only for optional topology and approved-history relationships; it is neve
 a second operational source of truth.
 
 Tables are auto-created by the backend on startup (`backend/store_postgres.go`).
-Fourteen tables, grouped by what they serve.
+Twelve backend-owned tables, grouped by what they serve. Two more —
+`rca_dataset` and `ontology_backfill_cursors` — are created by the agent's
+Python offline jobs, not the Go backend.
 
 **Ingestion & analysis**
 
@@ -55,7 +57,7 @@ Fourteen tables, grouped by what they serve.
 | `incidents` | Correlated alert groups — the unit of RCA and the Slack thread | `incident_id` (PK), `correlation_key`, `status`, `fired_at`, `resolved_at`, `alert_count`, `analysis_seq`, `user_approved_at` |
 | `alerts` | Individual alerts; a re-firing alert accrues here | `alert_id` (PK), `incident_id`, `fingerprint`, `occurrence_count`, `occurrence_pods` (JSONB), `labels`/`annotations` (JSONB), `thread_ts` |
 | `analysis_runs` | **RCA source of truth** — the full output of every analysis run | `run_id` (PK), `source` (`auto`/`manual`/`chat`/`feedback`), `status`, `target_type`/`target_id`, `analysis_summary`/`analysis_detail`, `analysis_quality`, `root_cause_family`, `capabilities`/`missing_data`/`warnings`/`artifacts` (JSONB) |
-| `incident_embeddings` | Similarity memory — find past look-alike incidents | `incident_id`, `alert_id`, `analysis_summary`/`analysis_detail`, `vector_json` (JSONB), `embedding vector(384)` + HNSW cosine index |
+| `incident_embeddings` | Similarity memory — find past look-alike incidents. One row per approved incident (`alert_id` retained but always empty) | `incident_id`, `alert_id` (`''`), `analysis_summary`/`analysis_detail`, `vector_json` (JSONB), `embedding vector(N)` (N = `EMBEDDING_DIM`, default 384) + HNSW cosine index |
 
 > The per-alert RCA columns (`analysis_*`, `capabilities`, …) have been **removed** from `alerts` — the RCA lives on `analysis_runs`. The backend no longer creates or reads them; drop any leftover columns from existing DBs manually (documented in `store_postgres.go`).
 
@@ -73,7 +75,7 @@ Fourteen tables, grouped by what they serve.
 | Table | Purpose | Key columns |
 |---|---|---|
 | `rca_case_snapshots` | Immutable snapshot of an **operator-approved** RCA — the input to learning + ontology | `case_id` (PK = `run_id:hash`), `incident_id`, `run_id`, `analysis_hash`, `approval_state` (`active`/`revoked`/`superseded`), `mechanism_fingerprint`, `snapshot` (JSONB) |
-| `knowledge_candidates` | Knowledge drawn from a snapshot, moving through a review state machine | `candidate_id` (PK), `case_id`, `knowledge_fingerprint`, `supporting_case_count`, `status` (`ready_for_review`→`active` / `validation_failed` / `rejected` / `superseded`), `content_hash`, `payload` (JSONB) |
+| `knowledge_candidates` | Knowledge drawn from a snapshot, moving through a review state machine | `candidate_id` (PK), `case_id`, `knowledge_fingerprint`, `supporting_case_count`, `status` (`generated` → `ready_for_review`/`shadow` → `active` / `validation_failed` / `rejected` / `superseded`), `content_hash`, `payload` (JSONB) |
 | `knowledge_candidate_cases` | M:N link — which approved cases support one candidate (cross-incident dedup) | `candidate_id` + `case_id` (composite PK), `linked_at` |
 | `knowledge_packages` | Published knowledge; mirrored to TypeDB | `package_id` (PK = `KPK-<case>`), `candidate_id`, `status` (`active`/`shadow`/`retired`), `payload` (JSONB), `mirror_status` |
 | `knowledge_events` | Append-only audit log of every lifecycle transition | `event_id` (PK), `candidate_id`, `package_id`, `event_type`, `actor`, `note`, `created_at` |
@@ -88,8 +90,9 @@ Fourteen tables, grouped by what they serve.
 
 **Similarity search**: `incident_embeddings.embedding` (pgvector, HNSW cosine) is
 the primary path when an OpenAI-compatible embedding endpoint is configured. The
-query and stored memory both include RCA summary/detail, and same-family and
-normalized workload-identity signals improve ranking. When the endpoint or dense
+stored memory includes RCA summary/detail; the query is built from the incoming
+alert's title, severity, annotations, and labels (a firing alert has no RCA
+yet). Same-family and normalized workload-identity signals improve ranking. When the endpoint or dense
 search is unavailable, the Backend falls back to a deterministic 384-dim sparse
 feature-hash cosine search. Embedding basis/model/dimension changes trigger a
 rebuild of derived vectors; incident writes and searches remain available during

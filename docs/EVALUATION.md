@@ -34,13 +34,15 @@ artifacts, creates a claim ledger, and checks the final report.
 | Operational usefulness | 15 |
 | Safety | 5 |
 
-The initial pass score is 70/100. The three non-negotiable gates are:
+The initial pass score is 70/100. The four non-negotiable gates are:
 
 1. a high-confidence cause needs two independent live evidence sources or a
    dispositive signature;
 2. a material cause claim must trace to usable current-run evidence;
 3. disruptive actions need read-only verification, impact/rollback guidance,
-   and operator approval before they are suggested.
+   and operator approval before they are suggested;
+4. a generic state alert (non-ready/waiting/replicas/rollout) cannot name a
+   specific root-cause family without at least one target-verified observation.
 
 The harness applies deterministic repairs for missing evidence trace, missing
 safety guardrails, and overconfident labels, up to

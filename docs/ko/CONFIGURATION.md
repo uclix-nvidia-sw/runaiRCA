@@ -31,7 +31,13 @@ flowchart LR
 | --- | --- |
 | `PORT` | 백엔드 HTTP 포트. Helm은 이를 컴포넌트 서비스 포트에서 매핑합니다. 에이전트 포트는 컨테이너 커맨드에 고정돼 있습니다 |
 | `AGENT_URL` | 백엔드에서 에이전트로 접근하는 URL. 기본값 `http://localhost:8000` |
+| `KNOWLEDGE_VALIDATOR_URL` | 백엔드 승인 시점 에이전트 검증기 기본 URL입니다. 백엔드가 `/knowledge/validate`를 덧붙이며, Helm은 클러스터 내 에이전트 서비스로 기본 설정합니다. |
 | `BACKEND_URL` | 에이전트가 분석 진행 이벤트를 fire-and-forget 방식으로 백엔드에 보내기 위한 URL입니다. 비어 있으면 progress POST가 비활성화되며, Helm은 기본적으로 백엔드 서비스 주소로 설정합니다 |
+| `DYNAMIC_KNOWLEDGE_MODE` | 승인된 인시던트 유래 지식의 런타임 사용: `off`, `shadow`, `assist`(기본값), `authoritative`. `shadow`는 headline RCA를 바꾸지 않고 관찰만 기록하고, `assist`는 active 패키지를 병합하며 family 선택은 바꾸지 않고 활성화 대기 힌트를 냅니다. `authoritative`는 active와 shadow 패키지를 provenance 마커와 함께 병합합니다. |
+| `RUNTIME_KNOWLEDGE_URL` | 읽기 전용 승인 지식 스냅샷 URL입니다. 비어 있으면 에이전트가 `${BACKEND_URL}/api/v1/knowledge/runtime-snapshot`을 유도하며, Helm은 명시적 override를 노출합니다. |
+| `RUNTIME_KNOWLEDGE_TOKEN` | 런타임 지식 스냅샷 엔드포인트용 선택 사항 bearer 토큰입니다. 클러스터 내 기본 엔드포인트에서는 비워도 안전합니다. |
+| `RUNTIME_KNOWLEDGE_REFRESH_SECONDS` | 런타임 지식 새로고침 간격. 기본값 `30`초(`30` 미만 값은 `30`으로 올림). |
+| `RUNTIME_KNOWLEDGE_TIMEOUT_SECONDS` | 런타임 지식 fetch 타임아웃. 기본값 `10`초(최소 `1`). |
 | `AGENT_REQUEST_TIMEOUT_SECONDS` | 에이전트 `/analyze` 및 `/chat` 요청에 대한 백엔드 타임아웃. 기본값 `960`(에이전트의 `ANALYSIS_DEADLINE_SECONDS`보다 커야 합니다) |
 | `MANUAL_AGENT_REQUEST_TIMEOUT_SECONDS` | 운영자가 직접 트리거한 에이전트 `/analyze` 요청에 대한 백엔드 타임아웃. 기본값 `960` |
 | `TRASH_RETENTION_DAYS` | 휴지통 인시던트를 purge하기 전 백엔드 soft delete 보존 기간. 기본값 `30` |
@@ -101,14 +107,16 @@ flowchart LR
 | `NAT_CONFIG_FILE` | 내부 NeMo 엔진 워크플로 구성 경로. 기본값 `configs/runai_rca_engine.yml` |
 | `ENABLE_INVESTIGATION_LOOP` | 중앙 LLM 조사 루프: 계획 → 가장 관련성 높은 에이전트 탐색 → 관찰 → 재계획. 기본값 `false`(Helm은 `true`로 설정) |
 | `OPEN_WORLD_RCA_MODE` | `off`, `shadow`, `assist`, `authoritative` 중 하나입니다. 기본값은 `shadow`이며 headline RCA를 바꾸지 않고 open-world 추론을 기록합니다. |
-| `MAX_INVESTIGATION_STEPS` | 레거시 호환 제한입니다. 기본값 `0`은 전체 analysis deadline 안에서 의미적 완료까지 조사합니다. |
-| `MAX_REANALYSIS_STEPS` | 재분석 레거시 호환 제한입니다. 기본값 `0`은 전체 analysis deadline 안에서 의미적 완료까지 조사합니다. |
+| `MAX_INVESTIGATION_STEPS` | 조사 루프 단계 제한. 기본값 `3`(Helm도 `3`); `0`은 전체 analysis deadline 안에서 의미적 완료까지 조사합니다. |
+| `MAX_REANALYSIS_STEPS` | 재분석 패스 단계 제한. 기본값 `3`(Helm도 `3`); `0`은 전체 analysis deadline 안에서 의미적 완료까지 조사합니다. |
 | `ENABLE_AGENT_DRILLDOWN` | 수집기별 자율 드릴다운: 각 증거 에이전트(kubernetes/prometheus/loki/runai)가 자기 도메인의 서로 다른 읽기 전용 probe를 완료·반복 쿼리·분석 deadline까지 계속 수행합니다. 기본값 `false`(Helm은 `true`로 설정) |
 | `LLM_SYNTHESIS_MAX_TOKENS` | 최종 한국어 JSON 보고서의 completion 예산. 기본값 `16384`. |
 | `ANALYSIS_DEADLINE_SECONDS` | 분석당 전체 하드 상한(초과 시 우아하게 축소된 리포트). 기본값 `900`(15분), `0` = 상한 없음. 백엔드 `AGENT_REQUEST_TIMEOUT_SECONDS`를 이 값보다 크게 유지하세요. |
 | `ENABLE_RCA_OUTPUT_HARNESS` | 최종 RCA를 live evidence와 safety gate로 검증합니다. 기본값 `true` |
 | `MAX_RCA_REPAIR_ATTEMPTS` | harness 검증 뒤 최종 보고서를 수정하는 최대 횟수. 기본값 `3` |
 | `RCA_HARNESS_PASS_SCORE` | non-fatal RCA를 degraded로 표시하는 score 기준(0..100). 기본값 `70` |
+| `AUTO_ANALYZE_SEVERITIES` | 백엔드: 자동 분석을 트리거하는 알림 심각도. 기본값 `warning,critical` |
+| `ENABLE_HELM_CHANGE_DETECTION` | 에이전트: Change 수집기의 Helm/ConfigMap 변경 감지를 활성화합니다. 기본값 `false`. 활성화하면 에이전트에 광범위한 Secret 읽기 RBAC가 부여되므로 필요할 때만 켜세요. |
 | `MAX_AUTO_ANALYZE_FANOUT` | 백엔드: 웹훅당 시작되는 최대 분석 수. 기본값 `50` |
 | `MAX_CONCURRENT_AGENT_RUNS` | 백엔드: 에이전트에 대해 동시에 실행되는 최대 분석 수. 기본값 `50` |
 | `FLAPPING_GROUP_WINDOW_MINUTES` | 백엔드: 반복되는 알림이 또 다른 발생이 아니라 NEW 인시던트가 되기 전의 정적 구간. 코드 기본값 `120`(Helm은 `360`으로 설정) |
@@ -173,6 +181,8 @@ helm upgrade --install runai-rca charts/runai-rca \
 | `agent.rbac.clusterWide` | Kubernetes 증거 수집에 ClusterRole을 사용합니다. 기본값 `true` |
 | `agent.rbac.namespaces` | `agent.rbac.clusterWide=false`일 때 Role/RoleBinding을 받는 네임스페이스. 기본값은 릴리스 네임스페이스 |
 | `agent.env.kubernetesNamespaces` | 에이전트 측 Kubernetes 네임스페이스 허용 목록. 비어 있고 `clusterWide=false`이면 Helm이 `agent.rbac.namespaces`에서 유도합니다 |
+| `agent.env.dynamicKnowledgeMode` / `runtimeKnowledgeUrl` / `runtimeKnowledgeRefreshSeconds` / `runtimeKnowledgeTimeoutSeconds` | 승인된 런타임 지식 모드와 스냅샷 클라이언트 설정. 기본값은 `assist`, 유도된 백엔드 스냅샷 URL, `30`, `10`입니다. |
+| `agent.env.runtimeKnowledgeToken` | 선택 사항인 런타임 스냅샷 bearer 토큰. 기본값은 빈 값입니다. 프로덕션에서는 시크릿으로 관리되는 values 방식을 사용하세요. |
 | `agent.serviceAccount.annotations` | 워크로드 아이덴티티 통합을 위한 ServiceAccount 어노테이션 |
 | `{backend,frontend,postgresql}.automountServiceAccountToken` | 클러스터 API 접근이 필요 없는 파드의 Kubernetes API 토큰 마운트를 비활성화합니다. 기본값 `false` |
 | `agent.automountServiceAccountToken` | 에이전트 Kubernetes API 토큰 마운트. 직접 Kubernetes 수집이 서비스 계정 토큰을 사용하므로 기본값은 `true` |

@@ -35,7 +35,11 @@ detail pages must contain:
 - RCA summary: concise final answer.
 - RCA body: root cause, impact, evidence, action items, missing data,
   prevention.
-- RCA report: a structured, scannable report view.
+- RCA report: a structured, scannable report view, exportable as a styled
+  Word (`.docx`) incident report with Korean-capable fonts, GFM tables, and a
+  page footer carrying the incident id and page numbers.
+- Similar Incidents: past look-alike incidents from dense RCA-content matching,
+  re-ranked by family and workload identity.
 - Agent Evidence Trail: collector tabs in a single panel on the same page.
 - Raw artifact viewer: collapsed by default.
 - Chat panel: context-aware and tied to the current route.

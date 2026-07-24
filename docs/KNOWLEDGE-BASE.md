@@ -115,6 +115,20 @@ disconfirmations, and declarative probe templates. Placeholders are filled only
 from alert scope. It is guidance, not a shell command: each agent's read-only
 tool registry remains the enforcement boundary.
 
+**Runtime activation ladder.** How aggressively approved knowledge packages
+feed the live analysis is controlled by `DYNAMIC_KNOWLEDGE_MODE` (default
+`assist`):
+
+- `off` — approved packages are not consulted at runtime.
+- `shadow` — records observations without changing the headline RCA.
+- `assist` — merges **active** packages and emits shadow "pending-activation"
+  report hints, without changing family selection.
+- `authoritative` — merges **active and shadow** packages with provenance
+  markers that name the contributing package, family, and symptom.
+
+Runtime-package families are hard-validated against the closed `families.yaml`
+catalog; a package naming a family outside it is rejected.
+
 ## 4. Worked example: NVIDIA Xid 79
 
 **Situation:** a workload alert arrives with `NVRM: Xid ... 79` and “GPU has

@@ -32,11 +32,12 @@ flowchart LR
 | Operational usefulness | 15 |
 | Safety | 5 |
 
-초기 통과 기준은 70/100점입니다. 아래 세 항목은 점수와 별개인 hard gate입니다.
+초기 통과 기준은 70/100점입니다. 아래 네 항목은 점수와 별개인 hard gate입니다.
 
 1. high confidence 원인은 두 개의 독립 live evidence 또는 확정 signature가 필요합니다.
 2. 주요 원인 주장은 현재 run의 사용 가능한 evidence로 추적돼야 합니다.
 3. 변경·중단 조치는 read-only 확인, 영향/rollback 안내, 운영자 승인보다 먼저 제안될 수 없습니다.
+4. 일반적인 상태 알림(non-ready/waiting/replicas/rollout)은 target 검증된 관측이 최소 하나 없으면 특정 root-cause family를 지목할 수 없습니다.
 
 하네스는 evidence trace, 안전 guardrail, 과도한 confidence를 결정론적으로 최대
 `MAX_RCA_REPAIR_ATTEMPTS=3`회 수정합니다. hard gate가 남으면 추측하지 않고
