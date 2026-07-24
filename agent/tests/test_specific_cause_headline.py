@@ -187,3 +187,46 @@ def test_response_model_carries_specific_cause_field() -> None:
     response = AlertAnalysisResponse.model_construct()
     response.specific_cause = "구체적 원인"
     assert response.specific_cause == "구체적 원인"
+
+
+def test_unschedulable_condition_supplies_specific_cause() -> None:
+    """The injected nodeSelector fault: the PodScheduled=False artifact must
+    both promote the typed state AND surface the scheduler's mismatch verdict."""
+    from dataclasses import replace
+
+    from app.collectors.kubernetes import _pod_scheduling_artifact
+    from tests.test_orchestrator import make_settings, make_target
+
+    target = replace(make_target(), pod="scheduling-error", namespace="default")
+    pod_object = {
+        "metadata": {"name": "scheduling-error", "namespace": "default"},
+        "status": {
+            "conditions": [
+                {
+                    "type": "PodScheduled",
+                    "status": "False",
+                    "reason": "Unschedulable",
+                    "message": (
+                        "0/7 nodes are available: 4 node(s) didn't match Pod's "
+                        "node affinity/selector."
+                    ),
+                }
+            ]
+        },
+    }
+    item = _pod_scheduling_artifact("kubernetes", make_settings(), target, pod_object)
+    assert item is not None
+    result = CollectorResult(agent="kubernetes", status="ok", summary="k8s", artifacts=[item])
+    assign_evidence_ids([result])
+    eligible = {item.evidence_id}
+    family, mechanism, ids = pipeline._dispositive_typed_state([result], eligible)
+    assert family == "k8s_scheduling_error"
+    assert "Unschedulable" in mechanism
+    headline = pipeline._ranked_root_cause_statement(
+        [_candidate("Unschedulable", "k8s_scheduling_error")],
+        _request(),
+        results=[result],
+        eligible_evidence_ids=eligible,
+        language="ko",
+    )
+    assert "nodeSelector/affinity 불일치" in headline

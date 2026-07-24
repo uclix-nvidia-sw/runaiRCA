@@ -125,6 +125,10 @@ _DISPOSITIVE_TYPED_REASONS: dict[str, frozenset[str]] = {
         }
     ),
     "workload_runtime_error": frozenset({"OOMKilled"}),
+    # Set only by the typed PodScheduled=False condition artifact
+    # (kubernetes_pod_scheduling); container states and Warning events never
+    # carry these reason strings, so lifecycle/event promotion is unaffected.
+    "k8s_scheduling_error": frozenset({"Unschedulable", "SchedulingGated"}),
 }
 
 
@@ -4996,7 +5000,34 @@ def _dispositive_typed_state(
                             "(machine-reported, not keyword-matched)",
                             [evidence_id],
                         )
+            if getattr(item, "type", "") == "kubernetes_pod_scheduling":
+                reason = _canonical_scheduling_reason(payload)
+                family = _typed_reason_family(reason) if reason else ""
+                if family:
+                    return (
+                        family,
+                        f"typed container state {reason} on the alert Pod "
+                        "(machine-reported, not keyword-matched)",
+                        [evidence_id],
+                    )
     return "", "", []
+
+
+# The scheduling collector stores the PodScheduled reason casefolded; the
+# dispositive table and the specific-cause layer key on the canonical casing.
+_SCHEDULING_REASON_CANONICAL = {
+    "unschedulable": "Unschedulable",
+    "schedulinggated": "SchedulingGated",
+}
+
+
+def _canonical_scheduling_reason(payload: dict[str, Any]) -> str:
+    condition = payload.get("condition")
+    if not isinstance(condition, dict):
+        return ""
+    return _SCHEDULING_REASON_CANONICAL.get(
+        str(condition.get("reason") or "").strip().casefold(), ""
+    )
 
 
 def _typed_reason_family(reason: str) -> str:
@@ -5624,6 +5655,15 @@ def _typed_reason_observations(
                                     {"container": container, "payload": payload},
                                 )
                             )
+            elif getattr(item, "type", "") == "kubernetes_pod_scheduling":
+                if _canonical_scheduling_reason(payload) == reason:
+                    condition = payload.get("condition")
+                    message = (
+                        str(condition.get("message") or "")
+                        if isinstance(condition, dict)
+                        else ""
+                    )
+                    found.append((reason, message, None, {"payload": payload}))
             elif getattr(item, "type", "") == "kubernetes_warning_events":
                 for event in payload.get("events", []):
                     if not (

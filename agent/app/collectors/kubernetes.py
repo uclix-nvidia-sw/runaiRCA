@@ -3775,6 +3775,7 @@ def _pod_scheduling_artifact(
     if not isinstance(conditions, list):
         return None
     scheduling_reason = ""
+    scheduling_message = ""
     for condition in conditions:
         if not isinstance(condition, dict):
             continue
@@ -3785,6 +3786,7 @@ def _pod_scheduling_artifact(
         reason = str(condition.get("reason") or "").strip().casefold()
         if reason in _POD_SCHEDULING_REASONS:
             scheduling_reason = reason
+            scheduling_message = str(condition.get("message") or "")
             break
     if not scheduling_reason:
         return None
@@ -3823,6 +3825,10 @@ def _pod_scheduling_artifact(
                 "type": "PodScheduled",
                 "status": "False",
                 "reason": scheduling_reason,
+                # The scheduler's machine-formatted verdict (affinity mismatch,
+                # insufficient resources, untolerated taints) — the specific-cause
+                # layer regexes it with bounded patterns only.
+                "message": scheduling_message,
             },
         },
         highlights=[scheduling_reason],

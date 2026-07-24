@@ -92,7 +92,9 @@ def test_pending_failed_scheduling_walks_to_scheduling_leaf() -> None:
     assert "insufficient nvidia.com/gpu" in walked["steps"][-1]["matched"]
 
 
-def test_crashloop_oomkilled_walks_to_startup_leaf() -> None:
+def test_crashloop_oomkilled_walks_to_runtime_leaf() -> None:
+    """OOMKilled is workload_runtime_error everywhere else (reason->family
+    table, dispositive typed promotion); the runbook leaf must agree."""
     tree = load_tree(TREE)
     walked = walk_tree(
         tree,
@@ -104,7 +106,7 @@ def test_crashloop_oomkilled_walks_to_startup_leaf() -> None:
     )
 
     assert walked["path"][-1] == "crash_oomkilled"
-    assert walked["conclusion"]["family"] == "workload_startup_error"
+    assert walked["conclusion"]["family"] == "workload_runtime_error"
     assert "oomkilled" in walked["steps"][-1]["matched"]
 
 

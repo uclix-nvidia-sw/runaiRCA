@@ -22,7 +22,13 @@ _PROBE_TEMPLATE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 # Alert-name concatenations (for example, KubePodImagePullBackOff) must retain
 # suffix matching, so lexical boundary rules cannot distinguish same-suffix
 # collisions. Extend this set only when a new collision is verified.
-_ATOMIC_OBSERVATION_TOKENS = frozenset({"progressdeadlineexceeded"})
+# "containersnotready"/"kubepodnotready" are POD-level identifiers; without the
+# atomic guard the left-lenient matcher lets the NODE token "notready" fire
+# inside them and route pod incidents into the node-not-ready runbook branch
+# ("kubenodenotready" stays matchable — that IS a node alert).
+_ATOMIC_OBSERVATION_TOKENS = frozenset(
+    {"progressdeadlineexceeded", "containersnotready", "kubepodnotready"}
+)
 _STEM_SUFFIXES = frozenset({"e", "s", "es", "d", "ed", "ing", "ion", "ions", "er", "ers", "or", "ors"})
 _BUNDLED_TROUBLESHOOTING_TREE = (
     Path(__file__).resolve().parent.parent / "knowledge" / "k8s_troubleshooting_tree.yaml"

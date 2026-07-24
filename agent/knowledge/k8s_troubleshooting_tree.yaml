@@ -407,7 +407,7 @@ nodes:
           any: ["startup probe failed", "liveness probe failed", "readiness probe failed"]
         next: probe_failure
       - match:
-          any: [crashloopbackoff, "back-off restarting", oomkilled, runcontainererror, containercannotrun]
+          any: [crashloopbackoff, "back-off restarting", oomkilled, runcontainererror, containercannotrun, starterror, createcontainerconfigerror, createcontainererror]
         next: pod_crashing
       - match:
           any: ["no such host", nxdomain, "no endpoints available", "connection refused", "networkpolicy", "i/o timeout"]
@@ -431,9 +431,16 @@ nodes:
       any:
         - pending
         - failedscheduling
+        - unschedulable
+        - schedulinggated
         - crashloopbackoff
         - back-off restarting
         - oomkilled
+        - starterror
+        - createcontainerconfigerror
+        - createcontainererror
+        - runcontainererror
+        - containercannotrun
         - imagepullbackoff
         - errimagepull
         - failedmount
@@ -445,12 +452,12 @@ nodes:
         - failed to create pod sandbox
     branches:
       - match:
-          any: [pending, failedscheduling]
+          any: [pending, failedscheduling, unschedulable, schedulinggated]
           fields:
             pod_phase: Pending
         next: pod_pending
       - match:
-          any: [crashloopbackoff, back-off restarting, oomkilled, backoff]
+          any: [crashloopbackoff, back-off restarting, oomkilled, backoff, starterror, createcontainerconfigerror, createcontainererror]
         next: pod_crashing
       - match:
           any: [imagepullbackoff, errimagepull, failed to pull image]
@@ -819,7 +826,7 @@ nodes:
         refute_signal_any: ["restart count: 0"]
         source_group: kubernetes_api
     match:
-      any: [crashloopbackoff, back-off restarting, backoff, oomkilled]
+      any: [crashloopbackoff, back-off restarting, backoff, oomkilled, starterror, createcontainerconfigerror, createcontainererror, runcontainererror, containercannotrun]
     branches:
       - match:
           any: [oomkilled, out of memory, exit code 137]
@@ -827,7 +834,7 @@ nodes:
             terminated_reason: OOMKilled
         next: crash_oomkilled
       - match:
-          any: [runcontainererror, containercannotrun, executable file not found]
+          any: [runcontainererror, containercannotrun, executable file not found, starterror, createcontainerconfigerror, createcontainererror]
         next: container_start_error
       - match:
           any: [startup probe failed, liveness probe failed, readiness probe failed]
@@ -878,7 +885,7 @@ nodes:
       fields:
         terminated_reason: OOMKilled
     conclusion:
-      family: workload_startup_error
+      family: workload_runtime_error
       summary: "The workload restarts because the target container exceeded its memory limit and was OOMKilled; CrashLoopBackOff is downstream."
       confidence: "high when the target container's terminated reason is OOMKilled; distinguish a node-wide OOM only with separate incident-era node evidence"
       disconfirm:
@@ -923,7 +930,7 @@ nodes:
     probes: [{<<: *probe_workload_startup, id: k8s_troubleshooting:container_start_error:p01}]
     question: "Did kubelet fail before the container process could execute, and what exact ContainerCannotRun or CreateContainer error was recorded? Healthy setup creates the process after image and mount success. If process creation succeeds, move to runtime logs rather than treating later exits as setup errors."
     match:
-      any: [runcontainererror, containercannotrun, executable file not found]
+      any: [runcontainererror, containercannotrun, executable file not found, starterror, createcontainerconfigerror, createcontainererror]
     conclusion:
       family: workload_startup_error
       summary: "The container cannot start because its command or runtime setup is invalid."
