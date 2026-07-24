@@ -3768,7 +3768,16 @@ def _container_lifecycle_artifact(
         and not target.resolved_at
         and any(_container_is_waiting_with_restarts(item) for item in container_diagnostics)
     )
-    if target_identity_verified and (terminated_times or current_restart_loop):
+    waiting_reason = _target_waiting_fault_reason(container_diagnostics)
+    current_waiting_fault = (
+        target_identity_verified
+        and bool(time_range)
+        and not target.resolved_at
+        and bool(waiting_reason)
+    )
+    if target_identity_verified and (
+        terminated_times or current_restart_loop or current_waiting_fault
+    ):
         polarity, coverage = "present", "scoped"
     else:
         polarity, coverage = "unknown", "partial"
@@ -3794,6 +3803,8 @@ def _container_lifecycle_artifact(
         }
     if current_restart_loop:
         observation["current_restart_loop"] = True
+    if waiting_reason:
+        observation["container_reason"] = waiting_reason
 
     summary = _container_lifecycle_summary(container_diagnostics)
     return artifact(
@@ -3863,13 +3874,16 @@ def _container_termination_times_in_range(
         return []
     timestamps: list[tuple[object, str]] = []
     for diagnostic in container_diagnostics:
-        last_terminated = diagnostic.get("lastTerminated")
-        if not isinstance(last_terminated, dict):
-            continue
-        finished_at = last_terminated.get("finishedAt")
-        parsed = parse_incident_time(finished_at)
-        if parsed is not None and start <= parsed <= end:
-            timestamps.append((parsed, str(finished_at)))
+        for state_key in ("state", "lastTerminated"):
+            state = diagnostic.get(state_key)
+            if not isinstance(state, dict):
+                continue
+            if state_key == "state" and state.get("phase") != "terminated":
+                continue
+            finished_at = state.get("finishedAt")
+            parsed = parse_incident_time(finished_at)
+            if parsed is not None and start <= parsed <= end:
+                timestamps.append((parsed, str(finished_at)))
     return sorted(timestamps, key=lambda item: item[0])
 
 
@@ -3911,6 +3925,21 @@ def _container_state_text(state: dict[str, object]) -> str:
         if state.get(key) is not None
     ]
     return ", ".join(fields) if fields else "state reported"
+
+
+def _target_waiting_fault_reason(container_diagnostics: list[dict[str, object]]) -> str:
+    """Return a closed-vocabulary kubelet reason from the target container."""
+    for diagnostic in container_diagnostics:
+        state = diagnostic.get("state") if isinstance(diagnostic, dict) else None
+        if not isinstance(state, dict) or str(state.get("phase") or "") not in {
+            "waiting",
+            "terminated",
+        }:
+            continue
+        reason = str(state.get("reason") or "").strip().casefold()
+        if reason in _FOLLOWUP_WAITING:
+            return reason
+    return ""
 
 
 def _target_pod_summary(responses: list[dict[str, object]]) -> dict[str, object] | None:
@@ -5931,6 +5960,7 @@ _FOLLOWUP_WAITING = {
     "createcontainererror",
     "runcontainererror",
     "containercannotrun",
+    "starterror",
 }
 
 

@@ -1578,6 +1578,19 @@ async def investigate(
             )
         _record_blackboard(blackboard, "kubernetes", kubernetes_result, target)
 
+    # The normal collector gather happens after the LLM/reflection rounds. Make
+    # its typed facts available to the same ledger attachment path as probe
+    # results; otherwise a valid final Kubernetes observation can never move a
+    # hypothesis beyond testing.
+    ledger = _apply_ledger_updates(
+        ledger,
+        [],
+        blackboard=blackboard,
+        artifacts=[item for result in evidence.values() for item in result.artifacts],
+        eligible_support_ids=_eligible_support_ids(blackboard),
+    )
+    sufficiency = _evidence_sufficiency(ledger, evidence, blackboard, target)
+
     results = list(evidence.values())
     skipped_collectors = [name for name in by_name if name not in evidence]
     context = {

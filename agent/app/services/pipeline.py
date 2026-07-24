@@ -121,6 +121,7 @@ _DISPOSITIVE_TYPED_REASONS: dict[str, frozenset[str]] = {
             "CreateContainerConfigError",
             "CreateContainerError",
             "RunContainerError",
+            "StartError",
         }
     ),
     "workload_runtime_error": frozenset({"OOMKilled"}),
