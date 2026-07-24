@@ -385,6 +385,7 @@ func Run() {
 
 	<-ctx.Done()
 	stop()
+	server.store.stopEmbeddingBackfill()
 	log.Printf("shutdown signal received, draining connections")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

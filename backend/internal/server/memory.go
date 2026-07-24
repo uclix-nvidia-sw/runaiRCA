@@ -88,12 +88,19 @@ func (s *Store) embeddingDim() int {
 // configured OpenAI-compatible endpoint when set, and falls back to the
 // hash embedding on any error so an incident write/search is never blocked.
 func (e *embedder) embed(text string) []float32 {
+	return e.embedContext(context.Background(), text)
+}
+
+func (e *embedder) embedContext(ctx context.Context, text string) []float32 {
 	if e == nil || e.endpoint == "" {
 		return denseEmbedding(text, embeddingDim)
 	}
-	vector, err := e.remoteEmbed(text)
+	vector, err := e.remoteEmbedContext(ctx, text)
 	if err != nil {
-		log.Printf("embedding endpoint failed, falling back to hash embedding: %v", err)
+		if ctx.Err() != nil {
+			return nil
+		}
+		log.Printf("WARNING: embedding endpoint failed, falling back to hash embedding: %v", err)
 		return denseEmbedding(text, e.dim)
 	}
 	return normalize(vector)
@@ -102,11 +109,15 @@ func (e *embedder) embed(text string) []float32 {
 // remoteEmbed POSTs to {endpoint}/embeddings and returns the raw model vector.
 // The response follows the OpenAI embeddings schema: {"data":[{"embedding":[...]}]}.
 func (e *embedder) remoteEmbed(text string) ([]float32, error) {
+	return e.remoteEmbedContext(context.Background(), text)
+}
+
+func (e *embedder) remoteEmbedContext(parent context.Context, text string) ([]float32, error) {
 	body, err := json.Marshal(map[string]any{"model": e.model, "input": text})
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 15*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint+"/embeddings", bytes.NewReader(body))
 	if err != nil {

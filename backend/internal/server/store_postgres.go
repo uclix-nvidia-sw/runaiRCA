@@ -16,7 +16,11 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-const postgresOperationTimeout = 5 * time.Second
+const (
+	postgresOperationTimeout   = 5 * time.Second
+	embeddingBackfillBatchSize = 25
+	embeddingBackfillPause     = 300 * time.Millisecond
+)
 
 func (s *Store) ConnectDatabase(databaseURL string, connectTimeout time.Duration) {
 	s.connectDatabaseWithDriver("pgx", databaseURL, connectTimeout)
@@ -67,6 +71,7 @@ func (s *Store) connectDatabaseWithDriver(driverName string, databaseURL string,
 		return
 	}
 	s.loadDatabaseState(schemaCtx)
+	s.startEmbeddingBackfill()
 	log.Printf(
 		"Postgres store enabled for incidents, embeddings, feedback, comments, and analysis runs; %s",
 		s.pgvectorLogState(),
@@ -472,7 +477,7 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 		}
 	}
 	if pgvectorReady {
-		s.ensureVectorColumn(ctx)
+		s.embeddingColumnRecreated = s.ensureVectorColumn(ctx)
 	}
 	return pgvectorReady
 }
@@ -482,19 +487,164 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 // deliberately non-fatal: if the column or index cannot be created (e.g. an
 // older pgvector without HNSW), the backend keeps the JSONB sparse vectors and
 // in-process cosine fallback rather than failing startup.
-func (s *Store) ensureVectorColumn(ctx context.Context) {
-	statements := []string{
-		fmt.Sprintf(
+func (s *Store) ensureVectorColumn(ctx context.Context) bool {
+	targetDim := s.embeddingDim()
+	var storedDim sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT atttypmod
+		  FROM pg_attribute
+		 WHERE attrelid = 'incident_embeddings'::regclass
+		   AND attname = 'embedding'
+		   AND attnum > 0
+		   AND NOT attisdropped
+	`).Scan(&storedDim)
+	if errors.Is(err, sql.ErrNoRows) {
+		if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
 			`ALTER TABLE incident_embeddings ADD COLUMN IF NOT EXISTS embedding vector(%d)`,
-			s.embeddingDim(),
-		),
-		`CREATE INDEX IF NOT EXISTS idx_embeddings_vector
-			ON incident_embeddings USING hnsw (embedding vector_cosine_ops)`,
+			targetDim,
+		)); err != nil {
+			log.Printf("WARNING: pgvector column setup skipped: %v", err)
+			return false
+		}
+	} else if err != nil {
+		log.Printf("WARNING: pgvector embedding dimension check skipped: %v", err)
+		return false
+	} else if !storedDim.Valid || int(storedDim.Int64) != targetDim {
+		oldDim := int(storedDim.Int64)
+		log.Printf("WARNING: pgvector embedding dimension changed from %d to %d; recreating column", oldDim, targetDim)
+		for _, statement := range []string{
+			`DROP INDEX IF EXISTS idx_embeddings_vector`,
+			`ALTER TABLE incident_embeddings DROP COLUMN IF EXISTS embedding`,
+			fmt.Sprintf(`ALTER TABLE incident_embeddings ADD COLUMN embedding vector(%d)`, targetDim),
+		} {
+			if _, err := s.db.ExecContext(ctx, statement); err != nil {
+				log.Printf("WARNING: pgvector embedding column recreation skipped: %v", err)
+				return false
+			}
+		}
+		if _, err := s.db.ExecContext(ctx, `
+			CREATE INDEX IF NOT EXISTS idx_embeddings_vector
+				ON incident_embeddings USING hnsw (embedding vector_cosine_ops)`); err != nil {
+			log.Printf("WARNING: pgvector index recreation skipped: %v", err)
+			return true
+		}
+		return true
 	}
-	for _, statement := range statements {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
-			log.Printf("pgvector column/index setup skipped: %v", err)
+	if _, err := s.db.ExecContext(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_embeddings_vector
+			ON incident_embeddings USING hnsw (embedding vector_cosine_ops)`); err != nil {
+		log.Printf("WARNING: pgvector index setup skipped: %v", err)
+		return false
+	}
+	return false
+}
+
+func (s *Store) startEmbeddingBackfill() {
+	if s.db == nil || !s.dbReady || !s.pgvectorReady {
+		return
+	}
+	ctx := s.embeddingBackfillCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s.embedder == nil || s.embedder.endpoint == "" {
+		if s.embeddingColumnRecreated {
+			s.backfillEmbeddings(ctx, false)
+		}
+		return
+	}
+	go s.backfillEmbeddings(ctx, true)
+}
+
+func (s *Store) stopEmbeddingBackfill() {
+	if s.embeddingBackfillCancel != nil {
+		s.embeddingBackfillCancel()
+	}
+}
+
+func (s *Store) backfillEmbeddings(ctx context.Context, paced bool) {
+	for {
+		if err := ctx.Err(); err != nil {
 			return
+		}
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT incident_id, alert_id, title, severity, status,
+			       analysis_summary, analysis_detail, labels
+			  FROM incident_embeddings
+			 WHERE embedding IS NULL
+			 ORDER BY incident_id, alert_id
+			 LIMIT $1`, embeddingBackfillBatchSize)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("WARNING: embedding backfill query failed: %v", err)
+			}
+			return
+		}
+		batch := make([]IncidentMemory, 0, embeddingBackfillBatchSize)
+		for rows.Next() {
+			var row IncidentMemory
+			var labelsRaw []byte
+			if err := rows.Scan(
+				&row.IncidentID,
+				&row.AlertID,
+				&row.Title,
+				&row.Severity,
+				&row.Status,
+				&row.AnalysisSummary,
+				&row.AnalysisDetail,
+				&labelsRaw,
+			); err != nil {
+				_ = rows.Close()
+				log.Printf("WARNING: embedding backfill row scan failed: %v", err)
+				return
+			}
+			_ = json.Unmarshal(labelsRaw, &row.Labels)
+			batch = append(batch, row)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			log.Printf("WARNING: embedding backfill row iteration failed: %v", err)
+			return
+		}
+		_ = rows.Close()
+		if len(batch) == 0 {
+			return
+		}
+		for _, memory := range batch {
+			if err := ctx.Err(); err != nil {
+				return
+			}
+			var vector []float32
+			if s.embedder == nil {
+				vector = s.embed(memoryText(memory))
+			} else {
+				vector = s.embedder.embedContext(ctx, memoryText(memory))
+			}
+			if vector == nil {
+				return
+			}
+			if _, err := s.db.ExecContext(ctx, `
+				UPDATE incident_embeddings
+				   SET embedding = $1::vector, updated_at = now()
+				 WHERE incident_id = $2 AND alert_id = $3 AND embedding IS NULL`,
+				embeddingLiteral(vector), memory.IncidentID, memory.AlertID); err != nil {
+				if ctx.Err() == nil {
+					log.Printf("WARNING: embedding backfill update failed: %v", err)
+				}
+				return
+			}
+		}
+		if !paced {
+			continue
+		}
+		timer := time.NewTimer(embeddingBackfillPause)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
 		}
 	}
 }

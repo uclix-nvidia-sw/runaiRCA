@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -54,36 +55,39 @@ type recurrenceStatsCacheEntry struct {
 }
 
 type Store struct {
-	mu                   sync.RWMutex
-	incidentSeq          atomic.Int64
-	alertSeq             atomic.Int64
-	feedbackSeq          atomic.Int64
-	commentSeq           atomic.Int64
-	analysisRunSeq       atomic.Int64
-	evaluationSeq        atomic.Int64
-	knowledgeEventSeq    atomic.Int64
-	incidents            map[string]*Incident
-	incidentByKey        map[string]string
-	alerts               map[string]*AlertRecord
-	alertByFinger        map[string]string
-	alertByGroup         map[string]string
-	memories             map[string]*IncidentMemory
-	feedback             map[string]*FeedbackRecord
-	comments             map[string]*CommentRecord
-	analysisRuns         map[string]*AnalysisRun
-	evaluationReviews    map[string]*EvaluationReview
-	caseSnapshots        map[string]*CaseSnapshot
-	activeCaseByIncident map[string]string
-	knowledgeCandidates  map[string]*KnowledgeCandidate
-	knowledgePackages    map[string]*KnowledgePackage
-	knowledgeEvents      map[string]*KnowledgeEvent
-	chatConversations    map[string]*ChatConversation
-	recurrenceStatsCache map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry
-	db                   *sql.DB
-	dbReady              bool
-	pgvectorReady        bool
-	pgvectorDetail       string
-	embedder             *embedder
+	mu                       sync.RWMutex
+	incidentSeq              atomic.Int64
+	alertSeq                 atomic.Int64
+	feedbackSeq              atomic.Int64
+	commentSeq               atomic.Int64
+	analysisRunSeq           atomic.Int64
+	evaluationSeq            atomic.Int64
+	knowledgeEventSeq        atomic.Int64
+	incidents                map[string]*Incident
+	incidentByKey            map[string]string
+	alerts                   map[string]*AlertRecord
+	alertByFinger            map[string]string
+	alertByGroup             map[string]string
+	memories                 map[string]*IncidentMemory
+	feedback                 map[string]*FeedbackRecord
+	comments                 map[string]*CommentRecord
+	analysisRuns             map[string]*AnalysisRun
+	evaluationReviews        map[string]*EvaluationReview
+	caseSnapshots            map[string]*CaseSnapshot
+	activeCaseByIncident     map[string]string
+	knowledgeCandidates      map[string]*KnowledgeCandidate
+	knowledgePackages        map[string]*KnowledgePackage
+	knowledgeEvents          map[string]*KnowledgeEvent
+	chatConversations        map[string]*ChatConversation
+	recurrenceStatsCache     map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry
+	db                       *sql.DB
+	dbReady                  bool
+	pgvectorReady            bool
+	pgvectorDetail           string
+	embedder                 *embedder
+	embeddingBackfillCtx     context.Context
+	embeddingBackfillCancel  context.CancelFunc
+	embeddingColumnRecreated bool
 
 	flappingWindow        time.Duration
 	autoReanalyzeCooldown time.Duration
@@ -114,6 +118,7 @@ type DashboardSnapshot struct {
 }
 
 func NewStore() *Store {
+	embeddingBackfillCtx, embeddingBackfillCancel := context.WithCancel(context.Background())
 	return &Store{
 		incidents:            make(map[string]*Incident),
 		incidentByKey:        make(map[string]string),
@@ -134,7 +139,9 @@ func NewStore() *Store {
 		recurrenceStatsCache: make(
 			map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry,
 		),
-		embedder: newEmbedder(),
+		embedder:                newEmbedder(),
+		embeddingBackfillCtx:    embeddingBackfillCtx,
+		embeddingBackfillCancel: embeddingBackfillCancel,
 		// How long an alert signature can be quiet before a recurrence is treated as
 		// a NEW incident rather than another occurrence of the flapping one. 30 min
 		// was too tight — real alerts recur over hours, so each firing spawned its
