@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from app.collectors.base import CollectorResult, artifact
-from app.collectors.kubernetes import _container_lifecycle_artifact
+from app.collectors.kubernetes import _container_lifecycle_artifact, _pod_scheduling_artifact
 from app.plan import InvestigationPlan
 from app.services.evidence_blackboard import Blackboard
 from app.services.investigator import _apply_ledger_updates, investigate
@@ -75,6 +75,132 @@ def test_typed_startup_reason_confirms_family_with_evidence(reason, phase, finis
         eligible_support_ids={evidence_id},
     )
 
+    assert ledger[0]["evidence_for"] == [evidence_id]
+
+
+def test_current_oom_termination_confirms_runtime_family_with_evidence():
+    target = replace(
+        make_target(),
+        namespace="default",
+        pod="memory-stress",
+        pod_uid="oom-pod-uid",
+        fired_at="2026-07-24T04:50:00Z",
+        resolved_at="",
+    )
+    lifecycle = _container_lifecycle_artifact(
+        "kubernetes",
+        make_settings(),
+        target,
+        {"name": target.pod, "namespace": target.namespace, "uid": target.pod_uid},
+        [
+            {
+                "name": "stress",
+                "ready": False,
+                "restartCount": 0,
+                "started": False,
+                "state": {
+                    "exitCode": 137,
+                    "finishedAt": "2026-07-24T04:56:19Z",
+                    "phase": "terminated",
+                    "reason": "OOMKilled",
+                    "startedAt": "2026-07-24T04:56:18Z",
+                },
+                "lastTerminated": None,
+            }
+        ],
+        time_range={
+            "start": "2026-07-24T04:50:00Z",
+            "end": "2026-07-24T05:00:00Z",
+        },
+    )
+    board = Blackboard()
+    board.add_result(
+        "kubernetes",
+        CollectorResult(agent="kubernetes", status="ok", summary="OOMKilled", artifacts=[lifecycle]),
+        entity=f"pod:{target.pod}",
+    )
+    evidence_id = board.evidence_id_for(lifecycle)
+    ledger = [{"id": "H1", "family": "workload_runtime_error", "status": "testing"}]
+
+    assert lifecycle.result["observation"]["container_reason"] == "oomkilled"
+    assert artifact_supports_family("workload_runtime_error", lifecycle)
+    _apply_ledger_updates(
+        ledger,
+        [],
+        blackboard=board,
+        artifacts=[lifecycle],
+        eligible_support_ids={evidence_id},
+    )
+    assert ledger[0]["evidence_for"] == [evidence_id]
+
+
+def test_podscheduled_unschedulable_confirms_scheduling_family_with_evidence():
+    target = replace(
+        make_target(),
+        namespace="default",
+        pod="scheduling-error",
+        pod_uid="scheduling-pod-uid",
+    )
+    pod = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": target.pod,
+            "namespace": target.namespace,
+            "uid": target.pod_uid,
+        },
+        "spec": {
+            "containers": [{"name": "nginx", "image": "nginx"}],
+            "nodeSelector": {"nonexistent-label": "true"},
+        },
+        "status": {
+            "phase": "Pending",
+            "conditions": [
+                {
+                    "type": "PodScheduled",
+                    "status": "False",
+                    "reason": "Unschedulable",
+                    "message": "0/7 nodes matched Pod's node affinity/selector.",
+                }
+            ],
+        },
+    }
+    scheduling = _pod_scheduling_artifact(
+        "kubernetes", make_settings(), target, pod
+    )
+    assert scheduling is not None
+    board = Blackboard()
+    board.add_result(
+        "kubernetes",
+        CollectorResult(
+            agent="kubernetes", status="ok", summary="Unschedulable", artifacts=[scheduling]
+        ),
+        entity=f"pod:{target.pod}",
+    )
+    evidence_id = board.evidence_id_for(scheduling)
+    ledger = [{"id": "H1", "family": "k8s_scheduling_error", "status": "testing"}]
+
+    assert scheduling.result["observation"] == {
+        "kind": "kubernetes_pod_scheduling",
+        "predicate": "kubernetes_pod_scheduling",
+        "polarity": "present",
+        "coverage": "scoped",
+        "target_identity_verified": True,
+        "observed_entity": {
+            "kind": "pod",
+            "name": target.pod,
+            "namespace": target.namespace,
+        },
+        "scheduling_reason": "unschedulable",
+    }
+    assert artifact_supports_family("k8s_scheduling_error", scheduling)
+    _apply_ledger_updates(
+        ledger,
+        [],
+        blackboard=board,
+        artifacts=[scheduling],
+        eligible_support_ids={evidence_id},
+    )
     assert ledger[0]["evidence_for"] == [evidence_id]
 
 

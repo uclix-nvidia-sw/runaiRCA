@@ -45,6 +45,9 @@ _K8S_CONTAINER_REASON_FAMILY: dict[str, str] = {
     "errimageneverpull": "image_pull_error",
     "invalidimagename": "image_pull_error",
     "imageinspecterror": "image_pull_error",
+    "oomkilled": "workload_runtime_error",
+    "unschedulable": "k8s_scheduling_error",
+    "schedulinggated": "k8s_scheduling_error",
 }
 
 _FLOOR = 2.0          # min top score below which we fall back to insufficient_evidence
@@ -1355,7 +1358,11 @@ def _artifact_is_relevant_to_family(family: str, art: object) -> bool:
             )
         return predicate == f"alert_signature:{family}"
 
-    reason = str(observation.get("container_reason") or "").strip().casefold()
+    reason = str(
+        observation.get("container_reason")
+        or observation.get("scheduling_reason")
+        or ""
+    ).strip().casefold()
     if reason:
         return _K8S_CONTAINER_REASON_FAMILY.get(reason) == family
 
@@ -1406,7 +1413,7 @@ def artifact_supports_family(family: str, art: object) -> bool:
             return False
         return bool(_keyword_hits(semantic_text, list(rule[2]))[0])
 
-    if observation.get("container_reason"):
+    if observation.get("container_reason") or observation.get("scheduling_reason"):
         return True
 
     _canonical, allowed_agents, keywords = rule

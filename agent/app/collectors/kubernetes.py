@@ -1533,6 +1533,16 @@ class KubernetesCollector:
                     since_time=since_time,
                 )
         container_diagnostics = _container_diagnostics(pod_summary_data)
+        scheduling_describe = (
+            target_pod_describe if target.pod else resolved_pod_describe
+        )
+        scheduling_artifact = _pod_scheduling_artifact(
+            self.name,
+            self._settings,
+            target,
+            scheduling_describe.get("object"),
+            resolved_pod_anchor=resolved_pod_anchor,
+        )
         warnings.extend(
             f"Kubernetes {item['name']} query failed: {item['error']}"
             for item in responses
@@ -1783,6 +1793,8 @@ class KubernetesCollector:
             )
         ]
         artifacts.append(_pod_lifecycle_artifact(self.name, target, responses))
+        if scheduling_artifact is not None:
+            artifacts.append(scheduling_artifact)
         artifacts.append(
             _container_lifecycle_artifact(
                 self.name,
@@ -3738,6 +3750,85 @@ def _pod_lifecycle_artifact(
     )
 
 
+_POD_SCHEDULING_REASONS = frozenset({"unschedulable", "schedulinggated"})
+
+
+def _pod_scheduling_artifact(
+    agent: str,
+    settings: Settings,
+    target: AnalysisTarget,
+    pod_object: object,
+    *,
+    resolved_pod_anchor: AnalysisTarget | None = None,
+):
+    """Expose a target PodScheduled=False condition as typed scheduling evidence."""
+    if not isinstance(pod_object, dict):
+        return None
+    pod_summary = _pod_summary(pod_object)
+    target_identity_verified = _container_lifecycle_target_verified(
+        pod_summary, target, resolved_pod_anchor=resolved_pod_anchor
+    )
+    if not target_identity_verified:
+        return None
+    status = pod_object.get("status")
+    conditions = status.get("conditions") if isinstance(status, dict) else None
+    if not isinstance(conditions, list):
+        return None
+    scheduling_reason = ""
+    for condition in conditions:
+        if not isinstance(condition, dict):
+            continue
+        if str(condition.get("type") or "").strip().casefold() != "podscheduled":
+            continue
+        if _boolean_condition_status(condition.get("status")) is not False:
+            continue
+        reason = str(condition.get("reason") or "").strip().casefold()
+        if reason in _POD_SCHEDULING_REASONS:
+            scheduling_reason = reason
+            break
+    if not scheduling_reason:
+        return None
+
+    observed_target = resolved_pod_anchor or target
+    return artifact(
+        agent=agent,
+        source="kubernetes",
+        type="kubernetes_pod_scheduling",
+        status="ok",
+        confidence="high",
+        title=ko_en(settings, "Pod 스케줄링 상태", "Pod scheduling state"),
+        query=pod_inspection_repr(observed_target.namespace, observed_target.pod),
+        summary=ko_en(
+            settings,
+            f"대상 Pod의 PodScheduled 조건이 False입니다(reason={scheduling_reason}).",
+            f"Target Pod has PodScheduled=False (reason={scheduling_reason}).",
+        ),
+        result={
+            "observation": {
+                "kind": "kubernetes_pod_scheduling",
+                "predicate": "kubernetes_pod_scheduling",
+                "polarity": "present",
+                "coverage": "scoped",
+                "target_identity_verified": True,
+                "observed_entity": {
+                    "kind": "pod",
+                    "name": observed_target.pod,
+                    "namespace": observed_target.namespace,
+                },
+                "scheduling_reason": scheduling_reason,
+            },
+            "pod": observed_target.pod,
+            "namespace": observed_target.namespace,
+            "condition": {
+                "type": "PodScheduled",
+                "status": "False",
+                "reason": scheduling_reason,
+            },
+        },
+        highlights=[scheduling_reason],
+    )
+
+
 def _container_lifecycle_artifact(
     agent: str,
     settings: Settings,
@@ -3769,6 +3860,11 @@ def _container_lifecycle_artifact(
         and any(_container_is_waiting_with_restarts(item) for item in container_diagnostics)
     )
     waiting_reason = _target_waiting_fault_reason(container_diagnostics)
+    current_terminated_reason = (
+        _target_current_terminated_reason(container_diagnostics, time_range)
+        if target_identity_verified
+        else ""
+    )
     current_waiting_fault = (
         target_identity_verified
         and bool(time_range)
@@ -3776,7 +3872,10 @@ def _container_lifecycle_artifact(
         and bool(waiting_reason)
     )
     if target_identity_verified and (
-        terminated_times or current_restart_loop or current_waiting_fault
+        terminated_times
+        or current_restart_loop
+        or current_waiting_fault
+        or current_terminated_reason
     ):
         polarity, coverage = "present", "scoped"
     else:
@@ -3805,6 +3904,8 @@ def _container_lifecycle_artifact(
         observation["current_restart_loop"] = True
     if waiting_reason:
         observation["container_reason"] = waiting_reason
+    elif current_terminated_reason:
+        observation["container_reason"] = current_terminated_reason
 
     summary = _container_lifecycle_summary(container_diagnostics)
     return artifact(
@@ -3939,6 +4040,37 @@ def _target_waiting_fault_reason(container_diagnostics: list[dict[str, object]])
         reason = str(state.get("reason") or "").strip().casefold()
         if reason in _FOLLOWUP_WAITING:
             return reason
+    return ""
+
+
+def _target_current_terminated_reason(
+    container_diagnostics: list[dict[str, object]],
+    time_range: dict[str, str] | None,
+) -> str:
+    """Return OOMKilled from a target's current termination state in this sample."""
+    if not time_range:
+        return ""
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return ""
+    for diagnostic in container_diagnostics:
+        state = diagnostic.get("state") if isinstance(diagnostic, dict) else None
+        if not isinstance(state, dict):
+            continue
+        if str(state.get("phase") or "").strip().casefold() != "terminated":
+            continue
+        if str(state.get("reason") or "").strip().casefold() != "oomkilled":
+            continue
+        if diagnostic.get("lastTerminated") is not None:
+            continue
+        try:
+            if int(diagnostic.get("restartCount") or 0) != 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if parse_incident_time(state.get("finishedAt")) is not None:
+            return "oomkilled"
     return ""
 
 
