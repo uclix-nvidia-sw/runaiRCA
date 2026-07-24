@@ -187,6 +187,35 @@ def _grounds_promoted_issue(artifact: object, issue_keywords: tuple[str, ...] | 
     return bool(_keyword_hits(text, list(issue_keywords))[0])
 
 
+def _grounds_promoted_symptom(candidate: RankedCause | None, artifact: object) -> bool:
+    if candidate is None:
+        return False
+    evidence_id = str(getattr(artifact, "evidence_id", "") or "")
+    if evidence_id not in set(getattr(candidate, "support_evidence_ids", []) or []):
+        return False
+    for item in getattr(candidate, "score_breakdown", []) or []:
+        if item.get("kind") != "curated_symptom":
+            continue
+        keywords = [str(keyword) for keyword in item.get("matched_keywords") or []]
+        _agent, _predicate, text = _artifact_family_semantics(artifact)
+        if keywords and any(keyword.casefold() in text for keyword in keywords):
+            return True
+    return False
+
+
+def _supports_candidate_family(
+    candidate: RankedCause | None,
+    family: str,
+    artifact: object,
+    issue_keywords: tuple[str, ...] | None,
+) -> bool:
+    return bool(
+        artifact_supports_family(family, artifact)
+        or _grounds_promoted_issue(artifact, issue_keywords)
+        or _grounds_promoted_symptom(candidate, artifact)
+    )
+
+
 def evaluate(
     response: AlertAnalysisResponse,
     results: list[CollectorResult],
@@ -205,9 +234,7 @@ def evaluate(
         by_agent.setdefault(str(getattr(item, "agent", "")), []).append(item)
 
     family = str(getattr(top, "family", "") or "")
-    issue_keywords = (
-        _promoted_issue_keywords(top, known_issues) if family not in FAMILIES else None
-    )
+    issue_keywords = _promoted_issue_keywords(top, known_issues)
     agents = set(getattr(top, "evidence_agents", []) or []) if top else set()
     agent_supporting = [item for agent in agents for item in by_agent.get(agent, [])]
     if _signature_support(top):
@@ -216,7 +243,7 @@ def evaluate(
         # Kubernetes, or the system agent.  Claim semantics below are the
         # authoritative boundary, so consider every family-relevant card here.
         agent_supporting.extend(
-            item for item in usable if artifact_supports_family(family, item)
+            item for item in usable if _supports_candidate_family(top, family, item, issue_keywords)
         )
     agent_supporting = _unique_artifacts(agent_supporting)
     all_artifacts = [item for result in results for item in result.artifacts]
@@ -244,8 +271,8 @@ def evaluate(
         for link in links:
             artifact = by_id.get(link.fact_id)
             if artifact is not None:
-                if link.role == "support" and not artifact_supports_family(
-                    family, artifact
+                if link.role == "support" and not _supports_candidate_family(
+                    top, family, artifact, issue_keywords
                 ):
                     link_errors.append(
                         f"link to {link.fact_id!r} does not support root-cause family {family!r}"
@@ -289,9 +316,7 @@ def evaluate(
                 and callable(getattr(eligibility, "permits", None))
                 and eligibility.permits("support")
                 and (
-                    artifact_supports_family(family, item)
-                    if family in FAMILIES
-                    else _grounds_promoted_issue(item, issue_keywords)
+                    _supports_candidate_family(top, family, item, issue_keywords)
                 )
             )
         ]
