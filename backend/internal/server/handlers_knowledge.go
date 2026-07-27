@@ -139,6 +139,15 @@ func (s *Server) handleRootCauseFamilies(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) fetchRootCauseFamilyCatalog(parent context.Context) (RootCauseFamilyCatalog, error) {
+	// Serve from the short-lived cache first. Callers sort/truncate the slice,
+	// so always hand out a copy.
+	s.familyCatalogMu.Lock()
+	if len(s.familyCatalog.Families) > 0 && time.Since(s.familyCatalogFetchedAt) < time.Minute {
+		catalog := RootCauseFamilyCatalog{Families: append([]string(nil), s.familyCatalog.Families...)}
+		s.familyCatalogMu.Unlock()
+		return catalog, nil
+	}
+	s.familyCatalogMu.Unlock()
 	if strings.TrimSpace(s.agentURL) == "" || s.client == nil {
 		return RootCauseFamilyCatalog{}, errors.New("agent is not configured")
 	}
@@ -182,6 +191,10 @@ func (s *Server) fetchRootCauseFamilyCatalog(parent context.Context) (RootCauseF
 	if len(catalog.Families) == 0 {
 		return RootCauseFamilyCatalog{}, errors.New("family catalog is empty")
 	}
+	s.familyCatalogMu.Lock()
+	s.familyCatalog = RootCauseFamilyCatalog{Families: append([]string(nil), catalog.Families...)}
+	s.familyCatalogFetchedAt = time.Now()
+	s.familyCatalogMu.Unlock()
 	return catalog, nil
 }
 

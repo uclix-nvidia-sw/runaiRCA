@@ -3048,12 +3048,25 @@ td span.occurrence-pill {
 .evaluation-actions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
+  gap: 0.75rem;
   border-top: 1px solid var(--line);
   padding-top: 0.9rem;
 }
 
 .evaluation-save {
   min-width: 10rem;
+}
+
+/* Persistent proof that MY review is stored for this exact analysis — the
+   save button alone read as stateless and operators re-saved "just in case". */
+.evaluation-saved-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.82rem;
+  color: var(--ok, #2e7d32);
+  white-space: nowrap;
 }
 
 /* The timeline is a bordered CARD, not a plain section: the shared separator

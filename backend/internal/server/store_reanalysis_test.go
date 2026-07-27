@@ -115,3 +115,43 @@ func TestListIncidentsPageFilteredSortsByLatestActivity(t *testing.T) {
 		t.Fatalf("expected active incident to sort ahead by latest activity, total=%d items=%+v", total, items)
 	}
 }
+
+func TestAutoRevokeSupersededApprovalReleasesApprovalAndCleansReviews(t *testing.T) {
+	store := NewStore()
+	snapshot := eligibleKnowledgeSnapshot()
+	snapshot.ApprovalState = "active"
+	store.caseSnapshots[snapshot.CaseID] = snapshot
+	store.activeCaseByIncident[snapshot.IncidentID] = snapshot.CaseID
+	confirmKnowledgeSnapshot(store, snapshot)
+	approvedAt := time.Now().UTC()
+	incident := &Incident{IncidentID: snapshot.IncidentID, Status: "firing", UserApprovedAt: &approvedAt}
+	store.incidents[incident.IncidentID] = incident
+
+	// A re-analysis that reproduces the approved hash keeps the approval.
+	if _, _, revoked := store.AutoRevokeSupersededApproval(incident.IncidentID, snapshot.AnalysisHash); revoked {
+		t.Fatal("identical re-analysis must keep the approval")
+	}
+
+	// A changed result releases the approval, revokes the snapshot as history,
+	// and deletes the superseded run's evaluation reviews.
+	if _, _, revoked := store.AutoRevokeSupersededApproval(incident.IncidentID, "hash-2"); !revoked {
+		t.Fatal("changed re-analysis must release the approval")
+	}
+	if incident.UserApprovedAt != nil {
+		t.Fatal("approval flag must be cleared")
+	}
+	if snapshot.ApprovalState != "revoked" {
+		t.Fatalf("snapshot must be revoked, got %q", snapshot.ApprovalState)
+	}
+	for _, review := range store.evaluationReviews {
+		if review != nil && review.RunID == snapshot.RunID && review.AnalysisHash == snapshot.AnalysisHash {
+			t.Fatal("superseded evaluation reviews must be deleted")
+		}
+	}
+
+	// Without a comparable hash nothing is released.
+	incident.UserApprovedAt = &approvedAt
+	if _, _, revoked := store.AutoRevokeSupersededApproval(incident.IncidentID, ""); revoked {
+		t.Fatal("missing hash must not revoke")
+	}
+}

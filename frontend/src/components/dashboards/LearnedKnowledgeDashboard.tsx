@@ -420,7 +420,7 @@ export function CandidateDetail({
                   )}
                 </>
               )}
-              {rawActions.length > 0 && rawActions.join(' ') !== confirmedActions.join(' ') && (
+              {rawActions.length > 0 && rawActions.join('\u0000') !== confirmedActions.join('\u0000') && (
                 <small className="knowledge-raw-actions">Operator&apos;s original: {rawActions.join(' · ')}</small>
               )}
             </dd>

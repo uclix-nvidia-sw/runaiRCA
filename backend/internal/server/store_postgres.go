@@ -1436,7 +1436,10 @@ func (s *Store) persistAlertLocked(alert *AlertRecord) bool {
 	return true
 }
 
-func (s *Store) persistMemoryLocked(memory *IncidentMemory) {
+// persistMemory runs OFF the store mutex (goroutine from upsertMemoryLocked):
+// it performs a remote embedding HTTP call and a DB upsert, and reads only its
+// argument plus startup-immutable fields (db, dbReady, pgvectorReady, embed).
+func (s *Store) persistMemory(memory *IncidentMemory) {
 	if s.db == nil || !s.dbReady || memory == nil {
 		return
 	}

@@ -173,6 +173,14 @@ func (s *Server) requestAnalysisRun(
 	}
 	s.broadcastAnalysisRunCompleted(run, incidentID, alertID)
 	s.notifySlackAnalysis(run, incidentID)
+	// A changed result releases the previous approval automatically (the
+	// operator approved text that no longer exists) so the UI never shows an
+	// approved incident whose approval refers to a superseded analysis.
+	if incidentID != "" {
+		if status, resolvedAt, revoked := s.store.AutoRevokeSupersededApproval(incidentID, currentAnalysisHash(&run)); revoked {
+			s.hub.Broadcast(incidentResolvedEvent(incidentID, status, resolvedAt, nil))
+		}
+	}
 }
 
 func isTerminalAgentFailure(analysis AgentAnalysisResponse) bool {

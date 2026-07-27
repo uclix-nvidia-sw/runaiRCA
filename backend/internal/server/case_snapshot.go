@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"log"
 	"sort"
 	"strings"
 	"time"
@@ -565,6 +566,60 @@ func (s *Store) revokeCaseSnapshotsLocked(incidentID string, revokedAt time.Time
 	}
 	delete(s.activeCaseByIncident, incidentID)
 	return true
+}
+
+// AutoRevokeSupersededApproval releases an incident's approval when a NEW
+// analysis result (different hash) supersedes the approved one. Owner decision
+// 2026-07-27: an approval always refers to the analysis the operator actually
+// read — keeping it across a changed re-analysis forced a manual un-approve /
+// re-approve dance. The revoked snapshot stays as history; the superseded
+// run's evaluation reviews are deleted (they scored text that no longer
+// exists) and knowledge derived from them is withdrawn.
+func (s *Store) AutoRevokeSupersededApproval(incidentID, newAnalysisHash string) (string, *time.Time, bool) {
+	if strings.TrimSpace(newAnalysisHash) == "" {
+		return "", nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	incident := s.incidents[incidentID]
+	if incident == nil || incident.UserApprovedAt == nil {
+		return "", nil, false
+	}
+	snapshot := s.caseSnapshots[s.activeCaseByIncident[incidentID]]
+	if snapshot != nil && snapshot.AnalysisHash == newAnalysisHash {
+		// The re-analysis reproduced the approved content exactly; the
+		// approval still vouches for what the operator read.
+		return "", nil, false
+	}
+	now := time.Now().UTC()
+	if !s.revokeCaseSnapshotsLocked(incidentID, now) {
+		return "", nil, false
+	}
+	if snapshot != nil {
+		s.deleteEvaluationReviewsLocked(snapshot.RunID, snapshot.AnalysisHash)
+		s.invalidateKnowledgeForReviewLocked(snapshot.RunID, snapshot.AnalysisHash, now)
+	}
+	incident.UserApprovedAt = nil
+	s.persistIncidentLocked(incident)
+	s.invalidateRecurrenceStatsLocked()
+	return incident.Status, incident.ResolvedAt, true
+}
+
+// deleteEvaluationReviewsLocked removes the operator reviews bound to one
+// superseded (run, hash) pair — their scores and effective actions describe an
+// analysis text that has been replaced.
+func (s *Store) deleteEvaluationReviewsLocked(runID, analysisHash string) {
+	for key, review := range s.evaluationReviews {
+		if review != nil && review.RunID == runID && review.AnalysisHash == analysisHash {
+			delete(s.evaluationReviews, key)
+		}
+	}
+	if s.db == nil || !s.dbReady {
+		return
+	}
+	if _, err := s.execPostgres(`DELETE FROM rca_eval_reviews WHERE run_id = $1 AND analysis_hash = $2`, runID, analysisHash); err != nil {
+		log.Printf("Failed to delete superseded evaluation reviews for run %s: %v", runID, err)
+	}
 }
 
 func caseMechanismFromMetadata(metadata map[string]any) (string, string) {

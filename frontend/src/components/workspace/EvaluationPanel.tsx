@@ -3,6 +3,7 @@ import { useEffect, useReducer, useState } from 'react';
 
 import { fetchAnalysisEvaluation, fetchRootCauseFamilies, saveAnalysisEvaluation } from '../../api';
 import { EvaluationReviewInput, EvaluationView } from '../../types';
+import { formatTime } from '../../utils/formatters';
 
 const DIMENSIONS = [
   ['evidence_grounding', 'Evidence grounding'],
@@ -392,8 +393,13 @@ export function EvaluationPanel({
         </label>
         <div className="evaluation-actions">
           <button className="primary-button evaluation-save" disabled={!evaluationReady || busy || confirmNeedsNote} type="submit">
-            <Save size={16} /> {busy ? 'Saving…' : evaluationStatus === 'loading' ? 'Loading evaluation…' : 'Save evaluation'}
+            <Save size={16} /> {busy ? 'Saving…' : evaluationStatus === 'loading' ? 'Loading evaluation…' : view?.my_review ? 'Update evaluation' : 'Save evaluation'}
           </button>
+          {view?.my_review && (
+            <span className="evaluation-saved-chip" aria-live="polite">
+              <ClipboardCheck size={14} /> Saved · {formatTime(view.my_review.updated_at)}
+            </span>
+          )}
         </div>
       </form>
     </section>

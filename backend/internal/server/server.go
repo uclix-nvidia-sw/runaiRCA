@@ -270,9 +270,15 @@ type Server struct {
 	agentResponseMaxBytes     int64
 	client                    *http.Client
 	agentSlots                chan struct{}
-	autoAnalyzeMu             sync.Mutex
-	autoAnalyzeStarts         []time.Time
-	autoAnalyzeFanout         int
+	// The family catalog changes only when the agent redeploys, but it used to
+	// be fetched from the agent on EVERY evaluation save — the whole perceived
+	// save latency whenever the agent was busy analyzing.
+	familyCatalogMu        sync.Mutex
+	familyCatalog          RootCauseFamilyCatalog
+	familyCatalogFetchedAt time.Time
+	autoAnalyzeMu          sync.Mutex
+	autoAnalyzeStarts      []time.Time
+	autoAnalyzeFanout      int
 	// Severities eligible for AUTO analysis. nil = every ingested severity (except
 	// info, dropped by ignoredAlert). Manual analysis is never gated by this.
 	autoAnalyzeSeverities map[string]bool

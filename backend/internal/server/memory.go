@@ -533,7 +533,19 @@ func (s *Store) upsertMemoryLocked(incident *Incident, alert *AlertRecord) {
 	}
 	memory.Vector = textVector(memoryText(*memory))
 	s.memories[first(memory.AlertID, memory.IncidentID)] = memory
-	s.persistMemoryLocked(memory)
+	// The remote embedding call (up to 15s) plus the DB upsert must not run
+	// under the global store mutex: one approve used to stall every read and
+	// write behind the lock, which surfaced as "approve and the incident list
+	// are slow". The row is an idempotent upsert of an immutable value, and
+	// the in-memory entry above is already visible, so persistence is safe to
+	// finish asynchronously.
+	snapshot := *memory
+	snapshot.Labels = cloneMap(memory.Labels)
+	snapshot.Vector = make(map[string]float64, len(memory.Vector))
+	for token, weight := range memory.Vector {
+		snapshot.Vector[token] = weight
+	}
+	go s.persistMemory(&snapshot)
 	s.invalidateRecurrenceStatsLocked()
 }
 
