@@ -578,6 +578,58 @@ async def test_chat_adhoc_alert_is_not_a_node_alert() -> None:
 
 
 @pytest.mark.asyncio
+async def test_alert_text_symptom_signature_leads_the_plan() -> None:
+    # The alert BODY carries the literal curated signature; the plan must lead
+    # with that symptom's family instead of ranking on the alert NAME alone.
+    settings = make_settings()
+    target = _target(alert_name="KubeContainerWaiting", namespace="acme-team", pod="web-0")
+    alert = Alert(
+        status="firing",
+        labels={"alertname": "KubeContainerWaiting"},
+        annotations={"description": "Container web is in CreateContainerConfigError state"},
+    )
+    plan = await plan_investigation(settings, target, alert, {}, [])
+    assert plan.hypotheses[0]["family"] == "workload_startup_error"
+    assert "curated symptom" in plan.hypotheses[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_negated_symptom_text_does_not_lead_the_plan() -> None:
+    settings = make_settings()
+    target = _target(alert_name="SomethingCompletelyUnrecognized", namespace="acme-team")
+    alert = Alert(
+        status="firing",
+        labels={"alertname": "SomethingCompletelyUnrecognized"},
+        annotations={"description": "no CreateContainerConfigError observed on this pod"},
+    )
+    plan = await plan_investigation(settings, target, alert, {}, [])
+    assert "curated symptom" not in plan.hypotheses[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_non_catalog_symptom_family_cannot_lead_the_plan() -> None:
+    # A learned/legacy family outside the closed vocabulary may inform matching
+    # elsewhere, but the plan headline stays catalog-bound.
+    settings = make_settings()
+    target = _target(alert_name="SomethingCompletelyUnrecognized", namespace="acme-team")
+    alert = Alert(
+        status="firing",
+        labels={"alertname": "SomethingCompletelyUnrecognized"},
+        annotations={"description": "hit the legacy marker somethinglegacy"},
+    )
+    kg = {
+        "available": True,
+        "knowledge": {
+            "legacy_family_not_in_catalog": [
+                {"symptom": "legacy", "keywords": ["somethinglegacy"], "actions": ["a"]}
+            ]
+        },
+    }
+    plan = await plan_investigation(settings, target, alert, kg, [])
+    assert plan.hypotheses[0]["family"] != "legacy_family_not_in_catalog"
+
+
+@pytest.mark.asyncio
 async def test_namespace_less_infra_alert_still_leads_node_level() -> None:
     # The node promotion itself stays: a REAL label-less infra alert is about
     # the node, and the system agent carries the investigation.

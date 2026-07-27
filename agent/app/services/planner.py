@@ -519,6 +519,40 @@ def _has_precise_xid(alert_text: str) -> bool:
     return bool(_XID_PATTERN.search(alert_text or ""))
 
 
+def _alert_symptom_lead(
+    settings: Settings,
+    kg_context: dict,
+    alert_text: str,
+    family_catalog: FamilyCatalog,
+) -> dict[str, str] | None:
+    """Curated/learned symptom whose keyword appears in the alert text itself.
+
+    Uses the TypeDB knowledge map when enrichment supplied it, else the YAML
+    catalog. Only catalog families may lead the plan — a legacy/learned family
+    outside the closed vocabulary informs matching elsewhere but must not
+    become the plan headline.
+    """
+    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+
+    failure_modes = dict(kg_context.get("knowledge") or {})
+    if not failure_modes:
+        try:
+            failure_modes = load_failure_modes(settings.failure_modes_file)
+        except Exception:  # noqa: BLE001 - plan-time hint only, never fatal
+            return None
+    matches = match_failure_mode_symptoms(failure_modes, alert_text)
+    for family, symptom in matches:
+        if family not in family_catalog.families:
+            continue
+        name = str(symptom.get("symptom") or symptom.get("name") or "curated symptom")
+        hits = ", ".join(str(hit) for hit in symptom.get("matched_keywords") or [])
+        reason = f"alert text matches curated symptom '{name}'"
+        if hits:
+            reason += f" ({hits})"
+        return {"family": family, "reason": reason}
+    return None
+
+
 async def plan_investigation(
     settings: Settings,
     target: AnalysisTarget,
@@ -594,6 +628,16 @@ async def plan_investigation(
         hypotheses = [change_lead] + [
             h for h in hypotheses if h["family"] != change_lead["family"]
         ]
+    # The alert BODY (annotations/labels) often carries the literal failure
+    # signature ("CreateContainerConfigError", "preempted by higher priority").
+    # The symptom signature is the ontology entry point everywhere else in the
+    # pipeline — let it lead the plan too, instead of ranking on the alert NAME
+    # alone. Exact substring only; negation/context guards live in the matcher.
+    symptom_lead = _alert_symptom_lead(settings, kg_context, alert_text, family_catalog)
+    if symptom_lead:
+        hypotheses = [symptom_lead] + [
+            h for h in hypotheses if h["family"] != symptom_lead["family"]
+        ]
     if _has_precise_xid(alert_text):
         hypotheses = [
             {
@@ -644,6 +688,7 @@ async def plan_investigation(
         or bool(matched_alert)
         or bool(component)
         or bool(change_lead)
+        or bool(symptom_lead)
         or scope in _SCOPE_LEAD
         or node_focused
         or seed_valid
