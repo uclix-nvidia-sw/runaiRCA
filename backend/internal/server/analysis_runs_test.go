@@ -1962,3 +1962,35 @@ func TestReusedManualRunBecomesLatestSoItsResultApplies(t *testing.T) {
 		t.Fatalf("reused run result must apply as the newest analysis, not be rejected as stale")
 	}
 }
+
+func TestSynthesisContextReachesRunMetadata(t *testing.T) {
+	// The agent measures how long Korean localization took; without the
+	// allowlist entry that number is collected and then dropped on the floor
+	// before anything can read it.
+	store := NewStore()
+	_, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "g-synthesis"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "KubeContainerWaiting"},
+		Fingerprint: "fp-synthesis",
+	})
+	run := store.CreateAnalysisRun(
+		"manual", "incident", alert.IncidentID, alert.IncidentID, alert.AlertID, "Initial", "",
+	)
+	completed, ok := store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "RCA",
+		Context: map[string]any{
+			"synthesis": map[string]any{
+				"status":           "completed",
+				"duration_seconds": float64(12.5),
+				"model":            "m",
+			},
+		},
+	})
+	if !ok {
+		t.Fatal("failed to complete the analysis run")
+	}
+	synthesis, _ := completed.Metadata["synthesis"].(map[string]any)
+	if synthesis["status"] != "completed" || synthesis["duration_seconds"] != float64(12.5) {
+		t.Fatalf("synthesis diagnostics did not reach run metadata: %+v", completed.Metadata)
+	}
+}
