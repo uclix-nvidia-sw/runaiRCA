@@ -465,6 +465,11 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 			"probe_template_ids": map[string]any{family: probeTemplateIDs},
 		},
 	}
+	if strings.HasPrefix(family, "novel_") {
+		payload["matcher_only"] = true
+		payload["novelty"] = "open_world"
+		payload["provenance"].(map[string]any)["promotion_path"] = "open_world_novel"
+	}
 	if evidenceSource != "" {
 		payload["evidence_source"] = evidenceSource
 		payload["provenance"].(map[string]any)["promotion_path"] = evidenceSource

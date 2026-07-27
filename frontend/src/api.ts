@@ -1,4 +1,4 @@
-import { AlertRecord, AnalysisRun, Envelope, EvaluationReview, EvaluationReviewInput, EvaluationView, FeedbackSummary, Incident, IncidentDetail, KPIStats, KnowledgeCandidate, KnowledgePackage, KnowledgeRuntimeSnapshot, LLMSpendStats, PageInfo, ProbeMetricsSnapshot, RecurrenceStats, RootCauseFamilyCatalog } from './types';
+import { AlertRecord, AnalysisRun, Envelope, EvaluationReview, EvaluationReviewInput, EvaluationView, FamilySuggestions, FeedbackSummary, Incident, IncidentDetail, KPIStats, KnowledgeCandidate, KnowledgePackage, KnowledgeRuntimeSnapshot, LLMSpendStats, PageInfo, ProbeMetricsSnapshot, RecurrenceStats, RootCauseFamilyCatalog } from './types';
 
 // globalThis: this module is also loaded by node-side component tests, where
 // bare `window` throws at import time.
@@ -118,6 +118,9 @@ export async function saveAnalysisEvaluation(runID: string, input: EvaluationRev
 export async function fetchRootCauseFamilies(): Promise<string[]> {
   return (await read<Envelope<RootCauseFamilyCatalog>>('/api/v1/knowledge/families')).data.families;
 }
+export async function fetchFamilySuggestions(q: string): Promise<FamilySuggestions> {
+  return read<FamilySuggestions>(`/api/v1/knowledge/family-suggestions?q=${encodeURIComponent(q)}`);
+}
 
 
 export async function analyzeIncident(id: string): Promise<void> {
@@ -129,7 +132,8 @@ export async function cancelIncidentAnalysis(id: string): Promise<void> {
 }
 
 export type RCACorrectionInput = {
-  root_cause_family: string;
+  root_cause_family?: string;
+  new_cause?: string;
   summary: string;
   actions: string[];
 };

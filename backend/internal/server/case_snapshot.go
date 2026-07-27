@@ -155,7 +155,40 @@ func (s *Store) knowledgeCandidateForSnapshotLocked(snapshot *CaseSnapshot) *Kno
 	if !hasReviews || !allowsPromotion {
 		return nil
 	}
+	// In shadow mode the approved headline remains catalog-bound. A novel review
+	// promotes the separately evidence-gated open-world candidate instead.
+	if review, ok := s.novelReviewForSnapshotLocked(snapshot); ok {
+		if candidate := openWorldCandidate(snapshot); candidate != nil {
+			copy := cloneCaseSnapshot(snapshot)
+			copy.RootCauseFamily = stringValue(candidate["family"])
+			copy.Mechanism = stringValue(candidate["mechanism"])
+			copy.MechanismFingerprint = stringValue(candidate["mechanism_fingerprint"])
+			return knowledgeCandidateForSnapshotWithOutcome(&copy, true, false)
+		}
+		_ = review
+	}
 	return knowledgeCandidateForSnapshotWithOutcome(snapshot, true, s.operatorConfirmedForSnapshotLocked(snapshot))
+}
+
+func (s *Store) novelReviewForSnapshotLocked(snapshot *CaseSnapshot) (*EvaluationReview, bool) {
+	for _, review := range s.evaluationReviews {
+		if review != nil && review.RunID == snapshot.RunID && review.AnalysisHash == snapshot.AnalysisHash && review.CaseType == "novel" {
+			return review, true
+		}
+	}
+	return nil, false
+}
+
+func openWorldCandidate(snapshot *CaseSnapshot) map[string]any {
+	metadata, _ := snapshot.Snapshot["metadata"].(map[string]any)
+	items, _ := metadata["open_world_candidates"].([]any)
+	for _, raw := range items {
+		candidate, _ := raw.(map[string]any)
+		if strings.HasPrefix(stringValue(candidate["family"]), "novel_") && strings.TrimSpace(stringValue(candidate["mechanism"])) != "" {
+			return candidate
+		}
+	}
+	return nil
 }
 
 // operatorConfirmedForSnapshotLocked reports whether an operator explicitly
@@ -221,7 +254,7 @@ func (s *Store) caseReviewAllowsKnowledgePromotionLocked(snapshot *CaseSnapshot)
 				successfulConfirmation = true
 			}
 		case "novel":
-			if expected != "" || !strings.HasPrefix(family, "novel_") {
+			if expected != "" || (!strings.HasPrefix(family, "novel_") && openWorldCandidate(snapshot) == nil) {
 				return true, false
 			}
 			if review.ResolutionOutcome == "resolved" || review.ResolutionOutcome == "mitigated" {

@@ -97,6 +97,7 @@ export type EvaluationView = {
 export type RootCauseFamilyCatalog = {
   families: string[];
 };
+export type FamilySuggestions = { catalog: string[]; novel: Array<{ family: string; mechanism: string }>; slug: string };
 
 export type EvaluationReviewInput = Omit<EvaluationReview, 'review_id' | 'run_id' | 'reviewer' | 'created_at' | 'updated_at'>;
 
@@ -300,7 +301,7 @@ export type CompiledKnowledge = {
 export type KnowledgeCandidate = {
   candidate_id: string;
   status: string;
-  payload?: { mechanism?: string; compiled?: CompiledKnowledge };
+  payload?: { mechanism?: string; matcher_only?: boolean; novelty?: string; compiled?: CompiledKnowledge };
   title?: string;
   summary?: string;
   root_cause_family?: string;

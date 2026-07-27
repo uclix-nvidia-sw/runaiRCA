@@ -532,7 +532,7 @@ def _alert_symptom_lead(
     outside the closed vocabulary informs matching elsewhere but must not
     become the plan headline.
     """
-    from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+    from app.knowledge import is_matcher_only_family, load_failure_modes, match_failure_mode_symptoms
 
     failure_modes = dict(kg_context.get("knowledge") or {})
     if not failure_modes:
@@ -542,7 +542,7 @@ def _alert_symptom_lead(
             return None
     matches = match_failure_mode_symptoms(failure_modes, alert_text)
     for family, symptom in matches:
-        if family not in family_catalog.families:
+        if is_matcher_only_family(family) or family not in family_catalog.families:
             continue
         name = str(symptom.get("symptom") or symptom.get("name") or "curated symptom")
         hits = ", ".join(str(hit) for hit in symptom.get("matched_keywords") or [])

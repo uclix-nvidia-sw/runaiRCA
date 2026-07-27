@@ -216,6 +216,7 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
               >
                 <span className="knowledge-candidate-topline"><Status value={candidate.status} /><time>{formatTime(candidate.created_at || '')}</time></span>
                 <strong>{candidate.title || 'Untitled incident-derived candidate'}</strong>
+                {candidate.payload?.matcher_only === true && candidate.payload?.novelty === 'open_world' && <strong>novel · matcher-only</strong>}
                 <span>{candidate.root_cause_family || 'Unclassified family'} · {candidate.kind || 'kind not reported'} · {supportingCaseLabel(candidate)}</span>
               </button>
             ))}
@@ -313,6 +314,7 @@ export function CandidateDetail({
   const symptoms = (candidate.payload?.compiled?.failure_modes ?? []).flatMap((mode) => mode.symptoms ?? []);
   const mechanism = candidate.payload?.mechanism || symptoms[0]?.name || '';
   const confirmedActions = symptoms.flatMap((symptom) => symptom.actions ?? []);
+  const matcherOnly = candidate.payload?.matcher_only === true && candidate.payload?.novelty === 'open_world';
   return (
     <>
       <div className="knowledge-panel-head candidate-detail-head">
@@ -320,6 +322,7 @@ export function CandidateDetail({
           <p className="eyebrow">Candidate detail</p>
           <h3>{candidate.title || 'Untitled incident-derived candidate'}</h3>
           <span>{candidate.root_cause_family || 'Unclassified family'} · confidence {formatConfidence(candidate.confidence)}</span>
+          {matcherOnly && <strong>novel · matcher-only</strong>}
         </div>
         <Status value={candidate.status} />
       </div>
@@ -405,6 +408,7 @@ export function IngestionPreview({ candidate }: { candidate: KnowledgeCandidate 
   return (
     <section className="knowledge-ingestion-preview">
       <strong>Ingestion preview — what activation writes</strong>
+      {candidate.payload?.matcher_only === true && candidate.payload?.novelty === 'open_world' && <small>Activation matches future incidents but never names the headline family.</small>}
       {symptoms.map((symptom, index) => (
         <div className="knowledge-ingestion-symptom" key={symptom.name || index}>
           <span>

@@ -36,6 +36,7 @@ import {
   emptyIncidentTrash,
   fetchAnalysisRun,
   fetchIncident,
+  fetchFamilySuggestions,
   fetchRootCauseFamilies,
   rcaCorrection,
   rcaPin,
@@ -893,6 +894,8 @@ function UnifiedWorkspace({
   const [justApproved, setJustApproved] = useState(false);
   const [correctionOpen, setCorrectionOpen] = useState(false);
   const [correctionFamily, setCorrectionFamily] = useState('');
+  const [correctionNewCause, setCorrectionNewCause] = useState('');
+  const [correctionSuggestions, setCorrectionSuggestions] = useState<{ catalog: string[]; novel: Array<{ family: string; mechanism: string }>; slug: string }>();
   const [correctionSummary, setCorrectionSummary] = useState('');
   const [correctionActions, setCorrectionActions] = useState('');
   const [correctionCatalogStatus, setCorrectionCatalogStatus] = useState<'loading' | 'ready' | 'failed'>('ready');
@@ -951,6 +954,13 @@ function UnifiedWorkspace({
     });
     return () => { cancelled = true; };
   }, [correctionOpen]);
+
+  useEffect(() => {
+    if (!correctionNewCause.trim()) { setCorrectionSuggestions(undefined); return undefined; }
+    let cancelled = false;
+    const handle = window.setTimeout(() => { void fetchFamilySuggestions(correctionNewCause).then((value) => { if (!cancelled) setCorrectionSuggestions(value); }).catch(() => { if (!cancelled) setCorrectionSuggestions(undefined); }); }, 300);
+    return () => { cancelled = true; window.clearTimeout(handle); };
+  }, [correctionNewCause]);
 
   useEffect(() => {
     if (!correctionOpen) return undefined;
@@ -1051,18 +1061,19 @@ function UnifiedWorkspace({
     document.getElementById('operator-feedback')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
   const saveCorrection = async () => {
-    if (!incident || busyAction || correctionCatalogStatus !== 'ready' || !correctionFamily || !correctionSummary.trim()) return;
+    if (!incident || busyAction || correctionCatalogStatus !== 'ready' || (!correctionFamily && !correctionNewCause.trim()) || !correctionSummary.trim()) return;
     setBusyAction('rca-correction');
     setCorrectionError('');
     try {
       await rcaCorrection(incident.incident_id, {
-        root_cause_family: correctionFamily,
+        ...(correctionNewCause.trim() ? { new_cause: correctionNewCause.trim() } : { root_cause_family: correctionFamily }),
         summary: correctionSummary.trim(),
         actions: parseCorrectionActions(correctionActions),
       });
       await onRefresh();
       setCorrectionOpen(false);
       setCorrectionFamily('');
+      setCorrectionNewCause('');
       setCorrectionSummary('');
       setCorrectionActions('');
     } catch (err) {
@@ -1290,6 +1301,17 @@ function UnifiedWorkspace({
                 </select>
               </label>
               <label className="evaluation-field">
+                <span>New cause <small>Optional; leave blank to use the catalog family</small></span>
+                <input value={correctionNewCause} onChange={(event) => { setCorrectionNewCause(event.target.value); setCorrectionFamily(''); }} disabled={Boolean(busyAction)} maxLength={200} />
+                {correctionSuggestions && (
+                  <small>
+                    {correctionSuggestions.catalog.map((family) => <button key={family} type="button" className="link-button" onClick={() => { setCorrectionFamily(family); setCorrectionNewCause(''); }}>{family}</button>)}
+                    {correctionSuggestions.novel.map((item) => <button key={item.family} type="button" className="link-button" onClick={() => { setCorrectionFamily(item.family); setCorrectionNewCause(''); }}>{item.mechanism || item.family}</button>)}
+                    {correctionNewCause.trim() && <> New slug: <code>{correctionSuggestions.slug}</code></>}
+                  </small>
+                )}
+              </label>
+              <label className="evaluation-field">
                 <span>RCA summary</span>
                 <textarea
                   value={correctionSummary}
@@ -1317,7 +1339,7 @@ function UnifiedWorkspace({
                 </button>
                 <button
                   className={`primary-button evaluation-save ${busyAction === 'rca-correction' ? 'is-busy' : ''}`}
-                  disabled={Boolean(busyAction) || correctionCatalogStatus !== 'ready' || !correctionFamily || !correctionSummary.trim()}
+                  disabled={Boolean(busyAction) || correctionCatalogStatus !== 'ready' || (!correctionFamily && !correctionNewCause.trim()) || !correctionSummary.trim()}
                   type="submit"
                 >
                   {busyAction === 'rca-correction' ? 'Saving...' : 'Save'}

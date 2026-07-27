@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -16,6 +17,44 @@ const maxRootCauseFamilyCatalogBytes = 64 << 10
 
 type RootCauseFamilyCatalog struct {
 	Families []string `json:"families"`
+}
+
+func (s *Server) handleFamilySuggestions(w http.ResponseWriter, r *http.Request) {
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	catalog, err := s.fetchRootCauseFamilyCatalog(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "root-cause family catalog unavailable")
+		return
+	}
+	tokens := strings.Fields(strings.ToLower(q))
+	sort.SliceStable(catalog.Families, func(i, j int) bool {
+		return tokenOverlap(catalog.Families[i], tokens) > tokenOverlap(catalog.Families[j], tokens)
+	})
+	if len(catalog.Families) > 5 {
+		catalog.Families = catalog.Families[:5]
+	}
+	novel := make([]map[string]string, 0, 5)
+	for _, c := range s.store.ListKnowledgeCandidates("") {
+		if strings.HasPrefix(c.Family, "novel_") {
+			novel = append(novel, map[string]string{"family": c.Family, "mechanism": stringValue(c.Payload["mechanism"])})
+			if len(novel) == 5 {
+				break
+			}
+		}
+	}
+	slug, _ := novelFamilySlug(q)
+	writeJSON(w, http.StatusOK, map[string]any{"catalog": catalog.Families, "novel": novel, "slug": slug})
+}
+
+func tokenOverlap(value string, tokens []string) int {
+	score := 0
+	lower := strings.ToLower(strings.ReplaceAll(value, "_", " "))
+	for _, token := range tokens {
+		if strings.Contains(lower, token) {
+			score++
+		}
+	}
+	return score
 }
 
 func (s *Server) handleKnowledge(w http.ResponseWriter, r *http.Request) {

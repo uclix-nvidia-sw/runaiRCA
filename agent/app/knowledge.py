@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -1601,6 +1602,11 @@ def match_failure_mode_symptoms(
         kept.append((family, {**symptom, "matched_keywords": hits}))
         kept_hits.append(hits)
     return kept
+
+
+def is_matcher_only_family(family: str) -> bool:
+    """True for learned/open-world families that may match but never lead RCA."""
+    return family.startswith("novel_")
 
 
 _GENERIC_CONTEXT_HITS = {

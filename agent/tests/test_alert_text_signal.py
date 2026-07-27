@@ -455,3 +455,63 @@ def test_backofflimitexceeded_end_to_end_headline() -> None:
     assert promoted[0].family == "workload_startup_error"
     assert promoted[0].score == 7.0
     assert "signature" in promoted[0].evidence_agents
+
+
+def test_learned_novel_family_can_match_but_never_leads_the_rca() -> None:
+    """The matcher-only invariant (owner decision 2026-07-27): an activated
+    novel symptom must surface its mechanism and fixes, but its `novel_*`
+    family must never become the headline — the closed catalog stays closed."""
+    from app.services.pipeline import _promote_signature_cause
+
+    ranked = [RankedCause(family="node_kubelet_pressure", confidence="medium", score=3.0)]
+    novel = [(
+        "novel_configmap_race_on_startup_f1b5a4d1",
+        {"symptom": "configmap replaced during rollout", "matched_keywords": ["configmap race"]},
+    )]
+
+    out = _promote_signature_cause(ranked, [], [], novel, evidence_text="configmap race")
+
+    assert out[0].family == "node_kubelet_pressure", "a novel family must not take the headline"
+    assert not any(candidate.family.startswith("novel_") for candidate in out), (
+        "a novel family must not enter the ranked candidate list"
+    )
+    # A CATALOG symptom in the same call still promotes normally — the guard is
+    # scoped to matcher-only families, it does not disable signature promotion.
+    catalog = [(
+        "gpu_hardware_error",
+        {"symptom": "GPU Fallen Off The Bus", "matched_keywords": ["fallen off the bus"]},
+    )]
+    assert _promote_signature_cause(ranked, [], [], novel + catalog)[0].family == "gpu_hardware_error"
+
+
+def test_novel_family_cannot_lead_the_plan_either() -> None:
+    import asyncio
+
+    from app.collectors.base import AnalysisTarget
+    from app.schemas import Alert
+    from app.services.planner import plan_investigation
+    from tests.test_orchestrator import make_settings
+
+    settings = make_settings()
+    target = AnalysisTarget(
+        cluster="", project="", queue="", namespace="acme-team", workload_name="",
+        workload_type="", runai_workload_id="", node="", pod="web-0",
+        severity="warning", alert_name="SomethingUnrecognized",
+    )
+    alert = Alert(
+        status="firing",
+        labels={"alertname": "SomethingUnrecognized"},
+        annotations={"description": "configmap race observed during rollout"},
+    )
+    kg = {
+        "available": True,
+        "knowledge": {
+            "novel_configmap_race_on_startup_f1b5a4d1": [
+                {"symptom": "configmap race", "keywords": ["configmap race"], "actions": ["recreate"]}
+            ]
+        },
+    }
+    plan = asyncio.run(plan_investigation(settings, target, alert, kg, []))
+    assert not any(
+        str(hypothesis.get("family", "")).startswith("novel_") for hypothesis in plan.hypotheses
+    ), f"novel family leaked into the plan: {plan.hypotheses}"

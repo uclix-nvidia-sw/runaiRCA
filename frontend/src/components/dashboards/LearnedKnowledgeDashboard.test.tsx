@@ -51,6 +51,11 @@ describe('IngestionPreview', () => {
     const bare = candidate({ payload: undefined });
     expect(renderToStaticMarkup(<IngestionPreview candidate={bare} />)).toBe('');
   });
+
+  it('explains the novel matcher-only boundary', () => {
+    const markup = renderToStaticMarkup(<IngestionPreview candidate={candidate({ payload: { matcher_only: true, novelty: 'open_world', compiled: candidate().payload!.compiled } })} />);
+    expect(markup).toContain('never names the headline family');
+  });
 });
 
 describe('CandidateDetail', () => {

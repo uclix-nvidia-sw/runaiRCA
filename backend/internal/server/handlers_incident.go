@@ -1,16 +1,82 @@
 package server
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
+
+// caseFold matches Python's str.casefold() (full Unicode folding), not
+// strings.ToLower: "ß" folds to "ss". The agent mints novel family slugs with
+// casefold, and the fingerprint is the dedup key across both paths — a
+// ToLower/casefold split would mint two families for one mechanism.
+var caseFold = cases.Fold()
 
 type rcaCorrectionRequest struct {
 	RootCauseFamily string   `json:"root_cause_family"`
+	NewCause        string   `json:"new_cause"`
 	Summary         string   `json:"summary"`
 	Actions         []string `json:"actions"`
+}
+
+func novelFamilySlug(mechanism string) (string, string) {
+	canonical := strings.Join(strings.Fields(caseFold.String(norm.NFKC.String(mechanism))), " ")
+	var ascii strings.Builder
+	for _, r := range norm.NFKD.String(canonical) {
+		if r <= unicode.MaxASCII {
+			ascii.WriteRune(r)
+		}
+	}
+	slug := strings.Trim(strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			return r
+		}
+		return '_'
+	}, ascii.String()), "_")
+	if slug == "" {
+		slug = "mechanism"
+	}
+	digest := sha256.Sum256([]byte(canonical))
+	fingerprint := fmt.Sprintf("%x", digest[:])[:8]
+	if len(slug) > 42 {
+		slug = strings.TrimRight(slug[:42], "_")
+	}
+	family := "novel_" + slug + "_" + fingerprint
+	if len(family) > 64 {
+		family = family[:64]
+	}
+	return family, fingerprint
+}
+
+func compactCause(text string) string {
+	return strings.Join(strings.Fields(caseFold.String(norm.NFKC.String(text))), " ")
+}
+
+func (s *Server) existingNovelFamily(mechanism, fingerprint string) string {
+	needle := compactCause(mechanism)
+	for _, candidate := range s.store.ListKnowledgeCandidates("") {
+		if !strings.HasPrefix(candidate.RootCauseFamily, "novel_") {
+			continue
+		}
+		if candidate.Family == "" {
+			candidate.Family = candidate.RootCauseFamily
+		}
+		if strings.HasSuffix(candidate.Family, "_"+fingerprint) || compactCause(stringValue(candidate.Payload["mechanism"])) == needle {
+			return candidate.Family
+		}
+	}
+	for _, pkg := range s.store.ListKnowledgePackages(true) {
+		if strings.HasPrefix(pkg.Family, "novel_") && (strings.HasSuffix(pkg.Family, "_"+fingerprint) || compactCause(stringValue(pkg.Payload["mechanism"])) == needle) {
+			return pkg.Family
+		}
+	}
+	return ""
 }
 
 type rcaPinRequest struct {
@@ -181,9 +247,18 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.RootCauseFamily = strings.TrimSpace(req.RootCauseFamily)
+		req.NewCause = strings.TrimSpace(req.NewCause)
 		req.Summary = strings.TrimSpace(req.Summary)
 		if req.Summary == "" {
 			writeError(w, http.StatusBadRequest, "summary is required")
+			return
+		}
+		if req.NewCause != "" && req.RootCauseFamily != "" {
+			writeError(w, http.StatusBadRequest, "new_cause and root_cause_family are mutually exclusive")
+			return
+		}
+		if len([]rune(req.NewCause)) > 200 {
+			writeError(w, http.StatusBadRequest, "new_cause must be 200 characters or fewer")
 			return
 		}
 		catalog, err := s.fetchRootCauseFamilyCatalog(r.Context())
@@ -191,7 +266,24 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, "root-cause family catalog unavailable")
 			return
 		}
-		if !mapContains(catalog.Families, req.RootCauseFamily) {
+		reused := ""
+		if req.NewCause != "" {
+			family, fingerprint := novelFamilySlug(req.NewCause)
+			for _, known := range catalog.Families {
+				if compactCause(known) == compactCause(req.NewCause) {
+					family = known
+					reused = known
+					break
+				}
+			}
+			if reused == "" {
+				if existing := s.existingNovelFamily(req.NewCause, fingerprint); existing != "" {
+					family, reused = existing, existing
+				}
+			}
+			req.RootCauseFamily = family
+		}
+		if !mapContains(catalog.Families, req.RootCauseFamily) && !strings.HasPrefix(req.RootCauseFamily, "novel_") {
 			writeError(w, http.StatusBadRequest, "root_cause_family must be selected from the root-cause family catalog")
 			return
 		}
@@ -207,6 +299,9 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.broadcastAnalysisRunCompleted(run, id, alertID)
+		if reused != "" {
+			run.Metadata["reused_family"] = reused
+		}
 		writeJSON(w, http.StatusCreated, envelope(run))
 	case "rca-pin":
 		if len(parts) != 2 || r.Method != http.MethodPost {

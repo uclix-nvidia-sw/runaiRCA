@@ -41,6 +41,7 @@ from app.knowledge import (
     load_troubleshooting_cases,
     localized_failure_mode_actions,
     match_failure_mode_symptoms,
+    is_matcher_only_family,
     match_runai_known_issues,
     merge_runtime_failure_modes,
     runtime_shadow_hints,
@@ -2541,9 +2542,13 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             "investigation": state.investigation_context,
             "reasoning_trace_v2": state.investigation_context.get("reasoning_trace_v2", {}),
             "reasoning_trace_v3": state.investigation_context.get("reasoning_trace_v3", {}),
-            "open_world_candidates": [
-                candidate.as_dict() for candidate in state.open_world_candidates
-            ],
+            **({"open_world_candidates": [{
+                "family": candidate.family, "mechanism": candidate.mechanism,
+                "mechanism_fingerprint": candidate.mechanism_fingerprint,
+                "confidence": candidate.confidence, "hypothesis_id": candidate.hypothesis_id,
+                "support_evidence_ids": candidate.support_evidence_ids,
+                "independent_source_groups": candidate.independent_source_groups,
+            } for candidate in state.open_world_candidates]} if state.open_world_candidates else {}),
             **({"timeline": state.timeline} if state.timeline else {}),
             **(
                 {"troubleshooting_path": state.troubleshooting_path}
@@ -4206,7 +4211,7 @@ def _actionable_failure_mode_matches(
         for family, symptom in match_failure_mode_symptoms(
             failure_modes, observed_text, top_family, fuzzy_query=fuzzy_query
         )
-        if not filter_to_top or family == top_family
+        if not filter_to_top or family == top_family or is_matcher_only_family(family)
     ]
     exclusive = next(
         ((family, symptom) for family, symptom in matches if symptom.get("exclusive_actions")),
@@ -4813,7 +4818,7 @@ def _promote_signature_cause(
         )
         return [lead] + [c for c in candidates if c.family != family]
     for family, symptom in symptom_matches:
-        if not family:
+        if not family or is_matcher_only_family(family):
             continue
         support = (symptom_support or {}).get(
             f"{family}\0{str(symptom.get('symptom') or '')}", {}
@@ -6490,14 +6495,14 @@ def _kb_remediation_lines(
     for family, symptom in match_failure_mode_symptoms(
         knowledge, observed_text, top_family, fuzzy_query=fuzzy_query
     ):
-        if filter_to_top and family != top_family:
+        if filter_to_top and family != top_family and not is_matcher_only_family(family):
             continue
         actions = symptom.get("actions", [])
         if actions:
             symptom_name = _safe_line(symptom.get("symptom"), limit=160, masker=active_masker)
-            header = (
-                f"- Matched symptom **{symptom_name}** "
-                f"({_family_label(family)}); known fixes from the knowledge base:"
+            learned = is_matcher_only_family(family)
+            header = (f"- Learned from a previous incident (not a catalog family): " if learned else "") + (
+                f"Matched symptom **{symptom_name}** ({_family_label(family)}); known fixes from the knowledge base:"
             )
             return [
                 header,
@@ -6569,7 +6574,8 @@ def _playbook_lines(
             limit=180,
             masker=active_masker,
         )
-        lines.append(f"- **{symptom_name}** ({_family_label(family)})")
+        learned = is_matcher_only_family(family)
+        lines.append(("- 이전 인시던트에서 학습된 지식(카탈로그 계열 아님): " if learned and language == "ko" else "- Learned from a previous incident (not a catalog family): " if learned else "- ") + f"**{symptom_name}** ({_family_label(family)})")
         lines.extend(
             f"  - {_safe_line(action, limit=360, masker=active_masker)}"
             for action in _localized_failure_mode_actions(symptom, language)[:5]
