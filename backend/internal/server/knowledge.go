@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -292,7 +291,7 @@ func sanitizeTraceV3(trace map[string]any) map[string]any {
 	if hypotheses := sanitizeTraceObjects(trace["hypotheses"], []string{"hypothesis_id", "family", "mechanism", "status", "confidence"}, map[string][]string{"evidence_for": nil, "evidence_against": nil}); len(hypotheses) > 0 {
 		out["hypotheses"] = hypotheses
 	}
-	if evidence := sanitizeTraceObjects(trace["evidence"], []string{"evidence_id", "entity", "source", "source_group", "predicate", "polarity", "coverage", "quality"}, nil); len(evidence) > 0 {
+	if evidence := sanitizeTraceObjects(trace["evidence"], []string{"evidence_id", "entity", "source", "source_group", "predicate", "polarity", "coverage", "quality"}, map[string][]string{"observed_terms": nil}); len(evidence) > 0 {
 		for _, item := range evidence {
 			if raw, ok := item.(map[string]any); ok {
 				if original, ok := traceEvidenceByID(trace, stringValue(raw["evidence_id"])); ok {
@@ -441,7 +440,7 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 	}
 	family, mechanism := stringValue(hypothesis["family"]), stringValue(hypothesis["mechanism"])
 	confidence, _ := numberToFloat(hypothesis["confidence"])
-	evidenceSummaries, predicates := traceEvidenceSummaries(trace, support)
+	evidenceSummaries, observedTerms := traceEvidenceSummaries(trace, support)
 	payload := map[string]any{
 		"schema_version": 1, "source_case_id": snapshot.CaseID, "root_cause_family": snapshot.RootCauseFamily,
 		"quality_score": quality, "quality_source": source, "hypothesis_id": hypothesis["hypothesis_id"],
@@ -460,7 +459,7 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 					// fixed it (actions, from the evaluation's effective-action
 					// field on this case). Actions attach to this mechanism,
 					// never to the family as a whole.
-					"name": mechanism, "keywords": safeKnowledgeKeywords(append([]string{mechanism}, predicates...)), "actions": operatorConfirmedActions(card),
+					"name": mechanism, "keywords": compiledSymptomKeywords(card, observedTerms), "actions": operatorConfirmedActions(card),
 				}},
 			}},
 			"probe_template_ids": map[string]any{family: probeTemplateIDs},
@@ -509,6 +508,11 @@ func harnessClaimHypothesis(snapshot *CaseSnapshot, harness, trace map[string]an
 	}
 	mechanism := strings.TrimSpace(snapshot.Mechanism)
 	if mechanism == "" {
+		mechanism = traceMechanismForFamily(trace, snapshot.RootCauseFamily)
+	}
+	if mechanism == "" {
+		// Last resort only: the summary's first sentence is the localized
+		// HEADLINE ("…알림이 발생했습니다"), which names the alert, not the cause.
 		mechanism = firstAnalysisSentence(stringValue(snapshot.Snapshot["analysis_summary"]))
 	}
 	if mechanism == "" {
@@ -524,6 +528,30 @@ func harnessClaimHypothesis(snapshot *CaseSnapshot, harness, trace map[string]an
 		"mechanism":     mechanism,
 		"confidence":    confidence,
 	}, support, map[string]bool{}, true
+}
+
+// traceMechanismForFamily recovers the causal statement the run itself ranked
+// for this family — a supported hypothesis first, else any with a mechanism.
+func traceMechanismForFamily(trace map[string]any, family string) string {
+	items, _ := trace["hypotheses"].([]any)
+	fallback := ""
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		if !ok || strings.TrimSpace(stringValue(item["family"])) != strings.TrimSpace(family) {
+			continue
+		}
+		mechanism := strings.TrimSpace(stringValue(item["mechanism"]))
+		if mechanism == "" {
+			continue
+		}
+		if stringValue(item["status"]) == "supported" {
+			return mechanism
+		}
+		if fallback == "" {
+			fallback = mechanism
+		}
+	}
+	return fallback
 }
 
 func firstAnalysisSentence(summary string) string {
@@ -602,7 +630,7 @@ func canonicalSupportingEvidenceError(trace map[string]any, support map[string]b
 
 func traceEvidenceSummaries(trace map[string]any, selected map[string]bool) ([]KnowledgeEvidenceSummary, []string) {
 	items, _ := trace["evidence"].([]any)
-	summaries, predicates := []KnowledgeEvidenceSummary{}, []string{}
+	summaries, observedTerms := []KnowledgeEvidenceSummary{}, []string{}
 	for _, raw := range items {
 		item, ok := raw.(map[string]any)
 		if !ok || !selected[stringValue(item["evidence_id"])] {
@@ -610,26 +638,52 @@ func traceEvidenceSummaries(trace map[string]any, selected map[string]bool) ([]K
 		}
 		summary := KnowledgeEvidenceSummary{EvidenceID: stringValue(item["evidence_id"]), Source: stringValue(item["source"]), SourceGroup: stringValue(item["source_group"]), Entity: stringValue(item["entity"]), Predicate: stringValue(item["predicate"]), Polarity: stringValue(item["polarity"]), Coverage: stringValue(item["coverage"]), Quality: stringValue(item["quality"])}
 		summaries = append(summaries, summary)
-		predicates = append(predicates, summary.Predicate)
+		// What the evidence actually SAW ("CreateContainerConfigError"), when
+		// the trace recorded it; the predicate is a machine category name
+		// ("kubernetes_target_container_lifecycle") and only stands in for
+		// legacy traces without observed terms.
+		if terms := stringSlice(item["observed_terms"]); len(terms) > 0 {
+			observedTerms = append(observedTerms, terms...)
+		} else {
+			observedTerms = append(observedTerms, summary.Predicate)
+		}
 	}
-	return summaries, predicates
+	return summaries, observedTerms
 }
 
-var safeKeywordSplit = regexp.MustCompile(`[^a-z0-9]+`)
-
+// safeKnowledgeKeywords normalizes observed evidence terms into matcher
+// keywords. Values stay WHOLE: the old word-splitting turned machine predicates
+// into universal substrings ("error", "container", "kubernetes") that matched
+// every future incident. Downstream matching is case-insensitive substring
+// with token boundaries, so lowercase + whitespace-collapse is enough.
 func safeKnowledgeKeywords(values []string) []string {
 	seen := map[string]bool{}
 	out := []string{}
 	for _, value := range values {
-		for _, token := range safeKeywordSplit.Split(strings.ToLower(value), -1) {
-			if len(token) < 2 || seen[token] {
-				continue
-			}
-			seen[token] = true
-			out = append(out, token)
+		keyword := strings.Join(strings.Fields(strings.ToLower(value)), " ")
+		if len(keyword) < 3 || seen[keyword] {
+			continue
+		}
+		seen[keyword] = true
+		out = append(out, keyword)
+		if len(out) == 12 {
+			break
 		}
 	}
 	return out
+}
+
+// compiledSymptomKeywords is the matcher side of a learned symptom: the alert
+// name plus the observed evidence terms. The mechanism is the symptom's NAME,
+// never a matcher — tokenizing a localized causal sentence produced fragments.
+func compiledSymptomKeywords(card map[string]any, observedTerms []string) []string {
+	inputs := []string{}
+	if context, ok := card["context"].(map[string]string); ok {
+		inputs = append(inputs, context["alert_name"])
+	} else if context, ok := card["context"].(map[string]any); ok {
+		inputs = append(inputs, stringValue(context["alert_name"]))
+	}
+	return safeKnowledgeKeywords(append(inputs, observedTerms...))
 }
 
 func hydrateKnowledgeCandidate(candidate *KnowledgeCandidate) {

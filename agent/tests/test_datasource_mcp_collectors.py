@@ -669,6 +669,32 @@ async def test_loki_direct_queries_the_alert_time_window(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_loki_label_less_target_is_skipped_not_unavailable(monkeypatch) -> None:
+    # A chat ad-hoc alert has no namespace/pod/workload: every query is skipped
+    # for lack of a selector. That is a targeting gap, not a Loki outage — the
+    # old "unavailable" classification surfaced "fix Loki connectivity" as a
+    # recommended action even though Loki was never contacted.
+    async def direct_should_not_run(**kwargs):
+        raise AssertionError("no query should be attempted without a selector")
+
+    monkeypatch.setattr(loki, "get_json", direct_should_not_run)
+    target = replace(
+        make_target(),
+        project="", queue="", namespace="", workload_name="", pod="",
+        alert_name="OperatorRequestedAnalysis",
+    )
+    plan = InvestigationPlan(focus="", check_control_plane=False)
+    result = await loki.LokiCollector(
+        replace(make_settings(), loki_url="http://loki")
+    ).collect(target, plan)
+
+    assert result.status == "ok"
+    assert NO_EVIDENCE in result.summary
+    assert "loki.query" not in result.missing_data
+    assert "loki.target" in result.missing_data
+
+
+@pytest.mark.asyncio
 async def test_postgres_collector_uses_mcp_before_asyncpg(monkeypatch) -> None:
     async def fake_mcp_call(url, tool, arguments):
         sql = arguments["sql"].lower()

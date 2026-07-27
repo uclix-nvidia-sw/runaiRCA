@@ -481,6 +481,68 @@ func TestKnowledgeCandidateEligibilityFailsClosedOnPlanGates(t *testing.T) {
 	}
 }
 
+func TestCompiledSymptomKeywordsAreObservedTermsNotFragments(t *testing.T) {
+	snapshot := eligibleKnowledgeSnapshot()
+	trace := knowledgeTraceForTest(snapshot)
+	// The live INC-000008 candidate: machine predicates only, no observed
+	// terms, tokenized into "kubernetes container error" fragments that would
+	// substring-match every future incident.
+	trace["evidence"].([]any)[0].(map[string]any)["predicate"] = "kubernetes_target_container_lifecycle"
+	trace["evidence"].([]any)[0].(map[string]any)["observed_terms"] = []any{"CreateContainerConfigError"}
+	trace["evidence"].([]any)[1].(map[string]any)["predicate"] = "alert_signature:workload_startup_error"
+	snapshot.Snapshot["case_card"].(map[string]any)["context"] = map[string]string{"alert_name": "KubeContainerWaiting"}
+
+	candidate := knowledgeCandidateForSnapshot(snapshot)
+	if candidate == nil || candidate.Status != knowledgeCandidateReady {
+		t.Fatalf("expected ready candidate, got %+v", candidate)
+	}
+	symptom := candidate.Payload["compiled"].(map[string]any)["failure_modes"].([]any)[0].(map[string]any)["symptoms"].([]any)[0].(map[string]any)
+	keywords := symptom["keywords"].([]string)
+	for _, fragment := range []string{"error", "container", "kubernetes", "alert", "signature"} {
+		for _, keyword := range keywords {
+			if keyword == fragment {
+				t.Fatalf("generic fragment %q survived as a matcher keyword: %+v", fragment, keywords)
+			}
+		}
+	}
+	got := map[string]bool{}
+	for _, keyword := range keywords {
+		got[keyword] = true
+	}
+	// Observed term + alert name, whole and lowercased; the legacy predicate
+	// stays whole (a dead phrase, not a universal fragment).
+	for _, want := range []string{"kubecontainerwaiting", "createcontainerconfigerror", "alert_signature:workload_startup_error"} {
+		if !got[want] {
+			t.Fatalf("expected keyword %q, got %+v", want, keywords)
+		}
+	}
+}
+
+func TestHarnessClaimMechanismPrefersTraceHypothesisOverHeadline(t *testing.T) {
+	snapshot := eligibleKnowledgeSnapshot()
+	snapshot.Mechanism = ""
+	snapshot.Snapshot["analysis_summary"] = "대상에서 KubeContainerWaiting 알림이 발생했습니다. 구체적으로는 ConfigMap이 없습니다."
+	harness := snapshot.Snapshot["metadata"].(map[string]any)["harness"].(map[string]any)
+	harness["diagnosis_state"] = "supported"
+	harness["claims"] = []any{map[string]any{
+		"family": snapshot.RootCauseFamily, "kind": "root_cause", "claim_id": "C01",
+		"confidence": "medium", "supporting_evidence": []any{"E-1"}, "contradicting_evidence": []any{},
+	}}
+	trace := knowledgeTraceForTest(snapshot)
+	trace["hypotheses"].([]any)[0].(map[string]any)["evidence_for"] = []any{}
+	delete(trace, "probe_executions")
+
+	candidate := knowledgeCandidateForSnapshot(snapshot)
+	if candidate == nil || candidate.Status != knowledgeCandidateReady {
+		t.Fatalf("expected ready candidate, got %+v", candidate)
+	}
+	// The trace hypothesis for the family carries the causal statement; the
+	// summary's first sentence is the alert headline and says nothing causal.
+	if candidate.Payload["mechanism"] != "quota exhausted" {
+		t.Fatalf("harness path took the headline over the trace mechanism: %v", candidate.Payload["mechanism"])
+	}
+}
+
 func TestHarnessClaimEvidenceFallbackCompilesKnowledge(t *testing.T) {
 	snapshot := eligibleKnowledgeSnapshot()
 	harness := snapshot.Snapshot["metadata"].(map[string]any)["harness"].(map[string]any)

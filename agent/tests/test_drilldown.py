@@ -107,6 +107,30 @@ def test_promql_sanitizer_is_not_escape_hardened() -> None:
     assert drilldown._sanitize_metric_query(query, "promql_query") == (query, None)
 
 
+def test_logql_empty_selector_rejected_before_loki() -> None:
+    # On a label-less run the model reaches for {} — Loki 400s every time
+    # ("queries require at least one ... matcher"). Fail locally with guidance.
+    for query in (
+        '{} |~ "(?i)eviction"',
+        '{ } |~ "oom"',
+        '{namespace=~".*"} |~ "error"',
+        '{namespace=""} |= "x"',
+    ):
+        sanitized, error = drilldown._sanitize_metric_query(query, "logql_query")
+        assert sanitized == "" and error and "selector" in error, query
+
+
+def test_logql_anchored_selectors_pass() -> None:
+    for query in (
+        '{namespace="runai"} |= "error"',
+        '{namespace=~"runai.*"} |~ "quota"',
+        '{namespace!=""} |~ "pressure"',  # Loki accepts != "" — it anchors
+        'sum(rate({job="loki"}[5m]))',  # no leading selector: let Loki judge
+    ):
+        _, error = drilldown._sanitize_metric_query(query, "logql_query")
+        assert error is None, (query, error)
+
+
 def test_kubernetes_prompt_refuses_configuration_as_observed_preemption() -> None:
     prompt = drilldown._system_prompt("kubernetes", {})
 

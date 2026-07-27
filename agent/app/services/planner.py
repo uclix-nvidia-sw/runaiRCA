@@ -563,7 +563,20 @@ async def plan_investigation(
     # scope to dig into, so lead with node/system-level causes. The workload/loki/
     # runai agents will have nothing to match; the system agent (node syslog/
     # journalctl/dmesg) + kubernetes node conditions carry the investigation.
-    node_focused = not target.namespace and not target.project and not target.queue
+    # A chat-created ad-hoc alert is also label-less, but it is a QUESTION, not a
+    # node alert — "namespace-less ⇒ node-level" would make every operator ask
+    # open with "most likely node kubelet pressure" regardless of what was asked.
+    # The question travels as operator guidance; the LLM refine ranks from it.
+    operator_requested = (
+        (getattr(alert, "labels", None) or {}).get("source") == "chat"
+        or target.alert_name == "OperatorRequestedAnalysis"
+    )
+    node_focused = (
+        not target.namespace
+        and not target.project
+        and not target.queue
+        and not operator_requested
+    )
     if node_focused:
         hypotheses = _node_first_hypotheses(hypotheses)
     # family, and fix — lead with that family and carry the definition on the plan.

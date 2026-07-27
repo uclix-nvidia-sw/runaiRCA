@@ -296,6 +296,19 @@ class LokiCollector:
                     "Loki is reachable, but the workload log queries returned "
                     "no lines. Check label names and log retention.",
                 )
+        elif not query_results:
+            # Nothing was ATTEMPTED (label-less alert: every query was skipped
+            # for lack of a selector). Loki was never proven unreachable, so
+            # don't classify this as an outage — that mislabel used to surface
+            # "fix Loki connectivity" as a recommended action on chat asks.
+            status = "ok"
+            confidence = "low"
+            summary = f"{NO_EVIDENCE} " + ko_en(
+                self._settings,
+                "이 알림에는 로그를 조회할 대상 셀렉터가 없어 Loki 쿼리를 "
+                "실행하지 않았습니다.",
+                "No target selector on this alert, so no Loki queries were run.",
+            )
         else:
             status = "unavailable"
             confidence = "low"
@@ -322,7 +335,10 @@ class LokiCollector:
             "queries": query_results,
         }
         missing_data: list[str] = []
-        if not successful or required_failures:
+        # Only a query that was actually ATTEMPTED and failed marks the
+        # capability missing; "nothing to query" is a targeting gap, not a
+        # Loki failure (loki.target below already records it).
+        if query_results and (not successful or required_failures):
             missing_data.append("loki.query")
         if not required_names:
             missing_data.append("loki.target")

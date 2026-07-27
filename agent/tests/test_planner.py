@@ -560,6 +560,39 @@ async def test_no_signal_alert_does_not_default_to_node_pressure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_adhoc_alert_is_not_a_node_alert() -> None:
+    # A chat-created ad-hoc analysis has no namespace/project/queue, but it is a
+    # QUESTION — the "namespace-less ⇒ node-level" promotion made every operator
+    # ask open with "most likely node kubelet pressure" regardless of the ask.
+    settings = make_settings()
+    target = _target(alert_name="OperatorRequestedAnalysis")
+    alert = Alert(
+        status="firing",
+        labels={"alertname": "OperatorRequestedAnalysis", "severity": "info", "source": "chat"},
+        annotations={"summary": "Run:AI scheduling에 문제가 생긴 것 같다"},
+    )
+    plan = await plan_investigation(settings, target, alert, {}, [])
+    assert plan.hypotheses[0]["family"] == "insufficient_evidence"
+    assert "node kubelet pressure" not in plan.focus
+    assert "most likely" not in plan.focus
+
+
+@pytest.mark.asyncio
+async def test_namespace_less_infra_alert_still_leads_node_level() -> None:
+    # The node promotion itself stays: a REAL label-less infra alert is about
+    # the node, and the system agent carries the investigation.
+    settings = make_settings()
+    target = _target(alert_name="NodeBondingDegraded")
+    alert = Alert(
+        status="firing",
+        labels={"alertname": "NodeBondingDegraded", "severity": "warning"},
+        annotations={},
+    )
+    plan = await plan_investigation(settings, target, alert, {}, [])
+    assert plan.hypotheses[0]["family"] == "node_kubelet_pressure"
+
+
+@pytest.mark.asyncio
 async def test_typedb_diagnostic_graph_is_injected_as_neutral_collector_directive() -> None:
     settings = make_settings()
     target = _target(

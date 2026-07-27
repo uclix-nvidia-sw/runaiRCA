@@ -1418,6 +1418,14 @@ def _public_v3_fact(
         "polarity": str(getattr(fact, "polarity", "unknown") or "unknown"),
         "coverage": str(getattr(fact, "coverage", "unknown") or "unknown"),
         "quality": str(getattr(fact, "quality", "") or ""),
+        # The OBSERVED failure tokens (salient markers / matched alert signals).
+        # `predicate` is a machine category name ("kubernetes_target_container_
+        # lifecycle"); learned-knowledge keyword compilation needs what was
+        # actually seen ("CreateContainerConfigError"), or a promoted symptom
+        # ends up matching on fragments like "container" and "error".
+        "observed_terms": [
+            str(term)[:80] for term in tuple(getattr(fact, "highlights", ()) or ())[:6]
+        ],
     }
 
 
