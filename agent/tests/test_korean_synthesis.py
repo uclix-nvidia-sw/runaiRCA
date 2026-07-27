@@ -301,6 +301,8 @@ async def test_korean_synthesis_keeps_commands_and_structure_out_of_the_prompt(
         "1. kubectl describe node dgx02\n"
         "2. Confirm the Secret exists in the SAME namespace with `kubectl get secret`.\n"
         "- 이미 한국어인 줄입니다.\n"
+        "- `values.yaml`\n"
+        "- https://docs.example/runbook\n"
         "\n"
         "```json\n"
         '{"alertname": "NodeDiskPressure"}\n'
@@ -308,7 +310,9 @@ async def test_korean_synthesis_keeps_commands_and_structure_out_of_the_prompt(
     )
     pending = _translatable_report_lines(detail)
 
-    # Only the English prose line, and without its list prefix.
+    # Only the English prose line, and without its list prefix: the command,
+    # the Korean line, the inline-code-only line, the bare URL, the heading and
+    # the fenced block are all withheld.
     assert list(pending) == ["3"]
     assert pending["3"].startswith("Confirm the Secret")
 
@@ -796,3 +800,77 @@ async def test_translation_keeping_the_object_name_is_accepted(monkeypatch) -> N
 
     assert missing == 0
     assert '"app-secret"' in result
+
+
+@pytest.mark.asyncio
+async def test_translation_runs_after_every_section_is_appended(monkeypatch) -> None:
+    """Placement regression: localization must be the LAST thing synthesize does.
+
+    Self-Check, operator questions and general guidance are appended after the
+    report body is built. While translation ran before them those sections
+    stayed English no matter how well the translator worked — the reported
+    "recommended actions came back in English" symptom.
+    """
+    from app.collectors.base import CollectorResult
+    from app.masking import build_masker
+    from app.plan import InvestigationPlan
+    from app.progress import ProgressReporter
+    from app.services.kg_enrichment import KGContext
+    from app.services import pipeline
+    from app.services.pipeline import PipelineState, synthesize_stage
+    from tests.test_orchestrator import make_target
+
+    settings = replace(
+        make_settings(),
+        language="ko",
+        llm_base_url="https://llm.example/v1",
+        llm_model="m",
+        llm_api_key="k",
+    )
+    seen: dict[str, str] = {}
+
+    async def fake_translate(settings, detail, diagnostics=None):
+        seen["detail"] = detail
+        return detail, 0
+
+    monkeypatch.setattr(
+        "app.services.pipeline._translate_report_lines_ko", fake_translate
+    )
+    state = PipelineState(
+        settings=settings,
+        request=AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={"alertname": "KubePodNotReady", "namespace": "default"},
+                annotations={"summary": "pod not ready"},
+                fingerprint="fp-placement",
+            )
+        ),
+        target=make_target(),
+        progress=ProgressReporter(settings, run_id=""),
+        masker=build_masker(()),
+        collectors=[],
+        kg_context=KGContext(),
+        plan=InvestigationPlan(namespaces=["default"], pod="trainer-0"),
+        results=[CollectorResult(agent="kubernetes", status="ok", summary="no evidence")],
+        root_cause_candidates=[
+            RankedCause(family="insufficient_evidence", confidence="low", score=0.0)
+        ],
+    )
+    state.self_check_next = "Run kubectl describe pod trainer-0 and read the Events tail."
+    state.self_check_caveat = (
+        "The evidence cannot yet separate a missing Secret from a namespace mismatch."
+    )
+
+    await synthesize_stage(state)
+
+    body = seen.get("detail", "")
+    assert body, "the translator was never called"
+    # Sections appended after the report body must be inside the translated span.
+    assert "## Self-Check" in body
+    assert state.self_check_caveat in body
+    assert state.self_check_next in body
+    assert pipeline._general_guidance_heading("ko") in body
+    # And they must actually be picked up as translatable prose, not just present.
+    batch = set(pipeline._translatable_report_lines(body).values())
+    assert any(state.self_check_caveat in line for line in batch)
