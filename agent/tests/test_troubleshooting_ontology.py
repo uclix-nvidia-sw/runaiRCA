@@ -48,6 +48,29 @@ def test_loader_projects_every_yaml_step_transition_and_action() -> None:
     assert "isa diagnostic_recommendation" in joined
 
 
+def test_domain_runbooks_cover_every_step_and_name_the_real_coverage() -> None:
+    # Browsing the ontology used to show ONE runbook ("k8s only") even though
+    # the tree covers Run:ai scheduling, the GPU stack, NCCL and more. Every
+    # step must land in exactly one domain view, and the non-k8s domains must
+    # actually be populated.
+    from ontology.load_troubleshooting import RUNBOOK_NAME, step_domain
+
+    raw = _document(TREE)
+    assert raw is not None
+    domains = {str(node["id"]): step_domain(str(node["id"])) for node in raw["nodes"]}
+    populated = set(domains.values())
+    for expected in ("runai_scheduling", "runai_control_plane", "gpu_stack", "distributed_training", "storage", "networking", "node_health"):
+        assert expected in populated, f"domain {expected} has no steps"
+
+    tx = _Tx()
+    _load(tx, raw)
+    joined = "\n".join(tx.queries)
+    for domain in populated:
+        assert f"{RUNBOOK_NAME}:domain:{domain}" in joined
+    # Domain views must not add entry points or touch probe IDs.
+    assert joined.count("isa runbook_entry;") == 1
+
+
 def test_schema_models_executable_runbook_relations() -> None:
     schema = Path("ontology/schema.tql").read_text(encoding="utf-8")
     for label in (

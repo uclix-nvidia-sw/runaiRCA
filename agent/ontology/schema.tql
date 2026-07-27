@@ -32,6 +32,11 @@ attribute workload_type, value string;
 attribute workload_id, value string;
 attribute gpu_allocated, value double;
 attribute gpu_requested, value double;
+attribute cluster_name, value string;
+attribute namespace_name, value string;
+attribute project_name, value string;
+attribute queue_name, value string;
+attribute node_name, value string;
 attribute source, value string;
 attribute summary, value string;
 attribute confidence, value string;
@@ -119,49 +124,28 @@ attribute package_template_binding_id, value string;
 attribute template_active, value boolean;
 
 # --- entities ---------------------------------------------------------------
-entity cluster,
-    owns name @key,
-    plays scopes:scope;
-
+# Infra layer, deliberately small (2026-07-27 simplification): node and
+# workload are the only topology ENTITIES. Cluster/namespace/project/queue are
+# plain attributes on the workload — they were entities with 4 write-only
+# relations nobody queried, and every reader can filter on an attribute.
+# Pods are NOT modelled at all: controller-suffixed pod names mint a new
+# "thing" on every restart, so the workload (stable identity) is the guest of
+# runs_on and pod names stay inside incident/alert payloads.
 entity node,
     owns name @key,
+    owns cluster_name,
     owns condition_type,
     owns gpu_allocated,
-    plays runs_on:host,
-    plays scopes:member;
-
-entity namespace,
-    owns name @key,
-    plays contains:space;
-
-entity project,
-    owns name @key,
-    owns gpu_allocated,
-    owns gpu_requested,
-    plays in_project:project,
-    plays scopes:member;
-
-entity queue,
-    owns name @key,
-    owns gpu_allocated,
-    owns gpu_requested,
-    plays submitted_to:queue;
+    plays runs_on:host;
 
 entity workload,
     owns name,
     owns workload_type,
     owns workload_id,
-    plays belongs_to:owner,
-    plays in_project:member,
-    plays submitted_to:job,
-    plays contains:occupant;
-
-entity pod,
-    owns name,
-    owns status,
-    plays runs_on:guest,
-    plays belongs_to:member,
-    plays contains:occupant;
+    owns namespace_name,
+    owns project_name,
+    owns queue_name,
+    plays runs_on:guest;
 
 # Run:ai platform components (BOTH the cluster side and the runai-backend
 # control plane; `layer` disambiguates). Mirrored from
@@ -178,8 +162,6 @@ entity control_plane_component,
     # A component ships several ready-to-run checks; without the explicit card
     # the 3.x default @card(0..1) makes any 2-check component uncommittable.
     owns check_command @card(0..),
-    plays emits:emitter,
-    plays contains:occupant,
     plays depends_on:dependent,
     plays depends_on:dependency;
 
@@ -191,6 +173,10 @@ entity alert,
     owns status,
     owns occurrence_count,
     owns reason,
+    # Where the alert fired — attributes, not relations, so "past incidents on
+    # this node / in this namespace" is a one-line filter.
+    owns node_name,
+    owns namespace_name,
     plays grouped_into:member;
 
 entity incident,
@@ -239,8 +225,7 @@ entity symptom,
     plays has_symptom:symptom,
     plays indicates:symptom,
     plays resolved_by:symptom,
-    plays supported_by:claim,
-    plays emits:signal;
+    plays supported_by:claim;
 
 entity root_cause,
     owns subtype,
@@ -328,7 +313,6 @@ entity evidence,
     owns observed_window_end,
     owns quality,
     plays supported_by:proof,
-    plays emits:signal,
     plays contradicted_by:proof,
     plays probe_execution_evidence:proof,
     plays rejected_evidence_link:proof;
@@ -417,12 +401,7 @@ entity probe_execution,
     plays probe_execution_evidence:execution;
 
 # --- relations --------------------------------------------------------------
-relation scopes, relates scope, relates member;           # cluster scopes node/project
-relation runs_on, relates host, relates guest;            # node runs_on pod
-relation belongs_to, relates owner, relates member;       # workload belongs_to pod
-relation in_project, relates project, relates member;     # project <- workload
-relation submitted_to, relates queue, relates job;        # workload submitted_to queue
-relation contains, relates space, relates occupant;       # namespace contains pod/workload/component
+relation runs_on, relates host, relates guest;            # node runs_on workload
 relation grouped_into, relates incident, relates member;  # incident <- alert
 relation has_symptom, relates incident, relates symptom;
 relation indicates, relates symptom, relates cause;       # symptom indicates root_cause
@@ -430,7 +409,6 @@ relation resolved_by, relates symptom, relates remedy;    # symptom resolved_by 
 relation supported_by, relates claim, relates proof;      # (symptom|root_cause) <- evidence
 relation contradicted_by, relates claim, relates proof;   # run-local diagnosis <- conflicting evidence
 relation analyzed_by, relates incident, relates run;
-relation emits, relates emitter, relates signal;          # component emits evidence/symptom
 relation depends_on, relates dependent, relates dependency;  # component needs component (check order)
 relation diagnosis,
     relates run,

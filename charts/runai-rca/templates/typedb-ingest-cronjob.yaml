@@ -11,6 +11,13 @@
 {{- if .Values.typedb.ingest.generateDataset }}
 {{- $genCmd = printf " && python -m eval.gen_dataset --from-incidents --resolved-grace-hours %v --limit %v" .Values.typedb.ingest.resolvedGraceHours .Values.typedb.ingest.limit }}
 {{- end }}
+{{- /* Curator-approved vendor-support cases ship in the agent image; refresh them as
+       trusted knowledge on the same cadence (idempotent per case). Shares
+       typedb.externalCases with the schema job — one knob, two load points. */ -}}
+{{- $extCmd := "" }}
+{{- if .Values.typedb.externalCases.enabled }}
+{{- $extCmd = printf " && python -m ontology.load_external_cases --approved-by '%s'" .Values.typedb.externalCases.approvedBy }}
+{{- end }}
 # Periodic projection of resolved incidents (resolved >= resolvedGraceHours ago)
 # into the TypeDB knowledge graph. The grace window lets late feedback / re-analysis
 # settle; re-fired incidents flip back to 'firing' and are excluded automatically.
@@ -48,7 +55,7 @@ spec:
               imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
               command: ["sh", "-c"]
               args:
-                - "{{ $ingestCmd }}{{ $genCmd }}"
+                - "{{ $ingestCmd }}{{ $genCmd }}{{ $extCmd }}"
               env:
                 - name: ENABLE_TYPEDB
                   value: "true"

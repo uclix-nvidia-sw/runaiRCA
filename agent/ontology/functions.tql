@@ -163,9 +163,8 @@ fun checks_for_component_path($component_name: string) -> { name, check_command 
 fun affected_workloads_for_node($node_name: string) -> { name }:
   match
     $node isa node, has name $name; $name == $node_name;
-    (host: $node, guest: $pod) isa runs_on;
-    (owner: $workload, member: $pod) isa belongs_to;
-    $workload has name $workload_name;
+    (host: $node, guest: $workload) isa runs_on;
+    $workload isa workload, has name $workload_name;
   return { $workload_name };
 
 # All executable steps in a runbook. The loader materializes empty strings for

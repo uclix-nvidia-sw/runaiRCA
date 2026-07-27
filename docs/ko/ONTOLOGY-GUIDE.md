@@ -9,13 +9,39 @@ TypeDB는 Run:AI RCA가 선택적으로 사용하는 관계형 지식 계층입�
 운영자가 승인한 과거 사례를 보태 줍니다. TypeDB를 사용할 수
 없어도 Agent는 YAML/Python 경로로 계속 동작하며 그 공백을 기록합니다.
 
+## 0. 한 장짜리 멘탈 모델
+
+하나만 기억한다면 이 그림입니다 — 3개 층, 1개 체인:
+
+```mermaid
+flowchart LR
+  subgraph INFRA["인프라 층 (어디서)"]
+    N[node] --- W[workload]
+  end
+  subgraph INCIDENT["인시던트 층 (무슨 일이)"]
+    I[incident] --- RUNX[analysis_run] --- D[diagnosis]
+  end
+  subgraph KNOWLEDGE["지식 층 (우리가 아는 것)"]
+    K[keywords] --> SY[symptom] --> F[root-cause family]
+    SY --> AC[action]
+  end
+  INFRA -.-> INCIDENT
+  INCIDENT -.-> KNOWLEDGE
+```
+
+한 문장으로: **관찰된 keywords가 symptom에 매칭되고, symptom이 family(메커니즘)를
+지목하며 확인된 action을 들고 있다.** 나머지 전부 — runbook, probe, 사례,
+패키지 — 는 이 체인을 채우거나 검증하기 위해 존재합니다. 큐레이션 YAML,
+운영자 승인 인시던트, 벤더 서포트 외부 케이스가 전부 *같은* 체인으로
+저장되므로 검색 경로도 하나입니다.
+
 ## 1. 서로 연결된 네 가지 지식 계층
 
 ```mermaid
 flowchart TB
   T[토폴로지: 컴포넌트, 노드, 워크로드] --> R[관계]
   C[큐레이션 카드: 증상, XID, 조치] --> R
-  H[승인 사례] --> R
+  H[승인 사례 + 외부 서포트 케이스] --> R
   R --> Q[읽기 전용 TypeDB 함수]
   Q --> P[플래너와 합성]
   P --> L[Live collector]
@@ -46,8 +72,12 @@ erDiagram
   ACTION ||--o{ RESOLUTION : remedy
   COMPONENT ||--o{ DEPENDS_ON : dependent
   COMPONENT ||--o{ DEPENDS_ON : dependency
-  SYMPTOM ||--o{ OBSERVED_SYMPTOM : symptom
-  EVIDENCE ||--o{ OBSERVED_SYMPTOM : evidence
+  INCIDENT ||--o{ HAS_SYMPTOM : incident
+  SYMPTOM ||--o{ HAS_SYMPTOM : symptom
+  SYMPTOM ||--o{ INDICATES : symptom
+  ROOT_CAUSE ||--o{ INDICATES : cause
+  SYMPTOM ||--o{ RESOLVED_BY : symptom
+  ACTION ||--o{ RESOLVED_BY : remedy
 ```
 
 | 스키마 용어 | 뜻 | 예시 |
@@ -59,8 +89,16 @@ erDiagram
 
 `root_cause`는 `gpu_hardware_error` 같은 재사용 가능한 family입니다. `diagnosis`는 하나의
 인시던트에 대해 한 run이 한 주장입니다. evidence는 전체 family가 아니라 그 diagnosis를
-지지합니다. `observed_symptom`은 증상과 그 증거를 함께 기록하고, `resolution`은 운영자가
-`resolved` 또는 `mitigated`를 기록했을 때만 작성됩니다.
+지지합니다. `indicates`와 `resolved_by`가 지식 체인이고(symptom → family,
+symptom → 확인된 action), `has_symptom`은 인시던트가 보인 증상을 연결합니다.
+`resolution`은 운영자가 `resolved` 또는 `mitigated`를 기록했을 때만 작성됩니다.
+
+runbook은 의도적으로 두 겹입니다: 실행 가능한 runbook 하나가 모든 diagnostic
+step을 담고(walk와 모든 probe ID가 여기 있음), 도메인별 runbook
+(`…:domain:gpu_stack`, `…:domain:runai_scheduling`, …)이 같은 step을 묶어서
+브라우징할 때 "Kubernetes만 있다"가 아니라 실제 커버리지가 보이게 합니다.
+외부 서포트 케이스는 벤더 스레드가 실제로 밟은 진단 절차를 케이스별 playbook
+runbook(`ext:…:playbook`)으로 추가합니다.
 
 ## 3. 안전한 지식이 TypeDB로 들어오는 과정
 
@@ -81,6 +119,7 @@ flowchart LR
 | 스키마/함수/카탈로그 | 버전 관리 load job | 파일 매처와 같은 큐레이션 사실 |
 | 인시던트/RCA | 운영자 승인, 보통 해결 및 grace | 미승인 분석은 prior가 되지 않음 |
 | 검증된 조치 | 승인된 non-abstained 결과 | 현재 증명이 아닌 과거 안내 |
+| 외부 서포트 케이스 | 저장소의 큐레이터 승인 번들, ingest CronJob이 적재 | 신뢰하는 벤더 지식: 같은 symptom→family→action 체인으로 저장, 서포트가 확인한 조치만 `resolved_by`, 진단 절차는 케이스별 playbook |
 
 ingest CronJob은 승인 시점에 고정된 스냅샷(CaseSnapshot)을 사용하고, 이후에 실행된
 run으로 그 내용을 덮어쓰지 않습니다. 재분석은 해당 run의 이전 diagnosis/support edge를 교체합니다. 원시 artifact,

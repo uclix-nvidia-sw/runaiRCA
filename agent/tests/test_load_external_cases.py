@@ -169,15 +169,15 @@ def test_unresolved_case_has_evidence_but_no_supported_by_or_resolution(monkeypa
     assert "insert $resolution isa resolution" not in emitted
 
 
-def test_write_case_emits_symptom_edge_and_never_knowledge_edges(monkeypatch: Any) -> None:
+def test_write_case_wires_the_trusted_knowledge_chain(monkeypatch: Any) -> None:
+    # Owner decision 2026-07-27: vendor-support cases are trusted knowledge.
+    # A catalog-family case with support-confirmed actions must land in the
+    # SAME family→symptom→action chain as curated knowledge.
     monkeypatch.setattr(
         ingest, "load_family_catalog",
         lambda _: SimpleNamespace(families={"network_fabric_error"}),
     )
-    # Even if a payload lies about promotion eligibility, the loader must never
-    # reach the knowledge layer.
     p = _payload()
-    p["ingestion_controls"] = {"eligible_for_positive_promotion": True}
     inc = lx._to_incident(p, "op", "t")
     keywords = lx._symptom_keywords(p)
 
@@ -189,9 +189,50 @@ def test_write_case_emits_symptom_edge_and_never_knowledge_edges(monkeypatch: An
     assert 'has keyword "ibv_modify_qp failed with 19 no such device"' in emitted
     assert "isa has_symptom" in emitted
     assert "isa case_projection" in emitted
-    # The isolation invariant — no catalog authority, ever.
+    assert "isa indicates" in emitted
+    # Only support-CONFIRMED actions become resolved_by fixes.
+    assert 'has statement "Correct switch routing."' in emitted
+    assert "isa resolved_by" in emitted
+    assert 'has statement "Constrain RDMA device to one NIC."; insert (symptom' not in emitted
+    # The mechanism rides as the symptom's reason for report narration.
+    assert 'has reason "Switch routing blocked the MacVLAN path."' in emitted
+
+
+def test_write_case_off_catalog_family_stays_out_of_the_chain(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        ingest, "load_family_catalog",
+        lambda _: SimpleNamespace(families={"weird_external_family"}),
+    )
+    p = _payload()
+    p["incident"] = {**p["incident"], "family": "weird_external_family"}
+    inc = lx._to_incident(p, "op", "t")
+
+    tx = _Tx()
+    lx._write_case(tx, inc, lx._symptom_keywords(p))
+    emitted = "\n".join(tx.queries)
+    # Not in the closed catalog -> retrieval only, no knowledge authority.
     assert "isa indicates" not in emitted
     assert "isa resolved_by" not in emitted
+
+
+def test_write_case_projects_support_thread_as_diagnostic_playbook(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        ingest, "load_family_catalog",
+        lambda _: SimpleNamespace(families={"network_fabric_error"}),
+    )
+    inc = lx._to_incident(_payload(), "op", "t")
+
+    tx = _Tx()
+    lx._write_case(tx, inc, lx._symptom_keywords(_payload()))
+    emitted = "\n".join(tx.queries)
+
+    # The diagnostic step from the support thread becomes a mini-runbook step,
+    # scoped by a case-local runbook name so the executable walk never sees it.
+    assert 'isa runbook, has name "ext:sc-ab12cd34ef56:playbook"' in emitted
+    assert 'has diagnostic_id "ext:sc-ab12cd34ef56:d01"' in emitted
+    assert "isa runbook_entry" in emitted
+    # Confirmed fixes are resolved_by actions, not playbook steps.
+    assert 'has question "Correct switch routing."' not in emitted
 
 
 def test_symptom_keywords_lowercase_dedup_and_error_signatures_only() -> None:

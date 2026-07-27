@@ -107,9 +107,14 @@ typedb:
   # image ships no payloads. `approvedBy` binds the operator accountable for
   # these priors and is REQUIRED when enabled — the load records it on each case
   # and refuses to run unset (approval is an explicit act).
+  # Owner decision 2026-07-27: vendor-support cases are trusted knowledge and
+  # load by default — with this off the cases sit in the agent image but never
+  # reach TypeDB, so retrieval silently finds nothing (the Thanos OOMKilled ask
+  # was exactly this). Loaded by the schema job AND refreshed by the ingest
+  # CronJob; approvedBy is recorded on each case.
   externalCases:
-    enabled: false
-    approvedBy: ""
+    enabled: true
+    approvedBy: "helm-chart"
   # Periodically project resolved incidents into the KG (the "facts" layer).
   ingest:
     enabled: true

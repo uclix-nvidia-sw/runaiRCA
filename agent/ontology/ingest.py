@@ -1023,15 +1023,22 @@ def _write_run_projection(tx: Any, inc: OntologyIncident) -> None:
 
 
 def _write_incident(tx: Any, inc: OntologyIncident) -> None:
-    # keyed singletons (match-or-insert)
-    _ensure(tx, "cluster", "name", inc.cluster)
+    # keyed singletons (match-or-insert). The infra layer is deliberately just
+    # node + workload; cluster/namespace/project/queue ride as attributes
+    # (2026-07-27 simplification — they were entities with write-only relations).
     _ensure(tx, "node", "name", inc.node)
-    _ensure(tx, "namespace", "name", inc.namespace)
-    _ensure(tx, "project", "name", inc.project)
-    _ensure(tx, "queue", "name", inc.queue)
     _ensure(tx, "workload", "name", inc.workload_name)
     _ensure(tx, "incident", "incident_id", inc.incident_id)
     _ensure(tx, "alert", "alert_id", inc.alert_id)
+    if inc.node:
+        _replace_attr(tx, "node", "name", inc.node, "cluster_name", inc.cluster)
+    if inc.workload_name:
+        for attr, value in (
+            ("namespace_name", inc.namespace),
+            ("project_name", inc.project),
+            ("queue_name", inc.queue),
+        ):
+            _replace_attr(tx, "workload", "name", inc.workload_name, attr, value)
 
     # incident attributes (replace-in-place so re-projection updates, not duplicates)
     for attr, value in (
@@ -1056,6 +1063,10 @@ def _write_incident(tx: Any, inc: OntologyIncident) -> None:
             ("severity", inc.severity),
             ("status", inc.status),
             ("fingerprint", inc.fingerprint),
+            # Where it fired: attributes, so node/namespace incident history is
+            # a one-line filter instead of a relation walk.
+            ("node_name", inc.node),
+            ("namespace_name", inc.namespace),
         ):
             _replace_attr(tx, "alert", "alert_id", inc.alert_id, attr, value)
         _replace_attr(
@@ -1069,25 +1080,12 @@ def _write_incident(tx: Any, inc: OntologyIncident) -> None:
             "grouped_into", "incident", "member",
         )
 
-    # topology relations (each skipped when either end is missing)
-    _relate(tx, ("cluster", "name", inc.cluster), ("node", "name", inc.node),
-            "scopes", "scope", "member")
-    _relate(tx, ("cluster", "name", inc.cluster), ("project", "name", inc.project),
-            "scopes", "scope", "member")
-    _relate(tx, ("project", "name", inc.project), ("workload", "name", inc.workload_name),
-            "in_project", "project", "member")
-    _relate(tx, ("queue", "name", inc.queue), ("workload", "name", inc.workload_name),
-            "submitted_to", "queue", "job")
-
-    # pods (occurrence) -> runs_on node + belongs_to workload + contains namespace
-    for pod in inc.occurrence_pods[:25]:
-        _ensure(tx, "pod", "name", pod)
-        _relate(tx, ("node", "name", inc.node), ("pod", "name", pod),
-                "runs_on", "host", "guest")
-        _relate(tx, ("workload", "name", inc.workload_name), ("pod", "name", pod),
-                "belongs_to", "owner", "member")
-        _relate(tx, ("namespace", "name", inc.namespace), ("pod", "name", pod),
-                "contains", "space", "occupant")
+    # The one topology relation: node hosts workload (skipped when either end
+    # is missing). Pods are intentionally NOT entities — controller-suffixed
+    # pod names change on every restart and were accumulating dead vertices;
+    # the stable workload identity carries the topology.
+    _relate(tx, ("node", "name", inc.node), ("workload", "name", inc.workload_name),
+            "runs_on", "host", "guest")
 
     _write_run_projection(tx, inc)
 

@@ -9,13 +9,39 @@ live facts. The ontology supplies curated topology and operator-approved history
 If TypeDB is unavailable, the Agent continues through the YAML/Python path and
 records the gap.
 
+## 0. The one-page mental model
+
+If you remember one picture, make it this one — three layers, one chain:
+
+```mermaid
+flowchart LR
+  subgraph INFRA["Infra layer (where)"]
+    N[node] --- W[workload]
+  end
+  subgraph INCIDENT["Incident layer (what happened)"]
+    I[incident] --- RUNX[analysis_run] --- D[diagnosis]
+  end
+  subgraph KNOWLEDGE["Knowledge layer (what we know)"]
+    K[keywords] --> SY[symptom] --> F[root-cause family]
+    SY --> AC[action]
+  end
+  INFRA -.-> INCIDENT
+  INCIDENT -.-> KNOWLEDGE
+```
+
+And one sentence: **observed keywords match a symptom; the symptom names its
+family (the mechanism) and carries its confirmed actions.** Everything else —
+runbooks, probes, cases, packages — exists to feed or verify that chain.
+Curated YAML, operator-approved incidents, and vendor-support external cases
+all write the *same* chain, so one retrieval path serves all three.
+
 ## 1. Four connected knowledge layers
 
 ```mermaid
 flowchart TB
   T[Topology: components, nodes, workloads] --> R[Relationships]
   C[Curated cards: symptoms, XIDs, actions] --> R
-  H[Approved cases] --> R
+  H[Approved cases + external support cases] --> R
   R --> Q[Read-only TypeDB functions]
   Q --> P[Planner and synthesis]
   P --> L[Live collectors]
@@ -46,8 +72,12 @@ erDiagram
   ACTION ||--o{ RESOLUTION : remedy
   COMPONENT ||--o{ DEPENDS_ON : dependent
   COMPONENT ||--o{ DEPENDS_ON : dependency
-  SYMPTOM ||--o{ OBSERVED_SYMPTOM : symptom
-  EVIDENCE ||--o{ OBSERVED_SYMPTOM : evidence
+  INCIDENT ||--o{ HAS_SYMPTOM : incident
+  SYMPTOM ||--o{ HAS_SYMPTOM : symptom
+  SYMPTOM ||--o{ INDICATES : symptom
+  ROOT_CAUSE ||--o{ INDICATES : cause
+  SYMPTOM ||--o{ RESOLVED_BY : symptom
+  ACTION ||--o{ RESOLVED_BY : remedy
 ```
 
 | Schema word | Meaning | Example |
@@ -59,8 +89,17 @@ erDiagram
 
 A `root_cause` is a reusable family such as `gpu_hardware_error`. A `diagnosis`
 is one run's claim about one incident. Evidence supports that diagnosis, not the
-global family. `observed_symptom` records a symptom plus its evidence.
-`resolution` is written only when an operator records `resolved` or `mitigated`.
+global family. `indicates` and `resolved_by` are the knowledge chain
+(symptom → family, symptom → confirmed action); `has_symptom` links an incident
+to the symptoms it exhibited. `resolution` is written only when an operator
+records `resolved` or `mitigated`.
+
+Runbooks appear twice on purpose: one *executable* runbook holds every
+diagnostic step (the walk and all probe IDs live there), and per-domain
+runbooks (`…:domain:gpu_stack`, `…:domain:runai_scheduling`, …) group the same
+steps so browsing shows the real coverage instead of "Kubernetes only".
+External support cases add per-case playbook runbooks (`ext:…:playbook`) with
+the diagnostic steps the vendor thread actually walked.
 
 ## 3. Ingestion: how safe knowledge enters TypeDB
 
@@ -81,6 +120,7 @@ flowchart LR
 | Schema/functions/catalogs | Version-controlled load job | Same curated facts as file matcher |
 | Incident/RCA | Operator approval; normally resolved plus grace | Unapproved analyses never become priors |
 | Verified remedy | Approved non-abstained outcome | Historical guidance, not current proof |
+| External support case | Curator-approved bundle in the repo; loaded by the ingest CronJob | Trusted vendor knowledge: enters the same symptom→family→action chain; only support-confirmed actions become `resolved_by`, diagnostic steps become a per-case playbook |
 
 The ingest CronJob uses an immutable approved CaseSnapshot when available; it
 does not substitute a later run. Re-analysis replaces old diagnosis/support

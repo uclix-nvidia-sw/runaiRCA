@@ -50,6 +50,50 @@ SCHEMA_MIGRATIONS = [
     "undefine relation has_cause;",
     "undefine relation observed_symptom;",
     "undefine relation similar_to;",
+    # 2026-07-27 infra-layer simplification: cluster/namespace/project/queue/pod
+    # entities and their write-only relations are gone (identities became plain
+    # attributes; the one topology relation is node runs_on workload). Surviving
+    # types shed the dead plays first, then the relations and entities go.
+    "undefine plays scopes:member from node;",
+    "undefine plays belongs_to:owner from workload;",
+    "undefine plays in_project:member from workload;",
+    "undefine plays submitted_to:job from workload;",
+    "undefine plays contains:occupant from workload;",
+    "undefine plays emits:emitter from control_plane_component;",
+    "undefine plays contains:occupant from control_plane_component;",
+    "undefine plays emits:signal from symptom;",
+    "undefine plays emits:signal from evidence;",
+    "undefine relation scopes;",
+    "undefine relation belongs_to;",
+    "undefine relation in_project;",
+    "undefine relation submitted_to;",
+    "undefine relation contains;",
+    "undefine relation emits;",
+    "undefine entity pod;",
+    "undefine entity cluster;",
+    "undefine entity namespace;",
+    "undefine entity project;",
+    "undefine entity queue;",
+]
+
+# Instance deletions that must precede the schema undefines above: a type with
+# live instances cannot be undefined. WRITE transactions, same non-fatal
+# pattern (a fresh or already-cleaned DB simply has nothing to delete).
+# runs_on is wholesale: every pre-migration edge is node->pod, and the next
+# ingest pass rebuilds node->workload edges from the incident store.
+DATA_MIGRATIONS = [
+    "match $x isa runs_on; delete $x;",
+    "match $x isa scopes; delete $x;",
+    "match $x isa belongs_to; delete $x;",
+    "match $x isa in_project; delete $x;",
+    "match $x isa submitted_to; delete $x;",
+    "match $x isa contains; delete $x;",
+    "match $x isa emits; delete $x;",
+    "match $x isa pod; delete $x;",
+    "match $x isa cluster; delete $x;",
+    "match $x isa namespace; delete $x;",
+    "match $x isa project; delete $x;",
+    "match $x isa queue; delete $x;",
 ]
 
 
@@ -70,6 +114,17 @@ def main() -> int:
         if not driver.databases.contains(settings.typedb_database):
             driver.databases.create(settings.typedb_database)
             print(f"created database '{settings.typedb_database}'")
+        for migration in DATA_MIGRATIONS:
+            try:
+                with driver.transaction(settings.typedb_database, TransactionType.WRITE) as tx:
+                    tx.query(migration).resolve()
+                    tx.commit()
+                print(f"data migration applied: {migration}")
+            except Exception as exc:  # fresh / already-cleaned DB — nothing to delete
+                print(
+                    "data migration skipped (non-fatal): "
+                    f"{migration} -> {exc.__class__.__name__}"
+                )
         for migration in SCHEMA_MIGRATIONS:
             try:
                 with driver.transaction(settings.typedb_database, TransactionType.SCHEMA) as tx:

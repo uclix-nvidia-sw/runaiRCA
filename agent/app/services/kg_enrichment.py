@@ -32,8 +32,7 @@ _log = logging.getLogger(__name__)
 _BLAST_QUERY = """
 match
   $n isa node, has name "{node}";
-  (host: $n, guest: $p) isa runs_on;
-  (owner: $w, member: $p) isa belongs_to;
+  (host: $n, guest: $w) isa runs_on;
   $w isa workload, has name $wn;
 select $wn;
 """

@@ -1,14 +1,16 @@
-"""Load external NVIDIA support-case payloads into TypeDB as LABELLED priors.
+"""Load external NVIDIA support-case payloads into TypeDB as TRUSTED knowledge.
 
 Consumes each curated bundle's ``03_ingestion_payload.yaml`` (schema v2.0,
-``payload_kind: historical_incident_candidate``). These are external,
-curator-approved cases whose payloads self-declare
-``eligible_for_positive_promotion: false``. They are ingested ONLY as retrieval
-context — a ``case_snapshot`` + ``diagnosis`` + ``evidence`` + one case-local
-``symptom`` — never as knowledge-layer authority. This loader structurally never
-writes ``indicates``/``resolved_by`` edges, so ``_KNOWLEDGE_QUERY`` (which
-requires both) can never surface them; retrieval is via error-signature match on
-the case-local symptom keywords (see app/services/kg_enrichment.py).
+``payload_kind: historical_incident_candidate``). Owner decision 2026-07-27:
+these are vendor-support threads — trusted, so they enter the SAME
+family→symptom→action chain as curated knowledge (``indicates`` for the
+closed-catalog family, ``resolved_by`` for support-confirmed actions), which
+puts them on every knowledge surface: ``_KNOWLEDGE_QUERY`` → signature
+matching, the plan-time symptom lead, guidance and actions. Their
+diagnostic/preventive support-thread steps additionally become a per-case
+mini-runbook of ``diagnostic_step`` entities (never wired into the main
+executable walk — runbook-name scoping keeps walk_tree on the bundled tree).
+Error-signature retrieval on the ``ext:`` symptom keywords is unchanged.
 
     ENABLE_TYPEDB=true TYPEDB_ADDRESS=localhost:1729 \
         ./.venv/bin/python -m ontology.load_external_cases \
@@ -43,7 +45,13 @@ from app.config import load_settings
 from app.services.root_cause_ranking import novel_family_slug
 from ontology import ingest
 from ontology.incident import OntologyIncident
-from ontology.load_knowledge import _ensure_symptom
+from ontology.load_knowledge import (
+    FAMILIES,
+    _ensure_action,
+    _ensure_symptom,
+    _relate_indicates,
+    _relate_resolved_by,
+)
 
 PAYLOAD_NAME = "03_ingestion_payload.yaml"
 # Baked into the agent image (agent/Dockerfile COPYs knowledge/); the Helm
@@ -292,18 +300,106 @@ def _to_incident(
 
 
 def _write_case(tx: Any, inc: OntologyIncident, keywords: list[str]) -> None:
-    """Write one case's incident projection + case-local symptom + has_symptom
-    edge. NEVER calls _relate_indicates / _relate_resolved_by — that structural
-    omission is the knowledge-layer isolation guarantee (see module docstring)."""
+    """Write one case's incident projection + its ``ext:`` symptom, wired into
+    the SAME family→symptom→action chain as curated knowledge.
+
+    Owner decision 2026-07-27: vendor-support cases are TRUSTED knowledge — the
+    earlier case-local isolation (no indicates/resolved_by edges) kept them out
+    of _KNOWLEDGE_QUERY, so they never reached signature matching, the plan-time
+    symptom lead, guidance, or actions. The chain is still honest about what it
+    asserts: indicates only for a closed-catalog family, resolved_by only for
+    actions the support thread confirmed (resolving/mitigating outcomes —
+    diagnostic/preventive steps remain investigation hints on the case card).
+    The ``ext:`` symptom name keeps provenance visible in the graph and in any
+    report line citing it; ``reason`` carries the confirmed mechanism."""
     ingest._write_incident(tx, inc)
-    if keywords:
-        _ensure_symptom(tx, inc.incident_id, keywords)
-        ingest._relate(
-            tx,
-            ("incident", "incident_id", inc.incident_id),
-            ("symptom", "name", inc.incident_id),
-            "has_symptom", "incident", "symptom",
-        )
+    if not keywords:
+        return
+    _ensure_symptom(tx, inc.incident_id, keywords, reason=inc.mechanism)
+    ingest._relate(
+        tx,
+        ("incident", "incident_id", inc.incident_id),
+        ("symptom", "name", inc.incident_id),
+        "has_symptom", "incident", "symptom",
+    )
+    if inc.root_cause_family in FAMILIES:
+        _relate_indicates(tx, inc.incident_id, inc.root_cause_family)
+        for action in inc.successful_actions:
+            statement = str(action.get("statement") or "").strip()
+            if not statement:
+                continue
+            _ensure_action(tx, statement)
+            _relate_resolved_by(tx, inc.incident_id, statement)
+    _write_diagnostic_playbook(tx, inc)
+
+
+_PLAYBOOK_STEP_OUTCOMES = ("diagnostic", "preventive")
+
+
+def _write_diagnostic_playbook(tx: Any, inc: OntologyIncident) -> None:
+    """Mirror the support thread's diagnostic/preventive steps one-by-one as a
+    per-case mini-runbook of ``diagnostic_step`` entities.
+
+    These are the commands/checks actually exchanged with vendor support —
+    valuable as an ordered sequence, not as resolved_by fixes. The runbook name
+    is case-scoped (``<case>:playbook``) so the executable walk, which loads
+    steps by the bundled runbook's name, never routes into them. Replace-in-full
+    per case: rerunning the loader must not duplicate steps."""
+    from app.ontology.typedb_client import escape_typeql as esc
+
+    leads = [
+        str(action.get("normalized_action") or "").strip()
+        for action in inc.case_card.get("historical_actions") or []
+        if str(action.get("outcome") or "").strip() in _PLAYBOOK_STEP_OUTCOMES
+        and str(action.get("normalized_action") or "").strip()
+    ]
+    runbook_name = f"{inc.incident_id}:playbook"
+    name = esc(runbook_name)
+    tx.query(
+        f'match $s isa diagnostic_step, has runbook_name "{name}"; '
+        f"$x isa diagnostic_transition(prior: $s); delete $x;"
+    ).resolve()
+    for relation in ("runbook_entry", "runbook_contains"):
+        tx.query(
+            f'match $r isa runbook, has name "{name}"; '
+            f"$x isa {relation}(runbook: $r); delete $x;"
+        ).resolve()
+    tx.query(f'match $x isa diagnostic_step, has runbook_name "{name}"; delete $x;').resolve()
+    tx.query(f'match $x isa runbook, has name "{name}"; delete $x;').resolve()
+    if not leads:
+        return
+    summary = f"Vendor-support diagnostic sequence for {inc.incident_id} ({len(leads)} steps)"
+    tx.query(
+        f'insert $x isa runbook, has name "{name}", has summary "{esc(summary)}";'
+    ).resolve()
+    previous = ""
+    for index, statement in enumerate(leads, start=1):
+        step_id = f"{inc.incident_id}:d{index:02d}"
+        tx.query(
+            f'insert $x isa diagnostic_step, has diagnostic_id "{esc(step_id)}", '
+            f'has runbook_name "{name}", has question "{esc(statement)}", '
+            f'has verification "", has interpretation "", has avoidance "", '
+            f'has match_expression "";'
+        ).resolve()
+        tx.query(
+            f'match $r isa runbook, has name "{name}"; '
+            f'$s isa diagnostic_step, has diagnostic_id "{esc(step_id)}"; '
+            f"insert (runbook: $r, step: $s) isa runbook_contains;"
+        ).resolve()
+        if index == 1:
+            tx.query(
+                f'match $r isa runbook, has name "{name}"; '
+                f'$s isa diagnostic_step, has diagnostic_id "{esc(step_id)}"; '
+                f"insert (runbook: $r, step: $s) isa runbook_entry;"
+            ).resolve()
+        if previous:
+            tx.query(
+                f'match $p isa diagnostic_step, has diagnostic_id "{esc(previous)}"; '
+                f'$n isa diagnostic_step, has diagnostic_id "{esc(step_id)}"; '
+                f'insert $x isa diagnostic_transition(prior: $p, next: $n), '
+                f'has match_expression "", has transition_priority {index - 1};'
+            ).resolve()
+        previous = step_id
 
 
 def _write_external(cases: list[tuple[OntologyIncident, list[str]]]) -> tuple[int, int]:

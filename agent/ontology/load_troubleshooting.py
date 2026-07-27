@@ -30,6 +30,35 @@ from ontology.load_knowledge import FAMILIES
 
 RUNBOOK_NAME = "k8s-senior-troubleshooting"
 BUNDLED_RUNBOOK_ID = "k8s_troubleshooting"
+
+# Domain views of the unified graph. One executable runbook holds all 170+
+# steps, so browsing the ontology read as "runbook = Kubernetes only" even
+# though the tree covers Run:ai scheduling, the GPU stack, NCCL, storage and
+# more. Each domain runbook below shares runbook_contains edges with its steps;
+# the walk, the entry point, and every probe template ID stay on the main
+# runbook (probe IDs embed BUNDLED_RUNBOOK_ID and must never change).
+# First matching prefix wins; renaming a domain needs a manual cleanup of the
+# old "<RUNBOOK_NAME>:domain:<name>" entity.
+_DOMAIN_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("runai_scheduling", ("runai_scheduling", "runai_reclaim", "runai_gang", "runai_binding", "runai_quota")),
+    ("runai_control_plane", ("runai_control_plane", "runai_cluster_sync", "runai_backend")),
+    ("gpu_stack", ("gpu_",)),
+    ("distributed_training", ("nccl_", "distributed_")),
+    ("storage", ("storage_", "volume_", "pending_volume")),
+    ("networking", ("dns_", "service_", "traffic_")),
+    ("k8s_control_plane", ("etcd_", "api_server", "admission_", "control_plane_")),
+    ("node_health", ("node_",)),
+    ("k8s_scheduling", ("scheduling_", "pending_failed_scheduling")),
+)
+_DOMAIN_FALLBACK = "k8s_workloads"
+ALL_DOMAINS = tuple(domain for domain, _ in _DOMAIN_RULES) + (_DOMAIN_FALLBACK,)
+
+
+def step_domain(step_id: str) -> str:
+    for domain, prefixes in _DOMAIN_RULES:
+        if any(step_id.startswith(prefix) for prefix in prefixes):
+            return domain
+    return _DOMAIN_FALLBACK
 _SCOPED_PROBE_ID = re.compile(
     r"(?P<runbook>[a-z][a-z0-9_-]{0,80}):"
     r"(?P<step>[a-z][a-z0-9_-]{0,80}):"
@@ -77,6 +106,13 @@ def _delete_existing(tx: Any, runbook: str) -> None:
             f'match $r isa runbook, has name "{name}"; '
             f'$x isa {relation}(runbook: $r); delete $x;'
         ).resolve()
+    for domain in ALL_DOMAINS:
+        domain_name = esc(f"{runbook}:domain:{domain}")
+        tx.query(
+            f'match $r isa runbook, has name "{domain_name}"; '
+            f'$x isa runbook_contains(runbook: $r); delete $x;'
+        ).resolve()
+        tx.query(f'match $x isa runbook, has name "{domain_name}"; delete $x;').resolve()
     tx.query(
         f'match $x isa diagnostic_step, has runbook_name "{name}"; delete $x;'
     ).resolve()
@@ -300,9 +336,31 @@ def _load(tx: Any, raw: dict[str, Any]) -> tuple[int, int, int]:
         f'$s isa diagnostic_step, has diagnostic_id "{esc(root)}"; '
         f"insert (runbook: $r, step: $s) isa runbook_entry;"
     ).resolve()
+    _insert_domain_runbooks(tx, [str(node["id"]) for node in nodes])
     edges = _insert_transitions(tx, nodes)
     actions = sum(_insert_outcome(tx, node) for node in nodes)
     return len(nodes), edges, actions
+
+
+def _insert_domain_runbooks(tx: Any, step_ids: list[str]) -> None:
+    groups: dict[str, list[str]] = {}
+    for step_id in step_ids:
+        groups.setdefault(step_domain(step_id), []).append(step_id)
+    for domain, ids in sorted(groups.items()):
+        name = f"{RUNBOOK_NAME}:domain:{domain}"
+        summary = (
+            f"Domain view ({domain.replace('_', ' ')}) of the unified troubleshooting "
+            f"graph — {len(ids)} step(s); the executable walk stays on {RUNBOOK_NAME}"
+        )
+        tx.query(
+            f'insert $x isa runbook, has name "{esc(name)}", has summary "{esc(summary)}";'
+        ).resolve()
+        for step_id in ids:
+            tx.query(
+                f'match $r isa runbook, has name "{esc(name)}"; '
+                f'$s isa diagnostic_step, has diagnostic_id "{esc(step_id)}"; '
+                f"insert (runbook: $r, step: $s) isa runbook_contains;"
+            ).resolve()
 
 
 def main() -> int:
