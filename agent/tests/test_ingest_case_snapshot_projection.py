@@ -206,3 +206,39 @@ def test_trace_v3_keyset_cursor_is_bound_as_an_aware_datetime() -> None:
     assert isinstance(cursor, datetime)
     assert cursor.utcoffset() == timedelta(hours=9)
     assert ingest._trace_v3_cursor_datetime("") is None
+
+
+def test_workload_topology_projection_writes_stable_edges() -> None:
+    # The collector's workload_topology artifact becomes exposes/uses_storage
+    # edges under the STEM workload identity — Service and PVC names survive
+    # pod restarts, so these stay browsable in the graph.
+    inc = SimpleNamespace(
+        workload_name="runai-backend-workloads",
+        namespace="runai-backend",
+        artifacts=[
+            {"type": "pod_inspection", "result": {}},
+            {
+                "type": "workload_topology",
+                "result": {
+                    "services": ["runai-backend-workloads", ""],
+                    "pvcs": ["data-workloads-0"],
+                },
+            },
+        ],
+    )
+    tx = _Tx()
+    ingest._write_workload_topology(tx, inc)
+    joined = "\n".join(tx.queries)
+    assert 'isa service, has name "runai-backend-workloads"' in joined
+    assert 'isa pvc, has name "data-workloads-0"' in joined
+    assert "isa exposes" in joined
+    assert "isa uses_storage" in joined
+    assert 'has namespace_name' in joined
+
+    # No workload identity or no topology artifact -> writes nothing.
+    empty = _Tx()
+    ingest._write_workload_topology(empty, SimpleNamespace(workload_name="", namespace="", artifacts=[]))
+    ingest._write_workload_topology(
+        empty, SimpleNamespace(workload_name="w", namespace="", artifacts=[{"type": "pod_inspection"}])
+    )
+    assert empty.queries == []

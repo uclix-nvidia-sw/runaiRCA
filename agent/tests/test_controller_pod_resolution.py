@@ -344,6 +344,30 @@ def test_pod_fallback_workload_identity_is_stemmed() -> None:
         assert target.pod == pod
 
 
+def test_workload_topology_extracts_pvcs_and_selector_matched_services() -> None:
+    pod = {
+        "metadata": {"labels": {"app": "workloads", "tier": "backend"}},
+        "spec": {
+            "volumes": [
+                {"persistentVolumeClaim": {"claimName": "data-workloads-0"}},
+                {"configMap": {"name": "not-a-pvc"}},
+                {"persistentVolumeClaim": {"claimName": "data-workloads-0"}},  # dedupe
+            ]
+        },
+    }
+    services = [
+        {"metadata": {"name": "runai-backend-workloads"}, "spec": {"selector": {"app": "workloads"}}},
+        {"metadata": {"name": "other-svc"}, "spec": {"selector": {"app": "no-match"}}},
+        {"metadata": {"name": "selectorless"}, "spec": {}},  # never matches
+    ]
+    topology = kubernetes._workload_topology(pod, services)
+    assert topology == {
+        "services": ["runai-backend-workloads"],
+        "pvcs": ["data-workloads-0"],
+    }
+    assert kubernetes._workload_topology(None, services) == {"services": [], "pvcs": []}
+
+
 def test_explicit_workload_label_is_never_stemmed() -> None:
     # A Run:ai workload legitimately named with a trailing ordinal must keep it.
     target = resolve_target(

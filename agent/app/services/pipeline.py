@@ -6425,6 +6425,21 @@ def _knowledge_base_lines(
                 limit=240,
             )
             body.append(f"  - {incident_id} ({where}): {summary}")
+    topology = kg_context.get("workload_topology") or {}
+    if topology.get("services") or topology.get("pvcs"):
+        parts = []
+        if topology.get("services"):
+            parts.append("Service(s) " + ", ".join(topology["services"][:5]))
+        if topology.get("pvcs"):
+            parts.append("PVC(s) " + ", ".join(topology["pvcs"][:5]))
+        line = "- Workload topology (stable identity): " + "; ".join(parts)
+        shared = topology.get("shared_storage_workloads") or []
+        if shared:
+            line += (
+                f" — PVC shared with {len(shared)} other workload(s): "
+                + ", ".join(shared[:5])
+            )
+        body.append(active_masker.mask_text(line))
     prior = kg_context.get("prior_incidents") or []
     if prior:
         body.append(f"- This alert recurred in {len(prior)} prior incident(s):")

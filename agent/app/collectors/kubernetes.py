@@ -1962,6 +1962,51 @@ class KubernetesCollector:
                     },
                 )
             )
+            # Stable-identity topology: the PVC claims this pod mounts and the
+            # Services whose selector matches its labels. Ingest projects these
+            # under the STEM workload identity so the graph answers "workloads
+            # with this name expose these Services / use this PVC" — the live
+            # binding itself is never evidence (polarity stays unknown).
+            services_items: list[dict] = []
+            try:
+                services_response = await k8s_read(
+                    self._settings, "services", namespace=target.namespace
+                )
+                data = services_response.get("data")
+                if isinstance(data, dict) and isinstance(data.get("items"), list):
+                    services_items = [item for item in data["items"] if isinstance(item, dict)]
+            except Exception:  # noqa: BLE001 - topology is optional context
+                _log.warning("service listing for workload topology failed", exc_info=True)
+            topology = _workload_topology(target_pod_describe.get("object"), services_items)
+            if topology["services"] or topology["pvcs"]:
+                artifacts.append(
+                    artifact(
+                        agent=self.name,
+                        source="kubernetes",
+                        type="workload_topology",
+                        status="ok",
+                        confidence="low",
+                        title=ko_en(self._settings, "워크로드 토폴로지", "Workload topology"),
+                        query=f"kubectl get svc,pvc -n {target.namespace}",
+                        summary=ko_en(
+                            self._settings,
+                            f"대상 워크로드에 연결된 Service {len(topology['services'])}개, "
+                            f"PVC {len(topology['pvcs'])}개를 확인했습니다.",
+                            f"Observed {len(topology['services'])} Service(s) and "
+                            f"{len(topology['pvcs'])} PVC(s) attached to the target workload.",
+                        ),
+                        result={
+                            "observation": {
+                                "kind": "workload_topology",
+                                "predicate": "workload_topology",
+                                "polarity": "unknown",
+                                "coverage": "partial",
+                                "observation_window": {},
+                            },
+                            **topology,
+                        },
+                    )
+                )
         if exec_probes:
             exec_successes = [probe for probe in exec_probes if not probe.get("error")]
             # A probe that couldn't START (binary absent, exec subresource down) is
@@ -3939,6 +3984,33 @@ def _container_lifecycle_artifact(
         },
         highlights=salient_markers(container_diagnostics),
     )
+
+
+def _workload_topology(pod_object: object, services: list[dict]) -> dict[str, list[str]]:
+    """Stable-identity topology observed on the target pod: the PVC claims its
+    spec mounts and the Services whose (non-empty) selector matches its labels."""
+    if not isinstance(pod_object, dict):
+        return {"services": [], "pvcs": []}
+    labels = (pod_object.get("metadata") or {}).get("labels") or {}
+    pvcs: list[str] = []
+    for volume in (pod_object.get("spec") or {}).get("volumes") or []:
+        claim = str(
+            (((volume or {}).get("persistentVolumeClaim") or {}).get("claimName")) or ""
+        ).strip()
+        if claim and claim not in pvcs:
+            pvcs.append(claim)
+    matched: list[str] = []
+    for service in services:
+        selector = (service.get("spec") or {}).get("selector") or {}
+        name = str(((service.get("metadata") or {}).get("name")) or "").strip()
+        if (
+            name
+            and selector
+            and name not in matched
+            and all(labels.get(key) == value for key, value in selector.items())
+        ):
+            matched.append(name)
+    return {"services": matched, "pvcs": pvcs}
 
 
 def _container_lifecycle_target_verified(

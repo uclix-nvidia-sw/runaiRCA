@@ -1086,8 +1086,48 @@ def _write_incident(tx: Any, inc: OntologyIncident) -> None:
     # the stable workload identity carries the topology.
     _relate(tx, ("node", "name", inc.node), ("workload", "name", inc.workload_name),
             "runs_on", "host", "guest")
+    _write_workload_topology(tx, inc)
 
     _write_run_projection(tx, inc)
+
+
+def _write_workload_topology(tx: Any, inc: OntologyIncident) -> None:
+    """Project the analysis's observed Service/PVC attachments under the STEM
+    workload identity (the collector's workload_topology artifact). Service and
+    PVC names survive pod restarts, so these edges stay browsable — "workloads
+    with this name expose these Services / use this PVC"."""
+    if not inc.workload_name:
+        return
+    topology = next(
+        (
+            item.get("result")
+            for item in inc.artifacts or []
+            if isinstance(item, dict)
+            and str(item.get("type") or "") == "workload_topology"
+            and isinstance(item.get("result"), dict)
+        ),
+        None,
+    )
+    if not topology:
+        return
+    for name in topology.get("services") or []:
+        service = str(name).strip()
+        if not service:
+            continue
+        _ensure(tx, "service", "name", service)
+        if inc.namespace:
+            _replace_attr(tx, "service", "name", service, "namespace_name", inc.namespace)
+        _relate(tx, ("service", "name", service), ("workload", "name", inc.workload_name),
+                "exposes", "endpoint", "backend")
+    for name in topology.get("pvcs") or []:
+        claim = str(name).strip()
+        if not claim:
+            continue
+        _ensure(tx, "pvc", "name", claim)
+        if inc.namespace:
+            _replace_attr(tx, "pvc", "name", claim, "namespace_name", inc.namespace)
+        _relate(tx, ("workload", "name", inc.workload_name), ("pvc", "name", claim),
+                "uses_storage", "consumer", "storage")
 
 
 # --- knowledge promotion (--promote-knowledge) --------------------------------

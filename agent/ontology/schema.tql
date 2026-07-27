@@ -145,7 +145,25 @@ entity workload,
     owns namespace_name,
     owns project_name,
     owns queue_name,
-    plays runs_on:guest;
+    plays runs_on:guest,
+    plays exposes:backend,
+    plays uses_storage:consumer;
+
+# Stable-identity topology around a workload, observed from the target pod
+# during analysis (spec.volumes claims; Services whose selector matched the
+# pod's labels) and projected by ingest under the STEM workload identity.
+# Service and PVC names survive pod restarts, so unlike per-pod bindings these
+# stay browsable: "workloads with this name expose these Services / use this
+# PVC". Live bindings are still verified by collectors at analysis time.
+entity service,
+    owns name,
+    owns namespace_name,
+    plays exposes:endpoint;
+
+entity pvc,
+    owns name,
+    owns namespace_name,
+    plays uses_storage:storage;
 
 # Run:ai platform components (BOTH the cluster side and the runai-backend
 # control plane; `layer` disambiguates). Mirrored from
