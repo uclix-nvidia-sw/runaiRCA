@@ -264,8 +264,9 @@ Self-Check, 추가 확인 요청, 일반 가이드 블록까지 덧붙인 뒤 �
 줄은 프로세스를 벗어나지 않습니다. 따라서 번역이 결론을 바꾸거나 섹션을 누락시키거나 문서 순서를
 바꾸는 일이 구조적으로 불가능합니다. 줄은 약 2,000자 단위(`_TRANSLATION_BATCH_CHARS`)로 나눠
 보내고 `max_tokens`도 배치 크기에 맞춰 잡습니다 — 긴 리포트를 한 번에 번역하던 방식이 completion
-cap에 걸려 리포트가 들어갈 때보다 짧게 돌아오곤 했기 때문입니다. 응답은 백틱 구간이 한 글자도 바뀌지
-않은 줄만 채택하고, 한 배치가 실패해도 성공한 배치는 유지하며, 번역되지 않은 줄이 하나라도 남으면
+cap에 걸려 리포트가 들어갈 때보다 짧게 돌아오곤 했기 때문입니다. 응답은 보호 구간이 한 글자도 바뀌지 않은 줄만 채택합니다 — 백틱 구간,
+겹따옴표 구간, 그리고 `CreateContainerConfigError`·`secretKeyRef`·`nvidia.com/gpu` 같은 API
+용어 — 일반 영어 문장은 그대로 번역됩니다. 한 배치가 실패해도 성공한 배치는 유지하며, 번역되지 않은 줄이 하나라도 남으면
 `synthesis_failed` + `analysis_quality=degraded`로 표시합니다. `context.synthesis`에는 `status`,
 `duration_seconds`, `model`, `max_tokens`가 담깁니다.
 

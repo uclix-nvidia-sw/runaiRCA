@@ -299,7 +299,10 @@ so a translation cannot change a conclusion, drop a section, or reorder the
 document. Lines go out in ~2,000-character batches (`_TRANSLATION_BATCH_CHARS`)
 with `max_tokens` scaled to each batch, because one reply covering a long report
 used to hit the completion cap and come back shorter than it went in. A reply is
-accepted per line only when every backtick span survives verbatim; batches that
+accepted per line only when every protected span survives verbatim — backtick
+spans, double-quoted spans, and API vocabulary such as `CreateContainerConfigError`,
+`secretKeyRef` or `nvidia.com/gpu` — while ordinary English stays translatable;
+batches that
 succeed are kept even if another fails, and any line left untranslated marks the
 run `synthesis_failed` with `analysis_quality=degraded`. `context.synthesis`
 carries `status`, `duration_seconds`, `model` and `max_tokens`.

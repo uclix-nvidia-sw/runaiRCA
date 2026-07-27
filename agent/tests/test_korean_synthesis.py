@@ -734,3 +734,65 @@ async def test_failed_batch_keeps_the_batches_that_worked(monkeypatch) -> None:
     assert 0 < missing < len(lines)
     assert "수집기 관측" in result  # the good batch survived
     assert "Collector" in result  # the failed batch kept its deterministic text
+
+
+def test_preserved_spans_cover_api_vocabulary_but_not_plain_english() -> None:
+    from app.services.pipeline import _preserved_spans
+
+    source = (
+        "Confirm the object exists in the SAME namespace: fix the "
+        "secretKeyRef/configMapKeyRef name+key, check nvidia.com/gpu on the node, "
+        'and note that secret "app-secret" not found raised '
+        "CreateContainerConfigError with `kubectl -n ns get secret` — "
+        "cross-namespace and/or aliased references and their IDs never resolve."
+    )
+    spans = _preserved_spans(source)
+
+    for protected in (
+        "`kubectl -n ns get secret`",
+        '"app-secret"',
+        "secretKeyRef",
+        "configMapKeyRef",
+        "CreateContainerConfigError",
+        "nvidia.com",
+    ):
+        assert protected in spans, protected
+    # Ordinary English — including emphasis, hyphenated words, slashed pairs and
+    # short acronym plurals — must stay translatable.
+    for free in ("SAME", "cross-namespace", "and/or", "namespace", "IDs"):
+        assert free not in spans, free
+
+
+@pytest.mark.asyncio
+async def test_translation_dropping_an_api_term_is_rejected(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko")
+    detail = "The alert payload explicitly reported CreateContainerConfigError."
+
+    async def fake_complete_with_error(*_args, **_kwargs):
+        # "컨테이너 설정 오류" localizes the API term away — unusable for an operator.
+        return '{"0": "알림 페이로드가 컨테이너 설정 오류를 명시적으로 보고했습니다."}', None
+
+    monkeypatch.setattr(
+        "app.services.pipeline.complete_with_error", fake_complete_with_error
+    )
+    result, missing = await _translate_report_lines_ko(settings, detail)
+
+    assert (result, missing) == (detail, 1)
+
+
+@pytest.mark.asyncio
+async def test_translation_keeping_the_object_name_is_accepted(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko")
+    detail = 'The kubelet reported secret "app-secret" not found for this Pod.'
+
+    async def fake_complete_with_error(*_args, **_kwargs):
+        reply = {"0": 'kubelet이 이 Pod에 대해 secret "app-secret" not found를 보고했습니다.'}
+        return json.dumps(reply, ensure_ascii=False), None
+
+    monkeypatch.setattr(
+        "app.services.pipeline.complete_with_error", fake_complete_with_error
+    )
+    result, missing = await _translate_report_lines_ko(settings, detail)
+
+    assert missing == 0
+    assert '"app-secret"' in result

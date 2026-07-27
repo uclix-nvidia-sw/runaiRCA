@@ -3357,6 +3357,23 @@ def _exclude_refuted_reanalysis_candidates(
 _HANGUL_RE = re.compile(r"[가-힣]")
 _LIST_PREFIX_RE = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+)")
 _BACKTICK_SPAN_RE = re.compile(r"`[^`]*`")
+# Double quotes only. English possessives ("the Master's spec") make apostrophes
+# pair across unrelated words and would demand nonsense substrings verbatim.
+_QUOTED_SPAN_RE = re.compile(r"\"[^\"]+\"")
+# camelCase/PascalCase API vocabulary, and dotted/underscored/colon-separated
+# identifiers. Two guards keep ordinary text out, both found by replaying the
+# real knowledge base through this: anchoring at a token boundary (unanchored,
+# "NVLink" demanded "VLink" and "GPUs" demanded "PUs"), and requiring two
+# lowercase characters per hump (else "IDs"/"IPs" were demanded verbatim and a
+# translation that correctly wrote "ID" was rejected). Plain hyphenated or
+# slashed English ("cross-namespace", "and/or") is intentionally NOT matched.
+_IDENTIFIER_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"[A-Za-z][a-z0-9]*(?:[A-Z][a-z0-9]{2,})+"
+    r"|[A-Za-z0-9]+(?:[._:][A-Za-z0-9]+)+"
+    r")"
+)
+_PROSE_ABBREVIATIONS = frozenset({"e.g", "i.e", "vs", "etc"})
 
 _TRANSLATOR_SYSTEM = (
     "당신은 기술 문서 전문 번역가입니다. 입력 JSON은 이미 완성된 장애 분석 보고서의 "
@@ -3364,9 +3381,10 @@ _TRANSLATOR_SYSTEM = (
     "문장을 자연스러운 한국어로 번역하세요.\n"
     "규칙:\n"
     "- 모든 키를 빠짐없이 포함하고, 키는 바꾸지 마세요.\n"
-    "- 백틱(`)으로 감싼 부분은 한 글자도 바꾸지 말고 그대로 두세요.\n"
-    "- pod/네임스페이스/노드/알림 이름, 명령어, 에러 문자열, 코드, URL, 라벨 값 "
-    "같은 식별자는 번역하지 마세요.\n"
+    "- 백틱(`)이나 따옴표로 감싼 부분은 한 글자도 바꾸지 말고 그대로 두세요.\n"
+    "- pod/네임스페이스/노드/알림 이름, 명령어, 에러 문자열, 코드, URL, 라벨 값, "
+    "그리고 CreateContainerConfigError·secretKeyRef·nvidia.com/gpu 같은 API 용어는 "
+    "번역하거나 표기를 바꾸지 말고 원문 그대로 두세요.\n"
     "- 굵기(**) 같은 마크다운 표기는 원문 위치 그대로 유지하세요.\n"
     '- JSON 객체 하나로만, 코드펜스 없이 응답하세요: {"12": "<한국어>", ...}'
 )
@@ -3412,11 +3430,32 @@ def _apply_line_translations(detail: str, translations: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+def _preserved_spans(source: str) -> list[str]:
+    """Substrings a translation must carry through byte-for-byte.
+
+    Asking the model nicely is not enough: an operator acts on these literally.
+    Quoted spans cover the object names the mechanism sentence extracts
+    (``Secret 'app-secret'``, ``secret "app-secret" not found``); the token
+    classes cover unquoted API vocabulary (``CreateContainerConfigError``,
+    ``secretKeyRef``, ``nvidia.com/gpu``). Both classes are deliberately narrow
+    so ordinary English — ``SAME``, ``cross-namespace``, ``and/or`` — is still
+    free to become Korean.
+    """
+    spans = _BACKTICK_SPAN_RE.findall(source)
+    spans += _QUOTED_SPAN_RE.findall(source)
+    spans += [
+        token
+        for token in _IDENTIFIER_TOKEN_RE.findall(source)
+        if token.casefold() not in _PROSE_ABBREVIATIONS
+    ]
+    return list(dict.fromkeys(spans))
+
+
 def _valid_line_translation(source: str, translated: object) -> bool:
-    """Accept a translation only when it preserved every backtick span verbatim."""
+    """Accept a translation only when every protected span survived verbatim."""
     if not isinstance(translated, str) or not translated.strip():
         return False
-    return all(span in translated for span in _BACKTICK_SPAN_RE.findall(source))
+    return all(span in translated for span in _preserved_spans(source))
 
 
 # One call per ~2000 source characters. A long report translated in a single
