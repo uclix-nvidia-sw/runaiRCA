@@ -435,6 +435,8 @@ entity probe_execution,
 
 # --- relations --------------------------------------------------------------
 relation runs_on, relates host, relates guest;            # node runs_on workload
+relation exposes, relates endpoint, relates backend;      # service exposes workload
+relation uses_storage, relates consumer, relates storage; # workload uses_storage pvc
 relation grouped_into, relates incident, relates member;  # incident <- alert
 relation has_symptom, relates incident, relates symptom;
 relation indicates, relates symptom, relates cause;       # symptom indicates root_cause
