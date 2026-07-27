@@ -634,13 +634,17 @@ def _trace_text(value: object, limit: int = 500) -> str:
     return " ".join(str(value or "").split())[:limit]
 
 
-def _ensure_trace_evidence(tx: Any, inc: OntologyIncident, item: dict[str, Any]) -> str:
-    """Project trace-v3 evidence without merging it with legacy artifact rows."""
+def _ensure_trace_evidence(
+    tx: Any, inc: OntologyIncident, item: dict[str, Any], ensured: set[str]
+) -> str:
+    """Project trace-v3 metadata onto its run-local evidence entity."""
     local_id = _trace_id(item.get("evidence_id"))
     if not local_id:
         return ""
     evidence_id = _trace_key(inc, local_id)
-    _ensure(tx, _evidence_type(item), "evidence_id", evidence_id)
+    if evidence_id not in ensured:
+        _ensure(tx, _evidence_type(item), "evidence_id", evidence_id)
+        ensured.add(evidence_id)
     # Every field below is supplied by the trace-v3 evidence object itself.
     # In particular, do not copy these values from an artifact or a v1/v2 trace.
     window = item.get("observation_window")
@@ -711,7 +715,7 @@ def _relate_trace_evidence(
     _trace_relation(tx, match, edge, f"$x isa {relation}, links (claim: $h, proof: $e)")
 
 
-def _write_trace_v3_projection(tx: Any, inc: OntologyIncident) -> None:
+def _write_trace_v3_projection(tx: Any, inc: OntologyIncident, ensured_evidence: set[str]) -> None:
     """Write only the explicit, versioned hypothesis/probe trace contract."""
     trace = inc.reasoning_trace_v3
     if not inc.run_id or not isinstance(trace, dict):
@@ -738,7 +742,7 @@ def _write_trace_v3_projection(tx: Any, inc: OntologyIncident) -> None:
         evidence_id: evidence_id
         for item in raw_evidence
         if isinstance(item, dict)
-        if (evidence_id := _ensure_trace_evidence(tx, inc, item))
+        if (evidence_id := _ensure_trace_evidence(tx, inc, item, ensured_evidence))
     }
     hypothesis_ids: dict[str, str] = {}
     for item in raw_hypotheses:
@@ -1045,26 +1049,26 @@ def _write_run_projection(tx: Any, inc: OntologyIncident) -> None:
         for item in inc.artifacts
         if isinstance(item, dict) and item.get("evidence_id")
     }
-    for item in evidence_by_id.values():
-        _ensure_evidence(tx, inc, item)
+    evidence_keys = {
+        evidence_id: _ensure_evidence(tx, inc, item)
+        for evidence_id, item in evidence_by_id.items()
+    }
     support = root_claim.get("supporting_evidence") if isinstance(root_claim, dict) else []
     for evidence_id in support if isinstance(support, list) else []:
-        item = evidence_by_id.get(str(evidence_id))
-        if item:
-            _relate_diagnosis_evidence(tx, inc, family, _ensure_evidence(tx, inc, item))
+        if evidence_key := evidence_keys.get(str(evidence_id)):
+            _relate_diagnosis_evidence(tx, inc, family, evidence_key)
     contradictions = []
     if isinstance(root_claim, dict):
         raw = root_claim.get("contradicting_evidence") or root_claim.get("contradiction_evidence_ids")
         if isinstance(raw, list):
             contradictions = raw
     for evidence_id in contradictions:
-        item = evidence_by_id.get(str(evidence_id))
-        if item:
+        if evidence_key := evidence_keys.get(str(evidence_id)):
             _relate_diagnosis_evidence(
                 tx,
                 inc,
                 family,
-                _ensure_evidence(tx, inc, item),
+                evidence_key,
                 relation="contradicted_by",
             )
     # Resolution outcomes are allowed into the graph only from hash-bound
@@ -1074,7 +1078,7 @@ def _write_run_projection(tx: Any, inc: OntologyIncident) -> None:
         _ensure_resolution(tx, inc, family, action)
     # Keep the versioned trace separate from the legacy diagnosis projection:
     # it is populated solely from explicit reasoning_trace_v3 fields.
-    _write_trace_v3_projection(tx, inc)
+    _write_trace_v3_projection(tx, inc, set(evidence_keys.values()))
 
 
 def _write_incident(tx: Any, inc: OntologyIncident) -> None:

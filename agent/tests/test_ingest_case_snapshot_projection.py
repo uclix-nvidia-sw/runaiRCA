@@ -123,6 +123,7 @@ def test_trace_v3_projects_only_explicit_ids_and_metadata(monkeypatch: Any) -> N
         incident_id="INC-trace",
         run_id="ANL-trace",
         root_cause_family="k8s_storage_error",
+        artifacts=[{"evidence_id": "E-mount", "source": "kubernetes_api"}],
         reasoning_trace_v3={
             "schema_version": 3,
             "hypotheses": [
@@ -175,6 +176,7 @@ def test_trace_v3_projects_only_explicit_ids_and_metadata(monkeypatch: Any) -> N
     emitted = "\n".join(tx.queries)
     assert 'has hypothesis_id "ANL-trace:H-storage"' in emitted
     assert 'has evidence_id "ANL-trace:E-mount"' in emitted
+    assert emitted.count("insert $x isa state_evidence") == 1
     assert 'has probe_execution_id "ANL-trace:PX-1"' in emitted
     assert 'has trace_local_id "H-storage"' in emitted
     assert "isa hypothesis_for" in emitted
