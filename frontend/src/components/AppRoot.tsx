@@ -333,6 +333,9 @@ function App() {
     analysis: analysisPageIndex,
   }, incidentViewForMainView(activeView), incidentQueryFilters, alertQueryFilters);
   const [detail, setDetail] = useState<DetailState>(null);
+  // Failures of destructive incident actions (trash/permanent delete); the
+  // dashboard-load `error` above never carries these.
+  const [incidentActionError, setIncidentActionError] = useState('');
   const [chatDocked, setChatDocked] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [knowledgeRefreshKey, setKnowledgeRefreshKey] = useState(0);
@@ -594,7 +597,12 @@ function App() {
   }, [refreshCurrentView]);
 
   const handleDeleteIncident = useCallback(async (id: string, permanent = false) => {
-    await deleteIncident(id, permanent);
+    setIncidentActionError('');
+    try {
+      await deleteIncident(id, permanent);
+    } catch (err) {
+      setIncidentActionError(errorMessage(err, 'Failed to delete the incident. Check the backend logs.'));
+    }
     await refreshCurrentView();
   }, [refreshCurrentView]);
 
@@ -602,12 +610,36 @@ function App() {
     incidentIDs: string[],
     action: 'archive' | 'unarchive' | 'restore' | 'trash' | 'delete_permanently',
   ) => {
-    await bulkIncidentAction(incidentIDs, action);
+    setIncidentActionError('');
+    try {
+      // The backend applies bulk actions best-effort and reports per-row
+      // failures; swallowing them made a failed permanent delete look done.
+      const result = await bulkIncidentAction(incidentIDs, action);
+      const failed = result.failed_ids?.length ?? 0;
+      if (failed > 0) {
+        setIncidentActionError(
+          `${failed} incident${failed === 1 ? '' : 's'} could not be ${action === 'delete_permanently' ? 'permanently deleted' : 'updated'}. Check the backend logs.`,
+        );
+      }
+    } catch (err) {
+      setIncidentActionError(errorMessage(err, 'Bulk incident action failed.'));
+    }
     await refreshCurrentView();
   }, [refreshCurrentView]);
 
   const handleEmptyIncidentTrash = useCallback(async () => {
-    await emptyIncidentTrash();
+    setIncidentActionError('');
+    try {
+      const result = await emptyIncidentTrash();
+      const failed = result.failed_count ?? 0;
+      if (failed > 0) {
+        setIncidentActionError(
+          `${failed} incident${failed === 1 ? '' : 's'} in trash could not be permanently deleted. Check the backend logs.`,
+        );
+      }
+    } catch (err) {
+      setIncidentActionError(errorMessage(err, 'Emptying trash failed.'));
+    }
     await refreshCurrentView();
   }, [refreshCurrentView]);
 
@@ -749,6 +781,7 @@ function App() {
         )}
 
         {error && <div className="error-banner">{error}</div>}
+        {incidentActionError && <div className="error-banner">{incidentActionError}</div>}
 
         {(activeView === 'incidents' || activeView === 'archived' || activeView === 'trash') && (
           <IncidentsDashboard

@@ -178,6 +178,7 @@ func TestPostgresHardDeleteUsesSingleTransaction(t *testing.T) {
 		"DELETE FROM incident_embeddings",
 		"DELETE FROM alerts",
 		"DELETE FROM incidents",
+		"INSERT INTO deleted_alert_episodes",
 	} {
 		if !state.Executed(fragment) {
 			t.Fatalf("expected hard delete statement %q, got %+v", fragment, state.Execs())

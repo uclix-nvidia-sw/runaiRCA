@@ -79,6 +79,12 @@ type Store struct {
 	knowledgePackages        map[string]*KnowledgePackage
 	knowledgeEvents          map[string]*KnowledgeEvent
 	chatConversations        map[string]*ChatConversation
+	// deletedEpisodes remembers hard-deleted alert episodes (fingerprint ->
+	// StartsAt). Alertmanager keeps re-sending a still-firing alert with its
+	// original StartsAt, so without this a purged incident reappeared minutes
+	// later as an identical-looking new row. A NEWER StartsAt is a new episode
+	// and spends the tombstone.
+	deletedEpisodes          map[string]deletedEpisode
 	recurrenceStatsCache     map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry
 	db                       *sql.DB
 	dbReady                  bool
@@ -104,6 +110,17 @@ type AlertUpsertResult struct {
 	// incident. Alertmanager may retry resolved webhooks, so callers must not
 	// infer this from Alert.Status alone.
 	IncidentResolved bool
+	// Dropped means the webhook was a resend of an episode the operator
+	// deleted (trashed or purged). Nothing was stored; Incident and Alert are
+	// nil and callers must not broadcast or analyze.
+	Dropped bool
+}
+
+// deletedEpisode is the identity of one hard-deleted alert firing: the exact
+// StartsAt the alert carried when it was purged.
+type deletedEpisode struct {
+	FiredAt   time.Time
+	DeletedAt time.Time
 }
 
 type DashboardSnapshot struct {
@@ -136,6 +153,7 @@ func NewStore() *Store {
 		knowledgePackages:    make(map[string]*KnowledgePackage),
 		knowledgeEvents:      make(map[string]*KnowledgeEvent),
 		chatConversations:    make(map[string]*ChatConversation),
+		deletedEpisodes:      make(map[string]deletedEpisode),
 		recurrenceStatsCache: make(
 			map[recurrenceStatsCacheKey]recurrenceStatsCacheEntry,
 		),
@@ -434,6 +452,19 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	alertStatus := status(alert.Status)
 	now := time.Now().UTC()
 	alertFiredAt := firstTime(alert.StartsAt, now)
+	if tombstone, ok := s.deletedEpisodes[fingerprint]; ok {
+		if tombstone.FiredAt.Equal(alertFiredAt) {
+			// The operator purged this exact firing; its resolve notification
+			// ends the episode, so the tombstone has done its job.
+			if alertStatus == "resolved" {
+				s.clearEpisodeTombstoneLocked(fingerprint)
+			}
+			return AlertUpsertResult{CorrelationKey: key, Dropped: true}
+		}
+		if alertFiredAt.After(tombstone.FiredAt) {
+			s.clearEpisodeTombstoneLocked(fingerprint)
+		}
+	}
 	alertID := ""
 	if storageKey != "" {
 		alertID = s.alertByGroup[storageKey]
@@ -448,9 +479,26 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	incidentID := ""
 	if alertID != "" {
 		if existing := s.alerts[alertID]; existing != nil {
-			if s.shouldReuseIncidentForAlertLocked(key, s.incidents[existing.IncidentID], alertFiredAt) {
+			existingIncident := s.incidents[existing.IncidentID]
+			// A webhook whose StartsAt is not newer than what we already hold is
+			// a resend (or the resolve) of the episode this record tracks — never
+			// a new occurrence. It must land on the same incident even when the
+			// flap window says otherwise: LatestActivityAt advances on every
+			// (re)analysis, so a long-firing alert re-sent after the operator
+			// reanalyzed its incident used to fail the window check and mint an
+			// identical twin.
+			sameEpisode := !alertFiredAt.After(existing.FiredAt)
+			switch {
+			case incidentDeleted(existingIncident):
+				if sameEpisode {
+					// The operator trashed this episode; don't resurrect it as a
+					// fresh active row on every resend.
+					return AlertUpsertResult{CorrelationKey: key, Dropped: true}
+				}
+				alertID = ""
+			case sameEpisode || s.shouldReuseIncidentForAlertLocked(key, existingIncident, alertFiredAt):
 				incidentID = existing.IncidentID
-			} else {
+			default:
 				alertID = ""
 			}
 		}
@@ -907,7 +955,10 @@ func (s *Store) SoftDeleteIncident(id string) (*Incident, bool) {
 		now := time.Now().UTC()
 		incident.DeletedAt = &now
 	}
-	s.removeIncidentIndexesLocked(id)
+	// Dedup indexes stay in place: UpsertAlertResult needs the identity match
+	// to recognize (and drop) resends of a trashed episode. A genuinely new
+	// episode still gets a fresh incident there — incidentDeleted short-circuits
+	// every reuse path.
 	if !s.persistIncidentLocked(incident) {
 		return nil, false
 	}
@@ -940,17 +991,25 @@ func (s *Store) HardDeleteIncident(id string) bool {
 		return false
 	}
 	alertIDs := map[string]struct{}{}
+	episodes := map[string]deletedEpisode{}
+	now := time.Now().UTC()
 	for alertID, alert := range s.alerts {
 		if alert != nil && alert.IncidentID == id {
 			alertIDs[alertID] = struct{}{}
+			if alert.Fingerprint != "" {
+				episodes[alert.Fingerprint] = deletedEpisode{FiredAt: alert.FiredAt, DeletedAt: now}
+			}
 		}
 	}
 	alertList := make([]string, 0, len(alertIDs))
 	for alertID := range alertIDs {
 		alertList = append(alertList, alertID)
 	}
-	if !s.persistHardDeleteIncidentLocked(id, alertList) {
+	if !s.persistHardDeleteIncidentLocked(id, alertList, episodes) {
 		return false
+	}
+	for fingerprint, episode := range episodes {
+		s.deletedEpisodes[fingerprint] = episode
 	}
 	s.removeIncidentIndexesLocked(id)
 	delete(s.incidents, id)
@@ -1026,6 +1085,12 @@ func (s *Store) HardDeleteIncident(id string) bool {
 	return true
 }
 
+// deletedEpisodeRetention bounds how long a purged episode's tombstone keeps
+// swallowing resends. Normally the episode's resolve notification clears it;
+// this is the fallback for alerts that never resolve.
+// ponytail: an alert firing continuously past this resurrects once; acceptable.
+const deletedEpisodeRetention = 90 * 24 * time.Hour
+
 func (s *Store) PurgeExpiredTrash(retention time.Duration, now time.Time) int {
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -1048,7 +1113,19 @@ func (s *Store) PurgeExpiredTrash(retention time.Duration, now time.Time) int {
 			purged++
 		}
 	}
+	s.mu.Lock()
+	for fingerprint, episode := range s.deletedEpisodes {
+		if episode.DeletedAt.Before(now.Add(-deletedEpisodeRetention)) {
+			s.clearEpisodeTombstoneLocked(fingerprint)
+		}
+	}
+	s.mu.Unlock()
 	return purged
+}
+
+func (s *Store) clearEpisodeTombstoneLocked(fingerprint string) {
+	delete(s.deletedEpisodes, fingerprint)
+	s.persistClearEpisodeTombstoneLocked(fingerprint)
 }
 
 func (s *Store) EmptyTrash() []string {

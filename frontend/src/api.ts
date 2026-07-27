@@ -173,12 +173,15 @@ export async function deleteIncident(id: string, permanent = false): Promise<voi
   await mutate('DELETE', `/api/v1/incidents/${encodeURIComponent(id)}${suffix}`);
 }
 
-export async function bulkIncidentAction(incidentIDs: string[], action: BulkIncidentAction): Promise<void> {
-  await write('/api/v1/incidents/bulk', { incident_ids: incidentIDs, action });
+export async function bulkIncidentAction(
+  incidentIDs: string[],
+  action: BulkIncidentAction,
+): Promise<{ processed_ids?: string[]; failed_ids?: string[] }> {
+  return await write('/api/v1/incidents/bulk', { incident_ids: incidentIDs, action });
 }
 
-export async function emptyIncidentTrash(): Promise<void> {
-  await mutate('DELETE', '/api/v1/incidents/trash');
+export async function emptyIncidentTrash(): Promise<{ deleted_count?: number; failed_count?: number }> {
+  return await mutate('DELETE', '/api/v1/incidents/trash');
 }
 
 export async function fetchRecurrenceStats(days = 7): Promise<RecurrenceStats> {

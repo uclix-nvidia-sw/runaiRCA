@@ -3095,14 +3095,27 @@ func TestIncidentLifecycleViewsAndDeletedGuards(t *testing.T) {
 		t.Fatalf("memory search should exclude deleted incidents: %+v", results)
 	}
 
-	recreated := store.UpsertAlertResult(webhook, alert)
+	// A resend of the exact episode the operator trashed is dropped — this is
+	// what "delete" means to the operator; without it every Alertmanager
+	// repeat_interval resend resurrected the trashed incident as a twin.
+	if dropped := store.UpsertAlertResult(webhook, alert); !dropped.Dropped || dropped.Incident != nil {
+		t.Fatalf("same episode after soft delete should be dropped: %+v", dropped)
+	}
+	// A NEW firing episode is a genuinely new occurrence and still gets a
+	// fresh incident; the trashed one stays in trash.
+	episode2 := alert
+	episode2.StartsAt = "2026-07-01T14:00:00Z"
+	recreated := store.UpsertAlertResult(webhook, episode2)
 	if !recreated.NewIncident || recreated.Incident.IncidentID == incident.IncidentID {
-		t.Fatalf("same fingerprint after soft delete should create a new incident: %+v", recreated)
+		t.Fatalf("new episode after soft delete should create a new incident: %+v", recreated)
+	}
+	if trash, total := store.ListIncidentsPage(0, 0, incidentViewTrash); total != 1 || len(trash) != 1 {
+		t.Fatalf("trash should still hold the deleted incident, total=%d", total)
 	}
 	if _, ok := store.RestoreIncident(incident.IncidentID); !ok {
 		t.Fatalf("restore failed")
 	}
-	reused := store.UpsertAlertResult(webhook, alert)
+	reused := store.UpsertAlertResult(webhook, episode2)
 	if reused.Incident.IncidentID != recreated.Incident.IncidentID {
 		t.Fatalf("restore should not steal occupied indexes, got %+v want %s", reused.Incident, recreated.Incident.IncidentID)
 	}

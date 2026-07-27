@@ -29,6 +29,10 @@ func (s *Server) handleAlertmanager(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		result := s.store.UpsertAlertResult(webhook, alert)
+		if result.Dropped {
+			ignored++
+			continue
+		}
 		incident, record := result.Incident, result.Alert
 		accepted++
 		if result.Changed {

@@ -435,6 +435,11 @@ func (s *Store) ensurePostgresSchema(ctx context.Context) bool {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`CREATE TABLE IF NOT EXISTS deleted_alert_episodes (
+			fingerprint TEXT PRIMARY KEY,
+			fired_at TIMESTAMPTZ NOT NULL,
+			deleted_at TIMESTAMPTZ NOT NULL
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_alerts_incident_id ON alerts (incident_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_feedback_target ON rca_feedback (target_type, target_id)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_one_vote_per_author ON rca_feedback (target_type, target_id, author) WHERE kind = 'vote'`,
@@ -685,6 +690,7 @@ func (s *Store) loadDatabaseState(ctx context.Context) {
 	s.loadCaseSnapshots(ctx)
 	s.loadKnowledge(ctx)
 	s.loadChatConversations(ctx)
+	s.loadDeletedEpisodes(ctx)
 }
 
 func (s *Store) loadIncidents(ctx context.Context) {
@@ -779,6 +785,17 @@ func (s *Store) loadAlerts(ctx context.Context) {
 		}
 		if incident := s.incidents[alert.IncidentID]; incident != nil && incident.CorrelationKey != "" {
 			s.alertByGroup["correlation:"+incident.CorrelationKey] = alert.AlertID
+		}
+	}
+	// Trashed incidents keep their identity match so a resend of a trashed
+	// episode is dropped instead of resurrected (see UpsertAlertResult) — but
+	// only where no active alert owns the fingerprint.
+	for _, alert := range s.alerts {
+		if alert.Fingerprint == "" || !incidentDeleted(s.incidents[alert.IncidentID]) {
+			continue
+		}
+		if _, taken := s.alertByFinger[alert.Fingerprint]; !taken {
+			s.alertByFinger[alert.Fingerprint] = alert.AlertID
 		}
 	}
 	for _, alert := range s.alerts {
@@ -1286,7 +1303,7 @@ func (s *Store) persistIncidentLocked(incident *Incident) bool {
 	return true
 }
 
-func (s *Store) persistHardDeleteIncidentLocked(incidentID string, alertIDs []string) bool {
+func (s *Store) persistHardDeleteIncidentLocked(incidentID string, alertIDs []string, episodes map[string]deletedEpisode) bool {
 	if s.db == nil || !s.dbReady || incidentID == "" {
 		return true
 	}
@@ -1325,12 +1342,52 @@ func (s *Store) persistHardDeleteIncidentLocked(incidentID string, alertIDs []st
 			return false
 		}
 	}
+	for fingerprint, episode := range episodes {
+		if _, err := tx.ExecContext(
+			ctx,
+			`INSERT INTO deleted_alert_episodes (fingerprint, fired_at, deleted_at) VALUES ($1, $2, $3)
+			 ON CONFLICT (fingerprint) DO UPDATE SET fired_at = EXCLUDED.fired_at, deleted_at = EXCLUDED.deleted_at`,
+			fingerprint, episode.FiredAt, episode.DeletedAt,
+		); err != nil {
+			log.Printf("Failed to record deleted episode for incident %s: %v", incidentID, err)
+			return false
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		log.Printf("Failed to commit hard delete incident %s: %v", incidentID, err)
 		return false
 	}
 	committed = true
 	return true
+}
+
+func (s *Store) persistClearEpisodeTombstoneLocked(fingerprint string) {
+	if s.db == nil || !s.dbReady || fingerprint == "" {
+		return
+	}
+	if _, err := s.execPostgres(`DELETE FROM deleted_alert_episodes WHERE fingerprint = $1`, fingerprint); err != nil {
+		log.Printf("Failed to clear deleted episode %s: %v", fingerprint, err)
+	}
+}
+
+func (s *Store) loadDeletedEpisodes(ctx context.Context) {
+	rows, err := s.db.QueryContext(ctx, `SELECT fingerprint, fired_at, deleted_at FROM deleted_alert_episodes`)
+	if err != nil {
+		log.Printf("Failed to load deleted episodes: %v", err)
+		return
+	}
+	defer rows.Close()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for rows.Next() {
+		var fingerprint string
+		var episode deletedEpisode
+		if err := rows.Scan(&fingerprint, &episode.FiredAt, &episode.DeletedAt); err != nil {
+			log.Printf("Failed to scan deleted episode: %v", err)
+			continue
+		}
+		s.deletedEpisodes[fingerprint] = episode
+	}
 }
 
 func (s *Store) persistAlertLocked(alert *AlertRecord) bool {

@@ -49,6 +49,7 @@ func (s *Server) handleIncidentBulkAction(w http.ResponseWriter, r *http.Request
 	}
 
 	processed := make([]string, 0, len(ids))
+	failed := make([]string, 0)
 	for _, id := range ids {
 		var incident *Incident
 		var ok bool
@@ -65,6 +66,9 @@ func (s *Server) handleIncidentBulkAction(w http.ResponseWriter, r *http.Request
 			ok = s.store.HardDeleteIncident(id)
 		}
 		if !ok {
+			// A permanent delete that failed to persist (Postgres error, see the
+			// backend log) must not report success — the row is still there.
+			failed = append(failed, id)
 			continue
 		}
 		processed = append(processed, id)
@@ -74,7 +78,7 @@ func (s *Server) handleIncidentBulkAction(w http.ResponseWriter, r *http.Request
 		}
 		s.hub.Broadcast(incidentUpdatedEvent(id, req.Action, incident.Status, incident.ArchivedAt, incident.DeletedAt))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "processed_ids": processed})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "processed_ids": processed, "failed_ids": failed})
 }
 
 func (s *Server) handleEmptyIncidentTrash(w http.ResponseWriter, _ *http.Request) {
@@ -82,7 +86,8 @@ func (s *Server) handleEmptyIncidentTrash(w http.ResponseWriter, _ *http.Request
 	for _, id := range ids {
 		s.hub.Broadcast(incidentUpdatedEvent(id, "delete_permanent", "", nil, nil))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "deleted_count": len(ids)})
+	_, remaining := s.store.ListIncidentsPage(1, 0, incidentViewTrash)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "deleted_count": len(ids), "failed_count": remaining})
 }
 
 func (s *Server) handleIncident(w http.ResponseWriter, r *http.Request) {
