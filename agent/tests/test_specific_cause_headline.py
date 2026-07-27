@@ -230,3 +230,139 @@ def test_unschedulable_condition_supplies_specific_cause() -> None:
         language="ko",
     )
     assert "nodeSelector/affinity 불일치" in headline
+
+
+def _signature_result(family: str, *markers: str) -> CollectorResult:
+    """An alert_signature card exactly as _alert_signature_evidence_result builds it."""
+    item = artifact(
+        agent="alert",
+        source="alertmanager",
+        type="alert_signature",
+        status="ok",
+        confidence="high",
+        summary="Alert payload explicitly reported " + ", ".join(markers) + ".",
+        result={
+            "matched_signals": list(markers),
+            "observation": {
+                "predicate": f"alert_signature:{family}",
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "alert", "name": "fp-1"},
+            },
+        },
+    )
+    result = CollectorResult(
+        agent="alert", status="ok", summary="alert signature", artifacts=[item]
+    )
+    assign_evidence_ids([result])
+    return result
+
+
+def _ranked(family: str, mechanism: str) -> RankedCause:
+    return RankedCause(family, "high", 9.0, mechanism=mechanism)
+
+
+def test_warning_event_ranking_still_names_the_missing_object():
+    # Ranking settled on the family through a Warning event, so there is no
+    # "typed container state ..." mechanism — the headline must still be concrete.
+    result = _result(
+        "CreateContainerConfigError", 'secret "app-secret" not found', event=True
+    )
+    eligible = {result.artifacts[0].evidence_id}
+    headline = pipeline._ranked_root_cause_statement(
+        [_ranked("workload_startup_error", "warning event CreateContainerConfigError")],
+        _request(),
+        results=[result],
+        eligible_evidence_ids=eligible,
+        language="ko",
+    )
+    assert "Secret 'app-secret'" in headline
+    assert headline.index("Secret 'app-secret'") < headline.index("분류:")
+
+
+def test_alert_signature_ranking_names_the_missing_object():
+    # The alert payload itself asserted the reason; the object name lives in the
+    # annotation text the signature was asserted from.
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "KubeContainerWaiting"},
+            annotations={
+                "description": 'CreateContainerConfigError: secret "app-secret" not found'
+            },
+            fingerprint="fp-1",
+        )
+    )
+    result = _signature_result("workload_startup_error", "CreateContainerConfigError")
+    eligible = {result.artifacts[0].evidence_id}
+    headline = pipeline._ranked_root_cause_statement(
+        [_ranked("workload_startup_error", "alert signature CreateContainerConfigError")],
+        request,
+        results=[result],
+        eligible_evidence_ids=eligible,
+        language="ko",
+    )
+    assert "Secret 'app-secret'" in headline
+
+
+def test_alert_signature_outside_eligible_evidence_is_not_used():
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "KubeContainerWaiting"},
+            annotations={
+                "description": 'CreateContainerConfigError: secret "app-secret" not found'
+            },
+            fingerprint="fp-1",
+        )
+    )
+    result = _signature_result("workload_startup_error", "CreateContainerConfigError")
+    assert (
+        pipeline._specific_cause_statement(
+            _ranked("workload_startup_error", "alert signature"),
+            [result],
+            set(),
+            language="ko",
+            request=request,
+        )
+        == ""
+    )
+
+
+def test_runbook_text_never_supplies_the_headline():
+    # Probe/runbook wording is hypothesis guidance, never incident evidence.
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "KubeContainerWaiting"},
+            annotations={
+                "runbook_url": 'https://wiki/secret "app-secret" not found',
+                "summary": "container waiting",
+            },
+            fingerprint="fp-1",
+        )
+    )
+    result = _signature_result("workload_startup_error", "CreateContainerConfigError")
+    eligible = {result.artifacts[0].evidence_id}
+    detail = pipeline._specific_cause_statement(
+        _ranked("workload_startup_error", "alert signature"),
+        [result],
+        eligible,
+        language="ko",
+        request=request,
+    )
+    assert "app-secret" not in detail
+
+
+def test_specific_cause_leads_and_family_becomes_the_classification():
+    result = _result("CreateContainerConfigError", 'secret "app-secret" not found')
+    eligible = {result.artifacts[0].evidence_id}
+    headline = pipeline._ranked_root_cause_statement(
+        [_candidate("CreateContainerConfigError", "workload_startup_error")],
+        _request(),
+        results=[result],
+        eligible_evidence_ids=eligible,
+        language="ko",
+    )
+    assert "가장 가능성 높은 원인은" not in headline
+    assert "(분류:" in headline

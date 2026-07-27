@@ -25,15 +25,13 @@ from app.schemas import Alert, AlertAnalysisRequest
 from app.services.kg_enrichment import GraphRemediation, graph_remediation
 from app.services.orchestrator import AnalysisOrchestrator
 from app.services.pipeline import (
-    _SYNTHESIS_USER_CHARS,
-    _complete_synthesis_json,
+    _apply_line_translations,
     _detail_from,
     _gpu_model_from,
     _graph_remediation_lines,
-    _korean_report_language_conflict,
     _summary_from,
-    _synthesis_evidence_json,
-    _synthesize_korean,
+    _translatable_report_lines,
+    _translate_report_lines_ko,
     _xid_codes_from_results,
 )
 from app.services.planner import plan_investigation
@@ -180,7 +178,7 @@ async def test_analyze_synthesis_sees_every_collector() -> None:
 
 
 @pytest.mark.asyncio
-async def test_korean_llm_synthesis_replaces_report(monkeypatch) -> None:
+async def test_korean_llm_synthesis_localizes_english_lines(monkeypatch) -> None:
     settings = replace(
         make_settings(),
         language="ko",
@@ -188,22 +186,18 @@ async def test_korean_llm_synthesis_replaces_report(monkeypatch) -> None:
         llm_model="m",
         llm_api_key="k",
     )
+    sent: list[dict] = []
 
     async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        pending = json.loads(json_body["messages"][-1]["content"])
+        sent.append(pending)
+        # Echo every requested line, keeping backtick spans verbatim.
+        translated = {key: f"[번역] {value}" for key, value in pending.items()}
         return SimpleNamespace(
             ok=True,
             data={
                 "choices": [
-                    {
-                        "message": {
-                                "content": (
-                                    '{"summary": "노드 디스크 압박이 근본 원인입니다.", '
-                                    '"detail": "## 1. 문제\\n\\n노드 디스크 압박 알림이 발생했습니다.\\n\\n'
-                                    '## 2. 원인\\n\\n노드 디스크 압박입니다.\\n\\n'
-                                    '## 3. 권장 조치\\n\\n1. `kubectl describe node`로 압박 조건과 이벤트를 확인하세요."}'
-                                )
-                        }
-                    }
+                    {"message": {"content": json.dumps(translated, ensure_ascii=False)}}
                 ]
             },
         )
@@ -221,41 +215,15 @@ async def test_korean_llm_synthesis_replaces_report(monkeypatch) -> None:
         )
     )
 
-    assert response.analysis_summary == "노드 디스크 압박이 근본 원인입니다."
-    assert "노드 디스크 압박" in response.analysis_detail
+    assert response.context["synthesis"]["status"] == "completed"
+    assert isinstance(response.context["synthesis"]["duration_seconds"], float)
+    assert "[번역]" in response.analysis_detail
     assert response.analysis_detail == response.analysis
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    # Structure is never sent to the model, so it cannot be rewritten.
+    assert "## 2. 원인 (Root Cause)" in response.analysis_detail
+    assert sent and all(
+        not line.lstrip().startswith("#") for line in sent[0].values()
+    )
 
 
 @pytest.mark.asyncio
@@ -299,24 +267,112 @@ async def test_korean_synthesis_falls_back_on_bad_json(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_korean_synthesis_retries_json_missing_detail(monkeypatch, caplog) -> None:
+async def test_korean_synthesis_reasks_only_the_missing_lines(monkeypatch) -> None:
     settings = replace(make_settings(), language="ko")
+    detail = "Disk pressure was reported.\nThe kubelet started evicting pods."
+    asked: list[dict] = []
     replies = [
-        '{"summary":"요약만 반환됨"}',
-        '{"summary":"정상 요약","detail":"정상 본문"}',
+        '{"0": "디스크 압박이 보고되었습니다."}',
+        '{"1": "kubelet이 Pod를 축출하기 시작했습니다."}',
     ]
 
-    async def fake_complete_with_error(*_args, **_kwargs):
+    async def fake_complete_with_error(*_args, **kwargs):
+        asked.append(json.loads(kwargs["user"]))
         return replies.pop(0), None
 
     monkeypatch.setattr(
         "app.services.pipeline.complete_with_error", fake_complete_with_error
     )
-    result = await _complete_synthesis_json(settings, system="system", user="user")
+    result, missing = await _translate_report_lines_ko(settings, detail)
 
-    assert result == {"summary": "정상 요약", "detail": "정상 본문"}
-    assert not replies
-    assert "omitted required field(s) detail (attempt 1); retrying" in caplog.text
+    assert result == "디스크 압박이 보고되었습니다.\nkubelet이 Pod를 축출하기 시작했습니다."
+    assert missing == 0
+    assert [sorted(payload) for payload in asked] == [["0", "1"], ["1"]]
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_keeps_commands_and_structure_out_of_the_prompt(
+    monkeypatch,
+) -> None:
+    settings = replace(make_settings(), language="ko")
+    detail = (
+        "## 3. 권장 조치\n"
+        "\n"
+        "1. kubectl describe node dgx02\n"
+        "2. Confirm the Secret exists in the SAME namespace with `kubectl get secret`.\n"
+        "- 이미 한국어인 줄입니다.\n"
+        "\n"
+        "```json\n"
+        '{"alertname": "NodeDiskPressure"}\n'
+        "```\n"
+    )
+    pending = _translatable_report_lines(detail)
+
+    # Only the English prose line, and without its list prefix.
+    assert list(pending) == ["3"]
+    assert pending["3"].startswith("Confirm the Secret")
+
+    asked: list[dict] = []
+
+    async def fake_complete_with_error(*_args, **kwargs):
+        asked.append(json.loads(kwargs["user"]))
+        return (
+            '{"3": "동일한 네임스페이스에 Secret이 있는지 `kubectl get secret`으로 확인하세요."}',
+            None,
+        )
+
+    monkeypatch.setattr(
+        "app.services.pipeline.complete_with_error", fake_complete_with_error
+    )
+    result, missing = await _translate_report_lines_ko(settings, detail)
+
+    assert missing == 0
+    assert "2. 동일한 네임스페이스에 Secret이 있는지" in result
+    assert "1. kubectl describe node dgx02" in result
+    assert '{"alertname": "NodeDiskPressure"}' in result
+    assert "## 3. 권장 조치" in result
+
+
+@pytest.mark.asyncio
+async def test_korean_synthesis_rejects_a_mangled_command_span(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko")
+    detail = "Run `kubectl get secret app-secret` to confirm the Secret exists."
+
+    async def fake_complete_with_error(*_args, **_kwargs):
+        return '{"0": "`kubectl get secrets` 를 실행해 Secret 존재를 확인하세요."}', None
+
+    monkeypatch.setattr(
+        "app.services.pipeline.complete_with_error", fake_complete_with_error
+    )
+    # A mangled command span is rejected, so the line keeps its English text.
+    result, missing = await _translate_report_lines_ko(settings, detail)
+    assert result == detail
+    assert missing == 1
+
+
+@pytest.mark.asyncio
+async def test_korean_report_needs_no_llm_call(monkeypatch) -> None:
+    settings = replace(make_settings(), language="ko")
+    calls = 0
+
+    async def fake_complete_with_error(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return "{}", None
+
+    monkeypatch.setattr(
+        "app.services.pipeline.complete_with_error", fake_complete_with_error
+    )
+    detail = "## 1. 문제\n\n노드 디스크 압박 알림이 발생했습니다.\n"
+    assert await _translate_report_lines_ko(settings, detail) == (detail, 0)
+    assert calls == 0
+
+
+def test_apply_line_translations_preserves_list_prefixes() -> None:
+    detail = "- English bullet line here.\n2. Another English action line."
+    assert _apply_line_translations(detail, {"0": "한국어 항목.", "1": "다른 항목."}) == (
+        "- 한국어 항목.\n2. 다른 항목."
+    )
 
 
 @pytest.mark.asyncio
@@ -333,11 +389,10 @@ async def test_korean_synthesis_does_not_retry_transport_failure(monkeypatch, ca
         "app.services.pipeline.complete_with_error", fake_complete_with_error
     )
     diagnostics: list[str] = []
-    result = await _complete_synthesis_json(
-        settings, system="system", user="user", diagnostics=diagnostics
-    )
+    detail = "Disk pressure was reported on the node."
+    result, missing = await _translate_report_lines_ko(settings, detail, diagnostics)
 
-    assert result is None
+    assert (result, missing) == (detail, 1)
     assert calls == 1
     assert "HTTP 504 gateway timeout" in caplog.text
     assert diagnostics and "HTTP 504 gateway timeout" in diagnostics[0]
@@ -540,36 +595,6 @@ def test_image_pull_actions_ignore_family_wide_graph_siblings() -> None:
     assert "ImagePullSecret을 추가하세요" not in appendix
 
 
-def test_korean_language_guard_rejects_english_recommended_actions() -> None:
-    detail = """## 1. 문제 (Problem)
-
-이미지 pull이 실패했습니다.
-
-## 2. 원인 (Root Cause)
-
-레지스트리 인증을 확인해야 합니다.
-
-## 3. 권장 조치 (Recommended Actions)
-
-1. The registry rejected the pull because the anonymous pull limit was hit.
-2. Add the registry CA certificate to every node.
-
-## 부록 (Appendix)
-"""
-
-    conflict = _korean_report_language_conflict("이미지 pull 실패", detail)
-
-    assert "English-only" in conflict
-
-
-
-
-
-
-
-
-
-
 @pytest.mark.asyncio
 async def test_english_language_keeps_deterministic_report(monkeypatch) -> None:
     # language == "en" (default) never calls Korean synthesis even if LLM configured.
@@ -605,94 +630,31 @@ async def test_english_language_keeps_deterministic_report(monkeypatch) -> None:
     assert not any("한국어" in body for body in seen), "Korean synthesis must not run for en"
 
 
-def test_synthesis_evidence_json_is_valid_under_heavy_load() -> None:
-    # A blunt string slice used to hand the model malformed JSON. The cap must
-    # trim at the DATA level (drop lowest-priority collectors from the end) so
-    # the evidence is always parseable and the leading reasoning inputs survive.
-    heavy = {
-        "operator_guidance": "GPU 하드웨어부터 확인하라." * 5,
-        "alert": {"name": "KubePodNotReady"},
-        "plan": {"narrative": "N" * 400},
-        "ranked_root_cause_candidates": [{"family": "gpu_hardware_error"}] * 3,
-        "graph_remediation": {"family_fixes": ["fix" * 20] * 5},
-        "collector_findings": [
-            {"agent": a, "summary": "S" * 300,
-             "artifacts": [{"result": "R" * 1200, "summary": "f" * 200} for _ in range(3)]}
-            for a in ["runai", "kubernetes", "postgres", "prometheus", "loki", "system", "change"]
-        ],
-    }
-    out = _synthesis_evidence_json(heavy, _SYNTHESIS_USER_CHARS)
-    assert len(out) <= _SYNTHESIS_USER_CHARS
-    parsed = json.loads(out)  # MUST NOT raise — valid JSON, not a mid-structure cut
-    # Human directive + graph-derived fixes are never dropped.
-    assert parsed["operator_guidance"].startswith("GPU")
-    assert "graph_remediation" in parsed
-    # At least the highest-priority collectors survive; drops come from the end.
-    assert parsed["collector_findings"]
-    assert parsed["collector_findings"][0]["agent"] == "runai"
-
-
-def test_synthesis_evidence_json_keeps_everything_when_small() -> None:
-    small = {"operator_guidance": "x", "collector_findings": [{"agent": "runai", "summary": "ok"}]}
-    parsed = json.loads(_synthesis_evidence_json(small, _SYNTHESIS_USER_CHARS))
-    assert len(parsed["collector_findings"]) == 1  # nothing dropped under the cap
-
-
-# --- translation-only synthesis (owner directive 2026-07-22) ------------------
-
-
 @pytest.mark.asyncio
-async def test_korean_synthesis_translates_deterministic_report_verbatim(monkeypatch) -> None:
-    # Synthesis is a TRANSLATOR: the prompt must carry exactly the deterministic
-    # summary+detail (no evidence JSON, no re-analysis inputs) and return the
-    # localized pair.
+async def test_korean_synthesis_prompt_carries_report_text_only(monkeypatch) -> None:
+    # Synthesis is a TRANSLATOR: the prompt must carry report lines and nothing
+    # that would let the model re-analyze.
     settings = replace(make_settings(), language="ko")
-    captured = {}
+    captured: dict[str, str] = {}
 
-    async def fake_complete_synthesis_json(settings, *, system, user, diagnostics=None):
-        captured["system"] = system
-        captured["user"] = user
-        return {"summary": "한국어 요약", "detail": "# 한국어 본문"}
+    async def fake_complete_with_error(*_args, **kwargs):
+        captured.update(kwargs)
+        return '{"0": "이미지 pull 실패 증거입니다."}', None
 
     monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
+        "app.services.pipeline.complete_with_error", fake_complete_with_error
     )
-    synth = await _synthesize_korean(
-        settings,
-        summary="Pod default/x is not ready. Likely cause: image pull failure.",
-        fallback_detail="# 장애 분석 보고서\n\n- image pull failure evidence",
+    result, missing = await _translate_report_lines_ko(
+        settings, "- image pull failure evidence was collected"
     )
-    assert synth == ("한국어 요약", "# 한국어 본문")
-    payload = json.loads(captured["user"])
-    assert payload == {
-        "summary": "Pod default/x is not ready. Likely cause: image pull failure.",
-        "detail": "# 장애 분석 보고서\n\n- image pull failure evidence",
+
+    assert (result, missing) == ("- 이미지 pull 실패 증거입니다.", 0)
+    assert json.loads(captured["user"]) == {
+        "0": "image pull failure evidence was collected"
     }
     assert "번역" in captured["system"]
-    # The translator prompt must not smuggle re-analysis material back in.
     assert "ranked_root_cause_candidates" not in captured["user"]
     assert "collector_findings" not in captured["user"]
-
-
-@pytest.mark.asyncio
-async def test_korean_synthesis_failure_keeps_deterministic_report(monkeypatch) -> None:
-    settings = replace(make_settings(), language="ko")
-
-    async def fake_complete_synthesis_json(settings, *, system, user, diagnostics=None):
-        return None
-
-    monkeypatch.setattr(
-        "app.services.pipeline._complete_synthesis_json", fake_complete_synthesis_json
-    )
-    diagnostics: list[str] = []
-    synth = await _synthesize_korean(
-        settings,
-        summary="summary",
-        fallback_detail="detail",
-        diagnostics=diagnostics,
-    )
-    assert synth is None
-    assert diagnostics == ["synthesis returned no valid JSON report"]
 
 
 # --- closed family universe (graph knowledge cannot mint headline families) ---
@@ -716,3 +678,59 @@ def test_catalog_only_knowledge_drops_llm_authored_graph_families(caplog) -> Non
     # Catalog-only input passes through untouched; empty graph falls back.
     assert _catalog_only_knowledge({"image_pull_error": []}) == {"image_pull_error": []}
     assert _catalog_only_knowledge(None) == {}
+
+
+@pytest.mark.asyncio
+async def test_long_report_is_translated_in_batches(monkeypatch) -> None:
+    # A long report must not depend on one reply fitting under one completion
+    # cap — that is how sections silently went missing.
+    lines = [f"Collector {index} reported a scoped observation." for index in range(120)]
+    detail = "\n".join(lines)
+    batches: list[dict] = []
+
+    async def fake_complete_with_error(*_args, **kwargs):
+        pending = json.loads(kwargs["user"])
+        batches.append(pending)
+        assert kwargs["max_tokens"] < 16384, "batch must not request the full cap"
+        return (
+            json.dumps({key: f"수집기 관측 {key}." for key in pending}, ensure_ascii=False),
+            None,
+        )
+
+    monkeypatch.setattr(
+        "app.services.pipeline.complete_with_error", fake_complete_with_error
+    )
+    settings = replace(make_settings(), language="ko")
+    result, missing = await _translate_report_lines_ko(settings, detail)
+
+    assert missing == 0
+    assert len(batches) > 1
+    assert len(result.split("\n")) == len(lines)  # line count preserved exactly
+    assert "Collector" not in result
+
+
+@pytest.mark.asyncio
+async def test_failed_batch_keeps_the_batches_that_worked(monkeypatch) -> None:
+    lines = [f"Collector {index} reported a scoped observation." for index in range(120)]
+    detail = "\n".join(lines)
+    calls = {"n": 0}
+
+    async def fake_complete_with_error(*_args, **kwargs):
+        calls["n"] += 1
+        pending = json.loads(kwargs["user"])
+        if calls["n"] == 1:
+            return (
+                json.dumps({key: f"수집기 관측 {key}." for key in pending}, ensure_ascii=False),
+                None,
+            )
+        return "not json at all", None
+
+    monkeypatch.setattr(
+        "app.services.pipeline.complete_with_error", fake_complete_with_error
+    )
+    settings = replace(make_settings(), language="ko")
+    result, missing = await _translate_report_lines_ko(settings, detail)
+
+    assert 0 < missing < len(lines)
+    assert "수집기 관측" in result  # the good batch survived
+    assert "Collector" in result  # the failed batch kept its deterministic text

@@ -177,42 +177,6 @@ async def test_unhealthy_postgres_check_stays_evidence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_translate_playbook_ko_splices_only_the_playbook(monkeypatch) -> None:
-    detail = (
-        "## 4. Appendix\n"
-        "\n### Troubleshooting Playbook\n\n"
-        "- **GPU Allocation Shows Zero On Dashboard** (known issue)\n"
-        "  - Delete the offending pod.\n"
-        "\n### Similar Incidents\n\n- No similar past incident found."
-    )
-
-    async def fake_complete(settings, *, system, user, **kwargs):
-        assert "GPU Allocation" in user
-        assert kwargs["model"] == "super"
-        return (
-            "- **대시보드 GPU 할당 0 표시** (알려진 이슈)\n"
-            "  - 문제 파드를 삭제하세요. api_key=translation-secret-12345"
-        )
-
-    monkeypatch.setattr(pipeline, "complete", fake_complete)
-    translated = await pipeline._translate_playbook_ko(
-        replace(make_settings(), llm_model_insight="super"), detail
-    )
-    assert "대시보드 GPU 할당 0 표시" in translated
-    assert "Delete the offending pod" not in translated
-    assert "### Similar Incidents" in translated  # neighbouring sections untouched
-    assert "- No similar past incident found." in translated
-    assert "translation-secret-12345" not in translated
-    assert "[MASKED]" in translated
-
-
-@pytest.mark.asyncio
-async def test_translate_playbook_ko_keeps_detail_without_marker() -> None:
-    detail = "## 2. 원인\n\n- 근거"
-    assert await pipeline._translate_playbook_ko(make_settings(), detail) == detail
-
-
-@pytest.mark.asyncio
 async def test_sharpen_operator_questions_uses_insight_model(monkeypatch) -> None:
     models: list[str | None] = []
 
@@ -262,31 +226,6 @@ def test_appendix_omits_drilldown_artifact_dump() -> None:
     assert "### Evidence" not in detail
     assert "runtime/panic.go:785" not in detail
     assert "1 row(s)" not in detail
-
-
-def test_korean_synthesis_cleanup_preserves_evidence_trace() -> None:
-    detail = """## 부록 (Appendix)
-
-### Evidence
-
-- **kubernetes**: duplicated collector result
-
-### Investigation Plan
-
-- inspect the target pod
-
-## Evidence Trace
-
-- [E01] kubernetes: ImagePullBackOff
-"""
-
-    cleaned = pipeline._strip_appendix_evidence_section(detail)
-
-    assert "### Evidence" not in cleaned
-    assert "duplicated collector result" not in cleaned
-    assert "### Investigation Plan" in cleaned
-    assert "## Evidence Trace" in cleaned
-    assert "[E01] kubernetes: ImagePullBackOff" in cleaned
 
 
 def test_root_cause_supporting_evidence_uses_drilldown_after_no_evidence_base() -> None:
@@ -856,23 +795,6 @@ def test_parse_json_object_survives_prose_fences_and_trailing_junk() -> None:
     assert parse_json_object("no json here") is None
     assert parse_json_object("{truncated: ") is None
     assert parse_json_object("") is None
-
-
-@pytest.mark.asyncio
-async def test_synthesis_retries_once_on_malformed_json(monkeypatch) -> None:
-    replies = iter(["not json at all", '{"summary": "요약", "detail": "본문"}'])
-    calls = {"n": 0}
-
-    async def fake_complete_with_error(settings, **kwargs):
-        calls["n"] += 1
-        return next(replies), None
-
-    monkeypatch.setattr(pipeline, "complete_with_error", fake_complete_with_error)
-    parsed = await pipeline._complete_synthesis_json(
-        make_settings(), system="s", user="u"
-    )
-    assert parsed == {"summary": "요약", "detail": "본문"}
-    assert calls["n"] == 2
 
 
 # --- MCP label-selector fidelity ----------------------------------------------------

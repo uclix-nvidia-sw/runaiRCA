@@ -40,6 +40,6 @@
 
 ### `synthesis`
 
-**정의.** `synthesis`는 운영자에게 표시할 최종 보고서를 생성하는 단계입니다. `agent/app/services/pipeline.py`의 `synthesize_stage`가 결정론적 영어 보고서를 만들며, 한국어로 설정되고 조건이 맞으면 적격 증거에 엄격히 근거한 한국어 LLM 보고서로 덮어쓸 수 있습니다.
+**정의.** `synthesis`는 운영자에게 표시할 최종 보고서를 조립하는 단계입니다. `agent/app/services/pipeline.py`의 `synthesize_stage`가 랭킹된 후보와 적격 증거로부터 보고서를 결정론적으로 만듭니다. 한국어로 설정된 경우 LLM은 보고서의 영어 산문 줄만 배치 단위로 번역할 뿐, 보고서를 저작하거나 재판단하거나 구조를 바꾸지 않습니다.
 
 **어디에서 보이나.** `synthesize` 파이프라인 단계와 최종 보고서의 summary, detail, 조치, caveat, 증거 표시에서 보입니다.

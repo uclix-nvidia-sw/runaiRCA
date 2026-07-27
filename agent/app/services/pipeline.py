@@ -74,7 +74,6 @@ _log = logging.getLogger(__name__)
 TModel = TypeVar("TModel", bound=BaseModel)
 Stage = Callable[["PipelineState"], Awaitable["PipelineState"]]
 _SYNTHESIS_ARTIFACT_RESULT_CHARS = 1200
-_SYNTHESIS_USER_CHARS = 24000
 
 # Raw Kubernetes objects contain failure vocabulary even when the observed
 # value is healthy or merely declarative configuration.  Those fields remain
@@ -177,6 +176,7 @@ class PipelineState:
     reanalysis_note: str = ""
     synthesis_status: str = "not_requested"
     synthesis_error: str = ""
+    synthesis_duration: float | None = None
     # Eligible semantic matches returned by the most recent re-analysis pass.
     # This is intentionally transient: it only changes the next probe order.
     reanalysis_fresh_support_families: tuple[str, ...] = ()
@@ -2377,36 +2377,8 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         self_check_next=state.self_check_next,
         runtime_knowledge_hints=state.runtime_knowledge_hints,
     )
-    # Korean localization (when language == "ko" and LLM configured): translate
-    # the deterministic report just built — the LLM never re-analyzes. Falls
-    # back to the deterministic (mixed-language) report on any failure.
-    if getattr(settings, "language", "en") == "ko":
-        synth = None
-        synthesis_diagnostics: list[str] = []
-        if llm_configured(settings, settings.llm_model_synthesis):
-            state.synthesis_status = "running"
-            synth = await _synthesize_korean(
-                settings,
-                summary=state.summary,
-                fallback_detail=state.detail,
-                diagnostics=synthesis_diagnostics,
-            )
-        if synth:
-            state.summary, state.detail = synth
-            state.synthesis_status = "completed"
-        elif llm_configured(settings, getattr(settings, "llm_model_insight", "")):
-            state.synthesis_status = "failed"
-            state.synthesis_error = _short_sentence(
-                synthesis_diagnostics[-1]
-                if synthesis_diagnostics
-                else "LLM synthesis returned no valid report without a diagnostic",
-                limit=500,
-            )
-            state.quality = "degraded"
-            state.warnings.append(f"한국어 LLM synthesis 실패: {state.synthesis_error}")
-
-    # A Korean synthesis can replace the deterministic detail wholesale. Restore
-    # the explicitly non-diagnostic guide when the RCA had no supported action.
+    # Restore the explicitly non-diagnostic guide when the RCA had no supported
+    # action and the report builder did not already carry one.
     if _needs_general_guidance(state.root_cause_candidates, eligible_support_ids):
         heading = _general_guidance_heading(getattr(settings, "language", "en"))
         if heading not in state.detail:
@@ -2460,12 +2432,41 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             body = "\n".join(f"- {question}" for question in questions)
             state.detail = _insert_before_appendix(state.detail, f"{header}\n\n{body}")
 
+    # Korean localization runs LAST so the Self-Check, operator-question and
+    # general-guidance blocks appended above are localized too — they used to be
+    # added after the translator and stayed English.
+    if getattr(settings, "language", "en") == "ko" and llm_configured(
+        settings, settings.llm_model_synthesis
+    ):
+        state.synthesis_status = "running"
+        synthesis_diagnostics: list[str] = []
+        started_at = time.monotonic()
+        # Every batch that succeeded is kept: a partially localized report beats
+        # discarding good Korean because one batch failed.
+        state.detail, untranslated = await _translate_report_lines_ko(
+            settings, state.detail, synthesis_diagnostics
+        )
+        state.synthesis_duration = round(time.monotonic() - started_at, 3)
+        if untranslated:
+            state.synthesis_status = "failed"
+            state.synthesis_error = _short_sentence(
+                synthesis_diagnostics[-1]
+                if synthesis_diagnostics
+                else f"{untranslated} report line(s) were left untranslated",
+                limit=500,
+            )
+            state.quality = "degraded"
+            state.warnings.append(f"한국어 LLM synthesis 실패: {state.synthesis_error}")
+        else:
+            state.synthesis_status = "completed"
+
     affected_pods = _affected_pods_from_results(state.results)
     specific_cause = _specific_cause_statement(
         state.root_cause_candidates[0] if state.root_cause_candidates else None,
         state.results,
         eligible_support_ids,
         language=getattr(settings, "language", "en"),
+        request=request,
     )
 
     synthesis_failed = state.synthesis_status == "failed"
@@ -2492,6 +2493,11 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             "synthesis": {
                 "status": state.synthesis_status,
                 **({"error": state.synthesis_error} if state.synthesis_error else {}),
+                **(
+                    {"duration_seconds": state.synthesis_duration}
+                    if state.synthesis_duration is not None
+                    else {}
+                ),
                 "model": settings.llm_model_synthesis or settings.llm_model,
                 "max_tokens": settings.llm_synthesis_max_tokens,
             },
@@ -2652,6 +2658,7 @@ async def harness_stage(state: PipelineState) -> PipelineState:
         state.results,
         _eligible_support_ids_for_output(state),
         language=getattr(state.settings, "language", "en"),
+        request=state.request,
     )
     # The harness is the final authority on the headline family.  Reconcile the
     # short summary after that decision so a demotion cannot leave a confident
@@ -3347,140 +3354,185 @@ def _exclude_refuted_reanalysis_candidates(
     ]
 
 
-def _synthesis_knowledge_projection(
-    knowledge: dict[str, list[dict]],
-    observed_text: str,
-    candidates: list[RankedCause],
-    *,
-    fuzzy_query: str,
-) -> tuple[dict[str, list[dict[str, object]]], list[dict[str, object]]]:
-    """Project one matched symptom plus labelled same-family alternatives."""
-    matches = _actionable_failure_mode_matches(
-        knowledge, observed_text, candidates, fuzzy_query=fuzzy_query
-    )
-    if not matches:
-        return {}, []
-    family, symptom = matches[0]
+_HANGUL_RE = re.compile(r"[가-힣]")
+_LIST_PREFIX_RE = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+)")
+_BACKTICK_SPAN_RE = re.compile(r"`[^`]*`")
 
-    def localized(item: dict, *, confirmed: bool) -> dict[str, object]:
-        projected: dict[str, object] = {
-            "family": family,
-            "symptom": _localized_failure_mode_name(item, "ko"),
-            "reason": str(item.get("reason_ko") or item.get("reason") or ""),
-            "evidence_matched": confirmed,
-        }
-        if confirmed:
-            projected["actions"] = _localized_failure_mode_actions(item, "ko")
-        else:
-            projected["distinguishing_signals"] = [
-                str(keyword) for keyword in item.get("keywords", [])[:5]
-            ]
-            projected["use_policy"] = (
-                "대안 symptom 후보일 뿐이며, distinguishing_signals가 현재 증거에서 "
-                "확인되기 전에는 해당 조치를 제안하지 않는다."
-            )
-        return projected
-
-    selected = localized(symptom, confirmed=True)
-    selected_name = str(symptom.get("symptom") or "")
-    supplemental = [
-        localized(item, confirmed=False)
-        for item in knowledge.get(family, [])
-        if str(item.get("symptom") or "") != selected_name
-    ][:4]
-    return {family: [selected]}, supplemental
+_TRANSLATOR_SYSTEM = (
+    "당신은 기술 문서 전문 번역가입니다. 입력 JSON은 이미 완성된 장애 분석 보고서의 "
+    "영어 문장들이며, 키는 줄 번호입니다. 내용을 판단·수정·추가·삭제하지 말고 각 "
+    "문장을 자연스러운 한국어로 번역하세요.\n"
+    "규칙:\n"
+    "- 모든 키를 빠짐없이 포함하고, 키는 바꾸지 마세요.\n"
+    "- 백틱(`)으로 감싼 부분은 한 글자도 바꾸지 말고 그대로 두세요.\n"
+    "- pod/네임스페이스/노드/알림 이름, 명령어, 에러 문자열, 코드, URL, 라벨 값 "
+    "같은 식별자는 번역하지 마세요.\n"
+    "- 굵기(**) 같은 마크다운 표기는 원문 위치 그대로 유지하세요.\n"
+    '- JSON 객체 하나로만, 코드펜스 없이 응답하세요: {"12": "<한국어>", ...}'
+)
 
 
-async def _synthesize_korean(
-    settings: Settings,
-    *,
-    summary: str,
-    fallback_detail: str,
-    diagnostics: list[str] | None = None,
-) -> tuple[str, str] | None:
-    """Translate the deterministic report into natural Korean — nothing else.
+def _translatable_report_lines(detail: str) -> dict[str, str]:
+    """Map line index -> English prose that needs localizing.
 
-    Owner directive (2026-07-22): synthesis must NOT re-analyze, re-judge, or
-    re-write the RCA. The deterministic report already carries the analysis
-    (ranked causes, evidence, actions, appendix); the LLM's only job here is
-    localizing its English fragments. This keeps the prompt small (report text
-    only, no evidence JSON), the reasoning short, and removes the guard layer
-    that used to reject valid reports. Returns (summary, detail) in Korean, or
-    None so the caller keeps the deterministic report. Never raises into
-    analyze().
+    Structure is never sent to the LLM: headings, fenced blocks (which include
+    the Alert Labels JSON), commands, identifiers and already-Korean lines are
+    skipped, so a translation can only ever change sentence surface — never the
+    report's conclusions, ordering, or executable text.
     """
-    system = (
-        "당신은 기술 문서 전문 번역가입니다. 입력 JSON의 summary와 detail은 이미 "
-        "완성된 장애 분석 보고서입니다. 내용을 판단·수정·추가·삭제하지 말고, 영어 "
-        "문장만 자연스러운 한국어로 번역하세요.\n"
-        "규칙:\n"
-        "- 이미 한국어인 부분은 그대로 유지하세요.\n"
-        "- 마크다운 구조(헤딩, 목록, 번호, 굵기)와 항목 개수·순서를 그대로 유지하세요.\n"
-        "- pod/네임스페이스/노드/알림 이름, 명령어, 에러 문자열, 코드, URL, 라벨 값 "
-        "같은 식별자는 번역하지 말고 원문 그대로 두세요.\n"
-        '- JSON 객체 하나로만 응답하세요: {"summary": <한국어 번역>, '
-        '"detail": <한국어 번역 마크다운>}'
-    )
-    user = json.dumps(
-        {"summary": summary, "detail": fallback_detail}, ensure_ascii=False
-    )
-    try:
-        completion_kwargs: dict[str, object] = {"system": system, "user": user}
-        if _accepts_keyword(_complete_synthesis_json, "diagnostics"):
-            completion_kwargs["diagnostics"] = diagnostics
-        data = await _complete_synthesis_json(settings, **completion_kwargs)
-    except Exception as exc:  # noqa: BLE001 - synthesis is best-effort
-        detail = _masked_exception_text(exc)
-        if diagnostics is not None:
-            diagnostics.append(detail)
-        _log.warning("korean synthesis call failed: %s", detail)
-        return None
-    if not data:
-        if diagnostics is not None and not diagnostics:
-            diagnostics.append("synthesis returned no valid JSON report")
-        _log.warning(
-            "korean synthesis returned no valid JSON report; using deterministic fallback"
-        )
-        return None
-    return _short_sentence(data["summary"], limit=280), data["detail"]
-
-
-def _strip_appendix_evidence_section(detail: str) -> str:
-    """Remove a duplicated Evidence subsection from an LLM-written appendix.
-
-    The report harness owns the citable Evidence Trace.  Keeping a second,
-    collector-oriented dump in the appendix made query metadata and zero-result
-    probes look as important as the facts actually linked to the conclusion.
-    Preserve every other appendix subsection and any top-level Evidence Trace.
-    """
-    lines = detail.strip().splitlines()
-    kept: list[str] = []
-    in_appendix = False
-    dropping = False
-    in_fence = False
-    appendix_heading = re.compile(
-        r"^(?:\d+\.\s*)?(?:appendix|부록(?:\s*\(appendix\))?)$", re.IGNORECASE
-    )
-    evidence_heading = re.compile(
-        r"^(?:evidence|증거(?:\s*\(evidence\))?)$", re.IGNORECASE
-    )
-
-    for line in lines:
+    pending: dict[str, str] = {}
+    fenced = False
+    for index, line in enumerate(detail.split("\n")):
         stripped = line.strip()
-        if not in_fence and line.startswith("## "):
-            in_appendix = bool(appendix_heading.fullmatch(line[3:].strip()))
-            dropping = False
-        elif not in_fence and in_appendix and line.startswith("### "):
-            dropping = bool(evidence_heading.fullmatch(line[4:].strip()))
-            if dropping:
-                continue
-
-        if not dropping:
-            kept.append(line)
         if stripped.startswith("```"):
-            in_fence = not in_fence
+            fenced = not fenced
+            continue
+        if fenced or not stripped or stripped.startswith("#"):
+            continue
+        if _HANGUL_RE.search(stripped):
+            continue
+        prefix = _LIST_PREFIX_RE.match(line)
+        text = line[prefix.end():].strip() if prefix else stripped
+        if not text or _COMMAND_ONLY_ACTION.match(text):
+            continue
+        # Punctuation/code-only lines carry no prose to localize.
+        prose = _BACKTICK_SPAN_RE.sub("", re.sub(r"https?://\S+", "", text))
+        if len(re.findall(r"[A-Za-z]{3,}", prose)) < 2:
+            continue
+        pending[str(index)] = text
+    return pending
 
-    return "\n".join(kept).strip()
+
+def _apply_line_translations(detail: str, translations: dict[str, str]) -> str:
+    lines = detail.split("\n")
+    for key, translated in translations.items():
+        index = int(key)
+        prefix = _LIST_PREFIX_RE.match(lines[index])
+        lines[index] = (prefix.group(1) if prefix else "") + translated
+    return "\n".join(lines)
+
+
+def _valid_line_translation(source: str, translated: object) -> bool:
+    """Accept a translation only when it preserved every backtick span verbatim."""
+    if not isinstance(translated, str) or not translated.strip():
+        return False
+    return all(span in translated for span in _BACKTICK_SPAN_RE.findall(source))
+
+
+# One call per ~2000 source characters. A long report translated in a single
+# reply has to fit reasoning + every localized line under one completion cap;
+# that is how a report silently came back shorter than it went in. Batching
+# keeps each reply small enough to finish, and a batch that fails only costs
+# its own lines.
+_TRANSLATION_BATCH_CHARS = 2000
+
+
+def _translation_batches(pending: dict[str, str]) -> list[dict[str, str]]:
+    batches: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    size = 0
+    for key, text in pending.items():
+        if current and size + len(text) > _TRANSLATION_BATCH_CHARS:
+            batches.append(current)
+            current, size = {}, 0
+        current[key] = text
+        size += len(text)
+    if current:
+        batches.append(current)
+    return batches
+
+
+async def _translate_line_batch(
+    settings: Settings,
+    batch: dict[str, str],
+    translations: dict[str, str],
+    diagnostics: list[str] | None,
+) -> bool:
+    """Translate one batch in place. Returns False on transport failure (stop)."""
+    pending = dict(batch)
+    for attempt in range(2):
+        estimated = sum(len(text) for text in pending.values()) // 2
+        max_tokens = min(settings.llm_synthesis_max_tokens, max(3072, 3 * estimated))
+        text, error = await complete_with_error(
+            settings,
+            system=_TRANSLATOR_SYSTEM
+            + (
+                "\n(직전 응답에서 일부 항목이 빠졌습니다 — 아래 키를 모두 포함하세요.)"
+                if attempt
+                else ""
+            ),
+            user=json.dumps(pending, ensure_ascii=False),
+            temperature=0.2,
+            max_tokens=max_tokens,
+            model=settings.llm_model_synthesis,
+            purpose="korean_synthesis",
+        )
+        parsed = parse_json_object(text or "")
+        if parsed:
+            for key, value in parsed.items():
+                source = pending.get(str(key))
+                if source is not None and _valid_line_translation(source, value):
+                    translations[str(key)] = str(value).strip()
+            pending = {k: v for k, v in pending.items() if k not in translations}
+            if not pending:
+                return True
+        diagnostic = (
+            f"attempt={attempt + 1}, model="
+            f"{settings.llm_model_synthesis or settings.llm_model}, "
+            f"requested_max_tokens={max_tokens}: "
+        )
+        if text is None:
+            diagnostic += error or "no reply without transport diagnostic"
+            if diagnostics is not None:
+                diagnostics.append(diagnostic)
+            _log.warning("korean synthesis call failed: %s", diagnostic)
+            # Transport failure is not a malformed reply. Retrying (or starting
+            # the next batch) would only burn the remaining finalization budget.
+            return False
+        if parsed is None:
+            truncated = not text.rstrip().endswith("}")
+            diagnostic += f"invalid JSON{' (looks truncated)' if truncated else ''}"
+        else:
+            diagnostic += f"{len(pending)} line(s) missing or malformed"
+        if diagnostics is not None:
+            diagnostics.append(diagnostic)
+        _log.warning("korean synthesis reply incomplete: %s", diagnostic)
+    return True
+
+
+async def _translate_report_lines_ko(
+    settings: Settings,
+    detail: str,
+    diagnostics: list[str] | None = None,
+) -> tuple[str, int]:
+    """Localize the deterministic report by translating its English lines only.
+
+    Owner directive (2026-07-22): synthesis must NOT re-analyze, re-judge or
+    re-write the RCA. Sending the whole report let the model do exactly that and
+    cost a 16k-token reasoning generation; sending the English lines alone makes
+    changing a conclusion structurally impossible, keeps every call small, and
+    guarantees the report cannot come back shorter than it went in.
+
+    Returns ``(report, untranslated_line_count)``. The report is always usable —
+    lines that failed keep their deterministic text. Never raises into analyze().
+    """
+    pending = _translatable_report_lines(detail)
+    if not pending:
+        return detail, 0
+    translations: dict[str, str] = {}
+    try:
+        for batch in _translation_batches(pending):
+            if not await _translate_line_batch(
+                settings, batch, translations, diagnostics
+            ):
+                break
+    except Exception as exc:  # noqa: BLE001 - synthesis is best-effort
+        message = _masked_exception_text(exc)
+        if diagnostics is not None:
+            diagnostics.append(message)
+        _log.warning("korean synthesis call failed: %s", message)
+    missing = len(pending) - len(translations)
+    return _apply_line_translations(detail, translations), missing
 
 
 _COMMAND_ONLY_ACTION = re.compile(
@@ -3488,186 +3540,6 @@ _COMMAND_ONLY_ACTION = re.compile(
     r"systemctl|curl|wget|grep|awk|sed|cat|ls|df|du|find|nslookup|getent)\b",
     re.IGNORECASE,
 )
-
-
-def _korean_report_language_conflict(summary: str, detail: str) -> str:
-    """Reject an English report returned from the Korean synthesis endpoint.
-
-    Commands and product/resource names may remain in English. Narrative action
-    items may not: accepting those is how an English family/graph runbook was
-    previously marked as a successful Korean synthesis.
-    """
-    if not re.search(r"[가-힣]", summary):
-        return "summary contains no Korean text"
-    if not re.search(r"[가-힣]", detail):
-        return "detail contains no Korean text"
-
-    action_heading = re.search(
-        r"(?im)^##\s*3\.[^\n]*(?:권장\s*조치|Recommended\s+Actions)[^\n]*$",
-        detail,
-    )
-    if action_heading is None:
-        # Tiny unit-test/integration stubs may return plain Korean prose. A real
-        # structured report that started emitting headings must include the
-        # required action section.
-        return "required Recommended Actions section is missing" if "##" in detail else ""
-    action_end = re.search(r"(?m)^##\s+", detail[action_heading.end() :])
-    block_end = action_heading.end() + action_end.start() if action_end is not None else len(detail)
-    block = detail[action_heading.end() : block_end]
-    for match in re.finditer(r"(?m)^\s*\d+[.)]\s+(.+?)\s*$", block):
-        action = match.group(1).strip()
-        if re.search(r"[가-힣]", action) or _COMMAND_ONLY_ACTION.match(action):
-            continue
-        # Punctuation-only/code-only entries carry no prose to localize.
-        prose = re.sub(r"`[^`]*`|https?://\S+", "", action)
-        if len(re.findall(r"[A-Za-z]{3,}", prose)) >= 2:
-            return f"recommended action is English-only: {action[:120]}"
-    return ""
-
-
-def _synthesis_has_scoped_support(evidence_eligibility: Mapping[str, object] | None) -> bool:
-    """Whether the Korean synthesizer may receive graph remediation actions.
-
-    ``None`` preserves direct/unit callers that do not have a blackboard.  In a
-    pipeline run an empty/non-permitting map is an explicit safety verdict, not
-    a reason to fall back to broad collector text or historical knowledge.
-    """
-    if evidence_eligibility is None:
-        return True
-    return any(
-        callable(getattr(eligibility, "permits", None)) and eligibility.permits("support")
-        for eligibility in evidence_eligibility.values()
-    )
-
-
-def _synthesis_plan_context(
-    plan: InvestigationPlan, *, allow_remediation: bool
-) -> dict[str, object]:
-    """Project the plan for free-form synthesis without leaking dormant fixes.
-
-    A plan can carry catalog actions and historical case cards so collectors know
-    what to verify.  When every current artifact is context-only or out of
-    scope, those fields must not become an indirect recommendation channel for
-    the synthesis model.
-    """
-    context = plan.as_dict()
-    if allow_remediation:
-        return context
-    matched = context.get("matched_alert")
-    if isinstance(matched, dict):
-        context["matched_alert"] = {
-            key: value for key, value in matched.items() if key != "actions"
-        }
-    context["case_cards"] = []
-    return context
-
-
-async def _complete_synthesis_json(
-    settings: Settings,
-    *,
-    system: str,
-    user: str,
-    diagnostics: list[str] | None = None,
-) -> dict | None:
-    """Synthesis JSON with ONE retry: a single malformed reply must not silently
-    downgrade the whole report to the deterministic English fallback.
-
-    max_tokens is EXPLICIT: without it the gateway's own completion cap applies,
-    and a full Korean report JSON that gets cut mid-string parses as nothing —
-    the LLM "worked" (call succeeded, tokens billed) while the report silently
-    fell back to English. The log names which way it failed."""
-    instruction = "\n\nJSON 객체 하나로만, 프롬프트나 코드펜스 없이 응답하세요."
-    for attempt in range(2):
-        text, error = await complete_with_error(
-            settings,
-            system=system
-            + instruction
-            + (
-                "\n(직전 응답이 유효한 JSON 객체가 아니었습니다 — 이번에는 반드시 "
-                "JSON 객체 하나만 출력하세요.)"
-                if attempt
-                else ""
-            ),
-            user=user,
-            temperature=0.2,
-            max_tokens=settings.llm_synthesis_max_tokens,
-            model=settings.llm_model_synthesis,
-            purpose="korean_synthesis",
-        )
-        parsed = parse_json_object(text or "")
-        if parsed is not None:
-            missing = [
-                field
-                for field in ("summary", "detail")
-                if not isinstance(parsed.get(field), str) or not parsed[field].strip()
-            ]
-            if not missing:
-                return parsed
-            diagnostic = (
-                f"attempt={attempt + 1}, model="
-                f"{settings.llm_model_synthesis or settings.llm_model}, "
-                f"requested_max_tokens={settings.llm_synthesis_max_tokens}: "
-                f"JSON omitted required field(s) {', '.join(missing)}"
-            )
-            if diagnostics is not None:
-                diagnostics.append(diagnostic)
-            _log.warning(
-                "korean synthesis JSON omitted required field(s) %s (attempt %d); retrying",
-                ", ".join(missing),
-                attempt + 1,
-            )
-            continue
-        if text is None:
-            detail = error or "no reply without transport diagnostic"
-            diagnostic = (
-                f"attempt={attempt + 1}, model="
-                f"{settings.llm_model_synthesis or settings.llm_model}, "
-                f"requested_max_tokens={settings.llm_synthesis_max_tokens}: {detail}"
-            )
-            if diagnostics is not None:
-                diagnostics.append(diagnostic)
-            _log.warning("korean synthesis call failed: %s", diagnostic)
-            # Transport failure/timeout is not malformed JSON. A second full
-            # reasoning generation would only burn the remaining finalization
-            # budget and leave no time for the deterministic Korean fallback.
-            return None
-        else:
-            truncated = not text.rstrip().endswith("}")
-            diagnostic = (
-                f"attempt={attempt + 1}, model="
-                f"{settings.llm_model_synthesis or settings.llm_model}, "
-                f"requested_max_tokens={settings.llm_synthesis_max_tokens}: "
-                f"invalid JSON{' (looks truncated)' if truncated else ''}"
-            )
-            if diagnostics is not None:
-                diagnostics.append(diagnostic)
-            _log.warning(
-                "korean synthesis reply was not valid JSON (attempt %d)%s: %r",
-                attempt + 1,
-                " — looks TRUNCATED (completion cap?)" if truncated else "",
-                text[:160],
-            )
-    return None
-
-
-def _synthesis_evidence_json(evidence: dict, max_chars: int) -> str:
-    """Serialize the synthesis evidence to VALID JSON within max_chars.
-
-    A blunt string slice would cut the JSON mid-structure and hand the model
-    malformed evidence (unterminated string / unbalanced braces). Instead drop
-    whole collector_findings entries from the END — the lowest-priority,
-    most-likely-NO_EVIDENCE collectors, whose summaries still live in the
-    deterministic detail — and re-serialize, so the JSON stays well-formed and
-    the leading reasoning inputs (operator_guidance, ranked cause, graph/KG
-    remediation) are always intact. The non-collector part is bounded by
-    construction (short_sentence caps, compact), so it fits well under the cap."""
-    findings = evidence.get("collector_findings")
-    text = json.dumps(evidence, ensure_ascii=False, default=str)
-    while len(text) > max_chars and isinstance(findings, list) and findings:
-        findings = findings[:-1]
-        evidence = {**evidence, "collector_findings": findings}
-        text = json.dumps(evidence, ensure_ascii=False, default=str)
-    return text
 
 
 def _synthesis_collector_findings(
@@ -4162,14 +4034,27 @@ def _failure_mode_root_cause_statement(
     top_family = candidates[0].family if candidates else ""
     if not _top_family_settled(candidates):
         matches = []
+    curated = ""
     for _family, symptom in matches:
         if top_family and _family != top_family:
             continue
         reason = str(symptom.get("reason_ko" if language == "ko" else "reason") or "").strip()
         if reason:
-            statement = reason
+            curated = reason
             break
+    if curated:
+        # A curated reason is already mechanism-level; the observed detail sharpens
+        # it with the concrete object from this incident.
+        detail = _specific_cause_statement(
+            candidates[0] if candidates else None,
+            results or [],
+            eligible_evidence_ids,
+            language=language,
+            request=request,
+        )
+        statement = f"{curated} {detail}" if detail else curated
     else:
+        # _ranked_root_cause_statement already folds the observed detail in.
         statement = _ranked_root_cause_statement(
             candidates,
             request,
@@ -4177,15 +4062,6 @@ def _failure_mode_root_cause_statement(
             eligible_evidence_ids=eligible_evidence_ids,
             language=language,
         )
-    if matches:
-        detail = _specific_cause_statement(
-            candidates[0] if candidates else None,
-            results or [],
-            eligible_evidence_ids,
-            language=language,
-        )
-        if detail:
-            statement = f"{statement} {detail}"
     provenance = _runtime_failure_mode_provenance(matches, candidates)
     return f"{statement} ({provenance})" if provenance else statement
 
@@ -4525,46 +4401,6 @@ def _general_guidance_heading(language: str) -> str:
         if language == "ko"
         else "## General Troubleshooting Guidance (Not a Current RCA Conclusion)"
     )
-
-
-async def _translate_playbook_ko(settings: Settings, detail: str) -> str:
-    """Translate ONLY the Troubleshooting Playbook section to Korean.
-
-    The deterministic fallback report splices curated KB text (known issues /
-    failure-mode actions) in verbatim English. One bounded LLM call fixes the
-    operator-facing section; on any failure the English original stays (honest
-    degradation, same as synthesis itself)."""
-    marker = "\n### Troubleshooting Playbook\n"
-    start = detail.find(marker)
-    if start < 0:
-        return detail
-    body_start = start + len(marker)
-    end = detail.find("\n### ", body_start)
-    if end < 0:
-        end = len(detail)
-    block = detail[body_start:end].strip()
-    if not block:
-        return detail
-    system = (
-        "다음 마크다운 트러블슈팅 지침을 자연스러운 한국어로 번역하세요. "
-        "목록 구조·볼드·들여쓰기를 그대로 유지하고, 백틱 안의 명령어, 리소스/메트릭 "
-        "이름, 제품명(Run:ai, Prometheus, Thanos 등), 버전 표기는 원문 그대로 두세요. "
-        "설명을 추가하지 말고 번역문만 출력하세요."
-    )
-    try:
-        translated = await complete(
-            settings,
-            system=system,
-            user=block,
-            max_tokens=1600,
-            model=getattr(settings, "llm_model_insight", "") or None,
-        )
-    except Exception:  # noqa: BLE001 - translation is best-effort polish
-        return detail
-    if not translated or not translated.strip():
-        return detail
-    translated = _build_settings_masker(settings).mask_text(translated.strip())
-    return f"{detail[:body_start]}\n{translated}\n{detail[end:]}"
 
 
 def _insert_before_appendix(detail: str, block: str) -> str:
@@ -5540,14 +5376,28 @@ def _ranked_root_cause_statement(
             "at a specific cause; the collected signals are inconclusive.",
             limit=320,
         )
-    if language == "ko":
-        explanation = _FAMILY_EXPLANATION_KO.get(top.family) or _family_label(top.family)
+    explanation = (
+        _FAMILY_EXPLANATION_KO.get(top.family)
+        if language == "ko"
+        else _FAMILY_EXPLANATION.get(top.family)
+    ) or _family_label(top.family)
+    detail = _specific_cause_statement(
+        top, results or [], eligible_evidence_ids, language=language, request=request
+    )
+    # The concrete mechanism is what an operator can act on, so it leads and the
+    # ranked family stays as the classification behind it.  Without one, the
+    # family sentence is all we honestly have.
+    if detail:
+        statement = (
+            f"{subject} {detail} (분류: {explanation})"
+            if language == "ko"
+            else f"{subject} {detail} (Classification: {explanation}.)"
+        )
+    elif language == "ko":
         statement = f"{subject} 가장 가능성 높은 원인은 {explanation}입니다."
     else:
-        explanation = _FAMILY_EXPLANATION.get(top.family) or _family_label(top.family)
         statement = f"{subject} Likely cause: {explanation}."
-    detail = _specific_cause_statement(top, results or [], eligible_evidence_ids, language=language)
-    return _short_sentence(f"{statement} {detail}" if detail else statement, limit=320)
+    return _short_sentence(statement, limit=320)
 
 
 _TYPED_MECHANISM_REASON = re.compile(
@@ -5574,15 +5424,100 @@ def _specific_cause_statement(
     eligible_evidence_ids: set[str] | None,
     *,
     language: str,
+    request: AlertAnalysisRequest | None = None,
 ) -> str:
-    """Render a closed-vocabulary typed-state detail from eligible message fields only."""
+    """Render a closed-vocabulary typed-state detail from eligible message fields only.
+
+    The typed mechanism is the primary source, but ranking can also settle on a
+    family through a Warning event or an explicit alert signature. Those runs
+    carry the same dispositive reason token in eligible evidence, so they get the
+    same deterministic mechanism sentence instead of a family-level headline.
+    """
     if top is None or not eligible_evidence_ids:
         return ""
     matched = _TYPED_MECHANISM_REASON.match(str(top.mechanism or "").strip())
-    if not matched:
+    if matched:
+        reason = matched.group(1)
+        observations = _typed_reason_observations(results, eligible_evidence_ids, reason)
+        return _reason_specific_detail(
+            reason, observations, results, eligible_evidence_ids, language=language
+        )
+    family = str(getattr(top, "family", "") or "")
+    for reason in _dispositive_reason_order(family):
+        observations = _typed_reason_observations(results, eligible_evidence_ids, reason)
+        if observations:
+            return _reason_specific_detail(
+                reason, observations, results, eligible_evidence_ids, language=language
+            )
+    if request is None:
         return ""
-    reason = matched.group(1)
-    observations = _typed_reason_observations(results, eligible_evidence_ids, reason)
+    for reason in _asserted_signature_reasons(results, eligible_evidence_ids, family):
+        observations = [
+            (reason, text, None, {}) for text in _asserted_alert_texts(request)
+        ]
+        detail = _reason_specific_detail(
+            reason, observations, results, eligible_evidence_ids, language=language
+        )
+        if detail:
+            return detail
+    return ""
+
+
+def _dispositive_reason_order(family: str) -> list[str]:
+    """Dispositive reasons for a family, deepest mechanism first.
+
+    ``CrashLoopBackOff`` only says the container keeps restarting; when a more
+    specific reason is also present it is the one worth reporting.
+    """
+    reasons = _DISPOSITIVE_TYPED_REASONS.get(family) or frozenset()
+    return sorted(reasons, key=lambda reason: (reason == "CrashLoopBackOff", reason))
+
+
+def _asserted_signature_reasons(
+    results: list[CollectorResult], eligible_evidence_ids: set[str], family: str
+) -> list[str]:
+    """Reason tokens the alert payload itself asserted for this family.
+
+    Only markers carried by an *eligible* ``alert_signature`` artifact count, and
+    only those that are also dispositive typed reasons — the alert text is never
+    re-scanned here, so probe/runbook wording cannot reach the headline.
+    """
+    dispositive = _DISPOSITIVE_TYPED_REASONS.get(family) or frozenset()
+    if not dispositive:
+        return []
+    predicate = f"alert_signature:{family}"
+    signals: list[str] = []
+    for result in results:
+        for item in result.artifacts:
+            if str(getattr(item, "evidence_id", "") or "") not in eligible_evidence_ids:
+                continue
+            if getattr(item, "type", "") != "alert_signature":
+                continue
+            payload = getattr(item, "result", None)
+            if not isinstance(payload, dict):
+                continue
+            observation = payload.get("observation")
+            if not (
+                isinstance(observation, dict)
+                and observation.get("predicate") == predicate
+                and observation.get("polarity") == "present"
+            ):
+                continue
+            for signal in payload.get("matched_signals") or []:
+                marker = str(signal)
+                if marker in dispositive and marker not in signals:
+                    signals.append(marker)
+    return sorted(signals, key=lambda reason: (reason == "CrashLoopBackOff", reason))
+
+
+def _reason_specific_detail(
+    reason: str,
+    observations: list[tuple[str, str, object | None, dict[str, Any]]],
+    results: list[CollectorResult],
+    eligible_evidence_ids: set[str],
+    *,
+    language: str,
+) -> str:
     if reason == "CrashLoopBackOff":
         terminated = _typed_last_terminated_observations(results, eligible_evidence_ids)
         deeper = next(

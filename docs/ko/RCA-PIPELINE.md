@@ -67,7 +67,7 @@ flowchart TB
 | Evidence | plan → collector artifact | 출처별 실패는 partial/unavailable evidence가 됨 |
 | Rank | artifact → 순서가 있는 후보 | 시그니처도 live evidence의 뒷받침이 필요 |
 | Self-check | 선두 후보 → 주의 사항/재분석 필요 여부 | LLM은 선택 사항이며 deadline이 추가 작업을 제한 |
-| Synthesize | evidence → 운영자가 읽는 RCA | 24k evidence 예산, 사실을 만들지 않음 |
+| Synthesize | evidence → 운영자가 읽는 RCA | 결정론적 리포트, ko 한국어화는 산문 라인만 번역 |
 | Harness | 초안 → 수정/신뢰도 하향/보류 응답 | hard evidence gate는 `insufficient_evidence`를 반환할 수 있음 |
 
 ```mermaid
@@ -256,12 +256,18 @@ TypeDB가 꺼져 있거나 도달 불가능할 때는 빈 값으로 저하되며
 
 `_detail_from`은 결정론적 리포트를 구성합니다 — **Problem → Root Cause →
 Recommended Actions → Appendix** — 운영자(또는 Word 내보내기)가 읽는 약 1페이지 분량의
-문서입니다. `language=ko`이고 LLM이 구성된 경우, `_synthesize_korean`이 요약 + 상세를 **엄격히**
-증거에 근거하여 다시 작성하며, 어떤 실패든 발생하면 결정론적 영어 리포트로 폴백(fallback)합니다.
+문서입니다. 이 리포트의 모든 결론은 코드가 만들며, LLM이 리포트를 저작하지 않습니다.
 
-Synthesis는 수집기 역할마다 최대 6개의 artifact를 받아 salience 우선으로 선택하되 최신 artifact는
-항상 유지하며, 증거 예산은 24,000자입니다. 회의적인 self-check도 같은 선택 규칙과 별도의
-24,000자 전체 라인 digest 상한을 사용합니다.
+`language=ko`이고 LLM이 구성된 경우 `_translate_report_lines_ko`가 **가장 마지막에** 실행됩니다 —
+Self-Check, 추가 확인 요청, 일반 가이드 블록까지 덧붙인 뒤 — 리포트를 *줄 단위로* 한국어화합니다.
+한글이 없고 실제 산문인 줄만 전송되며, 헤딩·펜스 블록(Alert Labels JSON 포함)·명령어·식별자만 있는
+줄은 프로세스를 벗어나지 않습니다. 따라서 번역이 결론을 바꾸거나 섹션을 누락시키거나 문서 순서를
+바꾸는 일이 구조적으로 불가능합니다. 줄은 약 2,000자 단위(`_TRANSLATION_BATCH_CHARS`)로 나눠
+보내고 `max_tokens`도 배치 크기에 맞춰 잡습니다 — 긴 리포트를 한 번에 번역하던 방식이 completion
+cap에 걸려 리포트가 들어갈 때보다 짧게 돌아오곤 했기 때문입니다. 응답은 백틱 구간이 한 글자도 바뀌지
+않은 줄만 채택하고, 한 배치가 실패해도 성공한 배치는 유지하며, 번역되지 않은 줄이 하나라도 남으면
+`synthesis_failed` + `analysis_quality=degraded`로 표시합니다. `context.synthesis`에는 `status`,
+`duration_seconds`, `model`, `max_tokens`가 담깁니다.
 
 **Troubleshooting Playbook** 섹션은 연루된 모든 플랫폼 컴포넌트에 대해 그 실패 영향, BFS
 **의존성 점검 순서**(예: `cluster-sync → status-updater → runai-backend-traefik`), 그리고 바로

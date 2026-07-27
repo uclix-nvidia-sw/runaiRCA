@@ -40,6 +40,6 @@ The four meanings must not be conflated: a hypothesis being `supported` in the i
 
 ### `synthesis`
 
-**Definition.** `synthesis` is the stage that generates the final operator-facing report: `synthesize_stage` in `agent/app/services/pipeline.py` builds the deterministic English report, and when configured for Korean it may be overwritten by a Korean LLM report grounded strictly in eligible evidence.
+**Definition.** `synthesis` is the stage that assembles the final operator-facing report: `synthesize_stage` in `agent/app/services/pipeline.py` builds it deterministically from the ranked candidates and eligible evidence. When configured for Korean, the LLM only translates the report's English prose lines in batches — it never authors, re-judges, or restructures the report.
 
 **Where you see it.** As the `synthesize` pipeline stage and in the final report summary, detail, actions, caveats, and evidence presentation.

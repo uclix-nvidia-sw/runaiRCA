@@ -650,3 +650,58 @@ def test_generic_alert_with_target_verified_support_passes_gate() -> None:
 
     verdict = evaluate(_response(), results, [cause], generic_state_alert=True)
     assert verdict.gates["generic_alert_without_target_evidence"] is False
+
+
+@pytest.mark.asyncio
+async def test_abstain_strips_the_specific_cause_from_the_headline() -> None:
+    # A generic state alert with only its own signature card has no
+    # target-verified observation, so the harness abstains. The concrete
+    # mechanism sentence must not survive that demotion.
+    settings = replace(make_settings(), enable_rca_output_harness=True)
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "KubeContainerWaiting"},
+            annotations={
+                "description": 'CreateContainerConfigError: secret "app-secret" not found'
+            },
+            fingerprint="fp-1",
+        )
+    )
+    state = pipeline.new_state(settings, request, collectors=[])
+    signature = artifact(
+        agent="alert",
+        source="alertmanager",
+        type="alert_signature",
+        status="ok",
+        confidence="high",
+        summary="Alert payload explicitly reported CreateContainerConfigError.",
+        result={
+            "matched_signals": ["CreateContainerConfigError"],
+            "observation": {
+                "predicate": "alert_signature:workload_startup_error",
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "alert", "name": "fp-1"},
+            },
+        },
+    )
+    result = CollectorResult(
+        agent="alert", status="ok", summary="alert signature", artifacts=[signature]
+    )
+    assign_evidence_ids([result])
+    state.results = [result]
+    state.root_cause_candidates = [
+        RankedCause("workload_startup_error", "high", 8.0, evidence_agents=["alert"])
+    ]
+    state.response = _response("## Root Cause\n\nSecret 'app-secret' is missing.")
+    state.response.analysis_summary = "Secret 'app-secret' is missing."
+
+    await pipeline.harness_stage(state)
+
+    assert state.response.root_cause_family == "insufficient_evidence"
+    assert not state.response.specific_cause
+    # The alert's own text may still be echoed as the subject; what must be gone
+    # is any claim about what caused it.
+    assert "Specifically," not in state.response.analysis_summary
+    assert "Insufficient evidence" in state.response.analysis_summary

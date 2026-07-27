@@ -70,7 +70,7 @@ fast-but-shallow); the overall deadline is the real bound. The backend's
 | Evidence | Plan → collector artifacts | Per-source failure becomes partial/unavailable evidence |
 | Rank | Artifacts → ordered candidates | Signatures still need supporting live evidence |
 | Self-check | Leading candidate → caveat/re-analysis need | LLM is optional; deadline bounds extra work |
-| Synthesize | Evidence → operator-readable RCA | 24k evidence budget; no invented facts |
+| Synthesize | Evidence → operator-readable RCA | Deterministic report; ko localization translates prose lines only |
 | Harness | Draft → repaired, downgraded, or abstained response | Hard evidence gate can return `insufficient_evidence` |
 
 ```mermaid
@@ -287,14 +287,22 @@ Degrades to empty when TypeDB is off/unreachable; never raises.
 
 `_detail_from` builds the deterministic report — **Problem → Root Cause →
 Recommended Actions → Appendix** — the ~1-page document an operator (or a Word
-export) reads. When `language=ko` and an LLM is configured, `_synthesize_korean`
-rewrites summary + detail grounded **strictly** in the evidence, falling back to
-the deterministic English report on any failure.
+export) reads. Every conclusion in it is produced by code; no LLM authors the
+report.
 
-Synthesis receives up to six artifacts per collector role, selected salience-first
-while always retaining the newest artifact, under a 24,000-character evidence
-budget. The skeptical self-check uses the same selection and a separate
-24,000-character whole-line digest cap.
+When `language=ko` and an LLM is configured, `_translate_report_lines_ko` runs
+**last** — after the Self-Check, operator-question and general-guidance blocks
+are appended — and localizes the report *line by line*. Only lines with no
+Korean text and real prose are sent: headings, fenced blocks (including the
+Alert Labels JSON), commands and identifier-only lines never leave the process,
+so a translation cannot change a conclusion, drop a section, or reorder the
+document. Lines go out in ~2,000-character batches (`_TRANSLATION_BATCH_CHARS`)
+with `max_tokens` scaled to each batch, because one reply covering a long report
+used to hit the completion cap and come back shorter than it went in. A reply is
+accepted per line only when every backtick span survives verbatim; batches that
+succeed are kept even if another fails, and any line left untranslated marks the
+run `synthesis_failed` with `analysis_quality=degraded`. `context.synthesis`
+carries `status`, `duration_seconds`, `model` and `max_tokens`.
 
 The **Troubleshooting Playbook** section appends, for any implicated platform
 component, its failure effect, its BFS **dependency check order** (e.g.
