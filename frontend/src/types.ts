@@ -302,6 +302,9 @@ export type KnowledgeCandidate = {
   candidate_id: string;
   status: string;
   payload?: { mechanism?: string; matcher_only?: boolean; novelty?: string; compiled?: CompiledKnowledge };
+  // Sanitized reasoning-trace-v3 excerpt: identifies which diagnostic probes
+  // backed this candidate (never carries queries or raw tool output).
+  trace?: { probe_executions?: Array<{ template_id?: string; tool?: string; verdict?: string }> };
   title?: string;
   summary?: string;
   root_cause_family?: string;
