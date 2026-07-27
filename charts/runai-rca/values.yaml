@@ -580,7 +580,11 @@ frontend:
     pullPolicy: IfNotPresent
   service:
     annotations: {}
-    type: ClusterIP
+    # NodePort pinned to 30006 so the dashboard address survives reinstalls
+    # (random NodePorts changed it on every release). The Ingress below is the
+    # named-URL path; this stays as the direct/stable fallback.
+    type: NodePort
+    nodePort: 30006
     port: 80
   config:
     apiBaseUrl: ""
@@ -610,8 +614,13 @@ frontend:
   extraEnv: []
   resources: {}
 
+# Dashboard URL entry point: routes the host to the frontend Service (whose
+# nginx already proxies /api, /webhook and /api-docs to the backend, long
+# timeouts included for SSE). Enabled by default — set hosts[0].host to the
+# URL you assign; the pinned frontend NodePort (30006) remains as the direct
+# fallback while DNS/ingress rolls out.
 ingress:
-  enabled: false
+  enabled: true
   className: ""
   annotations: {}
   hosts:
