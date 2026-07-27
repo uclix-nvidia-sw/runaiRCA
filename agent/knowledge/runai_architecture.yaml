@@ -24,6 +24,29 @@
 
 # --- cluster side (namespace: runai) ----------------------------------------
 
+# TODO(owner-review): purpose drafted 2026-07-27
+- component: application-controller
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Run:ai application controller"
+  failure_effect: "Run:ai application controller unavailable."
+  depends_on: []
+  services: [application-controller]
+  checks:
+    - "kubectl logs -n runai deploy/application-controller --tail=200"
+
+# TODO(owner-review): purpose drafted 2026-07-27
+- component: init-ca
+  layer: cluster
+  namespace: runai
+  kind: Deployment
+  purpose: "Run:ai certificate authority initialization service"
+  failure_effect: "Run:ai certificate initialization unavailable."
+  depends_on: []
+  checks:
+    - "kubectl logs -n runai deploy/init-ca --tail=200"
+
 - component: runai-agent
   layer: cluster
   namespace: runai
@@ -301,6 +324,7 @@
   purpose: "Run:ai's bundled Prometheus: scrapes cluster/GPU metrics and remote-writes them to the control plane (thanos-receive)."
   failure_effect: "ALL UI metrics stop (dashboards empty) while the cluster itself is healthy; gaps if remote_write backlogs."
   depends_on: [runai-backend-thanos-receive, runai-node-exporter, metrics-exporter]
+  services: [prometheus-operated]
   checks:
     - "kubectl logs -n runai sts/prometheus-runai --tail=200 | grep -i 'remote_write\\|error'"
     - "kubectl get pvc -n runai | grep prometheus"
@@ -445,6 +469,7 @@
   purpose: "Identity provider (logins, tokens, SSO/OIDC/SAML federation)."
   failure_effect: "Nobody can log in; CLI/agent tokens rejected platform-wide (401s everywhere)."
   depends_on: [runai-backend-postgres]
+  services: [keycloak-headless, keycloak-http]
   checks:
     - "kubectl logs -n runai-backend sts/keycloak --tail=200"
 
@@ -604,6 +629,7 @@
   purpose: "Receives remote-written metrics from every cluster's prometheus-runai; persists to its PVC."
   failure_effect: "Metrics stop for ALL clusters (storage full/OOM are the classic causes)."
   depends_on: []
+  services: [runai-backend-thanos-receive]
   checks:
     - "kubectl logs -n runai-backend sts/runai-backend-thanos-receive --tail=200"
     - "kubectl get pvc -n runai-backend | grep thanos"
@@ -615,6 +641,7 @@
   purpose: "Query layer over thanos-receive."
   failure_effect: "Dashboards empty/slow while ingestion continues fine."
   depends_on: [runai-backend-thanos-receive]
+  services: [runai-backend-thanos-query, runai-backend-thanos-query-grpc]
   checks:
     - "kubectl logs -n runai-backend deploy/runai-backend-thanos-query --tail=200"
 
@@ -646,6 +673,7 @@
   purpose: "Message bus between control-plane services (events, workload streams)."
   failure_effect: "Cross-service updates stall: workload events not propagating, notifications dead — while HTTP APIs still answer."
   depends_on: []
+  services: [runai-backend-nats, runai-backend-nats-headless]
   checks:
     - "kubectl logs -n runai-backend sts/runai-backend-nats --tail=200"
 
@@ -689,6 +717,42 @@
   depends_on: [runai-backend-postgres]
   checks:
     - "kubectl logs -n runai-backend deploy/runai-backend-catalog-service --tail=100"
+
+# TODO(owner-review): purpose drafted 2026-07-27
+- component: runai-backend-notifications-proxy
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  purpose: "Run:ai backend notifications proxy"
+  failure_effect: "Run:ai backend notification proxy unavailable."
+  depends_on: [runai-backend-notifications-service]
+  services: [runai-backend-notifications-proxy]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-notifications-proxy --tail=100"
+
+# TODO(owner-review): purpose drafted 2026-07-27
+- component: runai-backend-org-unit-helper
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  purpose: "Run:ai backend organization unit helper"
+  failure_effect: "Run:ai backend organization unit helper unavailable."
+  depends_on: [runai-backend-org-unit-service]
+  services: [runai-backend-org-unit-helper]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-org-unit-helper --tail=100"
+
+# TODO(owner-review): purpose drafted 2026-07-27
+- component: runai-backend-redoc
+  layer: control_plane
+  namespace: runai-backend
+  kind: Deployment
+  purpose: "Run:ai backend API documentation service"
+  failure_effect: "Run:ai backend API documentation unavailable."
+  depends_on: []
+  services: [runai-backend-redoc]
+  checks:
+    - "kubectl logs -n runai-backend deploy/runai-backend-redoc --tail=100"
 
 # --- shared external dependencies -------------------------------------------
 

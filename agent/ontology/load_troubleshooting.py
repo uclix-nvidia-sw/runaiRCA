@@ -24,6 +24,7 @@ import yaml
 
 from app.config import load_settings
 from app.ontology.typedb_client import escape_typeql as esc
+from ontology.normalization import confidence_score
 from app.ontology.typedb_client import open_driver
 from app.services.decision_tree import load_tree
 from ontology.load_knowledge import FAMILIES
@@ -273,7 +274,9 @@ def _insert_outcome(tx: Any, node: dict[str, Any]) -> int:
         f'match $s isa diagnostic_step, has diagnostic_id "{esc(step_id)}"; '
         f'$c isa {family}, has subtype "{esc(family)}"; '
         f'insert $x isa diagnostic_outcome(step: $s, cause: $c), '
-        f'has summary "{esc(summary)}", has confidence "{esc(confidence)}";'
+        f'has summary "{esc(summary)}", has confidence "{esc(confidence)}"'
+        + (f", has confidence_score {score}" if (score := confidence_score(confidence)) is not None else "")
+        + ";"
     ).resolve()
     disconfirm = conclusion.get("disconfirm") or []
     if not isinstance(disconfirm, list):

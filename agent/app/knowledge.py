@@ -659,6 +659,7 @@ def load_architecture(path: str) -> dict[str, dict[str, Any]]:
             "family": str(entry.get("family") or ""),
             "owns_schema": str(entry.get("owns_schema") or ""),
             "depends_on": [str(d) for d in (entry.get("depends_on") or [])],
+            "services": [str(s) for s in (entry.get("services") or [])],
             "checks": [str(c) for c in (entry.get("checks") or [])],
             "saas_only": bool(entry.get("saas_only")),
         }

@@ -15,7 +15,7 @@ from typing import Any
 from app.config import load_settings
 from app.ontology.typedb_client import escape_typeql as esc
 from app.ontology.typedb_client import open_driver
-from ontology.ingest import _ensure, _replace_attr
+from ontology.ingest import _ensure, _iso_or_empty, _replace_attr
 
 _SELECT_PACKAGES = """
 SELECT p.package_id, p.case_id, p.status, p.payload, p.published_at::text AS published_at,
@@ -147,8 +147,8 @@ def _write_package(tx: Any, row: dict[str, Any]) -> tuple[int, int]:
         "title": str(payload.get("title") or ""),
         "summary": str(payload.get("summary") or ""),
         "hypothesis_family": str(payload.get("family") or ""),
-        "package_published_at": str(row.get("published_at") or ""),
-        "package_retired_at": str(row.get("retired_at") or ""),
+        "package_published_at": _iso_or_empty(row.get("published_at")),
+        "package_retired_at": _iso_or_empty(row.get("retired_at")),
     }.items():
         if value:
             _replace_attr(tx, "knowledge_package", "package_id", package_id, attr, value)

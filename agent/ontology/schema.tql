@@ -40,6 +40,7 @@ attribute node_name, value string;
 attribute source, value string;
 attribute summary, value string;
 attribute confidence, value string;
+attribute confidence_score, value double;
 attribute blast_radius, value string;
 attribute subtype, value string;
 attribute statement, value string;
@@ -68,6 +69,7 @@ attribute analysis_hash, value string;
 attribute diagnosis_state, value string;
 attribute harness_status, value string;
 attribute harness_score, value integer;
+# ISO-8601 UTC timestamp string (for example 2026-07-27T00:00:00Z).
 attribute approved_at, value string;
 attribute outcome, value string;
 attribute case_id, value string;
@@ -110,14 +112,17 @@ attribute predicate, value string;
 attribute observed_value, value string;
 attribute polarity, value string;
 attribute coverage, value string;
+# ISO-8601 UTC timestamp strings (for example 2026-07-27T00:00:00Z).
 attribute observed_window_start, value string;
 attribute observed_window_end, value string;
 attribute quality, value string;
+# ISO-8601 UTC timestamp string (for example 2026-07-27T00:00:00Z).
 attribute executed_at, value string;
 attribute trace_stop_reason, value string;
 attribute rejection_reason, value string;
 attribute package_id, value string;
 attribute package_status, value string;
+# ISO-8601 UTC timestamp strings (for example 2026-07-27T00:00:00Z).
 attribute package_published_at, value string;
 attribute package_retired_at, value string;
 attribute package_template_binding_id, value string;
@@ -171,7 +176,7 @@ entity pvc,
 # (description), failure effect, dependency edges, control-plane DB schema
 # ownership, and ready-to-run checks.
 entity control_plane_component,
-    owns name,
+    owns name @key,
     owns layer,
     owns k8s_namespace,
     owns description,
@@ -217,13 +222,16 @@ entity analysis_run,
     owns source,
     owns status,
     owns confidence,
+    owns confidence_score,
     owns trace_stop_reason,
     plays analyzed_by:run,
     plays diagnosis:run,
     plays hypothesis_for:run;
 
-entity symptom,
-    owns name,
+entity signal @abstract;
+
+entity symptom sub signal,
+    owns name @key,
     owns reason,
     owns reason_ko @card(0..1),
     owns name_ko @card(0..1),
@@ -306,7 +314,7 @@ entity platform_auth_error sub root_cause;     # login/permissions/SAML/OIDC/JWT
 entity platform_lifecycle_change sub root_cause;
 
 entity action,
-    owns statement,
+    owns statement @key,
     plays resolved_by:remedy,
     plays resolution:remedy,
     plays diagnostic_recommendation:remedy;
@@ -319,6 +327,7 @@ entity evidence,
     owns source,
     owns summary,
     owns confidence,
+    owns confidence_score,
     # Trace-v3 evidence metadata is populated only from explicit trace fields;
     # legacy artifacts intentionally remain unannotated rather than guessed.
     owns observed_entity,
@@ -335,6 +344,11 @@ entity evidence,
     plays probe_execution_evidence:proof,
     plays rejected_evidence_link:proof;
 
+entity log_evidence sub evidence;
+entity event_evidence sub evidence;
+entity metric_evidence sub evidence;
+entity state_evidence sub evidence;
+
 # A hypothesis is a run-local, incident-derived candidate. It is never seeded
 # from historical/legacy data, and does not itself assert an RCA.
 entity hypothesis,
@@ -343,6 +357,7 @@ entity hypothesis,
     owns hypothesis_family,
     owns hypothesis_status,
     owns confidence,
+    owns confidence_score,
     owns mechanism,
     owns mechanism_fingerprint,
     owns trace_version,
@@ -433,6 +448,7 @@ relation diagnosis,
     relates incident,
     relates cause,
     owns confidence,
+    owns confidence_score,
     owns diagnosis_state,
     owns analysis_hash,
     owns harness_status,
@@ -458,6 +474,7 @@ relation diagnostic_outcome,
     relates cause,
     owns summary,
     owns confidence,
+    owns confidence_score,
     owns disconfirm @card(0..);
 relation diagnostic_recommendation,
     relates step,
@@ -483,7 +500,7 @@ relation package_has_template, relates package, relates template, relates bindin
 # the gpu_hardware_error root_cause family, and is resolved_by action(s). We
 # reuse the existing `indicates`/`resolved_by`/`action` machinery so the
 # knowledge layer stays uniform — xid_error slots in wherever a symptom does.
-entity xid_error,
+entity xid_error sub signal,
     owns xid_code @key,
     owns xid_trigger @card(0..1),
     owns mnemonic,

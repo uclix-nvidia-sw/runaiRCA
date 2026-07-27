@@ -33,6 +33,22 @@ def test_architecture_loads_and_is_internally_consistent() -> None:
             assert all("kubectl" in c for c in entry["checks"]), name
 
 
+def test_live_roster_additions_and_confirmed_service_names_are_present() -> None:
+    components = load_architecture(ARCHITECTURE)
+    for name in (
+        "application-controller",
+        "init-ca",
+        "runai-backend-notifications-proxy",
+        "runai-backend-org-unit-helper",
+        "runai-backend-redoc",
+    ):
+        assert name in components
+    assert components["keycloak"]["services"] == ["keycloak-headless", "keycloak-http"]
+    assert components["runai-backend-nats"]["services"] == [
+        "runai-backend-nats", "runai-backend-nats-headless"
+    ]
+
+
 def test_key_sync_and_scheduling_paths_are_modeled() -> None:
     components = load_architecture(ARCHITECTURE)
     # The two sync directions the diagrams distinguish:

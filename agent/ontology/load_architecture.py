@@ -71,11 +71,44 @@ def _ensure_component(tx: Any, entry: dict[str, Any]) -> None:
     ).resolve()
     for check in entry.get("checks") or []:
         text = str(check).strip()
-        if not text:
-            continue
+        if text:
+            tx.query(
+                f'match $c isa control_plane_component, has name "{esc(name)}"; '
+                f'insert $c has check_command "{esc(text)}";'
+            ).resolve()
+
+
+def _ensure_service(tx: Any, component: str, namespace: str, service: str) -> None:
+    if not _exists(tx, f'$x isa service, has name "{esc(service)}";'):
+        tx.query(f'insert $x isa service, has name "{esc(service)}";').resolve()
+    if namespace:
         tx.query(
-            f'match $c isa control_plane_component, has name "{esc(name)}"; '
-            f'insert $c has check_command "{esc(text)}";'
+            f'match $s isa service, has name "{esc(service)}", has namespace_name $old; '
+            'delete has $old of $s;'
+        ).resolve()
+        tx.query(
+            f'match $s isa service, has name "{esc(service)}"; '
+            f'insert $s has namespace_name "{esc(namespace)}";'
+        ).resolve()
+    if not _exists(tx, f'$x isa workload, has name "{esc(component)}";'):
+        tx.query(f'insert $x isa workload, has name "{esc(component)}";').resolve()
+    if namespace:
+        tx.query(
+            f'match $w isa workload, has name "{esc(component)}", has namespace_name $old; '
+            'delete has $old of $w;'
+        ).resolve()
+        tx.query(
+            f'match $w isa workload, has name "{esc(component)}"; '
+            f'insert $w has namespace_name "{esc(namespace)}";'
+        ).resolve()
+    if not _exists(
+        tx,
+        f'$s isa service, has name "{esc(service)}"; $w isa workload, has name "{esc(component)}"; '
+        '$x isa exposes, links (endpoint: $s, backend: $w);',
+    ):
+        tx.query(
+            f'match $s isa service, has name "{esc(service)}"; $w isa workload, has name "{esc(component)}"; '
+            'insert (endpoint: $s, backend: $w) isa exposes;'
         ).resolve()
 
 
@@ -112,6 +145,8 @@ def main() -> int:
         with driver.transaction(settings.typedb_database, TransactionType.WRITE) as tx:
             for entry in components.values():
                 _ensure_component(tx, entry)
+                for service in entry.get("services") or []:
+                    _ensure_service(tx, entry["component"], str(entry.get("namespace") or ""), str(service))
                 loaded += 1
             # Second pass so every dependency target exists before relating.
             for entry in components.values():

@@ -94,6 +94,12 @@ global family. `indicates` and `resolved_by` are the knowledge chain
 to the symptoms it exhibited. `resolution` is written only when an operator
 records `resolved` or `mitigated`.
 
+The current schema has **16 operational families + 3 auxiliary states**: the
+16 `failure_modes.yaml` families are operator-facing, while
+`platform_version_bug`, `expected_known_behavior`, and `insufficient_evidence`
+are supporting classification states. That is 19 `root_cause` subtypes total;
+the closed vocabulary is intentionally unchanged.
+
 Runbooks appear twice on purpose: one *executable* runbook holds every
 diagnostic step (the walk and all probe IDs live there), and per-domain
 runbooks (`…:domain:gpu_stack`, `…:domain:runai_scheduling`, …) group the same

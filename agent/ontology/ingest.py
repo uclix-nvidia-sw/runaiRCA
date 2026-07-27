@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import re
 import sys
 from datetime import datetime
@@ -32,6 +33,7 @@ from app.collectors.base import resolve_target
 from app.config import load_settings
 from app.knowledge import load_family_catalog
 from app.ontology.typedb_client import escape_typeql as esc
+from app.masking import build_masker
 from ontology.incident import OntologyIncident
 from ontology.load_knowledge import (
     _ensure_action,
@@ -40,6 +42,10 @@ from ontology.load_knowledge import (
     _relate_indicates,
     _relate_resolved_by,
 )
+from ontology.normalization import confidence_score
+
+_log = logging.getLogger(__name__)
+_MASKER = build_masker((r"\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b",))
 
 _SELECT_INCIDENTS = """
 SELECT i.incident_id, i.correlation_key, i.title, i.severity, i.status,
@@ -420,11 +426,49 @@ def _replace_attr(
         f'match $x isa {etype}, has {key_attr} "{esc(key_value)}", has {attr} $old; '
         f"delete has $old of $x;"
     ).resolve()
+    if attr == "confidence":
+        score = confidence_score(new_value)
+        if score is not None and etype in {"analysis_run", "evidence", "hypothesis", "root_cause"}:
+            _replace_attr(tx, etype, key_attr, key_value, "confidence_score", score, quoted=False)
     value = f'"{esc(str(new_value))}"' if quoted else str(new_value)
     tx.query(
         f'match $x isa {etype}, has {key_attr} "{esc(key_value)}"; '
         f"insert $x has {attr} {value};"
     ).resolve()
+
+
+def _iso_or_empty(value: object) -> str:
+    """Keep only ISO-8601 UTC strings; string-backed schema stays compatible."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        _log.warning("dropping malformed ontology timestamp: %r", text)
+        return ""
+    if parsed.tzinfo is None or parsed.utcoffset() is None or parsed.utcoffset().total_seconds() != 0:
+        _log.warning("dropping non-UTC ontology timestamp: %r", text)
+        return ""
+    return text
+
+
+def _safe_text(value: object, limit: int) -> str:
+    return " ".join(_MASKER.mask_text(str(value or "")).split())[:limit]
+
+
+def _evidence_type(item: dict[str, Any]) -> str:
+    source = f"{item.get('source') or item.get('agent') or ''} {item.get('source_group') or ''}".lower()
+    predicate = str(item.get("predicate") or "").lower()
+    if "loki" in source:
+        return "log_evidence"
+    if "prometheus" in source:
+        return "metric_evidence"
+    if "event" in source or "event" in predicate:
+        return "event_evidence"
+    if source or predicate:
+        return "state_evidence"
+    return "evidence"
 
 
 def _relate(
@@ -535,6 +579,16 @@ def _ensure_diagnosis(
             f"match {match} $d isa diagnosis, links (run: $r, incident: $i, cause: $c), has {attr} $old; "
             f"delete has $old of $d;"
         ).resolve()
+    score = confidence_score(confidence)
+    if score is not None:
+        tx.query(
+            f"match {match} $d isa diagnosis, links (run: $r, incident: $i, cause: $c), has confidence_score $old; "
+            "delete has $old of $d;"
+        ).resolve()
+        tx.query(
+            f"match {match} $d isa diagnosis, links (run: $r, incident: $i, cause: $c); "
+            f"insert $d has confidence_score {score};"
+        ).resolve()
         literal = value if attr == "harness_score" else f'"{esc(value)}"'
         tx.query(
             f"match {match} $d isa diagnosis, links (run: $r, incident: $i, cause: $c); "
@@ -547,12 +601,12 @@ def _ensure_evidence(tx: Any, inc: OntologyIncident, item: dict[str, Any]) -> st
     if not inc.run_id or not evidence_id:
         return ""
     key = f"{inc.run_id}:{evidence_id}"
-    _ensure(tx, "evidence", "evidence_id", key)
+    _ensure(tx, _evidence_type(item), "evidence_id", key)
     values = {
         "artifact_ref": key,
         "source": str(item.get("source") or item.get("agent") or ""),
         "evidence_type": str(item.get("type") or ""),
-        "summary": " ".join(str(item.get("summary") or "").split())[:1200],
+        "summary": _safe_text(item.get("summary"), 1200),
         "confidence": str(item.get("confidence") or "low"),
     }
     for attr, value in values.items():
@@ -586,7 +640,7 @@ def _ensure_trace_evidence(tx: Any, inc: OntologyIncident, item: dict[str, Any])
     if not local_id:
         return ""
     evidence_id = _trace_key(inc, local_id)
-    _ensure(tx, "evidence", "evidence_id", evidence_id)
+    _ensure(tx, _evidence_type(item), "evidence_id", evidence_id)
     # Every field below is supplied by the trace-v3 evidence object itself.
     # In particular, do not copy these values from an artifact or a v1/v2 trace.
     window = item.get("observation_window")
@@ -594,16 +648,16 @@ def _ensure_trace_evidence(tx: Any, inc: OntologyIncident, item: dict[str, Any])
     values = {
         "artifact_ref": local_id,
         "trace_local_id": local_id,
-        "source": _trace_text(item.get("source"), 120),
-        "observed_entity": _trace_text(item.get("entity"), 300),
-        "source_group": _trace_text(item.get("source_group"), 120),
-        "predicate": _trace_text(item.get("predicate"), 300),
-        "observed_value": _trace_text(item.get("value"), 500),
+        "source": _safe_text(item.get("source"), 120),
+        "observed_entity": _safe_text(item.get("entity"), 300),
+        "source_group": _safe_text(item.get("source_group"), 120),
+        "predicate": _safe_text(item.get("predicate"), 300),
+        "observed_value": _safe_text(item.get("value"), 500),
         "polarity": _trace_text(item.get("polarity"), 80),
         "coverage": _trace_text(item.get("coverage"), 120),
         "quality": _trace_text(item.get("quality"), 120),
-        "observed_window_start": _trace_text(window.get("start"), 80),
-        "observed_window_end": _trace_text(window.get("end"), 80),
+        "observed_window_start": _iso_or_empty(window.get("start")),
+        "observed_window_end": _iso_or_empty(window.get("end")),
     }
     for attr, value in values.items():
         if value:
@@ -737,7 +791,7 @@ def _write_trace_v3_projection(tx: Any, inc: OntologyIncident) -> None:
         for attr, value in {
             "trace_local_id": local_execution_id,
             "probe_verdict": _trace_text(item.get("verdict"), 80),
-            "executed_at": _trace_text(item.get("executed_at"), 80),
+            "executed_at": _iso_or_empty(item.get("executed_at")),
         }.items():
             if value:
                 _replace_attr(tx, "probe_execution", "probe_execution_id", execution_id, attr, value)
@@ -819,7 +873,8 @@ def _ensure_case_projection(tx: Any, inc: OntologyIncident, family: str) -> None
     if inc.analysis_hash:
         _replace_attr(tx, "case_snapshot", "case_id", inc.case_id, "analysis_hash", inc.analysis_hash)
     if inc.user_approved_at:
-        _replace_attr(tx, "case_snapshot", "case_id", inc.case_id, "approved_at", inc.user_approved_at)
+        if approved_at := _iso_or_empty(inc.user_approved_at):
+            _replace_attr(tx, "case_snapshot", "case_id", inc.case_id, "approved_at", approved_at)
     # Keep the immutable approval record self-describing for the retrieval
     # projection. Empty mechanism values are represented inside case_card rather
     # than forced as TypeDB attributes, so legacy snapshots remain queryable.
@@ -1046,12 +1101,12 @@ def _write_incident(tx: Any, inc: OntologyIncident) -> None:
         ("severity", inc.severity),
         ("status", inc.status),
         ("correlation_key", inc.correlation_key),
-        ("analysis_summary", inc.analysis_summary),
+        ("analysis_summary", _safe_text(inc.analysis_summary, 1200)),
     ):
         _replace_attr(tx, "incident", "incident_id", inc.incident_id, attr, value)
-    if inc.user_approved_at:
+    if approved_at := _iso_or_empty(inc.user_approved_at):
         _replace_attr(
-            tx, "incident", "incident_id", inc.incident_id, "approved_at", inc.user_approved_at
+            tx, "incident", "incident_id", inc.incident_id, "approved_at", approved_at
         )
 
     # alert attributes + grouped_into(incident, alert). Replace-in-place (like the

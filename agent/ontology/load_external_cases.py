@@ -52,6 +52,7 @@ from ontology.load_knowledge import (
     _relate_indicates,
     _relate_resolved_by,
 )
+from ontology.normalization import confidence_score
 
 PAYLOAD_NAME = "03_ingestion_payload.yaml"
 # Baked into the agent image (agent/Dockerfile COPYs knowledge/); the Helm
@@ -117,7 +118,7 @@ def _validate(payload: dict[str, Any]) -> str:
 def _confidence_bucket(value: Any) -> str:
     """low|medium|high. Pass valid strings through; bucket numeric confidences."""
     text = str(value or "").strip().lower()
-    if text in {"low", "medium", "high"}:
+    if confidence_score(text) is not None:
         return text
     try:
         num = float(value)

@@ -24,6 +24,11 @@ SCHEMA_FILE = Path(__file__).resolve().parent / "schema.tql"
 # non-fatal: a fresh database has nothing to redefine (define below covers it),
 # and an already-migrated database rejects the no-op redefine.
 SCHEMA_MIGRATIONS = [
+    "redefine control_plane_component owns name @key;",
+    "redefine symptom owns name @key;",
+    "redefine action owns statement @key;",
+    "redefine entity symptom sub signal;",
+    "redefine entity xid_error sub signal;",
     # check_command widened from the implicit @card(0..1): components ship
     # several ready-to-run checks, so the architecture loader could never
     # commit a 2-check component against the old card.
@@ -82,6 +87,12 @@ SCHEMA_MIGRATIONS = [
 # runs_on is wholesale: every pre-migration edge is node->pod, and the next
 # ingest pass rebuilds node->workload edges from the incident store.
 DATA_MIGRATIONS = [
+    # Best-effort legacy de-duplication before each new @key. These are
+    # intentionally independent/non-fatal because old graphs can contain
+    # relation shapes that prevent a generic delete from committing.
+    'match $x isa control_plane_component, has name $n; $y isa control_plane_component, has name $n; $x != $y; delete $y;',
+    'match $x isa symptom, has name $n; $y isa symptom, has name $n; $x != $y; delete $y;',
+    'match $x isa action, has statement $s; $y isa action, has statement $s; $x != $y; delete $y;',
     "match $x isa runs_on; delete $x;",
     "match $x isa scopes; delete $x;",
     "match $x isa belongs_to; delete $x;",
