@@ -403,6 +403,126 @@ def test_kubernetes_drilldown_reuses_base_events_node_and_pod_inspection(monkeyp
     assert len(result.artifacts) == 3
 
 
+def test_deduplicated_declared_probe_replays_against_base_artifacts(monkeypatch) -> None:
+    # The probe's read already ran in the base pass (pod_inspection dedupes the
+    # describe), so the probe must not re-query — but its verdict and
+    # hypothesis link must still be produced from the collected observations.
+    target = replace(_target(), pod="secret-error")
+    lifecycle = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_container_lifecycle",
+        status="ok",
+        confidence="high",
+        summary="container waiting",
+        result={
+            "observation": {"polarity": "present", "coverage": "scoped"},
+            "waiting_reason": "CreateContainerConfigError",
+        },
+    )
+    described = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="pod_inspection",
+        status="ok",
+        confidence="high",
+        query="kubectl describe pod secret-error -n runai-vision",
+        summary="pod described",
+        result={},
+    )
+    result = CollectorResult(
+        agent="kubernetes", status="ok", summary="base", artifacts=[lifecycle, described]
+    )
+    plan = InvestigationPlan(
+        diagnostic_directive={
+            "run_id": "ANL-1",
+            "probes": [
+                {
+                    "id": "k8s_troubleshooting:container_start_error:p01",
+                    "tool": "k8s_describe",
+                    "arguments_template": {
+                        "kind": "pods",
+                        "namespace": "{{namespace}}",
+                        "name": "{{pod}}",
+                    },
+                    "support_signal_any": ["CreateContainerConfigError"],
+                    "refute_signal_any": ["Running"],
+                    "hypothesis_ids": ["ANL-1:H3"],
+                }
+            ],
+        }
+    )
+
+    async def conclude(*_args, **_kwargs):
+        return {"action": "done"}
+
+    async def must_not_query(*_args, **_kwargs):  # pragma: no cover
+        raise AssertionError("deduplicated probe must not re-query")
+
+    monkeypatch.setattr(drilldown, "complete_json", conclude)
+    monkeypatch.setattr(drilldown, "k8s_describe", must_not_query)
+    monkeypatch.setattr(drilldown, "k8s_read", must_not_query)
+
+    asyncio.run(run_drilldowns(drill_settings(), [result], target, plan))
+
+    assessment = result.details["ontology_probe_assessments"][0]
+    execution_id = "ANL-1:k8s_troubleshooting:container_start_error:p01:1"
+    assert assessment["verdict"] == "supports"
+    assert assessment["support_signals"] == ["CreateContainerConfigError"]
+    assert assessment["execution_id"] == execution_id
+    assert assessment["hypothesis_ids"] == ["ANL-1:H3"]
+    assert assessment["replayed_from_base_pass"] is True
+    # The observed artifact carries the identity link; no artifact was added.
+    assert lifecycle.probe_execution_ids == [execution_id]
+    assert len(result.artifacts) == 2
+
+
+def test_deduplicated_probe_without_matching_signals_replays_inconclusive(monkeypatch) -> None:
+    target = replace(_target(), pod="secret-error")
+    described = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="pod_inspection",
+        status="ok",
+        confidence="high",
+        query="kubectl describe pod secret-error -n runai-vision",
+        summary="pod described",
+        result={"observation": {"polarity": "unknown", "coverage": "partial"}},
+    )
+    result = CollectorResult(
+        agent="kubernetes", status="ok", summary="base", artifacts=[described]
+    )
+    plan = InvestigationPlan(
+        diagnostic_directive={
+            "probes": [
+                {
+                    "id": "k8s_troubleshooting:pod_crashing:p01",
+                    "tool": "k8s_describe",
+                    "arguments_template": {
+                        "kind": "pods",
+                        "namespace": "{{namespace}}",
+                        "name": "{{pod}}",
+                    },
+                    "support_signal_any": ["CrashLoopBackOff"],
+                }
+            ],
+        }
+    )
+
+    async def conclude(*_args, **_kwargs):
+        return {"action": "done"}
+
+    monkeypatch.setattr(drilldown, "complete_json", conclude)
+
+    asyncio.run(run_drilldowns(drill_settings(), [result], target, plan))
+
+    assessment = result.details["ontology_probe_assessments"][0]
+    assert assessment["verdict"] == "inconclusive"
+    assert assessment["replayed_from_base_pass"] is True
+    assert "execution_id" not in assessment
+    assert described.probe_execution_ids is None
+
+
 def test_non_kubernetes_drilldown_reuses_successful_base_query(monkeypatch) -> None:
     result = CollectorResult(
         agent="prometheus",
@@ -1272,7 +1392,6 @@ def test_ontology_probe_keeps_untyped_remote_signal_inconclusive(monkeypatch) ->
         "refute_signals": [],
         "template_id": "mount-check",
         "attempt_index": 1,
-        "artifact_index": 0,
         "executed_at": "",
     }
     assert assessment["executed_at"].endswith("Z")

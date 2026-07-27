@@ -96,6 +96,10 @@ class AlertAnalysisArtifact(BaseModel):
     # Stable within one analysis response (E01, E02, ...). The TypeDB ingest
     # qualifies this with run_id, so the same readable ID may safely recur later.
     evidence_id: str | None = None
+    # Ontology-probe execution IDs whose assessment observed THIS artifact.
+    # Identity link, never a positional index: evidence aggregation compacts
+    # artifact lists, which silently broke index-based probe→evidence links.
+    probe_execution_ids: list[str] | None = None
     agent: str
     source: str
     type: str
