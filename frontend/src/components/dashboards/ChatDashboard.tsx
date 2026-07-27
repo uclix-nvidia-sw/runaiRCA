@@ -1,4 +1,4 @@
-import { Bot, MessageSquarePlus, Send, Trash2 } from 'lucide-react';
+import { Bot, MessageSquarePlus, Radar, Send, Trash2 } from 'lucide-react';
 import { type KeyboardEvent, useEffect, useMemo, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -138,6 +138,17 @@ export function ChatDashboard({
                 <Trash2 size={15} />
               </button>
             )}
+            <button
+              className="full-chat-analyze"
+              type="button"
+              disabled={chat.sending || !chat.input.trim()}
+              onClick={() => void chat.send({ analyze: true })}
+              aria-label="Run RCA analysis"
+              title="Run RCA analysis on this message"
+            >
+              <Radar size={15} />
+              <span>RCA 분석</span>
+            </button>
             <button
               className="full-chat-send"
               type="button"

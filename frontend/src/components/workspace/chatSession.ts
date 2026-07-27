@@ -118,7 +118,7 @@ export function useRcaChat({
     setActiveConversationID((current) => (current === id ? '' : current));
   }, []);
 
-  const send = useCallback(async () => {
+  const send = useCallback(async (options?: { analyze?: boolean }) => {
     const message = input.trim();
     if (!message || sending) return;
 
@@ -167,6 +167,7 @@ export function useRcaChat({
       language: 'en',
       page: chatContext.page,
       auto: false,
+      analyze: options?.analyze || undefined,
       incident_id: incidentID,
       alert_id: alertID,
       incident_title: chatContext.incidentTitle,

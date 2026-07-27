@@ -1449,10 +1449,81 @@ func TestWantsAnalysisRunDoesNotTreatReplayAsReanalysis(t *testing.T) {
 		"이 인시던트 재분석",
 		"analyze this again please",
 		"start a new analysis for the runai namespace",
+		"이 pod 원인 찾아줘",
+		"장애 원인 파악해줘",
+		"진단 시작해줘",
+		"diagnose this pod",
+		"investigate the runai-scheduler crash",
 	} {
 		if !wantsAnalysisRun(message) {
 			t.Fatalf("expected analysis request for %q", message)
 		}
+	}
+	// Questions about the RCA we already have must stay in the Q&A path.
+	for _, message := range []string{
+		"원인이 뭐야?",
+		"root cause가 뭐였어?",
+		"진단 결과 보여줘",
+		"어제 분석 결과 요약해줘",
+	} {
+		if wantsAnalysisRun(message) {
+			t.Fatalf("question about an existing RCA must not start a run: %q", message)
+		}
+	}
+}
+
+func TestChatExplicitAnalyzeFlagStartsRunWithoutKeywords(t *testing.T) {
+	// The operator pressed "run RCA" in the chat UI. Phrasing must not matter:
+	// Alertmanager misses real problems, so this is a first-class entry point.
+	server := NewServer()
+	agentReqCh := make(chan AgentAnalysisRequest, 1)
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req AgentAnalysisRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode agent analysis request: %v", err)
+		}
+		agentReqCh <- req
+		_ = json.NewEncoder(w).Encode(AgentAnalysisResponse{
+			Status:          "ok",
+			AnalysisSummary: "Operator-requested RCA completed.",
+			AnalysisDetail:  "## Root Cause\n\nOperator-requested analysis.",
+			AnalysisQuality: "medium",
+			Capabilities:    map[string]string{"analysis": "ok"},
+		})
+	}))
+	defer agent.Close()
+	server.agentURL = agent.URL
+
+	message := "dgx02 노드 상태가 좀 이상해"
+	if wantsAnalysisRun(message) {
+		t.Fatalf("test premise broken: %q should not match the phrasing gate", message)
+	}
+	payload, _ := json.Marshal(ChatRequest{Message: message, Analyze: true})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected chat 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var response ChatResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode chat response: %v", err)
+	}
+	if response.AnalysisRun == nil {
+		t.Fatalf("expected an analysis run, got %+v", response)
+	}
+	agentReq := <-agentReqCh
+	if agentReq.Alert.Labels["alertname"] != "OperatorRequestedAnalysis" {
+		t.Fatalf("expected the ad-hoc alert sent to the agent, got %+v", agentReq.Alert.Labels)
+	}
+	if agentReq.Alert.Annotations["operator_prompt"] != message {
+		t.Fatalf("expected the chat message as operator_prompt, got %q",
+			agentReq.Alert.Annotations["operator_prompt"])
+	}
+	run := waitForAnalysisRun(t, server, "chat")
+	if run.Status != "complete" {
+		t.Fatalf("unexpected analysis run: %+v", run)
 	}
 }
 

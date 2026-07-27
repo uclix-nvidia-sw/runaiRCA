@@ -15,6 +15,10 @@ type ChatRequest struct {
 	Language        string         `json:"language,omitempty"`
 	Page            string         `json:"page,omitempty"`
 	Auto            bool           `json:"auto,omitempty"`
+	// Analyze is the operator pressing "run RCA" explicitly. Alertmanager does
+	// not fire for every real problem, so chat is a first-class analysis entry
+	// point and must not depend on the phrasing heuristic below.
+	Analyze bool `json:"analyze,omitempty"`
 	IncidentID      string         `json:"incident_id,omitempty"`
 	AlertID         string         `json:"alert_id,omitempty"`
 	IncidentTitle   string         `json:"incident_title,omitempty"`
@@ -77,7 +81,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	userMessageAt := time.Now().UTC()
 	req = s.enrichChatRequest(req)
-	if wantsAnalysisRun(req.Message) {
+	if req.Analyze || wantsAnalysisRun(req.Message) {
 		targetType, targetID, inferred := s.chatAnalysisTarget(req)
 		adHoc := false
 		if targetType == "" || targetID == "" {
@@ -373,7 +377,9 @@ func wantsAnalysisRun(message string) bool {
 		strings.Contains(lowered, "run analysis") ||
 		strings.Contains(lowered, "start analysis") ||
 		strings.Contains(lowered, "create analysis") ||
-		strings.Contains(lowered, "new analysis") {
+		strings.Contains(lowered, "new analysis") ||
+		strings.Contains(lowered, "diagnose") ||
+		strings.Contains(lowered, "investigate") {
 		return true
 	}
 	// Verb "analyze" + "again" = re-run ("analyze this again"); the noun form
@@ -387,7 +393,21 @@ func wantsAnalysisRun(message string) bool {
 	if strings.Contains(message, "재분석") {
 		return true
 	}
-	if !strings.Contains(message, "분석") {
+	// "분석 결과"/"진단 결과" names the report we already produced, so an action
+	// verb attached to it ("요약해줘") is a replay, not a request to re-run.
+	if strings.Contains(message, "분석 결과") || strings.Contains(message, "진단 결과") {
+		return false
+	}
+	// "원인 찾아줘" is a request to work, "원인이 뭐야?" is a question about the
+	// RCA we already have — only the action verbs trigger a run.
+	if strings.Contains(message, "원인") {
+		for _, token := range []string{"찾아", "파악해", "밝혀"} {
+			if strings.Contains(message, token) {
+				return true
+			}
+		}
+	}
+	if !strings.Contains(message, "분석") && !strings.Contains(message, "진단") {
 		return false
 	}
 	// "다시" alone is NOT a token: "분석 결과 다시 보여줘" is a replay request,

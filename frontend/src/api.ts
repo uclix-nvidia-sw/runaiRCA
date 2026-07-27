@@ -234,6 +234,7 @@ export type ChatRequest = {
   language?: 'ko' | 'en';
   page?: string;
   auto?: boolean;
+  analyze?: boolean;
   incident_id?: string;
   alert_id?: string;
   incident_title?: string;

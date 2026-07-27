@@ -4719,6 +4719,48 @@ code .evidence-mark {
   opacity: 0.42;
 }
 
+.full-chat-compose-meta .full-chat-analyze {
+  width: auto;
+  gap: 0.35rem;
+  grid-auto-flow: column;
+  padding: 0 0.7rem;
+  border-radius: 999px;
+  border-color: var(--nvidia);
+  color: var(--nvidia);
+  font-size: 0.8rem;
+  font-weight: 750;
+  transition: background var(--dur-1) var(--ease-out), color var(--dur-1) var(--ease-out);
+}
+
+.full-chat-compose-meta .full-chat-analyze:hover:not(:disabled) {
+  background: var(--nvidia);
+  color: #ffffff;
+}
+
+.full-chat-compose-meta .full-chat-analyze:disabled,
+.chat-analyze-button:disabled {
+  opacity: 0.42;
+}
+
+.chat-analyze-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0 0.7rem;
+  border: 1px solid var(--nvidia);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--nvidia);
+  font-size: 0.82rem;
+  font-weight: 750;
+  transition: background var(--dur-1) var(--ease-out), color var(--dur-1) var(--ease-out);
+}
+
+.chat-analyze-button:hover:not(:disabled) {
+  background: var(--nvidia);
+  color: #ffffff;
+}
+
 .chat-fab {
   position: fixed;
   right: 1.25rem;

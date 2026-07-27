@@ -1,4 +1,4 @@
-import { Bot, Maximize2, MessageSquare, Minimize2, Send, Settings2, X } from 'lucide-react';
+import { Bot, Maximize2, MessageSquare, Minimize2, Radar, Send, Settings2, X } from 'lucide-react';
 import { type KeyboardEvent, useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -123,6 +123,14 @@ export function FloatingChat({
               rows={2}
               placeholder="Ask a follow-up about root cause, evidence, actions, or similar incidents"
             />
+            <button
+              className="chat-analyze-button"
+              disabled={chat.sending || !chat.input.trim()}
+              onClick={() => void chat.send({ analyze: true })}
+              title="Run RCA analysis on this message"
+            >
+              <Radar size={16} /> RCA
+            </button>
             <button className="primary-button" disabled={chat.sending || !chat.input.trim()} onClick={() => void chat.send()}>
               <Send size={16} /> Send
             </button>
