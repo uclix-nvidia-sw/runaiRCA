@@ -91,6 +91,7 @@ import {
   Status,
   agentIcon,
   agentLabel,
+  analysisRunDurationMs,
   formatDuration,
   formatOccurrenceCount,
   formatTime,
@@ -990,13 +991,7 @@ function UnifiedWorkspace({
   const missingData = incident?.missing_data ?? [];
   const warnings = incident?.warnings ?? [];
   const tokenUsage = incident?.token_usage;
-  const analysisDuration = formatDuration(
-    (analysisRun?.first_completed_at
-      ? Date.parse(analysisRun.first_completed_at)
-      : analysisRun?.status === 'complete' || analysisRun?.status === 'completed'
-        ? Date.parse(analysisRun.updated_at)
-        : Number.NaN) - (analysisRun ? Date.parse(analysisRun.created_at) : Number.NaN),
-  );
+  const analysisDuration = formatDuration(analysisRunDurationMs(analysisRun));
   const analysis = incident?.analysis_detail;
   const summary = incident?.analysis_summary;
   const isAnalyzing = Boolean(detail.data.is_analyzing);

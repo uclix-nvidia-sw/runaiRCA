@@ -232,6 +232,30 @@ export function formatDurationMinutes(value: number) {
   return `${formatDecimal(hours)}h`;
 }
 
+/** Elapsed time of the analysis attempt this run row currently holds.
+ *
+ * `first_completed_at` is the "first ever RCA completion" KPI and is pinned for
+ * the lifetime of the row, while re-analysis reuses the row in place and resets
+ * `created_at`. Trusting it unconditionally yields a negative duration on every
+ * re-analysis, so it only counts when it belongs to this attempt. */
+export function analysisRunDurationMs(run?: {
+  source?: string;
+  status?: string;
+  created_at?: string;
+  updated_at?: string;
+  first_completed_at?: string;
+}): number {
+  if (!run) return Number.NaN;
+  // Operator corrections are authored, not analyzed — they have no runtime.
+  if (run.source === 'operator') return Number.NaN;
+  const created = Date.parse(run.created_at ?? '');
+  const first = run.first_completed_at ? Date.parse(run.first_completed_at) : Number.NaN;
+  if (Number.isFinite(first) && first >= created) return first - created;
+  const terminal =
+    run.status === 'complete' || run.status === 'completed' || run.status === 'failed';
+  return terminal ? Date.parse(run.updated_at ?? '') - created : Number.NaN;
+}
+
 export function formatDuration(ms: number): string {
   if (!Number.isFinite(ms) || ms < 0) return '';
   const totalSeconds = Math.floor(ms / 1000);

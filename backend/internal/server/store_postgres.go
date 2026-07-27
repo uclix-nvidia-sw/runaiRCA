@@ -2183,6 +2183,7 @@ func (s *Store) persistAnalysisRunLocked(run *AnalysisRun) bool {
 			artifacts = EXCLUDED.artifacts,
 			metadata = EXCLUDED.metadata,
 			first_completed_at = EXCLUDED.first_completed_at,
+			created_at = EXCLUDED.created_at,
 			updated_at = EXCLUDED.updated_at`,
 		run.RunID,
 		run.Source,
