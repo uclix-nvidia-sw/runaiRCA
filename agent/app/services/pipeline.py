@@ -5446,21 +5446,87 @@ def _specific_cause_statement(
     for reason in _dispositive_reason_order(family):
         observations = _typed_reason_observations(results, eligible_evidence_ids, reason)
         if observations:
+            # Only the typed match may open this branch, but the kubelet Event
+            # usually holds the message naming the object, so pool both.
+            observations += _event_message_observations(
+                results, eligible_evidence_ids, reason
+            )
             return _reason_specific_detail(
                 reason, observations, results, eligible_evidence_ids, language=language
             )
     if request is None:
         return ""
     for reason in _asserted_signature_reasons(results, eligible_evidence_ids, family):
-        observations = [
-            (reason, text, None, {}) for text in _asserted_alert_texts(request)
-        ]
+        # The alert asserted the reason; the cluster's own Event message is the
+        # better source for WHICH object failed, so it is consulted first.
+        observations = _event_message_observations(
+            results, eligible_evidence_ids, reason
+        ) + [(reason, text, None, {}) for text in _asserted_alert_texts(request)]
         detail = _reason_specific_detail(
             reason, observations, results, eligible_evidence_ids, language=language
         )
         if detail:
             return detail
     return ""
+
+
+# Kubernetes reports these mechanisms twice: the container state carries the
+# reason token, while the Event that carries the human-readable message uses the
+# kubelet's own generic reason ("Failed" for a missing Secret/ConfigMap). Mapping
+# the pair keeps object-name extraction on a closed vocabulary instead of
+# grepping every event message in the run.
+_EVENT_REASONS_FOR_STATE: dict[str, frozenset[str]] = {
+    "CreateContainerConfigError": frozenset({"Failed"}),
+    "CreateContainerError": frozenset({"Failed"}),
+    "RunContainerError": frozenset({"Failed"}),
+    "StartError": frozenset({"Failed"}),
+    "ImagePullBackOff": frozenset({"Failed", "BackOff"}),
+    "ErrImagePull": frozenset({"Failed", "BackOff"}),
+    "ErrImageNeverPull": frozenset({"Failed", "ErrImageNeverPull"}),
+    "InvalidImageName": frozenset({"Failed", "InvalidImageName"}),
+    "Unschedulable": frozenset({"FailedScheduling"}),
+    "SchedulingGated": frozenset({"FailedScheduling"}),
+}
+
+
+def _event_message_observations(
+    results: list[CollectorResult], eligible_evidence_ids: set[str], reason: str
+) -> list[tuple[str, str, object | None, dict[str, Any]]]:
+    """Messages from eligible target-verified Warning events for this mechanism.
+
+    Same identity bar as ``_typed_reason_observations`` — the artifact must be
+    scoped/present/target-verified and the individual event target-verified, so a
+    neighbouring workload's failure can never name this incident's object — but
+    deliberately WITHOUT its ``count >= 3`` threshold. That threshold guards
+    treating a reason token as the mechanism; here the mechanism is already
+    established by typed state or an asserted alert signature, and a single
+    kubelet Event is enough to say WHICH object it was about.
+    """
+    allowed = _EVENT_REASONS_FOR_STATE.get(reason) or frozenset()
+    if not allowed:
+        return []
+    found: list[tuple[str, str, object | None, dict[str, Any]]] = []
+    for result in results:
+        for item in result.artifacts:
+            if str(getattr(item, "evidence_id", "") or "") not in eligible_evidence_ids:
+                continue
+            if getattr(item, "type", "") != "kubernetes_warning_events":
+                continue
+            payload = getattr(item, "result", None)
+            if not _typed_artifact_is_verified(payload):
+                continue
+            for event in payload.get("events", []):
+                if not (
+                    isinstance(event, dict)
+                    and str(event.get("type") or "") == "Warning"
+                    and event.get("target_identity_verified") is True
+                    and str(event.get("reason") or "") in allowed
+                ):
+                    continue
+                message = str(event.get("message") or "")
+                if message:
+                    found.append((reason, message, None, {"event": event}))
+    return found
 
 
 def _dispositive_reason_order(family: str) -> list[str]:
@@ -6014,6 +6080,10 @@ _FAMILY_EXPLANATION_KO = {
     "platform_version_bug": "Run:ai 버전 결함",
     "observability_accuracy": "워크로드가 아닌 메트릭·관측 정확도 문제",
     "expected_known_behavior": "제품의 알려진 정상 동작",
+    "platform_lifecycle_change": (
+        "플랫폼 rollout·업그레이드 진행 중 발생한 예상된 변동(GPU Operator·컨트롤러·"
+        "Helm 릴리스) — 결함이 아니므로 먼저 rollout·Helm 릴리스 완료 여부를 확인"
+    ),
 }
 
 
