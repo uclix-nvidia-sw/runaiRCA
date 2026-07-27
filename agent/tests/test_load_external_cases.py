@@ -189,13 +189,91 @@ def test_write_case_wires_the_trusted_knowledge_chain(monkeypatch: Any) -> None:
     assert 'has keyword "ibv_modify_qp failed with 19 no such device"' in emitted
     assert "isa has_symptom" in emitted
     assert "isa case_projection" in emitted
-    assert "isa indicates" in emitted
+    assert "insert (symptom: $s, cause: $rc) isa indicates" in emitted
     # Only support-CONFIRMED actions become resolved_by fixes.
     assert 'has statement "Correct switch routing."' in emitted
-    assert "isa resolved_by" in emitted
+    assert "insert (symptom: $s, remedy: $a) isa resolved_by" in emitted
     assert 'has statement "Constrain RDMA device to one NIC."; insert (symptom' not in emitted
     # The mechanism rides as the symptom's reason for report narration.
     assert 'has reason "Switch routing blocked the MacVLAN path."' in emitted
+
+
+def test_unconfirmed_mechanism_case_stays_out_of_the_chain(monkeypatch: Any) -> None:
+    # Curator recorded only an OBSERVED mechanism (support never confirmed) —
+    # the case stays retrieval+playbook, and previously-written chain edges of
+    # a demoted case are deleted.
+    monkeypatch.setattr(
+        ingest, "load_family_catalog",
+        lambda _: SimpleNamespace(families={"network_fabric_error"}),
+    )
+    p = _payload()
+    p["incident"] = {**p["incident"], "confirmed_mechanism": None}
+    inc = lx._to_incident(p, "op", "t")
+
+    tx = _Tx()
+    lx._write_case(tx, inc, lx._symptom_keywords(p))
+    emitted = "\n".join(tx.queries)
+    assert "insert (symptom: $s, cause: $rc) isa indicates" not in emitted
+    assert "insert (symptom: $s, remedy: $a) isa resolved_by" not in emitted
+    assert "isa indicates(symptom: $s); delete $x;" in emitted  # demote cleanup
+    assert "isa has_symptom" in emitted  # retrieval stays
+
+
+def test_legacy_blanket_positive_promotion_label_does_not_block_the_chain(monkeypatch: Any) -> None:
+    # Every shipped payload carries prohibited_uses: positive_promotion as a
+    # blanket sanitizer-era label; gating on it would zero the chain and revert
+    # the owner's trust decision. The per-case gate is mechanism_confirmed.
+    monkeypatch.setattr(
+        ingest, "load_family_catalog",
+        lambda _: SimpleNamespace(families={"network_fabric_error"}),
+    )
+    inc = lx._to_incident(_payload(), "op", "t")  # fixture carries the label
+    tx = _Tx()
+    lx._write_case(tx, inc, lx._symptom_keywords(_payload()))
+    assert "insert (symptom: $s, cause: $rc) isa indicates" in "\n".join(tx.queries)
+
+
+def test_chain_keywords_require_specific_signatures(monkeypatch: Any) -> None:
+    # A single generic token must not anchor the causal chain; when no keyword
+    # survives the specificity gate the case demotes to retrieval-only WITH its
+    # full keyword set.
+    assert lx._chain_specific("ibv_modify_qp failed with 19 no such device")
+    assert lx._chain_specific("runai_pod_gpu_info")
+    assert lx._chain_specific("error: column d.daticulocale does not exist")
+    assert not lx._chain_specific("oomkilled")
+    assert not lx._chain_specific("evicted")
+
+    monkeypatch.setattr(
+        ingest, "load_family_catalog",
+        lambda _: SimpleNamespace(families={"network_fabric_error"}),
+    )
+    p = _payload()
+    # "oomkilled" never even reaches keywords (_is_generic drops bare words);
+    # "xid79" survives _is_generic (digit) but is too weak to anchor causality.
+    p["searchable_context"] = {
+        **(p.get("searchable_context") or {}),
+        "error_signatures": ["xid79"],
+        "curated_signature_tokens": [],
+    }
+    inc = lx._to_incident(p, "op", "t")
+    tx = _Tx()
+    lx._write_case(tx, inc, lx._symptom_keywords(p))
+    emitted = "\n".join(tx.queries)
+    assert "insert (symptom: $s, cause: $rc) isa indicates" not in emitted
+    assert 'has keyword "xid79"' in emitted  # retrieval keeps the full set
+
+
+def test_sweep_deletes_only_vanished_case_surfaces() -> None:
+    tx = _Tx()
+    lx._delete_case_surfaces(tx, "ext:sc-gone000000")
+    emitted = "\n".join(tx.queries)
+    assert 'has name "ext:sc-gone000000"' in emitted
+    assert "isa indicates(symptom: $s); delete $x;" in emitted
+    assert "isa has_symptom(symptom: $s); delete $x;" in emitted
+    assert 'has runbook_name "ext:sc-gone000000:playbook"' in emitted
+    # History stays: no incident/case_snapshot deletion.
+    assert "isa incident" not in emitted
+    assert "isa case_snapshot" not in emitted
 
 
 def test_write_case_off_catalog_family_stays_out_of_the_chain(monkeypatch: Any) -> None:
@@ -210,9 +288,10 @@ def test_write_case_off_catalog_family_stays_out_of_the_chain(monkeypatch: Any) 
     tx = _Tx()
     lx._write_case(tx, inc, lx._symptom_keywords(p))
     emitted = "\n".join(tx.queries)
-    # Not in the closed catalog -> retrieval only, no knowledge authority.
-    assert "isa indicates" not in emitted
-    assert "isa resolved_by" not in emitted
+    # Not in the closed catalog -> retrieval only, no knowledge authority
+    # (the demote-cleanup DELETE of chain edges is expected and fine).
+    assert "insert (symptom: $s, cause: $rc) isa indicates" not in emitted
+    assert "insert (symptom: $s, remedy: $a) isa resolved_by" not in emitted
 
 
 def test_write_case_projects_support_thread_as_diagnostic_playbook(monkeypatch: Any) -> None:

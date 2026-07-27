@@ -316,14 +316,41 @@ def _write_case(tx: Any, inc: OntologyIncident, keywords: list[str]) -> None:
     ingest._write_incident(tx, inc)
     if not keywords:
         return
-    _ensure_symptom(tx, inc.incident_id, keywords, reason=inc.mechanism)
+    # Trust guards (owner-approved 2026-07-27). The chain asserts causality, so
+    # it must respect the CURATOR's own judgement and only match on signatures
+    # specific enough to name this case:
+    #   1. A case whose support thread never CONFIRMED the mechanism
+    #      (mechanism_confirmed=false — observed-only), stays retrieval+playbook.
+    #      NOTE: the prohibited_uses "positive_promotion" label is deliberately
+    #      NOT a gate — every shipped payload carries it as a blanket
+    #      sanitizer-era declaration from the old isolation design, so honoring
+    #      it would zero the chain and silently revert the owner's 2026-07-27
+    #      trust decision. A per-case opt-out belongs in a dedicated field.
+    #   2. Only specific signatures may anchor the chain symptom: multi-word
+    #      phrases, long tokens, or code-ish identifiers. A single generic word
+    #      ("oomkilled") would substring-match every unrelated OOM incident.
+    #      When no keyword survives the gate, the case demotes to retrieval-only
+    #      with its full keyword set instead of entering the chain unanchored.
+    chain = (
+        inc.root_cause_family in FAMILIES
+        and bool(inc.case_card.get("mechanism_confirmed"))
+    )
+    chain_keywords = [kw for kw in keywords if _chain_specific(kw)] if chain else []
+    if chain and not chain_keywords:
+        chain = False
+    _ensure_symptom(
+        tx,
+        inc.incident_id,
+        chain_keywords if chain else keywords,
+        reason=inc.mechanism,
+    )
     ingest._relate(
         tx,
         ("incident", "incident_id", inc.incident_id),
         ("symptom", "name", inc.incident_id),
         "has_symptom", "incident", "symptom",
     )
-    if inc.root_cause_family in FAMILIES:
+    if chain:
         _relate_indicates(tx, inc.incident_id, inc.root_cause_family)
         for action in inc.successful_actions:
             statement = str(action.get("statement") or "").strip()
@@ -331,10 +358,103 @@ def _write_case(tx: Any, inc: OntologyIncident, keywords: list[str]) -> None:
                 continue
             _ensure_action(tx, statement)
             _relate_resolved_by(tx, inc.incident_id, statement)
+    else:
+        # A case demoted AFTER previously entering the chain must lose its old
+        # causal edges (its keywords self-reconcile inside _ensure_symptom).
+        _delete_chain_edges(tx, inc.incident_id)
     _write_diagnostic_playbook(tx, inc)
 
 
+def _delete_chain_edges(tx: Any, symptom_name: str) -> None:
+    from app.ontology.typedb_client import escape_typeql as esc
+
+    for relation, role in (("indicates", "symptom"), ("resolved_by", "symptom")):
+        tx.query(
+            f'match $s isa symptom, has name "{esc(symptom_name)}"; '
+            f"$x isa {relation}({role}: $s); delete $x;"
+        ).resolve()
+
+
+def _chain_specific(keyword: str) -> bool:
+    """Specific enough to anchor a causal match: a multi-word phrase, a long
+    token, or a code-ish identifier (runai_pod_gpu_info, error: column …)."""
+    keyword = keyword.strip()
+    return " " in keyword or len(keyword) >= 12 or any(c in keyword for c in "_:./")
+
+
 _PLAYBOOK_STEP_OUTCOMES = ("diagnostic", "preventive")
+
+
+def _delete_playbook(tx: Any, incident_id: str) -> None:
+    from app.ontology.typedb_client import escape_typeql as esc
+
+    name = esc(f"{incident_id}:playbook")
+    tx.query(
+        f'match $s isa diagnostic_step, has runbook_name "{name}"; '
+        f"$x isa diagnostic_transition(prior: $s); delete $x;"
+    ).resolve()
+    for relation in ("runbook_entry", "runbook_contains"):
+        tx.query(
+            f'match $r isa runbook, has name "{name}"; '
+            f"$x isa {relation}(runbook: $r); delete $x;"
+        ).resolve()
+    tx.query(f'match $x isa diagnostic_step, has runbook_name "{name}"; delete $x;').resolve()
+    tx.query(f'match $x isa runbook, has name "{name}"; delete $x;').resolve()
+
+
+def _delete_case_surfaces(tx: Any, incident_id: str) -> None:
+    """Remove a vanished case's ACTIVE surfaces: chain edges, symptom, playbook.
+
+    The historical incident/case_snapshot projection stays — it is archive, not
+    a matcher. Used by the sweep for cases no longer shipped in the repo, so a
+    bad case removed from git actually leaves the runtime knowledge."""
+    from app.ontology.typedb_client import escape_typeql as esc
+
+    _delete_chain_edges(tx, incident_id)
+    tx.query(
+        f'match $s isa symptom, has name "{esc(incident_id)}"; '
+        f"$x isa has_symptom(symptom: $s); delete $x;"
+    ).resolve()
+    tx.query(f'match $s isa symptom, has name "{esc(incident_id)}"; delete $s;').resolve()
+    _delete_playbook(tx, incident_id)
+
+
+def _sweep_missing_cases(settings: Any, keep_ids: set[str]) -> tuple[list[str], list[str]]:
+    """Best-effort removal of graph cases the repo no longer ships.
+
+    Reads every ``ext:`` symptom name, diffs against the loaded set, and deletes
+    the missing ones' surfaces case-by-case. Every step is non-fatal: a read or
+    per-case failure prints a warning and moves on — sweeping must never block
+    loading."""
+    from typedb.driver import TransactionType
+
+    from app.ontology.typedb_client import TypeDBClient, open_driver
+
+    try:
+        with TypeDBClient(settings).open_reader() as run:
+            names = {
+                str(row.get("n") or "")
+                for row in run('match $s isa symptom, has name $n; $n like "ext:.*"; select $n;')
+            }
+    except Exception as exc:  # noqa: BLE001 - sweep is advisory
+        print(f"  ! sweep skipped (read failed): {type(exc).__name__}: {exc}", file=sys.stderr)
+        return [], []
+    missing = sorted(name for name in names if name and name not in keep_ids)
+    removed: list[str] = []
+    failed: list[str] = []
+    if not missing:
+        return removed, failed
+    with open_driver(settings) as driver:
+        for incident_id in missing:
+            try:
+                with driver.transaction(settings.typedb_database, TransactionType.WRITE) as tx:
+                    _delete_case_surfaces(tx, incident_id)
+                    tx.commit()
+                removed.append(incident_id)
+            except Exception as exc:  # noqa: BLE001 - keep sweeping the rest
+                failed.append(incident_id)
+                print(f"  ! sweep {incident_id}: {type(exc).__name__}: {exc}", file=sys.stderr)
+    return removed, failed
 
 
 def _write_diagnostic_playbook(tx: Any, inc: OntologyIncident) -> None:
@@ -356,17 +476,7 @@ def _write_diagnostic_playbook(tx: Any, inc: OntologyIncident) -> None:
     ]
     runbook_name = f"{inc.incident_id}:playbook"
     name = esc(runbook_name)
-    tx.query(
-        f'match $s isa diagnostic_step, has runbook_name "{name}"; '
-        f"$x isa diagnostic_transition(prior: $s); delete $x;"
-    ).resolve()
-    for relation in ("runbook_entry", "runbook_contains"):
-        tx.query(
-            f'match $r isa runbook, has name "{name}"; '
-            f"$x isa {relation}(runbook: $r); delete $x;"
-        ).resolve()
-    tx.query(f'match $x isa diagnostic_step, has runbook_name "{name}"; delete $x;').resolve()
-    tx.query(f'match $x isa runbook, has name "{name}"; delete $x;').resolve()
+    _delete_playbook(tx, inc.incident_id)
     if not leads:
         return
     summary = f"Vendor-support diagnostic sequence for {inc.incident_id} ({len(leads)} steps)"
@@ -514,6 +624,12 @@ def main() -> int:
         return 0
 
     written, failed = _write_external([(inc, kw) for inc, _payload, kw in prepared])
+    # keep set = every case the repo SHIPS (write success or not): a transient
+    # write failure must never let the sweep delete a real case's knowledge.
+    keep_ids = {inc.incident_id for inc, _payload, _kw in prepared}
+    swept, sweep_failed = _sweep_missing_cases(load_settings(), keep_ids)
+    if swept or sweep_failed:
+        print(f"swept vanished cases: {len(swept)} removed, {len(sweep_failed)} failed")
     print(f"done: {written} written, {failed} failed")
     return 1 if failed and not written else 0
 
