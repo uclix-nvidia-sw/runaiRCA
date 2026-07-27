@@ -580,11 +580,12 @@ frontend:
     pullPolicy: IfNotPresent
   service:
     annotations: {}
-    # NodePort pinned to 30006 so the dashboard address survives reinstalls
-    # (random NodePorts changed it on every release). The Ingress below is the
-    # named-URL path; this stays as the direct/stable fallback.
-    type: NodePort
-    nodePort: 30006
+    # ClusterIP: the Ingress (default-on below) is the access path. The entry
+    # PORT (e.g. 30006) belongs to the cluster's ingress CONTROLLER service,
+    # not to this chart's Ingress resource. `nodePort` is honored only if you
+    # opt back into type: NodePort for a direct fallback.
+    type: ClusterIP
+    nodePort: null
     port: 80
   config:
     apiBaseUrl: ""
