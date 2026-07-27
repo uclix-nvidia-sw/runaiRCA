@@ -402,7 +402,11 @@ async def _fetch_trace_v3_page(
 def _ensure(tx: Any, etype: str, key_attr: str, value: str) -> None:
     if not value:
         return
-    q = f'match $x isa {etype}, has {key_attr} "{esc(value)}"; select $x;'
+    # Evidence was historically written as the direct supertype. Look it up
+    # across the hierarchy so a later, more specific source classification
+    # reuses that entity instead of violating evidence_id's global @key.
+    lookup_type = "evidence" if key_attr == "evidence_id" else etype
+    q = f'match $x isa {lookup_type}, has {key_attr} "{esc(value)}"; select $x;'
     if not list(tx.query(q).resolve().as_concept_rows()):
         tx.query(f'insert $x isa {etype}, has {key_attr} "{esc(value)}";').resolve()
 
